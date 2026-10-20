@@ -64,7 +64,7 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     CalleePin,
-    BinaryExpr, CallExpr, ExpressionNode, IdentifierExpr, LiteralExpr,
+    ArrayExpr, BinaryExpr, CallExpr, ExpressionNode, IdentifierExpr, LiteralExpr,
     MemberAccessExpr, ScopeResolutionExpr, UnaryExpr
 };
 import compiler::ast::node::{ ASTNode };
@@ -1562,7 +1562,9 @@ type struct CallResolver {
     }
 
     /// A bare / negated / arithmetic-constant numeric literal is polymorphic for
-    /// generic inference (adopts whatever a non-literal arg or context binds).
+    /// generic inference (adopts whatever a non-literal arg or context binds),
+    /// and so is an array literal whose elements all are: `[1, 2]` for `[T]`
+    /// is an array of whatever `T` the other arguments bind.
     sema_arg_is_polymorphic_literal(&this, expr: ExpressionNode*) -> boolean {
         if (expr == null) { return false; }
         // A written-down type suffix is not a default to be adopted: it is the
@@ -1591,6 +1593,14 @@ type struct CallResolver {
             if (!is_arith) { return false; }
             return this.sema_arg_is_polymorphic_literal(b.left)
                 && this.sema_arg_is_polymorphic_literal(b.right);
+        }
+        const arr: ArrayExpr* = ExpressionNode::array_of(expr);
+        if (arr != null) {
+            if (arr.elements.length == 0) { return false; }
+            for (mut i: i64 = 0; i < arr.elements.length; i++) {
+                if (!this.sema_arg_is_polymorphic_literal(arr.elements[i])) { return false; }
+            }
+            return true;
         }
         return false;
     }
@@ -1641,6 +1651,18 @@ type struct CallResolver {
             if (!ty.as_instantiated().has_resolved_type()) { return false; }
         }
         return true;
+    }
+
+    /// What a polymorphic literal argument's own literals fill in `ty` (a
+    /// parameter's type, or the argument's): `ty` itself for a scalar, its
+    /// element for an array literal in `[T]` or `[T; N]`.
+    literal_slot(&this, ty: TypeRef, arg: ExpressionNode*) -> TypeRef {
+        if (ExpressionNode::array_of(arg) == null) { return ty; }
+        const dynamic_elem: TypeRef = this.arena.default_array_element(ty);
+        if (dynamic_elem.is_valid()) { return dynamic_elem; }
+        const t: Type* = this.arena.lookup(ty);
+        if (t != null && t.kind == TypeKind::Array) { return t.as_array().element; }
+        return ty;
     }
 
     /// Whether a polymorphic numeric literal can adopt the concrete binding `bnd`
@@ -1755,11 +1777,12 @@ type struct CallResolver {
                 if (!this.sema_arg_is_polymorphic_literal(arg)) { continue; }
                 const lit_actual: TypeRef = arg.resolved_type;
                 if (!lit_actual.is_valid()) { continue; }
-                const f_idx: i64 = ictx.binding_index(param.resolved_type);
+                const f_idx: i64 = ictx.binding_index(this.literal_slot(param.resolved_type, arg));
                 if (f_idx >= 0 && ictx.bindings[f_idx].is_valid()) {
                     const bnd: TypeRef = ictx.bindings[f_idx];
                     if (this.free_infer_type_concrete(bnd) && !this.literal_adopts_binding(bnd)) {
-                        this.emit_free_infer_conflict(call_e, call, tmpl.name, arg, bnd, lit_actual);
+                        this.emit_free_infer_conflict(call_e, call, tmpl.name, arg, bnd,
+                            this.literal_slot(lit_actual, arg));
                         return TypeRef::invalid();
                     }
                     continue;
@@ -4395,7 +4418,79 @@ type struct CallResolver {
             decl.push(if (p != null) { p.resolved_type } else { TypeRef::invalid() });
         }
         const params: [TypeRef] = this.free_call_params(entry, call, &decl, &decl);
+        this.retype_literal_array_arguments(visitor, call, &params);
         this.check_args_against_params(visitor, &call.arguments, params.as_slice());
+    }
+
+    /// An array literal of polymorphic literals was typed by its literals'
+    /// defaults before the call's type arguments were known; once its
+    /// parameter is instantiated it is typed again under it, so `[1, 2]` for
+    /// a `[T]` that another argument binds to `i64` is an `[i64]`, as one
+    /// literal adopts its parameter's width.
+    retype_literal_array_arguments(mut &this, visitor: SemaVisitor*, call: CallExpr*,
+                                   params: &[TypeRef]) -> void {
+        if (params.length != call.arguments.length) { return; }
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            const arg: ExpressionNode* = call.arguments[i];
+            if (ExpressionNode::array_of(arg) == null || !this.sema_arg_is_polymorphic_literal(arg)) { continue; }
+            const want: TypeRef = params[i];
+            if (!want.is_valid() || this.types.contains_generic_param(want)
+                    || want.equals(arg.resolved_type)) { continue; }
+            if (!this.literal_kinds_fit(arg, want)) { continue; }
+            CallResolver::forget_literal_types(arg);
+            const saved_expected: TypeRef = this.state.expected_type;
+            this.state.expected_type = want;
+            visitor.resolve_expr(arg);
+            this.state.expected_type = saved_expected;
+        }
+    }
+
+    /// Whether every literal in the polymorphic literal `e` can be typed as
+    /// what it fills in `ty`: an integer as any number, a float only as a
+    /// float.  One that cannot keeps its own type, so the argument check
+    /// reports the mismatch once, as it does for a single literal.
+    literal_kinds_fit(&this, e: ExpressionNode*, ty: TypeRef) -> boolean {
+        const arr: ArrayExpr* = ExpressionNode::array_of(e);
+        if (arr != null) {
+            const elem: TypeRef = this.literal_slot(ty, e);
+            for (mut i: i64 = 0; i < arr.elements.length; i++) {
+                if (!this.literal_kinds_fit(arr.elements[i], elem)) { return false; }
+            }
+            return true;
+        }
+        const u: UnaryExpr* = ExpressionNode::unary_of(e);
+        if (u != null) { return this.literal_kinds_fit(u.operand, ty); }
+        const b: BinaryExpr* = ExpressionNode::binary_of(e);
+        if (b != null) { return this.literal_kinds_fit(b.left, ty) && this.literal_kinds_fit(b.right, ty); }
+        const lit: LiteralExpr* = ExpressionNode::literal_of(e);
+        if (lit != null && lit.literal_kind == LiteralKind::Float) {
+            const t: Type* = this.arena.lookup(ty);
+            return t != null && t.kind == TypeKind::Float;
+        }
+        return true;
+    }
+
+    /// Clear the types a polymorphic literal was given, through the shapes
+    /// `sema_arg_is_polymorphic_literal` admits, so that typing it again
+    /// runs the literal resolver rather than returning the first answer.
+    static forget_literal_types(e: ExpressionNode*) -> void {
+        if (e == null) { return; }
+        e.set_resolved_type(TypeRef::invalid());
+        const arr: ArrayExpr* = ExpressionNode::array_of(e);
+        if (arr != null) {
+            for (mut i: i64 = 0; i < arr.elements.length; i++) { CallResolver::forget_literal_types(arr.elements[i]); }
+            return;
+        }
+        const u: UnaryExpr* = ExpressionNode::unary_of(e);
+        if (u != null) {
+            CallResolver::forget_literal_types(u.operand);
+            return;
+        }
+        const b: BinaryExpr* = ExpressionNode::binary_of(e);
+        if (b != null) {
+            CallResolver::forget_literal_types(b.left);
+            CallResolver::forget_literal_types(b.right);
+        }
     }
 
     /// `params` of the generic function `entry` as `call` instantiates them,
