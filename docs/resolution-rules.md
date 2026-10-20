@@ -163,6 +163,11 @@ yet is recorded with the change that builds it, not here.
      through the member-access and call conversions,** and deleted in the
      first change after the call conversion lands.  (Jake)
 
+457. **Code a change leaves dead is deleted in that same change,** even
+     when the work is otherwise cut one kind per commit: the call
+     conversion deleting `ExprKind::Legacy`, which it orphaned, was right.
+     (Jake)
+
 ### 2026-10-18
 
 438. **A `Location` constant keeps its pointers, and the growth of the
