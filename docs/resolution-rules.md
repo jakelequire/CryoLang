@@ -161,6 +161,15 @@ yet is recorded with the change that builds it, not here.
      to a struct,** including one that used a class only incidentally; this
      replaces ruling 386's porting of incidental ones.  (Jake)
 
+471. **What the deleted class tests alone covered gets fresh struct
+     tests,** written for structs rather than ported: a second explicit
+     `.drop()` of one binding refused (E0452), `p as A` with `p: A*`
+     refused (E0208), and `new T[n]` taking its block from `Allocate` with
+     `delete` running `Drop` before `release`.  (Jake)
+
+472. **The work-in-progress stash of the class deletion is dropped,** its
+     content being committed.  (Jake)
+
 462. **A path through a bounded type parameter naming a member no bound
      declares (`T::missing()` in a generic function that is instantiated)
      is refused with a diagnostic where it is written,** not left for
