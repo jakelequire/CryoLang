@@ -3727,7 +3727,7 @@ async function drain(mut q: Queue) -> i64 {
 }
 ```
 
-`await` is only legal inside an `async` function or method. Using it elsewhere is an error.
+`await` is only legal inside an `async` function or method. Using it elsewhere - an ordinary function or method, a global's initializer, or a lambda's body, which is a function of its own even when the lambda is written in an `async` body - is an error at the `await` (`E0600`).
 
 ### 19.3 The `Future` Trait
 
