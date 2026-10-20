@@ -26,10 +26,11 @@ import compiler::diag::diagnostic;
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::ast;
 import compiler::ast::{
-    GenericAnnotation, ImportStyle, NamedAnnotation, PatternBinding, ProjectionAnnotation,
+    GenericAnnotation, ImportStyle, NamedAnnotation, ObjectAnnotation, PatternBinding, ProjectionAnnotation,
     TraitBound, TraitRef, TypeAnnotation, Visibility, declaration, expression, node,
     pattern, statement
 };
+import compiler::ast::node_locator::{ annotation_span };
 import compiler::passes::pass_id;
 import compiler::passes::pass_id::{ PassResult };
 import compiler::compilation_context;
@@ -1864,6 +1865,12 @@ type struct NameResolver {
                 this.stamp_annotation_tree(r.inner);
                 this.refuse_trait_type(r.inner, r.span, "&", "", "a reference to a trait");
             }
+            // The trait under `virtual` is the one place a trait is written
+            // as part of a value's type; anything else there is refused.
+            TypeAnnotation::Object(o)      => {
+                this.stamp_annotation_tree(o.trait_annotation);
+                this.refuse_object_of_non_trait(o);
+            }
             TypeAnnotation::Array(a)       => {
                 this.stamp_annotation(a.element);
                 // `[T; N]`'s size is the one EXPRESSION hanging off an
@@ -2164,32 +2171,10 @@ type struct NameResolver {
     refuse_trait_type(&this, ann: TypeAnnotation*, span: SourceSpan, before: string, after: string,
                       label: string) -> void {
         if (ann == null) { return; }
-        mut named: NamedAnnotation* = null;
         mut generic: boolean = false;
-        mut at: SourceSpan = span;
-        match (*ann) {
-            TypeAnnotation::Named(n)   => { named = n; if (!at.has_location()) { at = n.span; } }
-            TypeAnnotation::Generic(g) => {
-                match (*g.base) {
-                    TypeAnnotation::Named(bn) => { named = bn; generic = true; }
-                    _                         => { }
-                }
-                if (!at.has_location()) { at = g.span; }
-            }
-            _ => { }
-        }
-        if (named == null) { return; }
-        mut trait_def: DefId = DefId::invalid();
-        match (named.res) {
-            ResSlot::Answered(r) => {
-                match (r) {
-                    Res::Def(d) => { trait_def = d; }
-                    _           => { }
-                }
-            }
-            _ => { }
-        }
-        if (!trait_def.is_valid() || this.ctx.generic_registry.get_trait_decl(trait_def) == null) { return; }
+        const named: NamedAnnotation* = NameResolver::spelled_name(ann, &generic);
+        if (named == null || !this.trait_named(named).is_valid()) { return; }
+        const at: SourceSpan = if (span.has_location()) { span } else { annotation_span(ann) };
         named.res = ResSlot::Answered(Res::Err);
         const name: string = this.resolver.intern_table.resolve(named.name);
         const shown: string = if (generic) { fmt::format("%s<...>", name) } else { name };
@@ -2202,10 +2187,85 @@ type struct NameResolver {
         const param: string = if (written == shown) { "T" } else { "&T" };
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0313_TRAIT_AS_TYPE, message);
         d = d.at_with_label(at, label);
-        d = d.with_note(fmt::format("a trait object is not supported yet; it will be written `virtual &%s` or `virtual %s*`",
+        d = d.with_note(fmt::format("a trait object is written `virtual &%s` or `virtual %s*`",
             shown, shown));
         d = d.help(fmt::format("to accept any type that implements `%s`, use a bounded type parameter: `function f<T>(p: %s) where T: %s`",
             name, param, shown));
+        this.ctx.emit_diagnostic(d);
+    }
+
+    /// The name a type spelling is written with - `Shape`, or the base of
+    /// `Conv<i64>`, in which case `out_generic` is set - or null for any
+    /// other shape.
+    static spelled_name(ann: TypeAnnotation*, out_generic: boolean*) -> NamedAnnotation* {
+        *out_generic = false;
+        if (ann == null) { return null; }
+        return match (*ann) {
+            TypeAnnotation::Named(n)   => { n }
+            TypeAnnotation::Generic(g) => {
+                *out_generic = true;
+                match (*g.base) {
+                    TypeAnnotation::Named(bn) => { bn }
+                    _                         => { null }
+                }
+            }
+            _ => { null }
+        };
+    }
+
+    /// The trait `named` names, as the name layer answered it; invalid when
+    /// it names anything else, or nothing.
+    trait_named(&this, named: NamedAnnotation*) -> DefId {
+        mut def: DefId = DefId::invalid();
+        match (named.res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Def(d) => { def = d; }
+                    _           => { }
+                }
+            }
+            _ => { }
+        }
+        if (!def.is_valid() || this.ctx.generic_registry.get_trait_decl(def) == null) { return DefId::invalid(); }
+        return def;
+    }
+
+    /// E0316 at an object type whose `virtual` is written on something that
+    /// is not a trait (`virtual &i32`, `virtual &Point` for a struct): only
+    /// a trait has a table of methods to reach a value through.  A name the
+    /// layer refused was reported where it is written, and is not reported
+    /// again here.
+    refuse_object_of_non_trait(&this, o: ObjectAnnotation*) -> void {
+        mut generic: boolean = false;
+        const named: NamedAnnotation* = NameResolver::spelled_name(o.trait_annotation, &generic);
+        if (named != null) {
+            if (this.trait_named(named).is_valid()) { return; }
+            if (TypeAnnotation::refused(o.trait_annotation)) { return; }
+        }
+        o.refused = true;
+        const written: string = TypeAnnotation::spell(o.trait_annotation, this.resolver.intern_table);
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0316_VIRTUAL_MISUSE,
+            fmt::format("`%s` is not a trait, so `%s` is not a trait object", written, o.form.spell(written)));
+        d = d.at_with_label(o.span, "not a trait");
+        this.ctx.emit_diagnostic(d);
+    }
+
+    /// E0316 at a trait object in an `extern` function's signature: the C
+    /// side of the call has no table to call through, and the object's two
+    /// words are no C type.
+    refuse_object_in_extern(&this, func: FunctionDecl*) -> void {
+        if (func == null) { return; }
+        mut found: ObjectAnnotation* = TypeAnnotation::object_in(func.return_type_annotation);
+        for (mut i: i64 = 0; i < func.parameters.length && found == null; i++) {
+            found = TypeAnnotation::object_in(DeclarationNode::var_of(func.parameters[i]).type_annotation);
+        }
+        if (found == null || found.refused) { return; }
+        found.refused = true;
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0316_VIRTUAL_MISUSE,
+            fmt::format("`%s` is a trait object, which an `extern` function `%s` cannot take or return",
+                found.form.spell(TypeAnnotation::spell(found.trait_annotation, this.resolver.intern_table)),
+                this.resolver.intern_table.resolve(func.name)));
+        d = d.at_with_label(found.span, "a trait object in an `extern` signature");
         this.ctx.emit_diagnostic(d);
     }
 
@@ -3344,6 +3404,7 @@ implement trait Walk for struct NameResolver {
         // Already forward-declared functions; visit bodies if any.
         for (mut i: i64 = 0; i < node.functions.length; i++) {
             this.walk_decl(node.functions[i]);
+            this.refuse_object_in_extern(DeclarationNode::fn_of(node.functions[i]));
         }
     }
 

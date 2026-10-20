@@ -183,6 +183,9 @@ type enum TypeAnnotation {
     /// is known (during type resolution / monomorphization). See
     /// ProjectionAnnotation.
     Projection(ProjectionAnnotation*);
+    /// A trait object type: `virtual &Trait`, `virtual mut &Trait` or
+    /// `virtual Trait*`.  See ObjectAnnotation.
+    Object(ObjectAnnotation*);
 }
 
 
@@ -270,8 +273,40 @@ implement enum TypeAnnotation {
                 hit
             }
             TypeAnnotation::Projection(pj) => { pj.refused || TypeAnnotation::refused(pj.base) }
+            TypeAnnotation::Object(o)      => { o.refused || TypeAnnotation::refused(o.trait_annotation) }
             _ => { false }
         };
+    }
+
+    /// The first trait object written anywhere in `ann` - itself, or inside
+    /// a pointer, reference, array, tuple, function type or type argument -
+    /// or null when it holds none.
+    static object_in(ann: TypeAnnotation*) -> ObjectAnnotation* {
+        if (ann == null) { return null; }
+        return match (*ann) {
+            TypeAnnotation::Object(o)    => { o }
+            TypeAnnotation::Pointer(p)   => { TypeAnnotation::object_in(p.inner) }
+            TypeAnnotation::Reference(r) => { TypeAnnotation::object_in(r.inner) }
+            TypeAnnotation::Array(a)     => { TypeAnnotation::object_in(a.element) }
+            TypeAnnotation::Tuple(t)     => { TypeAnnotation::first_object_in(&t.elements) }
+            TypeAnnotation::Function(f)  => {
+                const in_params: ObjectAnnotation* = TypeAnnotation::first_object_in(&f.parameters);
+                const found: ObjectAnnotation* = if (in_params != null) { in_params } else {
+                    TypeAnnotation::object_in(f.return_type) };
+                found
+            }
+            TypeAnnotation::Generic(g)   => { TypeAnnotation::first_object_in(&g.args) }
+            _ => { null }
+        };
+    }
+
+    /// The first trait object written in any of `anns`, or null.
+    static first_object_in(anns: &[TypeAnnotation*]) -> ObjectAnnotation* {
+        for (mut i: i64 = 0; i < anns.length; i++) {
+            const o: ObjectAnnotation* = TypeAnnotation::object_in(anns[i]);
+            if (o != null) { return o; }
+        }
+        return null;
     }
 
     /// The source spelling of an annotation, for a diagnostic that proposes
@@ -297,6 +332,7 @@ implement enum TypeAnnotation {
                 }
                 out + ">"
             }
+            TypeAnnotation::Object(o)     => { o.form.spell(TypeAnnotation::spell(o.trait_annotation, intern)) }
             _ => { ".." }
         };
     }
@@ -332,6 +368,15 @@ implement enum TypeAnnotation {
                     span:       ref.span,
                 };
                 new TypeAnnotation::Reference(r)
+            }
+            TypeAnnotation::Object(obj) => {
+                const o: ObjectAnnotation* = new ObjectAnnotation {
+                    trait_annotation: TypeAnnotation::clone_ptr(obj.trait_annotation),
+                    form:             obj.form,
+                    span:             obj.span,
+                    refused:          obj.refused,
+                };
+                new TypeAnnotation::Object(o)
             }
             TypeAnnotation::Array(arr) => {
                 const a: ArrayAnnotation* = new ArrayAnnotation {
@@ -513,6 +558,46 @@ type struct ReferenceAnnotation {
     inner:      TypeAnnotation*;
     is_mutable: boolean;
     span:       SourceSpan;
+}
+
+/// How a trait object holds the value behind it: `virtual &T` borrows it,
+/// `virtual mut &T` borrows it mutably, `virtual T*` points at it.
+type enum ObjectForm {
+    Borrowed;
+    MutableBorrowed;
+    Raw;
+}
+
+implement enum ObjectForm {
+    /// The form written around a trait's spelling `inner`.
+    spell(&this, inner: string) -> string {
+        return match (this) {
+            ObjectForm::Borrowed        => { fmt::format("virtual &%s", inner) }
+            ObjectForm::MutableBorrowed => { fmt::format("virtual mut &%s", inner) }
+            ObjectForm::Raw             => { fmt::format("virtual %s*", inner) }
+        };
+    }
+
+    /// The form's position, for an interning key.
+    index(&this) -> u64 {
+        return match (this) {
+            ObjectForm::Borrowed        => { 0 }
+            ObjectForm::MutableBorrowed => { 1 }
+            ObjectForm::Raw             => { 2 }
+        };
+    }
+}
+
+/// A trait object type, `virtual &Shape`: a value of any type implementing
+/// `trait_annotation`'s trait, reached through a table of its methods.
+/// `trait_annotation` is the trait's spelling, with its arguments.
+type struct ObjectAnnotation {
+    trait_annotation: TypeAnnotation*;
+    form:             ObjectForm;
+    span:             SourceSpan;
+    /// Set by the name layer when it refuses the object where it is
+    /// written (E0316), so nothing after reports it again.
+    refused:          boolean;
 }
 
 type struct ArrayAnnotation {

@@ -37,8 +37,9 @@ import compiler::resolver::decl_name::{ DeclName };
 import compiler::resolver::symbol_id::{ SymbolID, SymbolKey };
 import compiler::resolver::res::{ DefId };
 import compiler::types::compound::{
-    ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
+    ArrayType, FunctionType, ObjectType, OptionalType, PointerType, ReferenceType, TupleType
 };
+import compiler::ast::{ ObjectForm };
 import compiler::types::generic::{
     AssocProjectionType, GenericParamType, InstantiatedType
 };
@@ -460,6 +461,23 @@ public:
 
         const ref: TypeRef = this.alloc_type(TypeData::Reference(ReferenceType::new(referent, mutability)));
         this.intern_record(TypeKind::Reference, aux, 0, &ops, ref);
+        return ref;
+    }
+
+    /// Get or create the trait object type of the trait `trait_type` (whose
+    /// definition is `trait_def`) bound by `args`, in `form`.
+    get_object(mut &this, trait_def: DefId, trait_type: TypeRef, args: [TypeRef], form: ObjectForm) -> TypeRef {
+        mut ops: [TypeRef] = [trait_type];
+        for (mut i: i64 = 0; i < args.length; i++) {
+            ops.push(args[i]);
+        }
+        const aux: u64 = form.index();
+
+        const hit: TypeRef = this.intern_find(TypeKind::Object, aux, 0, &ops);
+        if (hit.is_valid()) { return hit; }
+
+        const ref: TypeRef = this.alloc_type(TypeData::Object(ObjectType::new(trait_def, trait_type, args, form)));
+        this.intern_record(TypeKind::Object, aux, 0, &ops, ref);
         return ref;
     }
 
@@ -930,6 +948,10 @@ public:
                 const inst: InstantiatedType* = t.as_instantiated();
                 for (mut i: i64 = 0; i < inst.type_args.length; i++) { this.generic_params_in(inst.type_args[i], out); }
             }
+            TypeKind::Object => {
+                const obj: ObjectType* = t.as_object();
+                for (mut i: i64 = 0; i < obj.args.length; i++) { this.generic_params_in(obj.args[i], out); }
+            }
             _ => {}
         }
     }
@@ -988,6 +1010,13 @@ public:
             const inst: InstantiatedType* = t.as_instantiated();
             for (mut i: i64 = 0; i < inst.type_args.length; i++) {
                 if (this.contains_generic_param(inst.type_args[i])) { return true; }
+            }
+            return false;
+        }
+        if (t.kind == TypeKind::Object) {
+            const obj: ObjectType* = t.as_object();
+            for (mut i: i64 = 0; i < obj.args.length; i++) {
+                if (this.contains_generic_param(obj.args[i])) { return true; }
             }
             return false;
         }
@@ -1140,6 +1169,7 @@ public:
                 const o: OptionalType* = ty.as_optional();
                 return this.resolve_display_name(o.wrapped) + "?";
             }
+            TypeKind::Object => { return this.object_spelled(ty.as_object(), false); }
             TypeKind::Function => {
                 const f: FunctionType* = ty.as_function();
                 mut result: string = "(";
@@ -1258,6 +1288,23 @@ public:
         return this.format_display_short(t);
     }
 
+    /// A trait object's spelling, `virtual &Conv<i64>`, its names qualified
+    /// unless `short`.
+    object_spelled(&this, obj: ObjectType*, short: boolean) -> string {
+        mut inner: string = if (short) { this.resolve_display_name_short(obj.trait_type) } else {
+            this.resolve_display_name(obj.trait_type) };
+        if (obj.args.length > 0) {
+            inner += "<";
+            for (mut i: i64 = 0; i < obj.args.length; i++) {
+                if (i > 0) { inner += ", "; }
+                inner += if (short) { this.resolve_display_name_short(obj.args[i]) } else {
+                    this.resolve_display_name(obj.args[i]) };
+            }
+            inner += ">";
+        }
+        return obj.form.spell(inner);
+    }
+
     format_display_short(&this, ty: Type*) -> string {
         if (ty == null) { return "?"; }
 
@@ -1281,6 +1328,7 @@ public:
                 const o: OptionalType* = ty.as_optional();
                 return this.resolve_display_name_short(o.wrapped) + "?";
             }
+            TypeKind::Object => { return this.object_spelled(ty.as_object(), true); }
             TypeKind::Function => {
                 const f: FunctionType* = ty.as_function();
                 mut result: string = "(";

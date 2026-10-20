@@ -225,6 +225,9 @@ with `s` (`i16`). Additional rules:
 | Optional `T?`        | `N$L8Optional$L` T `$G$G`               | `int?` -> `N$L8Optional$Li$G$G`   |
 | Tuple `(T0, T1, ...)`  | `N$L5Tuple$L` T0 `_` T1 ... `$G$G`        | `(i32, i32)` -> `N$L5Tuple$Li_i$G$G` |
 | Function `fn(...)->R`  | `F$L` params `$G` R                     | `fn(int,int)->int` -> `F$Li_i$Gi` |
+| Trait object `virtual &Tr<A>` | `N$L10VirtualRef$L` Tr `_` A ... `$G$G` | `virtual &Shape` -> `N$L10VirtualRef$LN$L5Shape$G$G$G` |
+| Trait object `virtual mut &Tr` | `N$L13VirtualMutRef$L` Tr ... `$G$G` | `virtual mut &Shape` -> `N$L13VirtualMutRef$LN$L5Shape$G$G$G` |
+| Trait object `virtual Tr*` | `N$L10VirtualPtr$L` Tr ... `$G$G`      | `virtual Shape*` -> `N$L10VirtualPtr$LN$L5Shape$G$G$G` |
 
 Notes:
 
@@ -237,6 +240,9 @@ Notes:
   outer length first: `[[u64; 2]; 3]` -> `A$L3$GA$L2$Gm`.
 - `Optional` and tuples are encoded as named generics over the reserved names
   `Optional` and `Tuple`, so distinct element shapes never share a symbol.
+  A trait object is encoded the same way, over one reserved name per form,
+  whose first argument is the trait and the rest the trait's arguments in
+  the order the object writes them.
 - A generic parameter that survives to mangling (a resolution leak) is encoded as a
   named type over its parameter name, making the leak visible in IR rather than
   silently colliding.

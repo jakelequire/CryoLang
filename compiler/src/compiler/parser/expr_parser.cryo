@@ -19,7 +19,8 @@ import compiler::diag::source_span::{ SourceSpan };
 import compiler::ast;
 import compiler::ast::{
     ArrayAnnotation, declaration, expression, FunctionAnnotation, GenericAnnotation,
-    ImplTraitAnnotation, LiteralKind, MemberPin, NamedAnnotation, node, pattern,
+    ImplTraitAnnotation, LiteralKind, MemberPin, NamedAnnotation, node, ObjectAnnotation,
+    ObjectForm, pattern,
     PatternBinding, PatternElement, PatternLiteralFloat, PatternLiteralInt,
     PatternSub, PatternWildcard, PointerAnnotation, PrimitiveAnnotation,
     ProjectionAnnotation, ReferenceAnnotation, statement, ThisTypeAnnotation,
@@ -2786,6 +2787,13 @@ implement struct Parser {
             return this.parse_impl_trait_type();
         }
 
+        // `virtual &Trait`, `virtual mut &Trait`, `virtual Trait*`: a trait
+        // object.  The suffixes after it apply to the object: `virtual
+        // Shape*?` is an optional object pointer.
+        if (this.check(TokenType::KwVirtual)) {
+            return this.parse_object_type();
+        }
+
         // `const T*` FFI pointer-to-const. The `const` qualifies the pointee,
         // so it binds to the first pointer suffix (`parse_type_suffixes`
         // consumes the pending flag for the nearest `*`). A `const` with no
@@ -2803,6 +2811,33 @@ implement struct Parser {
         const base: TypeAnnotation* = this.parse_base_type();
         if (base == null) { return null; }
         return this.parse_type_suffixes(base, base_tok);
+    }
+
+    /// Parse a trait object type after its `virtual`: `&Trait`, `mut
+    /// &Trait`, or `Trait*`, the trait a base type with its arguments.
+    parse_object_type() -> TypeAnnotation* {
+        const start: Token = this.advance(); // consume `virtual`
+        mut form: ObjectForm = ObjectForm::Raw;
+        if (this.check(TokenType::KwMut) && this.peek_at(1).kind == TokenType::Amp) {
+            this.advance();
+            this.advance();
+            form = ObjectForm::MutableBorrowed;
+        } else if (this.match_tok(TokenType::Amp)) {
+            form = ObjectForm::Borrowed;
+        }
+        const trait_annotation: TypeAnnotation* = this.parse_base_type();
+        if (trait_annotation == null) { return null; }
+        match (form) {
+            ObjectForm::Raw => { this.consume(TokenType::Star, "'*'"); }
+            _               => { }
+        }
+        const object: ObjectAnnotation* = new ObjectAnnotation {
+            trait_annotation: trait_annotation,
+            form:             form,
+            span:             this.span_from(start),
+            refused:          false,
+        };
+        return this.parse_type_suffixes(new TypeAnnotation::Object(object), start);
     }
 
     /// Parse `implement Trait + Trait2 + ...`. Each bound is a base type

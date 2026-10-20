@@ -20,7 +20,7 @@ import compiler::types::{
 import compiler::ast;
 import compiler::ast::{
     ArrayAnnotation, declaration, expression, FunctionAnnotation, GenericAnnotation,
-    ImplTraitAnnotation, NamedAnnotation, node, ProjectionAnnotation, statement,
+    ImplTraitAnnotation, NamedAnnotation, node, ObjectAnnotation, ProjectionAnnotation, statement,
     TraitBound, TraitRef, TupleAnnotation, TypeAnnotation
 };
 import compiler::resolver::{ symbol_str, intern_table, resolver };
@@ -297,6 +297,31 @@ type struct TypeResolver {
         return 0;
     }
 
+    /// The trait object type `o` spells: the trait the name layer placed
+    /// under `virtual`, with its written arguments resolved.  Invalid when
+    /// the name layer refused it or placed no trait there (it has reported
+    /// that where it is written), or when an argument does not resolve.
+    resolve_object(&this, o: ObjectAnnotation*, ctx: ResolutionContext*) -> TypeRef {
+        if (o.refused || this.decl_index == null || this.generic_registry == null) { return TypeRef::invalid(); }
+        if (TypeAnnotation::refused(o.trait_annotation)) { return TypeRef::invalid(); }
+        const trait_def: DefId = TypeAnnotation::trait_def(o.trait_annotation);
+        if (!trait_def.is_valid() || this.generic_registry.get_trait_decl(trait_def) == null) { return TypeRef::invalid(); }
+        const trait_type: TypeRef = this.decl_index.type_of_def(trait_def);
+        if (!trait_type.is_valid()) { return TypeRef::invalid(); }
+        mut args: [TypeRef] = [];
+        match (*o.trait_annotation) {
+            TypeAnnotation::Generic(g) => {
+                for (mut i: i64 = 0; i < g.args.length; i++) {
+                    const arg: TypeRef = this.resolve(g.args[i], ctx);
+                    if (!arg.is_valid()) { return TypeRef::invalid(); }
+                    args.push(arg);
+                }
+            }
+            _ => { }
+        }
+        return this.arena.get_object(trait_def, trait_type, args, o.form);
+    }
+
     /// Resolve a TypeAnnotation to a TypeRef.
     resolve(&this, ann: TypeAnnotation*, ctx: ResolutionContext*) -> TypeRef {
         if (ann == null) {
@@ -337,6 +362,9 @@ type struct TypeResolver {
                     mutability = RefMutability::Mutable;
                 }
                 return this.arena.get_reference_to(inner, mutability);
+            }
+            TypeAnnotation::Object(o) => {
+                return this.resolve_object(o, ctx);
             }
             TypeAnnotation::Array(a) => {
                 mut elem: TypeRef = this.resolve(a.element, ctx);

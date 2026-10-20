@@ -68,9 +68,15 @@ type struct SignaturePlan {
 
 Driven by the aggregate's `size_bytes()` after unwrapping `TypeAlias`
 and `InstantiatedType` to the concrete kind. Aggregate kinds are
-`Struct`, `Enum`, `Tuple`, and `Optional`. Primitive scalars
+`Struct`, `Enum`, `Tuple`, `Optional` and `Object`. Primitive scalars
 (`Int`, `Float`, `Pointer`, `Reference`, ...) and `Array`/`String`/etc.
 are always Direct.
+
+A trait object (`Object`, every form) lowers to `{ ptr, ptr }`: the
+value's address, then its table's.  It is a 16-byte aggregate of two
+INTEGER eightbytes, so on SysV it travels as a `DirectPair` in two GP
+registers, and on Win64 (above 8 bytes) indirectly, through a pointer to
+a caller-made copy.
 
 ### Returns
 

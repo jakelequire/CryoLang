@@ -1685,7 +1685,7 @@ type struct SemaVisitor {
                 TypeRef::invalid()
             }
             ExprKind::Delete(d) => {
-                this.resolve_expr(d.operand);
+                this.refuse_delete_of_object(d.operand, this.resolve_expr(d.operand));
                 this.arena.get_void()
             }
             // A `yield` has no type: codegen refuses it.
@@ -2784,6 +2784,19 @@ type struct SemaVisitor {
     /// resolved later in the walk) is left to that walk.
     refuse_unresolved_body_annotation(&this, ann: TypeAnnotation*) -> void {
         TypeAnnotation::refused(ann);
+    }
+
+    /// E0200 at `delete` of a trait object: what the object points at has a
+    /// size and a destructor only its table knows, and the table holds
+    /// neither yet.
+    refuse_delete_of_object(&this, operand: ExpressionNode*, operand_type: TypeRef) -> void {
+        const t: Type* = this.arena.lookup(operand_type);
+        if (t == null || t.kind != TypeKind::Object) { return; }
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0200_TYPE_MISMATCH,
+            fmt::format("`delete` takes a pointer, and `%s` is a trait object", this.arena.format_display(t)));
+        d = d.at(operand.span);
+        d = d.with_note("a trait object's value has a size and a destructor that are not known where the object is used");
+        this.ctx.emit_diagnostic(d);
     }
 
     resolve_cast(mut &this, e: ExpressionNode*, cast: CastExpr*) -> TypeRef {
@@ -4183,6 +4196,7 @@ type struct SemaVisitor {
             }
             TypeAnnotation::Pointer(p)   => { this.prime_typeof_annotation(p.inner); }
             TypeAnnotation::Reference(r) => { this.prime_typeof_annotation(r.inner); }
+            TypeAnnotation::Object(o)    => { this.prime_typeof_annotation(o.trait_annotation); }
             TypeAnnotation::Array(a)     => { this.prime_typeof_annotation(a.element); }
             TypeAnnotation::Generic(g)   => {
                 for (mut i: i64 = 0; i < g.args.length; i++) { this.prime_typeof_annotation(g.args[i]); }

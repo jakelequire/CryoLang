@@ -1866,15 +1866,23 @@ type trait Ord : Eq {
 }
 ```
 
-A trait is not a type. Written where a value's type goes - `p: Shape`, a return type, a field, a local, a type argument, an alias's target - it is refused where it is written (`E0313`). A pointer or reference to one - a trait object - is not supported yet, and `&Shape` or `Shape*` with `Shape` a trait is refused the same way. Code that accepts any type implementing a trait takes a bounded type parameter instead ([section 11.3](#113-trait-bounds-with-where)):
+A trait is not a type. Written where a value's type goes - `p: Shape`, a return type, a field, a local, a type argument, an alias's target - it is refused where it is written (`E0313`), and so are `&Shape` and `Shape*` with `Shape` a trait. Code that accepts any type implementing a trait takes a bounded type parameter instead ([section 11.3](#113-trait-bounds-with-where)), or a trait object (below):
 
 ```cryo
 function area_of(p: Shape) -> i32 { ... }                      // error[E0313]: `Shape` is a trait, not a type
 function area_of(p: &Shape) -> i32 { ... }                     // error[E0313]: `Shape` is a trait, so `&Shape` is not a type
 function area_of<T>(p: &T) -> i32 where T: Shape { ... }       // ok: one copy per implementing type
+function area_of(p: virtual &Shape) -> i32 { ... }             // a trait object: one copy for every type
 ```
 
 `&This` inside a trait names the implementing type and is not a trait object.
+
+**Trait objects.** `virtual &Shape`, `virtual mut &Shape` and `virtual Shape*` are trait objects: a value of any type implementing `Shape`, held with a table of that type's methods for the trait. The three forms borrow the value, borrow it mutably, or point at it. A trait object is a type of its own, not a reference or a pointer: it is two words, the value's address and its table's, 16 bytes at 8-byte alignment in every form, and it is copied as a reference is, owning nothing. The trait's arguments are written after its name, `virtual &Conv<i64>`, and the suffixes after an object apply to it: `virtual Shape*?` is an optional object pointer, `[virtual &Shape]` an array of objects.
+
+- `virtual` written on anything but a trait - a struct, a primitive, a type parameter - is refused (`E0316`), and so is a trait object anywhere in an `extern` function's signature, whose C side has no table to call through (`E0316`).
+- A trait object has no fields: `s.width` is refused (`E0204`), whatever the value behind it holds.
+- `delete` of a trait object is refused (`E0200`): the size and destructor of the value behind it are not known where the object is used.
+- Converting a value to an object, calling a method through one, and comparing an object pointer with `null` are not supported yet: `&c` where a `virtual &Shape` is expected is a type mismatch (`E0200`), a call through an object is refused (`E0358`), and an object compares with nothing (`E0229`).
 
 ### 11.2 Implementing a Trait
 
