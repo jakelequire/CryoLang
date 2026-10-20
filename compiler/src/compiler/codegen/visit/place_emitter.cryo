@@ -442,6 +442,16 @@ type struct PlaceEmitter {
         // compile-time constant, so an in-range constant index folds away
         // under O2).
         const arr_ty: LType = this.cg.type_mapper.map_type(array_type);
+        // An array held as a value (`pair()[1]`, a call's result) has no
+        // address to index from; it is stored to a temporary first, and the
+        // element is read from there.
+        mut arr_ptr: LValue = array_val;
+        const val_llvm: void* = llvm::LLVMTypeOf(array_val.raw);
+        if (val_llvm != null && LType::kind_of(val_llvm) == LTypeKind::Array) {
+            const cur_fn: LValue = this.cg.builder.get_insert_block().get_parent();
+            arr_ptr = this.cg.flow.create_entry_alloca(cur_fn, "arrval", arr_ty);
+            this.cg.builder.build_store(array_val, arr_ptr);
+        }
         const fx_len: LValue = LType::const_int(LType::i64(), arr.size as u64, false);
         this.emit_bounds_check(index_val, fx_len, visitor, idx_sched, site_span);
         // Build indices: [0, index]
@@ -450,7 +460,7 @@ type struct PlaceEmitter {
         const slots: void** = buf as void**;
         slots[0] = zero.raw;
         slots[1] = index_val.raw;
-        const gep: LValue = this.cg.builder.build_gep(arr_ty, array_val, buf, 2, "elemptr");
+        const gep: LValue = this.cg.builder.build_gep(arr_ty, arr_ptr, buf, 2, "elemptr");
         libc::free(buf);
         out.value = gep;
         out.is_lvalue = true;
