@@ -62,7 +62,7 @@ import compiler::ast::declaration::{
     VarDecl
 };
 import compiler::ast::expression::{
-    ArrayAccessExpr, ArrayExpr, AwaitExpr, BinaryExpr, CallExprNode,
+    ArrayAccessExpr, ArrayExpr, AwaitExpr, BinaryExpr, CallExpr,
     CastExpr, DeleteExpr, ExpressionNode, FieldInit, IdentifierExpr, IfExpr,
     LambdaExpr, MatchExpr, MemberAccessExpr, NewExpr,
     ScopeResolutionExpr, StaticMatchExpr, StructExpr, TernaryExpr,
@@ -949,11 +949,11 @@ type struct AsyncLower {
         mut scope: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(scope_e);
         scope.set_synthesized_ref(scope_e, ty, this.ctx.decl_index.def_of(ty, this.ctx.type_arena));
         scope.set_resolved_member(this.variant_pin(ty, scope.member_name, span));
-        mut call: CallExprNode* = new CallExprNode(scope_e, span);
+        mut call: ExpressionNode* = ExpressionNode::call_expr(scope_e, span);
         if (value != null) { value.arg_binding = ArgBinding::ByValue; }
-        call.add_argument(value);
+        ExpressionNode::call_of(call).add_argument(value);
         call.set_resolved_type(ty);
-        return call as ExpressionNode*;
+        return call;
     }
 
     /// The variant `leaf` of the enum `ty` instantiates, as the pin a
@@ -1072,7 +1072,6 @@ type struct AsyncLower {
     /// reach a `match` expression nested within it.
     rewrite_returns_expr(mut &this, e: ExpressionNode*, poll_out: TypeRef, span: SourceSpan) -> void {
         if (e == null) { return; }
-        const k: NodeKind = (e as ASTNode*).kind;
         const rr_try: TryExpr* = ExpressionNode::try_of(e);
         if (rr_try != null) {
             this.rewrite_returns_expr(rr_try.live(), poll_out, span);
@@ -1100,8 +1099,8 @@ type struct AsyncLower {
             this.rewrite_returns_expr(rr_un.operand, poll_out, span);
             return;
         }
-        if (k == NodeKind::CallExpression) {
-            const c: CallExprNode* = e as CallExprNode*;
+        if (ExpressionNode::call_of(e) != null) {
+            const c: CallExpr* = ExpressionNode::call_of(e);
             this.rewrite_returns_expr(c.callee, poll_out, span);
             for (mut i: i64 = 0; i < c.arguments.length; i++) {
                 this.rewrite_returns_expr(c.arguments[i], poll_out, span);
@@ -1166,7 +1165,6 @@ type struct AsyncLower {
     /// imperfect count degrades only the diagnostic, never soundness.
     expr_await_count(&this, e: ExpressionNode*) -> i64 {
         if (e == null) { return 0; }
-        const k: NodeKind = (e as ASTNode*).kind;
         const count_aw: AwaitExpr* = ExpressionNode::await_of(e);
         if (count_aw != null) {
             return 1 + this.expr_await_count(count_aw.operand);
@@ -1183,8 +1181,8 @@ type struct AsyncLower {
         if (count_un != null) {
             return this.expr_await_count(count_un.operand);
         }
-        if (k == NodeKind::CallExpression) {
-            const c: CallExprNode* = e as CallExprNode*;
+        if (ExpressionNode::call_of(e) != null) {
+            const c: CallExpr* = ExpressionNode::call_of(e);
             mut n: i64 = this.expr_await_count(c.callee);
             for (mut i: i64 = 0; i < c.arguments.length; i++) {
                 n += this.expr_await_count(c.arguments[i]);
@@ -1516,18 +1514,18 @@ type struct AsyncLower {
 
     /// `<recv>.<item>()` typed `ret_ty`: a call of the method language item
     /// `item`, which names its method by definition
-    /// (`CallExprNode.named_method`) and is bound to the receiver's own
+    /// (`CallExpr.named_method`) and is bound to the receiver's own
     /// method by that identity, on the receiver's type as built here
     /// (`template_recv`).  The member is the method's leaf, for printing the
     /// tree only.
     method_call0(&this, recv: ExpressionNode*, item: LangItem, ret_ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
         const d: DefId = this.method_item(item, span);
         mut m: ExpressionNode* = ExpressionNode::member_access_expr(recv, this.ctx.defs.leaf_of(d).spelling(), span, span);
-        mut c: CallExprNode* = new CallExprNode(m, span);
-        c.named_method = d;
-        c.template_recv = recv.resolved_type;
+        mut c: ExpressionNode* = ExpressionNode::call_expr(m, span);
+        ExpressionNode::call_of(c).named_method = d;
+        ExpressionNode::call_of(c).template_recv = recv.resolved_type;
         c.set_resolved_type(ret_ty);
-        return c as ExpressionNode*;
+        return c;
     }
 
     /// `<recv>.<item>(<arg>)`; see `method_call0`.
@@ -1535,12 +1533,12 @@ type struct AsyncLower {
                  ret_ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
         const d: DefId = this.method_item(item, span);
         mut m: ExpressionNode* = ExpressionNode::member_access_expr(recv, this.ctx.defs.leaf_of(d).spelling(), span, span);
-        mut c: CallExprNode* = new CallExprNode(m, span);
-        c.named_method = d;
-        c.template_recv = recv.resolved_type;
-        c.add_argument(arg);
+        mut c: ExpressionNode* = ExpressionNode::call_expr(m, span);
+        ExpressionNode::call_of(c).named_method = d;
+        ExpressionNode::call_of(c).template_recv = recv.resolved_type;
+        ExpressionNode::call_of(c).add_argument(arg);
         c.set_resolved_type(ret_ty);
-        return c as ExpressionNode*;
+        return c;
     }
 
     /// The method the language item `item` names.  An item no declaration
@@ -1725,7 +1723,6 @@ type struct AsyncLower {
     /// a loud compile error, never a silent miscompile.
     name_read_in_expr(&this, e: ExpressionNode*, key: SymbolID) -> boolean {
         if (e == null) { return false; }
-        const k: NodeKind = (e as ASTNode*).kind;
         if (ExpressionNode::identifier_of(e) != null) {
             return this.names_binding(e, key);
         }
@@ -1737,8 +1734,8 @@ type struct AsyncLower {
         if (read_un != null) {
             return this.name_read_in_expr(read_un.operand, key);
         }
-        if (k == NodeKind::CallExpression) {
-            const c: CallExprNode* = e as CallExprNode*;
+        if (ExpressionNode::call_of(e) != null) {
+            const c: CallExpr* = ExpressionNode::call_of(e);
             if (this.name_read_in_expr(c.callee, key)) { return true; }
             for (mut i: i64 = 0; i < c.arguments.length; i++) {
                 if (this.name_read_in_expr(c.arguments[i], key)) { return true; }
@@ -1991,7 +1988,6 @@ type struct AsyncLower {
                     struct_ref: TypeRef, ty: TypeRef, span: SourceSpan,
                     by_value: boolean) -> ExpressionNode* {
         if (e == null) { return null; }
-        const k: NodeKind = (e as ASTNode*).kind;
         const sub_id: IdentifierExpr* = ExpressionNode::identifier_of(e);
         if (sub_id != null) {
             if (this.names_binding(e, key)) {
@@ -2064,8 +2060,8 @@ type struct AsyncLower {
             subst_un.desugared_call = this.subst_name_expr(subst_un.desugared_call, key, field, struct_ref, ty, span, false);
             return e;
         }
-        if (k == NodeKind::CallExpression) {
-            const c: CallExprNode* = e as CallExprNode*;
+        if (ExpressionNode::call_of(e) != null) {
+            const c: CallExpr* = ExpressionNode::call_of(e);
             // A receiver is reached into; an argument is handed over only when
             // the parameter it binds to takes ownership. `arg_binding` is the
             // authority, and an UNCLASSIFIED slot must read as a borrow here:
@@ -2733,8 +2729,8 @@ type struct AsyncLower {
     /// answer lets them through and drops the refresh, silently either way.
     awaited_keeps_recv_ptr(&this, e: ExpressionNode*, slot_ty: TypeRef) -> boolean {
         if (slot_ty.is_valid()) { return true; }
-        if (e == null || (e as ASTNode*).kind != NodeKind::CallExpression) { return false; }
-        const c: CallExprNode* = e as CallExprNode*;
+        if (e == null || ExpressionNode::call_of((e as ASTNode*)) == null) { return false; }
+        const c: CallExpr* = ExpressionNode::call_of(e);
         if (c.callee == null || ExpressionNode::member_access_of((c.callee as ASTNode*)) == null) {
             return false;
         }
@@ -2793,8 +2789,8 @@ type struct AsyncLower {
         if (this.awaited_keeps_recv_ptr(e, this.awaited_recv_ptr_type(e.resolved_type))) {
             return true;
         }
-        if ((e as ASTNode*).kind != NodeKind::CallExpression) { return false; }
-        const c: CallExprNode* = e as CallExprNode*;
+        if (ExpressionNode::call_of((e as ASTNode*)) == null) { return false; }
+        const c: CallExpr* = ExpressionNode::call_of(e);
         for (mut i: i64 = 0; i < c.arguments.length; i++) {
             if (this.expr_has_recv_call(c.arguments[i])) { return true; }
         }
@@ -2815,7 +2811,7 @@ type struct AsyncLower {
     /// leaving those unanswered is what keeps the caller reporting instead of
     /// addressing a field it cannot vouch for.
 
-    callee_template(&this, c: CallExprNode*) -> TemplateEntry* {
+    callee_template(&this, c: CallExpr*) -> TemplateEntry* {
         if (c.resolved_template.is_valid()) {
             return this.ctx.generic_registry.template_of_type(c.resolved_template);
         }
@@ -2854,9 +2850,9 @@ type struct AsyncLower {
     /// initializer is the bare parameter. A wrapper, a computed value or a
     /// conditional leaves the position unproven, and the caller reports rather
     /// than guessing — guessing here is a silent wrong-address store.
-    ctor_field_for_param(&this, c: CallExprNode*, argi: i64) -> FieldInit {
+    ctor_field_for_param(&this, e: ExpressionNode*, c: CallExpr*, argi: i64) -> FieldInit {
         const none: FieldInit = FieldInit { field_name: SymbolStr::empty(), value: null,
-                                            span: (c as ASTNode*).span, pin: MemberPin::None,
+                                            span: e.span, pin: MemberPin::None,
                                             pin_carried: false };
         const te: TemplateEntry* = this.callee_template(c);
         if (te == null || te.kind != TemplateKind::Function) {
@@ -2916,8 +2912,8 @@ type struct AsyncLower {
     /// implicit in the call ABI. The place itself is therefore what has to be
     /// re-addressed; there is no `&` node to find.
     awaited_recv_place(&this, e: ExpressionNode*) -> ExpressionNode* {
-        if (e == null || (e as ASTNode*).kind != NodeKind::CallExpression) { return null; }
-        const c: CallExprNode* = e as CallExprNode*;
+        if (e == null || ExpressionNode::call_of((e as ASTNode*)) == null) { return null; }
+        const c: CallExpr* = ExpressionNode::call_of(e);
         if (c.callee == null || ExpressionNode::member_access_of((c.callee as ASTNode*)) == null) {
             return null;
         }
@@ -3050,12 +3046,12 @@ type struct AsyncLower {
         // re-address and `base` goes unused.
         if (!this.expr_has_recv_call(e)) { return true; }
 
-        if ((e as ASTNode*).kind == NodeKind::CallExpression) {
-            const c: CallExprNode* = e as CallExprNode*;
+        if (ExpressionNode::call_of((e as ASTNode*)) != null) {
+            const c: CallExpr* = ExpressionNode::call_of(e);
             for (mut i: i64 = 0; i < c.arguments.length; i++) {
                 mut a: ExpressionNode* = c.arguments[i];
                 if (!this.expr_has_recv_call(a)) { continue; }
-                const fld: FieldInit = this.ctor_field_for_param(c, i);
+                const fld: FieldInit = this.ctor_field_for_param(e, c, i);
                 if (!fld.field_name.is_valid()) {
                     this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
                         "async: this `await` hands an `async` method's future to a call that does not put it straight into a field of what it returns, so the receiver the method points at cannot be re-addressed when the future resumes; await the method call directly, or bind its result before combining it",
@@ -4075,7 +4071,6 @@ type struct AsyncLower {
     /// exploded loop escapes the state-dispatch `loop` instead of the user's loop.
     expr_has_free_edge(&this, e: ExpressionNode*, break_only: boolean) -> boolean {
         if (e == null) { return false; }
-        const k: NodeKind = (e as ASTNode*).kind;
         const me: MatchExpr* = ExpressionNode::match_of(e);
         if (me != null) {
             if (this.expr_has_free_edge(me.subject, break_only)) { return true; }
@@ -4093,8 +4088,8 @@ type struct AsyncLower {
         if (edge_un != null) {
             return this.expr_has_free_edge(edge_un.operand, break_only);
         }
-        if (k == NodeKind::CallExpression) {
-            const c: CallExprNode* = e as CallExprNode*;
+        if (ExpressionNode::call_of(e) != null) {
+            const c: CallExpr* = ExpressionNode::call_of(e);
             if (this.expr_has_free_edge(c.callee, break_only)) { return true; }
             for (mut i: i64 = 0; i < c.arguments.length; i++) {
                 if (this.expr_has_free_edge(c.arguments[i], break_only)) { return true; }
@@ -4502,7 +4497,6 @@ type struct AsyncLower {
     mark_last_use_expr(&this, e: ExpressionNode*, key: SymbolID,
                        by_value: boolean, out: i64*) -> void {
         if (e == null) { return; }
-        const k: NodeKind = (e as ASTNode*).kind;
         if (ExpressionNode::identifier_of(e) != null) {
             if (this.names_binding(e, key)) {
                 if (by_value) { *out = 2; } else { *out = 1; }
@@ -4522,8 +4516,8 @@ type struct AsyncLower {
             this.mark_last_use_expr(b.right, key, false, out);
             return;
         }
-        if (k == NodeKind::CallExpression) {
-            const c: CallExprNode* = e as CallExprNode*;
+        if (ExpressionNode::call_of(e) != null) {
+            const c: CallExpr* = ExpressionNode::call_of(e);
             // A receiver is reached into; an argument is handed over only when
             // the parameter it binds to takes ownership, which `arg_binding`
             // records. Reading the position instead classified an argument
@@ -4985,13 +4979,13 @@ type struct AsyncLower {
 
     /// The `Poll::Ready(<value>)` call a completion return carries - the shape
     /// the lowering rewrites every user `return` into - or null.
-    ready_call(&this, s: Stmt*) -> CallExprNode* {
+    ready_call(&this, s: Stmt*) -> CallExpr* {
         const e: ExpressionNode* = this.returned_value(s);
-        if (e == null || (e as ASTNode*).kind != NodeKind::CallExpression) { return null; }
-        const callee: ExpressionNode* = (e as CallExprNode*).callee;
+        if (e == null || ExpressionNode::call_of((e as ASTNode*)) == null) { return null; }
+        const callee: ExpressionNode* = ExpressionNode::call_of(e).callee;
         if (callee == null) { return null; }
         if (!this.is_poll_variant(callee, "Ready")) { return null; }
-        return e as CallExprNode*;
+        return ExpressionNode::call_of(e);
     }
 
     /// `this.<field>.take();` — empty an in-place carrier into a discarded
@@ -5056,7 +5050,7 @@ type struct AsyncLower {
                 mut rebuilt: [Stmt*] = [];
                 for (mut i: i64 = 0; i < blk.statements.length; i++) {
                     const st: Stmt* = blk.statements[i];
-                    mut ready: CallExprNode* = this.ready_call(st);
+                    mut ready: CallExpr* = this.ready_call(st);
                     if (ready == null || ready.arguments.length != 1
                             || ready.arguments[0] == null) {
                         this.release_before_ready(sm, st, fields, opts, span);
@@ -5250,8 +5244,8 @@ type struct AsyncLower {
     /// dynamic array naming its heap block — stops the walk: the pointee does
     /// not move when a poll returns, so `arr.as_ptr()` and `this.conn.pending()`
     /// stay sound and must not be reported.
-    call_frame_addr_root(&this, sm: PollSm*, c: CallExprNode*) -> ExpressionNode* {
-        const rt: TypeRef = (c as ExpressionNode*).resolved_type;
+    call_frame_addr_root(&this, sm: PollSm*, e: ExpressionNode*, c: CallExpr*) -> ExpressionNode* {
+        const rt: TypeRef = e.resolved_type;
         if (!rt.is_valid()) { return null; }
         const t: Type* = this.arena.lookup(rt);
         if (t == null) { return null; }
@@ -5274,7 +5268,6 @@ type struct AsyncLower {
     /// the state that built them.
     frame_addr_root_expr(&this, sm: PollSm*, e: ExpressionNode*) -> ExpressionNode* {
         if (e == null) { return null; }
-        const k: NodeKind = (e as ASTNode*).kind;
         const root_un: UnaryExpr* = ExpressionNode::unary_of(e);
         if (root_un != null) {
             if (root_un.op.kind == TokenType::Amp && !root_un.is_synthetic) {
@@ -5289,9 +5282,9 @@ type struct AsyncLower {
             if (l != null) { return l; }
             return this.frame_addr_root_expr(sm, b.right);
         }
-        if (k == NodeKind::CallExpression) {
-            const c: CallExprNode* = e as CallExprNode*;
-            const cr: ExpressionNode* = this.call_frame_addr_root(sm, c);
+        if (ExpressionNode::call_of(e) != null) {
+            const c: CallExpr* = ExpressionNode::call_of(e);
+            const cr: ExpressionNode* = this.call_frame_addr_root(sm, e, c);
             if (cr != null) { return cr; }
             const cl: ExpressionNode* = this.frame_addr_root_expr(sm, c.callee);
             if (cl != null) { return cl; }
@@ -5870,7 +5863,6 @@ type struct AsyncLower {
         // arm can carry. Left an expression it would compile to a native break
         // out of the state-dispatch loop rather than the user's.
         if (this.expr_await_count(e) == 0 && !this.expr_has_free_edge(e, false)) { return e; }
-        const k: NodeKind = (e as ASTNode*).kind;
         const span: SourceSpan = (e as ASTNode*).span;
 
         // Hoist INTO the `?` node rather than replacing it with its desugar: the
@@ -5959,8 +5951,8 @@ type struct AsyncLower {
             return e;
         }
 
-        if (k == NodeKind::CallExpression) {
-            mut c: CallExprNode* = e as CallExprNode*;
+        if (ExpressionNode::call_of(e) != null) {
+            mut c: CallExpr* = ExpressionNode::call_of(e);
             // The callee is evaluated first. A method call's callee is a member
             // access on the receiver, which `await_transparent` keeps in place —
             // lifting it would copy (and so move out of) the receiver.
@@ -6554,7 +6546,6 @@ type struct AsyncLower {
     /// silent miscompile.
     rn_expr(mut &this, map: RenameMap*, e: ExpressionNode*) -> void {
         if (e == null) { return; }
-        const k: NodeKind = (e as ASTNode*).kind;
         mut rn_id: IdentifierExpr* = ExpressionNode::identifier_of(e);
         if (rn_id != null) {
             const f: SymbolStr = map.fresh_of(this.local_key(e));
@@ -6588,8 +6579,8 @@ type struct AsyncLower {
             this.rn_expr(map, rn_if.else_expr);
             return;
         }
-        if (k == NodeKind::CallExpression) {
-            const c: CallExprNode* = e as CallExprNode*;
+        if (ExpressionNode::call_of(e) != null) {
+            const c: CallExpr* = ExpressionNode::call_of(e);
             this.rn_expr(map, c.callee);
             for (mut i: i64 = 0; i < c.arguments.length; i++) { this.rn_expr(map, c.arguments[i]); }
             return;
@@ -6869,7 +6860,6 @@ type struct AsyncLower {
 
     rb_expr(mut &this, ctx: RebindCtx*, e: ExpressionNode*) -> void {
         if (e == null) { return; }
-        const k: NodeKind = (e as ASTNode*).kind;
         mut id: IdentifierExpr* = ExpressionNode::identifier_of(e);
         if (id != null) {
             mut found: boolean = false;
@@ -6904,8 +6894,8 @@ type struct AsyncLower {
             this.rb_expr(ctx, rb_if.else_expr);
             return;
         }
-        if (k == NodeKind::CallExpression) {
-            const c: CallExprNode* = e as CallExprNode*;
+        if (ExpressionNode::call_of(e) != null) {
+            const c: CallExpr* = ExpressionNode::call_of(e);
             this.rb_expr(ctx, c.callee);
             for (mut i: i64 = 0; i < c.arguments.length; i++) { this.rb_expr(ctx, c.arguments[i]); }
             return;
@@ -7257,13 +7247,13 @@ type struct AsyncLower {
             this.ctx.defs.leaf_of(exec_id).spelling(), this.intern.intern("new"), span);
         ExpressionNode::scope_resolution_of(ex_scope).set_synthesized_ref(ex_scope, exec_ty,
             this.ctx.decl_index.def_of(exec_ty, this.ctx.type_arena));
-        mut ex_new: CallExprNode* = new CallExprNode(
+        mut ex_new: ExpressionNode* = ExpressionNode::call_expr(
             ex_scope, span);
         mut ex_decl: VarDecl* = VarDecl::new(ex_sym);
         ex_decl.set_sym_id(this.resolver.alloc_synthetic_binding());
         ex_decl.set_mutable(true);
         ex_decl.set_type_annotation(this.make_type_ann(exec_ty, span));
-        ex_decl.set_initializer(ex_new as ExpressionNode*);
+        ex_decl.set_initializer(ex_new);
         body.as_block().add_statement(Stmt::decl_stmt(
             DeclarationNode::of(DeclKind::Variable(ex_decl), span), span));
 
@@ -7272,17 +7262,17 @@ type struct AsyncLower {
         // id registered where it was renamed.
         const root_callee: ExpressionNode* = ExpressionNode::identifier_expr(inner_sym, span);
         ExpressionNode::identifier_of(root_callee).res.answer(Res::Def(inner_def));
-        mut root: CallExprNode* = new CallExprNode(root_callee, span);
-        for (mut i: i64 = 0; i < fwd.length; i++) { root.add_argument(fwd[i]); }
+        mut root: ExpressionNode* = ExpressionNode::call_expr(root_callee, span);
+        for (mut i: i64 = 0; i < fwd.length; i++) { ExpressionNode::call_of(root).add_argument(fwd[i]); }
         const ex_use: ExpressionNode* = ExpressionNode::identifier_expr(ex_sym, span);
         ExpressionNode::identifier_of(ex_use).set_res(Res::Local(ex_decl.sym_id));
-        mut drive: CallExprNode* = new CallExprNode(
+        mut drive: ExpressionNode* = ExpressionNode::call_expr(
             ExpressionNode::member_access_expr(ex_use,
                                  this.intern.intern("block_on"), span, span) as ExpressionNode*, span);
-        drive.add_argument(root as ExpressionNode*);
+        ExpressionNode::call_of(drive).add_argument(root);
 
         if (returns_void) {
-            body.as_block().add_statement(Stmt::expr_stmt(drive as ExpressionNode*, span));
+            body.as_block().add_statement(Stmt::expr_stmt(drive, span));
             body.as_block().add_statement(Stmt::return_stmt(
                 ExpressionNode::literal("0", LiteralKind::Integer, span),
                 span));
@@ -7295,7 +7285,7 @@ type struct AsyncLower {
             out_decl.set_sym_id(this.resolver.alloc_synthetic_binding());
             out_decl.set_mutable(false);
             out_decl.set_type_annotation(this.make_type_ann(i32_ty, span));
-            out_decl.set_initializer(drive as ExpressionNode*);
+            out_decl.set_initializer(drive);
             body.as_block().add_statement(Stmt::decl_stmt(
                 DeclarationNode::of(DeclKind::Variable(out_decl), span), span));
             const out_use: ExpressionNode* = ExpressionNode::identifier_expr(out_sym, span);

@@ -49,7 +49,7 @@ import std::fmt;
 import compiler::ast::declaration::{ FunctionDecl, MethodDecl, DeclarationNode, VarDecl };
 import compiler::ast::expression::{
     CalleePin,
-    CallExprNode, ExpressionNode, IdentifierExpr,
+    CallExpr, ExpressionNode, IdentifierExpr,
     MemberAccessExpr, ScopeResolutionExpr
 };
 import compiler::ast::node::{ ASTNode };
@@ -160,12 +160,12 @@ type struct CallEmitter {
 
     /// `location()`: the `Location` of the call, or in a `![caller_location]`
     /// body the one its caller passed the address of.
-    emit_location(mut &this, node: CallExprNode*) -> LValue {
-        const lty: LType = this.cg.type_mapper.map_type(node.resolved_type);
+    emit_location(mut &this, e: ExpressionNode*) -> LValue {
+        const lty: LType = this.cg.type_mapper.map_type(e.resolved_type);
         if (this.cg.decl.caller_location.is_valid()) {
             return this.cg.builder.build_load(lty, this.cg.decl.caller_location, "caller.location");
         }
-        return this.cg.intrinsics.location_constant(lty, node.span);
+        return this.cg.intrinsics.location_constant(lty, e.span);
     }
 
     /// The lowered `Location`, or an invalid type when the program does not
@@ -224,7 +224,7 @@ type struct CallEmitter {
     /// pointer was computed, so it is no LLVM function: neither its type nor
     /// the call site's sret/byval attributes can be read off it, and both
     /// come from `plan`, classified from the value's Cryo function type.
-    call_through_value(mut &this, visitor: IRGeneratorVisitor*, node: CallExprNode*,
+    call_through_value(mut &this, visitor: IRGeneratorVisitor*, e: ExpressionNode*, node: CallExpr*,
                        fn_ptr: LValue, plan: SignaturePlan) -> Emitted {
         mut out: Emitted = Emitted::none();
         // The seam returns `void` when sret applies, else the Direct
@@ -241,7 +241,7 @@ type struct CallEmitter {
         const void_ty: LType = LType::void_type();
         const call_name: string = if (ret_ty.raw == void_ty.raw) { "" } else { "calltmp" };
         const fn_type: LType = plan.llvm_fn_type;
-        out.value = this.reshape_call_result(node,
+        out.value = this.reshape_call_result(e,
             this.cg.expr_ops.codegen_call_with_plan(fn_ptr, fn_type, plan, call_args, call_name));
         out.is_lvalue = false;
         return out;
@@ -257,10 +257,10 @@ type struct CallEmitter {
     /// round-trips (the inverse of the coercion the callee does on its
     /// return).  An sret call already yields the struct loaded from its
     /// slot, so the equal-types check leaves it alone.
-    reshape_call_result(mut &this, node: CallExprNode*, result: LValue) -> LValue {
-        if (!result.is_valid() || !node.resolved_type.is_valid()) { return result; }
+    reshape_call_result(mut &this, e: ExpressionNode*, result: LValue) -> LValue {
+        if (!result.is_valid() || !e.resolved_type.is_valid()) { return result; }
         const got_raw: void* = llvm::LLVMTypeOf(result.raw);
-        const expected_lty: LType = this.cg.type_mapper.map_type(node.resolved_type);
+        const expected_lty: LType = this.cg.type_mapper.map_type(e.resolved_type);
         const got_kind: LTypeKind = LType::kind_of(got_raw);
         const needs_coerce: boolean = expected_lty.is_valid()
             && got_raw != expected_lty.raw
@@ -289,10 +289,11 @@ type struct CallEmitter {
 
     // Main emit
 
-    /// Lower `node.callee(args)` into LLVM IR.  The visitor's `visit_call`
-    /// delegates here, passing itself as `visitor: IRGeneratorVisitor*` so
-    /// argument expressions can recurse through `dispatch.codegen_rvalue`.
-    emit(mut &this, visitor: IRGeneratorVisitor*, node: CallExprNode*) -> Emitted {
+    /// Lower the call `e`, whose payload is `node`, into LLVM IR.  The
+    /// visitor's dispatch delegates here, passing itself as `visitor:
+    /// IRGeneratorVisitor*` so argument expressions can recurse through
+    /// `dispatch.codegen_rvalue`.
+    emit(mut &this, visitor: IRGeneratorVisitor*, e: ExpressionNode*, node: CallExpr*) -> Emitted {
         mut out: Emitted = Emitted::none();
         mut callee_val: LValue = LValue::null();
 
@@ -317,7 +318,7 @@ type struct CallEmitter {
             // entry, and the module carries an extern declaration for it
             // (from declare_function) that nothing defines, so a real call
             // would fail the link with `undefined reference`.
-            match (this.emit_pinned_intrinsic(visitor, node)) {
+            match (this.emit_pinned_intrinsic(visitor, e, node)) {
                 Option::Some(e) => { return e; }
                 Option::None    => { }
             }
@@ -353,10 +354,10 @@ type struct CallEmitter {
                 // that type's own name.  Computed on every such call.
                 mut new_ref: TypeRef = TypeRef::invalid();
                 mut new_qn: SymbolStr = SymbolStr::empty();
-                if (node.has_resolved_type()) {
-                    const rt: Type* = arena.lookup(node.resolved_type);
+                if (e.has_resolved_type()) {
+                    const rt: Type* = arena.lookup(e.resolved_type);
                     if (rt != null && (rt.kind == TypeKind::Class || rt.kind == TypeKind::Struct)) {
-                        new_ref = node.resolved_type;
+                        new_ref = e.resolved_type;
                         new_qn = arena.get_qualified_name(new_ref).spelling();
                     }
                 }
@@ -409,7 +410,7 @@ type struct CallEmitter {
                             const ctor_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(ctor_fn.raw) };
                             if (ctor_ty.is_valid() && LType::kind_of(ctor_ty.raw) == LTypeKind::Function) {
                                 mut ctor_args: [Pair<LValue, TypeRef>] = [];
-                                ctor_args.push(Pair::<LValue, TypeRef>::new(obj_alloca, node.resolved_type));
+                                ctor_args.push(Pair::<LValue, TypeRef>::new(obj_alloca, e.resolved_type));
                                 for (mut ci: i64 = 0; ci < node.arguments.length; ci++) {
                                     const carg: LValue = this.dispatch.codegen_rvalue(visitor,node.arguments[ci]);
                                     ctor_args.push(Pair::<LValue, TypeRef>::new(carg, node.arguments[ci].resolved_type));
@@ -460,7 +461,7 @@ type struct CallEmitter {
                         // Load the function pointer from the alloca.
                         const fn_ptr_llvm: LType = LType::pointer_to(LType::i8());
                         const fn_ptr: LValue = this.cg.builder.build_load(fn_ptr_llvm, local, "fn.ptr.load");
-                        return this.call_through_value(visitor, node, fn_ptr, plan);
+                        return this.call_through_value(visitor, e, node, fn_ptr, plan);
                     }
                 }
             }
@@ -476,7 +477,7 @@ type struct CallEmitter {
             // is lowered inline BEFORE the pin is resolved as a callee: the
             // declaration table would declare the pinned symbol as an extern
             // and the link would look for a `ptr_diff` nothing defines.
-            match (this.emit_pinned_intrinsic(visitor, node)) {
+            match (this.emit_pinned_intrinsic(visitor, e, node)) {
                 Option::Some(e) => { return e; }
                 Option::None    => { }
             }
@@ -496,12 +497,12 @@ type struct CallEmitter {
             // No pin: an enum variant constructor (`Option::Some`,
             // `Result::Ok`).  Variants are not registered as functions; the
             // value is synthesized inline.  The enum is the one sema
-            // resolved the call TO (`node.resolved_type`, through any chain
+            // resolved the call TO (`e.resolved_type`, through any chain
             // of instantiations), never the one the scope segment spells: a
             // generic variant's spelling names the template; the variant is
             // the ordinal sema pinned on the path.
             if (!callee_val.is_valid()) {
-                mut real_ref: TypeRef = node.resolved_type;
+                mut real_ref: TypeRef = e.resolved_type;
                 mut real_t: Type* = this.cg.arena_type(real_ref);
                 mut follow_count: i32 = 0;
                 while (real_t != null && real_t.kind == TypeKind::InstantiatedType && follow_count < 5) {
@@ -578,7 +579,7 @@ type struct CallEmitter {
                     out.is_lvalue = false;
                     return out;
                 }
-                return this.call_through_value(visitor, node, fn_ptr, plan);
+                return this.call_through_value(visitor, e, node, fn_ptr, plan);
             }
 
             // Get the object's type, unwrapping pointer/reference.
@@ -687,7 +688,7 @@ type struct CallEmitter {
                     out.is_lvalue = false;
                     return out;
                 }
-                return this.call_through_value(visitor, node, fn_ptr, plan);
+                return this.call_through_value(visitor, e, node, fn_ptr, plan);
             }
             callee_val = this.dispatch.codegen_rvalue(visitor,node.callee);
         }
@@ -737,7 +738,7 @@ type struct CallEmitter {
             // synthesized after it is bound by the pass that builds it.
             mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 "internal: code generation found nothing to call for this call; monomorphization reports an unbound call before code generation, so this should never happen");
-            diag = diag.at(node.span);
+            diag = diag.at(e.span);
             this.cg.diag.emit(diag);
             out.value = LValue::null();
             out.is_lvalue = false;
@@ -789,7 +790,7 @@ type struct CallEmitter {
                     // the same consume check DropInsertion uses, so a receiver it
                     // treats as borrowed (still owned elsewhere) is not recorded.
                     if (this.cg.ctx.options.unwinds()
-                        && (ma.object.kind == NodeKind::CallExpression
+                        && (ExpressionNode::call_of(ma.object) != null
                             || ExpressionNode::struct_of(ma.object) != null)
                         && this.call_consumes_receiver(node)
                         && OwnershipQuery::needs_drop(this.cg.get_arena(),
@@ -862,7 +863,7 @@ type struct CallEmitter {
         if (!fn_ty.is_valid()) {
             this.cg.diag.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
                 "codegen: call expression: failed to retrieve function type from callee",
-                node.span);
+                e.span);
             out.value = LValue::null();
             out.is_lvalue = false;
             return out;
@@ -908,7 +909,7 @@ type struct CallEmitter {
             }
         }
 
-        const ret_ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
+        const ret_ty: LType = this.cg.type_mapper.map_type(e.resolved_type);
         const void_ty: LType = LType::void_type();
         // Void calls and unresolved return types must use empty name;
         // LLVM doesn't allow naming void-typed instructions.  The ABI/
@@ -922,8 +923,8 @@ type struct CallEmitter {
         // value!".  Detect the void-returning ABI from the source-level
         // return-type kind to stay in lockstep with the definition side.
         mut ret_kind_is_void: boolean = false;
-        if (node.resolved_type.is_valid()) {
-            const _rt: Type* = this.cg.arena_type(node.resolved_type);
+        if (e.resolved_type.is_valid()) {
+            const _rt: Type* = this.cg.arena_type(e.resolved_type);
             if (_rt != null && (_rt.kind == TypeKind::Unit
                                 || _rt.kind == TypeKind::Void
                                 || _rt.kind == TypeKind::Never)) {
@@ -948,7 +949,7 @@ type struct CallEmitter {
         // `Location` after its own arguments: this call's place, or, inside
         // another such function, the one that function was given.
         if (this.cg.resolver.caller_located(this.cg.resolver.pinned_entry(node.resolved_callee))) {
-            this.push_caller_location(&args, node.span);
+            this.push_caller_location(&args, e.span);
         }
         const needs_invoke: boolean = this.cg.ctx.options.unwinds()
             && (node.unwind_cleanup.length > 0
@@ -975,7 +976,7 @@ type struct CallEmitter {
             result = this.cg.expr_ops.codegen_call_via(callee_val, declared, fn_ty, args, call_name);
         }
 
-        result = this.reshape_call_result(node, result);
+        result = this.reshape_call_result(e, result);
 
         // A user-written `drop` runs IN ADDITION to field glue, not instead of
         // it: the body releases what it names, and the type's own droppable
@@ -1018,8 +1019,8 @@ type struct CallEmitter {
         // `Option<T>::unwrap`) leaves the block without a terminator and
         // the body-validator strips the entire function.
         mut should_unreachable: boolean = false;
-        if (node.resolved_type.is_valid()) {
-            const _ret_t: Type* = this.cg.arena_type(node.resolved_type);
+        if (e.resolved_type.is_valid()) {
+            const _ret_t: Type* = this.cg.arena_type(e.resolved_type);
             if (_ret_t != null && _ret_t.kind == TypeKind::Never) {
                 should_unreachable = true;
             }
@@ -1053,9 +1054,9 @@ type struct CallEmitter {
         const drop_sym: SymbolStr = intern.intern("drop");
         mut da: ExpressionNode* = ExpressionNode::member_access_expr(
             id_node, drop_sym, span, span);
-        mut call: CallExprNode* = new CallExprNode(da, span);
+        mut call: ExpressionNode* = ExpressionNode::call_expr(da, span);
         this.cg.bind_destructor_call(call);
-        mut stmt: Stmt* = Stmt::expr_stmt(call as ExpressionNode*, span);
+        mut stmt: Stmt* = Stmt::expr_stmt(call, span);
         this.cg.expr_ops.push_arg_temp_drop(stmt as ASTNode*);
     }
 
@@ -1077,7 +1078,7 @@ type struct CallEmitter {
     /// (borrowed) args.
     maybe_record_arg_temp(mut &this, arg_expr: ExpressionNode*, arg_val: LValue) -> void {
         if (arg_expr == null || !arg_val.is_valid()) { return; }
-        if (arg_expr.kind != NodeKind::CallExpression
+        if (ExpressionNode::call_of(arg_expr) == null
             && ExpressionNode::struct_of(arg_expr) == null
             && ExpressionNode::member_access_of(arg_expr) == null) { return; }
         const ty: TypeRef = arg_expr.resolved_type;
@@ -1101,7 +1102,7 @@ type struct CallEmitter {
     /// consumed anonymous receiver from being both dropped here and left for
     /// some other pass.  A call with no pinned method has no receiver to
     /// consume.
-    call_consumes_receiver(&this, node: CallExprNode*) -> boolean {
+    call_consumes_receiver(&this, node: CallExpr*) -> boolean {
         const m_decl: DeclarationNode* = this.cg.get_decl_index().entry_method(node.resolved_callee.decl_entry());
         const m: MethodDecl* = DeclarationNode::method_of(m_decl);
         if (m == null) { return false; }
@@ -1128,7 +1129,7 @@ type struct CallEmitter {
     /// The schedule-driven core lives on `ExprOps` (reachable from the
     /// synthesized-check origins too); this forwards the ordinary-call schedule
     /// to it.
-    emit_cleanup_landingpad(mut &this, visitor: IRGeneratorVisitor*, node: CallExprNode*,
+    emit_cleanup_landingpad(mut &this, visitor: IRGeneratorVisitor*, node: CallExpr*,
                             cur_fn: LValue, lpad_bb: LBasicBlock) -> void {
         this.cg.expr_ops.emit_cleanup_landingpad_sched(
             visitor, &node.unwind_cleanup, cur_fn, lpad_bb);
@@ -1143,7 +1144,7 @@ type struct CallEmitter {
     /// with NO pin is a call through a VALUE - a parameter, a local or a
     /// field holding a function pointer - which is never an intrinsic,
     /// whatever the value is named.  No spelling is read here.
-    pinned_intrinsic_kind(&this, node: CallExprNode*) -> IntrinsicKind {
+    pinned_intrinsic_kind(&this, node: CallExpr*) -> IntrinsicKind {
         return node.resolved_callee.intrinsic_kind(this.cg.get_decl_index());
     }
 
@@ -1152,7 +1153,8 @@ type struct CallEmitter {
     /// call is a function call, or names an intrinsic the dispatcher
     /// declines (an arity it does not take), which then goes through the
     /// pin as a call.
-    emit_pinned_intrinsic(mut &this, visitor: IRGeneratorVisitor*, node: CallExprNode*) -> Option<Emitted> {
+    emit_pinned_intrinsic(mut &this, visitor: IRGeneratorVisitor*, e: ExpressionNode*,
+                          node: CallExpr*) -> Option<Emitted> {
         const kind: IntrinsicKind = this.pinned_intrinsic_kind(node);
         if (kind == IntrinsicKind::Call) { return Option::None; }
         // `try_catch(body, data)` - the catch_unwind primitive.  Needs an
@@ -1160,10 +1162,10 @@ type struct CallEmitter {
         // generic `try_emit` inline path cannot build), so it is special-
         // lowered here rather than by the inline dispatcher.
         if (kind == IntrinsicKind::TryCatch) {
-            return Option::Some(this.emit_catch_unwind(visitor, node));
+            return Option::Some(this.emit_catch_unwind(visitor, e, node));
         }
         if (kind == IntrinsicKind::Location) {
-            return Option::Some(Emitted::rvalue(this.emit_location(node)));
+            return Option::Some(Emitted::rvalue(this.emit_location(e)));
         }
         if (kind == IntrinsicKind::Panic) {
             return Option::Some(this.emit_panic(visitor, node));
@@ -1183,7 +1185,7 @@ type struct CallEmitter {
 
     /// `intrinsics::panic(message, loc)`: the funnel, given the message and
     /// the address of `loc`.
-    emit_panic(mut &this, visitor: IRGeneratorVisitor*, node: CallExprNode*) -> Emitted {
+    emit_panic(mut &this, visitor: IRGeneratorVisitor*, node: CallExpr*) -> Emitted {
         const msg: LValue = this.dispatch.codegen_rvalue(visitor, node.arguments[0]);
         const loc: LValue = this.location_address(this.dispatch.codegen_rvalue(visitor, node.arguments[1]));
         // `--panic=unwind` direct-panic drop-completeness: route the panic
@@ -1218,7 +1220,7 @@ type struct CallEmitter {
     /// (innermost-first) before the unwind continues, then `resume`s.  Reuses
     /// `node.unwind_cleanup` (DropInsertion populates it for EVERY call, panic
     /// included).
-    emit_panic_unwind(mut &this, visitor: IRGeneratorVisitor*, node: CallExprNode*,
+    emit_panic_unwind(mut &this, visitor: IRGeneratorVisitor*, node: CallExpr*,
                       msg: LValue, loc: LValue) -> Emitted {
         mut out: Emitted = Emitted::none();
         const cur_fn: LValue = this.get_current_function();
@@ -1283,12 +1285,13 @@ type struct CallEmitter {
     /// `__cryo_panic_taken_*` symbols.  The default path never reaches here (the
     /// stdlib `catch_unwind` is generic and uninstantiated unless a program
     /// calls it), so this leaves the default IR byte-identical.
-    emit_catch_unwind(mut &this, visitor: IRGeneratorVisitor*, node: CallExprNode*) -> Emitted {
+    emit_catch_unwind(mut &this, visitor: IRGeneratorVisitor*, e: ExpressionNode*,
+                      node: CallExpr*) -> Emitted {
         mut out: Emitted = Emitted::none();
         if (node.arguments.length != 2) {
             this.cg.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
                 "codegen: try_catch expects exactly two arguments (body, data)",
-                node.span);
+                e.span);
             out.value = LValue::null();
             out.is_lvalue = false;
             return out;
@@ -1297,7 +1300,7 @@ type struct CallEmitter {
         if (!this.cg.ctx.options.unwinds()) {
             this.cg.diag.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
                 "`catch_unwind` requires the unwinding panic strategy; rebuild with `--panic=unwind` (or set `panic = \"unwind\"` in cryoconfig). Under the default `--panic=abort` a panic terminates the process, so there is nothing to catch.",
-                node.span);
+                e.span);
             out.value = LValue::null();
             out.is_lvalue = false;
             return out;
@@ -1392,7 +1395,7 @@ type struct CallEmitter {
     /// them keeps `node.arguments[i]` aligned with `param_types[i]` without a
     /// receiver offset.  `va_list` parameters therefore only arise on the
     /// free/extern call paths handled here.
-    va_forward_fn_type(mut &this, node: CallExprNode*) -> FunctionType* {
+    va_forward_fn_type(mut &this, node: CallExpr*) -> FunctionType* {
         if (!this.cg.abi.is_win64()) { return null; }
         if (node.callee == null) { return null; }
         // Only free / extern-"C" callees (bare identifier or `Scope::member`)
@@ -1498,11 +1501,11 @@ type struct CallEmitter {
             mut drop_access: ExpressionNode* = ExpressionNode::member_access_expr(
                 elem_access, drop_sym,
                 receiver.span, receiver.span);
-            mut call: CallExprNode* = new CallExprNode(
+            mut call: ExpressionNode* = ExpressionNode::call_expr(
                 drop_access, receiver.span);
             this.cg.bind_destructor_call(call);
             mut stmt: Stmt* = Stmt::expr_stmt(
-                call as ExpressionNode*, receiver.span);
+                call, receiver.span);
             visitor.dispatch_node(stmt);
         }
     }
@@ -1531,11 +1534,11 @@ type struct CallEmitter {
             mut drop_access: ExpressionNode* = ExpressionNode::member_access_expr(
                 arr_access, drop_sym,
                 receiver.span, receiver.span);
-            mut call: CallExprNode* = new CallExprNode(
+            mut call: ExpressionNode* = ExpressionNode::call_expr(
                 drop_access, receiver.span);
             this.cg.bind_destructor_call(call);
             mut stmt: Stmt* = Stmt::expr_stmt(
-                call as ExpressionNode*, receiver.span);
+                call, receiver.span);
             visitor.dispatch_node(stmt);
         }
     }
@@ -1565,11 +1568,11 @@ type struct CallEmitter {
             mut drop_access: ExpressionNode* = ExpressionNode::member_access_expr(
                 field_access, drop_sym,
                 receiver.span, receiver.span);
-            mut call: CallExprNode* = new CallExprNode(
+            mut call: ExpressionNode* = ExpressionNode::call_expr(
                 drop_access, receiver.span);
             this.cg.bind_destructor_call(call);
             mut stmt: Stmt* = Stmt::expr_stmt(
-                call as ExpressionNode*, receiver.span);
+                call, receiver.span);
             visitor.dispatch_node(stmt);
         }
     }
@@ -1668,11 +1671,11 @@ type struct CallEmitter {
                     id_node.set_resolved_type(pt);
                     mut da: ExpressionNode* = ExpressionNode::member_access_expr(
                         id_node, drop_sym, receiver.span, receiver.span);
-                    mut call: CallExprNode* = new CallExprNode(
+                    mut call: ExpressionNode* = ExpressionNode::call_expr(
                         da, receiver.span);
                     this.cg.bind_destructor_call(call);
                     mut stmt: Stmt* = Stmt::expr_stmt(
-                        call as ExpressionNode*, receiver.span);
+                        call, receiver.span);
                     visitor.dispatch_node(stmt);
                 }
             }

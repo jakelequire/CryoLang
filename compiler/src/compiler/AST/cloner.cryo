@@ -31,7 +31,7 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     AlignofExpr, ArrayAccessExpr, ArrayExpr, AwaitExpr, BinaryExpr,
-    CallExprNode, CastExpr, ExprKind, ExpressionNode, FieldInit, IdentifierExpr,
+    CallExpr, CastExpr, ExprKind, ExpressionNode, FieldInit, IdentifierExpr,
     LambdaExpr, LiteralExpr, MatchExpr, MemberAccessExpr, NewExpr,
     ScopeResolutionExpr, SizeofExpr, StaticMatchExpr, StructExpr,
     TryExpr, TupleExpr, TypeofExpr, UnaryExpr
@@ -115,8 +115,6 @@ type struct ASTCloner {
         if (n == null) { return null; }
         match (n.kind) {
             NodeKind::Program                   => { return this.visit_program(n as ProgramNode*); }
-
-            NodeKind::CallExpression            => { return this.visit_call(n as CallExprNode*); }
 
             NodeKind::Expression                => { return this.copy_expr_shape(n as ExpressionNode*); }
             NodeKind::Statement                 => { return this.copy_stmt(n as Stmt*); }
@@ -209,10 +207,10 @@ type struct ASTCloner {
 
     // Expression visitors
 
-    visit_call(mut &this, node: CallExprNode*) -> ASTNode* {
-        mut c: CallExprNode* = new CallExprNode(
-            this.clone_expr(node.callee), node.span
-        );
+    /// A copy of the call `e`, whose payload is `node`.
+    copy_call(mut &this, e: ExpressionNode*, node: CallExpr*) -> ExpressionNode* {
+        const ce: ExpressionNode* = ExpressionNode::call_expr(this.clone_expr(node.callee), e.span);
+        mut c: CallExpr* = ExpressionNode::call_of(ce);
         for (mut i: i64 = 0; i < node.arguments.length; i++) {
             c.add_argument(this.clone_expr(node.arguments[i]));
         }
@@ -246,14 +244,11 @@ type struct ASTCloner {
             btas.push(node.bound_trait_args[i]);
         }
         c.bound_trait_args = btas;
-        c.has_error = node.has_error;
-        return c;
+        return ce;
     }
 
-    /// A copy of an expression whose kind has a payload: the payload copied
-    /// field by field, under a header carrying the original's span and
-    /// error flag.  `Legacy` is built with its own `NodeKind`, which
-    /// `dispatch_node` copied, and answers null.
+    /// A copy of an expression: the payload copied field by field, under a
+    /// header carrying the original's span and error flag.
     copy_expr_shape(mut &this, node: ExpressionNode*) -> ExpressionNode* {
         mut c: ExpressionNode* = null;
         match (node.shape) {
@@ -524,7 +519,7 @@ type struct ASTCloner {
                     }
                 }
             }
-            ExprKind::Legacy => { return null; }
+            ExprKind::Call(n) => { c = this.copy_call(node, n); }
         }
         c.has_error = node.has_error;
         return c;

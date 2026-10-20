@@ -103,17 +103,15 @@ public:
     /// `Unclassified` outside an argument slot.
     arg_binding: ArgBinding;
 
-    /// Which expression this is, for a kind whose fields live in a payload;
-    /// such an expression is built with `NodeKind::Expression`.  `Legacy`
-    /// for a kind still declared as a subclass of this header, which its
-    /// own `NodeKind` names.
+    /// Which expression this is; every expression is built with
+    /// `NodeKind::Expression`.
     shape: ExprKind;
 
-    ExpressionNode(kind: NodeKind, span: SourceSpan) : ASTNode(kind, span) {
+    ExpressionNode(shape: ExprKind, span: SourceSpan) : ASTNode(NodeKind::Expression, span) {
         this.resolved_type = TypeRef::invalid();
         this.autoref       = false;
         this.arg_binding   = ArgBinding::Unclassified;
-        this.shape         = ExprKind::Legacy;
+        this.shape         = shape;
     }
 
     set_resolved_type(t: TypeRef) -> void { this.resolved_type = t; }
@@ -121,9 +119,7 @@ public:
 
     /// An expression of `shape` at `span`, with the header's defaults.
     static of(shape: ExprKind, span: SourceSpan) -> ExpressionNode* {
-        const e: ExpressionNode* = new ExpressionNode(NodeKind::Expression, span);
-        e.shape = shape;
-        return e;
+        return new ExpressionNode(shape, span);
     }
 
     /// `sizeof(type_ann)` at `span`, its operand not yet resolved.
@@ -383,6 +379,24 @@ public:
         }), span);
     }
 
+    /// `callee()` at `span`, not yet bound; its arguments are added after.
+    static call_expr(callee: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Call(new CallExpr {
+            callee:             callee,
+            arguments:          [],
+            generic_args:       [],
+            resolved_callee:    CalleePin::None,
+            named_method:       DefId::invalid(),
+            template_method:    DefId::invalid(),
+            template_recv:      TypeRef::invalid(),
+            bound_params:       [],
+            bound_trait_args:   [],
+            resolved_type_args: [],
+            resolved_template:  TypeRef::invalid(),
+            unwind_cleanup:     [],
+        }), span);
+    }
+
     /// `yield operand` at `span`; a bare `yield` when `operand` is null.
     static yield_expr(operand: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
         return ExpressionNode::of(ExprKind::Yield(new YieldExpr { operand: operand }), span);
@@ -594,6 +608,16 @@ public:
         };
     }
 
+    /// The call `n` is, or null.
+    static call_of(n: ASTNode*) -> CallExpr* {
+        const e: ExpressionNode* = ExpressionNode::with_shape(n);
+        if (e == null) { return null; }
+        return match (e.shape) {
+            ExprKind::Call(c) => { c }
+            _                 => { null }
+        };
+    }
+
     /// The member access `n` is, or null.
     static member_access_of(n: ASTNode*) -> MemberAccessExpr* {
         const e: ExpressionNode* = ExpressionNode::with_shape(n);
@@ -626,16 +650,14 @@ public:
 }
 
 
-/// What an expression is, for the kinds whose fields live in a payload.
-/// `Legacy` is the bridge for the kinds still declared as a subclass of
-/// `ExpressionNode`; it goes when the last kind converts.
+/// What an expression is; its kind's fields live in the payload.
 type enum ExprKind {
-    Legacy;
     Alignof(AlignofExpr*);
     Array(ArrayExpr*);
     ArrayAccess(ArrayAccessExpr*);
     Await(AwaitExpr*);
     Binary(BinaryExpr*);
+    Call(CallExpr*);
     Cast(CastExpr*);
     Delete(DeleteExpr*);
     Identifier(IdentifierExpr*);
@@ -815,7 +837,7 @@ type struct BinaryExpr {
     /// `--panic=unwind` cleanup schedule for the synthesized divide-by-zero /
     /// `INT_MIN / -1` guard (populated only for `/` and `%`), so the guard's
     /// raise runs the frame's local destructors on unwind.  See
-    /// `CallExprNode.unwind_cleanup`.  Empty on the default abort path.
+    /// `CallExpr.unwind_cleanup`.  Empty on the default abort path.
     unwind_cleanup: [ASTNode*];
 
     static walk_children<V>(n: BinaryExpr*, v: mut &V) -> void where V: Walk {
@@ -920,7 +942,7 @@ type struct MatchExpr {
 
     /// `--panic=unwind` cleanup schedule for the synthesized non-exhaustive
     /// `no_match` guard, so a scrutinee matching no arm runs the frame's local
-    /// destructors on unwind.  See `CallExprNode.unwind_cleanup`.
+    /// destructors on unwind.  See `CallExpr.unwind_cleanup`.
     unwind_cleanup: [ASTNode*];
 
     static walk_children<V>(n: MatchExpr*, v: mut &V) -> void where V: Walk {
@@ -967,8 +989,8 @@ implement trait Allocate for struct StaticMatchExpr {
 }
 
 
-type class CallExprNode : ExpressionNode {
-public:
+/// `callee(arguments)`, a function, method, path or value call.
+type struct CallExpr {
     callee:       ExpressionNode*;
     arguments:    [ExpressionNode*];
     generic_args: [TypeAnnotation*];
@@ -1066,23 +1088,12 @@ public:
     /// unchanged there.
     unwind_cleanup: [ASTNode*];
 
-    CallExprNode(callee: ExpressionNode*, span: SourceSpan)
-        : ExpressionNode(NodeKind::CallExpression, span) {
-        this.callee             = callee;
-        this.arguments          = [];
-        this.generic_args       = [];
-        this.resolved_callee    = CalleePin::None;
-        this.named_method       = DefId::invalid();
-        this.template_method    = DefId::invalid();
-        this.template_recv      = TypeRef::invalid();
-        this.bound_params       = [];
-        this.bound_trait_args   = [];
-        this.resolved_type_args = [];
-        this.resolved_template  = TypeRef::invalid();
-        this.unwind_cleanup     = [];
+    static walk_children<V>(n: CallExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.callee);
+        for (mut i: i64 = 0; i < n.arguments.length; i++) { v.walk_expr(n.arguments[i]); }
     }
 
-    add_argument(arg: ExpressionNode*) -> void {
+    add_argument(mut &this, arg: ExpressionNode*) -> void {
         this.arguments.push(arg);
     }
 
@@ -1101,7 +1112,7 @@ public:
     ///
     /// Arguments past the declared parameters (a variadic tail) are left
     /// unclassified, which the move passes read as a transfer.
-    bind_arguments(arena: TypeArena*, param_types: &[TypeRef]) -> void {
+    bind_arguments(&this, arena: TypeArena*, param_types: &[TypeRef]) -> void {
         const lim: i64 = if (param_types.length < this.arguments.length) {
             param_types.length
         } else {
@@ -1126,20 +1137,26 @@ public:
         }
     }
 
-    set_generic_args(args: [TypeAnnotation*]) -> void {
+    set_generic_args(mut &this, args: [TypeAnnotation*]) -> void {
         this.generic_args = args;
     }
 
-    set_resolved_callee(pin: CalleePin) -> void {
+    set_resolved_callee(mut &this, pin: CalleePin) -> void {
         this.resolved_callee = pin;
     }
 
-    set_resolved_type_args(args: [TypeRef]) -> void {
+    set_resolved_type_args(mut &this, args: [TypeRef]) -> void {
         this.resolved_type_args = args;
     }
 
-    set_resolved_template(template_type: TypeRef) -> void {
+    set_resolved_template(mut &this, template_type: TypeRef) -> void {
         this.resolved_template = template_type;
+    }
+}
+
+implement trait Allocate for struct CallExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
@@ -1163,7 +1180,7 @@ type struct NewExpr {
     /// `--panic=unwind` cleanup schedule for the synthesized `new T[n]`
     /// size-overflow guard (populated only for the array form), so the guard's
     /// raise runs the frame's local destructors on unwind.  See
-    /// `CallExprNode.unwind_cleanup`.
+    /// `CallExpr.unwind_cleanup`.
     unwind_cleanup: [ASTNode*];
 
     /// What `type_name` names, stamped by NameResolution from the scope the
@@ -1507,7 +1524,7 @@ type struct ArrayAccessExpr {
 
     /// `--panic=unwind` cleanup schedule for the synthesized array bounds check
     /// (fat-array / fixed-array indexing), so an out-of-bounds index runs the
-    /// frame's local destructors on unwind.  See `CallExprNode.unwind_cleanup`.
+    /// frame's local destructors on unwind.  See `CallExpr.unwind_cleanup`.
     unwind_cleanup: [ASTNode*];
 
     static walk_children<V>(n: ArrayAccessExpr*, v: mut &V) -> void where V: Walk {
@@ -1634,7 +1651,7 @@ type struct ScopeResolutionExpr {
     /// The function this path names when it is used as a VALUE (`Type::static`
     /// or `Module::fn` as a function pointer), pinned by sema - the mangled
     /// symbol of a static method, the canonical name of a free function -
-    /// exactly as a `CallExprNode`'s pin is.  `None` when the path names no
+    /// exactly as a `CallExpr`'s pin is.  `None` when the path names no
     /// function; a variant or a global is then `resolved_member`'s.
     resolved_callee:    CalleePin;
 
@@ -1698,7 +1715,7 @@ type struct ScopeResolutionExpr {
     resolved_trait:     DefId;
 
     /// The trait's declared method a bound-directed path names when it is
-    /// used as a VALUE (`const f = T::make;`), as `CallExprNode`'s
+    /// used as a VALUE (`const f = T::make;`), as `CallExpr`'s
     /// `template_method` is for the call `T::make()`: every copy of the body
     /// binds it on the type the parameter becomes.  Invalid on any other path.
     template_method:    DefId;

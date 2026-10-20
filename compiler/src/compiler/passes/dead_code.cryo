@@ -68,7 +68,7 @@ import compiler::ast::declaration::{
     MethodDecl, StructDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
-    CallExprNode,
+    CallExpr,
     ExprKind, ExpressionNode,
     MemberAccessExpr
 };
@@ -386,7 +386,7 @@ type struct DeadCodeChecker {
     /// one - a generic body's call before its receiver is minted, or a
     /// path naming a method with type parameters of its own, which the pin
     /// answers only in a copy.
-    mark_named_methods(mut &this, c: CallExprNode*) -> void {
+    mark_named_methods(mut &this, c: CallExpr*) -> void {
         const entry: OverloadId = c.resolved_callee.decl_entry();
         if (entry.is_valid()) {
             this.mark_call_target(this.ctx.decl_index.entry_method(entry) as ASTNode*);
@@ -513,20 +513,19 @@ type struct DeadCodeChecker {
     }
 
     /// Complete expression traversal: harvest a call target at every
-    /// `CallExprNode`, and recurse into every child expression - including the
+    /// `CallExpr`, and recurse into every child expression - including the
     /// `desugared_call` side-channels where operator overloads hang their
     /// resolved method call.
     walk_expr(mut &this, e: ExpressionNode*) -> void {
         if (e == null) { return; }
         match (e.kind) {
-            NodeKind::CallExpression => {
-                const c: CallExprNode* = e as CallExprNode*;
-                this.mark_named_methods(c);
-                this.walk_expr(c.callee);
-                for (mut i: i64 = 0; i < c.arguments.length; i++) { this.walk_expr(c.arguments[i]); }
-            }
             NodeKind::Expression => {
                 match (e.shape) {
+                    ExprKind::Call(c) => {
+                        this.mark_named_methods(c);
+                        this.walk_expr(c.callee);
+                        for (mut i: i64 = 0; i < c.arguments.length; i++) { this.walk_expr(c.arguments[i]); }
+                    }
                     ExprKind::Ternary(t) => {
                         this.walk_expr(t.condition);
                         this.walk_expr(t.true_expr);
@@ -597,7 +596,6 @@ type struct DeadCodeChecker {
                     ExprKind::Identifier(_) => { }
                     ExprKind::ScopeResolution(_) => { }
                     ExprKind::MemberAccess(ma) => { this.walk_expr(ma.object); }
-                    ExprKind::Legacy     => { }
                 }
             }
             _ => {}

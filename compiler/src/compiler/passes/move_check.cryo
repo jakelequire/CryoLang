@@ -58,7 +58,7 @@ import compiler::ast::declaration::{
     VarDecl
 };
 import compiler::ast::expression::{
-    ArrayAccessExpr, ArrayExpr, BinaryExpr, CallExprNode, CastExpr,
+    ArrayAccessExpr, ArrayExpr, BinaryExpr, CallExpr, CastExpr,
     ExprKind, ExpressionNode, IdentifierExpr, IfExpr, LambdaExpr, MatchExpr,
     MemberAccessExpr, NewExpr, StructExpr, TernaryExpr,
     TupleExpr, UnaryExpr
@@ -498,7 +498,7 @@ type struct MoveChecker {
     /// Record `<local>.poll(cx)` so a later move of that local is rejected.
     /// Only an identifier receiver matters: a field or a temporary is not a
     /// binding this pass can see moved.
-    note_poll_receiver(mut &this, c: CallExprNode*) -> void {
+    note_poll_receiver(mut &this, e: ExpressionNode*, c: CallExpr*) -> void {
         if (c == null || c.callee == null || this.intern == null) { return; }
         if (ExpressionNode::member_access_of(c.callee) == null) { return; }
         const ma: MemberAccessExpr* = ExpressionNode::member_access_of(c.callee);
@@ -507,7 +507,7 @@ type struct MoveChecker {
         if (obj_id == null) { return; }
         const nm: SymbolID = obj_id.res.local_sym();
         if (!this.type_implements_future(this.lookup_type(nm))) { return; }
-        this.mark_polled(nm, (c as ASTNode*).span);
+        this.mark_polled(nm, e.span);
     }
 
     /// A future whose `poll` has run may have handed out a pointer into its own
@@ -1282,9 +1282,9 @@ type struct MoveChecker {
     walk_expr_read(mut &this, expr: ExpressionNode*) -> void {
         if (expr == null) { return; }
         match (expr.kind) {
-            NodeKind::CallExpression     => { this.read_call(expr as CallExprNode*);                 }
             NodeKind::Expression         => {
                 match (expr.shape) {
+                    ExprKind::Call(c) => { this.read_call(expr, c); }
                     ExprKind::Identifier(id) => { this.handle_ident(expr, id, false, false); }
                     ExprKind::MemberAccess(ma) => { this.read_member(ma); }
                     // Reduced to one live arm by the monomorphizer; walk it as
@@ -1315,7 +1315,7 @@ type struct MoveChecker {
                     // Not walked by this pass.
                     ExprKind::Sizeof(_) | ExprKind::Alignof(_) | ExprKind::Typeof(_)
                     | ExprKind::Delete(_) | ExprKind::Yield(_) | ExprKind::Literal(_)
-                    | ExprKind::Await(_) | ExprKind::ScopeResolution(_) | ExprKind::Legacy => { }
+                    | ExprKind::Await(_) | ExprKind::ScopeResolution(_) => { }
                 }
             }
             _ => {}
@@ -1358,7 +1358,7 @@ type struct MoveChecker {
         }
     }
 
-    read_call(mut &this, c: CallExprNode*) -> void {
+    read_call(mut &this, e: ExpressionNode*, c: CallExpr*) -> void {
         if (c == null) { return; }
         // Special case: `<ident>.drop()` is the user's "release this
         // binding now" mark.  `Drop::drop` is signed `drop(mut &this)`,
@@ -1398,7 +1398,7 @@ type struct MoveChecker {
         // Recorded before the receiver is walked: a consuming `poll` would mark
         // the receiver moved below, and the question here is what the call does
         // to the value's ADDRESS, not to its ownership.
-        this.note_poll_receiver(c);
+        this.note_poll_receiver(e, c);
         mut receiver_moved: boolean = false;
         const pinned_decl: DeclarationNode* = this.ctx.decl_index.entry_method(c.resolved_callee.decl_entry());
         const pinned: MethodDecl* = DeclarationNode::method_of(pinned_decl);

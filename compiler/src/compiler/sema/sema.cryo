@@ -75,7 +75,7 @@ import compiler::ast::declaration::{
 import compiler::ast::expression::{
     CalleePin,
     ArrayAccessExpr, ArrayExpr, AwaitExpr, BinaryExpr,
-    CallExprNode, CastExpr, ExprKind, ExpressionNode, FieldInit, IdentifierExpr,
+    CallExpr, CastExpr, ExprKind, ExpressionNode, FieldInit, IdentifierExpr,
     IfExpr, LambdaExpr, LiteralExpr, MatchExpr, MemberAccessExpr, NewExpr,
     ScopeResolutionExpr, StaticMatchExpr, StructExpr,
     TernaryExpr, TryExpr, TupleExpr, UnaryExpr
@@ -305,7 +305,8 @@ type struct SemaVisitor {
     /// method of the type merely named `drop` is never bound here, and a
     /// pointer receiver is a `Copy` value with no destructor: it never
     /// reaches its pointee's.
-    bind_destructor_call(mut &this, call: CallExprNode*) -> void {
+    bind_destructor_call(mut &this, call_e: ExpressionNode*) -> void {
+        const call: CallExpr* = ExpressionNode::call_of(call_e);
         if (call == null || call.callee == null) { return; }
         if (ExpressionNode::member_access_of(call.callee) == null) { return; }
         const member: MemberAccessExpr* = ExpressionNode::member_access_of(call.callee);
@@ -1342,10 +1343,10 @@ type struct SemaVisitor {
                         mut gen_args: [TypeAnnotation*] = [];
                         gen_args.push(elt_ann);
                         sr.set_scope_generic_args(gen_args);
-                        mut call: CallExprNode* = new CallExprNode(sr_e, sp);
-                        call.add_argument(amp);
-                        call.add_argument(n_lit);
-                        var_node.set_initializer(call as ExpressionNode*);
+                        mut call: ExpressionNode* = ExpressionNode::call_expr(sr_e, sp);
+                        ExpressionNode::call_of(call).add_argument(amp);
+                        ExpressionNode::call_of(call).add_argument(n_lit);
+                        var_node.set_initializer(call);
                         init_type = this.resolve_expr(var_node.initializer);
                     }
                 }
@@ -1363,8 +1364,8 @@ type struct SemaVisitor {
                             const orig_init: ExpressionNode* = var_node.initializer;
                             const wrap_span: SourceSpan = orig_init.span;
                             mut iter_member: ExpressionNode* = ExpressionNode::member_access_expr(orig_init, this.intern.intern("iter"), wrap_span, wrap_span);
-                            mut iter_call: CallExprNode* = new CallExprNode(iter_member, wrap_span);
-                            var_node.set_initializer(iter_call as ExpressionNode*);
+                            mut iter_call: ExpressionNode* = ExpressionNode::call_expr(iter_member, wrap_span);
+                            var_node.set_initializer(iter_call);
                             init_type = this.resolve_expr(var_node.initializer);
                         }
                     }
@@ -1662,8 +1663,7 @@ type struct SemaVisitor {
         match (n.kind) {
             NodeKind::Program                => { this.visit_program(n as ProgramNode*); }
 
-            NodeKind::Expression
-            | NodeKind::CallExpression => {
+            NodeKind::Expression => {
                 this.resolve_expr(n as ExpressionNode*);
             }
 
@@ -1708,7 +1708,6 @@ type struct SemaVisitor {
         }
         const n: ASTNode* = expr as ASTNode*;
         const result: TypeRef = match (n.kind) {
-            NodeKind::CallExpression    => { this.calls.resolve_call(this, expr as CallExprNode*) }
             NodeKind::Expression        => { this.resolve_expr_shape(expr) }
             _ => { TypeRef::invalid() }
         };
@@ -1767,8 +1766,7 @@ type struct SemaVisitor {
             ExprKind::ArrayAccess(a) => { this.member.resolve_array_access(this, expr, a) }
             ExprKind::Lambda(l) => { this.lambda.resolve_lambda(this, expr, l) }
             ExprKind::Await(a) => { this.resolve_await(expr, a) }
-            // Built with its own `NodeKind`, which `resolve_expr` dispatched.
-            ExprKind::Legacy => { TypeRef::invalid() }
+            ExprKind::Call(c) => { this.calls.resolve_call(this, expr, c) }
         };
     }
 
@@ -1990,7 +1988,7 @@ type struct SemaVisitor {
                         span: SourceSpan) -> ExpressionNode* {
         const member: ExpressionNode* = ExpressionNode::member_access_expr(receiver, method, span, span);
         this.calls.stamp_trait_item(ExpressionNode::member_access_of(member), trait_id);
-        mut call: CallExprNode* = new CallExprNode(member, span);
+        mut call: ExpressionNode* = ExpressionNode::call_expr(member, span);
         if (rhs != null) {
             // The trait method takes `rhs: &Rhs`.  When the operand is already a
             // reference (`&Rhs`, e.g. a by-reference parameter or `&scratch[0]`),
@@ -1998,13 +1996,13 @@ type struct SemaVisitor {
             // operand, so we never build a `&&Rhs` that fails to type-check.
             const rhs_t: Type* = this.arena.lookup(rhs.resolved_type);
             if (rhs_t != null && rhs_t.kind == TypeKind::Reference) {
-                call.add_argument(rhs);
+                ExpressionNode::call_of(call).add_argument(rhs);
             } else {
                 const amp: Token = Token::new(TokenType::Amp, "&", op_tok.line, op_tok.column);
-                call.add_argument(ExpressionNode::synthetic_unary(amp, rhs, rhs.span));
+                ExpressionNode::call_of(call).add_argument(ExpressionNode::synthetic_unary(amp, rhs, rhs.span));
             }
         }
-        return call as ExpressionNode*;
+        return call;
     }
 
     /// Bind `bin`, a `+` whose left operand is a string, to the standard
@@ -2180,7 +2178,7 @@ type struct SemaVisitor {
             const pred_sym: SymbolStr = this.intern.intern(map.ord_pred);
             const pred_member: ExpressionNode* =
                 ExpressionNode::member_access_expr(desugared, pred_sym, span, span);
-            desugared = new CallExprNode(pred_member, span) as ExpressionNode*;
+            desugared = ExpressionNode::call_expr(pred_member, span) as ExpressionNode*;
         }
         if (map.negate) {
             const bang: Token = Token::new(TokenType::Exclaim, "!", op_tok.line, op_tok.column);
@@ -3230,9 +3228,9 @@ type struct SemaVisitor {
             this.async_lower.poll_identity(), this.intern.intern("Ready"), span);
         ExpressionNode::scope_resolution_of(scope).set_synthesized_res(
             this.ctx.decl_index.def_of(poll_out, this.ctx.type_arena));
-        mut call: CallExprNode* = new CallExprNode(scope, span);
-        call.add_argument(value);
-        return call as ExpressionNode*;
+        mut call: ExpressionNode* = ExpressionNode::call_expr(scope, span);
+        ExpressionNode::call_of(call).add_argument(value);
+        return call;
     }
 
     /// `func`'s Output if it is the `poll` an `async fn` was lowered into,
@@ -3358,11 +3356,11 @@ type struct SemaVisitor {
             const err_scope: ExpressionNode* = ExpressionNode::scope_resolution_expr(enum_name, err_variant, span);
             ExpressionNode::scope_resolution_of(err_scope).set_synthesized_ref(err_scope, ret_ty,
                 this.ctx.decl_index.def_of(ret_ty, this.ctx.type_arena));
-            mut err_call: CallExprNode* = new CallExprNode(err_scope, span);
+            mut err_call: ExpressionNode* = ExpressionNode::call_expr(err_scope, span);
             const err_ident: ExpressionNode* = ExpressionNode::identifier_expr(err_bind, span);
             ExpressionNode::identifier_of(err_ident).set_res(Res::Local(err_sym));
-            err_call.add_argument(err_ident);
-            ret_value = err_call as ExpressionNode*;
+            ExpressionNode::call_of(err_call).add_argument(err_ident);
+            ret_value = err_call;
         } else {
             const bare_err: ExpressionNode* =
                 ExpressionNode::scope_resolution_expr(enum_name, err_variant, span);
@@ -4357,11 +4355,11 @@ type struct SemaVisitor {
     // type, so no special-casing on the callee's symbol name is needed.
     expr_is_divergent(&this, expr: ExpressionNode*) -> boolean {
         if (expr == null) { return false; }
-        if (expr.kind != NodeKind::CallExpression) { return false; }
-        const call: CallExprNode* = expr as CallExprNode*;
+        if (ExpressionNode::call_of(expr) == null) { return false; }
+        const call: CallExpr* = ExpressionNode::call_of(expr);
         if (call.callee == null) { return false; }
-        if (call.resolved_type.is_valid()) {
-            const rt: Type* = this.arena.lookup(call.resolved_type);
+        if (expr.resolved_type.is_valid()) {
+            const rt: Type* = this.arena.lookup(expr.resolved_type);
             if (rt != null && rt.kind == TypeKind::Never) { return true; }
         }
         return false;
@@ -4379,8 +4377,8 @@ type struct SemaVisitor {
             }
             return;
         }
-        if (e.kind == NodeKind::CallExpression) {
-            const c: CallExprNode* = e as CallExprNode*;
+        if (ExpressionNode::call_of(e) != null) {
+            const c: CallExpr* = ExpressionNode::call_of(e);
             const arg_id: IdentifierExpr* = if (c.arguments.length == 1) { ExpressionNode::identifier_of(c.arguments[0]) } else { null };
             if (arg_id != null && this.callee_names_ret_variant(c.callee, ret_ty)) {
                 if (this.scopes.names_payload(arg_id.res.local_sym()) && this.ret_carries_pointer_to(ret_ty, c.arguments[0].resolved_type)) {

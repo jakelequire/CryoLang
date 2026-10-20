@@ -19,7 +19,7 @@ import compiler::ast::declaration::{
     StructDecl, TraitDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
-    CallExprNode,
+    CallExpr,
     ExprKind, ExpressionNode,
     MemberAccessExpr, ScopeResolutionExpr,
     UnaryExpr
@@ -410,27 +410,26 @@ type struct Uses {
     }
 
     /// An expression; `call` is the call it is the callee of, or null.
-    expr(mut &this, e: ExpressionNode*, call: CallExprNode*) -> void {
+    expr(mut &this, e: ExpressionNode*, call: CallExpr*) -> void {
         if (e == null) { return; }
         const n: ASTNode* = e as ASTNode*;
         if (n.generated) {
             // The compiler wrote it, so it names nothing; the written code
             // it wraps - an f-string's holes, a converted operand - is
             // walked.
-            if (n.kind == NodeKind::CallExpression) { this.exprs(&(e as CallExprNode*).arguments); }
+            if (ExpressionNode::call_of(n) != null) { this.exprs(&ExpressionNode::call_of(e).arguments); }
             const gen_un: UnaryExpr* = ExpressionNode::unary_of(n);
             if (gen_un != null) { this.expr(gen_un.operand, null); }
             return;
         }
         match (n.kind) {
-            NodeKind::CallExpression => {
-                const c: CallExprNode* = e as CallExprNode*;
-                this.expr(c.callee, c);
-                this.exprs(&c.arguments);
-                this.annotations(&c.generic_args);
-            }
             NodeKind::Expression => {
                 match (e.shape) {
+                    ExprKind::Call(c) => {
+                        this.expr(c.callee, c);
+                        this.exprs(&c.arguments);
+                        this.annotations(&c.generic_args);
+                    }
                     ExprKind::Identifier(id) => {
                         if (!id.is_this_keyword) { this.add(n.span, this.loc.res_target(&id.res), false); }
                         this.annotations(&id.generic_args);
@@ -520,7 +519,6 @@ type struct Uses {
                         this.node(l.body as ASTNode*);
                     }
                     ExprKind::Literal(_)  => { }
-                    ExprKind::Legacy      => { }
                 }
             }
             _ => { }

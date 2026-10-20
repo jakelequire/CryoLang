@@ -55,7 +55,7 @@ import compiler::ast::declaration::{
     TraitDecl, TypeAliasDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
-    AlignofExpr, BinaryExpr, CallExprNode, CastExpr,
+    AlignofExpr, BinaryExpr, CallExpr, CastExpr,
     ExprKind, ExpressionNode, IdentifierExpr,
     MemberAccessExpr, ScopeResolutionExpr, SizeofExpr,
     UnaryExpr
@@ -1048,15 +1048,14 @@ type struct TypeResolutionRunner {
         if (expr == null) { return; }
         const n: ASTNode* = expr as ASTNode*;
         match (n.kind) {
-            NodeKind::CallExpression => {
-                // Recurse into arguments so lambdas passed as arguments get resolved.
-                const call: CallExprNode* = expr as CallExprNode*;
-                for (mut i: i64 = 0; i < call.arguments.length; i++) {
-                    this.resolve_var_types_in_expression(call.arguments[i], res_ctx);
-                }
-            }
             NodeKind::Expression => {
                 match (expr.shape) {
+                    // Recurse into arguments so lambdas passed as arguments get resolved.
+                    ExprKind::Call(call) => {
+                        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                            this.resolve_var_types_in_expression(call.arguments[i], res_ctx);
+                        }
+                    }
                     ExprKind::Match(match_expr) => {
                         for (mut i: i64 = 0; i < match_expr.arms.length; i++) {
                             const arm: MatchArmNode* = match_expr.arms[i];
@@ -1102,8 +1101,7 @@ type struct TypeResolutionRunner {
                     | ExprKind::Tuple(_) | ExprKind::Array(_) | ExprKind::Struct(_)
                     | ExprKind::Literal(_) | ExprKind::Cast(_) | ExprKind::Unary(_)
                     | ExprKind::Binary(_) | ExprKind::ArrayAccess(_) | ExprKind::Await(_)
-                    | ExprKind::Identifier(_) | ExprKind::ScopeResolution(_) | ExprKind::MemberAccess(_)
-                    | ExprKind::Legacy => { }
+                    | ExprKind::Identifier(_) | ExprKind::ScopeResolution(_) | ExprKind::MemberAccess(_) => { }
                     // Resolve parameter types and body variables of a lambda.
                     ExprKind::Lambda(lam) => {
                         // Resolve each parameter's type annotation into resolved_type.
@@ -1140,7 +1138,7 @@ type struct TypeResolutionRunner {
 
     // Generic function call instantiation collection
 
-    /// Scan a statement (recursively) for CallExprNodes with generic_args.
+    /// Scan a statement (recursively) for calls with generic_args.
     /// For each, resolve the args and register an instantiation in the
     /// GenericRegistry so the Monomorphizer can discover and specialize it.
     collect_generic_fn_calls_in_stmt(&this, stmt: Stmt*,
@@ -1222,27 +1220,26 @@ type struct TypeResolutionRunner {
         }
     }
 
-    /// Scan an expression (recursively) for CallExprNodes with generic_args.
+    /// Scan an expression (recursively) for calls with generic_args.
     collect_generic_fn_calls_in_expr(&this, expr: ExpressionNode*,
                                      res_ctx: ResolutionContext*) -> void {
         if (expr == null) { return; }
         const node: ASTNode* = expr as ASTNode*;
 
         match (node.kind) {
-            NodeKind::CallExpression => {
-                const call: CallExprNode* = expr as CallExprNode*;
-                // Recurse into callee and arguments first
-                this.collect_generic_fn_calls_in_expr(call.callee, res_ctx);
-                for (mut i: i64 = 0; i < call.arguments.length; i++) {
-                    this.collect_generic_fn_calls_in_expr(call.arguments[i], res_ctx);
-                }
-                // Check for generic_args on the call
-                if (call.generic_args.length > 0) {
-                    this.register_generic_fn_call(call, res_ctx);
-                }
-            }
             NodeKind::Expression => {
                 match (expr.shape) {
+                    ExprKind::Call(call) => {
+                        // Recurse into callee and arguments first
+                        this.collect_generic_fn_calls_in_expr(call.callee, res_ctx);
+                        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                            this.collect_generic_fn_calls_in_expr(call.arguments[i], res_ctx);
+                        }
+                        // Check for generic_args on the call
+                        if (call.generic_args.length > 0) {
+                            this.register_generic_fn_call(call, res_ctx);
+                        }
+                    }
                     ExprKind::Try(try_expr) => {
                         this.collect_generic_fn_calls_in_expr(try_expr.operand, res_ctx);
                     }
@@ -1276,7 +1273,7 @@ type struct TypeResolutionRunner {
                     | ExprKind::Tuple(_) | ExprKind::Array(_) | ExprKind::Struct(_)
                     | ExprKind::Literal(_) | ExprKind::StaticMatch(_) | ExprKind::Match(_)
                     | ExprKind::Cast(_) | ExprKind::Lambda(_) | ExprKind::Await(_)
-                    | ExprKind::Identifier(_) | ExprKind::ScopeResolution(_) | ExprKind::Legacy => { }
+                    | ExprKind::Identifier(_) | ExprKind::ScopeResolution(_) => { }
                 }
             }
             _ => {
@@ -1301,7 +1298,7 @@ type struct TypeResolutionRunner {
     /// search for one under - a bare leaf prefixed with the writer's module
     /// misses every imported template, and a resolver re-entered from here
     /// answers for whatever module the cursor is on.
-    register_generic_fn_call(&this, call: CallExprNode*,
+    register_generic_fn_call(&this, call: CallExpr*,
                              res_ctx: ResolutionContext*) -> void {
         const ident: IdentifierExpr* = ExpressionNode::identifier_of(call.callee);
         if (ident == null) { return; }

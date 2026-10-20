@@ -33,7 +33,7 @@ import compiler::ast::declaration::{
     TraitDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
-    CallExprNode,
+    CallExpr,
     ExprKind, ExpressionNode, FieldInit,
     MatchExpr, MemberAccessExpr
 };
@@ -155,6 +155,13 @@ public function find_named_annotation_at(ann: TypeAnnotation*,
 /// The position walk's per-kind descent, as stateless `static`s.
 type struct NodeLocator {
 
+    /// The callee if it covers the position, else the argument that does.
+    static pick_call(e: CallExpr*, line: u32, character: u32) -> ASTNode* {
+        const callee_match: ASTNode* = NodeLocator::pick_one(e.callee as ASTNode*, line, character);
+        if (callee_match != null) { return callee_match; }
+        return NodeLocator::pick_array_expr(e.arguments, line, character);
+    }
+
     /// Return the first child of `node` whose span covers (line, character),
     /// or `null` if no child does.  Per-kind dispatch: each branch knows
     /// the structural children of its node type.  Add new node kinds here
@@ -164,12 +171,6 @@ type struct NodeLocator {
                                    line: u32, character: u32) -> ASTNode* {
         match (node.kind) {
             // -- Expressions --
-            NodeKind::CallExpression => {
-                const e: CallExprNode* = node as CallExprNode*;
-                const callee_match: ASTNode* = NodeLocator::pick_one(e.callee as ASTNode*, line, character);
-                if (callee_match != null) { return callee_match; }
-                return NodeLocator::pick_array_expr(e.arguments, line, character);
-            }
             NodeKind::Expression => {
                 // `sizeof` and `alignof` hold a type annotation, no child
                 // expression to descend into.
@@ -240,7 +241,7 @@ type struct NodeLocator {
                     ExprKind::MemberAccess(e) => {
                         NodeLocator::pick(e.object as ASTNode*, null, null, null, line, character)
                     }
-                    ExprKind::Legacy     => { null }
+                    ExprKind::Call(e) => { NodeLocator::pick_call(e, line, character) }
                 };
             }
 

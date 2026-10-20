@@ -51,7 +51,7 @@ import std::fmt;
 import compiler::ast::declaration::{ DeclarationNode, DeclKind, VarDecl };
 import compiler::ast::expression::{
     ArrayExpr, BinaryExpr,
-    CallExprNode, ExpressionNode, FieldInit, IdentifierExpr,
+    CallExpr, ExpressionNode, FieldInit, IdentifierExpr,
     LambdaExpr, MatchExpr, MemberAccessExpr, NewExpr,
     ScopeResolutionExpr, StaticMatchExpr, StructExpr,
     TupleExpr, UnaryExpr
@@ -191,14 +191,14 @@ implement struct Parser {
     }
 
     /// Build a call from a pipe operator.  `callable` is the function side
-    /// (an existing CallExprNode whose argument list we extend, or a bare
+    /// (an existing CallExpr whose argument list we extend, or a bare
     /// callable (identifier, member access, or scope resolution) that we
     /// wrap in a fresh call).  `value` is the piped operand; `prepend` puts
     /// it first (`|>`), otherwise last (`<|`).
     desugar_pipe(callable: ExpressionNode*, value: ExpressionNode*,
                  prepend: boolean, span: SourceSpan) -> ExpressionNode* {
-        if (callable.kind == NodeKind::CallExpression) {
-            mut call: CallExprNode* = callable as CallExprNode*;
+        if (ExpressionNode::call_of(callable) != null) {
+            mut call: CallExpr* = ExpressionNode::call_of(callable);
             mut new_args: [ExpressionNode*] = [];
             if (prepend) {
                 new_args.push(value);
@@ -212,14 +212,14 @@ implement struct Parser {
                 new_args.push(value);
             }
             call.arguments = new_args;
-            call.span = span;
-            return call as ExpressionNode*;
+            callable.span = span;
+            return callable;
         }
         // Bare callable: wrap it in a fresh call with the piped value as
         // the sole argument.
-        mut call: CallExprNode* = new CallExprNode(callable, span);
-        call.add_argument(value);
-        return call as ExpressionNode*;
+        mut call: ExpressionNode* = ExpressionNode::call_expr(callable, span);
+        ExpressionNode::call_of(call).add_argument(value);
+        return call;
     }
 
     /// `a ?? b` => `match (a) { Option::Some(v) => { v } Option::None => { b } }`.
@@ -401,10 +401,10 @@ implement struct Parser {
                 const compare_name: SymbolStr = this.ctx.intern("compare");
                 const member: ExpressionNode* = ExpressionNode::member_access_expr(
                     left, compare_name, this.span_from_token(op), span);
-                mut call: CallExprNode* =
-                    new CallExprNode(member, span);
-                call.add_argument(ref_right);
-                left = call as ExpressionNode*;
+                mut call: ExpressionNode* =
+                    ExpressionNode::call_expr(member, span);
+                ExpressionNode::call_of(call).add_argument(ref_right);
+                left = call;
             } else if (op.kind == TokenType::DotDot ||
                        op.kind == TokenType::DotDotEq) {
                 // `a..b`  => `Range::new(a, b)`
@@ -421,11 +421,11 @@ implement struct Parser {
                     ctor_scope, new_name, span);
                 ExpressionNode::scope_resolution_of(sr).scope_res = ResSlot::Lang(range_item);
                 this.ctx.note_lang_ref(sr as ASTNode*, range_item);
-                mut call: CallExprNode* =
-                    new CallExprNode(sr, span);
-                call.add_argument(left);
-                call.add_argument(right);
-                left = call as ExpressionNode*;
+                mut call: ExpressionNode* =
+                    ExpressionNode::call_expr(sr, span);
+                ExpressionNode::call_of(call).add_argument(left);
+                ExpressionNode::call_of(call).add_argument(right);
+                left = call;
             } else {
                 left = ExpressionNode::binary_expr(op, left, right, span);
             }
@@ -1063,25 +1063,25 @@ implement struct Parser {
     /// A call of `name` the lowering writes.  The f-string's text spells
     /// neither the call nor its callee, so both are marked as the
     /// compiler's; the holes among its arguments are written code.
-    fstr_call(name: string) -> CallExprNode* {
+    fstr_call(name: string) -> ExpressionNode* {
         mut id: ExpressionNode* = ExpressionNode::identifier_expr(this.ctx.intern(name), this.fstr_span);
         id.generated = true;
-        mut call: CallExprNode* = new CallExprNode(id, this.fstr_span);
+        mut call: ExpressionNode* = ExpressionNode::call_expr(id, this.fstr_span);
         call.generated = true;
         return call;
     }
 
     /// Build a zero-argument free-function call `name()`.
     fstr_call0(name: string) -> ExpressionNode* {
-        return this.fstr_call(name) as ExpressionNode*;
+        return this.fstr_call(name);
     }
 
     /// Build a two-argument free-function call `name(a, b)`.
     fstr_call2(name: string, a: ExpressionNode*, b: ExpressionNode*) -> ExpressionNode* {
-        mut call: CallExprNode* = this.fstr_call(name);
-        call.add_argument(a);
-        call.add_argument(b);
-        return call as ExpressionNode*;
+        const call: ExpressionNode* = this.fstr_call(name);
+        ExpressionNode::call_of(call).add_argument(a);
+        ExpressionNode::call_of(call).add_argument(b);
+        return call;
     }
 
     /// Sub-lex and parse a hole's source text as a standalone expression.
@@ -1124,13 +1124,13 @@ implement struct Parser {
     /// re-parsed at runtime by `std::fmt::spec::fmt_parse_spec`.
     fstr_call_fmt(acc: ExpressionNode*, ref_node: ExpressionNode*,
                   spec: string) -> ExpressionNode* {
-        mut call: CallExprNode* = this.fstr_call("fmt_append_fmt");
-        call.add_argument(acc);
-        call.add_argument(ref_node);
+        const call: ExpressionNode* = this.fstr_call("fmt_append_fmt");
+        ExpressionNode::call_of(call).add_argument(acc);
+        ExpressionNode::call_of(call).add_argument(ref_node);
         mut lit: ExpressionNode* = ExpressionNode::literal(spec, LiteralKind::String, this.fstr_span);
         lit.generated = true;
-        call.add_argument(lit);
-        return call as ExpressionNode*;
+        ExpressionNode::call_of(call).add_argument(lit);
+        return call;
     }
 
     /// Index of the `:` that separates a hole's expression from its format
@@ -1262,14 +1262,14 @@ implement struct Parser {
         const gen_args: [TypeAnnotation*] = this.parse_generic_args();
 
         if (this.check(TokenType::LParen)) {
-            mut call: CallExprNode* = new CallExprNode(head, head.span);
-            call.set_generic_args(gen_args);
+            mut call: ExpressionNode* = ExpressionNode::call_expr(head, head.span);
+            ExpressionNode::call_of(call).set_generic_args(gen_args);
             this.advance(); // consume '('
             if (!this.check(TokenType::RParen)) {
                 while (true) {
                     const arg: ExpressionNode* = this.parse_expression();
                     if (arg != null) {
-                        call.add_argument(arg);
+                        ExpressionNode::call_of(call).add_argument(arg);
                     }
                     if (!this.match_tok(TokenType::Comma)) {
                         break;
@@ -2449,7 +2449,7 @@ implement struct Parser {
     // Postfix Helpers
 
     /// Parse function call arguments: callee(arg1, arg2, ...)
-    parse_call_args(callee: ExpressionNode*) -> CallExprNode* {
+    parse_call_args(callee: ExpressionNode*) -> ExpressionNode* {
         // PAREN_DEPTH_LIMIT: nested calls (`f(f(f(...)))`) recurse through
         // parse_expression for each argument, overflowing the native stack
         // (SIGSEGV) on pathological depth. `paren_depth` is maintained by
@@ -2461,7 +2461,7 @@ implement struct Parser {
             return null;
         }
         this.advance(); // consume '('
-        mut call: CallExprNode* = new CallExprNode(callee, callee.span);
+        mut call: ExpressionNode* = ExpressionNode::call_expr(callee, callee.span);
 
         // If the callee is a member access whose name carried explicit type
         // arguments (`obj.method<T>`), promote those onto the call so the
@@ -2475,7 +2475,7 @@ implement struct Parser {
                 // nodes - a shallow pointer copy double-frees the shared nodes.
                 mut ga_copy: [TypeAnnotation*] = [];
                 for (mut gi: i64 = 0; gi < ma.generic_args.length; gi++) { ga_copy.push(TypeAnnotation::clone_ptr(ma.generic_args[gi])); }
-                call.set_generic_args(ga_copy);
+                ExpressionNode::call_of(call).set_generic_args(ga_copy);
             }
         }
 
@@ -2483,7 +2483,7 @@ implement struct Parser {
             while (true) {
                 const arg: ExpressionNode* = this.parse_expression();
                 if (arg != null) {
-                    call.add_argument(arg);
+                    ExpressionNode::call_of(call).add_argument(arg);
                 }
                 if (!this.match_tok(TokenType::Comma)) {
                     break;
@@ -3367,8 +3367,8 @@ implement struct Parser {
         if (sr != null) {
             return sr.member_name;
         }
-        if (node.kind == NodeKind::CallExpression) {
-            const call: CallExprNode* = expr as CallExprNode*;
+        if (ExpressionNode::call_of(node) != null) {
+            const call: CallExpr* = ExpressionNode::call_of(expr);
             return this.get_expr_name(call.callee);
         }
         return SymbolStr::empty();
