@@ -2336,6 +2336,25 @@ place that answers "no node at all" answers `Node?` (the node locator).
   a defect today; give each one a test.
 - **Proof:** identical; selfhost.
 
+Built so far:
+
+- `Clone`: the eight hand-written `clone(&this) -> This` methods are trait
+  implementations, and arrays of them copy through `Array`'s `Clone`.
+  `TypeAnnotation::clone` stays a method (it returns a fresh pointer, not a
+  value of its own type); the cloner's leaf copies stay in the cloner (each
+  recurses through it).
+- The cloner's audit: a function's copy keeps `is_implicit`, `is_weak`,
+  `is_naked` and `link_section`; a path's and an enum pattern's copy keep
+  their segment spans; a declaration's copy keeps `modifier_span`, a
+  variable's its `kw_span`, a struct's its `binding_namespace`.  Left as
+  they are, each with its reason in the cloner: the stamps and types a
+  later pass writes (`def`, `resolved_type`, `spec_of`, the impl's
+  `trait_item_methods`), the intrinsic, import and extern block fields no
+  clone ever copies (bug 0066, ruling 410).  Open: `generated` is set on a
+  copy only through `clone_node`, so the sub-nodes the cloner reaches
+  directly (a function's body, parameters, arms, patterns, directives)
+  lose it; whether any reader sees it on a copy is not measured.
+
 ### Slice 9: delete the class feature (built before slice 8)
 
 Ruling 415 orders the class deletion before trait objects; the slices keep
