@@ -13,9 +13,10 @@ and measured only; nothing in it was built except two throwaway probes
 (section 2.6).  The decisions it needs are in section 9; nothing in a slice
 that depends on one starts before it is answered.
 
-**Status.**  The 13 decisions in section 9 are answered.  Slices 0 to 5
-are built; their results are recorded under each slice in section 6.
-Every temporary bridge piece is listed in section 10 until it is deleted.
+**Status.**  The 13 decisions in section 9 are answered.  Every slice is
+built, slices 0 to 9 and slice 8's steps T0 to T5; their results are
+recorded under each slice in section 6.  The bridge table in section 10 is
+empty.
 
 **Prerequisite:** the array unification is finished (it has landed).  The
 node shapes below hold their children in `[T]` (`Array<T>`); the pin of
@@ -870,7 +871,8 @@ Every compiler slice also runs:
   arena figures below.  It refuses a run that does not end in a clean
   check.  Control: `PeakWorkingSet64` polled by PowerShell every 100 ms
   during one run read 1515.9 MiB; the script read 1520.3 MiB for the same
-  input, and the poll can miss the last 100 ms.
+  input, and the poll can miss the last 100 ms.  Deleted once the last
+  slice was measured; `CRYO_TIMINGS`, which it read, stays.
 - A counter was needed, because the arena's own `used()` also counts the
   container heap routed into it.  `cryo_ast_arena_alloc` counts node
   allocations and their requested bytes, reset with the arena, and the
@@ -2337,7 +2339,7 @@ place that answers "no node at all" answers `Node?` (the node locator).
   a defect today; give each one a test.
 - **Proof:** identical; selfhost.
 
-Built so far:
+**Built:**
 
 - `Clone`: the eight hand-written `clone(&this) -> This` methods are trait
   implementations, and arrays of them copy through `Array`'s `Clone`.
@@ -2351,10 +2353,18 @@ Built so far:
   they are, each with its reason in the cloner: the stamps and types a
   later pass writes (`def`, `resolved_type`, `spec_of`, the impl's
   `trait_item_methods`), the intrinsic, import and extern block fields no
-  clone ever copies (bug 0066, ruling 410).  Open: `generated` is set on a
-  copy only through `clone_node`, so the sub-nodes the cloner reaches
-  directly (a function's body, parameters, arms, patterns, directives)
-  lose it; whether any reader sees it on a copy is not measured.
+  clone ever copies (bug 0066, ruling 410).  `generated`: an expression's,
+  a statement's and a declaration's copy keep it (`clone_expr`,
+  `clone_stmt`, `clone_decl`); a pattern's, an arm's and a directive's keep
+  it only through `clone_node`.  It has two readers.  The unused-variable
+  lint reads it on a declaration statement's declaration, which
+  `clone_decl` copies with the flag.  The language server's locator reads
+  it on any node, to step past a node the compiler wrote; it answers a
+  position in a file the editor holds, and a pattern, arm or directive
+  copied without the flag would answer there only if a copy were reachable
+  from that file's tree, which is not measured.  Established by reading the
+  cloner and both readers, not by instrumenting; nothing further is
+  planned on this branch.
 - `Walk` reaches written types: `walk_children` hands every annotation, `where`
   bound and named trait a node holds to `walk_annotation`, `walk_bound` and
   `walk_trait_ref`, whose defaults do nothing.  The name layer's exit check
@@ -2437,7 +2447,7 @@ their numbers so the references to "slice 9" elsewhere stay true.
 
 | step | what | proof |
 |---|---|---|
-| T0 | One function answers "which traits of a trait chain declare this method, nearest first, and at what position": `trait_members_declaring`.  The bounded-receiver lookups (return, parameters, the projection and default-copy bounds, the generic-method search) ask it instead of walking the chain each its own way.  No behaviour change: each caller keeps its own choice among the answers (the first with a return, the first with the argument count, the bound's own trait only). | Every object identical; `--ast` identical. |
+| T0 | One function answers "which traits of a trait chain declare this method, nearest first, and at what position": `trait_members_declaring`.  The bounded-receiver lookups (return, parameters, the projection and default-copy bounds, the generic-method search) ask it instead of walking the chain each its own way.  No behaviour change: each caller keeps its own choice among the answers (the first with a return, the first with the argument count, the bound's own trait only). | Every object identical; `--ast` identical.  Built. |
 | T1 | Syntax and type: `virtual &T`, `virtual mut &T`, `virtual T*` parsed into an object annotation; a type kind of its own holding the trait, its arguments and the form; resolution (E0313 not raised under `virtual`); E0316 for `virtual` on a non-trait and for an object in an `extern` signature; display, mangling, size and alignment (two pointers), the ABI's pair, `Copy`.  No method callable and no conversion yet: a conversion is a type mismatch, a call is refused at the call (E0358), a field read (E0204) and `delete` (E0200) are refused for good. | Negative files per new code, each refused differently by the parent and shown to fail with its check disabled; a run project asserting the layout.  Built.  Left for T3: the count of trait arguments an object writes is not checked, and a generic parameter is not inferred through an object's arguments. |
 | T2 | Conversion and calls through one trait: object safety per method (E0314), the conversion at every assignment site (E0315), the call through the table, the table emitted in the implementation's module with its three reserved words, the symbol and its demangler test, `null` and comparison rules.  Built as T2a and T2b, each a finished commit. | Run tests on both systems dispatching to two implementations, a default through the table, two traits with a same-named method; the table-position swap gate pair. |
 | T2a | The value: one sema conversion helper asked at every site that checks an assignment (initializer, assignment, argument, return, struct-literal field, array element), inserting a conversion node that names the source type and the implementation chosen; E0315 where the type does not implement the trait or implements it generically; accepted sources `&X`/`mut &X` to the borrowed forms, `X*` and `null` to `virtual T*`, an object to an object of the same trait and form.  Codegen builds the pair `{ data, &table }`; the table, `C$vt$<trait>$f<type>`, is emitted in the implementation's module for each implementation some conversion in the build names, its first three words drop, size and alignment, then the trait's own methods by position (an empty slot is an internal error); the demangler prints it.  `virtual T*` against `null` with `==` and `!=`; every other comparison of an object refused.  Calls through an object stay refused (E0358). | Negative files for E0315 and the comparison refusals, refused differently by the parent and shown to fail with each check disabled; a run project on both systems converting at each site and comparing a `virtual T*` with `null`; a demangler test; a cross-module project (implementation, trait and conversion in three modules); every other object identical.  Built.  A borrowed form takes a reference in either mutability, as a reference parameter does; the drop word releases the value in full, its type's `Drop` implementation's `drop` and then every field it owns, through a release function internal to the implementation's module, null for a type that owns nothing; a slot for a method unavailable on objects is null.  Left for later: a variant constructor written with type arguments (`Pick::<A>::One(&c)`) does not convert its payload, and an overloaded call does not count a conversion when it picks an overload. |
@@ -2445,30 +2455,33 @@ their numbers so the references to "slice 9" elsewhere stay true.
 | T3 | Supertraits first in the table, supertrait methods callable on the object, trait arguments bound positionally.  Built in steps, each a finished commit: T3a supertraits, then calls through a reference or pointer to an object, then trait arguments. | Run tests through a subtrait object and a generic trait's object. |
 | T3a | Supertraits: the table lays out each supertrait's methods first (`GenericRegistry::object_table_traits`, recursive, a trait reached twice once), and one answer, `object_table_index`, gives the word of a (object trait, declaring trait, slot) method for both the table and the call; a conversion finds the type's implementation of every supertrait, recorded with the table, and refuses a missing one (E0315); a call on an object resolves to the nearest declaring trait as a bound does. | Run test on both systems through a subtrait object: a supertrait's and a supertrait's supertrait's method, a default, a trait inherited twice, a subtrait method shadowing a supertrait's, the supertrait implementations in another module, the table's prefix read through its words; an E0315 negative file.  Built.  Left: an object of a trait whose supertrait takes type arguments is refused (E0315, interim note), for the trait-argument step. |
 | T3-ref | Calls through a reference or pointer to an object: the receiver's type is read through references and pointers to the object it reaches (`TypeArena::object_behind_receiver`), the one answer sema, monomorphization and codegen ask; codegen loads the object through each level; the interim E0358 note is gone. | Run test on both systems through `&virtual &Shape`, `virtual &Shape*`, `virtual Shape**`, two levels, a `mut` method through `&virtual mut &Shape`, a supertrait's method through a reference; the E0358 file's reference and pointer cases name a missing method.  Built. |
-| T3-targs | Type arguments written on a call through an object are refused (E0307, the wording of the excess on a method value, one function `CallResolver::report_excess_type_arguments` for both): a method callable through an object has none of its own. | Negative file: on the object, on a supertrait's method, through a reference.  Built.  Not done: the same excess on a call of an ordinary method that has no type parameters is not checked. |
+| T3-targs | Type arguments written on a call through an object are refused (E0307, the wording of the excess on a method value, one function `CallResolver::report_excess_type_arguments` for both): a method callable through an object has none of its own. | Negative file: on the object, on a supertrait's method, through a reference.  Built.  The same excess on a call of an ordinary method is refused with the same wording, whether the method has type parameters of its own or none (`CallResolver::method_call_type_arguments_excess`). |
 | T3-args | Trait arguments: an object writes the trait's parameters, then its associated types, each in declaration order, and exactly that many (E0307 in the name layer); a conversion matches the implementation's trait arguments and associated-type bindings, head or body, position by position (`GenericRegistry::binds_trait_arguments`), and each supertrait's at the arguments the subtrait writes on it with the object's put in (`TypeResolver::object_trait_arguments`; the interim E0315 for a supertrait taking arguments is gone); a call reads the method's parameters and return with them put in (`TypeResolver::object_method_type`, over `substitute_trait_arguments`, which a bound's call uses too), in sema and in code generation alike; `This::Item` no longer makes a method unavailable, but one the object leaves unbound is E0314 at the call; inference unifies two objects' arguments. | Run test on both systems: a generic trait implemented at two arguments, a subtrait's argument flowing into its supertrait, associated types bound in the body and positionally, a default through the table returning the trait's parameter and a tuple of associated types, a generic function inferring through an object, a mutable counter, the standard library's `Chars` through `virtual mut &Iterator<u32>`; negative files for the count, an unbound associated type, a conversion at the wrong arguments.  Built.  Left: a trait reached twice in one table at different arguments is laid out once, at the first. |
 | T3b | An object satisfies its own trait (a compiler-made implementation).  Built in steps, each a finished commit: T3b-calls, then T3b-defaults, then T3b-rest. | The parent refuses `Foo<virtual &Bar>`; the new compiler runs it. |
 | T3b-calls | The bound and the calls, for a trait whose every method is callable through a table: `TraitChecker::type_implements_trait` answers an object for its own trait and each supertrait when every method of the bound's trait chain is callable through a table, in every form, as a call written on the object is; a bounded call whose receiver is an object after substitution goes through the table (monomorphization already leaves an object call unbound, and code generation already loads through references); an associated-type projection on an object reads the object's own arguments; the release of an object (`drop_in_place` in `Array<virtual &Bar>`) releases nothing, as for every `Copy` type. | Run test on both systems: a generic struct and a generic function at `virtual &`, `virtual mut &` and `virtual *` objects of two implementations, a supertrait bound met by a subtrait object, a default reached through the table (reaching an override), a projection through the object, `[virtual &Bar]`, the instance in another module; a negative E0306 file for methods a table cannot hold, accepted with its check disabled.  Built. |
 | T3b-defaults | A default method a table cannot hold (its own type parameters, `This` outside the receiver, a by-value receiver) no longer blocks the bound: a call of it on an object in a generic body binds to the trait's default compiled with `This` as the object type, in which each call on the object goes through the table.  A concrete type's own override of such a default is not reached through the object; `docs/cryo.md` says so.  A required method a table cannot hold still blocks the bound. | Run test on both systems: `Iterator`'s generic defaults (`map`, `filter`, a `for` loop) through `virtual mut &Iterator<i32>` in a generic function and a generic struct; a `This`-returning default; the override caveat shown by a run that reaches the default.  Built: the default is compiled once per object type, under a definition minted beneath the trait, in the trait's module. |
-| T3b-rest | Whatever T3b-calls and T3b-defaults left, listed in their rows when they land; the E0306 note naming the method that blocks an object's bound waits on its wording. | As the cases need.  Nothing else remains: neither row left a case open.  Adaptors chained after `take` or `map` on a bounded receiver, which T3b-defaults' run test did not need, landed with T4.  The E0306 note is not built; it waits on its wording. |
+| T3b-rest | Whatever T3b-calls and T3b-defaults left, listed in their rows when they land; the E0306 note naming the method that blocks an object's bound. | As the cases need.  Nothing else remains: neither row left a case open.  Adaptors chained after `take` or `map` on a bounded receiver, which T3b-defaults' run test did not need, landed with T4.  Built: the E0306 note names the first method with no default a table cannot hold, in the bound's trait or a supertrait, with E0314's reason (`TraitChecker::bound_failure_note`, at each of the four sites that report a bound the type does not meet; a type that is not an object keeps its note). |
 | T4 | Docs: `docs/cryo.md` section 11.7, trait objects (spelling, type arguments, conversion, supertraits, calls, object safety, an object satisfying its own trait, the override caveat, `null` and comparison); the table's layout in `docs/abi.md`; the object form in `docs/grammar.md`; the object type, the table and the default compiled for an object in `docs/cryo-mangling-spec.md`. | Rides with a code change.  Built, with `take(n).map(f)` and `map(f).filter(p)` on a bounded receiver: `TakeIter`'s where-only item read off a type parameter's projection, and `filter`, a default copied per call, typed and bound on an instantiation not yet minted. |
 | T5 | Re-pin, then the language server's yield hook as `virtual YieldHook*`. | `lsp-check`; selfhost.  Built: the trait `YieldHook` in `compiler::compilation_context`, implemented by the server; the gate fails 2 of its checks with the hook's call disabled. |
 
 ### Slice 10: docs (in each slice's own commit, listed here so nothing is missed)
 
-- `docs/cryo.md`: section 9 removed; casts, `new`/`delete`, `Allocate`,
-  layout, keywords, the directive table and async updated; trait objects
-  written into section 11.
-- `docs/grammar.md`, `docs/abi.md`, `docs/cryo-mangling-spec.md`.
-- `docs/resolution-rules.md`: the door table's class field door, and
+- [x] `docs/cryo.md`: casts, `new`/`delete`, `Allocate`, layout, keywords,
+  the directive table and async updated; trait objects written into
+  section 11 (11.7).  Section 9 is not removed: it says Cryo has no
+  classes and lists each refused form with what to write instead, and
+  the keyword table links to it.
+- [x] `docs/grammar.md`, `docs/abi.md`, `docs/cryo-mangling-spec.md`.
+- [ ] `docs/resolution-rules.md`: the door table's class field door, and
   rulings superseding 249 (inheritance clause), 253, 258, 291, 294, 295
   and 303.
-- `docs/roadmap.md`: the class-removal and trait-object items marked
+- [ ] `docs/roadmap.md`: the class-removal and trait-object items marked
   built, with what is left (owning boxes, upcasting, generic
   implementations as objects, supertrait reach).
-- The language server's keyword hover text and `tools/CryoAnalyzer`'s
-  grammar.
-- This plan is deleted when slice 9 lands.
+- [x] The language server's keyword hover text (`class`, `protected`,
+  `override` say they are refused, and what to write); `tools/CryoAnalyzer`'s
+  grammar keeps them as keywords, since they stay reserved.
+- [ ] This plan is deleted when slice 9 lands.
 
 ### The riskiest slices
 
@@ -2669,9 +2682,9 @@ Every piece of code that exists only to carry the tree from one shape to the
 next is listed here when it is written and struck when it is deleted.  The
 final audit greps for each name listed and expects none.
 
-| piece | where | written in | deleted when |
-|---|---|---|---|
-| `implement class ClassDeclNode { static walk_children ... }`, the last of the per-class walk blocks (the others moved inline into their structs) | `compiler/src/compiler/AST/walk.cryo` | slice 2 (`1d9945cf`) | deleted with the class, in slice 9 |
-| The expression projections, one per kind (`ExpressionNode::sizeof_of`, `alignof_of`, `typeof_of`, `delete_of`, `new_of`, `try_of`, `tuple_of`, `array_of`, `struct_of`, `literal_of`, `ternary_of`, `if_of`, `static_match_of`, `match_of`, `cast_of`, `unary_of`, `binary_of`, `array_access_of`, `lambda_of`, `await_of`, `identifier_of`, `scope_resolution_of`, `member_access_of`, `call_of`) | `compiler/src/compiler/AST/expression.cryo` and their callers | slice 6 (expressions) | take the header since `Program` and `Node` commit 3, and `ExpressionNode::with_shape` is deleted; a one-kind projection of a header is then a checked accessor, as `Stmt::as_block` is, not a conversion between two shapes, and they stay as accessors (ruling 460): no longer a bridge piece |
-| `DeclKind::Legacy` and every `match` arm for it, `DeclarationNode::is_class` and `kind_name`, `DeclarationNode` a class (its one subclass is `ClassDeclNode`) and its kind named `shape` | `compiler/src/compiler/AST/declaration.cryo` and every declaration consumer | slice 6 (declarations, `IntrinsicConst` and `Module`) | deleted in slice 9 with the class, the one kind never converted (ruling 413): the header is a struct and `shape` is renamed `kind` |
-| The declaration projections (`DeclarationNode::module_of`, `import_of`, `extern_of`, `alias_of`, `enum_of`, `trait_of`, `union_of`, `struct_of`, `impl_of`, `var_of`, `fn_of`, `method_of`) and `DeclarationNode::with_shape` | `compiler/src/compiler/AST/declaration.cryo` and their callers | slice 6 (declarations) | take the header since `Program` and `Node` commit 3; `with_shape` answered null for a class and was deleted with it in slice 9.  The projections themselves stay as checked accessors (ruling 460) |
+None is standing.  The class's walk block and the declaration header's
+legacy kind were deleted with the class; the per-kind expression and
+declaration accessors (`ExpressionNode::call_of`, `DeclarationNode::fn_of`
+and the rest) stay as checked accessors of a header, which is what they
+became once the headers were structs (ruling 460), and are no longer bridge
+pieces.

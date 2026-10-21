@@ -191,23 +191,64 @@ type struct TraitChecker {
     /// (`MonoCallSpecializer::object_default_method`).
     object_implements_trait(&this, object: ObjectType*, trait_def: DefId) -> boolean {
         if (this.generic_registry == null) { return false; }
+        if (!this.object_reaches_trait(object, trait_def)) { return false; }
+        mut declaring: DefId = DefId::invalid();
+        return this.object_bound_blocker(trait_def, &declaring) == null;
+    }
+
+    /// Whether `trait_def` is the object's own trait or one of its
+    /// supertraits: the traits whose implementation the compiler makes for
+    /// it.
+    object_reaches_trait(&this, object: ObjectType*, trait_def: DefId) -> boolean {
         const reached: [DefId] = this.generic_registry.object_table_traits(object.trait_def);
-        mut found: boolean = false;
         for (mut i: i64 = 0; i < reached.length; i++) {
-            if (reached[i].equals(trait_def)) { found = true; }
+            if (reached[i].equals(trait_def)) { return true; }
         }
-        if (!found) { return false; }
+        return false;
+    }
+
+    /// The method that keeps every object from satisfying a bound of
+    /// `trait_def`: the first, in `trait_def` or a supertrait, with no
+    /// default that a table cannot hold, its trait written through
+    /// `out_declaring`; null when there is none.
+    object_bound_blocker(&this, trait_def: DefId, out_declaring: DefId*) -> DeclarationNode* {
         const required: [DefId] = this.generic_registry.object_table_traits(trait_def);
         for (mut t: i64 = 0; t < required.length; t++) {
             const decl: TraitDecl* = this.generic_registry.get_trait_decl(required[t]);
-            if (decl == null) { return false; }
+            if (decl == null) { continue; }
             for (mut m: i64 = 0; m < decl.methods.length; m++) {
                 const method: FunctionDecl* = DeclarationNode::fn_of(decl.methods[m]);
                 if (method != null && method.has_body()) { continue; }
-                if (this.generic_registry.method_object_unavailable(decl.methods[m]).length() > 0) { return false; }
+                if (this.generic_registry.method_object_unavailable(decl.methods[m]).length() > 0) {
+                    *out_declaring = required[t];
+                    return decl.methods[m];
+                }
             }
         }
-        return true;
+        return null;
+    }
+
+    /// The note an unmet bound of `trait_def` on `ty` carries, `trait_shown`
+    /// and `ty_shown` being the names its headline gives them.  For an
+    /// object of a trait that reaches `trait_def`, the compiler makes the
+    /// implementation, so the note names the method that keeps it from
+    /// doing so and why, in the words a call of that method through the
+    /// object is refused with (E0314).  For any other type, that the type
+    /// does not implement the trait.
+    bound_failure_note(&this, ty: TypeRef, trait_def: DefId, trait_shown: string, ty_shown: string) -> string {
+        const t: Type* = this.arena.lookup(ty);
+        if (t != null && t.kind == TypeKind::Object && this.generic_registry != null
+                && this.object_reaches_trait(t.as_object(), trait_def)) {
+            mut declaring: DefId = DefId::invalid();
+            const method: DeclarationNode* = this.object_bound_blocker(trait_def, &declaring);
+            if (method != null) {
+                return fmt::format("the method `%s` of `%s` has no default, and cannot be called through `%s`: %s",
+                    this.intern_table.resolve(DeclarationNode::fn_of(method).name),
+                    this.intern_table.resolve(this.generic_registry.get_trait_decl(declaring).name),
+                    ty_shown, this.generic_registry.method_object_unavailable(method));
+            }
+        }
+        return fmt::format("the trait `%s` is not implemented for `%s`", trait_shown, ty_shown);
     }
 
     /// The impl of `trait_id` for `subject` that APPLIES: the first
