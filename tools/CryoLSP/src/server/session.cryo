@@ -45,7 +45,7 @@ import std::io::stdio;
 import std::alloc::arena;
 
 import compiler::compilation_context;
-import compiler::compilation_context::{ SourceOverride };
+import compiler::compilation_context::{ SourceOverride, YieldHook };
 import compiler::module_graph::{ ModuleGraph, ModuleOrigin };
 import compiler::instance;
 import compiler::codegen::ast_arena;
@@ -155,8 +155,8 @@ type struct Project {
 
     /// Run one analysis of the project, with every open buffer in place of
     /// its file.  The analysis is returned unadopted.  The compiler calls
-    /// `hook` with `client` between modules.
-    analyse(mut &this, docs: &docs::Docs, hook: (void*) -> void, client: void*) -> Analysis {
+    /// `hook` between modules.
+    analyse(mut &this, docs: &docs::Docs, hook: virtual YieldHook*) -> Analysis {
         mut a: Analysis = Analysis::none();
 
         // Everything the context points into is made here, with arena
@@ -188,7 +188,6 @@ type struct Project {
         a.arena = box_arena.leak();
         this.building = a.arena;
         this.instance.yield_hook = hook;
-        this.instance.yield_client = client;
         ast_arena::cryo_ast_arena_set_current(a.arena);
         ast_arena::cryo_alloc_arena_set_active(true);
         mut overlays: [SourceOverride] = [];
@@ -211,10 +210,10 @@ type struct Project {
     /// Analyse the project as its files and buffers are now.  The analysis
     /// is kept for publishing; it becomes the one that answers when its
     /// whole tree parsed, and then each open buffer's text is what it read.
-    refresh(mut &this, docs: mut &docs::Docs, hook: (void*) -> void, client: void*) -> void {
+    refresh(mut &this, docs: mut &docs::Docs, hook: virtual YieldHook*) -> void {
         // Owed no longer: a save while this one runs owes the next.
         this.owed = false;
-        mut a: Analysis = this.analyse(docs, hook, client);
+        mut a: Analysis = this.analyse(docs, hook);
         this.analysed = true;
         this.unpublished = true;
         this.last.release();
@@ -279,10 +278,9 @@ implement trait Drop for Project {
 
 type struct Projects {
     by_key: HashMap<String, Project>;
-    /// Called by the compiler between modules of an analysis, with
-    /// `yield_client`: the server answering what it can meanwhile.
-    yield_hook:   (void*) -> void;
-    yield_client: void*;
+    /// Called by the compiler between modules of an analysis: the server
+    /// answering what it can meanwhile.
+    yield_hook:   virtual YieldHook*;
     /// An analysis is running: a request answered from inside it is
     /// answered from the last analysis, never by starting another.
     analysing: boolean;
@@ -291,7 +289,7 @@ type struct Projects {
 
     static new() -> Projects {
         return Projects { by_key: HashMap::<String, Project>::new(), yield_hook: null,
-                          yield_client: null, analysing: false, analyses: 0 };
+                          analysing: false, analyses: 0 };
     }
 
     /// Run project `p`'s owed analysis, unless one is already running.
@@ -300,7 +298,7 @@ type struct Projects {
         this.analysing = true;
         this.analyses = this.analyses + 1;
         p.analysed_at = this.analyses;
-        p.refresh(docs, this.yield_hook, this.yield_client);
+        p.refresh(docs, this.yield_hook);
         this.analysing = false;
     }
 

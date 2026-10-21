@@ -34,6 +34,7 @@ import std::ffi::libc;
 import std::sys::syscall;
 
 import compiler::codegen::ast_arena;
+import compiler::compilation_context::{ YieldHook };
 
 import lsp::protocol::framing;
 import lsp::protocol::jsonrpc;
@@ -89,12 +90,6 @@ type struct Server {
         };
     }
 
-    /// The compiler's hook between two modules of an analysis; `client` is
-    /// the server.
-    static between_modules(client: void*) -> void {
-        const s: Server* = client as Server*;
-        s.serve_waiting();
-    }
 
     /// Handle every message already waiting on stdin, while an analysis is
     /// suspended between modules: a request is answered from the last
@@ -150,8 +145,7 @@ type struct Server {
     /// request that needs the analysis runs it at once
     /// (`Projects::analysis_for`).
     run(mut &this) -> i32 {
-        this.projects.yield_hook = Server::between_modules;
-        this.projects.yield_client = &this as void*;
+        this.projects.yield_hook = &this as Server*;
         loop {
             // Debounce window: only enter it while an analysis or its
             // publishing is owed, so an otherwise-idle server still blocks
@@ -549,6 +543,13 @@ type struct Server {
 
 implement trait Drop for struct Server {
     drop(mut &this) -> void { }
+}
+
+/// The compiler's hook between two modules of an analysis.
+implement trait YieldHook for struct Server {
+    between_modules(mut &this) -> void {
+        this.serve_waiting();
+    }
 }
 
 
