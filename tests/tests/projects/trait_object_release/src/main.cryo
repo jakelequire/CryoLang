@@ -1,0 +1,85 @@
+namespace TraitObjectRelease::Main;
+
+import std::core::drop::{ Drop };
+
+// A trait-object table's first word releases the value behind the object in
+// full: the type's own `drop`, then every field it owns, as the value's scope
+// exit would.  Nothing in the language calls it yet, so the test reads the
+// table through the object's words; the exit code names the first word that
+// answered wrong.
+
+type trait Shape {
+    area(&this) -> i32;
+}
+
+/// Appends its digit to `*log` when released.
+type struct Part {
+    log:   i64*;
+    digit: i64;
+}
+
+implement trait Drop for Part {
+    drop(mut &this) -> void {
+        *this.log = *this.log * 10 + this.digit;
+    }
+}
+
+/// A destructor of its own, and an owned field released after it.
+type struct Owner {
+    log:   i64*;
+    inner: Part;
+}
+
+implement trait Drop for Owner {
+    drop(mut &this) -> void {
+        *this.log = *this.log * 10 + 1;
+    }
+}
+
+/// No destructor of its own: its release is its fields', in order.
+type struct Plain {
+    first:  Part;
+    second: Part;
+}
+
+implement trait Shape for Owner {
+    area(&this) -> i32 { return 1; }
+}
+
+implement trait Shape for Plain {
+    area(&this) -> i32 { return 2; }
+}
+
+implement trait Shape for i64 {
+    area(&this) -> i32 { return 3; }
+}
+
+/// Runs the release word of `o`'s table on the value behind it, when the
+/// table has one, and answers the table's size word, or -1 for no release.
+function release_through_table(o: virtual &Shape) -> i64 {
+    mut copy: virtual &Shape = o;
+    const words: void** = (&copy) as void**;
+    const table: void** = words[1] as void**;
+    if (table[0] == null) { return -1; }
+    const release: (void*) -> void = table[0] as (void*) -> void;
+    release(words[0]);
+    return table[1] as i64;
+}
+
+// Each value is released again at the end of `main`, by its own scope,
+// after the checks have read the log.
+function main() -> i32 {
+    mut log: i64 = 0;
+    const lp: i64* = &log;
+    mut a: Owner = Owner { log: lp, inner: Part { log: lp, digit: 2 } };
+    if (release_through_table(&a) != 24) { return 1; }
+    if (log != 12) { return 2; }
+    log = 0;
+    mut b: Plain = Plain { first: Part { log: lp, digit: 3 }, second: Part { log: lp, digit: 4 } };
+    if (release_through_table(&b) != 32) { return 3; }
+    if (log != 34) { return 4; }
+    // A type that owns nothing has no release.
+    const n: i64 = 5;
+    if (release_through_table(&n) != -1) { return 5; }
+    return 0;
+}

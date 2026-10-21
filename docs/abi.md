@@ -81,8 +81,12 @@ a caller-made copy.
 The table an object points at is a constant array of pointer-sized
 words, emitted once, in the module holding the implementation, as
 `C$vt$<trait>$f<type>` with external linkage.  Its first three words are
-reserved: the type's `Drop` implementation's `drop` (null when it has
-none), the type's size and its alignment.  Then comes one word per method
+reserved: a function of the value's address releasing the value in full
+- its type's `Drop` implementation's `drop`, then every field it owns, as
+its scope's exit would - or null for a type that owns nothing; the type's
+size; and its alignment.  The release function is internal to the
+implementation's module, named after the table, `__cryo.release.` then
+the table's symbol.  Then comes one word per method
 the trait declares, in declaration order: the implementation's function,
 or its copy of the trait's default, and null for a method that cannot be
 called through an object.  A `null` `virtual T*` has both words null.

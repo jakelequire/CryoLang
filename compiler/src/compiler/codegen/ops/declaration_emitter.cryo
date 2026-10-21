@@ -646,7 +646,7 @@ type struct DeclarationEmitter {
     // Trait-object tables
 
     /// The LLVM type of `block`'s trait-object table: three reserved words,
-    /// the type's `drop`, its size and its alignment, then a word per method
+    /// the type's release, its size and its alignment, then a word per method
     /// the trait declares, by position.
     object_table_type(&this, block: ImplBlock*) -> LType {
         const decl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(block.trait_def);
@@ -664,10 +664,11 @@ type struct DeclarationEmitter {
     }
 
     /// Define `block`'s table, in the module holding the implementation,
-    /// when some conversion names it.  A method unavailable on an object
-    /// holds a null word; an available one with no function to point at is
-    /// an internal error, never a table left short.
-    emit_object_table(mut &this, block: ImplBlock*, span: SourceSpan) -> void {
+    /// when some conversion names it.  `drop_word` is the function that
+    /// releases the value behind an object in full, or null.  A method
+    /// unavailable on an object holds a null word; an available one with no
+    /// function to point at is an internal error, never a table left short.
+    emit_object_table(mut &this, block: ImplBlock*, drop_word: LValue, span: SourceSpan) -> void {
         if (!block.object_table_symbol.is_valid()) { return; }
         const registry: GenericRegistry* = this.ctx.generic_registry;
         const decl: TraitDecl* = registry.get_trait_decl(block.trait_def);
@@ -677,7 +678,7 @@ type struct DeclarationEmitter {
         const n: u32 = DeclarationEmitter::object_table_word(decl.methods.length) as u32;
         const buf: void* = libc::malloc(n as u64 * 8);
         const words: void** = buf as void**;
-        words[0] = this.object_table_drop(owner).raw;
+        words[0] = drop_word.raw;
         words[1] = llvm::LLVMConstIntToPtr(this.expr_ops.codegen_sizeof(owner).raw, word.raw);
         words[2] = llvm::LLVMConstIntToPtr(this.expr_ops.codegen_alignof(owner).raw, word.raw);
         for (mut slot: i64 = 0; slot < decl.methods.length; slot++) {
@@ -703,23 +704,6 @@ type struct DeclarationEmitter {
         global.set_initializer(init);
         global.set_global_constant(true);
         global.set_linkage(LLinkage::External);
-    }
-
-    /// A table's drop word: the function of `owner`'s `Drop` implementation,
-    /// or null when it has none.
-    object_table_drop(mut &this, owner: TypeRef) -> LValue {
-        const word: LType = LType::pointer_to(LType::i8());
-        const registry: GenericRegistry* = this.ctx.generic_registry;
-        const drop_trait: DefId = registry.wellknown(LangItem::Drop);
-        if (!drop_trait.is_valid()) { return LType::const_null(word); }
-        const block: ImplBlock* = DeclarationNode::impl_of(
-            registry.select_trait_impl(drop_trait, owner, this.ctx.intern_table));
-        if (block == null) { return LType::const_null(word); }
-        const m: MethodDecl* = DeclarationNode::method_of(registry.trait_item_method(
-            block, registry.trait_item_position(registry.wellknown(LangItem::DropDrop))));
-        if (m == null || m.func == null) { return LType::const_null(word); }
-        const f: LValue = this.resolver.resolve_decl(DeclarationNode::fn_of(m.func).overload_entry);
-        return if (f.is_valid()) { f } else { LType::const_null(word) };
     }
 
     /// Declare methods defined inline within a struct declaration.

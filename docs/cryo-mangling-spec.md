@@ -123,7 +123,10 @@ A trait-object table's symbol is the trait-impl method's without the member and
 signature: the trait's path with its arguments, then `$f` and the implementing
 type's path. `virtual &Shape` over a `Circle` names
 `C$vt$4Main.5Shape$f4Main.6Circle`, demangled `<vtable for Main::Shape for
-Main::Circle>`; two traits' tables for one type differ by the trait.
+Main::Circle>`; two traits' tables for one type differ by the trait.  The
+function a table's first word points at, releasing the value, is internal to
+the table's module and named `__cryo.release.` followed by the table's symbol;
+it is no mangled symbol, and no other module links against it.
 
 The tags `ct` and `dt` are not emitted and stay reserved: they named class
 constructors and destructors.

@@ -41,10 +41,18 @@ import compiler::ast::declaration::{
     UnionDecl, DeclarationNode, VarDecl
 };
 import compiler::ast::expression::{ ExpressionNode };
+import compiler::ast::statement::{ Stmt };
 import compiler::codegen::visit::ir_generator;
 import compiler::codegen::visit::ir_generator::{ IRGeneratorVisitor };
 import compiler::codegen::context::{ CodegenContext };
-import compiler::codegen::llvm_types::{ LType, LTypeKind, LValue };
+import compiler::codegen::llvm_types::{ LBasicBlock, LLinkage, LType, LTypeKind, LValue };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::resolver::mangled_name;
+import compiler::resolver::mangled_name::{ MangledName };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::types::ownership;
+import compiler::types::ownership::{ OwnershipQuery };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::res;
@@ -102,8 +110,59 @@ type struct DeclVisitEmitter {
         cdebug("[IRGen]   impl block: %s (%lld methods)\n",
                impl_target, node.methods.length); libc::fflush(null);
         this.generate_impl_block(visitor, node);
-        this.cg.decl.emit_object_table(node, node.target_type_span);
+        if (node.object_table_symbol.is_valid()) {
+            this.cg.decl.emit_object_table(node, this.emit_object_release(visitor, node), node.target_type_span);
+        }
         cdebug("[IRGen]   impl done\n"); libc::fflush(null);
+    }
+
+    /// The drop word of `block`'s trait-object table: a function of the
+    /// value's address that releases the value in full - its type's `Drop`
+    /// implementation's `drop`, then every field it owns - or null for a
+    /// type that owns nothing.  The body is the release a scope exit
+    /// performs, `value.drop()` lowered as any other, on a value at the
+    /// function's parameter.  Internal, beside the table that points at it,
+    /// which is the function's one use, so its name is no symbol any other
+    /// module links against.
+    emit_object_release(mut &this, visitor: IRGeneratorVisitor*, block: ImplBlock*) -> LValue {
+        const word: LType = LType::pointer_to(LType::i8());
+        const owner: TypeRef = this.cg.ctx.decl_index.impl_owner(block, "codegen/trait-object release");
+        if (!OwnershipQuery::needs_drop(this.cg.get_arena(), this.cg.ctx.generic_registry,
+                this.cg.get_intern(), owner)) {
+            return LType::const_null(word);
+        }
+        const saved: LBasicBlock = this.cg.builder.get_insert_block();
+        const param_buf: void* = libc::malloc(8);
+        const param_tys: void** = param_buf as void**;
+        param_tys[0] = word.raw;
+        const fn_ty: LType = LType::function_type(LType::void_type(), param_buf, 1, false);
+        libc::free(param_buf);
+        // Named after the table, which is one per implementation, so two
+        // types' releases in one module are two functions.
+        const fn_val: LValue = this.cg.llvm_module.add_function(MangledName::new(
+            "__cryo.release." + this.cg.ctx.intern_table.resolve(block.object_table_symbol)), fn_ty);
+        fn_val.set_linkage(LLinkage::Internal);
+        this.cg.builder.position_at_end(LBasicBlock::append(fn_val, "entry"));
+        // The function has no source of its own, so no debug location from
+        // the last body emitted may reach it.
+        if (this.cg.debug_info.is_on()) {
+            llvm::LLVMSetCurrentDebugLocation2(this.cg.builder.raw, null);
+        }
+        this.cg.values.push_scope();
+        const span: SourceSpan = block.target_type_span;
+        const value_sym: SymbolID = this.cg.ctx.resolver.alloc_synthetic_binding();
+        this.cg.values.set(value_sym, LValue { raw: llvm::LLVMGetParam(fn_val.raw, 0) });
+        const value: ExpressionNode* = ExpressionNode::identifier_expr(this.cg.get_intern().intern("value"), span);
+        ExpressionNode::identifier_of(value).set_res(Res::Local(value_sym));
+        value.set_resolved_type(owner);
+        const release: ExpressionNode* = ExpressionNode::call_expr(
+            ExpressionNode::member_access_expr(value, this.cg.get_intern().intern("drop"), span, span), span);
+        this.cg.bind_destructor_call(release);
+        visitor.dispatch_node(Node::Stmt(Stmt::expr_stmt(release, span)));
+        this.cg.values.pop_scope();
+        this.cg.builder.build_ret_void();
+        if (saved.is_valid()) { this.cg.builder.position_at_end(saved); }
+        return fn_val;
     }
 
     emit_struct_decl(mut &this, visitor: IRGeneratorVisitor*, node: StructDecl*) -> void {
