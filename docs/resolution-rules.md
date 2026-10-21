@@ -224,6 +224,20 @@ yet is recorded with the change that builds it, not here.
      on the associated-constants branch, before the feature is built.
      (Jake)
 
+522. **A diagnostic's wording needs no approval:** the one proposed is
+     used and reported, not asked about.  Error codes are chosen the same
+     way; the question is asked only when reusing an existing code versus
+     making a new one is genuinely unclear, and otherwise the choice is
+     reported.  This adjusts ruling 518.  (Jake)
+
+523. **A type's constant may leave out its type annotation,** as a
+     module constant may; its type is then the initializer's.  (Jake)
+
+524. **The constant folder handles the full unsigned 64-bit range,** so
+     that `u64::MAX` can size an array and appear in a `static_assert`;
+     this is built before the standard library's limits are declared.
+     (Jake)
+
 ### 2026-10-20
 
 465. **The removed class syntax is refused with E0117,** "`<form>` is not

@@ -39,6 +39,11 @@
 ///! the pipeline - an array size is fixed before any layout is computed, so
 ///! `sizeof` is not a constant there - and a capability is passed as a
 ///! pointer that may be null rather than as a separate folder.
+///!
+///! A folded value is an `i128`: wide enough for every value of every 64-bit
+///! type at once, so `0xFFFF_FFFF_FFFF_FFFF` and `-9223372036854775808` are
+///! both constants, and every `i128` value is one.  A `u128` above
+///! `i128::MAX` is not, and a fold that would leave the `i128` range bails.
 
 namespace compiler::const_table;
 
@@ -68,10 +73,6 @@ import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::arena::{ TypeArena };
 
 
-/// Largest magnitude representable in i64, as u64.  Folding bails above this
-/// rather than wrapping into a negative size.
-const CONST_I64_MAX_MAG: u64 = 9223372036854775807;
-
 /// Fold states for one entry.  Only a SUCCESS is memoized: a fold can fail
 /// for want of a capability that a later position supplies, so caching the
 /// failure would make the answer depend on which position asked first.
@@ -87,7 +88,7 @@ const CONST_FOLDED:  i32 = 2;
 /// `init` is borrowed from the AST, which outlives the table.
 type struct ConstEntry {
     init:      ExpressionNode*;
-    value:     i64;
+    value:     i128;
     state:     i32;
     /// The same initializer folded as a REAL, memoized separately.
     ///
@@ -273,12 +274,12 @@ public:
 
 
     /// Decode an integer literal lexeme, honouring `0x`/`0o`/`0b` prefixes and
-    /// `_` separators.  False on overflow past u64 or on a stray character.
-    static parse_int_literal(text_text: string, out: u64*) -> boolean {
+    /// `_` separators.  False on overflow past u128 or on a stray character.
+    static parse_int_literal(text_text: string, out: u128*) -> boolean {
         const text: string = text_text;
         if (text == null) { return false; }
         mut i: i64 = 0;
-        mut base: u64 = 10;
+        mut base: u128 = 10;
         if (text[0] == '0' && text[1] != 0) {
             const c: char = text[1];
             if (c == 'x' || c == 'X') { base = 16; i = 2; }
@@ -286,21 +287,20 @@ public:
             else if (c == 'b' || c == 'B') { base = 2;  i = 2; }
         }
 
-        mut acc: u64 = 0;
+        mut acc: u128 = 0;
         mut saw_digit: boolean = false;
         while (text[i] != 0) {
             const c: char = text[i];
             i = i + 1;
             if (c == '_') { continue; }
-            mut d: u64 = 0;
-            if (c >= '0' && c <= '9')      { d = (c - '0') as u64; }
-            else if (c >= 'a' && c <= 'f') { d = ((c - 'a') as u64) + 10; }
-            else if (c >= 'A' && c <= 'F') { d = ((c - 'A') as u64) + 10; }
+            mut d: u128 = 0;
+            if (c >= '0' && c <= '9')      { d = (c - '0') as u128; }
+            else if (c >= 'a' && c <= 'f') { d = ((c - 'a') as u128) + 10; }
+            else if (c >= 'A' && c <= 'F') { d = ((c - 'A') as u128) + 10; }
             else { return false; }         // type suffix or stray character
             if (d >= base) { return false; }
             // Overflow check before the multiply-add.
-            const limit: u64 = 18446744073709551615;
-            if (acc > (limit - d) / base) { return false; }
+            if (acc > (u128::max_value() - d) / base) { return false; }
             acc = acc * base + d;
             saw_digit = true;
         }
@@ -335,16 +335,16 @@ type struct ConstEval {
         return ConstEval { table: null, intern: null, arena: null };
     }
 
-    /// Fold a compile-time integer expression to its `i64` value.
+    /// Fold a compile-time integer expression to its value.
     ///
     /// Returns false for anything non-constant, for any step that would
-    /// overflow i64 or divide by a constant zero, and for a name this
+    /// leave the `i128` range or divide by a constant zero, and for a name this
     /// environment cannot bind.  Bailing is always safe: callers either leave
     /// a width unchanged or report the position as non-constant.
     ///
     /// Booleans fold as 0/1 so a comparison composes with arithmetic; a caller
     /// that wants a count rejects a negative result itself.
-    fold(&this, expr: ExpressionNode*, out: i64*) -> boolean {
+    fold(&this, expr: ExpressionNode*, out: i128*) -> boolean {
         if (expr == null) { return false; }
         const node: ExpressionNode* = expr;
 
@@ -365,10 +365,10 @@ type struct ConstEval {
                 if (vlen <= slen) { return false; }
                 text = lit.value.substr(0, (vlen - slen) as i64);
             }
-            mut v: u64 = 0;
+            mut v: u128 = 0;
             if (!ConstantTable::parse_int_literal(text, &v)) { return false; }
-            if (v > CONST_I64_MAX_MAG) { return false; }
-            *out = v as i64;
+            if (v > i128::max_value() as u128) { return false; }
+            *out = v as i128;
             return true;
         }
 
@@ -384,7 +384,7 @@ type struct ConstEval {
 
         const fold_cast: CastExpr* = ExpressionNode::cast_of(node);
         if (fold_cast != null) {
-            mut v: i64 = 0;
+            mut v: i128 = 0;
             if (!this.fold(fold_cast.expression, &v)) { return false; }
             return ConstEval::wrap_to_primitive(
                 this.primitive_name_of(fold_cast.target_annotation), v, out);
@@ -398,7 +398,7 @@ type struct ConstEval {
             if (this.arena == null || !sz.operand_type.is_valid()) { return false; }
             const t: Type* = this.arena.lookup(sz.operand_type);
             if (t == null) { return false; }
-            *out = t.size_bytes() as i64;
+            *out = t.size_bytes() as i128;
             return true;
         }
 
@@ -407,15 +407,19 @@ type struct ConstEval {
             if (this.arena == null || !al.operand_type.is_valid()) { return false; }
             const t: Type* = this.arena.lookup(al.operand_type);
             if (t == null) { return false; }
-            *out = t.alignment() as i64;
+            *out = t.alignment() as i128;
             return true;
         }
 
         const u: UnaryExpr* = ExpressionNode::unary_of(node);
         if (u != null) {
-            mut a: i64 = 0;
+            mut a: i128 = 0;
             if (!this.fold(u.operand, &a)) { return false; }
-            if (u.op.kind == TokenType::Minus) { *out = 0 - a; return true; }
+            if (u.op.kind == TokenType::Minus) {
+                if (a == i128::min_value()) { return false; }
+                *out = 0 - a;
+                return true;
+            }
             if (u.op.kind == TokenType::Tilde) { *out = ~a;    return true; }
             if (u.op.kind == TokenType::Exclaim) { *out = if (a == 0) { 1 } else { 0 }; return true; }
             return false;
@@ -423,8 +427,8 @@ type struct ConstEval {
 
         const b: BinaryExpr* = ExpressionNode::binary_of(node);
         if (b != null) {
-            mut x: i64 = 0;
-            mut y: i64 = 0;
+            mut x: i128 = 0;
+            mut y: i128 = 0;
             if (!this.fold(b.left,  &x)) { return false; }
             if (!this.fold(b.right, &y)) { return false; }
             return ConstEval::apply_binary(b.op.kind, x, y, out);
@@ -514,7 +518,7 @@ type struct ConstEval {
 
         // Anything else this environment can evaluate is integer-valued
         // (a named integer constant, an enum variant, `sizeof`), promoted.
-        mut iv: i64 = 0;
+        mut iv: i128 = 0;
         if (this.fold(expr, &iv)) { *out = iv as f64; return true; }
         return false;
     }
@@ -537,7 +541,7 @@ type struct ConstEval {
     }
 
     /// Fold a bare name: the constant its stamp names.
-    fold_named(&this, id: IdentifierExpr*, out: i64*) -> boolean {
+    fold_named(&this, id: IdentifierExpr*, out: i128*) -> boolean {
         const idx: i64 = this.stamped_index_of(id);
         if (idx < 0) { return false; }
         return this.fold_entry(idx, out);
@@ -558,7 +562,7 @@ type struct ConstEval {
     /// means it named a TYPE, so the member is a constant the type declares
     /// (`u8::MAX`, `Point::LIMIT`) or an enum variant of it.  Anything else
     /// is not a compile-time integer.
-    fold_scoped(&this, sr: ScopeResolutionExpr*, out: i64*) -> boolean {
+    fold_scoped(&this, sr: ScopeResolutionExpr*, out: i128*) -> boolean {
         if (this.table == null || this.intern == null) { return false; }
         return this.fold_scoped_res(
             sr.scope_res.require("ConstEval::fold_scoped"), sr, out);
@@ -570,7 +574,7 @@ type struct ConstEval {
     /// without requiring the slot a second time: `require` records a pending
     /// bug for an unstamped node, so asking twice would count one unstamped
     /// path as two.
-    fold_scoped_res(&this, r: Res, sr: ScopeResolutionExpr*, out: i64*) -> boolean {
+    fold_scoped_res(&this, r: Res, sr: ScopeResolutionExpr*, out: i128*) -> boolean {
         if (this.table == null || this.intern == null) { return false; }
 
         return match (r) {
@@ -607,13 +611,13 @@ type struct ConstEval {
     /// variant.  A variant carrying a payload is a constructor, not a value,
     /// so it is not a compile-time integer.
     static variant_tag_of(decl: EnumDecl*, member: SymbolStr,
-                          out: i64*) -> boolean {
+                          out: i128*) -> boolean {
         if (decl == null) { return false; }
         const i: i64 = decl.variant_position(member);
         if (i < 0) { return false; }
         if (DeclarationNode::variant_of(decl.variants[i]).associated_types.length > 0) { return false; }
         const tags: [i64] = decl.variant_tags();
-        *out = tags[i];
+        *out = tags[i] as i128;
         return true;
     }
 
@@ -623,7 +627,7 @@ type struct ConstEval {
     /// must be able to succeed at a position that has one.  `Folding` is the
     /// cycle guard: a constant reached from its own initializer is not a
     /// compile-time integer, and without the guard the recursion has no floor.
-    fold_entry(&this, idx: i64, out: i64*) -> boolean {
+    fold_entry(&this, idx: i64, out: i128*) -> boolean {
         if (this.table == null) { return false; }
         if (idx < 0 || idx >= this.table.entries.length) { return false; }
 
@@ -635,7 +639,7 @@ type struct ConstEval {
         if (init == null) { return false; }
 
         this.table.entries[idx].state = CONST_FOLDING;
-        mut v: i64 = 0;
+        mut v: i128 = 0;
         const ok: boolean = this.fold(init, &v);
         if (!ok) {
             this.table.entries[idx].state = CONST_PENDING;
@@ -679,13 +683,13 @@ type struct ConstEval {
                 const constant: i64 = this.table.index_of(this.table.type_constant(
                     this.table.type_constant_owner(base), sr.member_name));
                 if (constant >= 0) { return this.fold_entry_real(constant, out); }
-                mut iv: i64 = 0;
+                mut iv: i128 = 0;
                 if (!this.fold_scoped_res(r, sr, &iv)) { return false; }
                 *out = iv as f64;
                 return true;
             }
             _ => {
-                mut iv: i64 = 0;
+                mut iv: i128 = 0;
                 if (!this.fold_scoped_res(r, sr, &iv)) { return false; }
                 *out = iv as f64;
                 return true;
@@ -716,7 +720,7 @@ type struct ConstEval {
         // the initializer looks identical either way.
         mut ok: boolean = false;
         if (this.table.entries[idx].int_typed) {
-            mut iv: i64 = 0;
+            mut iv: i128 = 0;
             ok = this.fold(init, &iv);
             if (ok) { v = iv as f64; }
         } else {
@@ -747,34 +751,36 @@ type struct ConstEval {
     /// the emitted cast will, so `Slot::B as u8` folds to what the program
     /// observes rather than to the unwrapped operand.
     ///
-    /// False for anything an `i64` cannot carry: a float, a 128-bit width, and
-    /// a negative value cast to a 64-bit unsigned type.  `char` is excluded
-    /// because its width is not settled.
-    static wrap_to_primitive(prim: string, v: i64, out: i64*) -> boolean {
+    /// False for anything a folded value cannot carry: a float, and a negative
+    /// value cast to `u128`, whose wrapped value is above `i128::MAX`.  `char`
+    /// is excluded because its width is not settled.
+    static wrap_to_primitive(prim: string, v: i128, out: i128*) -> boolean {
         if (prim == "boolean") { *out = if (v != 0) { 1 } else { 0 }; return true; }
 
-        mut bits: i64 = 0;
+        mut bits: i128 = 0;
         mut is_signed: boolean = true;
         if (prim == "i8")   { bits = 8;  is_signed = true; }
         else if (prim == "i16")   { bits = 16; is_signed = true; }
         else if (prim == "i32")   { bits = 32; is_signed = true; }
         else if (prim == "i64" || prim == "isize") { bits = 64; is_signed = true; }
+        else if (prim == "i128")  { bits = 128; is_signed = true; }
         else if (prim == "u8")    { bits = 8;  is_signed = false; }
         else if (prim == "u16")   { bits = 16; is_signed = false; }
         else if (prim == "u32")   { bits = 32; is_signed = false; }
         else if (prim == "u64" || prim == "usize") { bits = 64; is_signed = false; }
+        else if (prim == "u128")  { bits = 128; is_signed = false; }
         if (bits == 0) { return false; }
 
-        if (bits == 64) {
+        if (bits == 128) {
             if (!is_signed && v < 0) { return false; }
             *out = v;
             return true;
         }
 
-        const mask: i64 = (1 << bits) - 1;
-        const low: i64 = v & mask;
+        const mask: i128 = (1 << bits) - 1;
+        const low: i128 = v & mask;
         if (is_signed) {
-            const sign_bit: i64 = 1 << (bits - 1);
+            const sign_bit: i128 = 1 << (bits - 1);
             if ((low & sign_bit) != 0) { *out = low - (mask + 1); } else { *out = low; }
         } else {
             *out = low;
@@ -784,43 +790,43 @@ type struct ConstEval {
 
     /// Evaluate `x <op> y` with overflow and divide-by-zero guarded; false
     /// means the result is not representable and the fold must bail.
-    static apply_binary(op: TokenType, x: i64, y: i64, out: i64*) -> boolean {
-        const I64MAX: i64 = CONST_I64_MAX_MAG as i64;
-        const I64MIN: i64 = (0 - I64MAX) - 1;
+    static apply_binary(op: TokenType, x: i128, y: i128, out: i128*) -> boolean {
+        const highest: i128 = i128::max_value();
+        const lowest: i128 = i128::min_value();
 
         if (op == TokenType::Plus) {
-            if (y > 0 && x > I64MAX - y) { return false; }
-            if (y < 0 && x < I64MIN - y) { return false; }
+            if (y > 0 && x > highest - y) { return false; }
+            if (y < 0 && x < lowest - y) { return false; }
             *out = x + y; return true;
         }
         if (op == TokenType::Minus) {
-            if (y < 0 && x > I64MAX + y) { return false; }
-            if (y > 0 && x < I64MIN + y) { return false; }
+            if (y < 0 && x > highest + y) { return false; }
+            if (y > 0 && x < lowest + y) { return false; }
             *out = x - y; return true;
         }
         if (op == TokenType::Star) {
             if (x == 0 || y == 0) { *out = 0; return true; }
-            // I64MIN has no positive counterpart; the re-division check below
-            // would itself trap on it.
-            if (x == I64MIN || y == I64MIN) { return false; }
-            const p: i64 = x * y;
+            // The lowest value has no positive counterpart; the re-division
+            // check below would itself trap on it.
+            if (x == lowest || y == lowest) { return false; }
+            const p: i128 = x * y;
             if (p / y != x) { return false; }
             *out = p; return true;
         }
         if (op == TokenType::Slash || op == TokenType::Percent) {
             if (y == 0) { return false; }
-            if (x == I64MIN && y == 0 - 1) { return false; }
+            if (x == lowest && y == 0 - 1) { return false; }
             if (op == TokenType::Slash) { *out = x / y; } else { *out = x % y; }
             return true;
         }
         if (op == TokenType::LessLess) {
-            if (y < 0 || y >= 64) { return false; }
-            const s: i64 = x << y;
+            if (y < 0 || y >= 128) { return false; }
+            const s: i128 = x << y;
             if ((s >> y) != x) { return false; }
             *out = s; return true;
         }
         if (op == TokenType::GreaterGreater) {
-            if (y < 0 || y >= 64) { return false; }
+            if (y < 0 || y >= 128) { return false; }
             *out = x >> y; return true;
         }
         if (op == TokenType::Amp) { *out = x & y; return true; }

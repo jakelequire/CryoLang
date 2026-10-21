@@ -106,7 +106,7 @@ import compiler::sema::call_resolver::{ CallResolver };
 import compiler::sema::diagnostics::{ Diagnostics };
 import compiler::sema::helpers::{
     is_constant_numeric_expr, is_narrow_float_type, is_numeric_literal_expr,
-    is_wide_int_type, is_zero_int_literal, sema_i32_max_mag, try_fold_const_i64
+    is_wide_int_type, is_zero_int_literal, sema_i32_max_mag, try_fold_const_integer
 };
 import compiler::sema::lambda_synth::{ LambdaSynth };
 import compiler::sema::literal_resolver::{ LiteralResolver };
@@ -2516,10 +2516,16 @@ type struct SemaVisitor {
 
         mut force_wide: TypeRef = TypeRef::invalid();
         if (!this.literals.expected_type_is_int_type()) {
-            mut folded: i64 = 0;
-            if (try_fold_const_i64(e, &folded)) {
-                const mag: u64 = if (folded < 0) { (0 - folded) as u64 } else { folded as u64 };
-                if (mag > sema_i32_max_mag()) { force_wide = this.arena.get_i64(); }
+            // The narrowest of i64 and u64 that holds the value, as for a
+            // single literal; a value neither holds keeps its literals' widths.
+            mut folded: i128 = 0;
+            if (try_fold_const_integer(e, &folded)) {
+                if (folded >= i64::min_value() as i128 && folded <= i64::max_value() as i128) {
+                    const mag: i128 = if (folded < 0) { 0 - folded } else { folded };
+                    if (mag > sema_i32_max_mag() as i128) { force_wide = this.arena.get_i64(); }
+                } else if (folded > 0 && folded <= u64::max_value() as i128) {
+                    force_wide = this.arena.get_u64();
+                }
             }
         }
         if (force_wide.is_valid()) {
@@ -4360,10 +4366,10 @@ type struct SemaVisitor {
     const_repeat_count(&this, arr: ArrayExpr*) -> i64 {
         if (this.ctx == null) { return -1; }
         const ev: ConstEval = ConstEval::new(this.ctx.const_table, this.ctx.intern_table, null);
-        mut n: i64 = 0;
+        mut n: i128 = 0;
         if (!ev.fold(arr.repeat_count_expr, &n)) { return -1; }
-        if (n < 0) { return -1; }
-        return n;
+        if (n < 0 || n > i64::max_value() as i128) { return -1; }
+        return n as i64;
     }
 
     resolve_array_literal(mut &this, e: ExpressionNode*, arr: ArrayExpr*) -> TypeRef {

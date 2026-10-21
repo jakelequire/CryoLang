@@ -2236,6 +2236,17 @@ type struct DeclarationEmitter {
                               this.ctx.type_arena);
     }
 
+    /// `ConstEval`'s value for `expr` as a 64-bit two's-complement bit
+    /// pattern.  A value outside `i64::MIN ..= u64::MAX` has no such pattern
+    /// and is not folded here.
+    fold_64_bit_pattern(&this, expr: ExpressionNode*, out: u64*) -> boolean {
+        mut value: i128 = 0;
+        if (!this.const_eval().fold(expr, &value)) { return false; }
+        if (value < i64::min_value() as i128 || value > u64::max_value() as i128) { return false; }
+        *out = value as u64;
+        return true;
+    }
+
     /// Constant-fold an INTEGER const initializer to its 64-bit two's-complement
     /// bit pattern.  Handles integer/bool literals, unary `-`/`+`/`~`, and the
     /// binary operators that are bit-exact in two's complement regardless of
@@ -2287,12 +2298,7 @@ type struct DeclarationEmitter {
                 // module-qualified CONSTANT (`limits::MAX_PATH`) - a different
                 // referent, answered by the constant table rather than by a
                 // variant tag.
-                mut qv: i64 = 0;
-                if (this.const_eval().fold(expr, &qv)) {
-                    *out = qv as u64;
-                    return true;
-                }
-                return false;
+                return this.fold_64_bit_pattern(expr, out);
             }
             const et: EnumType* = real_t.as_enum();
             const variant: EnumVariantInfo* = CodegenUtil::pinned_variant(et, sr.resolved_member);
@@ -2321,10 +2327,7 @@ type struct DeclarationEmitter {
         if (ExpressionNode::identifier_of(node) != null
             || ExpressionNode::sizeof_of(node) != null
             || ExpressionNode::alignof_of(node) != null) {
-            mut nv: i64 = 0;
-            if (!this.const_eval().fold(expr, &nv)) { return false; }
-            *out = nv as u64;
-            return true;
+            return this.fold_64_bit_pattern(expr, out);
         }
         const u: UnaryExpr* = ExpressionNode::unary_of(node);
         if (u != null) {
@@ -2340,14 +2343,12 @@ type struct DeclarationEmitter {
             const op: TokenType = b.op.kind;
             // `/ % >>` read their operands as NUMBERS, so their result depends
             // on a signedness a u64 bit pattern has already discarded.  They
-            // are computed by the folder that works in signed i64 rather than
-            // approximated here; each operator therefore has exactly one
-            // evaluator, and none is left to the zeroinitializer.
+            // are computed by the folder, which holds every 64-bit value as
+            // the number it is, rather than approximated here; each operator
+            // therefore has exactly one evaluator, and none is left to the
+            // zeroinitializer.
             if (op == TokenType::Slash || op == TokenType::Percent || op == TokenType::GreaterGreater) {
-                mut sv: i64 = 0;
-                if (!this.const_eval().fold(expr, &sv)) { return false; }
-                *out = sv as u64;
-                return true;
+                return this.fold_64_bit_pattern(expr, out);
             }
             mut x: u64 = 0;
             mut y: u64 = 0;
