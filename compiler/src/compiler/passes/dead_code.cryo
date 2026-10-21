@@ -68,9 +68,10 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     CallExpr,
-    ExprKind, ExpressionNode,
+    ExprKind, ExpressionNode, LambdaExpr,
     MemberAccessExpr
 };
+import compiler::ast::walk::{ Walk };
 import compiler::ast::node::{ ProgramNode };
 import compiler::ast::pattern::{ MatchArmNode, StaticMatchArmNode };
 import compiler::ast::statement::{ BlockStmt, DeclStmt, Stmt, StmtKind };
@@ -80,6 +81,25 @@ import compiler::resolver::resolution_map::{ ResolutionMap };
 import compiler::resolver::resolver::{ Resolver };
 import compiler::decl_index::{ OverloadId };
 import utils::keyword::{ Keyword };
+
+
+/// The bodies of the lambdas written in a body that capture nothing, nested
+/// ones included.  Such a lambda becomes no declaration, so the lints reach
+/// its body only where it is written.  A capturing lambda's body becomes its
+/// closure's `__call__`, which is checked as a method, so it is not collected
+/// here: it would be checked twice, and only the sink's dropping of repeated
+/// diagnostics would keep its warnings from showing twice.
+type struct NonCapturingLambdaBodies {
+    bodies: [Stmt*];
+}
+
+implement trait Walk for struct NonCapturingLambdaBodies {
+    walk_lambda(mut &this, e: ExpressionNode*, n: LambdaExpr*) -> void {
+        if (n.captured_names.length > 0) { return; }
+        if (n.body != null) { this.bodies.push(n.body); }
+        LambdaExpr::walk_children(n, this);
+    }
+}
 
 
 type struct DeadCodeChecker {
@@ -197,6 +217,11 @@ type struct DeadCodeChecker {
         if (func == null || func.body == null) { return; }
         this.body_resolved = body_resolved;
         this.check_block(func.body);
+        mut lambdas: NonCapturingLambdaBodies = NonCapturingLambdaBodies { bodies: [] };
+        lambdas.walk_stmt(func.body);
+        for (mut i: i64 = 0; i < lambdas.bodies.length; i++) {
+            this.check_stmt(lambdas.bodies[i]);
+        }
         this.body_resolved = true;
     }
 
