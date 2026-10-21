@@ -1980,9 +1980,31 @@ type struct MethodBinding {
         }
     }
 
+    /// A projection of a type parameter's associated type is what the bound
+    /// on the parameter writes for it: `I::Item` under `where I: Iterator<i32>`
+    /// is `i32`, whose arguments put the associated types in positionally
+    /// after the trait's own parameters.  Not cached on the projection: the
+    /// answer is the enclosing walk's bound, not the projection's.  `t`
+    /// itself for any other type, and when no bound on the parameter names
+    /// the projection's trait or writes that associated type.
+    projection_through_param_bound(mut &this, t: TypeRef) -> TypeRef {
+        const ty: Type* = this.arena.lookup(t);
+        if (ty == null || ty.kind != TypeKind::AssocProjection) { return t; }
+        const proj: AssocProjectionType* = ty.as_assoc_projection();
+        const base: Type* = this.arena.lookup(proj.base);
+        if (base == null || base.kind != TypeKind::GenericParam) { return t; }
+        const trait_def: DefId = this.ctx.decl_index.def_of(proj.owning_trait, this.arena);
+        if (!trait_def.is_valid()) { return t; }
+        const tr: TraitRef* = this.param_bound_naming(base.as_generic_param(), trait_def);
+        if (tr == null) { return t; }
+        return this.subst_bound_trait_args(t, tr.path[tr.path.length - 1], tr);
+    }
+
     /// Recursively replace concrete-base associated-type projections in `ty` with
-    /// their member type, caching on each `AssocProjectionType`.  Symbolic
-    /// projections and projection-free types pass through unchanged.
+    /// their member type, caching on each `AssocProjectionType`, and a type
+    /// parameter's projection with what its bound writes for it
+    /// (`projection_through_param_bound`).  Other symbolic projections and
+    /// projection-free types pass through unchanged.
     reduce_assoc_projections(mut &this, ty: TypeRef) -> TypeRef {
         if (!ty.is_valid()) { return ty; }
         const t: Type* = this.arena.lookup(ty);
@@ -1990,14 +2012,14 @@ type struct MethodBinding {
         match (t.kind) {
             TypeKind::AssocProjection => {
                 const proj: AssocProjectionType* = t.as_assoc_projection();
-                if (proj.resolved_type.is_valid()) { return proj.resolved_type; }
+                if (proj.resolved_type.is_valid()) { return this.projection_through_param_bound(proj.resolved_type); }
                 const base: TypeRef = this.reduce_assoc_projections(proj.base);
                 const reduced: TypeRef = this.ctx.type_resolver.concrete_projection(base, proj.slot, proj.owning_trait);
                 if (reduced.is_valid()) {
                     proj.set_resolved_type(reduced);
-                    return reduced;
+                    return this.projection_through_param_bound(reduced);
                 }
-                return ty;
+                return this.projection_through_param_bound(ty);
             }
             TypeKind::Pointer => {
                 const p: PointerType* = t.as_pointer();
