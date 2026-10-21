@@ -166,6 +166,9 @@ yet is recorded with the change that builds it, not here.
 
 507. **`legacy/` is left as it is.**  (Jake)
 
+508. **The report-only previous-commit object comparison is removed from
+     CI;** local `make verify` remains the comparison tool.  (Jake)
+
 ### 2026-10-20
 
 465. **The removed class syntax is refused with E0117,** "`<form>` is not
@@ -1081,7 +1084,7 @@ yet is recorded with the change that builds it, not here.
      again on CI; ruling 270 had the arm measured on CI before its fate is
      decided.  (Jake)
 
-321. **On CI, the object comparison runs against the previous commit and
+321. *Superseded by ruling 508.* **On CI, the object comparison runs against the previous commit and
      reports its differences without failing the job.**  (Jake)
 
 322. **A compiler flag that stops a build at object files,** so cross-check
