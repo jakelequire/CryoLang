@@ -1270,7 +1270,7 @@ yet is recorded with the change that builds it, not here.
 262. **E0312, the trait-implementation check, keeps its number and
      wording.**  (Jake)
 
-263. **`const a: i32 = i32::MAX;` storing nothing, so the local is read
+263. *Superseded by rulings 509, 510 and 517.* **`const a: i32 = i32::MAX;` storing nothing, so the local is read
      uninitialized, is fixed before the merge.**  (Jake)  No type declares
      constants, so the path names no value: it is refused where it is
      written (E0201), as any path naming nothing is; a primitive's bounds
@@ -1315,7 +1315,7 @@ yet is recorded with the change that builds it, not here.
 274. **`make install-lsp` stays in the Makefile,** and its help line says
      that it replaces the installed VS Code extension.  (Jake)
 
-275. **Primitives keep `max_value()` and `min_value()` for now;**
+275. *Superseded by ruling 510.* **Primitives keep `max_value()` and `min_value()` for now;**
      associated constants such as `i32::MAX` are roadmap work for after the
      merge.  (Jake)
 

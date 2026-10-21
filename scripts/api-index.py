@@ -97,11 +97,17 @@ IMPL_RE = re.compile(
 # `implement<A> trait Eq for struct String<A>` -- the target carries the type
 # keyword, which is noise in an index keyed by type name.
 IMPL_TARGET_KW_RE = re.compile(r"^(?:struct|enum|union)\s+")
+# An inherent block, `implement i32 {` or `implement enum Level {`: its methods
+# and constants are the named type's own.
+INHERENT_IMPL_RE = re.compile(
+    r"^\s*implement\s*(?:<[^>]*>)?\s*(?:(?:struct|enum|union)\s+)?([A-Za-z_]\w*)\s*(?:<[^{]*>)?\s*\{?\s*$"
+)
 FUNC_RE = re.compile(
     r"^\s*(?:(public|private)\s+)?function\s+([A-Za-z_]\w*)\s*(<[^(]*>)?\s*\(([^)]*)\)"
     r"\s*(?:->\s*([^{;]+?))?\s*[{;]"
 )
-CONST_RE = re.compile(r"^\s*(?:(public|private)\s+)?const\s+([A-Z_][A-Z0-9_]*)\s*:\s*([^=;]+)")
+# The type annotation may be left to the initializer.
+CONST_RE = re.compile(r"^\s*(?:(public|private)\s+)?const\s+([A-Z_][A-Z0-9_]*)\s*(?::\s*([^=;]+))?=")
 # A method inside a type body: optional `static`, a name, args, optional return.
 METHOD_RE = re.compile(
     r"^\s*(?:(public|private)\s+)?(static\s+)?([a-z_]\w*)\s*(<[^(]*>)?\s*\(([^)]*)\)"
@@ -211,6 +217,13 @@ def scan_file(path):
                 opened_type = True
 
         if not opened_type:
+            m = INHERENT_IMPL_RE.match(code)
+            if m and m.group(1) != "trait":
+                if "{" in code:
+                    type_stack.append((m.group(1), depth))
+                opened_type = True
+
+        if not opened_type:
             m = FUNC_RE.match(code)
             if m and m.group(2) not in KEYWORDS:
                 vis, name, generics, args, ret = m.groups()
@@ -230,10 +243,17 @@ def scan_file(path):
                         sig += f" -> {clean_sig(ret)}"
                     entries.append(("method", sig, vis == "private"))
 
+            # A module's constant is at the top level and a type's directly in
+            # the type's body or inherent block; one deeper is a function's
+            # local, which is no part of the API.
             m = CONST_RE.match(code)
             if m:
                 vis, name, ty = m.groups()
-                entries.append(("const", f"{name}: {clean_sig(ty)}", vis == "private"))
+                decl = f"{name}: {clean_sig(ty)}" if ty else name
+                if depth == 0:
+                    entries.append(("const", decl, vis == "private"))
+                elif type_stack and type_stack[-1][0] is not None and depth == type_stack[-1][1] + 1:
+                    entries.append(("const", f"{type_stack[-1][0]}::{decl}", vis == "private"))
 
         # -- brace tracking ----------------------------------------------
         depth += code.count("{") - code.count("}")
@@ -338,6 +358,7 @@ def render(by_ns):
     out.append("# Grep this file BEFORE writing a helper. Most utility operations")
     out.append("# already exist; a near-duplicate is worse than an imperfect call.")
     out.append("#")
+    out.append("#   Type::NAME: T     a type's constant")
     out.append("#   Type::name(...)   static method / constructor")
     out.append("#   Type.name(...)    instance method")
     out.append("#   name(...)         free function")
