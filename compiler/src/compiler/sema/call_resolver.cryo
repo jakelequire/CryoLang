@@ -1237,8 +1237,8 @@ type struct CallResolver {
             const arg_snap: DiagnosticSnapshot = this.ctx.diagnostics.snapshot();
             this.lambda.reject_closure_struct_args_in_non_free_call(call,
                 "passing a capturing closure as a method-call argument");
-            const receiver_t: Type* = this.arena.lookup(visitor.resolve_expr(callee_member.object));
-            if (receiver_t != null && receiver_t.kind == TypeKind::Object) {
+            const receiver_t: Type* = this.arena.object_behind_receiver(visitor.resolve_expr(callee_member.object));
+            if (receiver_t != null) {
                 return this.resolve_object_call(visitor, call_e, call, callee_member, receiver_t);
             }
             const selected: Selection = this.resolve_method_overload(visitor, call, callee_member);
@@ -4968,7 +4968,9 @@ type struct CallResolver {
             || ty.kind == TypeKind::Never;
     }
 
-    /// The type of a call through the trait object `receiver_t`.  The
+    /// The type of a call through the trait object `receiver_t`, the
+    /// receiver's own type or the object it reaches through references and
+    /// pointers (`TypeArena::object_behind_receiver`).  The
     /// method is the nearest declaration of the call's leaf among the
     /// object's trait and its supertraits (`trait_members_declaring`), as a
     /// bound gives its subject; the call is stamped with the declaring
@@ -5148,19 +5150,6 @@ type struct CallResolver {
             unwrap_depth += 1;
         }
 
-        // A call through a trait object is answered before selection
-        // (`resolve_object_call`); one reached through a reference or a
-        // pointer to the object is not built, and is refused here, at the
-        // call, rather than left for code generation to find unresolved.
-        if (base_t != null && base_t.kind == TypeKind::Object) {
-            mut od: Diagnostic = Diagnostic::error(ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
-                fmt::format("no method named `%s` can be called on `%s`",
-                    this.intern.resolve(member.member), this.arena.format_display(base_t)));
-            od = od.at(if (member.member_span.has_location()) { member.member_span } else { member_e.span });
-            od = od.with_note("a call through a reference or pointer to a trait object is not supported yet");
-            this.ctx.emit_diagnostic(od);
-            return TypeRef::invalid();
-        }
         const type_sym: SymbolStr = this.types.lookup_type_sym(lookup_ref);
         if (!type_sym.is_valid()) {
             // A receiver with no type symbol names no type, so there is no

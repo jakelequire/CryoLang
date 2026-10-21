@@ -261,14 +261,17 @@ type struct CallEmitter {
     /// there - called with the object's data word as its receiver.  The
     /// signature is classified from the trait method's own declaration,
     /// since which function the word holds is known only where the call
-    /// runs.  A call whose method the table does not hold is an internal
-    /// error, never a call bound some other way.
+    /// runs.  `object_t` is the object the receiver reaches
+    /// (`TypeArena::object_behind_receiver`): a receiver that is a
+    /// reference or pointer to it is the object's address, loaded through
+    /// each level.  A call whose method the table does not hold is an
+    /// internal error, never a call bound some other way.
     call_through_object(mut &this, visitor: IRGeneratorVisitor*, e: ExpressionNode*, node: CallExpr*,
-                        ma: MemberAccessExpr*) -> Emitted {
+                        ma: MemberAccessExpr*, object_t: Type*) -> Emitted {
         mut out: Emitted = Emitted::none();
         const registry: GenericRegistry* = this.cg.ctx.generic_registry;
         const slot: i64 = ma.resolved_trait_slot;
-        const object_trait: DefId = this.cg.arena_type(ma.object.resolved_type).as_object().trait_def;
+        const object_trait: DefId = object_t.as_object().trait_def;
         const index: i64 = registry.object_table_index(object_trait, ma.resolved_trait, slot);
         const decl: TraitDecl* = if (index >= 0) { registry.get_trait_decl(ma.resolved_trait) } else { null };
         if (decl == null) {
@@ -286,8 +289,18 @@ type struct CallEmitter {
         const plan: SignaturePlan = this.cg.abi.classify_signature(
             &param_types, func.resolved_return_type, false);
         if (!plan.llvm_fn_type.is_valid()) { return out; }
-        const object: LValue = this.dispatch.codegen_rvalue(visitor, ma.object);
+        mut object: LValue = this.dispatch.codegen_rvalue(visitor, ma.object);
         if (!object.is_valid()) { return out; }
+        mut level: Type* = this.cg.arena_type(ma.object.resolved_type);
+        while (level != object_t) {
+            const inner: TypeRef = if (level.kind == TypeKind::Reference) {
+                level.as_reference().referent
+            } else {
+                level.as_pointer().pointee
+            };
+            object = this.cg.builder.build_load(this.cg.type_mapper.map_type(inner), object, "object.through");
+            level = this.cg.arena_type(inner);
+        }
         const word: LType = LType::pointer_to(LType::i8());
         const data: LValue = this.cg.builder.build_extract_value(object, 0, "object.data");
         const table: LValue = this.cg.builder.build_extract_value(object, 1, "object.table");
@@ -489,9 +502,9 @@ type struct CallEmitter {
             // shortcut, then routes the pin through `resolve_pinned`.
             const ma: MemberAccessExpr* = ExpressionNode::member_access_of(node.callee);
 
-            const recv_t: Type* = this.cg.arena_type(ma.object.resolved_type);
-            if (recv_t != null && recv_t.kind == TypeKind::Object) {
-                return this.call_through_object(visitor, e, node, ma);
+            const object_t: Type* = this.cg.ctx.type_arena.object_behind_receiver(ma.object.resolved_type);
+            if (object_t != null) {
+                return this.call_through_object(visitor, e, node, ma, object_t);
             }
 
             // Function-pointer field call: `receiver.field(args)` where
