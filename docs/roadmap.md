@@ -23,10 +23,11 @@ language server".  From there, in order, to the v1.0 freeze:
    288, 289, 415).  Left for trait objects: owning boxes, upcasting, and
    generic implementations as objects, the last revisited before the
    freeze (ruling 425); see "Trait objects" below.
-4. **Associated constants on concrete types** (`i32::MAX`,
-   `Config::DEFAULT_PORT`), with the decision whether `max_value()` stays.
-   Trait constants used as values come after v1.0; trait constants as
-   array lengths are not in v1.0.
+4. **Associated constants on concrete types.**  Built, on
+   `associated-constants`: `i32::MAX`, `f64::NAN`, `Duration::NANOS_PER_SEC`,
+   with `max_value()` removed (ruling 510).  Trait constants used as
+   values come after v1.0; trait constants as array lengths are not in
+   v1.0; see "Associated constants" below.
 5. **An internal compiler logger** in place of `LOG_DEBUG` and `cdebug`.
 6. **The standard library's visibility pass.**  Everything in it is public
    today, so internals such as `Array`'s grower are public API.  The pass
@@ -309,15 +310,23 @@ normalised before the comparison.
 
 ## Associated constants
 
-A concrete type declares named constants reached by a path, so `i32::MAX`
-and `Config::DEFAULT_PORT` are values; this comes before v1.0.  Until then
-a primitive's bounds are `min_value()` and `max_value()`, and `i32::MAX` is
-refused (ruling 275: primitives keep `max_value()` and `min_value()` for
-now).  Whether `max_value()` stays once `i32::MAX` exists is decided with
-it.  A constant a trait declares and its implementations supply, used as a
-value, comes after v1.0; one used as an array length is not in v1.0.
+Built, on `associated-constants`: a struct, union, enum or primitive
+declares constants reached by a path, `Type::NAME` (docs/cryo.md section
+8.8; rulings 509-524).  The standard library gives every integer type
+`MIN`, `MAX`, `BITS` and its `MAX_*_DIGITS` buffer sizes, `char` its
+`MIN` and `MAX`, and `f32`/`f64` their limits and non-finite values;
+`max_value()`/`min_value()` and `math`'s float limits are gone.  The
+constant folder computes over the whole `i128` range.
 
-Open: whether a constant may be used where a type argument is expected.
+Left:
+- constants in a trait and in its implementations (E0245, E0246 today):
+  used as values after v1.0; used as array lengths, not in v1.0;
+- a constant on a generic type (E0247 today), additive, after v1.0;
+- whether a constant may be used where a type argument is expected
+  (open);
+- the folder does not wrap a constant's value to its declared type, so
+  a named constant whose initializer leaves its type's range folds to a
+  value the program never holds.
 
 ## An internal compiler logger
 
