@@ -32,12 +32,11 @@ import compiler::types::{
     arena, compound, generic, ownership, type_base, type_ref, TypeKind, user_defined
 };
 import compiler::ast;
-import compiler::ast::{ declaration, LiteralKind, node};
+import compiler::ast::{ declaration, LiteralKind, MemberPin, node};
 import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name, res };
 import compiler::decl_index::{ OverloadId };
 import std::collections::pair;
 import std::collections::pair::{ Pair };
-import std::fmt::float;
 import compiler::ast::expression;
 import compiler::ast::expression::{
     CalleePin,
@@ -56,6 +55,8 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::node::{ Node, ProgramNode };
 import compiler::lex::{ TokenType };
+import compiler::lex::lexer;
+import compiler::lex::lexer::{ Lexer };
 import compiler::codegen::abi::{ AbiAttr, AbiClassifier, ArgClass, ParamPlan, SignaturePlan };
 import compiler::codegen::llvm_types::{
     LBasicBlock, LBuilder, LContext, LLinkage, LModule, LType, LTypeKind, LValue
@@ -1267,7 +1268,7 @@ type struct DeclarationEmitter {
                 init = LType::const_int(ty, bval, false);
             } else if (lit.literal_kind == LiteralKind::Float
                        && (tk == LTypeKind::Float || tk == LTypeKind::Double)) {
-                const fval: f64 = float::parse_f64(lit.value).unwrap_or(0.0);
+                const fval: f64 = Lexer::float_literal_value(lit.value).unwrap_or(0.0);
                 init = LType::const_real(ty, fval);
             } else if (tk == LTypeKind::Pointer) {
                 init = this.const_pointer(ty, init_expr);
@@ -2361,14 +2362,16 @@ type struct DeclarationEmitter {
     }
 
     /// Build a constant struct aggregate for a module-level struct-literal const
-    /// initializer (`const RAYWHITE: Color = Color { r: 245, ... }`, the shape
-    /// the bindgen importer lowers a C compound-literal macro to).  The importer
-    /// emits the field initializers in struct DECLARATION order, so a positional
-    /// zip against the LLVM struct's element types is exact.  Every field init
-    /// must fold to a constant (`const_element`: a number, a `null` or string
-    /// literal, a nested array or struct literal); any non-constant field, or a field-count mismatch (an unexpected shape),
-    /// returns an invalid value so the caller declines to the zeroinitializer
-    /// fallback - correct-or-decline, never a silently wrong layout.
+    /// initializer (`const RAYWHITE: Color = Color { r: 245, ... }`).  Each
+    /// field initializer is placed at the field sema pinned on it, never at
+    /// its position in the literal: a literal may name its fields in any
+    /// order, and placing `Point { y: 2, x: 1 }` by position stores each value
+    /// in the other field.  Every field init must fold to a constant
+    /// (`const_element`: a number, a `null` or string literal, a nested array
+    /// or struct literal); any non-constant or unpinned field, or a
+    /// field-count mismatch (an unexpected shape), returns an invalid value so
+    /// the caller declines to the zeroinitializer fallback - correct-or-decline,
+    /// never a silently wrong layout.
     /// `layout` is the Cryo type whose field list `sl` initializes, so a field
     /// can be placed at the element that actually holds it: a body may carry
     /// alignment padding elements the field list has no member for.  Padding
@@ -2381,9 +2384,8 @@ type struct DeclarationEmitter {
         if (sl == null) { return LValue::null(); }
         const n: u32 = llvm::LLVMCountStructElementTypes(ty.raw);
         if (n == 0 || mapper == null || layout == null) { return LValue::null(); }
-        // Every field initialized, in declaration order - the shape the
-        // importer emits.  A partial literal still declines: filling only some
-        // fields here would silently define the rest as zero.
+        // Every field initialized.  A partial literal declines: filling only
+        // some fields here would silently define the rest as zero.
         mut field_count: i64 = -1;
         if (layout.kind == TypeKind::Struct) { field_count = layout.as_struct().fields.length; }
         if (field_count < 0 || sl.field_inits.length != field_count) { return LValue::null(); }
@@ -2399,7 +2401,13 @@ type struct DeclarationEmitter {
             slots[z as i64] = zval.raw;
         }
         for (mut i: u32 = 0; ok && i < sl.field_inits.length as u32; i++) {
-            const elem: i64 = mapper.field_element_index(layout, i as i64);
+            mut field: i64 = -1;
+            match (sl.field_inits[i as i64].pin) {
+                MemberPin::Field(index) => { if (index < field_count) { field = index; } }
+                _                       => { }
+            }
+            if (field < 0) { ok = false; break; }
+            const elem: i64 = mapper.field_element_index(layout, field);
             if (elem < 0 || elem as u32 >= n) { ok = false; break; }
             const fty_raw: void* = llvm::LLVMStructGetTypeAtIndex(ty.raw, elem as u32);
             const fty: LType = LType { raw: fty_raw };

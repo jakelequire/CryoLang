@@ -169,6 +169,60 @@ yet is recorded with the change that builds it, not here.
 508. **The report-only previous-commit object comparison is removed from
      CI;** local `make verify` remains the comparison tool.  (Jake)
 
+509. **A struct's or union's constants may be written inline in its body
+     or in an `implement struct` (or `implement union`) block; both
+     work.**  An enum's and a primitive's constants are written in
+     `implement` blocks, where their methods are.  (Jake)
+
+510. **`max_value()` and `min_value()` are removed once the integer types
+     have `MAX` and `MIN`,** and every caller is moved to the constants,
+     before the freeze.  (Jake)
+
+511. **A type's constant follows the rules of a module-level constant:**
+     its initializer is folded where it is a constant expression and
+     otherwise computed once before `main`, and the constant has an
+     address.  (Jake)
+
+512. **The float types' limits are constants** - `EPSILON`, `MAX`, `MIN`,
+     `MIN_POSITIVE`, `INFINITY`, `NEG_INFINITY` and `NAN` on `f32` and
+     `f64`.  `math::F64_*` and `math::F32_*`, and `math::infinity()`,
+     `math::neg_infinity()` and `math::nan()`, are removed and their
+     callers moved to the constants.  `math::PI` and the other
+     mathematical constants stay in `std::math`.  (Jake)
+
+513. **A constant on a generic type is refused before v1.0;** allowing
+     one is additive and comes later.  (Jake)
+
+514. **`const` in a trait or in a trait implementation is refused for
+     now, with a clear error,** so that trait constants can be added
+     later without changing what any program means.  (Jake)
+
+515. **A constant named like a field of its own type is refused** (E0205),
+     as one named like a method, a variant or another constant of the type
+     is.  (Jake)
+
+516. **The standard library's move to type constants covers the type
+     limits, the per-width digit counts and the clearly per-type
+     constants** (such as `Duration`'s unit counts and the json depth),
+     not every module constant.  (Jake)
+
+517. **The E0201 negative test for a constant a primitive does not
+     declare stays,** over names that remain undeclared, and the
+     constants that become declared get positive tests.  (Jake)
+
+518. **Each new refusal the feature brings gets its own error code,**
+     with the codes and wordings put to Jake with the change that builds
+     them.  (Jake)
+
+519. **`char` has `MIN` and `MAX`; `boolean` has no constants.**  (Jake)
+
+520. **Every integer type has a `BITS: u32` constant.**  (Jake)
+
+521. **A folded struct constant written out of field order, and a float
+     literal with `_` separators in a module constant, are fixed first,**
+     on the associated-constants branch, before the feature is built.
+     (Jake)
+
 ### 2026-10-20
 
 465. **The removed class syntax is refused with E0117,** "`<form>` is not
