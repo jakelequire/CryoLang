@@ -174,8 +174,14 @@ type struct ASTTypeSubstituter {
         return this.types.reduce_projections(t, false);
     }
 
-    /// The same drop for a path's callee - see the overload above.
-    drop_stale_callee_pin(&this, node: ScopeResolutionExpr*) -> void {
+    /// The same drop for a path's callee - see the overload above.  A
+    /// `CalleePin::Decl` crosses unless `retargeted`: a path whose segments
+    /// the substitution left alone names the same declaration in every copy,
+    /// and no pass over the copy would pin it again.  A path whose scope
+    /// segment the substitution rewrote (`T::make`, the template's own type)
+    /// may name another owner's member in the copy.
+    drop_stale_callee_pin(&this, node: ScopeResolutionExpr*, retargeted: boolean) -> void {
+        if (!retargeted && node.resolved_callee.decl_entry().is_valid()) { return; }
         node.set_resolved_callee(CalleePin::None);
     }
 
@@ -885,8 +891,8 @@ implement trait Walk for struct ASTTypeSubstituter {
         }
         // The same reason a call's pin is cleared: the scope segment above may
         // now name a different owner than the one the template's walk pinned
-        // the function for, and sema's walk over this body pins it again.
-        this.drop_stale_callee_pin(node);
+        // the function for.
+        this.drop_stale_callee_pin(node, is_self || rewrote_owner);
         // The member pin crosses the substitution - a variant's ordinal and a
         // global's slot are the same in every instantiation - EXCEPT where the
         // branch above retargeted the scope segment at another declaration

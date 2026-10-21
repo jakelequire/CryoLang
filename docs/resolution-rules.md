@@ -261,6 +261,17 @@ yet is recorded with the change that builds it, not here.
      its wording,** "`Square` does not implement `Base`, which `Shape`
      requires, so `Square` cannot implement `Shape`".  (Delegated)
 
+494. **A shared object `virtual &Bar` satisfies a bound of a trait with a
+     `mut &this` method,** as a call of that method through `virtual &Bar`
+     is accepted; mutability through a reference is enforced for every
+     form together, when `&this` becomes read-only (ruling 479).
+     (Delegated)
+
+495. **The two defects that keep `map` and `filter` from being called on a
+     receiver known only by its bound in a generic body are fixed first,
+     each in its own change,** and trait-object defaults then land with
+     `map` and `filter` through an object in their run test.  (Delegated)
+
 462. **A path through a bounded type parameter naming a member no bound
      declares (`T::missing()` in a generic function that is instantiated)
      is refused with a diagnostic where it is written,** not left for
