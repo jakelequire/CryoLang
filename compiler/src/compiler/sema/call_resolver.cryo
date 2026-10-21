@@ -1242,6 +1242,9 @@ type struct CallResolver {
                 return this.resolve_object_call(visitor, call_e, call, callee_member, receiver_t);
             }
             const selected: Selection = this.resolve_method_overload(visitor, call, callee_member);
+            if (this.method_call_type_arguments_excess(callee_member, selected.chosen)) {
+                return TypeRef::invalid();
+            }
             this.check_method_call_arg_types(visitor, call_e, call, callee_member, selected.chosen);
             this.check_symbolic_method_bounds(callee, callee_member, selected.chosen);
             const args_refused: boolean = this.ctx.diagnostics.errors_since(arg_snap) > 0;
@@ -6342,14 +6345,38 @@ type struct CallResolver {
         this.ctx.emit_diagnostic(d);
     }
 
+    /// E0307 when a method call writes more type arguments than the method
+    /// `chosen` has type parameters of its own (`s.area::<i32>()` on a
+    /// method that has none), as a call through an object and a method
+    /// taken as a value are refused; true when it is reported.
+    method_call_type_arguments_excess(mut &this, member: MemberAccessExpr*, chosen: DeclarationNode*) -> boolean {
+        if (member.generic_args.length == 0 || chosen == null) { return false; }
+        mut func: FunctionDecl* = DeclarationNode::fn_of(chosen);
+        if (func == null) {
+            const method: MethodDecl* = DeclarationNode::method_of(chosen);
+            if (method != null) { func = DeclarationNode::fn_of(method.func); }
+        }
+        if (func == null || member.generic_args.length <= func.generic_params.length) { return false; }
+        mut receiver_type: TypeRef = member.object.resolved_type;
+        while (this.types.peel_indirection(receiver_type).is_valid()) {
+            receiver_type = this.types.peel_indirection(receiver_type);
+        }
+        const receiver: Type* = this.arena.lookup(receiver_type);
+        const owner: string = if (receiver != null) { this.arena.format_display(receiver) } else { "?" };
+        const at: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.object.span };
+        this.report_excess_type_arguments(fmt::format("%s::%s", owner, this.intern.resolve(member.member)),
+            func.generic_params.length, member.generic_args.length, at);
+        return true;
+    }
+
     /// E0307 for more type arguments written on `shown` than its
     /// `parameters` type parameters.
     report_excess_type_arguments(mut &this, shown: string, parameters: i64, written: i64,
                                  span: SourceSpan) -> void {
-        const plural: string = if (parameters == 1) { "" } else { "s" };
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
-            fmt::format("`%s` has %lld type parameter%s, and %lld type arguments are written", shown,
-                parameters, plural, written));
+            fmt::format("`%s` has %lld type parameter%s, and %lld type argument%s %s written", shown,
+                parameters, if (parameters == 1) { "" } else { "s" },
+                written, if (written == 1) { "" } else { "s" }, if (written == 1) { "is" } else { "are" }));
         d = d.at_with_label(span, "too many type arguments");
         this.ctx.emit_diagnostic(d);
     }
