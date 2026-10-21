@@ -642,6 +642,7 @@ type struct SemaVisitor {
     }
 
     visit_impl(mut &this, decl: DeclarationNode*, node: ImplBlock*) -> void {
+        this.check_supertraits_implemented(decl, node);
         if (node.is_generic()) {
             const impl_target: TypeRef = this.ctx.decl_index.impl_owner(node, "sema/visit:ImplBlock");
             const saved_impl: ImplBlock* = this.state.symbolic_impl_node;
@@ -2884,7 +2885,7 @@ type struct SemaVisitor {
         const shown_value: string = this.arena.format_display(value_t);
         const trait_t: Type* = this.arena.lookup(object.trait_type);
         const shown_trait: string = if (trait_t != null) {
-            this.shown_with_arguments(this.arena.format_display(trait_t), &object.args)
+            this.arena.display_with_arguments(this.arena.format_display(trait_t), &object.args)
         } else {
             shown_to
         };
@@ -2937,13 +2938,13 @@ type struct SemaVisitor {
         for (mut k: i64 = 0; k < traits.length; k++) {
             if (traits[k].equals(object.trait_def)) { blocks.push(own); continue; }
             const args: [TypeRef] = this.ctx.type_resolver.object_trait_arguments(object, traits[k]);
-            const shown_super: string = this.shown_with_arguments(
+            const shown_super: string = this.arena.display_with_arguments(
                 this.intern.resolve(this.ctx.defs.path_of(traits[k]).spelling()), &args);
             const heads: [DeclarationNode*] = registry.heads_for(traits[k], value, this.intern);
             mut found: ImplBlock* = null;
             for (mut i: i64 = 0; i < heads.length; i++) {
                 const candidate: ImplBlock* = DeclarationNode::impl_of(heads[i]);
-                if (candidate == null || !registry.object_arguments_unify(candidate, &args, this.intern)) { continue; }
+                if (candidate == null || !registry.binds_trait_arguments(candidate, &args, this.intern)) { continue; }
                 if (checker.impl_applies(candidate, value, 0)) { found = candidate; break; }
             }
             if (found == null) {
@@ -2986,23 +2987,64 @@ type struct SemaVisitor {
         return true;
     }
 
-    /// A trait's name `shown` with the arguments an object gives it,
-    /// `Conv<i64>`; the name alone when it takes none, or when any of them
-    /// is left unbound.
-    shown_with_arguments(&this, shown: string, args: &[TypeRef]) -> string {
-        if (args.length == 0) { return shown; }
-        mut written: string = "";
-        for (mut i: i64 = 0; i < args.length; i++) {
-            const arg_t: Type* = this.arena.lookup(args[i]);
-            if (arg_t == null) { return shown; }
-            written = written + (if (i > 0) { ", " } else { "" }) + this.arena.format_display(arg_t);
+    /// E0312 at an implementation of a trait for a type that does not
+    /// implement each of the trait's supertraits, at the arguments the trait
+    /// writes on it with this implementation's put in
+    /// (`TypeResolver::supertrait_arguments`): whatever implements a
+    /// subtrait promises the supertrait's methods too.  A supertrait's own
+    /// supertraits are its implementation's to check.  Asked here, where
+    /// every module's implementations are registered.  A concrete
+    /// implementation's supertrait implementation must have its
+    /// where-clause hold for the type; a generic one's type arguments are
+    /// not known here, so the supertrait's head unifying with it is enough.
+    check_supertraits_implemented(mut &this, decl: DeclarationNode*, node: ImplBlock*) -> void {
+        if (!node.is_trait_impl() || node.spec_owner.is_valid()) { return; }
+        const registry: GenericRegistry* = this.ctx.generic_registry;
+        const trait_decl: TraitDecl* = registry.get_trait_decl(node.trait_def);
+        if (trait_decl == null || trait_decl.base_traits.length == 0) { return; }
+        const owner: TypeRef = this.ctx.decl_index.impl_owner(node, "sema/supertraits implemented");
+        const owner_t: Type* = this.arena.lookup(owner);
+        if (owner_t == null) { return; }
+        const resolver: TypeResolver* = this.ctx.type_resolver;
+        mut args: [TypeRef] = [];
+        const positions: i64 = trait_decl.generic_params.length + trait_decl.assoc_types.length;
+        for (mut k: i64 = 0; k < positions; k++) {
+            if (k < trait_decl.generic_params.length && k < node.trait_arg_types.length) {
+                args.push(node.trait_arg_types[k]);
+                continue;
+            }
+            const written: TypeAnnotation* = node.trait_slot_annotation(trait_decl, k);
+            mut rc: ResolutionContext = ResolutionContext::new("");
+            args.push(if (written != null && !node.is_generic()) { resolver.resolve(written, &rc) } else { TypeRef::invalid() });
         }
-        return shown + "<" + written + ">";
+        const generic: boolean = node.is_generic() || registry.template_of(node.target_def()) != null;
+        const checker: TraitChecker = this.trait_checker();
+        const shown_owner: string = this.arena.format_display(owner_t);
+        const shown_trait: string = this.intern.resolve(this.ctx.defs.path_of(node.trait_def).spelling());
+        for (mut i: i64 = 0; i < trait_decl.base_traits.length; i++) {
+            const base: DefId = trait_decl.base_traits[i].definition();
+            if (!base.is_valid() || registry.get_trait_decl(base) == null) { continue; }
+            const base_args: [TypeRef] = resolver.supertrait_arguments(node.trait_def, &args, i);
+            const heads: [DeclarationNode*] = registry.heads_for(base, owner, this.intern);
+            mut found: boolean = false;
+            for (mut h: i64 = 0; h < heads.length && !found; h++) {
+                const candidate: ImplBlock* = DeclarationNode::impl_of(heads[h]);
+                if (candidate == null || !registry.binds_trait_arguments(candidate, &base_args, this.intern)) { continue; }
+                found = generic || checker.impl_applies(candidate, owner, 0);
+            }
+            if (found) { continue; }
+            const shown_base: string = this.arena.display_with_arguments(
+                this.intern.resolve(this.ctx.defs.path_of(base).spelling()), &base_args);
+            const span: SourceSpan = if (node.target_type_span.has_location()) { node.target_type_span } else { decl.span };
+            this.ctx.emit_error_at(ErrorCode::E0312_TRAIT_IMPL_MISMATCH,
+                fmt::format("`%s` does not implement `%s`, which `%s` requires, so `%s` cannot implement `%s`",
+                    shown_owner, shown_base, shown_trait, shown_owner, shown_trait), span);
+        }
     }
 
     /// The implementation of `object`'s trait for `value` whose where-clause
     /// holds, among those binding the trait at the object's arguments
-    /// (`GenericRegistry::object_arguments_unify`); null when there is none.
+    /// (`GenericRegistry::binds_trait_arguments`); null when there is none.
     object_implementation(&this, object: ObjectType*, value: TypeRef) -> DeclarationNode* {
         const registry: GenericRegistry* = this.ctx.generic_registry;
         if (registry == null) { return null; }
@@ -3011,7 +3053,7 @@ type struct SemaVisitor {
         for (mut i: i64 = 0; i < heads.length; i++) {
             const block: ImplBlock* = DeclarationNode::impl_of(heads[i]);
             if (block == null) { continue; }
-            if (!registry.object_arguments_unify(block, &object.args, this.intern)) { continue; }
+            if (!registry.binds_trait_arguments(block, &object.args, this.intern)) { continue; }
             if (checker.impl_applies(block, value, 0)) { return heads[i]; }
         }
         return null;

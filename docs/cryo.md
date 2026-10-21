@@ -1866,6 +1866,8 @@ type trait Ord : Eq {
 }
 ```
 
+An implementation of the derived trait for a type that does not implement the base is refused where the `implement` block is written (`E0312`: "`Square` does not implement `Eq`, which `Ord` requires, so `Square` cannot implement `Ord`"). A base written with arguments, `type trait Sized<U> : Measure<U>`, must be implemented at them, with the derived implementation's arguments put in: `Sized<i64>` for a type needs `Measure<i64>` for it. A generic implementation, `implement<T> trait Ord for Box<T>`, needs an implementation of the base for the same generic type, whose where-clause is not compared with the derived one's.
+
 A trait is not a type. Written where a value's type goes - `p: Shape`, a return type, a field, a local, a type argument, an alias's target - it is refused where it is written (`E0313`), and so are `&Shape` and `Shape*` with `Shape` a trait. Code that accepts any type implementing a trait takes a bounded type parameter instead ([section 11.3](#113-trait-bounds-with-where)), or a trait object (below):
 
 ```cryo
