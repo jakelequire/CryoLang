@@ -1914,6 +1914,7 @@ type struct NameResolver {
                 for (mut i: i64 = 0; i < g.args.length; i++) {
                     this.stamp_annotation(g.args[i]);
                 }
+                this.refuse_type_argument_count(g);
             }
             TypeAnnotation::ImplTrait(imp) => {
                 for (mut i: i64 = 0; i < imp.bounds.length; i++) {
@@ -2228,6 +2229,58 @@ type struct NameResolver {
         }
         if (!def.is_valid() || this.ctx.generic_registry.get_trait_decl(def) == null) { return DefId::invalid(); }
         return def;
+    }
+
+    /// E0307 at a generic struct, union, enum or alias written with more type
+    /// arguments than it has parameters, or with fewer than its parameters
+    /// that have no default (`Box<i32, i64>` for `Box<T>`): an argument with
+    /// no parameter to bind would otherwise be dropped where it is written.
+    /// A trait's arguments are counted where its object type is, with its
+    /// associated types.
+    refuse_type_argument_count(&this, g: GenericAnnotation*) -> void {
+        const named: NamedAnnotation* = match (*g.base) {
+            TypeAnnotation::Named(bn) => { bn }
+            _                         => { null }
+        };
+        if (named == null) { return; }
+        mut def: DefId = DefId::invalid();
+        match (named.res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Def(d) => { def = d; }
+                    _           => { }
+                }
+            }
+            _ => { }
+        }
+        const declared: DeclarationNode* = this.ctx.decl_index.declaration_of(def);
+        if (declared == null) { return; }
+        const none: [DeclarationNode*] = [];
+        mut params: &[DeclarationNode*] = &none;
+        mut name: SymbolStr = SymbolStr::empty();
+        match (declared.kind) {
+            DeclKind::Struct(s)    => { params = &s.generic_params; name = s.name; }
+            DeclKind::Union(u)     => { params = &u.generic_params; name = u.name; }
+            DeclKind::Enum(e)      => { params = &e.generic_params; name = e.name; }
+            DeclKind::TypeAlias(a) => { params = &a.generic_params; name = a.alias_name; }
+            _                      => { return; }
+        }
+        if (params.length == 0) { return; }
+        mut required: i64 = 0;
+        for (mut i: i64 = 0; i < params.length; i++) {
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(params[i]);
+            if (gp != null && !gp.has_default_annotation()) { required = i + 1; }
+        }
+        const written: i64 = g.args.length;
+        const parameters: i64 = params.length;
+        if (written >= required && written <= parameters) { return; }
+        g.refused = true;
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
+            fmt::format("`%s` has %lld type parameter%s, and %lld type argument%s %s written",
+                this.resolver.intern_table.resolve(name), parameters, if (parameters == 1) { "" } else { "s" },
+                written, if (written == 1) { "" } else { "s" }, if (written == 1) { "is" } else { "are" }));
+        d = d.at_with_label(g.span, if (written > parameters) { "too many type arguments" } else { "too few type arguments" });
+        this.ctx.emit_diagnostic(d);
     }
 
     /// E0316 at an object type whose `virtual` is written on something that

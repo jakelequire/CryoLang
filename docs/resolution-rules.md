@@ -285,6 +285,27 @@ yet is recorded with the change that builds it, not here.
      same rule, not a new one, so objects add no placement case.
      (Delegated)
 
+497. **The four open bug reports about class features (an override left
+     unchecked, a missing table slot, slots matched by name, a delete
+     through a base pointer skipping the derived drop) are closed as
+     moot:** the features they describe no longer exist.
+
+498. **The bridge table in the class-removal plan is emptied:** the two
+     rows for the per-kind node accessors, which were ruled to stay
+     (460), and the two rows naming code that is gone are struck, so the
+     final audit's check that the table is empty holds.
+
+499. **A generic type written with the wrong number of type arguments
+     (`Box<i32, i64>` for `Box<T>`), and a call of a generic method writing
+     more type arguments than the method has type parameters, are refused
+     with E0307 in its existing wording,** "`Box` has 1 type parameter,
+     and 2 type arguments are written".
+
+500. **The E0306 note shown when an object cannot satisfy a bound of its
+     own trait names the method that blocks it and why, in full words,**
+     in the form of E0314's reason notes; the wording was left to the
+     implementer.  (Delegated)
+
 462. **A path through a bounded type parameter naming a member no bound
      declares (`T::missing()` in a generic function that is instantiated)
      is refused with a diagnostic where it is written,** not left for
