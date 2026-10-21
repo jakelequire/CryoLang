@@ -5,9 +5,8 @@
 /// annotations resolved, so every type has its fields/variants fully populated.
 ///
 /// Layout rules follow C/LLVM conventions:
-///   - Struct/Class: sequential fields with alignment padding; total size
+///   - Struct: sequential fields with alignment padding; total size
 ///     rounded up to struct alignment (max field alignment).
-///   - Class with virtual methods: 8-byte vtable pointer at offset 0.
 ///   - Enum (simple): i32 tag only (4 bytes, align 4).
 ///   - Enum (ADT): i32 tag + padding + largest variant payload; total aligned.
 ///   - Tuple: sequential elements like struct fields.
@@ -41,7 +40,7 @@ import compiler::types::type_base;
 import compiler::types::type_base::{ Type };
 import compiler::types::user_defined;
 import compiler::types::user_defined::{
-    ClassType, EnumType, EnumVariantInfo, StructType, TypeAliasType
+    EnumType, EnumVariantInfo, StructType, TypeAliasType
 };
 import std::fmt;
 import compiler::ast::expression::{ ExpressionNode };
@@ -106,7 +105,7 @@ type struct TypeLoweringPasses {
             cdebug("[TypeLowering] Computed layouts for %lld types\n", computed);
         }
 
-        // Reject infinitely-sized recursive value types.  Any struct/class
+        // Reject infinitely-sized recursive value types.  Any struct
         // the fixpoint could not settle which contains itself by value
         // (directly or transitively, through non-pointer fields) has no
         // finite size; the front end otherwise accepted it and left it at
@@ -115,18 +114,13 @@ type struct TypeLoweringPasses {
         for (mut ri: i64 = 0; ri < arena.type_count(); ri++) {
             const rty: Type* = arena.types[ri];
             if (rty == null) { continue; }
-            if (rty.kind != TypeKind::Struct && rty.kind != TypeKind::Class) {
+            if (rty.kind != TypeKind::Struct) {
                 continue;
             }
             if (TypeLoweringPasses::layout_settled(rty)) { continue; }
             if (!TypeLoweringPasses::reaches_by_value(arena, rty, rty.id, 0)) { continue; }
 
-            mut tname: string = "<type>";
-            if (rty.kind == TypeKind::Struct) {
-                tname = (rty as StructType*).display_name();
-            } else {
-                tname = (rty as ClassType*).display_name();
-            }
+            const tname: string = rty.as_struct().display_name();
             mut diag: Diagnostic = Diagnostic::error(
                 ErrorCode::E0236_RECURSIVE_TYPE,
                 fmt::format("recursive type `%s` has infinite size", tname));
@@ -168,7 +162,7 @@ type struct TypeLoweringPasses {
                 if (sa == null) { continue; }
                 const ev: ConstEval = ConstEval::new(ctx.const_table, ctx.intern_table, arena);
                 mut result: i64 = 0;
-                const ok: boolean = ev.fold(sa.cond as ExpressionNode*, &result);
+                const ok: boolean = ev.fold(sa.cond, &result);
                 if (!ok) {
                     mut d1: Diagnostic = Diagnostic::error(
                         ErrorCode::E0237_STATIC_ASSERT_FAILED,
@@ -198,12 +192,12 @@ type struct TypeLoweringPasses {
         mut d: i32 = 0;
         while (c != null && d < 16) {
             if (c.kind == TypeKind::TypeAlias) {
-                const al: TypeAliasType* = c as TypeAliasType*;
+                const al: TypeAliasType* = c.as_alias();
                 if (al.has_target()) { c = arena.lookup(al.target); d += 1; continue; }
                 return c;
             }
             if (c.kind == TypeKind::InstantiatedType) {
-                const it: InstantiatedType* = c as InstantiatedType*;
+                const it: InstantiatedType* = c.as_instantiated();
                 if (it.has_resolved_type()) { c = arena.lookup(it.resolved_type); d += 1; continue; }
                 return c;
             }
@@ -228,7 +222,7 @@ type struct TypeLoweringPasses {
     }
 
     /// True if `target_id` is reachable from `container` through by-value
-    /// containment (struct/class fields, tuple elements, fixed-array
+    /// containment (struct fields, tuple elements, fixed-array
     /// elements).  Detects infinitely-sized recursive value types.  Depth
     /// guarded so a cyclic graph terminates even before the target is found.
     static reaches_by_value(arena: TypeArena*, container: Type*,
@@ -236,7 +230,7 @@ type struct TypeLoweringPasses {
         if (container == null || depth > 128) { return false; }
 
         if (container.kind == TypeKind::Struct) {
-            const st: StructType* = container as StructType*;
+            const st: StructType* = container.as_struct();
             for (mut i: i64 = 0; i < st.fields.length; i++) {
                 if (TypeLoweringPasses::by_value_child_reaches(arena, st.fields[i].field_type, target_id, depth)) {
                     return true;
@@ -244,17 +238,8 @@ type struct TypeLoweringPasses {
             }
             return false;
         }
-        if (container.kind == TypeKind::Class) {
-            const ct: ClassType* = container as ClassType*;
-            for (mut i: i64 = 0; i < ct.fields.length; i++) {
-                if (TypeLoweringPasses::by_value_child_reaches(arena, ct.fields[i].field_type, target_id, depth)) {
-                    return true;
-                }
-            }
-            return false;
-        }
         if (container.kind == TypeKind::Tuple) {
-            const tt: TupleType* = container as TupleType*;
+            const tt: TupleType* = container.as_tuple();
             for (mut i: i64 = 0; i < tt.elements.length; i++) {
                 if (TypeLoweringPasses::by_value_child_reaches(arena, tt.elements[i], target_id, depth)) {
                     return true;
@@ -263,7 +248,7 @@ type struct TypeLoweringPasses {
             return false;
         }
         if (container.kind == TypeKind::Array) {
-            const at: ArrayType* = container as ArrayType*;
+            const at: ArrayType* = container.as_array();
             return TypeLoweringPasses::by_value_child_reaches(arena, at.element, target_id, depth);
         }
         return false;
@@ -292,35 +277,31 @@ type struct TypeLoweringPasses {
         if (ty == null) { return true; }
         if (ty.size_bytes() > 0) { return true; }
         if (ty.kind == TypeKind::Struct) {
-            const st: StructType* = ty as StructType*;
+            const st: StructType* = ty.as_struct();
             return st.computed_align > 0;
         }
-        if (ty.kind == TypeKind::Class) {
-            const cl: ClassType* = ty as ClassType*;
-            return cl.computed_align > 0;
-        }
         if (ty.kind == TypeKind::Enum) {
-            const en: EnumType* = ty as EnumType*;
+            const en: EnumType* = ty.as_enum();
             return en.computed_align > 0;
         }
         if (ty.kind == TypeKind::Tuple) {
-            const tt: TupleType* = ty as TupleType*;
+            const tt: TupleType* = ty.as_tuple();
             return tt.computed_align > 0;
         }
         if (ty.kind == TypeKind::Optional) {
-            const ot: OptionalType* = ty as OptionalType*;
+            const ot: OptionalType* = ty.as_optional();
             return ot.computed_align > 0;
         }
         if (ty.kind == TypeKind::TypeAlias) {
-            const al: TypeAliasType* = ty as TypeAliasType*;
+            const al: TypeAliasType* = ty.as_alias();
             return al.computed_align > 0;
         }
         if (ty.kind == TypeKind::InstantiatedType) {
-            const it: InstantiatedType* = ty as InstantiatedType*;
+            const it: InstantiatedType* = ty.as_instantiated();
             return it.computed_align > 0;
         }
         if (ty.kind == TypeKind::Array) {
-            const arr: ArrayType* = ty as ArrayType*;
+            const arr: ArrayType* = ty.as_array();
             return arr.computed_align > 0;
         }
         return !TypeLoweringPasses::needs_layout(ty);
@@ -329,7 +310,6 @@ type struct TypeLoweringPasses {
     /// Returns true if this type kind should have a non-zero layout computed.
     static needs_layout(ty: Type*) -> boolean {
         if (ty.kind == TypeKind::Struct)           { return true; }
-        if (ty.kind == TypeKind::Class)            { return true; }
         if (ty.kind == TypeKind::Enum)             { return true; }
         if (ty.kind == TypeKind::Tuple)            { return true; }
         if (ty.kind == TypeKind::Optional)         { return true; }
@@ -344,28 +324,25 @@ type struct TypeLoweringPasses {
     /// Returns true if a layout was computed (size changed from 0 to non-zero).
     static compute_layout(ty: Type*, arena: TypeArena*) -> boolean {
         if (ty.kind == TypeKind::Struct) {
-            return TypeLoweringPasses::compute_struct_layout(ty as StructType*, arena);
-        }
-        if (ty.kind == TypeKind::Class) {
-            return TypeLoweringPasses::compute_class_layout(ty as ClassType*, arena);
+            return TypeLoweringPasses::compute_struct_layout(ty.as_struct(), arena);
         }
         if (ty.kind == TypeKind::Enum) {
-            return TypeLoweringPasses::compute_enum_layout(ty as EnumType*, arena);
+            return TypeLoweringPasses::compute_enum_layout(ty.as_enum(), arena);
         }
         if (ty.kind == TypeKind::Tuple) {
-            return TypeLoweringPasses::compute_tuple_layout(ty as TupleType*, arena);
+            return TypeLoweringPasses::compute_tuple_layout(ty.as_tuple(), arena);
         }
         if (ty.kind == TypeKind::Optional) {
-            return TypeLoweringPasses::compute_optional_layout(ty as OptionalType*, arena);
+            return TypeLoweringPasses::compute_optional_layout(ty.as_optional(), arena);
         }
         if (ty.kind == TypeKind::Array) {
-            return TypeLoweringPasses::compute_fixed_array_layout(ty as ArrayType*, arena);
+            return TypeLoweringPasses::compute_fixed_array_layout(ty.as_array(), arena);
         }
         if (ty.kind == TypeKind::TypeAlias) {
-            return TypeLoweringPasses::compute_alias_layout(ty as TypeAliasType*, arena);
+            return TypeLoweringPasses::compute_alias_layout(ty.as_alias(), arena);
         }
         if (ty.kind == TypeKind::InstantiatedType) {
-            return TypeLoweringPasses::compute_instantiated_layout(ty as InstantiatedType*, arena);
+            return TypeLoweringPasses::compute_instantiated_layout(ty.as_instantiated(), arena);
         }
         return false;
     }
@@ -432,7 +409,7 @@ type struct TypeLoweringPasses {
             const f_align: u64 = field_ty.alignment();
 
             // Skip fields whose types haven't been laid out yet.  Empty
-            // marker structs / classes (laid out at size 0 with align 1)
+            // marker structs (laid out at size 0 with align 1)
             // are settled; don't defer on those.
             if (f_size == 0 && TypeLoweringPasses::needs_layout(field_ty) && !TypeLoweringPasses::layout_settled(field_ty)) {
                 return false;
@@ -474,81 +451,6 @@ type struct TypeLoweringPasses {
         // structs, so no padding is added in that case).
         const total: u64 = math::align_up(offset, max_align);
         st.set_layout(total, max_align);
-        return true;
-    }
-
-
-    // Class layout: like struct but with vtable pointer if virtual
-
-    static compute_class_layout(cl: ClassType*, arena: TypeArena*) -> boolean {
-        if (cl.computed_align > 0) { return false; }
-
-        // One flat object: a single vtable pointer at offset 0 iff any class in
-        // the inheritance chain declares virtual methods, then every class's
-        // fields root-to-derived in one sequence, each at the lowest offset
-        // satisfying its natural alignment.  This is the object codegen emits
-        // (`TypeMapper::map_class`), so it is the only layout `sizeof` may
-        // report: charging a vtable pointer per level, or restarting the
-        // derived fields after the base's *padded* size, describes an object
-        // that does not exist and overruns anything sized from it.
-        //
-        // chain[0] is this class; chain[N-1] is the root.  The depth cap
-        // mirrors the mapper's, so a pathological chain truncates identically
-        // on both sides rather than disagreeing.
-        mut chain: [ClassType*] = [];
-        mut any_virtual: boolean = false;
-        mut walk: ClassType* = cl;
-        mut depth: i32 = 0;
-        while (walk != null && depth < 16) {
-            chain.push(walk);
-            if (walk.has_virtual_methods) { any_virtual = true; }
-            if (!walk.has_base || !walk.base_class.is_valid()) { break; }
-            const base_t: Type* = arena.lookup(walk.base_class);
-            if (base_t == null || base_t.kind != TypeKind::Class) { break; }
-            walk = base_t as ClassType*;
-            depth += 1;
-        }
-
-        mut offset:    u64 = 0;
-        mut max_align: u64 = 1;
-        if (any_virtual) {
-            offset    = 8;
-            max_align = 8;
-        }
-        // `![align(N)]` raises the minimum alignment.
-        if (cl.min_alignment > max_align) { max_align = cl.min_alignment; }
-
-        for (mut ci: i64 = chain.length - 1; ci >= 0; ci--) {
-            const link: ClassType* = chain[ci];
-            for (mut i: i64 = 0; i < link.fields.length; i++) {
-                const field_ty: Type* = arena.lookup(link.fields[i].field_type);
-                if (field_ty == null) { continue; }
-
-                const f_size:  u64 = field_ty.size_bytes();
-                const f_align: u64 = field_ty.alignment();
-
-                // Defer until every member type is laid out.  Empty markers
-                // (size 0, align 1) are settled; don't defer on those.
-                if (f_size == 0 && TypeLoweringPasses::needs_layout(field_ty)
-                        && !TypeLoweringPasses::layout_settled(field_ty)) {
-                    return false;
-                }
-
-                if (f_align > 0) {
-                    offset = math::align_up(offset, f_align);
-                    if (f_align > max_align) { max_align = f_align; }
-                }
-
-                // Only this class's own field offsets are ours to record; an
-                // ancestor records its own, and does so from the same start,
-                // which is what makes an upcast pointer a no-op.
-                if (ci == 0) { cl.set_field_offset(i, offset); }
-                offset += f_size;
-            }
-        }
-
-        const total: u64 = math::align_up(offset, max_align);
-        cl.set_layout(total, max_align);
         return true;
     }
 
@@ -763,23 +665,14 @@ type struct TypeLoweringPasses {
     /// `compute_*_layout` reads for sizing.
     static has_unresolved_layout_child(arena: TypeArena*, ty: Type*) -> boolean {
         if (ty.kind == TypeKind::Struct) {
-            const st: StructType* = ty as StructType*;
+            const st: StructType* = ty.as_struct();
             for (mut i: i64 = 0; i < st.fields.length; i++) {
                 if (arena.lookup(st.fields[i].field_type) == null) { return true; }
             }
             return false;
         }
-        if (ty.kind == TypeKind::Class) {
-            const cl: ClassType* = ty as ClassType*;
-            if (cl.has_base && cl.base_class.is_valid()
-                    && arena.lookup(cl.base_class) == null) { return true; }
-            for (mut i: i64 = 0; i < cl.fields.length; i++) {
-                if (arena.lookup(cl.fields[i].field_type) == null) { return true; }
-            }
-            return false;
-        }
         if (ty.kind == TypeKind::Enum) {
-            const en: EnumType* = ty as EnumType*;
+            const en: EnumType* = ty.as_enum();
             for (mut i: i64 = 0; i < en.variants.length; i++) {
                 const variant: EnumVariantInfo* = &en.variants[i];
                 for (mut j: i64 = 0; j < variant.payload_types.length; j++) {
@@ -789,27 +682,27 @@ type struct TypeLoweringPasses {
             return false;
         }
         if (ty.kind == TypeKind::Tuple) {
-            const tt: TupleType* = ty as TupleType*;
+            const tt: TupleType* = ty.as_tuple();
             for (mut i: i64 = 0; i < tt.elements.length; i++) {
                 if (arena.lookup(tt.elements[i]) == null) { return true; }
             }
             return false;
         }
         if (ty.kind == TypeKind::Optional) {
-            const opt: OptionalType* = ty as OptionalType*;
+            const opt: OptionalType* = ty.as_optional();
             return arena.lookup(opt.wrapped) == null;
         }
         if (ty.kind == TypeKind::Array) {
-            const arr: ArrayType* = ty as ArrayType*;
+            const arr: ArrayType* = ty.as_array();
             return arena.lookup(arr.element) == null;
         }
         if (ty.kind == TypeKind::TypeAlias) {
-            const al: TypeAliasType* = ty as TypeAliasType*;
+            const al: TypeAliasType* = ty.as_alias();
             if (al.has_target()) { return arena.lookup(al.target) == null; }
             return false;
         }
         if (ty.kind == TypeKind::InstantiatedType) {
-            const it: InstantiatedType* = ty as InstantiatedType*;
+            const it: InstantiatedType* = ty.as_instantiated();
             if (it.has_resolved_type()) { return arena.lookup(it.resolved_type) == null; }
             return false;
         }

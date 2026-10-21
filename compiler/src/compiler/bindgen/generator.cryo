@@ -33,14 +33,14 @@ import compiler::compilation_context::{ BuildOptions, CompilationContext };
 import compiler::compile_mode;
 import compiler::compile_mode::{ CompileMode };
 import compiler::ast;
-import compiler::ast::{ declaration, LiteralKind, node, NodeKind, TypeAnnotation };
+import compiler::ast::{ declaration, LiteralKind, node, TypeAnnotation };
 import compiler::ast::expression;
 import compiler::ast::expression::{
-    CallExprNode, CastExprNode, ExpressionNode, FieldInit, IdentifierNode, LiteralNode,
-    StructLiteralNode
+    CallExpr, CastExpr, ExpressionNode, FieldInit,LiteralExpr,
+    StructExpr
 };
 import compiler::ast::statement;
-import compiler::ast::statement::{ ExprStmtNode, ReturnStmtNode, StatementNode };
+import compiler::ast::statement::{ Stmt, StmtKind };
 import compiler::resolver::{ symbol_str, intern_table };
 import compiler::diag::{ source_span };
 import utils::logger;
@@ -59,11 +59,11 @@ import std::collections::str;
 import std::collections::str::{ Str };
 import std::core::mem;
 import compiler::ast::declaration::{
-    BindingAccessor, EnumDeclNode, EnumVariantNode, ExternBlockNode, FieldDeclNode,
-    FunctionDeclNode, ImplBlockNode, MethodNode, StructDeclNode, TypeAliasDeclNode,
-    UnionDeclNode, VarDeclNode
+    BindingAccessor, DeclarationNode, EnumDecl, EnumVariant, ExternBlock, FieldDecl,
+    FunctionDecl, ImplBlock, MethodDecl, StructDecl, TypeAliasDecl,
+    UnionDecl, VarDecl
 };
-import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::node::{ ProgramNode };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import utils::keyword::{ Keyword };
@@ -137,7 +137,7 @@ type struct BindingSerializer {
     /// Render the full binding file for `root` (top-level type decls) plus
     /// `extern_node` (the C functions) under `namespace ns`.
     static render(ctx: CompilationContext*, ns: string,
-                  root: ProgramNode*, extern_node: ExternBlockNode*,
+                  root: ProgramNode*, extern_node: ExternBlock*,
                   report: ImportReport*) -> string {
         mut buf: String = String::new();
         mut s: BindingSerializer = BindingSerializer {
@@ -150,9 +150,9 @@ type struct BindingSerializer {
         // Type declarations, in emission order, deduped by name (a type can be
         // visited once per header across a multi-header library).
         mut seen: [string] = [];
-        mut ext_globals: [VarDeclNode*] = [];
+        mut ext_globals: [VarDecl*] = [];
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const node: ASTNode* = root.statements[i];
+            const node: DeclarationNode* = root.statements[i].as_decl();
             if (node == null) { continue; }
             const nm: string = BindingSerializer::decl_name(s.ctx, node);
             if (nm.length() == 0 || BindingSerializer::contains(&seen, nm)) { continue; }
@@ -160,9 +160,9 @@ type struct BindingSerializer {
             // An imported global is a MEMBER of the `extern "C"` block rendered
             // below, not a standalone declaration.  Gathering it here rather
             // than in a second sweep lets it inherit this loop's dedup.
-            if (node.kind == NodeKind::VariableDeclaration
-                    && (node as VarDeclNode*).is_extern_import) {
-                ext_globals.push(node as VarDeclNode*);
+            if (DeclarationNode::var_of(node) != null
+                    && (DeclarationNode::var_of(node)).is_extern_import) {
+                ext_globals.push(DeclarationNode::var_of(node));
                 continue;
             }
             s.render_decl(node);
@@ -184,7 +184,8 @@ type struct BindingSerializer {
                 s.render_extern_global(ext_globals[gi]);
             }
             for (mut i: i64 = 0; i < extern_node.functions.length; i++) {
-                const fnode: FunctionDeclNode* = extern_node.functions[i];
+                const fnode_decl: DeclarationNode* = extern_node.functions[i];
+                const fnode: FunctionDecl* = DeclarationNode::fn_of(fnode_decl);
                 const fnm: string = s.ctx.intern_table.resolve(fnode.name);
                 const sym: string = if (fnode.has_link_name) { fnode.link_name } else { fnm };
                 mut dup_at: i64 = -1;
@@ -208,7 +209,7 @@ type struct BindingSerializer {
                         }
                         seen_fn.push(alias);
                         seen_sym.push(sym);
-                        s.render_function_named(fnode, alias, sym);
+                        s.render_function_named(fnode_decl, alias, sym);
                         if (report != null) {
                             report.approx(fmt::format(
                                 "function `%s` renamed to `%s` (C++ overload or cross-namespace leaf collision; binds `%s`)",
@@ -219,7 +220,7 @@ type struct BindingSerializer {
                 }
                 seen_fn.push(fnm);
                 seen_sym.push(sym);
-                s.render_function(fnode);
+                s.render_function(fnode_decl);
             }
             s.out.push("}\n");
         }
@@ -227,52 +228,50 @@ type struct BindingSerializer {
     }
 
     /// The declared name of a top-level decl node (for dedup), or "".
-    static decl_name(ctx: CompilationContext*, node: ASTNode*) -> string {
-        const k: NodeKind = node.kind;
-        if (k == NodeKind::StructDeclaration) {
-            return ctx.intern_table.resolve((node as StructDeclNode*).name);
-        } else if (k == NodeKind::UnionDeclaration) {
-            return ctx.intern_table.resolve((node as UnionDeclNode*).name);
-        } else if (k == NodeKind::EnumDeclaration) {
-            return ctx.intern_table.resolve((node as EnumDeclNode*).name);
-        } else if (k == NodeKind::TypeAliasDeclaration) {
-            return ctx.intern_table.resolve((node as TypeAliasDeclNode*).alias_name);
-        } else if (k == NodeKind::VariableDeclaration) {
-            return ctx.intern_table.resolve((node as VarDeclNode*).name);
-        } else if (k == NodeKind::FunctionDeclaration) {
-            return ctx.intern_table.resolve((node as FunctionDeclNode*).name);
-        } else if (k == NodeKind::ImplementationBlock) {
+    static decl_name(ctx: CompilationContext*, node: DeclarationNode*) -> string {
+        if (DeclarationNode::struct_of(node) != null) {
+            return ctx.intern_table.resolve((DeclarationNode::struct_of(node)).name);
+        } else if (DeclarationNode::union_of(node) != null) {
+            return ctx.intern_table.resolve(DeclarationNode::union_of(node).name);
+        } else if (DeclarationNode::enum_of(node) != null) {
+            return ctx.intern_table.resolve(DeclarationNode::enum_of(node).name);
+        } else if (DeclarationNode::alias_of(node) != null) {
+            return ctx.intern_table.resolve(DeclarationNode::alias_of(node).alias_name);
+        } else if (DeclarationNode::var_of(node) != null) {
+            return ctx.intern_table.resolve((DeclarationNode::var_of(node)).name);
+        } else if (DeclarationNode::fn_of(node) != null) {
+            return ctx.intern_table.resolve(DeclarationNode::fn_of(node).name);
+        } else if (DeclarationNode::impl_of(node) != null) {
             // A synthetic key so an impl block isn't dropped by the empty-name
             // skip, and so a class re-visited across headers dedups by target.
             return fmt::format("impl:%s",
-                ctx.intern_table.resolve((node as ImplBlockNode*).target_type));
+                ctx.intern_table.resolve((DeclarationNode::impl_of(node)).target_type));
         }
         return "";
     }
 
-    render_decl(mut &this, node: ASTNode*) -> void {
-        const k: NodeKind = node.kind;
-        if (k == NodeKind::StructDeclaration) {
-            this.render_struct(node as StructDeclNode*);
-        } else if (k == NodeKind::UnionDeclaration) {
-            this.render_union(node as UnionDeclNode*);
-        } else if (k == NodeKind::EnumDeclaration) {
-            this.render_enum(node as EnumDeclNode*);
-        } else if (k == NodeKind::TypeAliasDeclaration) {
-            this.render_alias(node as TypeAliasDeclNode*);
-        } else if (k == NodeKind::VariableDeclaration) {
-            this.render_const(node as VarDeclNode*);
-        } else if (k == NodeKind::FunctionDeclaration) {
+    render_decl(mut &this, node: DeclarationNode*) -> void {
+        if (DeclarationNode::struct_of(node) != null) {
+            this.render_struct(DeclarationNode::struct_of(node));
+        } else if (DeclarationNode::union_of(node) != null) {
+            this.render_union(DeclarationNode::union_of(node));
+        } else if (DeclarationNode::enum_of(node) != null) {
+            this.render_enum(DeclarationNode::enum_of(node));
+        } else if (DeclarationNode::alias_of(node) != null) {
+            this.render_alias(DeclarationNode::alias_of(node));
+        } else if (DeclarationNode::var_of(node) != null) {
+            this.render_const(DeclarationNode::var_of(node));
+        } else if (DeclarationNode::fn_of(node) != null) {
             // A bodied top-level function in `root.statements` is a function-alias
             // forwarding wrapper (the extern prototypes live in `extern_node`).
-            this.render_wrapper_function(node as FunctionDeclNode*);
-        } else if (k == NodeKind::ImplementationBlock) {
+            this.render_wrapper_function(node);
+        } else if (DeclarationNode::impl_of(node) != null) {
             // A C++ class's bound methods (direct mangled binding).
-            this.render_impl(node as ImplBlockNode*);
+            this.render_impl(DeclarationNode::impl_of(node));
         }
     }
 
-    render_struct(mut &this, node: StructDeclNode*) -> void {
+    render_struct(mut &this, node: StructDecl*) -> void {
         if (node.repr_c) { this.out.push("![repr(C)]\n"); }
         if (node.min_alignment > 0) {
             this.out.push(fmt::format("![align(%llu)]\n", node.min_alignment));
@@ -280,7 +279,8 @@ type struct BindingSerializer {
         this.out.push(fmt::format("type struct %s {\n",
             BindingSerializer::ident(this.ctx.intern_table.resolve(node.name))));
         for (mut i: i64 = 0; i < node.fields.length; i++) {
-            const f: FieldDeclNode* = node.fields[i];
+            const f_decl: DeclarationNode* = node.fields[i];
+            const f: FieldDecl* = DeclarationNode::field_of(f_decl);
             this.out.push(fmt::format("    %s: %s;\n",
                 BindingSerializer::ident(this.ctx.intern_table.resolve(f.name)),
                 this.render_type(f.type_annotation)));
@@ -296,7 +296,7 @@ type struct BindingSerializer {
     /// Render a native `type union` (untagged C union): one field per member, all
     /// overlaid at offset 0.  No synthesized accessors - members are accessed
     /// directly (`v.field`); a literal initializes exactly one member.
-    render_union(mut &this, node: UnionDeclNode*) -> void {
+    render_union(mut &this, node: UnionDecl*) -> void {
         if (node.repr_c) { this.out.push("![repr(C)]\n"); }
         if (node.min_alignment > 0) {
             this.out.push(fmt::format("![align(%llu)]\n", node.min_alignment));
@@ -304,7 +304,8 @@ type struct BindingSerializer {
         this.out.push(fmt::format("type union %s {\n",
             BindingSerializer::ident(this.ctx.intern_table.resolve(node.name))));
         for (mut i: i64 = 0; i < node.fields.length; i++) {
-            const f: FieldDeclNode* = node.fields[i];
+            const f_decl: DeclarationNode* = node.fields[i];
+            const f: FieldDecl* = DeclarationNode::field_of(f_decl);
             this.out.push(fmt::format("    %s: %s;\n",
                 BindingSerializer::ident(this.ctx.intern_table.resolve(f.name)),
                 this.render_type(f.type_annotation)));
@@ -393,7 +394,7 @@ type struct BindingSerializer {
         return 64;
     }
 
-    render_enum(mut &this, node: EnumDeclNode*) -> void {
+    render_enum(mut &this, node: EnumDecl*) -> void {
         if (node.repr_c) { this.out.push("![repr(C)]\n"); }
         mut disc: string = "i32";
         if (node.discriminant_annotation != null) {
@@ -402,7 +403,7 @@ type struct BindingSerializer {
         this.out.push(fmt::format("type enum %s : %s {\n",
             BindingSerializer::ident(this.ctx.intern_table.resolve(node.name)), disc));
         for (mut i: i64 = 0; i < node.variants.length; i++) {
-            const v: EnumVariantNode* = node.variants[i];
+            const v: EnumVariant* = DeclarationNode::variant_of(node.variants[i]);
             const vn: string = BindingSerializer::ident(this.ctx.intern_table.resolve(v.name));
             if (v.has_value) {
                 this.out.push(fmt::format("    %s = %lld;\n", vn, v.explicit_value));
@@ -413,7 +414,7 @@ type struct BindingSerializer {
         this.out.push("}\n\n");
     }
 
-    render_alias(mut &this, node: TypeAliasDeclNode*) -> void {
+    render_alias(mut &this, node: TypeAliasDecl*) -> void {
         this.out.push(fmt::format("type %s = %s;\n\n",
             BindingSerializer::ident(this.ctx.intern_table.resolve(node.alias_name)),
             this.render_type(node.target_annotation)));
@@ -425,7 +426,7 @@ type struct BindingSerializer {
     /// change the symbol bound - so whenever escaping changed the spelling, the
     /// original C name is pinned with `![symbol("...")]`.  `link_name` (set on
     /// the C++ path, where every symbol is mangled) takes precedence.
-    render_extern_global(mut &this, node: VarDeclNode*) -> void {
+    render_extern_global(mut &this, node: VarDecl*) -> void {
         const raw: string = this.ctx.intern_table.resolve(node.name);
         const name: string = BindingSerializer::ident(raw);
         const sym: string = if (node.link_name.length() > 0) { node.link_name } else { raw };
@@ -437,7 +438,7 @@ type struct BindingSerializer {
             kw, name, this.render_type(node.type_annotation)));
     }
 
-    render_const(mut &this, node: VarDeclNode*) -> void {
+    render_const(mut &this, node: VarDecl*) -> void {
         const ty: string = this.render_type(node.type_annotation);
         const name: string =
             BindingSerializer::ident(this.ctx.intern_table.resolve(node.name));
@@ -449,8 +450,9 @@ type struct BindingSerializer {
         // A struct-literal initializer (a C compound-literal macro the importer
         // lowered, e.g. `#define RAYWHITE CLITERAL(Color){...}`): render
         // `const NAME: Type = Type { field: value, ... };`.
-        if (init.kind == NodeKind::StructLiteral) {
-            this.render_struct_const(node, ty, init as StructLiteralNode*);
+        const init_struct: StructExpr* = ExpressionNode::struct_of(init);
+        if (init_struct != null) {
+            this.render_struct_const(node, ty, init_struct);
             return;
         }
         // An INTEGER initializer arrives wrapped in a cast to the const's own
@@ -459,18 +461,19 @@ type struct BindingSerializer {
         // declaration as a bare literal.  Source text needs the same cast, and
         // the integer branch below writes one - so read through the wrapper to
         // the literal it holds rather than treating the shape as unrenderable.
-        if (init.kind == NodeKind::CastExpression) {
-            init = (init as CastExprNode*).expression;
+        const init_cast: CastExpr* = ExpressionNode::cast_of(init);
+        if (init_cast != null) {
+            init = init_cast.expression;
             if (init == null) {
                 this.skip_const(name, "cast over an empty initializer");
                 return;
             }
         }
-        if (init.kind != NodeKind::Literal) {
+        const lit: LiteralExpr* = ExpressionNode::literal_of(init);
+        if (lit == null) {
             this.skip_const(name, "initializer is not a literal");
             return;
         }
-        const lit: LiteralNode* = init as LiteralNode*;
         mut val: string = "";
         if (lit.literal_kind == LiteralKind::String) {
             val = fmt::format("\"%s\"", BindingSerializer::escape(lit.value));
@@ -499,7 +502,7 @@ type struct BindingSerializer {
     /// Field initializers are numeric literals in struct-declaration order (the
     /// importer emits them that way); names are keyword-escaped like every other
     /// emitted identifier.
-    render_struct_const(mut &this, node: VarDeclNode*, ty: string, sl: StructLiteralNode*) -> void {
+    render_struct_const(mut &this, node: VarDecl*, ty: string, sl: StructExpr*) -> void {
         mut s: string = fmt::format("const %s: %s = %s {",
             BindingSerializer::ident(this.ctx.intern_table.resolve(node.name)), ty, ty);
         for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
@@ -515,32 +518,35 @@ type struct BindingSerializer {
     /// literal text; non-literals fall back to `0`, which the importer never
     /// emits here).
     static render_const_scalar(expr: ExpressionNode*) -> string {
-        if (expr == null || expr.kind != NodeKind::Literal) { return "0"; }
-        const lit: LiteralNode* = expr as LiteralNode*;
+        const lit: LiteralExpr* = ExpressionNode::literal_of(expr);
+        if (lit == null) { return "0"; }
         return lit.value;
     }
 
-    render_function(mut &this, node: FunctionDeclNode*) -> void {
+    render_function(mut &this, node_decl: DeclarationNode*) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         // C++ free/namespace function: pin its mangled linker symbol.  C
         // functions have no link override, so `sym` is empty for them.
         const nm: string = this.ctx.intern_table.resolve(node.name);
         const sym: string = if (node.has_link_name) { node.link_name } else { "" };
-        this.render_function_named(node, nm, sym);
+        this.render_function_named(node_decl, nm, sym);
     }
 
     /// Emit an extern `function` prototype for `node` under `disp_name`, pinning
     /// `symbol` as its linker name when non-empty.  Shared by the 1:1 emit and the
     /// collision disambiguator, which renders a distinct same-leaf overload under a
     /// suffixed alias with its true (mangled or bare-C) symbol pinned.
-    render_function_named(mut &this, node: FunctionDeclNode*,
+    render_function_named(mut &this, node_decl: DeclarationNode*,
                           disp_name: string, symbol: string) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         if (symbol.length() > 0) {
             this.out.push(fmt::format("    ![symbol(\"%s\")]\n", symbol));
         }
         this.out.push(fmt::format("    function %s(", disp_name));
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             if (i > 0) { this.out.push(", "); }
-            const p: VarDeclNode* = node.parameters[i];
+            const p_decl: DeclarationNode* = node.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             mut pn: string = this.ctx.intern_table.resolve(p.name);
             if (pn.length() == 0) { pn = fmt::format("arg%lld", i); }
             else                       { pn = BindingSerializer::ident(pn); }
@@ -559,33 +565,40 @@ type struct BindingSerializer {
     /// a single statement the importer built - a `return TARGET(args)` (or, for a
     /// `void` target, a bare `TARGET(args)`).  Top-level functions are public by
     /// default, so no modifier is emitted; the file's `namespace` qualifies it.
-    render_wrapper_function(mut &this, node: FunctionDeclNode*) -> void {
+    render_wrapper_function(mut &this, node_decl: DeclarationNode*) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         // Signature (param names keyword-escaped, matching the call args below).
         mut s: string = fmt::format("function %s(", this.ctx.intern_table.resolve(node.name));
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             if (i > 0) { s = s + ", "; }
-            const p: VarDeclNode* = node.parameters[i];
+            const p_decl: DeclarationNode* = node.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             const pn: string = BindingSerializer::ident(this.ctx.intern_table.resolve(p.name));
             s = s + fmt::format("%s: %s", pn, this.render_type(p.type_annotation));
         }
         s = s + fmt::format(") -> %s {\n", this.render_type(node.return_type_annotation));
 
-        // Body: extract the forwarded call (return-of-call, or a void call).
-        const st: StatementNode* = node.body.statements[0];
-        mut is_ret: boolean = st.kind == NodeKind::ReturnStatement;
-        const call: CallExprNode* = if (is_ret) {
-            (st as ReturnStmtNode*).expression as CallExprNode*
-        } else {
-            (st as ExprStmtNode*).expression as CallExprNode*
+        // Body: extract the forwarded call (return-of-call, or a void call);
+        // the importer builds a forwarding body as nothing else.
+        const st: Stmt* = node.body.as_block().statements[0];
+        mut is_ret: boolean = false;
+        const call: CallExpr* = match (st.kind) {
+            StmtKind::Return(r) => {
+                is_ret = true;
+                ExpressionNode::call_of(r.expression)
+            }
+            StmtKind::Expr(e) => { ExpressionNode::call_of(e.expression) }
+            _ => { unreachable() }
         };
         const target: string =
-            this.ctx.intern_table.resolve((call.callee as IdentifierNode*).name);
+            this.ctx.intern_table.resolve(ExpressionNode::identifier_of(call.callee).name);
 
         s = s + (if (is_ret) { "    return " } else { "    " });
         s = s + fmt::format("%s(", target);
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             if (i > 0) { s = s + ", "; }
-            s = s + BindingSerializer::ident(this.ctx.intern_table.resolve(node.parameters[i].name));
+            s = s + BindingSerializer::ident(this.ctx.intern_table.resolve(
+                DeclarationNode::var_of(node.parameters[i]).name));
         }
         s = s + ");\n}\n\n";
         this.out.push(s);
@@ -595,7 +608,7 @@ type struct BindingSerializer {
     /// declaration pinned to its mangled symbol with `![symbol]`.  The receiver
     /// (`&this` / `mut &this`) is the method's first parameter for an instance
     /// method (encoded by the importer); a static method has none.
-    render_impl(mut &this, node: ImplBlockNode*) -> void {
+    render_impl(mut &this, node: ImplBlock*) -> void {
         this.out.push(fmt::format("implement %s {\n",
             BindingSerializer::ident(this.ctx.intern_table.resolve(node.target_type))));
         for (mut i: i64 = 0; i < node.methods.length; i++) {
@@ -605,8 +618,10 @@ type struct BindingSerializer {
     }
 
     /// Render one bound C++ method: `![symbol("sym")] public [static] name(recv, params) -> Ret;`.
-    render_method(mut &this, m: MethodNode*) -> void {
-        const func: FunctionDeclNode* = m.func;
+    render_method(mut &this, m_decl: DeclarationNode*) -> void {
+        const m: MethodDecl* = DeclarationNode::method_of(m_decl);
+        const func_decl: DeclarationNode* = m.func;
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func.has_link_name) {
             this.out.push(fmt::format("    ![symbol(\"%s\")]\n", func.link_name));
         }
@@ -618,7 +633,8 @@ type struct BindingSerializer {
         // null) - rendered verbatim, not as `name: type`.
         mut first: boolean = true;
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
-            const p: VarDeclNode* = func.parameters[i];
+            const p_decl: DeclarationNode* = func.parameters[i];
+            const p: VarDecl* = DeclarationNode::var_of(p_decl);
             if (!first) { s = s + ", "; }
             first = false;
             if (i == 0 && !m.is_static && p.type_annotation == null) {
@@ -746,13 +762,13 @@ type struct VendorGenerator {
             BuildOptions::defaults(CompileMode::SingleFile), "<vendor-bindgen>", null);
         // The importer pushes top-level type decls into the AST root; give it a
         // fresh program node to collect into.
-        mut root: ProgramNode* = new ProgramNode(SourceSpan::none());
+        mut root: ProgramNode* = ProgramNode::new(SourceSpan::none());
         ctx.artifacts.ast.root = root;
 
         // One shared extern block carries the C functions; its alias namespace
         // is the vendor namespace, so emitted type references qualify under it.
         const alias_sym: SymbolStr = ctx.intern_table.intern(ns);
-        mut extern_node: ExternBlockNode* = new ExternBlockNode("C", SourceSpan::none());
+        const extern_node: ExternBlock* = ExternBlock::new("C");
         extern_node.set_namespace_alias(alias_sym);
 
         // Build the shared clang args: `-I<abs include dir>` and `-D<define>`.
@@ -782,7 +798,7 @@ type struct VendorGenerator {
             // the transitive non-system includes.  Final de-dup happens below.
             if (out_inputs != null) { out_inputs.push(hp); }
             Importer::collect_from_tu(hp as u8*, null, 0, &extra, hp,
-                                      extern_node, &ctx, &report, out_inputs,
+                                      extern_node, false, &ctx, &report, out_inputs,
                                       language, cpp_std);
             parsed = parsed + 1;
         }

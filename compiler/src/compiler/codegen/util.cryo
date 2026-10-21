@@ -2,7 +2,7 @@
 ///
 /// Pure helpers used by the codegen pass.  No CodegenContext dependency,
 /// no LLVM-builder dependency - just data shaping that doesn't naturally
-/// live inside `CodegenContext`'s class body.  Grouped as statics on
+/// live inside `CodegenContext`'s own body.  Grouped as statics on
 /// `CodegenUtil` so the codegen emitters call them as `CodegenUtil::fn(...)`.
 
 namespace compiler::codegen::util;
@@ -14,24 +14,11 @@ import compiler::types;
 import compiler::types::{ type_ref, type_base };
 import compiler::resolver::{ symbol_str };
 import std::ffi::libc;
-import compiler::ast::declaration::{ FunctionDeclNode, IntrinsicDeclNode, VarDeclNode };
+import compiler::ast::declaration::{ FunctionDecl, DeclarationNode, VarDecl };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::lex::lexer;
 import compiler::lex::lexer::{ Lexer };
-
-
-// VTable slot identity
-
-/// Identity of a single vtable slot: the (method_name, param_types)
-/// pair.  Two methods occupy the same slot if the name matches AND
-/// every parameter TypeRef matches by arena ID.  Keeps overloaded
-/// virtuals in distinct slots while letting overrides collapse back
-/// onto the base virtual's slot.
-type struct VTableSlot {
-    name:        SymbolStr;
-    param_types: [TypeRef];
-}
 
 
 type struct CodegenUtil {
@@ -133,26 +120,12 @@ type struct CodegenUtil {
     /// stands in for the vararg bucket; sema needs it to be a local in scope,
     /// but LLVM must not see it as a fixed param (there's no callable type for
     /// it, and every call site passes a different arity for that slot).
-    static fixed_param_count(func: FunctionDeclNode*) -> u32 {
+    static fixed_param_count(func_decl: DeclarationNode*) -> u32 {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         mut count: u32 = func.parameters.length as u32;
         if (func.is_variadic && count > 0) {
-            const last: VarDeclNode* = func.parameters[count - 1];
-            if (last.type_annotation == null) {
-                count -= 1;
-            }
-        }
-        return count;
-    }
-
-    /// Same shape as `fixed_param_count` but typed for `IntrinsicDeclNode*`.
-    /// IntrinsicDeclNode and FunctionDeclNode both inherit from DeclarationNode
-    /// but have different field layouts, so reusing the FunctionDeclNode-typed
-    /// helper reads `is_variadic` past the end of an IntrinsicDeclNode's
-    /// allocation and segfaults when the read crosses an unmapped page.
-    static fixed_param_count_intrinsic(node: IntrinsicDeclNode*) -> u32 {
-        mut count: u32 = node.parameters.length as u32;
-        if (node.is_variadic && count > 0) {
-            const last: VarDeclNode* = node.parameters[count - 1];
+            const last_decl: DeclarationNode* = func.parameters[count - 1];
+            const last: VarDecl* = DeclarationNode::var_of(last_decl);
             if (last.type_annotation == null) {
                 count -= 1;
             }
@@ -164,35 +137,16 @@ type struct CodegenUtil {
     /// its last parameter is the vararg bucket (no type annotation, so sema
     /// couldn't give it a concrete type).  Null when the function has no
     /// such parameter.
-    static variadic_param(func: FunctionDeclNode*) -> VarDeclNode* {
-        if (!func.is_variadic) { return null as VarDeclNode*; }
+    static variadic_param(func_decl: DeclarationNode*) -> VarDecl* {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
+        if (!func.is_variadic) { return null as VarDecl*; }
         const n: i64 = func.parameters.length;
-        if (n == 0) { return null as VarDeclNode*; }
-        const last: VarDeclNode* = func.parameters[n - 1];
+        if (n == 0) { return null as VarDecl*; }
+        const last_decl: DeclarationNode* = func.parameters[n - 1];
+        const last: VarDecl* = DeclarationNode::var_of(last_decl);
         if (last == null || last.type_annotation != null) {
-            return null as VarDeclNode*;
+            return null as VarDecl*;
         }
         return last;
-    }
-
-
-    // VTable slot identity
-
-    /// Equality on two param-type lists: same arity, and element-wise equal
-    /// arena ids.
-    ///
-    /// A plain id compare is sufficient because type ids are canonical - the
-    /// arena's structural interner guarantees one id per semantic type, so two
-    /// `TypeRef`s denoting the same shape ARE the same id no matter which
-    /// resolution context minted them.  Vtable slot matching depends on that:
-    /// an override's parameter `Foo*` and the virtual base's `Foo*` must
-    /// compare equal even when one was registered while `Foo` was still a
-    /// forward declaration.
-    static param_types_equal(a: &[TypeRef], b: &[TypeRef]) -> boolean {
-        if (a.length != b.length) { return false; }
-        for (mut i: i64 = 0; i < a.length; i++) {
-            if (!a[i].equals(b[i])) { return false; }
-        }
-        return true;
     }
 }

@@ -1,0 +1,59 @@
+/// A struct literal inside a global's initializer - a field of another struct
+/// literal, or an element of an array literal - is folded into static data
+/// with the rest.  A thread-local so initialized starts with that value on
+/// every thread, not only on the main one.  The exit code names what read
+/// wrong; 0 means all held.
+namespace ThreadLocalNestedStructInitializer::Main;
+
+import std::thread;
+import std::ffi::libc;
+
+type struct Inner {
+    a: i32;
+    tag: string;
+}
+
+type struct Outer {
+    inner: Inner;
+    n: i64;
+    pair: [Inner; 2];
+}
+
+const G_OUTER: Outer = Outer {
+    inner: Inner { a: 3, tag: "in" },
+    n: 9,
+    pair: [Inner { a: 4, tag: null }, Inner { a: 5, tag: "p" }],
+};
+
+const G_ARR: [Inner; 2] = [Inner { a: 6, tag: "x" }, Inner { a: 7, tag: null }];
+
+![thread_local]
+mut t_outer: Outer = Outer {
+    inner: Inner { a: 11, tag: "tl" },
+    n: 12,
+    pair: [Inner { a: 13, tag: null }, Inner { a: 14, tag: "q" }],
+};
+
+/// What a fresh thread finds in its own copy of `t_outer`.
+function inspect(_unused: u32) -> u32 {
+    if (t_outer.inner.a != 11) { return 1; }
+    if (t_outer.n != 12) { return 2; }
+    if (t_outer.pair[1].a != 14) { return 3; }
+    if (libc::strcmp(t_outer.inner.tag as u8*, "tl" as u8*) != 0) { return 4; }
+    if (t_outer.pair[0].tag != null) { return 5; }
+    return 0;
+}
+
+function main() -> int {
+    // The main thread's copy changes first, so a value read on the spawned
+    // thread cannot have come from it.
+    t_outer.inner.a = 99;
+    const h: thread::JoinHandle<u32> = thread::spawn(0, inspect);
+    const code: u32 = h.join();
+    if (code != 0) { return code as int; }
+    if (G_OUTER.inner.a + G_OUTER.pair[1].a + G_ARR[1].a != 15) { return 20; }
+    if (G_OUTER.n != 9) { return 21; }
+    if (libc::strcmp(G_ARR[0].tag as u8*, "x" as u8*) != 0) { return 22; }
+    libc::printf("nested fold ok\n");
+    return 0;
+}

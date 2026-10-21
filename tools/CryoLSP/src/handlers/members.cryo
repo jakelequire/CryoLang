@@ -2,21 +2,20 @@
 ///!
 ///! A type's members are what its declaration holds - fields, methods,
 ///! variants - then what every implementation block whose stamped target is
-///! the type adds, then, for a class, its base's.  A module's contents are
+///! the type adds.  A module's contents are
 ///! its export list and the modules nested under it.  Nothing here asks for
 ///! a member by its name: completion and the extended hover list them all.
 namespace lsp::handlers::members;
 
 import compiler::compilation_context::{ CompilationContext };
-import compiler::ast::{ NodeKind };
-import compiler::ast::node::{ ASTNode, ProgramNode };
-import compiler::ast::statement::{ DeclStmtNode };
+import compiler::ast::node::{ ProgramNode };
+import compiler::ast::node_locator::{ NodeLocator };
 import compiler::ast::declaration::{
-    ClassDeclNode, EnumDeclNode, EnumVariantNode, FieldDeclNode, ImplBlockNode, MethodNode,
-    StructDeclNode, UnionDeclNode
+    DeclarationNode, DeclKind, EnumDecl, ImplBlock, MethodDecl,
+    StructDecl, UnionDecl
 };
 import compiler::module_graph::{ ModulePath };
-import compiler::resolver::res::{ DefId, Res, ResSlot };
+import compiler::resolver::res::{ DefId };
 import compiler::resolver::symbol::{ Symbol, SymbolKind };
 import compiler::resolver::symbol_id::{ SymbolID };
 
@@ -28,69 +27,59 @@ type enum Member {
     /// Variant `ordinal` of the enum `owner`.
     Variant(DefId, i64);
     /// A method, by its declaration.
-    Method(MethodNode*);
+    Method(MethodDecl*);
 }
 
 type struct Members {
     ctx: CompilationContext*;
     out: [Member];
 
-    /// Every member of the type `d`: its own, its implementation blocks',
-    /// then its base classes'.  Empty for a definition that is no type.
+    /// Every member of the type `d`: its own, then its implementation
+    /// blocks'.  Empty for a definition that is no type.
     static of_type(ctx: CompilationContext*, d: DefId) -> [Member] {
         mut m: Members = Members { ctx: ctx, out: [] };
-        mut cur: DefId = d;
-        for (mut depth: i64 = 0; depth < 16 && cur.is_valid(); depth++) {
-            cur = m.add_type(cur);
-        }
+        if (d.is_valid()) { m.add_type(d); }
         return m.out;
     }
 
-    /// Add the members `d` declares and its blocks add; the base class to
-    /// continue with, or invalid.
-    add_type(mut &this, d: DefId) -> DefId {
-        const decl: ASTNode* = this.ctx.decl_index.declaration_of(d);
-        if (decl == null) { return DefId::invalid(); }
-        mut base: DefId = DefId::invalid();
+    /// Add the members `d` declares and its blocks add.
+    add_type(mut &this, d: DefId) -> void {
+        const decl: DeclarationNode* = this.ctx.decl_index.declaration_of(d);
+        if (decl == null) { return; }
         match (decl.kind) {
-            NodeKind::StructDeclaration => {
-                const sd: StructDeclNode* = decl as StructDeclNode*;
-                this.add_fields(d, &sd.fields);
-                this.add_methods(&sd.methods);
-            }
-            NodeKind::ClassDeclaration => {
-                const cd: ClassDeclNode* = decl as ClassDeclNode*;
-                this.add_fields(d, &cd.fields);
-                this.add_methods(&cd.methods);
-                base = Members::def_of_slot(&cd.base_res);
-            }
-            NodeKind::UnionDeclaration => {
-                const ud: UnionDeclNode* = decl as UnionDeclNode*;
-                this.add_fields(d, &ud.fields);
-                this.add_methods(&ud.methods);
-            }
-            NodeKind::EnumDeclaration => {
-                const ed: EnumDeclNode* = decl as EnumDeclNode*;
+            DeclKind::Enum(ed) => {
                 for (mut i: i64 = 0; i < ed.variants.length; i++) {
                     this.out.push(Member::Variant(d, i));
                 }
             }
-            _ => { return DefId::invalid(); }
+            DeclKind::Union(ud) => {
+                this.add_fields(d, &ud.fields);
+                this.add_methods(&ud.methods);
+            }
+            DeclKind::Struct(sd) => {
+                this.add_fields(d, &sd.fields);
+                this.add_methods(&sd.methods);
+            }
+            DeclKind::Import(_) | DeclKind::Intrinsic(_) | DeclKind::Impl(_)
+            | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
+            | DeclKind::Extern(_) | DeclKind::TypeAlias(_) | DeclKind::Field(_)
+            | DeclKind::GenericParam(_) | DeclKind::Trait(_) | DeclKind::Variable(_)
+            | DeclKind::Function(_) | DeclKind::Method(_) => { return; }
         }
         this.add_blocks(d);
-        return base;
     }
 
-    add_fields(mut &this, owner: DefId, fields: &[FieldDeclNode*]) -> void {
+    add_fields(mut &this, owner: DefId, fields: &[DeclarationNode*]) -> void {
         for (mut i: i64 = 0; i < fields.length; i++) {
             if (fields[i] != null) { this.out.push(Member::Field(owner, i)); }
         }
     }
 
-    add_methods(mut &this, methods: &[MethodNode*]) -> void {
+    add_methods(mut &this, methods: &[DeclarationNode*]) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: MethodNode* = methods[i];
-            if (m == null || m.func == null || m.is_destructor) { continue; }
+            const m_decl: DeclarationNode* = methods[i];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
+            if (m == null || m.func == null) { continue; }
             this.out.push(Member::Method(m));
         }
     }
@@ -103,54 +92,35 @@ type struct Members {
             const program: ProgramNode* = this.ctx.module_graph.get_module_ast(mi);
             if (program == null) { continue; }
             for (mut si: i64 = 0; si < program.statements.length; si++) {
-                const stmt: ASTNode* = Members::unwrap(program.statements[si]);
-                if (stmt == null || stmt.kind != NodeKind::ImplementationBlock) { continue; }
-                const ib: ImplBlockNode* = stmt as ImplBlockNode*;
+                const stmt: DeclarationNode* = NodeLocator::unwrap_decl_stmt(program.statements[si]).as_decl();
+                if (stmt == null || DeclarationNode::impl_of(stmt) == null) { continue; }
+                const ib: ImplBlock* = DeclarationNode::impl_of(stmt);
                 if (ib.target_def().equals(d)) { this.add_methods(&ib.methods); }
             }
         }
     }
 
-    static unwrap(n: ASTNode*) -> ASTNode* {
-        if (n == null || n.kind != NodeKind::DeclarationStatement) { return n; }
-        return (n as DeclStmtNode*).declaration as ASTNode*;
-    }
 
-    static def_of_slot(slot: &ResSlot) -> DefId {
-        match (slot) {
-            ResSlot::Answered(r) => {
-                return match (r) {
-                    Res::Def(d) => { d }
-                    _           => { DefId::invalid() }
-                };
-            }
-            _ => { return DefId::invalid(); }
-        }
-    }
-
-    /// The declaration of field `index` of the type `owner`, or null.
-    static field_decl(ctx: CompilationContext*, owner: DefId, index: i64) -> FieldDeclNode* {
-        const decl: ASTNode* = ctx.decl_index.declaration_of(owner);
+    /// The declaration of field `index` of the type `owner`, or null.  The
+    /// header: a field carries its spans and documentation there.
+    static field_decl(ctx: CompilationContext*, owner: DefId, index: i64) -> DeclarationNode* {
+        const decl: DeclarationNode* = ctx.decl_index.declaration_of(owner);
         if (decl == null || index < 0) { return null; }
-        if (decl.kind == NodeKind::StructDeclaration) {
-            const sd: StructDeclNode* = decl as StructDeclNode*;
+        if (DeclarationNode::struct_of(decl) != null) {
+            const sd: StructDecl* = DeclarationNode::struct_of(decl);
             if (index < sd.fields.length) { return sd.fields[index]; }
-        } else if (decl.kind == NodeKind::ClassDeclaration) {
-            const cd: ClassDeclNode* = decl as ClassDeclNode*;
-            if (index < cd.fields.length) { return cd.fields[index]; }
-        } else if (decl.kind == NodeKind::UnionDeclaration) {
-            const ud: UnionDeclNode* = decl as UnionDeclNode*;
+        } else if (DeclarationNode::union_of(decl) != null) {
+            const ud: UnionDecl* = DeclarationNode::union_of(decl);
             if (index < ud.fields.length) { return ud.fields[index]; }
         }
         return null;
     }
 
     /// The declaration of variant `ordinal` of the enum `owner`, or null.
-    static variant_decl(ctx: CompilationContext*, owner: DefId, ordinal: i64) -> EnumVariantNode* {
-        const decl: ASTNode* = ctx.decl_index.declaration_of(owner);
-        if (decl == null || decl.kind != NodeKind::EnumDeclaration || ordinal < 0) { return null; }
-        const ed: EnumDeclNode* = decl as EnumDeclNode*;
-        if (ordinal >= ed.variants.length) { return null; }
+    static variant_decl(ctx: CompilationContext*, owner: DefId, ordinal: i64) -> DeclarationNode* {
+        const decl: DeclarationNode* = ctx.decl_index.declaration_of(owner);
+        const ed: EnumDecl* = DeclarationNode::enum_of(decl);
+        if (ed == null || ordinal < 0 || ordinal >= ed.variants.length) { return null; }
         return ed.variants[ordinal];
     }
 
@@ -160,7 +130,7 @@ type struct Members {
         return match (m) {
             Member::Field(_, _)   => { true }
             Member::Variant(_, _) => { false }
-            Member::Method(md)    => { !md.is_static && !md.is_constructor }
+            Member::Method(md)    => { !md.is_static }
         };
     }
 

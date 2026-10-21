@@ -18,9 +18,10 @@ import compiler::mono::monomorphizer::{ Monomorphizer };
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, resolver };
 import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, DefTable, DefKind, FamilyOwner, ResBase };
-import compiler::ast::node::{ ASTNode };
-import compiler::ast::{ NamedAnnotation, NodeKind };
-import compiler::ast::declaration::{ FunctionDeclNode, MethodNode };
+import compiler::ast::node::{ Node };
+import compiler::ast::{ NamedAnnotation };
+import compiler::ast::declaration::{ DeclarationNode, FunctionDecl, ImplBlock, MethodDecl };
+import compiler::ast::expression::{ ExpressionNode };
 import compiler::types::generic_registry::{ TemplateEntry };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
@@ -43,6 +44,7 @@ import compiler::diag::sink::{ DiagnosticSink };
 import compiler::module_graph::{ ModuleGraph, ModuleInfo, ModuleSpellingMatch };
 import compiler::project_config::{ ProjectConfig };
 import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::mangled_name::{ MangledName };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::resolver::{ Resolver };
 import compiler::resolver::symbol_str::{ SymbolStr };
@@ -161,20 +163,33 @@ type struct SourceOverride {
 
 /// An injected specialization and the module its template is declared in.
 type struct InjectedOrigin {
-    node:   ASTNode*;
+    node:   DeclarationNode*;
     module: ModulePath;
 }
 
 /// A node a desugaring wrote naming a language item (its slot holds
 /// `ResSlot::Lang`) before the item was claimed.
 type struct LangRef {
-    node: ASTNode*;
+    /// An expression or a pattern.
+    node: Node;
     item: LangItem;
 }
 
-/// A node another list refers to without owning it.
-type struct AstRef {
-    node: ASTNode*;
+/// A type alias's declaration, which the list refers to without owning it.
+type struct AliasDeclRef {
+    decl: DeclarationNode*;
+}
+
+/// A trait implementation some conversion to a trait object names, which the
+/// list refers to without owning it.
+type struct ObjectTableRef {
+    decl: DeclarationNode*;
+}
+
+/// A path whose scope segment names a type alias, which the list refers to
+/// without owning it.
+type struct AliasPathRef {
+    path: ExpressionNode*;
 }
 
 /// A reference a C import made to one of its own records: the import's
@@ -184,7 +199,14 @@ type struct CRecordRef {
     ann:   NamedAnnotation*;
     alias: ModulePath;
     tag:   SymbolStr;
-    decl:  ASTNode*;
+    decl:  DeclarationNode*;
+}
+
+/// What a compilation hands control to between two modules of each stage:
+/// the language server, answering requests from its last analysis while
+/// this one runs.  It must leave this compilation's state as it found it.
+type trait YieldHook {
+    between_modules(mut &this) -> void;
 }
 
 /// What the build was asked for: CLI flags merged over cryoconfig, complete
@@ -212,12 +234,8 @@ public:
     output:        OutputOverride;
     /// The language server's open buffers, each replacing its file on disk.
     source_overrides: [SourceOverride];
-    /// The language server's hook, called with `yield_client` before each
-    /// module of each stage, so it can answer requests from its last
-    /// analysis while this one runs.  Null for the command line.  It must
-    /// leave this compilation's state as it found it.
-    yield_hook:    (void*) -> void;
-    yield_client:  void*;
+    /// Called before each module of each stage; null for the command line.
+    yield_hook:    virtual YieldHook*;
 
     static defaults(mode: CompileMode) -> BuildOptions {
         return BuildOptions {
@@ -235,13 +253,12 @@ public:
             output:          OutputOverride::Default,
             source_overrides: [],
             yield_hook:      null,
-            yield_client:    null,
         };
     }
 
     /// Hand control to the language server's hook, when it gave one.
     yield_between_modules(&this) -> void {
-        if ((this.yield_hook as void*) != null) { this.yield_hook(this.yield_client); }
+        if (this.yield_hook != null) { this.yield_hook.between_modules(); }
     }
 
     unwinds(&this) -> boolean {
@@ -315,14 +332,20 @@ public:
 
     /// Every type alias declared, and every path whose scope segment names
     /// one (`NameResolutionPass::settle_alias_paths` answers the paths once
-    /// every module's names are resolved).  Each is an `ASTNode*` held in a
-    /// struct, so the lists own none of the nodes.
-    alias_decls: [AstRef];
-    alias_paths: [AstRef];
+    /// every module's names are resolved).  Each node is held in a struct,
+    /// so the lists own none of the nodes.
+    alias_decls: [AliasDeclRef];
+    alias_paths: [AliasPathRef];
 
     /// References a C import made to its own records before the name layer
     /// declared anything (`NameDeclarationPass::settle_c_refs` answers them).
     c_refs: [CRecordRef];
+
+    /// The trait implementations a conversion to a trait object names, each
+    /// once.  The module holding each one emits its table, so it is rebuilt
+    /// whenever the build's demand may have changed, as a module owning a
+    /// specialization is.
+    object_tables: [ObjectTableRef];
 
     // -- Inactive-region tracking (LSP tooling) --
     // Source spans of top-level declarations, methods, and inline `![dir] { }`
@@ -414,6 +437,7 @@ public:
             alias_decls:          [],
             alias_paths:          [],
             c_refs:               [],
+            object_tables:        [],
             inactive_spans:       [],
             frontend_complete:    false,
             type_arena:    arena_ptr,
@@ -461,26 +485,44 @@ public:
         return this.generic_registry;
     }
 
-    note_lang_ref(mut &this, node: ASTNode*, item: LangItem) -> void {
+    note_lang_ref(mut &this, node: Node, item: LangItem) -> void {
         this.lang_refs.push(LangRef { node: node, item: item });
     }
 
-    note_alias_decl(mut &this, node: ASTNode*) -> void {
-        this.alias_decls.push(AstRef { node: node });
+    note_alias_decl(mut &this, decl: DeclarationNode*) -> void {
+        this.alias_decls.push(AliasDeclRef { decl: decl });
     }
 
-    note_alias_path(mut &this, node: ASTNode*) -> void {
-        this.alias_paths.push(AstRef { node: node });
+    note_alias_path(mut &this, path: ExpressionNode*) -> void {
+        this.alias_paths.push(AliasPathRef { path: path });
+    }
+
+    /// Record that a conversion names `implementation`'s table: the block
+    /// takes the table's symbol, which its module's codegen emits and every
+    /// conversion names, and the implementations whose methods the table
+    /// holds (`blocks`, in the table's order); its declaration is listed
+    /// once for the build cache.
+    note_object_table(mut &this, implementation: DeclarationNode*, blocks: [ImplBlock*]) -> void {
+        const block: ImplBlock* = DeclarationNode::impl_of(implementation);
+        if (block == null || block.object_table_symbol.is_valid()) { return; }
+        block.object_table_blocks = blocks;
+        const owner: TypeRef = this.decl_index.impl_owner(block, "trait-object table");
+        const trait_qname: QualifiedName = QualifiedName::from_symbol(this.defs.path_of(block.trait_def).spelling());
+        const owner_qname: QualifiedName = QualifiedName::from_symbol(this.decl_index.lookup_type_name(owner));
+        const symbol: MangledName = MangledName::for_object_table(this.intern_table, this.type_arena,
+            trait_qname, &block.trait_arg_types, owner_qname);
+        block.object_table_symbol = this.intern_table.intern(symbol.as_string());
+        this.object_tables.push(ObjectTableRef { decl: implementation });
     }
 
     /// Record that an injected AST node came from a specific template module.
-    register_injected_origin(mut &this, node: ASTNode*, template_module: ModulePath) -> void {
+    register_injected_origin(mut &this, node: DeclarationNode*, template_module: ModulePath) -> void {
         this.injected_origins.push(InjectedOrigin { node: node, module: template_module });
     }
 
     /// Look up the template module for an injected AST node.
     /// Returns no module if the node wasn't injected.
-    lookup_injected_origin(&this, node: ASTNode*) -> ModulePath {
+    lookup_injected_origin(&this, node: DeclarationNode*) -> ModulePath {
         for (mut i: i64 = 0; i < this.injected_origins.length; i++) {
             if (this.injected_origins[i].node == node) {
                 return this.injected_origins[i].module;
@@ -625,7 +667,7 @@ public:
     /// default placed in an implementation, a monomorphized clone - is not
     /// registered.
     define_method(mut &this, owner: DefId, leaf: SymbolStr, span: SourceSpan,
-                  decl: ASTNode*) -> DefId {
+                  decl: DeclarationNode*) -> DefId {
         const d: DefId = this.defs.register(owner, leaf, DefKind::Method, span);
         this.decl_index.keep_declaration(d, decl);
         return d;
@@ -702,13 +744,13 @@ public:
         const entries: [OverloadId] = this.decl_index.lookup_family_entries(FamilyOwner::Def(owner), leaf);
         mut found: TemplateEntry* = null;
         for (mut i: i64 = 0; i < entries.length; i++) {
-            const decl: ASTNode* = this.decl_index.entry_decl(entries[i]);
+            const decl: DeclarationNode* = this.decl_index.entry_decl(entries[i]);
             if (decl == null) { continue; }
             mut def: DefId = DefId::invalid();
-            if (decl.kind == NodeKind::MethodDeclaration && (decl as MethodNode*).func != null) {
-                def = (decl as MethodNode*).func.def;
-            } else if (decl.kind == NodeKind::FunctionDeclaration) {
-                def = (decl as FunctionDeclNode*).def;
+            if (DeclarationNode::method_of(decl) != null && DeclarationNode::method_of(decl).func != null) {
+                def = DeclarationNode::fn_of(DeclarationNode::method_of(decl).func).def;
+            } else if (DeclarationNode::fn_of(decl) != null) {
+                def = DeclarationNode::fn_of(decl).def;
             }
             const t: TemplateEntry* = this.generic_registry.template_of(def);
             if (t == null || t == found) { continue; }

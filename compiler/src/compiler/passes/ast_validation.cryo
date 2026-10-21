@@ -14,7 +14,7 @@ namespace compiler::passes::ast_validation;
 import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, snapshot, source_span };
 import compiler::ast;
-import compiler::ast::{ declaration, expression, node, NodeKind, pattern, statement };
+import compiler::ast::{ declaration, expression, node, pattern, statement };
 import compiler::passes::pass_id;
 import compiler::passes::pass_id::{ PassResult };
 import compiler::compilation_context;
@@ -25,13 +25,14 @@ import utils::logger;
 import utils::logger::{ cdebug };
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, EnumDeclNode, EnumVariantNode, ExternBlockNode, FieldDeclNode,
-    FunctionDeclNode, GenericParamNode, ImplBlockNode, ImportDeclNode, IntrinsicDeclNode,
-    MethodNode, StructDeclNode, TraitDeclNode, TypeAliasDeclNode, UnionDeclNode,
-    VarDeclNode
+    EnumDecl, EnumVariant, ExternBlock, FieldDecl,
+    DeclarationNode, DeclKind, FunctionDecl, GenericParamDecl, ImplBlock,
+    ImportDecl, IntrinsicDecl,
+    MethodDecl, StructDecl, TraitDecl, TypeAliasDecl, UnionDecl,
+    VarDecl
 };
-import compiler::ast::node::{ ASTNode, ProgramNode };
-import compiler::ast::statement::{ BlockStmtNode, DeclStmtNode };
+import compiler::ast::node::{ ProgramNode };
+import compiler::ast::statement::{ BlockStmt, Stmt, StmtKind };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::diag::source_span::{ SourceSpan };
@@ -77,8 +78,8 @@ type struct ASTValidator {
         }
 
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i];
-            if (stmt == null) {
+            const stmt: Node = root.statements[i];
+            if (stmt.is_null()) {
                 this.emit_no_span(ErrorCode::E0050_NULL_AST_NODE,
                     fmt::format("null top-level statement at index %lld", i));
                 continue;
@@ -90,41 +91,53 @@ type struct ASTValidator {
 
     // Top-level dispatch
 
-    validate_top_level(mut &this, node: ASTNode*) -> void {
-        match (node.kind) {
-            NodeKind::FunctionDeclaration   => { this.validate_function(node as FunctionDeclNode*); }
-            NodeKind::StructDeclaration     => { this.validate_struct(node as StructDeclNode*); }
-            NodeKind::UnionDeclaration      => { this.validate_union(node as UnionDeclNode*); }
-            NodeKind::ClassDeclaration      => { this.validate_class(node as ClassDeclNode*); }
-            NodeKind::EnumDeclaration       => { this.validate_enum(node as EnumDeclNode*); }
-            NodeKind::TraitDeclaration      => { this.validate_trait(node as TraitDeclNode*); }
-            NodeKind::TypeAliasDeclaration  => { this.validate_type_alias(node as TypeAliasDeclNode*); }
-            NodeKind::ImplementationBlock   => { this.validate_impl_block(node as ImplBlockNode*); }
-            NodeKind::ImportDeclaration     => { this.validate_import(node as ImportDeclNode*); }
-            NodeKind::ExternBlock           => { this.validate_extern_block(node as ExternBlockNode*); }
-            NodeKind::VariableDeclaration   => { this.validate_variable(node as VarDeclNode*); }
-            NodeKind::DeclarationStatement  => {
-                const ds: DeclStmtNode* = node as DeclStmtNode*;
-                if (ds.declaration != null) {
-                    this.validate_top_level(ds.declaration as ASTNode*);
+    validate_top_level(mut &this, node: Node) -> void {
+        match (node) {
+            Node::Stmt(s) => {
+                match (s.kind) {
+                    StmtKind::Decl(ds) => {
+                        if (ds.declaration != null) {
+                            this.validate_decl(ds.declaration);
+                        }
+                    }
+                    _ => {}
                 }
             }
-            NodeKind::IntrinsicDeclaration  => { this.validate_intrinsic(node as IntrinsicDeclNode*); }
-            NodeKind::Directive             => { /* directives are always structurally valid */ }
-            _ => {
-                // Other node kinds at top level are unusual but not invalid
-                // (e.g., expression statements at module level in scripts)
-            }
+            Node::Decl(d) => { this.validate_decl(d); }
+            // A directive is always structurally valid; any other item at
+            // the top level is unusual but not invalid (an expression
+            // statement in a script).
+            _ => { }
+        }
+    }
+
+    validate_decl(mut &this, d: DeclarationNode*) -> void {
+        match (d.kind) {
+            DeclKind::Function(_)  => { this.validate_function(d); }
+            DeclKind::Enum(n)      => { this.validate_enum(d, n); }
+            DeclKind::Extern(n)    => { this.validate_extern_block(d, n); }
+            DeclKind::Import(n)    => { this.validate_import(d, n); }
+            DeclKind::Intrinsic(n) => { this.validate_intrinsic(d, n); }
+            DeclKind::Trait(n)     => { this.validate_trait(d, n); }
+            DeclKind::TypeAlias(n) => { this.validate_type_alias(d, n); }
+            DeclKind::Union(n)     => { this.validate_union(d, n); }
+            DeclKind::Struct(n)    => { this.validate_struct(d, n); }
+            DeclKind::Impl(n)      => { this.validate_impl_block(d, n); }
+            DeclKind::Variable(n)  => { this.validate_variable(d, n); }
+            DeclKind::Module(_) | DeclKind::Variant(_)
+            | DeclKind::Destructure(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
+            | DeclKind::Method(_) => {}
         }
     }
 
 
     // Declaration validators
 
-    validate_function(mut &this, func: FunctionDeclNode*) -> void {
+    validate_function(mut &this, func_decl: DeclarationNode*) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (!func.name.is_valid()) {
             this.emit(ErrorCode::E0051_MISSING_FUNCTION_NAME,
-                "function declaration has no name", func.span);
+                "function declaration has no name", func_decl.span);
         }
 
         // Validate parameters
@@ -133,11 +146,11 @@ type struct ASTValidator {
                 this.emit(ErrorCode::E0053_NULL_PARAMETER,
                     fmt::format("null parameter at index %lld in function '%s'",
                         i, this.ctx.resolve_str(func.name)),
-                    func.span);
+                    func_decl.span);
             }
         }
 
-        this.validate_generic_params(func.generic_params, func.span,
+        this.validate_generic_params(func.generic_params, func_decl.span,
             this.ctx.resolve_str(func.name));
 
         // Validate body (if present); null body is valid for extern/forward decls
@@ -146,10 +159,10 @@ type struct ASTValidator {
         }
     }
 
-    validate_struct(mut &this, node: StructDeclNode*) -> void {
+    validate_struct(mut &this, d: DeclarationNode*, node: StructDecl*) -> void {
         if (!node.name.is_valid()) {
             this.emit(ErrorCode::E0052_MISSING_TYPE_NAME,
-                "struct declaration has no name", node.span);
+                "struct declaration has no name", d.span);
             return;
         }
 
@@ -159,23 +172,23 @@ type struct ASTValidator {
             if (node.fields[i] == null) {
                 this.emit(ErrorCode::E0054_NULL_FIELD,
                     fmt::format("null field at index %lld in struct '%s'", i, name),
-                    node.span);
+                    d.span);
             }
         }
         this.check_duplicate_fields(node.fields, name);
 
-        this.validate_methods(node.methods, name, node.span);
-        this.validate_generic_params(node.generic_params, node.span, name);
+        this.validate_methods(node.methods, name, d.span);
+        this.validate_generic_params(node.generic_params, d.span, name);
     }
 
     /// Validate a union declaration.  Mirrors `validate_struct` (name, no
     /// null/duplicate fields, methods, generic params); additionally an
     /// untagged union must declare at least one field, since its size/layout
     /// is defined by its members.
-    validate_union(mut &this, node: UnionDeclNode*) -> void {
+    validate_union(mut &this, d: DeclarationNode*, node: UnionDecl*) -> void {
         if (!node.name.is_valid()) {
             this.emit(ErrorCode::E0052_MISSING_TYPE_NAME,
-                "union declaration has no name", node.span);
+                "union declaration has no name", d.span);
             return;
         }
 
@@ -184,29 +197,30 @@ type struct ASTValidator {
         if (node.fields.length == 0) {
             this.emit(ErrorCode::E0054_NULL_FIELD,
                 fmt::format("union '%s' must declare at least one field", name),
-                node.span);
+                d.span);
         }
 
         for (mut i: i64 = 0; i < node.fields.length; i++) {
             if (node.fields[i] == null) {
                 this.emit(ErrorCode::E0054_NULL_FIELD,
                     fmt::format("null field at index %lld in union '%s'", i, name),
-                    node.span);
+                    d.span);
             }
         }
         this.check_duplicate_fields(node.fields, name);
 
-        this.validate_methods(node.methods, name, node.span);
-        this.validate_generic_params(node.generic_params, node.span, name);
+        this.validate_methods(node.methods, name, d.span);
+        this.validate_generic_params(node.generic_params, d.span, name);
     }
 
-    /// Reject two fields that share a name within one struct/class. A
+    /// Reject two fields that share a name within one struct. A
     /// duplicate makes field layout and member access ambiguous.
-    check_duplicate_fields(mut &this, fields: &[FieldDeclNode*],
+    check_duplicate_fields(mut &this, fields: &[DeclarationNode*],
                            container: string) -> void {
         mut seen: [u32] = [];
         for (mut i: i64 = 0; i < fields.length; i++) {
-            const f: FieldDeclNode* = fields[i];
+            const f_decl: DeclarationNode* = fields[i];
+            const f: FieldDecl* = DeclarationNode::field_of(f_decl);
             if (f == null) { continue; }
             mut dup: boolean = false;
             for (mut k: i64 = 0; k < seen.length; k++) {
@@ -216,39 +230,17 @@ type struct ASTValidator {
                 this.emit(ErrorCode::E0356_DUPLICATE_FIELD,
                     fmt::format("duplicate field `%s` in `%s`",
                         this.ctx.resolve_str(f.name), container),
-                    f.span);
+                    f_decl.span);
             } else {
                 seen.push(f.name.id);
             }
         }
     }
 
-    validate_class(mut &this, node: ClassDeclNode*) -> void {
+    validate_enum(mut &this, d: DeclarationNode*, node: EnumDecl*) -> void {
         if (!node.name.is_valid()) {
             this.emit(ErrorCode::E0052_MISSING_TYPE_NAME,
-                "class declaration has no name", node.span);
-            return;
-        }
-
-        const name: string = this.ctx.resolve_str(node.name);
-
-        for (mut i: i64 = 0; i < node.fields.length; i++) {
-            if (node.fields[i] == null) {
-                this.emit(ErrorCode::E0054_NULL_FIELD,
-                    fmt::format("null field at index %lld in class '%s'", i, name),
-                    node.span);
-            }
-        }
-        this.check_duplicate_fields(node.fields, name);
-
-        this.validate_methods(node.methods, name, node.span);
-        this.validate_generic_params(node.generic_params, node.span, name);
-    }
-
-    validate_enum(mut &this, node: EnumDeclNode*) -> void {
-        if (!node.name.is_valid()) {
-            this.emit(ErrorCode::E0052_MISSING_TYPE_NAME,
-                "enum declaration has no name", node.span);
+                "enum declaration has no name", d.span);
             return;
         }
 
@@ -256,14 +248,14 @@ type struct ASTValidator {
 
         if (node.variants.length == 0) {
             this.emit(ErrorCode::E0057_EMPTY_ENUM_VARIANTS,
-                fmt::format("enum '%s' has no variants", name), node.span);
+                fmt::format("enum '%s' has no variants", name), d.span);
         }
 
         for (mut i: i64 = 0; i < node.variants.length; i++) {
             if (node.variants[i] == null) {
                 this.emit(ErrorCode::E0058_NULL_ENUM_VARIANT,
                     fmt::format("null variant at index %lld in enum '%s'", i, name),
-                    node.span);
+                    d.span);
             }
         }
 
@@ -274,7 +266,8 @@ type struct ASTValidator {
         mut seen_names: [SymbolStr] = [];
         mut next_tag: i64 = 0;
         for (mut i: i64 = 0; i < node.variants.length; i++) {
-            const v: EnumVariantNode* = node.variants[i];
+            const v_decl: DeclarationNode* = node.variants[i];
+            const v: EnumVariant* = DeclarationNode::variant_of(v_decl);
             if (v == null) { continue; }
             mut tag: i64 = next_tag;
             if (v.has_value) { tag = v.explicit_value; }
@@ -303,7 +296,7 @@ type struct ASTValidator {
                     fmt::format("variant `%s` shares discriminant %lld with `%s` in enum `%s`",
                         this.ctx.resolve_str(v.name), tag,
                         this.ctx.resolve_str(seen_names[clash_idx]), name));
-                diag = diag.at_with_label(v.span,
+                diag = diag.at_with_label(v_decl.span,
                     fmt::format("duplicate discriminant %lld", tag));
                 if (found_free) {
                     diag = diag.help(fmt::format(
@@ -317,13 +310,13 @@ type struct ASTValidator {
             }
         }
 
-        this.validate_generic_params(node.generic_params, node.span, name);
+        this.validate_generic_params(node.generic_params, d.span, name);
     }
 
-    validate_trait(mut &this, node: TraitDeclNode*) -> void {
+    validate_trait(mut &this, d: DeclarationNode*, node: TraitDecl*) -> void {
         if (!node.name.is_valid()) {
             this.emit(ErrorCode::E0052_MISSING_TYPE_NAME,
-                "trait declaration has no name", node.span);
+                "trait declaration has no name", d.span);
             return;
         }
 
@@ -333,90 +326,91 @@ type struct ASTValidator {
             if (node.methods[i] == null) {
                 this.emit(ErrorCode::E0055_NULL_METHOD,
                     fmt::format("null method at index %lld in trait '%s'", i, name),
-                    node.span);
+                    d.span);
             } else {
                 this.validate_function(node.methods[i]);
             }
         }
 
-        this.validate_generic_params(node.generic_params, node.span, name);
+        this.validate_generic_params(node.generic_params, d.span, name);
     }
 
-    validate_type_alias(mut &this, node: TypeAliasDeclNode*) -> void {
+    validate_type_alias(mut &this, d: DeclarationNode*, node: TypeAliasDecl*) -> void {
         if (!node.alias_name.is_valid()) {
             this.emit(ErrorCode::E0052_MISSING_TYPE_NAME,
-                "type alias declaration has no name", node.span);
+                "type alias declaration has no name", d.span);
         }
 
         if (node.target_annotation == null) {
             this.emit(ErrorCode::E0061_TYPE_ALIAS_MISSING_TARGET,
                 fmt::format("type alias '%s' has no target type",
                     this.ctx.resolve_str(node.alias_name)),
-                node.span);
+                d.span);
         }
     }
 
-    validate_impl_block(mut &this, node: ImplBlockNode*) -> void {
+    validate_impl_block(mut &this, d: DeclarationNode*, node: ImplBlock*) -> void {
         if (!node.target_type.is_valid()) {
             this.emit(ErrorCode::E0062_IMPL_MISSING_TARGET,
-                "implement block has no target type", node.span);
+                "implement block has no target type", d.span);
             return;
         }
 
         const name: string = this.ctx.resolve_str(node.target_type);
-        this.validate_methods(node.methods, name, node.span);
-        this.validate_generic_params(node.generic_params, node.span, name);
+        this.validate_methods(node.methods, name, d.span);
+        this.validate_generic_params(node.generic_params, d.span, name);
     }
 
-    validate_import(mut &this, node: ImportDeclNode*) -> void {
+    validate_import(mut &this, d: DeclarationNode*, node: ImportDecl*) -> void {
         if (!node.module_path.is_valid()) {
             this.emit(ErrorCode::E0063_IMPORT_MISSING_PATH,
-                "import declaration has no module path", node.span);
+                "import declaration has no module path", d.span);
         }
     }
 
-    validate_extern_block(mut &this, node: ExternBlockNode*) -> void {
+    validate_extern_block(mut &this, d: DeclarationNode*, node: ExternBlock*) -> void {
         for (mut i: i64 = 0; i < node.functions.length; i++) {
             if (node.functions[i] == null) {
                 this.emit(ErrorCode::E0050_NULL_AST_NODE,
                     fmt::format("null function at index %lld in extern block", i),
-                    node.span);
+                    d.span);
             } else {
                 this.validate_function(node.functions[i]);
             }
         }
     }
 
-    validate_variable(mut &this, node: VarDeclNode*) -> void {
+    validate_variable(mut &this, d: DeclarationNode*, node: VarDecl*) -> void {
         if (!node.name.is_valid()) {
             this.emit(ErrorCode::E0052_MISSING_TYPE_NAME,
-                "variable declaration has no name", node.span);
+                "variable declaration has no name", d.span);
         }
         // A variable with neither type annotation nor initializer is suspicious
         // but technically valid (could be filled by type inference later).
     }
 
-    validate_intrinsic(mut &this, node: IntrinsicDeclNode*) -> void {
+    validate_intrinsic(mut &this, d: DeclarationNode*, node: IntrinsicDecl*) -> void {
         if (!node.name.is_valid()) {
             this.emit(ErrorCode::E0051_MISSING_FUNCTION_NAME,
-                "intrinsic declaration has no name", node.span);
+                "intrinsic declaration has no name", d.span);
         }
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             if (node.parameters[i] == null) {
                 this.emit(ErrorCode::E0053_NULL_PARAMETER,
                     fmt::format("null parameter at index %lld in intrinsic '%s'",
                         i, this.ctx.resolve_str(node.name)),
-                    node.span);
+                    d.span);
             }
         }
     }
 
 
-    /// Validate a [MethodNode*] array (used by struct, class, impl).
-    validate_methods(mut &this, methods: &[MethodNode*], owner: string,
+    /// Validate a [DeclarationNode*] array (used by struct, union, impl).
+    validate_methods(mut &this, methods: &[DeclarationNode*], owner: string,
                      owner_span: SourceSpan) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const method: MethodNode* = methods[i];
+            const method_decl: DeclarationNode* = methods[i];
+            const method: MethodDecl* = DeclarationNode::method_of(method_decl);
             if (method == null) {
                 this.emit(ErrorCode::E0055_NULL_METHOD,
                     fmt::format("null method at index %lld in '%s'", i, owner),
@@ -427,7 +421,7 @@ type struct ASTValidator {
                 this.emit(ErrorCode::E0056_METHOD_MISSING_FUNC,
                     fmt::format("method at index %lld in '%s' has null function node",
                         i, owner),
-                    method.span);
+                    method_decl.span);
                 continue;
             }
             this.validate_function(method.func);
@@ -435,7 +429,7 @@ type struct ASTValidator {
     }
 
     /// Validate generic parameter list for null entries.
-    validate_generic_params(mut &this, params: &[GenericParamNode*],
+    validate_generic_params(mut &this, params: &[DeclarationNode*],
                             owner_span: SourceSpan, owner: string) -> void {
         for (mut i: i64 = 0; i < params.length; i++) {
             if (params[i] == null) {
@@ -448,10 +442,11 @@ type struct ASTValidator {
     }
 
     /// Validate a block statement's contents.
-    validate_block(mut &this, block: BlockStmtNode*) -> void {
+    validate_block(mut &this, block: Stmt*) -> void {
         if (block == null) { return; }
-        for (mut i: i64 = 0; i < block.statements.length; i++) {
-            if (block.statements[i] == null) {
+        const b: BlockStmt* = block.as_block();
+        for (mut i: i64 = 0; i < b.statements.length; i++) {
+            if (b.statements[i] == null) {
                 this.emit(ErrorCode::E0059_NULL_BLOCK_STATEMENT,
                     fmt::format("null statement at index %lld in block", i),
                     block.span);

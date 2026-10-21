@@ -19,7 +19,7 @@ namespace compiler::mono::ast_resolver;
 
 import compiler::ast;
 import compiler::ast::{
-    declaration, expression, node, NodeKind, pattern, statement, TypeAnnotation
+    declaration, expression, node, pattern, statement, TypeAnnotation
 };
 import compiler::types::{
     generic, user_defined, compound, type_base, arena, type_ref, substitution, resolver, TypeKind
@@ -29,24 +29,18 @@ import compiler::diag::{ diagnostic, ErrorCode, sink, source_span };
 import compiler::resolver::{ intern_table, symbol_str };
 import compiler::mono::{ state, trait_specializer };
 import compiler::types::generic_registry;
-import compiler::types::generic_registry::{ TemplateEntry };
+import compiler::types::generic_registry::{ TemplateKind };
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, FunctionDeclNode, GenericParamNode, ImplBlockNode,
-    MethodNode, StructDeclNode, UnionDeclNode, VarDeclNode
+    DeclarationNode, FunctionDecl, GenericParamDecl, ImplBlock,
+    MethodDecl, StructDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
-    ArrayAccessNode, BinaryExprNode, CallExprNode, CastExprNode, ExpressionNode,
-    IfExprNode, MatchExprNode, MemberAccessNode, StaticMatchExprNode, TernaryExprNode,
-    UnaryExprNode
+    CallExpr, ExprKind, ExpressionNode,
+    MemberAccessExpr
 };
-import compiler::ast::node::{ ASTNode };
 import compiler::ast::pattern::{ MatchArmNode, StaticMatchArmNode };
-import compiler::ast::statement::{
-    BlockStmtNode, DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode,
-    LoopStmtNode, MatchStmtNode, ReturnStmtNode, StatementNode, StaticMatchStmtNode,
-    UnsafeBlockStmtNode, WhileStmtNode
-};
+import compiler::ast::statement::{ BlockStmt, Stmt, StmtKind };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::sink::{ DiagnosticSink };
 import compiler::diag::source_span::{ SourceSpan };
@@ -94,130 +88,119 @@ type struct MonoAstResolver {
 
     /// Walk the specialized AST and resolve all type annotations into concrete
     /// TypeRefs.
-    resolve_specialized_ast(mut &this, ast_node: ASTNode*, node_kind: NodeKind,
-                            entry: TemplateEntry*, subst: TypeSubstitution*,
+    ///
+    /// A bare leaf in this clone carries the stamp it was given in the file
+    /// that WROTE it, and the MANGLED SPEC NAMES the substituter writes into
+    /// the clone carry a `pre_resolved` TypeRef that `TypeResolver::resolve`
+    /// returns before it consults the context, so the context holds only the
+    /// bindings and `This`.
+    resolve_specialized_ast(mut &this, ast_node: DeclarationNode*, kind: TemplateKind,
                             this_type: TypeRef) -> void {
         if (ast_node == null || this.type_resolver == null) { return; }
-
-        // A bare leaf in this clone carries the stamp it was given in the file
-        // that WROTE it, and the MANGLED SPEC NAMES the substituter writes into
-        // the clone carry a `pre_resolved` TypeRef that `TypeResolver::resolve`
-        // returns before it consults the context, so the context holds only
-        // the bindings and `This`.
         mut res_ctx: ResolutionContext = ResolutionContext::new("");
 
-        match (node_kind) {
-            NodeKind::StructDeclaration => {
-                const decl: StructDeclNode* = ast_node as StructDeclNode*;
-                if (decl == null) { return; }
+        match (kind) {
+            TemplateKind::Struct => {
+                const decl: StructDecl* = DeclarationNode::struct_of(ast_node);
                 this.type_resolver.resolve_fields(decl.fields, &res_ctx);
                 this.resolve_methods(decl.methods, &res_ctx, this_type);
             }
-            NodeKind::UnionDeclaration => {
-                const decl: UnionDeclNode* = ast_node as UnionDeclNode*;
-                if (decl == null) { return; }
+            TemplateKind::Union => {
+                const decl: UnionDecl* = DeclarationNode::union_of(ast_node);
                 this.type_resolver.resolve_fields(decl.fields, &res_ctx);
                 this.resolve_methods(decl.methods, &res_ctx, this_type);
             }
-            NodeKind::ClassDeclaration => {
-                const decl: ClassDeclNode* = ast_node as ClassDeclNode*;
-                if (decl == null) { return; }
-                this.type_resolver.resolve_fields(decl.fields, &res_ctx);
-                this.resolve_methods(decl.methods, &res_ctx, this_type);
-            }
-            NodeKind::EnumDeclaration => {
+            TemplateKind::Enum => {
                 // Enum variants use SymbolStr names; resolution handled in
                 // populate_enum_variants via name lookup.
             }
-            NodeKind::FunctionDeclaration => {
-                const decl: FunctionDeclNode* = ast_node as FunctionDeclNode*;
-                if (decl == null) { return; }
+            TemplateKind::Function => {
                 // Free functions have no `this`.
-                this.resolve_func_and_body(decl, &res_ctx, TypeRef::invalid());
+                this.resolve_func_and_body(ast_node, &res_ctx, TypeRef::invalid());
             }
-            NodeKind::ImplementationBlock => {
-                const decl: ImplBlockNode* = ast_node as ImplBlockNode*;
-                if (decl == null) { return; }
-                // Bounds-violating impls/methods were already stripped pre-clone
-                // by filter_bounds_violating_* in specialize_with_entry.
-                //
-                // First derive any impl-introduced generic the Self type doesn't
-                // determine (e.g. `A` in `implement<I, A> Iterator<A> for TakeN<I>
-                // where I: Iterator<A>`) from the where-bounds, then bind the trait's
-                // outer generic params to the impl's concrete trait args, so cloned
-                // default-method bodies resolve their inner element names concretely.
-                this.trait_spec.derive_impl_where_generics(decl, subst, &res_ctx);
-                this.trait_spec.bind_trait_args_for_spec_impl(decl, &res_ctx);
-                // Persist the concrete trait-element bindings onto the spec'd impl
-                // (self-returning defaults are instantiated lazily and re-seed these).
-                this.trait_spec.cache_derived_trait_params(decl, &res_ctx);
-                // Drop conditionally-bounded trait defaults (`min`/`max` with
-                // `where This::Item: Ord`) whose concrete Item does not satisfy
-                // the bound for THIS monomorphization (e.g. `EnumerateIter`'s
-                // `Pair` Item is not `Ord`) - before their bodies are resolved,
-                // so `.compare()` on a non-`Ord` element never reaches type check.
-                this.trait_spec.filter_projection_bound_methods(decl, this_type);
-                // Rewrite where-bound-derived generics (`A`) inside the impl's method
-                // BODIES so a struct literal `Pair<A, A>{..}` becomes concrete before
-                // body resolution.  Run before resolve_methods.
-                this.trait_spec.substitute_derived_params_in_method_bodies(decl);
-                this.resolve_methods(decl.methods, &res_ctx, this_type);
-            }
-            _ => {}
+            TemplateKind::Trait => {}
+            TemplateKind::TypeAlias => {}
         }
+    }
+
+    /// Resolve a specialization's `implement` block under `subst`, the
+    /// block's own parameters bound through its head.
+    resolve_specialized_impl(mut &this, decl: ImplBlock*, subst: TypeSubstitution*,
+                             this_type: TypeRef) -> void {
+        if (decl == null || this.type_resolver == null) { return; }
+        mut res_ctx: ResolutionContext = ResolutionContext::new("");
+        // Bounds-violating impls/methods were already stripped pre-clone
+        // by filter_bounds_violating_* in specialize_with_entry.
+        //
+        // First derive any impl-introduced generic the Self type doesn't
+        // determine (e.g. `A` in `implement<I, A> Iterator<A> for TakeN<I>
+        // where I: Iterator<A>`) from the where-bounds, then bind the trait's
+        // outer generic params to the impl's concrete trait args, so cloned
+        // default-method bodies resolve their inner element names concretely.
+        this.trait_spec.derive_impl_where_generics(decl, subst, &res_ctx);
+        this.trait_spec.bind_trait_args_for_spec_impl(decl, &res_ctx);
+        // Persist the concrete trait-element bindings onto the spec'd impl
+        // (self-returning defaults are instantiated lazily and re-seed these).
+        this.trait_spec.cache_derived_trait_params(decl, &res_ctx);
+        // Drop conditionally-bounded trait defaults (`min`/`max` with
+        // `where This::Item: Ord`) whose concrete Item does not satisfy
+        // the bound for THIS monomorphization (e.g. `EnumerateIter`'s
+        // `Pair` Item is not `Ord`) - before their bodies are resolved,
+        // so `.compare()` on a non-`Ord` element never reaches type check.
+        this.trait_spec.filter_projection_bound_methods(decl, this_type);
+        // Rewrite where-bound-derived generics (`A`) inside the impl's method
+        // BODIES so a struct literal `Pair<A, A>{..}` becomes concrete before
+        // body resolution.  Run before resolve_methods.
+        this.trait_spec.substitute_derived_params_in_method_bodies(decl);
+        this.resolve_methods(decl.methods, &res_ctx, this_type);
     }
 
     // ---- static match arm pruning (compile-time type dispatch) -----------
 
     /// Entry point: prune `static match` arms throughout a freshly-substituted
     /// specialized AST.  Reduces each static match to its single live arm.
-    prune_static_match_arms(mut &this, ast_node: ASTNode*, node_kind: NodeKind,
-                            entry: TemplateEntry*, subst: TypeSubstitution*) -> void {
+    ///
+    /// Scoped per body, not per template.  Both kinds of name a `static
+    /// match` resolves - the arm patterns the author wrote and the scrutinee
+    /// the substituter rewrote to the concrete binding - were written
+    /// wherever the BODY was, and a cloned trait default's body lives in the
+    /// trait's file while the template names the implementing type's module.
+    /// The same walk reached through `prune_static_match_in_stmt` from the
+    /// call specializer is scoped that way too.
+    prune_static_match_arms(mut &this, ast_node: DeclarationNode*, kind: TemplateKind) -> void {
         if (ast_node == null || this.type_resolver == null) { return; }
         mut res_ctx: ResolutionContext = ResolutionContext::new("");
-        // Scoped per body below, not here.  Both kinds of name a `static match`
-        // resolves - the arm patterns the author wrote and the scrutinee the
-        // substituter rewrote to the concrete binding - were written wherever
-        // the BODY was, and a cloned trait default's body lives in the trait's
-        // file while `entry` names the implementing type's module.  The same
-        // walk reached through `prune_static_match_in_block` from the call
-        // specializer is scoped that way already; this entry is the one that
-        // was not, so the two disagreed about the same question.
-
-        match (node_kind) {
-            NodeKind::StructDeclaration => {
-                const decl: StructDeclNode* = ast_node as StructDeclNode*;
-                if (decl == null) { return; }
-                this.prune_static_match_in_methods(decl.methods, &res_ctx);
+        match (kind) {
+            TemplateKind::Struct => {
+                this.prune_static_match_in_methods((DeclarationNode::struct_of(ast_node)).methods, &res_ctx);
             }
-            NodeKind::UnionDeclaration => {
-                const decl: UnionDeclNode* = ast_node as UnionDeclNode*;
-                if (decl == null) { return; }
-                this.prune_static_match_in_methods(decl.methods, &res_ctx);
+            TemplateKind::Union => {
+                this.prune_static_match_in_methods((DeclarationNode::union_of(ast_node)).methods, &res_ctx);
             }
-            NodeKind::ClassDeclaration => {
-                const decl: ClassDeclNode* = ast_node as ClassDeclNode*;
-                if (decl == null) { return; }
-                this.prune_static_match_in_methods(decl.methods, &res_ctx);
+            TemplateKind::Function => {
+                const decl_decl: DeclarationNode* = ast_node;
+                const decl: FunctionDecl* = DeclarationNode::fn_of(decl_decl);
+                if (decl.body == null) { return; }
+                this.prune_static_match_in_stmt(decl.body, &res_ctx);
             }
-            NodeKind::FunctionDeclaration => {
-                const decl: FunctionDeclNode* = ast_node as FunctionDeclNode*;
-                if (decl == null || decl.body == null) { return; }
-                this.prune_static_match_in_block(decl.body, &res_ctx);
-            }
-            NodeKind::ImplementationBlock => {
-                const decl: ImplBlockNode* = ast_node as ImplBlockNode*;
-                if (decl == null) { return; }
-                this.prune_static_match_in_methods(decl.methods, &res_ctx);
-            }
-            _ => {}
+            TemplateKind::Enum => {}
+            TemplateKind::Trait => {}
+            TemplateKind::TypeAlias => {}
         }
     }
 
-    prune_static_match_in_methods(mut &this, methods: &[MethodNode*],
+    /// `prune_static_match_arms` for a specialization's `implement` block.
+    prune_static_match_arms_in_impl(mut &this, decl: ImplBlock*) -> void {
+        if (decl == null || this.type_resolver == null) { return; }
+        mut res_ctx: ResolutionContext = ResolutionContext::new("");
+        this.prune_static_match_in_methods(decl.methods, &res_ctx);
+    }
+
+    prune_static_match_in_methods(mut &this, methods: &[DeclarationNode*],
                                   res_ctx: ResolutionContext*) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const method: MethodNode* = methods[i];
+            const method_decl: DeclarationNode* = methods[i];
+            const method: MethodDecl* = DeclarationNode::method_of(method_decl);
             if (method == null || method.func == null) { continue; }
             // A method with its OWN generic params (`try_push<T>`, `parse_int<T>`)
             // is pruned per-call by the CallSpecializer, which substitutes the
@@ -226,96 +209,79 @@ type struct MonoAstResolver {
             // params are bound (`String<A>` -> `A = GlobalAlloc`); the method's
             // own `T` is still unbound, so resolving a method-level scrutinee
             // would fail (E0900).  Skip them; the per-call path handles them.
-            if (method.func.is_generic()) { continue; }
-            if (method.func.body != null) {
-                this.prune_static_match_in_block(method.func.body, res_ctx);
+            if (DeclarationNode::fn_of(method.func).is_generic()) { continue; }
+            if (DeclarationNode::fn_of(method.func).body != null) {
+                this.prune_static_match_in_stmt(DeclarationNode::fn_of(method.func).body, res_ctx);
             }
         }
     }
 
-    prune_static_match_in_block(mut &this, block: BlockStmtNode*,
-                                res_ctx: ResolutionContext*) -> void {
-        if (block == null) { return; }
-        for (mut i: i64 = 0; i < block.statements.length; i++) {
-            this.prune_static_match_in_stmt(block.statements[i], res_ctx);
-        }
-    }
-
-    prune_static_match_in_stmt(mut &this, stmt: StatementNode*,
+    prune_static_match_in_stmt(mut &this, stmt: Stmt*,
                                res_ctx: ResolutionContext*) -> void {
         if (stmt == null) { return; }
-        const node: ASTNode* = stmt as ASTNode*;
-        match (node.kind) {
-            NodeKind::BlockStatement => {
-                this.prune_static_match_in_block(stmt as BlockStmtNode*, res_ctx);
+        match (stmt.kind) {
+            StmtKind::Block(b) => {
+                for (mut i: i64 = 0; i < b.statements.length; i++) {
+                    this.prune_static_match_in_stmt(b.statements[i], res_ctx);
+                }
             }
-            NodeKind::UnsafeBlockStatement => {
-                const ub: UnsafeBlockStmtNode* = stmt as UnsafeBlockStmtNode*;
-                this.prune_static_match_in_block(ub.block, res_ctx);
+            StmtKind::UnsafeBlock(ub) => {
+                this.prune_static_match_in_stmt(ub.block, res_ctx);
             }
-            NodeKind::ExpressionStatement => {
-                const es: ExprStmtNode* = stmt as ExprStmtNode*;
+            StmtKind::Expr(es) => {
                 this.prune_static_match_in_expr(es.expression, res_ctx);
             }
-            NodeKind::ReturnStatement => {
-                const rs: ReturnStmtNode* = stmt as ReturnStmtNode*;
+            StmtKind::Return(rs) => {
                 this.prune_static_match_in_expr(rs.expression, res_ctx);
             }
-            NodeKind::DeclarationStatement => {
-                const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+            StmtKind::Decl(ds) => {
                 if (ds.declaration != null &&
-                    ds.declaration.kind == NodeKind::VariableDeclaration) {
-                    const vd: VarDeclNode* = ds.declaration as VarDeclNode*;
+                    DeclarationNode::var_of(ds.declaration) != null) {
+                    const vd: VarDecl* = DeclarationNode::var_of(ds.declaration);
                     this.prune_static_match_in_expr(vd.initializer, res_ctx);
                 }
             }
-            NodeKind::VariableDeclaration => {
-                const vd: VarDeclNode* = stmt as VarDeclNode*;
-                this.prune_static_match_in_expr(vd.initializer, res_ctx);
-            }
-            NodeKind::IfStatement => {
-                const ifs: IfStmtNode* = stmt as IfStmtNode*;
+            StmtKind::If(ifs) => {
                 this.prune_static_match_in_expr(ifs.condition, res_ctx);
                 this.prune_static_match_in_stmt(ifs.then_stmt, res_ctx);
-                if (ifs.has_else()) {
-                    this.prune_static_match_in_stmt(ifs.else_stmt, res_ctx);
-                }
+                this.prune_static_match_in_stmt(ifs.else_stmt, res_ctx);
             }
-            NodeKind::WhileStatement => {
-                const ws: WhileStmtNode* = stmt as WhileStmtNode*;
+            StmtKind::While(ws) => {
                 this.prune_static_match_in_expr(ws.condition, res_ctx);
                 this.prune_static_match_in_stmt(ws.body, res_ctx);
             }
-            NodeKind::DoWhileStatement => {
-                const dw: DoWhileStmtNode* = stmt as DoWhileStmtNode*;
+            StmtKind::DoWhile(dw) => {
                 this.prune_static_match_in_stmt(dw.body, res_ctx);
                 this.prune_static_match_in_expr(dw.condition, res_ctx);
             }
-            NodeKind::ForStatement => {
-                const fs: ForStmtNode* = stmt as ForStmtNode*;
-                if (fs.init != null) { this.prune_static_match_in_stmt(fs.init as StatementNode*, res_ctx); }
+            StmtKind::For(fs) => {
+                // A variable declaration initializer is pruned; an expression
+                // one is not.
+                const init_var: VarDecl* = DeclarationNode::var_of(fs.init.as_decl());
+                if (init_var != null) {
+                    this.prune_static_match_in_expr(init_var.initializer, res_ctx);
+                } else if (fs.init.as_stmt() != null) {
+                    this.prune_static_match_in_stmt(fs.init.as_stmt(), res_ctx);
+                }
                 this.prune_static_match_in_expr(fs.condition, res_ctx);
                 this.prune_static_match_in_expr(fs.update, res_ctx);
                 this.prune_static_match_in_stmt(fs.body, res_ctx);
             }
-            NodeKind::LoopStatement => {
-                const ls: LoopStmtNode* = stmt as LoopStmtNode*;
+            StmtKind::Loop(ls) => {
                 this.prune_static_match_in_stmt(ls.body, res_ctx);
             }
-            NodeKind::MatchStatement => {
-                const ms: MatchStmtNode* = stmt as MatchStmtNode*;
+            StmtKind::Match(ms) => {
                 this.prune_static_match_in_expr(ms.subject, res_ctx);
                 for (mut i: i64 = 0; i < ms.arms.length; i++) {
                     const arm: MatchArmNode* = ms.arms[i];
-                    if (arm != null && arm.body != null) {
+                    if (arm != null) {
                         this.prune_static_match_in_stmt(arm.body, res_ctx);
                     }
                 }
             }
-            NodeKind::StaticMatchStatement => {
-                mut sms: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+            StmtKind::StaticMatch(sms) => {
                 const idx: i64 = this.select_static_match_arm(
-                    sms.scrutinee, sms.arms, sms.span, res_ctx);
+                    sms.scrutinee, sms.arms, stmt.span, res_ctx);
                 if (idx >= 0) {
                     mut reduced: [StaticMatchArmNode*] = [];
                     reduced.push(sms.arms[idx]);
@@ -324,24 +290,22 @@ type struct MonoAstResolver {
                 // Recurse into the surviving arm for nested static matches.
                 for (mut i: i64 = 0; i < sms.arms.length; i++) {
                     const arm: StaticMatchArmNode* = sms.arms[i];
-                    if (arm != null && arm.body != null) {
+                    if (arm != null) {
                         this.prune_static_match_in_stmt(arm.body, res_ctx);
                     }
                 }
             }
-            _ => {}
+            StmtKind::Asm(_) | StmtKind::Break | StmtKind::Continue => {}
         }
     }
 
     prune_static_match_in_expr(mut &this, expr: ExpressionNode*,
                                res_ctx: ResolutionContext*) -> void {
         if (expr == null) { return; }
-        const node: ASTNode* = expr as ASTNode*;
-        match (node.kind) {
-            NodeKind::StaticMatchExpression => {
-                mut sme: StaticMatchExprNode* = expr as StaticMatchExprNode*;
+        match (expr.kind) {
+            ExprKind::StaticMatch(sme) => {
                 const idx: i64 = this.select_static_match_arm(
-                    sme.scrutinee, sme.arms, sme.span, res_ctx);
+                    sme.scrutinee, sme.arms, expr.span, res_ctx);
                 if (idx >= 0) {
                     mut reduced: [StaticMatchArmNode*] = [];
                     reduced.push(sme.arms[idx]);
@@ -354,49 +318,19 @@ type struct MonoAstResolver {
                     }
                 }
             }
-            NodeKind::BinaryExpression => {
-                const b: BinaryExprNode* = expr as BinaryExprNode*;
+            ExprKind::Cast(ce) => { this.prune_static_match_in_expr(ce.expression, res_ctx); }
+            ExprKind::ObjectConversion(oc) => { this.prune_static_match_in_expr(oc.operand, res_ctx); }
+            ExprKind::MemberAccess(ma) => { this.prune_static_match_in_expr(ma.object, res_ctx); }
+            ExprKind::Unary(u) => { this.prune_static_match_in_expr(u.operand, res_ctx); }
+            ExprKind::Binary(b) => {
                 this.prune_static_match_in_expr(b.left, res_ctx);
                 this.prune_static_match_in_expr(b.right, res_ctx);
             }
-            NodeKind::UnaryExpression => {
-                const u: UnaryExprNode* = expr as UnaryExprNode*;
-                this.prune_static_match_in_expr(u.operand, res_ctx);
-            }
-            NodeKind::TernaryExpression => {
-                const t: TernaryExprNode* = expr as TernaryExprNode*;
-                this.prune_static_match_in_expr(t.condition, res_ctx);
-                this.prune_static_match_in_expr(t.true_expr, res_ctx);
-                this.prune_static_match_in_expr(t.false_expr, res_ctx);
-            }
-            NodeKind::IfExpression => {
-                const ie: IfExprNode* = expr as IfExprNode*;
-                this.prune_static_match_in_expr(ie.condition, res_ctx);
-                this.prune_static_match_in_expr(ie.then_expr, res_ctx);
-                this.prune_static_match_in_expr(ie.else_expr, res_ctx);
-            }
-            NodeKind::CallExpression => {
-                const c: CallExprNode* = expr as CallExprNode*;
-                this.prune_static_match_in_expr(c.callee, res_ctx);
-                for (mut i: i64 = 0; i < c.arguments.length; i++) {
-                    this.prune_static_match_in_expr(c.arguments[i], res_ctx);
-                }
-            }
-            NodeKind::CastExpression => {
-                const ce: CastExprNode* = expr as CastExprNode*;
-                this.prune_static_match_in_expr(ce.expression, res_ctx);
-            }
-            NodeKind::MemberAccess => {
-                const ma: MemberAccessNode* = expr as MemberAccessNode*;
-                this.prune_static_match_in_expr(ma.object, res_ctx);
-            }
-            NodeKind::ArrayAccess => {
-                const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
+            ExprKind::ArrayAccess(aa) => {
                 this.prune_static_match_in_expr(aa.array, res_ctx);
                 this.prune_static_match_in_expr(aa.index, res_ctx);
             }
-            NodeKind::MatchExpression => {
-                const me: MatchExprNode* = expr as MatchExprNode*;
+            ExprKind::Match(me) => {
                 this.prune_static_match_in_expr(me.subject, res_ctx);
                 for (mut i: i64 = 0; i < me.arms.length; i++) {
                     const arm: MatchArmNode* = me.arms[i];
@@ -405,8 +339,30 @@ type struct MonoAstResolver {
                     }
                 }
             }
-            _ => {}
+            ExprKind::Ternary(t) => {
+                this.prune_static_match_in_expr(t.condition, res_ctx);
+                this.prune_static_match_in_expr(t.true_expr, res_ctx);
+                this.prune_static_match_in_expr(t.false_expr, res_ctx);
+            }
+            ExprKind::If(ie) => {
+                this.prune_static_match_in_expr(ie.condition, res_ctx);
+                this.prune_static_match_in_expr(ie.then_expr, res_ctx);
+                this.prune_static_match_in_expr(ie.else_expr, res_ctx);
+            }
+            // As the default below: not descended into.
+            ExprKind::Sizeof(_) | ExprKind::Alignof(_) | ExprKind::Typeof(_)
+            | ExprKind::Delete(_) | ExprKind::Yield(_) | ExprKind::Try(_)
+            | ExprKind::New(_) | ExprKind::Tuple(_) | ExprKind::Array(_)
+            | ExprKind::Struct(_) | ExprKind::Literal(_) | ExprKind::Lambda(_)
+            | ExprKind::Await(_) | ExprKind::Identifier(_) | ExprKind::ScopeResolution(_) => { }
+            ExprKind::Call(c) => {
+                this.prune_static_match_in_expr(c.callee, res_ctx);
+                for (mut i: i64 = 0; i < c.arguments.length; i++) {
+                    this.prune_static_match_in_expr(c.arguments[i], res_ctx);
+                }
+            }
         }
+    
     }
 
     /// Resolve the scrutinee and each arm's type pattern, returning the index of
@@ -500,41 +456,37 @@ type struct MonoAstResolver {
 
     /// Resolve signatures on an array of methods; delegates core signature
     /// resolution to TypeResolver, then resolves body locals.
-    resolve_methods(mut &this, methods: &[MethodNode*], res_ctx: ResolutionContext*,
+    resolve_methods(mut &this, methods: &[DeclarationNode*], res_ctx: ResolutionContext*,
                     this_type: TypeRef) -> void {
         // Share `nested_visited` across all methods in this impl block so repeated
         // return types only produce a single monomorphization request per impl.
         this.state.nested_visited = [];
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const method: MethodNode* = methods[i];
+            const method_decl: DeclarationNode* = methods[i];
+            const method: MethodDecl* = DeclarationNode::method_of(method_decl);
             if (method == null || method.func == null) { continue; }
             // Self-returning trait defaults (combinators returning an adapter over
             // `This`) AND self-growing inherent methods (`as_ref -> Option<T*>`)
             // are instantiated lazily at call sites, never eagerly - eager
             // resolution here would fire the return-type tower discovery below.
-            if (method.func.is_self_returning_default
-                    || method.func.is_lazy_self_growing) { continue; }
-            // Static methods don't take `this`; pass invalid.
-            const m_this: TypeRef = if (method.is_static) {
-                TypeRef::invalid()
-            } else {
-                this_type
-            };
+            if (DeclarationNode::fn_of(method.func).is_self_returning_default
+                    || DeclarationNode::fn_of(method.func).is_lazy_self_growing) { continue; }
             // If the method has its own generic params (e.g. `hash<H>`), bind them
             // in a per-method resolution context before signature resolution so the
             // Reference branch builds `Reference(GenericParam_H)` not `Reference(invalid)`.
-            if (method.func.is_generic()) {
+            if (DeclarationNode::fn_of(method.func).is_generic()) {
                 mut method_ctx: ResolutionContext = res_ctx.clone();
-                for (mut j: i64 = 0; j < method.func.generic_params.length; j++) {
-                    const gp: GenericParamNode* = method.func.generic_params[j];
+                for (mut j: i64 = 0; j < DeclarationNode::fn_of(method.func).generic_params.length; j++) {
+                    const gp_decl: DeclarationNode* = DeclarationNode::fn_of(method.func).generic_params[j];
+                    const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
                     if (gp == null) { continue; }
                     const gp_ref: TypeRef = this.arena.create_generic_param(
                         gp.sym_id, gp.name, j as u64);
                     method_ctx.add_binding(gp.sym_id, gp.name, gp_ref);
                 }
-                this.resolve_func_and_body(method.func, &method_ctx, m_this);
+                this.resolve_func_and_body(method.func, &method_ctx, this_type);
             } else {
-                this.resolve_func_and_body(method.func, res_ctx, m_this);
+                this.resolve_func_and_body(method.func, res_ctx, this_type);
             }
         }
     }
@@ -548,8 +500,9 @@ type struct MonoAstResolver {
     /// the substituter before this runs, so a parameter left in one names a
     /// declaration the clone cannot see, and there is no second context to
     /// try it under.
-    resolve_func_and_body(mut &this, func: FunctionDeclNode*, res_ctx: ResolutionContext*,
+    resolve_func_and_body(mut &this, func_decl: DeclarationNode*, res_ctx: ResolutionContext*,
                           this_type: TypeRef) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         // Spec'd method clones have their `&this` parameter annotated as
         // `Reference(ThisType)`; thread `this_type` onto a per-call copy of the
         // context so `&this` resolves to `Reference(<spec'd_owner>)`.
@@ -557,14 +510,15 @@ type struct MonoAstResolver {
         if (this_type.is_valid()) {
             sig_ctx.set_this_type(this_type);
         }
-        this.type_resolver.resolve_func_signature(func, &sig_ctx);
+        this.type_resolver.resolve_func_signature(func_decl, &sig_ctx);
 
         // Back-fill `&this` / `this` parameters when they have no explicit
         // annotation (the parser leaves `type_annotation` null on the implicit
         // receiver).  `&this` -> `Pointer(this_type)`; bare `this` -> the owner type.
         if (this_type.is_valid()) {
             for (mut bp: i64 = 0; bp < func.parameters.length; bp++) {
-                const param: VarDeclNode* = func.parameters[bp];
+                const param_decl: DeclarationNode* = func.parameters[bp];
+                const param: VarDecl* = DeclarationNode::var_of(param_decl);
                 if (param == null || param.resolved_type.is_valid()) { continue; }
                 if (param.is_ref_receiver()) {
                     param.resolved_type = this.arena.get_pointer_to(this_type);
@@ -581,7 +535,8 @@ type struct MonoAstResolver {
                 this.trait_spec.reduce_projections(func.resolved_return_type);
         }
         for (mut rpi: i64 = 0; rpi < func.parameters.length; rpi++) {
-            const rpp: VarDeclNode* = func.parameters[rpi];
+            const rpp_decl: DeclarationNode* = func.parameters[rpi];
+            const rpp: VarDecl* = DeclarationNode::var_of(rpp_decl);
             if (rpp != null && rpp.resolved_type.is_valid()) {
                 rpp.resolved_type = this.trait_spec.reduce_projections(rpp.resolved_type);
             }
@@ -602,126 +557,99 @@ type struct MonoAstResolver {
     }
 
     /// Walk a block statement and resolve type annotations on all local variable
-    /// declarations.  Recurses into nested blocks / control-flow bodies.
-    resolve_body_locals(mut &this, block: BlockStmtNode*, res_ctx: ResolutionContext*) -> void {
+    /// declarations.  Recurses into the nested bodies that are blocks; a
+    /// statement that is not a block is not walked.
+    resolve_body_locals(mut &this, block_stmt: Stmt*, res_ctx: ResolutionContext*) -> void {
+        if (block_stmt == null) { return; }
+        const block: BlockStmt* = match (block_stmt.kind) {
+            StmtKind::Block(b) => { b }
+            _                  => { null }
+        };
         if (block == null) { return; }
         for (mut i: i64 = 0; i < block.statements.length; i++) {
-            const stmt: StatementNode* = block.statements[i];
+            const stmt: Stmt* = block.statements[i];
             if (stmt == null) { continue; }
-            const node: ASTNode* = stmt as ASTNode*;
-
-            if (node.kind == NodeKind::DeclarationStatement) {
-                const decl_stmt: DeclStmtNode* = stmt as DeclStmtNode*;
-                const inner_decl: DeclarationNode* = decl_stmt.declaration;
-                if (inner_decl != null) {
-                    const inner_node: ASTNode* = inner_decl as ASTNode*;
-                    if (inner_node.kind == NodeKind::VariableDeclaration) {
-                        const var_decl: VarDeclNode* = inner_decl as VarDeclNode*;
-                        if (var_decl.type_annotation != null && !var_decl.resolved_type.is_valid()) {
+            match (stmt.kind) {
+                StmtKind::Decl(decl_stmt) => {
+                    const inner_decl: DeclarationNode* = decl_stmt.declaration;
+                    if (inner_decl != null) {
+                        const inner_node: DeclarationNode* = inner_decl as DeclarationNode*;
+                        if (DeclarationNode::var_of(inner_node) != null) {
+                            const var_decl: VarDecl* = DeclarationNode::var_of(inner_decl);
+                            if (var_decl.type_annotation != null && !var_decl.resolved_type.is_valid()) {
+                                const vtype: TypeRef = this.type_resolver.resolve(
+                                    var_decl.type_annotation, res_ctx);
+                                if (vtype.is_valid()) {
+                                    var_decl.resolved_type = vtype;
+                                }
+                            }
+                        }
+                    }
+                }
+                StmtKind::Block(_) => {
+                    this.resolve_body_locals(stmt, res_ctx);
+                }
+                StmtKind::If(if_stmt) => {
+                    this.resolve_body_locals(if_stmt.then_stmt, res_ctx);
+                    this.resolve_body_locals(if_stmt.else_stmt, res_ctx);
+                }
+                StmtKind::While(while_stmt) => {
+                    this.resolve_body_locals(while_stmt.body, res_ctx);
+                }
+                StmtKind::For(for_stmt) => {
+                    // Resolve the loop's init VarDecl (e.g. `mut i: int = 0`).  The init
+                    // can be a bare variable declaration or a declaration statement.
+                    if (!for_stmt.init.is_null()) {
+                        mut for_var: VarDecl* = null;
+                        if (DeclarationNode::var_of(for_stmt.init.as_decl()) != null) {
+                            for_var = DeclarationNode::var_of(for_stmt.init.as_decl());
+                        } else if (for_stmt.init.as_stmt() != null) {
+                            match (for_stmt.init.as_stmt().kind) {
+                                StmtKind::Decl(init_decl) => {
+                                    const inner_decl: DeclarationNode* = init_decl.declaration;
+                                    if (inner_decl != null
+                                            && DeclarationNode::var_of(inner_decl) != null) {
+                                        for_var = DeclarationNode::var_of(inner_decl);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if (for_var != null && for_var.type_annotation != null
+                                && !for_var.resolved_type.is_valid()) {
                             const vtype: TypeRef = this.type_resolver.resolve(
-                                var_decl.type_annotation, res_ctx);
+                                for_var.type_annotation, res_ctx);
                             if (vtype.is_valid()) {
-                                var_decl.resolved_type = vtype;
+                                for_var.resolved_type = vtype;
                             }
                         }
                     }
+                    this.resolve_body_locals(for_stmt.body, res_ctx);
                 }
-            }
-            // Recurse into nested blocks / control-flow bodies.
-            if (node.kind == NodeKind::BlockStatement) {
-                this.resolve_body_locals(stmt as BlockStmtNode*, res_ctx);
-            }
-            if (node.kind == NodeKind::IfStatement) {
-                const if_stmt: IfStmtNode* = stmt as IfStmtNode*;
-                if (if_stmt.then_stmt != null) {
-                    const then_node: ASTNode* = if_stmt.then_stmt as ASTNode*;
-                    if (then_node.kind == NodeKind::BlockStatement) {
-                        this.resolve_body_locals(if_stmt.then_stmt as BlockStmtNode*, res_ctx);
-                    }
-                }
-                if (if_stmt.has_else() && if_stmt.else_stmt != null) {
-                    const else_node: ASTNode* = if_stmt.else_stmt as ASTNode*;
-                    if (else_node.kind == NodeKind::BlockStatement) {
-                        this.resolve_body_locals(if_stmt.else_stmt as BlockStmtNode*, res_ctx);
-                    }
-                }
-            }
-            if (node.kind == NodeKind::WhileStatement) {
-                const while_stmt: WhileStmtNode* = stmt as WhileStmtNode*;
-                if (while_stmt.body != null) {
-                    const body_node: ASTNode* = while_stmt.body as ASTNode*;
-                    if (body_node.kind == NodeKind::BlockStatement) {
-                        this.resolve_body_locals(while_stmt.body as BlockStmtNode*, res_ctx);
-                    }
-                }
-            }
-            if (node.kind == NodeKind::ForStatement) {
-                const for_stmt: ForStmtNode* = stmt as ForStmtNode*;
-                // Resolve the loop's init VarDecl (e.g. `mut i: int = 0`).  The init
-                // can be a bare VariableDeclaration or a DeclarationStatement.
-                if (for_stmt.init != null) {
-                    const init_node: ASTNode* = for_stmt.init;
-                    mut for_var: VarDeclNode* = null;
-                    if (init_node.kind == NodeKind::VariableDeclaration) {
-                        for_var = for_stmt.init as VarDeclNode*;
-                    } else if (init_node.kind == NodeKind::DeclarationStatement) {
-                        const init_decl: DeclStmtNode* = for_stmt.init as DeclStmtNode*;
-                        const inner_decl: DeclarationNode* = init_decl.declaration;
-                        if (inner_decl != null) {
-                            const inner_node: ASTNode* = inner_decl as ASTNode*;
-                            if (inner_node.kind == NodeKind::VariableDeclaration) {
-                                for_var = inner_decl as VarDeclNode*;
-                            }
-                        }
-                    }
-                    if (for_var != null && for_var.type_annotation != null
-                            && !for_var.resolved_type.is_valid()) {
-                        const vtype: TypeRef = this.type_resolver.resolve(
-                            for_var.type_annotation, res_ctx);
-                        if (vtype.is_valid()) {
-                            for_var.resolved_type = vtype;
+                StmtKind::Match(match_stmt) => {
+                    for (mut mi: i64 = 0; mi < match_stmt.arms.length; mi++) {
+                        const arm: MatchArmNode* = match_stmt.arms[mi];
+                        if (arm != null) {
+                            this.resolve_body_locals(arm.body, res_ctx);
                         }
                     }
                 }
-                if (for_stmt.body != null) {
-                    const body_node: ASTNode* = for_stmt.body as ASTNode*;
-                    if (body_node.kind == NodeKind::BlockStatement) {
-                        this.resolve_body_locals(for_stmt.body as BlockStmtNode*, res_ctx);
-                    }
-                }
-            }
-            if (node.kind == NodeKind::MatchStatement) {
-                const match_stmt: MatchStmtNode* = stmt as MatchStmtNode*;
-                for (mut mi: i64 = 0; mi < match_stmt.arms.length; mi++) {
-                    const arm: MatchArmNode* = match_stmt.arms[mi];
-                    if (arm != null && arm.body != null) {
-                        const arm_body: ASTNode* = arm.body as ASTNode*;
-                        if (arm_body.kind == NodeKind::BlockStatement) {
-                            this.resolve_body_locals(arm.body as BlockStmtNode*, res_ctx);
+                StmtKind::StaticMatch(sm_stmt) => {
+                    for (mut mi: i64 = 0; mi < sm_stmt.arms.length; mi++) {
+                        const arm: StaticMatchArmNode* = sm_stmt.arms[mi];
+                        if (arm != null) {
+                            this.resolve_body_locals(arm.body, res_ctx);
                         }
                     }
                 }
-            }
-            if (node.kind == NodeKind::StaticMatchStatement) {
-                const sm_stmt: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
-                for (mut mi: i64 = 0; mi < sm_stmt.arms.length; mi++) {
-                    const arm: StaticMatchArmNode* = sm_stmt.arms[mi];
-                    if (arm != null && arm.body != null) {
-                        const arm_body: ASTNode* = arm.body as ASTNode*;
-                        if (arm_body.kind == NodeKind::BlockStatement) {
-                            this.resolve_body_locals(arm.body as BlockStmtNode*, res_ctx);
-                        }
-                    }
+                StmtKind::Loop(loop_stmt) => {
+                    this.resolve_body_locals(loop_stmt.body, res_ctx);
                 }
-            }
-            if (node.kind == NodeKind::LoopStatement) {
-                const loop_stmt: LoopStmtNode* = stmt as LoopStmtNode*;
-                if (loop_stmt.body != null) {
-                    const loop_body: ASTNode* = loop_stmt.body as ASTNode*;
-                    if (loop_body.kind == NodeKind::BlockStatement) {
-                        this.resolve_body_locals(loop_stmt.body as BlockStmtNode*, res_ctx);
-                    }
-                }
+                // Neither an `unsafe` block's nor a `do`-`while` body's
+                // locals are resolved here.
+                StmtKind::UnsafeBlock(_) | StmtKind::DoWhile(_) | StmtKind::Asm(_)
+                | StmtKind::Return(_) | StmtKind::Break | StmtKind::Continue
+                | StmtKind::Expr(_) => {}
             }
         }
     }

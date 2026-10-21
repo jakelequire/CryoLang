@@ -15,11 +15,10 @@ import std::json::value;
 import std::ffi::libc;
 
 import compiler::compilation_context::{ CompilationContext };
-import compiler::ast::{ NodeKind, TypeAnnotation };
-import compiler::ast::node::{ ASTNode };
+import compiler::ast::{  TypeAnnotation };
 import compiler::ast::declaration::{
-    DeclarationNode, EnumVariantNode, FieldDeclNode, FunctionDeclNode, IntrinsicDeclNode,
-    MethodNode, VarDeclNode
+    DeclarationNode, DeclKind, EnumVariant, FieldDecl, FunctionDecl,
+    MethodDecl, VarDecl
 };
 import compiler::resolver::res::{ DefId, DefKind };
 import compiler::resolver::symbol::{ Symbol, SymbolKind };
@@ -139,45 +138,47 @@ type struct Shown {
             this.text = "module " + this.path(d);
             return;
         }
-        const decl: ASTNode* = this.ctx.decl_index.declaration_of(d);
+        const decl: DeclarationNode* = this.ctx.decl_index.declaration_of(d);
         if (decl == null) {
             this.text = this.path(d);
             return;
         }
-        this.doc = (decl as DeclarationNode*).documentation;
+        this.doc = decl.documentation;
         match (decl.kind) {
-            NodeKind::FunctionDeclaration => { this.text = this.signature(d, decl as FunctionDeclNode*, false); }
-            NodeKind::MethodDeclaration => {
-                const m: MethodNode* = decl as MethodNode*;
+            DeclKind::Method(m) => {
                 if (m.func != null) {
                     this.text = this.signature(d, m.func, m.is_static);
                     if (this.doc.length() == 0) { this.doc = m.func.documentation; }
                 }
             }
-            NodeKind::IntrinsicDeclaration => {
-                const f: IntrinsicDeclNode* = decl as IntrinsicDeclNode*;
-                this.text = "intrinsic function " + this.path(d) + "(" + this.params(&f.parameters, false)
-                    + ") -> " + this.type_text(f.resolved_return_type);
+            DeclKind::Function(_) => { this.text = this.signature(d, decl, false); }
+            DeclKind::Intrinsic(f) => {
+                this.text = "intrinsic function " + this.path(d) + "("
+                    + this.params(&f.parameters, false) + ") -> "
+                    + this.type_text(f.resolved_return_type);
             }
-            NodeKind::StructDeclaration    => { this.text = "type struct " + this.path(d); }
-            NodeKind::UnionDeclaration     => { this.text = "type union " + this.path(d); }
-            NodeKind::ClassDeclaration     => { this.text = "type class " + this.path(d); }
-            NodeKind::EnumDeclaration      => { this.text = "type enum " + this.path(d); }
-            NodeKind::TraitDeclaration     => { this.text = "type trait " + this.path(d); }
-            NodeKind::TypeAliasDeclaration => { this.text = "type " + this.path(d); }
-            NodeKind::VariableDeclaration => {
-                const v: VarDeclNode* = decl as VarDeclNode*;
+            DeclKind::TypeAlias(_) => { this.text = "type " + this.path(d); }
+            DeclKind::Enum(_)      => { this.text = "type enum " + this.path(d); }
+            DeclKind::Trait(_)     => { this.text = "type trait " + this.path(d); }
+            DeclKind::Union(_)     => { this.text = "type union " + this.path(d); }
+            DeclKind::Struct(_)    => { this.text = "type struct " + this.path(d); }
+            DeclKind::Variable(v)  => {
                 const kw: string = if (v.is_mutable) { "mut " } else { "const " };
                 this.text = kw + this.path(d) + ": "
                     + this.names.type_text_written(v.resolved_type, v.type_annotation);
             }
-            _ => { this.text = this.path(d); }
+            DeclKind::Import(_) | DeclKind::Module(_) | DeclKind::Impl(_)
+            | DeclKind::Variant(_) | DeclKind::Extern(_) | DeclKind::Destructure(_)
+            | DeclKind::Field(_) | DeclKind::GenericParam(_) => {
+                this.text = this.path(d);
+            }
         }
     }
 
     /// `function a::b(x: i32) -> i64`, or for a method `[static]
     /// Owner::m(...)`.
-    signature(&this, d: DefId, f: FunctionDeclNode*, is_static: boolean) -> string {
+    signature(&this, d: DefId, f_decl: DeclarationNode*, is_static: boolean) -> string {
+        const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
         const is_method: boolean = this.ctx.defs.kind_of(d) == DefKind::Method;
         const head: string = if (is_method) {
             if (is_static) { "static " } else { "" }
@@ -189,13 +190,14 @@ type struct Shown {
             + this.names.type_text_written(f.resolved_return_type, f.return_type_annotation);
     }
 
-    params(&this, ps: &[VarDeclNode*], receiver: boolean) -> string {
+    params(&this, ps: &[DeclarationNode*], receiver: boolean) -> string {
         mut out: string = "";
         for (mut i: i64 = 0; i < ps.length; i++) {
             if (i > 0) { out = out + ", "; }
-            out = out + this.ctx.intern_table.resolve(ps[i].name);
+            const p: VarDecl* = DeclarationNode::var_of(ps[i]);
+            out = out + this.ctx.intern_table.resolve(p.name);
             if (i > 0 || !receiver) {
-                out = out + ": " + this.names.type_text_written(ps[i].resolved_type, ps[i].type_annotation);
+                out = out + ": " + this.names.type_text_written(p.resolved_type, p.type_annotation);
             }
         }
         return out;
@@ -211,27 +213,29 @@ type struct Shown {
             kw = if (sym.is_mutable) { "mut " } else { "const " };
         }
         // A binding declared with an annotation shows its type as written.
-        const at: ASTNode* = Declared::binding_node(this.ctx, s);
-        if (at != null && at.kind == NodeKind::VariableDeclaration) {
+        const at: DeclarationNode* = Declared::binding_decl(this.ctx, s);
+        if (at != null && DeclarationNode::var_of(at) != null) {
             this.text = kw + name + ": "
-                + this.names.type_text_written(ty, (at as VarDeclNode*).type_annotation);
+                + this.names.type_text_written(ty, (DeclarationNode::var_of(at)).type_annotation);
             return;
         }
         this.text = kw + name + ": " + this.type_text(ty);
     }
 
     field(mut &this, owner: DefId, index: i64) -> void {
-        const fd: FieldDeclNode* = Members::field_decl(this.ctx, owner, index);
-        if (fd == null) { return; }
+        const h: DeclarationNode* = Members::field_decl(this.ctx, owner, index);
+        if (h == null) { return; }
+        const fd: FieldDecl* = DeclarationNode::field_of(h);
         this.text = "field " + this.path(owner) + "::" + this.ctx.intern_table.resolve(fd.name)
             + ": " + this.names.type_text_written(fd.resolved_type, fd.type_annotation);
-        this.doc = fd.documentation;
+        this.doc = h.documentation;
     }
 
     variant(mut &this, owner: DefId, ordinal: i64) -> void {
-        const v: EnumVariantNode* = Members::variant_decl(this.ctx, owner, ordinal);
+        const v: DeclarationNode* = Members::variant_decl(this.ctx, owner, ordinal);
         if (v == null) { return; }
-        this.text = this.path(owner) + "::" + this.ctx.intern_table.resolve(v.name);
+        this.text = this.path(owner) + "::"
+            + this.ctx.intern_table.resolve(DeclarationNode::variant_of(v).name);
         this.doc = v.documentation;
     }
 
@@ -244,17 +248,17 @@ type struct Shown {
             mut line: Shown = Shown::new(this.names);
             match (&all[i]) {
                 Member::Field(o, k) => {
-                    const fd: FieldDeclNode* = Members::field_decl(this.ctx, o, k);
+                    const fd: FieldDecl* = DeclarationNode::field_of(Members::field_decl(this.ctx, o, k));
                     if (fd != null) {
                         line.text = this.ctx.intern_table.resolve(fd.name) + ": " + this.type_text(fd.resolved_type);
                     }
                 }
                 Member::Variant(o, k) => {
-                    const v: EnumVariantNode* = Members::variant_decl(this.ctx, o, k);
+                    const v: EnumVariant* = DeclarationNode::variant_of(Members::variant_decl(this.ctx, o, k));
                     if (v != null) { line.text = this.ctx.intern_table.resolve(v.name); }
                 }
                 Member::Method(m) => {
-                    if (m.func.def.is_valid()) { line.def(m.func.def); }
+                    if (DeclarationNode::fn_of(m.func).def.is_valid()) { line.def(DeclarationNode::fn_of(m.func).def); }
                 }
             }
             if (line.text.length() == 0) { continue; }

@@ -89,7 +89,7 @@ public function handle_code_lens(docs: mut &docs::Docs, projects: mut &session::
 
 // ImplLensBuilder - "N implementations" lenses above type / trait decls.
 //
-// For each top-level struct / class / enum / union / trait in the
+// For each top-level struct / enum / union / trait in the
 // document, count the impl blocks targeting it (types) or implementing
 // it (traits) across the module graph, and emit a code lens whose
 // command opens a VS Code reference peek over the implementation sites.
@@ -107,30 +107,28 @@ type struct ImplLensBuilder {
         if (ast == null) { return; }
 
         for (mut si: i64 = 0; si < ast.statements.length; si++) {
-            const stmt: node::ASTNode* = node_locator::NodeLocator::unwrap_decl_stmt(ast.statements[si]);
+            const item: node::Node = node_locator::NodeLocator::unwrap_decl_stmt(ast.statements[si]);
+            const stmt: declaration::DeclarationNode* = item.as_decl();
             if (stmt == null || stmt.generated) { continue; }
 
             // Which declarations get a lens: a type, by the implementations
             // targeting it, and a trait, by the implementations of it.
             mut def: DefId = DefId::invalid();
             mut is_trait: boolean = false;
-            match (stmt.kind) {
-                ast::NodeKind::StructDeclaration => { def = (stmt as declaration::StructDeclNode*).def; }
-                ast::NodeKind::ClassDeclaration  => { def = (stmt as declaration::ClassDeclNode*).def; }
-                ast::NodeKind::EnumDeclaration   => { def = (stmt as declaration::EnumDeclNode*).def; }
-                ast::NodeKind::UnionDeclaration  => { def = (stmt as declaration::UnionDeclNode*).def; }
-                ast::NodeKind::TraitDeclaration  => {
-                    def = (stmt as declaration::TraitDeclNode*).def;
-                    is_trait = true;
-                }
-                _ => { }
-            }
+            const sd: declaration::StructDecl* = declaration::DeclarationNode::struct_of(stmt);
+            if (sd != null) { def = sd.def; }
+            const en: declaration::EnumDecl* = declaration::DeclarationNode::enum_of(stmt);
+            if (en != null) { def = en.def; }
+            const tr: declaration::TraitDecl* = declaration::DeclarationNode::trait_of(stmt);
+            if (tr != null) { def = tr.def; is_trait = true; }
+            const un: declaration::UnionDecl* = declaration::DeclarationNode::union_of(stmt);
+            if (un != null) { def = un.def; }
             if (!def.is_valid()) { continue; }
 
             const spans: [source_span::SourceSpan] = ImplLensBuilder::impls_of(ctx, def, is_trait);
             if (spans.length == 0) { continue; }
 
-            const name_span: source_span::SourceSpan = node_locator::name_span_of(stmt);
+            const name_span: source_span::SourceSpan = node_locator::name_span_of(item);
             if (!name_span.has_location()) { continue; }
 
             lenses.push(ImplLensBuilder::build_impl_lens(positions, uri, name_span, &spans));
@@ -151,10 +149,10 @@ type struct ImplLensBuilder {
             if (prog == null) { continue; }
             const file: string = ctx.module_graph.modules[mi as i64].file_path;
             for (mut si: i64 = 0; si < prog.statements.length; si++) {
-                const stmt: node::ASTNode* = node_locator::NodeLocator::unwrap_decl_stmt(prog.statements[si]);
-                if (stmt == null || stmt.generated || stmt.kind != ast::NodeKind::ImplementationBlock) { continue; }
+                const stmt: declaration::DeclarationNode* = node_locator::NodeLocator::unwrap_decl_stmt(prog.statements[si]).as_decl();
+                if (stmt == null || stmt.generated || declaration::DeclarationNode::impl_of(stmt) == null) { continue; }
                 if (stmt.span.file == null || !stmt.span.file.eq(file)) { continue; }
-                const ib: declaration::ImplBlockNode* = stmt as declaration::ImplBlockNode*;
+                const ib: declaration::ImplBlock* = declaration::DeclarationNode::impl_of(stmt);
                 const named: DefId = if (is_trait) {
                     ImplLensBuilder::annotation_def(ib.trait_annotation)
                 } else {

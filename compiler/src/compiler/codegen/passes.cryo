@@ -56,7 +56,7 @@ import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::type_base::{ Type };
-import compiler::types::user_defined::{ ClassType, FieldInfo, StructType };
+import compiler::types::user_defined::{ FieldInfo, StructType };
 import std::fmt::interp::{ fmt_append_display, fmt_append_lit, fmt_new };
 import std::core::mem;
 import compiler::resolver::mangled_name::{ MangledName };
@@ -104,11 +104,10 @@ type struct LinkerConfig {
     ///     the cryo compiler itself needs (libLLVM-20 is C++); ordinary
     ///     cryo programs don't reference it but the symbol set is a no-op
     ///     so keeping it on the host line costs nothing.
-    ///   - x86_64 windows-gnu: `x86_64-w64-mingw32-gcc -lm`, `.exe` suffix,
-    ///     archive no.  mingw-w64 ships its own libc/libm equivalents; no
-    ///     C++ runtime to pull in for cross-compiled cryo programs (the
-    ///     compiler binary itself isn't cross-compilable yet - it links
-    ///     libLLVM, which has no Windows-gnu shim in this checkout).
+    ///   - x86_64 windows-gnu: the driver `windows_gnu_link_driver` names
+    ///     (clang + lld on a POSIX host), `-lm`, `.exe` suffix, archive no.
+    ///     mingw-w64 ships its own libc/libm equivalents; no C++ runtime to
+    ///     pull in for cross-compiled cryo programs.
     ///   - anything else (aarch64, riscv, windows-msvc, ...): unsupported;
     ///     `run_linking` falls back to the object-files-only bailout that
     ///     prints a manual-link hint.
@@ -130,7 +129,7 @@ type struct LinkerConfig {
                 && triple.contains("gnu")
                 && triple.contains("x86_64")) {
             return LinkerConfig {
-                driver:             CodegenPasses::pick_link_driver("x86_64-w64-mingw32-gcc"),
+                driver:             LinkerConfig::windows_gnu_link_driver(),
                 // `-lws2_32` for std::net (Winsock) and `-lntdll` for the
                 // async reactor (its readiness backend polls `\Device\Afd`
                 // through the NT layer); mingw auto-links neither, the way it
@@ -183,6 +182,23 @@ type struct LinkerConfig {
         };
     }
 
+    /// The driver a build for x86_64 windows-gnu links with when that is
+    /// not the host.  A POSIX-hosted compiler drives clang at the mingw
+    /// target with lld: binutils-mingw-w64's GNU ld (2.41 on Ubuntu 24.04)
+    /// places a base relocation over every thread-local's section-relative
+    /// offset, so once the loader moves the image the program faults on its
+    /// first thread-local access, and lld does not.  `CRYO_CC` overrides
+    /// either (`pick_link_driver`).
+    ![target(unix)]
+    static windows_gnu_link_driver() -> string {
+        return CodegenPasses::pick_link_driver("clang-20 --target=x86_64-w64-mingw32 -fuse-ld=lld");
+    }
+
+    ![target(windows)]
+    static windows_gnu_link_driver() -> string {
+        return CodegenPasses::pick_link_driver("x86_64-w64-mingw32-gcc");
+    }
+
     ![target(windows)]
     static host_linker_config() -> LinkerConfig {
         return LinkerConfig {
@@ -226,6 +242,20 @@ type struct CodegenPasses {
     /// here, as it would have been (a linker's warnings).  The log is
     /// removed on success and kept on failure, beside the response file.
     static run_tool(cmd_text: string, log_path_text: string, out: string*) -> i32 {
+        const log_path: string = log_path_text;
+        const rc: i32 = CodegenPasses::capture_tool(cmd_text, log_path_text, out);
+        const text: string = *out;
+        if (rc == 0) {
+            if (text.length() > 0) { fmt::eprintf("%s", text); }
+            dir::remove_file(Path::from(log_path));
+        }
+        return rc;
+    }
+
+    /// Run a toolchain command with its combined output captured to
+    /// `log_path`, and answer its exit code, the output in `*out`.  The log
+    /// is left in place and nothing is printed: the caller decides both.
+    static capture_tool(cmd_text: string, log_path_text: string, out: string*) -> i32 {
         const cmd: string = cmd_text;
         const log_path: string = log_path_text;
         const rc: i32 = Command::shell(fmt::format("%s > %s 2>&1", cmd,
@@ -236,11 +266,22 @@ type struct CodegenPasses {
             Result::Err(_) => { }
         }
         *out = text;
-        if (rc == 0) {
-            if (text.length() > 0) { fmt::eprintf("%s", text); }
-            dir::remove_file(Path::from(log_path));
-        }
         return rc;
+    }
+
+    /// Whether the link driver's toolchain takes its unwinder from libgcc:
+    /// the driver resolves `libgcc_eh.a` to a path (`-print-file-name` echoes
+    /// the bare name back when the file is not in its search dirs).  A
+    /// toolchain without it unwinds through LLVM's libunwind instead.  The
+    /// probe's output goes to `log_path`, which is removed afterwards.
+    static unwinds_with_libgcc(driver_text: string, log_path_text: string) -> boolean {
+        const driver: string = driver_text;
+        mut out: string = "";
+        const rc: i32 = CodegenPasses::capture_tool(
+            fmt::format("%s -print-file-name=libgcc_eh.a", driver), log_path_text, &out);
+        dir::remove_file(Path::from(log_path_text));
+        const answer: string = out;
+        return rc == 0 && (answer.contains("/") || answer.contains("\\"));
     }
 
     /// The error for a toolchain command that failed: what ran, where its
@@ -323,7 +364,8 @@ type struct CodegenPasses {
     /// benefit (identical ABI).  An LLVM-libunwind / freestanding combination
     /// that needs an explicit unwinder is a follow-up (a `[link]`-config knob).
     static append_hosted_runtime_libs(ctx: CompilationContext*, cmd_text: string,
-                                      triple_text: string) -> string {
+                                      triple_text: string, driver_text: string,
+                                      probe_log_text: string) -> string {
         const cmd: string = cmd_text;
         const triple: string = triple_text;
         const lib_dir: string = CodegenPasses::resolve_runtime_lib_dir(ctx, triple_text, true);
@@ -339,38 +381,32 @@ type struct CodegenPasses {
         };
         out = fmt::format("%s %s", out, CodegenPasses::link_quote(
             fmt::format("%s/%s", lib_dir, archive)));
-        // Windows resolves the `_Unwind_*` ABI through LLVM's libunwind rather
-        // than libgcc_s, and the mingw clang driver links it SHARED whenever the
-        // toolchain ships `libunwind.dll.a` - which makes every binary we emit
-        // carry a runtime `libunwind.dll` import.  That is wrong twice over: a
-        // shipped `cryo.exe` would need a loose DLL beside it, and any stage of
-        // the self-host chain that runs a freshly linked compiler dies before
-        // main with STATUS_DLL_NOT_FOUND (c0000135) and an empty log.  Take the
-        // static `libunwind.a` instead: `--unwindlib=none` stops the driver
-        // adding its own shared one, and the `-Bstatic`/`-Bdynamic` bracket
-        // pins OUR `-lunwind` to the archive while leaving every other library
-        // (kernel32, ntdll, the CRT) dynamic.  `-lunwind` stays un-pathed so it
-        // resolves from the active toolchain's own lib dir.
+        // A windows toolchain built on LLVM's runtimes (llvm-mingw) resolves the
+        // `_Unwind_*` ABI through libunwind, and its clang driver links that
+        // SHARED whenever the toolchain ships `libunwind.dll.a` - which makes
+        // every binary we emit carry a runtime `libunwind.dll` import.  That is
+        // wrong twice over: a shipped `cryo.exe` would need a loose DLL beside
+        // it, and any stage of the self-host chain that runs a freshly linked
+        // compiler dies before main with STATUS_DLL_NOT_FOUND (c0000135) and an
+        // empty log.  Take the static `libunwind.a` instead: `--unwindlib=none`
+        // stops the driver adding its own shared one, and the
+        // `-Bstatic`/`-Bdynamic` bracket pins OUR `-lunwind` to the archive
+        // while leaving every other library (kernel32, ntdll, the CRT) dynamic.
+        // `-lunwind` stays un-pathed so it resolves from the active toolchain's
+        // own lib dir.
         //
         // Scoped to windows on purpose: a hosted glibc link must NOT gain an
         // explicit `-lunwind` (see this function's contract above) - such hosts
         // ship `libunwind.so.8` with no `.so` dev symlink and the link fails.
         //
-        // Scoped to a CLANG driver too, and that is not cosmetic: the default
-        // windows-gnu driver is `x86_64-w64-mingw32-gcc`, which resolves
-        // `_Unwind_*` from its own libgcc, ships no libunwind to link, and
-        // rejects `--unwindlib` outright ("unrecognized command line option").
-        // Adding these unconditionally turns a working mingw-gcc cross-link
-        // into a hard failure.  Resolved through `pick_link_driver` with the
-        // same default the windows link config uses, so this sees exactly the
-        // driver the command was built with - including a `CRYO_CC` override,
-        // which is how the self-host chain selects llvm-mingw's clang.
-        if (triple.contains("windows")) {
-            const driver: string =
-                CodegenPasses::pick_link_driver("x86_64-w64-mingw32-gcc");
-            if (driver.contains("clang")) {
-                out = fmt::format("%s --unwindlib=none -Wl,-Bstatic -lunwind -Wl,-Bdynamic", out);
-            }
+        // Scoped to a toolchain WITHOUT libgcc's unwinder too, and asked of the
+        // toolchain rather than read off the driver's name: a mingw-w64 gcc, or
+        // a clang driving the same gcc sysroot, resolves `_Unwind_*` from
+        // `libgcc_eh`, ships no libunwind to link, and a gcc driver rejects
+        // `--unwindlib` outright ("unrecognized command line option").
+        if (triple.contains("windows")
+                && !CodegenPasses::unwinds_with_libgcc(driver_text, probe_log_text)) {
+            out = fmt::format("%s --unwindlib=none -Wl,-Bstatic -lunwind -Wl,-Bdynamic", out);
         }
         if (ctx.options.static_link) {
             return out;
@@ -652,7 +688,7 @@ type struct CodegenPasses {
         for (mut i: i64 = 0; i < arena.types.length; i++) {
             const t: Type* = arena.types[i];
             if (t == null) { continue; }
-            if (t.kind != TypeKind::Struct && t.kind != TypeKind::Class) { continue; }
+            if (t.kind != TypeKind::Struct) { continue; }
             nominal += 1;
 
             // Only types this module put through the type mapper: mapping one
@@ -675,7 +711,7 @@ type struct CodegenPasses {
             // body -- which this comparison, and only this comparison, sees.
             mut lit_size: u64 = 0;
             if (t.kind == TypeKind::Struct) {
-                const st0: StructType* = t as StructType*;
+                const st0: StructType* = t.as_struct();
                 const nf: u32 = st0.fields.length as u32;
                 if (!st0.is_union && nf > 0) {
                     const fbuf: void* = libc::malloc(nf as u64 * 8);
@@ -699,21 +735,11 @@ type struct CodegenPasses {
             }
 
             examined += 1;
-            mut name:      string = "<anon>";
-            mut min_align: u64    = 0;
-            mut nargs:     i64    = 0;
-            mut kind:      string = "C";
-            if (t.kind == TypeKind::Struct) {
-                const st: StructType* = t as StructType*;
-                name      = ctx.intern_table.shown(st.qualified_name);
-                min_align = st.min_alignment;
-                nargs     = st.type_args.length;
-                kind      = "S";
-            } else {
-                const cl: ClassType* = t as ClassType*;
-                name      = ctx.intern_table.shown(cl.qualified_name);
-                min_align = cl.min_alignment;
-            }
+            const st: StructType* = t.as_struct();
+            const name:      string = ctx.intern_table.shown(st.qualified_name);
+            const min_align: u64    = st.min_alignment;
+            const nargs:     i64    = st.type_args.length;
+            const kind:      string = "S";
 
             // WHERE each field lives, not just how big the type is.  Size and
             // alignment can both agree while the offsets do not: an
@@ -723,21 +749,11 @@ type struct CodegenPasses {
             // index comes from `field_element_index` - the same routine the
             // body was built from and every field GEP addresses through - so
             // this compares the mapping against LLVM's own layout rather than
-            // re-deriving it.  A class is checked on its OWN fields: an
-            // ancestor's recorded offset is relative to that ancestor's
-            // layout, and every class is audited in its own right anyway.
+            // re-deriving it.
             mut off_bad: i64 = 0;
             {
-                const empty_fields: [FieldInfo] = [];
-                mut fields_ref: &[FieldInfo] = &empty_fields;
-                mut skip: boolean = false;
-                if (t.kind == TypeKind::Struct) {
-                    const st1: StructType* = t as StructType*;
-                    if (st1.is_union) { skip = true; }
-                    fields_ref = &st1.fields;
-                } else {
-                    fields_ref = &(t as ClassType*).fields;
-                }
+                const fields_ref: &[FieldInfo] = &st.fields;
+                const skip: boolean = st.is_union;
                 const n_elems: i64 = llvm::LLVMCountStructElementTypes(mapped.raw) as i64;
                 if (!skip) {
                     for (mut fi: i64 = 0; fi < (*fields_ref).length; fi++) {
@@ -861,7 +877,7 @@ type struct CodegenPasses {
         // so sub-emitters can hold stable `state: VisitorState*` back-pointers
         // into `gen.state`; same two-phase pattern as `CodegenContext` above.
         cdebug("[Codegen] Step 12: Creating IRGeneratorVisitor...\n");
-        const _box_gen: Box<IRGeneratorVisitor> = Box::<IRGeneratorVisitor>::new(IRGeneratorVisitor(cg));
+        const _box_gen: Box<IRGeneratorVisitor> = Box::<IRGeneratorVisitor>::new(IRGeneratorVisitor::new(cg));
         const gen: IRGeneratorVisitor* = _box_gen.leak();
         // Two-phase init step 2: wire back-pointers on sub-emitters now
         // that `gen` is at its stable heap address.  No-op while the
@@ -1720,7 +1736,8 @@ type struct CodegenPasses {
         if (cfg.no_runtime) {
             cmd = CodegenPasses::append_runtime_tier_libs(ctx, cmd, effective_triple);
         } else {
-            cmd = CodegenPasses::append_hosted_runtime_libs(ctx, cmd, effective_triple);
+            cmd = CodegenPasses::append_hosted_runtime_libs(ctx, cmd, effective_triple,
+                link_cfg.driver, fmt::format("%s.probe", link_rsp_path));
         }
         // Cryo runtime support is fully inline-lowered: every intrinsic
         // with a kind (ptr_diff, fpclass, atomic_*, dirent_*, ...) is
@@ -1884,7 +1901,8 @@ type struct CodegenPasses {
         if (ctx.options.freestanding()) {
             cmd = CodegenPasses::append_runtime_tier_libs(ctx, cmd, raw_triple);
         } else {
-            cmd = CodegenPasses::append_hosted_runtime_libs(ctx, cmd, raw_triple);
+            cmd = CodegenPasses::append_hosted_runtime_libs(ctx, cmd, raw_triple,
+                link_cfg.driver, fmt::format("%s.probe", link_rsp_path));
             cmd = fmt::format("%s %s", cmd, link_cfg.extra_system_libs);
         }
 

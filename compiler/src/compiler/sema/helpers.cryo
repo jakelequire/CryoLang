@@ -14,26 +14,24 @@
 namespace compiler::sema::helpers;
 
 import compiler::ast;
-import compiler::ast::{ LiteralKind, NodeKind };
+import compiler::ast::{ LiteralKind };
 import compiler::const_table;
 import compiler::const_table::{ ConstEval };
 import compiler::resolver::symbol_str;
-import compiler::ast::node;
-import compiler::ast::node::{ ASTNode };
 import compiler::lex::{ TokenType };
 import compiler::ast::expression;
 import compiler::ast::expression::{
-    BinaryExprNode, ExpressionNode, LiteralNode, UnaryExprNode
+    BinaryExpr, ExpressionNode, LiteralExpr, UnaryExpr
 };
 import compiler::lex;
 import compiler::lex::lexer;
 import compiler::lex::lexer::{ Lexer };
 import compiler::types;
-import compiler::types::{ TypeKind };
+import compiler::types::{ FloatKind, IntegerKind, TypeKind };
 import compiler::types::type_ref;
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::type_base;
-import compiler::types::type_base::{ FloatType, IntType, Type };
+import compiler::types::type_base::{ Type };
 import compiler::types::arena;
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound;
@@ -105,14 +103,13 @@ public function sema_numeric_suffix_type(arena: TypeArena*, suffix_text: Keyword
 /// a type parameter from it rather than skipping it as an adoptable default.
 public function sema_expr_has_numeric_suffix(expr: ExpressionNode*) -> boolean {
     if (expr == null) { return false; }
-    const node: ASTNode* = expr as ASTNode*;
-    if (node.kind == NodeKind::Literal) {
-        const lit: LiteralNode* = expr as LiteralNode*;
+    const lit: LiteralExpr* = ExpressionNode::literal_of(expr);
+    if (lit != null) {
         return lit.suffix != "";
     }
-    if (node.kind == NodeKind::UnaryExpression) {
-        const u: UnaryExprNode* = expr as UnaryExprNode*;
-        if (u.op.kind == TokenType::Minus || u.op.kind == TokenType::Plus || u.op.kind == TokenType::Tilde) {
+    const u: UnaryExpr* = ExpressionNode::unary_of(expr);
+    if (u != null) {
+        if (u.op.kind == TokenType::Minus || u.op.kind == TokenType::Tilde) {
             return sema_expr_has_numeric_suffix(u.operand);
         }
         return false;
@@ -120,8 +117,8 @@ public function sema_expr_has_numeric_suffix(expr: ExpressionNode*) -> boolean {
     // An arithmetic constant is suffix-typed when EITHER operand names a type:
     // `1u64 << 40` is a u64 shift, and treating the whole expression as
     // polymorphic would re-type it back to the default width.
-    if (node.kind == NodeKind::BinaryExpression) {
-        const b: BinaryExprNode* = expr as BinaryExprNode*;
+    const b: BinaryExpr* = ExpressionNode::binary_of(expr);
+    if (b != null) {
         return sema_expr_has_numeric_suffix(b.left)
             || sema_expr_has_numeric_suffix(b.right);
     }
@@ -135,21 +132,18 @@ public function sema_expr_has_numeric_suffix(expr: ExpressionNode*) -> boolean {
 /// expression is not a plain integer literal / not a valid index.
 public function sema_const_int_index(expr: ExpressionNode*) -> i64 {
     if (expr == null) { return -1; }
-    const node: ASTNode* = expr as ASTNode*;
-    if (node.kind != NodeKind::Literal) { return -1; }
-    const lit: LiteralNode* = expr as LiteralNode*;
-    if (lit.literal_kind != LiteralKind::Integer) { return -1; }
+    const lit: LiteralExpr* = ExpressionNode::literal_of(expr);
+    if (lit == null || lit.literal_kind != LiteralKind::Integer) { return -1; }
     return parse_tuple_index(lit.value);
 }
 
 /// True when `expr` is a bare integer or float literal node.  Negative literals
-/// (`-5`) parse as a UnaryExpression wrapping the literal and are NOT matched
+/// (`-5`) parse as a unary minus wrapping the literal and are NOT matched
 /// here - see `is_negative_numeric_literal_expr`.
 public function is_numeric_literal_expr(expr: ExpressionNode*) -> boolean {
     if (expr == null) { return false; }
-    const node: ASTNode* = expr as ASTNode*;
-    if (node.kind != NodeKind::Literal) { return false; }
-    const lit: LiteralNode* = expr as LiteralNode*;
+    const lit: LiteralExpr* = ExpressionNode::literal_of(expr);
+    if (lit == null) { return false; }
     return lit.literal_kind == LiteralKind::Integer
         || lit.literal_kind == LiteralKind::Float;
 }
@@ -163,21 +157,20 @@ public function is_numeric_literal_expr(expr: ExpressionNode*) -> boolean {
 /// produce bool, not a numeric the slot could adopt.
 public function is_constant_numeric_expr(expr: ExpressionNode*) -> boolean {
     if (expr == null) { return false; }
-    const node: ASTNode* = expr as ASTNode*;
-    if (node.kind == NodeKind::Literal) {
-        const lit: LiteralNode* = expr as LiteralNode*;
+    const lit: LiteralExpr* = ExpressionNode::literal_of(expr);
+    if (lit != null) {
         return lit.literal_kind == LiteralKind::Integer
             || lit.literal_kind == LiteralKind::Float;
     }
-    if (node.kind == NodeKind::UnaryExpression) {
-        const u: UnaryExprNode* = expr as UnaryExprNode*;
-        if (u.op.kind == TokenType::Minus || u.op.kind == TokenType::Plus || u.op.kind == TokenType::Tilde) {
+    const u: UnaryExpr* = ExpressionNode::unary_of(expr);
+    if (u != null) {
+        if (u.op.kind == TokenType::Minus || u.op.kind == TokenType::Tilde) {
             return is_constant_numeric_expr(u.operand);
         }
         return false;
     }
-    if (node.kind == NodeKind::BinaryExpression) {
-        const b: BinaryExprNode* = expr as BinaryExprNode*;
+    const b: BinaryExpr* = ExpressionNode::binary_of(expr);
+    if (b != null) {
         const op: TokenType = b.op.kind;
         const is_arith: boolean =
             op == TokenType::Plus || op == TokenType::Minus || op == TokenType::Star || op == TokenType::Slash || op == TokenType::Percent
@@ -197,8 +190,8 @@ public function is_wide_int_type(arena: TypeArena*, ty: TypeRef) -> boolean {
     if (!ty.is_valid()) { return false; }
     const t: Type* = arena.lookup(ty);
     if (t == null || t.kind != TypeKind::Int) { return false; }
-    const it: IntType* = t as IntType*;
-    return it.int_kind.bit_width() >= 64;
+    const it: IntegerKind = t.int_kind();
+    return it.bit_width() >= 64;
 }
 
 /// True when `ty` is a narrower-than-f64 float type.  Gates pushing a param
@@ -210,7 +203,7 @@ public function is_narrow_float_type(arena: TypeArena*, ty: TypeRef) -> boolean 
     if (!ty.is_valid()) { return false; }
     const t: Type* = arena.lookup(ty);
     if (t == null || t.kind != TypeKind::Float) { return false; }
-    const ft: FloatType* = t as FloatType*;
+    const ft: FloatKind = t.float_kind();
     return ft.bit_width() < 64;
 }
 
@@ -228,16 +221,15 @@ public function is_adoptable_numeric_type(arena: TypeArena*, ty: TypeRef) -> boo
         || t.kind == TypeKind::Char;
 }
 
-/// True when `expr` is a negated numeric literal: a `-`-operator UnaryExpression
-/// wrapping an integer/float literal.  The inner magnitude needs the surrounding
+/// True when `expr` is a negated numeric literal: a unary `-` wrapping an
+/// integer/float literal.  The inner magnitude needs the surrounding
 /// expected type pushed onto it - otherwise it defaults to i32 and a wide bit
 /// pattern (i64::MIN's 2^63 magnitude) truncates to its low 32 bits, which
 /// negate to 0.
 public function is_negative_numeric_literal_expr(expr: ExpressionNode*) -> boolean {
     if (expr == null) { return false; }
-    const node: ASTNode* = expr as ASTNode*;
-    if (node.kind != NodeKind::UnaryExpression) { return false; }
-    const u: UnaryExprNode* = expr as UnaryExprNode*;
+    const u: UnaryExpr* = ExpressionNode::unary_of(expr);
+    if (u == null) { return false; }
     if (u.op.kind != TokenType::Minus) { return false; }
     return is_numeric_literal_expr(u.operand);
 }
@@ -246,10 +238,8 @@ public function is_negative_numeric_literal_expr(expr: ExpressionNode*) -> boole
 /// ignoring digit separators: `0`, `0x0`, `0b0`, `00`, `0_0`, ...
 public function is_zero_int_literal(expr: ExpressionNode*) -> boolean {
     if (expr == null) { return false; }
-    const node: ASTNode* = expr as ASTNode*;
-    if (node.kind != NodeKind::Literal) { return false; }
-    const lit: LiteralNode* = expr as LiteralNode*;
-    if (lit.literal_kind != LiteralKind::Integer) { return false; }
+    const lit: LiteralExpr* = ExpressionNode::literal_of(expr);
+    if (lit == null || lit.literal_kind != LiteralKind::Integer) { return false; }
     return int_literal_text_is_zero(lit.value);
 }
 

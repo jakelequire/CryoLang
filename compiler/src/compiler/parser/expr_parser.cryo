@@ -1,8 +1,8 @@
 ///! ExprParser
 ///!
-///! Expression and type annotation parsing layer.  Extends ParserBase with
-///! Pratt-style precedence-climbing for binary operators, prefix/postfix
-///! unary handling, and recursive type annotation parsing.
+///! `Parser`'s expression and type annotation parsing: Pratt-style
+///! precedence-climbing for binary operators, prefix/postfix unary
+///! handling, and recursive type annotation parsing.
 
 namespace compiler::parser::expr_parser;
 
@@ -19,8 +19,9 @@ import compiler::diag::source_span::{ SourceSpan };
 import compiler::ast;
 import compiler::ast::{
     ArrayAnnotation, declaration, expression, FunctionAnnotation, GenericAnnotation,
-    ImplTraitAnnotation, LiteralKind, MemberPin, NamedAnnotation, node, NodeKind, pattern,
-    PatternBinding, PatternElement, PatternKind, PatternLiteralFloat, PatternLiteralInt,
+    ImplTraitAnnotation, LiteralKind, MemberPin, NamedAnnotation, node, ObjectAnnotation,
+    ObjectForm, pattern,
+    PatternBinding, PatternElement, PatternLiteralFloat, PatternLiteralInt,
     PatternSub, PatternWildcard, PointerAnnotation, PrimitiveAnnotation,
     ProjectionAnnotation, ReferenceAnnotation, statement, ThisTypeAnnotation,
     TupleAnnotation, TypeAnnotation, TypeofAnnotation
@@ -34,8 +35,8 @@ import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, Res, ResSlot };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
-import compiler::parser::parser_base;
-import compiler::parser::parser_base::{ ParserBase };
+import compiler::parser::cursor;
+import compiler::parser::cursor::{ Parser };
 import utils::logger;
 import utils::logger::{ LOG_DEBUG, LogComponent };
 import compiler::diag::diagnostic;
@@ -48,20 +49,19 @@ import compiler::types::generic_registry;
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import std::fmt;
-import compiler::ast::declaration::{ VarDeclNode };
+import compiler::ast::declaration::{ DeclarationNode, DeclKind, VarDecl };
 import compiler::ast::expression::{
-    AlignofExprNode, ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode,
-    CallExprNode, CastExprNode, DeleteExprNode, ExpressionNode, FieldInit, IdentifierNode,
-    IfExprNode, LambdaExprNode, LiteralNode, MatchExprNode, MemberAccessNode, NewExprNode,
-    ScopeResolutionNode, SizeofExprNode, StaticMatchExprNode, StructLiteralNode,
-    TernaryExprNode, TryExprNode, TupleLiteralNode, TypeofExprNode, UnaryExprNode,
-    YieldExprNode
+    ArrayExpr, BinaryExpr,
+    CallExpr, ExpressionNode, FieldInit, IdentifierExpr,
+    LambdaExpr, MatchExpr, MemberAccessExpr, NewExpr,
+    ScopeResolutionExpr, StaticMatchExpr, StructExpr,
+    TupleExpr, UnaryExpr
 };
-import compiler::ast::node::{ ASTNode };
 import compiler::ast::pattern::{
-    EnumPatternNode, MatchArmNode, PatternNode, StaticMatchArmNode
+    EnumPattern, LiteralPattern, MatchArmNode, Pattern, PatternKind, RangePattern,
+    StaticMatchArmNode
 };
-import compiler::ast::statement::{ BlockStmtNode, ExprStmtNode, MatchStmtNode, StatementNode };
+import compiler::ast::statement::{ MatchStmt, Stmt, StmtKind };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
 
@@ -79,12 +79,7 @@ mut g_coalesce_counter: u32 = 0;
 public mut g_for_in_counter: u32 = 0;
 
 
-type class ExprParser : ParserBase {
-public:
-    ExprParser(tokens: [Token], source_file: string, ctx: CompilationContext*)
-        : ParserBase(tokens, source_file, ctx) {
-    }
-
+implement struct Parser {
 
     // Expression Parsing: Entry Points
 
@@ -119,8 +114,8 @@ public:
                     "expected expression after assignment operator");
                 return left;
             }
-            const span: SourceSpan = ParserBase::merge_spans(left.span, right.span);
-            return new BinaryExprNode(op, left, right, span);
+            const span: SourceSpan = Parser::merge_spans(left.span, right.span);
+            return ExpressionNode::binary_expr(op, left, right, span);
         }
 
         return left;
@@ -158,7 +153,7 @@ public:
                     fmt::format("expected expression after '%s'", op.lexeme));
                 return left;
             }
-            const span: SourceSpan = ParserBase::merge_spans(left.span, right.span);
+            const span: SourceSpan = Parser::merge_spans(left.span, right.span);
             if (op.kind == TokenType::PipeGreater) {
                 // x |> f : f is `right`, piped value is `left`, prepend.
                 left = this.desugar_pipe(right, left, true, span);
@@ -188,7 +183,7 @@ public:
                     "expected expression after '??'");
                 return left;
             }
-            const span: SourceSpan = ParserBase::merge_spans(left.span, right.span);
+            const span: SourceSpan = Parser::merge_spans(left.span, right.span);
             left = this.desugar_null_coalesce(left, right, span,
                                               this.span_from_token(op_tok));
         }
@@ -196,14 +191,14 @@ public:
     }
 
     /// Build a call from a pipe operator.  `callable` is the function side
-    /// (an existing CallExprNode whose argument list we extend, or a bare
+    /// (an existing CallExpr whose argument list we extend, or a bare
     /// callable (identifier, member access, or scope resolution) that we
     /// wrap in a fresh call).  `value` is the piped operand; `prepend` puts
     /// it first (`|>`), otherwise last (`<|`).
     desugar_pipe(callable: ExpressionNode*, value: ExpressionNode*,
                  prepend: boolean, span: SourceSpan) -> ExpressionNode* {
-        if (callable.kind == NodeKind::CallExpression) {
-            mut call: CallExprNode* = callable as CallExprNode*;
+        if (ExpressionNode::call_of(callable) != null) {
+            mut call: CallExpr* = ExpressionNode::call_of(callable);
             mut new_args: [ExpressionNode*] = [];
             if (prepend) {
                 new_args.push(value);
@@ -217,14 +212,14 @@ public:
                 new_args.push(value);
             }
             call.arguments = new_args;
-            call.span = span;
-            return call as ExpressionNode*;
+            callable.span = span;
+            return callable;
         }
         // Bare callable: wrap it in a fresh call with the piped value as
         // the sole argument.
-        mut call: CallExprNode* = new CallExprNode(callable, span);
-        call.add_argument(value);
-        return call as ExpressionNode*;
+        mut call: ExpressionNode* = ExpressionNode::call_expr(callable, span);
+        ExpressionNode::call_of(call).add_argument(value);
+        return call;
     }
 
     /// `a ?? b` => `match (a) { Option::Some(v) => { v } Option::None => { b } }`.
@@ -247,35 +242,34 @@ public:
         const bind_str:  string    = fmt::format("__cryo_coalesce_%u", g_coalesce_counter);
         const bind_name: SymbolStr = this.ctx.intern(bind_str);
 
-        mut match_expr: MatchExprNode* = new MatchExprNode(left, span);
+        const match_expr: ExpressionNode* = ExpressionNode::match_expr(left, span);
+        mut coalesce: MatchExpr* = ExpressionNode::match_of(match_expr);
 
         // Some(v) => { v }
-        mut some_pat: EnumPatternNode* = this.lang_variant_pattern(LangItem::Option, "Some", op_span);
+        const some_pat: Pattern* = this.lang_variant_pattern(LangItem::Option, "Some", op_span);
         const pb: PatternBinding* = new PatternBinding {
             name: bind_name, span: op_span, sym_id: SymbolID::invalid(),
             resolved_type: TypeRef::invalid(), written_mut: false
         };
-        some_pat.add_element(PatternElement::Binding(pb));
-        mut some_arm: MatchArmNode* = new MatchArmNode(op_span);
-        some_arm.add_pattern(some_pat as PatternNode*);
-        const some_ident: IdentifierNode* = new IdentifierNode(bind_name, op_span);
-        const some_stmt:  ExprStmtNode*   = new ExprStmtNode(some_ident as ExpressionNode*, op_span);
-        mut some_block: BlockStmtNode* = new BlockStmtNode(op_span);
-        some_block.add_statement(some_stmt as StatementNode*);
-        some_arm.set_body(some_block as StatementNode*);
-        match_expr.add_arm(some_arm);
+        some_pat.enum_payload().add_element(PatternElement::Binding(pb));
+        mut some_arm: MatchArmNode* = MatchArmNode::new(op_span);
+        some_arm.add_pattern(some_pat);
+        const some_ident: ExpressionNode* = ExpressionNode::identifier_expr(bind_name, op_span);
+        const some_block: Stmt* = Stmt::block(op_span);
+        some_block.as_block().add_statement(Stmt::expr_stmt(some_ident, op_span));
+        some_arm.set_body(some_block);
+        coalesce.add_arm(some_arm);
 
         // None => { b }
-        const none_pat: EnumPatternNode* = this.lang_variant_pattern(LangItem::Option, "None", op_span);
-        mut none_arm: MatchArmNode* = new MatchArmNode(op_span);
-        none_arm.add_pattern(none_pat as PatternNode*);
-        const none_stmt: ExprStmtNode* = new ExprStmtNode(right, right.span);
-        mut none_block: BlockStmtNode* = new BlockStmtNode(right.span);
-        none_block.add_statement(none_stmt as StatementNode*);
-        none_arm.set_body(none_block as StatementNode*);
-        match_expr.add_arm(none_arm);
+        const none_pat: Pattern* = this.lang_variant_pattern(LangItem::Option, "None", op_span);
+        mut none_arm: MatchArmNode* = MatchArmNode::new(op_span);
+        none_arm.add_pattern(none_pat);
+        const none_block: Stmt* = Stmt::block(right.span);
+        none_block.as_block().add_statement(Stmt::expr_stmt(right, right.span));
+        none_arm.set_body(none_block);
+        coalesce.add_arm(none_arm);
 
-        return match_expr as ExpressionNode*;
+        return match_expr;
     }
 
     /// `Item::variant` as a pattern, where `item` is an enum the language
@@ -288,12 +282,11 @@ public:
     /// a module declaring its own `Option` would otherwise have its enum
     /// matched against the language's value and refused.  The leaf stays on
     /// the node for a diagnostic to print.
-    lang_variant_pattern(item: LangItem, variant: string, span: SourceSpan) -> EnumPatternNode* {
-        mut pat: EnumPatternNode* = new EnumPatternNode(span);
-        pat.set_enum_name(this.ctx.intern(item.leaf()));
-        pat.set_variant_name(this.ctx.intern(variant));
-        pat.res = ResSlot::Lang(item);
-        this.ctx.note_lang_ref(pat as ASTNode*, item);
+    lang_variant_pattern(item: LangItem, variant: string, span: SourceSpan) -> Pattern* {
+        mut pat: Pattern* = Pattern::enum_variant(
+            this.ctx.intern(item.leaf()), this.ctx.intern(variant), span);
+        pat.enum_payload().res = ResSlot::Lang(item);
+        this.ctx.note_lang_ref(Node::Pattern(pat), item);
         return pat;
     }
 
@@ -330,8 +323,8 @@ public:
                     "expected expression after ':'");
                 return expr;
             }
-            const span: SourceSpan = ParserBase::merge_spans(expr.span, false_expr.span);
-            return new TernaryExprNode(expr, true_expr, false_expr, span);
+            const span: SourceSpan = Parser::merge_spans(expr.span, false_expr.span);
+            return ExpressionNode::ternary_expr(expr, true_expr, false_expr, span);
         }
 
         return expr;
@@ -375,8 +368,9 @@ public:
                 // `f<T>` as a value - since `<` after a name is a comparison.
                 // Name the spelling; the reader is otherwise sent to fix a
                 // comparison they never wrote.
-                if (op.kind == TokenType::RAngle && left.kind == NodeKind::BinaryExpression
-                        && (left as BinaryExprNode*).op.kind == TokenType::LAngle) {
+                const left_bin: BinaryExpr* = ExpressionNode::binary_of(left);
+                if (op.kind == TokenType::RAngle && left_bin != null
+                        && left_bin.op.kind == TokenType::LAngle) {
                     this.panic_mode = true;
                     this.error_count += 1;
                     mut diag: Diagnostic = Diagnostic::error(
@@ -391,7 +385,7 @@ public:
                     fmt::format("expected expression after '%s'", op.lexeme));
                 return left;
             }
-            const span: SourceSpan = ParserBase::merge_spans(left.span, right.span);
+            const span: SourceSpan = Parser::merge_spans(left.span, right.span);
             if (op.kind == TokenType::Spaceship) {
                 // `a <=> b` => `a.compare(&b)`.  Three-way comparison is
                 // sugar for the `Ord` trait method, so sema and codegen
@@ -400,20 +394,17 @@ public:
                 // `Ordering`.  `&b` matches `compare`'s `other: &This`.
                 const amp_tok: Token = Token::new(
                     TokenType::Amp, "&", op.line, op.column);
-                mut ref_right_node: UnaryExprNode* =
-                    new UnaryExprNode(amp_tok, right, right.span);
                 // Compiler-synthesized address-of a temporary: exempt from
                 // the user-facing "no address-of a literal" check (E0223).
-                ref_right_node.is_synthetic = true;
                 const ref_right: ExpressionNode* =
-                    ref_right_node as ExpressionNode*;
+                    ExpressionNode::synthetic_unary(amp_tok, right, right.span);
                 const compare_name: SymbolStr = this.ctx.intern("compare");
-                const member: MemberAccessNode* = new MemberAccessNode(
+                const member: ExpressionNode* = ExpressionNode::member_access_expr(
                     left, compare_name, this.span_from_token(op), span);
-                mut call: CallExprNode* =
-                    new CallExprNode(member as ExpressionNode*, span);
-                call.add_argument(ref_right);
-                left = call as ExpressionNode*;
+                mut call: ExpressionNode* =
+                    ExpressionNode::call_expr(member, span);
+                ExpressionNode::call_of(call).add_argument(ref_right);
+                left = call;
             } else if (op.kind == TokenType::DotDot ||
                        op.kind == TokenType::DotDotEq) {
                 // `a..b`  => `Range::new(a, b)`
@@ -426,17 +417,17 @@ public:
                     if (op.kind == TokenType::DotDotEq) { LangItem::RangeInclusive } else { LangItem::Range };
                 const ctor_scope: SymbolStr = this.ctx.intern(range_item.leaf());
                 const new_name: SymbolStr = this.ctx.intern("new");
-                mut sr: ScopeResolutionNode* = new ScopeResolutionNode(
+                const sr: ExpressionNode* = ExpressionNode::scope_resolution_expr(
                     ctor_scope, new_name, span);
-                sr.scope_res = ResSlot::Lang(range_item);
-                this.ctx.note_lang_ref(sr as ASTNode*, range_item);
-                mut call: CallExprNode* =
-                    new CallExprNode(sr as ExpressionNode*, span);
-                call.add_argument(left);
-                call.add_argument(right);
-                left = call as ExpressionNode*;
+                ExpressionNode::scope_resolution_of(sr).scope_res = ResSlot::Lang(range_item);
+                this.ctx.note_lang_ref(Node::Expr(sr), range_item);
+                mut call: ExpressionNode* =
+                    ExpressionNode::call_expr(sr, span);
+                ExpressionNode::call_of(call).add_argument(left);
+                ExpressionNode::call_of(call).add_argument(right);
+                left = call;
             } else {
-                left = new BinaryExprNode(op, left, right, span);
+                left = ExpressionNode::binary_expr(op, left, right, span);
             }
         }
 
@@ -486,8 +477,8 @@ public:
             } else if (!this.check(TokenType::Star)) {
                 target = this.parse_type_suffixes_q(target, pending_const, target_tok);
             }
-            const span: SourceSpan = ParserBase::merge_spans(expr.span, this.current_span());
-            expr = new CastExprNode(expr, target, span);
+            const span: SourceSpan = Parser::merge_spans(expr.span, this.current_span());
+            expr = ExpressionNode::cast_expr(expr, target, span);
         }
 
         return expr;
@@ -518,9 +509,9 @@ public:
                     fmt::format("expected expression after unary '%s'", op.lexeme));
                 return null;
             }
-            const span: SourceSpan = ParserBase::merge_spans(
+            const span: SourceSpan = Parser::merge_spans(
                 this.span_from_token(op), operand.span);
-            return new UnaryExprNode(op, operand, span);
+            return ExpressionNode::unary_expr(op, operand, span);
         }
 
         return this.parse_primary_with_postfix();
@@ -580,7 +571,7 @@ public:
                 expr = this.parse_member_access_expr(expr);
             } else if (this.check(TokenType::ColonColon)) {
                 // Scope resolution.  For chained paths like `alpha::utils::run`,
-                // join the prior `ScopeResolutionNode`'s scope and member into
+                // join the prior `ScopeResolutionExpr`'s scope and member into
                 // a single dotted scope name so the full qualifier is
                 // preserved on the new node.  Without this, the parser
                 // collapses `alpha::utils::run` to a node whose `scope_name`
@@ -591,8 +582,8 @@ public:
                 this.advance();
                 mut scope_name: SymbolStr = SymbolStr::empty();
                 mut carried_gen_args: [TypeAnnotation*] = [];
-                if (expr.kind == NodeKind::ScopeResolution) {
-                    const psr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
+                const psr: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(expr);
+                if (psr != null) {
                     // An impl-qualified path names one member of one
                     // implementation; folding it into a longer scope would
                     // drop the trait that qualifies it.
@@ -623,13 +614,12 @@ public:
                 } else {
                     scope_name = this.get_expr_name(expr);
                 }
-                const this_type_head: boolean = expr.kind == NodeKind::Identifier
-                    && (expr as IdentifierNode*).is_this_type_keyword;
-                mut sr: ScopeResolutionNode* = this.parse_scope_member(scope_name, carried_gen_args, expr.span);
-                sr.scope_is_this_type = this_type_head;
-                expr = sr as ExpressionNode*;
+                const head_id: IdentifierExpr* = ExpressionNode::identifier_of(expr);
+                const this_type_head: boolean = head_id != null && head_id.is_this_type_keyword;
+                expr = this.parse_scope_member(scope_name, carried_gen_args, expr.span);
+                ExpressionNode::scope_resolution_of(expr).scope_is_this_type = this_type_head;
             } else if (this.check(TokenType::LBrace)
-                       && expr.kind == NodeKind::ScopeResolution
+                       && ExpressionNode::scope_resolution_of(expr) != null
                        && !this.struct_lit_suppressed()
                        && this.is_struct_literal_ahead()) {
                 // Qualified struct literal at the tail of a *deep* scope path
@@ -642,7 +632,7 @@ public:
                 // field validation and miscompiling to garbage.  Mirrors the
                 // bare-name path's `is_struct_literal_ahead()` guard, so it
                 // adds no new ambiguity beyond what already applies there.
-                const sr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
+                const sr: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(expr);
                 const scope_s: string  = this.ctx.intern_table.resolve(sr.scope_name);
                 const member_s: string = this.ctx.intern_table.resolve(sr.member_name);
                 const qname: SymbolStr = this.ctx.intern_table.intern(
@@ -663,10 +653,10 @@ public:
                 // in parse_unary) leave is_postfix=false and yield the
                 // updated value.
                 const op: Token        = this.advance();
-                const span: SourceSpan = ParserBase::merge_spans(expr.span, this.span_from_token(op));
-                mut un: UnaryExprNode* = new UnaryExprNode(op, expr, span);
+                const span: SourceSpan = Parser::merge_spans(expr.span, this.span_from_token(op));
+                expr = ExpressionNode::unary_expr(op, expr, span);
+                mut un: UnaryExpr* = ExpressionNode::unary_of(expr);
                 un.is_postfix = true;
-                expr = un;
             } else if (this.check(TokenType::Question)
                        && this.peek_at(1).kind.question_terminates()) {
                 // Postfix try operator `expr?`.  The lookahead distinguishes
@@ -676,8 +666,8 @@ public:
                 // so the loop continues.  Sema lowers this to the
                 // equivalent `match` once the operand's type is known.
                 const op: Token        = this.advance();
-                const span: SourceSpan = ParserBase::merge_spans(expr.span, this.span_from_token(op));
-                expr = new TryExprNode(expr, span);
+                const span: SourceSpan = Parser::merge_spans(expr.span, this.span_from_token(op));
+                expr = ExpressionNode::try_expr(expr, span);
             } else {
                 break;
             }
@@ -714,19 +704,19 @@ public:
         if (tok.kind == TokenType::KwTrue || tok.kind == TokenType::KwFalse) {
             const btok: Token = this.advance();
             const value: string = btok.lexeme;
-            return new LiteralNode(value, LiteralKind::Boolean, this.span_from_token(btok));
+            return ExpressionNode::literal(value, LiteralKind::Boolean, this.span_from_token(btok));
         }
 
         if (tok.kind == TokenType::KwNull) {
             const ntok: Token = this.advance();
-            return new LiteralNode("null", LiteralKind::Null, this.span_from_token(ntok));
+            return ExpressionNode::literal("null", LiteralKind::Null, this.span_from_token(ntok));
         }
 
         if (tok.kind == TokenType::KwThis) {
             const ttok: Token = this.advance();
             const name: SymbolStr = this.intern_lexeme(ttok);
-            mut id: IdentifierNode* = new IdentifierNode(name, this.span_from_token(ttok));
-            id.is_this_keyword = true;
+            const id: ExpressionNode* = ExpressionNode::identifier_expr(name, this.span_from_token(ttok));
+            ExpressionNode::identifier_of(id).is_this_keyword = true;
             return id;
         }
 
@@ -796,15 +786,15 @@ public:
             }
             mut inner: ExpressionNode* = this.parse_paren_expr_or_lambda();
             if (inner == null) { return null; }
-            if (inner.kind != NodeKind::LambdaExpression) {
+            mut lambda: LambdaExpr* = ExpressionNode::lambda_of(inner);
+            if (lambda == null) {
                 this.report_error(ErrorCode::E0111_INVALID_SYNTAX,
                     "'move' must be followed by a lambda expression");
                 return null;
             }
-            mut lambda: LambdaExprNode* = inner as LambdaExprNode*;
             lambda.is_move = true;
-            lambda.span    = this.span_from(move_tok);
-            return lambda;
+            inner.span     = this.span_from(move_tok);
+            return inner;
         }
 
         // Parenthesized expression, tuple, or lambda
@@ -821,15 +811,15 @@ public:
         if (this.is_primitive_type_token()) {
             const ptok: Token = this.advance();
             const name: SymbolStr = this.intern_lexeme(ptok);
-            return new IdentifierNode(name, this.span_from_token(ptok));
+            return ExpressionNode::identifier_expr(name, this.span_from_token(ptok));
         }
 
         // Any remaining keyword used as identifier (for built-in function names, etc.)
         if (tok.kind.is_keyword()) {
             const ktok: Token = this.advance();
             const name: SymbolStr = this.intern_lexeme(ktok);
-            mut id: IdentifierNode* = new IdentifierNode(name, this.span_from_token(ktok));
-            id.is_this_type_keyword = ktok.kind == TokenType::KwThisType;
+            const id: ExpressionNode* = ExpressionNode::identifier_expr(name, this.span_from_token(ktok));
+            ExpressionNode::identifier_of(id).is_this_type_keyword = ktok.kind == TokenType::KwThisType;
             return id;
         }
 
@@ -865,23 +855,23 @@ public:
                 }
             }
         }
-        mut lit: LiteralNode* = new LiteralNode(tok.lexeme, kind, this.span_from_token(tok));
-        lit.suffix = tok.numeric_suffix;
+        const lit: ExpressionNode* = ExpressionNode::literal(tok.lexeme, kind, this.span_from_token(tok));
+        ExpressionNode::literal_of(lit).suffix = tok.numeric_suffix;
         return lit;
     }
 
     /// Parse a string literal.
     parse_string_literal() -> ExpressionNode* {
         const tok: Token = this.advance();
-        mut lit: LiteralNode* = new LiteralNode(tok.lexeme, LiteralKind::String, this.span_from_token(tok));
-        lit.byte_length = tok.text_length;
+        const lit: ExpressionNode* = ExpressionNode::literal(tok.lexeme, LiteralKind::String, this.span_from_token(tok));
+        ExpressionNode::literal_of(lit).byte_length = tok.text_length;
         return lit;
     }
 
     /// Parse a character literal.
     parse_char_literal() -> ExpressionNode* {
         const tok: Token = this.advance();
-        return new LiteralNode(tok.lexeme, LiteralKind::Char, this.span_from_token(tok));
+        return ExpressionNode::literal(tok.lexeme, LiteralKind::Char, this.span_from_token(tok));
     }
 
     /// Parse an f-string `f"...{expr}...{expr:?}..."` and desugar it, here
@@ -1019,17 +1009,16 @@ public:
                 // &inner: synthetic address-of, exempt from the user-facing
                 // no-address-of-a-literal check (E0223) so `f"{42}"` works.
                 const amp: Token = Token::new(TokenType::Amp, "&", tok.line, tok.column);
-                mut ref_node: UnaryExprNode* = new UnaryExprNode(amp, inner, this.fstr_span);
-                ref_node.is_synthetic = true;
+                mut ref_node: ExpressionNode* = ExpressionNode::synthetic_unary(amp, inner, this.fstr_span);
                 ref_node.generated = true;
 
                 if (helper_kind == 2) {
-                    acc = this.fstr_call_fmt(acc, ref_node as ExpressionNode*, spec_src);
+                    acc = this.fstr_call_fmt(acc, ref_node, spec_src);
                 } else {
                     const helper: string =
                         if (helper_kind == 1) { "fmt_append_debug" }
                         else { "fmt_append_display" };
-                    acc = this.fstr_call2(helper, acc, ref_node as ExpressionNode*);
+                    acc = this.fstr_call2(helper, acc, ref_node);
                 }
                 continue;
             }
@@ -1065,41 +1054,41 @@ public:
         const text_raw: string = raw.substr(start, end - start);
         const text: String = Lexer::process_escape_sequences(text_raw);
         const byte_length: i64 = text.length() as i64;
-        mut lit: LiteralNode* = new LiteralNode(text.into_raw(), LiteralKind::String, this.fstr_span);
-        lit.byte_length = byte_length;
+        mut lit: ExpressionNode* = ExpressionNode::literal(text.into_raw(), LiteralKind::String, this.fstr_span);
+        ExpressionNode::literal_of(lit).byte_length = byte_length;
         lit.generated = true;
-        return this.fstr_call2("fmt_append_lit", acc, lit as ExpressionNode*);
+        return this.fstr_call2("fmt_append_lit", acc, lit);
     }
 
     /// A call of `name` the lowering writes.  The f-string's text spells
     /// neither the call nor its callee, so both are marked as the
     /// compiler's; the holes among its arguments are written code.
-    fstr_call(name: string) -> CallExprNode* {
-        mut id: IdentifierNode* = new IdentifierNode(this.ctx.intern(name), this.fstr_span);
+    fstr_call(name: string) -> ExpressionNode* {
+        mut id: ExpressionNode* = ExpressionNode::identifier_expr(this.ctx.intern(name), this.fstr_span);
         id.generated = true;
-        mut call: CallExprNode* = new CallExprNode(id as ExpressionNode*, this.fstr_span);
+        mut call: ExpressionNode* = ExpressionNode::call_expr(id, this.fstr_span);
         call.generated = true;
         return call;
     }
 
     /// Build a zero-argument free-function call `name()`.
     fstr_call0(name: string) -> ExpressionNode* {
-        return this.fstr_call(name) as ExpressionNode*;
+        return this.fstr_call(name);
     }
 
     /// Build a two-argument free-function call `name(a, b)`.
     fstr_call2(name: string, a: ExpressionNode*, b: ExpressionNode*) -> ExpressionNode* {
-        mut call: CallExprNode* = this.fstr_call(name);
-        call.add_argument(a);
-        call.add_argument(b);
-        return call as ExpressionNode*;
+        const call: ExpressionNode* = this.fstr_call(name);
+        ExpressionNode::call_of(call).add_argument(a);
+        ExpressionNode::call_of(call).add_argument(b);
+        return call;
     }
 
     /// Sub-lex and parse a hole's source text as a standalone expression.
     /// Reuses the full expression grammar (so `f"{a + b.c()}"` parses
     /// correctly) by lexing the hole into its own token stream and handing
-    /// it to a fresh sub-parser via `parse_expr_from_tokens` (overridden on
-    /// the concrete `Parser`).  A separate parser is used so the hole's
+    /// it to a fresh sub-parser via `parse_expr_from_tokens`.  A separate
+    /// parser is used so the hole's
     /// tokens never displace this parser's own (owned) token stream.
     /// `base_line`/`base_col` are the hole's real position in the enclosing
     /// file, so the sub-lexed tokens carry true coordinates (the sub-parser
@@ -1135,13 +1124,13 @@ public:
     /// re-parsed at runtime by `std::fmt::spec::fmt_parse_spec`.
     fstr_call_fmt(acc: ExpressionNode*, ref_node: ExpressionNode*,
                   spec: string) -> ExpressionNode* {
-        mut call: CallExprNode* = this.fstr_call("fmt_append_fmt");
-        call.add_argument(acc);
-        call.add_argument(ref_node);
-        mut lit: LiteralNode* = new LiteralNode(spec, LiteralKind::String, this.fstr_span);
+        const call: ExpressionNode* = this.fstr_call("fmt_append_fmt");
+        ExpressionNode::call_of(call).add_argument(acc);
+        ExpressionNode::call_of(call).add_argument(ref_node);
+        mut lit: ExpressionNode* = ExpressionNode::literal(spec, LiteralKind::String, this.fstr_span);
         lit.generated = true;
-        call.add_argument(lit as ExpressionNode*);
-        return call as ExpressionNode*;
+        ExpressionNode::call_of(call).add_argument(lit);
+        return call;
     }
 
     /// Index of the `:` that separates a hole's expression from its format
@@ -1253,7 +1242,7 @@ public:
     parse_identifier_or_call() -> ExpressionNode* {
         const tok: Token = this.advance();
         const name: SymbolStr = this.intern_lexeme(tok);
-        mut expr: ExpressionNode* = new IdentifierNode(name, this.span_from_token(tok));
+        mut expr: ExpressionNode* = ExpressionNode::identifier_expr(name, this.span_from_token(tok));
 
         // Generic arguments on the name: `Name::<T, U>`.  A bare `<` after a
         // name is a comparison, whatever the name binds.
@@ -1273,14 +1262,14 @@ public:
         const gen_args: [TypeAnnotation*] = this.parse_generic_args();
 
         if (this.check(TokenType::LParen)) {
-            mut call: CallExprNode* = new CallExprNode(head, head.span);
-            call.set_generic_args(gen_args);
+            mut call: ExpressionNode* = ExpressionNode::call_expr(head, head.span);
+            ExpressionNode::call_of(call).set_generic_args(gen_args);
             this.advance(); // consume '('
             if (!this.check(TokenType::RParen)) {
                 while (true) {
                     const arg: ExpressionNode* = this.parse_expression();
                     if (arg != null) {
-                        call.add_argument(arg);
+                        ExpressionNode::call_of(call).add_argument(arg);
                     }
                     if (!this.match_tok(TokenType::Comma)) {
                         break;
@@ -1298,9 +1287,9 @@ public:
         } else {
             // The args are attached to the identifier so the monomorphizer can
             // instantiate the named template for them and codegen can
-            // reference the specialized symbol.  `head` is the IdentifierNode
+            // reference the specialized symbol.  `head` is the identifier
             // built by the caller; nothing else has consumed it yet.
-            (head as IdentifierNode*).set_generic_args(gen_args);
+            ExpressionNode::identifier_of(head).set_generic_args(gen_args);
         }
         return this.parse_identifier_tail(head, name, tok);
     }
@@ -1322,7 +1311,7 @@ public:
         // rather than naming conventions, so lowercase type names work too.
         //
         // When a scope resolution was parsed above (`Module::Type`), `expr` is
-        // a ScopeResolutionNode and `name` holds only the leading segment
+        // a ScopeResolutionExpr and `name` holds only the leading segment
         // ("Module"). A trailing struct-literal body must be built under the
         // *qualified* `Module::Type` name - otherwise sema resolves the literal
         // against the bare scope name, fails to find a type, skips field
@@ -1332,8 +1321,8 @@ public:
         if (this.check(TokenType::LBrace) && !this.struct_lit_suppressed() && this.is_struct_literal_ahead()) {
             mut lit_name: SymbolStr = name;
             mut lit_gen: [TypeAnnotation*] = [];
-            if (expr.kind == NodeKind::ScopeResolution) {
-                const sr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
+            const sr: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(expr);
+            if (sr != null) {
                 const scope_s: string  = this.ctx.intern_table.resolve(sr.scope_name);
                 const member_s: string = this.ctx.intern_table.resolve(sr.member_name);
                 lit_name = this.ctx.intern_table.intern(
@@ -1381,7 +1370,8 @@ public:
 
     /// Parse the body of a struct literal after the name and optional generic args.
     parse_struct_literal_body(name: SymbolStr, gen_args: [TypeAnnotation*], start: Token) -> ExpressionNode* {
-        mut lit: StructLiteralNode* = new StructLiteralNode(name, this.span_from_token(start));
+        mut lit_e: ExpressionNode* = ExpressionNode::struct_expr(name, this.span_from_token(start));
+        mut lit: StructExpr* = ExpressionNode::struct_of(lit_e);
         if (gen_args.length > 0) {
             lit.set_generic_args(gen_args);
         }
@@ -1409,7 +1399,7 @@ public:
                 value = this.parse_expression();
             } else {
                 // Shorthand: create an identifier expression referencing the same name
-                value = new IdentifierNode(field_name, this.span_from_token(field_tok));
+                value = ExpressionNode::identifier_expr(field_name, this.span_from_token(field_tok));
             }
 
             const field_span: SourceSpan = this.span_from(field_tok);
@@ -1428,8 +1418,8 @@ public:
         }
 
         this.consume(TokenType::RBrace, "'}'");
-        lit.span = this.span_from(start);
-        return lit;
+        lit_e.span = this.span_from(start);
+        return lit_e;
     }
 
     /// Parse parenthesized expression, tuple literal, or lambda.
@@ -1453,8 +1443,8 @@ public:
                 // Lambda with no parameters: () -> body
                 return this.parse_lambda_after_params([], start);
             }
-            // Void literal / unit value: create null literal
-            return new LiteralNode("void", LiteralKind::Null, this.span_from(start));
+            // The unit value: the empty tuple, as the unit type `()` is.
+            return ExpressionNode::tuple_expr(this.span_from(start));
         }
 
         // Impl-qualified path: `(Trait for Type)::member`.  A `for` at the
@@ -1491,7 +1481,8 @@ public:
 
         // Check for tuple: (expr, expr, ...)
         if (this.check(TokenType::Comma)) {
-            mut tup: TupleLiteralNode* = new TupleLiteralNode(this.span_from_token(start));
+            mut tup_e: ExpressionNode* = ExpressionNode::tuple_expr(this.span_from_token(start));
+            mut tup: TupleExpr* = ExpressionNode::tuple_of(tup_e);
             tup.add_element(first);
             while (this.match_tok(TokenType::Comma)) {
                 if (this.check(TokenType::RParen)) { break; }
@@ -1501,8 +1492,8 @@ public:
                 }
             }
             this.consume(TokenType::RParen, "')'");
-            tup.span = this.span_from(start);
-            return tup;
+            tup_e.span = this.span_from(start);
+            return tup_e;
         }
 
         // Parenthesized expression
@@ -1630,24 +1621,23 @@ public:
             return null;
         }
         this.advance(); // consume '::'
-        mut sr: ScopeResolutionNode* = this.parse_scope_member(scope_name, scope_args, head_span);
-        sr.set_impl_trait(trait_ann);
+        const sr: ExpressionNode* = this.parse_scope_member(scope_name, scope_args, head_span);
+        ExpressionNode::scope_resolution_of(sr).set_impl_trait(trait_ann);
         return sr;
     }
 
     /// Parse a lambda starting from the parameter list (after '(' was consumed).
     /// Lambdas accept a stripped-down parameter form: `name` or `name: Type`,
-    /// without `mut`, default values, or variadics. Kept inline (rather than
-    /// delegating to Parser::parse_parameter_list) because ExprParser does
-    /// not extend Parser and pulling the helper down would require either
-    /// duplicating it on ParserBase or threading a Parser* through.
+    /// without `mut`, default values, or variadics, all of which
+    /// `parse_parameter_list` accepts.
     parse_lambda_expression(start: Token) -> ExpressionNode* {
-        mut params: [VarDeclNode*] = [];
+        mut params: [DeclarationNode*] = [];
         mut reported_untyped: boolean = false;
         while (!this.check(TokenType::RParen) && !this.is_at_end()) {
             const name_tok: Token = this.consume(TokenType::Identifier, "parameter name");
             const pname: SymbolStr = this.intern_lexeme(name_tok);
-            mut param: VarDeclNode* = new VarDeclNode(pname, this.span_from_token(name_tok));
+            mut param: VarDecl* = VarDecl::new(pname);
+            const param_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(param), this.span_from_token(name_tok));
 
             if (this.match_tok(TokenType::Colon)) {
                 const ptype: TypeAnnotation* = this.parse_type_annotation();
@@ -1670,7 +1660,7 @@ public:
                 reported_untyped = true;
             }
 
-            params.push(param);
+            params.push(param_decl);
             if (!this.match_tok(TokenType::Comma)) {
                 break;
             }
@@ -1685,10 +1675,11 @@ public:
     ///   () -> T { return value; }   (block body)
     ///   () -> T expr                (expression body)
     ///   (x: A) -> C { ... }         (block body with params)
-    parse_lambda_after_params(params: [VarDeclNode*], start: Token) -> ExpressionNode* {
+    parse_lambda_after_params(params: [DeclarationNode*], start: Token) -> ExpressionNode* {
         this.consume(TokenType::Arrow, "'->'");
 
-        mut lambda: LambdaExprNode* = new LambdaExprNode(this.span_from_token(start));
+        mut lambda_e: ExpressionNode* = ExpressionNode::lambda_expr(this.span_from_token(start));
+        mut lambda: LambdaExpr* = ExpressionNode::lambda_of(lambda_e);
         for (mut i: i64 = 0; i < params.length; i++) {
             lambda.add_parameter(params[i]);
         }
@@ -1713,12 +1704,7 @@ public:
         // call.  Until the form is properly desugared to `{ return expr; }`,
         // reject it with a clear diagnostic pointing at the braced form.
         if (this.check(TokenType::LBrace)) {
-            // Route through the virtual `parse_inner_block` hook so Parser's
-            // full-statement override (if/while/for/loop/match/switch/break/
-            // continue) takes effect.  Parser is the only concrete parser -
-            // ExprParser exists as its base, never standalone - so this always
-            // dispatches there.
-            const block: BlockStmtNode* = this.parse_inner_block();
+            const block: Stmt* = this.parse_inner_block();
             lambda.set_body(block);
         } else {
             this.report_error(ErrorCode::E0108_EXPECTED_BRACE,
@@ -1728,15 +1714,15 @@ public:
             // E0108 above is the user-facing error.
             const body_expr: ExpressionNode* = this.parse_expression();
             if (body_expr != null) {
-                const expr_stmt: ExprStmtNode* = new ExprStmtNode(body_expr, body_expr.span);
-                const block: BlockStmtNode* = new BlockStmtNode(body_expr.span);
-                block.add_statement(expr_stmt);
+                const expr_stmt: Stmt* = Stmt::expr_stmt(body_expr, body_expr.span);
+                const block: Stmt* = Stmt::block(body_expr.span);
+                block.as_block().add_statement(expr_stmt);
                 lambda.set_body(block);
             }
         }
 
-        lambda.span = this.span_from(start);
-        return lambda;
+        lambda_e.span = this.span_from(start);
+        return lambda_e;
     }
 
     /// Parse an array literal: [ expr, expr, ... ]
@@ -1752,7 +1738,8 @@ public:
             return null;
         }
         const start: Token = this.advance(); // consume '['
-        mut arr: ArrayLiteralNode* = new ArrayLiteralNode(this.span_from_token(start));
+        mut arr_e: ExpressionNode* = ExpressionNode::array_expr(this.span_from_token(start));
+        mut arr: ArrayExpr* = ExpressionNode::array_of(arr_e);
 
         if (!this.check(TokenType::RSquare)) {
             const first: ExpressionNode* = this.parse_expression();
@@ -1780,8 +1767,8 @@ public:
         }
 
         this.consume(TokenType::RSquare, "']'");
-        arr.span = this.span_from(start);
-        return arr;
+        arr_e.span = this.span_from(start);
+        return arr_e;
     }
 
     /// Parse a new expression: new Type(args) or new Type[size]
@@ -1824,7 +1811,8 @@ public:
         mut path: string = type_tok.lexeme;
         path = this.append_path_segments(path);
         mut type_name: SymbolStr = this.ctx.intern(path);
-        mut node: NewExprNode* = new NewExprNode(type_name, this.span_from_token(start));
+        mut new_e: ExpressionNode* = ExpressionNode::new_expr(type_name, this.span_from_token(start));
+        mut node: NewExpr* = ExpressionNode::new_of(new_e);
 
         // Optional generic args on the type: `new Type<T>(...)`.  The operand
         // of `new` is a type, so a `<` here is never a comparison.
@@ -1845,7 +1833,8 @@ public:
         node.type_name = type_name;
 
         if (this.check(TokenType::LParen)) {
-            // Constructor call: new Type(args)
+            // Arguments: `new Enum::Variant(args)`; sema refuses them on any
+            // other type.
             this.advance();
             if (!this.check(TokenType::RParen)) {
                 while (true) {
@@ -1861,7 +1850,7 @@ public:
             this.consume(TokenType::RParen, "')'");
         } else if (this.check(TokenType::LBrace)) {
             // Heap-allocated struct literal: new Type { field: value, ... }
-            // Parse the struct literal body and attach it to the NewExprNode
+            // Parse the struct literal body and attach it to the `new`
             // so sema knows to return a pointer type.
             // Independent DEEP copy: `TypeAnnotation*[]` owns its pointees
             // (drop frees each node, like `ASTCloner::clone_type_annotations`),
@@ -1869,10 +1858,9 @@ public:
             // pointer copy would let both arrays free the same nodes.
             mut gen: [TypeAnnotation*] = [];
             for (mut gi: i64 = 0; gi < node.generic_args.length; gi++) { gen.push(TypeAnnotation::clone_ptr(node.generic_args[gi])); }
-            const lit: StructLiteralNode* = this.parse_struct_literal_body(type_name, gen, start) as StructLiteralNode*;
-            node.struct_init = lit;
-            node.span = this.span_from_token(start);
-            return node;
+            node.struct_init = this.parse_struct_literal_body(type_name, gen, start);
+            new_e.span = this.span_from_token(start);
+            return new_e;
         } else if (this.check(TokenType::LSquare)) {
             // Array allocation: new Type[size]
             this.advance();
@@ -1883,8 +1871,8 @@ public:
             this.consume(TokenType::RSquare, "']'");
         }
 
-        node.span = this.span_from(start);
-        return node;
+        new_e.span = this.span_from(start);
+        return new_e;
     }
 
     /// Parse sizeof(Type): supports qualified names and generic args.
@@ -1894,7 +1882,7 @@ public:
         this.consume(TokenType::LParen, "'('");
         const ann: TypeAnnotation* = this.parse_type_annotation();
         this.consume(TokenType::RParen, "')'");
-        return new SizeofExprNode(ann, this.span_from(start));
+        return ExpressionNode::sizeof_expr(ann, this.span_from(start));
     }
 
     /// Parse alignof(Type): supports qualified names and generic args.
@@ -1903,7 +1891,7 @@ public:
         this.consume(TokenType::LParen, "'('");
         const ann: TypeAnnotation* = this.parse_type_annotation();
         this.consume(TokenType::RParen, "')'");
-        return new AlignofExprNode(ann, this.span_from(start));
+        return ExpressionNode::alignof_expr(ann, this.span_from(start));
     }
 
     /// Parse typeof(expr)
@@ -1912,21 +1900,21 @@ public:
         this.consume(TokenType::LParen, "'('");
         const operand: ExpressionNode* = this.parse_expression();
         this.consume(TokenType::RParen, "')'");
-        return new TypeofExprNode(operand, this.span_from(start));
+        return ExpressionNode::typeof_expr(operand, this.span_from(start));
     }
 
     /// Parse delete expr
     parse_delete_expression() -> ExpressionNode* {
         const start: Token = this.advance(); // consume 'delete'
         const operand: ExpressionNode* = this.parse_unary();
-        return new DeleteExprNode(operand, this.span_from(start));
+        return ExpressionNode::delete_expr(operand, this.span_from(start));
     }
 
     /// Parse await expr
     parse_await_expression() -> ExpressionNode* {
         const start: Token = this.advance(); // consume 'await'
         const operand: ExpressionNode* = this.parse_unary();
-        return new AwaitExprNode(operand, this.span_from(start));
+        return ExpressionNode::await_expr(operand, this.span_from(start));
     }
 
     /// Parse yield [expr]: value is optional (bare yield)
@@ -1937,7 +1925,7 @@ public:
         if (!this.check(TokenType::Semicolon) && !this.check(TokenType::RBrace)) {
             operand = this.parse_expression();
         }
-        return new YieldExprNode(operand, this.span_from(start));
+        return ExpressionNode::yield_expr(operand, this.span_from(start));
     }
 
     /// Parse a condition, with the surrounding `()` OPTIONAL.
@@ -1987,7 +1975,7 @@ public:
         }
 
         const span: SourceSpan = this.span_from(start);
-        return new IfExprNode(condition, then_expr, else_expr, span);
+        return ExpressionNode::if_expr(condition, then_expr, else_expr, span);
     }
 
     /// Parse match expression: match (subject) { arms }
@@ -1996,13 +1984,14 @@ public:
         const subject: ExpressionNode* = this.parse_paren_condition();
         this.consume(TokenType::LBrace, "'{'");
 
-        mut match_expr: MatchExprNode* = new MatchExprNode(subject, this.span_from_token(start));
+        mut match_expr: ExpressionNode* = ExpressionNode::match_expr(subject, this.span_from_token(start));
+        mut payload: MatchExpr* = ExpressionNode::match_of(match_expr);
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
             const before_pos: i64 = this.pos;
             const arm: MatchArmNode* = this.parse_expr_match_arm();
             if (arm != null) {
-                match_expr.add_arm(arm);
+                payload.add_arm(arm);
             }
             if (this.panic_mode) {
                 this.synchronize();
@@ -2032,14 +2021,15 @@ public:
         this.consume(TokenType::RParen, "')'");
         this.consume(TokenType::LBrace, "'{'");
 
-        mut sm: StaticMatchExprNode* = new StaticMatchExprNode(
+        mut sm: ExpressionNode* = ExpressionNode::static_match_expr(
             scrutinee, this.span_from_token(start));
+        mut payload: StaticMatchExpr* = ExpressionNode::static_match_of(sm);
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
             const before_pos: i64 = this.pos;
             const arm: StaticMatchArmNode* = this.parse_static_match_arm();
             if (arm != null) {
-                sm.add_arm(arm);
+                payload.add_arm(arm);
             }
             if (this.panic_mode) {
                 this.synchronize();
@@ -2060,7 +2050,7 @@ public:
     /// parse_expr_match_arm.
     parse_static_match_arm() -> StaticMatchArmNode* {
         const start: Token = this.current();
-        mut arm: StaticMatchArmNode* = new StaticMatchArmNode(
+        mut arm: StaticMatchArmNode* = StaticMatchArmNode::new(
             this.span_from_token(start));
 
         if (this.check(TokenType::Identifier) && this.current().lexeme == "_") {
@@ -2079,14 +2069,14 @@ public:
         this.consume(TokenType::FatArrow, "'=>'");
 
         if (this.check(TokenType::LBrace)) {
-            const block: BlockStmtNode* = this.parse_inner_block();
+            const block: Stmt* = this.parse_inner_block();
             arm.set_body(block);
         } else {
             const body_expr: ExpressionNode* = this.parse_expression();
             if (body_expr != null) {
-                const stmt: ExprStmtNode* = new ExprStmtNode(body_expr, body_expr.span);
-                const block: BlockStmtNode* = new BlockStmtNode(body_expr.span);
-                block.add_statement(stmt);
+                const stmt: Stmt* = Stmt::expr_stmt(body_expr, body_expr.span);
+                const block: Stmt* = Stmt::block(body_expr.span);
+                block.as_block().add_statement(stmt);
                 arm.set_body(block);
             }
         }
@@ -2097,14 +2087,14 @@ public:
 
     /// Parse match arm patterns and the '=>' arrow.
     /// Returns a MatchArmNode with patterns set but body NOT set.
-    /// Shared between expression match (ExprParser) and statement match (Parser).
+    /// Shared between expression match and statement match.
     parse_match_arm_patterns() -> MatchArmNode* {
         const start: Token = this.current();
-        mut arm: MatchArmNode* = new MatchArmNode(this.span_from_token(start));
+        mut arm: MatchArmNode* = MatchArmNode::new(this.span_from_token(start));
 
         // Parse pattern(s) separated by |
         while (true) {
-            const pat: PatternNode* = this.parse_pattern_internal();
+            const pat: Pattern* = this.parse_pattern_internal();
             if (pat != null) {
                 arm.add_pattern(pat);
             }
@@ -2136,19 +2126,18 @@ public:
         const start: Token = this.current();
         mut arm: MatchArmNode* = this.parse_match_arm_patterns();
 
-        // Body is either a block or a single expression.
-        // Block bodies are parsed via parse_inner_block(), which Parser
-        // overrides to support full statements (for, if, while, etc.).
+        // Body is either a block, which may hold any statement, or a single
+        // expression.
         if (this.check(TokenType::LBrace)) {
-            mut block: BlockStmtNode* = this.parse_inner_block();
+            mut block: Stmt* = this.parse_inner_block();
             this.promote_value_block_tail(block);
             arm.set_body(block);
         } else {
             const body_expr: ExpressionNode* = this.parse_expression();
             if (body_expr != null) {
-                const stmt: ExprStmtNode* = new ExprStmtNode(body_expr, body_expr.span);
-                const block: BlockStmtNode* = new BlockStmtNode(body_expr.span);
-                block.add_statement(stmt);
+                const stmt: Stmt* = Stmt::expr_stmt(body_expr, body_expr.span);
+                const block: Stmt* = Stmt::block(body_expr.span);
+                block.as_block().add_statement(stmt);
                 arm.set_body(block);
             }
         }
@@ -2159,7 +2148,7 @@ public:
 
     /// A match-expression arm's braced body is a VALUE block: codegen takes the
     /// arm's value from whatever its LAST statement left behind (the same
-    /// contract `BlockStmtNode.synth_drops` is built around).  Inside that
+    /// contract `BlockStmt.synth_drops` is built around).  Inside that
     /// block, `match` parses in statement position, and the statement lowering
     /// merges no value — so an arm whose tail is a `match` would silently adopt
     /// whichever value that match's last arm happened to emit, regardless of
@@ -2170,16 +2159,33 @@ public:
     /// is a statement, evaluated for effect, and must keep lowering as one.
     /// The unbraced arm form (`p => match (x) { .. }`) already parses as an
     /// expression and never reaches here.
-    promote_value_block_tail(block: BlockStmtNode*) -> void {
-        if (block == null || block.statements.length == 0) { return; }
-        const last: i64 = block.statements.length - 1;
-        const s: StatementNode* = block.statements[last];
-        if (s == null || s.kind != NodeKind::MatchStatement) { return; }
-        const ms: MatchStmtNode* = s as MatchStmtNode*;
-        // Both nodes carry the same components, so this re-wraps rather than
-        // rebuilding: the arms move across by pointer and keep their bindings,
-        // guards and bodies (and their identity, which later passes rely on).
-        mut me: MatchExprNode* = new MatchExprNode(ms.subject, ms.span);
+    promote_value_block_tail(block_stmt: Stmt*) -> void {
+        if (block_stmt == null) { return; }
+        match (block_stmt.kind) {
+            StmtKind::Block(block) => {
+                if (block.statements.length == 0) { return; }
+                const last: i64 = block.statements.length - 1;
+                const s: Stmt* = block.statements[last];
+                if (s == null) { return; }
+                match (s.kind) {
+                    StmtKind::Match(ms) => {
+                        block.statements[last] = this.match_stmt_as_expr(s, ms);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The match statement `s` (payload `ms`) re-formed as an expression
+    /// statement holding the same match.  Both nodes carry the same
+    /// components, so this re-wraps rather than rebuilding: the arms move
+    /// across by pointer and keep their bindings, guards and bodies (and
+    /// their identity, which later passes rely on).
+    match_stmt_as_expr(s: Stmt*, ms: MatchStmt*) -> Stmt* {
+        const me_node: ExpressionNode* = ExpressionNode::match_expr(ms.subject, s.span);
+        mut me: MatchExpr* = ExpressionNode::match_of(me_node);
         for (mut i: i64 = 0; i < ms.arms.length; i++) {
             const a: MatchArmNode* = ms.arms[i];
             // These arms were parsed in STATEMENT context, so their own bodies
@@ -2188,24 +2194,23 @@ public:
             // is what carries the promotion to arbitrary depth.  Idempotent on
             // an arm already parsed in expression context: its tail is an
             // ExpressionStatement by then and no longer matches.
-            if (a != null && a.body != null && a.body.kind == NodeKind::BlockStatement) {
-                this.promote_value_block_tail(a.body as BlockStmtNode*);
+            if (a != null) {
+                this.promote_value_block_tail(a.body);
             }
             me.add_arm(a);
         }
-        block.statements[last] =
-            new ExprStmtNode(me as ExpressionNode*, ms.span) as StatementNode*;
+        return Stmt::expr_stmt(me_node, s.span);
     }
 
 
     /// Parse a pattern (internal, used by match expressions and statements).
-    parse_pattern_internal() -> PatternNode* {
+    parse_pattern_internal() -> Pattern* {
         const start: Token = this.current();
 
         // Wildcard: _
         if (this.check(TokenType::Identifier) && this.current().lexeme == "_") {
             this.advance();
-            return new PatternNode(PatternKind::Wildcard, this.span_from(start));
+            return Pattern::wildcard(this.span_from(start));
         }
 
         // Enum pattern: EnumName::Variant or EnumName::Variant(bindings)
@@ -2220,21 +2225,20 @@ public:
             this.current().kind == TokenType::KwTrue ||
             this.current().kind == TokenType::KwFalse) {
             const lit_tok: Token = this.advance();
-            mut pat: PatternNode* = new PatternNode(PatternKind::Literal, this.span_from(start));
-            pat.set_value(this.intern_lexeme(lit_tok));
             // Record which kind of literal this is.  Codegen cannot recover
             // it from the interned text alone; `0` and `'0'` both intern
             // to "0", `true`/`false` to "true"/"false", so without this
             // it would mis-emit single-digit ints as chars and bools as 0.
-            pat.set_literal_kind(match (lit_tok.kind) {
+            const lk: LiteralKind = match (lit_tok.kind) {
                 TokenType::NumericConstant => { LiteralKind::Integer }
                 TokenType::StringLiteral   => { LiteralKind::String }
                 TokenType::CharConstant    => { LiteralKind::Char }
                 TokenType::KwTrue          => { LiteralKind::Boolean }
                 TokenType::KwFalse         => { LiteralKind::Boolean }
                 _                          => { LiteralKind::Integer }
-            });
-            return this.finish_range_pattern(pat);
+            };
+            return this.finish_range_pattern(
+                Pattern::literal(this.intern_lexeme(lit_tok), lk, this.span_from(start)));
         }
 
         // Negative number literal: -123
@@ -2242,18 +2246,14 @@ public:
             this.advance(); // consume '-'
             const lit_tok: Token = this.advance();
             const neg_value: string = "-" + lit_tok.lexeme;
-            mut pat: PatternNode* = new PatternNode(PatternKind::Literal, this.span_from(start));
-            pat.set_value(this.ctx.intern(neg_value));
-            pat.set_literal_kind(LiteralKind::Integer);
-            return this.finish_range_pattern(pat);
+            return this.finish_range_pattern(Pattern::literal(
+                this.ctx.intern(neg_value), LiteralKind::Integer, this.span_from(start)));
         }
 
         // Identifier pattern (binding)
         if (this.check(TokenType::Identifier)) {
             const id_tok: Token = this.advance();
-            mut pat: PatternNode* = new PatternNode(PatternKind::Identifier, this.span_from(start));
-            pat.set_binding_name(this.intern_lexeme(id_tok));
-            return pat;
+            return Pattern::binding(this.intern_lexeme(id_tok), this.span_from(start));
         }
 
         this.report_error(ErrorCode::E0113_INVALID_PATTERN,
@@ -2266,21 +2266,24 @@ public:
     /// Both spellings are accepted and both are inclusive in pattern
     /// position (`..=` is the explicit inclusive form; `..` is inclusive
     /// here too, unlike a range *expression* where `..` is exclusive).  The
-    /// low bound is already in `pat` (its `value` + `literal_kind`); this
-    /// consumes the operator and the high-bound literal, records the high
-    /// text in `high_value`, and flips the kind to `Range`.  Returns `pat`
-    /// unchanged when there is no range operator.
+    /// low bound is the literal `pat` already is; this consumes the operator
+    /// and the high-bound literal and makes `pat` a `Range` over both.
+    /// Returns `pat` unchanged when there is no range operator.
     ///
     /// Only integer and char literals form a range, and both ends must be
     /// the same kind: the two bounds share a single `literal_kind`, so a
     /// mixed `'a'..9` would make codegen decode one end with the wrong
     /// reader.  Such cases are rejected here rather than silently miscompiled.
-    finish_range_pattern(mut &this, pat: PatternNode*) -> PatternNode* {
+    finish_range_pattern(mut &this, pat: Pattern*) -> Pattern* {
         if (!this.check(TokenType::DotDot)
             && !this.check(TokenType::DotDotEq)) { return pat; }
 
-        if (pat.literal_kind != LiteralKind::Integer
-            && pat.literal_kind != LiteralKind::Char) {
+        const lit: LiteralPattern* = match (pat.kind) {
+            PatternKind::Literal(l) => { l }
+            _                       => { null }
+        };
+        if (lit.literal_kind != LiteralKind::Integer
+            && lit.literal_kind != LiteralKind::Char) {
             this.report_error(ErrorCode::E0113_INVALID_PATTERN,
                 "range patterns require integer or char bounds");
             return pat;
@@ -2313,7 +2316,7 @@ public:
                 "'-' is only valid before an integer range bound");
             return pat;
         }
-        if (hi_kind != pat.literal_kind) {
+        if (hi_kind != lit.literal_kind) {
             this.report_error(ErrorCode::E0113_INVALID_PATTERN,
                 "range pattern bounds must be the same kind (both char or both integer)");
             return pat;
@@ -2322,8 +2325,8 @@ public:
         this.advance(); // consume the high-bound literal
         mut hi_text: string = hi_tok.lexeme;
         if (neg) { hi_text = "-" + hi_text; }
-        pat.set_high_value(this.ctx.intern(hi_text));
-        pat.set_pattern_kind(PatternKind::Range);
+        pat.kind = PatternKind::Range(
+            RangePattern::new(lit.value, this.ctx.intern(hi_text), lit.literal_kind));
         return pat;
     }
 
@@ -2334,7 +2337,7 @@ public:
     /// final identifier becomes the variant name.  The match-arm consumer
     /// (sema) only needs the enum's resolved type; the joined string is
     /// purely for diagnostics.
-    parse_enum_pattern_internal() -> PatternNode* {
+    parse_enum_pattern_internal() -> Pattern* {
         const start: Token = this.current();
         const first_tok: Token = this.advance(); // first identifier
         this.consume(TokenType::ColonColon, "'::'");
@@ -2356,11 +2359,11 @@ public:
             variant_tok = this.consume(TokenType::Identifier, "variant name");
         }
 
-        mut pat: EnumPatternNode* = new EnumPatternNode(this.span_from_token(start));
-        pat.set_enum_name(this.ctx.intern(enum_path));
-        pat.set_variant_name(this.intern_lexeme(variant_tok));
+        mut node: Pattern* = Pattern::enum_variant(
+            this.ctx.intern(enum_path), this.intern_lexeme(variant_tok), this.span_from_token(start));
+        mut pat: EnumPattern* = node.enum_payload();
         pat.set_segment_spans(
-            ParserBase::merge_spans(this.span_from_token(first_tok),
+            Parser::merge_spans(this.span_from_token(first_tok),
                                     this.span_from_token(path_end_tok)),
             this.span_from_token(variant_tok));
 
@@ -2387,9 +2390,9 @@ public:
                     // `Branch(Leaf(x), r)`. A qualified `Ident::...` element is
                     // itself an enum pattern; recurse and store it as a Sub
                     // element (sema/codegen destructure it level by level).
-                    const sub: PatternNode* = this.parse_enum_pattern_internal();
+                    const sub: Pattern* = this.parse_enum_pattern_internal();
                     const ps: PatternSub* = new PatternSub {
-                        pattern: sub as void*,
+                        pattern: sub,
                         span:    sub.span,
                     };
                     pat.add_element(PatternElement::Sub(ps));
@@ -2410,8 +2413,8 @@ public:
                     if (this.match_tok(TokenType::Minus)) { sign = -1; }
                     const num_tok: Token = this.advance();
                     const ns: SourceSpan = this.span_from_token(num_tok);
-                    if (ParserBase::is_float_lexeme(num_tok.lexeme)) {
-                        const fv: f64 = ParserBase::parse_numeric_lexeme_f64(
+                    if (Parser::is_float_lexeme(num_tok.lexeme)) {
+                        const fv: f64 = Parser::parse_numeric_lexeme_f64(
                             num_tok.lexeme);
                         const signed_fv: f64 = if (sign < 0) { 0.0 - fv } else { fv };
                         const pf: PatternLiteralFloat* = new PatternLiteralFloat {
@@ -2419,7 +2422,7 @@ public:
                         };
                         pat.add_element(PatternElement::LiteralFloat(pf));
                     } else {
-                        const iv: i64 = ParserBase::parse_numeric_lexeme_i64(
+                        const iv: i64 = Parser::parse_numeric_lexeme_i64(
                             num_tok.lexeme);
                         const pi: PatternLiteralInt* = new PatternLiteralInt {
                             value: sign * iv, span: ns,
@@ -2439,15 +2442,15 @@ public:
             this.consume(TokenType::RParen, "')'");
         }
 
-        pat.span = this.span_from(start);
-        return pat;
+        node.span = this.span_from(start);
+        return node;
     }
 
 
     // Postfix Helpers
 
     /// Parse function call arguments: callee(arg1, arg2, ...)
-    parse_call_args(callee: ExpressionNode*) -> CallExprNode* {
+    parse_call_args(callee: ExpressionNode*) -> ExpressionNode* {
         // PAREN_DEPTH_LIMIT: nested calls (`f(f(f(...)))`) recurse through
         // parse_expression for each argument, overflowing the native stack
         // (SIGSEGV) on pathological depth. `paren_depth` is maintained by
@@ -2459,13 +2462,13 @@ public:
             return null;
         }
         this.advance(); // consume '('
-        mut call: CallExprNode* = new CallExprNode(callee, callee.span);
+        mut call: ExpressionNode* = ExpressionNode::call_expr(callee, callee.span);
 
         // If the callee is a member access whose name carried explicit type
         // arguments (`obj.method<T>`), promote those onto the call so the
         // sema/mono layers see a generic call rather than a bare member ref.
-        if (callee.kind == NodeKind::MemberAccess) {
-            const ma: MemberAccessNode* = callee as MemberAccessNode*;
+        if (ExpressionNode::member_access_of(callee) != null) {
+            const ma: MemberAccessExpr* = ExpressionNode::member_access_of(callee);
             if (ma.generic_args.length > 0) {
                 // Independent DEEP copy: `set_generic_args` stores and owns the
                 // array, and `TypeAnnotation*[]` owns its pointees, so the call
@@ -2473,7 +2476,7 @@ public:
                 // nodes - a shallow pointer copy double-frees the shared nodes.
                 mut ga_copy: [TypeAnnotation*] = [];
                 for (mut gi: i64 = 0; gi < ma.generic_args.length; gi++) { ga_copy.push(TypeAnnotation::clone_ptr(ma.generic_args[gi])); }
-                call.set_generic_args(ga_copy);
+                ExpressionNode::call_of(call).set_generic_args(ga_copy);
             }
         }
 
@@ -2481,7 +2484,7 @@ public:
             while (true) {
                 const arg: ExpressionNode* = this.parse_expression();
                 if (arg != null) {
-                    call.add_argument(arg);
+                    ExpressionNode::call_of(call).add_argument(arg);
                 }
                 if (!this.match_tok(TokenType::Comma)) {
                     break;
@@ -2490,12 +2493,12 @@ public:
         }
 
         const end: Token = this.consume(TokenType::RParen, "')'");
-        call.span = ParserBase::merge_spans(callee.span, this.span_from_token(end));
+        call.span = Parser::merge_spans(callee.span, this.span_from_token(end));
         return call;
     }
 
     /// Parse array access: array[index]
-    parse_array_access_expr(array: ExpressionNode*) -> ArrayAccessNode* {
+    parse_array_access_expr(array: ExpressionNode*) -> ExpressionNode* {
         // BRACKET_DEPTH_LIMIT: nested index expressions (`a[a[a[...]]]`)
         // recurse through parse_expression for the index, overflowing the
         // native stack (SIGSEGV) on pathological depth. `bracket_depth` is
@@ -2510,12 +2513,12 @@ public:
         this.advance(); // consume '['
         const index: ExpressionNode* = this.parse_expression();
         const end: Token = this.consume(TokenType::RSquare, "']'");
-        const span: SourceSpan = ParserBase::merge_spans(array.span, this.span_from_token(end));
-        return new ArrayAccessNode(array, index, span);
+        const span: SourceSpan = Parser::merge_spans(array.span, this.span_from_token(end));
+        return ExpressionNode::array_access_expr(array, index, span);
     }
 
     /// Parse member access: object.member or object.method<T, U>
-    parse_member_access_expr(object: ExpressionNode*) -> MemberAccessNode* {
+    parse_member_access_expr(object: ExpressionNode*) -> ExpressionNode* {
         this.advance(); // consume '.'
         // Tuple field access: `t.0`, `t.1`, etc. Accept a numeric constant
         // as the member name. The lexeme ("0", "1", ...) is interned as a
@@ -2545,7 +2548,7 @@ public:
         }
 
         if (member_tok.kind == TokenType::NumericConstant) {
-            const dot_pos: i64 = ExprParser::lexeme_first_dot(member_tok.lexeme);
+            const dot_pos: i64 = Parser::lexeme_first_dot(member_tok.lexeme);
             if (dot_pos >= 0) {
                 const lex_len: i64 = member_tok.lexeme.length() as i64;
                 const first_str: string = member_tok.lexeme.substr(0, dot_pos as i64);
@@ -2553,25 +2556,24 @@ public:
                 const first_sym: SymbolStr = this.ctx.intern(first_str);
                 const rest_sym: SymbolStr = this.ctx.intern(rest_str);
                 const tok_span: SourceSpan = this.span_from_token(member_tok);
-                const inner_span: SourceSpan = ParserBase::merge_spans(
+                const inner_span: SourceSpan = Parser::merge_spans(
                     object.span, tok_span);
-                const inner: MemberAccessNode* = new MemberAccessNode(
+                const inner: ExpressionNode* = ExpressionNode::member_access_expr(
                     object, first_sym, tok_span, inner_span);
-                return new MemberAccessNode(
-                    inner as ExpressionNode*, rest_sym, tok_span, inner_span);
+                return ExpressionNode::member_access_expr(inner, rest_sym, tok_span, inner_span);
             }
         }
 
         const member: SymbolStr = this.intern_lexeme(member_tok);
         const member_span: SourceSpan = this.span_from_token(member_tok);
-        const span: SourceSpan = ParserBase::merge_spans(object.span, member_span);
-        mut node: MemberAccessNode* = new MemberAccessNode(object, member, member_span, span);
+        const span: SourceSpan = Parser::merge_spans(object.span, member_span);
+        const node: ExpressionNode* = ExpressionNode::member_access_expr(object, member, member_span, span);
 
         // Explicit type arguments on the member: `obj.method::<T, U>(...)`.
         if (this.at_turbofish()) {
             this.advance(); // consume '::'
             const member_gen_args: [TypeAnnotation*] = this.parse_generic_args();
-            node.set_generic_args(member_gen_args);
+            ExpressionNode::member_access_of(node).set_generic_args(member_gen_args);
         }
 
         return node;
@@ -2581,11 +2583,11 @@ public:
     // Scope Resolution Helper
 
     /// Consume a member name after '::' has already been consumed, create a
-    /// ScopeResolutionNode, and parse any generic args on the member.
+    /// ScopeResolutionExpr, and parse any generic args on the member.
     /// `scope_name`       - the left-hand identifier (e.g. "Foo" in Foo::bar)
     /// `scope_gen_args`   - generic args on the scope (e.g. <T> in Foo<T>::bar), empty if none
     /// `start_span`       - span of the left-hand side (for merged span)
-    parse_scope_member(scope_name: SymbolStr, scope_gen_args: [TypeAnnotation*], start_span: SourceSpan) -> ScopeResolutionNode* {
+    parse_scope_member(scope_name: SymbolStr, scope_gen_args: [TypeAnnotation*], start_span: SourceSpan) -> ExpressionNode* {
         // Accept identifiers and any keyword as member names after '::'.
         // Keywords like `new`, `default`, `function`, `optional`, `type`
         // can all be used as static method / variant names.
@@ -2597,8 +2599,9 @@ public:
         };
         const member_name: SymbolStr = this.intern_lexeme(member_tok);
         const member_span: SourceSpan = this.span_from_token(member_tok);
-        const span: SourceSpan = ParserBase::merge_spans(start_span, member_span);
-        mut sr: ScopeResolutionNode* = new ScopeResolutionNode(scope_name, member_name, span);
+        const span: SourceSpan = Parser::merge_spans(start_span, member_span);
+        const sr_e: ExpressionNode* = ExpressionNode::scope_resolution_expr(scope_name, member_name, span);
+        mut sr: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(sr_e);
         // Record the scope/member token spans separately so LSP hover can
         // resolve each side of `Scope::member` independently.
         sr.set_segment_spans(start_span, member_span);
@@ -2615,7 +2618,7 @@ public:
             sr.set_generic_args(member_gen_args);
         }
 
-        return sr;
+        return sr_e;
     }
 
 
@@ -2784,6 +2787,13 @@ public:
             return this.parse_impl_trait_type();
         }
 
+        // `virtual &Trait`, `virtual mut &Trait`, `virtual Trait*`: a trait
+        // object.  The suffixes after it apply to the object: `virtual
+        // Shape*?` is an optional object pointer.
+        if (this.check(TokenType::KwVirtual)) {
+            return this.parse_object_type();
+        }
+
         // `const T*` FFI pointer-to-const. The `const` qualifies the pointee,
         // so it binds to the first pointer suffix (`parse_type_suffixes`
         // consumes the pending flag for the nearest `*`). A `const` with no
@@ -2801,6 +2811,33 @@ public:
         const base: TypeAnnotation* = this.parse_base_type();
         if (base == null) { return null; }
         return this.parse_type_suffixes(base, base_tok);
+    }
+
+    /// Parse a trait object type after its `virtual`: `&Trait`, `mut
+    /// &Trait`, or `Trait*`, the trait a base type with its arguments.
+    parse_object_type() -> TypeAnnotation* {
+        const start: Token = this.advance(); // consume `virtual`
+        mut form: ObjectForm = ObjectForm::Raw;
+        if (this.check(TokenType::KwMut) && this.peek_at(1).kind == TokenType::Amp) {
+            this.advance();
+            this.advance();
+            form = ObjectForm::MutableBorrowed;
+        } else if (this.match_tok(TokenType::Amp)) {
+            form = ObjectForm::Borrowed;
+        }
+        const trait_annotation: TypeAnnotation* = this.parse_base_type();
+        if (trait_annotation == null) { return null; }
+        match (form) {
+            ObjectForm::Raw => { this.consume(TokenType::Star, "'*'"); }
+            _               => { }
+        }
+        const object: ObjectAnnotation* = new ObjectAnnotation {
+            trait_annotation: trait_annotation,
+            form:             form,
+            span:             this.span_from(start),
+            refused:          false,
+        };
+        return this.parse_type_suffixes(new TypeAnnotation::Object(object), start);
     }
 
     /// Parse `implement Trait + Trait2 + ...`. Each bound is a base type
@@ -2915,14 +2952,14 @@ public:
         // expression's static type.  The operand is stored opaquely (the AST
         // root can't name ExpressionNode); sema casts it back and derives the
         // type, caching it in `resolved`.  Value-position `typeof` is parsed
-        // separately as a TypeofExprNode (parse_typeof_expression).
+        // separately as a `typeof` expression (parse_typeof_expression).
         if (tok.kind == TokenType::KwTypeof) {
             this.advance();
             this.consume(TokenType::LParen, "'('");
             const operand: ExpressionNode* = this.parse_expression();
             this.consume(TokenType::RParen, "')'");
             const to: TypeofAnnotation* = new TypeofAnnotation {
-                operand:  operand as void*,
+                operand:  operand,
                 resolved: TypeRef::invalid(),
                 span:     this.span_from_token(tok),
             };
@@ -2987,6 +3024,7 @@ public:
                     base: base_ann,
                     args: type_args,
                     span: this.span_from(tok),
+                    refused: false,
                 };
                 return new TypeAnnotation::Generic(gen_ann);
             }
@@ -3112,6 +3150,7 @@ public:
                     base: opt_base,
                     args: opt_args,
                     span: this.span_from(start),
+                    refused: false,
                 };
                 result = new TypeAnnotation::Generic(opt_gen);
                 if (postfix_array) { rewritten = rewritten + "?"; }
@@ -3220,12 +3259,12 @@ public:
             // that needs more than 64 bits would saturate to a meaningless
             // value; reject it up front rather than build a garbage array
             // type.
-            if (ParserBase::numeric_lexeme_overflows_u64(size_tok.lexeme)) {
+            if (Parser::numeric_lexeme_overflows_u64(size_tok.lexeme)) {
                 this.report_error(ErrorCode::E0010_NUMBER_TOO_LARGE,
                     fmt::format("array size `%s` does not fit in 64 bits",
                         size_tok.lexeme));
             }
-            size = ParserBase::parse_numeric_lexeme_i64(size_tok.lexeme);
+            size = Parser::parse_numeric_lexeme_i64(size_tok.lexeme);
             this.advance();
         } else {
             // A named constant or computed size is fixed-pending until the
@@ -3356,17 +3395,17 @@ public:
 
     /// Try to extract the name from an expression node (for scope resolution).
     get_expr_name(expr: ExpressionNode*) -> SymbolStr {
-        const node: ASTNode* = expr as ASTNode*;
-        if (node.kind == NodeKind::Identifier) {
-            const id: IdentifierNode* = expr as IdentifierNode*;
+        const node: ExpressionNode* = expr;
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(node);
+        if (id != null) {
             return id.name;
         }
-        if (node.kind == NodeKind::ScopeResolution) {
-            const sr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
+        const sr: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(node);
+        if (sr != null) {
             return sr.member_name;
         }
-        if (node.kind == NodeKind::CallExpression) {
-            const call: CallExprNode* = expr as CallExprNode*;
+        if (ExpressionNode::call_of(node) != null) {
+            const call: CallExpr* = ExpressionNode::call_of(expr);
             return this.get_expr_name(call.callee);
         }
         return SymbolStr::empty();

@@ -18,7 +18,7 @@ import compiler::lex::{ Token, TokenType };
 import compiler::lex::lexer;
 import compiler::lex::lexer::{ Lexer };
 import compiler::ast;
-import compiler::ast::{ declaration, ImportStyle, node, NodeKind };
+import compiler::ast::{ declaration, ImportStyle, node};
 import compiler::types;
 import compiler::types::{ arena, type_ref, TypeKind };
 import compiler::passes::{
@@ -57,10 +57,11 @@ import compiler::types::user_defined::{ TypeAliasType };
 import std::fmt;
 import compiler::artifacts::{ ASTOutput, TokenStream };
 import compiler::ast::declaration::{
-    ClassDeclNode, EnumDeclNode, ImplBlockNode, ImportDeclNode, MethodNode, StructDeclNode,
-    TraitDeclNode, TypeAliasDeclNode, UnionDeclNode
+    DeclarationNode, DeclKind, ImplBlock, ImportDecl,
+    MethodDecl, StructDecl,
+    TraitDecl, UnionDecl
 };
-import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::node::{ Node, ProgramNode };
 import compiler::compilation_context::{ CompilationContext, LangRef, SourceOverride };
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::diag::source_span::{ SourceSpan };
@@ -91,9 +92,9 @@ import compiler::resolver::lang_item::{ LangModule, LangItem };
 import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, Res, ResBase };
 import compiler::ast::expression;
-import compiler::ast::expression::{ ScopeResolutionNode, MemberAccessNode };
+import compiler::ast::expression::{ ExpressionNode, MemberAccessExpr };
 import compiler::ast::pattern;
-import compiler::ast::pattern::{ EnumPatternNode };
+import compiler::ast::pattern::{ Pattern };
 
 
 // PassStats: Per-pass execution statistics
@@ -609,8 +610,8 @@ type struct PassRegistry {
             namespace_name: root.namespace_name,
         };
 
-        LOG_DEBUG(LogComponent::Parser, "[Parsing] store: root=%p, root.kind=%d, stmts=%d",
-            root, root.kind as int, root.statements.length);
+        LOG_DEBUG(LogComponent::Parser, "[Parsing] store: root=%p, stmts=%d",
+            root, root.statements.length);
         LOG_DEBUG(LogComponent::Parser, "[Parsing] readback: ctx.artifacts.ast.root=%p",
             ctx.artifacts.ast.root);
 
@@ -653,7 +654,7 @@ type struct PassRegistry {
 
     /// Walks top-level declarations to create Type objects in the arena.
     /// This pass bridges the gap between name resolution and type resolution:
-    /// after this pass, every declared struct/enum/class/trait has a TypeRef.
+    /// after this pass, every declared struct/enum/trait has a TypeRef.
     static run_type_declaration_pass(ctx: CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
@@ -681,37 +682,22 @@ type struct PassRegistry {
         // pre-pass with a module-local seen set.
         mut seen_types: [u64] = [];
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i];
+            const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
             mut def: DefId = DefId::invalid();
             mut leaf: SymbolStr = SymbolStr::empty();
             mut tspan: SourceSpan = SourceSpan::none();
             match (stmt.kind) {
-                NodeKind::StructDeclaration => {
-                    const n: StructDeclNode* = stmt as StructDeclNode*;
-                    def = n.def; leaf = n.name; tspan = n.span;
-                }
-                NodeKind::UnionDeclaration => {
-                    const n: UnionDeclNode* = stmt as UnionDeclNode*;
-                    def = n.def; leaf = n.name; tspan = n.span;
-                }
-                NodeKind::EnumDeclaration => {
-                    const n: EnumDeclNode* = stmt as EnumDeclNode*;
-                    def = n.def; leaf = n.name; tspan = n.span;
-                }
-                NodeKind::ClassDeclaration => {
-                    const n: ClassDeclNode* = stmt as ClassDeclNode*;
-                    def = n.def; leaf = n.name; tspan = n.span;
-                }
-                NodeKind::TraitDeclaration => {
-                    const n: TraitDeclNode* = stmt as TraitDeclNode*;
-                    def = n.def; leaf = n.name; tspan = n.span;
-                }
-                NodeKind::TypeAliasDeclaration => {
-                    const n: TypeAliasDeclNode* = stmt as TypeAliasDeclNode*;
-                    def = n.def; leaf = n.alias_name; tspan = n.span;
-                }
-                _ => {}
+                DeclKind::Struct(n)    => { def = n.def; leaf = n.name; tspan = stmt.span; }
+                DeclKind::Enum(n)      => { def = n.def; leaf = n.name; tspan = stmt.span; }
+                DeclKind::Trait(n)     => { def = n.def; leaf = n.name; tspan = stmt.span; }
+                DeclKind::TypeAlias(n) => { def = n.def; leaf = n.alias_name; tspan = stmt.span; }
+                DeclKind::Union(n)     => { def = n.def; leaf = n.name; tspan = stmt.span; }
+                // No other kind with a payload declares a type.
+                DeclKind::Import(_) | DeclKind::Intrinsic(_) | DeclKind::Impl(_)
+                | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
+                | DeclKind::Extern(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
+                | DeclKind::Variable(_) | DeclKind::Function(_) | DeclKind::Method(_) => {}
             }
             if (!def.is_valid()) { continue; }
             const parent: DefId = ctx.defs.parent_of(def);
@@ -727,73 +713,35 @@ type struct PassRegistry {
         // Walk top-level statements and create types for declarations
         mut type_count: i64 = 0;
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i];
+            const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
 
-            cdebug("[TypeDecl] stmt[%lld] kind=%d\n", i, stmt.kind as i32);
+            cdebug("[TypeDecl] stmt[%lld]\n", i);
             match (stmt.kind) {
-                NodeKind::StructDeclaration => {
-                    const node: StructDeclNode* = stmt as StructDeclNode*;
+                DeclKind::Struct(node) => {
                     const _intern: InternTable* = ctx.get_intern_table();
                     const _dbg: string = _intern.resolve(node.name);
                     cdebug("[TypeDecl]   -> Struct '%s'\n", _dbg);
-                    const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, node.span.file);
+                    const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, stmt.span.file);
                     // The index learns the name here, with the arena: this
                     // stage's guarantee is that every type name is known
-                    // before any signature resolves, and that has to hold for
-                    // both stores or a qualified annotation in a signature
-                    // finds the arena and misses the index.  The NAME only -
-                    // the per-module type list is not idempotent and stays
-                    // TypeResolution's to own.
+                    // before any signature resolves, and that has to hold
+                    // for both stores or a qualified annotation in a
+                    // signature finds the arena and misses the index.  The
+                    // NAME only - the per-module type list is not
+                    // idempotent and stays TypeResolution's to own.
                     const struct_ref: TypeRef =
                         arena.create_struct(qualified_sym, ctx.declaring_module(node.def));
                     ctx.decl_index.register_type(node.def, struct_ref, node.is_public);
                     PassRegistry::claim_method_items(ctx, &node.methods);
-                    // Whether this IS the language's `Array`, `Slice`, `Rc`, ...
-                    // is decided by the identity, claimed where it is minted.
+                    // Whether this IS the language's `Array`, `Slice`, `Rc`,
+                    // ... is decided by the identity, claimed where it is
+                    // minted.
                     ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
                     type_count++;
                 }
-                NodeKind::UnionDeclaration => {
-                    const node: UnionDeclNode* = stmt as UnionDeclNode*;
-                    const _internu: InternTable* = ctx.get_intern_table();
-                    const _dbgu: string = _internu.resolve(node.name);
-                    cdebug("[TypeDecl]   -> Union '%s'\n", _dbgu);
-                    const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, node.span.file);
-                    const union_ref: TypeRef =
-                        arena.create_union(qualified_sym, ctx.declaring_module(node.def));
-                    ctx.decl_index.register_type(node.def, union_ref, node.is_public);
-                    PassRegistry::claim_method_items(ctx, &node.methods);
-                    type_count++;
-                }
-                NodeKind::EnumDeclaration => {
-                    const node: EnumDeclNode* = stmt as EnumDeclNode*;
-                    const _intern2: InternTable* = ctx.get_intern_table();
-                    const _dbg2: string = _intern2.resolve(node.name);
-                    cdebug("[TypeDecl]   -> Enum '%s'\n", _dbg2);
-                    const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, node.span.file);
-                    const enum_ref: TypeRef =
-                        arena.create_enum(qualified_sym, ctx.declaring_module(node.def));
-                    ctx.decl_index.register_type(node.def, enum_ref, node.is_public);
-                    // Whether this IS the language's `Result`/`Option` - the enums
-                    // `?` desugars through - is decided by the identity, claimed
-                    // here where it is first minted, as a trait's is below.
-                    ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
-                    type_count++;
-                }
-                NodeKind::ClassDeclaration => {
-                    const node: ClassDeclNode* = stmt as ClassDeclNode*;
-                    const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, ModulePath::none(), node.span.file);
-                    const class_ref: TypeRef =
-                        arena.create_class(qualified_sym, ctx.declaring_module(node.def));
-                    ctx.decl_index.register_type(node.def, class_ref, node.is_public);
-                    PassRegistry::claim_method_items(ctx, &node.methods);
-                    ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
-                    type_count++;
-                }
-                NodeKind::TraitDeclaration => {
-                    const node: TraitDeclNode* = stmt as TraitDeclNode*;
-                    const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, ModulePath::none(), node.span.file);
+                DeclKind::Trait(node) => {
+                    const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, ModulePath::none(), stmt.span.file);
                     const trait_ref: TypeRef =
                         arena.create_trait(qualified_sym, ctx.declaring_module(node.def));
                     // A trait carries no visibility modifier: public.
@@ -805,15 +753,28 @@ type struct PassRegistry {
                     ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
                     for (mut mi: i64 = 0; mi < node.methods.length; mi++) {
                         if (node.methods[mi] != null) {
-                            ctx.generic_registry.claim_wellknown(node.methods[mi].def, ctx.intern_table);
+                            ctx.generic_registry.claim_wellknown(DeclarationNode::fn_of(node.methods[mi]).def, ctx.intern_table);
                         }
                     }
                     type_count++;
                 }
-                NodeKind::TypeAliasDeclaration => {
-                    const node: TypeAliasDeclNode* = stmt as TypeAliasDeclNode*;
-                    const qualified_alias: SymbolStr = ctx.decl_type_key(node.alias_name, node.binding_namespace, node.span.file);
-                    // Use qualified name (consistent with struct/enum/class/trait);
+                DeclKind::Enum(node) => {
+                    const _intern2: InternTable* = ctx.get_intern_table();
+                    const _dbg2: string = _intern2.resolve(node.name);
+                    cdebug("[TypeDecl]   -> Enum '%s'\n", _dbg2);
+                    const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, stmt.span.file);
+                    const enum_ref: TypeRef =
+                        arena.create_enum(qualified_sym, ctx.declaring_module(node.def));
+                    ctx.decl_index.register_type(node.def, enum_ref, node.is_public);
+                    // Whether this IS the language's `Result`/`Option` - the enums
+                    // `?` desugars through - is decided by the identity, claimed
+                    // here where it is first minted, as a trait's is below.
+                    ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
+                    type_count++;
+                }
+                DeclKind::TypeAlias(node) => {
+                    const qualified_alias: SymbolStr = ctx.decl_type_key(node.alias_name, node.binding_namespace, stmt.span.file);
+                    // Use qualified name (consistent with struct/enum/trait);
                     // target resolved in TypeResolution pass
                     const alias_ref: TypeRef = arena.create_type_alias(qualified_alias, TypeRef::invalid());
                     // Mark generic aliases so the arena dump can distinguish
@@ -821,7 +782,7 @@ type struct PassRegistry {
                     if (node.is_generic()) {
                         const alias_ty: Type* = arena.lookup(alias_ref);
                         if (alias_ty != null && alias_ty.kind == TypeKind::TypeAlias) {
-                            const alias_obj: TypeAliasType* = alias_ty as TypeAliasType*;
+                            const alias_obj: TypeAliasType* = alias_ty.as_alias();
                             alias_obj.is_generic = true;
                         }
                     }
@@ -832,12 +793,26 @@ type struct PassRegistry {
                     ctx.decl_index.register_type(node.def, alias_ref, true);
                     type_count++;
                 }
-                NodeKind::ImplementationBlock => {
-                    PassRegistry::claim_method_items(ctx, &(stmt as ImplBlockNode*).methods);
+                DeclKind::Union(node) => {
+                    const _internu: InternTable* = ctx.get_intern_table();
+                    const _dbgu: string = _internu.resolve(node.name);
+                    cdebug("[TypeDecl]   -> Union '%s'\n", _dbgu);
+                    const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, stmt.span.file);
+                    const union_ref: TypeRef =
+                        arena.create_union(qualified_sym, ctx.declaring_module(node.def));
+                    ctx.decl_index.register_type(node.def, union_ref, node.is_public);
+                    PassRegistry::claim_method_items(ctx, &node.methods);
+                    type_count++;
                 }
-                _ => {
-                    // Functions, variables, imports, etc. don't create Type objects here
+                // An impl block declares no type; its methods are items.
+                DeclKind::Impl(node) => {
+                    PassRegistry::claim_method_items(ctx, &node.methods);
                 }
+                // No other kind with a payload declares a type.
+                DeclKind::Import(_) | DeclKind::Intrinsic(_)
+                | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
+                | DeclKind::Extern(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
+                | DeclKind::Variable(_) | DeclKind::Function(_) | DeclKind::Method(_) => {}
             }
         }
 
@@ -902,13 +877,14 @@ type struct PassRegistry {
     /// written in the module that declares its owner is claimed: an
     /// implementation in another module can give the owner a method of the
     /// same path, and it must not become the method generated code calls.
-    static claim_method_items(ctx: CompilationContext*, methods: &[MethodNode*]) -> void {
+    static claim_method_items(ctx: CompilationContext*, methods: &[DeclarationNode*]) -> void {
         const here: DefId = ctx.module_def_of(ctx.unit_module);
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: MethodNode* = methods[i];
-            if (m == null || m.func == null || !m.func.def.is_valid()) { continue; }
-            if (!ctx.defs.module_of(m.func.def).equals(here)) { continue; }
-            ctx.generic_registry.claim_wellknown(m.func.def, ctx.intern_table);
+            const m_decl: DeclarationNode* = methods[i];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
+            if (m == null || m.func == null || !DeclarationNode::fn_of(m.func).def.is_valid()) { continue; }
+            if (!ctx.defs.module_of(DeclarationNode::fn_of(m.func).def).equals(here)) { continue; }
+            ctx.generic_registry.claim_wellknown(DeclarationNode::fn_of(m.func).def, ctx.intern_table);
         }
     }
 
@@ -935,14 +911,18 @@ type struct PassRegistry {
                 kept++;
                 continue;
             }
-            const node: ASTNode* = r.node;
-            if (node.kind == NodeKind::EnumPattern) {
-                (node as EnumPatternNode*).res.settle(Res::Def(id));
-            } else if (node.kind == NodeKind::ScopeResolution) {
-                (node as ScopeResolutionNode*).scope_res.settle(
-                    Res::TypeRelative(ResBase::Def(id), 1));
-            } else if (node.kind == NodeKind::MemberAccess) {
-                (node as MemberAccessNode*).set_resolved_trait(id);
+            match (r.node) {
+                // A lang ref on a pattern is the desugarings' `Item::variant`.
+                Node::Pattern(p) => { p.enum_payload().res.settle(Res::Def(id)); }
+                Node::Expr(e) => {
+                    if (ExpressionNode::scope_resolution_of(e) != null) {
+                        ExpressionNode::scope_resolution_of(e).scope_res.settle(
+                            Res::TypeRelative(ResBase::Def(id), 1));
+                    } else if (ExpressionNode::member_access_of(e) != null) {
+                        ExpressionNode::member_access_of(e).set_resolved_trait(id);
+                    }
+                }
+                _ => { }
             }
         }
         while (ctx.lang_refs.length > kept) {
@@ -1003,10 +983,10 @@ type struct PassRegistry {
         // A same-module re-import (if the user also wrote it) is silently
         // de-duplicated during name resolution.
         if (root.uses_fstring) {
-            const interp_import: ImportDeclNode* = new ImportDeclNode(
-                ctx.intern_table.intern(LangModule::Interp.path()), ImportStyle::Wildcard, SourceSpan::none());
-            mut with_interp: [ASTNode*] = [];
-            with_interp.push(interp_import as ASTNode*);
+            const interp_import: DeclarationNode* = DeclarationNode::of(DeclKind::Import(ImportDecl::new(
+                ctx.intern_table.intern(LangModule::Interp.path()), ImportStyle::Wildcard)), SourceSpan::none());
+            mut with_interp: [Node] = [];
+            with_interp.push(Node::Decl(interp_import));
             for (mut fi: i64 = 0; fi < root.statements.length; fi++) {
                 with_interp.push(root.statements[fi]);
             }
@@ -1025,9 +1005,9 @@ type struct PassRegistry {
         // no diagnostic of its own.
         const prelude_path: SymbolStr = ctx.intern_table.intern(LangModule::Prelude.path());
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i];
-            if (stmt != null && stmt.kind == NodeKind::ImportDeclaration) {
-                const imp: ImportDeclNode* = stmt as ImportDeclNode*;
+            const stmt: DeclarationNode* = root.statements[i].as_decl();
+            const imp: ImportDecl* = DeclarationNode::import_of(stmt);
+            if (imp != null) {
                 if (LangModule::Prelude.is_written(imp.module_path, ctx.intern_table)
                     && imp.style == ImportStyle::Wildcard) {
                     if (ctx.options.verbose) {
@@ -1039,13 +1019,13 @@ type struct PassRegistry {
         }
 
         // Inject a synthetic `import std::prelude;` (wildcard) as the first statement.
-        const prelude_import: ImportDeclNode* = new ImportDeclNode(
-            prelude_path, ImportStyle::Wildcard, SourceSpan::none());
+        const prelude_import: DeclarationNode* = DeclarationNode::of(
+            DeclKind::Import(ImportDecl::new(prelude_path, ImportStyle::Wildcard)), SourceSpan::none());
 
         // Build a new statement list with the prelude import at position 0.
         const old_len: i64 = root.statements.length;
-        mut new_stmts: [ASTNode*] = [];
-        new_stmts.push(prelude_import as ASTNode*);
+        mut new_stmts: [Node] = [];
+        new_stmts.push(Node::Decl(prelude_import));
         for (mut i: i64 = 0; i < old_len; i++) {
             new_stmts.push(root.statements[i]);
         }
@@ -1089,11 +1069,10 @@ type struct PassRegistry {
             "", ctx.source_file, ctx.options.stdlib_root, ctx.options.no_std, []);
 
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i];
+            const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
-            if (stmt.kind != NodeKind::ImportDeclaration) { continue; }
-
-            const import_node: ImportDeclNode* = stmt as ImportDeclNode*;
+            const import_node: ImportDecl* = DeclarationNode::import_of(stmt);
+            if (import_node == null) { continue; }
             const module_path: string = ctx.intern_table.resolve(import_node.module_path);
             import_count += 1;
 
@@ -1105,13 +1084,13 @@ type struct PassRegistry {
             // imports (e.g. the synthetic `std::prelude`) carry no source
             // location and are trusted; blaming the user for them - or for a
             // virtual module with no backing file - would be wrong.
-            if (single_file_mode && import_node.span.has_location()) {
+            if (single_file_mode && stmt.span.has_location()) {
                 const resolved: string = sf_loader.resolve_import_path(
                     ctx.intern_table, import_node.module_path, "");
                 if (resolved.length() == 0) {
                     ctx.emit_error_at(ErrorCode::E0500_MODULE_NOT_FOUND,
                         fmt::format("module '%s' not found", module_path),
-                        import_node.span);
+                        stmt.span);
                     error_count += 1;
                 }
             }

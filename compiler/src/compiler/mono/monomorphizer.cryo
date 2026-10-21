@@ -5,12 +5,12 @@
 ///! creates concrete types in the TypeArena, and discovers transitive dependencies.
 ///!
 ///! After process_all() completes, every InstantiatedType has a resolved_type
-///! pointing to a concrete Struct/Enum/Class, and the finished specializations
+///! pointing to a concrete Struct/Enum, and the finished specializations
 ///! are exposed to `passes/specialization.cryo` through `spec_entry_at()` + the
 ///! injection cursor for placement into the program AST.
 ///!
 ///! Semantic analysis is authoritative and runs FIRST.  It pins generic type
-///! arguments onto `CallExprNode.resolved_type_args` and types every
+///! arguments onto `CallExpr.resolved_type_args` and types every
 ///! expression/literal.  This monomorphizer CONSUMES those pinned bindings (via
 ///! `MonoCallSpecializer`); it does NOT re-derive them.  Mono's job: materialize
 ///! concrete arena types, discover nested instantiations, consume sema's stash to
@@ -23,7 +23,7 @@
 namespace compiler::mono::monomorphizer;
 
 import compiler::ast;
-import compiler::ast::{ declaration, expression, node, NodeKind, pattern, statement, TraitBound, TraitRef };
+import compiler::ast::{ declaration, expression, node, pattern, statement, TraitBound, TraitRef };
 import compiler::types::{
     generic, user_defined, compound, type_base, arena, type_ref, substitution,
     checker, resolver, generic_registry, ownership, trait_checker, TypeKind
@@ -45,7 +45,7 @@ import std::collections::hashmap::{ HashMap };
 import utils::logger;
 import utils::logger::{ cdebug, LOG_DEBUG, LogComponent };
 import std::fmt;
-import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::node::{ ProgramNode };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::sink::{ DiagnosticSink };
 import compiler::mono::ast_resolver::{ MonoAstResolver };
@@ -65,7 +65,7 @@ import compiler::module_graph::{ ModulePath };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ ArrayType };
 import compiler::types::generic::{ InstantiatedType };
-import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
+import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry, TemplateKind };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::types::resolver::{ ResolutionContext, TypeResolver };
@@ -73,7 +73,7 @@ import compiler::types::substitution::{ TypeSubstitution };
 import compiler::types::trait_checker::{ TraitChecker };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef, TypeKey };
-import compiler::types::user_defined::{ ClassType, EnumType, StructType };
+import compiler::types::user_defined::{ EnumType, StructType };
 
 
 // `SpecializationEntry` + `MonomorphRequest` live in `compiler::mono::state` so
@@ -290,7 +290,7 @@ type struct Monomorphizer {
         for (mut i: i64 = 0; i < unprocessed.length; i++) {
             const t: Type* = this.arena.lookup(unprocessed[i]);
             if (t != null && t.kind == TypeKind::InstantiatedType) {
-                const inst: InstantiatedType* = t as InstantiatedType*;
+                const inst: InstantiatedType* = t.as_instantiated();
                 this.generic_registry.mark_monomorphized(inst.generic_base, inst.type_args);
             }
         }
@@ -417,9 +417,9 @@ type struct Monomorphizer {
         // A function's copy is the instance it was made for: what a call to
         // the instance is pinned by, and what its registration files the
         // copy's entry under.
-        if (entry.node_kind == NodeKind::FunctionDeclaration && result.specialized_ast != null
-                && result.specialized_ast.kind == NodeKind::FunctionDeclaration) {
-            (result.specialized_ast as declaration::FunctionDeclNode*).instance = request.generic_type;
+        if (entry.kind == TemplateKind::Function && result.specialized_ast != null
+                && DeclarationNode::fn_of(result.specialized_ast) != null) {
+            DeclarationNode::fn_of(result.specialized_ast).instance = request.generic_type;
         }
 
         // Create concrete type in arena based on node kind
@@ -439,7 +439,7 @@ type struct Monomorphizer {
         // substitution.  Removing them here means resolve_specialized_ast never
         // sees an uncompilable body and DI never indexes a junk signature.
         this.trait_spec.filter_bounds_violating_methods(result.specialized_ast, &subst);
-        const kept_impl_asts: [ASTNode*] = this.trait_spec.filter_bounds_violating_impls(
+        const kept_impl_asts: [DeclarationNode*] = this.trait_spec.filter_bounds_violating_impls(
             result.impl_asts, &request.type_args);
 
         // Determine the concrete aggregate kind for this template.  Function
@@ -447,13 +447,13 @@ type struct Monomorphizer {
         mut target_kind: TypeKind = TypeKind::Struct;
         mut is_named: boolean = true;
         mut is_union_kind: boolean = false;
-        match (entry.node_kind) {
-            NodeKind::StructDeclaration   => { target_kind = TypeKind::Struct; }
-            NodeKind::UnionDeclaration    => { target_kind = TypeKind::Struct; is_union_kind = true; }
-            NodeKind::EnumDeclaration     => { target_kind = TypeKind::Enum; }
-            NodeKind::ClassDeclaration    => { target_kind = TypeKind::Class; }
-            NodeKind::FunctionDeclaration => { is_named = false; }
-            _                             => { target_kind = TypeKind::Struct; }
+        match (entry.kind) {
+            TemplateKind::Struct    => { target_kind = TypeKind::Struct; }
+            TemplateKind::Union     => { target_kind = TypeKind::Struct; is_union_kind = true; }
+            TemplateKind::Enum      => { target_kind = TypeKind::Enum; }
+            TemplateKind::Function  => { is_named = false; }
+            TemplateKind::Trait     => { target_kind = TypeKind::Struct; }
+            TemplateKind::TypeAlias => { target_kind = TypeKind::Struct; }
         }
 
         // Human-readable display name ("Pair<i32, string>"), computed from the
@@ -530,9 +530,8 @@ type struct Monomorphizer {
                 if (concrete_type.is_valid() && display_name.is_valid()) {
                     const ct: Type* = this.arena.lookup(concrete_type);
                     if (ct != null) {
-                        if (ct.kind == TypeKind::Struct)     { (ct as StructType*).set_display_name(display_name); }
-                        else if (ct.kind == TypeKind::Enum)  { (ct as EnumType*).set_display_name(display_name); }
-                        else if (ct.kind == TypeKind::Class) { (ct as ClassType*).set_display_name(display_name); }
+                        if (ct.kind == TypeKind::Struct)     { ct.as_struct().set_display_name(display_name); }
+                        else if (ct.kind == TypeKind::Enum)  { ct.as_enum().set_display_name(display_name); }
                     }
                 }
             }
@@ -576,22 +575,22 @@ type struct Monomorphizer {
         // target off a spelling.
         for (mut ri: i64 = 0; ri < kept_impl_asts.length; ri++) {
             if (kept_impl_asts[ri] != null && concrete_type.is_valid()) {
-                (kept_impl_asts[ri] as declaration::ImplBlockNode*).spec_owner = concrete_type;
+                declaration::DeclarationNode::impl_of(kept_impl_asts[ri]).spec_owner = concrete_type;
             }
         }
         // Compile-time `static match` arm pruning.  Runs AFTER substitution but
         // BEFORE resolve_specialized_ast, so dead arms are removed first.
-        this.ast_resolver.prune_static_match_arms(result.specialized_ast, entry.node_kind, entry, &subst);
+        this.ast_resolver.prune_static_match_arms(result.specialized_ast, entry.kind);
         for (mut ri: i64 = 0; ri < kept_impl_asts.length; ri++) {
-            this.ast_resolver.prune_static_match_arms(kept_impl_asts[ri], NodeKind::ImplementationBlock, entry, &subst);
+            this.ast_resolver.prune_static_match_arms_in_impl(declaration::DeclarationNode::impl_of(kept_impl_asts[ri]));
         }
-        this.ast_resolver.resolve_specialized_ast(result.specialized_ast, entry.node_kind, entry, &subst, this_type_for_methods);
+        this.ast_resolver.resolve_specialized_ast(result.specialized_ast, entry.kind, this_type_for_methods);
         // An impl block is resolved under its own parameters, bound through
         // its head, not under the template's.
         for (mut ri: i64 = 0; ri < kept_impl_asts.length; ri++) {
-            mut head: TypeSubstitution = this.trait_spec.head_bindings(
-                kept_impl_asts[ri] as declaration::ImplBlockNode*, &request.type_args);
-            this.ast_resolver.resolve_specialized_ast(kept_impl_asts[ri], NodeKind::ImplementationBlock, entry, &head, this_type_for_methods);
+            const ib: declaration::ImplBlock* = declaration::DeclarationNode::impl_of(kept_impl_asts[ri]);
+            mut head: TypeSubstitution = this.trait_spec.head_bindings(ib, &request.type_args);
+            this.ast_resolver.resolve_specialized_impl(ib, &head, this_type_for_methods);
         }
 
         // A specialized TYPE is a declaration this pass writes, and it is
@@ -623,7 +622,7 @@ type struct Monomorphizer {
             this.register_carried_methods(result.specialized_ast, concrete_type);
             for (mut ri: i64 = 0; ri < kept_impl_asts.length; ri++) {
                 if (kept_impl_asts[ri] == null) { continue; }
-                const ib: declaration::ImplBlockNode* = kept_impl_asts[ri] as declaration::ImplBlockNode*;
+                const ib: declaration::ImplBlock* = declaration::DeclarationNode::impl_of(kept_impl_asts[ri]);
                 this.decl_index.register_methods(
                     concrete_type, ib.methods, this.intern_table, this.arena, "mono/placed spec impl methods");
             }
@@ -641,7 +640,7 @@ type struct Monomorphizer {
         // unpinned.  `kept_impl_asts` is MOVED into the
         // entry, so capture the impl-node pointers into a walk list first (they alias
         // the same nodes the entry now owns).
-        mut walk_impls: [ASTNode*] = [];
+        mut walk_impls: [DeclarationNode*] = [];
         for (mut ri: i64 = 0; ri < kept_impl_asts.length; ri++) {
             walk_impls.push(kept_impl_asts[ri]);
         }
@@ -685,18 +684,18 @@ type struct Monomorphizer {
                 this.arena.swap_wrapper_to_concrete(concrete_type, qualified_spec_sym,
                     entry.declared_in, target_kind, is_union_kind, display_name);
             }
-            this.type_populator.populate_concrete_type(concrete_type, result.specialized_ast, entry.node_kind, &subst, entry, &walk_impls);
+            this.type_populator.populate_concrete_type(concrete_type, result.specialized_ast, &subst, entry, &walk_impls);
 
             if (!swap_path) {
                 const inst_t: Type* = this.arena.lookup(request.generic_type);
                 if (inst_t != null && inst_t.kind == TypeKind::InstantiatedType) {
-                    (inst_t as InstantiatedType*).set_resolved_type(concrete_type);
+                    inst_t.as_instantiated().set_resolved_type(concrete_type);
                     // Record the concrete's intrinsic generic-instantiation identity:
                     // the instantiation it was built from (the `inst_*` views read this).
                     this.arena.set_type_generic_origin(concrete_type, request.generic_type);
                 }
             }
-        } else if (entry.node_kind == NodeKind::FunctionDeclaration) {
+        } else if (entry.kind == TemplateKind::Function) {
             // Function templates don't create named arena types, but still get a
             // concrete FunctionType so the InstantiatedType has a valid resolved_type.
             // (No generic origin: a FunctionType is not an aggregate and carries
@@ -735,7 +734,7 @@ type struct Monomorphizer {
                     // `set_signature`, NOT `set_resolved_type`: this records the
                     // spec's SIGNATURE, it does not claim the wrapper collapsed
                     // into it.  Same storage, different assertion.
-                    (inst_t as InstantiatedType*).set_signature(func_type);
+                    inst_t.as_instantiated().set_signature(func_type);
                 }
             }
         }
@@ -755,7 +754,7 @@ type struct Monomorphizer {
         if (concrete_type.is_valid()) {
             this.state.nested_visited = [];
             this.state.request_nested_instantiations(concrete_type);
-        } else if (entry.node_kind == NodeKind::FunctionDeclaration) {
+        } else if (entry.kind == TemplateKind::Function) {
             // Walk the SIGNATURE's param/return types for nested instantiations.
             // The checked accessor is deliberate: this path is only meaningful
             // for a FunctionType, and reading `resolved_type` raw would happily
@@ -774,26 +773,26 @@ type struct Monomorphizer {
 
     create_concrete_type(mut &this, entry: TemplateEntry*, spec_name: SymbolStr,
                          subst: TypeSubstitution*) -> TypeRef {
-        return match (entry.node_kind) {
-            NodeKind::StructDeclaration => {
+        return match (entry.kind) {
+            TemplateKind::Struct => {
                 this.arena.create_struct(spec_name, entry.declared_in)
             }
-            NodeKind::UnionDeclaration => {
+            TemplateKind::Union => {
                 this.arena.create_union(spec_name, entry.declared_in)
             }
-            NodeKind::EnumDeclaration => {
+            TemplateKind::Enum => {
                 this.arena.create_enum(spec_name, entry.declared_in)
             }
-            NodeKind::ClassDeclaration => {
-                this.arena.create_class(spec_name, entry.declared_in)
-            }
-            NodeKind::FunctionDeclaration => {
+            TemplateKind::Function => {
                 // Generic functions don't create arena types; they just produce
                 // specialized AST declarations.  Return invalid so
                 // specialize_with_entry skips type population.
                 TypeRef::invalid()
             }
-            _ => {
+            TemplateKind::Trait => {
+                this.arena.create_struct(spec_name, entry.declared_in)
+            }
+            TemplateKind::TypeAlias => {
                 this.arena.create_struct(spec_name, entry.declared_in)
             }
         };
@@ -821,12 +820,13 @@ type struct Monomorphizer {
         // bounds are checked at its call, and nothing else has one.
         const none: [TraitBound] = [];
         mut bounds: &[TraitBound] = &none;
-        match (entry.node_kind) {
-            NodeKind::StructDeclaration => { bounds = &(entry.ast_node as declaration::StructDeclNode*).where_bounds; }
-            NodeKind::UnionDeclaration  => { bounds = &(entry.ast_node as declaration::UnionDeclNode*).where_bounds; }
-            NodeKind::ClassDeclaration  => { bounds = &(entry.ast_node as declaration::ClassDeclNode*).where_bounds; }
-            NodeKind::EnumDeclaration   => { bounds = &(entry.ast_node as declaration::EnumDeclNode*).where_bounds; }
-            _ => { return true; }
+        match (entry.kind) {
+            TemplateKind::Struct    => { bounds = &(declaration::DeclarationNode::struct_of(entry.ast_node)).where_bounds; }
+            TemplateKind::Union     => { bounds = &(declaration::DeclarationNode::union_of(entry.ast_node)).where_bounds; }
+            TemplateKind::Enum      => { bounds = &declaration::DeclarationNode::enum_of(entry.ast_node).where_bounds; }
+            TemplateKind::Function  => { return true; }
+            TemplateKind::Trait     => { return true; }
+            TemplateKind::TypeAlias => { return true; }
         }
         mut concrete: TypeRef = TypeRef::invalid();
         const tref: TraitRef* = this.trait_checker.unsatisfied_trait_ref(bounds, subst, &concrete);
@@ -845,10 +845,10 @@ type struct Monomorphizer {
             fmt::format("the trait bound `%s: %s` is not satisfied by `%s<%s>`",
                 concrete_str, trait_str, tmpl_str, args_str));
         diag = diag.at_with_label(tref.span, fmt::format("required by this bound on `%s`", tmpl_str));
-        diag = diag.with_note(fmt::format("the trait `%s` is not implemented for `%s`", trait_str, concrete_str));
-        diag = diag.help(fmt::format(
+        diag = diag.with_note(this.trait_checker.bound_failure_note(concrete, tref.definition(), trait_str, concrete_str));
+        diag = diag.help(this.trait_checker.bound_failure_help(concrete, tref.definition(), trait_str, concrete_str, fmt::format(
             "implement `%s` for `%s`, or instantiate `%s` with a type that does",
-            trait_str, concrete_str, tmpl_str));
+            trait_str, concrete_str, tmpl_str)));
         this.diagnostics.emit(diag);
         return false;
     }
@@ -869,42 +869,41 @@ type struct Monomorphizer {
     /// Stamp the id a specialized type declaration registered under.  The
     /// cloner leaves the field invalid (a clone has its own registration,
     /// never its template's), so this is the clone's one writer.
-    static stamp_def(node: ASTNode*, d: DefId) -> void {
+    static stamp_def(node: DeclarationNode*, d: DefId) -> void {
         if (node == null) { return; }
-        if (node.kind == NodeKind::StructDeclaration) { (node as declaration::StructDeclNode*).def = d; return; }
-        if (node.kind == NodeKind::UnionDeclaration)  { (node as declaration::UnionDeclNode*).def = d; return; }
-        if (node.kind == NodeKind::ClassDeclaration)  { (node as declaration::ClassDeclNode*).def = d; return; }
-        if (node.kind == NodeKind::EnumDeclaration)   { (node as declaration::EnumDeclNode*).def = d; return; }
-        if (node.kind == NodeKind::TraitDeclaration)  { (node as declaration::TraitDeclNode*).def = d; return; }
-        if (node.kind == NodeKind::TypeAliasDeclaration) { (node as declaration::TypeAliasDeclNode*).def = d; return; }
+        if (DeclarationNode::struct_of(node) != null) { (declaration::DeclarationNode::struct_of(node)).def = d; return; }
+        if (DeclarationNode::union_of(node) != null)  { (declaration::DeclarationNode::union_of(node)).def = d; return; }
+        const tr: declaration::TraitDecl* = declaration::DeclarationNode::trait_of(node);
+        if (tr != null) { tr.def = d; return; }
+        const en: declaration::EnumDecl* = declaration::DeclarationNode::enum_of(node);
+        if (en != null) { en.def = d; return; }
+        const alias: declaration::TypeAliasDecl* = declaration::DeclarationNode::alias_of(node);
+        if (alias != null) { alias.def = d; }
     }
 
     /// Register the methods a specialized type declaration carries inline,
     /// under the type.  An enum's methods live in its impl blocks; a kind
     /// with no method list carries nothing.
-    register_carried_methods(mut &this, node: ASTNode*, spec_type: TypeRef) -> void {
+    register_carried_methods(mut &this, node: DeclarationNode*, spec_type: TypeRef) -> void {
         if (node == null) { return; }
-        if (node.kind == NodeKind::StructDeclaration) {
-            this.decl_index.register_methods(spec_type, (node as declaration::StructDeclNode*).methods,
+        if (DeclarationNode::struct_of(node) != null) {
+            this.decl_index.register_methods(spec_type, (declaration::DeclarationNode::struct_of(node)).methods,
                 this.intern_table, this.arena, "mono/placed spec struct methods");
-        } else if (node.kind == NodeKind::UnionDeclaration) {
-            this.decl_index.register_methods(spec_type, (node as declaration::UnionDeclNode*).methods,
+        } else if (DeclarationNode::union_of(node) != null) {
+            this.decl_index.register_methods(spec_type, (declaration::DeclarationNode::union_of(node)).methods,
                 this.intern_table, this.arena, "mono/placed spec union methods");
-        } else if (node.kind == NodeKind::ClassDeclaration) {
-            this.decl_index.register_methods(spec_type, (node as declaration::ClassDeclNode*).methods,
-                this.intern_table, this.arena, "mono/placed spec class methods");
         }
     }
 
     /// The visibility a specialized type declaration carries: its template's,
     /// which the cloner copied onto the node.  A kind without a modifier is
     /// public.
-    static node_is_public(node: ASTNode*) -> boolean {
+    static node_is_public(node: DeclarationNode*) -> boolean {
         if (node == null) { return true; }
-        if (node.kind == NodeKind::StructDeclaration) { return (node as declaration::StructDeclNode*).is_public; }
-        if (node.kind == NodeKind::UnionDeclaration)  { return (node as declaration::UnionDeclNode*).is_public; }
-        if (node.kind == NodeKind::ClassDeclaration)  { return (node as declaration::ClassDeclNode*).is_public; }
-        if (node.kind == NodeKind::EnumDeclaration)   { return (node as declaration::EnumDeclNode*).is_public; }
+        if (DeclarationNode::struct_of(node) != null) { return (declaration::DeclarationNode::struct_of(node)).is_public; }
+        if (DeclarationNode::union_of(node) != null)  { return (declaration::DeclarationNode::union_of(node)).is_public; }
+        const en: declaration::EnumDecl* = declaration::DeclarationNode::enum_of(node);
+        if (en != null) { return en.is_public; }
         return true;
     }
 
@@ -1017,7 +1016,7 @@ type struct Monomorphizer {
         // unresolved after mono (E0900).
         const inst_t: Type* = this.arena.lookup(request.generic_type);
         if (inst_t != null && inst_t.kind == TypeKind::InstantiatedType) {
-            (inst_t as InstantiatedType*).set_resolved_type(entry.specialized_type);
+            inst_t.as_instantiated().set_resolved_type(entry.specialized_type);
             this.arena.set_type_generic_origin(entry.specialized_type, request.generic_type);
         }
     }

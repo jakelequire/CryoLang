@@ -20,8 +20,8 @@ import compiler::resolver::res;
 import compiler::resolver::res::{ Res, ResSlot };
 import compiler::ast;
 import compiler::ast::{
-    expression, LiteralKind, MemberPin, node, NodeKind, pattern, PatternBinding,
-    PatternElement, PatternKind, statement
+    expression, LiteralKind, MemberPin, node, pattern, PatternBinding,
+    PatternElement, statement
 };
 import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, source_span, suggestion };
@@ -32,8 +32,8 @@ import compiler::compilation_context::{ CompilationContext };
 import compiler::sema::{ state, type_utils, symbolic_checker, scope_manager, helpers };
 import std::fmt;
 import compiler::ast::expression::{ ExpressionNode };
-import compiler::ast::pattern::{ EnumPatternNode, MatchArmNode, PatternNode };
-import compiler::ast::statement::{ BlockStmtNode, ExprStmtNode, StatementNode };
+import compiler::ast::pattern::{ EnumPattern, MatchArmNode, Pattern, PatternKind, RangePattern };
+import compiler::ast::statement::{ Stmt, StmtKind };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::diag::suggestion::{ Applicability };
@@ -107,17 +107,18 @@ type struct PatternResolver {
     bind_arm_patterns(mut &this, arm: MatchArmNode*, subject_type: TypeRef,
                       caller_backed: boolean) -> void {
         for (mut i: i64 = 0; i < arm.patterns.length; i++) {
-            const pat: PatternNode* = arm.patterns[i];
+            const pat: Pattern* = arm.patterns[i];
             if (pat == null) { continue; }
-            if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
-                pat.binding_type = subject_type;
-                if (subject_type.is_valid()) {
-                    this.bind_arm_name(pat.binding_sym, subject_type, caller_backed);
+            match (pat.kind) {
+                PatternKind::Binding(b) => {
+                    b.binding_type = subject_type;
+                    if (subject_type.is_valid()) {
+                        this.bind_arm_name(b.binding_sym, subject_type, caller_backed);
+                    }
                 }
-                continue;
+                PatternKind::Enum(e) => { this.bind_enum_pattern(e, subject_type, caller_backed); }
+                _ => { }
             }
-            if (pat.pattern_kind != PatternKind::Enum) { continue; }
-            this.bind_enum_pattern(pat as EnumPatternNode*, subject_type, caller_backed);
         }
         if (arm.patterns.length > 1 && !this.state.in_symbolic_check) {
             this.check_alternatives_agree(arm);
@@ -135,7 +136,7 @@ type struct PatternResolver {
         if (arm.patterns[0] == null) { return; }
         PatternResolver::collect_alt_bindings(arm.patterns[0], &first);
         for (mut i: i64 = 1; i < arm.patterns.length; i++) {
-            const alt: PatternNode* = arm.patterns[i];
+            const alt: Pattern* = arm.patterns[i];
             if (alt == null) { continue; }
             mut here: [AltBinding] = [];
             PatternResolver::collect_alt_bindings(alt, &here);
@@ -193,17 +194,20 @@ type struct PatternResolver {
     }
 
     /// The names `pat` binds, at any depth, in the order written.
-    static collect_alt_bindings(pat: PatternNode*, out: mut &[AltBinding]) -> void {
+    static collect_alt_bindings(pat: Pattern*, out: mut &[AltBinding]) -> void {
         if (pat == null) { return; }
-        if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
-            out.push(AltBinding {
-                sym: pat.binding_sym, name: pat.binding_name, ty: pat.binding_type,
-                written_mut: false, span: pat.span,
-            });
-            return;
+        mut ep: EnumPattern* = null;
+        match (pat.kind) {
+            PatternKind::Binding(b) => {
+                out.push(AltBinding {
+                    sym: b.binding_sym, name: b.name, ty: b.binding_type,
+                    written_mut: false, span: pat.span,
+                });
+                return;
+            }
+            PatternKind::Enum(e) => { ep = e; }
+            _ => { return; }
         }
-        if (pat.pattern_kind != PatternKind::Enum) { return; }
-        const ep: EnumPatternNode* = pat as EnumPatternNode*;
         for (mut j: i64 = 0; j < ep.elements.length; j++) {
             const pb: PatternBinding* = ep.binding_at(j);
             if (pb != null) {
@@ -244,7 +248,7 @@ type struct PatternResolver {
     /// Resolve the positional payload types of `enum_pat`'s variant against a value
     /// of `value_type`, applying the value-instantiation's generic substitution.
     resolve_variant_payload_types(mut &this, value_type: TypeRef,
-                                  enum_pat: EnumPatternNode*) -> [TypeRef] {
+                                  enum_pat: EnumPattern*) -> [TypeRef] {
         mut payload_types: [TypeRef] = [];
         mut enum_ty: Type* = this.types.unwrap_to_enum(value_type);
         const peeled_inst: InstantiatedType* = this.types.peel_to_instantiation(value_type);
@@ -289,14 +293,14 @@ type struct PatternResolver {
         }
         if (enum_ty == null || enum_ty.kind != TypeKind::Enum) { return payload_types; }
 
-        const et: EnumType* = enum_ty as EnumType*;
+        const et: EnumType* = enum_ty.as_enum();
         // The pattern's own stamp names the enum the SOURCE wrote; the enum
         // above is the subject's.  A variant leaf both declare would match
         // the subject through a pattern of another enum, so the two are
         // held to the same definition before the leaf is read.  Refused on
         // the committed walk only: the symbolic walk may check a pattern
         // against a type that is not its own.
-        if (!this.state.in_symbolic_check && !this.pattern_names_enum(enum_pat, et)) {
+        if (!this.state.in_symbolic_check && !this.pattern_names_enum(enum_pat, enum_ty)) {
             return payload_types;
         }
         const vi: i64 = et.variant_index(enum_pat.variant_name);
@@ -309,7 +313,7 @@ type struct PatternResolver {
         // same in the template and in every copy.  The symbolic walk records
         // it only where the pattern names the subject's own enum, for the
         // reason above.
-        if (!this.state.in_symbolic_check || this.pattern_is_subjects_enum(enum_pat, et)) {
+        if (!this.state.in_symbolic_check || this.pattern_is_subjects_enum(enum_pat, enum_ty)) {
             enum_pat.set_resolved_member(MemberPin::Variant(vi));
         }
         payload_types = sema_copy_type_refs(&variant.payload_types);
@@ -339,7 +343,7 @@ type struct PatternResolver {
     }
 
     /// The enum `enum_pat`'s stamp names, or null when it makes no enum claim.
-    pattern_enum(&this, enum_pat: EnumPatternNode*) -> Type* {
+    pattern_enum(&this, enum_pat: EnumPattern*) -> Type* {
         mut named: TypeRef = TypeRef::invalid();
         match (enum_pat.res) {
             ResSlot::Answered(r) => {
@@ -358,9 +362,9 @@ type struct PatternResolver {
 
     /// Whether the pattern's stamp names `subject`'s own enum definition,
     /// without reporting anything.
-    pattern_is_subjects_enum(&this, enum_pat: EnumPatternNode*, subject: EnumType*) -> boolean {
+    pattern_is_subjects_enum(&this, enum_pat: EnumPattern*, subject: Type*) -> boolean {
         const named_t: Type* = this.pattern_enum(enum_pat);
-        return named_t != null && PatternResolver::enum_definition_id(named_t as EnumType*)
+        return named_t != null && PatternResolver::enum_definition_id(named_t)
             == PatternResolver::enum_definition_id(subject);
     }
 
@@ -370,13 +374,13 @@ type struct PatternResolver {
     /// synthesized one without a stamp asserts nothing).  A pattern naming
     /// another enum is refused: its variant leaf may be one the subject's
     /// enum also declares, and reading the leaf off the subject would match.
-    pattern_names_enum(mut &this, enum_pat: EnumPatternNode*, subject: EnumType*) -> boolean {
+    pattern_names_enum(mut &this, enum_pat: EnumPattern*, subject: Type*) -> boolean {
         const named_t: Type* = this.pattern_enum(enum_pat);
         if (named_t == null) { return true; }
-        if (PatternResolver::enum_definition_id(named_t as EnumType*)
+        if (PatternResolver::enum_definition_id(named_t)
                 == PatternResolver::enum_definition_id(subject)) { return true; }
-        const want: string = this.intern.shown(subject.qualified_name);
-        const got: string = this.intern.shown((named_t as EnumType*).qualified_name);
+        const want: string = this.intern.shown(subject.as_enum().qualified_name);
+        const got: string = this.intern.shown(named_t.as_enum().qualified_name);
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0200_TYPE_MISMATCH,
             fmt::format("pattern names enum `%s`, but the value matched is `%s`", got, want));
         diag = diag.at_with_label(enum_pat.enum_span, fmt::format("expected `%s`", want));
@@ -386,9 +390,10 @@ type struct PatternResolver {
 
     /// The definition an enum type is an instance of: its template's arena
     /// id for an instantiation, its own otherwise.
-    static enum_definition_id(et: EnumType*) -> u64 {
+    static enum_definition_id(t: Type*) -> u64 {
+        const et: EnumType* = t.as_enum();
         if (et.generic_base.is_valid()) { return et.generic_base.key(); }
-        return et.id;
+        return t.id;
     }
 
     /// Report a pattern naming a variant the enum does not have.
@@ -406,7 +411,7 @@ type struct PatternResolver {
     /// Only reported once the subject's enum type is known and the walk is
     /// committed: during the symbolic pass a pattern may legitimately be
     /// checked against a type that is not its own.
-    report_unknown_variant(mut &this, et: EnumType*, enum_pat: EnumPatternNode*) -> void {
+    report_unknown_variant(mut &this, et: EnumType*, enum_pat: EnumPattern*) -> void {
         if (et == null || enum_pat == null) { return; }
         if (this.state.in_symbolic_check) { return; }
         if (!enum_pat.variant_name.is_valid()) { return; }
@@ -431,11 +436,16 @@ type struct PatternResolver {
 
     /// Bind the names of an enum pattern matched against a value of `value_type`,
     /// recursing into nested sub-patterns; each element binds against its payload.
-    bind_enum_pattern(mut &this, enum_pat: EnumPatternNode*, value_type: TypeRef,
+    bind_enum_pattern(mut &this, enum_pat: EnumPattern*, value_type: TypeRef,
                       caller_backed: boolean) -> void {
-        const payload_types: [TypeRef] = this.resolve_variant_payload_types(value_type, enum_pat);
+        // A subject with no type was refused where it was written; its
+        // bindings get no type either, where the variant's template would
+        // bind them to its own parameters and every use would report again.
+        const payload_types: [TypeRef] = if (value_type.is_valid()) {
+            this.resolve_variant_payload_types(value_type, enum_pat)
+        } else { [] };
         for (mut j: i64 = 0; j < enum_pat.elements.length; j++) {
-            mut elem_ty: TypeRef = this.arena.get_void();
+            mut elem_ty: TypeRef = if (value_type.is_valid()) { this.arena.get_void() } else { TypeRef::invalid() };
             if (j < payload_types.length && payload_types[j].is_valid()) {
                 elem_ty = payload_types[j];
             } else if (value_type.is_valid()) {
@@ -449,25 +459,25 @@ type struct PatternResolver {
                 this.bind_payload(pb.sym_id, elem_ty, caller_backed);
                 continue;
             }
-            const sub: PatternNode* = enum_pat.sub_at(j);
+            const sub: Pattern* = enum_pat.sub_at(j);
             if (sub != null) { this.bind_subpattern(sub, elem_ty, caller_backed); }
         }
     }
 
     /// Bind names in an arbitrary nested pattern matched against `value_type`.
     /// Only identifier bindings and nested enum patterns introduce names.
-    bind_subpattern(mut &this, pat: PatternNode*, value_type: TypeRef,
+    bind_subpattern(mut &this, pat: Pattern*, value_type: TypeRef,
                     caller_backed: boolean) -> void {
         if (pat == null) { return; }
-        if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
-            pat.binding_type = value_type;
-            if (value_type.is_valid()) {
-                this.bind_arm_name(pat.binding_sym, value_type, caller_backed);
+        match (pat.kind) {
+            PatternKind::Binding(b) => {
+                b.binding_type = value_type;
+                if (value_type.is_valid()) {
+                    this.bind_arm_name(b.binding_sym, value_type, caller_backed);
+                }
             }
-            return;
-        }
-        if (pat.pattern_kind == PatternKind::Enum) {
-            this.bind_enum_pattern(pat as EnumPatternNode*, value_type, caller_backed);
+            PatternKind::Enum(e) => { this.bind_enum_pattern(e, value_type, caller_backed); }
+            _ => { }
         }
     }
 
@@ -476,7 +486,7 @@ type struct PatternResolver {
 
     /// True when an enum arm's payload is irrefutable (no payload, or every element
     /// is a binding/wildcard).  `None`/`Some(x)`/`Some(_)` yes; `Some(5)` no.
-    arm_payload_irrefutable(&this, epat: EnumPatternNode*) -> boolean {
+    arm_payload_irrefutable(&this, epat: EnumPattern*) -> boolean {
         for (mut i: i64 = 0; i < epat.elements.length; i++) {
             const ok: boolean = match (epat.elements[i]) {
                 PatternElement::Binding(_)  => { true }
@@ -491,15 +501,12 @@ type struct PatternResolver {
     /// Do the alternative patterns `pats` exhaustively cover `value_type`?  Recurses
     /// into nested enum sub-patterns; conservative for non-enum slots and multi-
     /// position narrowing.  `depth` guards pathologically deep recursive types.
-    patterns_cover(mut &this, pats: &[PatternNode*], value_type: TypeRef, depth: i32) -> boolean {
+    patterns_cover(mut &this, pats: &[Pattern*], value_type: TypeRef, depth: i32) -> boolean {
         if (depth > 16) { return false; }
         for (mut i: i64 = 0; i < pats.length; i++) {
-            const p: PatternNode* = pats[i];
+            const p: Pattern* = pats[i];
             if (p == null) { continue; }
-            if (p.pattern_kind == PatternKind::Wildcard
-                    || (p.pattern_kind == PatternKind::Identifier && p.binding_name.is_valid())) {
-                return true;
-            }
+            if (p.is_irrefutable()) { return true; }
         }
         mut enum_ty: Type* = this.types.unwrap_to_enum(value_type);
         // Pre-mono: an unresolved Result/Option instantiation -> generic base enum
@@ -511,16 +518,14 @@ type struct PatternResolver {
             }
         }
         if (enum_ty == null || enum_ty.kind != TypeKind::Enum) { return false; }
-        const et: EnumType* = enum_ty as EnumType*;
+        const et: EnumType* = enum_ty.as_enum();
         if (et.variants.length == 0) { return false; }
         for (mut vi: i64 = 0; vi < et.variants.length; vi++) {
-            mut v_arms: [EnumPatternNode*] = [];
+            mut v_arms: [EnumPattern*] = [];
             for (mut i: i64 = 0; i < pats.length; i++) {
-                const p: PatternNode* = pats[i];
-                if (p != null && p.pattern_kind == PatternKind::Enum) {
-                    const ep: EnumPatternNode* = p as EnumPatternNode*;
-                    if (et.variant_index(ep.variant_name) == vi) { v_arms.push(ep); }
-                }
+                const p: Pattern* = pats[i];
+                const ep: EnumPattern* = if (p != null) { p.enum_payload() } else { null };
+                if (ep != null && et.variant_index(ep.variant_name) == vi) { v_arms.push(ep); }
             }
             if (v_arms.length == 0) { return false; }
             if (!this.variant_covered(&v_arms, value_type, depth)) { return false; }
@@ -530,7 +535,7 @@ type struct PatternResolver {
 
     /// Is a variant fully covered by the enum-pattern arms `v_arms` (all the same
     /// variant) against a value of `parent_value_type`?
-    variant_covered(mut &this, v_arms: &[EnumPatternNode*],
+    variant_covered(mut &this, v_arms: &[EnumPattern*],
                     parent_value_type: TypeRef, depth: i32) -> boolean {
         for (mut i: i64 = 0; i < v_arms.length; i++) {
             if (this.arm_payload_irrefutable(v_arms[i])) { return true; }
@@ -539,11 +544,11 @@ type struct PatternResolver {
         const payload_types: [TypeRef] =
             this.resolve_variant_payload_types(parent_value_type, v_arms[0]);
         if (payload_types.length != 1) { return false; }
-        mut sub_alts: [PatternNode*] = [];
+        mut sub_alts: [Pattern*] = [];
         for (mut i: i64 = 0; i < v_arms.length; i++) {
-            const ep: EnumPatternNode* = v_arms[i];
+            const ep: EnumPattern* = v_arms[i];
             if (ep.elements.length < 1) { continue; }
-            const sub: PatternNode* = ep.sub_at(0);
+            const sub: Pattern* = ep.sub_at(0);
             if (sub != null) { sub_alts.push(sub); }
         }
         return this.patterns_cover(&sub_alts, payload_types[0], depth + 1);
@@ -553,12 +558,12 @@ type struct PatternResolver {
     /// expression-match to decide whether a `_` arm is required).
     match_is_exhaustive(mut &this, subject: ExpressionNode*, arms: &[MatchArmNode*]) -> boolean {
         if (subject == null) { return false; }
-        mut top_pats: [PatternNode*] = [];
+        mut top_pats: [Pattern*] = [];
         for (mut i: i64 = 0; i < arms.length; i++) {
             const arm: MatchArmNode* = arms[i];
             if (arm == null || arm.guard != null) { continue; }
             for (mut j: i64 = 0; j < arm.patterns.length; j++) {
-                const pat: PatternNode* = arm.patterns[j];
+                const pat: Pattern* = arm.patterns[j];
                 if (pat != null) { top_pats.push(pat); }
             }
         }
@@ -575,9 +580,13 @@ type struct PatternResolver {
             if (arm.guard != null) { continue; }
             mut is_default: boolean = false;
             for (mut j: i64 = 0; j < arm.patterns.length; j++) {
-                const pat: PatternNode* = arm.patterns[j];
+                const pat: Pattern* = arm.patterns[j];
                 if (pat == null) { continue; }
-                if (pat.pattern_kind == PatternKind::Wildcard) { is_default = true; break; }
+                match (pat.kind) {
+                    PatternKind::Wildcard => { is_default = true; }
+                    _                     => { }
+                }
+                if (is_default) { break; }
             }
             if (is_default) {
                 if (seen_default) {
@@ -606,18 +615,25 @@ type struct PatternResolver {
             const arm: MatchArmNode* = arms[i];
             if (arm == null) { continue; }
             for (mut j: i64 = 0; j < arm.patterns.length; j++) {
-                const pat: PatternNode* = arm.patterns[j];
+                const pat: Pattern* = arm.patterns[j];
                 if (pat == null) { continue; }
-                if (pat.pattern_kind != PatternKind::Literal
-                        && pat.pattern_kind != PatternKind::Range) { continue; }
+                mut tested: boolean = false;
+                mut literal_kind: LiteralKind = LiteralKind::Integer;
+                mut range: RangePattern* = null;
+                match (pat.kind) {
+                    PatternKind::Literal(l) => { tested = true; literal_kind = l.literal_kind; }
+                    PatternKind::Range(r)   => { tested = true; literal_kind = r.literal_kind; range = r; }
+                    _                       => { }
+                }
+                if (!tested) { continue; }
 
                 if (subject != null) {
-                    this.check_pattern_fits_subject(pat, subject, subject_type);
+                    this.check_pattern_fits_subject(pat, literal_kind, range != null, subject, subject_type);
                 }
-                if (pat.pattern_kind != PatternKind::Range) { continue; }
+                if (range == null) { continue; }
 
-                const lo: i64 = sema_decode_range_bound(this.intern.resolve(pat.value), pat.literal_kind);
-                const hi: i64 = sema_decode_range_bound(this.intern.resolve(pat.high_value), pat.literal_kind);
+                const lo: i64 = sema_decode_range_bound(this.intern.resolve(range.low), range.literal_kind);
+                const hi: i64 = sema_decode_range_bound(this.intern.resolve(range.high), range.literal_kind);
                 if (lo > hi) {
                     this.ctx.emit_error_at(ErrorCode::E0628_PATTERN_MATCHING_ERROR,
                         fmt::format("range pattern lower bound (%lld) exceeds upper bound (%lld)", lo, hi),
@@ -629,14 +645,13 @@ type struct PatternResolver {
 
     /// E0200 when a literal or range pattern's kind is not the subject's own
     /// type (see `check_literal_patterns`).
-    check_pattern_fits_subject(mut &this, pat: PatternNode*, subject: Type*,
-                               subject_type: TypeRef) -> void {
+    check_pattern_fits_subject(mut &this, pat: Pattern*, literal_kind: LiteralKind, is_range: boolean,
+                               subject: Type*, subject_type: TypeRef) -> void {
         const k: TypeKind = subject.kind;
-        const is_range: boolean = pat.pattern_kind == PatternKind::Range;
         mut fits: boolean = true;
         mut kind: string = "";
         mut wants: string = "";
-        match (pat.literal_kind) {
+        match (literal_kind) {
             LiteralKind::String  => {
                 fits = k == TypeKind::String; kind = "string"; wants = "a `string`";
             }
@@ -668,22 +683,19 @@ type struct PatternResolver {
         if (!subject_type.is_valid()) { return; }
         const enum_ty: Type* = this.types.unwrap_to_enum(subject_type);
         if (enum_ty == null || enum_ty.kind != TypeKind::Enum) { return; }
-        const et: EnumType* = enum_ty as EnumType*;
+        const et: EnumType* = enum_ty.as_enum();
         if (et.variants.length == 0) { return; }
 
         // Gather unguarded top-level patterns; an unguarded `_`/binding catches all.
-        mut top_pats: [PatternNode*] = [];
+        mut top_pats: [Pattern*] = [];
         mut has_wildcard: boolean = false;
         for (mut i: i64 = 0; i < arms.length; i++) {
             const arm: MatchArmNode* = arms[i];
             if (arm == null || arm.guard != null) { continue; }
             for (mut j: i64 = 0; j < arm.patterns.length; j++) {
-                const pat: PatternNode* = arm.patterns[j];
+                const pat: Pattern* = arm.patterns[j];
                 if (pat == null) { continue; }
-                if (pat.pattern_kind == PatternKind::Wildcard
-                        || (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid())) {
-                    has_wildcard = true;
-                }
+                if (pat.is_irrefutable()) { has_wildcard = true; }
                 top_pats.push(pat);
             }
         }
@@ -691,13 +703,11 @@ type struct PatternResolver {
 
         mut missing_names: [string] = [];
         for (mut i: i64 = 0; i < et.variants.length; i++) {
-            mut v_arms: [EnumPatternNode*] = [];
+            mut v_arms: [EnumPattern*] = [];
             for (mut k: i64 = 0; k < top_pats.length; k++) {
-                const p: PatternNode* = top_pats[k];
-                if (p != null && p.pattern_kind == PatternKind::Enum) {
-                    const ep: EnumPatternNode* = p as EnumPatternNode*;
-                    if (et.variant_index(ep.variant_name) == i) { v_arms.push(ep); }
-                }
+                const p: Pattern* = top_pats[k];
+                const ep: EnumPattern* = if (p != null) { p.enum_payload() } else { null };
+                if (ep != null && et.variant_index(ep.variant_name) == i) { v_arms.push(ep); }
             }
             if (v_arms.length == 0 || !this.variant_covered(&v_arms, subject_type, 0)) {
                 missing_names.push(et.variants[i].display_name(this.intern));
@@ -764,22 +774,22 @@ type struct PatternResolver {
 
     /// The tail expression of an arm body (`expr` or the last `expr;` of a block),
     /// or null.  Used by the match-payload borrow-escape check.
-    arm_tail_expr(&this, stmt: StatementNode*) -> ExpressionNode* {
+    arm_tail_expr(&this, stmt: Stmt*) -> ExpressionNode* {
         if (stmt == null) { return null; }
-        if (stmt.kind == NodeKind::ExpressionStatement) {
-            return (stmt as ExprStmtNode*).expression;
-        }
-        if (stmt.kind == NodeKind::BlockStatement) {
-            const blk: BlockStmtNode* = stmt as BlockStmtNode*;
-            for (mut i: i64 = blk.statements.length - 1; i >= 0; i -= 1) {
-                const s: StatementNode* = blk.statements[i];
-                if (s == null) { continue; }
-                if (s.kind == NodeKind::ExpressionStatement) {
-                    return (s as ExprStmtNode*).expression;
+        match (stmt.kind) {
+            StmtKind::Expr(es) => { return es.expression; }
+            StmtKind::Block(blk) => {
+                for (mut i: i64 = blk.statements.length - 1; i >= 0; i -= 1) {
+                    const s: Stmt* = blk.statements[i];
+                    if (s == null) { continue; }
+                    return match (s.kind) {
+                        StmtKind::Expr(es) => { es.expression }
+                        _                  => { null }
+                    };
                 }
                 return null;
             }
+            _ => { return null; }
         }
-        return null;
     }
 }

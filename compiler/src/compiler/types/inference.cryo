@@ -17,7 +17,7 @@ namespace compiler::types::inference;
 
 import compiler::types::{ type_ref, type_base, compound, generic, arena, TypeKind };
 import compiler::types::arena::{ TypeArena };
-import compiler::types::compound::{ FunctionType, PointerType, ReferenceType };
+import compiler::types::compound::{ FunctionType, ObjectType, PointerType, ReferenceType };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 
@@ -108,13 +108,13 @@ type struct InferCtx {
         // Reference: tolerate mismatched ref-ness. `&T` vs `&T` peels both;
         // `&T` vs `T` peels just the formal; `&T` vs `*T` peels both.
         if (ft.kind == TypeKind::Reference) {
-            const fr: ReferenceType* = ft as ReferenceType*;
+            const fr: ReferenceType* = ft.as_reference();
             if (at.kind == TypeKind::Reference) {
-                const ar: ReferenceType* = at as ReferenceType*;
+                const ar: ReferenceType* = at.as_reference();
                 return this.unify(fr.referent, ar.referent);
             }
             if (at.kind == TypeKind::Pointer) {
-                const ap2: PointerType* = at as PointerType*;
+                const ap2: PointerType* = at.as_pointer();
                 return this.unify(fr.referent, ap2.pointee);
             }
             return this.unify(fr.referent, actual);
@@ -127,18 +127,18 @@ type struct InferCtx {
         // reference first, leaving `T*` against the bare referent with no rule
         // to bind `T` (e.g. `swap<T>(a: T*, ...)` called `swap(&this.field, ...)`).
         if (ft.kind == TypeKind::Pointer) {
-            const fp: PointerType* = ft as PointerType*;
+            const fp: PointerType* = ft.as_pointer();
             if (at.kind == TypeKind::Pointer) {
-                const ap: PointerType* = at as PointerType*;
+                const ap: PointerType* = at.as_pointer();
                 return this.unify(fp.pointee, ap.pointee);
             }
             if (at.kind == TypeKind::Reference) {
-                const ar2: ReferenceType* = at as ReferenceType*;
+                const ar2: ReferenceType* = at.as_reference();
                 return this.unify(fp.pointee, ar2.referent);
             }
         }
         if (at.kind == TypeKind::Reference) {
-            const ar: ReferenceType* = at as ReferenceType*;
+            const ar: ReferenceType* = at.as_reference();
             return this.unify(formal, ar.referent);
         }
 
@@ -174,8 +174,8 @@ type struct InferCtx {
         // binds a generic that appears only inside a function-typed argument,
         // e.g. formal `(T) -> U` against actual `(int) -> int` binds `U`.
         if (ft.kind == TypeKind::Function && at.kind == TypeKind::Function) {
-            const ff: FunctionType* = ft as FunctionType*;
-            const af: FunctionType* = at as FunctionType*;
+            const ff: FunctionType* = ft.as_function();
+            const af: FunctionType* = at.as_function();
             if (ff.is_variadic != af.is_variadic) { return false; }
             if (ff.param_types.length != af.param_types.length) { return false; }
             for (mut i: i64 = 0; i < ff.param_types.length; i++) {
@@ -184,6 +184,19 @@ type struct InferCtx {
                 }
             }
             return this.unify(ff.return_type, af.return_type);
+        }
+
+        // Trait object vs trait object of the same trait and form: unify the
+        // trait's arguments position by position, as an instantiation's.
+        if (ft.kind == TypeKind::Object && at.kind == TypeKind::Object) {
+            const fo: ObjectType* = ft.as_object();
+            const ao: ObjectType* = at.as_object();
+            if (!fo.trait_def.equals(ao.trait_def) || fo.form != ao.form) { return false; }
+            if (fo.args.length != ao.args.length) { return false; }
+            for (mut i: i64 = 0; i < fo.args.length; i++) {
+                if (!this.unify(fo.args[i], ao.args[i])) { return false; }
+            }
+            return true;
         }
 
         // Identical typerefs (primitives, same arena slot) succeed trivially.

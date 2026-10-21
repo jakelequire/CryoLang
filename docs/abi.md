@@ -68,9 +68,57 @@ type struct SignaturePlan {
 
 Driven by the aggregate's `size_bytes()` after unwrapping `TypeAlias`
 and `InstantiatedType` to the concrete kind. Aggregate kinds are
-`Struct`, `Class`, `Enum`, `Tuple`, and `Optional`. Primitive scalars
+`Struct`, `Enum`, `Tuple`, `Optional` and `Object`. Primitive scalars
 (`Int`, `Float`, `Pointer`, `Reference`, ...) and `Array`/`String`/etc.
 are always Direct.
+
+A trait object (`Object`, every form) lowers to `{ ptr, ptr }`: the
+value's address, then its table's.  It is a 16-byte aggregate of two
+INTEGER eightbytes, so on SysV it travels as a `DirectPair` in two GP
+registers, and on Win64 (above 8 bytes) indirectly, through a pointer to
+a caller-made copy.
+
+The table an object points at is a constant array of pointer-sized
+words, emitted once, in the module holding the implementation, as
+`C$vt$<trait>$f<type>` with external linkage.  Its first three words are
+reserved: a function of the value's address releasing the value in full
+- its type's `Drop` implementation's `drop`, then every field it owns, as
+its scope's exit would - or null for a type that owns nothing; the type's
+size; and its alignment.  The release function is internal to the
+implementation's module, named after the table, `__cryo.release.` then
+the table's symbol.  Then come the methods' words, a trait at a time:
+each supertrait's own methods first, laid out by this same rule in the
+order the supertraits are written, then the trait's own, each trait in
+declaration order and a trait reached twice only the first time, so a
+subtrait's table begins with its first supertrait's whole table.  Each
+word is the function of the type's implementation of the declaring
+trait, which may be in another module, or that implementation's copy of
+the trait's default, and null for a method that cannot be called through
+an object.  A `null` `virtual T*` has both words null.
+
+For `type trait Named { name(&this) -> string; }` and
+`type trait Shape : Named { area(&this) -> i32; scale(mut &this, by: i32) -> void; }`,
+the table behind a `virtual &Shape` holding a `Circle` is:
+
+| word | holds                                                          |
+|------|----------------------------------------------------------------|
+| 0    | release function for a `Circle`, or null if it owns nothing    |
+| 1    | size of `Circle` in bytes                                      |
+| 2    | alignment of `Circle` in bytes                                 |
+| 3    | `name` of `Circle`'s implementation of `Named`                 |
+| 4    | `area` of `Circle`'s implementation of `Shape`                 |
+| 5    | `scale` of `Circle`'s implementation of `Shape`                |
+
+A `virtual &Named` over the same value points at a different table, the
+one named for `Named`, whose words 0 to 3 are the same.
+
+A call through an object loads the word at three plus the method's
+position in that layout and calls it with the object's first word, the value's address,
+as the receiver, then the call's own arguments.  The call is classified
+from the trait method's declared signature, whose receiver is a pointer
+whatever the implementing type, so it passes and returns exactly as a
+direct call of the implementation's function does: the same sret slot,
+byval copies and register pairs.
 
 ### Returns
 
@@ -150,7 +198,7 @@ For each <= 8 byte half of an aggregate ("eightbyte bucket"),
 `AbiClassifier::eightbyte_slot_type` picks the LLVM type that occupies
 the slot:
 
-1. Walk the struct/class fields whose offset falls in `[start, end)`.
+1. Walk the struct fields whose offset falls in `[start, end)`.
 2. **One float-class field that fully covers the bucket**: emit `double`
    (for F64) or `float` (for F32) - SSE class.
 3. **Two F32 fields packing into one 8-byte eightbyte**: emit

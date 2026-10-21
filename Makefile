@@ -92,6 +92,13 @@ endif
 endif
 MINGW_GCC    := x86_64-w64-mingw32-gcc
 MINGW_STRIP  := x86_64-w64-mingw32-strip
+# The link driver for the cross build of cryo.exe: clang driving lld over the
+# same mingw-w64 sysroot, not mingw gcc's GNU ld.  The GNU ld that Ubuntu's
+# binutils-mingw-w64 ships (2.41.90) emits a 32-bit base relocation over every
+# thread-local's section-relative offset, so the loader adds the ASLR delta to
+# the offset and the first thread-local access faults; lld emits none.
+# verify-pin refuses a pin carrying such a relocation.
+WIN_LINK_CC  := clang-20 --target=x86_64-w64-mingw32 -fuse-ld=lld
 WIN_LLVM_LIB := $(ROOT)/.toolchains/llvm-win/lib/libLLVM-C.dll.a
 WIN_LLVM_DLL := $(ROOT)/.toolchains/llvm-win/bin/LLVM-C.dll
 # libclang import lib + DLL: the C-import engine (Compiler::Bindgen) links
@@ -393,10 +400,11 @@ $(LIBCRYO_A): $(STDLIB_SOURCES) $(STDLIB_PIN)
 # built for the windows triple to resolve `__cryo_panic`, not the host ones.
 cryo-exe: cryo runtime-tiers-win
 	@command -v $(MINGW_GCC) >/dev/null 2>&1 || { echo "ERROR: $(MINGW_GCC) not found (install gcc-mingw-w64-x86-64)."; exit 1; }
+	@command -v ld.lld-20 >/dev/null 2>&1 || { echo "ERROR: ld.lld-20 not found (install lld-20); WIN_LINK_CC links with it."; exit 1; }
 	@test -f "$(WIN_LLVM_LIB)" || { echo "ERROR: windows libLLVM-C import lib missing at"; echo "       $(WIN_LLVM_LIB)"; echo "       Run: scripts/fetch-windows-llvm.sh"; exit 1; }
 	@test -f "$(WIN_CLANG_LIB)" || { echo "ERROR: windows libclang import lib missing at"; echo "       $(WIN_CLANG_LIB)"; echo "       Run: scripts/fetch-windows-llvm.sh"; exit 1; }
 	@echo "==> Cross-building cryo.exe ($(WIN_TRIPLE)) via the self-hosted compiler"
-	@cd compiler && "$(STAGE2)" build --target=$(WIN_TRIPLE) --no-incremental --profile=$(CRYO_PROFILE)
+	@cd compiler && CRYO_CC="$(WIN_LINK_CC)" "$(STAGE2)" build --target=$(WIN_TRIPLE) --no-incremental --profile=$(CRYO_PROFILE)
 	@"$(PIN)" stamp "$(STAGE2_EXE)" --profile=$(CRYO_PROFILE) --exclude=$(STAMP_EXCLUDE)
 	@echo "==> cryo.exe: $(STAGE2_EXE)"
 

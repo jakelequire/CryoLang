@@ -22,8 +22,8 @@
 ///                                 module; only built under `cryo test`
 ///   ![deprecated]             : any decl: deprecation marker
 ///   ![deprecated("msg")]      : any decl: deprecation marker w/ msg
-///   ![align(N)]               : struct/class: align bytes (N integer)
-///   ![repr(C)] / ![repr(packed)] : struct/class: layout repr
+///   ![align(N)]               : struct: align bytes (N integer)
+///   ![repr(C)] / ![repr(packed)] : struct: layout repr
 ///   ![link("name")]           : extern block: library to link (e.g. "kernel32")
 ///   ![symbol("name")]         : extern fn / method: linker symbol-name override
 ///   ![config(<atom>)] / ![target(<atom>)] / ![<atom>] : platform gate
@@ -32,7 +32,7 @@
 ///                                 `not(<atom>)`.
 ///   ![allow(name)] / ![warn(name)] / ![deny(name)] : lint level; each
 ///                                 takes an optional `reason = "..."`
-///   ![derive(Trait, ...)]     : struct/class/enum: traits to auto-derive
+///   ![derive(Trait, ...)]     : struct/enum: traits to auto-derive
 ///
 /// Unknown directive names are accepted and recorded but otherwise inert.
 /// Misuse of a built-in (wrong arity, wrong target kind, malformed args)
@@ -45,7 +45,7 @@ import compiler::diag::{
     diagnostic, edit_distance, ErrorCode, snapshot, source_span, suggestion
 };
 import compiler::ast;
-import compiler::ast::{ declaration, node, NodeKind, pattern };
+import compiler::ast::{ declaration, node, pattern };
 import compiler::passes::pass_id;
 import compiler::passes::pass_id::{ PassResult };
 import compiler::compilation_context;
@@ -60,10 +60,10 @@ import utils::logger;
 import utils::logger::{ cdebug };
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, EnumDeclNode, ExternBlockNode, FieldDeclNode, FunctionDeclNode,
-    ImplBlockNode, MethodNode, StructDeclNode, UnionDeclNode, VarDeclNode
+    DeclarationNode, DeclKind, EnumDecl, ExternBlock, FunctionDecl,
+    ImplBlock, MethodDecl, StructDecl, UnionDecl, VarDecl
 };
-import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::node::{ ProgramNode };
 import compiler::ast::pattern::{ DirectiveArg, DirectiveArgKind, DirectiveNode };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::edit_distance::{ find_best_candidate };
@@ -73,8 +73,9 @@ import compiler::diag::suggestion::{ Suggestion };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
-import compiler::types::user_defined::{ ClassType, EnumType, StructType };
+import compiler::types::user_defined::{ EnumType, StructType };
 import utils::keyword::{ Keyword };
+import compiler::ast::statement::{ BlockStmt, Stmt, StmtKind };
 
 
 // DirectiveRecord: one observed directive
@@ -103,14 +104,13 @@ type struct DirectiveRecord {
 /// Tracks every directive observed during compilation so later passes,
 /// tooling, and tests can ask "is this function marked `![test]`?",
 /// "what's the `repr` of struct Foo?", etc.
-type class DirectiveRegistry {
-public:
+type struct DirectiveRegistry {
     records: [DirectiveRecord];
+}
 
+implement struct DirectiveRegistry {
     static new() -> DirectiveRegistry* {
-        mut r: DirectiveRegistry* = new DirectiveRegistry();
-        r.records = [];
-        return r;
+        return new DirectiveRegistry { records: [] };
     }
 
     /// Idempotently add a directive observation.  The pass may run on the
@@ -126,8 +126,6 @@ public:
     count(&this) -> i64 {
         return this.records.length;
     }
-
-
 }
 
 
@@ -138,11 +136,10 @@ public:
 type enum DirectiveTarget {
     Module;       // top-level (no owning decl)
     Function;
-    Method;       // a method inside a struct/class body or impl block
-    Field;        // a field of a struct, class or union
+    Method;       // a method inside a struct body or impl block
+    Field;        // a field of a struct or union
     Struct;
     Union;
-    Class;
     Enum;
     Trait;
     TypeAlias;
@@ -154,27 +151,28 @@ type enum DirectiveTarget {
 }
 
 implement enum DirectiveTarget {
-    /// Map a declaration's `NodeKind` to the target category a directive
-    /// is attached to.  `ModuleDeclaration` (and a null/absent owner)
-    /// classify as `Module`; anything not in the declaration vocabulary
-    /// falls through to `Other`.
-    static from_kind(k: NodeKind) -> DirectiveTarget {
-        return match (k) {
-            NodeKind::FunctionDeclaration   => { DirectiveTarget::Function }
-            NodeKind::MethodDeclaration     => { DirectiveTarget::Method   }
-            NodeKind::FieldDeclaration      => { DirectiveTarget::Field    }
-            NodeKind::StructDeclaration     => { DirectiveTarget::Struct   }
-            NodeKind::UnionDeclaration      => { DirectiveTarget::Union    }
-            NodeKind::ClassDeclaration      => { DirectiveTarget::Class    }
-            NodeKind::EnumDeclaration       => { DirectiveTarget::Enum     }
-            NodeKind::TraitDeclaration      => { DirectiveTarget::Trait    }
-            NodeKind::TypeAliasDeclaration  => { DirectiveTarget::TypeAlias }
-            NodeKind::VariableDeclaration   => { DirectiveTarget::Variable }
-            NodeKind::ImplementationBlock   => { DirectiveTarget::Impl     }
-            NodeKind::ExternBlock           => { DirectiveTarget::Extern   }
-            NodeKind::ImportDeclaration     => { DirectiveTarget::Import   }
-            NodeKind::ModuleDeclaration     => { DirectiveTarget::Module   }
-            _                               => { DirectiveTarget::Other    }
+    /// Map a declaration to the target category a directive is attached
+    /// to.  A module declaration classifies as `Module`; a kind no directive
+    /// targets is `Other`.
+    static from_decl(d: DeclarationNode*) -> DirectiveTarget {
+        return match (d.kind) {
+            DeclKind::Method(_)         => { DirectiveTarget::Method   }
+            DeclKind::Function(_)       => { DirectiveTarget::Function }
+            DeclKind::Enum(_)           => { DirectiveTarget::Enum   }
+            DeclKind::Extern(_)         => { DirectiveTarget::Extern }
+            DeclKind::Import(_)         => { DirectiveTarget::Import }
+            DeclKind::Module(_)         => { DirectiveTarget::Module }
+            DeclKind::Trait(_)          => { DirectiveTarget::Trait  }
+            DeclKind::TypeAlias(_)      => { DirectiveTarget::TypeAlias }
+            DeclKind::Union(_)          => { DirectiveTarget::Union  }
+            DeclKind::Struct(_)         => { DirectiveTarget::Struct }
+            DeclKind::Impl(_)           => { DirectiveTarget::Impl   }
+            DeclKind::Field(_)          => { DirectiveTarget::Field  }
+            DeclKind::Variable(_)       => { DirectiveTarget::Variable }
+            DeclKind::Variant(_)        => { DirectiveTarget::Other  }
+            DeclKind::GenericParam(_)   => { DirectiveTarget::Other  }
+            DeclKind::Destructure(_)    => { DirectiveTarget::Other  }
+            DeclKind::Intrinsic(_)      => { DirectiveTarget::Other  }
         };
     }
 
@@ -187,7 +185,6 @@ implement enum DirectiveTarget {
             DirectiveTarget::Field     => { "field" }
             DirectiveTarget::Struct    => { "struct" }
             DirectiveTarget::Union     => { "union" }
-            DirectiveTarget::Class     => { "class" }
             DirectiveTarget::Enum      => { "enum" }
             DirectiveTarget::Trait     => { "trait" }
             DirectiveTarget::TypeAlias => { "type alias" }
@@ -313,8 +310,8 @@ type struct DirectiveProcessingPasses {
             }
 
             // `![sink]`: zero args; method-target only.  Static-method
-            // and missing-receiver checks need the MethodNode and its
-            // FunctionDeclNode, so they live in the per-decl loop in
+            // and missing-receiver checks need the MethodDecl and its
+            // FunctionDecl, so they live in the per-decl loop in
             // run_directive_processing where we already have the decl pointer.
             "sink" => {
                 if (argc != 0) {
@@ -527,10 +524,9 @@ type struct DirectiveProcessingPasses {
                 }
                 if (target != DirectiveTarget::Struct
                     && target != DirectiveTarget::Union
-                    && target != DirectiveTarget::Class
                     && target != DirectiveTarget::Enum
                     && target != DirectiveTarget::Variable) {
-                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, "struct/union/class/enum/variable", target);
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, "struct/union/enum/variable", target);
                 }
             }
 
@@ -564,19 +560,15 @@ type struct DirectiveProcessingPasses {
                 }
                 if (target != DirectiveTarget::Struct
                     && target != DirectiveTarget::Union
-                    && target != DirectiveTarget::Class
                     && target != DirectiveTarget::Enum) {
-                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, "struct/union/class/enum", target);
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, "struct/union/enum", target);
                     return;
                 }
                 // Per-flavor placement.  `repr(packed)` and `repr(transparent)`
-                // only make sense on plain structs:
-                //   - Classes have vtables / inheritance / fixed-offset
-                //     conventions that don't compose with packing or
-                //     newtype-style flattening.
-                //   - Enums have a tag-plus-payload layout; `packed` and
-                //     `transparent` don't have a meaningful semantics there.
-                // `repr(C)` is accepted on all three kinds.
+                // only make sense on plain structs: an enum has a
+                // tag-plus-payload layout, and `packed` and `transparent`
+                // have no meaningful semantics there.  `repr(C)` is accepted
+                // on all three kinds.
                 const is_packed:      boolean = a.name == "packed";
                 const is_transparent: boolean = a.name == "transparent";
                 if ((is_packed || is_transparent)
@@ -634,7 +626,7 @@ type struct DirectiveProcessingPasses {
             }
 
             // `![thread_local]`: zero args; variable-target only.  Applied in
-            // `apply_effects` onto the VarDeclNode.
+            // `apply_effects` onto the VarDecl.
             "thread_local" => {
                 if (argc != 0) {
                     DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
@@ -646,7 +638,7 @@ type struct DirectiveProcessingPasses {
 
             // `![naked]`: zero args; function-target only.  A naked function's
             // body must be a single `asm { }` block; that body-shape check runs
-            // in `apply_effects` where the FunctionDeclNode body is in hand.
+            // in `apply_effects` where the FunctionDecl body is in hand.
             "naked" => {
                 if (argc != 0) {
                     DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
@@ -778,9 +770,8 @@ type struct DirectiveProcessingPasses {
                     }
                 }
                 if (target != DirectiveTarget::Struct
-                    && target != DirectiveTarget::Class
                     && target != DirectiveTarget::Enum) {
-                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, "struct/class/enum", target);
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, "struct/enum", target);
                 }
             }
 
@@ -881,7 +872,7 @@ type struct DirectiveProcessingPasses {
 
     // Side-effect application: layout directives
     //
-    // `apply_layout_effects_{struct,class,enum}` mirror `![repr(...)]` /
+    // `apply_layout_effects_{struct,union,enum}` mirror `![repr(...)]` /
     // `![align(N)]` onto the decl node and emit a diagnostic when two
     // directives on the same decl conflict.  Conflicts:
     //   * `repr(packed)` + `align(N)` (mutually exclusive)
@@ -910,7 +901,7 @@ type struct DirectiveProcessingPasses {
 
     static apply_layout_effects_struct(ctx: CompilationContext*,
                                          dir: DirectiveNode*,
-                                         sd: StructDeclNode*,
+                                         sd: StructDecl*,
                                          name: Keyword) -> void {
         match (name.as_string()) {
             "repr" => {
@@ -951,7 +942,7 @@ type struct DirectiveProcessingPasses {
 
     static apply_layout_effects_union(ctx: CompilationContext*,
                                         dir: DirectiveNode*,
-                                        ud: UnionDeclNode*,
+                                        ud: UnionDecl*,
                                         name: Keyword) -> void {
         // Unions accept the same layout directives as structs: `repr(C)`,
         // `repr(packed)` (floors alignment to 1), `repr(transparent)`, and
@@ -992,49 +983,9 @@ type struct DirectiveProcessingPasses {
         }
     }
 
-    static apply_layout_effects_class(ctx: CompilationContext*,
-                                        dir: DirectiveNode*,
-                                        cd: ClassDeclNode*,
-                                        name: Keyword) -> void {
-        match (name.as_string()) {
-            "repr" => {
-                if (dir.args.length != 1) { return; }
-                if (cd.repr_c || cd.repr_packed || cd.repr_transparent) {
-                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "repr", "repr");
-                    return;
-                }
-                match (dir.args[0].name) {
-                    "C"           => { cd.repr_c = true; }
-                    "packed"      => {
-                        if (cd.min_alignment != 0) {
-                            DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "repr(packed)", "align");
-                            return;
-                        }
-                        cd.repr_packed = true;
-                    }
-                    "transparent" => { cd.repr_transparent = true; }
-                    _             => { }
-                }
-            }
-            "align" => {
-                if (dir.args.length != 1) { return; }
-                if (cd.repr_packed) {
-                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "align", "repr(packed)");
-                    return;
-                }
-                if (cd.min_alignment != 0) {
-                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "align", "align");
-                    return;
-                }
-                cd.min_alignment = dir.args[0].int_value as u64;
-            }
-            _ => { }
-        }
-    }
-
     static apply_layout_effects_enum(ctx: CompilationContext*,
                                        dir: DirectiveNode*,
-                                       ed: EnumDeclNode*,
+                                       ed: EnumDecl*,
                                        name: Keyword) -> void {
         // Enums accept only `repr(C)` and `![align(N)]` today; the validator
         // has already rejected `repr(packed)` / `repr(transparent)` on
@@ -1068,18 +1019,19 @@ type struct DirectiveProcessingPasses {
 
     /// Apply known semantic side-effects of a directive to its target decl.
     /// Currently:
-    ///   ![inline]         -> sets FunctionDeclNode.is_inline = true
-    ///   ![noinline]       -> sets FunctionDeclNode.is_noinline = true
-    ///   ![sink]           -> sets MethodNode.is_sink = true
-    ///   ![repr(C|packed|transparent)] -> sets repr_* flags on struct/class/enum decl
-    ///   ![align(N)]       -> sets min_alignment on struct/class/enum decl
+    ///   ![inline]         -> sets FunctionDecl.is_inline = true
+    ///   ![noinline]       -> sets FunctionDecl.is_noinline = true
+    ///   ![sink]           -> sets MethodDecl.is_sink = true
+    ///   ![repr(C|packed|transparent)] -> sets repr_* flags on struct/enum decl
+    ///   ![align(N)]       -> sets min_alignment on struct/enum decl
     static apply_effects(ctx: CompilationContext*, dir: DirectiveNode*,
                            decl: DeclarationNode*) -> void {
         if (decl == null) { return; }
         const name: string = dir.directive_kind.as_string();
 
-        if (decl.kind == NodeKind::FunctionDeclaration) {
-            const fn: FunctionDeclNode* = decl as FunctionDeclNode*;
+        if (DeclarationNode::fn_of(decl) != null) {
+            const fn_decl: DeclarationNode* = decl;
+            const fn: FunctionDecl* = DeclarationNode::fn_of(fn_decl);
             if (name.eq("inline")) {
                 fn.is_inline   = true;
                 fn.is_noinline = false;
@@ -1091,7 +1043,7 @@ type struct DirectiveProcessingPasses {
                 return;
             }
             if (name.eq("caller_location")) {
-                fn.is_caller_located = true;
+                DirectiveProcessingPasses::apply_caller_location(ctx, dir, fn_decl);
                 return;
             }
             if (name.eq("implicit")) {
@@ -1143,12 +1095,18 @@ type struct DirectiveProcessingPasses {
                 // or locals through a frame that was never set up.  Require the
                 // body to consist solely of `asm { }` block statements.
                 mut all_asm: boolean =
-                    fn.body != null && fn.body.statements.length > 0;
+                    fn.body != null && fn.body.as_block().statements.length > 0;
                 if (all_asm) {
-                    for (mut i: i64 = 0; i < fn.body.statements.length; i++) {
-                        if (fn.body.statements[i] == null
-                                || fn.body.statements[i].kind != NodeKind::AsmBlockStatement) {
+                    const body: BlockStmt* = fn.body.as_block();
+                    for (mut i: i64 = 0; i < body.statements.length; i++) {
+                        const s: Stmt* = body.statements[i];
+                        if (s == null) {
                             all_asm = false;
+                        } else {
+                            match (s.kind) {
+                                StmtKind::Asm(_) => {}
+                                _ => { all_asm = false; }
+                            }
                         }
                     }
                 }
@@ -1166,8 +1124,8 @@ type struct DirectiveProcessingPasses {
 
         // `![thread_local]` on a global variable: mark it for thread-local
         // emission (read by codegen_global_var and cross-module extern refs).
-        if (decl.kind == NodeKind::VariableDeclaration) {
-            const vd: VarDeclNode* = decl as VarDeclNode*;
+        if (DeclarationNode::var_of(decl) != null) {
+            const vd: VarDecl* = DeclarationNode::var_of(decl);
             // TypeResolution registered this global before directives ran,
             // under its definition; a directive corrects that slot.
             if (name.eq("thread_local")) {
@@ -1205,29 +1163,25 @@ type struct DirectiveProcessingPasses {
         // observe it.  Conflict detection (e.g. `repr(packed)` + `align`,
         // duplicate `repr`) lives in the same place so a stable diagnostic
         // is produced regardless of source order.
-        if (decl.kind == NodeKind::StructDeclaration) {
-            const sd: StructDeclNode* = decl as StructDeclNode*;
+        if (DeclarationNode::struct_of(decl) != null) {
+            const sd: StructDecl* = DeclarationNode::struct_of(decl);
             DirectiveProcessingPasses::apply_layout_effects_struct(ctx, dir, sd, dir.directive_kind);
             return;
         }
-        if (decl.kind == NodeKind::UnionDeclaration) {
-            const ud: UnionDeclNode* = decl as UnionDeclNode*;
+        if (DeclarationNode::union_of(decl) != null) {
+            const ud: UnionDecl* = DeclarationNode::union_of(decl);
             DirectiveProcessingPasses::apply_layout_effects_union(ctx, dir, ud, dir.directive_kind);
             return;
         }
-        if (decl.kind == NodeKind::ClassDeclaration) {
-            const cd: ClassDeclNode* = decl as ClassDeclNode*;
-            DirectiveProcessingPasses::apply_layout_effects_class(ctx, dir, cd, dir.directive_kind);
-            return;
-        }
-        if (decl.kind == NodeKind::EnumDeclaration) {
-            const ed: EnumDeclNode* = decl as EnumDeclNode*;
+        const ed: EnumDecl* = DeclarationNode::enum_of(decl);
+        if (ed != null) {
             DirectiveProcessingPasses::apply_layout_effects_enum(ctx, dir, ed, dir.directive_kind);
             return;
         }
 
-        if (decl.kind == NodeKind::MethodDeclaration) {
-            const m: MethodNode* = decl as MethodNode*;
+        if (DeclarationNode::method_of(decl) != null) {
+            const m_decl: DeclarationNode* = decl;
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (name.eq("sink")) {
                 // Reject placement on a static method: static methods have
                 // no receiver, so "consumes the receiver" is meaningless.
@@ -1247,7 +1201,7 @@ type struct DirectiveProcessingPasses {
                 // enforces that the first parameter is named `this` for
                 // non-static methods, so a zero-parameter method is missing
                 // its receiver entirely.
-                if (m.func == null || m.func.parameters.length == 0) {
+                if (m.func == null || DeclarationNode::fn_of(m.func).parameters.length == 0) {
                     const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
                     const msg: string =
                         "directive `![sink]` requires a method with a `this` receiver";
@@ -1263,31 +1217,33 @@ type struct DirectiveProcessingPasses {
                 return;
             }
             if (name.eq("implicit")) {
-                if (m.func != null) { m.func.is_implicit = true; }
+                if (m.func != null) { DeclarationNode::fn_of(m.func).is_implicit = true; }
                 return;
             }
             // `![inline]` / `![noinline]` on a method: record on the wrapped
-            // FunctionDeclNode, which is what codegen's declare_method reads.
+            // FunctionDecl, which is what codegen's declare_method reads.
             if (name.eq("inline")) {
                 if (m.func != null) {
-                    m.func.is_inline   = true;
-                    m.func.is_noinline = false;
+                    DeclarationNode::fn_of(m.func).is_inline   = true;
+                    DeclarationNode::fn_of(m.func).is_noinline = false;
                 }
                 return;
             }
             if (name.eq("noinline")) {
                 if (m.func != null) {
-                    m.func.is_noinline = true;
-                    m.func.is_inline   = false;
+                    DeclarationNode::fn_of(m.func).is_noinline = true;
+                    DeclarationNode::fn_of(m.func).is_inline   = false;
                 }
                 return;
             }
             if (name.eq("caller_location")) {
-                if (m.func != null) { m.func.is_caller_located = true; }
+                if (m.func != null) {
+                    DirectiveProcessingPasses::apply_caller_location(ctx, dir, m.func);
+                }
                 return;
             }
             // `![symbol("sym")]` on a method: pin the LLVM symbol of the wrapped
-            // FunctionDeclNode, which is what codegen's declare_method reads.
+            // FunctionDecl, which is what codegen's declare_method reads.
             // Used by the C++ binding generator to bind a non-virtual C++ method
             // to its mangled Itanium symbol (`_ZNK5Point3sumEv`) while Cryo
             // callers still resolve through the method's source name.
@@ -1295,8 +1251,8 @@ type struct DirectiveProcessingPasses {
                 if (m.func != null
                         && dir.args.length == 1
                         && dir.args[0].kind == DirectiveArgKind::StringLit) {
-                    m.func.link_name     = dir.args[0].str_value;
-                    m.func.has_link_name = true;
+                    DeclarationNode::fn_of(m.func).link_name     = dir.args[0].str_value;
+                    DeclarationNode::fn_of(m.func).has_link_name = true;
                 }
                 return;
             }
@@ -1304,20 +1260,20 @@ type struct DirectiveProcessingPasses {
                 // See the free-function arm above: emit the method under its
                 // bare declared name instead of the mangled `C$...` symbol.
                 if (m.func != null) {
-                    m.func.link_name     = ctx.resolve_str(m.func.name);
-                    m.func.has_link_name = true;
+                    DeclarationNode::fn_of(m.func).link_name     = ctx.resolve_str(DeclarationNode::fn_of(m.func).name);
+                    DeclarationNode::fn_of(m.func).has_link_name = true;
                 }
                 return;
             }
             if (name.eq("weak")) {
-                if (m.func != null) { m.func.is_weak = true; }
+                if (m.func != null) { DeclarationNode::fn_of(m.func).is_weak = true; }
                 return;
             }
             if (name.eq("section")) {
                 if (m.func != null
                         && dir.args.length == 1
                         && dir.args[0].kind == DirectiveArgKind::StringLit) {
-                    m.func.link_section = dir.args[0].str_value;
+                    DeclarationNode::fn_of(m.func).link_section = dir.args[0].str_value;
                 }
                 return;
             }
@@ -1361,6 +1317,26 @@ type struct DirectiveProcessingPasses {
         diag = diag.suggest(Suggestion::machine_applicable(
             dir.span, "",
             fmt::format("remove the misplaced `![%s]` directive", name.as_string())));
+        ctx.emit_diagnostic(diag);
+    }
+
+    /// Mark `fn` as taking its caller's location, or refuse the directive
+    /// when `fn` is variadic: the hidden `(file, line)` pair follows the
+    /// written arguments, and a variadic call's written arguments have no
+    /// fixed end for the pair to follow.
+    static apply_caller_location(ctx: CompilationContext*, dir: DirectiveNode*,
+                                 fn_decl: DeclarationNode*) -> void {
+        const fn: FunctionDecl* = DeclarationNode::fn_of(fn_decl);
+        if (!fn.is_variadic) {
+            fn.is_caller_located = true;
+            return;
+        }
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0151_DIRECTIVE_MISPLACED,
+            "`![caller_location]` cannot be applied to a variadic function: its caller's location would be passed among the variadic arguments");
+        diag = diag.at(dir.span);
+        diag = diag.suggest(Suggestion::machine_applicable(
+            dir.span, "",
+            "remove the `![caller_location]` directive"));
         ctx.emit_diagnostic(diag);
     }
 
@@ -1408,12 +1384,12 @@ type struct DirectiveProcessingPasses {
         mut first_test_dir_name: Keyword = Keyword::new("");
 
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i];
-            if (stmt == null) { continue; }
+            const item: Node = root.statements[i];
+            if (item.is_null()) { continue; }
 
             // Standalone (module-level) directives: no owner decl.
-            if (stmt.kind == NodeKind::Directive) {
-                const d: DirectiveNode* = stmt as DirectiveNode*;
+            if (item.as_directive() != null) {
+                const d: DirectiveNode* = item.as_directive();
                 DirectiveProcessingPasses::validate_builtin(ctx, d, DirectiveTarget::Module);
                 const rec: DirectiveRecord = DirectiveRecord {
                     kind: d.directive_kind,
@@ -1433,13 +1409,14 @@ type struct DirectiveProcessingPasses {
             }
 
             // Attached directives on declarations.
-            const t: DirectiveTarget = DirectiveTarget::from_kind(stmt.kind);
+            const decl: DeclarationNode* = item.as_decl();
+            if (decl == null) { continue; }
+            const t: DirectiveTarget = DirectiveTarget::from_decl(decl);
             if (t == DirectiveTarget::Other) { continue; }
 
-            const decl: DeclarationNode* = stmt as DeclarationNode*;
             const ad_count: i64 = decl.attached_directives.length;
             // Note: do NOT `continue` when ad_count == 0; the method
-            // descent below still needs to run for struct/class/impl decls
+            // descent below still needs to run for struct/impl decls
             // whose own attached_directives are empty but whose method
             // members carry their own (e.g. `![sink]`).
 
@@ -1473,9 +1450,10 @@ type struct DirectiveProcessingPasses {
                 // correct for this module.  Late passes (TestMainCodegen)
                 // need the qualifier to look up DI mangled names.
                 mut qualified: SymbolStr = SymbolStr::empty();
-                if (decl.kind == NodeKind::FunctionDeclaration) {
-                    const fn_decl: FunctionDeclNode* = decl as FunctionDeclNode*;
-                    qualified = ctx.decl_fn_key(fn_decl.name, fn_decl.span.file);
+                if (DeclarationNode::fn_of(decl) != null) {
+                    const fn_decl_decl: DeclarationNode* = decl;
+                    const fn_decl: FunctionDecl* = DeclarationNode::fn_of(fn_decl_decl);
+                    qualified = ctx.decl_fn_key(fn_decl.name, fn_decl_decl.span.file);
                 }
                 const rec: DirectiveRecord = DirectiveRecord {
                     kind: d.directive_kind,
@@ -1496,43 +1474,41 @@ type struct DirectiveProcessingPasses {
                 }
             }
 
-            // Descend into method lists on structs/classes/impls.  The
+            // Descend into method lists on structs/impls.  The
             // top-level loop above only sees the container; per-method
-            // directives like `![sink]` live on each MethodNode
+            // directives like `![sink]` live on each MethodDecl
             // and must be validated + applied here.  Methods on traits
-            // are [FunctionDeclNode*] (no MethodNode wrapper) and don't
+            // are [DeclarationNode*] (no MethodDecl wrapper) and don't
             // currently carry directives; if that changes, fold them in.
             // Borrow the decl's method array - aliasing it into an owning local
             // would free the decl node's buffer when the local drops.
-            const empty_methods: [MethodNode*] = [];
-            mut method_list: &[MethodNode*] = &empty_methods;
-            if (decl.kind == NodeKind::StructDeclaration) {
-                const sn: StructDeclNode* = decl as StructDeclNode*;
+            const empty_methods: [DeclarationNode*] = [];
+            mut method_list: &[DeclarationNode*] = &empty_methods;
+            if (DeclarationNode::struct_of(decl) != null) {
+                const sn: StructDecl* = DeclarationNode::struct_of(decl);
                 method_list = &sn.methods;
-            } else if (decl.kind == NodeKind::UnionDeclaration) {
-                const un: UnionDeclNode* = decl as UnionDeclNode*;
+            } else if (DeclarationNode::union_of(decl) != null) {
+                const un: UnionDecl* = DeclarationNode::union_of(decl);
                 method_list = &un.methods;
-            } else if (decl.kind == NodeKind::ClassDeclaration) {
-                const cn: ClassDeclNode* = decl as ClassDeclNode*;
-                method_list = &cn.methods;
-            } else if (decl.kind == NodeKind::ImplementationBlock) {
-                const ib: ImplBlockNode* = decl as ImplBlockNode*;
+            } else if (DeclarationNode::impl_of(decl) != null) {
+                const ib: ImplBlock* = DeclarationNode::impl_of(decl);
                 method_list = &ib.methods;
             }
             for (mut mi: i64 = 0; mi < method_list.length; mi++) {
-                const m: MethodNode* = method_list[mi];
+                const m_decl: DeclarationNode* = method_list[mi];
+                const m: MethodDecl* = DeclarationNode::method_of(m_decl);
                 if (m == null) { continue; }
-                const m_count: i64 = m.attached_directives.length;
+                const m_count: i64 = m_decl.attached_directives.length;
                 if (m_count == 0) { continue; }
                 for (mut mj: i64 = 0; mj < m_count; mj++) {
-                    const md: DirectiveNode* = m.attached_directives[mj];
+                    const md: DirectiveNode* = m_decl.attached_directives[mj];
                     if (md == null) { continue; }
                     DirectiveProcessingPasses::validate_builtin(ctx, md, DirectiveTarget::Method);
-                    DirectiveProcessingPasses::apply_effects(ctx, md, m as DeclarationNode*);
+                    DirectiveProcessingPasses::apply_effects(ctx, md, m_decl as DeclarationNode*);
                     const m_rec: DirectiveRecord = DirectiveRecord {
                         kind: md.directive_kind,
                         node: md,
-                        decl: m as DeclarationNode*,
+                        decl: m_decl as DeclarationNode*,
                         qualified_name: SymbolStr::empty(),
                         span: md.span,
                     };
@@ -1548,19 +1524,17 @@ type struct DirectiveProcessingPasses {
                 }
             }
 
-            // Descend into the fields of structs, classes and unions: a field's
+            // Descend into the fields of structs and unions: a field's
             // own directives are validated and recorded as a declaration's are.
-            const empty_fields: [FieldDeclNode*] = [];
-            mut field_list: &[FieldDeclNode*] = &empty_fields;
-            if (decl.kind == NodeKind::StructDeclaration) {
-                field_list = &(decl as StructDeclNode*).fields;
-            } else if (decl.kind == NodeKind::UnionDeclaration) {
-                field_list = &(decl as UnionDeclNode*).fields;
-            } else if (decl.kind == NodeKind::ClassDeclaration) {
-                field_list = &(decl as ClassDeclNode*).fields;
+            const empty_fields: [DeclarationNode*] = [];
+            mut field_list: &[DeclarationNode*] = &empty_fields;
+            if (DeclarationNode::struct_of(decl) != null) {
+                field_list = &(DeclarationNode::struct_of(decl)).fields;
+            } else if (DeclarationNode::union_of(decl) != null) {
+                field_list = &(DeclarationNode::union_of(decl)).fields;
             }
             for (mut fi: i64 = 0; fi < field_list.length; fi++) {
-                const fd: FieldDeclNode* = field_list[fi];
+                const fd: DeclarationNode* = field_list[fi];
                 if (fd == null) { continue; }
                 for (mut fj: i64 = 0; fj < fd.attached_directives.length; fj++) {
                     const fdir: DirectiveNode* = fd.attached_directives[fj];
@@ -1569,7 +1543,7 @@ type struct DirectiveProcessingPasses {
                     const f_rec: DirectiveRecord = DirectiveRecord {
                         kind: fdir.directive_kind,
                         node: fdir,
-                        decl: fd as DeclarationNode*,
+                        decl: fd,
                         qualified_name: SymbolStr::empty(),
                         span: fdir.span,
                     };
@@ -1581,20 +1555,21 @@ type struct DirectiveProcessingPasses {
             // Descend into extern-block functions so per-function directives
             // like `![symbol("sym")]` are validated + applied; the block is the
             // top-level statement, its functions aren't otherwise visited here.
-            if (decl.kind == NodeKind::ExternBlock) {
-                const eb: ExternBlockNode* = decl as ExternBlockNode*;
+            const eb: ExternBlock* = DeclarationNode::extern_of(decl);
+            if (eb != null) {
                 for (mut ei: i64 = 0; ei < eb.functions.length; ei++) {
-                    const ef: FunctionDeclNode* = eb.functions[ei];
+                    const ef_decl: DeclarationNode* = eb.functions[ei];
+                    const ef: FunctionDecl* = DeclarationNode::fn_of(ef_decl);
                     if (ef == null) { continue; }
-                    for (mut ej: i64 = 0; ej < ef.attached_directives.length; ej++) {
-                        const ed: DirectiveNode* = ef.attached_directives[ej];
+                    for (mut ej: i64 = 0; ej < ef_decl.attached_directives.length; ej++) {
+                        const ed: DirectiveNode* = ef_decl.attached_directives[ej];
                         if (ed == null) { continue; }
                         DirectiveProcessingPasses::validate_builtin(ctx, ed, DirectiveTarget::Extern);
-                        DirectiveProcessingPasses::apply_effects(ctx, ed, ef as DeclarationNode*);
+                        DirectiveProcessingPasses::apply_effects(ctx, ed, ef_decl as DeclarationNode*);
                         const e_rec: DirectiveRecord = DirectiveRecord {
                             kind: ed.directive_kind,
                             node: ed,
-                            decl: ef as DeclarationNode*,
+                            decl: ef_decl as DeclarationNode*,
                             qualified_name: SymbolStr::empty(),
                             span: ed.span,
                         };
@@ -1649,29 +1624,25 @@ type struct DirectiveProcessingPasses {
                                           root: ProgramNode*) -> void {
         if (root == null) { return; }
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i];
+            const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
             match (stmt.kind) {
-                NodeKind::FunctionDeclaration => {
-                    DirectiveProcessingPasses::register_converter_fn(ctx, stmt as FunctionDeclNode*);
+                DeclKind::Function(_) => {
+                    DirectiveProcessingPasses::register_converter_fn(ctx, stmt);
                 }
-                NodeKind::StructDeclaration => {
-                    const sd: StructDeclNode* = stmt as StructDeclNode*;
+                DeclKind::Struct(sd) => {
                     DirectiveProcessingPasses::register_converter_methods(ctx, &sd.methods);
                 }
-                NodeKind::UnionDeclaration => {
-                    const ud: UnionDeclNode* = stmt as UnionDeclNode*;
-                    DirectiveProcessingPasses::register_converter_methods(ctx, &ud.methods);
-                }
-                NodeKind::ClassDeclaration => {
-                    const cd: ClassDeclNode* = stmt as ClassDeclNode*;
-                    DirectiveProcessingPasses::register_converter_methods(ctx, &cd.methods);
-                }
-                NodeKind::ImplementationBlock => {
-                    const ib: ImplBlockNode* = stmt as ImplBlockNode*;
+                DeclKind::Impl(ib) => {
                     DirectiveProcessingPasses::register_converter_methods(ctx, &ib.methods);
                 }
-                _ => {}
+                DeclKind::Union(ud) => {
+                    DirectiveProcessingPasses::register_converter_methods(ctx, &ud.methods);
+                }
+                DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
+                | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) => {}
             }
         }
     }
@@ -1679,9 +1650,10 @@ type struct DirectiveProcessingPasses {
     /// Register each `![implicit]` static method of `methods` as a
     /// converter.  Instance methods are skipped: a converter needs no
     /// receiver.
-    static register_converter_methods(ctx: CompilationContext*, methods: &[MethodNode*]) -> void {
+    static register_converter_methods(ctx: CompilationContext*, methods: &[DeclarationNode*]) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: MethodNode* = methods[i];
+            const m_decl: DeclarationNode* = methods[i];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null || m.func == null) { continue; }
             if (!m.is_static) { continue; }
             DirectiveProcessingPasses::register_converter_fn(ctx, m.func);
@@ -1692,12 +1664,14 @@ type struct DirectiveProcessingPasses {
     /// converter, by its definition, if it qualifies (one resolved
     /// parameter, no generic params, resolved return type).  A declaration
     /// with no definition of its own is a copy and registers nothing.
-    static register_converter_fn(ctx: CompilationContext*, fn: FunctionDeclNode*) -> void {
+    static register_converter_fn(ctx: CompilationContext*, fn_decl: DeclarationNode*) -> void {
+        const fn: FunctionDecl* = DeclarationNode::fn_of(fn_decl);
         if (fn == null || !fn.is_implicit) { return; }
         if (fn.parameters.length != 1) { return; }
         if (fn.generic_params.length != 0) { return; }
         if (!fn.resolved_return_type.is_valid()) { return; }
-        const p: VarDeclNode* = fn.parameters[0];
+        const p_decl: DeclarationNode* = fn.parameters[0];
+        const p: VarDecl* = DeclarationNode::var_of(p_decl);
         if (p == null || !p.resolved_type.is_valid()) { return; }
         ctx.decl_index.register_implicit_converter(
             p.resolved_type, fn.resolved_return_type, fn.def);
@@ -1706,8 +1680,8 @@ type struct DirectiveProcessingPasses {
     // Layout-attr propagation: AST -> Type
 
     /// After the per-decl walk has set `repr_*` and `min_alignment` on each
-    /// `{Struct,Class,Enum}DeclNode`, walk the AST again and mirror those
-    /// flags onto the corresponding `{Struct,Class,Enum}Type*` in the arena
+    /// struct, union and enum declaration, walk the AST again and mirror those
+    /// flags onto the corresponding `{Struct,Enum}Type*` in the arena
     /// so TypeLowering and codegen see the chosen layout.
     ///
     /// Each declaration is found in the index by the id its registration
@@ -1720,18 +1694,17 @@ type struct DirectiveProcessingPasses {
         if (arena == null) { return; }
 
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i];
+            const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
 
             match (stmt.kind) {
-                NodeKind::StructDeclaration => {
-                    const node: StructDeclNode* = stmt as StructDeclNode*;
+                DeclKind::Struct(node) => {
                     if (node.is_generic()) {
-                        // Generic struct definitions have no concrete Type yet;
-                        // each specialization stamps its own layout in the
-                        // monomorphizer (`populate_struct_fields`), which copies
-                        // the repr/align flags the cloner carried over from this
-                        // template. Nothing to do for the template itself.
+                        // Generic struct definitions have no concrete Type
+                        // yet; each specialization stamps its own layout in
+                        // the monomorphizer (`populate_struct_fields`), which
+                        // copies the repr/align flags the cloner carried over
+                        // from this template.
                         continue;
                     }
                     if (!node.repr_c && !node.repr_packed
@@ -1742,14 +1715,24 @@ type struct DirectiveProcessingPasses {
                     if (!tref.is_valid()) { continue; }
                     const ty: Type* = arena.lookup(tref);
                     if (ty == null || ty.kind != TypeKind::Struct) { continue; }
-                    mut st: StructType* = ty as StructType*;
+                    mut st: StructType* = ty.as_struct();
                     st.set_repr(node.repr_c, node.repr_packed, node.repr_transparent);
                     st.set_min_alignment(node.min_alignment);
                 }
-                NodeKind::UnionDeclaration => {
+                DeclKind::Enum(node) => {
+                    if (node.is_generic()) { continue; }
+                    if (!node.repr_c && node.min_alignment == 0) { continue; }
+                    const tref: TypeRef = ctx.decl_index.type_of_decl(node.def, "directive/enum layout");
+                    if (!tref.is_valid()) { continue; }
+                    const ty: Type* = arena.lookup(tref);
+                    if (ty == null || ty.kind != TypeKind::Enum) { continue; }
+                    mut et: EnumType* = ty.as_enum();
+                    et.set_repr_c(node.repr_c);
+                    et.set_min_alignment(node.min_alignment);
+                }
+                DeclKind::Union(node) => {
                     // A union's Type is a StructType (with is_union set); the
                     // repr/align propagation is identical to the struct path.
-                    const node: UnionDeclNode* = stmt as UnionDeclNode*;
                     if (node.is_generic()) { continue; }
                     if (!node.repr_c && !node.repr_packed
                             && !node.repr_transparent && node.min_alignment == 0) {
@@ -1759,38 +1742,16 @@ type struct DirectiveProcessingPasses {
                     if (!tref.is_valid()) { continue; }
                     const ty: Type* = arena.lookup(tref);
                     if (ty == null || ty.kind != TypeKind::Struct) { continue; }
-                    mut st: StructType* = ty as StructType*;
+                    mut st: StructType* = ty.as_struct();
                     st.set_repr(node.repr_c, node.repr_packed, node.repr_transparent);
                     st.set_min_alignment(node.min_alignment);
                 }
-                NodeKind::ClassDeclaration => {
-                    const node: ClassDeclNode* = stmt as ClassDeclNode*;
-                    if (node.is_generic()) { continue; }
-                    if (!node.repr_c && !node.repr_packed
-                            && !node.repr_transparent && node.min_alignment == 0) {
-                        continue;
-                    }
-                    const tref: TypeRef = ctx.decl_index.type_of_decl(node.def, "directive/class layout");
-                    if (!tref.is_valid()) { continue; }
-                    const ty: Type* = arena.lookup(tref);
-                    if (ty == null || ty.kind != TypeKind::Class) { continue; }
-                    mut ct: ClassType* = ty as ClassType*;
-                    ct.set_repr(node.repr_c, node.repr_packed, node.repr_transparent);
-                    ct.set_min_alignment(node.min_alignment);
-                }
-                NodeKind::EnumDeclaration => {
-                    const node: EnumDeclNode* = stmt as EnumDeclNode*;
-                    if (node.is_generic()) { continue; }
-                    if (!node.repr_c && node.min_alignment == 0) { continue; }
-                    const tref: TypeRef = ctx.decl_index.type_of_decl(node.def, "directive/enum layout");
-                    if (!tref.is_valid()) { continue; }
-                    const ty: Type* = arena.lookup(tref);
-                    if (ty == null || ty.kind != TypeKind::Enum) { continue; }
-                    mut et: EnumType* = ty as EnumType*;
-                    et.set_repr_c(node.repr_c);
-                    et.set_min_alignment(node.min_alignment);
-                }
-                _ => { }
+                // No other kind with a payload has a layout.
+                DeclKind::Destructure(_) | DeclKind::Extern(_) | DeclKind::Field(_)
+                | DeclKind::GenericParam(_) | DeclKind::Impl(_) | DeclKind::Import(_)
+                | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
+                | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_)
+                | DeclKind::Function(_) | DeclKind::Method(_) => { }
             }
         }
     }

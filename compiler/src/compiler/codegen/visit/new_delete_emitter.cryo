@@ -1,16 +1,13 @@
 /// New / Delete Emitter
 ///
-/// `new T(args)` and `new T { fields }` take storage from `T`'s `Allocate`
-/// (its own or a base class's) or else the global allocator, optionally
-/// seed the vtable slot for classes with virtual methods, store
-/// struct-literal field inits, then run the constructor with the fresh
-/// pointer as `this`.
+/// `new T { fields }` takes storage from `T`'s `Allocate` or else the
+/// global allocator and stores the struct literal's field inits;
+/// `new E::V(args)` boxes an enum variant.
 ///
 /// `delete ptr` is the manual-memory dual of an end-of-scope drop:
-/// if the pointee has a Drop impl, synthesise a `ptr.drop()` method
-/// call (routed through the visitor's normal method-dispatch path so
-/// inherent/trait/virtual drops all reach the right symbol), then hand
-/// the pointer to the `Allocate`'s `release`, or free it.
+/// release the pointee as a scope exit releases a value of its type
+/// (its `Drop`, then the fields it owns), then hand the pointer to the
+/// `Allocate`'s `release`, or free it.
 ///
 /// Holds the same back-pointer bundle as CallEmitter (cg, state,
 /// dispatch, enum_variant) - both modules construct heap objects and
@@ -22,7 +19,7 @@ import compiler::codegen;
 import compiler::codegen::{ context, llvm, llvm_types, type_map, util };
 import compiler::codegen::util::{ CodegenUtil };
 import compiler::codegen::state::visitor_state;
-import compiler::codegen::state::visitor_state::{ VisitorState };
+import compiler::codegen::state::visitor_state::{ Emitted, VisitorState };
 import compiler::codegen::visit::{ expr_dispatch, enum_variant_emitter };
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
@@ -31,25 +28,27 @@ import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, source_span };
 import compiler::types;
 import compiler::types::{
-    arena, compound, generic, generic_registry, ownership, type_base, type_ref, TypeKind,
-    user_defined
+    arena, compound, generic, generic_registry, IntegerKind, ownership, type_base, type_ref, TypeKind, user_defined
 };
 import compiler::ast;
-import compiler::ast::{ MemberPin, node, visitor, expression, statement };
+import compiler::ast::{ MemberPin, node, expression, statement };
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, mangled_name };
 import std::collections::pair;
 import std::collections::pair::{ Pair };
 import std::fmt;
 import compiler::ast::expression::{
-    CallExprNode, DeleteExprNode, ExpressionNode, FieldInit, IdentifierNode,
-    MemberAccessNode, NewExprNode, StructLiteralNode
+    CallExpr, DeleteExpr, ExpressionNode, FieldInit,
+    MemberAccessExpr, NewExpr, StructExpr
 };
-import compiler::ast::statement::{ ExprStmtNode };
+import compiler::lex;
+import compiler::lex::{ Token, TokenType };
+import compiler::ast::statement::{ Stmt };
 import compiler::ast::declaration;
-import compiler::ast::declaration::{ ImplBlockNode, MethodNode };
+import compiler::ast::declaration::{ DeclarationNode, ImplBlock, MethodDecl };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
-import compiler::ast::visitor::{ ASTVisitor };
+import compiler::codegen::visit::ir_generator;
+import compiler::codegen::visit::ir_generator::{ IRGeneratorVisitor };
 import compiler::codegen::context::{ CodegenContext };
 import compiler::codegen::llvm_types::{ LType, LTypeKind, LValue };
 import compiler::codegen::visit::expr_dispatch::{ ExprDispatch };
@@ -65,9 +64,9 @@ import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ PointerType };
 import compiler::types::generic_registry::{ GenericRegistry };
 import compiler::types::ownership::{ OwnershipQuery };
-import compiler::types::type_base::{ IntType, Type };
+import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
-import compiler::types::user_defined::{ ClassType, EnumType, EnumVariantInfo, StructType };
+import compiler::types::user_defined::{ EnumType, EnumVariantInfo, StructType };
 import compiler::codegen::visit::enum_variant_emitter::{ EnumVariantEmitter };
 
 
@@ -97,37 +96,27 @@ type struct NewDeleteEmitter {
     // Allocate
 
     /// The implementation of the language's `Allocate` that `new` of `ty`
-    /// takes its storage from and `delete` returns it to: the type's own, or
-    /// for a class below the root of its hierarchy the root's, the only one a
-    /// hierarchy may implement; null when there is none, and the
-    /// global allocator serves it.
-    allocator_of(mut &this, ty: TypeRef) -> ImplBlockNode* {
+    /// takes its storage from and `delete` returns it to: the struct's own;
+    /// null when there is none, and the global allocator serves it.
+    allocator_of(mut &this, ty: TypeRef) -> ImplBlock* {
         const registry: GenericRegistry* = this.cg.ctx.generic_registry;
         const trait_id: DefId = registry.wellknown(LangItem::Allocate);
         if (!trait_id.is_valid()) { return null; }
-        mut cur: TypeRef = ty;
-        loop {
-            const t: Type* = this.cg.arena_type(cur);
-            if (t == null || (t.kind != TypeKind::Class && t.kind != TypeKind::Struct)) { return null; }
-            const block: ImplBlockNode* = registry.select_trait_impl(trait_id, cur, this.cg.get_intern());
-            if (block != null) { return block; }
-            if (t.kind != TypeKind::Class) { return null; }
-            const ct: ClassType* = t as ClassType*;
-            if (!ct.has_base) { return null; }
-            cur = ct.base_class;
-        }
+        const t: Type* = this.cg.arena_type(ty);
+        if (t == null || t.kind != TypeKind::Struct) { return null; }
+        return DeclarationNode::impl_of(registry.select_trait_impl(trait_id, ty, this.cg.get_intern()));
     }
 
     /// The function `block`'s method for the `Allocate` method `item` lowers
     /// to: the one it writes, or the copy of the trait's default.  Null,
     /// reported, when the implementation has no function code generation
     /// can call.
-    allocator_method(mut &this, block: ImplBlockNode*, item: LangItem, span: SourceSpan) -> LValue {
+    allocator_method(mut &this, block: ImplBlock*, item: LangItem, span: SourceSpan) -> LValue {
         const registry: GenericRegistry* = this.cg.ctx.generic_registry;
-        const m: MethodNode* = registry.trait_item_method(
-            block, registry.trait_item_position(registry.wellknown(item)));
+        const m: MethodDecl* = DeclarationNode::method_of(registry.trait_item_method(
+            block, registry.trait_item_position(registry.wellknown(item))));
         mut f: LValue = LValue::null();
-        if (m != null && m.func != null) { f = this.cg.resolver.resolve_decl(m.func.overload_entry); }
+        if (m != null && m.func != null) { f = this.cg.resolver.resolve_decl(DeclarationNode::fn_of(m.func).overload_entry); }
         if (!f.is_valid()) {
             this.cg.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
                 fmt::format("codegen: the `Allocate` implementation has no `%s` to call",
@@ -137,17 +126,17 @@ type struct NewDeleteEmitter {
     }
 
 
-    // new T(args) / new T { fields }
+    // new T { fields } / new E::V(args)
 
-    emit_new(mut &this, visitor: ASTVisitor*, node: NewExprNode*) -> void {
+    emit_new(mut &this, visitor: IRGeneratorVisitor*, e: ExpressionNode*, node: NewExpr*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         // Array allocation `new T[n]` is handled up front: it allocates raw
         // memory and the element may be a primitive (`new int[100]`) whose
         // name is a keyword not in the decl index, so the type_name lookup
         // below would fail.  emit_new_array reads the element type from the
         // sema-resolved `T*` result type instead.
         if (node.has_array_size()) {
-            this.emit_new_array(visitor, node);
-            return;
+            return this.emit_new_array(visitor, e, node);
         }
 
         const intern: InternTable* = this.cg.get_intern();
@@ -155,70 +144,57 @@ type struct NewDeleteEmitter {
 
         // What `new T` allocates is what sema resolved the node to, read off
         // the node: `resolved_type` is `T*` (a `new` yields a pointer), so the
-        // pointee is the type.  The name the allocation needs - for the vtable
-        // global and the constructor symbol - is that TYPE's own registered
-        // name, the same name the owning module defines the vtable under and
-        // registers the constructor beneath.  The spelling is not consulted:
-        // sema already answered it from the name layer's stamp, and asking
-        // the index by leaf again could land on a same-named type from
-        // another module.
+        // pointee is the type.  The spelling is not consulted: sema already
+        // answered it from the name layer's stamp.
         mut type_ref: TypeRef = TypeRef::invalid();
-        if (node.has_resolved_type()) {
-            const rt: Type* = arena_p.lookup(node.resolved_type);
+        if (e.has_resolved_type()) {
+            const rt: Type* = arena_p.lookup(e.resolved_type);
             if (rt != null && rt.kind == TypeKind::Pointer) {
-                type_ref = (rt as PointerType*).pointee;
+                type_ref = rt.as_pointer().pointee;
             }
         }
-        const qualified_sym: SymbolStr = arena_p.get_qualified_name(type_ref).spelling();
         const t: Type* = this.cg.arena_type(type_ref);
         if (t == null) {
             this.cg.diag.emit_error_at_span(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED,
                 fmt::format("codegen: 'new': target type '%s' not found",
                     intern.resolve(node.type_name)),
-                node.span);
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+                e.span);
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         // Heap-allocated enum variant: the one sema pinned inside the enum
         // the stamp names (a leaf the enum lacks was refused there).
         if (t.kind == TypeKind::Enum && node.has_variant()) {
-            const et: EnumType* = t as EnumType*;
+            const et: EnumType* = t.as_enum();
             const variant: EnumVariantInfo* = CodegenUtil::pinned_variant(et, node.resolved_member);
             if (variant == null) {
                 this.cg.diag.emit_error_at_span(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED,
                     "codegen: `new T::V(...)` carries no variant pin: no sema walk answered it",
-                    node.span);
-                this.state.last_value = LValue::null();
-                this.state.last_is_lvalue = false;
-                return;
+                    e.span);
+                out.value = LValue::null();
+                out.is_lvalue = false;
+                return out;
             }
             mut vargs: [LValue] = [];
             for (mut i: i64 = 0; i < node.arguments.length; i++) {
                 vargs.push(this.dispatch.codegen_rvalue(visitor,node.arguments[i]));
             }
             const variant_val: LValue = this.enum_variant.build(et, variant, type_ref, vargs);
-            this.state.last_value = this.cg.expr_ops.heap_box_enum_variant(et, type_ref, variant_val, node.span);
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = this.cg.expr_ops.heap_box_enum_variant(et, type_ref, variant_val, e.span);
+            out.is_lvalue = false;
+            return out;
         }
 
         const mapped: LType = this.cg.type_mapper.map_type(type_ref);
-        // Virtual dispatch through `t.size_bytes()` resolves to the base
-        // `Type::size_bytes` (which returns 0) when codegen hasn't wired
-        // vtable dispatch yet.  Pull `computed_size` directly from the
-        // concrete type based on kind; type_lowering already accounted for
-        // inheritance in that value.
+        // An aggregate's size is the `computed_size` type lowering gave it.
         mut size: u64 = 0;
-        if (t.kind == TypeKind::Class) {
-            const ct: ClassType* = t as ClassType*;
-            size = ct.computed_size;
-        } else if (t.kind == TypeKind::Struct) {
-            const st: StructType* = t as StructType*;
+        if (t.kind == TypeKind::Struct) {
+            const st: StructType* = t.as_struct();
             size = st.computed_size;
         } else if (t.kind == TypeKind::Enum) {
-            const et: EnumType* = t as EnumType*;
+            const et: EnumType* = t.as_enum();
             size = et.computed_size;
         } else {
             size = t.size_bytes();
@@ -227,31 +203,27 @@ type struct NewDeleteEmitter {
 
         const size_val: LValue = LType::const_int(LType::i64(), size, false);
 
-        // A type with an `Allocate` (its own or a base's) takes its storage
-        // from it; everything else shares the canonical GlobalAlloc via the
-        // shared funnel. The bitcast / vtable seed / struct init / ctor call
-        // below are the same whichever allocator supplied the storage.
-        const alloc_block: ImplBlockNode* = this.allocator_of(type_ref);
+        // A type with an `Allocate` takes its storage from it; everything
+        // else shares the canonical GlobalAlloc via the shared funnel. The
+        // bitcast and struct init below are the same whichever allocator
+        // supplied the storage.
+        const alloc_block: ImplBlock* = this.allocator_of(type_ref);
         mut alloc_fn: LValue = LValue::null();
         if (alloc_block != null) {
-            alloc_fn = this.allocator_method(alloc_block, LangItem::AllocateAllocate, node.span);
+            alloc_fn = this.allocator_method(alloc_block, LangItem::AllocateAllocate, e.span);
             if (!alloc_fn.is_valid()) {
-                this.state.last_value = LValue::null();
-                this.state.last_is_lvalue = false;
-                return;
+                out.value = LValue::null();
+                out.is_lvalue = false;
+                return out;
             }
         }
-        mut align: u64 = 16;
-        if (t.kind == TypeKind::Class) {
-            const ct_a: ClassType* = t as ClassType*;
-            if (ct_a.computed_align > 0) { align = ct_a.computed_align; }
-        }
+        const align: u64 = 16;
         const raw_ptr: LValue = this.cg.expr_ops.emit_raw_alloc(
-            alloc_fn, size_val, align, "newtmp", node.span, "'new' expression");
+            alloc_fn, size_val, align, "newtmp", e.span, "'new' expression");
         if (!raw_ptr.is_valid()) {
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         // Bitcast to the target struct pointer type.
@@ -261,51 +233,18 @@ type struct NewDeleteEmitter {
                 raw_ptr, LType::pointer_to(mapped), "newcast");
         }
 
-        // Store the vtable pointer at slot 0 for classes with virtual methods.
-        // The vtable global is emitted by codegen_vtable_for_class in the
-        // owning module's codegen pass.  When `new` is used in a different
-        // module than the class declaration, the vtable global isn't yet in
-        // the current LLVM module's symbol table; declare it as an extern
-        // (no initializer) so the link step resolves it to the owning
-        // module's definition.
-        if (t.kind == TypeKind::Class) {
-            const cls: ClassType* = t as ClassType*;
-            if (cls.has_virtual_methods && mapped.is_valid() && obj_ptr.is_valid()) {
-                const qname: QualifiedName = QualifiedName::from_symbol(qualified_sym);
-                const vtbl_name: MangledName = MangledName::for_vtable(intern, qname);
-                mut vtbl_global: LValue = this.cg.llvm_module.get_named_global(vtbl_name);
-                if (!vtbl_global.is_valid()) {
-                    // Cross-module reference: emit an extern declaration.
-                    // The placeholder type doesn't have to match the
-                    // definition exactly: opaque pointers mean we only
-                    // store the global's address, and the linker resolves
-                    // by symbol name regardless of the IR-level type.
-                    const fn_ptr_ty: LType = LType::pointer_to(LType::i8());
-                    const placeholder_ty: LType = LType::array_of(fn_ptr_ty, 1);
-                    vtbl_global = this.cg.llvm_module.add_global(placeholder_ty, vtbl_name);
-                }
-                if (vtbl_global.is_valid()) {
-                    const vptr_slot: LValue = this.cg.builder.build_struct_gep(
-                        mapped, obj_ptr, 0, "vptr.slot");
-                    if (vptr_slot.is_valid()) {
-                        this.cg.builder.build_store(vtbl_global, vptr_slot);
-                    }
-                }
-            }
-        }
-
         // Initialize fields for `new T { fields }`. Without this the malloc'd
         // struct's fields are left uninitialized; every TypeAnnotation* the
         // parser produces would be a pointer to garbage.
         if (node.struct_init != null && t.kind == TypeKind::Struct && mapped.is_valid()) {
-            const lit: StructLiteralNode* = node.struct_init;
-            const st: StructType* = t as StructType*;
+            const lit: StructExpr* = ExpressionNode::struct_of(node.struct_init);
+            const st: StructType* = t.as_struct();
             for (mut sfi: i64 = 0; sfi < lit.field_inits.length; sfi++) {
                 const finit: FieldInit = lit.field_inits[sfi];
                 // The field is the one sema pinned on the initializer.
                 mut sf_fidx: i64 = -1;
                 match (finit.pin) {
-                    MemberPin::Field(_, ix) => { if (ix < st.fields.length) { sf_fidx = ix; } }
+                    MemberPin::Field(ix) => { if (ix < st.fields.length) { sf_fidx = ix; } }
                     _                       => { }
                 }
                 if (sf_fidx >= 0) {
@@ -332,8 +271,8 @@ type struct NewDeleteEmitter {
                                 const field_t: Type* = this.cg.arena_type(
                                     st.fields[sf_fidx].field_type);
                                 if (field_t != null && field_t.kind == TypeKind::Int) {
-                                    const ft_int: IntType* = field_t as IntType*;
-                                    signed_target = ft_int.int_kind.is_signed();
+                                    const ft_int: IntegerKind = field_t.int_kind();
+                                    signed_target = ft_int.is_signed();
                                 }
                                 if (signed_target) {
                                     val = this.cg.builder.build_sext(val, field_lty, "field.widen");
@@ -350,64 +289,43 @@ type struct NewDeleteEmitter {
             }
         }
 
-        // Call the constructor, read off the constructors the class's
-        // definition registered, by arity.
-        // Constructor LLVM arity = user args + 1 for the implicit `this`.
-        const ctor_arity: u32 = (node.arguments.length + 1) as u32;
-        const ctor_fn: LValue = this.cg.resolver.resolve_constructor(
-            this.cg.ctx.decl_index.registered_def(type_ref), ctor_arity as i64);
-        if (ctor_fn.is_valid() && obj_ptr.is_valid()) {
-            const ctor_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(ctor_fn.raw) };
-            if (ctor_ty.is_valid() && LType::kind_of(ctor_ty.raw) == LTypeKind::Function) {
-                // Same single-element-literal bug applies here; use push.
-                mut ctor_args: [Pair<LValue, TypeRef>] = [];
-                ctor_args.push(Pair::<LValue, TypeRef>::new(obj_ptr, node.resolved_type));
-                for (mut i: i64 = 0; i < node.arguments.length; i++) {
-                    const arg_val: LValue = this.dispatch.codegen_rvalue(visitor,node.arguments[i]);
-                    ctor_args.push(Pair::<LValue, TypeRef>::new(arg_val, node.arguments[i].resolved_type));
-                }
-                mut ctor_result: LValue = LValue::null();
-                ctor_result = this.cg.expr_ops.codegen_call(ctor_fn, ctor_ty, ctor_args, "");
-            }
-        }
-
-        this.state.last_value = obj_ptr;
-        this.state.last_is_lvalue = false;
+        out.value = obj_ptr;
+        out.is_lvalue = false;
+        return out;
     }
 
     // new T[n]  - raw array allocation
 
     /// Lower `new T[n]` to `malloc(n * sizeof(T))` cast to `T*`.  The memory
-    /// is left uninitialized - no constructors run - matching the doc's
+    /// is left uninitialized - nothing fills it - matching the doc's
     /// `const arr: int* = new int[100]` example and the low-level framing of
-    /// section 15.2 (use `Array<T>` when you want constructed/managed elements).
+    /// section 14.2 (use `Array<T>` when you want constructed/managed elements).
     /// The element type is read from the sema-resolved `T*` result type so
     /// primitive elements (whose name is a keyword, not a decl-index entry)
     /// resolve the same way user types do.
-    emit_new_array(mut &this, visitor: ASTVisitor*, node: NewExprNode*) -> void {
-        const result_t: Type* = this.cg.arena_type(node.resolved_type);
+    emit_new_array(mut &this, visitor: IRGeneratorVisitor*, e: ExpressionNode*, node: NewExpr*) -> Emitted {
+        mut out: Emitted = Emitted::none();
+        const result_t: Type* = this.cg.arena_type(e.resolved_type);
         if (result_t == null || result_t.kind != TypeKind::Pointer) {
             this.cg.diag.emit_error_at_span(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED,
                 "codegen: 'new T[n]': could not resolve element type",
-                node.span);
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+                e.span);
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
-        const elem_ref: TypeRef = (result_t as PointerType*).pointee;
+        const elem_ref: TypeRef = result_t.as_pointer().pointee;
         const elem_t: Type* = this.cg.arena_type(elem_ref);
         const elem_llvm: LType = this.cg.type_mapper.map_type(elem_ref);
 
-        // Element byte size (same kind-derivation as emit_new: virtual
-        // size_bytes() returns 0 for aggregates, so read computed_size).
+        // Element byte size (same kind-derivation as emit_new: an
+        // aggregate's is its `computed_size`).
         mut elem_size: u64 = 0;
         if (elem_t != null) {
-            if (elem_t.kind == TypeKind::Class) {
-                elem_size = (elem_t as ClassType*).computed_size;
-            } else if (elem_t.kind == TypeKind::Struct) {
-                elem_size = (elem_t as StructType*).computed_size;
+            if (elem_t.kind == TypeKind::Struct) {
+                elem_size = elem_t.as_struct().computed_size;
             } else if (elem_t.kind == TypeKind::Enum) {
-                elem_size = (elem_t as EnumType*).computed_size;
+                elem_size = elem_t.as_enum().computed_size;
             } else {
                 elem_size = elem_t.size_bytes();
             }
@@ -417,9 +335,9 @@ type struct NewDeleteEmitter {
         // Element count expression -> i64.
         mut count_val: LValue = this.dispatch.codegen_rvalue(visitor, node.array_size);
         if (!count_val.is_valid()) {
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
         count_val = this.widen_to_i64(count_val);
 
@@ -427,7 +345,7 @@ type struct NewDeleteEmitter {
         // u64 would malloc a too-small block and the element writes would
         // run off the heap. (Same guard class as `Layout::array`.)
         this.cg.expr_ops.emit_array_mul_guard(count_val, elem_size,
-            visitor, &node.unwind_cleanup, node.span);
+            visitor, &node.unwind_cleanup, e.span);
 
         const elem_size_val: LValue = LType::const_int(LType::i64(), elem_size, false);
         const total: LValue = this.cg.builder.build_mul(
@@ -435,22 +353,22 @@ type struct NewDeleteEmitter {
 
         // An element type with an `Allocate` takes the block from it, as
         // `new` of one does.  Array allocations use a fixed 16 alignment.
-        const alloc_block: ImplBlockNode* = this.allocator_of(elem_ref);
+        const alloc_block: ImplBlock* = this.allocator_of(elem_ref);
         mut alloc_fn: LValue = LValue::null();
         if (alloc_block != null) {
-            alloc_fn = this.allocator_method(alloc_block, LangItem::AllocateAllocate, node.span);
+            alloc_fn = this.allocator_method(alloc_block, LangItem::AllocateAllocate, e.span);
             if (!alloc_fn.is_valid()) {
-                this.state.last_value = LValue::null();
-                this.state.last_is_lvalue = false;
-                return;
+                out.value = LValue::null();
+                out.is_lvalue = false;
+                return out;
             }
         }
         const raw_ptr: LValue = this.cg.expr_ops.emit_raw_alloc(
-            alloc_fn, total, 16, "new.arr", node.span, "'new T[n]'");
+            alloc_fn, total, 16, "new.arr", e.span, "'new T[n]'");
         if (!raw_ptr.is_valid()) {
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         mut elem_ptr: LValue = raw_ptr;
@@ -458,8 +376,9 @@ type struct NewDeleteEmitter {
             elem_ptr = this.cg.builder.build_pointer_cast(
                 raw_ptr, LType::pointer_to(elem_llvm), "new.arr.cast");
         }
-        this.state.last_value = elem_ptr;
-        this.state.last_is_lvalue = false;
+        out.value = elem_ptr;
+        out.is_lvalue = false;
+        return out;
     }
 
     /// Widen an integer value to i64 for use as a malloc byte count.  Array
@@ -476,16 +395,19 @@ type struct NewDeleteEmitter {
 
     // delete ptr
 
-    emit_delete(mut &this, visitor: ASTVisitor*, node: DeleteExprNode*) -> void {
+    emit_delete(mut &this, visitor: IRGeneratorVisitor*, e: ExpressionNode*, node: DeleteExpr*) -> Emitted {
+        mut out: Emitted = Emitted::none();
+        const span: SourceSpan = e.span;
         // `delete ptr` is the manual-memory dual of an end-of-scope drop:
-        //   1. Run the pointee's drop method, if it has one.
+        //   1. Release the pointee as a scope exit releases a value of its
+        //      type: its destructor, if it has one, then its owned fields.
         //   2. Free the allocation.
         // The operand is evaluated exactly once (see below): the pointer
-        // is spilled to a temp slot, the drop is synthesized as a
-        // `.drop()` on a synthetic local reading that slot - bound to the
-        // pointee's `Drop` implementation by identity, and emitted through
-        // the normal method-dispatch path, so virtual class destructors
-        // reach the right symbol - and the same spilled pointer is freed.  This
+        // is spilled to a temp slot, the release is synthesized as
+        // `(*recv).drop()` on a synthetic local reading that slot - bound to
+        // the pointee's `Drop` implementation by identity, or left for the
+        // type's glue when it has none - and the same spilled pointer is
+        // freed.  This
         // makes side-effecting operands (`delete arr.pop()`) safe: the
         // side effects fire once and the destructor and `free` see the
         // identical pointer.
@@ -498,7 +420,7 @@ type struct NewDeleteEmitter {
         if (operand_type.is_valid() && arena_ptr != null) {
             const ot: Type* = arena_ptr.lookup(operand_type);
             if (ot != null && ot.kind == TypeKind::Pointer) {
-                const pt: PointerType* = ot as PointerType*;
+                const pt: PointerType* = ot.as_pointer();
                 pointee = pt.pointee;
             }
         }
@@ -508,13 +430,13 @@ type struct NewDeleteEmitter {
         // does not own it.
         mut release_fn: LValue = LValue::null();
         if (pointee.is_valid()) {
-            const alloc_block: ImplBlockNode* = this.allocator_of(pointee);
+            const alloc_block: ImplBlock* = this.allocator_of(pointee);
             if (alloc_block != null) {
-                release_fn = this.allocator_method(alloc_block, LangItem::AllocateRelease, node.span);
+                release_fn = this.allocator_method(alloc_block, LangItem::AllocateRelease, span);
                 if (!release_fn.is_valid()) {
-                    this.state.last_value = LValue::null();
-                    this.state.last_is_lvalue = false;
-                    return;
+                    out.value = LValue::null();
+                    out.is_lvalue = false;
+                    return out;
                 }
             }
         }
@@ -522,8 +444,8 @@ type struct NewDeleteEmitter {
         mut should_drop: boolean = false;
         if (pointee.is_valid() && arena_ptr != null && registry_ptr != null
                 && intern_ptr != null) {
-            should_drop = OwnershipQuery::type_implements_drop(arena_ptr, registry_ptr,
-                                                               intern_ptr, pointee);
+            should_drop = OwnershipQuery::needs_drop(arena_ptr, registry_ptr,
+                                                     intern_ptr, pointee);
         }
 
         // Evaluate the operand exactly once.  A side-effecting operand
@@ -534,18 +456,18 @@ type struct NewDeleteEmitter {
         // drive both the synthesized `.drop()` and the `free` off it.
         const ptr: LValue = this.dispatch.codegen_rvalue(visitor, node.operand);
         if (!ptr.is_valid()) {
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         if (should_drop) {
             // Bind the already-evaluated pointer to a synthetic local so
-            // the drop dispatch (which re-codegens its receiver node) reads
-            // the spilled value instead of re-evaluating `node.operand`.
-            // The slot mirrors a real `T*` local - it holds the pointer
-            // value - so the receiver auto-deref in method dispatch behaves
-            // identically to a direct `node.operand.drop()`.
+            // the release (which re-codegens its receiver node) reads the
+            // spilled value instead of re-evaluating `node.operand`.  The
+            // release is `(*recv).drop()`, the one a scope exit gives a value
+            // of the pointee's type: its destructor, if it has one, then the
+            // release of the fields it owns.
             const slot_ty: LType = LType::pointer_to(LType::i8());
             // Hoisted to the entry block: `delete` in a loop body would
             // otherwise leave one spill slot behind per iteration.  The slot
@@ -558,18 +480,23 @@ type struct NewDeleteEmitter {
             this.cg.values.bind_transient(recv_bind, slot);
 
             const drop_sym: SymbolStr = intern_ptr.intern("drop");
-            mut recv: IdentifierNode* = new IdentifierNode(recv_sym, node.span);
-            recv.set_res(Res::Local(recv_bind));
+            const recv: ExpressionNode* = ExpressionNode::identifier_expr(recv_sym, span);
+            ExpressionNode::identifier_of(recv).set_res(Res::Local(recv_bind));
             recv.set_resolved_type(node.operand.resolved_type);
-            mut member: MemberAccessNode* = new MemberAccessNode(
-                recv as ExpressionNode*, drop_sym, node.span, node.span);
+            const deref_tok: Token = Token::new(TokenType::Star, "*",
+                span.start_line as int, span.start_col as int);
+            mut target: ExpressionNode* = ExpressionNode::synthetic_unary(
+                deref_tok, recv, span);
+            target.set_resolved_type(pointee);
+            mut member: ExpressionNode* = ExpressionNode::member_access_expr(
+                target, drop_sym, span, span);
             member.set_resolved_type(TypeRef::invalid());
-            mut call: CallExprNode* = new CallExprNode(
-                member as ExpressionNode*, node.span);
-            this.cg.bind_pointee_destructor_call(call, pointee);
-            mut stmt: ExprStmtNode* = new ExprStmtNode(
-                call as ExpressionNode*, node.span);
-            stmt.accept(visitor);
+            mut call: ExpressionNode* = ExpressionNode::call_expr(
+                member, span);
+            this.cg.bind_destructor_call(call);
+            mut stmt: Stmt* = Stmt::expr_stmt(
+                call, span);
+            visitor.dispatch_node(Node::Stmt(stmt));
 
             this.cg.values.remove(recv_bind);
         }
@@ -583,14 +510,7 @@ type struct NewDeleteEmitter {
         // takes the pointee alignment so the dealloc pairs with the `new`
         // site on platforms where free is alignment-sensitive (Windows
         // `_aligned_free`); the computation mirrors `emit_new`.
-        mut del_align: u64 = 16;
-        if (pointee.is_valid() && arena_ptr != null) {
-            const del_pt: Type* = arena_ptr.lookup(pointee);
-            if (del_pt != null && del_pt.kind == TypeKind::Class) {
-                const del_cpt: ClassType* = del_pt as ClassType*;
-                if (del_cpt.computed_align > 0) { del_align = del_cpt.computed_align; }
-            }
-        }
+        const del_align: u64 = 16;
         if (release_fn.is_valid()) {
             const rel_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(release_fn.raw) };
             const rel_ptr: LValue = this.cg.builder.build_pointer_cast(
@@ -601,9 +521,10 @@ type struct NewDeleteEmitter {
                 LType::const_int(LType::i64(), del_align, false), TypeRef::invalid()));
             this.cg.expr_ops.codegen_call(release_fn, rel_ty, rel_args, "");
         } else {
-            this.cg.expr_ops.emit_raw_dealloc(ptr, del_align, node.span);
+            this.cg.expr_ops.emit_raw_dealloc(ptr, del_align, span);
         }
-        this.state.last_value = LValue::null();
-        this.state.last_is_lvalue = false;
+        out.value = LValue::null();
+        out.is_lvalue = false;
+        return out;
     }
 }

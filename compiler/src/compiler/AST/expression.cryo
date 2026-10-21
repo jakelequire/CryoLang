@@ -1,18 +1,18 @@
 /// AST Expression Nodes
 ///
-/// ExpressionNode base and all 19 concrete expression classes.
+/// ExpressionNode header and the payload struct of each expression kind.
 
 namespace compiler::ast::expression;
 
 import compiler::diag;
 import compiler::ast;
-import compiler::ast::{ ArgBinding, LiteralKind, MemberPin, NodeKind, TypeAnnotation };
+import compiler::ast::{ ArgBinding, LiteralKind, MemberPin, TypeAnnotation };
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::lex;
 import compiler::lex::{ Token };
 import compiler::ast::node;
-import compiler::ast::node::{ ASTNode };
+import compiler::ast::node::{ Node };
 import compiler::types::type_ref;
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::{ TypeKind };
@@ -27,13 +27,13 @@ import compiler::intrinsic_kind::{ IntrinsicKind };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::ast::declaration;
-import compiler::ast::declaration::{ VarDeclNode };
+import compiler::ast::declaration::{ DeclarationNode, GenericParamDecl, ImplBlock, VarDecl };
 import compiler::ast::pattern;
 import compiler::ast::pattern::{ MatchArmNode, StaticMatchArmNode };
 import compiler::ast::statement;
-import compiler::ast::statement::{ StatementNode };
-import compiler::ast::visitor;
-import compiler::ast::visitor::{ ASTVisitor };
+import compiler::ast::statement::{ Stmt };
+import compiler::ast::walk::{ Walk };
+import compiler::codegen::ast_arena::{ cryo_ast_arena_alloc };
 
 /// What a call's callee is pinned to once sema or the monomorphizer has
 /// decided it, and by WHICH kind of answer - the two are different keys
@@ -85,8 +85,18 @@ implement enum CalleePin {
     }
 }
 
-type class ExpressionNode : ASTNode {
-public:
+/// Every expression: what all kinds share, and which kind of expression it
+/// is.
+type struct ExpressionNode {
+    span:          SourceSpan;
+    has_error:     boolean;
+    /// The compiler wrote this node where the source spells nothing, and
+    /// gave it the span of the source it stands for: an f-string's lowering
+    /// (its calls, their callees, its literal runs), an implicit
+    /// conversion's call.  A reader asking what is written at a position -
+    /// the editor - looks through it to the written code under it (an
+    /// f-string's holes, the converted operand).
+    generated:     boolean;
     resolved_type: TypeRef;
 
     /// Set by sema when this expression is a by-value argument passed to a
@@ -103,25 +113,590 @@ public:
     /// `Unclassified` outside an argument slot.
     arg_binding: ArgBinding;
 
-    ExpressionNode(kind: NodeKind, span: SourceSpan) : ASTNode(kind, span) {
-        this.resolved_type = TypeRef::invalid();
-        this.autoref       = false;
-        this.arg_binding   = ArgBinding::Unclassified;
+    /// Which expression this is.
+    kind: ExprKind;
+
+    set_resolved_type(mut &this, t: TypeRef) -> void { this.resolved_type = t; }
+    has_resolved_type(&this) -> boolean        { return this.resolved_type.is_valid(); }
+
+    /// An expression of `kind` at `span`, with the header's defaults.
+    static of(kind: ExprKind, span: SourceSpan) -> ExpressionNode* {
+        return new ExpressionNode {
+            span:          span,
+            has_error:     false,
+            generated:     false,
+            resolved_type: TypeRef::invalid(),
+            autoref:       false,
+            arg_binding:   ArgBinding::Unclassified,
+            kind:          kind,
+        };
     }
 
-    set_resolved_type(t: TypeRef) -> void { this.resolved_type = t; }
-    has_resolved_type() -> boolean        { return this.resolved_type.is_valid(); }
-
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+    /// `sizeof(type_ann)` at `span`, its operand not yet resolved.
+    static sizeof_expr(type_ann: TypeAnnotation*, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Sizeof(new SizeofExpr {
+            type_ann:     type_ann,
+            operand_type: TypeRef::invalid(),
+        }), span);
     }
+
+    /// `alignof(type_ann)` at `span`, its operand not yet resolved.
+    static alignof_expr(type_ann: TypeAnnotation*, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Alignof(new AlignofExpr {
+            type_ann:     type_ann,
+            operand_type: TypeRef::invalid(),
+        }), span);
+    }
+
+    /// `typeof(operand)` at `span`.
+    static typeof_expr(operand: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Typeof(new TypeofExpr { operand: operand }), span);
+    }
+
+    /// `delete operand` at `span`.
+    static delete_expr(operand: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Delete(new DeleteExpr { operand: operand }), span);
+    }
+
+    /// `operand` converted to the trait object `object`, its value's type
+    /// `source` implementing the trait by `implementation`.  Made by sema
+    /// only, at the operand's span.
+    static object_conversion(operand: ExpressionNode*, source: TypeRef, implementation: ImplBlock*,
+                             object: TypeRef) -> ExpressionNode* {
+        mut c: ExpressionNode* = ExpressionNode::of(ExprKind::ObjectConversion(new ObjectConversionExpr {
+            operand:        operand,
+            source:         source,
+            implementation: implementation,
+        }), operand.span);
+        c.set_resolved_type(object);
+        return c;
+    }
+
+    /// `new type_name` at `span`, with nothing after the name yet; the
+    /// parser and the cloner fill in the rest.
+    static new_expr(type_name: SymbolStr, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::New(new NewExpr {
+            type_name:       type_name,
+            variant_name:    SymbolStr::empty(),
+            generic_args:    [],
+            arguments:       [],
+            array_size:      null,
+            struct_init:     null,
+            unwind_cleanup:  [],
+            res:             ResSlot::Pending,
+            resolved_member: MemberPin::None,
+            pin_carried:     false,
+        }), span);
+    }
+
+    /// The `literal_kind` literal written `value` at `span`, with no suffix.
+    static literal(value: string, literal_kind: LiteralKind, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Literal(new LiteralExpr {
+            value:        value,
+            literal_kind: literal_kind,
+            suffix:       "",
+            byte_length:  if (value == null) { 0 } else { value.length() as i64 },
+        }), span);
+    }
+
+    /// A `struct_type { }` literal at `span`; its fields and type arguments
+    /// are added after.
+    static struct_expr(struct_type: SymbolStr, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Struct(new StructExpr {
+            struct_type:  struct_type,
+            generic_args: [],
+            field_inits:  [],
+            res:          ResSlot::Pending,
+        }), span);
+    }
+
+    /// An empty array literal at `span`; its elements are added after.
+    static array_expr(span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Array(new ArrayExpr {
+            elements:          [],
+            repeat_count:      0,
+            repeat_count_expr: null,
+        }), span);
+    }
+
+    /// An empty tuple literal at `span`; its elements are added after.
+    static tuple_expr(span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Tuple(new TupleExpr { elements: [] }), span);
+    }
+
+    /// `operand?` at `span`, not yet desugared.
+    static try_expr(operand: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Try(new TryExpr {
+            operand:   operand,
+            desugared: null,
+        }), span);
+    }
+
+    /// `condition ? true_expr : false_expr` at `span`.
+    static ternary_expr(condition: ExpressionNode*, true_expr: ExpressionNode*,
+                        false_expr: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Ternary(new TernaryExpr {
+            condition:  condition,
+            true_expr:  true_expr,
+            false_expr: false_expr,
+        }), span);
+    }
+
+    /// `if (condition) { then_expr } else { else_expr }` as a value, at `span`.
+    static if_expr(condition: ExpressionNode*, then_expr: ExpressionNode*,
+                   else_expr: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::If(new IfExpr {
+            condition: condition,
+            then_expr: then_expr,
+            else_expr: else_expr,
+        }), span);
+    }
+
+    /// `expression as target_annotation` at `span`, its target not yet
+    /// resolved.
+    static cast_expr(expression: ExpressionNode*, target_annotation: TypeAnnotation*,
+                     span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Cast(new CastExpr {
+            expression:        expression,
+            target_annotation: target_annotation,
+            resolved_target:   TypeRef::invalid(),
+        }), span);
+    }
+
+    /// `await operand` at `span`.
+    static await_expr(operand: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Await(new AwaitExpr { operand: operand }), span);
+    }
+
+    /// A lambda at `span` with no parameters, return type or body yet; the
+    /// parser and the cloner fill them in.
+    static lambda_expr(span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Lambda(new LambdaExpr {
+            parameters:      [],
+            return_type:     TypeRef::invalid(),
+            return_type_ann: null,
+            body:            null,
+            captured_names:  [],
+            captured_syms:   [],
+            captured_types:  [],
+            captured_spans:  [],
+            is_move:         false,
+        }), span);
+    }
+
+    /// `array[index]` at `span`.
+    static array_access_expr(array: ExpressionNode*, index: ExpressionNode*,
+                             span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::ArrayAccess(new ArrayAccessExpr {
+            array:          array,
+            index:          index,
+            desugared_call: null,
+            unwind_cleanup: [],
+        }), span);
+    }
+
+    /// `left op right` at `span`.
+    static binary_expr(op: Token, left: ExpressionNode*, right: ExpressionNode*,
+                       span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Binary(new BinaryExpr {
+            op:               op,
+            left:             left,
+            right:            right,
+            desugared_call:   null,
+            desugar_by_bound: false,
+            append_entry:     OverloadId::invalid(),
+            unwind_cleanup:   [],
+        }), span);
+    }
+
+    /// The prefix `op operand` at `span`, written by the user.
+    static unary_expr(op: Token, operand: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Unary(new UnaryExpr {
+            op:               op,
+            operand:          operand,
+            is_postfix:       false,
+            is_synthetic:     false,
+            desugared_call:   null,
+            desugar_by_bound: false,
+        }), span);
+    }
+
+    /// The prefix `op operand` at `span`, built by the compiler, which the
+    /// checks that constrain user syntax skip.
+    static synthetic_unary(op: Token, operand: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
+        const e: ExpressionNode* = ExpressionNode::unary_expr(op, operand, span);
+        mut u: UnaryExpr* = ExpressionNode::unary_of(e);
+        u.is_synthetic = true;
+        return e;
+    }
+
+    /// `match (subject) { }` at `span`; its arms are added after.
+    static match_expr(subject: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Match(new MatchExpr {
+            subject:        subject,
+            arms:           [],
+            unwind_cleanup: [],
+        }), span);
+    }
+
+    /// `static match (scrutinee) { }` at `span`; its arms are added after.
+    static static_match_expr(scrutinee: TypeAnnotation*, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::StaticMatch(new StaticMatchExpr {
+            scrutinee: scrutinee,
+            arms:      [],
+        }), span);
+    }
+
+    /// The bare name `name` at `span`, not yet resolved.
+    static identifier_expr(name: SymbolStr, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Identifier(new IdentifierExpr {
+            name:                 name,
+            is_this_keyword:      false,
+            is_this_type_keyword: false,
+            generic_args:         [],
+            resolved_callee:      CalleePin::None,
+            value_type_args:      [],
+            value_template:       TypeRef::invalid(),
+            res:                  ResSlot::Pending,
+        }), span);
+    }
+
+    /// The path `scope_name::member_name` at `span`, not yet resolved; both
+    /// segments' spans are the whole path's until the parser sets them.
+    static scope_resolution_expr(scope_name: SymbolStr, member_name: SymbolStr,
+                                 span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::ScopeResolution(new ScopeResolutionExpr {
+            scope_name:         scope_name,
+            member_name:        member_name,
+            generic_args:       [],
+            scope_generic_args: [],
+            scope_span:         span,
+            member_span:        span,
+            scope_res:          ResSlot::Pending,
+            resolved_callee:    CalleePin::None,
+            resolved_member:    MemberPin::None,
+            pin_carried:        false,
+            scope_is_this_type: false,
+            value_type_args:    [],
+            value_template:     TypeRef::invalid(),
+            spec_owner:         TypeRef::invalid(),
+            impl_trait:         null,
+            resolved_trait:     DefId::invalid(),
+            template_method:    DefId::invalid(),
+            refused:            false,
+            member_def:         DefId::invalid(),
+        }), span);
+    }
+
+    /// `object.member` at `span`, the member's own token at `member_span`,
+    /// not yet resolved.
+    static member_access_expr(object: ExpressionNode*, member: SymbolStr,
+                              member_span: SourceSpan, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::MemberAccess(new MemberAccessExpr {
+            object:              object,
+            member:              member,
+            member_span:         member_span,
+            generic_args:        [],
+            resolved_trait:      DefId::invalid(),
+            resolved_trait_slot: -1,
+            resolved_member:     MemberPin::None,
+            pin_carried:         false,
+        }), span);
+    }
+
+    /// `callee()` at `span`, not yet bound; its arguments are added after.
+    static call_expr(callee: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Call(new CallExpr {
+            callee:             callee,
+            arguments:          [],
+            generic_args:       [],
+            resolved_callee:    CalleePin::None,
+            named_method:       DefId::invalid(),
+            template_method:    DefId::invalid(),
+            template_recv:      TypeRef::invalid(),
+            bound_params:       [],
+            bound_trait_args:   [],
+            resolved_type_args: [],
+            resolved_template:  TypeRef::invalid(),
+            unwind_cleanup:     [],
+        }), span);
+    }
+
+    /// `yield operand` at `span`; a bare `yield` when `operand` is null.
+    static yield_expr(operand: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
+        return ExpressionNode::of(ExprKind::Yield(new YieldExpr { operand: operand }), span);
+    }
+
+    /// The `sizeof` expression `e` is, or null.
+    static sizeof_of(e: ExpressionNode*) -> SizeofExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::Sizeof(s) => { s }
+            _                   => { null }
+        };
+    }
+
+    /// The `alignof` expression `e` is, or null.
+    static alignof_of(e: ExpressionNode*) -> AlignofExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::Alignof(a) => { a }
+            _                    => { null }
+        };
+    }
+
+    /// The `typeof` expression `e` is, or null.
+    static typeof_of(e: ExpressionNode*) -> TypeofExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::Typeof(t) => { t }
+            _                   => { null }
+        };
+    }
+
+    /// The conversion to a trait object `e` is, or null.
+    static object_conversion_of(e: ExpressionNode*) -> ObjectConversionExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::ObjectConversion(c) => { c }
+            _                             => { null }
+        };
+    }
+
+    /// The `delete` expression `e` is, or null.
+    static delete_of(e: ExpressionNode*) -> DeleteExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::Delete(d) => { d }
+            _                   => { null }
+        };
+    }
+
+    /// The `new` expression `e` is, or null.
+    static new_of(e: ExpressionNode*) -> NewExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::New(ne) => { ne }
+            _                 => { null }
+        };
+    }
+
+    /// The literal `e` is, or null.
+    static literal_of(e: ExpressionNode*) -> LiteralExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::Literal(l) => { l }
+            _                    => { null }
+        };
+    }
+
+    /// The struct literal `e` is, or null.
+    static struct_of(e: ExpressionNode*) -> StructExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::Struct(s) => { s }
+            _                   => { null }
+        };
+    }
+
+    /// The array literal `e` is, or null.
+    static array_of(e: ExpressionNode*) -> ArrayExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::Array(a) => { a }
+            _                  => { null }
+        };
+    }
+
+    /// The tuple literal `e` is, or null.
+    static tuple_of(e: ExpressionNode*) -> TupleExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::Tuple(t) => { t }
+            _                  => { null }
+        };
+    }
+
+    /// The `?:` expression `e` is, or null.
+    static ternary_of(e: ExpressionNode*) -> TernaryExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::Ternary(t) => { t }
+            _                    => { null }
+        };
+    }
+
+    /// The `if` expression `e` is, or null.
+    static if_of(e: ExpressionNode*) -> IfExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::If(i) => { i }
+            _               => { null }
+        };
+    }
+
+    /// The `as` cast `e` is, or null.
+    static cast_of(e: ExpressionNode*) -> CastExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::Cast(c) => { c }
+            _                 => { null }
+        };
+    }
+
+    /// The `await` `e` is, or null.
+    static await_of(e: ExpressionNode*) -> AwaitExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::Await(a) => { a }
+            _                  => { null }
+        };
+    }
+
+    /// The lambda `e` is, or null.
+    static lambda_of(e: ExpressionNode*) -> LambdaExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::Lambda(l) => { l }
+            _                   => { null }
+        };
+    }
+
+    /// The indexing `e` is, or null.
+    static array_access_of(e: ExpressionNode*) -> ArrayAccessExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::ArrayAccess(a) => { a }
+            _                        => { null }
+        };
+    }
+
+    /// The binary operation `e` is, or null.
+    static binary_of(e: ExpressionNode*) -> BinaryExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::Binary(b) => { b }
+            _                   => { null }
+        };
+    }
+
+    /// The unary operation `e` is, or null.
+    static unary_of(e: ExpressionNode*) -> UnaryExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::Unary(u) => { u }
+            _                  => { null }
+        };
+    }
+
+    /// The `match` expression `e` is, or null.
+    static match_of(e: ExpressionNode*) -> MatchExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::Match(m) => { m }
+            _                  => { null }
+        };
+    }
+
+    /// The `static match` expression `e` is, or null.
+    static static_match_of(e: ExpressionNode*) -> StaticMatchExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::StaticMatch(s) => { s }
+            _                        => { null }
+        };
+    }
+
+    /// The bare name `e` is, or null.
+    static identifier_of(e: ExpressionNode*) -> IdentifierExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::Identifier(i) => { i }
+            _                       => { null }
+        };
+    }
+
+    /// The call `e` is, or null.
+    static call_of(e: ExpressionNode*) -> CallExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::Call(c) => { c }
+            _                 => { null }
+        };
+    }
+
+    /// The member access `e` is, or null.
+    static member_access_of(e: ExpressionNode*) -> MemberAccessExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::MemberAccess(m) => { m }
+            _                         => { null }
+        };
+    }
+
+    /// The path `e` is, or null.
+    static scope_resolution_of(e: ExpressionNode*) -> ScopeResolutionExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::ScopeResolution(s) => { s }
+            _                            => { null }
+        };
+    }
+
+    /// The `?` expression `e` is, or null.
+    static try_of(e: ExpressionNode*) -> TryExpr* {
+        if (e == null) { return null; }
+        return match (e.kind) {
+            ExprKind::Try(t) => { t }
+            _                => { null }
+        };
+    }
+}
+
+/// `new` of a node takes its storage from the AST arena; `delete` of one
+/// releases nothing, since the arena is reclaimed whole.
+implement trait Allocate for struct ExpressionNode {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
+}
+
+
+/// What an expression is; its kind's fields live in the payload.
+type enum ExprKind {
+    Alignof(AlignofExpr*);
+    Array(ArrayExpr*);
+    ArrayAccess(ArrayAccessExpr*);
+    Await(AwaitExpr*);
+    Binary(BinaryExpr*);
+    Call(CallExpr*);
+    Cast(CastExpr*);
+    Delete(DeleteExpr*);
+    Identifier(IdentifierExpr*);
+    If(IfExpr*);
+    Lambda(LambdaExpr*);
+    Literal(LiteralExpr*);
+    Match(MatchExpr*);
+    MemberAccess(MemberAccessExpr*);
+    New(NewExpr*);
+    ObjectConversion(ObjectConversionExpr*);
+    ScopeResolution(ScopeResolutionExpr*);
+    Sizeof(SizeofExpr*);
+    StaticMatch(StaticMatchExpr*);
+    Struct(StructExpr*);
+    Ternary(TernaryExpr*);
+    Try(TryExpr*);
+    Tuple(TupleExpr*);
+    Typeof(TypeofExpr*);
+    Unary(UnaryExpr*);
+    Yield(YieldExpr*);
 }
 
 
 // Concrete Expression Nodes
 
-type class LiteralNode : ExpressionNode {
-public:
+/// A literal: its text as written and its kind.
+type struct LiteralExpr {
     value:        string;
     literal_kind: LiteralKind;
 
@@ -137,25 +712,18 @@ public:
     /// `"a\0b"` is 3 where its text reads as 1.  The text's own length
     /// unless the parser says otherwise.
     byte_length:  i64;
+}
 
-    LiteralNode(value: string, literal_kind: LiteralKind, span: SourceSpan)
-        : ExpressionNode(NodeKind::Literal, span) {
-        this.value        = value;
-        this.literal_kind = literal_kind;
-        this.suffix       = "";
-        this.byte_length  = if (value == null) { 0 } else { value.length() as i64 };
-    }
-
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+implement trait Allocate for struct LiteralExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
 
-type class IdentifierNode : ExpressionNode {
-public:
+/// A bare name, `this` and `This` among them.
+type struct IdentifierExpr {
     name:                SymbolStr;
-    is_global_reference: boolean;
     /// Whether the parser read this identifier from the keyword `this`.
     is_this_keyword:     boolean;
     /// Whether the parser read this identifier from the keyword `This`.
@@ -197,28 +765,19 @@ public:
     /// meet without a search.
     res:                 ResSlot;
 
-    IdentifierNode(name: SymbolStr, span: SourceSpan)
-        : ExpressionNode(NodeKind::Identifier, span) {
-        this.name                = name;
-        this.is_global_reference = false;
-        this.is_this_keyword     = false;
-        this.is_this_type_keyword = false;
-        this.generic_args        = [];
-        this.resolved_callee     = CalleePin::None;
-        this.value_type_args     = [];
-        this.value_template      = TypeRef::invalid();
-        this.res                 = ResSlot::Pending;
-    }
-
-    set_value_instance(template: TypeRef, args: [TypeRef]) -> void {
+    set_value_instance(mut &this, template: TypeRef, args: [TypeRef]) -> void {
         this.value_template  = template;
         this.value_type_args = args;
     }
 
+    static walk_children<V>(n: IdentifierExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_annotations(&n.generic_args);
+    }
+
     /// Record what this name refers to.  The first answer wins, for the reason
-    /// `ScopeResolutionNode::set_scope_res` gives: a `Res` states what the file
+    /// `ScopeResolutionExpr::set_scope_res` gives: a `Res` states what the file
     /// that WROTE the name can see.
-    set_res(r: Res) -> void {
+    set_res(mut &this, r: Res) -> void {
         this.res.answer(r);
     }
 
@@ -232,7 +791,7 @@ public:
     /// the stand-in; left on the original, it names nothing in the body it now
     /// lives in.  A use answered with anything but a local is not a binding
     /// and keeps its answer.
-    rebind_local(sym: SymbolID) -> void {
+    rebind_local(mut &this, sym: SymbolID) -> void {
         match (this.res) {
             ResSlot::Answered(r) => {
                 match (r) {
@@ -247,22 +806,24 @@ public:
         this.res = ResSlot::Answered(Res::Local(sym));
     }
 
-    set_generic_args(args: [TypeAnnotation*]) -> void {
+    set_generic_args(mut &this, args: [TypeAnnotation*]) -> void {
         this.generic_args = args;
     }
 
-    set_resolved_callee(pin: CalleePin) -> void {
+    set_resolved_callee(mut &this, pin: CalleePin) -> void {
         this.resolved_callee = pin;
     }
+}
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+implement trait Allocate for struct IdentifierExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
 
-type class BinaryExprNode : ExpressionNode {
-public:
+/// `left op right`, an assignment and a compound assignment among them.
+type struct BinaryExpr {
     op:    Token;
     left:  ExpressionNode*;
     right: ExpressionNode*;
@@ -293,28 +854,24 @@ public:
     /// `--panic=unwind` cleanup schedule for the synthesized divide-by-zero /
     /// `INT_MIN / -1` guard (populated only for `/` and `%`), so the guard's
     /// raise runs the frame's local destructors on unwind.  See
-    /// `CallExprNode.unwind_cleanup`.  Empty on the default abort path.
-    unwind_cleanup: [ASTNode*];
+    /// `CallExpr.unwind_cleanup`.  Empty on the default abort path.
+    unwind_cleanup: [Stmt*];
 
-    BinaryExprNode(op: Token, left: ExpressionNode*, right: ExpressionNode*, span: SourceSpan)
-        : ExpressionNode(NodeKind::BinaryExpression, span) {
-        this.op    = op;
-        this.left  = left;
-        this.right = right;
-        this.desugared_call = null;
-        this.desugar_by_bound = false;
-        this.append_entry = OverloadId::invalid();
-        this.unwind_cleanup = [];
+    static walk_children<V>(n: BinaryExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.left);
+        v.walk_expr(n.right);
     }
+}
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+implement trait Allocate for struct BinaryExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
 
-type class UnaryExprNode : ExpressionNode {
-public:
+/// `op operand`, or `operand op` for a postfix `++`/`--`.
+type struct UnaryExpr {
     op:         Token;
     operand:    ExpressionNode*;
     /// True for postfix ++/-- (`a++`, `a--`), false for prefix and all
@@ -333,7 +890,7 @@ public:
     /// Unary operator-overloading desugar target (currently only `-x` for a
     /// user type or a `Neg`-bounded generic param, rewritten to `x.neg()`), or
     /// null for the ordinary numeric-negation / deref / addr-of / inc-dec path.
-    /// Same discipline as `BinaryExprNode.desugared_call`: type-directed, built
+    /// Same discipline as `BinaryExpr.desugared_call`: type-directed, built
     /// in sema after `check_unary_op` rejects, and delegated to by codegen.
     desugared_call: ExpressionNode*;
     /// The desugar was built in a generic body, on an operand that is a type
@@ -343,85 +900,81 @@ public:
     /// monomorphization drops the desugar there.
     desugar_by_bound: boolean;
 
-    UnaryExprNode(op: Token, operand: ExpressionNode*, span: SourceSpan)
-        : ExpressionNode(NodeKind::UnaryExpression, span) {
-        this.op           = op;
-        this.operand      = operand;
-        this.is_postfix   = false;
-        this.is_synthetic = false;
-        this.desugared_call = null;
-        this.desugar_by_bound = false;
+    static walk_children<V>(n: UnaryExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.operand);
     }
+}
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+implement trait Allocate for struct UnaryExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
 
-type class TernaryExprNode : ExpressionNode {
-public:
+/// `condition ? true_expr : false_expr`.
+type struct TernaryExpr {
     condition:  ExpressionNode*;
     true_expr:  ExpressionNode*;
     false_expr: ExpressionNode*;
 
-    TernaryExprNode(condition: ExpressionNode*, true_expr: ExpressionNode*,
-                    false_expr: ExpressionNode*, span: SourceSpan)
-        : ExpressionNode(NodeKind::TernaryExpression, span) {
-        this.condition  = condition;
-        this.true_expr  = true_expr;
-        this.false_expr = false_expr;
+    static walk_children<V>(n: TernaryExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.condition);
+        v.walk_expr(n.true_expr);
+        v.walk_expr(n.false_expr);
     }
+}
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+implement trait Allocate for struct TernaryExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
 
-type class IfExprNode : ExpressionNode {
-public:
+/// `if (condition) { then_expr } else { else_expr }` as a value.
+type struct IfExpr {
     condition: ExpressionNode*;
     then_expr: ExpressionNode*;
     else_expr: ExpressionNode*;
 
-    IfExprNode(condition: ExpressionNode*, then_expr: ExpressionNode*,
-               else_expr: ExpressionNode*, span: SourceSpan)
-        : ExpressionNode(NodeKind::IfExpression, span) {
-        this.condition = condition;
-        this.then_expr = then_expr;
-        this.else_expr = else_expr;
+    static walk_children<V>(n: IfExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.condition);
+        v.walk_expr(n.then_expr);
+        v.walk_expr(n.else_expr);
     }
+}
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+implement trait Allocate for struct IfExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
 
-type class MatchExprNode : ExpressionNode {
-public:
+/// `match (subject) { arms }` as a value.
+type struct MatchExpr {
     subject: ExpressionNode*;
     arms:    [MatchArmNode*];
 
     /// `--panic=unwind` cleanup schedule for the synthesized non-exhaustive
     /// `no_match` guard, so a scrutinee matching no arm runs the frame's local
-    /// destructors on unwind.  See `CallExprNode.unwind_cleanup`.
-    unwind_cleanup: [ASTNode*];
+    /// destructors on unwind.  See `CallExpr.unwind_cleanup`.
+    unwind_cleanup: [Stmt*];
 
-    MatchExprNode(subject: ExpressionNode*, span: SourceSpan)
-        : ExpressionNode(NodeKind::MatchExpression, span) {
-        this.subject = subject;
-        this.arms    = [];
-        this.unwind_cleanup = [];
+    static walk_children<V>(n: MatchExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.subject);
+        for (mut i: i64 = 0; i < n.arms.length; i++) { v.walk_node(Node::Arm(n.arms[i])); }
     }
 
-    add_arm(arm: MatchArmNode*) -> void {
+    add_arm(mut &this, arm: MatchArmNode*) -> void {
         this.arms.push(arm);
     }
+}
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+implement trait Allocate for struct MatchExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
@@ -433,29 +986,29 @@ public:
 /// does not match, BEFORE type-checking, leaving a single live arm. Sema and
 /// codegen then treat the reduced node as "evaluate the one arm's block, yield
 /// its trailing expression" - see StaticMatchArmNode.
-type class StaticMatchExprNode : ExpressionNode {
-public:
+type struct StaticMatchExpr {
     scrutinee: TypeAnnotation*;
     arms:      [StaticMatchArmNode*];
 
-    StaticMatchExprNode(scrutinee: TypeAnnotation*, span: SourceSpan)
-        : ExpressionNode(NodeKind::StaticMatchExpression, span) {
-        this.scrutinee = scrutinee;
-        this.arms      = [];
+    static walk_children<V>(n: StaticMatchExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_annotation(n.scrutinee);
+        for (mut i: i64 = 0; i < n.arms.length; i++) { v.walk_node(Node::StaticArm(n.arms[i])); }
     }
 
-    add_arm(arm: StaticMatchArmNode*) -> void {
+    add_arm(mut &this, arm: StaticMatchArmNode*) -> void {
         this.arms.push(arm);
     }
+}
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+implement trait Allocate for struct StaticMatchExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
 
-type class CallExprNode : ExpressionNode {
-public:
+/// `callee(arguments)`, a function, method, path or value call.
+type struct CallExpr {
     callee:       ExpressionNode*;
     arguments:    [ExpressionNode*];
     generic_args: [TypeAnnotation*];
@@ -547,29 +1100,17 @@ public:
     /// the same move/init flags as the normal-path drops).  DropInsertion
     /// populates it only when a panic may unwind; codegen replays it in the
     /// call's cleanup landing pad so a panic propagating out of the callee
-    /// runs local destructors before continuing to unwind.  Typed `[ASTNode*]`
-    /// (each element is a `StatementNode*`) to avoid an Expression<->Statement
-    /// import cycle.  Empty on the default abort path, so emitted IR is
-    /// unchanged there.
-    unwind_cleanup: [ASTNode*];
+    /// runs local destructors before continuing to unwind.  Empty on the
+    /// default abort path, so emitted IR is unchanged there.
+    unwind_cleanup: [Stmt*];
 
-    CallExprNode(callee: ExpressionNode*, span: SourceSpan)
-        : ExpressionNode(NodeKind::CallExpression, span) {
-        this.callee             = callee;
-        this.arguments          = [];
-        this.generic_args       = [];
-        this.resolved_callee    = CalleePin::None;
-        this.named_method       = DefId::invalid();
-        this.template_method    = DefId::invalid();
-        this.template_recv      = TypeRef::invalid();
-        this.bound_params       = [];
-        this.bound_trait_args   = [];
-        this.resolved_type_args = [];
-        this.resolved_template  = TypeRef::invalid();
-        this.unwind_cleanup     = [];
+    static walk_children<V>(n: CallExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.callee);
+        for (mut i: i64 = 0; i < n.arguments.length; i++) { v.walk_expr(n.arguments[i]); }
+        v.walk_annotations(&n.generic_args);
     }
 
-    add_argument(arg: ExpressionNode*) -> void {
+    add_argument(mut &this, arg: ExpressionNode*) -> void {
         this.arguments.push(arg);
     }
 
@@ -588,7 +1129,7 @@ public:
     ///
     /// Arguments past the declared parameters (a variadic tail) are left
     /// unclassified, which the move passes read as a transfer.
-    bind_arguments(arena: TypeArena*, param_types: &[TypeRef]) -> void {
+    bind_arguments(&this, arena: TypeArena*, param_types: &[TypeRef]) -> void {
         const lim: i64 = if (param_types.length < this.arguments.length) {
             param_types.length
         } else {
@@ -613,47 +1154,50 @@ public:
         }
     }
 
-    set_generic_args(args: [TypeAnnotation*]) -> void {
+    set_generic_args(mut &this, args: [TypeAnnotation*]) -> void {
         this.generic_args = args;
     }
 
-    set_resolved_callee(pin: CalleePin) -> void {
+    set_resolved_callee(mut &this, pin: CalleePin) -> void {
         this.resolved_callee = pin;
     }
 
-    set_resolved_type_args(args: [TypeRef]) -> void {
+    set_resolved_type_args(mut &this, args: [TypeRef]) -> void {
         this.resolved_type_args = args;
     }
 
-    set_resolved_template(template_type: TypeRef) -> void {
+    set_resolved_template(mut &this, template_type: TypeRef) -> void {
         this.resolved_template = template_type;
     }
+}
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+implement trait Allocate for struct CallExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
 
-type class NewExprNode : ExpressionNode {
-public:
+/// `new T`, `new T(args)`, `new T[n]`, `new T { fields }` and
+/// `new Enum::Variant(args)`.
+type struct NewExpr {
     type_name:    SymbolStr;
     /// Set when the source spelling was `new EnumType::Variant(args)`.
-    /// Empty for plain class `new` like `new Foo(args)`.  Codegen
-    /// dispatches to enum-variant construction (build_enum_variant)
-    /// when this is non-empty, since enums don't have class-style
-    /// constructors that the class-`new` path can call.
+    /// Empty for `new T { .. }` and `new T[n]`.  Codegen dispatches to
+    /// enum-variant construction (build_enum_variant) when this is
+    /// non-empty.
     variant_name: SymbolStr;
     generic_args: [TypeAnnotation*];
     arguments:    [ExpressionNode*];
     array_size:   ExpressionNode*;
-    struct_init:  StructLiteralNode*;
+    /// The `{ field: value, ... }` after the name, a struct literal.
+    struct_init:  ExpressionNode*;
 
     /// `--panic=unwind` cleanup schedule for the synthesized `new T[n]`
     /// size-overflow guard (populated only for the array form), so the guard's
     /// raise runs the frame's local destructors on unwind.  See
-    /// `CallExprNode.unwind_cleanup`.
-    unwind_cleanup: [ASTNode*];
+    /// `CallExpr.unwind_cleanup`.
+    unwind_cleanup: [Stmt*];
 
     /// What `type_name` names, stamped by NameResolution from the scope the
     /// expression was written in.  A `new` names one type outright, so there is
@@ -662,7 +1206,7 @@ public:
 
     /// The variant `variant_name` names inside the enum `res` stamps
     /// (`Variant(ordinal)`), as sema found it; codegen builds the boxed
-    /// variant from it.  `None` on a plain class `new`, and on a variant
+    /// variant from it.  `None` on a `new` of a struct, and on a variant
     /// `new` sema refused.
     resolved_member: MemberPin;
 
@@ -671,134 +1215,129 @@ public:
     /// carriage rule.
     pin_carried: boolean;
 
-    NewExprNode(type_name: SymbolStr, span: SourceSpan)
-        : ExpressionNode(NodeKind::NewExpression, span) {
-        this.type_name    = type_name;
-        this.variant_name = SymbolStr::empty();
-        this.resolved_member = MemberPin::None;
-        this.pin_carried  = false;
-        this.generic_args = [];
-        this.arguments    = [];
-        this.array_size   = null;
-        this.struct_init  = null;
-        this.unwind_cleanup = [];
-        this.res          = ResSlot::Pending;
+    static walk_children<V>(n: NewExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_annotations(&n.generic_args);
+        for (mut i: i64 = 0; i < n.arguments.length; i++) { v.walk_expr(n.arguments[i]); }
+        v.walk_expr(n.array_size);
+        v.walk_expr(n.struct_init);
     }
 
     /// Record what the expression's type name refers to.  First answer wins.
-    set_res(r: Res) -> void {
+    set_res(mut &this, r: Res) -> void {
         this.res.answer(r);
     }
 
-    has_array_size() -> boolean { return this.array_size != null; }
-    has_struct_init() -> boolean { return this.struct_init != null; }
-    has_variant() -> boolean { return this.variant_name.is_valid(); }
+    has_array_size(&this) -> boolean { return this.array_size != null; }
+    has_struct_init(&this) -> boolean { return this.struct_init != null; }
+    has_variant(&this) -> boolean { return this.variant_name.is_valid(); }
 
-    set_resolved_member(pin: MemberPin) -> void {
+    set_resolved_member(mut &this, pin: MemberPin) -> void {
         this.resolved_member = pin;
         this.pin_carried     = false;
     }
 
     /// Keep the pin a clone inherited and mark it carried.
-    carry_resolved_member() -> void {
+    carry_resolved_member(mut &this) -> void {
         this.pin_carried = this.resolved_member.is_some();
     }
 
-    add_argument(arg: ExpressionNode*) -> void {
+    add_argument(mut &this, arg: ExpressionNode*) -> void {
         this.arguments.push(arg);
     }
 
-    set_generic_args(args: [TypeAnnotation*]) -> void {
+    set_generic_args(mut &this, args: [TypeAnnotation*]) -> void {
         this.generic_args = args;
     }
 
-    set_array_size(size: ExpressionNode*) -> void {
+    set_array_size(mut &this, size: ExpressionNode*) -> void {
         this.array_size = size;
     }
 
-    set_variant_name(name: SymbolStr) -> void {
+    set_variant_name(mut &this, name: SymbolStr) -> void {
         this.variant_name = name;
     }
+}
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+implement trait Allocate for struct NewExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
 
-type class SizeofExprNode : ExpressionNode {
-public:
+/// `sizeof(T)`.
+type struct SizeofExpr {
     /// The operand as written (`HashMapEntry<K, V>`), the one carrier of
     /// what is measured: the name layer stamps it, the substituter rewrites
     /// it for a clone, and `operand_type` is resolved from it.
     type_ann: TypeAnnotation*;
 
     /// The OPERAND's type - what is being measured - which is a different
-    /// question from `resolved_type`, the type of the expression itself
-    /// (always `u64`).  They are separate fields because they had to be: one
-    /// slot holding both meant whichever pass wrote last decided which one a
-    /// reader got, so the same `sizeof` folded to the operand's size in a
-    /// `static_assert` and to 8 - the width of `u64` - anywhere sema walked.
+    /// question from the header's `resolved_type`, the type of the
+    /// expression itself (always `u64`).  One slot holding both would let
+    /// whichever pass wrote last decide which a reader got, so the same
+    /// `sizeof` would fold to the operand's size in a `static_assert` and to
+    /// 8 - the width of `u64` - anywhere sema walked.
     operand_type: TypeRef;
 
-    SizeofExprNode(type_ann: TypeAnnotation*, span: SourceSpan)
-        : ExpressionNode(NodeKind::SizeofExpression, span) {
-        this.type_ann     = type_ann;
-        this.operand_type = TypeRef::invalid();
+    set_operand_type(mut &this, ty: TypeRef) -> void { this.operand_type = ty; }
+
+    static walk_children<V>(n: SizeofExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_annotation(n.type_ann);
     }
+}
 
-    set_operand_type(ty: TypeRef) -> void { this.operand_type = ty; }
-
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+implement trait Allocate for struct SizeofExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
 
-type class AlignofExprNode : ExpressionNode {
-public:
-    /// The operand as written.  Same rationale as SizeofExprNode.type_ann.
+/// `alignof(T)`.
+type struct AlignofExpr {
+    /// The operand as written, as `SizeofExpr.type_ann` is.
     type_ann: TypeAnnotation*;
 
-    /// The OPERAND's type. Same rationale as SizeofExprNode.operand_type.
+    /// The OPERAND's type, kept apart from the header's `resolved_type` as
+    /// `SizeofExpr.operand_type` is.
     operand_type: TypeRef;
 
-    AlignofExprNode(type_ann: TypeAnnotation*, span: SourceSpan)
-        : ExpressionNode(NodeKind::AlignofExpression, span) {
-        this.type_ann     = type_ann;
-        this.operand_type = TypeRef::invalid();
+    set_operand_type(mut &this, ty: TypeRef) -> void { this.operand_type = ty; }
+
+    static walk_children<V>(n: AlignofExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_annotation(n.type_ann);
     }
+}
 
-    set_operand_type(ty: TypeRef) -> void { this.operand_type = ty; }
-
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+implement trait Allocate for struct AlignofExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
 
-type class CastExprNode : ExpressionNode {
-public:
+/// `expression as target_annotation`.
+type struct CastExpr {
     expression:        ExpressionNode*;
     target_annotation: TypeAnnotation*;
     resolved_target:   TypeRef;
 
-    CastExprNode(expression: ExpressionNode*, target_annotation: TypeAnnotation*,
-                 span: SourceSpan)
-        : ExpressionNode(NodeKind::CastExpression, span) {
-        this.expression        = expression;
-        this.target_annotation = target_annotation;
-        this.resolved_target   = TypeRef::invalid();
+    static walk_children<V>(n: CastExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.expression);
+        v.walk_annotation(n.target_annotation);
     }
 
-    has_resolved_target() -> boolean { return this.resolved_target.is_valid(); }
+    has_resolved_target(&this) -> boolean { return this.resolved_target.is_valid(); }
 
-    set_resolved_target(t: TypeRef) -> void {
+    set_resolved_target(mut &this, t: TypeRef) -> void {
         this.resolved_target = t;
     }
+}
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+implement trait Allocate for struct CastExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
@@ -819,8 +1358,8 @@ type struct FieldInit {
     pin_carried: boolean;
 }
 
-type class StructLiteralNode : ExpressionNode {
-public:
+/// `Name { field: value, ... }`, or `Name::<Args> { ... }`.
+type struct StructExpr {
     struct_type:  SymbolStr;
     generic_args: [TypeAnnotation*];
     field_inits:  [FieldInit];
@@ -830,23 +1369,20 @@ public:
     /// no trailing segment and `TypeRelative` never appears here.
     res:          ResSlot;
 
-    StructLiteralNode(struct_type: SymbolStr, span: SourceSpan)
-        : ExpressionNode(NodeKind::StructLiteral, span) {
-        this.struct_type  = struct_type;
-        this.generic_args = [];
-        this.field_inits  = [];
-        this.res          = ResSlot::Pending;
+    static walk_children<V>(n: StructExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_annotations(&n.generic_args);
+        for (mut i: i64 = 0; i < n.field_inits.length; i++) { v.walk_expr(n.field_inits[i].value); }
     }
 
     /// Record what the literal's type name refers to.  First answer wins.
-    set_res(r: Res) -> void {
+    set_res(mut &this, r: Res) -> void {
         this.res.answer(r);
     }
 
     /// Record what a SYNTHESIZED literal's type name refers to.
     ///
     /// A pass that builds a path-bearing node owes it a `Res`, for the reason
-    /// `ScopeResolutionNode::set_synthesized_ref` gives: name resolution has
+    /// `ScopeResolutionExpr::set_synthesized_ref` gives: name resolution has
     /// already run by the time the node exists, so the synthesizer is the only
     /// place the referent is known without a lookup, and a consumer left to
     /// guess for synthesized nodes keeps the guess alive for written ones too.
@@ -855,77 +1391,80 @@ public:
     /// the spelling it happened to write.  An empty one leaves the slot
     /// unanswered rather than inventing a base, so the stage that needed the
     /// answer reports it instead of this absorbing it.
-    set_synthesized_res(def: DefId) -> void {
+    set_synthesized_res(mut &this, def: DefId) -> void {
         if (!def.is_valid()) { return; }
         this.set_res(Res::Def(def));
     }
 
-    set_generic_args(args: [TypeAnnotation*]) -> void {
+    set_generic_args(mut &this, args: [TypeAnnotation*]) -> void {
         this.generic_args = args;
     }
 
-    add_field_init(init: FieldInit) -> void {
+    add_field_init(mut &this, init: FieldInit) -> void {
         this.field_inits.push(init);
     }
+}
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+implement trait Allocate for struct StructExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
 
-type class ArrayLiteralNode : ExpressionNode {
-public:
+/// `[a, b, ...]`, or `[value; count]` with one element and its count.
+type struct ArrayExpr {
     elements:          [ExpressionNode*];
     repeat_count:      i64;
     repeat_count_expr: ExpressionNode*;
 
-    ArrayLiteralNode(span: SourceSpan)
-        : ExpressionNode(NodeKind::ArrayLiteral, span) {
-        this.elements          = [];
-        this.repeat_count      = 0;
-        this.repeat_count_expr = null;
+    static walk_children<V>(n: ArrayExpr*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.elements.length; i++) { v.walk_expr(n.elements[i]); }
+        v.walk_expr(n.repeat_count_expr);
     }
 
-    add_element(elem: ExpressionNode*) -> void {
+    add_element(mut &this, elem: ExpressionNode*) -> void {
         this.elements.push(elem);
     }
 
-    set_repeat_count_expr(expr: ExpressionNode*) -> void {
+    set_repeat_count_expr(mut &this, expr: ExpressionNode*) -> void {
         this.repeat_count_expr = expr;
     }
+}
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+implement trait Allocate for struct ArrayExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
 
-type class TupleLiteralNode : ExpressionNode {
-public:
+/// `(a, b, ...)`.
+type struct TupleExpr {
     elements: [ExpressionNode*];
 
-    TupleLiteralNode(span: SourceSpan)
-        : ExpressionNode(NodeKind::TupleLiteral, span) {
-        this.elements = [];
+    static walk_children<V>(n: TupleExpr*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.elements.length; i++) { v.walk_expr(n.elements[i]); }
     }
 
-    add_element(elem: ExpressionNode*) -> void {
+    add_element(mut &this, elem: ExpressionNode*) -> void {
         this.elements.push(elem);
     }
+}
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+implement trait Allocate for struct TupleExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
 
-type class LambdaExprNode : ExpressionNode {
-public:
-    parameters:      [VarDeclNode*];
+/// `(parameters) -> return_type_ann { body }`, `move` or not.
+type struct LambdaExpr {
+    parameters:      [DeclarationNode*];
     return_type:     TypeRef;
     return_type_ann: TypeAnnotation*;
-    body:            StatementNode*;
+    body:            Stmt*;
     // Free variables referenced by the body that resolve to outer-function
     // locals - parallel arrays populated by sema::resolve_lambda when the
     // body references an enclosing-scope binding.  Empty for non-capturing
@@ -946,39 +1485,34 @@ public:
     // Drop method that drops each non-Copy field.
     is_move:         boolean;
 
-    LambdaExprNode(span: SourceSpan)
-        : ExpressionNode(NodeKind::LambdaExpression, span) {
-        this.parameters      = [];
-        this.return_type     = TypeRef::invalid();
-        this.return_type_ann = null;
-        this.body            = null;
-        this.captured_names  = [];
-        this.captured_syms   = [];
-        this.captured_types  = [];
-        this.captured_spans  = [];
-        this.is_move         = false;
+    static walk_children<V>(n: LambdaExpr*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.parameters.length; i++) {
+            v.walk_decl(n.parameters[i] as DeclarationNode*);
+        }
+        v.walk_annotation(n.return_type_ann);
+        v.walk_stmt(n.body);
     }
 
-    add_parameter(param: VarDeclNode*) -> void {
+    add_parameter(mut &this, param: DeclarationNode*) -> void {
         this.parameters.push(param);
     }
 
-    set_return_type(t: TypeRef) -> void {
+    set_return_type(mut &this, t: TypeRef) -> void {
         this.return_type = t;
     }
 
-    set_return_type_ann(ann: TypeAnnotation*) -> void {
+    set_return_type_ann(mut &this, ann: TypeAnnotation*) -> void {
         this.return_type_ann = ann;
     }
 
-    set_body(b: StatementNode*) -> void {
+    set_body(mut &this, b: Stmt*) -> void {
         this.body = b;
     }
 
     /// Record a free-variable use of an outer-scope binding.  Idempotent:
     /// a binding already in `captured_syms` is not re-added (the body may
     /// reference the same outer local multiple times).
-    add_capture(name: SymbolStr, sym: SymbolID, ty: TypeRef, span: SourceSpan) -> void {
+    add_capture(mut &this, name: SymbolStr, sym: SymbolID, ty: TypeRef, span: SourceSpan) -> void {
         for (mut i: i64 = 0; i < this.captured_syms.length; i++) {
             if (this.captured_syms[i].equals(sym)) { return; }
         }
@@ -988,18 +1522,20 @@ public:
         this.captured_spans.push(span);
     }
 
-    is_capturing() -> boolean {
+    is_capturing(&this) -> boolean {
         return this.captured_names.length > 0;
     }
+}
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+implement trait Allocate for struct LambdaExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
 
-type class ArrayAccessNode : ExpressionNode {
-public:
+/// `array[index]`.
+type struct ArrayAccessExpr {
     array: ExpressionNode*;
     index: ExpressionNode*;
     /// Index-operator-overloading desugar target, or null for the ordinary
@@ -1007,7 +1543,7 @@ public:
     /// is a user type (or a generic param bounded by `Index`) that has no
     /// primitive indexing rule, sema rewrites `a[i]` into `*(a.index(i))` - a
     /// deref of the `Output*` the trait method returns - and hangs the resolved
-    /// expression here.  Same discipline as `BinaryExprNode.desugared_call`:
+    /// expression here.  Same discipline as `BinaryExpr.desugared_call`:
     /// type-directed, built after `check_index_access` rejects a user/bounded
     /// base.  Because `*ptr` is itself a place, the one desugar serves reads,
     /// writes, and compound assignment: codegen delegates to it and lets the
@@ -1016,25 +1552,24 @@ public:
 
     /// `--panic=unwind` cleanup schedule for the synthesized array bounds check
     /// (fat-array / fixed-array indexing), so an out-of-bounds index runs the
-    /// frame's local destructors on unwind.  See `CallExprNode.unwind_cleanup`.
-    unwind_cleanup: [ASTNode*];
+    /// frame's local destructors on unwind.  See `CallExpr.unwind_cleanup`.
+    unwind_cleanup: [Stmt*];
 
-    ArrayAccessNode(array: ExpressionNode*, index: ExpressionNode*, span: SourceSpan)
-        : ExpressionNode(NodeKind::ArrayAccess, span) {
-        this.array = array;
-        this.index = index;
-        this.desugared_call = null;
-        this.unwind_cleanup = [];
+    static walk_children<V>(n: ArrayAccessExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.array);
+        v.walk_expr(n.index);
     }
+}
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+implement trait Allocate for struct ArrayAccessExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
 
-type class MemberAccessNode : ExpressionNode {
-public:
+/// `object.member`, a field read or a method call's callee.
+type struct MemberAccessExpr {
     object:       ExpressionNode*;
     member:       SymbolStr;
     member_span:  SourceSpan;
@@ -1061,7 +1596,7 @@ public:
     /// Which of `resolved_trait`'s declared methods the call names, by its
     /// position in the trait's declaration; -1 when the stamp names none.
     /// With the trait and a concrete receiver it selects an implementation
-    /// and that implementation's method (`ImplBlockNode::trait_item_method`)
+    /// and that implementation's method (`ImplBlock::trait_item_method`)
     /// without the member's name.
     resolved_trait_slot: i64;
 
@@ -1078,51 +1613,46 @@ public:
     /// carriage rule.
     pin_carried: boolean;
 
-    MemberAccessNode(object: ExpressionNode*, member: SymbolStr,
-                     member_span: SourceSpan, span: SourceSpan)
-        : ExpressionNode(NodeKind::MemberAccess, span) {
-        this.object          = object;
-        this.member          = member;
-        this.member_span     = member_span;
-        this.generic_args    = [];
-        this.resolved_trait  = DefId::invalid();
-        this.resolved_trait_slot = -1;
-        this.resolved_member = MemberPin::None;
-        this.pin_carried     = false;
+    static walk_children<V>(n: MemberAccessExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.object);
+        v.walk_annotations(&n.generic_args);
     }
 
-    set_generic_args(args: [TypeAnnotation*]) -> void {
+    set_generic_args(mut &this, args: [TypeAnnotation*]) -> void {
         this.generic_args = args;
     }
 
-    set_resolved_trait(t: DefId) -> void {
+    set_resolved_trait(mut &this, t: DefId) -> void {
         this.resolved_trait = t;
     }
 
     /// The trait and the position of its declared method the call names.
-    set_resolved_trait_item(t: DefId, slot: i64) -> void {
+    set_resolved_trait_item(mut &this, t: DefId, slot: i64) -> void {
         this.resolved_trait      = t;
         this.resolved_trait_slot = slot;
     }
 
-    set_resolved_member(pin: MemberPin) -> void {
+    set_resolved_member(mut &this, pin: MemberPin) -> void {
         this.resolved_member = pin;
         this.pin_carried     = false;
     }
 
     /// Keep the pin a clone inherited and mark it carried.
-    carry_resolved_member() -> void {
+    carry_resolved_member(mut &this) -> void {
         this.pin_carried = this.resolved_member.is_some();
     }
+}
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+implement trait Allocate for struct MemberAccessExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
 
-type class ScopeResolutionNode : ExpressionNode {
-public:
+/// A path `scope::member`, with the scope's and the member's own type
+/// arguments.
+type struct ScopeResolutionExpr {
     scope_name:         SymbolStr;
     member_name:        SymbolStr;
     generic_args:       [TypeAnnotation*];
@@ -1150,7 +1680,7 @@ public:
     /// The function this path names when it is used as a VALUE (`Type::static`
     /// or `Module::fn` as a function pointer), pinned by sema - the mangled
     /// symbol of a static method, the canonical name of a free function -
-    /// exactly as a `CallExprNode`'s pin is.  `None` when the path names no
+    /// exactly as a `CallExpr`'s pin is.  `None` when the path names no
     /// function; a variant or a global is then `resolved_member`'s.
     resolved_callee:    CalleePin;
 
@@ -1207,17 +1737,22 @@ public:
 
     /// The trait a BOUND directs this path through, `T::make()` under
     /// `where T: Beta`: the bound's identity, stamped before
-    /// monomorphization erases the parameter, as `MemberAccessNode`'s
+    /// monomorphization erases the parameter, as `MemberAccessExpr`'s
     /// `resolved_trait` is for `t.go()`.  A direction, not a refusal: the
     /// concrete type's implementation of THAT trait delivers the member
     /// when it has one.  Empty on a path no bound directs.
     resolved_trait:     DefId;
 
     /// The trait's declared method a bound-directed path names when it is
-    /// used as a VALUE (`const f = T::make;`), as `CallExprNode`'s
+    /// used as a VALUE (`const f = T::make;`), as `CallExpr`'s
     /// `template_method` is for the call `T::make()`: every copy of the body
     /// binds it on the type the parameter becomes.  Invalid on any other path.
     template_method:    DefId;
+
+    /// Whether the type check of the generic body refused this path, a
+    /// type parameter's member none of its bounds declares (`T::missing()`).
+    /// It was reported there; a copy of the body binds nothing for it.
+    refused:            boolean;
 
     /// The declaration the MEMBER segment names when the scope segment names
     /// a module, stamped by the name layer from the binding the module
@@ -1227,57 +1762,41 @@ public:
     /// and when the module offers nothing under the leaf.
     member_def:         DefId;
 
-    ScopeResolutionNode(scope_name: SymbolStr, member_name: SymbolStr, span: SourceSpan)
-        : ExpressionNode(NodeKind::ScopeResolution, span) {
-        this.scope_name         = scope_name;
-        this.member_name        = member_name;
-        this.generic_args       = [];
-        this.scope_generic_args = [];
-        this.scope_span         = span;
-        this.member_span        = span;
-        this.scope_res          = ResSlot::Pending;
-        this.resolved_callee    = CalleePin::None;
-        this.resolved_member    = MemberPin::None;
-        this.pin_carried        = false;
-        this.scope_is_this_type = false;
-        this.value_type_args    = [];
-        this.value_template     = TypeRef::invalid();
-        this.spec_owner         = TypeRef::invalid();
-        this.impl_trait         = null;
-        this.resolved_trait     = DefId::invalid();
-        this.template_method    = DefId::invalid();
-        this.member_def         = DefId::invalid();
-    }
-
-    set_impl_trait(ann: TypeAnnotation*) -> void {
+    set_impl_trait(mut &this, ann: TypeAnnotation*) -> void {
         this.impl_trait = ann;
     }
 
-    set_resolved_trait(t: DefId) -> void {
+    static walk_children<V>(n: ScopeResolutionExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_annotations(&n.generic_args);
+        v.walk_annotations(&n.scope_generic_args);
+        v.walk_annotation(n.impl_trait);
+    }
+
+    set_resolved_trait(mut &this, t: DefId) -> void {
         this.resolved_trait = t;
     }
 
     /// Record the declaration the member segment names.  The first answer
     /// wins, as the scope segment's does.
-    set_member_def(d: DefId) -> void {
+    set_member_def(mut &this, d: DefId) -> void {
         if (!this.member_def.is_valid()) { this.member_def = d; }
     }
 
-    set_resolved_callee(pin: CalleePin) -> void {
+    set_resolved_callee(mut &this, pin: CalleePin) -> void {
         this.resolved_callee = pin;
     }
 
-    set_resolved_member(pin: MemberPin) -> void {
+    set_resolved_member(mut &this, pin: MemberPin) -> void {
         this.resolved_member = pin;
         this.pin_carried     = false;
     }
 
     /// Keep the pin a clone inherited and mark it carried.
-    carry_resolved_member() -> void {
+    carry_resolved_member(mut &this) -> void {
         this.pin_carried = this.resolved_member.is_some();
     }
 
-    set_segment_spans(scope_span: SourceSpan, member_span: SourceSpan) -> void {
+    set_segment_spans(mut &this, scope_span: SourceSpan, member_span: SourceSpan) -> void {
         this.scope_span  = scope_span;
         this.member_span = member_span;
     }
@@ -1285,14 +1804,14 @@ public:
     /// Record what the scope segment refers to.  The first answer wins: a
     /// `Res` states what the file that WROTE the path can see, so a later walk
     /// standing in a different module must not be able to replace it.
-    set_scope_res(r: Res) -> void {
+    set_scope_res(mut &this, r: Res) -> void {
         this.scope_res.answer(r);
     }
 
     /// Claim the scope segment for the type alias `alias`, to be answered
     /// with the alias's target (`ResSlot::Alias`).  False when the segment
     /// was already answered.
-    defer_to_alias(alias: DefId) -> boolean {
+    defer_to_alias(mut &this, alias: DefId) -> boolean {
         match (this.scope_res) {
             ResSlot::Pending => { this.scope_res = ResSlot::Alias(alias); return true; }
             _                => { return false; }
@@ -1300,7 +1819,8 @@ public:
     }
 
     /// Record BOTH answers a synthesized `Type::member` reference has: the type
-    /// it names, and the name-layer `Res` derived from that type.
+    /// it names, written on `e`, the path's header, and the name-layer `Res`
+    /// derived from that type.
     ///
     /// A pass that builds a path-bearing node owes it a `Res`, because the
     /// synthesizer is the only place the referent is known without a lookup.
@@ -1309,26 +1829,25 @@ public:
     /// exists to end - and a consumer that has to guess for synthesized nodes
     /// keeps the guess alive for written ones too.
     ///
-    /// `def_name` is the DEFINITION's canonical name, which the caller derives
-    /// from `ty` (`CompilationContext::definition_id_of`); it is not read off
-    /// the spelling the node was built with, since a synthesizer holds a bare
-    /// one. The trailing count is 1: the base is what `ty` names and the member
-    /// segment is the type layer's to finish.
+    /// `def` is the DEFINITION, which the caller derives from `ty`; it is not
+    /// read off the spelling the node was built with, since a synthesizer
+    /// holds a bare one. The trailing count is 1: the base is what `ty` names
+    /// and the member segment is the type layer's to finish.
     ///
-    /// An empty `def_name` leaves the slot unanswered rather than inventing a
+    /// An invalid `def` leaves the slot unanswered rather than inventing a
     /// base. A synthesized reference to a type that names no declaration is a
     /// defect in the synthesizer, and an unanswered slot is what reports it -
     /// against the stage that needed the answer, with a site - instead of being
     /// absorbed here.
-    set_synthesized_ref(ty: TypeRef, def: DefId) -> void {
-        this.set_resolved_type(ty);
+    set_synthesized_ref(mut &this, e: ExpressionNode*, ty: TypeRef, def: DefId) -> void {
+        e.set_resolved_type(ty);
         this.set_synthesized_res(def);
     }
 
     /// The `Res` half alone, for a synthesizer that knows WHAT it is referring
     /// to before it knows the type - a lowering that names a stdlib type and
     /// lets the following resolution walk supply the instantiation.
-    set_synthesized_res(def: DefId) -> void {
+    set_synthesized_res(mut &this, def: DefId) -> void {
         if (def.is_valid()) {
             this.set_scope_res(Res::TypeRelative(ResBase::Def(def), 1));
         }
@@ -1345,86 +1864,146 @@ public:
         return this.scope_res.require(site);
     }
 
-    set_generic_args(args: [TypeAnnotation*]) -> void {
+    set_generic_args(mut &this, args: [TypeAnnotation*]) -> void {
         this.generic_args = args;
     }
 
-    set_scope_generic_args(args: [TypeAnnotation*]) -> void {
+    set_scope_generic_args(mut &this, args: [TypeAnnotation*]) -> void {
         this.scope_generic_args = args;
     }
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+    /// Answer a `This::member` path's scope segment with the self type
+    /// `owner`, its arguments the parameters `params` it is written with
+    /// (`Pair::<T>::member` in `implement struct Pair<T>`), each stamped
+    /// with the parameter it is: the owner's name is never written into the
+    /// path to be looked up a second time.
+    name_self_type(mut &this, owner: ResBase, params: &[DeclarationNode*], span: SourceSpan) -> void {
+        mut args: [TypeAnnotation*] = [];
+        for (mut i: i64 = 0; i < params.length; i++) {
+            const p: GenericParamDecl* = DeclarationNode::generic_param_of(params[i]);
+            args.push(TypeAnnotation::answered(p.name, Res::GenericParam(p.sym_id), span));
+        }
+        this.set_scope_generic_args(args);
+        this.set_scope_res(Res::TypeRelative(owner, 1));
+    }
+
+    /// In an implementation's copy of a trait's default body, answer a
+    /// `This::member` the trait's own body stamped as "the implementor"
+    /// with the implementing type, as `name_self_type` does.  The one
+    /// answer a copy replaces: the trait's stamp says only that the type
+    /// is not known where the default is written.  False, and nothing
+    /// changed, for any other path.
+    name_implementor(mut &this, owner: ResBase, params: &[DeclarationNode*], span: SourceSpan) -> boolean {
+        match (this.scope_res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::TypeRelative(b, _) => {
+                        match (b) {
+                            ResBase::TraitThis(_) => { }
+                            _                     => { return false; }
+                        }
+                    }
+                    _ => { return false; }
+                }
+            }
+            _ => { return false; }
+        }
+        this.scope_res = ResSlot::Pending;
+        this.name_self_type(owner, params, span);
+        return true;
+    }
+}
+
+implement trait Allocate for struct ScopeResolutionExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
 
 // Typeof Expression: typeof(expr)
 
-type class TypeofExprNode : ExpressionNode {
-public:
+type struct TypeofExpr {
     operand: ExpressionNode*;
 
-    TypeofExprNode(operand: ExpressionNode*, span: SourceSpan)
-        : ExpressionNode(NodeKind::TypeofExpression, span) {
-        this.operand = operand;
+    static walk_children<V>(n: TypeofExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.operand);
     }
+}
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+implement trait Allocate for struct TypeofExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
 
-// Delete Expression: delete expr
-
-type class DeleteExprNode : ExpressionNode {
-public:
+/// `delete operand`.
+type struct DeleteExpr {
     operand: ExpressionNode*;
 
-    DeleteExprNode(operand: ExpressionNode*, span: SourceSpan)
-        : ExpressionNode(NodeKind::DeleteExpression, span) {
-        this.operand = operand;
+    static walk_children<V>(n: DeleteExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.operand);
     }
+}
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+implement trait Allocate for struct DeleteExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
+}
+
+
+/// A value converted to a trait object: the pair of the value's address
+/// and the table of `implementation`.  `source` is the type of the value
+/// the address reaches.
+type struct ObjectConversionExpr {
+    operand:        ExpressionNode*;
+    source:         TypeRef;
+    implementation: ImplBlock*;
+
+    static walk_children<V>(n: ObjectConversionExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.operand);
+    }
+}
+
+implement trait Allocate for struct ObjectConversionExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
 
 // Await Expression: await expr
 
-type class AwaitExprNode : ExpressionNode {
-public:
+/// `await operand`.
+type struct AwaitExpr {
     operand: ExpressionNode*;
 
-    AwaitExprNode(operand: ExpressionNode*, span: SourceSpan)
-        : ExpressionNode(NodeKind::AwaitExpression, span) {
-        this.operand = operand;
+    static walk_children<V>(n: AwaitExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.operand);
     }
+}
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+implement trait Allocate for struct AwaitExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
 
-// Yield Expression: yield expr (or bare yield)
-
-type class YieldExprNode : ExpressionNode {
-public:
+/// `yield operand`, or a bare `yield` with a null operand.
+type struct YieldExpr {
     operand: ExpressionNode*;
 
-    YieldExprNode(operand: ExpressionNode*, span: SourceSpan)
-        : ExpressionNode(NodeKind::YieldExpression, span) {
-        this.operand = operand;
+    static walk_children<V>(n: YieldExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.operand);
     }
+}
 
-    has_operand() -> boolean { return this.operand != null; }
-
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+implement trait Allocate for struct YieldExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }
 
@@ -1441,19 +2020,36 @@ public:
 // `match` expression (with a `return` in the failure arm) and stores it
 // in `desugared`.  Every post-sema consumer (codegen, drop insertion,
 // move check) forwards through `desugared`, so they only ever deal with
-// an ordinary `MatchExprNode`.  `desugared` is null until sema runs.
-type class TryExprNode : ExpressionNode {
-public:
+// an ordinary `match` expression.  `desugared` is null until sema runs.
+type struct TryExpr {
     operand:   ExpressionNode*;
     desugared: ExpressionNode*;
 
-    TryExprNode(operand: ExpressionNode*, span: SourceSpan)
-        : ExpressionNode(NodeKind::TryExpression, span) {
-        this.operand   = operand;
-        this.desugared = null;
+    static walk_children<V>(n: TryExpr*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.operand);
     }
 
-    set_desugared(d: ExpressionNode*) -> void { this.desugared = d; }
+    set_desugared(mut &this, d: ExpressionNode*) -> void { this.desugared = d; }
+
+    /// The expression a `?` actually evaluates to.
+    ///
+    /// Sema replaces `expr?` with an equivalent `match` and stores it on
+    /// `desugared`; every pass downstream reads that and never the operand
+    /// (codegen emits it, move-check and drop insertion walk it), so the
+    /// async lowering must too. Walking BOTH would visit the operand twice,
+    /// because the desugared `match` takes the very same operand node as its
+    /// subject.
+    ///
+    /// The desugar carries a `return` in its `Err`/`None` arm and may hold an
+    /// `await` in its subject, so a walk that stopped at the `?` node would
+    /// leave that `return` unwrapped and that `await` uncounted.
+    ///
+    /// A null `desugared` means sema rejected the operand and has already
+    /// reported it; the operand is walked so the traversal stays total.
+    live(&this) -> ExpressionNode* {
+        if (this.desugared != null) { return this.desugared; }
+        return this.operand;
+    }
 
     /// Re-point `operand` at the desugared `match`'s subject.
     ///
@@ -1468,13 +2064,15 @@ public:
     /// Every in-place rewrite of the desugar must call this.  The async
     /// lowering has two: hoisting an `await` out of the subject, and promoting
     /// a carried local there to a frame field.
-    resync_operand() -> void {
-        if (this.desugared == null) { return; }
-        if ((this.desugared as ASTNode*).kind != NodeKind::MatchExpression) { return; }
-        this.operand = (this.desugared as MatchExprNode*).subject;
+    resync_operand(mut &this) -> void {
+        const m: MatchExpr* = ExpressionNode::match_of(this.desugared);
+        if (m == null) { return; }
+        this.operand = m.subject;
     }
+}
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+implement trait Allocate for struct TryExpr {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }

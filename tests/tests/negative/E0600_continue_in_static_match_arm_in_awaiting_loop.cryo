@@ -1,0 +1,39 @@
+// E0600: a `continue` inside a `static match` arm, in a loop that awaits, is
+// rejected.
+//
+// A loop holding a suspend is split into states, and a `continue` in it
+// becomes a state transition at the point it is written.  A `static match`
+// arm is chosen by monomorphization, after the body has been lowered, so its
+// arms cannot be split into states either, and the `continue` cannot become
+// that transition.  Left as written it would re-enter the loop that
+// dispatches the states instead of the program's loop.
+//
+// The rewrite is to decide inside the arm and branch outside it:
+//   mut skip = false;
+//   static match (T) { i64 => { skip = true; } _ => { } }
+//   if (skip) { continue; }
+![config(testing)]
+![config(negative, E0600)]
+namespace CryoTests::Negative::E0600ContinueInStaticMatchArmInAwaitingLoop;
+
+import std::future;
+import std::future::{ PendingThenReady };
+
+async function skips<T>(n: i64) -> i64 {
+    mut i: i64 = 0;
+    mut sum: i64 = 0;
+    while (i < n) {
+        i = i + 1;
+        sum += await PendingThenReady::<i64>::new(1, i);
+        static match (T) {                       //~ ERROR[E0600] async: a `break`/`continue` inside a `static match` arm is not supported
+            i64 => { continue; }
+            _   => { }
+        }
+        sum += 100;
+    }
+    return sum;
+}
+
+function main() -> i32 {
+    return future::block_on(skips::<i64>(3)) as i32;
+}

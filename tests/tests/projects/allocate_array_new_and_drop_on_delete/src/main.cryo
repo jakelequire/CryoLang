@@ -1,0 +1,84 @@
+namespace allocate_array_new_and_drop_on_delete;
+import std::ffi::libc;
+
+// `new T[n]` of a struct that implements `Allocate` asks that `allocate`
+// for room for all `n` elements, at the element's alignment.  `delete p`
+// runs the pointee's `Drop` first and hands the block to `release` after
+// it.  A struct with no implementation is served by the global allocator
+// and never reaches another type's `allocate`.
+
+mut g_allocations: i32 = 0;
+mut g_last_size: u64 = 0;
+mut g_last_block: void* = null;
+mut g_releases: i32 = 0;
+mut g_drops: i32 = 0;
+mut g_releases_seen_by_drop: i32 = -1;
+
+type struct Cell {
+    a: i64;
+    b: i32;
+}
+
+implement trait Allocate for struct Cell {
+    static allocate(size: u64, align: u64) -> void* {
+        g_allocations = g_allocations + 1;
+        g_last_size = size;
+        g_last_block = libc::malloc(size) as void*;
+        return g_last_block;
+    }
+    static release(ptr: void*, align: u64) -> void {
+        g_releases = g_releases + 1;
+        libc::free(ptr as u8*);
+    }
+}
+
+type struct Guarded {
+    value: i32;
+}
+
+implement trait Allocate for struct Guarded {
+    static allocate(size: u64, align: u64) -> void* {
+        g_allocations = g_allocations + 1;
+        return libc::malloc(size) as void*;
+    }
+    static release(ptr: void*, align: u64) -> void {
+        g_releases = g_releases + 1;
+        libc::free(ptr as u8*);
+    }
+}
+
+implement trait Drop for struct Guarded {
+    drop(mut &this) -> void {
+        g_drops = g_drops + 1;
+        g_releases_seen_by_drop = g_releases;
+    }
+}
+
+type struct Plain {
+    n: i32;
+}
+
+function main() -> i32 {
+    const cells: Cell* = new Cell[3];
+    if (g_allocations != 1) { return 1; }
+    if (g_last_size != 3 * sizeof(Cell)) { return 2; }
+    if ((cells as void*) != g_last_block) { return 3; }
+    cells[2].b = 7;
+    if (cells[2].b != 7) { return 4; }
+
+    const plain: Plain* = new Plain { n: 5 };
+    if (g_allocations != 1) { return 5; }
+    if (plain.n != 5) { return 6; }
+
+    const g: Guarded* = new Guarded { value: 9 };
+    if (g_allocations != 2) { return 7; }
+    delete g;
+    if (g_drops != 1) { return 8; }
+    if (g_releases_seen_by_drop != 0) { return 9; }
+    if (g_releases != 1) { return 10; }
+
+    delete plain;
+    if (g_releases != 1) { return 11; }
+    libc::free(cells as u8*);
+    return 0;
+}

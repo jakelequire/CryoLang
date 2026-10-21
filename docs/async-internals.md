@@ -1,8 +1,8 @@
 # Async internals
 
 How `async`/`await` is implemented, and the decisions the implementation rests on. For the
-*language surface* - what you write and what it means - see [section 19 of the language
-reference](./cryo.md#19-asynchronous-programming). This document is for people changing the
+*language surface* - what you write and what it means - see [section 18 of the language
+reference](./cryo.md#18-asynchronous-programming). This document is for people changing the
 lowering, the runtime, or anything they touch.
 
 Every claim here describes the compiler as it stands. Where a decision could reasonably have gone
@@ -98,7 +98,7 @@ beyond a correct `Drop`.
 | `E0455` | A reference or frame address live across a suspension; an async method awaited on a receiver that names no storage; a method future stored and awaited later. |
 | `E0459` | Moving a future after it has been polled.                                                                                                                     |
 | `E0453` | Moving a carried value out from behind its in-place pointer (the give-away rules).                                                                            |
-| `E0364` | `async` combined with `virtual`/`override`; async constructors, destructors, fields.                                                                          |
+| `E0364` | An `async` field.                                                                                                                                             |
 | `E0365` | A generic `async function main`, or a return type that is neither `i32` nor `void`.                                                                           |
 | `E0600` | A future that would contain itself; unsupported async control flow.                                                                                           |
 

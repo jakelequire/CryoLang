@@ -17,7 +17,7 @@ import compiler::decl_index::{ DeclarationIndex };
 import compiler::diag;
 import compiler::diag::{ diagnostic, source_span, sink };
 import compiler::types;
-import compiler::types::{ arena, compound, generic, type_base, type_ref, TypeKind };
+import compiler::types::{ arena, compound, generic, IntegerKind, type_base, type_ref, TypeKind };
 import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name };
 import std::collections::pair;
 import compiler::codegen::abi::{ AbiClassifier };
@@ -37,11 +37,11 @@ import compiler::codegen::type_map::{ TypeMapper };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::ast::expression;
-import compiler::ast::expression::{ CallExprNode };
+import compiler::ast::expression::{ ExpressionNode };
 import compiler::sema::sema;
 import compiler::sema::sema::{ SemaVisitor };
 import compiler::types::arena::{ TypeArena };
-import compiler::types::type_base::{ IntType, Type };
+import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 
 
@@ -93,7 +93,7 @@ type struct CodegenContext {
     expr_ops: ExprOps;
 
     // -- Phase-1 (forward-declare types) and Phase-2 (declare functions,
-    //    methods, externs, globals, vtables) of the codegen pipeline,
+    //    methods, externs, globals) of the codegen pipeline,
     //    plus function/method prologue/epilogue lowering. --
     decl: DeclarationEmitter;
 
@@ -151,20 +151,11 @@ type struct CodegenContext {
 
     /// Bind a destructor call this module's codegen synthesized (see
     /// `synth_binder`) to the receiver type's destructor, by identity.
-    bind_destructor_call(mut &this, call: CallExprNode*) -> void {
+    bind_destructor_call(mut &this, call: ExpressionNode*) -> void {
         if (this.synth_binder == null) {
             this.synth_binder = SemaVisitor::synthesized_binder(this.ctx);
         }
         this.synth_binder.bind_destructor_call(call);
-    }
-
-    /// Bind `delete p`'s synthesized `p.drop()` to the destructor of the
-    /// type `p` points at, by identity.
-    bind_pointee_destructor_call(mut &this, call: CallExprNode*, pointee: TypeRef) -> void {
-        if (this.synth_binder == null) {
-            this.synth_binder = SemaVisitor::synthesized_binder(this.ctx);
-        }
-        this.synth_binder.bind_pointee_destructor_call(call, pointee);
     }
 
     /// Two-phase init step 2: wire up back-pointers on sub-components.
@@ -183,8 +174,7 @@ type struct CodegenContext {
                            &this.functions, &this.globals, this.ctx);
 
         this.intrinsics.wire(&this.llvm_module, &this.builder, &this.abi,
-                             this.ctx.options.freestanding(),
-                             this.ctx.options.unwinds());
+                             this.ctx.options.freestanding());
 
         this.expr_ops.wire(&this.llvm_module, &this.builder, &this.type_mapper,
                            &this.abi,
@@ -203,10 +193,10 @@ type struct CodegenContext {
     /// GEP to a user type's field.  `layout` is the type whose FIELD list the
     /// index belongs to and `mapped` its emitted body; the element index comes
     /// from `TypeMapper::field_element_index`, never from the field index
-    /// directly, because a body carries a vtable slot and alignment padding
-    /// the field list does not.  Use `build_struct_gep` only for an aggregate
-    /// whose element positions ARE its definition - a fat pointer, an enum's
-    /// tag and payload, the vtable slot - never for a declared field.
+    /// directly, because a body carries alignment padding the field list
+    /// does not.  Use `build_struct_gep` only for an aggregate whose element
+    /// positions ARE its definition - a fat pointer, an enum's tag and
+    /// payload - never for a declared field.
     field_gep(mut &this, layout: Type*, mapped: LType, base: LValue,
               field_idx: i64, name: string) -> LValue {
         const elem: i64 = this.type_mapper.field_element_index(layout, field_idx);
@@ -263,8 +253,8 @@ type struct CodegenContext {
     int_type_is_signed(&this, ty: TypeRef) -> boolean {
         const t: Type* = this.arena_type(ty);
         if (t != null && t.kind == TypeKind::Int) {
-            const it: IntType* = t as IntType*;
-            return it.int_kind.is_signed();
+            const it: IntegerKind = t.int_kind();
+            return it.is_signed();
         }
         return false;
     }

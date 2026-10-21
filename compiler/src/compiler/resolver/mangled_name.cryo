@@ -6,7 +6,7 @@
 ///
 /// Quick reference:
 ///   PREFIX         C$
-///   KIND TAGS      $vt$ $ti$ $ct$ $dt$ $op$ $mi$ $cl$ $tr$
+///   KIND TAGS      $ti$ $op$ $mi$ $cl$ $tr$ $vt$
 ///   PATH SEP       .            MEMBER SEP    -
 ///   GENERIC OPEN   $L           GENERIC CLOSE $G
 ///   TYPELIST SEP   _            EMPTY PARAMS  v
@@ -40,15 +40,16 @@ import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::decl_name::{ DeclName };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{
-    ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
+    ArrayType, FunctionType, ObjectType, OptionalType, PointerType, ReferenceType, TupleType
 };
+import compiler::ast::{ ObjectForm };
 import compiler::types::generic::{
     AssocProjectionType, GenericParamType, InstantiatedType
 };
-import compiler::types::type_base::{ FloatType, IntType, Type };
+import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{
-    ClassType, EnumType, FunctionTemplateType, StructType, TraitType, TypeAliasType
+    EnumType, FunctionTemplateType, StructType, TraitType, TypeAliasType
 };
 import std::fmt::interp::{ fmt_append_display, fmt_append_lit, fmt_new };
 
@@ -205,9 +206,32 @@ public:
         return MangledName { raw: buf };
     }
 
+    /// Mangle the table of a trait's methods for a type, a trait object's
+    /// second word: `C$vt$<trait>[$L<args>$G]$f<owner>`, the trait-impl
+    /// method's symbol with no member and no signature, so two traits'
+    /// tables for one type differ.
+    static for_object_table(table: InternTable*, arena: TypeArena*,
+                            trait_qname: QualifiedName, trait_args: &[TypeRef],
+                            owner_qname: QualifiedName) -> MangledName {
+        mut ctx: MangleContext = MangleContext::new(table, arena);
+        mut buf: string = "C$vt$";
+        buf += MangleContext::encode_path(table, trait_qname, SymbolStr::empty(), false);
+        if (trait_args.length > 0) {
+            buf += "$L";
+            for (mut i: i64 = 0; i < trait_args.length; i++) {
+                if (i > 0) { buf += "_"; }
+                buf += ctx.encode_type_ref(trait_args[i], "for_object_table.trait_arg");
+            }
+            buf += "$G";
+        }
+        buf += "$f";
+        buf += MangleContext::encode_path(table, owner_qname, SymbolStr::empty(), false);
+        return MangledName { raw: buf };
+    }
+
     /// Choose between inherent-method and trait-impl mangling based on
     /// whether the method carries an originating trait (see
-    /// `FunctionDeclNode.origin_trait`).  When `origin_trait` is valid the
+    /// `FunctionDecl.origin_trait`).  When `origin_trait` is valid the
     /// symbol is the trait-qualified form (`C$tr$<trait>$f<owner>-<method>`)
     /// so two distinct traits that define a same-named method for the same
     /// type don't collide; otherwise it is the plain `for_method` form.
@@ -234,13 +258,6 @@ public:
 
 
     // Data-symbol factories (no signature)
-
-    /// Vtable for a class: `C$vt$<path>`.
-    static for_vtable(table: InternTable*, owner_qname: QualifiedName) -> MangledName {
-        const path: string = MangleContext::encode_path(table, owner_qname, SymbolStr::empty(), false);
-        return MangledName { raw: "C$vt$" + path };
-    }
-
 
     /// Global variable / constant: `C$<namespace_path>.<name>` (data symbol,
     /// no signature).  When `namespace_sym` is empty the result is the
@@ -547,20 +564,20 @@ type struct MangleContext {
         if (ty.kind == TypeKind::VaList) { return "V"; }
 
         if (ty.kind == TypeKind::Int) {
-            const it: IntType* = ty as IntType*;
-            return MangleContext::int_code(it.int_kind);
+            const it: IntegerKind = ty.int_kind();
+            return MangleContext::int_code(it);
         }
         if (ty.kind == TypeKind::Float) {
-            const ft: FloatType* = ty as FloatType*;
-            return MangleContext::float_code(ft.float_kind);
+            const ft: FloatKind = ty.float_kind();
+            return MangleContext::float_code(ft);
         }
 
         if (ty.kind == TypeKind::Pointer) {
-            const p: PointerType* = ty as PointerType*;
+            const p: PointerType* = ty.as_pointer();
             return "P" + this.encode_type_ref(p.pointee, "Pointer.pointee");
         }
         if (ty.kind == TypeKind::Reference) {
-            const r: ReferenceType* = ty as ReferenceType*;
+            const r: ReferenceType* = ty.as_reference();
             return "R" + this.encode_type_ref(r.referent, "Reference.referent");
         }
         if (ty.kind == TypeKind::Array) {
@@ -581,7 +598,7 @@ type struct MangleContext {
             // on `ArrayAnnotation`, and `TypeResolver::array_size_of` folds it
             // at the one site that builds an arena array - so a pending size
             // cannot reach the mangler and split one type across two keys.
-            const a: ArrayType* = ty as ArrayType*;
+            const a: ArrayType* = ty.as_array();
             const elem_a: string = this.encode_type_ref(a.element, "Array.element");
             const len_a: u64 = a.size as u64;
             mut buf_a: string = "A$L";
@@ -593,16 +610,34 @@ type struct MangleContext {
         if (ty.kind == TypeKind::Optional) {
             // Optional<T>: encode as a synthetic named generic so the form
             // is round-trippable through the demangler.
-            const o: OptionalType* = ty as OptionalType*;
+            const o: OptionalType* = ty.as_optional();
             const inner_o: string = this.encode_type_ref(o.wrapped, "Optional.wrapped");
             mut buf_o: string = "N$L8Optional$L";
             buf_o += inner_o;
             buf_o += "$G$G";
             return buf_o;
         }
+        if (ty.kind == TypeKind::Object) {
+            // A trait object: a synthetic named generic over a reserved name
+            // per form, whose arguments are the trait and then the trait's
+            // bound arguments, as `Optional` is encoded.
+            const obj: ObjectType* = ty.as_object();
+            mut buf_v: string = match (obj.form) {
+                ObjectForm::Borrowed        => { "N$L10VirtualRef$L" }
+                ObjectForm::MutableBorrowed => { "N$L13VirtualMutRef$L" }
+                ObjectForm::Raw             => { "N$L10VirtualPtr$L" }
+            };
+            buf_v += this.encode_type_ref(obj.trait_type, "Object.trait");
+            for (mut i: i64 = 0; i < obj.args.length; i++) {
+                buf_v += "_";
+                buf_v += this.encode_type_ref(obj.args[i], "Object.argument");
+            }
+            buf_v += "$G$G";
+            return buf_v;
+        }
 
         if (ty.kind == TypeKind::Function) {
-            const f: FunctionType* = ty as FunctionType*;
+            const f: FunctionType* = ty.as_function();
             const inner_params: string = this.encode_params(
                 f.param_types, ReceiverKind::None, f.is_variadic);
             const inner_ret: string = this.encode_type_ref(f.return_type, "FunctionType.ret");
@@ -614,13 +649,12 @@ type struct MangleContext {
         }
 
         if (ty.kind == TypeKind::Struct
-         || ty.kind == TypeKind::Class
          || ty.kind == TypeKind::Enum
          || ty.kind == TypeKind::Trait
          || ty.kind == TypeKind::TypeAlias
          || ty.kind == TypeKind::FunctionTemplate) {
             // SINGLE-ID IDENTITY: a monomorphized generic now lives at its former
-            // wrapper's id AS a concrete Struct/Class/Enum carrying the mangled
+            // wrapper's id AS a concrete Struct/Enum carrying the mangled
             // SPEC name, so it lands here - while any path still holding an
             // InstantiatedType node lands on the `encode_instantiated` branch
             // below.  One logical type, two symbols: the definition is emitted
@@ -633,7 +667,6 @@ type struct MangleContext {
             // symbol in the program relative to the pin, breaking selfhost
             // byte-identity and forcing a two-phase repin.
             if (ty.kind == TypeKind::Struct
-             || ty.kind == TypeKind::Class
              || ty.kind == TypeKind::Enum) {
                 const inst_base: TypeRef = this.arena.inst_generic_base(ref);
                 if (inst_base.is_valid()) {
@@ -648,12 +681,12 @@ type struct MangleContext {
         }
 
         if (ty.kind == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = ty as InstantiatedType*;
+            const inst: InstantiatedType* = ty.as_instantiated();
             return this.encode_instantiated(ref, inst);
         }
 
         if (ty.kind == TypeKind::GenericParam) {
-            const gp: GenericParamType* = ty as GenericParamType*;
+            const gp: GenericParamType* = ty.as_generic_param();
             // Should be resolved before mangling; emit the param name so any
             // leaks are easy to spot in IR rather than a silent collision.
             return "N$L" + MangleContext::encode_ident(this.table.resolve(gp.param_name)) + "$G";
@@ -665,7 +698,7 @@ type struct MangleContext {
             // stable, distinct placeholder (`base` + `::` + `member`) rather than
             // ICE. A leak into an emitted symbol stays visible (never collides with
             // a genuine named type), matching the GenericParam policy above.
-            const proj: AssocProjectionType* = ty as AssocProjectionType*;
+            const proj: AssocProjectionType* = ty.as_assoc_projection();
             mut buf_pj: string = "N$L";
             buf_pj += this.encode_type_ref(proj.base, "AssocProjection.base");
             buf_pj += "_";   // `::` escape
@@ -681,7 +714,7 @@ type struct MangleContext {
         // to share a spec name, with the second registration overwriting the
         // first in the type registry.
         if (ty.kind == TypeKind::Tuple) {
-            const tup: TupleType* = ty as TupleType*;
+            const tup: TupleType* = ty.as_tuple();
             mut buf_t: string = "N$L5Tuple$L";
             for (mut i: i64 = 0; i < tup.elements.length; i++) {
                 if (i > 0) { buf_t += "_"; }
@@ -707,27 +740,23 @@ type struct MangleContext {
     /// Table-only -> static.
     static encode_named_type_path(table: InternTable*, ty: Type*) -> string {
         if (ty.kind == TypeKind::Struct) {
-            const s: StructType* = ty as StructType*;
+            const s: StructType* = ty.as_struct();
             return MangleContext::encode_named_qname(table, s.qualified_name.spelling());
         }
-        if (ty.kind == TypeKind::Class) {
-            const c: ClassType* = ty as ClassType*;
-            return MangleContext::encode_named_qname(table, c.qualified_name.spelling());
-        }
         if (ty.kind == TypeKind::Enum) {
-            const e: EnumType* = ty as EnumType*;
+            const e: EnumType* = ty.as_enum();
             return MangleContext::encode_named_qname(table, e.qualified_name.spelling());
         }
         if (ty.kind == TypeKind::Trait) {
-            const tr: TraitType* = ty as TraitType*;
+            const tr: TraitType* = ty.as_trait();
             return MangleContext::encode_named_qname(table, tr.qualified_name.spelling());
         }
         if (ty.kind == TypeKind::TypeAlias) {
-            const ta: TypeAliasType* = ty as TypeAliasType*;
+            const ta: TypeAliasType* = ty.as_alias();
             return MangleContext::encode_named_qname(table, ta.alias_name);
         }
         if (ty.kind == TypeKind::FunctionTemplate) {
-            const ft: FunctionTemplateType* = ty as FunctionTemplateType*;
+            const ft: FunctionTemplateType* = ty.as_function_template();
             return MangleContext::encode_named_qname(table, ft.qualified_name.spelling());
         }
         return MangleContext::encode_ident("?");
@@ -833,7 +862,7 @@ type struct MangleContext {
             fmt::eprintln(f"warning: mangler internal error in LSP mode: {msg}");
             return MANGLER_POISON;
         }
-        intrinsics::panic(msg, FILE, LINE);
+        intrinsics::panic(msg, intrinsics::location());
         return MANGLER_POISON;
     }
 }

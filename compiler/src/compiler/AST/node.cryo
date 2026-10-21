@@ -1,77 +1,137 @@
-/// AST Node Base
+/// AST nodes by category
 ///
-/// Abstract base class for all AST nodes and the ProgramNode root.
+/// `Node`, the handle that holds a node of any category, and the
+/// `ProgramNode` root.
 
 namespace compiler::ast::node;
 
 import compiler::ast;
-import compiler::ast::{ NodeKind };
+import compiler::ast::walk::{ Walk };
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::diag;
-import compiler::ast::visitor;
-import compiler::ast::visitor::{ ASTVisitor };
 import compiler::codegen::ast_arena::{ cryo_ast_arena_alloc };
+import compiler::ast::expression::{ ExpressionNode };
+import compiler::ast::statement::{ Stmt };
+import compiler::ast::declaration::{ DeclarationNode };
+import compiler::ast::pattern::{ DirectiveNode, MatchArmNode, Pattern, StaticMatchArmNode };
 
-/// Base class for every node in the abstract syntax tree.  Every node is
-/// allocated in the AST arena, which is reclaimed whole at each target
-/// boundary.
-type class ASTNode {
-public:
-    kind:      NodeKind;
-    span:      SourceSpan;
-    has_error: boolean;
-    /// The compiler wrote this node where the source spells nothing, and
-    /// gave it the span of the source it stands for: an f-string's lowering
-    /// (its calls, their callees, its literal runs), an implicit
-    /// conversion's call, a lambda's closure struct.  A reader asking what
-    /// is written at a position - the editor - looks through a marked
-    /// expression to the written code under it (an f-string's holes, the
-    /// converted operand), and skips a marked declaration whole: the
-    /// closure struct's method holds the lambda's body, which is written
-    /// where the lambda is.
-    generated: boolean;
-
-    ASTNode(kind: NodeKind, span: SourceSpan) {
-        this.kind      = kind;
-        this.span      = span;
-        this.has_error = false;
-        this.generated = false;
-    }
-
-    virtual accept(visitor: ASTVisitor*) -> void;
+/// Any node of the tree, by its category: what a place holds when it can
+/// hold more than one category (a program's items, the cleanups a call
+/// records, a `for` initializer, the node at an editor position).  A
+/// place that holds one category holds that category's pointer instead.
+/// The payload is null exactly where the category's pointer would be (an
+/// absent child); a place answering "no node at all" answers `Node?`.
+type enum Node {
+    Expr(ExpressionNode*);
+    Stmt(Stmt*);
+    Decl(DeclarationNode*);
+    Pattern(Pattern*);
+    Arm(MatchArmNode*);
+    StaticArm(StaticMatchArmNode*);
+    Directive(DirectiveNode*);
+    Program(ProgramNode*);
 }
 
-/// `new` of any node takes its storage from the AST arena; `delete` of one
-/// releases nothing, since the arena is reclaimed whole.
-implement trait Allocate for class ASTNode {
-    static allocate(size: u64, align: u64) -> void* {
-        return cryo_ast_arena_alloc(size, align);
+implement enum Node {
+    /// Whether the node is absent.
+    is_null(&this) -> boolean {
+        return match (this) {
+            Node::Expr(e)      => { e == null }
+            Node::Stmt(s)      => { s == null }
+            Node::Decl(d)      => { d == null }
+            Node::Pattern(p)   => { p == null }
+            Node::Arm(a)       => { a == null }
+            Node::StaticArm(a) => { a == null }
+            Node::Directive(d) => { d == null }
+            Node::Program(p)   => { p == null }
+        };
     }
-}
 
+    /// The source range the node covers.  Not asked of an absent node.
+    span(&this) -> SourceSpan {
+        return match (this) {
+            Node::Expr(e)      => { e.span }
+            Node::Stmt(s)      => { s.span }
+            Node::Decl(d)      => { d.span }
+            Node::Pattern(p)   => { p.span }
+            Node::Arm(a)       => { a.span }
+            Node::StaticArm(a) => { a.span }
+            Node::Directive(d) => { d.span }
+            Node::Program(p)   => { p.span }
+        };
+    }
+
+    /// Whether the compiler wrote the node where the source spells nothing.
+    /// Not asked of an absent node.
+    generated(&this) -> boolean {
+        return match (this) {
+            Node::Expr(e)      => { e.generated }
+            Node::Stmt(s)      => { s.generated }
+            Node::Decl(d)      => { d.generated }
+            Node::Pattern(p)   => { p.generated }
+            Node::Arm(a)       => { a.generated }
+            Node::StaticArm(a) => { a.generated }
+            Node::Directive(d) => { d.generated }
+            Node::Program(p)   => { p.generated }
+        };
+    }
+
+    /// The declaration this node is, or null.
+    as_decl(&this) -> DeclarationNode* {
+        return match (this) {
+            Node::Decl(d) => { d }
+            _             => { null }
+        };
+    }
+
+    /// The statement this node is, or null.
+    as_stmt(&this) -> Stmt* {
+        return match (this) {
+            Node::Stmt(s) => { s }
+            _             => { null }
+        };
+    }
+
+    /// The directive this node is, or null.
+    as_directive(&this) -> DirectiveNode* {
+        return match (this) {
+            Node::Directive(d) => { d }
+            _                  => { null }
+        };
+    }
+
+    /// The expression this node is, or null.
+    as_expr(&this) -> ExpressionNode* {
+        return match (this) {
+            Node::Expr(e) => { e }
+            _             => { null }
+        };
+    }
+
+}
 
 // ProgramNode: Root of a compilation unit
 
 /// A `static_assert(cond)` / `static_assert(cond, "message")` declared at module
 /// scope. Held in a side list on ProgramNode (not the statement stream) so it
-/// needs no NodeKind and no visitor changes: TypeResolution resolves the
-/// `sizeof`/`alignof` types inside `cond`, and TypeLowering folds it once
-/// layouts are known, emitting E0237 if the condition is false or non-constant.
+/// is no item: TypeResolution resolves the `sizeof`/`alignof` types
+/// inside `cond`, and TypeLowering folds it once layouts are known, emitting
+/// E0237 if the condition is false or non-constant.
 type struct StaticAssertItem {
-    /// The condition expression, stored opaquely as `void*` (really an
-    /// `ExpressionNode*`). The AST root module can't import
-    /// `compiler::ast::expression` without a module cycle (same reason as
-    /// `TypeofAnnotation.operand`); the parser stashes it and the
-    /// TypeResolution / TypeLowering passes cast it back to evaluate.
-    cond:    void*;
+    cond:    ExpressionNode*;
     message: string;
     span:    SourceSpan;
 }
 
-type class ProgramNode : ASTNode {
-public:
-    statements:     [ASTNode*];
+/// A compilation unit: one file's items.
+type struct ProgramNode {
+    span:           SourceSpan;
+    has_error:      boolean;
+    /// The compiler wrote this node where the source spells nothing.
+    generated:      boolean;
+    /// The file's items: declarations, statements and loose directives.
+    statements:     [Node];
     static_asserts: [StaticAssertItem*];
     namespace_name: string;
     /// Set by the parser when this module contains at least one f-string
@@ -80,26 +140,41 @@ public:
     /// resolve, without forcing the import on modules that don't use one.
     uses_fstring:   boolean;
 
-    ProgramNode(span: SourceSpan) : ASTNode(NodeKind::Program, span) {
-        this.statements     = [];
-        this.static_asserts = [];
-        this.namespace_name = "";
-        this.uses_fstring   = false;
+    /// An empty program at `span`.
+    static new(span: SourceSpan) -> ProgramNode* {
+        return new ProgramNode {
+            span:           span,
+            has_error:      false,
+            generated:      false,
+            statements:     [],
+            static_asserts: [],
+            namespace_name: "",
+            uses_fstring:   false,
+        };
     }
 
-    add_statement(stmt: ASTNode*) -> void {
+    add_statement(mut &this, stmt: Node) -> void {
         this.statements.push(stmt);
     }
 
-    add_static_assert(item: StaticAssertItem*) -> void {
+    add_static_assert(mut &this, item: StaticAssertItem*) -> void {
         this.static_asserts.push(item);
     }
 
-    set_namespace_name(name: string) -> void {
+    set_namespace_name(mut &this, name: string) -> void {
         this.namespace_name = name;
     }
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+    /// Visit the items in source order.
+    static walk_children<V>(n: ProgramNode*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.statements.length; i++) { v.walk_node(n.statements[i]); }
+    }
+}
+
+/// `new` of a node takes its storage from the AST arena; `delete` of one
+/// releases nothing, since the arena is reclaimed whole.
+implement trait Allocate for struct ProgramNode {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }

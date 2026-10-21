@@ -38,8 +38,8 @@ MangledName = "C$" ( TraitImpl | Tagged | Plain ) ;
 
 TraitImpl   = "tr$" Path "$f" Path Signature ;                 (* trait-impl method *)
 
-Tagged      = ( "ct" | "dt" | "op" ) "$" Path Signature        (* ctor / dtor / operator *)
-            | ( "vt" | "ti" | "mi" ) "$" Path ;                (* vtable / type-info / module-init *)
+Tagged      = "op" "$" Path Signature                          (* operator *)
+            | ( "ti" | "mi" ) "$" Path ;                       (* type-info / module-init *)
 
 Plain       = Path [ Signature ] [ Overload ] ;                (* functions, methods, data symbols *)
 
@@ -113,13 +113,32 @@ a digit.
 
 | Tag    | Symbol                  | Shape                        |
 |--------|-------------------------|------------------------------|
-| `ct`   | Constructor             | `C$ct$` Path Signature       |
-| `dt`   | Destructor              | `C$dt$` Path Signature       |
 | `op`   | Operator overload       | `C$op$` Path Signature       |
 | `tr`   | Trait-impl method       | `C$tr$` Trait `$f` Path Signature |
-| `vt`   | Vtable                  | `C$vt$` Path                 |
 | `ti`   | Type info / RTTI        | `C$ti$` Path                 |
 | `mi`   | Module initializer      | `C$mi$` Path                 |
+| `vt`   | Trait-object table      | `C$vt$` Trait `$f` Path      |
+
+A trait-object table's symbol is the trait-impl method's without the member and
+signature: the trait's path with its arguments, then `$f` and the implementing
+type's path. `virtual &Shape` over a `Circle` names
+`C$vt$4Main.5Shape$f4Main.6Circle`, demangled `<vtable for Main::Shape for
+Main::Circle>`; two traits' tables for one type differ by the trait.  The
+function a table's first word points at, releasing the value, is internal to
+the table's module and named `__cryo.release.` followed by the table's symbol;
+it is no mangled symbol, and no other module links against it.
+
+A trait's default that an object's table cannot hold (`map`, `filter`, `take` of
+`Iterator`), compiled for an object a bound is met by, is a plain method and
+carries no tag. Its path is the trait's, then one segment that is the object
+type's encoding (§8) prefixed by its length, then `-` and the method's leaf, then
+its signature: `map` for a `virtual mut &Iterator<i32>` is
+`C$3std.4core.4iter.8Iterator.58$N$L13VirtualMutRef$LN$L3std.4core.4iter.8Iterator$G_i$G$G-3map$F...`.
+The path names neither the module that asked for it nor the value behind the
+object, so one symbol serves every call at that object type, and two traits or
+two object types give two symbols.
+
+The tags `ct` and `dt` are reserved and not emitted.
 
 Plain functions, methods, global variables, and named-type symbols carry no kind tag.
 A closure carries none either: it is a synthesized type with a `__call__` method
@@ -141,9 +160,6 @@ Each identifier is encoded as its **UTF-8 byte length** in decimal followed by t
 bytes (`<length><bytes>`). Lengths count bytes, not code points, so Unicode identifiers
 require no escaping: `café` (5 bytes) -> `5café`. Length-prefixing also makes embedded
 `_` unambiguous, so identifiers need no escape rules of their own.
-
-A constructor's and destructor's member segment duplicates the owning type's leaf name
-(e.g. `C$ct$3Dog-3Dog...`).
 
 ---
 
@@ -176,7 +192,7 @@ parameter or return type.
 ## 7. Signatures
 
 Function-like symbols carry a signature: `$F` ParamList `$R` ReturnType. Data symbols
-(vtables, type info, module initializers, globals, named-type labels) omit it entirely.
+(type info, module initializers, globals, named-type labels) omit it entirely.
 
 - An empty parameter list is the literal `v`.
 - A non-static method encodes its receiver as the first parameter: `$s` for `&this`,
@@ -228,6 +244,9 @@ with `s` (`i16`). Additional rules:
 | Optional `T?`        | `N$L8Optional$L` T `$G$G`               | `int?` -> `N$L8Optional$Li$G$G`   |
 | Tuple `(T0, T1, ...)`  | `N$L5Tuple$L` T0 `_` T1 ... `$G$G`        | `(i32, i32)` -> `N$L5Tuple$Li_i$G$G` |
 | Function `fn(...)->R`  | `F$L` params `$G` R                     | `fn(int,int)->int` -> `F$Li_i$Gi` |
+| Trait object `virtual &Tr<A>` | `N$L10VirtualRef$L` Tr `_` A ... `$G$G` | `virtual &Shape` -> `N$L10VirtualRef$LN$L5Shape$G$G$G` |
+| Trait object `virtual mut &Tr` | `N$L13VirtualMutRef$L` Tr ... `$G$G` | `virtual mut &Shape` -> `N$L13VirtualMutRef$LN$L5Shape$G$G$G` |
+| Trait object `virtual Tr*` | `N$L10VirtualPtr$L` Tr ... `$G$G`      | `virtual Shape*` -> `N$L10VirtualPtr$LN$L5Shape$G$G$G` |
 
 Notes:
 
@@ -240,6 +259,9 @@ Notes:
   outer length first: `[[u64; 2]; 3]` -> `A$L3$GA$L2$Gm`.
 - `Optional` and tuples are encoded as named generics over the reserved names
   `Optional` and `Tuple`, so distinct element shapes never share a symbol.
+  A trait object is encoded the same way, over one reserved name per form,
+  whose first argument is the trait and the rest the trait's arguments in
+  the order the object writes them.
 - A generic parameter that survives to mangling (a resolution leak) is encoded as a
   named type over its parameter name, making the leak visible in IR rather than
   silently colliding.
@@ -286,7 +308,6 @@ Data symbols carry no signature. Their forms:
 
 | Symbol                     | Encoding                          | Example                       |
 |----------------------------|-----------------------------------|-------------------------------|
-| Vtable                     | `C$vt$` Path                      | `C$vt$6Animal`                |
 | Type info                  | `C$ti$` Path                      | `C$ti$6Animal`                |
 | Module initializer         | `C$mi$` Path                      | `C$mi$4Math.6Vector`          |
 | Global / constant          | `C$` Path                         | `Math::PI` -> `C$4Math.2PI`    |

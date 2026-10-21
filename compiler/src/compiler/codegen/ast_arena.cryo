@@ -1,9 +1,9 @@
 /// AST Arena
 ///
-/// A process-global bump arena for the compiler's own AST nodes.  `ASTNode`
-/// implements `Allocate` with `cryo_ast_arena_alloc`, so every `new T(...)`
-/// whose `T` derives from it takes its storage from the arena; the node's
-/// vtable seed and constructor run exactly as with `malloc`.  The whole region is
+/// A process-global bump arena for the compiler's own AST nodes.  Each node
+/// struct implements `Allocate` with `cryo_ast_arena_alloc`, so every
+/// `new T { .. }` of one takes its storage from the arena and is filled
+/// exactly as with `malloc`.  The whole region is
 /// reclaimed in O(blocks) at each target boundary via `cryo_ast_arena_reset`
 /// (called next to `reset_shared_type_cache` in `instance.cryo`).
 ///
@@ -21,13 +21,14 @@
 ///   - The arena holds ONLY target-scoped AST nodes (everything that is
 ///     leaked-until-exit today).  Nothing that must outlive a target may be
 ///     arena-allocated.  `delete` of a node runs its `Drop`, if any, and
-///     then `Allocate::release`, which `ASTNode` leaves empty; `free()` on
-///     arena memory would corrupt the heap.
+///     then `Allocate::release`, which no AST node's `Allocate`
+///     implementation overrides, so it is the trait's empty default;
+///     `free()` on arena memory would corrupt the heap.
 ///   - Determinism: allocation order is deterministic and the compiler is
 ///     pointer-value-independent (self-host is byte-identical run to run),
 ///     so routing allocation through the arena cannot change emitted IR.
 ///   - No bootstrap loop: the arena's own backing (`Arena`/`Chunk`/`Layout`
-/// - plain structs, not `ASTNode`) comes from `intrinsics::malloc`, so
+///     - plain structs, not AST nodes) comes from `intrinsics::malloc`, so
 ///     this module's allocations never route back into the arena.
 
 namespace compiler::codegen::ast_arena;
@@ -60,10 +61,9 @@ function get_ast_arena() -> Arena* {
     return g_ast_arena;
 }
 
-/// Allocate `size` bytes aligned to `align` from the AST arena, for
-/// `ASTNode`'s `Allocate::allocate`, which every `new <ASTNode-derived>`
-/// calls.  Returns uninitialised storage; the caller seeds
-/// the vtable and runs the constructor.  Returns null on OOM, matching
+/// Allocate `size` bytes aligned to `align` from the AST arena, for the node
+/// structs' `Allocate::allocate`, which every `new` of a node calls.
+/// Returns uninitialised storage; the caller fills it.  Returns null on OOM, matching
 /// `malloc` so the existing downstream null-checks behave identically.
 public function cryo_ast_arena_alloc(size: u64, align: u64) -> void* {
     mut a: Arena* = get_ast_arena();

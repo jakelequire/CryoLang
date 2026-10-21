@@ -5,12 +5,10 @@
 /// the IR-gen-side decomposition, referenced by sub-emitters via a
 /// `state: VisitorState*` back-pointer.
 ///
-/// `last_value` / `last_is_lvalue` form the visitor's "return channel":
-/// each `visit(...)` override stashes its result here, and the caller
-/// (often the same visitor recursing through `accept(visitor)`) reads
-/// it back.  `current_impl_target` is set while traversing an impl
-/// block so method bodies can resolve `Self`.  `lambda_counter` mints
-/// unique names for anonymous lambdas within a module.
+/// `current_impl_target` is set while traversing an impl block so method
+/// bodies can resolve `Self`.  `lambda_counter` mints unique names for
+/// anonymous lambdas within a module.  What emitting a node produced is
+/// returned as an `Emitted`, never left here.
 ///
 /// Leaf component: owns its fields, holds no back-pointers.
 
@@ -24,12 +22,21 @@ import compiler::types::type_ref;
 import compiler::types::type_ref::{ TypeRef };
 
 
-type struct VisitorState {
-    /// Result of the most recent expression codegen.  Each visit(Expr*)
-    /// override writes here; recursive callers read it back.
-    last_value:     LValue;
-    last_is_lvalue: boolean;
+/// What emitting a node produced: the value, and whether it is a place (an
+/// address to load from or store to) rather than the value itself.  A
+/// statement produces the value of its trailing expression statement, which
+/// is how a block-bodied match arm yields its value; any other statement
+/// produces none.
+type struct Emitted {
+    value:     LValue;
+    is_lvalue: boolean;
 
+    static none() -> Emitted { return Emitted { value: LValue::null(), is_lvalue: false }; }
+    static rvalue(v: LValue) -> Emitted { return Emitted { value: v, is_lvalue: false }; }
+    static place(v: LValue) -> Emitted { return Emitted { value: v, is_lvalue: true }; }
+}
+
+type struct VisitorState {
     /// The type whose methods are being emitted - an impl block's owner or
     /// a declaration's own type - while its bodies are walked; invalid
     /// outside one.  A type, not a name: `implement i32` and `for ()` have
@@ -43,8 +50,6 @@ type struct VisitorState {
 
     static new() -> VisitorState {
         return VisitorState {
-            last_value:          LValue::null(),
-            last_is_lvalue:      false,
             current_impl_target: TypeRef::invalid(),
             lambda_counter:      0,
         };

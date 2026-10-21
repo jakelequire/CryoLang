@@ -27,8 +27,7 @@ import compiler::resolver::{ intern_table, symbol_str, res };
 import compiler::decl_index::{ OverloadId };
 import std::collections::hashmap;
 import std::collections::hashmap::{ HashMap };
-import compiler::ast::node;
-import compiler::ast::node::{ ASTNode };
+import compiler::ast::declaration::{ DeclarationNode };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::arena::{ TypeArena };
@@ -42,7 +41,7 @@ import compiler::resolver::lang_item::{ LangItem };
 import compiler::types::resolver::{ ResolutionContext, TypeResolver };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef, TypeKey };
-import compiler::types::user_defined::{ ClassType, EnumType, StructType };
+import compiler::types::user_defined::{ EnumType, StructType };
 import compiler::module_graph;
 import compiler::module_graph::{ ModulePath };
 import compiler::resolver::res::{ DefKey };
@@ -78,12 +77,14 @@ type struct MonomorphRequest {
     type_args:    [TypeRef];        // Concrete type arguments
     base_type:    TypeRef;          // The generic base type
     span:         SourceSpan;
+}
 
-    /// Deep copy.  `type_args` is a heap array of Copy `TypeRef` handles, so the
-    /// worklist loop clones an entry before processing it: the worklist (`pending`)
-    /// grows during processing (specialization enqueues more instantiations), and
-    /// the cloned snapshot owns an independent buffer so dropping it at the end of
-    /// an iteration cannot double-free the entry the worklist still owns.
+/// A deep copy.  `type_args` is a heap array of Copy `TypeRef` handles, so the
+/// worklist loop clones an entry before processing it: the worklist (`pending`)
+/// grows during processing (specialization enqueues more instantiations), and
+/// the cloned snapshot owns an independent buffer so dropping it at the end of
+/// an iteration cannot double-free the entry the worklist still owns.
+implement trait Clone for struct MonomorphRequest {
     clone(&this) -> MonomorphRequest {
         mut args_copy: [TypeRef] = [];
         for (mut i: i64 = 0; i < this.type_args.length; i++) {
@@ -109,8 +110,8 @@ type struct MonomorphRequest {
 
 type struct SpecializationEntry {
     specialized_type:  TypeRef;
-    ast_node:          ASTNode*;
-    impl_nodes:        [ASTNode*];
+    ast_node:          DeclarationNode*;
+    impl_nodes:        [DeclarationNode*];
     template_module:   ModulePath;     // Module where the template is defined (deterministic owner key)
     instantiated_type: TypeRef;        // The InstantiatedType that was resolved
     injected:          boolean;        // True once placed into its owner module's AST root (Phase 6a-iii)
@@ -318,10 +319,10 @@ type struct MonoState {
         if (t == null || t.kind != TypeKind::InstantiatedType) {
             return;
         }
-        const inst: InstantiatedType* = t as InstantiatedType*;
+        const inst: InstantiatedType* = t.as_instantiated();
 
         // Skip if base type is not a monomorphizable kind.  Only Struct, Enum,
-        // Class, Trait, and Function types can be templates.
+        // Trait, and Function types can be templates.
         const base_t: Type* = this.arena.lookup(inst.generic_base);
         if (base_t == null) {
             return;
@@ -331,7 +332,6 @@ type struct MonoState {
         }
         if (base_t.kind != TypeKind::Struct &&
             base_t.kind != TypeKind::Enum &&
-            base_t.kind != TypeKind::Class &&
             base_t.kind != TypeKind::Trait &&
             base_t.kind != TypeKind::Function &&
             base_t.kind != TypeKind::FunctionTemplate) {
@@ -408,7 +408,7 @@ type struct MonoState {
 
         match (t.kind) {
             TypeKind::InstantiatedType => {
-                const inst: InstantiatedType* = t as InstantiatedType*;
+                const inst: InstantiatedType* = t.as_instantiated();
                 if (!inst.has_resolved_type()) {
                     this.enqueue_from_type_ref(ty);
                 }
@@ -417,48 +417,42 @@ type struct MonoState {
                 }
             }
             TypeKind::Pointer => {
-                const ptr: PointerType* = t as PointerType*;
+                const ptr: PointerType* = t.as_pointer();
                 this.request_nested_instantiations(ptr.pointee);
             }
             TypeKind::Reference => {
-                const ref: ReferenceType* = t as ReferenceType*;
+                const ref: ReferenceType* = t.as_reference();
                 this.request_nested_instantiations(ref.referent);
             }
             TypeKind::Array => {
-                const arr: ArrayType* = t as ArrayType*;
+                const arr: ArrayType* = t.as_array();
                 this.request_nested_instantiations(arr.element);
             }
             TypeKind::Optional => {
-                const opt: OptionalType* = t as OptionalType*;
+                const opt: OptionalType* = t.as_optional();
                 this.request_nested_instantiations(opt.wrapped);
             }
             TypeKind::Function => {
-                const func: FunctionType* = t as FunctionType*;
+                const func: FunctionType* = t.as_function();
                 this.request_nested_instantiations(func.return_type);
                 for (mut i: i64 = 0; i < func.param_types.length; i++) {
                     this.request_nested_instantiations(func.param_types[i]);
                 }
             }
             TypeKind::Tuple => {
-                const tup: TupleType* = t as TupleType*;
+                const tup: TupleType* = t.as_tuple();
                 for (mut i: i64 = 0; i < tup.elements.length; i++) {
                     this.request_nested_instantiations(tup.elements[i]);
                 }
             }
             TypeKind::Struct => {
-                const st: StructType* = t as StructType*;
+                const st: StructType* = t.as_struct();
                 for (mut i: i64 = 0; i < st.fields.length; i++) {
                     this.request_nested_instantiations(st.fields[i].field_type);
                 }
             }
-            TypeKind::Class => {
-                const cl: ClassType* = t as ClassType*;
-                for (mut i: i64 = 0; i < cl.fields.length; i++) {
-                    this.request_nested_instantiations(cl.fields[i].field_type);
-                }
-            }
             TypeKind::Enum => {
-                const en: EnumType* = t as EnumType*;
+                const en: EnumType* = t.as_enum();
                 for (mut i: i64 = 0; i < en.variants.length; i++) {
                     for (mut j: i64 = 0; j < en.variants[i].payload_types.length; j++) {
                         const payload_ty: TypeRef = en.variants[i].payload_types[j];

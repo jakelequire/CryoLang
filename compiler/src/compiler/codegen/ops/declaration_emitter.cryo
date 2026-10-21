@@ -1,7 +1,7 @@
 /// Declaration Emitter
 ///
 /// Phase-1 (forward-declare types) and Phase-2 (declare functions,
-/// methods, externs, globals, vtables) of the codegen pipeline; called
+/// methods, externs, globals) of the codegen pipeline; called
 /// by the Codegen pass before body emission begins.  Also owns the
 /// function-prologue / function-epilogue / method-prologue lowering
 /// that materializes parameter allocas, binds `this` / args slots, and
@@ -32,7 +32,7 @@ import compiler::types::{
     arena, compound, generic, ownership, type_base, type_ref, TypeKind, user_defined
 };
 import compiler::ast;
-import compiler::ast::{ declaration, LiteralKind, node, NodeKind };
+import compiler::ast::{ declaration, LiteralKind, node};
 import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name, res };
 import compiler::decl_index::{ OverloadId };
 import std::collections::pair;
@@ -41,8 +41,8 @@ import std::fmt::float;
 import compiler::ast::expression;
 import compiler::ast::expression::{
     CalleePin,
-    ArrayLiteralNode, BinaryExprNode, CastExprNode, ExpressionNode, LiteralNode,
-    ScopeResolutionNode, StructLiteralNode, UnaryExprNode
+    ArrayExpr, BinaryExpr, CastExpr, ExpressionNode, LiteralExpr,
+    ScopeResolutionExpr, StructExpr, UnaryExpr
 };
 import compiler::types::generic_registry;
 import compiler::types::generic_registry::{ GenericRegistry };
@@ -51,10 +51,10 @@ import compiler::resolver::lang_item::{ LangItem };
 import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, EnumDeclNode, ExternBlockNode, FunctionDeclNode, ImplBlockNode,
-    IntrinsicDeclNode, MethodNode, StructDeclNode, UnionDeclNode, VarDeclNode
+    DeclarationNode, DeclKind, EnumDecl, ExternBlock, FunctionDecl,
+    ImplBlock, IntrinsicDecl, MethodDecl, StructDecl, TraitDecl, UnionDecl, VarDecl
 };
-import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::node::{ Node, ProgramNode };
 import compiler::lex::{ TokenType };
 import compiler::codegen::abi::{ AbiAttr, AbiClassifier, ArgClass, ParamPlan, SignaturePlan };
 import compiler::codegen::llvm_types::{
@@ -68,10 +68,11 @@ import compiler::codegen::state::global_registry::{ GlobalRegistry };
 import compiler::codegen::state::string_cache::{ StringCache };
 import compiler::codegen::state::value_table::{ ValueTable };
 import compiler::codegen::type_map::{ TypeMapper };
-import compiler::codegen::util::{ CodegenUtil, VTableSlot };
+import compiler::codegen::util::{ CodegenUtil };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::mangled_name::{ MangledName };
 import compiler::resolver::qualified_name::{ QualifiedName };
+import compiler::resolver::res::{ DefId };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::resolver::symbol_str::{ SymbolStr };
@@ -79,10 +80,10 @@ import compiler::resolver::decl_name::{ DeclName };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ FunctionType };
 import compiler::types::generic::{ InstantiatedType };
-import compiler::types::type_base::{ IntType, Type };
+import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{
-    ClassType, EnumType, EnumVariantInfo, MethodInfo, StructType
+    EnumType, EnumVariantInfo, MethodInfo, StructType
 };
 import compiler::codegen::ops::intrinsic_emitter::{ IntrinsicEmitter };
 import compiler::codegen::state::function_registry::{ FunctionRegistry };
@@ -107,7 +108,7 @@ type struct DebugInfoState {
 /// computed when the program starts (`emit_global_initializers`).  Read by
 /// position only.
 type struct StartedGlobals {
-    nodes: [VarDeclNode*];
+    nodes: [DeclarationNode*];
     slots: [LValue];
 }
 
@@ -129,17 +130,23 @@ type struct DeclarationEmitter {
     ctx:         CompilationContext*;
     started:     StartedGlobals;
 
-    /// While a `![caller_location]` function's body is emitted, the two
-    /// trailing parameters its callers pass their `FILE` and `LINE` in;
-    /// null for any other body.
-    caller_file: LValue;
-    caller_line: LValue;
+    /// While a `![caller_location]` function's body is emitted, the trailing
+    /// parameter its callers pass the address of their `Location` in; null
+    /// for any other body.
+    caller_location: LValue;
+
+    /// The word of a trait-object table holding the method at `index` among
+    /// the table's methods (`GenericRegistry::object_table_index`): past the
+    /// three reserved words, the drop, the size and the alignment.  The
+    /// table is built and a call through it loads by this one answer.
+    static object_table_word(index: i64) -> i64 {
+        return 3 + index;
+    }
 
     static null() -> DeclarationEmitter {
         return DeclarationEmitter {
             started:     StartedGlobals { nodes: [], slots: [] },
-            caller_file: LValue::null(),
-            caller_line: LValue::null(),
+            caller_location: LValue::null(),
             llvm_module: null,
             builder:     null,
             type_mapper: null,
@@ -221,34 +228,29 @@ type struct DeclarationEmitter {
 
 
     // Declaration emission.  Phase-1 (forward-declare types) and Phase-2
-    // (declare functions, methods, externs, globals, vtables) of the codegen
+    // (declare functions, methods, externs, globals) of the codegen
     // pipeline; called by the Codegen pass before body emission begins.
 
-    /// Walk the program and forward-declare all struct/class/enum types as
+    /// Walk the program and forward-declare all struct/union/enum types as
     /// named LLVM struct types.  This must run before function declarations
     /// so that parameter and return types can reference these types.
     declare_types(mut &this, program: ProgramNode*) -> void {
-        const stmts: &[ASTNode*] = &program.statements;
+        const stmts: &[Node] = &program.statements;
         for (mut i: i64 = 0; i < stmts.length; i++) {
-            const stmt: ASTNode* = stmts[i];
+            const stmt: DeclarationNode* = stmts[i].as_decl();
             if (stmt == null) { continue; }
 
             match (stmt.kind) {
-                NodeKind::StructDeclaration => {
-                    this.declare_struct_type(stmt as StructDeclNode*);
-                }
-                NodeKind::UnionDeclaration => {
-                    this.declare_union_type(stmt as UnionDeclNode*);
-                }
-                NodeKind::ClassDeclaration => {
-                    this.declare_class_type(stmt as ClassDeclNode*);
-                }
-                NodeKind::EnumDeclaration => {
-                    this.declare_enum_type(stmt as EnumDeclNode*);
-                }
-                // Impl blocks may contain methods we need, but types are
-                // already declared via StructDecl/ClassDecl.
-                _ => {}
+                DeclKind::Struct(n) => { this.declare_struct_type(n); }
+                DeclKind::Enum(n) => { this.declare_enum_type(n); }
+                DeclKind::Union(n) => { this.declare_union_type(n); }
+                // An impl block declares no type; its target's
+                // declaration does.
+                DeclKind::Import(_) | DeclKind::Intrinsic(_) | DeclKind::Impl(_)
+                | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
+                | DeclKind::Extern(_) | DeclKind::TypeAlias(_) | DeclKind::Field(_)
+                | DeclKind::GenericParam(_) | DeclKind::Trait(_) | DeclKind::Variable(_)
+                | DeclKind::Function(_) | DeclKind::Method(_) => {}
             }
         }
     }
@@ -258,7 +260,7 @@ type struct DeclarationEmitter {
     /// storage to initialize from the caller's argument area.
 
     /// Forward-declare a struct as a named LLVM type and fill its body.
-    declare_struct_type(mut &this, node: StructDeclNode*) -> void {
+    declare_struct_type(mut &this, node: StructDecl*) -> void {
         // Skip generic templates; only monomorphized versions get IR.
         if (node.generic_params.length > 0) {
             return;
@@ -277,7 +279,7 @@ type struct DeclarationEmitter {
     /// Forward-declare a union type.  A union's arena type is a StructType
     /// (with is_union set), so this mirrors declare_struct_type exactly: the
     /// type mapper emits the union's storage-blob LLVM body.
-    declare_union_type(mut &this, node: UnionDeclNode*) -> void {
+    declare_union_type(mut &this, node: UnionDecl*) -> void {
         if (node.generic_params.length > 0) {
             return;
         }
@@ -288,22 +290,8 @@ type struct DeclarationEmitter {
         this.type_mapper.map_type(type_ref);
     }
 
-    /// Forward-declare a class type.
-    declare_class_type(mut &this, node: ClassDeclNode*) -> void {
-        if (node.generic_params.length > 0) {
-            return;
-        }
-
-        const type_ref: TypeRef = this.ctx.decl_index.type_of_decl(node.def, "codegen/declare class type");
-        if (type_ref.is_invalid()) {
-            return;
-        }
-
-        this.type_mapper.map_type(type_ref);
-    }
-
     /// Declare an enum type.
-    declare_enum_type(mut &this, node: EnumDeclNode*) -> void {
+    declare_enum_type(mut &this, node: EnumDecl*) -> void {
         if (node.generic_params.length > 0) {
             return;
         }
@@ -322,40 +310,29 @@ type struct DeclarationEmitter {
     /// (regardless of source order, e.g. `clock_gettime(CLOCK_REALTIME, ...)`
     /// where the const is declared later in the file) can resolve it.
     declare_functions(mut &this, program: ProgramNode*) -> void {
-        const stmts: &[ASTNode*] = &program.statements;
+        const stmts: &[Node] = &program.statements;
         for (mut i: i64 = 0; i < stmts.length; i++) {
-            const stmt: ASTNode* = stmts[i];
+            const stmt: DeclarationNode* = stmts[i].as_decl();
             if (stmt == null) { continue; }
 
             match (stmt.kind) {
-                NodeKind::FunctionDeclaration => {
-                    this.declare_function(stmt as FunctionDeclNode*);
+                DeclKind::Function(_) => {
+                    this.declare_function(stmt);
                 }
-                NodeKind::IntrinsicDeclaration => {
-                    this.declare_intrinsic(stmt as IntrinsicDeclNode*);
-                }
-                NodeKind::ExternBlock => {
-                    this.declare_extern_block(stmt as ExternBlockNode*);
-                }
-                NodeKind::ImplementationBlock => {
-                    this.declare_impl_block(stmt as ImplBlockNode*);
-                }
-                NodeKind::StructDeclaration => {
-                    this.declare_struct_methods(stmt as StructDeclNode*);
-                }
-                NodeKind::UnionDeclaration => {
-                    this.declare_union_methods(stmt as UnionDeclNode*);
-                }
-                NodeKind::ClassDeclaration => {
-                    this.declare_class_methods(stmt as ClassDeclNode*);
-                }
-                NodeKind::VariableDeclaration => {
-                    const var_decl: VarDeclNode* = stmt as VarDeclNode*;
-                    if (var_decl.is_global) {
-                        this.codegen_global_var(var_decl);
+                DeclKind::Intrinsic(n) => { this.declare_intrinsic(n); }
+                DeclKind::Extern(n)    => { this.declare_extern_block(n); }
+                DeclKind::Union(n)     => { this.declare_union_methods(n); }
+                DeclKind::Struct(n)    => { this.declare_struct_methods(n); }
+                DeclKind::Impl(n)      => { this.declare_impl_block(n); }
+                DeclKind::Variable(n)  => {
+                    if (n.is_global) {
+                        this.codegen_global_var(stmt, n);
                     }
                 }
-                _ => {}
+                DeclKind::Import(_) | DeclKind::Module(_)
+                | DeclKind::Variant(_) | DeclKind::Destructure(_) | DeclKind::TypeAlias(_)
+                | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Enum(_)
+                | DeclKind::Trait(_) | DeclKind::Method(_) => {}
             }
         }
     }
@@ -389,8 +366,9 @@ type struct DeclarationEmitter {
     ///
     /// `main` is exempt: it is the C entry point, must be strong, and is never a
     /// specialization anyway (the guard only documents the invariant).
-    apply_spec_linkage(mut &this, fn_val: LValue, node: FunctionDeclNode*,
+    apply_spec_linkage(mut &this, fn_val: LValue, node_decl: DeclarationNode*,
                        fn_name: MangledName, is_program_main: boolean) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         if (node == null || is_program_main) { return; }
         if (!node.is_specialization || !fn_val.is_valid()) { return; }
         fn_val.set_linkage(LLinkage::WeakODR);
@@ -405,8 +383,9 @@ type struct DeclarationEmitter {
     /// consistent.  `fn_name` is the emitted LLVM symbol (used to key the weak
     /// COMDAT).  Caller gates on the presence of a body: these only apply to
     /// definitions, never bodyless externs.
-    apply_directive_effects(mut &this, fn_val: LValue, node: FunctionDeclNode*,
+    apply_directive_effects(mut &this, fn_val: LValue, node_decl: DeclarationNode*,
                             fn_name: MangledName) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         if (node == null || !fn_val.is_valid()) { return; }
         // `![weak]`: weak definition (WeakAny) so a strong definition in
         // another object overrides it - the user-overridable runtime symbols
@@ -437,11 +416,13 @@ type struct DeclarationEmitter {
     /// made and never to a same-name neighbour; and registration is the one
     /// place the symbol is computed, so a declaration the index never
     /// registered has no symbol here and is not emitted.
-    free_function_symbol(&this, node: FunctionDeclNode*) -> SymbolStr {
+    free_function_symbol(&this, node_decl: DeclarationNode*) -> SymbolStr {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         return this.ctx.decl_index.entry_symbol(node.overload_entry).spelling();
     }
 
-    declare_function(mut &this, node: FunctionDeclNode*) -> void {
+    declare_function(mut &this, node_decl: DeclarationNode*) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         // Skip generic templates, and a generic intrinsic's specializations:
         // an intrinsic has no symbol, its calls are rewritten before codegen.
         if (node.generic_params.length > 0 || node.is_intrinsic) {
@@ -450,7 +431,7 @@ type struct DeclarationEmitter {
 
         const ctx_ptr: CompilationContext* = this.ctx;
         const intern: InternTable* = ctx_ptr.intern_table;
-        const mangled_sym: SymbolStr = this.free_function_symbol(node);
+        const mangled_sym: SymbolStr = this.free_function_symbol(node_decl);
         // The C ABI entry point must be named `main` verbatim; the C
         // runtime's _start references the unmangled symbol.  Override the
         // mangled name for the program's entry point - the function the name
@@ -494,7 +475,7 @@ type struct DeclarationEmitter {
         // (sret on returns, byval on params), so the produced LLVM
         // signature looks like `void f(ptr sret(%T), ptr byval(%P), ...)`.
         // Phase 1/2 attribute attachment happens just below.
-        const param_count: u32 = CodegenUtil::fixed_param_count(node);
+        const param_count: u32 = CodegenUtil::fixed_param_count(node_decl);
 
         mut fn_type:    LType         = LType::null();
         mut sret_pointee: LType       = LType::null();   // null => no sret
@@ -521,7 +502,7 @@ type struct DeclarationEmitter {
             // This widening is not expressible in the ABI seam (it adds
             // synthetic parameters not in the source signature), so it
             // stays open-coded here.  `envp` shares argv's `char**` type.
-            const ret_ty: LType = this.map_return_type(node);
+            const ret_ty: LType = this.map_return_type(node_decl);
             if (!ret_ty.is_valid()) { return; }
             const argv_ty: LType = LType::pointer_to(LType::pointer_to(LType::i8()));
             const buf: void* = libc::malloc(3 * 8);
@@ -534,7 +515,8 @@ type struct DeclarationEmitter {
         } else {
             mut params: [TypeRef] = [];
             for (mut i: u32 = 0; i < param_count; i++) {
-                const param: VarDeclNode* = node.parameters[i];
+                const param_decl: DeclarationNode* = node.parameters[i];
+                const param: VarDecl* = DeclarationNode::var_of(param_decl);
                 if (param != null && param.resolved_type.is_valid()) {
                     params.push(param.resolved_type);
                 }
@@ -553,15 +535,12 @@ type struct DeclarationEmitter {
             // Deep-clone the plans (ParamPlan owns `llvm_slots`, so a bitwise
             // copy would alias the array into a second owner and double-free
             // when the local `plan` is dropped at block exit).
-            plan_param_plans = [];
-            for (mut pp: i64 = 0; pp < plan.param_plans.length; pp++) {
-                plan_param_plans.push(plan.param_plans[pp].clone());
-            }
+            plan_param_plans = plan.param_plans.clone();
         }
 
         // Add the function to the LLVM module.
         const fn_val: LValue = this.llvm_module.add_function(MangledName::new(fn_name), fn_type);
-        this.apply_spec_linkage(fn_val, node, MangledName::new(fn_name), is_program_main);
+        this.apply_spec_linkage(fn_val, node_decl, MangledName::new(fn_name), is_program_main);
 
         // `--panic=unwind`: `fn_val` is now `__cryo_user_main`; synthesize the
         // `main` wrapper that catches an uncaught panic at the root (see
@@ -623,7 +602,7 @@ type struct DeclarationEmitter {
                 this.abi.apply_frame_pointer_attribute(fn_val);
             }
             // `![weak]` / `![naked]` / `![section]` linkage-and-placement.
-            this.apply_directive_effects(fn_val, node, MangledName::new(fn_name));
+            this.apply_directive_effects(fn_val, node_decl, MangledName::new(fn_name));
         }
 
         // Held under the Cryo symbol, which is what a caller's pin names.
@@ -637,7 +616,7 @@ type struct DeclarationEmitter {
     }
 
     /// Declare all methods in an impl block.
-    declare_impl_block(mut &this, node: ImplBlockNode*) -> void {
+    declare_impl_block(mut &this, node: ImplBlock*) -> void {
         // Skip generic impl blocks.
         if (node.generic_params.length > 0) {
             return;
@@ -664,8 +643,84 @@ type struct DeclarationEmitter {
         }
     }
 
+    // Trait-object tables
+
+    /// The LLVM type of `block`'s trait-object table: three reserved words,
+    /// the type's release, its size and its alignment, then a word per method
+    /// of the trait and its supertraits, in the table's order
+    /// (`GenericRegistry::object_table_index`).
+    object_table_type(&this, block: ImplBlock*) -> LType {
+        const methods: i64 = this.ctx.generic_registry.object_table_method_count(block.trait_def);
+        return LType::array_of(LType::pointer_to(LType::i8()), DeclarationEmitter::object_table_word(methods) as u32);
+    }
+
+    /// The global holding `block`'s table: this module's definition when it
+    /// has one, else a declaration the implementation's module defines.
+    object_table_global(mut &this, block: ImplBlock*) -> LValue {
+        const name: MangledName = MangledName::new(this.ctx.intern_table.resolve(block.object_table_symbol));
+        const found: LValue = this.llvm_module.get_named_global(name);
+        if (found.is_valid()) { return found; }
+        return this.llvm_module.add_global(this.object_table_type(block), name);
+    }
+
+    /// Define `block`'s table, in the module holding the implementation,
+    /// when some conversion names it.  `drop_word` is the function that
+    /// releases the value behind an object in full, or null.  Each trait's
+    /// methods come from the type's implementation of that trait, which
+    /// sema recorded with the table (`object_table_blocks`) and which may
+    /// live in another module.  A method unavailable on an object holds a
+    /// null word; an available one with no function to point at is an
+    /// internal error, never a table left short.
+    emit_object_table(mut &this, block: ImplBlock*, drop_word: LValue, span: SourceSpan) -> void {
+        if (!block.object_table_symbol.is_valid()) { return; }
+        const registry: GenericRegistry* = this.ctx.generic_registry;
+        const traits: [DefId] = registry.object_table_traits(block.trait_def);
+        const shown: string = this.ctx.intern_table.resolve(block.object_table_symbol);
+        if (traits.length != block.object_table_blocks.length) {
+            this.diag.emit_error_at_span(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                fmt::format("codegen: the trait-object table `%s` holds %lld traits but has %lld implementations",
+                    shown, traits.length, block.object_table_blocks.length), span);
+            return;
+        }
+        const word: LType = LType::pointer_to(LType::i8());
+        const owner: TypeRef = this.ctx.decl_index.impl_owner(block, "codegen/trait-object table");
+        const n: u32 = DeclarationEmitter::object_table_word(registry.object_table_method_count(block.trait_def)) as u32;
+        const buf: void* = libc::malloc(n as u64 * 8);
+        const words: void** = buf as void**;
+        words[0] = drop_word.raw;
+        words[1] = llvm::LLVMConstIntToPtr(this.expr_ops.codegen_sizeof(owner).raw, word.raw);
+        words[2] = llvm::LLVMConstIntToPtr(this.expr_ops.codegen_alignof(owner).raw, word.raw);
+        for (mut k: i64 = 0; k < traits.length; k++) {
+            const decl: TraitDecl* = registry.get_trait_decl(traits[k]);
+            const implementation: ImplBlock* = block.object_table_blocks[k];
+            for (mut slot: i64 = 0; slot < decl.methods.length; slot++) {
+                mut f: LValue = LType::const_null(word);
+                if (registry.method_object_unavailable(decl.methods[slot]).length() == 0) {
+                    const m: MethodDecl* = DeclarationNode::method_of(registry.trait_item_method(implementation, slot));
+                    if (m != null && m.func != null) {
+                        f = this.resolver.resolve_decl(DeclarationNode::fn_of(m.func).overload_entry);
+                    }
+                    if (!f.is_valid()) {
+                        this.diag.emit_error_at_span(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                            fmt::format("codegen: the trait-object table `%s` has no function for method %lld of its trait %lld",
+                                shown, slot, k), span);
+                        libc::free(buf);
+                        return;
+                    }
+                }
+                words[DeclarationEmitter::object_table_word(registry.object_table_index(block.trait_def, traits[k], slot))] = f.raw;
+            }
+        }
+        const init: LValue = LType::const_array(word, buf, n);
+        libc::free(buf);
+        const global: LValue = this.object_table_global(block);
+        global.set_initializer(init);
+        global.set_global_constant(true);
+        global.set_linkage(LLinkage::External);
+    }
+
     /// Declare methods defined inline within a struct declaration.
-    declare_struct_methods(mut &this, node: StructDeclNode*) -> void {
+    declare_struct_methods(mut &this, node: StructDecl*) -> void {
         if (node.generic_params.length > 0) {
             return;
         }
@@ -680,7 +735,7 @@ type struct DeclarationEmitter {
 
     /// Declare methods defined inline within a union declaration.  Mirrors
     /// declare_struct_methods (a union's type is a StructType).
-    declare_union_methods(mut &this, node: UnionDeclNode*) -> void {
+    declare_union_methods(mut &this, node: UnionDecl*) -> void {
         if (node.generic_params.length > 0) {
             return;
         }
@@ -693,241 +748,21 @@ type struct DeclarationEmitter {
         }
     }
 
-    /// Declare methods defined inline within a class declaration.
-    declare_class_methods(mut &this, node: ClassDeclNode*) -> void {
-        if (node.generic_params.length > 0) {
-            return;
-        }
-        const di_ref: TypeRef = this.ctx.decl_index.type_of_decl(node.def, "codegen/declare class methods");
-        for (mut i: i64 = 0; i < node.methods.length; i++) {
-            this.declare_method(node.methods[i], di_ref);
-        }
-
-        // Emit the vtable for classes with virtual methods.  Drive this from
-        // ClassType.methods + its base chain (populated by the type-resolution
-        // pass) so the vtable is inheritance-complete: a subclass's vtable has
-        // one slot per virtual method introduced anywhere in the ancestry,
-        // in the order of first introduction (root -> leaf).  The slot's
-        // implementation is the most-derived override present in the chain,
-        // falling back to the inherited base implementation when the subclass
-        // doesn't override that slot.  Layout discipline is what makes call-site
-        // dispatch work: a `Base*` callsite looks up slot N in `Base`'s layout,
-        // and any subclass's vtable guarantees slot N at the same index.
-        if (di_ref.is_valid()) {
-            const arena: TypeArena* = this.get_arena();
-            const t: Type* = arena.lookup(di_ref);
-            if (t != null && t.kind == TypeKind::Class) {
-                const cls: ClassType* = t as ClassType*;
-                if (cls.has_virtual_methods) {
-                    this.codegen_vtable_for_class(cls);
-                }
-            }
-        }
-    }
-
-    /// Walk the class's base chain (leaf -> root) and collect the ordered
-    /// list of virtual-method slots.  New `is_virtual` methods append a
-    /// new slot; `is_override` methods do NOT; they install into an
-    /// existing slot at vtable-emission time.  The returned list is in
-    /// root -> leaf declaration order, so every subclass's vtable extends
-    /// the base's layout with its own additions.
-    collect_vtable_slots(mut &this, cls: ClassType*) -> [VTableSlot] {
-        const arena: TypeArena* = this.get_arena();
-
-        // Build chain = [cls, ..., root].
-        mut chain: [ClassType*] = [];
-        mut walk: ClassType* = cls;
-        mut depth: i32 = 0;
-        while (walk != null && depth < 16) {
-            chain.push(walk);
-            if (!walk.has_base || !walk.base_class.is_valid()) { break; }
-            const base_t: Type* = arena.lookup(walk.base_class);
-            if (base_t == null || base_t.kind != TypeKind::Class) { break; }
-            walk = base_t as ClassType*;
-            depth += 1;
-        }
-
-        mut slots: [VTableSlot] = [];
-        for (mut ci: i64 = chain.length - 1; ci >= 0; ci--) {
-            const link: ClassType* = chain[ci];
-            for (mut mi: i64 = 0; mi < link.methods.length; mi++) {
-                const m: &MethodInfo = &link.methods[mi];
-                if (!m.is_virtual) { continue; }
-                mut already: boolean = false;
-                for (mut ki: i64 = 0; ki < slots.length; ki++) {
-                    // Must use the SAME param equality as `find_vtable_slot_impl`
-                    // / `vtable_slot_index`, or slot construction and slot
-                    // lookup disagree: two virtual declarations of the same
-                    // overload counted as distinct here produce two slots, while
-                    // a laxer lookup then matches both to one method - a
-                    // duplicate slot / index skew.
-                    if (slots[ki].name.equals(m.name) &&
-                        CodegenUtil::param_types_equal(
-                            slots[ki].param_types, m.param_types)) {
-                        already = true;
-                        break;
-                    }
-                }
-                if (!already) {
-                    // Own an independent copy of the param-type ids; moving
-                    // `m.param_types` out of the slice-element copy `m` would
-                    // alias the array and double-free. TypeRef is Copy.
-                    mut pt_copy: [TypeRef] = [];
-                    for (mut pk: i64 = 0; pk < m.param_types.length; pk++) {
-                        pt_copy.push(m.param_types[pk]);
-                    }
-                    slots.push(VTableSlot { name: m.name, param_types: pt_copy });
-                }
-            }
-        }
-        return slots;
-    }
-
-    /// For a given vtable slot (name + param_types), walk leaf -> root and
-    /// return the first matching method's LLVM function: the most-derived
-    /// override, falling back to the inherited base implementation when
-    /// the subclass doesn't override that specific overload.  Resolution
-    /// goes through the method's own registered entry so the correct LLVM
-    /// function is installed in the slot, not the last-registered one
-    /// under `Type::method`.
-    find_vtable_slot_impl(mut &this, cls: ClassType*, slot_name: SymbolStr, slot_params: &[TypeRef]) -> LValue {
-        const arena: TypeArena* = this.get_arena();
-        mut walk: ClassType* = cls;
-        mut depth: i32 = 0;
-        while (walk != null && depth < 16) {
-            for (mut mi: i64 = 0; mi < walk.methods.length; mi++) {
-                const m: &MethodInfo = &walk.methods[mi];
-                if (!m.name.equals(slot_name)) { continue; }
-                // Param equality must agree with `collect_vtable_slots`, which
-                // built these slots.  It relies on canonical type identity: an
-                // override's params and the virtual base's params denote the
-                // same types and therefore share arena ids, even when the two
-                // declarations resolved at different points (e.g. `ASTVisitor*`
-                // registered before vs. after the visitor module finished
-                // resolving).  If that ever stopped holding, this would miss
-                // every override and the whole vtable would bail (every
-                // `new <DerivedClass>` then skips the vtable store; runtime
-                // virtual dispatch crashes reading a null vtable pointer).
-                if (!CodegenUtil::param_types_equal(m.param_types, slot_params)) { continue; }
-                if (!m.is_virtual && !m.is_override) { continue; }
-                // Skip pure virtual declarations (virtual without body).
-                // Their LLVM function is a bare `declare` that links as an
-                // undefined reference.  Keep walking up; a concrete override
-                // must come from further up the chain, or the caller's
-                // `!impl.is_valid()` bail drops the whole vtable.
-                if (m.ast_node != null) {
-                    const mnode_ck: MethodNode* = m.ast_node as MethodNode*;
-                    if (mnode_ck != null && mnode_ck.func != null && !mnode_ck.func.has_body()) {
-                        continue;
-                    }
-                }
-                // The slot's function is this declaration and nothing else:
-                // an inherited base method the module has not declared yet
-                // is declared extern from its entry.  A lookup by the
-                // combined `Type::method` name would fill the slot with
-                // whichever overload registered first - right only when that
-                // is the slot's own.
-                mut slot_entry: OverloadId = OverloadId::invalid();
-                if (m.ast_node != null) {
-                    const smn: MethodNode* = m.ast_node as MethodNode*;
-                    if (smn != null && smn.func != null) { slot_entry = smn.func.overload_entry; }
-                }
-                return this.resolver.resolve_pinned(CalleePin::Decl(slot_entry));
-            }
-            if (!walk.has_base || !walk.base_class.is_valid()) { break; }
-            const base_t: Type* = arena.lookup(walk.base_class);
-            if (base_t == null || base_t.kind != TypeKind::Class) { break; }
-            walk = base_t as ClassType*;
-            depth += 1;
-        }
-        return LValue::null();
-    }
-
-    /// Return the vtable slot index of (method_name, param_types) in this
-    /// class's layout, or -1 if no matching virtual slot exists.  Called
-    /// from codegen dispatch after the call's pin has identified the exact
-    /// overload; this function just maps that declaration to its slot
-    /// position.
-    ///
-    /// Param-type matching goes through `param_types_equal` (canonical arena-id
-    /// compare), the same relation `collect_vtable_slots` used to build the
-    /// slots.  It matters that an override's parameter `Foo*` and the base
-    /// method's `Foo*` share one id even when the two declarations resolved
-    /// before/after `Foo`'s body was sealed - that is exactly what canonical
-    /// type identity provides.  Were they to diverge, `node.accept(this)` on a
-    /// base-class pointer would fall back to a static call to the base accept
-    /// (which targets vtable slot 0, the no-op base `visit(BaseNode*)`;
-    /// silently dropping every visitor traversal).
-    vtable_slot_index(mut &this, cls: ClassType*, method_name: SymbolStr, param_types: [TypeRef]) -> i32 {
-        const slots: [VTableSlot] = this.collect_vtable_slots(cls);
-        for (mut i: i32 = 0; i < slots.length as i32; i++) {
-            if (slots[i].name.equals(method_name) &&
-                CodegenUtil::param_types_equal(
-                    slots[i].param_types, param_types)) {
-                return i;
-            }
-        }
-        return -1;
-    }
-
-    /// Emit the vtable global for `cls`.  Slot layout comes from
-    /// `collect_vtable_slots` (inheritance-complete, overload-aware); each
-    /// slot's contents come from `find_vtable_slot_impl` (most-derived
-    /// override wins, inherited base implementation otherwise).
-    codegen_vtable_for_class(mut &this, cls: ClassType*) -> void {
-        const intern: InternTable* = this.get_intern();
-
-        const slots: [VTableSlot] = this.collect_vtable_slots(cls);
-        if (slots.length == 0) { return; }
-
-        mut impls: [LValue] = [];
-        for (mut i: i64 = 0; i < slots.length; i++) {
-            const impl: LValue = this.find_vtable_slot_impl(cls, slots[i].name, slots[i].param_types);
-            if (!impl.is_valid()) {
-                // If the slot's implementation isn't declared in this module,
-                // skip vtable emission entirely; a half-populated vtable would
-                // misdispatch.  Cross-module vtables are handled when the owning
-                // module's codegen runs.
-                return;
-            }
-            impls.push(impl);
-        }
-
-        const n: u32 = impls.length as u32;
-        const fn_ptr_ty: LType = LType::pointer_to(LType::i8());
-        const vtable_ty: LType = LType::array_of(fn_ptr_ty, n);
-
-        const buf: void* = libc::malloc(n as u64 * 8);
-        const slot_ptrs: void** = buf as void**;
-        for (mut i: u32 = 0; i < n; i++) {
-            slot_ptrs[i] = llvm::LLVMConstBitCast(impls[i].raw, fn_ptr_ty.raw);
-        }
-        const init: LValue = LType::const_array(fn_ptr_ty, buf, n);
-        libc::free(buf);
-
-        const qname: QualifiedName = QualifiedName::from_symbol(cls.qualified_name.spelling());
-        const mangled: MangledName = MangledName::for_vtable(intern, qname);
-        const global: LValue = this.llvm_module.add_global(vtable_ty, mangled);
-        global.set_initializer(init);
-        global.set_global_constant(true);
-        // External linkage so cross-module `new` sites can resolve the vtable
-        // symbol at link time.  Internal linkage hides the global from the
-        // owning module's .o exports, leaving cross-module references unresolved.
-        global.set_linkage(LLinkage::External);
-    }
-
     /// The LLVM symbol of a method's declaration: its registered entry's.
     /// Empty for a method the index never registered, which is then not
     /// emitted.
-    method_symbol(&this, node: MethodNode*) -> SymbolStr {
-        return this.ctx.decl_index.entry_symbol(node.func.overload_entry).spelling();
+    method_symbol(&this, node_decl: DeclarationNode*) -> SymbolStr {
+        const node: MethodDecl* = DeclarationNode::method_of(node_decl);
+        return this.ctx.decl_index.entry_symbol(DeclarationNode::fn_of(node.func).overload_entry).spelling();
     }
 
     /// Declare a method.  Methods get a `this` pointer as the first parameter.
     /// `owner` is the type the method is on: an impl head's owner or a
     /// declaration's own type, never re-derived from a name here.
-    declare_method(mut &this, node: MethodNode*, owner: TypeRef) -> void {
-        const func: FunctionDeclNode* = node.func;
+    declare_method(mut &this, node_decl: DeclarationNode*, owner: TypeRef) -> void {
+        const node: MethodDecl* = DeclarationNode::method_of(node_decl);
+        const func_decl: DeclarationNode* = node.func;
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return; }
 
         // Skip generic methods.
@@ -947,7 +782,7 @@ type struct DeclarationEmitter {
 
         // The symbol is the registered entry's: registration computed it
         // once from this node, and every caller's pin names the same entry.
-        const mangled_sym: SymbolStr = this.method_symbol(node);
+        const mangled_sym: SymbolStr = this.method_symbol(node_decl);
         if (!mangled_sym.is_valid()) { return; }
         // `![symbol("sym")]` overrides the LLVM symbol name ONLY (the C++ binding
         // generator uses it to pin a non-virtual C++ method to its mangled
@@ -1024,10 +859,11 @@ type struct DeclarationEmitter {
         // existing param.
         // For variadic methods (`args...`), skip the trailing name-only param;
         // LLVM's `...` marker covers it.
-        const fixed_user_count: u32 = CodegenUtil::fixed_param_count(func);
+        const fixed_user_count: u32 = CodegenUtil::fixed_param_count(func_decl);
         mut user_param_count: u32 = 0;
         for (mut pc: u32 = 0; pc < fixed_user_count; pc++) {
-            const pp: VarDeclNode* = func.parameters[pc];
+            const pp_decl: DeclarationNode* = func.parameters[pc];
+            const pp: VarDecl* = DeclarationNode::var_of(pp_decl);
             if (pp != null) { user_param_count += 1; }
         }
         // sret-returning methods get a hidden `ptr sret(%T)` parameter
@@ -1047,7 +883,8 @@ type struct DeclarationEmitter {
         mut user_plans: [ParamPlan] = [];
         mut total_user_slots: u32 = 0;
         for (mut i: u32 = 0; i < fixed_user_count; i++) {
-            const param: VarDeclNode* = func.parameters[i];
+            const param_decl: DeclarationNode* = func.parameters[i];
+            const param: VarDecl* = DeclarationNode::var_of(param_decl);
             if (param == null) {
                 mut empty_slots: [LType] = [];
                 user_plans.push(ParamPlan {
@@ -1144,7 +981,8 @@ type struct DeclarationEmitter {
                 // a malformed signature.  This branch only fires for
                 // null params (which the loop above produced an
                 // empty plan for).
-                const param: VarDeclNode* = func.parameters[i];
+                const param_decl: DeclarationNode* = func.parameters[i];
+                const param: VarDecl* = DeclarationNode::var_of(param_decl);
                 const fallback: LType = if (param != null) {
                     this.type_mapper.map_type(param.resolved_type)
                 } else {
@@ -1201,7 +1039,7 @@ type struct DeclarationEmitter {
         }
 
         // `![inline]` / `![noinline]` on a method: mirror the free-function
-        // path.  The flags live on the wrapped FunctionDeclNode (`func`),
+        // path.  The flags live on the wrapped FunctionDecl (`func`),
         // set by directive_processing.  Gate on a body so bodyless declares
         // don't carry a dead attribute.
         if (func.body != null) {
@@ -1215,7 +1053,7 @@ type struct DeclarationEmitter {
                 this.abi.apply_frame_pointer_attribute(fn_val);
             }
             // `![weak]` / `![section]` on a method (naked is function-only).
-            this.apply_directive_effects(fn_val, func, MangledName::new(fn_name));
+            this.apply_directive_effects(fn_val, func_decl, MangledName::new(fn_name));
         }
 
         // Held under the Cryo symbol: the key every pin and the body's own
@@ -1226,22 +1064,19 @@ type struct DeclarationEmitter {
 
     /// Declare an intrinsic function (e.g., malloc, printf, strlen).
     /// Intrinsics use C linkage: bare name, no namespace qualification.
-    declare_intrinsic(mut &this, node: IntrinsicDeclNode*) -> void {
+    declare_intrinsic(mut &this, node: IntrinsicDecl*) -> void {
         const intern: InternTable* = this.get_intern();
         const name_str: string = intern.resolve(node.name);
 
         // Route the LLVM function-type through the ABI seam.  Intrinsics
         // are flat C signatures with no receiver, so the seam handles
         // them directly without any pre-lowering.
-        const ret_ref: TypeRef = if (node.has_resolved_return_type()) {
-            node.resolved_return_type
-        } else {
-            TypeRef::invalid()
-        };
-        const param_count: u32 = CodegenUtil::fixed_param_count_intrinsic(node);
+        const ret_ref: TypeRef = node.resolved_return_type;
+        const param_count: u32 = node.fixed_param_count();
         mut params: [TypeRef] = [];
         for (mut i: u32 = 0; i < param_count; i++) {
-            const param: VarDeclNode* = node.parameters[i];
+            const param_decl: DeclarationNode* = node.parameters[i];
+            const param: VarDecl* = DeclarationNode::var_of(param_decl);
             if (param != null && param.resolved_type.is_valid()) {
                 params.push(param.resolved_type);
             }
@@ -1263,17 +1098,18 @@ type struct DeclarationEmitter {
     }
 
     /// Declare extern block functions.
-    declare_extern_block(mut &this, node: ExternBlockNode*) -> void {
+    declare_extern_block(mut &this, node: ExternBlock*) -> void {
         // Get intern table from CompilationContext to avoid CodegenContext offset issues.
         const ctx_ptr: CompilationContext* = this.ctx;
         const intern: InternTable* = ctx_ptr.intern_table;
 
         for (mut i: i64 = 0; i < node.functions.length; i++) {
-            const func: FunctionDeclNode* = node.functions[i];
+            const func_decl: DeclarationNode* = node.functions[i];
+            const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
             if (func == null) { continue; }
 
             const name_str: string = intern.resolve(func.name);
-            const param_count: u32 = CodegenUtil::fixed_param_count(func);
+            const param_count: u32 = CodegenUtil::fixed_param_count(func_decl);
 
             // Route the extern declaration through the Phase 1 + 2 + 3
             // extern-C seam so the LLVM function type matches the SysV
@@ -1282,7 +1118,8 @@ type struct DeclarationEmitter {
             // into a register-sized integer (Phase 3).
             mut params: [TypeRef] = [];
             for (mut pi: u32 = 0; pi < param_count; pi++) {
-                const param_pi: VarDeclNode* = func.parameters[pi];
+                const param_pi_decl: DeclarationNode* = func.parameters[pi];
+                const param_pi: VarDecl* = DeclarationNode::var_of(param_pi_decl);
                 if (param_pi != null && param_pi.resolved_type.is_valid()) {
                     params.push(param_pi.resolved_type);
                 }
@@ -1292,7 +1129,7 @@ type struct DeclarationEmitter {
             if (!plan.llvm_fn_type.is_valid()) {
                 this.diag.emit_warning_at_span(ErrorCode::E0643_RETURN_TYPE_ERROR,
                     fmt::format("codegen: extern function '%s': failed to classify signature", name_str),
-                    func.span);
+                    func_decl.span);
                 continue;
             }
             const fn_type: LType = plan.llvm_fn_type;
@@ -1330,8 +1167,9 @@ type struct DeclarationEmitter {
         }
     }
 
-    /// Generate a global variable declaration with optional initializer.
-    codegen_global_var(mut &this, node: VarDeclNode*) -> void {
+    /// Generate a global variable declaration with optional initializer;
+    /// `decl` is the declaration whose payload `node` is.
+    codegen_global_var(mut &this, decl: DeclarationNode*, node: VarDecl*) -> void {
         // Mangle definitions under the current module's namespace
         // (`C$<namespace>.<name>`) so two modules with the same private
         // `const NAME = ...` don't collide at link time.  Cross-module readers
@@ -1404,14 +1242,14 @@ type struct DeclarationEmitter {
         // of this function, leaving HEX_LOWER null at runtime, which
         // segfaults the moment a downstream consumer indexes it.
         mut init_expr: ExpressionNode* = node.initializer;
-        if (init_expr != null && init_expr.kind == NodeKind::CastExpression) {
-            const ce: CastExprNode* = init_expr as CastExprNode*;
-            if (ce.expression != null && ce.expression.kind == NodeKind::Literal) {
+        const ce: CastExpr* = ExpressionNode::cast_of(init_expr);
+        if (ce != null) {
+            if (ExpressionNode::literal_of(ce.expression) != null) {
                 init_expr = ce.expression;
             }
         }
-        if (init_expr != null && init_expr.kind == NodeKind::Literal) {
-            const lit: LiteralNode* = init_expr as LiteralNode*;
+        const lit: LiteralExpr* = ExpressionNode::literal_of(init_expr);
+        if (lit != null) {
             const tk: LTypeKind = LType::kind_of(ty.raw);
             if (lit.literal_kind == LiteralKind::Integer && tk == LTypeKind::Integer) {
                 if (llvm::LLVMGetIntTypeWidth(ty.raw) == 128) {
@@ -1431,15 +1269,8 @@ type struct DeclarationEmitter {
                        && (tk == LTypeKind::Float || tk == LTypeKind::Double)) {
                 const fval: f64 = float::parse_f64(lit.value).unwrap_or(0.0);
                 init = LType::const_real(ty, fval);
-            } else if (lit.literal_kind == LiteralKind::Null && tk == LTypeKind::Pointer) {
-                init = LType::const_pointer_null(ty);
-            } else if (lit.literal_kind == LiteralKind::String && tk == LTypeKind::Pointer) {
-                // String literal global: store the address of the interned
-                // string global as the initializer.  Without this, every
-                // `const SOME_TEXT: string = "..."` emits as `null`, which
-                // surfaces as literal "(null)" in any printf/format output
-                // that consumes the constant.
-                init = this.str_cache.get_or_create(lit.value, lit.byte_length, this.llvm_module);
+            } else if (tk == LTypeKind::Pointer) {
+                init = this.const_pointer(ty, init_expr);
             }
         }
         // Fold a constant-expression initializer that isn't a bare literal -
@@ -1460,7 +1291,7 @@ type struct DeclarationEmitter {
                 // Integer const-expression initializer that isn't a bare literal -
                 // unary minus / bitwise-not / arithmetic, e.g. `const EOF: i32 = -1;`
                 // or `const FLAGS: u32 = (1 << 4) | (1 << 2)`.  A negative literal
-                // parses as a UnaryExpression (not a Literal), so without this the
+                // parses as a unary minus (not a literal), so without this the
                 // leading `-` is dropped and the global silently lands on the
                 // `const_null` (0) fallback below - a real miscompile for every
                 // negative module-level integer constant (EOF, AT_FDCWD, the EAI_*
@@ -1483,10 +1314,9 @@ type struct DeclarationEmitter {
         // Only runs when `init` is still invalid, so no currently-correct const
         // can change.
         if (!init.is_valid() && init_expr != null
-            && init_expr.kind == NodeKind::StructLiteral
             && LType::kind_of(ty.raw) == LTypeKind::Struct) {
             init = this.try_const_struct(
-                this.type_mapper, gty, init_expr as StructLiteralNode*, ty);
+                this.type_mapper, gty, ExpressionNode::struct_of(init_expr), ty);
         }
         // Array-literal const initializer, e.g. `const GAINS: [f32; 2] = [0.9,
         // 1.0]`.  Without this an array-typed global has no branch at all and
@@ -1494,9 +1324,8 @@ type struct DeclarationEmitter {
         // literal one included, which is what makes the failure look like a
         // fold that went wrong rather than one that never ran.
         if (!init.is_valid() && init_expr != null
-            && init_expr.kind == NodeKind::ArrayLiteral
             && LType::kind_of(ty.raw) == LTypeKind::Array) {
-            init = this.try_const_array(init_expr as ArrayLiteralNode*, ty);
+            init = this.try_const_array(ExpressionNode::array_of(init_expr), ty);
         }
         // An initializer none of the folds above answers - a call, a value
         // read from another global - is computed when the program starts:
@@ -1504,12 +1333,18 @@ type struct DeclarationEmitter {
         // since a store into a constant global is one the optimizer may
         // read past.
         const started: boolean = !init.is_valid() && init_expr != null;
+        // Each thread's copy of a thread-local starts from the global's
+        // static data; a value computed at program start would reach the
+        // main thread's copy only, and every other thread would read zero.
+        if (started && node.is_thread_local) {
+            this.refuse_computed_thread_local(node, init_expr);
+        }
         if (!init.is_valid()) {
             init = LType::const_null(ty);
         }
         global.set_initializer(init);
         if (started) {
-            this.started.nodes.push(node);
+            this.started.nodes.push(decl);
             this.started.slots.push(global);
         }
 
@@ -1524,6 +1359,18 @@ type struct DeclarationEmitter {
         }
 
         this.globals.register(this.global_cache_slot(node), global);
+    }
+
+    /// E0646 at a `![thread_local]` global whose initializer is not a
+    /// constant the program can carry as static data.
+    refuse_computed_thread_local(&this, node: VarDecl*, init_expr: ExpressionNode*) -> void {
+        const name: string = this.resolve(node.name);
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0646_THREAD_LOCAL_NOT_CONSTANT,
+            fmt::format("thread-local `%s` is initialized by a value computed at program start", name));
+        d = d.at_with_label(init_expr.span, "not a constant");
+        d = d.with_note("every thread's copy of a thread-local starts from its initializer as static data; a computed value would reach the main thread's copy only");
+        d = d.help("initialize it with a constant (a number, `null`, a string literal, or array and struct literals of those writing every field) and assign the computed value on each thread that reads it");
+        this.diag.emit(d);
     }
 
     /// The function that computes the module's started globals, opened with
@@ -1549,7 +1396,8 @@ type struct DeclarationEmitter {
     /// storage `codegen_global_var` gave it.
     store_started_global(mut &this, k: i64, value: LValue) -> void {
         if (!value.is_valid()) { return; }
-        const node: VarDeclNode* = this.started.nodes[k];
+        const node_decl: DeclarationNode* = this.started.nodes[k];
+        const node: VarDecl* = DeclarationNode::var_of(node_decl);
         const ty: LType = this.type_mapper.map_type(node.resolved_type);
         this.builder.build_store(this.expr_ops.init_store_value(value, ty, node.resolved_type),
                                  this.started.slots[k]);
@@ -1594,7 +1442,7 @@ type struct DeclarationEmitter {
     /// `SymbolResolver::resolve_global_entry` reads and writes too, so a
     /// reader in this module and one in another reach the same value, and
     /// two imports declaring one leaf (`a::FOO`, `b::FOO`) hold two.
-    global_cache_slot(&this, node: VarDeclNode*) -> i64 {
+    global_cache_slot(&this, node: VarDecl*) -> i64 {
         return this.ctx.global_entry_of_def(node.def).slot;
     }
 
@@ -1604,8 +1452,21 @@ type struct DeclarationEmitter {
     /// 2. Create entry basic block
     /// 3. Create allocas for parameters and store incoming values
     /// 4. Push scope, bind parameter names
-    /// 5. The visitor will visit the body (BlockStmtNode)
+    /// 5. The visitor will visit the body (a block)
     /// 6. Handle implicit return for void functions
+    /// Enter the body of `func`, defined as `fn_val`: record its name for the
+    /// `Location`s made in it, and for a `![caller_location]` body the last
+    /// parameter, the address of its caller's `Location`.
+    open_caller_site(mut &this, fn_val: LValue, func_decl: DeclarationNode*) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
+        this.intrinsics.open_function(this.ctx.intern_table.shown(
+            this.ctx.defs.path_of(FunctionDecl::written_in_of(func_decl))));
+        this.caller_location = LValue::null();
+        if (!func.is_caller_located) { return; }
+        const n: u32 = llvm::LLVMCountParams(fn_val.raw);
+        this.caller_location = fn_val.get_param(n - 1);
+    }
+
     /// Attach a DWARF DISubprogram to `fn_val` and set the builder's
     /// current debug location to the function's declaration line, scoped
     /// to that subprogram. Called from the prologue once the builder is at
@@ -1613,18 +1474,8 @@ type struct DeclarationEmitter {
     /// location. No-op unless `-g`. The subroutine type carries no
     /// parameter list (sufficient for function-level file:line backtraces;
     /// per-argument types and per-statement line granularity are follow-ups).
-    /// Enter the body of `func`, defined as `fn_val`: a `![caller_location]`
-    /// body reads `FILE` and `LINE` from its last two parameters.
-    open_caller_site(mut &this, fn_val: LValue, func: FunctionDeclNode*) -> void {
-        this.caller_file = LValue::null();
-        this.caller_line = LValue::null();
-        if (!func.is_caller_located) { return; }
-        const n: u32 = llvm::LLVMCountParams(fn_val.raw);
-        this.caller_file = fn_val.get_param(n - 2);
-        this.caller_line = fn_val.get_param(n - 1);
-    }
-
-    emit_debug_subprogram(mut &this, fn_val: LValue, node: FunctionDeclNode*) -> void {
+    emit_debug_subprogram(mut &this, fn_val: LValue, node_decl: DeclarationNode*) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         const ctx_ptr: CompilationContext* = this.ctx;
         if (!this.debug_info.is_on()) { return; }
         if (!fn_val.is_valid()) { return; }
@@ -1632,7 +1483,7 @@ type struct DeclarationEmitter {
         const dib:  void* = this.debug_info.builder;
         const file: void* = this.debug_info.file;
 
-        mut line: u32 = node.span.start_line;
+        mut line: u32 = node_decl.span.start_line;
         if (line == 0) { line = 1; }
 
         // Idempotent: if `fn_val` already carries a DISubprogram, REUSE it. A
@@ -1655,7 +1506,7 @@ type struct DeclarationEmitter {
             // methods are distinguishable in a backtrace, rather than the bare
             // leaf name - and the module the linkage name below mangles, which
             // for a specialization is the template's, not the one emitting it.
-            const disp_sym: SymbolStr = ctx_ptr.decl_fn_key(node.name, node.span.file);
+            const disp_sym: SymbolStr = ctx_ptr.decl_fn_key(node.name, node_decl.span.file);
             const name: string = this.resolve(disp_sym);
             const name_len: u64 = name.length();
 
@@ -1684,7 +1535,7 @@ type struct DeclarationEmitter {
             llvm::LLVMSetSubprogram(fn_val.raw, sp);
         }
 
-        mut col: u32 = node.span.start_col;
+        mut col: u32 = node_decl.span.start_col;
         if (col == 0) { col = 1; }
         // Debug metadata is context-scoped; build it in the same per-target
         // context as the module/builder (LContext::current()), not the global
@@ -1703,13 +1554,14 @@ type struct DeclarationEmitter {
     /// exists.  The caller caps the entry block with `unreachable` after
     /// emitting the asm (inline asm is not a terminator; the asm performs the
     /// real control transfer).
-    codegen_naked_prologue(mut &this, node: FunctionDeclNode*) -> LValue {
-        const fn_val: LValue = this.functions.get(this.free_function_symbol(node));
+    codegen_naked_prologue(mut &this, node_decl: DeclarationNode*) -> LValue {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
+        const fn_val: LValue = this.functions.get(this.free_function_symbol(node_decl));
         if (!fn_val.is_valid()) {
             const fname: string = this.resolve(node.name);
             this.diag.emit_warning_at_span(ErrorCode::E0606_FUNCTION_GENERATION_ERROR,
                 fmt::format("codegen: naked function '%s' has no LLVM declaration in this module; body skipped.", fname),
-                node.span);
+                node_decl.span);
             return LValue::null();
         }
         const entry_bb: LBasicBlock = LBasicBlock::append(fn_val, "entry");
@@ -1717,10 +1569,11 @@ type struct DeclarationEmitter {
         return fn_val;
     }
 
-    codegen_function_prologue(mut &this, node: FunctionDeclNode*) -> LValue {
+    codegen_function_prologue(mut &this, node_decl: DeclarationNode*) -> LValue {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         // The body attaches to the function `declare_function` made for THIS
         // signature, held under the symbol both derive the same way.
-        const mangled_sym: SymbolStr = this.free_function_symbol(node);
+        const mangled_sym: SymbolStr = this.free_function_symbol(node_decl);
         const fn_val: LValue = this.functions.get(mangled_sym);
         if (!fn_val.is_valid()) {
             // IRGeneration's declare-functions phase should have produced a
@@ -1732,7 +1585,7 @@ type struct DeclarationEmitter {
             const fname: string = this.resolve(node.name);
             this.diag.emit_warning_at_span(ErrorCode::E0606_FUNCTION_GENERATION_ERROR,
                 fmt::format("codegen: function '%s' has no LLVM declaration in this module; body skipped (the declare-functions phase should have produced one). Calls to this function will fail at link time.", fname),
-                node.span);
+                node_decl.span);
             return LValue::null();
         }
 
@@ -1744,8 +1597,8 @@ type struct DeclarationEmitter {
         // whole body inherit a !dbg location (the verifier requires one on
         // inlinable calls in a function that carries debug info). No-op
         // unless `-g`.
-        this.emit_debug_subprogram(fn_val, node);
-        this.open_caller_site(fn_val, node);
+        this.emit_debug_subprogram(fn_val, node_decl);
+        this.open_caller_site(fn_val, node_decl);
 
         // Create allocas for each parameter and store the incoming value.
         this.values.push_scope();
@@ -1757,9 +1610,10 @@ type struct DeclarationEmitter {
         const is_sret_fn: boolean = this.abi.sret_pointee_of(fn_val).is_valid();
         mut llvm_idx: u32 = if (is_sret_fn) { 1 } else { 0 } as u32;
 
-        const fixed_count: u32 = CodegenUtil::fixed_param_count(node);
+        const fixed_count: u32 = CodegenUtil::fixed_param_count(node_decl);
         for (mut i: u32 = 0; i < fixed_count; i++) {
-            const param: VarDeclNode* = node.parameters[i];
+            const param_decl: DeclarationNode* = node.parameters[i];
+            const param: VarDecl* = DeclarationNode::var_of(param_decl);
             const param_name: string = this.resolve(param.name);
             const param_ty: LType = this.type_mapper.map_type(param.resolved_type);
 
@@ -1768,7 +1622,7 @@ type struct DeclarationEmitter {
                 this.diag.emit_warning_at_span(ErrorCode::E0642_PARAM_TYPE_ERROR,
                     fmt::format("codegen: function '%s', parameter '%s': could not lower its type to LLVM; body skipped. Calls to this function will fail at link time.",
                         fname, param_name),
-                    if (param != null) { param.span } else { node.span });
+                    if (param != null) { param_decl.span } else { node_decl.span });
                 this.values.pop_scope();
                 return LValue::null();
             }
@@ -1842,7 +1696,7 @@ type struct DeclarationEmitter {
         // a v* variant (vsprintf, vfprintf, etc.).  Without this the `args`
         // identifier has no LLVM value and every forwarding call codegens
         // with a null operand.
-        const va_param: VarDeclNode* = CodegenUtil::variadic_param(node);
+        const va_param: VarDecl* = CodegenUtil::variadic_param(node_decl);
         if (va_param != null) {
             this.expr_ops.emit_va_start_for_variadic(fn_val, va_param.name, va_param.sym_id);
         } else {
@@ -1858,7 +1712,7 @@ type struct DeclarationEmitter {
         // Suppressed under `no_runtime`: main's signature was NOT widened
         // (no argc/argv/envp), so there are no synthetic params to publish,
         // and `std::env` is not linked in a freestanding build.
-        if (node.def.is_valid() && node.def.equals(this.ctx.entry_fn) && CodegenUtil::fixed_param_count(node) == 0
+        if (node.def.is_valid() && node.def.equals(this.ctx.entry_fn) && CodegenUtil::fixed_param_count(node_decl) == 0
             && !this.ctx.options.freestanding()) {
             this.emit_set_args_call(fn_val);
             this.emit_set_env_call(fn_val);
@@ -2012,7 +1866,8 @@ type struct DeclarationEmitter {
     /// side already does when it emits `unreachable` after a `never`-returning
     /// call.  Without this the block stays unterminated and the body validator
     /// discards the whole function.
-    codegen_function_epilogue(mut &this, node: FunctionDeclNode*) -> void {
+    codegen_function_epilogue(mut &this, node_decl: DeclarationNode*) -> void {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         const current_bb: LBasicBlock = this.builder.get_insert_block();
         if (current_bb.is_valid() && !current_bb.has_terminator()) {
             const ret_ty: TypeRef = node.resolved_return_type;
@@ -2082,8 +1937,10 @@ type struct DeclarationEmitter {
 
     /// Generate function prologue for a method.  Prepends `this` parameter binding.
     /// `owner` as in `declare_method`; its display name serves the diagnostics.
-    codegen_method_prologue(mut &this, node: MethodNode*, owner: TypeRef) -> LValue {
-        const func: FunctionDeclNode* = node.func;
+    codegen_method_prologue(mut &this, node_decl: DeclarationNode*, owner: TypeRef) -> LValue {
+        const node: MethodDecl* = DeclarationNode::method_of(node_decl);
+        const func_decl: DeclarationNode* = node.func;
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return LValue::null(); }
 
         const intern: InternTable* = this.get_intern();
@@ -2094,7 +1951,7 @@ type struct DeclarationEmitter {
 
         // The body attaches to the function `declare_method` made, held
         // under the entry's symbol - the one place both read it from.
-        const mangled_sym: SymbolStr = this.method_symbol(node);
+        const mangled_sym: SymbolStr = this.method_symbol(node_decl);
         const fn_val: LValue = this.functions.get(mangled_sym);
         if (!fn_val.is_valid()) {
             // declare_method should have produced an LLVM declare for this
@@ -2108,13 +1965,13 @@ type struct DeclarationEmitter {
             this.diag.emit_warning_at_span(ErrorCode::E0619_METHOD_GENERATION_ERROR,
                 fmt::format("codegen: method '%s::%s' has no LLVM declaration in this module; body skipped (declare_method should have produced one). Calls to this method will fail at link time.",
                     type_str, method_str),
-                func.span);
+                func_decl.span);
             return LValue::null();
         }
 
         const entry_bb: LBasicBlock = LBasicBlock::append(fn_val, "entry");
         this.builder.position_at_end(entry_bb);
-        this.open_caller_site(fn_val, func);
+        this.open_caller_site(fn_val, func_decl);
 
         this.values.push_scope();
 
@@ -2138,7 +1995,8 @@ type struct DeclarationEmitter {
         mut explicit_val_idx: i64 = -1;    // parameters[i] is bare "this" (by-value self)
         mut explicit_typed_idx: i64 = -1;  // parameters[i] is "this: T*" (user-typed self)
         for (mut pc: i64 = 0; pc < func.parameters.length; pc++) {
-            const pp: VarDeclNode* = func.parameters[pc];
+            const pp_decl: DeclarationNode* = func.parameters[pc];
+            const pp: VarDecl* = DeclarationNode::var_of(pp_decl);
             if (pp == null) { continue; }
             if (pp.is_ref_receiver()) { explicit_ref_idx = pc; break; }
             if (pp.is_value_receiver()) {
@@ -2165,7 +2023,7 @@ type struct DeclarationEmitter {
                 const ms: string = this.resolve(func.name);
                 this.diag.emit_error_at_span(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                     fmt::format("codegen: method '%s::%s': the owner has no type", type_str, ms),
-                    func.span);
+                    func_decl.span);
                 this.values.pop_scope();
                 return LValue::null();
             }
@@ -2176,7 +2034,7 @@ type struct DeclarationEmitter {
             if (recv_idx < 0) { recv_idx = explicit_val_idx; }
             if (recv_idx < 0) { recv_idx = explicit_typed_idx; }
             const this_bind: SymbolID = if (recv_idx >= 0) {
-                func.parameters[recv_idx].sym_id
+                DeclarationNode::var_of(func.parameters[recv_idx]).sym_id
             } else {
                 SymbolID::invalid()
             };
@@ -2201,7 +2059,7 @@ type struct DeclarationEmitter {
                     this.diag.emit_warning_at_span(ErrorCode::E0609_TYPE_MAPPING_ERROR,
                         fmt::format("codegen: method '%s::%s': could not lower the by-value `this` type to LLVM; body skipped. Calls to this method will fail at link time.",
                             type_str, method_str),
-                        func.span);
+                        func_decl.span);
                     this.values.pop_scope();
                     return LValue::null();
                 }
@@ -2260,9 +2118,10 @@ type struct DeclarationEmitter {
         // method uses (we already handled it above).  Cap iteration at the
         // fixed-param count so a trailing `args...` bucket doesn't try to pull
         // an LLVM param that doesn't exist.
-        const fixed_count: u32 = CodegenUtil::fixed_param_count(func);
+        const fixed_count: u32 = CodegenUtil::fixed_param_count(func_decl);
         for (mut i: u32 = 0; i < fixed_count; i++) {
-            const param: VarDeclNode* = func.parameters[i];
+            const param_decl: DeclarationNode* = func.parameters[i];
+            const param: VarDecl* = DeclarationNode::var_of(param_decl);
             if (param == null) { continue; }
             if (i as i64 == explicit_ref_idx) { continue; }
             if (i as i64 == explicit_val_idx) { continue; }
@@ -2274,7 +2133,7 @@ type struct DeclarationEmitter {
                 this.diag.emit_warning_at_span(ErrorCode::E0642_PARAM_TYPE_ERROR,
                     fmt::format("codegen: method '%s::%s', parameter '%s': could not lower its type to LLVM; body skipped. Calls to this method will fail at link time.",
                         type_str, method_str, param_name),
-                    if (param != null) { param.span } else { func.span });
+                    if (param != null) { param_decl.span } else { func_decl.span });
                 this.values.pop_scope();
                 return LValue::null();
             }
@@ -2332,7 +2191,8 @@ type struct DeclarationEmitter {
     }
 
     /// Map a function's return type to an LLVMType.
-    map_return_type(mut &this, node: FunctionDeclNode*) -> LType {
+    map_return_type(mut &this, node_decl: DeclarationNode*) -> LType {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         if (node.resolved_return_type.is_invalid()) {
             return LType::void_type();
         }
@@ -2391,27 +2251,27 @@ type struct DeclarationEmitter {
     /// constant's value.
     try_fold_const_int(&this, expr: ExpressionNode*, out: u64*) -> boolean {
         if (expr == null) { return false; }
-        const node: ASTNode* = expr as ASTNode*;
-        if (node.kind == NodeKind::CastExpression) {
-            // `Enum::Variant as u64`, `SOME_CONST as i32`.  Fold the OPERAND:
-            // the cast's own width is applied by `const_int` when it builds the
-            // constant against the global's type, so a cast chain folds once and
-            // narrows once.  Without this the initializer does not fold at all
-            // and the global lands on the zero fallback below.
-            const ce: CastExprNode* = expr as CastExprNode*;
+        const node: ExpressionNode* = expr;
+        // `Enum::Variant as u64`, `SOME_CONST as i32`.  Fold the OPERAND: the
+        // cast's own width is applied by `const_int` when it builds the
+        // constant against the global's type, so a cast chain folds once and
+        // narrows once.  Without this the initializer does not fold at all and
+        // the global lands on the zero fallback below.
+        const ce: CastExpr* = ExpressionNode::cast_of(expr);
+        if (ce != null) {
             return this.try_fold_const_int(ce.expression, out);
         }
-        if (node.kind == NodeKind::ScopeResolution) {
+        if (ExpressionNode::scope_resolution_of(node) != null) {
             // `Enum::Variant`: a payload-free variant IS its discriminant.
             // Naming the enum rather than copying its number is the spelling
             // that survives a header change, and it is the one that silently
             // produced 0 at module scope.
-            const sr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
-            mut real_ref: TypeRef = sr.resolved_type;
+            const sr: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(expr);
+            mut real_ref: TypeRef = expr.resolved_type;
             mut real_t: Type* = this.arena_type(real_ref);
             mut depth: i32 = 0;
             while (real_t != null && real_t.kind == TypeKind::InstantiatedType && depth < 5) {
-                const inst: InstantiatedType* = real_t as InstantiatedType*;
+                const inst: InstantiatedType* = real_t.as_instantiated();
                 if (!inst.has_resolved_type()) { break; }
                 real_ref = inst.resolved_type;
                 real_t = this.arena_type(real_ref);
@@ -2429,7 +2289,7 @@ type struct DeclarationEmitter {
                 }
                 return false;
             }
-            const et: EnumType* = real_t as EnumType*;
+            const et: EnumType* = real_t.as_enum();
             const variant: EnumVariantInfo* = CodegenUtil::pinned_variant(et, sr.resolved_member);
             // A variant carrying a payload is a CONSTRUCTOR, not a constant -
             // its tag alone is not the value the initializer names.
@@ -2437,8 +2297,8 @@ type struct DeclarationEmitter {
             *out = variant.tag_value;
             return true;
         }
-        if (node.kind == NodeKind::Literal) {
-            const lit: LiteralNode* = expr as LiteralNode*;
+        const lit: LiteralExpr* = ExpressionNode::literal_of(expr);
+        if (lit != null) {
             if (lit.literal_kind == LiteralKind::Integer) {
                 *out = lit.value.parse_int::<u64>();
                 return true;
@@ -2453,26 +2313,25 @@ type struct DeclarationEmitter {
         // this position's questions - they belong to `ConstEval` over the
         // constant table and the arena - so they are asked there rather than
         // re-derived here.
-        if (node.kind == NodeKind::Identifier
-            || node.kind == NodeKind::SizeofExpression
-            || node.kind == NodeKind::AlignofExpression) {
+        if (ExpressionNode::identifier_of(node) != null
+            || ExpressionNode::sizeof_of(node) != null
+            || ExpressionNode::alignof_of(node) != null) {
             mut nv: i64 = 0;
             if (!this.const_eval().fold(expr, &nv)) { return false; }
             *out = nv as u64;
             return true;
         }
-        if (node.kind == NodeKind::UnaryExpression) {
-            const u: UnaryExprNode* = expr as UnaryExprNode*;
+        const u: UnaryExpr* = ExpressionNode::unary_of(node);
+        if (u != null) {
             mut a: u64 = 0;
             if (!this.try_fold_const_int(u.operand, &a)) { return false; }
             const op: TokenType = u.op.kind;
             if (op == TokenType::Minus) { *out = 0 - a; return true; }
-            if (op == TokenType::Plus) { *out = a;        return true; }
             if (op == TokenType::Tilde) { *out = ~a;       return true; }
             return false;
         }
-        if (node.kind == NodeKind::BinaryExpression) {
-            const b: BinaryExprNode* = expr as BinaryExprNode*;
+        const b: BinaryExpr* = ExpressionNode::binary_of(node);
+        if (b != null) {
             const op: TokenType = b.op.kind;
             // `/ % >>` read their operands as NUMBERS, so their result depends
             // on a signedness a u64 bit pattern has already discarded.  They
@@ -2506,8 +2365,8 @@ type struct DeclarationEmitter {
     /// the bindgen importer lowers a C compound-literal macro to).  The importer
     /// emits the field initializers in struct DECLARATION order, so a positional
     /// zip against the LLVM struct's element types is exact.  Every field init
-    /// must fold to a scalar constant (`try_fold_const_int`/`try_fold_const_real`);
-    /// any non-constant field, or a field-count mismatch (an unexpected shape),
+    /// must fold to a constant (`const_element`: a number, a `null` or string
+    /// literal, a nested array or struct literal); any non-constant field, or a field-count mismatch (an unexpected shape),
     /// returns an invalid value so the caller declines to the zeroinitializer
     /// fallback - correct-or-decline, never a silently wrong layout.
     /// `layout` is the Cryo type whose field list `sl` initializes, so a field
@@ -2518,15 +2377,15 @@ type struct DeclarationEmitter {
     /// but the count alone can no longer decide, because padding makes a
     /// correct body wider than its field list.
     try_const_struct(&this, mapper: TypeMapper*, layout: Type*,
-                     sl: StructLiteralNode*, ty: LType) -> LValue {
+                     sl: StructExpr*, ty: LType) -> LValue {
+        if (sl == null) { return LValue::null(); }
         const n: u32 = llvm::LLVMCountStructElementTypes(ty.raw);
         if (n == 0 || mapper == null || layout == null) { return LValue::null(); }
         // Every field initialized, in declaration order - the shape the
         // importer emits.  A partial literal still declines: filling only some
         // fields here would silently define the rest as zero.
         mut field_count: i64 = -1;
-        if (layout.kind == TypeKind::Struct) { field_count = (layout as StructType*).fields.length; }
-        else if (layout.kind == TypeKind::Class) { field_count = (layout as ClassType*).fields.length; }
+        if (layout.kind == TypeKind::Struct) { field_count = layout.as_struct().fields.length; }
         if (field_count < 0 || sl.field_inits.length != field_count) { return LValue::null(); }
         const buf: void* = libc::malloc((n as u64) * 8);
         const slots: void** = buf as void**;
@@ -2563,10 +2422,11 @@ type struct DeclarationEmitter {
     /// disagree about which expressions are constant, and the disagreement
     /// would surface as a zeroed aggregate rather than as an error.
     ///
-    /// A nested aggregate recurses, so `[[f32; 2]; 2]` and an array inside a struct
-    /// are built rather than declined.  A struct element declines: building one
-    /// needs its layout to map field order onto element order, which is reached
-    /// from the declaration and not from the llvm type in hand here.
+    /// A nested aggregate recurses, so `[[f32; 2]; 2]`, an array inside a
+    /// struct and a struct literal inside either are built rather than
+    /// declined.  A struct literal's layout, which maps its field order onto
+    /// element order, is its own type's, not anything the llvm type in hand
+    /// says.
     const_element(&this, ety: LType, expr: ExpressionNode*) -> LValue {
         if (expr == null) { return LValue::null(); }
         const k: LTypeKind = LType::kind_of(ety.raw);
@@ -2584,8 +2444,40 @@ type struct DeclarationEmitter {
             }
             return LValue::null();
         }
-        if (k == LTypeKind::Array && expr.kind == NodeKind::ArrayLiteral) {
-            return this.try_const_array(expr as ArrayLiteralNode*, ety);
+        if (k == LTypeKind::Array) {
+            return this.try_const_array(ExpressionNode::array_of(expr), ety);
+        }
+        const sl: StructExpr* = ExpressionNode::struct_of(expr);
+        if (k == LTypeKind::Struct && sl != null) {
+            return this.try_const_struct(this.type_mapper, this.arena_type(expr.resolved_type), sl, ety);
+        }
+        if (k == LTypeKind::Pointer) {
+            return this.const_pointer(ety, expr);
+        }
+        return LValue::null();
+    }
+
+    /// A constant pointer of type `ty` from a `null` literal or a string
+    /// literal (the address of its interned bytes), with one cast around the
+    /// literal peeled, as `"..." as u8*` is written; any other expression is
+    /// not a pointer constant here, and answers an invalid value.
+    ///
+    /// A string literal must answer its address rather than decline: a
+    /// declined global is zeroed and filled in by the startup constructor,
+    /// which for a thread-local fills only the main thread's copy.
+    const_pointer(&this, ty: LType, expr_in: ExpressionNode*) -> LValue {
+        mut expr: ExpressionNode* = expr_in;
+        const ce: CastExpr* = ExpressionNode::cast_of(expr);
+        if (ce != null) {
+            expr = ce.expression;
+        }
+        const lit: LiteralExpr* = ExpressionNode::literal_of(expr);
+        if (lit == null) { return LValue::null(); }
+        if (lit.literal_kind == LiteralKind::Null) {
+            return LType::const_pointer_null(ty);
+        }
+        if (lit.literal_kind == LiteralKind::String) {
+            return this.str_cache.get_or_create(lit.value, lit.byte_length, this.llvm_module);
         }
         return LValue::null();
     }
@@ -2599,7 +2491,7 @@ type struct DeclarationEmitter {
     /// length disagrees with the type is not a constant this position can
     /// build, and a partial one would define the remainder as zero, which is
     /// the failure this whole branch exists to remove.
-    try_const_array(&this, al: ArrayLiteralNode*, ty: LType) -> LValue {
+    try_const_array(&this, al: ArrayExpr*, ty: LType) -> LValue {
         if (al == null) { return LValue::null(); }
         const n: u32 = llvm::LLVMGetArrayLength(ty.raw);
         if (n == 0) { return LValue::null(); }

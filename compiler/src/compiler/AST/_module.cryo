@@ -1,8 +1,10 @@
 /// AST Module
 ///
-/// Abstract Syntax Tree node classes for the Cryo compiler.
-/// Uses class inheritance with the visitor pattern: each node type extends
-/// `ASTNode` and dispatches through `accept(visitor)`.
+/// Abstract Syntax Tree nodes for the Cryo compiler.
+/// Each category (expression, statement, declaration, pattern) is a header
+/// struct holding what every kind shares and an enum of per-kind payloads;
+/// `Node` holds any of them.  A pass dispatches on the kind (`Walk`, or its
+/// own `match`).
 
 namespace compiler::ast;
 
@@ -11,7 +13,7 @@ public module Expression;
 public module Statement;
 public module Declaration;
 public module Pattern;
-public module Visitor;
+public module Walk;
 public module Cloner;
 public module Substituter;
 public module Dumper;
@@ -32,186 +34,14 @@ import compiler::resolver::intern_table;
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::ast::expression;
 import compiler::ast::expression::{ ExpressionNode };
+import compiler::ast::pattern;
+import compiler::ast::pattern::{ Pattern };
 import std::fmt;
 
-/// Discriminator for all AST node types.
-type enum NodeKind {
-    // Base categories
-    Expression; Statement; Declaration;
-
-    // Expressions (25)
-    Literal; Identifier; BinaryExpression; UnaryExpression; TernaryExpression;
-    IfExpression; MatchExpression; StaticMatchExpression; CallExpression; NewExpression;
-    SizeofExpression; AlignofExpression; CastExpression;
-    StructLiteral; ArrayLiteral; TupleLiteral; LambdaExpression;
-    ArrayAccess; MemberAccess; ScopeResolution;
-    TypeofExpression; DeleteExpression; AwaitExpression;
-    YieldExpression; AsyncExpression; TryExpression;
-
-    // Statements (16)
-    BlockStatement; UnsafeBlockStatement; ReturnStatement;
-    IfStatement; WhileStatement; DoWhileStatement; ForStatement;
-    MatchStatement; StaticMatchStatement;
-    BreakStatement; ContinueStatement; ExpressionStatement; DeclarationStatement;
-    LoopStatement; AsmBlockStatement;
-
-    // Declarations (19)
-    VariableDeclaration; DestructureDeclaration; FunctionDeclaration; MethodDeclaration;
-    IntrinsicDeclaration; IntrinsicConstDeclaration;
-    ImportDeclaration; ModuleDeclaration;
-    StructDeclaration; UnionDeclaration; ClassDeclaration; EnumDeclaration; EnumVariant;
-    TraitDeclaration; TypeAliasDeclaration; ImplementationBlock; ExternBlock;
-    FieldDeclaration; GenericParamDeclaration;
-
-    // Other
-    Program; MatchArm; StaticMatchArm; Pattern; EnumPattern; Directive; Unknown;
-}
-
-implement enum NodeKind {
-    to_string(&this) -> string {
-        return match (this) {
-            NodeKind::Expression                => { "Expression" }
-            NodeKind::Statement                 => { "Statement" }
-            NodeKind::Declaration               => { "Declaration" }
-            NodeKind::Literal                   => { "Literal" }
-            NodeKind::Identifier                => { "Identifier" }
-            NodeKind::BinaryExpression          => { "BinaryExpression" }
-            NodeKind::UnaryExpression           => { "UnaryExpression" }
-            NodeKind::TernaryExpression         => { "TernaryExpression" }
-            NodeKind::IfExpression              => { "IfExpression" }
-            NodeKind::MatchExpression           => { "MatchExpression" }
-            NodeKind::StaticMatchExpression     => { "StaticMatchExpression" }
-            NodeKind::CallExpression            => { "CallExpression" }
-            NodeKind::NewExpression             => { "NewExpression" }
-            NodeKind::SizeofExpression          => { "SizeofExpression" }
-            NodeKind::AlignofExpression         => { "AlignofExpression" }
-            NodeKind::CastExpression            => { "CastExpression" }
-            NodeKind::StructLiteral             => { "StructLiteral" }
-            NodeKind::ArrayLiteral              => { "ArrayLiteral" }
-            NodeKind::TupleLiteral              => { "TupleLiteral" }
-            NodeKind::LambdaExpression          => { "LambdaExpression" }
-            NodeKind::ArrayAccess               => { "ArrayAccess" }
-            NodeKind::MemberAccess              => { "MemberAccess" }
-            NodeKind::ScopeResolution           => { "ScopeResolution" }
-            NodeKind::TypeofExpression          => { "TypeofExpression" }
-            NodeKind::DeleteExpression          => { "DeleteExpression" }
-            NodeKind::AwaitExpression           => { "AwaitExpression" }
-            NodeKind::YieldExpression           => { "YieldExpression" }
-            NodeKind::AsyncExpression           => { "AsyncExpression" }
-            NodeKind::TryExpression             => { "TryExpression" }
-            NodeKind::BlockStatement            => { "BlockStatement" }
-            NodeKind::UnsafeBlockStatement      => { "UnsafeBlockStatement" }
-            NodeKind::ReturnStatement           => { "ReturnStatement" }
-            NodeKind::IfStatement               => { "IfStatement" }
-            NodeKind::WhileStatement            => { "WhileStatement" }
-            NodeKind::DoWhileStatement          => { "DoWhileStatement" }
-            NodeKind::ForStatement              => { "ForStatement" }
-            NodeKind::MatchStatement            => { "MatchStatement" }
-            NodeKind::StaticMatchStatement      => { "StaticMatchStatement" }
-            NodeKind::BreakStatement            => { "BreakStatement" }
-            NodeKind::ContinueStatement         => { "ContinueStatement" }
-            NodeKind::ExpressionStatement       => { "ExpressionStatement" }
-            NodeKind::DeclarationStatement      => { "DeclarationStatement" }
-            NodeKind::LoopStatement             => { "LoopStatement" }
-            NodeKind::AsmBlockStatement         => { "AsmBlockStatement" }
-            NodeKind::VariableDeclaration       => { "VariableDeclaration" }
-            NodeKind::DestructureDeclaration    => { "DestructureDeclaration" }
-            NodeKind::FunctionDeclaration       => { "FunctionDeclaration" }
-            NodeKind::MethodDeclaration         => { "MethodDeclaration" }
-            NodeKind::IntrinsicDeclaration      => { "IntrinsicDeclaration" }
-            NodeKind::IntrinsicConstDeclaration => { "IntrinsicConstDeclaration" }
-            NodeKind::ImportDeclaration         => { "ImportDeclaration" }
-            NodeKind::ModuleDeclaration         => { "ModuleDeclaration" }
-            NodeKind::StructDeclaration         => { "StructDeclaration" }
-            NodeKind::UnionDeclaration          => { "UnionDeclaration" }
-            NodeKind::ClassDeclaration          => { "ClassDeclaration" }
-            NodeKind::EnumDeclaration           => { "EnumDeclaration" }
-            NodeKind::EnumVariant               => { "EnumVariant" }
-            NodeKind::TraitDeclaration          => { "TraitDeclaration" }
-            NodeKind::TypeAliasDeclaration      => { "TypeAliasDeclaration" }
-            NodeKind::ImplementationBlock       => { "ImplementationBlock" }
-            NodeKind::ExternBlock               => { "ExternBlock" }
-            NodeKind::FieldDeclaration          => { "FieldDeclaration" }
-            NodeKind::GenericParamDeclaration   => { "GenericParamDeclaration" }
-            NodeKind::Program                   => { "Program" }
-            NodeKind::MatchArm                  => { "MatchArm" }
-            NodeKind::StaticMatchArm            => { "StaticMatchArm" }
-            NodeKind::Pattern                   => { "Pattern" }
-            NodeKind::EnumPattern               => { "EnumPattern" }
-            NodeKind::Directive                 => { "Directive" }
-            NodeKind::Unknown                   => { "Unknown" }
-        };
-    }
-
-    /// True for the declaration node kinds (the family whose nodes
-    /// downcast to `DeclarationNode` and carry a `name_span`).  Mirrors
-    /// the `Declaration` AST hierarchy; keep in sync when adding a decl
-    /// kind.  Used by position lookup / hover to gate the
-    /// `DeclarationNode` downcast.
-    is_declaration(&this) -> boolean {
-        return match (this) {
-            NodeKind::VariableDeclaration       => { true }
-            NodeKind::DestructureDeclaration    => { true }
-            NodeKind::FunctionDeclaration       => { true }
-            NodeKind::MethodDeclaration         => { true }
-            NodeKind::IntrinsicDeclaration      => { true }
-            NodeKind::IntrinsicConstDeclaration => { true }
-            NodeKind::StructDeclaration         => { true }
-            NodeKind::UnionDeclaration          => { true }
-            NodeKind::ClassDeclaration          => { true }
-            NodeKind::EnumDeclaration           => { true }
-            NodeKind::EnumVariant               => { true }
-            NodeKind::TraitDeclaration          => { true }
-            NodeKind::TypeAliasDeclaration      => { true }
-            NodeKind::ImplementationBlock       => { true }
-            NodeKind::ExternBlock               => { true }
-            NodeKind::FieldDeclaration          => { true }
-            NodeKind::GenericParamDeclaration   => { true }
-            _ => { false }
-        };
-    }
-
-    /// True for the expression node kinds (the family whose nodes
-    /// downcast to `ExpressionNode` and carry `resolved_type` on the
-    /// base).  Mirrors the `Expression` AST hierarchy; keep in sync
-    /// when adding an expression kind.
-    is_expression(&this) -> boolean {
-        return match (this) {
-            NodeKind::Literal               => { true }
-            NodeKind::Identifier            => { true }
-            NodeKind::BinaryExpression      => { true }
-            NodeKind::UnaryExpression       => { true }
-            NodeKind::TernaryExpression     => { true }
-            NodeKind::IfExpression          => { true }
-            NodeKind::MatchExpression       => { true }
-            NodeKind::StaticMatchExpression => { true }
-            NodeKind::CallExpression        => { true }
-            NodeKind::NewExpression         => { true }
-            NodeKind::SizeofExpression      => { true }
-            NodeKind::AlignofExpression     => { true }
-            NodeKind::CastExpression        => { true }
-            NodeKind::StructLiteral         => { true }
-            NodeKind::ArrayLiteral          => { true }
-            NodeKind::TupleLiteral          => { true }
-            NodeKind::LambdaExpression      => { true }
-            NodeKind::ArrayAccess           => { true }
-            NodeKind::MemberAccess          => { true }
-            NodeKind::ScopeResolution       => { true }
-            NodeKind::TypeofExpression      => { true }
-            NodeKind::DeleteExpression      => { true }
-            NodeKind::AwaitExpression       => { true }
-            NodeKind::YieldExpression       => { true }
-            NodeKind::AsyncExpression       => { true }
-            NodeKind::TryExpression         => { true }
-            _ => { false }
-        };
-    }
-}
 
 type enum Visibility {
     Public;
     Private;
-    Protected;
 }
 
 implement enum Visibility {
@@ -219,7 +49,6 @@ implement enum Visibility {
         return match (this) {
             Visibility::Public    => { "public" }
             Visibility::Private   => { "private" }
-            Visibility::Protected => { "protected" }
         };
     }
 }
@@ -247,13 +76,6 @@ type enum LiteralKind {
     Null;
 }
 
-type enum PatternKind {
-    Literal;
-    Identifier;
-    Wildcard;
-    Enum;
-    Range;
-}
 
 /// How an expression standing in a call or constructor argument slot binds to
 /// the parameter it is passed to.  Sema records this at the one point where the
@@ -280,11 +102,10 @@ type enum ArgBinding {
 /// What a MEMBER segment resolved to, once sema has decided it: the
 /// coordinates of the member inside the owner the node's type already
 /// names, so no later stage searches the owner's member table by the
-/// spelling again.  A field is `(depth, index)`: `index` into the field
-/// list of the class `depth` steps up the base chain from the receiver's
-/// type (0 for a struct, a tuple element, or a class's own field); the
-/// coordinates are the same in a template and in every instantiation of
-/// it, so a pin written by the pre-mono walk stays right.  A variant is
+/// spelling again.  A field is its index in the owner's field list (a
+/// struct's fields, a tuple's elements); the index is the same in a
+/// template and in every instantiation of it, so a pin written by the
+/// pre-mono walk stays right.  A variant is
 /// its ordinal in the enum's variant list; a global is the declaration
 /// index's registration slot.  `None` is a node sema never answered, which
 /// codegen reports rather than answering by the spelling: an unanswered
@@ -313,7 +134,7 @@ type enum ArgBinding {
 /// future's own type, never found by the field's spelling.
 type enum MemberPin {
     None;
-    Field(i64, i64);
+    Field(i64);
     Variant(i64);
     Global(i64);
     RecvSlot;
@@ -362,6 +183,9 @@ type enum TypeAnnotation {
     /// is known (during type resolution / monomorphization). See
     /// ProjectionAnnotation.
     Projection(ProjectionAnnotation*);
+    /// A trait object type: `virtual &Trait`, `virtual mut &Trait` or
+    /// `virtual Trait*`.  See ObjectAnnotation.
+    Object(ObjectAnnotation*);
 }
 
 
@@ -442,15 +266,47 @@ implement enum TypeAnnotation {
                 hit
             }
             TypeAnnotation::Generic(g) => {
-                mut hit: boolean = TypeAnnotation::refused(g.base);
+                mut hit: boolean = g.refused || TypeAnnotation::refused(g.base);
                 for (mut i: i64 = 0; i < g.args.length; i++) {
                     if (TypeAnnotation::refused(g.args[i])) { hit = true; }
                 }
                 hit
             }
             TypeAnnotation::Projection(pj) => { pj.refused || TypeAnnotation::refused(pj.base) }
+            TypeAnnotation::Object(o)      => { o.refused || TypeAnnotation::refused(o.trait_annotation) }
             _ => { false }
         };
+    }
+
+    /// The first trait object written anywhere in `ann` - itself, or inside
+    /// a pointer, reference, array, tuple, function type or type argument -
+    /// or null when it holds none.
+    static object_in(ann: TypeAnnotation*) -> ObjectAnnotation* {
+        if (ann == null) { return null; }
+        return match (*ann) {
+            TypeAnnotation::Object(o)    => { o }
+            TypeAnnotation::Pointer(p)   => { TypeAnnotation::object_in(p.inner) }
+            TypeAnnotation::Reference(r) => { TypeAnnotation::object_in(r.inner) }
+            TypeAnnotation::Array(a)     => { TypeAnnotation::object_in(a.element) }
+            TypeAnnotation::Tuple(t)     => { TypeAnnotation::first_object_in(&t.elements) }
+            TypeAnnotation::Function(f)  => {
+                const in_params: ObjectAnnotation* = TypeAnnotation::first_object_in(&f.parameters);
+                const found: ObjectAnnotation* = if (in_params != null) { in_params } else {
+                    TypeAnnotation::object_in(f.return_type) };
+                found
+            }
+            TypeAnnotation::Generic(g)   => { TypeAnnotation::first_object_in(&g.args) }
+            _ => { null }
+        };
+    }
+
+    /// The first trait object written in any of `anns`, or null.
+    static first_object_in(anns: &[TypeAnnotation*]) -> ObjectAnnotation* {
+        for (mut i: i64 = 0; i < anns.length; i++) {
+            const o: ObjectAnnotation* = TypeAnnotation::object_in(anns[i]);
+            if (o != null) { return o; }
+        }
+        return null;
     }
 
     /// The source spelling of an annotation, for a diagnostic that proposes
@@ -476,6 +332,7 @@ implement enum TypeAnnotation {
                 }
                 out + ">"
             }
+            TypeAnnotation::Object(o)     => { o.form.spell(TypeAnnotation::spell(o.trait_annotation, intern)) }
             _ => { ".." }
         };
     }
@@ -511,6 +368,15 @@ implement enum TypeAnnotation {
                     span:       ref.span,
                 };
                 new TypeAnnotation::Reference(r)
+            }
+            TypeAnnotation::Object(obj) => {
+                const o: ObjectAnnotation* = new ObjectAnnotation {
+                    trait_annotation: TypeAnnotation::clone_ptr(obj.trait_annotation),
+                    form:             obj.form,
+                    span:             obj.span,
+                    refused:          obj.refused,
+                };
+                new TypeAnnotation::Object(o)
             }
             TypeAnnotation::Array(arr) => {
                 const a: ArrayAnnotation* = new ArrayAnnotation {
@@ -556,6 +422,7 @@ implement enum TypeAnnotation {
                     base: TypeAnnotation::clone_ptr(gen.base),
                     args: new_args,
                     span: gen.span,
+                    refused: gen.refused,
                 };
                 new TypeAnnotation::Generic(g)
             }
@@ -694,6 +561,46 @@ type struct ReferenceAnnotation {
     span:       SourceSpan;
 }
 
+/// How a trait object holds the value behind it: `virtual &T` borrows it,
+/// `virtual mut &T` borrows it mutably, `virtual T*` points at it.
+type enum ObjectForm {
+    Borrowed;
+    MutableBorrowed;
+    Raw;
+}
+
+implement enum ObjectForm {
+    /// The form written around a trait's spelling `inner`.
+    spell(&this, inner: string) -> string {
+        return match (this) {
+            ObjectForm::Borrowed        => { fmt::format("virtual &%s", inner) }
+            ObjectForm::MutableBorrowed => { fmt::format("virtual mut &%s", inner) }
+            ObjectForm::Raw             => { fmt::format("virtual %s*", inner) }
+        };
+    }
+
+    /// The form's position, for an interning key.
+    index(&this) -> u64 {
+        return match (this) {
+            ObjectForm::Borrowed        => { 0 }
+            ObjectForm::MutableBorrowed => { 1 }
+            ObjectForm::Raw             => { 2 }
+        };
+    }
+}
+
+/// A trait object type, `virtual &Shape`: a value of any type implementing
+/// `trait_annotation`'s trait, reached through a table of its methods.
+/// `trait_annotation` is the trait's spelling, with its arguments.
+type struct ObjectAnnotation {
+    trait_annotation: TypeAnnotation*;
+    form:             ObjectForm;
+    span:             SourceSpan;
+    /// Set by the name layer when it refuses the object where it is
+    /// written (E0316), so nothing after reports it again.
+    refused:          boolean;
+}
+
 type struct ArrayAnnotation {
     element: TypeAnnotation*;
     size:    i64;
@@ -725,17 +632,15 @@ type struct GenericAnnotation {
     base: TypeAnnotation*;
     args: [TypeAnnotation*];
     span: SourceSpan;
+    /// Set where the name layer refused the number of arguments written,
+    /// so the annotation's failure to resolve is not reported again.
+    refused: boolean;
 }
 
-/// `typeof(expr)` used in type position (decltype-style); resolves to the
-/// static type of `operand`.
+/// `typeof(expr)` used in type position; resolves to the static type of
+/// `operand`.
 type struct TypeofAnnotation {
-    /// The operand expression, stored opaquely as `void*` (really an
-    /// `ExpressionNode*`).  The AST root module can't import
-    /// `compiler::ast::expression` without a module cycle, so the pointer is
-    /// kept untyped here; the parser stashes it and sema casts it back to
-    /// `ExpressionNode*` to resolve the operand's type.
-    operand:  void*;
+    operand:  ExpressionNode*;
     /// The operand's static type, cached by sema (which alone can resolve an
     /// expression's type, and only once the operand is in scope).  The
     /// TypeResolver returns this directly - it has no expression resolver of
@@ -826,24 +731,6 @@ type struct TraitRef {
     type_args: [TypeAnnotation*];
     span:      SourceSpan;
 
-    /// Deep copy into independently-owned arrays (SymbolStr and the
-    /// TypeAnnotation* handles are Copy), so a clone can be stored in a
-    /// second owner without aliasing this one's buffers.
-    ///
-    /// `resolved` IS copied: specializing an impl rewrites which types a
-    /// bound is applied to, never which trait the bound names, so the
-    /// template's identity is the clone's. Copying it also keeps the answer
-    /// pinned to the module that wrote the bound once the clone is re-visited
-    /// under a different module cursor.
-    clone(&this) -> TraitRef {
-        mut path_c: [SymbolStr] = [];
-        mut args_c: [TypeAnnotation*] = [];
-        for (mut i: i64 = 0; i < this.path.length; i++)      { path_c.push(this.path[i]); }
-        for (mut i: i64 = 0; i < this.type_args.length; i++) { args_c.push(this.type_args[i]); }
-        return TraitRef { path: path_c, resolved: this.resolved, refused: this.refused,
-                          type_args: args_c, span: this.span };
-    }
-
     /// The trait's identity.  One accessor so a consumer never re-derives it
     /// from `path`; its path, where text is wanted, is the definition
     /// table's `path_of`.
@@ -860,6 +747,26 @@ type struct TraitRef {
         return DefId::invalid();
     }
 
+}
+
+/// A deep copy into independently-owned arrays (SymbolStr and the
+/// TypeAnnotation* handles are Copy), so a clone can be stored in a second
+/// owner without aliasing this one's buffers.
+///
+/// `resolved` IS copied: specializing an impl rewrites which types a bound is
+/// applied to, never which trait the bound names, so the template's identity
+/// is the clone's. Copying it also keeps the answer pinned to the module that
+/// wrote the bound once the clone is re-visited under a different module
+/// cursor.
+implement trait Clone for struct TraitRef {
+    clone(&this) -> TraitRef {
+        mut path_c: [SymbolStr] = [];
+        mut args_c: [TypeAnnotation*] = [];
+        for (mut i: i64 = 0; i < this.path.length; i++)      { path_c.push(this.path[i]); }
+        for (mut i: i64 = 0; i < this.type_args.length; i++) { args_c.push(this.type_args[i]); }
+        return TraitRef { path: path_c, resolved: this.resolved, refused: this.refused,
+                          type_args: args_c, span: this.span };
+    }
 }
 
 /// A trait bound from a where clause (e.g., `where T: Default`,
@@ -893,21 +800,19 @@ type struct TraitBound {
     has_projection_subject(&this) -> boolean {
         return this.subject_type != null;
     }
+}
 
-    /// Deep copy; clones each (owning) TraitRef into an independent buffer so
-    /// the result can be stored in a second owner without a double-free. The
-    /// projection subject, if any, is null-safe cloned so the spec re-resolves
-    /// `Base::Member` against its substituted base.
+/// A deep copy: each (owning) TraitRef is cloned into an independent buffer,
+/// so the result can be stored in a second owner without a double-free.  The
+/// projection subject, if any, is null-safe cloned so the specialization
+/// re-resolves `Base::Member` against its substituted base.
+implement trait Clone for struct TraitBound {
     clone(&this) -> TraitBound {
-        mut refs_c: [TraitRef] = [];
-        for (mut i: i64 = 0; i < this.trait_refs.length; i++) {
-            refs_c.push(this.trait_refs[i].clone());
-        }
         return TraitBound {
             type_parameter: this.type_parameter,
             subject_sym:    this.subject_sym,
             subject_type:   TypeAnnotation::clone_ptr(this.subject_type),
-            trait_refs:     refs_c,
+            trait_refs:     this.trait_refs.clone(),
             span:           this.span,
         };
     }
@@ -971,11 +876,7 @@ type struct PatternLiteralString {
 }
 
 /// A nested sub-pattern element (`Some(Some(n))`, `Branch(Leaf(x), _)`).
-/// The pattern is stored opaquely as `void*` (really a
-/// `compiler::ast::pattern::PatternNode*`): the AST root module can't import
-/// the Pattern module without a cycle, so consumers (parser/sema/codegen)
-/// cast it back. Mirrors `TypeofAnnotation.operand`.
 type struct PatternSub {
-    pattern: void*;
+    pattern: Pattern*;
     span:    SourceSpan;
 }

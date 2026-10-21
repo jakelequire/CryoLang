@@ -81,7 +81,7 @@ or reads the store by identity.  Locked so far:
 | an enum type's variants (`EnumVariantInfo.name`) | `compiler/src/compiler/types/user_defined.cryo` | `member-variant` (`EnumType::variant_index`) | text for a message: `EnumVariantInfo::display_name` |
 | the declaration index's families and module globals (`overload_index`, `func_type_refs`, `refused_methods`, `overload_func_family`, `overload_func_mangled`, `module_global_leaves`, `module_global_extern_syms`, `extern_symbol_first`, `family_slot`) | `compiler/src/compiler/decl_index.cryo` | `member-function`, `member-global` | none |
 | the interner (`strings`, `lookup`) | `compiler/src/compiler/resolver/intern_table.cryo` | `intern` | `resolve`, `shown` |
-| a struct's or class's fields (`FieldInfo.name`) | `compiler/src/compiler/types/user_defined.cryo` | `member-field` (`StructType::field_position`, `ClassType::own_field_position`; `MemberResolver::field_of` asks them) | by position; the name sealed for a message or a synthesized node: `FieldInfo::decl_name` |
+| a struct's fields (`FieldInfo.name`) | `compiler/src/compiler/types/user_defined.cryo` | `member-field` (`StructType::field_position`; `MemberResolver::field_of` asks it) | by position; the name sealed for a message or a synthesized node: `FieldInfo::decl_name` |
 | the loader's namespace maps (`ModuleLoader.scanned_ns`, `ns_map`) | `compiler/src/compiler/module_loader.cryo` | `loader-path` | none |
 | the module graph's names (`ModuleInfo.name`, `namespace_name`; `ModuleGraph.name_index`, `module_defs`, `def_list`, `def_paths`) and each module's import list (`ModuleInfo.visible`) | `compiler/src/compiler/module_graph.cryo` | `module-by-path` | by identity: `ModuleInfo::path`, `namespace_path`, `declares_namespace`, `ModuleGraph::imports`; a body path's modules through `ModuleGraph::modules_written_as`; text for a message, a mangled symbol or a manifest entry through `ModulePath::decl_name`; a declaration's canonical name, `module::leaf`, composed by `ModulePath::qualified` and nowhere else |
 | the template registry's names (`TemplateEntry.name`) | `compiler/src/compiler/types/generic_registry.cryo` | none: the registry is asked by definition | text for a message: `TemplateEntry::display_name`; a mangled name is spelled from `leaf_name`, a `DeclName` |
@@ -91,15 +91,14 @@ or reads the store by identity.  Locked so far:
 |---|---|---|---|
 | `scope-value` | `Resolver::lookup_value` | `compiler/src/compiler/resolver/resolver.cryo` | bare identifier to its binding, value namespace |
 | `scope-type` | `Resolver::type_binding` | `compiler/src/compiler/resolver/resolver.cryo` | written type name, or a type path's first segment, to its binding in the writer's ribs; the name layer's `NameResolver::type_spelling_res` asks it and reads the binding's kind |
-| `scope-type` | `Resolver::type_res_in_scope` | `compiler/src/compiler/resolver/resolver.cryo` | written type name's leaf, type namespace, walking outward from an explicit scope: a module's own scope, or the scope enclosing a class whose base it names |
+| `scope-type` | `Resolver::type_res_in_scope` | `compiler/src/compiler/resolver/resolver.cryo` | written type name's leaf, type namespace, walking outward from an explicit scope: a module's own scope |
 | `member-function` | `DeclarationIndex::lookup_family_entries` | `compiler/src/compiler/decl_index.cryo` | member: a function or method family, by owner and leaf; a generic type's own methods under the template itself (`FamilyOwner::Template`) |
 | `member-export` | `Resolver::exports_named` | `compiler/src/compiler/resolver/resolver.cryo` | member: a module's public declarations, by the module and leaf, read off its export list |
 | `member-global` | `DeclarationIndex::global_in_module` | `compiler/src/compiler/decl_index.cryo` | member: a module's global, by the module and leaf |
 | `member-field` | `MemberResolver::field_of` | `compiler/src/compiler/sema/member_resolver.cryo` | member: a field, by owner type and leaf |
 | `member-field` | `StructType::field_position` | `compiler/src/compiler/types/user_defined.cryo` | member: a field of a struct in hand, by leaf, to its position among the struct's fields |
-| `member-field` | `ClassType::own_field_position` | `compiler/src/compiler/types/user_defined.cryo` | member: a field of a class in hand, by leaf, to its position among the class's own fields |
 | `member-variant` | `EnumType::variant_index` | `compiler/src/compiler/types/user_defined.cryo` | member: an enum variant, by owner type and leaf |
-| `member-variant` | `EnumDeclNode::variant_position` | `compiler/src/compiler/AST/declaration.cryo` | member: an enum variant, by the enum's declaration and leaf, to its position among the declared variants - for a constant folded off the declaration |
+| `member-variant` | `EnumDecl::variant_position` | `compiler/src/compiler/AST/declaration.cryo` | member: an enum variant, by the enum's declaration and leaf, to its position among the declared variants - for a constant folded off the declaration |
 | `trait-method` | `GenericRegistry::trait_item_slot` | `compiler/src/compiler/types/generic_registry.cryo` | member: a trait's declared method, by trait identity and leaf, to its position in the trait |
 | `assoc-type` | `TraitDeclNode::assoc_type_index` | `compiler/src/compiler/AST/declaration.cryo` | member: a trait's associated type, by the trait's declaration and leaf, to its position among the trait's associated types |
 | `module-by-path` | `ModuleGraph::module_named` | `compiler/src/compiler/module_graph.cryo` | written module path to its module |
@@ -111,7 +110,6 @@ or reads the store by identity.  Locked so far:
 | `primitive` | `ResBase::is_primitive_spelling` | `compiler/src/compiler/resolver/res.cryo` | the fixed primitive table |
 | `primitive` | `ResBase::primitive_of_alias` | `compiler/src/compiler/resolver/res.cryo` | the fixed primitive table: alias keywords |
 | `primitive` | `ResBase::primitive_position` | `compiler/src/compiler/resolver/res.cryo` | the fixed primitive table: a primitive's position, which its definition is kept under |
-| `primitive` | `SourceLoc::of_spelling` | `compiler/src/compiler/resolver/res.cryo` | the fixed table of source-location pseudo-constants (`FILE`, `LINE`), declared nowhere |
 | `lang-item` | `GenericRegistry::claim_wellknown` | `compiler/src/compiler/types/generic_registry.cryo` | the fixed language-item table |
 | `lang-item` | `LangModule::is_written` | `compiler/src/compiler/resolver/lang_item.cryo` | the fixed table of modules the compiler imports on a program's behalf: whether an import's written path names one (the prelude a file already globs) |
 | `lang-item` | `IntrinsicKind::from_name` | `compiler/src/compiler/intrinsic_kind.cryo` | the fixed intrinsic table: an `intrinsic function` declaration's name to the operation it lowers as |
@@ -133,6 +131,642 @@ caller of a door, or an identity lookup.
 Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
+
+### 2026-10-21
+
+501. **The class-removal plan is deleted now,** its slices all built and its
+     bridge table empty.  (Jake)
+
+502. **`docs/cryo.md` keeps no section on classes:** the section that
+     tabled each refused form is deleted, the sections after it are
+     renumbered, and every reference to them follows.  User-facing material
+     (the reference, the grammar, the guides, the editor grammar, the
+     release notes) reads as if Cryo never had classes; the E0117
+     refusal, the reserved keywords, the C++ binding generator's handling
+     of C++ classes, these rulings and the roadmap's history stay.  (Jake)
+
+503. **The roadmap marks class removal and borrowed trait objects built,**
+     and lists what is left for trait objects: owning boxes, upcasting,
+     and generic implementations as objects.  (Jake)
+
+504. **Rulings 249, 253, 258, 291, 294, 295 and 303 are superseded by
+     ruling 465:** each governed a class feature that no longer exists.
+     (Jake)
+
+505. **The E0306 help for an object does not tell the user to implement
+     the trait for the object,** since no implementation can be written
+     for one: it says to use a type that implements the trait, or an
+     object of a trait whose methods a table can hold.  An object whose
+     trait does not reach the bound is told the same first half, and that
+     an object implements only its own trait and that trait's
+     supertraits; the wording was left to the implementer.  (Jake)
+
+506. **The release notes' 1.0.0 entry has a Trait objects bullet,**
+     describing them as built.  (Jake)
+
+507. **`legacy/` is left as it is.**  (Jake)
+
+### 2026-10-20
+
+465. **The removed class syntax is refused with E0117,** "`<form>` is not
+     part of Cryo", with one help line per form: `type class` - declare a
+     struct and implement a trait; a base list - hold the shared part in a
+     field, its methods in a trait; `virtual` / `override` - declare the
+     method in a trait and implement it; `protected:` - `private:` or
+     `public:`; a base-constructor initializer - build the shared field in
+     the factory; `implement class` - `implement struct`; a constructor - a
+     `static new` factory; a destructor - implement `Drop`.  (Jake)
+
+466. **`()` is only the unit value:** it is not a null pointer, and `()`
+     used where a pointer is wanted is a type error.  (Jake)
+
+467. **Assigning an array to an array of a different element type is
+     refused.**  (Jake)
+
+468. **`This::missing()` in a trait's default body, and `T::missing()` in a
+     generic function, are refused at the trait or the function itself,**
+     even when nothing implements the trait or calls the function.  (Jake)
+
+469. **Node type names stay unabbreviated** (`ExpressionNode`, not
+     `Expr`): names in the compiler are written out in full, as the keyword
+     is `implement` and not a shortening of it.  (Jake)
+
+470. **A test of the class feature is deleted with the feature, not ported
+     to a struct,** including one that used a class only incidentally; this
+     replaces ruling 386's porting of incidental ones.  (Jake)
+
+471. **What the deleted class tests alone covered gets fresh struct
+     tests,** written for structs rather than ported: a second explicit
+     `.drop()` of one binding refused (E0452), `p as A` with `p: A*`
+     refused (E0208), and `new T[n]` taking its block from `Allocate` with
+     `delete` running `Drop` before `release`.  (Jake)
+
+472. **The work-in-progress stash of the class deletion is dropped,** its
+     content being committed.  (Jake)
+
+473. **The trait-object refusals keep their wording as written:** E0316's
+     "`Circle` is not a trait, so `virtual &Circle` is not a trait object"
+     and "`virtual &Shape` is a trait object, which an `extern` function
+     `f` cannot take or return"; a field read on an object, "no field
+     `width` on `virtual &Shape`: a trait object has no fields"; `delete`
+     of an object, "`delete` takes a pointer, and `virtual Shape*` is a
+     trait object".  (Jake)
+
+474. **E0313's note reads "a trait object is written `virtual &Shape` or
+     `virtual Shape*`",** the object type being built.  (Jake)
+
+475. **An object type mangles as a generic over a reserved full name per
+     form,** `VirtualRef`, `VirtualMutRef` and `VirtualPtr`, with the trait
+     first, as `Optional` and tuples are encoded; no new type prefix
+     letter.  (Jake)
+
+476. **A method call on a function- or tuple-typed value, a field read on a
+     function-typed one, and `delete` of an operand that is not a pointer
+     are refused in sema,** each fixed on its own before calls through
+     objects are built.  (Jake)
+
+477. **E0315's wording stays as built:** "`Square` does not implement
+     `Shape`, so `&Square` cannot become `virtual &Shape`", and its forms
+     for a generic implementation and a type parameter.  (Jake)
+
+478. **The other trait-object messages stay as built:** "`delete` takes a
+     pointer, and `i32` is not a pointer"; a borrowed object "does not
+     compare"; a `virtual T*` "compares only with `null`".  (Jake)
+
+479. **`virtual mut &T` accepts either reference for now,** as a `mut &T`
+     parameter does.  Reference mutability is enforced for every form
+     together when `&this` becomes read-only, in the slice and API pass.
+     (Jake)
+
+480. **A trait-object table is emitted on demand,** only for an
+     implementation some conversion in the build names.  (Jake)
+
+481. **A table's drop word is the full release code for the type,**
+     the type's own `Drop::drop` and the release of every field it owns,
+     settled before the ABI freezes so that owning boxes after v1.0 need no
+     change to the table.  (Jake)
+
+482. **A table demangles as `<vtable for Main::Shape for Main::Circle>`.**
+     (Jake)
+
+483. **E0314 keeps its wording,** "`consume` cannot be called through
+     `virtual &Shape`", with the reason as a note: the method is static,
+     takes `this` by value, has type parameters of its own, or names
+     `This` in a parameter or its return.  (Jake)
+
+484. **The two interim E0358 notes stay until their cases are built,** a
+     supertrait's method through an object and a call through a reference
+     or pointer to an object (`r: &virtual &Shape; r.area()`), both built
+     with the supertrait step; each note is removed in the commit that
+     makes its case work.  (Jake)
+
+485. **The release function keeps the internal name
+     `__cryo.release.<table symbol>`,** outside the mangling grammar, until
+     backtrace symbolization lands.  (Jake)
+
+486. **E0315's supertrait form keeps its wording,** "`Square` does not
+     implement `Named`, which `Shape` requires, so `&Square` cannot become
+     `virtual &Shape`".  (Jake)
+
+487. **The interim E0315 for an object whose trait's supertrait takes type
+     arguments stays until trait arguments are built,** and is removed in
+     the commit that builds them.  (Jake)
+
+488. **E0307's count of written type arguments agrees in number,** "1 type
+     argument is written", at every site that reports it.  (Jake)
+
+489. **Type arguments written on a call of an ordinary method that takes
+     none are refused with E0307,** as on a call through an object.  (Jake)
+
+490. **Implementing a subtrait without implementing each of its
+     supertraits is refused where the `implement` block is written,** in
+     words that agree with E0315's supertrait form.  (Jake)
+
+491. **E0307 for the count of an object's type arguments keeps its
+     wording,** "`Iterator` takes 1 type argument in an object type, and 0
+     are written", with the note naming the parameters and associated types
+     in declaration order.  (Delegated)
+
+492. **E0314 keeps its note for an associated type an object leaves
+     unbound,** "its signature names an associated type of `Pick` that
+     `virtual &Twice` does not bind".  (Delegated)
+
+493. **Implementing a subtrait without its supertrait keeps code E0312 and
+     its wording,** "`Square` does not implement `Base`, which `Shape`
+     requires, so `Square` cannot implement `Shape`".  (Delegated)
+
+494. **A shared object `virtual &Bar` satisfies a bound of a trait with a
+     `mut &this` method,** as a call of that method through `virtual &Bar`
+     is accepted; mutability through a reference is enforced for every
+     form together, when `&this` becomes read-only (ruling 479).
+     (Delegated)
+
+495. **The two defects that keep `map` and `filter` from being called on a
+     receiver known only by its bound in a generic body are fixed first,
+     each in its own change,** and trait-object defaults then land with
+     `map` and `filter` through an object in their run test.  (Delegated)
+
+496. **The implementation the compiler makes for an object (its defaults
+     for `virtual mut &Iterator<i32>`, and so on) has one definition per
+     (trait, object type),** registered in the declaration index under the
+     trait, as a specialization is under its template.  Its methods are
+     placed and linked by the rule every generic instance follows: emitted
+     in the module that owns the first named type among the instance's
+     arguments, else in the template's module - for an object, the
+     trait's, compiled within the build - with `weak_odr` linkage in a
+     COMDAT of its own symbol, which names no requesting module.  A copy
+     the prebuilt standard library also holds folds into one at link.  The
+     same rule, not a new one, so objects add no placement case.
+     (Delegated)
+
+497. **The four open bug reports about class features (an override left
+     unchecked, a missing table slot, slots matched by name, a delete
+     through a base pointer skipping the derived drop) are closed as
+     moot:** the features they describe no longer exist.
+
+498. **The bridge table in the class-removal plan is emptied:** the two
+     rows for the per-kind node accessors, which were ruled to stay
+     (460), and the two rows naming code that is gone are struck, so the
+     final audit's check that the table is empty holds.
+
+499. **A generic type written with the wrong number of type arguments
+     (`Box<i32, i64>` for `Box<T>`), and a call of a generic method writing
+     more type arguments than the method has type parameters, are refused
+     with E0307 in its existing wording,** "`Box` has 1 type parameter,
+     and 2 type arguments are written".
+
+500. **The E0306 note shown when an object cannot satisfy a bound of its
+     own trait names the method that blocks it and why, in full words,**
+     in the form of E0314's reason notes; the wording was left to the
+     implementer.  (Delegated)
+
+462. **A path through a bounded type parameter naming a member no bound
+     declares (`T::missing()` in a generic function that is instantiated)
+     is refused with a diagnostic where it is written,** not left for
+     code generation to report as an internal error; a method argument
+     the body's copies cannot bind is fixed beside it.  (Delegated)
+
+463. **`Allocate` implemented for a generic struct is fixed before the
+     class feature is deleted:** `new Cell<i32> { .. }` uses the
+     instance's allocator and links.  (Delegated)
+
+464. **`Display` is not adopted in the compiler for now:** it formats
+     through C strings, and the compiler keeps its `to_string` methods as
+     the plan records.  (Delegated)
+
+460. **The per-kind node projections stay as checked accessors**
+     (`ExpressionNode::call_of`, `DeclarationNode::fn_of` and the rest):
+     each answers its kind's payload or null, and a read through one is
+     not rewritten as a `match` arm.  (Delegated)
+
+461. **`DeclarationNode` and its subclass `ClassDeclNode` stay classes
+     until the class feature is deleted,** as ruling 413 has it; they are
+     converted when that deletion starts, not before.  (Delegated)
+
+### 2026-10-19
+
+452. **Indexing a call's fixed-size array result (`pair()[1]`) and an
+     `Array` whose elements are fixed-size arrays are fixed after the
+     expressions finish converting to payloads,** not before: both fail at
+     LLVM verification on the parent compiler too, and neither blocks the
+     conversion.  (Delegated)
+
+453. **An array literal whose elements are all literals adapts to the type
+     another argument fixes, as a single literal does:**
+     `count_eq([1, 2], an_i64)` with `count_eq<T>(xs: [T], y: T)` compiles
+     with `T = i64`.  Built as its own change after the expressions finish
+     converting to payloads.  (Delegated)
+
+454. **A variable a lambda captures is not reported unused, and `await` in a
+     function that is not `async` is a diagnostic at the `await` rather than
+     an internal error;** both are fixed after the expressions finish
+     converting to payloads, beside the two fixed-size-array defects of
+     ruling 452.  (Delegated)
+
+455. **`This` names the self type wherever there is one:** `This::member`
+     resolves inside a generic struct's own body and inside a trait impl
+     as it does inside a non-generic struct's body.  Refusing it there
+     (E0203) is a defect, fixed after the expressions finish converting to
+     payloads, with the defects of rulings 452 and 454.  (Jake)
+
+456. **The expression codemod (`scripts/expr-kind-codemod.py`) is kept
+     through the member-access and call conversions,** and deleted in the
+     first change after the call conversion lands.  (Jake)
+
+457. **Code a change leaves dead is deleted in that same change,** even
+     when the work is otherwise cut one kind per commit: the call
+     conversion deleting `ExprKind::Legacy`, which it orphaned, was right.
+     (Jake)
+
+458. **`This::member` inside a trait's own default body is covered by
+     ruling 455:** it resolves against the trait's members, and each
+     implementation's copy of the default reads `This` as the implementing
+     type.  Fixed as a change of its own after the "any node" handle
+     lands.  (Delegated)
+
+459. **`await` outside an `async` body keeps E0600 and its wording**
+     ("`await` is only allowed in the body of an `async` function or
+     method"), the spec table's code for a misplaced `await`.  (Delegated)
+
+### 2026-10-18
+
+438. **A `Location` constant keeps its pointers, and the growth of the
+     position-independent Linux pin from relocating them is accepted for
+     now.**  Making a `Location` relocation-free (offsets instead of
+     pointers, an ABI change for the panic funnel and the check handlers)
+     or linking the Linux pin as a fixed-address executable is not decided.
+     (Dispatch, delegated)
+
+439. **A `match` arm on a declaration's shape binds the payload in its
+     pattern** (`DeclKind::Function(f) =>`) instead of projecting the
+     matched node a second time inside the arm; the change compiles every
+     program to the same output.  (Dispatch, delegated)
+
+440. **A pointer argument is judged the same way at every kind of call.**
+     A free function, a static function, a function reached by its path, a
+     generic one and a class constructor refuse a pointer to a type the
+     parameter's pointer does not convert from without a cast, as a method
+     call does; an `if` or conditional expression with a `null` arm has its
+     other arm's type, so a `null` first arm does not let an unrelated
+     pointer through.  Existing code the check refuses is fixed first, then
+     the check lands, with compile-fail tests proved against the parent.
+
+441. **A function signature sees an alias's target.**  Alias targets are
+     recorded at the start of the signature pass, so a parameter or return
+     type written as an alias is the type it names (a call through a
+     function-type alias, an operator on an alias-typed call result).  Two
+     overloads that differ only by an alias and its target have one
+     signature and are refused (E0206).
+
+442. **A Linux-hosted cross build to windows-gnu links with clang and lld
+     by default,** as the pin does; `CRYO_CC` still overrides the driver.
+
+443. **A thread-local's initializer is static data or it is refused.**
+     First, struct literals nested in a global's initializer (in a struct
+     or an array) fold into static data too; then a `![thread_local]`
+     whose initializer still cannot fold is refused with its own error
+     code.
+
+444. **A struct literal through a generic alias keeps the E0233 wording**
+     ("cannot build a `K` literal: `K` is a generic type alias, and a
+     struct literal through one is not supported").
+
+445. **A struct literal whose type name is refused has the error type,**
+     not `void`, so nothing that uses its value reports a second error.
+
+446. **A pointer converts only to a pointer at the same type.**  A pointer
+     to a type that merely converts to the wanted pointee (`i32*` for
+     `i64*`, `f32*` for `f64*`, `i32**` for `i64**` or `void**`) is
+     refused wherever it meets a declared type and at every kind of call,
+     a method call and a value bound to a pointer parameter by its address
+     included.  What stays implicit is what the language already states:
+     the same pointee, `const` added, `void*` on either side, `null`, and a
+     class to its base.  Existing code the check refuses is fixed first,
+     then the check lands with compile-fail tests proved against the
+     parent.
+
+447. **A thread-local whose initializer cannot fold keeps the E0646
+     wording** ("thread-local `x` is initialized by a value computed at
+     program start").
+
+448. **The libc bindings are aligned with their C headers later,** at low
+     priority (`void*` and `char*` where C has them, not `u8*`); recorded
+     in the roadmap, not done with the pointer check.
+
+449. **A generic call whose type parameter only an array literal argument
+     fixes is inferred from the literal's element type** (`generic_len([true,
+     false])` for `generic_len<T>(xs: [T])` binds `T = boolean`), fixed as a
+     unit of its own after the value-producing control forms convert, with a
+     project the parent compiler fails.
+
+450. **`()` is a value.**  `const unit: () = ();` being refused ("expected
+     `()`, found `void*`") is a defect, logged with a repro and fixed only if
+     the fix turns out trivial and safe.
+
+451. **A literal is built by one factory,** `ExpressionNode::literal(value,
+     kind, span)`, not one per literal kind.
+
+### 2026-10-17
+
+405. **A `return` inside an await-free `unsafe` block or `static match`
+     arm of an `async function` compiles,** fixed in its own change ahead
+     of the remaining declaration kinds: every walk of the async lowering
+     descends into both forms as it does into a block or a `match` arm.
+     (Dispatch, delegated)
+
+406. **`intrinsic const` is left as it is, parked for Jake:** reading one
+     emits invalid IR, nothing is built on the form, and it is neither
+     deleted nor given a value source until he decides.  (Dispatch,
+     delegated)
+
+407. **The error code for the removed class syntax (ruling 388) and the
+     trait-object symbol spelling (ruling 391) are chosen by whoever
+     implements those slices,** and reported.  How verify treats a moved
+     project object is likewise the implementer's call if it blocks the
+     work, and otherwise stays as it is.  (Dispatch, delegated)
+
+408. **A `break` or `continue` inside an `unsafe` block or a `static
+     match` arm that leaves a loop containing an `await` stays refused
+     with E0600,** as built; the edge is not lowered.  (Dispatch,
+     delegated)
+
+409. **The generic registry records each template's kind as a kind of its
+     own** (`TemplateKind`: function, struct, union, class, enum, trait,
+     type alias) rather than the declaration's `NodeKind`, converted in a
+     change of its own that moves no compiled output, before any type
+     declaration converts to a payload.  (Dispatch, delegated)
+
+410. **The cloner's uncopied fields on intrinsics, imports and extern
+     blocks are low priority:** how often each of those kinds is cloned is
+     counted first; if any is, every field is copied and a test added; if
+     none is, that is recorded and the defect stays open.  (Dispatch,
+     delegated)
+
+411. **The three places a type alias is not transparent** - calling a
+     value typed by a function-type alias, an operator on a call returning
+     an alias, and a struct literal through a generic alias - are fixed as
+     one change after every declaration kind but classes has converted to
+     a payload, not before.  (Dispatch, delegated)
+
+412. **A comparison between unrelated types is refused with E0200:** two
+     values of different enum types, or two pointers neither of which
+     converts to the other (pointers to unrelated structs among them).
+     Built as a change of its own, with a compile-fail test for each.
+     (Jake)
+
+413. **Class declarations are not converted to a declaration payload:** the
+     class feature is deleted outright, so a class stays a subclass behind
+     the declaration bridge until then.  (Jake)
+
+414. **`intrinsic const` is replaced by the declared intrinsic function
+     `location() -> Location`** in `std::core::intrinsics`.  A call
+     evaluates to its own place - file, line, column and the readable
+     qualified name of the enclosing function - and in a
+     `![caller_location]` body to its caller's, the same `Location` that
+     function is passed.  `FILE` and `LINE` migrate to it and are
+     deleted; the `intrinsic const` form is deleted and the parser
+     refuses it.  `Location` is read-only to programs: the standard
+     library's visibility pass closes construction.  (Jake)
+
+415. **Borrowed trait objects are built after the class feature is
+     deleted,** not before it as ruling 384 had it.  The table emission
+     copies the few dozen lines of the class vtable code it needs rather
+     than sharing code with the class path, which is deleted.  (Jake, on
+     the trait-object audit)
+
+416. **A trait object's type is a type kind of its own,** not a pointer or
+     reference to a trait.  (Jake, on the trait-object audit)
+
+417. **A method is callable on a trait object only if `This`, the
+     concrete type, appears in its signature as the receiver alone.**  Any
+     other use of `This` - a parameter, a return, a type argument - makes
+     that method unavailable on the object; the trait is still usable as an
+     object through its other methods.  (Jake, on the trait-object audit)
+
+418. **Every trait-object table starts with three reserved words: drop,
+     size and alignment,** before any method slot, so owning boxes after
+     v1.0 need no change to the table's shape.  (Jake, on the trait-object
+     audit)
+
+419. **A table holds the supertraits' slots first,** then the trait's own
+     methods.  (Jake, on the trait-object audit)
+
+420. **A table is emitted in the module that holds the implementation** of
+     the trait for the type.  (Jake, on the trait-object audit)
+
+421. **The trait-object codes and symbol:** E0314, a method unavailable on
+     an object; E0315, a conversion to an object whose type does not
+     implement the trait, or implements it generically; E0316, `virtual`
+     written on something that is not a trait, or an object in an
+     `extern` signature.  A table's symbol is `C$vt$<trait>$f<type>`.
+     (Jake, on the trait-object audit)
+
+422. **A trait's associated types are bound positionally in an object
+     type,** as type arguments in declaration order: `virtual mut
+     &Iterator<i32>`.  (Jake, on the trait-object audit)
+
+423. **Printing goes through objects by a non-generic formatting method**
+     taking a `virtual mut &FmtWrite` formatter, added in the standard
+     library's visibility pass.  (Jake, on the trait-object audit)
+
+424. **A trait that declares two methods with the same name is refused**
+     where the trait is declared.  (Jake, on the trait-object audit)
+
+425. **Converting a value whose trait implementation is generic to an
+     object is deferred,** and revisited before the language freeze.
+     (Jake, on the trait-object audit)
+
+426. **A raw object pointer `virtual T*` accepts `null` and compares only
+     with `== null` and `!= null`;** a borrowed object never compares.
+     (Jake, on the trait-object audit)
+
+427. **A trait object satisfies its own trait wherever the trait is
+     required.**  The compiler makes the implementation: a method without a
+     default calls through the table, and a default method is compiled
+     with `This` as the object type.  (Jake, on the trait-object audit)
+
+428. **The concrete type behind `implement Trait` in type position is
+     hidden:** only the trait's methods are visible through it.  Built in
+     the slice and API pass before v1.0.  (Jake, on the trait-object audit)
+
+429. **A function's `-> implement Trait` promise is checked at the
+     function itself,** not at its callers.  Built in the slice and API
+     pass.  (Jake, on the trait-object audit)
+
+430. **`implement Trait` in a parameter, a field, an alias or a type
+     argument is refused with a message of its own** suggesting a bounded
+     type parameter or `virtual &Trait`, instead of an unrelated error or
+     `void`.  Built in the slice and API pass.  (Jake, on the trait-object
+     audit)
+
+431. **`panic` takes a `Location` instead of separate file and line
+     arguments,** so the column and the function name reach the panic
+     message.  Built as a change of its own with a pin refresh.  (Jake, on
+     class-removal session 9's questions)
+
+432. **`Location.function` is the full qualified path of the function**
+     (`App::Main::Probe::own`); a lambda, closure or async body is named for
+     the function it is written in, a specialization for its generic.
+     (Jake, on class-removal session 9's questions)
+
+433. **The unrelated-types refusal (E0200, ruling 412) applies to every
+     comparison operator,** not only `==` and `!=`, as built.  (Jake, on
+     class-removal session 9's questions)
+
+434. **The Windows pin is linked so that it carries no base relocation
+     over a thread-local's offset,** and a gate scans the built binary for
+     one so the defect cannot come back silently.  Fixed in the pin build,
+     as a change of its own, proven by the gate refusing the old pin and
+     passing the fixed one, and by the fixed pin printing a deliberate
+     panic's report.  (Jake, on class-removal session 10's questions)
+
+435. **`null` and string literals in a global's initializer fold into
+     static data,** so a thread-local initialized by a struct literal holding
+     them is not written by a startup constructor on the main thread only.
+     Whether a thread-local whose initializer still cannot be folded is
+     refused is NOT decided.  (Jake, on class-removal session 10's
+     questions)
+
+436. **The runtime panic entry point is named `__cryo_panic` again** (it was
+     `__cryo_panic_at` while the old symbol lived beside it), through the
+     two-step pin refresh.  (Jake, on class-removal session 10's questions)
+
+437. **The panic report keeps the form `panicked at
+     <file>:<line>:<column> in <function>: <msg>`.**  (Jake, on
+     class-removal session 10's questions)
+
+### 2026-10-16
+
+379. **A fixed-size array does not convert implicitly to a dynamic `[T]`:**
+     `const d: [i32] = buf;` with `buf: [i32; 3]` stays refused with E0200.
+     (Dispatch, delegated)
+
+380. **The demangler prints the full `Array<...>` type a `[T]` symbol
+     names** - `std::collections::array::Array<i64,
+     std::alloc::allocator::GlobalAlloc>` - rather than sugaring it back to
+     `[i64]`.  (Dispatch, delegated)
+
+381. **A call-site argument error spells a dynamic array `[T]`;** only
+     declaration-site text follows the written spelling (ruling 369).
+     (Dispatch, delegated)
+
+382. **An AST node is a header struct of the fields every kind shares plus
+     a `kind` enum of pointers to per-kind structs** (`Expr { span, ...,
+     kind: ExprKind }`), not a bare enum value as the handle: identity stays
+     the address, an absent child stays `null`, and the header is a field.
+     (Jake)
+
+383. **Each node struct carries its own small `Allocate` implementation**
+     over the AST arena, about 75 of them, rather than factories that
+     allocate from the arena directly.  (Jake)
+
+384. **Borrowed trait objects are built inside the class removal:** after
+     the compiler is free of classes and before the class feature is
+     deleted, reusing the class vtable emission rather than deleting and
+     rewriting it.  (Jake)
+
+385. **Declarations and expressions convert kind by kind under a temporary
+     bridge variant; patterns and statements convert all at once.**  The
+     bridge is temporary in fact: each category ends with its bridge
+     deleted, every bridge piece is tracked until it is, and the final
+     audit finds none left.  (Jake)
+
+386. **Tests of the class feature are deleted with it; tests that use a
+     class incidentally are ported to structs.**  (Jake)
+
+387. **Constructors and destructors written in a struct body are removed
+     along with classes;** a struct is built by a `static` factory and
+     released by `Drop`.  Their use is measured before they go.  (Jake)
+
+388. **The removed class syntax is refused with one new error code,** with
+     a help line per form saying what to write instead.  (Jake)
+
+389. **The visitors' side channels become return values in a commit of
+     their own,** after the dispatch change and apart from it.  (Jake)
+
+390. **`TypeKind` is derived from the type's data as a follow-up** to the
+     type conversion, not in it.  (Jake)
+
+391. **The trait-object error codes and the vtable symbol's spelling are
+     chosen by the implementation** and reported.  (Jake)
+
+392. **The language server's yield hook becomes a `virtual YieldHook*`**
+     once trait objects exist, as the compiler's own use of them.  (Jake)
+
+393. **A supertrait's methods are callable directly on a subtrait
+     object;** the subtrait's table holds the supertrait's slots.  (Jake)
+
+394. **`protected` is removed** with classes.  (Jake)
+
+395. **`![caller_location]` on a variadic function or method is refused
+     (E0151)** where the directive is written.  The hidden location
+     follows the written arguments, and a variadic call's written
+     arguments have no fixed end.  (Dispatch, delegated)
+
+396. **`delete p` releases `*p` as a scope exit releases a value of the
+     pointee type:** its `Drop`, if it has one, then the values its fields
+     own; then the storage is returned.  (Dispatch, delegated)
+
+397. **A struct's or union's own methods, static and instance, are written
+     inline in its body.**  An `implement` block is for implementing a trait
+     on a type, for an enum's methods (an enum body holds only variants),
+     and for the cases the language requires one.  A type whose methods
+     are split across several files (the parser's `Parser`) keeps
+     `implement struct` blocks in the other files, rather than growing one
+     huge file; the methods in its own file are inline.  A bound only some
+     methods need is a `where` on those methods, which works inline on a
+     generic struct.  (Jake)
+
+398. **A `match` whose arms test constants dispatches through one
+     `switch`,** built as its own change ahead of deriving `TypeKind`
+     (ruling 390), which then follows.  Every object with such a `match`
+     moves, so verify is re-baselined on it.  (Jake)
+
+399. **A method's name read as a field is refused by the type check with
+     E0204,** with a help line naming the call: "`kind` is a method; call
+     it: `t.kind()`".  (Jake)
+
+400. **The stamp checker's planting test switch plants a name of any
+     kind,** not only an identifier, and the enum-pattern check has a
+     committed test through it.  (Jake)
+
+401. **`??` and `for` accept only the language's `Option`;** a program's
+     own enum spelled like it is refused (E0200).  (Jake)
+
+402. **Statements convert as the class-removal plan designs them,** with
+     the node split's memory cost (about 3% of the arena) accepted.
+     (Jake)
+
+403. **`Type` keeps its stored `kind` field.**  Deriving it from the
+     payload (ruling 390) waits until the compiler itself is built with
+     LLVM optimisation, which folds a `match` yielding constants into a
+     table load; built unoptimised, the derived read measured 5.5% slower
+     with `![inline]`.  The roadmap carries the two steps.  (Jake)
+
+404. **A method's name read as a field is fixed by a suggestion showing
+     the corrected line** (`t.kind()` under the source line), with no
+     separate plain help line.  This settles the wording ruling 399 left
+     open.  (Jake)
 
 ### 2026-10-15
 
@@ -358,7 +992,7 @@ yet is recorded with the change that builds it, not here.
      not a type", with the `virtual &Shape` note and the
      bounded-type-parameter help.  (Dispatch, delegated)
 
-303. **Ruling 294 stays as built:** no class with a base class may
+303. *Superseded by ruling 465.* **Ruling 294 stays as built:** no class with a base class may
      implement `Allocate`.  (Dispatch, delegated)
 
 304. **A bare trait used as a value type (`p: Shape`) is refused with E0313
@@ -502,7 +1136,7 @@ yet is recorded with the change that builds it, not here.
      but a `boolean` converts to `boolean`, so a test on a float is
      written `x != 0.0`.  (Jake)
 
-249. **Allocation goes through a trait.**  `new T(...)` is sugar for an
+249. *Superseded by ruling 465.* **Allocation goes through a trait.**  `new T(...)` is sugar for an
      `Allocate` trait, as `a[i]` is for `Index` and `*p` for `Deref`.  A
      class that implements `Allocate` gets its memory from it, and its
      subclasses inherit it: the nearest ancestor's implementation wins.
@@ -530,7 +1164,7 @@ yet is recorded with the change that builds it, not here.
      each refused, under an error code of their own.  A method the trait
      gives a default body is not missing.  (Jake)
 
-253. **Casting a class value to a pointer (`av as void*`) is refused;**
+253. *Superseded by ruling 465.* **Casting a class value to a pointer (`av as void*`) is refused;**
      the address is written `&av`.  (Jake)
 
 254. **A type alias reaches its type's static methods:** with `type PI =
@@ -548,7 +1182,7 @@ yet is recorded with the change that builds it, not here.
 257. **A struct may implement `Allocate`;** with no inheritance, only that
      struct's own `new` goes through it.  (Jake)
 
-258. **Casting a class value up or down its hierarchy stays refused;**
+258. *Superseded by ruling 465.* **Casting a class value up or down its hierarchy stays refused;**
      casting a pointer along the hierarchy is allowed.  (Jake)
 
 259. **The ledger's status rows go with it,** the ones expecting zero
@@ -661,7 +1295,7 @@ yet is recorded with the change that builds it, not here.
 290. **The class removal converts the AST straight to enums and `match`.**
      (Jake)
 
-291. **The known class defects are left alone, since classes are going:**
+291. *Superseded by ruling 465.* **The known class defects are left alone, since classes are going:**
      `override` is not checked, a missing vtable slot is not reported, and
      vtable slots are matched by name.  (Jake)
 
@@ -675,12 +1309,12 @@ yet is recorded with the change that builds it, not here.
      return value is refused (E0458),** where it compiled and crashed.
      Supporting it is roadmap work.  (Jake)
 
-294. **`Allocate` on a class whose base class gets its memory from another
+294. *Superseded by ruling 465.* **`Allocate` on a class whose base class gets its memory from another
      allocator is refused,** so `delete` through a base pointer never
      releases through an allocator that did not hand out the memory.
      (Jake)
 
-295. **`delete` through a base-class pointer runs the static type's `Drop`,
+295. *Superseded by ruling 465.* **`delete` through a base-class pointer runs the static type's `Drop`,
      not the derived class's.**  The spec says so; it is not fixed, since
      classes are going.  (Jake)
 
@@ -1786,7 +2420,7 @@ check is being deleted and the seals are what hold.  (Jake)
     ```
 
 64. **Brace exports restrict**: `export A::{ a };` exposes `a` and nothing
-    else of `A`, as `docs/cryo.md` section 14.5 says. The compiler is
+    else of `A`, as `docs/cryo.md` section 13.5 says. The compiler is
     fixed to match, with the breakage measured first.
 
 65. **A local declaration and an import of the same name in the same

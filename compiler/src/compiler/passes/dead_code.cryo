@@ -26,8 +26,7 @@
 ///!     methods each call site names - its pin, and the definition a call in
 ///!     a generic body records (operator overloads included, via their
 ///!     `desugared_call`); free-function usage from the resolution map.  Entry
-///!     points (`main`, `![entry]`), tests, trait-impl methods,
-///!     constructors/destructors, virtual/override methods, generic templates,
+///!     points (`main`, `![entry]`), tests, trait-impl methods, generic templates,
 ///!     mono specializations, and `![symbol(...)]` link-named functions are
 ///!     never flagged.  STATIC methods are also skipped: a static call pinned
 ///!     to a family (`CalleePin::Family`) names no one method, so the harvest
@@ -52,7 +51,7 @@ import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, source_span };
 import compiler::ast;
 import compiler::ast::{
-    declaration, expression, node, NodeKind, pattern, statement, Visibility
+    declaration, expression, node, pattern, statement, Visibility
 };
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
@@ -64,29 +63,43 @@ import std::collections::hashmap;
 import std::collections::hashmap::{ HashMap };
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, DestructureDeclNode, FunctionDeclNode, ImplBlockNode,
-    MethodNode, StructDeclNode, TraitDeclNode, UnionDeclNode, VarDeclNode
+    DeclarationNode, DeclKind, FunctionDecl, ImplBlock,
+    MethodDecl, StructDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
-    ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode, CallExprNode,
-    CastExprNode, DeleteExprNode, ExpressionNode, IfExprNode, LambdaExprNode,
-    MatchExprNode, MemberAccessNode, NewExprNode, StaticMatchExprNode, StructLiteralNode,
-    TernaryExprNode, TryExprNode, TupleLiteralNode, TypeofExprNode, UnaryExprNode,
-    YieldExprNode
+    CallExpr,
+    ExprKind, ExpressionNode, LambdaExpr,
+    MemberAccessExpr
 };
-import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::walk::{ Walk };
+import compiler::ast::node::{ ProgramNode };
 import compiler::ast::pattern::{ MatchArmNode, StaticMatchArmNode };
-import compiler::ast::statement::{
-    BlockStmtNode, DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode,
-    LoopStmtNode, MatchStmtNode, ReturnStmtNode, StatementNode, StaticMatchStmtNode,
-    UnsafeBlockStmtNode, WhileStmtNode
-};
+import compiler::ast::statement::{ BlockStmt, DeclStmt, Stmt, StmtKind };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::resolution_map::{ ResolutionMap };
 import compiler::resolver::resolver::{ Resolver };
 import compiler::decl_index::{ OverloadId };
 import utils::keyword::{ Keyword };
+
+
+/// The bodies of the lambdas written in a body that capture nothing, nested
+/// ones included.  Such a lambda becomes no declaration, so the lints reach
+/// its body only where it is written.  A capturing lambda's body becomes its
+/// closure's `__call__`, which is checked as a method, so it is not collected
+/// here: it would be checked twice, and only the sink's dropping of repeated
+/// diagnostics would keep its warnings from showing twice.
+type struct NonCapturingLambdaBodies {
+    bodies: [Stmt*];
+}
+
+implement trait Walk for struct NonCapturingLambdaBodies {
+    walk_lambda(mut &this, e: ExpressionNode*, n: LambdaExpr*) -> void {
+        if (n.captured_names.length > 0) { return; }
+        if (n.body != null) { this.bodies.push(n.body); }
+        LambdaExpr::walk_children(n, this);
+    }
+}
 
 
 type struct DeadCodeChecker {
@@ -111,7 +124,7 @@ type struct DeadCodeChecker {
     /// references are present in `used`.  W0001 (unused local) is only sound
     /// when this holds.  It is FALSE for trait *default* method bodies - the
     /// resolver declares trait methods "as signatures only" (see
-    /// visit(TraitDeclNode)) and never resolves their bodies - and for mono
+    /// visit(TraitDecl)) and never resolves their bodies - and for mono
     /// specialization clones, which are not independently resolved (their
     /// resolved template, walked separately, is where a genuine dead local
     /// surfaces).  W0009 (unreachable) is structural and stays enabled either
@@ -148,42 +161,37 @@ type struct DeadCodeChecker {
     check_module(mut &this, root: ProgramNode*) -> void {
         if (root == null) { return; }
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i];
+            const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
             match (stmt.kind) {
-                NodeKind::FunctionDeclaration => {
-                    const fn: FunctionDeclNode* = stmt as FunctionDeclNode*;
-                    this.check_fn(fn, this.is_body_resolved(fn));
+                DeclKind::Function(_) => {
+                    const fn_decl: DeclarationNode* = stmt;
+                    this.check_fn(fn_decl, this.is_body_resolved(fn_decl));
                 }
-                NodeKind::StructDeclaration => {
-                    this.check_methods((stmt as StructDeclNode*).methods);
-                }
-                NodeKind::UnionDeclaration => {
-                    this.check_methods((stmt as UnionDeclNode*).methods);
-                }
-                NodeKind::ClassDeclaration => {
-                    this.check_methods((stmt as ClassDeclNode*).methods);
-                }
-                NodeKind::ImplementationBlock => {
-                    this.check_methods((stmt as ImplBlockNode*).methods);
-                }
-                NodeKind::TraitDeclaration => {
-                    // Trait default method bodies are not name-resolved
-                    // (signatures only), so W0001 would false-positive on every
-                    // local; run structural W0009 only (body_resolved = false).
-                    const td: TraitDeclNode* = stmt as TraitDeclNode*;
+                // Trait default method bodies are not name-resolved
+                // (signatures only), so W0001 would false-positive on
+                // every local; run structural W0009 only
+                // (body_resolved = false).
+                DeclKind::Trait(td) => {
                     for (mut j: i64 = 0; j < td.methods.length; j++) {
                         this.check_fn(td.methods[j], false);
                     }
                 }
-                _ => {}
+                DeclKind::Union(ud) => { this.check_methods(ud.methods); }
+                DeclKind::Struct(sd) => { this.check_methods(sd.methods); }
+                DeclKind::Impl(ib) => { this.check_methods(ib.methods); }
+                DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
+                | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) => {}
             }
         }
     }
 
-    check_methods(mut &this, methods: &[MethodNode*]) -> void {
+    check_methods(mut &this, methods: &[DeclarationNode*]) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: MethodNode* = methods[i];
+            const m_decl: DeclarationNode* = methods[i];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null || m.func == null) { continue; }
             this.check_fn(m.func, this.is_body_resolved(m.func));
         }
@@ -195,7 +203,8 @@ type struct DeadCodeChecker {
     /// compiler BUILT after resolution ran (`is_synthesized_body`, the `poll` of
     /// an `async` lowering) - none of them is a body the resolver walked.
     /// See the `body_resolved` field doc.
-    is_body_resolved(&this, func: FunctionDeclNode*) -> boolean {
+    is_body_resolved(&this, func_decl: DeclarationNode*) -> boolean {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         return !func.is_specialization && !func.is_synth_default
             && !func.is_synthesized_body;
     }
@@ -203,10 +212,16 @@ type struct DeadCodeChecker {
     /// `body_resolved` gates W0001 (see the field doc): pass false for bodies
     /// whose local references are absent from `used` (trait defaults, mono
     /// clones); W0009 runs regardless.
-    check_fn(mut &this, func: FunctionDeclNode*, body_resolved: boolean) -> void {
+    check_fn(mut &this, func_decl: DeclarationNode*, body_resolved: boolean) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.body == null) { return; }
         this.body_resolved = body_resolved;
         this.check_block(func.body);
+        mut lambdas: NonCapturingLambdaBodies = NonCapturingLambdaBodies { bodies: [] };
+        lambdas.walk_stmt(func.body);
+        for (mut i: i64 = 0; i < lambdas.bodies.length; i++) {
+            this.check_stmt(lambdas.bodies[i]);
+        }
         this.body_resolved = true;
     }
 
@@ -216,10 +231,11 @@ type struct DeadCodeChecker {
     /// next non-null statement is unreachable (W0009) - report it once and stop
     /// (everything after is equally dead, and dead bindings need no
     /// unused-warning).
-    check_block(mut &this, block: BlockStmtNode*) -> void {
-        if (block == null) { return; }
+    check_block(mut &this, block_stmt: Stmt*) -> void {
+        if (block_stmt == null) { return; }
+        const block: BlockStmt* = block_stmt.as_block();
         for (mut i: i64 = 0; i < block.statements.length; i++) {
-            const stmt: StatementNode* = block.statements[i];
+            const stmt: Stmt* = block.statements[i];
             if (stmt == null) { continue; }
 
             this.check_local_decl(stmt);
@@ -247,80 +263,79 @@ type struct DeadCodeChecker {
 
     /// A reportable source span for a statement.  A `DeclStmt` wrapper carries
     /// no location of its own; fall back to the declaration it wraps.
-    report_span(&this, stmt: StatementNode*) -> SourceSpan {
+    report_span(&this, stmt: Stmt*) -> SourceSpan {
         if (stmt.span.has_location()) { return stmt.span; }
-        if (stmt.kind == NodeKind::DeclarationStatement) {
-            const ds: DeclStmtNode* = stmt as DeclStmtNode*;
-            if (ds.declaration != null) { return ds.declaration.span; }
+        match (stmt.kind) {
+            StmtKind::Decl(ds) => {
+                if (ds.declaration != null) { return ds.declaration.span; }
+            }
+            _ => {}
         }
         return stmt.span;
     }
 
     /// If `stmt` declares a plain local binding that is never referenced, warn
     /// (W0001).  Destructuring bindings are exempt (see the module header).
-    check_local_decl(mut &this, stmt: StatementNode*) -> void {
+    check_local_decl(mut &this, stmt: Stmt*) -> void {
         if (!this.body_resolved) { return; }   // unresolved body: `used` is incomplete
-        if (stmt.kind != NodeKind::DeclarationStatement) { return; }
-        const ds: DeclStmtNode* = stmt as DeclStmtNode*;
-        if (ds.declaration == null) { return; }
-        if (ds.declaration.kind != NodeKind::VariableDeclaration) { return; }
+        const ds: DeclStmt* = match (stmt.kind) {
+            StmtKind::Decl(d) => { d }
+            _                 => { null }
+        };
+        if (ds == null || ds.declaration == null) { return; }
+        // A binding the compiler wrote (a closure's copy of a capture, read
+        // through the captured binding's identity) is not the user's to name.
+        if (ds.declaration.generated) { return; }
+        if (DeclarationNode::var_of(ds.declaration) == null) { return; }
 
-        const vd: VarDeclNode* = ds.declaration as VarDeclNode*;
-        if (!vd.span.has_location()) { return; }
+        const vd: VarDecl* = DeclarationNode::var_of(ds.declaration);
+        const span: SourceSpan = ds.declaration.span;
+        if (!span.has_location()) { return; }
 
         const name: string = this.ctx.resolve_str(vd.name);
         if (name == "" || name.starts_with("_")) { return; }
 
-        const key: u64 = ResolutionMap::make_key(vd.span);
+        const key: u64 = ResolutionMap::make_key(span);
         if (this.is_referenced(key)) { return; }
 
         mut diag: Diagnostic = Diagnostic::warning(
             ErrorCode::W0001_UNUSED_VARIABLE,
             fmt::format("unused variable `%s`; prefix it with `_` to silence this warning", name));
-        diag = diag.at(vd.span);
+        diag = diag.at(span);
         this.ctx.emit_diagnostic(diag);
     }
 
     /// Recurse into a statement's nested blocks so code inside an `if` arm,
     /// loop body, etc. is scanned too.  Does NOT judge divergence.
-    check_stmt(mut &this, stmt: StatementNode*) -> void {
+    check_stmt(mut &this, stmt: Stmt*) -> void {
         if (stmt == null) { return; }
         match (stmt.kind) {
-            NodeKind::BlockStatement => {
-                this.check_block(stmt as BlockStmtNode*);
+            StmtKind::Block(_) => {
+                this.check_block(stmt);
             }
-            NodeKind::IfStatement => {
-                const it: IfStmtNode* = stmt as IfStmtNode*;
-                if (it.then_stmt != null) { this.check_stmt(it.then_stmt); }
-                if (it.else_stmt != null) { this.check_stmt(it.else_stmt); }
+            StmtKind::If(it) => {
+                this.check_stmt(it.then_stmt);
+                this.check_stmt(it.else_stmt);
             }
-            NodeKind::WhileStatement => {
-                this.check_stmt((stmt as WhileStmtNode*).body);
-            }
-            NodeKind::ForStatement => {
-                this.check_stmt((stmt as ForStmtNode*).body);
-            }
-            NodeKind::DoWhileStatement => {
-                this.check_stmt((stmt as DoWhileStmtNode*).body);
-            }
-            NodeKind::LoopStatement => {
-                this.check_stmt((stmt as LoopStmtNode*).body);
-            }
-            NodeKind::MatchStatement => {
-                const m: MatchStmtNode* = stmt as MatchStmtNode*;
+            StmtKind::While(w)   => { this.check_stmt(w.body); }
+            StmtKind::For(f)     => { this.check_stmt(f.body); }
+            StmtKind::DoWhile(d) => { this.check_stmt(d.body); }
+            StmtKind::Loop(l)    => { this.check_stmt(l.body); }
+            StmtKind::Match(m) => {
                 for (mut i: i64 = 0; i < m.arms.length; i++) {
                     const arm: MatchArmNode* = m.arms[i];
-                    if (arm != null && arm.body != null) { this.check_stmt(arm.body); }
+                    if (arm != null) { this.check_stmt(arm.body); }
                 }
             }
-            NodeKind::StaticMatchStatement => {
-                const sm: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+            StmtKind::StaticMatch(sm) => {
                 for (mut i: i64 = 0; i < sm.arms.length; i++) {
                     const arm: StaticMatchArmNode* = sm.arms[i];
-                    if (arm != null && arm.body != null) { this.check_stmt(arm.body); }
+                    if (arm != null) { this.check_stmt(arm.body); }
                 }
             }
-            _ => {}
+            // An `unsafe` block's statements are not scanned.
+            StmtKind::UnsafeBlock(_) | StmtKind::Asm(_) | StmtKind::Return(_) | StmtKind::Break
+            | StmtKind::Continue | StmtKind::Expr(_) | StmtKind::Decl(_) => {}
         }
     }
 
@@ -329,22 +344,26 @@ type struct DeadCodeChecker {
     /// literal `return`/`break`/`continue` and control structures whose every
     /// branch diverges count.  Everything else is treated as fall-through, so
     /// the lint never fabricates an unreachable warning.
-    stmt_diverges(mut &this, stmt: StatementNode*) -> boolean {
+    stmt_diverges(mut &this, stmt: Stmt*) -> boolean {
         if (stmt == null) { return false; }
         match (stmt.kind) {
-            NodeKind::ReturnStatement   => { return true; }
-            NodeKind::BreakStatement    => { return true; }
-            NodeKind::ContinueStatement => { return true; }
-            NodeKind::BlockStatement => {
-                return this.block_diverges(stmt as BlockStmtNode*);
+            StmtKind::Return(_) => { return true; }
+            StmtKind::Break     => { return true; }
+            StmtKind::Continue  => { return true; }
+            StmtKind::Block(block) => {
+                // A block diverges if any statement in it diverges (once one
+                // does, the block cannot complete normally).
+                for (mut i: i64 = 0; i < block.statements.length; i++) {
+                    const s: Stmt* = block.statements[i];
+                    if (s != null && this.stmt_diverges(s)) { return true; }
+                }
+                return false;
             }
-            NodeKind::IfStatement => {
-                const it: IfStmtNode* = stmt as IfStmtNode*;
+            StmtKind::If(it) => {
                 if (it.then_stmt == null || it.else_stmt == null) { return false; }
                 return this.stmt_diverges(it.then_stmt) && this.stmt_diverges(it.else_stmt);
             }
-            NodeKind::MatchStatement => {
-                const m: MatchStmtNode* = stmt as MatchStmtNode*;
+            StmtKind::Match(m) => {
                 if (m.arms.length == 0) { return false; }
                 for (mut i: i64 = 0; i < m.arms.length; i++) {
                     const arm: MatchArmNode* = m.arms[i];
@@ -354,19 +373,10 @@ type struct DeadCodeChecker {
                 }
                 return true;
             }
-            _ => { return false; }
+            StmtKind::UnsafeBlock(_) | StmtKind::Asm(_) | StmtKind::While(_) | StmtKind::DoWhile(_)
+            | StmtKind::For(_) | StmtKind::Loop(_) | StmtKind::StaticMatch(_) | StmtKind::Expr(_)
+            | StmtKind::Decl(_) => { return false; }
         }
-    }
-
-    /// A block diverges if any statement in it diverges (once one does, the
-    /// block cannot complete normally).
-    block_diverges(mut &this, block: BlockStmtNode*) -> boolean {
-        if (block == null) { return false; }
-        for (mut i: i64 = 0; i < block.statements.length; i++) {
-            const stmt: StatementNode* = block.statements[i];
-            if (stmt != null && this.stmt_diverges(stmt)) { return true; }
-        }
-        return false;
     }
 
     // -- Method-usage harvest (for W0002) --
@@ -374,15 +384,16 @@ type struct DeadCodeChecker {
     /// Record a resolved call target (a method or specialized free function)
     /// as used, keyed by its declaration span so it matches how the target
     /// declaration is keyed in `report_module`.
-    mark_call_target(mut &this, node: ASTNode*) -> void {
+    mark_call_target(mut &this, node: DeclarationNode*) -> void {
         if (node == null) { return; }
         mut key: u64 = 0;
-        if (node.kind == NodeKind::MethodDeclaration) {
-            const mn: MethodNode* = node as MethodNode*;
+        if (DeclarationNode::method_of(node) != null) {
+            const mn_decl: DeclarationNode* = node;
+            const mn: MethodDecl* = DeclarationNode::method_of(mn_decl);
             if (mn.func == null) { return; }
             key = ResolutionMap::make_key(mn.func.span);
-        } else if (node.kind == NodeKind::FunctionDeclaration) {
-            key = ResolutionMap::make_key((node as FunctionDeclNode*).span);
+        } else if (DeclarationNode::fn_of(node) != null) {
+            key = ResolutionMap::make_key(node.span);
         } else {
             return;
         }
@@ -394,10 +405,10 @@ type struct DeadCodeChecker {
     /// one - a generic body's call before its receiver is minted, or a
     /// path naming a method with type parameters of its own, which the pin
     /// answers only in a copy.
-    mark_named_methods(mut &this, c: CallExprNode*) -> void {
+    mark_named_methods(mut &this, c: CallExpr*) -> void {
         const entry: OverloadId = c.resolved_callee.decl_entry();
         if (entry.is_valid()) {
-            this.mark_call_target(this.ctx.decl_index.entry_method(entry) as ASTNode*);
+            this.mark_call_target(this.ctx.decl_index.entry_method(entry));
         }
         this.mark_call_target(this.ctx.decl_index.method_decl_of(c.template_method));
     }
@@ -410,84 +421,82 @@ type struct DeadCodeChecker {
     harvest_module(mut &this, root: ProgramNode*) -> void {
         if (root == null) { return; }
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i];
+            const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
             match (stmt.kind) {
-                NodeKind::FunctionDeclaration => { this.harvest_fn(stmt as FunctionDeclNode*); }
-                NodeKind::StructDeclaration   => { this.harvest_methods((stmt as StructDeclNode*).methods); }
-                NodeKind::UnionDeclaration    => { this.harvest_methods((stmt as UnionDeclNode*).methods); }
-                NodeKind::ClassDeclaration    => { this.harvest_methods((stmt as ClassDeclNode*).methods); }
-                NodeKind::ImplementationBlock => { this.harvest_methods((stmt as ImplBlockNode*).methods); }
-                NodeKind::TraitDeclaration => {
-                    const td: TraitDeclNode* = stmt as TraitDeclNode*;
+                DeclKind::Function(_) => { this.harvest_fn(stmt); }
+                DeclKind::Trait(td) => {
                     for (mut j: i64 = 0; j < td.methods.length; j++) { this.harvest_fn(td.methods[j]); }
                 }
-                _ => {}
+                DeclKind::Union(ud) => { this.harvest_methods(ud.methods); }
+                DeclKind::Struct(sd) => { this.harvest_methods(sd.methods); }
+                DeclKind::Impl(ib) => { this.harvest_methods(ib.methods); }
+                DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
+                | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) => {}
             }
         }
     }
 
-    harvest_methods(mut &this, methods: &[MethodNode*]) -> void {
+    harvest_methods(mut &this, methods: &[DeclarationNode*]) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: MethodNode* = methods[i];
+            const m_decl: DeclarationNode* = methods[i];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null || m.func == null) { continue; }
             this.harvest_fn(m.func);
         }
     }
 
-    harvest_fn(mut &this, func: FunctionDeclNode*) -> void {
+    harvest_fn(mut &this, func_decl: DeclarationNode*) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.body == null) { return; }
-        this.harvest_stmt(func.body as StatementNode*);
+        this.harvest_stmt(func.body);
     }
 
     /// Fully recurse a statement, harvesting call targets from every
     /// expression and every nested statement.
-    harvest_stmt(mut &this, stmt: StatementNode*) -> void {
+    harvest_stmt(mut &this, stmt: Stmt*) -> void {
         if (stmt == null) { return; }
         match (stmt.kind) {
-            NodeKind::BlockStatement => {
-                const b: BlockStmtNode* = stmt as BlockStmtNode*;
+            StmtKind::Block(b) => {
                 for (mut i: i64 = 0; i < b.statements.length; i++) { this.harvest_stmt(b.statements[i]); }
             }
-            NodeKind::UnsafeBlockStatement => {
-                this.harvest_stmt((stmt as UnsafeBlockStmtNode*).block as StatementNode*);
-            }
-            NodeKind::ReturnStatement     => { this.walk_expr((stmt as ReturnStmtNode*).expression); }
-            NodeKind::ExpressionStatement => { this.walk_expr((stmt as ExprStmtNode*).expression); }
-            NodeKind::DeclarationStatement => {
-                const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+            StmtKind::UnsafeBlock(u) => { this.harvest_stmt(u.block); }
+            StmtKind::Return(r)      => { this.walk_expr(r.expression); }
+            StmtKind::Expr(e)        => { this.walk_expr(e.expression); }
+            StmtKind::Decl(ds) => {
                 if (ds.declaration != null) { this.harvest_decl(ds.declaration); }
             }
-            NodeKind::VariableDeclaration   => { this.harvest_decl(stmt as DeclarationNode*); }
-            NodeKind::DestructureDeclaration => { this.harvest_decl(stmt as DeclarationNode*); }
-            NodeKind::IfStatement => {
-                const it: IfStmtNode* = stmt as IfStmtNode*;
+            StmtKind::If(it) => {
                 this.walk_expr(it.condition);
                 this.harvest_stmt(it.then_stmt);
                 this.harvest_stmt(it.else_stmt);
             }
-            NodeKind::WhileStatement => {
-                const w: WhileStmtNode* = stmt as WhileStmtNode*;
+            StmtKind::While(w) => {
                 this.walk_expr(w.condition);
                 this.harvest_stmt(w.body);
             }
-            NodeKind::DoWhileStatement => {
-                const d: DoWhileStmtNode* = stmt as DoWhileStmtNode*;
+            StmtKind::DoWhile(d) => {
                 this.harvest_stmt(d.body);
                 this.walk_expr(d.condition);
             }
-            NodeKind::ForStatement => {
-                const f: ForStmtNode* = stmt as ForStmtNode*;
-                if (f.init != null) { this.harvest_stmt(f.init as StatementNode*); }
+            StmtKind::For(f) => {
+                // The initializer is a declaration or an expression; an
+                // expression there is not harvested.
+                const init_decl: DeclarationNode* = f.init.as_decl();
+                if (DeclarationNode::var_of(init_decl) != null
+                        || DeclarationNode::destructure_of(init_decl) != null) {
+                    this.harvest_decl(init_decl);
+                } else if (f.init.as_stmt() != null) {
+                    this.harvest_stmt(f.init.as_stmt());
+                }
                 this.walk_expr(f.condition);
                 this.walk_expr(f.update);
                 this.harvest_stmt(f.body);
             }
-            NodeKind::LoopStatement => {
-                this.harvest_stmt((stmt as LoopStmtNode*).body);
-            }
-            NodeKind::MatchStatement => {
-                const m: MatchStmtNode* = stmt as MatchStmtNode*;
+            StmtKind::Loop(l) => { this.harvest_stmt(l.body); }
+            StmtKind::Match(m) => {
                 this.walk_expr(m.subject);
                 for (mut i: i64 = 0; i < m.arms.length; i++) {
                     const arm: MatchArmNode* = m.arms[i];
@@ -496,64 +505,60 @@ type struct DeadCodeChecker {
                     this.harvest_stmt(arm.body);
                 }
             }
-            NodeKind::StaticMatchStatement => {
-                const sm: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+            StmtKind::StaticMatch(sm) => {
                 for (mut i: i64 = 0; i < sm.arms.length; i++) {
                     const arm: StaticMatchArmNode* = sm.arms[i];
                     if (arm != null) { this.harvest_stmt(arm.body); }
                 }
             }
-            _ => {}
+            StmtKind::Asm(_) | StmtKind::Break | StmtKind::Continue => {}
         }
     }
 
     harvest_decl(mut &this, decl: DeclarationNode*) -> void {
         if (decl == null) { return; }
-        if (decl.kind == NodeKind::VariableDeclaration) {
-            this.walk_expr((decl as VarDeclNode*).initializer);
-        } else if (decl.kind == NodeKind::DestructureDeclaration) {
-            this.walk_expr((decl as DestructureDeclNode*).initializer);
+        if (DeclarationNode::var_of(decl) != null) {
+            this.walk_expr((DeclarationNode::var_of(decl)).initializer);
+        } else if (DeclarationNode::destructure_of(decl) != null) {
+            this.walk_expr(DeclarationNode::destructure_of(decl).initializer);
         }
     }
 
     /// Complete expression traversal: harvest a call target at every
-    /// `CallExprNode`, and recurse into every child expression - including the
+    /// `CallExpr`, and recurse into every child expression - including the
     /// `desugared_call` side-channels where operator overloads hang their
     /// resolved method call.
     walk_expr(mut &this, e: ExpressionNode*) -> void {
         if (e == null) { return; }
         match (e.kind) {
-            NodeKind::CallExpression => {
-                const c: CallExprNode* = e as CallExprNode*;
+            ExprKind::Call(c) => {
                 this.mark_named_methods(c);
                 this.walk_expr(c.callee);
                 for (mut i: i64 = 0; i < c.arguments.length; i++) { this.walk_expr(c.arguments[i]); }
             }
-            NodeKind::BinaryExpression => {
-                const b: BinaryExprNode* = e as BinaryExprNode*;
-                this.walk_expr(b.left);
-                this.walk_expr(b.right);
-                this.walk_expr(b.desugared_call);
-            }
-            NodeKind::UnaryExpression => {
-                const u: UnaryExprNode* = e as UnaryExprNode*;
-                this.walk_expr(u.operand);
-                this.walk_expr(u.desugared_call);
-            }
-            NodeKind::TernaryExpression => {
-                const t: TernaryExprNode* = e as TernaryExprNode*;
+            ExprKind::Ternary(t) => {
                 this.walk_expr(t.condition);
                 this.walk_expr(t.true_expr);
                 this.walk_expr(t.false_expr);
             }
-            NodeKind::IfExpression => {
-                const ie: IfExprNode* = e as IfExprNode*;
-                this.walk_expr(ie.condition);
-                this.walk_expr(ie.then_expr);
-                this.walk_expr(ie.else_expr);
+            ExprKind::Cast(ce) => { this.walk_expr(ce.expression); }
+            ExprKind::ObjectConversion(oc) => { this.walk_expr(oc.operand); }
+            ExprKind::Unary(u) => {
+                this.walk_expr(u.operand);
+                this.walk_expr(u.desugared_call);
             }
-            NodeKind::MatchExpression => {
-                const m: MatchExprNode* = e as MatchExprNode*;
+            ExprKind::Binary(b) => {
+                this.walk_expr(b.left);
+                this.walk_expr(b.right);
+                this.walk_expr(b.desugared_call);
+            }
+            ExprKind::ArrayAccess(a) => {
+                this.walk_expr(a.array);
+                this.walk_expr(a.index);
+                this.walk_expr(a.desugared_call);
+            }
+            ExprKind::Lambda(l) => { this.harvest_stmt(l.body); }
+            ExprKind::Match(m) => {
                 this.walk_expr(m.subject);
                 for (mut i: i64 = 0; i < m.arms.length; i++) {
                     const arm: MatchArmNode* = m.arms[i];
@@ -562,57 +567,48 @@ type struct DeadCodeChecker {
                     this.harvest_stmt(arm.body);
                 }
             }
-            NodeKind::StaticMatchExpression => {
-                const sm: StaticMatchExprNode* = e as StaticMatchExprNode*;
+            ExprKind::StaticMatch(sm) => {
                 for (mut i: i64 = 0; i < sm.arms.length; i++) {
                     const arm: StaticMatchArmNode* = sm.arms[i];
                     if (arm != null) { this.harvest_stmt(arm.body); }
                 }
             }
-            NodeKind::NewExpression => {
-                const n: NewExprNode* = e as NewExprNode*;
-                for (mut i: i64 = 0; i < n.arguments.length; i++) { this.walk_expr(n.arguments[i]); }
-                this.walk_expr(n.array_size);
-                if (n.struct_init != null) { this.walk_expr(n.struct_init as ExpressionNode*); }
+            ExprKind::If(ie)     => {
+                this.walk_expr(ie.condition);
+                this.walk_expr(ie.then_expr);
+                this.walk_expr(ie.else_expr);
             }
-            NodeKind::CastExpression => {
-                this.walk_expr((e as CastExprNode*).expression);
-            }
-            NodeKind::StructLiteral => {
-                const sl: StructLiteralNode* = e as StructLiteralNode*;
+            ExprKind::Typeof(t)  => { this.walk_expr(t.operand); }
+            ExprKind::Delete(d)  => { this.walk_expr(d.operand); }
+            ExprKind::Struct(sl) => {
                 for (mut i: i64 = 0; i < sl.field_inits.length; i++) { this.walk_expr(sl.field_inits[i].value); }
             }
-            NodeKind::ArrayLiteral => {
-                const al: ArrayLiteralNode* = e as ArrayLiteralNode*;
+            ExprKind::Array(al)  => {
                 for (mut i: i64 = 0; i < al.elements.length; i++) { this.walk_expr(al.elements[i]); }
             }
-            NodeKind::TupleLiteral => {
-                const tl: TupleLiteralNode* = e as TupleLiteralNode*;
+            ExprKind::Tuple(tl)  => {
                 for (mut i: i64 = 0; i < tl.elements.length; i++) { this.walk_expr(tl.elements[i]); }
             }
-            NodeKind::LambdaExpression => {
-                this.harvest_stmt((e as LambdaExprNode*).body);
+            ExprKind::New(n)     => {
+                for (mut i: i64 = 0; i < n.arguments.length; i++) { this.walk_expr(n.arguments[i]); }
+                this.walk_expr(n.array_size);
+                if (n.struct_init != null) { this.walk_expr(n.struct_init); }
             }
-            NodeKind::ArrayAccess => {
-                const a: ArrayAccessNode* = e as ArrayAccessNode*;
-                this.walk_expr(a.array);
-                this.walk_expr(a.index);
-                this.walk_expr(a.desugared_call);
-            }
-            NodeKind::MemberAccess => {
-                this.walk_expr((e as MemberAccessNode*).object);
-            }
-            NodeKind::TypeofExpression => { this.walk_expr((e as TypeofExprNode*).operand); }
-            NodeKind::DeleteExpression => { this.walk_expr((e as DeleteExprNode*).operand); }
-            NodeKind::AwaitExpression  => { this.walk_expr((e as AwaitExprNode*).operand); }
-            NodeKind::YieldExpression  => { this.walk_expr((e as YieldExprNode*).operand); }
-            NodeKind::TryExpression => {
-                const tr: TryExprNode* = e as TryExprNode*;
+            ExprKind::Yield(y)   => { this.walk_expr(y.operand); }
+            ExprKind::Try(tr)    => {
                 this.walk_expr(tr.operand);
                 this.walk_expr(tr.desugared);
             }
-            _ => {}
+            // A type operand holds no expression, nor does a literal.
+            ExprKind::Sizeof(_)  => { }
+            ExprKind::Alignof(_) => { }
+            ExprKind::Await(aw)  => { this.walk_expr(aw.operand); }
+            ExprKind::Literal(_) => { }
+            ExprKind::Identifier(_) => { }
+            ExprKind::ScopeResolution(_) => { }
+            ExprKind::MemberAccess(ma) => { this.walk_expr(ma.object); }
         }
+    
     }
 
     // -- Lint 3: unused private functions/methods (W0002) --
@@ -623,24 +619,27 @@ type struct DeadCodeChecker {
     report_module(mut &this, root: ProgramNode*) -> void {
         if (root == null) { return; }
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i];
+            const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
             match (stmt.kind) {
-                NodeKind::FunctionDeclaration => { this.report_function(stmt as FunctionDeclNode*); }
-                NodeKind::StructDeclaration   => { this.report_methods((stmt as StructDeclNode*).methods); }
-                NodeKind::UnionDeclaration    => { this.report_methods((stmt as UnionDeclNode*).methods); }
-                NodeKind::ClassDeclaration    => { this.report_methods((stmt as ClassDeclNode*).methods); }
-                NodeKind::ImplementationBlock => { this.report_methods((stmt as ImplBlockNode*).methods); }
-                _ => {}
+                DeclKind::Function(_) => { this.report_function(stmt); }
+                DeclKind::Union(ud) => { this.report_methods(ud.methods); }
+                DeclKind::Struct(sd) => { this.report_methods(sd.methods); }
+                DeclKind::Impl(ib) => { this.report_methods(ib.methods); }
+                DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
+                | DeclKind::TypeAlias(_) | DeclKind::Variable(_) | DeclKind::Variant(_) | DeclKind::Method(_) => {}
             }
         }
     }
 
-    report_methods(mut &this, methods: &[MethodNode*]) -> void {
+    report_methods(mut &this, methods: &[DeclarationNode*]) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: MethodNode* = methods[i];
+            const m_decl: DeclarationNode* = methods[i];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null || m.func == null) { continue; }
-            this.report_method(m);
+            this.report_method(m_decl);
         }
     }
 
@@ -650,14 +649,15 @@ type struct DeadCodeChecker {
         return this.method_used.contains_key(&key) || this.is_referenced(key);
     }
 
-    report_function(mut &this, func: FunctionDeclNode*) -> void {
+    report_function(mut &this, func_decl: DeclarationNode*) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.body == null) { return; }   // extern / no body
         if (func.is_public) { return; }                       // only private
         if (func.is_generic()) { return; }                    // template - skip (conservative)
         if (func.is_specialization) { return; }               // mono-generated instance
-        if (this.is_directive_excluded(func)) { return; }
-        if (!func.span.has_location()) { return; }
-        if (this.is_target_used(func.span)) { return; }
+        if (this.is_directive_excluded(func_decl)) { return; }
+        if (!func_decl.span.has_location()) { return; }
+        if (this.is_target_used(func_decl.span)) { return; }
 
         const name: string = this.ctx.resolve_str(func.name);
         if (name == "" || (func.def.is_valid() && func.def.equals(this.ctx.entry_fn))) { return; }
@@ -665,15 +665,17 @@ type struct DeadCodeChecker {
         mut diag: Diagnostic = Diagnostic::warning(
             ErrorCode::W0002_UNUSED_FUNCTION,
             fmt::format("function `%s` is never used", name));
-        diag = diag.at(func.span);
+        diag = diag.at(func_decl.span);
         this.ctx.emit_diagnostic(diag);
     }
 
-    report_method(mut &this, m: MethodNode*) -> void {
-        const f: FunctionDeclNode* = m.func;
+    report_method(mut &this, m_decl: DeclarationNode*) -> void {
+        const m: MethodDecl* = DeclarationNode::method_of(m_decl);
+        const f_decl: DeclarationNode* = m.func;
+        const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
         if (f == null || f.body == null) { return; }          // abstract / no body
         // Only private methods.  A method's symbol visibility derives from
-        // `MethodNode.visibility` (see name_resolution), which defaults Public,
+        // `MethodDecl.visibility` (see name_resolution), which defaults Public,
         // so anything not explicitly private is conservatively left alone.
         match (m.visibility) {
             Visibility::Private => {}
@@ -685,12 +687,10 @@ type struct DeadCodeChecker {
         // harvest cannot see which static it uses; flagging statics would
         // false-positive.
         if (m.is_static) { return; }
-        // Dispatch-only or implicitly-invoked methods are never called by name:
-        if (m.is_constructor || m.is_destructor || m.is_virtual || m.is_override) { return; }
         if (f.origin_trait.is_valid()) { return; }            // trait-impl method
-        if (this.is_directive_excluded(f)) { return; }
-        if (!f.span.has_location()) { return; }
-        if (this.is_target_used(f.span)) { return; }
+        if (this.is_directive_excluded(f_decl)) { return; }
+        if (!f_decl.span.has_location()) { return; }
+        if (this.is_target_used(f_decl.span)) { return; }
 
         const name: string = this.ctx.resolve_str(f.name);
         if (name == "") { return; }
@@ -698,18 +698,19 @@ type struct DeadCodeChecker {
         mut diag: Diagnostic = Diagnostic::warning(
             ErrorCode::W0002_UNUSED_FUNCTION,
             fmt::format("method `%s` is never used", name));
-        diag = diag.at(f.span);
+        diag = diag.at(f_decl.span);
         this.ctx.emit_diagnostic(diag);
     }
 
     /// Always-live directives/link-names: entry points, tests, and functions
     /// whose linker symbol is pinned are never "unused".
-    is_directive_excluded(&this, func: FunctionDeclNode*) -> boolean {
+    is_directive_excluded(&this, func_decl: DeclarationNode*) -> boolean {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func.has_link_name) { return true; }
-        if (func.has_directive(Keyword::new("entry")))         { return true; }
-        if (func.has_directive(Keyword::new("test")))          { return true; }
-        if (func.has_directive(Keyword::new("ignore")))        { return true; }
-        if (func.has_directive(Keyword::new("should_panic")))  { return true; }
+        if (func_decl.has_directive(Keyword::new("entry")))         { return true; }
+        if (func_decl.has_directive(Keyword::new("test")))          { return true; }
+        if (func_decl.has_directive(Keyword::new("ignore")))        { return true; }
+        if (func_decl.has_directive(Keyword::new("should_panic")))  { return true; }
         return false;
     }
 }

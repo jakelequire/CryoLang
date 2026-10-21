@@ -1,11 +1,11 @@
 /// Pattern Emitter
 ///
 /// Match-arm / pattern lowering: enum-subject normalisation, payload
-/// binding, per-arm comparison chain emission, and pattern-value
+/// binding, per-arm tests and switch case values, and pattern-value
 /// lowering (literal, identifier, enum-tag).  Shared by the `match`
-/// statement (`visit(MatchStmtNode*)`) and the `match` expression
-/// (`visit(MatchExprNode*)`); both pass through `prepare_match_subject`
-/// + `emit_match_arm_comparison` + `bind_arm_enum_payloads`.
+/// statement (`visit_match_stmt`) and the `match` expression
+/// (`visit_match_expr`); both pass through `prepare_match_subject`
+/// + `IRGeneratorVisitor::emit_match_dispatch` + `bind_arm_enum_payloads`.
 ///
 /// Held by IRGeneratorVisitor (not by CodegenContext), so this module
 /// can safely import `compiler::codegen::context` and hold the context
@@ -21,7 +21,7 @@ import compiler::types::{
 };
 import compiler::ast;
 import compiler::ast::{
-    LiteralKind, node, pattern, PatternBinding, PatternElement, PatternKind
+    LiteralKind, node, pattern, PatternBinding, PatternElement
 };
 import compiler::lex;
 import compiler::lex::{ TokenType };
@@ -29,7 +29,9 @@ import compiler::lex::lexer::{ Lexer };
 import compiler::resolver::{ intern_table };
 import std::ffi::libc;
 import std::fmt;
-import compiler::ast::pattern::{ EnumPatternNode, MatchArmNode, PatternNode };
+import compiler::ast::pattern::{
+    BindingPattern, ConstantPattern, EnumPattern, MatchArmNode, Pattern, PatternKind, RangePattern
+};
 import compiler::diag;
 import compiler::diag::{ ErrorCode };
 import compiler::codegen::context::{ CodegenContext };
@@ -48,7 +50,7 @@ import compiler::types::user_defined::{ EnumType, EnumVariantInfo };
 
 
 // MatchSubjectInfo: precomputed state for match/if-let pattern codegen.
-// Public because callers (visit(MatchStmtNode*), visit(MatchExprNode*))
+// Public because callers (visit_match_stmt, visit_match_expr)
 // receive it from prepare_match_subject and pass it back into the rest
 // of the emitter API.
 
@@ -102,15 +104,15 @@ type struct PatternEmitter {
         mut depth: i32 = 0;
         while (t != null && depth < 8) {
             if (t.kind == TypeKind::Pointer) {
-                const pt: PointerType* = t as PointerType*;
+                const pt: PointerType* = t.as_pointer();
                 unwrap_ref = pt.pointee;
                 t = this.cg.arena_type(unwrap_ref);
             } else if (t.kind == TypeKind::Reference) {
-                const rt: ReferenceType* = t as ReferenceType*;
+                const rt: ReferenceType* = t.as_reference();
                 unwrap_ref = rt.referent;
                 t = this.cg.arena_type(unwrap_ref);
             } else if (t.kind == TypeKind::InstantiatedType) {
-                const it: InstantiatedType* = t as InstantiatedType*;
+                const it: InstantiatedType* = t.as_instantiated();
                 if (it.has_resolved_type()) {
                     unwrap_ref = it.resolved_type;
                     t = this.cg.arena_type(unwrap_ref);
@@ -125,7 +127,7 @@ type struct PatternEmitter {
             return info;
         }
 
-        info.enum_type = t as EnumType*;
+        info.enum_type = t.as_enum();
         info.enum_ref  = unwrap_ref;
         info.enum_llvm = this.cg.type_mapper.map_type(unwrap_ref);
         if (!info.enum_llvm.is_valid()) {
@@ -215,11 +217,10 @@ type struct PatternEmitter {
         if (!minfo.enum_llvm.is_valid()) { return; }
 
         for (mut p: i64 = 0; p < arm.patterns.length; p++) {
-            const pat: PatternNode* = arm.patterns[p];
-            if (pat == null || pat.pattern_kind != PatternKind::Enum) { continue; }
-
-            const epat: EnumPatternNode* = pat as EnumPatternNode*;
-            if (!epat.has_bindings()) { continue; }
+            const pat: Pattern* = arm.patterns[p];
+            if (pat == null) { continue; }
+            const epat: EnumPattern* = pat.enum_payload();
+            if (epat == null || !epat.has_bindings()) { continue; }
 
             this.bind_enum_payloads_rec(epat, minfo.enum_type, minfo.enum_llvm,
                                         minfo.subject_ptr);
@@ -265,12 +266,12 @@ type struct PatternEmitter {
     payload_enum_type(mut &this, ty: TypeRef) -> EnumType* {
         mut t: Type* = this.cg.arena_type(ty);
         if (t != null && t.kind == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = t as InstantiatedType*;
+            const inst: InstantiatedType* = t.as_instantiated();
             if (inst.has_resolved_type()) {
                 t = this.cg.arena_type(inst.resolved_type);
             }
         }
-        if (t != null && t.kind == TypeKind::Enum) { return t as EnumType*; }
+        if (t != null && t.kind == TypeKind::Enum) { return t.as_enum(); }
         return null;
     }
 
@@ -279,7 +280,7 @@ type struct PatternEmitter {
     /// points to a value of `enum_type` (LLVM type `enum_llvm`). Reads through
     /// each registered binding load via `codegen_rvalue` using the binding's
     /// resolved_type.
-    bind_enum_payloads_rec(mut &this, epat: EnumPatternNode*, enum_type: EnumType*,
+    bind_enum_payloads_rec(mut &this, epat: EnumPattern*, enum_type: EnumType*,
                            enum_llvm: LType, subject_ptr: LValue) -> void {
         if (enum_type == null || !subject_ptr.is_valid() || !enum_llvm.is_valid()) {
             return;
@@ -294,7 +295,7 @@ type struct PatternEmitter {
         for (mut pos: i64 = 0; pos < epat.elements.length; pos++) {
             if (pos >= num_payload) { continue; }
             const pb: PatternBinding* = epat.binding_at(pos);
-            const sub: PatternNode* = epat.sub_at(pos);
+            const sub: Pattern* = epat.sub_at(pos);
             if (pb == null && sub == null) { continue; }
 
             const field_ref: TypeRef = variant.payload_types[pos];
@@ -308,12 +309,12 @@ type struct PatternEmitter {
 
             if (pb != null) {
                 this.cg.values.set(pb.sym_id, field_ptr);
-            } else if (sub != null && sub.pattern_kind == PatternKind::Enum) {
+            } else if (sub != null && sub.enum_payload() != null) {
                 // Nested enum sub-pattern: recurse using the payload field as
                 // the new subject pointer and its concrete enum type.
                 const nested_ty: EnumType* = this.payload_enum_type(field_ref);
                 if (nested_ty != null) {
-                    this.bind_enum_payloads_rec(sub as EnumPatternNode*, nested_ty,
+                    this.bind_enum_payloads_rec(sub.enum_payload(), nested_ty,
                                                 field_llvm, field_ptr);
                 }
             }
@@ -331,11 +332,13 @@ type struct PatternEmitter {
     bind_arm_value_bindings(mut &this, arm: MatchArmNode*,
                             minfo: MatchSubjectInfo) -> void {
         for (mut p: i64 = 0; p < arm.patterns.length; p++) {
-            const pat: PatternNode* = arm.patterns[p];
-            if (pat == null || pat.pattern_kind != PatternKind::Identifier) {
-                continue;
-            }
-            if (!pat.binding_name.is_valid()) { continue; }
+            const pat: Pattern* = arm.patterns[p];
+            if (pat == null) { continue; }
+            const binding: BindingPattern* = match (pat.kind) {
+                PatternKind::Binding(b) => { b }
+                _                       => { null }
+            };
+            if (binding == null) { continue; }
             if (!minfo.subject_ptr.is_valid()) { continue; }
 
             // Already an addressable slot (e.g. an ADT enum's alloca/ptr): bind
@@ -357,7 +360,7 @@ type struct PatternEmitter {
                 if (!slot.is_valid()) { continue; }
                 this.cg.builder.build_store(minfo.subject_ptr, slot);
             }
-            this.cg.values.set(pat.binding_sym, slot);
+            this.cg.values.set(binding.binding_sym, slot);
             return;
         }
     }
@@ -373,7 +376,7 @@ type struct PatternEmitter {
     /// dead).  `name_prefix` namespaces the synthesised intermediate blocks
     /// ("match" for statement matches, "mexpr" for expression matches).
     ///
-    /// Shared by `visit(MatchStmtNode*)` and `visit(MatchExprNode*)`: the
+    /// Shared by `visit_match_stmt` and `visit_match_expr`: the
     /// per-pattern lowering is identical between them; only the block-name
     /// prefix differs.  On return the builder is positioned at whichever
     /// block emitted the last test (always terminated); the caller is free to
@@ -386,7 +389,7 @@ type struct PatternEmitter {
         const name_prefix: string = name_prefix_text;
         const npat: i64 = arm.patterns.length;
         for (mut p: i64 = 0; p < npat; p++) {
-            const pat: PatternNode* = arm.patterns[p];
+            const pat: Pattern* = arm.patterns[p];
             if (pat == null) { continue; }
 
             // Where control goes if THIS pattern doesn't match: the next
@@ -400,17 +403,14 @@ type struct PatternEmitter {
                     fmt::format("%s.or", name_prefix));
             }
 
-            if (pat.pattern_kind == PatternKind::Wildcard
-                || (pat.pattern_kind == PatternKind::Identifier
-                    && pat.binding_name.is_valid())) {
+            if (pat.is_irrefutable()) {
                 // Wildcard and bare-identifier bindings match unconditionally
                 // (an identifier binds the whole subject, like `_` but named);
                 // branch straight to the arm body. Any later OR alternatives
                 // are unreachable. The binding itself is materialized by
-                // `bind_arm_value_bindings` in the arm/guard block. An
-                // Identifier whose `binding_name` was cleared by the resolver is
-                // a constant-value pattern, not a binding, and falls through to
-                // the comparison below.
+                // `bind_arm_value_bindings` in the arm/guard block. A name the
+                // resolver found to be a constant's is a `Constant` pattern,
+                // compared below.
                 this.cg.builder.build_br(arm_bb);
                 return;
             }
@@ -421,76 +421,83 @@ type struct PatternEmitter {
             // skipped. Used by enum patterns with payload tests (literal
             // payloads / nested sub-patterns).
             mut handled: boolean = false;
-            if (pat.pattern_kind == PatternKind::Literal) {
-                // For string subjects, build the pattern as a global string
-                // pointer and compare via strcmp; `codegen_pattern_value`
-                // lowers every literal to an i32 and would compare pointer
-                // bits, not content.
-                if (is_string_subj) {
-                    const pat_text: string = this.cg.resolve(pat.value);
-                    const pat_val: LValue = this.cg.str_cache.get_or_create(
-                        pat_text, pat_text.length() as i64, &this.cg.llvm_module);
-                    cmp = this.cg.expr_ops.codegen_string_compare(subject, pat_val,
-                        TokenType::EqualEqual);
-                } else {
+            match (pat.kind) {
+                PatternKind::Literal(lit) => {
+                    // For string subjects, build the pattern as a global string
+                    // pointer and compare via strcmp; `lower_scalar_literal`
+                    // lowers every literal to an integer and would compare
+                    // pointer bits, not content.
+                    if (is_string_subj) {
+                        const pat_text: string = this.cg.resolve(lit.value);
+                        const pat_val: LValue = this.cg.str_cache.get_or_create(
+                            pat_text, pat_text.length() as i64, &this.cg.llvm_module);
+                        cmp = this.cg.expr_ops.codegen_string_compare(subject, pat_val,
+                            TokenType::EqualEqual);
+                    } else {
+                        const pat_val: LValue = this.lower_scalar_literal(
+                            this.cg.get_intern().resolve(lit.value), lit.literal_kind,
+                            minfo.subject_ty);
+                        if (pat_val.is_valid()) {
+                            const pat_val_coerced: LValue =
+                                this.cg.expr_ops.coerce_icmp_operands(subject, pat_val,
+                                                     minfo.subject_ty);
+                            cmp = this.cg.builder.build_icmp(LIntPredicate::EQ,
+                                subject, pat_val_coerced,
+                                fmt::format("%s.cmp", name_prefix));
+                        }
+                    }
+                }
+                PatternKind::Constant(constant) => {
+                    // The identifier names a `const`: compare the subject
+                    // against the constant's loaded value, like a literal arm.
                     const pat_val: LValue =
-                        this.codegen_pattern_value(pat, minfo.subject_ty);
+                        this.codegen_constant_value(constant, minfo.subject_ty);
                     if (pat_val.is_valid()) {
-                        const pat_val_coerced: LValue =
+                        const coerced: LValue =
                             this.cg.expr_ops.coerce_icmp_operands(subject, pat_val,
                                                  minfo.subject_ty);
                         cmp = this.cg.builder.build_icmp(LIntPredicate::EQ,
-                            subject, pat_val_coerced,
-                            fmt::format("%s.cmp", name_prefix));
+                            subject, coerced, fmt::format("%s.cmp", name_prefix));
                     }
                 }
-            } else if (pat.pattern_kind == PatternKind::Identifier) {
-                // Constant-value pattern: the resolver cleared `binding_name`
-                // because the identifier names a `const`. Compare the subject
-                // against the constant's loaded value, like a literal arm.
-                const pat_val: LValue =
-                    this.codegen_pattern_value(pat, minfo.subject_ty);
-                if (pat_val.is_valid()) {
-                    const coerced: LValue =
-                        this.cg.expr_ops.coerce_icmp_operands(subject, pat_val,
-                                             minfo.subject_ty);
-                    cmp = this.cg.builder.build_icmp(LIntPredicate::EQ,
-                        subject, coerced, fmt::format("%s.cmp", name_prefix));
+                PatternKind::Range(range) => {
+                    // Inclusive `lo..hi` range: `lo <= subject && subject <= hi`.
+                    // String subjects can't form a range (sema rejects them), so
+                    // this always operates on the integer/char subject directly.
+                    cmp = this.codegen_range_compare(range, minfo.subject_ty,
+                                                     subject, name_prefix_text);
                 }
-            } else if (pat.pattern_kind == PatternKind::Range) {
-                // Inclusive `lo..hi` range: `lo <= subject && subject <= hi`.
-                // String subjects can't form a range (sema rejects them), so
-                // this always operates on the integer/char subject directly.
-                cmp = this.codegen_range_compare(pat, minfo.subject_ty,
-                                                 subject, name_prefix_text);
-            } else if (pat.pattern_kind == PatternKind::Enum) {
-                const epat: EnumPatternNode* = pat as EnumPatternNode*;
-                if (minfo.enum_type != null
-                        && this.enum_pattern_needs_payload_test(epat)) {
-                    // Payload literals (`Some(5)`) or nested sub-patterns
-                    // (`Some(Some(n))`) need value/tag checks beyond the outer
-                    // tag. Emit the full recursive test, which terminates the
-                    // block by branching to arm_bb (full match) / miss_bb.
-                    this.emit_enum_pattern_test(epat, minfo.enum_type,
-                        minfo.enum_llvm, minfo.subject_ptr, arm_bb, miss_bb,
-                        current_fn, name_prefix_text);
-                    handled = true;
-                } else if (minfo.enum_type != null && minfo.tag_val.is_valid()) {
-                    // Tag-only check (bindings/wildcards in payload need no test).
-                    const variant: EnumVariantInfo* =
-                        CodegenUtil::pinned_variant(minfo.enum_type, epat.resolved_member);
-                    if (variant != null) {
-                        // Match the comparison constant to the tag's width
-                        // (discriminant base for simple enums, else i32) so a
-                        // non-i32 simple enum's icmp operands agree.
-                        const tag_ty: LType = this.cg.type_mapper.enum_tag_ltype(minfo.enum_type);
-                        const pat_val: LValue = LType::const_int(
-                            tag_ty, variant.tag_value, false);
-                        cmp = this.cg.builder.build_icmp(LIntPredicate::EQ,
-                            minfo.tag_val, pat_val,
-                            fmt::format("%s.cmp", name_prefix));
+                PatternKind::Enum(epat) => {
+                    if (minfo.enum_type != null
+                            && this.enum_pattern_needs_payload_test(epat)) {
+                        // Payload literals (`Some(5)`) or nested sub-patterns
+                        // (`Some(Some(n))`) need value/tag checks beyond the
+                        // outer tag. Emit the full recursive test, which
+                        // terminates the block by branching to arm_bb (full
+                        // match) / miss_bb.
+                        this.emit_enum_pattern_test(epat, minfo.enum_type,
+                            minfo.enum_llvm, minfo.subject_ptr, arm_bb, miss_bb,
+                            current_fn, name_prefix_text);
+                        handled = true;
+                    } else if (minfo.enum_type != null && minfo.tag_val.is_valid()) {
+                        // Tag-only check (bindings/wildcards in payload need no test).
+                        const variant: EnumVariantInfo* =
+                            CodegenUtil::pinned_variant(minfo.enum_type, epat.resolved_member);
+                        if (variant != null) {
+                            // Match the comparison constant to the tag's width
+                            // (discriminant base for simple enums, else i32) so
+                            // a non-i32 simple enum's icmp operands agree.
+                            const tag_ty: LType = this.cg.type_mapper.enum_tag_ltype(minfo.enum_type);
+                            const pat_val: LValue = LType::const_int(
+                                tag_ty, variant.tag_value, false);
+                            cmp = this.cg.builder.build_icmp(LIntPredicate::EQ,
+                                minfo.tag_val, pat_val,
+                                fmt::format("%s.cmp", name_prefix));
+                        }
                     }
                 }
+                // Irrefutable patterns branched above.
+                _ => { }
             }
 
             if (handled) {
@@ -527,10 +534,88 @@ type struct PatternEmitter {
         }
     }
 
+    // Switch dispatch
+
+    /// The integer a `switch` over this subject dispatches on: an enum's
+    /// tag, or an integer-typed subject itself (a character or boolean
+    /// included).  Null when the subject has no such value, a string
+    /// among them.
+    switch_condition(mut &this, minfo: MatchSubjectInfo, subject: LValue,
+                     is_string_subj: boolean) -> LValue {
+        if (minfo.enum_type != null) { return minfo.tag_val; }
+        if (is_string_subj || !subject.is_valid()) { return LValue::null(); }
+        if (LType::kind_of(llvm::LLVMTypeOf(subject.raw)) != LTypeKind::Integer) {
+            return LValue::null();
+        }
+        return subject;
+    }
+
+    /// True when one of the arm's patterns takes every value.
+    static arm_takes_all(arm: MatchArmNode*) -> boolean {
+        for (mut p: i64 = 0; p < arm.patterns.length; p++) {
+            const pat: Pattern* = arm.patterns[p];
+            if (pat != null && pat.is_irrefutable()) { return true; }
+        }
+        return false;
+    }
+
+    /// True when every pattern of the arm is irrefutable or has a case
+    /// value (`switch_case_value`), so the arm can be a `switch` case.
+    arm_is_switchable(mut &this, arm: MatchArmNode*, minfo: MatchSubjectInfo,
+                      subject: LValue, cond: LValue) -> boolean {
+        if (arm.patterns.length == 0) { return false; }
+        for (mut p: i64 = 0; p < arm.patterns.length; p++) {
+            const pat: Pattern* = arm.patterns[p];
+            if (pat == null) { return false; }
+            if (pat.is_irrefutable()) { continue; }
+            if (!this.switch_case_value(pat, minfo, subject, cond).is_valid()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// The constant a pattern matches, at the type of `cond`: an enum
+    /// pattern's tag when its payload needs no test of its own, or an
+    /// integer, character or boolean literal at the subject's width.  The
+    /// value is the one `emit_match_arm_comparison` compares against.
+    /// Null for any other pattern.
+    switch_case_value(mut &this, pat: Pattern*, minfo: MatchSubjectInfo,
+                      subject: LValue, cond: LValue) -> LValue {
+        mut v: LValue = LValue::null();
+        match (pat.kind) {
+            PatternKind::Enum(epat) => {
+                if (minfo.enum_type != null && minfo.tag_val.is_valid()
+                        && !this.enum_pattern_needs_payload_test(epat)) {
+                    const variant: EnumVariantInfo* =
+                        CodegenUtil::pinned_variant(minfo.enum_type, epat.resolved_member);
+                    if (variant != null) {
+                        v = LType::const_int(this.cg.type_mapper.enum_tag_ltype(minfo.enum_type),
+                                             variant.tag_value, false);
+                    }
+                }
+            }
+            PatternKind::Literal(lit) => {
+                if (minfo.enum_type == null) {
+                    const raw: LValue = this.lower_scalar_literal(
+                        this.cg.get_intern().resolve(lit.value), lit.literal_kind,
+                        minfo.subject_ty);
+                    if (raw.is_valid()) {
+                        v = this.cg.expr_ops.coerce_icmp_operands(subject, raw, minfo.subject_ty);
+                    }
+                }
+            }
+            _ => { }
+        }
+        if (!v.is_valid() || llvm::LLVMIsConstant(v.raw) == 0) { return LValue::null(); }
+        if (llvm::LLVMTypeOf(v.raw) != llvm::LLVMTypeOf(cond.raw)) { return LValue::null(); }
+        return v;
+    }
+
     /// True when an enum pattern's payload requires a value/tag check beyond
     /// the outer variant tag: a literal payload (`Some(5)`) or a nested
     /// sub-pattern (`Some(Some(n))`). Bindings and wildcards need no test.
-    enum_pattern_needs_payload_test(mut &this, epat: EnumPatternNode*) -> boolean {
+    enum_pattern_needs_payload_test(mut &this, epat: EnumPattern*) -> boolean {
         for (mut i: i64 = 0; i < epat.elements.length; i++) {
             const need: boolean = match (epat.elements[i]) {
                 PatternElement::LiteralInt(_)    => { true }
@@ -550,7 +635,7 @@ type struct PatternEmitter {
     /// Recurses for nested enum sub-patterns, so `Some(Some(5))` checks all
     /// levels. Only invoked for ADT enums (those with payloads), so
     /// `subject_ptr` is a real pointer.
-    emit_enum_pattern_test(mut &this, epat: EnumPatternNode*, enum_type: EnumType*,
+    emit_enum_pattern_test(mut &this, epat: EnumPattern*, enum_type: EnumType*,
                            enum_llvm: LType, subject_ptr: LValue,
                            match_bb: LBasicBlock, miss_bb: LBasicBlock,
                            current_fn: LValue, name_prefix_text: string) -> void {
@@ -632,13 +717,14 @@ type struct PatternEmitter {
                     this.cg.builder.build_cond_br(c, success_bb, miss_bb);
                 }
                 PatternElement::Sub(ps) => {
-                    const sub: PatternNode* = ps.pattern as PatternNode*;
-                    const nested_ty: EnumType* = if (sub != null
-                            && sub.pattern_kind == PatternKind::Enum) {
+                    const sub: EnumPattern* = if (ps.pattern != null) {
+                        ps.pattern.enum_payload()
+                    } else { null };
+                    const nested_ty: EnumType* = if (sub != null) {
                         this.payload_enum_type(field_ref)
                     } else { null };
                     if (nested_ty != null) {
-                        this.emit_enum_pattern_test(sub as EnumPatternNode*,
+                        this.emit_enum_pattern_test(sub,
                             nested_ty, field_llvm, field_ptr, success_bb, miss_bb,
                             current_fn, name_prefix_text);
                     } else {
@@ -657,40 +743,27 @@ type struct PatternEmitter {
 
     // Pattern-value lowering
 
-    /// Evaluate a pattern to an LLVM value for comparison.
-    /// `subj_ty` is the Cryo type of the match subject: integer-literal
-    /// patterns are built at the subject's integer width and signedness so
-    /// `match (x: i64) { -1 => ... }` compares against a real i64 `-1`
-    /// instead of a zero-extended-from-i32 `0x00000000FFFFFFFF`.
-    codegen_pattern_value(mut &this, pat: PatternNode*, subj_ty: TypeRef) -> LValue {
-        if (pat.pattern_kind == PatternKind::Literal) {
-            const intern: InternTable* = this.cg.get_intern();
-            return this.lower_scalar_literal(intern.resolve(pat.value),
-                                             pat.literal_kind, subj_ty);
-        } else if (pat.pattern_kind == PatternKind::Identifier) {
-            // Constant-value pattern: `pat.value` holds the const's name (the
-            // resolver set it after recognising the identifier as a `const`)
-            // and `const_res` what that name refers to.  A local constant is
-            // its slot; a module-level one is that module's global under the
-            // leaf - two modules may each declare the leaf, so the leaf alone
-            // names nothing.  Loaded at the subject's width so the comparison
-            // operands agree.  Through the door: a constant pattern's name is
-            // stamped by the name layer or refused there, so an unanswered
-            // slot here is a defect the door records (0 over the corpus).
-            mut slot: LValue = LValue::null();
-            match (pat.const_res.require("pattern_emitter:constant pattern")) {
-                Res::Local(s) => { slot = this.cg.values.get(s); }
-                Res::Def(d)   => {
-                    slot = this.cg.resolver.resolve_global_of_def(d);
-                }
-                _ => {}
+    /// A constant pattern's value, loaded for comparison: `res` says what
+    /// the constant's name refers to.  A local constant is its slot; a
+    /// module-level one is that module's global under the leaf - two modules
+    /// may each declare the leaf, so the leaf alone names nothing.  Loaded at
+    /// the subject's width (`subj_ty`) so the comparison operands agree.
+    /// Through the door: a constant pattern's name is stamped by the name
+    /// layer or refused there, so an unanswered slot here is a defect the
+    /// door records (0 over the corpus).
+    codegen_constant_value(mut &this, pat: ConstantPattern*, subj_ty: TypeRef) -> LValue {
+        mut slot: LValue = LValue::null();
+        match (pat.res.require("pattern_emitter:constant pattern")) {
+            Res::Local(s) => { slot = this.cg.values.get(s); }
+            Res::Def(d)   => {
+                slot = this.cg.resolver.resolve_global_of_def(d);
             }
-            if (slot.is_valid()) {
-                mut ty: LType = this.cg.type_mapper.map_type(subj_ty);
-                if (!ty.is_valid()) { ty = LType::i32(); }
-                return this.cg.builder.build_load(ty, slot, "pat.const");
-            }
-            return LValue::null();
+            _ => {}
+        }
+        if (slot.is_valid()) {
+            mut ty: LType = this.cg.type_mapper.map_type(subj_ty);
+            if (!ty.is_valid()) { ty = LType::i32(); }
+            return this.cg.builder.build_load(ty, slot, "pat.const");
         }
         return LValue::null();
     }
@@ -701,9 +774,9 @@ type struct PatternEmitter {
     /// from the text alone - `0` (Integer) and `'0'` (Char) both intern to
     /// "0", and `true`/`false` intern to "true"/"false".  Integer literals
     /// are built at the subject's width and signedness so the icmp operands
-    /// match without a lossy widen.  Shared by the single-literal pattern
-    /// path (`codegen_pattern_value`) and both bounds of a range pattern
-    /// (`codegen_range_compare`).
+    /// match without a lossy widen: `match (x: i64) { -1 => ... }` compares
+    /// against a real i64 `-1`, not a zero-extended i32.  Shared by a literal
+    /// pattern and both bounds of a range pattern (`codegen_range_compare`).
     lower_scalar_literal(mut &this, text: string, lit_kind: LiteralKind,
                          subj_ty: TypeRef) -> LValue {
         if (lit_kind == LiteralKind::Char) {
@@ -742,14 +815,14 @@ type struct PatternEmitter {
     /// unsigned, which is what we want (char code points are non-negative
     /// and stored as unsigned i32).  Returns null if either bound fails to
     /// lower, leaving the caller to treat the arm as a non-matching miss.
-    codegen_range_compare(mut &this, pat: PatternNode*, subj_ty: TypeRef,
+    codegen_range_compare(mut &this, pat: RangePattern*, subj_ty: TypeRef,
                           subject: LValue, name_prefix_text: string) -> LValue {
         const name_prefix: string = name_prefix_text;
         const intern: InternTable* = this.cg.get_intern();
         const lo_val: LValue = this.lower_scalar_literal(
-            intern.resolve(pat.value), pat.literal_kind, subj_ty);
+            intern.resolve(pat.low), pat.literal_kind, subj_ty);
         const hi_val: LValue = this.lower_scalar_literal(
-            intern.resolve(pat.high_value), pat.literal_kind, subj_ty);
+            intern.resolve(pat.high), pat.literal_kind, subj_ty);
         if (!lo_val.is_valid() || !hi_val.is_valid()) { return LValue::null(); }
 
         const lo_c: LValue = this.cg.expr_ops.coerce_icmp_operands(

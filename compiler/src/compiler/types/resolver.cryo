@@ -20,7 +20,7 @@ import compiler::types::{
 import compiler::ast;
 import compiler::ast::{
     ArrayAnnotation, declaration, expression, FunctionAnnotation, GenericAnnotation,
-    ImplTraitAnnotation, NamedAnnotation, node, NodeKind, ProjectionAnnotation, statement,
+    ImplTraitAnnotation, NamedAnnotation, node, ObjectAnnotation, ProjectionAnnotation, statement,
     TraitBound, TraitRef, TupleAnnotation, TypeAnnotation
 };
 import compiler::resolver::{ symbol_str, intern_table, resolver };
@@ -39,7 +39,7 @@ import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, Res, ResBase, ResSlot };
 import compiler::types::compound;
 import compiler::types::compound::{
-    ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
+    ArrayType, FunctionType, ObjectType, OptionalType, PointerType, ReferenceType, TupleType
 };
 import compiler::types::generic::{ AssocProjectionType, InstantiatedType };
 import compiler::types::type_base;
@@ -48,12 +48,11 @@ import compiler::types::user_defined;
 import compiler::types::user_defined::{ TypeAliasType };
 import std::fmt;
 import compiler::ast::declaration::{
-    FieldDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode, MethodNode,
-    TraitDeclNode, TypeAliasDeclNode, VarDeclNode
+    DeclarationNode, FieldDecl, FunctionDecl, GenericParamDecl, ImplBlock, MethodDecl,
+    TraitDecl, TypeAliasDecl, VarDecl
 };
-import compiler::ast::expression::{ ExpressionNode, StructLiteralNode };
-import compiler::ast::node::{ ASTNode };
-import compiler::ast::statement::{ BlockStmtNode, IfStmtNode, ReturnStmtNode, StatementNode };
+import compiler::ast::expression::{ ExpressionNode, StructExpr };
+import compiler::ast::statement::{ Stmt, StmtKind };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::sink::{ DiagnosticSink };
 import compiler::diag::source_span::{ SourceSpan };
@@ -67,7 +66,7 @@ import compiler::types::substitution;
 import compiler::types::substitution::{ TypeSubstitution };
 import compiler::types::trait_checker;
 import compiler::types::trait_checker::{ TraitChecker };
-import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
+import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry, TemplateKind };
 import compiler::types::inference::{ InferCtx };
 import compiler::types::type_ref::{ TypeRef };
 
@@ -178,13 +177,15 @@ type struct ResolutionContext {
     set_this_type(mut &this, t: TypeRef) -> void {
         this.this_type = t;
     }
+}
 
-    /// Deep copy.  A bitwise `*ctx` copy aliases the owning
-    /// `generic_bindings` buffer between the original and the copy, so a
-    /// later `push`/realloc on either invalidates the other and end-of-scope
-    /// drop-glue frees one buffer twice (double-free).  This produces an
-    /// independent context with its own binding storage.  The element types
-    /// are POD (interned ids), so the per-element copies are trivial.
+/// Deep copy.  A bitwise `*ctx` copy aliases the owning
+/// `generic_bindings` buffer between the original and the copy, so a
+/// later `push`/realloc on either invalidates the other and end-of-scope
+/// drop-glue frees one buffer twice (double-free).  This produces an
+/// independent context with its own binding storage.  The element types
+/// are POD (interned ids), so the per-element copies are trivial.
+implement trait Clone for struct ResolutionContext {
     clone(&this) -> ResolutionContext {
         mut out: ResolutionContext = ResolutionContext::new(this.source_file);
         out.this_type = this.this_type;
@@ -296,6 +297,138 @@ type struct TypeResolver {
         return 0;
     }
 
+    /// The trait object type `o` spells: the trait the name layer placed
+    /// under `virtual`, with its written arguments resolved.  Invalid when
+    /// the name layer refused it or placed no trait there (it has reported
+    /// that where it is written), or when an argument does not resolve.
+    resolve_object(&this, o: ObjectAnnotation*, ctx: ResolutionContext*) -> TypeRef {
+        if (o.refused || this.decl_index == null || this.generic_registry == null) { return TypeRef::invalid(); }
+        if (TypeAnnotation::refused(o.trait_annotation)) { return TypeRef::invalid(); }
+        const trait_def: DefId = TypeAnnotation::trait_def(o.trait_annotation);
+        if (!trait_def.is_valid() || this.generic_registry.get_trait_decl(trait_def) == null) { return TypeRef::invalid(); }
+        const trait_type: TypeRef = this.decl_index.type_of_def(trait_def);
+        if (!trait_type.is_valid()) { return TypeRef::invalid(); }
+        mut args: [TypeRef] = [];
+        match (*o.trait_annotation) {
+            TypeAnnotation::Generic(g) => {
+                for (mut i: i64 = 0; i < g.args.length; i++) {
+                    const arg: TypeRef = this.resolve(g.args[i], ctx);
+                    if (!arg.is_valid()) { return TypeRef::invalid(); }
+                    args.push(arg);
+                }
+            }
+            _ => { }
+        }
+        return this.arena.get_object(trait_def, trait_type, args, o.form);
+    }
+
+    /// `ty`, read off the declaration of the trait `trait_def`, with the
+    /// trait's arguments `args` put in: the trait's own parameters are the
+    /// leading positions, its associated types the trailing ones in
+    /// declaration order, as a bound and an object type write them.  An
+    /// invalid argument leaves its parameter or projection as it is.
+    substitute_trait_arguments(&this, ty: TypeRef, trait_def: DefId, args: &[TypeRef]) -> TypeRef {
+        const decl: TraitDecl* = this.generic_registry.get_trait_decl(trait_def);
+        if (decl == null) { return ty; }
+        mut out: TypeRef = ty;
+        mut params: [TypeRef] = [];
+        mut bound: [TypeRef] = [];
+        for (mut g: i64 = 0; g < decl.generic_params.length && g < args.length; g++) {
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(decl.generic_params[g]);
+            if (gp == null || !args[g].is_valid()) { continue; }
+            params.push(this.arena.create_generic_param(gp.sym_id, gp.name, g as u64));
+            bound.push(args[g]);
+        }
+        if (params.length > 0) {
+            const by_param: TypeSubstitution = TypeSubstitution::from_params(&params, &bound);
+            out = by_param.apply(out, this.arena);
+        }
+        const trait_ty: TypeRef = this.decl_index.type_of_def(trait_def);
+        for (mut a: i64 = 0; a < decl.assoc_types.length; a++) {
+            if (decl.assoc_types[a] == null) { continue; }
+            const at: i64 = decl.generic_params.length + a;
+            if (at >= args.length || !args[at].is_valid()) { continue; }
+            out = this.arena.substitute_assoc_slot(out, trait_ty, a, args[at]);
+        }
+        return out;
+    }
+
+    /// The arguments an object of `object`'s type gives the trait
+    /// `declaring`, one per position of that trait's parameters and then
+    /// its associated types: the object's own, written on it, when
+    /// `declaring` is the object's trait; for a supertrait, what the
+    /// subtrait writes on it with the subtrait's own arguments put in,
+    /// along the first path the table's layout reaches it by
+    /// (`GenericRegistry::object_table_traits`).  A position nothing binds,
+    /// such as an associated type of a supertrait written without
+    /// arguments, is invalid.  Empty when no path reaches `declaring`.
+    object_trait_arguments(&this, object: ObjectType*, declaring: DefId) -> [TypeRef] {
+        mut open: [DefId] = [];
+        mut out: [TypeRef] = [];
+        this.trait_arguments_along(object.trait_def, &object.args, declaring, &open, &out);
+        return out;
+    }
+
+    trait_arguments_along(&this, trait_def: DefId, args: &[TypeRef], declaring: DefId,
+                          open: mut &[DefId], out: mut &[TypeRef]) -> boolean {
+        const decl: TraitDecl* = this.generic_registry.get_trait_decl(trait_def);
+        if (decl == null) { return false; }
+        if (trait_def.equals(declaring)) {
+            const positions: i64 = decl.generic_params.length + decl.assoc_types.length;
+            for (mut i: i64 = 0; i < positions; i++) {
+                out.push(if (i < args.length) { args[i] } else { TypeRef::invalid() });
+            }
+            return true;
+        }
+        for (mut j: i64 = 0; j < open.length; j++) {
+            if (open[j].equals(trait_def)) { return false; }
+        }
+        open.push(trait_def);
+        for (mut i: i64 = 0; i < decl.base_traits.length; i++) {
+            const base_args: [TypeRef] = this.supertrait_arguments(trait_def, args, i);
+            if (this.trait_arguments_along(decl.base_traits[i].definition(), &base_args, declaring, open, out)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// The arguments the trait `trait_def`, given `args` (its parameters,
+    /// then its associated types), gives its `index`-th supertrait: the
+    /// ones written on the supertrait, with `args` put in for the trait's
+    /// own parameters and associated types.  A position the supertrait is
+    /// written without, or whose argument names something `args` leaves
+    /// unbound, is invalid or absent.
+    supertrait_arguments(&this, trait_def: DefId, args: &[TypeRef], index: i64) -> [TypeRef] {
+        mut out: [TypeRef] = [];
+        const decl: TraitDecl* = this.generic_registry.get_trait_decl(trait_def);
+        if (decl == null || index < 0 || index >= decl.base_traits.length) { return out; }
+        mut rc: ResolutionContext = ResolutionContext::new("");
+        for (mut g: i64 = 0; g < decl.generic_params.length && g < args.length; g++) {
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(decl.generic_params[g]);
+            if (gp != null && args[g].is_valid()) { rc.add_binding(gp.sym_id, gp.name, args[g]); }
+        }
+        for (mut a: i64 = 0; a < decl.assoc_types.length; a++) {
+            const at: i64 = decl.generic_params.length + a;
+            if (at < args.length && args[at].is_valid()) { rc.add_assoc_binding(trait_def, a, args[at]); }
+        }
+        const base: TraitRef* = &decl.base_traits[index];
+        for (mut k: i64 = 0; k < base.type_args.length; k++) {
+            out.push(this.resolve(base.type_args[k], &rc));
+        }
+        return out;
+    }
+
+    /// The type `ty` of a method `declaring` declares, as a call through an
+    /// object of `object`'s type sees it: the trait's arguments the object
+    /// gives (`object_trait_arguments`) put in.  Sema types the call by it
+    /// and code generation classifies the call's signature by it, so the
+    /// two agree.
+    object_method_type(&this, object: ObjectType*, declaring: DefId, ty: TypeRef) -> TypeRef {
+        const args: [TypeRef] = this.object_trait_arguments(object, declaring);
+        return this.substitute_trait_arguments(ty, declaring, &args);
+    }
+
     /// Resolve a TypeAnnotation to a TypeRef.
     resolve(&this, ann: TypeAnnotation*, ctx: ResolutionContext*) -> TypeRef {
         if (ann == null) {
@@ -336,6 +469,9 @@ type struct TypeResolver {
                     mutability = RefMutability::Mutable;
                 }
                 return this.arena.get_reference_to(inner, mutability);
+            }
+            TypeAnnotation::Object(o) => {
+                return this.resolve_object(o, ctx);
             }
             TypeAnnotation::Array(a) => {
                 mut elem: TypeRef = this.resolve(a.element, ctx);
@@ -417,7 +553,7 @@ type struct TypeResolver {
 
         match (*proj.base) {
             TypeAnnotation::ThisType(_tt) => {
-                const owner_decl: TraitDeclNode* = if (this.generic_registry == null) { null } else {
+                const owner_decl: TraitDecl* = if (this.generic_registry == null) { null } else {
                     this.generic_registry.get_trait_decl(proj.owner_trait) };
                 if (owner_decl != null) {
                     const b: TypeRef = ctx.lookup_assoc_binding(
@@ -468,7 +604,7 @@ type struct TypeResolver {
     /// asks by the leaf again.
     project_member(&this, base_ty: TypeRef, member: SymbolStr,
                    owning_trait: TypeRef, ctx: ResolutionContext*) -> TypeRef {
-        const owner: TraitDeclNode* = this.trait_decl_of(owning_trait);
+        const owner: TraitDecl* = this.trait_decl_of(owning_trait);
         const slot: i64 = if (owner == null) { -1 } else { owner.assoc_type_index(member) };
         if (slot >= 0) { return this.project_slot(base_ty, owning_trait, slot); }
         // The source names no trait, or the trait declares no such type: the
@@ -484,7 +620,7 @@ type struct TypeResolver {
     project_slot(&this, base_ty: TypeRef, owning_trait: TypeRef, slot: i64) -> TypeRef {
         const bt: Type* = this.arena.lookup(base_ty);
         if (bt == null) { return TypeRef::invalid(); }
-        const owner: TraitDeclNode* = this.trait_decl_of(owning_trait);
+        const owner: TraitDecl* = this.trait_decl_of(owning_trait);
         if (owner == null || slot < 0 || slot >= owner.assoc_types.length || owner.assoc_types[slot] == null) {
             return TypeRef::invalid();
         }
@@ -502,7 +638,7 @@ type struct TypeResolver {
 
     /// The registered declaration of the trait `trait_ty`, or null when it
     /// names none.
-    trait_decl_of(&this, trait_ty: TypeRef) -> TraitDeclNode* {
+    trait_decl_of(&this, trait_ty: TypeRef) -> TraitDecl* {
         if (this.generic_registry == null || this.decl_index == null) { return null; }
         return this.generic_registry.get_trait_decl(this.decl_index.def_of(trait_ty, this.arena));
     }
@@ -512,7 +648,7 @@ type struct TypeResolver {
     /// is invalid (the projection names no trait) or names no registered
     /// trait.
     concrete_projection(&this, base_ty: TypeRef, slot: i64, owning_trait: TypeRef) -> TypeRef {
-        const owner: TraitDeclNode* = this.trait_decl_of(owning_trait);
+        const owner: TraitDecl* = this.trait_decl_of(owning_trait);
         mut rc: ResolutionContext = ResolutionContext::new("");
         return this.resolve_concrete_member(base_ty, slot, owner, &rc);
     }
@@ -530,7 +666,7 @@ type struct TypeResolver {
         if (t == null) { return ty; }
         match (t.kind) {
             TypeKind::AssocProjection => {
-                const proj: AssocProjectionType* = t as AssocProjectionType*;
+                const proj: AssocProjectionType* = t.as_assoc_projection();
                 if (proj.resolved_type.is_valid()) { return proj.resolved_type; }
                 const base: TypeRef = this.reduce_projections(proj.base, memo);
                 const reduced: TypeRef = this.concrete_projection(base, proj.slot, proj.owning_trait);
@@ -539,31 +675,31 @@ type struct TypeResolver {
                 return reduced;
             }
             TypeKind::Pointer => {
-                const p: PointerType* = t as PointerType*;
+                const p: PointerType* = t.as_pointer();
                 const inner: TypeRef = this.reduce_projections(p.pointee, memo);
                 if (inner.equals(p.pointee)) { return ty; }
                 return this.arena.get_pointer_to(inner);
             }
             TypeKind::Reference => {
-                const r: ReferenceType* = t as ReferenceType*;
+                const r: ReferenceType* = t.as_reference();
                 const inner: TypeRef = this.reduce_projections(r.referent, memo);
                 if (inner.equals(r.referent)) { return ty; }
                 return this.arena.get_reference_to(inner, r.mutability);
             }
             TypeKind::Array => {
-                const a: ArrayType* = t as ArrayType*;
+                const a: ArrayType* = t.as_array();
                 const inner: TypeRef = this.reduce_projections(a.element, memo);
                 if (inner.equals(a.element)) { return ty; }
                 return this.arena.get_array_of(inner, a.size);
             }
             TypeKind::Optional => {
-                const o: OptionalType* = t as OptionalType*;
+                const o: OptionalType* = t.as_optional();
                 const inner: TypeRef = this.reduce_projections(o.wrapped, memo);
                 if (inner.equals(o.wrapped)) { return ty; }
                 return this.arena.get_optional_of(inner);
             }
             TypeKind::Function => {
-                const f: FunctionType* = t as FunctionType*;
+                const f: FunctionType* = t.as_function();
                 const new_ret: TypeRef = this.reduce_projections(f.return_type, memo);
                 mut changed: boolean = !new_ret.equals(f.return_type);
                 mut new_params: [TypeRef] = [];
@@ -576,7 +712,7 @@ type struct TypeResolver {
                 return this.arena.get_function(new_ret, new_params, f.is_variadic);
             }
             TypeKind::Tuple => {
-                const tup: TupleType* = t as TupleType*;
+                const tup: TupleType* = t.as_tuple();
                 mut changed_t: boolean = false;
                 mut new_elems: [TypeRef] = [];
                 for (mut i: i64 = 0; i < tup.elements.length; i++) {
@@ -588,7 +724,7 @@ type struct TypeResolver {
                 return this.arena.get_tuple(new_elems);
             }
             TypeKind::InstantiatedType => {
-                const inst: InstantiatedType* = t as InstantiatedType*;
+                const inst: InstantiatedType* = t.as_instantiated();
                 mut changed_i: boolean = false;
                 mut new_args: [TypeRef] = [];
                 for (mut i: i64 = 0; i < inst.type_args.length; i++) {
@@ -638,7 +774,7 @@ type struct TypeResolver {
     /// declaring something of that name was meant is not a question a
     /// search can settle.  Invalid when nothing applies.
     resolve_concrete_member(&this, base_ty_in: TypeRef, slot: i64,
-                            owner: TraitDeclNode*, ctx: ResolutionContext*) -> TypeRef {
+                            owner: TraitDecl*, ctx: ResolutionContext*) -> TypeRef {
         if (this.generic_registry == null) { return TypeRef::invalid(); }
         // The base is used directly whether it is a pre-mono InstantiatedType
         // wrapper or a post-mono concrete spec: `carries_impl_key` asks the
@@ -647,6 +783,15 @@ type struct TypeResolver {
         const base_ty: TypeRef = base_ty_in;
         const bt: Type* = this.arena.lookup(base_ty);
         if (bt == null) { return TypeRef::invalid(); }
+        // An object binds its trait's associated types, and its supertraits',
+        // in its own type arguments; the implementation the compiler makes
+        // for it binds them so.
+        if (bt.kind == TypeKind::Object && owner != null) {
+            const bound: [TypeRef] = this.object_trait_arguments(bt.as_object(), owner.def);
+            const at: i64 = owner.generic_params.length + slot;
+            if (at >= bound.length) { return TypeRef::invalid(); }
+            return bound[at];
+        }
         if (!this.arena.carries_impl_key(base_ty, this.intern_table)) { return TypeRef::invalid(); }
         if (owner == null) { return TypeRef::invalid(); }
 
@@ -663,15 +808,15 @@ type struct TypeResolver {
         }
 
         for (mut i: i64 = 0; i < this.generic_registry.trait_decl_nodes.length; i++) {
-            const tdecl: TraitDeclNode* = this.generic_registry.trait_decl_nodes[i];
+            const tdecl: TraitDecl* = this.generic_registry.trait_decl_nodes[i];
             if (tdecl != owner) { continue; }
             const assoc_pos: i64 = slot;
             if (assoc_pos < 0 || assoc_pos >= tdecl.assoc_types.length) { continue; }
             // The WRITTEN head, whose positional trait arguments carry the
             // binding; a placed clone has substituted them away.
-            const impl_node: ImplBlockNode* =
+            const impl_node: ImplBlock* = DeclarationNode::impl_of(
                 this.generic_registry.template_head_for(
-                    this.generic_registry.trait_decl_keys[i], base_ty, this.intern_table);
+                    this.generic_registry.trait_decl_keys[i], base_ty, this.intern_table));
             if (impl_node == null) { continue; }
 
             const ann: TypeAnnotation* = impl_node.trait_slot_annotation(
@@ -706,9 +851,19 @@ type struct TypeResolver {
             const r: TypeRef = this.resolve(ann, &bctx);
             if (r.is_valid()) {
                 const rt: Type* = this.arena.lookup(r);
-                // Guard against returning another unresolved projection.
                 if (rt != null && rt.kind != TypeKind::AssocProjection) {
                     return r;
+                }
+                // A projection on one of the base's own arguments is the
+                // answer while that argument is still abstract:
+                // `FilterIter<I>::Item` is `I::Item`, which the caller reduces
+                // through `I`'s bound.  Any other projection names a parameter
+                // of the implementation that nothing bound.
+                if (rt != null) {
+                    const projected_base: TypeRef = rt.as_assoc_projection().base;
+                    for (mut ai: i64 = 0; ai < base_args.length; ai++) {
+                        if (base_args[ai].equals(projected_base)) { return r; }
+                    }
                 }
             }
         }
@@ -740,7 +895,7 @@ type struct TypeResolver {
         const traits: [DefId] = this.generic_registry.trait_and_supertraits(trait_def);
         mut found: DefId = DefId::invalid();
         for (mut i: i64 = 0; i < traits.length; i++) {
-            const tdecl: TraitDeclNode* = this.generic_registry.get_trait_decl(traits[i]);
+            const tdecl: TraitDecl* = this.generic_registry.get_trait_decl(traits[i]);
             if (tdecl == null || tdecl.assoc_type_index(member) < 0) { continue; }
             if (found.is_valid() && !found.equals(traits[i])) { return TypeRef::invalid(); }
             found = traits[i];
@@ -760,10 +915,30 @@ type struct TypeResolver {
     concrete_trait_slots(&this, subject: TypeRef, trait_id: DefId) -> [TypeRef] {
         mut out: [TypeRef] = [];
         if (this.generic_registry == null) { return out; }
-        const impl_node: ImplBlockNode* =
-            this.generic_registry.template_head_for(trait_id, subject, this.intern_table);
+        // An object gives its trait, and each supertrait, the arguments
+        // written on it, as the implementation the compiler makes for it does.
+        const st: Type* = this.arena.lookup(subject);
+        if (st != null && st.kind == TypeKind::Object) {
+            return this.object_trait_arguments(st.as_object(), trait_id);
+        }
+        // A type parameter has no implementation to read: each associated
+        // type is its projection on the parameter (`I::Item`), which a reader
+        // reduces through the parameter's own bound, and each of the trait's
+        // parameters is left unbound.
+        if (st != null && st.kind == TypeKind::GenericParam) {
+            const param_trait: TraitDecl* = this.generic_registry.get_trait_decl(trait_id);
+            if (param_trait == null || this.decl_index == null) { return out; }
+            const trait_ty: TypeRef = this.decl_index.type_of_def(trait_id);
+            for (mut gi: i64 = 0; gi < param_trait.generic_params.length; gi++) { out.push(TypeRef::invalid()); }
+            for (mut ai: i64 = 0; ai < param_trait.assoc_types.length; ai++) {
+                out.push(this.project_slot(subject, trait_ty, ai));
+            }
+            return out;
+        }
+        const impl_node: ImplBlock* = DeclarationNode::impl_of(
+            this.generic_registry.template_head_for(trait_id, subject, this.intern_table));
         if (impl_node == null) { return out; }
-        const tdecl: TraitDeclNode* = this.generic_registry.get_trait_decl(trait_id);
+        const tdecl: TraitDecl* = this.generic_registry.get_trait_decl(trait_id);
         if (tdecl == null) { return out; }
         // `ann` is the impl block's own text; its scope is the file that
         // block is written in, never the subject's or the asker's.
@@ -801,7 +976,7 @@ type struct TypeResolver {
     /// `resolve_concrete_member` so a chain of adapters bottoms out at the
     /// source. Only simple `Named` param args are bound (a projection or
     /// concrete arg names no generic to derive); existing bindings are kept.
-    derive_where_assoc_bindings(&this, impl_node: ImplBlockNode*,
+    derive_where_assoc_bindings(&this, impl_node: ImplBlock*,
                                 bctx: ResolutionContext*) -> void {
         if (impl_node == null) { return; }
         for (mut bi: i64 = 0; bi < impl_node.where_bounds.length; bi++) {
@@ -811,7 +986,7 @@ type struct TypeResolver {
             for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
                 const tr: TraitRef* = &bound.trait_refs[ti];
                 if (tr.path.length == 0) { continue; }
-                const tdecl: TraitDeclNode* =
+                const tdecl: TraitDecl* =
                     this.generic_registry.get_trait_decl(tr.definition());
                 if (tdecl == null) { continue; }
                 const ngp: i64 = tdecl.generic_params.length;
@@ -835,8 +1010,14 @@ type struct TypeResolver {
                     if (tdecl.assoc_types[assoc_idx] == null) { continue; }
                     const arg_ann: TypeAnnotation* = tr.type_args[ai];
                     if (arg_ann == null) { continue; }
-                    const derived: TypeRef =
-                        this.resolve_concrete_member(subject, assoc_idx, tdecl, bctx);
+                    // A subject still a type parameter has no implementation
+                    // to read: its member is its projection (`A` in
+                    // `I: Iterator<A>` is `I::Item`).
+                    const derived: TypeRef = if (this.arena.lookup(subject).kind == TypeKind::GenericParam) {
+                        this.concrete_trait_slots(subject, tr.definition())[ngp + assoc_idx]
+                    } else {
+                        this.resolve_concrete_member(subject, assoc_idx, tdecl, bctx)
+                    };
                     if (derived.is_valid()) {
                         this.bind_where_arg_into_ctx(arg_ann, derived, bctx);
                     }
@@ -864,14 +1045,14 @@ type struct TypeResolver {
                 const ct: Type* = this.arena.lookup(concrete);
                 if (ct != null && ct.kind == TypeKind::Pointer) {
                     this.bind_where_arg_into_ctx(p.inner,
-                        (ct as PointerType*).pointee, bctx);
+                        ct.as_pointer().pointee, bctx);
                 }
             }
             TypeAnnotation::Reference(r) => {
                 const ct: Type* = this.arena.lookup(concrete);
                 if (ct != null && ct.kind == TypeKind::Reference) {
                     this.bind_where_arg_into_ctx(r.inner,
-                        (ct as ReferenceType*).referent, bctx);
+                        ct.as_reference().referent, bctx);
                 }
             }
             _ => {}
@@ -928,7 +1109,7 @@ type struct TypeResolver {
             for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
                 const tr: TraitRef* = &bound.trait_refs[ti];
                 if (tr.path.length == 0) { continue; }
-                const tdecl: TraitDeclNode* = this.generic_registry.get_trait_decl(tr.definition());
+                const tdecl: TraitDecl* = this.generic_registry.get_trait_decl(tr.definition());
                 if (tdecl == null) { continue; }
                 const ngp: i64 = tdecl.generic_params.length;
                 for (mut ai: i64 = 0; ai < tr.type_args.length; ai++) {
@@ -1073,10 +1254,11 @@ type struct TypeResolver {
     // Batch resolution helpers (shared by TypeResolution & Monomorphizer)
 
     /// Resolve a function's return type and parameter type annotations.
-    /// Sets resolved_return_type on the FunctionDeclNode and resolved_type
-    /// on each parameter VarDeclNode.
-    resolve_func_signature(&this, func: FunctionDeclNode*,
+    /// Sets resolved_return_type on the FunctionDecl and resolved_type
+    /// on each parameter VarDecl.
+    resolve_func_signature(&this, func_decl: DeclarationNode*,
                            res_ctx: ResolutionContext*) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return; }
         const _fname: string = this.intern_table.resolve(func.name);
         cdebug("[ResFuncSig] enter func=%p '%s' params=%lld body=%p ret_ann=%p\n",
@@ -1097,7 +1279,7 @@ type struct TypeResolver {
                 // both non-generic methods (concrete body) and generic
                 // templates / specializations (body already substituted by
                 // the time the spec path re-enters this function).
-                this.infer_impl_trait_return(func, res_ctx);
+                this.infer_impl_trait_return(func_decl, res_ctx);
             }
         }
         // Default to void if no return type annotation was provided.
@@ -1108,7 +1290,8 @@ type struct TypeResolver {
 
         // Resolve parameter types
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
-            const param: VarDeclNode* = func.parameters[i];
+            const param_decl: DeclarationNode* = func.parameters[i];
+            const param: VarDecl* = DeclarationNode::var_of(param_decl);
             if (param == null) { continue; }
             if (param.type_annotation != null && !param.resolved_type.is_valid()) {
                 const ptype: TypeRef = this.resolve(param.type_annotation, res_ctx);
@@ -1150,8 +1333,9 @@ type struct TypeResolver {
     /// (`return SomeIter<T> { ... }`), which covers every collection iterator
     /// entry point; other shapes leave the return unresolved (a clear
     /// downstream error rather than a silent miscompile).
-    infer_impl_trait_return(&this, func: FunctionDeclNode*,
+    infer_impl_trait_return(&this, func_decl: DeclarationNode*,
                             res_ctx: ResolutionContext*) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.return_type_annotation == null) { return; }
         mut imp: ImplTraitAnnotation* = null;
         match (*func.return_type_annotation) {
@@ -1178,12 +1362,8 @@ type struct TypeResolver {
     /// types in a specialized body) and resolved through `res_ctx`.
     type_of_impl_return_expr(&this, expr: ExpressionNode*,
                              res_ctx: ResolutionContext*) -> TypeRef {
-        if (expr == null) { return TypeRef::invalid(); }
-        const node: ASTNode* = expr as ASTNode*;
-        if (node.kind != NodeKind::StructLiteral) {
-            return TypeRef::invalid();
-        }
-        const sl: StructLiteralNode* = expr as StructLiteralNode*;
+        const sl: StructExpr* = ExpressionNode::struct_of(expr);
+        if (sl == null) { return TypeRef::invalid(); }
         // The literal already carries what its own name refers to, so the
         // annotation synthesized from it inherits that answer instead of
         // being handed a `Pending` for a name that is in fact resolved.  A
@@ -1206,58 +1386,45 @@ type struct TypeResolver {
                 base: result_ann,
                 args: cloned_args,
                 span: SourceSpan::none(),
+                refused: false,
             };
             result_ann = new TypeAnnotation::Generic(gen);
         }
         return this.resolve(result_ann, res_ctx);
     }
 
-    /// First `return <expr>;` expression reachable from `block`, descending
+    /// First `return <expr>;` expression reachable from `stmt`, descending
     /// through nested blocks and `if` branches.  All returns of an
     /// `implement Trait` body must yield the same concrete type, so the first one
     /// is authoritative.
-    find_first_return_expr(&this, block: BlockStmtNode*) -> ExpressionNode* {
-        if (block == null) { return null; }
-        for (mut i: i64 = 0; i < block.statements.length; i++) {
-            const e: ExpressionNode* =
-                this.find_first_return_expr_in_stmt(block.statements[i]);
-            if (e != null) { return e; }
-        }
-        return null;
-    }
-
-    find_first_return_expr_in_stmt(&this, stmt: StatementNode*) -> ExpressionNode* {
+    find_first_return_expr(&this, stmt: Stmt*) -> ExpressionNode* {
         if (stmt == null) { return null; }
-        const node: ASTNode* = stmt as ASTNode*;
-        match (node.kind) {
-            NodeKind::ReturnStatement => {
-                const rs: ReturnStmtNode* = stmt as ReturnStmtNode*;
+        match (stmt.kind) {
+            StmtKind::Return(rs) => {
                 return rs.expression;
             }
-            NodeKind::BlockStatement => {
-                return this.find_first_return_expr(stmt as BlockStmtNode*);
-            }
-            NodeKind::IfStatement => {
-                const ifs: IfStmtNode* = stmt as IfStmtNode*;
-                if (ifs.then_stmt != null) {
-                    const e: ExpressionNode* =
-                        this.find_first_return_expr_in_stmt(ifs.then_stmt);
+            StmtKind::Block(b) => {
+                for (mut i: i64 = 0; i < b.statements.length; i++) {
+                    const e: ExpressionNode* = this.find_first_return_expr(b.statements[i]);
                     if (e != null) { return e; }
                 }
-                if (ifs.has_else() && ifs.else_stmt != null) {
-                    return this.find_first_return_expr_in_stmt(ifs.else_stmt);
-                }
                 return null;
+            }
+            StmtKind::If(ifs) => {
+                const e: ExpressionNode* = this.find_first_return_expr(ifs.then_stmt);
+                if (e != null) { return e; }
+                return this.find_first_return_expr(ifs.else_stmt);
             }
             _ => { return null; }
         }
     }
 
-    /// Resolve type annotations on an array of FieldDeclNode.
-    resolve_fields(&this, fields: &[FieldDeclNode*],
+    /// Resolve type annotations on a type's field declarations.
+    resolve_fields(&this, fields: &[DeclarationNode*],
                    res_ctx: ResolutionContext*) -> void {
         for (mut i: i64 = 0; i < fields.length; i++) {
-            const field: FieldDeclNode* = fields[i];
+            const field_decl: DeclarationNode* = fields[i];
+            const field: FieldDecl* = DeclarationNode::field_of(field_decl);
             if (field == null) { continue; }
             if (field.type_annotation != null && !field.resolved_type.is_valid()) {
                 const ftype: TypeRef = this.resolve(field.type_annotation, res_ctx);
@@ -1268,7 +1435,7 @@ type struct TypeResolver {
         }
     }
 
-    /// Resolve all method signatures ([MethodNode*]) on a struct/class/impl.
+    /// Resolve all method signatures ([DeclarationNode*]) on a struct/impl.
     /// `owner_type` is the receiver type, used to back-fill the
     /// `this`/`&this` parameter's resolved_type, which the parser leaves
     /// unset because the receiver is implicit-typed.  Without this, by-value
@@ -1276,7 +1443,7 @@ type struct TypeResolver {
     /// codegen with no resolved_type and gets dropped from the function's
     /// LLVM signature, producing a 0-arg `define` for what should be a
     /// 1-arg method.
-    resolve_method_signatures(&this, methods: &[MethodNode*],
+    resolve_method_signatures(&this, methods: &[DeclarationNode*],
                               res_ctx: ResolutionContext*,
                               owner_type: TypeRef,
                               owner_def: DefId,
@@ -1289,17 +1456,19 @@ type struct TypeResolver {
         }
         cdebug("[ResMthSig] count=%lld owner_id=%d\n", methods.length, owner_type.key() as i32);
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const method: MethodNode* = methods[i];
+            const method_decl: DeclarationNode* = methods[i];
+            const method: MethodDecl* = DeclarationNode::method_of(method_decl);
             if (method == null || method.func == null) { continue; }
 
-            const _mname: string = this.intern_table.resolve(method.func.name);
-            cdebug("[ResMthSig]   [%lld] method='%s' generic=%d\n", i, _mname, method.func.is_generic() as i32);
+            const _mname: string = this.intern_table.resolve(DeclarationNode::fn_of(method.func).name);
+            cdebug("[ResMthSig]   [%lld] method='%s' generic=%d\n", i, _mname, DeclarationNode::fn_of(method.func).is_generic() as i32);
 
             // If the method itself is generic, bind its own params
-            if (method.func.is_generic()) {
+            if (DeclarationNode::fn_of(method.func).is_generic()) {
                 mut method_ctx: ResolutionContext = res_ctx.clone();
-                for (mut j: i64 = 0; j < method.func.generic_params.length; j++) {
-                    const gp: GenericParamNode* = method.func.generic_params[j];
+                for (mut j: i64 = 0; j < DeclarationNode::fn_of(method.func).generic_params.length; j++) {
+                    const gp_decl: DeclarationNode* = DeclarationNode::fn_of(method.func).generic_params[j];
+                    const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
                     const gp_ref: TypeRef = this.create_param_type(gp, j as u64);
                     method_ctx.add_binding(gp.sym_id, gp.name, gp_ref);
                 }
@@ -1328,17 +1497,18 @@ type struct TypeResolver {
             // is often invalid at this pass (the receiver is back-filled later),
             // so a TypeRef-identity check would silently never fire.
             if (owner_def.is_valid()
-                    && !method.func.is_generic()
+                    && !DeclarationNode::fn_of(method.func).is_generic()
                     && !method.is_static
-                    && !method.func.is_self_returning_default
-                    && !method.func.is_lazy_self_growing) {
+                    && !DeclarationNode::fn_of(method.func).is_self_returning_default
+                    && !DeclarationNode::fn_of(method.func).is_lazy_self_growing) {
                 const owner_base: TypeRef = this.decl_index.type_of_def(owner_def);
-                mut grows: boolean = method.func.resolved_return_type.is_valid()
+                mut grows: boolean = DeclarationNode::fn_of(method.func).resolved_return_type.is_valid()
                     && this.arena.is_self_growing_instantiation(
-                           method.func.resolved_return_type, owner_base);
+                           DeclarationNode::fn_of(method.func).resolved_return_type, owner_base);
                 if (!grows) {
-                    for (mut gp: i64 = 0; gp < method.func.parameters.length; gp++) {
-                        const gparam: VarDeclNode* = method.func.parameters[gp];
+                    for (mut gp: i64 = 0; gp < DeclarationNode::fn_of(method.func).parameters.length; gp++) {
+                        const gparam_decl: DeclarationNode* = DeclarationNode::fn_of(method.func).parameters[gp];
+                        const gparam: VarDecl* = DeclarationNode::var_of(gparam_decl);
                         if (gparam == null || !gparam.resolved_type.is_valid()) { continue; }
                         // Skip the receiver: `&this`/`this` is the owner itself,
                         // never a superterm.
@@ -1351,7 +1521,7 @@ type struct TypeResolver {
                     }
                 }
                 if (grows) {
-                    method.func.set_lazy_self_growing(true);
+                    DeclarationNode::fn_of(method.func).set_lazy_self_growing(true);
                 }
             }
 
@@ -1361,8 +1531,9 @@ type struct TypeResolver {
             // `&this` resolves to a Pointer to owner; bare `this` resolves
             // to owner directly.
             if (method.is_static || !owner_type.is_valid()) { continue; }
-            for (mut p: i64 = 0; p < method.func.parameters.length; p++) {
-                const param: VarDeclNode* = method.func.parameters[p];
+            for (mut p: i64 = 0; p < DeclarationNode::fn_of(method.func).parameters.length; p++) {
+                const param_decl: DeclarationNode* = DeclarationNode::fn_of(method.func).parameters[p];
+                const param: VarDecl* = DeclarationNode::var_of(param_decl);
                 if (param == null || param.resolved_type.is_valid()) { continue; }
                 if (param.is_value_receiver()) {
                     param.resolved_type = owner_type;
@@ -1373,11 +1544,11 @@ type struct TypeResolver {
         }
     }
 
-    /// Create the arena TypeRef for a `GenericParamNode` at position `index`.
+    /// Create the arena TypeRef for a generic parameter at position `index`.
     /// A bound on the param is not carried here: it is written in a `where`
     /// clause on the enclosing declaration, so the arena entry is the bare
     /// `GenericParamType` and consumers needing the bound read the clause.
-    create_param_type(&this, gp: GenericParamNode*, index: u64) -> TypeRef {
+    create_param_type(&this, gp: GenericParamDecl*, index: u64) -> TypeRef {
         if (gp == null) { return TypeRef::invalid(); }
         return this.arena.create_generic_param(gp.sym_id, gp.name, index);
     }
@@ -1393,12 +1564,13 @@ type struct TypeResolver {
                              ctx: ResolutionContext*) -> [TypeRef] {
         if (entry == null) { return args; }
         if (args.length >= entry.param_count) { return args; }
-        const params: [GenericParamNode*] = entry.get_generic_params();
+        const params: [DeclarationNode*] = entry.get_generic_params();
         const start: i64 = args.length;
         mut filled: [TypeRef] = args;
         for (mut i: i64 = start; i < entry.param_count; i++) {
             if (i >= params.length) { return filled; }
-            const gp: GenericParamNode* = params[i];
+            const gp_decl: DeclarationNode* = params[i];
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             if (gp == null || !gp.has_default_annotation()) { return filled; }
             // A default annotation (`struct String<A = GlobalAlloc>`) is syntax
             // written in the TEMPLATE'S module and carries that module's answer
@@ -1442,14 +1614,14 @@ type struct TypeResolver {
         return this.generic_registry.instantiate(owner_type, filled);
     }
 
-    /// Resolve all function signatures ([FunctionDeclNode*]) on a trait.
+    /// Resolve all function signatures ([DeclarationNode*]) on a trait.
     ///
     /// Inside a trait body, `This` is a symbolic placeholder for the type
     /// that future impls will bind. We give it a stable identity by
     /// synthesizing a deduplicated GenericParam("This", sentinel-index);
     /// this lets `&This` parameters and `-> This` returns resolve to a real
     /// TypeRef that downstream substitution can rewrite per-impl.
-    resolve_trait_method_signatures(&this, methods: &[FunctionDeclNode*],
+    resolve_trait_method_signatures(&this, methods: &[DeclarationNode*],
                                     res_ctx: ResolutionContext*) -> void {
         if (!res_ctx.this_type.is_valid()) {
             const this_name: SymbolStr = this.intern_table.intern("This");
@@ -1459,19 +1631,21 @@ type struct TypeResolver {
         }
 
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const func: FunctionDeclNode* = methods[i];
+            const func_decl: DeclarationNode* = methods[i];
+            const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
             if (func == null) { continue; }
 
             if (func.is_generic()) {
                 mut method_ctx: ResolutionContext = res_ctx.clone();
                 for (mut j: i64 = 0; j < func.generic_params.length; j++) {
-                    const gp: GenericParamNode* = func.generic_params[j];
+                    const gp_decl: DeclarationNode* = func.generic_params[j];
+                    const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
                     const gp_ref: TypeRef = this.create_param_type(gp, j as u64);
                     method_ctx.add_binding(gp.sym_id, gp.name, gp_ref);
                 }
-                this.resolve_func_signature(func, &method_ctx);
+                this.resolve_func_signature(func_decl, &method_ctx);
             } else {
-                this.resolve_func_signature(func, res_ctx);
+                this.resolve_func_signature(func_decl, res_ctx);
             }
         }
     }
@@ -1544,15 +1718,15 @@ type struct TypeResolver {
         const t: Type* = this.arena.lookup(ty);
         if (t == null) { return ty; }
         if (t.kind != TypeKind::Struct
-                && t.kind != TypeKind::Class
                 && t.kind != TypeKind::Enum) { return ty; }
         const entry: TemplateEntry* =
             this.generic_registry.template_of_type(ty);
         if (entry == null || entry.param_count <= 0) { return ty; }
-        const params: [GenericParamNode*] = entry.get_generic_params();
+        const params: [DeclarationNode*] = entry.get_generic_params();
         if (params.length < entry.param_count) { return ty; }
         for (mut i: i64 = 0; i < entry.param_count; i++) {
-            const gp: GenericParamNode* = params[i];
+            const gp_decl: DeclarationNode* = params[i];
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             if (gp == null || !gp.has_default_annotation()) { return ty; }
         }
         // The defaults carry their own stamps; this context holds nothing but
@@ -1573,10 +1747,12 @@ type struct TypeResolver {
         const entry: TemplateEntry* = this.generic_registry.template_of(
             this.generic_registry.wellknown(LangItem::Array));
         if (entry == null || entry.param_count != 2) { return; }
-        const params: [GenericParamNode*] = entry.get_generic_params();
-        if (params.length != 2 || params[1] == null || !params[1].has_default_annotation()) { return; }
+        const params: [DeclarationNode*] = entry.get_generic_params();
+        if (params.length != 2) { return; }
+        const alloc_param: GenericParamDecl* = DeclarationNode::generic_param_of(params[1]);
+        if (alloc_param == null || !alloc_param.has_default_annotation()) { return; }
         mut ctx: ResolutionContext = ResolutionContext::new("");
-        const alloc: TypeRef = this.resolve(params[1].default_annotation, &ctx);
+        const alloc: TypeRef = this.resolve(alloc_param.default_annotation, &ctx);
         if (!alloc.is_valid()) { return; }
         this.arena.set_dynamic_array_shape(entry.base_type, alloc);
     }
@@ -1610,7 +1786,7 @@ private:
             if (!current.is_valid()) { return current; }
             const t: Type* = this.arena.lookup(current);
             if (t == null || t.kind != TypeKind::TypeAlias) { return current; }
-            const alias: TypeAliasType* = t as TypeAliasType*;
+            const alias: TypeAliasType* = t.as_alias();
             if (alias.is_generic) { return current; }
             if (!alias.has_target()) { return current; }
             current = alias.target;
@@ -1790,12 +1966,13 @@ private:
         if (entry == null || entry.ast_node == null || this.diagnostics == null) { return true; }
         const none: [TraitBound] = [];
         mut bounds: &[TraitBound] = &none;
-        match (entry.node_kind) {
-            NodeKind::StructDeclaration => { bounds = &(entry.ast_node as declaration::StructDeclNode*).where_bounds; }
-            NodeKind::UnionDeclaration  => { bounds = &(entry.ast_node as declaration::UnionDeclNode*).where_bounds; }
-            NodeKind::ClassDeclaration  => { bounds = &(entry.ast_node as declaration::ClassDeclNode*).where_bounds; }
-            NodeKind::EnumDeclaration   => { bounds = &(entry.ast_node as declaration::EnumDeclNode*).where_bounds; }
-            _ => { return true; }
+        match (entry.kind) {
+            TemplateKind::Struct    => { bounds = &(declaration::DeclarationNode::struct_of(entry.ast_node)).where_bounds; }
+            TemplateKind::Union     => { bounds = &(declaration::DeclarationNode::union_of(entry.ast_node)).where_bounds; }
+            TemplateKind::Enum      => { bounds = &declaration::DeclarationNode::enum_of(entry.ast_node).where_bounds; }
+            TemplateKind::Function  => { return true; }
+            TemplateKind::Trait     => { return true; }
+            TemplateKind::TypeAlias => { return true; }
         }
         if (bounds.length == 0) { return true; }
         mut arg_copy: [TypeRef] = [];
@@ -1815,10 +1992,10 @@ private:
             fmt::format("the trait bound `%s: %s` is not satisfied", concrete_str, trait_str));
         diag = diag.at(span);
         diag = diag.also_at(tref.span, fmt::format("required by this bound on `%s`", tmpl_str));
-        diag = diag.with_note(fmt::format("the trait `%s` is not implemented for `%s`", trait_str, concrete_str));
-        diag = diag.help(fmt::format(
+        diag = diag.with_note(checker.bound_failure_note(concrete, tref.definition(), trait_str, concrete_str));
+        diag = diag.help(checker.bound_failure_help(concrete, tref.definition(), trait_str, concrete_str, fmt::format(
             "implement `%s` for `%s`, or instantiate `%s` with a type that does",
-            trait_str, concrete_str, tmpl_str));
+            trait_str, concrete_str, tmpl_str)));
         this.diagnostics.emit(diag);
         return false;
     }
@@ -1906,8 +2083,8 @@ private:
             //   e.g. type SomeResult<T> = Result<T, string>;
             //        SomeResult<int> -> resolve Result<T, string> with {T->int}
             //                        -> Result<int, string> (a real instantiation)
-            if (entry.node_kind == NodeKind::TypeAliasDeclaration) {
-                const alias_node: TypeAliasDeclNode* = entry.ast_node as TypeAliasDeclNode*;
+            if (entry.kind == TemplateKind::TypeAlias) {
+                const alias_node: TypeAliasDecl* = declaration::DeclarationNode::alias_of(entry.ast_node);
                 if (alias_node != null && alias_node.target_annotation != null) {
                     mut alias_ctx: ResolutionContext = ctx.clone();
                     for (mut i: i64 = 0; i < entry.param_count; i++) {

@@ -16,10 +16,13 @@ language server".  From there, in order, to the v1.0 freeze:
    the postfix forms are refused.  Built, on `type-syntax-impl`.
 2. **One dynamic array type.**  `[T]` becomes `Array<T>`, which also
    removes the crash of nested builtin arrays (below).
-3. **The class removal, and borrowed trait objects** (`virtual &T`,
-   rulings 285, 288, 289) right after it or folded into it, built on the
-   class vtable machinery (ruling 360).  Owning boxes, upcasting and
-   generic implementations coerced to an object come after v1.0.
+3. **Class removal and borrowed trait objects.**  Built, on
+   `class-removal`: the class feature is deleted, each of its forms refused
+   where it is written (E0117, ruling 465), and `virtual &T`,
+   `virtual mut &T` and `virtual T*` dispatch through a table (rulings 285,
+   288, 289, 415).  Left for trait objects: owning boxes, upcasting, and
+   generic implementations as objects, the last revisited before the
+   freeze (ruling 425); see "Trait objects" below.
 4. **Associated constants on concrete types** (`i32::MAX`,
    `Config::DEFAULT_PORT`), with the decision whether `max_value()` stays.
    Trait constants used as values come after v1.0; trait constants as
@@ -29,7 +32,21 @@ language server".  From there, in order, to the v1.0 freeze:
    today, so internals such as `Array`'s grower are public API.  The pass
    decides what stays public, and which standard-library APIs want trait
    objects.
-7. **Bug fixing and bug hunting** before the freeze.
+7. **The slice and API pass**, after the visibility pass:
+   - first, the fix for a by-value struct parameter accepting
+     `&OtherStruct` (bug 0063);
+   - `&this` enforced as read-only (D37), with const pointers following;
+   - `Read` taking a `Slice`;
+   - `Slice` finished: `s[i]`, `Eq` and `Hash`, `s.slice(1..4)`, and
+     `as_slice()` on fixed-size arrays;
+   - `implement Trait` in type position: the concrete type hidden, the
+     return promise checked at the function, and a refusal of its own in
+     parameters, fields, aliases and type arguments (rulings 428-430);
+   - a trait declaring two methods with the same name refused at the
+     declaration (ruling 424);
+   - `![implicit]`'s conversion of a string literal written down in
+     `docs/cryo.md` (the directive stays).
+8. **Bug fixing and bug hunting** before the freeze.
 
 The rule of thumb: a breaking change goes in before the freeze; an
 additive feature, or an internal rewrite such as the HIR and MIR pipeline
@@ -49,6 +66,23 @@ remove.
 Open: a survey of the compiler and the standard library for ad-hoc
 `equal`, compare, hash and to-string style methods that should be trait
 implementations, each one a candidate for its trait.  Not started.
+
+### Inherent `implement struct` blocks to inline methods
+
+Ruling 397 puts a struct's own methods inline in its body.  Existing
+inherent blocks are converted as their files are next touched, not in one
+sweep.  Counted (`grep -E '^\s*implement(<[^>]*>)? (struct|union) '`):
+
+- compiler: 9.  Three are `Parser`'s: the blocks in `expr_parser.cryo`
+  and `parser.cryo` are the split-type exception and stay; the one in
+  `cursor.cryo`, the struct's own file, goes inline.  The others are
+  `AsmPiece`, `InlineBodies`, `DirectiveRegistry`, and `StampSlot`,
+  `BuildStamp`, `VersionReport` in `utils/build_stamp.cryo`.
+- standard library: 4.  Three are `BufStream<S>` extended from the
+  HTTP/1.1, HTTP/2 and WebSocket modules, the split-type exception; one is
+  `Array<T, A>`'s second block in its own file, to fold inline (its bound
+  becomes a `where` on the methods that need it, or stays on the type).
+- tests: 108, converted with the tests they belong to.
 
 ## Merge notes
 
@@ -302,6 +336,13 @@ Everything in the standard library is public today, so its internals -
 v1.0.  The pass goes through the library deciding what stays public, and
 decides at the same time which of its APIs want borrowed trait objects.
 
+`std::core::intrinsics::Location` is one it must close: only the compiler
+makes one (`location()`, and the caller of a `![caller_location]`
+function), and a program reads its fields.  A program must not be able to
+build one with a struct literal, so that adding a field later is not a
+breaking change; its fields read, and nothing outside the compiler
+constructs it.
+
 Open: whether the pass is gated (a public item with no documentation, or
 nothing outside the library using it, reported) or done by review alone.
 
@@ -334,61 +375,65 @@ alike first.  What stays open:
 - **The demangler prints `[T]` as the instance it is**,
   `std::collections::array::Array<i64, std::alloc::allocator::GlobalAlloc>`.
 
-## The class removal
+## Build the compiler with LLVM optimisation, then derive `TypeKind`
 
-Classes are removed as a language feature before the v1.0 freeze: after
-the array syntax and the type-system update, and well before the pipeline
-work, compile-time execution and what follows them.  What remains is
-structs, enums and traits.  The compiler's AST goes straight to enums and
-`match` (ruling 290: no intermediate struct-node stage).
+Ruling 403.  `Type` carries both a stored `kind: TypeKind` and the payload
+`data: TypeData`, so the kind is said twice.  Deriving it from `data`
+(ruling 390) is right, but the compiler is built at O0, where
+`passes.cryo` runs no IR pipeline, so nothing folds a `match` that yields
+a constant per arm into a table load: every one of the compiler's 1,130
+`kind` reads becomes a jump-table branch, plus a call when not inlined.
+Measured by `cryo check src/main.cryo` on the compiler (five runs,
+medians, all built by a compiler that lowers a `match` on constants to a
+`switch`):
 
-It starts with a read-only scoping audit.  What is known now:
+| `kind` | check time |
+|---|---|
+| stored field | 8.60 s |
+| derived | 9.55 s (+11%) |
+| derived, both `kind`s `![inline]` | 9.07 s (+5.5%) |
+| derived, built by a compiler lowering `match` to a compare chain | 10.01 s (+16%) |
 
-- 109 classes, all in the compiler; the standard library, the language
-  server and the examples declare none.
-- The AST is 69 of them, at most 3 deep.
-- 6 visitors walk it (cloner, dumper, substituter, IR generator, name
-  resolver, sema).
-- Dispatch is already by tag: about 1,300 `kind` checks and 2,400 casts,
-  against 188 `accept()` calls.
-- Every hierarchy is a closed set, so each becomes an enum with no need for
-  dynamic dispatch.
+Peak memory was unchanged (1,530 MiB).  The steps, in order:
 
-The class defects known today stay unfixed, since classes are going
-(ruling 291: an unchecked `override`, a silently missing vtable slot, and
-slots matched by name).  Trait objects must not repeat them.
-
-Open: how the six visitors' `visit` overloads become `match` arms without
-a flag day across the whole compiler, and what replaces `ASTNode`'s
-`Allocate` arena when the nodes are enum values.
+1. Build the compiler with an LLVM pipeline (at least `simplifycfg`,
+   which turns a `switch` yielding constants into a table load), with the
+   selfhost fixed point and the object gates re-baselined on it.
+2. Derive `TypeKind` from `TypeData` and delete the field, measured
+   against the stored field under the optimised build.
 
 ## Trait objects
 
 A pointer or reference to a trait, dispatched through a table of the
-implementation's methods.  Borrowed trait objects come before v1.0, right
-after the class removal or folded into it, built on the class vtable
-machinery (ruling 360, which brings forward ruling 286's "possibly after
-v1.0"); owning boxes, upcasting and generic implementations coerced to an
-object come after v1.0.
+implementation's methods.  **Borrowed trait objects are built** (ruling
+360 brought them forward from ruling 286's "possibly after v1.0"; ruling
+415 placed them after the class removal); `docs/cryo.md` section 10.7
+describes them.  Left: owning boxes, upcasting, and generic
+implementations as objects.
 
-- **Spelling:** `virtual &Shape` and `virtual Shape*`, a prefix as in
-  `mut &this`; there is no `dyn` (ruling 285).  Until then `&Shape` and
-  `Shape*` are refused where they are written (`E0313`; ruling 287), as
-  is a bare `p: Shape` (ruling 304).  The prefix composes inside an
-  array's brackets with no parentheses: `[virtual &Shape]`.
+- **Spelling:** `virtual &Shape`, `virtual mut &Shape` and
+  `virtual Shape*`, a prefix as in `mut &this`; there is no `dyn` (ruling
+  285).  `&Shape` and `Shape*` are refused where they are written
+  (`E0313`; ruling 287), as is a bare `p: Shape` (ruling 304).  The prefix
+  composes inside an array's brackets with no parentheses:
+  `[virtual &Shape]`.
 - **Object safety is per method** (ruling 288): a method that cannot go in
   the table - one with type parameters of its own, for instance - is unavailable on
   the object, and the rest of the trait still works.
 - **Borrowed pointers first** (ruling 289); an owning box, which must take
-  its drop, size and alignment from the table, comes later.
+  its drop, size and alignment from the table, is still to build.
 - The table's slots come from the trait's method numbering, the same one
   the trait-implementation check (E0312) relies on, never from method
   names.
 
-Open: whether a supertrait's methods are reachable from a subtrait object
-directly or through an upcast; and how a generic implementation coerced to
-an object becomes a monomorphization root, including in the incremental
-cache.
+A supertrait's methods are reachable from a subtrait object directly: the
+table holds them.  Still to build:
+
+- **Owning boxes**, above.
+- **Upcasting** a subtrait object to an object of one of its supertraits.
+- **Generic implementations as objects:** how a generic implementation
+  coerced to an object becomes a monomorphization root, including in the
+  incremental cache.
 
 ## The compiler pipeline: AST, HIR, MIR, LLVM
 
@@ -414,9 +459,8 @@ compile-time functions and limits on what they may touch.
 
 `with_allocator(arena) { ... }` makes `arena` the allocator for the `new`
 expressions inside the block.  It arrives with the compile-time work.  A
-class's own `Allocate` implementation wins over it (ruling 249: `new` and
-`delete` go through the `Allocate` trait, and the nearest ancestor's
-implementation wins).
+type's own `Allocate` implementation wins over it (ruling 249: `new` and
+`delete` go through the `Allocate` trait).
 
 Open: whether the scope reaches into the functions the block calls or only
 the `new` written inside it; and what `delete` does with memory allocated
@@ -472,15 +516,6 @@ only a separate closure-value type does; who owns an escaping closure's
 captures and when they are released; and whether a non-capturing function
 keeps its single-pointer form across the C boundary.
 
-## `Allocate` on a generic class
-
-`implement<T> trait Allocate for class G<T>` type-checks, and then `new
-G<i64>(77)` fails at link time: the allocator is never instantiated for
-`G<i64>`, and the linker reports the missing symbol.  It is refused late,
-not miscompiled (ruling 292: left for after the merge).  It may become
-moot with the class removal.  Whether a generic struct's `Allocate` fails
-the same way has not been measured.
-
 ## Moving a value out from behind a reference
 
 A field moved out of a place reached through a reference or a pointer -
@@ -528,6 +563,14 @@ told apart before the warning becomes an error.
 
 Open: whether `ptr::drop_in_place` stays the spelling for releasing a
 value through a raw pointer.
+
+## libc bindings spelled as their C headers
+
+Low priority.  Most of the standard library's libc bindings spell C's
+`void*` and `char*` as `u8*`; only the `mem*`/`b*` family takes and returns
+`void*` as C does.  Every binding is aligned with the C header it binds, so
+a call passes the pointer type C declares and a generic copy does not need
+a cast to reach it.
 
 ## Open questions
 

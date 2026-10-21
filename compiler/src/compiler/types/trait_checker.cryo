@@ -28,7 +28,7 @@ import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, sink, source_span };
 import compiler::resolver::{ intern_table, symbol_str };
 import std::fmt;
-import compiler::ast::declaration::{ FunctionDeclNode, ImplBlockNode, MethodNode, VarDeclNode };
+import compiler::ast::declaration::{ DeclarationNode, FunctionDecl, ImplBlock, MethodDecl, TraitDecl, VarDecl };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::sink::{ DiagnosticSink };
 import compiler::resolver::intern_table::{ InternTable };
@@ -37,7 +37,7 @@ import compiler::resolver::decl_name::{ DeclName };
 import compiler::resolver::res::{ DefId };
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::types::arena::{ TypeArena };
-import compiler::types::compound::{ PointerType, ReferenceType };
+import compiler::types::compound::{ ObjectType, PointerType, ReferenceType };
 import compiler::types::user_defined::{ TypeAliasType };
 import compiler::types::generic::{ GenericParamType };
 import compiler::types::generic_registry::{ GenericRegistry };
@@ -145,7 +145,7 @@ type struct TraitChecker {
             // otherwise always satisfy.
             const t_ptr: Type* = this.arena.lookup(ty);
             if (t_ptr != null && t_ptr.kind == TypeKind::Pointer) {
-                const pt: PointerType* = t_ptr as PointerType*;
+                const pt: PointerType* = t_ptr.as_pointer();
                 return this.type_implements_trait(pt.pointee, trait_name, depth + 1);
             }
 
@@ -162,6 +162,11 @@ type struct TraitChecker {
             }
         }
 
+        const object_t: Type* = this.arena.lookup(ty);
+        if (object_t != null && object_t.kind == TypeKind::Object) {
+            return this.object_implements_trait(object_t.as_object(), trait_name);
+        }
+
         // The subject is used directly, whether it is a pre-mono InstantiatedType
         // wrapper or a post-mono concrete spec: both `carries_impl_key` and the
         // type-arg substitution below read the instantiation identity through the
@@ -169,10 +174,99 @@ type struct TraitChecker {
         const subject: TypeRef = ty;
         if (!this.arena.carries_impl_key(subject, this.intern_table)) { return false; }
         // The candidates by identity, the first whose bounds hold.
-        const impl_block: ImplBlockNode* = this.select_impl(trait_name, subject, depth);
+        const impl_block: ImplBlock* = this.select_impl(trait_name, subject, depth);
         // A method merely named `drop` does not satisfy `Drop`: a type
         // implements it with `implement trait Drop`, as any other trait.
         return impl_block != null;
+    }
+
+    /// Whether a trait object implements `trait_def`.  The compiler makes
+    /// that implementation, for the object's own trait and each of its
+    /// supertraits, and no other: no implementation is written for an object
+    /// type.  Each method of `trait_def` and of its supertraits is then
+    /// called through the object's table, so each with no default must be
+    /// callable through one (`GenericRegistry::method_object_unavailable`),
+    /// in every form of object, as a call written on the object is.  A
+    /// default the table cannot hold is compiled for the object instead
+    /// (`MonoCallSpecializer::object_default_method`).
+    object_implements_trait(&this, object: ObjectType*, trait_def: DefId) -> boolean {
+        if (this.generic_registry == null) { return false; }
+        if (!this.object_reaches_trait(object, trait_def)) { return false; }
+        mut declaring: DefId = DefId::invalid();
+        return this.object_bound_blocker(trait_def, &declaring) == null;
+    }
+
+    /// Whether `trait_def` is the object's own trait or one of its
+    /// supertraits: the traits whose implementation the compiler makes for
+    /// it.
+    object_reaches_trait(&this, object: ObjectType*, trait_def: DefId) -> boolean {
+        const reached: [DefId] = this.generic_registry.object_table_traits(object.trait_def);
+        for (mut i: i64 = 0; i < reached.length; i++) {
+            if (reached[i].equals(trait_def)) { return true; }
+        }
+        return false;
+    }
+
+    /// The method that keeps every object from satisfying a bound of
+    /// `trait_def`: the first, in `trait_def` or a supertrait, with no
+    /// default that a table cannot hold, its trait written through
+    /// `out_declaring`; null when there is none.
+    object_bound_blocker(&this, trait_def: DefId, out_declaring: DefId*) -> DeclarationNode* {
+        const required: [DefId] = this.generic_registry.object_table_traits(trait_def);
+        for (mut t: i64 = 0; t < required.length; t++) {
+            const decl: TraitDecl* = this.generic_registry.get_trait_decl(required[t]);
+            if (decl == null) { continue; }
+            for (mut m: i64 = 0; m < decl.methods.length; m++) {
+                const method: FunctionDecl* = DeclarationNode::fn_of(decl.methods[m]);
+                if (method != null && method.has_body()) { continue; }
+                if (this.generic_registry.method_object_unavailable(decl.methods[m]).length() > 0) {
+                    *out_declaring = required[t];
+                    return decl.methods[m];
+                }
+            }
+        }
+        return null;
+    }
+
+    /// The note an unmet bound of `trait_def` on `ty` carries, `trait_shown`
+    /// and `ty_shown` being the names its headline gives them.  For an
+    /// object of a trait that reaches `trait_def`, the compiler makes the
+    /// implementation, so the note names the method that keeps it from
+    /// doing so and why, in the words a call of that method through the
+    /// object is refused with (E0314).  For any other type, that the type
+    /// does not implement the trait.
+    bound_failure_note(&this, ty: TypeRef, trait_def: DefId, trait_shown: string, ty_shown: string) -> string {
+        const t: Type* = this.arena.lookup(ty);
+        if (t != null && t.kind == TypeKind::Object && this.generic_registry != null
+                && this.object_reaches_trait(t.as_object(), trait_def)) {
+            mut declaring: DefId = DefId::invalid();
+            const method: DeclarationNode* = this.object_bound_blocker(trait_def, &declaring);
+            if (method != null) {
+                return fmt::format("the method `%s` of `%s` has no default, and cannot be called through `%s`: %s",
+                    this.intern_table.resolve(DeclarationNode::fn_of(method).name),
+                    this.intern_table.resolve(this.generic_registry.get_trait_decl(declaring).name),
+                    ty_shown, this.generic_registry.method_object_unavailable(method));
+            }
+        }
+        return fmt::format("the trait `%s` is not implemented for `%s`", trait_shown, ty_shown);
+    }
+
+    /// The help an unmet bound of `trait_def` on `ty` carries.  No
+    /// implementation can be written for an object, so an object is told to
+    /// give way to a type that implements the trait: one whose trait reaches
+    /// `trait_def` is blocked by a method a table cannot hold, and one whose
+    /// trait does not reach it never implements it.  Any other type gets
+    /// `written_help`, the site's own advice.
+    bound_failure_help(&this, ty: TypeRef, trait_def: DefId, trait_shown: string, ty_shown: string,
+                       written_help: string) -> string {
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null || t.kind != TypeKind::Object) { return written_help; }
+        if (this.generic_registry != null && this.object_reaches_trait(t.as_object(), trait_def)) {
+            return fmt::format("use a type that implements `%s` in place of `%s`, or an object of a trait whose methods a table can hold",
+                trait_shown, ty_shown);
+        }
+        return fmt::format("use a type that implements `%s` in place of `%s`; an object implements only its own trait and that trait's supertraits",
+            trait_shown, ty_shown);
     }
 
     /// The impl of `trait_id` for `subject` that APPLIES: the first
@@ -181,11 +275,12 @@ type struct TraitChecker {
     /// subject's arguments.  Null when no head unifies or every one that
     /// does is refused by its bounds - selection, candidate assembly then
     /// confirmation, in one place.
-    select_impl(&this, trait_id: DefId, subject: TypeRef, depth: i32) -> ImplBlockNode* {
+    select_impl(&this, trait_id: DefId, subject: TypeRef, depth: i32) -> ImplBlock* {
         if (this.generic_registry == null) { return null; }
-        const heads: [ImplBlockNode*] = this.generic_registry.heads_for(trait_id, subject, this.intern_table);
+        const heads: [DeclarationNode*] = this.generic_registry.heads_for(trait_id, subject, this.intern_table);
         for (mut i: i64 = 0; i < heads.length; i++) {
-            if (this.impl_applies(heads[i], subject, depth)) { return heads[i]; }
+            const head: ImplBlock* = DeclarationNode::impl_of(heads[i]);
+            if (this.impl_applies(head, subject, depth)) { return head; }
         }
         return null;
     }
@@ -193,12 +288,13 @@ type struct TraitChecker {
     /// Every impl that applies to `subject`, of every trait: the registry's
     /// candidates (`trait_impls_of`) with each one's where-clause confirmed.
     /// The set a method call on a concrete receiver binds against.
-    impls_of(&this, subject: TypeRef) -> [ImplBlockNode*] {
-        mut out: [ImplBlockNode*] = [];
+    impls_of(&this, subject: TypeRef) -> [ImplBlock*] {
+        mut out: [ImplBlock*] = [];
         if (this.generic_registry == null) { return out; }
-        const heads: [ImplBlockNode*] = this.generic_registry.trait_impls_of(subject, this.intern_table);
+        const heads: [DeclarationNode*] = this.generic_registry.trait_impls_of(subject, this.intern_table);
         for (mut i: i64 = 0; i < heads.length; i++) {
-            if (this.impl_applies(heads[i], subject, 0)) { out.push(heads[i]); }
+            const head: ImplBlock* = DeclarationNode::impl_of(heads[i]);
+            if (this.impl_applies(head, subject, 0)) { out.push(head); }
         }
         return out;
     }
@@ -208,7 +304,7 @@ type struct TraitChecker {
     /// placed (its bounds held for those arguments, and are substituted away
     /// on the clone), so it applies outright; a written head applies when
     /// its where-clause holds for the subject.
-    impl_applies(&this, head: ImplBlockNode*, subject: TypeRef, depth: i32) -> boolean {
+    impl_applies(&this, head: ImplBlock*, subject: TypeRef, depth: i32) -> boolean {
         if (head == null) { return false; }
         if (head.spec_owner.is_valid()) { return true; }
         return this.impl_bounds_hold(head, subject, depth);
@@ -219,7 +315,7 @@ type struct TraitChecker {
     /// checked recursively.  A head with no where-clause holds outright.  A
     /// subject that carries no arguments cannot bind the head's parameters,
     /// so a bounded head is refused for it rather than assumed.
-    impl_bounds_hold(&this, impl_block: ImplBlockNode*, subject: TypeRef, depth: i32) -> boolean {
+    impl_bounds_hold(&this, impl_block: ImplBlock*, subject: TypeRef, depth: i32) -> boolean {
         if (impl_block == null) { return false; }
         if (impl_block.where_bounds.length == 0) { return true; }
         // Build a fresh substitution from the impl's generic params to
@@ -263,7 +359,7 @@ type struct TraitChecker {
     /// writes (`where U: Show`) is checked against these bindings and never
     /// against the type's parameters, which may be spelled differently.  A
     /// head whose argument count differs from `args` binds nothing.
-    add_head_param_bindings(&this, impl_block: ImplBlockNode*, args: &[TypeRef],
+    add_head_param_bindings(&this, impl_block: ImplBlock*, args: &[TypeRef],
                             subst: TypeSubstitution*) -> void {
         if (impl_block == null || subst == null) { return; }
         if (impl_block.target_args.length != args.length) { return; }
@@ -276,7 +372,7 @@ type struct TraitChecker {
     /// The type of the parameter an implement block's head writes at
     /// position `index` (`U` in `.. for Wrap<U>`, at 0), or invalid where
     /// the head writes a type there.
-    head_param_type(&this, impl_block: ImplBlockNode*, index: i64) -> TypeRef {
+    head_param_type(&this, impl_block: ImplBlock*, index: i64) -> TypeRef {
         if (impl_block == null || index < 0 || index >= impl_block.target_args.length) {
             return TypeRef::invalid();
         }
@@ -323,10 +419,11 @@ type struct TraitChecker {
     diagnose_method_bounds_failure(&this, receiver: TypeRef,
                                     method_name: SymbolStr) -> DeclName {
         if (this.generic_registry == null) { return DeclName::empty(); }
-        const blocks: [ImplBlockNode*] = this.generic_registry.trait_impls_of(receiver, this.intern_table);
+        const blocks: [DeclarationNode*] = this.generic_registry.trait_impls_of(receiver, this.intern_table);
         for (mut i: i64 = 0; i < blocks.length; i++) {
-            const impl_block: ImplBlockNode* = blocks[i];
-            const m: MethodNode* = this.generic_registry.impl_method_by_leaf(impl_block, method_name);
+            const impl_block: ImplBlock* = DeclarationNode::impl_of(blocks[i]);
+            const m_decl: DeclarationNode* = this.generic_registry.impl_method_by_leaf(impl_block, method_name);
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null || m.func == null) { continue; }
             if (!this.type_implements_trait(receiver, impl_block.trait_def, 0)) {
                 return this.arena.defs.path_of(impl_block.trait_def);
@@ -430,8 +527,9 @@ type struct TraitChecker {
     /// `subst` (no bounds, every bound has a registered impl, or the
     /// substitution is missing entirely). Returns false only when at least one
     /// bound's impl is *known absent*.
-    method_bounds_satisfied(&this, func: FunctionDeclNode*,
+    method_bounds_satisfied(&this, func_decl: DeclarationNode*,
                             subst: TypeSubstitution*) -> boolean {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return true; }
         if (func.trait_bounds.length == 0) { return true; }
         return this.bounds_satisfied(func.trait_bounds, subst);
@@ -443,11 +541,13 @@ type struct TraitChecker {
     /// Result<T, E>` as `Result<i32, string>`, `this: Result<T*, E>` denotes
     /// `Result<i32*, string>` and is not a method of it; `this: Result<T, E>`
     /// is.  A receiver written as the bare owner names every instantiation.
-    method_receiver_excludes(&this, func: FunctionDeclNode*, subst: TypeSubstitution*,
+    method_receiver_excludes(&this, func_decl: DeclarationNode*, subst: TypeSubstitution*,
                              base: TypeRef, args: &[TypeRef]) -> boolean {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return false; }
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
-            const param: VarDeclNode* = func.parameters[i];
+            const param_decl: DeclarationNode* = func.parameters[i];
+            const param: VarDecl* = DeclarationNode::var_of(param_decl);
             if (param == null || !param.is_receiver()) { continue; }
             mut ty: TypeRef = param.resolved_type;
             if (subst != null) { ty = subst.apply(ty, this.arena); }
@@ -468,10 +568,10 @@ type struct TraitChecker {
         for (mut depth: i32 = 0; depth < 8; depth++) {
             const t: Type* = this.arena.lookup(cur);
             if (t == null) { return cur; }
-            if (t.kind == TypeKind::Reference) { cur = (t as ReferenceType*).referent; continue; }
-            if (t.kind == TypeKind::Pointer) { cur = (t as PointerType*).pointee; continue; }
-            if (t.kind == TypeKind::TypeAlias && (t as TypeAliasType*).has_target()) {
-                cur = (t as TypeAliasType*).target;
+            if (t.kind == TypeKind::Reference) { cur = t.as_reference().referent; continue; }
+            if (t.kind == TypeKind::Pointer) { cur = t.as_pointer().pointee; continue; }
+            if (t.kind == TypeKind::TypeAlias && t.as_alias().has_target()) {
+                cur = t.as_alias().target;
                 continue;
             }
             return cur;
@@ -486,7 +586,7 @@ type struct TraitChecker {
         for (mut i: i64 = 0; i < subst.params.length; i++) {
             const pt: Type* = this.arena.lookup(subst.params[i]);
             if (pt == null || pt.kind != TypeKind::GenericParam) { continue; }
-            if ((pt as GenericParamType*).declared_by(sym)) { return subst.replacements[i]; }
+            if (pt.as_generic_param().declared_by(sym)) { return subst.replacements[i]; }
         }
         return TypeRef::invalid();
     }

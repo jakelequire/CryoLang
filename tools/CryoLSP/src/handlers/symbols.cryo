@@ -13,13 +13,11 @@ import std::collections::array::{ Array };
 import std::json::value;
 
 import compiler::compilation_context::{ CompilationContext };
-import compiler::ast::{ NodeKind };
-import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::node::{ ProgramNode };
 import compiler::ast::node_locator::{ NodeLocator };
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, EnumDeclNode, EnumVariantNode, ExternBlockNode,
-    FieldDeclNode, FunctionDeclNode, ImplBlockNode, IntrinsicDeclNode, MethodNode,
-    StructDeclNode, TraitDeclNode, TypeAliasDeclNode, UnionDeclNode, VarDeclNode
+    DeclarationNode, DeclKind, FunctionDecl, ImplBlock, MethodDecl,
+    StructDecl, TraitDecl, UnionDecl, VarDecl
 };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::symbol_str::{ SymbolStr };
@@ -45,7 +43,7 @@ public function handle_document_symbols(docs: mut &docs::Docs, projects: mut &se
     const program: ProgramNode* = asked.ctx.module_graph.get_module_ast(asked.module_idx as u32);
     if (program == null) { return value::JsonValue::Array(out); }
     for (mut i: i64 = 0; i < program.statements.length; i++) {
-        outline.nested(docs, &out, NodeLocator::unwrap_decl_stmt(program.statements[i]));
+        outline.nested(docs, &out, NodeLocator::unwrap_decl_stmt(program.statements[i]).as_decl());
     }
     return value::JsonValue::Array(out);
 }
@@ -69,7 +67,7 @@ public function handle_workspace_symbols(docs: mut &docs::Docs, projects: mut &s
             if (program == null) { continue; }
             const outline: Outline = Outline::new(ctx, m as i64);
             for (mut i: i64 = 0; i < program.statements.length; i++) {
-                outline.flat(docs, &out, NodeLocator::unwrap_decl_stmt(program.statements[i]), query);
+                outline.flat(docs, &out, NodeLocator::unwrap_decl_stmt(program.statements[i]).as_decl(), query);
             }
         }
     }
@@ -88,27 +86,28 @@ type struct Outline {
 
     /// Whether `n` is written in this module's file: a node copied in from
     /// another file, or a monomorphized function, is not.
-    written_here(&this, n: ASTNode*) -> boolean {
+    written_here(&this, n: DeclarationNode*) -> boolean {
         if (n == null || n.span.start_line == 0 || n.span.file == null) { return false; }
-        if (n.kind == NodeKind::FunctionDeclaration && (n as FunctionDeclNode*).is_specialization) {
+        if (DeclarationNode::fn_of(n) != null && DeclarationNode::fn_of(n).is_specialization) {
             return false;
         }
-        if (n.kind == NodeKind::MethodDeclaration) {
-            const m: MethodNode* = n as MethodNode*;
-            if (m.func != null && m.func.is_specialization) { return false; }
+        if (DeclarationNode::method_of(n) != null) {
+            const m_decl: DeclarationNode* = n;
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
+            if (m.func != null && DeclarationNode::fn_of(m.func).is_specialization) { return false; }
         }
         return n.span.file.eq(this.file);
     }
 
     /// `n` with the members it declares nested under it.
-    nested(&this, docs: &docs::Docs, out: mut &Array<value::JsonValue>, n: ASTNode*) -> void {
+    nested(&this, docs: &docs::Docs, out: mut &Array<value::JsonValue>, n: DeclarationNode*) -> void {
         if (!this.written_here(n)) { return; }
         const kind: i64 = Outline::kind_of(n);
         if (kind == 0) { return; }
         const name: string = this.name_of(n);
         if (name.length() == 0) { return; }
         mut children: Array<value::JsonValue> = Array::<value::JsonValue>::new();
-        const members: [ASTNode*] = Outline::members(n);
+        const members: [DeclarationNode*] = Outline::members(n);
         for (mut i: i64 = 0; i < members.length; i++) { this.nested(docs, &children, members[i]); }
         mut s: value::JsonObject = value::JsonObject::new();
         s.put("name", value::JsonValue::from(name));
@@ -121,7 +120,7 @@ type struct Outline {
 
     /// `n` and every declaration under it whose name holds `query`, flat,
     /// each with its location, while there is room.
-    flat(&this, docs: &docs::Docs, out: mut &Array<value::JsonValue>, n: ASTNode*, query: str::Str) -> void {
+    flat(&this, docs: &docs::Docs, out: mut &Array<value::JsonValue>, n: DeclarationNode*, query: str::Str) -> void {
         if ((out.length() as u64) >= WORKSPACE_LIMIT || !this.written_here(n)) { return; }
         const kind: i64 = Outline::kind_of(n);
         if (kind == 0) { return; }
@@ -136,48 +135,40 @@ type struct Outline {
             s.put("location", value::JsonValue::Object(loc));
             out.push(value::JsonValue::Object(s));
         }
-        const members: [ASTNode*] = Outline::members(n);
+        const members: [DeclarationNode*] = Outline::members(n);
         for (mut i: i64 = 0; i < members.length; i++) { this.flat(docs, out, members[i], query); }
     }
 
     /// The declarations `n` holds: a type's fields and methods, an enum's
     /// variants, a trait's, an implementation's or an extern block's
     /// functions.
-    static members(n: ASTNode*) -> [ASTNode*] {
-        mut out: [ASTNode*] = [];
+    static members(n: DeclarationNode*) -> [DeclarationNode*] {
+        mut out: [DeclarationNode*] = [];
         match (n.kind) {
-            NodeKind::StructDeclaration => {
-                const d: StructDeclNode* = n as StructDeclNode*;
-                for (mut i: i64 = 0; i < d.fields.length; i++) { out.push(d.fields[i] as ASTNode*); }
-                for (mut i: i64 = 0; i < d.methods.length; i++) { out.push(d.methods[i] as ASTNode*); }
+            DeclKind::Impl(d) => {
+                for (mut i: i64 = 0; i < d.methods.length; i++) { out.push(d.methods[i]); }
             }
-            NodeKind::UnionDeclaration => {
-                const d: UnionDeclNode* = n as UnionDeclNode*;
-                for (mut i: i64 = 0; i < d.fields.length; i++) { out.push(d.fields[i] as ASTNode*); }
-                for (mut i: i64 = 0; i < d.methods.length; i++) { out.push(d.methods[i] as ASTNode*); }
+            DeclKind::Trait(d) => {
+                for (mut i: i64 = 0; i < d.methods.length; i++) { out.push(d.methods[i]); }
             }
-            NodeKind::ClassDeclaration => {
-                const d: ClassDeclNode* = n as ClassDeclNode*;
-                for (mut i: i64 = 0; i < d.fields.length; i++) { out.push(d.fields[i] as ASTNode*); }
-                for (mut i: i64 = 0; i < d.methods.length; i++) { out.push(d.methods[i] as ASTNode*); }
+            DeclKind::Enum(d) => {
+                for (mut i: i64 = 0; i < d.variants.length; i++) { out.push(d.variants[i]); }
             }
-            NodeKind::EnumDeclaration => {
-                const d: EnumDeclNode* = n as EnumDeclNode*;
-                for (mut i: i64 = 0; i < d.variants.length; i++) { out.push(d.variants[i] as ASTNode*); }
+            DeclKind::Extern(d) => {
+                for (mut i: i64 = 0; i < d.functions.length; i++) { out.push(d.functions[i]); }
             }
-            NodeKind::TraitDeclaration => {
-                const d: TraitDeclNode* = n as TraitDeclNode*;
-                for (mut i: i64 = 0; i < d.methods.length; i++) { out.push(d.methods[i] as ASTNode*); }
+            DeclKind::Union(d) => {
+                for (mut i: i64 = 0; i < d.fields.length; i++) { out.push(d.fields[i]); }
+                for (mut i: i64 = 0; i < d.methods.length; i++) { out.push(d.methods[i]); }
             }
-            NodeKind::ImplementationBlock => {
-                const d: ImplBlockNode* = n as ImplBlockNode*;
-                for (mut i: i64 = 0; i < d.methods.length; i++) { out.push(d.methods[i] as ASTNode*); }
+            DeclKind::Struct(d) => {
+                for (mut i: i64 = 0; i < d.fields.length; i++) { out.push(d.fields[i]); }
+                for (mut i: i64 = 0; i < d.methods.length; i++) { out.push(d.methods[i]); }
             }
-            NodeKind::ExternBlock => {
-                const d: ExternBlockNode* = n as ExternBlockNode*;
-                for (mut i: i64 = 0; i < d.functions.length; i++) { out.push(d.functions[i] as ASTNode*); }
-            }
-            _ => { }
+            DeclKind::Import(_) | DeclKind::Intrinsic(_)
+            | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
+            | DeclKind::TypeAlias(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
+            | DeclKind::Variable(_) | DeclKind::Function(_) | DeclKind::Method(_) => { }
         }
         return out;
     }
@@ -205,53 +196,51 @@ type struct Outline {
 
     /// The protocol's symbol kind of a declaration; 0 for a node no outline
     /// shows.
-    static kind_of(n: ASTNode*) -> i64 {
-        if (n.kind == NodeKind::VariableDeclaration) {
-            return if ((n as VarDeclNode*).is_mutable) { 13 } else { 14 };
-        }
+    static kind_of(n: DeclarationNode*) -> i64 {
         return match (n.kind) {
-            NodeKind::StructDeclaration    => { 23 }
-            NodeKind::UnionDeclaration     => { 23 }
-            NodeKind::ClassDeclaration     => { 5 }
-            NodeKind::EnumDeclaration      => { 10 }
-            NodeKind::TraitDeclaration     => { 11 }
-            NodeKind::TypeAliasDeclaration => { 26 }
-            NodeKind::FunctionDeclaration  => { 12 }
-            NodeKind::IntrinsicDeclaration => { 12 }
-            NodeKind::MethodDeclaration    => { 6 }
-            NodeKind::FieldDeclaration     => { 8 }
-            NodeKind::EnumVariant          => { 22 }
-            NodeKind::ImplementationBlock  => { 2 }
-            NodeKind::ExternBlock          => { 2 }
-            _                              => { 0 }
+            DeclKind::Method(_)    => { 6 }
+            DeclKind::Function(_)  => { 12 }
+            DeclKind::Trait(_)     => { 11 }
+            DeclKind::TypeAlias(_) => { 26 }
+            DeclKind::Enum(_)      => { 10 }
+            DeclKind::Union(_)     => { 23 }
+            DeclKind::Struct(_)    => { 23 }
+            DeclKind::Intrinsic(_) => { 12 }
+            DeclKind::Variant(_)   => { 22 }
+            DeclKind::Field(_)     => { 8 }
+            DeclKind::Extern(_)    => { 2 }
+            DeclKind::Impl(_)      => { 2 }
+            DeclKind::Variable(v)  => {
+                const k: i64 = if (v.is_mutable) { 13 } else { 14 };
+                k
+            }
+            DeclKind::Import(_) | DeclKind::Module(_)
+            | DeclKind::Destructure(_) | DeclKind::GenericParam(_) => { 0 }
         };
     }
 
     /// The name a declaration is shown under: its declared name; an
     /// implementation block's head.
-    name_of(&this, n: ASTNode*) -> string {
+    name_of(&this, n: DeclarationNode*) -> string {
         match (n.kind) {
-            NodeKind::StructDeclaration    => { return this.text((n as StructDeclNode*).name); }
-            NodeKind::UnionDeclaration     => { return this.text((n as UnionDeclNode*).name); }
-            NodeKind::ClassDeclaration     => { return this.text((n as ClassDeclNode*).name); }
-            NodeKind::EnumDeclaration      => { return this.text((n as EnumDeclNode*).name); }
-            NodeKind::TraitDeclaration     => { return this.text((n as TraitDeclNode*).name); }
-            NodeKind::TypeAliasDeclaration => { return this.text((n as TypeAliasDeclNode*).alias_name); }
-            NodeKind::FunctionDeclaration  => { return this.text((n as FunctionDeclNode*).name); }
-            NodeKind::IntrinsicDeclaration => { return this.text((n as IntrinsicDeclNode*).name); }
-            NodeKind::MethodDeclaration    => {
-                const m: MethodNode* = n as MethodNode*;
+            DeclKind::Method(m) => {
                 if (m.func == null) { return ""; }
-                return this.text(m.func.name);
+                return this.text(DeclarationNode::fn_of(m.func).name);
             }
-            NodeKind::FieldDeclaration     => { return this.text((n as FieldDeclNode*).name); }
-            NodeKind::EnumVariant          => { return this.text((n as EnumVariantNode*).name); }
-            NodeKind::VariableDeclaration  => { return this.text((n as VarDeclNode*).name); }
-            NodeKind::ImplementationBlock  => {
-                return "implement " + this.text((n as ImplBlockNode*).target_type);
-            }
-            NodeKind::ExternBlock          => { return "extern"; }
-            _                              => { return ""; }
+            DeclKind::Function(f)  => { return this.text(f.name); }
+            DeclKind::Trait(t)     => { return this.text(t.name); }
+            DeclKind::TypeAlias(a) => { return this.text(a.alias_name); }
+            DeclKind::Enum(e)      => { return this.text(e.name); }
+            DeclKind::Union(u)     => { return this.text(u.name); }
+            DeclKind::Struct(s)    => { return this.text(s.name); }
+            DeclKind::Intrinsic(i) => { return this.text(i.name); }
+            DeclKind::Variant(v)   => { return this.text(v.name); }
+            DeclKind::Field(f)     => { return this.text(f.name); }
+            DeclKind::Extern(_)    => { return "extern"; }
+            DeclKind::Impl(ib)     => { return "implement " + this.text(ib.target_type); }
+            DeclKind::Variable(v)  => { return this.text(v.name); }
+            DeclKind::Import(_) | DeclKind::Module(_)
+            | DeclKind::Destructure(_) | DeclKind::GenericParam(_) => { return ""; }
         }
     }
 
@@ -262,34 +251,35 @@ type struct Outline {
 
     /// Where a declaration's name is written; its whole span when it has
     /// no name.
-    name_span(&this, n: ASTNode*) -> SourceSpan {
-        if (n.kind == NodeKind::MethodDeclaration) {
-            const m: MethodNode* = n as MethodNode*;
+    name_span(&this, n: DeclarationNode*) -> SourceSpan {
+        if (DeclarationNode::method_of(n) != null) {
+            const m_decl: DeclarationNode* = n;
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m.func != null && m.func.name_span.start_line != 0) { return m.func.name_span; }
             return n.span;
         }
-        if (n.kind == NodeKind::ImplementationBlock) {
-            const ib: ImplBlockNode* = n as ImplBlockNode*;
+        if (DeclarationNode::impl_of(n) != null) {
+            const ib: ImplBlock* = DeclarationNode::impl_of(n);
             if (ib.target_type_span.start_line != 0) { return ib.target_type_span; }
             return n.span;
         }
-        if (n.kind.is_declaration()) {
-            const s: SourceSpan = (n as DeclarationNode*).name_span;
-            if (s.start_line != 0) { return s; }
-        }
+        const s: SourceSpan = n.name_span;
+        if (s.start_line != 0) { return s; }
         return n.span;
     }
 
     /// The span a declaration covers: its own, widened to hold its name
     /// and, for a function or method, its body.
-    whole_span(&this, n: ASTNode*) -> SourceSpan {
+    whole_span(&this, n: DeclarationNode*) -> SourceSpan {
         mut s: SourceSpan = n.span;
         Outline::widen(&s, this.name_span(n));
-        if (n.kind == NodeKind::MethodDeclaration) {
-            const m: MethodNode* = n as MethodNode*;
-            if (m.func != null && m.func.body != null) { Outline::widen(&s, m.func.body.span); }
-        } else if (n.kind == NodeKind::FunctionDeclaration) {
-            const f: FunctionDeclNode* = n as FunctionDeclNode*;
+        if (DeclarationNode::method_of(n) != null) {
+            const m_decl: DeclarationNode* = n;
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
+            if (m.func != null && DeclarationNode::fn_of(m.func).body != null) { Outline::widen(&s, DeclarationNode::fn_of(m.func).body.span); }
+        } else if (DeclarationNode::fn_of(n) != null) {
+            const f_decl: DeclarationNode* = n;
+            const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
             if (f.body != null) { Outline::widen(&s, f.body.span); }
         }
         return s;

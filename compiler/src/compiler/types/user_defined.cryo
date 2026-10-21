@@ -1,30 +1,27 @@
 ///! User-Defined Types
 ///!
-///! Type classes and helper structs for struct, class, enum, trait, and type
-///! alias declarations.  Supports forward declaration (is_complete flag)
-///! and incremental population of fields/methods.
+///! The payloads of struct, enum, trait, type alias and function
+///! template types, and their helper structs.  Supports forward declaration
+///! (is_complete flag) and incremental population of fields/methods.
 
 namespace compiler::types::user_defined;
 
 import compiler::types;
-import compiler::types::{ TypeKind };
 import compiler::types::type_ref;
 import compiler::types::type_ref::{ TypeRef };
 import compiler::resolver::{ symbol_str, intern_table };
 import compiler::ast::expression;
 import compiler::ast::expression::{ ExpressionNode };
-import compiler::types::type_base;
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::decl_name;
 import compiler::resolver::decl_name::{ DeclName };
 import compiler::resolver::res::{ DefId };
-import compiler::types::type_base::{ Type };
 import compiler::module_graph;
 import compiler::module_graph::{ ModulePath };
 
 
-// FieldInfo: Metadata for a struct/class field
+// FieldInfo: Metadata for a struct field
 
 type struct FieldInfo {
 private:
@@ -33,10 +30,6 @@ public:
     field_type: TypeRef;
     offset:     u64;
     is_public:  boolean;
-    /// `protected` visibility: accessible from the declaring type and any
-    /// of its subclasses (but not unrelated code).  Mutually exclusive
-    /// with `is_public`; both false => `private`.
-    is_protected: boolean;
     is_mutable: boolean;
     /// The field's `= expr` default, or null.  When a struct literal omits this
     /// field, sema clones this expression, resolves it, and appends it as a
@@ -46,13 +39,12 @@ public:
     default_value: ExpressionNode*;
 
     static new(name: SymbolStr, field_type: TypeRef, is_public: boolean,
-               is_protected: boolean, is_mutable: boolean) -> FieldInfo {
+               is_mutable: boolean) -> FieldInfo {
         return FieldInfo {
             name:          name,
             field_type:    field_type,
             offset:        0,
             is_public:     is_public,
-            is_protected:  is_protected,
             is_mutable:    is_mutable,
             default_value: null,
         };
@@ -77,25 +69,16 @@ type struct MethodInfo {
     name:          SymbolStr;
     function_type: TypeRef;   // Points to a FunctionType in the arena
     is_public:     boolean;
-    /// `protected` visibility: callable from the declaring type and its
-    /// subclasses.  Mutually exclusive with `is_public`; both false =>
-    /// `private`.
-    is_protected:  boolean;
     is_static:     boolean;
-    is_virtual:    boolean;
-    is_override:   boolean;
     /// Canonical parameter TypeRefs: the non-self params in declaration
-    /// order.  This is the overload discriminator for vtable slot
-    /// identity: two methods share a slot if they have the same `name`
-    /// AND all param TypeRefs equal by arena ID.  The arena dedups types,
-    /// so identical parameter types always share an ID regardless of how
-    /// they were spelled at the source level.
+    /// order.  The arena dedups types, so identical parameter types always
+    /// share an ID regardless of how they were spelled at the source level.
     param_types:   [TypeRef];
-    /// Opaque back-reference to the AST `MethodNode*`.  Typed as
-    /// `void*` here to keep the Types module free of AST imports
-    /// (AST depends on Types, so the other direction would cycle);
-    /// callers downcast to `MethodNode*` at the use site.  Enables sema
-    /// to walk from `ClassType.methods` back to the declaration during
+    /// Opaque back-reference to the method's declaration (kind
+    /// `DeclKind::Method`).  Typed as `void*` here to keep the Types module
+    /// free of AST imports (AST depends on Types, so the other direction
+    /// would cycle); callers read it through `DeclarationNode::method_of`.  Enables sema
+    /// to walk from a type's methods back to the declaration during
     /// overload resolution, and codegen to identify the chosen overload.
     ast_node:      void*;
 
@@ -104,10 +87,7 @@ type struct MethodInfo {
             name:          name,
             function_type: function_type,
             is_public:     is_public,
-            is_protected:  false,
             is_static:     is_static,
-            is_virtual:    false,
-            is_override:   false,
             param_types:   [],
             ast_node:      null,
         };
@@ -154,8 +134,7 @@ type struct EnumVariantInfo {
 
 // StructType: Named struct with fields and methods
 
-type class StructType : Type {
-public:
+type struct StructType {
     qualified_name: DeclName;
     /// The module the type is declared in; none for a unit the module graph
     /// did not load.
@@ -169,7 +148,7 @@ public:
     custom_display: DeclName;
     computed_size:  u64;        // Computed by TypeLowering pass (0 = not yet computed)
     computed_align: u64;        // Computed by TypeLowering pass (0 = not yet computed)
-    /// Layout attributes copied from the StructDeclNode by TypeResolution.
+    /// Layout attributes copied from the StructDecl by TypeResolution.
     /// `repr_c`/`repr_packed`/`repr_transparent` are mutually exclusive.
     /// `min_alignment` is 0 when no `![align]` directive applies, else a
     /// power-of-two byte count.  TypeLowering honours these when computing
@@ -180,7 +159,7 @@ public:
     repr_transparent: boolean;
     min_alignment:    u64;
     /// True when this type came from `type union NAME { ... }` (AST
-    /// `UnionDeclNode`).  An untagged C-style union: TypeLowering overlaps all
+    /// `UnionDecl`).  An untagged C-style union: TypeLowering overlaps all
     /// fields at offset 0 (size = largest field, align = largest field), codegen
     /// lowers it to a single storage blob and accesses members via a bitcast at
     /// offset 0, and drop analysis treats it as POD (no field is auto-dropped,
@@ -188,7 +167,7 @@ public:
     /// member resolution, generics) is otherwise shared.
     is_union:         boolean;
     /// The index in `fields` of the receiver slot on a future the async
-    /// lowering minted for an `async` method (`StructDeclNode.async_recv_slot`,
+    /// lowering minted for an `async` method (`StructDecl.async_recv_slot`,
     /// carried onto every instantiation of it); -1 on every other struct.
     async_recv_slot:  i64;
     /// The generic instantiation this concrete IS, carried intrinsically:
@@ -199,25 +178,26 @@ public:
     generic_base:     TypeRef;
     type_args:        [TypeRef];
 
-    StructType(id: u64, qualified_name: SymbolStr, declared_in: ModulePath, intern_table: InternTable*)
-        : Type(id, TypeKind::Struct) {
-        this.qualified_name   = DeclName::of(qualified_name);
-        this.declared_in      = declared_in;
-        this.intern_table     = intern_table;
-        this.fields           = [];
-        this.methods          = [];
-        this.is_complete      = false;
-        this.custom_display   = DeclName::empty();
-        this.computed_size    = 0;
-        this.computed_align   = 0;
-        this.repr_c           = false;
-        this.repr_packed      = false;
-        this.repr_transparent = false;
-        this.min_alignment    = 0;
-        this.is_union         = false;
-        this.async_recv_slot  = -1;
-        this.generic_base     = TypeRef::invalid();
-        this.type_args        = [];
+    static new(qualified_name: SymbolStr, declared_in: ModulePath, intern_table: InternTable*) -> StructType* {
+        return new StructType {
+            qualified_name:   DeclName::of(qualified_name),
+            declared_in:      declared_in,
+            intern_table:     intern_table,
+            fields:           [],
+            methods:          [],
+            is_complete:      false,
+            custom_display:   DeclName::empty(),
+            computed_size:    0,
+            computed_align:   0,
+            repr_c:           false,
+            repr_packed:      false,
+            repr_transparent: false,
+            min_alignment:    0,
+            is_union:         false,
+            async_recv_slot:  -1,
+            generic_base:     TypeRef::invalid(),
+            type_args:        [],
+        };
     }
 
     /// Record the instantiation this concrete was monomorphized from.  `args` is
@@ -286,144 +266,16 @@ public:
         this.fields[index].offset = offset;
     }
 
-    override display_name(&this) -> string {
+    display_name(&this) -> string {
         if (this.custom_display.is_valid()) { return this.intern_table.shown(this.custom_display); }
         return this.intern_table.shown(this.qualified_name);
-    }
-
-    override size_bytes(&this) -> u64 { return this.computed_size; }
-    override alignment(&this) -> u64  {
-        if (this.computed_align > 0) { return this.computed_align; }
-        return 1;
-    }
-}
-
-
-// ClassType: Class with inheritance support
-
-type class ClassType : Type {
-public:
-    qualified_name:      DeclName;
-    declared_in:         ModulePath;
-    intern_table:        InternTable*;
-    fields:              [FieldInfo];
-    methods:             [MethodInfo];
-    base_class:          TypeRef;
-    has_base:            boolean;
-    has_virtual_methods: boolean;
-    is_complete:         boolean;
-    /// A specialization's display; the name of nothing on any other type.
-    custom_display:      DeclName;
-    computed_size:       u64;
-    computed_align:      u64;
-
-    /// Layout attributes copied from the ClassDeclNode by TypeResolution.
-    /// See StructType for semantics.
-    repr_c:           boolean;
-    repr_packed:      boolean;
-    repr_transparent: boolean;
-    min_alignment:    u64;
-    /// See StructType.generic_base / type_args: the instantiation this concrete
-    /// IS, carried intrinsically rather than via a side node.
-    generic_base:     TypeRef;
-    type_args:        [TypeRef];
-
-    ClassType(id: u64, qualified_name: SymbolStr, declared_in: ModulePath, intern_table: InternTable*)
-        : Type(id, TypeKind::Class) {
-        this.qualified_name      = DeclName::of(qualified_name);
-        this.declared_in         = declared_in;
-        this.intern_table        = intern_table;
-        this.fields              = [];
-        this.methods             = [];
-        this.base_class          = TypeRef::invalid();
-        this.has_base            = false;
-        this.has_virtual_methods = false;
-        this.is_complete         = false;
-        this.custom_display      = DeclName::empty();
-        this.computed_size       = 0;
-        this.computed_align      = 0;
-        this.repr_c              = false;
-        this.repr_packed         = false;
-        this.repr_transparent    = false;
-        this.min_alignment       = 0;
-        this.generic_base        = TypeRef::invalid();
-        this.type_args           = [];
-    }
-
-    /// See StructType::set_generic_origin - `args` is copied element-wise.
-    set_generic_origin(mut &this, base: TypeRef, args: &[TypeRef]) -> void {
-        this.generic_base = base;
-        mut copied: [TypeRef] = [];
-        for (mut i: i64 = 0; i < args.length; i++) { copied.push(args[i]); }
-        this.type_args = copied;
-    }
-
-    set_repr(mut &this, c: boolean, packed: boolean, transparent: boolean) -> void {
-        this.repr_c           = c;
-        this.repr_packed      = packed;
-        this.repr_transparent = transparent;
-    }
-
-    set_min_alignment(mut &this, n: u64) -> void {
-        this.min_alignment = n;
-    }
-
-    set_fields(mut &this, fields: [FieldInfo]) -> void {
-        this.fields      = fields;
-        this.is_complete = true;
-    }
-
-    set_base_class(mut &this, base: TypeRef) -> void {
-        this.base_class = base;
-        this.has_base   = true;
-    }
-
-    add_method(mut &this, method: MethodInfo) -> void {
-        const is_virtual: boolean  = method.is_virtual;
-        const is_override: boolean = method.is_override;
-        this.methods.push(method);
-        if (is_virtual || is_override) {
-            this.has_virtual_methods = true;
-        }
-    }
-
-    /// A field written as a leaf on a class in hand:
-    /// its position among the class's OWN fields, or -1.  A base's fields
-    /// are its own class's to answer; the caller walks the chain.
-    own_field_position(&this, leaf: SymbolStr) -> i64 {
-        for (mut i: i64 = 0; i < this.fields.length; i++) {
-            if (this.fields[i].name.equals(leaf)) { return i; }
-        }
-        return -1;
-    }
-
-    set_display_name(mut &this, name: DeclName) -> void { this.custom_display = name; }
-
-    set_layout(mut &this, size: u64, align: u64) -> void {
-        this.computed_size  = size;
-        this.computed_align = align;
-    }
-
-    set_field_offset(mut &this, index: i64, offset: u64) -> void {
-        this.fields[index].offset = offset;
-    }
-
-    override display_name(&this) -> string {
-        if (this.custom_display.is_valid()) { return this.intern_table.shown(this.custom_display); }
-        return this.intern_table.shown(this.qualified_name);
-    }
-    override size_bytes(&this) -> u64 { return this.computed_size; }
-    override alignment(&this) -> u64  {
-        if (this.computed_align > 0) { return this.computed_align; }
-        return 1;
     }
 }
 
 
 // EnumType: Discriminated union with variants
 
-type class EnumType : Type {
-public:
+type struct EnumType {
     qualified_name: DeclName;
     declared_in:    ModulePath;
     intern_table:   InternTable*;
@@ -434,7 +286,7 @@ public:
     custom_display: DeclName;
     computed_size:  u64;
     computed_align: u64;
-    /// Layout attributes copied from EnumDeclNode by TypeResolution.
+    /// Layout attributes copied from EnumDecl by TypeResolution.
     /// `repr_c` is currently a no-op marker reserved for full C-ABI ADT
     /// layout post-1.0; `min_alignment` is honoured by TypeLowering.
     repr_c:        boolean;
@@ -450,21 +302,22 @@ public:
     generic_base:      TypeRef;
     type_args:         [TypeRef];
 
-    EnumType(id: u64, qualified_name: SymbolStr, declared_in: ModulePath, intern_table: InternTable*)
-        : Type(id, TypeKind::Enum) {
-        this.qualified_name = DeclName::of(qualified_name);
-        this.declared_in    = declared_in;
-        this.intern_table   = intern_table;
-        this.variants       = [];
-        this.methods        = [];
-        this.custom_display = DeclName::empty();
-        this.computed_size  = 0;
-        this.computed_align = 0;
-        this.repr_c         = false;
-        this.min_alignment  = 0;
-        this.discriminant_type = TypeRef::invalid();
-        this.generic_base      = TypeRef::invalid();
-        this.type_args         = [];
+    static new(qualified_name: SymbolStr, declared_in: ModulePath, intern_table: InternTable*) -> EnumType* {
+        return new EnumType {
+            qualified_name:    DeclName::of(qualified_name),
+            declared_in:       declared_in,
+            intern_table:      intern_table,
+            variants:          [],
+            methods:           [],
+            custom_display:    DeclName::empty(),
+            computed_size:     0,
+            computed_align:    0,
+            repr_c:            false,
+            min_alignment:     0,
+            discriminant_type: TypeRef::invalid(),
+            generic_base:      TypeRef::invalid(),
+            type_args:         [],
+        };
     }
 
     /// See StructType::set_generic_origin - `args` is copied element-wise.
@@ -528,39 +381,34 @@ public:
         this.computed_align = align;
     }
 
-    override display_name(&this) -> string {
+    display_name(&this) -> string {
         if (this.custom_display.is_valid()) { return this.intern_table.shown(this.custom_display); }
         return this.intern_table.shown(this.qualified_name);
-    }
-    override size_bytes(&this) -> u64 { return this.computed_size; }
-    override alignment(&this) -> u64  {
-        if (this.computed_align > 0) { return this.computed_align; }
-        return 1;
     }
 }
 
 
 // TraitType: Interface definition with required methods
 
-type class TraitType : Type {
-public:
+type struct TraitType {
     qualified_name:   DeclName;
     declared_in:      ModulePath;
     intern_table:     InternTable*;
     required_methods: [MethodInfo];
     /// Names of associated types declared in this trait (`type Item;`). Empty
     /// for traits without associated types. The concrete binding for each is
-    /// per-impl (see ImplBlockNode's assoc bindings); a projection
+    /// per-impl (see ImplBlock's assoc bindings); a projection
     /// `X::<name>` resolves by looking up X's impl of this trait.
     assoc_type_names: [SymbolStr];
 
-    TraitType(id: u64, qualified_name: SymbolStr, declared_in: ModulePath, intern_table: InternTable*)
-        : Type(id, TypeKind::Trait) {
-        this.qualified_name   = DeclName::of(qualified_name);
-        this.declared_in      = declared_in;
-        this.intern_table     = intern_table;
-        this.required_methods = [];
-        this.assoc_type_names = [];
+    static new(qualified_name: SymbolStr, declared_in: ModulePath, intern_table: InternTable*) -> TraitType* {
+        return new TraitType {
+            qualified_name:   DeclName::of(qualified_name),
+            declared_in:      declared_in,
+            intern_table:     intern_table,
+            required_methods: [],
+            assoc_type_names: [],
+        };
     }
 
     add_required_method(method: MethodInfo) -> void {
@@ -571,16 +419,13 @@ public:
         this.assoc_type_names.push(name);
     }
 
-    override display_name(&this) -> string { return this.intern_table.shown(this.qualified_name); }
-    override size_bytes(&this) -> u64      { return 0; }  // Traits have no size
-    override alignment(&this) -> u64       { return 0; }
+    display_name(&this) -> string { return this.intern_table.shown(this.qualified_name); }
 }
 
 
 // TypeAliasType: Named alias for another type
 
-type class TypeAliasType : Type {
-public:
+type struct TypeAliasType {
     alias_name:   SymbolStr;
     intern_table: InternTable*;
     target:       TypeRef;
@@ -589,14 +434,15 @@ public:
     computed_size:  u64;
     computed_align: u64;
 
-    TypeAliasType(id: u64, alias_name: SymbolStr, intern_table: InternTable*, target: TypeRef)
-        : Type(id, TypeKind::TypeAlias) {
-        this.alias_name    = alias_name;
-        this.intern_table  = intern_table;
-        this.target        = target;
-        this.is_generic    = false;
-        this.computed_size  = 0;
-        this.computed_align = 0;
+    static new(alias_name: SymbolStr, intern_table: InternTable*, target: TypeRef) -> TypeAliasType* {
+        return new TypeAliasType {
+            alias_name:     alias_name,
+            intern_table:   intern_table,
+            target:         target,
+            is_generic:     false,
+            computed_size:  0,
+            computed_align: 0,
+        };
     }
 
     has_target(&this) -> boolean {
@@ -607,15 +453,12 @@ public:
         this.target = target;
     }
 
-    override display_name(&this) -> string { return this.intern_table.resolve(this.alias_name); }
+    display_name(&this) -> string { return this.intern_table.resolve(this.alias_name); }
 
     set_layout(mut &this, size: u64, align: u64) -> void {
         this.computed_size  = size;
         this.computed_align = align;
     }
-
-    override size_bytes(&this) -> u64 { return this.computed_size; }
-    override alignment(&this) -> u64  { return this.computed_align; }
 }
 
 
@@ -628,18 +471,16 @@ public:
 // FunctionTemplateType is a lightweight sentinel that occupies an arena slot
 // solely for ID generation.  It has no fields, methods, or layout.
 
-type class FunctionTemplateType : Type {
-public:
+type struct FunctionTemplateType {
     qualified_name: DeclName;
     intern_table:   InternTable*;
 
-    FunctionTemplateType(id: u64, qualified_name: SymbolStr, intern_table: InternTable*)
-        : Type(id, TypeKind::FunctionTemplate) {
-        this.qualified_name = DeclName::of(qualified_name);
-        this.intern_table   = intern_table;
+    static new(qualified_name: SymbolStr, intern_table: InternTable*) -> FunctionTemplateType* {
+        return new FunctionTemplateType {
+            qualified_name: DeclName::of(qualified_name),
+            intern_table:   intern_table,
+        };
     }
 
-    override display_name(&this) -> string { return this.intern_table.shown(this.qualified_name); }
-    override size_bytes(&this) -> u64 { return 0; }
-    override alignment(&this) -> u64 { return 0; }
+    display_name(&this) -> string { return this.intern_table.shown(this.qualified_name); }
 }

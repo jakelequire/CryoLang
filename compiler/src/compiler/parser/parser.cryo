@@ -1,9 +1,12 @@
 ///! Parser
 ///!
-///! Top-level parser class extending ExprParser with statement and declaration
-///! parsing.  This is the main entry point for the parsing pass.
+///! `Parser`'s statement and declaration parsing, and its entry point for
+///! the parsing pass.  `Parser` is declared in `cursor` and re-exported
+///! here, so an importer of this module names a parser with every method.
 
 namespace compiler::parser::parser;
+
+export compiler::parser::cursor::{ Parser };
 
 import compiler::lex;
 import compiler::lex::{ Token, TokenType };
@@ -11,7 +14,7 @@ import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, source_span, suggestion };
 import compiler::ast;
 import compiler::ast::{
-    declaration, expression, ImportStyle, NamedAnnotation, node, NodeKind,
+    declaration, expression, ImportStyle, NamedAnnotation, node,
     pattern, PatternBinding, PatternElement, PrimitiveAnnotation, ReferenceAnnotation,
     statement, ThisTypeAnnotation, TraitBound, TraitRef, TupleAnnotation, TypeAnnotation,
     Visibility
@@ -23,7 +26,7 @@ import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, ResSlot };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
-import compiler::parser::{ parser_base, expr_parser };
+import compiler::parser::{ cursor, expr_parser };
 import utils::logger;
 import utils::logger::{ LOG_DEBUG, LogComponent };
 import compiler::types::type_ref;
@@ -34,32 +37,28 @@ import compiler::resolver::lang_item::{ LangItem };
 import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{
-    AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DestructureBinding,
-    DestructureDeclNode, EnumDeclNode, EnumVariantNode, ExternBlockNode, FieldDeclNode,
-    FunctionDeclNode, GenericParamNode, ImplBlockNode, ImportDeclNode,
-    IntrinsicConstDeclNode, IntrinsicDeclNode, MethodNode, ModuleDeclNode, ReceiverForm,
-    StructDeclNode,
-    TraitDeclNode, TypeAliasDeclNode, UnionDeclNode, VarDeclNode
+    AssocTypeDeclNode, DeclarationNode, DeclKind, DestructureBinding,
+    DestructureDecl, EnumDecl, EnumVariant, ExternBlock, FieldDecl,
+    FunctionDecl, GenericParamDecl, ImplBlock, ImportDecl,
+    IntrinsicDecl, MethodDecl, ModuleDecl, ReceiverForm,
+    StructDecl,
+    TraitDecl, TypeAliasDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
-    CallExprNode, ExpressionNode, IdentifierNode, MemberAccessNode
+    CallExpr, ExpressionNode, MemberAccessExpr
 };
-import compiler::ast::node::{ ASTNode, ProgramNode, StaticAssertItem };
+import compiler::ast::node::{ Node, ProgramNode, StaticAssertItem };
 import compiler::ast::pattern::{
-    DirectiveArg, DirectiveArgKind, DirectiveNode, EnumPatternNode, MatchArmNode,
-    PatternNode, StaticMatchArmNode
+    DirectiveArg, DirectiveArgKind, DirectiveNode, MatchArmNode, Pattern, StaticMatchArmNode
 };
 import compiler::ast::statement::{
-    AsmBlockStmtNode, AsmConstraintKind, AsmDialect, AsmOpDir, AsmOperand, AsmPiece,
-    BlockStmtNode, BreakStmtNode, ContinueStmtNode, DeclStmtNode, DoWhileStmtNode,
-    ExprStmtNode, ForStmtNode, IfStmtNode, LoopStmtNode, MatchStmtNode, ReturnStmtNode,
-    StatementNode, StaticMatchStmtNode, UnsafeBlockStmtNode, WhileStmtNode
+    AsmBlockStmt, AsmConstraintKind, AsmDialect, AsmOpDir, AsmOperand, AsmPiece, BlockStmt,
+    MatchStmt, StaticMatchStmt, Stmt, StmtKind
 };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::diag::suggestion::{ Applicability, Suggestion };
 import compiler::parser::expr_parser::{ g_for_in_counter };
-import compiler::parser::parser_base::{ ParserBase };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import utils::keyword::{ Keyword };
@@ -75,34 +74,22 @@ type struct MethodModifiers {
     span:      SourceSpan;
 }
 
-type class Parser : ExprParser {
-public:
-    /// Module-scope `static_assert(...)` items collected during the top-level
-    /// parse and attached to the ProgramNode before it is returned. Kept off
-    /// the statement stream so they need no NodeKind / visitor handling.
-    static_assert_items: [StaticAssertItem*];
-
-    Parser(tokens: [Token], source_file: string, ctx: CompilationContext*)
-        : ExprParser(tokens, source_file, ctx) {
-        this.static_assert_items = [];
-    }
-
+implement struct Parser {
     /// Parse a standalone expression from `toks` on a fresh sub-`Parser`,
     /// sharing this parser's source file and compilation context (intern
     /// table, diagnostics).  Used by f-string hole desugaring.  A separate
     /// parser is used so the hole's token stream never displaces this
     /// parser's own (owned) tokens.
-    override parse_expr_from_tokens(toks: [Token]) -> ExpressionNode* {
-        mut sub: Parser = Parser(toks, this.source_file, this.ctx);
+    parse_expr_from_tokens(toks: [Token]) -> ExpressionNode* {
+        mut sub: Parser = Parser::new(toks, this.source_file, this.ctx);
         return sub.parse_expression();
     }
 
-    /// Override ExprParser's limited block parser with full statement support.
-    /// This allows match expression arms and lambda bodies to contain any
-    /// statement (for, if, while, etc.), not just const/return/expressions.
-    /// Unlike parse_block_statement(), semicolons are optional before '}'
-    /// (the last expression in the block is the arm's return value).
-    override parse_inner_block() -> BlockStmtNode* {
+    /// The braced body of a match arm or a lambda, which may hold any
+    /// statement (for, if, while, etc.).  Unlike parse_block_statement(),
+    /// semicolons are optional before '}' (the last expression in the block
+    /// is the arm's return value).
+    parse_inner_block() -> Stmt* {
         // BRACE_DEPTH_LIMIT: nested blocks (`{{{...}}}`, and the block bodies
         // of nested `if`/`match`/`while`/`for`) recurse through here with no
         // expression-level bracketing for the unary/expr/type guards to catch,
@@ -115,10 +102,11 @@ public:
         if (this.brace_depth > 256) {
             this.report_error(ErrorCode::E0111_INVALID_SYNTAX,
                 "block nesting too deep (recursion limit exceeded)");
-            return new BlockStmtNode(this.current_span());
+            return Stmt::block(this.current_span());
         }
         const bstart: Token = this.advance(); // consume '{'
-        mut block: BlockStmtNode* = new BlockStmtNode(this.span_from_token(bstart));
+        const block: Stmt* = Stmt::block(this.span_from_token(bstart));
+        const body: BlockStmt* = block.as_block();
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
             const before_pos: i64 = this.pos;
@@ -137,23 +125,20 @@ public:
                 this.check(TokenType::KwStatic) &&
                 this.peek_at(1).kind == TokenType::KwMatch;
             if (this.is_declaration_start() && !is_static_match) {
-                const decl: ASTNode* = this.parse_declaration(false, "");
-                if (decl != null) {
-                    const decl_stmt: DeclStmtNode* = new DeclStmtNode(
-                        decl as DeclarationNode*, decl.span);
-                    block.add_statement(decl_stmt);
+                const item: Stmt* = Parser::block_item(this.parse_declaration(false, ""));
+                if (item != null) {
+                    body.add_statement(item);
                 }
             } else if (is_static_match || this.is_statement_keyword()) {
-                const stmt: StatementNode* = this.parse_statement();
+                const stmt: Stmt* = this.parse_statement();
                 if (stmt != null) {
-                    block.add_statement(stmt);
+                    body.add_statement(stmt);
                 }
             } else {
                 // Expression: semicolon optional before '}'
                 const expr: ExpressionNode* = this.parse_expression();
                 if (expr != null) {
-                    const stmt: ExprStmtNode* = new ExprStmtNode(expr, expr.span);
-                    block.add_statement(stmt);
+                    body.add_statement(Stmt::expr_stmt(expr, expr.span));
                 }
                 this.match_tok(TokenType::Semicolon);
             }
@@ -169,7 +154,7 @@ public:
     }
 
     /// Create a parser from the compilation context's token stream.
-    /// The parser OWNS its `tokens` buffer (ParserBase.tokens), so it must
+    /// The parser OWNS its `tokens` buffer, so it must
     /// receive an independent copy rather than aliasing the ctx-owned lexer
     /// output (`ctx.artifacts.tokens.tokens`): otherwise both the parser and
     /// the context would free the same buffer.  Token is Copy, so this is a
@@ -180,46 +165,37 @@ public:
         for (mut i: i64 = 0; i < src_len; i++) {
             toks_copy.push(ctx.artifacts.tokens.tokens[i]);
         }
-        return Parser(
+        return Parser::new(
             toks_copy,
             ctx.artifacts.tokens.source_file,
             ctx
         );
     }
 
-    /// True if the AST node is a declaration that can carry attached
-    /// directives (i.e. inherits from `DeclarationNode`).
-    static is_attachable_decl(node: ASTNode*) -> boolean {
-        if (node == null) { return false; }
-        return match (node.kind) {
-            NodeKind::FunctionDeclaration   => { true }
-            NodeKind::StructDeclaration     => { true }
-            NodeKind::UnionDeclaration      => { true }
-            NodeKind::ClassDeclaration      => { true }
-            NodeKind::EnumDeclaration       => { true }
-            NodeKind::TraitDeclaration      => { true }
-            NodeKind::TypeAliasDeclaration  => { true }
-            NodeKind::VariableDeclaration   => { true }
-            NodeKind::ImplementationBlock   => { true }
-            NodeKind::ExternBlock           => { true }
-            NodeKind::ImportDeclaration     => { true }
-            NodeKind::ModuleDeclaration     => { true }
-            NodeKind::IntrinsicDeclaration  => { true }
-            NodeKind::IntrinsicConstDeclaration => { true }
-            _                               => { false }
-        };
+    /// What `parse_declaration` parsed where a statement stands, as a
+    /// statement of the block: a declaration wrapped in a declaration
+    /// statement, the statement it fell back to as itself, null for nothing.
+    static block_item(item: Node) -> Stmt* {
+        match (item) {
+            Node::Decl(d) => {
+                if (d != null) { return Stmt::decl_stmt(d, d.span); }
+            }
+            Node::Stmt(s) => { return s; }
+            _ => { }
+        }
+        return null;
     }
 
     /// Record a leading modifier keyword (`public` / `private`) on a
     /// declaration that has just been parsed.  The keyword is consumed
     /// before the declaration's own parse begins, so it falls outside the
     /// node's `span`; `DeclarationNode::outer_span` folds it back in for
-    /// consumers that need the full written extent.  Nodes that can't carry
-    /// one (a recovery `null`, a non-declaration) are ignored - the same
-    /// gate `is_attachable_decl` applies to directives.
-    static note_decl_modifier(node: ASTNode*, span: SourceSpan) -> void {
-        if (!Parser::is_attachable_decl(node)) { return; }
-        const decl: DeclarationNode* = node as DeclarationNode*;
+    /// consumers that need the full written extent.  An item that can't
+    /// carry one (a recovery null, a non-declaration) is ignored, as it is
+    /// for attached directives.
+    static note_decl_modifier(node: Node, span: SourceSpan) -> void {
+        const decl: DeclarationNode* = node.as_decl();
+        if (decl == null) { return; }
         decl.note_modifier_span(span);
     }
 
@@ -233,7 +209,7 @@ public:
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse() starting parsing...");
 
         const start: Token = this.current();
-        mut program: ProgramNode* = new ProgramNode(this.span_from_token(start));
+        mut program: ProgramNode* = ProgramNode::new(this.span_from_token(start));
 
         while (!this.is_at_end()) {
             if (this.panic_mode) {
@@ -257,7 +233,7 @@ public:
 
             if (this.is_at_end()) {
                 for (mut i: i64 = 0; i < pending.length; i++) {
-                    program.add_statement(pending[i] as ASTNode*);
+                    program.add_statement(Node::Directive(pending[i]));
                 }
                 break;
             }
@@ -266,28 +242,27 @@ public:
             // lowered to LLVM module inline asm.  `pending` (its `![arch]` /
             // `![clobber]`) is lifted into the node.
             if (this.check(TokenType::KwAsm)) {
-                const asm_node: AsmBlockStmtNode* = this.parse_asm_block(pending, true);
-                program.add_statement(asm_node as ASTNode*);
+                program.add_statement(Node::Stmt(this.parse_asm_block(pending, true)));
                 continue;
             }
 
-            const node: ASTNode* = this.parse_top_level();
-            if (node != null) {
-                if (pending.length > 0 && Parser::is_attachable_decl(node)) {
-                    const decl: DeclarationNode* = node as DeclarationNode*;
+            const node: Node = this.parse_top_level();
+            if (!node.is_null()) {
+                const decl: DeclarationNode* = node.as_decl();
+                if (pending.length > 0 && decl != null) {
                     for (mut i: i64 = 0; i < pending.length; i++) {
                         decl.add_directive(pending[i]);
                     }
                 } else {
                     for (mut i: i64 = 0; i < pending.length; i++) {
-                        program.add_statement(pending[i] as ASTNode*);
+                        program.add_statement(Node::Directive(pending[i]));
                     }
                 }
                 program.add_statement(node);
-                Parser::hoist_extern_globals(program, node);
+                Parser::hoist_extern_globals(program, decl);
             } else if (pending.length > 0) {
                 for (mut i: i64 = 0; i < pending.length; i++) {
-                    program.add_statement(pending[i] as ASTNode*);
+                    program.add_statement(Node::Directive(pending[i]));
                 }
             }
         }
@@ -299,18 +274,21 @@ public:
         program.uses_fstring = this.used_fstring;
 
         // Set the file's namespace from its `namespace X::Y::Z;` line.
-        // The parser converts that line into a `ModuleDeclNode`; the
+        // The parser converts that line into a module declaration; the
         // first such node in the statement list is, by convention, the
         // file's own namespace (subsequent `public module ...;` lines
         // are sub-module re-exports).  Skipping over directive nodes
         // keeps `![config(...)]`-prefixed files producing the right
         // `namespace_name`.
         for (mut i: i64 = 0; i < program.statements.length; i++) {
-            const s: ASTNode* = program.statements[i];
-            if (s == null) { continue; }
-            if (s.kind == NodeKind::Directive) { continue; }
-            if (s.kind == NodeKind::ModuleDeclaration) {
-                const m: ModuleDeclNode* = s as ModuleDeclNode*;
+            const s: Node = program.statements[i];
+            if (s.is_null()) { continue; }
+            match (s) {
+                Node::Directive(_) => { continue; }
+                _                  => { }
+            }
+            const m: ModuleDecl* = DeclarationNode::module_of(s.as_decl());
+            if (m != null) {
                 program.set_namespace_name(m.path);
             }
             break;
@@ -343,7 +321,7 @@ public:
         this.consume(TokenType::RParen, "')'");
         this.consume(TokenType::Semicolon, "';'");
         const item: StaticAssertItem* = new StaticAssertItem {
-            cond:    cond as void*,
+            cond:    cond,
             message: msg,
             span:    this.span_from(start),
         };
@@ -355,7 +333,7 @@ public:
 
     /// Dispatch to the appropriate declaration or statement parser based on
     /// the current token.
-    parse_top_level() -> ASTNode* {
+    parse_top_level() -> Node {
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_top_level() token='%s'", this.current().lexeme);
         const tok: Token = this.current();
         const doc: string = this.take_documentation();
@@ -364,27 +342,27 @@ public:
         // `namespace X::Y;` line is the module's documentation; attach
         // it so the LSP can surface it on hover.
         if (tok.kind == TokenType::KwNamespace) {
-            const ns: ASTNode* = this.parse_namespace_declaration();
+            const ns: DeclarationNode* = this.parse_namespace_declaration();
             if (ns != null && doc != "") {
-                (ns as ModuleDeclNode*).set_documentation(doc);
+                ns.set_documentation(doc);
             }
-            return ns;
+            return Node::Decl(ns);
         }
 
         // Module declaration (public module Foo;)
         if (tok.kind == TokenType::KwPublic && this.peek_at(1).kind == TokenType::KwModule) {
-            const md: ModuleDeclNode* = this.parse_module_declaration();
+            const md: DeclarationNode* = this.parse_module_declaration();
             if (md != null && doc != "") {
                 md.set_documentation(doc);
             }
-            return md;
+            return Node::Decl(md);
         }
 
         // Public declarations
         if (tok.kind == TokenType::KwPublic) {
             const vis_span: SourceSpan = this.span_from_token(tok);
             this.advance(); // consume 'public'
-            const decl: ASTNode* = this.parse_declaration(true, doc);
+            const decl: Node = this.parse_declaration(true, doc);
             Parser::note_decl_modifier(decl, vis_span);
             return decl;
         }
@@ -393,66 +371,66 @@ public:
         if (tok.kind == TokenType::KwPrivate) {
             const vis_span: SourceSpan = this.span_from_token(tok);
             this.advance();
-            const decl: ASTNode* = this.parse_declaration(false, doc);
+            const decl: Node = this.parse_declaration(false, doc);
             Parser::note_decl_modifier(decl, vis_span);
             return decl;
         }
 
         // Import declaration
         if (tok.kind == TokenType::KwImport) {
-            const imp: ImportDeclNode* = this.parse_import_declaration();
+            const imp: DeclarationNode* = this.parse_import_declaration();
             if (imp != null && doc != "") {
                 imp.set_documentation(doc);
             }
-            return imp;
+            return Node::Decl(imp);
         }
 
         // Export declaration (symbol re-export).
         if (tok.kind == TokenType::KwExport) {
-            const exp: ImportDeclNode* = this.parse_export_declaration();
+            const exp: DeclarationNode* = this.parse_export_declaration();
             if (exp != null && doc != "") {
                 exp.set_documentation(doc);
             }
-            return exp;
+            return Node::Decl(exp);
         }
 
         // Extern block, or the C-header import form `extern module name := "C"`.
         if (tok.kind == TokenType::KwExtern) {
             if (this.peek_at(1).kind == TokenType::KwModule) {
-                const cext: ExternBlockNode* = this.parse_extern_module_cimport();
+                const cext: DeclarationNode* = this.parse_extern_module_cimport();
                 if (cext != null && doc != "") {
                     cext.set_documentation(doc);
                 }
-                return cext;
+                return Node::Decl(cext);
             }
-            const ext: ExternBlockNode* = this.parse_extern_block();
+            const ext: DeclarationNode* = this.parse_extern_block();
             if (ext != null && doc != "") {
                 ext.set_documentation(doc);
             }
-            return ext;
+            return Node::Decl(ext);
         }
 
         // Implement block
         if (tok.kind == TokenType::KwImplement) {
-            const impl_blk: ImplBlockNode* = this.parse_implementation_block();
+            const impl_blk: DeclarationNode* = this.parse_implementation_block();
             if (impl_blk != null && doc != "") {
                 impl_blk.set_documentation(doc);
             }
-            return impl_blk;
+            return Node::Decl(impl_blk);
         }
 
         // Directive: ![name] or ![name(args)]
         if (tok.kind == TokenType::BangBracket) {
-            return this.parse_directive();
+            return Node::Directive(this.parse_directive());
         }
 
         // `static_assert(cond)` / `static_assert(cond, "message")` at module
         // scope. `static_assert` is a reserved keyword. The item is stashed on
         // the parser and attached to the ProgramNode; nothing is added to the
-        // statement stream, so this returns null.
+        // statement stream, so this returns an absent item.
         if (tok.kind == TokenType::KwStaticAssert) {
             this.parse_static_assert();
-            return null;
+            return Node::Decl(null);
         }
 
         // Regular declaration (function, type, const, mut, etc.).
@@ -468,18 +446,19 @@ public:
     }
 
     /// Parse a declaration based on the current token.
-    parse_declaration(is_public: boolean, doc_text: string) -> ASTNode* {
+    parse_declaration(is_public: boolean, doc_text: string) -> Node {
         const doc: string = doc_text;
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_declaration() token='%s'", this.current().lexeme);
         const tok: Token = this.current();
 
         // Function declaration
         if (tok.kind == TokenType::KwFunction) {
-            const func: FunctionDeclNode* = this.parse_function_declaration(is_public);
+            const func_decl: DeclarationNode* = this.parse_function_declaration(is_public);
+            const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
             if (func != null && doc != "") {
-                func.set_documentation(doc_text);
+                func_decl.set_documentation(doc_text);
             }
-            return func;
+            return Node::Decl(func_decl);
         }
 
         // `async function` - an async fn is parsed as an ordinary function
@@ -488,110 +467,99 @@ public:
         if (tok.kind == TokenType::KwAsync && this.peek_at(1).kind == TokenType::KwFunction) {
             const async_span: SourceSpan = this.span_from_token(tok);
             this.advance(); // consume 'async'
-            const func: FunctionDeclNode* = this.parse_function_declaration(is_public);
+            const func_decl: DeclarationNode* = this.parse_function_declaration(is_public);
+            const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
             if (func != null) {
                 func.set_async(true);
-                func.note_modifier_span(async_span);
-                if (doc != "") { func.set_documentation(doc_text); }
+                func_decl.note_modifier_span(async_span);
+                if (doc != "") { func_decl.set_documentation(doc_text); }
             }
-            return func;
+            return Node::Decl(func_decl);
         }
 
         // Variable declaration: const or mut.  If the next-after token is `{`
         // it's a struct destructure binding (`const { f }: T = expr;`); these
         // are body-only (no global destructures), so the global path stays on
-        // the VarDeclNode form.
+        // the VarDecl form.
         if (tok.kind == TokenType::KwConst || tok.kind == TokenType::KwMut) {
             if (this.peek_at(1).kind == TokenType::LBrace && this.scope_depth > 0) {
-                return this.parse_destructure_decl();
+                return Node::Decl(this.parse_destructure_decl());
             }
-            const vd: VarDeclNode* = this.parse_variable_declaration();
+            const vd: DeclarationNode* = this.parse_variable_declaration();
             if (vd != null) {
                 if (doc != "") { vd.set_documentation(doc_text); }
-                if (this.scope_depth == 0) { vd.set_global(true); }
+                if (this.scope_depth == 0) { DeclarationNode::var_of(vd).set_global(true); }
             }
-            return vd;
+            return Node::Decl(vd);
         }
 
-        // Type declarations: type struct/class/enum/trait/alias
+        // Type declarations: type struct/enum/trait/alias
         if (tok.kind == TokenType::KwType) {
             const next: Token = this.peek_at(1);
 
-            if (next.kind == TokenType::KwStruct) {
-                const sd: StructDeclNode* = this.parse_struct_declaration();
+            if (next.kind == TokenType::KwStruct || next.kind == TokenType::KwClass) {
+                const sd: DeclarationNode* = this.parse_struct_declaration();
                 if (sd != null) {
-                    sd.set_public(is_public);
+                    DeclarationNode::struct_of(sd).is_public = is_public;
                     if (doc != "") { sd.set_documentation(doc_text); }
                 }
-                return sd;
+                return Node::Decl(sd);
             }
             if (next.kind == TokenType::KwUnion) {
-                const ud: UnionDeclNode* = this.parse_union_declaration();
+                const ud: DeclarationNode* = this.parse_union_declaration();
                 if (ud != null) {
-                    ud.set_public(is_public);
+                    DeclarationNode::union_of(ud).is_public = is_public;
                     if (doc != "") { ud.set_documentation(doc_text); }
                 }
-                return ud;
-            }
-            if (next.kind == TokenType::KwClass) {
-                const cd: ClassDeclNode* = this.parse_class_declaration();
-                if (cd != null) {
-                    cd.set_public(is_public);
-                    if (doc != "") { cd.set_documentation(doc_text); }
-                }
-                return cd;
+                return Node::Decl(ud);
             }
             if (next.kind == TokenType::KwEnum) {
-                const ed: EnumDeclNode* = this.parse_enum_declaration();
+                const ed: DeclarationNode* = this.parse_enum_declaration();
                 if (ed != null) {
-                    ed.set_public(is_public);
+                    DeclarationNode::enum_of(ed).is_public = is_public;
                     if (doc != "") { ed.set_documentation(doc_text); }
                 }
-                return ed;
+                return Node::Decl(ed);
             }
             if (next.kind == TokenType::KwTrait) {
-                const td: TraitDeclNode* = this.parse_trait_declaration();
+                const td: DeclarationNode* = this.parse_trait_declaration();
                 if (td != null && doc != "") { td.set_documentation(doc_text); }
-                return td;
+                return Node::Decl(td);
             }
 
             // Type alias: type Alias = Target;
-            return this.parse_type_alias_declaration();
+            return Node::Decl(this.parse_type_alias_declaration());
         }
 
         // Static keyword before function
         if (tok.kind == TokenType::KwStatic && this.peek_at(1).kind == TokenType::KwFunction) {
             const static_span: SourceSpan = this.span_from_token(tok);
             this.advance(); // consume 'static'
-            const func: FunctionDeclNode* = this.parse_function_declaration(is_public);
+            const func_decl: DeclarationNode* = this.parse_function_declaration(is_public);
+            const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
             if (func != null) {
                 func.set_static(true);
-                func.note_modifier_span(static_span);
-                if (doc != "") { func.set_documentation(doc_text); }
+                func_decl.note_modifier_span(static_span);
+                if (doc != "") { func_decl.set_documentation(doc_text); }
             }
-            return func;
+            return Node::Decl(func_decl);
         }
 
-        // Intrinsic declaration or intrinsic const
+        // Intrinsic function declaration
         if (tok.kind == TokenType::KwIntrinsic) {
-            // Peek ahead: intrinsic const -> IntrinsicConstDecl
-            if (this.peek_at(1).kind == TokenType::KwConst) {
-                const ic: IntrinsicConstDeclNode* = this.parse_intrinsic_const_declaration();
-                if (ic != null && doc != "") { ic.set_documentation(doc_text); }
-                return ic;
-            }
             if (this.peek_at(1).kind == TokenType::KwFunction && this.peek_at(3).kind == TokenType::LAngle) {
-                const gi: FunctionDeclNode* = this.parse_generic_intrinsic_declaration();
-                if (gi != null && doc != "") { gi.set_documentation(doc_text); }
-                return gi;
+                const gi_decl: DeclarationNode* = this.parse_generic_intrinsic_declaration();
+                const gi: FunctionDecl* = DeclarationNode::fn_of(gi_decl);
+                if (gi != null && doc != "") { gi_decl.set_documentation(doc_text); }
+                return Node::Decl(gi_decl);
             }
-            const intr: IntrinsicDeclNode* = this.parse_intrinsic_declaration();
+            const intr: DeclarationNode* = this.parse_intrinsic_declaration();
             if (intr != null && doc != "") { intr.set_documentation(doc_text); }
-            return intr;
+            return Node::Decl(intr);
         }
 
         // Fall through to statement
-        return this.parse_statement();
+        return Node::Stmt(this.parse_statement());
     }
 
 
@@ -600,7 +568,7 @@ public:
     /// Parse a variable declaration: const/mut name: Type = expr;
     /// The variable name may be a keyword used as an identifier
     /// (e.g. `mut string: String`, `const default: i32`).
-    parse_variable_declaration() -> VarDeclNode* {
+    parse_variable_declaration() -> DeclarationNode* {
         const start: Token = this.current();
         const is_mutable: boolean = this.current().kind == TokenType::KwMut;
         this.advance(); // consume 'const' or 'mut'
@@ -613,9 +581,10 @@ public:
             name_tok = this.consume(TokenType::Identifier, "variable name");
         }
         const name: SymbolStr = this.intern_lexeme(name_tok);
-        mut node: VarDeclNode* = new VarDeclNode(name, this.span_from_token(start));
+        mut node: VarDecl* = VarDecl::new(name);
+        const node_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(node), this.span_from_token(start));
         node.set_mutable(is_mutable);
-        node.set_name_span(this.span_from_token(name_tok));
+        node_decl.set_name_span(this.span_from_token(name_tok));
         // The leading `const`/`mut` keyword's exact span - recorded
         // separately from the whole-declaration span so E0218 can emit a
         // precise replace-keyword quickfix.
@@ -639,19 +608,19 @@ public:
         }
 
         this.consume(TokenType::Semicolon, "';'");
-        node.span = this.span_from(start);
-        return node;
+        node_decl.span = this.span_from(start);
+        return node_decl;
     }
 
     /// Parse a struct destructure declaration: `const { f1, f2: alias, mut f3 }: T = expr;`.
     /// Caller has confirmed the next-after-const/mut token is `{`.
-    parse_destructure_decl() -> DestructureDeclNode* {
+    parse_destructure_decl() -> DeclarationNode* {
         const start: Token = this.current();
         const is_mutable: boolean = this.current().kind == TokenType::KwMut;
         this.advance(); // consume 'const' or 'mut'
 
-        mut node: DestructureDeclNode* = new DestructureDeclNode(this.span_from_token(start));
-        node.set_mutable(is_mutable);
+        const node: DestructureDecl* = DestructureDecl::new();
+        node.is_mutable = is_mutable;
 
         this.consume(TokenType::LBrace, "'{'");
 
@@ -712,15 +681,14 @@ public:
             const binding: DestructureBinding = DestructureBinding::new(
                 source_field, local_name, entry_mut || is_mutable,
                 entry_span, name_span);
-            node.add_binding(binding);
+            node.bindings.push(binding);
         }
 
         this.consume(TokenType::RBrace, "'}'");
 
         // Required `: Type` annotation
         if (this.match_tok(TokenType::Colon)) {
-            const type_ann: TypeAnnotation* = this.parse_type_annotation();
-            node.set_type_annotation(type_ann);
+            node.type_annotation = this.parse_type_annotation();
         } else {
             this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
                 "destructure binding requires ': Type' after the pattern");
@@ -728,22 +696,20 @@ public:
 
         // Initializer is mandatory for destructure (can't bind fields of nothing)
         if (this.match_tok(TokenType::Equal)) {
-            const init: ExpressionNode* = this.parse_expression();
-            node.set_initializer(init);
+            node.initializer = this.parse_expression();
         } else {
             this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
                 "destructure binding requires an initializer (`= expr`)");
         }
 
         this.consume(TokenType::Semicolon, "';'");
-        node.span = this.span_from(start);
-        return node;
+        return DeclarationNode::of(DeclKind::Destructure(node), this.span_from(start));
     }
 
     /// Parse a function declaration: `function name<T>(params) -> RetType { body }`.
     /// The leading `function` keyword is optional: trait bodies use the
     /// keyword-less `name(params) -> RetType;` form for declarations.
-    parse_function_declaration(is_public: boolean) -> FunctionDeclNode* {
+    parse_function_declaration(is_public: boolean) -> DeclarationNode* {
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_function_declaration()");
         const start: Token = this.current();
         if (this.check(TokenType::KwFunction)) {
@@ -757,19 +723,20 @@ public:
             name_tok = this.consume(TokenType::Identifier, "function name");
         }
         const name: SymbolStr = this.intern_lexeme(name_tok);
-        mut func: FunctionDeclNode* = new FunctionDeclNode(name, this.span_from_token(start));
+        mut func: FunctionDecl* = FunctionDecl::new(name);
+        const func_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(func), this.span_from_token(start));
         func.set_public(is_public);
-        func.set_name_span(this.span_from_token(name_tok));
+        func_decl.set_name_span(this.span_from_token(name_tok));
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
-            const gen_params: [GenericParamNode*] = this.parse_generic_params(true);
+            const gen_params: [DeclarationNode*] = this.parse_generic_params(true);
             for (mut i: i64 = 0; i < gen_params.length; i++) {
                 func.add_generic_param(gen_params[i]);
             }
         }
 
-        this.parse_function_param_list_into(func);
+        this.parse_function_param_list_into(func_decl);
 
         // Optional return type
         if (this.match_tok(TokenType::Arrow)) {
@@ -787,44 +754,70 @@ public:
 
         // Function body or semicolon (forward declaration)
         if (this.check(TokenType::LBrace)) {
-            const body: BlockStmtNode* = this.parse_block_statement();
+            const body: Stmt* = this.parse_block_statement();
             func.set_body(body);
         } else {
             this.consume(TokenType::Semicolon, "';' or '{'");
         }
 
-        func.span = this.span_from(start);
-        return func;
+        func_decl.span = this.span_from(start);
+        return func_decl;
     }
 
-    /// Emit E0359 for `protected` (block or inline form) used inside a struct.
-    /// `is_block` controls the suggestion text (`public:` vs `public`).
-    emit_protected_in_struct_error(kw_tok: Token, is_block: boolean) -> void {
-        const kw_span: SourceSpan = this.span_from_token(kw_tok);
-        this.panic_mode = true;
+    /// Refuse a form the language does not have where it is written (E0117):
+    /// "`form` is not part of Cryo", the span labelled with what the form is,
+    /// and a help line saying what to write instead.  The caller consumes the
+    /// form and parses on, so what follows it is still checked.
+    refuse_removed_form(span: SourceSpan, form: string, label: string, help: string) -> void {
         this.error_count += 1;
-        const msg: string = if (is_block) {
-            "`protected:` is not allowed in structs (structs do not support inheritance)"
-        } else {
-            "`protected` is not allowed in structs (structs do not support inheritance)"
-        };
-        const sugg_text: string = if (is_block) { "public" } else { "public" };
-        const sugg_label: string = if (is_block) { "change to `public:`" } else { "change to `public`" };
-        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0359_PROTECTED_IN_STRUCT, msg);
-        diag = diag.at(kw_span);
-        diag = diag.suggest(Suggestion::single(kw_span, sugg_text, sugg_label,
-            Applicability::MaybeIncorrect));
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0117_REMOVED_FORM,
+            fmt::format("`%s` is not part of Cryo", form));
+        diag = diag.at_with_label(span, label);
+        diag = diag.help(help);
         this.ctx.emit_diagnostic(diag);
+    }
+
+    /// Refuse `protected` (`protected:` when `is_block`) at its keyword and
+    /// consume it.
+    refuse_protected(is_block: boolean) -> void {
+        mut span: SourceSpan = this.span_from_token(this.current());
+        this.advance();
+        if (is_block) {
+            span = SourceSpan::covering(span, this.span_from_token(this.current()));
+            this.advance();
+        }
+        this.refuse_removed_form(span,
+            if (is_block) { "protected:" } else { "protected" },
+            "a visibility no declaration has",
+            if (is_block) { "write `private:` or `public:`" } else { "write `private` or `public`" });
+    }
+
+    /// At a `virtual` or `override` member modifier: refuse it and consume
+    /// it, so the method it modifies parses as an ordinary method.
+    refuse_member_modifier() -> void {
+        if (!this.at_removed_modifier(TokenType::KwVirtual) && !this.at_removed_modifier(TokenType::KwOverride)) { return; }
+        const tok: Token = this.advance();
+        this.refuse_removed_form(this.span_from_token(tok), tok.lexeme, "a method modifier",
+            "declare the method in a trait and implement it");
+    }
+
+    /// Whether the cursor is at keyword `kw` used as a modifier, not as the
+    /// name of a method (`protected()`), which a keyword may be.
+    at_removed_modifier(kw: TokenType) -> boolean {
+        if (!this.check(kw)) { return false; }
+        const next: TokenType = this.peek_at(1).kind;
+        return next != TokenType::LParen && next != TokenType::LAngle;
     }
 
     /// Parse `'(' params ')'` directly into `func`, also forwarding bare
     /// (`...`) and named (`name...`) variadic markers. Shared by free-fn,
-    /// method, and constructor parsing so the variadic-detection rules don't
-    /// drift across the three sites.
-    parse_function_param_list_into(func: FunctionDeclNode*) -> void {
+    /// method, and refused-constructor parsing so the variadic-detection
+    /// rules don't drift across the three sites.
+    parse_function_param_list_into(func_decl: DeclarationNode*) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         this.consume(TokenType::LParen, "'('");
         if (!this.check(TokenType::RParen)) {
-            const params: [VarDeclNode*] = this.parse_parameter_list();
+            const params: [DeclarationNode*] = this.parse_parameter_list();
             for (mut i: i64 = 0; i < params.length; i++) {
                 func.add_parameter(params[i]);
             }
@@ -843,8 +836,8 @@ public:
     /// instead of producing a parameter; the named form `args...` sets
     /// `this.pending_named_variadic` after pushing the parameter. Callers
     /// forward either flag onto the function node they're building.
-    parse_parameter_list() -> [VarDeclNode*] {
-        mut params: [VarDeclNode*] = [];
+    parse_parameter_list() -> [DeclarationNode*] {
+        mut params: [DeclarationNode*] = [];
         this.pending_bare_variadic  = false;
         this.pending_named_variadic = false;
 
@@ -857,7 +850,7 @@ public:
                 break;
             }
 
-            const param: VarDeclNode* = this.parse_parameter();
+            const param: DeclarationNode* = this.parse_parameter();
             if (param != null) {
                 params.push(param);
             }
@@ -871,7 +864,7 @@ public:
     }
 
     /// The type of a by-reference receiver of the type being parsed: inside a
-    /// struct/class/impl it is `&CurrentType`; inside a trait declaration it
+    /// struct/impl it is `&CurrentType`; inside a trait declaration it
     /// is `&This`, a placeholder that impl-method resolution rewrites to each
     /// concrete impl target.  A written `&this` and the receiver given to a
     /// method that wrote none are typed by this one method.
@@ -930,38 +923,40 @@ public:
     }
 
     /// Give a non-static method the receiver its source did not write.  Every
-    /// instance method takes one - a constructor's is the storage being
-    /// initialized - and a method that writes none takes it by reference, as
+    /// instance method takes one, and a method that writes none takes it by reference, as
     /// `&this`; synthesizing it here makes that one parameter, declared once,
     /// instead of a case every later stage re-derives.  Its span is zero-width
     /// at the method's name: a report about it points at the method, and it
     /// covers no written text.
-    give_receiver(func: FunctionDeclNode*, is_static: boolean) -> void {
+    give_receiver(func_decl: DeclarationNode*, is_static: boolean) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || is_static) { return; }
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
-            if (func.parameters[i].is_receiver()) { return; }
+            if (DeclarationNode::var_of(func.parameters[i]).is_receiver()) { return; }
         }
-        const at: SourceSpan = if (func.name_span.has_location()) { func.name_span } else { func.span };
+        const at: SourceSpan = if (func_decl.name_span.has_location()) { func_decl.name_span } else { func_decl.span };
         const span: SourceSpan = SourceSpan::new(at.file, at.start_line, at.start_col,
                                                  at.start_line, at.start_col);
-        mut param: VarDeclNode* = new VarDeclNode(this.ctx.intern("&this"), span);
+        mut param: VarDecl* = VarDecl::new(this.ctx.intern("&this"));
+        const param_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(param), span);
         param.set_mutable(false);
         param.set_receiver(ReceiverForm::ByReference);
         param.set_type_annotation(this.receiver_type_annotation(false, span));
-        func.parameters.insert(0, param);
+        func.parameters.insert(0, param_decl);
     }
 
     /// `give_receiver` over every method of a type body or an impl block, once
     /// each method's `static` is known.
-    give_receivers(methods: &[MethodNode*]) -> void {
+    give_receivers(methods: &[DeclarationNode*]) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: MethodNode* = methods[i];
+            const m_decl: DeclarationNode* = methods[i];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m != null) { this.give_receiver(m.func, m.is_static); }
         }
     }
 
     /// Parse a single parameter: [mut] name: Type [= default]
-    parse_parameter() -> VarDeclNode* {
+    parse_parameter() -> DeclarationNode* {
         const start: Token = this.current();
         mut is_mutable: boolean = false;
         // Span of the leading `mut` keyword if present; otherwise an
@@ -978,7 +973,7 @@ public:
 
         // Check for &this parameter (method self reference). Synthesize the
         // reference-to-receiver type annotation so FunctionSignature can
-        // resolve the self parameter: inside a struct/class/impl the receiver
+        // resolve the self parameter: inside a struct/impl the receiver
         // is `&CurrentType`; inside a trait declaration it is `&This`, a
         // placeholder that downstream impl-method resolution rewrites to
         // each concrete impl target.
@@ -987,14 +982,15 @@ public:
             this.advance(); // consume 'this'
             const pname: SymbolStr = this.ctx.intern("&this");
             const span: SourceSpan = this.span_from(start);
-            mut param: VarDeclNode* = new VarDeclNode(pname, span);
+            mut param: VarDecl* = VarDecl::new(pname);
+            const param_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(param), span);
             param.set_mutable(is_mutable);
             // One of the two places the receiver's spelling is read; every
             // later stage asks the mark.
             param.set_receiver(ReceiverForm::ByReference);
 
             param.set_type_annotation(this.receiver_type_annotation(is_mutable, span));
-            return param;
+            return param_decl;
         }
 
         // Accept keywords as parameter names (e.g., this, default, type, value).
@@ -1008,7 +1004,8 @@ public:
             name_tok = this.consume(TokenType::Identifier, "parameter name");
         }
         const pname: SymbolStr = this.intern_lexeme(name_tok);
-        mut param: VarDeclNode* = new VarDeclNode(pname, this.span_from_token(name_tok));
+        mut param: VarDecl* = VarDecl::new(pname);
+        const param_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(param), this.span_from_token(name_tok));
         param.set_mutable(is_mutable);
         // A parameter written `this` is the by-value receiver: `this` is a
         // keyword, so nothing else can be spelled that way.  The other half of
@@ -1016,7 +1013,7 @@ public:
         if (name_tok.kind == TokenType::KwThis) {
             param.set_receiver(ReceiverForm::ByValue);
         }
-        param.set_name_span(this.span_from_token(name_tok));
+        param_decl.set_name_span(this.span_from_token(name_tok));
         // If no `mut` keyword was consumed, point kw_span at a zero-width
         // anchor just before the parameter name so a downstream E0218
         // fix can insert `mut ` at exactly the right place.
@@ -1035,7 +1032,7 @@ public:
             this.advance(); // consume '...'
             param.set_mutable(false);
             this.pending_named_variadic = true;
-            return param;
+            return param_decl;
         }
 
         // Type annotation
@@ -1050,28 +1047,44 @@ public:
             param.set_initializer(default_val);
         }
 
-        param.span = this.span_from(start);
-        return param;
+        param_decl.span = this.span_from(start);
+        return param_decl;
     }
 
-    /// Parse a struct declaration: type struct Name<T> { fields, methods }
-    parse_struct_declaration() -> StructDeclNode* {
+    /// Parse a struct declaration: type struct Name<T> { fields, methods }.
+    /// `type class` is refused at its keywords and parsed as a struct.
+    parse_struct_declaration() -> DeclarationNode* {
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_struct_declaration()");
         const start: Token = this.advance(); // consume 'type'
-        this.advance(); // consume 'struct'
+        const kw: Token = this.advance();    // consume 'struct' (or 'class')
+        if (kw.kind == TokenType::KwClass) {
+            this.refuse_removed_form(SourceSpan::covering(this.span_from_token(start), this.span_from_token(kw)),
+                "type class", "a class", "declare a struct and implement a trait");
+        }
 
         const name_tok: Token = this.consume(TokenType::Identifier, "struct name");
         const name: SymbolStr = this.intern_lexeme(name_tok);
-        mut node: StructDeclNode* = new StructDeclNode(name, this.span_from_token(start));
-        node.set_name_span(this.span_from_token(name_tok));
+        const node: StructDecl* = StructDecl::new(name);
+        const decl: DeclarationNode* = DeclarationNode::of(DeclKind::Struct(node), this.span_from_token(start));
+        decl.set_name_span(this.span_from_token(name_tok));
         this.current_type_name = name_tok.lexeme;
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
-            const gen_params: [GenericParamNode*] = this.parse_generic_params(false);
+            const gen_params: [DeclarationNode*] = this.parse_generic_params(false);
             for (mut i: i64 = 0; i < gen_params.length; i++) {
-                node.add_generic_param(gen_params[i]);
+                node.generic_params.push(gen_params[i]);
             }
+        }
+
+        // A base list `: Base` is refused where it is written, and its type
+        // parsed so the body after it is still read.
+        if (this.check(TokenType::Colon)) {
+            const colon: Token = this.advance();
+            const base_text: string = this.current().lexeme;
+            this.parse_type_annotation();
+            this.refuse_removed_form(this.span_from(colon),
+                ": " + base_text, "a base list", "hold the shared part in a field, its methods in a trait");
         }
 
         // Optional `where T: Bound` clause on the declaration's own
@@ -1079,38 +1092,39 @@ public:
         if (this.check(TokenType::KwWhere)) {
             const bounds: [TraitBound] = this.parse_trait_bounds();
             for (mut wi: i64 = 0; wi < bounds.length; wi++) {
-                node.add_where_bound(bounds[wi].clone());
+                node.where_bounds.push(bounds[wi].clone());
             }
         }
 
         this.consume(TokenType::LBrace, "'{'");
-        this.parse_type_body(node, null, null);
+        this.parse_type_body(node, null);
         this.consume(TokenType::RBrace, "'}'");
 
         this.current_type_name = "";
-        node.span = this.span_from(start);
-        return node;
+        decl.span = this.span_from(start);
+        return decl;
     }
 
     /// Parse a union declaration: type union Name<T> { fields, methods }
     /// Shares the struct member-grammar; an untagged C-style union where all
-    /// fields overlap at offset 0 (see UnionDeclNode).
-    parse_union_declaration() -> UnionDeclNode* {
+    /// fields overlap at offset 0 (see UnionDecl).
+    parse_union_declaration() -> DeclarationNode* {
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_union_declaration()");
         const start: Token = this.advance(); // consume 'type'
         this.advance(); // consume 'union'
 
         const name_tok: Token = this.consume(TokenType::Identifier, "union name");
         const name: SymbolStr = this.intern_lexeme(name_tok);
-        mut node: UnionDeclNode* = new UnionDeclNode(name, this.span_from_token(start));
-        node.set_name_span(this.span_from_token(name_tok));
+        const node: UnionDecl* = UnionDecl::new(name);
+        const decl: DeclarationNode* = DeclarationNode::of(DeclKind::Union(node), this.span_from_token(start));
+        decl.set_name_span(this.span_from_token(name_tok));
         this.current_type_name = name_tok.lexeme;
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
-            const gen_params: [GenericParamNode*] = this.parse_generic_params(false);
+            const gen_params: [DeclarationNode*] = this.parse_generic_params(false);
             for (mut i: i64 = 0; i < gen_params.length; i++) {
-                node.add_generic_param(gen_params[i]);
+                node.generic_params.push(gen_params[i]);
             }
         }
 
@@ -1119,151 +1133,73 @@ public:
         if (this.check(TokenType::KwWhere)) {
             const bounds: [TraitBound] = this.parse_trait_bounds();
             for (mut wi: i64 = 0; wi < bounds.length; wi++) {
-                node.add_where_bound(bounds[wi].clone());
+                node.where_bounds.push(bounds[wi].clone());
             }
         }
 
         this.consume(TokenType::LBrace, "'{'");
-        this.parse_type_body(null, null, node);
+        this.parse_type_body(null, node);
         this.consume(TokenType::RBrace, "'}'");
 
         this.current_type_name = "";
-        node.span = this.span_from(start);
-        return node;
+        decl.span = this.span_from(start);
+        return decl;
     }
 
-    /// Parse a class declaration: type class Name<T> : Base { fields, methods }
-    parse_class_declaration() -> ClassDeclNode* {
-        LOG_DEBUG(LogComponent::Parser, "[Parser] parse_class_declaration()");
-        const start: Token = this.advance(); // consume 'type'
-        this.advance(); // consume 'class'
-
-        const name_tok: Token = this.consume(TokenType::Identifier, "class name");
-        const name: SymbolStr = this.intern_lexeme(name_tok);
-        mut node: ClassDeclNode* = new ClassDeclNode(name, this.span_from_token(start));
-        node.set_name_span(this.span_from_token(name_tok));
-        this.current_type_name = name_tok.lexeme;
-
-        // Optional generic parameters
-        if (this.check(TokenType::LAngle)) {
-            const gen_params: [GenericParamNode*] = this.parse_generic_params(false);
-            for (mut i: i64 = 0; i < gen_params.length; i++) {
-                node.add_generic_param(gen_params[i]);
-            }
-        }
-
-        // Optional base class: : BaseClass
-        if (this.match_tok(TokenType::Colon)) {
-            const base_tok: Token = this.consume(TokenType::Identifier, "base class name");
-            node.set_base_class(this.intern_lexeme(base_tok),
-                                this.span_from_token(base_tok));
-        }
-
-        // Optional `where T: Bound` clause on the declaration's own
-        // parameters, after the list that declares them.
-        if (this.check(TokenType::KwWhere)) {
-            const bounds: [TraitBound] = this.parse_trait_bounds();
-            for (mut wi: i64 = 0; wi < bounds.length; wi++) {
-                node.add_where_bound(bounds[wi].clone());
-            }
-        }
-
-        this.consume(TokenType::LBrace, "'{'");
-        this.parse_type_body(null, node, null);
-        this.consume(TokenType::RBrace, "'}'");
-
-        this.current_type_name = "";
-        node.span = this.span_from(start);
-        return node;
-    }
-
-    /// Parse the body of a struct or class declaration (fields, methods, visibility).
-    ///
-    /// Visibility rules:
-    ///   Struct: all members default to public.  `public:` and `private:` blocks
-    ///            are allowed but optional.  `protected:` is an error (no inheritance).
-    ///   Class: no default visibility.  Every member MUST appear inside an explicit
-    ///            `public:`, `private:`, or `protected:` block.
-    parse_type_body(struct_node: StructDeclNode*, class_node: ClassDeclNode*,
-                    union_node: UnionDeclNode*) -> void {
-        // Unions share the struct member-grammar (default-public, no
-        // `protected`); only their layout/codegen differ.
-        const is_struct: boolean = (struct_node != null) || (union_node != null);
-
-        // Structs default to public; classes have no default (sentinel).
+    /// Parse the body of a struct or union declaration: fields, methods and
+    /// visibility.  Members default to public; a `public:` or `private:`
+    /// block sets the visibility of the members after it, and an inline
+    /// `public` or `private` that of one member.
+    parse_type_body(struct_node: StructDecl*, union_node: UnionDecl*) -> void {
         mut current_visibility: Visibility = Visibility::Public;
-        mut has_visibility_block: boolean = is_struct;  // structs implicitly "have" one
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
             this.collect_doc_comments();
             if (this.check(TokenType::RBrace)) { break; }
             const doc: string = this.take_documentation();
 
-            // Visibility labels: public: / private: / protected:
+            // Visibility labels: public: / private:
             if (this.peek_at(1).kind == TokenType::Colon) {
                 mut matched: boolean = true;
                 match (this.current().kind) {
                     TokenType::KwPublic    => { current_visibility = Visibility::Public; }
                     TokenType::KwPrivate   => { current_visibility = Visibility::Private; }
-                    TokenType::KwProtected => {
-                        if (is_struct) {
-                            this.emit_protected_in_struct_error(this.current(), true);
-                            current_visibility = Visibility::Public;
-                        } else {
-                            current_visibility = Visibility::Protected;
-                        }
-                    }
                     _ => { matched = false; }
                 }
                 if (matched) {
-                    has_visibility_block = true;
                     this.advance(); this.advance(); // consume keyword + ':'
+                    continue;
+                }
+                if (this.check(TokenType::KwProtected)) {
+                    this.refuse_protected(true);
                     continue;
                 }
             }
 
             // Inline visibility for the next member: `private foo()`,
-            // `public bar: T;`, or `protected baz()`.  Distinguished
-            // from block-form labels (above) by the absence of a
-            // trailing `:`.  Applies to one member only; the block-
-            // level `current_visibility` is untouched, so a single
-            // inline opt-out doesn't shift the rest of the section.
+            // `public bar: T;`.  Distinguished from block-form labels
+            // (above) by the absence of a trailing `:`.  Applies to one
+            // member only; the block-level `current_visibility` is
+            // untouched, so a single inline opt-out doesn't shift the rest
+            // of the section.
             mut member_visibility: Visibility = current_visibility;
-            mut had_inline_visibility: boolean = false;
             // Where that inline keyword sat, for the member's `outer_span()`:
             // it is consumed here, before the member node exists, so nothing
             // else records it.  Stays `none()` for block-form visibility,
             // whose label is not part of any one member.
             mut member_modifier_span: SourceSpan = SourceSpan::none();
             if (this.peek_at(1).kind != TokenType::Colon) {
+                if (this.at_removed_modifier(TokenType::KwProtected)) { this.refuse_protected(false); }
                 mut matched: boolean = true;
                 match (this.current().kind) {
                     TokenType::KwPublic    => { member_visibility = Visibility::Public; }
                     TokenType::KwPrivate   => { member_visibility = Visibility::Private; }
-                    TokenType::KwProtected => {
-                        if (is_struct) {
-                            this.emit_protected_in_struct_error(this.current(), false);
-                            this.advance();
-                            continue;
-                        }
-                        member_visibility = Visibility::Protected;
-                    }
                     _ => { matched = false; }
                 }
                 if (matched) {
-                    had_inline_visibility = true;
                     member_modifier_span = this.span_from_token(this.current());
                     this.advance(); // consume keyword
                 }
-            }
-
-            // For classes, every member must declare visibility; either
-            // via a block marker (`public:`) or an inline keyword
-            // (`private foo()`).  Structs default to public so the
-            // check is class-only.
-            if (!has_visibility_block && !had_inline_visibility) {
-                this.report_error(ErrorCode::E0360_MISSING_VISIBILITY_BLOCK,
-                    "class members must declare visibility (block-form `public:` / `private:` / `protected:`, or inline `public` / `private` / `protected`)");
             }
 
             // Drain consecutive `![...]` directives so we can attach them
@@ -1271,7 +1207,7 @@ public:
             // continue'd past this point, so directives placed between
             // labels and members reach this drain.  If the next thing
             // turns out to be a field, the directives are still attached
-            // (FieldDeclNode is a DeclarationNode); the directive_
+            // (a field is a declaration); the directive_
             // processing pass will surface a placement error if the
             // directive isn't valid on a field.
             mut pending_dirs: [DirectiveNode*] = [];
@@ -1283,13 +1219,13 @@ public:
             }
             if (this.check(TokenType::RBrace) || this.is_at_end()) { break; }
 
+            this.refuse_member_modifier();
+
             // A leading `async` is consumed ahead of the member head, so every
             // member kind below sees it: only a method can carry it, and the
             // kinds that cannot are rejected where they are built rather than
             // dropping the keyword silently. `static` is deliberately NOT
-            // hoisted here — `static Name()` has always meant a static method
-            // named after the type, not a constructor, and hoisting it would
-            // change that.
+            // hoisted here: `static` begins a static method's own head.
             mut member_is_async: boolean = false;
             if (this.check(TokenType::KwAsync) && this.at_method_modifier()) {
                 member_is_async = true;
@@ -1298,102 +1234,29 @@ public:
                 this.advance();
             }
 
-            // Constructor: ClassName(params) { body }
+            // A constructor `Name(params) { body }` and a destructor
+            // `~Name() { body }` are refused where they are written.
             if (this.check(TokenType::Identifier) && this.current().lexeme == this.current_type_name &&
                 this.peek_at(1).kind == TokenType::LParen) {
-                const method: MethodNode* = this.parse_constructor(member_visibility);
-                if (method != null) {
-                    // A constructor runs to completion at a fixed point in an
-                    // object's lifetime: it has no caller that could hold and
-                    // poll a future, and the object does not exist until it
-                    // returns.
-                    if (member_is_async) {
-                        this.report_invalid_at(ErrorCode::E0364_INVALID_ASYNC_MEMBER,
-                            "a constructor cannot be `async`: it must produce a fully initialized object before any caller can observe it, so there is nothing to suspend into",
-                            member_modifier_span);
-                    }
-                    if (doc != "") { method.set_documentation(doc); }
-                    for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
-                        method.add_directive(pending_dirs[pi]);
-                    }
-                    method.note_modifier_span(member_modifier_span);
-                    if (struct_node != null) { struct_node.add_method(method); }
-                    if (class_node != null) { class_node.add_method(method); }
-                    if (union_node != null) { union_node.add_method(method); }
-                }
+                this.refuse_constructor();
                 continue;
             }
-
-            // Destructor: ~ClassName() { body }
             if (this.check(TokenType::Tilde)) {
-                const method: MethodNode* = this.parse_destructor(member_visibility);
-                if (method != null) {
-                    // A destructor is called by drop insertion at scope exit,
-                    // from contexts that have no executor and cannot wait.
-                    if (member_is_async) {
-                        this.report_invalid_at(ErrorCode::E0364_INVALID_ASYNC_MEMBER,
-                            "a destructor cannot be `async`: it is called by drop insertion at scope exit, where there is no executor to poll a future",
-                            member_modifier_span);
-                    }
-                    if (doc != "") { method.set_documentation(doc); }
-                    for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
-                        method.add_directive(pending_dirs[pi]);
-                    }
-                    method.note_modifier_span(member_modifier_span);
-                    if (struct_node != null) { struct_node.add_method(method); }
-                    if (class_node != null) { class_node.add_method(method); }
-                    if (union_node != null) { union_node.add_method(method); }
-                }
+                this.refuse_destructor();
                 continue;
             }
 
             // Static method or static field
             if (this.check(TokenType::KwStatic)) {
-                const method: MethodNode* = this.parse_method_with_modifiers(
-                    member_visibility, true, false, false, member_is_async);
-                if (method != null) {
-                    if (doc != "") { method.set_documentation(doc); }
+                const method_decl: DeclarationNode* = this.parse_static_method(member_visibility, member_is_async);
+                if (method_decl != null) {
+                    if (doc != "") { method_decl.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
-                        method.add_directive(pending_dirs[pi]);
+                        method_decl.add_directive(pending_dirs[pi]);
                     }
-                    method.note_modifier_span(member_modifier_span);
-                    if (struct_node != null) { struct_node.add_method(method); }
-                    if (class_node != null) { class_node.add_method(method); }
-                    if (union_node != null) { union_node.add_method(method); }
-                }
-                continue;
-            }
-
-            // Virtual method
-            if (this.check(TokenType::KwVirtual)) {
-                const method: MethodNode* = this.parse_method_with_modifiers(
-                    member_visibility, false, true, false, member_is_async);
-                if (method != null) {
-                    if (doc != "") { method.set_documentation(doc); }
-                    for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
-                        method.add_directive(pending_dirs[pi]);
-                    }
-                    method.note_modifier_span(member_modifier_span);
-                    if (struct_node != null) { struct_node.add_method(method); }
-                    if (class_node != null) { class_node.add_method(method); }
-                    if (union_node != null) { union_node.add_method(method); }
-                }
-                continue;
-            }
-
-            // Override method
-            if (this.check(TokenType::KwOverride)) {
-                const method: MethodNode* = this.parse_method_with_modifiers(
-                    member_visibility, false, false, true, member_is_async);
-                if (method != null) {
-                    if (doc != "") { method.set_documentation(doc); }
-                    for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
-                        method.add_directive(pending_dirs[pi]);
-                    }
-                    method.note_modifier_span(member_modifier_span);
-                    if (struct_node != null) { struct_node.add_method(method); }
-                    if (class_node != null) { class_node.add_method(method); }
-                    if (union_node != null) { union_node.add_method(method); }
+                    method_decl.note_modifier_span(member_modifier_span);
+                    if (struct_node != null) { struct_node.methods.push(method_decl); }
+                    if (union_node != null) { union_node.methods.push(method_decl); }
                 }
                 continue;
             }
@@ -1413,17 +1276,17 @@ public:
                 // Method pattern: name ( or name < (generic method)
                 const next: Token = this.peek_at(1);
                 if (next.kind == TokenType::LParen || next.kind == TokenType::LAngle) {
-                    const method: MethodNode* = this.parse_method(member_visibility);
+                    const method_decl: DeclarationNode* = this.parse_method(member_visibility);
+                    const method: MethodDecl* = DeclarationNode::method_of(method_decl);
                     if (method != null) {
-                        if (member_is_async && method.func != null) { method.func.set_async(true); }
-                        if (doc != "") { method.set_documentation(doc); }
+                        if (member_is_async && method.func != null) { DeclarationNode::fn_of(method.func).set_async(true); }
+                        if (doc != "") { method_decl.set_documentation(doc); }
                         for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
-                            method.add_directive(pending_dirs[pi]);
+                            method_decl.add_directive(pending_dirs[pi]);
                         }
-                        method.note_modifier_span(member_modifier_span);
-                        if (struct_node != null) { struct_node.add_method(method); }
-                        if (class_node != null) { class_node.add_method(method); }
-                        if (union_node != null) { union_node.add_method(method); }
+                        method_decl.note_modifier_span(member_modifier_span);
+                        if (struct_node != null) { struct_node.methods.push(method_decl); }
+                        if (union_node != null) { union_node.methods.push(method_decl); }
                     }
                 } else if (this.check(TokenType::Identifier)
                            || next.kind == TokenType::Colon) {
@@ -1432,17 +1295,16 @@ public:
                             "only a method can be `async`; a field holds a value, not a computation to suspend",
                             member_modifier_span);
                     }
-                    const field: FieldDeclNode* = this.parse_field_declaration();
+                    const field: DeclarationNode* = this.parse_field_declaration();
                     if (field != null) {
-                        field.set_visibility(member_visibility);
+                        DeclarationNode::field_of(field).visibility = member_visibility;
                         if (doc != "") { field.set_documentation(doc); }
                         for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                             field.add_directive(pending_dirs[pi]);
                         }
                         field.note_modifier_span(member_modifier_span);
-                        if (struct_node != null) { struct_node.add_field(field); }
-                        if (class_node != null) { class_node.add_field(field); }
-                        if (union_node != null) { union_node.add_field(field); }
+                        if (struct_node != null) { struct_node.fields.push(field); }
+                        if (union_node != null) { union_node.fields.push(field); }
                     }
                 } else {
                     // A keyword followed by neither `(`/`<` nor `:` names no
@@ -1459,89 +1321,50 @@ public:
         }
 
         if (struct_node != null) { this.give_receivers(&struct_node.methods); }
-        if (class_node != null)  { this.give_receivers(&class_node.methods); }
         if (union_node != null)  { this.give_receivers(&union_node.methods); }
     }
 
-    /// Parse a constructor: ClassName(params) [: BaseClass(args)] { body }
-    parse_constructor(visibility: Visibility) -> MethodNode* {
-        const start: Token = this.current();
-        const name_tok: Token = this.advance(); // consume class name
-        const name: SymbolStr = this.intern_lexeme(name_tok);
-
-        // Parse as function declaration
-        mut func: FunctionDeclNode* = new FunctionDeclNode(name, this.span_from_token(start));
-
-        this.parse_function_param_list_into(func);
-
-        mut method: MethodNode* = new MethodNode(func, this.span_from_token(start));
-        method.set_constructor(true);
-        method.set_visibility(visibility);
-
-        // Optional base constructor call: : Base(args)
-        if (this.match_tok(TokenType::Colon)) {
-            const base_tok: Token = this.consume(TokenType::Identifier, "base class name");
-            method.set_base_ctor_name(this.intern_lexeme(base_tok));
+    /// Refuse a constructor `Name(params) [: Base(args)] [-> T] { body }`
+    /// written in a type body, and consume it.  A base-constructor
+    /// initializer in it is refused as well, where it is written.
+    refuse_constructor() -> void {
+        const start: Token = this.advance(); // the type's name
+        const func: FunctionDecl* = FunctionDecl::new(this.intern_lexeme(start));
+        const func_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(func), this.span_from_token(start));
+        this.parse_function_param_list_into(func_decl);
+        this.refuse_removed_form(this.span_from(start), start.lexeme + "(..)", "a constructor",
+            "write a `static new` factory");
+        if (this.check(TokenType::Colon)) {
+            const colon: Token = this.advance();
+            const base_tok: Token = this.consume(TokenType::Identifier, "base name");
             this.consume(TokenType::LParen, "'('");
             while (!this.check(TokenType::RParen) && !this.is_at_end()) {
-                const arg: ExpressionNode* = this.parse_expression();
-                if (arg != null) {
-                    method.add_base_ctor_arg(arg);
-                }
+                this.parse_expression();
                 if (!this.match_tok(TokenType::Comma)) { break; }
             }
             this.consume(TokenType::RParen, "')'");
+            this.refuse_removed_form(this.span_from(colon), ": " + base_tok.lexeme + "(..)",
+                "a base-constructor initializer", "build the shared field in the factory");
         }
-
-        // Optional return type: -> Type (allowed on constructors for factory patterns)
-        if (this.match_tok(TokenType::Arrow)) {
-            const ret_ann: TypeAnnotation* = this.parse_type_annotation();
-            func.set_return_type_annotation(ret_ann);
-        }
-
-        // Body
-        if (this.check(TokenType::LBrace)) {
-            const body: BlockStmtNode* = this.parse_block_statement();
-            func.set_body(body);
-        }
-
-        method.span = this.span_from(start);
-        return method;
+        if (this.match_tok(TokenType::Arrow)) { this.parse_type_annotation(); }
+        if (this.check(TokenType::LBrace)) { this.parse_block_statement(); }
     }
 
-    /// Parse a destructor: ~ClassName() { body }
-    parse_destructor(visibility: Visibility) -> MethodNode* {
+    /// Refuse a destructor `~Name() { body }` (or `~Name() = default;`)
+    /// written in a type body, and consume it.
+    refuse_destructor() -> void {
         const start: Token = this.advance(); // consume '~'
-        const name_tok: Token = this.advance(); // consume class name
-        const name: SymbolStr = this.ctx.intern("~" + name_tok.lexeme);
-
-        mut func: FunctionDeclNode* = new FunctionDeclNode(name, this.span_from_token(start));
-
+        const name_tok: Token = this.consume(TokenType::Identifier, "type name");
         this.consume(TokenType::LParen, "'('");
         this.consume(TokenType::RParen, "')'");
-
-        mut method: MethodNode* = new MethodNode(func, this.span_from_token(start));
-        method.set_destructor(true);
-        method.set_visibility(visibility);
-
-        // Check for = default
+        this.refuse_removed_form(this.span_from(start), "~" + name_tok.lexeme + "()", "a destructor",
+            "implement `Drop`");
         if (this.match_tok(TokenType::Equal)) {
-            if (this.check(TokenType::KwDefault)) {
-                this.advance();
-                method.set_default_destructor(true);
-                this.consume(TokenType::Semicolon, "';'");
-                method.span = this.span_from(start);
-                return method;
-            }
+            if (this.check(TokenType::KwDefault)) { this.advance(); }
+            this.consume(TokenType::Semicolon, "';'");
+            return;
         }
-
-        if (this.check(TokenType::LBrace)) {
-            const body: BlockStmtNode* = this.parse_block_statement();
-            func.set_body(body);
-        }
-
-        method.span = this.span_from(start);
-        return method;
+        if (this.check(TokenType::LBrace)) { this.parse_block_statement(); }
     }
 
     /// True when the current token is a method MODIFIER keyword rather than a
@@ -1573,47 +1396,41 @@ public:
         return m;
     }
 
-    /// Parse a method with optional modifiers (static, async, virtual, override).
-    ///
-    /// The keyword that selected this path is still at the cursor and is
-    /// consumed here; a `static` / `async` run may follow it. `virtual async` /
-    /// `override async` are accepted by the grammar and rejected by sema, which
-    /// can say why (each override would return a different future type, so they
-    /// cannot share a vtable slot) instead of leaving a parse error on `async`.
-    parse_method_with_modifiers(visibility: Visibility, is_static: boolean,
-                                 is_virtual: boolean, is_override: boolean,
-                                 is_async: boolean) -> MethodNode* {
-        this.advance(); // consume modifier keyword
+    /// Parse a static method.  The `static` that selected this path is still
+    /// at the cursor and is consumed here; a `static` / `async` run may
+    /// follow it.
+    parse_static_method(visibility: Visibility, is_async: boolean) -> DeclarationNode* {
+        this.advance(); // consume `static`
         const extra: MethodModifiers = this.consume_method_modifiers(SourceSpan::none());
 
-        const method: MethodNode* = this.parse_method(visibility);
+        const method_decl: DeclarationNode* = this.parse_method(visibility);
+        const method: MethodDecl* = DeclarationNode::method_of(method_decl);
         if (method != null) {
-            if (is_static || extra.is_static) { method.set_static(true); }
-            if (is_virtual) { method.set_virtual(true); }
-            if (is_override) { method.set_override(true); }
-            if ((is_async || extra.is_async) && method.func != null) { method.func.set_async(true); }
+            method.set_static(true);
+            if ((is_async || extra.is_async) && method.func != null) { DeclarationNode::fn_of(method.func).set_async(true); }
         }
-        return method;
+        return method_decl;
     }
 
     /// Parse a method: name<T>(params) -> RetType { body }
-    parse_method(visibility: Visibility) -> MethodNode* {
+    parse_method(visibility: Visibility) -> DeclarationNode* {
         const start: Token = this.current();
         const name_tok: Token = this.advance(); // consume method name
         const name: SymbolStr = this.intern_lexeme(name_tok);
 
-        mut func: FunctionDeclNode* = new FunctionDeclNode(name, this.span_from_token(start));
-        func.set_name_span(this.span_from_token(name_tok));
+        mut func: FunctionDecl* = FunctionDecl::new(name);
+        const func_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(func), this.span_from_token(start));
+        func_decl.set_name_span(this.span_from_token(name_tok));
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
-            const gen_params: [GenericParamNode*] = this.parse_generic_params(true);
+            const gen_params: [DeclarationNode*] = this.parse_generic_params(true);
             for (mut i: i64 = 0; i < gen_params.length; i++) {
                 func.add_generic_param(gen_params[i]);
             }
         }
 
-        this.parse_function_param_list_into(func);
+        this.parse_function_param_list_into(func_decl);
 
         // Optional return type
         if (this.match_tok(TokenType::Arrow)) {
@@ -1630,38 +1447,37 @@ public:
             }
         }
 
-        mut method: MethodNode* = new MethodNode(func, this.span_from_token(start));
+        mut method: MethodDecl* = MethodDecl::new(func_decl);
+        const method_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Method(method), this.span_from_token(start));
         method.set_visibility(visibility);
 
         // Body or semicolon
         if (this.check(TokenType::LBrace)) {
-            const body: BlockStmtNode* = this.parse_block_statement();
+            const body: Stmt* = this.parse_block_statement();
             func.set_body(body);
         } else {
             this.consume(TokenType::Semicolon, "';' or '{'");
         }
 
-        method.span = this.span_from(start);
-        return method;
+        method_decl.span = this.span_from(start);
+        return method_decl;
     }
 
     /// Parse a field declaration: name: Type [= default];
-    parse_field_declaration() -> FieldDeclNode* {
+    parse_field_declaration() -> DeclarationNode* {
         const start: Token = this.current();
         const name_tok: Token = this.advance(); // consume field name
-        const name: SymbolStr = this.intern_lexeme(name_tok);
-        mut field: FieldDeclNode* = new FieldDeclNode(name, this.span_from_token(start));
+        const f: FieldDecl* = FieldDecl::new(this.intern_lexeme(name_tok));
+        mut field: DeclarationNode* = DeclarationNode::of(DeclKind::Field(f), this.span_from_token(start));
         field.set_name_span(this.span_from_token(name_tok));
 
         // Type annotation
         this.consume(TokenType::Colon, "':'");
-        const type_ann: TypeAnnotation* = this.parse_type_annotation();
-        field.set_type_annotation(type_ann);
+        f.type_annotation = this.parse_type_annotation();
 
         // Optional default value
         if (this.match_tok(TokenType::Equal)) {
-            const default_val: ExpressionNode* = this.parse_expression();
-            field.set_default_value(default_val);
+            f.default_value = this.parse_expression();
         }
 
         this.consume(TokenType::Semicolon, "';'");
@@ -1670,21 +1486,22 @@ public:
     }
 
     /// Parse an enum declaration: type enum Name<T> { variants }
-    parse_enum_declaration() -> EnumDeclNode* {
+    parse_enum_declaration() -> DeclarationNode* {
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_enum_declaration()");
         const start: Token = this.advance(); // consume 'type'
         this.advance(); // consume 'enum'
 
         const name_tok: Token = this.consume(TokenType::Identifier, "enum name");
         const name: SymbolStr = this.intern_lexeme(name_tok);
-        mut node: EnumDeclNode* = new EnumDeclNode(name, this.span_from_token(start));
+        const en: EnumDecl* = EnumDecl::new(name);
+        const node: DeclarationNode* = DeclarationNode::of(DeclKind::Enum(en), this.span_from_token(start));
         node.set_name_span(this.span_from_token(name_tok));
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
-            const gen_params: [GenericParamNode*] = this.parse_generic_params(false);
+            const gen_params: [DeclarationNode*] = this.parse_generic_params(false);
             for (mut i: i64 = 0; i < gen_params.length; i++) {
-                node.add_generic_param(gen_params[i]);
+                en.generic_params.push(gen_params[i]);
             }
         }
 
@@ -1693,7 +1510,7 @@ public:
         if (this.match_tok(TokenType::Colon)) {
             const disc: TypeAnnotation* = this.parse_type_annotation();
             if (disc != null) {
-                node.set_discriminant_annotation(disc);
+                en.discriminant_annotation = disc;
             }
         }
 
@@ -1702,7 +1519,7 @@ public:
         if (this.check(TokenType::KwWhere)) {
             const bounds: [TraitBound] = this.parse_trait_bounds();
             for (mut wi: i64 = 0; wi < bounds.length; wi++) {
-                node.add_where_bound(bounds[wi].clone());
+                en.where_bounds.push(bounds[wi].clone());
             }
         }
 
@@ -1714,10 +1531,10 @@ public:
             if (this.check(TokenType::RBrace)) { break; }
             const doc: string = this.take_documentation();
 
-            const variant: EnumVariantNode* = this.parse_enum_variant();
+            const variant: DeclarationNode* = this.parse_enum_variant();
             if (variant != null) {
                 if (doc != "") { variant.set_documentation(doc); }
-                node.add_variant(variant);
+                en.variants.push(variant);
             }
 
             // Progress guard: parse_enum_variant recovers via non-advancing
@@ -1734,12 +1551,11 @@ public:
     }
 
     /// Parse an enum variant: Name; or Name(Type); or Name = value;
-    parse_enum_variant() -> EnumVariantNode* {
+    parse_enum_variant() -> DeclarationNode* {
         const start: Token = this.current();
         const name_tok: Token = this.consume(TokenType::Identifier, "variant name");
         const name: SymbolStr = this.intern_lexeme(name_tok);
-        mut variant: EnumVariantNode* = new EnumVariantNode(name, this.span_from_token(start));
-        variant.set_name_span(this.span_from_token(name_tok));
+        const variant: EnumVariant* = EnumVariant::new(name);
 
         // Associated types: Variant(Type1, Type2)
         // Uses parse_type_annotation() so generics, pointers, arrays, etc.
@@ -1749,7 +1565,7 @@ public:
             while (!this.check(TokenType::RParen) && !this.is_at_end()) {
                 const ann: TypeAnnotation* = this.parse_type_annotation();
                 if (ann != null) {
-                    variant.add_associated_type(ann);
+                    variant.associated_types.push(ann);
                 }
                 if (!this.match_tok(TokenType::Comma)) { break; }
             }
@@ -1764,7 +1580,7 @@ public:
             const val_tok: Token = this.current();
             if (val_tok.kind == TokenType::NumericConstant) {
                 this.advance();
-                const v: i64 = ParserBase::parse_numeric_lexeme_i64(val_tok.lexeme);
+                const v: i64 = Parser::parse_numeric_lexeme_i64(val_tok.lexeme);
                 variant.set_explicit_value(sign * v);
             } else {
                 this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
@@ -1774,26 +1590,28 @@ public:
         }
 
         this.consume(TokenType::Semicolon, "';'");
-        variant.span = this.span_from(start);
-        return variant;
+        const d: DeclarationNode* = DeclarationNode::of(DeclKind::Variant(variant), this.span_from(start));
+        d.set_name_span(this.span_from_token(name_tok));
+        return d;
     }
 
     /// Parse a trait declaration: type trait Name<T> [: Base] { methods }
-    parse_trait_declaration() -> TraitDeclNode* {
+    parse_trait_declaration() -> DeclarationNode* {
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_trait_declaration()");
         const start: Token = this.advance(); // consume 'type'
         this.advance(); // consume 'trait'
 
         const name_tok: Token = this.consume(TokenType::Identifier, "trait name");
         const name: SymbolStr = this.intern_lexeme(name_tok);
-        mut node: TraitDeclNode* = new TraitDeclNode(name, this.span_from_token(start));
+        const tr: TraitDecl* = TraitDecl::new(name);
+        mut node: DeclarationNode* = DeclarationNode::of(DeclKind::Trait(tr), this.span_from_token(start));
         node.set_name_span(this.span_from_token(name_tok));
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
-            const gen_params: [GenericParamNode*] = this.parse_generic_params(false);
+            const gen_params: [DeclarationNode*] = this.parse_generic_params(false);
             for (mut i: i64 = 0; i < gen_params.length; i++) {
-                node.add_generic_param(gen_params[i]);
+                tr.generic_params.push(gen_params[i]);
             }
         }
 
@@ -1801,7 +1619,7 @@ public:
         // `: Trait1, path::Trait2<T>`
         if (this.match_tok(TokenType::Colon)) {
             while (true) {
-                node.add_base_trait(this.parse_trait_ref());
+                tr.base_traits.push(this.parse_trait_ref());
                 if (!this.match_tok(TokenType::Comma)) { break; }
             }
         }
@@ -1822,7 +1640,7 @@ public:
             // and would otherwise be taken as a (keyword-named) method head.
             if (this.check(TokenType::KwType)) {
                 const assoc: AssocTypeDeclNode* = this.parse_assoc_type_decl();
-                if (assoc != null) { node.add_assoc_type(assoc); }
+                if (assoc != null) { tr.assoc_types.push(assoc); }
                 continue;
             }
 
@@ -1841,12 +1659,13 @@ public:
             const head: TokenType = this.current().kind;
             if (head == TokenType::Identifier || head == TokenType::KwFunction
                 || head.is_keyword()) {
-                const func: FunctionDeclNode* = this.parse_function_declaration(false);
+                const func_decl: DeclarationNode* = this.parse_function_declaration(false);
+                const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
                 if (func != null) {
                     if (is_static) { func.set_static(true); }
                     if (trait_mods.is_async) { func.set_async(true); }
-                    this.give_receiver(func, is_static);
-                    node.add_method(func);
+                    this.give_receiver(func_decl, is_static);
+                    tr.methods.push(func_decl);
                 }
             } else {
                 this.error_unexpected();
@@ -1887,24 +1706,23 @@ public:
     }
 
     /// Parse a type alias: type Alias = Target; or type Alias<T> = Target;
-    parse_type_alias_declaration() -> TypeAliasDeclNode* {
+    parse_type_alias_declaration() -> DeclarationNode* {
         const start: Token = this.advance(); // consume 'type'
         const name_tok: Token = this.consume(TokenType::Identifier, "type alias name");
-        const name: SymbolStr = this.intern_lexeme(name_tok);
-        mut node: TypeAliasDeclNode* = new TypeAliasDeclNode(name, this.span_from_token(start));
+        const alias: TypeAliasDecl* = TypeAliasDecl::new(this.intern_lexeme(name_tok));
+        mut node: DeclarationNode* = DeclarationNode::of(DeclKind::TypeAlias(alias), this.span_from_token(start));
         node.set_name_span(this.span_from_token(name_tok));
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
-            const gen_params: [GenericParamNode*] = this.parse_generic_params(false);
+            const gen_params: [DeclarationNode*] = this.parse_generic_params(false);
             for (mut gi: i64 = 0; gi < gen_params.length; gi++) {
-                node.add_generic_param(gen_params[gi]);
+                alias.generic_params.push(gen_params[gi]);
             }
         }
 
         this.consume(TokenType::Equal, "'='");
-        const target: TypeAnnotation* = this.parse_type_annotation();
-        node.set_target_annotation(target);
+        alias.target_annotation = this.parse_type_annotation();
         this.consume(TokenType::Semicolon, "';'");
 
         node.span = this.span_from(start);
@@ -1912,20 +1730,20 @@ public:
     }
 
     /// Parse an import declaration (5 styles).
-    parse_import_declaration() -> ImportDeclNode* {
+    parse_import_declaration() -> DeclarationNode* {
         return this.parse_import_form(false);
     }
 
     /// Parse an export declaration: the import form minus the wildcard.
     /// `export A::B::{X, Y};`, `export A::B as C;`, `export A::B;`.
-    parse_export_declaration() -> ImportDeclNode* {
+    parse_export_declaration() -> DeclarationNode* {
         return this.parse_import_form(true);
     }
 
     /// Shared body of `import` and `export`.  They differ in exactly two
     /// places - whether a `*` form is accepted, and the flag stamped on the
     /// node - so they share one production rather than drifting as two.
-    parse_import_form(is_export: boolean) -> ImportDeclNode* {
+    parse_import_form(is_export: boolean) -> DeclarationNode* {
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_import_form(is_export=%d)",
                   is_export as i32);
         const start: Token = this.advance(); // consume 'import' / 'export'
@@ -1949,7 +1767,7 @@ public:
         mut prefix_sym: SymbolStr = SymbolStr::empty();
 
         // Per-segment tracking for the LSP; each segment's name +
-        // span gets stamped on the resulting `ImportDeclNode` so
+        // span gets stamped on the resulting `ImportDecl` so
         // hover/go-to-def can target an individual segment.
         mut seg_names: [SymbolStr] = [];
         mut seg_spans: [SourceSpan] = [];
@@ -1982,18 +1800,17 @@ public:
                 // module-graph lookup misses and the import binds nothing -
                 // silently, because a wildcard that binds no names is
                 // indistinguishable from a module that exports none.
-                mut imp: ImportDeclNode* = new ImportDeclNode(path_sym, ImportStyle::Wildcard, this.span_from_token(start));
+                const imp: ImportDecl* = ImportDecl::new(path_sym, ImportStyle::Wildcard);
                 for (mut i: i64 = 0; i < seg_names.length; i++) {
                     imp.add_path_segment(seg_names[i], seg_spans[i]);
                 }
                 this.consume(TokenType::Semicolon, "';'");
-                imp.span = this.span_from(start);
-                return imp;
+                return DeclarationNode::of(DeclKind::Import(imp), this.span_from(start));
             }
             if (next.kind == TokenType::LBrace) {
                 // Selective import: import A::B::{X, Y}
                 this.advance(); // consume '{'
-                mut imp: ImportDeclNode* = new ImportDeclNode(path_sym, ImportStyle::Specific, this.span_from_token(start));
+                const imp: ImportDecl* = ImportDecl::new(path_sym, ImportStyle::Specific);
                 imp.is_export = is_export;
                 for (mut i: i64 = 0; i < seg_names.length; i++) {
                     imp.add_path_segment(seg_names[i], seg_spans[i]);
@@ -2016,8 +1833,7 @@ public:
                 }
                 this.consume(TokenType::RBrace, "'}'");
                 this.consume(TokenType::Semicolon, "';'");
-                imp.span = this.span_from(start);
-                return imp;
+                return DeclarationNode::of(DeclKind::Import(imp), this.span_from(start));
             }
             // Append "::segment" and intern to pin on the heap
             const prev: string = this.ctx.resolve_str(path_sym);
@@ -2037,8 +1853,7 @@ public:
         if (this.check(TokenType::KwAs) && !is_export && seg_names.length >= 2) {
             this.advance();
             const entry_alias: Token = this.consume(TokenType::Identifier, "alias name");
-            mut ent: ImportDeclNode* = new ImportDeclNode(
-                prefix_sym, ImportStyle::Specific, this.span_from_token(start));
+            const ent: ImportDecl* = ImportDecl::new(prefix_sym, ImportStyle::Specific);
             for (mut i: i64 = 0; i < seg_names.length - 1; i++) {
                 ent.add_path_segment(seg_names[i], seg_spans[i]);
             }
@@ -2046,15 +1861,14 @@ public:
                                     seg_spans[seg_spans.length - 1], this.span_from_token(entry_alias));
             ent.path_entry = true;
             this.consume(TokenType::Semicolon, "';'");
-            ent.span = this.span_from(start);
-            return ent;
+            return DeclarationNode::of(DeclKind::Import(ent), this.span_from(start));
         }
 
         // `import A::B;` names the module and binds nothing from it.  A name
         // it reaches is either written in braces or spelled through the
         // qualifier; the path itself stays a module reference, which is what
         // records the dependency edge and what `B::X` resolves against.
-        mut imp: ImportDeclNode* = new ImportDeclNode(path_sym, ImportStyle::Module, this.span_from_token(start));
+        const imp: ImportDecl* = ImportDecl::new(path_sym, ImportStyle::Module);
         imp.is_export = is_export;
         for (mut i: i64 = 0; i < seg_names.length; i++) {
             imp.add_path_segment(seg_names[i], seg_spans[i]);
@@ -2064,17 +1878,16 @@ public:
         if (this.check(TokenType::KwAs)) {
             this.advance();
             const alias_tok: Token = this.consume(TokenType::Identifier, "alias name");
-            imp.set_alias(this.intern_lexeme(alias_tok));
+            imp.alias = this.intern_lexeme(alias_tok);
         }
 
         this.consume(TokenType::Semicolon, "';'");
-        imp.span = this.span_from(start);
-        return imp;
+        return DeclarationNode::of(DeclKind::Import(imp), this.span_from(start));
     }
 
     /// Parse a namespace declaration: namespace A::B;
     /// Accepts keywords as path segments (e.g., std::collections::string).
-    parse_namespace_declaration() -> ASTNode* {
+    parse_namespace_declaration() -> DeclarationNode* {
         const start: Token = this.advance(); // consume 'namespace'
         mut qn: QualifiedName = QualifiedName::empty();
         mut seg_names: [SymbolStr] = [];
@@ -2108,17 +1921,16 @@ public:
 
         // Create a module declaration node representing the namespace
         const span: SourceSpan = this.span_from(start);
-        mut node: ModuleDeclNode* = new ModuleDeclNode(
-            qn.display(this.ctx.get_intern_table()), true, span);
+        const m: ModuleDecl* = ModuleDecl::new(qn.display(this.ctx.get_intern_table()), true);
         for (mut i: i64 = 0; i < seg_names.length; i++) {
-            node.add_path_segment(seg_names[i], seg_spans[i]);
+            m.add_path_segment(seg_names[i], seg_spans[i]);
         }
-        return node;
+        return DeclarationNode::of(DeclKind::Module(m), span);
     }
 
     /// Parse a module declaration: public module Name;
     /// Accepts keywords as path segments (e.g., public module collections::string;).
-    parse_module_declaration() -> ModuleDeclNode* {
+    parse_module_declaration() -> DeclarationNode* {
         const start: Token = this.current();
         mut is_public: boolean = false;
         if (this.check(TokenType::KwPublic)) {
@@ -2155,22 +1967,21 @@ public:
 
         this.consume(TokenType::Semicolon, "';'");
         const span: SourceSpan = this.span_from(start);
-        mut node: ModuleDeclNode* = new ModuleDeclNode(
-            qn.display(this.ctx.get_intern_table()), is_public, span);
+        const m: ModuleDecl* = ModuleDecl::new(qn.display(this.ctx.get_intern_table()), is_public);
         for (mut i: i64 = 0; i < seg_names.length; i++) {
-            node.add_path_segment(seg_names[i], seg_spans[i]);
+            m.add_path_segment(seg_names[i], seg_spans[i]);
         }
-        return node;
+        return DeclarationNode::of(DeclKind::Module(m), span);
     }
 
     /// Parse an implementation block. Two shapes:
     ///
     ///   Inherent (existing):
-    ///     implement [enum|struct|class] Name[<T>] { ... }
+    ///     implement [enum|struct|union] Name[<T>] { ... }
     ///     implement boolean { ... }
     ///
     ///   Trait impl (G1, G2):
-    ///     implement [<T, ...>] trait <TraitPath>[<args>] for [enum|struct|class]
+    ///     implement [<T, ...>] trait <TraitPath>[<args>] for [enum|struct|union]
     ///         Name[<args>] [where T: Bound + Bound2, U: Other] { ... }
     ///
     /// The leading `<T, ...>` after `implement` carries the impl's own generic
@@ -2180,7 +1991,7 @@ public:
     /// `trait` keyword missing.  Returns:
     ///   0: pattern doesn't match (proceed as a normal inherent impl)
     ///   1: `<Path>[<args>] for ...` form (just `trait` missing)
-    ///   2: `<struct|enum|class> <Path>[<args>] for ...` form
+    ///   2: `<struct|enum|union> <Path>[<args>] for ...` form
     ///       (`trait` missing AND a spurious kind tag is sitting in the
     ///       trait position; kind tags belong on the target after `for`)
     detect_missing_trait_form() -> int {
@@ -2189,8 +2000,7 @@ public:
         const first: TokenType = this.peek_at(0).kind;
         if (first == TokenType::KwStruct
             || first == TokenType::KwUnion
-            || first == TokenType::KwEnum
-            || first == TokenType::KwClass) {
+            || first == TokenType::KwEnum) {
             had_kind_tag = true;
             off = 1;
         }
@@ -2225,20 +2035,20 @@ public:
     }
 
     /// Whether `gp` repeats a parameter of the leading `implement<...>` list.
-    static declares_generic_param(leading: [GenericParamNode*]*, gp: GenericParamNode*) -> boolean {
+    static declares_generic_param(leading: [DeclarationNode*]*, gp: GenericParamDecl*) -> boolean {
         for (mut i: i64 = 0; i < (*leading).length; i++) {
-            if ((*leading)[i].name.equals(gp.name)) { return true; }
+            if (DeclarationNode::generic_param_of((*leading)[i]).name.equals(gp.name)) { return true; }
         }
         return false;
     }
 
-    parse_implementation_block() -> ImplBlockNode* {
+    parse_implementation_block() -> DeclarationNode* {
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_implementation_block()");
         const start: Token = this.advance(); // consume 'implement'
 
         // (G2) Optional `<T, ...>` directly after `implement`: generic params
         // for a trait impl head: `implement<T> trait Iter<T> for Range<T>`.
-        mut leading_gen_params: [GenericParamNode*] = [];
+        mut leading_gen_params: [DeclarationNode*] = [];
         if (this.check(TokenType::LAngle)) {
             leading_gen_params = this.parse_generic_params(true);
         }
@@ -2253,7 +2063,7 @@ public:
             this.consume(TokenType::KwFor, "'for'");
         } else {
             // Detect trait-impl heads that are missing the `trait` keyword
-            // (and possibly carry a spurious struct/enum/class kind tag in
+            // (and possibly carry a spurious struct/enum/union kind tag in
             // the trait position).  Both shapes are common copy-paste
             // mistakes; emit a tailored diagnostic and recover by parsing
             // the path before `for` as the trait annotation, exactly as
@@ -2268,7 +2078,7 @@ public:
                     "missing `trait` keyword in `implement ... for ...` block");
                 diag = diag.at(sugg_span);
                 diag = diag.with_note("trait impls are written `implement trait <TraitName> for <TypeName> { ... }`; the `trait` keyword distinguishes a trait impl from an inherent impl");
-                diag = diag.with_note("inherent impls (no `for` clause) use `implement <TypeName> { ... }`, optionally with a `struct`/`enum`/`class` kind tag on the target");
+                diag = diag.with_note("inherent impls (no `for` clause) use `implement <TypeName> { ... }`, optionally with a `struct`/`enum`/`union` kind tag on the target");
                 diag = diag.suggest(Suggestion::replace(sugg_span,
                     fmt::format("trait %s", head),
                     "insert `trait` before the trait name"));
@@ -2278,7 +2088,7 @@ public:
                 this.consume(TokenType::KwFor, "'for'");
             } else if (detect == 2) {
                 // `implement <KindTag> <Path> for ...`: kind tag in the
-                // wrong position.  `struct`/`enum`/`class` are only valid
+                // wrong position.  `struct`/`enum`/`union` are only valid
                 // on the *target* type (after `for`), never on the trait
                 // name.  The user almost certainly meant `trait` here.
                 const tag_tok: Token = this.current();
@@ -2288,7 +2098,7 @@ public:
                     ErrorCode::E0101_UNEXPECTED_TOKEN,
                     fmt::format("`%s` is not valid before a trait name", tag_tok.lexeme));
                 diag = diag.at(tag_span);
-                diag = diag.with_note(fmt::format("the `struct`/`enum`/`class` kind tag is only allowed on the *target* type after `for`; on the trait side, use `trait` (you wrote `implement %s %s for ...`)",
+                diag = diag.with_note(fmt::format("the `struct`/`enum`/`union` kind tag is only allowed on the *target* type after `for`; on the trait side, use `trait` (you wrote `implement %s %s for ...`)",
                     tag_tok.lexeme, name_tok.lexeme));
                 diag = diag.with_note("the canonical form is `implement trait <TraitName> for [<KindTag>] <TypeName> { ... }`");
                 diag = diag.suggest(Suggestion::replace(tag_span, "trait",
@@ -2301,9 +2111,18 @@ public:
             }
         }
 
-        // Optional type keyword (enum, struct, union, class)
-        if (this.check(TokenType::KwEnum) || this.check(TokenType::KwStruct)
-            || this.check(TokenType::KwUnion) || this.check(TokenType::KwClass)) {
+        // Optional type keyword (enum, struct, union); `class` is refused
+        // and the head read on as `struct`'s.
+        if (this.check(TokenType::KwClass)) {
+            const tag: Token = this.advance();
+            if (trait_ann == null) {
+                this.refuse_removed_form(SourceSpan::covering(this.span_from_token(start), this.span_from_token(tag)),
+                    "implement class", "a class", "write `implement struct`");
+            } else {
+                this.refuse_removed_form(this.span_from_token(tag), "for class", "a class", "write `for struct`");
+            }
+        } else if (this.check(TokenType::KwEnum) || this.check(TokenType::KwStruct)
+            || this.check(TokenType::KwUnion)) {
             this.advance();
         }
 
@@ -2339,17 +2158,18 @@ public:
             type_name = this.intern_lexeme(type_tok);
             type_text = type_tok.lexeme;
         }
-        mut node: ImplBlockNode* = new ImplBlockNode(type_name, this.span_from_token(start));
-        node.set_target_type_span(this.span_from_token(type_tok));
+        const node: ImplBlock* = ImplBlock::new(type_name);
+        const decl: DeclarationNode* = DeclarationNode::of(DeclKind::Impl(node), this.span_from_token(start));
+        node.target_type_span = this.span_from_token(type_tok);
         this.current_type_name = type_text;
 
         // Attach the trait annotation and the leading generic params (if any)
         // collected before the target name was known.
         if (trait_ann != null) {
-            node.set_trait_annotation(trait_ann);
+            node.trait_annotation = trait_ann;
         }
         for (mut lgi: i64 = 0; lgi < leading_gen_params.length; lgi++) {
-            node.add_generic_param(leading_gen_params[lgi]);
+            node.generic_params.push(leading_gen_params[lgi]);
         }
 
         // The `<...>` after the target name is what the head writes for the
@@ -2363,22 +2183,23 @@ public:
         // once, not twice.
         if (this.check(TokenType::LAngle)) {
             if (trait_ann == null) {
-                const gen_params: [GenericParamNode*] = this.parse_generic_params(true);
+                const gen_params: [DeclarationNode*] = this.parse_generic_params(true);
                 mut inherent_args: [TypeAnnotation*] = [];
                 for (mut gi: i64 = 0; gi < gen_params.length; gi++) {
-                    const gp: GenericParamNode* = gen_params[gi];
-                    if (!Parser::declares_generic_param(&leading_gen_params, gp)) { node.add_generic_param(gp); }
+                    const gp_decl: DeclarationNode* = gen_params[gi];
+                    const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
+                    if (!Parser::declares_generic_param(&leading_gen_params, gp)) { node.generic_params.push(gp_decl); }
                     const arg: NamedAnnotation* = new NamedAnnotation {
                         name: gp.name,
-                        span: gp.span,
+                        span: gp_decl.span,
                         pre_resolved: TypeRef::invalid(),
                         res: ResSlot::Pending,
                     };
                     inherent_args.push(new TypeAnnotation::Named(arg));
                 }
-                node.set_target_args(inherent_args);
+                node.target_args = inherent_args;
             } else {
-                node.set_target_args(this.parse_generic_args());
+                node.target_args = this.parse_generic_args();
             }
         }
 
@@ -2386,7 +2207,7 @@ public:
         if (this.check(TokenType::KwWhere)) {
             const bounds: [TraitBound] = this.parse_trait_bounds();
             for (mut wi: i64 = 0; wi < bounds.length; wi++) {
-                node.add_where_bound(bounds[wi].clone());
+                node.where_bounds.push(bounds[wi].clone());
             }
         }
 
@@ -2448,22 +2269,28 @@ public:
                     vis = Visibility::Private;
                     modifier_span = this.span_from_token(this.current());
                     this.advance();
+                } else if (this.at_removed_modifier(TokenType::KwProtected)) {
+                    const block: boolean = this.peek_at(1).kind == TokenType::Colon;
+                    this.refuse_protected(block);
+                    if (block) { continue; }
                 }
+                this.refuse_member_modifier();
 
                 const mods: MethodModifiers = this.consume_method_modifiers(modifier_span);
                 is_static = mods.is_static;
                 modifier_span = mods.span;
 
-                const method: MethodNode* = this.parse_method(vis);
+                const method_decl: DeclarationNode* = this.parse_method(vis);
+                const method: MethodDecl* = DeclarationNode::method_of(method_decl);
                 if (method != null) {
                     if (is_static) { method.set_static(true); }
-                    if (mods.is_async && method.func != null) { method.func.set_async(true); }
-                    if (doc != "") { method.set_documentation(doc); }
+                    if (mods.is_async && method.func != null) { DeclarationNode::fn_of(method.func).set_async(true); }
+                    if (doc != "") { method_decl.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
-                        method.add_directive(pending_dirs[pi]);
+                        method_decl.add_directive(pending_dirs[pi]);
                     }
-                    method.note_modifier_span(modifier_span);
-                    node.add_method(method);
+                    method_decl.note_modifier_span(modifier_span);
+                    node.methods.push(method_decl);
                 }
             } else {
                 this.error_unexpected();
@@ -2474,12 +2301,12 @@ public:
         this.consume(TokenType::RBrace, "'}'");
         this.give_receivers(&node.methods);
         this.current_type_name = "";
-        node.span = this.span_from(start);
-        return node;
+        decl.span = this.span_from(start);
+        return decl;
     }
 
     /// Parse an extern block: extern "C" { function declarations }
-    parse_extern_block() -> ExternBlockNode* {
+    parse_extern_block() -> DeclarationNode* {
         const start: Token = this.advance(); // consume 'extern'
         mut linkage: string = "C";
 
@@ -2489,7 +2316,7 @@ public:
             this.advance();
         }
 
-        mut node: ExternBlockNode* = new ExternBlockNode(linkage, this.span_from_token(start));
+        const node: ExternBlock* = ExternBlock::new(linkage);
 
         this.consume(TokenType::LBrace, "'{'");
 
@@ -2519,15 +2346,16 @@ public:
                 ext_public = false;
             }
             if (this.check(TokenType::KwFunction)) {
-                const func: FunctionDeclNode* = this.parse_extern_function(ext_public);
+                const func_decl: DeclarationNode* = this.parse_extern_function(ext_public);
+                const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
                 if (func != null) {
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
-                        func.add_directive(pending_dirs[pi]);
+                        func_decl.add_directive(pending_dirs[pi]);
                     }
-                    node.add_function(func);
+                    node.add_function(func_decl);
                 }
             } else if (this.check(TokenType::KwMut) || this.check(TokenType::KwConst)) {
-                const gvar: VarDeclNode* = this.parse_extern_global();
+                const gvar: DeclarationNode* = this.parse_extern_global();
                 if (gvar != null) {
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                         gvar.add_directive(pending_dirs[pi]);
@@ -2541,14 +2369,13 @@ public:
         }
 
         this.consume(TokenType::RBrace, "'}'");
-        node.span = this.span_from(start);
-        return node;
+        return DeclarationNode::of(DeclKind::Extern(node), this.span_from(start));
     }
 
     /// Parse the CImport form: `extern module name := "C" { #include "..." }`
     /// 'extern' is current. The keyword-led spelling groups with other `extern`
     /// declarations and reuses the existing `module` keyword.
-    parse_extern_module_cimport() -> ExternBlockNode* {
+    parse_extern_module_cimport() -> DeclarationNode* {
         const start: Token = this.advance(); // consume 'extern'
         this.advance();                      // consume 'module'
         const alias_tok: Token = this.current();
@@ -2561,8 +2388,8 @@ public:
 
     /// Shared tail for both CImport spellings: with `start` at the leading
     /// `extern` token and the cursor positioned at the linkage string, parse
-    /// `"C" { #include ... }` into a namespace-aliased ExternBlockNode.
-    finish_cimport_block(alias: SymbolStr, start: Token) -> ExternBlockNode* {
+    /// `"C" { #include ... }` into a namespace-aliased extern block.
+    finish_cimport_block(alias: SymbolStr, start: Token) -> DeclarationNode* {
         mut linkage: string = "C";
 
         // Linkage type: "C"
@@ -2571,7 +2398,7 @@ public:
             this.advance();
         }
 
-        mut node: ExternBlockNode* = new ExternBlockNode(linkage, this.span_from_token(start));
+        const node: ExternBlock* = ExternBlock::new(linkage);
         node.set_namespace_alias(alias);
 
         this.consume(TokenType::LBrace, "'{'");
@@ -2634,14 +2461,13 @@ public:
         }
 
         this.consume(TokenType::RBrace, "'}'");
-        node.span = this.span_from(start);
-        return node;
+        return DeclarationNode::of(DeclKind::Extern(node), this.span_from(start));
     }
 
     /// Parse an extern function declaration (no body).
-    parse_extern_function(is_public: boolean) -> FunctionDeclNode* {
-        const func: FunctionDeclNode* = this.parse_function_declaration(is_public);
-        return func;
+    parse_extern_function(is_public: boolean) -> DeclarationNode* {
+        const func_decl: DeclarationNode* = this.parse_function_declaration(is_public);
+        return func_decl;
     }
 
     /// Parse an imported global inside an `extern "C"` block:
@@ -2653,9 +2479,10 @@ public:
     /// cannot be inferred because there is nothing to infer it from.  `mut` and
     /// `const` still say what CRYO may do with it - `const` is not a promise
     /// about the library, which remains free to change the value.
-    parse_extern_global() -> VarDeclNode* {
-        mut node: VarDeclNode* = this.parse_variable_declaration();
-        if (node == null) { return null; }
+    parse_extern_global() -> DeclarationNode* {
+        const decl: DeclarationNode* = this.parse_variable_declaration();
+        if (decl == null) { return null; }
+        mut node: VarDecl* = DeclarationNode::var_of(decl);
         node.is_global = true;
         node.is_extern_import = true;
         if (node.initializer != null) {
@@ -2666,7 +2493,7 @@ public:
             this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
                 "an imported global needs a type annotation: there is no initializer to infer one from");
         }
-        return node;
+        return decl;
     }
 
     /// Move an `extern "C"` block's imported globals into the top-level
@@ -2674,85 +2501,91 @@ public:
     /// elsewhere - so hoisting lets the declaration index, name resolution, type
     /// resolution and codegen reach them through the paths that already handle
     /// globals, instead of each learning to look inside an extern block.
-    static hoist_extern_globals(program: ProgramNode*, node: ASTNode*) -> void {
+    static hoist_extern_globals(program: ProgramNode*, node: DeclarationNode*) -> void {
         if (program == null || node == null) { return; }
-        if (node.kind != NodeKind::ExternBlock) { return; }
-        const blk: ExternBlockNode* = node as ExternBlockNode*;
+        const blk: ExternBlock* = DeclarationNode::extern_of(node);
+        if (blk == null) { return; }
         for (mut i: i64 = 0; i < blk.globals.length; i++) {
-            program.add_statement(blk.globals[i] as ASTNode*);
+            program.add_statement(Node::Decl(blk.globals[i]));
         }
     }
 
     /// Parse an intrinsic declaration:
     ///   intrinsic name(params) -> RetType { body }
     ///   intrinsic function name(params) -> RetType;    (stdlib form)
-    parse_intrinsic_declaration() -> IntrinsicDeclNode* {
+    parse_intrinsic_declaration() -> DeclarationNode* {
         const start: Token = this.advance(); // consume 'intrinsic'
         // Allow optional 'function' keyword: intrinsic function malloc(...)
         if (this.check(TokenType::KwFunction)) {
             this.advance(); // consume 'function'
         }
+        // An intrinsic is a function; anything else here (`intrinsic
+        // const`) is refused once, and the rest of it skipped.
+        if (!this.check(TokenType::Identifier)) {
+            this.consume(TokenType::Identifier, "intrinsic name");
+            this.synchronize();
+            return null;
+        }
         const name_tok: Token = this.consume(TokenType::Identifier, "intrinsic name");
         const name: SymbolStr = this.intern_lexeme(name_tok);
-        mut node: IntrinsicDeclNode* = new IntrinsicDeclNode(name, this.span_from_token(start));
+        const node: IntrinsicDecl* = IntrinsicDecl::new(name);
 
         // Parameter list
         this.consume(TokenType::LParen, "'('");
         if (!this.check(TokenType::RParen)) {
-            const params: [VarDeclNode*] = this.parse_parameter_list();
+            const params: [DeclarationNode*] = this.parse_parameter_list();
             for (mut i: i64 = 0; i < params.length; i++) {
-                const p: VarDeclNode* = params[i];
+                const p_decl: DeclarationNode* = params[i];
+                const p: VarDecl* = DeclarationNode::var_of(p_decl);
                 // Detect variadic marker: the `args...` param has no type
                 // annotation (parse_parameter returns it early on `...`).
                 if (p.type_annotation == null && i == params.length - 1) {
-                    node.set_variadic(true);
+                    node.is_variadic = true;
                 } else {
-                    node.add_parameter(p);
+                    node.parameters.push(p_decl);
                 }
             }
         }
         if (this.pending_bare_variadic) {
-            node.set_variadic(true);
+            node.is_variadic = true;
             this.pending_bare_variadic = false;
         }
         this.consume(TokenType::RParen, "')'");
 
         // Optional return type
         if (this.match_tok(TokenType::Arrow)) {
-            const ret_ann: TypeAnnotation* = this.parse_type_annotation();
-            node.set_return_type_annotation(ret_ann);
+            node.return_type_annotation = this.parse_type_annotation();
         }
 
         // Optional body
         if (this.check(TokenType::LBrace)) {
-            const body: BlockStmtNode* = this.parse_block_statement();
-            node.set_body(body);
+            node.body = this.parse_block_statement();
         } else {
             this.consume(TokenType::Semicolon, "';'");
         }
 
-        node.span = this.span_from(start);
-        return node;
+        return DeclarationNode::of(DeclKind::Intrinsic(node), this.span_from(start));
     }
 
     /// Parse a generic intrinsic declaration:
     ///   intrinsic function name<T, ..>(params) -> RetType where .. ;
     /// It is a generic function with no body, and is typed and specialized
     /// as one; its entries carry the kind its name lowers as.
-    parse_generic_intrinsic_declaration() -> FunctionDeclNode* {
+    parse_generic_intrinsic_declaration() -> DeclarationNode* {
         const start: Token = this.advance(); // consume 'intrinsic'
         this.advance(); // consume 'function'
         const name_tok: Token = this.consume(TokenType::Identifier, "intrinsic name");
-        mut func: FunctionDeclNode* = new FunctionDeclNode(this.intern_lexeme(name_tok), this.span_from_token(start));
-        func.set_name_span(this.span_from_token(name_tok));
+        mut func: FunctionDecl* = FunctionDecl::new(this.intern_lexeme(name_tok));
+        const func_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(func), this.span_from_token(start));
+        func_decl.set_name_span(this.span_from_token(name_tok));
         func.set_intrinsic(true);
         // Reachable from every module, as every intrinsic declaration is.
         func.set_public(true);
-        const gen_params: [GenericParamNode*] = this.parse_generic_params(true);
+        const gen_params: [DeclarationNode*] = this.parse_generic_params(true);
         for (mut i: i64 = 0; i < gen_params.length; i++) {
             func.add_generic_param(gen_params[i]);
         }
-        this.parse_function_param_list_into(func);
+        this.parse_function_param_list_into(func_decl);
         if (this.match_tok(TokenType::Arrow)) {
             func.set_return_type_annotation(this.parse_type_annotation());
         }
@@ -2763,26 +2596,8 @@ public:
             }
         }
         this.consume(TokenType::Semicolon, "';'");
-        func.span = this.span_from(start);
-        return func;
-    }
-
-    /// Parse an intrinsic const declaration: intrinsic const NAME: Type;
-    parse_intrinsic_const_declaration() -> IntrinsicConstDeclNode* {
-        const start: Token = this.advance(); // consume 'intrinsic'
-        this.advance(); // consume 'const'
-        const name_tok: Token = this.consume(TokenType::Identifier, "intrinsic const name");
-        const name: SymbolStr = this.intern_lexeme(name_tok);
-        mut node: IntrinsicConstDeclNode* = new IntrinsicConstDeclNode(name, this.span_from_token(start));
-
-        // Type annotation: : Type
-        if (this.match_tok(TokenType::Colon)) {
-            node.type_annotation = this.parse_type_annotation();
-        }
-
-        this.consume(TokenType::Semicolon, "';'");
-        node.span = this.span_from(start);
-        return node;
+        func_decl.span = this.span_from(start);
+        return func_decl;
     }
 
     /// Parse generic type parameters: <T, U, A = DefaultType>
@@ -2795,8 +2610,8 @@ public:
     /// `where` clause at all.  Only function-shaped declarations and impl
     /// blocks can, so on a type declaration the bound has no replacement to
     /// suggest and the diagnostic must not name one.
-    parse_generic_params(where_allowed: boolean) -> [GenericParamNode*] {
-        mut params: [GenericParamNode*] = [];
+    parse_generic_params(where_allowed: boolean) -> [DeclarationNode*] {
+        mut params: [DeclarationNode*] = [];
         this.advance(); // consume '<'
 
         while (!this.check(TokenType::RAngle) &&
@@ -2805,7 +2620,8 @@ public:
             const start: Token = this.current();
             const name_tok: Token = this.consume(TokenType::Identifier, "type parameter name");
             const name: SymbolStr = this.intern_lexeme(name_tok);
-            mut param: GenericParamNode* = new GenericParamNode(name, this.span_from_token(start));
+            const gp: GenericParamDecl* = GenericParamDecl::new(name);
+            mut param: DeclarationNode* = DeclarationNode::of(DeclKind::GenericParam(gp), this.span_from_token(start));
 
             // A `:` here is a bound, which is not this production's syntax.
             // The bound list is consumed rather than left for the caller: the
@@ -2845,7 +2661,7 @@ public:
             if (this.match_tok(TokenType::Equal)) {
                 const default_ann: TypeAnnotation* = this.parse_type_annotation();
                 if (default_ann != null) {
-                    param.set_default_annotation(default_ann);
+                    gp.default_annotation = default_ann;
                 }
             }
 
@@ -2968,7 +2784,7 @@ public:
         const start: Token = this.advance(); // consume '!['
 
         const kind_tok: Token = this.consume_directive_name();
-        mut dir: DirectiveNode* = new DirectiveNode(Keyword::new(kind_tok.lexeme), this.span_from_token(start));
+        mut dir: DirectiveNode* = DirectiveNode::new(Keyword::new(kind_tok.lexeme), this.span_from_token(start));
 
         if (this.check(TokenType::LParen)) {
             this.advance();
@@ -3006,14 +2822,14 @@ public:
         // String literal: "foo"
         if (start.kind == TokenType::StringLiteral) {
             const tok: Token = this.advance();
-            const content: string = ParserBase::unquote_string_lexeme(tok.lexeme);
+            const content: string = Parser::unquote_string_lexeme(tok.lexeme);
             return DirectiveArg::string_lit(content, this.span_from_token(tok));
         }
 
         // Integer literal: 16, 0xFF, 0b101, ...
         if (start.kind == TokenType::NumericConstant) {
             const tok: Token = this.advance();
-            const v: i64 = ParserBase::parse_numeric_lexeme_i64(tok.lexeme);
+            const v: i64 = Parser::parse_numeric_lexeme_i64(tok.lexeme);
             return DirectiveArg::int_lit(v, tok.lexeme, this.span_from_token(tok));
         }
 
@@ -3026,7 +2842,7 @@ public:
 
             // Nested directive call: name(args...)
             if (this.check(TokenType::LParen)) {
-                mut nested: DirectiveNode* = new DirectiveNode(
+                mut nested: DirectiveNode* = DirectiveNode::new(
                     Keyword::new(id_tok.lexeme), this.span_from_token(id_tok));
                 this.advance(); // consume '('
                 if (!this.check(TokenType::RParen)) {
@@ -3088,12 +2904,12 @@ public:
             TokenType::StringLiteral => {
                 this.advance();
                 kv.value_kind = DirectiveArgKind::StringLit;
-                kv.str_value  = ParserBase::unquote_string_lexeme(v_tok.lexeme);
+                kv.str_value  = Parser::unquote_string_lexeme(v_tok.lexeme);
             }
             TokenType::NumericConstant => {
                 this.advance();
                 kv.value_kind = DirectiveArgKind::IntLit;
-                kv.int_value  = ParserBase::parse_numeric_lexeme_i64(v_tok.lexeme);
+                kv.int_value  = Parser::parse_numeric_lexeme_i64(v_tok.lexeme);
                 kv.str_value  = v_tok.lexeme;
             }
             TokenType::Identifier => {
@@ -3116,7 +2932,7 @@ public:
     // Statement Parsing
 
     /// Parse a statement based on the current token.
-    parse_statement() -> StatementNode* {
+    parse_statement() -> Stmt* {
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse_statement() token='%s'", this.current().lexeme);
         if (this.panic_mode || this.is_at_end()) { return null; }
 
@@ -3142,10 +2958,10 @@ public:
                         this.current().lexeme));
                 return null;
             }
-            mut block: BlockStmtNode* = this.parse_block_statement();
+            const block: Stmt* = this.parse_block_statement();
             if (block == null) { return null; }
             for (mut i: i64 = 0; i < pending.length; i++) {
-                block.add_directive(pending[i]);
+                block.as_block().add_directive(pending[i]);
             }
             return block;
         }
@@ -3213,15 +3029,15 @@ public:
         // (`const { f }: T = expr;`); otherwise the standard var decl path.
         if (tok.kind == TokenType::KwConst || tok.kind == TokenType::KwMut) {
             if (this.peek_at(1).kind == TokenType::LBrace) {
-                const dd: DestructureDeclNode* = this.parse_destructure_decl();
+                const dd: DeclarationNode* = this.parse_destructure_decl();
                 if (dd != null) {
-                    return new DeclStmtNode(dd, dd.span);
+                    return Stmt::decl_stmt(dd, dd.span);
                 }
                 return null;
             }
-            const var_decl: VarDeclNode* = this.parse_variable_declaration();
+            const var_decl: DeclarationNode* = this.parse_variable_declaration();
             if (var_decl != null) {
-                return new DeclStmtNode(var_decl, var_decl.span);
+                return Stmt::decl_stmt(var_decl, var_decl.span);
             }
             return null;
         }
@@ -3230,7 +3046,7 @@ public:
     }
 
     /// Parse a block statement: { statement* }
-    parse_block_statement() -> BlockStmtNode* {
+    parse_block_statement() -> Stmt* {
         // BRACE_DEPTH_LIMIT: see parse_inner_block. Nested block statements
         // (and the bodies of nested if/match/while/for, which route here)
         // recurse with no expression-bracketing token to bound them, so a
@@ -3241,11 +3057,12 @@ public:
         if (this.brace_depth > 256) {
             this.report_error(ErrorCode::E0111_INVALID_SYNTAX,
                 "block nesting too deep (recursion limit exceeded)");
-            return new BlockStmtNode(this.current_span());
+            return Stmt::block(this.current_span());
         }
         const start: Token = this.advance(); // consume '{'
         this.enter_scope();
-        mut block: BlockStmtNode* = new BlockStmtNode(this.span_from_token(start));
+        const block: Stmt* = Stmt::block(this.span_from_token(start));
+        const body: BlockStmt* = block.as_block();
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
             const before_pos: i64 = this.pos;
@@ -3266,17 +3083,14 @@ public:
                 this.check(TokenType::KwStatic) &&
                 this.peek_at(1).kind == TokenType::KwMatch;
             if (this.is_declaration_start() && !is_static_match) {
-                const decl: ASTNode* = this.parse_declaration(false, doc);
-                if (decl != null) {
-                    // Wrap declaration in a DeclStmtNode if it's a DeclarationNode
-                    // Otherwise it might already be a StatementNode
-                    const decl_stmt: DeclStmtNode* = new DeclStmtNode(decl as DeclarationNode*, decl.span);
-                    block.add_statement(decl_stmt);
+                const item: Stmt* = Parser::block_item(this.parse_declaration(false, doc));
+                if (item != null) {
+                    body.add_statement(item);
                 }
             } else {
-                const stmt: StatementNode* = this.parse_statement();
+                const stmt: Stmt* = this.parse_statement();
                 if (stmt != null) {
-                    block.add_statement(stmt);
+                    body.add_statement(stmt);
                 }
             }
 
@@ -3295,50 +3109,50 @@ public:
     }
 
     /// Parse an if statement: if (cond) stmt [else stmt]
-    parse_if_statement() -> IfStmtNode* {
+    parse_if_statement() -> Stmt* {
         const start: Token = this.advance(); // consume 'if'
         const condition: ExpressionNode* = this.parse_paren_condition();
 
-        const then_stmt: StatementNode* = this.parse_statement_or_block();
+        const then_stmt: Stmt* = this.parse_statement_or_block();
 
-        mut else_stmt: StatementNode* = null;
+        mut else_stmt: Stmt* = null;
         if (this.match_tok(TokenType::KwElse)) {
             else_stmt = this.parse_statement_or_block();
         }
 
         const span: SourceSpan = this.span_from(start);
-        return new IfStmtNode(condition, then_stmt, else_stmt, span);
+        return Stmt::if_stmt(condition, then_stmt, else_stmt, span);
     }
 
     /// Parse a while statement: while (cond) stmt
-    parse_while_statement() -> WhileStmtNode* {
+    parse_while_statement() -> Stmt* {
         const start: Token = this.advance(); // consume 'while'
         const condition: ExpressionNode* = this.parse_paren_condition();
 
-        const body: StatementNode* = this.parse_statement_or_block();
-        return new WhileStmtNode(condition, body, this.span_from(start));
+        const body: Stmt* = this.parse_statement_or_block();
+        return Stmt::while_stmt(condition, body, this.span_from(start));
     }
 
     /// Parse a loop statement: loop { body }
-    parse_loop_statement() -> LoopStmtNode* {
+    parse_loop_statement() -> Stmt* {
         const start: Token = this.advance(); // consume 'loop'
-        const body: StatementNode* = this.parse_statement_or_block();
-        return new LoopStmtNode(body, this.span_from(start));
+        const body: Stmt* = this.parse_statement_or_block();
+        return Stmt::loop_stmt(body, this.span_from(start));
     }
 
     /// Parse a do-while statement: do stmt while (cond);
-    parse_do_while_statement() -> DoWhileStmtNode* {
+    parse_do_while_statement() -> Stmt* {
         const start: Token = this.advance(); // consume 'do'
-        const body: StatementNode* = this.parse_statement_or_block();
+        const body: Stmt* = this.parse_statement_or_block();
         this.consume(TokenType::KwWhile, "'while'");
         const condition: ExpressionNode* = this.parse_paren_condition();
         this.consume(TokenType::Semicolon, "';'");
-        return new DoWhileStmtNode(body, condition, this.span_from(start));
+        return Stmt::do_while_stmt(body, condition, this.span_from(start));
     }
 
     /// Parse a for statement: for (init; cond; update) body
     /// or for-in: for (item in collection) body
-    parse_for_statement() -> StatementNode* {
+    parse_for_statement() -> Stmt* {
         const start: Token = this.advance(); // consume 'for'
         // The surrounding `()` are optional: `for (x in it)` and `for x in it`
         // (and the C-style `for init; cond; upd`) are both accepted.  When
@@ -3379,20 +3193,20 @@ public:
                 return this.parse_statement_or_block();
             }
             if (has_paren) { this.consume(TokenType::RParen, "')'"); }
-            const body: StatementNode* = this.parse_statement_or_block();
+            const body: Stmt* = this.parse_statement_or_block();
             const full_span: SourceSpan = this.span_from(start);
             return this.build_for_in_desugar(iter_tok, collection, body, full_span);
         }
 
         // C-style for: for (init; cond; update) body
-        mut init: ASTNode* = null;
+        mut init: Node = Node::Expr(null);
         if (!this.check(TokenType::Semicolon)) {
             if (this.check(TokenType::KwConst) || this.check(TokenType::KwMut)) {
-                init = this.parse_variable_declaration();
+                init = Node::Decl(this.parse_variable_declaration());
             } else {
                 const expr: ExpressionNode* = this.parse_expression();
                 this.consume(TokenType::Semicolon, "';'");
-                init = expr;
+                init = Node::Expr(expr);
             }
         } else {
             this.advance(); // consume ';'
@@ -3417,8 +3231,8 @@ public:
             }
         }
 
-        const body: StatementNode* = this.parse_statement_or_block();
-        return new ForStmtNode(init, condition, update, body, this.span_from(start));
+        const body: Stmt* = this.parse_statement_or_block();
+        return Stmt::for_stmt(init, condition, update, body, this.span_from(start));
     }
 
     /// Synthesise the desugaring of `for (x in collection) body` into:
@@ -3444,7 +3258,7 @@ public:
     /// `Some(x)` arm pattern, which already means `break` / `continue` /
     /// `return` inside the body behave like an ordinary `loop`.
     build_for_in_desugar(iter_tok: Token, collection: ExpressionNode*,
-                         body: StatementNode*, full_span: SourceSpan) -> StatementNode* {
+                         body: Stmt*, full_span: SourceSpan) -> Stmt* {
         const iter_span: SourceSpan = this.span_from_token(iter_tok);
         const user_name: SymbolStr  = this.intern_lexeme(iter_tok);
 
@@ -3454,83 +3268,86 @@ public:
         const iter_name: SymbolStr = this.ctx.intern(iter_str);
 
         // `mut __cryo_for_iter_N = collection;`
-        mut iter_decl: VarDeclNode* = new VarDeclNode(iter_name, full_span);
-        iter_decl.set_mutable(true);
-        iter_decl.set_auto(true);                      // type from initializer
-        iter_decl.set_initializer(collection);
-        const iter_decl_stmt: DeclStmtNode* = new DeclStmtNode(
-            iter_decl as DeclarationNode*, full_span);
+        mut iter_var: VarDecl* = VarDecl::new(iter_name);
+        iter_var.set_mutable(true);
+        iter_var.set_auto(true);                      // type from initializer
+        iter_var.set_initializer(collection);
+        const iter_decl_stmt: Stmt* = Stmt::decl_stmt(
+            DeclarationNode::of(DeclKind::Variable(iter_var), full_span), full_span);
 
         // `__cryo_for_iter_N.next()` - match scrutinee.  The call is
         // `Iterator::next`: the loop is defined over the language's
         // `Iterator`, so the member is that trait's, never a method that is
         // merely spelled `next`.  Sema refuses a scrutinee that does not
         // implement the trait before this call is bound.
-        const iter_ident:  IdentifierNode*    = new IdentifierNode(iter_name, full_span);
+        const iter_ident:  ExpressionNode*    = ExpressionNode::identifier_expr(iter_name, full_span);
         const next_name:   SymbolStr          = this.ctx.intern("next");
-        mut next_member:   MemberAccessNode*  = new MemberAccessNode(
-            iter_ident as ExpressionNode*, next_name, full_span, full_span);
-        this.ctx.note_lang_ref(next_member as ASTNode*, LangItem::Iterator);
-        const next_call:   CallExprNode*      = new CallExprNode(
-            next_member as ExpressionNode*, full_span);
+        mut next_member:   ExpressionNode*  = ExpressionNode::member_access_expr(
+            iter_ident, next_name, full_span, full_span);
+        this.ctx.note_lang_ref(Node::Expr(next_member), LangItem::Iterator);
+        const next_call:   ExpressionNode*      = ExpressionNode::call_expr(
+            next_member, full_span);
 
         // `Option::Some(x) => { body }`
-        mut some_pat: EnumPatternNode* = this.lang_variant_pattern(LangItem::Option, "Some", iter_span);
+        const some_pat: Pattern* = this.lang_variant_pattern(LangItem::Option, "Some", iter_span);
         const pb: PatternBinding* = new PatternBinding {
             name: user_name, span: iter_span, sym_id: SymbolID::invalid(),
             resolved_type: TypeRef::invalid(), written_mut: false
         };
-        some_pat.add_element(PatternElement::Binding(pb));
+        some_pat.enum_payload().add_element(PatternElement::Binding(pb));
 
-        mut some_arm: MatchArmNode* = new MatchArmNode(full_span);
-        some_arm.add_pattern(some_pat as PatternNode*);
+        mut some_arm: MatchArmNode* = MatchArmNode::new(full_span);
+        some_arm.add_pattern(some_pat);
         // The user's body block becomes the arm body verbatim.  If the
         // body parsed as a non-block statement, wrap it so the arm body
         // is always a block (matches the rest of the parser's invariant).
-        mut some_body: BlockStmtNode* = null;
-        if (body != null && (body as ASTNode*).kind == NodeKind::BlockStatement) {
-            some_body = body as BlockStmtNode*;
+        const some_body: Stmt* = if (body == null) {
+            Stmt::block(full_span)
         } else {
-            some_body = new BlockStmtNode(if (body != null) { body.span } else { full_span });
-            if (body != null) { some_body.add_statement(body); }
-        }
-        some_arm.set_body(some_body as StatementNode*);
+            match (body.kind) {
+                StmtKind::Block(_) => { body }
+                _ => {
+                    const wrap: Stmt* = Stmt::block(body.span);
+                    wrap.as_block().add_statement(body);
+                    wrap
+                }
+            }
+        };
+        some_arm.set_body(some_body);
 
         // `Option::None => { break; }`
-        const none_pat: EnumPatternNode* = this.lang_variant_pattern(LangItem::Option, "None", full_span);
+        const none_pat: Pattern* = this.lang_variant_pattern(LangItem::Option, "None", full_span);
 
-        mut none_arm: MatchArmNode* = new MatchArmNode(full_span);
-        none_arm.add_pattern(none_pat as PatternNode*);
-        mut none_body: BlockStmtNode* = new BlockStmtNode(full_span);
-        none_body.add_statement(new BreakStmtNode(full_span) as StatementNode*);
-        none_arm.set_body(none_body as StatementNode*);
+        mut none_arm: MatchArmNode* = MatchArmNode::new(full_span);
+        none_arm.add_pattern(none_pat);
+        const none_body: Stmt* = Stmt::block(full_span);
+        none_body.as_block().add_statement(Stmt::break_stmt(full_span));
+        none_arm.set_body(none_body);
 
         // `match (__cryo_for_iter_N.next()) { Some(x)=>..., None=>... }`
-        mut match_stmt: MatchStmtNode* = new MatchStmtNode(
-            next_call as ExpressionNode*, full_span);
-        match_stmt.add_arm(some_arm);
-        match_stmt.add_arm(none_arm);
+        const arms: MatchStmt* = MatchStmt::new(next_call);
+        arms.add_arm(some_arm);
+        arms.add_arm(none_arm);
 
         // `loop { <match> }`
-        mut loop_body: BlockStmtNode* = new BlockStmtNode(full_span);
-        loop_body.add_statement(match_stmt as StatementNode*);
-        const loop_stmt: LoopStmtNode* = new LoopStmtNode(
-            loop_body as StatementNode*, full_span);
+        const loop_body: Stmt* = Stmt::block(full_span);
+        loop_body.as_block().add_statement(Stmt::of(StmtKind::Match(arms), full_span));
+        const loop_stmt: Stmt* = Stmt::loop_stmt(loop_body, full_span);
 
         // `{ <iter_decl_stmt>; <loop_stmt>; }`
-        mut outer: BlockStmtNode* = new BlockStmtNode(full_span);
-        outer.add_statement(iter_decl_stmt as StatementNode*);
-        outer.add_statement(loop_stmt as StatementNode*);
-        return outer as StatementNode*;
+        const outer: Stmt* = Stmt::block(full_span);
+        outer.as_block().add_statement(iter_decl_stmt);
+        outer.as_block().add_statement(loop_stmt);
+        return outer;
     }
 
     /// Parse a match statement: match (expr) { arms }
-    parse_match_statement() -> MatchStmtNode* {
+    parse_match_statement() -> Stmt* {
         const start: Token = this.advance(); // consume 'match'
         const subject: ExpressionNode* = this.parse_paren_condition();
         this.consume(TokenType::LBrace, "'{'");
 
-        mut match_stmt: MatchStmtNode* = new MatchStmtNode(subject, this.span_from_token(start));
+        const match_stmt: MatchStmt* = MatchStmt::new(subject);
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
             const before_pos: i64 = this.pos;
@@ -3552,15 +3369,13 @@ public:
         }
 
         this.consume(TokenType::RBrace, "'}'");
-        match_stmt.span = this.span_from(start);
-        return match_stmt;
+        return Stmt::of(StmtKind::Match(match_stmt), this.span_from(start));
     }
 
     /// Parse a static match statement: `static match (Type) { type-arms }`.
-    /// Used when arms yield no value. Reuses parse_static_match_arm (inherited
-    /// from ExprParser); arm blocks parse full statements via the Parser
-    /// override of parse_inner_block.
-    parse_static_match_statement() -> StaticMatchStmtNode* {
+    /// Used when arms yield no value. Reuses parse_static_match_arm, whose
+    /// arm blocks parse full statements through parse_inner_block.
+    parse_static_match_statement() -> Stmt* {
         const start: Token = this.advance(); // consume 'static'
         this.advance();                      // consume 'match'
         this.consume(TokenType::LParen, "'('");
@@ -3568,8 +3383,7 @@ public:
         this.consume(TokenType::RParen, "')'");
         this.consume(TokenType::LBrace, "'{'");
 
-        mut sm: StaticMatchStmtNode* = new StaticMatchStmtNode(
-            scrutinee, this.span_from_token(start));
+        const sm: StaticMatchStmt* = StaticMatchStmt::new(scrutinee);
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
             const before_pos: i64 = this.pos;
@@ -3586,14 +3400,13 @@ public:
         }
 
         this.consume(TokenType::RBrace, "'}'");
-        sm.span = this.span_from(start);
-        return sm;
+        return Stmt::of(StmtKind::StaticMatch(sm), this.span_from(start));
     }
 
     /// Parse a match arm for statement context: pattern => { body }.
     /// Uses shared parse_match_arm_patterns() for pattern + '=>', then
     /// handles the body as a full block (declarations, statements, expressions).
-    /// See also: ExprParser::parse_expr_match_arm() for expression context.
+    /// See also: parse_expr_match_arm() for expression context.
     parse_match_arm() -> MatchArmNode* {
         const start: Token = this.current();
         mut arm: MatchArmNode* = this.parse_match_arm_patterns();
@@ -3604,7 +3417,7 @@ public:
             arm.set_body(this.parse_inner_block());
         } else {
             // Single statement/expression
-            const stmt: StatementNode* = this.parse_statement();
+            const stmt: Stmt* = this.parse_statement();
             if (stmt != null) {
                 arm.set_body(stmt);
             }
@@ -3615,7 +3428,7 @@ public:
     }
 
     /// Parse a return statement: return [expr];
-    parse_return_statement() -> ReturnStmtNode* {
+    parse_return_statement() -> Stmt* {
         const start: Token = this.advance(); // consume 'return'
         mut expr: ExpressionNode* = null;
 
@@ -3634,25 +3447,25 @@ public:
                 this.consume(TokenType::Semicolon, "';'");
             }
         }
-        return new ReturnStmtNode(expr, this.span_from(start));
+        return Stmt::return_stmt(expr, this.span_from(start));
     }
 
     /// Parse a break statement: break;
-    parse_break_statement() -> BreakStmtNode* {
+    parse_break_statement() -> Stmt* {
         const start: Token = this.advance(); // consume 'break'
         this.consume(TokenType::Semicolon, "';'");
-        return new BreakStmtNode(this.span_from(start));
+        return Stmt::break_stmt(this.span_from(start));
     }
 
     /// Parse a continue statement: continue;
-    parse_continue_statement() -> ContinueStmtNode* {
+    parse_continue_statement() -> Stmt* {
         const start: Token = this.advance(); // consume 'continue'
         this.consume(TokenType::Semicolon, "';'");
-        return new ContinueStmtNode(this.span_from(start));
+        return Stmt::continue_stmt(this.span_from(start));
     }
 
     /// Parse an expression statement: expr;
-    parse_expression_statement() -> ExprStmtNode* {
+    parse_expression_statement() -> Stmt* {
         const expr: ExpressionNode* = this.parse_expression();
         if (expr == null) {
             // Try to recover
@@ -3662,14 +3475,14 @@ public:
             return null;
         }
         this.consume(TokenType::Semicolon, "';'");
-        return new ExprStmtNode(expr, expr.span);
+        return Stmt::expr_stmt(expr, expr.span);
     }
 
     /// Parse an unsafe block: unsafe { ... }
-    parse_unsafe_block() -> UnsafeBlockStmtNode* {
+    parse_unsafe_block() -> Stmt* {
         const start: Token = this.advance(); // consume 'unsafe'
-        const block: BlockStmtNode* = this.parse_block_statement();
-        return new UnsafeBlockStmtNode(block, this.span_from(start));
+        const block: Stmt* = this.parse_block_statement();
+        return Stmt::unsafe_block(block, this.span_from(start));
     }
 
     /// Parse an inline-assembly block: `asm { ...raw asm... }`.
@@ -3692,9 +3505,9 @@ public:
     ///   `${x:"rax"}`  pin to a specific register
     ///   `${x:m}`      memory operand (passed by address)
     ///   `${x:i}`      immediate ; `${x:r}` explicit general register
-    parse_asm_block(pending: [DirectiveNode*], is_module: boolean) -> AsmBlockStmtNode* {
+    parse_asm_block(pending: [DirectiveNode*], is_module: boolean) -> Stmt* {
         const start: Token = this.advance(); // consume 'asm'
-        mut node: AsmBlockStmtNode* = new AsmBlockStmtNode(this.span_from_token(start));
+        const node: AsmBlockStmt* = AsmBlockStmt::new();
         node.is_module_level = is_module;
 
         // Lift arch / dialect / clobbers out of the attached directives.
@@ -3785,7 +3598,7 @@ public:
                     if (this.check(TokenType::StringLiteral)) {
                         const s: Token = this.advance();
                         ck = AsmConstraintKind::Pinned;
-                        pin = ParserBase::unquote_string_lexeme(s.lexeme);
+                        pin = Parser::unquote_string_lexeme(s.lexeme);
                     } else if (this.check(TokenType::Identifier)) {
                         const c: Token = this.advance();
                         if (c.lexeme == "m") { ck = AsmConstraintKind::Memory; }
@@ -3815,16 +3628,18 @@ public:
                     }
                 }
                 if (idx >= 0) {
-                    mut existing: AsmOperand* = node.operands[idx];
-                    if (existing.direction != dir) { existing.direction = AsmOpDir::InOut; }
-                    if (existing.constraint == AsmConstraintKind::Reg
+                    if (node.operands[idx].direction != dir) {
+                        node.operands[idx].direction = AsmOpDir::InOut;
+                    }
+                    if (node.operands[idx].constraint == AsmConstraintKind::Reg
                             && ck != AsmConstraintKind::Reg) {
-                        existing.constraint = ck;
-                        existing.pinned_reg = pin;
+                        node.operands[idx].constraint = ck;
+                        node.operands[idx].pinned_reg = pin;
                     }
                 } else {
-                    const op: AsmOperand* = new AsmOperand(dir, expr, ck, pin);
-                    idx = node.add_operand(op);
+                    idx = node.add_operand(AsmOperand {
+                        direction: dir, expr: expr, constraint: ck, pinned_reg: pin,
+                    });
                     names.push(opname);
                 }
                 node.add_piece(AsmPiece::operand(idx));
@@ -3871,12 +3686,11 @@ public:
             this.advance();
         }
 
-        node.span = this.span_from(start);
-        return node;
+        return Stmt::of(StmtKind::Asm(node), this.span_from(start));
     }
 
     /// Helper: parse a statement that should be a block, or wrap in one.
-    parse_statement_or_block() -> StatementNode* {
+    parse_statement_or_block() -> Stmt* {
         if (this.check(TokenType::LBrace)) {
             return this.parse_block_statement();
         }

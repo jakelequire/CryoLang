@@ -21,21 +21,21 @@ import lsp::protocol::conv;
 
 import compiler::compilation_context::{ CompilationContext };
 import compiler::ast;
-import compiler::ast::{ MemberPin, NamedAnnotation, NodeKind, PatternElement, PatternKind, TypeAnnotation };
-import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::{ MemberPin, NamedAnnotation, PatternElement, TypeAnnotation };
+import compiler::ast::node::{ Node, ProgramNode };
 import compiler::ast::node_locator;
 import compiler::ast::node_locator::{ NodeLocator };
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, EnumDeclNode, EnumVariantNode, FieldDeclNode,
-    FunctionDeclNode, ImplBlockNode, ImportDeclNode, IntrinsicDeclNode, MethodNode,
-    ModuleDeclNode, StructDeclNode, TraitDeclNode, TypeAliasDeclNode, UnionDeclNode, VarDeclNode
+    DeclarationNode, EnumDecl, FieldDecl,
+    FunctionDecl, ImplBlock, ImportDecl, MethodDecl,
+    DeclKind, ModuleDecl, StructDecl, TraitDecl, UnionDecl, VarDecl
 };
 import compiler::module_graph::{ ModulePath };
 import compiler::ast::expression::{
-    CallExprNode, CalleePin, CastExprNode, ExpressionNode, IdentifierNode, MemberAccessNode,
-    NewExprNode, ScopeResolutionNode, StructLiteralNode
+    CallExpr, CalleePin, ExprKind, ExpressionNode, IdentifierExpr,
+    MemberAccessExpr, ScopeResolutionExpr, StructExpr
 };
-import compiler::ast::pattern::{ EnumPatternNode, PatternNode };
+import compiler::ast::pattern::{ EnumPattern, Pattern, PatternKind };
 import compiler::decl_index::{ DeclarationIndex, OverloadId };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::res::{ DefId, DefKind, Res, ResBase, ResSlot };
@@ -195,7 +195,7 @@ type struct Locator {
     col:  u32;
     /// The nodes from the top-level statement down to the innermost one
     /// holding the position.
-    chain: [ASTNode*];
+    chain: [Node];
     /// The module the position is in, when the caller named it.
     module: ModulePath;
 
@@ -214,12 +214,11 @@ type struct Locator {
         return loc.answer();
     }
 
-    /// The innermost node holding the position in `program`, or null.
-    static node_at(ctx: CompilationContext*, program: ProgramNode*, line: u32, col: u32) -> ASTNode* {
+    /// The innermost node holding the position in `program`, or none.
+    static node_at(ctx: CompilationContext*, program: ProgramNode*, line: u32, col: u32) -> Node? {
         mut loc: Locator = Locator::new(ctx, line, col);
         loc.descend(program);
-        if (loc.chain.length == 0) { return null; }
-        return loc.chain[loc.chain.length - 1];
+        return loc.innermost();
     }
 
     holds(&this, span: SourceSpan) -> boolean {
@@ -231,126 +230,132 @@ type struct Locator {
     /// is a declaration the compiler wrote.
     descend(mut &this, program: ProgramNode*) -> void {
         if (program == null) { return; }
-        mut cur: ASTNode* = null;
+        mut cur: Node? = Option::None;
         for (mut i: i64 = 0; i < program.statements.length; i++) {
-            const stmt: ASTNode* = program.statements[i];
-            if (stmt == null || stmt.generated || !this.holds(stmt.span)) { continue; }
-            if (stmt.kind == NodeKind::FunctionDeclaration
-                    && (stmt as FunctionDeclNode*).is_specialization) { continue; }
-            cur = stmt;
+            const item: Node = program.statements[i];
+            if (item.is_null() || item.generated() || !this.holds(item.span())) { continue; }
+            const f: FunctionDecl* = DeclarationNode::fn_of(item.as_decl());
+            if (f != null && f.is_specialization) { continue; }
+            cur = Option::Some(item);
             break;
         }
-        while (cur != null) {
-            this.chain.push(cur);
-            cur = NodeLocator::first_covering_child(cur, this.line, this.col);
+        while (cur.is_some()) {
+            const n: Node = cur.unwrap();
+            this.chain.push(n);
+            cur = NodeLocator::first_covering_child(n, this.line, this.col);
         }
     }
 
-    innermost(&this) -> ASTNode* {
-        if (this.chain.length == 0) { return null; }
-        return this.chain[this.chain.length - 1];
+    /// The innermost node holding the position, or none.
+    innermost(&this) -> Node? {
+        if (this.chain.length == 0) { return Option::None; }
+        return Option::Some(this.chain[this.chain.length - 1]);
     }
 
-    parent(&this) -> ASTNode* {
+    /// The declaration directly holding the innermost node, or null.
+    parent_decl(&this) -> DeclarationNode* {
         if (this.chain.length < 2) { return null; }
-        return this.chain[this.chain.length - 2];
+        return this.chain[this.chain.length - 2].as_decl();
     }
 
     /// The call `callee` is the callee of, or null.
-    call_of(&this, callee: ASTNode*) -> CallExprNode* {
-        const p: ASTNode* = this.parent();
-        if (p == null || p.kind != NodeKind::CallExpression) { return null; }
-        const call: CallExprNode* = p as CallExprNode*;
-        const called: ASTNode* = call.callee as ASTNode*;
+    call_of(&this, callee: ExpressionNode*) -> CallExpr* {
+        if (this.chain.length < 2) { return null; }
+        const call: CallExpr* = ExpressionNode::call_of(this.chain[this.chain.length - 2].as_expr());
+        if (call == null) { return null; }
+        const called: ExpressionNode* = call.callee;
         if (called != callee) { return null; }
         return call;
     }
 
     answer(&this) -> Answer {
-        const n: ASTNode* = this.innermost();
-        if (n == null) { return Answer::nothing(); }
-        match (n.kind) {
-            NodeKind::Identifier => { return this.identifier(n as IdentifierNode*); }
-            NodeKind::ScopeResolution => { return this.path(n as ScopeResolutionNode*); }
-            NodeKind::MemberAccess => { return this.member(n as MemberAccessNode*); }
-            NodeKind::StructLiteral => { return this.struct_literal(n as StructLiteralNode*); }
-            NodeKind::NewExpression => {
-                const ne: NewExprNode* = n as NewExprNode*;
-                return Answer::of(this.res_target(&ne.res), n.span, ne.resolved_type);
+        const at: Node? = this.innermost();
+        if (at.is_none()) { return Answer::nothing(); }
+        match (at.unwrap()) {
+            Node::Expr(e) => {
+                match (e.kind) {
+                    ExprKind::MemberAccess(m) => { return this.member(e, m); }
+                    ExprKind::Identifier(id) => { return this.identifier(e, id); }
+                    ExprKind::ScopeResolution(s) => { return this.path(e, s); }
+                    ExprKind::New(ne) => {
+                        return Answer::of(this.res_target(&ne.res), e.span, e.resolved_type);
+                    }
+                    ExprKind::Struct(sl) => { return this.struct_literal(e, sl); }
+                    ExprKind::Cast(c) => { return this.annotation(c.target_annotation); }
+                    // Nothing here names a definition the editor can answer.
+                    ExprKind::Sizeof(_) | ExprKind::Alignof(_) | ExprKind::Typeof(_)
+                    | ExprKind::Delete(_) | ExprKind::Yield(_) | ExprKind::Try(_)
+                    | ExprKind::ObjectConversion(_)
+                    | ExprKind::Tuple(_) | ExprKind::Array(_) | ExprKind::Literal(_)
+                    | ExprKind::Ternary(_) | ExprKind::If(_) | ExprKind::StaticMatch(_)
+                    | ExprKind::Match(_) | ExprKind::Unary(_) | ExprKind::Binary(_)
+                    | ExprKind::ArrayAccess(_) | ExprKind::Lambda(_) | ExprKind::Await(_)
+                    | ExprKind::Call(_) => { return Answer::nothing(); }
+                }
             }
-            NodeKind::CastExpression => {
-                return this.annotation((n as CastExprNode*).target_annotation);
+            Node::Pattern(p) => { return this.pattern(p); }
+            Node::Decl(d) => {
+                match (d.kind) {
+                    DeclKind::Method(m) => {
+                        if (m.func == null) { return Answer::nothing(); }
+                        if (this.holds(m.func.name_span)) { return this.function_decl(m.func, m.func.name_span); }
+                        return this.annotation(DeclarationNode::fn_of(m.func).return_type_annotation);
+                    }
+                    DeclKind::Function(f) => {
+                        if (this.holds(d.name_span)) { return this.function_decl(d, d.name_span); }
+                        return this.annotation(f.return_type_annotation);
+                    }
+                    DeclKind::Impl(ib) => { return this.impl_head(ib); }
+                    DeclKind::TypeAlias(ta) => {
+                        if (this.holds(d.name_span)) { return this.type_decl(d, ta.def); }
+                        return this.annotation(ta.target_annotation);
+                    }
+                    DeclKind::Enum(en) => { return this.type_decl(d, en.def); }
+                    DeclKind::Trait(tr) => { return this.type_decl(d, tr.def); }
+                    DeclKind::Union(un) => { return this.type_decl(d, un.def); }
+                    DeclKind::Struct(sd) => { return this.type_decl(d, sd.def); }
+                    DeclKind::Import(imp) => { return this.import(imp); }
+                    DeclKind::Module(md) => { return this.submodule(md); }
+                    DeclKind::Variant(_) => { return this.variant_decl(d); }
+                    DeclKind::Field(f) => { return this.field_decl(d, f); }
+                    DeclKind::Variable(v) => { return this.var_decl(d, v); }
+                    DeclKind::Destructure(_) | DeclKind::Extern(_) | DeclKind::Intrinsic(_)
+                    | DeclKind::GenericParam(_) => {
+                        return Answer::nothing();
+                    }
+                }
             }
-            NodeKind::Pattern => { return this.pattern(n as PatternNode*); }
-            NodeKind::EnumPattern => { return this.pattern(n as PatternNode*); }
-            NodeKind::VariableDeclaration => { return this.var_decl(n as VarDeclNode*); }
-            NodeKind::FunctionDeclaration => {
-                const f: FunctionDeclNode* = n as FunctionDeclNode*;
-                if (this.holds(f.name_span)) { return this.function_decl(f, f.name_span); }
-                return this.annotation(f.return_type_annotation);
-            }
-            NodeKind::MethodDeclaration => {
-                const m: MethodNode* = n as MethodNode*;
-                if (m.func == null) { return Answer::nothing(); }
-                if (this.holds(m.func.name_span)) { return this.function_decl(m.func, m.func.name_span); }
-                return this.annotation(m.func.return_type_annotation);
-            }
-            NodeKind::FieldDeclaration => { return this.field_decl(n as FieldDeclNode*); }
-            NodeKind::EnumVariant => { return this.variant_decl(n as EnumVariantNode*); }
-            NodeKind::StructDeclaration => {
-                return this.type_decl(n, (n as StructDeclNode*).def);
-            }
-            NodeKind::UnionDeclaration => {
-                return this.type_decl(n, (n as UnionDeclNode*).def);
-            }
-            NodeKind::ClassDeclaration => {
-                return this.type_decl(n, (n as ClassDeclNode*).def);
-            }
-            NodeKind::EnumDeclaration => {
-                return this.type_decl(n, (n as EnumDeclNode*).def);
-            }
-            NodeKind::TraitDeclaration => {
-                return this.type_decl(n, (n as TraitDeclNode*).def);
-            }
-            NodeKind::TypeAliasDeclaration => {
-                const ta: TypeAliasDeclNode* = n as TypeAliasDeclNode*;
-                if (this.holds(ta.name_span)) { return this.type_decl(n, ta.def); }
-                return this.annotation(ta.target_annotation);
-            }
-            NodeKind::ImplementationBlock => { return this.impl_head(n as ImplBlockNode*); }
-            NodeKind::ImportDeclaration => { return this.import(n as ImportDeclNode*); }
-            NodeKind::ModuleDeclaration => { return this.submodule(n as ModuleDeclNode*); }
             _ => { return Answer::nothing(); }
         }
     }
 
     // -- Expressions --
 
-    identifier(&this, id: IdentifierNode*) -> Answer {
-        const at: SourceSpan = (id as ASTNode*).span;
+    identifier(&this, e: ExpressionNode*, id: IdentifierExpr*) -> Answer {
+        const at: SourceSpan = e.span;
         if (id.is_this_keyword) {
             // The receiver's target is the type it receives.
-            const d: DefId = this.di.def_of(this.carrier(id.resolved_type), this.ctx.type_arena);
+            const d: DefId = this.di.def_of(this.carrier(e.resolved_type), this.ctx.type_arena);
             if (!d.is_valid()) { return Answer::nothing(); }
-            mut a: Answer = Answer::of(Target::Def(d), at, id.resolved_type);
+            mut a: Answer = Answer::of(Target::Def(d), at, e.resolved_type);
             a.receiver = true;
             return a;
         }
-        return Answer::of(this.res_target(&id.res), at, id.resolved_type);
+        return Answer::of(this.res_target(&id.res), at, e.resolved_type);
     }
 
-    path(&this, s: ScopeResolutionNode*) -> Answer {
-        const ty: TypeRef = (s as ExpressionNode*).resolved_type;
+    path(&this, e: ExpressionNode*, s: ScopeResolutionExpr*) -> Answer {
+        const ty: TypeRef = e.resolved_type;
         if (this.holds(s.scope_span)) {
             return Answer::of(this.res_target(&s.scope_res), s.scope_span, TypeRef::invalid());
         }
         if (!this.holds(s.member_span)) { return Answer::nothing(); }
-        return Answer::of(this.path_member(s, this.call_of(s as ASTNode*)), s.member_span, ty);
+        return Answer::of(this.path_member(s, this.call_of(e)), s.member_span, ty);
     }
 
     /// What a path's member segment names; `call` is the call the path is
     /// the callee of, or null.
-    path_member(&this, s: ScopeResolutionNode*, call: CallExprNode*) -> Target {
+    path_member(&this, s: ScopeResolutionExpr*, call: CallExpr*) -> Target {
         if (s.member_def.is_valid()) { return Target::Def(s.member_def); }
         if (call != null) {
             const t: Target = this.call_target(call);
@@ -366,55 +371,55 @@ type struct Locator {
         return this.pin_target(&s.resolved_callee);
     }
 
-    member(&this, m: MemberAccessNode*) -> Answer {
+    member(&this, e: ExpressionNode*, m: MemberAccessExpr*) -> Answer {
         if (!this.holds(m.member_span)) { return Answer::nothing(); }
-        const ty: TypeRef = (m as ExpressionNode*).resolved_type;
-        return Answer::of(this.member_target(m, this.call_of(m as ASTNode*)), m.member_span, ty);
+        const ty: TypeRef = e.resolved_type;
+        return Answer::of(this.member_target(m, this.call_of(e)), m.member_span, ty);
     }
 
     /// What a member access names: the method the call it is the callee of
     /// names, or the field its pin holds.
-    member_target(&this, m: MemberAccessNode*, call: CallExprNode*) -> Target {
+    member_target(&this, m: MemberAccessExpr*, call: CallExpr*) -> Target {
         if (call != null) { return this.call_target(call); }
         match (&m.resolved_member) {
-            MemberPin::Field(depth, index) => {
+            MemberPin::Field(index) => {
                 if (m.object == null) { return Target::Nothing; }
-                return this.field_target(m.object.resolved_type, depth, index);
+                return this.field_target(m.object.resolved_type, index);
             }
             _ => { return Target::Nothing; }
         }
     }
 
-    struct_literal(&this, sl: StructLiteralNode*) -> Answer {
-        const ty: TypeRef = (sl as ExpressionNode*).resolved_type;
+    struct_literal(&this, e: ExpressionNode*, sl: StructExpr*) -> Answer {
+        const ty: TypeRef = e.resolved_type;
         for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
             if (!this.holds(sl.field_inits[i].span)) { continue; }
             match (&sl.field_inits[i].pin) {
-                MemberPin::Field(depth, index) => {
-                    return Answer::of(this.field_target(ty, depth, index),
+                MemberPin::Field(index) => {
+                    return Answer::of(this.field_target(ty, index),
                         sl.field_inits[i].span, TypeRef::invalid());
                 }
                 _ => { return Answer::nothing(); }
             }
         }
-        return Answer::of(this.res_target(&sl.res), (sl as ASTNode*).span, ty);
+        return Answer::of(this.res_target(&sl.res), e.span, ty);
     }
 
     /// What a call names: the entry its pin holds, or the method a generic
     /// body or a bound selected.
-    call_target(&this, call: CallExprNode*) -> Target {
+    call_target(&this, call: CallExpr*) -> Target {
         const pinned: Target = this.pin_target(&call.resolved_callee);
         if (!pinned.is_nothing()) { return pinned; }
         if (call.template_method.is_valid()) { return Target::Def(call.template_method); }
-        const ck: ASTNode* = call.callee as ASTNode*;
-        if (ck != null && ck.kind == NodeKind::MemberAccess) {
-            const ma: MemberAccessNode* = call.callee as MemberAccessNode*;
+        const ck: ExpressionNode* = call.callee;
+        if (ck != null && ExpressionNode::member_access_of(ck) != null) {
+            const ma: MemberAccessExpr* = ExpressionNode::member_access_of(call.callee);
             if (ma.resolved_trait.is_valid() && ma.resolved_trait_slot >= 0) {
-                const decl: ASTNode* = this.di.declaration_of(ma.resolved_trait);
-                if (decl != null && decl.kind == NodeKind::TraitDeclaration) {
-                    const td: TraitDeclNode* = decl as TraitDeclNode*;
+                const decl: DeclarationNode* = this.di.declaration_of(ma.resolved_trait);
+                const td: TraitDecl* = DeclarationNode::trait_of(decl);
+                if (td != null) {
                     if (ma.resolved_trait_slot < td.methods.length) {
-                        return Locator::def_target(td.methods[ma.resolved_trait_slot].def);
+                        return Locator::def_target(DeclarationNode::fn_of(td.methods[ma.resolved_trait_slot]).def);
                     }
                 }
             }
@@ -433,17 +438,26 @@ type struct Locator {
     /// The definition an overload entry was registered for; a copy's is
     /// the definition it is a copy of.
     entry_target(&this, e: OverloadId) -> Target {
-        const decl: ASTNode* = this.di.entry_decl(e);
+        const decl: DeclarationNode* = this.di.entry_decl(e);
         if (decl == null) { return Target::Nothing; }
-        mut f: FunctionDeclNode* = null;
-        if (decl.kind == NodeKind::MethodDeclaration) { f = (decl as MethodNode*).func; }
-        if (decl.kind == NodeKind::FunctionDeclaration) { f = decl as FunctionDeclNode*; }
-        if (decl.kind == NodeKind::IntrinsicDeclaration) {
-            return Locator::def_target((decl as IntrinsicDeclNode*).def);
+        mut f: DeclarationNode* = null;
+        if (DeclarationNode::method_of(decl) != null) { f = DeclarationNode::method_of(decl).func; }
+        if (DeclarationNode::fn_of(decl) != null) { f = decl; }
+        const shaped: DeclarationNode* = decl;
+        if (shaped != null) {
+            match (shaped.kind) {
+                DeclKind::Intrinsic(i) => { return Locator::def_target(i.def); }
+                DeclKind::Import(_) | DeclKind::Module(_)
+                | DeclKind::Variant(_) | DeclKind::Extern(_) | DeclKind::Destructure(_)
+                | DeclKind::TypeAlias(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
+                | DeclKind::Enum(_) | DeclKind::Trait(_) | DeclKind::Union(_)
+                | DeclKind::Struct(_) | DeclKind::Impl(_) | DeclKind::Variable(_)
+                | DeclKind::Function(_) | DeclKind::Method(_) => {}
+            }
         }
         if (f == null) { return Target::Nothing; }
-        if (f.def.is_valid()) { return Target::Def(f.def); }
-        return Locator::def_target(f.copy_of);
+        if (DeclarationNode::fn_of(f).def.is_valid()) { return Target::Def(DeclarationNode::fn_of(f).def); }
+        return Locator::def_target(DeclarationNode::fn_of(f).copy_of);
     }
 
     static def_target(d: DefId) -> Target {
@@ -451,15 +465,9 @@ type struct Locator {
         return Target::Def(d);
     }
 
-    /// Field `index` of the type `depth` steps up the base chain from the
-    /// type `ty` names.
-    field_target(&this, ty: TypeRef, depth: i64, index: i64) -> Target {
-        mut owner: DefId = this.di.def_of(this.carrier(ty), this.ctx.type_arena);
-        for (mut k: i64 = 0; k < depth && owner.is_valid(); k++) {
-            const decl: ASTNode* = this.di.declaration_of(owner);
-            if (decl == null || decl.kind != NodeKind::ClassDeclaration) { return Target::Nothing; }
-            owner = this.res_def(&(decl as ClassDeclNode*).base_res);
-        }
+    /// Field `index` of the type `ty` names.
+    field_target(&this, ty: TypeRef, index: i64) -> Target {
+        const owner: DefId = this.di.def_of(this.carrier(ty), this.ctx.type_arena);
         if (!owner.is_valid()) { return Target::Nothing; }
         return Target::Field(owner, index);
     }
@@ -472,9 +480,9 @@ type struct Locator {
             const t: type_base::Type* = this.ctx.type_arena.lookup(cur);
             if (t == null) { return cur; }
             if (t.kind == types::TypeKind::Reference) {
-                cur = (t as compound::ReferenceType*).referent;
+                cur = t.as_reference().referent;
             } else if (t.kind == types::TypeKind::Pointer) {
-                cur = (t as compound::PointerType*).pointee;
+                cur = t.as_pointer().pointee;
             } else {
                 return cur;
             }
@@ -508,6 +516,8 @@ type struct Locator {
             ResBase::Def(d)          => { Locator::def_target(d) }
             ResBase::GenericParam(s) => { Target::TypeParam(s) }
             ResBase::PrimTy(p)       => { Target::Prim(p) }
+            // A trait's implementor is no type yet; the trait is what names it.
+            ResBase::TraitThis(t)    => { Locator::def_target(t) }
         };
     }
 
@@ -521,104 +531,103 @@ type struct Locator {
 
     // -- Patterns --
 
-    pattern(&this, p: PatternNode*) -> Answer {
-        const at: SourceSpan = (p as ASTNode*).span;
-        if ((p as ASTNode*).kind == NodeKind::EnumPattern) {
-            const ep: EnumPatternNode* = p as EnumPatternNode*;
-            if (this.holds(ep.enum_span)) {
-                return Answer::of(this.res_target(&ep.res), ep.enum_span, TypeRef::invalid());
+    pattern(&this, p: Pattern*) -> Answer {
+        const at: SourceSpan = p.span;
+        match (p.kind) {
+            PatternKind::Binding(b) => {
+                return Answer::of(Target::Local(b.binding_sym), at, b.binding_type);
             }
-            if (this.holds(ep.variant_span)) {
-                match (&ep.resolved_member) {
-                    MemberPin::Variant(ord) => {
-                        const owner: DefId = this.res_def(&ep.res);
-                        if (owner.is_valid()) {
-                            return Answer::of(Target::Variant(owner, ord), ep.variant_span, TypeRef::invalid());
-                        }
-                    }
-                    _ => { }
-                }
-                return Answer::nothing();
+            PatternKind::Constant(c) => {
+                return Answer::of(this.res_target(&c.res), at, TypeRef::invalid());
             }
-            for (mut i: i64 = 0; i < ep.elements.length; i++) {
-                match (ep.elements[i]) {
-                    PatternElement::Binding(b) => {
-                        if (b != null && this.holds(b.span)) {
-                            return Answer::of(Target::Local(b.sym_id), b.span, b.resolved_type);
-                        }
+            PatternKind::Enum(ep) => { return this.enum_pattern(ep); }
+            _ => { return Answer::nothing(); }
+        }
+    }
+
+    enum_pattern(&this, ep: EnumPattern*) -> Answer {
+        if (this.holds(ep.enum_span)) {
+            return Answer::of(this.res_target(&ep.res), ep.enum_span, TypeRef::invalid());
+        }
+        if (this.holds(ep.variant_span)) {
+            match (&ep.resolved_member) {
+                MemberPin::Variant(ord) => {
+                    const owner: DefId = this.res_def(&ep.res);
+                    if (owner.is_valid()) {
+                        return Answer::of(Target::Variant(owner, ord), ep.variant_span, TypeRef::invalid());
                     }
-                    PatternElement::Sub(s) => {
-                        if (s != null && this.holds(s.span)) {
-                            return this.pattern(s.pattern as PatternNode*);
-                        }
-                    }
-                    _ => { }
                 }
+                _ => { }
             }
             return Answer::nothing();
         }
-        if (p.binding_name.is_valid()) {
-            return Answer::of(Target::Local(p.binding_sym), at, p.binding_type);
-        }
-        if (p.pattern_kind == PatternKind::Identifier) {
-            return Answer::of(this.res_target(&p.const_res), at, TypeRef::invalid());
+        for (mut i: i64 = 0; i < ep.elements.length; i++) {
+            match (ep.elements[i]) {
+                PatternElement::Binding(b) => {
+                    if (b != null && this.holds(b.span)) {
+                        return Answer::of(Target::Local(b.sym_id), b.span, b.resolved_type);
+                    }
+                }
+                PatternElement::Sub(s) => {
+                    if (s != null && this.holds(s.span)) {
+                        return this.pattern(s.pattern);
+                    }
+                }
+                _ => { }
+            }
         }
         return Answer::nothing();
     }
 
     // -- Declarations --
 
-    var_decl(&this, v: VarDeclNode*) -> Answer {
-        if (this.holds(v.name_span)) {
+    var_decl(&this, d: DeclarationNode*, v: VarDecl*) -> Answer {
+        if (this.holds(d.name_span)) {
             if (v.is_global) {
-                return Answer::of(Locator::def_target(v.def), v.name_span, v.resolved_type);
+                return Answer::of(Locator::def_target(v.def), d.name_span, v.resolved_type);
             }
-            return Answer::of(Target::Local(v.sym_id), v.name_span, v.resolved_type);
+            return Answer::of(Target::Local(v.sym_id), d.name_span, v.resolved_type);
         }
         return this.annotation(v.type_annotation);
     }
 
-    function_decl(&this, f: FunctionDeclNode*, at: SourceSpan) -> Answer {
+    function_decl(&this, f_decl: DeclarationNode*, at: SourceSpan) -> Answer {
+        const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
         const d: DefId = if (f.def.is_valid()) { f.def } else { f.copy_of };
         return Answer::of(Locator::def_target(d), at, TypeRef::invalid());
     }
 
-    field_decl(&this, fd: FieldDeclNode*) -> Answer {
-        if (!this.holds(fd.name_span)) { return this.annotation(fd.type_annotation); }
-        const p: ASTNode* = this.parent();
+    field_decl(&this, fd: DeclarationNode*, f: FieldDecl*) -> Answer {
+        if (!this.holds(fd.name_span)) { return this.annotation(f.type_annotation); }
+        const p: DeclarationNode* = this.parent_decl();
         if (p == null) { return Answer::nothing(); }
         mut owner: DefId = DefId::invalid();
         mut index: i64 = -1;
-        if (p.kind == NodeKind::StructDeclaration) {
-            const sd: StructDeclNode* = p as StructDeclNode*;
+        if (DeclarationNode::struct_of(p) != null) {
+            const sd: StructDecl* = DeclarationNode::struct_of(p);
             owner = sd.def;
             index = Locator::field_position(&sd.fields, fd);
-        } else if (p.kind == NodeKind::ClassDeclaration) {
-            const cd: ClassDeclNode* = p as ClassDeclNode*;
-            owner = cd.def;
-            index = Locator::field_position(&cd.fields, fd);
-        } else if (p.kind == NodeKind::UnionDeclaration) {
-            const ud: UnionDeclNode* = p as UnionDeclNode*;
+        } else if (DeclarationNode::union_of(p) != null) {
+            const ud: UnionDecl* = DeclarationNode::union_of(p);
             owner = ud.def;
             index = Locator::field_position(&ud.fields, fd);
         }
         if (!owner.is_valid() || index < 0) { return Answer::nothing(); }
-        return Answer::of(Target::Field(owner, index), fd.name_span, fd.resolved_type);
+        return Answer::of(Target::Field(owner, index), fd.name_span, f.resolved_type);
     }
 
-    static field_position(fields: &[FieldDeclNode*], fd: FieldDeclNode*) -> i64 {
+    static field_position(fields: &[DeclarationNode*], fd: DeclarationNode*) -> i64 {
         for (mut i: i64 = 0; i < fields.length; i++) {
             if (fields[i] == fd) { return i; }
         }
         return -1;
     }
 
-    variant_decl(&this, v: EnumVariantNode*) -> Answer {
-        const p: ASTNode* = this.parent();
-        if (!this.holds(v.name_span) || p == null || p.kind != NodeKind::EnumDeclaration) {
+    variant_decl(&this, v: DeclarationNode*) -> Answer {
+        const ed: EnumDecl* = DeclarationNode::enum_of(this.parent_decl());
+        if (!this.holds(v.name_span) || ed == null) {
             return Answer::nothing();
         }
-        const ed: EnumDeclNode* = p as EnumDeclNode*;
         for (mut i: i64 = 0; i < ed.variants.length; i++) {
             if (ed.variants[i] == v) {
                 return Answer::of(Target::Variant(ed.def, i), v.name_span, TypeRef::invalid());
@@ -627,13 +636,13 @@ type struct Locator {
         return Answer::nothing();
     }
 
-    type_decl(&this, n: ASTNode*, d: DefId) -> Answer {
-        const at: SourceSpan = (n as DeclarationNode*).name_span;
+    type_decl(&this, n: DeclarationNode*, d: DefId) -> Answer {
+        const at: SourceSpan = n.name_span;
         if (!this.holds(at)) { return Answer::nothing(); }
         return Answer::of(Locator::def_target(d), at, TypeRef::invalid());
     }
 
-    impl_head(&this, ib: ImplBlockNode*) -> Answer {
+    impl_head(&this, ib: ImplBlock*) -> Answer {
         if (this.holds(ib.target_type_span)) {
             return Answer::of(this.res_target(&ib.res), ib.target_type_span, TypeRef::invalid());
         }
@@ -649,7 +658,7 @@ type struct Locator {
     /// The module an import's path names, from its last segment, or the
     /// definition a brace entry (or its alias) names.  An entry naming
     /// several answers with the first it bound.
-    import(&this, imp: ImportDeclNode*) -> Answer {
+    import(&this, imp: ImportDecl*) -> Answer {
         for (mut k: i64 = 0; k < imp.specific_defs.length; k++) {
             const e: i64 = imp.specific_def_entries[k];
             const t: Target = Locator::def_target(imp.specific_defs[k]);
@@ -669,7 +678,7 @@ type struct Locator {
 
     /// The module a `public module` line names, from its path's last
     /// segment: the one the loader found where the path is written.
-    submodule(&this, md: ModuleDeclNode*) -> Answer {
+    submodule(&this, md: ModuleDecl*) -> Answer {
         const last: i64 = md.path_segment_spans.length - 1;
         if (!md.is_public || last < 0 || !this.holds(md.path_segment_spans[last])) {
             return Answer::nothing();

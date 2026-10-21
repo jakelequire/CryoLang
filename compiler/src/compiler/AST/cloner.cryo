@@ -1,7 +1,8 @@
 /// AST Cloner
 ///
-/// Deep-clones AST subtrees via the visitor pattern.  Each visit() override
-/// allocates a new node, copies scalar fields, and recursively clones children.
+/// Deep-clones AST subtrees.  Each category's copy dispatches on the node's
+/// kind to a method that allocates a new node, copies scalar fields, and
+/// recursively clones children.
 /// Resolved type fields are left as TypeRef::invalid() on clones (the constructor
 /// default); the type substituter fills them during generic specialization.
 ///
@@ -13,49 +14,42 @@ namespace compiler::ast::cloner;
 import compiler::diag;
 import compiler::ast;
 import compiler::ast::{
-    declaration, expression, node, NodeKind, pattern, PatternBinding, PatternElement,
-    PatternKind, PatternSub, statement, TypeAnnotation, visitor
+    declaration, expression, node, pattern, PatternBinding, PatternElement,
+    PatternSub, statement, TypeAnnotation
 };
+import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::symbol_str;
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::type_ref;
 import compiler::types::type_ref::{ TypeRef };
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, DestructureBinding, DestructureDeclNode, EnumDeclNode,
-    EnumVariantNode, ExternBlockNode, FieldDeclNode, FunctionDeclNode, GenericParamNode,
-    ImplBlockNode, ImportDeclNode, IntrinsicConstDeclNode, IntrinsicDeclNode, MethodNode,
-    ModuleDeclNode, StructDeclNode, TraitDeclNode, TypeAliasDeclNode, UnionDeclNode,
-    VarDeclNode
+    DeclarationNode, DestructureBinding, DestructureDecl, EnumDecl,
+    EnumVariant, ExternBlock, FieldDecl, FunctionDecl, GenericParamDecl,
+    DeclKind, ImplBlock, ImportDecl, IntrinsicDecl, MethodDecl,
+    ModuleDecl, StructDecl, TraitDecl, TypeAliasDecl, UnionDecl,
+    VarDecl
 };
 import compiler::ast::expression::{
-    AlignofExprNode, ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode,
-    CallExprNode, CastExprNode, DeleteExprNode, ExpressionNode, FieldInit, IdentifierNode,
-    IfExprNode, LambdaExprNode, LiteralNode, MatchExprNode, MemberAccessNode, NewExprNode,
-    ScopeResolutionNode, SizeofExprNode, StaticMatchExprNode, StructLiteralNode,
-    TernaryExprNode, TryExprNode, TupleLiteralNode, TypeofExprNode, UnaryExprNode,
-    YieldExprNode
+    AlignofExpr, ArrayAccessExpr, ArrayExpr, AwaitExpr, BinaryExpr,
+    CallExpr, CastExpr, ExprKind, ExpressionNode, FieldInit, IdentifierExpr,
+    LambdaExpr, LiteralExpr, MatchExpr, MemberAccessExpr, NewExpr,
+    ScopeResolutionExpr, SizeofExpr, StaticMatchExpr, StructExpr,
+    TryExpr, TupleExpr, TypeofExpr, UnaryExpr
 };
-import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::node::{ Node, ProgramNode };
 import compiler::ast::pattern::{
-    DirectiveArg, DirectiveArgKind, DirectiveNode, EnumPatternNode, MatchArmNode,
-    PatternNode, StaticMatchArmNode
+    BindingPattern, ConstantPattern, DirectiveArg, DirectiveArgKind, DirectiveNode, EnumPattern,
+    LiteralPattern, MatchArmNode, Pattern, PatternKind, RangePattern, StaticMatchArmNode
 };
 import compiler::ast::statement::{
-    AsmBlockStmtNode, AsmOperand, AsmPiece, BlockStmtNode, BreakStmtNode, ContinueStmtNode,
-    DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode, LoopStmtNode,
-    MatchStmtNode, ReturnStmtNode, StatementNode, StaticMatchStmtNode, UnsafeBlockStmtNode,
-    WhileStmtNode
+    AsmBlockStmt, AsmOperand, BlockStmt, DeclStmt, DoWhileStmt, ExprStmt, ForStmt, IfStmt,
+    LoopStmt, MatchStmt, ReturnStmt, StaticMatchStmt, Stmt, StmtKind, UnsafeBlockStmt,
+    WhileStmt
 };
-import compiler::ast::visitor::{ BaseASTVisitor };
 
-type class ASTCloner : BaseASTVisitor {
-public:
-    /// The result of the most recent visit() call.  After calling
-    /// node.accept(this), retrieve the clone from this field.
-    result: ASTNode*;
-
+type struct ASTCloner {
     /// One-shot specialization name applied at the first decl-level visit
-    /// (StructDeclNode / ClassDeclNode / EnumDeclNode / FunctionDeclNode).
+    /// (StructDecl / EnumDecl / FunctionDecl).
     /// `consume_spec_name()` reads and clears it so child decls keep their
     /// own names.
     spec_name: SymbolStr;
@@ -70,17 +64,18 @@ public:
     /// over what is typed.
     carries_types: boolean;
 
-    ASTCloner() : BaseASTVisitor() {
-        this.result        = null;
-        this.spec_name     = SymbolStr::empty();
-        this.skip_generics = false;
-        this.carries_types = false;
+    static new() -> ASTCloner {
+        return ASTCloner {
+            spec_name:     SymbolStr::empty(),
+            skip_generics: false,
+            carries_types: false,
+        };
     }
 
     /// A cloner for a copy monomorphization makes: its expressions carry
     /// their template's types.
     static for_monomorphization() -> ASTCloner {
-        mut c: ASTCloner = ASTCloner();
+        mut c: ASTCloner = ASTCloner::new();
         c.carries_types  = true;
         return c;
     }
@@ -96,7 +91,7 @@ public:
 
     /// Read and clear the one-shot specialization name, falling back to
     /// `original` when not specializing.
-    consume_spec_name(original: SymbolStr) -> SymbolStr {
+    consume_spec_name(mut &this, original: SymbolStr) -> SymbolStr {
         if (this.spec_name.is_valid()) {
             const name: SymbolStr = this.spec_name;
             this.spec_name = SymbolStr::empty();
@@ -106,7 +101,7 @@ public:
     }
 
     /// Read and clear the skip_generics flag.
-    consume_skip_generics() -> boolean {
+    consume_skip_generics(mut &this) -> boolean {
         const skip: boolean = this.skip_generics;
         this.skip_generics = false;
         return skip;
@@ -115,58 +110,92 @@ public:
 
     // Top-level entry points
 
-    /// Clone any ASTNode.
-    clone_node(node: ASTNode*) -> ASTNode* {
-        if (node == null) { return null; }
-        node.accept(this);
-        this.keep_generated(node);
-        return this.result;
+    /// The copy of `n`, by its category, marked generated when `n` is: a
+    /// copy of a node the compiler wrote is one too.  An expression's copy
+    /// carries no type, whatever `carries_types` says.
+    clone_node(mut &this, n: Node) -> Node {
+        if (n.is_null()) { return n; }
+        match (n) {
+            Node::Expr(e) => {
+                const c: ExpressionNode* = this.copy_expr_shape(e);
+                c.generated = e.generated;
+                return Node::Expr(c);
+            }
+            Node::Stmt(s)      => { return Node::Stmt(this.clone_stmt(s)); }
+            Node::Decl(d)      => { return Node::Decl(this.clone_decl(d)); }
+            Node::Pattern(p) => {
+                const c: Pattern* = this.clone_pattern(p);
+                c.generated = p.generated;
+                return Node::Pattern(c);
+            }
+            Node::Arm(a) => {
+                const c: MatchArmNode* = this.clone_match_arm(a);
+                c.generated = a.generated;
+                return Node::Arm(c);
+            }
+            Node::StaticArm(a) => {
+                const c: StaticMatchArmNode* = this.clone_static_match_arm(a);
+                c.generated = a.generated;
+                return Node::StaticArm(c);
+            }
+            Node::Directive(d) => {
+                const c: DirectiveNode* = this.clone_directive(d);
+                c.generated = d.generated;
+                return Node::Directive(c);
+            }
+            Node::Program(p) => {
+                const c: ProgramNode* = this.clone_program(p);
+                c.generated = p.generated;
+                return Node::Program(c);
+            }
+        }
     }
 
-    /// A copy of a node the compiler wrote is one too.
-    keep_generated(node: ASTNode*) -> void {
-        if (this.result != null) { this.result.generated = node.generated; }
-    }
-
-    /// Clone an expression node (cast wrapper).
-    clone_expr(node: ExpressionNode*) -> ExpressionNode* {
+    /// Clone an expression node, marked generated when `node` is.
+    clone_expr(mut &this, node: ExpressionNode*) -> ExpressionNode* {
         if (node == null) { return null; }
-        node.accept(this);
-        this.keep_generated(node as ASTNode*);
-        const e: ExpressionNode* = this.result as ExpressionNode*;
-        if (this.carries_types && e != null && !e.resolved_type.is_valid()) {
+        const e: ExpressionNode* = this.copy_expr_shape(node);
+        e.generated = node.generated;
+        if (this.carries_types && !e.resolved_type.is_valid()) {
             e.set_resolved_type(node.resolved_type);
         }
         return e;
     }
 
-    /// Clone a statement node (cast wrapper).
-    clone_stmt(node: StatementNode*) -> StatementNode* {
+    /// Clone a statement node, marked generated when `node` is.
+    clone_stmt(mut &this, node: Stmt*) -> Stmt* {
         if (node == null) { return null; }
-        node.accept(this);
-        this.keep_generated(node as ASTNode*);
-        return this.result as StatementNode*;
+        const c: Stmt* = this.copy_stmt(node);
+        c.generated = node.generated;
+        return c;
     }
 
     /// Clone a declaration node (cast wrapper).
-    clone_decl(node: DeclarationNode*) -> DeclarationNode* {
+    clone_decl(mut &this, node: DeclarationNode*) -> DeclarationNode* {
         if (node == null) { return null; }
-        node.accept(this);
-        this.keep_generated(node as ASTNode*);
-        return this.result as DeclarationNode*;
+        const c: DeclarationNode* = this.copy_decl(node);
+        c.generated = node.generated;
+        return c;
     }
+
+    /// The copy of the method `m` in a type's method list; null for null.
+    copy_method(mut &this, m: DeclarationNode*) -> DeclarationNode* {
+        if (m == null) { return null; }
+        return this.copy_decl(m);
+    }
+
 
 
     // Type annotation cloning: delegates to TypeAnnotation::clone()
 
     /// Deep-copy a type annotation tree.  Null-safe wrapper around
     /// the TypeAnnotation::clone() method defined in compiler::ast.
-    clone_type_annotation(ann: TypeAnnotation*) -> TypeAnnotation* {
+    clone_type_annotation(mut &this, ann: TypeAnnotation*) -> TypeAnnotation* {
         return TypeAnnotation::clone_ptr(ann);
     }
 
     /// Deep-copy an array of type annotations.
-    clone_type_annotations(anns: &[TypeAnnotation*]) -> [TypeAnnotation*] {
+    clone_type_annotations(mut &this, anns: &[TypeAnnotation*]) -> [TypeAnnotation*] {
         mut result: [TypeAnnotation*] = [];
         for (mut i: i64 = 0; i < anns.length; i++) {
             result.push(TypeAnnotation::clone_ptr(anns[i]));
@@ -177,16 +206,16 @@ public:
 
     // Helper: copy DeclarationNode base fields
 
-    copy_decl_base(src: DeclarationNode*, dst: DeclarationNode*) -> void {
+    copy_decl_base(mut &this, src: DeclarationNode*, dst: DeclarationNode*) -> void {
         dst.documentation = src.documentation;
         dst.source_file = src.source_file;
         dst.name_span     = src.name_span;
+        dst.modifier_span = src.modifier_span;
         dst.has_error     = src.has_error;
         for (mut i: i64 = 0; i < src.attached_directives.length; i++) {
             const orig: DirectiveNode* = src.attached_directives[i];
             if (orig != null) {
-                this.visit(orig);
-                dst.attached_directives.push(this.result as DirectiveNode*);
+                dst.attached_directives.push(this.clone_directive(orig));
             }
         }
     }
@@ -194,124 +223,10 @@ public:
 
     // Expression visitors
 
-    override visit(node: LiteralNode*) -> void {
-        mut c: LiteralNode* = new LiteralNode(node.value, node.literal_kind, node.span);
-        c.has_error = node.has_error;
-        // The suffix is the literal's type. A generic template body is cloned
-        // once per specialization, so dropping it here would silently re-type
-        // every suffixed literal inside a template back to the default width.
-        c.suffix    = node.suffix;
-        c.byte_length = node.byte_length;
-        this.result = c;
-    }
-
-    override visit(node: IdentifierNode*) -> void {
-        mut c: IdentifierNode* = new IdentifierNode(node.name, node.span);
-        c.is_global_reference = node.is_global_reference;
-        c.is_this_keyword     = node.is_this_keyword;
-        c.is_this_type_keyword = node.is_this_type_keyword;
-        c.has_error           = node.has_error;
-        c.generic_args        = this.clone_type_annotations(node.generic_args);
-        c.resolved_callee     = node.resolved_callee;
-        c.res                 = node.res;
-        mut vta: [TypeRef] = [];
-        for (mut i: i64 = 0; i < node.value_type_args.length; i++) { vta.push(node.value_type_args[i]); }
-        c.value_type_args     = vta;
-        c.value_template      = node.value_template;
-        // Carry sema's type for the identifier.  A generic template body sema
-        // type-checked is cloned per specialization; the monomorphizer dispatches
-        // a method call on its receiver's `resolved_type`, and that receiver is
-        // commonly a local/parameter identifier (e.g. `raw.cast<..>()` where
-        // `raw` is a `match`-bound local).  Codegen re-resolves identifier types
-        // from their declaration, so carrying a still-generic type here is safe;
-        // the monomorphizer applies the active substitution at its walk.
-        c.set_resolved_type(node.resolved_type);
-        this.result = c;
-    }
-
-    override visit(node: BinaryExprNode*) -> void {
-        mut c: BinaryExprNode* = new BinaryExprNode(
-            node.op,
-            this.clone_expr(node.left),
-            this.clone_expr(node.right),
-            node.span
-        );
-        c.has_error = node.has_error;
-        // Carry an operator-overload desugar (built at sema for a bounded-param
-        // operand) into the specialization so the substituter can concretize
-        // its stashed type-args and codegen finds the trait-method call.
-        if (node.desugared_call != null) {
-            c.desugared_call = this.clone_expr(node.desugared_call);
-        }
-        c.desugar_by_bound = node.desugar_by_bound;
-        c.append_entry = node.append_entry;
-        this.result = c;
-    }
-
-    override visit(node: UnaryExprNode*) -> void {
-        mut c: UnaryExprNode* = new UnaryExprNode(
-            node.op,
-            this.clone_expr(node.operand),
-            node.span
-        );
-        c.has_error    = node.has_error;
-        c.is_postfix   = node.is_postfix;
-        c.is_synthetic = node.is_synthetic;
-        if (node.desugared_call != null) {
-            c.desugared_call = this.clone_expr(node.desugared_call);
-        }
-        c.desugar_by_bound = node.desugar_by_bound;
-        this.result    = c;
-    }
-
-    override visit(node: TernaryExprNode*) -> void {
-        mut c: TernaryExprNode* = new TernaryExprNode(
-            this.clone_expr(node.condition),
-            this.clone_expr(node.true_expr),
-            this.clone_expr(node.false_expr),
-            node.span
-        );
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: IfExprNode*) -> void {
-        mut c: IfExprNode* = new IfExprNode(
-            this.clone_expr(node.condition),
-            this.clone_expr(node.then_expr),
-            this.clone_expr(node.else_expr),
-            node.span
-        );
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: MatchExprNode*) -> void {
-        mut c: MatchExprNode* = new MatchExprNode(
-            this.clone_expr(node.subject), node.span
-        );
-        for (mut i: i64 = 0; i < node.arms.length; i++) {
-            c.add_arm(this.clone_match_arm(node.arms[i]));
-        }
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: StaticMatchExprNode*) -> void {
-        mut c: StaticMatchExprNode* = new StaticMatchExprNode(
-            this.clone_type_annotation(node.scrutinee), node.span
-        );
-        for (mut i: i64 = 0; i < node.arms.length; i++) {
-            c.add_arm(this.clone_static_match_arm(node.arms[i]));
-        }
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: CallExprNode*) -> void {
-        mut c: CallExprNode* = new CallExprNode(
-            this.clone_expr(node.callee), node.span
-        );
+    /// A copy of the call `e`, whose payload is `node`.
+    copy_call(mut &this, e: ExpressionNode*, node: CallExpr*) -> ExpressionNode* {
+        const ce: ExpressionNode* = ExpressionNode::call_expr(this.clone_expr(node.callee), e.span);
+        mut c: CallExpr* = ExpressionNode::call_of(ce);
         for (mut i: i64 = 0; i < node.arguments.length; i++) {
             c.add_argument(this.clone_expr(node.arguments[i]));
         }
@@ -345,840 +260,714 @@ public:
             btas.push(node.bound_trait_args[i]);
         }
         c.bound_trait_args = btas;
-        c.has_error = node.has_error;
-        this.result = c;
+        return ce;
     }
 
-    override visit(node: NewExprNode*) -> void {
-        mut c: NewExprNode* = new NewExprNode(node.type_name, node.span);
-        c.variant_name    = node.variant_name;
-        c.res             = node.res;
-        c.resolved_member = node.resolved_member;
-        c.pin_carried     = node.pin_carried;
-        for (mut i: i64 = 0; i < node.arguments.length; i++) {
-            c.add_argument(this.clone_expr(node.arguments[i]));
-        }
-        c.generic_args = this.clone_type_annotations(node.generic_args);
-        if (node.has_array_size()) {
-            c.set_array_size(this.clone_expr(node.array_size));
-        }
-        if (node.has_struct_init()) {
-            c.struct_init = this.clone_expr(node.struct_init) as StructLiteralNode*;
-        }
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: SizeofExprNode*) -> void {
-        mut c: SizeofExprNode* = new SizeofExprNode(
-            this.clone_type_annotation(node.type_ann), node.span);
-        // The operand's type is carried as every decided type is; a copy's
-        // substitution rewrites it with the annotation.
-        c.set_operand_type(node.operand_type);
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: AlignofExprNode*) -> void {
-        mut c: AlignofExprNode* = new AlignofExprNode(
-            this.clone_type_annotation(node.type_ann), node.span);
-        c.set_operand_type(node.operand_type);
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: CastExprNode*) -> void {
-        mut c: CastExprNode* = new CastExprNode(
-            this.clone_expr(node.expression),
-            this.clone_type_annotation(node.target_annotation),
-            node.span
-        );
-        // The target the walk decided, carried as every other type is; a copy's
-        // substitution rewrites it with the annotation.
-        c.set_resolved_target(node.resolved_target);
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: StructLiteralNode*) -> void {
-        mut c: StructLiteralNode* = new StructLiteralNode(node.struct_type, node.span);
-        c.generic_args = this.clone_type_annotations(node.generic_args);
-        c.res          = node.res;
-        for (mut i: i64 = 0; i < node.field_inits.length; i++) {
-            const fi: FieldInit = node.field_inits[i];
-            c.add_field_init(FieldInit {
-                field_name: fi.field_name,
-                value:      this.clone_expr(fi.value),
-                span:        fi.span,
-                pin:         fi.pin,
-                pin_carried: fi.pin_carried,
-            });
-        }
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: ArrayLiteralNode*) -> void {
-        mut c: ArrayLiteralNode* = new ArrayLiteralNode(node.span);
-        for (mut i: i64 = 0; i < node.elements.length; i++) {
-            c.add_element(this.clone_expr(node.elements[i]));
-        }
-        c.repeat_count = node.repeat_count;
-        if (node.repeat_count_expr != null) {
-            c.set_repeat_count_expr(this.clone_expr(node.repeat_count_expr));
-        }
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: TupleLiteralNode*) -> void {
-        mut c: TupleLiteralNode* = new TupleLiteralNode(node.span);
-        for (mut i: i64 = 0; i < node.elements.length; i++) {
-            c.add_element(this.clone_expr(node.elements[i]));
-        }
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: LambdaExprNode*) -> void {
-        mut c: LambdaExprNode* = new LambdaExprNode(node.span);
-        for (mut i: i64 = 0; i < node.parameters.length; i++) {
-            c.add_parameter(this.clone_var_decl(node.parameters[i]));
-        }
-        if (node.return_type.is_valid()) {
-            c.set_return_type(node.return_type);
-        }
-        if (node.return_type_ann != null) {
-            c.set_return_type_ann(node.return_type_ann.clone());
-        }
-        if (node.body != null) {
-            c.set_body(this.clone_stmt(node.body));
-        }
-        // Captures are normally populated during Sema, which runs after
-        // cloning, so this loop is a no-op in practice; defensive in case
-        // an already-sema'd lambda is ever cloned later.
-        for (mut k: i64 = 0; k < node.captured_names.length; k++) {
-            c.add_capture(node.captured_names[k],
-                          node.captured_syms[k],
-                          node.captured_types[k],
-                          node.captured_spans[k]);
-        }
-        c.is_move   = node.is_move;
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: ArrayAccessNode*) -> void {
-        mut c: ArrayAccessNode* = new ArrayAccessNode(
-            this.clone_expr(node.array),
-            this.clone_expr(node.index),
-            node.span
-        );
-        c.has_error = node.has_error;
-        // Carry an index-operator-overload desugar (`*(a.index(i))`, built at
-        // sema for a bounded-param or generic container) into the specialization
-        // so the substituter can concretize its type-args and codegen finds it.
-        if (node.desugared_call != null) {
-            c.desugared_call = this.clone_expr(node.desugared_call);
-        }
-        this.result = c;
-    }
-
-    override visit(node: MemberAccessNode*) -> void {
-        mut c: MemberAccessNode* = new MemberAccessNode(
-            this.clone_expr(node.object),
-            node.member,
-            node.member_span,
-            node.span
-        );
-        c.generic_args    = this.clone_type_annotations(node.generic_args);
-        c.resolved_trait  = node.resolved_trait;
-        c.resolved_trait_slot = node.resolved_trait_slot;
-        c.resolved_member = node.resolved_member;
-        c.pin_carried     = node.pin_carried;
-        c.has_error       = node.has_error;
-        this.result       = c;
-    }
-
-    override visit(node: ScopeResolutionNode*) -> void {
-        mut c: ScopeResolutionNode* = new ScopeResolutionNode(
-            node.scope_name, node.member_name, node.span
-        );
-        c.generic_args       = this.clone_type_annotations(node.generic_args);
-        c.scope_generic_args = this.clone_type_annotations(node.scope_generic_args);
-        // Copied verbatim: a `Res` names a definition, so it stays true for a
-        // copy of the syntax that named it.  A clone that dropped it would
-        // re-ask the question from wherever the cloner happens to be standing,
-        // which is the whole reason the answer is on the node.
-        c.scope_res = node.scope_res;
-        c.resolved_callee = node.resolved_callee;
-        c.resolved_member = node.resolved_member;
-        c.pin_carried = node.pin_carried;
-        c.scope_is_this_type = node.scope_is_this_type;
-        mut vta: [TypeRef] = [];
-        for (mut i: i64 = 0; i < node.value_type_args.length; i++) { vta.push(node.value_type_args[i]); }
-        c.value_type_args = vta;
-        c.value_template = node.value_template;
-        c.spec_owner = node.spec_owner;
-        c.impl_trait = this.clone_type_annotation(node.impl_trait);
-        c.resolved_trait = node.resolved_trait;
-        c.template_method = node.template_method;
-        c.member_def = node.member_def;
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: TypeofExprNode*) -> void {
-        mut c: TypeofExprNode* = new TypeofExprNode(
-            this.clone_expr(node.operand), node.span
-        );
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: DeleteExprNode*) -> void {
-        mut c: DeleteExprNode* = new DeleteExprNode(
-            this.clone_expr(node.operand), node.span
-        );
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: AwaitExprNode*) -> void {
-        mut c: AwaitExprNode* = new AwaitExprNode(
-            this.clone_expr(node.operand), node.span
-        );
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: YieldExprNode*) -> void {
-        const operand: ExpressionNode* = node.has_operand()
-            ? this.clone_expr(node.operand)
-            : null;
-        mut c: YieldExprNode* = new YieldExprNode(operand, node.span);
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: TryExprNode*) -> void {
-        mut c: TryExprNode* = new TryExprNode(
-            this.clone_expr(node.operand), node.span
-        );
-        // `desugared` is normally null at clone time (monomorphization runs
-        // before sema lowers `?`), but clone it defensively if present so a
-        // post-sema clone stays self-consistent.
-        if (node.desugared != null) {
-            c.desugared = this.clone_expr(node.desugared);
-            // The desugared `match` takes the operand node ITSELF as its
-            // subject. Cloning the two independently splits that sharing, and
-            // the halves are read by different consumers: call specialization
-            // and dispatch annotation walk `operand`, while codegen emits
-            // `desugared`. A split clone therefore emits a call that nothing
-            // specialized — `?` on a generic free function stopped resolving at
-            // codegen. Re-point the copy so the invariant survives the clone.
-            //
-            // The async lowering deliberately breaks the sharing (it hoists an
-            // `await` out of the subject into a temp), so this only re-points
-            // when the original still holds it.
-            if (node.desugared.kind == NodeKind::MatchExpression
-                    && (node.desugared as MatchExprNode*).subject == node.operand) {
-                (c.desugared as MatchExprNode*).subject = c.operand;
+    /// A copy of an expression: the payload copied field by field, under a
+    /// header carrying the original's span and error flag.
+    copy_expr_shape(mut &this, node: ExpressionNode*) -> ExpressionNode* {
+        mut c: ExpressionNode* = null;
+        match (node.kind) {
+            // The operand's type is carried as every decided type is; a
+            // copy's substitution rewrites it with the annotation.
+            ExprKind::Alignof(n) => {
+                c = ExpressionNode::of(ExprKind::Alignof(new AlignofExpr {
+                    type_ann:     this.clone_type_annotation(n.type_ann),
+                    operand_type: n.operand_type,
+                }), node.span);
             }
+            ExprKind::Sizeof(n) => {
+                c = ExpressionNode::of(ExprKind::Sizeof(new SizeofExpr {
+                    type_ann:     this.clone_type_annotation(n.type_ann),
+                    operand_type: n.operand_type,
+                }), node.span);
+            }
+            ExprKind::Typeof(n) => {
+                c = ExpressionNode::typeof_expr(this.clone_expr(n.operand), node.span);
+            }
+            ExprKind::Delete(n) => {
+                c = ExpressionNode::delete_expr(this.clone_expr(n.operand), node.span);
+            }
+            ExprKind::ObjectConversion(n) => {
+                c = ExpressionNode::object_conversion(this.clone_expr(n.operand), n.source,
+                    n.implementation, node.resolved_type);
+            }
+            ExprKind::Literal(n) => {
+                c = ExpressionNode::literal(n.value, n.literal_kind, node.span);
+                mut cl: LiteralExpr* = ExpressionNode::literal_of(c);
+                // The suffix is the literal's type. A generic template body is cloned
+                // once per specialization, so dropping it here would silently re-type
+                // every suffixed literal inside a template back to the default width.
+                cl.suffix      = n.suffix;
+                cl.byte_length = n.byte_length;
+            }
+            ExprKind::Struct(n) => {
+                c = ExpressionNode::struct_expr(n.struct_type, node.span);
+                mut cs: StructExpr* = ExpressionNode::struct_of(c);
+                cs.generic_args = this.clone_type_annotations(n.generic_args);
+                cs.res          = n.res;
+                for (mut i: i64 = 0; i < n.field_inits.length; i++) {
+                    const fi: FieldInit = n.field_inits[i];
+                    cs.add_field_init(FieldInit {
+                        field_name: fi.field_name,
+                        value:      this.clone_expr(fi.value),
+                        span:        fi.span,
+                        pin:         fi.pin,
+                        pin_carried: fi.pin_carried,
+                    });
+                }
+            }
+            ExprKind::Array(n) => {
+                c = ExpressionNode::array_expr(node.span);
+                mut ca: ArrayExpr* = ExpressionNode::array_of(c);
+                for (mut i: i64 = 0; i < n.elements.length; i++) {
+                    ca.add_element(this.clone_expr(n.elements[i]));
+                }
+                ca.repeat_count = n.repeat_count;
+                if (n.repeat_count_expr != null) {
+                    ca.set_repeat_count_expr(this.clone_expr(n.repeat_count_expr));
+                }
+            }
+            ExprKind::Tuple(n) => {
+                c = ExpressionNode::tuple_expr(node.span);
+                mut ct: TupleExpr* = ExpressionNode::tuple_of(c);
+                for (mut i: i64 = 0; i < n.elements.length; i++) {
+                    ct.add_element(this.clone_expr(n.elements[i]));
+                }
+            }
+            ExprKind::New(n) => {
+                c = ExpressionNode::new_expr(n.type_name, node.span);
+                mut cn: NewExpr* = ExpressionNode::new_of(c);
+                cn.variant_name    = n.variant_name;
+                cn.res             = n.res;
+                cn.resolved_member = n.resolved_member;
+                cn.pin_carried     = n.pin_carried;
+                for (mut i: i64 = 0; i < n.arguments.length; i++) {
+                    cn.add_argument(this.clone_expr(n.arguments[i]));
+                }
+                cn.generic_args = this.clone_type_annotations(n.generic_args);
+                if (n.has_array_size()) {
+                    cn.set_array_size(this.clone_expr(n.array_size));
+                }
+                if (n.has_struct_init()) {
+                    cn.struct_init = this.clone_expr(n.struct_init);
+                }
+            }
+            ExprKind::Yield(n) => {
+                c = ExpressionNode::yield_expr(this.clone_expr(n.operand), node.span);
+            }
+            ExprKind::Ternary(n) => {
+                c = ExpressionNode::ternary_expr(this.clone_expr(n.condition),
+                                                 this.clone_expr(n.true_expr),
+                                                 this.clone_expr(n.false_expr), node.span);
+            }
+            ExprKind::Await(n) => {
+                c = ExpressionNode::await_expr(this.clone_expr(n.operand), node.span);
+            }
+            ExprKind::MemberAccess(n) => {
+                c = ExpressionNode::member_access_expr(this.clone_expr(n.object), n.member,
+                                                       n.member_span, node.span);
+                mut cm: MemberAccessExpr* = ExpressionNode::member_access_of(c);
+                cm.generic_args        = this.clone_type_annotations(n.generic_args);
+                cm.resolved_trait      = n.resolved_trait;
+                cm.resolved_trait_slot = n.resolved_trait_slot;
+                cm.resolved_member     = n.resolved_member;
+                cm.pin_carried         = n.pin_carried;
+            }
+            ExprKind::ScopeResolution(n) => {
+                c = ExpressionNode::scope_resolution_expr(n.scope_name, n.member_name, node.span);
+                mut cs: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(c);
+                cs.scope_span         = n.scope_span;
+                cs.member_span        = n.member_span;
+                cs.generic_args       = this.clone_type_annotations(n.generic_args);
+                cs.scope_generic_args = this.clone_type_annotations(n.scope_generic_args);
+                // Copied verbatim: a `Res` names a definition, so it stays true for a
+                // copy of the syntax that named it.  A clone that dropped it would
+                // re-ask the question from wherever the cloner happens to be standing,
+                // which is the whole reason the answer is on the node.
+                cs.scope_res = n.scope_res;
+                cs.resolved_callee = n.resolved_callee;
+                cs.resolved_member = n.resolved_member;
+                cs.pin_carried = n.pin_carried;
+                cs.scope_is_this_type = n.scope_is_this_type;
+                mut vta: [TypeRef] = [];
+                for (mut i: i64 = 0; i < n.value_type_args.length; i++) { vta.push(n.value_type_args[i]); }
+                cs.value_type_args = vta;
+                cs.value_template = n.value_template;
+                cs.spec_owner = n.spec_owner;
+                cs.impl_trait = this.clone_type_annotation(n.impl_trait);
+                cs.resolved_trait = n.resolved_trait;
+                cs.template_method = n.template_method;
+                cs.refused = n.refused;
+                cs.member_def = n.member_def;
+            }
+            ExprKind::Identifier(n) => {
+                c = ExpressionNode::identifier_expr(n.name, node.span);
+                mut ci: IdentifierExpr* = ExpressionNode::identifier_of(c);
+                ci.is_this_keyword      = n.is_this_keyword;
+                ci.is_this_type_keyword = n.is_this_type_keyword;
+                ci.generic_args         = this.clone_type_annotations(n.generic_args);
+                ci.resolved_callee      = n.resolved_callee;
+                ci.res                  = n.res;
+                mut vta: [TypeRef] = [];
+                for (mut i: i64 = 0; i < n.value_type_args.length; i++) { vta.push(n.value_type_args[i]); }
+                ci.value_type_args      = vta;
+                ci.value_template       = n.value_template;
+                // Carry sema's type for the identifier.  A generic template body sema
+                // type-checked is cloned per specialization; the monomorphizer dispatches
+                // a method call on its receiver's `resolved_type`, and that receiver is
+                // commonly a local/parameter identifier (e.g. `raw.cast<..>()` where
+                // `raw` is a `match`-bound local).  Codegen re-resolves identifier types
+                // from their declaration, so carrying a still-generic type here is safe;
+                // the monomorphizer applies the active substitution at its walk.
+                c.set_resolved_type(node.resolved_type);
+            }
+            ExprKind::Lambda(n) => {
+                c = ExpressionNode::lambda_expr(node.span);
+                mut cl: LambdaExpr* = ExpressionNode::lambda_of(c);
+                for (mut i: i64 = 0; i < n.parameters.length; i++) {
+                    cl.add_parameter(this.clone_var_decl(n.parameters[i]));
+                }
+                if (n.return_type.is_valid()) {
+                    cl.set_return_type(n.return_type);
+                }
+                if (n.return_type_ann != null) {
+                    cl.set_return_type_ann(n.return_type_ann.clone());
+                }
+                if (n.body != null) {
+                    cl.set_body(this.clone_stmt(n.body));
+                }
+                // Captures are normally populated during Sema, which runs after
+                // cloning, so this loop is a no-op in practice; defensive in
+                // case an already-sema'd lambda is ever cloned later.
+                for (mut k: i64 = 0; k < n.captured_names.length; k++) {
+                    cl.add_capture(n.captured_names[k],
+                                   n.captured_syms[k],
+                                   n.captured_types[k],
+                                   n.captured_spans[k]);
+                }
+                cl.is_move = n.is_move;
+            }
+            ExprKind::ArrayAccess(n) => {
+                c = ExpressionNode::array_access_expr(this.clone_expr(n.array),
+                                                      this.clone_expr(n.index), node.span);
+                // Carry an index-operator-overload desugar (`*(a.index(i))`,
+                // built at sema for a bounded-param or generic container) into
+                // the specialization so the substituter can concretize its
+                // type-args and codegen finds it.
+                if (n.desugared_call != null) {
+                    mut ca: ArrayAccessExpr* = ExpressionNode::array_access_of(c);
+                    ca.desugared_call = this.clone_expr(n.desugared_call);
+                }
+            }
+            ExprKind::Binary(n) => {
+                c = ExpressionNode::binary_expr(n.op, this.clone_expr(n.left),
+                                                this.clone_expr(n.right), node.span);
+                mut cb: BinaryExpr* = ExpressionNode::binary_of(c);
+                // Carry an operator-overload desugar (built at sema for a
+                // bounded-param operand) into the specialization so the
+                // substituter can concretize its stashed type-args and codegen
+                // finds the trait-method call.
+                if (n.desugared_call != null) {
+                    cb.desugared_call = this.clone_expr(n.desugared_call);
+                }
+                cb.desugar_by_bound = n.desugar_by_bound;
+                cb.append_entry = n.append_entry;
+            }
+            ExprKind::Unary(n) => {
+                c = ExpressionNode::unary_expr(n.op, this.clone_expr(n.operand), node.span);
+                mut cu: UnaryExpr* = ExpressionNode::unary_of(c);
+                cu.is_postfix   = n.is_postfix;
+                cu.is_synthetic = n.is_synthetic;
+                if (n.desugared_call != null) {
+                    cu.desugared_call = this.clone_expr(n.desugared_call);
+                }
+                cu.desugar_by_bound = n.desugar_by_bound;
+            }
+            ExprKind::Cast(n) => {
+                c = ExpressionNode::cast_expr(this.clone_expr(n.expression),
+                                              this.clone_type_annotation(n.target_annotation),
+                                              node.span);
+                // The target the walk decided, carried as every other type is;
+                // a copy's substitution rewrites it with the annotation.
+                mut cc: CastExpr* = ExpressionNode::cast_of(c);
+                cc.set_resolved_target(n.resolved_target);
+            }
+            ExprKind::Match(n) => {
+                c = ExpressionNode::match_expr(this.clone_expr(n.subject), node.span);
+                mut cm: MatchExpr* = ExpressionNode::match_of(c);
+                for (mut i: i64 = 0; i < n.arms.length; i++) {
+                    cm.add_arm(this.clone_match_arm(n.arms[i]));
+                }
+            }
+            ExprKind::StaticMatch(n) => {
+                c = ExpressionNode::static_match_expr(this.clone_type_annotation(n.scrutinee),
+                                                      node.span);
+                mut cs: StaticMatchExpr* = ExpressionNode::static_match_of(c);
+                for (mut i: i64 = 0; i < n.arms.length; i++) {
+                    cs.add_arm(this.clone_static_match_arm(n.arms[i]));
+                }
+            }
+            ExprKind::If(n) => {
+                c = ExpressionNode::if_expr(this.clone_expr(n.condition),
+                                            this.clone_expr(n.then_expr),
+                                            this.clone_expr(n.else_expr), node.span);
+            }
+            ExprKind::Try(n) => {
+                mut ct: TryExpr* = new TryExpr {
+                    operand:   this.clone_expr(n.operand),
+                    desugared: null,
+                };
+                c = ExpressionNode::of(ExprKind::Try(ct), node.span);
+                // `desugared` is normally null at clone time (monomorphization
+                // runs before sema lowers `?`), but clone it defensively if
+                // present so a post-sema clone stays self-consistent.
+                if (n.desugared != null) {
+                    ct.desugared = this.clone_expr(n.desugared);
+                    // The desugared `match` takes the operand node ITSELF as
+                    // its subject. Cloning the two independently splits that
+                    // sharing, and the halves are read by different consumers:
+                    // call specialization and dispatch annotation walk
+                    // `operand`, while codegen emits `desugared`. A split clone
+                    // therefore emits a call that nothing specialized. Re-point
+                    // the copy so the invariant survives the clone.
+                    //
+                    // The async lowering deliberately breaks the sharing (it
+                    // hoists an `await` out of the subject into a temp), so
+                    // this only re-points when the original still holds it.
+                    const om: MatchExpr* = ExpressionNode::match_of(n.desugared);
+                    if (om != null && om.subject == n.operand) {
+                        mut cm: MatchExpr* = ExpressionNode::match_of(ct.desugared);
+                        cm.subject = ct.operand;
+                    }
+                }
+            }
+            ExprKind::Call(n) => { c = this.copy_call(node, n); }
         }
         c.has_error = node.has_error;
-        this.result = c;
+        return c;
     }
 
 
-    // Statement visitors
 
-    override visit(node: BlockStmtNode*) -> void {
-        mut c: BlockStmtNode* = new BlockStmtNode(node.span);
-        for (mut i: i64 = 0; i < node.statements.length; i++) {
-            c.add_statement(this.clone_stmt(node.statements[i]));
-        }
-        // ConfigGating runs strictly before any clone-emitting pass
-        // (Monomorphization etc.), so attached_directives on a block
-        // are always empty by the time we reach the cloner.  Skipping
-        // the copy avoids burdening the cloner with directive-graph
-        // walking that would otherwise be dead code.
-        c.has_error = node.has_error;
-        this.result = c;
-    }
 
-    override visit(node: UnsafeBlockStmtNode*) -> void {
-        node.block.accept(this);
-        const cloned_block: BlockStmtNode* = this.result as BlockStmtNode*;
-        mut c: UnsafeBlockStmtNode* = new UnsafeBlockStmtNode(cloned_block, node.span);
-        c.has_error = node.has_error;
-        this.result = c;
-    }
 
-    override visit(node: AsmBlockStmtNode*) -> void {
-        mut c: AsmBlockStmtNode* = new AsmBlockStmtNode(node.span);
-        c.arch = node.arch;
-        c.dialect = node.dialect;
-        c.is_module_level = node.is_module_level;
-        c.has_error = node.has_error;
-        for (mut i: i64 = 0; i < node.operands.length; i++) {
-            const op: AsmOperand* = node.operands[i];
-            const ce: ExpressionNode* = this.clone_expr(op.expr);
-            c.add_operand(new AsmOperand(op.direction, ce, op.constraint, op.pinned_reg));
-        }
-        for (mut i: i64 = 0; i < node.pieces.length; i++) {
-            const p: AsmPiece* = node.pieces[i];
-            if (p.is_operand) { c.add_piece(AsmPiece::operand(p.operand_index)); }
-            else { c.add_piece(AsmPiece::raw(p.text)); }
-        }
-        for (mut i: i64 = 0; i < node.clobbers.length; i++) {
-            c.add_clobber(node.clobbers[i]);
-        }
-        for (mut i: i64 = 0; i < node.attached_directives.length; i++) {
-            c.add_directive(node.attached_directives[i]);
-        }
-        this.result = c;
-    }
 
-    override visit(node: ReturnStmtNode*) -> void {
-        mut c: ReturnStmtNode* = new ReturnStmtNode(
-            this.clone_expr(node.expression), node.span
-        );
-        c.has_error = node.has_error;
-        this.result = c;
-    }
+    // Statements
 
-    override visit(node: IfStmtNode*) -> void {
-        mut c: IfStmtNode* = new IfStmtNode(
-            this.clone_expr(node.condition),
-            this.clone_stmt(node.then_stmt),
-            this.clone_stmt(node.else_stmt),
-            node.span
-        );
+    /// The copy of statement `node`, made for its kind; null for null.  The
+    /// copy is marked generated only by `clone_stmt`.
+    copy_stmt(mut &this, node: Stmt*) -> Stmt* {
+        if (node == null) { return null; }
+        const shape: StmtKind = match (node.kind) {
+            StmtKind::Block(n) => {
+                const b: BlockStmt* = BlockStmt::new();
+                for (mut i: i64 = 0; i < n.statements.length; i++) {
+                    b.add_statement(this.clone_stmt(n.statements[i]));
+                }
+                // ConfigGating runs strictly before any clone-emitting pass
+                // (Monomorphization etc.), so attached_directives on a block
+                // are always empty by the time we reach the cloner.  Skipping
+                // the copy avoids burdening the cloner with directive-graph
+                // walking that would otherwise be dead code.
+                StmtKind::Block(b)
+            }
+            StmtKind::UnsafeBlock(n) => {
+                StmtKind::UnsafeBlock(new UnsafeBlockStmt { block: this.copy_stmt(n.block) })
+            }
+            StmtKind::Asm(n) => {
+                const a: AsmBlockStmt* = AsmBlockStmt::new();
+                a.arch = n.arch;
+                a.dialect = n.dialect;
+                a.is_module_level = n.is_module_level;
+                for (mut i: i64 = 0; i < n.operands.length; i++) {
+                    mut op: AsmOperand = n.operands[i].clone();
+                    op.expr = this.clone_expr(op.expr);
+                    a.add_operand(op);
+                }
+                for (mut i: i64 = 0; i < n.pieces.length; i++) {
+                    a.add_piece(n.pieces[i].clone());
+                }
+                for (mut i: i64 = 0; i < n.clobbers.length; i++) {
+                    a.add_clobber(n.clobbers[i]);
+                }
+                for (mut i: i64 = 0; i < n.attached_directives.length; i++) {
+                    a.add_directive(n.attached_directives[i]);
+                }
+                StmtKind::Asm(a)
+            }
+            StmtKind::Return(n) => {
+                StmtKind::Return(new ReturnStmt { expression: this.clone_expr(n.expression), synth_drops: [] })
+            }
+            StmtKind::If(n) => {
+                StmtKind::If(new IfStmt {
+                    condition: this.clone_expr(n.condition),
+                    then_stmt: this.clone_stmt(n.then_stmt),
+                    else_stmt: this.clone_stmt(n.else_stmt),
+                })
+            }
+            StmtKind::While(n) => {
+                StmtKind::While(new WhileStmt {
+                    condition: this.clone_expr(n.condition), body: this.clone_stmt(n.body),
+                })
+            }
+            StmtKind::DoWhile(n) => {
+                StmtKind::DoWhile(new DoWhileStmt {
+                    body: this.clone_stmt(n.body), condition: this.clone_expr(n.condition),
+                })
+            }
+            StmtKind::For(n) => {
+                StmtKind::For(new ForStmt {
+                    init:      this.clone_node(n.init),
+                    condition: this.clone_expr(n.condition),
+                    update:    this.clone_expr(n.update),
+                    body:      this.clone_stmt(n.body),
+                })
+            }
+            StmtKind::Match(n) => {
+                const m: MatchStmt* = MatchStmt::new(this.clone_expr(n.subject));
+                for (mut i: i64 = 0; i < n.arms.length; i++) {
+                    m.add_arm(this.clone_match_arm(n.arms[i]));
+                }
+                StmtKind::Match(m)
+            }
+            StmtKind::StaticMatch(n) => {
+                const m: StaticMatchStmt* = StaticMatchStmt::new(this.clone_type_annotation(n.scrutinee));
+                for (mut i: i64 = 0; i < n.arms.length; i++) {
+                    m.add_arm(this.clone_static_match_arm(n.arms[i]));
+                }
+                StmtKind::StaticMatch(m)
+            }
+            StmtKind::Break    => { StmtKind::Break }
+            StmtKind::Continue => { StmtKind::Continue }
+            StmtKind::Expr(n)  => { StmtKind::Expr(new ExprStmt { expression: this.clone_expr(n.expression) }) }
+            StmtKind::Decl(n)  => { StmtKind::Decl(new DeclStmt { declaration: this.clone_decl(n.declaration) }) }
+            StmtKind::Loop(n)  => { StmtKind::Loop(new LoopStmt { body: this.clone_stmt(n.body) }) }
+        };
+        const c: Stmt* = Stmt::of(shape, node.span);
         c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: WhileStmtNode*) -> void {
-        mut c: WhileStmtNode* = new WhileStmtNode(
-            this.clone_expr(node.condition),
-            this.clone_stmt(node.body),
-            node.span
-        );
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: DoWhileStmtNode*) -> void {
-        mut c: DoWhileStmtNode* = new DoWhileStmtNode(
-            this.clone_stmt(node.body),
-            this.clone_expr(node.condition),
-            node.span
-        );
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: ForStmtNode*) -> void {
-        mut c: ForStmtNode* = new ForStmtNode(
-            this.clone_node(node.init),
-            this.clone_expr(node.condition),
-            this.clone_expr(node.update),
-            this.clone_stmt(node.body),
-            node.span
-        );
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: MatchStmtNode*) -> void {
-        mut c: MatchStmtNode* = new MatchStmtNode(
-            this.clone_expr(node.subject), node.span
-        );
-        for (mut i: i64 = 0; i < node.arms.length; i++) {
-            c.add_arm(this.clone_match_arm(node.arms[i]));
-        }
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: StaticMatchStmtNode*) -> void {
-        mut c: StaticMatchStmtNode* = new StaticMatchStmtNode(
-            this.clone_type_annotation(node.scrutinee), node.span
-        );
-        for (mut i: i64 = 0; i < node.arms.length; i++) {
-            c.add_arm(this.clone_static_match_arm(node.arms[i]));
-        }
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: BreakStmtNode*) -> void {
-        mut c: BreakStmtNode* = new BreakStmtNode(node.span);
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: ContinueStmtNode*) -> void {
-        mut c: ContinueStmtNode* = new ContinueStmtNode(node.span);
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: ExprStmtNode*) -> void {
-        mut c: ExprStmtNode* = new ExprStmtNode(
-            this.clone_expr(node.expression), node.span
-        );
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: DeclStmtNode*) -> void {
-        mut c: DeclStmtNode* = new DeclStmtNode(
-            this.clone_decl(node.declaration), node.span
-        );
-        c.has_error = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: LoopStmtNode*) -> void {
-        mut c: LoopStmtNode* = new LoopStmtNode(
-            this.clone_stmt(node.body), node.span
-        );
-        c.has_error = node.has_error;
-        this.result = c;
+        return c;
     }
 
 
     // Declaration visitors
 
-    override visit(node: VarDeclNode*) -> void {
-        const c: VarDeclNode* = this.clone_var_decl(node);
-        // A local declaration's decided type is carried, and a copy's
-        // substitution rewrites it.  Only the statement: a parameter's type
-        // is the copy's signature, which monomorphization builds itself.
-        c.resolved_type = node.resolved_type;
-        this.result = c;
-    }
-
-    override visit(node: DestructureDeclNode*) -> void {
-        mut c: DestructureDeclNode* = new DestructureDeclNode(node.span);
-        this.copy_decl_base(node, c);
-        c.set_mutable(node.is_mutable);
-        for (mut i: i64 = 0; i < node.bindings.length; i++) {
-            const b: DestructureBinding = node.bindings[i];
-            mut nb: DestructureBinding = DestructureBinding::new(
-                b.source_field, b.local_name, b.is_mutable, b.span, b.name_span);
-            nb.sym_id = b.sym_id;
-            nb.resolved_type = b.resolved_type;
-            nb.field_index = b.field_index;
-            c.add_binding(nb);
-        }
-        c.resolved_type = node.resolved_type;
-        if (node.has_type_annotation()) {
-            c.set_type_annotation(this.clone_type_annotation(node.type_annotation));
-        }
-        if (node.has_initializer()) {
-            c.set_initializer(this.clone_expr(node.initializer));
-        }
-        this.result = c;
-    }
-
-    override visit(node: FunctionDeclNode*) -> void {
-        const name: SymbolStr = this.consume_spec_name(node.name);
-        const skip_gp: boolean = this.consume_skip_generics();
-        mut c: FunctionDeclNode* = new FunctionDeclNode(name, node.span);
-        this.copy_decl_base(node, c);
-        c.is_public   = node.is_public;
-        c.is_static   = node.is_static;
-        c.is_async    = node.is_async;
-        c.is_inline   = node.is_inline;
-        c.is_noinline = node.is_noinline;
-        c.is_caller_located = node.is_caller_located;
-        c.is_variadic = node.is_variadic;
-        c.is_synthesized_body = node.is_synthesized_body;
-        c.is_synth_default = node.is_synth_default;
-        c.is_intrinsic = node.is_intrinsic;
-        c.is_self_returning_default = node.is_self_returning_default;
-        c.is_lazy_self_growing = node.is_lazy_self_growing;
-        c.link_name     = node.link_name;
-        c.has_link_name = node.has_link_name;
-        // Preserve the originating trait so a SPECIALIZED generic trait
-        // method (e.g. `Str::Debug::fmt<String>` cloned from `fmt<W>`)
-        // mangles with its trait and doesn't collide with the same-named
-        // method of another trait on the same type (`Str::Display::fmt`).
-        // Without this the two specs share one symbol and dispatch silently
-        // resolves to whichever was emitted, breaking Debug.
-        c.set_origin_trait(node.origin_trait);
-        c.set_async_fut_slot(node.async_fut_slot);
-        // A copy stands for the definition its source is, or for the one
-        // its source already stood for.
-        c.copy_of = if (node.def.is_valid()) { node.def } else { node.copy_of };
-        for (mut i: i64 = 0; i < node.parameters.length; i++) {
-            c.add_parameter(this.clone_var_decl(node.parameters[i]));
-        }
-        if (!skip_gp) {
-            for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-                c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
-            }
-        }
-        // A copy owns its bounds as it owns its parameters: a bound's
-        // projection subject caches what it resolved to in its own
-        // signature's context, which is not the source's.
-        for (mut i: i64 = 0; i < node.trait_bounds.length; i++) {
-            c.add_trait_bound(node.trait_bounds[i].clone());
-        }
-        if (node.return_type_annotation != null) {
-            c.set_return_type_annotation(this.clone_type_annotation(node.return_type_annotation));
-        }
-        if (node.has_body()) {
-            node.body.accept(this);
-            c.set_body(this.result as BlockStmtNode*);
-        }
-        this.result = c;
-    }
-
-    override visit(node: MethodNode*) -> void {
-        const cloned_func: FunctionDeclNode* = this.clone_func_decl(node.func);
-        mut c: MethodNode* = new MethodNode(cloned_func, node.span);
-        this.copy_decl_base(node, c);
+    /// The payload of a method's copy; the generic method it specializes is
+    /// not carried (a copy is the same method, not an instance of it).
+    copy_method(mut &this, node: MethodDecl*) -> MethodDecl* {
+        mut c: MethodDecl* = MethodDecl::new(this.clone_func_decl(node.func));
         c.visibility            = node.visibility;
-        c.is_constructor        = node.is_constructor;
-        c.is_destructor         = node.is_destructor;
         c.is_static             = node.is_static;
-        c.is_default_destructor = node.is_default_destructor;
-        c.is_virtual            = node.is_virtual;
-        c.is_override           = node.is_override;
         // `![sink]` must survive monomorphization: a cloned generic method
         // (e.g. Option<T>::unwrap specialized for a concrete T) still
         // consumes its receiver, and drop-insertion relies on this flag to
         // suppress the receiver's scope-exit drop (otherwise glue would
         // double-free a payload the method copied out).
         c.is_sink               = node.is_sink;
-        c.base_ctor_name        = node.base_ctor_name;
-        mut cloned_args: [ExpressionNode*] = [];
-        for (mut i: i64 = 0; i < node.base_ctor_args.length; i++) {
-            cloned_args.push(this.clone_expr(node.base_ctor_args[i]));
-        }
-        c.base_ctor_args = cloned_args;
-        this.result = c;
+        return c;
     }
 
-    override visit(node: IntrinsicDeclNode*) -> void {
-        mut c: IntrinsicDeclNode* = new IntrinsicDeclNode(node.name, node.span);
-        this.copy_decl_base(node, c);
-        for (mut i: i64 = 0; i < node.parameters.length; i++) {
-            c.add_parameter(this.clone_var_decl(node.parameters[i]));
-        }
-        if (node.has_body()) {
-            node.body.accept(this);
-            c.set_body(this.result as BlockStmtNode*);
-        }
-        // resolved_return_type left as TypeRef::invalid() (constructor default)
-        this.result = c;
-    }
-
-    override visit(node: IntrinsicConstDeclNode*) -> void {
-        mut c: IntrinsicConstDeclNode* = new IntrinsicConstDeclNode(node.name, node.span);
-        this.copy_decl_base(node, c);
-        if (node.type_annotation != null) {
-            c.type_annotation = node.type_annotation.clone();
-        }
-        // resolved_type left as TypeRef::invalid() (constructor default)
-        c.def = node.def;
-        this.result = c;
-    }
-
-    override visit(node: ImportDeclNode*) -> void {
-        mut c: ImportDeclNode* = new ImportDeclNode(node.module_path, node.style, node.span);
-        this.copy_decl_base(node, c);
-        c.alias = node.alias;
-        c.specific_imports = node.specific_imports;
-        c.specific_aliases = node.specific_aliases;
-        c.specific_spans = node.specific_spans;
-        c.specific_alias_spans = node.specific_alias_spans;
-        c.specific_defs = node.specific_defs;
-        c.specific_def_entries = node.specific_def_entries;
-        c.is_export = node.is_export;
-        c.path_entry = node.path_entry;
-        c.resolved_module = node.resolved_module;
-        this.result = c;
-    }
-
-    override visit(node: ModuleDeclNode*) -> void {
-        mut c: ModuleDeclNode* = new ModuleDeclNode(node.path, node.is_public, node.span);
-        this.copy_decl_base(node, c);
-        this.result = c;
-    }
-
-    override visit(node: StructDeclNode*) -> void {
-        const name: SymbolStr = this.consume_spec_name(node.name);
-        const skip_gp: boolean = this.consume_skip_generics();
-        mut c: StructDeclNode* = new StructDeclNode(name, node.span);
-        this.copy_decl_base(node, c);
-        // Carry `![repr(...)]` / `![align]` onto the specialization so the
-        // monomorphizer can stamp the chosen layout on the concrete type
-        // (DirectiveProcessing runs before mono and never sees specialized
-        // decls). copy_decl_base only copies the raw directive nodes, not
-        // these resolved flags.
-        c.repr_c           = node.repr_c;
-        c.repr_packed      = node.repr_packed;
-        c.repr_transparent = node.repr_transparent;
-        c.min_alignment    = node.min_alignment;
-        c.async_recv_slot  = node.async_recv_slot;
-        c.is_public        = node.is_public;
-        c.where_bounds     = node.where_bounds;
-        if (!skip_gp) {
-            for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-                c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
+    /// The copy of declaration `node`, made for its kind; the copy is marked
+    /// generated only by `clone_decl`.
+    copy_decl(mut &this, node: DeclarationNode*) -> DeclarationNode* {
+        const kind: DeclKind = match (node.kind) {
+            DeclKind::Destructure(n) => {
+                const c: DestructureDecl* = DestructureDecl::new();
+                c.is_mutable = n.is_mutable;
+                for (mut i: i64 = 0; i < n.bindings.length; i++) {
+                    const b: DestructureBinding = n.bindings[i];
+                    mut nb: DestructureBinding = DestructureBinding::new(
+                        b.source_field, b.local_name, b.is_mutable, b.span, b.name_span);
+                    nb.sym_id = b.sym_id;
+                    nb.resolved_type = b.resolved_type;
+                    nb.field_index = b.field_index;
+                    c.bindings.push(nb);
+                }
+                c.resolved_type = n.resolved_type;
+                if (n.type_annotation != null) {
+                    c.type_annotation = this.clone_type_annotation(n.type_annotation);
+                }
+                if (n.initializer != null) {
+                    c.initializer = this.clone_expr(n.initializer);
+                }
+                DeclKind::Destructure(c)
             }
-        }
-        for (mut i: i64 = 0; i < node.fields.length; i++) {
-            c.add_field(this.clone_field_decl(node.fields[i]));
-        }
-        for (mut i: i64 = 0; i < node.methods.length; i++) {
-            node.methods[i].accept(this);
-            c.add_method(this.result as MethodNode*);
-        }
-        // Bindgen-only blob accessors (shallow: shares the value_type annotation
-        // pointers, as elsewhere in cloning).  Empty for every parser-produced
-        // struct, so this is a no-op outside the C-import path.
-        for (mut i: i64 = 0; i < node.binding_accessors.length; i++) {
-            c.add_accessor(node.binding_accessors[i]);
-        }
-        this.result = c;
-    }
-
-    override visit(node: UnionDeclNode*) -> void {
-        const name: SymbolStr = this.consume_spec_name(node.name);
-        const skip_gp: boolean = this.consume_skip_generics();
-        mut c: UnionDeclNode* = new UnionDeclNode(name, node.span);
-        this.copy_decl_base(node, c);
-        // See StructDeclNode clone: carry layout flags onto the spec so the
-        // monomorphizer can stamp the chosen layout on the concrete type.
-        c.repr_c            = node.repr_c;
-        c.repr_packed       = node.repr_packed;
-        c.repr_transparent  = node.repr_transparent;
-        c.min_alignment     = node.min_alignment;
-        c.is_public         = node.is_public;
-        c.where_bounds      = node.where_bounds;
-        c.binding_namespace = node.binding_namespace;
-        if (!skip_gp) {
-            for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-                c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
+            DeclKind::Enum(n) => {
+                const c: EnumDecl* = EnumDecl::new(this.consume_spec_name(n.name));
+                const skip_gp: boolean = this.consume_skip_generics();
+                // The definition is stamped on the copy by whoever places it;
+                // the binding namespace is left as `new` leaves it.
+                c.repr_c        = n.repr_c;
+                c.min_alignment = n.min_alignment;
+                c.is_public     = n.is_public;
+                c.where_bounds  = n.where_bounds;
+                if (!skip_gp) {
+                    for (mut i: i64 = 0; i < n.generic_params.length; i++) {
+                        c.generic_params.push(this.copy_decl(n.generic_params[i]));
+                    }
+                }
+                if (n.discriminant_annotation != null) {
+                    c.discriminant_annotation = this.clone_type_annotation(n.discriminant_annotation);
+                }
+                for (mut i: i64 = 0; i < n.variants.length; i++) {
+                    c.variants.push(this.copy_decl(n.variants[i]));
+                }
+                DeclKind::Enum(c)
             }
-        }
-        for (mut i: i64 = 0; i < node.fields.length; i++) {
-            c.add_field(this.clone_field_decl(node.fields[i]));
-        }
-        for (mut i: i64 = 0; i < node.methods.length; i++) {
-            node.methods[i].accept(this);
-            c.add_method(this.result as MethodNode*);
-        }
-        this.result = c;
-    }
-
-    override visit(node: ClassDeclNode*) -> void {
-        const name: SymbolStr = this.consume_spec_name(node.name);
-        const skip_gp: boolean = this.consume_skip_generics();
-        mut c: ClassDeclNode* = new ClassDeclNode(name, node.span);
-        this.copy_decl_base(node, c);
-        // See StructDeclNode clone: carry layout flags onto the spec.
-        c.repr_c           = node.repr_c;
-        c.repr_packed      = node.repr_packed;
-        c.repr_transparent = node.repr_transparent;
-        c.min_alignment    = node.min_alignment;
-        c.is_public        = node.is_public;
-        c.where_bounds     = node.where_bounds;
-        c.base_class = node.base_class;
-        c.base_res   = node.base_res;
-        c.base_span  = node.base_span;
-        if (!skip_gp) {
-            for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-                c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
+            DeclKind::Trait(n) => {
+                // The name, parameters, methods, supertraits and the name
+                // layer's symbol; the associated types and the definition are
+                // left as `new` leaves them.
+                const c: TraitDecl* = TraitDecl::new(n.name);
+                for (mut i: i64 = 0; i < n.generic_params.length; i++) {
+                    c.generic_params.push(this.copy_decl(n.generic_params[i]));
+                }
+                for (mut i: i64 = 0; i < n.methods.length; i++) {
+                    c.methods.push(this.clone_func_decl(n.methods[i]));
+                }
+                for (mut i: i64 = 0; i < n.base_traits.length; i++) {
+                    c.base_traits.push(n.base_traits[i].clone());
+                }
+                c.sym_id = n.sym_id;
+                DeclKind::Trait(c)
             }
-        }
-        for (mut i: i64 = 0; i < node.fields.length; i++) {
-            c.add_field(this.clone_field_decl(node.fields[i]));
-        }
-        for (mut i: i64 = 0; i < node.methods.length; i++) {
-            node.methods[i].accept(this);
-            c.add_method(this.result as MethodNode*);
-        }
-        this.result = c;
-    }
-
-    override visit(node: TraitDeclNode*) -> void {
-        mut c: TraitDeclNode* = new TraitDeclNode(node.name, node.span);
-        this.copy_decl_base(node, c);
-        for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-            c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
-        }
-        for (mut i: i64 = 0; i < node.methods.length; i++) {
-            c.add_method(this.clone_func_decl(node.methods[i]));
-        }
-        for (mut i: i64 = 0; i < node.base_traits.length; i++) {
-            c.add_base_trait(node.base_traits[i].clone());
-        }
-        c.sym_id      = node.sym_id;
-        this.result = c;
-    }
-
-    override visit(node: TypeAliasDeclNode*) -> void {
-        mut c: TypeAliasDeclNode* = new TypeAliasDeclNode(node.alias_name, node.span);
-        this.copy_decl_base(node, c);
-        for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-            c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
-        }
-        if (node.target_annotation != null) {
-            c.set_target_annotation(this.clone_type_annotation(node.target_annotation));
-        }
-        // resolved_target left as TypeRef::invalid() (constructor default)
-        this.result = c;
-    }
-
-    override visit(node: EnumDeclNode*) -> void {
-        const name: SymbolStr = this.consume_spec_name(node.name);
-        const skip_gp: boolean = this.consume_skip_generics();
-        mut c: EnumDeclNode* = new EnumDeclNode(name, node.span);
-        this.copy_decl_base(node, c);
-        // See StructDeclNode clone: carry layout flags onto the spec.
-        c.repr_c        = node.repr_c;
-        c.min_alignment = node.min_alignment;
-        c.is_public     = node.is_public;
-        c.where_bounds  = node.where_bounds;
-        if (!skip_gp) {
-            for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-                c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
+            DeclKind::Extern(n) => {
+                // Only the linkage and the functions are copied.
+                const c: ExternBlock* = ExternBlock::new(n.linkage_type);
+                for (mut i: i64 = 0; i < n.functions.length; i++) {
+                    c.add_function(this.clone_func_decl(n.functions[i]));
+                }
+                DeclKind::Extern(c)
             }
-        }
-        if (node.discriminant_annotation != null) {
-            c.set_discriminant_annotation(this.clone_type_annotation(node.discriminant_annotation));
-        }
-        for (mut i: i64 = 0; i < node.variants.length; i++) {
-            c.add_variant(this.clone_enum_variant(node.variants[i]));
-        }
-        this.result = c;
-    }
-
-    override visit(node: EnumVariantNode*) -> void {
-        mut c: EnumVariantNode* = this.clone_enum_variant(node);
-        this.result = c;
-    }
-
-    override visit(node: ImplBlockNode*) -> void {
-        mut c: ImplBlockNode* = new ImplBlockNode(node.target_type, node.span);
+            DeclKind::Field(n) => {
+                const c: FieldDecl* = FieldDecl::new(n.name);
+                c.visibility = n.visibility;
+                if (n.has_default_value()) {
+                    c.default_value = this.clone_expr(n.default_value);
+                }
+                if (n.has_type_annotation()) {
+                    c.type_annotation = this.clone_type_annotation(n.type_annotation);
+                }
+                // resolved_type left invalid, as `new` leaves it
+                DeclKind::Field(c)
+            }
+            DeclKind::GenericParam(n) => {
+                const c: GenericParamDecl* = GenericParamDecl::new(n.name);
+                // The template's symbol, as every `Res` in the body is the template's.
+                c.sym_id = n.sym_id;
+                if (n.default_annotation != null) {
+                    c.default_annotation = this.clone_type_annotation(n.default_annotation);
+                }
+                DeclKind::GenericParam(c)
+            }
+            DeclKind::Import(n) => {
+                // The path segments and private export entries are not copied.
+                const c: ImportDecl* = ImportDecl::new(n.module_path, n.style);
+                c.alias = n.alias;
+                c.specific_imports = n.specific_imports;
+                c.specific_aliases = n.specific_aliases;
+                c.specific_spans = n.specific_spans;
+                c.specific_alias_spans = n.specific_alias_spans;
+                c.specific_defs = n.specific_defs;
+                c.specific_def_entries = n.specific_def_entries;
+                c.is_export = n.is_export;
+                c.path_entry = n.path_entry;
+                c.resolved_module = n.resolved_module;
+                DeclKind::Import(c)
+            }
+            DeclKind::Intrinsic(n) => {
+                // Neither the definition, the return type nor `is_variadic`
+                // is copied; resolved_return_type left invalid, as `new`
+                // leaves it.
+                const ic: IntrinsicDecl* = IntrinsicDecl::new(n.name);
+                for (mut i: i64 = 0; i < n.parameters.length; i++) {
+                    ic.parameters.push(this.clone_var_decl(n.parameters[i]));
+                }
+                if (n.body != null) {
+                    ic.body = this.copy_stmt(n.body);
+                }
+                DeclKind::Intrinsic(ic)
+            }
+            DeclKind::Module(n) => { DeclKind::Module(ModuleDecl::new(n.path, n.is_public)) }
+            DeclKind::TypeAlias(n) => {
+                // The definition is stamped on the copy by whoever places it;
+                // the binding namespace and the resolved target are left as
+                // `new` leaves them.
+                const c: TypeAliasDecl* = TypeAliasDecl::new(n.alias_name);
+                for (mut i: i64 = 0; i < n.generic_params.length; i++) {
+                    c.generic_params.push(this.copy_decl(n.generic_params[i]));
+                }
+                if (n.target_annotation != null) {
+                    c.target_annotation = this.clone_type_annotation(n.target_annotation);
+                }
+                DeclKind::TypeAlias(c)
+            }
+            DeclKind::Union(n) => {
+                const c: UnionDecl* = UnionDecl::new(this.consume_spec_name(n.name));
+                const skip_gp: boolean = this.consume_skip_generics();
+                // See StructDecl clone: carry layout flags onto the spec so the
+                // monomorphizer can stamp the chosen layout on the concrete type.
+                // The definition is stamped on the copy by whoever places it.
+                c.repr_c            = n.repr_c;
+                c.repr_packed       = n.repr_packed;
+                c.repr_transparent  = n.repr_transparent;
+                c.min_alignment     = n.min_alignment;
+                c.is_public         = n.is_public;
+                c.where_bounds      = n.where_bounds;
+                c.binding_namespace = n.binding_namespace;
+                if (!skip_gp) {
+                    for (mut i: i64 = 0; i < n.generic_params.length; i++) {
+                        c.generic_params.push(this.copy_decl(n.generic_params[i]));
+                    }
+                }
+                for (mut i: i64 = 0; i < n.fields.length; i++) {
+                    c.fields.push(this.copy_decl(n.fields[i]));
+                }
+                for (mut i: i64 = 0; i < n.methods.length; i++) {
+                    c.methods.push(this.copy_method(n.methods[i]));
+                }
+                DeclKind::Union(c)
+            }
+            DeclKind::Struct(n) => {
+                const c: StructDecl* = StructDecl::new(this.consume_spec_name(n.name));
+                const skip_gp: boolean = this.consume_skip_generics();
+                // Carry `![repr(...)]` / `![align]` onto the specialization so the
+                // monomorphizer can stamp the chosen layout on the concrete type
+                // (DirectiveProcessing runs before mono and never sees specialized
+                // decls); `copy_decl_base` copies only the raw directive nodes.
+                // The definition is stamped on the copy by whoever places it.
+                c.repr_c           = n.repr_c;
+                c.repr_packed      = n.repr_packed;
+                c.repr_transparent = n.repr_transparent;
+                c.min_alignment    = n.min_alignment;
+                c.async_recv_slot  = n.async_recv_slot;
+                c.is_public        = n.is_public;
+                c.where_bounds     = n.where_bounds;
+                c.binding_namespace = n.binding_namespace;
+                if (!skip_gp) {
+                    for (mut i: i64 = 0; i < n.generic_params.length; i++) {
+                        c.generic_params.push(this.copy_decl(n.generic_params[i]));
+                    }
+                }
+                for (mut i: i64 = 0; i < n.fields.length; i++) {
+                    c.fields.push(this.copy_decl(n.fields[i]));
+                }
+                for (mut i: i64 = 0; i < n.methods.length; i++) {
+                    c.methods.push(this.copy_method(n.methods[i]));
+                }
+                // Bindgen-only blob accessors (shallow: shares the value_type
+                // annotation pointers, as elsewhere in cloning).  Empty for every
+                // parser-produced struct.
+                for (mut i: i64 = 0; i < n.binding_accessors.length; i++) {
+                    c.binding_accessors.push(n.binding_accessors[i]);
+                }
+                DeclKind::Struct(c)
+            }
+            DeclKind::Impl(n) => {
+                const c: ImplBlock* = ImplBlock::new(n.target_type);
+                for (mut i: i64 = 0; i < n.generic_params.length; i++) {
+                    c.generic_params.push(this.copy_decl(n.generic_params[i]));
+                }
+                if (n.trait_annotation != null) {
+                    c.trait_annotation = this.clone_type_annotation(n.trait_annotation);
+                }
+                c.target_args = this.clone_type_annotations(n.target_args);
+                mut tats: [TypeRef] = [];
+                for (mut i: i64 = 0; i < n.trait_arg_types.length; i++) { tats.push(n.trait_arg_types[i]); }
+                c.trait_arg_types = tats;
+                // where_bounds: shallow array copy. TraitBound entries are not
+                // mutated post-construction (parser fills them, sema reads
+                // them), so the inner trait_refs arrays can be shared safely.
+                c.where_bounds = n.where_bounds;
+                // `target_type_span` is deliberately NOT copied.
+                // `trait_def` IS copied: specializing an impl rewrites which
+                // type it is for, never which trait it provides, so the
+                // template's trait identity is the clone's.
+                c.trait_def = n.trait_def;
+                // `res` is NOT copied: a specialization rebinds WHICH type the
+                // head is for, and the stamp names the template's definition.
+                // A clone whose `target_type` the monomorphizer rewrote to the
+                // spec would otherwise carry a stamp naming the generic base
+                // beside a spelling naming the instantiation, and a consumer
+                // reading the stamp would bind the head to the template.  Left
+                // unanswered, the spelling stays the single carrier of which
+                // specialization the clone is for.
+                // Associated-type bindings (`type Item = T;` / positional-header
+                // desugar) and monomorphizer-recovered derived element
+                // bindings are how `This::Item` projections and self-returning
+                // default methods resolve concretely; without them an
+                // eager-specialized generic-trait impl's projections fail
+                // (E0636).  The annotations are owning pointers, so deep-clone
+                // them (no aliasing).
+                for (mut i: i64 = 0; i < n.derived_param_names.length; i++) {
+                    c.add_derived_param(n.derived_param_syms[i], n.derived_param_names[i],
+                                        n.derived_param_types[i]);
+                }
+                for (mut i: i64 = 0; i < n.assoc_binding_names.length; i++) {
+                    c.assoc_binding_names.push(n.assoc_binding_names[i]);
+                    c.assoc_binding_slots.push(n.assoc_binding_slots[i]);
+                    c.assoc_binding_annotations.push(this.clone_type_annotation(n.assoc_binding_annotations[i]));
+                }
+                for (mut i: i64 = 0; i < n.methods.length; i++) {
+                    c.methods.push(this.copy_method(n.methods[i]));
+                }
+                DeclKind::Impl(c)
+            }
+            DeclKind::Variant(n) => {
+                const c: EnumVariant* = EnumVariant::new(n.name);
+                // Deep-clone type annotations (not shallow copy)
+                for (mut i: i64 = 0; i < n.associated_types.length; i++) {
+                    c.associated_types.push(this.clone_type_annotation(n.associated_types[i]));
+                }
+                c.explicit_value = n.explicit_value;
+                c.has_value      = n.has_value;
+                DeclKind::Variant(c)
+            }
+            DeclKind::Function(n) => {
+                // A specialization's copy is named for its instance and drops
+                // the parameters it is specialized over.
+                const name: SymbolStr = this.consume_spec_name(n.name);
+                const skip_gp: boolean = this.consume_skip_generics();
+                DeclKind::Function(this.copy_function(n, name, skip_gp))
+            }
+            DeclKind::Method(n) => { DeclKind::Method(this.copy_method(n)) }
+            DeclKind::Variable(n) => {
+                const c: VarDecl* = this.copy_var(n);
+                // A local declaration's decided type is carried, and a copy's
+                // substitution rewrites it.  Only here: a parameter's type is
+                // the copy's signature, which monomorphization builds itself
+                // (`clone_var_decl`).
+                c.resolved_type = n.resolved_type;
+                DeclKind::Variable(c)
+            }
+        };
+        const c: DeclarationNode* = DeclarationNode::of(kind, node.span);
         this.copy_decl_base(node, c);
-        for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-            c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
-        }
-        if (node.trait_annotation != null) {
-            c.set_trait_annotation(this.clone_type_annotation(node.trait_annotation));
-        }
-        c.set_target_args(this.clone_type_annotations(node.target_args));
-        mut tats: [TypeRef] = [];
-        for (mut i: i64 = 0; i < node.trait_arg_types.length; i++) { tats.push(node.trait_arg_types[i]); }
-        c.trait_arg_types = tats;
-        // where_bounds: shallow array copy. TraitBound entries are not mutated
-        // post-construction (parser fills them, sema reads them), so the inner
-        // trait_refs arrays can be shared safely.
-        c.where_bounds = node.where_bounds;
-        // `target_type_span` is deliberately NOT copied.
-        // `trait_def` IS copied: specializing an impl rewrites
-        // which type it is for, never which trait it provides, so the
-        // template's trait identity is the clone's.
-        c.trait_def = node.trait_def;
-        // `res` is NOT copied:
-        // a specialization rebinds WHICH type the head is for, and the stamp
-        // names the template's definition.  A clone whose `target_type` the
-        // monomorphizer rewrote to the spec would otherwise carry a stamp
-        // naming the generic base beside a spelling naming the instantiation,
-        // and a consumer reading the stamp would bind the head to the template.
-        // Left unanswered, the spelling stays the single carrier of which
-        // specialization the clone is for.
-        // Associated-type bindings (`type Item = T;` / positional-header
-        // desugar) and monomorphizer-recovered derived element bindings. These
-        // are how `This::Item` projections and self-returning default methods
-        // resolve concretely. Omitting them left eager-specialized generic-trait
-        // impls with empty bindings -> E0636-class projection failures. The
-        // annotations are owning pointers, so deep-clone them (no aliasing).
-        for (mut i: i64 = 0; i < node.derived_param_names.length; i++) {
-            c.add_derived_param(node.derived_param_syms[i], node.derived_param_names[i],
-                                node.derived_param_types[i]);
-        }
-        for (mut i: i64 = 0; i < node.assoc_binding_names.length; i++) {
-            c.assoc_binding_names.push(node.assoc_binding_names[i]);
-            c.assoc_binding_slots.push(node.assoc_binding_slots[i]);
-            c.assoc_binding_annotations.push(this.clone_type_annotation(node.assoc_binding_annotations[i]));
-        }
-        for (mut i: i64 = 0; i < node.methods.length; i++) {
-            node.methods[i].accept(this);
-            c.add_method(this.result as MethodNode*);
-        }
-        this.result = c;
-    }
-
-    override visit(node: ExternBlockNode*) -> void {
-        mut c: ExternBlockNode* = new ExternBlockNode(node.linkage_type, node.span);
-        this.copy_decl_base(node, c);
-        for (mut i: i64 = 0; i < node.functions.length; i++) {
-            c.add_function(this.clone_func_decl(node.functions[i]));
-        }
-        this.result = c;
-    }
-
-    override visit(node: FieldDeclNode*) -> void {
-        const c: FieldDeclNode* = this.clone_field_decl(node);
-        this.result = c;
-    }
-
-    override visit(node: GenericParamNode*) -> void {
-        const c: GenericParamNode* = this.clone_generic_param(node);
-        this.result = c;
+        return c;
     }
 
 
     // Other visitors
 
-    override visit(node: ProgramNode*) -> void {
-        mut c: ProgramNode* = new ProgramNode(node.span);
+    clone_program(mut &this, node: ProgramNode*) -> ProgramNode* {
+        mut c: ProgramNode* = ProgramNode::new(node.span);
         c.namespace_name = node.namespace_name;
         for (mut i: i64 = 0; i < node.statements.length; i++) {
             c.add_statement(this.clone_node(node.statements[i]));
         }
         c.has_error = node.has_error;
-        this.result = c;
+        return c;
     }
 
-    override visit(node: MatchArmNode*) -> void {
-        const c: MatchArmNode* = this.clone_match_arm(node);
-        this.result = c;
-    }
-
-    override visit(node: PatternNode*) -> void {
-        mut c: PatternNode* = new PatternNode(node.pattern_kind, node.span);
-        c.value        = node.value;
-        c.binding_name = node.binding_name;
-        c.literal_kind = node.literal_kind;
-        c.high_value   = node.high_value;
-        c.const_res    = node.const_res;
-        c.binding_sym  = node.binding_sym;
-        c.has_error    = node.has_error;
-        this.result = c;
-    }
-
-    override visit(node: EnumPatternNode*) -> void {
-        mut c: EnumPatternNode* = new EnumPatternNode(node.span);
-        c.value        = node.value;
-        c.binding_name = node.binding_name;
-        c.literal_kind = node.literal_kind;
-        c.high_value   = node.high_value;
-        c.enum_name       = node.enum_name;
-        c.variant_name    = node.variant_name;
+    /// A copy of the enum pattern `node`.
+    clone_enum_pattern(mut &this, node: EnumPattern*, span: SourceSpan) -> EnumPattern* {
+        mut c: EnumPattern* = EnumPattern::new(node.enum_name, node.variant_name, span);
+        c.enum_span       = node.enum_span;
+        c.variant_span    = node.variant_span;
         c.res             = node.res;
         c.resolved_member = node.resolved_member;
         c.pin_carried     = node.pin_carried;
-        // Deep-clone the elements. A `Sub` element OWNS a nested PatternNode
+        // Deep-clone the elements. A `Sub` element OWNS a nested Pattern
         // that the substituter rewrites in place, so two specializations must
         // not alias it. (Before this, nested patterns like `Some(Some(n))`
         // aliased the template and skipped substitution -> a generic body
@@ -1204,7 +993,7 @@ public:
                         span:    sub.span,
                     };
                     if (sub.pattern != null) {
-                        ns.pattern = this.clone_pattern(sub.pattern as PatternNode*) as void*;
+                        ns.pattern = this.clone_pattern(sub.pattern);
                     }
                     new_elems.push(PatternElement::Sub(ns));
                 }
@@ -1221,35 +1010,40 @@ public:
                 _ => { new_elems.push(el); }
             }
         }
-        c.elements     = new_elems;
-        c.has_error    = node.has_error;
-        this.result = c;
+        c.elements = new_elems;
+        return c;
     }
 
-    override visit(node: DirectiveNode*) -> void {
-        mut c: DirectiveNode* = new DirectiveNode(node.directive_kind, node.span);
+    clone_directive(mut &this, node: DirectiveNode*) -> DirectiveNode* {
+        mut c: DirectiveNode* = DirectiveNode::new(node.directive_kind, node.span);
         // Deep-clone typed args; nested DirectiveNode* references must be
         // cloned recursively so two callers don't alias the same nested call.
         for (mut i: i64 = 0; i < node.args.length; i++) {
             const orig: DirectiveArg = node.args[i];
             mut copy: DirectiveArg = orig;
             if (orig.kind == DirectiveArgKind::Nested && orig.nested != null) {
-                this.visit(orig.nested);
-                copy.nested = this.result as DirectiveNode*;
+                copy.nested = this.clone_directive(orig.nested);
             }
             c.args.push(copy);
         }
         c.has_error = node.has_error;
-        this.result = c;
+        return c;
     }
 
 
     // Typed clone helpers (avoid code duplication)
 
-    /// Clone a VarDeclNode.
-    clone_var_decl(node: VarDeclNode*) -> VarDeclNode* {
-        mut c: VarDeclNode* = new VarDeclNode(node.name, node.span);
+    /// Clone a variable declaration (a parameter, without its decided type).
+    clone_var_decl(mut &this, node: DeclarationNode*) -> DeclarationNode* {
+        const c: DeclarationNode* = DeclarationNode::of(
+            DeclKind::Variable(this.copy_var(DeclarationNode::var_of(node))), node.span);
         this.copy_decl_base(node, c);
+        return c;
+    }
+
+    /// The payload of a variable's copy; its resolved type is left invalid.
+    copy_var(mut &this, node: VarDecl*) -> VarDecl* {
+        mut c: VarDecl* = VarDecl::new(node.name);
         c.is_mutable       = node.is_mutable;
         c.is_auto          = node.is_auto;
         c.is_global        = node.is_global;
@@ -1257,6 +1051,7 @@ public:
         c.is_drop_flag     = node.is_drop_flag;
         c.binding_namespace = node.binding_namespace;
         c.is_thread_local  = node.is_thread_local;
+        c.kw_span          = node.kw_span;
         // Losing these turns an imported global back into one Cryo defines: the
         // clone would be mangled under its module's namespace and emitted with
         // an initializer, so every reader asks the linker for a symbol the C
@@ -1282,16 +1077,27 @@ public:
         return c;
     }
 
-    /// Clone a FunctionDeclNode.
-    clone_func_decl(node: FunctionDeclNode*) -> FunctionDeclNode* {
-        mut c: FunctionDeclNode* = new FunctionDeclNode(node.name, node.span);
-        this.copy_decl_base(node, c);
+    /// Clone a function's declaration as it is: its name, and its generic
+    /// parameters.
+    clone_func_decl(mut &this, node_decl: DeclarationNode*) -> DeclarationNode* {
+        const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
+        const c_decl: DeclarationNode* = DeclarationNode::of(
+            DeclKind::Function(this.copy_function(node, node.name, false)), node_decl.span);
+        this.copy_decl_base(node_decl, c_decl);
+        return c_decl;
+    }
+
+    /// The payload of a function's copy named `name`, with no generic
+    /// parameters when `skip_gp`; its resolved return type is left invalid.
+    copy_function(mut &this, node: FunctionDecl*, name: SymbolStr, skip_gp: boolean) -> FunctionDecl* {
+        mut c: FunctionDecl* = FunctionDecl::new(name);
         c.is_public   = node.is_public;
         c.is_static   = node.is_static;
         c.is_async    = node.is_async;
         c.is_inline   = node.is_inline;
         c.is_noinline = node.is_noinline;
         c.is_caller_located = node.is_caller_located;
+        c.written_in  = node.written_in;
         c.is_variadic = node.is_variadic;
         c.is_synthesized_body = node.is_synthesized_body;
         c.is_synth_default = node.is_synth_default;
@@ -1300,6 +1106,14 @@ public:
         c.is_lazy_self_growing = node.is_lazy_self_growing;
         c.link_name     = node.link_name;
         c.has_link_name = node.has_link_name;
+        // What the function's directives decided: directive processing runs
+        // on the written declaration only, so a copy that lost these would
+        // emit an instance without the linkage, section or frame its
+        // template asked for.
+        c.is_implicit  = node.is_implicit;
+        c.is_weak      = node.is_weak;
+        c.is_naked     = node.is_naked;
+        c.link_section = node.link_section;
         // Preserve the originating trait so a SPECIALIZED generic trait
         // method (e.g. `Str::Debug::fmt<String>` cloned from `fmt<W>`)
         // mangles with its trait and doesn't collide with the same-named
@@ -1314,8 +1128,10 @@ public:
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             c.add_parameter(this.clone_var_decl(node.parameters[i]));
         }
-        for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-            c.add_generic_param(this.clone_generic_param(node.generic_params[i]));
+        if (!skip_gp) {
+            for (mut i: i64 = 0; i < node.generic_params.length; i++) {
+                c.add_generic_param(this.copy_decl(node.generic_params[i]));
+            }
         }
         // A copy owns its bounds as it owns its parameters: a bound's
         // projection subject caches what it resolved to in its own
@@ -1327,70 +1143,40 @@ public:
             c.set_return_type_annotation(this.clone_type_annotation(node.return_type_annotation));
         }
         if (node.has_body()) {
-            node.body.accept(this);
-            c.set_body(this.result as BlockStmtNode*);
+            c.set_body(this.copy_stmt(node.body));
         }
         // resolved_return_type left as TypeRef::invalid() (constructor default)
         return c;
     }
 
-    /// Clone a FieldDeclNode.
-    clone_field_decl(node: FieldDeclNode*) -> FieldDeclNode* {
-        mut c: FieldDeclNode* = new FieldDeclNode(node.name, node.span);
-        this.copy_decl_base(node, c);
-        c.visibility = node.visibility;
-        if (node.has_default_value()) {
-            c.set_default_value(this.clone_expr(node.default_value));
-        }
-        if (node.has_type_annotation()) {
-            c.set_type_annotation(this.clone_type_annotation(node.type_annotation));
-        }
-        // resolved_type left as TypeRef::invalid() (constructor default)
-        return c;
-    }
-
-    /// Clone a GenericParamNode.
-    clone_generic_param(node: GenericParamNode*) -> GenericParamNode* {
-        mut c: GenericParamNode* = new GenericParamNode(node.name, node.span);
-        this.copy_decl_base(node, c);
-        // The template's symbol, as every `Res` in the body is the template's.
-        c.set_sym_id(node.sym_id);
-        if (node.default_annotation != null) {
-            c.set_default_annotation(this.clone_type_annotation(node.default_annotation));
-        }
-        return c;
-    }
-
-    /// Clone an EnumVariantNode.
-    clone_enum_variant(node: EnumVariantNode*) -> EnumVariantNode* {
-        mut c: EnumVariantNode* = new EnumVariantNode(node.name, node.span);
-        this.copy_decl_base(node, c);
-        // Deep-clone type annotations (not shallow copy)
-        for (mut i: i64 = 0; i < node.associated_types.length; i++) {
-            c.add_associated_type(this.clone_type_annotation(node.associated_types[i]));
-        }
-        c.explicit_value   = node.explicit_value;
-        c.has_value        = node.has_value;
-        return c;
-    }
-
     /// Clone a single pattern node.
-    /// Uses an explicit kind check instead of accept() virtual dispatch to
-    /// avoid an overloaded-vtable miscompile (visit(PatternNode*) can be
-    /// called instead of visit(EnumPatternNode*), losing binding data).
-    clone_pattern(pat: PatternNode*) -> PatternNode* {
+    clone_pattern(mut &this, pat: Pattern*) -> Pattern* {
         if (pat == null) { return null; }
-        if (pat.pattern_kind == PatternKind::Enum) {
-            this.visit(pat as EnumPatternNode*);
-        } else {
-            this.visit(pat);
-        }
-        return this.result as PatternNode*;
+        const shape: PatternKind = match (pat.kind) {
+            PatternKind::Wildcard    => { PatternKind::Wildcard }
+            PatternKind::Literal(n)  => { PatternKind::Literal(LiteralPattern::new(n.value, n.literal_kind)) }
+            PatternKind::Range(n)    => { PatternKind::Range(RangePattern::new(n.low, n.high, n.literal_kind)) }
+            PatternKind::Binding(n)  => {
+                // A clone is typed when its own body is checked.
+                mut b: BindingPattern* = BindingPattern::new(n.name);
+                b.binding_sym = n.binding_sym;
+                PatternKind::Binding(b)
+            }
+            PatternKind::Constant(n) => {
+                mut k: ConstantPattern* = ConstantPattern::new(n.name);
+                k.res = n.res;
+                PatternKind::Constant(k)
+            }
+            PatternKind::Enum(n)     => { PatternKind::Enum(this.clone_enum_pattern(n, pat.span)) }
+        };
+        mut c: Pattern* = Pattern::of(shape, pat.span);
+        c.has_error = pat.has_error;
+        return c;
     }
 
     /// Clone a MatchArmNode.
-    clone_match_arm(node: MatchArmNode*) -> MatchArmNode* {
-        mut c: MatchArmNode* = new MatchArmNode(node.span);
+    clone_match_arm(mut &this, node: MatchArmNode*) -> MatchArmNode* {
+        mut c: MatchArmNode* = MatchArmNode::new(node.span);
         for (mut i: i64 = 0; i < node.patterns.length; i++) {
             c.add_pattern(this.clone_pattern(node.patterns[i]));
         }
@@ -1406,8 +1192,8 @@ public:
 
     /// Clone a StaticMatchArmNode (type-pattern(s) + body). An empty
     /// `type_patterns` is the wildcard `_` and clones to an empty list.
-    clone_static_match_arm(node: StaticMatchArmNode*) -> StaticMatchArmNode* {
-        mut c: StaticMatchArmNode* = new StaticMatchArmNode(node.span);
+    clone_static_match_arm(mut &this, node: StaticMatchArmNode*) -> StaticMatchArmNode* {
+        mut c: StaticMatchArmNode* = StaticMatchArmNode::new(node.span);
         for (mut i: i64 = 0; i < node.type_patterns.length; i++) {
             c.add_type_pattern(this.clone_type_annotation(node.type_patterns[i]));
         }
@@ -1442,12 +1228,12 @@ public:
                 continue;
             }
             for (mut p: i64 = 0; p < arm.type_patterns.length; p++) {
-                mut one: StaticMatchArmNode* = new StaticMatchArmNode(arm.span);
+                mut one: StaticMatchArmNode* = StaticMatchArmNode::new(arm.span);
                 one.add_type_pattern(arm.type_patterns[p]);
                 if (p == 0) {
                     one.set_body(arm.body);
                 } else {
-                    mut cloner: ASTCloner = ASTCloner();
+                    mut cloner: ASTCloner = ASTCloner::new();
                     one.set_body(cloner.clone_stmt(arm.body));
                 }
                 one.has_error = arm.has_error;
@@ -1455,9 +1241,5 @@ public:
             }
         }
         return out;
-    }
-
-    override visit(node: StaticMatchArmNode*) -> void {
-        this.result = this.clone_static_match_arm(node) as ASTNode*;
     }
 }

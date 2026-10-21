@@ -12,7 +12,15 @@ For each pin it:
   2. reads the build stamp `cryo stamp` wrote into the binary and asserts its
      `commit` is the sidecar's `git-commit`, so the commit `cryo version`
      reports for a pin is the one its sidecar names,
-  3. (optional, --require-clean) asserts the sidecar recorded `worktree: clean`,
+  3. for a Windows (PE32+) pin based above 4 GiB, asserts the image carries no
+     32-bit (HIGHLOW) base relocation.  Such a field cannot hold an address in
+     that image, so the loader adding the relocation delta to it corrupts
+     whatever it does hold.  A linker that emits one over a thread-local's
+     section-relative offset produces a binary that faults on every
+     thread-local access whenever the image is not loaded at its preferred
+     base - which, under ASLR, is every run - while its sha256 and stamp
+     verify perfectly,
+  4. (optional, --require-clean) asserts the sidecar recorded `worktree: clean`,
      which is what a *release* pin must look like (pins built from a dirty
      worktree are not reproducible from any commit).
 
@@ -124,6 +132,81 @@ def verify_stamp(pin: Path, fields: dict) -> bool:
     return True
 
 
+IMAGE_REL_BASED_HIGHLOW = 3
+BASE_RELOC_DIRECTORY = 5
+
+
+def pe_highlow_relocs(data: bytes):
+    """The RVAs of a PE32+ image's HIGHLOW base relocations when the image is
+    based above 4 GiB; None when the bytes are not such an image.  Raises
+    ValueError on an image whose headers or relocation table do not parse:
+    a pin that cannot be read is not a pin that passed."""
+    if data[:2] != b"MZ":
+        return None
+
+    def u16(at: int) -> int:
+        return int.from_bytes(data[at:at + 2], "little")
+
+    def u32(at: int) -> int:
+        return int.from_bytes(data[at:at + 4], "little")
+
+    pe = u32(0x3C)
+    if data[pe:pe + 4] != b"PE\0\0":
+        raise ValueError("no PE signature")
+    coff = pe + 4
+    sections, opt_size = u16(coff + 2), u16(coff + 16)
+    opt = coff + 20
+    if u16(opt) != 0x20B:
+        return None
+    if int.from_bytes(data[opt + 24:opt + 32], "little") <= 0xFFFFFFFF:
+        return None
+    if u32(opt + 108) <= BASE_RELOC_DIRECTORY:
+        return []
+    rva = u32(opt + 112 + 8 * BASE_RELOC_DIRECTORY)
+    size = u32(opt + 112 + 8 * BASE_RELOC_DIRECTORY + 4)
+    if size == 0:
+        return []
+    table = opt + opt_size
+    start = None
+    for i in range(sections):
+        s = table + 40 * i
+        vsize, va, raw_size, raw_ptr = u32(s + 8), u32(s + 12), u32(s + 16), u32(s + 20)
+        if va <= rva < va + max(vsize, raw_size):
+            start = raw_ptr + rva - va
+            break
+    if start is None or start + size > len(data):
+        raise ValueError("the base relocation table lies outside the image")
+    found = []
+    at, end = start, start + size
+    while at + 8 <= end:
+        page, block = u32(at), u32(at + 4)
+        if block < 8 or at + block > end:
+            raise ValueError("a malformed base relocation block")
+        for entry in range(at + 8, at + block, 2):
+            e = u16(entry)
+            if e >> 12 == IMAGE_REL_BASED_HIGHLOW:
+                found.append(page + (e & 0xFFF))
+        at += block
+    return found
+
+
+def verify_relocations(pin: Path) -> bool:
+    """A 64-bit Windows pin holds no 32-bit base relocation (see check 3)."""
+    try:
+        found = pe_highlow_relocs(pin.read_bytes())
+    except ValueError as e:
+        print(f"  [FAIL] {pin.name}: its PE headers do not parse: {e}")
+        return False
+    if not found:
+        return True
+    print(f"  [FAIL] {pin.name}: {len(found)} 32-bit base relocation(s) in a 64-bit image"
+          f" based above 4 GiB, first at RVA {found[0]:#x}")
+    print("           such a field holds no address; relocating it corrupts it (a")
+    print("           thread-local's offset faults on first use).  Link with a")
+    print("           linker that emits none: the Makefile's WIN_LINK_CC")
+    return False
+
+
 def verify_pair(pins) -> bool:
     """Assert every present pin was built from the same commit.
 
@@ -177,6 +260,9 @@ def verify_one(pin: Path, require_clean: bool) -> tuple[bool, bool]:
         return (True, False)
 
     if not verify_stamp(pin, fields):
+        return (True, False)
+
+    if not verify_relocations(pin):
         return (True, False)
 
     if require_clean:
@@ -233,6 +319,35 @@ def selftest() -> int:
         ("two stamp regions", stamped(commit) + stamped(commit), commit, "clean", False, False),
         ("dirty pin under --require-clean", stamped(commit), commit, "dirty", True, False),
     ]
+    def pe_image(types, base: int) -> bytes:
+        """A PE32+ image: headers, then one section holding one base
+        relocation block with an entry of each type in `types`."""
+        def le(n: int, width: int) -> bytes:
+            return n.to_bytes(width, "little")
+        entries = b"".join(le((t << 12) | (8 * i), 2) for i, t in enumerate(types))
+        block = le(0x1000, 4) + le(8 + len(entries), 4) + entries
+        opt = bytearray(112 + 16 * 8)
+        opt[0:2] = le(0x20B, 2)
+        opt[24:32] = le(base, 8)
+        opt[108:112] = le(16, 4)
+        opt[112 + 8 * BASE_RELOC_DIRECTORY:120 + 8 * BASE_RELOC_DIRECTORY] = le(0x2000, 4) + le(len(block), 4)
+        section = bytearray(40)
+        section[0:6] = b".reloc"
+        section[8:24] = le(len(block), 4) + le(0x2000, 4) + le(len(block), 4) + le(0x200, 4)
+        coff = le(0x8664, 2) + le(1, 2) + bytes(12) + le(len(opt), 2) + bytes(2)
+        head = b"MZ" + bytes(0x3A) + le(0x40, 4) + b"PE\0\0" + coff + bytes(opt) + bytes(section)
+        return head + bytes(0x200 - len(head)) + block
+
+    dir64 = 10
+    pe_cases = [
+        # (name, base relocation entry types, image base, must pass)
+        ("PE32+ with 64-bit base relocations only", [dir64, dir64], 0x140000000, True),
+        ("PE32+ above 4 GiB with a 32-bit base relocation",
+         [dir64, IMAGE_REL_BASED_HIGHLOW], 0x140000000, False),
+        ("PE32+ below 4 GiB with a 32-bit base relocation",
+         [dir64, IMAGE_REL_BASED_HIGHLOW], 0x400000, True),
+    ]
+
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
         for name, data, sidecar_commit, worktree, require_clean, must_pass in cases:
@@ -248,10 +363,17 @@ def selftest() -> int:
         pin.write_bytes(stamped(commit))
         sidecar_path(pin).write_text(f"sha256: {'0' * 64}\ngit-commit: {commit}\n")
         failures += judge("sha256 differs from the sidecar", pin, False, False)
+        # A Windows pin: the same stamp, in a PE32+ image whose base
+        # relocation table holds the given entry types.
+        for name, types, base, must_pass in pe_cases:
+            pin = Path(tmp) / "cryo.exe"
+            pin.write_bytes(pe_image(types, base) + stamped(commit))
+            sidecar_path(pin).write_text(f"sha256: {sha256_of(pin)}\ngit-commit: {commit}\n")
+            failures += judge(name, pin, False, must_pass)
     if failures:
         print(f"verify-pin selftest: FAILED ({failures} case(s) judged wrongly)")
         return 1
-    print(f"verify-pin selftest: OK ({len(cases) + 1} cases)")
+    print(f"verify-pin selftest: OK ({len(cases) + 1 + len(pe_cases)} cases)")
     return 0
 
 

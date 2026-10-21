@@ -2,8 +2,8 @@
 ///
 /// Lvalue / place lowering for member access (`obj.field`), array
 /// access (`arr[i]`), and tuple index (`t.0`).  Each path GEPs into the
-/// container and lands on `state.last_value` with `last_is_lvalue=true`
-/// so the caller can assign through or load from it depending on
+/// container and gives the address as a place (`Emitted::place`), so
+/// the caller can assign through or load from it depending on
 /// context (rvalue users go through `dispatch.codegen_rvalue` which
 /// loads).
 ///
@@ -21,7 +21,7 @@ namespace compiler::codegen::visit::place_emitter;
 import compiler::codegen;
 import compiler::codegen::{ context, llvm, llvm_types, type_map, util };
 import compiler::codegen::state::visitor_state;
-import compiler::codegen::state::visitor_state::{ VisitorState };
+import compiler::codegen::state::visitor_state::{ Emitted, VisitorState };
 import compiler::codegen::visit::expr_dispatch;
 import compiler::codegen::visit::expr_dispatch::{ ExprDispatch };
 import compiler::compilation_context;
@@ -31,15 +31,16 @@ import compiler::diag::{ diagnostic, ErrorCode, source_span };
 import compiler::types;
 import compiler::types::{ arena, compound, type_base, type_ref, TypeKind, user_defined };
 import compiler::ast;
-import compiler::ast::{ expression, LiteralKind, MemberPin, node, NodeKind, visitor };
+import compiler::ast::{ expression, LiteralKind, MemberPin, node };
 import compiler::resolver::{ symbol_str, intern_table };
 import compiler::types::generic;
 import std::fmt;
 import compiler::types::generic::{ InstantiatedType };
 import std::ffi::libc;
-import compiler::ast::expression::{ ArrayAccessNode, LiteralNode };
-import compiler::ast::node::{ ASTNode };
-import compiler::ast::visitor::{ ASTVisitor };
+import compiler::ast::expression::{ ArrayAccessExpr, ExpressionNode, LiteralExpr };
+import compiler::ast::statement::{ Stmt };
+import compiler::codegen::visit::ir_generator;
+import compiler::codegen::visit::ir_generator::{ IRGeneratorVisitor };
 import compiler::codegen::context::{ CodegenContext };
 import compiler::codegen::llvm_types::{ LBasicBlock, LIntPredicate, LType, LTypeKind, LValue };
 import compiler::diag::source_span::{ SourceSpan };
@@ -74,15 +75,16 @@ type struct PlaceEmitter {
 
     // Member access (obj.field)
 
-    /// Generate a GEP to a struct/class field.  The field is the one sema
+    /// Generate a GEP to a struct field.  The field is the one sema
     /// pinned on the node (`pin`, its coordinates in the receiver's type);
     /// `member` is its spelling, for the diagnostic alone, and `pin_carried`
     /// says whether the pin came through a substituted clone rather than from
     /// a walk over the node, which the refusal below names.  `site_span` is
     /// the source span of the access expression in the caller; used only to
     /// attach a source snippet to any diagnostic we emit.
-    codegen_member_access(mut &this, object_ptr: LValue, object_type: TypeRef, object_is_lvalue: boolean, member: SymbolStr, pin: MemberPin, pin_carried: boolean, site_span: SourceSpan) -> void {
-        // Auto-deref: if the object is a pointer/reference (e.g., `node: ExprStmtNode*`
+    codegen_member_access(mut &this, object_ptr: LValue, object_type: TypeRef, object_is_lvalue: boolean, member: SymbolStr, pin: MemberPin, pin_carried: boolean, site_span: SourceSpan) -> Emitted {
+        mut out: Emitted = Emitted::none();
+        // Auto-deref: if the object is a pointer/reference (e.g., `node: ExprStmt*`
         // stored in an alloca), load the pointer value so we can GEP into the struct.
         // `node.field` on a pointer is an implicit
         // deref.  Applied once per call; GEP'd field pointers stay as struct pointers.
@@ -93,10 +95,10 @@ type struct PlaceEmitter {
         // Unwrap InstantiatedType to its concrete resolved form before kind-based
         // dispatch.  Sema does the same in `MemberResolver::field_of`; without this,
         // a `Pair<string>` resolves to an `InstantiatedType` whose kind isn't
-        // Struct/Class/Array, and every field/length access silently returns null.
+        // Struct/Array, and every field/length access silently returns null.
         mut inst_depth: i32 = 0;
         while (t != null && t.kind == TypeKind::InstantiatedType && inst_depth < 5) {
-            const inst: InstantiatedType* = t as InstantiatedType*;
+            const inst: InstantiatedType* = t.as_instantiated();
             if (!inst.has_resolved_type()) { break; }
             obj_type = inst.resolved_type;
             t = this.cg.arena_type(obj_type);
@@ -105,10 +107,10 @@ type struct PlaceEmitter {
 
         if (t != null && (t.kind == TypeKind::Pointer || t.kind == TypeKind::Reference)) {
             if (t.kind == TypeKind::Pointer) {
-                const pt: PointerType* = t as PointerType*;
+                const pt: PointerType* = t.as_pointer();
                 obj_type = pt.pointee;
             } else {
-                const rt: ReferenceType* = t as ReferenceType*;
+                const rt: ReferenceType* = t.as_reference();
                 obj_type = rt.referent;
             }
             t = this.cg.arena_type(obj_type);
@@ -130,12 +132,12 @@ type struct PlaceEmitter {
         // The pointee of a Pointer/Reference may itself be an InstantiatedType
         // (e.g. `HashMapEntry<u32, i64>` sitting in the arena as the pointee of a
         // `HashMapEntry<u32, i64>*`). Mirror the pre-Pointer unwrap above so the
-        // kind dispatch below sees the concrete Struct/Class/Array; without this,
+        // kind dispatch below sees the concrete Struct/Array; without this,
         // field_idx stays -1, the access silently emits no IR, and the
         // half-emitted basic block gets stripped by `is_function_body_valid`.
         mut inst_depth2: i32 = 0;
         while (t != null && t.kind == TypeKind::InstantiatedType && inst_depth2 < 5) {
-            const inst: InstantiatedType* = t as InstantiatedType*;
+            const inst: InstantiatedType* = t.as_instantiated();
             if (!inst.has_resolved_type()) { break; }
             obj_type = inst.resolved_type;
             t = this.cg.arena_type(obj_type);
@@ -143,81 +145,72 @@ type struct PlaceEmitter {
         }
 
         if (t == null) {
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         const tk: TypeKind = t.kind;
         mut field_idx: i64 = -1;
 
         // The field sema pinned: a tuple's element and a struct's field are
-        // their own index; a class member's slot is computed from the
-        // coordinates by the routine the flattened body was built from.
-        // Nothing here searches a field table by the spelling: a node with
-        // no pin is one no sema walk answered, reported as such.
-        mut pin_depth: i64 = -1;
+        // their own index.  Nothing here searches a field table by the
+        // spelling: a node with no pin is one no sema walk answered,
+        // reported as such.
         mut pin_index: i64 = -1;
         match (pin) {
-            MemberPin::Field(d, i) => { pin_depth = d; pin_index = i; }
-            MemberPin::RecvSlot    => {
+            MemberPin::Field(i) => { pin_index = i; }
+            MemberPin::RecvSlot => {
                 if (tk == TypeKind::Struct) {
-                    pin_depth = 0;
-                    pin_index = (t as StructType*).async_recv_slot;
+                    pin_index = t.as_struct().async_recv_slot;
                 }
             }
-            _                      => { }
+            _                   => { }
         }
         if (tk == TypeKind::Tuple) {
-            const tup: TupleType* = t as TupleType*;
-            if (pin_depth == 0 && pin_index >= 0 && pin_index < tup.elements.length) {
+            const tup: TupleType* = t.as_tuple();
+            if (pin_index >= 0 && pin_index < tup.elements.length) {
                 field_idx = pin_index;
             }
         } else if (tk == TypeKind::Struct) {
             // The field-list index; the body element it maps to is computed
             // below, where a padding element may sit before it.
-            const st: StructType* = t as StructType*;
-            if (pin_depth == 0 && pin_index >= 0 && pin_index < st.fields.length) {
+            const st: StructType* = t.as_struct();
+            if (pin_index >= 0 && pin_index < st.fields.length) {
                 field_idx = pin_index;
             }
-        } else if (tk == TypeKind::Class) {
-            // A class body is flattened - vtable slot, then ancestors' fields,
-            // then its own - so a member's slot is not its index in any one
-            // field list; the coordinates are mapped by the routine the body
-            // was built from.
-            field_idx = this.cg.type_mapper.pinned_element_index(t, pin_depth, pin_index);
         } else if (tk == TypeKind::Array) {
             // A fixed array's one member is its length, which is what sema
             // admits on the type: a compile-time constant.
-            const arr_t: ArrayType* = t as ArrayType*;
-            this.state.last_value = LType::const_int(LType::i64(), arr_t.size as u64, false);
-            this.state.last_is_lvalue = false;
-            return;
+            const arr_t: ArrayType* = t.as_array();
+            out.value = LType::const_int(LType::i64(), arr_t.size as u64, false);
+            out.is_lvalue = false;
+            return out;
         }
-        if (tk == TypeKind::Tuple || tk == TypeKind::Struct || tk == TypeKind::Class) {
+        if (tk == TypeKind::Tuple || tk == TypeKind::Struct) {
             if (pin_index < 0) {
                 this.cg.diag.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
                     fmt::format("codegen: member access `%s` on `%s` carries no field pin: no sema walk answered it, and the pass that minted it owes it the answer",
                         this.cg.resolve(member), t.display_name()),
                     site_span);
             } else if (field_idx < 0) {
-                // The pin names coordinates this type does not have.  A pin
-                // that CROSSED a substitution is the shape that can go wrong
-                // here - the coordinates are read off the owner the template
-                // was walked against - so the report says which kind it was
-                // rather than leaving the access to emit no IR at all.
+                // The pin names a field this type does not have.  A pin that
+                // CROSSED a substitution is the shape that can go wrong here
+                // - the index is read off the owner the template was walked
+                // against - so the report says which kind it was rather than
+                // leaving the access to emit no IR at all.
                 this.cg.diag.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
-                    fmt::format("codegen: member access `%s` is pinned at field %d, %d steps up, which `%s` does not have (the pin was %s)",
-                        this.cg.resolve(member), pin_index, pin_depth, t.display_name(),
+                    fmt::format("codegen: member access `%s` is pinned at field %d, which `%s` does not have (the pin was %s)",
+                        this.cg.resolve(member), pin_index, t.display_name(),
                         if (pin_carried) { "carried across a substitution" } else { "written by a sema walk" }),
                     site_span);
             }
         }
 
         if (field_idx < 0) {
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         // Union member access: every field overlaps at offset 0, so the
@@ -226,7 +219,7 @@ type struct PlaceEmitter {
         // the storage blob.  A union returned by value (`f().x`) is first
         // spilled to a temp alloca so we have an address to reinterpret.
         if (tk == TypeKind::Struct) {
-            const ust: StructType* = t as StructType*;
+            const ust: StructType* = t.as_struct();
             if (ust.is_union) {
                 const fld_ty: TypeRef = ust.fields[field_idx].field_type;
                 const fld_lty: LType = this.cg.type_mapper.map_type(fld_ty);
@@ -234,9 +227,9 @@ type struct PlaceEmitter {
                     this.cg.diag.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
                         "codegen: union member access: failed to map member type or null object",
                         site_span);
-                    this.state.last_value = LValue::null();
-                    this.state.last_is_lvalue = false;
-                    return;
+                    out.value = LValue::null();
+                    out.is_lvalue = false;
+                    return out;
                 }
                 mut uptr: LValue = obj_ptr;
                 const u_llvm: void* = llvm::LLVMTypeOf(obj_ptr.raw);
@@ -250,9 +243,9 @@ type struct PlaceEmitter {
                 }
                 const cast: LValue = this.cg.builder.build_bitcast(
                     uptr, LType::pointer_to(fld_lty), "unionfield");
-                this.state.last_value = cast;
-                this.state.last_is_lvalue = true;
-                return;
+                out.value = cast;
+                out.is_lvalue = true;
+                return out;
             }
         }
 
@@ -261,17 +254,17 @@ type struct PlaceEmitter {
             this.cg.diag.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
                 "codegen: member access: failed to map object type to LLVM type",
                 site_span);
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
         if (!obj_ptr.is_valid()) {
             this.cg.diag.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
                 "codegen: member access: object pointer is null",
                 site_span);
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
         // If `obj_ptr` is a struct VALUE (e.g., a direct return from a
         // function call: `f().field`), it isn't a GEP-able address.  Use
@@ -281,8 +274,8 @@ type struct PlaceEmitter {
         const obj_llvm_ty: void* = llvm::LLVMTypeOf(obj_ptr.raw);
         // From here on the index addresses the BODY, not the field list: a
         // struct's fields can be separated by alignment padding elements.  A
-        // class member already arrived as a body slot (see above); a tuple
-        // slot and the dynamic-array header are their own element order.
+        // tuple slot and the dynamic-array header are their own element
+        // order.
         mut elem_idx: i64 = field_idx;
         if (tk == TypeKind::Struct) {
             elem_idx = this.cg.type_mapper.field_element_index(t, field_idx);
@@ -290,21 +283,22 @@ type struct PlaceEmitter {
                 this.cg.diag.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
                     "codegen: member access: field has no slot in the emitted layout",
                     site_span);
-                this.state.last_value = LValue::null();
-                this.state.last_is_lvalue = false;
-                return;
+                out.value = LValue::null();
+                out.is_lvalue = false;
+                return out;
             }
         }
         if (obj_llvm_ty != null && LType::kind_of(obj_llvm_ty) == LTypeKind::Struct) {
-            this.state.last_value = this.cg.builder.build_extract_value(
+            out.value = this.cg.builder.build_extract_value(
                 obj_ptr, elem_idx as u32, "fieldval");
-            this.state.last_is_lvalue = false;
-            return;
+            out.is_lvalue = false;
+            return out;
         }
         const gep: LValue = this.cg.builder.build_struct_gep(struct_ty, obj_ptr,
                                                           elem_idx as u32, "fieldptr");
-        this.state.last_value = gep;
-        this.state.last_is_lvalue = true;
+        out.value = gep;
+        out.is_lvalue = true;
+        return out;
     }
 
     // Array access (arr[i])
@@ -312,12 +306,13 @@ type struct PlaceEmitter {
 
     /// Generate IR for an array indexing operation.
     codegen_array_access(mut &this, array_val: LValue, array_type: TypeRef, array_is_lvalue: boolean, index_val: LValue, site_span: SourceSpan,
-                         visitor: ASTVisitor*, idx_sched: [ASTNode*]*) -> void {
+                         visitor: IRGeneratorVisitor*, idx_sched: [Stmt*]*) -> Emitted {
+        mut out: Emitted = Emitted::none();
         const t: Type* = this.cg.arena_type(array_type);
         if (t == null) {
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         // Reference indexing: `foo[i]` on a `&[T]` means deref-then-index,
@@ -329,20 +324,19 @@ type struct PlaceEmitter {
         // loaded address acts as the array's lvalue.  This is NOT done for raw
         // pointers `T*`, which index as C pointer arithmetic below.
         if (t.kind == TypeKind::Reference) {
-            const rt: ReferenceType* = t as ReferenceType*;
+            const rt: ReferenceType* = t.as_reference();
             if (!array_val.is_valid()) {
-                this.state.last_value = LValue::null();
-                this.state.last_is_lvalue = false;
-                return;
+                out.value = LValue::null();
+                out.is_lvalue = false;
+                return out;
             }
             mut header_ptr: LValue = array_val;
             if (array_is_lvalue) {
                 header_ptr = this.cg.builder.build_load(
                     LType::pointer_to(LType::i8()), array_val, "refderef");
             }
-            this.codegen_array_access(header_ptr, rt.referent, true,
+            return this.codegen_array_access(header_ptr, rt.referent, true,
                                       index_val, site_span, visitor, idx_sched);
-            return;
         }
 
         // Pointer indexing (C-style `ptr[i]` == `*(ptr + i)`).  When
@@ -351,12 +345,12 @@ type struct PlaceEmitter {
         // first.  When false, the pointer value is already in hand
         // (e.g. result of a call returning `T*`) and we GEP directly.
         if (t.kind == TypeKind::Pointer) {
-            const pt: PointerType* = t as PointerType*;
+            const pt: PointerType* = t.as_pointer();
             const elem_ty: LType = this.cg.type_mapper.map_type(pt.pointee);
             if (!elem_ty.is_valid() || !array_val.is_valid() || !index_val.is_valid()) {
-                this.state.last_value = LValue::null();
-                this.state.last_is_lvalue = false;
-                return;
+                out.value = LValue::null();
+                out.is_lvalue = false;
+                return out;
             }
             mut data_ptr: LValue = array_val;
             if (array_is_lvalue) {
@@ -368,9 +362,9 @@ type struct PlaceEmitter {
             slots[0] = index_val.raw;
             const gep: LValue = this.cg.builder.build_gep(elem_ty, data_ptr, buf, 1, "elemptr");
             libc::free(buf);
-            this.state.last_value = gep;
-            this.state.last_is_lvalue = true;
-            return;
+            out.value = gep;
+            out.is_lvalue = true;
+            return out;
         }
 
         // String indexing (`s[i]`): treat the string as `i8*` at the LLVM
@@ -382,9 +376,9 @@ type struct PlaceEmitter {
         // source type to detect this case).
         if (t.kind == TypeKind::String) {
             if (!array_val.is_valid() || !index_val.is_valid()) {
-                this.state.last_value = LValue::null();
-                this.state.last_is_lvalue = false;
-                return;
+                out.value = LValue::null();
+                out.is_lvalue = false;
+                return out;
             }
             const i8_ty: LType = LType::i8();
             mut data_ptr: LValue = array_val;
@@ -397,48 +391,58 @@ type struct PlaceEmitter {
             slots[0] = index_val.raw;
             const byte_ptr: LValue = this.cg.builder.build_gep(i8_ty, data_ptr, buf, 1, "charptr");
             libc::free(buf);
-            this.state.last_value = byte_ptr;
-            this.state.last_is_lvalue = true;
-            return;
+            out.value = byte_ptr;
+            out.is_lvalue = true;
+            return out;
         }
 
         if (t.kind != TypeKind::Array) {
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
-        const arr: ArrayType* = t as ArrayType*;
+        const arr: ArrayType* = t.as_array();
         const elem_ty: LType = this.cg.type_mapper.map_type(arr.element);
         if (!elem_ty.is_valid()) {
             this.cg.diag.emit_error_at_span(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
                 "codegen: array access: failed to map element type",
                 site_span);
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
         if (!array_val.is_valid()) {
             this.cg.diag.emit_error_at_span(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
                 "codegen: array access: array value is null",
                 site_span);
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
         if (!index_val.is_valid()) {
             this.cg.diag.emit_error_at_span(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
                 "codegen: array access: index value is null",
                 site_span);
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+            out.value = LValue::null();
+            out.is_lvalue = false;
+            return out;
         }
 
         // A fixed array: GEP into [N x T], bounds-checked against `N` (a
         // compile-time constant, so an in-range constant index folds away
         // under O2).
         const arr_ty: LType = this.cg.type_mapper.map_type(array_type);
+        // An array held as a value (`pair()[1]`, a call's result) has no
+        // address to index from; it is stored to a temporary first, and the
+        // element is read from there.
+        mut arr_ptr: LValue = array_val;
+        const val_llvm: void* = llvm::LLVMTypeOf(array_val.raw);
+        if (val_llvm != null && LType::kind_of(val_llvm) == LTypeKind::Array) {
+            const cur_fn: LValue = this.cg.builder.get_insert_block().get_parent();
+            arr_ptr = this.cg.flow.create_entry_alloca(cur_fn, "arrval", arr_ty);
+            this.cg.builder.build_store(array_val, arr_ptr);
+        }
         const fx_len: LValue = LType::const_int(LType::i64(), arr.size as u64, false);
         this.emit_bounds_check(index_val, fx_len, visitor, idx_sched, site_span);
         // Build indices: [0, index]
@@ -447,10 +451,11 @@ type struct PlaceEmitter {
         const slots: void** = buf as void**;
         slots[0] = zero.raw;
         slots[1] = index_val.raw;
-        const gep: LValue = this.cg.builder.build_gep(arr_ty, array_val, buf, 2, "elemptr");
+        const gep: LValue = this.cg.builder.build_gep(arr_ty, arr_ptr, buf, 2, "elemptr");
         libc::free(buf);
-        this.state.last_value = gep;
-        this.state.last_is_lvalue = true;
+        out.value = gep;
+        out.is_lvalue = true;
+        return out;
     }
 
     /// Emit an array bounds check: `index >= len` raises through `__cryo_panic`
@@ -462,7 +467,7 @@ type struct PlaceEmitter {
     /// O2, so the guard has no steady-state cost when safety is statically
     /// provable (mirrors `emit_int_div_guard`).
     emit_bounds_check(mut &this, index_val: LValue, len_val: LValue,
-                      visitor: ASTVisitor*, idx_sched: [ASTNode*]*, site_span: SourceSpan) -> void {
+                      visitor: IRGeneratorVisitor*, idx_sched: [Stmt*]*, site_span: SourceSpan) -> void {
         if (!index_val.is_valid() || !len_val.is_valid()) { return; }
         mut idx64: LValue = index_val;
         const idx_ty_raw: void* = llvm::LLVMTypeOf(index_val.raw);
@@ -494,7 +499,7 @@ type struct PlaceEmitter {
 
     // Tuple index (t.N as t[N])
 
-    try_codegen_tuple_index(mut &this, visitor: ASTVisitor*, aa: ArrayAccessNode*) -> boolean {
+    try_codegen_tuple_index(mut &this, visitor: IRGeneratorVisitor*, aa: ArrayAccessExpr*) -> Option<Emitted> {
         // Walk past pointer/reference/instantiation wrappers to find the
         // underlying tuple kind. Mirrors the unwrap chain in
         // codegen_member_access so `(&t)[0]` works the same as `t[0]`.
@@ -503,15 +508,15 @@ type struct PlaceEmitter {
         mut depth: i32 = 0;
         while (walk_t != null && depth < 5) {
             if (walk_t.kind == TypeKind::Pointer) {
-                const pt: PointerType* = walk_t as PointerType*;
+                const pt: PointerType* = walk_t.as_pointer();
                 walk_ty = pt.pointee;
                 walk_t = this.cg.arena_type(walk_ty);
             } else if (walk_t.kind == TypeKind::Reference) {
-                const rt: ReferenceType* = walk_t as ReferenceType*;
+                const rt: ReferenceType* = walk_t.as_reference();
                 walk_ty = rt.referent;
                 walk_t = this.cg.arena_type(walk_ty);
             } else if (walk_t.kind == TypeKind::InstantiatedType) {
-                const it: InstantiatedType* = walk_t as InstantiatedType*;
+                const it: InstantiatedType* = walk_t.as_instantiated();
                 if (!it.has_resolved_type()) { break; }
                 walk_ty = it.resolved_type;
                 walk_t = this.cg.arena_type(walk_ty);
@@ -521,20 +526,19 @@ type struct PlaceEmitter {
             depth += 1;
         }
         if (walk_t == null || walk_t.kind != TypeKind::Tuple) {
-            return false;
+            return Option::None;
         }
 
         // Sema already validated this; the index is an integer literal
         // in bounds. Read the literal value directly off the AST so we
         // can pass it to build_struct_gep.
-        const idx_node: ASTNode* = aa.index as ASTNode*;
-        if (idx_node.kind != NodeKind::Literal) { return false; }
-        const lit: LiteralNode* = aa.index as LiteralNode*;
-        if (lit.literal_kind != LiteralKind::Integer) { return false; }
+        const lit: LiteralExpr* = ExpressionNode::literal_of(aa.index);
+        if (lit == null || lit.literal_kind != LiteralKind::Integer) { return Option::None; }
         const idx: u64 = lit.value.parse_int::<u64>();
 
-        const recv: LValue = this.dispatch.codegen_lvalue(visitor,aa.array);
-        const recv_is_lvalue: boolean = this.state.last_is_lvalue;
+        const recv_e: Emitted = this.dispatch.generate_expression(visitor, aa.array);
+        const recv: LValue = recv_e.value;
+        const recv_is_lvalue: boolean = recv_e.is_lvalue;
         // Auto-deref reference receivers so `&t[0]` GEPs the underlying
         // tuple, not the reference slot.
         mut obj_ptr: LValue = recv;
@@ -548,14 +552,10 @@ type struct PlaceEmitter {
 
         const tup_ty: LType = this.cg.type_mapper.map_type(walk_ty);
         if (!tup_ty.is_valid() || !obj_ptr.is_valid()) {
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return true;
+            return Option::Some(Emitted::none());
         }
         const gep: LValue = this.cg.builder.build_struct_gep(
             tup_ty, obj_ptr, idx as u32, "tupelem");
-        this.state.last_value = gep;
-        this.state.last_is_lvalue = true;
-        return true;
+        return Option::Some(Emitted::place(gep));
     }
 }

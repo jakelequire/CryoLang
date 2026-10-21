@@ -27,10 +27,10 @@ import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, source_span };
 // AST access is otherwise avoided here (see the module doc), but the shared
 // `--panic=unwind` cleanup landing pad must replay drop-call statements via
-// `accept(visitor)`, which needs the node + visitor types.  This is a downward
+// the visitor's dispatch, which needs the node + visitor types.  This is a downward
 // dependency (Codegen already depends on AST), not a cycle.
 import compiler::ast;
-import compiler::ast::{ node, visitor, statement };
+import compiler::ast::{ node, statement };
 import compiler::types;
 import compiler::types::{
     arena, compound, FloatKind, IntegerKind, type_base, type_ref, TypeKind, user_defined
@@ -48,9 +48,8 @@ import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import std::ffi::libc;
 import std::fmt;
-import compiler::ast::node::{ ASTNode };
-import compiler::ast::statement::{ StatementNode };
-import compiler::ast::visitor::{ ASTVisitor };
+import compiler::codegen::visit::ir_generator;
+import compiler::codegen::visit::ir_generator::{ IRGeneratorVisitor };
 import compiler::codegen::abi::{ AbiClassifier, SignaturePlan };
 import compiler::codegen::llvm_types::{
     LBasicBlock, LBuilder, LIntPredicate, LModule, LRealPredicate, LType, LTypeKind,
@@ -73,7 +72,7 @@ import compiler::resolver::res::{ DefId };
 import compiler::decl_index::{ OverloadId };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ ArrayType, PointerType, ReferenceType };
-import compiler::types::type_base::{ FloatType, IntType, Type };
+import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{ EnumType };
 import compiler::resolver::mangled_name::{ MangledName };
@@ -124,7 +123,7 @@ type struct ExprOps {
     /// begin, so CallEmitter truncates them once that call is fully built (the
     /// callee now owns them). Populated only under a hosted unwind build, so the
     /// default abort path allocates nothing and its IR is unchanged.
-    arg_temp_drops:  [ASTNode*];
+    arg_temp_drops:  [Stmt*];
     arg_temp_frames: [i64];
 
     /// Set while a cleanup landing pad replays its drops. The synthesized
@@ -219,9 +218,9 @@ type struct ExprOps {
         if (t == null) { return 0; }
         mut pointee: TypeRef = TypeRef::invalid();
         if (t.kind == TypeKind::Pointer) {
-            pointee = (t as PointerType*).pointee;
+            pointee = t.as_pointer().pointee;
         } else if (t.kind == TypeKind::Reference) {
-            pointee = (t as ReferenceType*).referent;
+            pointee = t.as_reference().referent;
         }
         if (!pointee.is_valid()) { return 0; }
         const pmapped: LType = this.type_mapper.map_type(pointee);
@@ -235,8 +234,8 @@ type struct ExprOps {
         const t: Type* = this.arena_type(ty);
         if (t == null) { return false; }
         if (t.kind != TypeKind::Int) { return false; }
-        const it: IntType* = t as IntType*;
-        return it.int_kind.is_signed();
+        const it: IntegerKind = t.int_kind();
+        return it.is_signed();
     }
 
     intern_str(&this, text: string) -> SymbolStr {
@@ -335,9 +334,9 @@ type struct ExprOps {
         // width (handled in the int<->int block below; the default tag is
         // i32).  ADT enums are structs and fall through to the other paths.
         const from_enum: boolean = from_kind == TypeKind::Enum &&
-                                   (src_type as EnumType*).is_simple_enum();
+                                   src_type.as_enum().is_simple_enum();
         const to_enum: boolean = to_kind == TypeKind::Enum &&
-                                 (dst_type as EnumType*).is_simple_enum();
+                                 dst_type.as_enum().is_simple_enum();
         const from_int: boolean = from_kind == TypeKind::Int || from_kind == TypeKind::Char || from_enum;
         const from_float: boolean = from_kind == TypeKind::Float;
         const to_int: boolean = to_kind == TypeKind::Int || to_kind == TypeKind::Char || to_enum;
@@ -366,9 +365,9 @@ type struct ExprOps {
             mut from_bits: u32 = 0;
             mut signed_src: boolean = false;
             if (from_kind == TypeKind::Int) {
-                const from_it: IntType* = src_type as IntType*;
-                from_bits = from_it.int_kind.bit_width() as u32;
-                signed_src = from_it.int_kind.is_signed();
+                const from_it: IntegerKind = src_type.int_kind();
+                from_bits = from_it.bit_width() as u32;
+                signed_src = from_it.is_signed();
             } else if (from_kind == TypeKind::Char) {
                 from_bits = 32;
                 signed_src = false;
@@ -377,28 +376,28 @@ type struct ExprOps {
                 // (`type enum E : u8` -> 8/unsigned); default tag is i32.
                 from_bits = 32;
                 signed_src = true;
-                const fet: EnumType* = src_type as EnumType*;
+                const fet: EnumType* = src_type.as_enum();
                 if (fet.discriminant_type.is_valid()) {
                     const fdt: Type* = this.arena_type(fet.discriminant_type);
                     if (fdt != null && fdt.kind == TypeKind::Int) {
-                        from_bits = (fdt as IntType*).int_kind.bit_width() as u32;
-                        signed_src = (fdt as IntType*).int_kind.is_signed();
+                        from_bits = fdt.int_kind().bit_width() as u32;
+                        signed_src = fdt.int_kind().is_signed();
                     }
                 }
             }
             mut to_bits: u32 = 0;
             if (to_kind == TypeKind::Int) {
-                const to_it: IntType* = dst_type as IntType*;
-                to_bits = to_it.int_kind.bit_width() as u32;
+                const to_it: IntegerKind = dst_type.int_kind();
+                to_bits = to_it.bit_width() as u32;
             } else if (to_kind == TypeKind::Char) {
                 to_bits = 32;
             } else if (to_enum) {
                 to_bits = 32;
-                const tet: EnumType* = dst_type as EnumType*;
+                const tet: EnumType* = dst_type.as_enum();
                 if (tet.discriminant_type.is_valid()) {
                     const tdt: Type* = this.arena_type(tet.discriminant_type);
                     if (tdt != null && tdt.kind == TypeKind::Int) {
-                        to_bits = (tdt as IntType*).int_kind.bit_width() as u32;
+                        to_bits = tdt.int_kind().bit_width() as u32;
                     }
                 }
             }
@@ -416,10 +415,10 @@ type struct ExprOps {
                 return val;  // Same width, no-op.
             }
         } else if (from_float && to_float) {
-            const from_ft: FloatType* = src_type as FloatType*;
-            const to_ft: FloatType* = dst_type as FloatType*;
-            const from_fk: FloatKind = from_ft.float_kind;
-            const to_fk: FloatKind = to_ft.float_kind;
+            const from_ft: FloatKind = src_type.float_kind();
+            const to_ft: FloatKind = dst_type.float_kind();
+            const from_fk: FloatKind = from_ft;
+            const to_fk: FloatKind = to_ft;
             const from_bits: u64 = from_fk.bit_width();
             const to_bits: u64 = to_fk.bit_width();
             if (from_bits > to_bits) {
@@ -430,16 +429,16 @@ type struct ExprOps {
                 return val;
             }
         } else if (from_int && to_float) {
-            const from_it2: IntType* = src_type as IntType*;
-            const from_ik2: IntegerKind = from_it2.int_kind;
+            const from_it2: IntegerKind = src_type.int_kind();
+            const from_ik2: IntegerKind = from_it2;
             if (from_ik2.is_signed()) {
                 return this.builder.build_si_to_fp(val, dest_ty, "sitofptmp");
             } else {
                 return this.builder.build_ui_to_fp(val, dest_ty, "uitofptmp");
             }
         } else if (from_float && to_int) {
-            const to_it2: IntType* = dst_type as IntType*;
-            const to_ik2: IntegerKind = to_it2.int_kind;
+            const to_it2: IntegerKind = dst_type.int_kind();
+            const to_ik2: IntegerKind = to_it2;
             if (to_ik2.is_signed()) {
                 return this.builder.build_fp_to_si(val, dest_ty, "fptositmp");
             } else {
@@ -621,8 +620,8 @@ type struct ExprOps {
             mut signed_target: boolean = false;
             const ty_t: Type* = this.arena_type(ty);
             if (ty_t != null && ty_t.kind == TypeKind::Int) {
-                const ti: IntType* = ty_t as IntType*;
-                signed_target = ti.int_kind.is_signed();
+                const ti: IntegerKind = ty_t.int_kind();
+                signed_target = ti.is_signed();
             }
             if (signed_target) {
                 return this.builder.build_sext(init_val, llvm_ty, "init.widen");
@@ -654,8 +653,8 @@ type struct ExprOps {
     /// `codegen_call` of `callee`, a function or a pointer to one, passing
     /// arguments and the result the way the function `declared` declares
     /// them: its `sret` and `byval` parameters.  A pointer carries no
-    /// parameter attributes, so a call through one loaded from a vtable
-    /// names the method it stands for here.
+    /// parameter attributes, so a call through a loaded pointer names the
+    /// function it stands for here.
     codegen_call_via(mut &this, callee: LValue, declared: LValue, callee_type: LType,
                      args: [Pair<LValue, TypeRef>], name: string) -> LValue {
         // Phase 1 - sret marshalling.  If the callee was declared with
@@ -1016,8 +1015,8 @@ type struct ExprOps {
                 if (arg_ty_ref.is_valid()) {
                     const at_t: Type* = this.arena_type(arg_ty_ref);
                     if (at_t != null && at_t.kind == TypeKind::Int) {
-                        const it: IntType* = at_t as IntType*;
-                        src_signed = it.int_kind.is_signed();
+                        const it: IntegerKind = at_t.int_kind();
+                        src_signed = it.is_signed();
                     }
                 }
                 if (src_signed) {
@@ -1120,7 +1119,7 @@ type struct ExprOps {
     /// Record a ready-made `<name>.drop()` statement for a live anonymous owning
     /// arg temp (built by CallEmitter, whose name is bound to the temp's slot in
     /// the value table).
-    push_arg_temp_drop(mut &this, stmt: ASTNode*) -> void {
+    push_arg_temp_drop(mut &this, stmt: Stmt*) -> void {
         if (stmt != null) { this.arg_temp_drops.push(stmt); }
     }
 
@@ -1137,13 +1136,13 @@ type struct ExprOps {
     /// live anonymous arg temps (whole stack, most-recent first - at the panic
     /// point the enclosing calls have not run, so this pad is the only one that
     /// frees them), replays the drop schedule (`sched`, innermost-first, each a
-    /// drop-call statement up-cast to `ASTNode*`) via `accept(visitor)`, then
+    /// drop-call statement) through the visitor, then
     /// `resume`s.  Attaches the personality to `cur_fn` (idempotent) and restores
     /// the builder to where it was called from.  `invoke_active` is clear here,
     /// so a drop that itself unwinds propagates without re-entering this pad; the
     /// arg-temp invoke path is suppressed across both replays so a drop-call does
     /// not re-drop the stack.
-    emit_cleanup_landingpad_sched(mut &this, visitor: ASTVisitor*, sched: [ASTNode*]*,
+    emit_cleanup_landingpad_sched(mut &this, visitor: IRGeneratorVisitor*, sched: [Stmt*]*,
                                   cur_fn: LValue, lpad_bb: LBasicBlock) -> void {
         const saved_bb: LBasicBlock = this.builder.get_insert_block();
         const pers: LValue = this.get_or_decl_personality();
@@ -1155,43 +1154,36 @@ type struct ExprOps {
         const saved_suppress: boolean = this.suppress_arg_temp_invoke;
         this.suppress_arg_temp_invoke = true;
         for (mut a: i64 = this.arg_temp_drops.length - 1; a >= 0; a--) {
-            const t: ASTNode* = this.arg_temp_drops[a];
-            if (t != null) { (t as StatementNode*).accept(visitor); }
+            const t: Stmt* = this.arg_temp_drops[a];
+            if (t != null) { visitor.dispatch_node(Node::Stmt(t)); }
         }
         for (mut i: i64 = 0; i < sched.length; i++) {
-            const d: ASTNode* = (*sched)[i];
-            if (d != null) { (d as StatementNode*).accept(visitor); }
+            const d: Stmt* = (*sched)[i];
+            if (d != null) { visitor.dispatch_node(Node::Stmt(d)); }
         }
         this.suppress_arg_temp_invoke = saved_suppress;
         this.builder.build_resume(lp);
         if (saved_bb.is_valid()) { this.builder.position_at_end(saved_bb); }
     }
 
-    /// Emit a diverging raise through `__cryo_panic(msg, file, line)` for a
+    /// Emit a diverging raise through `__cryo_panic(msg, loc)` for a
     /// synthesized check (div-by-zero, non-exhaustive match, `new[]` overflow)
-    /// under `--panic=unwind`.  When the frame has live droppable locals
-    /// (`sched` non-empty) the raise is an `invoke` into a cleanup landing pad
-    /// that drops them before the unwind continues; otherwise a plain `call`.
-    /// Either way it diverges (`unreachable` on the normal edge).  Callers gate
-    /// this on `ctx.options.unwinds()` and keep the `abort` trap on the
-    /// default path, so emitted IR is unchanged there.
-    emit_panic_diverge_cleanup(mut &this, visitor: ASTVisitor*, sched: [ASTNode*]*,
-                               msg: LValue, file: LValue, line: LValue) -> void {
+    /// under `--panic=unwind`, `loc` the address of a `Location`.  When the
+    /// frame has live droppable locals (`sched` non-empty) the raise is an
+    /// `invoke` into a cleanup landing pad that drops them before the unwind
+    /// continues; otherwise a plain `call`.  Either way it diverges
+    /// (`unreachable` on the normal edge).  Callers gate this on
+    /// `ctx.options.unwinds()` and keep the `abort` trap on the default path,
+    /// so emitted IR is unchanged there.
+    emit_panic_diverge_cleanup(mut &this, visitor: IRGeneratorVisitor*, sched: [Stmt*]*,
+                               msg: LValue, loc: LValue) -> void {
         const panic_fn: LValue = this.intrinsics.get_or_decl_cryo_panic();
         if (!panic_fn.is_valid()) { return; }
-        const ptr_ty: LType = LType::pointer_to(LType::i8());
-        const param_buf: void* = libc::malloc(24);
-        const param_slots: void** = param_buf as void**;
-        param_slots[0] = ptr_ty.raw;
-        param_slots[1] = ptr_ty.raw;
-        param_slots[2] = LType::i32().raw;
-        const fty: LType = LType::function_type(LType::void_type(), param_buf, 3, false);
-        libc::free(param_buf);
-        const arg_buf: void* = libc::malloc(24);
+        const fty: LType = LType { raw: llvm::LLVMGlobalGetValueType(panic_fn.raw) };
+        const arg_buf: void* = libc::malloc(16);
         const arg_slots: void** = arg_buf as void**;
         arg_slots[0] = msg.raw;
-        arg_slots[1] = file.raw;
-        arg_slots[2] = line.raw;
+        arg_slots[1] = loc.raw;
 
         // Live anonymous arg temps also demand the invoke+pad path even when the
         // frame has no named schedule (`sched` empty): a div/bounds/no-match/
@@ -1207,30 +1199,26 @@ type struct ExprOps {
             this.invoke_active = true;
             this.invoke_normal = cont_bb;
             this.invoke_lpad   = lpad_bb;
-            this.build_call_maybe_invoke(fty, panic_fn, arg_buf, 3, "");
+            this.build_call_maybe_invoke(fty, panic_fn, arg_buf, 2, "");
             this.invoke_active = false;
             libc::free(arg_buf);
             this.builder.build_unreachable();
             this.emit_cleanup_landingpad_sched(visitor, sched, cur_fn, lpad_bb);
         } else {
-            this.builder.build_call(fty, panic_fn, arg_buf, 3, "");
+            this.builder.build_call(fty, panic_fn, arg_buf, 2, "");
             libc::free(arg_buf);
             this.builder.build_unreachable();
         }
     }
 
-    /// Build the `(message, file, line)` args for a synthesized check from a
-    /// compile-time `message` and the origin's `span`, then raise + clean up via
-    /// `emit_panic_diverge_cleanup`.  The shared body of every synthesized-check
-    /// raise (div-by-zero, non-exhaustive match, `new[]` overflow).
-    emit_check_raise(mut &this, visitor: ASTVisitor*, sched: [ASTNode*]*,
+    /// Raise a synthesized check's compile-time `message` at the origin's
+    /// `span`, cleaning up via `emit_panic_diverge_cleanup`.  The shared body
+    /// of every synthesized-check raise (div-by-zero, non-exhaustive match,
+    /// `new[]` overflow).
+    emit_check_raise(mut &this, visitor: IRGeneratorVisitor*, sched: [Stmt*]*,
                      span: SourceSpan, message: string) -> void {
         const msg: LValue = this.builder.build_global_string_ptr(message, "check.msg");
-        mut filename: string = span.file;
-        if (filename == null || filename.length() == 0) { filename = "<unknown>"; }
-        const file: LValue = this.builder.build_global_string_ptr(filename, "check.file");
-        const line: LValue = LType::const_int(LType::i32(), span.start_line as u64, false);
-        this.emit_panic_diverge_cleanup(visitor, sched, msg, file, line);
+        this.emit_panic_diverge_cleanup(visitor, sched, msg, this.intrinsics.location_global(span));
     }
 
     /// The pre-Phase-1 call lowering: coerce integer widths to match
@@ -1525,9 +1513,9 @@ type struct ExprOps {
     /// Generate IR for a binary expression.  Handles arithmetic,
     /// comparison, logical short-circuit, and assignment operators.
     /// `append_entry` is the `append` a string `+` was bound to where it is
-    /// written (`BinaryExprNode::append_entry`).
+    /// written (`BinaryExpr::append_entry`).
     codegen_binary(mut &this, lhs_val: LValue, rhs_val: LValue, op_kind: TokenType, result_type: TypeRef, rhs_type: TypeRef,
-                   append_entry: OverloadId, visitor: ASTVisitor*, div_sched: [ASTNode*]*, div_span: SourceSpan) -> LValue {
+                   append_entry: OverloadId, visitor: IRGeneratorVisitor*, div_sched: [Stmt*]*, div_span: SourceSpan) -> LValue {
         mut out_value: LValue = LValue::null();
         if (!lhs_val.is_valid() || !rhs_val.is_valid()) {
             out_value = LValue::null();
@@ -1538,7 +1526,7 @@ type struct ExprOps {
         mut t: Type* = this.arena_type(result_type);
         mut bd: i32 = 0;
         while (t != null && t.kind == TypeKind::InstantiatedType && bd < 5) {
-            const binst: InstantiatedType* = t as InstantiatedType*;
+            const binst: InstantiatedType* = t.as_instantiated();
             if (binst.has_resolved_type()) {
                 t = this.arena_type(binst.resolved_type);
             } else { break; }
@@ -1700,10 +1688,10 @@ type struct ExprOps {
             (op_kind == TokenType::Plus || op_kind == TokenType::Minus)) {
             mut elem_ty: TypeRef = TypeRef::invalid();
             if (t_kind == TypeKind::Pointer) {
-                const ptr_t: PointerType* = t as PointerType*;
+                const ptr_t: PointerType* = t.as_pointer();
                 elem_ty = ptr_t.pointee;
             } else {
-                const ref_t: ReferenceType* = t as ReferenceType*;
+                const ref_t: ReferenceType* = t.as_reference();
                 elem_ty = ref_t.referent;
             }
             const pointee_lty: LType = this.type_mapper.map_type(elem_ty);
@@ -1730,8 +1718,8 @@ type struct ExprOps {
         mut is_float: boolean = t_kind == TypeKind::Float;
         mut is_signed: boolean = false;
         if (t_kind == TypeKind::Int) {
-            const int_t: IntType* = t as IntType*;
-            const ik: IntegerKind = int_t.int_kind;
+            const int_t: IntegerKind = t.int_kind();
+            const ik: IntegerKind = int_t;
             is_signed = ik.is_signed();
         }
 
@@ -1746,15 +1734,15 @@ type struct ExprOps {
         mut rt: Type* = this.arena_type(rhs_type);
         mut rbd: i32 = 0;
         while (rt != null && rt.kind == TypeKind::InstantiatedType && rbd < 5) {
-            const rinst: InstantiatedType* = rt as InstantiatedType*;
+            const rinst: InstantiatedType* = rt.as_instantiated();
             if (rinst.has_resolved_type()) {
                 rt = this.arena_type(rinst.resolved_type);
             } else { break; }
             rbd += 1;
         }
         if (rt != null && rt.kind == TypeKind::Int) {
-            const rint: IntType* = rt as IntType*;
-            rhs_is_signed = rint.int_kind.is_signed();
+            const rint: IntegerKind = rt.int_kind();
+            rhs_is_signed = rint.is_signed();
         }
 
         // Normalize integer operand widths.
@@ -2096,7 +2084,7 @@ type struct ExprOps {
     /// builds (default), so the guard has no steady-state runtime cost
     /// when the compiler can prove safety statically.
     emit_int_div_guard(mut &this, lhs: LValue, rhs: LValue, is_signed: boolean,
-                       visitor: ASTVisitor*, div_sched: [ASTNode*]*, div_span: SourceSpan) -> void {
+                       visitor: IRGeneratorVisitor*, div_sched: [Stmt*]*, div_span: SourceSpan) -> void {
         const rhs_ty_raw: void* = llvm::LLVMTypeOf(rhs.raw);
         if (rhs_ty_raw == null) { return; }
         const rhs_ty: LType = LType { raw: rhs_ty_raw };
@@ -2169,7 +2157,7 @@ type struct ExprOps {
     /// can never overflow, so the guard is elided. Leaves the builder at the
     /// ok block; mirrors `emit_int_div_guard`'s trap shape.
     emit_array_mul_guard(mut &this, count_i64: LValue, elem_size: u64,
-                         visitor: ASTVisitor*, ovf_sched: [ASTNode*]*, ovf_span: SourceSpan) -> void {
+                         visitor: IRGeneratorVisitor*, ovf_sched: [Stmt*]*, ovf_span: SourceSpan) -> void {
         if (elem_size <= (1 as u64)) { return; }
         const u64_max: u64 = (0 as u64) - (1 as u64);
         const max_count: u64 = u64_max / elem_size;
@@ -2264,8 +2252,8 @@ type struct ExprOps {
     /// allocator a weak, overridable `__cryo_alloc` lang item).
     ///
     /// Resolution ladder, emitting the exact same call each caller did:
-    ///   - a valid `alloc_fn` (the `allocate` of the `Allocate` the type, or
-    ///     a base class, implements): `alloc_fn(size, align)`.
+    ///   - a valid `alloc_fn` (the `allocate` of the `Allocate` the type
+    ///     implements): `alloc_fn(size, align)`.
     ///   - otherwise the canonical `GlobalAlloc` via `std::alloc::allocator::alloc`
     ///     (`{size, align}`), so every heap object shares the same arena routing.
     ///   - if the stdlib is not linked (`--no-std`), the `intrinsics::malloc` intrinsic (libc's `malloc`)

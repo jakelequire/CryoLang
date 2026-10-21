@@ -26,7 +26,7 @@ import compiler::resolver::res;
 import compiler::resolver::name_resolution::{ NameResolutionPass };
 import compiler::resolver::stamp_check;
 import compiler::resolver::stamp_check::{ StampCheck };
-import compiler::ast::{ node, declaration, dumper, NodeKind };
+import compiler::ast::{ node, declaration, dumper};
 import compiler::deps::dep_resolver;
 import compiler::deps::dep_resolver::{ DepResolver, ResolveMode, ResolveOutcome };
 import compiler::deps::lockfile;
@@ -59,9 +59,9 @@ import std::core::hash::{ Fnv128Hasher };
 import std::core::mem;
 import std::ffi::libc;
 import compiler::artifacts::{ ASTOutput, IROutput, TokenStream };
-import compiler::ast::declaration::{ ImportDeclNode };
+import compiler::ast::declaration::{ DeclarationNode, ImportDecl };
 import compiler::ast::dumper::{ ASTDumper };
-import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::node::{ ProgramNode };
 import compiler::codegen::llvm_types::{ LContext, LModule, LTargetMachine };
 import compiler::codegen::passes::{
     codegen_emit_job, CodegenPasses, emit_worker_entry, EmitJob, EmitTarget, EmitWorkerCtx
@@ -69,7 +69,7 @@ import compiler::codegen::passes::{
 import compiler::codegen::test_main_codegen::{ TestMainCodegen };
 import compiler::compilation_context::{
     BuildOptions, CompilationContext, HeapBackend, OutputKind, OutputOverride, PanicMode,
-    Runtime, SourceOverride
+    Runtime, SourceOverride, YieldHook
 };
 import compiler::compile_mode::{ CompileMode };
 import compiler::diag::{ ErrorCode };
@@ -206,9 +206,9 @@ type struct CompilerConfig {
     /// build speed vs. cores - never output.
     codegen_threads_override: i32;
     /// The project's `[compiler] test_plant_unanswered_name`: the name
-    /// layer's exit check resets the first identifier it walks to
-    /// unanswered.  A test switch, never set by a real build.
-    plant_unanswered_name: boolean;
+    /// layer's exit check counts the first slot of the kind it names as
+    /// unanswered.  A test switch, empty in every real build.
+    plant_unanswered_name: string;
 
     static default() -> CompilerConfig {
         return CompilerConfig {
@@ -232,7 +232,7 @@ type struct CompilerConfig {
             panic:               PanicStrategy::Unspecified,
             locked:              false,
             codegen_threads_override: -1,
-            plant_unanswered_name: false,
+            plant_unanswered_name: "",
         };
     }
 
@@ -258,7 +258,7 @@ type struct CompilerConfig {
             panic:               PanicStrategy::Unspecified,
             locked:              false,
             codegen_threads_override: -1,
-            plant_unanswered_name: false,
+            plant_unanswered_name: "",
         };
     }
 }
@@ -351,14 +351,12 @@ type struct CompilerInstance {
     config: CompilerConfig;
     /// Handed to every compilation's `BuildOptions` (see there); null
     /// unless the language server sets it.
-    yield_hook:   (void*) -> void;
-    yield_client: void*;
+    yield_hook:   virtual YieldHook*;
 
     static new(config: CompilerConfig) -> CompilerInstance {
         return CompilerInstance {
             config:       config,
             yield_hook:   null,
-            yield_client: null,
         };
     }
 
@@ -773,8 +771,8 @@ type struct CompilerInstance {
         // has to be able to select abort as well as unwind.  `pick` keeps the
         // project's answer when the CLI said nothing.
         config.panic = PanicStrategy::pick(config.panic, this.config.panic);
-        if (config.test_plant_unanswered_name) {
-            this.config.plant_unanswered_name = true;
+        if (config.test_plant_unanswered_name.length() > 0) {
+            this.config.plant_unanswered_name = config.test_plant_unanswered_name;
         }
 
         // Mirror cryoconfig `debug = true` into the global compiler debug
@@ -1034,7 +1032,6 @@ type struct CompilerInstance {
         options.static_link = this.config.release_static;
         options.source_overrides = overlays;
         options.yield_hook = this.yield_hook;
-        options.yield_client = this.yield_client;
 
         // An independent clone, so the local `config` stays usable below.
         const _box_config: Box<ProjectConfig> = Box::<ProjectConfig>::new(config.clone());
@@ -1811,6 +1808,17 @@ type struct CompilerInstance {
                     }
                 }
             }
+            // A trait-object table is emitted in the module holding its
+            // implementation, on the demand of any module that converts to
+            // it, so that module is keyed as an owner is.
+            for (mut s: i64 = 0; s < ctx.object_tables.length; s++) {
+                const tidx: i64 = ctx.module_graph.find_module_by_path(ctx.object_tables[s].decl.source_file);
+                if (tidx >= 0 && tidx < n as i64) {
+                    pm_owns_spec[tidx] = true;
+                } else {
+                    pm_active = false;
+                }
+            }
 
             // Global digest over every module's source hash, in topo order.
             mut pm_global_h: Fnv128Hasher = Fnv128Hasher::new();
@@ -2017,7 +2025,7 @@ type struct CompilerInstance {
         // after every stage that mints or mutates types in place
         // (monomorphization's `swap_wrapper_to_concrete`, sema's resolution) and
         // before codegen consumes those ids, so a fork is caught at its widest
-        // point rather than after it has already skewed a vtable or a mangle.
+        // point rather than after it has already skewed a layout or a mangle.
         //
         // A violation is an ICE rather than a warning: forked identity produces
         // wrong output, not a diagnostic, so continuing past it just buries the
@@ -2853,8 +2861,7 @@ type struct CompilerInstance {
 
     /// TypeDeclaration: register all type NAMES in the arena across all modules
     /// before resolving any signatures.  Handles forward references (e.g.
-    /// node.cryo uses ASTVisitor* defined in visitor.cryo, which depends on
-    /// node).
+    /// two modules whose types point at each other).
     collect_type_declarations(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
                               ast_buf: void*) -> boolean {
         const order: &[u32] = &ctx.module_graph.topo_order;
@@ -3028,19 +3035,18 @@ type struct CompilerInstance {
             const root: ProgramNode* = ctx.module_graph.get_module_ast(mi);
             if (root == null) { continue; }
             for (mut si: i64 = 0; si < root.statements.length; si++) {
-                const stmt: ASTNode* = root.statements[si];
+                const stmt: DeclarationNode* = root.statements[si].as_decl();
                 if (stmt == null) { continue; }
-                if (stmt.kind != NodeKind::ImportDeclaration) { continue; }
-                const exp: ImportDeclNode* = stmt as ImportDeclNode*;
-                if (!exp.is_export) { continue; }
+                const exp: ImportDecl* = DeclarationNode::import_of(stmt);
+                if (exp == null || !exp.is_export) { continue; }
                 for (mut pi: i64 = 0; pi < exp.private_export_entries.length; pi++) {
                     const item_str: string = intern.resolve(exp.specific_imports[exp.private_export_entries[pi]]);
                     mut pdiag: Diagnostic = Diagnostic::error(
                         ErrorCode::E0241_EXPORT_NOT_GRANTABLE,
                         fmt::format("`%s` is private in `%s` and cannot be re-exported",
                                item_str, intern.resolve(exp.module_path)));
-                    if (exp.span.has_location()) {
-                        pdiag = pdiag.at_with_label(exp.span,
+                    if (stmt.span.has_location()) {
+                        pdiag = pdiag.at_with_label(stmt.span,
                             "an export cannot widen visibility");
                     }
                     pdiag = pdiag.with_note(fmt::format(

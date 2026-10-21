@@ -13,7 +13,7 @@ import compiler::types::{
 };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{
-    ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
+    ArrayType, FunctionType, ObjectType, OptionalType, PointerType, ReferenceType, TupleType
 };
 import compiler::types::generic::{ AssocProjectionType, InstantiatedType };
 import compiler::types::type_base::{ Type };
@@ -121,6 +121,9 @@ type struct TypeSubstitution {
             TypeKind::Tuple => {
                 this.apply_tuple(ty, t, arena)
             }
+            TypeKind::Object => {
+                this.apply_object(ty, t, arena)
+            }
             TypeKind::InstantiatedType => {
                 this.apply_instantiation(ty, t, arena)
             }
@@ -131,7 +134,7 @@ type struct TypeSubstitution {
                 this.apply_type_alias(ty, t, arena)
             }
             _ => {
-                // Primitives, Struct, Class, Enum, Trait, etc.: concrete types
+                // Primitives, Struct, Enum, Trait, etc.: concrete types
                 // with identity; no substitution needed.  Generic references to
                 // these kinds always come through InstantiatedType, which IS
                 // handled above.
@@ -152,7 +155,7 @@ type struct TypeSubstitution {
     }
 
     apply_pointer(&this, ty: TypeRef, t: Type*, arena: TypeArena*) -> TypeRef {
-        const ptr: PointerType* = t as PointerType*;
+        const ptr: PointerType* = t.as_pointer();
         const new_pointee: TypeRef = this.apply(ptr.pointee, arena);
         if (new_pointee.equals(ptr.pointee)) {
             return ty;  // Short-circuit: nothing changed
@@ -161,7 +164,7 @@ type struct TypeSubstitution {
     }
 
     apply_reference(&this, ty: TypeRef, t: Type*, arena: TypeArena*) -> TypeRef {
-        const ref: ReferenceType* = t as ReferenceType*;
+        const ref: ReferenceType* = t.as_reference();
         const new_referent: TypeRef = this.apply(ref.referent, arena);
         if (new_referent.equals(ref.referent)) {
             return ty;
@@ -170,7 +173,7 @@ type struct TypeSubstitution {
     }
 
     apply_array(&this, ty: TypeRef, t: Type*, arena: TypeArena*) -> TypeRef {
-        const arr: ArrayType* = t as ArrayType*;
+        const arr: ArrayType* = t.as_array();
         const new_element: TypeRef = this.apply(arr.element, arena);
         if (new_element.equals(arr.element)) {
             return ty;
@@ -179,7 +182,7 @@ type struct TypeSubstitution {
     }
 
     apply_optional(&this, ty: TypeRef, t: Type*, arena: TypeArena*) -> TypeRef {
-        const opt: OptionalType* = t as OptionalType*;
+        const opt: OptionalType* = t.as_optional();
         const new_wrapped: TypeRef = this.apply(opt.wrapped, arena);
         if (new_wrapped.equals(opt.wrapped)) {
             return ty;
@@ -188,7 +191,7 @@ type struct TypeSubstitution {
     }
 
     apply_function(&this, ty: TypeRef, t: Type*, arena: TypeArena*) -> TypeRef {
-        const func: FunctionType* = t as FunctionType*;
+        const func: FunctionType* = t.as_function();
         const new_ret: TypeRef = this.apply(func.return_type, arena);
 
         mut changed: boolean = !new_ret.equals(func.return_type);
@@ -208,7 +211,7 @@ type struct TypeSubstitution {
     }
 
     apply_tuple(&this, ty: TypeRef, t: Type*, arena: TypeArena*) -> TypeRef {
-        const tup: TupleType* = t as TupleType*;
+        const tup: TupleType* = t.as_tuple();
 
         mut changed: boolean = false;
         mut new_elems: [TypeRef] = [];
@@ -226,8 +229,23 @@ type struct TypeSubstitution {
         return arena.get_tuple(new_elems);
     }
 
+    /// A trait object with its trait's arguments substituted: `virtual
+    /// &Conv<T>` in a generic body is `virtual &Conv<i64>` in its instance.
+    apply_object(&this, ty: TypeRef, t: Type*, arena: TypeArena*) -> TypeRef {
+        const obj: ObjectType* = t.as_object();
+        mut changed: boolean = false;
+        mut new_args: [TypeRef] = [];
+        for (mut i: i64 = 0; i < obj.args.length; i++) {
+            const new_a: TypeRef = this.apply(obj.args[i], arena);
+            new_args.push(new_a);
+            if (!new_a.equals(obj.args[i])) { changed = true; }
+        }
+        if (!changed) { return ty; }
+        return arena.get_object(obj.trait_def, obj.trait_type, new_args, obj.form);
+    }
+
     apply_type_alias(&this, ty: TypeRef, t: Type*, arena: TypeArena*) -> TypeRef {
-        const alias: TypeAliasType* = t as TypeAliasType*;
+        const alias: TypeAliasType* = t.as_alias();
         if (!alias.has_target()) {
             return ty;  // Unresolved alias; nothing to substitute
         }
@@ -248,7 +266,7 @@ type struct TypeSubstitution {
     apply_assoc_projection(&this, ty: TypeRef, t: Type*, arena: TypeArena*) -> TypeRef {
         const direct: TypeRef = this.get(ty);
         if (direct.is_valid()) { return direct; }
-        const proj: AssocProjectionType* = t as AssocProjectionType*;
+        const proj: AssocProjectionType* = t.as_assoc_projection();
         const new_base: TypeRef = this.apply(proj.base, arena);
         if (new_base.equals(proj.base)) {
             return ty;
@@ -257,7 +275,7 @@ type struct TypeSubstitution {
     }
 
     apply_instantiation(&this, ty: TypeRef, t: Type*, arena: TypeArena*) -> TypeRef {
-        const inst: InstantiatedType* = t as InstantiatedType*;
+        const inst: InstantiatedType* = t.as_instantiated();
 
         mut changed: boolean = false;
         mut new_args: [TypeRef] = [];

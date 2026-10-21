@@ -25,9 +25,7 @@ import std::fmt;
 import std::json::value;
 
 import compiler::compilation_context::{ CompilationContext };
-import compiler::ast::{ NodeKind };
-import compiler::ast::node::{ ASTNode };
-import compiler::ast::declaration::{ MethodNode };
+import compiler::ast::declaration::{ DeclarationNode, MethodDecl };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::lex::{ TokenType };
 import compiler::module_graph::{ ModuleOrigin, ModulePath };
@@ -130,12 +128,13 @@ type struct Renaming {
 
     /// Whether method `d` is declared by a trait or implements one.
     trait_method(&this, d: DefId) -> boolean {
-        const owner: ASTNode* = this.ctx.decl_index.declaration_of(this.ctx.defs.parent_of(d));
-        if (owner != null && owner.kind == NodeKind::TraitDeclaration) { return true; }
-        const decl: ASTNode* = this.ctx.decl_index.declaration_of(d);
-        if (decl == null || decl.kind != NodeKind::MethodDeclaration) { return false; }
-        const m: MethodNode* = decl as MethodNode*;
-        return m.func != null && m.func.origin_trait.is_valid();
+        const owner: DeclarationNode* = this.ctx.decl_index.declaration_of(this.ctx.defs.parent_of(d));
+        if (owner != null && DeclarationNode::trait_of(owner) != null) { return true; }
+        const decl: DeclarationNode* = this.ctx.decl_index.declaration_of(d);
+        if (decl == null || DeclarationNode::method_of(decl) == null) { return false; }
+        const m_decl: DeclarationNode* = decl;
+        const m: MethodDecl* = DeclarationNode::method_of(m_decl);
+        return m.func != null && DeclarationNode::fn_of(m.func).origin_trait.is_valid();
     }
 
     /// Every use of the target, every one in a module of the project, and
@@ -331,7 +330,7 @@ type struct Renaming {
         return SourceSpan::none();
     }
 
-    /// The declaration's site when type `owner` (or a base class) already
+    /// The declaration's site when type `owner` already
     /// has a field, method or variant `name`.
     member_collision(&this, owner: DefId, name: SymbolStr) -> SourceSpan {
         const ty: TypeRef = this.ctx.decl_index.type_of_def(owner);
@@ -340,7 +339,7 @@ type struct Renaming {
         const c: Completer = Completer::new(this.ctx, -1);
         if (c.field_type(ty, name).is_valid() || c.method_entries(ty, name).length > 0) { return at; }
         const t: type_base::Type* = this.ctx.type_arena.lookup(ty);
-        if (t != null && t.kind == types::TypeKind::Enum && (t as EnumType*).variant_index(name) >= 0) {
+        if (t != null && t.kind == types::TypeKind::Enum && t.as_enum().variant_index(name) >= 0) {
             return at;
         }
         return SourceSpan::none();

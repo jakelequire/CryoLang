@@ -13,7 +13,7 @@ namespace compiler::mono::trait_specializer;
 
 import compiler::ast;
 import compiler::ast::{
-    declaration, expression, node, NodeKind, statement, substituter, ProjectionAnnotation, TraitBound,
+    declaration, expression, node, statement, substituter, ProjectionAnnotation, TraitBound,
     TraitRef, TypeAnnotation
 };
 import compiler::types::{
@@ -29,11 +29,12 @@ import std::alloc::allocator;
 import std::core::mem::{ swap };
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode, MethodNode,
-    StructDeclNode, TraitDeclNode, UnionDeclNode
+    FunctionDecl, DeclarationNode, GenericParamDecl, ImplBlock, MethodDecl,
+    StructDecl, TraitDecl, UnionDecl
 };
-import compiler::ast::node::{ ASTNode };
 import compiler::ast::substituter::{ ASTTypeSubstituter };
+import compiler::ast::walk;
+import compiler::ast::walk::{ Walk };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::res::{ DefId };
@@ -83,7 +84,7 @@ type struct MonoTraitSpecializer {
 
 
 
-    bind_trait_args_for_spec_impl(mut &this, impl_node: ImplBlockNode*,
+    bind_trait_args_for_spec_impl(mut &this, impl_node: ImplBlock*,
                                    res_ctx: ResolutionContext*) -> void {
         if (impl_node == null || !impl_node.is_trait_impl()) { return; }
         const trait_ann: TypeAnnotation* = impl_node.trait_annotation;
@@ -111,13 +112,14 @@ type struct MonoTraitSpecializer {
         }
         if (!trait_leaf.is_valid()) { return; }
         if (this.generic_registry == null) { return; }
-        const trait_decl: TraitDeclNode* = this.generic_registry.get_trait_decl(
+        const trait_decl: TraitDecl* = this.generic_registry.get_trait_decl(
             TypeAnnotation::trait_def(trait_ann));
         if (trait_decl == null) { return; }
         if (trait_decl.generic_params.length != trait_args.length) { return; }
 
         for (mut i: i64 = 0; i < trait_args.length; i++) {
-            const gp: GenericParamNode* = trait_decl.generic_params[i];
+            const gp_decl: DeclarationNode* = trait_decl.generic_params[i];
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             if (gp == null) { continue; }
             const arg_ty: TypeRef = this.type_resolver.resolve(trait_args[i], res_ctx);
             if (!arg_ty.is_valid()) { continue; }
@@ -135,7 +137,7 @@ type struct MonoTraitSpecializer {
     /// Bind impl-introduced generic params that the Self type doesn't determine
     /// (e.g. `A` in `implement<I, A> Iterator<A> for TakeN<I> where I: Iterator<A>`)
     /// into `res_ctx`, by resolving each where-bound against the concrete subject.
-    derive_impl_where_generics(mut &this, impl_node: ImplBlockNode*,
+    derive_impl_where_generics(mut &this, impl_node: ImplBlock*,
                                subst: TypeSubstitution*,
                                res_ctx: ResolutionContext*) -> void {
         if (impl_node == null || subst == null) { return; }
@@ -163,7 +165,7 @@ type struct MonoTraitSpecializer {
     /// spec'd impl node, so a self-returning default specialized later can recover
     /// the trait element it doesn't carry as a struct parameter.  Only
     /// fully-concrete bindings are kept.
-    cache_derived_trait_params(mut &this, impl_node: ImplBlockNode*,
+    cache_derived_trait_params(mut &this, impl_node: ImplBlock*,
                                res_ctx: ResolutionContext*) -> void {
         if (impl_node == null || res_ctx == null) { return; }
         for (mut i: i64 = 0; i < res_ctx.generic_bindings.length; i++) {
@@ -181,7 +183,7 @@ type struct MonoTraitSpecializer {
     /// with a `name -> concrete` substitution.  Signatures are deliberately NOT
     /// touched (they already resolve concretely through `res_ctx`); self-returning
     /// defaults are skipped (specialized lazily per call site).
-    substitute_derived_params_in_method_bodies(mut &this, decl: ImplBlockNode*) -> void {
+    substitute_derived_params_in_method_bodies(mut &this, decl: ImplBlock*) -> void {
         if (decl == null) { return; }
         if (decl.derived_param_names.length == 0) { return; }
         mut param_ids: [TypeRef] = [];
@@ -206,17 +208,18 @@ type struct MonoTraitSpecializer {
         }
         // No template and no spec id: this rewrites the derived parameters
         // only, so no name in these bodies denotes a specialization being built.
-        mut substituter: ASTTypeSubstituter* = new ASTTypeSubstituter(
+        mut substituter: ASTTypeSubstituter* = ASTTypeSubstituter::create(
             subst_ptr, this.arena, this.intern_table,
             DefId::invalid(), empty_sym,
             psyms, TypeRef::invalid());
         for (mut mi: i64 = 0; mi < decl.methods.length; mi++) {
-            const method: MethodNode* = decl.methods[mi];
+            const method_decl: DeclarationNode* = decl.methods[mi];
+            const method: MethodDecl* = DeclarationNode::method_of(method_decl);
             if (method == null || method.func == null) { continue; }
-            if (method.func.is_self_returning_default
-                    || method.func.is_lazy_self_growing) { continue; }
-            if (method.func.body == null) { continue; }
-            (method.func.body as ASTNode*).accept(substituter);
+            if (DeclarationNode::fn_of(method.func).is_self_returning_default
+                    || DeclarationNode::fn_of(method.func).is_lazy_self_growing) { continue; }
+            if (DeclarationNode::fn_of(method.func).body == null) { continue; }
+            substituter.walk_stmt(DeclarationNode::fn_of(method.func).body);
         }
     }
 
@@ -254,7 +257,7 @@ type struct MonoTraitSpecializer {
     peel_pointer_pointee(&this, t: TypeRef) -> TypeRef {
         const ty: Type* = this.arena.lookup(t);
         if (ty != null && ty.kind == TypeKind::Pointer) {
-            return (ty as PointerType*).pointee;
+            return ty.as_pointer().pointee;
         }
         return TypeRef::invalid();
     }
@@ -263,7 +266,7 @@ type struct MonoTraitSpecializer {
     peel_reference_referent(&this, t: TypeRef) -> TypeRef {
         const ty: Type* = this.arena.lookup(t);
         if (ty != null && ty.kind == TypeKind::Reference) {
-            return (ty as ReferenceType*).referent;
+            return ty.as_reference().referent;
         }
         return TypeRef::invalid();
     }
@@ -275,8 +278,8 @@ type struct MonoTraitSpecializer {
     }
 
     /// Drop methods whose own where-bounds aren't satisfied by `subst` from the
-    /// spec'd type's inherent-method list.  In-place on Struct/Class AST nodes.
-    filter_bounds_violating_methods(mut &this, ast_node: ASTNode*,
+    /// spec'd type's inherent-method list.  In-place on Struct AST nodes.
+    filter_bounds_violating_methods(mut &this, ast_node: DeclarationNode*,
                                      subst: TypeSubstitution*) -> void {
         if (ast_node == null) { return; }
         // Reassign the owning-array field by SWAP, not `=`: a plain assignment
@@ -285,17 +288,13 @@ type struct MonoTraitSpecializer {
         // `methods` (e.g. `Array<X>::with_capacity`) would later read a freed
         // array (garbage -> a bare-scope/template-shaped body at codegen).  Swap
         // gives the field the filtered buffer and drops the old one via the local.
-        if (ast_node.kind == NodeKind::StructDeclaration) {
-            const decl: StructDeclNode* = ast_node as StructDeclNode*;
-            mut filtered: [MethodNode*] = this.filter_methods(decl.methods, subst);
+        if (DeclarationNode::struct_of(ast_node) != null) {
+            const decl: StructDecl* = DeclarationNode::struct_of(ast_node);
+            mut filtered: [DeclarationNode*] = this.filter_methods(decl.methods, subst);
             swap(&decl.methods, &filtered);
-        } else if (ast_node.kind == NodeKind::UnionDeclaration) {
-            const decl: UnionDeclNode* = ast_node as UnionDeclNode*;
-            mut filtered: [MethodNode*] = this.filter_methods(decl.methods, subst);
-            swap(&decl.methods, &filtered);
-        } else if (ast_node.kind == NodeKind::ClassDeclaration) {
-            const decl: ClassDeclNode* = ast_node as ClassDeclNode*;
-            mut filtered: [MethodNode*] = this.filter_methods(decl.methods, subst);
+        } else if (DeclarationNode::union_of(ast_node) != null) {
+            const decl: UnionDecl* = DeclarationNode::union_of(ast_node);
+            mut filtered: [DeclarationNode*] = this.filter_methods(decl.methods, subst);
             swap(&decl.methods, &filtered);
         }
     }
@@ -304,12 +303,12 @@ type struct MonoTraitSpecializer {
     /// arguments do not unify with it, or whose bounds do not hold - and for
     /// surviving impls, drop any methods
     /// whose own where-bounds don't hold.  Returns the pruned impl-AST array.
-    filter_bounds_violating_impls(mut &this, impl_asts: &[ASTNode*],
-                                   type_args: &[TypeRef]) -> [ASTNode*] {
-        mut kept: [ASTNode*] = [];
+    filter_bounds_violating_impls(mut &this, impl_asts: &[DeclarationNode*],
+                                   type_args: &[TypeRef]) -> [DeclarationNode*] {
+        mut kept: [DeclarationNode*] = [];
         for (mut i: i64 = 0; i < impl_asts.length; i++) {
-            const impl_ast: ASTNode* = impl_asts[i];
-            const impl_node: ImplBlockNode* = impl_ast as ImplBlockNode*;
+            const impl_ast: DeclarationNode* = impl_asts[i];
+            const impl_node: ImplBlock* = DeclarationNode::impl_of(impl_ast);
             if (impl_node == null) { continue; }
             // A head whose written target arguments do not unify with this
             // instantiation's is not an impl for it: `implement<T> trait Show
@@ -326,7 +325,7 @@ type struct MonoTraitSpecializer {
             if (!this.bounds_satisfied(impl_node.where_bounds, &head)) {
                 continue;
             }
-            mut impl_filtered: [MethodNode*] = this.filter_methods(impl_node.methods, &head);
+            mut impl_filtered: [DeclarationNode*] = this.filter_methods(impl_node.methods, &head);
             swap(&impl_node.methods, &impl_filtered);
             kept.push(impl_ast);
         }
@@ -337,32 +336,33 @@ type struct MonoTraitSpecializer {
     /// arguments through its head (`U` in `implement<U> .. for Wrap<U>`,
     /// for `Wrap<Num>`, to `Num`): the substitution everything written
     /// inside the block is read under.
-    head_bindings(&this, impl_node: ImplBlockNode*, type_args: &[TypeRef]) -> TypeSubstitution {
+    head_bindings(&this, impl_node: ImplBlock*, type_args: &[TypeRef]) -> TypeSubstitution {
         mut head: TypeSubstitution = TypeSubstitution::empty();
         this.trait_checker.add_head_param_bindings(impl_node, type_args, &head);
         return head;
     }
 
     /// Keep only methods whose per-method where-bounds are satisfied by `subst`.
-    filter_methods(&this, methods: &[MethodNode*],
-                    subst: TypeSubstitution*) -> [MethodNode*] {
-        mut kept: [MethodNode*] = [];
+    filter_methods(&this, methods: &[DeclarationNode*],
+                    subst: TypeSubstitution*) -> [DeclarationNode*] {
+        mut kept: [DeclarationNode*] = [];
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: MethodNode* = methods[i];
+            const m_decl: DeclarationNode* = methods[i];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null || m.func == null) { continue; }
             if (!this.method_bounds_satisfied(m.func, subst)) {
                 continue;
             }
-            kept.push(m);
+            kept.push(m_decl);
         }
         return kept;
     }
 
     /// Check that every `where`-clause TraitBound on `func` has a registered impl
     /// for the substituted type.  Forwards to the standalone `TraitChecker`.
-    method_bounds_satisfied(&this, func: FunctionDeclNode*,
+    method_bounds_satisfied(&this, func_decl: DeclarationNode*,
                             subst: TypeSubstitution*) -> boolean {
-        return this.trait_checker.method_bounds_satisfied(func, subst);
+        return this.trait_checker.method_bounds_satisfied(func_decl, subst);
     }
 
     /// Drop conditionally-bounded trait-default methods whose associated-type
@@ -378,13 +378,14 @@ type struct MonoTraitSpecializer {
     /// happens. Conservative: a method is dropped ONLY when its projected Item
     /// reduces to a concrete type AND the bound trait is known-absent; an
     /// unreducible projection keeps the method.
-    filter_projection_bound_methods(mut &this, decl: ImplBlockNode*,
+    filter_projection_bound_methods(mut &this, decl: ImplBlock*,
                                     this_type: TypeRef) -> void {
         if (decl == null || !this_type.is_valid()) { return; }
         // Fast path: nothing to do unless some method carries a projection bound.
         mut any: boolean = false;
         for (mut i: i64 = 0; i < decl.methods.length; i++) {
-            const m: MethodNode* = decl.methods[i];
+            const m_decl: DeclarationNode* = decl.methods[i];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m != null && m.func != null && this.func_has_projection_bound(m.func)) {
                 any = true;
                 break;
@@ -392,12 +393,13 @@ type struct MonoTraitSpecializer {
         }
         if (!any) { return; }
 
-        mut kept: [MethodNode*] = [];
+        mut kept: [DeclarationNode*] = [];
         for (mut i: i64 = 0; i < decl.methods.length; i++) {
-            const m: MethodNode* = decl.methods[i];
-            if (m == null || m.func == null) { kept.push(m); continue; }
+            const m_decl: DeclarationNode* = decl.methods[i];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
+            if (m == null || m.func == null) { kept.push(m_decl); continue; }
             if (this.method_projection_bounds_hold(m.func, this_type)) {
-                kept.push(m);
+                kept.push(m_decl);
             }
         }
         // Swap-relocate the owning array (see `filter_bounds_violating_methods`).
@@ -405,7 +407,8 @@ type struct MonoTraitSpecializer {
     }
 
     /// Whether `func` carries at least one projection-subject where-bound.
-    func_has_projection_bound(&this, func: FunctionDeclNode*) -> boolean {
+    func_has_projection_bound(&this, func_decl: DeclarationNode*) -> boolean {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return false; }
         for (mut bi: i64 = 0; bi < func.trait_bounds.length; bi++) {
             if (func.trait_bounds[bi].has_projection_subject()) { return true; }
@@ -415,8 +418,9 @@ type struct MonoTraitSpecializer {
 
     /// True unless some projection-subject where-bound on `func` is concretely
     /// violated by `this_type`'s corresponding associated type.
-    method_projection_bounds_hold(mut &this, func: FunctionDeclNode*,
+    method_projection_bounds_hold(mut &this, func_decl: DeclarationNode*,
                                   this_type: TypeRef) -> boolean {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return true; }
         for (mut bi: i64 = 0; bi < func.trait_bounds.length; bi++) {
             const b: TraitBound* = &func.trait_bounds[bi];
@@ -424,7 +428,7 @@ type struct MonoTraitSpecializer {
             const pj: ProjectionAnnotation* = this.projection_ann(b.subject_type);
             if (pj == null) { continue; }
             const trait_ty: TypeRef = this.type_resolver.projection_trait(pj);
-            const tdecl: TraitDeclNode* = this.type_resolver.trait_decl_of(trait_ty);
+            const tdecl: TraitDecl* = this.type_resolver.trait_decl_of(trait_ty);
             if (tdecl == null) { continue; }
             const item: TypeRef = this.type_resolver.concrete_projection(
                 this_type, tdecl.assoc_type_index(pj.member), trait_ty);

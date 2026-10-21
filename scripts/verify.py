@@ -47,7 +47,8 @@ is DECLARED, one per line with the reason, committed with the change: in
 builds it, in `tests/started-passing` otherwise.  The entries that apply to a
 run are the ones the working tree's file lists and REV's does not, so an
 entry is inert once the baseline has it, and asserted again against any
-older baseline.  For every one, the baseline census must fail on exactly the
+older baseline.  Rewriting an entry's reason declares its program again,
+for a later change that makes it start passing a second time.  For every one, the baseline census must fail on exactly the
 declared projects and nothing else, and the tree's census passing them is
 the rest of the claim; a started-compiling project must also be REFUSED by
 the baseline with a diagnostic and BUILT by the tree.  Their objects are
@@ -389,18 +390,28 @@ def parse_declared(text):
     return out
 
 
+def declarations_between(tree_text, base_text):
+    """The declarations `tree_text` carries that `base_text` does not.  A
+    line naming a program the base also names, with its reason rewritten,
+    declares it again: a later change can make a program start passing a
+    second time, and the line records the latest cause."""
+    tree = parse_declared(tree_text)
+    base = parse_declared(base_text)
+    return {k: v for k, v in tree.items() if base.get(k) != v}
+
+
 def declared_since(sha, rel=DECLARED):
     """The declarations the working tree's `rel` carries and revision `sha`'s
-    does not."""
+    does not (`declarations_between`)."""
     path = os.path.join(ROOT, rel)
-    tree = {}
+    tree_text = ""
     if os.path.isfile(path):
         with io.open(path, encoding="utf-8") as fh:
-            tree = parse_declared(fh.read())
+            tree_text = fh.read()
     r = subprocess.run(["git", "show", "%s:%s" % (sha, rel)], cwd=ROOT,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    base = parse_declared(r.stdout.decode("utf-8", "replace")) if r.returncode == 0 else {}
-    return {k: v for k, v in tree.items() if k not in base}
+    base_text = r.stdout.decode("utf-8", "replace") if r.returncode == 0 else ""
+    return declarations_between(tree_text, base_text)
 
 
 def census_failures(log):
@@ -563,6 +574,14 @@ def selftest():
          judge_unit_moves({"u": "/U.o"}, {}, {}), 1),
         ("declarations: parse skips comments and blanks",
          [] if parse_declared("# c\n\np why\nq\n") == {"p": "why", "q": ""} else ["bad"], 0),
+        ("declarations: a new line applies",
+         [] if declarations_between("p a\nq b\n", "p a\n") == {"q": "b"} else ["bad"], 0),
+        ("declarations: an unchanged line does not",
+         [] if declarations_between("p a\n", "p a\n") == {} else ["bad"], 0),
+        ("declarations: a rewritten reason declares again",
+         [] if declarations_between("p b\n", "p a\n") == {"p": "b"} else ["bad"], 0),
+        ("declarations: a removed line declares nothing",
+         [] if declarations_between("", "p a\n") == {} else ["bad"], 0),
     ]
     bad = 0
     for label, problems, want in cases:

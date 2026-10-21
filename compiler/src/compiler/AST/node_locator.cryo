@@ -1,16 +1,15 @@
 /// AST Position Lookup
 ///
 /// `NodeLocator::first_covering_child(node, line, character)` returns the
-/// first child of a node whose `span` covers (line, character), or `null`;
+/// first child of a node whose `span` covers (line, character), or none;
 /// a caller walks down by repeating it, which is how the language server
 /// finds the innermost node at a cursor.  Positions are 1-based to match
 /// the compiler's `SourceSpan` convention; the server converts its
 /// 0-based positions before asking.
 ///
-/// Dispatch is by `NodeKind` rather than the visitor pattern.  The
-/// visitor needs ~50 method overrides per concrete walker; this file
-/// recurses inline through the children that actually exist for each
-/// kind, which keeps the walk in one place.  Kinds with no children
+/// Dispatch is a `match` on the node's category and kind rather than a
+/// walk: this file recurses inline through the children that actually
+/// exist for each kind, which keeps the walk in one place.  Kinds with no children
 /// (Identifier, Literal, the various leaf statements) have no covering
 /// child, so the walk stops at them.
 ///
@@ -21,30 +20,24 @@ namespace compiler::ast::node_locator;
 
 import compiler::ast;
 import compiler::ast::{
-    declaration, expression, NamedAnnotation, node, NodeKind, statement, TypeAnnotation
+    declaration, expression, NamedAnnotation, node, statement, TypeAnnotation
 };
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::ast::pattern;
-import compiler::ast::pattern::{ MatchArmNode, PatternNode, StaticMatchArmNode };
+import compiler::ast::pattern::{ MatchArmNode, Pattern, StaticMatchArmNode };
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, EnumDeclNode, EnumVariantNode, ExternBlockNode,
-    FieldDeclNode, FunctionDeclNode, ImplBlockNode, MethodNode, StructDeclNode,
-    TraitDeclNode, UnionDeclNode, VarDeclNode
+    DeclarationNode, DeclKind,
+    FunctionDecl, ImplBlock, MethodDecl, StructDecl,
+    TraitDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
-    ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode, CallExprNode,
-    CastExprNode, DeleteExprNode, ExpressionNode, IfExprNode, LambdaExprNode,
-    MatchExprNode, MemberAccessNode, NewExprNode, StaticMatchExprNode, StructLiteralNode,
-    TernaryExprNode, TryExprNode, TupleLiteralNode, TypeofExprNode, UnaryExprNode,
-    YieldExprNode
+    CallExpr,
+    ExprKind, ExpressionNode, FieldInit,
+    MatchExpr, MemberAccessExpr
 };
-import compiler::ast::node::{ ASTNode };
-import compiler::ast::statement::{
-    BlockStmtNode, DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode,
-    LoopStmtNode, MatchStmtNode, ReturnStmtNode, StatementNode, StaticMatchStmtNode,
-    UnsafeBlockStmtNode, WhileStmtNode
-};
+import compiler::ast::node::{ Node };
+import compiler::ast::statement::{ Stmt, StmtKind };
 
 
 /// True when (line, character) falls within `span` inclusive of both
@@ -72,6 +65,7 @@ public function annotation_span(ann: TypeAnnotation*) -> SourceSpan {
         TypeAnnotation::Named(n)     => { n.span }
         TypeAnnotation::Pointer(p)   => { p.span }
         TypeAnnotation::Reference(r) => { r.span }
+        TypeAnnotation::Object(o)    => { o.span }
         TypeAnnotation::Array(a)     => { a.span }
         TypeAnnotation::Function(f)  => { f.span }
         TypeAnnotation::Tuple(t)     => { t.span }
@@ -87,18 +81,14 @@ public function annotation_span(ann: TypeAnnotation*) -> SourceSpan {
 /// covering just the declared identifier (e.g. `body_str` in
 /// `const body_str: Str = ...;`).  Returns `SourceSpan::none()` for
 /// non-declarations, for nodes whose name span the parser hasn't
-/// stamped, and for `MethodNode` (which delegates to its inner
-/// `FunctionDeclNode`).
-public function name_span_of(node: ASTNode*) -> SourceSpan {
-    if (node == null) { return SourceSpan::none(); }
-    if (node.kind == NodeKind::MethodDeclaration) {
-        const m: MethodNode* = node as MethodNode*;
-        if (m.func == null) { return SourceSpan::none(); }
-        return m.func.name_span;
-    }
-    if (!node.kind.is_declaration()) { return SourceSpan::none(); }
-    const d: DeclarationNode* = node as DeclarationNode*;
-    return d.name_span;
+/// stamped, and for `MethodDecl` (which delegates to its inner
+/// `FunctionDecl`).
+public function name_span_of(node: Node) -> SourceSpan {
+    if (node.is_null()) { return SourceSpan::none(); }
+    return match (node) {
+        Node::Decl(d) => { NodeLocator::decl_name_span(d) }
+        _             => { SourceSpan::none() }
+    };
 }
 
 
@@ -121,6 +111,9 @@ public function find_named_annotation_at(ann: TypeAnnotation*,
         }
         TypeAnnotation::Reference(r) => {
             return find_named_annotation_at(r.inner, line, ch);
+        }
+        TypeAnnotation::Object(o) => {
+            return find_named_annotation_at(o.trait_annotation, line, ch);
         }
         TypeAnnotation::Array(a) => {
             return find_named_annotation_at(a.element, line, ch);
@@ -160,313 +153,283 @@ public function find_named_annotation_at(ann: TypeAnnotation*,
 /// The position walk's per-kind descent, as stateless `static`s.
 type struct NodeLocator {
 
+    /// The name span of declaration `d`: a method's is its function's.
+    static decl_name_span(d: DeclarationNode*) -> SourceSpan {
+        const m: MethodDecl* = DeclarationNode::method_of(d);
+        if (m != null) {
+            if (m.func == null) { return SourceSpan::none(); }
+            return m.func.name_span;
+        }
+        return d.name_span;
+    }
+
+    /// The callee if it covers the position, else the argument that does.
+    static pick_call(e: CallExpr*, line: u32, character: u32) -> Node? {
+        const callee_match: Node? = NodeLocator::pick_one(Node::Expr(e.callee), line, character);
+        if (callee_match.is_some()) { return callee_match; }
+        return NodeLocator::pick_array_expr(e.arguments, line, character);
+    }
+
     /// Return the first child of `node` whose span covers (line, character),
-    /// or `null` if no child does.  Per-kind dispatch: each branch knows
+    /// or none if no child does.  Per-kind dispatch: each branch knows
     /// the structural children of its node type.  Add new node kinds here
     /// when they need to participate in position lookup; leaving a kind
     /// out is harmless (the walk just stops at that node).
-    static first_covering_child(node: ASTNode*,
-                                   line: u32, character: u32) -> ASTNode* {
-        match (node.kind) {
-            // -- Expressions --
-            NodeKind::BinaryExpression => {
-                const e: BinaryExprNode* = node as BinaryExprNode*;
-                return NodeLocator::pick(e.left as ASTNode*, e.right as ASTNode*, null, null,
-                            line, character);
-            }
-            NodeKind::UnaryExpression => {
-                const e: UnaryExprNode* = node as UnaryExprNode*;
-                return NodeLocator::pick(e.operand as ASTNode*, null, null, null, line, character);
-            }
-            NodeKind::TernaryExpression => {
-                const e: TernaryExprNode* = node as TernaryExprNode*;
-                return NodeLocator::pick(e.condition as ASTNode*, e.true_expr as ASTNode*,
-                            e.false_expr as ASTNode*, null, line, character);
-            }
-            NodeKind::IfExpression => {
-                const e: IfExprNode* = node as IfExprNode*;
-                return NodeLocator::pick(e.condition as ASTNode*, e.then_expr as ASTNode*,
-                            e.else_expr as ASTNode*, null, line, character);
-            }
-            NodeKind::CallExpression => {
-                const e: CallExprNode* = node as CallExprNode*;
-                const callee_match: ASTNode* = NodeLocator::pick_one(e.callee as ASTNode*, line, character);
-                if (callee_match != null) { return callee_match; }
-                return NodeLocator::pick_array_expr(e.arguments, line, character);
-            }
-            NodeKind::NewExpression => {
-                const e: NewExprNode* = node as NewExprNode*;
-                return NodeLocator::pick_array_expr(e.arguments, line, character);
-            }
-            NodeKind::CastExpression => {
-                const e: CastExprNode* = node as CastExprNode*;
-                return NodeLocator::pick(e.expression as ASTNode*, null, null, null, line, character);
-            }
-            NodeKind::MemberAccess => {
-                const e: MemberAccessNode* = node as MemberAccessNode*;
-                return NodeLocator::pick(e.object as ASTNode*, null, null, null, line, character);
-            }
-            NodeKind::ArrayAccess => {
-                const e: ArrayAccessNode* = node as ArrayAccessNode*;
-                return NodeLocator::pick(e.array as ASTNode*, e.index as ASTNode*, null, null,
-                            line, character);
-            }
-            NodeKind::ArrayLiteral => {
-                const e: ArrayLiteralNode* = node as ArrayLiteralNode*;
-                return NodeLocator::pick_array_expr(e.elements, line, character);
-            }
-            NodeKind::TupleLiteral => {
-                const e: TupleLiteralNode* = node as TupleLiteralNode*;
-                return NodeLocator::pick_array_expr(e.elements, line, character);
-            }
-            NodeKind::StructLiteral => {
-                // StructLiteral fields are name=expr pairs.  Descend into
-                // each `FieldInit.value` so the cursor on a value
-                // expression (an identifier, a `Foo::Bar` ScopeResolution,
-                // a literal) reaches the inner node.  When the cursor is
-                // on the field name itself the descent finds nothing and
-                // the caller falls back to the StructLiteral hover branch
-                // which classifies cursor-on-name vs cursor-on-head.
-                const e: StructLiteralNode* = node as StructLiteralNode*;
-                for (mut i: i64 = 0; i < e.field_inits.length; i++) {
-                    const v: ExpressionNode* = e.field_inits[i].value;
-                    if (v != null && span_contains(v.span, line, character)) {
-                        return v as ASTNode*;
+    static first_covering_child(node: Node, line: u32, character: u32) -> Node? {
+        match (node) {
+            Node::Expr(x) => {
+                // `sizeof` and `alignof` hold a type annotation, no child
+                // expression to descend into.
+                return match (x.kind) {
+                    ExprKind::Typeof(e) => {
+                        NodeLocator::pick_one(Node::Expr(e.operand), line, character)
                     }
-                }
-                return null;
-            }
-            NodeKind::TypeofExpression => {
-                const e: TypeofExprNode* = node as TypeofExprNode*;
-                return NodeLocator::pick(e.operand as ASTNode*, null, null, null, line, character);
-            }
-            NodeKind::DeleteExpression => {
-                const e: DeleteExprNode* = node as DeleteExprNode*;
-                return NodeLocator::pick(e.operand as ASTNode*, null, null, null, line, character);
-            }
-            NodeKind::AwaitExpression => {
-                const e: AwaitExprNode* = node as AwaitExprNode*;
-                return NodeLocator::pick(e.operand as ASTNode*, null, null, null, line, character);
-            }
-            NodeKind::TryExpression => {
-                // Descend into the source operand, not the synthetic desugar;
-                // hover/go-to-definition want the spans the user actually typed.
-                const e: TryExprNode* = node as TryExprNode*;
-                return NodeLocator::pick(e.operand as ASTNode*, null, null, null, line, character);
-            }
-            NodeKind::YieldExpression => {
-                const e: YieldExprNode* = node as YieldExprNode*;
-                return NodeLocator::pick(e.operand as ASTNode*, null, null, null, line, character);
-            }
-            NodeKind::LambdaExpression => {
-                const e: LambdaExprNode* = node as LambdaExprNode*;
-                return NodeLocator::pick(e.body as ASTNode*, null, null, null, line, character);
-            }
-            NodeKind::MatchExpression => {
-                const e: MatchExprNode* = node as MatchExprNode*;
-                const subj: ASTNode* = NodeLocator::pick_one(e.subject as ASTNode*, line, character);
-                if (subj != null) { return subj; }
-                return NodeLocator::pick_array_arm(e.arms, line, character);
-            }
-            NodeKind::StaticMatchExpression => {
-                const e: StaticMatchExprNode* = node as StaticMatchExprNode*;
-                for (mut i: i64 = 0; i < e.arms.length; i++) {
-                    const arm: StaticMatchArmNode* = e.arms[i];
-                    if (arm == null || arm.body == null) { continue; }
-                    const hit: ASTNode* = NodeLocator::pick(arm.body as ASTNode*, null, null, null,
-                                               line, character);
-                    if (hit != null) { return hit; }
-                }
-                return null;
+                    ExprKind::Unary(e) => {
+                        NodeLocator::pick_one(Node::Expr(e.operand), line, character)
+                    }
+                    ExprKind::Await(e) => {
+                        NodeLocator::pick_one(Node::Expr(e.operand), line, character)
+                    }
+                    ExprKind::Lambda(e) => {
+                        NodeLocator::pick_one(Node::Stmt(e.body), line, character)
+                    }
+                    ExprKind::ArrayAccess(e) => {
+                        NodeLocator::pick(Node::Expr(e.array), Node::Expr(e.index),
+                                          NodeLocator::absent(), NodeLocator::absent(),
+                                          line, character)
+                    }
+                    ExprKind::Binary(e) => {
+                        NodeLocator::pick(Node::Expr(e.left), Node::Expr(e.right),
+                                          NodeLocator::absent(), NodeLocator::absent(),
+                                          line, character)
+                    }
+                    ExprKind::New(e) => {
+                        NodeLocator::pick_array_expr(e.arguments, line, character)
+                    }
+                    ExprKind::Array(e) => {
+                        NodeLocator::pick_array_expr(e.elements, line, character)
+                    }
+                    ExprKind::Struct(e) => {
+                        NodeLocator::pick_field_value(e.field_inits, line, character)
+                    }
+                    ExprKind::Tuple(e) => {
+                        NodeLocator::pick_array_expr(e.elements, line, character)
+                    }
+                    ExprKind::ObjectConversion(e) => {
+                        NodeLocator::pick_one(Node::Expr(e.operand), line, character)
+                    }
+                    ExprKind::Delete(e) => {
+                        NodeLocator::pick_one(Node::Expr(e.operand), line, character)
+                    }
+                    ExprKind::Yield(e) => {
+                        NodeLocator::pick_one(Node::Expr(e.operand), line, character)
+                    }
+                    ExprKind::Ternary(e) => {
+                        NodeLocator::pick(Node::Expr(e.condition), Node::Expr(e.true_expr),
+                            Node::Expr(e.false_expr), NodeLocator::absent(), line, character)
+                    }
+                    ExprKind::Match(e) => { NodeLocator::pick_match_expr(e, line, character) }
+                    ExprKind::Cast(e) => {
+                        NodeLocator::pick_one(Node::Expr(e.expression), line, character)
+                    }
+                    ExprKind::StaticMatch(e) => {
+                        NodeLocator::pick_static_arm_body(e.arms, line, character)
+                    }
+                    ExprKind::If(e) => {
+                        NodeLocator::pick(Node::Expr(e.condition), Node::Expr(e.then_expr),
+                            Node::Expr(e.else_expr), NodeLocator::absent(), line, character)
+                    }
+                    // The source operand, not the synthetic desugar: hover
+                    // and go-to-definition want the spans the user typed.
+                    ExprKind::Try(e) => {
+                        NodeLocator::pick_one(Node::Expr(e.operand), line, character)
+                    }
+                    ExprKind::Sizeof(_)  => { Option::None }
+                    ExprKind::Alignof(_) => { Option::None }
+                    ExprKind::Literal(_) => { Option::None }
+                    ExprKind::Identifier(_) => { Option::None }
+                    ExprKind::ScopeResolution(_) => { Option::None }
+                    ExprKind::MemberAccess(e) => {
+                        NodeLocator::pick_one(Node::Expr(e.object), line, character)
+                    }
+                    ExprKind::Call(e) => { NodeLocator::pick_call(e, line, character) }
+                };
             }
 
-            // -- Statements --
-            NodeKind::BlockStatement => {
-                const s: BlockStmtNode* = node as BlockStmtNode*;
-                return NodeLocator::pick_array_stmt(s.statements, line, character);
+            Node::Stmt(s) => {
+                return NodeLocator::stmt_covering_child(s, line, character);
             }
-            NodeKind::UnsafeBlockStatement => {
-                const s: UnsafeBlockStmtNode* = node as UnsafeBlockStmtNode*;
-                return NodeLocator::pick(s.block as ASTNode*, null, null, null, line, character);
-            }
-            NodeKind::ReturnStatement => {
-                const s: ReturnStmtNode* = node as ReturnStmtNode*;
-                return NodeLocator::pick(s.expression as ASTNode*, null, null, null, line, character);
-            }
-            NodeKind::IfStatement => {
-                const s: IfStmtNode* = node as IfStmtNode*;
-                return NodeLocator::pick(s.condition as ASTNode*, s.then_stmt as ASTNode*,
-                            s.else_stmt as ASTNode*, null, line, character);
-            }
-            NodeKind::WhileStatement => {
-                const s: WhileStmtNode* = node as WhileStmtNode*;
-                return NodeLocator::pick(s.condition as ASTNode*, s.body as ASTNode*, null, null,
-                            line, character);
-            }
-            NodeKind::DoWhileStatement => {
-                const s: DoWhileStmtNode* = node as DoWhileStmtNode*;
-                return NodeLocator::pick(s.body as ASTNode*, s.condition as ASTNode*, null, null,
-                            line, character);
-            }
-            NodeKind::ForStatement => {
-                const s: ForStmtNode* = node as ForStmtNode*;
-                return NodeLocator::pick(s.init, s.condition as ASTNode*,
-                            s.update as ASTNode*, s.body as ASTNode*,
-                            line, character);
-            }
-            NodeKind::LoopStatement => {
-                const s: LoopStmtNode* = node as LoopStmtNode*;
-                return NodeLocator::pick(s.body as ASTNode*, null, null, null, line, character);
-            }
-            NodeKind::ExpressionStatement => {
-                const s: ExprStmtNode* = node as ExprStmtNode*;
-                return NodeLocator::pick(s.expression as ASTNode*, null, null, null, line, character);
-            }
-            NodeKind::DeclarationStatement => {
-                const s: DeclStmtNode* = node as DeclStmtNode*;
-                return NodeLocator::pick(s.declaration as ASTNode*, null, null, null, line, character);
-            }
-            NodeKind::MatchStatement => {
-                const s: MatchStmtNode* = node as MatchStmtNode*;
-                const subj: ASTNode* = NodeLocator::pick_one(s.subject as ASTNode*, line, character);
-                if (subj != null) { return subj; }
-                return NodeLocator::pick_array_arm(s.arms, line, character);
-            }
-            NodeKind::StaticMatchStatement => {
-                const s: StaticMatchStmtNode* = node as StaticMatchStmtNode*;
-                for (mut i: i64 = 0; i < s.arms.length; i++) {
-                    const arm: StaticMatchArmNode* = s.arms[i];
-                    if (arm == null || arm.body == null) { continue; }
-                    const hit: ASTNode* = NodeLocator::pick(arm.body as ASTNode*, null, null, null,
-                                               line, character);
-                    if (hit != null) { return hit; }
-                }
-                return null;
-            }
-            NodeKind::MatchArm => {
-                const a: MatchArmNode* = node as MatchArmNode*;
+            Node::Arm(a) => {
                 // Patterns first: `ENOENT` in `ENOENT => { ... }` is a
-                // PatternNode with `pattern_kind = Identifier`.  Hover
-                // dispatch resolves the pattern's `value` SymbolStr
-                // through the resolver to recover the const it names.
-                const pat_match: ASTNode* = NodeLocator::pick_array_pattern(
+                // `Constant` pattern, whose stamp names the constant.
+                const pat_match: Node? = NodeLocator::pick_array_pattern(
                     a.patterns, line, character);
-                if (pat_match != null) { return pat_match; }
-                return NodeLocator::pick(a.body as ASTNode*, null, null, null, line, character);
+                if (pat_match.is_some()) { return pat_match; }
+                return NodeLocator::pick_one(Node::Stmt(a.body), line, character);
             }
 
-            // -- Declarations --
-            NodeKind::VariableDeclaration => {
-                const d: VarDeclNode* = node as VarDeclNode*;
-                return NodeLocator::pick(d.initializer as ASTNode*, null, null, null, line, character);
-            }
-            NodeKind::FunctionDeclaration => {
-                const d: FunctionDeclNode* = node as FunctionDeclNode*;
-                // Body almost always covers the cursor; parameters span the
-                // signature line so they're checked first.
-                const param_match: ASTNode* = NodeLocator::pick_array_var(
-                    d.parameters, line, character);
-                if (param_match != null) { return param_match; }
-                return NodeLocator::pick(d.body as ASTNode*, null, null, null, line, character);
-            }
-            NodeKind::MethodDeclaration => {
-                const d: MethodNode* = node as MethodNode*;
-                if (d.func == null) { return null; }
-                // Stop at MethodNode when the cursor is on the method's
-                // name token; otherwise the walk descends into the inner
-                // FunctionDeclNode and the hover renders as a free
-                // function with a `function` keyword.  The method-name
-                // case is more useful, so let the MethodDeclaration
-                // hover branch handle it.
-                if (span_contains(d.func.name_span, line, character)) { return null; }
-                // Drive descent into the inner `FunctionDeclNode`'s
-                // params and body directly: parse_method leaves
-                // `func.span` covering only the method-name token, so a
-                // generic `pick(d.func)` span check would miss every
-                // position inside the params or body and the walk would
-                // stop at MethodNode (whole method) instead of the
-                // identifier under the cursor.
-                const f: FunctionDeclNode* = d.func;
-                const param_match: ASTNode* = NodeLocator::pick_array_var(
-                    f.parameters, line, character);
-                if (param_match != null) { return param_match; }
-                if (f.body != null && span_contains(f.body.span, line, character)) {
-                    return f.body as ASTNode*;
+            Node::Decl(decl) => {
+                match (decl.kind) {
+                    DeclKind::Method(d) => {
+                        if (d.func == null) { return Option::None; }
+                        // Stop at the method when the cursor is on its name
+                        // token; otherwise the walk descends into the inner
+                        // function and the hover renders as a free function
+                        // with a `function` keyword.  The method-name case is
+                        // more useful, so let the method's hover branch
+                        // handle it.
+                        if (span_contains(d.func.name_span, line, character)) { return Option::None; }
+                        // Drive descent into the inner `FunctionDecl`'s
+                        // params and body directly: parse_method leaves
+                        // `func.span` covering only the method-name token, so a
+                        // generic `pick(d.func)` span check would miss every
+                        // position inside the params or body and the walk would
+                        // stop at MethodDecl (whole method) instead of the
+                        // identifier under the cursor.
+                        const f_decl: DeclarationNode* = d.func;
+                        const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
+                        const param_match: Node? = NodeLocator::pick_array_decl(
+                            f.parameters, line, character);
+                        if (param_match.is_some()) { return param_match; }
+                        if (f.body != null && span_contains(f.body.span, line, character)) {
+                            return Option::Some(Node::Stmt(f.body));
+                        }
+                        return Option::None;
+                    }
+                    DeclKind::Function(d) => {
+                        // Body almost always covers the cursor; parameters span the
+                        // signature line so they're checked first.
+                        const param_match: Node? = NodeLocator::pick_array_decl(
+                            d.parameters, line, character);
+                        if (param_match.is_some()) { return param_match; }
+                        return NodeLocator::pick_one(Node::Stmt(d.body), line, character);
+                    }
+                    // Trait methods are stored as bare function declarations
+                    // (no `MethodDecl` wrapper, since trait decls have no instance
+                    // bodies in the inherent-method sense).  Without this
+                    // descent the locator stops at the trait and any hover
+                    // inside a trait method's signature renders the trait head
+                    // instead of the method.
+                    DeclKind::Trait(d) => {
+                        return NodeLocator::pick_array_decl(d.methods, line, character);
+                    }
+                    // Extern declarations are bare function declarations on the
+                    // block's `functions` array, exactly like trait methods.
+                    // Without this descent the locator stops at the block and
+                    // hovering `syscall` in `extern "C" { function syscall(...) }`
+                    // finds no declaration.
+                    DeclKind::Extern(d) => {
+                        return NodeLocator::pick_array_decl(d.functions, line, character);
+                    }
+                    // Descend into variants so a hover on `NotFound` inside
+                    // `type enum X { NotFound; ... }` reaches the variant's
+                    // declaration directly; otherwise the walk stops at the
+                    // enum and the hover renders its head.
+                    DeclKind::Enum(d) => {
+                        return NodeLocator::pick_array_decl(d.variants, line, character);
+                    }
+                    DeclKind::Union(d) => {
+                        const f: Node? = NodeLocator::pick_array_decl(d.fields, line, character);
+                        if (f.is_some()) { return f; }
+                        return NodeLocator::pick_array_method(d.methods, line, character);
+                    }
+                    DeclKind::Struct(d) => {
+                        const f: Node? = NodeLocator::pick_array_decl(d.fields, line, character);
+                        if (f.is_some()) { return f; }
+                        return NodeLocator::pick_array_method(d.methods, line, character);
+                    }
+                    // `synthesize_default_trait_methods` (TypeResolution)
+                    // clones default-bodied trait methods INTO this impl's
+                    // `methods` array.  The clones retain spans from the
+                    // trait decl's source file (e.g. `io/traits.cryo`), so a
+                    // line-only match can land on a synthesized method whose
+                    // line number happens to overlap the impl head in the
+                    // impl's own file.  Filter to methods whose span.file
+                    // matches the impl block's span.file so position lookup
+                    // only sees real source positions in the file we're
+                    // walking.
+                    DeclKind::Impl(d) => {
+                        return NodeLocator::pick_array_method_in_file(
+                            d.methods, decl.span.file, line, character);
+                    }
+                    DeclKind::Variable(d) => {
+                        return NodeLocator::pick_one(Node::Expr(d.initializer), line, character);
+                    }
+                    DeclKind::Destructure(_) | DeclKind::Import(_) | DeclKind::Intrinsic(_)
+                    | DeclKind::Module(_) | DeclKind::Variant(_)
+                    | DeclKind::TypeAlias(_) | DeclKind::Field(_)
+                    | DeclKind::GenericParam(_) => { return Option::None; }
                 }
-                return null;
             }
-            NodeKind::StructDeclaration => {
-                const d: StructDeclNode* = node as StructDeclNode*;
-                const f: ASTNode* = NodeLocator::pick_array_field(d.fields, line, character);
-                if (f != null) { return f; }
-                return NodeLocator::pick_array_method(d.methods, line, character);
-            }
-            NodeKind::UnionDeclaration => {
-                const d: UnionDeclNode* = node as UnionDeclNode*;
-                const f: ASTNode* = NodeLocator::pick_array_field(d.fields, line, character);
-                if (f != null) { return f; }
-                return NodeLocator::pick_array_method(d.methods, line, character);
-            }
-            NodeKind::ClassDeclaration => {
-                const d: ClassDeclNode* = node as ClassDeclNode*;
-                const f: ASTNode* = NodeLocator::pick_array_field(d.fields, line, character);
-                if (f != null) { return f; }
-                return NodeLocator::pick_array_method(d.methods, line, character);
-            }
-            NodeKind::EnumDeclaration => {
-                // Descend into variants so a hover on `NotFound` inside
-                // `type enum X { NotFound; ... }` reaches the
-                // `EnumVariantNode` directly.  Without this descent the
-                // walk stops at `EnumDeclaration` and the hover renders
-                // the enum head instead of the specific variant.
-                const d: EnumDeclNode* = node as EnumDeclNode*;
-                return NodeLocator::pick_array_variant(d.variants, line, character);
-            }
-            NodeKind::TraitDeclaration => {
-                // Trait methods are stored as bare `FunctionDeclNode*` (no
-                // `MethodNode` wrapper, since trait decls have no instance
-                // bodies in the inherent-method sense).  Without this
-                // descent the locator stops at TraitDeclaration and any
-                // hover inside a trait method's signature renders the
-                // trait head instead of the method.
-                const d: TraitDeclNode* = node as TraitDeclNode*;
-                return NodeLocator::pick_array_function(d.methods, line, character);
-            }
-            NodeKind::ExternBlock => {
-                // Extern declarations are bare `FunctionDeclNode*`s on the
-                // block's `functions` array, exactly like trait methods.
-                // Without this descent the locator stops at the block and
-                // hovering `syscall` in `extern "C" { function syscall(...) }`
-                // finds no declaration.
-                const d: ExternBlockNode* = node as ExternBlockNode*;
-                return NodeLocator::pick_array_function(d.functions, line, character);
-            }
-            NodeKind::ImplementationBlock => {
-                // `synthesize_default_trait_methods` (TypeResolution) clones
-                // default-bodied trait methods INTO this impl's `methods`
-                // array.  The clones retain spans from the trait decl's
-                // source file (e.g. `io/traits.cryo`), so a line-only match
-                // can land on a synthesized method whose line number
-                // happens to overlap the impl head in the impl's own file.
-                // Filter to methods whose span.file matches the impl
-                // block's span.file so position lookup only sees real
-                // source positions in the file we're walking.
-                const d: ImplBlockNode* = node as ImplBlockNode*;
-                return NodeLocator::pick_array_method_in_file(
-                    d.methods, d.span.file, line, character);
-            }
-            _ => { return null; }
+            _ => { return Option::None; }
         }
     }
 
-    static pick(a: ASTNode*, b: ASTNode*, c: ASTNode*, d: ASTNode*,
-                  line: u32, character: u32) -> ASTNode* {
-        const ha: ASTNode* = NodeLocator::pick_one(a, line, character);
-        if (ha != null) { return ha; }
-        const hb: ASTNode* = NodeLocator::pick_one(b, line, character);
-        if (hb != null) { return hb; }
-        const hc: ASTNode* = NodeLocator::pick_one(c, line, character);
-        if (hc != null) { return hc; }
+    /// `first_covering_child` for a statement.  An `asm` block's operands
+    /// are not descended into, and `break` / `continue` have no children.
+    static stmt_covering_child(s: Stmt*, line: u32, character: u32) -> Node? {
+        match (s.kind) {
+            StmtKind::Block(n) => {
+                return NodeLocator::pick_array_stmt(n.statements, line, character);
+            }
+            StmtKind::UnsafeBlock(n) => {
+                return NodeLocator::pick_one(Node::Stmt(n.block), line, character);
+            }
+            StmtKind::Return(n) => {
+                return NodeLocator::pick_one(Node::Expr(n.expression), line, character);
+            }
+            StmtKind::If(n) => {
+                return NodeLocator::pick(Node::Expr(n.condition), Node::Stmt(n.then_stmt),
+                            Node::Stmt(n.else_stmt), NodeLocator::absent(), line, character);
+            }
+            StmtKind::While(n) => {
+                return NodeLocator::pick(Node::Expr(n.condition), Node::Stmt(n.body),
+                            NodeLocator::absent(), NodeLocator::absent(), line, character);
+            }
+            StmtKind::DoWhile(n) => {
+                return NodeLocator::pick(Node::Stmt(n.body), Node::Expr(n.condition),
+                            NodeLocator::absent(), NodeLocator::absent(), line, character);
+            }
+            StmtKind::For(n) => {
+                return NodeLocator::pick(n.init, Node::Expr(n.condition),
+                            Node::Expr(n.update), Node::Stmt(n.body),
+                            line, character);
+            }
+            StmtKind::Loop(n) => {
+                return NodeLocator::pick_one(Node::Stmt(n.body), line, character);
+            }
+            StmtKind::Expr(n) => {
+                return NodeLocator::pick_one(Node::Expr(n.expression), line, character);
+            }
+            StmtKind::Decl(n) => {
+                return NodeLocator::pick_one(Node::Decl(n.declaration), line, character);
+            }
+            StmtKind::Match(n) => {
+                const subj: Node? = NodeLocator::pick_one(Node::Expr(n.subject), line, character);
+                if (subj.is_some()) { return subj; }
+                return NodeLocator::pick_array_arm(n.arms, line, character);
+            }
+            StmtKind::StaticMatch(n) => {
+                return NodeLocator::pick_static_arm_body(n.arms, line, character);
+            }
+            StmtKind::Asm(_)   => { return Option::None; }
+            StmtKind::Break    => { return Option::None; }
+            StmtKind::Continue => { return Option::None; }
+        }
+    }
+
+    /// An absent node, for a `pick` slot with nothing in it.
+    static absent() -> Node {
+        return Node::Expr(null);
+    }
+
+    static pick(a: Node, b: Node, c: Node, d: Node, line: u32, character: u32) -> Node? {
+        const ha: Node? = NodeLocator::pick_one(a, line, character);
+        if (ha.is_some()) { return ha; }
+        const hb: Node? = NodeLocator::pick_one(b, line, character);
+        if (hb.is_some()) { return hb; }
+        const hc: Node? = NodeLocator::pick_one(c, line, character);
+        if (hc.is_some()) { return hc; }
         return NodeLocator::pick_one(d, line, character);
     }
 
@@ -474,83 +437,77 @@ type struct NodeLocator {
     /// nothing at its span, so the walk looks through it to the written
     /// node under it holding the position, if any: a hole of an f-string
     /// is found under the lowering's calls, not as one of them.
-    static pick_one(a: ASTNode*, line: u32, character: u32) -> ASTNode* {
-        if (a == null || !span_contains(a.span, line, character)) { return null; }
-        if (a.generated) { return NodeLocator::first_covering_child(a, line, character); }
-        return a;
+    static pick_one(a: Node, line: u32, character: u32) -> Node? {
+        if (a.is_null() || !span_contains(a.span(), line, character)) { return Option::None; }
+        if (a.generated()) { return NodeLocator::first_covering_child(a, line, character); }
+        return Option::Some(a);
     }
 
-    static pick_array_expr(arr: &[ExpressionNode*], line: u32, character: u32) -> ASTNode* {
+    static pick_array_expr(arr: &[ExpressionNode*], line: u32, character: u32) -> Node? {
         for (mut i: i64 = 0; i < arr.length; i++) {
-            const hit: ASTNode* = NodeLocator::pick_one(arr[i] as ASTNode*, line, character);
-            if (hit != null) { return hit; }
+            const hit: Node? = NodeLocator::pick_one(Node::Expr(arr[i]), line, character);
+            if (hit.is_some()) { return hit; }
         }
-        return null;
+        return Option::None;
+    }
+
+    /// The struct literal field VALUE holding the position, itself rather
+    /// than a node inside it: the cursor on a value expression (an
+    /// identifier, a `Foo::Bar` path, a literal) reaches it.  On a field
+    /// name nothing holds the position, and the caller falls back to the
+    /// literal's hover, which tells cursor-on-name from cursor-on-head.
+    static pick_field_value(fields: &[FieldInit], line: u32, character: u32) -> Node? {
+        for (mut i: i64 = 0; i < fields.length; i++) {
+            const v: ExpressionNode* = fields[i].value;
+            if (v != null && span_contains(v.span, line, character)) {
+                return Option::Some(Node::Expr(v));
+            }
+        }
+        return Option::None;
     }
 
     /// The statement holding the position.  A statement the compiler wrote
     /// beside a written one can share its span (a release after a discarded
     /// value), so it is looked through as `pick_one` looks through any node
     /// the compiler wrote, and the walk goes on to the next.
-    static pick_array_stmt(arr: &[StatementNode*], line: u32, character: u32) -> ASTNode* {
+    static pick_array_stmt(arr: &[Stmt*], line: u32, character: u32) -> Node? {
         for (mut i: i64 = 0; i < arr.length; i++) {
-            const hit: ASTNode* = NodeLocator::pick_one(arr[i] as ASTNode*, line, character);
-            if (hit != null) { return hit; }
+            const hit: Node? = NodeLocator::pick_one(Node::Stmt(arr[i]), line, character);
+            if (hit.is_some()) { return hit; }
         }
-        return null;
+        return Option::None;
     }
 
-    static pick_array_var(arr: &[VarDeclNode*], line: u32, character: u32) -> ASTNode* {
+    static pick_array_method(arr: &[DeclarationNode*], line: u32, character: u32) -> Node? {
         for (mut i: i64 = 0; i < arr.length; i++) {
-            const elem: VarDeclNode* = arr[i];
-            if (elem != null && span_contains(elem.span, line, character)) {
-                return elem as ASTNode*;
+            const elem_decl: DeclarationNode* = arr[i];
+            const elem: MethodDecl* = DeclarationNode::method_of(elem_decl);
+            if (elem != null && span_contains(elem_decl.span, line, character)) {
+                return Option::Some(Node::Decl(elem_decl));
             }
         }
-        return null;
-    }
-
-    static pick_array_method(arr: &[MethodNode*], line: u32, character: u32) -> ASTNode* {
-        for (mut i: i64 = 0; i < arr.length; i++) {
-            const elem: MethodNode* = arr[i];
-            if (elem != null && span_contains(elem.span, line, character)) {
-                return elem as ASTNode*;
-            }
-        }
-        return null;
-    }
-
-    /// Bare-function variant: `TraitDeclNode.methods` is a
-    /// `[FunctionDeclNode*]` rather than `[MethodNode*]`, so it can't go
-    /// through `pick_array_method`.
-    static pick_array_function(arr: &[FunctionDeclNode*], line: u32, character: u32) -> ASTNode* {
-        for (mut i: i64 = 0; i < arr.length; i++) {
-            const elem: FunctionDeclNode* = arr[i];
-            if (elem != null && span_contains(elem.span, line, character)) {
-                return elem as ASTNode*;
-            }
-        }
-        return null;
+        return Option::None;
     }
 
     /// Like `pick_array_method`, but skips methods whose span.file differs
-    /// from `expected_file`.  Used by the ImplementationBlock dispatch:
+    /// from `expected_file`.  Used by the implement-block dispatch:
     /// `synthesize_default_trait_methods` clones default-bodied trait
     /// methods into the impl's `methods` array, and the clones retain
     /// spans from the trait decl's source file.  Without the file filter
     /// a line-only match can pick a synthesized method whose line range
     /// overlaps the impl head in the impl's own file.
-    static pick_array_method_in_file(arr: &[MethodNode*], expected_file: string,
-                                        line: u32, character: u32) -> ASTNode* {
+    static pick_array_method_in_file(arr: &[DeclarationNode*], expected_file: string,
+                                        line: u32, character: u32) -> Node? {
         for (mut i: i64 = 0; i < arr.length; i++) {
-            const elem: MethodNode* = arr[i];
+            const elem_decl: DeclarationNode* = arr[i];
+            const elem: MethodDecl* = DeclarationNode::method_of(elem_decl);
             if (elem == null) { continue; }
-            if (!NodeLocator::same_file(elem.span.file, expected_file)) { continue; }
-            if (span_contains(elem.span, line, character)) {
-                return elem as ASTNode*;
+            if (!NodeLocator::same_file(elem_decl.span.file, expected_file)) { continue; }
+            if (span_contains(elem_decl.span, line, character)) {
+                return Option::Some(Node::Decl(elem_decl));
             }
         }
-        return null;
+        return Option::None;
     }
 
     /// String equality on file paths.  Both args may be null; null/empty
@@ -560,55 +517,72 @@ type struct NodeLocator {
         return a.eq(b);
     }
 
-    static pick_array_field(arr: &[FieldDeclNode*], line: u32, character: u32) -> ASTNode* {
-        for (mut i: i64 = 0; i < arr.length; i++) {
-            const elem: FieldDeclNode* = arr[i];
-            if (elem != null && span_contains(elem.span, line, character)) {
-                return elem as ASTNode*;
-            }
-        }
-        return null;
-    }
-
-    static pick_array_arm(arr: &[MatchArmNode*], line: u32, character: u32) -> ASTNode* {
+    static pick_array_arm(arr: &[MatchArmNode*], line: u32, character: u32) -> Node? {
         for (mut i: i64 = 0; i < arr.length; i++) {
             const elem: MatchArmNode* = arr[i];
             if (elem != null && span_contains(elem.span, line, character)) {
-                return elem as ASTNode*;
+                return Option::Some(Node::Arm(elem));
             }
         }
-        return null;
+        return Option::None;
     }
 
-    static pick_array_variant(arr: &[EnumVariantNode*], line: u32, character: u32) -> ASTNode* {
+    /// The node under the position in a `match` expression's subject, else
+    /// the arm that covers it.
+    static pick_match_expr(m: MatchExpr*, line: u32, character: u32) -> Node? {
+        const subj: Node? = NodeLocator::pick_one(Node::Expr(m.subject), line, character);
+        if (subj.is_some()) { return subj; }
+        return NodeLocator::pick_array_arm(m.arms, line, character);
+    }
+
+    /// The node under the position in the first `static match` arm body that
+    /// holds one.
+    static pick_static_arm_body(arr: &[StaticMatchArmNode*], line: u32, character: u32) -> Node? {
         for (mut i: i64 = 0; i < arr.length; i++) {
-            const elem: EnumVariantNode* = arr[i];
-            if (elem != null && span_contains(elem.span, line, character)) {
-                return elem as ASTNode*;
-            }
+            const arm: StaticMatchArmNode* = arr[i];
+            if (arm == null || arm.body == null) { continue; }
+            const hit: Node? = NodeLocator::pick_one(Node::Stmt(arm.body), line, character);
+            if (hit.is_some()) { return hit; }
         }
-        return null;
+        return Option::None;
     }
 
-    static pick_array_pattern(arr: &[PatternNode*], line: u32, character: u32) -> ASTNode* {
+    static pick_array_decl(arr: &[DeclarationNode*], line: u32, character: u32) -> Node? {
         for (mut i: i64 = 0; i < arr.length; i++) {
-            const elem: PatternNode* = arr[i];
+            const elem: DeclarationNode* = arr[i];
             if (elem != null && span_contains(elem.span, line, character)) {
-                return elem as ASTNode*;
+                return Option::Some(Node::Decl(elem));
             }
         }
-        return null;
+        return Option::None;
     }
 
-    /// `ProgramNode.statements` mixes raw decl nodes and `DeclStmtNode`
-    /// wrappers depending on how the parser shaped that file's top-level
-    /// list.  Unwrap so callers can branch on the inner decl's `NodeKind`
-    /// directly.
-    static unwrap_decl_stmt(node: ASTNode*) -> ASTNode* {
-        if (node == null) { return null; }
-        if (node.kind != NodeKind::DeclarationStatement) { return node; }
-        const d: DeclStmtNode* = node as DeclStmtNode*;
-        return d.declaration as ASTNode*;
+    static pick_array_pattern(arr: &[Pattern*], line: u32, character: u32) -> Node? {
+        for (mut i: i64 = 0; i < arr.length; i++) {
+            const elem: Pattern* = arr[i];
+            if (elem != null && span_contains(elem.span, line, character)) {
+                return Option::Some(Node::Pattern(elem));
+            }
+        }
+        return Option::None;
+    }
+
+    /// A program's items mix bare declarations and declaration statements
+    /// depending on how the parser shaped the file's top-level list.
+    /// Unwrap so callers can branch on the inner declaration directly.
+    static unwrap_decl_stmt(node: Node) -> Node {
+        match (node) {
+            Node::Stmt(s) => {
+                if (s != null) {
+                    match (s.kind) {
+                        StmtKind::Decl(d) => { return Node::Decl(d.declaration); }
+                        _                 => { }
+                    }
+                }
+            }
+            _ => { }
+        }
+        return node;
     }
 
 }

@@ -21,21 +21,21 @@
 /// semantics in DirectiveProcessing are independent of platform gating.
 ///
 /// Scope of stripping:
-///   * top-level declarations (functions, structs, classes, enums,
+///   * top-level declarations (functions, structs, enums,
 ///     traits, type aliases, impl/extern blocks, ...) via their attached
 ///     directives;
-///   * whole `![target(...)]`-gated METHODS inside struct/class/impl
+///   * whole `![target(...)]`-gated METHODS inside struct/impl
 ///     bodies (filtered out of the owning node's `methods` list);
 ///   * inline `![dir] { stmt; ... }` blocks inside function AND method
 ///     bodies (see `process_block`).
-/// Struct/class FIELDS and enum VARIANTS are intentionally NOT gated:
+/// Struct FIELDS and enum VARIANTS are intentionally NOT gated:
 /// gating a data member would diverge a type's layout per platform.  Gate
 /// the whole type instead (write two same-named decls, one per OS).
 
 namespace compiler::passes::config_gating;
 
 import compiler::ast;
-import compiler::ast::{ declaration, node, NodeKind, pattern, statement };
+import compiler::ast::{ declaration, node, pattern, statement };
 import compiler::passes::pass_id;
 import compiler::passes::pass_id::{ PassResult };
 import compiler::compilation_context;
@@ -47,12 +47,12 @@ import compiler::diag::{ ErrorCode };
 import utils::logger;
 import utils::logger::{ cdebug };
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, FunctionDeclNode, ImplBlockNode, MethodNode,
-    StructDeclNode, UnionDeclNode
+    DeclarationNode, FunctionDecl, ImplBlock, MethodDecl,
+    StructDecl, UnionDecl
 };
-import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::node::{ ProgramNode };
 import compiler::ast::pattern::{ DirectiveArg, DirectiveArgKind, DirectiveNode };
-import compiler::ast::statement::{ BlockStmtNode, StatementNode };
+import compiler::ast::statement::{ BlockStmt, Stmt, StmtKind };
 import utils::keyword::{ Keyword };
 import std::core::mem;
 
@@ -321,8 +321,7 @@ type struct ConfigGatingPasses {
     /// Same predicate for block-attached directives.  Used by the
     /// function-body walker to decide whether `![dir] { ... }` blocks
     /// survive.
-    static block_is_active(block: BlockStmtNode*, env: CfgEnv) -> boolean {
-        if (block == null) { return true; }
+    static block_is_active(block: BlockStmt*, env: CfgEnv) -> boolean {
         for (mut i: i64 = 0; i < block.attached_directives.length; i++) {
             const d: DirectiveNode* = block.attached_directives[i];
             const r: CfgEvalResult = ConfigGatingPasses::eval_directive(d, env);
@@ -341,43 +340,48 @@ type struct ConfigGatingPasses {
     /// so gates can sit at any nesting level.  Active gated blocks have
     /// their `attached_directives` cleared once kept; downstream passes
     /// see them as plain blocks.
-    static process_block(block: BlockStmtNode*, env: CfgEnv, ctx: CompilationContext*) -> void {
-        if (block == null) { return; }
+    static process_block(block_stmt: Stmt*, env: CfgEnv, ctx: CompilationContext*) -> void {
+        if (block_stmt == null) { return; }
+        const block: BlockStmt* = block_stmt.as_block();
         // Fast-path scan: most function bodies have no inline cfg-gated
         // sub-blocks at all.  Skip the rebuild loop in that case so we
         // don't touch `block.statements`; array assignment through a
-        // class-field write is a known-fragile codegen path on the
-        // current pin.
+        // field write through a pointer is a known-fragile codegen path on
+        // the current pin.
         mut needs_filter: boolean = false;
         for (mut i: i64 = 0; i < block.statements.length; i++) {
-            const stmt: StatementNode* = block.statements[i];
+            const stmt: Stmt* = block.statements[i];
             if (stmt == null) { continue; }
-            if (stmt.kind == NodeKind::BlockStatement) {
-                const inner: BlockStmtNode* = stmt as BlockStmtNode*;
-                if (inner.has_directives()) { needs_filter = true; break; }
+            match (stmt.kind) {
+                StmtKind::Block(inner) => {
+                    if (inner.has_directives()) { needs_filter = true; break; }
+                }
+                _ => {}
             }
         }
         if (!needs_filter) { return; }
 
-        mut kept: [StatementNode*] = [];
+        mut kept: [Stmt*] = [];
         for (mut i: i64 = 0; i < block.statements.length; i++) {
-            const stmt: StatementNode* = block.statements[i];
+            const stmt: Stmt* = block.statements[i];
             if (stmt == null) { continue; }
 
-            if (stmt.kind == NodeKind::BlockStatement) {
-                const inner: BlockStmtNode* = stmt as BlockStmtNode*;
-                if (inner.has_directives() && !ConfigGatingPasses::block_is_active(inner, env)) {
-                    // `outer_span`, not `span`: the gating `![dir]` sits before
-                    // the `{` and is part of what got compiled out, so the LSP
-                    // must dim it too.
-                    ctx.note_inactive(inner.outer_span());
-                    if (ctx.options.verbose) {
-                        cdebug("[ConfigGating] stripped inline block at line %u\n",
-                            inner.span.start_line);
+            match (stmt.kind) {
+                StmtKind::Block(inner) => {
+                    if (inner.has_directives() && !ConfigGatingPasses::block_is_active(inner, env)) {
+                        // `outer_span`, not `span`: the gating `![dir]` sits before
+                        // the `{` and is part of what got compiled out, so the LSP
+                        // must dim it too.
+                        ctx.note_inactive(stmt.outer_span());
+                        if (ctx.options.verbose) {
+                            cdebug("[ConfigGating] stripped inline block at line %u\n",
+                                stmt.span.start_line);
+                        }
+                        continue;
                     }
-                    continue;
+                    ConfigGatingPasses::process_block(stmt, env, ctx);
                 }
-                ConfigGatingPasses::process_block(inner, env, ctx);
+                _ => {}
             }
             kept.push(stmt);
         }
@@ -391,11 +395,12 @@ type struct ConfigGatingPasses {
     /// `match` expression's arms has historically miscompiled.  Borrows the
     /// list (read-only) so the caller keeps ownership of the owning node's
     /// `methods` field.
-    static walk_method_bodies(methods: &[MethodNode*], env: CfgEnv, ctx: CompilationContext*) -> void {
+    static walk_method_bodies(methods: &[DeclarationNode*], env: CfgEnv, ctx: CompilationContext*) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: MethodNode* = methods[i];
+            const m_decl: DeclarationNode* = methods[i];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m != null && m.func != null) {
-                const body: BlockStmtNode* = m.func.body;
+                const body: Stmt* = DeclarationNode::fn_of(m.func).body;
                 ConfigGatingPasses::process_block(body, env, ctx);
             }
         }
@@ -404,38 +409,40 @@ type struct ConfigGatingPasses {
     /// True if any method in `methods` carries a platform gate that evaluates
     /// Inactive for `os` - i.e. the list needs to be rebuilt.  Scans without
     /// allocating so the overwhelmingly-common no-gate case stays cheap and
-    /// never rewrites the owning node's `methods` field (a class-field array
+    /// never rewrites the owning node's `methods` field (an array field
     /// write is a heavier codegen path; mirrors `process_block`'s fast-path).
-    static methods_need_filter(methods: &[MethodNode*], env: CfgEnv) -> boolean {
+    static methods_need_filter(methods: &[DeclarationNode*], env: CfgEnv) -> boolean {
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: MethodNode* = methods[i];
+            const m_decl: DeclarationNode* = methods[i];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null) { continue; }
-            if (!ConfigGatingPasses::decl_is_active(m as DeclarationNode*, env)) { return true; }
+            if (!ConfigGatingPasses::decl_is_active(m_decl as DeclarationNode*, env)) { return true; }
         }
         return false;
     }
 
     /// Build a fresh method list keeping only the methods active for `os`.
-    /// The caller assigns the result back onto the owning struct/class/impl
+    /// The caller assigns the result back onto the owning struct/impl
     /// node; only invoked after `methods_need_filter` confirms a rebuild is
     /// needed.  A method survives unless one of its attached gates evaluates
     /// Inactive - the same predicate (`decl_is_active`) used for top-level
     /// declarations, so `![target(windows)]` / `![target(unix)]` on a method
     /// behaves exactly like it does on a free function.
-    static active_methods(methods: &[MethodNode*], env: CfgEnv,
-                            ctx: CompilationContext*) -> [MethodNode*] {
-        mut kept: [MethodNode*] = [];
+    static active_methods(methods: &[DeclarationNode*], env: CfgEnv,
+                            ctx: CompilationContext*) -> [DeclarationNode*] {
+        mut kept: [DeclarationNode*] = [];
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: MethodNode* = methods[i];
+            const m_decl: DeclarationNode* = methods[i];
+            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null) { continue; }
-            if (!ConfigGatingPasses::decl_is_active(m as DeclarationNode*, env)) {
-                ctx.note_inactive(m.outer_span());
+            if (!ConfigGatingPasses::decl_is_active(m_decl as DeclarationNode*, env)) {
+                ctx.note_inactive(m_decl.outer_span());
                 if (ctx.options.verbose) {
                     cdebug("[ConfigGating] stripped gated method for target os\n");
                 }
                 continue;
             }
-            kept.push(m);
+            kept.push(m_decl);
         }
         return kept;
     }
@@ -470,42 +477,20 @@ type struct ConfigGatingPasses {
             return PassResult::failure(1);
         }
 
-        mut kept: [ASTNode*] = [];
+        mut kept: [Node] = [];
         mut stripped: i64 = 0;
 
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i];
-            if (stmt == null) { continue; }
+            const item: Node = root.statements[i];
+            if (item.is_null()) { continue; }
 
-            // Only DeclarationNode subclasses carry attached_directives.
-            // Everything else passes through.
-            const k: NodeKind = stmt.kind;
-            const is_decl: boolean = match (k) {
-                NodeKind::VariableDeclaration       => { true }
-                NodeKind::DestructureDeclaration    => { true }
-                NodeKind::FunctionDeclaration       => { true }
-                NodeKind::MethodDeclaration         => { true }
-                NodeKind::IntrinsicDeclaration      => { true }
-                NodeKind::IntrinsicConstDeclaration => { true }
-                NodeKind::ImportDeclaration         => { true }
-                NodeKind::ModuleDeclaration         => { true }
-                NodeKind::StructDeclaration         => { true }
-                NodeKind::UnionDeclaration          => { true }
-                NodeKind::ClassDeclaration          => { true }
-                NodeKind::EnumDeclaration           => { true }
-                NodeKind::TraitDeclaration          => { true }
-                NodeKind::TypeAliasDeclaration      => { true }
-                NodeKind::ImplementationBlock       => { true }
-                NodeKind::ExternBlock               => { true }
-                _                                   => { false }
-            };
-
-            if (!is_decl) {
-                kept.push(stmt);
+            // Only declarations carry attached directives.  Everything else
+            // passes through.
+            const decl: DeclarationNode* = item.as_decl();
+            if (decl == null) {
+                kept.push(item);
                 continue;
             }
-
-            const decl: DeclarationNode* = stmt as DeclarationNode*;
             if (!ConfigGatingPasses::decl_is_active(decl, env)) {
                 stripped += 1;
                 // Remember where it was before it's dropped from the AST, so
@@ -516,65 +501,57 @@ type struct ConfigGatingPasses {
                 // would leave both rendering as live code.
                 ctx.note_inactive(decl.outer_span());
                 if (ctx.options.verbose) {
-                    cdebug("[ConfigGating] stripped %s for target os\n",
-                        k.to_string());
+                    cdebug("[ConfigGating] stripped a declaration for target os\n");
                 }
                 continue;
             }
 
             // Recurse into function/method bodies for inline `![dir] { ... }`
             // gates, and strip whole `![target(...)]`-gated methods inside
-            // struct / class / impl bodies.  Method-list filtering uses the
+            // struct / impl bodies.  Method-list filtering uses the
             // same `decl_is_active` predicate as top-level decls, so a
             // platform gate on a method behaves identically to one on a free
             // function - no more delegate-to-free-helper workaround needed.
             // Each cast sits in its own straight-line `if` (never in `match`
             // arms) to dodge the historic consecutive-cast-and-call miscompile.
-            if (k == NodeKind::FunctionDeclaration) {
-                const fd: FunctionDeclNode* = stmt as FunctionDeclNode*;
-                const body: BlockStmtNode* = fd.body;
+            if (DeclarationNode::fn_of(decl) != null) {
+                const fd: FunctionDecl* = DeclarationNode::fn_of(decl);
+                const body: Stmt* = fd.body;
                 if (body != null) {
                     ConfigGatingPasses::process_block(body, env, ctx);
                 }
             }
-            if (k == NodeKind::MethodDeclaration) {
-                const md: MethodNode* = stmt as MethodNode*;
+            if (DeclarationNode::method_of(decl) != null) {
+                const md: MethodDecl* = DeclarationNode::method_of(decl);
                 if (md.func != null) {
-                    const mbody: BlockStmtNode* = md.func.body;
+                    const mbody: Stmt* = DeclarationNode::fn_of(md.func).body;
                     if (mbody != null) {
                         ConfigGatingPasses::process_block(mbody, env, ctx);
                     }
                 }
             }
-            if (k == NodeKind::StructDeclaration) {
-                const sd: StructDeclNode* = stmt as StructDeclNode*;
+            const sd: StructDecl* = DeclarationNode::struct_of(decl);
+            if (sd != null) {
                 if (ConfigGatingPasses::methods_need_filter(&sd.methods, env)) {
                     sd.methods = ConfigGatingPasses::active_methods(&sd.methods, env, ctx);
                 }
                 ConfigGatingPasses::walk_method_bodies(&sd.methods, env, ctx);
             }
-            if (k == NodeKind::UnionDeclaration) {
-                const ud: UnionDeclNode* = stmt as UnionDeclNode*;
+            const ud: UnionDecl* = DeclarationNode::union_of(decl);
+            if (ud != null) {
                 if (ConfigGatingPasses::methods_need_filter(&ud.methods, env)) {
                     ud.methods = ConfigGatingPasses::active_methods(&ud.methods, env, ctx);
                 }
                 ConfigGatingPasses::walk_method_bodies(&ud.methods, env, ctx);
             }
-            if (k == NodeKind::ClassDeclaration) {
-                const cd: ClassDeclNode* = stmt as ClassDeclNode*;
-                if (ConfigGatingPasses::methods_need_filter(&cd.methods, env)) {
-                    cd.methods = ConfigGatingPasses::active_methods(&cd.methods, env, ctx);
-                }
-                ConfigGatingPasses::walk_method_bodies(&cd.methods, env, ctx);
-            }
-            if (k == NodeKind::ImplementationBlock) {
-                const ib: ImplBlockNode* = stmt as ImplBlockNode*;
+            const ib: ImplBlock* = DeclarationNode::impl_of(decl);
+            if (ib != null) {
                 if (ConfigGatingPasses::methods_need_filter(&ib.methods, env)) {
                     ib.methods = ConfigGatingPasses::active_methods(&ib.methods, env, ctx);
                 }
                 ConfigGatingPasses::walk_method_bodies(&ib.methods, env, ctx);
             }
-            kept.push(stmt);
+            kept.push(item);
         }
 
         if (stripped > 0) {
@@ -588,7 +565,7 @@ type struct ConfigGatingPasses {
         } else {
             // Nothing stripped: `root.statements` keeps its original array and
             // the freshly-built `kept` copy is discarded.  Release its array
-            // spine (the ASTNode* elements are arena-owned and unaffected).
+            // spine (the nodes it holds are arena-owned and unaffected).
             mem::drop(kept);
         }
 

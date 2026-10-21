@@ -1,40 +1,165 @@
 /// AST Statement Nodes
 ///
-/// StatementNode base and all 14 concrete statement classes.
+/// `Stmt`, the header every statement shares, and one payload struct per
+/// kind of statement.
 
 namespace compiler::ast::statement;
 
 import compiler::diag;
 import compiler::ast;
-import compiler::ast::{ NodeKind, TypeAnnotation };
+import compiler::ast::{ TypeAnnotation };
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::ast::node;
-import compiler::ast::node::{ ASTNode };
+import compiler::ast::node::{ Node };
 import compiler::ast::expression;
 import compiler::ast::expression::{ ExpressionNode };
 import compiler::ast::declaration;
 import compiler::ast::declaration::{ DeclarationNode };
 import compiler::ast::pattern;
 import compiler::ast::pattern::{ DirectiveNode, MatchArmNode, StaticMatchArmNode };
-import compiler::ast::visitor;
-import compiler::ast::visitor::{ ASTVisitor };
+import compiler::ast::walk::{ Walk };
+import compiler::codegen::ast_arena::{ cryo_ast_arena_alloc };
 
-type class StatementNode : ASTNode {
-public:
-    StatementNode(kind: NodeKind, span: SourceSpan) : ASTNode(kind, span) {}
+/// Every statement: what all kinds share, and which kind of statement it is.
+type struct Stmt {
+    span:      SourceSpan;
+    has_error: boolean;
+    /// The compiler wrote this node where the source spells nothing, and
+    /// gave it the span of the source it stands for; a reader asking what is
+    /// written at a position (the editor) looks through it.
+    generated: boolean;
+    kind:      StmtKind;
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+    /// A statement of `kind` at `span`.
+    static of(kind: StmtKind, span: SourceSpan) -> Stmt* {
+        return new Stmt { span: span, has_error: false, generated: false, kind: kind };
+    }
+
+    /// `{ }`, with no statements yet.
+    static block(span: SourceSpan) -> Stmt* {
+        return Stmt::of(StmtKind::Block(BlockStmt::new()), span);
+    }
+
+    /// `unsafe` over `block`, which is a block statement.
+    static unsafe_block(block: Stmt*, span: SourceSpan) -> Stmt* {
+        return Stmt::of(StmtKind::UnsafeBlock(new UnsafeBlockStmt { block: block }), span);
+    }
+
+    /// `return expression;`, or a bare `return;` when `expression` is null.
+    static return_stmt(expression: ExpressionNode*, span: SourceSpan) -> Stmt* {
+        return Stmt::of(StmtKind::Return(new ReturnStmt { expression: expression, synth_drops: [] }), span);
+    }
+
+    /// `if (condition) then_stmt else else_stmt`; `else_stmt` may be null.
+    static if_stmt(condition: ExpressionNode*, then_stmt: Stmt*, else_stmt: Stmt*,
+                   span: SourceSpan) -> Stmt* {
+        return Stmt::of(StmtKind::If(new IfStmt {
+            condition: condition, then_stmt: then_stmt, else_stmt: else_stmt,
+        }), span);
+    }
+
+    static while_stmt(condition: ExpressionNode*, body: Stmt*, span: SourceSpan) -> Stmt* {
+        return Stmt::of(StmtKind::While(new WhileStmt { condition: condition, body: body }), span);
+    }
+
+    static do_while_stmt(body: Stmt*, condition: ExpressionNode*, span: SourceSpan) -> Stmt* {
+        return Stmt::of(StmtKind::DoWhile(new DoWhileStmt { body: body, condition: condition }), span);
+    }
+
+    /// `for (init; condition; update) body`; each of the first three may be
+    /// absent.
+    static for_stmt(init: Node, condition: ExpressionNode*, update: ExpressionNode*,
+                    body: Stmt*, span: SourceSpan) -> Stmt* {
+        return Stmt::of(StmtKind::For(new ForStmt {
+            init: init, condition: condition, update: update, body: body,
+        }), span);
+    }
+
+    static break_stmt(span: SourceSpan) -> Stmt* {
+        return Stmt::of(StmtKind::Break, span);
+    }
+
+    static continue_stmt(span: SourceSpan) -> Stmt* {
+        return Stmt::of(StmtKind::Continue, span);
+    }
+
+    static expr_stmt(expression: ExpressionNode*, span: SourceSpan) -> Stmt* {
+        return Stmt::of(StmtKind::Expr(new ExprStmt { expression: expression }), span);
+    }
+
+    static decl_stmt(declaration: DeclarationNode*, span: SourceSpan) -> Stmt* {
+        return Stmt::of(StmtKind::Decl(new DeclStmt { declaration: declaration }), span);
+    }
+
+    /// `loop body`.
+    static loop_stmt(body: Stmt*, span: SourceSpan) -> Stmt* {
+        return Stmt::of(StmtKind::Loop(new LoopStmt { body: body }), span);
+    }
+
+    /// The block this statement is.  For a statement whose kind is fixed by
+    /// where it stands - a function's body, the block under `unsafe` - so
+    /// any other kind here is a compiler defect.
+    as_block(&this) -> BlockStmt* {
+        match (this.kind) {
+            StmtKind::Block(b) => { return b; }
+            _ => { unreachable(); }
+        }
+    }
+
+    /// The statement's full written extent: `span` (which starts at a
+    /// block's `{`) widened to cover the `![...]` directives that gate a
+    /// block.  Anything highlighting the gated construct as a whole - the
+    /// LSP's inactive-region dimming - needs the directive included, since
+    /// that is what the reader sees as the reason the block is compiled
+    /// out.  Mirrors `DeclarationNode::outer_span`.
+    outer_span(&this) -> SourceSpan {
+        mut out: SourceSpan = this.span;
+        match (this.kind) {
+            StmtKind::Block(b) => {
+                for (mut i: i64 = 0; i < b.attached_directives.length; i++) {
+                    const d: DirectiveNode* = b.attached_directives[i];
+                    if (d != null) {
+                        out = SourceSpan::covering(out, d.span);
+                    }
+                }
+            }
+            _ => {}
+        }
+        return out;
     }
 }
 
+/// `new` of a node takes its storage from the AST arena; `delete` of one
+/// releases nothing, since the arena is reclaimed whole.
+implement trait Allocate for struct Stmt {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
+}
 
-// Concrete Statement Nodes
+/// What a statement is, one variant per kind.
+type enum StmtKind {
+    Block(BlockStmt*);
+    UnsafeBlock(UnsafeBlockStmt*);
+    Asm(AsmBlockStmt*);
+    Return(ReturnStmt*);
+    If(IfStmt*);
+    While(WhileStmt*);
+    DoWhile(DoWhileStmt*);
+    For(ForStmt*);
+    Match(MatchStmt*);
+    StaticMatch(StaticMatchStmt*);
+    Break;
+    Continue;
+    Expr(ExprStmt*);
+    Decl(DeclStmt*);
+    Loop(LoopStmt*);
+}
 
-type class BlockStmtNode : StatementNode {
-public:
-    statements: [StatementNode*];
+
+type struct BlockStmt {
+    statements: [Stmt*];
     /// Directives written as `![name(args)]` immediately preceding this
     /// block when it appears in statement position (e.g. `![windows] { ... }`
     /// inside a function body).  Evaluated by the ConfigGating pass:
@@ -49,61 +174,38 @@ public:
     /// arm-value extraction.  Emitting them as trailing statements would make
     /// codegen mistake a drop for the arm value; emitting them before the value
     /// statement would free a local the value expression still reads.  So they
-    /// are stashed here and replayed at the end of `generate_block` (preserving
-    /// `state.last_value`).  Empty for every non-value block.  Mirrors
-    /// `ReturnStmtNode.synth_drops`.
-    synth_drops: [StatementNode*];
+    /// are stashed here and replayed at the end of `generate_block`, which
+    /// keeps the value statement's value as the block's.  Empty for every
+    /// non-value block.  Mirrors `ReturnStmt.synth_drops`.
+    synth_drops: [Stmt*];
 
-    BlockStmtNode(span: SourceSpan) : StatementNode(NodeKind::BlockStatement, span) {
-        this.statements = [];
-        this.attached_directives = [];
-        this.synth_drops = [];
+    static new() -> BlockStmt* {
+        return new BlockStmt { statements: [], attached_directives: [], synth_drops: [] };
     }
 
-    add_statement(stmt: StatementNode*) -> void {
+    add_statement(mut &this, stmt: Stmt*) -> void {
         this.statements.push(stmt);
     }
 
-    add_directive(d: DirectiveNode*) -> void {
+    add_directive(mut &this, d: DirectiveNode*) -> void {
         if (d != null) { this.attached_directives.push(d); }
     }
 
-    has_directives() -> boolean { return this.attached_directives.length > 0; }
+    has_directives(&this) -> boolean { return this.attached_directives.length > 0; }
 
-    /// The block's full written extent: `span` (which starts at `{`) widened
-    /// to cover the `![...]` directives that gate it.  Anything highlighting
-    /// the gated construct as a whole - the LSP's inactive-region dimming -
-    /// needs the directive included, since that is what the reader sees as
-    /// the reason the block is compiled out.  Mirrors
-    /// `DeclarationNode::outer_span`.
-    outer_span(&this) -> SourceSpan {
-        mut out: SourceSpan = this.span;
-        for (mut i: i64 = 0; i < this.attached_directives.length; i++) {
-            const d: DirectiveNode* = this.attached_directives[i];
-            if (d != null) {
-                out = SourceSpan::covering(out, d.span);
-            }
-        }
-        return out;
-    }
-
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+    /// Visit the statements in order.
+    static walk_children<V>(n: BlockStmt*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.statements.length; i++) { v.walk_stmt(n.statements[i]); }
     }
 }
 
 
-type class UnsafeBlockStmtNode : StatementNode {
-public:
-    block: BlockStmtNode*;
+type struct UnsafeBlockStmt {
+    /// A block statement.
+    block: Stmt*;
 
-    UnsafeBlockStmtNode(block: BlockStmtNode*, span: SourceSpan)
-        : StatementNode(NodeKind::UnsafeBlockStatement, span) {
-        this.block = block;
-    }
-
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+    static walk_children<V>(n: UnsafeBlockStmt*, v: mut &V) -> void where V: Walk {
+        v.walk_stmt(n.block);
     }
 }
 
@@ -137,10 +239,9 @@ type enum AsmConstraintKind {
 }
 
 /// One operand of an `asm` block: a Cryo expression bound into the
-/// assembly with a direction and a constraint class.  See
-/// `visit(AsmBlockStmtNode*)` in codegen/ir_generator.cryo for lowering.
-type class AsmOperand {
-public:
+/// assembly with a direction and a constraint class.  See `emit_asm_block`
+/// in codegen/ir_generator.cryo for lowering.
+type struct AsmOperand {
     direction: AsmOpDir;
     /// The Cryo operand.  Inputs are read as rvalues; outputs / in-outs
     /// must be assignable lvalues (the call result is stored back).
@@ -148,40 +249,48 @@ public:
     constraint: AsmConstraintKind;
     /// Register name when `constraint == Pinned` (e.g. "rax"); else "".
     pinned_reg: string;
+}
 
-    AsmOperand(direction: AsmOpDir, expr: ExpressionNode*,
-               constraint: AsmConstraintKind, pinned_reg: string) {
-        this.direction = direction;
-        this.expr = expr;
-        this.constraint = constraint;
-        this.pinned_reg = pinned_reg;
+/// A copy that shares the operand's expression; the AST cloner replaces
+/// `expr` with its own copy of the expression.
+implement trait Clone for struct AsmOperand {
+    clone(&this) -> AsmOperand {
+        return AsmOperand {
+            direction:  this.direction,
+            expr:       this.expr,
+            constraint: this.constraint,
+            pinned_reg: this.pinned_reg,
+        };
     }
 }
 
 /// One chunk of an `asm` template: either raw assembly text or a
-/// reference to an operand (by index into `AsmBlockStmtNode.operands`).
+/// reference to an operand (by index into `AsmBlockStmt.operands`).
 /// Codegen concatenates the pieces, substituting `$N` for operand refs
 /// (N assigned in outputs-first constraint order).
-type class AsmPiece {
-public:
+type struct AsmPiece {
     is_operand: boolean;
     /// Raw assembly text when `!is_operand`.
     text: string;
     /// Index into `operands` when `is_operand`.
     operand_index: i64;
 
-    AsmPiece(is_operand: boolean, text: string, operand_index: i64) {
-        this.is_operand = is_operand;
-        this.text = text;
-        this.operand_index = operand_index;
+    static raw(text: string) -> AsmPiece {
+        return AsmPiece { is_operand: false, text: text, operand_index: 0 };
     }
 
-    static raw(text: string) -> AsmPiece* {
-        return new AsmPiece(false, text, 0);
+    static operand(index: i64) -> AsmPiece {
+        return AsmPiece { is_operand: true, text: "", operand_index: index };
     }
+}
 
-    static operand(index: i64) -> AsmPiece* {
-        return new AsmPiece(true, "", index);
+implement trait Clone for struct AsmPiece {
+    clone(&this) -> AsmPiece {
+        return AsmPiece {
+            is_operand:    this.is_operand,
+            text:          this.text,
+            operand_index: this.operand_index,
+        };
     }
 }
 
@@ -191,13 +300,12 @@ public:
 /// gate the block in the ConfigGating pass) and the dialect.  An optional
 /// `![clobber(...)]` directive lists clobbered registers / `flags` / `memory`.
 /// A module-level `asm { ... }` (no operands) lowers to module inline asm.
-type class AsmBlockStmtNode : StatementNode {
-public:
+type struct AsmBlockStmt {
     /// Target architecture from `![arch(...)]` (e.g. "x86_64").
     arch: string;
     dialect: AsmDialect;
-    operands: [AsmOperand*];
-    pieces: [AsmPiece*];
+    operands: [AsmOperand];
+    pieces: [AsmPiece];
     /// Clobber tokens from `![clobber(...)]` (register names, "flags", "memory").
     clobbers: [string];
     /// True when written at module scope (naked / global asm, no operands).
@@ -206,256 +314,261 @@ public:
     /// directive-processing validation pass.
     attached_directives: [DirectiveNode*];
 
-    AsmBlockStmtNode(span: SourceSpan)
-        : StatementNode(NodeKind::AsmBlockStatement, span) {
-        this.arch = "";
-        this.dialect = AsmDialect::ATT;
-        this.operands = [];
-        this.pieces = [];
-        this.clobbers = [];
-        this.is_module_level = false;
-        this.attached_directives = [];
+    static new() -> AsmBlockStmt* {
+        return new AsmBlockStmt {
+            arch:                "",
+            dialect:             AsmDialect::ATT,
+            operands:            [],
+            pieces:              [],
+            clobbers:            [],
+            is_module_level:     false,
+            attached_directives: [],
+        };
     }
 
-    add_operand(op: AsmOperand*) -> i64 {
+    add_operand(mut &this, op: AsmOperand) -> i64 {
         this.operands.push(op);
         return this.operands.length - 1;
     }
 
-    add_piece(p: AsmPiece*) -> void {
+    add_piece(mut &this, p: AsmPiece) -> void {
         this.pieces.push(p);
     }
 
-    add_clobber(name: string) -> void {
+    add_clobber(mut &this, name: string) -> void {
         this.clobbers.push(name);
     }
 
-    add_directive(d: DirectiveNode*) -> void {
+    add_directive(mut &this, d: DirectiveNode*) -> void {
         if (d != null) { this.attached_directives.push(d); }
     }
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+    static walk_children<V>(n: AsmBlockStmt*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.operands.length; i++) { v.walk_expr(n.operands[i].expr); }
     }
 }
 
 
-type class ReturnStmtNode : StatementNode {
-public:
+type struct ReturnStmt {
+    /// The returned value; null for a bare `return;`.
     expression: ExpressionNode*;
     /// Drop calls synthesised by the drop-insertion pass that must run
     /// at function exit *after* `expression` has been evaluated.  These
     /// can't be emitted as statements *before* the return because the
     /// return expression may borrow a local that is being dropped; see
     /// `walk_stmt_into` in passes/drop_insertion.cryo and the matching
-    /// sequencing in `visit(ReturnStmtNode*)` in codegen/ir_generator.cryo.
-    synth_drops: [StatementNode*];
+    /// sequencing for a return in codegen/ir_generator.cryo.
+    synth_drops: [Stmt*];
 
-    ReturnStmtNode(expression: ExpressionNode*, span: SourceSpan)
-        : StatementNode(NodeKind::ReturnStatement, span) {
-        this.expression = expression;
-        this.synth_drops = [];
-    }
-
-    has_expression() -> boolean { return this.expression != null; }
-
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+    static walk_children<V>(n: ReturnStmt*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.expression);
     }
 }
 
 
-type class IfStmtNode : StatementNode {
-public:
+type struct IfStmt {
     condition: ExpressionNode*;
-    then_stmt: StatementNode*;
-    else_stmt: StatementNode*;
+    then_stmt: Stmt*;
+    /// Null when there is no `else`.
+    else_stmt: Stmt*;
 
-    IfStmtNode(condition: ExpressionNode*, then_stmt: StatementNode*,
-               else_stmt: StatementNode*, span: SourceSpan)
-        : StatementNode(NodeKind::IfStatement, span) {
-        this.condition = condition;
-        this.then_stmt = then_stmt;
-        this.else_stmt = else_stmt;
-    }
-
-    has_else() -> boolean { return this.else_stmt != null; }
-
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+    static walk_children<V>(n: IfStmt*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.condition);
+        v.walk_stmt(n.then_stmt);
+        v.walk_stmt(n.else_stmt);
     }
 }
 
 
-type class WhileStmtNode : StatementNode {
-public:
+type struct WhileStmt {
     condition: ExpressionNode*;
-    body:      StatementNode*;
+    body:      Stmt*;
 
-    WhileStmtNode(condition: ExpressionNode*, body: StatementNode*, span: SourceSpan)
-        : StatementNode(NodeKind::WhileStatement, span) {
-        this.condition = condition;
-        this.body      = body;
-    }
-
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+    static walk_children<V>(n: WhileStmt*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.condition);
+        v.walk_stmt(n.body);
     }
 }
 
 
-type class DoWhileStmtNode : StatementNode {
-public:
-    body:      StatementNode*;
+type struct DoWhileStmt {
+    body:      Stmt*;
     condition: ExpressionNode*;
 
-    DoWhileStmtNode(body: StatementNode*, condition: ExpressionNode*, span: SourceSpan)
-        : StatementNode(NodeKind::DoWhileStatement, span) {
-        this.body      = body;
-        this.condition = condition;
-    }
-
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+    static walk_children<V>(n: DoWhileStmt*, v: mut &V) -> void where V: Walk {
+        v.walk_stmt(n.body);
+        v.walk_expr(n.condition);
     }
 }
 
 
-type class ForStmtNode : StatementNode {
-public:
-    init:      ASTNode*;
+type struct ForStmt {
+    /// A variable declaration or an expression; an absent expression when
+    /// omitted.
+    init:      Node;
     condition: ExpressionNode*;
     update:    ExpressionNode*;
-    body:      StatementNode*;
+    body:      Stmt*;
 
-    ForStmtNode(init: ASTNode*, condition: ExpressionNode*,
-                update: ExpressionNode*, body: StatementNode*, span: SourceSpan)
-        : StatementNode(NodeKind::ForStatement, span) {
-        this.init      = init;
-        this.condition = condition;
-        this.update    = update;
-        this.body      = body;
-    }
-
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+    static walk_children<V>(n: ForStmt*, v: mut &V) -> void where V: Walk {
+        v.walk_node(n.init);
+        v.walk_expr(n.condition);
+        v.walk_expr(n.update);
+        v.walk_stmt(n.body);
     }
 }
 
 
-type class MatchStmtNode : StatementNode {
-public:
+type struct MatchStmt {
     subject: ExpressionNode*;
     arms:    [MatchArmNode*];
 
     /// `--panic=unwind` cleanup schedule for the synthesized non-exhaustive
     /// `no_match` guard, so a scrutinee matching no arm runs the frame's local
-    /// destructors on unwind.  See `CallExprNode.unwind_cleanup`.
-    unwind_cleanup: [ASTNode*];
+    /// destructors on unwind.  See `CallExpr.unwind_cleanup`.
+    unwind_cleanup: [Stmt*];
 
-    MatchStmtNode(subject: ExpressionNode*, span: SourceSpan)
-        : StatementNode(NodeKind::MatchStatement, span) {
-        this.subject = subject;
-        this.arms    = [];
-        this.unwind_cleanup = [];
+    static new(subject: ExpressionNode*) -> MatchStmt* {
+        return new MatchStmt { subject: subject, arms: [], unwind_cleanup: [] };
     }
 
-    add_arm(arm: MatchArmNode*) -> void {
+    add_arm(mut &this, arm: MatchArmNode*) -> void {
         this.arms.push(arm);
     }
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+    static walk_children<V>(n: MatchStmt*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.subject);
+        for (mut i: i64 = 0; i < n.arms.length; i++) { v.walk_node(Node::Arm(n.arms[i])); }
     }
 }
 
 
 /// Statement-position `static match (T) { ... }` - used when arms yield no value
 /// (e.g. an `Atomic<T>::store` body). Same compile-time pruning semantics as
-/// StaticMatchExprNode; the reduced single arm's block is emitted for effect.
-type class StaticMatchStmtNode : StatementNode {
-public:
+/// StaticMatchExpr; the reduced single arm's block is emitted for effect.
+type struct StaticMatchStmt {
     scrutinee: TypeAnnotation*;
     arms:      [StaticMatchArmNode*];
 
-    StaticMatchStmtNode(scrutinee: TypeAnnotation*, span: SourceSpan)
-        : StatementNode(NodeKind::StaticMatchStatement, span) {
-        this.scrutinee = scrutinee;
-        this.arms      = [];
+    static new(scrutinee: TypeAnnotation*) -> StaticMatchStmt* {
+        return new StaticMatchStmt { scrutinee: scrutinee, arms: [] };
     }
 
-    add_arm(arm: StaticMatchArmNode*) -> void {
+    add_arm(mut &this, arm: StaticMatchArmNode*) -> void {
         this.arms.push(arm);
     }
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+    static walk_children<V>(n: StaticMatchStmt*, v: mut &V) -> void where V: Walk {
+        v.walk_annotation(n.scrutinee);
+        for (mut i: i64 = 0; i < n.arms.length; i++) { v.walk_node(Node::StaticArm(n.arms[i])); }
     }
 }
 
 
-type class BreakStmtNode : StatementNode {
-public:
-    BreakStmtNode(span: SourceSpan) : StatementNode(NodeKind::BreakStatement, span) {}
-
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
-    }
-}
-
-
-type class ContinueStmtNode : StatementNode {
-public:
-    ContinueStmtNode(span: SourceSpan) : StatementNode(NodeKind::ContinueStatement, span) {}
-
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
-    }
-}
-
-
-type class ExprStmtNode : StatementNode {
-public:
+type struct ExprStmt {
     expression: ExpressionNode*;
 
-    ExprStmtNode(expression: ExpressionNode*, span: SourceSpan)
-        : StatementNode(NodeKind::ExpressionStatement, span) {
-        this.expression = expression;
-    }
-
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+    static walk_children<V>(n: ExprStmt*, v: mut &V) -> void where V: Walk {
+        v.walk_expr(n.expression);
     }
 }
 
 
-type class DeclStmtNode : StatementNode {
-public:
+type struct DeclStmt {
     declaration: DeclarationNode*;
 
-    DeclStmtNode(declaration: DeclarationNode*, span: SourceSpan)
-        : StatementNode(NodeKind::DeclarationStatement, span) {
-        this.declaration = declaration;
-    }
-
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+    static walk_children<V>(n: DeclStmt*, v: mut &V) -> void where V: Walk {
+        v.walk_decl(n.declaration);
     }
 }
 
 
-// Loop Statement: loop { body }  (infinite loop, break to exit)
+/// `loop { body }`: runs until a `break` leaves it.
+type struct LoopStmt {
+    body: Stmt*;
 
-type class LoopStmtNode : StatementNode {
-public:
-    body: StatementNode*;
-
-    LoopStmtNode(body: StatementNode*, span: SourceSpan)
-        : StatementNode(NodeKind::LoopStatement, span) {
-        this.body = body;
+    static walk_children<V>(n: LoopStmt*, v: mut &V) -> void where V: Walk {
+        v.walk_stmt(n.body);
     }
+}
 
-    override accept(visitor: ASTVisitor*) -> void {
-        visitor.visit(this);
+
+/// `new` of a statement payload takes its storage from the AST arena, as the
+/// header's does.
+implement trait Allocate for struct BlockStmt {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
+}
+
+implement trait Allocate for struct UnsafeBlockStmt {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
+}
+
+implement trait Allocate for struct AsmBlockStmt {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
+}
+
+implement trait Allocate for struct ReturnStmt {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
+}
+
+implement trait Allocate for struct IfStmt {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
+}
+
+implement trait Allocate for struct WhileStmt {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
+}
+
+implement trait Allocate for struct DoWhileStmt {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
+}
+
+implement trait Allocate for struct ForStmt {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
+}
+
+implement trait Allocate for struct MatchStmt {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
+}
+
+implement trait Allocate for struct StaticMatchStmt {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
+}
+
+implement trait Allocate for struct ExprStmt {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
+}
+
+implement trait Allocate for struct DeclStmt {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
+    }
+}
+
+implement trait Allocate for struct LoopStmt {
+    static allocate(size: u64, align: u64) -> void* {
+        return cryo_ast_arena_alloc(size, align);
     }
 }

@@ -26,7 +26,7 @@ import compiler::compilation_context::{ CompilationContext };
 import compiler::decl_index;
 import compiler::decl_index::{ DeclarationIndex };
 import compiler::ast;
-import compiler::ast::{ expression, LiteralKind, node, NodeKind, TypeAnnotation };
+import compiler::ast::{ expression, LiteralKind, node, TypeAnnotation };
 import compiler::lex;
 import compiler::sema::{ state, helpers, type_utils };
 import std::core::option;
@@ -36,8 +36,8 @@ import std::collections::hashmap::{ HashMapIter };
 import std::fmt;
 import compiler::types::generic;
 import compiler::types::generic::{ InstantiatedType };
-import compiler::ast::expression::{ CallExprNode, ExpressionNode, LiteralNode };
-import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::expression::{ CallExpr, ExpressionNode, LiteralExpr };
+import compiler::ast::node::{ ProgramNode };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::edit_distance::{ find_best_candidate };
 import compiler::diag::source_span::{ SourceSpan };
@@ -53,10 +53,10 @@ import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ PointerType, ReferenceType };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
-import compiler::types::user_defined::{ ClassType, EnumType, MethodInfo, StructType };
+import compiler::types::user_defined::{ EnumType, MethodInfo, StructType };
 import compiler::module_graph::{ ModulePath };
 import compiler::ast::{ ImportStyle };
-import compiler::ast::declaration::{ ImportDeclNode };
+import compiler::ast::declaration::{ DeclarationNode, ImportDecl };
 
 /// Another type of a refused name's spelling: its path, as text for the
 /// message, and the module it is declared in.
@@ -91,9 +91,9 @@ type struct Diagnostics {
     // Each walks one symbol table and returns bare (non-`::`) names to feed
     // `find_best_candidate` from a typo diagnostic.
 
-    /// Field + method names on a struct/class (E0204 did-you-mean).  Walks past
+    /// Field + method names on a struct (E0204 did-you-mean).  Walks past
     /// pointer/reference/instantiation wrappers like the member-access resolver.
-    collect_struct_or_class_member_names(&this, obj_type: TypeRef) -> [string] {
+    collect_struct_member_names(&this, obj_type: TypeRef) -> [string] {
         mut out: [string] = [];
         mut walk_ty: TypeRef = obj_type;
         mut walk_t:  Type*   = this.arena.lookup(walk_ty);
@@ -101,15 +101,15 @@ type struct Diagnostics {
         while (walk_t != null && depth < 5) {
             match (walk_t.kind) {
                 TypeKind::Pointer => {
-                    walk_ty = (walk_t as PointerType*).pointee;
+                    walk_ty = walk_t.as_pointer().pointee;
                     walk_t  = this.arena.lookup(walk_ty);
                 }
                 TypeKind::Reference => {
-                    walk_ty = (walk_t as ReferenceType*).referent;
+                    walk_ty = walk_t.as_reference().referent;
                     walk_t  = this.arena.lookup(walk_ty);
                 }
                 TypeKind::InstantiatedType => {
-                    const it: InstantiatedType* = walk_t as InstantiatedType*;
+                    const it: InstantiatedType* = walk_t.as_instantiated();
                     if (!it.has_resolved_type()) { break; }
                     walk_ty = it.resolved_type;
                     walk_t  = this.arena.lookup(walk_ty);
@@ -122,14 +122,9 @@ type struct Diagnostics {
 
         match (walk_t.kind) {
             TypeKind::Struct => {
-                const st: StructType* = walk_t as StructType*;
+                const st: StructType* = walk_t.as_struct();
                 for (mut i: i64 = 0; i < st.fields.length; i++)  { out.push(this.intern.shown(st.fields[i].decl_name())); }
                 for (mut i: i64 = 0; i < st.methods.length; i++) { out.push(this.intern.resolve(st.methods[i].name)); }
-            }
-            TypeKind::Class => {
-                const cl: ClassType* = walk_t as ClassType*;
-                for (mut i: i64 = 0; i < cl.fields.length; i++)  { out.push(this.intern.shown(cl.fields[i].decl_name())); }
-                for (mut i: i64 = 0; i < cl.methods.length; i++) { out.push(this.intern.resolve(cl.methods[i].name)); }
             }
             _ => {}
         }
@@ -206,11 +201,11 @@ type struct Diagnostics {
     truth_test_hint(&this, ty: TypeRef) -> string {
         mut t: Type* = this.arena.lookup(ty);
         if (t != null && t.kind == TypeKind::InstantiatedType) {
-            const it: InstantiatedType* = t as InstantiatedType*;
+            const it: InstantiatedType* = t.as_instantiated();
             if (it.has_resolved_type()) { t = this.arena.lookup(it.resolved_type); }
         }
         if (t == null) { return "write the comparison the test means, or `match` on it"; }
-        if (t.kind == TypeKind::Enum && !(t as EnumType*).is_simple_enum()) {
+        if (t.kind == TypeKind::Enum && !t.as_enum().is_simple_enum()) {
             return "`match` on it";
         }
         return match (t.kind) {
@@ -233,10 +228,9 @@ type struct Diagnostics {
                                     expected: TypeRef, found: TypeRef, expected_name: string,
                                     value_expr: ExpressionNode*) -> Diagnostic {
         if (value_expr == null || !span.has_location()) { return diag; }
-        const node: ASTNode* = value_expr as ASTNode*;
-        if (node.kind != NodeKind::Literal) { return diag; }
+        const lit: LiteralExpr* = ExpressionNode::literal_of(value_expr);
+        if (lit == null) { return diag; }
 
-        const lit: LiteralNode* = value_expr as LiteralNode*;
         const want_kind: TypeKind = this.kind_or_void(expected);
         const want_bool: boolean = want_kind == TypeKind::Bool;
         const want_string:  boolean = want_kind == TypeKind::String;
@@ -345,7 +339,7 @@ type struct Diagnostics {
     suggest_similar_method(&this, ty_ref: TypeRef, method_name: SymbolStr) -> SymbolStr {
         if (!ty_ref.is_valid() || !method_name.is_valid()) { return SymbolStr::empty(); }
         const needle: string = this.intern.resolve(method_name);
-        const cands: [string] = this.collect_struct_or_class_member_names(ty_ref);
+        const cands: [string] = this.collect_struct_member_names(ty_ref);
         const best: string = find_best_candidate(needle, cands);
         if (best == "") { return SymbolStr::empty(); }
         return this.intern.intern(best);
@@ -383,17 +377,12 @@ type struct Diagnostics {
             const no_methods: [MethodInfo] = [];
             mut methods: &[MethodInfo] = &no_methods;
             if (t.kind == TypeKind::Struct) {
-                const st: StructType* = t as StructType*;
+                const st: StructType* = t.as_struct();
                 qname = st.qualified_name;
                 declared_in = st.declared_in;
                 methods = &st.methods;
-            } else if (t.kind == TypeKind::Class) {
-                const ct: ClassType* = t as ClassType*;
-                qname = ct.qualified_name;
-                declared_in = ct.declared_in;
-                methods = &ct.methods;
             } else if (t.kind == TypeKind::Enum) {
-                const et: EnumType* = t as EnumType*;
+                const et: EnumType* = t.as_enum();
                 qname = et.qualified_name;
                 declared_in = et.declared_in;
                 methods = &et.methods;
@@ -428,10 +417,10 @@ type struct Diagnostics {
         mut last_import_span: SourceSpan = SourceSpan::none();
         mut fallback_span: SourceSpan = SourceSpan::none();
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i];
-            if (stmt == null) { continue; }
-            if (stmt.kind == NodeKind::ImportDeclaration) { last_import_span = stmt.span; }
-            else if (!fallback_span.has_location()) { fallback_span = stmt.span; }
+            const item: Node = root.statements[i];
+            if (item.is_null()) { continue; }
+            if (DeclarationNode::import_of(item.as_decl()) != null) { last_import_span = item.span(); }
+            else if (!fallback_span.has_location()) { fallback_span = item.span(); }
         }
         const anchor: SourceSpan = if (last_import_span.has_location()) { last_import_span } else { fallback_span };
         if (!anchor.has_location()) { return SourceSpan::none(); }
@@ -488,9 +477,10 @@ type struct Diagnostics {
         const root: ProgramNode* = this.ctx.artifacts.ast.root;
         if (root == null) { return ""; }
         for (mut i: i64 = 0; i < root.statements.length; i++) {
-            const stmt: ASTNode* = root.statements[i];
-            if (stmt == null || stmt.kind != NodeKind::ImportDeclaration) { continue; }
-            const imp: ImportDeclNode* = stmt as ImportDeclNode*;
+            const stmt: DeclarationNode* = root.statements[i].as_decl();
+            if (stmt == null) { continue; }
+            const imp: ImportDecl* = DeclarationNode::import_of(stmt);
+            if (imp == null) { continue; }
             // `import A::B as C;` is one entry naming the sub-module.
             if (imp.path_entry) {
                 for (mut k: i64 = 0; k < imp.specific_defs.length; k++) {

@@ -134,7 +134,6 @@ IntrinsicDecl      ::= "intrinsic" "function" Ident
                        "(" ParamList? ")" ("->" Type)? (Block | ";")
                      | "intrinsic" "function" Ident Generics
                        "(" ParamList? ")" ("->" Type)? ("where" WhereClause)? ";"
-                     | "intrinsic" "const" Ident ":" Type ("=" Expr)? ";"
 
 (*  A generic intrinsic has no body: it is typed and specialized as a
     generic function, and each call to a specialization is lowered by the
@@ -158,29 +157,29 @@ WhereClause        ::= Ident ":" TraitBound ("+" TraitBound)*
                        (* TraitBound is a possibly-qualified trait name with
                           optional generic arguments - same shape as
                           super-trait references on a `type trait` decl. *)
-Visibility         ::= "public" | "private" | "protected"
+Visibility         ::= "public" | "private"
 
 
-(*  Aggregates (struct/class), Enums, Traits, Type Aliases ===== *)
+(*  Structs, Enums, Traits, Type Aliases ======================== *)
 
-(* Structs and classes share a single rule; the keyword and a few
-   class-only members (constructors, destructors, virtual/override)
-   are the only differences.  The leading `type` keyword is the
-   canonical form (`type struct Foo { ... }`); the bare `struct Foo`
-   form is also accepted.                                            *)
+(* The leading `type` keyword is the canonical form
+   (`type struct Foo { ... }`); the bare `struct Foo` form is also
+   accepted.  These forms are not part of the grammar: `type class`,
+   a list of types after a struct's name `: Base`, `virtual` /
+   `override` members, `protected`, a member `Name(..) { }` named by
+   its type, a member `~Name() { }`, an initializer `: Base(..)` and
+   the `class` tag on an implement head.  The parser reads each only
+   to refuse it where it is written (E0117).                          *)
 
-AggregateDecl      ::= "type"? AggregateKind Ident Generics?
-                       (":" Ident)?                  (* base class  *)
+AggregateDecl      ::= "type"? "struct" Ident Generics?
                        ("where" WhereClause)?        (* bounds on the declaration's own
                                                         parameters; checked per instantiation *)
                        "{" Member* "}"
-AggregateKind      ::= "struct" | "class"
 
-Member             ::= Visibility? "static"?
-                       (Field | Method | Constructor | Destructor)
-                     | VisibilityBlock          (* `public:` / `private:` / `protected:`
+Member             ::= Visibility? "static"? (Field | Method)
+                     | VisibilityBlock          (* `public:` / `private:`
                                                    labels a run of subsequent members. *)
-VisibilityBlock    ::= Visibility ":" (Field | Method | Constructor | Destructor)*
+VisibilityBlock    ::= Visibility ":" (Field | Method)*
 
 (* A member may be named by a keyword.  A member name is never read as a
    declaration or an operator - what follows it says which member kind it
@@ -188,18 +187,15 @@ VisibilityBlock    ::= Visibility ":" (Field | Method | Constructor | Destructor
    can only be a member name.  This is what lets a bound C struct keep a
    field called `type`, which the binding generator cannot rename without
    breaking the ABI.  The exceptions are the keywords a member position
-   reads FIRST: `public`/`private`/`protected` (a visibility label) and
-   `static`/`virtual`/`override`/`async` (a member modifier).             *)
+   reads FIRST: `public`/`private` (a visibility label), `static`/`async`
+   (a member modifier) and `protected`/`virtual`/`override` (refused).   *)
 MemberName         ::= Ident | Keyword
 
 Field              ::= MemberName ":" Type ("=" Expr)? ";"
-Method             ::= ("virtual" | "override" | "async")? MemberName Generics?
+Method             ::= "async"? MemberName Generics?
                        "(" ParamList? ")" ("->" Type)?
                        ("where" WhereClause)?
                        (Block | ";")
-Constructor        ::= Ident "(" ParamList? ")"
-                       (":" Ident "(" ArgList? ")")? Block
-Destructor         ::= "~" Ident "(" ")" Block
 
 EnumDecl           ::= "type"? "enum" Ident Generics? (":" Type)?
                        ("where" WhereClause)?
@@ -224,7 +220,7 @@ UnionDecl          ::= "type" "union" Ident Generics?
                           matched variant-wise - use `type enum` for a tagged
                           (discriminated) union.  Reading a member other than
                           the one last written is the programmer's
-                          responsibility.  Unlike `struct`/`class` there is no
+                          responsibility.  Unlike `struct` there is no
                           bare `union Foo` form; the leading `type` is
                           required. *)
 
@@ -251,19 +247,19 @@ TypeAlias          ::= "type" Ident Generics? "=" Type ";"
 (*  Two shapes: inherent impl (no `trait ... for`) and trait impl
     (with `trait ... for`).  Both may carry leading `<T, ...>`
     generic parameters on the impl head, an optional kind tag
-    (`struct`/`enum`/`class`) on the target, and generic arguments
+    (`struct`/`enum`/`union`) on the target, and generic arguments
     on the target type.                                              *)
 
 ImplBlock          ::= "implement" Generics?
                        ( "trait" Type "for" )?
-                       ("enum" | "struct" | "union" | "class")?
+                       ("enum" | "struct" | "union")?
                        TargetType
                        "{" MethodImpl* "}"
 TargetType         ::= QualName GenericArgs?
                      | Primitive
                      | "()"                              (* unit type *)
 
-MethodImpl         ::= ("virtual" | "override")? "static"? "async"?
+MethodImpl         ::= "static"? "async"?
                        Ident Generics?
                        "(" ParamList? ")" ("->" Type)?
                        ("where" WhereClause)? Block
@@ -333,9 +329,9 @@ Primary            ::= Literal
                      | Match
                      | StaticMatch
                      | Lambda
-                     | "delete" Expr           (* frees a `new` allocation; see cryo.md section 15.2 *)
-                     | "await"  Expr           (* only inside an `async` body; see cryo.md section 19 *)
-                     | "yield"  Expr?          (* parsed; no generator semantics yet (cryo.md section 22) *)
+                     | "delete" Expr           (* frees a `new` allocation; see cryo.md section 14.2 *)
+                     | "await"  Expr           (* only inside an `async` body; see cryo.md section 18 *)
+                     | "yield"  Expr?          (* parsed; no generator semantics yet (cryo.md section 21) *)
                      | "(" Expr ")"
                      | ImplQualPath
 
@@ -363,6 +359,8 @@ StructLit          ::= Ident TurbofishArgs?
 ArrayLit           ::= "[" (Expr ("," Expr)*)? "]"
                      | "[" Expr ";" Expr "]"
 NewExpr            ::= "new" Type ("(" ArgList? ")")?
+                       (* arguments build an enum variant, `new E::V(x)`;
+                          on any other type they are refused (E0117) *)
                      | "new" Type "[" Expr "]"
                      | "new" Type "{" Ident ":" Expr
                                   ("," Ident ":" Expr)* ","? "}"
@@ -442,6 +440,13 @@ Type               ::= Type "*"                            (* pointer *)
                      | "()"                                (* unit (also the empty tuple) *)
                      | Type "?"                            (* optional: T? desugars to Option<T> *)
                      | "implement" QualName GenericArgs?   (* opaque: implement Trait (see cryo.md section 2.11) *)
+                     | "virtual" "mut"? "&" BaseType       (* trait object, borrowed; the
+                                                              BaseType names a trait and
+                                                              writes its arguments
+                                                              (cryo.md section 10.7) *)
+                     | "virtual" BaseType "*"              (* trait object pointer; the `*`
+                                                              belongs to the object, so
+                                                              `virtual T**` points at one *)
                      | BaseType
 BaseType           ::= Primitive | "This" | QualName GenericArgs?
 Primitive          ::= "void" | "boolean" | "char" | "string"
@@ -498,9 +503,9 @@ Ident              ::= /* [a-zA-Z_][a-zA-Z0-9_]*                */
 (*                                                                  *)
 (*  These names are reserved by the lexer and may not be used as    *)
 (*  identifiers.  Some (e.g. `from`, `yield`, `auto`, `tuple`)      *)
-(*  are lexed but have no semantics yet - see section 22 of         *)
+(*  are lexed but have no semantics yet - see section 21 of         *)
 (*  `cryo.md` for the reserved-syntax table.  `async` and `await`   *)
-(*  are implemented (cryo.md section 19).                           *)
+(*  are implemented (cryo.md section 18).                           *)
 (*                                                                  *)
 (*  alignof    as         asm        async     auto      await     *)
 (*  boolean    break      char       class     const     continue  *)

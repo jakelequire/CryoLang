@@ -25,10 +25,10 @@ import compiler::ast;
 import compiler::ast::{ TypeAnnotation };
 import compiler::ast::node;
 import compiler::ast::expression;
-import compiler::ast::expression::{ CallExprNode, ExpressionNode, LambdaExprNode, ScopeResolutionNode };
+import compiler::ast::expression::{ CallExpr, ExpressionNode, LambdaExpr };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::ast::declaration;
-import compiler::ast::declaration::{ FunctionDeclNode, GenericParamNode, ImplBlockNode };
+import compiler::ast::declaration::{ FunctionDecl, DeclarationNode, GenericParamDecl, ImplBlock };
 import compiler::resolver::res;
 import compiler::resolver::res::{ DefKey };
 import compiler::decl_index::{ OverloadId };
@@ -147,7 +147,7 @@ type struct SemaState {
     // `this` in the body names.  Invalid outside a method.
     receiver_sym: SymbolID;
     // The function whose body is being checked; null outside one.
-    current_func: FunctionDeclNode*;
+    current_func: DeclarationNode*;
 
     // -- Closure-capture detection (mutated by LambdaSynth, read by resolve_identifier) --
     // `in_lambda_depth`: 0 outside any lambda, 1 inside the outermost, deeper
@@ -159,7 +159,7 @@ type struct SemaState {
     // `current_lambda`: the lambda whose body we're walking - the capture sink.
     in_lambda_depth:     i32;
     outer_bindings:      HashMap<SymbolKey, TypeRef>;
-    current_lambda:      LambdaExprNode*;
+    current_lambda:      LambdaExpr*;
 
     // Per-module monotonic counter for synthesised closure-struct names.
     // Cross-module uniqueness comes from the namespace prefix; never reset.
@@ -185,7 +185,7 @@ type struct SemaState {
     // expected type instantiated.  An enclosing generic call may still type
     // one from its own bindings, so each is refused only if the module's
     // walk ends with it still the template.
-    unbound_variants: [ScopeResolutionNode*];
+    unbound_variants: [ExpressionNode*];
 
     // -- Symbolic generic-body check --
     // True only while a symbolic generic-body walk is in progress.
@@ -195,18 +195,18 @@ type struct SemaState {
     symbolic_owner_is_generic: boolean;
     // The OWNER type's generic-param AST nodes (`Box<T>`'s `T`), declaration
     // order = abstract-param index.
-    symbolic_owner_param_nodes: [GenericParamNode*];
+    symbolic_owner_param_nodes: [DeclarationNode*];
     // The CURRENT method/free-fn's own generic-param AST nodes; separate 0-based
     // index space from the owner list.
-    symbolic_method_param_nodes: [GenericParamNode*];
+    symbolic_method_param_nodes: [DeclarationNode*];
     // The impl block whose method body is currently symbolically walked (the AST
     // outlives the visitor).  Recovers an in-scope param's where-clause bounds
     // (`T: Display`) which an abstract receiver type does not carry.
-    symbolic_impl_node: ImplBlockNode*;
+    symbolic_impl_node: ImplBlock*;
     // The function/method whose body is currently symbolically walked.  A
     // method/free-fn `where T: Display` clause lands in
-    // `FunctionDeclNode.trait_bounds`, recovered from here for abstract receivers.
-    symbolic_current_func: FunctionDeclNode*;
+    // `FunctionDecl.trait_bounds`, recovered from here for abstract receivers.
+    symbolic_current_func: DeclarationNode*;
     // The trait whose default methods are being walked.  `This` in such a body
     // is any type implementing that trait, so the trait is `This`'s bound; no
     // where-clause writes it, and one `This` placeholder serves every trait,
@@ -220,15 +220,6 @@ type struct SemaState {
     // Telemetry (debug-only): generic bodies walked, and real errors emitted.
     symbolic_bodies_walked:    i64;
     symbolic_total_would_emit: i64;
-
-    // -- Recursion seam (side-channel) --
-    // The expression return channel.  `SemaVisitor.resolve_expr` is the
-    // authoritative `match`-on-kind dispatch; each `override visit(SomeExpr*)`
-    // stashes its result here, and a collaborator recursing via
-    // `dispatch.resolve_expr(visitor, child)` reads it back.  Avoids importing
-    // the concrete `SemaVisitor` into collaborators (keeps the graph acyclic),
-    // and avoids touching the live shared `BaseASTVisitor` vtable.
-    last_expr_type: TypeRef;
 
     static new() -> SemaState {
         return SemaState {
@@ -272,7 +263,6 @@ type struct SemaState {
             symbolic_narrow_types: [],
             symbolic_bodies_walked:    0,
             symbolic_total_would_emit: 0,
-            last_expr_type: TypeRef::invalid(),
         };
     }
 

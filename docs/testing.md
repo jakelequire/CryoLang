@@ -78,7 +78,7 @@ Each assertion returns a `Result<(), TestError>`; propagate failures with the
 ![test]
 ![should_panic]
 function rejects_out_of_range() -> Result<(), TestError> {
-    intrinsics::panic("expected", FILE, LINE);
+    intrinsics::panic("expected", intrinsics::location());
     return Result::Ok(());
 }
 ```

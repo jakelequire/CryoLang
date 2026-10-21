@@ -40,7 +40,7 @@ no_std = true
 no_runtime = true
 CFG
 
-PANIC_MSG="panicked at verify.cryo:42: boom"
+PANIC_MSG="panicked at verify.cryo:42:5 in RtVerifyApp::main: boom"
 overall=0
 
 # A skipped arm is a FAILURE unless the caller says otherwise.
@@ -99,63 +99,67 @@ cat > "$WORK/ret.cryo" <<'APP'
 namespace RtVerifyApp;
 function main() -> int { return 42; }
 APP
-# main calling the panic funnel by its unmangled symbol.
+# main calling the panic funnel by its unmangled symbol, with a whole place:
+# the report carries the column and the function.
 cat > "$WORK/panic.cryo" <<'APP'
 namespace RtVerifyApp;
+type struct Location { file: string; line: u32; column: u32; function: string; }
 extern "C" {
-    function __cryo_panic(msg: string, file: string, line: u32) -> never;
+    function __cryo_panic(msg: string, loc: Location*) -> never;
 }
 function main() -> int {
-    __cryo_panic("boom", "verify.cryo", 42);
+    mut loc: Location = Location { file: "verify.cryo", line: 42, column: 5, function: "RtVerifyApp::main" };
+    __cryo_panic("boom", &loc);
     return 0;
 }
 APP
 
-# Each check handler: construct a SourceLoc (16-byte {string,u32,u32} POD,
-# matching abi/layout.def) and call the handler by its unmangled symbol, passing
-# its ADDRESS -- `lang_items.def` specifies SourceLoc by POINTER.
+# Each check handler: construct a Location ({string,u32,u32,string}, matching
+# abi/layout.def) and call the handler by its unmangled symbol, passing its
+# ADDRESS -- `lang_items.def` specifies the Location by POINTER.  No function:
+# the report leaves it out.
 #
 # It used to be declared here by VALUE, and that agreed with the tier only on
 # Windows: Win64 already passes a 16-byte struct by hidden pointer, while SysV
 # splits it across two registers. So the by-value form silently matched on one
-# OS and made the tier read `file` as if it were the SourceLoc on the other --
+# OS and made the tier read `file` as if it were the place on the other --
 # "panicked at " then a segfault. Passing the address is identical on both.
 cat > "$WORK/bounds.cryo" <<'APP'
 namespace RtVerifyApp;
-type struct SourceLoc { file: string; line: u32; col: u32; }
-extern "C" { function __cryo_panic_bounds_check(loc: SourceLoc*, index: u64, len: u64) -> never; }
+type struct Location { file: string; line: u32; column: u32; function: string; }
+extern "C" { function __cryo_panic_bounds_check(loc: Location*, index: u64, len: u64) -> never; }
 function main() -> int {
-    mut loc: SourceLoc = SourceLoc { file: "verify.cryo", line: 7, col: 3 };
+    mut loc: Location = Location { file: "verify.cryo", line: 7, column: 3, function: null };
     __cryo_panic_bounds_check(&loc, 5, 3);
     return 0;
 }
 APP
 cat > "$WORK/divzero.cryo" <<'APP'
 namespace RtVerifyApp;
-type struct SourceLoc { file: string; line: u32; col: u32; }
-extern "C" { function __cryo_panic_div_zero(loc: SourceLoc*) -> never; }
+type struct Location { file: string; line: u32; column: u32; function: string; }
+extern "C" { function __cryo_panic_div_zero(loc: Location*) -> never; }
 function main() -> int {
-    mut loc: SourceLoc = SourceLoc { file: "verify.cryo", line: 7, col: 3 };
+    mut loc: Location = Location { file: "verify.cryo", line: 7, column: 3, function: null };
     __cryo_panic_div_zero(&loc);
     return 0;
 }
 APP
 cat > "$WORK/nomatch.cryo" <<'APP'
 namespace RtVerifyApp;
-type struct SourceLoc { file: string; line: u32; col: u32; }
-extern "C" { function __cryo_panic_no_match(loc: SourceLoc*) -> never; }
+type struct Location { file: string; line: u32; column: u32; function: string; }
+extern "C" { function __cryo_panic_no_match(loc: Location*) -> never; }
 function main() -> int {
-    mut loc: SourceLoc = SourceLoc { file: "verify.cryo", line: 7, col: 3 };
+    mut loc: Location = Location { file: "verify.cryo", line: 7, column: 3, function: null };
     __cryo_panic_no_match(&loc);
     return 0;
 }
 APP
 cat > "$WORK/overflow.cryo" <<'APP'
 namespace RtVerifyApp;
-type struct SourceLoc { file: string; line: u32; col: u32; }
-extern "C" { function __cryo_panic_overflow(loc: SourceLoc*, op: u32, lhs: u64, rhs: u64) -> never; }
+type struct Location { file: string; line: u32; column: u32; function: string; }
+extern "C" { function __cryo_panic_overflow(loc: Location*, op: u32, lhs: u64, rhs: u64) -> never; }
 function main() -> int {
-    mut loc: SourceLoc = SourceLoc { file: "verify.cryo", line: 7, col: 3 };
+    mut loc: Location = Location { file: "verify.cryo", line: 7, column: 3, function: null };
     __cryo_panic_overflow(&loc, 2, 4000000000, 4000000000);
     return 0;
 }
@@ -320,11 +324,11 @@ run_linux() {
     [ "$msg" = "$PANIC_MSG" ] || { echo "linux panic FAIL: stderr [$msg] (want [$PANIC_MSG])"; fail=1; }
     [ "$got" -eq 101 ] && [ "$msg" = "$PANIC_MSG" ] && echo "linux panic ok: exit 101, stderr [$msg]"
 
-    # check handlers: raw operands + SourceLoc, formatted through the funnel.
-    linux_expect "$WORK/bounds.cryo"   "bounds"   "panicked at verify.cryo:7: index 5 out of bounds for length 3" || fail=1
-    linux_expect "$WORK/divzero.cryo"  "div_zero" "panicked at verify.cryo:7: attempt to divide by zero" || fail=1
-    linux_expect "$WORK/nomatch.cryo"  "no_match" "panicked at verify.cryo:7: no matching pattern" || fail=1
-    linux_expect "$WORK/overflow.cryo" "overflow" "panicked at verify.cryo:7: arithmetic overflow (op 2): 4000000000, 4000000000" || fail=1
+    # check handlers: raw operands + Location, formatted through the funnel.
+    linux_expect "$WORK/bounds.cryo"   "bounds"   "panicked at verify.cryo:7:3: index 5 out of bounds for length 3" || fail=1
+    linux_expect "$WORK/divzero.cryo"  "div_zero" "panicked at verify.cryo:7:3: attempt to divide by zero" || fail=1
+    linux_expect "$WORK/nomatch.cryo"  "no_match" "panicked at verify.cryo:7:3: no matching pattern" || fail=1
+    linux_expect "$WORK/overflow.cryo" "overflow" "panicked at verify.cryo:7:3: arithmetic overflow (op 2): 4000000000, 4000000000" || fail=1
 
     # alloc: exit 0 means alloc/align/write-read/free/re-alloc all held.
     local ao; ao="$(build_app "$WORK/alloc.cryo")"
@@ -412,7 +416,7 @@ run_windows() {
         *) echo "windows panic FAIL: stderr missing [$PANIC_MSG]; got [$msg]"; fail=1 ;;
     esac
 
-    # A check handler cross-OS: exercises the SourceLoc by-value ABI + the
+    # A check handler cross-OS: exercises the Location-by-address ABI + the
     # message-builder path under Win64 (indirect struct passing).
     windows_expect "$WORK/bounds.cryo" "bounds" "index 5 out of bounds for length 3" || fail=1
 

@@ -29,11 +29,12 @@ import std::collections::array::{ Array };
 import std::json::value;
 
 import compiler::compilation_context::{ CompilationContext };
-import compiler::ast::{ NodeKind };
-import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::node::{ Node, ProgramNode };
+import compiler::ast::node_locator::{ NodeLocator };
 import compiler::ast::statement;
-import compiler::ast::statement::{ DeclStmtNode };
-import compiler::ast::declaration::{ ImportDeclNode, MethodNode, ModuleDeclNode, VarDeclNode };
+import compiler::ast::declaration::{
+    DeclarationNode, DeclKind, ImportDecl, MethodDecl, ModuleDecl, VarDecl
+};
 import compiler::diag::source_span;
 import compiler::resolver::res::{ DefId, DefKind };
 import compiler::resolver::symbol::{ Symbol, SymbolKind };
@@ -153,7 +154,7 @@ type struct SemanticTokenizer {
     /// A definition's name: its kind, and for a type the kind of type its
     /// declaration is.
     def_token(mut &this, span: source_span::SourceSpan, d: DefId, decl: u32) -> void {
-        const node: ASTNode* = this.ctx.decl_index.declaration_of(d);
+        const node: DeclarationNode* = this.ctx.decl_index.declaration_of(d);
         match (this.ctx.defs.kind_of(d)) {
             DefKind::Module => {
                 this.emit_span(span, lsp::protocol::semantic_tokens::TYPE_NAMESPACE, decl);
@@ -162,12 +163,17 @@ type struct SemanticTokenizer {
                 mut ty: u32 = lsp::protocol::semantic_tokens::TYPE_TYPE;
                 if (node != null) {
                     ty = match (node.kind) {
-                        NodeKind::StructDeclaration => { lsp::protocol::semantic_tokens::TYPE_STRUCT }
-                        NodeKind::UnionDeclaration  => { lsp::protocol::semantic_tokens::TYPE_STRUCT }
-                        NodeKind::ClassDeclaration  => { lsp::protocol::semantic_tokens::TYPE_CLASS }
-                        NodeKind::EnumDeclaration   => { lsp::protocol::semantic_tokens::TYPE_ENUM }
-                        NodeKind::TraitDeclaration  => { lsp::protocol::semantic_tokens::TYPE_INTERFACE }
-                        _                           => { lsp::protocol::semantic_tokens::TYPE_TYPE }
+                        DeclKind::Struct(_) => { lsp::protocol::semantic_tokens::TYPE_STRUCT }
+                        DeclKind::Enum(_)   => { lsp::protocol::semantic_tokens::TYPE_ENUM }
+                        DeclKind::Union(_)  => { lsp::protocol::semantic_tokens::TYPE_STRUCT }
+                        DeclKind::Trait(_)  => { lsp::protocol::semantic_tokens::TYPE_INTERFACE }
+                        DeclKind::Import(_) | DeclKind::Intrinsic(_) | DeclKind::Impl(_)
+                        | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
+                        | DeclKind::Extern(_) | DeclKind::TypeAlias(_) | DeclKind::Field(_)
+                        | DeclKind::GenericParam(_) | DeclKind::Variable(_) | DeclKind::Function(_)
+                        | DeclKind::Method(_) => {
+                            lsp::protocol::semantic_tokens::TYPE_TYPE
+                        }
                     };
                 }
                 this.emit_span(span, ty, decl);
@@ -177,16 +183,16 @@ type struct SemanticTokenizer {
             }
             DefKind::Method => {
                 mut mods: u32 = decl;
-                if (node != null && node.kind == NodeKind::MethodDeclaration
-                        && (node as MethodNode*).is_static) {
+                if (node != null && DeclarationNode::method_of(node) != null
+                        && DeclarationNode::method_of(node).is_static) {
                     mods = mods | lsp::protocol::semantic_tokens::MOD_STATIC;
                 }
                 this.emit_span(span, lsp::protocol::semantic_tokens::TYPE_METHOD, mods);
             }
             DefKind::Value => {
                 mut mods: u32 = decl;
-                if (node != null && node.kind == NodeKind::VariableDeclaration
-                        && !(node as VarDeclNode*).is_mutable) {
+                if (node != null && DeclarationNode::var_of(node) != null
+                        && !(DeclarationNode::var_of(node)).is_mutable) {
                     mods = mods | lsp::protocol::semantic_tokens::MOD_READONLY;
                 }
                 this.emit_span(span, lsp::protocol::semantic_tokens::TYPE_VARIABLE, mods);
@@ -197,20 +203,17 @@ type struct SemanticTokenizer {
 
     /// Each segment of an import's path, or of the path a `namespace` or
     /// `public module` declares, is a namespace.
-    path_segments(mut &this, stmt: ASTNode*) -> void {
-        mut n: ASTNode* = stmt;
-        if (n != null && n.kind == NodeKind::DeclarationStatement) {
-            n = (n as DeclStmtNode*).declaration as ASTNode*;
-        }
+    path_segments(mut &this, stmt: Node) -> void {
+        const n: DeclarationNode* = NodeLocator::unwrap_decl_stmt(stmt).as_decl();
         if (n == null || n.generated) { return; }
-        if (n.kind == NodeKind::ImportDeclaration) {
-            const imp: ImportDeclNode* = n as ImportDeclNode*;
+        const imp: ImportDecl* = DeclarationNode::import_of(n);
+        if (imp != null) {
             for (mut i: i64 = 0; i < imp.path_segment_spans.length; i++) {
                 this.emit_span(imp.path_segment_spans[i], lsp::protocol::semantic_tokens::TYPE_NAMESPACE,
                                lsp::protocol::semantic_tokens::MOD_NONE);
             }
-        } else if (n.kind == NodeKind::ModuleDeclaration) {
-            const md: ModuleDeclNode* = n as ModuleDeclNode*;
+        } else if (DeclarationNode::module_of(n) != null) {
+            const md: ModuleDecl* = DeclarationNode::module_of(n);
             for (mut i: i64 = 0; i < md.path_segment_spans.length; i++) {
                 this.emit_span(md.path_segment_spans[i], lsp::protocol::semantic_tokens::TYPE_NAMESPACE,
                                lsp::protocol::semantic_tokens::MOD_NONE);
@@ -309,7 +312,7 @@ type struct SemanticTokenizer {
     // Inline-asm block colouring
     //
     // The parser does NOT keep per-token spans for the assembly body - it
-    // stores a list of reconstructed text `pieces` (see AsmBlockStmtNode).
+    // stores a list of reconstructed text `pieces` (see AsmBlockStmt).
     // So the block's source region is re-scanned straight out of the
     // analysed text with a small asm-aware lexer, emitting tokens in 0-based
     // BYTE coordinates via `emit_raw` (asm is ASCII, so byte == LSP char and
@@ -326,16 +329,23 @@ type struct SemanticTokenizer {
         this.push_token(line0, start_char, length, type_id, modifiers);
     }
 
-    asm_body(mut &this, node: statement::AsmBlockStmtNode*) -> void {
+    /// `node` is an `asm` statement.
+    asm_body(mut &this, node: statement::Stmt*) -> void {
         if (node == null) { return; }
         if (this.line_index == null || this.doc_text == "") { return; }
         const span: source_span::SourceSpan = node.span;
         if (!span.has_location()) { return; }
         if (span.start_line == 0 as u32) { return; }
-        const intel: boolean = match (node.dialect) {
-            statement::AsmDialect::Intel => { true }
-            statement::AsmDialect::ATT   => { false }
-        };
+        mut intel: boolean = false;
+        match (node.kind) {
+            statement::StmtKind::Asm(a) => {
+                intel = match (a.dialect) {
+                    statement::AsmDialect::Intel => { true }
+                    statement::AsmDialect::ATT   => { false }
+                };
+            }
+            _ => { return; }
+        }
         mut ln: u32 = span.start_line - 1 as u32;                 // 0-based
         const last: u32 = if (span.end_line >= span.start_line) {
             span.end_line - 1 as u32
