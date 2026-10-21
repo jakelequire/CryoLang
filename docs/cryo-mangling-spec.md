@@ -128,6 +128,16 @@ function a table's first word points at, releasing the value, is internal to
 the table's module and named `__cryo.release.` followed by the table's symbol;
 it is no mangled symbol, and no other module links against it.
 
+A trait's default that an object's table cannot hold (`map`, `filter`, `take` of
+`Iterator`), compiled for an object a bound is met by, is a plain method and
+carries no tag. Its path is the trait's, then one segment that is the object
+type's encoding (§8) prefixed by its length, then `-` and the method's leaf, then
+its signature: `map` for a `virtual mut &Iterator<i32>` is
+`C$3std.4core.4iter.8Iterator.58$N$L13VirtualMutRef$LN$L3std.4core.4iter.8Iterator$G_i$G$G-3map$F...`.
+The path names neither the module that asked for it nor the value behind the
+object, so one symbol serves every call at that object type, and two traits or
+two object types give two symbols.
+
 The tags `ct` and `dt` are not emitted and stay reserved: they named class
 constructors and destructors.
 

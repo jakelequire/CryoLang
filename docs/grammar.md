@@ -440,7 +440,10 @@ Type               ::= Type "*"                            (* pointer *)
                      | "()"                                (* unit (also the empty tuple) *)
                      | Type "?"                            (* optional: T? desugars to Option<T> *)
                      | "implement" QualName GenericArgs?   (* opaque: implement Trait (see cryo.md section 2.11) *)
-                     | "virtual" "mut"? "&" BaseType       (* trait object, borrowed *)
+                     | "virtual" "mut"? "&" BaseType       (* trait object, borrowed; the
+                                                              BaseType names a trait and
+                                                              writes its arguments
+                                                              (cryo.md section 11.7) *)
                      | "virtual" BaseType "*"              (* trait object pointer; the `*`
                                                               belongs to the object, so
                                                               `virtual T**` points at one *)

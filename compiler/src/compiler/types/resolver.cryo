@@ -921,6 +921,20 @@ type struct TypeResolver {
         if (st != null && st.kind == TypeKind::Object) {
             return this.object_trait_arguments(st.as_object(), trait_id);
         }
+        // A type parameter has no implementation to read: each associated
+        // type is its projection on the parameter (`I::Item`), which a reader
+        // reduces through the parameter's own bound, and each of the trait's
+        // parameters is left unbound.
+        if (st != null && st.kind == TypeKind::GenericParam) {
+            const param_trait: TraitDecl* = this.generic_registry.get_trait_decl(trait_id);
+            if (param_trait == null || this.decl_index == null) { return out; }
+            const trait_ty: TypeRef = this.decl_index.type_of_def(trait_id);
+            for (mut gi: i64 = 0; gi < param_trait.generic_params.length; gi++) { out.push(TypeRef::invalid()); }
+            for (mut ai: i64 = 0; ai < param_trait.assoc_types.length; ai++) {
+                out.push(this.project_slot(subject, trait_ty, ai));
+            }
+            return out;
+        }
         const impl_node: ImplBlock* = DeclarationNode::impl_of(
             this.generic_registry.template_head_for(trait_id, subject, this.intern_table));
         if (impl_node == null) { return out; }
@@ -996,8 +1010,14 @@ type struct TypeResolver {
                     if (tdecl.assoc_types[assoc_idx] == null) { continue; }
                     const arg_ann: TypeAnnotation* = tr.type_args[ai];
                     if (arg_ann == null) { continue; }
-                    const derived: TypeRef =
-                        this.resolve_concrete_member(subject, assoc_idx, tdecl, bctx);
+                    // A subject still a type parameter has no implementation
+                    // to read: its member is its projection (`A` in
+                    // `I: Iterator<A>` is `I::Item`).
+                    const derived: TypeRef = if (this.arena.lookup(subject).kind == TypeKind::GenericParam) {
+                        this.concrete_trait_slots(subject, tr.definition())[ngp + assoc_idx]
+                    } else {
+                        this.resolve_concrete_member(subject, assoc_idx, tdecl, bctx)
+                    };
                     if (derived.is_valid()) {
                         this.bind_where_arg_into_ctx(arg_ann, derived, bctx);
                     }

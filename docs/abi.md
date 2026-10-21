@@ -96,6 +96,22 @@ trait, which may be in another module, or that implementation's copy of
 the trait's default, and null for a method that cannot be called through
 an object.  A `null` `virtual T*` has both words null.
 
+For `type trait Named { name(&this) -> string; }` and
+`type trait Shape : Named { area(&this) -> i32; scale(mut &this, by: i32) -> void; }`,
+the table behind a `virtual &Shape` holding a `Circle` is:
+
+| word | holds                                                          |
+|------|----------------------------------------------------------------|
+| 0    | release function for a `Circle`, or null if it owns nothing    |
+| 1    | size of `Circle` in bytes                                      |
+| 2    | alignment of `Circle` in bytes                                 |
+| 3    | `name` of `Circle`'s implementation of `Named`                 |
+| 4    | `area` of `Circle`'s implementation of `Shape`                 |
+| 5    | `scale` of `Circle`'s implementation of `Shape`                |
+
+A `virtual &Named` over the same value points at a different table, the
+one named for `Named`, whose words 0 to 3 are the same.
+
 A call through an object loads the word at three plus the method's
 position in that layout and calls it with the object's first word, the value's address,
 as the receiver, then the call's own arguments.  The call is classified

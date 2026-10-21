@@ -4666,13 +4666,23 @@ type struct CallResolver {
         for (mut bi: i64 = 0; bi < block.where_bounds.length; bi++) {
             const bound: &TraitBound = &block.where_bounds[bi];
             const subject: TypeRef = this.trait_checker().lookup_subst_for_param(bound.subject_sym, view);
-            if (!subject.is_valid() || this.types.contains_generic_param(subject)) { continue; }
+            if (!subject.is_valid()) { continue; }
+            // A subject that is itself a type parameter gives its projections
+            // (`concrete_trait_slots`), each what the parameter's own bound
+            // writes for it; one that only holds a parameter has no
+            // implementation selected yet.
+            const subject_t: Type* = this.arena.lookup(subject);
+            const subject_is_param: boolean = subject_t != null && subject_t.kind == TypeKind::GenericParam;
+            if (this.types.contains_generic_param(subject) && !subject_is_param) { continue; }
             for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
                 const tr: &TraitRef = &bound.trait_refs[ti];
                 if (tr.type_args.length == 0) { continue; }
                 const slots: [TypeRef] = this.ctx.type_resolver.concrete_trait_slots(subject, tr.definition());
                 for (mut ai: i64 = 0; ai < tr.type_args.length && ai < slots.length; ai++) {
-                    this.bind_where_arg(block, tr.type_args[ai], slots[ai], view);
+                    const slot: TypeRef = if (subject_is_param && slots[ai].is_valid()) {
+                        this.binding.reduce_assoc_projections(slots[ai])
+                    } else { slots[ai] };
+                    this.bind_where_arg(block, tr.type_args[ai], slot, view);
                 }
             }
         }
@@ -5133,6 +5143,10 @@ type struct CallResolver {
             // block; the bound path below binds a trait method's the same way.
             // A generic owner's method with type parameters of its own
             // returns in the arguments the call's stash solved for them.
+            // Any other method selected on an instantiation not yet minted
+            // returns what the selection saw through its block's view of the
+            // instantiation; a default a block copies per call (`filter`) is
+            // registered nowhere, so there is no entry to read it from.
             mut dir: BoundDirection = BoundDirection::none();
             const on_instantiation: boolean = this.types.peel_to_instantiation(obj_type) != null;
             const abs_ret: TypeRef = if (member.generic_args.length > 0 && on_instantiation) {
@@ -5143,7 +5157,11 @@ type struct CallResolver {
                     this.binding.resolve_generic_method_return(obj_type, member, call, selected.chosen,
                         TypeRef::invalid())
                 } else {
-                    this.binding.abstract_receiver_method_return(obj_type, member.member, selected.chosen, &dir)
+                    if (selected.owner_inst.is_valid()) {
+                        selected.ret
+                    } else {
+                        this.binding.abstract_receiver_method_return(obj_type, member.member, selected.chosen, &dir)
+                    }
                 }
             };
             if (abs_ret.is_valid()) {
