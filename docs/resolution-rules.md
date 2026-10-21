@@ -272,6 +272,19 @@ yet is recorded with the change that builds it, not here.
      each in its own change,** and trait-object defaults then land with
      `map` and `filter` through an object in their run test.  (Delegated)
 
+496. **The implementation the compiler makes for an object (its defaults
+     for `virtual mut &Iterator<i32>`, and so on) has one definition per
+     (trait, object type),** registered in the declaration index under the
+     trait, as a specialization is under its template.  Its methods are
+     placed and linked by the rule every generic instance follows: emitted
+     in the module that owns the first named type among the instance's
+     arguments, else in the template's module - for an object, the
+     trait's, compiled within the build - with `weak_odr` linkage in a
+     COMDAT of its own symbol, which names no requesting module.  A copy
+     the prebuilt standard library also holds folds into one at link.  The
+     same rule, not a new one, so objects add no placement case.
+     (Delegated)
+
 462. **A path through a bounded type parameter naming a member no bound
      declares (`T::missing()` in a generic function that is instantiated)
      is refused with a diagnostic where it is written,** not left for

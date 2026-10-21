@@ -4462,7 +4462,7 @@ type struct CallResolver {
                 const proj: AssocProjectionType* = t.as_assoc_projection();
                 this.bind_projections(proj.base, subst);
                 const applied: TypeRef = subst.apply(ty, this.arena);
-                if (applied.equals(ty) || this.types.contains_generic_param(applied)) { return; }
+                if (applied.equals(ty)) { return; }
                 const reduced: TypeRef = this.binding.reduce_assoc_projections(applied);
                 const rt: Type* = this.arena.lookup(reduced);
                 if (rt != null && rt.kind != TypeKind::AssocProjection) { subst.add(ty, reduced); }
@@ -5131,13 +5131,20 @@ type struct CallResolver {
             // (`w.conv::<u32>(5)` on a `Wrap<A>`) returns in them, whether
             // the method is declared in the type's body or in an `implement`
             // block; the bound path below binds a trait method's the same way.
+            // A generic owner's method with type parameters of its own
+            // returns in the arguments the call's stash solved for them.
             mut dir: BoundDirection = BoundDirection::none();
-            const abs_ret: TypeRef = if (member.generic_args.length > 0
-                    && this.types.peel_to_instantiation(obj_type) != null) {
+            const on_instantiation: boolean = this.types.peel_to_instantiation(obj_type) != null;
+            const abs_ret: TypeRef = if (member.generic_args.length > 0 && on_instantiation) {
                 this.binding.resolve_method_return_with_explicit_args(obj_type, member, selected.chosen,
                     TypeRef::invalid())
             } else {
-                this.binding.abstract_receiver_method_return(obj_type, member.member, selected.chosen, &dir)
+                if (on_instantiation && call.resolved_type_args.length > 0) {
+                    this.binding.resolve_generic_method_return(obj_type, member, call, selected.chosen,
+                        TypeRef::invalid())
+                } else {
+                    this.binding.abstract_receiver_method_return(obj_type, member.member, selected.chosen, &dir)
+                }
             };
             if (abs_ret.is_valid()) {
                 if (dir.named().is_valid() && !member.resolved_trait.is_valid()) {
