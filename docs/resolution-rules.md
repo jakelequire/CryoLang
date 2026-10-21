@@ -248,6 +248,19 @@ yet is recorded with the change that builds it, not here.
      supertraits is refused where the `implement` block is written,** in
      words that agree with E0315's supertrait form.  (Jake)
 
+491. **E0307 for the count of an object's type arguments keeps its
+     wording,** "`Iterator` takes 1 type argument in an object type, and 0
+     are written", with the note naming the parameters and associated types
+     in declaration order.  (Delegated)
+
+492. **E0314 keeps its note for an associated type an object leaves
+     unbound,** "its signature names an associated type of `Pick` that
+     `virtual &Twice` does not bind".  (Delegated)
+
+493. **Implementing a subtrait without its supertrait keeps code E0312 and
+     its wording,** "`Square` does not implement `Base`, which `Shape`
+     requires, so `Square` cannot implement `Shape`".  (Delegated)
+
 462. **A path through a bounded type parameter naming a member no bound
      declares (`T::missing()` in a generic function that is instantiated)
      is refused with a diagnostic where it is written,** not left for

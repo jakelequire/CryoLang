@@ -28,7 +28,7 @@ import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, sink, source_span };
 import compiler::resolver::{ intern_table, symbol_str };
 import std::fmt;
-import compiler::ast::declaration::{ DeclarationNode, FunctionDecl, ImplBlock, MethodDecl, VarDecl };
+import compiler::ast::declaration::{ DeclarationNode, FunctionDecl, ImplBlock, MethodDecl, TraitDecl, VarDecl };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::sink::{ DiagnosticSink };
 import compiler::resolver::intern_table::{ InternTable };
@@ -37,7 +37,7 @@ import compiler::resolver::decl_name::{ DeclName };
 import compiler::resolver::res::{ DefId };
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::types::arena::{ TypeArena };
-import compiler::types::compound::{ PointerType, ReferenceType };
+import compiler::types::compound::{ ObjectType, PointerType, ReferenceType };
 import compiler::types::user_defined::{ TypeAliasType };
 import compiler::types::generic::{ GenericParamType };
 import compiler::types::generic_registry::{ GenericRegistry };
@@ -162,6 +162,11 @@ type struct TraitChecker {
             }
         }
 
+        const object_t: Type* = this.arena.lookup(ty);
+        if (object_t != null && object_t.kind == TypeKind::Object) {
+            return this.object_implements_trait(object_t.as_object(), trait_name);
+        }
+
         // The subject is used directly, whether it is a pre-mono InstantiatedType
         // wrapper or a post-mono concrete spec: both `carries_impl_key` and the
         // type-arg substitution below read the instantiation identity through the
@@ -173,6 +178,32 @@ type struct TraitChecker {
         // A method merely named `drop` does not satisfy `Drop`: a type
         // implements it with `implement trait Drop`, as any other trait.
         return impl_block != null;
+    }
+
+    /// Whether a trait object implements `trait_def`.  The compiler makes
+    /// that implementation, for the object's own trait and each of its
+    /// supertraits, and no other: no implementation is written for an object
+    /// type.  Each method of `trait_def` and of its supertraits is then
+    /// called through the object's table, so each must be callable through
+    /// one (`GenericRegistry::method_object_unavailable`), in every form of
+    /// object, as a call written on the object is.
+    object_implements_trait(&this, object: ObjectType*, trait_def: DefId) -> boolean {
+        if (this.generic_registry == null) { return false; }
+        const reached: [DefId] = this.generic_registry.object_table_traits(object.trait_def);
+        mut found: boolean = false;
+        for (mut i: i64 = 0; i < reached.length; i++) {
+            if (reached[i].equals(trait_def)) { found = true; }
+        }
+        if (!found) { return false; }
+        const required: [DefId] = this.generic_registry.object_table_traits(trait_def);
+        for (mut t: i64 = 0; t < required.length; t++) {
+            const decl: TraitDecl* = this.generic_registry.get_trait_decl(required[t]);
+            if (decl == null) { return false; }
+            for (mut m: i64 = 0; m < decl.methods.length; m++) {
+                if (this.generic_registry.method_object_unavailable(decl.methods[m]).length() > 0) { return false; }
+            }
+        }
+        return true;
     }
 
     /// The impl of `trait_id` for `subject` that APPLIES: the first
