@@ -4969,35 +4969,32 @@ type struct CallResolver {
     }
 
     /// The type of a call through the trait object `receiver_t`.  The
-    /// method is the object's trait's own declared method of the call's
-    /// leaf; the call is stamped with that trait and the method's position,
-    /// which is the slot code generation loads from the object's table, so
-    /// nothing later matches a slot by name.  The arguments are checked
-    /// against the trait method's parameters past its receiver.  A method
-    /// the trait does not declare is E0358, one unavailable on an object
-    /// E0314 with the reason.
+    /// method is the nearest declaration of the call's leaf among the
+    /// object's trait and its supertraits (`trait_members_declaring`), as a
+    /// bound gives its subject; the call is stamped with the declaring
+    /// trait and the method's position there, which locate the word code
+    /// generation loads from the object's table, so nothing later matches
+    /// a slot by name.  The arguments are checked against the trait
+    /// method's parameters past its receiver.  A method no such trait
+    /// declares is E0358, one unavailable on an object E0314 with the
+    /// reason.
     resolve_object_call(mut &this, visitor: SemaVisitor*, call_e: ExpressionNode*, call: CallExpr*,
                         member: MemberAccessExpr*, receiver_t: Type*) -> TypeRef {
         const object: ObjectType* = receiver_t.as_object();
         const registry: GenericRegistry* = this.ctx.generic_registry;
         const at: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { call.callee.span };
         const members: [TraitMember] = registry.trait_members_declaring(object.trait_def, member.member);
-        mut slot: i64 = -1;
-        for (mut k: i64 = 0; k < members.length; k++) {
-            if (members[k].trait_def.equals(object.trait_def)) { slot = members[k].slot; break; }
-        }
-        if (slot < 0) {
+        if (members.length == 0) {
             mut d: Diagnostic = Diagnostic::error(ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
                 fmt::format("no method named `%s` can be called on `%s`",
                     this.intern.resolve(member.member), this.arena.format_display(receiver_t)));
             d = d.at(at);
-            if (members.length > 0) {
-                d = d.with_note("a supertrait's method is not callable through a trait object yet");
-            }
             this.ctx.emit_diagnostic(d);
             return TypeRef::invalid();
         }
-        const method: DeclarationNode* = registry.get_trait_decl(object.trait_def).methods[slot];
+        const declaring: DefId = members[0].trait_def;
+        const slot: i64 = members[0].slot;
+        const method: DeclarationNode* = registry.get_trait_decl(declaring).methods[slot];
         const reason: string = registry.method_object_unavailable(method);
         if (reason.length() > 0) {
             mut d: Diagnostic = Diagnostic::error(ErrorCode::E0314_OBJECT_METHOD_UNAVAILABLE,
@@ -5008,7 +5005,7 @@ type struct CallResolver {
             this.ctx.emit_diagnostic(d);
             return TypeRef::invalid();
         }
-        member.set_resolved_trait_item(object.trait_def, slot);
+        member.set_resolved_trait_item(declaring, slot);
         const func: FunctionDecl* = DeclarationNode::fn_of(method);
         mut params: [TypeRef] = [];
         for (mut i: i64 = 1; i < func.parameters.length; i++) {

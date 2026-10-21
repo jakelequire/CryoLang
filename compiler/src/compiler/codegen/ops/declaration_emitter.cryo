@@ -135,12 +135,12 @@ type struct DeclarationEmitter {
     /// for any other body.
     caller_location: LValue;
 
-    /// The word of a trait-object table holding the method at `slot` among
-    /// the trait's declared ones: past the three reserved words, the drop,
-    /// the size and the alignment.  The table is built and a call through
-    /// it loads by this one answer.
-    static object_table_word(slot: i64) -> i64 {
-        return 3 + slot;
+    /// The word of a trait-object table holding the method at `index` among
+    /// the table's methods (`GenericRegistry::object_table_index`): past the
+    /// three reserved words, the drop, the size and the alignment.  The
+    /// table is built and a call through it loads by this one answer.
+    static object_table_word(index: i64) -> i64 {
+        return 3 + index;
     }
 
     static null() -> DeclarationEmitter {
@@ -647,10 +647,10 @@ type struct DeclarationEmitter {
 
     /// The LLVM type of `block`'s trait-object table: three reserved words,
     /// the type's release, its size and its alignment, then a word per method
-    /// the trait declares, by position.
+    /// of the trait and its supertraits, in the table's order
+    /// (`GenericRegistry::object_table_index`).
     object_table_type(&this, block: ImplBlock*) -> LType {
-        const decl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(block.trait_def);
-        const methods: i64 = if (decl != null) { decl.methods.length } else { 0 };
+        const methods: i64 = this.ctx.generic_registry.object_table_method_count(block.trait_def);
         return LType::array_of(LType::pointer_to(LType::i8()), DeclarationEmitter::object_table_word(methods) as u32);
     }
 
@@ -665,38 +665,51 @@ type struct DeclarationEmitter {
 
     /// Define `block`'s table, in the module holding the implementation,
     /// when some conversion names it.  `drop_word` is the function that
-    /// releases the value behind an object in full, or null.  A method
-    /// unavailable on an object holds a null word; an available one with no
-    /// function to point at is an internal error, never a table left short.
+    /// releases the value behind an object in full, or null.  Each trait's
+    /// methods come from the type's implementation of that trait, which
+    /// sema recorded with the table (`object_table_blocks`) and which may
+    /// live in another module.  A method unavailable on an object holds a
+    /// null word; an available one with no function to point at is an
+    /// internal error, never a table left short.
     emit_object_table(mut &this, block: ImplBlock*, drop_word: LValue, span: SourceSpan) -> void {
         if (!block.object_table_symbol.is_valid()) { return; }
         const registry: GenericRegistry* = this.ctx.generic_registry;
-        const decl: TraitDecl* = registry.get_trait_decl(block.trait_def);
-        if (decl == null) { return; }
+        const traits: [DefId] = registry.object_table_traits(block.trait_def);
+        const shown: string = this.ctx.intern_table.resolve(block.object_table_symbol);
+        if (traits.length != block.object_table_blocks.length) {
+            this.diag.emit_error_at_span(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                fmt::format("codegen: the trait-object table `%s` holds %lld traits but has %lld implementations",
+                    shown, traits.length, block.object_table_blocks.length), span);
+            return;
+        }
         const word: LType = LType::pointer_to(LType::i8());
         const owner: TypeRef = this.ctx.decl_index.impl_owner(block, "codegen/trait-object table");
-        const n: u32 = DeclarationEmitter::object_table_word(decl.methods.length) as u32;
+        const n: u32 = DeclarationEmitter::object_table_word(registry.object_table_method_count(block.trait_def)) as u32;
         const buf: void* = libc::malloc(n as u64 * 8);
         const words: void** = buf as void**;
         words[0] = drop_word.raw;
         words[1] = llvm::LLVMConstIntToPtr(this.expr_ops.codegen_sizeof(owner).raw, word.raw);
         words[2] = llvm::LLVMConstIntToPtr(this.expr_ops.codegen_alignof(owner).raw, word.raw);
-        for (mut slot: i64 = 0; slot < decl.methods.length; slot++) {
-            mut f: LValue = LType::const_null(word);
-            if (registry.method_object_unavailable(decl.methods[slot]).length() == 0) {
-                const m: MethodDecl* = DeclarationNode::method_of(registry.trait_item_method(block, slot));
-                if (m != null && m.func != null) {
-                    f = this.resolver.resolve_decl(DeclarationNode::fn_of(m.func).overload_entry);
+        for (mut k: i64 = 0; k < traits.length; k++) {
+            const decl: TraitDecl* = registry.get_trait_decl(traits[k]);
+            const implementation: ImplBlock* = block.object_table_blocks[k];
+            for (mut slot: i64 = 0; slot < decl.methods.length; slot++) {
+                mut f: LValue = LType::const_null(word);
+                if (registry.method_object_unavailable(decl.methods[slot]).length() == 0) {
+                    const m: MethodDecl* = DeclarationNode::method_of(registry.trait_item_method(implementation, slot));
+                    if (m != null && m.func != null) {
+                        f = this.resolver.resolve_decl(DeclarationNode::fn_of(m.func).overload_entry);
+                    }
+                    if (!f.is_valid()) {
+                        this.diag.emit_error_at_span(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                            fmt::format("codegen: the trait-object table `%s` has no function for method %lld of its trait %lld",
+                                shown, slot, k), span);
+                        libc::free(buf);
+                        return;
+                    }
                 }
-                if (!f.is_valid()) {
-                    this.diag.emit_error_at_span(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                        fmt::format("codegen: the trait-object table `%s` has no function for its method %lld",
-                            this.ctx.intern_table.resolve(block.object_table_symbol), slot), span);
-                    libc::free(buf);
-                    return;
-                }
+                words[DeclarationEmitter::object_table_word(registry.object_table_index(block.trait_def, traits[k], slot))] = f.raw;
             }
-            words[DeclarationEmitter::object_table_word(slot)] = f.raw;
         }
         const init: LValue = LType::const_array(word, buf, n);
         libc::free(buf);

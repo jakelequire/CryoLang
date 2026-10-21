@@ -1442,6 +1442,66 @@ type struct GenericRegistry {
         return out;
     }
 
+    /// The traits whose methods the table of an object of `trait_def` holds,
+    /// in the table's order: each supertrait's own order first, in the order
+    /// the supertraits are written, then `trait_def` itself.  A trait
+    /// reached a second time keeps its first place, so a subtrait's table
+    /// starts with its first supertrait's whole table.  A supertrait the
+    /// name layer could not place, and one that inherits back from a trait
+    /// still being laid out, add nothing.
+    object_table_traits(&this, trait_def: DefId) -> [DefId] {
+        mut out: [DefId] = [];
+        mut open: [DefId] = [];
+        this.lay_out_object_table(trait_def, &out, &open);
+        return out;
+    }
+
+    lay_out_object_table(&this, trait_def: DefId, out: mut &[DefId], open: mut &[DefId]) -> void {
+        if (!trait_def.is_valid()) { return; }
+        for (mut j: i64 = 0; j < out.length; j++) {
+            if (out[j].equals(trait_def)) { return; }
+        }
+        for (mut j: i64 = 0; j < open.length; j++) {
+            if (open[j].equals(trait_def)) { return; }
+        }
+        const decl: TraitDecl* = this.get_trait_decl(trait_def);
+        if (decl == null) { return; }
+        open.push(trait_def);
+        for (mut i: i64 = 0; i < decl.base_traits.length; i++) {
+            this.lay_out_object_table(decl.base_traits[i].definition(), out, open);
+        }
+        out.push(trait_def);
+    }
+
+    /// The position among the method words of the table of an object of
+    /// `object_trait` that holds `declaring`'s method at `slot`: the
+    /// methods of every trait laid out before `declaring`
+    /// (`object_table_traits`), then `slot`.  The one answer both the table
+    /// and a call through it read; -1 when the table holds no such method.
+    object_table_index(&this, object_trait: DefId, declaring: DefId, slot: i64) -> i64 {
+        const traits: [DefId] = this.object_table_traits(object_trait);
+        mut before: i64 = 0;
+        for (mut k: i64 = 0; k < traits.length; k++) {
+            const decl: TraitDecl* = this.get_trait_decl(traits[k]);
+            if (traits[k].equals(declaring)) {
+                if (slot < 0 || slot >= decl.methods.length) { return -1; }
+                return before + slot;
+            }
+            before += decl.methods.length;
+        }
+        return -1;
+    }
+
+    /// How many method words the table of an object of `trait_def` holds.
+    object_table_method_count(&this, trait_def: DefId) -> i64 {
+        const traits: [DefId] = this.object_table_traits(trait_def);
+        mut n: i64 = 0;
+        for (mut k: i64 = 0; k < traits.length; k++) {
+            n += this.get_trait_decl(traits[k]).methods.length;
+        }
+        return n;
+    }
+
     /// The language items are a table the compiler fixes,
     /// named by path; this is the one place a declaration's path is compared
     /// with it, so every other reader asks by the `LangItem`.

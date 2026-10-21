@@ -256,21 +256,24 @@ type struct CallEmitter {
     }
 
     /// A call through a trait object: the function is the word of the
-    /// object's table at the slot sema recorded on the call, called with
-    /// the object's data word as its receiver.  The signature is classified
-    /// from the trait method's own declaration, since which function the
-    /// slot holds is known only where the call runs.  A call with no slot
-    /// of its trait is an internal error, never a call bound some other way.
+    /// object's table holding the method sema recorded on the call - its
+    /// declaring trait, the object's own or a supertrait, and its slot
+    /// there - called with the object's data word as its receiver.  The
+    /// signature is classified from the trait method's own declaration,
+    /// since which function the word holds is known only where the call
+    /// runs.  A call whose method the table does not hold is an internal
+    /// error, never a call bound some other way.
     call_through_object(mut &this, visitor: IRGeneratorVisitor*, e: ExpressionNode*, node: CallExpr*,
                         ma: MemberAccessExpr*) -> Emitted {
         mut out: Emitted = Emitted::none();
+        const registry: GenericRegistry* = this.cg.ctx.generic_registry;
         const slot: i64 = ma.resolved_trait_slot;
-        const decl: TraitDecl* = if (slot >= 0) {
-            this.cg.ctx.generic_registry.get_trait_decl(ma.resolved_trait)
-        } else { null };
-        if (decl == null || slot >= decl.methods.length) {
+        const object_trait: DefId = this.cg.arena_type(ma.object.resolved_type).as_object().trait_def;
+        const index: i64 = registry.object_table_index(object_trait, ma.resolved_trait, slot);
+        const decl: TraitDecl* = if (index >= 0) { registry.get_trait_decl(ma.resolved_trait) } else { null };
+        if (decl == null) {
             mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                "internal: a call through a trait object reached code generation with no slot of its trait");
+                "internal: a call through a trait object reached code generation naming no method of the object's table");
             diag = diag.at(e.span);
             this.cg.diag.emit(diag);
             return out;
@@ -290,7 +293,7 @@ type struct CallEmitter {
         const table: LValue = this.cg.builder.build_extract_value(object, 1, "object.table");
         const index_buf: void* = libc::malloc(8);
         const index_slots: void** = index_buf as void**;
-        index_slots[0] = LType::const_int(LType::i64(), DeclarationEmitter::object_table_word(slot) as u64, false).raw;
+        index_slots[0] = LType::const_int(LType::i64(), DeclarationEmitter::object_table_word(index) as u64, false).raw;
         const at: LValue = this.cg.builder.build_gep(word, table, index_buf, 1, "object.slot");
         libc::free(index_buf);
         const fn_ptr: LValue = this.cg.builder.build_load(word, at, "object.method");

@@ -86,13 +86,18 @@ reserved: a function of the value's address releasing the value in full
 its scope's exit would - or null for a type that owns nothing; the type's
 size; and its alignment.  The release function is internal to the
 implementation's module, named after the table, `__cryo.release.` then
-the table's symbol.  Then comes one word per method
-the trait declares, in declaration order: the implementation's function,
-or its copy of the trait's default, and null for a method that cannot be
-called through an object.  A `null` `virtual T*` has both words null.
+the table's symbol.  Then come the methods' words, a trait at a time:
+each supertrait's own methods first, laid out by this same rule in the
+order the supertraits are written, then the trait's own, each trait in
+declaration order and a trait reached twice only the first time, so a
+subtrait's table begins with its first supertrait's whole table.  Each
+word is the function of the type's implementation of the declaring
+trait, which may be in another module, or that implementation's copy of
+the trait's default, and null for a method that cannot be called through
+an object.  A `null` `virtual T*` has both words null.
 
 A call through an object loads the word at three plus the method's
-position and calls it with the object's first word, the value's address,
+position in that layout and calls it with the object's first word, the value's address,
 as the receiver, then the call's own arguments.  The call is classified
 from the trait method's declared signature, whose receiver is a pointer
 whatever the implementing type, so it passes and returns exactly as a

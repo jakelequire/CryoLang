@@ -215,6 +215,21 @@ yet is recorded with the change that builds it, not here.
 482. **A table demangles as `<vtable for Main::Shape for Main::Circle>`.**
      (Jake)
 
+483. **E0314 keeps its wording,** "`consume` cannot be called through
+     `virtual &Shape`", with the reason as a note: the method is static,
+     takes `this` by value, has type parameters of its own, or names
+     `This` in a parameter or its return.  (Jake)
+
+484. **The two interim E0358 notes stay until their cases are built,** a
+     supertrait's method through an object and a call through a reference
+     or pointer to an object (`r: &virtual &Shape; r.area()`), both built
+     with the supertrait step; each note is removed in the commit that
+     makes its case work.  (Jake)
+
+485. **The release function keeps the internal name
+     `__cryo.release.<table symbol>`,** outside the mangling grammar, until
+     backtrace symbolization lands.  (Jake)
+
 462. **A path through a bounded type parameter naming a member no bound
      declares (`T::missing()` in a generic function that is instantiated)
      is refused with a diagnostic where it is written,** not left for
