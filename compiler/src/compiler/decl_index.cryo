@@ -72,12 +72,14 @@ type struct GlobalEntry {
     source_file:   SymbolStr;
     extern_symbol: SymbolStr;
     thread_local:  boolean;
+    /// The type a type's constant belongs to; invalid for a module's global.
+    owner:         DefId;
 
     static none() -> GlobalEntry {
         return GlobalEntry {
             valid: false, slot: -1, leaf: SymbolStr::empty(), declared_in: ModulePath::none(),
             type_ref: TypeRef::invalid(), source_file: SymbolStr::empty(),
-            extern_symbol: SymbolStr::empty(), thread_local: false,
+            extern_symbol: SymbolStr::empty(), thread_local: false, owner: DefId::invalid(),
         };
     }
 }
@@ -282,6 +284,9 @@ type struct DeclarationIndex {
                                       // marked thread-local too (else it would
                                       // reference a TLS symbol with a non-TLS
                                       // relocation and fail to link).
+    module_global_owners:     [DefId];  // parallel to module_global_leaves:
+                                      // the type a type's constant belongs to,
+                                      // invalid for a module's own global.
     private module_global_extern_syms: [u32];  // parallel to module_global_leaves: the
                                       // linker symbol of a global whose storage
                                       // another object owns (an `extern` C
@@ -420,6 +425,7 @@ public:
             def_globals:              [],
             module_global_leaves:     [],
             module_global_threadlocal: [],
+            module_global_owners:     [],
             module_global_extern_syms: [],
             module_global_files:      [],
             module_global_declared_in: [],
@@ -959,15 +965,18 @@ public:
     /// what the first recorded (its module, type and thread-local flag)
     /// rather than adding a slot.  Codegen mangles the global as
     /// `C$<module path>.<leaf>`; `declared_in` is none for a unit declaring
-    /// no namespace (the global stays bare-mangled).
+    /// no namespace (the global stays bare-mangled).  `owner` is the type a
+    /// type's constant belongs to, which mangles it as `C$<type>-<leaf>`,
+    /// and invalid for a module's own global.
     register_global(mut &this, def: DefId, leaf: SymbolStr, ty: TypeRef,
                     source_file: SymbolStr, declared_in: ModulePath,
-                    thread_local: boolean) -> void {
+                    thread_local: boolean, owner: DefId) -> void {
         const i: i64 = this.global_slot_of_def(def);
         if (i >= 0) {
             this.module_global_declared_in[i] = declared_in;
             this.module_global_threadlocal[i] = thread_local;
             this.module_global_types[i] = ty;
+            this.module_global_owners[i] = owner;
             return;
         }
         const ds: i64 = this.defs.slot(def);
@@ -977,6 +986,7 @@ public:
         this.module_global_files.push(source_file.id);
         this.module_global_declared_in.push(declared_in);
         this.module_global_threadlocal.push(thread_local);
+        this.module_global_owners.push(owner);
         this.module_global_extern_syms.push(0);
         this.module_global_types.push(ty);
     }
@@ -1008,6 +1018,7 @@ public:
             source_file:   SymbolStr::from_id(this.module_global_files[i]),
             extern_symbol: SymbolStr::from_id(this.module_global_extern_syms[i]),
             thread_local:  this.module_global_threadlocal[i],
+            owner:         this.module_global_owners[i],
         };
     }
 
@@ -1018,10 +1029,12 @@ public:
     ///
     /// The global the module `m` declares as `leaf`, or an entry that is not
     /// `valid`.  No module is the root, which a unit with no `namespace`
-    /// declaration registers its globals under.
+    /// declaration registers its globals under.  A type's constant is not
+    /// the module's: `m::ORIGIN` does not name `Point::ORIGIN`.
     global_in_module(&this, leaf: SymbolStr, m: ModulePath) -> GlobalEntry {
         for (mut i: i64 = 0; i < this.module_global_leaves.length; i++) {
             if (this.module_global_leaves[i] != leaf.id) { continue; }
+            if (this.module_global_owners[i].is_valid()) { continue; }
             if (!this.module_global_declared_in[i].equals(m)) { continue; }
             return this.global_entry_at(i);
         }

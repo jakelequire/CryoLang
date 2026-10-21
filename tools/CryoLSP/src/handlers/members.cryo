@@ -1,8 +1,8 @@
 ///! A type's members and a module's contents, enumerated by identity.
 ///!
-///! A type's members are what its declaration holds - fields, methods,
-///! variants - then what every implementation block whose stamped target is
-///! the type adds.  A module's contents are
+///! A type's members are what its declaration holds - fields, constants,
+///! methods, variants - then what every implementation block whose stamped
+///! target is the type adds.  A module's contents are
 ///! its export list and the modules nested under it.  Nothing here asks for
 ///! a member by its name: completion and the extended hover list them all.
 namespace lsp::handlers::members;
@@ -12,7 +12,7 @@ import compiler::ast::node::{ ProgramNode };
 import compiler::ast::node_locator::{ NodeLocator };
 import compiler::ast::declaration::{
     DeclarationNode, DeclKind, EnumDecl, ImplBlock, MethodDecl,
-    StructDecl, UnionDecl
+    StructDecl, UnionDecl, VarDecl
 };
 import compiler::module_graph::{ ModulePath };
 import compiler::resolver::res::{ DefId };
@@ -28,6 +28,8 @@ type enum Member {
     Variant(DefId, i64);
     /// A method, by its declaration.
     Method(MethodDecl*);
+    /// A constant the type declares, by its definition.
+    Constant(DefId);
 }
 
 type struct Members {
@@ -54,10 +56,12 @@ type struct Members {
             }
             DeclKind::Union(ud) => {
                 this.add_fields(d, &ud.fields);
+                this.add_constants(&ud.constants);
                 this.add_methods(&ud.methods);
             }
             DeclKind::Struct(sd) => {
                 this.add_fields(d, &sd.fields);
+                this.add_constants(&sd.constants);
                 this.add_methods(&sd.methods);
             }
             DeclKind::Import(_) | DeclKind::Intrinsic(_) | DeclKind::Impl(_)
@@ -72,6 +76,14 @@ type struct Members {
     add_fields(mut &this, owner: DefId, fields: &[DeclarationNode*]) -> void {
         for (mut i: i64 = 0; i < fields.length; i++) {
             if (fields[i] != null) { this.out.push(Member::Field(owner, i)); }
+        }
+    }
+
+    add_constants(mut &this, constants: &[DeclarationNode*]) -> void {
+        for (mut i: i64 = 0; i < constants.length; i++) {
+            const c: VarDecl* = DeclarationNode::var_of(constants[i]);
+            if (c == null || !c.def.is_valid()) { continue; }
+            this.out.push(Member::Constant(c.def));
         }
     }
 
@@ -95,7 +107,10 @@ type struct Members {
                 const stmt: DeclarationNode* = NodeLocator::unwrap_decl_stmt(program.statements[si]).as_decl();
                 if (stmt == null || DeclarationNode::impl_of(stmt) == null) { continue; }
                 const ib: ImplBlock* = DeclarationNode::impl_of(stmt);
-                if (ib.target_def().equals(d)) { this.add_methods(&ib.methods); }
+                if (ib.target_def().equals(d)) {
+                    this.add_constants(&ib.constants);
+                    this.add_methods(&ib.methods);
+                }
             }
         }
     }
@@ -131,6 +146,7 @@ type struct Members {
             Member::Field(_, _)   => { true }
             Member::Variant(_, _) => { false }
             Member::Method(md)    => { !md.is_static }
+            Member::Constant(_)   => { false }
         };
     }
 

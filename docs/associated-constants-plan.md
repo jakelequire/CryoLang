@@ -429,7 +429,24 @@ PIN, so the standard library cannot declare `implement i32 { const MAX ...
    field's pin, and clean a global's float literal.  Each gets a project
    test that fails on the parent.  Prediction: only objects holding an
    out-of-order constant struct literal or an underscored float global move.
-1. **The feature in the compiler.**
+1. **The feature in the compiler.**  Built.  The codes and wordings:
+   - E0245 "a trait cannot declare constants";
+   - E0246 "a trait implementation cannot declare constants; a trait
+     declares none for it to supply";
+   - E0247 "a generic type cannot declare constants, and `X` is declared
+     on one";
+   - E0248 "the constant `X` has no value; a type's constant is written
+     with one, `const X: T = value;`";
+   - E0249 "a type declared inside a function body cannot declare
+     constants; declare the type at module level";
+   - E0205 "the constant `X` is declared twice on this type" and "the
+     constant `X` has the name of a field / a method / a variant of `T`; a
+     type's constants and other members need distinct names";
+   - E0353 "constant `X` of `T` is private", labelled "private constant
+     reached outside module `M`";
+   - E0204's help for `p.X`: "`X` is a constant of `T`; write `T::X`".
+
+   The original slice-1 plan, for reference:
    - Parse `const NAME: T = e;` in struct and union bodies and in inherent
      `implement` blocks (struct, union, enum, primitive), with one token of
      lookahead, so that keyword-named fields keep working.

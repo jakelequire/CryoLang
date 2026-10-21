@@ -1700,6 +1700,52 @@ const e: Either<i64, f64> = Either::<i64, f64> { a: 100 };
 
 **Ownership.** A union's members are never auto-dropped, since the active member is unknown. If a union owns a resource, implement `Drop` for it (`implement trait Drop for Handle { drop(mut &this) -> void { ... } }`); an inherent method merely named `drop` is not a destructor ([section 15.2](#152-the-drop-trait)).
 
+### 8.8 Constants
+
+A type may declare named constants, reached through the type with `::`. A struct or union writes them in its body, beside its fields and methods, or in an `implement struct` (or `implement union`) block:
+
+```cryo
+type struct Point {
+    x: i32;
+    y: i32;
+
+    const ORIGIN: Point = Point { x: 0, y: 0 };
+    const DIMENSIONS: i32 = 2;
+
+    static new(x: i32, y: i32) -> Point { return Point { x: x, y: y }; }
+}
+
+implement struct Point {
+    const UNIT: Point = Point { x: 1, y: 1 };
+}
+
+const o: Point = Point::ORIGIN;
+mut coordinates: [f64; Point::DIMENSIONS] = [0.0, 0.0];
+```
+
+An enum's constants go in an `implement enum` block, since its body holds only variants, and a primitive's in an `implement` block on the primitive ([section 12.3](#123-implement-blocks-on-primitives)):
+
+```cryo
+type enum Level { Quiet; Normal; Loud; }
+
+implement enum Level {
+    const DEFAULT: Level = Level::Normal;
+}
+```
+
+**What a constant is.** A type's constant follows the rules of a module-level constant ([section 3](#3-variables-and-constants)): its initializer is folded into the program when it is a constant expression, and otherwise computed once, before `main`; its type annotation may be left to the initializer. It is one global with an address, so `&Point::ORIGIN` is a pointer to it. An integer constant folds wherever a compile-time integer is wanted, so it may size an array. A constant is reached through an alias of its type as through the type (`Int::ANSWER` with `type Int = i32;`), as an array length too.
+
+**Names.** Inside the type, in its methods and in its constants' initializers, `This::ORIGIN` names the constant as `Point::ORIGIN` does. A constant is reached only through its type: `p.ORIGIN` on a value `p` is refused (`E0204`), with a help line giving `Point::ORIGIN`. A module-level constant of the same name is a different constant. A constant shares its name with no other member of its type - another constant, a field, a method in any `implement` block, or an enum variant (`E0205`).
+
+**Visibility.** A constant is public by default; `private` (inline, or a `private:` block) confines it to the module that declares it, and reading it from another module is refused (`E0353`).
+
+**Where a constant may not be written.**
+
+- A constant is written with a value: `const EMPTY: Gauge;` is refused (`E0248`).
+- A trait declares no constants (`E0245`), and a trait implementation therefore supplies none (`E0246`).
+- A generic type declares no constants, in its body or in a generic `implement` block (`E0247`).
+- A type declared inside a function body declares no constants (`E0249`); declare the type at module level.
+
 ---
 
 ## 9. Enums
@@ -1771,7 +1817,7 @@ A variant constructs one instantiation, and something must say which: type argum
 
 ### 9.4 Methods on Enums
 
-Enums cannot declare methods inline. Methods are added via an `implement` block, which is also how the standard library gives `Option` and `Result` their rich API:
+Enums cannot declare methods inline. Methods are added via an `implement` block, which is also how the standard library gives `Option` and `Result` their rich API, and where an enum's constants are declared ([section 8.8](#88-constants)):
 
 ```cryo
 implement enum Option<T> {
@@ -2576,7 +2622,17 @@ implement boolean {
 
 After the block is loaded, `my_bool.to_i32()` resolves like any other method call. Resolution is at compile time; no dynamic dispatch.
 
-A primitive owns methods and nothing else: no type declares constants, so `i32::MAX` names no value and is refused (E0201), through an alias of the primitive too. An integer type's bounds are its static methods, `i32::max_value()` and `i32::min_value()`.
+An `implement` block on a primitive may declare constants as well, which are reached through the primitive and through an alias of it ([section 8.8](#88-constants)):
+
+```cryo
+implement i32 {
+    const ANSWER: i32 = 42;
+}
+
+const a: i32 = i32::ANSWER;
+```
+
+A path naming a constant the primitive does not declare names no value and is refused (`E0201`), through an alias of the primitive too. An integer type's bounds are its static methods, `i32::max_value()` and `i32::min_value()`.
 
 ### 12.4 Which Method a Call Names
 

@@ -126,6 +126,16 @@ type struct ConstantTable {
     enums: [EnumDecl*];
     enums_by_def: HashMap<DefKey, i64>;
 
+    /// The constants each type declares (`Point::ORIGIN`, `i32::MAX`),
+    /// parallel arrays: the owning type's definition (a primitive's
+    /// included), the constant's leaf, and the constant's definition.
+    /// Read only through `type_constant`.
+private:
+    type_constant_owners: [DefId];
+    type_constant_leaves: [SymbolStr];
+    type_constant_defs:   [DefId];
+
+public:
     static new(defs: DefTable*) -> ConstantTable {
         return ConstantTable {
             defs: defs,
@@ -133,7 +143,45 @@ type struct ConstantTable {
             by_def:       HashMap::<DefKey, i64>::new(),
             enums:        [],
             enums_by_def: HashMap::<DefKey, i64>::new(),
+            type_constant_owners: [],
+            type_constant_leaves: [],
+            type_constant_defs:   [],
         };
+    }
+
+    /// Record `def` as the constant the type `owner` declares as `leaf`.
+    /// False, recording nothing, when `owner` already declares a constant
+    /// under `leaf`: the caller reports the redeclaration.
+    declare_type_constant(mut &this, owner: DefId, leaf: SymbolStr, def: DefId) -> boolean {
+        if (this.type_constant(owner, leaf).is_valid()) { return false; }
+        this.type_constant_owners.push(owner);
+        this.type_constant_leaves.push(leaf);
+        this.type_constant_defs.push(def);
+        return true;
+    }
+
+    /// The type a path's qualifier names, as the owner its constants are
+    /// recorded under: a declared type's definition, or a primitive's.
+    /// Invalid for a qualifier that names neither.
+    type_constant_owner(&this, base: ResBase) -> DefId {
+        return match (base) {
+            ResBase::Def(d)    => { d }
+            ResBase::PrimTy(p) => { this.defs.primitive(p) }
+            _                  => { DefId::invalid() }
+        };
+    }
+
+    /// The constant the type `owner` declares as `leaf`, or the invalid id.
+    /// The one door for a type's constant: a path `T::NAME` with `T` a
+    /// type is answered here, whichever pass asks.
+    type_constant(&this, owner: DefId, leaf: SymbolStr) -> DefId {
+        if (!owner.is_valid()) { return DefId::invalid(); }
+        for (mut i: i64 = 0; i < this.type_constant_defs.length; i++) {
+            if (this.type_constant_leaves[i].id == leaf.id && this.type_constant_owners[i].equals(owner)) {
+                return this.type_constant_defs[i];
+            }
+        }
+        return DefId::invalid();
     }
 
     /// Record the constant `def` as initialized from `init`.
@@ -507,8 +555,9 @@ type struct ConstEval {
     /// Two answers are meaningful here and they are different questions:
     /// `Def` means the scope named a MODULE, so the member is the constant
     /// the name layer bound in that module (`member_def`); `TypeRelative`
-    /// means it named a TYPE, so the member is an enum variant of it.
-    /// Anything else is not a compile-time integer.
+    /// means it named a TYPE, so the member is a constant the type declares
+    /// (`u8::MAX`, `Point::LIMIT`) or an enum variant of it.  Anything else
+    /// is not a compile-time integer.
     fold_scoped(&this, sr: ScopeResolutionExpr*, out: i64*) -> boolean {
         if (this.table == null || this.intern == null) { return false; }
         return this.fold_scoped_res(
@@ -531,9 +580,12 @@ type struct ConstEval {
                 return this.fold_entry(i, out);
             }
             Res::TypeRelative(base, trailing) => {
-                // `Enum::Variant` is one trailing segment past the type.  A
-                // longer tail is an associated item, which is sema's.
+                // A type's constant or `Enum::Variant`, one trailing segment
+                // past the type.
                 if (trailing != 1) { return false; }
+                const constant: i64 = this.table.index_of(this.table.type_constant(
+                    this.table.type_constant_owner(base), sr.member_name));
+                if (constant >= 0) { return this.fold_entry(constant, out); }
                 return match (base) {
                     ResBase::Def(q) => {
                         return match (this.table.enums_by_def.get(&this.table.defs.table_key(q))) {
@@ -622,6 +674,15 @@ type struct ConstEval {
                 const i: i64 = this.table.index_of(sr.member_def);
                 if (i < 0) { return false; }
                 return this.fold_entry_real(i, out);
+            }
+            Res::TypeRelative(base, 1) => {
+                const constant: i64 = this.table.index_of(this.table.type_constant(
+                    this.table.type_constant_owner(base), sr.member_name));
+                if (constant >= 0) { return this.fold_entry_real(constant, out); }
+                mut iv: i64 = 0;
+                if (!this.fold_scoped_res(r, sr, &iv)) { return false; }
+                *out = iv as f64;
+                return true;
             }
             _ => {
                 mut iv: i64 = 0;

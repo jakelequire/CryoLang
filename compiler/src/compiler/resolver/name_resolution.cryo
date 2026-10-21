@@ -338,6 +338,39 @@ type struct NameResolver {
         return func.def;
     }
 
+    /// Declare the constants a struct, union or inherent `implement` block
+    /// writes as definitions of the type `owner` (a primitive's definition
+    /// for `implement i32`), each recorded under its leaf for the
+    /// `type_constant` door and, for folding, under its definition; then
+    /// walk each one's annotation and initializer, in the scope the caller
+    /// set up, where `This` names the type.  A constant on a generic type
+    /// is refused (E0247), and so is a second constant of one name on a
+    /// type (E0205).  An owner the head could not name declares nothing:
+    /// the head's own error has been reported.
+    declare_type_constants(mut &this, owner: DefId, generic: boolean,
+                           constants: &[DeclarationNode*]) -> void {
+        if (!owner.is_valid()) { return; }
+        for (mut i: i64 = 0; i < constants.length; i++) {
+            const decl: DeclarationNode* = constants[i];
+            const constant: VarDecl* = DeclarationNode::var_of(decl);
+            const leaf: string = this.resolver.intern_table.resolve(constant.name);
+            if (generic) {
+                this.ctx.emit_error_at(ErrorCode::E0247_CONSTANT_ON_GENERIC_TYPE,
+                    fmt::format("a generic type cannot declare constants, and `%s` is declared on one", leaf),
+                    decl.name_span);
+            }
+            constant.def = this.ctx.defs.register(owner, constant.name, DefKind::Value, decl.span);
+            this.ctx.decl_index.keep_declaration(constant.def, decl);
+            if (!this.ctx.const_table.declare_type_constant(owner, constant.name, constant.def)) {
+                this.ctx.emit_error_at(ErrorCode::E0205_REDEFINED_SYMBOL,
+                    fmt::format("the constant `%s` is declared twice on this type", leaf),
+                    decl.name_span);
+            }
+            this.record_const_value(constant.def, constant);
+            this.walk_decl(decl);
+        }
+    }
+
     /// Register every method written in a type's body as a definition of
     /// the type `owner`.
     define_body_methods(&this, owner: DefId, methods: &[DeclarationNode*]) -> void {
@@ -381,6 +414,9 @@ type struct NameResolver {
     /// Declare a module-level variable `decl` (whose payload is `var_node`);
     /// a local is declared where the body walk meets it.
     forward_declare_var(mut &this, decl: DeclarationNode*, var_node: VarDecl*) -> void {
+        // A type's constant binds no name in the module; its type declares
+        // it (`declare_type_constants`).
+        if (var_node.owner != null) { return; }
         // A C-imported global (binding_namespace set) is a
         // declaration of its alias's module, reachable as
         // `cit::NAME`; declared bare here it would shadow same-leaf
@@ -3081,6 +3117,11 @@ implement trait Walk for struct NameResolver {
         // again here would CREATE a second scope of the same name and walk into
         // it, leaving every symbol declared above unreachable from the walk.
         for (mut i: i64 = 0; i < node.statements.length; i++) {
+            // A type's constant is walked with its type, where `This` names
+            // the type.
+            const item_decl: DeclarationNode* = node.statements[i].as_decl();
+            const item_var: VarDecl* = DeclarationNode::var_of(item_decl);
+            if (item_var != null && item_var.owner != null) { continue; }
             this.walk_node(node.statements[i]);
         }
 
@@ -3191,6 +3232,7 @@ implement trait Walk for struct NameResolver {
         this.this_owner = ResBase::Def(node.def);
         this.this_owner_decl = if (node.def.is_valid()) { d } else { null };
         this.this_owner_sym = SymbolID::invalid();
+        this.declare_type_constants(node.def, node.generic_params.length > 0, &node.constants);
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             this.walk_decl(node.methods[i]);
         }
@@ -3230,6 +3272,16 @@ implement trait Walk for struct NameResolver {
         // Every method is a definition of the type before any body is
         // walked.
         this.define_body_methods(node.def, &node.methods);
+        const outer_owner: ResBase = this.this_owner;
+        const outer_owner_decl: DeclarationNode* = this.this_owner_decl;
+        const outer_owner_sym: SymbolID = this.this_owner_sym;
+        this.this_owner = ResBase::Def(node.def);
+        this.this_owner_decl = if (node.def.is_valid()) { d } else { null };
+        this.this_owner_sym = SymbolID::invalid();
+        this.declare_type_constants(node.def, node.generic_params.length > 0, &node.constants);
+        this.this_owner = outer_owner;
+        this.this_owner_decl = outer_owner_decl;
+        this.this_owner_sym = outer_owner_sym;
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             this.walk_decl(node.methods[i]);
         }
@@ -3389,6 +3441,8 @@ implement trait Walk for struct NameResolver {
         // names - a trait implementation's too: the trait's own method is
         // the trait's definition, the implementation's is the type's.
         const method_owner: DefId = this.impl_owner_def(node);
+        this.declare_type_constants(method_owner,
+            node.generic_params.length > 0 || node.target_args.length > 0, &node.constants);
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             const method_decl: DeclarationNode* = node.methods[i];
             const method: MethodDecl* = DeclarationNode::method_of(method_decl);

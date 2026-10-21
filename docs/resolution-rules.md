@@ -100,6 +100,7 @@ or reads the store by identity.  Locked so far:
 | `member-variant` | `EnumType::variant_index` | `compiler/src/compiler/types/user_defined.cryo` | member: an enum variant, by owner type and leaf |
 | `member-variant` | `EnumDecl::variant_position` | `compiler/src/compiler/AST/declaration.cryo` | member: an enum variant, by the enum's declaration and leaf, to its position among the declared variants - for a constant folded off the declaration |
 | `trait-method` | `GenericRegistry::trait_item_slot` | `compiler/src/compiler/types/generic_registry.cryo` | member: a trait's declared method, by trait identity and leaf, to its position in the trait |
+| `member-constant` | `ConstantTable::type_constant` | `compiler/src/compiler/const_table.cryo` | member: a type's constant, by the owning type's definition (a primitive's included) and leaf - for a path `T::NAME` sema types and for a compile-time integer the folder reads |
 | `assoc-type` | `TraitDeclNode::assoc_type_index` | `compiler/src/compiler/AST/declaration.cryo` | member: a trait's associated type, by the trait's declaration and leaf, to its position among the trait's associated types |
 | `module-by-path` | `ModuleGraph::module_named` | `compiler/src/compiler/module_graph.cryo` | written module path to its module |
 | `module-by-path` | `ModuleGraph::module_path_over` | `compiler/src/compiler/module_graph.cryo` | an import's written path to itself as a path to list modules within, when the graph holds a module at it or under it, whether or not it names a module (`import std::`) |
