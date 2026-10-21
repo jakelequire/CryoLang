@@ -875,119 +875,16 @@ type struct MethodBinding {
         if (tdecl.generic_params.length == 0 && tdecl.assoc_types.length == 0) { return ret; }
         mut rc: ResolutionContext = ResolutionContext::new("");
         this.symbolic.symbolic_bind_params(&rc);
-        mut out: TypeRef = ret;
-        mut params: [TypeRef] = [];
         mut args: [TypeRef] = [];
-        for (mut g: i64 = 0; g < tdecl.generic_params.length && g < tr.type_args.length; g++) {
-            const gp_decl: DeclarationNode* = tdecl.generic_params[g];
-            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
-            if (gp == null) { continue; }
-            const arg: TypeRef = this.ctx.type_resolver.resolve(tr.type_args[g], &rc);
-            if (!arg.is_valid()) { continue; }
-            params.push(this.symbolic.symbolic_param_ref(gp, g as u64));
-            args.push(arg);
+        const positions: i64 = tdecl.generic_params.length + tdecl.assoc_types.length;
+        for (mut i: i64 = 0; i < positions; i++) {
+            args.push(if (i < tr.type_args.length) {
+                this.ctx.type_resolver.resolve(tr.type_args[i], &rc)
+            } else {
+                TypeRef::invalid()
+            });
         }
-        if (params.length > 0) {
-            const by_param: TypeSubstitution = TypeSubstitution::from_params(&params, &args);
-            out = by_param.apply(out, this.arena);
-        }
-        const trait_ty: TypeRef = this.ctx.decl_index.type_of_def(tr.definition());
-        for (mut a: i64 = 0; a < tdecl.assoc_types.length; a++) {
-            const decl: AssocTypeDeclNode* = tdecl.assoc_types[a];
-            if (decl == null) { continue; }
-            const idx: i64 = tdecl.generic_params.length + a;
-            if (idx < 0 || idx >= tr.type_args.length) { continue; }
-            const arg: TypeRef = this.ctx.type_resolver.resolve(tr.type_args[idx], &rc);
-            if (!arg.is_valid()) { continue; }
-            out = this.subst_assoc_slot(out, trait_ty, a, arg);
-        }
-        return out;
-    }
-
-    /// Replace every projection of the `slot`-th associated type of the trait
-    /// `trait_ty` inside `ty` with `repl`, rebuilding the enclosing type
-    /// structurally.  Mirrors `reduce_assoc_projections`, but keyed on the
-    /// projected associated type instead of on a concrete base.
-    ///
-    /// It deliberately does NOT cache onto the `AssocProjectionType`: the
-    /// projection is trait-relative (`This::Output` as written in the trait decl)
-    /// and interned once, so it is shared by every bound over that trait -
-    /// pinning one bound's answer would leak into all the others.
-    subst_assoc_slot(mut &this, ty: TypeRef, trait_ty: TypeRef, slot: i64, repl: TypeRef) -> TypeRef {
-        if (!ty.is_valid()) { return ty; }
-        const t: Type* = this.arena.lookup(ty);
-        if (t == null) { return ty; }
-        match (t.kind) {
-            TypeKind::AssocProjection => {
-                const proj: AssocProjectionType* = t.as_assoc_projection();
-                if (proj.slot == slot && proj.owning_trait.equals(trait_ty)) { return repl; }
-                const base: TypeRef = this.subst_assoc_slot(proj.base, trait_ty, slot, repl);
-                if (base.equals(proj.base)) { return ty; }
-                return this.arena.create_assoc_projection(base, proj.member, proj.owning_trait, proj.slot);
-            }
-            TypeKind::Pointer => {
-                const p: PointerType* = t.as_pointer();
-                const inner: TypeRef = this.subst_assoc_slot(p.pointee, trait_ty, slot, repl);
-                if (inner.equals(p.pointee)) { return ty; }
-                return this.arena.get_pointer_to(inner);
-            }
-            TypeKind::Reference => {
-                const r: ReferenceType* = t.as_reference();
-                const inner: TypeRef = this.subst_assoc_slot(r.referent, trait_ty, slot, repl);
-                if (inner.equals(r.referent)) { return ty; }
-                return this.arena.get_reference_to(inner, r.mutability);
-            }
-            TypeKind::Array => {
-                const a: ArrayType* = t.as_array();
-                const inner: TypeRef = this.subst_assoc_slot(a.element, trait_ty, slot, repl);
-                if (inner.equals(a.element)) { return ty; }
-                return this.arena.get_array_of(inner, a.size);
-            }
-            TypeKind::Optional => {
-                const o: OptionalType* = t.as_optional();
-                const inner: TypeRef = this.subst_assoc_slot(o.wrapped, trait_ty, slot, repl);
-                if (inner.equals(o.wrapped)) { return ty; }
-                return this.arena.get_optional_of(inner);
-            }
-            TypeKind::Function => {
-                const f: FunctionType* = t.as_function();
-                const new_ret: TypeRef = this.subst_assoc_slot(f.return_type, trait_ty, slot, repl);
-                mut changed: boolean = !new_ret.equals(f.return_type);
-                mut new_params: [TypeRef] = [];
-                for (mut i: i64 = 0; i < f.param_types.length; i++) {
-                    const np: TypeRef = this.subst_assoc_slot(f.param_types[i], trait_ty, slot, repl);
-                    new_params.push(np);
-                    if (!np.equals(f.param_types[i])) { changed = true; }
-                }
-                if (!changed) { return ty; }
-                return this.arena.get_function(new_ret, new_params, f.is_variadic);
-            }
-            TypeKind::Tuple => {
-                const tup: TupleType* = t.as_tuple();
-                mut changed_t: boolean = false;
-                mut new_elems: [TypeRef] = [];
-                for (mut i: i64 = 0; i < tup.elements.length; i++) {
-                    const ne: TypeRef = this.subst_assoc_slot(tup.elements[i], trait_ty, slot, repl);
-                    new_elems.push(ne);
-                    if (!ne.equals(tup.elements[i])) { changed_t = true; }
-                }
-                if (!changed_t) { return ty; }
-                return this.arena.get_tuple(new_elems);
-            }
-            TypeKind::InstantiatedType => {
-                const inst: InstantiatedType* = t.as_instantiated();
-                mut changed_i: boolean = false;
-                mut new_args: [TypeRef] = [];
-                for (mut i: i64 = 0; i < inst.type_args.length; i++) {
-                    const na: TypeRef = this.subst_assoc_slot(inst.type_args[i], trait_ty, slot, repl);
-                    new_args.push(na);
-                    if (!na.equals(inst.type_args[i])) { changed_i = true; }
-                }
-                if (!changed_i) { return ty; }
-                return this.arena.create_instantiation(inst.generic_base, new_args);
-            }
-            _ => { return ty; }
-        }
+        return this.ctx.type_resolver.substitute_trait_arguments(ret, tr.definition(), &args);
     }
 
     /// The projected member name of a projection type-annotation, or empty for

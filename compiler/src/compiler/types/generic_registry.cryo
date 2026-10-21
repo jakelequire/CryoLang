@@ -821,6 +821,24 @@ type struct GenericRegistry {
         }
     }
 
+    /// Whether the implementation `block` binds its trait at `args`, the
+    /// arguments an object type gives the trait: position by position, the
+    /// trait's parameters as the head writes them, then each associated
+    /// type as the head or the body binds it (`ImplBlock::trait_slot_annotation`).
+    /// An invalid argument, a position the object leaves unbound, matches
+    /// any binding.
+    object_arguments_unify(&this, block: ImplBlock*, args: &[TypeRef], intern: InternTable*) -> boolean {
+        if (block == null) { return false; }
+        const decl: TraitDecl* = this.get_trait_decl(block.trait_def);
+        if (decl == null) { return false; }
+        for (mut i: i64 = 0; i < args.length; i++) {
+            if (!args[i].is_valid()) { continue; }
+            const ann: TypeAnnotation* = block.trait_slot_annotation(decl, i);
+            if (ann == null || !this.annotation_unifies(ann, args[i], intern)) { return false; }
+        }
+        return true;
+    }
+
     /// One written argument of a head against one argument of the subject.
     /// A name stamped as a parameter of the head binds to anything; one
     /// stamped as a declaration must name the definition the subject's
@@ -1232,7 +1250,10 @@ type struct GenericRegistry {
     /// object's table, or "" when it can: its signature must name the
     /// concrete type as its receiver alone - a `&this` or `mut &this`
     /// receiver, no type parameters of its own, and `This` in no other
-    /// parameter and not in the return.  The table's slot for a method with
+    /// parameter and not in the return, except as the base of an
+    /// associated-type projection (`This::Item`), which the object's type
+    /// arguments bind (`TypeResolver::object_method_type`; a call whose
+    /// object leaves one unbound is refused there).  The table's slot for a method with
     /// a reason is empty, and a call of it through an object is refused
     /// with the reason, so the two cannot disagree.
     method_object_unavailable(&this, method: DeclarationNode*) -> string {
@@ -1252,11 +1273,11 @@ type struct GenericRegistry {
         }
         for (mut i: i64 = 1; i < func.parameters.length; i++) {
             const p: VarDecl* = DeclarationNode::var_of(func.parameters[i]);
-            if (p == null || this.arena.mentions_this(p.resolved_type)) {
+            if (p == null || this.arena.mentions_this_outside_projection(p.resolved_type)) {
                 return "a parameter's type names `This`, the implementing type, which is not known where the object is used";
             }
         }
-        if (this.arena.mentions_this(func.resolved_return_type)) {
+        if (this.arena.mentions_this_outside_projection(func.resolved_return_type)) {
             return "its return type names `This`, the implementing type, which is not known where the object is used";
         }
         return "";

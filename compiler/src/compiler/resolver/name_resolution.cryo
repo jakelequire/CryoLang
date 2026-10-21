@@ -2239,7 +2239,11 @@ type struct NameResolver {
         mut generic: boolean = false;
         const named: NamedAnnotation* = NameResolver::spelled_name(o.trait_annotation, &generic);
         if (named != null) {
-            if (this.trait_named(named).is_valid()) { return; }
+            const def: DefId = this.trait_named(named);
+            if (def.is_valid()) {
+                this.refuse_object_argument_count(o, def);
+                return;
+            }
             if (TypeAnnotation::refused(o.trait_annotation)) { return; }
         }
         o.refused = true;
@@ -2247,6 +2251,41 @@ type struct NameResolver {
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0316_VIRTUAL_MISUSE,
             fmt::format("`%s` is not a trait, so `%s` is not a trait object", written, o.form.spell(written)));
         d = d.at_with_label(o.span, "not a trait");
+        this.ctx.emit_diagnostic(d);
+    }
+
+    /// E0307 at an object type that writes a number of type arguments other
+    /// than its trait's parameters and associated types together: the
+    /// object binds every one of them, the parameters first and then the
+    /// associated types, each in the order the trait declares it
+    /// (`virtual mut &Iterator<i32>` binds `Item`).
+    refuse_object_argument_count(&this, o: ObjectAnnotation*, trait_def: DefId) -> void {
+        const decl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(trait_def);
+        const written: i64 = match (*o.trait_annotation) {
+            TypeAnnotation::Generic(g) => { g.args.length }
+            _                          => { 0 }
+        };
+        const expected: i64 = decl.generic_params.length + decl.assoc_types.length;
+        if (written == expected) { return; }
+        o.refused = true;
+        const intern: InternTable* = this.resolver.intern_table;
+        mut names: string = "";
+        for (mut i: i64 = 0; i < decl.generic_params.length; i++) {
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(decl.generic_params[i]);
+            names = names + (if (names.length() > 0) { ", " } else { "" }) + "`" + intern.resolve(gp.name) + "`";
+        }
+        for (mut i: i64 = 0; i < decl.assoc_types.length; i++) {
+            names = names + (if (names.length() > 0) { ", " } else { "" }) + "`" + intern.resolve(decl.assoc_types[i].name) + "`";
+        }
+        const shown: string = intern.resolve(decl.name);
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
+            fmt::format("`%s` takes %lld type argument%s in an object type, and %lld %s written",
+                shown, expected, if (expected == 1) { "" } else { "s" }, written,
+                if (written == 1) { "is" } else { "are" }));
+        d = d.at_with_label(o.span, "the wrong number of type arguments");
+        if (expected > 0) {
+            d = d.with_note(fmt::format("an object type writes the trait's type parameters, then its associated types, in the order they are declared: %s", names));
+        }
         this.ctx.emit_diagnostic(d);
     }
 

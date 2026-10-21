@@ -682,6 +682,143 @@ public:
         return ref;
     }
 
+    /// Replace every projection of the `slot`-th associated type of the trait
+    /// `trait_ty` inside `ty` with `repl`, rebuilding the enclosing type
+    /// structurally.  Keyed on the projected associated type, whatever the
+    /// projection's base.
+    ///
+    /// It deliberately does NOT cache onto the `AssocProjectionType`: the
+    /// projection is trait-relative (`This::Output` as written in the trait declaration)
+    /// and interned once, so it is shared by every bound over that trait -
+    /// pinning one bound's answer would leak into all the others.
+    substitute_assoc_slot(mut &this, ty: TypeRef, trait_ty: TypeRef, slot: i64, repl: TypeRef) -> TypeRef {
+        if (!ty.is_valid()) { return ty; }
+        const t: Type* = this.lookup(ty);
+        if (t == null) { return ty; }
+        match (t.kind) {
+            TypeKind::AssocProjection => {
+                const proj: AssocProjectionType* = t.as_assoc_projection();
+                if (proj.slot == slot && proj.owning_trait.equals(trait_ty)) { return repl; }
+                const base: TypeRef = this.substitute_assoc_slot(proj.base, trait_ty, slot, repl);
+                if (base.equals(proj.base)) { return ty; }
+                return this.create_assoc_projection(base, proj.member, proj.owning_trait, proj.slot);
+            }
+            TypeKind::Pointer => {
+                const p: PointerType* = t.as_pointer();
+                const inner: TypeRef = this.substitute_assoc_slot(p.pointee, trait_ty, slot, repl);
+                if (inner.equals(p.pointee)) { return ty; }
+                return this.get_pointer_to(inner);
+            }
+            TypeKind::Reference => {
+                const r: ReferenceType* = t.as_reference();
+                const inner: TypeRef = this.substitute_assoc_slot(r.referent, trait_ty, slot, repl);
+                if (inner.equals(r.referent)) { return ty; }
+                return this.get_reference_to(inner, r.mutability);
+            }
+            TypeKind::Array => {
+                const a: ArrayType* = t.as_array();
+                const inner: TypeRef = this.substitute_assoc_slot(a.element, trait_ty, slot, repl);
+                if (inner.equals(a.element)) { return ty; }
+                return this.get_array_of(inner, a.size);
+            }
+            TypeKind::Optional => {
+                const o: OptionalType* = t.as_optional();
+                const inner: TypeRef = this.substitute_assoc_slot(o.wrapped, trait_ty, slot, repl);
+                if (inner.equals(o.wrapped)) { return ty; }
+                return this.get_optional_of(inner);
+            }
+            TypeKind::Function => {
+                const f: FunctionType* = t.as_function();
+                const new_ret: TypeRef = this.substitute_assoc_slot(f.return_type, trait_ty, slot, repl);
+                mut changed: boolean = !new_ret.equals(f.return_type);
+                mut new_params: [TypeRef] = [];
+                for (mut i: i64 = 0; i < f.param_types.length; i++) {
+                    const np: TypeRef = this.substitute_assoc_slot(f.param_types[i], trait_ty, slot, repl);
+                    new_params.push(np);
+                    if (!np.equals(f.param_types[i])) { changed = true; }
+                }
+                if (!changed) { return ty; }
+                return this.get_function(new_ret, new_params, f.is_variadic);
+            }
+            TypeKind::Tuple => {
+                const tup: TupleType* = t.as_tuple();
+                mut changed_t: boolean = false;
+                mut new_elems: [TypeRef] = [];
+                for (mut i: i64 = 0; i < tup.elements.length; i++) {
+                    const ne: TypeRef = this.substitute_assoc_slot(tup.elements[i], trait_ty, slot, repl);
+                    new_elems.push(ne);
+                    if (!ne.equals(tup.elements[i])) { changed_t = true; }
+                }
+                if (!changed_t) { return ty; }
+                return this.get_tuple(new_elems);
+            }
+            TypeKind::InstantiatedType => {
+                const inst: InstantiatedType* = t.as_instantiated();
+                mut changed_i: boolean = false;
+                mut new_args: [TypeRef] = [];
+                for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+                    const na: TypeRef = this.substitute_assoc_slot(inst.type_args[i], trait_ty, slot, repl);
+                    new_args.push(na);
+                    if (!na.equals(inst.type_args[i])) { changed_i = true; }
+                }
+                if (!changed_i) { return ty; }
+                return this.create_instantiation(inst.generic_base, new_args);
+            }
+            _ => { return ty; }
+        }
+    }
+
+    /// Whether `ty` names the `This` placeholder anywhere but as the base of
+    /// an associated-type projection (`This::Item`), which a trait object's
+    /// type arguments bind.
+    mentions_this_outside_projection(&this, ty: TypeRef) -> boolean {
+        if (!this.this_param.is_valid() || !ty.is_valid()) { return false; }
+        const t: Type* = this.lookup(ty);
+        if (t == null) { return false; }
+        match (t.kind) {
+            TypeKind::GenericParam     => { return ty.equals(this.this_param); }
+            TypeKind::AssocProjection  => {
+                const base: TypeRef = t.as_assoc_projection().base;
+                if (base.equals(this.this_param)) { return false; }
+                return this.mentions_this_outside_projection(base);
+            }
+            TypeKind::Pointer   => { return this.mentions_this_outside_projection(t.as_pointer().pointee); }
+            TypeKind::Reference => { return this.mentions_this_outside_projection(t.as_reference().referent); }
+            TypeKind::Array     => { return this.mentions_this_outside_projection(t.as_array().element); }
+            TypeKind::Optional  => { return this.mentions_this_outside_projection(t.as_optional().wrapped); }
+            TypeKind::Tuple => {
+                const tup: TupleType* = t.as_tuple();
+                for (mut i: i64 = 0; i < tup.elements.length; i++) {
+                    if (this.mentions_this_outside_projection(tup.elements[i])) { return true; }
+                }
+                return false;
+            }
+            TypeKind::Function => {
+                const func: FunctionType* = t.as_function();
+                if (this.mentions_this_outside_projection(func.return_type)) { return true; }
+                for (mut i: i64 = 0; i < func.param_types.length; i++) {
+                    if (this.mentions_this_outside_projection(func.param_types[i])) { return true; }
+                }
+                return false;
+            }
+            TypeKind::InstantiatedType => {
+                const inst: InstantiatedType* = t.as_instantiated();
+                for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+                    if (this.mentions_this_outside_projection(inst.type_args[i])) { return true; }
+                }
+                return false;
+            }
+            TypeKind::Object => {
+                const obj: ObjectType* = t.as_object();
+                for (mut i: i64 = 0; i < obj.args.length; i++) {
+                    if (this.mentions_this_outside_projection(obj.args[i])) { return true; }
+                }
+                return false;
+            }
+            _ => { return false; }
+        }
+    }
+
     /// Enter/leave walk-scoped symbolic mode (see `symbolic_no_demand_active`).
     set_symbolic_no_demand(mut &this, on: boolean) -> void {
         this.symbolic_no_demand_active = on;

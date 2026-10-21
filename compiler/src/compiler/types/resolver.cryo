@@ -39,7 +39,7 @@ import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, Res, ResBase, ResSlot };
 import compiler::types::compound;
 import compiler::types::compound::{
-    ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
+    ArrayType, FunctionType, ObjectType, OptionalType, PointerType, ReferenceType, TupleType
 };
 import compiler::types::generic::{ AssocProjectionType, InstantiatedType };
 import compiler::types::type_base;
@@ -320,6 +320,98 @@ type struct TypeResolver {
             _ => { }
         }
         return this.arena.get_object(trait_def, trait_type, args, o.form);
+    }
+
+    /// `ty`, read off the declaration of the trait `trait_def`, with the
+    /// trait's arguments `args` put in: the trait's own parameters are the
+    /// leading positions, its associated types the trailing ones in
+    /// declaration order, as a bound and an object type write them.  An
+    /// invalid argument leaves its parameter or projection as it is.
+    substitute_trait_arguments(&this, ty: TypeRef, trait_def: DefId, args: &[TypeRef]) -> TypeRef {
+        const decl: TraitDecl* = this.generic_registry.get_trait_decl(trait_def);
+        if (decl == null) { return ty; }
+        mut out: TypeRef = ty;
+        mut params: [TypeRef] = [];
+        mut bound: [TypeRef] = [];
+        for (mut g: i64 = 0; g < decl.generic_params.length && g < args.length; g++) {
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(decl.generic_params[g]);
+            if (gp == null || !args[g].is_valid()) { continue; }
+            params.push(this.arena.create_generic_param(gp.sym_id, gp.name, g as u64));
+            bound.push(args[g]);
+        }
+        if (params.length > 0) {
+            const by_param: TypeSubstitution = TypeSubstitution::from_params(&params, &bound);
+            out = by_param.apply(out, this.arena);
+        }
+        const trait_ty: TypeRef = this.decl_index.type_of_def(trait_def);
+        for (mut a: i64 = 0; a < decl.assoc_types.length; a++) {
+            if (decl.assoc_types[a] == null) { continue; }
+            const at: i64 = decl.generic_params.length + a;
+            if (at >= args.length || !args[at].is_valid()) { continue; }
+            out = this.arena.substitute_assoc_slot(out, trait_ty, a, args[at]);
+        }
+        return out;
+    }
+
+    /// The arguments an object of `object`'s type gives the trait
+    /// `declaring`, one per position of that trait's parameters and then
+    /// its associated types: the object's own, written on it, when
+    /// `declaring` is the object's trait; for a supertrait, what the
+    /// subtrait writes on it with the subtrait's own arguments put in,
+    /// along the first path the table's layout reaches it by
+    /// (`GenericRegistry::object_table_traits`).  A position nothing binds,
+    /// such as an associated type of a supertrait written without
+    /// arguments, is invalid.  Empty when no path reaches `declaring`.
+    object_trait_arguments(&this, object: ObjectType*, declaring: DefId) -> [TypeRef] {
+        mut open: [DefId] = [];
+        mut out: [TypeRef] = [];
+        this.trait_arguments_along(object.trait_def, &object.args, declaring, &open, &out);
+        return out;
+    }
+
+    trait_arguments_along(&this, trait_def: DefId, args: &[TypeRef], declaring: DefId,
+                          open: mut &[DefId], out: mut &[TypeRef]) -> boolean {
+        const decl: TraitDecl* = this.generic_registry.get_trait_decl(trait_def);
+        if (decl == null) { return false; }
+        if (trait_def.equals(declaring)) {
+            const positions: i64 = decl.generic_params.length + decl.assoc_types.length;
+            for (mut i: i64 = 0; i < positions; i++) {
+                out.push(if (i < args.length) { args[i] } else { TypeRef::invalid() });
+            }
+            return true;
+        }
+        for (mut j: i64 = 0; j < open.length; j++) {
+            if (open[j].equals(trait_def)) { return false; }
+        }
+        open.push(trait_def);
+        mut rc: ResolutionContext = ResolutionContext::new("");
+        for (mut g: i64 = 0; g < decl.generic_params.length && g < args.length; g++) {
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(decl.generic_params[g]);
+            if (gp != null && args[g].is_valid()) { rc.add_binding(gp.sym_id, gp.name, args[g]); }
+        }
+        for (mut a: i64 = 0; a < decl.assoc_types.length; a++) {
+            const at: i64 = decl.generic_params.length + a;
+            if (at < args.length && args[at].is_valid()) { rc.add_assoc_binding(trait_def, a, args[at]); }
+        }
+        for (mut i: i64 = 0; i < decl.base_traits.length; i++) {
+            const base: TraitRef* = &decl.base_traits[i];
+            mut base_args: [TypeRef] = [];
+            for (mut k: i64 = 0; k < base.type_args.length; k++) {
+                base_args.push(this.resolve(base.type_args[k], &rc));
+            }
+            if (this.trait_arguments_along(base.definition(), &base_args, declaring, open, out)) { return true; }
+        }
+        return false;
+    }
+
+    /// The type `ty` of a method `declaring` declares, as a call through an
+    /// object of `object`'s type sees it: the trait's arguments the object
+    /// gives (`object_trait_arguments`) put in.  Sema types the call by it
+    /// and code generation classifies the call's signature by it, so the
+    /// two agree.
+    object_method_type(&this, object: ObjectType*, declaring: DefId, ty: TypeRef) -> TypeRef {
+        const args: [TypeRef] = this.object_trait_arguments(object, declaring);
+        return this.substitute_trait_arguments(ty, declaring, &args);
     }
 
     /// Resolve a TypeAnnotation to a TypeRef.

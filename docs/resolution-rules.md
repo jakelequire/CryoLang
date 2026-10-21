@@ -230,6 +230,24 @@ yet is recorded with the change that builds it, not here.
      `__cryo.release.<table symbol>`,** outside the mangling grammar, until
      backtrace symbolization lands.  (Jake)
 
+486. **E0315's supertrait form keeps its wording,** "`Square` does not
+     implement `Named`, which `Shape` requires, so `&Square` cannot become
+     `virtual &Shape`".  (Jake)
+
+487. **The interim E0315 for an object whose trait's supertrait takes type
+     arguments stays until trait arguments are built,** and is removed in
+     the commit that builds them.  (Jake)
+
+488. **E0307's count of written type arguments agrees in number,** "1 type
+     argument is written", at every site that reports it.  (Jake)
+
+489. **Type arguments written on a call of an ordinary method that takes
+     none are refused with E0307,** as on a call through an object.  (Jake)
+
+490. **Implementing a subtrait without implementing each of its
+     supertraits is refused where the `implement` block is written,** in
+     words that agree with E0315's supertrait form.  (Jake)
+
 462. **A path through a bounded type parameter naming a member no bound
      declares (`T::missing()` in a generic function that is instantiated)
      is refused with a diagnostic where it is written,** not left for

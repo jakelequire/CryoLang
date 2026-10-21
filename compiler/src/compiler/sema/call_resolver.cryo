@@ -4976,10 +4976,12 @@ type struct CallResolver {
     /// bound gives its subject; the call is stamped with the declaring
     /// trait and the method's position there, which locate the word code
     /// generation loads from the object's table, so nothing later matches
-    /// a slot by name.  The arguments are checked against the trait
-    /// method's parameters past its receiver.  A method no such trait
-    /// declares is E0358, one unavailable on an object E0314 with the
-    /// reason.
+    /// a slot by name.  The method's parameters past its receiver and its
+    /// return are read with the trait's arguments the object gives put in
+    /// (`TypeResolver::object_method_type`), and the arguments are checked
+    /// against those parameters.  A method no such trait declares is E0358,
+    /// one unavailable on an object E0314 with the reason, as is one whose
+    /// signature names an associated type the object leaves unbound.
     resolve_object_call(mut &this, visitor: SemaVisitor*, call_e: ExpressionNode*, call: CallExpr*,
                         member: MemberAccessExpr*, receiver_t: Type*) -> TypeRef {
         const object: ObjectType* = receiver_t.as_object();
@@ -5016,20 +5018,40 @@ type struct CallResolver {
                 0, member.generic_args.length, at);
             return TypeRef::invalid();
         }
-        member.set_resolved_trait_item(declaring, slot);
         const func: FunctionDecl* = DeclarationNode::fn_of(method);
+        const resolver: TypeResolver* = this.ctx.type_resolver;
         mut params: [TypeRef] = [];
         for (mut i: i64 = 1; i < func.parameters.length; i++) {
-            params.push(DeclarationNode::var_of(func.parameters[i]).resolved_type);
+            params.push(resolver.object_method_type(object, declaring,
+                DeclarationNode::var_of(func.parameters[i]).resolved_type));
         }
+        const returned: TypeRef = resolver.object_method_type(object, declaring, func.resolved_return_type);
+        // A projection of `This` left after the object's arguments are put
+        // in names an associated type the object does not bind.
+        mut unbound: boolean = this.arena.mentions_this(returned);
+        for (mut i: i64 = 0; i < params.length; i++) {
+            if (this.arena.mentions_this(params[i])) { unbound = true; }
+        }
+        if (unbound) {
+            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0314_OBJECT_METHOD_UNAVAILABLE,
+                fmt::format("`%s` cannot be called through `%s`",
+                    this.intern.resolve(member.member), this.arena.format_display(receiver_t)));
+            d = d.at(at);
+            d = d.with_note(fmt::format("its signature names an associated type of `%s` that `%s` does not bind",
+                this.intern.resolve(this.ctx.defs.leaf_of(declaring).spelling()),
+                this.arena.format_display(receiver_t)));
+            this.ctx.emit_diagnostic(d);
+            return TypeRef::invalid();
+        }
+        member.set_resolved_trait_item(declaring, slot);
         if (call.arguments.length != params.length) {
             this.diag.emit_method_arity_error(call_e.span, member.member, "method", params.length,
                 call.arguments.length, false);
             return TypeRef::invalid();
         }
         this.check_args_against_params(visitor, &call.arguments, params.as_slice());
-        call.callee.set_resolved_type(func.resolved_return_type);
-        return func.resolved_return_type;
+        call.callee.set_resolved_type(returned);
+        return returned;
     }
 
     /// The type of a method call.  Which method it names was answered by

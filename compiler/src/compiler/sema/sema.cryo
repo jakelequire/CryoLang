@@ -2883,7 +2883,11 @@ type struct SemaVisitor {
         const shown_to: string = this.arena.format_display(target);
         const shown_value: string = this.arena.format_display(value_t);
         const trait_t: Type* = this.arena.lookup(object.trait_type);
-        const shown_trait: string = if (trait_t != null) { this.arena.format_display(trait_t) } else { shown_to };
+        const shown_trait: string = if (trait_t != null) {
+            this.shown_with_arguments(this.arena.format_display(trait_t), &object.args)
+        } else {
+            shown_to
+        };
         if (this.arena.contains_generic_param(value)) {
             this.ctx.emit_error_at(ErrorCode::E0315_OBJECT_CONVERSION,
                 fmt::format("`%s` cannot become `%s`: `%s` is a type parameter, whose implementation of `%s` is not known here",
@@ -2921,8 +2925,9 @@ type struct SemaVisitor {
     /// The implementation for `value` of each trait the table of an object
     /// of `object`'s trait holds methods of, in the table's order, `own`
     /// in the object's trait's place.  A supertrait's methods are in the
-    /// table too, so the type must implement each supertrait; false, with
-    /// E0315 reported, when it does not.
+    /// table too, so the type must implement each supertrait, at the
+    /// arguments the object gives it (`TypeResolver::object_trait_arguments`);
+    /// false, with E0315 reported, when it does not.
     object_table_implementations(mut &this, expr: ExpressionNode*, object: ObjectType*, value: TypeRef,
                                  own: ImplBlock*, blocks: mut &[ImplBlock*], shown_from: string,
                                  shown_to: string, shown_value: string, shown_trait: string) -> boolean {
@@ -2931,22 +2936,15 @@ type struct SemaVisitor {
         const checker: TraitChecker = this.trait_checker();
         for (mut k: i64 = 0; k < traits.length; k++) {
             if (traits[k].equals(object.trait_def)) { blocks.push(own); continue; }
-            const shown_super: string = this.intern.resolve(this.ctx.defs.path_of(traits[k]).spelling());
-            const decl: TraitDecl* = registry.get_trait_decl(traits[k]);
-            if (decl.generic_params.length > 0 || decl.assoc_types.length > 0) {
-                mut d: Diagnostic = Diagnostic::error(ErrorCode::E0315_OBJECT_CONVERSION,
-                    fmt::format("`%s` cannot become `%s`: `%s` requires `%s`, which takes type arguments",
-                        shown_from, shown_to, shown_trait, shown_super));
-                d = d.at(expr.span);
-                d = d.with_note("an object of a trait whose supertrait takes type arguments does not convert yet");
-                this.ctx.emit_diagnostic(d);
-                return false;
-            }
+            const args: [TypeRef] = this.ctx.type_resolver.object_trait_arguments(object, traits[k]);
+            const shown_super: string = this.shown_with_arguments(
+                this.intern.resolve(this.ctx.defs.path_of(traits[k]).spelling()), &args);
             const heads: [DeclarationNode*] = registry.heads_for(traits[k], value, this.intern);
             mut found: ImplBlock* = null;
             for (mut i: i64 = 0; i < heads.length; i++) {
                 const candidate: ImplBlock* = DeclarationNode::impl_of(heads[i]);
-                if (candidate != null && checker.impl_applies(candidate, value, 0)) { found = candidate; break; }
+                if (candidate == null || !registry.object_arguments_unify(candidate, &args, this.intern)) { continue; }
+                if (checker.impl_applies(candidate, value, 0)) { found = candidate; break; }
             }
             if (found == null) {
                 this.ctx.emit_error_at(ErrorCode::E0315_OBJECT_CONVERSION,
@@ -2988,9 +2986,23 @@ type struct SemaVisitor {
         return true;
     }
 
+    /// A trait's name `shown` with the arguments an object gives it,
+    /// `Conv<i64>`; the name alone when it takes none, or when any of them
+    /// is left unbound.
+    shown_with_arguments(&this, shown: string, args: &[TypeRef]) -> string {
+        if (args.length == 0) { return shown; }
+        mut written: string = "";
+        for (mut i: i64 = 0; i < args.length; i++) {
+            const arg_t: Type* = this.arena.lookup(args[i]);
+            if (arg_t == null) { return shown; }
+            written = written + (if (i > 0) { ", " } else { "" }) + this.arena.format_display(arg_t);
+        }
+        return shown + "<" + written + ">";
+    }
+
     /// The implementation of `object`'s trait for `value` whose where-clause
-    /// holds, among the heads written with the object's trait arguments
-    /// when it writes any; null when there is none.
+    /// holds, among those binding the trait at the object's arguments
+    /// (`GenericRegistry::object_arguments_unify`); null when there is none.
     object_implementation(&this, object: ObjectType*, value: TypeRef) -> DeclarationNode* {
         const registry: GenericRegistry* = this.ctx.generic_registry;
         if (registry == null) { return null; }
@@ -2999,7 +3011,7 @@ type struct SemaVisitor {
         for (mut i: i64 = 0; i < heads.length; i++) {
             const block: ImplBlock* = DeclarationNode::impl_of(heads[i]);
             if (block == null) { continue; }
-            if (object.args.length > 0 && !registry.trait_args_unify(block, &object.args, this.intern)) { continue; }
+            if (!registry.object_arguments_unify(block, &object.args, this.intern)) { continue; }
             if (checker.impl_applies(block, value, 0)) { return heads[i]; }
         }
         return null;
