@@ -5007,6 +5007,15 @@ type struct CallResolver {
             this.ctx.emit_diagnostic(d);
             return TypeRef::invalid();
         }
+        // A method with type parameters of its own is unavailable above, so
+        // any type argument written on the call is one too many.
+        if (member.generic_args.length > 0) {
+            this.report_excess_type_arguments(fmt::format("%s::%s",
+                    this.intern.resolve(this.ctx.defs.leaf_of(declaring).spelling()),
+                    this.intern.resolve(member.member)),
+                0, member.generic_args.length, at);
+            return TypeRef::invalid();
+        }
         member.set_resolved_trait_item(declaring, slot);
         const func: FunctionDecl* = DeclarationNode::fn_of(method);
         mut params: [TypeRef] = [];
@@ -6311,6 +6320,18 @@ type struct CallResolver {
         this.ctx.emit_diagnostic(d);
     }
 
+    /// E0307 for more type arguments written on `shown` than its
+    /// `parameters` type parameters.
+    report_excess_type_arguments(mut &this, shown: string, parameters: i64, written: i64,
+                                 span: SourceSpan) -> void {
+        const plural: string = if (parameters == 1) { "" } else { "s" };
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
+            fmt::format("`%s` has %lld type parameter%s, and %lld type arguments are written", shown,
+                parameters, plural, written));
+        d = d.at_with_label(span, "too many type arguments");
+        this.ctx.emit_diagnostic(d);
+    }
+
     /// A method with type parameters of its own taken as a value,
     /// `Box::wrap::<i32>`: one instance of it, whose type arguments the
     /// turbofish on the member writes, one per parameter, or the expected
@@ -6506,12 +6527,7 @@ type struct CallResolver {
             return TypeRef::invalid();
         }
         if (scope.generic_args.length > bindings.length) {
-            const plural: string = if (bindings.length == 1) { "" } else { "s" };
-            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
-                fmt::format("`%s` has %lld type parameter%s, and %lld type arguments are written", shown,
-                    bindings.length, plural, scope.generic_args.length));
-            d = d.at_with_label(scope_e.span, "too many type arguments");
-            this.ctx.emit_diagnostic(d);
+            this.report_excess_type_arguments(shown, bindings.length, scope.generic_args.length, scope_e.span);
             return TypeRef::invalid();
         }
         if (!this.check_call_where_bounds(scope_e.span, DeclarationNode::method_of(node).func, &syms, &bindings)) { return TypeRef::invalid(); }
