@@ -138,8 +138,7 @@ The path names neither the module that asked for it nor the value behind the
 object, so one symbol serves every call at that object type, and two traits or
 two object types give two symbols.
 
-The tags `ct` and `dt` are not emitted and stay reserved: they named class
-constructors and destructors.
+The tags `ct` and `dt` are reserved and not emitted.
 
 Plain functions, methods, global variables, and named-type symbols carry no kind tag.
 A closure carries none either: it is a synthesized type with a `__call__` method

@@ -132,6 +132,35 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-21
+
+501. **The class-removal plan is deleted now,** its slices all built and its
+     bridge table empty.  (Jake)
+
+502. **`docs/cryo.md` keeps no section on classes:** the section that
+     tabled each refused form is deleted, the sections after it are
+     renumbered, and every reference to them follows.  User-facing material
+     (the reference, the grammar, the guides, the editor grammar, the
+     release notes) reads as if Cryo never had classes; the E0117
+     refusal, the reserved keywords, the C++ binding generator's handling
+     of C++ classes, these rulings and the roadmap's history stay.  (Jake)
+
+503. **The roadmap marks class removal and borrowed trait objects built,**
+     and lists what is left for trait objects: owning boxes, upcasting,
+     and generic implementations as objects.  (Jake)
+
+504. **Rulings 249, 253, 258, 291, 294, 295 and 303 are superseded by
+     ruling 465:** each governed a class feature that no longer exists.
+     (Jake)
+
+505. **The E0306 help for an object does not tell the user to implement
+     the trait for the object,** since no implementation can be written
+     for one: it says to use a type that implements the trait, or an
+     object of a trait whose methods a table can hold.  An object whose
+     trait does not reach the bound is told the same first half, and that
+     an object implements only its own trait and that trait's
+     supertraits; the wording was left to the implementer.  (Jake)
+
 ### 2026-10-20
 
 465. **The removed class syntax is refused with E0117,** "`<form>` is not
@@ -958,7 +987,7 @@ yet is recorded with the change that builds it, not here.
      not a type", with the `virtual &Shape` note and the
      bounded-type-parameter help.  (Dispatch, delegated)
 
-303. **Ruling 294 stays as built:** no class with a base class may
+303. *Superseded by ruling 465.* **Ruling 294 stays as built:** no class with a base class may
      implement `Allocate`.  (Dispatch, delegated)
 
 304. **A bare trait used as a value type (`p: Shape`) is refused with E0313
@@ -1102,7 +1131,7 @@ yet is recorded with the change that builds it, not here.
      but a `boolean` converts to `boolean`, so a test on a float is
      written `x != 0.0`.  (Jake)
 
-249. **Allocation goes through a trait.**  `new T(...)` is sugar for an
+249. *Superseded by ruling 465.* **Allocation goes through a trait.**  `new T(...)` is sugar for an
      `Allocate` trait, as `a[i]` is for `Index` and `*p` for `Deref`.  A
      class that implements `Allocate` gets its memory from it, and its
      subclasses inherit it: the nearest ancestor's implementation wins.
@@ -1130,7 +1159,7 @@ yet is recorded with the change that builds it, not here.
      each refused, under an error code of their own.  A method the trait
      gives a default body is not missing.  (Jake)
 
-253. **Casting a class value to a pointer (`av as void*`) is refused;**
+253. *Superseded by ruling 465.* **Casting a class value to a pointer (`av as void*`) is refused;**
      the address is written `&av`.  (Jake)
 
 254. **A type alias reaches its type's static methods:** with `type PI =
@@ -1148,7 +1177,7 @@ yet is recorded with the change that builds it, not here.
 257. **A struct may implement `Allocate`;** with no inheritance, only that
      struct's own `new` goes through it.  (Jake)
 
-258. **Casting a class value up or down its hierarchy stays refused;**
+258. *Superseded by ruling 465.* **Casting a class value up or down its hierarchy stays refused;**
      casting a pointer along the hierarchy is allowed.  (Jake)
 
 259. **The ledger's status rows go with it,** the ones expecting zero
@@ -1261,7 +1290,7 @@ yet is recorded with the change that builds it, not here.
 290. **The class removal converts the AST straight to enums and `match`.**
      (Jake)
 
-291. **The known class defects are left alone, since classes are going:**
+291. *Superseded by ruling 465.* **The known class defects are left alone, since classes are going:**
      `override` is not checked, a missing vtable slot is not reported, and
      vtable slots are matched by name.  (Jake)
 
@@ -1275,12 +1304,12 @@ yet is recorded with the change that builds it, not here.
      return value is refused (E0458),** where it compiled and crashed.
      Supporting it is roadmap work.  (Jake)
 
-294. **`Allocate` on a class whose base class gets its memory from another
+294. *Superseded by ruling 465.* **`Allocate` on a class whose base class gets its memory from another
      allocator is refused,** so `delete` through a base pointer never
      releases through an allocator that did not hand out the memory.
      (Jake)
 
-295. **`delete` through a base-class pointer runs the static type's `Drop`,
+295. *Superseded by ruling 465.* **`delete` through a base-class pointer runs the static type's `Drop`,
      not the derived class's.**  The spec says so; it is not fixed, since
      classes are going.  (Jake)
 
@@ -2386,7 +2415,7 @@ check is being deleted and the seals are what hold.  (Jake)
     ```
 
 64. **Brace exports restrict**: `export A::{ a };` exposes `a` and nothing
-    else of `A`, as `docs/cryo.md` section 14.5 says. The compiler is
+    else of `A`, as `docs/cryo.md` section 13.5 says. The compiler is
     fixed to match, with the breakage measured first.
 
 65. **A local declaration and an import of the same name in the same

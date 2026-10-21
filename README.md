@@ -522,10 +522,10 @@ for the full 1.0 release notes.
 - Lambdas and capturing closures (let-bound, inline, multi-capture, nested, closure-as-fn-arg).
 - Automatic drop synthesis at scope exit; explicit `delete` for heap pointees.
 - Allocator-generic standard library: `Array`, `String`, `HashMap`, `HashSet`, `Box`, `Arena`, `Pool`, `Rc`, `Arc`.
-- Synchronization primitives: a generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`, dispatched at compile time via `static match`), `MemoryOrder`, `fence`, `Mutex<T>`, `RwLock<T>`, `CondVar`, `Once`, `Barrier`. `Send` / `Sync` are computed structurally (never declared) with call-site enforcement; raw pointers are unconditionally `Send`, so treat a `Send` bound as a checked-what-it-can-see signal rather than a safety proof - see [`docs/cryo.md` section 16.4](./docs/cryo.md#164-the-send-and-sync-traits).
+- Synchronization primitives: a generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`, dispatched at compile time via `static match`), `MemoryOrder`, `fence`, `Mutex<T>`, `RwLock<T>`, `CondVar`, `Once`, `Barrier`. `Send` / `Sync` are computed structurally (never declared) with call-site enforcement; raw pointers are unconditionally `Send`, so treat a `Send` bound as a checked-what-it-can-see signal rather than a safety proof - see [`docs/cryo.md` section 15.4](./docs/cryo.md#154-the-send-and-sync-traits).
 - `ThreadLocal<T>` via POSIX TLS; OS threads via `thread::spawn` / `try_spawn` / `JoinHandle<T>` / `spawn_with_attr`, a named `thread::Builder` (stack size + OS thread name), scoped threads (`thread::Scope`), and `sync::mpsc` channels.
 - I/O over `Read` / `Write` traits with buffered wrappers.
-- `async` / `await` as a first-class language feature: `async` functions, methods, and trait methods compiled into state machines, `await` anywhere an expression may appear, and `async function main`. Futures are ordinary movable structs - no hidden allocation, no pinning discipline - which the language buys by rejecting a reference held live across a suspend (`E0455`) and carrying owned values across it for you. See [`docs/cryo.md` section 19](./docs/cryo.md#19-asynchronous-programming).
+- `async` / `await` as a first-class language feature: `async` functions, methods, and trait methods compiled into state machines, `await` anywhere an expression may appear, and `async function main`. Futures are ordinary movable structs - no hidden allocation, no pinning discipline - which the language buys by rejecting a reference held live across a suspend (`E0455`) and carrying owned values across it for you. See [`docs/cryo.md` section 18](./docs/cryo.md#18-asynchronous-programming).
 - `std::future`: a worker-pool `Executor` with `spawn` / `JoinHandle`, a readiness reactor (epoll on Linux, `\Device\Afd` + IOCP on Windows), `Sleep` timers, a blocking thread pool for work no reactor can drive, and the `join` / `try_join` / `select` / `timeout` combinators. Cancelling a future is a plain drop.
 - Networking, async throughout: `TcpStream` / `TcpListener`, `UdpSocket`, and OpenSSL-backed `TlsStream`. HTTP/1.1 server (keep-alive, read timeouts), client, and router; HTTP/2 (HPACK + single-stream framing) and WebSocket (RFC 6455). JSON parser and serializer.
 - Filesystem: `File` / `OpenOptions`, whole-path `read` / `write` / `copy`, `remove_file`, `create_dir` / `create_dir_all`, `read_dir`, `rename`, `canonicalize`, and `metadata` / `symlink_metadata`.
@@ -541,7 +541,7 @@ for the full 1.0 release notes.
 - Dialable IPv6 (the `IpAddr::V6` representation and DNS resolution exist in 1.0; connecting over v6 does not yet).
 - macOS / Darwin targets. (x86_64 Linux and x86_64 Windows - native builds plus Linux->Windows cross via mingw-w64 - ship in 1.0.)
 
-A precise list of features the grammar reserves but the compiler does not yet lower lives in [`docs/cryo.md` section 22](./docs/cryo.md#22-reserved-syntax).
+A precise list of features the grammar reserves but the compiler does not yet lower lives in [`docs/cryo.md` section 21](./docs/cryo.md#21-reserved-syntax).
 
 ---
 

@@ -87,7 +87,7 @@ OUT = os.path.join(ROOT, "docs", "stdlib-api.txt")
 
 NAMESPACE_RE = re.compile(r"^\s*namespace\s+([A-Za-z_][\w:]*)\s*;")
 TYPE_RE = re.compile(
-    r"^\s*(?:(public|private)\s+)?type\s+(struct|enum|class|union)\s+"
+    r"^\s*(?:(public|private)\s+)?type\s+(struct|enum|union)\s+"
     r"([A-Za-z_]\w*)\s*(<[^{;]*>)?"
 )
 TRAIT_RE = re.compile(r"^\s*(?:(public|private)\s+)?trait\s+([A-Za-z_]\w*)\s*(<[^{;]*>)?")
@@ -96,7 +96,7 @@ IMPL_RE = re.compile(
 )
 # `implement<A> trait Eq for struct String<A>` -- the target carries the type
 # keyword, which is noise in an index keyed by type name.
-IMPL_TARGET_KW_RE = re.compile(r"^(?:struct|enum|class|union)\s+")
+IMPL_TARGET_KW_RE = re.compile(r"^(?:struct|enum|union)\s+")
 FUNC_RE = re.compile(
     r"^\s*(?:(public|private)\s+)?function\s+([A-Za-z_]\w*)\s*(<[^(]*>)?\s*\(([^)]*)\)"
     r"\s*(?:->\s*([^{;]+?))?\s*[{;]"

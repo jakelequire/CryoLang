@@ -164,12 +164,12 @@ Visibility         ::= "public" | "private"
 
 (* The leading `type` keyword is the canonical form
    (`type struct Foo { ... }`); the bare `struct Foo` form is also
-   accepted.  The class forms - `type class`, a base list `: Base`,
-   `virtual` / `override` members, `protected`, constructors
-   `Name(..) { }` and destructors `~Name() { }`, a base-constructor
-   initializer `: Base(..)` and the `class` tag on an implement head -
-   are not part of the grammar: the parser reads each only to refuse
-   it where it is written (E0117).                                    *)
+   accepted.  These forms are not part of the grammar: `type class`,
+   a list of types after a struct's name `: Base`, `virtual` /
+   `override` members, `protected`, a member `Name(..) { }` named by
+   its type, a member `~Name() { }`, an initializer `: Base(..)` and
+   the `class` tag on an implement head.  The parser reads each only
+   to refuse it where it is written (E0117).                          *)
 
 AggregateDecl      ::= "type"? "struct" Ident Generics?
                        ("where" WhereClause)?        (* bounds on the declaration's own
@@ -329,9 +329,9 @@ Primary            ::= Literal
                      | Match
                      | StaticMatch
                      | Lambda
-                     | "delete" Expr           (* frees a `new` allocation; see cryo.md section 15.2 *)
-                     | "await"  Expr           (* only inside an `async` body; see cryo.md section 19 *)
-                     | "yield"  Expr?          (* parsed; no generator semantics yet (cryo.md section 22) *)
+                     | "delete" Expr           (* frees a `new` allocation; see cryo.md section 14.2 *)
+                     | "await"  Expr           (* only inside an `async` body; see cryo.md section 18 *)
+                     | "yield"  Expr?          (* parsed; no generator semantics yet (cryo.md section 21) *)
                      | "(" Expr ")"
                      | ImplQualPath
 
@@ -443,7 +443,7 @@ Type               ::= Type "*"                            (* pointer *)
                      | "virtual" "mut"? "&" BaseType       (* trait object, borrowed; the
                                                               BaseType names a trait and
                                                               writes its arguments
-                                                              (cryo.md section 11.7) *)
+                                                              (cryo.md section 10.7) *)
                      | "virtual" BaseType "*"              (* trait object pointer; the `*`
                                                               belongs to the object, so
                                                               `virtual T**` points at one *)
@@ -503,9 +503,9 @@ Ident              ::= /* [a-zA-Z_][a-zA-Z0-9_]*                */
 (*                                                                  *)
 (*  These names are reserved by the lexer and may not be used as    *)
 (*  identifiers.  Some (e.g. `from`, `yield`, `auto`, `tuple`)      *)
-(*  are lexed but have no semantics yet - see section 22 of         *)
+(*  are lexed but have no semantics yet - see section 21 of         *)
 (*  `cryo.md` for the reserved-syntax table.  `async` and `await`   *)
-(*  are implemented (cryo.md section 19).                           *)
+(*  are implemented (cryo.md section 18).                           *)
 (*                                                                  *)
 (*  alignof    as         asm        async     auto      await     *)
 (*  boolean    break      char       class     const     continue  *)

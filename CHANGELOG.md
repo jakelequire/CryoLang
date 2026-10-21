@@ -22,7 +22,7 @@ is written entirely in Cryo, and the public surface is frozen under semver.
   required only when there is no initializer to infer from (or to widen the
   declared type). `typeof(expr)` in type position.
 - **Traits:** trait declarations with default methods; impls on primitives,
-  structs, classes, and enums; coherence checks (a trait may be implemented
+  structs, unions, and enums; coherence checks (a trait may be implemented
   at most once per type) enforced uniformly within a file and across
   modules, keyed on the import-resolved impl head so generic traits
   (`From<i8>` vs `From<i16>`), generic targets, and `where`-bounds are all
@@ -39,9 +39,7 @@ is written entirely in Cryo, and the public surface is frozen under semver.
   Declaration-site bounds on an associated type (`type Item: Copy;`) are
   enforced against each impl's concrete binding (`E0306`). Opaque `implement Iterator<T>`
   bindings now cross-check `<T>` against the iterator's actual `Item` (`E0200`
-  on a category-level mismatch). See [`docs/cryo.md` section 11.5](./docs/cryo.md#115-associated-types).
-- **Classes:** single-inheritance with virtual dispatch, destructors,
-  `protected`/`private` visibility, `override` and `virtual` modifiers.
+  on a category-level mismatch). See [`docs/cryo.md` section 10.5](./docs/cryo.md#105-associated-types).
 - **Enums:** algebraic enums with explicit discriminants and discriminant
   base type (`type enum X : u8 { ... }`), exhaustive match enforcement on
   enum subjects.
@@ -100,7 +98,7 @@ is written entirely in Cryo, and the public surface is frozen under semver.
   pointers and bind anywhere). Generic
   type-parameter inference from function-typed arguments
   (`opt.map(lambda)` infers `U`).
-- **Modules:** `_module.cryo` aggregators, `public`/`private`/`protected`
+- **Modules:** `_module.cryo` aggregators, `public`/`private`
   visibility, import cycle detection.
 - **`async` / `await`.** `async` functions, methods, and trait methods are
   compiled into state machines, and `await` may appear anywhere an expression
@@ -111,7 +109,7 @@ is written entirely in Cryo, and the public surface is frozen under semver.
   allocation and no pinning discipline, which the language buys by rejecting
   a reference held live across a suspend (`E0455`); owned values are carried
   across it for you. See
-  [`docs/cryo.md` section 19](./docs/cryo.md#19-asynchronous-programming).
+  [`docs/cryo.md` section 18](./docs/cryo.md#18-asynchronous-programming).
 
 ### Build system
 
@@ -303,7 +301,7 @@ nor `CRYO_STDLIB`.
 
 These are not bugs against 1.0 - the language deliberately ships
 without them and the grammar reserves the relevant syntax. See
-[`docs/cryo.md` section 22](./docs/cryo.md#22-reserved-syntax) for the
+[`docs/cryo.md` section 21](./docs/cryo.md#21-reserved-syntax) for the
 authoritative list.
 
 - Macros / user-defined `![attr]` directives.

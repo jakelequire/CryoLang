@@ -16,12 +16,13 @@ language server".  From there, in order, to the v1.0 freeze:
    the postfix forms are refused.  Built, on `type-syntax-impl`.
 2. **One dynamic array type.**  `[T]` becomes `Array<T>`, which also
    removes the crash of nested builtin arrays (below).
-3. **Borrowed trait objects** (`virtual &T`, rulings 285, 288, 289),
-   now that the class feature is deleted, with the table emission copied
-   from the deleted class vtable code in the history rather than revived
-   (ruling 415).  Owning boxes and upcasting come after v1.0;
-   generic implementations converted to an object are revisited before the
-   freeze (ruling 425).
+3. **Class removal and borrowed trait objects.**  Built, on
+   `class-removal`: the class feature is deleted, each of its forms refused
+   where it is written (E0117, ruling 465), and `virtual &T`,
+   `virtual mut &T` and `virtual T*` dispatch through a table (rulings 285,
+   288, 289, 415).  Left for trait objects: owning boxes, upcasting, and
+   generic implementations as objects, the last revisited before the
+   freeze (ruling 425); see "Trait objects" below.
 4. **Associated constants on concrete types** (`i32::MAX`,
    `Config::DEFAULT_PORT`), with the decision whether `max_value()` stays.
    Trait constants used as values come after v1.0; trait constants as
@@ -404,30 +405,35 @@ Peak memory was unchanged (1,530 MiB).  The steps, in order:
 ## Trait objects
 
 A pointer or reference to a trait, dispatched through a table of the
-implementation's methods.  Borrowed trait objects come before v1.0, after
-the class removal (ruling 415), their table emission copied from the
-deleted class vtable code (ruling 360, which brings forward ruling 286's
-"possibly after v1.0"); owning boxes, upcasting and generic
-implementations coerced to an object come after v1.0.
+implementation's methods.  **Borrowed trait objects are built** (ruling
+360 brought them forward from ruling 286's "possibly after v1.0"; ruling
+415 placed them after the class removal); `docs/cryo.md` section 10.7
+describes them.  Left: owning boxes, upcasting, and generic
+implementations as objects.
 
-- **Spelling:** `virtual &Shape` and `virtual Shape*`, a prefix as in
-  `mut &this`; there is no `dyn` (ruling 285).  Until then `&Shape` and
-  `Shape*` are refused where they are written (`E0313`; ruling 287), as
-  is a bare `p: Shape` (ruling 304).  The prefix composes inside an
-  array's brackets with no parentheses: `[virtual &Shape]`.
+- **Spelling:** `virtual &Shape`, `virtual mut &Shape` and
+  `virtual Shape*`, a prefix as in `mut &this`; there is no `dyn` (ruling
+  285).  `&Shape` and `Shape*` are refused where they are written
+  (`E0313`; ruling 287), as is a bare `p: Shape` (ruling 304).  The prefix
+  composes inside an array's brackets with no parentheses:
+  `[virtual &Shape]`.
 - **Object safety is per method** (ruling 288): a method that cannot go in
   the table - one with type parameters of its own, for instance - is unavailable on
   the object, and the rest of the trait still works.
 - **Borrowed pointers first** (ruling 289); an owning box, which must take
-  its drop, size and alignment from the table, comes later.
+  its drop, size and alignment from the table, is still to build.
 - The table's slots come from the trait's method numbering, the same one
   the trait-implementation check (E0312) relies on, never from method
   names.
 
-Open: whether a supertrait's methods are reachable from a subtrait object
-directly or through an upcast; and how a generic implementation coerced to
-an object becomes a monomorphization root, including in the incremental
-cache.
+A supertrait's methods are reachable from a subtrait object directly: the
+table holds them.  Still to build:
+
+- **Owning boxes**, above.
+- **Upcasting** a subtrait object to an object of one of its supertraits.
+- **Generic implementations as objects:** how a generic implementation
+  coerced to an object becomes a monomorphization root, including in the
+  incremental cache.
 
 ## The compiler pipeline: AST, HIR, MIR, LLVM
 
