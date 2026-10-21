@@ -18,9 +18,10 @@ namespace compiler::mono::call_specializer;
 
 import compiler::ast;
 import compiler::ast::{
-    ArgBinding, declaration, expression, MemberPin, node, pattern, statement, TraitBound,
+    ArgBinding, declaration, expression, MemberPin, NamedAnnotation, node, pattern, statement, TraitBound,
     TraitRef, TypeAnnotation
 };
+import compiler::diag::source_span::{ SourceSpan };
 import compiler::types::{
     generic, user_defined, compound, type_base, arena, type_ref, substitution, resolver, generic_registry, ownership, TypeKind, RefMutability
 };
@@ -43,7 +44,7 @@ import compiler::ast::walk::{ Walk };
 import std::fmt;
 import compiler::ast::declaration::{
     DeclarationNode, DeclKind, DestructureDecl, FunctionDecl, GenericParamDecl,
-    ImplBlock, MethodDecl, StructDecl, UnionDecl, VarDecl
+    ImplBlock, MethodDecl, StructDecl, TraitDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
     CalleePin,
@@ -63,7 +64,8 @@ import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::res::{ FamilyOwner, Res, ResBase, ResSlot };
 import compiler::decl_index::{ OverloadId };
 import compiler::resolver::symbol_str::{ SymbolStr };
-import compiler::resolver::res::{ DefId, DefKey };
+import compiler::resolver::res::{ DefId, DefKey, DefKind };
+import compiler::resolver::mangled_name::{ MangleContext };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::types::arena::{ TypeArena };
@@ -871,8 +873,19 @@ type struct MonoCallSpecializer {
         // A call through a trait object is dispatched through the object's
         // table where it runs, and never bound to an implementation here:
         // the value behind the object is not known.  So is one through a
-        // reference or pointer to an object.
-        if (this.arena.object_behind_receiver(recv_type) != null) { return; }
+        // reference or pointer to an object.  A bounded call of a default the
+        // table cannot hold is bound to the trait's default compiled for the
+        // object (`object_default_method`).
+        if (this.arena.object_behind_receiver(recv_type) != null) {
+            if (ma != null && t.kind == TypeKind::Object) {
+                mut object_block: DeclarationNode* = null;
+                const default_decl: DeclarationNode* = this.object_default_method(ma, recv_type, &object_block);
+                if (default_decl != null) {
+                    this.bind_receiver_method(call, default_decl, object_block, null, recv_type, subst);
+                }
+            }
+            return;
+        }
         // A bare generic-template struct used directly as a receiver (`this` in
         // `implement FmtWrite for struct String`, or `mut s: String` with all params
         // defaulted) is NOT a materialized spec, so a generic method on it (`try_push<T>`)
@@ -1239,6 +1252,95 @@ type struct MonoCallSpecializer {
         const m: MethodDecl* = DeclarationNode::method_of(m_decl);
         if (m != null) { *out_impl = head; }
         return m_decl;
+    }
+
+    /// The method of the implementation of a trait the compiler makes for an
+    /// object that a bounded call on `object` names, when the call's method
+    /// is a default the object's table cannot hold, with the block holding
+    /// it (`out_impl`); null when the table holds the method, and the call
+    /// goes through it.
+    object_default_method(mut &this, ma: MemberAccessExpr*, object: TypeRef,
+                          out_impl: DeclarationNode**) -> DeclarationNode* {
+        if (!ma.resolved_trait.is_valid() || ma.resolved_trait_slot < 0) { return null; }
+        const decl: TraitDecl* = this.generic_registry.get_trait_decl(ma.resolved_trait);
+        if (decl == null || ma.resolved_trait_slot >= decl.methods.length) { return null; }
+        const method: DeclarationNode* = decl.methods[ma.resolved_trait_slot];
+        const func: FunctionDecl* = DeclarationNode::fn_of(method);
+        if (func == null || !func.has_body()) { return null; }
+        if (this.generic_registry.method_object_unavailable(method).length() == 0) { return null; }
+        const block_decl: DeclarationNode* = this.object_implementation(ma.resolved_trait, decl, object);
+        *out_impl = block_decl;
+        return this.generic_registry.trait_item_method(DeclarationNode::impl_of(block_decl), ma.resolved_trait_slot);
+    }
+
+    /// The implementation of `trait_def` the compiler makes for `object`:
+    /// a block holding a copy of each of the trait's defaults a table cannot
+    /// hold, each a template instantiated per call with `This` the object
+    /// (`specialize_method`), in which a call on the object goes through its
+    /// table.  Made the first time a call asks, under the object type's
+    /// entry, which places it in the trait's module.  The trait's other
+    /// methods are never asked of it: a call of one goes through the table.
+    object_implementation(mut &this, trait_def: DefId, decl: TraitDecl*, object: TypeRef) -> DeclarationNode* {
+        for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
+            const entry: SpecializationEntry* = &this.state.spec_entries[i];
+            if (!entry.specialized_type.equals(object)) { continue; }
+            for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
+                const held: ImplBlock* = DeclarationNode::impl_of(entry.impl_nodes[j]);
+                if (held != null && held.trait_def.equals(trait_def)) { return entry.impl_nodes[j]; }
+            }
+        }
+        const block: ImplBlock* = ImplBlock::new(decl.name);
+        block.trait_def = trait_def;
+        block.spec_owner = object;
+        block.trait_annotation = new TypeAnnotation::Named(new NamedAnnotation {
+            name:         decl.name,
+            span:         SourceSpan::none(),
+            pre_resolved: TypeRef::invalid(),
+            res:          ResSlot::Answered(Res::Def(trait_def)),
+        });
+        // The implementation is a definition of its own under the trait, its
+        // leaf the object type's encoding, so each object type, with the
+        // trait arguments it carries, owns its methods under its own path.
+        // Its block and methods carry the trait's file, as the trait's other
+        // code does, so none is attributed to the module whose call asked;
+        // the entry's template module, the trait's, is where they are emitted.
+        mut mangle: MangleContext = MangleContext::new(this.intern_table, this.arena);
+        const implementation_def: DefId = this.decl_index.defs.register_generated(trait_def,
+            this.intern_table.intern(mangle.encode_type_ref(object, "object_implementation")),
+            DefKind::Instance, SourceSpan::none());
+        this.decl_index.register_type(implementation_def, object, true);
+        const trait_file: string = this.decl_index.defs.span_of(trait_def).file;
+        mut cloner: ASTCloner = ASTCloner::for_monomorphization();
+        for (mut m: i64 = 0; m < decl.methods.length; m++) {
+            const func: FunctionDecl* = DeclarationNode::fn_of(decl.methods[m]);
+            if (func == null || !func.has_body()) { continue; }
+            if (this.generic_registry.method_object_unavailable(decl.methods[m]).length() == 0) { continue; }
+            const copy_decl: DeclarationNode* = cloner.copy_decl(decl.methods[m]);
+            copy_decl.set_source_file(trait_file);
+            const copy: FunctionDecl* = DeclarationNode::fn_of(copy_decl);
+            copy.set_synth_default(true);
+            copy.set_self_returning_default(true);
+            mut method: MethodDecl* = MethodDecl::new(copy_decl);
+            method.set_static(copy.is_static);
+            const method_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Method(method), copy_decl.span);
+            method_decl.set_source_file(trait_file);
+            block.methods.push(method_decl);
+        }
+        const block_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Impl(block), SourceSpan::none());
+        block_decl.set_source_file(trait_file);
+        mut impls: [DeclarationNode*] = [];
+        impls.push(block_decl);
+        const object_t: Type* = this.arena.lookup(object);
+        this.state.spec_entries.push(SpecializationEntry {
+            specialized_type:  object,
+            ast_node:          null,
+            impl_nodes:        impls,
+            template_module:   this.arena.declared_in(this.arena.lookup(object_t.as_object().trait_type)),
+            instantiated_type: TypeRef::invalid(),
+            injected:          false,
+            owner_source:      SymbolStr::empty(),
+        });
+        return block_decl;
     }
 
     /// The receiver's implementations of the trait `trait_def`: for a
@@ -2089,6 +2191,21 @@ type struct MonoCallSpecializer {
         // abstract -> codegen E0636 on the nested call.
         if (owner_type.is_valid()) {
             this.add_owner_param_bindings(&subst_val, owner_type);
+        }
+        // The implementation the compiler makes for an object holds the
+        // trait's own defaults, typed with `This` the placeholder and the
+        // trait's parameters its own: here they are the object and the
+        // arguments the object gives the trait.
+        const owner_t: Type* = this.arena.lookup(owner_type);
+        if (owner_impl != null && owner_t != null && owner_t.kind == TypeKind::Object) {
+            subst_val.add(this.arena.this_placeholder(SymbolStr::empty()), owner_type);
+            const trait_decl: TraitDecl* = this.generic_registry.get_trait_decl(owner_impl.trait_def);
+            const trait_args: [TypeRef] = this.type_resolver.object_trait_arguments(owner_t.as_object(), owner_impl.trait_def);
+            for (mut gi: i64 = 0; trait_decl != null && gi < trait_decl.generic_params.length && gi < trait_args.length; gi++) {
+                const gp: GenericParamDecl* = DeclarationNode::generic_param_of(trait_decl.generic_params[gi]);
+                if (gp == null || !trait_args[gi].is_valid()) { continue; }
+                subst_val.add(this.arena.create_generic_param(gp.sym_id, gp.name, gi as u64), trait_args[gi]);
+            }
         }
         // A parameter the impl's where-clause derives (`A` in `implement<I, A>
         // Iterator<A> for TakeIter<I> where I: Iterator<A>`) is no parameter of
