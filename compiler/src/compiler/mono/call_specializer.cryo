@@ -868,6 +868,10 @@ type struct MonoCallSpecializer {
         recv_type = this.receiver_owner(recv_type);
         mut t: Type* = this.arena.lookup(recv_type);
         if (t == null) { return; }
+        // A call through a trait object is dispatched through the object's
+        // table where it runs, and never bound to an implementation here:
+        // the value behind the object is not known.
+        if (t.kind == TypeKind::Object) { return; }
         // A bare generic-template struct used directly as a receiver (`this` in
         // `implement FmtWrite for struct String`, or `mut s: String` with all params
         // defaulted) is NOT a materialized spec, so a generic method on it (`try_push<T>`)
@@ -1654,8 +1658,8 @@ type struct MonoCallSpecializer {
     /// Whether code generation has something to call for `call`: its pin,
     /// or - for a call with none - the value it calls through: a local or a
     /// module's global of function type, an enum variant, a
-    /// function-typed field, a release of the `Drop` language item, or a
-    /// computed function value.
+    /// function-typed field, a trait object's table, a release of the
+    /// `Drop` language item, or a computed function value.
     call_is_bound(&this, e: ExpressionNode*) -> boolean {
         const call: CallExpr* = ExpressionNode::call_of(e);
         if (call.resolved_callee.is_some()) { return true; }
@@ -1695,6 +1699,10 @@ type struct MonoCallSpecializer {
         const ma: MemberAccessExpr* = ExpressionNode::member_access_of(callee);
         if (ma != null) {
             if (ma.resolved_member.is_some() && this.is_function_value(call.callee.resolved_type)) { return true; }
+            // A call through a trait object calls the function its table
+            // holds at the slot the call recorded.
+            const recv_t: Type* = this.arena.lookup(ma.object.resolved_type);
+            if (recv_t != null && recv_t.kind == TypeKind::Object) { return true; }
             return call.named_method.is_valid()
                 && call.named_method.equals(this.generic_registry.wellknown(LangItem::DropDrop));
         }

@@ -45,7 +45,7 @@ import std::collections::pair;
 import std::collections::pair::{ Pair };
 import std::ffi::libc;
 import std::fmt;
-import compiler::ast::declaration::{ FunctionDecl, MethodDecl, DeclarationNode, VarDecl };
+import compiler::ast::declaration::{ FunctionDecl, MethodDecl, DeclarationNode, TraitDecl, VarDecl };
 import compiler::ast::expression::{
     CalleePin,
     CallExpr, ExpressionNode, IdentifierExpr,
@@ -59,6 +59,7 @@ import compiler::codegen::context::{ CodegenContext };
 import compiler::codegen::llvm_types::{ LBasicBlock, LLinkage, LType, LTypeKind, LValue };
 import compiler::codegen::ops::symbol_resolver;
 import compiler::codegen::ops::symbol_resolver::{ SymbolResolver };
+import compiler::codegen::ops::declaration_emitter::{ DeclarationEmitter };
 import compiler::codegen::visit::expr_dispatch::{ ExprDispatch };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span::{ SourceSpan };
@@ -222,8 +223,10 @@ type struct CallEmitter {
     /// pointer was computed, so it is no LLVM function: neither its type nor
     /// the call site's sret/byval attributes can be read off it, and both
     /// come from `plan`, classified from the value's Cryo function type.
+    /// `leading` goes before the call's own arguments: the receiver of a
+    /// call through a trait object, nothing for any other call.
     call_through_value(mut &this, visitor: IRGeneratorVisitor*, e: ExpressionNode*, node: CallExpr*,
-                       fn_ptr: LValue, plan: SignaturePlan) -> Emitted {
+                       fn_ptr: LValue, plan: SignaturePlan, leading: [Pair<LValue, TypeRef>]) -> Emitted {
         mut out: Emitted = Emitted::none();
         // The seam returns `void` when sret applies, else the Direct
         // return slot's type; a void call gets no result name.
@@ -231,7 +234,7 @@ type struct CallEmitter {
         if (!plan.sret_slot && plan.return_plan.llvm_slots.length > 0) {
             ret_ty = plan.return_plan.llvm_slots[0];
         }
-        mut call_args: [Pair<LValue, TypeRef>] = [];
+        mut call_args: [Pair<LValue, TypeRef>] = leading;
         for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
             mut av: LValue = this.dispatch.codegen_rvalue(visitor,node.arguments[ai]);
             // A by-value argument in a `&T` slot passes its address, as at a
@@ -250,6 +253,50 @@ type struct CallEmitter {
             this.cg.expr_ops.codegen_call_with_plan(fn_ptr, fn_type, plan, call_args, call_name));
         out.is_lvalue = false;
         return out;
+    }
+
+    /// A call through a trait object: the function is the word of the
+    /// object's table at the slot sema recorded on the call, called with
+    /// the object's data word as its receiver.  The signature is classified
+    /// from the trait method's own declaration, since which function the
+    /// slot holds is known only where the call runs.  A call with no slot
+    /// of its trait is an internal error, never a call bound some other way.
+    call_through_object(mut &this, visitor: IRGeneratorVisitor*, e: ExpressionNode*, node: CallExpr*,
+                        ma: MemberAccessExpr*) -> Emitted {
+        mut out: Emitted = Emitted::none();
+        const slot: i64 = ma.resolved_trait_slot;
+        const decl: TraitDecl* = if (slot >= 0) {
+            this.cg.ctx.generic_registry.get_trait_decl(ma.resolved_trait)
+        } else { null };
+        if (decl == null || slot >= decl.methods.length) {
+            mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                "internal: a call through a trait object reached code generation with no slot of its trait");
+            diag = diag.at(e.span);
+            this.cg.diag.emit(diag);
+            return out;
+        }
+        const func: FunctionDecl* = DeclarationNode::fn_of(decl.methods[slot]);
+        mut param_types: [TypeRef] = [];
+        for (mut i: i64 = 0; i < func.parameters.length; i++) {
+            param_types.push(DeclarationNode::var_of(func.parameters[i]).resolved_type);
+        }
+        const plan: SignaturePlan = this.cg.abi.classify_signature(
+            &param_types, func.resolved_return_type, false);
+        if (!plan.llvm_fn_type.is_valid()) { return out; }
+        const object: LValue = this.dispatch.codegen_rvalue(visitor, ma.object);
+        if (!object.is_valid()) { return out; }
+        const word: LType = LType::pointer_to(LType::i8());
+        const data: LValue = this.cg.builder.build_extract_value(object, 0, "object.data");
+        const table: LValue = this.cg.builder.build_extract_value(object, 1, "object.table");
+        const index_buf: void* = libc::malloc(8);
+        const index_slots: void** = index_buf as void**;
+        index_slots[0] = LType::const_int(LType::i64(), DeclarationEmitter::object_table_word(slot) as u64, false).raw;
+        const at: LValue = this.cg.builder.build_gep(word, table, index_buf, 1, "object.slot");
+        libc::free(index_buf);
+        const fn_ptr: LValue = this.cg.builder.build_load(word, at, "object.method");
+        mut leading: [Pair<LValue, TypeRef>] = [];
+        leading.push(Pair::<LValue, TypeRef>::new(data, param_types[0]));
+        return this.call_through_value(visitor, e, node, fn_ptr, plan, leading);
     }
 
     /// A call's result at its source type.  When the callee returns a
@@ -362,7 +409,7 @@ type struct CallEmitter {
                         // Load the function pointer from the alloca.
                         const fn_ptr_llvm: LType = LType::pointer_to(LType::i8());
                         const fn_ptr: LValue = this.cg.builder.build_load(fn_ptr_llvm, local, "fn.ptr.load");
-                        return this.call_through_value(visitor, e, node, fn_ptr, plan);
+                        return this.call_through_value(visitor, e, node, fn_ptr, plan, []);
                     }
                 }
             }
@@ -439,6 +486,11 @@ type struct CallEmitter {
             // shortcut, then routes the pin through `resolve_pinned`.
             const ma: MemberAccessExpr* = ExpressionNode::member_access_of(node.callee);
 
+            const recv_t: Type* = this.cg.arena_type(ma.object.resolved_type);
+            if (recv_t != null && recv_t.kind == TypeKind::Object) {
+                return this.call_through_object(visitor, e, node, ma);
+            }
+
             // Function-pointer field call: `receiver.field(args)` where
             // `field` has a Function type.  What the member IS is its pin:
             // a field read carries the field sema found, and a method
@@ -479,7 +531,7 @@ type struct CallEmitter {
                     out.is_lvalue = false;
                     return out;
                 }
-                return this.call_through_value(visitor, e, node, fn_ptr, plan);
+                return this.call_through_value(visitor, e, node, fn_ptr, plan, []);
             }
 
             // `resolved_callee` is the mangled LLVM symbol selection chose;
@@ -512,7 +564,7 @@ type struct CallEmitter {
                     out.is_lvalue = false;
                     return out;
                 }
-                return this.call_through_value(visitor, e, node, fn_ptr, plan);
+                return this.call_through_value(visitor, e, node, fn_ptr, plan, []);
             }
             callee_val = this.dispatch.codegen_rvalue(visitor,node.callee);
         }

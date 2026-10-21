@@ -191,6 +191,30 @@ yet is recorded with the change that builds it, not here.
      are refused in sema,** each fixed on its own before calls through
      objects are built.  (Jake)
 
+477. **E0315's wording stays as built:** "`Square` does not implement
+     `Shape`, so `&Square` cannot become `virtual &Shape`", and its forms
+     for a generic implementation and a type parameter.  (Jake)
+
+478. **The other trait-object messages stay as built:** "`delete` takes a
+     pointer, and `i32` is not a pointer"; a borrowed object "does not
+     compare"; a `virtual T*` "compares only with `null`".  (Jake)
+
+479. **`virtual mut &T` accepts either reference for now,** as a `mut &T`
+     parameter does.  Reference mutability is enforced for every form
+     together when `&this` becomes read-only, in the slice and API pass.
+     (Jake)
+
+480. **A trait-object table is emitted on demand,** only for an
+     implementation some conversion in the build names.  (Jake)
+
+481. **A table's drop word is the full release code for the type,**
+     the type's own `Drop::drop` and the release of every field it owns,
+     settled before the ABI freezes so that owning boxes after v1.0 need no
+     change to the table.  (Jake)
+
+482. **A table demangles as `<vtable for Main::Shape for Main::Circle>`.**
+     (Jake)
+
 462. **A path through a bounded type parameter naming a member no bound
      declares (`T::missing()` in a generic function that is instantiated)
      is refused with a diagnostic where it is written,** not left for

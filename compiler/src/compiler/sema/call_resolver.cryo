@@ -98,10 +98,10 @@ import compiler::sema::type_utils::{ TypeUtils };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::checker::{ TypeChecker, TypeCompatibility };
 import compiler::types::compound::{
-    ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
+    ArrayType, FunctionType, ObjectType, OptionalType, PointerType, ReferenceType, TupleType
 };
 import compiler::types::generic::{ AssocProjectionType, GenericParamType, InstantiatedType };
-import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry, TemplateKind };
+import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry, TemplateKind, TraitMember };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::types::inference::{ InferCtx };
@@ -1237,6 +1237,10 @@ type struct CallResolver {
             const arg_snap: DiagnosticSnapshot = this.ctx.diagnostics.snapshot();
             this.lambda.reject_closure_struct_args_in_non_free_call(call,
                 "passing a capturing closure as a method-call argument");
+            const receiver_t: Type* = this.arena.lookup(visitor.resolve_expr(callee_member.object));
+            if (receiver_t != null && receiver_t.kind == TypeKind::Object) {
+                return this.resolve_object_call(visitor, call_e, call, callee_member, receiver_t);
+            }
             const selected: Selection = this.resolve_method_overload(visitor, call, callee_member);
             this.check_method_call_arg_types(visitor, call_e, call, callee_member, selected.chosen);
             this.check_symbolic_method_bounds(callee, callee_member, selected.chosen);
@@ -4964,6 +4968,62 @@ type struct CallResolver {
             || ty.kind == TypeKind::Never;
     }
 
+    /// The type of a call through the trait object `receiver_t`.  The
+    /// method is the object's trait's own declared method of the call's
+    /// leaf; the call is stamped with that trait and the method's position,
+    /// which is the slot code generation loads from the object's table, so
+    /// nothing later matches a slot by name.  The arguments are checked
+    /// against the trait method's parameters past its receiver.  A method
+    /// the trait does not declare is E0358, one unavailable on an object
+    /// E0314 with the reason.
+    resolve_object_call(mut &this, visitor: SemaVisitor*, call_e: ExpressionNode*, call: CallExpr*,
+                        member: MemberAccessExpr*, receiver_t: Type*) -> TypeRef {
+        const object: ObjectType* = receiver_t.as_object();
+        const registry: GenericRegistry* = this.ctx.generic_registry;
+        const at: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { call.callee.span };
+        const members: [TraitMember] = registry.trait_members_declaring(object.trait_def, member.member);
+        mut slot: i64 = -1;
+        for (mut k: i64 = 0; k < members.length; k++) {
+            if (members[k].trait_def.equals(object.trait_def)) { slot = members[k].slot; break; }
+        }
+        if (slot < 0) {
+            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
+                fmt::format("no method named `%s` can be called on `%s`",
+                    this.intern.resolve(member.member), this.arena.format_display(receiver_t)));
+            d = d.at(at);
+            if (members.length > 0) {
+                d = d.with_note("a supertrait's method is not callable through a trait object yet");
+            }
+            this.ctx.emit_diagnostic(d);
+            return TypeRef::invalid();
+        }
+        const method: DeclarationNode* = registry.get_trait_decl(object.trait_def).methods[slot];
+        const reason: string = registry.method_object_unavailable(method);
+        if (reason.length() > 0) {
+            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0314_OBJECT_METHOD_UNAVAILABLE,
+                fmt::format("`%s` cannot be called through `%s`",
+                    this.intern.resolve(member.member), this.arena.format_display(receiver_t)));
+            d = d.at(at);
+            d = d.with_note(reason);
+            this.ctx.emit_diagnostic(d);
+            return TypeRef::invalid();
+        }
+        member.set_resolved_trait_item(object.trait_def, slot);
+        const func: FunctionDecl* = DeclarationNode::fn_of(method);
+        mut params: [TypeRef] = [];
+        for (mut i: i64 = 1; i < func.parameters.length; i++) {
+            params.push(DeclarationNode::var_of(func.parameters[i]).resolved_type);
+        }
+        if (call.arguments.length != params.length) {
+            this.diag.emit_method_arity_error(call_e.span, member.member, "method", params.length,
+                call.arguments.length, false);
+            return TypeRef::invalid();
+        }
+        this.check_args_against_params(visitor, &call.arguments, params.as_slice());
+        call.callee.set_resolved_type(func.resolved_return_type);
+        return func.resolved_return_type;
+    }
+
     /// The type of a method call.  Which method it names was answered by
     /// the selection (`bind_method_on_receiver`), whose answer is `selected`;
     /// `args_refused` is whether the argument check reported this call.
@@ -5091,14 +5151,16 @@ type struct CallResolver {
             unwrap_depth += 1;
         }
 
-        // A call through a trait object is not built: refused here, at the
+        // A call through a trait object is answered before selection
+        // (`resolve_object_call`); one reached through a reference or a
+        // pointer to the object is not built, and is refused here, at the
         // call, rather than left for code generation to find unresolved.
         if (base_t != null && base_t.kind == TypeKind::Object) {
             mut od: Diagnostic = Diagnostic::error(ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
                 fmt::format("no method named `%s` can be called on `%s`",
                     this.intern.resolve(member.member), this.arena.format_display(base_t)));
             od = od.at(if (member.member_span.has_location()) { member.member_span } else { member_e.span });
-            od = od.with_note("a call through a trait object is not supported yet");
+            od = od.with_note("a call through a reference or pointer to a trait object is not supported yet");
             this.ctx.emit_diagnostic(od);
             return TypeRef::invalid();
         }

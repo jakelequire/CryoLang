@@ -1,0 +1,84 @@
+namespace TraitObjectDispatch::Main;
+
+import TraitObjectDispatch::Shapes::{ Extent, Label, Shape };
+import TraitObjectDispatch::Figures::{ Circle, Square };
+import std::future::ready::{ PendingThenReady };
+import std::future::traits::{ Future };
+import std::future::poll::{ Poll };
+import std::future::waker::{ Context, Waker };
+
+// Calls through trait objects: each reads the function from the object's
+// table at the method's position, so one object type reaches each
+// implementation, and the exit code names the first call that answered
+// wrong.
+
+type struct Holder {
+    shape: virtual &Shape;
+}
+
+function total(all: [virtual &Shape; 2]) -> i32 {
+    mut sum: i32 = 0;
+    for (mut i: i64 = 0; i < 2; i++) { sum = sum + all[i].area(); }
+    return sum;
+}
+
+function grow(s: virtual mut &Shape) -> i32 {
+    s.scale(2);
+    return s.area();
+}
+
+/// A generic body's copies call through the object as the body does.
+function area_beside<T>(t: T, s: virtual &Shape) -> i32 {
+    return s.area();
+}
+
+/// The object is held across both suspends, so the state machine carries
+/// it in the future, and the calls after each resume read its table.
+async function area_after_waits(s: virtual &Shape) -> i32 {
+    const a: i32 = await PendingThenReady::<i32>::new(1, 5);
+    const b: i32 = s.area();
+    const c: i32 = await PendingThenReady::<i32>::new(2, b);
+    return a + c + s.name();
+}
+
+function drive<F, R>(fut: F) -> R
+where F: Future<R> {
+    mut f:  F       = fut;
+    mut cx: Context = Context::new(Waker::noop());
+    loop {
+        match (f.poll(&cx)) {
+            Poll::Ready(v) => { return v; }
+            Poll::Pending  => { }
+        }
+    }
+}
+
+function main() -> i32 {
+    mut c: Circle = Circle { r: 2 };
+    mut q: Square = Square { side: 3 };
+    const s: virtual &Shape = &c;
+    if (s.area() != 12) { return 1; }
+    // Two traits declaring `area`: each object calls its own trait's.
+    const l: virtual &Label = &c;
+    if (l.area() != 1000) { return 2; }
+    const all: [virtual &Shape; 2] = [&c, &q];
+    if (total(all) != 21) { return 3; }
+    // The default through Circle's table, the override through Square's.
+    if (all[0].name() != 7 || all[1].name() != 9) { return 4; }
+    const h: Holder = Holder { shape: &q };
+    if (h.shape.area() != 9) { return 5; }
+    // Through `virtual mut &`, the value behind the object changes.
+    if (grow(&q) != 25 || q.side != 5) { return 6; }
+    if (grow(&c) != 48 || c.r != 4) { return 7; }
+    if (area_beside::<i64>(1, &c) != 48) { return 8; }
+    const p: virtual Shape* = &q as Square*;
+    if (p.area() != 25) { return 9; }
+    // A three-word result and arguments of two classes through the table.
+    const e: Extent = s.extent(3, 1.5);
+    if (e.width != 11 || e.height != 11 || e.depth != 15) { return 10; }
+    const f: Extent = all[1].extent(4, 0.25);
+    if (f.width != 5 || f.height != 4 || f.depth != 25) { return 11; }
+    if (drive(area_after_waits(&c)) != 5 + 48 + 7) { return 12; }
+    if (drive(area_after_waits(&q)) != 5 + 25 + 9) { return 13; }
+    return 0;
+}

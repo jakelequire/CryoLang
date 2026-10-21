@@ -87,6 +87,14 @@ the trait declares, in declaration order: the implementation's function,
 or its copy of the trait's default, and null for a method that cannot be
 called through an object.  A `null` `virtual T*` has both words null.
 
+A call through an object loads the word at three plus the method's
+position and calls it with the object's first word, the value's address,
+as the receiver, then the call's own arguments.  The call is classified
+from the trait method's declared signature, whose receiver is a pointer
+whatever the implementing type, so it passes and returns exactly as a
+direct call of the implementation's function does: the same sret slot,
+byval copies and register pairs.
+
 ### Returns
 
 | Source kind         | Size      | Plan                                                                          |

@@ -135,6 +135,14 @@ type struct DeclarationEmitter {
     /// for any other body.
     caller_location: LValue;
 
+    /// The word of a trait-object table holding the method at `slot` among
+    /// the trait's declared ones: past the three reserved words, the drop,
+    /// the size and the alignment.  The table is built and a call through
+    /// it loads by this one answer.
+    static object_table_word(slot: i64) -> i64 {
+        return 3 + slot;
+    }
+
     static null() -> DeclarationEmitter {
         return DeclarationEmitter {
             started:     StartedGlobals { nodes: [], slots: [] },
@@ -643,7 +651,7 @@ type struct DeclarationEmitter {
     object_table_type(&this, block: ImplBlock*) -> LType {
         const decl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(block.trait_def);
         const methods: i64 = if (decl != null) { decl.methods.length } else { 0 };
-        return LType::array_of(LType::pointer_to(LType::i8()), (3 + methods) as u32);
+        return LType::array_of(LType::pointer_to(LType::i8()), DeclarationEmitter::object_table_word(methods) as u32);
     }
 
     /// The global holding `block`'s table: this module's definition when it
@@ -666,7 +674,7 @@ type struct DeclarationEmitter {
         if (decl == null) { return; }
         const word: LType = LType::pointer_to(LType::i8());
         const owner: TypeRef = this.ctx.decl_index.impl_owner(block, "codegen/trait-object table");
-        const n: u32 = (3 + decl.methods.length) as u32;
+        const n: u32 = DeclarationEmitter::object_table_word(decl.methods.length) as u32;
         const buf: void* = libc::malloc(n as u64 * 8);
         const words: void** = buf as void**;
         words[0] = this.object_table_drop(owner).raw;
@@ -674,7 +682,7 @@ type struct DeclarationEmitter {
         words[2] = llvm::LLVMConstIntToPtr(this.expr_ops.codegen_alignof(owner).raw, word.raw);
         for (mut slot: i64 = 0; slot < decl.methods.length; slot++) {
             mut f: LValue = LType::const_null(word);
-            if (registry.method_object_safe(decl.methods[slot])) {
+            if (registry.method_object_unavailable(decl.methods[slot]).length() == 0) {
                 const m: MethodDecl* = DeclarationNode::method_of(registry.trait_item_method(block, slot));
                 if (m != null && m.func != null) {
                     f = this.resolver.resolve_decl(DeclarationNode::fn_of(m.func).overload_entry);
@@ -687,7 +695,7 @@ type struct DeclarationEmitter {
                     return;
                 }
             }
-            words[3 + slot] = f.raw;
+            words[DeclarationEmitter::object_table_word(slot)] = f.raw;
         }
         const init: LValue = LType::const_array(word, buf, n);
         libc::free(buf);
