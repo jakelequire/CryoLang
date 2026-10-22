@@ -360,13 +360,11 @@ Everything in the standard library is public today, so its internals -
 v1.0.  Cryo stays public by default and nothing is linted; the library
 itself writes `public`, `private` or `internal` on every item, so each
 exposure is a decision.  Built: `private` holds on every member and item
-(rulings 562, 563), and a public signature may not name a private type
-(564).  The rest, in order:
+(rulings 562, 563); `internal` reaches the declaring package (567); and a
+signature may not name a type seen by fewer modules than it is, a trait's
+implementation included (564, 565, 567).  The rest, in order:
 
 1. **The compiler's half.**
-   - `internal`: visible to every module of the same package (one
-     cryoconfig project; the whole library is one), for items and
-     members, in user projects as in the library.
    - Modules public by default, `public module` dropped; `internal
      module x;` importable only inside its package; the grouped forms
      `module { a; b; }` and `internal module { c; }`.
@@ -375,8 +373,6 @@ exposure is a decision.  Built: `private` holds on every member and item
      ...): the compiler's table is built from the attributes, the parser
      stops building those calls by name, and the compiler's own imports
      of the builders go.  A generated call is never refused.
-   - An `internal` type in a public signature refused at the
-     declaration, as a private one is.
 2. **Collections' `length` and `capacity` private**, behind `![inline]`
    accessors made inline first; the compiler's, the language server's
    and the tests' reads rewritten by a codemod.  Every `length()`

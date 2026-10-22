@@ -786,10 +786,10 @@ type struct Resolver {
     }
 
     declare_variable(mut &this, name: SymbolStr, span: SourceSpan,
-                     is_mutable: boolean, is_public: boolean) -> SymbolID {
+                     is_mutable: boolean, visibility: SymbolVisibility) -> SymbolID {
         const id: SymbolID = this.alloc_symbol_id();
         const sym: Symbol = Symbol::variable(id, name, this.current_scope, span,
-                                              this.current_module, is_mutable, is_public);
+                                              this.current_module, is_mutable, visibility);
         return this.declare(sym);
     }
 
@@ -797,24 +797,24 @@ type struct Resolver {
     /// module-level `const` declarations so they can be told apart from
     /// mutable globals and local bindings - e.g. a `const` named in a `match`
     /// arm is a value pattern, not a fresh binding.
-    declare_constant(mut &this, name: SymbolStr, span: SourceSpan, is_public: boolean) -> SymbolID {
+    declare_constant(mut &this, name: SymbolStr, span: SourceSpan, visibility: SymbolVisibility) -> SymbolID {
         const id: SymbolID = this.alloc_symbol_id();
         const sym: Symbol = Symbol::constant(id, name, this.current_scope, span,
-                                             this.current_module, is_public);
+                                             this.current_module, visibility);
         return this.declare(sym);
     }
 
-    declare_function(mut &this, name: SymbolStr, span: SourceSpan, is_public: boolean) -> SymbolID {
+    declare_function(mut &this, name: SymbolStr, span: SourceSpan, visibility: SymbolVisibility) -> SymbolID {
         const id: SymbolID = this.alloc_symbol_id();
         const sym: Symbol = Symbol::function(id, name, this.current_scope, span,
-                                              this.current_module, is_public);
+                                              this.current_module, visibility);
         return this.declare(sym);
     }
 
-    declare_type(mut &this, name: SymbolStr, span: SourceSpan, is_public: boolean) -> SymbolID {
+    declare_type(mut &this, name: SymbolStr, span: SourceSpan, visibility: SymbolVisibility) -> SymbolID {
         const id: SymbolID = this.alloc_symbol_id();
         const sym: Symbol = Symbol::type_sym(id, name, this.current_scope, span,
-                                              this.current_module, is_public);
+                                              this.current_module, visibility);
         return this.declare(sym);
     }
 
@@ -846,11 +846,11 @@ type struct Resolver {
         return this.declare(sym);
     }
 
-    declare_method(mut &this, name: SymbolStr, span: SourceSpan, is_public: boolean,
+    declare_method(mut &this, name: SymbolStr, span: SourceSpan, visibility: SymbolVisibility,
                    def: DefId) -> SymbolID {
         const id: SymbolID = this.alloc_symbol_id();
         mut sym: Symbol = Symbol::method(id, name, this.current_scope, span,
-                                          this.current_module, is_public);
+                                          this.current_module, visibility);
         sym.def = def;
         return this.declare(sym);
     }
@@ -1147,7 +1147,7 @@ type struct Resolver {
         for (mut i: i64 = 0; i < this.exports.length; i++) {
             if (this.exports[i].second.equals(m)) {
                 const sym: Symbol = this.get_symbol(this.exports[i].first);
-                if (sym.name.equals(name) && sym.visibility.is_public()) {
+                if (sym.name.equals(name) && this.offered_here(&sym)) {
                     out.push(this.declaration_of(this.exports[i].first));
                 }
             }
@@ -1155,17 +1155,33 @@ type struct Resolver {
         return out;
     }
 
-    /// The top-level declarations `module` holds under `name` and marks
-    /// `private` - the one case a path or an import can name a declaration
-    /// and still be handed nothing, which the writer must be told about
-    /// rather than left to read as "no such name".  Every one, in
+    /// Whether the module being resolved may name the exported `sym`: a
+    /// public one from anywhere, an internal one from a module of its own
+    /// package.  The export list holds both, and never a private one.  A
+    /// module being resolved that the graph does not hold is not judged.
+    offered_here(&this, sym: &Symbol) -> boolean {
+        return match (sym.visibility) {
+            SymbolVisibility::Public   => { true }
+            SymbolVisibility::Private  => { false }
+            SymbolVisibility::Internal => {
+                !this.current_module.is_valid() || sym.source_module.equals(this.current_module)
+                    || (this.graph != null && this.graph.same_package(sym.source_module, this.current_module))
+            }
+        };
+    }
+
+    /// The top-level declarations `module` holds under `name` that the
+    /// module being resolved may not name: private ones, and internal ones
+    /// of another package - the one case a path or an import can name a
+    /// declaration and still be handed nothing, which the writer must be
+    /// told about rather than left to read as "no such name".  Every one, in
     /// declaration order: a type and a function may share a leaf (the second
     /// sits in the scope's overload set), and a reader that wants one of
     /// them chooses by kind.
     ///
-    /// Read off the module's own scope: the export list holds only what is
-    /// public, so a private declaration is exactly what it does not carry.
-    private_declarations(&this, m: ModulePath, name: SymbolStr) -> [SymbolID] {
+    /// Read off the module's own scope: the export list holds no private
+    /// declaration.
+    hidden_declarations(&this, m: ModulePath, name: SymbolStr) -> [SymbolID] {
         mut out: [SymbolID] = [];
         const sid: u64 = this.find_module_scope(m);
         if (sid == 0) { return out; }
@@ -1174,7 +1190,7 @@ type struct Resolver {
         for (mut i: i64 = 0; i < all.length; i++) {
             const sym: Symbol = this.get_symbol(all[i]);
             if (sym.kind == SymbolKind::Import) { continue; }
-            if (sym.visibility.is_public()) { continue; }
+            if (this.offered_here(&sym)) { continue; }
             out.push(all[i]);
         }
         return out;

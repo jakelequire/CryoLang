@@ -15,7 +15,7 @@
 
 namespace compiler::decl_index;
 
-import compiler::ast::{  TypeAnnotation };
+import compiler::ast::{ TypeAnnotation, Visibility };
 import compiler::ast::declaration;
 import compiler::ast::declaration::{ FunctionDecl, ImplBlock, MethodDecl, DeclarationNode, VarDecl };
 import compiler::types;
@@ -943,9 +943,9 @@ public:
     /// to the first.  The type is kept under the definition, for
     /// `type_of_def`, and nowhere else: a definition's path is display text,
     /// and two definitions written under one path are two types.
-    register_type(mut &this, def: DefId, ty: TypeRef, is_public: boolean) -> void {
+    register_type(mut &this, def: DefId, ty: TypeRef, visibility: Visibility) -> void {
         this.type_reverse.insert(ty.table_key(), def);
-        this.defs.record_visibility(def, is_public);
+        this.defs.record_visibility(def, DeclarationIndex::recorded(visibility));
         const slot: i64 = this.defs.slot(def);
         while (this.def_types.length <= slot) { this.def_types.push(TypeRef::invalid()); }
         this.def_types[slot] = ty;
@@ -1553,8 +1553,17 @@ public:
     /// that would have bound it; the verdict is read for a QUALIFIED call's
     /// callee (`hidden_from`), where a module's own private items are never
     /// refused because the modules are compared first.
-    set_decl_visibility(mut &this, def: DefId, is_public: boolean) -> void {
-        this.defs.record_visibility(def, is_public);
+    set_decl_visibility(mut &this, def: DefId, visibility: Visibility) -> void {
+        this.defs.record_visibility(def, DeclarationIndex::recorded(visibility));
+    }
+
+    /// A written visibility as the definition table records it.
+    static recorded(visibility: Visibility) -> DeclVisibility {
+        return match (visibility) {
+            Visibility::Public   => { DeclVisibility::Public }
+            Visibility::Internal => { DeclVisibility::Internal }
+            Visibility::Private  => { DeclVisibility::Private }
+        };
     }
 
     /// Record that the family `(owner, method)` holds a method whose
@@ -1615,30 +1624,6 @@ public:
         return false;
     }
 
-    /// Whether the definition `d` is private to a module other than
-    /// `use_module`: declared in another module, and recorded as not public
-    /// by its registration.  False for a definition of `use_module` itself,
-    /// or one declared in no module.
-    ///
-    /// Every registration records a verdict (a type's with `register_type`,
-    /// a function's beside its signature), so a definition with none never
-    /// registered - recorded as such, which fails the build; the answer given
-    /// meanwhile is the top-level default rather than a refusal that would
-    /// report a public item as private.
-    hidden_from(&this, d: DefId, use_module: DefId) -> boolean {
-        if (!d.is_valid() || !use_module.is_valid()) { return false; }
-        const home: DefId = this.defs.module_of(d);
-        if (!home.is_valid() || home.equals(use_module)) { return false; }
-        return match (this.defs.visibility_of(d)) {
-            DeclVisibility::Public     => { false }
-            DeclVisibility::Private    => { true }
-            DeclVisibility::Unrecorded => {
-                compiler::resolver::res::record_unregistered_def(
-                    "decl_index: visibility of a definition no registration recorded a verdict for");
-                false
-            }
-        };
-    }
 
     /// The implicit-converter registry key of the argument and return
     /// types: the upper 32 bits the argument's number, the lower 32 the

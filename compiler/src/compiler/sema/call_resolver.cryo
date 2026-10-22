@@ -35,7 +35,8 @@ import compiler::types::{
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, mangled_name };
 import compiler::ast;
 import compiler::ast::{
-    declaration, expression, LiteralKind, MemberPin, NamedAnnotation, node, statement, TraitBound, TraitRef, TypeAnnotation
+    declaration, expression, LiteralKind, MemberPin, NamedAnnotation, node, statement, TraitBound, TraitRef, TypeAnnotation,
+    Visibility
 };
 import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, renderer, source_span, suggestion };
@@ -3381,14 +3382,19 @@ type struct CallResolver {
     enforce_callee_visibility(mut &this, callee: DefId, use_module: ModulePath,
                               span: SourceSpan) -> void {
         if (this.state.in_symbolic_check) { return; }
-        if (!this.ctx.decl_index.hidden_from(callee, this.ctx.module_def_of(use_module))) { return; }
+        if (!this.ctx.hidden_from(callee, use_module)) { return; }
         const callee_str: string = this.intern.shown(this.ctx.defs.path_of(callee));
+        const is_internal: boolean = this.ctx.declared_visibility(callee) == Visibility::Internal;
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0353_PRIVATE_ACCESS,
-            fmt::format("`%s` is private and cannot be called from `%s`",
-                callee_str, this.intern.shown(use_module.decl_name())));
+            fmt::format("`%s` is %s and cannot be called from `%s`",
+                callee_str, if (is_internal) { "internal" } else { "private" }, this.intern.shown(use_module.decl_name())));
         d = d.at_with_label(span,
-            fmt::format("`%s` is private to its declaring module", callee_str));
+            if (is_internal) {
+                fmt::format("`%s` is internal to its declaring package", callee_str)
+            } else {
+                fmt::format("`%s` is private to its declaring module", callee_str)
+            });
         d = d.with_note("declare it `public` to allow calls from other modules");
         this.ctx.emit_diagnostic(d);
     }

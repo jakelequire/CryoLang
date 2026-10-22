@@ -713,7 +713,7 @@ type struct TypeResolutionRunner {
         ctx.decl_index.register_global(
             var_node.def, g_key, var_node.resolved_type, gmod_sym, g_ns,
             var_node.is_thread_local, owner);
-        ctx.decl_index.set_decl_visibility(var_node.def, var_node.visibility == Visibility::Public);
+        ctx.decl_index.set_decl_visibility(var_node.def, var_node.visibility);
         TypeResolutionRunner::record_extern_symbol(ctx, var_node);
     }
 
@@ -1343,13 +1343,17 @@ type struct TypeResolutionRunner {
 type struct SignatureOwner {
     item:           SymbolStr;
     implementation: ImplBlock*;
+    /// The modules that see the signature: the item's own visibility,
+    /// narrowed by its type's for a member, and by its trait's and type's
+    /// for an implementation.
+    reach:          Visibility;
 
-    static of_item(item: SymbolStr) -> SignatureOwner {
-        return SignatureOwner { item: item, implementation: null };
+    static of_item(item: SymbolStr, reach: Visibility) -> SignatureOwner {
+        return SignatureOwner { item: item, implementation: null, reach: reach };
     }
 
-    static of_implementation(block: ImplBlock*) -> SignatureOwner {
-        return SignatureOwner { item: SymbolStr::empty(), implementation: block };
+    static of_implementation(block: ImplBlock*, reach: Visibility) -> SignatureOwner {
+        return SignatureOwner { item: SymbolStr::empty(), implementation: block, reach: reach };
     }
 }
 
@@ -1357,84 +1361,74 @@ type struct SignatureOwner {
 
 type struct TypeResolutionPasses {
 
-    // -- A private type in a public signature (E0506) --
+    // -- A narrower type in a wider signature (E0506) --
 
-    /// Refuse a private type named where another module can see it: in a
-    /// public item's signature, in a public member of a public type, or in
-    /// the head or associated types of a public trait's implementation for
-    /// a public type.  A program in another module could otherwise hold a
-    /// value of a type it cannot name, and call its methods.  Judged here,
-    /// where the signature is written, because that is the one place its
-    /// author can fix it; `-> implement Trait` keeps a concrete type hidden.
-    /// A trait implementation's methods take the trait's signature and are
-    /// judged at the trait.
+    /// Refuse a type named where a module that cannot name it would see it:
+    /// a private type in a signature another module sees, an internal one
+    /// in a signature another package sees.  The signatures are an item's,
+    /// a member's of a type (seen as far as both reach), and the head and
+    /// associated types of a trait's implementation for a type (seen as far
+    /// as both reach).  A program could otherwise hold a value of a type it
+    /// cannot name, and call its methods.  Judged here, where the signature
+    /// is written, because that is the one place its author can fix it;
+    /// `-> implement Trait` keeps a concrete type hidden.  A trait
+    /// implementation's methods take the trait's signature and are judged
+    /// at the trait.
     static refuse_private_in_signatures(stmt: DeclarationNode*, ctx: CompilationContext*) -> void {
         match (stmt.kind) {
             DeclKind::Function(func) => {
-                if (func.is_public) {
-                    const owner: SignatureOwner = SignatureOwner::of_item(func.name);
-                    TypeResolutionPasses::refuse_private_in_function(ctx, stmt, &owner);
-                }
+                const owner: SignatureOwner = SignatureOwner::of_item(func.name, func.visibility);
+                TypeResolutionPasses::refuse_private_in_function(ctx, stmt, &owner);
             }
             DeclKind::Struct(node) => {
-                if (node.is_public) {
-                    TypeResolutionPasses::refuse_private_in_fields(ctx, &node.fields);
-                    TypeResolutionPasses::refuse_private_in_methods(ctx, &node.methods);
-                }
+                TypeResolutionPasses::refuse_private_in_fields(ctx, &node.fields, node.visibility);
+                TypeResolutionPasses::refuse_private_in_methods(ctx, &node.methods, node.visibility);
             }
             DeclKind::Union(node) => {
-                if (node.is_public) {
-                    TypeResolutionPasses::refuse_private_in_fields(ctx, &node.fields);
-                    TypeResolutionPasses::refuse_private_in_methods(ctx, &node.methods);
-                }
+                TypeResolutionPasses::refuse_private_in_fields(ctx, &node.fields, node.visibility);
+                TypeResolutionPasses::refuse_private_in_methods(ctx, &node.methods, node.visibility);
             }
             DeclKind::Enum(node) => {
-                if (node.is_public) {
-                    const owner: SignatureOwner = SignatureOwner::of_item(node.name);
-                    for (mut i: i64 = 0; i < node.variants.length; i++) {
-                        const v: EnumVariant* = DeclarationNode::variant_of(node.variants[i]);
-                        if (v == null) { continue; }
-                        for (mut k: i64 = 0; k < v.associated_types.length; k++) {
-                            TypeResolutionPasses::refuse_private_in_annotation(ctx, v.associated_types[k], &owner);
-                        }
+                const owner: SignatureOwner = SignatureOwner::of_item(node.name, node.visibility);
+                for (mut i: i64 = 0; i < node.variants.length; i++) {
+                    const v: EnumVariant* = DeclarationNode::variant_of(node.variants[i]);
+                    if (v == null) { continue; }
+                    for (mut k: i64 = 0; k < v.associated_types.length; k++) {
+                        TypeResolutionPasses::refuse_private_in_annotation(ctx, v.associated_types[k], &owner);
                     }
                 }
             }
             DeclKind::TypeAlias(node) => {
-                if (node.is_public) {
-                    const owner: SignatureOwner = SignatureOwner::of_item(node.alias_name);
-                    TypeResolutionPasses::refuse_private_in_annotation(ctx, node.target_annotation, &owner);
-                }
+                const owner: SignatureOwner = SignatureOwner::of_item(node.alias_name, node.visibility);
+                TypeResolutionPasses::refuse_private_in_annotation(ctx, node.target_annotation, &owner);
             }
             DeclKind::Variable(node) => {
-                if (node.is_global && node.visibility == Visibility::Public) {
-                    const owner: SignatureOwner = SignatureOwner::of_item(node.name);
+                if (node.is_global) {
+                    const owner: SignatureOwner = SignatureOwner::of_item(node.name, node.visibility);
                     TypeResolutionPasses::refuse_private_in_annotation(ctx, node.type_annotation, &owner);
                 }
             }
             DeclKind::Trait(node) => {
-                if (node.is_public) {
-                    for (mut i: i64 = 0; i < node.methods.length; i++) {
-                        const m: FunctionDecl* = DeclarationNode::fn_of(node.methods[i]);
-                        if (m == null) { continue; }
-                        const owner: SignatureOwner = SignatureOwner::of_item(m.name);
-                        TypeResolutionPasses::refuse_private_in_function(ctx, node.methods[i], &owner);
-                    }
+                for (mut i: i64 = 0; i < node.methods.length; i++) {
+                    const m: FunctionDecl* = DeclarationNode::fn_of(node.methods[i]);
+                    if (m == null) { continue; }
+                    const owner: SignatureOwner = SignatureOwner::of_item(m.name, node.visibility);
+                    TypeResolutionPasses::refuse_private_in_function(ctx, node.methods[i], &owner);
                 }
             }
             DeclKind::Impl(node) => {
-                const target: DefId = node.res.require("signature visibility: impl head").def_id();
-                if (target.is_valid() && ctx.defs.visibility_of(target) != DeclVisibility::Public) { return; }
+                const target: Visibility = ctx.declared_visibility(
+                    node.res.require("signature visibility: impl head").def_id());
                 if (!node.is_trait_impl()) {
-                    TypeResolutionPasses::refuse_private_in_methods(ctx, &node.methods);
+                    TypeResolutionPasses::refuse_private_in_methods(ctx, &node.methods, target);
                     return;
                 }
-                // A public trait implemented for a public type is seen by
-                // every module that sees both, and its methods' signatures are
-                // the trait's with the head's arguments and the block's
-                // associated types put in: those are the types it exposes.
-                if (ctx.defs.visibility_of(node.trait_def) != DeclVisibility::Public) { return; }
-                const owner: SignatureOwner = SignatureOwner::of_implementation(node);
+                // A trait's implementation for a type is seen by every module
+                // that sees both, and its methods' signatures are the trait's
+                // with the head's arguments and the block's associated types
+                // put in: those are the types it exposes.
+                const owner: SignatureOwner = SignatureOwner::of_implementation(node,
+                    Visibility::narrower(target, ctx.declared_visibility(node.trait_def)));
                 TypeResolutionPasses::refuse_private_in_annotation(ctx, node.trait_annotation, &owner);
                 for (mut i: i64 = 0; i < node.assoc_binding_annotations.length; i++) {
                     TypeResolutionPasses::refuse_private_in_annotation(ctx, node.assoc_binding_annotations[i], &owner);
@@ -1446,20 +1440,21 @@ type struct TypeResolutionPasses {
         }
     }
 
-    static refuse_private_in_fields(ctx: CompilationContext*, fields: &[DeclarationNode*]) -> void {
+    static refuse_private_in_fields(ctx: CompilationContext*, fields: &[DeclarationNode*], owner_reach: Visibility) -> void {
         for (mut i: i64 = 0; i < fields.length; i++) {
             const f: FieldDecl* = DeclarationNode::field_of(fields[i]);
-            if (f == null || f.visibility != Visibility::Public) { continue; }
-            const owner: SignatureOwner = SignatureOwner::of_item(f.name);
+            if (f == null) { continue; }
+            const owner: SignatureOwner = SignatureOwner::of_item(f.name, Visibility::narrower(owner_reach, f.visibility));
             TypeResolutionPasses::refuse_private_in_annotation(ctx, f.type_annotation, &owner);
         }
     }
 
-    static refuse_private_in_methods(ctx: CompilationContext*, methods: &[DeclarationNode*]) -> void {
+    static refuse_private_in_methods(ctx: CompilationContext*, methods: &[DeclarationNode*], owner_reach: Visibility) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
             const m: MethodDecl* = DeclarationNode::method_of(methods[i]);
-            if (m == null || m.visibility != Visibility::Public || m.func == null) { continue; }
-            const owner: SignatureOwner = SignatureOwner::of_item(DeclarationNode::fn_of(m.func).name);
+            if (m == null || m.func == null) { continue; }
+            const owner: SignatureOwner = SignatureOwner::of_item(DeclarationNode::fn_of(m.func).name,
+                Visibility::narrower(owner_reach, m.visibility));
             TypeResolutionPasses::refuse_private_in_function(ctx, m.func, &owner);
         }
     }
@@ -1467,7 +1462,8 @@ type struct TypeResolutionPasses {
     /// A function's parameters, its return and the traits its bounds name.
     static refuse_private_in_function(ctx: CompilationContext*, func_decl: DeclarationNode*, owner: &SignatureOwner) -> void {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
-        if (func == null) { return; }
+        // A private signature is seen only where everything it can name is.
+        if (func == null || owner.reach == Visibility::Private) { return; }
         for (mut p: i64 = 0; p < func.parameters.length; p++) {
             const param: VarDecl* = DeclarationNode::var_of(func.parameters[p]);
             if (param != null) { TypeResolutionPasses::refuse_private_in_annotation(ctx, param.type_annotation, owner); }
@@ -1488,7 +1484,7 @@ type struct TypeResolutionPasses {
     /// `implement Trait` names only its traits: the concrete type it stands
     /// for is the one a signature may hide.
     static refuse_private_in_annotation(ctx: CompilationContext*, ann: TypeAnnotation*, owner: &SignatureOwner) -> void {
-        if (ann == null) { return; }
+        if (ann == null || owner.reach == Visibility::Private) { return; }
         match (*ann) {
             TypeAnnotation::Named(n) => {
                 if (n != null) {
@@ -1538,28 +1534,35 @@ type struct TypeResolutionPasses {
         }
     }
 
-    /// E0506 when `d` is a private type or trait: one of the writer's own
-    /// module, since another module's is refused where it is named (E0503).
+    /// E0506 when `d` is a type or trait reaching fewer modules than the
+    /// signature naming it.  The writer can name `d`, since one it cannot
+    /// is refused where it is named (E0503).
     static refuse_private_named(ctx: CompilationContext*, d: DefId, span: SourceSpan, owner: &SignatureOwner) -> void {
-        if (!d.is_valid() || ctx.defs.visibility_of(d) != DeclVisibility::Private) { return; }
+        if (!d.is_valid()) { return; }
+        const named: Visibility = ctx.declared_visibility(d);
+        if (named.reaches_as_far_as(owner.reach)) { return; }
         const type_str: string = ctx.intern_table.shown(ctx.defs.leaf_of(d));
+        const reach_str: string = owner.reach.label();
+        const named_str: string = named.label();
+        const seen_by: string = if (named == Visibility::Private) { "other modules" } else { "other packages" };
         if (owner.implementation != null) {
             const trait_str: string = ctx.intern_table.shown(ctx.defs.leaf_of(owner.implementation.trait_def));
             const target_str: string = ctx.resolve_str(owner.implementation.target_type);
             mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0506_PRIVATE_TYPE_IN_PUBLIC_SIGNATURE,
-                fmt::format("the implementation of `%s` for `%s` is public, but it names the private type `%s`",
-                    trait_str, target_str, type_str));
-            diag = diag.at_with_label(span, "private type in an implementation other modules can see");
-            diag = diag.help(fmt::format("make `%s` public, or make `%s` or `%s` private", type_str, trait_str, target_str));
+                fmt::format("the implementation of `%s` for `%s` is %s, but it names the %s type `%s`",
+                    trait_str, target_str, reach_str, named_str, type_str));
+            diag = diag.at_with_label(span, fmt::format("%s type in an implementation %s can see", named_str, seen_by));
+            diag = diag.help(fmt::format("make `%s` %s, or make `%s` or `%s` %s",
+                type_str, reach_str, trait_str, target_str, named_str));
             ctx.emit_diagnostic(diag);
             return;
         }
         const item_str: string = ctx.resolve_str(owner.item);
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0506_PRIVATE_TYPE_IN_PUBLIC_SIGNATURE,
-            fmt::format("`%s` is public, but its signature names the private type `%s`", item_str, type_str));
-        diag = diag.at_with_label(span, "private type in a signature other modules can see");
-        diag = diag.help(fmt::format("make `%s` public, make `%s` private, or hide the concrete type behind `-> implement Trait`",
-            type_str, item_str));
+            fmt::format("`%s` is %s, but its signature names the %s type `%s`", item_str, reach_str, named_str, type_str));
+        diag = diag.at_with_label(span, fmt::format("%s type in a signature %s can see", named_str, seen_by));
+        diag = diag.help(fmt::format("make `%s` %s, make `%s` %s, or hide the concrete type behind `-> implement Trait`",
+            type_str, reach_str, item_str, named_str));
         ctx.emit_diagnostic(diag);
     }
 
@@ -1706,7 +1709,7 @@ type struct TypeResolutionPasses {
                     // declaration when it bound the function.
                     ctx.generic_registry.claim_wellknown(func.def, ctx.intern_table);
 
-                    ctx.decl_index.set_decl_visibility(func.def, func.is_public);
+                    ctx.decl_index.set_decl_visibility(func.def, func.visibility);
                     // A free function's instance is answered by its entry.
                     ctx.decl_index.record_instance(func.instance, entry);
                 }
@@ -2920,8 +2923,7 @@ type struct TypeResolutionPasses {
                     field_decl.span);
                 continue;
             }
-            const is_pub: boolean = field.visibility == Visibility::Public;
-            mut fi: FieldInfo = FieldInfo::new(field.name, field.resolved_type, is_pub, true);
+            mut fi: FieldInfo = FieldInfo::new(field.name, field.resolved_type, field.visibility, true);
             fi.set_default_value(field.default_value);
             field_infos.push(fi);
         }
@@ -2953,7 +2955,6 @@ type struct TypeResolutionPasses {
             const minfo: MethodInfo = MethodInfo {
                 name:          fn_node.name,
                 function_type: fn_ty,
-                is_public:     mnode.visibility == Visibility::Public,
                 is_static:     mnode.is_static,
                 param_types:   ptypes,
                 ast_node:      mnode_decl as void*,
@@ -3012,7 +3013,6 @@ type struct TypeResolutionPasses {
                 const minfo: MethodInfo = MethodInfo {
                     name:          fn_node.name,
                     function_type: fn_ty,
-                    is_public:     mnode.visibility == Visibility::Public,
                     is_static:     mnode.is_static,
                     param_types:   ptypes,
                     ast_node:      mnode_decl as void*,
@@ -3060,8 +3060,7 @@ type struct TypeResolutionPasses {
                     field_decl.span);
                 continue;
             }
-            const is_pub: boolean = field.visibility == Visibility::Public;
-            mut fi: FieldInfo = FieldInfo::new(field.name, field.resolved_type, is_pub, true);
+            mut fi: FieldInfo = FieldInfo::new(field.name, field.resolved_type, field.visibility, true);
             fi.set_default_value(field.default_value);
             field_infos.push(fi);
         }
@@ -3086,7 +3085,6 @@ type struct TypeResolutionPasses {
             const minfo: MethodInfo = MethodInfo {
                 name:          fn_node.name,
                 function_type: fn_ty,
-                is_public:     mnode.visibility == Visibility::Public,
                 is_static:     mnode.is_static,
                 param_types:   ptypes,
                 ast_node:      mnode_decl as void*,
@@ -3205,7 +3203,7 @@ type struct TypeResolutionPasses {
                     tfunc.resolved_return_type, param_types,
                     tfunc.is_variadic);
                 mut info: MethodInfo = MethodInfo::new(
-                    tfunc.name, fn_ty, true, tfunc.is_static);
+                    tfunc.name, fn_ty, tfunc.is_static);
                 info.param_types = param_types;
                 tr_type.add_required_method(info);
             }
@@ -3449,7 +3447,7 @@ type struct TypeResolutionPasses {
                             // reached through, and the name layer declares
                             // them so - whatever the block's text wrote.
                             ctx.decl_index.set_decl_visibility(fn_node.def,
-                                node.is_c_import() || fn_node.is_public);
+                                if (node.is_c_import()) { Visibility::Public } else { fn_node.visibility });
                         }
                     }
                     sig_count += node.functions.length;
@@ -3509,7 +3507,7 @@ type struct TypeResolutionPasses {
                         // carries no visibility); record it explicitly so
                         // the verdict is stated rather than inherited from
                         // `is_candidate_public`'s permissive default.
-                        ctx.decl_index.set_decl_visibility(node.def, true);
+                        ctx.decl_index.set_decl_visibility(node.def, Visibility::Public);
                     }
                     sig_count++;
                 }

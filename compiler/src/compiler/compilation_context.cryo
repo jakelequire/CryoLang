@@ -17,9 +17,9 @@ import compiler::mono::monomorphizer;
 import compiler::mono::monomorphizer::{ Monomorphizer };
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, resolver };
 import compiler::resolver::res;
-import compiler::resolver::res::{ DefId, DefTable, DefKind, FamilyOwner, ResBase };
+import compiler::resolver::res::{ DeclVisibility, DefId, DefTable, DefKind, FamilyOwner, ResBase };
 import compiler::ast::node::{ Node };
-import compiler::ast::{ NamedAnnotation };
+import compiler::ast::{ NamedAnnotation, Visibility };
 import compiler::ast::declaration::{ DeclarationNode, FunctionDecl, ImplBlock, MethodDecl };
 import compiler::ast::expression::{ ExpressionNode };
 import compiler::types::generic_registry::{ TemplateEntry };
@@ -698,6 +698,48 @@ public:
     declaring_module(&this, d: DefId) -> ModulePath {
         if (this.module_graph == null) { return ModulePath::none(); }
         return this.module_graph.declaring_module(d);
+    }
+
+    /// Whether code in `use_module` may name something declared in `home`
+    /// with visibility `v`: anything public, an internal declaration from
+    /// any module of its package, a private one from its own module.  An
+    /// unknown module on either side is not judged: reading "I do not know
+    /// where this was written" as "somewhere else" refuses what is allowed.
+    reaches(&this, v: Visibility, home: ModulePath, use_module: ModulePath) -> boolean {
+        if (!home.is_valid() || !use_module.is_valid() || home.equals(use_module)) { return true; }
+        return match (v) {
+            Visibility::Public   => { true }
+            Visibility::Internal => { this.module_graph != null && this.module_graph.same_package(home, use_module) }
+            Visibility::Private  => { false }
+        };
+    }
+
+    /// Whether the definition `d` may not be named from `use_module`, by the
+    /// visibility its registration recorded (`reaches`).
+    ///
+    /// Every registration records a verdict (a type's with `register_type`,
+    /// a function's beside its signature), so a definition with none never
+    /// registered - recorded as such, which fails the build; the answer given
+    /// meanwhile is the top-level default rather than a refusal that would
+    /// report a public item as private.
+    hidden_from(&this, d: DefId, use_module: ModulePath) -> boolean {
+        if (!d.is_valid()) { return false; }
+        if (this.defs.visibility_of(d) == DeclVisibility::Unrecorded) {
+            compiler::resolver::res::record_unregistered_def(
+                "visibility of a definition no registration recorded a verdict for");
+            return false;
+        }
+        return !this.reaches(this.declared_visibility(d), this.declaring_module(d), use_module);
+    }
+
+    /// The visibility `d`'s registration recorded; public for no
+    /// definition (a primitive) or one with no verdict recorded.
+    declared_visibility(&this, d: DefId) -> Visibility {
+        return match (this.defs.visibility_of(d)) {
+            DeclVisibility::Internal => { Visibility::Internal }
+            DeclVisibility::Private  => { Visibility::Private }
+            _                        => { Visibility::Public }
+        };
     }
 
     /// The module the definition `d` IS; none when `d` is not a module.

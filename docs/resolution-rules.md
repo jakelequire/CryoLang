@@ -224,6 +224,15 @@ yet is recorded with the change that builds it, not here.
      yet minted, so it is accepted outside a generic body as inside one.
      (Jake)
 
+567. **`internal` reaches every module of the declaring package,** one
+     cryoconfig project, and is written wherever `private` is.  Another
+     package naming one is refused as a private name is (E0503 for a
+     type, E0353 otherwise); an `export` keeps the reach a declaration was
+     declared with.  E0506 compares reaches: a signature may not name a
+     type seen by fewer modules than the signature is, so a public one may
+     not name an internal type and an internal one may not name a private
+     type.  (Jake; the codes Delegated)
+
 ### 2026-10-21
 
 501. **The class-removal plan is deleted now,** its slices all built and its

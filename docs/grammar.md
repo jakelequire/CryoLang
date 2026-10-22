@@ -112,8 +112,9 @@ ExternDecl         ::= "extern" "function" Ident
                      | "extern" StringLit "{" ExternItem* "}"
 ExternItem         ::= ExternFn | ExternGlobal
 (*  An imported function is a top-level declaration of its module and
-    takes the top-level default: public unless `private` opts it out. *)
-ExternFn           ::= "private"? "function" Ident
+    takes the top-level default: public unless `internal` or `private`
+    narrows it. *)
+ExternFn           ::= ("internal" | "private")? "function" Ident
                        "(" ParamList? ")" ("->" Type)? ";"
 
 (*  An imported global: storage the linked library owns.  The type is
@@ -157,7 +158,7 @@ WhereClause        ::= Ident ":" TraitBound ("+" TraitBound)*
                        (* TraitBound is a possibly-qualified trait name with
                           optional generic arguments - same shape as
                           super-trait references on a `type trait` decl. *)
-Visibility         ::= "public" | "private"
+Visibility         ::= "public" | "internal" | "private"
 
 
 (*  Structs, Enums, Traits, Type Aliases ======================== *)
@@ -178,7 +179,7 @@ AggregateDecl      ::= "type"? "struct" Ident Generics?
 
 Member             ::= Visibility? "static"? (Field | Method)
                      | Visibility? MemberConstant
-                     | VisibilityBlock          (* `public:` / `private:`
+                     | VisibilityBlock          (* `public:` / `internal:` / `private:`
                                                    labels a run of subsequent members. *)
 VisibilityBlock    ::= Visibility ":" (Field | Method | MemberConstant)*
 
@@ -188,7 +189,7 @@ VisibilityBlock    ::= Visibility ":" (Field | Method | MemberConstant)*
    can only be a member name.  This is what lets a bound C struct keep a
    field called `type`, which the binding generator cannot rename without
    breaking the ABI.  The exceptions are the keywords a member position
-   reads FIRST: `public`/`private` (a visibility label), `static`/`async`
+   reads FIRST: `public`/`internal`/`private` (a visibility label), `static`/`async`
    (a member modifier), `const` followed by a name (a constant: `const:`
    is still a field named `const`, and `const(` a method) and
    `protected`/`virtual`/`override` (refused).                          *)
@@ -523,7 +524,8 @@ Ident              ::= /* [a-zA-Z_][a-zA-Z0-9_]*                */
 (*  export     extern     f32        f64       false     float     *)
 (*  for        from       function   i8        i16       i32       *)
 (*  i64        i128       if         implement import    in        *)
-(*  inline     int        intrinsic  loop      match     module    *)
+(*  inline     int        internal   intrinsic loop      match     *)
+(*  module                                                          *)
 (*  move       mut        namespace  never     new       null      *)
 (*  optional   override   private    protected public    return    *)
 (*  sizeof     static     string     struct    this      This      *)

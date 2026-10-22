@@ -69,7 +69,7 @@ import compiler::types::user_defined::{
 
 /// A field as the member door found it: its type as seen through the
 /// receiver, and its `index` in the owner's field list, for the access to
-/// be pinned to.  `is_public` and `declared_in` are what the visibility
+/// be pinned to.  `visibility` and `declared_in` are what the visibility
 /// check asks, read off the arena entry or, for a field of a generic
 /// template, off its declaration: one answer whichever the door read, so a
 /// template's private field is as private as a concrete type's.  `owner`
@@ -77,13 +77,13 @@ import compiler::types::user_defined::{
 /// array's `length`, which has a type and no slot and is public.
 type struct FieldAnswer {
     ty:          TypeRef;
-    is_public:   boolean;
+    visibility:  Visibility;
     declared_in: ModulePath;
     owner:       Type*;
     index:       i64;
 
     static none() -> FieldAnswer {
-        return FieldAnswer { ty: TypeRef::invalid(), is_public: true, declared_in: ModulePath::none(),
+        return FieldAnswer { ty: TypeRef::invalid(), visibility: Visibility::Public, declared_in: ModulePath::none(),
                              owner: null, index: -1 };
     }
 
@@ -530,7 +530,7 @@ type struct MemberResolver {
         if (t.kind == TypeKind::Array && this.intern.resolve(leaf).eq("length")) {
             return FieldAnswer {
                 ty:          this.types.subst_owner_params_from_receiver(recv, this.arena.get_i64()),
-                is_public:   true, declared_in: ModulePath::none(), owner: null, index: -1,
+                visibility:  Visibility::Public, declared_in: ModulePath::none(), owner: null, index: -1,
             };
         }
         return FieldAnswer::none();
@@ -542,7 +542,7 @@ type struct MemberResolver {
                  index: i64) -> FieldAnswer {
         return FieldAnswer {
             ty:          this.types.subst_owner_params_from_receiver(recv, entry.field_type),
-            is_public:   entry.is_public,
+            visibility:  entry.visibility,
             declared_in: this.arena.declared_in(owner),
             owner:       owner,
             index:       index,
@@ -570,7 +570,7 @@ type struct MemberResolver {
             if (f == null || !f.name.equals(leaf) || !f.resolved_type.is_valid()) { continue; }
             return FieldAnswer {
                 ty:          this.types.subst_owner_params_from_receiver(recv, f.resolved_type),
-                is_public:   f.visibility == Visibility::Public,
+                visibility:  f.visibility,
                 declared_in: tmpl.declared_in,
                 owner:       this.arena.lookup(tmpl_ref),
                 index:       k,
@@ -862,40 +862,44 @@ type struct MemberResolver {
 
     // -- Visibility enforcement --
 
-    /// Whether code written at `span` may reach a `private` member declared
-    /// in module `decl`: only from that module.  Which module the code is in
-    /// is the module that owns the syntax's own file - never the type the
-    /// walk is inside - so an `implement` block written in another module is
-    /// outside however it names the type, a free function beside the type is
+    /// Whether code written at `span` may reach a member with visibility
+    /// `v` declared in module `decl`: a private one only from that module,
+    /// an internal one from any module of its package
+    /// (`CompilationContext::reaches`).  Which module the code is in is the
+    /// module that owns the syntax's own file - never the type the walk is
+    /// inside - so an `implement` block written in another module is outside
+    /// however it names the type, a free function beside the type is
     /// inside, and a lowered `async` body, whose statements keep the spans
     /// they were written with, keeps the access of where it was written.
-    ///
-    /// An unknown use site or declaring module is not judged: reading "I do
-    /// not know where this was written" as "somewhere else" is the false
-    /// positive the callee gate was reverted for.
-    member_reachable(&this, decl: ModulePath, span: SourceSpan) -> boolean {
-        const use_site: ModulePath = this.ctx.module_of_file(span.file);
-        if (!use_site.is_valid() || !decl.is_valid()) { return true; }
-        return use_site.equals(decl);
+    member_reachable(&this, v: Visibility, decl: ModulePath, span: SourceSpan) -> boolean {
+        return this.ctx.reaches(v, decl, this.ctx.module_of_file(span.file));
     }
 
-    /// Emit E0353 when a private field is reached from outside the module
-    /// that may reach it (`member_reachable`).  A field is declared where its
-    /// type is.  `fa` is the answer the caller's lookup gave (`field_of`);
+    /// Where a member of visibility `v` declared in `decl` was reached from
+    /// outside of, for a refusal's label: its module, or its package.
+    outside_of(&this, v: Visibility, decl: ModulePath) -> string {
+        if (v == Visibility::Internal) { return "its package"; }
+        return fmt::format("module `%s`", this.intern.shown(decl.decl_name()));
+    }
+
+    /// Emit E0353 when a private or internal field is reached from where it
+    /// may not be (`member_reachable`).  A field is declared where its type
+    /// is.  `fa` is the answer the caller's lookup gave (`field_of`);
     /// `field_name` is the spelling, for the diagnostic alone.  Nothing here
     /// finds the field again.
     enforce_field_visibility(mut &this, fa: &FieldAnswer, field_name: SymbolStr, span: SourceSpan) -> void {
-        if (fa.is_public || fa.owner == null) { return; }
+        if (fa.owner == null) { return; }
         const decl: ModulePath = fa.declared_in;
-        if (this.member_reachable(decl, span)) { return; }
+        if (this.member_reachable(fa.visibility, decl, span)) { return; }
 
         const declaring_name: string = fa.owner.display_name();
         const field_str: string = this.intern.resolve(field_name);
+        const word: string = fa.visibility.label();
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0353_PRIVATE_ACCESS,
-            fmt::format("field `%s` of `%s` is private", field_str, declaring_name));
-        d = d.at_with_label(span, fmt::format("private field reached outside module `%s`",
-            this.intern.shown(decl.decl_name())));
+            fmt::format("field `%s` of `%s` is %s", field_str, declaring_name, word));
+        d = d.at_with_label(span, fmt::format("%s field reached outside %s", word,
+            this.outside_of(fa.visibility, decl)));
         this.ctx.emit_diagnostic(d);
     }
 
@@ -922,26 +926,27 @@ type struct MemberResolver {
             this.ctx.defs.parent_of(func.def)
         };
         if (this.ctx.generic_registry.get_trait_decl(trait_def) != null) {
-            const use_module: DefId = this.ctx.module_def_of(this.ctx.module_of_file(span.file));
-            if (!this.ctx.decl_index.hidden_from(trait_def, use_module)) { return; }
+            if (!this.ctx.hidden_from(trait_def, this.ctx.module_of_file(span.file))) { return; }
             mut td: Diagnostic = Diagnostic::error(
                 ErrorCode::E0353_PRIVATE_ACCESS,
-                fmt::format("method `%s` of the private trait `%s` cannot be called here",
-                    this.intern.resolve(func.name), this.intern.shown(this.ctx.defs.path_of(trait_def))));
+                fmt::format("method `%s` of the %s trait `%s` cannot be called here",
+                    this.intern.resolve(func.name), this.ctx.declared_visibility(trait_def).label(),
+                    this.intern.shown(this.ctx.defs.path_of(trait_def))));
             td = td.at_with_label(span, "a trait's methods are reachable only where the trait is");
             this.ctx.emit_diagnostic(td);
             return;
         }
-        if (node == null || node.visibility == Visibility::Public) { return; }
+        if (node == null) { return; }
         const decl: ModulePath = this.ctx.module_of_file(method_decl.span.file);
-        if (this.member_reachable(decl, span)) { return; }
+        if (this.member_reachable(node.visibility, decl, span)) { return; }
 
+        const word: string = node.visibility.label();
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0353_PRIVATE_ACCESS,
-            fmt::format("method `%s` of `%s` is private", this.intern.resolve(func.name),
-                this.intern.shown(this.ctx.defs.path_of(this.ctx.defs.parent_of(func.def)))));
-        d = d.at_with_label(span, fmt::format("private method called outside module `%s`",
-            this.intern.shown(decl.decl_name())));
+            fmt::format("method `%s` of `%s` is %s", this.intern.resolve(func.name),
+                this.intern.shown(this.ctx.defs.path_of(this.ctx.defs.parent_of(func.def))), word));
+        d = d.at_with_label(span, fmt::format("%s method called outside %s", word,
+            this.outside_of(node.visibility, decl)));
         this.ctx.emit_diagnostic(d);
     }
 

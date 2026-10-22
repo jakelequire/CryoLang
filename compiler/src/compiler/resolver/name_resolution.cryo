@@ -282,7 +282,7 @@ type struct NameResolver {
         const saved_module: ModulePath = this.resolver.current_module_path();
         const saved_scope: u64 = this.resolver.get_current_scope_id();
         this.resolver.set_module(c_module);
-        const sym_id: SymbolID = this.resolver.declare_type(name, span, true);
+        const sym_id: SymbolID = this.resolver.declare_type(name, span, SymbolVisibility::Public);
         this.resolver.export_symbol(sym_id);
         this.resolver.restore_scope(saved_module, saved_scope);
         return sym_id;
@@ -298,9 +298,9 @@ type struct NameResolver {
         const saved_scope: u64 = this.resolver.get_current_scope_id();
         this.resolver.set_module(c_module);
         const sym_id: SymbolID = if (node.is_mutable) {
-            this.resolver.declare_variable(node.name, decl.span, true, true)
+            this.resolver.declare_variable(node.name, decl.span, true, SymbolVisibility::Public)
         } else {
-            this.resolver.declare_constant(node.name, decl.span, true)
+            this.resolver.declare_constant(node.name, decl.span, SymbolVisibility::Public)
         };
         this.resolver.record_resolution(decl.span, sym_id);
         this.resolver.export_symbol(sym_id);
@@ -412,6 +412,23 @@ type struct NameResolver {
         this.ctx.emit_diagnostic(d);
     }
 
+    /// A written visibility as a symbol carries it.
+    static symbol_visibility(v: Visibility) -> SymbolVisibility {
+        return match (v) {
+            Visibility::Public   => { SymbolVisibility::Public }
+            Visibility::Internal => { SymbolVisibility::Internal }
+            Visibility::Private  => { SymbolVisibility::Private }
+        };
+    }
+
+    /// Declare `sym_id` in the module's export list unless it is private:
+    /// a private declaration is refused where a path or an import names
+    /// it, and an internal one is offered to its own package alone
+    /// (`Resolver::offered_here`).
+    export_unless_private(mut &this, sym_id: SymbolID, v: Visibility) -> void {
+        if (v != Visibility::Private) { this.resolver.export_symbol(sym_id); }
+    }
+
     /// Declare a module-level variable `decl` (whose payload is `var_node`);
     /// a local is declared where the body walk meets it.
     forward_declare_var(mut &this, decl: DeclarationNode*, var_node: VarDecl*) -> void {
@@ -427,13 +444,13 @@ type struct NameResolver {
             // (`SymbolKind::Constant`); a mutable global is a variable.
             // The kind lets later passes treat a const named in a
             // `match` arm as a value pattern rather than a binding.
-            const is_public: boolean = var_node.visibility == Visibility::Public;
+            const visibility: SymbolVisibility = NameResolver::symbol_visibility(var_node.visibility);
             const sym_id: SymbolID = if (var_node.is_mutable) {
                 this.resolver.declare_variable(
-                    var_node.name, decl.span, true, is_public)
+                    var_node.name, decl.span, true, visibility)
             } else {
                 this.resolver.declare_constant(
-                    var_node.name, decl.span, is_public)
+                    var_node.name, decl.span, visibility)
             };
             this.resolver.record_resolution(decl.span, sym_id);
             var_node.def = this.resolver.get_symbol(sym_id).def;
@@ -444,7 +461,7 @@ type struct NameResolver {
             // take whichever module registered last.  A private one is left
             // out, as a private function is: a path or an import naming it
             // is refused where it is written.
-            if (is_public) { this.resolver.export_symbol(sym_id); }
+            this.export_unless_private(sym_id, var_node.visibility);
             if (!var_node.is_mutable) {
                 this.record_const_value(this.resolver.get_symbol(sym_id).def, var_node);
             }
@@ -459,11 +476,9 @@ type struct NameResolver {
             DeclKind::Function(fn_node) => {
                 const fn_node_decl: DeclarationNode* = node;
                 const sym_id: SymbolID = this.resolver.declare_function(
-                    fn_node.name, fn_node_decl.span, fn_node.is_public);
+                    fn_node.name, fn_node_decl.span, NameResolver::symbol_visibility(fn_node.visibility));
                 this.stamp_function_def(fn_node_decl, sym_id);
-                if (fn_node.is_public) {
-                    this.resolver.export_symbol(sym_id);
-                }
+                this.export_unless_private(sym_id, fn_node.visibility);
             }
             DeclKind::Variable(var_node) => { this.forward_declare_var(decl, var_node); }
             DeclKind::Extern(extern_node) => {
@@ -495,7 +510,7 @@ type struct NameResolver {
                         const fn_node_decl: DeclarationNode* = extern_node.functions[j];
                         const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
                         const fn_sym: SymbolID = this.resolver.declare_function(
-                            fn_node.name, fn_node_decl.span, true);
+                            fn_node.name, fn_node_decl.span, SymbolVisibility::Public);
                         this.stamp_function_def(fn_node_decl, fn_sym);
                         this.resolver.export_symbol(fn_sym);
                     }
@@ -506,11 +521,9 @@ type struct NameResolver {
                         const fn_node_decl: DeclarationNode* = extern_node.functions[j];
                         const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
                         const sym_id: SymbolID = this.resolver.declare_function(
-                            fn_node.name, fn_node_decl.span, fn_node.is_public);
+                            fn_node.name, fn_node_decl.span, NameResolver::symbol_visibility(fn_node.visibility));
                         this.stamp_function_def(fn_node_decl, sym_id);
-                        if (fn_node.is_public) {
-                            this.resolver.export_symbol(sym_id);
-                        }
+                        this.export_unless_private(sym_id, fn_node.visibility);
                     }
                 }
             }
@@ -539,10 +552,10 @@ type struct NameResolver {
             }
             DeclKind::Trait(trait_node) => {
                 const sym_id: SymbolID = this.resolver.declare_type(
-                    trait_node.name, decl.span, trait_node.is_public);
+                    trait_node.name, decl.span, NameResolver::symbol_visibility(trait_node.visibility));
                 trait_node.sym_id = sym_id;
                 trait_node.def = this.type_def_of(sym_id);
-                if (trait_node.is_public) { this.resolver.export_symbol(sym_id); }
+                this.export_unless_private(sym_id, trait_node.visibility);
                 // Registered here, before any module's names are resolved, so
                 // a projection written in any of them can ask which
                 // associated types the trait declares.
@@ -551,11 +564,9 @@ type struct NameResolver {
             DeclKind::Enum(enum_node) => {
                 if (!enum_node.binding_namespace.is_valid()) {
                     const sym_id: SymbolID = this.resolver.declare_type(
-                        enum_node.name, decl.span, enum_node.is_public);
+                        enum_node.name, decl.span, NameResolver::symbol_visibility(enum_node.visibility));
                     enum_node.def = this.type_def_of(sym_id);
-                    if (enum_node.is_public) {
-                        this.resolver.export_symbol(sym_id);
-                    }
+                    this.export_unless_private(sym_id, enum_node.visibility);
                 } else {
                     enum_node.def = this.type_def_of(this.declare_c_imported(
                         enum_node.binding_namespace, enum_node.name, decl.span));
@@ -576,11 +587,9 @@ type struct NameResolver {
                     // otherwise is the declaration index - two lanes with
                     // two answers about one name.
                     const sym_id: SymbolID = this.resolver.declare_type(
-                        struct_node.name, decl.span, struct_node.is_public);
+                        struct_node.name, decl.span, NameResolver::symbol_visibility(struct_node.visibility));
                     struct_node.def = this.type_def_of(sym_id);
-                    if (struct_node.is_public) {
-                        this.resolver.export_symbol(sym_id);
-                    }
+                    this.export_unless_private(sym_id, struct_node.visibility);
                 } else {
                     struct_node.def = this.type_def_of(this.declare_c_imported(
                         struct_node.binding_namespace, struct_node.name, decl.span));
@@ -590,11 +599,9 @@ type struct NameResolver {
                 // Same binding_namespace rule as structs (see above).
                 if (!union_node.binding_namespace.is_valid()) {
                     const sym_id: SymbolID = this.resolver.declare_type(
-                        union_node.name, decl.span, union_node.is_public);
+                        union_node.name, decl.span, NameResolver::symbol_visibility(union_node.visibility));
                     union_node.def = this.type_def_of(sym_id);
-                    if (union_node.is_public) {
-                        this.resolver.export_symbol(sym_id);
-                    }
+                    this.export_unless_private(sym_id, union_node.visibility);
                 } else {
                     union_node.def = this.type_def_of(this.declare_c_imported(
                         union_node.binding_namespace, union_node.name, decl.span));
@@ -604,9 +611,9 @@ type struct NameResolver {
                 this.ctx.note_alias_decl(decl);
                 if (!alias_node.binding_namespace.is_valid()) {
                     const sym_id: SymbolID = this.resolver.declare_type(
-                        alias_node.alias_name, decl.span, alias_node.is_public);
+                        alias_node.alias_name, decl.span, NameResolver::symbol_visibility(alias_node.visibility));
                     alias_node.def = this.type_def_of(sym_id);
-                    if (alias_node.is_public) { this.resolver.export_symbol(sym_id); }
+                    this.export_unless_private(sym_id, alias_node.visibility);
                 } else {
                     alias_node.def = this.type_def_of(this.declare_c_imported(
                         alias_node.binding_namespace, alias_node.alias_name, decl.span));
@@ -1330,8 +1337,8 @@ type struct NameResolver {
             const reach: boolean = owner_path.equals(use_module)
                 || this.ctx.decl_index.is_prelude_ns(owner_path)
                 || this.ctx.module_graph.imports(use_module, owner_path);
-            const is_public: boolean = this.resolver.exports_named(owner_path, name).length > 0;
-            if (!reach || !is_public) {
+            const offered: boolean = this.resolver.exports_named(owner_path, name).length > 0;
+            if (!reach || !offered) {
                 mut d: Diagnostic = Diagnostic::error(
                     ErrorCode::E0240_NAMESPACE_NOT_REACHABLE,
                     fmt::format("`%s` is not reachable from this module", written));
@@ -1341,14 +1348,19 @@ type struct NameResolver {
                 // write - an aggregate that re-exports the declarer is a
                 // shorter, equally correct import.
                 d = d.with_note(fmt::format("`%s` is declared in `%s`", written, owner));
-                if (is_public) {
+                if (offered) {
                     d = d.with_note(fmt::format("add `import %s;` to bring it into scope",
                         this.reaching_import_for(owner_path)));
                 } else {
                     // A private declaration is outside its module's export
-                    // set, so no import reaches it and no re-export widens it.
-                    d = d.with_note(fmt::format(
-                        "`%s` is `private`, so no import makes it reachable", written));
+                    // set, and an internal one is offered to its own package
+                    // alone, so no import reaches it and no re-export widens
+                    // it.
+                    const hidden: SymbolID = this.hidden_in(owner_path, name, Namespace::Type);
+                    const is_internal: boolean = hidden.is_valid()
+                        && this.resolver.get_symbol(hidden).visibility == SymbolVisibility::Internal;
+                    d = d.with_note(fmt::format("`%s` is %s, so no import makes it reachable", written,
+                        if (is_internal) { "`internal` to another package" } else { "`private`" }));
                 }
                 this.ctx.emit_diagnostic(d);
                 return true;
@@ -1463,30 +1475,42 @@ type struct NameResolver {
             this.ctx.emit_diagnostic(d);
             return ResSlot::Answered(Res::Err);
         }
-        // Offered by nothing, and declared by the head as `private`: the path
-        // names a declaration the writer may not see.  Visibility is checked
-        // where the candidate is proposed, and this walk is where a spelled-out
-        // path proposes one, so the refusal is reported here rather than left
-        // as a name that appears not to exist - or, worse, re-derived by a
-        // later stage from the spelling, which is registered under exactly
-        // this name and would answer it.
-        const hidden: SymbolID = this.private_in(head.found, leaf_sym, Namespace::Type);
+        // Offered by nothing, and declared by the head as `private`, or as
+        // `internal` in another package: the path names a declaration the
+        // writer may not see.  Visibility is checked where the candidate is
+        // proposed, and this walk is where a spelled-out path proposes one,
+        // so the refusal is reported here rather than left as a name that
+        // appears not to exist - or, worse, re-derived by a later stage from
+        // the spelling, which is registered under exactly this name and
+        // would answer it.
+        const hidden: SymbolID = this.hidden_in(head.found, leaf_sym, Namespace::Type);
         if (!hidden.is_valid()) { return ResSlot::Pending; }
         const hs: Symbol = this.resolver.get_symbol(hidden);
         const owner: string = this.resolver.intern_table.shown(head.found.decl_name());
+        const is_internal: boolean = hs.visibility == SymbolVisibility::Internal;
         if (hs.kind == SymbolKind::Type || hs.kind == SymbolKind::TypeAlias) {
             mut d: Diagnostic = Diagnostic::error(
                 ErrorCode::E0503_PRIVATE_SYMBOL_ACCESS,
-                fmt::format("type `%s` is private to module `%s`", leaf, owner));
+                if (is_internal) {
+                    fmt::format("type `%s` is internal to the package of module `%s`", leaf, owner)
+                } else {
+                    fmt::format("type `%s` is private to module `%s`", leaf, owner)
+                });
             d = d.at_with_label(span,
-                fmt::format("`%s` cannot be named outside its module `%s`", leaf, owner));
+                if (is_internal) {
+                    fmt::format("`%s` cannot be named outside its package", leaf)
+                } else {
+                    fmt::format("`%s` cannot be named outside its module `%s`", leaf, owner)
+                });
             this.ctx.emit_diagnostic(d);
         } else {
             mut d: Diagnostic = Diagnostic::error(
                 ErrorCode::E0353_PRIVATE_ACCESS,
-                fmt::format("`%s::%s` is private and cannot be named from `%s`",
-                    owner, leaf, this.resolver.intern_table.shown(use_module.decl_name())));
-            d = d.at_with_label(span, "private declaration named by this path");
+                fmt::format("`%s::%s` is %s and cannot be named from `%s`",
+                    owner, leaf, if (is_internal) { "internal to its package" } else { "private" },
+                    this.resolver.intern_table.shown(use_module.decl_name())));
+            d = d.at_with_label(span,
+                if (is_internal) { "internal declaration named by this path" } else { "private declaration named by this path" });
             this.ctx.emit_diagnostic(d);
         }
         return ResSlot::Answered(Res::Err);
@@ -1697,7 +1721,7 @@ type struct NameResolver {
             // refused as private (E0353) where visibility is enforced
             // rather than reported as a name that does not exist.
             if (offered == 0) {
-                const hidden: SymbolID = this.private_in(found, node.member_name, Namespace::Value);
+                const hidden: SymbolID = this.hidden_in(found, node.member_name, Namespace::Value);
                 if (hidden.is_valid()) { node.set_member_def(this.resolver.get_symbol(hidden).def); }
             }
             node.set_scope_res(Res::Def(owner));
@@ -2548,7 +2572,7 @@ type struct NameResolver {
                 return held;
             }
         }
-        return this.resolver.declare_variable(name, span, false, false);
+        return this.resolver.declare_variable(name, span, false, SymbolVisibility::Private);
     }
 
     /// Visit block contents without creating a new scope (caller manages scope).
@@ -2674,10 +2698,10 @@ type struct NameResolver {
         return out;
     }
 
-    /// The private declaration module `m` holds under `name` in the
-    /// namespace `ns`, or an invalid id.
-    private_in(&this, m: ModulePath, name: SymbolStr, ns: Namespace) -> SymbolID {
-        const all: [SymbolID] = this.resolver.private_declarations(m, name);
+    /// The declaration module `m` holds under `name` in the namespace `ns`
+    /// that the module being resolved may not name, or an invalid id.
+    hidden_in(&this, m: ModulePath, name: SymbolStr, ns: Namespace) -> SymbolID {
+        const all: [SymbolID] = this.resolver.hidden_declarations(m, name);
         for (mut i: i64 = 0; i < all.length; i++) {
             if (ns.accepts(this.resolver.get_symbol(all[i]).kind)) { return all[i]; }
         }
@@ -2708,7 +2732,7 @@ type struct NameResolver {
         const own: [SymbolID] = this.resolver.get_exports(m);
         for (mut i: i64 = 0; i < own.length; i++) {
             const sym: Symbol = this.resolver.get_symbol(own[i]);
-            if (sym.visibility.is_public()) {
+            if (this.resolver.offered_here(&sym)) {
                 out.push(this.resolver.intern_table.resolve(sym.name));
             }
         }
@@ -2717,7 +2741,7 @@ type struct NameResolver {
             const rx_exports: [SymbolID] = this.resolver.get_exports(rx_all[rx]);
             for (mut re: i64 = 0; re < rx_exports.length; re++) {
                 const sym: Symbol = this.resolver.get_symbol(rx_exports[re]);
-                if (sym.visibility.is_public()) {
+                if (this.resolver.offered_here(&sym)) {
                     out.push(this.resolver.intern_table.resolve(sym.name));
                 }
             }
@@ -2881,7 +2905,7 @@ type struct NameResolver {
             // export the same bare name, the later import takes priority.
             for (mut i: i64 = 0; i < exports.length; i++) {
                 const export_sym: Symbol = this.resolver.get_symbol(exports[i]);
-                if (export_sym.visibility.is_public()) {
+                if (this.resolver.offered_here(&export_sym)) {
                     const id: SymbolID = this.resolver.alloc_symbol_id();
                     const import_sym: Symbol = Symbol::import_sym(
                         id, export_sym.name, this.resolver.current_scope,
@@ -2905,7 +2929,7 @@ type struct NameResolver {
                 const rx_exports: [SymbolID] = this.resolver.get_exports(rx_all[rx]);
                 for (mut re: i64 = 0; re < rx_exports.length; re++) {
                     const rx_sym: Symbol = this.resolver.get_symbol(rx_exports[re]);
-                    if (!rx_sym.visibility.is_public()) { continue; }
+                    if (!this.resolver.offered_here(&rx_sym)) { continue; }
                     // An export was declared in a module - the one the
                     // resolver stood in when it exported it - so the binding
                     // names the module that declared it.
@@ -3002,8 +3026,16 @@ type struct NameResolver {
                         // and nothing else of `M`; `export M::{ printf as
                         // print }` offers `print`, naming the declaration
                         // `printf` names.
+                        // An export keeps the declaration's reach: an
+                        // internal one re-exported stays its package's.
                         const offers_alias: boolean = node.is_export;
-                        if (offers_alias) { import_sym.visibility = SymbolVisibility::Public; }
+                        if (offers_alias) {
+                            import_sym.visibility = if (osym.visibility == SymbolVisibility::Internal) {
+                                SymbolVisibility::Internal
+                            } else {
+                                SymbolVisibility::Public
+                            };
+                        }
                         // A name an earlier explicit import already brought in,
                         // in this declaration's namespace, binds nothing and is
                         // refused here: the first import stays the name's.
@@ -3020,29 +3052,33 @@ type struct NameResolver {
                         if (ns == Namespace::Type) { in_type = now; } else { in_value = now; }
                     }
                 } else if (!node.is_export
-                           && this.resolver.private_declarations(imported, name).length > 0) {
-                    // The module declares the name and marks it `private`.
-                    // Visibility is a gate at the point a candidate is
-                    // proposed, and the import is where this one is: binding
-                    // nothing here in silence would leave the use site to
-                    // report "no such name" for a name that exists, and
-                    // binding it would make `private` advisory.  An `export`
-                    // naming a private declaration is E0241, reported by the
-                    // export check once the graph is whole.
+                           && this.resolver.hidden_declarations(imported, name).length > 0) {
+                    // The module declares the name and marks it `private`,
+                    // or `internal` in another package.  Visibility is a
+                    // gate at the point a candidate is proposed, and the
+                    // import is where this one is: binding nothing here in
+                    // silence would leave the use site to report "no such
+                    // name" for a name that exists, and binding it would make
+                    // the modifier advisory.  An `export` naming a private
+                    // declaration is E0241, reported by the export check once
+                    // the graph is whole.
                     const name_str: string = this.resolver.intern_table.resolve(name);
+                    const is_internal: boolean = this.resolver.get_symbol(
+                        this.resolver.hidden_declarations(imported, name)[0]).visibility == SymbolVisibility::Internal;
                     mut d: Diagnostic = Diagnostic::error(
                         ErrorCode::E0353_PRIVATE_ACCESS,
-                        fmt::format("`%s::%s` is private and cannot be imported into `%s`",
-                            resolved_module, name_str,
+                        fmt::format("`%s::%s` is %s and cannot be imported into `%s`",
+                            resolved_module, name_str, if (is_internal) { "internal to its package" } else { "private" },
                             if (this.ctx.has_namespace()) { this.ctx.namespace_display() } else { this.ctx.source_file }));
-                    d = d.at_with_label(decl.span, "private declaration named by this import");
+                    d = d.at_with_label(decl.span,
+                        if (is_internal) { "internal declaration named by this import" } else { "private declaration named by this import" });
                     this.ctx.emit_diagnostic(d);
                     // The name is bound to nothing, HERE: a use of it is then
                     // `Err` with this as its report, not a second diagnostic
                     // saying the name does not exist.
                     this.resolver.declare_refused(bind_as, decl.span);
                 } else if (node.is_export
-                           && this.resolver.private_declarations(imported, name).length > 0) {
+                           && this.resolver.hidden_declarations(imported, name).length > 0) {
                     // An `export` naming a private declaration is E0241,
                     // reported by the export check once the graph is whole
                     // from the entry recorded here; it is not a name the
@@ -3083,7 +3119,7 @@ type struct NameResolver {
                     const sub_exports: [SymbolID] = this.resolver.get_exports(sub_module);
                     for (mut j: i64 = 0; j < sub_exports.length; j++) {
                         const sub_export_sym: Symbol = this.resolver.get_symbol(sub_exports[j]);
-                        if (sub_export_sym.visibility.is_public()) {
+                        if (this.resolver.offered_here(&sub_export_sym)) {
                             const id: SymbolID = this.resolver.alloc_symbol_id();
                             const import_sym: Symbol = Symbol::import_sym(
                                 id, sub_export_sym.name, this.resolver.current_scope,
@@ -3363,7 +3399,7 @@ implement trait Walk for struct NameResolver {
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             const method_decl: DeclarationNode* = node.methods[i];
             const method: FunctionDecl* = DeclarationNode::fn_of(method_decl);
-            this.resolver.declare_method(method.name, method_decl.span, true,
+            this.resolver.declare_method(method.name, method_decl.span, SymbolVisibility::Public,
                 this.define_method(this.this_trait, method_decl, method_decl));
         }
 
@@ -3462,10 +3498,9 @@ implement trait Walk for struct NameResolver {
             const method_decl: DeclarationNode* = node.methods[i];
             const method: MethodDecl* = DeclarationNode::method_of(method_decl);
             if (method.func != null) {
-                const is_public: boolean =
-                    method.visibility == Visibility::Public;
                 this.resolver.declare_method(
-                    DeclarationNode::fn_of(method.func).name, method.func.span, is_public,
+                    DeclarationNode::fn_of(method.func).name, method.func.span,
+                    NameResolver::symbol_visibility(method.visibility),
                     this.define_method(method_owner, method.func, method_decl));
             }
             this.walk_decl(method_decl);
@@ -3496,7 +3531,7 @@ implement trait Walk for struct NameResolver {
                     d.span);
             }
             const sym_id: SymbolID = this.resolver.declare_variable(node.name, d.span, node.is_mutable,
-                                                          false);
+                                                          SymbolVisibility::Private);
             // Record the declaration span so downstream passes (TypeResolution,
             // Sema) can map the declaration's span -> SymbolID for type write-back.
             this.resolver.record_resolution(d.span, sym_id);
@@ -3529,7 +3564,7 @@ implement trait Walk for struct NameResolver {
                     b.name_span);
             }
             const sym_id: SymbolID = this.resolver.declare_variable(
-                b.local_name, b.name_span, b.is_mutable, false);
+                b.local_name, b.name_span, b.is_mutable, SymbolVisibility::Private);
             this.resolver.record_resolution(b.name_span, sym_id);
             node.bindings[i].sym_id = sym_id;
         }
