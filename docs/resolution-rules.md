@@ -149,6 +149,14 @@ yet is recorded with the change that builds it, not here.
      line.  A triple with no target is reported once, not once per
      module.  (Jake)
 
+555. **A module's file is named as its directory spells it,** not by
+     the spelling that found it: on a filesystem that ignores case,
+     `public module Dumper;` finding `dumper.cryo` makes the module's
+     spans, panic locations and log lines name `dumper.cryo`.  Which
+     files are found does not change.  (Jake)
+
+556. **`cryo raw` stays as it is.**  (Jake)
+
 ### 2026-10-21
 
 501. **The class-removal plan is deleted now,** its slices all built and its

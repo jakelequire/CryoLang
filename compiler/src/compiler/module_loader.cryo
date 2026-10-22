@@ -36,6 +36,7 @@ import std::collections::{ hashmap, pair };
 import std::collections::string;
 import std::collections::string::{ String };
 import std::collections::str;
+import std::collections::str::{ Str };
 import std::core::option;
 import std::core::option::{ Option };
 import std::ffi::libc;
@@ -1014,29 +1015,89 @@ public:
 
     // Internal: Path Resolution
 
-    /// Search a single directory for a module with case variations.
+    /// Search a single directory for a module with case variations.  The
+    /// path found is spelled as the directory entries are, whichever
+    /// variation found it: a filesystem that ignores case answers the
+    /// first variation, and the path's spelling becomes the file name of
+    /// every span in the module.
     search_location(&this, base_dir: string, fs_path: string) -> string {
         // 1. Directory module: base_dir/fs_path/_module.cryo
-        const dir_module: string = fmt::format("%s/%s/_module.cryo", base_dir, fs_path);
-        if (metadata::exists(Path::from(dir_module))) { return dir_module; }
+        const dir_module: string = fmt::format("%s/_module.cryo", fs_path);
+        if (ModuleLoader::exists_under(base_dir, dir_module)) {
+            return ModuleLoader::spelled_as_on_disk(base_dir, dir_module);
+        }
 
         // 2. Exact case: base_dir/fs_path.cryo
-        const exact: string = fmt::format("%s/%s.cryo", base_dir, fs_path);
-        if (metadata::exists(Path::from(exact))) { return exact; }
+        const exact: string = fmt::format("%s.cryo", fs_path);
+        if (ModuleLoader::exists_under(base_dir, exact)) {
+            return ModuleLoader::spelled_as_on_disk(base_dir, exact);
+        }
 
         // 3. Lowercase: base_dir/lowercase.cryo
-        const lower: string = fmt::format("%s/%s.cryo", base_dir, fs_path.to_ascii_lower());
-        if (metadata::exists(Path::from(lower))) { return lower; }
+        const lower: string = fmt::format("%s.cryo", fs_path.to_ascii_lower());
+        if (ModuleLoader::exists_under(base_dir, lower)) {
+            return ModuleLoader::spelled_as_on_disk(base_dir, lower);
+        }
 
         // 4. Snake case: base_dir/snake_case.cryo
-        const snake: string = fmt::format("%s/%s.cryo", base_dir, ModuleLoader::to_snake_case(fs_path));
-        if (metadata::exists(Path::from(snake))) { return snake; }
+        const snake: string = fmt::format("%s.cryo", ModuleLoader::to_snake_case(fs_path));
+        if (ModuleLoader::exists_under(base_dir, snake)) {
+            return ModuleLoader::spelled_as_on_disk(base_dir, snake);
+        }
 
         // 5. Lowercase directory module
-        const lower_dir: string = fmt::format("%s/%s/_module.cryo", base_dir, fs_path.to_ascii_lower());
-        if (metadata::exists(Path::from(lower_dir))) { return lower_dir; }
+        const lower_dir: string = fmt::format("%s/_module.cryo", fs_path.to_ascii_lower());
+        if (ModuleLoader::exists_under(base_dir, lower_dir)) {
+            return ModuleLoader::spelled_as_on_disk(base_dir, lower_dir);
+        }
 
         return "";
+    }
+
+    static exists_under(base_dir: string, relative: string) -> boolean {
+        return metadata::exists(Path::from(fmt::format("%s/%s", base_dir, relative)));
+    }
+
+    /// `base_dir/relative`, each component of `relative` replaced by the
+    /// entry of its directory that it names.
+    static spelled_as_on_disk(base_dir: string, relative: string) -> string {
+        mut spelled: String = String::new();
+        const separator: Str = Str::new("/");
+        for (component in Str::new(relative).split(&separator)) {
+            const directory: string = if (spelled.is_empty()) { base_dir }
+                else { fmt::format("%s/%s", base_dir, spelled.as_cstr() as string) };
+            const entry: String = ModuleLoader::entry_named(directory, component);
+            if (!spelled.is_empty()) { spelled.push("/"); }
+            spelled.push(entry.as_str());
+        }
+        return fmt::format("%s/%s", base_dir, spelled.as_cstr() as string);
+    }
+
+    /// The entry of `directory` that `name` names: the one spelled exactly
+    /// so, else the first equal to it ignoring ASCII case, else `name`.
+    static entry_named(directory: string, name: Str) -> String {
+        mut entries: ReadDir = match (dir::read_dir(Path::from(directory))) {
+            Result::Ok(r)  => { r }
+            Result::Err(_) => { return String::from_str(name); }
+        };
+        const folded: String = name.to_ascii_lowercase();
+        mut found: Option<String> = Option::None;
+        loop {
+            match (entries.next()) {
+                Option::Some(entry) => {
+                    const entry_name: Str = entry.name();
+                    if (entry_name == name) { return String::from_str(name); }
+                    if (found.is_none() && entry_name.to_ascii_lowercase().as_str() == folded.as_str()) {
+                        found = Option::Some(String::from_str(entry_name));
+                    }
+                }
+                Option::None => { break; }
+            }
+        }
+        match (found) {
+            Option::Some(spelling) => { return spelling; }
+            Option::None           => { return String::from_str(name); }
+        }
     }
 
 

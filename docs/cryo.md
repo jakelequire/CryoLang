@@ -2747,6 +2747,8 @@ public module collections::hashset;
 
 `public module` is **structure only**: it declares that a submodule exists, drives discovery, and suppresses a build-order edge. It does not bring the child's name or the child's symbols into any importer's scope. Importing `std::collections` therefore does not let you name `Array` — reaching a submodule takes an `import` of that submodule, or an `export` in the aggregator (see [section 13.5](#135-re-exports)).
 
+A submodule's file is found under its name as written, in lowercase, or in snake case: `public module NodeLocator;` finds `node_locator.cryo`. Whichever spelling found it, the file is named as its directory spells it - in diagnostics, panic locations and `location()` - so a filesystem that ignores case does not change the name a program reports.
+
 ### 13.3 Imports
 
 ```cryo
