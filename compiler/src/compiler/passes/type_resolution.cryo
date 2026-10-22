@@ -38,7 +38,7 @@ import compiler::types::{
 };
 import compiler::resolver::{ intern_table, symbol_str, resolver };
 import compiler::resolver::res;
-import compiler::resolver::res::{ DefId, FamilyOwner, Res, ResBase, ResSlot };
+import compiler::resolver::res::{ DeclVisibility, DefId, FamilyOwner, Res, ResBase, ResSlot };
 import compiler::decl_index::{ OverloadId };
 import std::core::mem;
 import utils::log::{ Log, LogArea, LogLevel };
@@ -1340,6 +1340,177 @@ type struct TypeResolutionRunner {
 // TypeResolutionPasses: static entry points for pass dispatch + cross-module API
 
 type struct TypeResolutionPasses {
+
+    // -- A private type in a public signature (E0506) --
+
+    /// Refuse a private type named where another module can see it: in a
+    /// public item's signature, or in a public member of a public type.
+    /// A program in another module could otherwise hold a value of a type
+    /// it cannot name, and call its methods.  Judged here, where the
+    /// signature is written, because that is the one place its author can
+    /// fix it; `-> implement Trait` keeps a concrete type hidden.  A trait
+    /// implementation's methods take the trait's signature and are judged
+    /// at the trait.
+    static refuse_private_in_signatures(stmt: DeclarationNode*, ctx: CompilationContext*) -> void {
+        match (stmt.kind) {
+            DeclKind::Function(func) => {
+                if (func.is_public) { TypeResolutionPasses::refuse_private_in_function(ctx, stmt, func.name); }
+            }
+            DeclKind::Struct(node) => {
+                if (node.is_public) {
+                    TypeResolutionPasses::refuse_private_in_fields(ctx, &node.fields);
+                    TypeResolutionPasses::refuse_private_in_methods(ctx, &node.methods);
+                }
+            }
+            DeclKind::Union(node) => {
+                if (node.is_public) {
+                    TypeResolutionPasses::refuse_private_in_fields(ctx, &node.fields);
+                    TypeResolutionPasses::refuse_private_in_methods(ctx, &node.methods);
+                }
+            }
+            DeclKind::Enum(node) => {
+                if (node.is_public) {
+                    for (mut i: i64 = 0; i < node.variants.length; i++) {
+                        const v: EnumVariant* = DeclarationNode::variant_of(node.variants[i]);
+                        if (v == null) { continue; }
+                        for (mut k: i64 = 0; k < v.associated_types.length; k++) {
+                            TypeResolutionPasses::refuse_private_in_annotation(ctx, v.associated_types[k], node.name);
+                        }
+                    }
+                }
+            }
+            DeclKind::TypeAlias(node) => {
+                if (node.is_public) { TypeResolutionPasses::refuse_private_in_annotation(ctx, node.target_annotation, node.alias_name); }
+            }
+            DeclKind::Variable(node) => {
+                if (node.is_global && node.visibility == Visibility::Public) {
+                    TypeResolutionPasses::refuse_private_in_annotation(ctx, node.type_annotation, node.name);
+                }
+            }
+            DeclKind::Trait(node) => {
+                if (node.is_public) {
+                    for (mut i: i64 = 0; i < node.methods.length; i++) {
+                        const m: FunctionDecl* = DeclarationNode::fn_of(node.methods[i]);
+                        if (m != null) { TypeResolutionPasses::refuse_private_in_function(ctx, node.methods[i], m.name); }
+                    }
+                }
+            }
+            DeclKind::Impl(node) => {
+                if (!node.trait_def.is_valid()
+                        && ctx.defs.visibility_of(node.res.require("signature visibility: impl head").def_id())
+                            == DeclVisibility::Public) {
+                    TypeResolutionPasses::refuse_private_in_methods(ctx, &node.methods);
+                }
+            }
+            DeclKind::Destructure(_) | DeclKind::Extern(_) | DeclKind::Field(_)
+            | DeclKind::GenericParam(_) | DeclKind::Import(_) | DeclKind::Intrinsic(_)
+            | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Method(_) => { }
+        }
+    }
+
+    static refuse_private_in_fields(ctx: CompilationContext*, fields: &[DeclarationNode*]) -> void {
+        for (mut i: i64 = 0; i < fields.length; i++) {
+            const f: FieldDecl* = DeclarationNode::field_of(fields[i]);
+            if (f == null || f.visibility != Visibility::Public) { continue; }
+            TypeResolutionPasses::refuse_private_in_annotation(ctx, f.type_annotation, f.name);
+        }
+    }
+
+    static refuse_private_in_methods(ctx: CompilationContext*, methods: &[DeclarationNode*]) -> void {
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodDecl* = DeclarationNode::method_of(methods[i]);
+            if (m == null || m.visibility != Visibility::Public || m.func == null) { continue; }
+            TypeResolutionPasses::refuse_private_in_function(ctx, m.func, DeclarationNode::fn_of(m.func).name);
+        }
+    }
+
+    /// A function's parameters, its return and the traits its bounds name.
+    static refuse_private_in_function(ctx: CompilationContext*, func_decl: DeclarationNode*, item: SymbolStr) -> void {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
+        if (func == null) { return; }
+        for (mut p: i64 = 0; p < func.parameters.length; p++) {
+            const param: VarDecl* = DeclarationNode::var_of(func.parameters[p]);
+            if (param != null) { TypeResolutionPasses::refuse_private_in_annotation(ctx, param.type_annotation, item); }
+        }
+        TypeResolutionPasses::refuse_private_in_annotation(ctx, func.return_type_annotation, item);
+        for (mut b: i64 = 0; b < func.trait_bounds.length; b++) {
+            for (mut t: i64 = 0; t < func.trait_bounds[b].trait_refs.length; t++) {
+                const r: &TraitRef = &func.trait_bounds[b].trait_refs[t];
+                TypeResolutionPasses::refuse_private_named(ctx, r.resolved, r.span, item);
+                for (mut a: i64 = 0; a < r.type_args.length; a++) {
+                    TypeResolutionPasses::refuse_private_in_annotation(ctx, r.type_args[a], item);
+                }
+            }
+        }
+    }
+
+    /// Each type `ann` names, through every type it is built from.  An
+    /// `implement Trait` names only its traits: the concrete type it stands
+    /// for is the one a signature may hide.
+    static refuse_private_in_annotation(ctx: CompilationContext*, ann: TypeAnnotation*, item: SymbolStr) -> void {
+        if (ann == null) { return; }
+        match (*ann) {
+            TypeAnnotation::Named(n) => {
+                if (n != null) {
+                    const d: DefId = match (n.res) {
+                        ResSlot::Answered(r) => { r.def_id() }
+                        _                    => { DefId::invalid() }
+                    };
+                    TypeResolutionPasses::refuse_private_named(ctx, d, n.span, item);
+                }
+            }
+            TypeAnnotation::Pointer(p)   => { if (p != null) { TypeResolutionPasses::refuse_private_in_annotation(ctx, p.inner, item); } }
+            TypeAnnotation::Reference(r) => { if (r != null) { TypeResolutionPasses::refuse_private_in_annotation(ctx, r.inner, item); } }
+            TypeAnnotation::Object(o)    => { if (o != null) { TypeResolutionPasses::refuse_private_in_annotation(ctx, o.trait_annotation, item); } }
+            TypeAnnotation::Array(a)     => { if (a != null) { TypeResolutionPasses::refuse_private_in_annotation(ctx, a.element, item); } }
+            TypeAnnotation::Function(f) => {
+                if (f != null) {
+                    for (mut i: i64 = 0; i < f.parameters.length; i++) {
+                        TypeResolutionPasses::refuse_private_in_annotation(ctx, f.parameters[i], item);
+                    }
+                    TypeResolutionPasses::refuse_private_in_annotation(ctx, f.return_type, item);
+                }
+            }
+            TypeAnnotation::Tuple(t) => {
+                if (t != null) {
+                    for (mut i: i64 = 0; i < t.elements.length; i++) {
+                        TypeResolutionPasses::refuse_private_in_annotation(ctx, t.elements[i], item);
+                    }
+                }
+            }
+            TypeAnnotation::Generic(g) => {
+                if (g != null) {
+                    TypeResolutionPasses::refuse_private_in_annotation(ctx, g.base, item);
+                    for (mut i: i64 = 0; i < g.args.length; i++) {
+                        TypeResolutionPasses::refuse_private_in_annotation(ctx, g.args[i], item);
+                    }
+                }
+            }
+            TypeAnnotation::ImplTrait(it) => {
+                if (it != null) {
+                    for (mut i: i64 = 0; i < it.bounds.length; i++) {
+                        TypeResolutionPasses::refuse_private_in_annotation(ctx, it.bounds[i], item);
+                    }
+                }
+            }
+            TypeAnnotation::Projection(p) => { if (p != null) { TypeResolutionPasses::refuse_private_in_annotation(ctx, p.base, item); } }
+            _ => { }
+        }
+    }
+
+    /// E0506 when `d` is a private type or trait: one of the writer's own
+    /// module, since another module's is refused where it is named (E0503).
+    static refuse_private_named(ctx: CompilationContext*, d: DefId, span: SourceSpan, item: SymbolStr) -> void {
+        if (!d.is_valid() || ctx.defs.visibility_of(d) != DeclVisibility::Private) { return; }
+        const type_str: string = ctx.intern_table.shown(ctx.defs.leaf_of(d));
+        const item_str: string = ctx.resolve_str(item);
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0506_PRIVATE_TYPE_IN_PUBLIC_SIGNATURE,
+            fmt::format("`%s` is public, but its signature names the private type `%s`", item_str, type_str));
+        diag = diag.at_with_label(span, "private type in a signature other modules can see");
+        diag = diag.help(fmt::format("make `%s` public, make `%s` private, or hide the concrete type behind `-> implement Trait`",
+            type_str, item_str));
+        ctx.emit_diagnostic(diag);
+    }
 
     // Shared utility: generic parameter declarations -> [TypeRef]
 
@@ -3588,6 +3759,7 @@ type struct TypeResolutionPasses {
 
             // Register in DeclarationIndex (shared logic with Specialization).
             TypeResolutionPasses::register_decl_in_index(stmt, ctx, true);
+            TypeResolutionPasses::refuse_private_in_signatures(stmt, ctx);
 
             // Phase 4-specific: resolve and register top-level global variables
             const var_node: VarDecl* = DeclarationNode::var_of(stmt);

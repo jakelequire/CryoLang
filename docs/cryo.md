@@ -2834,6 +2834,8 @@ const n: i32 = Tag(4);                // Labels's function
 
 Top-level items are **public by default**; mark an item `private` to confine it to its own module. For top-level types (`struct` / `union` / `enum`, an alias and a trait), `private` is enforced across modules: naming a `private` type from another module - in a type annotation, a struct literal, a bound, or a function signature - is rejected with `E0503`. A `private` type remains fully usable within its own module. A `private` function, constant or global named from another module, by a path or an import, is `E0353`.
 
+A public signature may not name a `private` type (`E0506`): not a public function's parameters, return or bounds, nor a public type's public fields or methods, a public enum's payloads, a public alias's target, a public constant's type or a public trait's methods. A value of a private type therefore never reaches a module that cannot name it; to hide a concrete type, return `implement Trait`.
+
 A trait's methods have no visibility of their own: they are reachable wherever the trait is. A `private` trait's methods are refused outside its module (`E0353`) even when a public type implements it, so `p.hidden()` from another module is refused whatever `p`'s type is.
 
 This is the mechanism behind hiding iterator engines: a cursor struct can be `private` while its producer returns [`implement Iterator<...>`](#211-opaque-types-implement-trait), so callers consume the sequence through the trait and can never name the concrete type.

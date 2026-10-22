@@ -360,7 +360,8 @@ Everything in the standard library is public today, so its internals -
 v1.0.  Cryo stays public by default and nothing is linted; the library
 itself writes `public`, `private` or `internal` on every item, so each
 exposure is a decision.  Built: `private` holds on every member and item
-(rulings 562, 563).  The rest, in order:
+(rulings 562, 563), and a public signature may not name a private type
+(564).  The rest, in order:
 
 1. **The compiler's half.**
    - `internal`: visible to every module of the same package (one
@@ -374,10 +375,8 @@ exposure is a decision.  Built: `private` holds on every member and item
      ...): the compiler's table is built from the attributes, the parser
      stops building those calls by name, and the compiler's own imports
      of the builders go.  A generated call is never refused.
-   - A private type, or another package's internal one, in a public
-     signature refused at the declaration; `-> implement Trait` hides a
-     concrete type.  This answers "a private type reached by inference"
-     below.
+   - An `internal` type in a public signature refused at the
+     declaration, as a private one is.
 2. **Collections' `length` and `capacity` private**, behind `![inline]`
    accessors made inline first; the compiler's, the language server's
    and the tests' reads rewritten by a codemod.  Every `length()`
@@ -634,10 +633,5 @@ a cast to reach it.
 - **A module cycle's report.**  E0501 names the modules in a cycle; whether
   it prints the cycle as a path, in order, is open, and so is whether a
   cycle that crosses packages is E0501 too or an error of its own.
-- **A private type reached by inference.**  E0503 refuses a `private` type
-  where the source names it, but a value of one returned by a public
-  function and bound by inference crosses the module boundary and answers
-  method calls.  `tests/tests/projects/resolution_tripwire` pins the
-  behaviour as it is.  Whether that is refused, and where, is open.
 - **`std::Range`.**  Nothing re-exports `Range` at the root of `std`, so the
   path is refused today.  Whether `stdlib/lib.cryo` exports it there is open.

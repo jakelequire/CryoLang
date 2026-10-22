@@ -202,6 +202,16 @@ yet is recorded with the change that builds it, not here.
      when a public type implements it; a trait's methods carry no
      visibility of their own.  (Jake)
 
+564. **A public signature may not name a private type** (E0506), refused
+     where the signature is written: a public function's parameters,
+     return and bounds; a public type's public fields and methods; a
+     public enum's payloads, alias's target, constant's or global's type,
+     and trait's methods.  A value of a private type therefore never
+     reaches a module that cannot name it, by inference or otherwise;
+     `-> implement Trait` is how a function hides its concrete type.  A
+     trait implementation's methods take the trait's signature and are
+     judged at the trait.  (Jake; the code Delegated)
+
 ### 2026-10-21
 
 501. **The class-removal plan is deleted now,** its slices all built and its
