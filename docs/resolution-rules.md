@@ -212,6 +212,18 @@ yet is recorded with the change that builds it, not here.
      trait implementation's methods take the trait's signature and are
      judged at the trait.  (Jake; the code Delegated)
 
+565. **A public trait's implementation for a public type is a public
+     signature:** the trait's arguments in its head and the associated
+     types it binds may not name a private type (E0506, the same code).
+     The implementation is seen wherever both the trait and the type are,
+     and its methods hand out what those name.  A private trait or a
+     private type keeps it unrefused.  (Jake)
+
+566. **A destructure of a generic struct's instance reads the fields
+     where a field access does,** off the template for an instance not
+     yet minted, so it is accepted outside a generic body as inside one.
+     (Jake)
+
 ### 2026-10-21
 
 501. **The class-removal plan is deleted now,** its slices all built and its

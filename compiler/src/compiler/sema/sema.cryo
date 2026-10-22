@@ -1520,30 +1520,21 @@ type struct SemaVisitor {
                 }
             }
         }
-        if (this.symbolic.symbolic_defer_type(node.resolved_type)) {
-            this.register_destructure_locals_abstract(d, node);
-            return;
-        }
         if (!node.has_resolved_type()) { this.register_destructure_locals_void(node); return; }
-        const ty: Type* = this.arena.lookup(node.resolved_type);
-        if (ty == null) { this.register_destructure_locals_void(node); return; }
-
-        const empty_fields: [FieldInfo] = [];
-        mut fields_ptr: &[FieldInfo] = &empty_fields;
-        mut got_fields: boolean = false;
-        if (ty.kind == TypeKind::Struct) { fields_ptr = &ty.as_struct().fields; got_fields = true; }
-        if (!got_fields) {
-            const ty_name: string = this.arena.format_display(ty);
-            this.ctx.emit_error_at(ErrorCode::E0361_DESTRUCTURE_NON_STRUCT,
-                fmt::format("cannot destructure non-struct type '%s'", ty_name), d.span);
+        mut names: [SymbolStr] = [];
+        if (!this.member.field_names(node.resolved_type, &names)) {
+            // A generic body's type with no field list of its own (a type
+            // parameter, a projection) is checked in each specialization.
+            if (!this.symbolic.symbolic_defer_type(node.resolved_type)) {
+                this.ctx.emit_error_at(ErrorCode::E0361_DESTRUCTURE_NON_STRUCT,
+                    fmt::format("cannot destructure non-struct type '%s'",
+                        this.arena.resolve_display_name(node.resolved_type)), d.span);
+            }
             this.register_destructure_locals_void(node);
             return;
         }
-
-        mut names: [SymbolStr] = [];
-        for (mut k: i64 = 0; k < fields_ptr.length; k++) { names.push(fields_ptr[k].decl_name().spelling()); }
         const positions: [i64] = this.check_destructure_shape(d, node, &names,
-            this.arena.format_display(ty));
+            this.arena.resolve_display_name(node.resolved_type));
         for (mut i: i64 = 0; i < node.bindings.length; i++) {
             mut b: DestructureBinding = node.bindings[i];
             if (positions[i] < 0) {
@@ -1551,14 +1542,17 @@ type struct SemaVisitor {
                 continue;
             }
             // A destructure reads every field it binds, so a private one is
-            // refused outside its module as a `.field` read is.
-            const bound: FieldAnswer = this.member.field_answer(node.resolved_type, &fields_ptr[positions[i]], ty, positions[i]);
+            // refused outside its module as a `.field` read is.  Each field is
+            // typed as it is seen through the destructured type, so a binding
+            // in a generic body is selected on before monomorphization as
+            // `this.field` is; the template records it and every copy
+            // substitutes it.
+            const bound: FieldAnswer = this.member.field_of(node.resolved_type, b.source_field);
             this.member.enforce_field_visibility(&bound, b.source_field, b.span);
-            const field_type: TypeRef = fields_ptr[positions[i]].field_type;
-            b.resolved_type = field_type;
+            if (bound.ty.is_valid()) { b.resolved_type = bound.ty; }
             b.field_index = positions[i];
             node.bindings[i] = b;
-            this.scopes.declare(b.sym_id, field_type, b.is_mutable);
+            this.scopes.declare(b.sym_id, if (bound.ty.is_valid()) { bound.ty } else { this.arena.get_void() }, b.is_mutable);
         }
     }
 
@@ -1626,39 +1620,6 @@ type struct SemaVisitor {
             this.ctx.emit_diagnostic(diag);
         }
         return positions;
-    }
-
-    /// A destructure in a generic body whose type still names the body's
-    /// parameters (`const { inner }: PathBuf<A> = this;`): each binding is
-    /// typed as its field seen through that type, so a call on it is selected
-    /// before monomorphization as a call on `this.inner` is.  The shape is
-    /// checked here, against the fields the template declares - they are
-    /// every specialization's fields, in the same order - so a broken
-    /// destructure is refused whether or not anything instantiates the body.
-    /// A type with no field list on the generic body (a type parameter, a
-    /// projection) is not checked.  Each binding's type is recorded on the
-    /// template, which every copy substitutes.
-    register_destructure_locals_abstract(mut &this, d: DeclarationNode*, node: DestructureDecl*) -> void {
-        mut names: [SymbolStr] = [];
-        mut positions: [i64] = [];
-        if (node.has_resolved_type() && this.member.template_field_names(node.resolved_type, &names)) {
-            positions = this.check_destructure_shape(d, node, &names,
-                this.arena.resolve_display_name(node.resolved_type));
-        }
-        for (mut i: i64 = 0; i < node.bindings.length; i++) {
-            const b: DestructureBinding = node.bindings[i];
-            mut ty: TypeRef = TypeRef::invalid();
-            const refused: boolean = positions.length > i && positions[i] < 0;
-            if (node.has_resolved_type() && !refused) {
-                const bound: FieldAnswer = this.member.field_of(node.resolved_type, b.source_field);
-                this.member.enforce_field_visibility(&bound, b.source_field, b.span);
-                ty = bound.ty;
-            }
-            if (ty.is_valid()) { node.bindings[i].resolved_type = ty; }
-            if (positions.length > i) { node.bindings[i].field_index = positions[i]; }
-            if (!ty.is_valid()) { ty = this.arena.get_void(); }
-            this.scopes.declare(b.sym_id, ty, b.is_mutable);
-        }
     }
 
     register_destructure_locals_void(mut &this, node: DestructureDecl*) -> void {

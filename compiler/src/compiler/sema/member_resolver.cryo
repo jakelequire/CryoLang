@@ -579,20 +579,33 @@ type struct MemberResolver {
         return FieldAnswer::none();
     }
 
-    /// The declared fields of the struct a generic body's type
-    /// `recv` is an instantiation of - an instantiation not minted yet, or
-    /// the generic owner itself - in declaration order, which is their order
-    /// in every specialization.  False when `recv` names no such template (a
-    /// type parameter, a projection): it has no field list to read.
-    template_field_names(&this, recv: TypeRef, out: mut &[SymbolStr]) -> boolean {
-        mut t: Type* = this.arena.lookup(recv);
+    /// The names of the fields of the struct `recv` names, in declaration
+    /// order, read where `field_of` reads them: a struct's or a resolved
+    /// instantiation's off its arena type, an instantiation not minted yet
+    /// and a generic owner off the template's declaration, whose order is
+    /// every specialization's.  False when `recv` names no struct (a type
+    /// parameter, a projection, an enum): it has no field list to read.
+    field_names(&this, recv: TypeRef, out: mut &[SymbolStr]) -> boolean {
+        mut owner: TypeRef = recv;
+        mut t: Type* = this.arena.lookup(owner);
         if (t == null) { return false; }
-        mut tmpl_ref: TypeRef = recv;
         if (t.kind == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = t.as_instantiated();
-            if (inst.has_resolved_type()) { return false; }
-            tmpl_ref = inst.generic_base;
+            if (!inst.has_resolved_type()) { return this.template_field_names(inst.generic_base, out); }
+            owner = inst.resolved_type;
+            t = this.arena.lookup(owner);
+            if (t == null) { return false; }
         }
+        if (t.kind != TypeKind::Struct) { return false; }
+        const reg: GenericRegistry* = this.ctx.get_generic_registry();
+        if (reg != null && reg.is_template(owner)) { return this.template_field_names(owner, out); }
+        const st: StructType* = t.as_struct();
+        for (mut k: i64 = 0; k < st.fields.length; k++) { out.push(st.fields[k].decl_name().spelling()); }
+        return true;
+    }
+
+    /// The declared field names of the generic struct template `tmpl_ref`.
+    template_field_names(&this, tmpl_ref: TypeRef, out: mut &[SymbolStr]) -> boolean {
         const reg: GenericRegistry* = this.ctx.get_generic_registry();
         if (reg == null) { return false; }
         const tmpl: TemplateEntry* = reg.template_of_type(tmpl_ref);
