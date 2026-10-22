@@ -2087,6 +2087,23 @@ type struct CompilerInstance {
                     Option::None    => { multiproc = false; }
                 }
             }
+            // The out-of-process emitter builds its target machines in the
+            // workers, so a triple LLVM has no target for is refused here,
+            // once and before any IR is generated, as the in-process path
+            // refuses it at its first module.
+            if (multiproc) {
+                const mp_check_triple: string = CodegenPasses::effective_triple(ctx);
+                match (LTargetMachine::create_target_machine_with_opt(
+                        mp_check_triple, ctx.options.opt_level as i32)) {
+                    Result::Ok(machine) => {
+                        mut checked: LTargetMachine = machine;
+                        checked.dispose();
+                    }
+                    Result::Err(reason) => {
+                        CodegenPasses::report_missing_target(ctx, mp_check_triple, reason);
+                    }
+                }
+            }
             // In-flight cap for the threaded path: bounds live LLVM contexts so
             // the whole target's modules never sit in memory at once.  `serial`
             // mode (or a 1-thread build) caps at 1 -> flush every module
@@ -2105,7 +2122,6 @@ type struct CompilerInstance {
             // the whole loop, in topo order, keeps the linker's input order
             // identical regardless of the order objects finish emitting.
             mut cg_obj: [string] = [];
-            mut cg_failed: boolean = false;
             for (mut r: u32 = 0; r < n; r++) { cg_obj.push(""); }
 
             // Multi-process collection: parallel arrays of (bitcode, object)
@@ -2135,7 +2151,6 @@ type struct CompilerInstance {
                 // line per module, none of them true, printed ahead of the
                 // one error that is.
                 if (ctx.diagnostics.has_errors()) {
-                    cg_failed = true;
                     break;
                 }
                 const _mi: ModuleInfo* = &ctx.module_graph.modules[order[i]];
@@ -2194,10 +2209,12 @@ type struct CompilerInstance {
                 if (!ctx.artifacts.ir.is_valid()) {
                     // IR generation failed for this module.  The fresh context
                     // has no module to emit; reclaim it now.  An error this
-                    // module reported already names the failure; the line is
-                    // for a module that came back empty without one.
+                    // module reported already names the failure; a module that
+                    // came back empty without one is the compiler's own fault.
                     if (!ctx.diagnostics.has_errors()) {
-                        fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, i)}");
+                        ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                            fmt::format("generating the IR of module %s failed without reporting why",
+                                CompilerInstance::codegen_module_name(ctx, i)));
                     }
                     // A module the verifier refused is written all the same,
                     // so the IR it refused can be read.  It dies with its
@@ -2209,7 +2226,6 @@ type struct CompilerInstance {
                         }
                         ctx.artifacts.unverified_ir = IROutput::empty();
                     }
-                    cg_failed = true;
                     compiler::codegen::llvm_types::dispose_codegen_context();
                     pipeline.reset();
                     continue;
@@ -2250,6 +2266,11 @@ type struct CompilerInstance {
                     continue;
                 }
 
+                // An earlier build's object is removed before this one is
+                // emitted: an emit that writes nothing then leaves nothing,
+                // and is refused, instead of leaving the old object to link.
+                CodegenPasses::remove_previous_output(tgt.emit_path);
+
                 if (multiproc) {
                     // Serialize the module to bitcode and dispose it immediately
                     // (one live context at a time - lower peak RSS than the
@@ -2266,8 +2287,7 @@ type struct CompilerInstance {
                         mp_obj.push(tgt.emit_path);
                         mp_pos.push(i);
                     } else {
-                        fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, i)}");
-                        cg_failed = true;
+                        CodegenPasses::report_emit_failure(ctx, bc_path, String::new());
                     }
                     continue;
                 }
@@ -2296,7 +2316,6 @@ type struct CompilerInstance {
                         ctx.artifacts.ir = IROutput::empty();
                         compiler::codegen::llvm_types::dispose_codegen_context();
                         pipeline.reset();
-                        cg_failed = true;
                         continue;
                     }
                 };
@@ -2320,9 +2339,7 @@ type struct CompilerInstance {
 
                 if (cg_jobs.length as u32 >= cg_batch_cap) {
                     CompilerInstance::emit_jobs_threaded(&cg_jobs, cg_threads);
-                    if (CompilerInstance::record_emitted_jobs(ctx, &cg_jobs, &cg_pos, &cg_obj)) {
-                        cg_failed = true;
-                    }
+                    CompilerInstance::record_emitted_jobs(ctx, &cg_jobs, &cg_pos, &cg_obj);
                     cg_jobs.clear();
                     cg_pos.clear();
                 }
@@ -2331,16 +2348,15 @@ type struct CompilerInstance {
             // Flush any remaining accumulated jobs (the final partial batch).
             if (cg_jobs.length > 0) {
                 CompilerInstance::emit_jobs_threaded(&cg_jobs, cg_threads);
-                if (CompilerInstance::record_emitted_jobs(ctx, &cg_jobs, &cg_pos, &cg_obj)) {
-                    cg_failed = true;
-                }
+                CompilerInstance::record_emitted_jobs(ctx, &cg_jobs, &cg_pos, &cg_obj);
                 cg_jobs.clear();
                 cg_pos.clear();
             }
 
             // Fan the multi-process emit out to child processes, then record
-            // each object (verifying it exists so a crashed worker fails the
-            // build rather than silently dropping an object).
+            // each object.  A module whose object is missing is refused with
+            // the note its worker left, or as written by nobody when the
+            // workers all ran; a fan-out that failed is refused once itself.
             if (multiproc) {
                 mut mf_dir: string = "build";
                 if (ctx.project_config != null) {
@@ -2349,16 +2365,29 @@ type struct CompilerInstance {
                 ProjectConfig::mkdir_p(mf_dir);
                 const manifest: string = fmt::format("%s/.cryo_emit_manifest.txt", mf_dir);
                 const mp_triple: string = CodegenPasses::effective_triple(ctx);
-                const emit_ok: boolean = CodegenPasses::run_multiprocess_emit(
-                    &mp_bc, &mp_obj, mp_triple, ctx.options.opt_level, cg_threads,
-                    self_exe, manifest);
-                if (!emit_ok) { cg_failed = true; }
+                mut workers_ran: boolean = true;
+                match (CodegenPasses::run_multiprocess_emit(
+                        &mp_bc, &mp_obj, mp_triple, ctx.options.opt_level, cg_threads,
+                        self_exe, manifest)) {
+                    Result::Ok(_) => { }
+                    Result::Err(reason) => {
+                        CodegenPasses::report_emit_workers_failed(ctx, reason);
+                        workers_ran = false;
+                    }
+                }
                 for (mut k: i64 = 0; k < mp_pos.length as i64; k++) {
-                    if (metadata::exists(Path::from(mp_obj[k]))) {
-                        cg_obj[mp_pos[k] as i64] = mp_obj[k];
-                    } else {
-                        fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, mp_pos[k])}");
-                        cg_failed = true;
+                    match (CodegenPasses::take_failure_note(mp_obj[k])) {
+                        Option::Some(reason) => {
+                            CodegenPasses::report_emit_failure(ctx, mp_obj[k], reason);
+                        }
+                        Option::None => {
+                            if (metadata::exists(Path::from(mp_obj[k]))) {
+                                cg_obj[mp_pos[k] as i64] = mp_obj[k];
+                            } else if (workers_ran) {
+                                CodegenPasses::report_emit_failure(ctx, mp_obj[k],
+                                    String::from("its worker exited without writing it"));
+                            }
+                        }
                     }
                 }
             }
@@ -3584,27 +3613,22 @@ type struct CompilerInstance {
     }
 
     /// Record each emitted job's object at its module's topo position in
-    /// `objects`, report each job that failed, and answer whether any did.
+    /// `objects`, and report each job that failed.
     static record_emitted_jobs(ctx: CompilationContext*, jobs: [EmitJob]*,
-                               positions: [u32]*, objects: [string]*) -> boolean {
-        mut failed: boolean = false;
+                               positions: [u32]*, objects: [string]*) -> void {
         for (mut b: i64 = 0; b < (*jobs).length as i64; b++) {
             const job: EmitJob* = &(*jobs)[b];
             const reason: String = LTargetMachine::take_message(job.err_msg as i8*);
             if (!job.ok) {
                 CodegenPasses::report_emit_failure(ctx, job.emit_path, reason);
-                failed = true;
             } else if (!metadata::exists(Path::from(job.emit_path))) {
-                // Reported success and wrote nothing.  In an incremental
-                // build the previous build's object is still on disk and
-                // would be archived in its place, silently, so this has to
-                // fail the build.
-                fmt::eprintln(f"error: codegen wrote no object for module {CompilerInstance::codegen_module_name(ctx, (*positions)[b])}");
-                failed = true;
+                // The object was removed before the emit, so an emit that
+                // reported success and wrote nothing is seen here.
+                CodegenPasses::report_emit_failure(ctx, job.emit_path,
+                    String::from("LLVM reported success and wrote no file"));
             } else {
                 (*objects)[(*positions)[b] as i64] = job.emit_path;
             }
         }
-        return failed;
     }
 }

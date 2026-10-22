@@ -166,6 +166,16 @@ yet is recorded with the change that builds it, not here.
      end sizes it,** its payload at offset 16, in the LLVM type as in
      `sizeof`.  (Delegated)
 
+559. **Every code generation failure fails the build with a diagnostic.**
+     What LLVM will not do - write a module's bitcode, emit an object in
+     a worker process, or write the object an emit reported as written -
+     is E0647 with LLVM's reason; a module whose IR generation fails
+     without reporting why is E0900.  An earlier build's object is
+     removed before a module is emitted, so an emit that writes nothing
+     cannot leave it to be linked, and worker processes refuse a triple
+     with no target once, before any IR is generated.  (Jake; the codes
+     Delegated)
+
 ### 2026-10-21
 
 501. **The class-removal plan is deleted now,** its slices all built and its
