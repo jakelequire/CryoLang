@@ -364,7 +364,7 @@ An array's `length` and `capacity`, read as fields or through `length()` and `ca
 
 The `N` in `[T; N]` is a **compile-time integer**: an integer literal, a named `const` (declared in this module or another, written bare or qualified), an enum variant, a cast between integer types, or arithmetic, comparison, logical, and bitwise operators over those. The repeat expression `[value; N]` accepts exactly the same set and yields `[T; N]`, so a field and the initializer that fills it can share one name for their length; a count that is *not* a compile-time integer is legal there and yields a dynamic `[T]` sized at run time. A size that is neither is E0239. `value` is evaluated once and the same bits are stored in every slot, so its type must be a plain-copy type (one that satisfies `Copy`); an element that releases what it owns would be released once per slot, and is refused (E0453).
 
-A compile-time integer is computed exactly, as a number from `i128::MIN` to `i128::MAX`: every value of every integer type of 64 bits or fewer, and of `i128`, is one, so `0xFFFF_FFFF_FFFF_FFFF >> 60` is `15`. A `u128` value above `i128::MAX`, a step whose result leaves that range, and a division by zero are not compile-time integers. A cast to an integer type wraps the value to that type as the running program does, so `-1 as u64` is `0xFFFF_FFFF_FFFF_FFFF`. An array's length is at most `i64::MAX`; a larger size is refused (E0010).
+A compile-time integer is computed exactly, as a number from `i128::MIN` to `u128::MAX`: every value of every integer type is one, so `0xFFFF_FFFF_FFFF_FFFF >> 60` is `15` and `u128::MAX / 2 + 1` is `i128::MAX as u128 + 1`. A step whose result leaves that range, and a division by zero, are not compile-time integers. A cast to an integer type wraps the value to that type as the running program does, so `-1 as u64` is `0xFFFF_FFFF_FFFF_FFFF`. An array's length is at most `i64::MAX`; a larger size is refused (E0010).
 
 ```cryo
 const CAPACITY: i64 = 512;
@@ -2747,6 +2747,8 @@ public module collections::hashset;
 
 `public module` is **structure only**: it declares that a submodule exists, drives discovery, and suppresses a build-order edge. It does not bring the child's name or the child's symbols into any importer's scope. Importing `std::collections` therefore does not let you name `Array` — reaching a submodule takes an `import` of that submodule, or an `export` in the aggregator (see [section 13.5](#135-re-exports)).
 
+A submodule's file is found under its name as written, in lowercase, or in snake case: `public module NodeLocator;` finds `node_locator.cryo`. Whichever spelling found it, the file is named as its directory spells it - in diagnostics, panic locations and `location()` - so a filesystem that ignores case does not change the name a program reports.
+
 ### 13.3 Imports
 
 ```cryo
@@ -3569,7 +3571,7 @@ Macros are taken from **any header the import pulled in**, not only the file nam
 
 A header's `extern` **globals** bind as [imported globals](#171-extern-blocks) under the alias (`extern int errno_value;` -> `c::errno_value`), including the loader idiom of exposing each entry point as a global function pointer. A `static` global is skipped and reported: it has no symbol outside the translation unit that defines it.
 
-Every construct that is skipped or approximated is recorded and printed as a per-header **translation report** under `--debug` (`[skip]` for an unbound construct, `[approx]` for a layout-only binding), so nothing is lost silently.
+Every construct that is skipped or approximated is recorded and printed as a per-header **translation report** under `--debug` or `--log=bindgen=info` (`[skip]` for an unbound construct, `[approx]` for a layout-only binding), so nothing is lost silently.
 
 To import only a header's function prototypes - suppressing all struct/enum/typedef emission - apply the **`![functions_only]`** directive to the extern-module block. It is valid only on a C-import extern module:
 
@@ -4217,7 +4219,7 @@ target_triple = ""                  # cross-compile triple; empty => build for h
 stdlib_root   = ""                  # project-pinned stdlib root (see section 23.3)
 ```
 
-`target_triple` (e.g. `"x86_64-pc-windows-gnu"`) cross-compiles: it is threaded into LLVM and selects the target ABI and toolchain. For `x86_64-pc-windows-gnu` the build drives a full mingw-w64 link to a `.exe`: from a Linux host with `clang-20 --target=x86_64-w64-mingw32 -fuse-ld=lld` over the mingw-w64 sysroot (binutils' GNU ld for mingw relocates thread-local offsets, so a program it links faults on its first thread-local access once Windows moves the image), and the environment variable `CRYO_CC` names another driver; for triples without a known toolchain (aarch64, riscv, windows-msvc, ...) the host link step is skipped and the object files are left for a manual link. The CLI `--target=TRIPLE` overrides it.
+`target_triple` (e.g. `"x86_64-pc-windows-gnu"`) cross-compiles: it is threaded into LLVM and selects the target ABI and toolchain. For `x86_64-pc-windows-gnu` the build drives a full mingw-w64 link to a `.exe`: from a Linux host with `clang-20 --target=x86_64-w64-mingw32 -fuse-ld=lld` over the mingw-w64 sysroot (binutils' GNU ld for mingw relocates thread-local offsets, so a program it links faults on its first thread-local access once Windows moves the image), and the environment variable `CRYO_CC` names another driver; for other x86-64 triples without a known toolchain (windows-msvc, ...) the host link step is skipped and the object files are left for a manual link. The compiler's LLVM carries the x86-64 backend only: a triple for another architecture (aarch64, riscv64, ...) is refused with `E0647`, which gives LLVM's reason, and so is an object file LLVM cannot write. The CLI `--target=TRIPLE` overrides it.
 
 ### 23.2 `[compiler]`
 
@@ -4225,7 +4227,7 @@ Code-generation knobs.
 
 ```ini
 [compiler]
-debug      = false                  # verbose compiler logging
+debug      = false                  # compiler logging, as --log=debug
 optimize   = "O2"                   # O0 | O1 | O2 | O3 (default O2)
 emit_llvm  = false                  # also write LLVM IR (.ll) beside the object
 no_std     = false                  # build without linking the standard library
@@ -4406,12 +4408,14 @@ Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` o
 
 | Flag                  | Effect                                                                                                                                  |
 | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `--debug`             | Verbose compiler logging.                                                                                                               |
+| `--debug`             | Compiler logging on in every area, at `debug`: the same as `--log=debug`, and nothing more.                                             |
+| `--log=SPEC`          | Compiler logging, by area and level (below); applied after `CRYO_LOG`, so it wins. `--log SPEC` is the same.                            |
+| `--log-file=PATH`     | Append the compiler's log lines to `PATH` in place of stderr; `CRYO_LOG_FILE` is then not opened. `--log-file PATH` is the same.        |
 | `--ast`               | Dump the AST after parsing.                                                                                                             |
-| `--emit-llvm`         | Emit LLVM IR (`.ll`) beside the object output.                                                                                          |
+| `--emit-llvm`         | Emit LLVM IR (`.ll`) beside the object output, including a module that fails LLVM verification (the build still fails).                 |
 | `--build-dir=PATH`    | Override `[project] output_dir`.                                                                                                        |
 | `--stdlib=PATH`       | Standard-library root for this run (highest priority; see section 23.3).                                                                |
-| `--target=TRIPLE`     | Cross-compile for an LLVM target triple. `x86_64-pc-windows-gnu` links to a `.exe` via mingw-w64; other triples emit object files only. |
+| `--target=TRIPLE`     | Cross-compile for an LLVM target triple. `x86_64-pc-windows-gnu` links to a `.exe` via mingw-w64; other x86-64 triples emit object files only; another architecture is `E0647`. |
 | `--opt-level=N`       | Optimization level `0`..`3`; overrides the profile and `[compiler] optimize`.                                                           |
 | `-g`, `--debug-info`  | Emit DWARF debug info.                                                                                                                  |
 | `--release`           | Build with the `release` profile (O2, no debug info).                                                                                   |
@@ -4423,6 +4427,8 @@ Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` o
 | `-o`, `--output PATH` | Redirect output for single-file builds; the output kind is inferred from the extension (`.o`, `.s`, `.ll`, or an executable).           |
 
 Test-only flags: `--ignored`, `--list`, `--exact`, `-q` / `--quiet`.
+
+**Compiler logging.** The compiler logs what it does, for whoever is working on the compiler; it is off unless switched on, by `CRYO_LOG=SPEC` in the environment or `--log=SPEC` (or `--debug`, meaning `--log=debug`), or by `debug = true` in cryoconfig. `--debug` switches logging on and does nothing else: the AST is `--ast`'s and the IR `--emit-llvm`'s. The command line is applied after the environment, so a flag wins; `debug = true` sets `debug` only in the areas neither of them set, so `--log=off` or `CRYO_LOG=off` silences a project that asks for logging, and `debug = false` switches nothing off. A spec is a comma-separated list of items: an area, `driver`, which logs that area at `debug`; `area=level`; or a level alone, which sets every area. A later item overrides an earlier one, so `CRYO_LOG=sema,codegen` logs two areas and `--log=debug,parse=off` logs all but one. The areas are `driver`, `loader`, `lex`, `parse`, `resolve`, `types`, `sema`, `mono`, `drop`, `codegen`, `link`, `bindgen`, `deps`, `diag`, `lsp` and `time`; the levels, from least to most said, `off`, `error`, `warn`, `info`, `debug` and `trace`. An item naming neither is reported on stderr and the rest of the spec still applies. Lines go to stderr, or appended to the file `CRYO_LOG_FILE` or `--log-file` names, each as `[level area] file:line function: message`, the place being where in the compiler's source the line was written. The `time` area at `info` reports how long each stage of a build took, at its end. The language server takes no flags, so it reads `CRYO_LOG` and `CRYO_LOG_FILE` alone, and with them unset it logs nothing.
 
 ### 24.3 Standard-library lookup
 

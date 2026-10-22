@@ -44,8 +44,7 @@ import compiler::passes::pass_id;
 import compiler::passes::pass_id::{ PassResult };
 import compiler::resolver::{ intern_table, symbol_str };
 import std::fmt;
-import utils::logger;
-import utils::logger::{ cdebug };
+import utils::log::{ Log, LogArea, LogLevel };
 import std::ffi::libc;
 import compiler::codegen::context::{ CodegenContext };
 import compiler::codegen::ops::declaration_emitter::{ DebugInfoState };
@@ -634,27 +633,27 @@ type struct CodegenPasses {
 
     /// Emit the combined `.ll` IR dump next to the hoisted exe (selfhost-check's
     /// byte-identity input).  POSIX-only: it relies on shell glob expansion
-    /// (`/*/ir/*.ll`) and `2>/dev/null`, neither of which `cmd` provides.  On a
-    /// Windows-hosted compiler this is a no-op - the dump is a Linux CI aid, not
-    /// part of a normal build's output.
+    /// (`/*/ir/*.ll`), which `cmd` does not provide.  On a Windows-hosted
+    /// compiler this is a no-op - the dump is a Linux CI aid, not part of a
+    /// normal build's output.  The shell sorts the glob's expansion, so the
+    /// modules are linked in the same order on every build.
     ![target(unix)]
     static emit_linked_ir_dump(profile_dir_text: string, ll_path_text: string) -> void {
-        const ll_path: string = ll_path_text;
         const ll_cmd: string = fmt::format(
-            "llvm-link-20 -S %s/*/ir/*.ll -o %s 2>/dev/null",
+            "llvm-link-20 -S %s/*/ir/*.ll -o %s",
             CodegenPasses::shell_quote(profile_dir_text), CodegenPasses::shell_quote(ll_path_text));
         const ll_rc: i32 = Command::shell(ll_cmd);
         if (ll_rc == 0) {
-            cdebug("[Codegen] Linked IR dump: %s\n", ll_path);
+            Log::debug(LogArea::Codegen, f"linked ir dump {ll_path_text}");
         } else {
-            cdebug("[Codegen] Warning: llvm-link-20 failed for IR dump (rc=%d)\n", ll_rc);
+            Log::warn(LogArea::Codegen, f"llvm-link-20 failed for the ir dump (exit code {ll_rc})");
         }
     }
 
     ![target(windows)]
     static emit_linked_ir_dump(profile_dir_text: string, ll_path_text: string) -> void {
-        // cmd has no glob / `2>/dev/null`; the IR dump is a POSIX selfhost-check
-        // aid and is not produced on a native Windows build.
+        // cmd has no glob; the IR dump is a POSIX selfhost-check aid and is
+        // not produced on a native Windows build.
     }
 
     /// Compare, for every nominal type this module actually mapped, the size
@@ -810,7 +809,7 @@ type struct CodegenPasses {
         // overall compile still fails (the pipeline's final gate is
         // `!diagnostics.has_errors()`), so no unsound binary is emitted.
         if (ctx.diagnostics.has_errors()) {
-            cdebug("[Codegen] Skipping IR generation: earlier passes reported errors\n");
+            Log::debug(LogArea::Codegen, "skipping ir generation: earlier passes reported errors");
             return PassResult::ok();
         }
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
@@ -821,42 +820,44 @@ type struct CodegenPasses {
             module_name = ctx.namespace_display();
         }
 
-        cdebug("[Codegen] Step 1: IR generation for module: %s\n", module_name);
+        if (Log::enabled(LogArea::Codegen, LogLevel::Debug)) {
+            Log::debug(LogArea::Codegen, f"ir generation for module {module_name}");
+        }
 
         // Initialize LLVM targets (idempotent).
-        cdebug("[Codegen] Step 2: Initializing LLVM targets...\n");
         LTargetMachine::init_native_target();
-        cdebug("[Codegen] Step 3: LLVM targets initialized\n");
 
         // Create per-module codegen context on the heap to avoid stack overflow.
         // CompilationContext is already large on the stack, and CodegenContext
         // adds ~400+ bytes of arrays and maps per module.
-        cdebug("[Codegen] Step 4: Creating CodegenContext...\n");
         const _box_cg: Box<CodegenContext> = Box::<CodegenContext>::new(CodegenContext::new(ctx, module_name));
         const cg: CodegenContext* = _box_cg.leak();
         // Two-phase init step 2: wire back-pointers on sub-components now
         // that `cg` is at its stable heap address.  Wiring before the move
         // into the Box would leave back-pointers dangling at the source.
         cg.wire();
-        cdebug("[Codegen] Step 5: CodegenContext created\n");
 
         // Set target triple and data layout.  Honor a project-level
         // override (cryoconfig `target = "..."` or CLI `--target=TRIPLE`)
         // when one is set; otherwise fall back to the host triple from
         // LLVM.  The resolved triple is also fed to the target machine
         // below so the data-layout string matches.
-        cdebug("[Codegen] Step 6: Setting target triple...\n");
         const triple: string = ctx.options.target_triple;
         cg.llvm_module.set_target_triple(triple);
-        cdebug("[Codegen] Step 7: Target triple set: %s\n", triple);
+        if (Log::enabled(LogArea::Codegen, LogLevel::Debug)) {
+            Log::debug(LogArea::Codegen, f"target triple {triple}");
+        }
 
-        cdebug("[Codegen] Step 8: Creating target machine...\n");
-        mut tm: LTargetMachine = LTargetMachine::create_target_machine_for_triple(triple);
+        // A triple LLVM has no target for leaves the module without a data
+        // layout; object emission reports it and fails the build.
+        mut tm: LTargetMachine = match (LTargetMachine::create_target_machine_for_triple(triple)) {
+            Result::Ok(machine) => { machine }
+            Result::Err(_)      => { LTargetMachine::null() }
+        };
         if (tm.is_valid()) {
             const layout: string = tm.get_data_layout_string();
             cg.llvm_module.set_data_layout(layout);
         }
-        cdebug("[Codegen] Step 9: Target machine ready\n");
 
         // DWARF debug-info scaffolding (no-op unless `-g`/--debug-info).
         // Must run before function-body emission so each prologue can
@@ -876,7 +877,6 @@ type struct CodegenPasses {
         // Create the visitor and generate IR.  Heap-allocate via Box::leak
         // so sub-emitters can hold stable `state: VisitorState*` back-pointers
         // into `gen.state`; same two-phase pattern as `CodegenContext` above.
-        cdebug("[Codegen] Step 12: Creating IRGeneratorVisitor...\n");
         const _box_gen: Box<IRGeneratorVisitor> = Box::<IRGeneratorVisitor>::new(IRGeneratorVisitor::new(cg));
         const gen: IRGeneratorVisitor* = _box_gen.leak();
         // Two-phase init step 2: wire back-pointers on sub-emitters now
@@ -884,19 +884,11 @@ type struct CodegenPasses {
         // visitor's sub-emitter set is empty; the call site is in place
         // for incremental extraction.
         gen.wire();
-        cdebug("[Codegen] Step 13: Getting program AST...\n");
         const program: ProgramNode* = ctx.artifacts.ast.program();
-        cdebug("[Codegen] Step 14: Generating program IR (program=%p)...\n", program as void*);
         const success: boolean = gen.generate_program(program);
-        mut step15_status: string = "failed";
-        if (success) { step15_status = "succeeded"; }
-        cdebug("[Codegen] Step 15: Program IR generation %s\n", step15_status);
-        libc::fflush(null);
 
         if (!success) {
-            if (ctx.options.verbose) {
-                cdebug("[Codegen] IR generation failed for module: %s\n", module_name);
-            }
+            Log::debug(LogArea::Codegen, f"ir generation failed for module {module_name}");
             cg.dispose_builder();
             tm.dispose();
             return PassResult::from_snapshot(ctx.diagnostics, snap);
@@ -936,15 +928,13 @@ type struct CodegenPasses {
                 const fn_ty: void* = llvm::LLVMGlobalGetValueType(fn_val);
                 if (fn_ty == null) {
                     const fn_name: string = llvm::LLVMGetValueName(fn_val) as string;
-                    cdebug("[Codegen] CORRUPT: function '%s' has null type in module %s\n",
-                           fn_name, module_name);
+                    Log::error(LogArea::Codegen, f"corrupt function '{fn_name}' in module {module_name}: null type");
                     has_corrupt = true;
                 } else {
                     const ret_ty: void* = llvm::LLVMGetReturnType(fn_ty);
                     if (ret_ty == null) {
                         const fn_name: string = llvm::LLVMGetValueName(fn_val) as string;
-                        cdebug("[Codegen] CORRUPT: function '%s' has null return type in module %s\n",
-                               fn_name, module_name);
+                        Log::error(LogArea::Codegen, f"corrupt function '{fn_name}' in module {module_name}: null return type");
                         has_corrupt = true;
                     }
                     const param_count: u32 = llvm::LLVMCountParamTypes(fn_ty);
@@ -955,8 +945,7 @@ type struct CodegenPasses {
                         for (mut pi: u32 = 0; pi < param_count; pi++) {
                             if (slots[pi] == null) {
                                 const fn_name: string = llvm::LLVMGetValueName(fn_val) as string;
-                                cdebug("[Codegen] CORRUPT: function '%s' param %u is null type in module %s\n",
-                                       fn_name, pi, module_name);
+                                Log::error(LogArea::Codegen, f"corrupt function '{fn_name}' in module {module_name}: parameter {pi} has a null type");
                                 has_corrupt = true;
                             }
                         }
@@ -967,34 +956,8 @@ type struct CodegenPasses {
             }
         }
 
-        // Dump .ll BEFORE verification so failing modules are inspectable.
-        if (ctx.options.verbose) {
-            const mn_len: u64 = module_name.length();
-            const mn_src: i8* = module_name as i8*;
-            mut mn_s: String = String::with_capacity(mn_len + 1);
-            for (mut si: u64 = 0; si < mn_len; si++) {
-                if (mn_src[si] == 58) { mn_s.push_byte(95 as u8); }
-                else { mn_s.push_byte(mn_src[si] as u8); }
-            }
-            // Per-module IR lands under the per-profile cache, grouped by
-            // origin (`<output_dir>/target/<profile>/<origin>/ir`); honour
-            // project_config so `--build-dir=...` and the active profile both
-            // flow through.
-            mut ll_dir: string = "build/target/release/local/ir";
-            if (ctx.project_config != null) {
-                ll_dir = ctx.project_config.ir_dir_for(
-                    CodegenPasses::current_origin_subdir(ctx));
-            }
-            ProjectConfig::mkdir_p(ll_dir);
-            const ll_path: string = fmt::format("%s/%s.ll", ll_dir, mn_s.as_cstr() as string);
-            mut ll_err: i8* = null;
-            llvm::LLVMPrintModuleToFile(cg.llvm_module.raw, ll_path, &ll_err as void*);
-            if (ll_err != null) { llvm::LLVMDisposeMessage(ll_err as void*); }
-            mem::drop(mn_s);
-        }
-
         if (has_corrupt) {
-            cdebug("[Codegen] Skipping verification for %s due to corrupt function types\n", module_name);
+            Log::error(LogArea::Codegen, f"skipping verification of module {module_name}: corrupt function types");
         } else {
             // Verify the LLVM module.
             mut verify_err: i8* = null;
@@ -1027,6 +990,10 @@ type struct CodegenPasses {
                 if (verify_err != null) {
                     llvm::LLVMDisposeMessage(verify_err as void*);
                 }
+                ctx.artifacts.unverified_ir = IROutput {
+                    llvm_module: cg.llvm_module.raw,
+                    module_name: module_name,
+                };
                 cg.dispose_builder();
                 tm.dispose();
                 return PassResult::failure(1);
@@ -1050,8 +1017,8 @@ type struct CodegenPasses {
             return PassResult::failure(1);
         }
 
-        if (ctx.options.verbose) {
-            cdebug("[Codegen] Module verified: %s\n", module_name);
+        if (Log::enabled(LogArea::Codegen, LogLevel::Debug)) {
+            Log::debug(LogArea::Codegen, f"module verified: {module_name}");
         }
 
         // Store the LLVM module in artifacts.  The module is now owned by
@@ -1074,9 +1041,8 @@ type struct CodegenPasses {
             return PassResult::ok();
         }
 
-        if (ctx.options.verbose) {
-            cdebug("[Codegen] Optimization for module: %s (O%u)\n",
-                ctx.artifacts.ir.module_name, ctx.options.opt_level);
+        if (Log::enabled(LogArea::Codegen, LogLevel::Debug)) {
+            Log::debug(LogArea::Codegen, f"optimizing module {ctx.artifacts.ir.module_name} at O{ctx.options.opt_level}");
         }
 
         // O0: skip the IR optimization pipeline entirely. This leaves the
@@ -1085,18 +1051,17 @@ type struct CodegenPasses {
         // cleanly back to source. The backend TargetMachine level below
         // still governs instruction selection / register allocation.
         if (ctx.options.opt_level == 0) {
-            if (ctx.options.verbose) {
-                cdebug("[Codegen] O0: skipping IR optimization pipeline\n");
-            }
+            Log::debug(LogArea::Codegen, "optimization level 0: skipping the ir optimization pipeline");
             return PassResult::ok();
         }
 
         const opt_triple: string = ctx.options.target_triple;
-        mut tm: LTargetMachine = LTargetMachine::create_target_machine_with_opt(
-            opt_triple, ctx.options.opt_level as i32);
-        if (!tm.is_valid()) {
-            return PassResult::ok();
-        }
+        // A triple LLVM has no target for is reported by object emission.
+        mut tm: LTargetMachine = match (LTargetMachine::create_target_machine_with_opt(
+                opt_triple, ctx.options.opt_level as i32)) {
+            Result::Ok(machine) => { machine }
+            Result::Err(_)      => { return PassResult::ok(); }
+        };
 
         // Run the default optimization pipeline at the configured level.
         const opts: void* = llvm::LLVMCreatePassBuilderOptions();
@@ -1253,7 +1218,9 @@ type struct CodegenPasses {
     /// Child-process entry (`cryo __emit-obj <manifest> <idx> <count>`): read
     /// the manifest and emit the objects assigned to this worker (module line
     /// `k` belongs to worker `k % count`, round-robin so large modules spread
-    /// across workers).  Returns 0 if every assigned object emitted.
+    /// across workers).  An object LLVM will not emit gets LLVM's reason in
+    /// its failure note, which the parent reports; the worker itself fails
+    /// only when it cannot read the manifest or write a note.
     static run_emit_worker(manifest_path_text: string, worker_idx: u32,
                            worker_count: u32) -> i32 {
         const manifest_path: string = manifest_path_text;
@@ -1285,9 +1252,19 @@ type struct CodegenPasses {
                     const bc: string = CodegenPasses::substr(line, 0, tab as u64);
                     const ol: string = CodegenPasses::substr(
                         line, (tab + 1) as u64, line.length() - (tab as u64) - 1);
-                    if (!CodegenPasses::emit_object_from_bitcode(bc, ol, triple, opt)) {
-                        fmt::eprintln(f"__emit-obj: failed to emit {ol}");
-                        failures = failures + 1;
+                    match (CodegenPasses::emit_object_from_bitcode(bc, ol, triple, opt)) {
+                        Result::Ok(_) => { }
+                        Result::Err(reason) => {
+                            const note: Path = Path::from(CodegenPasses::failure_note_path(ol));
+                            match (file::write(note,
+                                    Slice::<u8>::from_raw(reason.as_str().as_ptr(), reason.length()))) {
+                                Result::Ok(_)  => { }
+                                Result::Err(_) => {
+                                    fmt::eprintln(f"__emit-obj: failed to emit {ol}: {reason.as_str()}");
+                                    failures = failures + 1;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1301,10 +1278,12 @@ type struct CodegenPasses {
     /// waits for all of them.  Each module's object is emitted in a separate
     /// PROCESS (own address space, own LLVM globals) - so there is no shared
     /// LLVM state to race, which is what makes this safe where in-process
-    /// threading was not.  Returns true if every worker exited successfully.
+    /// threading was not.  Answers why the workers could not be run, or why
+    /// one of them failed; a module a worker could not emit is answered by
+    /// its failure note instead.
     static run_multiprocess_emit(bc: [string]*, obj: [string]*, triple_text: string,
                                  opt: u32, worker_count: u32, self_exe_text: string,
-                                 manifest_path_text: string) -> boolean {
+                                 manifest_path_text: string) -> Result<(), String> {
         const manifest_path: string = manifest_path_text;
         const self_exe: string = self_exe_text;
         const triple: string = triple_text;
@@ -1316,17 +1295,19 @@ type struct CodegenPasses {
         for (mut k: i64 = 0; k < cnt; k++) {
             mf.push((*bc)[k]);  mf.push_byte(9);
             mf.push((*obj)[k]); mf.push_byte(10);
+            // A note an earlier build left would read as this build's failure.
+            CodegenPasses::remove_previous_output(CodegenPasses::failure_note_path((*obj)[k]));
         }
         match (file::write(Path::from(manifest_path),
                            Slice::<u8>::from_raw(mf.as_str().as_ptr(), mf.length()))) {
             Result::Ok(_)  => { }
             Result::Err(_) => {
-                fmt::eprintln("codegen: failed to write emit manifest");
-                return false;
+                return Result::Err(f"could not write the emit manifest '{manifest_path}'");
             }
         }
 
         // Spawn the workers (all concurrent), then wait for each.
+        mut failure: Result<(), String> = Result::Ok(());
         mut children: [Child] = [];
         mut w: u32 = 0;
         while (w < worker_count) {
@@ -1337,46 +1318,74 @@ type struct CodegenPasses {
             cmd.arg(Str::new(fmt::format("%u", worker_count)));
             match (cmd.spawn()) {
                 Result::Ok(c)  => { children.push(c); }
-                Result::Err(_) => { fmt::eprintln("codegen: failed to spawn emit worker"); }
+                Result::Err(_) => {
+                    failure = Result::Err(f"could not start the emit worker '{self_exe}'");
+                }
             }
             w = w + 1;
         }
 
-        mut ok: boolean = true;
         mut ci: i64 = 0;
         while (ci < children.length as i64) {
             match (children[ci].wait()) {
-                Result::Ok(st) => { if (!st.success()) { ok = false; } }
-                Result::Err(_) => { ok = false; }
+                Result::Ok(st) => {
+                    if (!st.success()) {
+                        failure = Result::Err(String::from("an emit worker exited with a failure"));
+                    }
+                }
+                Result::Err(_) => {
+                    failure = Result::Err(String::from("an emit worker could not be waited for"));
+                }
             }
             ci = ci + 1;
         }
 
         // Reclaim the transient bitcode + manifest - pure inputs to the child
         // emitters, regenerated every build.  Best-effort (ignore errors).
-        mut rk: i64 = 0;
-        while (rk < cnt) {
-            match (dir::remove_file(Path::from((*bc)[rk]))) {
-                Result::Ok(_)  => { }
-                Result::Err(_) => { }
-            }
-            rk = rk + 1;
+        for (mut rk: i64 = 0; rk < cnt; rk++) {
+            CodegenPasses::remove_previous_output((*bc)[rk]);
         }
-        match (dir::remove_file(Path::from(manifest_path))) {
+        CodegenPasses::remove_previous_output(manifest_path);
+        return failure;
+    }
+
+    /// Where a worker of the out-of-process emitter leaves LLVM's reason for
+    /// not emitting the object at `object_path`.
+    static failure_note_path(object_path: string) -> string {
+        return fmt::format("%s.error", object_path);
+    }
+
+    /// The reason a worker left for not emitting the object at
+    /// `object_path`, removed as it is read; none when it left no note.
+    static take_failure_note(object_path: string) -> Option<String> {
+        const note: string = CodegenPasses::failure_note_path(object_path);
+        match (file::read_to_string(Path::from(note))) {
+            Result::Ok(reason) => {
+                CodegenPasses::remove_previous_output(note);
+                return Option::Some(reason);
+            }
+            Result::Err(_) => { return Option::None; }
+        }
+    }
+
+    /// Remove the file at `path` if there is one.  A file that cannot be
+    /// removed cannot be overwritten either, so the write that follows
+    /// fails and says so.
+    static remove_previous_output(path: string) -> void {
+        match (dir::remove_file(Path::from(path))) {
             Result::Ok(_)  => { }
             Result::Err(_) => { }
         }
-        return ok;
     }
 
     /// Child-process entry for the multi-process object emitter: parse a
     /// module's bitcode from `bc_path` (written by the main process) in a FRESH
     /// per-process LLVM context and emit its object to `o_path`.  Runs in its
     /// own process, so there is no shared LLVM global state to race - the whole
-    /// point of going multi-process instead of multi-thread.  Returns true iff
-    /// the object was emitted.
+    /// point of going multi-process instead of multi-thread.  Answers why
+    /// the object was not emitted, when it was not.
     static emit_object_from_bitcode(bc_path_text: string, o_path_text: string,
-                                    triple_text: string, opt_level: u32) -> boolean {
+                                    triple_text: string, opt_level: u32) -> Result<(), String> {
         LTargetMachine::init_native_target();
         const eff: string = LTargetMachine::resolve_effective_triple(triple_text);
         const lctx: LContext = LContext::create();
@@ -1384,19 +1393,50 @@ type struct CodegenPasses {
         if (!m.is_valid()) {
             mut c0: LContext = lctx;
             c0.dispose();
-            return false;
+            return Result::Err(f"LLVM could not read the bitcode '{bc_path_text}'");
         }
-        mut ok: boolean = false;
-        mut tm: LTargetMachine = LTargetMachine::create_target_machine_with_opt(
-            eff, opt_level as i32);
-        if (tm.is_valid()) {
-            ok = tm.emit_to_file(m, o_path_text, LFileType::Object);
-            tm.dispose();
+        mut emitted: Result<(), String> = Result::Ok(());
+        match (LTargetMachine::create_target_machine_with_opt(eff, opt_level as i32)) {
+            Result::Ok(machine) => {
+                mut tm: LTargetMachine = machine;
+                emitted = tm.emit_to_file(m, o_path_text, LFileType::Object);
+                tm.dispose();
+            }
+            Result::Err(reason) => {
+                emitted = Result::Err(f"LLVM has no target for the triple '{eff}': {reason.as_str()}");
+            }
         }
         m.dispose();
         mut c: LContext = lctx;
         c.dispose();
-        return ok;
+        return emitted;
+    }
+
+    /// E0647: LLVM has no target for `triple`, for LLVM's `reason`.
+    static report_missing_target(ctx: CompilationContext*, triple: string, reason: String) -> void {
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0647_LLVM_BACKEND_FAILED,
+            fmt::format("LLVM has no target for the triple '%s': %s", triple, reason.as_cstr() as string));
+        d = d.help("name a triple this compiler's LLVM supports, with `--target` or cryoconfig's `target_triple`; `cryo version --triple` prints the host's");
+        ctx.emit_diagnostic(d);
+    }
+
+    /// E0647: the out-of-process emitter's workers could not be run, or one
+    /// of them failed, for `reason`.
+    static report_emit_workers_failed(ctx: CompilationContext*, reason: String) -> void {
+        ctx.emit_error(ErrorCode::E0647_LLVM_BACKEND_FAILED,
+            fmt::format("the out-of-process object emitter failed: %s", reason.as_cstr() as string));
+    }
+
+    /// E0647: LLVM could not write the object or assembly file at `path`,
+    /// for LLVM's `reason`, which may be empty.
+    static report_emit_failure(ctx: CompilationContext*, path: string, reason: String) -> void {
+        if (reason.is_empty()) {
+            ctx.emit_error(ErrorCode::E0647_LLVM_BACKEND_FAILED,
+                fmt::format("LLVM could not emit '%s'", path));
+            return;
+        }
+        ctx.emit_error(ErrorCode::E0647_LLVM_BACKEND_FAILED,
+            fmt::format("LLVM could not emit '%s': %s", path, reason.as_cstr() as string));
     }
 
     static run_object_emission(ctx: CompilationContext*) -> PassResult {
@@ -1417,22 +1457,24 @@ type struct CodegenPasses {
         // a stale host machine here would silently undo the cross-
         // compile we set up in IR generation.
         const obj_triple: string = ctx.options.target_triple;
-        mut tm: LTargetMachine = LTargetMachine::create_target_machine_with_opt(
-            obj_triple, ctx.options.opt_level as i32);
-        if (!tm.is_valid()) {
-            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                "failed to create target machine for object emission");
-            return PassResult::failure(1);
-        }
+        mut tm: LTargetMachine = match (LTargetMachine::create_target_machine_with_opt(
+                obj_triple, ctx.options.opt_level as i32)) {
+            Result::Ok(machine) => { machine }
+            Result::Err(reason) => {
+                CodegenPasses::report_missing_target(ctx, obj_triple, reason);
+                return PassResult::failure(1);
+            }
+        };
 
         const mod: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
-        const success: boolean = tm.emit_to_file(mod, target.emit_path, target.emit_type);
+        const emitted: Result<(), String> = tm.emit_to_file(mod, target.emit_path, target.emit_type);
         tm.dispose();
-
-        if (!success) {
-            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                fmt::format("failed to emit object file: %s", target.emit_path));
-            return PassResult::failure(1);
+        match (emitted) {
+            Result::Ok(_) => { }
+            Result::Err(reason) => {
+                CodegenPasses::report_emit_failure(ctx, target.emit_path, reason);
+                return PassResult::failure(1);
+            }
         }
 
         // Store the object file path.
@@ -1451,8 +1493,8 @@ type struct CodegenPasses {
             ctx.artifacts.register_object_file(target.emit_path);
         }
 
-        if (ctx.options.verbose) {
-            cdebug("[Codegen] Emitted: %s\n", target.emit_path);
+        if (Log::enabled(LogArea::Link, LogLevel::Debug)) {
+            Log::debug(LogArea::Link, f"emitted object {target.emit_path}");
         }
 
         return PassResult::ok();
@@ -1516,9 +1558,7 @@ type struct CodegenPasses {
         }
         if (err != null) { llvm::LLVMDisposeMessage(err as void*); }
         ctx.artifacts.linked = LinkedOutput { object_file_path: path };
-        if (ctx.options.verbose) {
-            cdebug("[Codegen] Emitted IR text: %s\n", path);
-        }
+        Log::debug(LogArea::Codegen, f"emitted ir text {path}");
         return PassResult::ok();
     }
 
@@ -1759,11 +1799,8 @@ type struct CodegenPasses {
             cmd = fmt::format("%s -static -static-libstdc++ -static-libgcc", cmd);
         }
 
-        if (ctx.options.verbose) {
-            cdebug("[Codegen] Linking %lld objects -> %s\n",
-                ctx.artifacts.object_files.length, exe_path);
-            cdebug("[Codegen] Link command: %s\n", cmd);
-        }
+        Log::debug(LogArea::Link, f"linking {ctx.artifacts.object_files.length} objects into {exe_path}");
+        Log::debug(LogArea::Link, f"link command: {cmd}");
 
         mut link_out: string = "";
         const rc: i32 = CodegenPasses::run_tool(cmd, fmt::format("%s.log", link_rsp_path), &link_out);
@@ -1782,7 +1819,7 @@ type struct CodegenPasses {
         // harmless).
         dir::remove_file(Path::from(link_rsp_path));
 
-        cdebug("[Codegen] Linked executable: %s\n", exe_path);
+        Log::debug(LogArea::Link, f"linked executable {exe_path}");
 
         // Hoist the freshly-linked binary from the per-profile cache up to
         // the build root (`<output_dir>/<name>[.exe]`) so it can be run
@@ -1800,7 +1837,7 @@ type struct CodegenPasses {
                     hoisted_exe, hrc));
             return PassResult::failure(1);
         }
-        cdebug("[Codegen] Hoisted executable: %s\n", hoisted_exe);
+        Log::debug(LogArea::Link, f"hoisted executable {hoisted_exe}");
 
         // Single-file `-o PATH` (Exe): mirror the hoisted binary to the
         // user's explicit output path.  The path is taken verbatim - no
@@ -1814,23 +1851,18 @@ type struct CodegenPasses {
                         exe_out, orc));
                 return PassResult::failure(1);
             }
-            cdebug("[Codegen] Mirrored executable to -o path: %s\n", exe_out);
+            Log::debug(LogArea::Link, f"copied executable to the -o path {exe_out}");
         }
 
-        // Emit a combined `.ll` text dump of the project's per-module IR
-        // (written during Phase 7) next to the HOISTED executable
-        // (`<output_dir>/<name>.ll`).  Used by selfhost-check for
-        // stage-3/stage-4 byte-identity verification.  Per-module IR is split
-        // across per-origin subtrees, so the glob spans every origin's `ir/`
-        // dir; the shell sorts the full expansion deterministically, so the
-        // concatenation order is stable across builds.  Stderr is redirected
-        // to /dev/null so `llvm-link-20`'s "No such file or directory"
-        // complaint (when no .ll files were written because emit_llvm was
-        // unset) doesn't pollute the user's terminal in the silent default.
-        const ll_path: string = fmt::format("%s.ll", hoisted_exe);
-        // POSIX-only (shell glob + `2>/dev/null`); a no-op on a native
-        // Windows-hosted compiler, where `cmd` provides neither.
-        CodegenPasses::emit_linked_ir_dump(profile_dir, ll_path);
+        // Under `--emit-llvm`, link the per-module `.ll` files written during
+        // code generation into one dump next to the HOISTED executable
+        // (`<output_dir>/<name>.ll`), selfhost-check's input for its
+        // stage-3/stage-4 byte-identity check.  Without it no `.ll` exists to
+        // link.  POSIX-only (a shell glob); a no-op on a Windows-hosted
+        // compiler.
+        if (ctx.options.emit_llvm) {
+            CodegenPasses::emit_linked_ir_dump(profile_dir, fmt::format("%s.ll", hoisted_exe));
+        }
 
         return PassResult::ok();
     }
@@ -1906,10 +1938,8 @@ type struct CodegenPasses {
             cmd = fmt::format("%s %s", cmd, link_cfg.extra_system_libs);
         }
 
-        if (ctx.options.verbose) {
-            cdebug("[Codegen] Single-file link -> %s\n", exe_path);
-            cdebug("[Codegen] Link command: %s\n", cmd);
-        }
+        Log::debug(LogArea::Link, f"single-file link into {exe_path}");
+        Log::debug(LogArea::Link, f"link command: {cmd}");
 
         mut link_out: string = "";
         const rc: i32 = CodegenPasses::run_tool(cmd, fmt::format("%s.log", link_rsp_path), &link_out);
@@ -1925,7 +1955,7 @@ type struct CodegenPasses {
         // (best-effort - a failed unlink is harmless).
         dir::remove_file(Path::from(link_rsp_path));
 
-        cdebug("[Codegen] Linked executable: %s\n", exe_path);
+        Log::debug(LogArea::Link, f"linked executable {exe_path}");
         ctx.artifacts.linked = LinkedOutput { object_file_path: exe_path };
         return PassResult::ok();
     }
@@ -1999,11 +2029,8 @@ type struct CodegenPasses {
 
         const cmd: string = fmt::format("%s rcs \"%s\" @\"%s\"", ar, archive_path, rsp_path);
 
-        if (ctx.options.verbose) {
-            cdebug("[Codegen] Bundling %lld objects -> %s (via %s)\n",
-                objs.length, archive_path, rsp_path);
-            cdebug("[Codegen] Bundle command: %s\n", cmd);
-        }
+        Log::debug(LogArea::Link, f"archiving {objs.length} objects into {archive_path} (response file {rsp_path})");
+        Log::debug(LogArea::Link, f"archive command: {cmd}");
 
         mut ar_out: string = "";
         const rc: i32 = CodegenPasses::run_tool(cmd, fmt::format("%s.log", rsp_path), &ar_out);
@@ -2017,8 +2044,7 @@ type struct CodegenPasses {
         // Drop the response file now the archiver has read it (best-effort).
         dir::remove_file(Path::from(rsp_path));
 
-        cdebug("[Codegen] Bundled archive: %s (%lld objects)\n",
-            archive_path, objs.length);
+        Log::debug(LogArea::Link, f"archived {archive_path} ({objs.length} objects)");
         return PassResult::ok();
     }
 
@@ -2510,8 +2536,7 @@ type struct EmitJob {
     should_register: boolean;
     ok:              boolean;   // result: emission succeeded
     err_msg:         string;    // LLVM error message on failure (worker-set;
-                                // the main-thread report loop prints it and
-                                // disposes it via LLVMDisposeMessage)
+                                // the main thread reports it and disposes it)
 }
 
 /// Emit ONE module's object file from its own standalone LLVM context (the
@@ -2542,7 +2567,7 @@ function codegen_emit_job(job: EmitJob*) -> void {
         (*job).emit_type as i32, &err as void*);
     // Hand the LLVM error string to the main thread instead of discarding it
     // (storing the raw pointer allocates nothing on the Cryo side); the
-    // report loop prints it and disposes it with LLVMDisposeMessage.
+    // main thread reports it and disposes it.
     (*job).err_msg = err as string;
     (*job).ok = rc == 0;
 }

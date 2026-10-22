@@ -23,8 +23,7 @@ import compiler::vendor::registry;
 import compiler::vendor::registry::{ VendorRegistry };
 import compiler::deps::lockfile;
 import compiler::deps::lockfile::{ LockedVendor };
-import utils::logger;
-import utils::logger::{ cdebug };
+import utils::log::{ Log, LogArea, LogLevel };
 import std::fmt;
 import std::fs::file;
 import std::fs::metadata;
@@ -37,6 +36,7 @@ import std::collections::{ hashmap, pair };
 import std::collections::string;
 import std::collections::string::{ String };
 import std::collections::str;
+import std::collections::str::{ Str };
 import std::core::option;
 import std::core::option::{ Option };
 import std::ffi::libc;
@@ -222,19 +222,16 @@ public:
     /// Populates the module graph with ModuleInfo entries and dependency edges.
     discover_project(mut &this, intern: InternTable*,
                      graph: ModuleGraph*, sink: DiagnosticSink*,
-                     entry_path: string, debug: boolean) -> boolean {
-        if (debug) {
-            cdebug("[ModuleLoader] Discovering project from: %s\n", entry_path);
-            cdebug("[ModuleLoader] Project root: %s\n", this.project_root);
-        }
+                     entry_path: string) -> boolean {
+        Log::debug(LogArea::Loader, f"discovering project from {entry_path}, project root {this.project_root}");
 
         // Pre-scan: walk the project directory tree and lex every .cryo file
         // to extract its namespace.  This builds the ns_map (namespace -> path)
         // so that resolve_import_path can resolve any import with a simple
         // HashMap lookup, regardless of directory casing.
-        this.scan_all_project_files(intern, this.entry_dir, debug);
+        this.scan_all_project_files(intern, this.entry_dir);
         if (!this.no_std && this.stdlib_root.length() > 0) {
-            this.scan_all_project_files(intern, this.stdlib_root, debug);
+            this.scan_all_project_files(intern, this.stdlib_root);
         }
         // include_paths from cryoconfig: each is resolved relative to
         // project_root.  HashMap.insert is last-wins, so re-scanning a
@@ -247,18 +244,13 @@ public:
             } else {
                 fmt::format("%s/%s", this.project_root, rel)
             };
-            if (debug) {
-                cdebug("[ModuleLoader] Scanning extra root: %s\n", root);
-            }
-            this.scan_all_project_files(intern, root, debug);
+            Log::debug(LogArea::Loader, f"scanning extra root {root}");
+            this.scan_all_project_files(intern, root);
         }
 
-        if (debug) {
-            cdebug("[ModuleLoader] Pre-scan complete: %d namespaces indexed\n",
-                this.ns_map.length());
-        }
+        Log::debug(LogArea::Loader, f"pre-scan complete: {this.ns_map.length()} namespaces indexed");
 
-        return this.discover_module(intern, graph, sink, entry_path, debug);
+        return this.discover_module(intern, graph, sink, entry_path);
     }
 
     /// Recursively walk `dir`, calling `discover_module` on every `.cryo`
@@ -270,7 +262,7 @@ public:
     /// directory resolve through `ns_map`.
     discover_tests_directory(mut &this, intern: InternTable*,
                              graph: ModuleGraph*, sink: DiagnosticSink*,
-                             dir: string, debug: boolean) -> boolean {
+                             dir: string) -> boolean {
         mut rd: ReadDir = match (dir::read_dir(Path::from(dir))) {
             Result::Ok(r)  => { r }
             Result::Err(_) => { return true; }
@@ -293,7 +285,7 @@ public:
                         if (!name.eq("negative") && !name.eq("projects")) {
                             // Recurse into subdirectories.
                             if (!this.discover_tests_directory(
-                                    intern, graph, sink, full_path, debug)) {
+                                    intern, graph, sink, full_path)) {
                                 overall_ok = false;
                             }
                         }
@@ -303,7 +295,7 @@ public:
                             const ext: string = name + ((name_len - 5) as i64);
                             if (ext.eq(".cryo")) {
                                 if (!this.discover_module(
-                                        intern, graph, sink, full_path, debug)) {
+                                        intern, graph, sink, full_path)) {
                                     overall_ok = false;
                                 }
                             }
@@ -320,7 +312,7 @@ public:
 
     /// Recursively walk a directory, lex every .cryo file to extract its
     /// namespace declaration, and register namespace -> file_path in ns_map.
-    scan_all_project_files(mut &this, intern: InternTable*, dir: string, debug: boolean) -> void {
+    scan_all_project_files(mut &this, intern: InternTable*, dir: string) -> void {
         mut rd: ReadDir = match (dir::read_dir(Path::from(dir))) {
             Result::Ok(r)  => { r }
             Result::Err(_) => { return; }
@@ -339,7 +331,7 @@ public:
                         // namespaces into this project's resolution map.
                         if (!name.eq("projects")) {
                             // Recurse into subdirectory.
-                            this.scan_all_project_files(intern, full_path, debug);
+                            this.scan_all_project_files(intern, full_path);
                         }
                     } else {
                         // Regular file; check for .cryo extension.
@@ -604,7 +596,7 @@ public:
     /// Recursively discover a module and its imports.
     discover_module(mut &this, intern: InternTable*,
                     graph: ModuleGraph*, sink: DiagnosticSink*,
-                    file_path: string, debug: boolean) -> boolean {
+                    file_path: string) -> boolean {
         // Check if already loaded (case-insensitive on Windows).
         // Different import paths can resolve to the same file with different
         // casing (e.g., "src/Compiler/Passes/Sema.cryo" vs
@@ -638,8 +630,8 @@ public:
         // Mark as loading (use normalized path for dedup)
         this.push_loading(norm_path);
 
-        if (debug) {
-            cdebug("[ModuleLoader] Discovering: %s\n", file_path);
+        if (Log::enabled(LogArea::Loader, LogLevel::Trace)) {
+            Log::trace(LogArea::Loader, f"discovering {file_path}");
         }
 
         // Quick-scan the file: lex only, extract namespace and import paths
@@ -657,9 +649,8 @@ public:
             graph.uses_fstring = true;
         }
 
-        if (debug) {
-            cdebug("[ModuleLoader]   namespace: '%s', imports: %d\n",
-                intern.resolve(scan.namespace_name), scan.import_count);
+        if (Log::enabled(LogArea::Loader, LogLevel::Trace)) {
+            Log::trace(LogArea::Loader, f"{file_path}: namespace '{intern.resolve(scan.namespace_name)}', {scan.import_count} imports");
         }
 
         // Create ModuleInfo (store original path so the lexer can open the file)
@@ -710,8 +701,8 @@ public:
             // file's directory (bare `public module X;` declarations in
             // _module.cryo).
             mut resolved: string = this.resolve_import_path(intern, import_sym, file_dir);
-            if (debug) {
-                cdebug("[ModuleLoader]   import '%s' -> '%s'\n", import_path, resolved);
+            if (Log::enabled(LogArea::Loader, LogLevel::Trace)) {
+                Log::trace(LogArea::Loader, f"import '{import_path}' resolved to '{resolved}'");
             }
             if (resolved.length() == 0) {
                 // Filesystem resolution failed; check if the module was
@@ -724,9 +715,8 @@ public:
                 if (already_idx >= 0) {
                     // Module already in graph: use its recorded file path
                     resolved = graph.modules[already_idx].file_path;
-                    if (debug) {
-                        cdebug("[ModuleLoader]   import '%s' -> '%s' (found in graph)\n",
-                            import_path, resolved);
+                    if (Log::enabled(LogArea::Loader, LogLevel::Trace)) {
+                        Log::trace(LogArea::Loader, f"import '{import_path}' found in the graph at '{resolved}'");
                     }
                 } else if (scan.import_entry_items[i] >= 0) {
                     // `import A::B as C;` whose `A` is no module: the path
@@ -750,7 +740,7 @@ public:
 
             // Recursively discover the dependency (must happen before
             // add_dependency so the target module's namespace is known)
-            if (!this.discover_module(intern, graph, sink, resolved, debug)) {
+            if (!this.discover_module(intern, graph, sink, resolved)) {
                 success = false;
             }
 
@@ -808,7 +798,7 @@ public:
             const item_path: string = intern.resolve(item_sym);
             const item_resolved: string = this.resolve_import_path(intern, item_sym, file_dir);
             if (item_resolved.length() > 0) {
-                if (!this.discover_module(intern, graph, sink, item_resolved, debug)) {
+                if (!this.discover_module(intern, graph, sink, item_resolved)) {
                     success = false;
                 }
                 item_files[ii] = item_resolved;
@@ -857,10 +847,10 @@ public:
             if (owner_file.length() == 0) { continue; }
             const sub_file: string = this.sub_module_file(intern, owner_file, scan.path_rests[bp]);
             if (sub_file.length() == 0) { continue; }
-            if (debug) {
-                cdebug("[ModuleLoader]   path '%s' -> '%s'\n", intern.resolve(scan.path_rests[bp]), sub_file);
+            if (Log::enabled(LogArea::Loader, LogLevel::Trace)) {
+                Log::trace(LogArea::Loader, f"path '{intern.resolve(scan.path_rests[bp])}' resolved to '{sub_file}'");
             }
-            if (!this.discover_module(intern, graph, sink, sub_file, debug)) {
+            if (!this.discover_module(intern, graph, sink, sub_file)) {
                 success = false;
             }
         }
@@ -886,11 +876,11 @@ public:
             const exp_sym: SymbolStr = scan.export_paths[ei];
             const exp_path: string = intern.resolve(exp_sym);
             const exp_resolved: string = this.resolve_import_path(intern, exp_sym, file_dir);
-            if (debug) {
-                cdebug("[ModuleLoader]   export '%s' -> '%s'\n", exp_path, exp_resolved);
+            if (Log::enabled(LogArea::Loader, LogLevel::Trace)) {
+                Log::trace(LogArea::Loader, f"export '{exp_path}' resolved to '{exp_resolved}'");
             }
             if (exp_resolved.length() > 0) {
-                if (!this.discover_module(intern, graph, sink, exp_resolved, debug)) {
+                if (!this.discover_module(intern, graph, sink, exp_resolved)) {
                     success = false;
                 }
                 const exp_idx: i64 = graph.find_module_by_path(exp_resolved);
@@ -946,7 +936,7 @@ public:
             const eitem_sym: SymbolStr = scan.export_items[eii];
             const eitem_resolved: string = this.resolve_import_path(intern, eitem_sym, file_dir);
             if (eitem_resolved.length() > 0) {
-                if (!this.discover_module(intern, graph, sink, eitem_resolved, debug)) {
+                if (!this.discover_module(intern, graph, sink, eitem_resolved)) {
                     success = false;
                 }
                 const eby_path: i64 = graph.find_module_by_path(eitem_resolved);
@@ -982,11 +972,11 @@ public:
         for (mut s: i64 = 0; s < scan.submodule_count; s++) {
             const sub_sym: SymbolStr = scan.submodule_paths[s];
             const sub_resolved: string = this.resolve_import_path(intern, sub_sym, file_dir);
-            if (debug) {
-                cdebug("[ModuleLoader]   submodule '%s' -> '%s'\n", intern.resolve(sub_sym), sub_resolved);
+            if (Log::enabled(LogArea::Loader, LogLevel::Trace)) {
+                Log::trace(LogArea::Loader, f"submodule '{intern.resolve(sub_sym)}' resolved to '{sub_resolved}'");
             }
             if (sub_resolved.length() > 0) {
-                if (!this.discover_module(intern, graph, sink, sub_resolved, debug)) {
+                if (!this.discover_module(intern, graph, sink, sub_resolved)) {
                     success = false;
                 }
                 // NO add_dependency here; submodules are not real deps.
@@ -1025,29 +1015,89 @@ public:
 
     // Internal: Path Resolution
 
-    /// Search a single directory for a module with case variations.
+    /// Search a single directory for a module with case variations.  The
+    /// path found is spelled as the directory entries are, whichever
+    /// variation found it: a filesystem that ignores case answers the
+    /// first variation, and the path's spelling becomes the file name of
+    /// every span in the module.
     search_location(&this, base_dir: string, fs_path: string) -> string {
         // 1. Directory module: base_dir/fs_path/_module.cryo
-        const dir_module: string = fmt::format("%s/%s/_module.cryo", base_dir, fs_path);
-        if (metadata::exists(Path::from(dir_module))) { return dir_module; }
+        const dir_module: string = fmt::format("%s/_module.cryo", fs_path);
+        if (ModuleLoader::exists_under(base_dir, dir_module)) {
+            return ModuleLoader::spelled_as_on_disk(base_dir, dir_module);
+        }
 
         // 2. Exact case: base_dir/fs_path.cryo
-        const exact: string = fmt::format("%s/%s.cryo", base_dir, fs_path);
-        if (metadata::exists(Path::from(exact))) { return exact; }
+        const exact: string = fmt::format("%s.cryo", fs_path);
+        if (ModuleLoader::exists_under(base_dir, exact)) {
+            return ModuleLoader::spelled_as_on_disk(base_dir, exact);
+        }
 
         // 3. Lowercase: base_dir/lowercase.cryo
-        const lower: string = fmt::format("%s/%s.cryo", base_dir, fs_path.to_ascii_lower());
-        if (metadata::exists(Path::from(lower))) { return lower; }
+        const lower: string = fmt::format("%s.cryo", fs_path.to_ascii_lower());
+        if (ModuleLoader::exists_under(base_dir, lower)) {
+            return ModuleLoader::spelled_as_on_disk(base_dir, lower);
+        }
 
         // 4. Snake case: base_dir/snake_case.cryo
-        const snake: string = fmt::format("%s/%s.cryo", base_dir, ModuleLoader::to_snake_case(fs_path));
-        if (metadata::exists(Path::from(snake))) { return snake; }
+        const snake: string = fmt::format("%s.cryo", ModuleLoader::to_snake_case(fs_path));
+        if (ModuleLoader::exists_under(base_dir, snake)) {
+            return ModuleLoader::spelled_as_on_disk(base_dir, snake);
+        }
 
         // 5. Lowercase directory module
-        const lower_dir: string = fmt::format("%s/%s/_module.cryo", base_dir, fs_path.to_ascii_lower());
-        if (metadata::exists(Path::from(lower_dir))) { return lower_dir; }
+        const lower_dir: string = fmt::format("%s/_module.cryo", fs_path.to_ascii_lower());
+        if (ModuleLoader::exists_under(base_dir, lower_dir)) {
+            return ModuleLoader::spelled_as_on_disk(base_dir, lower_dir);
+        }
 
         return "";
+    }
+
+    static exists_under(base_dir: string, relative: string) -> boolean {
+        return metadata::exists(Path::from(fmt::format("%s/%s", base_dir, relative)));
+    }
+
+    /// `base_dir/relative`, each component of `relative` replaced by the
+    /// entry of its directory that it names.
+    static spelled_as_on_disk(base_dir: string, relative: string) -> string {
+        mut spelled: String = String::new();
+        const separator: Str = Str::new("/");
+        for (component in Str::new(relative).split(&separator)) {
+            const directory: string = if (spelled.is_empty()) { base_dir }
+                else { fmt::format("%s/%s", base_dir, spelled.as_cstr() as string) };
+            const entry: String = ModuleLoader::entry_named(directory, component);
+            if (!spelled.is_empty()) { spelled.push("/"); }
+            spelled.push(entry.as_str());
+        }
+        return fmt::format("%s/%s", base_dir, spelled.as_cstr() as string);
+    }
+
+    /// The entry of `directory` that `name` names: the one spelled exactly
+    /// so, else the first equal to it ignoring ASCII case, else `name`.
+    static entry_named(directory: string, name: Str) -> String {
+        mut entries: ReadDir = match (dir::read_dir(Path::from(directory))) {
+            Result::Ok(r)  => { r }
+            Result::Err(_) => { return String::from_str(name); }
+        };
+        const folded: String = name.to_ascii_lowercase();
+        mut found: Option<String> = Option::None;
+        loop {
+            match (entries.next()) {
+                Option::Some(entry) => {
+                    const entry_name: Str = entry.name();
+                    if (entry_name == name) { return String::from_str(name); }
+                    if (found.is_none() && entry_name.to_ascii_lowercase().as_str() == folded.as_str()) {
+                        found = Option::Some(String::from_str(entry_name));
+                    }
+                }
+                Option::None => { break; }
+            }
+        }
+        match (found) {
+            Option::Some(spelling) => { return spelling; }
+            Option::None           => { return String::from_str(name); }
+        }
     }
 
 

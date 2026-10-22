@@ -39,8 +39,7 @@ import compiler::diag::snapshot;
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::lex::lexer;
 import utils;
-import utils::logger;
-import utils::logger::{ cdebug, LOG_DEBUG, LogComponent, set_compiler_debug };
+import utils::log::{ Log, LogArea, LogLevel };
 import std::fmt;
 import std::fs::metadata;
 import std::fs::metadata::{ metadata };
@@ -105,9 +104,7 @@ function codegen_default_threads() -> u32 { return thread::available_parallelism
 const CODEGEN_MULTIPROC_MIN_MODULES: u32 = 16;
 
 type struct CompilerConfig {
-    debug:              boolean;
     show_ast:           boolean;
-    verbose_passes:     boolean;
     emit_llvm:          boolean;
     /// CLI override for project output_dir.  Empty string ("") means
     /// "use whatever the cryoconfig says".  Set from `--build-dir=...`
@@ -212,35 +209,7 @@ type struct CompilerConfig {
 
     static default() -> CompilerConfig {
         return CompilerConfig {
-            debug:               false,
             show_ast:            false,
-            verbose_passes:      false,
-            emit_llvm:           false,
-            output_dir_override: "",
-            stdlib_path_override: "",
-            test_mode:           false,
-            target_triple_override: "",
-            output_path_override: "",
-            output_kind:         OutputKind::None,
-            opt_level_override:  -1,
-            emit_debug_info:     false,
-            profile_override:    "",
-            incremental:         true,
-            release_static:      false,
-            no_std:              false,
-            no_runtime:          false,
-            panic:               PanicStrategy::Unspecified,
-            locked:              false,
-            codegen_threads_override: -1,
-            plant_unanswered_name: "",
-        };
-    }
-
-    static debug_config() -> CompilerConfig {
-        return CompilerConfig {
-            debug:               true,
-            show_ast:            true,
-            verbose_passes:      true,
             emit_llvm:           false,
             output_dir_override: "",
             stdlib_path_override: "",
@@ -416,29 +385,12 @@ type struct CompilerInstance {
     /// result construction.  All single-file compile_* methods delegate here.
     run_pipeline(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
                  output_path_text: string) -> CompilationResult {
-        const output_path: string = output_path_text;
-        pipeline.set_verbose(this.config.verbose_passes);
-
         if (!pipeline.validate()) {
-            LOG_DEBUG(LogComponent::General, "[Compiler] Pipeline validation FAILED");
+            Log::error(LogArea::Driver, "pipeline validation failed");
             return CompilationResult::failed(1, 0);
         }
 
         const success: boolean = pipeline.run_all(ctx);
-
-        // Write .ll text file when --emit-llvm is set (single-file mode).
-        if (this.config.emit_llvm && ctx.artifacts.ir.is_valid()) {
-            const ll_path: string = fmt::format("%s.ll", output_path);
-            mut ll_err: i8* = null;
-            const ll_ok: i32 = llvm::LLVMPrintModuleToFile(
-                ctx.artifacts.ir.llvm_module, ll_path, &ll_err as void*);
-            if (ll_ok == 0) {
-                fmt::eprintln(f"[Compiler] LLVM IR emitted: {ll_path}");
-            } else if (ll_err != null) {
-                fmt::eprintln(f"warning: failed to write {ll_path}: {ll_err as string}");
-                llvm::LLVMDisposeMessage(ll_err as void*);
-            }
-        }
 
         // Dump AST if --ast was requested
         if (this.config.show_ast && ctx.artifacts.ast.is_valid()) {
@@ -447,7 +399,7 @@ type struct CompilerInstance {
         }
 
         // Print diagnostic summary when ANY diagnostic was emitted (errors
-        // or warnings) or in debug mode.  Without flushing on warnings,
+        // or warnings).  Without flushing on warnings,
         // codegen warnings about silently-dropped function bodies (e.g.
         // missing LLVM declarations for cross-module trait impls) are
         // collected but never rendered, so the user sees a green build
@@ -465,8 +417,7 @@ type struct CompilerInstance {
         };
         if (!skip_flush
                 && (ctx.diagnostics.has_errors()
-                    || ctx.diagnostics.has_warnings()
-                    || this.config.debug)) {
+                    || ctx.diagnostics.has_warnings())) {
             ctx.diagnostics.flush();
             if (ctx.diag_renderer != null) {
                 ctx.diag_renderer.print_summary(
@@ -474,14 +425,9 @@ type struct CompilerInstance {
             }
         }
 
-        if (this.config.debug) {
-            // const r: Resolver * = ctx.get_resolver();
-            // if (r != null) { r.debug_dump(); }
-            ctx.type_arena.debug_dump();
-        }
+        ctx.type_arena.debug_dump();
 
-        LOG_DEBUG(LogComponent::General, "[Compiler] Finished: %s (%u errors, %u warnings)",
-            ctx.source_file, ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
+        Log::debug(LogArea::Driver, f"finished {ctx.source_file}: {ctx.diagnostics.error_count} errors, {ctx.diagnostics.warning_count} warnings");
 
         if (success && !ctx.diagnostics.has_errors()) {
             return CompilationResult::ok_with_warnings(
@@ -514,10 +460,7 @@ type struct CompilerInstance {
     /// the stdlib entirely for freestanding single files.
     compile_file(&this, source_text: string) -> CompilationResult {
         const source: string = source_text;
-        LOG_DEBUG(LogComponent::General, "[Compiler] compile_file: %s", source);
-        if (this.config.debug) {
-            LOG_DEBUG(LogComponent::General, "[Compiler] Compiling: %s (mode: single-file)", source);
-        }
+        Log::debug(LogArea::Driver, f"compiling {source} as a single file");
 
         if (!metadata::exists(Path::from(source))) {
             fmt::eprintln(f"error: file not found: {source}");
@@ -554,17 +497,14 @@ type struct CompilerInstance {
     /// Compile a single source file in raw mode (no stdlib, no prelude).
     compile_raw(&this, source_text: string) -> CompilationResult {
         const source: string = source_text;
-        if (this.config.debug) {
-            LOG_DEBUG(LogComponent::General, "[Compiler] Compiling: %s (mode: raw)", source);
-        }
+        Log::debug(LogArea::Driver, f"compiling {source} raw");
 
         if (!metadata::exists(Path::from(source))) {
-            LOG_DEBUG(LogComponent::General, "[Compiler] Error: File not found: %s", source);
+            Log::error(LogArea::Driver, f"file not found: {source}");
             return CompilationResult::failed(1, 0);
         }
 
         mut options: BuildOptions = BuildOptions::defaults(CompileMode::Raw);
-        options.verbose = this.config.debug;
         options.target_triple = LTargetMachine::resolve_effective_triple(
             this.config.target_triple_override);
         options.output = OutputOverride::from_cli(this.config.output_kind,
@@ -732,7 +672,7 @@ type struct CompilerInstance {
     /// stage across ALL modules before advancing to the next stage.
     compile_project(&this, config_path_text: string) -> CompilationResult {
         const config_path: string = config_path_text;
-        LOG_DEBUG(LogComponent::General, "[Compiler] compile_project: %s", config_path);
+        Log::debug(LogArea::Driver, f"compiling the project at {config_path}");
 
         // Project configuration
         mut config: ProjectConfig = ProjectConfig::parse(config_path_text);
@@ -775,12 +715,11 @@ type struct CompilerInstance {
             this.config.plant_unanswered_name = config.test_plant_unanswered_name;
         }
 
-        // Mirror cryoconfig `debug = true` into the global compiler debug
-        // gate so the [Tag] trace printfs fire.  Only flips it ON; CLI
-        // `--debug` already turned it on if present, and we don't want
-        // `debug = false` in cryoconfig to override that.
+        // cryoconfig `debug = true` is `--debug`, beneath the environment
+        // and the command line: an area `CRYO_LOG` or `--log` set keeps its
+        // level, and `debug = false` switches nothing off.
         if (config.debug) {
-            set_compiler_debug(true);
+            Log::configure_from_project(Str::new("debug"), "cryoconfig");
         }
 
         // Multi-target projects ([lib] and/or [[bin]]) build each output
@@ -822,8 +761,7 @@ type struct CompilerInstance {
         const derive_lib: boolean = base.lib.is_present() && base.bins.length > 0;
 
         if (base.lib.is_present() && !derive_lib) {
-            cdebug("[Compiler] Multi-target: building lib '%s' from %s\n",
-                base.lib.name, base.lib.source_dir);
+            Log::debug(LogArea::Driver, f"building lib '{base.lib.name}' from {base.lib.source_dir}");
             // Clone so `base` survives for the per-bin views below.
             const lib_view: ProjectConfig = CompilerInstance::make_lib_view(base.clone());
             const r: CompilationResult = this.compile_project_with_config(lib_view);
@@ -831,8 +769,7 @@ type struct CompilerInstance {
         }
 
         for (mut i: i64 = 0; i < base.bins.length; i++) {
-            cdebug("[Compiler] Multi-target: building bin '%s' from %s\n",
-                base.bins[i].name, base.bins[i].entry_point);
+            Log::debug(LogArea::Driver, f"building bin '{base.bins[i].name}' from {base.bins[i].entry_point}");
             // Clone `base` per iteration; make_bin_view consumes its first arg.
             const sel: BinTarget = base.bins[i];
             mut bin_view: ProjectConfig = CompilerInstance::make_bin_view(base.clone(), sel);
@@ -853,8 +790,7 @@ type struct CompilerInstance {
         // isolates the module graph, so members with disjoint namespaces do not
         // interfere; each member's name keys its own archive + incremental state.
         for (mut i: i64 = 0; i < base.libs.length; i++) {
-            cdebug("[Compiler] Workspace: building lib '%s' from %s\n",
-                base.libs[i].name, base.libs[i].source_dir);
+            Log::debug(LogArea::Driver, f"building workspace lib '{base.libs[i].name}' from {base.libs[i].source_dir}");
             // Clone `base` per iteration; make_lib_member_view consumes its first arg.
             const sel: LibTarget = base.libs[i];
             const lib_view: ProjectConfig = CompilerInstance::make_lib_member_view(base.clone(), sel);
@@ -896,9 +832,7 @@ type struct CompilerInstance {
     compile_project_with_config(&this, config: ProjectConfig) -> CompilationResult {
         const root_path: string = config.discovery_root_path();
 
-        cdebug("[Compiler] Project: %s (target: %s, root: %s, no_std: %d, no_runtime: %d)\n",
-            config.project_name, config.target_type.label(), root_path,
-            config.no_std as int, config.no_runtime as int);
+        Log::debug(LogArea::Driver, f"project {config.project_name} (target {config.target_type.label()}, root {root_path}, no_std {config.no_std}, no_runtime {config.no_runtime})");
 
         if (!metadata::exists(Path::from(root_path))) {
             // Route to stderr: stdout in LSP mode owns the JSON-RPC stream;
@@ -984,7 +918,7 @@ type struct CompilerInstance {
                 config.project_root,
                 &tried);
             if (stdlib_root.length() > 0) {
-                cdebug("[Compiler] Stdlib root: %s\n", stdlib_root);
+                Log::debug(LogArea::Driver, f"standard library root {stdlib_root}");
             } else {
                 // No prelude available: hard-fail rather than silently
                 // compile a project that can't see `Result`, `String`,
@@ -1006,7 +940,6 @@ type struct CompilerInstance {
         }
 
         mut options: BuildOptions = BuildOptions::defaults(mode);
-        options.verbose = this.config.debug;
         options.output = OutputOverride::from_cli(this.config.output_kind,
                                                   this.config.output_path_override);
         // Base from the profile (debug => O0, release => O2); an explicit
@@ -1030,6 +963,7 @@ type struct CompilerInstance {
         options.target_triple = LTargetMachine::resolve_effective_triple(
             config.target_triple);
         options.static_link = this.config.release_static;
+        options.emit_llvm = this.config.emit_llvm || config.emit_llvm;
         options.source_overrides = overlays;
         options.yield_hook = this.yield_hook;
 
@@ -1082,10 +1016,10 @@ type struct CompilerInstance {
         // until its own context is published at Frontend.
         compiler::codegen::llvm_types::dispose_codegen_context();
 
-        // CRYO_TIMINGS phase profiling.  All marks are captured regardless;
-        // the report only prints (success path) when the env var is set, so
-        // the overhead on a normal build is a handful of `clock_gettime`s.
-        const tm_on: boolean = CompilerInstance::timing_enabled();
+        // Phase timings.  All marks are captured regardless; the report only
+        // prints (success path) when the `time` area logs at info, so the
+        // overhead on a normal build is a handful of `clock_gettime`s.
+        const tm_on: boolean = Log::enabled(LogArea::Time, LogLevel::Info);
         const tm_entry:        i64 = Instant::now().as_nanos();
         mut tm_discovery_end:  i64 = 0;
         mut tm_frontend_end:   i64 = 0;
@@ -1131,8 +1065,7 @@ type struct CompilerInstance {
         }
         for (mut dr: i64 = 0; dr < dep_outcome.roots.length; dr++) {
             effective_roots.push(dep_outcome.roots[dr].path);
-            cdebug("[Compiler] Dependency scan root: %s (%s)\n",
-                dep_outcome.roots[dr].path, dep_outcome.roots[dr].name);
+            Log::debug(LogArea::Deps, f"dependency scan root {dep_outcome.roots[dr].path} ({dep_outcome.roots[dr].name})");
         }
 
         mut loader: ModuleLoader = ModuleLoader::new(
@@ -1172,7 +1105,7 @@ type struct CompilerInstance {
 
         const discovery_ok: boolean = loader.discover_project(
             ctx.intern_table, ctx.module_graph, ctx.diagnostics,
-            root_path, this.config.debug);
+            root_path);
 
         if (!discovery_ok) {
             // Flush deferred diagnostics so the user actually SEES the
@@ -1238,7 +1171,7 @@ type struct CompilerInstance {
             if (metadata::exists(Path::from(prelude_path))) {
                 loader.discover_module(
                     ctx.intern_table, ctx.module_graph, ctx.diagnostics,
-                    prelude_path, this.config.debug);
+                    prelude_path);
             }
         }
 
@@ -1253,27 +1186,26 @@ type struct CompilerInstance {
         if (ctx.options.mode.skip_user_main()) {
             const tests_dir: string = fmt::format("%s/tests", config.project_root);
             if (metadata::exists(Path::from(tests_dir))) {
-                loader.scan_all_project_files(ctx.intern_table, tests_dir, this.config.debug);
+                loader.scan_all_project_files(ctx.intern_table, tests_dir);
                 loader.discover_tests_directory(
                     ctx.intern_table, ctx.module_graph, ctx.diagnostics,
-                    tests_dir, this.config.debug);
-                cdebug("[Compiler] tests/ discovery complete from %s\n", tests_dir);
-            } else {
-                cdebug("[Compiler] tests/ directory not found at %s; running with no tests\n",
                     tests_dir);
+                Log::debug(LogArea::Loader, f"discovered tests from {tests_dir}");
+            } else {
+                Log::debug(LogArea::Loader, f"no tests directory at {tests_dir}; running with no tests");
             }
             if (!config.no_std && stdlib_root.length() > 0) {
                 const env_path: string = fmt::format("%s/env/_module.cryo", stdlib_root);
                 if (metadata::exists(Path::from(env_path))) {
                     loader.discover_module(
                         ctx.intern_table, ctx.module_graph, ctx.diagnostics,
-                        env_path, this.config.debug);
+                        env_path);
                 }
                 const runner_path: string = fmt::format("%s/test/runner.cryo", stdlib_root);
                 if (metadata::exists(Path::from(runner_path))) {
                     loader.discover_module(
                         ctx.intern_table, ctx.module_graph, ctx.diagnostics,
-                        runner_path, this.config.debug);
+                        runner_path);
                 }
             }
         }
@@ -1298,12 +1230,11 @@ type struct CompilerInstance {
             if (metadata::exists(Path::from(interp_path))) {
                 loader.discover_module(
                     ctx.intern_table, ctx.module_graph, ctx.diagnostics,
-                    interp_path, this.config.debug);
+                    interp_path);
             }
         }
 
-        cdebug("[Compiler] After discovery: module_count=%u, modules.length=%u\n",
-            ctx.module_graph.module_count(), ctx.module_graph.modules.length);
+        Log::debug(LogArea::Loader, f"discovered {ctx.module_graph.module_count()} modules");
         ctx.module_graph.resolve_edges();
 
         // Classify each discovered module's origin from its file_path so
@@ -1480,7 +1411,6 @@ type struct CompilerInstance {
         }
 
         // Compute topological order
-        cdebug("[Compiler] Calling compute_order()...\n");
         if (!ctx.module_graph.compute_order()) {
             // Name the modules that could not be placed.  Without this the
             // user saw only "Project compilation failed (1 errors, ...)" with
@@ -1513,11 +1443,11 @@ type struct CompilerInstance {
         const n: u32 = order.length as u32;
         tm_discovery_end = Instant::now().as_nanos();
 
-        cdebug("[Compiler] Discovered %u modules, compilation order:\n", n);
-        for (mut i: u32 = 0; i < n; i++) {
-            const info: ModuleInfo* = &ctx.module_graph.modules[order[i]];
-            cdebug("  [%u] %s (%s)\n", i,
-                ctx.intern_table.shown(info.path().decl_name()), info.file_path);
+        if (Log::enabled(LogArea::Loader, LogLevel::Trace)) {
+            for (mut i: u32 = 0; i < n; i++) {
+                const info: ModuleInfo* = &ctx.module_graph.modules[order[i]];
+                Log::trace(LogArea::Loader, f"compilation order {i}: {ctx.intern_table.shown(info.path().decl_name())} ({info.file_path})");
+            }
         }
 
         // Incremental whole-build fingerprint + short-circuit.
@@ -1659,7 +1589,6 @@ type struct CompilerInstance {
         mem::zero::<u8>(ast_buf as u8*, buf_size);
 
         mut pipeline: PassRegistry = PassRegistry::new();
-        pipeline.set_verbose(this.config.verbose_passes);
 
         // Run each stage across ALL modules before advancing to the next; see
         // the stage-driver block below for why the ordering is load-bearing.
@@ -2013,9 +1942,7 @@ type struct CompilerInstance {
             }
         }
 
-        if (this.config.debug) {
-            ctx.type_arena.debug_dump();
-        }
+        ctx.type_arena.debug_dump();
 
         // Invariant guard (gated by CRYO_TYPE_AUDIT): canonical type identity.
         // Off by default; zero cost when unset.
@@ -2049,10 +1976,9 @@ type struct CompilerInstance {
         // Codegen: per-module IR generation, optimization, object emission.
         // Each module gets its own LLVM module. Cross-module references are
         // resolved through SymbolResolver.
-        cdebug("[Compiler] Codegen gate: phase6_failed=%d, codegen_enabled=%d, errors=%u\n",
-            phase6_failed as int, ctx.options.mode.codegen_enabled() as int, ctx.diagnostics.error_count);
+        Log::debug(LogArea::Driver, f"codegen gate: analysis failed {phase6_failed}, codegen enabled {ctx.options.mode.codegen_enabled()}, {ctx.diagnostics.error_count} errors");
         if (!phase6_failed && ctx.options.mode.codegen_enabled()) {
-            cdebug("[Compiler] Codegen: %u modules\n", n);
+            Log::debug(LogArea::Driver, f"generating code for {n} modules");
 
             // Concise per-package build summary.  Codegen only runs on a real
             // (non-short-circuited) build and never under LSP, so this is safe
@@ -2162,6 +2088,23 @@ type struct CompilerInstance {
                     Option::None    => { multiproc = false; }
                 }
             }
+            // The out-of-process emitter builds its target machines in the
+            // workers, so a triple LLVM has no target for is refused here,
+            // once and before any IR is generated, as the in-process path
+            // refuses it at its first module.
+            if (multiproc) {
+                const mp_check_triple: string = CodegenPasses::effective_triple(ctx);
+                match (LTargetMachine::create_target_machine_with_opt(
+                        mp_check_triple, ctx.options.opt_level as i32)) {
+                    Result::Ok(machine) => {
+                        mut checked: LTargetMachine = machine;
+                        checked.dispose();
+                    }
+                    Result::Err(reason) => {
+                        CodegenPasses::report_missing_target(ctx, mp_check_triple, reason);
+                    }
+                }
+            }
             // In-flight cap for the threaded path: bounds live LLVM contexts so
             // the whole target's modules never sit in memory at once.  `serial`
             // mode (or a 1-thread build) caps at 1 -> flush every module
@@ -2180,7 +2123,6 @@ type struct CompilerInstance {
             // the whole loop, in topo order, keeps the linker's input order
             // identical regardless of the order objects finish emitting.
             mut cg_obj: [string] = [];
-            mut cg_failed: boolean = false;
             for (mut r: u32 = 0; r < n; r++) { cg_obj.push(""); }
 
             // Multi-process collection: parallel arrays of (bitcode, object)
@@ -2210,12 +2152,13 @@ type struct CompilerInstance {
                 // line per module, none of them true, printed ahead of the
                 // one error that is.
                 if (ctx.diagnostics.has_errors()) {
-                    cg_failed = true;
                     break;
                 }
                 const _mi: ModuleInfo* = &ctx.module_graph.modules[order[i]];
                 const _mn: string = ctx.intern_table.shown(_mi.path().decl_name());
-                cdebug("[Compiler] Codegen: module %u/%u (%s)\n", i, n, _mn);
+                if (Log::enabled(LogArea::Driver, LogLevel::Debug)) {
+                    Log::debug(LogArea::Driver, f"generating module {i} of {n}: {_mn}");
+                }
                 // Cached module: reuse the on-disk object instead of
                 // regenerating IR + emitting it.  Recorded at this topo
                 // position; registered with everything else below.
@@ -2224,7 +2167,9 @@ type struct CompilerInstance {
                         ctx.project_config.deps_dir_for(
                             ModuleInfo::origin_subdir(_mi.origin, _mi.origin_name)),
                         compiler::build_manifest::Manifest::path_module(_mn));
-                    cdebug("[Compiler] Codegen: reused cached object %s\n", cg_obj[i as i64]);
+                    if (Log::enabled(LogArea::Driver, LogLevel::Debug)) {
+                        Log::debug(LogArea::Driver, f"reused the cached object {cg_obj[i as i64]}");
+                    }
                     continue;
                 }
 
@@ -2259,22 +2204,33 @@ type struct CompilerInstance {
 
                 const _gen_ok: boolean = pipeline.run_all(ctx);
 
+                const mod_info: ModuleInfo* = &ctx.module_graph.modules[order[i]];
+                const mod_name: string = ctx.intern_table.shown(mod_info.path().decl_name());
+
                 if (!ctx.artifacts.ir.is_valid()) {
                     // IR generation failed for this module.  The fresh context
                     // has no module to emit; reclaim it now.  An error this
-                    // module reported already names the failure; the line is
-                    // for a module that came back empty without one.
+                    // module reported already names the failure; a module that
+                    // came back empty without one is the compiler's own fault.
                     if (!ctx.diagnostics.has_errors()) {
-                        fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, i)}");
+                        ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                            fmt::format("generating the IR of module %s failed without reporting why",
+                                CompilerInstance::codegen_module_name(ctx, i)));
                     }
-                    cg_failed = true;
+                    // A module the verifier refused is written all the same,
+                    // so the IR it refused can be read.  It dies with its
+                    // context below.
+                    if (ctx.artifacts.unverified_ir.is_valid()) {
+                        if (ctx.options.emit_llvm) {
+                            CompilerInstance::write_module_ir(
+                                ctx, mod_info, mod_name, ctx.artifacts.unverified_ir.llvm_module);
+                        }
+                        ctx.artifacts.unverified_ir = IROutput::empty();
+                    }
                     compiler::codegen::llvm_types::dispose_codegen_context();
                     pipeline.reset();
                     continue;
                 }
-
-                const mod_info: ModuleInfo* = &ctx.module_graph.modules[order[i]];
-                const mod_name: string = ctx.intern_table.shown(mod_info.path().decl_name());
 
                 // Invariant guard (gated by CRYO_CTX_AUDIT): every module must be
                 // self-contained in its own context for the zero-copy threaded
@@ -2290,29 +2246,9 @@ type struct CompilerInstance {
                 // Write the `.ll` text dump while the module is still on the main
                 // thread (before it is handed to a worker), when --emit-llvm is
                 // set via CLI flag or cryoconfig args.
-                if (this.config.emit_llvm || config.emit_llvm) {
-                    mut ir_dir: string = "build/target/release/local/ir";
-                    if (ctx.project_config != null) {
-                        ir_dir = ctx.project_config.ir_dir_for(
-                            ModuleInfo::origin_subdir(
-                                mod_info.origin, mod_info.origin_name));
-                    }
-                    // IR (`.ll`) files mirror the module namespace as
-                    // SUBDIRECTORIES under `ir/`, exactly like the object files
-                    // under `deps/` - same `Manifest::path_module` mapping - so the
-                    // IR tree mirrors the source tree instead of one flat folder
-                    // of `__`-joined stems.
-                    const ll_rel: string =
-                        compiler::build_manifest::Manifest::path_module(mod_name);
-                    const ll_path: string = fmt::format("%s/%s.ll", ir_dir, ll_rel);
-                    ProjectConfig::mkdir_p(ll_path.parent_dir());
-                    mut ll_err: i8* = null;
-                    const ll_ok: i32 = llvm::LLVMPrintModuleToFile(
-                        ctx.artifacts.ir.llvm_module, ll_path, &ll_err as void*);
-                    if (ll_ok != 0 && ll_err != null) {
-                        fmt::eprintln(f"warning: failed to write {ll_path}: {ll_err as string}");
-                        llvm::LLVMDisposeMessage(ll_err as void*);
-                    }
+                if (ctx.options.emit_llvm) {
+                    CompilerInstance::write_module_ir(
+                        ctx, mod_info, mod_name, ctx.artifacts.ir.llvm_module);
                 }
 
                 // Resolve WHERE/HOW to emit on the MAIN thread (needs ctx + the
@@ -2331,6 +2267,11 @@ type struct CompilerInstance {
                     continue;
                 }
 
+                // An earlier build's object is removed before this one is
+                // emitted: an emit that writes nothing then leaves nothing,
+                // and is refused, instead of leaving the old object to link.
+                CodegenPasses::remove_previous_output(tgt.emit_path);
+
                 if (multiproc) {
                     // Serialize the module to bitcode and dispose it immediately
                     // (one live context at a time - lower peak RSS than the
@@ -2347,8 +2288,7 @@ type struct CompilerInstance {
                         mp_obj.push(tgt.emit_path);
                         mp_pos.push(i);
                     } else {
-                        fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, i)}");
-                        cg_failed = true;
+                        CodegenPasses::report_emit_failure(ctx, bc_path, String::new());
                     }
                     continue;
                 }
@@ -2366,8 +2306,20 @@ type struct CompilerInstance {
                 // workers; `cg_batch_cap == 1` flushes one at a time, byte-
                 // identical to a serial build.
                 const cg_tri: string = CodegenPasses::effective_triple(ctx);
-                mut cg_tm: LTargetMachine = LTargetMachine::create_target_machine_with_opt(
-                    cg_tri, ctx.options.opt_level as i32);
+                mut cg_tm: LTargetMachine = match (LTargetMachine::create_target_machine_with_opt(
+                        cg_tri, ctx.options.opt_level as i32)) {
+                    Result::Ok(machine) => { machine }
+                    Result::Err(reason) => {
+                        // Reported once: the next module stops on the error.
+                        CodegenPasses::report_missing_target(ctx, cg_tri, reason);
+                        mut unemitted: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
+                        unemitted.dispose();
+                        ctx.artifacts.ir = IROutput::empty();
+                        compiler::codegen::llvm_types::dispose_codegen_context();
+                        pipeline.reset();
+                        continue;
+                    }
+                };
                 cg_jobs.push(EmitJob {
                     llvm_module:     ctx.artifacts.ir.llvm_module,
                     llvm_context:    compiler::codegen::llvm_types::current_codegen_context(),
@@ -2388,31 +2340,7 @@ type struct CompilerInstance {
 
                 if (cg_jobs.length as u32 >= cg_batch_cap) {
                     CompilerInstance::emit_jobs_threaded(&cg_jobs, cg_threads);
-                    for (mut b: i64 = 0; b < cg_jobs.length as i64; b++) {
-                        const p: u32 = cg_pos[b];
-                        if (cg_jobs[b].ok &&
-                            !metadata::exists(Path::from(cg_jobs[b].emit_path))) {
-                            // Reported success and wrote nothing. In an
-                            // incremental build the previous build's object is
-                            // still on disk and would be archived in its place,
-                            // silently, so this has to fail the build.
-                            fmt::eprintln(f"error: codegen wrote no object for module {CompilerInstance::codegen_module_name(ctx, p)}");
-                            cg_failed = true;
-                        } else if (cg_jobs[b].ok) {
-                            cg_obj[p as i64] = cg_jobs[b].emit_path;
-                        } else {
-                            const emsg: string = cg_jobs[b].err_msg;
-                            if (emsg != null as string) {
-                                fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, p)}: {emsg}");
-                            } else {
-                                fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, p)}");
-                            }
-                            cg_failed = true;
-                        }
-                        if (cg_jobs[b].err_msg != null as string) {
-                            llvm::LLVMDisposeMessage(cg_jobs[b].err_msg as void*);
-                        }
-                    }
+                    CompilerInstance::record_emitted_jobs(ctx, &cg_jobs, &cg_pos, &cg_obj);
                     cg_jobs.clear();
                     cg_pos.clear();
                 }
@@ -2421,34 +2349,15 @@ type struct CompilerInstance {
             // Flush any remaining accumulated jobs (the final partial batch).
             if (cg_jobs.length > 0) {
                 CompilerInstance::emit_jobs_threaded(&cg_jobs, cg_threads);
-                for (mut b: i64 = 0; b < cg_jobs.length as i64; b++) {
-                    const p: u32 = cg_pos[b];
-                    if (cg_jobs[b].ok &&
-                        !metadata::exists(Path::from(cg_jobs[b].emit_path))) {
-                        fmt::eprintln(f"error: codegen wrote no object for module {CompilerInstance::codegen_module_name(ctx, p)}");
-                        cg_failed = true;
-                    } else if (cg_jobs[b].ok) {
-                        cg_obj[p as i64] = cg_jobs[b].emit_path;
-                    } else {
-                        const emsg: string = cg_jobs[b].err_msg;
-                        if (emsg != null as string) {
-                            fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, p)}: {emsg}");
-                        } else {
-                            fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, p)}");
-                        }
-                        cg_failed = true;
-                    }
-                    if (cg_jobs[b].err_msg != null as string) {
-                        llvm::LLVMDisposeMessage(cg_jobs[b].err_msg as void*);
-                    }
-                }
+                CompilerInstance::record_emitted_jobs(ctx, &cg_jobs, &cg_pos, &cg_obj);
                 cg_jobs.clear();
                 cg_pos.clear();
             }
 
             // Fan the multi-process emit out to child processes, then record
-            // each object (verifying it exists so a crashed worker fails the
-            // build rather than silently dropping an object).
+            // each object.  A module whose object is missing is refused with
+            // the note its worker left, or as written by nobody when the
+            // workers all ran; a fan-out that failed is refused once itself.
             if (multiproc) {
                 mut mf_dir: string = "build";
                 if (ctx.project_config != null) {
@@ -2457,16 +2366,29 @@ type struct CompilerInstance {
                 ProjectConfig::mkdir_p(mf_dir);
                 const manifest: string = fmt::format("%s/.cryo_emit_manifest.txt", mf_dir);
                 const mp_triple: string = CodegenPasses::effective_triple(ctx);
-                const emit_ok: boolean = CodegenPasses::run_multiprocess_emit(
-                    &mp_bc, &mp_obj, mp_triple, ctx.options.opt_level, cg_threads,
-                    self_exe, manifest);
-                if (!emit_ok) { cg_failed = true; }
+                mut workers_ran: boolean = true;
+                match (CodegenPasses::run_multiprocess_emit(
+                        &mp_bc, &mp_obj, mp_triple, ctx.options.opt_level, cg_threads,
+                        self_exe, manifest)) {
+                    Result::Ok(_) => { }
+                    Result::Err(reason) => {
+                        CodegenPasses::report_emit_workers_failed(ctx, reason);
+                        workers_ran = false;
+                    }
+                }
                 for (mut k: i64 = 0; k < mp_pos.length as i64; k++) {
-                    if (metadata::exists(Path::from(mp_obj[k]))) {
-                        cg_obj[mp_pos[k] as i64] = mp_obj[k];
-                    } else {
-                        fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, mp_pos[k])}");
-                        cg_failed = true;
+                    match (CodegenPasses::take_failure_note(mp_obj[k])) {
+                        Option::Some(reason) => {
+                            CodegenPasses::report_emit_failure(ctx, mp_obj[k], reason);
+                        }
+                        Option::None => {
+                            if (metadata::exists(Path::from(mp_obj[k]))) {
+                                cg_obj[mp_pos[k] as i64] = mp_obj[k];
+                            } else if (workers_ran) {
+                                CodegenPasses::report_emit_failure(ctx, mp_obj[k],
+                                    String::from("its worker exited without writing it"));
+                            }
+                        }
                     }
                 }
             }
@@ -2490,7 +2412,7 @@ type struct CompilerInstance {
             // a fresh LLVM module containing the descriptor table + main,
             // emits it to disk, and registers it with the linker artifacts.
             if (!ctx.diagnostics.has_errors() && ctx.options.mode.skip_user_main()) {
-                cdebug("[Compiler] test-main synthesis: Synthesizing test main\n");
+                Log::debug(LogArea::Driver, "synthesizing the test main");
                 const test_result: PassResult = TestMainCodegen::run_test_main_codegen(ctx);
                 if (!test_result.success) {
                     fmt::eprintf("error: test-main synthesis failed\n");
@@ -2510,8 +2432,7 @@ type struct CompilerInstance {
             // Only runs when Codegen produced at least one object (executable
             // targets); library/stdlib builds short-circuit inside run_linking.
             if (!ctx.diagnostics.has_errors() && ctx.artifacts.object_files.length > 0) {
-                cdebug("[Compiler] Linking: %lld objects\n",
-                    ctx.artifacts.object_files.length);
+                Log::debug(LogArea::Link, f"linking {ctx.artifacts.object_files.length} objects");
                 const link_result: PassResult = CodegenPasses::run_linking(ctx);
                 if (!link_result.success) {
                     fmt::eprintf("error: linking failed\n");
@@ -2564,24 +2485,11 @@ type struct CompilerInstance {
                 if (!bres.success) {
                     fmt::eprintf("error: deriving %s from bin objects failed\n", lib_archive);
                 } else {
-                    cdebug("[Compiler] Compile-once: derived %s from %lld bin object(s)\n",
-                        lib_archive, lib_objs.length);
+                    Log::debug(LogArea::Link, f"derived {lib_archive} from {lib_objs.length} bin objects");
                 }
             }
             tm_link_end = Instant::now().as_nanos();
         }
-
-        // Print diagnostic summary on errors, warnings, or debug mode.
-        // Without flushing on warnings, codegen-side warnings about
-        // silently-dropped function bodies never reach the user; the
-        // build looks green, then the linker fails with `undefined
-        // reference`.
-        // Skip terminal flush in LSP mode; same rationale as in
-        // `run_pipeline`: the renderer fprintfs to `g_stderr` which
-        // a host that drives the compiler purely as a library hasn't
-        // necessarily wired up (the LSP, for one, gets `NULL`).  The
-        // language server reads `ctx.diagnostics.diagnostics` directly
-        // and emits them as JSON over stdout.
 
         // A stage required a node's `Res` and no resolver had written one.
         // That is an internal error rather than a licence to search: the
@@ -2620,14 +2528,18 @@ type struct CompilerInstance {
 
         CompilerInstance::report_unstamped_decls(ctx);
 
+        // Print the diagnostic summary on errors or warnings: a codegen
+        // warning about a dropped function body that is never flushed reads
+        // as a green build until the linker fails with `undefined reference`.
+        // The language server reads `ctx.diagnostics.diagnostics` directly
+        // and has no stream for the renderer, so it skips the flush.
         const skip_flush: boolean = match (ctx.options.mode) {
             CompileMode::Lsp => { true }
             _                => { false }
         };
         if (!skip_flush
                 && (ctx.diagnostics.has_errors()
-                    || ctx.diagnostics.has_warnings()
-                    || this.config.debug)) {
+                    || ctx.diagnostics.has_warnings())) {
             ctx.diagnostics.flush();
             if (ctx.diag_renderer != null) {
                 ctx.diag_renderer.print_summary(
@@ -2690,7 +2602,7 @@ type struct CompilerInstance {
             }
         }
 
-        // CRYO_TIMINGS report: per-phase wall time + the frontend/backend
+        // Timing report: per-phase wall time + the frontend/backend
         // split that gates the per-module-incremental design (only the
         // backend - SemanticAnalysis + Codegen + link - is cacheable per module; the
         // frontend and whole-program monomorphization must always run).
@@ -2703,21 +2615,20 @@ type struct CompilerInstance {
             const total: i64 = tm_end - tm_entry;
             const fe: i64 = tm_mono_end - tm_entry;
             const be: i64 = tm_end - tm_mono_end;
-            fmt::println(f"\n=== cryo build timings ({config.project_name}) ===");
-            CompilerInstance::timing_fmt("discovery (discovery)", tm_discovery_end - tm_entry, total);
-            CompilerInstance::timing_fmt("frontend (frontend)", tm_frontend_end - tm_discovery_end, total);
-            CompilerInstance::timing_fmt("monomorphization (6a)", tm_mono_end - tm_frontend_end, total);
-            CompilerInstance::timing_fmt("sema/lowering (6b)", tm_sema_end - tm_mono_end, total);
+            Log::info(LogArea::Time, f"build timings for {config.project_name}");
+            Log::info(LogArea::Time, CompilerInstance::timing_line("discovery", tm_discovery_end - tm_entry, total));
+            Log::info(LogArea::Time, CompilerInstance::timing_line("frontend", tm_frontend_end - tm_discovery_end, total));
+            Log::info(LogArea::Time, CompilerInstance::timing_line("monomorphization", tm_mono_end - tm_frontend_end, total));
+            Log::info(LogArea::Time, CompilerInstance::timing_line("sema and lowering", tm_sema_end - tm_mono_end, total));
             if (tm_codegen_end > 0) {
-                CompilerInstance::timing_fmt("codegen+objects (7)", tm_codegen_end - tm_sema_end, total);
+                Log::info(LogArea::Time, CompilerInstance::timing_line("codegen and objects", tm_codegen_end - tm_sema_end, total));
             }
             if (tm_link_end > 0) {
-                CompilerInstance::timing_fmt("link (8)", tm_link_end - tm_codegen_end, total);
+                Log::info(LogArea::Time, CompilerInstance::timing_line("link", tm_link_end - tm_codegen_end, total));
             }
-            fmt::printf("  %-28s\n", "----");
-            CompilerInstance::timing_fmt("FRONTEND (1-6a, uncacheable)", fe, total);
-            CompilerInstance::timing_fmt("BACKEND  (6b+7+link, cacheable)", be, total);
-            CompilerInstance::timing_fmt("TOTAL", total, total);
+            Log::info(LogArea::Time, CompilerInstance::timing_line("frontend, uncacheable", fe, total));
+            Log::info(LogArea::Time, CompilerInstance::timing_line("backend, cacheable", be, total));
+            Log::info(LogArea::Time, CompilerInstance::timing_line("total", total, total));
         }
 
         mut ok_result: CompilationResult = CompilationResult::ok(exe_path);
@@ -2748,7 +2659,7 @@ type struct CompilerInstance {
                  ast_buf: void*) -> boolean {
         const order: &[u32] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
-        cdebug("[Compiler] Frontend: %u module(s)\n", n);
+        Log::debug(LogArea::Driver, f"frontend over {n} modules");
         pipeline.set_passes([PassID::Lexing, PassID::Parsing,
                              PassID::ConfigGating,
                              PassID::ASTValidation, PassID::CHeaderImport]);
@@ -2759,7 +2670,7 @@ type struct CompilerInstance {
             ctx.options.yield_between_modules();
             ctx.switch_to_module(mod_idx as i64);
             if (!pipeline.run_all(ctx)) {
-                fmt::eprintln(f"error: frontend pipeline failed for module {i}");
+                Log::error(LogArea::Driver, f"the frontend failed for module {ctx.module_graph.modules[mod_idx].file_path}");
                 return false;
             }
             // Save the parsed AST using local buffer
@@ -3488,25 +3399,15 @@ type struct CompilerInstance {
         return true;
     }
 
-    /// True when the `CRYO_TIMINGS` env var is set to a non-empty value.  Gates
-    /// the per-phase wall-time report printed at the end of a successful build.
-    static timing_enabled() -> boolean {
-        match (env::var(Str::new("CRYO_TIMINGS"))) {
-            Option::Some(v) => { return v.length() > 0; }
-            Option::None => { return false; }
-        }
-    }
-
-    /// Render a nanosecond span as milliseconds with one decimal place, plus
-    /// its share of `total_ns`.  Pure formatting helper for the timing report.
-    static timing_fmt(label: string, span_ns: i64, total_ns: i64) -> void {
+    /// A nanosecond span as milliseconds with one decimal place, plus its
+    /// share of `total_ns`: one line of the timing report.
+    static timing_line(label: string, span_ns: i64, total_ns: i64) -> String {
         const ms_x10: i64 = (span_ns + 50000) / 100000;
         mut pct: i64 = 0;
         if (total_ns > 0) {
             pct = (span_ns * 100 + total_ns / 2) / total_ns;
         }
-        fmt::printf("  %-28s %6lld.%lld ms  (%lld%%)\n",
-            label, ms_x10 / 10, ms_x10 % 10, pct);
+        return f"{label}: {ms_x10 / 10}.{ms_x10 % 10} ms ({pct}%)";
     }
 
     /// Parallel-codegen worker count.  `CRYO_CODEGEN_THREADS` overrides; 0/1
@@ -3654,6 +3555,28 @@ type struct CompilerInstance {
         return ctx.intern_table.shown(info.path().decl_name());
     }
 
+    /// Write one module's IR text under its origin's `ir/` directory.  The
+    /// files mirror the module namespace as subdirectories, by the same
+    /// `Manifest::path_module` mapping as the objects under `deps/`, so the
+    /// IR tree mirrors the source tree.
+    static write_module_ir(ctx: CompilationContext*, mod_info: ModuleInfo*,
+                           mod_name: string, llvm_module: void*) -> void {
+        mut ir_dir: string = "build/target/release/local/ir";
+        if (ctx.project_config != null) {
+            ir_dir = ctx.project_config.ir_dir_for(
+                ModuleInfo::origin_subdir(mod_info.origin, mod_info.origin_name));
+        }
+        const ll_rel: string = compiler::build_manifest::Manifest::path_module(mod_name);
+        const ll_path: string = fmt::format("%s/%s.ll", ir_dir, ll_rel);
+        ProjectConfig::mkdir_p(ll_path.parent_dir());
+        mut ll_err: i8* = null;
+        const ll_rc: i32 = llvm::LLVMPrintModuleToFile(llvm_module, ll_path, &ll_err as void*);
+        if (ll_rc != 0 && ll_err != null) {
+            fmt::eprintln(f"warning: failed to write {ll_path}: {ll_err as string}");
+            llvm::LLVMDisposeMessage(ll_err as void*);
+        }
+    }
+
     /// `nthreads <= 1` (or a single job) runs the batch inline via
     /// `emit_jobs_serial`, keeping a serial build byte-identical.
     static emit_jobs_threaded(jobs: [EmitJob]*, nthreads: u32) -> void {
@@ -3688,5 +3611,25 @@ type struct CompilerInstance {
 
         // All workers joined; dispose on the main thread.
         CompilerInstance::dispose_emit_jobs(jobs);
+    }
+
+    /// Record each emitted job's object at its module's topo position in
+    /// `objects`, and report each job that failed.
+    static record_emitted_jobs(ctx: CompilationContext*, jobs: [EmitJob]*,
+                               positions: [u32]*, objects: [string]*) -> void {
+        for (mut b: i64 = 0; b < (*jobs).length as i64; b++) {
+            const job: EmitJob* = &(*jobs)[b];
+            const reason: String = LTargetMachine::take_message(job.err_msg as i8*);
+            if (!job.ok) {
+                CodegenPasses::report_emit_failure(ctx, job.emit_path, reason);
+            } else if (!metadata::exists(Path::from(job.emit_path))) {
+                // The object was removed before the emit, so an emit that
+                // reported success and wrote nothing is seen here.
+                CodegenPasses::report_emit_failure(ctx, job.emit_path,
+                    String::from("LLVM reported success and wrote no file"));
+            } else {
+                (*objects)[(*positions)[b] as i64] = job.emit_path;
+            }
+        }
     }
 }

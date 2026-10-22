@@ -1288,9 +1288,9 @@ type struct DeclarationEmitter {
         if (!init.is_valid() && init_expr != null) {
             const tkf: LTypeKind = LType::kind_of(ty.raw);
             if (tkf == LTypeKind::Float || tkf == LTypeKind::Double) {
-                mut folded: f64 = 0.0;
-                if (this.try_fold_const_real(init_expr, &folded)) {
-                    init = LType::const_real(ty, folded);
+                match (this.try_fold_const_real(init_expr)) {
+                    Option::Some(folded) => { init = LType::const_real(ty, folded); }
+                    Option::None         => { }
                 }
             } else if (tkf == LTypeKind::Integer) {
                 // Integer const-expression initializer that isn't a bare literal -
@@ -1304,9 +1304,9 @@ type struct DeclarationEmitter {
                 // the u64 two's-complement result truncates to the global's width
                 // in LLVMConstInt, which is exact for those types.
                 if (llvm::LLVMGetIntTypeWidth(ty.raw) <= 64) {
-                    mut ifold: u64 = 0;
-                    if (this.try_fold_const_int(init_expr, &ifold)) {
-                        init = LType::const_int(ty, ifold, true);
+                    match (this.try_fold_const_int(init_expr)) {
+                        Option::Some(ifold) => { init = LType::const_int(ty, ifold, true); }
+                        Option::None        => { }
                     }
                 }
             }
@@ -2223,9 +2223,9 @@ type struct DeclarationEmitter {
     /// fold is not diagnosed - it is emitted as 0.0.  Reading names is the
     /// constant table's job, and doing it here as well would be a second
     /// implementation of one question, free to drift from the first.
-    try_fold_const_real(&this, expr: ExpressionNode*, out: f64*) -> boolean {
-        if (expr == null) { return false; }
-        return this.const_eval().fold_real(expr, out);
+    try_fold_const_real(&this, expr: ExpressionNode*) -> Option<f64> {
+        if (expr == null) { return Option::None; }
+        return this.const_eval().fold_real(expr);
     }
 
     /// The compile-time integer folder, reading names as the module that WROTE
@@ -2239,12 +2239,11 @@ type struct DeclarationEmitter {
     /// `ConstEval`'s value for `expr` as a 64-bit two's-complement bit
     /// pattern.  A value outside `i64::MIN ..= u64::MAX` has no such pattern
     /// and is not folded here.
-    fold_64_bit_pattern(&this, expr: ExpressionNode*, out: u64*) -> boolean {
-        mut value: i128 = 0;
-        if (!this.const_eval().fold(expr, &value)) { return false; }
-        if (value < i64::MIN as i128 || value > u64::MAX as i128) { return false; }
-        *out = value as u64;
-        return true;
+    fold_64_bit_pattern(&this, expr: ExpressionNode*) -> Option<u64> {
+        return match (this.const_eval().fold(expr)) {
+            Option::Some(value) => { value.to_64_bit_pattern() }
+            Option::None        => { Option::None }
+        };
     }
 
     /// Constant-fold an INTEGER const initializer to its 64-bit two's-complement
@@ -2265,8 +2264,8 @@ type struct DeclarationEmitter {
     /// unfolded initializer does not become an error, it becomes the
     /// zeroinitializer, so a leaf that cannot answer publishes 0 as the
     /// constant's value.
-    try_fold_const_int(&this, expr: ExpressionNode*, out: u64*) -> boolean {
-        if (expr == null) { return false; }
+    try_fold_const_int(&this, expr: ExpressionNode*) -> Option<u64> {
+        if (expr == null) { return Option::None; }
         const node: ExpressionNode* = expr;
         // `Enum::Variant as u64`, `SOME_CONST as i32`.  Fold the OPERAND: the
         // cast's own width is applied by `const_int` when it builds the
@@ -2275,7 +2274,7 @@ type struct DeclarationEmitter {
         // the global lands on the zero fallback below.
         const ce: CastExpr* = ExpressionNode::cast_of(expr);
         if (ce != null) {
-            return this.try_fold_const_int(ce.expression, out);
+            return this.try_fold_const_int(ce.expression);
         }
         if (ExpressionNode::scope_resolution_of(node) != null) {
             // `Enum::Variant`: a payload-free variant IS its discriminant.
@@ -2298,27 +2297,24 @@ type struct DeclarationEmitter {
                 // module-qualified CONSTANT (`limits::MAX_PATH`) - a different
                 // referent, answered by the constant table rather than by a
                 // variant tag.
-                return this.fold_64_bit_pattern(expr, out);
+                return this.fold_64_bit_pattern(expr);
             }
             const et: EnumType* = real_t.as_enum();
             const variant: EnumVariantInfo* = CodegenUtil::pinned_variant(et, sr.resolved_member);
             // A variant carrying a payload is a CONSTRUCTOR, not a constant -
             // its tag alone is not the value the initializer names.
-            if (variant == null || variant.has_payload()) { return false; }
-            *out = variant.tag_value;
-            return true;
+            if (variant == null || variant.has_payload()) { return Option::None; }
+            return Option::Some(variant.tag_value);
         }
         const lit: LiteralExpr* = ExpressionNode::literal_of(expr);
         if (lit != null) {
             if (lit.literal_kind == LiteralKind::Integer) {
-                *out = lit.value.parse_int::<u64>();
-                return true;
+                return Option::Some(lit.value.parse_int::<u64>());
             }
             if (lit.literal_kind == LiteralKind::Boolean) {
-                *out = if (lit.value == "true") { 1 } else { 0 };
-                return true;
+                return Option::Some(if (lit.value == "true") { 1 } else { 0 });
             }
-            return false;
+            return Option::None;
         }
         // What a NAME denotes, and what a type's `sizeof`/`alignof` is, are not
         // this position's questions - they belong to `ConstEval` over the
@@ -2327,16 +2323,17 @@ type struct DeclarationEmitter {
         if (ExpressionNode::identifier_of(node) != null
             || ExpressionNode::sizeof_of(node) != null
             || ExpressionNode::alignof_of(node) != null) {
-            return this.fold_64_bit_pattern(expr, out);
+            return this.fold_64_bit_pattern(expr);
         }
         const u: UnaryExpr* = ExpressionNode::unary_of(node);
         if (u != null) {
-            mut a: u64 = 0;
-            if (!this.try_fold_const_int(u.operand, &a)) { return false; }
+            const operand: Option<u64> = this.try_fold_const_int(u.operand);
+            if (operand.is_none()) { return Option::None; }
+            const a: u64 = operand.unwrap();
             const op: TokenType = u.op.kind;
-            if (op == TokenType::Minus) { *out = 0 - a; return true; }
-            if (op == TokenType::Tilde) { *out = ~a;       return true; }
-            return false;
+            if (op == TokenType::Minus) { return Option::Some(0 - a); }
+            if (op == TokenType::Tilde) { return Option::Some(~a); }
+            return Option::None;
         }
         const b: BinaryExpr* = ExpressionNode::binary_of(node);
         if (b != null) {
@@ -2348,22 +2345,24 @@ type struct DeclarationEmitter {
             // therefore has exactly one evaluator, and none is left to the
             // zeroinitializer.
             if (op == TokenType::Slash || op == TokenType::Percent || op == TokenType::GreaterGreater) {
-                return this.fold_64_bit_pattern(expr, out);
+                return this.fold_64_bit_pattern(expr);
             }
-            mut x: u64 = 0;
-            mut y: u64 = 0;
-            if (!this.try_fold_const_int(b.left, &x)) { return false; }
-            if (!this.try_fold_const_int(b.right, &y)) { return false; }
-            if (op == TokenType::Plus)  { *out = x + y;  return true; }
-            if (op == TokenType::Minus)  { *out = x - y;  return true; }
-            if (op == TokenType::Star)  { *out = x * y;  return true; }
-            if (op == TokenType::Amp)  { *out = x & y;  return true; }
-            if (op == TokenType::Pipe)  { *out = x | y;  return true; }
-            if (op == TokenType::Caret)  { *out = x ^ y;  return true; }
-            if (op == TokenType::LessLess) { *out = x << y; return true; }
-            return false;
+            const left: Option<u64> = this.try_fold_const_int(b.left);
+            if (left.is_none()) { return Option::None; }
+            const right: Option<u64> = this.try_fold_const_int(b.right);
+            if (right.is_none()) { return Option::None; }
+            const x: u64 = left.unwrap();
+            const y: u64 = right.unwrap();
+            if (op == TokenType::Plus)     { return Option::Some(x + y); }
+            if (op == TokenType::Minus)    { return Option::Some(x - y); }
+            if (op == TokenType::Star)     { return Option::Some(x * y); }
+            if (op == TokenType::Amp)      { return Option::Some(x & y); }
+            if (op == TokenType::Pipe)     { return Option::Some(x | y); }
+            if (op == TokenType::Caret)    { return Option::Some(x ^ y); }
+            if (op == TokenType::LessLess) { return Option::Some(x << y); }
+            return Option::None;
         }
-        return false;
+        return Option::None;
     }
 
     /// Build a constant struct aggregate for a module-level struct-literal const
@@ -2444,18 +2443,16 @@ type struct DeclarationEmitter {
         if (expr == null) { return LValue::null(); }
         const k: LTypeKind = LType::kind_of(ety.raw);
         if (k == LTypeKind::Integer) {
-            mut iv: u64 = 0;
-            if (this.try_fold_const_int(expr, &iv)) {
-                return LType::const_int(ety, iv, true);
-            }
-            return LValue::null();
+            return match (this.try_fold_const_int(expr)) {
+                Option::Some(iv) => { LType::const_int(ety, iv, true) }
+                Option::None     => { LValue::null() }
+            };
         }
         if (k == LTypeKind::Float || k == LTypeKind::Double) {
-            mut fv: f64 = 0.0;
-            if (this.try_fold_const_real(expr, &fv)) {
-                return LType::const_real(ety, fv);
-            }
-            return LValue::null();
+            return match (this.try_fold_const_real(expr)) {
+                Option::Some(fv) => { LType::const_real(ety, fv) }
+                Option::None     => { LValue::null() }
+            };
         }
         if (k == LTypeKind::Array) {
             return this.try_const_array(ExpressionNode::array_of(expr), ety);

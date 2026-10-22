@@ -1,0 +1,249 @@
+/// The compiler's logger, `utils::log`, driven the way the compiler drives
+/// it: `Log::configure_from_command_line` reads `CRYO_LOG`, `CRYO_LOG_FILE`
+/// and then the flags, exactly as `cryo` does before any command runs.  A
+/// sink of this program's own captures what reaches it, so each check sees
+/// the lines a switch lets through and nothing else.
+namespace main;
+
+import std::fmt;
+import std::env;
+import std::core::intrinsics;
+import std::fs::dir;
+import std::fs::file;
+import std::fs::path::{ Path };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import utils::log::{ Log, LogArea, LogLevel, LogSink };
+
+type struct CapturingSink {
+    count: u32;
+    last:  String;
+}
+
+implement trait LogSink for struct CapturingSink {
+    write(mut &this, line: &String) -> void {
+        this.count += 1;
+        this.last = line.clone();
+    }
+}
+
+mut g_passed: i32 = 0;
+mut g_total: i32 = 0;
+mut g_built: i32 = 0;
+
+function check(ok: boolean, what: string) -> void {
+    g_total += 1;
+    if (ok) {
+        g_passed += 1;
+    } else {
+        fmt::println(f"FAIL: {what}");
+    }
+}
+
+/// A message that counts how often it was built.
+function built() -> i32 {
+    g_built += 1;
+    return g_built;
+}
+
+/// Every area off, the environment cleared, and `sink`, emptied, receiving
+/// lines.
+function reset(sink: mut &CapturingSink) -> void {
+    sink.count = 0;
+    Log::configure(Str::new("off"), "test");
+    env::remove_var(Str::new("CRYO_LOG"));
+    env::remove_var(Str::new("CRYO_LOG_FILE"));
+    Log::set_sink(sink as CapturingSink*);
+}
+
+/// `cryo` with `flags` after it, through the compiler's own entry.
+function run_command_line(flags: [string]) -> void {
+    mut args: [string] = ["cryo"];
+    for (mut i: i64 = 0; i < flags.length; i++) { args.push(flags[i]); }
+    Log::configure_from_command_line(args.length as int, args.as_ptr());
+}
+
+function file_holds(path: string, text: string) -> boolean {
+    return match (file::read_to_string(Path::from(Str::new(path)))) {
+        Result::Ok(content) => { content.as_str().contains(&Str::new(text)) }
+        Result::Err(_)      => { false }
+    };
+}
+
+function main() -> int {
+    mut capture: CapturingSink = CapturingSink { count: 0, last: String::new() };
+
+    check(!Log::enabled(LogArea::Driver, LogLevel::Error)
+          && !Log::enabled(LogArea::Codegen, LogLevel::Error)
+          && !Log::enabled(LogArea::Time, LogLevel::Error),
+          "every area starts off, before anything configures the logger");
+
+    reset(&capture);
+    run_command_line([]);
+    check(!Log::enabled(LogArea::Driver, LogLevel::Error)
+          && !Log::enabled(LogArea::Codegen, LogLevel::Error)
+          && !Log::enabled(LogArea::Lsp, LogLevel::Error)
+          && !Log::enabled(LogArea::Time, LogLevel::Error),
+          "every area is off with nothing set");
+    Log::error(LogArea::Driver, "an error line");
+    check(capture.count == 0, "an error line reaches no sink when its area is off");
+
+    reset(&capture);
+    env::set_var(Str::new("CRYO_LOG"), Str::new("driver"));
+    run_command_line([]);
+    check(Log::enabled(LogArea::Driver, LogLevel::Debug)
+          && !Log::enabled(LogArea::Driver, LogLevel::Trace)
+          && !Log::enabled(LogArea::Sema, LogLevel::Error),
+          "CRYO_LOG=driver turns the driver on at debug and nothing else");
+
+    const here: intrinsics::Location = intrinsics::location();
+    Log::debug(LogArea::Driver, "a probe");
+    const expected: String = f"[debug driver] {here.file}:{here.line + 1} {here.function}: a probe\n";
+    check(capture.count == 1 && capture.last.as_str() == expected.as_str(),
+          "a line names its level, its area and the caller's file, line and function");
+
+    Log::trace(LogArea::Driver, "a trace line");
+    Log::debug(LogArea::Sema, "a sema line");
+    check(capture.count == 1, "a line below its area's level, or in an area that is off, is dropped");
+
+    reset(&capture);
+    Log::configure(Str::new("driver=info"), "test");
+    Log::debug(LogArea::Driver, "a debug line");
+    Log::info(LogArea::Driver, "an info line");
+    check(capture.count == 1, "area=level sets that area's level");
+
+    reset(&capture);
+    Log::configure(Str::new("loader"), "test");
+    const at_debug: boolean = Log::enabled(LogArea::Loader, LogLevel::Trace);
+    Log::configure(Str::new("loader=trace"), "test");
+    check(!at_debug && Log::enabled(LogArea::Loader, LogLevel::Trace),
+          "an area alone is debug; area=trace adds its trace lines");
+
+    reset(&capture);
+    Log::configure(Str::new("info"), "test");
+    check(Log::enabled(LogArea::Codegen, LogLevel::Info)
+          && !Log::enabled(LogArea::Codegen, LogLevel::Debug)
+          && Log::enabled(LogArea::Lex, LogLevel::Info),
+          "a level alone sets every area");
+
+    reset(&capture);
+    Log::configure(Str::new("debug,parse=off"), "test");
+    check(!Log::enabled(LogArea::Parse, LogLevel::Error) && Log::enabled(LogArea::Sema, LogLevel::Debug),
+          "a later item overrides an earlier one");
+
+    reset(&capture);
+    const unknown: u32 = Log::configure(Str::new("bogus, sema=loud ,codegen"), "test");
+    check(unknown == 2 && Log::enabled(LogArea::Codegen, LogLevel::Debug)
+          && !Log::enabled(LogArea::Sema, LogLevel::Error),
+          "an item naming no area or level is counted and the rest still applies");
+
+    reset(&capture);
+    env::set_var(Str::new("CRYO_LOG"), Str::new("driver"));
+    run_command_line(["build", "--log=link,driver=off"]);
+    check(Log::enabled(LogArea::Link, LogLevel::Debug) && !Log::enabled(LogArea::Driver, LogLevel::Error),
+          "--log is applied after CRYO_LOG, so it wins");
+
+    reset(&capture);
+    run_command_line(["build", "--log", "link,driver=trace", "src/main.cryo"]);
+    check(Log::enabled(LogArea::Link, LogLevel::Debug) && Log::enabled(LogArea::Driver, LogLevel::Trace)
+          && !Log::enabled(LogArea::Sema, LogLevel::Error),
+          "--log takes its spec as the next argument too");
+
+    reset(&capture);
+    run_command_line(["build", "--log", "--debug"]);
+    check(Log::enabled(LogArea::Sema, LogLevel::Debug) && !Log::enabled(LogArea::Sema, LogLevel::Trace),
+          "--log does not take a following flag as its spec");
+
+    reset(&capture);
+    run_command_line(["build", "--log=off"]);
+    Log::configure_from_project(Str::new("debug"), "test");
+    check(!Log::enabled(LogArea::Driver, LogLevel::Error) && !Log::enabled(LogArea::Codegen, LogLevel::Error),
+          "a project's setting does not undo --log=off");
+
+    reset(&capture);
+    run_command_line(["build", "--log=parse=off"]);
+    Log::configure_from_project(Str::new("debug"), "test");
+    check(!Log::enabled(LogArea::Parse, LogLevel::Error) && Log::enabled(LogArea::Sema, LogLevel::Debug),
+          "a project's setting applies to the areas the command line left alone");
+
+    reset(&capture);
+    env::set_var(Str::new("CRYO_LOG"), Str::new("off"));
+    run_command_line(["build"]);
+    Log::configure_from_project(Str::new("debug"), "test");
+    check(!Log::enabled(LogArea::Driver, LogLevel::Error), "a project's setting does not undo CRYO_LOG=off");
+
+    reset(&capture);
+    run_command_line(["build"]);
+    Log::configure_from_project(Str::new("debug"), "test");
+    check(Log::enabled(LogArea::Driver, LogLevel::Debug) && Log::enabled(LogArea::Time, LogLevel::Debug),
+          "a project's setting turns logging on when nothing else chose");
+
+    reset(&capture);
+    run_command_line(["build", "--debug"]);
+    check(Log::enabled(LogArea::Driver, LogLevel::Debug) && Log::enabled(LogArea::Codegen, LogLevel::Debug)
+          && Log::enabled(LogArea::Time, LogLevel::Debug) && !Log::enabled(LogArea::Mono, LogLevel::Trace),
+          "--debug turns every area on at debug");
+
+    reset(&capture);
+    Log::configure(Str::new("codegen=trace"), "test");
+    g_built = 0;
+    if (Log::enabled(LogArea::Codegen, LogLevel::Trace)) {
+        Log::trace(LogArea::Codegen, f"built {built()}");
+    }
+    Log::configure(Str::new("off"), "test");
+    if (Log::enabled(LogArea::Codegen, LogLevel::Trace)) {
+        Log::trace(LogArea::Codegen, f"built {built()}");
+    }
+    check(g_built == 1 && capture.count == 1, "a guarded line builds its message only when its area is on");
+    Log::trace(LogArea::Codegen, f"built {built()}");
+    check(g_built == 2 && capture.count == 1, "a bare line builds its message even when off, and prints nothing");
+
+    reset(&capture);
+    const env_path: string = "build/compiler-log-env.txt";
+    dir::remove_file(Path::from(Str::new(env_path)));
+    env::set_var(Str::new("CRYO_LOG"), Str::new("driver"));
+    env::set_var(Str::new("CRYO_LOG_FILE"), Str::new(env_path));
+    run_command_line([]);
+    Log::debug(LogArea::Driver, "into the environment's file");
+    check(capture.count == 0 && file_holds(env_path, "[debug driver] ") &&file_holds(env_path, ": into the environment's file\n"),
+          "CRYO_LOG_FILE sends the lines to that file");
+
+    reset(&capture);
+    const flag_path: string = "build/compiler-log-flag.txt";
+    dir::remove_file(Path::from(Str::new(flag_path)));
+    run_command_line(["build", "--log=sema", "--log-file=build/compiler-log-flag.txt"]);
+    Log::debug(LogArea::Sema, "into the flag's file");
+    check(capture.count == 0 && file_holds(flag_path, "[debug sema] ") && file_holds(flag_path, ": into the flag's file\n"),
+          "--log-file sends the lines to that file");
+
+    reset(&capture);
+    const spaced_path: string = "build/compiler-log-spaced.txt";
+    dir::remove_file(Path::from(Str::new(spaced_path)));
+    run_command_line(["build", "--log", "sema", "--log-file", spaced_path]);
+    Log::debug(LogArea::Sema, "into the spaced flag's file");
+    check(capture.count == 0 && file_holds(spaced_path, ": into the spaced flag's file\n"),
+          "--log-file takes its path as the next argument too");
+
+    reset(&capture);
+    const unused_env_path: string = "build/compiler-log-unused-env.txt";
+    const chosen_path: string = "build/compiler-log-chosen.txt";
+    dir::remove_file(Path::from(Str::new(unused_env_path)));
+    dir::remove_file(Path::from(Str::new(chosen_path)));
+    env::set_var(Str::new("CRYO_LOG_FILE"), Str::new(unused_env_path));
+    run_command_line(["build", "--log=sema", "--log-file=build/compiler-log-chosen.txt"]);
+    Log::debug(LogArea::Sema, "into the chosen file");
+    check(file_holds(chosen_path, ": into the chosen file\n")
+          && !file::read_to_string(Path::from(Str::new(unused_env_path))).is_ok(),
+          "--log-file replaces CRYO_LOG_FILE, which is never created");
+
+    reset(&capture);
+    Log::configure(Str::new("lsp=error"), "test");
+    Log::warn(LogArea::Lsp, "a warning");
+    Log::error(LogArea::Lsp, "an error");
+    check(capture.count == 1 && capture.last.as_str().starts_with(&Str::new("[error lsp] ")),
+          "error is the most severe level, and warn is below it");
+
+    fmt::println(f"log checks: {g_passed} of {g_total} passed");
+    if (g_passed != g_total) { return 1; }
+    return 0;
+}

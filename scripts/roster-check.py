@@ -272,8 +272,12 @@ def project_entries():
             asserts += 1
         if "diagnostic" in expect:
             asserts += 1
-        asserts += len(expect.get("output_contains", []) or [])
-        asserts += len(expect.get("output_excludes", []) or [])
+        if "file" in expect:
+            asserts += 1
+        for key in ("output_contains", "output_excludes", "stderr_contains",
+                    "stderr_excludes", "stdout_line_prefixes",
+                    "stderr_line_prefixes", "file_contains", "file_excludes"):
+            asserts += len(expect.get(key, []) or [])
         reqs = ",".join(spec.get("requires", []) or []) or "-"
         entries.append(
             "project %s: outcome=%s fails=%d asserts=%d requires=%s ignore=%d"

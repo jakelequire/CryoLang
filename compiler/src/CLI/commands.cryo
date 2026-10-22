@@ -10,7 +10,7 @@ import compiler::resolver::demangler;
 import compiler::vendor::registry;
 import compiler::bindgen::generator;
 import utils;
-import utils::logger;
+import utils::log::{ Log, LogArea };
 import std::collections::string;
 import std::collections::string::{ String };
 import std::collections::str;
@@ -95,8 +95,8 @@ type struct NegDiag {
 
 /// Parsed `test.json` for a multi-module test project (see
 /// `run_projects_suite`). The FIXTURE (`outcome`: 0 = collect, 1 = build,
-/// 2 = run) and the ASSERTIONS (the `expect` fields - `exit_code`, `fails`,
-/// `stdout_sub`, `output_contains`, `output_excludes`) are orthogonal.
+/// 2 = run), with its `environment` and `arguments`, and the ASSERTIONS (the
+/// `expect` fields) are orthogonal.
 /// `compile_fail` is a recognized alias for `build` + `fails`, and
 /// `expect.diagnostic` is sugar for `fails` + an `error[<code>]` marker in
 /// `output_contains`.
@@ -128,6 +128,38 @@ type struct ProjSpec {
     /// the raylib window demo) stay live without turning a portable
     /// `make test` red.  Empty = no prerequisites (the common case).
     requires:   [string];
+    /// `NAME=value` entries (test.json `environment`) set in the compiler's
+    /// environment for this project's command only.
+    environment: [string];
+    /// Extra arguments (test.json `arguments`) given to the compiler after
+    /// the fixture's own verb and flags.
+    arguments:  [string];
+    /// Every entry must appear in the compiler's stderr alone; no entry of
+    /// `stderr_excludes` may.
+    stderr_contains: [string];
+    stderr_excludes: [string];
+    /// When non-empty, every non-empty line of that stream must start with
+    /// one of these prefixes, so a line nobody expected fails the project
+    /// whatever it says.
+    stdout_line_prefixes: [string];
+    stderr_line_prefixes: [string];
+    /// A file the command writes, relative to the project (test.json
+    /// `expect.file`): removed before the command runs, so what is read
+    /// afterwards is this run's, then checked against `file_contains` and
+    /// `file_excludes` and removed again.  Empty = no file is checked.
+    file: string;
+    file_contains: [string];
+    file_excludes: [string];
+
+    static empty() -> ProjSpec {
+        return ProjSpec {
+            outcome: 0, ignore: false, exit_code: 0, fails: false, stdout_sub: "",
+            output_contains: [], output_excludes: [], requires: [],
+            environment: [], arguments: [], stderr_contains: [], stderr_excludes: [],
+            stdout_line_prefixes: [], stderr_line_prefixes: [],
+            file: "", file_contains: [], file_excludes: []
+        };
+    }
 }
 
 /// Result of dispatching one project: did it meet its declared outcome, and
@@ -210,6 +242,19 @@ function shell_in_dir(dir_text: string, cmd_text: string) -> string {
     const cmd: string = cmd_text;
     const dir: string = dir_text;
     return fmt::format("cd \"%s\" && %s", dir, cmd);
+}
+
+// The platform shell's spelling of "set `NAME=value` for the commands after
+// this one", written in front of a suite job's command.  The variable is set
+// in that job's own shell, never in this process, which every job shares.
+![target(windows)]
+function shell_set_environment(setting: string) -> string {
+    return fmt::format("set \"%s\" && ", setting);
+}
+
+![target(unix)]
+function shell_set_environment(setting: string) -> string {
+    return fmt::format("export \"%s\" && ", setting);
 }
 
 /// One batch of shell commands for a suite's worker pool, moved into each
@@ -395,7 +440,9 @@ implement enum CommandKind {
                 fmt::printf("  cryo build [dir]         Build the project whose cryoconfig lives\n");
                 fmt::printf("                           in [dir] (default: the current directory).\n\n");
                 fmt::printf("Flags:\n");
-                fmt::printf("  --debug            Enable debug logging and verbose output\n");
+                fmt::printf("  --debug            Compiler logging on in every area (--log=debug)\n");
+                fmt::printf("  --log=SPEC         Compiler logging by area and level (cryo help log)\n");
+                fmt::printf("  --log-file=PATH    Append the compiler's log lines to PATH\n");
                 fmt::printf("  --ast              Dump the AST after parsing\n");
                 fmt::printf("  --emit-llvm        Emit LLVM IR (.ll) alongside the object output\n");
                 fmt::printf("  --build-dir=PATH   Override cryoconfig's output_dir\n");
@@ -411,7 +458,9 @@ implement enum CommandKind {
                 fmt::printf("works for executable targets - library and stdlib targets produce\n");
                 fmt::printf("no binary to run.\n\n");
                 fmt::printf("Flags:\n");
-                fmt::printf("  --debug            Enable debug logging and verbose output\n");
+                fmt::printf("  --debug            Compiler logging on in every area (--log=debug)\n");
+                fmt::printf("  --log=SPEC         Compiler logging by area and level (cryo help log)\n");
+                fmt::printf("  --log-file=PATH    Append the compiler's log lines to PATH\n");
                 fmt::printf("  --ast              Dump the AST after parsing\n");
                 fmt::printf("  --emit-llvm        Emit LLVM IR (.ll) alongside the object output\n");
                 fmt::printf("  --build-dir=PATH   Override cryoconfig's output_dir\n");
@@ -424,7 +473,9 @@ implement enum CommandKind {
                 fmt::printf("function from a synthesized test main.\n\n");
                 fmt::printf("An optional [pattern] positional filters which tests run.\n\n");
                 fmt::printf("Flags:\n");
-                fmt::printf("  --debug            Enable debug logging and verbose output\n");
+                fmt::printf("  --debug            Compiler logging on in every area (--log=debug)\n");
+                fmt::printf("  --log=SPEC         Compiler logging by area and level (cryo help log)\n");
+                fmt::printf("  --log-file=PATH    Append the compiler's log lines to PATH\n");
                 fmt::printf("  --build-dir=PATH   Override cryoconfig's output_dir\n");
                 fmt::printf("  --stdlib=PATH      Standard library root for this run\n");
                 fmt::printf("  --target=TRIPLE    Cross-compile for the given LLVM target triple\n");
@@ -443,7 +494,9 @@ implement enum CommandKind {
                 fmt::printf("errors and warnings, but emits no code.  Faster than a full\n");
                 fmt::printf("build when you only want to validate a source file.\n\n");
                 fmt::printf("Flags:\n");
-                fmt::printf("  --debug          Enable debug logging and verbose output\n");
+                fmt::printf("  --debug          Compiler logging on in every area (--log=debug)\n");
+                fmt::printf("  --log=SPEC       Compiler logging by area and level (cryo help log)\n");
+                fmt::printf("  --log-file=PATH  Append the compiler's log lines to PATH\n");
                 fmt::printf("  --ast            Dump the AST after parsing\n");
                 fmt::printf("  --stdlib=PATH    Standard library root for this run\n");
                 fmt::printf("  --target=TRIPLE  Cross-compile for the given LLVM target triple\n");
@@ -453,7 +506,7 @@ implement enum CommandKind {
                 fmt::printf("prelude.  Intended for low-level tests and bootstrapping work that\n");
                 fmt::printf("must not pull in stdlib symbols.\n\n");
                 fmt::printf("Flags:\n");
-                fmt::printf("  --debug   Enable debug logging and verbose output\n");
+                fmt::printf("  --debug   Compiler logging on in every area (--log=debug)\n");
                 fmt::printf("  --ast     Dump the AST after parsing\n");
             }
             CommandKind::Demangle => {
@@ -518,6 +571,7 @@ type enum FlagKind {
     Help;
     Version;
     Debug;
+    Log;
     Ast;
     EmitLlvm;
     Stdlib;
@@ -542,6 +596,7 @@ implement enum FlagKind {
             "help"      | "h" => { FlagKind::Help }
             "version"   | "v" => { FlagKind::Version }
             "debug"           => { FlagKind::Debug }
+            "log" | "log-file" => { FlagKind::Log }
             "ast"             => { FlagKind::Ast }
             "emit-llvm"       => { FlagKind::EmitLlvm }
             "stdlib"          => { FlagKind::Stdlib }
@@ -571,11 +626,28 @@ implement enum FlagKind {
                 fmt::printf("Equivalent to the `version` command.\n");
             }
             FlagKind::Debug => {
-                fmt::printf("--debug - Enable debug logging and verbose output\n\n");
-                fmt::printf("Flips the compiler debug gate before any pass runs, so the\n");
-                fmt::printf("verbose trace output sprinkled across the lexer, parser, resolver\n");
-                fmt::printf("and codegen passes is printed.  Off by default.\n\n");
+                fmt::printf("--debug - Compiler logging on in every area\n\n");
+                fmt::printf("The same as --log=debug, and nothing more: every area of the\n");
+                fmt::printf("compiler logs at `debug`.  The AST is --ast's, the IR --emit-llvm's.\n");
+                fmt::printf("See `cryo help log`.\n\n");
                 fmt::printf("Accepted by: build, run, test, check, raw\n");
+            }
+            FlagKind::Log => {
+                fmt::printf("--log=SPEC, --log-file=PATH - Compiler logging\n\n");
+                fmt::printf("The compiler logs nothing unless asked.  SPEC is a comma-separated\n");
+                fmt::printf("list of items: an area (logged at `debug`), area=level, or a level\n");
+                fmt::printf("alone, which sets every area; a later item overrides an earlier\n");
+                fmt::printf("one.  CRYO_LOG=SPEC in the environment does the same, and --log is\n");
+                fmt::printf("applied after it; cryoconfig's `debug = true` sets only the areas\n");
+                fmt::printf("neither of them set.  `--log SPEC` and `--log-file PATH` work too.\n\n");
+                fmt::printf("  areas:  driver loader lex parse resolve types sema mono drop\n");
+                fmt::printf("          codegen link bindgen deps diag lsp time\n");
+                fmt::printf("  levels: off error warn info debug trace\n\n");
+                fmt::printf("  --log=sema,codegen      two areas at debug\n");
+                fmt::printf("  --log=info,mono=trace   every area at info, mono at trace\n\n");
+                fmt::printf("Lines go to stderr, or are appended to the file --log-file=PATH\n");
+                fmt::printf("(or CRYO_LOG_FILE) names: [level area] file:line function: message.\n\n");
+                fmt::printf("Accepted by: every command\n");
             }
             FlagKind::Ast => {
                 fmt::printf("--ast - Dump the AST after parsing\n\n");
@@ -927,7 +999,7 @@ type struct Executor {
         fmt::printf("  target_triple = \"\"                  cross-compile triple (host if empty)\n");
         fmt::printf("  stdlib_root   = \"\"                  project-pinned stdlib (see `help stdlib`)\n\n");
         fmt::printf("[compiler]\n");
-        fmt::printf("  debug     = false                   verbose compiler logging\n");
+        fmt::printf("  debug     = false                   compiler logging, as --log=debug\n");
         fmt::printf("  optimize  = \"O2\"                    O0 | O1 | O2 | O3\n");
         fmt::printf("  emit_llvm = false                   also write LLVM IR (.ll)\n");
         fmt::printf("  no_std    = false                   build without the standard library\n");
@@ -954,7 +1026,9 @@ type struct Executor {
     /// top-level `cryo --help` lists only --help / --version and points here.
     static print_topic_flags() -> void {
         fmt::printf("Build flags (accepted by build / run / test / check as noted)\n\n");
-        fmt::printf("  --debug             Enable debug logging and verbose output\n");
+        fmt::printf("  --debug             Compiler logging on in every area (--log=debug)\n");
+        fmt::printf("  --log=SPEC          Compiler logging by area and level; see `cryo help log`\n");
+        fmt::printf("  --log-file=PATH     Append the compiler's log lines to PATH, not stderr\n");
         fmt::printf("  --ast               Dump the AST after parsing\n");
         fmt::printf("  --emit-llvm         Emit LLVM IR (.ll) alongside the object output\n");
         fmt::printf("  --build-dir=PATH    Override cryoconfig's output_dir\n");
@@ -1242,11 +1316,7 @@ type struct Executor {
     ///                              and run a full project build.
     /// - `cryo build`:             same as above with dir = `.`.
     static cmd_build(args: cli::ParsedArgs) -> int {
-        if (args.has_flag("debug")) {
-            logger::Logger::enable_debug();
-        }
-
-        logger::cdebug("[Build] Starting build process.\n");
+        Log::debug(LogArea::Driver, "starting a build");
 
         const file: string = args.input_file();
 
@@ -1279,12 +1349,9 @@ type struct Executor {
             return 1;
         }
 
-        logger::cdebug("[Build] Found cryoconfig: %s\n", config_path);
+        Log::debug(LogArea::Driver, f"found cryoconfig {config_path}");
 
         mut config: instance::CompilerConfig = instance::CompilerConfig::default();
-        if (args.has_flag("debug")) {
-            config = instance::CompilerConfig::debug_config();
-        }
         if (args.has_flag("ast")) {
             config.show_ast = true;
         }
@@ -1345,7 +1412,7 @@ type struct Executor {
         Executor::apply_profile_flags(&config, &args);
 
         mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
-        logger::cdebug("[Build] Compiling project from config: %s\n", config_path);
+        Log::debug(LogArea::Driver, f"compiling the project from {config_path}");
         const result: instance::CompilationResult = compiler.compile_project(config_path);
 
         if (result.success) {
@@ -1367,11 +1434,7 @@ type struct Executor {
     /// have no entry point and produce no executable, so `run` rejects
     /// them with a clear error rather than silently doing nothing.
     static cmd_run(args: cli::ParsedArgs) -> int {
-        if (args.has_flag("debug")) {
-            logger::Logger::enable_debug();
-        }
-
-        logger::cdebug("[Run] Building project before execution.\n");
+        Log::debug(LogArea::Driver, "building the project to run it");
 
         // Find cryoconfig in CWD (or explicit positional dir).
         const dir: string = if (args.positional_count() > 0) {
@@ -1387,9 +1450,6 @@ type struct Executor {
         }
 
         mut config: instance::CompilerConfig = instance::CompilerConfig::default();
-        if (args.has_flag("debug")) {
-            config = instance::CompilerConfig::debug_config();
-        }
         if (args.has_flag("ast")) {
             config.show_ast = true;
         }
@@ -1423,10 +1483,9 @@ type struct Executor {
             return 1;
         }
 
-        logger::cdebug("[Run] %s\n", result.output_path);
-        // Flush so the [Run] header appears before the child binary's
-        // output (under --debug); otherwise the libc line buffer can
-        // interleave them.
+        Log::debug(LogArea::Driver, f"running {result.output_path}");
+        // Flush so the build's own output appears before the child binary's;
+        // otherwise the libc buffer can interleave them.
         libc::fflush(null);
         // Run the produced binary through the platform shell (`Command::shell`
         // under the hood), inheriting stdio so its output reaches the terminal.
@@ -1451,11 +1510,7 @@ type struct Executor {
     /// optional positional pattern, `--ignored`, `--list`, `--exact`,
     /// `-q` / `--quiet`.
     static cmd_test(args: cli::ParsedArgs) -> int {
-        if (args.has_flag("debug")) {
-            logger::Logger::enable_debug();
-        }
-
-        logger::cdebug("[Test] Building test binary.\n");
+        Log::debug(LogArea::Driver, "building the test binary");
 
         const config_path: string = project_config::ProjectConfig::find_cryoconfig(".");
         if (config_path == "") {
@@ -1465,9 +1520,6 @@ type struct Executor {
         }
 
         mut config: instance::CompilerConfig = instance::CompilerConfig::default();
-        if (args.has_flag("debug")) {
-            config = instance::CompilerConfig::debug_config();
-        }
         if (args.has_arg("build-dir")) {
             config.output_dir_override = args.get_value("build-dir");
         }
@@ -1558,10 +1610,9 @@ type struct Executor {
             }
         }
 
-        logger::cdebug("[Test] %s\n", cmd);
-        // Flush parent stdio before spawning so the [Test] header lands
-        // before the child's output under --debug.  Same precaution as
-        // `cmd_run`.
+        Log::debug(LogArea::Driver, f"running {cmd}");
+        // Flush parent stdio before spawning so the build's own output lands
+        // before the child's.  Same precaution as `cmd_run`.
         libc::fflush(null);
         const status: i32 = exec::shell(cmd);
         if (status < 0) {
@@ -2375,10 +2426,7 @@ type struct Executor {
             Result::Ok(v)      => { v }
             Result::Err(e)     => { mem::drop(e); return Option::None; }
         };
-        mut spec: ProjSpec = ProjSpec {
-            outcome: 0, ignore: false, exit_code: 0, fails: false, stdout_sub: "",
-            output_contains: [], output_excludes: [], requires: []
-        };
+        mut spec: ProjSpec = ProjSpec::empty();
 
         // Outcome selects the FIXTURE: collect (default) / build / run.
         // `compile_fail` is a recognized alias for `build` + `fails`, so the
@@ -2408,23 +2456,9 @@ type struct Executor {
             }
             Option::None => { }
         }
-        match (root.get(str::Str::new("requires"))) {
-            Option::Some(rp) => {
-                const n: u64 = rp.length();
-                for (mut i: u64 = 0; i < n; i++) {
-                    match (rp.at(i)) {
-                        Option::Some(ep) => {
-                            match (ep.as::<str::Str>()) {
-                                Option::Some(es) => { spec.requires.push(Executor::dup_cstr(es)); }
-                                Option::None     => { }
-                            }
-                        }
-                        Option::None => { }
-                    }
-                }
-            }
-            Option::None => { }
-        }
+        Executor::read_strings(&root, "requires", &spec.requires);
+        Executor::read_strings(&root, "environment", &spec.environment);
+        Executor::read_strings(&root, "arguments", &spec.arguments);
         match (root.get(str::Str::new("expect"))) {
             Option::Some(ep) => {
                 match (ep.get(str::Str::new("exit_code"))) {
@@ -2470,45 +2504,50 @@ type struct Executor {
                     }
                     Option::None => { }
                 }
-                match (ep.get(str::Str::new("output_contains"))) {
-                    Option::Some(ap) => {
-                        const n: u64 = ap.length();
-                        for (mut i: u64 = 0; i < n; i++) {
-                            match (ap.at(i)) {
-                                Option::Some(iv) => {
-                                    match (iv.as::<str::Str>()) {
-                                        Option::Some(is) => { spec.output_contains.push(Executor::dup_cstr(is)); }
-                                        Option::None     => { }
-                                    }
-                                }
-                                Option::None => { }
-                            }
+                Executor::read_strings(ep, "output_contains", &spec.output_contains);
+                Executor::read_strings(ep, "output_excludes", &spec.output_excludes);
+                Executor::read_strings(ep, "stderr_contains", &spec.stderr_contains);
+                Executor::read_strings(ep, "stderr_excludes", &spec.stderr_excludes);
+                Executor::read_strings(ep, "stdout_line_prefixes", &spec.stdout_line_prefixes);
+                Executor::read_strings(ep, "stderr_line_prefixes", &spec.stderr_line_prefixes);
+                match (ep.get(str::Str::new("file"))) {
+                    Option::Some(fp) => {
+                        match (fp.as::<str::Str>()) {
+                            Option::Some(fs) => { spec.file = Executor::dup_cstr(fs); }
+                            Option::None     => { }
                         }
                     }
                     Option::None => { }
                 }
-                match (ep.get(str::Str::new("output_excludes"))) {
-                    Option::Some(ap) => {
-                        const n: u64 = ap.length();
-                        for (mut i: u64 = 0; i < n; i++) {
-                            match (ap.at(i)) {
-                                Option::Some(iv) => {
-                                    match (iv.as::<str::Str>()) {
-                                        Option::Some(is) => { spec.output_excludes.push(Executor::dup_cstr(is)); }
-                                        Option::None     => { }
-                                    }
-                                }
-                                Option::None => { }
-                            }
-                        }
-                    }
-                    Option::None => { }
-                }
+                Executor::read_strings(ep, "file_contains", &spec.file_contains);
+                Executor::read_strings(ep, "file_excludes", &spec.file_excludes);
             }
             Option::None => { }
         }
         mem::drop(root);
         return Option::Some(spec);
+    }
+
+    /// Append each string of the array `object.key` to `into`; a missing key
+    /// or a non-string element adds nothing.
+    static read_strings(object: &value::JsonValue, key: string, into: mut &[string]) -> void {
+        match (object.get(str::Str::new(key))) {
+            Option::Some(ap) => {
+                const n: u64 = ap.length();
+                for (mut i: u64 = 0; i < n; i++) {
+                    match (ap.at(i)) {
+                        Option::Some(iv) => {
+                            match (iv.as::<str::Str>()) {
+                                Option::Some(is) => { into.push(Executor::dup_cstr(is)); }
+                                Option::None     => { }
+                            }
+                        }
+                        Option::None => { }
+                    }
+                }
+            }
+            Option::None => { }
+        }
     }
 
     /// True if `<projects_dir>/<name>/test.json` exists and `name` is a real
@@ -2595,10 +2634,7 @@ type struct Executor {
             if (!metadata::exists(path::Path::from(tj))) { continue; }
 
             const content: string = Executor::read_file_or_empty(tj);
-            mut spec: ProjSpec = ProjSpec {
-                outcome: 0, ignore: false, exit_code: 0, fails: false, stdout_sub: "",
-                output_contains: [], output_excludes: [], requires: []
-            };
+            mut spec: ProjSpec = ProjSpec::empty();
             mut parsed_ok: boolean = false;
             match (Executor::parse_test_json(content)) {
                 Option::Some(s) => { spec = s; parsed_ok = true; }
@@ -2635,6 +2671,7 @@ type struct Executor {
             verdict_of.push(verdict);
             reason_of.push(reason);
             if (verdict == 0) {
+                Executor::remove_project_file(proj_dir, &spec);
                 const out_path: string = Executor::job_tmp_path(tmp, cmds.length as u64);
                 job_of.push(cmds.length as i64);
                 cmds.push(Executor::project_command(self_exe, stdlib_abs, proj_dir, &spec, out_path));
@@ -2709,7 +2746,9 @@ type struct Executor {
                 const k: u64 = job_of[i] as u64;
                 Executor::wait_job(done.as_ptr(), k);
                 const out_path: string = Executor::job_tmp_path(tmp, k);
-                const res: ProjOutcome = Executor::project_outcome(&specs[i], status[k as i64], out_path);
+                const proj_dir: string = fmt::format("%s/%s", projects_dir, name);
+                const res: ProjOutcome = Executor::project_outcome(&specs[i], status[k as i64], out_path, proj_dir);
+                Executor::remove_project_file(proj_dir, &specs[i]);
                 Executor::proj_report(is_pretty, is_compact, color_on, res.passed, res.detail);
                 if (!res.passed) {
                     failures += 1;
@@ -2718,9 +2757,12 @@ type struct Executor {
                     if (!is_compact) {
                         const out: string = Executor::read_file_or_empty(out_path);
                         if (out.length() > 0) { fmt::printf("%s\n", out); }
+                        const err: string = Executor::read_file_or_empty(Executor::stderr_path(out_path));
+                        if (err.length() > 0) { fmt::printf("%s\n", err); }
                     }
                 }
                 dir::remove_file(path::Path::from(out_path));
+                dir::remove_file(path::Path::from(Executor::stderr_path(out_path)));
                 ran += 1;
             }
         }
@@ -2783,22 +2825,54 @@ type struct Executor {
         const tmp: string = tmp_text;
         mut std_flag: string = "";
         if (stdlib_abs.length() > 0) { std_flag = fmt::format(" --stdlib=%s", stdlib_abs); }
-        if (spec.outcome == 1 || spec.outcome == 2) {
-            // FIXTURE build (`cryo build`) or run (`cryo run`); both capture the
-            // combined stdout+stderr so the ASSERTIONS in `project_outcome`
-            // can scan it.
-            const verb: string = if (spec.outcome == 1) { "build" } else { "run" };
-            return shell_in_dir(proj_dir_text,
-                fmt::format("%s %s%s > %s 2>&1", self_exe, verb, std_flag, tmp));
+        // FIXTURE build (`cryo build`), run (`cryo run`) or collect (the
+        // project's own `cryo test`).  Stdout and stderr are captured apart so
+        // the ASSERTIONS in `project_outcome` can tell the streams apart.
+        const verb: string = if (spec.outcome == 1) { "build" }
+            else { if (spec.outcome == 2) { "run" } else { "test --format=plain" } };
+        mut command: String = String::new();
+        for (mut i: i64 = 0; i < spec.environment.length; i++) {
+            command.push(shell_set_environment(spec.environment[i]));
         }
-        // collect: run the project's own `cryo test`.
-        return shell_in_dir(proj_dir_text,
-            fmt::format("%s test --format=plain%s > %s 2>&1", self_exe, std_flag, tmp));
+        command.push(fmt::format("%s %s%s", self_exe, verb, std_flag));
+        for (mut i: i64 = 0; i < spec.arguments.length; i++) {
+            command.push(fmt::format(" \"%s\"", spec.arguments[i]));
+        }
+        command.push(fmt::format(" > %s 2> %s", tmp, Executor::stderr_path(tmp)));
+        return shell_in_dir(proj_dir_text, command.into_raw());
+    }
+
+    /// Remove the file a project's expectations read (`expect.file`), if any.
+    static remove_project_file(proj_dir: string, spec: &ProjSpec) -> void {
+        if (spec.file.length() > 0) {
+            dir::remove_file(path::Path::from(fmt::format("%s/%s", proj_dir, spec.file)));
+        }
+    }
+
+    /// Where a project's command captures its stderr, beside `stdout_path`.
+    static stderr_path(stdout_path: string) -> string {
+        return fmt::format("%s.err", stdout_path);
+    }
+
+    /// The stream's first line that starts with none of `prefixes`, or ""
+    /// when every non-empty line starts with one of them.
+    static first_unexpected_line(stream: string, prefixes: &[string]) -> string {
+        const newline: str::Str = str::Str::new("\n");
+        for (raw in str::Str::new(stream).split(&newline)) {
+            const line: str::Str = raw.trim();
+            if (line.is_empty()) { continue; }
+            mut expected: boolean = false;
+            for (mut i: i64 = 0; !expected && i < prefixes.length; i++) {
+                expected = line.starts_with(&str::Str::new(prefixes[i]));
+            }
+            if (!expected) { return Executor::dup_cstr(line); }
+        }
+        return "";
     }
 
     /// Judge one project from its command's exit status `st` and the output
     /// captured in `tmp`.
-    static project_outcome(spec: &ProjSpec, st: i32, tmp_text: string) -> ProjOutcome {
+    static project_outcome(spec: &ProjSpec, st: i32, tmp_text: string, proj_dir: string) -> ProjOutcome {
         mut passed: boolean = false;
         mut detail: string = "";
 
@@ -2808,7 +2882,9 @@ type struct Executor {
             // `output_contains` marker (both folded in at parse time).
             const verb: string = if (spec.outcome == 1) { "build" } else { "run" };
             const ec: i64 = st as i64;
-            const out: string = Executor::read_file_or_empty(tmp_text);
+            const standard_output: string = Executor::read_file_or_empty(tmp_text);
+            const standard_error: string = Executor::read_file_or_empty(Executor::stderr_path(tmp_text));
+            const out: string = fmt::format("%s%s", standard_output, standard_error);
 
             if (spec.fails) {
                 passed = ec != 0;
@@ -2833,6 +2909,52 @@ type struct Executor {
                     detail = fmt::format("output must not contain \"%s\"", spec.output_excludes[i]);
                 }
             }
+            for (mut i: i64 = 0; passed && i < spec.stderr_contains.length; i++) {
+                if (!standard_error.contains(spec.stderr_contains[i])) {
+                    passed = false;
+                    detail = fmt::format("stderr missing \"%s\"", spec.stderr_contains[i]);
+                }
+            }
+            for (mut i: i64 = 0; passed && i < spec.stderr_excludes.length; i++) {
+                if (standard_error.contains(spec.stderr_excludes[i])) {
+                    passed = false;
+                    detail = fmt::format("stderr must not contain \"%s\"", spec.stderr_excludes[i]);
+                }
+            }
+            if (passed && spec.stdout_line_prefixes.length > 0) {
+                const line: string = Executor::first_unexpected_line(standard_output, &spec.stdout_line_prefixes);
+                if (line.length() > 0) {
+                    passed = false;
+                    detail = fmt::format("unexpected stdout line \"%s\"", line);
+                }
+            }
+            if (passed && spec.stderr_line_prefixes.length > 0) {
+                const line: string = Executor::first_unexpected_line(standard_error, &spec.stderr_line_prefixes);
+                if (line.length() > 0) {
+                    passed = false;
+                    detail = fmt::format("unexpected stderr line \"%s\"", line);
+                }
+            }
+            if (passed && spec.file.length() > 0) {
+                const file_path: string = fmt::format("%s/%s", proj_dir, spec.file);
+                if (!metadata::exists(path::Path::from(file_path))) {
+                    passed = false;
+                    detail = fmt::format("no file %s", spec.file);
+                }
+                const written: string = Executor::read_file_or_empty(file_path);
+                for (mut i: i64 = 0; passed && i < spec.file_contains.length; i++) {
+                    if (!written.contains(spec.file_contains[i])) {
+                        passed = false;
+                        detail = fmt::format("%s missing \"%s\"", spec.file, spec.file_contains[i]);
+                    }
+                }
+                for (mut i: i64 = 0; passed && i < spec.file_excludes.length; i++) {
+                    if (written.contains(spec.file_excludes[i])) {
+                        passed = false;
+                        detail = fmt::format("%s must not contain \"%s\"", spec.file, spec.file_excludes[i]);
+                    }
+                }
+            }
         } else {
             // collect: run the project's own `cryo test`; exit 0 = all passed.
             // With `fails: true` the polarity inverts: the run MUST exit
@@ -2854,10 +2976,6 @@ type struct Executor {
 
     /// `cryo check <file>`: frontend + semantic analysis, no codegen.
     static cmd_check(args: cli::ParsedArgs) -> int {
-        if (args.has_flag("debug")) {
-            logger::Logger::enable_debug();
-        }
-
         const file: string = args.input_file();
         if (file == "") {
             fmt::eprintf("Error: No input file specified.\nUsage: cryo check <file> [flags]\n");
@@ -2865,9 +2983,6 @@ type struct Executor {
         }
 
         mut config: instance::CompilerConfig = instance::CompilerConfig::default();
-        if (args.has_flag("debug")) {
-            config = instance::CompilerConfig::debug_config();
-        }
         if (args.has_flag("ast")) {
             config.show_ast = true;
         }
@@ -2899,10 +3014,6 @@ type struct Executor {
 
     /// `cryo raw <file>`: compile without stdlib or prelude.
     static cmd_raw(args: cli::ParsedArgs) -> int {
-        if (args.has_flag("debug")) {
-            logger::Logger::enable_debug();
-        }
-
         const file: string = args.input_file();
         if (file == "") {
             fmt::eprintf("Error: No input file specified.\nUsage: cryo raw <file> [flags]\n");
@@ -2910,9 +3021,6 @@ type struct Executor {
         }
 
         mut config: instance::CompilerConfig = instance::CompilerConfig::default();
-        if (args.has_flag("debug")) {
-            config = instance::CompilerConfig::debug_config();
-        }
         if (args.has_flag("ast")) {
             config.show_ast = true;
         }
@@ -3055,17 +3163,11 @@ type struct Executor {
     /// Routes through CompilerInstance for proper phase management.
     static compile_file(file_path_text: string, args: cli::ParsedArgs) -> int {
         const file_path: string = file_path_text;
-        if (args.has_flag("debug")) {
-            logger::Logger::enable_debug();
-        }
 
-        logger::cdebug("[Compile] Compiling file: %s\n", file_path);
+        Log::debug(LogArea::Driver, f"compiling the file {file_path}");
 
         mut config: instance::CompilerConfig = instance::CompilerConfig::default();
 
-        if (args.has_flag("debug")) {
-            config = instance::CompilerConfig::debug_config();
-        }
         if (args.has_flag("ast")) {
             config.show_ast = true;
         }
@@ -3175,9 +3277,6 @@ type struct Executor {
 
     /// Shared implementation for `cryo fetch` and `cryo update`.
     static run_dep_resolve(args: cli::ParsedArgs, mode: dep_resolver::ResolveMode) -> int {
-        if (args.has_flag("debug")) {
-            logger::Logger::enable_debug();
-        }
 
         const config_path: string = project_config::ProjectConfig::find_cryoconfig(".");
         if (config_path.length() == 0) {
@@ -3222,8 +3321,6 @@ type struct Executor {
     /// `cryo vendor <path>|list|remove <name>|clean|rebuild [name]`: manage the
     /// per-machine registry of vendored C libraries.
     static cmd_vendor(args: cli::ParsedArgs) -> int {
-        if (args.has_flag("debug")) { logger::Logger::enable_debug(); }
-
         const sub: string = args.input_file();
         if (sub == "") {
             fmt::eprintf("Error: cryo vendor needs a subcommand or path.\n");

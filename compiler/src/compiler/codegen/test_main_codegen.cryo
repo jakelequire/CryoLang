@@ -40,13 +40,14 @@ import compiler::decl_index::{ DeclarationIndex };
 import compiler::resolver::{ symbol_str, intern_table };
 import compiler::codegen;
 import compiler::codegen::{ llvm };
+import compiler::codegen::passes;
+import compiler::codegen::passes::{ CodegenPasses };
 import compiler::codegen::llvm_types;
 import compiler::codegen::llvm_types::{
     LBasicBlock, LBuilder, LFileType, LLinkage, LModule, LTargetMachine, LType, LValue
 };
 import compiler::passes::{ pass_id, directive_processing };
-import utils::logger;
-import utils::logger::{ cdebug };
+import utils::log::{ Log, LogArea };
 import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{ DeclarationNode, FunctionDecl };
@@ -98,7 +99,7 @@ type struct TestMainCodegen {
 
         mut tests: [TestEntry] = TestMainCodegen::collect_tests(ctx);
         const test_count: u64 = tests.length as u64;
-        cdebug("[TestMainCodegen] %llu tests discovered\n", test_count);
+        Log::debug(LogArea::Codegen, f"{test_count} tests discovered");
 
         // Create the synthesized module.  Match target/data-layout to the
         // rest of the build so the linker can splice the .o in cleanly.
@@ -110,10 +111,15 @@ type struct TestMainCodegen {
         }
         const triple: string = ctx.options.target_triple;
         test_mod.set_target_triple(triple);
-        mut tm: LTargetMachine = LTargetMachine::create_target_machine_for_triple(triple);
-        if (tm.is_valid()) {
-            test_mod.set_data_layout(tm.get_data_layout_string());
-        }
+        mut tm: LTargetMachine = match (LTargetMachine::create_target_machine_for_triple(triple)) {
+            Result::Ok(machine) => { machine }
+            Result::Err(reason) => {
+                CodegenPasses::report_missing_target(ctx, triple, reason);
+                test_mod.dispose();
+                return PassResult::failure(1);
+            }
+        };
+        test_mod.set_data_layout(tm.get_data_layout_string());
 
         // Build the descriptor's LLVM type. Layout matches stdlib's
         // `TestDescriptor` struct: { ptr, i64, ptr, i1, i1 }.
@@ -163,7 +169,7 @@ type struct TestMainCodegen {
         const built_ok: boolean = TestMainCodegen::build_test_main(
             ctx, test_mod, arr_global, arr_ty, desc_ty, test_count);
         if (!built_ok) {
-            if (tm.is_valid()) { tm.dispose(); }
+            tm.dispose();
             test_mod.dispose();
             return PassResult::failure(1);
         }
@@ -171,16 +177,14 @@ type struct TestMainCodegen {
         // Emit to disk and register with the linker artifacts.
         const obj_path: string = TestMainCodegen::emit_object(ctx, test_mod, tm);
         if (obj_path.length() == 0) {
-            if (tm.is_valid()) { tm.dispose(); }
+            tm.dispose();
             test_mod.dispose();
             return PassResult::failure(1);
         }
         ctx.artifacts.register_object_file(obj_path);
-        if (ctx.options.verbose) {
-            cdebug("[TestMainCodegen] emitted %s (%llu tests)\n", obj_path, test_count);
-        }
+        Log::debug(LogArea::Codegen, f"emitted test main {obj_path} ({test_count} tests)");
 
-        if (tm.is_valid()) { tm.dispose(); }
+        tm.dispose();
         test_mod.dispose();
         return PassResult::ok();
     }
@@ -498,12 +502,6 @@ type struct TestMainCodegen {
     /// have already emitted a diagnostic).
     static emit_object(ctx: CompilationContext*, test_mod: LModule,
                          tm: LTargetMachine) -> string {
-        if (!tm.is_valid()) {
-            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                "test-main synthesis: native target machine unavailable");
-            return "";
-        }
-
         // The synthesized test-main is part of the local project, so its object
         // lands in the local package's deps subtree
         // (`<output_dir>/target/<profile>/local/deps`), alongside the per-module
@@ -512,12 +510,12 @@ type struct TestMainCodegen {
         ProjectConfig::mkdir_p(obj_dir);
         const obj_path: string = fmt::format("%s/__cryo_test_main.o", obj_dir);
 
-        const ok: boolean = tm.emit_to_file(test_mod, obj_path, LFileType::Object);
-        if (!ok) {
-            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                fmt::format("test-main synthesis: failed to emit %s", obj_path));
-            return "";
+        match (tm.emit_to_file(test_mod, obj_path, LFileType::Object)) {
+            Result::Ok(_) => { return obj_path; }
+            Result::Err(reason) => {
+                CodegenPasses::report_emit_failure(ctx, obj_path, reason);
+                return "";
+            }
         }
-        return obj_path;
     }
 }

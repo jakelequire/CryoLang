@@ -28,7 +28,7 @@ import compiler::diag::{
 };
 import compiler::decl_index;
 import compiler::const_table;
-import compiler::const_table::{ ConstEval };
+import compiler::const_table::{ ConstEval, FoldedInteger };
 import compiler::ast;
 import compiler::ast::{
     cloner, declaration, expression, GenericAnnotation, ImplTraitAnnotation, LiteralKind,
@@ -60,8 +60,7 @@ import std::core::{ option, mem };
 import std::collections::hashmap;
 import std::collections::hashmap::{ HashMap, HashMapIter };
 import std::fmt;
-import utils::logger;
-import utils::logger::{ cdebug };
+import utils::log::{ Log, LogArea, LogLevel };
 import compiler::diag::sink;
 import compiler::diag::sink::{ DiagnosticSink };
 import compiler::passes::type_resolution;
@@ -2518,14 +2517,16 @@ type struct SemaVisitor {
         if (!this.literals.expected_type_is_int_type()) {
             // The narrowest of i64 and u64 that holds the value, as for a
             // single literal; a value neither holds keeps its literals' widths.
-            mut folded: i128 = 0;
-            if (try_fold_const_integer(e, &folded)) {
-                if (folded >= i64::MIN as i128 && folded <= i64::MAX as i128) {
-                    const mag: i128 = if (folded < 0) { 0 - folded } else { folded };
-                    if (mag > i32::MAX as i128) { force_wide = this.arena.get_i64(); }
-                } else if (folded > 0 && folded <= u64::MAX as i128) {
-                    force_wide = this.arena.get_u64();
+            match (try_fold_const_integer(e)) {
+                Option::Some(folded) => {
+                    if (folded >= i64::MIN as i128 && folded <= i64::MAX as i128) {
+                        const mag: i128 = if (folded < 0) { 0 - folded } else { folded };
+                        if (mag > i32::MAX as i128) { force_wide = this.arena.get_i64(); }
+                    } else if (folded > 0 && folded <= u64::MAX as i128) {
+                        force_wide = this.arena.get_u64();
+                    }
                 }
+                Option::None => { }
             }
         }
         // A shift's result has its left operand's width, and the amount says
@@ -4386,10 +4387,11 @@ type struct SemaVisitor {
     const_repeat_count(&this, arr: ArrayExpr*) -> i64 {
         if (this.ctx == null) { return -1; }
         const ev: ConstEval = ConstEval::new(this.ctx.const_table, this.ctx.intern_table, null);
-        mut n: i128 = 0;
-        if (!ev.fold(arr.repeat_count_expr, &n)) { return -1; }
-        if (n < 0 || n > i64::MAX as i128) { return -1; }
-        return n as i64;
+        const folded: Option<FoldedInteger> = ev.fold(arr.repeat_count_expr);
+        if (folded.is_none()) { return -1; }
+        const n: FoldedInteger = folded.unwrap();
+        if (n.negative || n.bits > i64::MAX as u128) { return -1; }
+        return n.bits as i64;
     }
 
     resolve_array_literal(mut &this, e: ExpressionNode*, arr: ArrayExpr*) -> TypeRef {
@@ -5032,9 +5034,6 @@ type struct SemanticPasses {
     /// Runs once, before monomorphization; a copy carries what it decided.
     static run_sema(ctx: CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
-        if (ctx.options.verbose) {
-            cdebug("[Sema] Type-checking function bodies\n");
-        }
         const arena: TypeArena* = ctx.type_arena;
         if (arena == null) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR, "Sema: type system not initialized");
@@ -5053,12 +5052,9 @@ type struct SemanticPasses {
         v.wire();
         v.visit_program(root);
 
-        if (ctx.options.verbose) {
-            cdebug("[Sema] Type-checked %lld function bodies\n", v.state.body_count);
-        }
-        if (ctx.options.verbose) {
-            cdebug("[symbolic-check] walked %lld generic bodies, emitted %lld errors\n",
-                v.state.symbolic_bodies_walked, v.state.symbolic_total_would_emit);
+        if (Log::enabled(LogArea::Sema, LogLevel::Debug)) {
+            Log::debug(LogArea::Sema, f"type-checked {v.state.body_count} function bodies");
+            Log::debug(LogArea::Sema, f"symbolic check walked {v.state.symbolic_bodies_walked} generic bodies, emitted {v.state.symbolic_total_would_emit} errors");
         }
         return PassResult::from_snapshot(ctx.diagnostics, snap);
     }

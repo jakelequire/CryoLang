@@ -10,18 +10,16 @@ namespace compiler::codegen::visit::expr_dispatch;
 
 import compiler::codegen;
 import compiler::codegen::{ llvm_types, context };
-import compiler::const_table::{ ConstEval };
+import compiler::const_table::{ ConstEval, FoldedInteger };
 import compiler::codegen::state::visitor_state;
 import compiler::codegen::state::visitor_state::{ Emitted, VisitorState };
 import compiler::types;
 import compiler::types::{ compound, type_base, type_ref, TypeKind };
 import compiler::ast;
 import compiler::ast::{ expression, node, statement };
-import utils::logger;
-import utils::logger::{ cdebug };
+import utils::log::{ Log, LogArea, LogLevel };
 import compiler::lex;
 import compiler::lex::{ TokenType };
-import std::ffi::libc;
 import compiler::ast::expression::{
     ArrayAccessExpr, ExpressionNode, IdentifierExpr, ScopeResolutionExpr, UnaryExpr
 };
@@ -63,9 +61,9 @@ type struct ExprDispatch {
         if (block == null) { return out; }
         const b: BlockStmt* = block.as_block();
         this.cg.values.push_scope();
-        cdebug("[IRGen]         block (%lld stmts) at %s:%d:%d\n",
-               b.statements.length, block.span.file,
-               block.span.start_line as i32, block.span.start_col as i32); libc::fflush(null);
+        if (Log::enabled(LogArea::Codegen, LogLevel::Trace)) {
+            Log::trace(LogArea::Codegen, f"block of {b.statements.length} statements at {block.span.file}:{block.span.start_line}:{block.span.start_col}");
+        }
         for (mut i: i64 = 0; i < b.statements.length; i++) {
             const current: LBasicBlock = this.cg.builder.get_insert_block();
             if (current.is_valid() && current.has_terminator()) {
@@ -99,14 +97,12 @@ type struct ExprDispatch {
     /// Emit a statement through the visitor's dispatch on its kind.
     generate_statement(mut &this, visitor: IRGeneratorVisitor*, stmt: Stmt*) -> Emitted {
         if (stmt == null) { return Emitted::none(); }
-        cdebug("[IRGen]           stmt kind=Statement\n"); libc::fflush(null);
         return visitor.dispatch_node(Node::Stmt(stmt));
     }
 
     /// Emit an expression through the visitor's dispatch on its kind.
     generate_expression(mut &this, visitor: IRGeneratorVisitor*, expr: ExpressionNode*) -> Emitted {
         if (expr == null) { return Emitted::none(); }
-        cdebug("[IRGen]             expr kind=Expression\n");
         return visitor.dispatch_node(Node::Expr(expr));
     }
 
@@ -133,22 +129,24 @@ type struct ExprDispatch {
         const evaluator: ConstEval = this.cg.decl.const_eval();
         const kind: LTypeKind = LType::kind_of(ty.raw);
         if (t.kind == TypeKind::Float && (kind == LTypeKind::Float || kind == LTypeKind::Double)) {
-            mut real: f64 = 0.0;
-            if (!evaluator.fold_real(expr, &real)) { return LValue::null(); }
-            return LType::const_real(ty, real);
+            return match (evaluator.fold_real(expr)) {
+                Option::Some(real) => { LType::const_real(ty, real) }
+                Option::None       => { LValue::null() }
+            };
         }
         if ((t.kind != TypeKind::Int && t.kind != TypeKind::Bool && t.kind != TypeKind::Char)
             || kind != LTypeKind::Integer) {
             return LValue::null();
         }
-        mut value: i128 = 0;
-        const known: boolean = if (ident != null) {
-            evaluator.fold_named(ident, &value)
+        const folded: Option<FoldedInteger> = if (ident != null) {
+            evaluator.fold_named(ident)
         } else {
-            evaluator.fold_scoped(scoped, &value)
+            evaluator.fold_scoped(scoped)
         };
-        if (!known) { return LValue::null(); }
-        return LType::const_int_folded(ty, value);
+        return match (folded) {
+            Option::Some(value) => { LType::const_int_folded(ty, value) }
+            Option::None        => { LValue::null() }
+        };
     }
 
     /// Codegen an expression, ensuring the result is an rvalue (loaded).

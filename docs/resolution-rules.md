@@ -133,6 +133,59 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-22
+
+553. **A test project can set the compiler's environment and arguments,
+     and check its stderr apart from its stdout:** `test.json` takes
+     `environment` (`NAME=value` entries) and `arguments`, and `expect`
+     takes `stderr_contains` / `stderr_excludes`, line prefixes every
+     line of a stream must start with, and a file the command writes.
+     The logger's behaviour in a real `cryo` run is tested with these,
+     not by a script outside the suite.  (Jake)
+
+554. **LLVM refusing to emit an object, or having no target for the
+     triple, is a diagnostic, E0647,** carrying LLVM's own reason and
+     failing the build, in place of ruling 549's unnumbered `error:`
+     line.  A triple with no target is reported once, not once per
+     module.  (Jake)
+
+555. **A module's file is named as its directory spells it,** not by
+     the spelling that found it: on a filesystem that ignores case,
+     `public module Dumper;` finding `dumper.cryo` makes the module's
+     spans, panic locations and log lines name `dumper.cryo`.  Which
+     files are found does not change.  (Jake)
+
+556. **`cryo raw` stays as it is.**  (Jake)
+
+557. **A compile-time integer ranges from `i128::MIN` through
+     `u128::MAX`:** a `u128` above `i128::MAX` folds, and so does
+     arithmetic crossing `i128::MAX` either way; a cast or a declared
+     type wraps the value as the running program does.  (Jake)
+
+558. **An enum whose payload is aligned to 16 is laid out as the front
+     end sizes it,** its payload at offset 16, in the LLVM type as in
+     `sizeof`.  (Delegated)
+
+559. **Every code generation failure fails the build with a diagnostic.**
+     What LLVM will not do - write a module's bitcode, emit an object in
+     a worker process, or write the object an emit reported as written -
+     is E0647 with LLVM's reason; a module whose IR generation fails
+     without reporting why is E0900.  An earlier build's object is
+     removed before a module is emitted, so an emit that writes nothing
+     cannot leave it to be linked, and worker processes refuse a triple
+     with no target once, before any IR is generated.  (Jake; the codes
+     Delegated)
+
+560. **An enum whose payload is aligned above 16 is laid out as the front
+     end sizes it,** its payload at the payload's own alignment and the
+     enum aligned to it, in the LLVM type as in `sizeof`: alone, as an
+     array's element and as a struct's field.  (Jake)
+
+561. **The linked IR dump beside an executable is written only under
+     `--emit-llvm`** (or cryoconfig's `emit_llvm`), the only build that
+     writes the per-module `.ll` files it links; a build without it
+     spawns no `llvm-link` and logs nothing about one.  (Jake)
+
 ### 2026-10-21
 
 501. **The class-removal plan is deleted now,** its slices all built and its
@@ -285,6 +338,57 @@ yet is recorded with the change that builds it, not here.
 
 537. **128-bit constants fold and compile to immediates,** as narrower
      integers do, within the folder's range.  (Jake)
+
+538. **The compiler logger has named areas** (`driver`, `resolve`, `sema`,
+     `codegen`, `lsp` and the rest), each switched on alone.  (Jake)
+
+539. **Every log line names its source place** - file, line and function -
+     taken by `![caller_location]` from `location()`.  (Jake)
+
+540. **The logger is internal to the compiler** and the tools that link it
+     (the LSP); it is not standard library API.  (Jake)
+
+541. **A log call in cold code may be unguarded; one on a hot path is
+     guarded,** so disabled logging costs nothing there.  (Jake)
+
+542. **Logging is off by default.**  (Jake)
+
+543. **`--debug` is a shorthand for turning logging on.**  (Jake)
+
+544. **Every existing trace (`LOG_DEBUG`, `cdebug`, a debug `eprint`) is
+     removed or converted to the logger.**  (Jake)
+
+545. **Log output goes to a sink, a trait object (`virtual LogSink*`):**
+     stderr by default, or a file.  (Jake)
+
+546. **In the LSP, log output never reaches the editor's stderr channel
+     unless logging is explicitly switched on.**  (Jake)
+
+547. **Logging is switched on by an environment variable and by a
+     command-line flag, both.**  (Jake)
+
+548. **`--debug` is exactly `--log=debug`:** it switches logging on and
+     nothing else.  The AST dump is `--ast`'s, the IR files are
+     `--emit-llvm`'s, and diagnostics flush as they would without it.
+     cryoconfig's `debug = true` is the same switch, applied beneath
+     the environment and the command line: an area `CRYO_LOG` or a flag
+     set keeps that level.  (Delegated)
+
+549. **LLVM's own reasons for a failed object emit or target lookup are
+     errors on stderr,** not lines on stdout, and not log lines a
+     disabled logger would hide.  (Delegated)
+
+550. **The logger has no `async` area:** nothing logs there, and an area
+     with no lines is dead code.  (Delegated)
+
+551. **The language server's smoke test clears `CRYO_LOG` and
+     `CRYO_LOG_FILE` for the server it starts,** so a developer's own
+     logging cannot turn its quiet-stderr check red.  (Delegated)
+
+552. **Under `--emit-llvm`, a module that fails LLVM verification still
+     writes its `.ll` file,** so the IR the verifier refused can be read.
+     The failure is still reported as an error and the build still fails;
+     the refused module is never optimized or emitted.  (Delegated)
 
 ### 2026-10-20
 

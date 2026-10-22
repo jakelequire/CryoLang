@@ -38,8 +38,7 @@ import compiler::compilation_context::{ CompilationContext, CRecordRef };
 import compiler::module_graph::{ ModuleSpellingMatch };
 import compiler::module_graph;
 import compiler::module_graph::{ ModuleGraph, ModuleInfo };
-import utils::logger;
-import utils::logger::{ LOG_DEBUG, LogComponent };
+import utils::log::{ Log, LogArea, LogLevel };
 import std::fmt;
 import compiler::ast::declaration::{
     DestructureBinding, DestructureDecl, EnumDecl, EnumVariant,
@@ -241,7 +240,9 @@ type struct NameResolver {
 
     /// Walk top-level statements and forward-declare all names.
     forward_declare(mut &this, program: ProgramNode*) -> void {
-        LOG_DEBUG(LogComponent::General, "[NameResolver] forward_declare() with %d statements", program.statements.length);
+        if (Log::enabled(LogArea::Resolve, LogLevel::Debug)) {
+            Log::debug(LogArea::Resolve, f"forward-declaring {program.statements.length} top-level items");
+        }
         for (mut i: i64 = 0; i < program.statements.length; i++) {
             this.forward_declare_item(program.statements[i]);
         }
@@ -2814,7 +2815,9 @@ type struct NameResolver {
 
     process_import(mut &this, decl: DeclarationNode*, node: ImportDecl*) -> void {
         const module_path: string = this.resolver.intern_table.resolve(node.module_path);
-        LOG_DEBUG(LogComponent::General, "[NameResolver] process_import() module='%s'", module_path);
+        if (Log::enabled(LogArea::Resolve, LogLevel::Trace)) {
+            Log::trace(LogArea::Resolve, f"import {module_path}");
+        }
 
         // Resolve import path to actual module namespace name.
         // Import paths (e.g. "core::option") may differ from the target
@@ -3147,8 +3150,9 @@ implement trait Walk for struct NameResolver {
 
     // -- Declarations --
     walk_function(mut &this, node_decl: DeclarationNode*, node: FunctionDecl*) -> void {
-        LOG_DEBUG(LogComponent::General, "[NameResolver] visit(FunctionDecl) name='%s' generics=%d",
-            this.resolver.intern_table.resolve(node.name), node.generic_params.length);
+        if (Log::enabled(LogArea::Resolve, LogLevel::Trace)) {
+            Log::trace(LogArea::Resolve, f"function {this.resolver.intern_table.resolve(node.name)}, {node.generic_params.length} generic parameters");
+        }
         // Enter function scope
         this.resolver.enter_scope(ScopeKind::Function, this.resolver.intern_table.resolve(node.name),
             NameResolver::function_extent(node_decl));
@@ -3196,7 +3200,9 @@ implement trait Walk for struct NameResolver {
     }
 
     walk_struct(mut &this, d: DeclarationNode*, node: StructDecl*) -> void {
-        LOG_DEBUG(LogComponent::General, "[NameResolver] visit(StructDecl) name='%s'", this.resolver.intern_table.resolve(node.name));
+        if (Log::enabled(LogArea::Resolve, LogLevel::Trace)) {
+            Log::trace(LogArea::Resolve, f"struct {this.resolver.intern_table.resolve(node.name)}");
+        }
         // Enter type body scope
         this.resolver.enter_scope(ScopeKind::TypeBody, this.resolver.intern_table.resolve(node.name), d.span);
 
@@ -3244,7 +3250,9 @@ implement trait Walk for struct NameResolver {
     }
 
     walk_union(mut &this, d: DeclarationNode*, node: UnionDecl*) -> void {
-        LOG_DEBUG(LogComponent::General, "[NameResolver] visit(UnionDecl) name='%s'", this.resolver.intern_table.resolve(node.name));
+        if (Log::enabled(LogArea::Resolve, LogLevel::Trace)) {
+            Log::trace(LogArea::Resolve, f"union {this.resolver.intern_table.resolve(node.name)}");
+        }
         // Enter type body scope
         this.resolver.enter_scope(ScopeKind::TypeBody, this.resolver.intern_table.resolve(node.name), d.span);
 
@@ -3290,7 +3298,9 @@ implement trait Walk for struct NameResolver {
     }
 
     walk_enum(mut &this, d: DeclarationNode*, node: EnumDecl*) -> void {
-        LOG_DEBUG(LogComponent::General, "[NameResolver] visit(EnumDecl) name='%s'", this.resolver.intern_table.resolve(node.name));
+        if (Log::enabled(LogArea::Resolve, LogLevel::Trace)) {
+            Log::trace(LogArea::Resolve, f"enum {this.resolver.intern_table.resolve(node.name)}");
+        }
         this.resolver.enter_scope(ScopeKind::TypeBody, this.resolver.intern_table.resolve(node.name), d.span);
 
         // Declare generic params
@@ -3313,7 +3323,9 @@ implement trait Walk for struct NameResolver {
     }
 
     walk_trait(mut &this, d: DeclarationNode*, node: TraitDecl*) -> void {
-        LOG_DEBUG(LogComponent::General, "[NameResolver] visit(TraitDecl) name='%s'", this.resolver.intern_table.resolve(node.name));
+        if (Log::enabled(LogArea::Resolve, LogLevel::Trace)) {
+            Log::trace(LogArea::Resolve, f"trait {this.resolver.intern_table.resolve(node.name)}");
+        }
         this.resolver.enter_scope(ScopeKind::Trait, this.resolver.intern_table.resolve(node.name), d.span);
         const outer_trait: DefId = this.this_trait;
         this.this_trait = match (this.bare_name_res(node.sym_id)) {
@@ -4023,14 +4035,13 @@ implement trait Walk for struct NameResolver {
 /// is absent from its scope for the rest of the compilation.
 type struct NameDeclarationPass {
     static run(ctx: CompilationContext*) -> PassResult {
-        LOG_DEBUG(LogComponent::General, "[NameDeclaration] run() entry");
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
         ctx.install_prelude_modules();
 
         const root: ProgramNode* = ctx.artifacts.ast.root;
         if (root == null) {
-            LOG_DEBUG(LogComponent::General, "[NameDeclaration] No AST root available, skipping");
+            Log::debug(LogArea::Resolve, "no syntax tree; nothing to declare");
             return PassResult::ok();
         }
 
@@ -4243,7 +4254,6 @@ type struct NameResolutionPass {
 
     /// Run the name resolution pass on the compilation context.
     static run(ctx: CompilationContext*) -> PassResult {
-        LOG_DEBUG(LogComponent::General, "[NameResolution] run() entry");
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
         ctx.install_prelude_modules();
@@ -4251,7 +4261,7 @@ type struct NameResolutionPass {
         // Get AST root from artifacts
         const root: ProgramNode* = ctx.artifacts.ast.root;
         if (root == null) {
-            LOG_DEBUG(LogComponent::General, "[NameResolution] No AST root available, skipping");
+            Log::debug(LogArea::Resolve, "no syntax tree; nothing to resolve");
             return PassResult::ok();
         }
 
@@ -4280,10 +4290,9 @@ type struct NameResolutionPass {
         resolver.walk_node(Node::Program(root));
         resolver.check_param_projections();
 
-        LOG_DEBUG(LogComponent::General, "[NameResolution] Resolved %lld symbols in %lld scopes, %lld map entries",
-            ctx.resolver.symbol_count(),
-            ctx.resolver.scope_count(),
-            ctx.resolver.resolution_map.count());
+        if (Log::enabled(LogArea::Resolve, LogLevel::Debug)) {
+            Log::debug(LogArea::Resolve, f"resolved {ctx.resolver.symbol_count()} symbols in {ctx.resolver.scope_count()} scopes, {ctx.resolver.resolution_map.count()} resolution entries");
+        }
 
         return PassResult::from_snapshot(ctx.diagnostics, snap);
     }

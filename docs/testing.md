@@ -346,6 +346,33 @@ for any package: `[link]`, `[dependencies]`, target type), and `test.json` is
   { "outcome": "run", "expect": { "exit_code": 0, "stdout_contains": "ready" } }
   ```
 
+A project can also drive the compiler itself, for a test of what `cryo`
+writes rather than what the program does. `environment` sets variables for
+that one command (`"NAME=value"` entries), `arguments` adds to its command
+line after the outcome's own verb, and the compiler's stdout and stderr are
+kept apart, so `expect` can say which stream a line belongs on:
+
+- `stderr_contains` / `stderr_excludes` - substrings of stderr alone
+  (`output_contains` / `output_excludes` read both streams together);
+- `stdout_line_prefixes` / `stderr_line_prefixes` - every non-empty line of
+  that stream must start with one of these, so a line nobody expected fails
+  the project whatever it says;
+- `file`, with `file_contains` / `file_excludes` - a file the command writes,
+  relative to the project; it is removed before the command runs and after
+  it is read, so what is checked is always this run's.
+
+```json
+{
+  "outcome": "build",
+  "arguments": ["--log", "driver", "--log-file", "compiler.log"],
+  "expect": {
+    "stderr_excludes": ["[debug "],
+    "file": "compiler.log",
+    "file_contains": ["[debug driver] "]
+  }
+}
+```
+
 Each project is built and run as its own process tree, so a crash in one project
 can't take down the suite - the same isolation guarantee fork-per-test gives
 individual tests (section 3). The `PATTERN` argument to `cryo test` filters projects by

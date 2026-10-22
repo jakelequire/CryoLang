@@ -28,11 +28,10 @@ import compiler::resolver::lang_item::{ LangItem };
 import compiler::decl_index;
 import compiler::decl_index::{ DeclarationIndex };
 import compiler::const_table;
-import compiler::const_table::{ ConstantTable, ConstEval };
+import compiler::const_table::{ ConstantTable, ConstEval, FoldedInteger };
 import compiler::module_graph;
 import compiler::module_graph::{ ModuleGraph };
-import utils::logger;
-import utils::logger::{ cdebug, LOG_DEBUG, LogComponent };
+import utils::log::{ Log, LogArea, LogLevel };
 import compiler::resolver::scope;
 import compiler::resolver::scope::{ ScopeID };
 import compiler::resolver::res;
@@ -271,9 +270,10 @@ type struct TypeResolver {
         // No arena: a size is fixed here, and TypeLowering computes every
         // layout later, so `sizeof`/`alignof` are not yet constants.
         const ev: ConstEval = ConstEval::new(this.const_table, this.intern_table, null);
-        mut folded: i128 = 0;
-        if (ev.fold(a.size_expr, &folded)) {
-            if (folded < 0) {
+        const size: Option<FoldedInteger> = ev.fold(a.size_expr);
+        if (size.is_some()) {
+            const folded: FoldedInteger = size.unwrap();
+            if (folded.negative) {
                 if (this.diagnostics != null) {
                     this.diagnostics.emit(Diagnostic::error(
                         ErrorCode::E0239_NON_CONST_ARRAY_SIZE,
@@ -282,7 +282,7 @@ type struct TypeResolver {
                 }
                 return 0;
             }
-            if (folded > i64::MAX as i128) {
+            if (folded.bits > i64::MAX as u128) {
                 if (this.diagnostics != null) {
                     this.diagnostics.emit(Diagnostic::error(
                         ErrorCode::E0010_NUMBER_TOO_LARGE,
@@ -291,8 +291,8 @@ type struct TypeResolver {
                 }
                 return 0;
             }
-            a.size = folded as i64;       // cache: fold once per annotation
-            return folded as i64;
+            a.size = folded.bits as i64;       // cache: fold once per annotation
+            return folded.bits as i64;
         }
 
         if (this.diagnostics != null) {
@@ -441,7 +441,7 @@ type struct TypeResolver {
     /// Resolve a TypeAnnotation to a TypeRef.
     resolve(&this, ann: TypeAnnotation*, ctx: ResolutionContext*) -> TypeRef {
         if (ann == null) {
-            LOG_DEBUG(LogComponent::TypeChecker, "[TypeResolver] resolve() null annotation");
+            Log::trace(LogArea::Types, "no annotation to resolve");
             return TypeRef::invalid();
         }
 
@@ -1269,14 +1269,12 @@ type struct TypeResolver {
                            res_ctx: ResolutionContext*) -> void {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return; }
-        const _fname: string = this.intern_table.resolve(func.name);
-        cdebug("[ResFuncSig] enter func=%p '%s' params=%lld body=%p ret_ann=%p\n",
-               func, _fname, func.parameters.length,
-               func.body, func.return_type_annotation);
+        if (Log::enabled(LogArea::Types, LogLevel::Trace)) {
+            Log::trace(LogArea::Types, f"resolving the signature of '{this.intern_table.resolve(func.name)}': {func.parameters.length} parameters");
+        }
 
         // Resolve return type
         if (func.return_type_annotation != null && !func.has_resolved_return_type()) {
-            cdebug("[ResFuncSig]   resolving return type\n");
             const ret: TypeRef = this.resolve(func.return_type_annotation, res_ctx);
             if (ret.is_valid()) {
                 func.resolved_return_type = ret;
@@ -1463,14 +1461,17 @@ type struct TypeResolver {
         if (owner_type.is_valid()) {
             res_ctx.set_this_type(this.owner_this_type(owner_type, owner_args, res_ctx));
         }
-        cdebug("[ResMthSig] count=%lld owner_id=%d\n", methods.length, owner_type.key() as i32);
+        if (Log::enabled(LogArea::Types, LogLevel::Trace)) {
+            Log::trace(LogArea::Types, f"resolving {methods.length} method signatures of type {owner_type.key()}");
+        }
         for (mut i: i64 = 0; i < methods.length; i++) {
             const method_decl: DeclarationNode* = methods[i];
             const method: MethodDecl* = DeclarationNode::method_of(method_decl);
             if (method == null || method.func == null) { continue; }
 
-            const _mname: string = this.intern_table.resolve(DeclarationNode::fn_of(method.func).name);
-            cdebug("[ResMthSig]   [%lld] method='%s' generic=%d\n", i, _mname, DeclarationNode::fn_of(method.func).is_generic() as i32);
+            if (Log::enabled(LogArea::Types, LogLevel::Trace)) {
+                Log::trace(LogArea::Types, f"method {i} '{this.intern_table.resolve(DeclarationNode::fn_of(method.func).name)}': generic {DeclarationNode::fn_of(method.func).is_generic()}");
+            }
 
             // If the method itself is generic, bind its own params
             if (DeclarationNode::fn_of(method.func).is_generic()) {
@@ -1825,7 +1826,9 @@ private:
                   slot: ResSlot, span: SourceSpan) -> TypeRef {
         const name_str: string = this.intern_table.resolve(name);
         const name_len: i64 = name_str.length() as i64;
-        LOG_DEBUG(LogComponent::TypeChecker, "resolve_named() name='%s'", name_str);
+        if (Log::enabled(LogArea::Types, LogLevel::Trace)) {
+            Log::trace(LogArea::Types, f"named type {name_str}");
+        }
         // 1. A type parameter, bound in the enclosing generic context.  The
         //    stamp says WHICH parameter the spelling names; the binding
         //    table is keyed by that and holds nothing under a spelling, so a
@@ -1936,7 +1939,9 @@ private:
         // caller left it and the tie belongs to the writer's scope.
 
         // Not found; return invalid (caller should create error)
-        LOG_DEBUG(LogComponent::TypeChecker, "[TypeResolver] resolve_named() FAILED for '%s'", name_str);
+        if (Log::enabled(LogArea::Types, LogLevel::Debug)) {
+            Log::debug(LogArea::Types, f"named type {name_str} resolved to nothing");
+        }
         return TypeRef::invalid();
     }
 
@@ -2030,8 +2035,7 @@ private:
 
         // Bail early if the base type itself couldn't be resolved.
         if (!base.is_valid()) {
-            LOG_DEBUG(LogComponent::TypeChecker,
-                "[TypeResolver] resolve_generic() base type is invalid; cannot instantiate");
+            Log::debug(LogArea::Types, "generic base type did not resolve; nothing to instantiate");
             return TypeRef::invalid();
         }
 
@@ -2039,8 +2043,9 @@ private:
         for (mut i: i64 = 0; i < g.args.length; i++) {
             mut arg: TypeRef = this.resolve(g.args[i], ctx);
             if (!arg.is_valid()) {
-                LOG_DEBUG(LogComponent::TypeChecker,
-                    "[TypeResolver] resolve_generic() arg %d is invalid", i);
+                if (Log::enabled(LogArea::Types, LogLevel::Debug)) {
+                    Log::debug(LogArea::Types, f"generic type argument {i} did not resolve");
+                }
                 return TypeRef::invalid();
             }
             args.push(arg);
@@ -2049,9 +2054,7 @@ private:
         // GenericRegistry is required; every instantiation must be tracked
         // so the Monomorphizer can discover and specialize it.
         if (this.generic_registry == null) {
-            LOG_DEBUG(LogComponent::TypeChecker,
-                "[TypeResolver] ICE: resolve_generic() called without GenericRegistry; "
-                "pipeline ordering bug, TemplateRegistration must run before TypeResolution");
+            Log::debug(LogArea::Types, "no generic registry: template registration must run before type resolution");
             return TypeRef::invalid();
         }
 
@@ -2069,10 +2072,9 @@ private:
             }
 
             if (args.length != entry.param_count) {
-                LOG_DEBUG(LogComponent::TypeChecker,
-                    "[TypeResolver] resolve_generic() arg count mismatch: "
-                    "expected %d, got %d",
-                    entry.param_count, args.length);
+                if (Log::enabled(LogArea::Types, LogLevel::Debug)) {
+                    Log::debug(LogArea::Types, f"{entry.display_name(this.intern_table)} takes {entry.param_count} type arguments, given {args.length}");
+                }
                 return TypeRef::invalid();
             }
 
@@ -2099,9 +2101,9 @@ private:
                     for (mut i: i64 = 0; i < entry.param_count; i++) {
                         alias_ctx.add_binding(entry.param_syms[i], entry.param_names[i], args[i]);
                     }
-                    LOG_DEBUG(LogComponent::TypeChecker,
-                        "[TypeResolver] expanding generic alias '%s' with %d args",
-                        entry.display_name(this.intern_table), args.length);
+                    if (Log::enabled(LogArea::Types, LogLevel::Trace)) {
+                        Log::trace(LogArea::Types, f"expanding generic alias {entry.display_name(this.intern_table)} with {args.length} type arguments");
+                    }
                     return this.resolve(alias_node.target_annotation, &alias_ctx);
                 }
             }

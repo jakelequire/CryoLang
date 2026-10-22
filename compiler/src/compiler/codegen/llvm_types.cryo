@@ -20,6 +20,7 @@ import std::collections::string;
 import std::collections::string::{ String };
 import std::fmt::interp::{ fmt_append_display, fmt_append_lit, fmt_new };
 import compiler::resolver::mangled_name::{ MangledName };
+import compiler::const_table::{ FoldedInteger };
 
 
 // LLVM-C enum mirrors
@@ -1042,20 +1043,20 @@ type struct LType {
         return LValue { raw: llvm::LLVMConstInt(ty.raw, val, sign_extend as i32) };
     }
 
+    /// A folded integer as a constant of the integer type `ty`, at any width:
+    /// a value with a 64-bit two's-complement pattern is built from it, a
+    /// wider one from its decimal digits.
+    static const_int_folded(ty: LType, value: FoldedInteger) -> LValue {
+        return match (value.to_64_bit_pattern()) {
+            Option::Some(pattern) => { LType::const_int(ty, pattern, true) }
+            Option::None => { LType::const_int_of_string(ty, value.to_decimal_str(), 10) }
+        };
+    }
+
     /// Build an integer constant from its textual digits in `radix`. Used for
     /// i128/u128 literals whose value exceeds 64 bits (the u64-based
     /// `const_int` would truncate). `digits` must be the bare digits with no
     /// sign or `0x`/`0b`/`0o` prefix and no `_` separators.
-    /// A folded integer as a constant of the integer type `ty`, at any width:
-    /// a value with a 64-bit two's-complement pattern is built from it, a
-    /// wider one from its decimal digits.
-    static const_int_folded(ty: LType, value: i128) -> LValue {
-        if (value >= i64::MIN as i128 && value <= u64::MAX as i128) {
-            return LType::const_int(ty, value as u64, true);
-        }
-        return LType::const_int_of_string(ty, value.to_decimal_str(), 10);
-    }
-
     static const_int_of_string(ty: LType, digits: string, radix: u8) -> LValue {
         return LValue { raw: llvm::LLVMConstIntOfString(ty.raw, digits, radix) };
     }
@@ -1177,15 +1178,26 @@ type struct LTargetMachine {
         return str;
     }
 
-    emit_to_file(&this, llmodule: LModule, filename: string, file_type: LFileType) -> boolean {
+    /// Write `llmodule` to `filename`, or answer LLVM's reason it could not;
+    /// the caller reports it.
+    emit_to_file(&this, llmodule: LModule, filename: string, file_type: LFileType) -> Result<(), String> {
         mut err_msg: i8* = null;
         const result: i32 = llvm::LLVMTargetMachineEmitToFile(
             this.raw, llmodule.raw, filename, file_type as i32, &err_msg as void*);
-        if (err_msg != null) {
-            fmt::println(f"[Codegen] Emit error: {err_msg as string}");
-            llvm::LLVMDisposeMessage(err_msg as void*);
+        const reason: String = LTargetMachine::take_message(err_msg);
+        if (result != 0) {
+            return Result::Err(reason);
         }
-        return result == 0;
+        return Result::Ok(());
+    }
+
+    /// An LLVM-allocated message as an owned string, the message disposed;
+    /// a null message is an empty string.
+    static take_message(message: i8*) -> String {
+        if (message == null) { return String::new(); }
+        const owned: String = String::from_string(message as string);
+        llvm::LLVMDisposeMessage(message as void*);
+        return owned;
     }
 
     /// Initialize the native target for code generation.  Must be called
@@ -1201,8 +1213,9 @@ type struct LTargetMachine {
     /// Create a target machine for an explicit LLVM target triple.  Used by
     /// codegen when the project specifies `target = "..."` in cryoconfig or
     /// the user passed `--target=TRIPLE`.  Falls back to the host triple when
-    /// `triple` is the empty string.
-    static create_target_machine_for_triple(triple: string) -> LTargetMachine {
+    /// `triple` is the empty string.  When LLVM has no target for the triple
+    /// the answer is LLVM's reason, which the caller reports.
+    static create_target_machine_for_triple(triple: string) -> Result<LTargetMachine, String> {
         return LTargetMachine::create_target_machine_with_opt(
             triple, LCodeGenOptLevel::LevelDefault as i32);
     }
@@ -1213,7 +1226,7 @@ type struct LTargetMachine {
     /// O0/debuggable build gets less aggressive instruction selection and
     /// register allocation than an optimized one. Out-of-range levels clamp
     /// into [0, 3].
-    static create_target_machine_with_opt(triple_text: string, opt_level: i32) -> LTargetMachine {
+    static create_target_machine_with_opt(triple_text: string, opt_level: i32) -> Result<LTargetMachine, String> {
         const triple: string = triple_text;
         mut level: i32 = opt_level;
         if (level < 0) { level = 0; }
@@ -1246,12 +1259,9 @@ type struct LTargetMachine {
         LTargetMachine::init_native_target();
 
         const found: i32 = llvm::LLVMGetTargetFromTriple(effective, &target as void*, &err_msg as void*);
+        const reason: String = LTargetMachine::take_message(err_msg);
         if (found != 0) {
-            if (err_msg != null) {
-                fmt::println(f"[Codegen] Target lookup failed for triple '{effective}': {err_msg as string}");
-                llvm::LLVMDisposeMessage(err_msg as void*);
-            }
-            return LTargetMachine::null();
+            return Result::Err(reason);
         }
 
         const tm: void* = llvm::LLVMCreateTargetMachine(
@@ -1260,7 +1270,7 @@ type struct LTargetMachine {
             LRelocMode::PIC as i32,
             LCodeModel::Default as i32);
 
-        return LTargetMachine { raw: tm };
+        return Result::Ok(LTargetMachine { raw: tm });
     }
 
     static pick_windows_default_triple(raw_text: string) -> string {
