@@ -30,8 +30,7 @@ import compiler::types::{ type_ref, type_base, arena, compound, generic, generic
 import compiler::ast;
 import compiler::ast::{ node, expression, statement, declaration };
 import compiler::resolver::{ symbol_str, intern_table };
-import utils::logger;
-import utils::logger::{ cdebug };
+import utils::log::{ Log, LogArea, LogLevel };
 import std::collections::pair;
 import std::collections::pair::{ Pair };
 import std::ffi::libc;
@@ -89,31 +88,33 @@ type struct DeclVisitEmitter {
         if (node == null) { return; }
         if (node.generic_params.length > 0) { return; }
         if (node.body == null) { return; }
-        const fn_name: string = this.cg.resolve(node.name);
         // `cryo test` synthesizes its own `main`; suppress the user's so
         // the LLVM module has exactly one `main` symbol.  Mirrors the
         // `declare_function` guard.
         if (this.cg.ctx.options.mode.skip_user_main()
                 && node.def.is_valid() && node.def.equals(this.cg.ctx.entry_fn)) {
-            cdebug("[IRGen]   func body: main (suppressed by test mode)\n");
-            libc::fflush(null);
+            if (Log::enabled(LogArea::Codegen, LogLevel::Trace)) {
+                Log::trace(LogArea::Codegen, "function body of main suppressed in test mode");
+            }
             return;
         }
-        cdebug("[IRGen]   func body: %s\n", fn_name); libc::fflush(null);
+        if (Log::enabled(LogArea::Codegen, LogLevel::Trace)) {
+            const fn_name: string = this.cg.resolve(node.name);
+            Log::trace(LogArea::Codegen, f"function body {fn_name}");
+        }
         this.generate_function_body(visitor, node_decl);
-        cdebug("[IRGen]   func done\n"); libc::fflush(null);
     }
 
     emit_impl_block_visit(mut &this, visitor: IRGeneratorVisitor*, node: ImplBlock*) -> void {
         if (node == null) { return; }
-        const impl_target: string = this.cg.resolve(node.target_type);
-        cdebug("[IRGen]   impl block: %s (%lld methods)\n",
-               impl_target, node.methods.length); libc::fflush(null);
+        if (Log::enabled(LogArea::Codegen, LogLevel::Trace)) {
+            const impl_target: string = this.cg.resolve(node.target_type);
+            Log::trace(LogArea::Codegen, f"implement block {impl_target} ({node.methods.length} methods)");
+        }
         this.generate_impl_block(visitor, node);
         if (node.object_table_symbol.is_valid()) {
             this.cg.decl.emit_object_table(node, this.emit_object_release(visitor, node), node.target_type_span);
         }
-        cdebug("[IRGen]   impl done\n"); libc::fflush(null);
     }
 
     /// The drop word of `block`'s trait-object table: a function of the
@@ -169,15 +170,15 @@ type struct DeclVisitEmitter {
         if (node == null) { return; }
         if (node.generic_params.length > 0) { return; }
         if (node.methods.length == 0) { return; }
-        const sname: string = this.cg.resolve(node.name);
-        cdebug("[IRGen]   struct methods: %s (%lld methods)\n",
-               sname, node.methods.length); libc::fflush(null);
+        if (Log::enabled(LogArea::Codegen, LogLevel::Trace)) {
+            const sname: string = this.cg.resolve(node.name);
+            Log::trace(LogArea::Codegen, f"struct methods {sname} ({node.methods.length} methods)");
+        }
         this.state.current_impl_target = this.cg.ctx.decl_index.type_of_decl(node.def, "codegen/struct method bodies");
         for (mut j: i64 = 0; j < node.methods.length; j++) {
             this.generate_method_body(visitor, node.methods[j]);
         }
         this.state.current_impl_target = TypeRef::invalid();
-        cdebug("[IRGen]   struct methods done\n"); libc::fflush(null);
     }
 
     /// Emit method bodies for a union declaration.  A union's type is a
@@ -218,12 +219,9 @@ type struct DeclVisitEmitter {
         }
         const fn_val: LValue = this.cg.decl.codegen_function_prologue(node_decl);
         if (!fn_val.is_valid()) {
-            cdebug("[IRGen]     func prologue failed\n"); libc::fflush(null);
             return;
         }
-        cdebug("[IRGen]     func prologue ok, generating block...\n"); libc::fflush(null);
         this.dispatch.generate_block(visitor,node.body);
-        cdebug("[IRGen]     func block done, epilogue...\n"); libc::fflush(null);
         this.cg.decl.codegen_function_epilogue(node_decl);
 
         // DWARF: clear the current debug location at the end of the body so
@@ -267,7 +265,9 @@ type struct DeclVisitEmitter {
     /// Generate every method body for an impl block.
     generate_impl_block(mut &this, visitor: IRGeneratorVisitor*, node: ImplBlock*) -> void {
         if (node.generic_params.length > 0) {
-            cdebug("[IRGen]     impl skipped (generic)\n"); libc::fflush(null);
+            if (Log::enabled(LogArea::Codegen, LogLevel::Trace)) {
+                Log::trace(LogArea::Codegen, "implement block skipped: generic");
+            }
             return;
         }
 
@@ -276,7 +276,9 @@ type struct DeclVisitEmitter {
         const cg_ctx: CompilationContext* = this.cg.ctx;
         const greg: GenericRegistry* = cg_ctx.generic_registry;
         if (greg.template_of(node.target_def()) != null) {
-            cdebug("[IRGen]     impl skipped (template target)\n"); libc::fflush(null);
+            if (Log::enabled(LogArea::Codegen, LogLevel::Trace)) {
+                Log::trace(LogArea::Codegen, "implement block skipped: its target is a generic template");
+            }
             return;
         }
         this.state.current_impl_target = this.cg.ctx.decl_index.impl_owner(node, "codegen/impl bodies");
@@ -286,14 +288,11 @@ type struct DeclVisitEmitter {
             const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             const mfunc_decl: DeclarationNode* = m.func;
             const mfunc: FunctionDecl* = DeclarationNode::fn_of(mfunc_decl);
-            if (mfunc != null) {
+            if (mfunc != null && Log::enabled(LogArea::Codegen, LogLevel::Trace)) {
                 const mname: string = this.cg.resolve(mfunc.name);
-                cdebug("[IRGen]     method[%lld]: %s (static=%d, generic=%lld, body=%p)\n",
-                       i, mname, m.is_static as i32,
-                       mfunc.generic_params.length, mfunc.body as void*); libc::fflush(null);
+                Log::trace(LogArea::Codegen, f"method {i}: {mname} (static {m.is_static}, {mfunc.generic_params.length} generic parameters)");
             }
             this.generate_method_body(visitor, m_decl);
-            cdebug("[IRGen]     method[%lld] done\n", i); libc::fflush(null);
         }
 
         this.state.current_impl_target = TypeRef::invalid();
@@ -312,16 +311,12 @@ type struct DeclVisitEmitter {
         // specializations (flag cleared).
         if (func.is_self_returning_default || func.is_lazy_self_growing) { return; }
 
-        cdebug("[IRGen]       method prologue...\n"); libc::fflush(null);
         const fn_val: LValue = this.cg.decl.codegen_method_prologue(node_decl, this.state.current_impl_target);
         if (!fn_val.is_valid()) {
-            cdebug("[IRGen]       method prologue FAILED\n"); libc::fflush(null);
             return;
         }
 
-        cdebug("[IRGen]       method body block...\n"); libc::fflush(null);
         this.dispatch.generate_block(visitor,func.body);
-        cdebug("[IRGen]       method body done, epilogue...\n"); libc::fflush(null);
         this.cg.decl.codegen_function_epilogue(func_decl);
 
         if (!this.cg.diag.is_function_body_valid(fn_val)) {

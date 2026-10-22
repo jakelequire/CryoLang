@@ -18,6 +18,8 @@ Cases:
     `trace`;
   - CRYO_LOG=lex,resolve,mono: exactly those areas log; parse=trace logs
     each statement;
+  - CRYO_LOG=codegen: codegen lines, no trace among them; codegen=trace adds
+    them;
   - CRYO_LOG=driver with --log=link,driver=off: the flag wins - link lines,
     no driver lines;
   - --debug: more than one area logs;
@@ -133,6 +135,14 @@ def main():
     r = build(cryo, env, {"CRYO_LOG": "parse=trace"})
     check(r.code == 0 and any(m.group(6).startswith("statement at") for m in r.err_lines),
           "the parser logs each statement at trace", r)
+
+    r = build(cryo, env, {"CRYO_LOG": "codegen"})
+    check(r.code == 0 and areas(r.err_lines) == ["codegen"]
+          and all(m.group(1) != "trace" for m in r.err_lines),
+          "codegen logs at debug, without its trace lines", r)
+    r = build(cryo, env, {"CRYO_LOG": "codegen=trace"})
+    check(r.code == 0 and any(m.group(1) == "trace" for m in r.err_lines),
+          "codegen=trace logs codegen's trace lines", r)
 
     r = build(cryo, env, {"CRYO_LOG": "driver"}, ["--log=link,driver=off"])
     check(r.code == 0 and areas(r.err_lines) == ["link"], "--log wins over CRYO_LOG", r)
