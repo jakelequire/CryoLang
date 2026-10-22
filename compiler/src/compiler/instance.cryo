@@ -104,7 +104,6 @@ function codegen_default_threads() -> u32 { return thread::available_parallelism
 const CODEGEN_MULTIPROC_MIN_MODULES: u32 = 16;
 
 type struct CompilerConfig {
-    debug:              boolean;
     show_ast:           boolean;
     emit_llvm:          boolean;
     /// CLI override for project output_dir.  Empty string ("") means
@@ -210,33 +209,7 @@ type struct CompilerConfig {
 
     static default() -> CompilerConfig {
         return CompilerConfig {
-            debug:               false,
             show_ast:            false,
-            emit_llvm:           false,
-            output_dir_override: "",
-            stdlib_path_override: "",
-            test_mode:           false,
-            target_triple_override: "",
-            output_path_override: "",
-            output_kind:         OutputKind::None,
-            opt_level_override:  -1,
-            emit_debug_info:     false,
-            profile_override:    "",
-            incremental:         true,
-            release_static:      false,
-            no_std:              false,
-            no_runtime:          false,
-            panic:               PanicStrategy::Unspecified,
-            locked:              false,
-            codegen_threads_override: -1,
-            plant_unanswered_name: "",
-        };
-    }
-
-    static debug_config() -> CompilerConfig {
-        return CompilerConfig {
-            debug:               true,
-            show_ast:            true,
             emit_llvm:           false,
             output_dir_override: "",
             stdlib_path_override: "",
@@ -442,7 +415,7 @@ type struct CompilerInstance {
         }
 
         // Print diagnostic summary when ANY diagnostic was emitted (errors
-        // or warnings) or in debug mode.  Without flushing on warnings,
+        // or warnings).  Without flushing on warnings,
         // codegen warnings about silently-dropped function bodies (e.g.
         // missing LLVM declarations for cross-module trait impls) are
         // collected but never rendered, so the user sees a green build
@@ -460,8 +433,7 @@ type struct CompilerInstance {
         };
         if (!skip_flush
                 && (ctx.diagnostics.has_errors()
-                    || ctx.diagnostics.has_warnings()
-                    || this.config.debug)) {
+                    || ctx.diagnostics.has_warnings())) {
             ctx.diagnostics.flush();
             if (ctx.diag_renderer != null) {
                 ctx.diag_renderer.print_summary(
@@ -549,7 +521,6 @@ type struct CompilerInstance {
         }
 
         mut options: BuildOptions = BuildOptions::defaults(CompileMode::Raw);
-        options.verbose = this.config.debug;
         options.target_triple = LTargetMachine::resolve_effective_triple(
             this.config.target_triple_override);
         options.output = OutputOverride::from_cli(this.config.output_kind,
@@ -760,10 +731,11 @@ type struct CompilerInstance {
             this.config.plant_unanswered_name = config.test_plant_unanswered_name;
         }
 
-        // cryoconfig `debug = true` is `--debug`.  It only switches logging
-        // ON: `debug = false` does not undo a `--debug` or a `CRYO_LOG`.
+        // cryoconfig `debug = true` is `--debug`, beneath the environment
+        // and the command line: an area `CRYO_LOG` or `--log` set keeps its
+        // level, and `debug = false` switches nothing off.
         if (config.debug) {
-            Log::configure(Str::new("debug"), "cryoconfig");
+            Log::configure_from_project(Str::new("debug"), "cryoconfig");
         }
 
         // Multi-target projects ([lib] and/or [[bin]]) build each output
@@ -984,7 +956,6 @@ type struct CompilerInstance {
         }
 
         mut options: BuildOptions = BuildOptions::defaults(mode);
-        options.verbose = this.config.debug;
         options.output = OutputOverride::from_cli(this.config.output_kind,
                                                   this.config.output_path_override);
         // Base from the profile (debug => O0, release => O2); an explicit
@@ -2185,7 +2156,9 @@ type struct CompilerInstance {
                 }
                 const _mi: ModuleInfo* = &ctx.module_graph.modules[order[i]];
                 const _mn: string = ctx.intern_table.shown(_mi.path().decl_name());
-                Log::debug(LogArea::Driver, f"generating module {i} of {n}: {_mn}");
+                if (Log::enabled(LogArea::Driver, LogLevel::Debug)) {
+                    Log::debug(LogArea::Driver, f"generating module {i} of {n}: {_mn}");
+                }
                 // Cached module: reuse the on-disk object instead of
                 // regenerating IR + emitting it.  Recorded at this topo
                 // position; registered with everything else below.
@@ -2194,7 +2167,9 @@ type struct CompilerInstance {
                         ctx.project_config.deps_dir_for(
                             ModuleInfo::origin_subdir(_mi.origin, _mi.origin_name)),
                         compiler::build_manifest::Manifest::path_module(_mn));
-                    Log::debug(LogArea::Driver, f"reused the cached object {cg_obj[i as i64]}");
+                    if (Log::enabled(LogArea::Driver, LogLevel::Debug)) {
+                        Log::debug(LogArea::Driver, f"reused the cached object {cg_obj[i as i64]}");
+                    }
                     continue;
                 }
 
@@ -2539,18 +2514,6 @@ type struct CompilerInstance {
             tm_link_end = Instant::now().as_nanos();
         }
 
-        // Print diagnostic summary on errors, warnings, or debug mode.
-        // Without flushing on warnings, codegen-side warnings about
-        // silently-dropped function bodies never reach the user; the
-        // build looks green, then the linker fails with `undefined
-        // reference`.
-        // Skip terminal flush in LSP mode; same rationale as in
-        // `run_pipeline`: the renderer fprintfs to a stream which
-        // a host that drives the compiler purely as a library hasn't
-        // necessarily wired up (the LSP, for one, gets `NULL`).  The
-        // language server reads `ctx.diagnostics.diagnostics` directly
-        // and emits them as JSON over stdout.
-
         // A stage required a node's `Res` and no resolver had written one.
         // That is an internal error rather than a licence to search: the
         // consumer was handed `Err` and stopped, so whatever was built below it
@@ -2588,14 +2551,18 @@ type struct CompilerInstance {
 
         CompilerInstance::report_unstamped_decls(ctx);
 
+        // Print the diagnostic summary on errors or warnings: a codegen
+        // warning about a dropped function body that is never flushed reads
+        // as a green build until the linker fails with `undefined reference`.
+        // The language server reads `ctx.diagnostics.diagnostics` directly
+        // and has no stream for the renderer, so it skips the flush.
         const skip_flush: boolean = match (ctx.options.mode) {
             CompileMode::Lsp => { true }
             _                => { false }
         };
         if (!skip_flush
                 && (ctx.diagnostics.has_errors()
-                    || ctx.diagnostics.has_warnings()
-                    || this.config.debug)) {
+                    || ctx.diagnostics.has_warnings())) {
             ctx.diagnostics.flush();
             if (ctx.diag_renderer != null) {
                 ctx.diag_renderer.print_summary(

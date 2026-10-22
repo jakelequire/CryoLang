@@ -314,6 +314,24 @@ yet is recorded with the change that builds it, not here.
 547. **Logging is switched on by an environment variable and by a
      command-line flag, both.**  (Jake)
 
+548. **`--debug` is exactly `--log=debug`:** it switches logging on and
+     nothing else.  The AST dump is `--ast`'s, the IR files are
+     `--emit-llvm`'s, and diagnostics flush as they would without it.
+     cryoconfig's `debug = true` is the same switch, applied beneath
+     the environment and the command line: an area `CRYO_LOG` or a flag
+     set keeps that level.  (Delegated)
+
+549. **LLVM's own reasons for a failed object emit or target lookup are
+     errors on stderr,** not lines on stdout, and not log lines a
+     disabled logger would hide.  (Delegated)
+
+550. **The logger has no `async` area:** nothing logs there, and an area
+     with no lines is dead code.  (Delegated)
+
+551. **The language server's smoke test clears `CRYO_LOG` and
+     `CRYO_LOG_FILE` for the server it starts,** so a developer's own
+     logging cannot turn its quiet-stderr check red.  (Delegated)
+
 ### 2026-10-20
 
 465. **The removed class syntax is refused with E0117,** "`<form>` is not

@@ -73,6 +73,11 @@ function file_holds(path: string, text: string) -> boolean {
 function main() -> int {
     mut capture: CapturingSink = CapturingSink { count: 0, last: String::new() };
 
+    check(!Log::enabled(LogArea::Driver, LogLevel::Error)
+          && !Log::enabled(LogArea::Codegen, LogLevel::Error)
+          && !Log::enabled(LogArea::Time, LogLevel::Error),
+          "every area starts off, before anything configures the logger");
+
     reset(&capture);
     run_command_line([]);
     check(!Log::enabled(LogArea::Driver, LogLevel::Error)
@@ -139,6 +144,41 @@ function main() -> int {
           "--log is applied after CRYO_LOG, so it wins");
 
     reset(&capture);
+    run_command_line(["build", "--log", "link,driver=trace", "src/main.cryo"]);
+    check(Log::enabled(LogArea::Link, LogLevel::Debug) && Log::enabled(LogArea::Driver, LogLevel::Trace)
+          && !Log::enabled(LogArea::Sema, LogLevel::Error),
+          "--log takes its spec as the next argument too");
+
+    reset(&capture);
+    run_command_line(["build", "--log", "--debug"]);
+    check(Log::enabled(LogArea::Sema, LogLevel::Debug) && !Log::enabled(LogArea::Sema, LogLevel::Trace),
+          "--log does not take a following flag as its spec");
+
+    reset(&capture);
+    run_command_line(["build", "--log=off"]);
+    Log::configure_from_project(Str::new("debug"), "test");
+    check(!Log::enabled(LogArea::Driver, LogLevel::Error) && !Log::enabled(LogArea::Codegen, LogLevel::Error),
+          "a project's setting does not undo --log=off");
+
+    reset(&capture);
+    run_command_line(["build", "--log=parse=off"]);
+    Log::configure_from_project(Str::new("debug"), "test");
+    check(!Log::enabled(LogArea::Parse, LogLevel::Error) && Log::enabled(LogArea::Sema, LogLevel::Debug),
+          "a project's setting applies to the areas the command line left alone");
+
+    reset(&capture);
+    env::set_var(Str::new("CRYO_LOG"), Str::new("off"));
+    run_command_line(["build"]);
+    Log::configure_from_project(Str::new("debug"), "test");
+    check(!Log::enabled(LogArea::Driver, LogLevel::Error), "a project's setting does not undo CRYO_LOG=off");
+
+    reset(&capture);
+    run_command_line(["build"]);
+    Log::configure_from_project(Str::new("debug"), "test");
+    check(Log::enabled(LogArea::Driver, LogLevel::Debug) && Log::enabled(LogArea::Time, LogLevel::Debug),
+          "a project's setting turns logging on when nothing else chose");
+
+    reset(&capture);
     run_command_line(["build", "--debug"]);
     check(Log::enabled(LogArea::Driver, LogLevel::Debug) && Log::enabled(LogArea::Codegen, LogLevel::Debug)
           && Log::enabled(LogArea::Time, LogLevel::Debug) && !Log::enabled(LogArea::Mono, LogLevel::Trace),
@@ -175,6 +215,26 @@ function main() -> int {
     Log::debug(LogArea::Sema, "into the flag's file");
     check(capture.count == 0 && file_holds(flag_path, "[debug sema] ") && file_holds(flag_path, ": into the flag's file\n"),
           "--log-file sends the lines to that file");
+
+    reset(&capture);
+    const spaced_path: string = "build/compiler-log-spaced.txt";
+    dir::remove_file(Path::from(Str::new(spaced_path)));
+    run_command_line(["build", "--log", "sema", "--log-file", spaced_path]);
+    Log::debug(LogArea::Sema, "into the spaced flag's file");
+    check(capture.count == 0 && file_holds(spaced_path, ": into the spaced flag's file\n"),
+          "--log-file takes its path as the next argument too");
+
+    reset(&capture);
+    const unused_env_path: string = "build/compiler-log-unused-env.txt";
+    const chosen_path: string = "build/compiler-log-chosen.txt";
+    dir::remove_file(Path::from(Str::new(unused_env_path)));
+    dir::remove_file(Path::from(Str::new(chosen_path)));
+    env::set_var(Str::new("CRYO_LOG_FILE"), Str::new(unused_env_path));
+    run_command_line(["build", "--log=sema", "--log-file=build/compiler-log-chosen.txt"]);
+    Log::debug(LogArea::Sema, "into the chosen file");
+    check(file_holds(chosen_path, ": into the chosen file\n")
+          && !file::read_to_string(Path::from(Str::new(unused_env_path))).is_ok(),
+          "--log-file replaces CRYO_LOG_FILE, which is never created");
 
     reset(&capture);
     Log::configure(Str::new("lsp=error"), "test");

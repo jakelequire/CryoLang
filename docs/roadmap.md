@@ -28,8 +28,7 @@ language server".  From there, in order, to the v1.0 freeze:
    with `max_value()` removed (ruling 510).  Trait constants used as
    values come after v1.0; trait constants as array lengths are not in
    v1.0; see "Associated constants" below.
-5. **An internal compiler logger.**  Built, on `compiler-logger`:
-   `utils::log`, with areas, levels, `CRYO_LOG` / `--log` and a file
+5. **An internal compiler logger.**  Built: `utils::log`, with areas, levels, `CRYO_LOG` / `--log` and a file
    sink, in place of `LOG_DEBUG`, `cdebug` and `CRYO_TIMINGS`; see
    "An internal compiler logger" below.
 6. **The standard library's visibility pass.**  Everything in it is public
@@ -334,7 +333,7 @@ Left:
 ## An internal compiler logger
 
 Built: one logger in `utils::log` replaces `LOG_DEBUG`, `cdebug` and
-`CRYO_TIMINGS` (rulings 538-547; `docs/cryo.md` section 24.2 has the
+`CRYO_TIMINGS` (rulings 538-551; `docs/cryo.md` section 24.2 has the
 switches).  The `CRYO_LAYOUT_AUDIT`, `CRYO_CTX_AUDIT` and
 `CRYO_TYPE_AUDIT` checks keep their own variables: each runs a check and
 reports what it finds, which is not a log line.
@@ -350,8 +349,17 @@ Open:
   open;
 - the language server logs to stderr or a file when `CRYO_LOG` is set; a
   sink sending lines to the editor as `window/logMessage` is not built;
-- `options.verbose` (from `debug = true` / `--debug`) still writes each
-  module's IR to disk in codegen.
+- two progress lines are still printed directly rather than logged or
+  reported: `[Compiler] LLVM IR emitted: <path>` for a single-file
+  `--emit-llvm` build, and `[deps] cloning <url>` when a git dependency
+  is first fetched;
+- a module that fails LLVM verification writes no IR, even under
+  `--emit-llvm`, since its `.ll` is written after codegen succeeds;
+- the `compiler_log` project drives the logger as a library; no test runs
+  the real `cryo` binary and checks what it writes to stderr (an area's
+  lines in a real build, `--debug` printing nothing but log lines, the
+  `time` report).  That needs the test runner to let a project set
+  environment variables for the compiler it runs and match its stderr.
 
 ## The standard library's visibility pass
 

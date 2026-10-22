@@ -2,7 +2,10 @@
 ///!
 ///! A line names its level, its area and the place it was written:
 ///!
-///!     [debug driver] compiler/src/compiler/instance.cryo:1092 CompilerInstance::run_project: loading modules
+///!     [debug loader] src/compiler/instance.cryo:1252 compiler::instance::CompilerInstance::run_project: discovered 79 modules
+///!
+///! The file is the source file's path relative to its project's root, as
+///! the compiler's own spans name it.
 ///!
 ///! Every area is off until `CRYO_LOG` or `--log` switches it on (`--debug`
 ///! is `--log=debug`).  A spec is a comma-separated list of items: `area`
@@ -69,7 +72,6 @@ type enum LogArea {
     Types;      // the type arena, type resolution, layouts
     Sema;       // body checking, directives, config gating, validation
     Mono;       // monomorphization
-    Async;      // async lowering
     Drop;       // drop insertion and move checking
     Codegen;
     Link;
@@ -92,15 +94,14 @@ implement enum LogArea {
             5  => { "types" }
             6  => { "sema" }
             7  => { "mono" }
-            8  => { "async" }
-            9  => { "drop" }
-            10 => { "codegen" }
-            11 => { "link" }
-            12 => { "bindgen" }
-            13 => { "deps" }
-            14 => { "diag" }
-            15 => { "lsp" }
-            16 => { "time" }
+            8  => { "drop" }
+            9  => { "codegen" }
+            10 => { "link" }
+            11 => { "bindgen" }
+            12 => { "deps" }
+            13 => { "diag" }
+            14 => { "lsp" }
+            15 => { "time" }
             _  => { "" }
         };
     }
@@ -158,6 +159,9 @@ implement trait LogSink for struct FileSink {
 
 /// Three bits per area, its `LogLevel`, at `area * 3`.
 mut g_log_levels: u64 = 0;
+/// Bit `area` set: the environment or the command line chose that area's
+/// level, so a project's setting does not change it.
+mut g_log_chosen: u64 = 0;
 mut g_log_standard_error: StandardErrorSink = StandardErrorSink { unused: 0 };
 /// `null` until a sink is chosen; a null sink is the standard error one.
 mut g_log_sink: virtual LogSink* = null;
@@ -236,38 +240,83 @@ type struct Log {
 
     /// Apply `CRYO_LOG` and `CRYO_LOG_FILE`, when they are set.
     static configure_from_environment() -> void {
-        match (env::var(Str::new("CRYO_LOG"))) {
-            Option::Some(spec) => { Log::configure(spec.as_str(), "CRYO_LOG"); }
-            Option::None       => { }
-        }
+        g_log_chosen = 0;
+        Log::configure_from_environment_spec();
         match (env::var(Str::new("CRYO_LOG_FILE"))) {
             Option::Some(path) => { Log::write_to_file(path.as_str(), "CRYO_LOG_FILE"); }
             Option::None       => { }
         }
     }
 
-    /// Apply the environment, then the command line's `--debug`, `--log=`
-    /// and `--log-file=`, so a flag wins over the environment.
+    /// Apply the environment, then the command line's `--debug`, `--log`
+    /// and `--log-file`, so a flag wins over the environment.  `--log` and
+    /// `--log-file` take their value after `=` or as the next argument, the
+    /// two forms the command line's parser accepts.  A `--log-file` replaces
+    /// `CRYO_LOG_FILE`, which is then never opened.
     static configure_from_command_line(argc: int, argv: string*) -> void {
-        Log::configure_from_environment();
+        g_log_chosen = 0;
+        Log::configure_from_environment_spec();
+        mut file: Option<String> = env::var(Str::new("CRYO_LOG_FILE"));
+        mut file_origin: string = "CRYO_LOG_FILE";
         for (mut i: int = 1; i < argc; i++) {
             const arg: string = argv[i];
             if (arg == "--debug") {
                 Log::configure(Str::new("debug"), "--debug");
+                continue;
             }
+            mut flag: string = "";
+            mut value: string = "";
             if (arg.starts_with("--log=")) {
-                Log::configure(Str::new(arg + 6), "--log");
+                flag = "--log";
+                value = arg.strip_prefix("--log=");
+            } else if (arg.starts_with("--log-file=")) {
+                flag = "--log-file";
+                value = arg.strip_prefix("--log-file=");
+            } else if ((arg == "--log" || arg == "--log-file")
+                       && i + 1 < argc && !argv[i + 1].starts_with("-")) {
+                flag = arg;
+                i += 1;
+                value = argv[i];
             }
-            if (arg.starts_with("--log-file=")) {
-                Log::write_to_file(Str::new(arg + 11), "--log-file");
+            if (flag == "--log") {
+                Log::configure(Str::new(value), flag);
+            }
+            if (flag == "--log-file") {
+                file = Option::Some(String::from_string(value));
+                file_origin = flag;
             }
         }
+        match (file) {
+            Option::Some(path) => { Log::write_to_file(path.as_str(), file_origin); }
+            Option::None       => { }
+        }
+    }
+
+    /// Apply a project's setting (cryoconfig's `debug = true`) beneath the
+    /// environment and the command line: an area either of them chose
+    /// keeps their level.
+    static configure_from_project(spec: Str, origin: string) -> u32 {
+        return Log::apply(spec, origin, true);
     }
 
     /// Apply a spec on top of the levels already set, and answer how many
     /// of its items named no area or level.  Each such item is reported on
     /// stderr, citing `origin`, and the rest of the spec still applies.
     static configure(spec: Str, origin: string) -> u32 {
+        return Log::apply(spec, origin, false);
+    }
+
+    private static configure_from_environment_spec() -> void {
+        match (env::var(Str::new("CRYO_LOG"))) {
+            Option::Some(spec) => { Log::configure(spec.as_str(), "CRYO_LOG"); }
+            Option::None       => { }
+        }
+    }
+
+    /// `configure`, or `configure_from_project` when `from_project`: a spec
+    /// from anywhere else marks the areas it sets in `g_log_chosen`, and a
+    /// project's spec leaves those areas alone.
+    private static apply(spec: Str, origin: string, from_project: boolean) -> u32 {
         mut unknown: u32 = 0;
         const comma: Str = Str::new(",");
         const equals: Str = Str::new("=");
@@ -285,13 +334,13 @@ type struct Log {
                         unknown += 1;
                         continue;
                     }
-                    Log::set_level(area, level);
+                    Log::set_level(area, level, from_project);
                 }
                 Option::None => {
                     const level: u64 = Log::level_index(item);
                     if (level != LEVEL_COUNT) {
                         for (mut area: u64 = 0; area < AREA_COUNT; area++) {
-                            Log::set_level(area, level);
+                            Log::set_level(area, level, from_project);
                         }
                         continue;
                     }
@@ -301,7 +350,7 @@ type struct Log {
                         unknown += 1;
                         continue;
                     }
-                    Log::set_level(area, LogLevel::Debug as u64);
+                    Log::set_level(area, LogLevel::Debug as u64, from_project);
                 }
             }
         }
@@ -333,7 +382,10 @@ type struct Log {
         g_log_sink.write(&line);
     }
 
-    private static set_level(area: u64, level: u64) -> void {
+    private static set_level(area: u64, level: u64, from_project: boolean) -> void {
+        const chosen: u64 = 1 << area;
+        if (from_project && (g_log_chosen & chosen) != 0) { return; }
+        if (!from_project) { g_log_chosen = g_log_chosen | chosen; }
         const shift: u64 = area * 3;
         g_log_levels = (g_log_levels & ~(7 << shift)) | (level << shift);
     }
@@ -364,5 +416,5 @@ type struct Log {
     }
 }
 
-const AREA_COUNT: u64 = 17;
+const AREA_COUNT: u64 = 16;
 const LEVEL_COUNT: u64 = 6;
