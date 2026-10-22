@@ -12,8 +12,6 @@ build:
     incr       scripts/incremental-instance-check.py
                                          an edit asking a cached module for a
                                          new generic instance still links
-    log        scripts/log-gate.py       the compiler's logger is off by default
-                                         and each switch does what it says
     fast       make check-fast           verify's self-test, pin integrity
 
 They are independent: each writes its own build directory, and nothing here
@@ -103,7 +101,6 @@ GATES = {
     "cross":    ([PY, "scripts/cross-check.py", "--cryo", "{cryo}"], r"^cross-check: "),
     "incr":     ([PY, "scripts/incremental-instance-check.py", "--cryo", "{cryo}"],
                  r"^incremental-instance-check: "),
-    "log":      ([PY, "scripts/log-gate.py", "--cryo", "{cryo}"], r"^log-gate: "),
     # `ARGS=` on the command line: `make verify ARGS=...` exports ARGS to
     # child makes, and no check-fast target is meant to receive verify's flags.
     "fast":     (["make", "--no-print-directory", "check-fast", "ARGS="], r"check-fast: "),

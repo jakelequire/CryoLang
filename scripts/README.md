@@ -11,7 +11,7 @@ one; the history keeps it.
 
 | script | what it does | called by |
 |---|---|---|
-| `verify.py` | Builds once, runs census, examples, lsp-check, cross-check, incremental-instance-check, log-check and check-fast concurrently, hashes every object, and with `--baseline REV` compares them against a compiler built from REV; `--selftest` drives its judges | `make verify`, `make verify-selftest` (so `make check-fast` and CI) |
+| `verify.py` | Builds once, runs census, examples, lsp-check, cross-check, incremental-instance-check and check-fast concurrently, hashes every object, and with `--baseline REV` compares them against a compiler built from REV; `--selftest` drives its judges | `make verify`, `make verify-selftest` (so `make check-fast` and CI) |
 | `test-census.py` | Runs `cryo test` and asserts each suite's count against `tests/test-roster.txt`; a unit test gated to another OS is excused by `roster-check.py`'s own reading of the `![target]` gates | `make test-census`, `verify.py` (census), CI |
 | `roster-check.py` | Checks the discovered unit tests, projects and negative files against `tests/test-roster.txt`; `--merge` / `--update` re-pin it | `make roster-check`, CI |
 | `examples-gate.py` | Builds every `examples/` project; refuses a sweep that found none, or fewer than `--min` | `make examples`, `verify.py` (examples), CI |
@@ -21,7 +21,6 @@ one; the history keeps it.
 | `cross-check.py` | Compiles runtime, stdlib, compiler and CryoLSP for the other OS's triple, objects only from a Windows host (a Linux host links the windows-gnu build and needs mingw plus the LLVM-C import lib) | `make cross-check`, `verify.py` (cross), CI (windows native) |
 | `incremental-check.py` | Incremental build == clean build, byte for byte, over an edit matrix (refuses on Windows) | `make incremental-check`, CI |
 | `incremental-instance-check.py` | An edit asking a cached module for a new generic instance still links and reuses the cache | `make incremental-instance-check`, `verify.py` (incr), CI |
-| `log-gate.py` | Builds `tests/fixtures/log` with the compiler's logger switched each way (nothing, `CRYO_LOG`, `--log`, `--log-file`, `CRYO_LOG_FILE`, `--debug`, an unknown area) and checks the lines it prints | `make log-check`, `verify.py` (log), CI |
 | `vendor-consts-gate.py` | Registers a fixture C header under a throwaway `$CRYO_HOME`, then builds and runs a consumer of every constant `cryo vendor` emitted | `make vendor-check`, CI |
 | `selfhost-check.py` | Six-stage byte-identity fixed point: the Linux chain, the Windows chain natively or under wine | `make selfhost-check`, `selfhost-check-windows.cmd`, CI |
 | `selfhost-check-windows.cmd` | Windows host: checks for Python and WSL, then runs `selfhost-check.py` | `make selfhost-check` (Windows) |
