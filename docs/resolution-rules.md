@@ -275,6 +275,17 @@ yet is recorded with the change that builds it, not here.
      at the shift amount's narrower type, and is fixed on the
      associated-constants branch.  (Jake)
 
+535. **A shift's amount is exempt from W0005:** its type never changes
+     the result, so an amount narrower than the shifted value widens
+     silently.  The shifted value widening to a wider amount still
+     warns.  (Jake)
+
+536. **The constant folder folds `char` literals,** so a `char` constant
+     read as a value compiles to an immediate.  (Jake)
+
+537. **128-bit constants fold and compile to immediates,** as narrower
+     integers do, within the folder's range.  (Jake)
+
 ### 2026-10-20
 
 465. **The removed class syntax is refused with E0117,** "`<form>` is not
