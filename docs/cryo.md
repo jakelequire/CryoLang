@@ -1527,6 +1527,10 @@ Visibility may also be declared per-field with a leading `private` / `public`. W
 
 A method is declared in the module its declaration is written in: a `private` method in an `implement` block is private to the block's module, not to the module of the type it extends.
 
+A destructure (`const { n: x }: Cents = c;`) binds every field of the type, so like a literal it may be written only where every field it binds is visible.
+
+These rules hold for a generic struct's members exactly as for a concrete struct's: a private field of `Cell<T>` is refused outside its module whether it is reached through `Cell<i32>`, through a `&Cell<T>` in a generic body, by a literal or by a destructure, and so are its private methods and statics.
+
 > Field visibility (a `private` *field*, `E0353`) is a different axis from a top-level type being `private` (`E0503` - see [section 13.4](#134-visibility)); both are scoped to the declaring module. A `public` struct may have `private` fields, and a `private` struct's fields are public to the rest of its own module.
 
 Fields may declare **default values** with `= <expr>`. When a struct literal
@@ -2828,7 +2832,9 @@ const n: i32 = Tag(4);                // Labels's function
 | *(none)* / `public` | Accessible to any module that imports this one. This is the default for top-level items. |
 | `private`           | Accessible only within the declaring module - for items and members alike.               |
 
-Top-level items are **public by default**; mark an item `private` to confine it to its own module. For top-level types (`struct` / `union` / `enum`), `private` is enforced across modules: naming a `private` type from another module - in a type annotation, a struct literal, or a function signature - is rejected with `E0503`. A `private` type remains fully usable within its own module.
+Top-level items are **public by default**; mark an item `private` to confine it to its own module. For top-level types (`struct` / `union` / `enum`, an alias and a trait), `private` is enforced across modules: naming a `private` type from another module - in a type annotation, a struct literal, a bound, or a function signature - is rejected with `E0503`. A `private` type remains fully usable within its own module. A `private` function, constant or global named from another module, by a path or an import, is `E0353`.
+
+A trait's methods have no visibility of their own: they are reachable wherever the trait is. A `private` trait's methods are refused outside its module (`E0353`) even when a public type implements it, so `p.hidden()` from another module is refused whatever `p`'s type is.
 
 This is the mechanism behind hiding iterator engines: a cursor struct can be `private` while its producer returns [`implement Iterator<...>`](#211-opaque-types-implement-trait), so callers consume the sequence through the trait and can never name the concrete type.
 

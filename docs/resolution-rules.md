@@ -186,6 +186,22 @@ yet is recorded with the change that builds it, not here.
      writes the per-module `.ll` files it links; a build without it
      spawns no `llvm-link` and logs nothing about one.  (Jake)
 
+562. **`private` holds for every member and item it can be written on.**
+     A generic type's private field is refused outside its module when
+     it is read, written, set by a literal or destructured, through an
+     instance or inside a generic body, and its private methods and
+     statics are refused as a concrete type's are.  A private module
+     constant or global, a private alias and a private trait are not
+     exported: a path or an import naming one from another module is
+     refused.  A destructure reads every field it binds, so it is
+     refused as a field read is.  The gate asks the declaration the
+     access bound, never a member found again by its name.  (Jake)
+
+563. **A trait's methods are reachable only where the trait is.**  A
+     private trait's method is refused outside the trait's module even
+     when a public type implements it; a trait's methods carry no
+     visibility of their own.  (Jake)
+
 ### 2026-10-21
 
 501. **The class-removal plan is deleted now,** its slices all built and its

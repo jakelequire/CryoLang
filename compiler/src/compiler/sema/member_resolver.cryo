@@ -18,7 +18,7 @@ import compiler::types::{
 };
 import compiler::resolver::{ symbol_str, intern_table };
 import compiler::ast;
-import compiler::ast::{ declaration, expression, MemberPin, node, TypeAnnotation };
+import compiler::ast::{ declaration, expression, MemberPin, node, TypeAnnotation, Visibility };
 import compiler::lex;
 import compiler::lex::{ Token, TokenType };
 import compiler::diag;
@@ -34,7 +34,7 @@ import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry, Temp
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::ast::declaration::{
-    DeclarationNode, FieldDecl, ImplBlock, MethodDecl, StructDecl, UnionDecl
+    DeclarationNode, FieldDecl, FunctionDecl, ImplBlock, MethodDecl, StructDecl, UnionDecl
 };
 import compiler::ast::expression::{
     ArrayAccessExpr, CallExpr, ExpressionNode, MemberAccessExpr
@@ -69,18 +69,22 @@ import compiler::types::user_defined::{
 
 /// A field as the member door found it: its type as seen through the
 /// receiver, and its `index` in the owner's field list, for the access to
-/// be pinned to.  `entry` and `owner` are the arena entry and the type declaring it, for
-/// the visibility check; both are null for a field read off a generic
-/// template's declaration.  `index` is -1 for an array's `length`, which has
-/// a type and no slot.
+/// be pinned to.  `is_public` and `declared_in` are what the visibility
+/// check asks, read off the arena entry or, for a field of a generic
+/// template, off its declaration: one answer whichever the door read, so a
+/// template's private field is as private as a concrete type's.  `owner`
+/// is the type declaring it, for the diagnostic.  `index` is -1 for an
+/// array's `length`, which has a type and no slot and is public.
 type struct FieldAnswer {
-    ty:    TypeRef;
-    entry: FieldInfo*;
-    owner: Type*;
-    index: i64;
+    ty:          TypeRef;
+    is_public:   boolean;
+    declared_in: ModulePath;
+    owner:       Type*;
+    index:       i64;
 
     static none() -> FieldAnswer {
-        return FieldAnswer { ty: TypeRef::invalid(), entry: null, owner: null, index: -1 };
+        return FieldAnswer { ty: TypeRef::invalid(), is_public: true, declared_in: ModulePath::none(),
+                             owner: null, index: -1 };
     }
 
     found(&this) -> boolean { return this.ty.is_valid(); }
@@ -384,8 +388,10 @@ type struct MemberResolver {
     }
 
     /// Resolve `member.member` as a field (incl. generic-template field) or
-    /// method on the ALREADY-RESOLVED receiver type `obj_type`, enforcing
-    /// visibility on success.  Returns the member's type, or `invalid` on a
+    /// method on the ALREADY-RESOLVED receiver type `obj_type`, enforcing a
+    /// field's visibility on success; a method found here is a method read,
+    /// reported by the caller, and a coerced call is gated where every
+    /// method call is.  Returns the member's type, or `invalid` on a
     /// genuine miss - emits no diagnostic.  Used by Deref coercion to probe each
     /// pointee in the chain without perturbing the direct-access path.
     member_type_on(mut &this, member_e: ExpressionNode*, member: MemberAccessExpr*,
@@ -428,10 +434,7 @@ type struct MemberResolver {
         if (type_sym.is_valid()) {
             const method_ret: TypeRef =
                 this.method_return_through_door(walk_ty, member);
-            if (method_ret.is_valid()) {
-                this.enforce_method_visibility(obj_type, member.member, acc_span);
-                return method_ret;
-            }
+            if (method_ret.is_valid()) { return method_ret; }
         }
         return TypeRef::invalid();
     }
@@ -526,8 +529,8 @@ type struct MemberResolver {
         // An array's `length` is an implicit `i64` field, at no position.
         if (t.kind == TypeKind::Array && this.intern.resolve(leaf).eq("length")) {
             return FieldAnswer {
-                ty:    this.types.subst_owner_params_from_receiver(recv, this.arena.get_i64()),
-                entry: null, owner: null, index: -1,
+                ty:          this.types.subst_owner_params_from_receiver(recv, this.arena.get_i64()),
+                is_public:   true, declared_in: ModulePath::none(), owner: null, index: -1,
             };
         }
         return FieldAnswer::none();
@@ -538,10 +541,11 @@ type struct MemberResolver {
     field_answer(&this, recv: TypeRef, entry: FieldInfo*, owner: Type*,
                  index: i64) -> FieldAnswer {
         return FieldAnswer {
-            ty:    this.types.subst_owner_params_from_receiver(recv, entry.field_type),
-            entry: entry,
-            owner: owner,
-            index: index,
+            ty:          this.types.subst_owner_params_from_receiver(recv, entry.field_type),
+            is_public:   entry.is_public,
+            declared_in: this.arena.declared_in(owner),
+            owner:       owner,
+            index:       index,
         };
     }
 
@@ -554,30 +558,25 @@ type struct MemberResolver {
         const tmpl: TemplateEntry* = reg.template_of_type(tmpl_ref);
         if (tmpl == null || tmpl.ast_node == null) { return FieldAnswer::none(); }
         // A declared field whose type did not resolve is no answer.
-        mut i: i64 = -1;
-        mut declared: TypeRef = TypeRef::invalid();
+        const no_fields: [DeclarationNode*] = [];
+        mut fields: &[DeclarationNode*] = &no_fields;
         if (tmpl.kind == TemplateKind::Struct) {
-            const sn: StructDecl* = DeclarationNode::struct_of(tmpl.ast_node);
-            for (mut k: i64 = 0; k < sn.fields.length; k++) {
-                const f_decl: DeclarationNode* = sn.fields[k];
-                const f: FieldDecl* = DeclarationNode::field_of(f_decl);
-                if (f != null && f.name.equals(leaf) && f.resolved_type.is_valid()) { i = k; declared = f.resolved_type; break; }
-            }
+            fields = &DeclarationNode::struct_of(tmpl.ast_node).fields;
         } else if (tmpl.kind == TemplateKind::Union) {
-            const un: UnionDecl* = DeclarationNode::union_of(tmpl.ast_node);
-            for (mut k: i64 = 0; k < un.fields.length; k++) {
-                const f_decl: DeclarationNode* = un.fields[k];
-                const f: FieldDecl* = DeclarationNode::field_of(f_decl);
-                if (f != null && f.name.equals(leaf) && f.resolved_type.is_valid()) { i = k; declared = f.resolved_type; break; }
-            }
+            fields = &DeclarationNode::union_of(tmpl.ast_node).fields;
         }
-        if (i < 0) { return FieldAnswer::none(); }
-        return FieldAnswer {
-            ty:    this.types.subst_owner_params_from_receiver(recv, declared),
-            entry: null,
-            owner: null,
-            index: i,
-        };
+        for (mut k: i64 = 0; k < fields.length; k++) {
+            const f: FieldDecl* = DeclarationNode::field_of(fields[k]);
+            if (f == null || !f.name.equals(leaf) || !f.resolved_type.is_valid()) { continue; }
+            return FieldAnswer {
+                ty:          this.types.subst_owner_params_from_receiver(recv, f.resolved_type),
+                is_public:   f.visibility == Visibility::Public,
+                declared_in: tmpl.declared_in,
+                owner:       this.arena.lookup(tmpl_ref),
+                index:       k,
+            };
+        }
+        return FieldAnswer::none();
     }
 
     /// The declared fields of the struct a generic body's type
@@ -607,13 +606,11 @@ type struct MemberResolver {
     }
 
     /// Record the field the door found on the access, and ask its
-    /// visibility of the entry the door found.  A template's field has no
-    /// entry; an array's `length` has no slot.
+    /// visibility of the answer the door gave.  An array's `length` has no
+    /// slot.
     pin_field(mut &this, member: MemberAccessExpr*, fa: &FieldAnswer, acc_span: SourceSpan) -> void {
         if (fa.index >= 0) { member.set_resolved_member(MemberPin::Field(fa.index)); }
-        if (fa.entry != null) {
-            this.enforce_field_visibility(fa.entry, fa.owner, member.member, acc_span);
-        }
+        this.enforce_field_visibility(fa, member.member, acc_span);
     }
 
     /// `obj.f(args)` where `f` is a function-typed field: tag the member with
@@ -871,18 +868,15 @@ type struct MemberResolver {
 
     /// Emit E0353 when a private field is reached from outside the module
     /// that may reach it (`member_reachable`).  A field is declared where its
-    /// type is.  `field` and `declaring_t` are the entry and the declaring
-    /// type the caller's lookup found (`field_of`); `field_name` is the
-    /// spelling, for the diagnostic alone.  Nothing here finds the field
-    /// again.
-    enforce_field_visibility(mut &this, field: FieldInfo*, declaring_t: Type*,
-                             field_name: SymbolStr, span: SourceSpan) -> void {
-        if (field == null || declaring_t == null) { return; }
-        if (field.is_public) { return; }
-        const decl: ModulePath = this.arena.declared_in(declaring_t);
+    /// type is.  `fa` is the answer the caller's lookup gave (`field_of`);
+    /// `field_name` is the spelling, for the diagnostic alone.  Nothing here
+    /// finds the field again.
+    enforce_field_visibility(mut &this, fa: &FieldAnswer, field_name: SymbolStr, span: SourceSpan) -> void {
+        if (fa.is_public || fa.owner == null) { return; }
+        const decl: ModulePath = fa.declared_in;
         if (this.member_reachable(decl, span)) { return; }
 
-        const declaring_name: string = declaring_t.display_name();
+        const declaring_name: string = fa.owner.display_name();
         const field_str: string = this.intern.resolve(field_name);
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0353_PRIVATE_ACCESS,
@@ -892,36 +886,47 @@ type struct MemberResolver {
         this.ctx.emit_diagnostic(d);
     }
 
-    /// Method-call counterpart to `enforce_field_visibility` (E0353).  A
-    /// method is declared where its declaration is written, which for one in
-    /// an `implement` block is the block's module, not its type's.
+    /// Method-call counterpart to `enforce_field_visibility` (E0353), asked
+    /// of `method_decl`, the declaration the call bound: a `MethodDecl`, or
+    /// the function a trait declares.  Nothing here finds the method again
+    /// by its receiver and name, which an instantiation not minted yet does
+    /// not answer.
     ///
-    /// Reached from both lanes that offer a method: a member access and a
-    /// static `Type::method()` path.  The static lane reached no gate at all
-    /// until it was given one, so a private method crossed module boundaries
-    /// through it.
-    enforce_method_visibility(mut &this, recv_type: TypeRef,
-                              method_name: SymbolStr, span: SourceSpan) -> void {
-        const base_ref: TypeRef = this.types.unwrap_to_base_ref(recv_type);
-        const base: Type* = this.arena.lookup(base_ref);
-        if (base == null || base.kind != TypeKind::Struct) { return; }
-
-        const method: MethodInfo* = this.ctx.decl_index.type_method(base_ref, method_name, this.arena);
-        if (method == null) { return; }
-        if (method.is_public) { return; }
-        // A method no declaration was written for has no module to be
-        // private to.
-        const node_decl: DeclarationNode* = method.ast_node;
-        const node: MethodDecl* = DeclarationNode::method_of(node_decl);
-        if (node == null) { return; }
-        const decl: ModulePath = this.ctx.module_of_file(node_decl.span.file);
+    /// A method is declared where its declaration is written, which for one
+    /// in an `implement` block is the block's module, not its type's.  A
+    /// trait's method - declared by the trait, or implementing it - has no
+    /// visibility of its own: it is reachable wherever the trait is, so a
+    /// private trait's methods are refused outside its module even on a
+    /// public type.
+    enforce_method_visibility(mut &this, method_decl: DeclarationNode*, span: SourceSpan) -> void {
+        if (method_decl == null) { return; }
+        const node: MethodDecl* = DeclarationNode::method_of(method_decl);
+        const func: FunctionDecl* = DeclarationNode::fn_of(if (node != null) { node.func } else { method_decl });
+        if (func == null) { return; }
+        const trait_def: DefId = if (func.origin_trait.is_valid()) {
+            func.origin_trait
+        } else {
+            this.ctx.defs.parent_of(func.def)
+        };
+        if (this.ctx.generic_registry.get_trait_decl(trait_def) != null) {
+            const use_module: DefId = this.ctx.module_def_of(this.ctx.module_of_file(span.file));
+            if (!this.ctx.decl_index.hidden_from(trait_def, use_module)) { return; }
+            mut td: Diagnostic = Diagnostic::error(
+                ErrorCode::E0353_PRIVATE_ACCESS,
+                fmt::format("method `%s` of the private trait `%s` cannot be called here",
+                    this.intern.resolve(func.name), this.intern.shown(this.ctx.defs.path_of(trait_def))));
+            td = td.at_with_label(span, "a trait's methods are reachable only where the trait is");
+            this.ctx.emit_diagnostic(td);
+            return;
+        }
+        if (node == null || node.visibility == Visibility::Public) { return; }
+        const decl: ModulePath = this.ctx.module_of_file(method_decl.span.file);
         if (this.member_reachable(decl, span)) { return; }
 
-        const declaring_name: string = base.as_struct().display_name();
-        const method_str: string = this.intern.resolve(method_name);
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0353_PRIVATE_ACCESS,
-            fmt::format("method `%s` of `%s` is private", method_str, declaring_name));
+            fmt::format("method `%s` of `%s` is private", this.intern.resolve(func.name),
+                this.intern.shown(this.ctx.defs.path_of(this.ctx.defs.parent_of(func.def)))));
         d = d.at_with_label(span, fmt::format("private method called outside module `%s`",
             this.intern.shown(decl.decl_name())));
         this.ctx.emit_diagnostic(d);

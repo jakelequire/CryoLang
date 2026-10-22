@@ -1550,6 +1550,10 @@ type struct SemaVisitor {
                 this.scopes.declare(b.sym_id, this.arena.get_void(), b.is_mutable);
                 continue;
             }
+            // A destructure reads every field it binds, so a private one is
+            // refused outside its module as a `.field` read is.
+            const bound: FieldAnswer = this.member.field_answer(node.resolved_type, &fields_ptr[positions[i]], ty, positions[i]);
+            this.member.enforce_field_visibility(&bound, b.source_field, b.span);
             const field_type: TypeRef = fields_ptr[positions[i]].field_type;
             b.resolved_type = field_type;
             b.field_index = positions[i];
@@ -1646,7 +1650,9 @@ type struct SemaVisitor {
             mut ty: TypeRef = TypeRef::invalid();
             const refused: boolean = positions.length > i && positions[i] < 0;
             if (node.has_resolved_type() && !refused) {
-                ty = this.member.field_of(node.resolved_type, b.source_field).ty;
+                const bound: FieldAnswer = this.member.field_of(node.resolved_type, b.source_field);
+                this.member.enforce_field_visibility(&bound, b.source_field, b.span);
+                ty = bound.ty;
             }
             if (ty.is_valid()) { node.bindings[i].resolved_type = ty; }
             if (positions.length > i) { node.bindings[i].field_index = positions[i]; }
@@ -3886,9 +3892,7 @@ type struct SemaVisitor {
                     lit.field_inits[i].pin = MemberPin::Field(fa.index);
                     lit.field_inits[i].pin_carried = false;
                 }
-                if (fa.entry != null) {
-                    this.member.enforce_field_visibility(fa.entry, fa.owner, field_init.field_name, field_init.span);
-                }
+                this.member.enforce_field_visibility(&fa, field_init.field_name, field_init.span);
             }
             if (value_expr == null) { field_type = TypeRef::invalid(); }
             if (field_type.is_valid()) { this.state.expected_type = field_type; }
@@ -3963,7 +3967,8 @@ type struct SemaVisitor {
                     // A literal sets every field, the ones it leaves to their
                     // defaults included, so one the writer may not reach
                     // refuses the literal whether it is named or not.
-                    this.member.enforce_field_visibility(&fields_ptr[k], struct_t, decl_name, e.span);
+                    const omitted: FieldAnswer = this.member.field_answer(struct_ref, &fields_ptr[k], struct_t, k);
+                    this.member.enforce_field_visibility(&omitted, decl_name, e.span);
                     // An omitted field carrying a `= default` is filled in: clone the
                     // default, resolve + type-check it, and append it as a synthetic
                     // field-init so codegen materializes it.  Only an omitted field
@@ -4204,7 +4209,21 @@ type struct SemaVisitor {
         // whichever module registered last, so `syscall::FIONBIO` would take
         // `libc::FIONBIO`'s value and its type.
         const st_global: TypeRef = this.types.scope_global_type(scope);
-        if (st_global.is_valid()) { return st_global; }
+        if (st_global.is_valid()) {
+            // The name layer stamps the member the path names, a private one
+            // included, so the path is refused here rather than reported as a
+            // name that does not exist.
+            if (!this.state.in_symbolic_check && this.ctx.decl_index.hidden_from(scope.member_def,
+                    this.ctx.module_def_of(this.ctx.module_of_file(e.span.file)))) {
+                const global_str: string = this.intern.shown(this.ctx.defs.path_of(scope.member_def));
+                mut d: Diagnostic = Diagnostic::error(ErrorCode::E0353_PRIVATE_ACCESS,
+                    fmt::format("`%s` is private and cannot be named from `%s`", global_str,
+                        this.intern.shown(this.ctx.module_of_file(e.span.file).decl_name())));
+                d = d.at_with_label(e.span, "private declaration named by this path");
+                this.ctx.emit_diagnostic(d);
+            }
+            return st_global;
+        }
         // A qualified path in value position may name a FUNCTION.  Sema owned no
         // lookup for this shape, so codegen resolved it alone and unobserved:
         // a path naming a function that does not exist compiled, linked, and
@@ -4260,7 +4279,7 @@ type struct SemaVisitor {
         scope.member_def = def;
         scope.resolved_member = MemberPin::Global(entry.slot);
         const constant: VarDecl* = DeclarationNode::var_of(this.ctx.decl_index.declaration_of(def));
-        if (constant != null && constant.member_visibility == Visibility::Private
+        if (constant != null && constant.visibility == Visibility::Private
                 && !this.member.member_reachable(entry.declared_in, e.span)) {
             mut d: Diagnostic = Diagnostic::error(ErrorCode::E0353_PRIVATE_ACCESS,
                 fmt::format("constant `%s` of `%s` is private",

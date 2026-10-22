@@ -349,24 +349,56 @@ Open:
   sink sending lines to the editor as `window/logMessage` is not built;
 - one progress line is still printed directly rather than logged or
   reported: `[deps] cloning <url>` when a git dependency is first
-  fetched.
+  fetched;
+- `cryo check` of the compiler is about 2% slower since the logger
+  merged, measured but not yet profiled.
 
 ## The standard library's visibility pass
 
 Everything in the standard library is public today, so its internals -
 `Array`'s grower among them - are public API, and would be frozen with
-v1.0.  The pass goes through the library deciding what stays public, and
-decides at the same time which of its APIs want borrowed trait objects.
+v1.0.  Cryo stays public by default and nothing is linted; the library
+itself writes `public`, `private` or `internal` on every item, so each
+exposure is a decision.  Built: `private` holds on every member and item
+(rulings 562, 563).  The rest, in order:
 
-`std::core::intrinsics::Location` is one it must close: only the compiler
-makes one (`location()`, and the caller of a `![caller_location]`
-function), and a program reads its fields.  A program must not be able to
-build one with a struct literal, so that adding a field later is not a
-breaking change; its fields read, and nothing outside the compiler
-constructs it.
-
-Open: whether the pass is gated (a public item with no documentation, or
-nothing outside the library using it, reported) or done by review alone.
+1. **The compiler's half.**
+   - `internal`: visible to every module of the same package (one
+     cryoconfig project; the whole library is one), for items and
+     members, in user projects as in the library.
+   - Modules public by default, `public module` dropped; `internal
+     module x;` importable only inside its package; the grouped forms
+     `module { a; b; }` and `internal module { c; }`.
+   - `![language("format_new")]` on the library items generated code
+     calls (the f-string builders, `Option::take`, `Poll::into_ready`,
+     ...): the compiler's table is built from the attributes, the parser
+     stops building those calls by name, and the compiler's own imports
+     of the builders go.  A generated call is never refused.
+   - A private type, or another package's internal one, in a public
+     signature refused at the declaration; `-> implement Trait` hides a
+     concrete type.  This answers "a private type reached by inference"
+     below.
+2. **Collections' `length` and `capacity` private**, behind `![inline]`
+   accessors made inline first; the compiler's, the language server's
+   and the tests' reads rewritten by a codemod.  Every `length()`
+   returns `i64`.
+3. **`Display` and `Debug` over a trait object:** one non-generic `fmt`
+   writing through a `virtual mut &FmtWrite` held by `Formatter`, in
+   place of `fmt<W>`; code size and the fmt suites measured first.
+4. **`std::core::intrinsics::Location`** with private fields and the
+   read methods `file()`, `line()`, `column()`, `function()`: only the
+   compiler makes one (`location()`, the caller of a
+   `![caller_location]` function), and a program reads one but cannot
+   build one.
+5. **Every item marked.**  About 650 helpers used only in their own
+   module become `private`; about 215 used across the library become
+   `internal`; implementation modules (the heap allocator, the reactor,
+   the raw buffer, the HPACK Huffman tables, ...) become `internal
+   module`.  The C bindings (`libc`, `syscall`, `openssl`) stay public,
+   outside the 1.0 stability promise.  Tests that reach internals are
+   rewritten through the public API, or deleted where they pinned only
+   an internal.  Anything borderline is listed for Jake rather than
+   hidden.
 
 ## One dynamic array type
 

@@ -300,7 +300,7 @@ type struct NameResolver {
         const sym_id: SymbolID = if (node.is_mutable) {
             this.resolver.declare_variable(node.name, decl.span, true, true)
         } else {
-            this.resolver.declare_constant(node.name, decl.span)
+            this.resolver.declare_constant(node.name, decl.span, true)
         };
         this.resolver.record_resolution(decl.span, sym_id);
         this.resolver.export_symbol(sym_id);
@@ -427,21 +427,24 @@ type struct NameResolver {
             // (`SymbolKind::Constant`); a mutable global is a variable.
             // The kind lets later passes treat a const named in a
             // `match` arm as a value pattern rather than a binding.
+            const is_public: boolean = var_node.visibility == Visibility::Public;
             const sym_id: SymbolID = if (var_node.is_mutable) {
                 this.resolver.declare_variable(
-                    var_node.name, decl.span, true, true)
+                    var_node.name, decl.span, true, is_public)
             } else {
                 this.resolver.declare_constant(
-                    var_node.name, decl.span)
+                    var_node.name, decl.span, is_public)
             };
             this.resolver.record_resolution(decl.span, sym_id);
             var_node.def = this.resolver.get_symbol(sym_id).def;
-            // The export set is what `exports_named` reads, so a
-            // module-level declaration left out of it cannot be
-            // resolved across modules by the name layer at all - which
-            // is what forces a later stage to key the global map by
-            // bare leaf and take whichever module registered last.
-            this.resolver.export_symbol(sym_id);
+            // The export set is what `exports_named` reads, so a public
+            // module-level declaration left out of it cannot be resolved
+            // across modules by the name layer at all - which is what
+            // forces a later stage to key the global map by bare leaf and
+            // take whichever module registered last.  A private one is left
+            // out, as a private function is: a path or an import naming it
+            // is refused where it is written.
+            if (is_public) { this.resolver.export_symbol(sym_id); }
             if (!var_node.is_mutable) {
                 this.record_const_value(this.resolver.get_symbol(sym_id).def, var_node);
             }
@@ -536,10 +539,10 @@ type struct NameResolver {
             }
             DeclKind::Trait(trait_node) => {
                 const sym_id: SymbolID = this.resolver.declare_type(
-                    trait_node.name, decl.span, true);
+                    trait_node.name, decl.span, trait_node.is_public);
                 trait_node.sym_id = sym_id;
                 trait_node.def = this.type_def_of(sym_id);
-                this.resolver.export_symbol(sym_id);
+                if (trait_node.is_public) { this.resolver.export_symbol(sym_id); }
                 // Registered here, before any module's names are resolved, so
                 // a projection written in any of them can ask which
                 // associated types the trait declares.
@@ -601,9 +604,9 @@ type struct NameResolver {
                 this.ctx.note_alias_decl(decl);
                 if (!alias_node.binding_namespace.is_valid()) {
                     const sym_id: SymbolID = this.resolver.declare_type(
-                        alias_node.alias_name, decl.span, true);
+                        alias_node.alias_name, decl.span, alias_node.is_public);
                     alias_node.def = this.type_def_of(sym_id);
-                    this.resolver.export_symbol(sym_id);
+                    if (alias_node.is_public) { this.resolver.export_symbol(sym_id); }
                 } else {
                     alias_node.def = this.type_def_of(this.declare_c_imported(
                         alias_node.binding_namespace, alias_node.alias_name, decl.span));

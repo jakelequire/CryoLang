@@ -1250,6 +1250,10 @@ type struct CallResolver {
                 return this.resolve_object_call(visitor, call_e, call, callee_member, receiver_t);
             }
             const selected: Selection = this.resolve_method_overload(visitor, call, callee_member);
+            // Every `recv.method(...)` call is selected here, whatever shape
+            // its receiver has, so this is where the method it chose is gated.
+            this.member.enforce_method_visibility(selected.chosen,
+                if (callee_member.member_span.has_location()) { callee_member.member_span } else { callee.span });
             if (this.method_call_type_arguments_excess(callee_member, selected.chosen)) {
                 return TypeRef::invalid();
             }
@@ -3457,25 +3461,6 @@ type struct CallResolver {
         return ft;
     }
 
-    /// Gate the static method a `Type::method(...)` call is about to pin.
-    ///
-    /// Placed at the pin rather than at each resolution branch because all four
-    /// static-bind paths funnel here, and shutting three of four is
-    /// indistinguishable from shutting all four unless one function sees them
-    /// all.  A `scope_sym` that names a MODULE rather than a type resolves to no
-    /// type, finds no method, and falls out without a verdict - module-qualified
-    /// free functions keep their own door.
-    enforce_static_method_visibility(mut &this, owner: TypeRef, member_sym: SymbolStr,
-                                     span: SourceSpan) -> void {
-        if (this.state.in_symbolic_check) { return; }
-        // `owner` is the type the call binds against, as its caller holds it -
-        // the segment's own type, a specialization, a DI key's type - never a
-        // name to look up again.  A written qualifier that makes no type claim
-        // names a module, which owns no method to gate.
-        if (!owner.is_valid()) { return; }
-        this.member.enforce_method_visibility(owner, member_sym, span);
-    }
-
     overload_return_type(&this, fn_ref: TypeRef) -> TypeRef {
         const ft: Type* = this.arena.lookup(fn_ref);
         if (ft == null || ft.kind != TypeKind::Function) { return TypeRef::invalid(); }
@@ -5263,8 +5248,6 @@ type struct CallResolver {
             DeclarationNode::fn_of(named.func).resolved_return_type
         } else { TypeRef::invalid() } };
         if (ret.is_valid() && !proj_blocked) {
-            const acc_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member_e.span };
-            this.member.enforce_method_visibility(lookup_ref, member.member, acc_span);
             const refined: TypeRef = if (member.generic_args.length > 0) {
                 this.binding.resolve_method_return_with_explicit_args(obj_type, member, named_decl, ret)
             } else {
@@ -5846,16 +5829,31 @@ type struct CallResolver {
             scope.require_scope_res("static-call owner template"));
     }
 
+    /// Pin a `Type::method(...)` call, then gate the method it pinned.
+    ///
+    /// The verdict is about the declaration that binds - the entry pinned,
+    /// or on a generic owner the template's method recorded - and never a
+    /// method found again by its name: a family can hold overloads of
+    /// different visibility, and an instantiation not minted yet has no
+    /// method entries of its own to find.  A call already pinned before it
+    /// arrived is judged the same way.  A module-qualified free function
+    /// pins no method and keeps its own door.
     pin_scope_callee_combined(mut &this, call_e: ExpressionNode*, call: CallExpr*, scope: ScopeResolutionExpr*, scope_sym: SymbolStr,
                               owner: TypeRef, member_sym: SymbolStr) -> void {
         if (call == null) { return; }
-        // Judge BEFORE the early returns below: a call whose callee is already
-        // pinned, or whose owner is a generic template, is still a call to a
-        // method the use site may not name.  `scope_sym` is the owner that won
-        // resolution, so the verdict is about the method that actually binds.
-        if (member_sym.is_valid() && scope_sym.is_valid()) {
-            this.enforce_static_method_visibility(owner, member_sym, call_e.span);
-        }
+        this.pin_scope_callee(call_e, call, scope, scope_sym, owner, member_sym);
+        if (this.state.in_symbolic_check || !member_sym.is_valid() || !scope_sym.is_valid()) { return; }
+        const entry: OverloadId = call.resolved_callee.decl_entry();
+        const method: DeclarationNode* = if (entry.is_valid()) {
+            this.ctx.decl_index.entry_method(entry)
+        } else {
+            this.ctx.decl_index.method_decl_of(call.template_method)
+        };
+        this.member.enforce_method_visibility(method, call_e.span);
+    }
+
+    pin_scope_callee(mut &this, call_e: ExpressionNode*, call: CallExpr*, scope: ScopeResolutionExpr*, scope_sym: SymbolStr,
+                     owner: TypeRef, member_sym: SymbolStr) -> void {
         if (call.resolved_callee.is_some()) { return; }
         if (!scope_sym.is_valid() || !member_sym.is_valid()) { return; }
         if (this.scope_is_generic_template(owner, scope, call)) {
