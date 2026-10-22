@@ -238,6 +238,27 @@ yet is recorded with the change that builds it, not here.
      this is built before the standard library's limits are declared.
      (Jake)
 
+525. **`char` is 32 bits wide:** a Unicode scalar value, `'\0'` to
+     `'\u{10FFFF}'`, which is what `char::MIN` and `char::MAX` state.
+     The reference says so where it called the width undecided or 8-bit.
+     (Jake)
+
+526. **A folded constant is wrapped to its declared type,** so its
+     compile-time value is always the value the program reads at run
+     time: `const A: u8 = B + 200` with `B` at 100 folds to 44, not 300,
+     wherever `A` is used - an array size, a `static_assert`, another
+     constant.  (Jake)
+
+527. **The HTTP request limits and the calendar constants stay at module
+     level;** they are not moved onto a type.  (Jake)
+
+528. **The associated-constants branch is not merged yet.**  (Jake)
+
+529. **A negated literal compared with a narrower integer takes the
+     operand's type, as a positive literal does:** `x != -128` with
+     `x: i8` draws no W0005, and is fixed on the associated-constants
+     branch.  (Jake)
+
 ### 2026-10-20
 
 465. **The removed class syntax is refused with E0117,** "`<form>` is not

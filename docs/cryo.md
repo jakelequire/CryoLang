@@ -189,7 +189,7 @@ Strings are enclosed in double quotes; characters in single quotes. Both share t
 
 An octal escape is one to three digits `0`-`7`, read as C reads them: the escape ends after three digits or at the first character that is not one, so `\0` is NUL, `"\033[1m"` is ESC and then `[1m`, `\177` is 127, and `"\0123"` is `\012` (newline) and then `3`. `\8` and `\9`, and an octal value above `\377`, are refused (`E0013`).
 
-In a string, `\u{...}` is the code point's UTF-8 bytes, so `"\u{e9}"` is the two bytes `C3 A9`; in a character it is the code point itself, so `'\u{42}'` is `'B'`. What a `char` holds for a code point above 255 depends on `char`'s width, which is not yet decided. A malformed `\u` (no braces, no digit, or past `10FFFF`), a `\x` with no hex digit, and an escape this table does not name (`\q`) are kept as written in a string; in a character, an escape the table does not name is the character after the backslash.
+In a string, `\u{...}` is the code point's UTF-8 bytes, so `"\u{e9}"` is the two bytes `C3 A9`; in a character it is the code point itself, so `'\u{42}'` is `'B'`. A `char` is 32 bits wide, so it holds every code point up to `10FFFF`: `'\u{1F600}'` is the code point U+1F600. A malformed `\u` (no braces, no digit, or past `10FFFF`), a `\x` with no hex digit, and an escape this table does not name (`\q`) are kept as written in a string; in a character, an escape the table does not name is the character after the backslash.
 
 A string literal keeps every byte it spells, a NUL among them: the constant the compiler emits for `"a\0b"` is `a`, NUL, `b` and the terminating NUL. A `string` is read up to its first NUL by what measures it, so `"a\0b".length()` is 1 while the bytes after the NUL are still there to be read through a pointer.
 
@@ -288,7 +288,7 @@ Every value in Cryo has a known type at compile time. A binding's type is either
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------ |
 | `void`                        | No value; only valid as a return type.                                                                                                           | 0                        |
 | `boolean`                     | `true` / `false`. Not interchangeable with integers.                                                                                             | 1 byte                   |
-| `char`                        | 8-bit character (byte).                                                                                                                          | 1 byte                   |
+| `char`                        | 32-bit unsigned Unicode scalar value, `'\0'` to `'\u{10FFFF}'`.                                                                                  | 4 bytes                  |
 | `string`                      | NUL-terminated raw string (`u8*`). FFI-shaped.                                                                                                   | pointer                  |
 | `int`                         | Default signed integer; alias for `i32`.                                                                                                         | 4 bytes                  |
 | `i8` `i16` `i32` `i64` `i128` | Signed integers of fixed width.                                                                                                                  | 1 / 2 / 4 / 8 / 16 bytes |
