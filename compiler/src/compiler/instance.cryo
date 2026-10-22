@@ -1060,10 +1060,10 @@ type struct CompilerInstance {
         // until its own context is published at Frontend.
         compiler::codegen::llvm_types::dispose_codegen_context();
 
-        // CRYO_TIMINGS phase profiling.  All marks are captured regardless;
-        // the report only prints (success path) when the env var is set, so
-        // the overhead on a normal build is a handful of `clock_gettime`s.
-        const tm_on: boolean = CompilerInstance::timing_enabled();
+        // Phase timings.  All marks are captured regardless; the report only
+        // prints (success path) when the `time` area logs at info, so the
+        // overhead on a normal build is a handful of `clock_gettime`s.
+        const tm_on: boolean = Log::enabled(LogArea::Time, LogLevel::Info);
         const tm_entry:        i64 = Instant::now().as_nanos();
         mut tm_discovery_end:  i64 = 0;
         mut tm_frontend_end:   i64 = 0;
@@ -2658,7 +2658,7 @@ type struct CompilerInstance {
             }
         }
 
-        // CRYO_TIMINGS report: per-phase wall time + the frontend/backend
+        // Timing report: per-phase wall time + the frontend/backend
         // split that gates the per-module-incremental design (only the
         // backend - SemanticAnalysis + Codegen + link - is cacheable per module; the
         // frontend and whole-program monomorphization must always run).
@@ -2671,21 +2671,20 @@ type struct CompilerInstance {
             const total: i64 = tm_end - tm_entry;
             const fe: i64 = tm_mono_end - tm_entry;
             const be: i64 = tm_end - tm_mono_end;
-            fmt::println(f"\n=== cryo build timings ({config.project_name}) ===");
-            CompilerInstance::timing_fmt("discovery (discovery)", tm_discovery_end - tm_entry, total);
-            CompilerInstance::timing_fmt("frontend (frontend)", tm_frontend_end - tm_discovery_end, total);
-            CompilerInstance::timing_fmt("monomorphization (6a)", tm_mono_end - tm_frontend_end, total);
-            CompilerInstance::timing_fmt("sema/lowering (6b)", tm_sema_end - tm_mono_end, total);
+            Log::info(LogArea::Time, f"build timings for {config.project_name}");
+            Log::info(LogArea::Time, CompilerInstance::timing_line("discovery", tm_discovery_end - tm_entry, total));
+            Log::info(LogArea::Time, CompilerInstance::timing_line("frontend", tm_frontend_end - tm_discovery_end, total));
+            Log::info(LogArea::Time, CompilerInstance::timing_line("monomorphization", tm_mono_end - tm_frontend_end, total));
+            Log::info(LogArea::Time, CompilerInstance::timing_line("sema and lowering", tm_sema_end - tm_mono_end, total));
             if (tm_codegen_end > 0) {
-                CompilerInstance::timing_fmt("codegen+objects (7)", tm_codegen_end - tm_sema_end, total);
+                Log::info(LogArea::Time, CompilerInstance::timing_line("codegen and objects", tm_codegen_end - tm_sema_end, total));
             }
             if (tm_link_end > 0) {
-                CompilerInstance::timing_fmt("link (8)", tm_link_end - tm_codegen_end, total);
+                Log::info(LogArea::Time, CompilerInstance::timing_line("link", tm_link_end - tm_codegen_end, total));
             }
-            fmt::printf("  %-28s\n", "----");
-            CompilerInstance::timing_fmt("FRONTEND (1-6a, uncacheable)", fe, total);
-            CompilerInstance::timing_fmt("BACKEND  (6b+7+link, cacheable)", be, total);
-            CompilerInstance::timing_fmt("TOTAL", total, total);
+            Log::info(LogArea::Time, CompilerInstance::timing_line("frontend, uncacheable", fe, total));
+            Log::info(LogArea::Time, CompilerInstance::timing_line("backend, cacheable", be, total));
+            Log::info(LogArea::Time, CompilerInstance::timing_line("total", total, total));
         }
 
         mut ok_result: CompilationResult = CompilationResult::ok(exe_path);
@@ -2727,7 +2726,7 @@ type struct CompilerInstance {
             ctx.options.yield_between_modules();
             ctx.switch_to_module(mod_idx as i64);
             if (!pipeline.run_all(ctx)) {
-                fmt::eprintln(f"error: frontend pipeline failed for module {i}");
+                Log::error(LogArea::Driver, f"the frontend failed for module {ctx.module_graph.modules[mod_idx].file_path}");
                 return false;
             }
             // Save the parsed AST using local buffer
@@ -3456,25 +3455,15 @@ type struct CompilerInstance {
         return true;
     }
 
-    /// True when the `CRYO_TIMINGS` env var is set to a non-empty value.  Gates
-    /// the per-phase wall-time report printed at the end of a successful build.
-    static timing_enabled() -> boolean {
-        match (env::var(Str::new("CRYO_TIMINGS"))) {
-            Option::Some(v) => { return v.length() > 0; }
-            Option::None => { return false; }
-        }
-    }
-
-    /// Render a nanosecond span as milliseconds with one decimal place, plus
-    /// its share of `total_ns`.  Pure formatting helper for the timing report.
-    static timing_fmt(label: string, span_ns: i64, total_ns: i64) -> void {
+    /// A nanosecond span as milliseconds with one decimal place, plus its
+    /// share of `total_ns`: one line of the timing report.
+    static timing_line(label: string, span_ns: i64, total_ns: i64) -> String {
         const ms_x10: i64 = (span_ns + 50000) / 100000;
         mut pct: i64 = 0;
         if (total_ns > 0) {
             pct = (span_ns * 100 + total_ns / 2) / total_ns;
         }
-        fmt::printf("  %-28s %6lld.%lld ms  (%lld%%)\n",
-            label, ms_x10 / 10, ms_x10 % 10, pct);
+        return f"{label}: {ms_x10 / 10}.{ms_x10 % 10} ms ({pct}%)";
     }
 
     /// Parallel-codegen worker count.  `CRYO_CODEGEN_THREADS` overrides; 0/1

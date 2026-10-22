@@ -28,7 +28,10 @@ language server".  From there, in order, to the v1.0 freeze:
    with `max_value()` removed (ruling 510).  Trait constants used as
    values come after v1.0; trait constants as array lengths are not in
    v1.0; see "Associated constants" below.
-5. **An internal compiler logger** in place of `LOG_DEBUG` and `cdebug`.
+5. **An internal compiler logger.**  Built, on `compiler-logger`:
+   `utils::log`, with areas, levels, `CRYO_LOG` / `--log` and a file
+   sink, in place of `LOG_DEBUG`, `cdebug` and `CRYO_TIMINGS`; see
+   "An internal compiler logger" below.
 6. **The standard library's visibility pass.**  Everything in it is public
    today, so internals such as `Array`'s grower are public API.  The pass
    decides what stays public, and which standard-library APIs want trait
@@ -330,13 +333,25 @@ Left:
 
 ## An internal compiler logger
 
-The compiler traces through two mechanisms.  `LOG_DEBUG` takes a component
-and returns at once without printing, so its call sites trace nothing.
-`cdebug` prints to stderr, all of it or none, behind `--debug` (or
-`debug = true` in cryoconfig).  One logger replaces both, before v1.0.
+Built: one logger in `utils::log` replaces `LOG_DEBUG`, `cdebug` and
+`CRYO_TIMINGS` (rulings 538-547; `docs/cryo.md` section 24.2 has the
+switches).  The `CRYO_LAYOUT_AUDIT`, `CRYO_CTX_AUDIT` and
+`CRYO_TYPE_AUDIT` checks keep their own variables: each runs a check and
+reports what it finds, which is not a log line.
 
-Open: how a component is selected (flag, environment variable or both),
-and whether a trace line names its source position.
+Open:
+
+- several lines only ever shown under `--debug` are really a warning or
+  an internal error a user should see - a missing bindgen header, a
+  missing cryoconfig, a path dependency without one, a pass pipeline that
+  fails validation, codegen's corrupt function types, a generic
+  instantiation reached with no generic registry.  They are `warn` and
+  `error` log lines, off by default; whether each becomes a diagnostic is
+  open;
+- the language server logs to stderr or a file when `CRYO_LOG` is set; a
+  sink sending lines to the editor as `window/logMessage` is not built;
+- `options.verbose` (from `debug = true` / `--debug`) still writes each
+  module's IR to disk in codegen.
 
 ## The standard library's visibility pass
 

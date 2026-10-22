@@ -92,8 +92,8 @@ that label must exist and its detail hold the text.  It may carry
 sends one the typed character triggered, not as one the user invoked.
 
 A position check may carry `"quiet_stderr": true`: it then also fails when the
-server writes to stderr while answering, which an analysis of a buffer that
-does not parse always does.  `expandHover` asks `cryo/expandHover`, the
+server writes to stderr while answering, which with `CRYO_LOG` unset it never
+should, a buffer that does not parse included.  `expandHover` asks `cryo/expandHover`, the
 editor's longer hover.
 
 Usage:
@@ -129,8 +129,12 @@ def default_server_path():
 
 
 def server_env():
-    """The server links LLVM-C; on Windows its DLL lives in the toolchain."""
+    """The server links LLVM-C; on Windows its DLL lives in the toolchain.
+    The compiler's logger is switched off, so `quiet_stderr` checks hold
+    whatever the caller's shell sets."""
     env = dict(os.environ)
+    env.pop("CRYO_LOG", None)
+    env.pop("CRYO_LOG_FILE", None)
     env["CRYO_STDLIB"] = os.path.join(REPO_ROOT, "stdlib")
     extra = [os.path.join(REPO_ROOT, ".toolchains", "llvm-win", "bin"),
              os.path.join(REPO_ROOT, "bin")]
@@ -539,8 +543,7 @@ def run_check(srv, fx, chk, c):
     stderr_before = len(srv._stderr)
     resp = srv.request(wire, params)
     if chk.get("quiet_stderr"):
-        # An analysis of a buffer that does not parse reports it on stderr,
-        # so a request answered without one leaves stderr as it was.  The
+        # The server writes nothing to stderr unless CRYO_LOG asks it to.  The
         # pause lets the reader thread catch a line written before the reply.
         time.sleep(0.5)
         if len(srv._stderr) != stderr_before:

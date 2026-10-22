@@ -24,10 +24,13 @@ Cases:
     no driver lines;
   - CRYO_LOG=loader,sema,drop,types: exactly those areas log; types=trace
     dumps the type arena;
+  - CRYO_LOG=time: the stage timings, on stderr;
   - --debug: more than one area logs, and no line on either stream looks
     like a `[Tag]` trace the logger did not write;
   - CRYO_LOG_FILE, and --log-file: the lines go to the file, not stderr;
-  - CRYO_LOG=bogus: a warning naming the item, and the build still succeeds.
+  - CRYO_LOG=bogus: a warning naming the item, and the build still succeeds;
+  - a program that does not parse: its diagnostics and nothing else, and
+    with driver=error a line naming the module whose frontend failed.
 
 Usage:
     python scripts/log-gate.py --cryo compiler/build/cryo.exe
@@ -158,6 +161,12 @@ def main():
           and sum(1 for m in r.err_lines if m.group(6).startswith("type ")) > 100,
           "types=trace dumps the type arena", r)
 
+    r = build(cryo, env, {"CRYO_LOG": "time"})
+    check(r.code == 0 and areas(r.err_lines) == ["time"]
+          and any(m.group(6).startswith("total: ") for m in r.err_lines)
+          and not any(m.group(6).startswith("total: ") for m in r.out_lines),
+          "the time area reports the stages' timings on stderr", r)
+
     r = build(cryo, env, flags=["--debug"])
     check(r.code == 0 and len(areas(r.err_lines)) > 1, "--debug turns every area on", r)
     check(not [l for l in (r.out + "\n" + r.err).splitlines()
@@ -179,6 +188,20 @@ def main():
     r = build(cryo, env, {"CRYO_LOG": "bogus"})
     check(r.code == 0 and "warning: CRYO_LOG: 'bogus'" in r.err and not r.err_lines,
           "an unknown item is reported and the build goes on", r)
+
+    main_path = os.path.join(SCRATCH, "src", "main.cryo")
+    with open(main_path, encoding="utf-8") as f:
+        good_main = f.read()
+    with open(main_path, "w", encoding="utf-8") as f:
+        f.write(good_main.replace("return 0;", "const broken: i32 = (((;\n    return 0;"))
+    r = build(cryo, env)
+    check(r.code != 0 and "E0102" in r.err and not r.err_lines
+          and not [l for l in r.err.splitlines() if "frontend" in l],
+          "a program that does not parse gets its diagnostics and no driver note", r)
+    r = build(cryo, env, {"CRYO_LOG": "driver=error"})
+    check(r.code != 0 and any(m.group(1) == "error" and "frontend failed" in m.group(6)
+                              for m in r.err_lines),
+          "driver=error logs the module whose frontend failed", r)
 
     shutil.rmtree(SCRATCH, ignore_errors=True)
     if failures:
