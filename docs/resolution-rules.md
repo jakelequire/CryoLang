@@ -181,6 +181,11 @@ yet is recorded with the change that builds it, not here.
      enum aligned to it, in the LLVM type as in `sizeof`: alone, as an
      array's element and as a struct's field.  (Jake)
 
+561. **The linked IR dump beside an executable is written only under
+     `--emit-llvm`** (or cryoconfig's `emit_llvm`), the only build that
+     writes the per-module `.ll` files it links; a build without it
+     spawns no `llvm-link` and logs nothing about one.  (Jake)
+
 ### 2026-10-21
 
 501. **The class-removal plan is deleted now,** its slices all built and its

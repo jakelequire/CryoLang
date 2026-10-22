@@ -633,13 +633,14 @@ type struct CodegenPasses {
 
     /// Emit the combined `.ll` IR dump next to the hoisted exe (selfhost-check's
     /// byte-identity input).  POSIX-only: it relies on shell glob expansion
-    /// (`/*/ir/*.ll`) and `2>/dev/null`, neither of which `cmd` provides.  On a
-    /// Windows-hosted compiler this is a no-op - the dump is a Linux CI aid, not
-    /// part of a normal build's output.
+    /// (`/*/ir/*.ll`), which `cmd` does not provide.  On a Windows-hosted
+    /// compiler this is a no-op - the dump is a Linux CI aid, not part of a
+    /// normal build's output.  The shell sorts the glob's expansion, so the
+    /// modules are linked in the same order on every build.
     ![target(unix)]
     static emit_linked_ir_dump(profile_dir_text: string, ll_path_text: string) -> void {
         const ll_cmd: string = fmt::format(
-            "llvm-link-20 -S %s/*/ir/*.ll -o %s 2>/dev/null",
+            "llvm-link-20 -S %s/*/ir/*.ll -o %s",
             CodegenPasses::shell_quote(profile_dir_text), CodegenPasses::shell_quote(ll_path_text));
         const ll_rc: i32 = Command::shell(ll_cmd);
         if (ll_rc == 0) {
@@ -651,8 +652,8 @@ type struct CodegenPasses {
 
     ![target(windows)]
     static emit_linked_ir_dump(profile_dir_text: string, ll_path_text: string) -> void {
-        // cmd has no glob / `2>/dev/null`; the IR dump is a POSIX selfhost-check
-        // aid and is not produced on a native Windows build.
+        // cmd has no glob; the IR dump is a POSIX selfhost-check aid and is
+        // not produced on a native Windows build.
     }
 
     /// Compare, for every nominal type this module actually mapped, the size
@@ -1853,20 +1854,15 @@ type struct CodegenPasses {
             Log::debug(LogArea::Link, f"copied executable to the -o path {exe_out}");
         }
 
-        // Emit a combined `.ll` text dump of the project's per-module IR
-        // (written during Phase 7) next to the HOISTED executable
-        // (`<output_dir>/<name>.ll`).  Used by selfhost-check for
-        // stage-3/stage-4 byte-identity verification.  Per-module IR is split
-        // across per-origin subtrees, so the glob spans every origin's `ir/`
-        // dir; the shell sorts the full expansion deterministically, so the
-        // concatenation order is stable across builds.  Stderr is redirected
-        // to /dev/null so `llvm-link-20`'s "No such file or directory"
-        // complaint (when no .ll files were written because emit_llvm was
-        // unset) doesn't pollute the user's terminal in the silent default.
-        const ll_path: string = fmt::format("%s.ll", hoisted_exe);
-        // POSIX-only (shell glob + `2>/dev/null`); a no-op on a native
-        // Windows-hosted compiler, where `cmd` provides neither.
-        CodegenPasses::emit_linked_ir_dump(profile_dir, ll_path);
+        // Under `--emit-llvm`, link the per-module `.ll` files written during
+        // code generation into one dump next to the HOISTED executable
+        // (`<output_dir>/<name>.ll`), selfhost-check's input for its
+        // stage-3/stage-4 byte-identity check.  Without it no `.ll` exists to
+        // link.  POSIX-only (a shell glob); a no-op on a Windows-hosted
+        // compiler.
+        if (ctx.options.emit_llvm) {
+            CodegenPasses::emit_linked_ir_dump(profile_dir, fmt::format("%s.ll", hoisted_exe));
+        }
 
         return PassResult::ok();
     }
