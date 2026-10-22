@@ -1,0 +1,77 @@
+namespace EnumWithOverAlignedPayload;
+import std::fmt;
+
+![align(32)]
+type struct Lane32 {
+    value: i64;
+}
+
+![align(64)]
+type struct Line64 {
+    first: i64;
+    last: i64;
+}
+
+type enum Slot {
+    Empty;
+    Narrow(Lane32);
+    Wide(Line64);
+}
+
+type struct Holder {
+    tag: u8;
+    slot: Option<Lane32>;
+}
+
+static_assert(sizeof(Option<Lane32>) == 64, "a 32-aligned payload sits at offset 32");
+static_assert(sizeof(Slot) == 128, "a 64-aligned payload sits at offset 64");
+static_assert(sizeof(Holder) == 96, "an over-aligned enum field sits at offset 32");
+
+function lane(value: i64) -> Option<Lane32> {
+    return Option::Some(Lane32 { value: value });
+}
+
+function wide(first: i64, last: i64) -> Slot {
+    return Slot::Wide(Line64 { first: first, last: last });
+}
+
+/// The i64 at `offset` bytes into the value at `base`.
+function word_at(base: u64, offset: u64) -> i64 {
+    const p: i64* = (base + offset) as i64*;
+    return *p;
+}
+
+function sum(slots: &[Slot; 3]) -> i64 {
+    mut total: i64 = 0;
+    for (mut i: i64 = 0; i < 3; i++) {
+        match (slots[i]) {
+            Slot::Narrow(n) => { total = total + n.value; }
+            Slot::Wide(w)   => { total = total + w.first + w.last; }
+            Slot::Empty     => { }
+        }
+    }
+    return total;
+}
+
+function main() -> i32 {
+    const one: Option<Lane32> = lane(1234);
+    if (word_at(&one as u64, 32) != 1234) { return 1; }
+    match (one) {
+        Option::Some(l) => { if (l.value != 1234) { return 2; } }
+        Option::None    => { return 3; }
+    }
+
+    const slots: [Slot; 3] = [wide(5, 6), Slot::Empty, Slot::Narrow(Lane32 { value: 7 })];
+    if (word_at(&slots[0] as u64, 64) != 5) { return 4; }
+    if (word_at(&slots[0] as u64, 72) != 6) { return 5; }
+    if (word_at(&slots[2] as u64, 64) != 7) { return 6; }
+    if (sum(&slots) != 18) { return 7; }
+
+    const holder: Holder = Holder { tag: 9, slot: lane(42) };
+    if (word_at(&holder as u64, 64) != 42) { return 8; }
+
+    const first: u64 = &slots[0] as u64;
+    const second: u64 = &slots[1] as u64;
+    fmt::println(f"element stride {second - first}, payload alignment {(&one as u64 + 32) % 32}");
+    return 0;
+}

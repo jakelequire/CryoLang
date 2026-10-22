@@ -176,6 +176,11 @@ yet is recorded with the change that builds it, not here.
      with no target once, before any IR is generated.  (Jake; the codes
      Delegated)
 
+560. **An enum whose payload is aligned above 16 is laid out as the front
+     end sizes it,** its payload at the payload's own alignment and the
+     enum aligned to it, in the LLVM type as in `sizeof`: alone, as an
+     array's element and as a struct's field.  (Jake)
+
 ### 2026-10-21
 
 501. **The class-removal plan is deleted now,** its slices all built and its
