@@ -318,17 +318,15 @@ declares constants reached by a path, `Type::NAME` (docs/cryo.md section
 `MIN`, `MAX`, `BITS` and its `MAX_*_DIGITS` buffer sizes, `char` its
 `MIN` and `MAX`, and `f32`/`f64` their limits and non-finite values;
 `max_value()`/`min_value()` and `math`'s float limits are gone.  The
-constant folder computes over the whole `i128` range.
+constant folder computes over every integer type's range, `i128::MIN`
+through `u128::MAX`, and wraps a constant's value to its declared type.
 
 Left:
 - constants in a trait and in its implementations (E0245, E0246 today):
   used as values after v1.0; used as array lengths, not in v1.0;
 - a constant on a generic type (E0247 today), additive, after v1.0;
 - whether a constant may be used where a type argument is expected
-  (open);
-- the folder does not wrap a constant's value to its declared type, so
-  a named constant whose initializer leaves its type's range folds to a
-  value the program never holds.
+  (open).
 
 ## An internal compiler logger
 

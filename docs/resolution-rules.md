@@ -157,6 +157,15 @@ yet is recorded with the change that builds it, not here.
 
 556. **`cryo raw` stays as it is.**  (Jake)
 
+557. **A compile-time integer ranges from `i128::MIN` through
+     `u128::MAX`:** a `u128` above `i128::MAX` folds, and so does
+     arithmetic crossing `i128::MAX` either way; a cast or a declared
+     type wraps the value as the running program does.  (Jake)
+
+558. **An enum whose payload is aligned to 16 is laid out as the front
+     end sizes it,** its payload at offset 16, in the LLVM type as in
+     `sizeof`.  (Delegated)
+
 ### 2026-10-21
 
 501. **The class-removal plan is deleted now,** its slices all built and its

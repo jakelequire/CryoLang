@@ -40,10 +40,9 @@
 ///! `sizeof` is not a constant there - and a capability is passed as a
 ///! pointer that may be null rather than as a separate folder.
 ///!
-///! A folded value is an `i128`: wide enough for every value of every 64-bit
-///! type at once, so `0xFFFF_FFFF_FFFF_FFFF` and `-9223372036854775808` are
-///! both constants, and every `i128` value is one.  A `u128` above
-///! `i128::MAX` is not, and a fold that would leave the `i128` range bails.
+///! A folded value is a `FoldedInteger`: wide enough for every value of every
+///! integer type at once, so `u128::MAX` and `i128::MIN` are both constants,
+///! and a fold that would leave that range bails.
 
 namespace compiler::const_table;
 
@@ -88,7 +87,7 @@ const CONST_FOLDED:  i32 = 2;
 /// `init` is borrowed from the AST, which outlives the table.
 type struct ConstEntry {
     init:      ExpressionNode*;
-    value:     i128;
+    value:     FoldedInteger;
     state:     i32;
     /// The same initializer folded as a REAL, memoized separately.
     ///
@@ -204,7 +203,7 @@ public:
         match (this.by_def.get(&key)) {
             Option::Some(existing) => {
                 this.entries[existing].init       = init;
-                this.entries[existing].value      = 0;
+                this.entries[existing].value      = FoldedInteger::unsigned(0);
                 this.entries[existing].state      = CONST_PENDING;
                 this.entries[existing].real_value = 0.0;
                 this.entries[existing].real_state = CONST_PENDING;
@@ -218,7 +217,7 @@ public:
         const idx: i64 = this.entries.length;
         this.entries.push(ConstEntry {
             init:           init,
-            value:          0,
+            value:          FoldedInteger::unsigned(0),
             state:          CONST_PENDING,
             real_value:     0.0,
             real_state:     CONST_PENDING,
@@ -313,6 +312,203 @@ public:
 }
 
 
+/// A folded integer: any value of any integer type, `i128::MIN` through
+/// `u128::MAX`, held as a 129-bit two's-complement number - `bits` its low
+/// 128 bits and `negative` its sign.  Every operation writes its result to
+/// `out` and answers false, writing nothing, when the result would leave that
+/// range, so a fold never carries a value no integer type holds.
+///
+/// Results come back through `out` rather than as an `Option`: an enum with a
+/// 16-byte-aligned payload is laid out correctly only by a compiler that has
+/// the layout fix, and the compiler that builds this one may not.
+type struct FoldedInteger {
+    bits: u128;
+    negative: boolean;
+
+    static of(value: i128) -> FoldedInteger {
+        return FoldedInteger { bits: value as u128, negative: value < 0 };
+    }
+
+    static unsigned(value: u128) -> FoldedInteger {
+        return FoldedInteger { bits: value, negative: false };
+    }
+
+    static truth(holds: boolean) -> FoldedInteger {
+        return FoldedInteger::unsigned(if (holds) { 1 } else { 0 });
+    }
+
+    is_zero(&this) -> boolean {
+        return !this.negative && this.bits == 0;
+    }
+
+    /// The value as an `i128`, when it is one.
+    to_i128(&this, out: i128*) -> boolean {
+        if (this.negative != (this.bits > i128::MAX as u128)) { return false; }
+        *out = this.bits as i128;
+        return true;
+    }
+
+    /// The value's 64-bit two's-complement bit pattern, when it has one:
+    /// from `i64::MIN` through `u64::MAX`.
+    to_64_bit_pattern(&this, out: u64*) -> boolean {
+        if (this.negative && (this.bits as i128) < i64::MIN as i128) { return false; }
+        if (!this.negative && this.bits > u64::MAX as u128) { return false; }
+        *out = this.bits as u64;
+        return true;
+    }
+
+    to_f64(&this) -> f64 {
+        if (this.negative) { return (this.bits as i128) as f64; }
+        return this.bits as f64;
+    }
+
+    /// The value in decimal, sign included.
+    to_decimal_str(&this) -> string {
+        if (this.negative) { return (this.bits as i128).to_decimal_str(); }
+        return this.bits.to_decimal_str();
+    }
+
+    /// The distance from zero; `i128::MIN`'s, 2^127, is a `u128` too.
+    magnitude(&this) -> u128 {
+        if (this.negative) { return ~this.bits + 1; }
+        return this.bits;
+    }
+
+    /// The value with sign `negative` and distance from zero `magnitude`.
+    static signed(negative: boolean, magnitude: u128, out: FoldedInteger*) -> boolean {
+        if (!negative || magnitude == 0) {
+            *out = FoldedInteger::unsigned(magnitude);
+            return true;
+        }
+        if (magnitude > (i128::MAX as u128) + 1) { return false; }
+        *out = FoldedInteger { bits: ~magnitude + 1, negative: true };
+        return true;
+    }
+
+    /// The 129-bit result `bits`/`negative`, when it is in range: a negative
+    /// value below `i128::MIN` has its top bit clear.
+    static checked(bits: u128, negative: boolean, out: FoldedInteger*) -> boolean {
+        if (negative && bits <= i128::MAX as u128) { return false; }
+        *out = FoldedInteger { bits: bits, negative: negative };
+        return true;
+    }
+
+    negate(&this, out: FoldedInteger*) -> boolean {
+        return FoldedInteger::signed(!this.negative, this.magnitude(), out);
+    }
+
+    add(&this, other: FoldedInteger, out: FoldedInteger*) -> boolean {
+        const bits: u128 = this.bits + other.bits;
+        const carry: boolean = bits < this.bits;
+        const negative: boolean = (this.negative != other.negative) != carry;
+        // Two operands of one sign whose sum has the other overflowed 129 bits.
+        if (this.negative == other.negative && negative != this.negative) { return false; }
+        return FoldedInteger::checked(bits, negative, out);
+    }
+
+    subtract(&this, other: FoldedInteger, out: FoldedInteger*) -> boolean {
+        const bits: u128 = this.bits - other.bits;
+        const borrow: boolean = this.bits < other.bits;
+        const negative: boolean = (this.negative != other.negative) != borrow;
+        // Operands of different signs whose difference has the subtrahend's
+        // sign overflowed 129 bits.
+        if (this.negative != other.negative && negative != this.negative) { return false; }
+        return FoldedInteger::checked(bits, negative, out);
+    }
+
+    multiply(&this, other: FoldedInteger, out: FoldedInteger*) -> boolean {
+        const left: u128 = this.magnitude();
+        const right: u128 = other.magnitude();
+        if (left != 0 && right > u128::MAX / left) { return false; }
+        return FoldedInteger::signed(this.negative != other.negative, left * right, out);
+    }
+
+    /// The quotient truncated toward zero, or the remainder taking the
+    /// dividend's sign when `remainder`; false for a zero divisor.
+    divide(&this, other: FoldedInteger, remainder: boolean, out: FoldedInteger*) -> boolean {
+        if (other.is_zero()) { return false; }
+        const left: u128 = this.magnitude();
+        const right: u128 = other.magnitude();
+        if (remainder) { return FoldedInteger::signed(this.negative, left % right, out); }
+        return FoldedInteger::signed(this.negative != other.negative, left / right, out);
+    }
+
+    /// `this * 2^count`, for a count below 128.
+    shift_left(&this, count: FoldedInteger, out: FoldedInteger*) -> boolean {
+        if (count.negative || count.bits >= 128) { return false; }
+        return this.multiply(FoldedInteger::unsigned((1 as u128) << count.bits), out);
+    }
+
+    /// The 129-bit arithmetic shift, for a count below 128: a negative value
+    /// shifts its sign in.
+    shift_right(&this, count: FoldedInteger, out: FoldedInteger*) -> boolean {
+        if (count.negative || count.bits >= 128) { return false; }
+        mut bits: u128 = this.bits >> count.bits;
+        if (this.negative && count.bits > 0) { bits = bits | (u128::MAX << (128 - count.bits)); }
+        *out = FoldedInteger { bits: bits, negative: this.negative };
+        return true;
+    }
+
+    bitwise_and(&this, other: FoldedInteger, out: FoldedInteger*) -> boolean {
+        return FoldedInteger::checked(this.bits & other.bits, this.negative && other.negative, out);
+    }
+
+    bitwise_or(&this, other: FoldedInteger, out: FoldedInteger*) -> boolean {
+        return FoldedInteger::checked(this.bits | other.bits, this.negative || other.negative, out);
+    }
+
+    bitwise_xor(&this, other: FoldedInteger, out: FoldedInteger*) -> boolean {
+        return FoldedInteger::checked(this.bits ^ other.bits, this.negative != other.negative, out);
+    }
+
+    bitwise_not(&this, out: FoldedInteger*) -> boolean {
+        return FoldedInteger::checked(~this.bits, !this.negative, out);
+    }
+
+    /// `this <op> other` for a binary operator a fold accepts; false for
+    /// any other operator and for a result out of range.  A comparison or
+    /// logical operator answers 0 or 1.
+    apply(&this, op: TokenType, other: FoldedInteger, out: FoldedInteger*) -> boolean {
+        return match (op) {
+            TokenType::Plus           => { this.add(other, out) }
+            TokenType::Minus          => { this.subtract(other, out) }
+            TokenType::Star           => { this.multiply(other, out) }
+            TokenType::Slash          => { this.divide(other, false, out) }
+            TokenType::Percent        => { this.divide(other, true, out) }
+            TokenType::LessLess       => { this.shift_left(other, out) }
+            TokenType::GreaterGreater => { this.shift_right(other, out) }
+            TokenType::Amp            => { this.bitwise_and(other, out) }
+            TokenType::Pipe           => { this.bitwise_or(other, out) }
+            TokenType::Caret          => { this.bitwise_xor(other, out) }
+            TokenType::EqualEqual     => { FoldedInteger::answer(this.equals(other), out) }
+            TokenType::ExclaimEqual   => { FoldedInteger::answer(!this.equals(other), out) }
+            TokenType::LAngle         => { FoldedInteger::answer(this.less_than(other), out) }
+            TokenType::LessEqual      => { FoldedInteger::answer(!other.less_than(*this), out) }
+            TokenType::RAngle         => { FoldedInteger::answer(other.less_than(*this), out) }
+            TokenType::GreaterEqual   => { FoldedInteger::answer(!this.less_than(other), out) }
+            TokenType::AmpAmp         => { FoldedInteger::answer(!this.is_zero() && !other.is_zero(), out) }
+            TokenType::PipePipe       => { FoldedInteger::answer(!this.is_zero() || !other.is_zero(), out) }
+            _                         => { false }
+        };
+    }
+
+    /// `holds` as 0 or 1 into `out`.
+    static answer(holds: boolean, out: FoldedInteger*) -> boolean {
+        *out = FoldedInteger::truth(holds);
+        return true;
+    }
+
+    equals(&this, other: FoldedInteger) -> boolean {
+        return this.negative == other.negative && this.bits == other.bits;
+    }
+
+    less_than(&this, other: FoldedInteger) -> boolean {
+        if (this.negative != other.negative) { return this.negative; }
+        return this.bits < other.bits;
+    }
+}
+
+
 /// Everything a compile-time integer fold is allowed to consult.
 ///
 /// A null capability is a NARROWER ENVIRONMENT, not a different rule.  Sema
@@ -340,26 +536,27 @@ type struct ConstEval {
     /// Fold a compile-time integer expression to its value.
     ///
     /// Returns false for anything non-constant, for any step that would
-    /// leave the `i128` range or divide by a constant zero, and for a name this
+    /// leave the range of every integer type (`i128::MIN` through
+    /// `u128::MAX`) or divide by a constant zero, and for a name this
     /// environment cannot bind.  Bailing is always safe: callers either leave
     /// a width unchanged or report the position as non-constant.
     ///
     /// Booleans fold as 0/1 so a comparison composes with arithmetic; a caller
     /// that wants a count rejects a negative result itself.
-    fold(&this, expr: ExpressionNode*, out: i128*) -> boolean {
+    fold(&this, expr: ExpressionNode*, out: FoldedInteger*) -> boolean {
         if (expr == null) { return false; }
         const node: ExpressionNode* = expr;
 
         const lit: LiteralExpr* = ExpressionNode::literal_of(expr);
         if (lit != null) {
             if (lit.literal_kind == LiteralKind::Boolean) {
-                *out = if (lit.value == "true") { 1 } else { 0 };
+                *out = FoldedInteger::truth(lit.value == "true");
                 return true;
             }
             // A character is its Unicode scalar value, read by the one
             // decoder of a character literal.
             if (lit.literal_kind == LiteralKind::Char) {
-                *out = Lexer::char_literal_value(lit.value) as i128;
+                *out = FoldedInteger::unsigned(Lexer::char_literal_value(lit.value) as u128);
                 return true;
             }
             if (lit.literal_kind != LiteralKind::Integer) { return false; }
@@ -375,8 +572,7 @@ type struct ConstEval {
             }
             mut v: u128 = 0;
             if (!ConstantTable::parse_int_literal(text, &v)) { return false; }
-            if (v > i128::MAX as u128) { return false; }
-            *out = v as i128;
+            *out = FoldedInteger::unsigned(v);
             return true;
         }
 
@@ -392,7 +588,7 @@ type struct ConstEval {
 
         const fold_cast: CastExpr* = ExpressionNode::cast_of(node);
         if (fold_cast != null) {
-            mut v: i128 = 0;
+            mut v: FoldedInteger = FoldedInteger::unsigned(0);
             if (!this.fold(fold_cast.expression, &v)) { return false; }
             return ConstEval::wrap_to_primitive(
                 this.primitive_name_of(fold_cast.target_annotation), v, out);
@@ -406,7 +602,7 @@ type struct ConstEval {
             if (this.arena == null || !sz.operand_type.is_valid()) { return false; }
             const t: Type* = this.arena.lookup(sz.operand_type);
             if (t == null) { return false; }
-            *out = t.size_bytes() as i128;
+            *out = FoldedInteger::unsigned(t.size_bytes() as u128);
             return true;
         }
 
@@ -415,31 +611,29 @@ type struct ConstEval {
             if (this.arena == null || !al.operand_type.is_valid()) { return false; }
             const t: Type* = this.arena.lookup(al.operand_type);
             if (t == null) { return false; }
-            *out = t.alignment() as i128;
+            *out = FoldedInteger::unsigned(t.alignment() as u128);
             return true;
         }
 
         const u: UnaryExpr* = ExpressionNode::unary_of(node);
         if (u != null) {
-            mut a: i128 = 0;
+            mut a: FoldedInteger = FoldedInteger::unsigned(0);
             if (!this.fold(u.operand, &a)) { return false; }
-            if (u.op.kind == TokenType::Minus) {
-                if (a == i128::MIN) { return false; }
-                *out = 0 - a;
-                return true;
-            }
-            if (u.op.kind == TokenType::Tilde) { *out = ~a;    return true; }
-            if (u.op.kind == TokenType::Exclaim) { *out = if (a == 0) { 1 } else { 0 }; return true; }
-            return false;
+            return match (u.op.kind) {
+                TokenType::Minus   => { a.negate(out) }
+                TokenType::Tilde   => { a.bitwise_not(out) }
+                TokenType::Exclaim => { FoldedInteger::answer(a.is_zero(), out) }
+                _                  => { false }
+            };
         }
 
         const b: BinaryExpr* = ExpressionNode::binary_of(node);
         if (b != null) {
-            mut x: i128 = 0;
-            mut y: i128 = 0;
+            mut x: FoldedInteger = FoldedInteger::unsigned(0);
+            mut y: FoldedInteger = FoldedInteger::unsigned(0);
             if (!this.fold(b.left,  &x)) { return false; }
             if (!this.fold(b.right, &y)) { return false; }
-            return ConstEval::apply_binary(b.op.kind, x, y, out);
+            return x.apply(b.op.kind, y, out);
         }
 
         return false;
@@ -526,8 +720,8 @@ type struct ConstEval {
 
         // Anything else this environment can evaluate is integer-valued
         // (a named integer constant, an enum variant, `sizeof`), promoted.
-        mut iv: i128 = 0;
-        if (this.fold(expr, &iv)) { *out = iv as f64; return true; }
+        mut iv: FoldedInteger = FoldedInteger::unsigned(0);
+        if (this.fold(expr, &iv)) { *out = iv.to_f64(); return true; }
         return false;
     }
 
@@ -549,7 +743,7 @@ type struct ConstEval {
     }
 
     /// Fold a bare name: the constant its stamp names.
-    fold_named(&this, id: IdentifierExpr*, out: i128*) -> boolean {
+    fold_named(&this, id: IdentifierExpr*, out: FoldedInteger*) -> boolean {
         const idx: i64 = this.stamped_index_of(id);
         if (idx < 0) { return false; }
         return this.fold_entry(idx, out);
@@ -570,7 +764,7 @@ type struct ConstEval {
     /// means it named a TYPE, so the member is a constant the type declares
     /// (`u8::MAX`, `Point::LIMIT`) or an enum variant of it.  Anything else
     /// is not a compile-time integer.
-    fold_scoped(&this, sr: ScopeResolutionExpr*, out: i128*) -> boolean {
+    fold_scoped(&this, sr: ScopeResolutionExpr*, out: FoldedInteger*) -> boolean {
         if (this.table == null || this.intern == null) { return false; }
         return this.fold_scoped_res(
             sr.scope_res.require("ConstEval::fold_scoped"), sr, out);
@@ -582,7 +776,7 @@ type struct ConstEval {
     /// without requiring the slot a second time: `require` records a pending
     /// bug for an unstamped node, so asking twice would count one unstamped
     /// path as two.
-    fold_scoped_res(&this, r: Res, sr: ScopeResolutionExpr*, out: i128*) -> boolean {
+    fold_scoped_res(&this, r: Res, sr: ScopeResolutionExpr*, out: FoldedInteger*) -> boolean {
         if (this.table == null || this.intern == null) { return false; }
 
         return match (r) {
@@ -619,13 +813,13 @@ type struct ConstEval {
     /// variant.  A variant carrying a payload is a constructor, not a value,
     /// so it is not a compile-time integer.
     static variant_tag_of(decl: EnumDecl*, member: SymbolStr,
-                          out: i128*) -> boolean {
+                          out: FoldedInteger*) -> boolean {
         if (decl == null) { return false; }
         const i: i64 = decl.variant_position(member);
         if (i < 0) { return false; }
         if (DeclarationNode::variant_of(decl.variants[i]).associated_types.length > 0) { return false; }
         const tags: [i64] = decl.variant_tags();
-        *out = tags[i] as i128;
+        *out = FoldedInteger::of(tags[i] as i128);
         return true;
     }
 
@@ -640,7 +834,7 @@ type struct ConstEval {
     /// declared type, as the stored global is: `const A: u8 = B + 200` with
     /// `B` at 100 is 44 at every use, never 300 in an array size and 44 at
     /// run time.
-    fold_entry(&this, idx: i64, out: i128*) -> boolean {
+    fold_entry(&this, idx: i64, out: FoldedInteger*) -> boolean {
         if (this.table == null) { return false; }
         if (idx < 0 || idx >= this.table.entries.length) { return false; }
 
@@ -652,10 +846,10 @@ type struct ConstEval {
         if (init == null) { return false; }
 
         this.table.entries[idx].state = CONST_FOLDING;
-        mut v: i128 = 0;
+        mut v: FoldedInteger = FoldedInteger::unsigned(0);
         mut ok: boolean = this.fold(init, &v);
         if (ok && this.table.entries[idx].int_typed) {
-            mut wrapped: i128 = 0;
+            mut wrapped: FoldedInteger = FoldedInteger::unsigned(0);
             ok = ConstEval::wrap_to_primitive(this.table.entries[idx].declared, v, &wrapped);
             v = wrapped;
         }
@@ -701,15 +895,15 @@ type struct ConstEval {
                 const constant: i64 = this.table.index_of(this.table.type_constant(
                     this.table.type_constant_owner(base), sr.member_name));
                 if (constant >= 0) { return this.fold_entry_real(constant, out); }
-                mut iv: i128 = 0;
+                mut iv: FoldedInteger = FoldedInteger::unsigned(0);
                 if (!this.fold_scoped_res(r, sr, &iv)) { return false; }
-                *out = iv as f64;
+                *out = iv.to_f64();
                 return true;
             }
             _ => {
-                mut iv: i128 = 0;
+                mut iv: FoldedInteger = FoldedInteger::unsigned(0);
                 if (!this.fold_scoped_res(r, sr, &iv)) { return false; }
-                *out = iv as f64;
+                *out = iv.to_f64();
                 return true;
             }
         };
@@ -738,9 +932,9 @@ type struct ConstEval {
         // the initializer looks identical either way.
         mut ok: boolean = false;
         if (this.table.entries[idx].int_typed) {
-            mut iv: i128 = 0;
+            mut iv: FoldedInteger = FoldedInteger::unsigned(0);
             ok = this.fold_entry(idx, &iv);
-            if (ok) { v = iv as f64; }
+            if (ok) { v = iv.to_f64(); }
         } else {
             ok = this.fold_real(init, &v);
         }
@@ -769,13 +963,12 @@ type struct ConstEval {
     /// the emitted cast will, so `Slot::B as u8` folds to what the program
     /// observes rather than to the unwrapped operand.
     ///
-    /// False for anything a folded value cannot carry: a float, and a negative
-    /// value cast to `u128`, whose wrapped value is above `i128::MAX`.  A
-    /// `char` is a 32-bit unsigned scalar.
-    static wrap_to_primitive(prim: string, v: i128, out: i128*) -> boolean {
-        if (prim == "boolean") { *out = if (v != 0) { 1 } else { 0 }; return true; }
+    /// False for a float, which a folded integer cannot carry.  A `char` is a
+    /// 32-bit unsigned scalar.
+    static wrap_to_primitive(prim: string, v: FoldedInteger, out: FoldedInteger*) -> boolean {
+        if (prim == "boolean") { *out = FoldedInteger::truth(!v.is_zero()); return true; }
 
-        mut bits: i128 = 0;
+        mut bits: u128 = 0;
         mut is_signed: boolean = true;
         if (prim == "char") { bits = 32; is_signed = false; }
         else if (prim == "i8")   { bits = 8;  is_signed = true; }
@@ -791,75 +984,18 @@ type struct ConstEval {
         if (bits == 0) { return false; }
 
         if (bits == 128) {
-            if (!is_signed && v < 0) { return false; }
-            *out = v;
+            *out = if (is_signed) { FoldedInteger::of(v.bits as i128) } else { FoldedInteger::unsigned(v.bits) };
             return true;
         }
 
-        const mask: i128 = (1 << bits) - 1;
-        const low: i128 = v & mask;
-        if (is_signed) {
-            const sign_bit: i128 = 1 << (bits - 1);
-            if ((low & sign_bit) != 0) { *out = low - (mask + 1); } else { *out = low; }
+        const mask: u128 = ((1 as u128) << bits) - 1;
+        const low: u128 = v.bits & mask;
+        const sign_bit: u128 = (1 as u128) << (bits - 1);
+        if (is_signed && (low & sign_bit) != 0) {
+            *out = FoldedInteger { bits: low | ~mask, negative: true };
         } else {
-            *out = low;
+            *out = FoldedInteger::unsigned(low);
         }
         return true;
-    }
-
-    /// Evaluate `x <op> y` with overflow and divide-by-zero guarded; false
-    /// means the result is not representable and the fold must bail.
-    static apply_binary(op: TokenType, x: i128, y: i128, out: i128*) -> boolean {
-        const highest: i128 = i128::MAX;
-        const lowest: i128 = i128::MIN;
-
-        if (op == TokenType::Plus) {
-            if (y > 0 && x > highest - y) { return false; }
-            if (y < 0 && x < lowest - y) { return false; }
-            *out = x + y; return true;
-        }
-        if (op == TokenType::Minus) {
-            if (y < 0 && x > highest + y) { return false; }
-            if (y > 0 && x < lowest + y) { return false; }
-            *out = x - y; return true;
-        }
-        if (op == TokenType::Star) {
-            if (x == 0 || y == 0) { *out = 0; return true; }
-            // The lowest value has no positive counterpart; the re-division
-            // check below would itself trap on it.
-            if (x == lowest || y == lowest) { return false; }
-            const p: i128 = x * y;
-            if (p / y != x) { return false; }
-            *out = p; return true;
-        }
-        if (op == TokenType::Slash || op == TokenType::Percent) {
-            if (y == 0) { return false; }
-            if (x == lowest && y == 0 - 1) { return false; }
-            if (op == TokenType::Slash) { *out = x / y; } else { *out = x % y; }
-            return true;
-        }
-        if (op == TokenType::LessLess) {
-            if (y < 0 || y >= 128) { return false; }
-            const s: i128 = x << y;
-            if ((s >> y) != x) { return false; }
-            *out = s; return true;
-        }
-        if (op == TokenType::GreaterGreater) {
-            if (y < 0 || y >= 128) { return false; }
-            *out = x >> y; return true;
-        }
-        if (op == TokenType::Amp) { *out = x & y; return true; }
-        if (op == TokenType::Pipe) { *out = x | y; return true; }
-        if (op == TokenType::Caret) { *out = x ^ y; return true; }
-
-        if (op == TokenType::EqualEqual) { *out = if (x == y) { 1 } else { 0 }; return true; }
-        if (op == TokenType::ExclaimEqual) { *out = if (x != y) { 1 } else { 0 }; return true; }
-        if (op == TokenType::LAngle)  { *out = if (x <  y) { 1 } else { 0 }; return true; }
-        if (op == TokenType::LessEqual) { *out = if (x <= y) { 1 } else { 0 }; return true; }
-        if (op == TokenType::RAngle)  { *out = if (x >  y) { 1 } else { 0 }; return true; }
-        if (op == TokenType::GreaterEqual) { *out = if (x >= y) { 1 } else { 0 }; return true; }
-        if (op == TokenType::AmpAmp) { *out = if (x != 0 && y != 0) { 1 } else { 0 }; return true; }
-        if (op == TokenType::PipePipe) { *out = if (x != 0 || y != 0) { 1 } else { 0 }; return true; }
-        return false;
     }
 }

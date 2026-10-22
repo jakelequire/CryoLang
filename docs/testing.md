@@ -364,10 +364,10 @@ kept apart, so `expect` can say which stream a line belongs on:
 ```json
 {
   "outcome": "build",
-  "arguments": ["--log", "driver", "--log-file", "build/compiler.log"],
+  "arguments": ["--log", "driver", "--log-file", "compiler.log"],
   "expect": {
     "stderr_excludes": ["[debug "],
-    "file": "build/compiler.log",
+    "file": "compiler.log",
     "file_contains": ["[debug driver] "]
   }
 }
