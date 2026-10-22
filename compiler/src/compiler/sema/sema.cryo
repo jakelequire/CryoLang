@@ -2528,6 +2528,14 @@ type struct SemaVisitor {
                 }
             }
         }
+        // A shift's result has its left operand's width, and the amount says
+        // nothing about that width, so a constant shifted there takes the
+        // integer type the result is expected to have instead of adopting the
+        // amount's: `1 << (u64::BITS - 1)` stored into a `u64` shifts at 64
+        // bits, where adopting the `u32` amount shifted at 32.
+        const shift_keeps_expected: boolean =
+            (bin.op.kind == TokenType::LessLess || bin.op.kind == TokenType::GreaterGreater)
+            && this.literals.expected_type_is_int_type();
         if (force_wide.is_valid()) {
             const saved_fw: TypeRef = this.state.expected_type;
             this.state.expected_type = force_wide;
@@ -2546,7 +2554,7 @@ type struct SemaVisitor {
             }
         } else if (left_is_lit && !right_is_lit) {
             rhs = this.resolve_expr(bin.right);
-            if (rhs.is_valid()) {
+            if (rhs.is_valid() && !shift_keeps_expected) {
                 const saved_exp: TypeRef = this.state.expected_type;
                 this.state.expected_type = rhs;
                 lhs = this.resolve_expr(bin.left);
@@ -2580,8 +2588,9 @@ type struct SemaVisitor {
             }
         } else if (left_is_const_num && !right_is_const_num) {
             rhs = this.resolve_expr(bin.right);
-            if (is_narrow_float_type(this.arena, rhs) || is_wide_int_type(this.arena, rhs)
-                || (is_negative_numeric_literal_expr(bin.left) && this.literals.is_signed_int_type(rhs))) {
+            if (!shift_keeps_expected
+                && (is_narrow_float_type(this.arena, rhs) || is_wide_int_type(this.arena, rhs)
+                    || (is_negative_numeric_literal_expr(bin.left) && this.literals.is_signed_int_type(rhs)))) {
                 const saved_exp: TypeRef = this.state.expected_type;
                 this.state.expected_type = rhs;
                 lhs = this.resolve_expr(bin.left);
