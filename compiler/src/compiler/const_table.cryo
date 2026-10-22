@@ -109,6 +109,10 @@ type struct ConstEntry {
     /// non-primitive, and for an absent annotation - all of which leave the
     /// choice to the expression, which is what an unannotated constant wants.
     int_typed: boolean;
+    /// The primitive the declaration names, or "" for any other annotation
+    /// and for none.  An integer-typed constant's folded value is wrapped to
+    /// it, so the compile-time value is the one the program reads.
+    declared: string;
 }
 
 
@@ -190,9 +194,12 @@ public:
     /// Re-registering the same definition replaces its initializer rather
     /// than adding a second entry, which keeps repeated passes over a module
     /// idempotent.  A declaration with no definition records nothing.
+    /// `declared` is the primitive the declaration names (`declared_primitive`).
     register(mut &this, def: DefId, init: ExpressionNode*,
-             int_typed: boolean) -> void {
+             declared: string) -> void {
         if (!def.is_valid()) { return; }
+        const int_typed: boolean = declared.length() > 0
+            && ResBase::reads_as_integer(ResBase::primitive_position(declared));
         const key: DefKey = this.defs.table_key(def);
         match (this.by_def.get(&key)) {
             Option::Some(existing) => {
@@ -202,6 +209,7 @@ public:
                 this.entries[existing].real_value = 0.0;
                 this.entries[existing].real_state = CONST_PENDING;
                 this.entries[existing].int_typed  = int_typed;
+                this.entries[existing].declared   = declared;
                 return;
             }
             Option::None => { }
@@ -215,6 +223,7 @@ public:
             real_value:     0.0,
             real_state:     CONST_PENDING,
             int_typed:      int_typed,
+            declared:       declared,
         });
         this.by_def.insert(key, idx);
     }
@@ -244,22 +253,15 @@ public:
         };
     }
 
-    /// Whether `ann` names an integer primitive, which is what decides how the
-    /// declaration's initializer is READ.
-    ///
-    /// `char` counts: whatever its width settles at, it is not a real, and the
-    /// question here is only which of the two folds may interpret the
-    /// initializer.  Anything that is not a primitive - a type name, an alias,
-    /// an absent annotation - answers false and leaves the choice to the
-    /// expression's own shape.
-    static declares_integer(ann: TypeAnnotation*, intern: InternTable*) -> boolean {
-        if (ann == null || intern == null) { return false; }
+    /// The primitive `ann` names, which decides how the declaration's
+    /// initializer is READ and what its folded value is wrapped to; "" for
+    /// anything that is not a primitive - a type name, an alias, an absent
+    /// annotation - which leaves the choice to the expression's own shape.
+    static declared_primitive(ann: TypeAnnotation*, intern: InternTable*) -> string {
+        if (ann == null || intern == null) { return ""; }
         return match (*ann) {
-            TypeAnnotation::Primitive(p) => {
-                return ResBase::reads_as_integer(
-                    ResBase::primitive_position(ConstantTable::keyword_primitive(p.name, intern)));
-            }
-            _ => { false }
+            TypeAnnotation::Primitive(p) => { ConstantTable::keyword_primitive(p.name, intern) }
+            _ => { "" }
         };
     }
 
@@ -627,6 +629,11 @@ type struct ConstEval {
     /// must be able to succeed at a position that has one.  `Folding` is the
     /// cycle guard: a constant reached from its own initializer is not a
     /// compile-time integer, and without the guard the recursion has no floor.
+    ///
+    /// An integer-typed constant's value is its initializer's wrapped to the
+    /// declared type, as the stored global is: `const A: u8 = B + 200` with
+    /// `B` at 100 is 44 at every use, never 300 in an array size and 44 at
+    /// run time.
     fold_entry(&this, idx: i64, out: i128*) -> boolean {
         if (this.table == null) { return false; }
         if (idx < 0 || idx >= this.table.entries.length) { return false; }
@@ -640,7 +647,12 @@ type struct ConstEval {
 
         this.table.entries[idx].state = CONST_FOLDING;
         mut v: i128 = 0;
-        const ok: boolean = this.fold(init, &v);
+        mut ok: boolean = this.fold(init, &v);
+        if (ok && this.table.entries[idx].int_typed) {
+            mut wrapped: i128 = 0;
+            ok = ConstEval::wrap_to_primitive(this.table.entries[idx].declared, v, &wrapped);
+            v = wrapped;
+        }
         if (!ok) {
             this.table.entries[idx].state = CONST_PENDING;
             return false;
@@ -721,7 +733,7 @@ type struct ConstEval {
         mut ok: boolean = false;
         if (this.table.entries[idx].int_typed) {
             mut iv: i128 = 0;
-            ok = this.fold(init, &iv);
+            ok = this.fold_entry(idx, &iv);
             if (ok) { v = iv as f64; }
         } else {
             ok = this.fold_real(init, &v);
@@ -752,14 +764,15 @@ type struct ConstEval {
     /// observes rather than to the unwrapped operand.
     ///
     /// False for anything a folded value cannot carry: a float, and a negative
-    /// value cast to `u128`, whose wrapped value is above `i128::MAX`.  `char`
-    /// is excluded because its width is not settled.
+    /// value cast to `u128`, whose wrapped value is above `i128::MAX`.  A
+    /// `char` is a 32-bit unsigned scalar.
     static wrap_to_primitive(prim: string, v: i128, out: i128*) -> boolean {
         if (prim == "boolean") { *out = if (v != 0) { 1 } else { 0 }; return true; }
 
         mut bits: i128 = 0;
         mut is_signed: boolean = true;
-        if (prim == "i8")   { bits = 8;  is_signed = true; }
+        if (prim == "char") { bits = 32; is_signed = false; }
+        else if (prim == "i8")   { bits = 8;  is_signed = true; }
         else if (prim == "i16")   { bits = 16; is_signed = true; }
         else if (prim == "i32")   { bits = 32; is_signed = true; }
         else if (prim == "i64" || prim == "isize") { bits = 64; is_signed = true; }
