@@ -22,7 +22,10 @@ Cases:
     them;
   - CRYO_LOG=driver with --log=link,driver=off: the flag wins - link lines,
     no driver lines;
-  - --debug: more than one area logs;
+  - CRYO_LOG=loader,sema,drop,types: exactly those areas log; types=trace
+    dumps the type arena;
+  - --debug: more than one area logs, and no line on either stream looks
+    like a `[Tag]` trace the logger did not write;
   - CRYO_LOG_FILE, and --log-file: the lines go to the file, not stderr;
   - CRYO_LOG=bogus: a warning naming the item, and the build still succeeds.
 
@@ -147,8 +150,19 @@ def main():
     r = build(cryo, env, {"CRYO_LOG": "driver"}, ["--log=link,driver=off"])
     check(r.code == 0 and areas(r.err_lines) == ["link"], "--log wins over CRYO_LOG", r)
 
+    r = build(cryo, env, {"CRYO_LOG": "loader,sema,drop,types"})
+    check(r.code == 0 and areas(r.err_lines) == ["drop", "loader", "sema", "types"],
+          "the loader, sema, drop checking and types log at debug", r)
+    r = build(cryo, env, {"CRYO_LOG": "types=trace"})
+    check(r.code == 0 and any(m.group(6).startswith("type arena dump:") for m in r.err_lines)
+          and sum(1 for m in r.err_lines if m.group(6).startswith("type ")) > 100,
+          "types=trace dumps the type arena", r)
+
     r = build(cryo, env, flags=["--debug"])
     check(r.code == 0 and len(areas(r.err_lines)) > 1, "--debug turns every area on", r)
+    check(not [l for l in (r.out + "\n" + r.err).splitlines()
+               if l.startswith("[") and not LINE.match(l)],
+          "--debug prints no trace outside the logger", r)
 
     log_path = os.path.join(SCRATCH, "env.log")
     r = build(cryo, env, {"CRYO_LOG": "driver", "CRYO_LOG_FILE": log_path})

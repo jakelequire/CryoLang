@@ -39,8 +39,6 @@ import compiler::diag::snapshot;
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::lex::lexer;
 import utils;
-import utils::logger;
-import utils::logger::{ set_compiler_debug };
 import utils::log::{ Log, LogArea, LogLevel };
 import std::fmt;
 import std::fs::metadata;
@@ -108,7 +106,6 @@ const CODEGEN_MULTIPROC_MIN_MODULES: u32 = 16;
 type struct CompilerConfig {
     debug:              boolean;
     show_ast:           boolean;
-    verbose_passes:     boolean;
     emit_llvm:          boolean;
     /// CLI override for project output_dir.  Empty string ("") means
     /// "use whatever the cryoconfig says".  Set from `--build-dir=...`
@@ -215,7 +212,6 @@ type struct CompilerConfig {
         return CompilerConfig {
             debug:               false,
             show_ast:            false,
-            verbose_passes:      false,
             emit_llvm:           false,
             output_dir_override: "",
             stdlib_path_override: "",
@@ -241,7 +237,6 @@ type struct CompilerConfig {
         return CompilerConfig {
             debug:               true,
             show_ast:            true,
-            verbose_passes:      true,
             emit_llvm:           false,
             output_dir_override: "",
             stdlib_path_override: "",
@@ -418,7 +413,6 @@ type struct CompilerInstance {
     run_pipeline(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
                  output_path_text: string) -> CompilationResult {
         const output_path: string = output_path_text;
-        pipeline.set_verbose(this.config.verbose_passes);
 
         if (!pipeline.validate()) {
             Log::error(LogArea::Driver, "pipeline validation failed");
@@ -475,11 +469,7 @@ type struct CompilerInstance {
             }
         }
 
-        if (this.config.debug) {
-            // const r: Resolver * = ctx.get_resolver();
-            // if (r != null) { r.debug_dump(); }
-            ctx.type_arena.debug_dump();
-        }
+        ctx.type_arena.debug_dump();
 
         Log::debug(LogArea::Driver, f"finished {ctx.source_file}: {ctx.diagnostics.error_count} errors, {ctx.diagnostics.warning_count} warnings");
 
@@ -773,7 +763,6 @@ type struct CompilerInstance {
         // cryoconfig `debug = true` is `--debug`.  It only switches logging
         // ON: `debug = false` does not undo a `--debug` or a `CRYO_LOG`.
         if (config.debug) {
-            set_compiler_debug(true);
             Log::configure(Str::new("debug"), "cryoconfig");
         }
 
@@ -1160,7 +1149,7 @@ type struct CompilerInstance {
 
         const discovery_ok: boolean = loader.discover_project(
             ctx.intern_table, ctx.module_graph, ctx.diagnostics,
-            root_path, this.config.debug);
+            root_path);
 
         if (!discovery_ok) {
             // Flush deferred diagnostics so the user actually SEES the
@@ -1226,7 +1215,7 @@ type struct CompilerInstance {
             if (metadata::exists(Path::from(prelude_path))) {
                 loader.discover_module(
                     ctx.intern_table, ctx.module_graph, ctx.diagnostics,
-                    prelude_path, this.config.debug);
+                    prelude_path);
             }
         }
 
@@ -1241,10 +1230,10 @@ type struct CompilerInstance {
         if (ctx.options.mode.skip_user_main()) {
             const tests_dir: string = fmt::format("%s/tests", config.project_root);
             if (metadata::exists(Path::from(tests_dir))) {
-                loader.scan_all_project_files(ctx.intern_table, tests_dir, this.config.debug);
+                loader.scan_all_project_files(ctx.intern_table, tests_dir);
                 loader.discover_tests_directory(
                     ctx.intern_table, ctx.module_graph, ctx.diagnostics,
-                    tests_dir, this.config.debug);
+                    tests_dir);
                 Log::debug(LogArea::Loader, f"discovered tests from {tests_dir}");
             } else {
                 Log::debug(LogArea::Loader, f"no tests directory at {tests_dir}; running with no tests");
@@ -1254,13 +1243,13 @@ type struct CompilerInstance {
                 if (metadata::exists(Path::from(env_path))) {
                     loader.discover_module(
                         ctx.intern_table, ctx.module_graph, ctx.diagnostics,
-                        env_path, this.config.debug);
+                        env_path);
                 }
                 const runner_path: string = fmt::format("%s/test/runner.cryo", stdlib_root);
                 if (metadata::exists(Path::from(runner_path))) {
                     loader.discover_module(
                         ctx.intern_table, ctx.module_graph, ctx.diagnostics,
-                        runner_path, this.config.debug);
+                        runner_path);
                 }
             }
         }
@@ -1285,7 +1274,7 @@ type struct CompilerInstance {
             if (metadata::exists(Path::from(interp_path))) {
                 loader.discover_module(
                     ctx.intern_table, ctx.module_graph, ctx.diagnostics,
-                    interp_path, this.config.debug);
+                    interp_path);
             }
         }
 
@@ -1644,7 +1633,6 @@ type struct CompilerInstance {
         mem::zero::<u8>(ast_buf as u8*, buf_size);
 
         mut pipeline: PassRegistry = PassRegistry::new();
-        pipeline.set_verbose(this.config.verbose_passes);
 
         // Run each stage across ALL modules before advancing to the next; see
         // the stage-driver block below for why the ordering is load-bearing.
@@ -1998,9 +1986,7 @@ type struct CompilerInstance {
             }
         }
 
-        if (this.config.debug) {
-            ctx.type_arena.debug_dump();
-        }
+        ctx.type_arena.debug_dump();
 
         // Invariant guard (gated by CRYO_TYPE_AUDIT): canonical type identity.
         // Off by default; zero cost when unset.
@@ -2559,7 +2545,7 @@ type struct CompilerInstance {
         // build looks green, then the linker fails with `undefined
         // reference`.
         // Skip terminal flush in LSP mode; same rationale as in
-        // `run_pipeline`: the renderer fprintfs to `g_stderr` which
+        // `run_pipeline`: the renderer fprintfs to a stream which
         // a host that drives the compiler purely as a library hasn't
         // necessarily wired up (the LSP, for one, gets `NULL`).  The
         // language server reads `ctx.diagnostics.diagnostics` directly

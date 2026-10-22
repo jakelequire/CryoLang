@@ -41,8 +41,7 @@ import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID, SymbolKey };
 import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, Res };
-import utils::logger;
-import utils::logger::{ cdebug };
+import utils::log::{ Log, LogArea, LogLevel };
 import std::core::option;
 import std::core::option::{ Option };
 import std::collections::hashmap;
@@ -946,7 +945,9 @@ type struct MoveChecker {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.body == null) { return; }
         if (func.is_generic()) { return; }
-        cdebug("[MoveCheck] === func '%s' ===\n", this.intern.resolve(func.name));
+        if (Log::enabled(LogArea::Drop, LogLevel::Trace)) {
+            Log::trace(LogArea::Drop, f"move checking function '{this.intern.resolve(func.name)}'");
+        }
         this.enter_function(func_decl);
         this.walk_stmt(func.body);
     }
@@ -2064,10 +2065,9 @@ type struct MoveChecker {
         const ty: TypeRef = this.lookup_type(sym);
         if (!ty.is_valid()) { return; }
         const _is_copy: boolean = this.is_copy(ty);
-        const _is_moved: boolean = this.is_moved(sym);
-        cdebug("[MoveCheck:ident] '%s' ty.id=%llu is_copy=%d is_moved=%d in_move=%d\n",
-            this.intern.resolve(name), ty.key(), _is_copy as i32,
-            _is_moved as i32, in_move_context as i32);
+        if (Log::enabled(LogArea::Drop, LogLevel::Trace)) {
+            Log::trace(LogArea::Drop, f"identifier '{this.intern.resolve(name)}': type {ty.key()}, copy {_is_copy}, moved {this.is_moved(sym)}, in move context {in_move_context}");
+        }
         if (_is_copy) { return; }
 
         // A move in a loop's condition or update is made again at every back
@@ -2129,10 +2129,7 @@ type struct MoveCheckPass {
         if (root == null) { return PassResult::ok(); }
         mut checker: MoveChecker = MoveChecker::new(ctx);
         checker.walk_program(root);
-        if (ctx.options.verbose) {
-            cdebug("[MoveCheck] %lld diagnostics emitted (%lld fatal)\n",
-                checker.fired, checker.fatal);
-        }
+        Log::debug(LogArea::Drop, f"move check: {checker.fired} diagnostics emitted ({checker.fatal} fatal)");
         // Both within-iteration use-after-move and loop-carried moves are
         // unambiguous double frees and increment `fatal`: fail the pass so
         // the pipeline aborts before codegen (MoveCheck is

@@ -50,8 +50,7 @@ import compiler::ast::statement;
 import compiler::ast::statement::{ Stmt };
 import compiler::resolver::{ symbol_str, intern_table };
 import utils;
-import utils::logger;
-import utils::logger::{ cdebug };
+import utils::log::{ Log, LogArea, LogLevel };
 import std::fmt;
 import std::fmt::float;
 import std::collections::string;
@@ -88,8 +87,8 @@ const PROBE_PREFIX: string = "__cryo_macro_probe_";
 /// `skipped` (a construct that produced NO binding - a function-like macro, a
 /// non-literal macro body) and `approximated` (a binding that round-trips by
 /// value but loses member access - a union, a bitfield run, an anonymous
-/// record member or field, lowered to an opaque storage blob).  Surfaced via
-/// `cdebug` today (so it only appears under `--debug`); the eventual `cryo
+/// record member or field, lowered to an opaque storage blob).  Surfaced as
+/// bindgen `info` log lines, off by default; the eventual `cryo
 /// vendor` generator will consume the same lists for its translation report.
 type struct ImportReport {
     /// LOST: a construct we *could* bind but don't yet - real API surface the
@@ -99,7 +98,7 @@ type struct ImportReport {
     /// IGNORED: a `#define`/decl that is never bindable API in the first place - 
     /// a header guard, a marker macro (`RLAPI`, `extern`), a function-like macro.
     /// Tracked so it doesn't inflate the "not bound" headline; surfaced as a
-    /// single count line, with detail only under `--debug`.
+    /// single count line, with detail only in the bindgen log.
     ignored:      [string];
 
     static new() -> ImportReport {
@@ -118,23 +117,22 @@ type struct ImportReport {
     ignore(mut &this, line: string) -> void { this.ignored.push(line); }
 
     /// Emit a per-translation-unit summary (no-op when nothing was lost, and
-    /// silent unless `--debug` is set, since it rides `cdebug`).  Used by the
+    /// silent unless the bindgen log area is at `info`).  Used by the
     /// inline `#include` path, where the report is diagnostic noise during a
     /// normal compile; the `cryo vendor` path uses `summary_stdout` instead.
     summary(&this, label: string) -> void {
         if (this.skipped.length == 0 && this.approximated.length == 0
             && this.ignored.length == 0) { return; }
-        cdebug("[Bindgen] '%s' translation report: %lld not bound, %lld approximated, %lld ignored\n",
-               label, this.skipped.length as i64, this.approximated.length as i64,
-               this.ignored.length as i64);
+        if (!Log::enabled(LogArea::Bindgen, LogLevel::Info)) { return; }
+        Log::info(LogArea::Bindgen, f"'{label}' translation report: {this.skipped.length} not bound, {this.approximated.length} approximated, {this.ignored.length} ignored");
         for (mut i: i64 = 0; i < this.skipped.length; i++) {
-            cdebug("  [skip]   %s\n", this.skipped[i]);
+            Log::info(LogArea::Bindgen, f"[skip] {this.skipped[i]}");
         }
         for (mut i: i64 = 0; i < this.approximated.length; i++) {
-            cdebug("  [approx] %s\n", this.approximated[i]);
+            Log::info(LogArea::Bindgen, f"[approx] {this.approximated[i]}");
         }
         for (mut i: i64 = 0; i < this.ignored.length; i++) {
-            cdebug("  [ignore] %s\n", this.ignored[i]);
+            Log::info(LogArea::Bindgen, f"[ignore] {this.ignored[i]}");
         }
     }
 
@@ -172,7 +170,7 @@ type struct ImportReport {
             fmt::printf("  [approx] %s\n", this.approximated[i]);
         }
         // Inherently-unbindable noise is summarized by the count above only; its
-        // detail rides the `--debug` `summary()` path, not this user-facing one.
+        // detail rides the logged `summary()` path, not this user-facing one.
     }
 }
 
@@ -842,7 +840,7 @@ type struct Importer {
             // it a synthetic `struct (unnamed at ...)` spelling, so test anonymity
             // via clang_Cursor_isAnonymous, NOT an empty-spelling check).
             // Reported, not silently relied upon - references fall back to void*.
-            cdebug("[Bindgen] skipped anonymous record (use a typedef to name it)\n");
+            Log::info(LogArea::Bindgen, "[skip] anonymous record (use a typedef to name it)");
             return;
         }
 
@@ -2262,8 +2260,7 @@ type struct Importer {
 
                 const resolved: string = Importer::resolve_include_path(source_dir, include_path);
                 if (resolved == "") {
-                    cdebug("[Bindgen] WARNING: header not found: '%s' (relative to '%s')\n",
-                           include_path, source_dir);
+                    Log::warn(LogArea::Bindgen, f"header not found: '{include_path}' (relative to '{source_dir}')");
                     continue;
                 }
 
@@ -2272,15 +2269,11 @@ type struct Importer {
                 total_imported += count;
             }
 
-            if (ctx.options.verbose) {
-                const alias_str: string = ctx.intern_table.resolve(extern_node.namespace_alias);
-                cdebug("[Bindgen] '%s': %d includes, %d functions\n",
-                       alias_str, extern_node.include_paths.length, extern_node.functions.length);
-            }
+            Log::debug(LogArea::Bindgen, f"'{ctx.intern_table.resolve(extern_node.namespace_alias)}': {extern_node.include_paths.length} includes, {extern_node.functions.length} functions");
         }
 
-        if (ctx.options.verbose && total_imported > 0) {
-            cdebug("[Bindgen] Total: %d C functions imported\n", total_imported);
+        if (total_imported > 0) {
+            Log::debug(LogArea::Bindgen, f"{total_imported} C functions imported");
         }
 
         return PassResult::from_snapshot(ctx.diagnostics, snap);
@@ -2355,7 +2348,7 @@ type struct Importer {
     /// (null/0 for a real file).  Returns the number of functions emitted.
     /// `out_report` (when non-null) accumulates this TU's skipped/approximated
     /// constructs for the caller's consolidated report (the `cryo vendor`
-    /// path); when null, the report rides the `--debug`-only `cdebug` summary
+    /// path); when null, the report goes to the bindgen log's summary
     /// (the inline `#include` path).  `out_inputs` (when non-null) is appended
     /// with every non-system file the TU included (via `clang_getInclusions`),
     /// for the generator's include-graph `.deps` sidecar; null on the inline

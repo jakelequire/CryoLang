@@ -3569,7 +3569,7 @@ Macros are taken from **any header the import pulled in**, not only the file nam
 
 A header's `extern` **globals** bind as [imported globals](#171-extern-blocks) under the alias (`extern int errno_value;` -> `c::errno_value`), including the loader idiom of exposing each entry point as a global function pointer. A `static` global is skipped and reported: it has no symbol outside the translation unit that defines it.
 
-Every construct that is skipped or approximated is recorded and printed as a per-header **translation report** under `--debug` (`[skip]` for an unbound construct, `[approx]` for a layout-only binding), so nothing is lost silently.
+Every construct that is skipped or approximated is recorded and printed as a per-header **translation report** under `--debug` or `--log=bindgen=info` (`[skip]` for an unbound construct, `[approx]` for a layout-only binding), so nothing is lost silently.
 
 To import only a header's function prototypes - suppressing all struct/enum/typedef emission - apply the **`![functions_only]`** directive to the extern-module block. It is valid only on a C-import extern module:
 

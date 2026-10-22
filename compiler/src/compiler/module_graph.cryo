@@ -12,8 +12,7 @@ import compiler::types::{
 import compiler::ast::node;
 import compiler::ast::node::{ ProgramNode };
 import compiler::decl_index;
-import utils::logger;
-import utils::logger::{ cdebug };
+import utils::log::{ Log, LogArea, LogLevel };
 import std::collections::hashmap;
 import std::collections::hashmap::{ HashMap };
 import std::ffi::libc;
@@ -1011,25 +1010,24 @@ public:
             }
 
             if (!placed_any) {
-                // No progress; cycle detected.  Print unplaced modules
-                // and their blocking dependencies to help debug.
-                cdebug("[TopSort] Cycle detected! %u of %u modules placed.\n",
-                    order.length, n);
-                cdebug("[TopSort] Unplaced modules and their unresolved deps:\n");
+                // No progress; cycle detected.  Record the unplaced modules
+                // and log their blocking dependencies.
+                Log::debug(LogArea::Loader, f"cycle detected: {order.length} of {n} modules placed");
                 mut unplaced: [u32] = [];
                 for (mut ci: u32 = 0; ci < n; ci++) {
                     if (ModuleGraph::topo_contains(order, ci)) { continue; }
                     unplaced.push(ci);
-                    const cinfo: ModuleInfo* = &this.modules[ci];
-                    cdebug("  [%u] %s\n", ci, cinfo.file_path);
-                    // Read deps in place - a value copy of `cinfo` would alias
-                    // its owning arrays and double-free at scope exit.
-                    for (mut cd: i64 = 0; cd < cinfo.dependencies.length; cd++) {
-                        const cdep_idx: i64 =
-                            this.find_module_index(cinfo.dependencies[cd]);
-                        if (cdep_idx >= 0 && !ModuleGraph::topo_contains(order, cdep_idx as u32)) {
-                            cdebug("    -> blocked by [%lld] %s\n",
-                                cdep_idx, this.modules[cdep_idx].file_path);
+                    if (Log::enabled(LogArea::Loader, LogLevel::Trace)) {
+                        const cinfo: ModuleInfo* = &this.modules[ci];
+                        Log::trace(LogArea::Loader, f"unplaced module {ci}: {cinfo.file_path}");
+                        // Read deps in place - a value copy of `cinfo` would alias
+                        // its owning arrays and double-free at scope exit.
+                        for (mut cd: i64 = 0; cd < cinfo.dependencies.length; cd++) {
+                            const cdep_idx: i64 =
+                                this.find_module_index(cinfo.dependencies[cd]);
+                            if (cdep_idx >= 0 && !ModuleGraph::topo_contains(order, cdep_idx as u32)) {
+                                Log::trace(LogArea::Loader, f"module {ci} blocked by module {cdep_idx}: {this.modules[cdep_idx].file_path}");
+                            }
                         }
                     }
                 }
