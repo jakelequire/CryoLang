@@ -42,46 +42,19 @@ import std::core::option::{ Option };
 import std::alloc::allocator;
 import std::ffi::libc;
 
-// Digit-count upper bounds: caller picks a buffer at least this big.
-
-// Unsigned decimal: digits of the type's max value.
-const U8_MAX_DECIMAL_DIGITS:  u64 = 3;   // "255"
-const U16_MAX_DECIMAL_DIGITS: u64 = 5;   // "65535"
-const U32_MAX_DECIMAL_DIGITS: u64 = 10;  // "4294967295"
-const U64_MAX_DECIMAL_DIGITS: u64 = 20;  // "18446744073709551615"
-const U128_MAX_DECIMAL_DIGITS: u64 = 39; // "340282366920938463463374607431768211455"
-
-// Signed decimal: sign + magnitude digits.
-const I8_MAX_DECIMAL_DIGITS:  u64 = 4;   // "-128"
-const I16_MAX_DECIMAL_DIGITS: u64 = 6;   // "-32768"
-const I32_MAX_DECIMAL_DIGITS: u64 = 11;  // "-2147483648"
-const I64_MAX_DECIMAL_DIGITS: u64 = 20;  // "-9223372036854775808"
-const I128_MAX_DECIMAL_DIGITS: u64 = 40; // "-170141183460469231731687303715884105728"
-
-// Hex: 2 nibbles per byte of the type.
-const U8_MAX_HEX_DIGITS:  u64 = 2;
-const U16_MAX_HEX_DIGITS: u64 = 4;
-const U32_MAX_HEX_DIGITS: u64 = 8;
-const U64_MAX_HEX_DIGITS: u64 = 16;
-const U128_MAX_HEX_DIGITS: u64 = 32;
-
-// Octal: digits to represent the type's max value.
-const U8_MAX_OCT_DIGITS:  u64 = 3;
-const U16_MAX_OCT_DIGITS: u64 = 6;
-const U32_MAX_OCT_DIGITS: u64 = 11;
-const U64_MAX_OCT_DIGITS: u64 = 22;
-const U128_MAX_OCT_DIGITS: u64 = 43;     // ceil(128 / 3)
-
-// Binary: one digit per bit of the type.
-const U8_MAX_BIN_DIGITS:  u64 = 8;
-const U16_MAX_BIN_DIGITS: u64 = 16;
-const U32_MAX_BIN_DIGITS: u64 = 32;
-const U64_MAX_BIN_DIGITS: u64 = 64;
-const U128_MAX_BIN_DIGITS: u64 = 128;
+// Each integer type's `MAX_*_DIGITS` constants bound the digits its buffer
+// writers produce, so a caller sizes a buffer by them: a signed type's
+// decimal count includes the `-` of its `MIN`, and an unsigned type has a
+// count for each base it writes.
 
 // Character classification. Each of these aggregates a range check
 // readers otherwise have to squint at.
 implement char {
+    const MIN: char = '\0';
+    /// The largest Unicode scalar value, U+10FFFF.
+    const MAX: char = '\u{10FFFF}';
+    const BITS: u32 = 32;
+
     is_digit(&this) -> boolean {
         return this >= '0' && this <= '9';
     }
@@ -149,22 +122,24 @@ implement char {
     }
 }
 
-// Range bounds, abs, checked_abs and clamp for the signed integer widths.
-// `abs` wraps at the type's min_value (two's complement has no positive
-// counterpart for the most-negative value): `i8::min_value().abs()` is
-// `-128`, not `128`; `checked_abs` answers `None` there instead.  Narrower
-// widths delegate to `i64` for the decimal-write digit loop so the
-// implementation lives in one place (down in the `implement i64` block).
+// Range bounds, width, abs, checked_abs and clamp for the signed integer
+// widths.  `abs` wraps at the type's `MIN` (two's complement has no positive
+// counterpart for the most-negative value): `i8::MIN.abs()` is `-128`, not
+// `128`; `checked_abs` answers `None` there instead.  Narrower widths
+// delegate to `i64` for the decimal-write digit loop so the implementation
+// lives in one place (down in the `implement i64` block).
 implement i8 {
-    static min_value() -> i8 { return -128 as i8; }
-    static max_value() -> i8 { return 127 as i8; }
+    const MIN: i8 = -128;
+    const MAX: i8 = 127;
+    const BITS: u32 = 8;
+    const MAX_DECIMAL_DIGITS: u64 = 4;     // "-128"
 
     abs(&this) -> i8 {
         if (this < 0) { return -this as i8; }
         return this;
     }
 
-    /// `Some(|this|)`, or `None` for `min_value()`, whose magnitude is not
+    /// `Some(|this|)`, or `None` for `MIN`, whose magnitude is not
     /// representable: only it negates to a value still negative.
     checked_abs(&this) -> Option<i8> {
         if (this < 0) {
@@ -182,7 +157,7 @@ implement i8 {
         return this;
     }
 
-    /// Buffer must hold at least `I8_MAX_DECIMAL_DIGITS` bytes.
+    /// Buffer must hold at least `i8::MAX_DECIMAL_DIGITS` bytes.
     to_decimal_buf(&this, buffer: u8*) -> u64 {
         const v: i64 = this as i64;
         return v.to_decimal_buf(buffer);
@@ -190,15 +165,17 @@ implement i8 {
 }
 
 implement i16 {
-    static min_value() -> i16 { return -32768; }
-    static max_value() -> i16 { return 32767; }
+    const MIN: i16 = -32768;
+    const MAX: i16 = 32767;
+    const BITS: u32 = 16;
+    const MAX_DECIMAL_DIGITS: u64 = 6;     // "-32768"
 
     abs(&this) -> i16 {
         if (this < 0) { return -this as i16; }
         return this;
     }
 
-    /// `Some(|this|)`, or `None` for `min_value()`, whose magnitude is not
+    /// `Some(|this|)`, or `None` for `MIN`, whose magnitude is not
     /// representable: only it negates to a value still negative.
     checked_abs(&this) -> Option<i16> {
         if (this < 0) {
@@ -216,7 +193,7 @@ implement i16 {
         return this;
     }
 
-    /// Buffer must hold at least `I16_MAX_DECIMAL_DIGITS` bytes.
+    /// Buffer must hold at least `i16::MAX_DECIMAL_DIGITS` bytes.
     to_decimal_buf(&this, buffer: u8*) -> u64 {
         const v: i64 = this as i64;
         return v.to_decimal_buf(buffer);
@@ -224,18 +201,20 @@ implement i16 {
 }
 
 implement i32 {
-    static min_value() -> i32 { return -2147483648; }
-    static max_value() -> i32 { return 2147483647; }
+    const MIN: i32 = -2147483648;
+    const MAX: i32 = 2147483647;
+    const BITS: u32 = 32;
+    const MAX_DECIMAL_DIGITS: u64 = 11;    // "-2147483648"
 
-    /// Wraps at `i32::min_value()`: the most-negative value has no
-    /// positive counterpart in two's complement, so `i32::min_value().abs()`
+    /// Wraps at `i32::MIN`: the most-negative value has no
+    /// positive counterpart in two's complement, so `i32::MIN.abs()`
     /// is itself; `checked_abs` answers `None` there.
     abs(&this) -> i32 {
         if (this < 0) { return -this; }
         return this;
     }
 
-    /// `Some(|this|)`, or `None` for `min_value()`, whose magnitude is not
+    /// `Some(|this|)`, or `None` for `MIN`, whose magnitude is not
     /// representable: only it negates to a value still negative.
     checked_abs(&this) -> Option<i32> {
         if (this < 0) {
@@ -253,7 +232,7 @@ implement i32 {
         return this;
     }
 
-    /// Buffer must hold at least `I32_MAX_DECIMAL_DIGITS` bytes.
+    /// Buffer must hold at least `i32::MAX_DECIMAL_DIGITS` bytes.
     to_decimal_buf(&this, buffer: u8*) -> u64 {
         const v: i64 = this as i64;
         return v.to_decimal_buf(buffer);
@@ -261,15 +240,17 @@ implement i32 {
 }
 
 implement i64 {
-    static min_value() -> i64 { return -9223372036854775808; }
-    static max_value() -> i64 { return 9223372036854775807; }
+    const MIN: i64 = -9223372036854775808;
+    const MAX: i64 = 9223372036854775807;
+    const BITS: u32 = 64;
+    const MAX_DECIMAL_DIGITS: u64 = 20;    // "-9223372036854775808"
 
     abs(&this) -> i64 {
         if (this < 0) { return -this; }
         return this;
     }
 
-    /// `Some(|this|)`, or `None` for `min_value()`, whose magnitude is not
+    /// `Some(|this|)`, or `None` for `MIN`, whose magnitude is not
     /// representable: only it negates to a value still negative.
     checked_abs(&this) -> Option<i64> {
         if (this < 0) {
@@ -294,8 +275,13 @@ implement i64 {
 // pick a smaller buffer per the `UN_MAX_*_DIGITS` constants above; the
 // u64 implementation writes only the digits it needs.
 implement u8 {
-    static min_value() -> u8 { return 0 as u8; }
-    static max_value() -> u8 { return 255 as u8; }
+    const MIN: u8 = 0;
+    const MAX: u8 = 255;
+    const BITS: u32 = 8;
+    const MAX_DECIMAL_DIGITS: u64 = 3;     // "255"
+    const MAX_HEX_DIGITS: u64 = 2;
+    const MAX_OCT_DIGITS: u64 = 3;
+    const MAX_BIN_DIGITS: u64 = 8;
 
     /// `this` confined to `[lo, hi]`.
     clamp(&this, lo: u8, hi: u8) -> u8 {
@@ -331,8 +317,13 @@ implement u8 {
 }
 
 implement u16 {
-    static min_value() -> u16 { return 0 as u16; }
-    static max_value() -> u16 { return 65535 as u16; }
+    const MIN: u16 = 0;
+    const MAX: u16 = 65535;
+    const BITS: u32 = 16;
+    const MAX_DECIMAL_DIGITS: u64 = 5;     // "65535"
+    const MAX_HEX_DIGITS: u64 = 4;
+    const MAX_OCT_DIGITS: u64 = 6;
+    const MAX_BIN_DIGITS: u64 = 16;
 
     /// `this` confined to `[lo, hi]`.
     clamp(&this, lo: u16, hi: u16) -> u16 {
@@ -368,8 +359,13 @@ implement u16 {
 }
 
 implement u32 {
-    static min_value() -> u32 { return 0 as u32; }
-    static max_value() -> u32 { return 4294967295; }
+    const MIN: u32 = 0;
+    const MAX: u32 = 4294967295;
+    const BITS: u32 = 32;
+    const MAX_DECIMAL_DIGITS: u64 = 10;    // "4294967295"
+    const MAX_HEX_DIGITS: u64 = 8;
+    const MAX_OCT_DIGITS: u64 = 11;
+    const MAX_BIN_DIGITS: u64 = 32;
 
     /// `this` confined to `[lo, hi]`.
     clamp(&this, lo: u32, hi: u32) -> u32 {
@@ -405,8 +401,13 @@ implement u32 {
 }
 
 implement u64 {
-    static min_value() -> u64 { return 0 as u64; }
-    static max_value() -> u64 { return 18446744073709551615; }
+    const MIN: u64 = 0;
+    const MAX: u64 = 18446744073709551615;
+    const BITS: u32 = 64;
+    const MAX_DECIMAL_DIGITS: u64 = 20;    // "18446744073709551615"
+    const MAX_HEX_DIGITS: u64 = 16;
+    const MAX_OCT_DIGITS: u64 = 22;
+    const MAX_BIN_DIGITS: u64 = 64;
 
     /// `this` confined to `[lo, hi]`.
     clamp(&this, lo: u64, hi: u64) -> u64 {
@@ -422,7 +423,7 @@ implement u64 {
     // (`u8`/`u16`/`u32`) above zero-extend to `u64` and reuse it.
 
     /// Write `this` in base 10 into `buffer`. Returns bytes written.
-    /// `buffer` must hold at least `U64_MAX_DECIMAL_DIGITS` bytes.
+    /// `buffer` must hold at least `u64::MAX_DECIMAL_DIGITS` bytes.
     /// Builds the digits on a 20-byte stack scratch then copies in one
     /// shot; no heap traffic.
     to_decimal_buf(&this, buffer: u8*) -> u64 {
@@ -461,7 +462,7 @@ implement u64 {
     }
 
     /// Lowercase hex. Returns bytes written.
-    /// `buffer` must hold at least `U64_MAX_HEX_DIGITS` bytes.
+    /// `buffer` must hold at least `u64::MAX_HEX_DIGITS` bytes.
     to_hex_buf(&this, buffer: u8*) -> u64 {
         return u64::to_hex_buf_with_table(this, buffer, "0123456789abcdef" as u8*);
     }
@@ -533,7 +534,7 @@ implement u64 {
         return width;
     }
 
-    /// Base 8. `buffer` must hold at least `U64_MAX_OCT_DIGITS` bytes.
+    /// Base 8. `buffer` must hold at least `u64::MAX_OCT_DIGITS` bytes.
     to_oct_buf(&this, buffer: u8*) -> u64 {
         if (this == 0) {
             buffer[0] = 0x30;
@@ -556,7 +557,7 @@ implement u64 {
         return digits;
     }
 
-    /// Base 2. `buffer` must hold at least `U64_MAX_BIN_DIGITS` bytes.
+    /// Base 2. `buffer` must hold at least `u64::MAX_BIN_DIGITS` bytes.
     to_bin_buf(&this, buffer: u8*) -> u64 {
         if (this == 0) {
             buffer[0] = 0x30;
@@ -598,7 +599,7 @@ implement u64 {
 
 implement i64 {
     /// Write signed `this` in base 10. Returns bytes written.
-    /// `buffer` must hold at least `I64_MAX_DECIMAL_DIGITS` bytes.
+    /// `buffer` must hold at least `i64::MAX_DECIMAL_DIGITS` bytes.
     to_decimal_buf(&this, buffer: u8*) -> u64 {
         if (this < 0) {
             buffer[0] = 0x2D; // '-'
@@ -632,13 +633,13 @@ implement i64 {
 // native LLVM ops except `/` and `%`, which lower to libgcc/compiler-rt
 // (`__udivti3` / `__umodti3`); gcc links those by default.
 implement u128 {
-    static min_value() -> u128 { return 0 as u128; }
-    static max_value() -> u128 {
-        // 2^128 - 1, above u64::MAX so it must go through the 128-bit literal
-        // path; bind to a typed const to pin the target width.
-        const m: u128 = 340282366920938463463374607431768211455;
-        return m;
-    }
+    const MIN: u128 = 0;
+    const MAX: u128 = 340282366920938463463374607431768211455;
+    const BITS: u32 = 128;
+    const MAX_DECIMAL_DIGITS: u64 = 39;    // "340282366920938463463374607431768211455"
+    const MAX_HEX_DIGITS: u64 = 32;
+    const MAX_OCT_DIGITS: u64 = 43;        // ceil(128 / 3)
+    const MAX_BIN_DIGITS: u64 = 128;
 
     /// `this` confined to `[lo, hi]`.
     clamp(&this, lo: u128, hi: u128) -> u128 {
@@ -648,7 +649,7 @@ implement u128 {
     }
 
     /// Write `this` in base 10 into `buffer`. Returns bytes written.
-    /// `buffer` must hold at least `U128_MAX_DECIMAL_DIGITS` bytes.
+    /// `buffer` must hold at least `u128::MAX_DECIMAL_DIGITS` bytes.
     to_decimal_buf(&this, buffer: u8*) -> u64 {
         if (this == 0) {
             buffer[0] = 0x30;
@@ -683,7 +684,7 @@ implement u128 {
         return buf;
     }
 
-    /// Lowercase hex. `buffer` must hold at least `U128_MAX_HEX_DIGITS` bytes.
+    /// Lowercase hex. `buffer` must hold at least `u128::MAX_HEX_DIGITS` bytes.
     to_hex_buf(&this, buffer: u8*) -> u64 {
         return u128::to_hex_buf_with_table(this, buffer, "0123456789abcdef" as u8*);
     }
@@ -715,7 +716,7 @@ implement u128 {
         return digits;
     }
 
-    /// Base 8. `buffer` must hold at least `U128_MAX_OCT_DIGITS` bytes.
+    /// Base 8. `buffer` must hold at least `u128::MAX_OCT_DIGITS` bytes.
     to_oct_buf(&this, buffer: u8*) -> u64 {
         if (this == 0) {
             buffer[0] = 0x30;
@@ -738,7 +739,7 @@ implement u128 {
         return digits;
     }
 
-    /// Base 2. `buffer` must hold at least `U128_MAX_BIN_DIGITS` bytes.
+    /// Base 2. `buffer` must hold at least `u128::MAX_BIN_DIGITS` bytes.
     to_bin_buf(&this, buffer: u8*) -> u64 {
         if (this == 0) {
             buffer[0] = 0x30;
@@ -763,26 +764,20 @@ implement u128 {
 }
 
 implement i128 {
-    static min_value() -> i128 {
-        // -(2^127). Written as the negated magnitude; the magnitude (2^127) is
-        // above u64::MAX so it routes through the 128-bit literal path.
-        const m: i128 = -170141183460469231731687303715884105728;
-        return m;
-    }
-    static max_value() -> i128 {
-        const m: i128 = 170141183460469231731687303715884105727;
-        return m;
-    }
+    const MIN: i128 = -170141183460469231731687303715884105728;
+    const MAX: i128 = 170141183460469231731687303715884105727;
+    const BITS: u32 = 128;
+    const MAX_DECIMAL_DIGITS: u64 = 40;    // "-170141183460469231731687303715884105728"
 
-    /// Wraps at `i128::min_value()`: the most-negative value has no positive
-    /// counterpart in two's complement, so `i128::min_value().abs()` is
+    /// Wraps at `i128::MIN`: the most-negative value has no positive
+    /// counterpart in two's complement, so `i128::MIN.abs()` is
     /// itself; `checked_abs` answers `None` there.
     abs(&this) -> i128 {
         if (this < 0) { return -this; }
         return this;
     }
 
-    /// `Some(|this|)`, or `None` for `min_value()`, whose magnitude is not
+    /// `Some(|this|)`, or `None` for `MIN`, whose magnitude is not
     /// representable: only it negates to a value still negative.
     checked_abs(&this) -> Option<i128> {
         if (this < 0) {
@@ -801,7 +796,7 @@ implement i128 {
     }
 
     /// Write signed `this` in base 10. Returns bytes written.
-    /// `buffer` must hold at least `I128_MAX_DECIMAL_DIGITS` bytes.
+    /// `buffer` must hold at least `i128::MAX_DECIMAL_DIGITS` bytes.
     to_decimal_buf(&this, buffer: u8*) -> u64 {
         if (this < 0) {
             buffer[0] = 0x2D; // '-'
@@ -828,13 +823,13 @@ implement i128 {
 
 // Platform-width integers. `usize`/`isize` are distinct types whose width
 // equals the target's pointer size (64-bit on every current Cryo target), so
-// here they delegate to the same-width `u64`/`i64` machinery via a cast.  The
-// `min_value`/`max_value` bounds therefore equal the u64/i64 bounds today; when
-// a non-64-bit target lands they will track that target's width automatically
-// (the compiler decides the width - see IntegerKind::bit_width).
+// here they delegate to the same-width `u64`/`i64` machinery via a cast.  Their
+// `MIN`, `MAX` and `BITS` are therefore the 64-bit ones, and a target of
+// another pointer width changes them here.
 implement usize {
-    static min_value() -> usize { return 0 as usize; }
-    static max_value() -> usize { return u64::max_value() as usize; }
+    const MIN: usize = 0;
+    const MAX: usize = u64::MAX as usize;
+    const BITS: u32 = 64;
 
     /// `this` confined to `[lo, hi]`.
     clamp(&this, lo: usize, hi: usize) -> usize {
@@ -844,7 +839,7 @@ implement usize {
     }
 
     /// Write `this` in base 10. `buffer` must hold at least
-    /// `U64_MAX_DECIMAL_DIGITS` bytes (on a 64-bit target).
+    /// `u64::MAX_DECIMAL_DIGITS` bytes (on a 64-bit target).
     to_decimal_buf(&this, buffer: u8*) -> u64 {
         const v: u64 = this as u64;
         return v.to_decimal_buf(buffer);
@@ -857,15 +852,16 @@ implement usize {
 }
 
 implement isize {
-    static min_value() -> isize { return i64::min_value() as isize; }
-    static max_value() -> isize { return i64::max_value() as isize; }
+    const MIN: isize = i64::MIN as isize;
+    const MAX: isize = i64::MAX as isize;
+    const BITS: u32 = 64;
 
     abs(&this) -> isize {
         if (this < 0) { return -this; }
         return this;
     }
 
-    /// `Some(|this|)`, or `None` for `min_value()`, whose magnitude is not
+    /// `Some(|this|)`, or `None` for `MIN`, whose magnitude is not
     /// representable: only it negates to a value still negative.
     checked_abs(&this) -> Option<isize> {
         if (this < 0) {
@@ -884,7 +880,7 @@ implement isize {
     }
 
     /// Write signed `this` in base 10. `buffer` must hold at least
-    /// `I64_MAX_DECIMAL_DIGITS` bytes (on a 64-bit target).
+    /// `i64::MAX_DECIMAL_DIGITS` bytes (on a 64-bit target).
     to_decimal_buf(&this, buffer: u8*) -> u64 {
         const v: i64 = this as i64;
         return v.to_decimal_buf(buffer);
@@ -900,7 +896,19 @@ implement isize {
 // formatting/numeric methods all delegate to the f64 implementation
 // (which itself lives in `fmt::float` for `to_buf` / `to_buf_with`
 // because that needs libm).
+// IEEE-754 limits.  `MIN` is the most-negative finite value (`-MAX`) and
+// `MIN_POSITIVE` the smallest positive normal one; the non-finite values are
+// the quotients IEEE division gives them, folded where they are declared.
 implement f32 {
+    /// The difference between `1.0` and the next larger value.
+    const EPSILON: f32 = 1.1920929e-7;
+    const MAX: f32 = 3.4028235e38;
+    const MIN: f32 = -3.4028235e38;
+    const MIN_POSITIVE: f32 = 1.1754944e-38;
+    const INFINITY: f32 = 1.0 / 0.0;
+    const NEG_INFINITY: f32 = -1.0 / 0.0;
+    const NAN: f32 = 0.0 / 0.0;
+
     /// Absolute value by clearing the sign bit, so `-0.0` gives `0.0` and a
     /// NaN keeps its payload with its sign cleared.
     abs(&this) -> f32 {
@@ -926,6 +934,15 @@ implement f32 {
 }
 
 implement f64 {
+    /// The difference between `1.0` and the next larger value.
+    const EPSILON: f64 = 2.220446049250313e-16;
+    const MAX: f64 = 1.7976931348623157e308;
+    const MIN: f64 = -1.7976931348623157e308;
+    const MIN_POSITIVE: f64 = 2.2250738585072014e-308;
+    const INFINITY: f64 = 1.0 / 0.0;
+    const NEG_INFINITY: f64 = -1.0 / 0.0;
+    const NAN: f64 = 0.0 / 0.0;
+
     /// Absolute value by clearing the sign bit, so `-0.0` gives `0.0` and a
     /// NaN keeps its payload with its sign cleared.
     abs(&this) -> f64 {

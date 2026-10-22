@@ -4,7 +4,7 @@
 ///! for error reporting. RFC 8259 strict: no trailing commas, no
 ///! unquoted keys, no comments.
 ///!
-///! `MAX_DEPTH` caps object/array nesting to prevent stack-blowup on
+///! `Parser::MAX_DEPTH` caps object/array nesting to prevent stack-blowup on
 ///! adversarial inputs. The default is generous for hand-authored data
 ///! and tight enough that a malicious 1 MB blob of `[[[...]]]` cannot
 ///! exhaust the stack.
@@ -27,9 +27,6 @@ import std::json::error::{ JsonError, JsonErrorKind };
 import std::fmt::float;
 import std::ffi::libc;
 import std::core::mem;
-
-/// Maximum nesting depth for arrays + objects, combined.
-const MAX_DEPTH: u64 = 256;
 
 /// ASCII code points used by the parser. Names beat magic numbers.
 const HT:   u8 = 9;     // tab
@@ -70,6 +67,9 @@ type struct Parser {
     line:   u64;
     column: u64;
     depth:  u64;
+
+    /// Maximum nesting depth for arrays + objects, combined.
+    const MAX_DEPTH: u64 = 256;
 
     static new(text: Str) -> Parser {
         return Parser {
@@ -332,12 +332,8 @@ type struct Parser {
         // Integer path: parse digits directly without going through libc.
         // For the negative case we accumulate as u64 and negate at the end;
         // i64::MIN is exactly -2^63, which fits as u64 magnitude 2^63.
-        // Hoisted u64 constants below: inline literals exceeding i64::MAX
-        // don't get promoted when compared against a u64 (Cryo quirk),
-        // so we name them with explicit u64 type.
-        const U64_DIV10:    u64 = 1844674407370955161;  // u64::MAX / 10
-        const I64_MAX_U64:  u64 = 9223372036854775807;  // i64::MAX as u64
-        const I64_MIN_MAG:  u64 = 9223372036854775808;  // |i64::MIN| as u64
+        const U64_DIV10:    u64 = u64::MAX / 10;
+        const I64_MIN_MAG:  u64 = (i64::MAX as u64) + 1;   // |i64::MIN|
         mut acc: u64 = 0;
         mut i: u64 = start;
         if (negative) { i = i + 1; }
@@ -370,14 +366,13 @@ type struct Parser {
                 ));
             }
             if (acc == I64_MIN_MAG) {
-                // i64::MIN
-                return Result::Ok(JsonValue::Number(JsonNumber::Int(-9223372036854775808)));
+                return Result::Ok(JsonValue::Number(JsonNumber::Int(i64::MIN)));
             }
             const v: i64 = -(acc as i64);
             return Result::Ok(JsonValue::Number(JsonNumber::Int(v)));
         }
 
-        if (acc <= I64_MAX_U64) {
+        if (acc <= i64::MAX as u64) {
             return Result::Ok(JsonValue::Number(JsonNumber::Int(acc as i64)));
         }
         return Result::Ok(JsonValue::Number(JsonNumber::UInt(acc)));
@@ -529,7 +524,7 @@ type struct Parser {
 
     parse_array(mut &this) -> Result<JsonValue, JsonError> {
         this.depth = this.depth + 1;
-        if (this.depth > MAX_DEPTH) {
+        if (this.depth > Parser::MAX_DEPTH) {
             return Result::Err(this.err_at(
                 JsonErrorKind::DepthExceeded,
                 Str::new("nesting too deep")
@@ -574,7 +569,7 @@ type struct Parser {
 
     parse_object(mut &this) -> Result<JsonValue, JsonError> {
         this.depth = this.depth + 1;
-        if (this.depth > MAX_DEPTH) {
+        if (this.depth > Parser::MAX_DEPTH) {
             return Result::Err(this.err_at(
                 JsonErrorKind::DepthExceeded,
                 Str::new("nesting too deep")
@@ -659,7 +654,7 @@ function append_utf8(out: mut &String, cp: u32) -> Result<(), JsonError> {
         out.push_byte((0x80 | (cp & 0x3F)) as u8);
         return Result::Ok(());
     }
-    if (cp <= 0x10FFFF) {
+    if (cp <= char::MAX as u32) {
         out.push_byte((0xF0 | (cp >> 18)) as u8);
         out.push_byte((0x80 | ((cp >> 12) & 0x3F)) as u8);
         out.push_byte((0x80 | ((cp >> 6) & 0x3F)) as u8);

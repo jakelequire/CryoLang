@@ -260,6 +260,7 @@ implement struct Parser {
                 }
                 program.add_statement(node);
                 Parser::hoist_extern_globals(program, decl);
+                Parser::hoist_type_constants(program, decl);
             } else if (pending.length > 0) {
                 for (mut i: i64 = 0; i < pending.length; i++) {
                     program.add_statement(Node::Directive(pending[i]));
@@ -1246,6 +1247,14 @@ implement struct Parser {
                 continue;
             }
 
+            if (this.at_member_constant(0)) {
+                const constant: DeclarationNode* = this.parse_type_constant(member_visibility,
+                    member_is_async, member_modifier_span, doc);
+                if (constant != null && struct_node != null) { struct_node.constants.push(constant); }
+                if (constant != null && union_node != null) { union_node.constants.push(constant); }
+                continue;
+            }
+
             // Static method or static field
             if (this.check(TokenType::KwStatic)) {
                 const method_decl: DeclarationNode* = this.parse_static_method(member_visibility, member_is_async);
@@ -1394,6 +1403,70 @@ implement struct Parser {
             this.advance();
         }
         return m;
+    }
+
+    /// Whether the cursor is at a type's constant, `const NAME ...`, `offset`
+    /// tokens ahead.  A member may be named by a keyword, so `const` alone
+    /// does not decide: `const: i32;` is a field named `const` and
+    /// `const(...)` or `const<T>(...)` a method, and `const` followed by a
+    /// name begins a constant.  A keyword in the name's place is a constant
+    /// too, refused for its name where the declaration is parsed.
+    at_member_constant(offset: i64) -> boolean {
+        if (this.peek_at(offset).kind != TokenType::KwConst) { return false; }
+        const name: TokenType = this.peek_at(offset + 1).kind;
+        return name == TokenType::Identifier || name.is_keyword();
+    }
+
+    /// Parse a type's constant, `const NAME: T = value;`, with the cursor
+    /// at `const`.  It is written as a module-level constant is, and is one
+    /// (`is_global`), reached through its type.  A constant has a value:
+    /// one written without an initializer is refused (E0248), as a module
+    /// constant is not, because nothing could give a type's constant its
+    /// value later.  Null when the declaration does not parse.
+    parse_member_constant(visibility: Visibility) -> DeclarationNode* {
+        const name: string = this.peek_at(1).lexeme;
+        const decl: DeclarationNode* = this.parse_variable_declaration();
+        const constant: VarDecl* = DeclarationNode::var_of(decl);
+        if (constant == null) { return null; }
+        constant.set_global(true);
+        constant.member_visibility = visibility;
+        if (constant.initializer == null) {
+            this.report_invalid_at(ErrorCode::E0248_CONSTANT_WITHOUT_VALUE,
+                fmt::format("the constant `%s` has no value; a type's constant is written with one, `const %s: T = value;`",
+                    name, name),
+                decl.name_span);
+        }
+        return decl;
+    }
+
+    /// Parse a constant member of a struct, union or inherent `implement`
+    /// block.  A constant is a module-level item, so a type declared inside
+    /// a function body cannot have one (E0249): the constant is parsed,
+    /// refused and dropped, and null is returned.
+    parse_type_constant(visibility: Visibility, is_async: boolean, modifier_span: SourceSpan,
+                        doc: string) -> DeclarationNode* {
+        if (is_async) {
+            this.report_invalid_at(ErrorCode::E0364_INVALID_ASYNC_MEMBER,
+                "only a method can be `async`; a constant holds a value, not a computation to suspend",
+                modifier_span);
+        }
+        if (this.scope_depth > 0) {
+            this.refuse_member_constant(ErrorCode::E0249_CONSTANT_ON_LOCAL_TYPE,
+                "a type declared inside a function body cannot declare constants; declare the type at module level");
+            return null;
+        }
+        const decl: DeclarationNode* = this.parse_member_constant(visibility);
+        if (decl == null) { return null; }
+        if (doc != "") { decl.set_documentation(doc); }
+        decl.note_modifier_span(modifier_span);
+        return decl;
+    }
+
+    /// Parse a constant written where no constant may be, so that the
+    /// refusal is reported once and the rest of the member is consumed.
+    refuse_member_constant(code: ErrorCode, message: string) -> void {
+        const decl: DeclarationNode* = this.parse_variable_declaration();
+        if (decl != null) { this.report_invalid_at(code, message, decl.name_span); }
     }
 
     /// Parse a static method.  The `static` that selected this path is still
@@ -1641,6 +1714,12 @@ implement struct Parser {
             if (this.check(TokenType::KwType)) {
                 const assoc: AssocTypeDeclNode* = this.parse_assoc_type_decl();
                 if (assoc != null) { tr.assoc_types.push(assoc); }
+                continue;
+            }
+
+            if (this.at_member_constant(0)) {
+                this.refuse_member_constant(ErrorCode::E0245_CONSTANT_IN_TRAIT,
+                    "a trait cannot declare constants");
                 continue;
             }
 
@@ -2247,6 +2326,27 @@ implement struct Parser {
                 continue;
             }
 
+            // A constant, `const NAME ...`, after an optional visibility.
+            const visibility_written: boolean = this.check(TokenType::KwPublic) || this.check(TokenType::KwPrivate);
+            if (this.at_member_constant(if (visibility_written) { 1 } else { 0 })) {
+                mut constant_visibility: Visibility = Visibility::Public;
+                mut constant_modifier_span: SourceSpan = SourceSpan::none();
+                if (visibility_written) {
+                    if (this.check(TokenType::KwPrivate)) { constant_visibility = Visibility::Private; }
+                    constant_modifier_span = this.span_from_token(this.current());
+                    this.advance();
+                }
+                if (node.trait_annotation != null) {
+                    this.refuse_member_constant(ErrorCode::E0246_CONSTANT_IN_TRAIT_IMPLEMENTATION,
+                        "a trait implementation cannot declare constants; a trait declares none for it to supply");
+                    continue;
+                }
+                const constant: DeclarationNode* = this.parse_type_constant(constant_visibility, false,
+                    constant_modifier_span, doc);
+                if (constant != null) { node.constants.push(constant); }
+                continue;
+            }
+
             // Methods in impl blocks. A keyword may name a method (`as<T>()`);
             // `type` bindings are handled above, so any other keyword here is
             // a method name (mirrors keyword-as-member-name after `.`/`::`).
@@ -2501,6 +2601,29 @@ implement struct Parser {
     /// elsewhere - so hoisting lets the declaration index, name resolution, type
     /// resolution and codegen reach them through the paths that already handle
     /// globals, instead of each learning to look inside an extern block.
+    /// List a struct's, union's or inherent `implement` block's constants
+    /// among the module's items, each marked with the declaration that owns
+    /// it: a type's constant is a global like any other, so every pass that
+    /// handles the module's globals handles it, while its `owner` keeps any
+    /// module scope from binding its name.
+    static hoist_type_constants(program: ProgramNode*, node: DeclarationNode*) -> void {
+        if (program == null || node == null) { return; }
+        match (&node.kind) {
+            DeclKind::Struct(s) => { Parser::hoist_owned_constants(program, node, &s.constants); }
+            DeclKind::Union(u)  => { Parser::hoist_owned_constants(program, node, &u.constants); }
+            DeclKind::Impl(b)   => { Parser::hoist_owned_constants(program, node, &b.constants); }
+            _                   => { }
+        }
+    }
+
+    static hoist_owned_constants(program: ProgramNode*, owner: DeclarationNode*,
+                                 constants: &[DeclarationNode*]) -> void {
+        for (mut i: i64 = 0; i < constants.length; i++) {
+            DeclarationNode::var_of(constants[i]).owner = owner;
+            program.add_statement(Node::Decl(constants[i]));
+        }
+    }
+
     static hoist_extern_globals(program: ProgramNode*, node: DeclarationNode*) -> void {
         if (program == null || node == null) { return; }
         const blk: ExternBlock* = DeclarationNode::extern_of(node);

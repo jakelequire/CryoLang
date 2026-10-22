@@ -311,6 +311,7 @@ Data symbols carry no signature. Their forms:
 | Type info                  | `C$ti$` Path                      | `C$ti$6Animal`                |
 | Module initializer         | `C$mi$` Path                      | `C$mi$4Math.6Vector`          |
 | Global / constant          | `C$` Path                         | `Math::PI` -> `C$4Math.2PI`    |
+| A type's constant          | `C$` Path with a `-` member       | `Geom::Point::ORIGIN` -> `C$4Geom.5Point-6ORIGIN`; `i32::MAX` -> `C$3i32-3MAX` |
 | Named-type (LLVM type name)| `C$` Path                         | `Math::Vec2` -> `C$4Math.4Vec2`|
 | Generic-instance label     | `C$` Path-with-leaf-generics      | `Pair<int>` -> `C$4Pair$Li$G`  |
 

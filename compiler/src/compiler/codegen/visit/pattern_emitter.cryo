@@ -40,7 +40,7 @@ import compiler::codegen::llvm_types::{
 };
 import compiler::codegen::util::{ CodegenUtil };
 import compiler::resolver::intern_table::{ InternTable };
-import compiler::resolver::res::{ Res, ResSlot };
+import compiler::resolver::res::{ DefId, Res, ResSlot };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ PointerType, ReferenceType };
 import compiler::types::generic::{ InstantiatedType };
@@ -756,6 +756,10 @@ type struct PatternEmitter {
         match (pat.res.require("pattern_emitter:constant pattern")) {
             Res::Local(s) => { slot = this.cg.values.get(s); }
             Res::Def(d)   => {
+                // A constant whose value folds is compared as that value, as
+                // it is wherever else it is read.
+                const folded: LValue = this.folded_constant_pattern(d, subj_ty);
+                if (folded.is_valid()) { return folded; }
                 slot = this.cg.resolver.resolve_global_of_def(d);
             }
             _ => {}
@@ -766,6 +770,20 @@ type struct PatternEmitter {
             return this.cg.builder.build_load(ty, slot, "pat.const");
         }
         return LValue::null();
+    }
+
+    /// The folded value of the constant `d` at the subject's integer width,
+    /// or null when `d` does not fold or the subject is not an integer.
+    folded_constant_pattern(mut &this, d: DefId, subj_ty: TypeRef) -> LValue {
+        const ty: LType = this.cg.type_mapper.map_type(subj_ty);
+        if (!ty.is_valid() || LType::kind_of(ty.raw) != LTypeKind::Integer) {
+            return LValue::null();
+        }
+        const index: i64 = this.cg.ctx.const_table.index_of(d);
+        if (index < 0) { return LValue::null(); }
+        mut value: i128 = 0;
+        if (!this.cg.decl.const_eval().fold_entry(index, &value)) { return LValue::null(); }
+        return LType::const_int_folded(ty, value);
     }
 
     /// Lower a single scalar literal (char / boolean / integer) to an LLVM

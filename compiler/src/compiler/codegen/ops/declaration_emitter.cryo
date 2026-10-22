@@ -32,12 +32,11 @@ import compiler::types::{
     arena, compound, generic, ownership, type_base, type_ref, TypeKind, user_defined
 };
 import compiler::ast;
-import compiler::ast::{ declaration, LiteralKind, node};
+import compiler::ast::{ declaration, LiteralKind, MemberPin, node};
 import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name, res };
 import compiler::decl_index::{ OverloadId };
 import std::collections::pair;
 import std::collections::pair::{ Pair };
-import std::fmt::float;
 import compiler::ast::expression;
 import compiler::ast::expression::{
     CalleePin,
@@ -56,6 +55,8 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::node::{ Node, ProgramNode };
 import compiler::lex::{ TokenType };
+import compiler::lex::lexer;
+import compiler::lex::lexer::{ Lexer };
 import compiler::codegen::abi::{ AbiAttr, AbiClassifier, ArgClass, ParamPlan, SignaturePlan };
 import compiler::codegen::llvm_types::{
     LBasicBlock, LBuilder, LContext, LLinkage, LModule, LType, LTypeKind, LValue
@@ -1187,13 +1188,17 @@ type struct DeclarationEmitter {
         // exists to keep two modules' same-named globals apart, and there is
         // only ever one `errno`.  `![symbol("...")]` overrides it for a C name
         // that is not a Cryo identifier.
-        const mangled: MangledName = if (node.is_extern_import) {
+        mut mangled: MangledName = if (node.is_extern_import) {
             if (node.link_name.length() > 0) { MangledName::new(node.link_name) }
             else { MangledName::new(this.get_intern().resolve(node.name)) }
         } else {
             MangledName::for_global(
                 this.get_intern(), def_ns, node.name)
         };
+        if (node.owner != null) {
+            mangled = MangledName::for_type_constant(this.get_intern(),
+                this.ctx.defs.path_of(this.ctx.defs.parent_of(node.def)), node.name);
+        }
 
         const ty: LType = this.type_mapper.map_type(node.resolved_type);
         if (!ty.is_valid()) {
@@ -1267,7 +1272,7 @@ type struct DeclarationEmitter {
                 init = LType::const_int(ty, bval, false);
             } else if (lit.literal_kind == LiteralKind::Float
                        && (tk == LTypeKind::Float || tk == LTypeKind::Double)) {
-                const fval: f64 = float::parse_f64(lit.value).unwrap_or(0.0);
+                const fval: f64 = Lexer::float_literal_value(lit.value).unwrap_or(0.0);
                 init = LType::const_real(ty, fval);
             } else if (tk == LTypeKind::Pointer) {
                 init = this.const_pointer(ty, init_expr);
@@ -2231,6 +2236,17 @@ type struct DeclarationEmitter {
                               this.ctx.type_arena);
     }
 
+    /// `ConstEval`'s value for `expr` as a 64-bit two's-complement bit
+    /// pattern.  A value outside `i64::MIN ..= u64::MAX` has no such pattern
+    /// and is not folded here.
+    fold_64_bit_pattern(&this, expr: ExpressionNode*, out: u64*) -> boolean {
+        mut value: i128 = 0;
+        if (!this.const_eval().fold(expr, &value)) { return false; }
+        if (value < i64::MIN as i128 || value > u64::MAX as i128) { return false; }
+        *out = value as u64;
+        return true;
+    }
+
     /// Constant-fold an INTEGER const initializer to its 64-bit two's-complement
     /// bit pattern.  Handles integer/bool literals, unary `-`/`+`/`~`, and the
     /// binary operators that are bit-exact in two's complement regardless of
@@ -2282,12 +2298,7 @@ type struct DeclarationEmitter {
                 // module-qualified CONSTANT (`limits::MAX_PATH`) - a different
                 // referent, answered by the constant table rather than by a
                 // variant tag.
-                mut qv: i64 = 0;
-                if (this.const_eval().fold(expr, &qv)) {
-                    *out = qv as u64;
-                    return true;
-                }
-                return false;
+                return this.fold_64_bit_pattern(expr, out);
             }
             const et: EnumType* = real_t.as_enum();
             const variant: EnumVariantInfo* = CodegenUtil::pinned_variant(et, sr.resolved_member);
@@ -2316,10 +2327,7 @@ type struct DeclarationEmitter {
         if (ExpressionNode::identifier_of(node) != null
             || ExpressionNode::sizeof_of(node) != null
             || ExpressionNode::alignof_of(node) != null) {
-            mut nv: i64 = 0;
-            if (!this.const_eval().fold(expr, &nv)) { return false; }
-            *out = nv as u64;
-            return true;
+            return this.fold_64_bit_pattern(expr, out);
         }
         const u: UnaryExpr* = ExpressionNode::unary_of(node);
         if (u != null) {
@@ -2335,14 +2343,12 @@ type struct DeclarationEmitter {
             const op: TokenType = b.op.kind;
             // `/ % >>` read their operands as NUMBERS, so their result depends
             // on a signedness a u64 bit pattern has already discarded.  They
-            // are computed by the folder that works in signed i64 rather than
-            // approximated here; each operator therefore has exactly one
-            // evaluator, and none is left to the zeroinitializer.
+            // are computed by the folder, which holds every 64-bit value as
+            // the number it is, rather than approximated here; each operator
+            // therefore has exactly one evaluator, and none is left to the
+            // zeroinitializer.
             if (op == TokenType::Slash || op == TokenType::Percent || op == TokenType::GreaterGreater) {
-                mut sv: i64 = 0;
-                if (!this.const_eval().fold(expr, &sv)) { return false; }
-                *out = sv as u64;
-                return true;
+                return this.fold_64_bit_pattern(expr, out);
             }
             mut x: u64 = 0;
             mut y: u64 = 0;
@@ -2361,14 +2367,16 @@ type struct DeclarationEmitter {
     }
 
     /// Build a constant struct aggregate for a module-level struct-literal const
-    /// initializer (`const RAYWHITE: Color = Color { r: 245, ... }`, the shape
-    /// the bindgen importer lowers a C compound-literal macro to).  The importer
-    /// emits the field initializers in struct DECLARATION order, so a positional
-    /// zip against the LLVM struct's element types is exact.  Every field init
-    /// must fold to a constant (`const_element`: a number, a `null` or string
-    /// literal, a nested array or struct literal); any non-constant field, or a field-count mismatch (an unexpected shape),
-    /// returns an invalid value so the caller declines to the zeroinitializer
-    /// fallback - correct-or-decline, never a silently wrong layout.
+    /// initializer (`const RAYWHITE: Color = Color { r: 245, ... }`).  Each
+    /// field initializer is placed at the field sema pinned on it, never at
+    /// its position in the literal: a literal may name its fields in any
+    /// order, and placing `Point { y: 2, x: 1 }` by position stores each value
+    /// in the other field.  Every field init must fold to a constant
+    /// (`const_element`: a number, a `null` or string literal, a nested array
+    /// or struct literal); any non-constant or unpinned field, or a
+    /// field-count mismatch (an unexpected shape), returns an invalid value so
+    /// the caller declines to the zeroinitializer fallback - correct-or-decline,
+    /// never a silently wrong layout.
     /// `layout` is the Cryo type whose field list `sl` initializes, so a field
     /// can be placed at the element that actually holds it: a body may carry
     /// alignment padding elements the field list has no member for.  Padding
@@ -2381,9 +2389,8 @@ type struct DeclarationEmitter {
         if (sl == null) { return LValue::null(); }
         const n: u32 = llvm::LLVMCountStructElementTypes(ty.raw);
         if (n == 0 || mapper == null || layout == null) { return LValue::null(); }
-        // Every field initialized, in declaration order - the shape the
-        // importer emits.  A partial literal still declines: filling only some
-        // fields here would silently define the rest as zero.
+        // Every field initialized.  A partial literal declines: filling only
+        // some fields here would silently define the rest as zero.
         mut field_count: i64 = -1;
         if (layout.kind == TypeKind::Struct) { field_count = layout.as_struct().fields.length; }
         if (field_count < 0 || sl.field_inits.length != field_count) { return LValue::null(); }
@@ -2399,7 +2406,13 @@ type struct DeclarationEmitter {
             slots[z as i64] = zval.raw;
         }
         for (mut i: u32 = 0; ok && i < sl.field_inits.length as u32; i++) {
-            const elem: i64 = mapper.field_element_index(layout, i as i64);
+            mut field: i64 = -1;
+            match (sl.field_inits[i as i64].pin) {
+                MemberPin::Field(index) => { if (index < field_count) { field = index; } }
+                _                       => { }
+            }
+            if (field < 0) { ok = false; break; }
+            const elem: i64 = mapper.field_element_index(layout, field);
             if (elem < 0 || elem as u32 >= n) { ok = false; break; }
             const fty_raw: void* = llvm::LLVMStructGetTypeAtIndex(ty.raw, elem as u32);
             const fty: LType = LType { raw: fty_raw };

@@ -162,6 +162,12 @@ const b: u8 = 200 + 100;   // error: 300 does not fit `u8`, and would silently t
 const c: i8 = 0 - 128;     // -128: held
 ```
 
+A literal an integer is compared with, or combined with by an operator, takes the integer's type the same way, so `x != 127` and `x != -128` with `x: i8` are both comparisons of two `i8`s. A negated literal takes the type of a signed operand only: beside an unsigned one, `-1` keeps its default type rather than becoming a huge unsigned value.
+
+A shift's amount does not type the value shifted: a literal shifted by an amount not made only of literals takes the integer type expected of the result, where one is - an initializer's, an assignment's, an argument's or a return's - so `const p: u64 = 1 << (u64::BITS - 1);` shifts at 64 bits, not at the `u32` amount's 32.  An amount narrower than the shifted value widens to its type silently: the amount's type never changes the result, so it draws no `W0005`. A shifted value narrower than its amount still widens with `W0005`, since that conversion does change the result's type.  Where no integer type is expected, the literal takes the amount's type.
+
+An integer literal stored where a `char` is takes `char`, and must be at most `0x10FFFF`, the largest Unicode scalar value: `const c: char = 0x110000;` is refused (`E0010`).
+
 > **Trap.** Integer literals exceeding `i64::MAX` (e.g. `0xFFFF_FFFF_FFFF_FFFF`) wrap to negative when used inline against a `u64` operand. Hoist the literal into a `const u64 NAME = ...` binding to compare correctly.
 
 #### String and Character Literals
@@ -189,7 +195,7 @@ Strings are enclosed in double quotes; characters in single quotes. Both share t
 
 An octal escape is one to three digits `0`-`7`, read as C reads them: the escape ends after three digits or at the first character that is not one, so `\0` is NUL, `"\033[1m"` is ESC and then `[1m`, `\177` is 127, and `"\0123"` is `\012` (newline) and then `3`. `\8` and `\9`, and an octal value above `\377`, are refused (`E0013`).
 
-In a string, `\u{...}` is the code point's UTF-8 bytes, so `"\u{e9}"` is the two bytes `C3 A9`; in a character it is the code point itself, so `'\u{42}'` is `'B'`. What a `char` holds for a code point above 255 depends on `char`'s width, which is not yet decided. A malformed `\u` (no braces, no digit, or past `10FFFF`), a `\x` with no hex digit, and an escape this table does not name (`\q`) are kept as written in a string; in a character, an escape the table does not name is the character after the backslash.
+In a string, `\u{...}` is the code point's UTF-8 bytes, so `"\u{e9}"` is the two bytes `C3 A9`; in a character it is the code point itself, so `'\u{42}'` is `'B'`. A `char` is 32 bits wide, so it holds every code point up to `10FFFF`: `'\u{1F600}'` is the code point U+1F600. A malformed `\u` (no braces, no digit, or past `10FFFF`), a `\x` with no hex digit, and an escape this table does not name (`\q`) are kept as written in a string; in a character, an escape the table does not name is the character after the backslash.
 
 A string literal keeps every byte it spells, a NUL among them: the constant the compiler emits for `"a\0b"` is `a`, NUL, `b` and the terminating NUL. A `string` is read up to its first NUL by what measures it, so `"a\0b".length()` is 1 while the bytes after the NUL are still there to be read through a pointer.
 
@@ -288,7 +294,7 @@ Every value in Cryo has a known type at compile time. A binding's type is either
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------ |
 | `void`                        | No value; only valid as a return type.                                                                                                           | 0                        |
 | `boolean`                     | `true` / `false`. Not interchangeable with integers.                                                                                             | 1 byte                   |
-| `char`                        | 8-bit character (byte).                                                                                                                          | 1 byte                   |
+| `char`                        | 32-bit unsigned Unicode scalar value, `'\0'` to `'\u{10FFFF}'`.                                                                                  | 4 bytes                  |
 | `string`                      | NUL-terminated raw string (`u8*`). FFI-shaped.                                                                                                   | pointer                  |
 | `int`                         | Default signed integer; alias for `i32`.                                                                                                         | 4 bytes                  |
 | `i8` `i16` `i32` `i64` `i128` | Signed integers of fixed width.                                                                                                                  | 1 / 2 / 4 / 8 / 16 bytes |
@@ -357,6 +363,8 @@ An array literal written where an `Array<T>` with the default allocator is expec
 An array's `length` and `capacity`, read as fields or through `length()` and `capacity()`, are `i64`.  `Array`'s methods take an index or an element count as a `u64`.
 
 The `N` in `[T; N]` is a **compile-time integer**: an integer literal, a named `const` (declared in this module or another, written bare or qualified), an enum variant, a cast between integer types, or arithmetic, comparison, logical, and bitwise operators over those. The repeat expression `[value; N]` accepts exactly the same set and yields `[T; N]`, so a field and the initializer that fills it can share one name for their length; a count that is *not* a compile-time integer is legal there and yields a dynamic `[T]` sized at run time. A size that is neither is E0239. `value` is evaluated once and the same bits are stored in every slot, so its type must be a plain-copy type (one that satisfies `Copy`); an element that releases what it owns would be released once per slot, and is refused (E0453).
+
+A compile-time integer is computed exactly, as a number from `i128::MIN` to `i128::MAX`: every value of every integer type of 64 bits or fewer, and of `i128`, is one, so `0xFFFF_FFFF_FFFF_FFFF >> 60` is `15`. A `u128` value above `i128::MAX`, a step whose result leaves that range, and a division by zero are not compile-time integers. A cast to an integer type wraps the value to that type as the running program does, so `-1 as u64` is `0xFFFF_FFFF_FFFF_FFFF`. An array's length is at most `i64::MAX`; a larger size is refused (E0010).
 
 ```cryo
 const CAPACITY: i64 = 512;
@@ -752,7 +760,7 @@ mut it         = arr.iter();   // inferred: the concrete iterator type
 mut y: int;                     // declared without an initialiser; assigned later
 ```
 
-**Globals.** Module-level `const` declares an immutable global; module-level `mut` declares mutable global state. Use the latter sparingly. An initializer that is a constant expression is folded into the program: a number, a `null` or string literal, an array literal of those, and a struct literal writing every field with one of those; array and struct literals nest in each other. Any other - a call, another global's value - is computed once, before `main` runs, a module's globals after those of the modules it imports, in the order they are declared. A `![thread_local]` global gets its folded initializer in every thread's copy, so its initializer must fold: one that would be computed would reach the main thread's copy only, and is refused (`E0646`).
+**Globals.** Module-level `const` declares an immutable global; module-level `mut` declares mutable global state. Use the latter sparingly. An initializer that is a constant expression is folded into the program: a number, a `null` or string literal, an array literal of those, and a struct literal writing every field with one of those; array and struct literals nest in each other. Any other - a call, another global's value - is computed once, before `main` runs, a module's globals after those of the modules it imports, in the order they are declared. A folded integer constant's value is its initializer's wrapped to the declared type, the value the program reads at run time: with `const B: u8 = 100;`, `const A: u8 = B + 200;` is 44 wherever it is used - an array size, a `static_assert`, another constant's initializer - never 300. Read as a value, an integer of any width, boolean, `char` or float constant whose initializer folds is compiled as that value itself rather than as a read of its global; the global remains, and `&NAME` is its address. A `![thread_local]` global gets its folded initializer in every thread's copy, so its initializer must fold: one that would be computed would reach the main thread's copy only, and is refused (`E0646`).
 
 ```cryo
 const VERSION:    string = "1.0.0";
@@ -1700,6 +1708,52 @@ const e: Either<i64, f64> = Either::<i64, f64> { a: 100 };
 
 **Ownership.** A union's members are never auto-dropped, since the active member is unknown. If a union owns a resource, implement `Drop` for it (`implement trait Drop for Handle { drop(mut &this) -> void { ... } }`); an inherent method merely named `drop` is not a destructor ([section 15.2](#152-the-drop-trait)).
 
+### 8.8 Constants
+
+A type may declare named constants, reached through the type with `::`. A struct or union writes them in its body, beside its fields and methods, or in an `implement struct` (or `implement union`) block:
+
+```cryo
+type struct Point {
+    x: i32;
+    y: i32;
+
+    const ORIGIN: Point = Point { x: 0, y: 0 };
+    const DIMENSIONS: i32 = 2;
+
+    static new(x: i32, y: i32) -> Point { return Point { x: x, y: y }; }
+}
+
+implement struct Point {
+    const UNIT: Point = Point { x: 1, y: 1 };
+}
+
+const o: Point = Point::ORIGIN;
+mut coordinates: [f64; Point::DIMENSIONS] = [0.0, 0.0];
+```
+
+An enum's constants go in an `implement enum` block, since its body holds only variants, and a primitive's in an `implement` block on the primitive ([section 12.3](#123-implement-blocks-on-primitives)):
+
+```cryo
+type enum Level { Quiet; Normal; Loud; }
+
+implement enum Level {
+    const DEFAULT: Level = Level::Normal;
+}
+```
+
+**What a constant is.** A type's constant follows the rules of a module-level constant ([section 3](#3-variables-and-constants)): its initializer is folded into the program when it is a constant expression, and otherwise computed once, before `main`; its type annotation may be left to the initializer. It is one global with an address, so `&Point::ORIGIN` is a pointer to it. An integer constant folds wherever a compile-time integer is wanted, so it may size an array. A constant is reached through an alias of its type as through the type (`Int::ANSWER` with `type Int = i32;`), as an array length too.
+
+**Names.** Inside the type, in its methods and in its constants' initializers, `This::ORIGIN` names the constant as `Point::ORIGIN` does. A constant is reached only through its type: `p.ORIGIN` on a value `p` is refused (`E0204`), with a help line giving `Point::ORIGIN`. A module-level constant of the same name is a different constant. A constant shares its name with no other member of its type - another constant, a field, a method in any `implement` block, or an enum variant (`E0205`).
+
+**Visibility.** A constant is public by default; `private` (inline, or a `private:` block) confines it to the module that declares it, and reading it from another module is refused (`E0353`).
+
+**Where a constant may not be written.**
+
+- A constant is written with a value: `const EMPTY: Gauge;` is refused (`E0248`).
+- A trait declares no constants (`E0245`), and a trait implementation therefore supplies none (`E0246`).
+- A generic type declares no constants, in its body or in a generic `implement` block (`E0247`).
+- A type declared inside a function body declares no constants (`E0249`); declare the type at module level.
+
 ---
 
 ## 9. Enums
@@ -1771,7 +1825,7 @@ A variant constructs one instantiation, and something must say which: type argum
 
 ### 9.4 Methods on Enums
 
-Enums cannot declare methods inline. Methods are added via an `implement` block, which is also how the standard library gives `Option` and `Result` their rich API:
+Enums cannot declare methods inline. Methods are added via an `implement` block, which is also how the standard library gives `Option` and `Result` their rich API, and where an enum's constants are declared ([section 8.8](#88-constants)):
 
 ```cryo
 implement enum Option<T> {
@@ -2576,7 +2630,25 @@ implement boolean {
 
 After the block is loaded, `my_bool.to_i32()` resolves like any other method call. Resolution is at compile time; no dynamic dispatch.
 
-A primitive owns methods and nothing else: no type declares constants, so `i32::MAX` names no value and is refused (E0201), through an alias of the primitive too. An integer type's bounds are its static methods, `i32::max_value()` and `i32::min_value()`.
+An `implement` block on a primitive may declare constants as well, which are reached through the primitive and through an alias of it ([section 8.8](#88-constants)):
+
+```cryo
+implement i32 {
+    const ANSWER: i32 = 42;
+}
+
+const a: i32 = i32::ANSWER;
+```
+
+A path naming a constant the primitive does not declare names no value and is refused (`E0201`), through an alias of the primitive too. The standard library declares the primitives' limits this way:
+
+| type | constants |
+|---|---|
+| every integer type, `i8` to `i128`, `u8` to `u128`, `isize`, `usize` | `MIN`, `MAX`, and `BITS: u32`, the width in bits |
+| `char` | `MIN` (`'\0'`), `MAX` (`'\u{10FFFF}'`), and `BITS: u32` (32) |
+| `f32`, `f64` | `EPSILON`, `MAX`, `MIN` (the most-negative finite value), `MIN_POSITIVE` (the smallest positive normal value), `INFINITY`, `NEG_INFINITY`, `NAN` |
+
+`boolean` declares none. An integer limit is a compile-time integer, so `[u8; u64::MAX >> 61]` is an array of 7 and `static_assert(i32::MAX == 2147483647)` holds.
 
 ### 12.4 Which Method a Call Names
 
@@ -3937,7 +4009,7 @@ The prelude is deliberately small. Anything else is an explicit `import` - notab
 | **`fs`**          | `Path` (borrowed) and `PathBuf` (owned). `OpenOptions` builder, `File` (`Read + Write`), convenience `read(path)` / `write(path, bytes)` / `read_to_string(path)` / `copy(from, to)`. Whole-path operations: `remove_file`, `rename`, `create_dir` / `create_dir_all`, `remove_dir` / `remove_dir_all`, `read_dir` (a `ReadDir` iterator of `DirEntry`), `canonicalize`. Metadata: `metadata` / `symlink_metadata` (typed `Metadata` via `stat` / `lstat`), `exists`, `is_file`, `is_dir`. `O_*` and `SEEK_*` constants.                                                                                                                                                                                                                                                                                                                                               |
 | **`ffi`**         | The C ABI boundary. `libc` is the single home for every `extern "C"` the stdlib needs (POSIX I/O, sockets, math) and the named POSIX constants. `cstr` provides `CStr` (borrowed) and `CString` (owned), with a `NulError` for interior-NUL conversion failures.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | **`env`**         | `args() -> Array<String>`, `var(name) -> Option<String>`, `set_var`, `remove_var`, `process_exit(code: i32) -> void`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| **`math`**        | `f64` functions: `cbrt`, `pow`, `powi`, `hypot`, `mul_add`, `exp` / `exp2` / `expm1`, `ln`, `log` / `log2` / `log10` / `log1p`, `sin` / `cos` / `tan` (plus the `a*` inverses, `atan2`, and the `*h` hyperbolics), `floor`, `ceil`, `round`, `trunc`, `fract`, `copysign`, `fmod`, `signum`, classification (`is_nan`, `is_finite`, `classify`, ...), integer `gcd` / `lcm` / `is_power_of_two`, generic `min` / `max` (`where T: Ord`), and constants (`PI`, `TAU`, `E`, `F64_EPSILON`, ...). `sqrt`, `abs`, `checked_abs` and `clamp` are **methods of each numeric primitive** in `core::primitives`, not `math` functions: `(16.0).sqrt()`, `(-5 as i32).abs()`, `x.clamp(lo, hi)`. A float's `abs` clears the sign bit; there is no `fabs`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| **`math`**        | `f64` functions: `cbrt`, `pow`, `powi`, `hypot`, `mul_add`, `exp` / `exp2` / `expm1`, `ln`, `log` / `log2` / `log10` / `log1p`, `sin` / `cos` / `tan` (plus the `a*` inverses, `atan2`, and the `*h` hyperbolics), `floor`, `ceil`, `round`, `trunc`, `fract`, `copysign`, `fmod`, `signum`, classification (`is_nan`, `is_finite`, `classify`, ...), integer `gcd` / `lcm` / `is_power_of_two`, generic `min` / `max` (`where T: Ord`), and the mathematical constants (`PI`, `TAU`, `E`, `SQRT_2`, ...); the float types' limits are constants of the types (`f64::EPSILON`, `f64::INFINITY`, [section 12.3](#123-implement-blocks-on-primitives)). `sqrt`, `abs`, `checked_abs` and `clamp` are **methods of each numeric primitive** in `core::primitives`, not `math` functions: `(16.0).sqrt()`, `(-5 as i32).abs()`, `x.clamp(lo, hi)`. A float's `abs` clears the sign bit; there is no `fabs`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | **`time`**        | `Duration` (normalized seconds + sub-second nanoseconds; `from_secs`/`from_millis`/`from_micros`/`from_nanos`, `as_secs`/`as_millis`/`as_micros`/`as_nanos`/`subsec_*`, `add`/`saturating_sub`/`is_zero`, `Eq` + `Ord`). `Instant` (monotonic `CLOCK_MONOTONIC`; `now`, `elapsed`, `duration_since`). `SystemTime` (wall `CLOCK_REALTIME`; `now`, `unix_epoch`, `duration_since_epoch`, `duration_since`). `sleep(Duration)` (EINTR-restarting). All clock differences saturate at zero.                                                                                                                                                                                                                                                                                                                                                                               |
 | **`random`**      | `Rng`, a fast non-cryptographic xoshiro256** generator seeded via `from_seed(u64)` (reproducible) or `from_os()`: `next_u64`/`next_u32`/`next_bool`/`next_f64`, unbiased `below(bound)` / `range_u64(lo, hi)` (rejection-sampled), `fill_bytes`. `secure_bytes(buf, len)` fills from the kernel CSPRNG (`getrandom`); use it for keys/tokens/nonces - `Rng` is not cryptographic.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | **`net`**         | `IpV4Addr`, `IpV6Addr`, `IpAddr`, `SocketAddr`, `TcpStream` (`AsyncTransport`), `TcpListener`. **Every operation that can wait is a future** driven by an `Executor` — there is no blocking socket surface. **HTTP/1.1 layer (`net::http`):** `Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, `HttpServer` with keep-alive + `Connection: close` opt-out + per-connection read timeouts, `Client::get`/`post` with `send(addr, req)`. **TLS** (`net::tls`, OpenSSL-backed `TlsStream`), **UDP** (`UdpSocket`, datagram send/receive futures), **DNS** (`net::dns`; `Resolve` runs `getaddrinfo` on the executor's blocking pool rather than stalling a worker), **HTTP/2** (`net::http2`, HPACK + single-stream framing), and **WebSocket** (`net::ws`, RFC 6455) all ship in 1.0. IPv6 addressing is parsed and represented but not yet dialable. |

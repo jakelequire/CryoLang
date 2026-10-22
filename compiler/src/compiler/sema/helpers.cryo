@@ -5,11 +5,9 @@
 /// small AST/type probes.  None hold visitor state; they take only their
 /// operands (an `ExpressionNode*`, a text lexeme, or a `TypeArena*`).
 ///
-/// The `SEMA_*` maxima are hoisted into typed `u64` consts (kept private to this
-/// module) so they adopt `u64` rather than wrapping negative when compared
-/// inline under the bootstrap compiler.  Callers that need the width bounds go
-/// through `sema_int_unsigned_bound` / `sema_default_int_type` so the
-/// width->magnitude mapping lives in exactly one place.
+/// Callers that need the width bounds go through `sema_int_unsigned_bound` /
+/// `sema_default_int_type` so the width->magnitude mapping lives in exactly one
+/// place.
 
 namespace compiler::sema::helpers;
 
@@ -38,29 +36,15 @@ import compiler::types::compound;
 import utils::keyword::{ Keyword };
 
 
-// -- Numeric maxima (private; reached via the accessors below) --
-
-/// u64 max (2^64-1).
-const SEMA_U64_MAX: u64 = 18446744073709551615;
-/// i32 / i64 positive maxima.
-const SEMA_I32_MAX_MAG: u64 = 2147483647;
-const SEMA_I64_MAX_MAG: u64 = 9223372036854775807;
-
-/// Unsigned magnitude bound for an N-bit integer width: 8/16/32/64 ->
-/// 255/65535/4294967295/u64max.  Returns 0 for unsupported widths (128-bit
-/// bounds exceed u64, left unchecked by the width-bound callers).
+/// The unsigned maximum of an N-bit integer width, `u8::MAX` to `u64::MAX`.
+/// Returns 0 for unsupported widths (128-bit bounds exceed u64, left
+/// unchecked by the width-bound callers).
 public function sema_int_unsigned_bound(width: u64) -> u64 {
-    if (width == 8)  { return 255; }
-    if (width == 16) { return 65535; }
-    if (width == 32) { return 4294967295; }
-    if (width == 64) { return SEMA_U64_MAX; }
+    if (width == 8)  { return u8::MAX as u64; }
+    if (width == 16) { return u16::MAX as u64; }
+    if (width == 32) { return u32::MAX as u64; }
+    if (width == 64) { return u64::MAX; }
     return 0;
-}
-
-/// i32 positive-magnitude bound (2^31-1), for the "force-wide constant fold"
-/// gate in resolve_binary (a folded constant exceeding this needs i64).
-public function sema_i32_max_mag() -> u64 {
-    return SEMA_I32_MAX_MAG;
 }
 
 /// The default integer type for a literal of magnitude `value` when no expected
@@ -69,8 +53,8 @@ public function sema_i32_max_mag() -> u64 {
 /// wide bare literal (e.g. an i64::MIN magnitude at a variadic boundary) from
 /// silently truncating to its low 32 bits.
 public function sema_default_int_type(arena: TypeArena*, value: string) -> TypeRef {
-    if (!int_literal_exceeds(value, SEMA_I32_MAX_MAG)) { return arena.get_i32(); }
-    if (!int_literal_exceeds(value, SEMA_I64_MAX_MAG)) { return arena.get_i64(); }
+    if (!int_literal_exceeds(value, i32::MAX as u64)) { return arena.get_i32(); }
+    if (!int_literal_exceeds(value, i64::MAX as u64)) { return arena.get_i64(); }
     return arena.get_u64();
 }
 
@@ -234,6 +218,18 @@ public function is_negative_numeric_literal_expr(expr: ExpressionNode*) -> boole
     return is_numeric_literal_expr(u.operand);
 }
 
+/// True when `expr` is a shift (`<<`, `>>`) whose left operand is a constant
+/// numeric expression.  Such a shift computes at the width the left operand
+/// is given, so it needs the surrounding expected type pushed onto it, or the
+/// constant adopts the amount's type and shifts at the amount's width.
+public function is_shift_of_constant_numeric_expr(expr: ExpressionNode*) -> boolean {
+    if (expr == null) { return false; }
+    const b: BinaryExpr* = ExpressionNode::binary_of(expr);
+    if (b == null) { return false; }
+    if (b.op.kind != TokenType::LessLess && b.op.kind != TokenType::GreaterGreater) { return false; }
+    return is_constant_numeric_expr(b.left);
+}
+
 /// True when `expr` is an integer literal whose value denotes zero in any radix,
 /// ignoring digit separators: `0`, `0x0`, `0b0`, `00`, `0_0`, ...
 public function is_zero_int_literal(expr: ExpressionNode*) -> boolean {
@@ -310,7 +306,7 @@ public function int_literal_exceeds(s_text: string, max_mag: u64) -> boolean {
         saw_digit = true;
         // Overflow-checked acc = acc*radix + d.  Past u64 it can only be larger
         // than any in-range bound, so report "exceeds".
-        if (acc > (SEMA_U64_MAX - d) / radix) { return true; }
+        if (acc > (u64::MAX - d) / radix) { return true; }
         acc = acc * radix + d;
         i = i + 1;
     }
@@ -318,16 +314,16 @@ public function int_literal_exceeds(s_text: string, max_mag: u64) -> boolean {
     return acc > max_mag;
 }
 
-/// Fold a compile-time-constant integer expression to its i64 value, for width
+/// Fold a compile-time-constant integer expression to its value, for width
 /// selection only (the actual computation is left to codegen at the chosen
 /// width).  Returns false - leaving the caller's width unchanged - for anything
-/// non-constant, and for any step that would overflow i64 or divide by a
-/// constant zero.
+/// non-constant, and for any step that would leave the `i128` range or divide
+/// by a constant zero.
 ///
 /// Literal arithmetic only: width selection runs before array sizes are folded
 /// and has no constant table to resolve a named constant against, so an
 /// identifier reads as non-constant here.
-public function try_fold_const_i64(expr: ExpressionNode*, out: i64*) -> boolean {
+public function try_fold_const_integer(expr: ExpressionNode*, out: i128*) -> boolean {
     const ev: ConstEval = ConstEval::literals_only();
     return ev.fold(expr, out);
 }

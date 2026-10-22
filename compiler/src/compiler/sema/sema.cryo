@@ -33,7 +33,7 @@ import compiler::ast;
 import compiler::ast::{
     cloner, declaration, expression, GenericAnnotation, ImplTraitAnnotation, LiteralKind,
     MemberPin, NamedAnnotation, node, node_locator, ObjectForm, pattern, PatternBinding, PatternElement,
-    statement, TraitRef, TypeAnnotation
+    statement, TraitRef, TypeAnnotation, Visibility
 };
 import compiler::passes::pass_id;
 import compiler::passes::pass_id::{ PassResult, Provision };
@@ -50,7 +50,7 @@ import compiler::types::{
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, mangled_name, resolver };
 import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, FamilyOwner, Res, ResSlot };
-import compiler::decl_index::{ DeclarationIndex, OverloadId };
+import compiler::decl_index::{ DeclarationIndex, GlobalEntry, OverloadId };
 import compiler::sema::{
     state, helpers, scope_manager, type_utils, literal_resolver, diagnostics,
     symbolic_checker, method_binding, pattern_resolver,
@@ -105,8 +105,8 @@ import compiler::sema::async_lower::{ AsyncLower, AsyncOwner };
 import compiler::sema::call_resolver::{ CallResolver };
 import compiler::sema::diagnostics::{ Diagnostics };
 import compiler::sema::helpers::{
-    is_constant_numeric_expr, is_narrow_float_type, is_numeric_literal_expr,
-    is_wide_int_type, is_zero_int_literal, sema_i32_max_mag, try_fold_const_i64
+    is_constant_numeric_expr, is_narrow_float_type, is_negative_numeric_literal_expr,
+    is_numeric_literal_expr, is_wide_int_type, is_zero_int_literal, try_fold_const_integer
 };
 import compiler::sema::lambda_synth::{ LambdaSynth };
 import compiler::sema::literal_resolver::{ LiteralResolver };
@@ -1209,8 +1209,33 @@ type struct SemaVisitor {
     /// a local; the statement form and the for-loop form own those.
     visit_var(mut &this, decl: DeclarationNode*, node: VarDecl*) -> void {
         if (node == null || !node.is_global) { return; }
+        if (node.owner != null) { this.refuse_constant_member_clash(decl, node); }
         if (this.typed_before_bodies(node)) { return; }
         this.check_var_decl(decl, node);
+    }
+
+    /// A type's constant shares its name with no other member of the type -
+    /// a field, a method (static or not, in any `implement` block) or an
+    /// enum variant - so `T::NAME` and a member reached any other way never
+    /// name two things (E0205).  Run once every `implement` block's methods
+    /// are registered, which the name layer's walk of the constant precedes.
+    refuse_constant_member_clash(mut &this, decl: DeclarationNode*, node: VarDecl*) -> void {
+        const owner: TypeRef = this.ctx.decl_index.type_of_def(this.ctx.defs.parent_of(node.def));
+        const t: Type* = this.arena.lookup(owner);
+        if (t == null) { return; }
+        mut clash: string = "";
+        if (t.kind == TypeKind::Struct && t.as_struct().field_position(node.name) >= 0) {
+            clash = "a field";
+        } else if (t.kind == TypeKind::Enum && t.as_enum().variant_index(node.name) >= 0) {
+            clash = "a variant";
+        } else if (this.calls.owner_declares_member(owner, node.name)) {
+            clash = "a method";
+        }
+        if (clash == "") { return; }
+        this.ctx.emit_error_at(ErrorCode::E0205_REDEFINED_SYMBOL,
+            fmt::format("the constant `%s` has the name of %s of `%s`; a type's constants and other members need distinct names",
+                this.intern.resolve(node.name), clash, this.arena.format_display(t)),
+            decl.name_span);
     }
 
     /// Whether `node` is a module-level variable with no written type and an
@@ -2491,12 +2516,26 @@ type struct SemaVisitor {
 
         mut force_wide: TypeRef = TypeRef::invalid();
         if (!this.literals.expected_type_is_int_type()) {
-            mut folded: i64 = 0;
-            if (try_fold_const_i64(e, &folded)) {
-                const mag: u64 = if (folded < 0) { (0 - folded) as u64 } else { folded as u64 };
-                if (mag > sema_i32_max_mag()) { force_wide = this.arena.get_i64(); }
+            // The narrowest of i64 and u64 that holds the value, as for a
+            // single literal; a value neither holds keeps its literals' widths.
+            mut folded: i128 = 0;
+            if (try_fold_const_integer(e, &folded)) {
+                if (folded >= i64::MIN as i128 && folded <= i64::MAX as i128) {
+                    const mag: i128 = if (folded < 0) { 0 - folded } else { folded };
+                    if (mag > i32::MAX as i128) { force_wide = this.arena.get_i64(); }
+                } else if (folded > 0 && folded <= u64::MAX as i128) {
+                    force_wide = this.arena.get_u64();
+                }
             }
         }
+        // A shift's result has its left operand's width, and the amount says
+        // nothing about that width, so a constant shifted there takes the
+        // integer type the result is expected to have instead of adopting the
+        // amount's: `1 << (u64::BITS - 1)` stored into a `u64` shifts at 64
+        // bits, where adopting the `u32` amount shifted at 32.
+        const shift_keeps_expected: boolean =
+            (bin.op.kind == TokenType::LessLess || bin.op.kind == TokenType::GreaterGreater)
+            && this.literals.expected_type_is_int_type();
         if (force_wide.is_valid()) {
             const saved_fw: TypeRef = this.state.expected_type;
             this.state.expected_type = force_wide;
@@ -2515,7 +2554,7 @@ type struct SemaVisitor {
             }
         } else if (left_is_lit && !right_is_lit) {
             rhs = this.resolve_expr(bin.right);
-            if (rhs.is_valid()) {
+            if (rhs.is_valid() && !shift_keeps_expected) {
                 const saved_exp: TypeRef = this.state.expected_type;
                 this.state.expected_type = rhs;
                 lhs = this.resolve_expr(bin.left);
@@ -2530,12 +2569,16 @@ type struct SemaVisitor {
         // which fails module verification with no source location.  A WIDE int:
         // `value < -128` against an `i64` otherwise computes the constant at
         // the i32 default and then widens it, which is a conversion the source
-        // never asked for.  Narrow int peers are excluded on purpose - pushing
-        // one onto `1 << 20` would truncate a constant that currently computes
-        // at the i32 default and is then widened correctly.
+        // never asked for.  A SIGNED peer of a negated literal: `x != -128` with
+        // `x: i8` is a literal of `x`'s type, as `x != 127` is, and an unsigned
+        // peer is left out so that `-1` cannot adopt it and turn huge.  Other
+        // narrow int peers are excluded on purpose - pushing one onto `1 << 20`
+        // would truncate a constant that currently computes at the i32 default
+        // and is then widened correctly.
         } else if (right_is_const_num && !left_is_const_num) {
             lhs = this.resolve_expr(bin.left);
-            if (is_narrow_float_type(this.arena, lhs) || is_wide_int_type(this.arena, lhs)) {
+            if (is_narrow_float_type(this.arena, lhs) || is_wide_int_type(this.arena, lhs)
+                || (is_negative_numeric_literal_expr(bin.right) && this.literals.is_signed_int_type(lhs))) {
                 const saved_exp: TypeRef = this.state.expected_type;
                 this.state.expected_type = lhs;
                 rhs = this.resolve_expr(bin.right);
@@ -2545,7 +2588,9 @@ type struct SemaVisitor {
             }
         } else if (left_is_const_num && !right_is_const_num) {
             rhs = this.resolve_expr(bin.right);
-            if (is_narrow_float_type(this.arena, rhs) || is_wide_int_type(this.arena, rhs)) {
+            if (!shift_keeps_expected
+                && (is_narrow_float_type(this.arena, rhs) || is_wide_int_type(this.arena, rhs)
+                    || (is_negative_numeric_literal_expr(bin.left) && this.literals.is_signed_int_type(rhs)))) {
                 const saved_exp: TypeRef = this.state.expected_type;
                 this.state.expected_type = rhs;
                 lhs = this.resolve_expr(bin.left);
@@ -2584,8 +2629,14 @@ type struct SemaVisitor {
             }
             const result: TypeCheckResult = this.checker.check_binary_op(bin.op.kind, lhs, rhs);
             const map: OperatorTraitMap = OperatorTraitMap::for_binary(bin.op.kind);
+            // A shift's amount widening to the shifted value's type changes no
+            // value - its type never reaches the result - so only the shifted
+            // value widening, to a wider amount, is a conversion to report.
+            const amount_widens_only: boolean =
+                (bin.op.kind == TokenType::LessLess || bin.op.kind == TokenType::GreaterGreater)
+                && result.result_type.equals(lhs);
             if (result.success) {
-                this.warn_implicit_numeric_conversion(e, lhs, rhs);
+                if (!amount_widens_only) { this.warn_implicit_numeric_conversion(e, lhs, rhs); }
                 // Phase 2: a bounded-param operand (`T: Add`) still overloads,
                 // even though `check_binary_op` passed the generic param through.
                 // Concrete primitives fall straight through (no user impl).
@@ -4082,6 +4133,12 @@ type struct SemaVisitor {
         // module or a type parameter, and the index holds no type under
         // either spelling; the module lane below is a different question.
         const found: TypeRef = this.types.scope_qualifier_type(scope);
+        // A constant the type declares (`Point::ORIGIN`, `i32::MAX`).  A
+        // name that is both a constant and another member of one type is
+        // refused at the constant's declaration, so nothing below can answer
+        // this path too.
+        const constant: TypeRef = this.scope_type_constant(e, scope, found);
+        if (constant.is_valid()) { return constant; }
         // `Type::static_method` as a VALUE is the method, not the type.  The
         // type-binding branch below answers "does this path name something the
         // type owns" - what an enum variant needs - and a static method satisfies
@@ -4182,6 +4239,36 @@ type struct SemaVisitor {
         miss = miss.at_with_label(e.span, "not found in this scope");
         this.ctx.emit_diagnostic(miss);
         return found;
+    }
+
+    /// The type of the constant the path `T::NAME` names, when `T` is a type
+    /// (`found`) that declares one, pinning the constant's definition and
+    /// registration on the path; invalid otherwise.  The owner is the type
+    /// `found` is, so an alias reaches its target's constants.  A `private`
+    /// constant is reached only from its own module (E0353).
+    scope_type_constant(mut &this, e: ExpressionNode*, scope: ScopeResolutionExpr*,
+                        found: TypeRef) -> TypeRef {
+        if (!found.is_valid()) { return TypeRef::invalid(); }
+        const owner: DefId = this.ctx.decl_index.def_of(found, this.arena);
+        const def: DefId = this.ctx.const_table.type_constant(owner, scope.member_name);
+        if (!def.is_valid()) { return TypeRef::invalid(); }
+        const entry: GlobalEntry = this.ctx.decl_index.global_entry_of_def(def);
+        // A constant whose type never resolved was refused where it is
+        // declared, and a use of it reports nothing more.
+        if (!entry.valid) { return TypeRef::invalid(); }
+        scope.member_def = def;
+        scope.resolved_member = MemberPin::Global(entry.slot);
+        const constant: VarDecl* = DeclarationNode::var_of(this.ctx.decl_index.declaration_of(def));
+        if (constant != null && constant.member_visibility == Visibility::Private
+                && !this.member.member_reachable(entry.declared_in, e.span)) {
+            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0353_PRIVATE_ACCESS,
+                fmt::format("constant `%s` of `%s` is private",
+                    this.intern.resolve(scope.member_name), this.arena.format_display(this.arena.lookup(found))));
+            d = d.at_with_label(e.span, fmt::format("private constant reached outside module `%s`",
+                this.intern.shown(entry.declared_in.decl_name())));
+            this.ctx.emit_diagnostic(d);
+        }
+        return entry.type_ref;
     }
 
     validate_enum_scope_member(mut &this, e: ExpressionNode*, scope_ty: TypeRef, scope: ScopeResolutionExpr*) -> void {
@@ -4299,10 +4386,10 @@ type struct SemaVisitor {
     const_repeat_count(&this, arr: ArrayExpr*) -> i64 {
         if (this.ctx == null) { return -1; }
         const ev: ConstEval = ConstEval::new(this.ctx.const_table, this.ctx.intern_table, null);
-        mut n: i64 = 0;
+        mut n: i128 = 0;
         if (!ev.fold(arr.repeat_count_expr, &n)) { return -1; }
-        if (n < 0) { return -1; }
-        return n;
+        if (n < 0 || n > i64::MAX as i128) { return -1; }
+        return n as i64;
     }
 
     resolve_array_literal(mut &this, e: ExpressionNode*, arr: ArrayExpr*) -> TypeRef {

@@ -33,7 +33,7 @@ import compiler::sema::state::{ SemaState };
 import compiler::sema::helpers;
 import compiler::sema::helpers::{
     int_literal_exceeds, is_constant_numeric_expr, is_numeric_literal_expr, sema_default_int_type,
-    sema_int_unsigned_bound, sema_numeric_suffix_type, try_fold_const_i64
+    sema_int_unsigned_bound, sema_numeric_suffix_type, try_fold_const_integer
 };
 import std::fmt;
 import compiler::diag::diagnostic;
@@ -185,12 +185,13 @@ type struct LiteralResolver {
             // Char/Int width lattice in `check_compatibility`, which correctly
             // refuses a signed 32-bit value narrowing into an unsigned 32-bit
             // one - turning every NUL terminator into an error.
+            // A `char` holds a Unicode scalar value, so its bound is
+            // `char::MAX`, not the 32-bit width's.
             if (exp != null && exp.kind == TypeKind::Char) {
-                const char_max: u64 = sema_int_unsigned_bound(32);
-                if (char_max != 0 && int_literal_exceeds(lit.value, char_max)) {
+                if (int_literal_exceeds(lit.value, char::MAX as u64)) {
                     this.ctx.emit_error_at(
                         ErrorCode::E0010_NUMBER_TOO_LARGE,
-                        fmt::format("integer literal `%s` is out of range for type `char`",
+                        fmt::format("integer literal `%s` is out of range for type `char`, whose largest value is U+10FFFF",
                             lit.value),
                         e.span);
                 }
@@ -317,33 +318,33 @@ type struct LiteralResolver {
         const it: IntegerKind = t.int_kind();
         const max_mag: u64 = sema_int_unsigned_bound(it.bit_width());
         if (max_mag == 0) { return false; }
-        mut v: i64 = 0;
-        if (!try_fold_const_i64(expr, &v)) { return false; }
+        mut v: i128 = 0;
+        if (!try_fold_const_integer(expr, &v)) { return false; }
         const held: boolean = if (v >= 0) {
-            (v as u64) <= max_mag
+            v <= max_mag as i128
         } else {
-            it.is_signed() && v >= -((max_mag / 2) as i64) - 1
+            it.is_signed() && v >= -((max_mag / 2) as i128) - 1
         };
         if (held) { return false; }
         this.ctx.emit_error_at(
             ErrorCode::E0010_NUMBER_TOO_LARGE,
-            fmt::format("this value is %lld, which `%s` does not hold: it narrows the value and would silently truncate; add an explicit `as` cast",
-                v, it.to_string()),
+            fmt::format("this value is %s, which `%s` does not hold: it narrows the value and would silently truncate; add an explicit `as` cast",
+                v.to_decimal_str(), it.to_string()),
             expr.span);
         return true;
     }
 
     static const_expr_fits_int(expr: ExpressionNode*, it: IntegerKind) -> boolean {
         if (expr == null) { return false; }
-        mut v: i64 = 0;
-        if (!try_fold_const_i64(expr, &v)) { return false; }
+        mut v: i128 = 0;
+        if (!try_fold_const_integer(expr, &v)) { return false; }
         const max_mag: u64 = sema_int_unsigned_bound(it.bit_width());
         if (max_mag == 0) { return false; }
         if (it.is_signed()) {
-            const hi: i64 = (max_mag / 2) as i64;
+            const hi: i128 = (max_mag / 2) as i128;
             if (v > hi || v < -hi - 1) { return false; }
         } else {
-            if (v < 0 || (v as u64) > max_mag) { return false; }
+            if (v < 0 || v > max_mag as i128) { return false; }
         }
         const u: UnaryExpr* = ExpressionNode::unary_of(expr);
         if (u != null) {

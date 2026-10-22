@@ -177,9 +177,10 @@ AggregateDecl      ::= "type"? "struct" Ident Generics?
                        "{" Member* "}"
 
 Member             ::= Visibility? "static"? (Field | Method)
+                     | Visibility? MemberConstant
                      | VisibilityBlock          (* `public:` / `private:`
                                                    labels a run of subsequent members. *)
-VisibilityBlock    ::= Visibility ":" (Field | Method)*
+VisibilityBlock    ::= Visibility ":" (Field | Method | MemberConstant)*
 
 (* A member may be named by a keyword.  A member name is never read as a
    declaration or an operator - what follows it says which member kind it
@@ -188,8 +189,16 @@ VisibilityBlock    ::= Visibility ":" (Field | Method)*
    field called `type`, which the binding generator cannot rename without
    breaking the ABI.  The exceptions are the keywords a member position
    reads FIRST: `public`/`private` (a visibility label), `static`/`async`
-   (a member modifier) and `protected`/`virtual`/`override` (refused).   *)
+   (a member modifier), `const` followed by a name (a constant: `const:`
+   is still a field named `const`, and `const(` a method) and
+   `protected`/`virtual`/`override` (refused).                          *)
 MemberName         ::= Ident | Keyword
+
+(* A type's constant, reached as `Type::NAME`.  It is written with a
+   value (E0248).  Refused in a trait (E0245), a trait implementation
+   (E0246), on a generic type (E0247) and on a type declared in a
+   function body (E0249).                                              *)
+MemberConstant     ::= "const" Ident (":" Type)? "=" Expr ";"
 
 Field              ::= MemberName ":" Type ("=" Expr)? ";"
 Method             ::= "async"? MemberName Generics?
@@ -264,6 +273,7 @@ MethodImpl         ::= "static"? "async"?
                        "(" ParamList? ")" ("->" Type)?
                        ("where" WhereClause)? Block
                      | "type" Ident "=" Type ";"   (* binds a trait's associated type *)
+                     | Visibility? MemberConstant  (* an inherent block's constant *)
 
 Generics           ::= "<" GenericParam ("," GenericParam)* ">"
 GenericParam       ::= Ident ("=" Type)?

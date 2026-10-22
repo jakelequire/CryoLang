@@ -100,6 +100,7 @@ or reads the store by identity.  Locked so far:
 | `member-variant` | `EnumType::variant_index` | `compiler/src/compiler/types/user_defined.cryo` | member: an enum variant, by owner type and leaf |
 | `member-variant` | `EnumDecl::variant_position` | `compiler/src/compiler/AST/declaration.cryo` | member: an enum variant, by the enum's declaration and leaf, to its position among the declared variants - for a constant folded off the declaration |
 | `trait-method` | `GenericRegistry::trait_item_slot` | `compiler/src/compiler/types/generic_registry.cryo` | member: a trait's declared method, by trait identity and leaf, to its position in the trait |
+| `member-constant` | `ConstantTable::type_constant` | `compiler/src/compiler/const_table.cryo` | member: a type's constant, by the owning type's definition (a primitive's included) and leaf - for a path `T::NAME` sema types and for a compile-time integer the folder reads |
 | `assoc-type` | `TraitDeclNode::assoc_type_index` | `compiler/src/compiler/AST/declaration.cryo` | member: a trait's associated type, by the trait's declaration and leaf, to its position among the trait's associated types |
 | `module-by-path` | `ModuleGraph::module_named` | `compiler/src/compiler/module_graph.cryo` | written module path to its module |
 | `module-by-path` | `ModuleGraph::module_path_over` | `compiler/src/compiler/module_graph.cryo` | an import's written path to itself as a path to list modules within, when the graph holds a module at it or under it, whether or not it names a module (`import std::`) |
@@ -168,6 +169,122 @@ yet is recorded with the change that builds it, not here.
 
 508. **The report-only previous-commit object comparison is removed from
      CI;** local `make verify` remains the comparison tool.  (Jake)
+
+509. **A struct's or union's constants may be written inline in its body
+     or in an `implement struct` (or `implement union`) block; both
+     work.**  An enum's and a primitive's constants are written in
+     `implement` blocks, where their methods are.  (Jake)
+
+510. **`max_value()` and `min_value()` are removed once the integer types
+     have `MAX` and `MIN`,** and every caller is moved to the constants,
+     before the freeze.  (Jake)
+
+511. **A type's constant follows the rules of a module-level constant:**
+     its initializer is folded where it is a constant expression and
+     otherwise computed once before `main`, and the constant has an
+     address.  (Jake)
+
+512. **The float types' limits are constants** - `EPSILON`, `MAX`, `MIN`,
+     `MIN_POSITIVE`, `INFINITY`, `NEG_INFINITY` and `NAN` on `f32` and
+     `f64`.  `math::F64_*` and `math::F32_*`, and `math::infinity()`,
+     `math::neg_infinity()` and `math::nan()`, are removed and their
+     callers moved to the constants.  `math::PI` and the other
+     mathematical constants stay in `std::math`.  (Jake)
+
+513. **A constant on a generic type is refused before v1.0;** allowing
+     one is additive and comes later.  (Jake)
+
+514. **`const` in a trait or in a trait implementation is refused for
+     now, with a clear error,** so that trait constants can be added
+     later without changing what any program means.  (Jake)
+
+515. **A constant named like a field of its own type is refused** (E0205),
+     as one named like a method, a variant or another constant of the type
+     is.  (Jake)
+
+516. **The standard library's move to type constants covers the type
+     limits, the per-width digit counts and the clearly per-type
+     constants** (such as `Duration`'s unit counts and the json depth),
+     not every module constant.  (Jake)
+
+517. **The E0201 negative test for a constant a primitive does not
+     declare stays,** over names that remain undeclared, and the
+     constants that become declared get positive tests.  (Jake)
+
+518. **Each new refusal the feature brings gets its own error code,**
+     with the codes and wordings put to Jake with the change that builds
+     them.  (Jake)
+
+519. **`char` has `MIN` and `MAX`; `boolean` has no constants.**  (Jake)
+
+520. **Every integer type has a `BITS: u32` constant.**  (Jake)
+
+521. **A folded struct constant written out of field order, and a float
+     literal with `_` separators in a module constant, are fixed first,**
+     on the associated-constants branch, before the feature is built.
+     (Jake)
+
+522. **A diagnostic's wording needs no approval:** the one proposed is
+     used and reported, not asked about.  Error codes are chosen the same
+     way; the question is asked only when reusing an existing code versus
+     making a new one is genuinely unclear, and otherwise the choice is
+     reported.  This adjusts ruling 518.  (Jake)
+
+523. **A type's constant may leave out its type annotation,** as a
+     module constant may; its type is then the initializer's.  (Jake)
+
+524. **The constant folder handles the full unsigned 64-bit range,** so
+     that `u64::MAX` can size an array and appear in a `static_assert`;
+     this is built before the standard library's limits are declared.
+     (Jake)
+
+525. **`char` is 32 bits wide:** a Unicode scalar value, `'\0'` to
+     `'\u{10FFFF}'`, which is what `char::MIN` and `char::MAX` state.
+     The reference says so where it called the width undecided or 8-bit.
+     (Jake)
+
+526. **A folded constant is wrapped to its declared type,** so its
+     compile-time value is always the value the program reads at run
+     time: `const A: u8 = B + 200` with `B` at 100 folds to 44, not 300,
+     wherever `A` is used - an array size, a `static_assert`, another
+     constant.  (Jake)
+
+527. **The HTTP request limits and the calendar constants stay at module
+     level;** they are not moved onto a type.  (Jake)
+
+528. **The associated-constants branch is not merged yet.**  (Jake)
+
+529. **A negated literal compared with a narrower integer takes the
+     operand's type, as a positive literal does:** `x != -128` with
+     `x: i8` draws no W0005, and is fixed on the associated-constants
+     branch.  (Jake)
+
+530. **A reference to a constant compiles to its value, an immediate,
+     wherever the value folds,** not to a load from the constant's global.
+     The global and its address remain (ruling 511).  (Jake)
+
+531. **`char` has a `BITS: u32` constant, 32,** and the compiler's own
+     copy of the width is replaced by it.  (Jake)
+
+532. **An integer literal above `0x10FFFF` given to a `char` is refused
+     with an error.**  (Jake)
+
+533. **HTTP/2's "no limit" settings are written as `u32::MAX`.**  (Jake)
+
+534. **`1 << (u64::BITS - 1)` shifts at the type the result needs,** not
+     at the shift amount's narrower type, and is fixed on the
+     associated-constants branch.  (Jake)
+
+535. **A shift's amount is exempt from W0005:** its type never changes
+     the result, so an amount narrower than the shifted value widens
+     silently.  The shifted value widening to a wider amount still
+     warns.  (Jake)
+
+536. **The constant folder folds `char` literals,** so a `char` constant
+     read as a value compiles to an immediate.  (Jake)
+
+537. **128-bit constants fold and compile to immediates,** as narrower
+     integers do, within the folder's range.  (Jake)
 
 ### 2026-10-20
 
@@ -1201,7 +1318,7 @@ yet is recorded with the change that builds it, not here.
 262. **E0312, the trait-implementation check, keeps its number and
      wording.**  (Jake)
 
-263. **`const a: i32 = i32::MAX;` storing nothing, so the local is read
+263. *Superseded by rulings 509, 510 and 517.* **`const a: i32 = i32::MAX;` storing nothing, so the local is read
      uninitialized, is fixed before the merge.**  (Jake)  No type declares
      constants, so the path names no value: it is refused where it is
      written (E0201), as any path naming nothing is; a primitive's bounds
@@ -1246,7 +1363,7 @@ yet is recorded with the change that builds it, not here.
 274. **`make install-lsp` stays in the Makefile,** and its help line says
      that it replaces the installed VS Code extension.  (Jake)
 
-275. **Primitives keep `max_value()` and `min_value()` for now;**
+275. *Superseded by ruling 510.* **Primitives keep `max_value()` and `min_value()` for now;**
      associated constants such as `i32::MAX` are roadmap work for after the
      merge.  (Jake)
 
