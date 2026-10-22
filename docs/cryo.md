@@ -4410,7 +4410,7 @@ Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` o
 | `--log=SPEC`          | Compiler logging, by area and level (below); applied after `CRYO_LOG`, so it wins. `--log SPEC` is the same.                            |
 | `--log-file=PATH`     | Append the compiler's log lines to `PATH` in place of stderr; `CRYO_LOG_FILE` is then not opened. `--log-file PATH` is the same.        |
 | `--ast`               | Dump the AST after parsing.                                                                                                             |
-| `--emit-llvm`         | Emit LLVM IR (`.ll`) beside the object output.                                                                                          |
+| `--emit-llvm`         | Emit LLVM IR (`.ll`) beside the object output, including a module that fails LLVM verification (the build still fails).                 |
 | `--build-dir=PATH`    | Override `[project] output_dir`.                                                                                                        |
 | `--stdlib=PATH`       | Standard-library root for this run (highest priority; see section 23.3).                                                                |
 | `--target=TRIPLE`     | Cross-compile for an LLVM target triple. `x86_64-pc-windows-gnu` links to a `.exe` via mingw-w64; other triples emit object files only. |

@@ -385,28 +385,12 @@ type struct CompilerInstance {
     /// result construction.  All single-file compile_* methods delegate here.
     run_pipeline(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
                  output_path_text: string) -> CompilationResult {
-        const output_path: string = output_path_text;
-
         if (!pipeline.validate()) {
             Log::error(LogArea::Driver, "pipeline validation failed");
             return CompilationResult::failed(1, 0);
         }
 
         const success: boolean = pipeline.run_all(ctx);
-
-        // Write .ll text file when --emit-llvm is set (single-file mode).
-        if (this.config.emit_llvm && ctx.artifacts.ir.is_valid()) {
-            const ll_path: string = fmt::format("%s.ll", output_path);
-            mut ll_err: i8* = null;
-            const ll_ok: i32 = llvm::LLVMPrintModuleToFile(
-                ctx.artifacts.ir.llvm_module, ll_path, &ll_err as void*);
-            if (ll_ok == 0) {
-                fmt::eprintln(f"[Compiler] LLVM IR emitted: {ll_path}");
-            } else if (ll_err != null) {
-                fmt::eprintln(f"warning: failed to write {ll_path}: {ll_err as string}");
-                llvm::LLVMDisposeMessage(ll_err as void*);
-            }
-        }
 
         // Dump AST if --ast was requested
         if (this.config.show_ast && ctx.artifacts.ast.is_valid()) {
@@ -2204,6 +2188,9 @@ type struct CompilerInstance {
 
                 const _gen_ok: boolean = pipeline.run_all(ctx);
 
+                const mod_info: ModuleInfo* = &ctx.module_graph.modules[order[i]];
+                const mod_name: string = ctx.intern_table.shown(mod_info.path().decl_name());
+
                 if (!ctx.artifacts.ir.is_valid()) {
                     // IR generation failed for this module.  The fresh context
                     // has no module to emit; reclaim it now.  An error this
@@ -2212,14 +2199,21 @@ type struct CompilerInstance {
                     if (!ctx.diagnostics.has_errors()) {
                         fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, i)}");
                     }
+                    // A module the verifier refused is written all the same,
+                    // so the IR it refused can be read.  It dies with its
+                    // context below.
+                    if (ctx.artifacts.unverified_ir.is_valid()) {
+                        if (this.config.emit_llvm || config.emit_llvm) {
+                            CompilerInstance::write_module_ir(
+                                ctx, mod_info, mod_name, ctx.artifacts.unverified_ir.llvm_module);
+                        }
+                        ctx.artifacts.unverified_ir = IROutput::empty();
+                    }
                     cg_failed = true;
                     compiler::codegen::llvm_types::dispose_codegen_context();
                     pipeline.reset();
                     continue;
                 }
-
-                const mod_info: ModuleInfo* = &ctx.module_graph.modules[order[i]];
-                const mod_name: string = ctx.intern_table.shown(mod_info.path().decl_name());
 
                 // Invariant guard (gated by CRYO_CTX_AUDIT): every module must be
                 // self-contained in its own context for the zero-copy threaded
@@ -2236,28 +2230,8 @@ type struct CompilerInstance {
                 // thread (before it is handed to a worker), when --emit-llvm is
                 // set via CLI flag or cryoconfig args.
                 if (this.config.emit_llvm || config.emit_llvm) {
-                    mut ir_dir: string = "build/target/release/local/ir";
-                    if (ctx.project_config != null) {
-                        ir_dir = ctx.project_config.ir_dir_for(
-                            ModuleInfo::origin_subdir(
-                                mod_info.origin, mod_info.origin_name));
-                    }
-                    // IR (`.ll`) files mirror the module namespace as
-                    // SUBDIRECTORIES under `ir/`, exactly like the object files
-                    // under `deps/` - same `Manifest::path_module` mapping - so the
-                    // IR tree mirrors the source tree instead of one flat folder
-                    // of `__`-joined stems.
-                    const ll_rel: string =
-                        compiler::build_manifest::Manifest::path_module(mod_name);
-                    const ll_path: string = fmt::format("%s/%s.ll", ir_dir, ll_rel);
-                    ProjectConfig::mkdir_p(ll_path.parent_dir());
-                    mut ll_err: i8* = null;
-                    const ll_ok: i32 = llvm::LLVMPrintModuleToFile(
-                        ctx.artifacts.ir.llvm_module, ll_path, &ll_err as void*);
-                    if (ll_ok != 0 && ll_err != null) {
-                        fmt::eprintln(f"warning: failed to write {ll_path}: {ll_err as string}");
-                        llvm::LLVMDisposeMessage(ll_err as void*);
-                    }
+                    CompilerInstance::write_module_ir(
+                        ctx, mod_info, mod_name, ctx.artifacts.ir.llvm_module);
                 }
 
                 // Resolve WHERE/HOW to emit on the MAIN thread (needs ctx + the
@@ -3576,6 +3550,28 @@ type struct CompilerInstance {
         if (mi as i64 >= ctx.module_graph.modules.length) { return "<unknown>"; }
         const info: ModuleInfo* = &ctx.module_graph.modules[mi as i64];
         return ctx.intern_table.shown(info.path().decl_name());
+    }
+
+    /// Write one module's IR text under its origin's `ir/` directory.  The
+    /// files mirror the module namespace as subdirectories, by the same
+    /// `Manifest::path_module` mapping as the objects under `deps/`, so the
+    /// IR tree mirrors the source tree.
+    static write_module_ir(ctx: CompilationContext*, mod_info: ModuleInfo*,
+                           mod_name: string, llvm_module: void*) -> void {
+        mut ir_dir: string = "build/target/release/local/ir";
+        if (ctx.project_config != null) {
+            ir_dir = ctx.project_config.ir_dir_for(
+                ModuleInfo::origin_subdir(mod_info.origin, mod_info.origin_name));
+        }
+        const ll_rel: string = compiler::build_manifest::Manifest::path_module(mod_name);
+        const ll_path: string = fmt::format("%s/%s.ll", ir_dir, ll_rel);
+        ProjectConfig::mkdir_p(ll_path.parent_dir());
+        mut ll_err: i8* = null;
+        const ll_rc: i32 = llvm::LLVMPrintModuleToFile(llvm_module, ll_path, &ll_err as void*);
+        if (ll_rc != 0 && ll_err != null) {
+            fmt::eprintln(f"warning: failed to write {ll_path}: {ll_err as string}");
+            llvm::LLVMDisposeMessage(ll_err as void*);
+        }
     }
 
     /// `nthreads <= 1` (or a single job) runs the batch inline via

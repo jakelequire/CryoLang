@@ -349,12 +349,9 @@ Open:
   open;
 - the language server logs to stderr or a file when `CRYO_LOG` is set; a
   sink sending lines to the editor as `window/logMessage` is not built;
-- two progress lines are still printed directly rather than logged or
-  reported: `[Compiler] LLVM IR emitted: <path>` for a single-file
-  `--emit-llvm` build, and `[deps] cloning <url>` when a git dependency
-  is first fetched;
-- a module that fails LLVM verification writes no IR, even under
-  `--emit-llvm`, since its `.ll` is written after codegen succeeds;
+- one progress line is still printed directly rather than logged or
+  reported: `[deps] cloning <url>` when a git dependency is first
+  fetched;
 - the `compiler_log` project drives the logger as a library; no test runs
   the real `cryo` binary and checks what it writes to stderr (an area's
   lines in a real build, `--debug` printing nothing but log lines, the

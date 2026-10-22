@@ -332,6 +332,11 @@ yet is recorded with the change that builds it, not here.
      `CRYO_LOG_FILE` for the server it starts,** so a developer's own
      logging cannot turn its quiet-stderr check red.  (Delegated)
 
+552. **Under `--emit-llvm`, a module that fails LLVM verification still
+     writes its `.ll` file,** so the IR the verifier refused can be read.
+     The failure is still reported as an error and the build still fails;
+     the refused module is never optimized or emitted.  (Delegated)
+
 ### 2026-10-20
 
 465. **The removed class syntax is refused with E0117,** "`<form>` is not
