@@ -286,6 +286,34 @@ yet is recorded with the change that builds it, not here.
 537. **128-bit constants fold and compile to immediates,** as narrower
      integers do, within the folder's range.  (Jake)
 
+538. **The compiler logger has named areas** (`driver`, `resolve`, `sema`,
+     `codegen`, `lsp` and the rest), each switched on alone.  (Jake)
+
+539. **Every log line names its source place** - file, line and function -
+     taken by `![caller_location]` from `location()`.  (Jake)
+
+540. **The logger is internal to the compiler** and the tools that link it
+     (the LSP); it is not standard library API.  (Jake)
+
+541. **A log call in cold code may be unguarded; one on a hot path is
+     guarded,** so disabled logging costs nothing there.  (Jake)
+
+542. **Logging is off by default.**  (Jake)
+
+543. **`--debug` is a shorthand for turning logging on.**  (Jake)
+
+544. **Every existing trace (`LOG_DEBUG`, `cdebug`, a debug `eprint`) is
+     removed or converted to the logger.**  (Jake)
+
+545. **Log output goes to a sink, a trait object (`virtual LogSink*`):**
+     stderr by default, or a file.  (Jake)
+
+546. **In the LSP, log output never reaches the editor's stderr channel
+     unless logging is explicitly switched on.**  (Jake)
+
+547. **Logging is switched on by an environment variable and by a
+     command-line flag, both.**  (Jake)
+
 ### 2026-10-20
 
 465. **The removed class syntax is refused with E0117,** "`<form>` is not

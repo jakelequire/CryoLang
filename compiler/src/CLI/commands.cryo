@@ -11,6 +11,7 @@ import compiler::vendor::registry;
 import compiler::bindgen::generator;
 import utils;
 import utils::logger;
+import utils::log::{ Log, LogArea };
 import std::collections::string;
 import std::collections::string::{ String };
 import std::collections::str;
@@ -395,7 +396,9 @@ implement enum CommandKind {
                 fmt::printf("  cryo build [dir]         Build the project whose cryoconfig lives\n");
                 fmt::printf("                           in [dir] (default: the current directory).\n\n");
                 fmt::printf("Flags:\n");
-                fmt::printf("  --debug            Enable debug logging and verbose output\n");
+                fmt::printf("  --debug            Compiler logging on in every area (--log=debug)\n");
+                fmt::printf("  --log=SPEC         Compiler logging by area and level (cryo help log)\n");
+                fmt::printf("  --log-file=PATH    Append the compiler's log lines to PATH\n");
                 fmt::printf("  --ast              Dump the AST after parsing\n");
                 fmt::printf("  --emit-llvm        Emit LLVM IR (.ll) alongside the object output\n");
                 fmt::printf("  --build-dir=PATH   Override cryoconfig's output_dir\n");
@@ -411,7 +414,9 @@ implement enum CommandKind {
                 fmt::printf("works for executable targets - library and stdlib targets produce\n");
                 fmt::printf("no binary to run.\n\n");
                 fmt::printf("Flags:\n");
-                fmt::printf("  --debug            Enable debug logging and verbose output\n");
+                fmt::printf("  --debug            Compiler logging on in every area (--log=debug)\n");
+                fmt::printf("  --log=SPEC         Compiler logging by area and level (cryo help log)\n");
+                fmt::printf("  --log-file=PATH    Append the compiler's log lines to PATH\n");
                 fmt::printf("  --ast              Dump the AST after parsing\n");
                 fmt::printf("  --emit-llvm        Emit LLVM IR (.ll) alongside the object output\n");
                 fmt::printf("  --build-dir=PATH   Override cryoconfig's output_dir\n");
@@ -424,7 +429,9 @@ implement enum CommandKind {
                 fmt::printf("function from a synthesized test main.\n\n");
                 fmt::printf("An optional [pattern] positional filters which tests run.\n\n");
                 fmt::printf("Flags:\n");
-                fmt::printf("  --debug            Enable debug logging and verbose output\n");
+                fmt::printf("  --debug            Compiler logging on in every area (--log=debug)\n");
+                fmt::printf("  --log=SPEC         Compiler logging by area and level (cryo help log)\n");
+                fmt::printf("  --log-file=PATH    Append the compiler's log lines to PATH\n");
                 fmt::printf("  --build-dir=PATH   Override cryoconfig's output_dir\n");
                 fmt::printf("  --stdlib=PATH      Standard library root for this run\n");
                 fmt::printf("  --target=TRIPLE    Cross-compile for the given LLVM target triple\n");
@@ -443,7 +450,9 @@ implement enum CommandKind {
                 fmt::printf("errors and warnings, but emits no code.  Faster than a full\n");
                 fmt::printf("build when you only want to validate a source file.\n\n");
                 fmt::printf("Flags:\n");
-                fmt::printf("  --debug          Enable debug logging and verbose output\n");
+                fmt::printf("  --debug          Compiler logging on in every area (--log=debug)\n");
+                fmt::printf("  --log=SPEC       Compiler logging by area and level (cryo help log)\n");
+                fmt::printf("  --log-file=PATH  Append the compiler's log lines to PATH\n");
                 fmt::printf("  --ast            Dump the AST after parsing\n");
                 fmt::printf("  --stdlib=PATH    Standard library root for this run\n");
                 fmt::printf("  --target=TRIPLE  Cross-compile for the given LLVM target triple\n");
@@ -453,7 +462,7 @@ implement enum CommandKind {
                 fmt::printf("prelude.  Intended for low-level tests and bootstrapping work that\n");
                 fmt::printf("must not pull in stdlib symbols.\n\n");
                 fmt::printf("Flags:\n");
-                fmt::printf("  --debug   Enable debug logging and verbose output\n");
+                fmt::printf("  --debug   Compiler logging on in every area (--log=debug)\n");
                 fmt::printf("  --ast     Dump the AST after parsing\n");
             }
             CommandKind::Demangle => {
@@ -518,6 +527,7 @@ type enum FlagKind {
     Help;
     Version;
     Debug;
+    Log;
     Ast;
     EmitLlvm;
     Stdlib;
@@ -542,6 +552,7 @@ implement enum FlagKind {
             "help"      | "h" => { FlagKind::Help }
             "version"   | "v" => { FlagKind::Version }
             "debug"           => { FlagKind::Debug }
+            "log" | "log-file" => { FlagKind::Log }
             "ast"             => { FlagKind::Ast }
             "emit-llvm"       => { FlagKind::EmitLlvm }
             "stdlib"          => { FlagKind::Stdlib }
@@ -571,11 +582,26 @@ implement enum FlagKind {
                 fmt::printf("Equivalent to the `version` command.\n");
             }
             FlagKind::Debug => {
-                fmt::printf("--debug - Enable debug logging and verbose output\n\n");
-                fmt::printf("Flips the compiler debug gate before any pass runs, so the\n");
-                fmt::printf("verbose trace output sprinkled across the lexer, parser, resolver\n");
-                fmt::printf("and codegen passes is printed.  Off by default.\n\n");
+                fmt::printf("--debug - Compiler logging on in every area\n\n");
+                fmt::printf("The same as --log=debug: every area of the compiler logs at\n");
+                fmt::printf("`debug`.  See `cryo help log`.\n\n");
                 fmt::printf("Accepted by: build, run, test, check, raw\n");
+            }
+            FlagKind::Log => {
+                fmt::printf("--log=SPEC, --log-file=PATH - Compiler logging\n\n");
+                fmt::printf("The compiler logs nothing unless asked.  SPEC is a comma-separated\n");
+                fmt::printf("list of items: an area (logged at `debug`), area=level, or a level\n");
+                fmt::printf("alone, which sets every area; a later item overrides an earlier\n");
+                fmt::printf("one.  CRYO_LOG=SPEC in the environment does the same, and --log is\n");
+                fmt::printf("applied after it.\n\n");
+                fmt::printf("  areas:  driver loader lex parse resolve types sema mono async\n");
+                fmt::printf("          drop codegen link bindgen deps diag lsp time\n");
+                fmt::printf("  levels: off error warn info debug trace\n\n");
+                fmt::printf("  --log=sema,codegen      two areas at debug\n");
+                fmt::printf("  --log=info,mono=trace   every area at info, mono at trace\n\n");
+                fmt::printf("Lines go to stderr, or are appended to the file --log-file=PATH\n");
+                fmt::printf("(or CRYO_LOG_FILE) names: [level area] file:line function: message.\n\n");
+                fmt::printf("Accepted by: every command\n");
             }
             FlagKind::Ast => {
                 fmt::printf("--ast - Dump the AST after parsing\n\n");
@@ -954,7 +980,9 @@ type struct Executor {
     /// top-level `cryo --help` lists only --help / --version and points here.
     static print_topic_flags() -> void {
         fmt::printf("Build flags (accepted by build / run / test / check as noted)\n\n");
-        fmt::printf("  --debug             Enable debug logging and verbose output\n");
+        fmt::printf("  --debug             Compiler logging on in every area (--log=debug)\n");
+        fmt::printf("  --log=SPEC          Compiler logging by area and level; see `cryo help log`\n");
+        fmt::printf("  --log-file=PATH     Append the compiler's log lines to PATH, not stderr\n");
         fmt::printf("  --ast               Dump the AST after parsing\n");
         fmt::printf("  --emit-llvm         Emit LLVM IR (.ll) alongside the object output\n");
         fmt::printf("  --build-dir=PATH    Override cryoconfig's output_dir\n");
@@ -1246,7 +1274,7 @@ type struct Executor {
             logger::Logger::enable_debug();
         }
 
-        logger::cdebug("[Build] Starting build process.\n");
+        Log::debug(LogArea::Driver, "starting a build");
 
         const file: string = args.input_file();
 
@@ -1279,7 +1307,7 @@ type struct Executor {
             return 1;
         }
 
-        logger::cdebug("[Build] Found cryoconfig: %s\n", config_path);
+        Log::debug(LogArea::Driver, f"found cryoconfig {config_path}");
 
         mut config: instance::CompilerConfig = instance::CompilerConfig::default();
         if (args.has_flag("debug")) {
@@ -1345,7 +1373,7 @@ type struct Executor {
         Executor::apply_profile_flags(&config, &args);
 
         mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
-        logger::cdebug("[Build] Compiling project from config: %s\n", config_path);
+        Log::debug(LogArea::Driver, f"compiling the project from {config_path}");
         const result: instance::CompilationResult = compiler.compile_project(config_path);
 
         if (result.success) {
@@ -1371,7 +1399,7 @@ type struct Executor {
             logger::Logger::enable_debug();
         }
 
-        logger::cdebug("[Run] Building project before execution.\n");
+        Log::debug(LogArea::Driver, "building the project to run it");
 
         // Find cryoconfig in CWD (or explicit positional dir).
         const dir: string = if (args.positional_count() > 0) {
@@ -1423,10 +1451,9 @@ type struct Executor {
             return 1;
         }
 
-        logger::cdebug("[Run] %s\n", result.output_path);
-        // Flush so the [Run] header appears before the child binary's
-        // output (under --debug); otherwise the libc line buffer can
-        // interleave them.
+        Log::debug(LogArea::Driver, f"running {result.output_path}");
+        // Flush so the build's own output appears before the child binary's;
+        // otherwise the libc buffer can interleave them.
         libc::fflush(null);
         // Run the produced binary through the platform shell (`Command::shell`
         // under the hood), inheriting stdio so its output reaches the terminal.
@@ -1455,7 +1482,7 @@ type struct Executor {
             logger::Logger::enable_debug();
         }
 
-        logger::cdebug("[Test] Building test binary.\n");
+        Log::debug(LogArea::Driver, "building the test binary");
 
         const config_path: string = project_config::ProjectConfig::find_cryoconfig(".");
         if (config_path == "") {
@@ -1558,10 +1585,9 @@ type struct Executor {
             }
         }
 
-        logger::cdebug("[Test] %s\n", cmd);
-        // Flush parent stdio before spawning so the [Test] header lands
-        // before the child's output under --debug.  Same precaution as
-        // `cmd_run`.
+        Log::debug(LogArea::Driver, f"running {cmd}");
+        // Flush parent stdio before spawning so the build's own output lands
+        // before the child's.  Same precaution as `cmd_run`.
         libc::fflush(null);
         const status: i32 = exec::shell(cmd);
         if (status < 0) {
@@ -3059,7 +3085,7 @@ type struct Executor {
             logger::Logger::enable_debug();
         }
 
-        logger::cdebug("[Compile] Compiling file: %s\n", file_path);
+        Log::debug(LogArea::Driver, f"compiling the file {file_path}");
 
         mut config: instance::CompilerConfig = instance::CompilerConfig::default();
 

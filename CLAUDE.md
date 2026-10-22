@@ -24,7 +24,7 @@ api-index-check` fails if it is stale.
 make cryo                # build the self-hosted compiler (compiler/build/cryo)
 make test                # unit + compile-fail + project suites
 make test-census         # the same run, with the suite COUNTS asserted
-make verify              # build once; census, examples, lsp, cross, incr, check-fast CONCURRENTLY,
+make verify              # build once; census, examples, lsp, cross, incr, log, check-fast CONCURRENTLY,
                          # objects hashed; ARGS="--baseline HEAD --require-identical" proves
                          # a change moved no compiled output (baseline built in .verify/, cached);
                          # a change that makes a refused program compile DECLARES its project in
@@ -49,6 +49,8 @@ make examples-golden     # build AND run them, diff stdout (POSIX only)
 make incremental-check   # incremental build == clean build, per module
 make incremental-instance-check  # an edit asking a cached module for a new generic
                          # instance still links (a verify gate: `incr`)
+make log-check           # the compiler's logger: off by default, CRYO_LOG / --log /
+                         # --log-file / --debug each work (a verify gate: `log`)
 make selfhost-check      # byte-identity fixed point, BOTH OS, ~17 min
 make help                # every target, and every side effect beyond its named output
 ```

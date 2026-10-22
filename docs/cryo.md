@@ -4406,7 +4406,9 @@ Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` o
 
 | Flag                  | Effect                                                                                                                                  |
 | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `--debug`             | Verbose compiler logging.                                                                                                               |
+| `--debug`             | Compiler logging on in every area, at `debug`: the same as `--log=debug`.                                                               |
+| `--log=SPEC`          | Compiler logging, by area and level (below); applied after `CRYO_LOG`, so it wins.                                                      |
+| `--log-file=PATH`     | Append the compiler's log lines to `PATH` in place of stderr.                                                                           |
 | `--ast`               | Dump the AST after parsing.                                                                                                             |
 | `--emit-llvm`         | Emit LLVM IR (`.ll`) beside the object output.                                                                                          |
 | `--build-dir=PATH`    | Override `[project] output_dir`.                                                                                                        |
@@ -4423,6 +4425,8 @@ Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` o
 | `-o`, `--output PATH` | Redirect output for single-file builds; the output kind is inferred from the extension (`.o`, `.s`, `.ll`, or an executable).           |
 
 Test-only flags: `--ignored`, `--list`, `--exact`, `-q` / `--quiet`.
+
+**Compiler logging.** The compiler logs what it does, for whoever is working on the compiler; it is off unless switched on, by `CRYO_LOG=SPEC` in the environment or `--log=SPEC` (or `--debug`, or `debug = true` in cryoconfig, either meaning `--log=debug`). A spec is a comma-separated list of items: an area, `driver`, which logs that area at `debug`; `area=level`; or a level alone, which sets every area. A later item overrides an earlier one, so `CRYO_LOG=sema,codegen` logs two areas and `--log=debug,parse=off` logs all but one. The areas are `driver`, `loader`, `lex`, `parse`, `resolve`, `types`, `sema`, `mono`, `async`, `drop`, `codegen`, `link`, `bindgen`, `deps`, `diag`, `lsp` and `time`; the levels, from least to most said, `off`, `error`, `warn`, `info`, `debug` and `trace`. An item naming neither is reported on stderr and the rest of the spec still applies. Lines go to stderr, or appended to the file `CRYO_LOG_FILE` or `--log-file` names, each as `[level area] file:line function: message`, the place being where in the compiler's source the line was written. The language server takes no flags, so it reads `CRYO_LOG` and `CRYO_LOG_FILE` alone, and with them unset it logs nothing.
 
 ### 24.3 Standard-library lookup
 

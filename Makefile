@@ -169,7 +169,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check check-fast lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
+.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check log-check check-fast lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do verify-pin verify-pin-clean incremental-check \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -204,7 +204,7 @@ Tests and gates
   make roster-check      The discovered roster against tests/test-roster.txt
                          (ARGS=--merge after adding, --update after removing).
   make verify            Build once; census, examples, lsp-check, cross-check,
-                         incremental-instance-check and check-fast run
+                         incremental-instance-check, log-check and check-fast run
                          concurrently and their objects are hashed
                          (ARGS="--baseline HEAD --require-identical").
   make check-fast        verify's self-test and verify-pin; builds nothing.
@@ -224,6 +224,9 @@ Tests and gates
                          (refuses on Windows: a PE carries a link timestamp).
   make incremental-instance-check  An edit asking a cached module for a new
                          generic instance still links.
+  make log-check         The compiler's logger is off by default, and
+                         CRYO_LOG, --log, --log-file and --debug each do
+                         what they say (tests/fixtures/log).
   make vendor-check      Every constant shape survives `cryo vendor`.
   make verify-freestanding  Runtime tiers' freestanding acceptance check
                          (POSIX only; refuses on Windows).
@@ -668,6 +671,16 @@ incremental-instance-check: cryo
 else
 incremental-instance-check: cryo
 	@$(PYTHON) scripts/incremental-instance-check.py --cryo "$(STAGE2)"
+endif
+
+# The compiler's logger: off by default, and each switch does what it says
+# (tests/fixtures/log).
+ifeq ($(HOST_OS),windows)
+log-check: cryo
+	@$(PYTHON) scripts/log-gate.py --cryo "$(STAGE2_EXE)"
+else
+log-check: cryo
+	@$(PYTHON) scripts/log-gate.py --cryo "$(STAGE2)"
 endif
 
 # The judges behind verify's tests/started-compiling declarations, and

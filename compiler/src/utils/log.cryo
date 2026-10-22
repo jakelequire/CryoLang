@@ -1,0 +1,345 @@
+///! The compiler's logger.
+///!
+///! A line names its level, its area and the place it was written:
+///!
+///!     [debug driver] compiler/src/compiler/instance.cryo:1092 CompilerInstance::run_project: loading modules
+///!
+///! Every area is off until `CRYO_LOG` or `--log` switches it on (`--debug`
+///! is `--log=debug`).  A spec is a comma-separated list of items: `area`
+///! (that area at `debug`), `area=level`, or `level` (every area); a later
+///! item overrides an earlier one.
+///!
+///! Each emitting method checks `Log::enabled` itself, so a bare call is
+///! correct, but its message is built before the check.  A call on a hot
+///! path - per token, node, statement, expression, type or declaration - is
+///! written inside `if (Log::enabled(area, level)) { ... }`, so a disabled
+///! line builds nothing.
+namespace utils::log;
+
+import std::core::intrinsics;
+import std::alloc::box::{ Box };
+import std::env;
+import std::fmt;
+import std::io::traits::{ Write };
+import std::io::stdio;
+import std::io::stdio::{ StderrLock };
+import std::fs::file::{ File, OpenOptions };
+import std::fs::path::{ Path };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+
+/// How much an area says.  An area set to a level prints that level and
+/// every more severe one; `Off` prints nothing.
+type enum LogLevel {
+    Off;
+    Error;
+    Warn;
+    Info;
+    Debug;
+    Trace;
+}
+
+implement enum LogLevel {
+    /// The name a spec writes the level as; `""` past the last level.
+    static name_at(index: u64) -> string {
+        return match (index) {
+            0 => { "off" }
+            1 => { "error" }
+            2 => { "warn" }
+            3 => { "info" }
+            4 => { "debug" }
+            5 => { "trace" }
+            _ => { "" }
+        };
+    }
+
+    name(&this) -> string {
+        return LogLevel::name_at(*this as u64);
+    }
+}
+
+/// The part of the compiler a line comes from, and the unit a spec selects.
+type enum LogArea {
+    Driver;     // the build driver, the pass registry, CLI commands
+    Loader;     // module discovery, the module graph, imports
+    Lex;
+    Parse;
+    Resolve;    // name resolution
+    Types;      // the type arena, type resolution, layouts
+    Sema;       // body checking, directives, config gating, validation
+    Mono;       // monomorphization
+    Async;      // async lowering
+    Drop;       // drop insertion and move checking
+    Codegen;
+    Link;
+    Bindgen;    // C import and vendor bindings
+    Deps;       // dependencies, the lockfile, the cache
+    Diag;       // the diagnostic engine
+    Lsp;
+    Time;       // stage timings
+}
+
+implement enum LogArea {
+    /// The name a spec writes the area as; `""` past the last area.
+    static name_at(index: u64) -> string {
+        return match (index) {
+            0  => { "driver" }
+            1  => { "loader" }
+            2  => { "lex" }
+            3  => { "parse" }
+            4  => { "resolve" }
+            5  => { "types" }
+            6  => { "sema" }
+            7  => { "mono" }
+            8  => { "async" }
+            9  => { "drop" }
+            10 => { "codegen" }
+            11 => { "link" }
+            12 => { "bindgen" }
+            13 => { "deps" }
+            14 => { "diag" }
+            15 => { "lsp" }
+            16 => { "time" }
+            _  => { "" }
+        };
+    }
+
+    name(&this) -> string {
+        return LogArea::name_at(*this as u64);
+    }
+}
+
+/// Where log lines go.  A sink receives each line whole, newline included,
+/// and writes it in one piece, so lines from different threads do not
+/// interleave within a line.
+type trait LogSink {
+    write(mut &this, line: &String) -> void;
+}
+
+/// The default sink.
+type struct StandardErrorSink {
+    unused: u8;
+}
+
+implement trait LogSink for struct StandardErrorSink {
+    write(mut &this, line: &String) -> void {
+        mut lock: StderrLock = stdio::stderr().lock();
+        match (lock.write(line.as_str())) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { }
+        }
+    }
+}
+
+/// Appends every line to a file.
+type struct FileSink {
+    file: File;
+
+    /// Open `path` for appending, creating it if it is missing.
+    static open(path: Str) -> Option<FileSink> {
+        mut options: OpenOptions = OpenOptions::new();
+        options = options.write(true).append(true).create(true);
+        return match (File::open_with(Path::from(path), &options)) {
+            Result::Ok(file) => { Option::Some(FileSink { file: file }) }
+            Result::Err(_)   => { Option::None }
+        };
+    }
+}
+
+implement trait LogSink for struct FileSink {
+    write(mut &this, line: &String) -> void {
+        match (this.file.write(line.as_str())) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { }
+        }
+    }
+}
+
+/// Three bits per area, its `LogLevel`, at `area * 3`.
+mut g_log_levels: u64 = 0;
+mut g_log_standard_error: StandardErrorSink = StandardErrorSink { unused: 0 };
+/// `null` until a sink is chosen; a null sink is the standard error one.
+mut g_log_sink: virtual LogSink* = null;
+
+type struct Log {
+    /// True when `area` prints lines at `level`.
+    ![inline]
+    static enabled(area: LogArea, level: LogLevel) -> boolean {
+        return ((g_log_levels >> ((area as u64) * 3)) & 7) >= (level as u64);
+    }
+
+    ![caller_location]
+    static error(area: LogArea, message: String) -> void {
+        if (!Log::enabled(area, LogLevel::Error)) { return; }
+        Log::emit(area, LogLevel::Error, message.as_str(), intrinsics::location());
+    }
+
+    ![caller_location]
+    static error(area: LogArea, message: string) -> void {
+        if (!Log::enabled(area, LogLevel::Error)) { return; }
+        Log::emit(area, LogLevel::Error, Str::new(message), intrinsics::location());
+    }
+
+    ![caller_location]
+    static warn(area: LogArea, message: String) -> void {
+        if (!Log::enabled(area, LogLevel::Warn)) { return; }
+        Log::emit(area, LogLevel::Warn, message.as_str(), intrinsics::location());
+    }
+
+    ![caller_location]
+    static warn(area: LogArea, message: string) -> void {
+        if (!Log::enabled(area, LogLevel::Warn)) { return; }
+        Log::emit(area, LogLevel::Warn, Str::new(message), intrinsics::location());
+    }
+
+    ![caller_location]
+    static info(area: LogArea, message: String) -> void {
+        if (!Log::enabled(area, LogLevel::Info)) { return; }
+        Log::emit(area, LogLevel::Info, message.as_str(), intrinsics::location());
+    }
+
+    ![caller_location]
+    static info(area: LogArea, message: string) -> void {
+        if (!Log::enabled(area, LogLevel::Info)) { return; }
+        Log::emit(area, LogLevel::Info, Str::new(message), intrinsics::location());
+    }
+
+    ![caller_location]
+    static debug(area: LogArea, message: String) -> void {
+        if (!Log::enabled(area, LogLevel::Debug)) { return; }
+        Log::emit(area, LogLevel::Debug, message.as_str(), intrinsics::location());
+    }
+
+    ![caller_location]
+    static debug(area: LogArea, message: string) -> void {
+        if (!Log::enabled(area, LogLevel::Debug)) { return; }
+        Log::emit(area, LogLevel::Debug, Str::new(message), intrinsics::location());
+    }
+
+    ![caller_location]
+    static trace(area: LogArea, message: String) -> void {
+        if (!Log::enabled(area, LogLevel::Trace)) { return; }
+        Log::emit(area, LogLevel::Trace, message.as_str(), intrinsics::location());
+    }
+
+    ![caller_location]
+    static trace(area: LogArea, message: string) -> void {
+        if (!Log::enabled(area, LogLevel::Trace)) { return; }
+        Log::emit(area, LogLevel::Trace, Str::new(message), intrinsics::location());
+    }
+
+    /// Send every line to `sink` from now on.
+    static set_sink(sink: virtual LogSink*) -> void {
+        g_log_sink = sink;
+    }
+
+    /// Apply `CRYO_LOG` and `CRYO_LOG_FILE`, when they are set.
+    static configure_from_environment() -> void {
+        match (env::var(Str::new("CRYO_LOG"))) {
+            Option::Some(spec) => { Log::configure(spec.as_str(), "CRYO_LOG"); }
+            Option::None       => { }
+        }
+        match (env::var(Str::new("CRYO_LOG_FILE"))) {
+            Option::Some(path) => { Log::write_to_file(path.as_str(), "CRYO_LOG_FILE"); }
+            Option::None       => { }
+        }
+    }
+
+    /// Apply a spec on top of the levels already set.  An item naming no
+    /// area or level is reported on stderr, citing `origin`, and the rest
+    /// of the spec still applies.
+    static configure(spec: Str, origin: string) -> void {
+        const comma: Str = Str::new(",");
+        const equals: Str = Str::new("=");
+        for (raw in spec.split(&comma)) {
+            const item: Str = raw.trim();
+            if (item.is_empty()) { continue; }
+            match (item.find(&equals)) {
+                Option::Some(at) => {
+                    const area_name: Str = item.sub_bytes(0, at).trim();
+                    const level_name: Str = item.sub_bytes(at + 1, item.length()).trim();
+                    const area: u64 = Log::area_index(area_name);
+                    const level: u64 = Log::level_index(level_name);
+                    if (area == AREA_COUNT || level == LEVEL_COUNT) {
+                        Log::report_unknown(item, origin);
+                        continue;
+                    }
+                    Log::set_level(area, level);
+                }
+                Option::None => {
+                    const level: u64 = Log::level_index(item);
+                    if (level != LEVEL_COUNT) {
+                        for (mut area: u64 = 0; area < AREA_COUNT; area++) {
+                            Log::set_level(area, level);
+                        }
+                        continue;
+                    }
+                    const area: u64 = Log::area_index(item);
+                    if (area == AREA_COUNT) {
+                        Log::report_unknown(item, origin);
+                        continue;
+                    }
+                    Log::set_level(area, LogLevel::Debug as u64);
+                }
+            }
+        }
+    }
+
+    /// Send every line to the file at `path`, appended.  A file that cannot
+    /// be opened is reported on stderr, citing `origin`, and the sink is
+    /// left as it was.
+    static write_to_file(path: Str, origin: string) -> void {
+        match (FileSink::open(path)) {
+            Option::Some(sink) => {
+                const held: FileSink* = Box::new(sink).leak();
+                Log::set_sink(held);
+            }
+            Option::None => {
+                fmt::eprintln(f"warning: {origin}: cannot open log file '{path}'; logging to stderr");
+            }
+        }
+    }
+
+    private static emit(area: LogArea, level: LogLevel, message: Str,
+                        place: intrinsics::Location) -> void {
+        const line: String = f"[{level.name()} {area.name()}] {place.file}:{place.line} {place.function}: {message}\n";
+        if (g_log_sink == null) {
+            g_log_standard_error.write(&line);
+            return;
+        }
+        g_log_sink.write(&line);
+    }
+
+    private static set_level(area: u64, level: u64) -> void {
+        const shift: u64 = area * 3;
+        g_log_levels = (g_log_levels & ~(7 << shift)) | (level << shift);
+    }
+
+    /// The index of the area named `name`, or `AREA_COUNT`.
+    private static area_index(name: Str) -> u64 {
+        for (mut index: u64 = 0; index < AREA_COUNT; index++) {
+            if (name == Str::new(LogArea::name_at(index))) { return index; }
+        }
+        return AREA_COUNT;
+    }
+
+    /// The index of the level named `name`, or `LEVEL_COUNT`.
+    private static level_index(name: Str) -> u64 {
+        for (mut index: u64 = 0; index < LEVEL_COUNT; index++) {
+            if (name == Str::new(LogLevel::name_at(index))) { return index; }
+        }
+        return LEVEL_COUNT;
+    }
+
+    private static report_unknown(item: Str, origin: string) -> void {
+        mut areas: String = String::new();
+        for (mut index: u64 = 0; index < AREA_COUNT; index++) {
+            if (index > 0) { areas.push(", "); }
+            areas.push(LogArea::name_at(index));
+        }
+        fmt::eprintln(f"warning: {origin}: '{item}' names no log area or level; areas: {areas.as_str()}; levels: off, error, warn, info, debug, trace");
+    }
+}
+
+const AREA_COUNT: u64 = 17;
+const LEVEL_COUNT: u64 = 6;
