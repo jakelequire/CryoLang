@@ -2641,7 +2641,7 @@ A path naming a constant the primitive does not declare names no value and is re
 | type | constants |
 |---|---|
 | every integer type, `i8` to `i128`, `u8` to `u128`, `isize`, `usize` | `MIN`, `MAX`, and `BITS: u32`, the width in bits |
-| `char` | `MIN` (`'\0'`) and `MAX` (`'\u{10FFFF}'`) |
+| `char` | `MIN` (`'\0'`), `MAX` (`'\u{10FFFF}'`), and `BITS: u32` (32) |
 | `f32`, `f64` | `EPSILON`, `MAX`, `MIN` (the most-negative finite value), `MIN_POSITIVE` (the smallest positive normal value), `INFINITY`, `NEG_INFINITY`, `NAN` |
 
 `boolean` declares none. An integer limit is a compile-time integer, so `[u8; u64::MAX >> 61]` is an array of 7 and `static_assert(i32::MAX == 2147483647)` holds.

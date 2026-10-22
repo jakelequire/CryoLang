@@ -259,6 +259,22 @@ yet is recorded with the change that builds it, not here.
      `x: i8` draws no W0005, and is fixed on the associated-constants
      branch.  (Jake)
 
+530. **A reference to a constant compiles to its value, an immediate,
+     wherever the value folds,** not to a load from the constant's global.
+     The global and its address remain (ruling 511).  (Jake)
+
+531. **`char` has a `BITS: u32` constant, 32,** and the compiler's own
+     copy of the width is replaced by it.  (Jake)
+
+532. **An integer literal above `0x10FFFF` given to a `char` is refused
+     with an error.**  (Jake)
+
+533. **HTTP/2's "no limit" settings are written as `u32::MAX`.**  (Jake)
+
+534. **`1 << (u64::BITS - 1)` shifts at the type the result needs,** not
+     at the shift amount's narrower type, and is fixed on the
+     associated-constants branch.  (Jake)
+
 ### 2026-10-20
 
 465. **The removed class syntax is refused with E0117,** "`<form>` is not
