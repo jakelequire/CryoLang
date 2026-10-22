@@ -133,6 +133,16 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-22
+
+553. **A test project can set the compiler's environment and arguments,
+     and check its stderr apart from its stdout:** `test.json` takes
+     `environment` (`NAME=value` entries) and `arguments`, and `expect`
+     takes `stderr_contains` / `stderr_excludes`, line prefixes every
+     line of a stream must start with, and a file the command writes.
+     The logger's behaviour in a real `cryo` run is tested with these,
+     not by a script outside the suite.  (Jake)
+
 ### 2026-10-21
 
 501. **The class-removal plan is deleted now,** its slices all built and its

@@ -351,12 +351,7 @@ Open:
   sink sending lines to the editor as `window/logMessage` is not built;
 - one progress line is still printed directly rather than logged or
   reported: `[deps] cloning <url>` when a git dependency is first
-  fetched;
-- the `compiler_log` project drives the logger as a library; no test runs
-  the real `cryo` binary and checks what it writes to stderr (an area's
-  lines in a real build, `--debug` printing nothing but log lines, the
-  `time` report).  That needs the test runner to let a project set
-  environment variables for the compiler it runs and match its stderr.
+  fetched.
 
 ## The standard library's visibility pass
 

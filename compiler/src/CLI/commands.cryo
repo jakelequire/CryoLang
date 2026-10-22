@@ -95,8 +95,8 @@ type struct NegDiag {
 
 /// Parsed `test.json` for a multi-module test project (see
 /// `run_projects_suite`). The FIXTURE (`outcome`: 0 = collect, 1 = build,
-/// 2 = run) and the ASSERTIONS (the `expect` fields - `exit_code`, `fails`,
-/// `stdout_sub`, `output_contains`, `output_excludes`) are orthogonal.
+/// 2 = run), with its `environment` and `arguments`, and the ASSERTIONS (the
+/// `expect` fields) are orthogonal.
 /// `compile_fail` is a recognized alias for `build` + `fails`, and
 /// `expect.diagnostic` is sugar for `fails` + an `error[<code>]` marker in
 /// `output_contains`.
@@ -128,6 +128,38 @@ type struct ProjSpec {
     /// the raylib window demo) stay live without turning a portable
     /// `make test` red.  Empty = no prerequisites (the common case).
     requires:   [string];
+    /// `NAME=value` entries (test.json `environment`) set in the compiler's
+    /// environment for this project's command only.
+    environment: [string];
+    /// Extra arguments (test.json `arguments`) given to the compiler after
+    /// the fixture's own verb and flags.
+    arguments:  [string];
+    /// Every entry must appear in the compiler's stderr alone; no entry of
+    /// `stderr_excludes` may.
+    stderr_contains: [string];
+    stderr_excludes: [string];
+    /// When non-empty, every non-empty line of that stream must start with
+    /// one of these prefixes, so a line nobody expected fails the project
+    /// whatever it says.
+    stdout_line_prefixes: [string];
+    stderr_line_prefixes: [string];
+    /// A file the command writes, relative to the project (test.json
+    /// `expect.file`): removed before the command runs, so what is read
+    /// afterwards is this run's, then checked against `file_contains` and
+    /// `file_excludes` and removed again.  Empty = no file is checked.
+    file: string;
+    file_contains: [string];
+    file_excludes: [string];
+
+    static empty() -> ProjSpec {
+        return ProjSpec {
+            outcome: 0, ignore: false, exit_code: 0, fails: false, stdout_sub: "",
+            output_contains: [], output_excludes: [], requires: [],
+            environment: [], arguments: [], stderr_contains: [], stderr_excludes: [],
+            stdout_line_prefixes: [], stderr_line_prefixes: [],
+            file: "", file_contains: [], file_excludes: []
+        };
+    }
 }
 
 /// Result of dispatching one project: did it meet its declared outcome, and
@@ -210,6 +242,19 @@ function shell_in_dir(dir_text: string, cmd_text: string) -> string {
     const cmd: string = cmd_text;
     const dir: string = dir_text;
     return fmt::format("cd \"%s\" && %s", dir, cmd);
+}
+
+// The platform shell's spelling of "set `NAME=value` for the commands after
+// this one", written in front of a suite job's command.  The variable is set
+// in that job's own shell, never in this process, which every job shares.
+![target(windows)]
+function shell_set_environment(setting: string) -> string {
+    return fmt::format("set \"%s\" && ", setting);
+}
+
+![target(unix)]
+function shell_set_environment(setting: string) -> string {
+    return fmt::format("export \"%s\" && ", setting);
 }
 
 /// One batch of shell commands for a suite's worker pool, moved into each
@@ -2381,10 +2426,7 @@ type struct Executor {
             Result::Ok(v)      => { v }
             Result::Err(e)     => { mem::drop(e); return Option::None; }
         };
-        mut spec: ProjSpec = ProjSpec {
-            outcome: 0, ignore: false, exit_code: 0, fails: false, stdout_sub: "",
-            output_contains: [], output_excludes: [], requires: []
-        };
+        mut spec: ProjSpec = ProjSpec::empty();
 
         // Outcome selects the FIXTURE: collect (default) / build / run.
         // `compile_fail` is a recognized alias for `build` + `fails`, so the
@@ -2414,23 +2456,9 @@ type struct Executor {
             }
             Option::None => { }
         }
-        match (root.get(str::Str::new("requires"))) {
-            Option::Some(rp) => {
-                const n: u64 = rp.length();
-                for (mut i: u64 = 0; i < n; i++) {
-                    match (rp.at(i)) {
-                        Option::Some(ep) => {
-                            match (ep.as::<str::Str>()) {
-                                Option::Some(es) => { spec.requires.push(Executor::dup_cstr(es)); }
-                                Option::None     => { }
-                            }
-                        }
-                        Option::None => { }
-                    }
-                }
-            }
-            Option::None => { }
-        }
+        Executor::read_strings(&root, "requires", &spec.requires);
+        Executor::read_strings(&root, "environment", &spec.environment);
+        Executor::read_strings(&root, "arguments", &spec.arguments);
         match (root.get(str::Str::new("expect"))) {
             Option::Some(ep) => {
                 match (ep.get(str::Str::new("exit_code"))) {
@@ -2476,45 +2504,50 @@ type struct Executor {
                     }
                     Option::None => { }
                 }
-                match (ep.get(str::Str::new("output_contains"))) {
-                    Option::Some(ap) => {
-                        const n: u64 = ap.length();
-                        for (mut i: u64 = 0; i < n; i++) {
-                            match (ap.at(i)) {
-                                Option::Some(iv) => {
-                                    match (iv.as::<str::Str>()) {
-                                        Option::Some(is) => { spec.output_contains.push(Executor::dup_cstr(is)); }
-                                        Option::None     => { }
-                                    }
-                                }
-                                Option::None => { }
-                            }
+                Executor::read_strings(ep, "output_contains", &spec.output_contains);
+                Executor::read_strings(ep, "output_excludes", &spec.output_excludes);
+                Executor::read_strings(ep, "stderr_contains", &spec.stderr_contains);
+                Executor::read_strings(ep, "stderr_excludes", &spec.stderr_excludes);
+                Executor::read_strings(ep, "stdout_line_prefixes", &spec.stdout_line_prefixes);
+                Executor::read_strings(ep, "stderr_line_prefixes", &spec.stderr_line_prefixes);
+                match (ep.get(str::Str::new("file"))) {
+                    Option::Some(fp) => {
+                        match (fp.as::<str::Str>()) {
+                            Option::Some(fs) => { spec.file = Executor::dup_cstr(fs); }
+                            Option::None     => { }
                         }
                     }
                     Option::None => { }
                 }
-                match (ep.get(str::Str::new("output_excludes"))) {
-                    Option::Some(ap) => {
-                        const n: u64 = ap.length();
-                        for (mut i: u64 = 0; i < n; i++) {
-                            match (ap.at(i)) {
-                                Option::Some(iv) => {
-                                    match (iv.as::<str::Str>()) {
-                                        Option::Some(is) => { spec.output_excludes.push(Executor::dup_cstr(is)); }
-                                        Option::None     => { }
-                                    }
-                                }
-                                Option::None => { }
-                            }
-                        }
-                    }
-                    Option::None => { }
-                }
+                Executor::read_strings(ep, "file_contains", &spec.file_contains);
+                Executor::read_strings(ep, "file_excludes", &spec.file_excludes);
             }
             Option::None => { }
         }
         mem::drop(root);
         return Option::Some(spec);
+    }
+
+    /// Append each string of the array `object.key` to `into`; a missing key
+    /// or a non-string element adds nothing.
+    static read_strings(object: &value::JsonValue, key: string, into: mut &[string]) -> void {
+        match (object.get(str::Str::new(key))) {
+            Option::Some(ap) => {
+                const n: u64 = ap.length();
+                for (mut i: u64 = 0; i < n; i++) {
+                    match (ap.at(i)) {
+                        Option::Some(iv) => {
+                            match (iv.as::<str::Str>()) {
+                                Option::Some(is) => { into.push(Executor::dup_cstr(is)); }
+                                Option::None     => { }
+                            }
+                        }
+                        Option::None => { }
+                    }
+                }
+            }
+            Option::None => { }
+        }
     }
 
     /// True if `<projects_dir>/<name>/test.json` exists and `name` is a real
@@ -2601,10 +2634,7 @@ type struct Executor {
             if (!metadata::exists(path::Path::from(tj))) { continue; }
 
             const content: string = Executor::read_file_or_empty(tj);
-            mut spec: ProjSpec = ProjSpec {
-                outcome: 0, ignore: false, exit_code: 0, fails: false, stdout_sub: "",
-                output_contains: [], output_excludes: [], requires: []
-            };
+            mut spec: ProjSpec = ProjSpec::empty();
             mut parsed_ok: boolean = false;
             match (Executor::parse_test_json(content)) {
                 Option::Some(s) => { spec = s; parsed_ok = true; }
@@ -2641,6 +2671,7 @@ type struct Executor {
             verdict_of.push(verdict);
             reason_of.push(reason);
             if (verdict == 0) {
+                Executor::remove_project_file(proj_dir, &spec);
                 const out_path: string = Executor::job_tmp_path(tmp, cmds.length as u64);
                 job_of.push(cmds.length as i64);
                 cmds.push(Executor::project_command(self_exe, stdlib_abs, proj_dir, &spec, out_path));
@@ -2715,7 +2746,9 @@ type struct Executor {
                 const k: u64 = job_of[i] as u64;
                 Executor::wait_job(done.as_ptr(), k);
                 const out_path: string = Executor::job_tmp_path(tmp, k);
-                const res: ProjOutcome = Executor::project_outcome(&specs[i], status[k as i64], out_path);
+                const proj_dir: string = fmt::format("%s/%s", projects_dir, name);
+                const res: ProjOutcome = Executor::project_outcome(&specs[i], status[k as i64], out_path, proj_dir);
+                Executor::remove_project_file(proj_dir, &specs[i]);
                 Executor::proj_report(is_pretty, is_compact, color_on, res.passed, res.detail);
                 if (!res.passed) {
                     failures += 1;
@@ -2724,9 +2757,12 @@ type struct Executor {
                     if (!is_compact) {
                         const out: string = Executor::read_file_or_empty(out_path);
                         if (out.length() > 0) { fmt::printf("%s\n", out); }
+                        const err: string = Executor::read_file_or_empty(Executor::stderr_path(out_path));
+                        if (err.length() > 0) { fmt::printf("%s\n", err); }
                     }
                 }
                 dir::remove_file(path::Path::from(out_path));
+                dir::remove_file(path::Path::from(Executor::stderr_path(out_path)));
                 ran += 1;
             }
         }
@@ -2789,22 +2825,54 @@ type struct Executor {
         const tmp: string = tmp_text;
         mut std_flag: string = "";
         if (stdlib_abs.length() > 0) { std_flag = fmt::format(" --stdlib=%s", stdlib_abs); }
-        if (spec.outcome == 1 || spec.outcome == 2) {
-            // FIXTURE build (`cryo build`) or run (`cryo run`); both capture the
-            // combined stdout+stderr so the ASSERTIONS in `project_outcome`
-            // can scan it.
-            const verb: string = if (spec.outcome == 1) { "build" } else { "run" };
-            return shell_in_dir(proj_dir_text,
-                fmt::format("%s %s%s > %s 2>&1", self_exe, verb, std_flag, tmp));
+        // FIXTURE build (`cryo build`), run (`cryo run`) or collect (the
+        // project's own `cryo test`).  Stdout and stderr are captured apart so
+        // the ASSERTIONS in `project_outcome` can tell the streams apart.
+        const verb: string = if (spec.outcome == 1) { "build" }
+            else { if (spec.outcome == 2) { "run" } else { "test --format=plain" } };
+        mut command: String = String::new();
+        for (mut i: i64 = 0; i < spec.environment.length; i++) {
+            command.push(shell_set_environment(spec.environment[i]));
         }
-        // collect: run the project's own `cryo test`.
-        return shell_in_dir(proj_dir_text,
-            fmt::format("%s test --format=plain%s > %s 2>&1", self_exe, std_flag, tmp));
+        command.push(fmt::format("%s %s%s", self_exe, verb, std_flag));
+        for (mut i: i64 = 0; i < spec.arguments.length; i++) {
+            command.push(fmt::format(" \"%s\"", spec.arguments[i]));
+        }
+        command.push(fmt::format(" > %s 2> %s", tmp, Executor::stderr_path(tmp)));
+        return shell_in_dir(proj_dir_text, command.into_raw());
+    }
+
+    /// Remove the file a project's expectations read (`expect.file`), if any.
+    static remove_project_file(proj_dir: string, spec: &ProjSpec) -> void {
+        if (spec.file.length() > 0) {
+            dir::remove_file(path::Path::from(fmt::format("%s/%s", proj_dir, spec.file)));
+        }
+    }
+
+    /// Where a project's command captures its stderr, beside `stdout_path`.
+    static stderr_path(stdout_path: string) -> string {
+        return fmt::format("%s.err", stdout_path);
+    }
+
+    /// The stream's first line that starts with none of `prefixes`, or ""
+    /// when every non-empty line starts with one of them.
+    static first_unexpected_line(stream: string, prefixes: &[string]) -> string {
+        const newline: str::Str = str::Str::new("\n");
+        for (raw in str::Str::new(stream).split(&newline)) {
+            const line: str::Str = raw.trim();
+            if (line.is_empty()) { continue; }
+            mut expected: boolean = false;
+            for (mut i: i64 = 0; !expected && i < prefixes.length; i++) {
+                expected = line.starts_with(&str::Str::new(prefixes[i]));
+            }
+            if (!expected) { return Executor::dup_cstr(line); }
+        }
+        return "";
     }
 
     /// Judge one project from its command's exit status `st` and the output
     /// captured in `tmp`.
-    static project_outcome(spec: &ProjSpec, st: i32, tmp_text: string) -> ProjOutcome {
+    static project_outcome(spec: &ProjSpec, st: i32, tmp_text: string, proj_dir: string) -> ProjOutcome {
         mut passed: boolean = false;
         mut detail: string = "";
 
@@ -2814,7 +2882,9 @@ type struct Executor {
             // `output_contains` marker (both folded in at parse time).
             const verb: string = if (spec.outcome == 1) { "build" } else { "run" };
             const ec: i64 = st as i64;
-            const out: string = Executor::read_file_or_empty(tmp_text);
+            const standard_output: string = Executor::read_file_or_empty(tmp_text);
+            const standard_error: string = Executor::read_file_or_empty(Executor::stderr_path(tmp_text));
+            const out: string = fmt::format("%s%s", standard_output, standard_error);
 
             if (spec.fails) {
                 passed = ec != 0;
@@ -2837,6 +2907,52 @@ type struct Executor {
                 if (out.contains(spec.output_excludes[i])) {
                     passed = false;
                     detail = fmt::format("output must not contain \"%s\"", spec.output_excludes[i]);
+                }
+            }
+            for (mut i: i64 = 0; passed && i < spec.stderr_contains.length; i++) {
+                if (!standard_error.contains(spec.stderr_contains[i])) {
+                    passed = false;
+                    detail = fmt::format("stderr missing \"%s\"", spec.stderr_contains[i]);
+                }
+            }
+            for (mut i: i64 = 0; passed && i < spec.stderr_excludes.length; i++) {
+                if (standard_error.contains(spec.stderr_excludes[i])) {
+                    passed = false;
+                    detail = fmt::format("stderr must not contain \"%s\"", spec.stderr_excludes[i]);
+                }
+            }
+            if (passed && spec.stdout_line_prefixes.length > 0) {
+                const line: string = Executor::first_unexpected_line(standard_output, &spec.stdout_line_prefixes);
+                if (line.length() > 0) {
+                    passed = false;
+                    detail = fmt::format("unexpected stdout line \"%s\"", line);
+                }
+            }
+            if (passed && spec.stderr_line_prefixes.length > 0) {
+                const line: string = Executor::first_unexpected_line(standard_error, &spec.stderr_line_prefixes);
+                if (line.length() > 0) {
+                    passed = false;
+                    detail = fmt::format("unexpected stderr line \"%s\"", line);
+                }
+            }
+            if (passed && spec.file.length() > 0) {
+                const file_path: string = fmt::format("%s/%s", proj_dir, spec.file);
+                if (!metadata::exists(path::Path::from(file_path))) {
+                    passed = false;
+                    detail = fmt::format("no file %s", spec.file);
+                }
+                const written: string = Executor::read_file_or_empty(file_path);
+                for (mut i: i64 = 0; passed && i < spec.file_contains.length; i++) {
+                    if (!written.contains(spec.file_contains[i])) {
+                        passed = false;
+                        detail = fmt::format("%s missing \"%s\"", spec.file, spec.file_contains[i]);
+                    }
+                }
+                for (mut i: i64 = 0; passed && i < spec.file_excludes.length; i++) {
+                    if (written.contains(spec.file_excludes[i])) {
+                        passed = false;
+                        detail = fmt::format("%s must not contain \"%s\"", spec.file, spec.file_excludes[i]);
+                    }
                 }
             }
         } else {
