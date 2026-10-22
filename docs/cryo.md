@@ -164,6 +164,8 @@ const c: i8 = 0 - 128;     // -128: held
 
 A literal an integer is compared with, or combined with by an operator, takes the integer's type the same way, so `x != 127` and `x != -128` with `x: i8` are both comparisons of two `i8`s. A negated literal takes the type of a signed operand only: beside an unsigned one, `-1` keeps its default type rather than becoming a huge unsigned value.
 
+An integer literal stored where a `char` is takes `char`, and must be at most `0x10FFFF`, the largest Unicode scalar value: `const c: char = 0x110000;` is refused (`E0010`).
+
 > **Trap.** Integer literals exceeding `i64::MAX` (e.g. `0xFFFF_FFFF_FFFF_FFFF`) wrap to negative when used inline against a `u64` operand. Hoist the literal into a `const u64 NAME = ...` binding to compare correctly.
 
 #### String and Character Literals
