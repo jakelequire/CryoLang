@@ -9,7 +9,8 @@
 namespace compiler::codegen::visit::expr_dispatch;
 
 import compiler::codegen;
-import compiler::codegen::{ llvm_types, context };
+import compiler::codegen::{ llvm, llvm_types, context };
+import compiler::const_table::{ ConstEval };
 import compiler::codegen::state::visitor_state;
 import compiler::codegen::state::visitor_state::{ Emitted, VisitorState };
 import compiler::types;
@@ -22,13 +23,13 @@ import compiler::lex;
 import compiler::lex::{ TokenType };
 import std::ffi::libc;
 import compiler::ast::expression::{
-    ArrayAccessExpr, ExpressionNode, IdentifierExpr, UnaryExpr
+    ArrayAccessExpr, ExpressionNode, IdentifierExpr, ScopeResolutionExpr, UnaryExpr
 };
 import compiler::ast::statement::{ BlockStmt, Stmt };
 import compiler::codegen::visit::ir_generator;
 import compiler::codegen::visit::ir_generator::{ IRGeneratorVisitor };
 import compiler::codegen::context::{ CodegenContext };
-import compiler::codegen::llvm_types::{ LBasicBlock, LType, LValue };
+import compiler::codegen::llvm_types::{ LBasicBlock, LType, LTypeKind, LValue };
 import compiler::types::type_base::{ Type };
 
 
@@ -112,9 +113,49 @@ type struct ExprDispatch {
 
     // Value-shape helpers (codegen_expr / codegen_rvalue / codegen_lvalue)
 
+    /// The value of a name that refers to an integer, boolean or float
+    /// constant whose initializer folds, as an immediate; null for anything
+    /// else.
+    /// Read as a value, such a constant is its folded value, the same one
+    /// its global holds, so loading the global would only repeat it at run
+    /// time.  Only a value read comes here: `&NAME` takes the global's
+    /// address through the lvalue path.  The folder answers only for
+    /// immutable definitions, so a `mut` global is still loaded.
+    folded_constant_reference(mut &this, expr: ExpressionNode*) -> LValue {
+        const ident: IdentifierExpr* = ExpressionNode::identifier_of(expr);
+        const scoped: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(expr);
+        if (ident == null && scoped == null) { return LValue::null(); }
+        if (!expr.resolved_type.is_valid()) { return LValue::null(); }
+        const t: Type* = this.cg.arena_type(expr.resolved_type);
+        if (t == null) { return LValue::null(); }
+        const ty: LType = this.cg.type_mapper.map_type(expr.resolved_type);
+        if (!ty.is_valid()) { return LValue::null(); }
+        const evaluator: ConstEval = this.cg.decl.const_eval();
+        const kind: LTypeKind = LType::kind_of(ty.raw);
+        if (t.kind == TypeKind::Float && (kind == LTypeKind::Float || kind == LTypeKind::Double)) {
+            mut real: f64 = 0.0;
+            if (!evaluator.fold_real(expr, &real)) { return LValue::null(); }
+            return LType::const_real(ty, real);
+        }
+        if ((t.kind != TypeKind::Int && t.kind != TypeKind::Bool)
+            || kind != LTypeKind::Integer || llvm::LLVMGetIntTypeWidth(ty.raw) > 64) {
+            return LValue::null();
+        }
+        mut value: i128 = 0;
+        const known: boolean = if (ident != null) {
+            evaluator.fold_named(ident, &value)
+        } else {
+            evaluator.fold_scoped(scoped, &value)
+        };
+        if (!known || value < i64::MIN as i128 || value > u64::MAX as i128) { return LValue::null(); }
+        return LType::const_int(ty, value as u64, true);
+    }
+
     /// Codegen an expression, ensuring the result is an rvalue (loaded).
     codegen_rvalue(mut &this, visitor: IRGeneratorVisitor*, expr: ExpressionNode*) -> LValue {
         if (expr == null) { return LValue::null(); }
+        const folded: LValue = this.folded_constant_reference(expr);
+        if (folded.is_valid()) { return folded; }
         const e: Emitted = this.generate_expression(visitor, expr);
         const v: LValue = e.value;
 
