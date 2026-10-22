@@ -2285,8 +2285,21 @@ type struct CompilerInstance {
                 // workers; `cg_batch_cap == 1` flushes one at a time, byte-
                 // identical to a serial build.
                 const cg_tri: string = CodegenPasses::effective_triple(ctx);
-                mut cg_tm: LTargetMachine = LTargetMachine::create_target_machine_with_opt(
-                    cg_tri, ctx.options.opt_level as i32);
+                mut cg_tm: LTargetMachine = match (LTargetMachine::create_target_machine_with_opt(
+                        cg_tri, ctx.options.opt_level as i32)) {
+                    Result::Ok(machine) => { machine }
+                    Result::Err(reason) => {
+                        // Reported once: the next module stops on the error.
+                        CodegenPasses::report_missing_target(ctx, cg_tri, reason);
+                        mut unemitted: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
+                        unemitted.dispose();
+                        ctx.artifacts.ir = IROutput::empty();
+                        compiler::codegen::llvm_types::dispose_codegen_context();
+                        pipeline.reset();
+                        cg_failed = true;
+                        continue;
+                    }
+                };
                 cg_jobs.push(EmitJob {
                     llvm_module:     ctx.artifacts.ir.llvm_module,
                     llvm_context:    compiler::codegen::llvm_types::current_codegen_context(),
@@ -2307,30 +2320,8 @@ type struct CompilerInstance {
 
                 if (cg_jobs.length as u32 >= cg_batch_cap) {
                     CompilerInstance::emit_jobs_threaded(&cg_jobs, cg_threads);
-                    for (mut b: i64 = 0; b < cg_jobs.length as i64; b++) {
-                        const p: u32 = cg_pos[b];
-                        if (cg_jobs[b].ok &&
-                            !metadata::exists(Path::from(cg_jobs[b].emit_path))) {
-                            // Reported success and wrote nothing. In an
-                            // incremental build the previous build's object is
-                            // still on disk and would be archived in its place,
-                            // silently, so this has to fail the build.
-                            fmt::eprintln(f"error: codegen wrote no object for module {CompilerInstance::codegen_module_name(ctx, p)}");
-                            cg_failed = true;
-                        } else if (cg_jobs[b].ok) {
-                            cg_obj[p as i64] = cg_jobs[b].emit_path;
-                        } else {
-                            const emsg: string = cg_jobs[b].err_msg;
-                            if (emsg != null as string) {
-                                fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, p)}: {emsg}");
-                            } else {
-                                fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, p)}");
-                            }
-                            cg_failed = true;
-                        }
-                        if (cg_jobs[b].err_msg != null as string) {
-                            llvm::LLVMDisposeMessage(cg_jobs[b].err_msg as void*);
-                        }
+                    if (CompilerInstance::record_emitted_jobs(ctx, &cg_jobs, &cg_pos, &cg_obj)) {
+                        cg_failed = true;
                     }
                     cg_jobs.clear();
                     cg_pos.clear();
@@ -2340,26 +2331,8 @@ type struct CompilerInstance {
             // Flush any remaining accumulated jobs (the final partial batch).
             if (cg_jobs.length > 0) {
                 CompilerInstance::emit_jobs_threaded(&cg_jobs, cg_threads);
-                for (mut b: i64 = 0; b < cg_jobs.length as i64; b++) {
-                    const p: u32 = cg_pos[b];
-                    if (cg_jobs[b].ok &&
-                        !metadata::exists(Path::from(cg_jobs[b].emit_path))) {
-                        fmt::eprintln(f"error: codegen wrote no object for module {CompilerInstance::codegen_module_name(ctx, p)}");
-                        cg_failed = true;
-                    } else if (cg_jobs[b].ok) {
-                        cg_obj[p as i64] = cg_jobs[b].emit_path;
-                    } else {
-                        const emsg: string = cg_jobs[b].err_msg;
-                        if (emsg != null as string) {
-                            fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, p)}: {emsg}");
-                        } else {
-                            fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, p)}");
-                        }
-                        cg_failed = true;
-                    }
-                    if (cg_jobs[b].err_msg != null as string) {
-                        llvm::LLVMDisposeMessage(cg_jobs[b].err_msg as void*);
-                    }
+                if (CompilerInstance::record_emitted_jobs(ctx, &cg_jobs, &cg_pos, &cg_obj)) {
+                    cg_failed = true;
                 }
                 cg_jobs.clear();
                 cg_pos.clear();
@@ -3608,5 +3581,30 @@ type struct CompilerInstance {
 
         // All workers joined; dispose on the main thread.
         CompilerInstance::dispose_emit_jobs(jobs);
+    }
+
+    /// Record each emitted job's object at its module's topo position in
+    /// `objects`, report each job that failed, and answer whether any did.
+    static record_emitted_jobs(ctx: CompilationContext*, jobs: [EmitJob]*,
+                               positions: [u32]*, objects: [string]*) -> boolean {
+        mut failed: boolean = false;
+        for (mut b: i64 = 0; b < (*jobs).length as i64; b++) {
+            const job: EmitJob* = &(*jobs)[b];
+            const reason: String = LTargetMachine::take_message(job.err_msg as i8*);
+            if (!job.ok) {
+                CodegenPasses::report_emit_failure(ctx, job.emit_path, reason);
+                failed = true;
+            } else if (!metadata::exists(Path::from(job.emit_path))) {
+                // Reported success and wrote nothing.  In an incremental
+                // build the previous build's object is still on disk and
+                // would be archived in its place, silently, so this has to
+                // fail the build.
+                fmt::eprintln(f"error: codegen wrote no object for module {CompilerInstance::codegen_module_name(ctx, (*positions)[b])}");
+                failed = true;
+            } else {
+                (*objects)[(*positions)[b] as i64] = job.emit_path;
+            }
+        }
+        return failed;
     }
 }

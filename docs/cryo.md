@@ -4217,7 +4217,7 @@ target_triple = ""                  # cross-compile triple; empty => build for h
 stdlib_root   = ""                  # project-pinned stdlib root (see section 23.3)
 ```
 
-`target_triple` (e.g. `"x86_64-pc-windows-gnu"`) cross-compiles: it is threaded into LLVM and selects the target ABI and toolchain. For `x86_64-pc-windows-gnu` the build drives a full mingw-w64 link to a `.exe`: from a Linux host with `clang-20 --target=x86_64-w64-mingw32 -fuse-ld=lld` over the mingw-w64 sysroot (binutils' GNU ld for mingw relocates thread-local offsets, so a program it links faults on its first thread-local access once Windows moves the image), and the environment variable `CRYO_CC` names another driver; for triples without a known toolchain (aarch64, riscv, windows-msvc, ...) the host link step is skipped and the object files are left for a manual link. The CLI `--target=TRIPLE` overrides it.
+`target_triple` (e.g. `"x86_64-pc-windows-gnu"`) cross-compiles: it is threaded into LLVM and selects the target ABI and toolchain. For `x86_64-pc-windows-gnu` the build drives a full mingw-w64 link to a `.exe`: from a Linux host with `clang-20 --target=x86_64-w64-mingw32 -fuse-ld=lld` over the mingw-w64 sysroot (binutils' GNU ld for mingw relocates thread-local offsets, so a program it links faults on its first thread-local access once Windows moves the image), and the environment variable `CRYO_CC` names another driver; for other x86-64 triples without a known toolchain (windows-msvc, ...) the host link step is skipped and the object files are left for a manual link. The compiler's LLVM carries the x86-64 backend only: a triple for another architecture (aarch64, riscv64, ...) is refused with `E0647`, which gives LLVM's reason, and so is an object file LLVM cannot write. The CLI `--target=TRIPLE` overrides it.
 
 ### 23.2 `[compiler]`
 
@@ -4413,7 +4413,7 @@ Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` o
 | `--emit-llvm`         | Emit LLVM IR (`.ll`) beside the object output, including a module that fails LLVM verification (the build still fails).                 |
 | `--build-dir=PATH`    | Override `[project] output_dir`.                                                                                                        |
 | `--stdlib=PATH`       | Standard-library root for this run (highest priority; see section 23.3).                                                                |
-| `--target=TRIPLE`     | Cross-compile for an LLVM target triple. `x86_64-pc-windows-gnu` links to a `.exe` via mingw-w64; other triples emit object files only. |
+| `--target=TRIPLE`     | Cross-compile for an LLVM target triple. `x86_64-pc-windows-gnu` links to a `.exe` via mingw-w64; other x86-64 triples emit object files only; another architecture is `E0647`. |
 | `--opt-level=N`       | Optimization level `0`..`3`; overrides the profile and `[compiler] optimize`.                                                           |
 | `-g`, `--debug-info`  | Emit DWARF debug info.                                                                                                                  |
 | `--release`           | Build with the `release` profile (O2, no debug info).                                                                                   |

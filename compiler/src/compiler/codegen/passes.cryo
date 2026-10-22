@@ -847,7 +847,12 @@ type struct CodegenPasses {
             Log::debug(LogArea::Codegen, f"target triple {triple}");
         }
 
-        mut tm: LTargetMachine = LTargetMachine::create_target_machine_for_triple(triple);
+        // A triple LLVM has no target for leaves the module without a data
+        // layout; object emission reports it and fails the build.
+        mut tm: LTargetMachine = match (LTargetMachine::create_target_machine_for_triple(triple)) {
+            Result::Ok(machine) => { machine }
+            Result::Err(_)      => { LTargetMachine::null() }
+        };
         if (tm.is_valid()) {
             const layout: string = tm.get_data_layout_string();
             cg.llvm_module.set_data_layout(layout);
@@ -1050,11 +1055,12 @@ type struct CodegenPasses {
         }
 
         const opt_triple: string = ctx.options.target_triple;
-        mut tm: LTargetMachine = LTargetMachine::create_target_machine_with_opt(
-            opt_triple, ctx.options.opt_level as i32);
-        if (!tm.is_valid()) {
-            return PassResult::ok();
-        }
+        // A triple LLVM has no target for is reported by object emission.
+        mut tm: LTargetMachine = match (LTargetMachine::create_target_machine_with_opt(
+                opt_triple, ctx.options.opt_level as i32)) {
+            Result::Ok(machine) => { machine }
+            Result::Err(_)      => { return PassResult::ok(); }
+        };
 
         // Run the default optimization pipeline at the configured level.
         const opts: void* = llvm::LLVMCreatePassBuilderOptions();
@@ -1243,9 +1249,12 @@ type struct CodegenPasses {
                     const bc: string = CodegenPasses::substr(line, 0, tab as u64);
                     const ol: string = CodegenPasses::substr(
                         line, (tab + 1) as u64, line.length() - (tab as u64) - 1);
-                    if (!CodegenPasses::emit_object_from_bitcode(bc, ol, triple, opt)) {
-                        fmt::eprintln(f"__emit-obj: failed to emit {ol}");
-                        failures = failures + 1;
+                    match (CodegenPasses::emit_object_from_bitcode(bc, ol, triple, opt)) {
+                        Result::Ok(_) => { }
+                        Result::Err(reason) => {
+                            fmt::eprintln(f"__emit-obj: failed to emit {ol}: {reason.as_str()}");
+                            failures = failures + 1;
+                        }
                     }
                 }
             }
@@ -1331,10 +1340,10 @@ type struct CodegenPasses {
     /// module's bitcode from `bc_path` (written by the main process) in a FRESH
     /// per-process LLVM context and emit its object to `o_path`.  Runs in its
     /// own process, so there is no shared LLVM global state to race - the whole
-    /// point of going multi-process instead of multi-thread.  Returns true iff
-    /// the object was emitted.
+    /// point of going multi-process instead of multi-thread.  Answers why
+    /// the object was not emitted, when it was not.
     static emit_object_from_bitcode(bc_path_text: string, o_path_text: string,
-                                    triple_text: string, opt_level: u32) -> boolean {
+                                    triple_text: string, opt_level: u32) -> Result<(), String> {
         LTargetMachine::init_native_target();
         const eff: string = LTargetMachine::resolve_effective_triple(triple_text);
         const lctx: LContext = LContext::create();
@@ -1342,19 +1351,43 @@ type struct CodegenPasses {
         if (!m.is_valid()) {
             mut c0: LContext = lctx;
             c0.dispose();
-            return false;
+            return Result::Err(f"LLVM could not read the bitcode '{bc_path_text}'");
         }
-        mut ok: boolean = false;
-        mut tm: LTargetMachine = LTargetMachine::create_target_machine_with_opt(
-            eff, opt_level as i32);
-        if (tm.is_valid()) {
-            ok = tm.emit_to_file(m, o_path_text, LFileType::Object);
-            tm.dispose();
+        mut emitted: Result<(), String> = Result::Ok(());
+        match (LTargetMachine::create_target_machine_with_opt(eff, opt_level as i32)) {
+            Result::Ok(machine) => {
+                mut tm: LTargetMachine = machine;
+                emitted = tm.emit_to_file(m, o_path_text, LFileType::Object);
+                tm.dispose();
+            }
+            Result::Err(reason) => {
+                emitted = Result::Err(f"LLVM has no target for the triple '{eff}': {reason.as_str()}");
+            }
         }
         m.dispose();
         mut c: LContext = lctx;
         c.dispose();
-        return ok;
+        return emitted;
+    }
+
+    /// E0647: LLVM has no target for `triple`, for LLVM's `reason`.
+    static report_missing_target(ctx: CompilationContext*, triple: string, reason: String) -> void {
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0647_LLVM_BACKEND_FAILED,
+            fmt::format("LLVM has no target for the triple '%s': %s", triple, reason.as_cstr() as string));
+        d = d.help("name a triple this compiler's LLVM supports, with `--target` or cryoconfig's `target_triple`; `cryo version --triple` prints the host's");
+        ctx.emit_diagnostic(d);
+    }
+
+    /// E0647: LLVM could not write the object or assembly file at `path`,
+    /// for LLVM's `reason`, which may be empty.
+    static report_emit_failure(ctx: CompilationContext*, path: string, reason: String) -> void {
+        if (reason.is_empty()) {
+            ctx.emit_error(ErrorCode::E0647_LLVM_BACKEND_FAILED,
+                fmt::format("LLVM could not emit '%s'", path));
+            return;
+        }
+        ctx.emit_error(ErrorCode::E0647_LLVM_BACKEND_FAILED,
+            fmt::format("LLVM could not emit '%s': %s", path, reason.as_cstr() as string));
     }
 
     static run_object_emission(ctx: CompilationContext*) -> PassResult {
@@ -1375,22 +1408,24 @@ type struct CodegenPasses {
         // a stale host machine here would silently undo the cross-
         // compile we set up in IR generation.
         const obj_triple: string = ctx.options.target_triple;
-        mut tm: LTargetMachine = LTargetMachine::create_target_machine_with_opt(
-            obj_triple, ctx.options.opt_level as i32);
-        if (!tm.is_valid()) {
-            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                "failed to create target machine for object emission");
-            return PassResult::failure(1);
-        }
+        mut tm: LTargetMachine = match (LTargetMachine::create_target_machine_with_opt(
+                obj_triple, ctx.options.opt_level as i32)) {
+            Result::Ok(machine) => { machine }
+            Result::Err(reason) => {
+                CodegenPasses::report_missing_target(ctx, obj_triple, reason);
+                return PassResult::failure(1);
+            }
+        };
 
         const mod: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
-        const success: boolean = tm.emit_to_file(mod, target.emit_path, target.emit_type);
+        const emitted: Result<(), String> = tm.emit_to_file(mod, target.emit_path, target.emit_type);
         tm.dispose();
-
-        if (!success) {
-            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                fmt::format("failed to emit object file: %s", target.emit_path));
-            return PassResult::failure(1);
+        match (emitted) {
+            Result::Ok(_) => { }
+            Result::Err(reason) => {
+                CodegenPasses::report_emit_failure(ctx, target.emit_path, reason);
+                return PassResult::failure(1);
+            }
         }
 
         // Store the object file path.
@@ -2457,8 +2492,7 @@ type struct EmitJob {
     should_register: boolean;
     ok:              boolean;   // result: emission succeeded
     err_msg:         string;    // LLVM error message on failure (worker-set;
-                                // the main-thread report loop prints it and
-                                // disposes it via LLVMDisposeMessage)
+                                // the main thread reports it and disposes it)
 }
 
 /// Emit ONE module's object file from its own standalone LLVM context (the
@@ -2489,7 +2523,7 @@ function codegen_emit_job(job: EmitJob*) -> void {
         (*job).emit_type as i32, &err as void*);
     // Hand the LLVM error string to the main thread instead of discarding it
     // (storing the raw pointer allocates nothing on the Cryo side); the
-    // report loop prints it and disposes it with LLVMDisposeMessage.
+    // main thread reports it and disposes it.
     (*job).err_msg = err as string;
     (*job).ok = rc == 0;
 }

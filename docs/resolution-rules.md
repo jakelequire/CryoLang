@@ -143,6 +143,12 @@ yet is recorded with the change that builds it, not here.
      The logger's behaviour in a real `cryo` run is tested with these,
      not by a script outside the suite.  (Jake)
 
+554. **LLVM refusing to emit an object, or having no target for the
+     triple, is a diagnostic, E0647,** carrying LLVM's own reason and
+     failing the build, in place of ruling 549's unnumbered `error:`
+     line.  A triple with no target is reported once, not once per
+     module.  (Jake)
+
 ### 2026-10-21
 
 501. **The class-removal plan is deleted now,** its slices all built and its
