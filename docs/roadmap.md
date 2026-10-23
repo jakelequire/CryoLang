@@ -366,7 +366,9 @@ implementation included (564, 565, 567); and `module x;`, `internal module
 x;` and the grouped forms reach as far as they say, with `public module`
 refused (568); and the compiler finds its language items by the
 library's `![language("name")]` on each, so an f-string's builder calls
-name their items and are never refused (570, 571).  Left over from that:
+name their items and are never refused (570, 571); and a `Location` is
+read through `file()`, `line()`, `column()` and `function()`, its fields
+private, so only the compiler makes one (414).  Left over from that:
 `a <=> b` lowers to a call of `compare` by name and the async entry point
 calls `Executor::new` and `block_on` by name; whether `<=>` means `Ord`'s
 `compare` alone is open.  The rest, in order:
@@ -378,12 +380,7 @@ calls `Executor::new` and `block_on` by name; whether `<=>` means `Ord`'s
 2. **`Display` and `Debug` over a trait object:** one non-generic `fmt`
    writing through a `virtual mut &FmtWrite` held by `Formatter`, in
    place of `fmt<W>`; code size and the fmt suites measured first.
-3. **`std::core::intrinsics::Location`** with private fields and the
-   read methods `file()`, `line()`, `column()`, `function()`: only the
-   compiler makes one (`location()`, the caller of a
-   `![caller_location]` function), and a program reads one but cannot
-   build one.
-4. **Every item marked.**  About 650 helpers used only in their own
+3. **Every item marked.**  About 650 helpers used only in their own
    module become `private`; about 215 used across the library become
    `internal`; implementation modules become `internal module`:
    `future::reactor` and `raw_buffer` once the public fields naming

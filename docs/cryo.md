@@ -906,12 +906,14 @@ A place in the source is the value of the intrinsic function `location()`, a `Lo
 
 ```cryo
 type struct Location {
-    file:     string;   // the source file, as the build was given it
-    line:     u32;      // from 1
-    column:   u32;      // from 1
-    function: string;   // the readable qualified name of the enclosing function
+    file(&this) -> string;     // the source file, as the build was given it
+    line(&this) -> u32;        // from 1
+    column(&this) -> u32;      // from 1
+    function(&this) -> string; // the readable qualified name of the enclosing function
 }
 ```
+
+Only the compiler makes a `Location`: its fields are private, so a program reads a place through these methods and cannot build one or change one (E0353).
 
 Each call answers the place it is written: the line and column of the call itself, and the function it is written in, named by its qualified path (`App::Main::main`, `App::Main::Probe::own`), never by its linker symbol. Two calls on one line answer two columns. Code the compiler moves into a function of its own is named for the function it is written in: a lambda's or a closure's body names the enclosing function, an `async function`'s body the async function, and every specialization of a generic function or method the generic as written (`App::Main::Holder::at`).
 
@@ -921,7 +923,7 @@ import std::core::intrinsics;
 
 function main() -> i32 {
     const here: intrinsics::Location = intrinsics::location();
-    fmt::println(f"{here.file}:{here.line}:{here.column} in {here.function}");
+    fmt::println(f"{here.file()}:{here.line()}:{here.column()} in {here.function()}");
     return 0;
 }
 ```
