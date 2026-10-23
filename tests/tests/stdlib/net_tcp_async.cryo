@@ -19,6 +19,7 @@ namespace CryoTests::Tests::Stdlib::NetTcpAsync;
 import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::core::drop;
+import std::core::mem;
 import std::collections::str::{ Str };
 import std::future;
 import std::net::addr::socket_addr::{ SocketAddr };
@@ -41,7 +42,6 @@ import std::future::timer::{ Sleep };
 async function serve_echo(listener: TcpListener) -> i64 {
     mut acc: TcpAccepted = await TcpAccept::start(listener);
     mut lst: TcpListener = acc.take_listener();
-    lst.drop();
 
     mut stream: TcpStream = TcpStream::from_fd(-1);
     match (acc.take_result()) {
@@ -58,14 +58,12 @@ async function serve_echo(listener: TcpListener) -> i64 {
     mut got: Array<u8>  = rio.take_buf();
     match (rio.outcome()) {
         Result::Ok(_)  => { }
-        Result::Err(_) => { s2.drop(); got.drop(); return -2; }
+        Result::Err(_) => { return -2; }
     }
 
     mut wio: TcpIo = await TcpWrite::start(s2, got);
     mut s3:   TcpStream = wio.take_stream();
     mut back: Array<u8> = wio.take_buf();
-    back.drop();
-    s3.drop();
     match (wio.outcome()) {
         Result::Ok(k)  => { return k as i64; }
         Result::Err(_) => { return -3; }
@@ -89,18 +87,16 @@ async function echo_client(port: u16) -> i64 {
     // A write hands the buffer back untouched, so a short write still has the
     // bytes it has not sent.
     const sent_len: u64 = sent.length() as u64;
-    sent.drop();
-    if (sent_len != 5) { s2.drop(); return -11; }
+    if (sent_len != 5) { return -11; }
     match (wio.outcome()) {
-        Result::Ok(k)  => { if (k != 5) { s2.drop(); return -12; } }
-        Result::Err(_) => { s2.drop(); return -13; }
+        Result::Ok(k)  => { if (k != 5) { return -12; } }
+        Result::Err(_) => { return -13; }
     }
 
     mut rbuf: Array<u8> = Array::<u8>::new();
     rbuf.resize(64, 0);
     mut rio: TcpIo = await TcpRead::start(s2, rbuf);
     mut s3: TcpStream = rio.take_stream();
-    s3.drop();
     // A read hands back a buffer TRUNCATED to what arrived, so its length is the
     // byte count - a 64-byte buffer that received 5 bytes comes back at 5.
     mut echoed: Array<u8> = rio.take_buf();
@@ -110,7 +106,6 @@ async function echo_client(port: u16) -> i64 {
         Option::Some(v) => { first = v; }
         Option::None    => { }
     }
-    echoed.drop();
     if (len != 5)   { return -14; }
     if (first != 72) { return -15; }
     return 5;
@@ -128,14 +123,13 @@ async function echo_round_trip(port: u16, listener: TcpListener) -> i64 {
 async function accept_and_hold(listener: TcpListener, hold_ms: u64) -> i64 {
     mut acc: TcpAccepted = await TcpAccept::start(listener);
     mut lst: TcpListener = acc.take_listener();
-    lst.drop();
     mut stream: TcpStream = TcpStream::from_fd(-1);
     match (acc.take_result()) {
         Result::Ok(s)  => { stream = s; }
         Result::Err(_) => { return -20; }
     }
     await Sleep::new(Duration::from_millis(hold_ms));
-    stream.drop();
+    mem::drop(stream);  // held open until the sleep ends
     return 1;
 }
 
@@ -157,8 +151,6 @@ async function read_until_timeout(port: u16) -> i64 {
             mut done: TcpIo = io;
             mut s: TcpStream = done.take_stream();
             mut b: Array<u8> = done.take_buf();
-            s.drop();
-            b.drop();
             return -31;
         }
         Result::Err(_) => { return 1; }
@@ -184,12 +176,11 @@ function async_tcp_echo_round_trip() -> Result<(), TestError> {
     listener.set_nonblocking(true);
     const port: u16 = match (listener.local_addr()) {
         Result::Ok(a)  => { a.port }
-        Result::Err(_) => { listener.drop(); return bail(Str::new("local_addr failed")); }
+        Result::Err(_) => { return bail(Str::new("local_addr failed")); }
     };
 
     mut ex: Executor = Executor::new();
     const r: i64 = ex.block_on(echo_round_trip(port, listener));
-    ex.drop();
     return expect_eq(r, 0 as i64);
 }
 
@@ -202,11 +193,10 @@ function async_tcp_read_timeout_cancels_cleanly() -> Result<(), TestError> {
     listener.set_nonblocking(true);
     const port: u16 = match (listener.local_addr()) {
         Result::Ok(a)  => { a.port }
-        Result::Err(_) => { listener.drop(); return bail(Str::new("local_addr failed")); }
+        Result::Err(_) => { return bail(Str::new("local_addr failed")); }
     };
 
     mut ex: Executor = Executor::new();
     const r: i64 = ex.block_on(timed_out_read(port, listener));
-    ex.drop();
     return expect_eq(r, 0 as i64);
 }

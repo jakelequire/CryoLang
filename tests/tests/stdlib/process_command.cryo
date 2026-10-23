@@ -125,9 +125,8 @@ function true_command_succeeds() -> Result<(), TestError> {
     mut code: i32 = -1;
     match (cmd.status()) {
         Result::Ok(st) => { success = st.success(); code = st.exit_code().unwrap_or(-1); }
-        Result::Err(_) => { cmd.drop(); return bail(Str::new("true command status failed")); }
+        Result::Err(_) => { return bail(Str::new("true command status failed")); }
     }
-    cmd.drop();
     match (expect(success, Str::new("true command should report success"))) {
         Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
     }
@@ -141,9 +140,8 @@ function false_command_fails() -> Result<(), TestError> {
     mut code: i32 = -1;
     match (cmd.status()) {
         Result::Ok(st) => { success = st.success(); code = st.exit_code().unwrap_or(-1); }
-        Result::Err(_) => { cmd.drop(); return bail(Str::new("false command status failed")); }
+        Result::Err(_) => { return bail(Str::new("false command status failed")); }
     }
-    cmd.drop();
     match (expect_false(success, Str::new("false command should not report success"))) {
         Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
     }
@@ -158,7 +156,6 @@ function missing_program_exits_127() -> Result<(), TestError> {
     // both per target.
     mut cmd: Command = Command::new(Str::new("/no/such/cryo_program_xyzzy"));
     const r: Result<ExitStatus, IoError> = cmd.status();
-    cmd.drop();
     return expect_missing(r);
 }
 
@@ -191,7 +188,6 @@ function echo_stdout_via_pipe() -> Result<(), TestError> {
                                 while (i < n) { acc.push(chunk[i]); i++; }
                             }
                             Result::Err(_) => {
-                                c.drop(); cmd.drop(); acc.drop();
                                 return bail(Str::new("reading child stdout failed"));
                             }
                         }
@@ -201,15 +197,12 @@ function echo_stdout_via_pipe() -> Result<(), TestError> {
             }
             match (c.wait()) {
                 Result::Ok(st) => { success = st.success(); }
-                Result::Err(_) => { c.drop(); cmd.drop(); acc.drop(); return bail(Str::new("wait failed")); }
+                Result::Err(_) => { return bail(Str::new("wait failed")); }
             }
-            c.drop();
         }
-        Result::Err(_) => { cmd.drop(); acc.drop(); return bail(Str::new("spawn of echo failed")); }
+        Result::Err(_) => { return bail(Str::new("spawn of echo failed")); }
     }
-    cmd.drop();
     const content_ok: boolean = array_eq_str(&acc, echo_hello_expect());
-    acc.drop();
 
     match (expect(success, Str::new("echo should succeed"))) {
         Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
@@ -231,11 +224,9 @@ function output_captures_stdout() -> Result<(), TestError> {
             mut o: Output = out;
             success = o.status.success();
             content_ok = array_eq_str(&o.stdout, echo_foobar_expect());
-            o.drop();
         }
-        Result::Err(_) => { cmd.drop(); return bail(Str::new("output() failed")); }
+        Result::Err(_) => { return bail(Str::new("output() failed")); }
     }
-    cmd.drop();
     match (expect(success, Str::new("echo foo bar should succeed"))) {
         Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
     }
@@ -272,7 +263,6 @@ function output_with_large_stderr_does_not_deadlock() -> Result<(), TestError> {
             success    = o.status.success();
             got_stdout = o.stdout.length() >= 4;     // "done\n"
             got_stderr = o.stderr.length() >= 100000;
-            o.drop();
         }
         Result::Err(_) => {
             // /bin/sh missing on this host - skip rather than fail.  This is
@@ -281,11 +271,9 @@ function output_with_large_stderr_does_not_deadlock() -> Result<(), TestError> {
             // the Windows collect_output still drains stdout-then-stderr
             // sequentially, so it must not be handed this >64-KiB-stderr
             // workload until it grows a concurrent drain of its own.
-            cmd.drop();
             return Result::Ok(());
         }
     }
-    cmd.drop();
     match (expect(!deadlocked, Str::new("output() must return; old serial drain deadlocked"))) {
         Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
     }
@@ -332,11 +320,9 @@ function env_override_passed_to_child() -> Result<(), TestError> {
             mut o: Output = out;
             success = o.status.success();
             content_ok = array_eq_str(&o.stdout, print_var_expect());
-            o.drop();
         }
-        Result::Err(_) => { cmd.drop(); return bail(Str::new("output() of env command failed")); }
+        Result::Err(_) => { return bail(Str::new("output() of env command failed")); }
     }
-    cmd.drop();
     match (expect(success, Str::new("print-var command should succeed"))) {
         Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
     }
@@ -355,9 +341,8 @@ function stdout_null_spawns_and_succeeds() -> Result<(), TestError> {
     mut success: boolean = false;
     match (cmd.status()) {
         Result::Ok(st) => { success = st.success(); }
-        Result::Err(_) => { cmd.drop(); return bail(Str::new("status() with stdout=Null failed")); }
+        Result::Err(_) => { return bail(Str::new("status() with stdout=Null failed")); }
     }
-    cmd.drop();
     return expect(success, Str::new("echo with stdout/stderr=Null should exit 0"));
 }
 
@@ -377,7 +362,6 @@ function stdout_fd_redirects_to_file() -> Result<(), TestError> {
             mut f: File = handle;
             raw = f.fd;
             f.fd = -1;          // ownership goes to the spawn; drop is now a no-op
-            f.drop();
         }
         Result::Err(_) => { return bail(Str::new("File::create failed")); }
     }
@@ -389,12 +373,12 @@ function stdout_fd_redirects_to_file() -> Result<(), TestError> {
     match (cmd.status()) {
         Result::Ok(st) => { success = st.success(); }
         Result::Err(_) => {
-            cmd.drop();
+            mem::drop(cmd);  // closes the redirect target before it is removed
             match (remove_file(p)) { Result::Ok(_) => { } Result::Err(_) => { } }
             return bail(Str::new("status() with stdout=Fd failed"));
         }
     }
-    cmd.drop();
+    mem::drop(cmd);  // closes the redirect target before it is read back
 
     // Read the redirect target back: the child's stdout must be in it.
     mut readbuf: [u8; 64];
@@ -405,12 +389,11 @@ function stdout_fd_redirects_to_file() -> Result<(), TestError> {
             match (f.read_all(&readbuf[0], 64)) {
                 Result::Ok(n)  => { got = n; }
                 Result::Err(_) => {
-                    f.drop();
+                    mem::drop(f);  // closed before the file is removed
                     match (remove_file(p)) { Result::Ok(_) => { } Result::Err(_) => { } }
                     return bail(Str::new("read-back of redirect target failed"));
                 }
             }
-            f.drop();
         }
         Result::Err(_) => {
             match (remove_file(p)) { Result::Ok(_) => { } Result::Err(_) => { } }
@@ -458,15 +441,12 @@ function output_large_stderr_no_deadlock_win() -> Result<(), TestError> {
             deadlocked = false;
             got_stdout = o.stdout.length() >= 4;        // "done"
             got_stderr = o.stderr.length() >= 100000;
-            o.drop();
         }
         Result::Err(_) => {
             // PowerShell missing on this host - skip rather than fail.
-            cmd.drop();
             return Result::Ok(());
         }
     }
-    cmd.drop();
     match (expect(!deadlocked, Str::new("output() must return; interleaved drain must not deadlock"))) {
         Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
     }

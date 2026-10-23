@@ -22,7 +22,6 @@ function new_arena_is_empty() -> Result<(), TestError> {
     mut a: Arena = Arena::new();
     const cap: u64 = a.capacity();
     const used: u64 = a.used();
-    a.drop();
     match (expect_eq(cap, 0)) {
         Result::Ok(_)  => { } Result::Err(e) => { return Result::Err(e); }
     }
@@ -39,9 +38,8 @@ function allocate_returns_usable_memory() -> Result<(), TestError> {
             *ip = 1234567;
             wrote_back = *ip;
         }
-        Result::Err(_) => { a.drop(); return bail(Str::new("allocate(4,4) failed")); }
+        Result::Err(_) => { return bail(Str::new("allocate(4,4) failed")); }
     }
-    a.drop();
     return expect_eq(wrote_back, 1234567);
 }
 
@@ -52,13 +50,12 @@ function allocate_distinct_pointers() -> Result<(), TestError> {
     mut p1: u64 = 0;
     match (a.allocate(Layout::new(8, 8))) {
         Result::Ok(nn) => { p0 = nn.as_ptr() as u64; }
-        Result::Err(_) => { a.drop(); return bail(Str::new("first allocate failed")); }
+        Result::Err(_) => { return bail(Str::new("first allocate failed")); }
     }
     match (a.allocate(Layout::new(8, 8))) {
         Result::Ok(nn) => { p1 = nn.as_ptr() as u64; }
-        Result::Err(_) => { a.drop(); return bail(Str::new("second allocate failed")); }
+        Result::Err(_) => { return bail(Str::new("second allocate failed")); }
     }
-    a.drop();
     return expect_ne(p0, p1);
 }
 
@@ -68,15 +65,14 @@ function allocate_respects_alignment() -> Result<(), TestError> {
     // Misalign the bump offset with a single odd byte first...
     match (a.allocate(Layout::new(1, 1))) {
         Result::Ok(_)  => { }
-        Result::Err(_) => { a.drop(); return bail(Str::new("priming alloc failed")); }
+        Result::Err(_) => { return bail(Str::new("priming alloc failed")); }
     }
     // ...then demand 8-byte alignment and confirm the pointer honors it.
     mut aligned: boolean = false;
     match (a.allocate(Layout::new(8, 8))) {
         Result::Ok(nn) => { aligned = is_aligned(nn.as_ptr() as u64, 8); }
-        Result::Err(_) => { a.drop(); return bail(Str::new("aligned alloc failed")); }
+        Result::Err(_) => { return bail(Str::new("aligned alloc failed")); }
     }
-    a.drop();
     return expect(aligned, Str::new("8-byte request must return an 8-aligned pointer"));
 }
 
@@ -84,7 +80,6 @@ function allocate_respects_alignment() -> Result<(), TestError> {
 function zero_sized_allocation_errors() -> Result<(), TestError> {
     mut a: Arena = Arena::new();
     const r: Result<NonNull<u8>, AllocError> = a.allocate(Layout::new(0, 1));
-    a.drop();
     return expect_err(&r, Str::new("zero-sized request must be rejected"));
 }
 
@@ -93,11 +88,10 @@ function used_and_capacity_track_allocations() -> Result<(), TestError> {
     mut a: Arena = Arena::with_chunk_size(1024);
     match (a.allocate(Layout::new(8, 8))) {
         Result::Ok(_)  => { }
-        Result::Err(_) => { a.drop(); return bail(Str::new("allocate failed")); }
+        Result::Err(_) => { return bail(Str::new("allocate failed")); }
     }
     const used: u64 = a.used();
     const cap: u64 = a.capacity();
-    a.drop();
     match (expect_eq(used, 8)) {     // exactly the bytes handed out
         Result::Ok(_)  => { } Result::Err(e) => { return Result::Err(e); }
     }
@@ -111,10 +105,9 @@ function large_request_gets_own_chunk() -> Result<(), TestError> {
     mut a: Arena = Arena::with_chunk_size(64);
     match (a.allocate(Layout::new(100, 1))) {
         Result::Ok(_)  => { }
-        Result::Err(_) => { a.drop(); return bail(Str::new("oversized allocate failed")); }
+        Result::Err(_) => { return bail(Str::new("oversized allocate failed")); }
     }
     const cap: u64 = a.capacity();
-    a.drop();
     return expect(cap >= 100, Str::new("oversized request needs a chunk >= 100 bytes"));
 }
 
@@ -128,7 +121,6 @@ function overflow_allocates_additional_chunk() -> Result<(), TestError> {
     match (a.allocate(Layout::new(8, 8))) { Result::Ok(_) => { } Result::Err(_) => { ok = false; } }
     const cap: u64 = a.capacity();
     const used: u64 = a.used();
-    a.drop();
     match (expect(ok, Str::new("all three allocations should succeed"))) {
         Result::Ok(_)  => { } Result::Err(e) => { return Result::Err(e); }
     }
@@ -143,7 +135,7 @@ function reset_reuses_chunks_and_arena_reusable() -> Result<(), TestError> {
     mut a: Arena = Arena::with_chunk_size(256);
     match (a.allocate(Layout::new(16, 8))) {
         Result::Ok(_)  => { }
-        Result::Err(_) => { a.drop(); return bail(Str::new("pre-reset allocate failed")); }
+        Result::Err(_) => { return bail(Str::new("pre-reset allocate failed")); }
     }
     const cap_before_reset: u64 = a.capacity();
     a.reset();
@@ -155,7 +147,6 @@ function reset_reuses_chunks_and_arena_reusable() -> Result<(), TestError> {
         Result::Ok(_)  => { reusable = true; }
         Result::Err(_) => { }
     }
-    a.drop();
     // Reset reuses the chunks (does NOT free them back to the system).
     match (expect_eq(cap_after_reset, cap_before_reset)) {
         Result::Ok(_)  => { } Result::Err(e) => { return Result::Err(e); }
@@ -175,22 +166,21 @@ function reset_does_not_round_trip_through_system_allocator() -> Result<(), Test
     mut a: Arena = Arena::with_chunk_size(1024);
     match (a.allocate(Layout::new(64, 8))) {
         Result::Ok(_)  => { }
-        Result::Err(_) => { a.drop(); return bail(Str::new("first allocate failed")); }
+        Result::Err(_) => { return bail(Str::new("first allocate failed")); }
     }
     const cap1: u64 = a.capacity();
     a.reset();
     match (a.allocate(Layout::new(64, 8))) {
         Result::Ok(_)  => { }
-        Result::Err(_) => { a.drop(); return bail(Str::new("post-reset allocate failed")); }
+        Result::Err(_) => { return bail(Str::new("post-reset allocate failed")); }
     }
     const cap2: u64 = a.capacity();
     a.reset();
     match (a.allocate(Layout::new(64, 8))) {
         Result::Ok(_)  => { }
-        Result::Err(_) => { a.drop(); return bail(Str::new("post-second-reset allocate failed")); }
+        Result::Err(_) => { return bail(Str::new("post-second-reset allocate failed")); }
     }
     const cap3: u64 = a.capacity();
-    a.drop();
     match (expect_eq(cap1, cap2)) {
         Result::Ok(_)  => { } Result::Err(e) => { return Result::Err(e); }
     }
@@ -218,7 +208,7 @@ function reset_reuses_chunks_across_multiple_chunks() -> Result<(), TestError> {
             if (i >= 8) { break; }
             match (a.allocate(Layout::new(16, 8))) {
                 Result::Ok(_)  => { }
-                Result::Err(_) => { a.drop(); return bail(Str::new("multi-chunk allocate failed")); }
+                Result::Err(_) => { return bail(Str::new("multi-chunk allocate failed")); }
             }
             i = i + 1;
         }
@@ -228,7 +218,6 @@ function reset_reuses_chunks_across_multiple_chunks() -> Result<(), TestError> {
         a.reset();
         cycle = cycle + 1;
     }
-    a.drop();
     // Capacity after the first fill must equal capacity after the last fill:
     // the emptied chunks are reused, not re-allocated.
     return expect_eq(cap_first, cap_last);
@@ -239,7 +228,6 @@ function reset_reuses_chunks_across_multiple_chunks() -> Result<(), TestError> {
 ![test]
 ![should_panic]
 function with_chunk_size_zero_panics() -> Result<(), TestError> {
-    mut a: Arena = Arena::with_chunk_size(0);
-    a.drop();
+    Arena::with_chunk_size(0);
     return Result::Ok(());
 }

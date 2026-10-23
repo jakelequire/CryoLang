@@ -1,0 +1,357 @@
+namespace DropCallCodemod;
+
+// One-off: deletes every explicit destructor call on a local, `x.drop();`,
+// from the `.cryo` files under the trees below.  Run from the repository
+// root.  A local is released at the end of its scope anyway, so a call
+// written before that point only repeats it, unless something after it
+// observes the release: a drop count, a lock taken again, a channel seeing
+// its last sender gone, a file unlinked, a teardown being timed.  Those
+// sites are listed in `KEPT` with the reason, and become `mem::drop(x)`;
+// the reason is written after the call unless the line has a comment.  A
+// file given one gains `import std::core::mem;` if it lacks it.
+//
+// A call is a name, not preceded by a name byte, `.`, `)` or `]`, followed
+// directly by `.drop();`.  Left alone: `this.field.drop()` and every other
+// receiver that is not a bare name (a field's release is the owner's, so
+// those are deleted by hand along with the destructor that wrote them),
+// anything inside a string, character literal or comment, and any line
+// carrying a `//~` expectation.  A line left holding only whitespace is
+// deleted with its line break; one left holding only a comment is printed,
+// to be rewritten by hand.  The negative tests and the projects that test
+// the diagnostics for a written `drop()` are skipped: the call is their
+// subject.
+
+import std::fmt;
+import std::fs::file;
+import std::fs::dir;
+import std::fs::path::{ Path, PathBuf };
+import std::collections::str::{ Str };
+
+/// A call kept as `mem::drop(x)`: the file's name (unique across the
+/// trees), its line, and why the release cannot wait for the scope's end.
+type struct Kept { file: string; line: i64; reason: string; }
+
+const UNLINKED: string = "closed before the file is unlinked";
+const COUNTED: string = "released before the drop count is read";
+const RELOCKED: string = "unlocked before the lock is taken again";
+const TIMED: string = "the teardown is part of what is timed";
+
+function kept_calls() -> [Kept] {
+    return [
+        Kept { file: "by_value_param_drop.cryo", line: 63, reason: "" },
+        Kept { file: "by_value_param_drop.cryo", line: 85, reason: COUNTED },
+        Kept { file: "discarded_temp_drops.cryo", line: 84, reason: "" },
+        Kept { file: "drop_glue.cryo", line: 112, reason: "" },
+        Kept { file: "array.cryo", line: 229, reason: "" },
+        Kept { file: "async_stress_shapes.cryo", line: 646, reason: COUNTED },
+        Kept { file: "async_stress_shapes.cryo", line: 659, reason: COUNTED },
+        Kept { file: "box.cryo", line: 131, reason: "runs Wrapper's destructor before the sentinel is read" },
+        Kept { file: "box.cryo", line: 159, reason: COUNTED },
+        Kept { file: "rc.cryo", line: 66, reason: "released before the count is read" },
+        Kept { file: "rc.cryo", line: 116, reason: COUNTED },
+        Kept { file: "rc.cryo", line: 182, reason: "" },
+        Kept { file: "rc.cryo", line: 199, reason: COUNTED },
+        Kept { file: "rc.cryo", line: 201, reason: "" },
+        Kept { file: "rc.cryo", line: 217, reason: "" },
+        Kept { file: "smart_ptr_accessors.cryo", line: 49, reason: "" },
+        Kept { file: "sync_arc.cryo", line: 37, reason: COUNTED },
+        Kept { file: "sync_arc.cryo", line: 58, reason: COUNTED },
+        Kept { file: "sync_arc.cryo", line: 59, reason: COUNTED },
+        Kept { file: "sync_arc.cryo", line: 60, reason: COUNTED },
+        Kept { file: "sync_arc.cryo", line: 88, reason: "" },
+        Kept { file: "sync_arc.cryo", line: 93, reason: COUNTED },
+        Kept { file: "sync_arc.cryo", line: 159, reason: COUNTED },
+        Kept { file: "sync_arc.cryo", line: 190, reason: COUNTED },
+        Kept { file: "sync_arc.cryo", line: 214, reason: COUNTED },
+        Kept { file: "sync_arc.cryo", line: 157, reason: "released before the count is read" },
+        Kept { file: "sync_arc.cryo", line: 226, reason: "" },
+        Kept { file: "sync_arc.cryo", line: 233, reason: "" },
+        Kept { file: "sync_arc.cryo", line: 244, reason: "" },
+        Kept { file: "sync_arc.cryo", line: 261, reason: "released so the Arc is unique again" },
+        Kept { file: "thread_local.cryo", line: 149, reason: COUNTED },
+        Kept { file: "future_blocking.cryo", line: 269, reason: "joins the workers before the counter they share is freed" },
+        Kept { file: "future_blocking.cryo", line: 461, reason: "joins the workers before the counter they share is freed" },
+        Kept { file: "future_blocking.cryo", line: 481, reason: "joins the workers before the job is released" },
+        Kept { file: "future_combinator.cryo", line: 205, reason: TIMED },
+        Kept { file: "future_combinator.cryo", line: 254, reason: TIMED },
+        Kept { file: "future_timer.cryo", line: 167, reason: TIMED },
+        Kept { file: "fs_file.cryo", line: 77, reason: UNLINKED },
+        Kept { file: "fs_file.cryo", line: 93, reason: UNLINKED },
+        Kept { file: "fs_file.cryo", line: 117, reason: UNLINKED },
+        Kept { file: "fs_file.cryo", line: 133, reason: UNLINKED },
+        Kept { file: "fs_file.cryo", line: 137, reason: UNLINKED },
+        Kept { file: "fs_file.cryo", line: 164, reason: UNLINKED },
+        Kept { file: "fs_file.cryo", line: 182, reason: UNLINKED },
+        Kept { file: "fs_file.cryo", line: 186, reason: UNLINKED },
+        Kept { file: "fs_file.cryo", line: 192, reason: UNLINKED },
+        Kept { file: "fs_file.cryo", line: 196, reason: UNLINKED },
+        Kept { file: "io_buf.cryo", line: 202, reason: "" },
+        Kept { file: "io_stdio_lock.cryo", line: 30, reason: "" },
+        Kept { file: "io_stdio_lock.cryo", line: 40, reason: RELOCKED },
+        Kept { file: "io_stdio_lock.cryo", line: 49, reason: RELOCKED },
+        Kept { file: "net_tcp.cryo", line: 172, reason: "" },
+        Kept { file: "net_tcp_async.cryo", line: 138, reason: "held open until the sleep ends" },
+        Kept { file: "main.cryo", line: 171, reason: "the server holds its address until `run` returns" },
+        Kept { file: "process_command.cryo", line: 392, reason: "closes the redirect target before it is removed" },
+        Kept { file: "process_command.cryo", line: 397, reason: "closes the redirect target before it is read back" },
+        Kept { file: "process_command.cryo", line: 408, reason: "closed before the file is removed" },
+        Kept { file: "sync_mpsc.cryo", line: 74, reason: "" },
+        Kept { file: "sync_mpsc.cryo", line: 97, reason: "" },
+        Kept { file: "sync_mpsc.cryo", line: 126, reason: "" },
+        Kept { file: "sync_mutex.cryo", line: 21, reason: "" },
+        Kept { file: "sync_mutex.cryo", line: 41, reason: RELOCKED },
+        Kept { file: "sync_mutex.cryo", line: 87, reason: "unlocked before the next iteration locks again" },
+        Kept { file: "sync_rwlock.cryo", line: 36, reason: RELOCKED },
+        Kept { file: "sync_rwlock.cryo", line: 53, reason: RELOCKED },
+        Kept { file: "sync_rwlock.cryo", line: 56, reason: RELOCKED },
+        Kept { file: "sync_rwlock.cryo", line: 59, reason: RELOCKED },
+    ];
+}
+
+/// The entry for `file`'s line `line`, if the call there is kept.
+function find_kept(kept: &[Kept], file: Str, line: i64) -> Option<i64> {
+    for (mut k: i64 = 0; k < kept.length(); k++) {
+        if (kept[k].line == line && file == Str::new(kept[k].file)) { return Option::Some(k); }
+    }
+    return Option::None;
+}
+
+function push_text(out: mut &[u8], word: string) -> void {
+    for (mut k: i64 = 0; k < word.length() as i64; k++) { out.push(word[k] as u8); }
+}
+
+function is_name_byte(b: u8) -> boolean {
+    return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_';
+}
+
+function matches_at(text: &[u8], at: i64, end: i64, word: string) -> boolean {
+    const n: i64 = word.length() as i64;
+    if (at + n > end) { return false; }
+    for (mut k: i64 = 0; k < n; k++) {
+        if (text[at + k] != word[k] as u8) { return false; }
+    }
+    return true;
+}
+
+/// Whether the line `text[start..end]` carries a `//~` expectation.
+function has_expectation(text: &[u8], start: i64, end: i64) -> boolean {
+    for (mut i: i64 = start; i < end; i++) {
+        if (matches_at(text, i, end, "//~")) { return true; }
+    }
+    return false;
+}
+
+function is_blank(b: u8) -> boolean {
+    return b == ' ' || b == '\t' || b == '\r';
+}
+
+/// Appends the line `text[start..end]` to `out` with every call deleted,
+/// or rewritten to `mem::drop(x)` when `keep`; answers how many were.
+function rewrite_line(text: &[u8], start: i64, end: i64, out: mut &[u8], keep: boolean) -> i64 {
+    mut count: i64 = 0;
+    mut quote: u8 = 0;
+    mut i: i64 = start;
+    while (i < end) {
+        const b: u8 = text[i];
+        if (quote != 0) {
+            out.push(b);
+            if (b == '\\' && i + 1 < end) { out.push(text[i + 1]); i += 2; continue; }
+            if (b == quote) { quote = 0; }
+            i++;
+            continue;
+        }
+        if (matches_at(text, i, end, "//")) {
+            while (i < end) { out.push(text[i]); i++; }
+            break;
+        }
+        if (b == '"' || b == '\'') { quote = b; out.push(b); i++; continue; }
+        const preceded: boolean = i > start
+            && (is_name_byte(text[i - 1]) || text[i - 1] == '.' || text[i - 1] == ')' || text[i - 1] == ']');
+        if (is_name_byte(b) && !preceded) {
+            mut name_end: i64 = i;
+            while (name_end < end && is_name_byte(text[name_end])) { name_end++; }
+            if (matches_at(text, name_end, end, ".drop();") && !matches_at(text, i, name_end, "this")) {
+                count++;
+                if (keep) {
+                    push_text(out, "mem::drop(");
+                    while (i < name_end) { out.push(text[i]); i++; }
+                    push_text(out, ");");
+                    i = name_end + 8;
+                    continue;
+                }
+                mut after: i64 = name_end + 8;
+                while (after < end && (text[after] == ' ' || text[after] == '\t')) { after++; }
+                i = after;
+                continue;
+            }
+            while (i < name_end) { out.push(text[i]); i++; }
+            continue;
+        }
+        out.push(b);
+        i++;
+    }
+    return count;
+}
+
+/// Whether `line` holds nothing but whitespace and a comment.
+function only_comment(line: &[u8]) -> boolean {
+    for (mut k: i64 = 0; k < line.length(); k++) {
+        if (is_blank(line[k])) { continue; }
+        return matches_at(line, k, line.length(), "//");
+    }
+    return false;
+}
+
+function has_comment(line: &[u8]) -> boolean {
+    for (mut k: i64 = 0; k < line.length(); k++) {
+        if (matches_at(line, k, line.length(), "//")) { return true; }
+    }
+    return false;
+}
+
+/// Appends `line` to `out`, followed by `  // reason` before any `\r`.
+function push_with_reason(out: mut &[u8], line: &[u8], reason: string) -> void {
+    mut end: i64 = line.length();
+    if (end > 0 && line[end - 1] == '\r') { end--; }
+    for (mut k: i64 = 0; k < end; k++) { out.push(line[k]); }
+    push_text(out, "  // ");
+    push_text(out, reason);
+    for (mut k: i64 = end; k < line.length(); k++) { out.push(line[k]); }
+}
+
+/// `text` with `import std::core::mem;` after its last `import std::core::`
+/// line, or after its first import when it has none.
+function with_mem_import(text: &[u8]) -> [u8] {
+    mut at: i64 = -1;
+    mut first: i64 = -1;
+    mut start: i64 = 0;
+    while (start < text.length()) {
+        mut end: i64 = start;
+        while (end < text.length() && text[end] != '\n') { end++; }
+        if (matches_at(text, start, end, "import std::core::mem;")) { return text.clone(); }
+        if (matches_at(text, start, end, "import ")) {
+            if (first < 0) { first = end; }
+            if (matches_at(text, start, end, "import std::core::")) { at = end; }
+        }
+        start = end + 1;
+    }
+    if (at < 0) { at = first; }
+    mut out: [u8] = [];
+    for (mut k: i64 = 0; k < text.length(); k++) {
+        out.push(text[k]);
+        if (k == at) {
+            push_text(&out, "import std::core::mem;");
+            if (k > 0 && text[k - 1] == '\r') { out.push('\r' as u8); }
+            out.push('\n' as u8);
+        }
+    }
+    return out;
+}
+
+/// The text of the file named `file` with every call deleted or kept;
+/// `count` gains one per call.
+function rewrite(text: &[u8], file: Str, path: Str, kept: &[Kept], count: mut &i64) -> [u8] {
+    mut out: [u8] = [];
+    mut any_kept: boolean = false;
+    mut line_number: i64 = 1;
+    mut start: i64 = 0;
+    while (start < text.length()) {
+        mut end: i64 = start;
+        while (end < text.length() && text[end] != '\n') { end++; }
+        const has_newline: boolean = end < text.length();
+        if (has_expectation(text, start, end)) {
+            for (mut k: i64 = start; k < end; k++) { out.push(text[k]); }
+            if (has_newline) { out.push('\n' as u8); }
+            start = end + 1;
+            line_number++;
+            continue;
+        }
+        const entry: Option<i64> = find_kept(kept, file, line_number);
+        mut line: [u8] = [];
+        const changed: i64 = rewrite_line(text, start, end, &line, entry.is_some());
+        mut blank: boolean = true;
+        for (mut k: i64 = 0; k < line.length(); k++) {
+            if (!is_blank(line[k])) { blank = false; }
+        }
+        match (entry) {
+            Option::Some(k) => {
+                if (changed == 0) { fmt::println(f"{path}:{line_number}: kept, but holds no call"); }
+                any_kept = true;
+                if (kept[k].reason.length() > 0 && !has_comment(&line)) {
+                    push_with_reason(&out, &line, kept[k].reason);
+                } else {
+                    for (mut j: i64 = 0; j < line.length(); j++) { out.push(line[j]); }
+                }
+                if (has_newline) { out.push('\n' as u8); }
+            }
+            Option::None => {
+                if (changed > 0 && only_comment(&line)) { fmt::println(f"{path}:{line_number}: a comment is left alone"); }
+                if (changed == 0 || !blank) {
+                    for (mut j: i64 = 0; j < line.length(); j++) { out.push(line[j]); }
+                    if (has_newline) { out.push('\n' as u8); }
+                }
+            }
+        }
+        *count += changed;
+        start = end + 1;
+        line_number++;
+    }
+    if (any_kept) { return with_mem_import(&out); }
+    return out;
+}
+
+/// Directories whose `drop()` calls are their subject.  A closure's
+/// destructor call stays too: `mem::drop` cannot yet take a capturing
+/// closure (E0458).
+function skipped(name: Str) -> boolean {
+    return name == Str::new("build")
+        || name == Str::new("negative")
+        || name == Str::new("closure_releases_captures_through_drop")
+        || name == Str::new("drop_call_help_names_the_pointer")
+        || name == Str::new("drop_call_on_type_parameter_help")
+        || name == Str::new("drop_on_unbounded_param_refused")
+        || name == Str::new("unbounded_param_method_refused");
+}
+
+function visit(directory: Path, kept: &[Kept], total: mut &i64, files: mut &i64) -> void {
+    match (dir::read_dir(directory)) {
+        Result::Err(_) => { fmt::println(f"cannot read {directory.as_str()}"); }
+        Result::Ok(entries) => {
+            mut iterator = entries;
+            for (entry in iterator) {
+                const name: Str = entry.name();
+                const child: PathBuf = directory.join(name);
+                if (entry.is_dir()) {
+                    if (!skipped(name)) { visit(child.as_path(), kept, total, files); }
+                    continue;
+                }
+                if (!name.ends_with(&Str::new(".cryo"))) { continue; }
+                match (file::read(child.as_path())) {
+                    Result::Err(_) => { fmt::println(f"cannot read {child.as_path().as_str()}"); }
+                    Result::Ok(bytes) => {
+                        mut count: i64 = 0;
+                        const rewritten: [u8] = rewrite(&bytes, name, child.as_path().as_str(), kept, &count);
+                        if (count > 0) {
+                            match (file::write(child.as_path(), rewritten.as_slice())) {
+                                Result::Err(_) => { fmt::println(f"cannot write {child.as_path().as_str()}"); }
+                                Result::Ok(_) => { *total += count; *files += 1; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+function main() -> int {
+    const roots: [string] = ["tests/tests", "examples", "tools/CryoLSP"];
+    const kept: [Kept] = kept_calls();
+    mut total: i64 = 0;
+    mut files: i64 = 0;
+    for (mut r: i64 = 0; r < roots.length(); r++) {
+        visit(Path::from(Str::new(roots[r])), &kept, &total, &files);
+    }
+    fmt::println(f"rewrote {total} call(s) in {files} file(s), {kept.length()} kept as mem::drop");
+    return 0;
+}

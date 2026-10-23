@@ -14,6 +14,7 @@ namespace CryoTests::Tests::Stdlib::SyncMpsc;
 import std::core::result::{ Result };
 import std::core::option;
 import std::core::drop;
+import std::core::mem;
 import std::collections::str::{ Str };
 import std::sync::mpsc::{ Receiver, RecvError, Sender, TryRecvError };
 import std::test::error::{ TestError };
@@ -48,8 +49,6 @@ function mpsc_delivers_in_fifo_order() -> Result<(), TestError> {
     recv_eq(&rx, 20)?;
     recv_eq(&rx, 30)?;
 
-    tx.drop();
-    rx.drop();
     return Result::Ok(());
 }
 
@@ -60,29 +59,28 @@ function mpsc_try_recv_empty_then_disconnected() -> Result<(), TestError> {
 
     // No value queued, but a sender is alive -> Empty.
     match (rx.try_recv()) {
-        Result::Ok(_)  => { tx.drop(); rx.drop(); return bail(Str::new("try_recv on an empty open channel must be Err(Empty)")); }
+        Result::Ok(_)  => { return bail(Str::new("try_recv on an empty open channel must be Err(Empty)")); }
         Result::Err(e) => {
             match (e) {
                 TryRecvError::Empty        => { }
-                TryRecvError::Disconnected => { tx.drop(); rx.drop(); return bail(Str::new("expected Empty while a sender is alive, got Disconnected")); }
+                TryRecvError::Disconnected => { return bail(Str::new("expected Empty while a sender is alive, got Disconnected")); }
             }
         }
     }
 
     // Drop the only sender; with the queue drained, the channel is now
     // disconnected.
-    tx.drop();
+    mem::drop(tx);
     match (rx.try_recv()) {
-        Result::Ok(_)  => { rx.drop(); return bail(Str::new("try_recv after all senders dropped must be Err(Disconnected)")); }
+        Result::Ok(_)  => { return bail(Str::new("try_recv after all senders dropped must be Err(Disconnected)")); }
         Result::Err(e) => {
             match (e) {
                 TryRecvError::Disconnected => { }
-                TryRecvError::Empty        => { rx.drop(); return bail(Str::new("expected Disconnected after the last sender dropped")); }
+                TryRecvError::Empty        => { return bail(Str::new("expected Disconnected after the last sender dropped")); }
             }
         }
     }
 
-    rx.drop();
     return Result::Ok(());
 }
 
@@ -94,11 +92,11 @@ function mpsc_recv_after_senders_dropped_is_disconnected() -> Result<(), TestErr
     // Queue one value, drop the sender, then drain. The buffered value comes
     // out first; the next recv sees no value and no senders -> Disconnected.
     send_ok(&tx, 7)?;
-    tx.drop();
+    mem::drop(tx);
 
     recv_eq(&rx, 7)?;
     match (rx.recv()) {
-        Result::Ok(_)  => { rx.drop(); return bail(Str::new("recv on a drained, sender-less channel must be Err(Disconnected)")); }
+        Result::Ok(_)  => { return bail(Str::new("recv on a drained, sender-less channel must be Err(Disconnected)")); }
         Result::Err(e) => {
             match (e) {
                 RecvError::Disconnected => { }
@@ -106,7 +104,6 @@ function mpsc_recv_after_senders_dropped_is_disconnected() -> Result<(), TestErr
         }
     }
 
-    rx.drop();
     return Result::Ok(());
 }
 
@@ -123,18 +120,16 @@ function mpsc_multiple_producers_via_clone() -> Result<(), TestError> {
     recv_eq(&rx, 2)?;
 
     // Dropping one of two senders must NOT disconnect the channel.
-    tx1.drop();
+    mem::drop(tx1);
     match (rx.try_recv()) {
-        Result::Ok(_)  => { tx2.drop(); rx.drop(); return bail(Str::new("no value was queued; try_recv should be Empty")); }
+        Result::Ok(_)  => { return bail(Str::new("no value was queued; try_recv should be Empty")); }
         Result::Err(e) => {
             match (e) {
                 TryRecvError::Empty        => { }
-                TryRecvError::Disconnected => { tx2.drop(); rx.drop(); return bail(Str::new("one live sender remains; must be Empty not Disconnected")); }
+                TryRecvError::Disconnected => { return bail(Str::new("one live sender remains; must be Empty not Disconnected")); }
             }
         }
     }
 
-    tx2.drop();
-    rx.drop();
     return Result::Ok(());
 }

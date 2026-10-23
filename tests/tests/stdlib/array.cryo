@@ -9,6 +9,7 @@ import std::core::iter::{ Iterator };
 import std::core::ops::{ Range };
 import std::core::slice;
 import std::core::drop::{ Drop };
+import std::core::mem;
 import std::collections::array::{ Array, from_iter };
 import std::collections::string::{ String };
 import std::alloc::allocator::{ AllocError, GlobalAlloc };
@@ -20,7 +21,6 @@ import std::collections::str::{ Str };
 function new_array_is_empty() -> Result<(), TestError> {
     mut arr: Array<i32> = Array::new();
     const empty: boolean = arr.is_empty();
-    arr.drop();
     match (expect(empty,
         Str::new("new array should be is_empty"))) {
         Result::Ok(_) => { }
@@ -36,7 +36,6 @@ function push_increases_length() -> Result<(), TestError> {
     arr.push(2);
     arr.push(3);
     const got_len: i64 = arr.length();
-    arr.drop();
     const want_len: i64 = 3;
     match (expect_eq(got_len, want_len)) {
         Result::Ok(_) => { }
@@ -54,7 +53,6 @@ function get_returns_some_in_range() -> Result<(), TestError> {
     const opt0: Option<i32> = arr.get(0);
     const opt1: Option<i32> = arr.get(1);
     const opt2: Option<i32> = arr.get(2);
-    arr.drop();
     match (expect_eq(opt0.unwrap_or(-1), 10)) {
         Result::Ok(_) => { }
         Result::Err(e) => { return Result::Err(e); }
@@ -76,7 +74,6 @@ function get_returns_none_out_of_range() -> Result<(), TestError> {
     arr.push(1);
     const opt: Option<i32> = arr.get(5);
     const present: boolean = opt.is_some();
-    arr.drop();
     match (expect(!present,
         Str::new("get(5) on length-1 should be None"))) {
         Result::Ok(_) => { }
@@ -93,7 +90,6 @@ function pop_returns_last_and_shrinks() -> Result<(), TestError> {
     arr.push(3);
     const popped: Option<i32> = arr.pop();
     const after_len: i64 = arr.length();
-    arr.drop();
     match (expect_eq(popped.unwrap_or(-1), 3)) {
         Result::Ok(_) => { }
         Result::Err(e) => { return Result::Err(e); }
@@ -111,7 +107,6 @@ function pop_empty_returns_none() -> Result<(), TestError> {
     mut arr: Array<i32> = Array::new();
     const popped: Option<i32> = arr.pop();
     const present: boolean = popped.is_some();
-    arr.drop();
     match (expect(!present,
         Str::new("pop on empty should be None"))) {
         Result::Ok(_) => { }
@@ -129,7 +124,6 @@ function clear_resets_length_keeps_capacity() -> Result<(), TestError> {
     arr.clear();
     const after_len: i64 = arr.length();
     const after_empty: boolean = arr.is_empty();
-    arr.drop();
     const want_len: i64 = 0;
     match (expect_eq(after_len, want_len)) {
         Result::Ok(_) => { }
@@ -152,7 +146,6 @@ function iter_empty_yields_none() -> Result<(), TestError> {
     mut arr: Array<i32> = Array::new();
     mut it: implement Iterator<i32> = arr.iter();
     const first: Option<i32> = it.next();
-    arr.drop();
     return expect_none(&first,
         Str::new("iter() on empty Array should be None on the first next()"));
 }
@@ -172,7 +165,6 @@ function iter_yields_each_element_in_order() -> Result<(), TestError> {
             Option::None    => { break; }
         }
     }
-    arr.drop();
     match (expect_eq(sum, 60)) {
         Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
     }
@@ -190,7 +182,6 @@ function iter_count_reports_length_in_O1() -> Result<(), TestError> {
     arr.push(4);
     mut it: implement Iterator<u32> = arr.iter();
     const got: i64 = it.count();
-    arr.drop();
     const want: i64 = 4;
     return expect_eq(got, want);
 }
@@ -226,7 +217,7 @@ function clear_drops_each_owned_element() -> Result<(), TestError> {
     const after_len: i64 = arr.length();
     // Capacity is retained, so the array stays usable after clear.
     arr.push(DropProbe::new(4));
-    arr.drop();                        // drops the 1 remaining element
+    mem::drop(arr);                        // drops the 1 remaining element
     const after_drop: i32 = g_arr_drops;
 
     match (expect_eq(after_clear, 3)) {   // clear dropped exactly 3
@@ -257,7 +248,6 @@ function get_ptr_reads_in_place_and_none_oob() -> Result<(), TestError> {
         Option::Some(_) => { oob_present = true; }
         Option::None    => { oob_present = false; }
     }
-    arr.drop();
     match (expect_eq(val, 200)) {
         Result::Ok(_) => { }
         Result::Err(e) => { return Result::Err(e); }
@@ -286,7 +276,6 @@ function get_ptr_borrows_owning_elements_no_double_free() -> Result<(), TestErro
         }
         Option::None => { }
     }
-    arr.drop();
     return expect(ok,
         Str::new("get_ref should borrow 'beta' from the array in place"));
 }
@@ -316,7 +305,6 @@ function sort_empty_array_is_noop() -> Result<(), TestError> {
     mut a: Array<i32> = Array::<i32>::new();
     a.sort();
     const ok: boolean = a.length() == 0;
-    a.drop();
     return expect(ok, Str::new("sort on empty array must not crash or grow it"));
 }
 
@@ -330,7 +318,6 @@ function sort_single_element_is_noop() -> Result<(), TestError> {
         Option::Some(v) => { if (v != 42) { ok = false; } }
         Option::None    => { ok = false; }
     }
-    a.drop();
     return expect(ok, Str::new("sort on single-element array preserves it"));
 }
 
@@ -344,8 +331,6 @@ function sort_already_sorted_unchanged() -> Result<(), TestError> {
     mut j: i32 = 0;
     while (j < 32) { want.push(j); j = j + 1; }
     const ok: boolean = arr_eq_i32_seq(&a, &want);
-    a.drop();
-    want.drop();
     return expect(ok, Str::new("already-sorted input must round-trip identical"));
 }
 
@@ -359,8 +344,6 @@ function sort_reverse_sorted_ascends() -> Result<(), TestError> {
     mut j: i32 = 0;
     while (j < 32) { want.push(j); j = j + 1; }
     const ok: boolean = arr_eq_i32_seq(&a, &want);
-    a.drop();
-    want.drop();
     return expect(ok, Str::new("reverse-sorted input must end up ascending 0..32"));
 }
 
@@ -376,8 +359,6 @@ function sort_random_small_below_cutoff() -> Result<(), TestError> {
     mut j: i32 = 0;
     while (j < 10) { want.push(j); j = j + 1; }
     const ok: boolean = arr_eq_i32_seq(&a, &want);
-    a.drop();
-    want.drop();
     return expect(ok, Str::new("small-input insertion-sort path must sort correctly"));
 }
 
@@ -408,7 +389,6 @@ function sort_random_above_cutoff() -> Result<(), TestError> {
         }
         j = j + 1;
     }
-    a.drop();
     return expect(ok, Str::new("quicksort path must produce a non-decreasing sequence"));
 }
 
@@ -424,8 +404,6 @@ function sort_with_duplicates() -> Result<(), TestError> {
     want.push(2); want.push(2);
     want.push(3); want.push(3); want.push(3);
     const ok: boolean = arr_eq_i32_seq(&a, &want);
-    a.drop();
-    want.drop();
     return expect(ok, Str::new("sort with duplicates must group equal elements"));
 }
 
@@ -444,8 +422,6 @@ function sort_by_descending_predicate() -> Result<(), TestError> {
     mut want: Array<i32> = Array::<i32>::new();
     want.push(5); want.push(4); want.push(3); want.push(2); want.push(1);
     const ok: boolean = arr_eq_i32_seq(&a, &want);
-    a.drop();
-    want.drop();
     return expect(ok, Str::new("sort_by with desc predicate must sort descending"));
 }
 
@@ -466,7 +442,6 @@ function reserve_near_i64_max_fails_cleanly() -> Result<(), TestError> {
         Str::new("reserve(~i64::MAX) must return Err, not loop forever"))?;
     // The failed reservation must leave the array untouched.
     expect_eq(a.length(), 2 as i64)?;
-    a.drop();
     return Result::Ok(());
 }
 
@@ -503,7 +478,6 @@ function reserve_exact_wrapping_additional_fails() -> Result<(), TestError> {
     expect_true(rg.is_err(),
         Str::new("reserve_grow with wrapping additional must return Err"))?;
     expect_eq(a.length(), 2 as i64)?;                  // array untouched
-    a.drop();
     return Result::Ok(());
 }
 
@@ -526,14 +500,13 @@ function from_iter_collects_range_in_order() -> Result<(), TestError> {
         match (a.get(i)) {
             Option::Some(v) => {
                 match (expect_eq(v, expected)) {
-                    Result::Ok(_) => { } Result::Err(e) => { a.drop(); return Result::Err(e); }
+                    Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
                 }
             }
-            Option::None => { a.drop(); return bail(Str::new("missing element")); }
+            Option::None => { return bail(Str::new("missing element")); }
         }
         expected = expected + 1;
     }
-    a.drop();
     return Result::Ok(());
 }
 
@@ -542,7 +515,6 @@ function from_iter_empty_iterator_yields_empty_array() -> Result<(), TestError> 
     mut r: Range<i32> = Range::new(5, 5);
     mut a: Array<i32> = from_iter(r);
     const len: i64 = a.length();
-    a.drop();
     return expect_eq(len, 0 as i64);
 }
 
@@ -555,7 +527,6 @@ function from_iter_collects_mapped_iterator() -> Result<(), TestError> {
     for (mut i: i64 = 0; i < a.length(); i++) {
         match (a.get(i)) { Option::Some(v) => { sum = sum + v; } Option::None => {} }
     }
-    a.drop();
     return expect_eq(sum, 12);
 }
 
@@ -565,6 +536,5 @@ function from_iter_collects_filtered_iterator() -> Result<(), TestError> {
     mut r: Range<i32> = Range::new(0, 6);
     mut a: Array<i32> = from_iter(r.filter(fi_is_even));
     const len: i64 = a.length();
-    a.drop();
     return expect_eq(len, 3 as i64);
 }

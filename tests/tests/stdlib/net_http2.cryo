@@ -79,7 +79,6 @@ function h2_handler(req: Request) -> Response {
     g_body_seen = g_body_seen + (request_local.body.length() as i64);
     g_headers_seen = g_headers_seen + (request_local.headers.length() as i64);
     const resp: Response = Response::text(StatusCode::ok(), Str::new("Hello, HTTP/2!"));
-    request_local.drop();
     return resp;
 }
 
@@ -91,7 +90,6 @@ function h2_echo_handler(req: Request) -> Response {
     g_body_seen = g_body_seen + (request_local.body.length() as i64);
     mut echo: Array<u8> = Array::<u8>::new();
     echo.append(request_local.body.as_slice());
-    request_local.drop();
     mut resp: Response = Response::new(StatusCode::ok());
     resp.set_body(echo);
     return resp;
@@ -157,7 +155,6 @@ async function h2_get(port: u16, path: Str) -> i64 {
     const status_ok: boolean = resp.status.as_u16() == 200;
     const body_ok: boolean = h2_body_eq(&resp.body, Str::new("Hello, HTTP/2!"));
     const got: i64 = resp.body.length();
-    resp.drop();
     if (!status_ok) { return -11; }
     if (!body_ok)   { return -12; }
     return got;
@@ -190,7 +187,6 @@ async function h2_post_echo(port: u16, n: i64) -> i64 {
         }
         j = j + 1;
     }
-    resp.drop();
     if (!status_ok)      { return -21; }
     if (mismatches != 0) { return -22; }
     return got;
@@ -222,10 +218,8 @@ async function h2_many_headers(port: u16, count: u64) -> i64 {
         name.push(Str::new("x-pad-"));
         h2_push_decimal(&name, i);
         req.headers.insert(name.as_str(), pad.as_str());
-        name.drop();
         i = i + 1;
     }
-    pad.drop();
 
     mut resp: Response = match (await conn.request(req, Str::new("http"), Str::new("localhost"))) {
         Result::Ok(r)  => { r }
@@ -233,7 +227,6 @@ async function h2_many_headers(port: u16, count: u64) -> i64 {
     };
     const status_ok: boolean = resp.status.as_u16() == 200;
     const got: i64 = resp.body.length() as i64;
-    resp.drop();
     if (!status_ok) { return -33; }
     return got;
 }
@@ -262,7 +255,6 @@ async function h2_sequential(port: u16, n: i64) -> i64 {
         };
         const status_ok: boolean = resp.status.as_u16() == 200;
         const body_ok: boolean = h2_body_eq(&resp.body, Str::new("Hello, HTTP/2!"));
-        resp.drop();
         if (!status_ok) { return -43; }
         if (!body_ok)   { return -44; }
         done = done + 1;
@@ -340,11 +332,10 @@ function h2c_loopback_get_round_trip() -> Result<(), TestError> {
     };
     const port: u16 = match (server.local_addr()) {
         Result::Ok(a)  => { a.port }
-        Result::Err(_) => { server.drop(); return bail(Str::new("local_addr failed")); }
+        Result::Err(_) => { return bail(Str::new("local_addr failed")); }
     };
     mut ex: Executor = Executor::new();
     const r: i64 = ex.block_on(h2_join_get(port, server));
-    ex.drop();
     if (r != REPLY_LEN) { return expect_eq(r, REPLY_LEN); }
     // Exactly one dispatch, no body, and only the two headers the server
     // synthesizes — the client sent none of its own.
@@ -365,11 +356,10 @@ function h2c_loopback_echoes_a_large_body_through_flow_control() -> Result<(), T
     };
     const port: u16 = match (server.local_addr()) {
         Result::Ok(a)  => { a.port }
-        Result::Err(_) => { server.drop(); return bail(Str::new("local_addr failed")); }
+        Result::Err(_) => { return bail(Str::new("local_addr failed")); }
     };
     mut ex: Executor = Executor::new();
     const r: i64 = ex.block_on(h2_join_echo(port, server, n));
-    ex.drop();
     if (r != n) { return expect_eq(r, n); }
     if (g_served != 1) { return expect_eq(g_served, 1 as i64); }
     return expect_eq(g_body_seen, n as i64);
@@ -387,11 +377,10 @@ function h2c_loopback_header_block_spanning_continuation_frames() -> Result<(), 
     };
     const port: u16 = match (server.local_addr()) {
         Result::Ok(a)  => { a.port }
-        Result::Err(_) => { server.drop(); return bail(Str::new("local_addr failed")); }
+        Result::Err(_) => { return bail(Str::new("local_addr failed")); }
     };
     mut ex: Executor = Executor::new();
     const r: i64 = ex.block_on(h2_join_headers(port, server, count));
-    ex.drop();
     if (r != REPLY_LEN) { return expect_eq(r, REPLY_LEN); }
     if (g_served != 1)  { return expect_eq(g_served, 1 as i64); }
     // Every padded field survived the split and was reassembled from the
@@ -410,11 +399,10 @@ function h2c_loopback_serves_several_requests_on_one_connection() -> Result<(), 
     };
     const port: u16 = match (server.local_addr()) {
         Result::Ok(a)  => { a.port }
-        Result::Err(_) => { server.drop(); return bail(Str::new("local_addr failed")); }
+        Result::Err(_) => { return bail(Str::new("local_addr failed")); }
     };
     mut ex: Executor = Executor::new();
     const r: i64 = ex.block_on(h2_join_sequential(port, server, n));
-    ex.drop();
     if (r != n) { return expect_eq(r, n); }
     // One dispatch per request, and the synthesized pair on each — so a request
     // silently served twice, or one whose headers leaked into the next, moves
@@ -432,11 +420,10 @@ function h2c_loopback_client_close_ends_the_server_loop() -> Result<(), TestErro
     };
     const port: u16 = match (server.local_addr()) {
         Result::Ok(a)  => { a.port }
-        Result::Err(_) => { server.drop(); return bail(Str::new("local_addr failed")); }
+        Result::Err(_) => { return bail(Str::new("local_addr failed")); }
     };
     mut ex: Executor = Executor::new();
     const r: i64 = ex.block_on(h2_join_close(port, server));
-    ex.drop();
     // The client handshook and left; the server's read loop reported a clean end
     // (pair.0 == 1) rather than an error, which it can only see if the client's
     // connection was actually released.

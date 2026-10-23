@@ -8,6 +8,7 @@ namespace CryoTests::Tests::Stdlib::SyncRwLock;
 import std::core::result::{ Result };
 import std::core::option::{ Option };
 import std::core::drop;
+import std::core::mem;
 import std::sync::rwlock::{ RwLock, RwLockReadGuard, RwLockWriteGuard };
 import std::test::error::{ TestError };
 import std::test::assert::{ expect_eq };
@@ -19,8 +20,6 @@ function rwlock_read_returns_guard() -> Result<(), TestError> {
     mut l: RwLock<i32> = RwLock::new(50);
     mut g: RwLockReadGuard<i32, GlobalAlloc> = l.read();
     const v: i32 = *g.as_ptr();
-    g.drop();
-    l.drop();
     match (expect_eq(v, 50)) {
         Result::Ok(_)  => { }
         Result::Err(e) => { return Result::Err(e); }
@@ -33,11 +32,9 @@ function rwlock_write_mutates_value() -> Result<(), TestError> {
     mut l: RwLock<i32> = RwLock::new(0);
     mut wg: RwLockWriteGuard<i32, GlobalAlloc> = l.write();
     *wg.as_ptr() = 123;
-    wg.drop();
+    mem::drop(wg);  // unlocked before the lock is taken again
     mut rg: RwLockReadGuard<i32, GlobalAlloc> = l.read();
     const v: i32 = *rg.as_ptr();
-    rg.drop();
-    l.drop();
     match (expect_eq(v, 123)) {
         Result::Ok(_)  => { }
         Result::Err(e) => { return Result::Err(e); }
@@ -50,17 +47,15 @@ function rwlock_write_then_read_round_trip() -> Result<(), TestError> {
     mut l: RwLock<i32> = RwLock::new(1);
     mut wg1: RwLockWriteGuard<i32, GlobalAlloc> = l.write();
     *wg1.as_ptr() = 7;
-    wg1.drop();
+    mem::drop(wg1);  // unlocked before the lock is taken again
     mut rg1: RwLockReadGuard<i32, GlobalAlloc> = l.read();
     const a: i32 = *rg1.as_ptr();
-    rg1.drop();
+    mem::drop(rg1);  // unlocked before the lock is taken again
     mut wg2: RwLockWriteGuard<i32, GlobalAlloc> = l.write();
     *wg2.as_ptr() = a * 2;
-    wg2.drop();
+    mem::drop(wg2);  // unlocked before the lock is taken again
     mut rg2: RwLockReadGuard<i32, GlobalAlloc> = l.read();
     const b: i32 = *rg2.as_ptr();
-    rg2.drop();
-    l.drop();
     match (expect_eq(a, 7)) {
         Result::Ok(_)  => { }
         Result::Err(e) => { return Result::Err(e); }
@@ -82,11 +77,9 @@ function rwlock_try_read_succeeds_when_unlocked() -> Result<(), TestError> {
             mut guard: RwLockReadGuard<i32, GlobalAlloc> = g;
             got = true;
             v = *guard.as_ptr();
-            guard.drop();
         }
         Option::None => { }
     }
-    l.drop();
     if (!got) {
         return Result::Err(TestError::failed(Str::new(
             "try_read on unlocked RwLock must return Some")));
@@ -107,7 +100,6 @@ function rwlock_try_write_succeeds_when_unlocked() -> Result<(), TestError> {
             mut guard: RwLockWriteGuard<i32, GlobalAlloc> = g;
             got = true;
             *guard.as_ptr() = 555;
-            guard.drop();
         }
         Option::None => { }
     }
@@ -115,9 +107,7 @@ function rwlock_try_write_succeeds_when_unlocked() -> Result<(), TestError> {
     {
         mut rg: RwLockReadGuard<i32, GlobalAlloc> = l.read();
         after = *rg.as_ptr();
-        rg.drop();
     }
-    l.drop();
     if (!got) {
         return Result::Err(TestError::failed(Str::new(
             "try_write on unlocked RwLock must return Some")));

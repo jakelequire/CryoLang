@@ -14,6 +14,7 @@
 namespace CryoTests::Tests::Stdlib::FutureTimer;
 
 import std::core::result::{ Result };
+import std::core::mem;
 import std::future;
 import std::sync::atomic::{ Atomic, MemoryOrder };
 import std::test::error::{ TestError };
@@ -63,7 +64,6 @@ async function forever_nap() -> i64 {
 function a_zero_duration_sleep_is_ready_on_the_first_poll() -> Result<(), TestError> {
     mut s: Sleep = Sleep::new(Duration::zero());
     const elapsed: boolean = s.is_elapsed();
-    s.drop();
     return expect_true(elapsed, "a zero-duration sleep should already be elapsed");
 }
 
@@ -71,7 +71,6 @@ function a_zero_duration_sleep_is_ready_on_the_first_poll() -> Result<(), TestEr
 function a_zero_duration_sleep_completes() -> Result<(), TestError> {
     mut ex: Executor = Executor::new();
     const r: i64 = ex.block_on(zero_nap());
-    ex.drop();
     return expect_eq(r, 1 as i64);
 }
 
@@ -81,7 +80,6 @@ function a_sleep_does_not_complete_before_its_deadline() -> Result<(), TestError
     const t0: Instant = Instant::now();
     const r: i64 = ex.block_on(nap(150));
     const ms: u64 = t0.elapsed().as_millis();
-    ex.drop();
     match (expect_eq(r, 1 as i64)) {
         Result::Ok(_)  => { }
         Result::Err(e) => { return Result::Err(e); }
@@ -97,7 +95,6 @@ function sequential_sleeps_each_wait() -> Result<(), TestError> {
     const t0: Instant = Instant::now();
     const r: i64 = ex.block_on(two_naps(100));
     const ms: u64 = t0.elapsed().as_millis();
-    ex.drop();
     match (expect_eq(r, 1 as i64)) {
         Result::Ok(_)  => { }
         Result::Err(e) => { return Result::Err(e); }
@@ -126,7 +123,6 @@ function parallel_sleeps_overlap() -> Result<(), TestError> {
     }
     const ms:  u64 = t0.elapsed().as_millis();
     const got: i64 = ft_done.load(MemoryOrder::Acquire);
-    ex.drop();
     match (expect_eq(got, 3 as i64)) {
         Result::Ok(_)  => { }
         Result::Err(e) => { return Result::Err(e); }
@@ -164,7 +160,7 @@ function an_armed_sleep_does_not_wedge_executor_teardown() -> Result<(), TestErr
     // reactor rather than still sitting unpolled in the ready queue.
     sleep(Duration::from_millis(50));
     const t0: Instant = Instant::now();
-    ex.drop();
+    mem::drop(ex);  // the teardown is part of what is timed
     const ms: u64 = t0.elapsed().as_millis();
     return expect_true(ms < 10000, "executor teardown waited on an armed timer");
 }
@@ -174,10 +170,9 @@ function until_accepts_an_absolute_deadline() -> Result<(), TestError> {
     const t0: Instant = Instant::now();
     match (t0.checked_add(&Duration::from_millis(100))) {
         Option::Some(at) => {
-            mut ex: Executor = Executor::new();
+            const _ex: Executor = Executor::new();
             future::block_on(Sleep::until(at));
             const ms: u64 = t0.elapsed().as_millis();
-            ex.drop();
             return expect_true(ms >= 90, "an absolute deadline returned early");
         }
         Option::None => {
@@ -202,7 +197,6 @@ function an_over_long_duration_saturates_rather_than_wrapping() -> Result<(), Te
     mut s: Sleep = Sleep::new(Duration::from_secs(18446744073709551615));
     const elapsed: boolean = s.is_elapsed();
     const d: i64 = s.deadline_nanos();
-    s.drop();
     match (expect_false(elapsed, "an over-long sleep wrapped into the past")) {
         Result::Ok(_)  => { }
         Result::Err(e) => { return Result::Err(e); }

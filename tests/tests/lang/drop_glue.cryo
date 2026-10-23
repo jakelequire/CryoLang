@@ -4,14 +4,15 @@
 ///! when the payload is also consumed manually.
 ///!
 ///! A non-Copy value nested in an Option/Result/struct that lacks its own
-///! `Drop` impl would otherwise silently leak: a single top-level
-///! `binding.drop()` does not by itself recurse into fields or payloads.
-///! Glue (codegen, call_emitter) expands a `.drop()` on such an
-///! aggregate into in-place drops of its droppable parts.
+///! `Drop` impl would otherwise silently leak: releasing the aggregate does
+///! not by itself recurse into fields or payloads.  Glue (codegen,
+///! call_emitter) expands the release of such an aggregate into in-place
+///! drops of its droppable parts.
 ///!
 ///! The double-free cases are the dangerous direction (worse than the leak):
-///!  - a match arm that consumes its payload binding (`Some(s) => s.drop()`)
-///!    marks the subject moved so glue does not re-drop it;
+///!  - a match arm that consumes its payload binding
+///!    (`Some(s) => mem::drop(s)`) marks the subject moved so glue does not
+///!    re-drop it;
 ///!  - an `![sink]` combinator (`opt.unwrap()`) marks its receiver moved.
 ///! Borrow-only matches leave the subject live so glue still frees it once.
 ///!
@@ -25,6 +26,7 @@ import std::core::result::{ Result };
 import std::core::option::{ Option };
 import std::core::drop::{ Drop };
 import std::core::cmp::{ Eq };
+import std::core::mem;
 import std::collections::array::{ Array };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
@@ -109,11 +111,11 @@ function match_consume_no_double_free() -> Result<(), TestError> {
     {
         mut o: Option<Probe> = Option::Some(Probe { tag: 1 });
         match (o) {
-            Option::Some(s) => { s.drop(); }   // consumes payload
+            Option::Some(s) => { mem::drop(s); }   // consumes payload
             Option::None    => { }
         }
     }
-    // s.drop() is the sole drop; the subject's glue is suppressed.
+    // mem::drop(s) is the sole drop; the subject's glue is suppressed.
     return expect_eq(count(), 1);
 }
 
@@ -136,8 +138,7 @@ function unwrap_consume_no_double_free() -> Result<(), TestError> {
     reset();
     {
         const o: Option<Probe> = Option::Some(Probe { tag: 1 });
-        mut p: Probe = o.unwrap();   // ![sink]: marks o moved
-        p.drop();
+        const _p: Probe = o.unwrap();   // ![sink]: marks o moved
     }
     return expect_eq(count(), 1);
 }
@@ -269,11 +270,10 @@ function user_drop_does_not_suppress_field_glue() -> Result<(), TestError> {
     return expect_eq(count(), 1);
 }
 
-// The transitional case, and the invariant the design now leans on: a body
-// that releases its own field is followed by glue releasing it a second time.
-// That is sound only because a leaf drop nulls what it frees, so the second
-// release is a no-op. Asserted as an EFFECT count rather than a call count, so
-// it stays true once the redundant hand-written releases are stripped.
+// A body that releases its own field swaps an already-released value in and
+// drops what comes out, so the glue that follows releases nothing a second
+// time.  Asserted as an EFFECT count rather than a call count: the glue does
+// call the replacement's destructor, which finds nothing to release.
 mut g_idem_releases: i32 = 0;
 
 type struct IdemProbe { released: boolean; }
@@ -288,7 +288,11 @@ implement trait Drop for struct IdemProbe {
 
 type struct ManualOwner { q: IdemProbe; }
 implement trait Drop for struct ManualOwner {
-    drop(mut &this) -> void { this.q.drop(); }
+    drop(mut &this) -> void {
+        mut closing: IdemProbe = IdemProbe { released: true };
+        mem::swap(&closing, &this.q);
+        mem::drop(closing);
+    }
 }
 
 ![test]

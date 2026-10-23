@@ -162,6 +162,20 @@ yet is recorded with the change that builds it, not here.
      brace line is enough on its own, and a plain line beside it is
      deleted.  (Jake)
 
+578. **A negative byte count, position or width in the I/O layer means
+     what the call's kind says.**  A read or seek given a negative count
+     or position fails with `InvalidInput`; moving a cursor by a negative
+     amount (`Cursor::set_position`, `consume` on a buffered reader)
+     panics "out of range"; a width, precision or buffer capacity of zero
+     or less writes or buffers nothing extra.  (Jake)
+
+579. **`Cursor`'s length is `length()`, and the hash map's bucket-level
+     accessors stay `u64`.**  `Cursor::len` is renamed `length`, as every
+     other length in the library is spelled.  `HashMap::bucket_count` and
+     `get_bucket` keep `u64`: a bucket index is masked from a `u64` hash,
+     and those accessors are internals of the bucket layer rather than
+     positions a caller computes.  (Jake)
+
 ### 2026-10-22
 
 553. **A test project can set the compiler's environment and arguments,

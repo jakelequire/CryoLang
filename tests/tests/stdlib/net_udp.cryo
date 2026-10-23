@@ -76,10 +76,9 @@ async function ping_pong(server: UdpSocket, client: UdpSocket, server_addr: Sock
     // A send hands the buffer back untouched, so the caller still has what it
     // sent; nothing here needs it again.
     mut sent: Array<u8> = sio.take_buf();
-    sent.drop();
     match (sio.outcome()) {
-        Result::Ok(k)  => { if (k != 4) { cl.drop(); srv.drop(); return -1; } }
-        Result::Err(_) => { cl.drop(); srv.drop(); return -2; }
+        Result::Ok(k)  => { if (k != 4) { return -1; } }
+        Result::Err(_) => { return -2; }
     }
 
     mut rio: UdpReceived = await UdpRecvFrom::start(srv, recv_buf());
@@ -96,20 +95,18 @@ async function ping_pong(server: UdpSocket, client: UdpSocket, server_addr: Sock
     // at 4.
     const n: u64   = got.length() as u64;
     const f: u8    = first_byte(&got);
-    got.drop();
-    if (!recv_ok)      { cl.drop(); srv2.drop(); return -3; }
-    if (n != 4)        { cl.drop(); srv2.drop(); return -4; }
-    if (f != 112)      { cl.drop(); srv2.drop(); return -5; }
-    if (!peer.ip.is_ipv4()) { cl.drop(); srv2.drop(); return -6; }
+    if (!recv_ok)      { return -3; }
+    if (n != 4)        { return -4; }
+    if (f != 112)      { return -5; }
+    if (!peer.ip.is_ipv4()) { return -6; }
 
     // Reply to the peer the datagram came from.
     mut sio2: UdpIo = await UdpSendTo::start(srv2, pong_bytes(), peer);
     mut srv3: UdpSocket = sio2.take_socket();
     mut sent2: Array<u8> = sio2.take_buf();
-    sent2.drop();
     match (sio2.outcome()) {
-        Result::Ok(k)  => { if (k != 4) { cl.drop(); srv3.drop(); return -7; } }
-        Result::Err(_) => { cl.drop(); srv3.drop(); return -8; }
+        Result::Ok(k)  => { if (k != 4) { return -7; } }
+        Result::Err(_) => { return -8; }
     }
 
     mut rio2: UdpReceived = await UdpRecvFrom::start(cl, recv_buf());
@@ -122,9 +119,6 @@ async function ping_pong(server: UdpSocket, client: UdpSocket, server_addr: Sock
     }
     const bn: u64 = back.length() as u64;
     const bf: u8  = first_byte(&back);
-    back.drop();
-    cl2.drop();
-    srv3.drop();
     if (!back_ok) { return -9; }
     if (bn != 4)  { return -10; }
     if (bf != 112) { return -11; }
@@ -139,17 +133,16 @@ function loopback_datagram_round_trip() -> Result<(), TestError> {
     };
     mut client: UdpSocket = match (UdpSocket::bind(SocketAddr::localhost_v4(0))) {
         Result::Ok(s)  => { s }
-        Result::Err(_) => { server.drop(); return bail(Str::new("client bind failed")); }
+        Result::Err(_) => { return bail(Str::new("client bind failed")); }
     };
     const server_addr: SocketAddr = match (server.local_addr()) {
         Result::Ok(a)  => { a }
-        Result::Err(_) => { client.drop(); server.drop();
+        Result::Err(_) => { 
                             return bail(Str::new("server local_addr failed")); }
     };
 
     mut ex: Executor = Executor::new();
     const r: i64 = ex.block_on(ping_pong(server, client, server_addr));
-    ex.drop();
     return expect_eq(r, 0 as i64);
 }
 
@@ -161,11 +154,10 @@ async function connected_exchange(server: UdpSocket, client: UdpSocket) -> i64 {
     mut sio: UdpIo = await UdpSend::start(client, hello);
     mut cl: UdpSocket = sio.take_socket();
     mut sent: Array<u8> = sio.take_buf();
-    sent.drop();
     mut srv: UdpSocket = server;
     match (sio.outcome()) {
-        Result::Ok(k)  => { if (k != 5) { cl.drop(); srv.drop(); return -20; } }
-        Result::Err(_) => { cl.drop(); srv.drop(); return -21; }
+        Result::Ok(k)  => { if (k != 5) { return -20; } }
+        Result::Err(_) => { return -21; }
     }
 
     mut rio: UdpReceived = await UdpRecvFrom::start(srv, recv_buf());
@@ -178,9 +170,6 @@ async function connected_exchange(server: UdpSocket, client: UdpSocket) -> i64 {
     }
     const n: u64 = got.length() as u64;
     const f: u8  = first_byte(&got);
-    got.drop();
-    cl.drop();
-    srv2.drop();
     if (!ok)      { return -22; }
     if (n != 5)   { return -23; }
     if (f != 104) { return -24; }
@@ -195,21 +184,20 @@ function connected_socket_send_recv() -> Result<(), TestError> {
     };
     const server_addr: SocketAddr = match (server.local_addr()) {
         Result::Ok(a)  => { a }
-        Result::Err(_) => { server.drop(); return bail(Str::new("server local_addr failed")); }
+        Result::Err(_) => { return bail(Str::new("server local_addr failed")); }
     };
     mut client: UdpSocket = match (UdpSocket::unbound()) {
         Result::Ok(s)  => { s }
-        Result::Err(_) => { server.drop(); return bail(Str::new("client unbound failed")); }
+        Result::Err(_) => { return bail(Str::new("client unbound failed")); }
     };
     match (client.connect(server_addr)) {
         Result::Ok(_)  => { }
-        Result::Err(_) => { client.drop(); server.drop();
+        Result::Err(_) => { 
                             return bail(Str::new("client connect failed")); }
     }
 
     mut ex: Executor = Executor::new();
     const r: i64 = ex.block_on(connected_exchange(server, client));
-    ex.drop();
     return expect_eq(r, 0 as i64);
 }
 
@@ -221,8 +209,6 @@ async function v6_send_rejected(client: UdpSocket) -> i64 {
     mut sio: UdpIo = await UdpSendTo::start(client, one, SocketAddr::any_v6(9));
     mut cl: UdpSocket = sio.take_socket();
     mut b: Array<u8> = sio.take_buf();
-    b.drop();
-    cl.drop();
     match (sio.outcome()) {
         Result::Ok(_)  => { return -30; }
         Result::Err(e) => {
@@ -242,8 +228,7 @@ async function v6_send_rejected(client: UdpSocket) -> i64 {
 ![test]
 function ipv6_rejected_unsupported() -> Result<(), TestError> {
     match (UdpSocket::bind(SocketAddr::localhost_v6(0))) {
-        Result::Ok(s)  => { mut sk: UdpSocket = s; sk.drop();
-                            return bail(Str::new("v6 bind should be rejected")); }
+        Result::Ok(_)  => { return bail(Str::new("v6 bind should be rejected")); }
         Result::Err(e) => {
             match (expect(e.kind == IoErrorKind::Unsupported,
                           Str::new("v6 bind should fail Unsupported"))) {
@@ -258,18 +243,17 @@ function ipv6_rejected_unsupported() -> Result<(), TestError> {
         Result::Err(_) => { return bail(Str::new("unbound failed")); }
     };
     match (client.connect(SocketAddr::localhost_v6(9))) {
-        Result::Ok(_)  => { client.drop(); return bail(Str::new("v6 connect should be rejected")); }
+        Result::Ok(_)  => { return bail(Str::new("v6 connect should be rejected")); }
         Result::Err(e) => {
             match (expect(e.kind == IoErrorKind::Unsupported,
                           Str::new("v6 connect should fail Unsupported"))) {
                 Result::Ok(_)  => { }
-                Result::Err(t) => { client.drop(); return Result::Err(t); }
+                Result::Err(t) => { return Result::Err(t); }
             }
         }
     }
 
     mut ex: Executor = Executor::new();
     const r: i64 = ex.block_on(v6_send_rejected(client));
-    ex.drop();
     return expect_eq(r, 0 as i64);
 }

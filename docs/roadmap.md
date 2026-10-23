@@ -382,8 +382,8 @@ Left over from that: the async entry point calls `Executor::new` and
    `next_below` and the HTTP/2 lengths and indexes are `i64` too: a read
    or seek given a negative one fails with `InvalidInput`, moving a
    cursor by one panics, and a width or precision of zero or less writes
-   nothing extra.  Left: `HashMap::bucket_count` and `get_bucket` are
-   still `u64`, because the bucket index is masked from a `u64` hash.
+   nothing extra (578).  `HashMap::bucket_count` and `get_bucket` stay
+   `u64`, because the bucket index is masked from a `u64` hash (579).
    Reaching a length through its accessor costs `cryo check` about a
    tenth more than a field read did; that is to be optimized when the HIR
    and MIR pipeline lands.
@@ -612,7 +612,8 @@ needs a take with a default left behind.
 ## W0015 becomes an error
 
 An explicit destructor call, `x.drop()`, is a warning today, and the
-compiler, the standard library and the editor have none left.  The
+compiler, the standard library, the editor, the examples and the tests
+have none left outside the tests of the diagnostic itself.  The
 warning's own text says it will become an error; then `mem::drop(x)` is
 the only way to release a value early.  An ordinary method that happens to
 be named `drop` on a type with no `Drop` is not a destructor call, and is

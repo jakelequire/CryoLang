@@ -29,6 +29,7 @@ namespace CryoTests::Tests::Stdlib::FutureBlocking;
 import std::core::option;
 import std::core::result::{ Result };
 import std::core::ptr::{ NonNull };
+import std::core::mem;
 import std::alloc::layout::{ Layout };
 import std::alloc::allocator::{ GlobalAlloc };
 import std::sync::atomic::{ Atomic, MemoryOrder };
@@ -210,7 +211,6 @@ function blocking_job_runs_off_the_executor() -> Result<(), TestError> {
     // ONE worker: if the job ran on it, nothing else on this executor could.
     mut ex: Executor = Executor::with_threads(1);
     const r: i64 = ex.block_on(handshake(j));
-    ex.drop();
     return expect_eq(r, 1 as i64);
 }
 
@@ -266,7 +266,7 @@ function blocking_pool_runs_jobs_concurrently() -> Result<(), TestError> {
     const r: i64 = ex.block_on(four_way(a, b, c, d));
     // Every job has finished and released its block by now (the executor's drop
     // joins the pool), so the barrier they shared has no readers left.
-    ex.drop();
+    mem::drop(ex);  // joins the workers before the counter they share is freed
     counter_free(arrived);
     return expect_eq(r, 0 as i64);
 }
@@ -458,7 +458,7 @@ function executor_blocking_ceiling_reaches_the_pool() -> Result<(), TestError> {
     z.flag.store(1, MemoryOrder::Release);
     mut ex: Executor = Executor::with_threads_and_blocking(1, 2);
     const r: i64 = ex.block_on(three_flags(x, y, z));
-    ex.drop();
+    mem::drop(ex);  // joins the workers before the counter they share is freed
     counter_free(arrived);
     return expect_eq(r, 0 as i64);
 }
@@ -478,7 +478,7 @@ function dropping_a_future_leaves_its_job_to_the_pool() -> Result<(), TestError>
     // waiting out FLAG_WAIT_MS — the join itself is the path under test: it must
     // wait the job out rather than free the block underneath it.
     j.flag.store(1, MemoryOrder::Release);
-    ex.drop();
+    mem::drop(ex);  // joins the workers before the job is released
     j.job.release();
     return expect_eq(r, 1 as i64);
 }
