@@ -397,9 +397,9 @@ type struct GenericRegistry {
     // DECLARATION, not about a spelling, so this maps each `LangItem` to the
     // qualified identity of the declaration that claimed it.
     //
-    // Only a declaration whose qualified name is a `LangItem`'s path can
-    // claim an entry, so a user trait sharing a leaf never lands here and
-    // therefore cannot answer a question the language asks of its own trait.
+    // Only a declaration marked `![language("name")]` claims an entry, so a
+    // user trait sharing a leaf never lands here and therefore cannot answer
+    // a question the language asks of its own trait.
     //
     // An absent entry means that declaration is not in this program's module
     // graph.  It is NOT "no type satisfies this": answering "no" off an absent
@@ -1523,29 +1523,26 @@ type struct GenericRegistry {
         return n;
     }
 
-    /// The language items are a table the compiler fixes,
-    /// named by path; this is the one place a declaration's path is compared
-    /// with it, so every other reader asks by the `LangItem`.
-    ///
-    /// Record `def` when its path is a `LangItem`'s. Called once per trait,
-    /// enum and struct declaration and per function signature, at the
-    /// registration site, with the id that registration made - so a claim is
-    /// always a declaration's own identity, never one built from a name.
+    /// Record `def` as `item`.  Only `CompilationContext::claim_language_item`
+    /// calls this, once it has read the declaration's `![language]` and
+    /// found the item unclaimed, so a claim is always a declaration's own
+    /// identity, never one built from a name.
     ///
     /// Every consumer asks by the `LangItem` and gets back the identity
-    /// recorded here, so no consumer needs to know the path - which is what
-    /// stops a user declaration from answering by being spelled the same.
-    claim_wellknown(mut &this, def: DefId, table: InternTable*) -> void {
-        if (!def.is_valid() || table == null) { return; }
-        const s: string = table.shown(this.arena.defs.path_of(def));
-        const items: [LangItem] = LangItem::all();
-        for (mut i: i64 = 0; i < items.length; i++) {
-            if (items[i].path() != s) { continue; }
-            if (!this.wellknown(items[i]).is_valid()) {
-                this.wellknown_claims.push(Pair::<LangItem, DefId>::new(items[i], def));
-            }
-            return;
-        }
+    /// recorded here, so no consumer needs to know a spelling - which is
+    /// what stops a user declaration from answering by being spelled the
+    /// same.
+    record_lang_item(mut &this, item: LangItem, def: DefId) -> void {
+        this.wellknown_claims.push(Pair::<LangItem, DefId>::new(item, def));
+    }
+
+    /// How a diagnostic names `item`: its claiming declaration's own name,
+    /// or the item's `![language]` name when nothing claimed it.  For
+    /// printing only; nothing is compared with it.
+    lang_item_shown(&this, item: LangItem, table: InternTable*) -> string {
+        const d: DefId = this.wellknown(item);
+        if (!d.is_valid()) { return item.name(); }
+        return table.resolve(this.arena.defs.leaf_of(d).spelling());
     }
 
     /// The definition that claimed `item`, or an invalid id when no such

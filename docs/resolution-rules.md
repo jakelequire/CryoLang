@@ -257,6 +257,18 @@ yet is recorded with the change that builds it, not here.
      compiler's items (E0152 otherwise) on a function, a method, a trait
      method, a struct, an enum or a trait (E0151 otherwise).  (Delegated)
 
+571. **The compiler finds its language items by `![language]` alone.**
+     The standard library marks each item's declaration; the compiler
+     keeps no table of paths, and a declaration not so marked is never an
+     item whatever it is spelled.  An f-string's builder calls name their
+     items, so nothing is imported for them, no scope is asked for them,
+     and their visibility is never in question; the compiler's own sources
+     import none of them.  An item declared twice is refused at both
+     declarations (E0152), each naming the other, since the order the two
+     are met in is not either one's doing.  `a <=> b` and the async entry
+     point's `Executor::new`/`block_on` are still bound by their method
+     names.  (Jake; the code and the item names Delegated)
+
 ### 2026-10-21
 
 501. **The class-removal plan is deleted now,** its slices all built and its

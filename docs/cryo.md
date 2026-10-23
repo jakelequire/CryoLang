@@ -252,8 +252,13 @@ const s: String = f"x = {x}, opt = {opt:?}";   // "x = 42, opt = Some(7)"
 - `{{` and `}}` produce literal `{` and `}`. Standard escape sequences in the
   literal text are processed as in a normal string.
 - The result is a heap-backed `String` the caller owns (and drops). The
-  parser desugars the whole f-string to calls into `std::fmt::interp`, which
-  is auto-imported into any module that uses one.
+  parser desugars the whole f-string to calls of the builders in
+  `std::fmt::interp`, the language items `format_new`,
+  `format_append_literal`, `format_append_display`, `format_append_debug`
+  and `format_append_spec` ([section 16.1](#161-recognised-attributes)).
+  The calls name the builders themselves, so nothing is imported for them,
+  and a function of the writing module spelled the same is neither called
+  nor in the way.
 
 For raw, untyped formatted output (C `printf` semantics, `%d`/`%s`
 specifiers, not type-checked), use `printf` from `std::fmt`. It is an
@@ -3348,7 +3353,7 @@ type struct AlignedData {
 | `![align(N)]`                                             | struct / union / enum / variable   | Minimum alignment in bytes; N must be a power of two. See [section 16.3](#163-memory-layout).                                                                                                                                                                                                                                                                                                                                   |
 | `![arch(<arch>, <dialect>)]`                              | asm block                          | Required directly above an `asm { ... }` block (see [section 6.12](#612-inline-assembly)). Names the target architecture - which *gates* the block, like `![config]` - and the assembly dialect (`intel` or `att`).                                                                                                                                                                                                             |
 | `![clobber(...)]`                                         | asm block                          | Lists registers, `flags`, or `memory` that an `asm` block overwrites but does not bind as operands.                                                                                                                                                                                                                                                                                                                             |
-| `![language("name")]`                                     | function / method / trait method / struct / enum / trait | Marks the declaration as the language item `name`: a declaration the compiler reasons about by identity, such as the trait an operator lowers to or a function generated code calls. `name` must be one of the compiler's items (`E0152`). *Validated; the compiler still finds its language items by their paths.*                                                                                          |
+| `![language("name")]`                                     | function / method / trait method / struct / enum / trait | Marks the declaration as the language item `name`: a declaration the compiler reasons about by identity, such as the trait an operator lowers to or a function generated code calls. The standard library marks each of its items so, and the compiler finds them by the directive and by nothing else; a call the compiler generates names its item and is never refused for visibility. `name` must be one of the compiler's items (`E0152`), and an item has one declaration: a second is refused at both (`E0152`).                                                                                          |
 
 A method declared in a trait body takes `![language]` and no other directive (`E0151`), and a directive written above an associated type is refused (`E0151`).
 

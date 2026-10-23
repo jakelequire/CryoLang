@@ -3658,6 +3658,10 @@ implement trait Walk for struct NameResolver {
     }
 
     walk_identifier(mut &this, e: ExpressionNode*, node: IdentifierExpr*) -> void {
+        // A call an f-string lowered to names its builder by the language
+        // item, settled once the item is claimed; its spelling is not the
+        // writing module's to answer.
+        if (node.res.is_lang()) { return; }
         // A bare identifier in expression position names a VALUE, so it is
         // asked in the value namespace alone: a type spelled the same is not
         // an answer, and when a module holds both a type and a function under
@@ -3727,6 +3731,13 @@ implement trait Walk for struct NameResolver {
     }
 
     walk_scope_resolution(mut &this, e: ExpressionNode*, node: ScopeResolutionExpr*) -> void {
+        // `a..b`'s constructor names the language's range type, settled once
+        // the item is claimed; its scope segment is not the writing module's
+        // to look up.
+        if (node.scope_res.is_lang()) {
+            this.stamp_annotation_list(&node.generic_args);
+            return;
+        }
         if (!this.stamp_this_scope(e, node)) {
             // Look up the scope name (e.g., "Foo" in "Foo::Bar")
             const scope_sym: SymbolID = this.resolver.lookup(
@@ -4052,19 +4063,23 @@ implement trait Walk for struct NameResolver {
     }
 
     walk_enum_pattern(mut &this, p: Pattern*, node: EnumPattern*) -> void {
-        // Resolve enum name
-        const enum_sym: SymbolID = this.resolver.lookup(
-            node.enum_name, this.resolver.current_scope);
-        if (enum_sym.is_valid()) {
-            this.resolver.record_resolution(p.span, enum_sym);
-        }
-        // The pattern names a TYPE, and its spelling may be qualified, so it is
-        // the annotation's question rather than the single-segment scope lookup
-        // a bare value name gets.  `enum_span` is the enum-path side of the
-        // pattern, which is what this stamp is about.
-        match (this.type_spelling_res(node.enum_name, node.enum_span)) {
-            ResSlot::Answered(r) => { node.set_res(r); }
-            _                    => { }
+        // A desugaring's `Option::Some` names the language's enum, settled
+        // once the item is claimed; only its bindings are this scope's.
+        if (!node.res.is_lang()) {
+            const enum_sym: SymbolID = this.resolver.lookup(
+                node.enum_name, this.resolver.current_scope);
+            if (enum_sym.is_valid()) {
+                this.resolver.record_resolution(p.span, enum_sym);
+            }
+            // The pattern names a TYPE, and its spelling may be qualified, so
+            // it is the annotation's question rather than the single-segment
+            // scope lookup a bare value name gets.  `enum_span` is the
+            // enum-path side of the pattern, which is what this stamp is
+            // about.
+            match (this.type_spelling_res(node.enum_name, node.enum_span)) {
+                ResSlot::Answered(r) => { node.set_res(r); }
+                _                    => { }
+            }
         }
 
         // Declare each binding variable.  A nested pattern (`Some(Some(n))`)

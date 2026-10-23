@@ -22,7 +22,9 @@ import compiler::ast::node::{ Node };
 import compiler::ast::{ NamedAnnotation, Visibility };
 import compiler::ast::declaration::{ DeclarationNode, FunctionDecl, ImplBlock, MethodDecl };
 import compiler::ast::expression::{ ExpressionNode };
+import compiler::ast::pattern::{ DirectiveArgKind, DirectiveNode };
 import compiler::types::generic_registry::{ TemplateEntry };
+import utils::keyword::{ Keyword };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import utils::log::{ Log, LogArea, LogLevel };
@@ -172,6 +174,12 @@ type struct LangRef {
     /// An expression or a pattern.
     node: Node;
     item: LangItem;
+}
+
+/// Where a language item's claiming declaration says so.
+type struct LangClaim {
+    item: LangItem;
+    span: SourceSpan;
 }
 
 /// A type alias's declaration, which the list refers to without owning it.
@@ -330,6 +338,10 @@ public:
     /// claimed (`PassRegistry::settle_lang_refs` answers them).
     lang_refs: [LangRef];
 
+    /// The `![language]` directive of each claimed item's declaration, for
+    /// a second claim's refusal to point at the first.
+    lang_claims: [LangClaim];
+
     /// Every type alias declared, and every path whose scope segment names
     /// one (`NameResolutionPass::settle_alias_paths` answers the paths once
     /// every module's names are resolved).  Each node is held in a struct,
@@ -434,6 +446,7 @@ public:
             const_table:   consts_ptr,
             injected_origins:     [],
             lang_refs:            [],
+            lang_claims:          [],
             alias_decls:          [],
             alias_paths:          [],
             c_refs:               [],
@@ -487,6 +500,48 @@ public:
 
     note_lang_ref(mut &this, node: Node, item: LangItem) -> void {
         this.lang_refs.push(LangRef { node: node, item: item });
+    }
+
+    /// Claim `def` as the language item its declaration `decl` names with
+    /// `![language("name")]`; a declaration without one claims nothing.
+    /// Called where the identity is first registered, so a check of an
+    /// earlier-resolved module that asks by the item finds it.
+    ///
+    /// An item has one declaration: a second is refused (E0152) at both,
+    /// each naming the other, rather than one of the two silently
+    /// answering - and since modules are claimed in an order neither
+    /// declaration chose, neither is singled out as the one in the wrong.
+    /// The directive's shape is DirectiveProcessing's to check, which runs
+    /// later, so a malformed one claims nothing here.
+    claim_language_item(mut &this, def: DefId, decl: DeclarationNode*) -> void {
+        if (!def.is_valid() || decl == null) { return; }
+        const d: DirectiveNode* = decl.find_directive(Keyword::new("language"));
+        if (d == null || d.args.length != 1 || d.args[0].kind != DirectiveArgKind::StringLit) { return; }
+        const named: Option<LangItem> = LangItem::named(d.args[0].str_value);
+        if (named.is_none()) { return; }
+        const item: LangItem = named.unwrap();
+        const held: DefId = this.generic_registry.wellknown(item);
+        if (!held.is_valid()) {
+            this.generic_registry.record_lang_item(item, def);
+            this.lang_claims.push(LangClaim { item: item, span: d.span });
+            return;
+        }
+        if (held.equals(def)) { return; }
+        this.refuse_second_claim(item, d.span, held);
+        for (mut i: i64 = 0; i < this.lang_claims.length; i++) {
+            if (this.lang_claims[i].item == item) {
+                this.refuse_second_claim(item, this.lang_claims[i].span, def);
+            }
+        }
+    }
+
+    /// The refusal of a claim to `item` at `at`, naming `other`, the
+    /// declaration claiming it as well.
+    refuse_second_claim(mut &this, item: LangItem, at: SourceSpan, other: DefId) -> void {
+        this.emit_error_at(ErrorCode::E0152_DIRECTIVE_BAD_ARG,
+            fmt::format("directive `![language]`: the language item `%s` is also declared by `%s`",
+                item.name(), this.intern_table.shown(this.defs.path_of(other))),
+            at);
     }
 
     note_alias_decl(mut &this, decl: DeclarationNode*) -> void {

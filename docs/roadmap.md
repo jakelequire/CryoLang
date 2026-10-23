@@ -364,31 +364,33 @@ exposure is a decision.  Built: `private` holds on every member and item
 signature may not name a type seen by fewer modules than it is, a trait's
 implementation included (564, 565, 567); and `module x;`, `internal module
 x;` and the grouped forms reach as far as they say, with `public module`
-refused (568).  The rest, in order:
+refused (568); and the compiler finds its language items by the
+library's `![language("name")]` on each, so an f-string's builder calls
+name their items and are never refused (570, 571).  Left over from that:
+`a <=> b` lowers to a call of `compare` by name and the async entry point
+calls `Executor::new` and `block_on` by name; whether `<=>` means `Ord`'s
+`compare` alone is open.  The rest, in order:
 
-1. **The compiler's half.**
-   - `![language("format_new")]` on the library items generated code
-     calls (the f-string builders, `Option::take`, `Poll::into_ready`,
-     ...): the compiler's table is built from the attributes, the parser
-     stops building those calls by name, and the compiler's own imports
-     of the builders go.  A generated call is never refused.
-2. **Collections' `length` and `capacity` private**, behind `![inline]`
+1. **Collections' `length` and `capacity` private**, behind `![inline]`
    accessors made inline first; the compiler's, the language server's
    and the tests' reads rewritten by a codemod.  Every `length()`
    returns `i64`.
-3. **`Display` and `Debug` over a trait object:** one non-generic `fmt`
+2. **`Display` and `Debug` over a trait object:** one non-generic `fmt`
    writing through a `virtual mut &FmtWrite` held by `Formatter`, in
    place of `fmt<W>`; code size and the fmt suites measured first.
-4. **`std::core::intrinsics::Location`** with private fields and the
+3. **`std::core::intrinsics::Location`** with private fields and the
    read methods `file()`, `line()`, `column()`, `function()`: only the
    compiler makes one (`location()`, the caller of a
    `![caller_location]` function), and a program reads one but cannot
    build one.
-5. **Every item marked.**  About 650 helpers used only in their own
+4. **Every item marked.**  About 650 helpers used only in their own
    module become `private`; about 215 used across the library become
-   `internal`; implementation modules (the heap allocator, the reactor,
-   the raw buffer, the HPACK Huffman tables, ...) become `internal
-   module`.  The C bindings (`libc`, `syscall`, `openssl`) stay public,
+   `internal`; implementation modules become `internal module`:
+   `future::reactor` and `raw_buffer` once the public fields naming
+   `Reactor` and `String.buffer` are private, and `alloc::heap` and
+   `net::http2::huffman`/`hpack` once the compiler and the tests stop
+   importing them.  `net::addr::sockaddr` stays public: low-level
+   programming is not hidden.  The C bindings (`libc`, `syscall`, `openssl`) stay public,
    outside the 1.0 stability promise.  Tests that reach internals are
    rewritten through the public API, or deleted where they pinned only
    an internal.  Anything borderline is listed for Jake rather than

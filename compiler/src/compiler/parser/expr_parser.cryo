@@ -278,11 +278,11 @@ implement struct Parser {
     /// leaving a spelling for the name layer to look up in the user's scope
     /// (`ResSlot::Lang`, answered once the item is claimed):
     /// a module declaring its own `Option` would otherwise have its enum
-    /// matched against the language's value and refused.  The leaf stays on
-    /// the node for a diagnostic to print.
+    /// matched against the language's value and refused.  The node takes
+    /// the claiming declaration's spelling when it is settled.
     lang_variant_pattern(item: LangItem, variant: string, span: SourceSpan) -> Pattern* {
         mut pat: Pattern* = Pattern::enum_variant(
-            this.ctx.intern(item.leaf()), this.ctx.intern(variant), span);
+            this.ctx.intern(item.name()), this.ctx.intern(variant), span);
         pat.enum_payload().res = ResSlot::Lang(item);
         this.ctx.note_lang_ref(Node::Pattern(pat), item);
         return pat;
@@ -413,7 +413,7 @@ implement struct Parser {
                 // module declaring its own `Range` keeps its range literals.
                 const range_item: LangItem =
                     if (op.kind == TokenType::DotDotEq) { LangItem::RangeInclusive } else { LangItem::Range };
-                const ctor_scope: SymbolStr = this.ctx.intern(range_item.leaf());
+                const ctor_scope: SymbolStr = this.ctx.intern(range_item.name());
                 const new_name: SymbolStr = this.ctx.intern("new");
                 const sr: ExpressionNode* = ExpressionNode::scope_resolution_expr(
                     ctor_scope, new_name, span);
@@ -874,15 +874,15 @@ implement struct Parser {
     }
 
     /// Parse an f-string `f"...{expr}...{expr:?}..."` and desugar it, here
-    /// in the parser, into a chain of `fmt_*` builder calls that produce an
-    /// owned `String`.  See `std::fmt::interp` for the runtime the chain
-    /// targets and the desugar shape.
+    /// in the parser, into a chain of calls of the builder language items
+    /// that produce an owned `String`.  See `std::fmt::interp` for the
+    /// runtime the chain targets and the desugar shape.
     ///
     /// Display vs Debug is chosen purely by the hole's format spec (`{}` ->
     /// Display, `{:?}` -> Debug), which is fully known here at parse time,
     /// so the entire desugar is built now and the rest of the pipeline only
-    /// ever sees ordinary calls.  Each generic `fmt_append_display`/`_debug`
-    /// call has its `T` inferred from the `&expr` argument by the
+    /// ever sees ordinary calls.  Each generic `format_append_display`/
+    /// `_debug` call has its `T` inferred from the `&expr` argument by the
     /// monomorphizer, exactly like a hand-written `format_to_string(&x)`;
     /// building the chain pre-monomorphization is what makes that work.
     ///
@@ -890,19 +890,19 @@ implement struct Parser {
     /// the literal chunks are processed via the same routine as plain
     /// strings.  A hole may carry a format spec after a `:` -
     /// `{expr:[[fill]align][#][0][width][.precision][type]}` - lowered to
-    /// `fmt_append_fmt` with the spec as a string; `{expr}` and `{expr:?}`
-    /// still lower to `fmt_append_display` / `fmt_append_debug`.
+    /// `format_append_spec` with the spec as a string; `{expr}` and
+    /// `{expr:?}` still lower to `format_append_display` /
+    /// `format_append_debug`.
     parse_fstring() -> ExpressionNode* {
         const tok: Token = this.advance();
-        this.used_fstring = true;
         // Stash the span so the desugar helpers can read it from a field
         // rather than taking it as a by-value struct parameter.
         this.fstr_span = this.span_from_token(tok);
         const raw: string = tok.lexeme;
         const len: i64 = raw.length() as i64;
 
-        // acc := fmt_new()
-        mut acc: ExpressionNode* = this.fstr_call0("fmt_new");
+        // acc := format_new()
+        mut acc: ExpressionNode* = this.fstr_call(LangItem::FormatNew);
 
         // Literal runs are tracked as `[chunk_start, i)` index ranges into
         // `raw` and materialised with `substr` - no manual byte buffer.  A
@@ -1014,9 +1014,9 @@ implement struct Parser {
                 if (helper_kind == 2) {
                     acc = this.fstr_call_fmt(acc, ref_node, spec_src);
                 } else {
-                    const helper: string =
-                        if (helper_kind == 1) { "fmt_append_debug" }
-                        else { "fmt_append_display" };
+                    const helper: LangItem =
+                        if (helper_kind == 1) { LangItem::FormatAppendDebug }
+                        else { LangItem::FormatAppendDisplay };
                     acc = this.fstr_call2(helper, acc, ref_node);
                 }
                 continue;
@@ -1044,7 +1044,8 @@ implement struct Parser {
     }
 
     /// Flush the literal run `raw[start, end)` into `acc` as a
-    /// `fmt_append_lit(acc, "<escape-processed>")` call.  No-op when empty.
+    /// `format_append_literal(acc, "<escape-processed>")` call.  No-op when
+    /// empty.
     /// Uses `this.fstr_span` for synthesized node spans.
     fstr_flush_range(acc: ExpressionNode*, raw_text: string,
                      start: i64, end: i64) -> ExpressionNode* {
@@ -1056,28 +1057,29 @@ implement struct Parser {
         mut lit: ExpressionNode* = ExpressionNode::literal(text.into_raw(), LiteralKind::String, this.fstr_span);
         ExpressionNode::literal_of(lit).byte_length = byte_length;
         lit.generated = true;
-        return this.fstr_call2("fmt_append_lit", acc, lit);
+        return this.fstr_call2(LangItem::FormatAppendLiteral, acc, lit);
     }
 
-    /// A call of `name` the lowering writes.  The f-string's text spells
-    /// neither the call nor its callee, so both are marked as the
+    /// A call of the builder `item` the lowering writes.  The callee names
+    /// the language item, never a spelling (`ResSlot::Lang`, answered once
+    /// the item is claimed): a function of the writing module's spelled the
+    /// same is not the builder, and no scope is asked for one, so the
+    /// builder's visibility is never in question.  The f-string's text
+    /// spells neither the call nor its callee, so both are marked as the
     /// compiler's; the holes among its arguments are written code.
-    fstr_call(name: string) -> ExpressionNode* {
-        mut id: ExpressionNode* = ExpressionNode::identifier_expr(this.ctx.intern(name), this.fstr_span);
+    fstr_call(item: LangItem) -> ExpressionNode* {
+        mut id: ExpressionNode* = ExpressionNode::identifier_expr(this.ctx.intern(item.name()), this.fstr_span);
         id.generated = true;
+        ExpressionNode::identifier_of(id).res = ResSlot::Lang(item);
+        this.ctx.note_lang_ref(Node::Expr(id), item);
         mut call: ExpressionNode* = ExpressionNode::call_expr(id, this.fstr_span);
         call.generated = true;
         return call;
     }
 
-    /// Build a zero-argument free-function call `name()`.
-    fstr_call0(name: string) -> ExpressionNode* {
-        return this.fstr_call(name);
-    }
-
-    /// Build a two-argument free-function call `name(a, b)`.
-    fstr_call2(name: string, a: ExpressionNode*, b: ExpressionNode*) -> ExpressionNode* {
-        const call: ExpressionNode* = this.fstr_call(name);
+    /// Build a two-argument call of the builder `item`, `item(a, b)`.
+    fstr_call2(item: LangItem, a: ExpressionNode*, b: ExpressionNode*) -> ExpressionNode* {
+        const call: ExpressionNode* = this.fstr_call(item);
         ExpressionNode::call_of(call).add_argument(a);
         ExpressionNode::call_of(call).add_argument(b);
         return call;
@@ -1117,13 +1119,13 @@ implement struct Parser {
         return n;
     }
 
-    /// Build the three-argument call `fmt_append_fmt(acc, ref, "spec")`
+    /// Build the three-argument call `format_append_spec(acc, ref, "spec")`
     /// that lowers a `{expr:spec}` hole. `spec` is the raw spec text; it
     /// is passed verbatim as a string literal (no escape processing) and
     /// re-parsed at runtime by `std::fmt::spec::fmt_parse_spec`.
     fstr_call_fmt(acc: ExpressionNode*, ref_node: ExpressionNode*,
                   spec: string) -> ExpressionNode* {
-        const call: ExpressionNode* = this.fstr_call("fmt_append_fmt");
+        const call: ExpressionNode* = this.fstr_call(LangItem::FormatAppendSpec);
         ExpressionNode::call_of(call).add_argument(acc);
         ExpressionNode::call_of(call).add_argument(ref_node);
         mut lit: ExpressionNode* = ExpressionNode::literal(spec, LiteralKind::String, this.fstr_span);

@@ -703,7 +703,7 @@ type struct PassRegistry {
                     // Whether this IS the language's `Array`, `Slice`, `Rc`,
                     // ... is decided by the identity, claimed where it is
                     // minted.
-                    ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
+                    ctx.claim_language_item(node.def, stmt);
                     type_count++;
                 }
                 DeclKind::Trait(node) => {
@@ -715,10 +715,10 @@ type struct PassRegistry {
                     // decided by the identity, and claimed here, where the identity
                     // is first minted: an ownership query of a module resolved
                     // before this trait's asks by the identity and must find it.
-                    ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
+                    ctx.claim_language_item(node.def, stmt);
                     for (mut mi: i64 = 0; mi < node.methods.length; mi++) {
                         if (node.methods[mi] != null) {
-                            ctx.generic_registry.claim_wellknown(DeclarationNode::fn_of(node.methods[mi]).def, ctx.intern_table);
+                            ctx.claim_language_item(DeclarationNode::fn_of(node.methods[mi]).def, node.methods[mi]);
                         }
                     }
                     type_count++;
@@ -734,7 +734,7 @@ type struct PassRegistry {
                     // Whether this IS the language's `Result`/`Option` - the enums
                     // `?` desugars through - is decided by the identity, claimed
                     // here where it is first minted, as a trait's is below.
-                    ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
+                    ctx.claim_language_item(node.def, stmt);
                     type_count++;
                 }
                 DeclKind::TypeAlias(node) => {
@@ -772,11 +772,19 @@ type struct PassRegistry {
                 DeclKind::Impl(node) => {
                     PassRegistry::claim_method_items(ctx, &node.methods);
                 }
+                // A function generated code calls is claimed here with the
+                // types, before any reference a desugaring wrote is settled:
+                // an f-string's builder calls are answered at the end of this
+                // stage, and the identity is the one the name layer stamped
+                // when it bound the function.
+                DeclKind::Function(node) => {
+                    ctx.claim_language_item(node.def, stmt);
+                }
                 // No other kind with a payload declares a type.
                 DeclKind::Import(_) | DeclKind::Intrinsic(_)
                 | DeclKind::Module(_) | DeclKind::Variant(_) | DeclKind::Destructure(_)
                 | DeclKind::Extern(_) | DeclKind::Field(_) | DeclKind::GenericParam(_)
-                | DeclKind::Variable(_) | DeclKind::Function(_) | DeclKind::Method(_) => {}
+                | DeclKind::Variable(_) | DeclKind::Method(_) => {}
             }
         }
 
@@ -836,18 +844,14 @@ type struct PassRegistry {
 
 
     /// Claim each method `methods` holds that is a language item, as a
-    /// type is claimed where its identity is first known.  Only a method
-    /// written in the module that declares its owner is claimed: an
-    /// implementation in another module can give the owner a method of the
-    /// same path, and it must not become the method generated code calls.
+    /// type is claimed where its identity is first known.  The directive
+    /// sits on the method's own declaration, its function on `m.func`.
     static claim_method_items(ctx: CompilationContext*, methods: &[DeclarationNode*]) -> void {
-        const here: DefId = ctx.module_def_of(ctx.unit_module);
         for (mut i: i64 = 0; i < methods.length; i++) {
             const m_decl: DeclarationNode* = methods[i];
             const m: MethodDecl* = DeclarationNode::method_of(m_decl);
-            if (m == null || m.func == null || !DeclarationNode::fn_of(m.func).def.is_valid()) { continue; }
-            if (!ctx.defs.module_of(DeclarationNode::fn_of(m.func).def).equals(here)) { continue; }
-            ctx.generic_registry.claim_wellknown(DeclarationNode::fn_of(m.func).def, ctx.intern_table);
+            if (m == null || m.func == null) { continue; }
+            ctx.claim_language_item(DeclarationNode::fn_of(m.func).def, m_decl);
         }
     }
 
@@ -864,6 +868,12 @@ type struct PassRegistry {
     /// reference can precede its item in module order, so an unclaimed one
     /// waits for a later module.  One claimed id answers every reference to
     /// the item; none is made here.
+    ///
+    /// The desugaring cannot know how the item's declaration is spelled, so
+    /// the node's own name is written here from the declaration that
+    /// claimed it, for what prints the node: a diagnostic, the tree dump.
+    /// A member name (`next`, `compare`) is the trait's method and is not
+    /// the item's spelling.
     static settle_lang_refs(ctx: CompilationContext*) -> void {
         mut kept: i64 = 0;
         for (mut i: i64 = 0; i < ctx.lang_refs.length; i++) {
@@ -874,15 +884,25 @@ type struct PassRegistry {
                 kept++;
                 continue;
             }
+            const spelling: SymbolStr = ctx.defs.leaf_of(id).spelling();
             match (r.node) {
                 // A lang ref on a pattern is the desugarings' `Item::variant`.
-                Node::Pattern(p) => { p.enum_payload().res.settle(Res::Def(id)); }
+                Node::Pattern(p) => {
+                    p.enum_payload().enum_name = spelling;
+                    p.enum_payload().res.settle(Res::Def(id));
+                }
                 Node::Expr(e) => {
                     if (ExpressionNode::scope_resolution_of(e) != null) {
+                        ExpressionNode::scope_resolution_of(e).scope_name = spelling;
                         ExpressionNode::scope_resolution_of(e).scope_res.settle(
                             Res::TypeRelative(ResBase::Def(id), 1));
                     } else if (ExpressionNode::member_access_of(e) != null) {
                         ExpressionNode::member_access_of(e).set_resolved_trait(id);
+                    } else if (ExpressionNode::identifier_of(e) != null) {
+                        // A function generated code calls: an f-string's
+                        // builders.
+                        ExpressionNode::identifier_of(e).name = spelling;
+                        ExpressionNode::identifier_of(e).res.settle(Res::Def(id));
                     }
                 }
                 _ => { }
@@ -931,27 +951,6 @@ type struct PassRegistry {
                 Log::debug(LogArea::Loader, f"auto-imports skipped: stdlib module '{ns}'");
             }
             return PassResult::ok();
-        }
-
-        // Inject the f-string runtime import for any module that used an
-        // f-string (`f"..."`).  The parser desugars each into nested
-        // `fmt_new`/`fmt_append_*` calls (see std::fmt::interp); this brings
-        // those names into scope.  Done here rather than via the prelude so the
-        // formatter's transitive deps (ffi::libc etc.) don't pollute every
-        // module.  Placed before the explicit-`import std::prelude` short-circuit
-        // below so it still fires when the user imported the prelude themselves.
-        // A same-module re-import (if the user also wrote it) is silently
-        // de-duplicated during name resolution.
-        if (root.uses_fstring) {
-            const interp_import: DeclarationNode* = DeclarationNode::of(DeclKind::Import(ImportDecl::new(
-                ctx.intern_table.intern(LangModule::Interp.path()), ImportStyle::Wildcard)), SourceSpan::none());
-            mut with_interp: [Node] = [];
-            with_interp.push(Node::Decl(interp_import));
-            for (mut fi: i64 = 0; fi < root.statements.length; fi++) {
-                with_interp.push(root.statements[fi]);
-            }
-            root.statements = with_interp;
-            Log::debug(LogArea::Loader, "injected 'import std::fmt::interp' (f-string used)");
         }
 
         // Skip injection when the file already GLOBS the prelude, so it is not
