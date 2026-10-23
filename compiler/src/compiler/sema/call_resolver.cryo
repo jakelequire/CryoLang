@@ -1250,6 +1250,9 @@ type struct CallResolver {
             if (receiver_t != null) {
                 return this.resolve_object_call(visitor, call_e, call, callee_member, receiver_t);
             }
+            if (callee_member.trait_required && !this.receiver_has_required_trait(visitor, callee_member)) {
+                return TypeRef::invalid();
+            }
             const selected: Selection = this.resolve_method_overload(visitor, call, callee_member);
             // Every `recv.method(...)` call is selected here, whatever shape
             // its receiver has, so this is where the method it chose is gated.
@@ -3607,6 +3610,32 @@ type struct CallResolver {
         if (fn_node.generic_params.length > 0 && call.resolved_callee.is_some()) { return; }
         if (!fn_node.overload_entry.is_valid()) { return; }
         call.set_resolved_callee(CalleePin::Decl(fn_node.overload_entry));
+    }
+
+    /// Whether the receiver of a call defined over its trait (`a <=> b`,
+    /// `Ord::compare`) implements that trait.  One that does not is refused
+    /// here, before selection, which would otherwise bind an inherent
+    /// method of the same name.  A receiver already refused reports nothing
+    /// more.
+    receiver_has_required_trait(mut &this, visitor: SemaVisitor*, member: MemberAccessExpr*) -> boolean {
+        const recv: TypeRef = visitor.resolve_expr(member.object);
+        if (!recv.is_valid()) { return false; }
+        if (visitor.receiver_implements(recv, member.resolved_trait)) { return true; }
+        if (!this.state.in_symbolic_check) {
+            const shown: string = this.arena.resolve_display_name_short(visitor.receiver_subject(recv));
+            const trait_name: string = if (member.resolved_trait.is_valid()) {
+                this.intern.shown(this.ctx.defs.leaf_of(member.resolved_trait))
+            } else {
+                "Ord"
+            };
+            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
+                fmt::format("`%s` does not implement `%s`", shown, trait_name));
+            d = d.at_with_label(member.object.span,
+                fmt::format("`<=>` compares through `%s::compare`; no `implement trait %s for %s` selects an implementation here",
+                    trait_name, trait_name, shown));
+            this.ctx.emit_diagnostic(d);
+        }
+        return false;
     }
 
     /// Pin `resolved_callee` for an instance method call.  Candidates are

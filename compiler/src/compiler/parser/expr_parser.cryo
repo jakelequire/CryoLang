@@ -385,11 +385,10 @@ implement struct Parser {
             }
             const span: SourceSpan = Parser::merge_spans(left.span, right.span);
             if (op.kind == TokenType::Spaceship) {
-                // `a <=> b` => `a.compare(&b)`.  Three-way comparison is
-                // sugar for the `Ord` trait method, so sema and codegen
-                // never see `<=>`; they just see an ordinary method call
-                // that resolves to the concrete `Ord` impl and yields an
-                // `Ordering`.  `&b` matches `compare`'s `other: &This`.
+                // `a <=> b` => `a.compare(&b)`, the call naming the
+                // language's `Ord::compare` by identity: an `a` whose type
+                // does not implement `Ord` is refused, whatever `compare`
+                // methods it has.  `&b` matches `compare`'s `other: &This`.
                 const amp_tok: Token = Token::new(
                     TokenType::Amp, "&", op.line, op.column);
                 // Compiler-synthesized address-of a temporary: exempt from
@@ -397,8 +396,10 @@ implement struct Parser {
                 const ref_right: ExpressionNode* =
                     ExpressionNode::synthetic_unary(amp_tok, right, right.span);
                 const compare_name: SymbolStr = this.ctx.intern("compare");
-                const member: ExpressionNode* = ExpressionNode::member_access_expr(
+                mut member: ExpressionNode* = ExpressionNode::member_access_expr(
                     left, compare_name, this.span_from_token(op), span);
+                ExpressionNode::member_access_of(member).trait_required = true;
+                this.ctx.note_lang_ref(Node::Expr(member), LangItem::Ord);
                 mut call: ExpressionNode* =
                     ExpressionNode::call_expr(member, span);
                 ExpressionNode::call_of(call).add_argument(ref_right);

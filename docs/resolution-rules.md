@@ -265,9 +265,25 @@ yet is recorded with the change that builds it, not here.
      and their visibility is never in question; the compiler's own sources
      import none of them.  An item declared twice is refused at both
      declarations (E0152), each naming the other, since the order the two
-     are met in is not either one's doing.  `a <=> b` and the async entry
-     point's `Executor::new`/`block_on` are still bound by their method
-     names.  (Jake; the code and the item names Delegated)
+     are met in is not either one's doing.  The async entry point's
+     `Executor::new`/`block_on` are still bound by their method names;
+     `a <=> b` is ruling 572's.  (Jake; the code and the item names
+     Delegated)
+
+572. **`a <=> b` is the language's `Ord::compare`, by identity.**  The
+     call the comparison lowers to names the trait claimed as `ord` and
+     its method's position, so a type with an inherent `compare` beside its
+     `Ord` implementation compares through the trait's, without ambiguity,
+     and a type that does not implement `Ord` is refused at the left
+     operand (E0306) whatever `compare` methods it has - as `for` requires
+     `Iterator`.  (Jake)
+
+573. **Only the standard library declares language items.**  A
+     `![language]` on a declaration outside it is refused (E0151) and
+     claims nothing, so the refusal is the only one: the standard
+     library's declaration of the same item is not reported as a second
+     claim.  The directive's shape is still checked.  (Jake; reusing E0151
+     rather than a new code Delegated, and parked as a question)
 
 ### 2026-10-21
 

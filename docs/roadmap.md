@@ -366,12 +366,12 @@ implementation included (564, 565, 567); and `module x;`, `internal module
 x;` and the grouped forms reach as far as they say, with `public module`
 refused (568); and the compiler finds its language items by the
 library's `![language("name")]` on each, so an f-string's builder calls
-name their items and are never refused (570, 571); and a `Location` is
-read through `file()`, `line()`, `column()` and `function()`, its fields
-private, so only the compiler makes one (414).  Left over from that:
-`a <=> b` lowers to a call of `compare` by name and the async entry point
-calls `Executor::new` and `block_on` by name; whether `<=>` means `Ord`'s
-`compare` alone is open.  The rest, in order:
+name their items and are never refused (570, 571), `a <=> b` is `Ord`'s
+`compare` by identity (572), and only the library declares items (573);
+and a `Location` is read through `file()`, `line()`, `column()` and
+`function()`, its fields private, so only the compiler makes one (414).
+Left over from that: the async entry point calls `Executor::new` and
+`block_on` by name.  The rest, in order:
 
 1. **Collections' `length` and `capacity` private**, behind `![inline]`
    accessors made inline first; the compiler's, the language server's

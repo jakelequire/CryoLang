@@ -1359,8 +1359,8 @@ type struct SemaVisitor {
                 // spelled `next`.  A collection that is not one is iterated
                 // through its `iter()`.
                 const iterator_id: DefId = this.ctx.generic_registry.wellknown(LangItem::Iterator);
-                if (!this.for_scrutinee_iterates(init_type, iterator_id)) {
-                    const owner_ref: TypeRef = this.types.method_owner_ref(this.for_scrutinee_subject(init_type));
+                if (!this.receiver_implements(init_type, iterator_id)) {
+                    const owner_ref: TypeRef = this.types.method_owner_ref(this.receiver_subject(init_type));
                     if (owner_ref.is_valid()) {
                         if (this.ctx.decl_index.lookup_family_entries(
                                 FamilyOwner::Type(owner_ref), this.intern.intern("iter")).length > 0) {
@@ -1376,10 +1376,10 @@ type struct SemaVisitor {
                     // no type, so the `next` call the loop makes on it reports
                     // nothing further.  An `iter()` that failed has already
                     // said why.
-                    if (init_type.is_valid() && !this.for_scrutinee_iterates(init_type, iterator_id)) {
+                    if (init_type.is_valid() && !this.receiver_implements(init_type, iterator_id)) {
                         if (!this.state.in_symbolic_check) {
                             const shown: string = this.arena.resolve_display_name_short(
-                                this.for_scrutinee_subject(init_type));
+                                this.receiver_subject(init_type));
                             mut d: Diagnostic = Diagnostic::error(ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
                                 fmt::format("`%s` does not implement `Iterator`", shown));
                             d = d.at_with_label(var_node.initializer.span,
@@ -2025,10 +2025,10 @@ type struct SemaVisitor {
         }
     }
 
-    /// The type a `for` scrutinee's `next` is called on: a pointer or
+    /// The type a receiver of type `ty` calls its methods on: a pointer or
     /// reference auto-derefs to what it points at, and an instantiation to
     /// the type it resolved to.
-    for_scrutinee_subject(&this, ty: TypeRef) -> TypeRef {
+    receiver_subject(&this, ty: TypeRef) -> TypeRef {
         mut r: TypeRef = ty;
         mut t: Type* = this.arena.lookup(r);
         mut depth: i32 = 0;
@@ -2045,19 +2045,20 @@ type struct SemaVisitor {
         return r;
     }
 
-    /// Whether a `for` scrutinee of type `ty` is an iterator: its subject
-    /// implements `iterator_id`, the language's `Iterator` - a parameter by
-    /// a bound naming it, a concrete type by an impl of it.  An impl whose
-    /// where-clause binds a generic the target does not carry
-    /// (`CopiedIter<I>`, `where I: Iterator<T*>`) is confirmed when its clone
-    /// is placed, so a head that unifies answers here, as for an `implement
-    /// Iterator` binding.
-    for_scrutinee_iterates(&this, ty: TypeRef, iterator_id: DefId) -> boolean {
-        if (!iterator_id.is_valid()) { return false; }
-        const subject: TypeRef = this.for_scrutinee_subject(ty);
+    /// Whether a receiver of type `ty` implements `trait_id` (a `for`
+    /// scrutinee the language's `Iterator`, `a <=> b`'s `a` its `Ord`): its
+    /// subject does - a parameter by a bound naming it, a concrete type by an
+    /// impl of it.  An impl whose where-clause binds a generic the target
+    /// does not carry (`CopiedIter<I>`, `where I: Iterator<T*>`) is confirmed
+    /// when its clone is placed, so a head that unifies answers here, as for
+    /// an `implement Iterator` binding.  An unclaimed trait is implemented
+    /// by nothing.
+    receiver_implements(&this, ty: TypeRef, trait_id: DefId) -> boolean {
+        if (!trait_id.is_valid()) { return false; }
+        const subject: TypeRef = this.receiver_subject(ty);
         const t: Type* = this.arena.lookup(subject);
         if (t == null) { return false; }
-        return this.trait_checker().type_satisfies_opaque_bound(subject, iterator_id);
+        return this.trait_checker().type_satisfies_opaque_bound(subject, trait_id);
     }
 
     /// Decide whether operand type `ty` overloads `map`'s operator and, if so,

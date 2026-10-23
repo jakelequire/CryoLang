@@ -2176,6 +2176,7 @@ implement the arithmetic traits. The operator traits live in
 | `!` `~` (unary)        | `Not` `BitNot`                        | `!a` -> `a.not()`, `~a` -> `a.bitnot()`                      |
 | `==` `!=`              | `Eq`                                  | `a == b` -> `a.equals(&b)`, `a != b` -> `!a.equals(&b)`      |
 | `<` `>` `<=` `>=`      | `Ord` (`: Eq`)                        | `a < b` -> `a.compare(&b).is_lt()` (`is_gt`/`is_le`/`is_ge`) |
+| `<=>`                  | `Ord` (`: Eq`)                        | `a <=> b` -> `a.compare(&b)`                                 |
 | `a[i]`                 | `Index<Idx, Output>`                  | `a[i]` -> `*(a.index(i))`                                    |
 | `*a` (deref)           | `Deref<Target>`                       | `*a` -> `*(a.deref())`                                       |
 
@@ -2221,6 +2222,13 @@ implement trait Ord for struct Vec2 {
 const eq: boolean = a == b;   // a.equals(&b)      -> false
 const lt: boolean = a < b;    // a.compare(&b).is_lt() -> true
 ```
+
+**Three-way comparison.** `a <=> b` is `Ord::compare` and yields its
+`Ordering`, on every type, the integers and `char` included. The call names
+the language's trait by identity: a type with a `compare` of its own beside
+its `Ord` implementation compares through `Ord`'s, and a type that does not
+implement `Ord` is refused at the left operand (`E0306`), whatever methods
+named `compare` it has.
 
 **Compound assignment** routes through the same trait: `a += b` evaluates
 `a.add(&b)` and stores the result back into `a`. This holds for every binary
@@ -3355,7 +3363,7 @@ type struct AlignedData {
 | `![align(N)]`                                             | struct / union / enum / variable   | Minimum alignment in bytes; N must be a power of two. See [section 16.3](#163-memory-layout).                                                                                                                                                                                                                                                                                                                                   |
 | `![arch(<arch>, <dialect>)]`                              | asm block                          | Required directly above an `asm { ... }` block (see [section 6.12](#612-inline-assembly)). Names the target architecture - which *gates* the block, like `![config]` - and the assembly dialect (`intel` or `att`).                                                                                                                                                                                                             |
 | `![clobber(...)]`                                         | asm block                          | Lists registers, `flags`, or `memory` that an `asm` block overwrites but does not bind as operands.                                                                                                                                                                                                                                                                                                                             |
-| `![language("name")]`                                     | function / method / trait method / struct / enum / trait | Marks the declaration as the language item `name`: a declaration the compiler reasons about by identity, such as the trait an operator lowers to or a function generated code calls. The standard library marks each of its items so, and the compiler finds them by the directive and by nothing else; a call the compiler generates names its item and is never refused for visibility. `name` must be one of the compiler's items (`E0152`), and an item has one declaration: a second is refused at both (`E0152`).                                                                                          |
+| `![language("name")]`                                     | function / method / trait method / struct / enum / trait | Marks the declaration as the language item `name`: a declaration the compiler reasons about by identity, such as the trait an operator lowers to or a function generated code calls. Only the standard library marks items: a declaration outside it is refused (`E0151`) and claims nothing. It marks each of its items so, and the compiler finds them by the directive and by nothing else; a call the compiler generates names its item and is never refused for visibility. `name` must be one of the compiler's items (`E0152`), and an item has one declaration: a second is refused at both (`E0152`).                                                                                          |
 
 A method declared in a trait body takes `![language]` and no other directive (`E0151`), and a directive written above an associated type is refused (`E0151`).
 
