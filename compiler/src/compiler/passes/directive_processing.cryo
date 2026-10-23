@@ -60,8 +60,10 @@ import utils::log::{ Log, LogArea, LogLevel };
 import std::fmt;
 import compiler::ast::declaration::{
     DeclarationNode, DeclKind, EnumDecl, ExternBlock, FunctionDecl,
-    ImplBlock, MethodDecl, StructDecl, UnionDecl, VarDecl
+    ImplBlock, MethodDecl, StructDecl, TraitDecl, UnionDecl, VarDecl
 };
+import compiler::resolver::lang_item;
+import compiler::resolver::lang_item::{ LangItem };
 import compiler::ast::node::{ ProgramNode };
 import compiler::ast::pattern::{ DirectiveArg, DirectiveArgKind, DirectiveNode };
 import compiler::diag::diagnostic::{ Diagnostic };
@@ -136,6 +138,7 @@ type enum DirectiveTarget {
     Module;       // top-level (no owning decl)
     Function;
     Method;       // a method inside a struct body or impl block
+    TraitMethod;  // a method declared in a trait body
     Field;        // a field of a struct or union
     Struct;
     Union;
@@ -181,6 +184,7 @@ implement enum DirectiveTarget {
             DirectiveTarget::Module    => { "module" }
             DirectiveTarget::Function  => { "function" }
             DirectiveTarget::Method    => { "method" }
+            DirectiveTarget::TraitMethod => { "trait method" }
             DirectiveTarget::Field     => { "field" }
             DirectiveTarget::Struct    => { "struct" }
             DirectiveTarget::Union     => { "union" }
@@ -253,7 +257,10 @@ type struct DirectiveProcessingPasses {
             | "windows" | "linux" | "macos" | "unix"
             // Top-level negation form: `![not(<atom>)]`.  Mirrors the
             // nested `not(...)` form recognised inside `config(...)`.
-            | "not" => { true }
+            | "not"
+            // `![language("name")]`: the declaration is the language item
+            // `name`, which the compiler reasons about by identity.
+            | "language" => { true }
             _       => { false }
         };
     }
@@ -821,6 +828,34 @@ type struct DirectiveProcessingPasses {
                 }
             }
 
+            // `![language("name")]`: one string naming a language item, on a
+            // declaration an item can be - a function, a method (a trait's
+            // included), or a type.
+            "language" => {
+                if (argc != 1) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 1, argc);
+                    return;
+                }
+                if (dir.args[0].kind != DirectiveArgKind::StringLit) {
+                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, dir.directive_kind, 0, "a string naming a language item");
+                    return;
+                }
+                if (LangItem::named(dir.args[0].str_value).is_none()) {
+                    mut ldiag: Diagnostic = Diagnostic::error(ErrorCode::E0152_DIRECTIVE_BAD_ARG,
+                        fmt::format("directive `![language]`: there is no language item named `%s`",
+                            dir.args[0].str_value));
+                    ldiag = ldiag.at(dir.span);
+                    ctx.emit_diagnostic(ldiag);
+                }
+                if (target != DirectiveTarget::Function && target != DirectiveTarget::Method
+                        && target != DirectiveTarget::TraitMethod && target != DirectiveTarget::Extern
+                        && target != DirectiveTarget::Struct && target != DirectiveTarget::Enum
+                        && target != DirectiveTarget::Trait) {
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind,
+                        "a function, a method, a struct, an enum or a trait", target);
+                }
+            }
+
             // Unrecognised directive name: warn so that typos like `![packed]`
             // (a directive documented in `docs/cryo.md` section 17.1 but never implemented)
             // surface instead of silently no-opping.  Warning, not error, so user
@@ -843,7 +878,7 @@ type struct DirectiveProcessingPasses {
                     "repr", "link", "symbol", "no_mangle", "weak", "naked", "section",
                     "target", "allow", "warn", "deny",
                     "derive", "sink", "implicit", "functions_only",
-                    "windows", "linux", "macos", "unix", "not"
+                    "windows", "linux", "macos", "unix", "not", "language"
                 ];
                 const best: string = find_best_candidate(name, cands);
                 if (best != "") {
@@ -1513,6 +1548,39 @@ type struct DirectiveProcessingPasses {
                         mut mtag: string = "custom";
                         if (DirectiveProcessingPasses::is_known_builtin(md.directive_kind)) { mtag = "builtin"; }
                         Log::trace(LogArea::Sema, f"{mtag} directive '{md.directive_kind.as_string()}' on method ({md.args.length} args) at {md.span.file}:{md.span.start_line}:{md.span.start_col}");
+                    }
+                }
+            }
+
+            // A trait's methods take `![language]` alone: no other directive's
+            // effect is applied to a trait's method, so one is refused rather
+            // than recorded with no effect.
+            const trait_decl: TraitDecl* = DeclarationNode::trait_of(decl);
+            if (trait_decl != null) {
+                for (mut ti: i64 = 0; ti < trait_decl.methods.length; ti++) {
+                    const t_decl: DeclarationNode* = trait_decl.methods[ti];
+                    if (t_decl == null) { continue; }
+                    for (mut tj: i64 = 0; tj < t_decl.attached_directives.length; tj++) {
+                        const tdir: DirectiveNode* = t_decl.attached_directives[tj];
+                        if (tdir == null) { continue; }
+                        if (!tdir.directive_kind.as_string().eq("language")) {
+                            mut tdiag: Diagnostic = Diagnostic::error(ErrorCode::E0151_DIRECTIVE_MISPLACED,
+                                fmt::format("directive `![%s]` does not apply to a trait method; a trait's methods take only `![language]`",
+                                    tdir.directive_kind.as_string()));
+                            tdiag = tdiag.at(tdir.span);
+                            ctx.emit_diagnostic(tdiag);
+                            continue;
+                        }
+                        DirectiveProcessingPasses::validate_builtin(ctx, tdir, DirectiveTarget::TraitMethod);
+                        const t_rec: DirectiveRecord = DirectiveRecord {
+                            kind: tdir.directive_kind,
+                            node: tdir,
+                            decl: t_decl,
+                            qualified_name: SymbolStr::empty(),
+                            span: tdir.span,
+                        };
+                        registry.add(t_rec);
+                        count += 1;
                     }
                 }
             }

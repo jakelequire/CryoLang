@@ -1713,10 +1713,28 @@ implement struct Parser {
             this.collect_doc_comments();
             if (this.check(TokenType::RBrace)) { break; }
 
+            // `![...]` directives attach to the method that follows them, as
+            // in a struct body.  An associated type is not a declaration a
+            // directive can be checked against, so one written above it is
+            // refused rather than dropped.
+            mut pending_dirs: [DirectiveNode*] = [];
+            while (this.check(TokenType::BangBracket)) {
+                const d: DirectiveNode* = this.parse_directive();
+                if (d != null) { pending_dirs.push(d); }
+                this.collect_doc_comments();
+                if (this.check(TokenType::RBrace) || this.is_at_end()) { break; }
+            }
+            if (this.check(TokenType::RBrace) || this.is_at_end()) { break; }
+
             // Associated-type member: `type Item;` or `type Item: Bound;`.
             // Intercepted before the method path because `type` is a keyword
             // and would otherwise be taken as a (keyword-named) method head.
             if (this.check(TokenType::KwType)) {
+                if (pending_dirs.length > 0) {
+                    this.report_invalid_at(ErrorCode::E0151_DIRECTIVE_MISPLACED,
+                        "a directive in a trait body applies to a method; an associated type takes none",
+                        pending_dirs[0].span);
+                }
                 const assoc: AssocTypeDeclNode* = this.parse_assoc_type_decl();
                 if (assoc != null) { tr.assoc_types.push(assoc); }
                 continue;
@@ -1749,6 +1767,9 @@ implement struct Parser {
                     if (is_static) { func.set_static(true); }
                     if (trait_mods.is_async) { func.set_async(true); }
                     this.give_receiver(func_decl, is_static);
+                    for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
+                        func_decl.add_directive(pending_dirs[pi]);
+                    }
                     tr.methods.push(func_decl);
                 }
             } else {

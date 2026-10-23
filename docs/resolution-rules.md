@@ -249,6 +249,14 @@ yet is recorded with the change that builds it, not here.
      an internal module is judged at the module's reach, so its public
      members may name its own types.  (Jake)
 
+570. **A trait's method takes `![language]` and no other directive.**  A
+     directive above a method in a trait body attaches to that method; any
+     but `![language]` is refused (E0151), since nothing applies its effect
+     to a trait's method, and one above an associated type is refused
+     (E0151) rather than dropped.  `![language("name")]` names one of the
+     compiler's items (E0152 otherwise) on a function, a method, a trait
+     method, a struct, an enum or a trait (E0151 otherwise).  (Delegated)
+
 ### 2026-10-21
 
 501. **The class-removal plan is deleted now,** its slices all built and its
