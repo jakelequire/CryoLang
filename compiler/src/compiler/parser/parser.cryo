@@ -244,6 +244,21 @@ implement struct Parser {
                 continue;
             }
 
+            // A sub-module line, which the grouped form makes several
+            // declarations of; each carries the directives above it.
+            if (this.at_module_declaration()) {
+                const doc: string = this.take_documentation();
+                const modules: [DeclarationNode*] = this.parse_module_declarations();
+                for (mut m: i64 = 0; m < modules.length; m++) {
+                    if (doc != "") { modules[m].set_documentation(doc); }
+                    for (mut i: i64 = 0; i < pending.length; i++) {
+                        modules[m].add_directive(pending[i]);
+                    }
+                    program.add_statement(Node::Decl(modules[m]));
+                }
+                continue;
+            }
+
             const node: Node = this.parse_top_level();
             if (!node.is_null()) {
                 const decl: DeclarationNode* = node.as_decl();
@@ -273,12 +288,10 @@ implement struct Parser {
         program.uses_fstring = this.used_fstring;
 
         // Set the file's namespace from its `namespace X::Y::Z;` line.
-        // The parser converts that line into a module declaration; the
-        // first such node in the statement list is, by convention, the
-        // file's own namespace (subsequent `public module ...;` lines
-        // are sub-module re-exports).  Skipping over directive nodes
-        // keeps `![config(...)]`-prefixed files producing the right
-        // `namespace_name`.
+        // The parser converts that line into a module declaration, which
+        // is the file's own namespace when it is the first statement.
+        // Skipping over directive nodes keeps `![config(...)]`-prefixed
+        // files producing the right `namespace_name`.
         for (mut i: i64 = 0; i < program.statements.length; i++) {
             const s: Node = program.statements[i];
             if (s.is_null()) { continue; }
@@ -287,7 +300,7 @@ implement struct Parser {
                 _                  => { }
             }
             const m: ModuleDecl* = DeclarationNode::module_of(s.as_decl());
-            if (m != null) {
+            if (m != null && m.is_namespace) {
                 program.set_namespace_name(m.path);
             }
             break;
@@ -348,15 +361,6 @@ implement struct Parser {
                 ns.set_documentation(doc);
             }
             return Node::Decl(ns);
-        }
-
-        // Module declaration (public module Foo;)
-        if (tok.kind == TokenType::KwPublic && this.peek_at(1).kind == TokenType::KwModule) {
-            const md: DeclarationNode* = this.parse_module_declaration();
-            if (md != null && doc != "") {
-                md.set_documentation(doc);
-            }
-            return Node::Decl(md);
         }
 
         // A written visibility: `public`, `internal` or `private`.
@@ -1999,23 +2003,55 @@ implement struct Parser {
 
         // Create a module declaration node representing the namespace
         const span: SourceSpan = this.span_from(start);
-        const m: ModuleDecl* = ModuleDecl::new(qn.display(this.ctx.get_intern_table()), true);
+        const m: ModuleDecl* = ModuleDecl::namespace(qn.display(this.ctx.get_intern_table()));
         for (mut i: i64 = 0; i < seg_names.length; i++) {
             m.add_path_segment(seg_names[i], seg_spans[i]);
         }
         return DeclarationNode::of(DeclKind::Module(m), span);
     }
 
-    /// Parse a module declaration: public module Name;
-    /// Accepts keywords as path segments (e.g., public module collections::string;).
-    parse_module_declaration() -> DeclarationNode* {
+    /// Whether the current token starts a sub-module line: `module`,
+    /// `internal module`, or the `public module` the tree is written in
+    /// until its codemod.
+    at_module_declaration() -> boolean {
+        const kind: TokenType = this.current().kind;
+        if (kind == TokenType::KwModule) { return true; }
+        return (kind == TokenType::KwInternal || kind == TokenType::KwPublic)
+            && this.peek_at(1).kind == TokenType::KwModule;
+    }
+
+    /// Parse a sub-module line: `module a::b;`, `internal module c;`, or a
+    /// group of entries each ending in `;`, `module { a; b; }` and
+    /// `internal module { c; }`, one declaration per entry.  Accepts
+    /// keywords as path segments (`module collections::string;`).
+    parse_module_declarations() -> [DeclarationNode*] {
         const start: Token = this.current();
-        mut is_public: boolean = false;
-        if (this.check(TokenType::KwPublic)) {
-            is_public = true;
+        mut visibility: Visibility = Visibility::Public;
+        if (this.check(TokenType::KwInternal)) {
+            visibility = Visibility::Internal;
+            this.advance();
+        } else if (this.check(TokenType::KwPublic)) {
             this.advance();
         }
         this.consume(TokenType::KwModule, "'module'");
+        mut modules: [DeclarationNode*] = [];
+        if (!this.check(TokenType::LBrace)) {
+            modules.push(this.parse_module_entry(start, visibility));
+            return modules;
+        }
+        this.advance(); // consume '{'
+        while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
+            const at: i64 = this.pos;
+            modules.push(this.parse_module_entry(this.current(), visibility));
+            if (this.pos == at) { break; }
+        }
+        this.consume(TokenType::RBrace, "'}'");
+        return modules;
+    }
+
+    /// One sub-module's path and its `;`, declared at `visibility`; its span
+    /// runs from `start`.
+    parse_module_entry(start: Token, visibility: Visibility) -> DeclarationNode* {
         mut name_tok: Token = this.current();
         if (name_tok.kind == TokenType::Identifier || name_tok.kind.is_keyword()) {
             this.advance();
@@ -2045,7 +2081,7 @@ implement struct Parser {
 
         this.consume(TokenType::Semicolon, "';'");
         const span: SourceSpan = this.span_from(start);
-        const m: ModuleDecl* = ModuleDecl::new(qn.display(this.ctx.get_intern_table()), is_public);
+        const m: ModuleDecl* = ModuleDecl::submodule(qn.display(this.ctx.get_intern_table()), visibility);
         for (mut i: i64 = 0; i < seg_names.length; i++) {
             m.add_path_segment(seg_names[i], seg_spans[i]);
         }

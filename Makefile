@@ -676,12 +676,13 @@ endif
 verify-selftest:
 	@$(PYTHON) scripts/verify.py --selftest
 	@$(PYTHON) scripts/verify-pin.py --selftest
+	@$(PYTHON) scripts/roster-check.py --selftest
 
 # ---- the pre-commit sweep ----------------------------------------------
 # Every gate here is source-derived, so this target builds nothing.  A short
 # gate everybody runs is worth more than a twenty-minute one nobody does.
 check-fast: verify-selftest verify-pin
-	@echo "check-fast: OK (verify's declared-program self-test, pin integrity)"
+	@echo "check-fast: OK (verify's declared-program self-test, roster merge self-test, pin integrity)"
 
 # ---- language-server compile gate --------------------------------------
 # The LSP links the compiler as a LIBRARY (tools/CryoLSP/cryoconfig ->

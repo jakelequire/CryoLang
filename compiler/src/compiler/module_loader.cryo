@@ -964,7 +964,7 @@ public:
             // reached through the path's own edge, recorded above.
         }
 
-        // Discover submodules (public module declarations) WITHOUT adding
+        // Discover submodules (`module` declarations) WITHOUT adding
         // dependency edges.  Aggregator _module.cryo files re-export their
         // children, but this isn't a real data dependency; the parent doesn't
         // need its children compiled first.  Treating these as dependencies
@@ -988,14 +988,17 @@ public:
                 } else {
                     SourceSpan::none()
                 };
+                const sub_internal: boolean = scan.submodule_internal[s];
                 const sub_idx: i64 = graph.find_module_by_path(sub_resolved);
                 if (sub_idx >= 0) {
-                    info.add_submodule(RecordedEdge::to(graph.modules[sub_idx].path()), sub_at);
+                    info.add_submodule(RecordedEdge::to(graph.modules[sub_idx].path()), sub_at, sub_internal);
                 } else {
                     // Mid-load (cycle): the graph entry is not written yet, but
                     // the namespace is known.  Same case as the import edge.
                     match (this.scanned_ns.get(&sub_resolved.to_ascii_lower())) {
-                        Option::Some(ns) => { info.add_submodule(RecordedEdge::written_as(intern.intern(ns)), sub_at); }
+                        Option::Some(ns) => {
+                            info.add_submodule(RecordedEdge::written_as(intern.intern(ns)), sub_at, sub_internal);
+                        }
                         Option::None     => { }
                     }
                 }
@@ -1155,6 +1158,7 @@ public:
         mut export_items: [string] = [];
         mut submodules: [string] = [];
         mut submodule_spans: [SourceSpan] = [];
+        mut submodule_internal: [boolean] = [];
         const len: i64 = tokens.length;
         mut i: i64 = 0;
 
@@ -1314,32 +1318,45 @@ public:
                 continue;
             }
 
-            // public module Math::Vec2;  -- sub-module declaration in _module.cryo files.
-            // The module path is used as-is for dependency resolution (same as an
-            // import).  Convention: always use the fully-qualified path, e.g.
-            //   namespace Math;
-            //   public module Math::Vec2;    // NOT just "Vec2"
-            if (tok.kind == TokenType::KwPublic) {
-                if ((i + 1) < len) {
-                    if (tokens[i + 1].kind == TokenType::KwModule) {
-                        i += 2;  // consume 'public' 'module'
-                        const sub_line: int = if (i < len) { tokens[i].line } else { 0 };
-                        const sub_col:  int = if (i < len) { tokens[i].column } else { 0 };
-                        const mod_path: string = ModuleLoader::collect_qualified_name(tokens, &i, len);
-                        if (mod_path.length() > 0) {
-                            submodules.push(mod_path);
-                            submodule_spans.push(SourceSpan::new("", sub_line as u32, sub_col as u32,
-                                                                 sub_line as u32, sub_col as u32));
-                        }
-                        // Skip semicolon if present
-                        if (i < len) {
-                            if (tokens[i].kind == TokenType::Semicolon) {
-                                i += 1;
-                            }
-                        }
-                        continue;
+            // module a::b;  internal module c;  module { a; b; }  -- sub-module
+            // declarations, mostly in _module.cryo files.  Each path is
+            // resolved as an import's is.  `public module` is the form the
+            // tree is written in until its codemod.
+            const lead: i64 = if ((tok.kind == TokenType::KwInternal || tok.kind == TokenType::KwPublic)
+                                  && (i + 1) < len && tokens[i + 1].kind == TokenType::KwModule) {
+                1
+            } else {
+                0
+            };
+            if (tokens[i + lead].kind == TokenType::KwModule) {
+                const is_internal: boolean = tok.kind == TokenType::KwInternal;
+                i += lead + 1;
+                const grouped: boolean = i < len && tokens[i].kind == TokenType::LBrace;
+                if (grouped) { i += 1; }
+                mut more: boolean = true;
+                while (more && i < len) {
+                    if (grouped && tokens[i].kind == TokenType::RBrace) {
+                        i += 1;
+                        break;
                     }
+                    const sub_line: int = tokens[i].line;
+                    const sub_col:  int = tokens[i].column;
+                    const mod_path: string = ModuleLoader::collect_qualified_name(tokens, &i, len);
+                    if (mod_path.length() > 0) {
+                        submodules.push(mod_path);
+                        submodule_spans.push(SourceSpan::new("", sub_line as u32, sub_col as u32,
+                                                             sub_line as u32, sub_col as u32));
+                        submodule_internal.push(is_internal);
+                    } else {
+                        // Not a name (stray token): advance so the loop cannot spin.
+                        i += 1;
+                    }
+                    if (i < len && tokens[i].kind == TokenType::Semicolon) {
+                        i += 1;
+                    }
+                    more = grouped;
                 }
+                continue;
             }
 
             // Stop scanning at the first non-import/namespace/module top-level
@@ -1439,6 +1456,7 @@ public:
             export_item_count: export_item_count_val,
             submodule_paths:   ModuleLoader::spelled(intern, &submodules),
             submodule_spans:   submodule_spans,
+            submodule_internal: submodule_internal,
             submodule_count:   submodule_count_val,
             uses_fstring:      uses_fstring_val,
         };
@@ -1697,10 +1715,13 @@ type struct ModuleScanResult {
     export_count:    i64;
     export_items:    [SymbolStr];
     export_item_count: i64;
-    submodule_paths: [SymbolStr]; // `public module` declarations (discover only, no dep edge)
-    /// Where each `public module` line's path starts, parallel to
+    submodule_paths: [SymbolStr]; // `module` declarations (discover only, no dep edge)
+    /// Where each `module` line's path starts, parallel to
     /// `submodule_paths` (file unset).
     submodule_spans: [SourceSpan];
+    /// Whether each was declared `internal module`, parallel to
+    /// `submodule_paths`.
+    submodule_internal: [boolean];
     submodule_count: i64;
     uses_fstring:    boolean;     // file contains at least one f-string (`f"..."`)
 }

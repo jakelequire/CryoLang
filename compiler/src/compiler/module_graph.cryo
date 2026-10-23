@@ -26,7 +26,7 @@ import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::res;
-import compiler::resolver::res::{ DefId, DefTable, DefKind };
+import compiler::resolver::res::{ DeclVisibility, DefId, DefTable, DefKind };
 import compiler::resolver::lang_item::{ LangModule };
 
 /// Where a module's source originates, driving which per-package subtree
@@ -147,12 +147,13 @@ public:
     }
 }
 
-/// A `public module` line: where its path starts in the declaring file, and
-/// the module it names.
+/// A `module` line: where its path starts in the declaring file, the module
+/// it names, and whether it was declared `internal module`.
 type struct SubmoduleSite {
-    line:   u32;
-    col:    u32;
-    module: ModulePath;
+    line:        u32;
+    col:         u32;
+    module:      ModulePath;
+    is_internal: boolean;
 }
 
 /// What one file can see under a module spelling.
@@ -219,23 +220,24 @@ public:
     /// answer "does this module import that namespace?".
     imported_namespaces: [ModulePath];
 
-    /// Modules this module declares with `public module X;`.
+    /// Modules this module declares with `module X;`.
     ///
-    /// Recorded so a `public module` set can be DERIVED rather than
+    /// Recorded so a `module` set can be DERIVED rather than
     /// transcribed: `instance.cryo` reads `std::prelude`'s set from here and
     /// hands it to `DeclarationIndex::register_prelude_namespaces`, so
     /// `stdlib/prelude.cryo` is the single source of truth for what the
     /// prelude contains.
     ///
     /// Deliberately NEITHER a dependency edge NOR a visibility edge, so
-    /// recording it changes no resolution input on its own.  Whether
-    /// `public module` should also grant visibility (i.e. become a real
+    /// recording it changes no resolution input on its own.  Whether a
+    /// `module` line should also grant visibility (i.e. become a real
     /// re-export) is the `public import` design question, and it should be
     /// decided and measured on its own terms - not acquired as a side effect
     /// of removing a hardcoded list.
     submodules:     [ModulePath];
-    /// Each `public module` line whose path names a module the graph holds:
-    /// where the path starts in this module's file, and the module.
+    /// Each `module` line whose path names a module the graph holds:
+    /// where the path starts in this module's file, the module, and whether
+    /// it is internal.
     submodule_sites: [SubmoduleSite];
 
     /// Modules this module RE-EXPORTS with `export X;`.  An importer of this
@@ -260,6 +262,9 @@ public:
     written_submodules:   [RecordedEdge];
     /// Where each of `written_submodules` is written, parallel to it.
     written_submodule_at: [SourceSpan];
+    /// Whether each of `written_submodules` is `internal module`, parallel
+    /// to it.
+    written_submodule_internal: [boolean];
     written_reexports:    [RecordedEdge];
     /// Every module this module can see through its imports: its
     /// dependencies and brace items, closed over re-exports.  Set once
@@ -297,6 +302,7 @@ public:
             written_imported:     [],
             written_submodules:   [],
             written_submodule_at: [],
+            written_submodule_internal: [],
             written_reexports:    [],
             visible:              [],
             unresolved_dependencies: 0,
@@ -371,9 +377,10 @@ public:
     /// Record a `public module X;` target by its resolved namespace, and
     /// where its path is written (`at`'s start; its file is not read).
     /// See `submodules` for why this grants nothing on its own.
-    add_submodule(mut &this, ns: RecordedEdge, at: SourceSpan) -> void {
+    add_submodule(mut &this, ns: RecordedEdge, at: SourceSpan, is_internal: boolean) -> void {
         this.written_submodules.push(ns);
         this.written_submodule_at.push(at);
+        this.written_submodule_internal.push(is_internal);
     }
 
 
@@ -765,15 +772,50 @@ public:
                 const m: ModulePath = this.edge_module(&this.modules[i].written_submodules[k]);
                 if (!m.is_valid() || k >= this.modules[i].written_submodule_at.length) { continue; }
                 const at: SourceSpan = this.modules[i].written_submodule_at[k];
-                sites.push(SubmoduleSite { line: at.start_line, col: at.start_col, module: m });
+                sites.push(SubmoduleSite {
+                    line:        at.start_line,
+                    col:         at.start_col,
+                    module:      m,
+                    is_internal: this.modules[i].written_submodule_internal[k],
+                });
             }
             this.modules[i].submodule_sites = sites;
             this.modules[i].written_submodule_at = [];
+            this.modules[i].written_submodule_internal = [];
             this.modules[i].reexports = this.modules_of(&this.modules[i].written_reexports, i, true, &ignored);
             this.modules[i].written_dependencies = [];
             this.modules[i].written_imported = [];
             this.modules[i].written_submodules = [];
             this.modules[i].written_reexports = [];
+        }
+        this.record_module_reach();
+    }
+
+    /// Record each module's reach on its definition: internal to its package
+    /// when a `internal module` line declares it, or when it is declared
+    /// under a module that is, and public otherwise.  Everything declared in
+    /// a module reaches no further than the module does
+    /// (`CompilationContext::declared_visibility`).
+    record_module_reach(mut &this) -> void {
+        mut is_internal: [boolean] = [];
+        for (mut i: i64 = 0; i < this.modules.length; i++) { is_internal.push(false); }
+        mut changed: boolean = true;
+        while (changed) {
+            changed = false;
+            for (mut i: i64 = 0; i < this.modules.length; i++) {
+                const sites: &[SubmoduleSite] = &this.modules[i].submodule_sites;
+                for (mut k: i64 = 0; k < sites.length; k++) {
+                    if (!sites[k].is_internal && !is_internal[i]) { continue; }
+                    const child: i64 = this.find_module_index(sites[k].module);
+                    if (child < 0 || is_internal[child]) { continue; }
+                    is_internal[child] = true;
+                    changed = true;
+                }
+            }
+        }
+        for (mut i: i64 = 0; i < this.modules.length; i++) {
+            this.defs.record_visibility(this.modules[i].def,
+                if (is_internal[i]) { DeclVisibility::Internal } else { DeclVisibility::Public });
         }
     }
 

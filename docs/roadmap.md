@@ -362,12 +362,13 @@ itself writes `public`, `private` or `internal` on every item, so each
 exposure is a decision.  Built: `private` holds on every member and item
 (rulings 562, 563); `internal` reaches the declaring package (567); and a
 signature may not name a type seen by fewer modules than it is, a trait's
-implementation included (564, 565, 567).  The rest, in order:
+implementation included (564, 565, 567); and `module x;`, `internal module
+x;` and the grouped forms reach as far as they say (568).  The rest, in
+order:
 
 1. **The compiler's half.**
-   - Modules public by default, `public module` dropped; `internal
-     module x;` importable only inside its package; the grouped forms
-     `module { a; b; }` and `internal module { c; }`.
+   - The tree rewritten from `public module` to the new forms, and the
+     old form then refused.
    - `![language("format_new")]` on the library items generated code
      calls (the f-string builders, `Option::take`, `Poll::into_ready`,
      ...): the compiler's table is built from the attributes, the parser

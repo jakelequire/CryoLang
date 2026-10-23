@@ -64,8 +64,13 @@ filesystem enumeration order differences across OSes cannot break it.
 
     --merge    add newly discovered tests to the golden without dropping
                entries this host cannot see.  This is the right mode when
-               ADDING tests.  Prints the golden-only entries so a genuine
-               deletion is still visible rather than silently preserved.
+               ADDING tests.  A pinned line whose test was discovered with a
+               different fingerprint (a project's test.json, a negative
+               file's annotations) is replaced.  Prints the golden-only
+               entries so a genuine deletion is still visible rather than
+               silently preserved.
+
+    --selftest drive the merge over a synthetic golden; runs no compiler.
 
 Because the golden is a union, the CHECK waives golden entries whose test is
 gated to a different OS: it reads the `![target(<os>)]` directive attached to
@@ -346,7 +351,81 @@ def is_unit(entry):
     return entry.endswith(": test") or ": test" in entry
 
 
+def entry_identity(entry):
+    """What a pinned line is the line FOR, without what it says about it.
+
+    `project foo: outcome=run ... asserts=19` -> `project foo`.  A project's or
+    negative file's fingerprint changes with its test.json or annotations while
+    the line still describes the same test; a unit entry is its own identity.
+    """
+    return entry.split(": ", 1)[0]
+
+
+def merge_entries(entries, golden, gated):
+    """The golden after adding what this host discovered.
+
+    A golden line whose identity was discovered with a different fingerprint
+    is REPLACED by the discovered one: it is the same test, changed, and
+    keeping the old line beside the new one pins a state that no longer
+    exists.  Every other golden-only line is kept, split into the ones gated
+    to another OS (absent by design) and the ones not found at all.
+
+    Returns (merged, added, replaced pairs, other-platform, absent).
+    """
+    found = set(entries)
+    discovered = {entry_identity(ln): ln for ln in entries}
+    replaced, other_platform, absent = [], [], []
+    for ln in golden:
+        if ln in found:
+            continue
+        new = discovered.get(entry_identity(ln))
+        if new is not None:
+            replaced.append((ln, new))
+        elif gated_elsewhere(ln, gated):
+            other_platform.append(ln)
+        else:
+            absent.append(ln)
+    renewed = set(new for _old, new in replaced)
+    added = sorted(found - set(golden) - renewed)
+    merged = sorted(found | set(other_platform) | set(absent))
+    return merged, added, sorted(replaced), sorted(other_platform), sorted(absent)
+
+
+def selftest():
+    """Drive merge_entries over a golden whose lines take every path."""
+    project_old = "project shelf: outcome=run fails=0 asserts=19 requires=- ignore=0"
+    project_new = "project shelf: outcome=run fails=0 asserts=20 requires=- ignore=0"
+    negative_old = "negative bad.cryo: E0100 annotations=1"
+    negative_new = "negative bad.cryo: E0100 annotations=2"
+    windows_only = "CryoTests::Process::windows_case: test"
+    deleted = "CryoTests::Gone::vanished: test"
+    kept = "CryoTests::Here::stays: test"
+    fresh = "CryoTests::Here::arrives: test"
+    other = "linux" if HOST_TARGET == "windows" else "windows"
+    golden = sorted([project_old, negative_old, windows_only, deleted, kept])
+    entries = sorted([project_new, negative_new, kept, fresh])
+    merged, added, replaced, other_platform, absent = merge_entries(
+        entries, golden, {"windows_case": other})
+    cases = [
+        ("a changed project line is replaced", project_old not in merged and project_new in merged),
+        ("a changed negative line is replaced", negative_old not in merged and negative_new in merged),
+        ("the replacements are reported as such",
+         replaced == sorted([(project_old, project_new), (negative_old, negative_new)])),
+        ("a replacement is not counted as added", added == [fresh]),
+        ("a test gated to another OS is kept", windows_only in merged and other_platform == [windows_only]),
+        ("an ungated absent test is kept and named", deleted in merged and absent == [deleted]),
+        ("an unchanged line stays once", merged.count(kept) == 1),
+    ]
+    bad = [name for name, ok in cases if not ok]
+    for name in bad:
+        sys.stderr.write("roster-check selftest: FAILED  %s\n" % name)
+    print("roster-check selftest: %d of %d cases as expected" % (len(cases) - len(bad), len(cases)))
+    return 1 if bad else 0
+
+
 def main(argv):
+    if argv == ["--selftest"]:
+        return selftest()
     update = "--update" in argv
     merge = "--merge" in argv
     argv = [a for a in argv if a not in ("--update", "--merge")]
@@ -373,21 +452,28 @@ def main(argv):
     entries = sorted(set(roster(argv[0])) | set(proj) | set(neg))
 
     if merge:
-        want = golden_entries()
-        only_golden = sorted(set(want) - set(entries))
-        added = sorted(set(entries) - set(want))
-        merged = sorted(set(entries) | set(want))
+        merged, added, replaced, other_platform, absent = merge_entries(
+            entries, golden_entries(), gated_tests())
         with open(GOLDEN, "w", newline="\n") as f:
             f.write("\n".join(merged) + "\n")
-        print("roster-check: merged -> %d entries (%d added)" % (len(merged), len(added)))
+        print("roster-check: merged -> %d entries (%d added, %d replaced)"
+              % (len(merged), len(added), len(replaced)))
         for ln in added:
             print("  + %s" % ln)
+        for old, new in replaced:
+            print("  - %s\n  + %s" % (old, new))
         # Kept, not dropped: this host cannot run them, which is not the same
-        # as their having been deleted.  Inspect them -- on Linux this must be
-        # exactly the Windows-only entries.
-        print("roster-check: %d golden-only entry(ies) KEPT (other platform):" % len(only_golden))
-        for ln in only_golden:
+        # as their having been deleted.
+        print("roster-check: %d golden-only entry(ies) KEPT (other platform):" % len(other_platform))
+        for ln in other_platform:
             print("  = %s" % ln)
+        # Also kept, so the check goes on failing on them: --merge only adds,
+        # and a deletion is --update's to make.
+        if absent:
+            print("roster-check: %d golden-only entry(ies) KEPT but NOT FOUND here "
+                  "(deleted? use --update):" % len(absent))
+            for ln in absent:
+                print("  ? %s" % ln)
         return 0
 
     if update:

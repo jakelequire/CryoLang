@@ -41,7 +41,9 @@ AsmConstraint      ::= StringLit | "m" | "i" | "r"
 
 (*  Modules, Imports, Directives =============================== *)
 
-ModuleDecl         ::= "public"? "module" ModulePath ";"
+ModuleDecl         ::= ("internal" | "public")? "module" ModuleEntries
+ModuleEntries      ::= ModulePath ";"
+                     | "{" (ModulePath ";")* "}"
 Import             ::= "import" ImportForm ";"
 ImportForm         ::= ModulePath "::" "*"
                      | ModulePath "::" "{" ImportEntry ("," ImportEntry)* "}"

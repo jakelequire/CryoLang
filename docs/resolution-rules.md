@@ -51,7 +51,7 @@ type-namespace twin; one door per member kind, each taking an owner identity
 plus a leaf name; module-by-path (private to the module graph, which offers
 its callers methods each named for the one kind of text it turns into a
 module); the loader's path door, which turns a module path written in an
-`import`, `export` or `public module` into the file it names, and matches a
+`import`, `export` or `module` line into the file it names, and matches a
 body path's head against the file's imports and its continuation against
 the namespaces files declare, before any module exists - discovery's
 written paths are spellings (`SymbolStr`), and what the door answers is a
@@ -105,7 +105,7 @@ or reads the store by identity.  Locked so far:
 | `module-by-path` | `ModuleGraph::module_named` | `compiler/src/compiler/module_graph.cryo` | written module path to its module |
 | `module-by-path` | `ModuleGraph::module_path_over` | `compiler/src/compiler/module_graph.cryo` | an import's written path to itself as a path to list modules within, when the graph holds a module at it or under it, whether or not it names a module (`import std::`) |
 | `module-by-path` | `ModuleGraph::modules_in_view` | `compiler/src/compiler/module_graph.cryo` | a path written in a body to the modules it names, among those the writing file can see: its own, the ones it imports, the prelude, or a package root written whole |
-| `loader-path` | `ModuleLoader::resolve_import_path` | `compiler/src/compiler/module_loader.cryo` | a module path written in an `import`, an `export` or a `public module` to the file of the module it names: a vendored library, a file declaring the namespace, or a file at the path on disk |
+| `loader-path` | `ModuleLoader::resolve_import_path` | `compiler/src/compiler/module_loader.cryo` | a module path written in an `import`, an `export` or a `module` line to the file of the module it names: a vendored library, a file declaring the namespace, or a file at the path on disk |
 | `loader-path` | `ModuleLoader::binding_of` | `compiler/src/compiler/module_loader.cryo` | a body path's head to the import of the file that binds it |
 | `loader-path` | `ModuleLoader::sub_module_file` | `compiler/src/compiler/module_loader.cryo` | a path's continuation past an import binding to the file of the sub-module it names |
 | `primitive` | `ResBase::is_primitive_spelling` | `compiler/src/compiler/resolver/res.cryo` | the fixed primitive table |
@@ -232,6 +232,16 @@ yet is recorded with the change that builds it, not here.
      type seen by fewer modules than the signature is, so a public one may
      not name an internal type and an internal one may not name a private
      type.  (Jake; the codes Delegated)
+
+568. **Modules are public; `internal module` reaches its package.**  A
+     sub-module is declared `module x;`, or several at once as
+     `module { a; b; }`; `internal module x;` and `internal module { a; b;
+     }` declare ones that reach only the declaring package, and a module
+     declared under an internal one reaches no further.  An import or an
+     export naming an internal module from another package is refused
+     (E0353), and what such a module declares reaches no further than the
+     module, however it is marked, so every door that judges an item's
+     reach judges it.  (Jake; the code Delegated)
 
 ### 2026-10-21
 

@@ -2736,23 +2736,27 @@ The namespace serves as the file's identity within the project. The compiler use
 
 ### 13.2 Module Aggregators
 
-A directory of related files uses a `_module.cryo` aggregator to declare which submodules exist and which are public.
+A directory of related files uses a `_module.cryo` aggregator to declare which submodules exist and how far each reaches.
 
 ```cryo
 // stdlib/collections/_module.cryo
 namespace std::collections;
 
-public module collections::raw_buffer;
-public module collections::array;
-public module collections::str;
-public module collections::string;
-public module collections::hashmap;
-public module collections::hashset;
+module collections::array;
+module {
+    collections::str;
+    collections::string;
+    collections::hashmap;
+    collections::hashset;
+}
+internal module collections::raw_buffer;
 ```
 
-`public module` is **structure only**: it declares that a submodule exists, drives discovery, and suppresses a build-order edge. It does not bring the child's name or the child's symbols into any importer's scope. Importing `std::collections` therefore does not let you name `Array` — reaching a submodule takes an `import` of that submodule, or an `export` in the aggregator (see [section 13.5](#135-re-exports)).
+A submodule is public: `module x;` declares one, and `module { a; b; }` declares several, each entry ending in `;`. `internal module x;` and `internal module { a; b; }` declare submodules that reach only their own package, one cryoconfig project. An import or an export of an internal module from another package is refused (`E0353`), and so is a module declared under one, which reaches no further than its parent. Everything an internal module declares reaches its package however it is marked: a `public` function in it called from another package is `E0353`, a type named from there is `E0503`, and a public signature may not name it (`E0506`, [section 13.4](#134-visibility)).
 
-A submodule's file is found under its name as written, in lowercase, or in snake case: `public module NodeLocator;` finds `node_locator.cryo`. Whichever spelling found it, the file is named as its directory spells it - in diagnostics, panic locations and `location()` - so a filesystem that ignores case does not change the name a program reports.
+A `module` line is **structure only**: it declares that a submodule exists, drives discovery, and suppresses a build-order edge. It does not bring the child's name or the child's symbols into any importer's scope. Importing `std::collections` therefore does not let you name `Array` — reaching a submodule takes an `import` of that submodule, or an `export` in the aggregator (see [section 13.5](#135-re-exports)).
+
+A submodule's file is found under its name as written, in lowercase, or in snake case: `module NodeLocator;` finds `node_locator.cryo`. Whichever spelling found it, the file is named as its directory spells it - in diagnostics, panic locations and `location()` - so a filesystem that ignores case does not change the name a program reports.
 
 ### 13.3 Imports
 
@@ -2834,7 +2838,7 @@ const n: i32 = Tag(4);                // Labels's function
 | `internal`          | Accessible to every module of the declaring package - for items and members alike.       |
 | `private`           | Accessible only within the declaring module - for items and members alike.               |
 
-A **package** is one cryoconfig project: the program being built, each of its dependencies, each vendored library, and the standard library, which is one package. `internal` is written wherever `private` can be - on an item, a field, a method, a static, a type's constant, a function in an `extern` block, and as a member label `internal:` - and reaches every module of its own package and none of another's.
+A **package** is one cryoconfig project: the program being built, each of its dependencies, each vendored library, and the standard library, which is one package. `internal` is written wherever `private` can be - on an item, a field, a method, a static, a type's constant, a function in an `extern` block, and as a member label `internal:` - and reaches every module of its own package and none of another's. A module is public; an `internal module` and everything it declares reach its package alone ([section 13.2](#132-module-aggregators)), so an item's reach is the narrower of its own and its module's.
 
 Top-level items are **public by default**; mark an item `private` to confine it to its own module, or `internal` to its package. For top-level types (`struct` / `union` / `enum`, an alias and a trait), visibility is enforced across modules: naming a `private` type from another module, or an `internal` one from another package - in a type annotation, a struct literal, a bound, or a function signature - is rejected with `E0503`. Such a type remains fully usable where it is visible. A `private` function, constant or global named from another module, or an `internal` one from another package, by a path or an import, is `E0353`, as is a field, method or static reached so.
 
@@ -2864,7 +2868,7 @@ An `export` declaration lets a module pass names it did not declare on to its ow
 ```cryo
 namespace std::future;
 
-public module future::waker;                  // structure (section 13.2)
+module future::waker;                         // structure (section 13.2)
 export future::waker::{ Context, Waker };     // re-export two names
 export future::poll;                          // re-export the whole submodule
 ```
