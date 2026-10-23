@@ -2792,7 +2792,7 @@ import Math::Vector::{ Vec2 as P2 };  // an item under another name
 import Math::Vector::Vec3 as P3;      // the same, for one item
 ```
 
-A plain `import Math::Vector;` binds the module and no names from it: its items are reached by path, `Vector::Vec2`. Only the wildcard brings a module's names in bare, and the compiler's own prelude is the one wildcard a file gets without writing it. An import whose path names no module is refused at the import (`E0502`), and the help names the module the path abbreviates (`core::option` for `std::core::option`).
+A plain `import Math::Vector;` binds the module and no names from it: its items are reached by path, `Vector::Vec2`. A brace import binds the module the same way and its entries besides: `import Math::Vector::{ Vec2 };` brings `Vec2` in bare and leaves `Vector::Vec3` reachable by path, so the plain line is never needed beside it. Only the wildcard brings a module's names in bare, and the compiler's own prelude is the one wildcard a file gets without writing it. An import whose path names no module is refused at the import (`E0502`), and the help names the module the path abbreviates (`core::option` for `std::core::option`).
 
 An entry's `as` binds the declaration it names under another name, and only that name: `import Toml::{ parse as toml_parse };` makes `toml_parse` Toml's `parse`, and does not bring `parse` into scope. The alias is the declaration itself - its overloads, its generic parameters, a type's statics and methods - not a second spelling looked up later.
 
@@ -2805,7 +2805,7 @@ const n: i32 = J::twice(3);          // Json::twice
 const m: i32 = J::Inner::deep();     // Json::Inner::deep
 ```
 
-A plain import's name continues the same way: with `import A::Toml;`, `Toml::Sub::three()` names `A::Toml::Sub::three`, and the sub-module is loaded although nothing imports it.
+An import's name continues the same way, plain or braced: with `import A::Toml;` or `import A::Toml::{ one };`, `Toml::Sub::three()` names `A::Toml::Sub::three`, and the sub-module is loaded although nothing imports it.
 
 `import A::B as C;` names the item `B` of the module `A`, or the module `A::B`. When `A` declares an item `B` and `A::B` is also a module, the path names both, and neither is chosen: the import is an error (E0244). The braced forms are the same error, aliased or not, so there is no import that picks the item out of the pair; the fix is to rename one of the two. The module stays reachable by its path:
 

@@ -155,6 +155,13 @@ yet is recorded with the change that builds it, not here.
      do; `take` of a negative count yields nothing and `skip` of one skips
      nothing.  (Jake)
 
+577. **A brace import records everything the plain import of its path
+     does.**  `import std::core::result::{ Result };` binds `result` as
+     `import std::core::result;` would, so `result::` paths resolve and a
+     path through it, `b::sub::f()`, loads the sub-module it names.  The
+     brace line is enough on its own, and a plain line beside it is
+     deleted.  (Jake)
+
 ### 2026-10-22
 
 553. **A test project can set the compiler's environment and arguments,
