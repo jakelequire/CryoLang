@@ -243,6 +243,12 @@ yet is recorded with the change that builds it, not here.
      module, however it is marked, so every door that judges an item's
      reach judges it.  (Jake; the code Delegated)
 
+569. **`public module` is refused** (E0117, the removed-form code), once
+     the tree and the pinned compiler are written in the new forms: a
+     module is public, so the word tells it from nothing.  A signature in
+     an internal module is judged at the module's reach, so its public
+     members may name its own types.  (Jake)
+
 ### 2026-10-21
 
 501. **The class-removal plan is deleted now,** its slices all built and its

@@ -261,8 +261,10 @@ function find<T>(xs: &Array<T>, target: T) -> Option<u64>
 // math/_module.cryo
 namespace Math;
 
-public module math::vector;
-public module math::matrix;
+module {
+    math::vector;
+    math::matrix;
+}
 ```
 
 ```cryo

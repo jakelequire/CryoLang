@@ -1092,9 +1092,9 @@ def run_stdlib_files(server_path, c):
                 "uri": opened[rel][0], "languageId": "cryo", "version": 1, "text": opened[rel][1]}})
 
         mod_uri, mod_text = opened["io/_module.cryo"]
-        got = first_uri(ask("definition", mod_uri, find_position(mod_text, "public module io::error;", 18)))
+        got = first_uri(ask("definition", mod_uri, find_position(mod_text, "    io::error;", 8)))
         c.ok(got is not None and got.endswith("stdlib/io/error.cryo"),
-             "%s: definition on a `public module` line is that module's file" % label, "got %r" % got)
+             "%s: definition on an entry of a `module` group is that module's file" % label, "got %r" % got)
 
         err_uri, err_text = opened["io/error.cryo"]
         hover = hover_text(ask("hover", err_uri, find_position(err_text, "type enum IoErrorKind", 10)))
