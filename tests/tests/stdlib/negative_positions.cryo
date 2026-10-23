@@ -1,0 +1,189 @@
+///! A negative length or position given to a standard-library method is
+///! never read as a huge unsigned one: a lookup answering `Option` answers
+///! `None`, a method writing or cutting at a position panics, `truncate`
+///! panics, `reserve` and `with_capacity` do nothing, and `take`/`skip`
+///! treat the count as zero.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::NegativePositions;
+
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::option;
+import std::core::option::{ Option };
+import std::core::iter;
+import std::core::iter::{ Iterator };
+import std::core::ops;
+import std::core::ops::{ Range };
+import std::core::slice;
+import std::core::slice::{ Slice };
+import std::collections::array;
+import std::collections::array::{ Array };
+import std::collections::hashmap;
+import std::collections::hashmap::{ HashMap };
+import std::collections::str;
+import std::collections::str::{ Str };
+import std::collections::string;
+import std::collections::string::{ String };
+import std::json::value;
+import std::json::value::{ JsonObject, JsonValue };
+import std::test::error;
+import std::test::error::{ TestError };
+import std::test::assert;
+import std::test::assert::{ expect, expect_eq };
+
+function three() -> Array<i32> {
+    mut a: Array<i32> = Array::new();
+    a.push(10); a.push(20); a.push(30);
+    return a;
+}
+
+// --- lookups answer None ---------------------------------------------------
+
+![test]
+function array_lookups_answer_none() -> Result<(), TestError> {
+    const a: Array<i32> = three();
+    expect(a.get(-1).is_none(), Str::new("Array::get(-1)"))?;
+    return expect(a.get_ref(-1).is_none(), Str::new("Array::get_ref(-1)"));
+}
+
+![test]
+function slice_lookups_answer_none() -> Result<(), TestError> {
+    const a: Array<i32> = three();
+    const s: Slice<i32> = a.as_slice();
+    expect(s.get(-1).is_none(), Str::new("Slice::get(-1)"))?;
+    return expect(s.get_ref(-1).is_none(), Str::new("Slice::get_ref(-1)"));
+}
+
+![test]
+function str_byte_at_answers_none() -> Result<(), TestError> {
+    return expect(Str::new("abc").byte_at(-1).is_none(), Str::new("Str::byte_at(-1)"));
+}
+
+![test]
+function json_lookups_answer_none() -> Result<(), TestError> {
+    mut object: JsonObject = JsonObject::new();
+    object.insert(String::from("k"), JsonValue::int_value(1));
+    expect(object.key_at(-1).is_none(), Str::new("JsonObject::key_at(-1)"))?;
+    expect(object.value_at(-1).is_none(), Str::new("JsonObject::value_at(-1)"))?;
+    mut items: Array<JsonValue> = Array::new();
+    items.push(JsonValue::int_value(1));
+    const list: JsonValue = JsonValue::Array(items);
+    return expect(list.at(-1).is_none(), Str::new("JsonValue::at(-1)"));
+}
+
+// --- writing or cutting at a negative position panics ----------------------
+
+![test]
+![should_panic]
+function array_set_negative_panics() -> Result<(), TestError> {
+    mut a: Array<i32> = three();
+    a.set(-1, 0);
+    return Result::Ok(());
+}
+
+![test]
+![should_panic]
+function array_insert_negative_panics() -> Result<(), TestError> {
+    mut a: Array<i32> = three();
+    a.insert(-1, 0);
+    return Result::Ok(());
+}
+
+![test]
+![should_panic]
+function array_remove_negative_panics() -> Result<(), TestError> {
+    mut a: Array<i32> = three();
+    const _gone: i32 = a.remove(-1);
+    return Result::Ok(());
+}
+
+![test]
+![should_panic]
+function array_swap_remove_negative_panics() -> Result<(), TestError> {
+    mut a: Array<i32> = three();
+    const _gone: i32 = a.swap_remove(-1);
+    return Result::Ok(());
+}
+
+![test]
+![should_panic]
+function str_sub_bytes_negative_panics() -> Result<(), TestError> {
+    const _cut: Str = Str::new("abc").sub_bytes(-1, 2);
+    return Result::Ok(());
+}
+
+![test]
+![should_panic]
+function slice_subslice_negative_panics() -> Result<(), TestError> {
+    const a: Array<i32> = three();
+    const _cut: Slice<i32> = a.as_slice().subslice(-1, 2);
+    return Result::Ok(());
+}
+
+// --- a negative length panics ----------------------------------------------
+
+![test]
+![should_panic]
+function array_truncate_negative_panics() -> Result<(), TestError> {
+    mut a: Array<i32> = three();
+    a.truncate(-1);
+    return Result::Ok(());
+}
+
+![test]
+![should_panic]
+function array_resize_negative_panics() -> Result<(), TestError> {
+    mut a: Array<i32> = three();
+    a.resize(-1, 0);
+    return Result::Ok(());
+}
+
+![test]
+![should_panic]
+function string_truncate_negative_panics() -> Result<(), TestError> {
+    mut s: String = String::from("abc");
+    s.truncate(-1);
+    return Result::Ok(());
+}
+
+// --- reserving zero or less does nothing ------------------------------------
+
+![test]
+function reserve_negative_is_nothing_to_do() -> Result<(), TestError> {
+    mut a: Array<i32> = three();
+    const before: i64 = a.capacity();
+    expect(a.reserve(-5).is_ok(), Str::new("Array::reserve(-5)"))?;
+    expect(a.reserve_exact(-5).is_ok(), Str::new("Array::reserve_exact(-5)"))?;
+    expect_eq(a.capacity(), before)?;
+    mut s: String = String::from("abc");
+    const string_before: i64 = s.capacity();
+    expect(s.reserve(-5).is_ok(), Str::new("String::reserve(-5)"))?;
+    expect(s.reserve_exact(-5).is_ok(), Str::new("String::reserve_exact(-5)"))?;
+    return expect_eq(s.capacity(), string_before);
+}
+
+![test]
+function with_capacity_negative_allocates_nothing() -> Result<(), TestError> {
+    const a: Array<i32> = Array::<i32>::with_capacity(-5);
+    expect_eq(a.capacity(), 0)?;
+    expect_eq(a.length(), 0)?;
+    const s: String = String::with_capacity(-5);
+    expect_eq(s.length(), 0)?;
+    const m: HashMap<i32, i32> = HashMap::<i32, i32>::with_capacity(-5);
+    return expect_eq(m.length(), 0);
+}
+
+// --- take and skip of a negative count --------------------------------------
+
+![test]
+function take_negative_yields_nothing() -> Result<(), TestError> {
+    const r: Range<i32> = Range::new(0, 5);
+    return expect_eq(r.take(-1).count(), 0);
+}
+
+![test]
+function skip_negative_skips_nothing() -> Result<(), TestError> {
+    const r: Range<i32> = Range::new(0, 5);
+    return expect_eq(r.skip(-1).count(), 5);
+}

@@ -32,7 +32,7 @@ import std::alloc::allocator::{
 
 type struct RawBuffer<T, A = GlobalAlloc> where A: Allocator {
     ptr: T*;
-    private capacity: u64;
+    private capacity: i64;
     alloc: A;
 
     /// Empty buffer backed by `GlobalAlloc`. No heap storage until
@@ -68,22 +68,26 @@ type struct RawBuffer<T, A = GlobalAlloc> where A: Allocator {
     }
 
     ![inline]
-    capacity(&this) -> u64 {
+    capacity(&this) -> i64 {
         return this.capacity;
     }
 
-    /// Ensure at least `additional` more slots past `used` fit.
+    /// Ensure at least `additional` more slots past `used` fit; an
+    /// `additional` of zero or less is already satisfied.
     /// Over-allocates along the doubling curve, seeded by
     /// `min_capacity` when the buffer is small (so empty-to-nonempty
     /// transitions don't start at a single slot).
     reserve(mut &this,
-            used: u64,
-            additional: u64,
-            min_capacity: u64) -> Result<(), AllocError> {
+            used: i64,
+            additional: i64,
+            min_capacity: i64) -> Result<(), AllocError> {
+        if (additional <= 0) {
+            return Result::Ok(());
+        }
         // Overflow-checked: a wrapped `used + additional` (sum < used) means
-        // the requested capacity can't be represented in `u64`, so it can
+        // the requested capacity can't be represented in `i64`, so it can
         // never be satisfied - report it instead of silently under-sizing.
-        const required: u64 = used + additional;
+        const required: i64 = used + additional;
         if (required < used) {
             return Result::Err(AllocError::new(
                 AllocErrorKind::OutOfMemory, Layout::array::<T>(used)));
@@ -96,13 +100,17 @@ type struct RawBuffer<T, A = GlobalAlloc> where A: Allocator {
 
     /// Allocate exactly enough for `used + additional`. No over-
     /// allocation. Useful when the caller already knows the final
-    /// size (e.g., `Array::with_capacity`).
+    /// size (e.g., `Array::with_capacity`).  An `additional` of zero or
+    /// less is already satisfied.
     reserve_exact(mut &this,
-                  used: u64,
-                  additional: u64) -> Result<(), AllocError> {
+                  used: i64,
+                  additional: i64) -> Result<(), AllocError> {
+        if (additional <= 0) {
+            return Result::Ok(());
+        }
         // See `reserve`: reject a wrapped `used + additional` rather than
         // under-allocating and overrunning the buffer in the caller's memcpy.
-        const required: u64 = used + additional;
+        const required: i64 = used + additional;
         if (required < used) {
             return Result::Err(AllocError::new(
                 AllocErrorKind::OutOfMemory, Layout::array::<T>(used)));
@@ -116,9 +124,9 @@ type struct RawBuffer<T, A = GlobalAlloc> where A: Allocator {
     /// Shrink capacity to `target`, which must be at least `used`.
     /// If shrinking fails, the buffer keeps its current capacity;
     /// losing capacity is fine, but losing data is not.
-    shrink_to(mut &this, target: u64) -> void {
+    shrink_to(mut &this, target: i64) -> void {
         if (target >= this.capacity) { return; }
-        if (target == 0) {
+        if (target <= 0) {
             if (this.ptr != null) {
                 this.alloc.deallocate(
                     NonNull::new(this.ptr as u8*),
@@ -140,7 +148,7 @@ type struct RawBuffer<T, A = GlobalAlloc> where A: Allocator {
     /// A method (not a free function) so the monomorphizer specializes it
     /// alongside the rest of `RawBuffer<T, A>`'s body, mirroring
     /// `Array::resize_storage`.
-    resize(mut &this, new_capacity: u64) -> Result<(), AllocError> {
+    resize(mut &this, new_capacity: i64) -> Result<(), AllocError> {
         if (new_capacity == this.capacity) {
             return Result::Ok(());
         }

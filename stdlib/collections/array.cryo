@@ -82,9 +82,10 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
         };
     }
 
-    /// Preallocate room for `capacity` elements. Panics on
-    /// allocation failure; use `try_with_capacity_in` to recover.
-    static with_capacity(capacity: u64) -> Array<T, GlobalAlloc> {
+    /// Preallocate room for `capacity` elements; a `capacity` of zero or
+    /// less allocates nothing. Panics on allocation failure; use
+    /// `try_with_capacity_in` to recover.
+    static with_capacity(capacity: i64) -> Array<T, GlobalAlloc> {
         match (Array::<T, GlobalAlloc>::try_with_capacity_in(capacity, GlobalAlloc::new())) {
             Result::Ok(array) => { return array; }
             Result::Err(_) => {
@@ -93,7 +94,7 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
         }
     }
 
-    static with_capacity_in(capacity: u64, alloc: A) -> Array<T, A> {
+    static with_capacity_in(capacity: i64, alloc: A) -> Array<T, A> {
         match (Array::<T, A>::try_with_capacity_in(capacity, alloc)) {
             Result::Ok(array) => { return array; }
             Result::Err(_) => {
@@ -102,17 +103,17 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
         }
     }
 
-    static try_with_capacity_in(capacity: u64, alloc: A) -> Result<Array<T, A>, AllocError> {
+    static try_with_capacity_in(capacity: i64, alloc: A) -> Result<Array<T, A>, AllocError> {
         mut array: Array<T, A> = Array::<T, A> {
             ptr: null,
             length: 0,
             capacity: 0,
             alloc: alloc
         };
-        if (capacity == 0) {
+        if (capacity <= 0) {
             return Result::Ok(array);
         }
-        array.resize_storage(capacity as i64)?;
+        array.resize_storage(capacity)?;
         return Result::Ok(array);
     }
 
@@ -130,27 +131,30 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
         return this.length == 0;
     }
 
-    /// Bounds-checked read by value. Gated on `T: Copy`: the result is
-    /// an independent bitwise duplicate while the array retains ownership
-    /// of the stored element, so handing back a copy is only sound when
-    /// `T` carries no `Drop` obligation. For owning `T`, borrow in place
-    /// with `get_ref` (or move an element out with `swap_remove`/`pop`).
-    get(&this, index: u64) -> Option<T> where T: Copy {
-        if (index >= this.length as u64) {
+    /// Bounds-checked read by value; `None` for an index outside
+    /// `[0, length)`, a negative one included. Gated on `T: Copy`: the
+    /// result is an independent bitwise duplicate while the array retains
+    /// ownership of the stored element, so handing back a copy is only
+    /// sound when `T` carries no `Drop` obligation. For owning `T`, borrow
+    /// in place with `get_ref` (or move an element out with
+    /// `swap_remove`/`pop`).
+    get(&this, index: i64) -> Option<T> where T: Copy {
+        if (index < 0 || index >= this.length) {
             return Option::None;
         }
         return Option::Some(this.ptr[index]);
     }
 
-    /// Bounds-checked borrow. Returns a pointer to the element in place;
-    /// the array keeps ownership, so this is sound for every `T` (Copy or
-    /// owning). The pointer is invalidated by any reallocating method
-    /// (`push`, `reserve`, `shrink_to_fit`).
-    get_ref(&this, index: u64) -> Option<T*> {
-        if (index >= this.length as u64) {
+    /// Bounds-checked borrow; `None` for an index outside `[0, length)`.
+    /// Returns a pointer to the element in place; the array keeps
+    /// ownership, so this is sound for every `T` (Copy or owning). The
+    /// pointer is invalidated by any reallocating method (`push`,
+    /// `reserve`, `shrink_to_fit`).
+    get_ref(&this, index: i64) -> Option<T*> {
+        if (index < 0 || index >= this.length) {
             return Option::None;
         }
-        return Option::Some(mem::offset(this.ptr, index as i64));
+        return Option::Some(mem::offset(this.ptr, index));
     }
 
     /// Raw pointer. Invalidated by any method that may reallocate
@@ -162,7 +166,7 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// Borrow the initialized prefix. Slice is invalidated by any
     /// reallocating method.
     as_slice(&this) -> Slice<T> {
-        return Slice::from_raw(this.ptr, this.length as u64);
+        return Slice::from_raw(this.ptr, this.length);
     }
 
     /// Iterate over the elements in order, yielding each by value
@@ -172,7 +176,7 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// iterator is invalidated by any reallocating method on the array
     /// (`push`, `reserve`, `shrink_to_fit`).
     iter(&this) -> implement Iterator<T> where T: Copy {
-        return SliceIter::<T> { ptr: this.ptr, remaining: this.length as u64 };
+        return SliceIter::<T> { ptr: this.ptr, remaining: this.length };
     }
 
     /// Iterate by shared borrow, yielding `T*` for each element in
@@ -215,10 +219,10 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// The previous occupant is released in place before the slot is
     /// reused: a raw slot store (`this.ptr[index] = value`) does NOT drop
     /// the destination, so for owning `T` (`String`, `Box<T>`, ...) the
-    /// old element's resources would otherwise leak. Panics on
-    /// out-of-range.
-    set(mut &this, index: u64, value: T) -> void {
-        if (index >= this.length as u64) {
+    /// old element's resources would otherwise leak. Panics on an index
+    /// outside `[0, length)`.
+    set(mut &this, index: i64, value: T) -> void {
+        if (index < 0 || index >= this.length) {
             core::panic("Array::set: index out of range", intrinsics::location());
         }
         mut prev: T* = this.get_ref(index).unwrap();
@@ -227,14 +231,14 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     }
 
     /// Remove at `index` by swapping in the last element. O(1) but
-    /// doesn't preserve order. Panics on out-of-range.
-    swap_remove(mut &this, index: u64) -> T {
-        if (index >= this.length as u64) {
+    /// doesn't preserve order. Panics on an index outside `[0, length)`.
+    swap_remove(mut &this, index: i64) -> T {
+        if (index < 0 || index >= this.length) {
             core::panic("Array::swap_remove: index out of range", intrinsics::location());
         }
         const removed: T = this.ptr[index];
         const last: i64 = this.length - 1;
-        if (index != last as u64) {
+        if (index != last) {
             this.ptr[index] = this.ptr[last];
         }
         this.length = last;
@@ -257,11 +261,11 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
 
     /// Index of the first element equal to `value`, or `None`. Linear
     /// scan; `T: Eq`.
-    index_of(&this, value: &T) -> Option<u64> where T: Eq {
+    index_of(&this, value: &T) -> Option<i64> where T: Eq {
         mut i: i64 = 0;
         while (i < this.length) {
             if (this.ptr[i].equals(value)) {
-                return Option::Some(i as u64);
+                return Option::Some(i);
             }
             i = i + 1;
         }
@@ -307,11 +311,12 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     }
 
     /// Insert `value` at `index`, shifting later elements right by one.
-    /// `index == length` appends. Panics if `index > length`. Panics on
-    /// allocation failure; use the `Result`-returning forms for recovery
-    /// via `try_push` if you need fallibility on the common (append) path.
-    insert(mut &this, index: u64, value: T) -> void {
-        if (index > this.length as u64) {
+    /// `index == length` appends. Panics if `index` is negative or
+    /// `index > length`. Panics on allocation failure; use the
+    /// `Result`-returning forms for recovery via `try_push` if you need
+    /// fallibility on the common (append) path.
+    insert(mut &this, index: i64, value: T) -> void {
+        if (index < 0 || index > this.length) {
             core::panic("Array::insert: index out of range", intrinsics::location());
         }
         if (this.length == this.capacity) {
@@ -322,14 +327,14 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
                 }
             }
         }
-        const tail: u64 = (this.length as u64) - index;
+        const tail: i64 = this.length - index;
         if (tail > 0) {
             // Shift [index, length) right by one slot. memmove handles the
             // overlap; this relocates owning elements without aliasing.
             libc::memmove(
-                mem::offset(this.ptr, (index + 1) as i64) as void*,
-                mem::offset(this.ptr, index as i64) as void*,
-                tail * sizeof(T)
+                mem::offset(this.ptr, index + 1) as void*,
+                mem::offset(this.ptr, index) as void*,
+                (tail as u64) * sizeof(T)
             );
         }
         this.ptr[index] = value;
@@ -337,20 +342,21 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     }
 
     /// Remove and return the element at `index`, shifting later elements
-    /// left by one to preserve order (O(n)). Panics if out of range. For
-    /// O(1) removal when order doesn't matter, use `swap_remove`.
-    remove(mut &this, index: u64) -> T {
-        if (index >= this.length as u64) {
+    /// left by one to preserve order (O(n)). Panics on an index outside
+    /// `[0, length)`. For O(1) removal when order doesn't matter, use
+    /// `swap_remove`.
+    remove(mut &this, index: i64) -> T {
+        if (index < 0 || index >= this.length) {
             core::panic("Array::remove: index out of range", intrinsics::location());
         }
         const removed: T = this.ptr[index];
-        const tail: u64 = (this.length as u64) - index - 1;
+        const tail: i64 = this.length - index - 1;
         if (tail > 0) {
             // Shift [index+1, length) left by one over the vacated slot.
             libc::memmove(
-                mem::offset(this.ptr, index as i64) as void*,
-                mem::offset(this.ptr, (index + 1) as i64) as void*,
-                tail * sizeof(T)
+                mem::offset(this.ptr, index) as void*,
+                mem::offset(this.ptr, index + 1) as void*,
+                (tail as u64) * sizeof(T)
             );
         }
         this.length = this.length - 1;
@@ -358,15 +364,19 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     }
 
     /// Shorten to at most `new_length`, releasing the truncated elements
-    /// in place. A no-op if `new_length >= length`. Keeps capacity.
-    truncate(mut &this, new_length: u64) -> void {
-        if (new_length >= this.length as u64) { return; }
-        mut i: i64 = new_length as i64;
+    /// in place. A no-op if `new_length >= length`; a negative
+    /// `new_length` panics. Keeps capacity.
+    truncate(mut &this, new_length: i64) -> void {
+        if (new_length < 0) {
+            core::panic("Array::truncate: negative length", intrinsics::location());
+        }
+        if (new_length >= this.length) { return; }
+        mut i: i64 = new_length;
         while (i < this.length) {
             ptr::drop_in_place::<T>(&this.ptr[i]);
             i++;
         }
-        this.length = new_length as i64;
+        this.length = new_length;
     }
 
     /// Release every initialized element (the `[0, length)` prefix) in
@@ -397,7 +407,7 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// intact (every initialised slot still gets dropped exactly once).
     sort(mut &this) -> void where T: Ord {
         if (this.length < 2) { return; }
-        sort_range::<T>(this.ptr, 0, this.length as u64);
+        sort_range::<T>(this.ptr, 0, this.length);
     }
 
     /// Sort in place using a user-supplied "less-than" predicate.
@@ -414,7 +424,7 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// closure-arg path.
     sort_by(mut &this, less: (&T, &T) -> boolean) -> void {
         if (this.length < 2) { return; }
-        sort_range_by::<T>(this.ptr, 0, this.length as u64, less);
+        sort_range_by::<T>(this.ptr, 0, this.length, less);
     }
 
     /// Append every element of `source` to the end of this array.
@@ -439,15 +449,15 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// or none are. Gated on `T: Copy` (see `append`): the append is a
     /// bitwise `memcpy` out of the borrowed `source`.
     try_append(mut &this, source: Slice<T>) -> Result<(), AllocError> where T: Copy {
-        const add: u64 = source.length();
+        const add: i64 = source.length();
         if (add == 0) { return Result::Ok(()); }
         this.reserve_grow(add)?;
         libc::memcpy(
             mem::offset(this.ptr, this.length) as void*,
             source.as_ptr() as void*,
-            add * sizeof(T)
+            (add as u64) * sizeof(T)
         );
-        this.length = this.length + add as i64;
+        this.length = this.length + add;
         return Result::Ok(());
     }
 
@@ -461,8 +471,9 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     ///
     /// Gated on `T: Copy` for the same reason as `append` - each new slot is a
     /// bitwise copy of `value`, so for an owning `T` every one of them would own
-    /// the same heap buffer and they would all free it.
-    resize(mut &this, new_length: u64, value: T) -> void where T: Copy {
+    /// the same heap buffer and they would all free it.  A negative
+    /// `new_length` panics, as in `truncate`.
+    resize(mut &this, new_length: i64, value: T) -> void where T: Copy {
         match (this.try_resize(new_length, value)) {
             Result::Ok(_)  => { return; }
             Result::Err(_) => {
@@ -473,36 +484,42 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
 
     /// Fallible `resize`. Reserves the whole growth up front, so the array is
     /// either resized or left exactly as it was - never partially grown.
-    try_resize(mut &this, new_length: u64, value: T) -> Result<(), AllocError>
+    try_resize(mut &this, new_length: i64, value: T) -> Result<(), AllocError>
     where T: Copy {
-        if (new_length <= this.length as u64) {
+        if (new_length <= this.length) {
             this.truncate(new_length);
             return Result::Ok(());
         }
-        this.reserve_grow(new_length - (this.length as u64))?;
+        this.reserve_grow(new_length - this.length)?;
         mut i: i64 = this.length;
-        while (i < new_length as i64) {
+        while (i < new_length) {
             this.ptr[i] = value;
             i++;
         }
-        this.length = new_length as i64;
+        this.length = new_length;
         return Result::Ok(());
     }
 
-    reserve(mut &this, additional: u64) -> Result<(), AllocError> {
+    /// Room for at least `additional` more elements; zero or less is a
+    /// no-op.
+    reserve(mut &this, additional: i64) -> Result<(), AllocError> {
         return this.reserve_grow(additional);
     }
 
-    reserve_exact(mut &this, additional: u64) -> Result<(), AllocError> {
-        const required: i64 = this.length + (additional as i64);
-        // A `length + additional` that does not fit in an `i64` (an
-        // `additional` past its range, or a sum that wrapped) reads below
+    /// Room for exactly `additional` more elements; zero or less is a
+    /// no-op.
+    reserve_exact(mut &this, additional: i64) -> Result<(), AllocError> {
+        if (additional <= 0) {
+            return Result::Ok(());
+        }
+        const required: i64 = this.length + additional;
+        // A `length + additional` that does not fit in an `i64` wraps below
         // `length`.  Reject it rather than under-sizing: `try_append` would
         // otherwise see `required <= capacity`, skip the realloc, and memcpy
         // `additional` elements past the end of the buffer.
         if (required < this.length) {
             return Result::Err(AllocError::new(
-                AllocErrorKind::OutOfMemory, Layout::array::<T>(this.length as u64)));
+                AllocErrorKind::OutOfMemory, Layout::array::<T>(this.length)));
         }
         if (required <= this.capacity) {
             return Result::Ok(());
@@ -512,20 +529,21 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
 
     /// Internal: ensure at least `additional` more slots fit, doubling
     /// past `INITIAL_CAPACITY`.
-    reserve_grow(mut &this, additional: u64) -> Result<(), AllocError> {
-        const required: i64 = this.length + (additional as i64);
+    reserve_grow(mut &this, additional: i64) -> Result<(), AllocError> {
+        if (additional <= 0) {
+            return Result::Ok(());
+        }
+        const required: i64 = this.length + additional;
         // See reserve_exact: reject a `length + additional` that does not fit
         // rather than under-allocating and overrunning the caller's memcpy.
         if (required < this.length) {
             return Result::Err(AllocError::new(
-                AllocErrorKind::OutOfMemory, Layout::array::<T>(this.length as u64)));
+                AllocErrorKind::OutOfMemory, Layout::array::<T>(this.length)));
         }
         if (required <= this.capacity) {
             return Result::Ok(());
         }
-        const grown: u64 = next_capacity(
-            this.capacity as u64, required as u64, INITIAL_CAPACITY as u64);
-        return this.resize_storage(grown as i64);
+        return this.resize_storage(next_capacity(this.capacity, required, INITIAL_CAPACITY));
     }
 
     shrink_to_fit(mut &this) -> void {
@@ -535,14 +553,14 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
             if (this.ptr != null) {
                 this.alloc.deallocate(
                     NonNull::new(this.ptr as u8*),
-                    Layout::array::<T>(this.capacity as u64)
+                    Layout::array::<T>(this.capacity)
                 );
             }
             this.ptr = null;
             this.capacity = 0;
             return;
         }
-        match (this.resize_storage( target)) {
+        match (this.resize_storage(target)) {
             Result::Ok(_) => { }
             Result::Err(_) => { }
         }
@@ -561,8 +579,7 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
             return Result::Ok(());
         }
         mut new_layout: Layout = Layout { size: 0, alignment: 0 };
-        // A negative capacity reads as one too large to allocate.
-        match (Layout::try_array::<T>(new_capacity as u64)) {
+        match (Layout::try_array::<T>(new_capacity)) {
             Option::Some(l) => { new_layout = l; }
             Option::None    => {
                 return Result::Err(AllocError::new(
@@ -575,7 +592,7 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
             this.capacity = new_capacity;
             return Result::Ok(());
         }
-        const old_layout: Layout = Layout::array::<T>(this.capacity as u64);
+        const old_layout: Layout = Layout::array::<T>(this.capacity);
         const raw: NonNull<u8> = this.alloc.reallocate(
             NonNull::new(this.ptr as u8*),
             old_layout,
@@ -611,7 +628,7 @@ where T: Drop, A: Allocator {
         if (this.ptr != null) {
             this.alloc.deallocate(
                 NonNull::new(this.ptr as u8*),
-                Layout::array::<T>(this.capacity as u64)
+                Layout::array::<T>(this.capacity)
             );
         }
         this.ptr = null;
@@ -658,29 +675,28 @@ function from_iter<I, T>(it: I) -> Array<T> where I: Iterator<T> {
 /// the canonical value; small enough that insertion sort's O(n^2) is
 /// faster than quicksort's per-element overhead, large enough to avoid
 /// recursing all the way down.
-const SORT_INSERTION_CUTOFF: u64 = 16;
+const SORT_INSERTION_CUTOFF: i64 = 16;
 
-function sort_range<T>(ptr: T*, lo: u64, hi: u64) -> void where T: Ord {
+function sort_range<T>(ptr: T*, lo: i64, hi: i64) -> void where T: Ord {
     if (hi - lo < SORT_INSERTION_CUTOFF) {
         sort_insertion::<T>(ptr, lo, hi);
         return;
     }
-    const pivot_idx: u64 = sort_partition::<T>(ptr, lo, hi);
+    const pivot_idx: i64 = sort_partition::<T>(ptr, lo, hi);
     sort_range::<T>(ptr, lo, pivot_idx);
     sort_range::<T>(ptr, pivot_idx + 1, hi);
 }
 
-function sort_insertion<T>(ptr: T*, lo: u64, hi: u64) -> void where T: Ord {
-    mut i: u64 = lo + 1;
+function sort_insertion<T>(ptr: T*, lo: i64, hi: i64) -> void where T: Ord {
+    mut i: i64 = lo + 1;
     while (i < hi) {
-        mut j: u64 = i;
+        mut j: i64 = i;
         // Walk j backwards while ptr[j-1] > ptr[j].  Stop at lo.
         while (j > lo) {
             const ord: Ordering = ptr[j - 1].compare(&ptr[j]);
             match (ord) {
                 Ordering::Greater => {
-                    mem::swap::<T>(mem::offset(ptr, (j - 1) as i64),
-                                 mem::offset(ptr,  j      as i64));
+                    mem::swap::<T>(mem::offset(ptr, j - 1), mem::offset(ptr, j));
                     j = j - 1;
                 }
                 Ordering::Less    => { break; }
@@ -694,24 +710,22 @@ function sort_insertion<T>(ptr: T*, lo: u64, hi: u64) -> void where T: Ord {
 /// Median-of-three pivot: pick the median of `ptr[lo]`, `ptr[mid]`,
 /// `ptr[hi-1]` as the pivot, move it to `ptr[hi-1]`, then partition
 /// `[lo, hi-1)` around its value.  Returns the final pivot index.
-function sort_partition<T>(ptr: T*, lo: u64, hi: u64) -> u64 where T: Ord {
-    const mid: u64 = lo + (hi - lo) / 2;
+function sort_partition<T>(ptr: T*, lo: i64, hi: i64) -> i64 where T: Ord {
+    const mid: i64 = lo + (hi - lo) / 2;
     sort_order_pair::<T>(ptr, lo,     mid);
     sort_order_pair::<T>(ptr, lo,     hi - 1);
     sort_order_pair::<T>(ptr, mid,    hi - 1);
     // After the three pair-orderings, ptr[lo] <= ptr[mid] <= ptr[hi-1].
     // Stash the median (ptr[mid]) at hi-1 as the pivot.
-    mem::swap::<T>(mem::offset(ptr, mid       as i64),
-                 mem::offset(ptr, (hi - 1)  as i64));
+    mem::swap::<T>(mem::offset(ptr, mid), mem::offset(ptr, hi - 1));
     // Lomuto partition over [lo, hi-1) with pivot at ptr[hi-1].
-    mut store: u64 = lo;
-    mut k:     u64 = lo;
+    mut store: i64 = lo;
+    mut k:     i64 = lo;
     while (k < hi - 1) {
         const ord: Ordering = ptr[k].compare(&ptr[hi - 1]);
         match (ord) {
             Ordering::Less    => {
-                mem::swap::<T>(mem::offset(ptr, store as i64),
-                             mem::offset(ptr, k     as i64));
+                mem::swap::<T>(mem::offset(ptr, store), mem::offset(ptr, k));
                 store = store + 1;
             }
             Ordering::Equal   => { }
@@ -719,17 +733,15 @@ function sort_partition<T>(ptr: T*, lo: u64, hi: u64) -> u64 where T: Ord {
         }
         k = k + 1;
     }
-    mem::swap::<T>(mem::offset(ptr, store    as i64),
-                 mem::offset(ptr, (hi - 1) as i64));
+    mem::swap::<T>(mem::offset(ptr, store), mem::offset(ptr, hi - 1));
     return store;
 }
 
-function sort_order_pair<T>(ptr: T*, i: u64, j: u64) -> void where T: Ord {
+function sort_order_pair<T>(ptr: T*, i: i64, j: i64) -> void where T: Ord {
     const ord: Ordering = ptr[i].compare(&ptr[j]);
     match (ord) {
         Ordering::Greater => {
-            mem::swap::<T>(mem::offset(ptr, i as i64),
-                         mem::offset(ptr, j as i64));
+            mem::swap::<T>(mem::offset(ptr, i), mem::offset(ptr, j));
         }
         Ordering::Less  => { }
         Ordering::Equal => { }
@@ -742,26 +754,25 @@ function sort_order_pair<T>(ptr: T*, i: u64, j: u64) -> void where T: Ord {
 // take a fn-typed parameter directly, and the duplication keeps the
 // hot inner loops monomorphic and obvious.
 
-function sort_range_by<T>(ptr: T*, lo: u64, hi: u64,
+function sort_range_by<T>(ptr: T*, lo: i64, hi: i64,
                           less: (&T, &T) -> boolean) -> void {
     if (hi - lo < SORT_INSERTION_CUTOFF) {
         sort_insertion_by::<T>(ptr, lo, hi, less);
         return;
     }
-    const pivot_idx: u64 = sort_partition_by::<T>(ptr, lo, hi, less);
+    const pivot_idx: i64 = sort_partition_by::<T>(ptr, lo, hi, less);
     sort_range_by::<T>(ptr, lo, pivot_idx,    less);
     sort_range_by::<T>(ptr, pivot_idx + 1, hi, less);
 }
 
-function sort_insertion_by<T>(ptr: T*, lo: u64, hi: u64,
+function sort_insertion_by<T>(ptr: T*, lo: i64, hi: i64,
                               less: (&T, &T) -> boolean) -> void {
-    mut i: u64 = lo + 1;
+    mut i: i64 = lo + 1;
     while (i < hi) {
-        mut j: u64 = i;
+        mut j: i64 = i;
         while (j > lo) {
             if (less(&ptr[j], &ptr[j - 1])) {
-                mem::swap::<T>(mem::offset(ptr, (j - 1) as i64),
-                             mem::offset(ptr,  j      as i64));
+                mem::swap::<T>(mem::offset(ptr, j - 1), mem::offset(ptr, j));
                 j = j - 1;
             } else {
                 break;
@@ -771,34 +782,30 @@ function sort_insertion_by<T>(ptr: T*, lo: u64, hi: u64,
     }
 }
 
-function sort_partition_by<T>(ptr: T*, lo: u64, hi: u64,
-                              less: (&T, &T) -> boolean) -> u64 {
-    const mid: u64 = lo + (hi - lo) / 2;
+function sort_partition_by<T>(ptr: T*, lo: i64, hi: i64,
+                              less: (&T, &T) -> boolean) -> i64 {
+    const mid: i64 = lo + (hi - lo) / 2;
     sort_order_pair_by::<T>(ptr, lo,  mid,     less);
     sort_order_pair_by::<T>(ptr, lo,  hi - 1,  less);
     sort_order_pair_by::<T>(ptr, mid, hi - 1,  less);
-    mem::swap::<T>(mem::offset(ptr, mid       as i64),
-                 mem::offset(ptr, (hi - 1)  as i64));
-    mut store: u64 = lo;
-    mut k:     u64 = lo;
+    mem::swap::<T>(mem::offset(ptr, mid), mem::offset(ptr, hi - 1));
+    mut store: i64 = lo;
+    mut k:     i64 = lo;
     while (k < hi - 1) {
         if (less(&ptr[k], &ptr[hi - 1])) {
-            mem::swap::<T>(mem::offset(ptr, store as i64),
-                         mem::offset(ptr, k     as i64));
+            mem::swap::<T>(mem::offset(ptr, store), mem::offset(ptr, k));
             store = store + 1;
         }
         k = k + 1;
     }
-    mem::swap::<T>(mem::offset(ptr, store    as i64),
-                 mem::offset(ptr, (hi - 1) as i64));
+    mem::swap::<T>(mem::offset(ptr, store), mem::offset(ptr, hi - 1));
     return store;
 }
 
-function sort_order_pair_by<T>(ptr: T*, i: u64, j: u64,
+function sort_order_pair_by<T>(ptr: T*, i: i64, j: i64,
                                less: (&T, &T) -> boolean) -> void {
     if (less(&ptr[j], &ptr[i])) {
-        mem::swap::<T>(mem::offset(ptr, i as i64),
-                     mem::offset(ptr, j as i64));
+        mem::swap::<T>(mem::offset(ptr, i), mem::offset(ptr, j));
     }
 }
 
@@ -808,7 +815,7 @@ function sort_order_pair_by<T>(ptr: T*, i: u64, j: u64,
 implement<T> trait Clone for struct Array<T, GlobalAlloc>
 where T: Clone {
     clone(&this) -> Array<T> {
-        mut out: Array<T> = Array::<T>::with_capacity(this.length as u64);
+        mut out: Array<T> = Array::<T>::with_capacity(this.length);
         mut i: i64 = 0;
         while (i < this.length) {
             out.push(this.ptr[i].clone());

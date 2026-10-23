@@ -192,7 +192,7 @@ type struct Http2Connection<S> {
         // The buffer may already hold the client's SETTINGS frame behind the
         // preface, so compare exactly the preface's worth of it. Nothing
         // suspends between here and the `consume`.
-        const got: Slice<u8> = this.conn.buffered().subslice(0, PREFACE_LEN);
+        const got: Slice<u8> = this.conn.buffered().subslice(0, PREFACE_LEN as i64);
         const good: boolean = slice_eq(got, preface_bytes());
         this.conn.consume(PREFACE_LEN);
         if (!good) {
@@ -313,8 +313,8 @@ type struct Http2Connection<S> {
     /// sees a header block interleaved with anything else.
     queue_header_block(mut &this, stream_id: u32, block: Slice<u8>,
                        end_stream: boolean) -> Result<(), IoError> {
-        const total: u64 = block.length();
-        const max: u64 = this.remote_max_frame;
+        const total: i64 = block.length();
+        const max: i64 = this.remote_max_frame as i64;
         if (total <= max) {
             mut flags: u8 = frame::FLAG_END_HEADERS;
             if (end_stream) { flags = flags | frame::FLAG_END_STREAM; }
@@ -325,9 +325,9 @@ type struct Http2Connection<S> {
         if (end_stream) { first_flags = first_flags | frame::FLAG_END_STREAM; }
         this.conn.queue_h2_frame(frame::FRAME_HEADERS, first_flags, stream_id,
                                  block.subslice(0, max))?;
-        mut pos: u64 = max;
+        mut pos: i64 = max;
         while (pos < total) {
-            mut end: u64 = pos + max;
+            mut end: i64 = pos + max;
             if (end > total) { end = total; }
             const last: boolean = end >= total;
             const cflags: u8 = if (last) { frame::FLAG_END_HEADERS } else { 0 };
@@ -353,7 +353,7 @@ type struct Http2Connection<S> {
                     end_stream: boolean) -> Result<(), IoError>
     where S: AsyncTransport {
         mut b: Array<u8> = body;
-        const total: u64 = b.length() as u64;
+        const total: i64 = b.length();
         if (total == 0) {
             if (end_stream) {
                 this.conn.queue_h2_frame(frame::FRAME_DATA, frame::FLAG_END_STREAM,
@@ -366,16 +366,16 @@ type struct Http2Connection<S> {
         // headers has no reason to enlarge the window.
         (await this.conn.flush())?;
 
-        mut pos: u64 = 0;
+        mut pos: i64 = 0;
         while (pos < total) {
             (await this.ensure_send_window())?;
-            mut avail: u64 = this.remote_max_frame;
-            const remaining: u64 = total - pos;
+            mut avail: i64 = this.remote_max_frame as i64;
+            const remaining: i64 = total - pos;
             if (remaining < avail) { avail = remaining; }
-            if ((this.stream_send_window as u64) < avail) { avail = this.stream_send_window as u64; }
-            if ((this.conn_send_window as u64) < avail) { avail = this.conn_send_window as u64; }
+            if (this.stream_send_window < avail) { avail = this.stream_send_window; }
+            if (this.conn_send_window < avail) { avail = this.conn_send_window; }
 
-            const end: u64 = pos + avail;
+            const end: i64 = pos + avail;
             const last: boolean = end >= total;
             const flags: u8 = if (last && end_stream) { frame::FLAG_END_STREAM } else { 0 };
             // The slice is taken from `b` AFTER the suspension above handed the
@@ -383,8 +383,8 @@ type struct Http2Connection<S> {
             // one, so no view is ever live across a fill.
             this.conn.queue_h2_frame(frame::FRAME_DATA, flags, stream_id,
                                      b.as_slice().subslice(pos, end))?;
-            this.stream_send_window = this.stream_send_window - (avail as i64);
-            this.conn_send_window = this.conn_send_window - (avail as i64);
+            this.stream_send_window = this.stream_send_window - avail;
+            this.conn_send_window = this.conn_send_window - avail;
             pos = end;
             (await this.conn.flush())?;
         }
@@ -741,8 +741,8 @@ function build_response(decoder: mut &HpackDecoder, block: Slice<u8>, body: Arra
 
     mut code: u16 = 0;
     mut have_status: boolean = false;
-    mut i: u64 = 0;
-    while (i < (fields.length() as u64)) {
+    mut i: i64 = 0;
+    while (i < fields.length()) {
         match (fields.get_ref(i)) {
             Option::Some(f) => {
                 if ((*f).name.as_str().equals(&Str::new(":status"))) {
@@ -759,8 +759,8 @@ function build_response(decoder: mut &HpackDecoder, block: Slice<u8>, body: Arra
     if (!have_status) { mem::drop(fields); mem::drop(body_local); return Option::None; }
 
     mut resp: Response = Response::new(StatusCode::from_u16(code));
-    mut j: u64 = 0;
-    while (j < (fields.length() as u64)) {
+    mut j: i64 = 0;
+    while (j < fields.length()) {
         match (fields.get_ref(j)) {
             Option::Some(f) => {
                 const name: Str = (*f).name.as_str();
@@ -791,8 +791,8 @@ function build_request(decoder: mut &HpackDecoder, block: Slice<u8>, body: Array
     mut path: Option<String> = Option::None;
     mut authority: Option<String> = Option::None;
 
-    mut i: u64 = 0;
-    while (i < (fields.length() as u64)) {
+    mut i: i64 = 0;
+    while (i < fields.length()) {
         match (fields.get_ref(i)) {
             Option::Some(f) => {
                 const name: Str = (*f).name.as_str();
@@ -844,8 +844,8 @@ function build_request(decoder: mut &HpackDecoder, block: Slice<u8>, body: Array
         Option::None => { }
     }
 
-    mut j: u64 = 0;
-    while (j < (fields.length() as u64)) {
+    mut j: i64 = 0;
+    while (j < fields.length()) {
         match (fields.get_ref(j)) {
             Option::Some(f) => {
                 const name: Str = (*f).name.as_str();
@@ -867,10 +867,10 @@ function build_request(decoder: mut &HpackDecoder, block: Slice<u8>, body: Array
 /// padding and PRIORITY prefix.
 function header_fragment(fr: &Frame) -> Slice<u8> {
     const p: Slice<u8> = fr.payload.as_slice();
-    mut start: u64 = 0;
-    mut end: u64 = p.length();
+    mut start: i64 = 0;
+    mut end: i64 = p.length();
     if (fr.has_flag(frame::FLAG_PADDED)) {
-        const pad: u64 = byte_at(p, 0) as u64;
+        const pad: i64 = byte_at(p, 0) as i64;
         start = 1;
         if (end >= pad) { end = end - pad; } else { return Slice::from_raw(p.as_ptr(), 0); }
     }
@@ -884,10 +884,10 @@ function header_fragment(fr: &Frame) -> Slice<u8> {
 /// Extract application data from a DATA frame, stripping any padding.
 function data_fragment(fr: &Frame) -> Slice<u8> {
     const p: Slice<u8> = fr.payload.as_slice();
-    mut start: u64 = 0;
-    mut end: u64 = p.length();
+    mut start: i64 = 0;
+    mut end: i64 = p.length();
     if (fr.has_flag(frame::FLAG_PADDED)) {
-        const pad: u64 = byte_at(p, 0) as u64;
+        const pad: i64 = byte_at(p, 0) as i64;
         start = 1;
         if (end >= pad) { end = end - pad; } else { return Slice::from_raw(p.as_ptr(), 0); }
     }
@@ -935,7 +935,7 @@ function write_u31(out: u8*, value: u32) -> void {
 
 function slice_eq(a: Slice<u8>, b: Slice<u8>) -> boolean {
     if (a.length() != b.length()) { return false; }
-    mut i: u64 = 0;
+    mut i: i64 = 0;
     while (i < a.length()) {
         if (byte_at(a, i) != byte_at(b, i)) { return false; }
         i++;
@@ -943,7 +943,7 @@ function slice_eq(a: Slice<u8>, b: Slice<u8>) -> boolean {
     return true;
 }
 
-function byte_at(s: Slice<u8>, index: u64) -> u8 {
+function byte_at(s: Slice<u8>, index: i64) -> u8 {
     match (s.get(index)) {
         Option::Some(b) => { return b; }
         Option::None    => { return 0; }

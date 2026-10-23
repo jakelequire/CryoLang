@@ -73,7 +73,7 @@ type struct Path {
     }
 
     ![inline]
-    length(&this) -> u64 {
+    length(&this) -> i64 {
         return this.inner.length();
     }
 
@@ -90,7 +90,7 @@ type struct Path {
 
     /// `source`'s byte at `index`, or 0 when out of range. Path syntax never
     /// gives 0 a meaning, so callers can compare it without unwrapping.
-    static byte_or_zero(source: Str, index: u64) -> u8 {
+    static byte_or_zero(source: Str, index: i64) -> u8 {
         match (source.byte_at(index)) {
             Option::Some(byte) => { return byte; }
             Option::None       => { return 0 as u8; }
@@ -107,8 +107,8 @@ type struct Path {
     ///
     /// This is the floor for every traversal here: bytes below it are not a
     /// segment and splitting them would change which volume the path names.
-    static root_len(source: Str) -> u64 {
-        const n: u64 = source.length();
+    static root_len(source: Str) -> i64 {
+        const n: i64 = source.length();
         if (n == 0) { return 0; }
 
         if (!WINDOWS_SYNTAX) {
@@ -121,7 +121,7 @@ type struct Path {
         // so `parent` must not hand it back as if it did.
         if (n >= 2 && Path::is_separator(Path::byte_or_zero(source, 0))
                    && Path::is_separator(Path::byte_or_zero(source, 1))) {
-            mut i: u64 = 2;
+            mut i: i64 = 2;
             // server
             while (i < n && !Path::is_separator(Path::byte_or_zero(source, i))) { i = i + 1; }
             if (i < n) { i = i + 1; }                        // separator after server
@@ -159,7 +159,7 @@ type struct Path {
     /// this toolchain passes around on every target - answering the same way
     /// everywhere.
     static is_absolute_str(source: Str) -> boolean {
-        const n: u64 = source.length();
+        const n: i64 = source.length();
         if (n == 0) { return false; }
 
         if (WINDOWS_SYNTAX && n >= 2
@@ -175,11 +175,11 @@ type struct Path {
     /// from being mistaken for segment breaks. Signed so "none" stays
     /// distinct from "found at `floor`" - both are reachable, and conflating
     /// them is what makes a root look like an ordinary segment.
-    static last_separator(source: Str, floor: u64) -> i64 {
-        mut i: u64 = source.length();
+    static last_separator(source: Str, floor: i64) -> i64 {
+        mut i: i64 = source.length();
         while (i > floor) {
-            const j: u64 = i - 1;
-            if (Path::is_separator(Path::byte_or_zero(source, j))) { return j as i64; }
+            const j: i64 = i - 1;
+            if (Path::is_separator(Path::byte_or_zero(source, j))) { return j; }
             i = j;
         }
         return -1;
@@ -189,10 +189,10 @@ type struct Path {
     /// single path component, not a whole path, so this never has to skip a
     /// root or separators - the caller passes the output of `file_name`.
     static last_dot(name: Str) -> i64 {
-        mut i: u64 = name.length();
+        mut i: i64 = name.length();
         while (i > 0) {
-            const j: u64 = i - 1;
-            if (Path::byte_or_zero(name, j) == DOT) { return j as i64; }
+            const j: i64 = i - 1;
+            if (Path::byte_or_zero(name, j) == DOT) { return j; }
             i = j;
         }
         return -1;
@@ -206,24 +206,24 @@ type struct Path {
     /// Last path segment, or `None` if the path ends with a separator, is
     /// empty, or is nothing but a root. Does not consult the filesystem.
     file_name(&this) -> Option<Str> {
-        const n: u64 = this.inner.length();
-        const root: u64 = Path::root_len(this.inner);
+        const n: i64 = this.inner.length();
+        const root: i64 = Path::root_len(this.inner);
         if (n == 0 || n <= root) { return Option::None; }
 
         const k: i64 = Path::last_separator(this.inner, root);
         // No separator past the root: everything after the root is the name.
         if (k < 0) { return Option::Some(this.inner.sub_bytes(root, n)); }
         // Trailing separator: the path names a directory, not a file.
-        if ((k as u64) == n - 1) { return Option::None; }
-        return Option::Some(this.inner.sub_bytes((k as u64) + 1, n));
+        if (k == n - 1) { return Option::None; }
+        return Option::Some(this.inner.sub_bytes(k + 1, n));
     }
 
     /// Path minus its final segment, or `None` if there is no parent - a
     /// single relative segment, a bare root, or empty. A rooted path whose
     /// last segment is stripped yields the root itself, never "".
     parent(&this) -> Option<Path> {
-        const n: u64 = this.inner.length();
-        const root: u64 = Path::root_len(this.inner);
+        const n: i64 = this.inner.length();
+        const root: i64 = Path::root_len(this.inner);
         if (n == 0 || n <= root) { return Option::None; }
 
         const k: i64 = Path::last_separator(this.inner, root);
@@ -231,7 +231,7 @@ type struct Path {
             // Cutting at the separator keeps the root's trailing separator
             // when the split lands on it, so `/x` yields `/` and `C:\x`
             // yields `C:\` rather than the volume-changing `C:`.
-            return Option::Some(Path { inner: this.inner.sub_bytes(0, k as u64) });
+            return Option::Some(Path { inner: this.inner.sub_bytes(0, k) });
         }
         // No separator past the root. A rooted path falls back to its root;
         // a single relative segment has no parent to give.
@@ -259,7 +259,7 @@ type struct Path {
         match (this.file_name()) {
             Option::None => { return Option::None; }
             Option::Some(name) => {
-                const n: u64 = name.length();
+                const n: i64 = name.length();
                 const dot: i64 = Path::last_dot(name);
                 // No dot, or a dot only at index 0 (dotfile): no extension.
                 if (dot <= 0) { return Option::None; }
@@ -268,7 +268,7 @@ type struct Path {
                            && Path::byte_or_zero(name, 1) == DOT) {
                     return Option::None;
                 }
-                return Option::Some(name.sub_bytes((dot as u64) + 1, n));
+                return Option::Some(name.sub_bytes(dot + 1, n));
             }
         }
     }
@@ -306,7 +306,7 @@ type struct PathBuf<A = GlobalAlloc> {
     }
 
     ![inline]
-    length(&this) -> u64 {
+    length(&this) -> i64 {
         return this.inner.length();
     }
 
@@ -346,7 +346,7 @@ type struct PathBuf<A = GlobalAlloc> {
                 // `this.inner = String::from_str(parent.as_str())`
                 // here would allocate a fresh buffer and silently leak
                 // this one, since the overwrite skips `inner.drop()`.
-                const new_len: u64 = parent.length();
+                const new_len: i64 = parent.length();
                 this.inner.truncate(new_len);
                 return true;
             }

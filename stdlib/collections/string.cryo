@@ -40,11 +40,11 @@ import std::fmt::error;
 import std::fmt::error::{ FmtError };
 import std::ffi::libc;
 
-const INITIAL_CAPACITY: u64 = 8;
+const INITIAL_CAPACITY: i64 = 8;
 
 type struct String<A = GlobalAlloc> {
     buffer: RawBuffer<u8, A>;
-    private length: u64;
+    private length: i64;
 
     /// Empty string. No heap storage until the first `push_*` /
     /// `reserve`.
@@ -62,9 +62,9 @@ type struct String<A = GlobalAlloc> {
         };
     }
 
-    /// Preallocate room for `capacity` bytes. Panics on allocation
-    /// failure.
-    static with_capacity(capacity: u64) -> String {
+    /// Preallocate room for `capacity` bytes; a `capacity` of zero or
+    /// less allocates nothing. Panics on allocation failure.
+    static with_capacity(capacity: i64) -> String {
         match (String::try_with_capacity_in(capacity, GlobalAlloc::new())) {
             Result::Ok(string) => { return string; }
             Result::Err(_) => {
@@ -73,14 +73,11 @@ type struct String<A = GlobalAlloc> {
         }
     }
 
-    static try_with_capacity_in(capacity: u64, alloc: A) -> Result<String<A>, AllocError> {
+    static try_with_capacity_in(capacity: i64, alloc: A) -> Result<String<A>, AllocError> {
         mut string: String<A> = String::<A> {
             buffer: RawBuffer::new_in(alloc),
             length: 0
         };
-        if (capacity == 0) {
-            return Result::Ok(string);
-        }
         string.buffer.reserve_exact(0, capacity)?;
         return Result::Ok(string);
     }
@@ -199,12 +196,12 @@ type struct String<A = GlobalAlloc> {
     }
 
     ![inline]
-    length(&this) -> u64 {
+    length(&this) -> i64 {
         return this.length;
     }
 
     ![inline]
-    capacity(&this) -> u64 {
+    capacity(&this) -> i64 {
         return this.buffer.capacity();
     }
 
@@ -276,7 +273,7 @@ type struct String<A = GlobalAlloc> {
         return this.as_str().ends_with(suffix);
     }
 
-    find(&this, needle: &Str) -> Option<u64> {
+    find(&this, needle: &Str) -> Option<i64> {
         return this.as_str().find(needle);
     }
 
@@ -342,17 +339,23 @@ type struct String<A = GlobalAlloc> {
     ///
     /// `new_length > this.length` is a no-op, matching the "losing
     /// data is a caller bug" shape of `clear` and `shrink_to_fit`.
-    truncate(mut &this, new_length: u64) -> void {
+    /// A negative `new_length` panics.
+    truncate(mut &this, new_length: i64) -> void {
+        if (new_length < 0) {
+            core::panic("String::truncate: negative length", intrinsics::location());
+        }
         if (new_length < this.length) {
             this.length = new_length;
         }
     }
 
-    reserve(mut &this, additional: u64) -> Result<(), AllocError> {
+    /// Room for at least `additional` more bytes; zero or less is a no-op.
+    reserve(mut &this, additional: i64) -> Result<(), AllocError> {
         return this.buffer.reserve(this.length, additional, INITIAL_CAPACITY);
     }
 
-    reserve_exact(mut &this, additional: u64) -> Result<(), AllocError> {
+    /// Room for exactly `additional` more bytes; zero or less is a no-op.
+    reserve_exact(mut &this, additional: i64) -> Result<(), AllocError> {
         return this.buffer.reserve_exact(this.length, additional);
     }
 
@@ -364,7 +367,7 @@ private:
     /// Append the bytes of a `Str` view verbatim (backs the `Str` / `string`
     /// arms of `try_push`).  Empty input is a no-op.
     push_view_bytes(mut &this, source: Str) -> Result<(), AllocError> {
-        const add: u64 = source.length();
+        const add: i64 = source.length();
         if (add == 0) {
             return Result::Ok(());
         }
@@ -372,7 +375,7 @@ private:
         libc::memcpy(
             (this.buffer.ptr() + this.length) as void*,
             source.as_ptr() as void*,
-            add
+            add as u64
         );
         this.length = this.length + add;
         return Result::Ok(());

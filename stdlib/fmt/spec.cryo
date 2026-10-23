@@ -62,9 +62,9 @@ type struct FmtSpec {
     align:         u8;       // ALIGN_*
     alternate:     boolean;  // '#' - radix prefix
     zero_pad:      boolean;  // '0' - sign-aware zero fill
-    width:         u64;      // minimum field width, in scalars
+    width:         i64;      // minimum field width, in scalars
     has_precision: boolean;
-    precision:     u64;
+    precision:     i64;
     radix:         u8;       // RADIX_*
 
     static empty() -> FmtSpec {
@@ -93,9 +93,9 @@ function align_of_byte(b: u8) -> u8 {
 /// walks it without re-checking; an unexpected byte is simply ignored.
 function fmt_parse_spec(spec: Str) -> FmtSpec {
     mut s: FmtSpec = FmtSpec::empty();
-    const n: u64 = spec.length();
+    const n: i64 = spec.length();
     const bytes: u8* = spec.as_ptr();
-    mut i: u64 = 0;
+    mut i: i64 = 0;
 
     // [fill]align  |  align
     if (n >= 2 && is_align_byte(bytes[1])) {
@@ -121,7 +121,7 @@ function fmt_parse_spec(spec: Str) -> FmtSpec {
 
     // width digits
     while (i < n && bytes[i] >= 0x30 && bytes[i] <= 0x39) {
-        s.width = s.width * 10 + ((bytes[i] - 0x30) as u64);
+        s.width = s.width * 10 + ((bytes[i] - 0x30) as i64);
         i = i + 1;
     }
 
@@ -131,7 +131,7 @@ function fmt_parse_spec(spec: Str) -> FmtSpec {
         s.has_precision = true;
         s.precision = 0;
         while (i < n && bytes[i] >= 0x30 && bytes[i] <= 0x39) {
-            s.precision = s.precision * 10 + ((bytes[i] - 0x30) as u64);
+            s.precision = s.precision * 10 + ((bytes[i] - 0x30) as i64);
             i = i + 1;
         }
     }
@@ -155,8 +155,8 @@ function fmt_parse_spec(spec: Str) -> FmtSpec {
 // ----------------------------------------------------------------------
 
 /// Uppercase the ASCII hex letters `a`-`f` in `buf[0, len)` in place.
-function ascii_hex_upper(buf: u8*, len: u64) -> void {
-    mut i: u64 = 0;
+function ascii_hex_upper(buf: u8*, len: i64) -> void {
+    mut i: i64 = 0;
     while (i < len) {
         if (buf[i] >= 0x61 && buf[i] <= 0x66) { buf[i] = buf[i] - 0x20; }
         i = i + 1;
@@ -177,18 +177,21 @@ function radix_prefix(spec: &FmtSpec) -> Str {
 /// Render the magnitude `val` in the spec's radix into a `String`.
 function radix_digits(val: u64, spec: &FmtSpec) -> String {
     mut buffer: [u8; 64];
-    mut digits: u64 = 0;
+    mut written: u64 = 0;
     if (spec.radix == RADIX_HEX_LOWER) {
-        digits = val.to_hex_buf(&buffer[0]);
+        written = val.to_hex_buf(&buffer[0]);
     } else if (spec.radix == RADIX_HEX_UPPER) {
-        digits = val.to_hex_buf(&buffer[0]);
-        ascii_hex_upper(&buffer[0], digits);
+        written = val.to_hex_buf(&buffer[0]);
     } else if (spec.radix == RADIX_OCT) {
-        digits = val.to_oct_buf(&buffer[0]);
+        written = val.to_oct_buf(&buffer[0]);
     } else if (spec.radix == RADIX_BIN) {
-        digits = val.to_bin_buf(&buffer[0]);
+        written = val.to_bin_buf(&buffer[0]);
     } else {
-        digits = val.to_decimal_buf(&buffer[0]);
+        written = val.to_decimal_buf(&buffer[0]);
+    }
+    const digits: i64 = written as i64;
+    if (spec.radix == RADIX_HEX_UPPER) {
+        ascii_hex_upper(&buffer[0], digits);
     }
     mut out: String = String::new();
     out.push(Str::from_raw(&buffer[0], digits));
@@ -199,7 +202,7 @@ function radix_digits(val: u64, spec: &FmtSpec) -> String {
 /// (out-param via the returned struct) is the prefix length.
 function fmt_uint_body(val: u64, spec: &FmtSpec) -> BodyText {
     mut out: String = String::new();
-    mut head: u64 = 0;
+    mut head: i64 = 0;
     const prefix: Str = radix_prefix(spec);
     if (spec.radix != RADIX_NONE) {
         out.push(prefix);
@@ -219,7 +222,7 @@ function fmt_sint_body(val: i64, masked: u64, spec: &FmtSpec) -> BodyText {
         return fmt_uint_body(masked, spec);
     }
     mut out: String = String::new();
-    mut head: u64 = 0;
+    mut head: i64 = 0;
     mut magnitude: u64 = val as u64;
     if (val < 0) {
         out.push_byte(0x2D);   // '-'
@@ -229,7 +232,7 @@ function fmt_sint_body(val: i64, masked: u64, spec: &FmtSpec) -> BodyText {
         magnitude = (0 - val) as u64;
     }
     mut buffer: [u8; 20];
-    const digits: u64 = magnitude.to_decimal_buf(&buffer[0]);
+    const digits: i64 = magnitude.to_decimal_buf(&buffer[0]) as i64;
     out.push(Str::from_raw(&buffer[0], digits));
     return BodyText { text: out, head_len: head };
 }
@@ -241,7 +244,7 @@ function fmt_float_body(val: f64, spec: &FmtSpec) -> BodyText {
     mut out: String = String::new();
     if (spec.has_precision) {
         mut buffer: [u8; 64];
-        const written: u64 = val.to_buf_with(&buffer[0], spec.precision);
+        const written: i64 = val.to_buf_with(&buffer[0], spec.precision as u64) as i64;
         out.push(Str::from_raw(&buffer[0], written));
     } else {
         match (format_to_string::<f64>(&val)) {
@@ -249,7 +252,7 @@ function fmt_float_body(val: f64, spec: &FmtSpec) -> BodyText {
             Result::Err(_) => { }
         }
     }
-    mut head: u64 = 0;
+    mut head: i64 = 0;
     if (out.length() > 0 && out.as_str().byte_at(0).unwrap_or(0) == 0x2D) { head = 1; }
     return BodyText { text: out, head_len: head };
 }
@@ -279,7 +282,7 @@ where T: Display {
 /// sign/radix-prefix run (bytes that a `0` flag must keep leftmost).
 type struct BodyText {
     text:     String;
-    head_len: u64;
+    head_len: i64;
 }
 
 implement trait Drop for struct BodyText {
@@ -288,9 +291,9 @@ implement trait Drop for struct BodyText {
 
 /// Truncate `s` to at most `n` Unicode scalars, returning a borrowed
 /// prefix.
-function truncate_scalars(s: Str, n: u64) -> Str {
-    mut seen: u64 = 0;
-    mut ci: implement Iterator<Pair<u64, u32>> = s.char_indices();
+function truncate_scalars(s: Str, n: i64) -> Str {
+    mut seen: i64 = 0;
+    mut ci: implement Iterator<Pair<i64, u32>> = s.char_indices();
     loop {
         match (ci.next()) {
             Option::Some(p) => {
@@ -305,9 +308,9 @@ function truncate_scalars(s: Str, n: u64) -> Str {
 }
 
 /// Count the Unicode scalars in `s`.
-function scalar_count(s: Str) -> u64 {
+function scalar_count(s: Str) -> i64 {
     mut it: implement Iterator<u32> = s.chars();
-    mut n: u64 = 0;
+    mut n: i64 = 0;
     loop {
         match (it.next()) {
             Option::Some(_) => { n = n + 1; }
@@ -318,12 +321,12 @@ function scalar_count(s: Str) -> u64 {
 }
 
 /// Append the UTF-8 encoding of scalar `c` to `out` `count` times.
-function push_fill(out: mut &String, c: u32, count: u64) -> void {
+function push_fill(out: mut &String, c: u32, count: i64) -> void {
     mut buffer: [u8; 4];
-    const width: u64 = encode_utf8(c, &buffer[0]);
-    mut i: u64 = 0;
+    const width: i64 = encode_utf8(c, &buffer[0]);
+    mut i: i64 = 0;
     while (i < count) {
-        mut b: u64 = 0;
+        mut b: i64 = 0;
         while (b < width) {
             out.push_byte(buffer[b]);
             b = b + 1;
@@ -334,13 +337,13 @@ function push_fill(out: mut &String, c: u32, count: u64) -> void {
 
 /// Pad `body` to the spec's field width and append it to `out`. `head_len`
 /// is the leading sign/prefix run for sign-aware zero-fill.
-function fmt_pad(out: mut &String, body: Str, head_len: u64, spec: &FmtSpec) -> void {
-    const count: u64 = scalar_count(body);
+function fmt_pad(out: mut &String, body: Str, head_len: i64, spec: &FmtSpec) -> void {
+    const count: i64 = scalar_count(body);
     if (count >= spec.width) {
         out.push(body);
         return;
     }
-    const padn: u64 = spec.width - count;
+    const padn: i64 = spec.width - count;
 
     // Resolve alignment and fill, honouring the `0` flag when no explicit
     // alignment was given.
@@ -357,7 +360,7 @@ function fmt_pad(out: mut &String, body: Str, head_len: u64, spec: &FmtSpec) -> 
         return;
     }
     if (align == ALIGN_CENTER) {
-        const left: u64 = padn / 2;
+        const left: i64 = padn / 2;
         push_fill(out, fill, left);
         out.push(body);
         push_fill(out, fill, padn - left);

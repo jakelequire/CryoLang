@@ -35,20 +35,20 @@ import std::ffi::libc;
 
 type struct Str {
     bytes: u8*;
-    private length: u64;
+    private length: i64;
 
-    /// Construct from a NUL-terminated C-style string literal. 
+    /// Construct from a NUL-terminated C-style string literal.
     /// The caller certifies that `text` is valid UTF-8 and outlives this view. The
     /// NUL terminator is not included in the view.
     ![implicit]
     static new(text: string) -> Str {
-        return Str { bytes: text as u8*, length: libc::strlen(text) };
+        return Str { bytes: text as u8*, length: libc::strlen(text) as i64 };
     }
 
     /// Construct from a raw pointer + length. The caller certifies that
     /// `[bytes, bytes + length)` is initialized UTF-8 and outlives this
-    /// view.
-    static from_raw(bytes: u8*, length: u64) -> Str {
+    /// view, and that `length` is not negative.
+    static from_raw(bytes: u8*, length: i64) -> Str {
         return Str { bytes: bytes, length: length };
     }
 
@@ -63,14 +63,14 @@ type struct Str {
     /// `new` remains the implicit `string` -> `Str` conversion.
     static from<T>(src: T) -> Str {
         return static match (T) {
-            string    => { Str { bytes: src as u8*, length: libc::strlen(src) } }
+            string    => { Str { bytes: src as u8*, length: libc::strlen(src) as i64 } }
             Slice<u8> => { Str { bytes: src.as_ptr(), length: src.length() } }
         };
     }
 
     /// Byte length. For a UTF-8 string, `length() >= char_count`.
     ![inline]
-    length(&this) -> u64 {
+    length(&this) -> i64 {
         return this.length;
     }
 
@@ -89,20 +89,21 @@ type struct Str {
         return this.bytes;
     }
 
-    /// Bounds-checked byte lookup. For scalar iteration, use
-    /// `as_bytes()` with a UTF-8 decoder.
-    byte_at(&this, index: u64) -> Option<u8> {
-        if (index >= this.length) {
+    /// Bounds-checked byte lookup; `None` for an index outside
+    /// `[0, length)`, a negative one included. For scalar iteration, use
+    /// `chars()`.
+    byte_at(&this, index: i64) -> Option<u8> {
+        if (index < 0 || index >= this.length) {
             return Option::None;
         }
         return Option::Some(this.bytes[index]);
     }
 
-    /// `[start, end)` byte sub-slice. Panics if the range is out of
-    /// bounds or if `start > end`. **Not UTF-8-aware**; splitting
+    /// `[start, end)` byte sub-slice. Panics if `start` is negative, if
+    /// `start > end`, or if `end > length`. **Not UTF-8-aware**; splitting
     /// inside a multi-byte scalar is the caller's responsibility.
-    sub_bytes(&this, start: u64, end: u64) -> Str {
-        if (start > end || end > this.length) {
+    sub_bytes(&this, start: i64, end: i64) -> Str {
+        if (start < 0 || start > end || end > this.length) {
             core::panic("Str::sub_bytes: out of range", intrinsics::location());
         }
         return Str {
@@ -117,7 +118,7 @@ type struct Str {
     /// can byte-scan manually, but most callers want this method.
     to_ascii_lowercase(&this) -> String {
         mut out: String = String::with_capacity(this.length);
-        mut i: u64 = 0;
+        mut i: i64 = 0;
         while (i < this.length) {
             match (this.byte_at(i)) {
                 Option::Some(byte) => {
@@ -134,36 +135,36 @@ type struct Str {
 
     /// True if this string begins with `prefix` (byte-wise).
     starts_with(&this, prefix: &Str) -> boolean {
-        const pl: u64 = prefix.length();
+        const pl: i64 = prefix.length();
         if (pl > this.length) { return false; }
         if (pl == 0) { return true; }
         return libc::memcmp(
-            this.bytes as void*, prefix.bytes as void*, pl) == 0;
+            this.bytes as void*, prefix.bytes as void*, pl as u64) == 0;
     }
 
     /// True if this string ends with `suffix` (byte-wise).
     ends_with(&this, suffix: &Str) -> boolean {
-        const sl: u64 = suffix.length();
+        const sl: i64 = suffix.length();
         if (sl > this.length) { return false; }
         if (sl == 0) { return true; }
         return libc::memcmp(
             (this.bytes + (this.length - sl)) as void*,
-            suffix.bytes as void*, sl) == 0;
+            suffix.bytes as void*, sl as u64) == 0;
     }
 
     /// Byte index of the first occurrence of `needle`, or `None`.
     /// An empty needle matches at index 0. O(n*m) naive scan; inputs in
     /// practice are short. **Not UTF-8-aware** (matches on bytes).
-    find(&this, needle: &Str) -> Option<u64> {
-        const nl: u64 = needle.length();
+    find(&this, needle: &Str) -> Option<i64> {
+        const nl: i64 = needle.length();
         if (nl == 0) { return Option::Some(0); }
         if (nl > this.length) { return Option::None; }
-        mut i: u64 = 0;
-        const stop: u64 = this.length - nl;
+        mut i: i64 = 0;
+        const stop: i64 = this.length - nl;
         while (i <= stop) {
             if (libc::memcmp(
                     (this.bytes + i) as void*,
-                    needle.bytes as void*, nl) == 0) {
+                    needle.bytes as void*, nl as u64) == 0) {
                 return Option::Some(i);
             }
             i = i + 1;
@@ -181,7 +182,7 @@ type struct Str {
 
     /// Borrowed sub-slice with leading ASCII whitespace removed.
     trim_start(&this) -> Str {
-        mut start: u64 = 0;
+        mut start: i64 = 0;
         while (start < this.length && is_ascii_ws(this.bytes[start])) {
             start = start + 1;
         }
@@ -190,7 +191,7 @@ type struct Str {
 
     /// Borrowed sub-slice with trailing ASCII whitespace removed.
     trim_end(&this) -> Str {
-        mut end: u64 = this.length;
+        mut end: i64 = this.length;
         while (end > 0 && is_ascii_ws(this.bytes[end - 1])) {
             end = end - 1;
         }
@@ -208,7 +209,7 @@ type struct Str {
     /// `to_ascii_lowercase`.
     to_ascii_uppercase(&this) -> String {
         mut out: String = String::with_capacity(this.length);
-        mut i: u64 = 0;
+        mut i: i64 = 0;
         while (i < this.length) {
             mut b: u8 = this.bytes[i];
             if (b >= 0x61 && b <= 0x7A) { b = b - 32; }
@@ -250,10 +251,10 @@ type struct Str {
 
     /// Iterator over `(byte_offset, scalar)` pairs: the same scalars as
     /// `chars`, each paired with the byte index at which it begins. The
-    /// pair is `Pair<u64, u32>` (`p.first` is the byte offset, `p.second`
+    /// pair is `Pair<i64, u32>` (`p.first` is the byte offset, `p.second`
     /// the scalar). Byte offsets are into this view's bytes, so a
     /// four-byte scalar advances the next offset by four.
-    char_indices(&this) -> implement Iterator<Pair<u64, u32>> {
+    char_indices(&this) -> implement Iterator<Pair<i64, u32>> {
         return CharIndices { bytes: this.bytes, length: this.length, pos: 0 };
     }
 
@@ -265,7 +266,7 @@ type struct Str {
             return Result::Err(ConversionError::new("hex overflow (>16 digits)"));
         }
         mut value: u64 = 0;
-        mut i: u64 = 0;
+        mut i: i64 = 0;
         while (i < this.length()) {
             match (this.byte_at(i)) {
                 Option::Some(byte) => {
@@ -306,10 +307,10 @@ function is_ascii_ws(b: u8) -> boolean {
 /// returns.
 type struct SplitIter {
     bytes:      u8*;
-    length:     u64;
+    length:     i64;
     sep_bytes:  u8*;
-    sep_length: u64;
-    pos:        u64;
+    sep_length: i64;
+    pos:        i64;
     done:       boolean;
 }
 
@@ -322,12 +323,12 @@ implement trait Iterator<Str> for struct SplitIter {
             return Option::Some(Str { bytes: this.bytes, length: this.length });
         }
         if (this.sep_length <= this.length) {
-            const stop: u64 = this.length - this.sep_length;
-            mut i: u64 = this.pos;
+            const stop: i64 = this.length - this.sep_length;
+            mut i: i64 = this.pos;
             while (i <= stop) {
                 if (libc::memcmp(
                         (this.bytes + i) as void*,
-                        this.sep_bytes as void*, this.sep_length) == 0) {
+                        this.sep_bytes as void*, this.sep_length as u64) == 0) {
                     const piece: Str = Str {
                         bytes: this.bytes + this.pos, length: i - this.pos
                     };
@@ -356,18 +357,18 @@ const REPLACEMENT_SCALAR: u32 = 0xFFFD;
 /// that advance by it can never stall). Lenient per the `Str::chars`
 /// contract: any malformed sequence decodes to U+FFFD consuming exactly
 /// one byte. Precondition: `pos < length`.
-function decode_scalar(bytes: u8*, length: u64, pos: u64) -> Pair<u32, u64> {
+function decode_scalar(bytes: u8*, length: i64, pos: i64) -> Pair<u32, i64> {
     const lead: u8 = bytes[pos];
 
     // ASCII fast path: one byte, value is the scalar.
     if (lead < 0x80) {
-        return Pair::<u32, u64> { first: lead as u32, second: 1 };
+        return Pair::<u32, i64> { first: lead as u32, second: 1 };
     }
 
     // Continuation count and initial scalar bits from the lead byte's
     // high prefix. `min` is the smallest scalar this length may legally
     // encode; a decoded value below it is an overlong form.
-    mut needed: u64 = 0;
+    mut needed: i64 = 0;
     mut scalar: u32 = 0;
     mut min: u32 = 0;
     if ((lead & 0xE0) == 0xC0) {
@@ -378,19 +379,19 @@ function decode_scalar(bytes: u8*, length: u64, pos: u64) -> Pair<u32, u64> {
         needed = 3; scalar = (lead & 0x07) as u32; min = 0x10000;
     } else {
         // 10xxxxxx orphan continuation, or 11111xxx out of range.
-        return Pair::<u32, u64> { first: REPLACEMENT_SCALAR, second: 1 };
+        return Pair::<u32, i64> { first: REPLACEMENT_SCALAR, second: 1 };
     }
 
     // The continuation bytes must all be present within the view.
     if (pos + 1 + needed > length) {
-        return Pair::<u32, u64> { first: REPLACEMENT_SCALAR, second: 1 };
+        return Pair::<u32, i64> { first: REPLACEMENT_SCALAR, second: 1 };
     }
 
-    mut i: u64 = 1;
+    mut i: i64 = 1;
     while (i <= needed) {
         const b: u8 = bytes[pos + i];
         if ((b & 0xC0) != 0x80) {
-            return Pair::<u32, u64> { first: REPLACEMENT_SCALAR, second: 1 };
+            return Pair::<u32, i64> { first: REPLACEMENT_SCALAR, second: 1 };
         }
         scalar = (scalar << 6) | ((b & 0x3F) as u32);
         i = i + 1;
@@ -399,16 +400,16 @@ function decode_scalar(bytes: u8*, length: u64, pos: u64) -> Pair<u32, u64> {
     // Reject overlong encodings, surrogate halves, and values above the
     // Unicode range - each is malformed UTF-8.
     if (scalar < min) {
-        return Pair::<u32, u64> { first: REPLACEMENT_SCALAR, second: 1 };
+        return Pair::<u32, i64> { first: REPLACEMENT_SCALAR, second: 1 };
     }
     if (scalar >= 0xD800 && scalar <= 0xDFFF) {
-        return Pair::<u32, u64> { first: REPLACEMENT_SCALAR, second: 1 };
+        return Pair::<u32, i64> { first: REPLACEMENT_SCALAR, second: 1 };
     }
     if (scalar > char::MAX as u32) {
-        return Pair::<u32, u64> { first: REPLACEMENT_SCALAR, second: 1 };
+        return Pair::<u32, i64> { first: REPLACEMENT_SCALAR, second: 1 };
     }
 
-    return Pair::<u32, u64> { first: scalar, second: 1 + needed };
+    return Pair::<u32, i64> { first: scalar, second: 1 + needed };
 }
 
 /// Lazy UTF-8 scalar iterator over a `Str`; see `Str::chars`. Borrows
@@ -420,14 +421,14 @@ function decode_scalar(bytes: u8*, length: u64, pos: u64) -> Pair<u32, u64> {
 /// `Str::chars` returns.
 type struct Chars {
     bytes:  u8*;
-    length: u64;
-    pos:    u64;
+    length: i64;
+    pos:    i64;
 }
 
 implement trait Iterator<u32> for struct Chars {
     next(mut &this) -> Option<u32> {
         if (this.pos >= this.length) { return Option::None; }
-        const step: Pair<u32, u64> = decode_scalar(this.bytes, this.length, this.pos);
+        const step: Pair<u32, i64> = decode_scalar(this.bytes, this.length, this.pos);
         this.pos = this.pos + step.second;
         return Option::Some(step.first);
     }
@@ -438,17 +439,17 @@ implement trait Iterator<u32> for struct Chars {
 /// same cross-module reason as `Chars`.
 type struct CharIndices {
     bytes:  u8*;
-    length: u64;
-    pos:    u64;
+    length: i64;
+    pos:    i64;
 }
 
-implement trait Iterator<Pair<u64, u32>> for struct CharIndices {
-    next(mut &this) -> Option<Pair<u64, u32>> {
+implement trait Iterator<Pair<i64, u32>> for struct CharIndices {
+    next(mut &this) -> Option<Pair<i64, u32>> {
         if (this.pos >= this.length) { return Option::None; }
-        const start: u64 = this.pos;
-        const step: Pair<u32, u64> = decode_scalar(this.bytes, this.length, this.pos);
+        const start: i64 = this.pos;
+        const step: Pair<u32, i64> = decode_scalar(this.bytes, this.length, this.pos);
         this.pos = this.pos + step.second;
-        return Option::Some(Pair::<u64, u32> { first: start, second: step.first });
+        return Option::Some(Pair::<i64, u32> { first: start, second: step.first });
     }
 }
 
@@ -465,7 +466,7 @@ implement trait Eq for struct Str {
         return libc::memcmp(
             this.bytes as void*,
             other.bytes as void*,
-            this.length
+            this.length as u64
         ) == 0;
     }
 }
@@ -485,9 +486,9 @@ implement trait Hash for struct Str {
 /// so `Str` is a valid `Ord` key and `Array<Str>::sort()` works.
 implement trait Ord for struct Str {
     compare(&this, other: &Str) -> Ordering {
-        mut min_len: u64 = this.length;
+        mut min_len: i64 = this.length;
         if (other.length() < min_len) { min_len = other.length(); }
-        mut i: u64 = 0;
+        mut i: i64 = 0;
         while (i < min_len) {
             const ca: u8 = this.bytes[i];
             const cb: u8 = other.bytes[i];
@@ -518,7 +519,7 @@ implement trait TryFrom<Str> for u64 {
             return Result::Err(ConversionError::new("empty input"));
         }
         mut value: u64 = 0;
-        mut i: u64 = 0;
+        mut i: i64 = 0;
         while (i < source.length()) {
             match (source.byte_at(i)) {
                 Option::Some(byte) => {
@@ -593,7 +594,7 @@ implement trait TryFrom<Str> for i64 {
             return Result::Err(ConversionError::new("empty input"));
         }
         mut negative: boolean = false;
-        mut start: u64 = 0;
+        mut start: i64 = 0;
         match (source.byte_at(0)) {
             Option::Some(byte) => {
                 if (byte == 0x2D) { // '-'

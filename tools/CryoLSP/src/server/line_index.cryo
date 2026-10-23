@@ -30,19 +30,19 @@ import lsp::protocol::lsp;
 type struct LineIndex {
     /// Total length of the indexed text, in bytes.  Cached so callers
     /// can clamp out-of-range positions without a separate length read.
-    text_length: u64;
+    text_length: i64;
     /// Byte offset of the start of each line.  Always at least one
     /// entry (offset 0); a trailing newline produces an extra entry
     /// for the empty last line.
-    line_starts: Array<u64>;
+    line_starts: Array<i64>;
 
     static build(text: str::Str) -> LineIndex {
-        const len: u64 = text.length();
-        mut starts: Array<u64> = Array::<u64>::with_capacity(64);
-        starts.push(0 as u64);
+        const len: i64 = text.length();
+        mut starts: Array<i64> = Array::<i64>::with_capacity(64);
+        starts.push(0);
 
         const ptr: u8* = text.as_ptr();
-        mut i: u64 = 0;
+        mut i: i64 = 0;
         while (i < len) {
             const b: u8 = ptr[i];
             if (b == 10) {
@@ -62,16 +62,16 @@ type struct LineIndex {
         };
     }
 
-    line_count(&this) -> u64 {
-        return this.line_starts.length() as u64;
+    line_count(&this) -> i64 {
+        return this.line_starts.length();
     }
 
     /// Byte offset of the start of `line`.  Out-of-range lines clamp
     /// to text_length so callers building substrings get an empty
     /// slice rather than a panic.
-    line_start(&this, line: u32) -> u64 {
-        const idx: u64 = line as u64;
-        if (idx >= (this.line_starts.length() as u64)) {
+    line_start(&this, line: u32) -> i64 {
+        const idx: i64 = line as i64;
+        if (idx >= this.line_starts.length()) {
             return this.text_length;
         }
         match (this.line_starts.get(idx)) {
@@ -82,9 +82,9 @@ type struct LineIndex {
 
     /// Byte offset of the END of `line` (exclusive - i.e. start of the
     /// next line, or text_length for the last line).
-    line_end(&this, line: u32) -> u64 {
-        const next: u64 = (line as u64) + 1;
-        if (next >= (this.line_starts.length() as u64)) {
+    line_end(&this, line: u32) -> i64 {
+        const next: i64 = (line as i64) + 1;
+        if (next >= this.line_starts.length()) {
             return this.text_length;
         }
         match (this.line_starts.get(next)) {
@@ -96,19 +96,19 @@ type struct LineIndex {
     /// Convert byte offset -> (line, byte column within the line).  Binary
     /// search over the line-start table; O(log N) in the line count.  The
     /// column is in bytes: `Docs::position_of_byte` makes it a wire column.
-    position_of(&this, byte_offset: u64) -> lsp::Position {
-        const n: u64 = this.line_starts.length() as u64;
+    position_of(&this, byte_offset: i64) -> lsp::Position {
+        const n: i64 = this.line_starts.length();
         if (n == 0) {
             return lsp::Position::new(0 as u32, 0 as u32);
         }
         // Find the largest index `lo` with line_starts[lo] <= byte_offset.
-        mut lo: u64 = 0;
-        mut hi: u64 = n;                                   // exclusive
+        mut lo: i64 = 0;
+        mut hi: i64 = n;                                   // exclusive
         while (lo + 1 < hi) {
-            const mid: u64 = (lo + hi) / 2;
-            const v: u64 = match (this.line_starts.get(mid)) {
+            const mid: i64 = (lo + hi) / 2;
+            const v: i64 = match (this.line_starts.get(mid)) {
                 Option::Some(x) => { x }
-                Option::None    => { 0 as u64 }
+                Option::None    => { 0 }
             };
             if (v <= byte_offset) {
                 lo = mid;
@@ -116,11 +116,11 @@ type struct LineIndex {
                 hi = mid;
             }
         }
-        const start: u64 = match (this.line_starts.get(lo)) {
+        const start: i64 = match (this.line_starts.get(lo)) {
             Option::Some(x) => { x }
-            Option::None    => { 0 as u64 }
+            Option::None    => { 0 }
         };
-        const ch: u64 = byte_offset - start;
+        const ch: i64 = byte_offset - start;
         return lsp::Position::new(lo as u32, ch as u32);
     }
 }
@@ -136,7 +136,7 @@ type struct Columns {
 
     /// Bytes in the UTF-8 sequence starting with `lead`.  A stray
     /// continuation byte counts as one, so malformed text still advances.
-    static seq_bytes(lead: u8) -> u64 {
+    static seq_bytes(lead: u8) -> i64 {
         if (lead < 0x80) { return 1; }
         if (lead >= 0xF0) { return 4; }
         if (lead >= 0xE0) { return 3; }
@@ -146,7 +146,7 @@ type struct Columns {
 
     /// Wire units of the sequence starting with `lead`: its bytes under
     /// `utf-8`, otherwise UTF-16 code units (two for a 4-byte sequence).
-    static seq_units(lead: u8, utf8: boolean) -> u64 {
+    static seq_units(lead: u8, utf8: boolean) -> i64 {
         if (utf8) { return Columns::seq_bytes(lead); }
         if (lead >= 0xF0) { return 2; }
         return 1;
@@ -155,14 +155,14 @@ type struct Columns {
     /// Byte offset of wire column `character`.  A column inside a
     /// character (half of a surrogate pair) lands on that character's start;
     /// a column past the end lands on the end.
-    static wire_to_byte(line: str::Str, character: u32, utf8: boolean) -> u64 {
+    static wire_to_byte(line: str::Str, character: u32, utf8: boolean) -> i64 {
         const p: u8* = line.as_ptr();
-        const len: u64 = line.length();
-        mut i: u64 = 0;
-        mut units: u64 = 0;
+        const len: i64 = line.length();
+        mut i: i64 = 0;
+        mut units: i64 = 0;
         while (i < len) {
-            const u: u64 = Columns::seq_units(p[i], utf8);
-            if (units + u > (character as u64)) { return i; }
+            const u: i64 = Columns::seq_units(p[i], utf8);
+            if (units + u > (character as i64)) { return i; }
             units = units + u;
             i = i + Columns::seq_bytes(p[i]);
         }
@@ -170,11 +170,11 @@ type struct Columns {
     }
 
     /// Wire column of byte offset `byte_col`.
-    static byte_to_wire(line: str::Str, byte_col: u64, utf8: boolean) -> u32 {
+    static byte_to_wire(line: str::Str, byte_col: i64, utf8: boolean) -> u32 {
         const p: u8* = line.as_ptr();
-        const len: u64 = line.length();
-        mut i: u64 = 0;
-        mut units: u64 = 0;
+        const len: i64 = line.length();
+        mut i: i64 = 0;
+        mut units: i64 = 0;
         while (i < len && i < byte_col) {
             units = units + Columns::seq_units(p[i], utf8);
             i = i + Columns::seq_bytes(p[i]);
@@ -184,14 +184,14 @@ type struct Columns {
 
     /// Byte offset of the compiler's 1-based column `col`.  A column inside
     /// a tab's expansion lands on the tab.
-    static compiler_to_byte(line: str::Str, col: u32) -> u64 {
+    static compiler_to_byte(line: str::Str, col: u32) -> i64 {
         const p: u8* = line.as_ptr();
-        const len: u64 = line.length();
-        mut i: u64 = 0;
-        mut c: u64 = 1;
+        const len: i64 = line.length();
+        mut i: i64 = 0;
+        mut c: i64 = 1;
         while (i < len) {
-            const next: u64 = Columns::compiler_advance(c, p[i]);
-            if (next > (col as u64)) { return i; }
+            const next: i64 = Columns::compiler_advance(c, p[i]);
+            if (next > (col as i64)) { return i; }
             c = next;
             i = i + 1;
         }
@@ -199,11 +199,11 @@ type struct Columns {
     }
 
     /// The compiler's 1-based column of byte offset `byte_col`.
-    static byte_to_compiler(line: str::Str, byte_col: u64) -> u32 {
+    static byte_to_compiler(line: str::Str, byte_col: i64) -> u32 {
         const p: u8* = line.as_ptr();
-        const len: u64 = line.length();
-        mut i: u64 = 0;
-        mut c: u64 = 1;
+        const len: i64 = line.length();
+        mut i: i64 = 0;
+        mut c: i64 = 1;
         while (i < len && i < byte_col) {
             c = Columns::compiler_advance(c, p[i]);
             i = i + 1;
@@ -211,15 +211,15 @@ type struct Columns {
         return c as u32;
     }
 
-    static compiler_advance(col: u64, b: u8) -> u64 {
+    static compiler_advance(col: i64, b: u8) -> i64 {
         if (b == 9) { return ((col - 1) / 4 + 1) * 4 + 1; }
         return col + 1;
     }
 
     /// The text of 0-based `line` in `text`, without its terminator.
     static line_of(text: str::Str, index: &LineIndex, line: u32) -> str::Str {
-        const start: u64 = index.line_start(line);
-        mut end: u64 = index.line_end(line);
+        const start: i64 = index.line_start(line);
+        mut end: i64 = index.line_end(line);
         const p: u8* = text.as_ptr();
         while (end > start && (p[end - 1] == 10 || p[end - 1] == 13)) {
             end = end - 1;

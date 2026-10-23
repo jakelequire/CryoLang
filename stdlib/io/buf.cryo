@@ -148,7 +148,7 @@ type struct BufWriter<W> where W: Write {
                     if (n == 0) {
                         return Result::Err(IoError::new(IoErrorKind::WriteZero, 0));
                     }
-                    remaining = remaining.subslice(n, remaining.length());
+                    remaining = remaining.subslice(n as i64, remaining.length());
                 }
                 Result::Err(err) => {
                     match (err.kind) {
@@ -167,7 +167,7 @@ type struct BufWriter<W> where W: Write {
 implement<W> trait Write for struct BufWriter<W>
 where W: Write {
     write_some(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
-        const incoming: u64 = bytes.length();
+        const incoming: u64 = bytes.length() as u64;
         // Buffer would overflow; flush what we have.
         if (this.length + incoming > this.capacity) {
             this.flush_buffer()?;
@@ -230,12 +230,12 @@ where W: Write {
         // "lines appear as they are completed" behaviour without
         // paying a flush per byte.
         mut last_nl: i64 = -1;
-        mut i: u64 = 0;
+        mut i: i64 = 0;
         while (i < bytes.length()) {
             match (bytes.get(i)) {
                 Option::Some(byte) => {
                     if (byte == BYTE_LF) {
-                        last_nl = i as i64;
+                        last_nl = i;
                     }
                 }
                 Option::None => { break; }
@@ -247,7 +247,7 @@ where W: Write {
             return this.inner.write_some(bytes);
         }
 
-        const head_len: u64 = (last_nl as u64) + 1;
+        const head_len: i64 = last_nl + 1;
         const head: Slice<u8> = bytes.subslice(0, head_len);
         // Deliver the head IN FULL (`write`, not `write_some`): we report
         // `head_len` bytes consumed below, so a short write here would
@@ -257,11 +257,11 @@ where W: Write {
         this.inner.write(head)?;
         this.inner.flush_buffer()?;
         if (head_len == bytes.length()) {
-            return Result::Ok(head_len);
+            return Result::Ok(head_len as u64);
         }
         const tail: Slice<u8> = bytes.subslice(head_len, bytes.length());
         const n: u64 = this.inner.write_some(tail)?;
-        return Result::Ok(head_len + n);
+        return Result::Ok(head_len as u64 + n);
     }
 
     flush(mut &this) -> Result<(), IoError> {
@@ -385,7 +385,7 @@ where R: Read {
             return this.reader.read(buffer, length);
         }
         const filled: Slice<u8> = this.fill_buf()?;
-        mut n: u64 = filled.length();
+        mut n: u64 = filled.length() as u64;
         if (n > length) { n = length; }
         if (n > 0) {
             libc::memcpy(
@@ -403,13 +403,13 @@ where R: Read {
     /// region for `\n`, copy the prefix wholesale, consume, refill
     /// only if we didn't hit the newline.
     read_line(mut &this, out: mut &String) -> Result<u64, IoError> {
-        const start: u64 = out.length();
+        const start: i64 = out.length();
         loop {
             const filled: Slice<u8> = this.fill_buf()?;
             if (filled.is_empty()) {
-                return Result::Ok(out.length() - start);
+                return Result::Ok((out.length() - start) as u64);
             }
-            mut scan: u64 = 0;
+            mut scan: i64 = 0;
             mut hit_nl: boolean = false;
             while (scan < filled.length()) {
                 match (filled.get(scan)) {
@@ -430,9 +430,9 @@ where R: Read {
                     return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0));
                 }
             }
-            this.consume(scan);
+            this.consume(scan as u64);
             if (hit_nl) {
-                return Result::Ok(out.length() - start);
+                return Result::Ok((out.length() - start) as u64);
             }
         }
     }
@@ -525,7 +525,7 @@ type struct BufStream<S> {
             p[i] = p[this.rpos + i];
             i = i + 1;
         }
-        this.rbuf.truncate(live);
+        this.rbuf.truncate(live as i64);
         this.rpos = 0;
     }
 
@@ -545,7 +545,7 @@ implement<S> trait AsyncRead for struct BufStream<S> {
         // nothing to read into: size it with `resize`.
         mut sc: Array<u8> = Array::<u8>::new();
         mem::swap::<Array<u8>>(&sc, &this.scratch);
-        sc.resize(FILL_CHUNK, 0);
+        sc.resize(FILL_CHUNK as i64, 0);
 
         mut t: Transfer = await this.inner.read_into(sc);
 
@@ -615,8 +615,8 @@ implement<S> trait AsyncWrite for struct BufStream<S> {
             }
 
             mut rest: Array<u8> = Array::<u8>::new();
-            const total: u64 = sent_buf.length() as u64;
-            const keep_from: u64 = if (failed) { 0 } else { moved };
+            const total: i64 = sent_buf.length();
+            const keep_from: i64 = if (failed) { 0 } else { moved as i64 };
             if (keep_from < total) {
                 match (rest.try_append(sent_buf.as_slice().subslice(keep_from, total))) {
                     Result::Ok(_)  => { }

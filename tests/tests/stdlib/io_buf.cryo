@@ -41,7 +41,7 @@ import std::ffi::libc;
 type struct MemSink {
     buf: u8*;
     cap: u64;
-    len: u64;
+    len: i64;
     writes: u64;
 
     static new(cap: u64) -> MemSink {
@@ -56,17 +56,17 @@ type struct MemSink {
 
 implement trait Write for struct MemSink {
     write_some(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
-        const n: u64 = bytes.length();
+        const n: i64 = bytes.length();
         if (n > 0) {
             libc::memcpy(
                 (this.buf + this.len) as void*,
                 bytes.as_ptr() as void*,
-                n
+                n as u64
             );
             this.len = this.len + n;
         }
         this.writes = this.writes + 1;
-        return Result::Ok(n);
+        return Result::Ok(n as u64);
     }
 
     flush(mut &this) -> Result<(), IoError> {
@@ -91,11 +91,11 @@ implement trait Drop for struct MemSink {
 
 type struct MemSource {
     src: Str;
-    pos: u64;
-    chunk: u64;
+    pos: i64;
+    chunk: i64;
     reads: u64;
 
-    static new(src: Str, chunk: u64) -> MemSource {
+    static new(src: Str, chunk: i64) -> MemSource {
         return MemSource { src: src, pos: 0, chunk: chunk, reads: 0 };
     }
 }
@@ -103,26 +103,26 @@ type struct MemSource {
 implement trait Read for struct MemSource {
     read(mut &this, buffer: u8*, length: u64) -> Result<u64, IoError> {
         const bytes: Slice<u8> = this.src.as_bytes();
-        mut n: u64 = bytes.length() - this.pos;
-        if (n > length) { n = length; }
+        mut n: i64 = bytes.length() - this.pos;
+        if (n > length as i64) { n = length as i64; }
         if (this.chunk > 0 && n > this.chunk) { n = this.chunk; }
         if (n > 0) {
             libc::memcpy(
                 buffer as void*,
                 (bytes.as_ptr() + this.pos) as void*,
-                n
+                n as u64
             );
             this.pos = this.pos + n;
         }
         this.reads = this.reads + 1;
-        return Result::Ok(n);
+        return Result::Ok(n as u64);
     }
 }
 
 // Byte-wise slice equality used by the content assertions.
 function slices_eq(a: Slice<u8>, b: Slice<u8>) -> boolean {
     if (a.length() != b.length()) { return false; }
-    mut i: u64 = 0;
+    mut i: i64 = 0;
     while (i < a.length()) {
         match (a.get(i)) {
             Option::Some(av) => {
@@ -172,7 +172,7 @@ function overflow_triggers_flush() -> Result<(), TestError> {
     mut bw: BufWriter<MemSink> = BufWriter::with_capacity(&sink, 4);
     match (bw.write(Str::new("abc").as_bytes())) { Result::Ok(_) => { } Result::Err(_) => { bw.drop(); sink.drop(); return bail(Str::new("write abc failed")); } }
     match (bw.write(Str::new("def").as_bytes())) { Result::Ok(_) => { } Result::Err(_) => { bw.drop(); sink.drop(); return bail(Str::new("write def failed")); } }
-    const sink_len_mid: u64 = sink.len;          // "abc" flushed by overflow
+    const sink_len_mid: i64 = sink.len;          // "abc" flushed by overflow
     const buffered_mid: u64 = bw.buffered();      // "def" still buffered
     const partial_ok: boolean = slices_eq(sink.as_slice(), Str::new("abc").as_bytes());
     match (bw.flush()) { Result::Ok(_) => { } Result::Err(_) => { bw.drop(); sink.drop(); return bail(Str::new("flush failed")); } }
@@ -226,7 +226,7 @@ function clear_discards_buffered() -> Result<(), TestError> {
     match (bw.write(Str::new("abc").as_bytes())) { Result::Ok(_) => { } Result::Err(_) => { bw.drop(); sink.drop(); return bail(Str::new("write failed")); } }
     bw.clear();                                   // throw the buffered bytes away
     match (bw.flush()) { Result::Ok(_) => { } Result::Err(_) => { bw.drop(); sink.drop(); return bail(Str::new("flush failed")); } }
-    const sink_len: u64 = sink.len;
+    const sink_len: i64 = sink.len;
     bw.drop();
     sink.drop();
     return expect_eq(sink_len, 0);                // nothing made it to the sink
@@ -304,7 +304,7 @@ function dribbling_source_reassembles_line() -> Result<(), TestError> {
 function available_tracks_buffered_bytes() -> Result<(), TestError> {
     mut src: MemSource = MemSource::new(Str::new("hello"), 0);
     mut br: BufReader<MemSource> = BufReader::with_capacity(&src, 8);
-    mut avail: u64 = 0;
+    mut avail: i64 = 0;
     match (br.fill_buf()) {
         Result::Ok(filled) => { avail = filled.length(); }
         Result::Err(_) => { br.drop(); return bail(Str::new("fill_buf failed")); }

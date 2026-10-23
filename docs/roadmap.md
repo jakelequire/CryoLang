@@ -373,13 +373,17 @@ and a `Location` is read through `file()`, `line()`, `column()` and
 Left over from that: the async entry point calls `Executor::new` and
 `block_on` by name.  The rest, in order:
 
-1. **Every `length()` returns `i64`.**  Built: the collections' `length`
-   and `capacity` fields are private behind `![inline]` accessors (574), and
-   every read outside a collection's own module goes through one.  Left:
-   `Str`, `String`, `Slice`, `HashMap`, `string` and the rest return
-   `u64`; the positions and sizes their methods and `Array`'s take
-   (`sub_bytes`, `get`, `insert`, `truncate`, `reserve`) are `u64` too,
-   and whether they follow the length to `i64` is open.
+1. **Every length, position and size is an `i64`.**  Built: the
+   collections' `length` and `capacity` fields are private behind
+   `![inline]` accessors (574), every `length()` and every position and
+   size a collection method takes or answers is an `i64` (575), and a
+   negative one means what the method's kind says (576).  Left: the byte
+   counts of the I/O traits (`read`, `write`, `consume`, a cursor's
+   position), the number-to-text writers (`to_decimal_buf`, `f64.to_buf`
+   and their kind), `next_below`, and the HTTP/2 wire integers are still
+   `u64`, cast where they meet an `i64`.  Reaching a length through its
+   accessor costs `cryo check` about a tenth more than a field read did;
+   that is to be optimized when the HIR and MIR pipeline lands.
 2. **`Display` and `Debug` over a trait object:** one non-generic `fmt`
    writing through a `virtual mut &FmtWrite` held by `Formatter`, in
    place of `fmt<W>`; code size and the fmt suites measured first.

@@ -61,7 +61,7 @@ type enum LineStatus {
 /// Cap on a single header line.  Real clients emit ~25 bytes; bigger
 /// is almost certainly a stuck-pipe situation, and reading-until-LF
 /// would otherwise let a malicious peer pin our memory at infinity.
-const MAX_HEADER_LINE: u64 = 8192;
+const MAX_HEADER_LINE: i64 = 8192;
 
 /// Hard cap on a single message body.  LSP payloads are source
 /// documents plus JSON overhead; even a very large source file stays
@@ -69,17 +69,17 @@ const MAX_HEADER_LINE: u64 = 8192;
 /// or a hostile peer trying to make us pre-allocate unbounded memory
 /// via `String::with_capacity(content_length)` below - so reject the
 /// frame instead of honoring the advertised size.
-const MAX_MESSAGE_SIZE: u64 = 536870912;                // 512 MiB
+const MAX_MESSAGE_SIZE: i64 = 536870912;               // 512 MiB
 
 /// Body read granularity.  The body loop reads up to this many bytes per
 /// syscall (bounded by the bytes remaining in the frame), turning a large
 /// `didChange` from ~1 syscall/byte into ~1 syscall/64 KiB.  A plain stack
 /// buffer (no heap churn on the hot edit path); 64 KiB is well under the
 /// LSP worker stack.
-const BODY_CHUNK_SIZE: u64 = 65536;
+const BODY_CHUNK_SIZE: i64 = 65536;
 
 const HEADER_CONTENT_LENGTH:     string = "Content-Length:";
-const HEADER_CONTENT_LENGTH_LEN: u64    = 15;
+const HEADER_CONTENT_LENGTH_LEN: i64    = 15;
 
 
 // FrameCodec - LSP Content-Length frame reader/writer
@@ -98,7 +98,7 @@ type struct FrameCodec {
     /// client closed stdin between frames) - the server treats that as a
     /// normal exit if shutdown was requested.
     static read_message(reader: mut &stdio::Stdin) -> Result<Option<String>, FrameError> {
-        mut content_length: u64    = 0;
+        mut content_length: i64    = 0;
         mut got_length:    boolean = false;
         mut saw_any_byte:  boolean = false;
         mut line_buf:      String  = String::new();
@@ -150,7 +150,7 @@ type struct FrameCodec {
         }
 
         // Guard the allocation below: a hostile or corrupt `Content-Length`
-        // (e.g. near-u64::MAX) would otherwise ask the allocator for an
+        // (e.g. near i64::MAX) would otherwise ask the allocator for an
         // absurd buffer and take the process down before a single body byte
         // is read.
         if (content_length > MAX_MESSAGE_SIZE) {
@@ -171,11 +171,11 @@ type struct FrameCodec {
         }
 
         mut chunk: [u8; BODY_CHUNK_SIZE];
-        mut read_so_far: u64 = 0;
+        mut read_so_far: i64 = 0;
         while (read_so_far < content_length) {
-            mut want: u64 = content_length - read_so_far;
+            mut want: i64 = content_length - read_so_far;
             if (want > BODY_CHUNK_SIZE) { want = BODY_CHUNK_SIZE; }
-            match (reader.read(&chunk[0], want)) {
+            match (reader.read(&chunk[0], want as u64)) {
                 Result::Ok(n) => {
                     if (n == 0) {
                         mem::drop(body);
@@ -183,8 +183,8 @@ type struct FrameCodec {
                     }
                     // One memcpy per chunk (the `Str` view over `chunk`),
                     // versus a push per byte before.
-                    body.push(str::Str::from_raw(&chunk[0], n));
-                    read_so_far = read_so_far + n;
+                    body.push(str::Str::from_raw(&chunk[0], n as i64));
+                    read_so_far = read_so_far + (n as i64);
                 }
                 Result::Err(e) => {
                     mem::drop(body);
@@ -219,7 +219,7 @@ type struct FrameCodec {
                         if (prev_cr) {
                             // Drop the `\r` we already pushed - `\r\n` is
                             // the terminator, not part of the value.
-                            const cur: u64 = out.length();
+                            const cur: i64 = out.length();
                             if (cur > 0) { out.truncate(cur - 1); }
                         }
                         if (out.length() == 0) {
@@ -249,30 +249,30 @@ type struct FrameCodec {
         return head.equals(&str::Str::from(HEADER_CONTENT_LENGTH));
     }
 
-    static parse_content_length(line: str::Str) -> Option<u64> {
-        return FrameCodec::parse_u64_skip_ws(line.sub_bytes(
+    static parse_content_length(line: str::Str) -> Option<i64> {
+        return FrameCodec::parse_decimal_skip_ws(line.sub_bytes(
             HEADER_CONTENT_LENGTH_LEN, line.length()));
     }
 
     /// Decimal digits with optional SP / HTAB around them.  `None` on
     /// anything else (`12abc`), and on a value too large to be a frame, so
     /// the multiply cannot wrap into a small, plausible length.
-    static parse_u64_skip_ws(s: str::Str) -> Option<u64> {
-        const len: u64 = s.length();
+    static parse_decimal_skip_ws(s: str::Str) -> Option<i64> {
+        const len: i64 = s.length();
         const ptr: u8* = s.as_ptr();
-        mut i: u64 = 0;
+        mut i: i64 = 0;
         while (i < len && (ptr[i] == 32 || ptr[i] == 9)) {
             i = i + 1;
         }
         if (i == len) { return Option::None; }
 
-        mut value:     u64     = 0;
+        mut value:     i64     = 0;
         mut saw_digit: boolean = false;
         while (i < len) {
             const b: u8 = ptr[i];
             if (b < 48 || b > 57) { break; }                    // not '0'..'9'
             if (value > 100000000000000) { return Option::None; }
-            value = value * 10 + ((b - 48) as u64);
+            value = value * 10 + ((b - 48) as i64);
             saw_digit = true;
             i = i + 1;
         }
@@ -296,7 +296,7 @@ type struct FrameCodec {
         header.push("Content-Length: ");
         mut len_buf: [u8; 20];
         const len_digits: u64 = body.length().to_decimal_buf(&len_buf[0]);
-        header.push(str::Str::from_raw(&len_buf[0], len_digits));
+        header.push(str::Str::from_raw(&len_buf[0], len_digits as i64));
         header.push("\r\n\r\n");
 
         const w_header: Result<(), error::IoError> = writer.write(header.as_bytes());

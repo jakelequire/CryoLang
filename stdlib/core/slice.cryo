@@ -17,17 +17,17 @@ import std::core::mem;
 ![language("slice")]
 type struct Slice<T> {
     ptr: T*;
-    private length: u64;
+    private length: i64;
 
     /// Construct from a raw pointer and length. The caller certifies
     /// that `[ptr, ptr + length)` is valid initialized memory for as
-    /// long as the slice exists.
-    static from_raw(ptr: T*, length: u64) -> Slice<T> {
+    /// long as the slice exists, and that `length` is not negative.
+    static from_raw(ptr: T*, length: i64) -> Slice<T> {
         return Slice::<T> { ptr: ptr, length: length };
     }
 
     ![inline]
-    length(&this) -> u64 {
+    length(&this) -> i64 {
         return this.length;
     }
 
@@ -35,25 +35,26 @@ type struct Slice<T> {
         return this.length == 0;
     }
 
-    /// Bounds-checked read by value. Gated on `T: Copy`: the result is
-    /// an independent bitwise duplicate while the backing storage still
-    /// owns the element, so this is only sound when `T` carries no `Drop`
-    /// obligation. For owning `T`, borrow in place with `get_ref`.
-    get(&this, index: u64) -> Option<T> where T: Copy {
-        if (index >= this.length) {
+    /// Bounds-checked read by value; `None` for an index outside
+    /// `[0, length)`, a negative one included. Gated on `T: Copy`: the
+    /// result is an independent bitwise duplicate while the backing storage
+    /// still owns the element, so this is only sound when `T` carries no
+    /// `Drop` obligation. For owning `T`, borrow in place with `get_ref`.
+    get(&this, index: i64) -> Option<T> where T: Copy {
+        if (index < 0 || index >= this.length) {
             return Option::None;
         }
         return Option::Some(this.ptr[index]);
     }
 
-    /// Bounds-checked borrow. Returns a pointer to the element in place,
-    /// sound for every `T`. The pointer is valid only while the backing
-    /// storage outlives the slice.
-    get_ref(&this, index: u64) -> Option<T*> {
-        if (index >= this.length) {
+    /// Bounds-checked borrow; `None` for an index outside `[0, length)`.
+    /// Returns a pointer to the element in place, sound for every `T`. The
+    /// pointer is valid only while the backing storage outlives the slice.
+    get_ref(&this, index: i64) -> Option<T*> {
+        if (index < 0 || index >= this.length) {
             return Option::None;
         }
-        return Option::Some(mem::offset(this.ptr, index as i64));
+        return Option::Some(mem::offset(this.ptr, index));
     }
 
     /// Raw pointer to the first element. Callers must respect `length`.
@@ -61,14 +62,14 @@ type struct Slice<T> {
         return this.ptr;
     }
 
-    /// The sub-slice `[start, end)`. Panics if `start > end` or
-    /// `end > length`.
-    subslice(&this, start: u64, end: u64) -> Slice<T> {
-        if (start > end || end > this.length) {
+    /// The sub-slice `[start, end)`. Panics if `start` is negative,
+    /// `start > end`, or `end > length`.
+    subslice(&this, start: i64, end: i64) -> Slice<T> {
+        if (start < 0 || start > end || end > this.length) {
             core::panic("Slice::subslice: out of range", intrinsics::location());
         }
         return Slice::<T> {
-            ptr: mem::offset(this.ptr, start as i64),
+            ptr: mem::offset(this.ptr, start),
             length: end - start
         };
     }
@@ -91,7 +92,7 @@ type struct Slice<T> {
 
 type struct SliceIter<T> {
     ptr: T*;
-    remaining: u64;
+    remaining: i64;
 }
 
 implement<T> trait Iterator<T> for struct SliceIter<T> {
@@ -106,8 +107,8 @@ implement<T> trait Iterator<T> for struct SliceIter<T> {
     }
 
     /// Override the default; slice length is known O(1).
-    count(mut &this) -> u64 {
-        const n: u64 = this.remaining;
+    count(mut &this) -> i64 {
+        const n: i64 = this.remaining;
         this.remaining = 0;
         return n;
     }

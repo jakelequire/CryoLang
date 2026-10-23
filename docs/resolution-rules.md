@@ -133,6 +133,28 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-23
+
+575. **Every length, position and size in the standard library is an
+     `i64`.**  `length()`, `capacity()`, `find`, `index_of` and
+     `Iterator::count` answer one, and `get`, `set`, `insert`, `remove`,
+     `sub_bytes`, `subslice`, `truncate`, `reserve`, `with_capacity`,
+     `take`, `skip` and their kind take one, so a position found by one
+     call is passed to the next with no cast.  This answers the question
+     ruling 574 left open.  The checking cost of reaching a length through
+     its accessor is accepted until the lowering after type checking can
+     remove it.  (Jake)
+
+576. **A negative length or position means what the method's kind says,
+     never a huge unsigned one.**  A lookup that answers `Option` (`get`,
+     `get_ref`, `byte_at`, `at`, `key_at`, `value_at`) answers `None`; a
+     method that writes or cuts at a position (`set`, `insert`, `remove`,
+     `swap_remove`, `sub_bytes`, `subslice`) panics "out of range";
+     `truncate` and `resize` panic "negative length"; `reserve`,
+     `reserve_exact` and `with_capacity` treat zero or less as nothing to
+     do; `take` of a negative count yields nothing and `skip` of one skips
+     nothing.  (Jake)
+
 ### 2026-10-22
 
 553. **A test project can set the compiler's environment and arguments,

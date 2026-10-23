@@ -366,7 +366,15 @@ Diagnostics and the editor spell an array the way the annotation that declared i
 
 An array literal written where an `Array<T>` with the default allocator is expected builds that array, in every form: `[a, b]`, `[]`, and `[value; n]` with `n` fixed or known only at run time.  The literal allocates the storage, so an `Array<T, A>` with another allocator is not initialised by one.  A literal passed for a `[T]` parameter whose `T` the call infers is the `Array` of its own element type, and its elements are what bind `T`: for `function generic_len<T>(xs: [T]) -> i64`, `generic_len([true, false])` calls `generic_len::<boolean>`.  An array literal whose elements are all numeric literals is as width-polymorphic as one numeric literal: when another argument or the expected type binds `T`, its elements are typed as that `T` instead of their defaults, so `count_eq([1, 2], wide)` with `count_eq<T>(xs: [T], y: T)` and `wide: i64` binds `T = i64` and passes an `[i64]`.  An element that cannot be that `T` (a float literal for an integer `T`, an integer out of its range) is refused as a single literal would be.
 
-An array's `length()` and `capacity()` are `i64`.  The fields behind them, and those behind every collection's `length()` and `capacity()`, are private to the collection's module (`E0353`), and the accessors are inline, so reading through one costs no call.  `Array`'s methods take an index or an element count as a `u64`.
+An array's `length()` and `capacity()` are `i64`.  The fields behind them, and those behind every collection's `length()` and `capacity()`, are private to the collection's module (`E0353`), and the accessors are inline, so reading through one costs no call.
+
+Every length, capacity, position and size in the standard library is an `i64`, whether a method returns it (`length()`, `find`, `index_of`, `Iterator::count`) or takes it (`get`, `insert`, `sub_bytes`, `truncate`, `with_capacity`, `take`), so one integer type carries a position from where it is found to where it is used, with no cast.  A negative argument is never read as a huge unsigned one; what it means is fixed by the kind of method:
+
+- a lookup that answers `Option` (`get`, `get_ref`, `byte_at`, `at`, `key_at`, `value_at`) answers `None`, as for any index past the end;
+- a method that writes or cuts at a position (`set`, `insert`, `remove`, `swap_remove`, `sub_bytes`, `subslice`) panics with "out of range";
+- `truncate` and `resize` panic with "negative length";
+- `reserve`, `reserve_exact` and `with_capacity` treat zero or less as nothing to do;
+- `take(n)` with `n` negative yields nothing, and `skip(n)` skips nothing.
 
 The `N` in `[T; N]` is a **compile-time integer**: an integer literal, a named `const` (declared in this module or another, written bare or qualified), an enum variant, a cast between integer types, or arithmetic, comparison, logical, and bitwise operators over those. The repeat expression `[value; N]` accepts exactly the same set and yields `[T; N]`, so a field and the initializer that fills it can share one name for their length; a count that is *not* a compile-time integer is legal there and yields a dynamic `[T]` sized at run time. A size that is neither is E0239. `value` is evaluated once and the same bits are stored in every slot, so its type must be a plain-copy type (one that satisfies `Copy`); an element that releases what it owns would be released once per slot, and is refused (E0453).
 
@@ -672,12 +680,12 @@ to write it.
 ```cryo
 // The concrete iterator (`SliceIter<T>`) never appears in the signature.
 iter(&this) -> implement Iterator<T> where T: Copy {
-    return SliceIter::<T> { ptr: this.ptr, remaining: this.length() as u64 };
+    return SliceIter::<T> { ptr: this.ptr, remaining: this.length() };
 }
 
 // A caller binds the result without naming the concrete type either.
 mut it: implement Iterator<i32> = arr.iter();
-const n: u64 = it.count();          // trait methods are available
+const n: i64 = it.count();          // trait methods are available
 ```
 
 Because Cryo monomorphises, this is a purely static, zero-cost construct: an
@@ -1963,7 +1971,7 @@ function smallest<T>(xs: &Array<T>) -> Option<T>
     where T: Ord + Copy {
     if (xs.length() == 0) { return Option::None; }
     mut best: T = xs.get(0).unwrap();
-    for (mut i: u64 = 1; i < (xs.length() as u64); i++) {
+    for (mut i: i64 = 1; i < xs.length(); i++) {
         const next: T = xs.get(i).unwrap();
         if (next.compare(&best) == Ordering::Less) {
             best = next;
@@ -2503,7 +2511,7 @@ const b: Pair<string> = Pair::<string>::new("x", "y");
 
 it generates two independent types and two specialised function bodies, one for each instantiation. There is no shared dispatch; every call is a direct call to a fully-typed function. The trade-off is binary size: each instantiation produces its own code.
 
-Generic bodies are type-checked once, as templates, **before** monomorphisation: a body is checked against its parameters' bounds, never against the types it is later instantiated with, so an error in a generic body is reported whether or not anything instantiates it. One exception: a path through a type parameter naming a member none of its bounds declares (`T::m()`, `T::m`, `(Tr for T)::m`) is found by that check and reported only once the body is instantiated (section on calls through a bound). Monomorphisation then copies each instantiated body with its type arguments substituted and binds every call in the copy to its concrete callee; the copies are not type-checked again, so a call the template check accepts must be one every copy can bind. A method call on the body's own instantiation of a generic type (`xs.get(i)` with `xs: &Array<T>`) is therefore refused where it is written when its arguments bind to no method of the name, by the rule a call's arguments bind by - an `i64` passed for `get`'s `u64` index is refused (E0214), as is an overload set none of whose members takes the arguments. The driver lives in [`compiler/src/compiler/mono/`](../compiler/src/compiler/mono/) (`monomorphizer.cryo`), run from `instance.cryo` after the function-body type check.
+Generic bodies are type-checked once, as templates, **before** monomorphisation: a body is checked against its parameters' bounds, never against the types it is later instantiated with, so an error in a generic body is reported whether or not anything instantiates it. One exception: a path through a type parameter naming a member none of its bounds declares (`T::m()`, `T::m`, `(Tr for T)::m`) is found by that check and reported only once the body is instantiated (section on calls through a bound). Monomorphisation then copies each instantiated body with its type arguments substituted and binds every call in the copy to its concrete callee; the copies are not type-checked again, so a call the template check accepts must be one every copy can bind. A method call on the body's own instantiation of a generic type (`xs.get(i)` with `xs: &Array<T>`) is therefore refused where it is written when its arguments bind to no method of the name, by the rule a call's arguments bind by - a `u64` passed for `get`'s `i64` index is refused (E0214), as is an overload set none of whose members takes the arguments. The driver lives in [`compiler/src/compiler/mono/`](../compiler/src/compiler/mono/) (`monomorphizer.cryo`), run from `instance.cryo` after the function-body type check.
 
 ### 11.7 `static match` — Compile-Time Type Dispatch
 
