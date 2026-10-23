@@ -366,7 +366,7 @@ Diagnostics and the editor spell an array the way the annotation that declared i
 
 An array literal written where an `Array<T>` with the default allocator is expected builds that array, in every form: `[a, b]`, `[]`, and `[value; n]` with `n` fixed or known only at run time.  The literal allocates the storage, so an `Array<T, A>` with another allocator is not initialised by one.  A literal passed for a `[T]` parameter whose `T` the call infers is the `Array` of its own element type, and its elements are what bind `T`: for `function generic_len<T>(xs: [T]) -> i64`, `generic_len([true, false])` calls `generic_len::<boolean>`.  An array literal whose elements are all numeric literals is as width-polymorphic as one numeric literal: when another argument or the expected type binds `T`, its elements are typed as that `T` instead of their defaults, so `count_eq([1, 2], wide)` with `count_eq<T>(xs: [T], y: T)` and `wide: i64` binds `T = i64` and passes an `[i64]`.  An element that cannot be that `T` (a float literal for an integer `T`, an integer out of its range) is refused as a single literal would be.
 
-An array's `length` and `capacity`, read as fields or through `length()` and `capacity()`, are `i64`.  `Array`'s methods take an index or an element count as a `u64`.
+An array's `length()` and `capacity()` are `i64`.  The fields behind them, and those behind every collection's `length()` and `capacity()`, are private to the collection's module (`E0353`), and the accessors are inline, so reading through one costs no call.  `Array`'s methods take an index or an element count as a `u64`.
 
 The `N` in `[T; N]` is a **compile-time integer**: an integer literal, a named `const` (declared in this module or another, written bare or qualified), an enum variant, a cast between integer types, or arithmetic, comparison, logical, and bitwise operators over those. The repeat expression `[value; N]` accepts exactly the same set and yields `[T; N]`, so a field and the initializer that fills it can share one name for their length; a count that is *not* a compile-time integer is legal there and yields a dynamic `[T]` sized at run time. A size that is neither is E0239. `value` is evaluated once and the same bits are stored in every slot, so its type must be a plain-copy type (one that satisfies `Copy`); an element that releases what it owns would be released once per slot, and is refused (E0453).
 
@@ -648,7 +648,7 @@ const slot: int? = Option::Some(7);   // int?  is  Option<int>
 const back: Option<int> = slot;       // interchangeable both ways
 
 function first(xs: [int]) -> int? {   // optional return
-    if (xs.length == 0) { return Option::None; }
+    if (xs.length() == 0) { return Option::None; }
     return Option::Some(xs[0]);
 }
 
@@ -672,7 +672,7 @@ to write it.
 ```cryo
 // The concrete iterator (`SliceIter<T>`) never appears in the signature.
 iter(&this) -> implement Iterator<T> where T: Copy {
-    return SliceIter::<T> { ptr: this.ptr, remaining: this.length as u64 };
+    return SliceIter::<T> { ptr: this.ptr, remaining: this.length() as u64 };
 }
 
 // A caller binds the result without naming the concrete type either.

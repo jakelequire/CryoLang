@@ -157,7 +157,7 @@ function doubling_table() -> Result<(), TestError> {
         Case { input: 3, want: 6 },
     ];
     mut i: i64 = 0;
-    while (i < cases.length) {
+    while (i < cases.length()) {
         const c: &Case = &cases[i];
         match (expect_eq(c.input * 2, c.want)) {
             Result::Ok(_)  => { }

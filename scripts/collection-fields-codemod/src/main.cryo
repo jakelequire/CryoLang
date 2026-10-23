@@ -1,0 +1,163 @@
+namespace CollectionFieldsCodemod;
+
+// One-off: rewrites reads of the collections' `length` and `capacity`
+// fields into calls of their accessors, `xs.length` -> `xs.length()`, in
+// every `.cryo` file under the trees below.  Run from the repository root.
+//
+// A read is `<receiver>.length` or `<receiver>.capacity` where the
+// receiver ends in a name, `)` or `]` and the member is not followed by a
+// name character or `(`.  Left alone: a `this.` receiver (a type's own
+// field, read where it is declared), an assignment to the field, and
+// anything inside a string or character literal.  A comment is rewritten
+// like code, so prose naming `xs.length` names the accessor, and the code
+// inside an f-string's `{ ... }` is rewritten as code.  The arena's file is
+// skipped: its chunks are not collections.  A fixed array's `.length` is
+// the language's own, with no accessor; the build names each such read it
+// rewrote (E0358 on a `[T; N]`), and those are restored by hand, as are
+// the reads of the language server's semantic token's own `length` field
+// (E0213).
+
+import std::fmt;
+import std::fs::file;
+import std::fs::dir;
+import std::fs::path::{ Path, PathBuf };
+import std::collections::str::{ Str };
+
+function is_name_byte(b: u8) -> boolean {
+    return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_';
+}
+
+function matches_at(text: &[u8], at: i64, word: string) -> boolean {
+    const n: i64 = word.length() as i64;
+    if (at + n > text.length()) { return false; }
+    for (mut k: i64 = 0; k < n; k++) {
+        if (text[at + k] != word[k] as u8) { return false; }
+    }
+    return true;
+}
+
+/// The length of the member `length` or `capacity` starting at `at`, or 0.
+function member_at(text: &[u8], at: i64) -> i64 {
+    if (matches_at(text, at, "length")) { return 6; }
+    if (matches_at(text, at, "capacity")) { return 8; }
+    return 0;
+}
+
+/// Whether the receiver ending just before the `.` at `dot` is `this`.
+function receiver_is_this(text: &[u8], dot: i64) -> boolean {
+    if (dot < 4 || !matches_at(text, dot - 4, "this")) { return false; }
+    return dot == 4 || !(is_name_byte(text[dot - 5]) || text[dot - 5] == '.');
+}
+
+/// Whether the text after the member at `after` assigns to it.
+function assigns_at(text: &[u8], after: i64) -> boolean {
+    mut i: i64 = after;
+    while (i < text.length() && text[i] == ' ') { i++; }
+    if (i + 1 >= text.length()) { return false; }
+    const c: u8 = text[i];
+    const next: u8 = text[i + 1];
+    if (c == '=') { return next != '='; }
+    if (next == '=' && (c == '+' || c == '-' || c == '*' || c == '/' || c == '%'
+            || c == '&' || c == '|' || c == '^')) {
+        return true;
+    }
+    return false;
+}
+
+/// The file's text with every field read rewritten; `count` gains one
+/// per rewrite.
+function rewrite(text: &[u8], count: mut &i64) -> [u8] {
+    mut out: [u8] = [];
+    mut quote: u8 = 0;
+    // In an f-string, a `{ ... }` is code: `interpolating` while in one.
+    mut formatted: boolean = false;
+    mut interpolating: boolean = false;
+    mut i: i64 = 0;
+    while (i < text.length()) {
+        const b: u8 = text[i];
+        if (quote != 0) {
+            out.push(b);
+            if (b == '\\' && i + 1 < text.length()) { out.push(text[i + 1]); i += 2; continue; }
+            if (formatted && b == '{') {
+                if (i + 1 < text.length() && text[i + 1] == '{') { out.push(text[i + 1]); i += 2; continue; }
+                quote = 0;
+                interpolating = true;
+                i++;
+                continue;
+            }
+            if (b == quote || b == '\n') { quote = 0; formatted = false; }
+            i++;
+            continue;
+        }
+        if (interpolating && b == '}') { out.push(b); quote = '"' as u8; interpolating = false; i++; continue; }
+        if (b == '"' || b == '\'') {
+            formatted = b == '"' && i > 0 && text[i - 1] == 'f';
+            quote = b;
+            out.push(b);
+            i++;
+            continue;
+        }
+        if (b == '.' && i > 0 && (is_name_byte(text[i - 1]) || text[i - 1] == ')' || text[i - 1] == ']')) {
+            const n: i64 = member_at(text, i + 1);
+            const after: i64 = i + 1 + n;
+            if (n > 0 && !receiver_is_this(text, i)
+                    && (after >= text.length() || !(is_name_byte(text[after]) || text[after] == '('))
+                    && !assigns_at(text, after)) {
+                for (mut k: i64 = i; k < after; k++) { out.push(text[k]); }
+                out.push('(' as u8);
+                out.push(')' as u8);
+                *count += 1;
+                i = after;
+                continue;
+            }
+        }
+        out.push(b);
+        i++;
+    }
+    return out;
+}
+
+function visit(directory: Path, total: mut &i64, files: mut &i64) -> void {
+    match (dir::read_dir(directory)) {
+        Result::Err(_) => { fmt::println(f"cannot read {directory.as_str()}"); }
+        Result::Ok(entries) => {
+            mut iterator = entries;
+            for (entry in iterator) {
+                const name: Str = entry.name();
+                const child: PathBuf = directory.join(name);
+                if (entry.is_dir()) {
+                    if (name != Str::new("build")) { visit(child.as_path(), total, files); }
+                    continue;
+                }
+                if (!name.ends_with(&Str::new(".cryo"))) { continue; }
+                // An arena's chunks are not collections: `chunk.capacity`
+                // is a field of the chunk's own.
+                if (name == Str::new("arena.cryo") && directory.as_str().ends_with(&Str::new("alloc"))) { continue; }
+                match (file::read(child.as_path())) {
+                    Result::Err(_) => { fmt::println(f"cannot read {child.as_path().as_str()}"); }
+                    Result::Ok(bytes) => {
+                        mut count: i64 = 0;
+                        const rewritten: [u8] = rewrite(&bytes, &count);
+                        if (count > 0) {
+                            match (file::write(child.as_path(), rewritten.as_slice())) {
+                                Result::Err(_) => { fmt::println(f"cannot write {child.as_path().as_str()}"); }
+                                Result::Ok(_) => { *total += count; *files += 1; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+function main() -> int {
+    const roots: [string] = ["compiler/src", "tools/CryoLSP/src", "tests/tests", "stdlib"];
+    mut total: i64 = 0;
+    mut files: i64 = 0;
+    for (mut r: i64 = 0; r < roots.length(); r++) {
+        visit(Path::from(Str::new(roots[r])), &total, &files);
+    }
+    fmt::println(f"rewrote {total} field read(s) in {files} file(s)");
+    return 0;
+}

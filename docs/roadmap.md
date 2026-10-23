@@ -373,10 +373,13 @@ and a `Location` is read through `file()`, `line()`, `column()` and
 Left over from that: the async entry point calls `Executor::new` and
 `block_on` by name.  The rest, in order:
 
-1. **Collections' `length` and `capacity` private**, behind `![inline]`
-   accessors made inline first; the compiler's, the language server's
-   and the tests' reads rewritten by a codemod.  Every `length()`
-   returns `i64`.
+1. **Every `length()` returns `i64`.**  Built: the collections' `length`
+   and `capacity` fields are private behind `![inline]` accessors (574), and
+   every read outside a collection's own module goes through one.  Left:
+   `Str`, `String`, `Slice`, `HashMap`, `string` and the rest return
+   `u64`; the positions and sizes their methods and `Array`'s take
+   (`sub_bytes`, `get`, `insert`, `truncate`, `reserve`) are `u64` too,
+   and whether they follow the length to `i64` is open.
 2. **`Display` and `Debug` over a trait object:** one non-generic `fmt`
    writing through a `virtual mut &FmtWrite` held by `Formatter`, in
    place of `fmt<W>`; code size and the fmt suites measured first.

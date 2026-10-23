@@ -285,6 +285,15 @@ yet is recorded with the change that builds it, not here.
      claim.  The directive's shape is still checked.  (Jake; reusing E0151
      rather than a new code Delegated, and parked as a question)
 
+574. **A collection's `length` and `capacity` are read through its
+     accessors.**  The fields behind `length()` and `capacity()` - an
+     array's, a string's, a slice's, a map's, a buffer's - are private to
+     the collection's module (E0353), and the accessors are `![inline]`,
+     so a read through one compiles to the field load.  A fixed array's
+     `length` is the language's and stays a field.  Whether every
+     `length()` returning `i64` takes the positions and sizes passed to
+     the collections with it is open.  (Jake)
+
 ### 2026-10-21
 
 501. **The class-removal plan is deleted now,** its slices all built and its
