@@ -1887,10 +1887,10 @@ Inside the trait body, `This` refers to the implementing type. Methods may have 
 
 ```cryo
 type trait Read {
-    read(mut &this, buf: u8*, len: u64) -> Result<u64, IoError>;
+    read(mut &this, buf: u8*, len: i64) -> Result<i64, IoError>;
 
     /// Default: keep reading until end-of-stream or error.
-    read_all(mut &this, out: mut &Array<u8>) -> Result<u64, IoError> {
+    read_all(mut &this, out: mut &Array<u8>) -> Result<i64, IoError> {
         // ... default implementation calls self.read in a loop ...
     }
 }

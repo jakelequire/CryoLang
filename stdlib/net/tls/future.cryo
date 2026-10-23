@@ -67,7 +67,7 @@ private function interest_for(code: i32) -> u32 {
 type struct TlsIo {
     tls:    TlsStream;
     buf:    Array<u8>;
-    result: Result<u64, IoError>;
+    result: Result<i64, IoError>;
 
     /// Take the stream back. Calling it twice yields a closed placeholder the
     /// second time — the outcome holds the stream exactly once.
@@ -87,7 +87,7 @@ type struct TlsIo {
     }
 
     /// How many bytes moved, or why none did.
-    outcome(&this) -> Result<u64, IoError> {
+    outcome(&this) -> Result<i64, IoError> {
         return this.result;
     }
 }
@@ -195,9 +195,9 @@ type struct TlsRead {
     /// `kept` is how much of the buffer holds bytes that actually arrived;
     /// everything above it is whatever the buffer held beforehand, so it is
     /// dropped rather than left for the caller to mistake for data.
-    private finish(mut &this, kept: u64, result: Result<u64, IoError>) -> Poll<TlsIo> {
+    private finish(mut &this, kept: i64, result: Result<i64, IoError>) -> Poll<TlsIo> {
         this.rt = null;
-        this.buf.truncate(kept as i64);
+        this.buf.truncate(kept);
         mut s: TlsStream = TlsStream::from_parts(null, TcpStream::from_fd(-1));
         mem::swap::<TlsStream>(&s, &this.tls);
         mut b: Array<u8> = Array::<u8>::new();
@@ -211,11 +211,11 @@ implement trait Future for struct TlsRead {
 
     poll(mut &this, cx: Context*) -> Poll<TlsIo> {
         const fd: i32 = this.tls.raw_fd();
-        const want_len: u64 = this.buf.length() as u64;
+        const want_len: i64 = this.buf.length();
         openssl::ERR_clear_error();
         const n: i32 = openssl::SSL_read(this.tls.ssl_ptr(), this.buf.as_ptr(),
                                          clamp_io(want_len));
-        if (n > 0) { return this.finish(n as u64, Result::Ok(n as u64)); }
+        if (n > 0) { return this.finish(n as i64, Result::Ok(n as i64)); }
         const code: i32 = openssl::SSL_get_error(this.tls.ssl_ptr(), n);
         if (code == openssl::SSL_ERROR_ZERO_RETURN) {
             return this.finish(0, Result::Ok(0));   // clean TLS close -> EOF
@@ -258,7 +258,7 @@ type struct TlsWrite {
         return TlsWrite { tls: tls, buf: buf, rt: null, armed: 0 };
     }
 
-    private finish(mut &this, result: Result<u64, IoError>) -> Poll<TlsIo> {
+    private finish(mut &this, result: Result<i64, IoError>) -> Poll<TlsIo> {
         this.rt = null;
         mut s: TlsStream = TlsStream::from_parts(null, TcpStream::from_fd(-1));
         mem::swap::<TlsStream>(&s, &this.tls);
@@ -273,12 +273,12 @@ implement trait Future for struct TlsWrite {
 
     poll(mut &this, cx: Context*) -> Poll<TlsIo> {
         const fd: i32 = this.tls.raw_fd();
-        const want_len: u64 = this.buf.length() as u64;
+        const want_len: i64 = this.buf.length();
         if (want_len == 0) { return this.finish(Result::Ok(0)); }
         openssl::ERR_clear_error();
         const n: i32 = openssl::SSL_write(this.tls.ssl_ptr(), this.buf.as_ptr(),
                                           clamp_io(want_len));
-        if (n > 0) { return this.finish(Result::Ok(n as u64)); }
+        if (n > 0) { return this.finish(Result::Ok(n as i64)); }
         const code: i32 = openssl::SSL_get_error(this.tls.ssl_ptr(), n);
         const interest: u32 = interest_for(code);
         if (interest != 0) {
@@ -304,8 +304,8 @@ implement trait Drop for struct TlsWrite {
 
 /// OpenSSL's length argument is a C `int`; cap at `INT_MAX` and let a caller
 /// with more to move start another operation for the remainder.
-private function clamp_io(n: u64) -> i32 {
-    if (n > i32::MAX as u64) { return i32::MAX; }
+private function clamp_io(n: i64) -> i32 {
+    if (n > i32::MAX as i64) { return i32::MAX; }
     return n as i32;
 }
 

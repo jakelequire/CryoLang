@@ -30,11 +30,11 @@ import std::core::mem;
 
 /// First HPACK index of the dynamic table: the static table holds 61
 /// entries (1..61), so the dynamic table begins at 62.
-const DYNAMIC_BASE: u64 = 62;
+const DYNAMIC_BASE: i64 = 62;
 
 /// Per-entry overhead the dynamic table charges on top of the name and
 /// value byte lengths (RFC 7541 section 4.1).
-const ENTRY_OVERHEAD: u64 = 32;
+const ENTRY_OVERHEAD: i64 = 32;
 
 /// Hard ceiling on the cumulative *uncompressed* size of a decoded header
 /// list (each field counts name + value + ENTRY_OVERHEAD per section 4.1). HPACK
@@ -42,7 +42,7 @@ const ENTRY_OVERHEAD: u64 = 32;
 /// this a small compressed block could decode into an unbounded list - a
 /// decompression bomb. A block that decodes past this is rejected. Kept in
 /// step with the connection's advertised SETTINGS_MAX_HEADER_LIST_SIZE.
-const MAX_DECODED_HEADER_LIST: u64 = 262144;
+const MAX_DECODED_HEADER_LIST: i64 = 262144;
 
 /// One header field. Owns its name and value bytes.
 type struct HeaderField {
@@ -57,8 +57,8 @@ type struct HeaderField {
     }
 
     /// Storage size charged against the dynamic table budget.
-    entry_size(&this) -> u64 {
-        return (this.name.length() + this.value.length()) as u64 + ENTRY_OVERHEAD;
+    entry_size(&this) -> i64 {
+        return this.name.length() + this.value.length() + ENTRY_OVERHEAD;
     }
 }
 
@@ -79,10 +79,10 @@ type struct Cursor {
 /// 62); the oldest entries are evicted when the byte budget is exceeded.
 type struct DynTable {
     entries:  Array<HeaderField>;
-    size:     u64;
-    max_size: u64;
+    size:     i64;
+    max_size: i64;
 
-    static new(max_size: u64) -> DynTable {
+    static new(max_size: i64) -> DynTable {
         return DynTable {
             entries:  Array::<HeaderField>::new(),
             size:     0,
@@ -100,7 +100,7 @@ type struct DynTable {
     /// budget empties the table (RFC 7541 section 4.4).
     add(mut &this, name: Str, value: Str) -> void {
         mut field: HeaderField = HeaderField::new(name, value);
-        const added: u64 = field.entry_size();
+        const added: i64 = field.entry_size();
         this.entries.insert(0, field);
         this.size = this.size + added;
         this.evict();
@@ -108,7 +108,7 @@ type struct DynTable {
 
     /// Shrink the maximum size (a dynamic table size update), evicting
     /// to fit immediately.
-    set_max(mut &this, max_size: u64) -> void {
+    set_max(mut &this, max_size: i64) -> void {
         this.max_size = max_size;
         this.evict();
     }
@@ -144,7 +144,7 @@ type struct StaticEntry {
 
 /// Look up static-table entry `index` (1..61). `found` is false for any
 /// out-of-range index.
-function static_entry(index: u64) -> StaticEntry {
+function static_entry(index: i64) -> StaticEntry {
     if (index == 1)  { return se(":authority", ""); }
     if (index == 2)  { return se(":method", "GET"); }
     if (index == 3)  { return se(":method", "POST"); }
@@ -214,20 +214,23 @@ function se(name: string, value: string) -> StaticEntry {
 }
 
 /// Count of static-table entries.
-const STATIC_COUNT: u64 = 61;
+const STATIC_COUNT: i64 = 61;
 
 // ---- integer codec (RFC 7541 section 5.1) ----------------------------------------
 
 /// Append `value` as an N-bit-prefix integer. `prefix_value` carries the
 /// representation's high bits (the prefix bits themselves must be zero).
-function encode_integer(out: mut &Array<u8>, prefix_bits: u32, prefix_value: u8, value: u64) -> void {
+/// `value` is a length or an index, never negative; the wire form is
+/// unsigned.
+function encode_integer(out: mut &Array<u8>, prefix_bits: u32, prefix_value: u8, value: i64) -> void {
+    const wire: u64 = value as u64;
     const max: u64 = (1 << (prefix_bits as u64)) - 1;
-    if (value < max) {
-        out.push(prefix_value | (value as u8));
+    if (wire < max) {
+        out.push(prefix_value | (wire as u8));
         return;
     }
     out.push(prefix_value | (max as u8));
-    mut v: u64 = value - max;
+    mut v: u64 = wire - max;
     while (v >= 128) {
         out.push(((v & 0x7f) | 0x80) as u8);
         v = v >> 7;
@@ -236,13 +239,14 @@ function encode_integer(out: mut &Array<u8>, prefix_bits: u32, prefix_value: u8,
 }
 
 /// Decode an N-bit-prefix integer starting at the cursor. Advances the
-/// cursor. `None` on truncation or an over-long continuation.
-function decode_integer(data: Slice<u8>, cur: mut &Cursor, prefix_bits: u32) -> Option<u64> {
+/// cursor. `None` on truncation, an over-long continuation, or a value
+/// past `i64::MAX`, which no length or index can be.
+function decode_integer(data: Slice<u8>, cur: mut &Cursor, prefix_bits: u32) -> Option<i64> {
     if (cur.pos >= data.length()) { return Option::None; }
     const max: u64 = (1 << (prefix_bits as u64)) - 1;
     mut value: u64 = (byte_at(data, cur.pos) as u64) & max;
     cur.pos = cur.pos + 1;
-    if (value < max) { return Option::Some(value); }
+    if (value < max) { return Option::Some(value as i64); }
     mut m: u64 = 0;
     loop {
         if (cur.pos >= data.length()) { return Option::None; }
@@ -253,7 +257,8 @@ function decode_integer(data: Slice<u8>, cur: mut &Cursor, prefix_bits: u32) -> 
         m = m + 7;
         if ((b & 0x80) == 0) { break; }
     }
-    return Option::Some(value);
+    if (value > i64::MAX as u64) { return Option::None; }
+    return Option::Some(value as i64);
 }
 
 // ---- string codec (RFC 7541 section 5.2) -----------------------------------------
@@ -261,8 +266,8 @@ function decode_integer(data: Slice<u8>, cur: mut &Cursor, prefix_bits: u32) -> 
 /// Append a string literal, Huffman-coding it when that is strictly
 /// shorter than the raw bytes.
 function encode_string(out: mut &Array<u8>, s: Slice<u8>) -> void {
-    const raw_len: u64 = s.length() as u64;
-    const huff_len: u64 = huffman::encoded_len(s);
+    const raw_len: i64 = s.length();
+    const huff_len: i64 = huffman::encoded_len(s);
     if (huff_len < raw_len) {
         encode_integer(out, 7, 0x80, huff_len);
         mut coded: Array<u8> = huffman::encode(s);
@@ -278,14 +283,11 @@ function encode_string(out: mut &Array<u8>, s: Slice<u8>) -> void {
 function decode_string(data: Slice<u8>, cur: mut &Cursor) -> Option<String> {
     if (cur.pos >= data.length()) { return Option::None; }
     const huffman_flag: boolean = (byte_at(data, cur.pos) & 0x80) != 0;
-    const encoded_len: u64 = match (decode_integer(data, cur, 7)) {
+    const len: i64 = match (decode_integer(data, cur, 7)) {
         Option::Some(n) => { n }
         Option::None    => { return Option::None; }
     };
-    // The encoded length is a protocol integer: compared before it becomes
-    // a position, so one past `i64` cannot read as negative.
-    if (encoded_len > (data.length() - cur.pos) as u64) { return Option::None; }
-    const len: i64 = encoded_len as i64;
+    if (len > data.length() - cur.pos) { return Option::None; }
     const raw: Slice<u8> = Slice::from_raw(data.as_ptr() + cur.pos, len);
     cur.pos = cur.pos + len;
     if (huffman_flag) {
@@ -308,9 +310,9 @@ type struct HpackDecoder {
     /// The largest dynamic-table size we permit a peer to select - the
     /// `SETTINGS_HEADER_TABLE_SIZE` we advertised.  RFC 7541 section 6.3 requires
     /// rejecting a dynamic-table-size update that exceeds it.
-    hard_max: u64;
+    hard_max: i64;
 
-    static new(max_dynamic: u64) -> HpackDecoder {
+    static new(max_dynamic: i64) -> HpackDecoder {
         return HpackDecoder { table: DynTable::new(max_dynamic), hard_max: max_dynamic };
     }
 
@@ -320,13 +322,13 @@ type struct HpackDecoder {
     decode(mut &this, data: Slice<u8>) -> Option<Array<HeaderField>> {
         mut out: Array<HeaderField> = Array::<HeaderField>::new();
         mut cur: Cursor = Cursor { pos: 0 };
-        mut list_size: u64 = 0;
+        mut list_size: i64 = 0;
 
         while (cur.pos < data.length()) {
             const b: u8 = byte_at(data, cur.pos);
             if ((b & 0x80) != 0) {
                 // section 6.1 Indexed header field.
-                const index: u64 = match (decode_integer(data, &cur, 7)) {
+                const index: i64 = match (decode_integer(data, &cur, 7)) {
                     Option::Some(n) => { n }
                     Option::None    => { mem::drop(out); return Option::None; }
                 };
@@ -357,7 +359,7 @@ type struct HpackDecoder {
                 // (SETTINGS_HEADER_TABLE_SIZE); a larger value is a
                 // decoding error (and would otherwise let a peer inflate
                 // our per-connection table memory).
-                const new_max: u64 = match (decode_integer(data, &cur, 5)) {
+                const new_max: i64 = match (decode_integer(data, &cur, 5)) {
                     Option::Some(n) => { n }
                     Option::None    => { mem::drop(out); return Option::None; }
                 };
@@ -386,9 +388,8 @@ type struct HpackDecoder {
     /// MAX_DECODED_HEADER_LIST (the HPACK decompression-bomb guard). On a
     /// false return the caller drops `out`.
     static account_and_push(out: mut &Array<HeaderField>, field: HeaderField,
-                            list_size: mut &u64) -> boolean {
-        *list_size = *list_size + (field.name.length() + field.value.length()) as u64
-                     + ENTRY_OVERHEAD;
+                            list_size: mut &i64) -> boolean {
+        *list_size = *list_size + field.entry_size();
         if (*list_size > MAX_DECODED_HEADER_LIST) {
             return false;
         }
@@ -401,7 +402,7 @@ type struct HpackDecoder {
     /// into the dynamic table (incremental indexing).
     decode_literal(mut &this, data: Slice<u8>, cur: mut &Cursor,
                    prefix_bits: u32, add: boolean) -> Option<HeaderField> {
-        const name_index: u64 = match (decode_integer(data, cur, prefix_bits)) {
+        const name_index: i64 = match (decode_integer(data, cur, prefix_bits)) {
             Option::Some(n) => { n }
             Option::None    => { return Option::None; }
         };
@@ -430,28 +431,28 @@ type struct HpackDecoder {
 
     /// Resolve a full entry (owned copies) for an index across the
     /// static then dynamic tables.
-    entry_at(&this, index: u64) -> Option<HeaderField> {
+    entry_at(&this, index: i64) -> Option<HeaderField> {
         if (index >= 1 && index <= STATIC_COUNT) {
             const e: StaticEntry = static_entry(index);
             return Option::Some(HeaderField::new(e.name, e.value));
         }
-        const d: u64 = index - DYNAMIC_BASE;
-        if (d < this.table.length() as u64) {
-            const stored: HeaderField* = this.table.get_ref(d as i64);
+        const d: i64 = index - DYNAMIC_BASE;
+        if (d >= 0 && d < this.table.length()) {
+            const stored: HeaderField* = this.table.get_ref(d);
             return Option::Some(HeaderField::new(stored.name.as_str(), stored.value.as_str()));
         }
         return Option::None;
     }
 
     /// Resolve just the name (owned copy) for an index.
-    name_at(&this, index: u64) -> Option<String> {
+    name_at(&this, index: i64) -> Option<String> {
         if (index >= 1 && index <= STATIC_COUNT) {
             const e: StaticEntry = static_entry(index);
             return Option::Some(String::from_str(e.name));
         }
-        const d: u64 = index - DYNAMIC_BASE;
-        if (d < this.table.length() as u64) {
-            const stored: HeaderField* = this.table.get_ref(d as i64);
+        const d: i64 = index - DYNAMIC_BASE;
+        if (d >= 0 && d < this.table.length()) {
+            const stored: HeaderField* = this.table.get_ref(d);
             return Option::Some(String::from_str(stored.name.as_str()));
         }
         return Option::None;
@@ -467,14 +468,14 @@ implement trait Drop for struct HpackDecoder {
 type struct HpackEncoder {
     table: DynTable;
 
-    static new(max_dynamic: u64) -> HpackEncoder {
+    static new(max_dynamic: i64) -> HpackEncoder {
         return HpackEncoder { table: DynTable::new(max_dynamic) };
     }
 
     /// Cap the dynamic table to the peer decoder's advertised
     /// SETTINGS_HEADER_TABLE_SIZE, evicting to fit. We never grow past
     /// our own default, so this only ever shrinks.
-    set_capacity(mut &this, max_size: u64) -> void {
+    set_capacity(mut &this, max_size: i64) -> void {
         if (max_size < this.table.max_size) {
             this.table.set_max(max_size);
         }
@@ -486,12 +487,12 @@ type struct HpackEncoder {
     /// with a literal name. `sensitive` forces the never-indexed
     /// representation and skips the dynamic table.
     encode_field(mut &this, out: mut &Array<u8>, name: Str, value: Str, sensitive: boolean) -> void {
-        const full: u64 = this.find_full(name, value);
+        const full: i64 = this.find_full(name, value);
         if (full != 0) {
             encode_integer(out, 7, 0x80, full);   // section 6.1 indexed
             return;
         }
-        const name_idx: u64 = this.find_name(name);
+        const name_idx: i64 = this.find_name(name);
         if (sensitive) {
             // section 6.2.3 never indexed (0001 prefix), not stored.
             encode_integer(out, 4, 0x10, name_idx);
@@ -507,8 +508,8 @@ type struct HpackEncoder {
     }
 
     /// Combined-index of an exact name+value match, or 0.
-    find_full(&this, name: Str, value: Str) -> u64 {
-        mut i: u64 = 1;
+    find_full(&this, name: Str, value: Str) -> i64 {
+        mut i: i64 = 1;
         while (i <= STATIC_COUNT) {
             const e: StaticEntry = static_entry(i);
             if (e.name.equals(&name) && e.value.equals(&value)) { return i; }
@@ -518,7 +519,7 @@ type struct HpackEncoder {
         while (d < this.table.length()) {
             const stored: HeaderField* = this.table.get_ref(d);
             if (stored.name.as_str().equals(&name) && stored.value.as_str().equals(&value)) {
-                return DYNAMIC_BASE + d as u64;
+                return DYNAMIC_BASE + d;
             }
             d++;
         }
@@ -526,8 +527,8 @@ type struct HpackEncoder {
     }
 
     /// Combined-index of the first name match, or 0.
-    find_name(&this, name: Str) -> u64 {
-        mut i: u64 = 1;
+    find_name(&this, name: Str) -> i64 {
+        mut i: i64 = 1;
         while (i <= STATIC_COUNT) {
             const e: StaticEntry = static_entry(i);
             if (e.name.equals(&name)) { return i; }
@@ -536,7 +537,7 @@ type struct HpackEncoder {
         mut d: i64 = 0;
         while (d < this.table.length()) {
             const stored: HeaderField* = this.table.get_ref(d);
-            if (stored.name.as_str().equals(&name)) { return DYNAMIC_BASE + d as u64; }
+            if (stored.name.as_str().equals(&name)) { return DYNAMIC_BASE + d; }
             d++;
         }
         return 0;

@@ -377,13 +377,16 @@ Left over from that: the async entry point calls `Executor::new` and
    collections' `length` and `capacity` fields are private behind
    `![inline]` accessors (574), every `length()` and every position and
    size a collection method takes or answers is an `i64` (575), and a
-   negative one means what the method's kind says (576).  Left: the byte
-   counts of the I/O traits (`read`, `write`, `consume`, a cursor's
-   position), the number-to-text writers (`to_decimal_buf`, `f64.to_buf`
-   and their kind), `next_below`, and the HTTP/2 wire integers are still
-   `u64`, cast where they meet an `i64`.  Reaching a length through its
-   accessor costs `cryo check` about a tenth more than a field read did;
-   that is to be optimized when the HIR and MIR pipeline lands.
+   negative one means what the method's kind says (576).  The byte counts
+   and positions of the I/O traits, the number-to-text writers,
+   `next_below` and the HTTP/2 lengths and indexes are `i64` too: a read
+   or seek given a negative one fails with `InvalidInput`, moving a
+   cursor by one panics, and a width or precision of zero or less writes
+   nothing extra.  Left: `HashMap::bucket_count` and `get_bucket` are
+   still `u64`, because the bucket index is masked from a `u64` hash.
+   Reaching a length through its accessor costs `cryo check` about a
+   tenth more than a field read did; that is to be optimized when the HIR
+   and MIR pipeline lands.
 2. **`Display` and `Debug` over a trait object:** one non-generic `fmt`
    writing through a `virtual mut &FmtWrite` held by `Formatter`, in
    place of `fmt<W>`; code size and the fmt suites measured first.

@@ -1,0 +1,160 @@
+///! A negative byte count, position, width or bound given to the I/O layer,
+///! the number writers or the random source is never read as a huge
+///! unsigned one: a read refuses it with `InvalidInput` before any byte
+///! moves, a seek to a negative offset refuses it the same way, a method
+///! that moves a cursor panics, a width or precision of zero or less writes
+///! nothing extra, and an empty random range panics.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::IoNegativeCounts;
+
+import std::core::result;
+import std::core::result::{ Result };
+import std::collections::array;
+import std::collections::array::{ Array };
+import std::collections::str;
+import std::collections::str::{ Str };
+import std::io::error;
+import std::io::error::{ IoError, IoErrorKind };
+import std::io::fd;
+import std::io::traits;
+import std::io::traits::{ Read, Seek, SeekFrom };
+import std::io::cursor;
+import std::io::cursor::{ Cursor };
+import std::io::buf;
+import std::io::buf::{ BufReader, BufWriter };
+import std::random::rng;
+import std::random::rng::{ Rng };
+import std::random::source;
+import std::random::source::{ RandomSource };
+import std::test::error;
+import std::test::error::{ TestError };
+import std::test::assert;
+import std::test::assert::{ expect, expect_eq };
+
+function abc() -> Cursor {
+    mut bytes: Array<u8> = Array::new();
+    bytes.push(97); bytes.push(98); bytes.push(99);
+    return Cursor::new(bytes);
+}
+
+function is_invalid_input(r: Result<i64, IoError>) -> boolean {
+    match (r) {
+        Result::Ok(_)  => { return false; }
+        Result::Err(e) => {
+            match (e.kind) {
+                IoErrorKind::InvalidInput => { return true; }
+                _ => { return false; }
+            }
+        }
+    }
+}
+
+// --- a read refuses a negative length ---------------------------------------
+
+![test]
+function cursor_read_negative_length_is_invalid_input() -> Result<(), TestError> {
+    mut c: Cursor = abc();
+    mut buffer: [u8; 4];
+    expect(is_invalid_input(c.read(&buffer[0], -1)), Str::new("Cursor::read(-1)"))?;
+    return expect_eq(c.position(), 0 as i64);
+}
+
+![test]
+function read_all_negative_length_is_invalid_input() -> Result<(), TestError> {
+    mut c: Cursor = abc();
+    mut buffer: [u8; 4];
+    return expect(is_invalid_input(c.read_all(&buffer[0], -1)), Str::new("read_all(-1)"));
+}
+
+![test]
+function read_fd_negative_length_is_invalid_input() -> Result<(), TestError> {
+    // A bad descriptor would fail with a different kind; `InvalidInput`
+    // shows the length was refused before the system call.
+    mut buffer: [u8; 4];
+    return expect(is_invalid_input(fd::read_fd(-1, &buffer[0], -1)), Str::new("read_fd(-1, -1)"));
+}
+
+![test]
+function buf_reader_read_negative_length_is_invalid_input() -> Result<(), TestError> {
+    mut c: Cursor = abc();
+    mut reader: BufReader<Cursor> = BufReader::new(&c);
+    mut buffer: [u8; 4];
+    return expect(is_invalid_input(reader.read(&buffer[0], -1)), Str::new("BufReader::read(-1)"));
+}
+
+// --- a seek to a negative offset is refused ---------------------------------
+
+![test]
+function cursor_seek_negative_start_is_invalid_input() -> Result<(), TestError> {
+    mut c: Cursor = abc();
+    expect(is_invalid_input(c.seek(SeekFrom::Start(-1))), Str::new("seek(Start(-1))"))?;
+    return expect_eq(c.position(), 0 as i64);
+}
+
+// --- moving a cursor by a negative amount panics ----------------------------
+
+![test]
+![should_panic]
+function cursor_set_position_negative_panics() -> Result<(), TestError> {
+    mut c: Cursor = abc();
+    c.set_position(-1);
+    return Result::Ok(());
+}
+
+![test]
+![should_panic]
+function buf_reader_consume_negative_panics() -> Result<(), TestError> {
+    mut c: Cursor = abc();
+    mut reader: BufReader<Cursor> = BufReader::new(&c);
+    reader.consume(-1);
+    return Result::Ok(());
+}
+
+![test]
+![should_panic]
+function buf_reader_negative_capacity_panics() -> Result<(), TestError> {
+    mut c: Cursor = abc();
+    const _reader: BufReader<Cursor> = BufReader::with_capacity(&c, -1);
+    return Result::Ok(());
+}
+
+// --- a size of zero or less means nothing to do -----------------------------
+
+![test]
+function buf_writer_negative_capacity_buffers_nothing() -> Result<(), TestError> {
+    mut c: Cursor = Cursor::empty();
+    const writer: BufWriter<Cursor> = BufWriter::with_capacity(&c, -8);
+    return expect_eq(writer.capacity(), 0 as i64);
+}
+
+![test]
+function padded_writers_negative_width_write_nothing() -> Result<(), TestError> {
+    mut buffer: [u8; 8];
+    const value: u64 = 42;
+    expect_eq(value.to_decimal_padded_buf(&buffer[0], -2), 0 as i64)?;
+    expect_eq(value.to_hex_padded_buf(&buffer[0], -2), 0 as i64)?;
+    return expect(Str::new(value.to_hex_padded_str(-1)).is_empty(), Str::new("to_hex_padded_str(-1)"));
+}
+
+![test]
+function float_negative_precision_writes_no_fraction() -> Result<(), TestError> {
+    mut negative: [u8; 32];
+    mut zero: [u8; 32];
+    const value: f64 = 3.75;
+    const n: i64 = value.to_buf_with(&negative[0], -3);
+    const m: i64 = value.to_buf_with(&zero[0], 0);
+    expect_eq(n, m)?;
+    return expect(Str::from_raw(&negative[0], n).equals(&Str::from_raw(&zero[0], m)),
+                  Str::new("to_buf_with(-3) == to_buf_with(0)"));
+}
+
+// --- an empty random range panics -------------------------------------------
+
+![test]
+![should_panic]
+function next_below_negative_bound_panics() -> Result<(), TestError> {
+    mut r: Rng = Rng::from_seed(7);
+    const _v: i64 = r.next_below(-5);
+    return Result::Ok(());
+}

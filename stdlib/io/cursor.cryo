@@ -33,7 +33,7 @@ import std::ffi::libc;
 /// first).
 type struct Cursor {
     buffer: Array<u8>;
-    pos:    u64;
+    pos:    i64;
 
     /// Wrap an existing byte buffer with the cursor at position 0. Takes
     /// ownership of `buffer`; reads start at its first byte.
@@ -50,20 +50,24 @@ type struct Cursor {
     /// Current cursor position: the absolute byte offset from the start
     /// where the next read or write lands. Independent of the buffer
     /// length; may exceed it after a seek-past-end.
-    position(&this) -> u64 {
+    position(&this) -> i64 {
         return this.pos;
     }
 
     /// Set the cursor position directly. Positions past the buffer end
-    /// are allowed and behave as documented on the type.
-    set_position(mut &this, pos: u64) -> void {
+    /// are allowed and behave as documented on the type; a negative one
+    /// panics "out of range".
+    set_position(mut &this, pos: i64) -> void {
+        if (pos < 0) {
+            core::panic("Cursor::set_position: out of range", intrinsics::location());
+        }
         this.pos = pos;
     }
 
     /// Number of bytes currently in the buffer, independent of the
     /// cursor position.
-    len(&this) -> u64 {
-        return this.buffer.length() as u64;
+    len(&this) -> i64 {
+        return this.buffer.length();
     }
 
     /// Borrow the buffered bytes without moving the cursor. The slice is
@@ -86,20 +90,23 @@ type struct Cursor {
 /// Read from the position forward, copying at most `length` bytes into
 /// `buffer` and advancing the cursor. A read at or past the buffer end
 /// returns 0 (EOF); otherwise it returns as many bytes as remain, up to
-/// `length`. Never errors.
+/// `length`. A negative `length` fails with `InvalidInput`.
 implement trait Read for struct Cursor {
-    read(mut &this, buffer: u8*, length: u64) -> Result<u64, IoError> {
-        const total: u64 = this.buffer.length() as u64;
+    read(mut &this, buffer: u8*, length: i64) -> Result<i64, IoError> {
+        if (length < 0) {
+            return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
+        }
+        const total: i64 = this.buffer.length();
         if (this.pos >= total) {
             return Result::Ok(0);
         }
-        mut n: u64 = total - this.pos;
+        mut n: i64 = total - this.pos;
         if (n > length) { n = length; }
         if (n > 0) {
             libc::memcpy(
                 buffer as void*,
                 (this.buffer.as_ptr() + this.pos) as void*,
-                n);
+                n as u64);
             this.pos = this.pos + n;
         }
         return Result::Ok(n);
@@ -112,14 +119,14 @@ implement trait Read for struct Cursor {
 /// `flush` is a no-op. Fails only on allocation failure during growth,
 /// surfaced as `WriteZero`.
 implement trait Write for struct Cursor {
-    write_some(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
-        const n: u64 = bytes.length() as u64;
+    write_some(mut &this, bytes: Slice<u8>) -> Result<i64, IoError> {
+        const n: i64 = bytes.length();
         if (n == 0) {
             return Result::Ok(0);
         }
         // Zero-fill any gap between the buffer end and the cursor so the
         // write always lands inside initialised storage.
-        while ((this.buffer.length() as u64) < this.pos) {
+        while (this.buffer.length() < this.pos) {
             match (this.buffer.try_push(0)) {
                 Result::Ok(_)  => { }
                 Result::Err(_) => {
@@ -128,11 +135,11 @@ implement trait Write for struct Cursor {
             }
         }
         const src: u8* = bytes.as_ptr();
-        mut i: u64 = 0;
+        mut i: i64 = 0;
         while (i < n) {
-            const at: u64 = this.pos + i;
-            if (at < (this.buffer.length() as u64)) {
-                this.buffer.set(at as i64, src[i]);
+            const at: i64 = this.pos + i;
+            if (at < this.buffer.length()) {
+                this.buffer.set(at, src[i]);
             } else {
                 match (this.buffer.try_push(src[i])) {
                     Result::Ok(_)  => { }
@@ -158,27 +165,21 @@ implement trait Write for struct Cursor {
 
 /// Reposition the cursor. `Start` sets an absolute offset; `Current` and
 /// `End` apply a signed delta to the position or the buffer length. A
-/// resulting negative offset fails with `InvalidInput`; landing past the
-/// end is allowed (the next write zero-fills up to it).
+/// resulting negative offset, a negative `Start` among them, fails with
+/// `InvalidInput`; landing past the end is allowed (the next write
+/// zero-fills up to it).
 implement trait Seek for struct Cursor {
-    seek(mut &this, from: SeekFrom) -> Result<u64, IoError> {
+    seek(mut &this, from: SeekFrom) -> Result<i64, IoError> {
         mut target: i64 = 0;
         match (from) {
-            SeekFrom::Start(offset) => {
-                this.pos = offset;
-                return Result::Ok(offset);
-            }
-            SeekFrom::Current(offset) => {
-                target = (this.pos as i64) + offset;
-            }
-            SeekFrom::End(offset) => {
-                target = (this.buffer.length() as i64) + offset;
-            }
+            SeekFrom::Start(offset)   => { target = offset; }
+            SeekFrom::Current(offset) => { target = this.pos + offset; }
+            SeekFrom::End(offset)     => { target = this.buffer.length() + offset; }
         }
         if (target < 0) {
             return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
         }
-        this.pos = target as u64;
+        this.pos = target;
         return Result::Ok(this.pos);
     }
 }

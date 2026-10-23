@@ -64,7 +64,7 @@ type trait RandomSource {
                 // Uniform Unicode scalar: draw over `[0, 0x110000)` minus the
                 // 0x800-wide UTF-16 surrogate gap `[0xD800, 0xE000)`, then fold
                 // the gap back in.
-                const bound: u64 = 0x110000 - 0x800;
+                const bound: i64 = 0x110000 - 0x800;
                 mut c: u32 = this.next_below(bound) as u32;
                 if (c >= 0xD800) { c = c + 0x800; }
                 c as char
@@ -74,31 +74,39 @@ type trait RandomSource {
 
     /// A uniform integer in `[0, bound)`. Unbiased: the top partial
     /// bucket is rejected so the modulo introduces no skew. Panics when
-    /// `bound == 0` - an empty range has no value to return.
-    next_below(mut &this, bound: u64) -> u64 {
-        if (bound == 0) {
+    /// `bound <= 0` - an empty range has no value to return.
+    next_below(mut &this, bound: i64) -> i64 {
+        if (bound <= 0) {
             core::panic("RandomSource::next_below: bound must be > 0", intrinsics::location());
         }
-        const threshold: u64 = (u64::MAX - bound + 1) % bound;   // 2^64 mod bound
+        const span: u64 = bound as u64;
+        const threshold: u64 = (u64::MAX - span + 1) % span;   // 2^64 mod span
         loop {
             const x: u64 = this.next_64();
             if (x >= threshold) {
-                return x % bound;
+                return (x % span) as i64;
             }
         }
     }
 
     /// A uniform integer of type `T` in `[lo, hi)`. Requires `lo < hi`.
-    /// `static match (T)` covers every integer width: the spans of the
-    /// 64-bit-and-narrower types are drawn unbiased through `next_below`;
-    /// `u128`/`i128` use an inline 128-bit rejection sampler.
+    /// `static match (T)` covers every integer width: a span of a
+    /// 64-bit-and-narrower type is drawn unbiased through `next_below`,
+    /// and through the 128-bit sampler `next_below_wide` when it is wider
+    /// than `i64::MAX`; `u128`/`i128` always use the 128-bit sampler.
     next_range<T>(mut &this, lo: T, hi: T) -> T {
         return static match (T) {
             u8 | u16 | u32 | u64 | usize | i8 | i16 | i32 | i64 | isize => {
                 if (lo >= hi) {
                     core::panic("RandomSource::next_range: lo must be < hi", intrinsics::location());
                 }
-                lo + (this.next_below((hi - lo) as u64) as T)
+                const span: u64 = (hi - lo) as u64;
+                const offset: u64 = if (span <= i64::MAX as u64) {
+                    this.next_below(span as i64) as u64
+                } else {
+                    this.next_below_wide(span as u128) as u64
+                };
+                lo + (offset as T)
             }
             u128 => {
                 if (lo >= hi) {
@@ -134,11 +142,11 @@ type trait RandomSource {
 
     /// Fill `dst` with random bytes, writing through the view.
     fill(mut &this, dst: Slice<u8>) -> void {
-        const len: u64 = dst.length() as u64;
+        const len: i64 = dst.length();
         const buf: u8* = dst.as_ptr();
-        mut i: u64 = 0;
+        mut i: i64 = 0;
         while (i + 8 <= len) {
-            store_u64_le(mem::offset(buf, i as i64), this.next_64());
+            store_u64_le(mem::offset(buf, i), this.next_64());
             i = i + 8;
         }
         if (i < len) {
@@ -160,7 +168,7 @@ type trait RandomSource {
         const base: T* = items.as_ptr();
         mut i: i64 = n - 1;
         loop {
-            const j: i64 = this.next_below((i + 1) as u64) as i64;
+            const j: i64 = this.next_below(i + 1);
             if (i != j) {
                 const a: T* = mem::offset(base, i);
                 const b: T* = mem::offset(base, j);
@@ -181,6 +189,6 @@ type trait RandomSource {
         if (n == 0) {
             return Option::None;
         }
-        return items.get_ref(this.next_below(n as u64) as i64);
+        return items.get_ref(this.next_below(n));
     }
 }

@@ -54,7 +54,7 @@ function parse_f64(s: string) -> Option<f64> {
 }
 
 /// Default fractional digits for fixed-point output.
-const DEFAULT_DECIMALS: u64 = 6;
+const DEFAULT_DECIMALS: i64 = 6;
 
 /// Above this magnitude, switch to scientific.
 const LARGE_THRESHOLD: f64 = 1.0e16;
@@ -65,7 +65,7 @@ const SMALL_THRESHOLD: f64 = 1.0e-4;
 /// Largest buffer the writers below will ever touch. A scientific-notation
 /// f64 with 6 fractional digits and a 4-digit exponent fits well inside
 /// this. Callers who stack-allocate pick this size.
-const F64_MAX_DIGITS: u64 = 32;
+const F64_MAX_DIGITS: i64 = 32;
 
 // Extension methods on f32: widen to f64 and delegate.
 //
@@ -75,12 +75,12 @@ const F64_MAX_DIGITS: u64 = 32;
 // f64 path itself gains Grisu/Ryu; same future work, same code path.
 
 implement f32 {
-    to_buf(&this, buffer: u8*) -> u64 {
+    to_buf(&this, buffer: u8*) -> i64 {
         const v: f64 = this as f64;
         return v.to_buf(buffer);
     }
 
-    to_buf_with(&this, buffer: u8*, decimals: u64) -> u64 {
+    to_buf_with(&this, buffer: u8*, decimals: i64) -> i64 {
         const v: f64 = this as f64;
         return v.to_buf_with(buffer, decimals);
     }
@@ -106,14 +106,16 @@ implement f64 {
 
     /// Write `this` into `buffer`. Returns bytes written. `buffer` must
     /// hold at least `F64_MAX_DIGITS` bytes.
-    to_buf(&this, buffer: u8*) -> u64 {
+    to_buf(&this, buffer: u8*) -> i64 {
         return this.to_buf_with(buffer, DEFAULT_DECIMALS);
     }
 
     /// Variant with caller-chosen precision. `decimals` applies to the
-    /// fixed-point form and to the mantissa of the scientific form.
-    to_buf_with(&this, buffer: u8*, decimals: u64) -> u64 {
+    /// fixed-point form and to the mantissa of the scientific form; zero
+    /// or less writes no fractional digits.
+    to_buf_with(&this, buffer: u8*, decimals: i64) -> i64 {
         const value: f64 = this;
+        const places: i64 = if (decimals > 0) { decimals } else { 0 };
         if (fp_is_nan(value)) {
             return write_literal(buffer, "NaN", 3);
         }
@@ -124,7 +126,7 @@ implement f64 {
             return write_literal(buffer, "inf", 3);
         }
 
-        mut cursor: u64 = 0;
+        mut cursor: i64 = 0;
         mut absolute: f64 = value;
         if (value < 0.0 || value.is_negative_zero()) {
             buffer[cursor] = 0x2D; // '-'
@@ -138,9 +140,9 @@ implement f64 {
         }
 
         if (absolute >= LARGE_THRESHOLD || absolute < SMALL_THRESHOLD) {
-            return cursor + write_scientific(buffer + cursor, absolute, decimals);
+            return cursor + write_scientific(buffer + cursor, absolute, places);
         }
-        return cursor + write_fixed(buffer + cursor, absolute, decimals);
+        return cursor + write_fixed(buffer + cursor, absolute, places);
     }
 
     /// Write `this` as the SHORTEST decimal string that re-parses (via
@@ -157,32 +159,32 @@ implement f64 {
     /// `buffer` must hold at least 32 bytes. Non-finite inputs (NaN/Inf) have
     /// no round-trippable form; callers handle them first, but as a guard we
     /// fall back to the debug spelling.
-    to_buf_roundtrip(&this, buffer: u8*) -> u64 {
+    to_buf_roundtrip(&this, buffer: u8*) -> i64 {
         const value: f64 = this;
         if (fp_is_nan(value) || fp_is_inf(value)) {
             return this.to_buf_with(buffer, DEFAULT_DECIMALS);
         }
         mut n: i32 = libc::snprintf(buffer, 32, "%.15g" as u8*, value);
-        if (n > 0 && libc::strtod(buffer, null) == value) { return n as u64; }
+        if (n > 0 && libc::strtod(buffer, null) == value) { return n as i64; }
         n = libc::snprintf(buffer, 32, "%.16g" as u8*, value);
-        if (n > 0 && libc::strtod(buffer, null) == value) { return n as u64; }
+        if (n > 0 && libc::strtod(buffer, null) == value) { return n as i64; }
         n = libc::snprintf(buffer, 32, "%.17g" as u8*, value);
         if (n < 0) { return 0; }
-        return n as u64;
+        return n as i64;
     }
 }
 
 // Private helpers
 
-private function write_literal(buffer: u8*, literal: u8*, length: u64) -> u64 {
-    libc::memcpy(buffer as void*, literal as void*, length);
+private function write_literal(buffer: u8*, literal: u8*, length: i64) -> i64 {
+    libc::memcpy(buffer as void*, literal as void*, length as u64);
     return length;
 }
 
 /// Fixed-point: integer part, `.`, zero-padded fraction. Assumes
 /// `value >= 0` and is within LARGE/SMALL thresholds; caller has
 /// routed NaN/Inf/zero/scientific cases already.
-private function write_fixed(buffer: u8*, value: f64, decimals: u64) -> u64 {
+private function write_fixed(buffer: u8*, value: f64, decimals: i64) -> i64 {
     mut integer_part: u64 = value as u64;
 
     if (decimals == 0) {
@@ -205,7 +207,7 @@ private function write_fixed(buffer: u8*, value: f64, decimals: u64) -> u64 {
         integer_part = integer_part + 1;
     }
 
-    mut cursor: u64 = integer_part.to_decimal_buf(buffer);
+    mut cursor: i64 = integer_part.to_decimal_buf(buffer);
     buffer[cursor] = 0x2E; // '.'
     cursor = cursor + 1;
     cursor = cursor + frac_scaled.to_decimal_padded_buf(buffer + cursor, decimals);
@@ -213,7 +215,7 @@ private function write_fixed(buffer: u8*, value: f64, decimals: u64) -> u64 {
 }
 
 /// Scientific: `<mantissa>e<sign><exponent>`. Assumes `value > 0`.
-private function write_scientific(buffer: u8*, value: f64, decimals: u64) -> u64 {
+private function write_scientific(buffer: u8*, value: f64, decimals: i64) -> i64 {
     const exponent: i64 = libc::log10(value) as i64;
     // `log10` rounds toward nearest, not toward zero; if the floor
     // landed one step high we end up with mantissa < 1. Correct by
@@ -239,7 +241,7 @@ private function write_scientific(buffer: u8*, value: f64, decimals: u64) -> u64
         mantissa = value / libc::pow(10.0, e as f64);
     }
 
-    mut cursor: u64 = write_fixed(buffer, mantissa, decimals);
+    mut cursor: i64 = write_fixed(buffer, mantissa, decimals);
     buffer[cursor] = 0x65; // 'e'
     cursor = cursor + 1;
 

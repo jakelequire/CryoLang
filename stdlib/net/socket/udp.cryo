@@ -189,7 +189,7 @@ implement trait Drop for struct UdpSocket {
 type struct UdpIo {
     socket: UdpSocket;
     buf:    Array<u8>;
-    result: Result<u64, IoError>;
+    result: Result<i64, IoError>;
 
     /// Take the socket back, so the next operation can be started on it.
     /// Calling it twice yields a closed socket the second time.
@@ -209,7 +209,7 @@ type struct UdpIo {
     }
 
     /// How many bytes moved, or why none did.
-    outcome(&this) -> Result<u64, IoError> {
+    outcome(&this) -> Result<i64, IoError> {
         return this.result;
     }
 }
@@ -221,7 +221,7 @@ type struct UdpIo {
 type struct UdpReceived {
     socket: UdpSocket;
     buf:    Array<u8>;
-    result: Result<(u64, SocketAddr), IoError>;
+    result: Result<(i64, SocketAddr), IoError>;
 
     take_socket(mut &this) -> UdpSocket {
         mut out: UdpSocket = UdpSocket::from_fd(-1);
@@ -236,7 +236,7 @@ type struct UdpReceived {
     }
 
     /// The byte count and the sender, or why no datagram arrived.
-    outcome(&this) -> Result<(u64, SocketAddr), IoError> {
+    outcome(&this) -> Result<(i64, SocketAddr), IoError> {
         return this.result;
     }
 }
@@ -265,7 +265,7 @@ type struct UdpSendTo {
     /// pair them with the operation's result. Clearing the fields is what keeps
     /// this future's `Drop` from closing a descriptor and freeing a block it has
     /// just handed to the caller.
-    private finish(mut &this, result: Result<u64, IoError>) -> Poll<UdpIo> {
+    private finish(mut &this, result: Result<i64, IoError>) -> Poll<UdpIo> {
         this.rt = null;
         mut s: UdpSocket = UdpSocket::from_fd(-1);
         mem::swap::<UdpSocket>(&s, &this.socket);
@@ -292,7 +292,7 @@ implement trait Future for struct UdpSendTo {
         loop {
             const n: i64 = sys::os_sendto(fd, this.buf.as_ptr(), this.buf.length(),
                                           &sockaddr_buf[0], addrlen);
-            if (n >= 0) { return this.finish(Result::Ok(n as u64)); }
+            if (n >= 0) { return this.finish(Result::Ok(n)); }
             const e: IoError = sys::last_io_error();
             match (e.kind) {
                 IoErrorKind::Interrupted => { }   // retry immediately
@@ -336,7 +336,7 @@ type struct UdpSend {
         return UdpSend { socket: socket, buf: buf, rt: null };
     }
 
-    private finish(mut &this, result: Result<u64, IoError>) -> Poll<UdpIo> {
+    private finish(mut &this, result: Result<i64, IoError>) -> Poll<UdpIo> {
         this.rt = null;
         mut s: UdpSocket = UdpSocket::from_fd(-1);
         mem::swap::<UdpSocket>(&s, &this.socket);
@@ -353,7 +353,7 @@ implement trait Future for struct UdpSend {
         const fd: i32 = this.socket.raw_fd();
         loop {
             const n: i64 = sys::os_send(fd, this.buf.as_ptr(), this.buf.length());
-            if (n >= 0) { return this.finish(Result::Ok(n as u64)); }
+            if (n >= 0) { return this.finish(Result::Ok(n)); }
             const e: IoError = sys::last_io_error();
             match (e.kind) {
                 IoErrorKind::Interrupted => { }
@@ -400,10 +400,10 @@ type struct UdpRecvFrom {
     /// `kept` is how much of the buffer holds bytes that actually arrived;
     /// everything above it is whatever the buffer was filled with beforehand, so
     /// it is dropped rather than left for the caller to mistake for data.
-    private finish(mut &this, kept: u64,
-                   result: Result<(u64, SocketAddr), IoError>) -> Poll<UdpReceived> {
+    private finish(mut &this, kept: i64,
+                   result: Result<(i64, SocketAddr), IoError>) -> Poll<UdpReceived> {
         this.rt = null;
-        this.buf.truncate(kept as i64);
+        this.buf.truncate(kept);
         mut s: UdpSocket = UdpSocket::from_fd(-1);
         mem::swap::<UdpSocket>(&s, &this.socket);
         mut b: Array<u8> = Array::<u8>::new();
@@ -427,7 +427,7 @@ implement trait Future for struct UdpRecvFrom {
                                             &sockaddr_buf[0], &addrlen);
             if (n >= 0) {
                 const peer: SocketAddr = sockaddr::unpack_sockaddr_in(&sockaddr_buf[0]);
-                return this.finish(n as u64, Result::Ok((n as u64, peer)));
+                return this.finish(n, Result::Ok((n, peer)));
             }
             const e: IoError = sys::last_io_error();
             match (e.kind) {
@@ -469,9 +469,9 @@ type struct UdpRecv {
         return UdpRecv { socket: socket, buf: buf, rt: null };
     }
 
-    private finish(mut &this, kept: u64, result: Result<u64, IoError>) -> Poll<UdpIo> {
+    private finish(mut &this, kept: i64, result: Result<i64, IoError>) -> Poll<UdpIo> {
         this.rt = null;
-        this.buf.truncate(kept as i64);
+        this.buf.truncate(kept);
         mut s: UdpSocket = UdpSocket::from_fd(-1);
         mem::swap::<UdpSocket>(&s, &this.socket);
         mut b: Array<u8> = Array::<u8>::new();
@@ -487,7 +487,7 @@ implement trait Future for struct UdpRecv {
         const fd: i32 = this.socket.raw_fd();
         loop {
             const n: i64 = sys::os_recv(fd, this.buf.as_ptr(), this.buf.length());
-            if (n >= 0) { return this.finish(n as u64, Result::Ok(n as u64)); }
+            if (n >= 0) { return this.finish(n, Result::Ok(n)); }
             const e: IoError = sys::last_io_error();
             match (e.kind) {
                 IoErrorKind::Interrupted => { }
