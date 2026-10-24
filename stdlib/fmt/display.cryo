@@ -2,14 +2,13 @@
 ///!
 ///! Every type that wants to be printable implements `Display` (for
 ///! user output) or `Debug` (for inspection). Both write through a
-///! `Formatter<W>` that sits on top of any `FmtWrite` impl, so
+///! `Formatter` that holds any `FmtWrite` sink as a trait object, so
 ///! formatting a value to `Stdout`, to a `String`, or to a file all
-///! share the same code path.
+///! share one compiled `fmt`.
 ///!
-///! Ownership: `Formatter<W>` borrows the writer via a raw pointer.
-///! The caller owns the underlying sink and is responsible for
-///! dropping it. This lets a `Formatter<String>` hand the string
-///! back without an `into_inner` gymnastics.
+///! Ownership: `Formatter` borrows the writer; the caller owns the
+///! underlying sink and is responsible for dropping it, so a `String`
+///! formatted into is the caller's own once the formatter is gone.
 
 namespace std::fmt::display;
 
@@ -38,111 +37,95 @@ import std::random::error::{ RandomError };
 
 // Formatter
 
-type struct Formatter<W> {
-    writer: W*;
+type struct Formatter {
+    writer: virtual mut &FmtWrite;
 
-    /// Construct over any `FmtWrite` sink. The bound is restated on
-    /// each instance method below; Cryo's monomorphizer doesn't
-    /// carry where-clauses from a static factory into the surrounding
-    /// impl block, so methods that route through `W` must declare the
-    /// bound themselves.
-    static new(writer: W*) -> Formatter<W>
-    where W: FmtWrite {
-        return Formatter::<W> { writer: writer };
+    /// Construct over any `FmtWrite` sink, which the formatter borrows
+    /// as a trait object: every `fmt` is compiled once and writes to
+    /// whatever sink it is given through the sink's table.
+    static new(writer: virtual mut &FmtWrite) -> Formatter {
+        return Formatter { writer: writer };
     }
 
     /// Write a `Str`. The usual path for fixed text and for
     /// pre-rendered ASCII (integer digits, escapes) wrapped as a `Str`.
-    write_str(mut &this, source: Str) -> Result<(), FmtError>
-    where W: FmtWrite {
+    write_str(mut &this, source: Str) -> Result<(), FmtError> {
         return this.writer.write_str(source);
     }
 
     /// Write a single Unicode scalar, UTF-8-encoded.
-    write_char(mut &this, c: char) -> Result<(), FmtError>
-    where W: FmtWrite {
+    write_char(mut &this, c: char) -> Result<(), FmtError> {
         return this.writer.write_char(c);
     }
 
     /// Surface the underlying writer. For advanced composition where
     /// the caller wants to dispatch a second formatter against the
     /// same sink, or to flush mid-stream.
-    get_writer(&this) -> W* {
+    get_writer(&this) -> virtual mut &FmtWrite {
         return this.writer;
     }
 }
 
 type trait Display {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite;
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError>;
 }
 
 type trait Debug {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite;
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError>;
 }
 
 
-private function write_u64<W>(f: mut &Formatter<W>, value: u64) -> Result<(), FmtError>
-where W: FmtWrite {
+private function write_u64(f: mut &Formatter,value: u64) -> Result<(), FmtError> {
     mut buffer: [u8; 20];
     const digits: i64 =value.to_decimal_buf(&buffer[0]);
     return f.write_str(Str::from_raw(&buffer[0], digits));
 }
 
-private function write_i64<W>(f: mut &Formatter<W>, value: i64) -> Result<(), FmtError>
-where W: FmtWrite {
+private function write_i64(f: mut &Formatter,value: i64) -> Result<(), FmtError> {
     mut buffer: [u8; 21];
     const digits: i64 =value.to_decimal_buf(&buffer[0]);
     return f.write_str(Str::from_raw(&buffer[0], digits));
 }
 
-private function write_u128<W>(f: mut &Formatter<W>, value: u128) -> Result<(), FmtError>
-where W: FmtWrite {
+private function write_u128(f: mut &Formatter,value: u128) -> Result<(), FmtError> {
     mut buffer: [u8; 39];
     const digits: i64 =value.to_decimal_buf(&buffer[0]);
     return f.write_str(Str::from_raw(&buffer[0], digits));
 }
 
-private function write_i128<W>(f: mut &Formatter<W>, value: i128) -> Result<(), FmtError>
-where W: FmtWrite {
+private function write_i128(f: mut &Formatter,value: i128) -> Result<(), FmtError> {
     mut buffer: [u8; 40];
     const digits: i64 =value.to_decimal_buf(&buffer[0]);
     return f.write_str(Str::from_raw(&buffer[0], digits));
 }
 
 /// Format `value` as lowercase hex through `f`.
-private function write_u64_hex<W>(f: mut &Formatter<W>, value: u64) -> Result<(), FmtError>
-where W: FmtWrite {
+private function write_u64_hex(f: mut &Formatter,value: u64) -> Result<(), FmtError> {
     mut buffer: [u8; 16];
     const digits: i64 =value.to_hex_buf(&buffer[0]);
     return f.write_str(Str::from_raw(&buffer[0], digits));
 }
 
-private function write_u64_hex_upper<W>(f: mut &Formatter<W>, value: u64) -> Result<(), FmtError>
-where W: FmtWrite {
+private function write_u64_hex_upper(f: mut &Formatter,value: u64) -> Result<(), FmtError> {
     mut buffer: [u8; 16];
     const digits: i64 =value.to_hex_upper_buf(&buffer[0]);
     return f.write_str(Str::from_raw(&buffer[0], digits));
 }
 
-private function write_u64_oct<W>(f: mut &Formatter<W>, value: u64) -> Result<(), FmtError>
-where W: FmtWrite {
+private function write_u64_oct(f: mut &Formatter,value: u64) -> Result<(), FmtError> {
     mut buffer: [u8; 22];
     const digits: i64 =value.to_oct_buf(&buffer[0]);
     return f.write_str(Str::from_raw(&buffer[0], digits));
 }
 
-private function write_u64_bin<W>(f: mut &Formatter<W>, value: u64) -> Result<(), FmtError>
-where W: FmtWrite {
+private function write_u64_bin(f: mut &Formatter,value: u64) -> Result<(), FmtError> {
     mut buffer: [u8; 64];
     const digits: i64 =value.to_bin_buf(&buffer[0]);
     return f.write_str(Str::from_raw(&buffer[0], digits));
 }
 
 /// Display-side wrapper for the float printer.
-private function write_float64<W>(f: mut &Formatter<W>, value: f64) -> Result<(), FmtError>
-where W: FmtWrite {
+private function write_float64(f: mut &Formatter,value: f64) -> Result<(), FmtError> {
     mut buffer: [u8; 32];
     const digits: i64 =value.to_buf(&buffer[0]);
     return f.write_str(Str::from_raw(&buffer[0], digits));
@@ -151,96 +134,81 @@ where W: FmtWrite {
 // Primitive Display impls
 
 implement trait Display for u8 {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_u64(f, this as u64);
     }
 }
 implement trait Display for u16 {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_u64(f, this as u64);
     }
 }
 implement trait Display for u32 {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_u64(f, this as u64);
     }
 }
 implement trait Display for u64 {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_u64(f, this);
     }
 }
 implement trait Display for u128 {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_u128(f, this);
     }
 }
 
 implement trait Display for i8 {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_i64(f, this as i64);
     }
 }
 implement trait Display for i16 {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_i64(f, this as i64);
     }
 }
 implement trait Display for i32 {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_i64(f, this as i64);
     }
 }
 implement trait Display for i64 {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_i64(f, this);
     }
 }
 implement trait Display for i128 {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_i128(f, this);
     }
 }
 implement trait Display for usize {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_u64(f, this as u64);
     }
 }
 implement trait Display for isize {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_i64(f, this as i64);
     }
 }
 
 implement trait Display for f32 {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_float64(f, this as f64);
     }
 }
 
 implement trait Display for f64 {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_float64(f, this);
     }
 }
 
 implement trait Display for boolean {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         if (this) {
             return f.write_str(Str::new("true"));
         }
@@ -249,8 +217,7 @@ implement trait Display for boolean {
 }
 
 implement trait Display for string {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         const view: Str = Str::new(this);
         return f.write_str(view);
     }
@@ -262,8 +229,7 @@ implement trait Display for string {
 /// the surrogate range (0xD800..=0xDFFF) are not legal Unicode; they
 /// produce the replacement character U+FFFD.
 implement trait Display for char {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         mut buffer: [u8; 4];
         const length: i64 = encode_utf8(this as u32, &buffer[0]);
         return f.write_str(Str::from_raw(&buffer[0], length));
@@ -271,16 +237,14 @@ implement trait Display for char {
 }
 
 implement trait Display for struct Str {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return f.write_str(this);
     }
 }
 
 implement<A> trait Display for struct String<A>
 where A: Allocator {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return f.write_str(this.as_str());
     }
 }
@@ -335,92 +299,77 @@ function write_replacement(out: u8*) -> i64 {
 // Primitive Debug impls: default to Display for numeric types
 
 implement trait Debug for u8 {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_u64(f, this as u64);
     }
 }
 implement trait Debug for u16 {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_u64(f, this as u64);
     }
 }
 implement trait Debug for u32 {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_u64(f, this as u64);
     }
 }
 implement trait Debug for u64 {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_u64(f, this);
     }
 }
 implement trait Debug for u128 {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_u128(f, this);
     }
 }
 implement trait Debug for i8 {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_i64(f, this as i64);
     }
 }
 implement trait Debug for i16 {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_i64(f, this as i64);
     }
 }
 implement trait Debug for i32 {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_i64(f, this as i64);
     }
 }
 implement trait Debug for i64 {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_i64(f, this);
     }
 }
 implement trait Debug for i128 {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_i128(f, this);
     }
 }
 implement trait Debug for usize {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_u64(f, this as u64);
     }
 }
 implement trait Debug for isize {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_i64(f, this as i64);
     }
 }
 implement trait Debug for f32 {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_float64(f, this as f64);
     }
 }
 implement trait Debug for f64 {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return write_float64(f, this);
     }
 }
 implement trait Debug for boolean {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         if (this) {
             return f.write_str(Str::new("true"));
         }
@@ -432,8 +381,7 @@ implement trait Debug for boolean {
 /// escapes the same set `Debug<Str>` does, so `print('\n' as debug)`
 /// is unambiguous.
 implement trait Debug for char {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         f.write_char(0x27 as char)?; // '\''
         write_debug_scalar(f, this as u32, 0x27)?;
         return f.write_char(0x27 as char);
@@ -446,8 +394,7 @@ implement trait Debug for char {
 /// source. Round-trippable by a parser that understands `\n`,
 /// `\r`, `\t`, `\\`, `\"`, `\xNN`.
 implement trait Debug for struct Str {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         f.write_char(0x22 as char)?; // '"'
         const bytes: Slice<u8> = this.as_bytes();
         const base: u8* = bytes.as_ptr();
@@ -484,8 +431,7 @@ implement trait Debug for struct Str {
 }
 
 implement trait Debug for struct String<GlobalAlloc> {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         const view: Str = this.as_str();
         return (Debug for Str)::fmt(&view, f);
     }
@@ -494,8 +440,7 @@ implement trait Debug for struct String<GlobalAlloc> {
 /// Escape a single byte for Debug output. `quote` is the surrounding
 /// delimiter: a quote matching the delimiter is escaped, a quote
 /// of the other flavor is passed through.
-function write_debug_byte<W>(f: mut &Formatter<W>, byte: u8, quote: u8) -> Result<(), FmtError>
-where W: FmtWrite {
+function write_debug_byte(f: mut &Formatter,byte: u8, quote: u8) -> Result<(), FmtError> {
     if (byte == 0x5C) {
         return f.write_str(Str::new("\\\\"));
     }
@@ -536,8 +481,7 @@ where W: FmtWrite {
 
 /// Escape one Unicode scalar for Debug<char> output. Non-ASCII
 /// scalars are emitted as `\u{XXXX}` to keep terminal output safe.
-function write_debug_scalar<W>(f: mut &Formatter<W>, scalar: u32, quote: u8) -> Result<(), FmtError>
-where W: FmtWrite {
+function write_debug_scalar(f: mut &Formatter,scalar: u32, quote: u8) -> Result<(), FmtError> {
     if (scalar < 0x80) {
         return write_debug_byte(f, scalar as u8, quote);
     }
@@ -559,8 +503,7 @@ where W: FmtWrite {
 
 implement<T> trait Display for enum Option<T>
 where T: Display {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         match (&this) {
             Option::Some(value) => {
                 f.write_str(Str::new("Some("))?;
@@ -576,8 +519,7 @@ where T: Display {
 
 implement<T> trait Debug for enum Option<T>
 where T: Debug {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         match (&this) {
             Option::Some(value) => {
                 f.write_str(Str::new("Some("))?;
@@ -602,8 +544,7 @@ private function fmt_err(e: FmtError) -> Result<(), FmtError> {
 
 implement<T, E> trait Display for enum Result<T, E>
 where T: Display, E: Display {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         match (&this) {
             Result::Ok(value) => {
                 match (f.write_str(Str::new("Ok("))) {
@@ -633,8 +574,7 @@ where T: Display, E: Display {
 
 implement<T, E> trait Debug for enum Result<T, E>
 where T: Debug, E: Debug {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         match (&this) {
             Result::Ok(value) => {
                 match (f.write_str(Str::new("Ok("))) {
@@ -672,8 +612,7 @@ where T: Debug, E: Debug {
 
 implement<T, A> trait Display for struct Array<T, A>
 where T: Display, A: Allocator {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         f.write_str(Str::new("["))?;
         const n: i64 = this.length();
         mut i: i64 = 0;
@@ -695,8 +634,7 @@ where T: Display, A: Allocator {
 
 implement<T, A> trait Debug for struct Array<T, A>
 where T: Debug, A: Allocator {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         f.write_str(Str::new("["))?;
         const n: i64 = this.length();
         mut i: i64 = 0;
@@ -718,8 +656,7 @@ where T: Debug, A: Allocator {
 
 implement<K, V, A> trait Display for struct HashMap<K, V, A>
 where K: Display, V: Display, A: Allocator {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         f.write_str(Str::new("{"))?;
         const nb: u64 = this.bucket_count();
         mut bi: u64 = 0;
@@ -744,8 +681,7 @@ where K: Display, V: Display, A: Allocator {
 
 implement<K, V, A> trait Debug for struct HashMap<K, V, A>
 where K: Debug, V: Debug, A: Allocator {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         f.write_str(Str::new("{"))?;
         const nb: u64 = this.bucket_count();
         mut bi: u64 = 0;
@@ -775,8 +711,7 @@ where K: Debug, V: Debug, A: Allocator {
 
 implement<T, A> trait Display for struct HashSet<T, A>
 where T: Display, A: Allocator {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         f.write_str(Str::new("{"))?;
         mut it: implement Iterator<T*> = this.iter_ref();
         mut first: boolean = true;
@@ -796,8 +731,7 @@ where T: Display, A: Allocator {
 
 implement<T, A> trait Debug for struct HashSet<T, A>
 where T: Debug, A: Allocator {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         f.write_str(Str::new("{"))?;
         mut it: implement Iterator<T*> = this.iter_ref();
         mut first: boolean = true;
@@ -825,8 +759,7 @@ where T: Debug, A: Allocator {
 // - the same shape `Array`/`HashMap` use for their elements.
 implement<A, B> trait Display for struct Pair<A, B>
 where A: Display, B: Display {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         f.write_str(Str::new("("))?;
         const fst: A* = &this.first;
         fst.fmt(f)?;
@@ -839,8 +772,7 @@ where A: Display, B: Display {
 
 implement<A, B> trait Debug for struct Pair<A, B>
 where A: Debug, B: Debug {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         f.write_str(Str::new("("))?;
         const fst: A* = &this.first;
         fst.fmt(f)?;
@@ -858,7 +790,7 @@ where A: Debug, B: Debug {
 function format_to_string<T>(value: &T) -> Result<String, FmtError>
 where T: Display {
     mut out: String = String::new();
-    mut f: Formatter<String> = Formatter::new(&out);
+    mut f: Formatter = Formatter::new(&out);
     value.fmt(&f)?;
     return Result::Ok(out);
 }
@@ -867,7 +799,7 @@ where T: Display {
 function format_debug_to_string<T>(value: &T) -> Result<String, FmtError>
 where T: Debug {
     mut out: String = String::new();
-    mut f: Formatter<String> = Formatter::new(&out);
+    mut f: Formatter = Formatter::new(&out);
     value.fmt(&f)?;
     return Result::Ok(out);
 }
@@ -884,79 +816,67 @@ where T: Debug {
 // `Display` (in `test::error`) rather than delegating to `describe`.
 
 implement trait Display for struct IoError {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return f.write_str(this.describe());
     }
 }
 implement trait Debug for struct IoError {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return f.write_str(this.describe());
     }
 }
 
 implement trait Display for struct JsonError {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return f.write_str(this.describe());
     }
 }
 implement trait Debug for struct JsonError {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return f.write_str(this.describe());
     }
 }
 
 implement trait Display for enum RandomError {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return f.write_str(this.describe());
     }
 }
 implement trait Debug for enum RandomError {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return f.write_str(this.describe());
     }
 }
 
 implement trait Display for struct AllocError {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return f.write_str(this.describe());
     }
 }
 implement trait Debug for struct AllocError {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return f.write_str(this.describe());
     }
 }
 
 implement trait Display for struct ConversionError {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return f.write_str(this.describe());
     }
 }
 implement trait Debug for struct ConversionError {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return f.write_str(this.describe());
     }
 }
 
 implement trait Display for enum FmtError {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return f.write_str(this.describe());
     }
 }
 implement trait Debug for enum FmtError {
-    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
-    where W: FmtWrite {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         return f.write_str(this.describe());
     }
 }

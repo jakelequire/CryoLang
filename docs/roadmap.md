@@ -387,9 +387,15 @@ Left over from that: the async entry point calls `Executor::new` and
    Reaching a length through its accessor costs `cryo check` about a
    tenth more than a field read did; that is to be optimized when the HIR
    and MIR pipeline lands.
-2. **`Display` and `Debug` over a trait object:** one non-generic `fmt`
-   writing through a `virtual mut &FmtWrite` held by `Formatter`, in
-   place of `fmt<W>`; code size and the fmt suites measured first.
+2. **`Display` and `Debug` over a trait object.**  Built: one
+   non-generic `fmt(&this, f: mut &Formatter)` writing through the
+   `virtual mut &FmtWrite` a `Formatter` holds (423).  Since that `fmt`
+   is no longer generic, the implementation for an instantiation of a
+   generic type (`Pair<i64, Str>`, `Option<T>`) is emitted with every
+   instantiation whose bound holds, as each of its other methods is,
+   where `fmt<W>` was instantiated only when called: the compiler's code
+   grew by about a thirtieth.  Emitting a specialization's methods only
+   when called would take it back.
 3. **Every item marked.**  About 650 helpers used only in their own
    module become `private`; about 215 used across the library become
    `internal`; implementation modules become `internal module`:
