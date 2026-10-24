@@ -184,6 +184,14 @@ yet is recorded with the change that builds it, not here.
      or `return` leaving it releases it, latest declared first.
      Reassigning a carried local releases the value it displaces.  (Jake)
 
+581. **An async local is carried only when a suspension falls between
+     its declaration and the end of its scope, never only to keep the
+     release order.**  At each exit from a scope, the locals the exit's
+     state holds on the stack are released first, by a block wrapping
+     that state's part of the scope, and then the carried ones; a
+     completion `return` releases the carried values after the returned
+     value is produced and after the stack locals it leaves.  (Jake)
+
 ### 2026-10-22
 
 553. **A test project can set the compiler's environment and arguments,

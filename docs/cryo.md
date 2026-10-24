@@ -3791,7 +3791,7 @@ implement trait Future for struct Countdown {
 Each `async` function generates one struct - the state machine - plus a `Future` implementation for it. The original function becomes a constructor returning that struct.
 
 - A `state` field records which suspension point to resume at. Each poll dispatches on it and re-enters there.
-- Every parameter, and every local that is live across a suspension, becomes a field. A local with a destructor is live until the end of its scope, mentioned again or not, so it is a field whenever a suspension falls between its declaration and that end, and so are the later locals with destructors in the same function, which keeps the releases in reverse declaration order. A local without a destructor used only between two suspensions stays an ordinary stack local.
+- Every parameter, and every local that is live across a suspension, becomes a field. A local with a destructor is live until the end of its scope, mentioned again or not, so it is a field whenever a suspension falls between its declaration and that end. A local with no suspension between its declaration and the end of its scope, and a local without a destructor used only between two suspensions, stays an ordinary stack local.
 - A local is released where its scope ends - the end of its block, or a `break`, `continue` or `return` that leaves it - latest declared first, exactly as in a function that never suspends ([section 15.2](#152-the-drop-trait)). An `await` in between does not move the release.
 - Every awaited sub-future is stored in a field and polled from the resuming state.
 - `Poll::Pending` from a sub-future records the state and returns `Pending`; the next poll resumes at that state.

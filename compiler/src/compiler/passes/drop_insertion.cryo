@@ -383,6 +383,11 @@ type struct DropInserter {
     /// drop discarded owning temporaries (see emit_discarded_temp_drop).
     discard_seq:  i64;
 
+    /// Blocks marked `after_return_releases` met since the last `return`,
+    /// held back from the statement list to run behind that return's own
+    /// releases.
+    held_for_return: [Stmt*];
+
     /// In-flight call-argument moves (`--panic=unwind` only). When a call's
     /// arguments are being walked, each bare-identifier owning argument that is
     /// moved into a pending arg slot is pushed here, keyed by binding identity;
@@ -457,6 +462,7 @@ type struct DropInserter {
             fired:           0,
             inserted:        0,
             discard_seq:     0,
+            held_for_return: [],
             pending_arg_ids:    [],
             pending_arg_frames: [],
         };
@@ -858,6 +864,7 @@ type struct DropInserter {
         if (func == null || func.body == null) { return; }
         if (func.is_generic()) { return; }
         // Reset per-function state.
+        this.held_for_return = [];
         this.types_keys      = [];
         this.types_refs      = [];
         this.scope_start_idx = [];
@@ -1100,6 +1107,11 @@ type struct DropInserter {
                 // node so codegen can sequence the drops *after* the
                 // expression value is materialised but before `ret`.
                 this.append_cumulative_drops(&r.synth_drops);
+                for (mut i: i64 = 0; i < this.held_for_return.length(); i++) {
+                    this.walk_block(this.held_for_return[i]);
+                    r.synth_drops.push(this.held_for_return[i]);
+                }
+                this.held_for_return = [];
                 out.push(stmt);
                 true
             }
@@ -1203,7 +1215,11 @@ type struct DropInserter {
                 this.append_move_flag_writes(decl_snap, null, out, stmt.span);
                 false
             }
-            StmtKind::Block(_) => {
+            StmtKind::Block(b) => {
+                if (b.after_return_releases) {
+                    this.held_for_return.push(stmt);
+                    return false;
+                }
                 const d: boolean = this.walk_block(stmt);
                 out.push(stmt);
                 d

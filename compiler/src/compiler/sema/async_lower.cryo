@@ -152,12 +152,24 @@ type struct PollSm {
     scoped_keys:     [SymbolID];
     scoped_scope:    [i64];
     scoped_alloc:    [i64];
+    // Per scope: the state it was entered in, and an empty block marking
+    // where in that state it begins.
+    scope_entry_state:  [i64];
+    scope_entry_marker: [Stmt*];
 
     // One empty block per exit from a scope (its end, or a `break`/`continue`
     // leaving it), in the state the exit runs in. Once the carriers are known,
-    // each is filled with the releases of the scope's carried locals.
+    // each is filled with the releases of the scope's carried locals, and the
+    // statements of the scope that state ran - from `exit_start` on - are
+    // wrapped in a block of their own, so their stack locals are released
+    // first.
     exit_blocks: [Stmt*];
     exit_scope:  [i64];
+    exit_state:  [i64];
+    exit_start:  [Stmt*];
+    // The pointer bindings `bind_carrier_ptr` placed after a state's first
+    // statement, which a wrapped part of a scope may come to hold.
+    pointer_binds: [Stmt*];
 
     // Bindings whose storage lives in the poll frame: the body's locals and
     // `match`-arm bindings (re-materialized on every poll) plus the parameters
@@ -2612,6 +2624,10 @@ type struct AsyncLower {
         const scope: i64 = sm.scope_end_alloc.length();
         sm.scope_end_alloc.push(-1);
         sm.scope_open.push(scope);
+        const entry_marker: Stmt* = Stmt::block(sm.span);
+        sm.blocks[cur].as_block().add_statement(entry_marker);
+        sm.scope_entry_state.push(cur);
+        sm.scope_entry_marker.push(entry_marker);
         mut s: i64 = cur;
         mut diverged: boolean = false;
         for (mut i: i64 = 0; i < blk.statements.length(); i++) {
@@ -2637,12 +2653,26 @@ type struct AsyncLower {
 
     /// Mark an exit from `scope` at the current end of state `state`: an empty
     /// block that `promote_cross_state` fills with the releases of the scope's
-    /// carried locals once it knows which locals are carried.
+    /// carried locals once it knows which locals are carried. The part of the
+    /// scope `state` runs starts at the scope's entry when the scope was
+    /// entered in this state, and otherwise at the state's own start, marked
+    /// here so the bindings promotion later prepends stay outside it.
     add_scope_exit(mut &this, sm: PollSm*, state: i64, scope: i64) -> void {
+        mut start: Stmt* = sm.scope_entry_marker[scope];
+        if (sm.scope_entry_state[scope] != state) {
+            start = Stmt::block(sm.span);
+            mut opened: [Stmt*] = [start];
+            for (mut i: i64 = 0; i < sm.blocks[state].as_block().statements.length(); i++) {
+                opened.push(sm.blocks[state].as_block().statements[i]);
+            }
+            sm.blocks[state].as_block().statements = opened;
+        }
         const marker: Stmt* = Stmt::block(sm.span);
         sm.blocks[state].as_block().add_statement(marker);
         sm.exit_blocks.push(marker);
         sm.exit_scope.push(scope);
+        sm.exit_state.push(state);
+        sm.exit_start.push(start);
     }
 
     /// Mark an exit from every scope a `break`/`continue` leaves, innermost
@@ -4890,7 +4920,9 @@ type struct AsyncLower {
         if (this.block_first_use(blk, pkey) == 0) { return; }
         mut opened: [Stmt*] = [];
         for (mut i: i64 = 0; i < at; i++) { opened.push(blk.as_block().statements[i]); }
-        opened.push(this.stand_in(this.agg_bind_ptr_stmt(sm, pnm, field, opt_ty, lty_ptr, span), pkey));
+        const bind: Stmt* = this.stand_in(this.agg_bind_ptr_stmt(sm, pnm, field, opt_ty, lty_ptr, span), pkey);
+        if (at > 0) { sm.pointer_binds.push(bind); }
+        opened.push(bind);
         for (mut i: i64 = at; i < blk.as_block().statements.length(); i++) { opened.push(blk.as_block().statements[i]); }
         blk.as_block().statements = opened;
     }
@@ -5122,113 +5154,80 @@ type struct AsyncLower {
         return Stmt::expr_stmt(take_call, span);
     }
 
-    /// Rewrite every completion return inside `s` so each in-place carrier is
-    /// released there:
+    /// Write the release of every in-place carrier just ahead of each
+    /// completion return inside `s`, as a block marked to run after the
+    /// return's own releases: after the returned value has been produced, and
+    /// after every local still on the stack, whose scopes all lie inside the
+    /// carriers' own. Returns what stands in `s`'s place: a completion return
+    /// that is not a statement of a block becomes a block holding the
+    /// releases and the return.
     ///
-    ///     mut <rv>: <Output> = <value>;
-    ///     mut <rel_i>: Option<T_i> = this.<field_i>.take();   // one per carrier
-    ///     return Poll::Ready(<rv>);
-    ///
-    /// The returned value has to be HOISTED first. Releasing before it is
-    /// evaluated would empty the very field the value is read through - every
-    /// state reaches a carried value as `*<nm>$p`, and `<nm>$p` points into the
-    /// field's payload, so a `take` beforehand leaves the pointer naming a
-    /// moved-from slot and the function returns garbage. Measured: doing it in
-    /// the wrong order took the address-stability probe straight back to `0`.
-    ///
-    /// The PAYLOAD is hoisted rather than the whole `Poll::Ready(…)`, and the
-    /// `Poll::Ready` node is reused with its argument swapped, so the wrapper's
-    /// typing is untouched. Binding the wrapper to a local instead requires
-    /// spelling `Poll<Output>`, and the lowering's `poll_out` is the bare `Poll`
-    /// in a generic or trait-method context - which type-checks as a return
-    /// expression but not as a declared local type.
-    ///
-    /// All carriers are released in ONE pass rather than one pass each, because
-    /// the first pass rewrites the return the next would have matched on.
-    release_before_ready(mut &this, sm: PollSm*, s: Stmt*,
-                         fields: &[SymbolStr], opts: &[TypeRef], span: SourceSpan) -> void {
-        if (s == null) { return; }
+    /// The value has to be produced first because a carried value is reached
+    /// through `*<nm>$p`, a pointer into the field's payload: a `take` ahead
+    /// of it leaves the value read from a moved-from slot. A value merely
+    /// derived from a carrier (`p = owner.conn()`) reads that storage without
+    /// naming it, so no return is exempt.
+    release_at_completion(mut &this, sm: PollSm*, s: Stmt*,
+                          fields: &[SymbolStr], opts: &[TypeRef], span: SourceSpan) -> Stmt* {
+        if (s == null) { return s; }
         match (s.kind) {
             StmtKind::Block(blk) => {
                 mut rebuilt: [Stmt*] = [];
                 for (mut i: i64 = 0; i < blk.statements.length(); i++) {
                     const st: Stmt* = blk.statements[i];
-                    mut ready: CallExpr* = this.ready_call(st);
-                    if (ready == null || ready.arguments.length() != 1
-                            || ready.arguments[0] == null) {
-                        this.release_before_ready(sm, st, fields, opts, span);
+                    if (this.ready_call(st) != null) {
+                        rebuilt.push(this.completion_releases(sm, fields, opts, span));
                         rebuilt.push(st);
-                        continue;
+                    } else {
+                        rebuilt.push(this.release_at_completion(sm, st, fields, opts, span));
                     }
-                    // Only a LITERAL payload may be released ahead of - it names no
-                    // storage, so nothing it needs can be freed early. That covers
-                    // the unit value a `-> void` async function returns, which is
-                    // the case that must not go through the hoist: unit has no type
-                    // worth binding a local to.
-                    //
-                    // Every other payload is hoisted, even one that never mentions a
-                    // carrier by name. Asking whether the payload reads a carrier
-                    // POINTER is not the same question and gets this wrong: a
-                    // pointer derived from the carrier earlier in the function (`p =
-                    // owner.conn()`) reads that storage without naming it, and
-                    // releasing first left it reading a freed value - measured, the
-                    // accessor test returned 2 instead of 3.
-                    if (ExpressionNode::literal_of(ready.arguments[0]) != null) {
-                        for (mut f: i64 = 0; f < fields.length(); f++) {
-                            rebuilt.push(this.agg_release_stmt(sm, fields[f], opts[f], span));
-                        }
-                        rebuilt.push(st);
-                        continue;
-                    }
-                    // A payload that reads a carrier but whose type cannot be
-                    // SPELLED cannot be hoisted, and releasing without hoisting
-                    // would empty the field it reads. Leave such a return alone: the
-                    // value then dies with the future, which is where it died before
-                    // this pass, so the fallback is the previous behaviour and not a
-                    // new hazard. A still-abstract type is the case that matters -
-                    // binding a local to one drops the instantiation and codegen
-                    // then loses an enum payload outright.
-                    const out_ty: TypeRef = ready.arguments[0].resolved_type;
-                    if (!out_ty.is_valid() || this.arena.contains_generic_param(out_ty)
-                            || this.ownership_unreadable(out_ty)) {
-                        rebuilt.push(st);
-                        continue;
-                    }
-                    const rv_id: SymbolID = this.resolver.alloc_synthetic_binding();
-                    const rsym: SymbolStr = this.mint_local(this.intern.intern("__rv"), rv_id);
-                    rebuilt.push(this.var_decl_stmt_bound(rsym, rv_id, true, out_ty,
-                                                          ready.arguments[0], span));
-                    for (mut f: i64 = 0; f < fields.length(); f++) {
-                        rebuilt.push(this.agg_release_stmt(sm, fields[f], opts[f], span));
-                    }
-                    ready.arguments[0] = this.ident_bound(rsym, rv_id, out_ty, span);
-                    rebuilt.push(st);
                 }
                 blk.statements = rebuilt;
             }
-            StmtKind::If(iff) => {
-                this.release_before_ready(sm, iff.then_stmt, fields, opts, span);
-                this.release_before_ready(sm, iff.else_stmt, fields, opts, span);
-            }
-            StmtKind::While(w)   => { this.release_before_ready(sm, w.body, fields, opts, span); }
-            StmtKind::DoWhile(d) => { this.release_before_ready(sm, d.body, fields, opts, span); }
-            StmtKind::For(f)     => { this.release_before_ready(sm, f.body, fields, opts, span); }
-            StmtKind::Loop(l)    => { this.release_before_ready(sm, l.body, fields, opts, span); }
-            StmtKind::Match(m) => {
-                for (mut i: i64 = 0; i < m.arms.length(); i++) {
-                    this.release_before_ready(sm, m.arms[i].body, fields, opts, span);
+            StmtKind::Return(_) => {
+                if (this.ready_call(s) != null) {
+                    mut wrapped: Stmt* = Stmt::block(span);
+                    wrapped.as_block().add_statement(this.completion_releases(sm, fields, opts, span));
+                    wrapped.as_block().add_statement(s);
+                    return wrapped;
                 }
             }
-            StmtKind::UnsafeBlock(u) => { this.release_before_ready(sm, u.block, fields, opts, span); }
+            StmtKind::If(iff) => {
+                iff.then_stmt = this.release_at_completion(sm, iff.then_stmt, fields, opts, span);
+                iff.else_stmt = this.release_at_completion(sm, iff.else_stmt, fields, opts, span);
+            }
+            StmtKind::While(w)   => { w.body = this.release_at_completion(sm, w.body, fields, opts, span); }
+            StmtKind::DoWhile(d) => { d.body = this.release_at_completion(sm, d.body, fields, opts, span); }
+            StmtKind::For(f)     => { f.body = this.release_at_completion(sm, f.body, fields, opts, span); }
+            StmtKind::Loop(l)    => { l.body = this.release_at_completion(sm, l.body, fields, opts, span); }
+            StmtKind::Match(m) => {
+                for (mut i: i64 = 0; i < m.arms.length(); i++) {
+                    m.arms[i].body = this.release_at_completion(sm, m.arms[i].body, fields, opts, span);
+                }
+            }
+            StmtKind::UnsafeBlock(u) => { u.block = this.release_at_completion(sm, u.block, fields, opts, span); }
             StmtKind::StaticMatch(sms) => {
                 for (mut i: i64 = 0; i < sms.arms.length(); i++) {
                     if (sms.arms[i] == null) { continue; }
-                    this.release_before_ready(sm, sms.arms[i].body, fields, opts, span);
+                    sms.arms[i].body = this.release_at_completion(sm, sms.arms[i].body, fields, opts, span);
                 }
             }
-            StmtKind::Asm(_) | StmtKind::Return(_) | StmtKind::Break | StmtKind::Continue
+            StmtKind::Asm(_) | StmtKind::Break | StmtKind::Continue
             | StmtKind::Expr(_) | StmtKind::Decl(_) => {}
         }
+        return s;
+    }
+
+    /// The releases of every in-place carrier, latest declared first, as a
+    /// block drop insertion runs behind the following `return`'s own.
+    completion_releases(mut &this, sm: PollSm*, fields: &[SymbolStr], opts: &[TypeRef],
+                        span: SourceSpan) -> Stmt* {
+        mut releases: Stmt* = Stmt::block(span);
+        for (mut f: i64 = 0; f < fields.length(); f++) {
+            releases.as_block().add_statement(this.agg_release_stmt(sm, fields[f], opts[f], span));
+        }
+        releases.as_block().after_return_releases = true;
+        return releases;
     }
 
     /// Prepend `const <name> = this.<field>;`, a stand-in for binding `key`, so
@@ -5556,7 +5555,7 @@ type struct AsyncLower {
         mut d_states: [i64] = [];
         mut d_nodes: [DeclarationNode*] = [];
         // Carriers that ended up living in their field, released together in one
-        // pass once every carrier is known; see `release_before_ready`.
+        // pass once every carrier is known; see `release_at_completion`.
         mut inplace_fields: [SymbolStr] = [];
         mut inplace_opts: [TypeRef] = [];
         mut inplace_keys: [SymbolID] = [];
@@ -5572,22 +5571,6 @@ type struct AsyncLower {
             }
         }
 
-        // A local with a destructor is released where its scope ends, so it
-        // lives across every suspend between its declaration and there whether
-        // or not anything mentions it again. A scope's later locals are carried
-        // too once anything is, because the releases at a scope's exit run in
-        // reverse declaration order: a later local left in the frame would be
-        // released when its state's block ends, after the carried ones.
-        mut any_held_across: boolean = false;
-        for (mut d: i64 = 0; d < d_keys.length(); d++) {
-            const at: i64 = this.held_local_index(sm, d_keys[d],
-                DeclarationNode::var_of(d_nodes[d]).resolved_type);
-            if (at >= 0 && sm.scope_end_alloc[sm.scoped_scope[at]] > sm.scoped_alloc[at]) {
-                any_held_across = true;
-            }
-        }
-        mut held_keys: [SymbolID] = [];
-
         for (mut d: i64 = 0; d < d_keys.length(); d++) {
             const key: SymbolID = d_keys[d];
             const ds: i64 = d_states[d];
@@ -5601,14 +5584,13 @@ type struct AsyncLower {
             for (mut b: i64 = 0; b < sm.blocks.length(); b++) {
                 if (b != ds && this.block_reads_name(sm.blocks[b], key)) { cross = true; }
             }
-            // Held only for the order of the releases, it never outlives the
-            // state that declares it, so an address of the frame inside it
-            // stays valid for as long as it lives.
+            // A local with a destructor is released where its scope ends, so it
+            // lives across every suspend between its declaration and there
+            // whether or not anything mentions it again.
             const held_at: i64 = this.held_local_index(sm, key, lty);
-            const held_across: boolean = held_at >= 0
+            const held: boolean = held_at >= 0
                 && sm.scope_end_alloc[sm.scoped_scope[held_at]] > sm.scoped_alloc[held_at];
-            const held: boolean = held_across || (held_at >= 0 && any_held_across);
-            if (held) { held_keys.push(key); }
+            if (held) { cross = true; }
             // "Read in a later state" is only a proxy for "still live there", and
             // it misses the local a future was BUILT from and that the body never
             // mentions again: the future holds a view into it, is stashed in a
@@ -5619,8 +5601,6 @@ type struct AsyncLower {
             const borrowed: boolean = this.borrow_outlives_suspend(lty)
                                    && this.borrowed_by_awaited_future(sm, key);
             if (borrowed) { cross = true; }
-            const crosses_suspend: boolean = cross || held_across;
-            if (held) { cross = true; }
             if (!cross) { continue; }
 
             const lt: Type* = this.arena.lookup(lty);
@@ -5695,7 +5675,7 @@ type struct AsyncLower {
                     continue;
                 }
 
-                if (crosses_suspend && this.reject_frame_addr_carry(sm, vd_decl, key)) { return; }
+                if (this.reject_frame_addr_carry(sm, vd_decl, key)) { return; }
 
                 mut agg_args: [TypeRef] = [lty];
                 const opt_ty: TypeRef = this.ctx.generic_registry.instantiate(sm.opt_base, &agg_args);
@@ -5861,7 +5841,12 @@ type struct AsyncLower {
 
         // Once every carrier is known: each exit from a scope releases the
         // scope's carried locals, latest declared first, as the end of the
-        // scope would have.
+        // scope would have. A local the exit's state declared in the scope
+        // was declared after every carried one - otherwise a suspend would
+        // follow it and it would be carried too - so it is released first, by
+        // the block its part of the scope is wrapped in; without that block it
+        // would live on to the end of the state, past the code that follows
+        // the scope.
         for (mut m: i64 = 0; m < sm.exit_blocks.length(); m++) {
             for (mut r: i64 = sm.scoped_keys.length() - 1; r >= 0; r--) {
                 if (sm.scoped_scope[r] != sm.exit_scope[m]) { continue; }
@@ -5871,6 +5856,8 @@ type struct AsyncLower {
                         this.agg_release_stmt(sm, inplace_fields[c], inplace_opts[c], span));
                 }
             }
+            this.wrap_scope_part(sm, sm.blocks[sm.exit_state[m]], sm.exit_start[m],
+                                 sm.exit_blocks[m], span);
         }
         // A completion return leaves every scope at once, so it releases every
         // in-place value, latest declared first; a scope already left holds
@@ -5883,10 +5870,55 @@ type struct AsyncLower {
                 latest_opts.push(inplace_opts[c]);
             }
             for (mut b: i64 = 0; b < sm.blocks.length(); b++) {
-                this.release_before_ready(sm, sm.blocks[b],
-                                          &latest_fields, &latest_opts, span);
+                this.release_at_completion(sm, sm.blocks[b],
+                                           &latest_fields, &latest_opts, span);
             }
         }
+    }
+
+    /// Move the statements of state block `blk` between the markers `start`
+    /// and `exit` into a block of their own, so the locals they declare are
+    /// released when that block ends, ahead of the releases `exit` holds.
+    /// Both markers are top-level statements of `blk`: a part of a scope
+    /// wrapped earlier lies strictly between its own two markers, which an
+    /// enclosing scope's part encloses.
+    ///
+    /// A carrier's pointer bound inside the part, after the statement that
+    /// refills the carrier, may be read by the code after the scope: it is
+    /// declared ahead of the part instead, and assigned where it was bound.
+    wrap_scope_part(mut &this, sm: PollSm*, blk: Stmt*, start: Stmt*, exit: Stmt*,
+                    span: SourceSpan) -> void {
+        const outer: BlockStmt* = blk.as_block();
+        mut first: i64 = outer.statements.length();
+        mut last: i64 = 0;
+        for (mut i: i64 = 0; i < outer.statements.length(); i++) {
+            if (outer.statements[i] == start) { first = i + 1; }
+            if (outer.statements[i] == exit) { last = i; }
+        }
+        if (first >= last) { return; }
+        mut part: Stmt* = Stmt::block(span);
+        mut rebuilt: [Stmt*] = [];
+        for (mut i: i64 = 0; i < first; i++) { rebuilt.push(outer.statements[i]); }
+        for (mut i: i64 = first; i < last; i++) {
+            const st: Stmt* = outer.statements[i];
+            mut is_bind: boolean = false;
+            for (mut b: i64 = 0; b < sm.pointer_binds.length(); b++) {
+                if (sm.pointer_binds[b] == st) { is_bind = true; }
+            }
+            if (!is_bind) {
+                part.as_block().add_statement(st);
+                continue;
+            }
+            const vd: VarDecl* = this.stmt_decl_var(st);
+            const key: SymbolID = this.decl_key(vd);
+            rebuilt.push(this.stand_in(this.var_decl_stmt(vd.name, true, vd.resolved_type,
+                this.zero_value(vd.resolved_type, span), span), key));
+            part.as_block().add_statement(this.assign_stmt(
+                this.ident_bound(vd.name, key, vd.resolved_type, span), vd.initializer, span));
+        }
+        rebuilt.push(part);
+        for (mut i: i64 = last; i < outer.statements.length(); i++) { rebuilt.push(outer.statements[i]); }
+        outer.statements = rebuilt;
     }
 
     /// The index of `key` among the locals declared directly in a scope the
@@ -8055,7 +8087,9 @@ type struct AsyncLower {
             loop_cont: [], loop_brk: [], loop_scope: [],
             scope_open: [], scope_end_alloc: [],
             scoped_keys: [], scoped_scope: [], scoped_alloc: [],
-            exit_blocks: [], exit_scope: [],
+            scope_entry_state: [], scope_entry_marker: [],
+            exit_blocks: [], exit_scope: [], exit_state: [], exit_start: [],
+            pointer_binds: [],
             frame_keys: [], borrow_ops: [],
             unit_output: this.is_void_type(declared_ref),
         };

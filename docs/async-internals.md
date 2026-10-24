@@ -61,9 +61,12 @@ it without breaking existing code.
   contract is exactly what §2 buys the freedom *not* to have. Two shapes cannot be re-addressed and
   are rejected rather than silently corrupted - a receiver that names no storage (a temporary or call
   result), and awaiting a method future the awaited expression did not itself produce.
-- **Drop timing is preserved explicitly.** A carried value is released before the future completes
-  (`release_before_ready`) rather than at future-drop. Deferring a carried socket's close to
-  future-drop deadlocks real code.
+- **Drop timing is preserved explicitly.** A carried value is released where its scope ends, and
+  at a completion `return` after the value is produced and the locals still on the stack are
+  released (`release_at_completion`), rather than at future-drop. Deferring a carried socket's
+  close to future-drop deadlocks real code. At a scope's end, the part of the scope the exit's
+  state ran is wrapped in a block of its own, so its stack locals are released before the
+  scope's carried ones, in reverse declaration order.
 
 ## 4. Runtime shape (`stdlib/future/`)
 

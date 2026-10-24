@@ -117,6 +117,10 @@ def parse(lines):
     Reads the SUMMARY blocks rather than counting per-test lines: the per-test
     line differs by --format and the summary does not, and a census that works
     in one output format only is one nobody runs in the format they use.
+
+    The unit and compile-fail summaries print before the first project runs.
+    One that opens after it is a failing project echoing its own run's output,
+    and is not read.
     """
     blocks = {}
     reached = []
@@ -129,6 +133,9 @@ def parse(lines):
         m = BLOCK.match(line)
         if m:
             current = m.group(1)
+            if current != "projects" and last_project is not None:
+                current = None
+                continue
             blocks.setdefault(current, {})
             continue
         m = PROJ_LINE.match(line.strip())

@@ -55,7 +55,9 @@ the baseline with a diagnostic and BUILT by the tree.  Their objects are
 left out of the comparison and counted.  A declaration is an assertion,
 never an exemption: declaring a project the baseline already passed, or a
 started-compiling one the baseline builds or the tree refuses, fails the
-run.
+run.  `tests/started-passing` names the other programs a change corrects the
+same way: a negative file, an example the baseline does not build, and a
+unit-test file whose tests the baseline fails.
 
 Usage:
     make verify [ARGS="--baseline HEAD"]
@@ -347,26 +349,32 @@ PROJECTS = "tests/tests/projects"
 DIAGNOSTIC = re.compile(r"error\[E\d{4}\]")
 PROJ_FAILED = re.compile(r"^test \(project\) (\S+) \.\.\. FAILED")
 NEG_FAILED = re.compile(r"^test \(negative\) (\S+) \.\.\. FAILED")
+UNIT_FAILED = re.compile(r"^FAIL\s+(\S+::\S+)")
+EXAMPLE_FAILED = re.compile(r"^\s*FAIL\s+(examples/\S+)")
 # A started-passing line names a project by its directory, a negative test
 # file as `negative/<file>.cryo` (its report changes, so the baseline's census
-# fails it), or a unit-test file as its path under tests/tests (its object
-# moves, so it is left out of the comparison and must have moved).
+# fails it), an example as `examples/<name>` (the baseline does not build it),
+# or a unit-test file as its path under tests/tests (its object moves, so it
+# is left out of the comparison and must have moved, and the baseline may
+# fail the tests it holds).
 NEGATIVE = "negative/"
+EXAMPLE = "examples/"
 UNIT_DIR = "tests/tests"
 
 
 def declared_kind(name):
     if name.startswith(NEGATIVE):
         return "negative"
+    if name.startswith(EXAMPLE):
+        return "example"
     if name.endswith(".cryo"):
         return "unit"
     return "project"
 
 
-def unit_object_suffix(name):
-    """The object path tail a unit-test file compiles to, from its namespace:
-    `namespace A::B::C;` is `.../deps/A/B/C.o`.  None when the file or its
-    namespace line is missing."""
+def unit_namespace(name):
+    """The namespace a unit-test file declares, `A::B::C`; None when the file
+    or its namespace line is missing."""
     path = os.path.join(ROOT, UNIT_DIR, name)
     if not os.path.isfile(path):
         return None
@@ -374,8 +382,15 @@ def unit_object_suffix(name):
         for line in fh:
             m = re.match(r"\s*namespace\s+([\w:]+)\s*;", line)
             if m:
-                return "/deps/" + "/".join(m.group(1).split("::")) + ".o"
+                return m.group(1)
     return None
+
+
+def unit_object_suffix(name):
+    """The object path tail a unit-test file compiles to, from its namespace:
+    `namespace A::B::C;` is `.../deps/A/B/C.o`."""
+    ns = unit_namespace(name)
+    return None if ns is None else "/deps/" + "/".join(ns.split("::")) + ".o"
 
 
 def parse_declared(text):
@@ -414,38 +429,66 @@ def declared_since(sha, rel=DECLARED):
     return declarations_between(tree_text, base_text)
 
 
-def census_failures(log):
-    """(verdict accounted?, unit failed, compile-fail failed, failed projects)."""
+def census_module():
+    """scripts/test-census.py as a module: its parse is the one both use."""
     spec = importlib.util.spec_from_file_location(
         "test_census", os.path.join(ROOT, "scripts", "test-census.py"))
     census = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(census)
+    return census
+
+
+def census_unit_failed(lines):
+    """The unit suite's failed count as the census reads it from `lines`."""
+    return census_module().parse(lines)[0].get("unit test", {}).get("failed", -1)
+
+
+def census_failures(log, examples_log):
+    """(verdict accounted?, unit failed, compile-fail failed, failed programs):
+    the projects, negative files and examples by their declaration names, and
+    the unit tests the unit suite itself failed by their full names."""
+    census = census_module()
     with io.open(log, encoding="utf-8", errors="replace") as fh:
         lines = fh.readlines()
+    with io.open(examples_log, encoding="utf-8", errors="replace") as fh:
+        examples = fh.readlines()
     blocks, _, _, _ = census.parse(lines)
     accounted = any(l.startswith("test-census: OK") for l in lines)
+    # A project's own run may echo unit-test lines; the unit suite's end at
+    # its summary.
+    end = next((i for i, l in enumerate(lines) if census.BLOCK.match(l.rstrip())), len(lines))
     failed = sorted({m.group(1) for m in map(PROJ_FAILED.match, lines) if m}
-                    | {NEGATIVE + m.group(1) for m in map(NEG_FAILED.match, lines) if m})
+                    | {NEGATIVE + m.group(1) for m in map(NEG_FAILED.match, lines) if m}
+                    | {m.group(1) for m in map(UNIT_FAILED.match, lines[:end]) if m}
+                    | {m.group(1) for m in map(EXAMPLE_FAILED.match, examples) if m})
     return (accounted, blocks.get("unit test", {}).get("failed", -1),
             blocks.get("compile-fail", {}).get("failed", -1), failed)
 
 
-def judge_baseline_census(declared, accounted, unit_failed, neg_failed, failed, fixed=()):
-    """Problems with a baseline census that may fail on declared projects only:
+def judge_baseline_census(declared, accounted, unit_failed, neg_failed, failed, fixed=(),
+                          unit_namespaces=None):
+    """Problems with a baseline census that may fail on declared programs only:
     `declared` the ones it refuses, `fixed` the ones it builds and runs wrong,
-    a negative file whose report changes, or a unit-test file whose object
-    moves (which the census does not fail)."""
+    a negative file whose report changes, an example it does not build, or a
+    unit-test file whose object moves and whose tests it may fail.
+    `unit_namespaces` maps each declared unit-test file to its namespace."""
     problems = []
     if not accounted:
         problems.append("the baseline census did not account for the pinned corpus")
     neg_names = [p for p in failed if declared_kind(p) == "negative"]
-    if unit_failed != 0:
-        problems.append("the baseline failed %s unit test(s); a unit test is declared "
-                        "for its object, never for a failure" % unit_failed)
+    unit_names = [p for p in failed if "::" in p]
+    held = {ns for p, ns in (unit_namespaces or {}).items() if p in fixed}
+    if unit_failed != len(unit_names):
+        problems.append("the baseline failed %s unit test(s) and named %d"
+                        % (unit_failed, len(unit_names)))
+    for u in unit_names:
+        if u.rpartition("::")[0] not in held:
+            problems.append("the baseline fails unit test %s, which no unit-test file "
+                            "declared in %s holds" % (u, FIXED))
     if neg_failed != len(neg_names):
         problems.append("the baseline failed %s compile-fail test(s) and named %d"
                         % (neg_failed, len(neg_names)))
-    for p in sorted(set(failed) - set(declared) - set(fixed)):
+    for p in sorted(set(failed) - set(unit_names) - set(declared) - set(fixed)):
         problems.append("the baseline fails %s, which neither %s nor %s declares"
                         % (p, DECLARED, FIXED))
     judged = set(declared) | {p for p in fixed if declared_kind(p) != "unit"}
@@ -502,6 +545,11 @@ def check_declared(declared, base_exe, cryo, logdir, env, fixed=()):
                 problems.append("%s: declared in %s but %s/%s does not exist"
                                 % (name, rel, UNIT_DIR, name))
             continue
+        if is_fixed and kind == "example":
+            if not os.path.isfile(os.path.join(ROOT, name, "cryoconfig")):
+                problems.append("%s: declared in %s but %s is not an example project"
+                                % (name, rel, name))
+            continue
         if is_fixed and kind == "unit":
             if unit_object_suffix(name) is None:
                 problems.append("%s: declared in %s but %s/%s is not a unit-test file "
@@ -532,7 +580,7 @@ def selftest():
          judge_baseline_census({"p"}, True, 0, 0, ["p", "q"]), 1),
         ("census: a declared project the baseline passes",
          judge_baseline_census({"p", "q"}, True, 0, 0, ["p"]), 1),
-        ("census: a unit failure is never declarable",
+        ("census: a unit failure the log does not name",
          judge_baseline_census({"p"}, True, 1, 0, ["p"]), 1),
         ("census: the corpus not accounted for",
          judge_baseline_census({"p"}, False, 0, 0, ["p"]), 1),
@@ -564,8 +612,27 @@ def selftest():
          judge_baseline_census({}, True, 0, 2, ["negative/n.cryo"], {"negative/n.cryo"}), 1),
         ("census: a declared unit-test file is not a census failure",
          judge_baseline_census({}, True, 0, 0, [], {"lang/u.cryo"}), 0),
-        ("census: a unit failure is never declarable, even beside a unit file",
-         judge_baseline_census({}, True, 1, 0, [], {"lang/u.cryo"}), 1),
+        ("census: an unnamed unit failure beside a unit file",
+         judge_baseline_census({}, True, 1, 0, [], {"lang/u.cryo"}, {"lang/u.cryo": "A::U"}), 1),
+        ("census: a unit failure in a declared unit-test file",
+         judge_baseline_census({}, True, 1, 0, ["A::U::t"], {"lang/u.cryo"},
+                               {"lang/u.cryo": "A::U"}), 0),
+        ("census: a unit failure in another file",
+         judge_baseline_census({}, True, 1, 0, ["A::V::t"], {"lang/u.cryo"},
+                               {"lang/u.cryo": "A::U"}), 1),
+        ("census: a unit failure with nothing declared",
+         judge_baseline_census({}, True, 1, 0, ["A::U::t"]), 1),
+        ("census: a declared example the baseline does not build",
+         judge_baseline_census({}, True, 0, 0, ["examples/e"], {"examples/e"}), 0),
+        ("census: an undeclared example the baseline does not build",
+         judge_baseline_census({}, True, 0, 0, ["examples/e"]), 1),
+        ("census: a declared example the baseline builds",
+         judge_baseline_census({}, True, 0, 0, [], {"examples/e"}), 1),
+        ("census: a project's echoed unit summary is not the suite's",
+         [] if census_unit_failed(["  unit test summary\n", "    failed        0\n",
+                                   "test (project) p ... FAILED (exit 1, expected 0)\n",
+                                   "  unit test summary\n", "    failed        3\n"]) == 0
+         else ["bad"], 0),
         ("units: a declared object that moved",
          judge_unit_moves({"u": "/U.o"}, {"x/U.o": "1"}, {"x/U.o": "2"}), 0),
         ("units: a declared object that did not move",
@@ -621,9 +688,10 @@ def compare(tag_a, a_path, b_path, limit, excluded=(), units=None, problems=None
         print("  %-9s declared unit-test objects left out: %d, %d problem(s)"
               % (tag_a, len(units), len(found)))
         problems.extend(found)
-    excluded = [n for n in excluded if declared_kind(n) == "project"]
+    excluded = [n for n in excluded if declared_kind(n) in ("project", "example")]
     if excluded:
-        prefixes = tuple("%s/%s/" % (PROJECTS, n) for n in excluded)
+        prefixes = tuple(n + "/" if declared_kind(n) == "example" else "%s/%s/" % (PROJECTS, n)
+                         for n in excluded)
         drop_a = [p for p in a if p.startswith(prefixes)]
         drop_b = [p for p in b if p.startswith(prefixes)]
         for p in drop_a:
@@ -725,8 +793,8 @@ def main():
             # is recorded as the projects it failed on.
             with io.open(os.path.join(cached, "base.failed"), encoding="utf-8") as fh:
                 recorded = fh.read().split()
-                census = (True, 0, sum(declared_kind(p) == "negative" for p in recorded),
-                          recorded)
+                census = (True, sum("::" in p for p in recorded),
+                          sum(declared_kind(p) == "negative" for p in recorded), recorded)
         else:
             print("verify: baseline run (%s) over the working tree's population"
                   % ", ".join(POPULATION_GATES))
@@ -734,17 +802,21 @@ def main():
             os.makedirs(bdir)
             bres, bcounts = population(exe, "base", bdir, env, list(POPULATION_GATES))
             report_gates(bres)
-            census = census_failures(os.path.join(bdir, "census.log"))
-            # The census may fail on declared projects; every other gate, and
-            # every other suite, must pass outright.
-            complete = all(r["ok"] for r in bres if r["name"] != "census") \
+            census = census_failures(os.path.join(bdir, "census.log"),
+                                     os.path.join(bdir, "examples.log"))
+            # The census and the examples may fail on declared programs; every
+            # other gate must pass outright.
+            complete = all(r["ok"] for r in bres if r["name"] not in ("census", "examples")) \
                 and all(bcounts.values()) \
-                and (next(r for r in bres if r["name"] == "census")["ok"] or declared or fixed)
+                and all(r["ok"] or declared or fixed for r in bres
+                        if r["name"] in ("census", "examples"))
             if not complete:
                 print("verify: FAIL -- the baseline run did not complete; its objects "
                       "are not a baseline (counts %s)" % bcounts)
                 return 1
-        problems = judge_baseline_census(declared, *census, fixed=fixed)
+        problems = judge_baseline_census(declared, *census, fixed=fixed,
+                                         unit_namespaces={n: unit_namespace(n) for n in fixed
+                                                          if declared_kind(n) == "unit"})
         problems += check_declared(declared, exe, cryo, logdir, env, fixed)
         if problems:
             for p in problems:
