@@ -2779,7 +2779,7 @@ module {
 internal module collections::raw_buffer;
 ```
 
-A submodule is public: `module x;` declares one, and `module { a; b; }` declares several, each entry ending in `;`. `public module` is refused (`E0117`), since there is no other kind of module for `public` to tell it from. `internal module x;` and `internal module { a; b; }` declare submodules that reach only their own package, one cryoconfig project. An import or an export of an internal module from another package is refused (`E0353`), and so is a module declared under one, which reaches no further than its parent. Everything an internal module declares reaches its package however it is marked: a `public` function in it called from another package is `E0353`, a type named from there is `E0503`, and a public signature may not name it (`E0506`, [section 13.4](#134-visibility)).
+A submodule is public: `module x;` declares one, and `module { a; b; }` declares several, each entry ending in `;`. `public module` is refused (`E0117`), since there is no other kind of module for `public` to tell it from. `internal module x;` and `internal module { a; b; }` declare submodules that reach only their own package, one cryoconfig project. An import or an export of an internal module from another package is refused (`E0353`), and so is a module declared under one, which reaches no further than its parent. The line that declares a module decides its reach even when nothing a program imports loads the file holding that line, as when the program imports the module directly. Everything an internal module declares reaches its package however it is marked: a `public` function in it called from another package is `E0353`, a type named from there is `E0503`, and a public signature may not name it (`E0506`, [section 13.4](#134-visibility)).
 
 A `module` line is **structure only**: it declares that a submodule exists, drives discovery, and suppresses a build-order edge. It does not bring the child's name or the child's symbols into any importer's scope. Importing `std::collections` therefore does not let you name `Array` — reaching a submodule takes an `import` of that submodule, or an `export` in the aggregator (see [section 13.5](#135-re-exports)).
 
@@ -4439,7 +4439,6 @@ color  = "auto"                     # auto | always | never
 | `cryo test [pattern]`    | Build and run the project's `![test]` functions.                                                                    |
 | `cryo check <file>`      | Front-end + semantic analysis only; no codegen.                                                                     |
 | `cryo init [dir]`        | Scaffold a new project (`cryoconfig` + `main.cryo`).                                                                |
-| `cryo raw <file>`        | Compile without the stdlib or prelude.                                                                              |
 | `cryo demangle <sym>`    | Decode a mangled symbol to its source form.                                                                         |
 | `cryo fetch`             | Fetch dependencies and write `cryoconfig.lock`.                                                                     |
 | `cryo update`            | Re-resolve every dependency, ignoring the lockfile.                                                                 |

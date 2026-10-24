@@ -85,6 +85,12 @@ private:
     // import writes, because an import names a module whole.
     vendor_modules: HashMap<string, string>;
 
+    // Every `module` line of every pre-scanned file, whether or not this
+    // build loads that file.  A module's reach is declared by its package's
+    // lines, and a program importing a module directly never loads the
+    // aggregator that declares it.
+    module_lines: [ModuleLine];
+
 public:
     /// The language server's open buffers.  A file one of them names is
     /// read from the buffer instead of the disk, so import discovery sees
@@ -134,6 +140,7 @@ public:
             scanned_ns:    HashMap::<string, string>::new(),
             ns_map:        HashMap::<string, string>::new(),
             vendor_modules: HashMap::<string, string>::new(),
+            module_lines:   [],
             lsp_overrides:    [],
             options:          null,
             vendor_registry:  VendorRegistry::empty(),
@@ -360,6 +367,42 @@ public:
         if (scan.namespace_name.is_valid()) {
             this.ns_map.insert(intern.resolve(scan.namespace_name), file_path);
         }
+        for (mut s: i64 = 0; s < scan.submodule_count; s++) {
+            this.module_lines.push(ModuleLine {
+                written:     scan.submodule_paths[s],
+                from_dir:    file_path.parent_dir(),
+                declarer:    file_path.to_ascii_lower(),
+                is_internal: scan.submodule_internal[s],
+                target:      "",
+                resolved:    false,
+            });
+        }
+    }
+
+    /// Whether the file `norm_path` (lower-cased) reaches only its package:
+    /// a `module` line declares it `internal module`, or declares it under a
+    /// module that is.  Every pre-scanned file's lines are read, so the
+    /// answer does not depend on which files this build loads.  A line's
+    /// path resolves as discovery resolves it, once the pre-scan has
+    /// indexed every namespace it can name.
+    declared_internal(mut &this, intern: InternTable*, norm_path: string) -> boolean {
+        for (mut k: i64 = 0; k < this.module_lines.length(); k++) {
+            if (this.module_lines[k].resolved) { continue; }
+            this.module_lines[k].target = this.resolve_import_path(
+                intern, this.module_lines[k].written, this.module_lines[k].from_dir).to_ascii_lower();
+            this.module_lines[k].resolved = true;
+        }
+        mut chain: [string] = [norm_path];
+        for (mut c: i64 = 0; c < chain.length(); c++) {
+            for (mut k: i64 = 0; k < this.module_lines.length(); k++) {
+                if (!this.module_lines[k].target.eq(chain[c])) { continue; }
+                if (this.module_lines[k].is_internal) { return true; }
+                if (!chain.contains(&this.module_lines[k].declarer)) {
+                    chain.push(this.module_lines[k].declarer);
+                }
+            }
+        }
+        return false;
     }
 
 
@@ -655,6 +698,7 @@ public:
         const mod_name_str: string = intern.resolve(mod_name);
         mut info: ModuleInfo = ModuleInfo::with_namespace(
             mod_name, file_path, mod_name);
+        info.declared_internal = this.declared_internal(intern, norm_path);
 
         // Publish this module's namespace BEFORE recursing into its imports.
         // Inside a cycle the recursion comes back around and asks for this
@@ -976,16 +1020,15 @@ public:
                 } else {
                     SourceSpan::none()
                 };
-                const sub_internal: boolean = scan.submodule_internal[s];
                 const sub_idx: i64 = graph.find_module_by_path(sub_resolved);
                 if (sub_idx >= 0) {
-                    info.add_submodule(RecordedEdge::to(graph.modules[sub_idx].path()), sub_at, sub_internal);
+                    info.add_submodule(RecordedEdge::to(graph.modules[sub_idx].path()), sub_at);
                 } else {
                     // Mid-load (cycle): the graph entry is not written yet, but
                     // the namespace is known.  Same case as the import edge.
                     match (this.scanned_ns.get(&sub_resolved.to_ascii_lower())) {
                         Option::Some(ns) => {
-                            info.add_submodule(RecordedEdge::written_as(intern.intern(ns)), sub_at, sub_internal);
+                            info.add_submodule(RecordedEdge::written_as(intern.intern(ns)), sub_at);
                         }
                         Option::None     => { }
                     }
@@ -1710,4 +1753,17 @@ type struct ModuleScanResult {
     submodule_internal: [boolean];
     submodule_count: i64;
     uses_fstring:    boolean;     // file contains at least one f-string (`f"..."`)
+}
+
+/// A `module` line the pre-scan read: the path as written, the directory
+/// of the file writing it (which resolves it as an import's path is), that
+/// file lower-cased, and whether it is `internal module`.  `target` is the
+/// file the path names, lower-cased, once `resolved`.
+type struct ModuleLine {
+    written:     SymbolStr;
+    from_dir:    string;
+    declarer:    string;
+    is_internal: boolean;
+    target:      string;
+    resolved:    boolean;
 }

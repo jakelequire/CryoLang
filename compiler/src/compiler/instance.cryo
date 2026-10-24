@@ -239,17 +239,6 @@ type struct CompilationResult {
         };
     }
 
-    static ok_with_warnings(output_path_text: string, warnings: u32) -> CompilationResult {
-        const output_path: string = output_path_text;
-        return CompilationResult {
-            success:       true,
-            error_count:   0,
-            warning_count: warnings,
-            output_path:   output_path,
-            stdlib_root:   "",
-        };
-    }
-
     static failed(errors: u32, warnings: u32) -> CompilationResult {
         return CompilationResult {
             success:       false,
@@ -364,65 +353,6 @@ type struct CompilerInstance {
         return view;
     }
 
-    // Shared pipeline orchestration
-
-    /// Run a pipeline on a context, handling AST dump, diagnostics, and
-    /// result construction.  All single-file compile_* methods delegate here.
-    run_pipeline(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
-                 output_path_text: string) -> CompilationResult {
-        if (!pipeline.validate()) {
-            Log::error(LogArea::Driver, "pipeline validation failed");
-            return CompilationResult::failed(1, 0);
-        }
-
-        const success: boolean = pipeline.run_all(ctx);
-
-        // Dump AST if --ast was requested
-        if (this.config.show_ast && ctx.artifacts.ast.is_valid()) {
-            const ast_root: ProgramNode* = ctx.artifacts.ast.root;
-            ASTDumper::dump(ast_root, ctx.intern_table);
-        }
-
-        // Print diagnostic summary when ANY diagnostic was emitted (errors
-        // or warnings).  Without flushing on warnings,
-        // codegen warnings about silently-dropped function bodies (e.g.
-        // missing LLVM declarations for cross-module trait impls) are
-        // collected but never rendered, so the user sees a green build
-        // followed by `undefined reference` link-time failures.
-        //
-        // LSP mode: skip the terminal-rendered output entirely.  The
-        // language server consumes `ctx.diagnostics.diagnostics`
-        // directly and emits them as JSON over stdout; an extra render
-        // to stderr would (a) try to read source from disk via the
-        // diag span's `file:` URI path and (b) print colour codes that
-        // confuse the editor's log capture.
-        const skip_flush: boolean = match (ctx.options.mode) {
-            CompileMode::Lsp => { true }
-            _                => { false }
-        };
-        if (!skip_flush
-                && (ctx.diagnostics.has_errors()
-                    || ctx.diagnostics.has_warnings())) {
-            ctx.diagnostics.flush();
-            if (ctx.diag_renderer != null) {
-                ctx.diag_renderer.print_summary(
-                    ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
-            }
-        }
-
-        ctx.type_arena.debug_dump();
-
-        Log::debug(LogArea::Driver, f"finished {ctx.source_file}: {ctx.diagnostics.error_count} errors, {ctx.diagnostics.warning_count} warnings");
-
-        if (success && !ctx.diagnostics.has_errors()) {
-            return CompilationResult::ok_with_warnings(
-                output_path_text, ctx.diagnostics.warning_count);
-        }
-        return CompilationResult::failed(
-            ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
-    }
-
-
     /// Compile a single source file with stdlib linking and prelude.
     ///
     /// Implemented as a synthesized one-entry project: the file's
@@ -477,32 +407,6 @@ type struct CompilerInstance {
             result.output_path = this.config.output_path_override;
         }
         return result;
-    }
-
-    /// Compile a single source file in raw mode (no stdlib, no prelude).
-    compile_raw(&this, source_text: string) -> CompilationResult {
-        const source: string = source_text;
-        Log::debug(LogArea::Driver, f"compiling {source} raw");
-
-        if (!metadata::exists(Path::from(source))) {
-            Log::error(LogArea::Driver, f"file not found: {source}");
-            return CompilationResult::failed(1, 0);
-        }
-
-        mut options: BuildOptions = BuildOptions::defaults(CompileMode::Raw);
-        options.target_triple = LTargetMachine::resolve_effective_triple(
-            this.config.target_triple_override);
-        options.output = OutputOverride::from_cli(this.config.output_kind,
-                                                  this.config.output_path_override);
-        mut ctx: CompilationContext = CompilationContext::new(options, source, null);
-        // Raw mode runs full codegen (IRGen/ObjectEmission), so it shares the
-        // process-wide (TypeRef.id -> LLVMTypeRef) cache. TypeArena.next_id
-        // resets to 1 per compile, so a prior compile's entries would alias
-        // unrelated types here, so every codegen entry resets it first.
-        compiler::codegen::type_map::TypeMapperCache::reset_shared_type_cache();
-        compiler::codegen::ast_arena::cryo_ast_arena_reset();
-        mut pipeline: PassRegistry = PassRegistry::build_raw_pipeline();
-        return this.run_pipeline(&ctx, &pipeline, ctx.artifacts.linked.object_file_path);
     }
 
     /// Compile for `cryo check`: frontend + semantic analysis, no codegen,

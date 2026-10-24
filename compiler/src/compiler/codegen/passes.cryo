@@ -49,8 +49,7 @@ import compiler::resolver::mangled_name::{ MangledName };
 /// toolchain: which driver binary to invoke, what to put on the system
 /// library line, and whether the executable filename grows an `.exe`
 /// suffix.  Built by `linker_config_for_triple` from the resolved
-/// target triple so both `run_linking` and `run_linking_singlefile`
-/// share one source of truth.
+/// target triple by `run_linking`.
 ///
 /// `use_stdlib_archive`:
 ///   - true  (host build): the stdlib was pre-built by `make stdlib`
@@ -1556,16 +1555,6 @@ type struct CodegenPasses {
             // was disabled (LSP mode).  Not an error.
             return PassResult::ok();
         }
-        if (ctx.project_config == null) {
-            // Raw mode (`cryo raw`): only Exe needs linking.  Asm /
-            // Object / IRText emit their final artifact straight from
-            // object emission; Default (no `-o`) leaves the .o behind
-            // without linking, matching the historic behaviour.
-            if (ctx.options.output.is_exe()) {
-                return CodegenPasses::run_linking_singlefile(ctx);
-            }
-            return PassResult::ok();
-        }
         // `-o foo.o` / `foo.s` / `foo.ll` on a single-file build: the
         // entry module's artifact was already written by ObjectEmission
         // directly to the override path; there is no executable to link.
@@ -1850,97 +1839,6 @@ type struct CodegenPasses {
     }
 
 
-    /// Single-file `-o PATH` Exe link.  Mirrors the project link path
-    /// minus the cryoconfig-driven extras: there are no `[link]` paths,
-    /// no test-suffix logic, and no llvm-link IR dump.  The stdlib
-    /// archive is still pulled in for host builds when `ctx.options.stdlib_root`
-    /// was resolved - without it most non-trivial programs would fail to
-    /// link.  Cross-compile builds skip the archive (same reasoning as
-    /// the project link path).  The user-supplied `exe_path` is taken
-    /// verbatim: we do NOT auto-append `.exe` for Windows targets,
-    /// since `-o` is explicit user intent.
-    static run_linking_singlefile(ctx: CompilationContext*) -> PassResult {
-        const exe_path: string = ctx.options.output.path();
-        if (exe_path.length() == 0) {
-            return PassResult::ok();
-        }
-
-        const effective_triple: string = ctx.options.target_triple;
-        const link_cfg: LinkerConfig = LinkerConfig::linker_config_for_triple(effective_triple);
-        if (!link_cfg.supported) {
-            // Unknown triple - same fallback as the project path.
-            fmt::println(f"Cross-compile: produced {ctx.artifacts.object_files.length()} object file(s) for target '{ctx.options.target_triple}'");
-            fmt::println(f"  (host linker skipped; link with a {ctx.options.target_triple}-aware toolchain)");
-            return PassResult::ok();
-        }
-
-        // Object list via an @response-file, same as the project link path
-        // and `bundle_archive`: a large single-file program can still blow
-        // past `cmd /c`'s ~8191-char command-line cap on a native Windows
-        // host (where `system(3)` routes through cmd), and `@file` keeps the
-        // spawned command short and byte-identical on every host.  `@"%s"`
-        // (literal double quotes) parses the same under `sh -c` and `cmd /c`.
-        const link_rsp_path: string = fmt::format("%s.rsp", exe_path);
-        if (!CodegenPasses::write_rsp_file(link_rsp_path, &ctx.artifacts.object_files)) {
-            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                fmt::format("could not open linker response file for writing: %s", link_rsp_path));
-            return PassResult::failure(1);
-        }
-
-        mut cmd: string = fmt::format("%s -o %s @\"%s\"",
-            link_cfg.driver, CodegenPasses::link_quote(exe_path), link_rsp_path);
-        // `no_runtime`: freestanding link (see run_linking).  In raw mode
-        // `ctx.options.freestanding()` carries the flag.  Same per-OS split as the
-        // project path: a PE cannot be `-static` (ntdll is always a DLL) and
-        // needs its entry pointed at the runtime's `_start`.
-        const raw_triple: string = CodegenPasses::effective_triple(ctx);
-        if (ctx.options.freestanding()) {
-            if (raw_triple.contains("windows")) {
-                cmd = fmt::format("%s -nostartfiles -nostdlib -Wl,-e,_start", cmd);
-            } else {
-                cmd = fmt::format("%s -nostartfiles -nostdlib -static", cmd);
-            }
-        }
-        // Stdlib archive: same lookup as the project link path, and same
-        // host-vs-cross gating.  Empty stdlib_root means single-file mode
-        // never resolved one (e.g. user passed `--no-std` semantically by
-        // stripping prelude resolution); skip the archive in that case
-        // and let the linker error if the program needs stdlib symbols.
-        if (link_cfg.use_stdlib_archive && !ctx.options.freestanding()
-                && ctx.options.stdlib_root.length() > 0) {
-            const stdlib_archive: string = CodegenPasses::stdlib_archive_path(
-                ctx.options.stdlib_root, raw_triple);
-            cmd = fmt::format("%s %s", cmd, CodegenPasses::link_quote(stdlib_archive));
-        }
-        if (ctx.options.freestanding()) {
-            cmd = CodegenPasses::append_runtime_tier_libs(ctx, cmd, raw_triple);
-        } else {
-            cmd = CodegenPasses::append_hosted_runtime_libs(ctx, cmd, raw_triple,
-                link_cfg.driver, fmt::format("%s.probe", link_rsp_path));
-            cmd = fmt::format("%s %s", cmd, link_cfg.extra_system_libs);
-        }
-
-        Log::debug(LogArea::Link, f"single-file link into {exe_path}");
-        Log::debug(LogArea::Link, f"link command: {cmd}");
-
-        mut link_out: string = "";
-        const rc: i32 = CodegenPasses::run_tool(cmd, fmt::format("%s.log", link_rsp_path), &link_out);
-        if (rc != 0) {
-            // Retained on failure so the reported command can be re-run; see
-            // the project link path for the reasoning.
-            ctx.emit_diagnostic(CodegenPasses::tool_failure(
-                fmt::format("linker invocation failed (%s exited with %d)", link_cfg.driver, rc),
-                cmd, link_rsp_path, link_out));
-            return PassResult::failure(1);
-        }
-        // Discard the response file once the link has consumed it
-        // (best-effort - a failed unlink is harmless).
-        dir::remove_file(Path::from(link_rsp_path));
-
-        Log::debug(LogArea::Link, f"linked executable {exe_path}");
-        ctx.artifacts.linked = LinkedOutput { object_file_path: exe_path };
-        return PassResult::ok();
-    }
 
 
     /// Bundle a library/stdlib target's per-module .o files into a single

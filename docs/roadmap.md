@@ -411,10 +411,10 @@ Left over from that: the async entry point calls `Executor::new` and
    hidden.  Built: `collections::raw_buffer` and `future::reactor` are
    `internal module`s with every item marked, and the fields naming
    their types (`String`'s buffer, an executor's and every I/O future's
-   reactor) are private.  Open: in the standard library the `internal
-   module` line itself restricts nothing yet - its items are refused
-   only by their own markers - which is a compiler defect in the bug
-   log.
+   reactor) are private.  An `internal module` line now hides its
+   module from other packages whichever files a build loads, so the
+   standard library's internal modules are refused at the import as a
+   dependency's are.
 
 ## A generic type's methods emitted only when called
 

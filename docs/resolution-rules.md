@@ -154,6 +154,19 @@ yet is recorded with the change that builds it, not here.
      exactly as it would in braces.  (Jake: the update a statement;
      braceless children, delegated)
 
+585. **How far a module reaches is decided by its package's `module`
+     lines, whichever files a build loads.**  A module an `internal
+     module` line declares, or that a line declares under such a module,
+     is internal to its package even when nothing the program imports
+     loads the file holding that line, as when a program imports the
+     module directly.  The standard library's internal modules are
+     internal by this rule like any dependency's.  (Jake: an internal
+     module hides everything in it; the mechanism, delegated)
+
+586. **`cryo raw` is removed,** with the compile mode it ran in; this
+     replaces 556.  A file compiled without the standard library is
+     `cryo build --no-std`.  (Jake)
+
 ### 2026-10-23
 
 575. **Every length, position and size in the standard library is an
@@ -241,7 +254,7 @@ yet is recorded with the change that builds it, not here.
      spans, panic locations and log lines name `dumper.cryo`.  Which
      files are found does not change.  (Jake)
 
-556. **`cryo raw` stays as it is.**  (Jake)
+556. *Replaced by 586.* **`cryo raw` stays as it is.**  (Jake)
 
 557. **A compile-time integer ranges from `i128::MIN` through
      `u128::MAX`:** a `u128` above `i128::MAX` folds, and so does
