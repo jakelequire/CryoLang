@@ -25,11 +25,11 @@ import std::core::mem;
 
 /// First HPACK index of the dynamic table: the static table holds 61
 /// entries (1..61), so the dynamic table begins at 62.
-const DYNAMIC_BASE: i64 = 62;
+private const DYNAMIC_BASE: i64 = 62;
 
 /// Per-entry overhead the dynamic table charges on top of the name and
 /// value byte lengths (RFC 7541 section 4.1).
-const ENTRY_OVERHEAD: i64 = 32;
+private const ENTRY_OVERHEAD: i64 = 32;
 
 /// Hard ceiling on the cumulative *uncompressed* size of a decoded header
 /// list (each field counts name + value + ENTRY_OVERHEAD per section 4.1). HPACK
@@ -37,13 +37,14 @@ const ENTRY_OVERHEAD: i64 = 32;
 /// this a small compressed block could decode into an unbounded list - a
 /// decompression bomb. A block that decodes past this is rejected. Kept in
 /// step with the connection's advertised SETTINGS_MAX_HEADER_LIST_SIZE.
-const MAX_DECODED_HEADER_LIST: i64 = 262144;
+private const MAX_DECODED_HEADER_LIST: i64 = 262144;
 
 /// One header field. Owns its name and value bytes.
-type struct HeaderField {
-    name:  String;
-    value: String;
+internal type struct HeaderField {
+    internal name:  String;
+    internal value: String;
 
+private:
     static new(name: Str, value: Str) -> HeaderField {
         return HeaderField {
             name:  String::from_str(name),
@@ -63,7 +64,7 @@ implement trait Drop for struct HeaderField {
 
 /// A read position into a byte slice, threaded through the decode
 /// helpers (a plain `mut &i64` cursor in struct form).
-type struct Cursor {
+private type struct Cursor {
     pos: i64;
 }
 
@@ -72,7 +73,7 @@ type struct Cursor {
 /// HPACK dynamic table: a FIFO of recently-seen header fields, indexed
 /// newest-first. Entry at array slot 0 is the most recent (HPACK index
 /// 62); the oldest entries are evicted when the byte budget is exceeded.
-type struct DynTable {
+private type struct DynTable {
     entries:  Array<HeaderField>;
     size:     i64;
     max_size: i64;
@@ -131,7 +132,7 @@ implement trait Drop for struct DynTable {
 /// A name/value pair drawn from the static table. Both `Str`s point at
 /// string literals (static storage), so the value is freely copyable
 /// and never needs dropping.
-type struct StaticEntry {
+private type struct StaticEntry {
     name:  Str;
     value: Str;
     found: boolean;
@@ -139,7 +140,7 @@ type struct StaticEntry {
 
 /// Look up static-table entry `index` (1..61). `found` is false for any
 /// out-of-range index.
-function static_entry(index: i64) -> StaticEntry {
+private function static_entry(index: i64) -> StaticEntry {
     if (index == 1)  { return se(":authority", ""); }
     if (index == 2)  { return se(":method", "GET"); }
     if (index == 3)  { return se(":method", "POST"); }
@@ -204,12 +205,12 @@ function static_entry(index: i64) -> StaticEntry {
     return StaticEntry { name: Str::new(""), value: Str::new(""), found: false };
 }
 
-function se(name: string, value: string) -> StaticEntry {
+private function se(name: string, value: string) -> StaticEntry {
     return StaticEntry { name: Str::new(name), value: Str::new(value), found: true };
 }
 
 /// Count of static-table entries.
-const STATIC_COUNT: i64 = 61;
+private const STATIC_COUNT: i64 = 61;
 
 // ---- integer codec (RFC 7541 section 5.1) ----------------------------------------
 
@@ -217,7 +218,7 @@ const STATIC_COUNT: i64 = 61;
 /// representation's high bits (the prefix bits themselves must be zero).
 /// `value` is a length or an index, never negative; the wire form is
 /// unsigned.
-function encode_integer(out: mut &Array<u8>, prefix_bits: u32, prefix_value: u8, value: i64) -> void {
+private function encode_integer(out: mut &Array<u8>, prefix_bits: u32, prefix_value: u8, value: i64) -> void {
     const wire: u64 = value as u64;
     const max: u64 = (1 << (prefix_bits as u64)) - 1;
     if (wire < max) {
@@ -236,7 +237,7 @@ function encode_integer(out: mut &Array<u8>, prefix_bits: u32, prefix_value: u8,
 /// Decode an N-bit-prefix integer starting at the cursor. Advances the
 /// cursor. `None` on truncation, an over-long continuation, or a value
 /// past `i64::MAX`, which no length or index can be.
-function decode_integer(data: Slice<u8>, cur: mut &Cursor, prefix_bits: u32) -> Option<i64> {
+private function decode_integer(data: Slice<u8>, cur: mut &Cursor, prefix_bits: u32) -> Option<i64> {
     if (cur.pos >= data.length()) { return Option::None; }
     const max: u64 = (1 << (prefix_bits as u64)) - 1;
     mut value: u64 = (byte_at(data, cur.pos) as u64) & max;
@@ -260,7 +261,7 @@ function decode_integer(data: Slice<u8>, cur: mut &Cursor, prefix_bits: u32) -> 
 
 /// Append a string literal, Huffman-coding it when that is strictly
 /// shorter than the raw bytes.
-function encode_string(out: mut &Array<u8>, s: Slice<u8>) -> void {
+private function encode_string(out: mut &Array<u8>, s: Slice<u8>) -> void {
     const raw_len: i64 = s.length();
     const huff_len: i64 = huffman::encoded_len(s);
     if (huff_len < raw_len) {
@@ -275,7 +276,7 @@ function encode_string(out: mut &Array<u8>, s: Slice<u8>) -> void {
 }
 
 /// Decode a string literal starting at the cursor. Advances it.
-function decode_string(data: Slice<u8>, cur: mut &Cursor) -> Option<String> {
+private function decode_string(data: Slice<u8>, cur: mut &Cursor) -> Option<String> {
     if (cur.pos >= data.length()) { return Option::None; }
     const huffman_flag: boolean = (byte_at(data, cur.pos) & 0x80) != 0;
     const len: i64 = match (decode_integer(data, cur, 7)) {
@@ -300,13 +301,14 @@ function decode_string(data: Slice<u8>, cur: mut &Cursor) -> Option<String> {
 
 // ---- decoder --------------------------------------------------------------
 
-type struct HpackDecoder {
-    table: DynTable;
+internal type struct HpackDecoder {
+    private table: DynTable;
     /// The largest dynamic-table size we permit a peer to select - the
     /// `SETTINGS_HEADER_TABLE_SIZE` we advertised.  RFC 7541 section 6.3 requires
     /// rejecting a dynamic-table-size update that exceeds it.
-    hard_max: i64;
+    private hard_max: i64;
 
+internal:
     static new(max_dynamic: i64) -> HpackDecoder {
         return HpackDecoder { table: DynTable::new(max_dynamic), hard_max: max_dynamic };
     }
@@ -377,6 +379,7 @@ type struct HpackDecoder {
         return Option::Some(out);
     }
 
+private:
     /// Account `field` against the decoded header-list budget, then push it
     /// onto `out`. Returns false - having dropped the un-pushed `field` -
     /// when the cumulative uncompressed size would exceed
@@ -460,9 +463,10 @@ implement trait Drop for struct HpackDecoder {
 
 // ---- encoder --------------------------------------------------------------
 
-type struct HpackEncoder {
-    table: DynTable;
+internal type struct HpackEncoder {
+    private table: DynTable;
 
+internal:
     static new(max_dynamic: i64) -> HpackEncoder {
         return HpackEncoder { table: DynTable::new(max_dynamic) };
     }
@@ -502,6 +506,7 @@ type struct HpackEncoder {
         this.table.add(name, value);
     }
 
+private:
     /// Combined-index of an exact name+value match, or 0.
     find_full(&this, name: Str, value: Str) -> i64 {
         mut i: i64 = 1;
@@ -544,7 +549,7 @@ implement trait Drop for struct HpackEncoder {
 }
 
 /// Slice byte access without the `Option` ceremony; callers stay in range.
-function byte_at(s: Slice<u8>, index: i64) -> u8 {
+private function byte_at(s: Slice<u8>, index: i64) -> u8 {
     match (s.get(index)) {
         Option::Some(b) => { return b; }
         Option::None    => { return 0; }

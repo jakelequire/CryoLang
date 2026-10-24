@@ -2995,7 +2995,7 @@ buf[0] = 0xFF;
 free(buf as void*);
 ```
 
-A bare `malloc`, `free` or `realloc` means a declaration in scope, as any bare name does: the module's own `intrinsic function`, an `extern "C"` it declares, or an import. With no such declaration in the writing module the bare name is an **error**, and the fix is to say which one is meant - `libc::free` for the C allocator, `heap::free` for the Cryo one. There is no freestanding exception: under `no_std` the name is declared (extern or intrinsic), so the rule holds there as everywhere.
+A bare `malloc`, `free` or `realloc` means a declaration in scope, as any bare name does: the module's own `intrinsic function`, an `extern "C"` it declares, or an import. With no such declaration in the writing module the bare name is an **error**, and the fix is to say which one is meant - `libc::free` for the C allocator, `allocator::free` for the Cryo one. There is no freestanding exception: under `no_std` the name is declared (extern or intrinsic), so the rule holds there as everywhere.
 
 **Heap values (`new` / `delete`):**
 

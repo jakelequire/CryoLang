@@ -51,39 +51,39 @@ import std::sys;
 /// SEGMENT_SIZE boundary, so `ptr & ~(SEGMENT_SIZE-1)` finds the header.
 /// 4 MiB keeps the VMA count low; mappings are demand-paged, so untouched
 /// tail pages cost no RSS.
-const SEGMENT_SIZE: u64 = 4194304;
+private const SEGMENT_SIZE: u64 = 4194304;
 
 /// OS page size (x86-64 linux and windows both use 4 KiB base pages).
-const PAGE: u64 = 4096;
+private const PAGE: u64 = 4096;
 
 /// Offset of the first block in a small segment: one page reserved for the
 /// header. Also the minimum large-payload offset. Page-aligned so blocks
 /// inherit 16-alignment from 16-multiple class sizes.
-const DATA_OFF: u64 = 4096;
+private const DATA_OFF: u64 = 4096;
 
 /// Small-path granule: class sizes are multiples of 16 and blocks are
 /// 16-aligned, matching the strictest alignment `Layout` produces for
 /// ordinary (non-`![align]`) types.
-const GRAN: u64 = 16;
+private const GRAN: u64 = 16;
 
 /// Largest size served from class segments; bigger goes to the large path.
 /// 32 KiB => 127 blocks per segment in the worst class.
-const SMALL_MAX: u64 = 32768;
+private const SMALL_MAX: u64 = 32768;
 
 /// Class count: 8 sixteen-step classes (16..128) + 8 doublings x 4
 /// quarter-step classes (129..32768). See `class_index`.
-const NUM_CLASSES: i64 = 40;
+private const NUM_CLASSES: i64 = 40;
 
 /// Segment magics: arbitrary but distinctive 64-bit tags. `free` uses
 /// them both to dispatch (small vs large) and to reject foreign pointers.
-const MAGIC_SMALL: u64 = 0xC59F0A11C5E60001;
-const MAGIC_LARGE: u64 = 0xC59F0A11C5E60002;
+private const MAGIC_SMALL: u64 = 0xC59F0A11C5E60001;
+private const MAGIC_LARGE: u64 = 0xC59F0A11C5E60002;
 
 // Atomic memory orders (LLVM AtomicOrdering numbering, see
 // core::intrinsics): Monotonic/Relaxed=2, Acquire=4, Release=5.
-const ORDER_RELAXED: u32 = 2;
-const ORDER_ACQUIRE: u32 = 4;
-const ORDER_RELEASE: u32 = 5;
+private const ORDER_RELAXED: u32 = 2;
+private const ORDER_ACQUIRE: u32 = 4;
+private const ORDER_RELEASE: u32 = 5;
 
 /// Per-segment header, living at the base of every mapping.
 ///
@@ -96,7 +96,7 @@ const ORDER_RELEASE: u32 = 5;
 /// Large segments: `class_idx == -1`, one payload at `base + payload_off`,
 /// `block_size` is the payload capacity, `map_size` the full mapping length;
 /// the list links and small-path fields are unused.
-type struct SegmentHeader {
+private type struct SegmentHeader {
     magic: u64;
     class_idx: i64;
     block_size: u64;
@@ -116,23 +116,23 @@ type struct SegmentHeader {
 // metadata never touches libc either. `g_lock` guards every read/write of
 // heap metadata (class lists and all header fields).
 
-mut g_heads: SegmentHeader** = null;
-mut g_lock: u32 = 0;
+private mut g_heads: SegmentHeader** = null;
+private mut g_lock: u32 = 0;
 
 /// Number of failed acquire attempts before a waiter yields its timeslice.
 /// Small: the critical sections here are a few dozen instructions, so if we
 /// have not won within this many spins the holder is almost certainly not
 /// running, and spinning further is pure waste.
-const LOCK_SPIN_LIMIT: u32 = 64;
+private const LOCK_SPIN_LIMIT: u32 = 64;
 
 /// Yield this thread's timeslice. Uses the raw OS primitive rather than
 /// `thread::yield_now()` or libc: this file must not call anything that could
 /// allocate and recurse into the lock we are trying to acquire.
 ![target(windows)]
-function heap_yield() -> void { syscall::SwitchToThread(); }
+private function heap_yield() -> void { syscall::SwitchToThread(); }
 
 ![target(unix)]
-function heap_yield() -> void { syscall::sys_sched_yield(); }
+private function heap_yield() -> void { syscall::sys_sched_yield(); }
 
 /// Acquire the heap lock: bounded spin, then yield.
 ///
@@ -159,7 +159,7 @@ function heap_yield() -> void { syscall::sys_sched_yield(); }
 /// This stays a global lock - per-class locks / thread-local pages remain the
 /// intended later evolution. It only stops the crude version from being
 /// pathological under real concurrency.
-function lock() -> void {
+private function lock() -> void {
     mut spins: u32 = 0;
     loop {
         mut ok: boolean = false;
@@ -181,7 +181,7 @@ function lock() -> void {
     }
 }
 
-function unlock() -> void {
+private function unlock() -> void {
     intrinsics::atomic_store_u32(&g_lock, 0, ORDER_RELEASE);
 }
 
@@ -189,7 +189,7 @@ function unlock() -> void {
 /// inside the heap (panic's formatting could allocate and re-enter). The
 /// explicit flush matters: `abort` does not flush stdio, and an unflushed
 /// diagnostic is indistinguishable from a mystery SIGABRT.
-function die(msg: u8*) -> void {
+private function die(msg: u8*) -> void {
     libc::printf("native_heap: %s\n", msg);
     libc::fflush(null);
     libc::abort();
@@ -202,7 +202,7 @@ function die(msg: u8*) -> void {
 // here (callers round). `os_unmap` returns a mapping to the OS.
 
 ![target(unix)]
-function os_map_aligned(size: u64) -> u8* {
+private function os_map_aligned(size: u64) -> u8* {
     // Over-map by one segment, then trim the head below the first aligned
     // boundary and the tail above `aligned + size`. Both trims are precise
     // munmaps, so exactly [aligned, aligned+size) survives.
@@ -226,12 +226,12 @@ function os_map_aligned(size: u64) -> u8* {
 }
 
 ![target(unix)]
-function os_unmap(ptr: u8*, size: u64) -> void {
+private function os_unmap(ptr: u8*, size: u64) -> void {
     sys::munmap(ptr, size);
 }
 
 ![target(windows)]
-function os_map_aligned(size: u64) -> u8* {
+private function os_map_aligned(size: u64) -> u8* {
     // VirtualAlloc can't trim a reservation, so alignment uses the classic
     // reserve/release/re-reserve dance: reserve oversized to LEARN an
     // aligned address, release, then reserve exactly there. Another thread
@@ -255,7 +255,7 @@ function os_map_aligned(size: u64) -> u8* {
 }
 
 ![target(windows)]
-function os_unmap(ptr: u8*, size: u64) -> void {
+private function os_unmap(ptr: u8*, size: u64) -> void {
     // MEM_RELEASE frees the whole reservation; dwSize must be 0.
     syscall::VirtualFree(ptr, 0, syscall::MEM_RELEASE);
 }
@@ -267,7 +267,7 @@ function os_unmap(ptr: u8*, size: u64) -> void {
 /// Classes 8..39: for each doubling (P = 128 << d, d in 0..7), four
 /// quarter-step classes P + q*(P/4) for q in 1..4 — bounded ~25% internal
 /// fragmentation with a compact class table.
-function class_index(size: u64) -> i64 {
+private function class_index(size: u64) -> i64 {
     if (size <= 128) {
         const rs: u64 = (size + GRAN - 1) & ~(GRAN - 1);
         return ((rs / GRAN) as i64) - 1;
@@ -286,7 +286,7 @@ function class_index(size: u64) -> i64 {
 }
 
 /// The block size a class serves (inverse of `class_index`).
-function class_size(idx: i64) -> u64 {
+private function class_size(idx: i64) -> u64 {
     if (idx < 8) {
         return ((idx + 1) as u64) * GRAN;
     }
@@ -302,7 +302,7 @@ function class_size(idx: i64) -> u64 {
 // Internals (all called with the lock held)
 
 /// The class-head slot array, mapping its page on first use.
-function class_heads() -> SegmentHeader** {
+private function class_heads() -> SegmentHeader** {
     if (g_heads == null) {
         const page: u8* = os_map_aligned(PAGE);
         if (page == null) {
@@ -315,7 +315,7 @@ function class_heads() -> SegmentHeader** {
 
 /// Map and initialize a fresh small segment for `idx`, linked at the front
 /// of its class list. Returns null on OOM.
-function new_segment(idx: i64) -> SegmentHeader* {
+private function new_segment(idx: i64) -> SegmentHeader* {
     const base: u8* = os_map_aligned(SEGMENT_SIZE);
     if (base == null) { return null; }
     const seg: SegmentHeader* = base as SegmentHeader*;
@@ -338,7 +338,7 @@ function new_segment(idx: i64) -> SegmentHeader* {
 
 /// Take one block from `seg` (free list first, then the bump frontier).
 /// Returns null when the segment is full.
-function take_block(seg: SegmentHeader*) -> void* {
+private function take_block(seg: SegmentHeader*) -> void* {
     if (seg.free_head != null) {
         const block: u8* = seg.free_head;
         seg.free_head = *(block as u8**);
@@ -355,7 +355,7 @@ function take_block(seg: SegmentHeader*) -> void* {
 }
 
 /// Unlink `seg` from its class list.
-function unlink_segment(seg: SegmentHeader*) -> void {
+private function unlink_segment(seg: SegmentHeader*) -> void {
     if (seg.prev != null) {
         seg.prev.next = seg.next;
     } else {
@@ -367,7 +367,7 @@ function unlink_segment(seg: SegmentHeader*) -> void {
 }
 
 /// Round `n` up to whole pages.
-function page_round(n: u64) -> u64 {
+private function page_round(n: u64) -> u64 {
     return (n + PAGE - 1) & ~(PAGE - 1);
 }
 
@@ -376,7 +376,7 @@ function page_round(n: u64) -> u64 {
 
 /// Allocate `size` bytes aligned to `align` (a non-zero power of two).
 /// Returns null on OOM or when `size` is 0.
-public function alloc(size: u64, align: u64) -> void* {
+internal function alloc(size: u64, align: u64) -> void* {
     if (size == 0) { return null; }
     if (align <= GRAN && size <= SMALL_MAX) {
         const idx: i64 = class_index(size);
@@ -414,7 +414,7 @@ public function alloc(size: u64, align: u64) -> void* {
 }
 
 /// Dedicated aligned mapping for a large or over-aligned request.
-function large_alloc(size: u64, align: u64) -> void* {
+private function large_alloc(size: u64, align: u64) -> void* {
     if (align >= SEGMENT_SIZE) {
         // The payload sits `max(page, align)` past the header; at
         // `align >= SEGMENT_SIZE` the mask in `owning_segment` would land
@@ -442,7 +442,7 @@ function large_alloc(size: u64, align: u64) -> void* {
 }
 
 /// Recover the segment header owning `ptr`, aborting on a foreign pointer.
-function owning_segment(ptr: void*, who: u8*) -> SegmentHeader* {
+private function owning_segment(ptr: void*, who: u8*) -> SegmentHeader* {
     const seg: SegmentHeader* = ((ptr as u64) & ~(SEGMENT_SIZE - 1)) as SegmentHeader*;
     if (seg.magic != MAGIC_SMALL && seg.magic != MAGIC_LARGE) {
         libc::printf("native_heap: %s: foreign or corrupt pointer %p\n",
@@ -454,7 +454,7 @@ function owning_segment(ptr: void*, who: u8*) -> SegmentHeader* {
 }
 
 /// Return `ptr` (from `alloc`) to the heap. Null is a no-op.
-public function free(ptr: void*) -> void {
+internal function free(ptr: void*) -> void {
     if (ptr == null) { return; }
     const seg: SegmentHeader* = owning_segment(ptr, "free" as u8*);
     if (seg.magic == MAGIC_LARGE) {
@@ -482,7 +482,7 @@ public function free(ptr: void*) -> void {
 /// or null on OOM (in which case `ptr` remains valid). `old_size` is the
 /// caller's bookkeeping of the live byte count; the copy is clamped to the
 /// block's actual capacity as a defense against stale bookkeeping.
-public function realloc(ptr: void*, old_size: u64,
+internal function realloc(ptr: void*, old_size: u64,
                              new_size: u64, align: u64) -> void* {
     if (ptr == null) { return alloc(new_size, align); }
     if (new_size == 0) { return null; }

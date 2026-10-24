@@ -3279,7 +3279,7 @@ dropped or deferred says so; a deferred one is listed in
   keyword half is deferred to a branch of its own after the merge.
 - **D19.** A bare `malloc`, `free` or `realloc` with no declaration in the
   writing module is an error (E0202), whose note names the modules that
-  declare the leaf: write `libc::free` or `heap::free`.
+  declare the leaf: write `libc::free` or `allocator::free`.
 - **D20.** `import Unknown;` naming no module is E0502 at the import, in
   every form; the help names the module the path abbreviates.
 - **D21.** An unknown type in expression or type-argument position

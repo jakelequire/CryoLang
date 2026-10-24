@@ -399,19 +399,19 @@ Left over from that: the async entry point calls `Executor::new` and
    emitted only when called" below would take it back.
 3. **Every item marked.**  About 650 helpers used only in their own
    module become `private`; about 215 used across the library become
-   `internal`; implementation modules become `internal module`:
-   `future::reactor` and `raw_buffer` once the public fields naming
-   `Reactor` and `String.buffer` are private, and `alloc::heap` and
-   `net::http2::huffman`/`hpack` once the compiler and the tests stop
-   importing them.  `net::addr::sockaddr` stays public: low-level
+   `internal`; implementation modules become `internal module`.
+   `net::addr::sockaddr` stays public: low-level
    programming is not hidden.  The C bindings (`libc`, `syscall`, `openssl`) stay public,
    outside the 1.0 stability promise.  Tests that reach internals are
    rewritten through the public API, or deleted where they pinned only
    an internal.  Anything borderline is listed for Jake rather than
-   hidden.  Built: `collections::raw_buffer` and `future::reactor` are
-   `internal module`s with every item marked, and the fields naming
-   their types (`String`'s buffer, an executor's and every I/O future's
-   reactor) are private.  An `internal module` line now hides its
+   hidden.  Built: `collections::raw_buffer`, `future::reactor`,
+   `alloc::heap` and `net::http2::huffman`/`hpack` are `internal
+   module`s with every item marked, and the fields naming their types
+   (`String`'s buffer, an executor's and every I/O future's reactor, a
+   connection's HPACK encoder and decoder) are private.  HPACK is tested
+   through `Http2Connection` against RFC 7541's examples, and the heap
+   through `GlobalAlloc` with `native_alloc` on.  An `internal module` line now hides its
    module from other packages whichever files a build loads, so the
    standard library's internal modules are refused at the import as a
    dependency's are.

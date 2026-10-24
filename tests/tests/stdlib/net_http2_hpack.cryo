@@ -1,10 +1,16 @@
-///! HPACK (RFC 7541) - Huffman, integer codec, and the Appendix C
-///! request examples.
+///! HPACK (RFC 7541) through the HTTP/2 connection, with header blocks
+///! written byte for byte as RFC 7541 Appendix C gives them, over an
+///! in-memory transport.
 ///!
-///! The Huffman vector and the C.4.1 wire-format decode anchor absolute
-///! correctness against the RFC; the round-trip tests exercise the
-///! encoder + decoder together, including the dynamic table across a
-///! sequence of requests.
+///! A server connection decodes the C.4 request sequence: Huffman strings,
+///! the static table, and the dynamic-table entries the earlier requests
+///! made.  A client connection must put exactly those C.4 bytes on the wire
+///! for the same three requests, while decoding the C.6 responses.  The
+///! comparison is byte-exact, because a header that decodes to the right
+///! value from the wrong encoding is what a round trip alone cannot see.
+///! The remaining cases cover what the vectors leave out: a never-indexed
+///! field is not stored, integers continue past a 5-bit and a 7-bit prefix,
+///! and an index past the dynamic table refuses the block.
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::NetHttp2Hpack;
@@ -13,226 +19,388 @@ import std::core::result::{ Result };
 import std::core::option::{ Option };
 import std::core::slice::{ Slice };
 import std::collections::array::{ Array };
-import std::collections::string;
 import std::collections::str::{ Str };
-import std::net::http2::huffman;
-import std::net::http2::hpack::{ Cursor, HeaderField, HpackDecoder, HpackEncoder };
+import std::collections::string::{ String };
+import std::future;
+import std::io::traits::{ AsyncTransport, Transfer };
+import std::io::buf::{ BufStream };
+import std::net::http::method::{ Method };
+import std::net::http::request::{ Request };
+import std::net::http::response::{ Response };
+import std::net::http2::connection::{ Http2Connection, RequestOnStream };
 import std::test::error::{ TestError };
-import std::test::assert::{ bail, expect };
+import std::test::assert::{ expect_eq };
 
-/// Parse an ASCII hex string into bytes.
-function from_hex(s: Str) -> Array<u8> {
+/// An in-memory transport: a read hands over what is left of `inbox`, a
+/// write appends to `outbox`, and an exhausted inbox reads as the peer
+/// closing.
+type struct MemTransport {
+    inbox:  Array<u8>;
+    ipos:   i64;
+    outbox: Array<u8>;
+
+    static of(inbox: Array<u8>) -> MemTransport {
+        return MemTransport { inbox: inbox, ipos: 0, outbox: Array::<u8>::new() };
+    }
+}
+
+implement trait AsyncTransport for struct MemTransport {
+    async read_into(mut &this, buf: Array<u8>) -> Transfer {
+        mut out: Array<u8> = buf;
+        mut take: i64 = this.inbox.length() - this.ipos;
+        if (take > out.length()) { take = out.length(); }
+        mut i: i64 = 0;
+        while (i < take) {
+            match (this.inbox.get(this.ipos + i)) {
+                Option::Some(byte) => { out.set(i, byte); }
+                Option::None       => { }
+            }
+            i = i + 1;
+        }
+        this.ipos = this.ipos + take;
+        out.truncate(take);
+        return Transfer { buf: out, result: Result::Ok(take) };
+    }
+
+    async write_from(mut &this, buf: Array<u8>) -> Transfer {
+        mut src: Array<u8> = buf;
+        this.outbox.append(src.as_slice());
+        const n: i64 = src.length();
+        return Transfer { buf: src, result: Result::Ok(n) };
+    }
+}
+
+// ---- wire construction ----------------------------------------------------
+
+const FRAME_HEADERS: u8 = 0x1;
+const FRAME_SETTINGS: u8 = 0x4;
+/// END_STREAM | END_HEADERS: a whole request or response in one frame.
+const COMPLETE: u8 = 0x5;
+const FRAME_HEADER_LEN: i64 = 9;
+const PREFACE: string = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+function hex_digit(c: u8) -> u8 {
+    if (c >= 0x30 && c <= 0x39) { return c - 0x30; }
+    return c - 0x61 + 10;
+}
+
+/// The bytes a lower-case hex string spells.
+function from_hex(text: string) -> Array<u8> {
+    const s: Slice<u8> = Str::new(text).as_bytes();
     mut out: Array<u8> = Array::<u8>::new();
     mut i: i64 = 0;
-    while (i + 2 <= s.length()) {
-        const hi: u8 = hex_digit(byte_at_str(s, i));
-        const lo: u8 = hex_digit(byte_at_str(s, i + 1));
+    while (i + 1 < s.length()) {
+        mut hi: u8 = 0;
+        mut lo: u8 = 0;
+        match (s.get(i))     { Option::Some(c) => { hi = hex_digit(c); } Option::None => { } }
+        match (s.get(i + 1)) { Option::Some(c) => { lo = hex_digit(c); } Option::None => { } }
         out.push((hi << 4) | lo);
         i = i + 2;
     }
     return out;
 }
 
-function hex_digit(c: u8) -> u8 {
-    if (c >= 0x30 && c <= 0x39) { return c - 0x30; }
-    if (c >= 0x61 && c <= 0x66) { return c - 0x61 + 10; }
-    if (c >= 0x41 && c <= 0x46) { return c - 0x41 + 10; }
-    return 0;
+/// Append one frame: the 9-octet frame header, then `payload`.
+function push_frame(out: mut &Array<u8>, kind: u8, flags: u8, stream_id: u32, payload: Slice<u8>) -> void {
+    const n: i64 = payload.length();
+    out.push((n >> 16) as u8);
+    out.push((n >> 8) as u8);
+    out.push(n as u8);
+    out.push(kind);
+    out.push(flags);
+    out.push((stream_id >> 24) as u8);
+    out.push((stream_id >> 16) as u8);
+    out.push((stream_id >> 8) as u8);
+    out.push(stream_id as u8);
+    out.append(payload);
 }
 
-function byte_at_str(s: Str, i: i64) -> u8 {
-    match (s.byte_at(i)) {
-        Option::Some(b) => { return b; }
-        Option::None    => { return 0; }
+/// Append a complete request or response on `stream_id` whose header block
+/// is `block`.
+function push_block(out: mut &Array<u8>, stream_id: u32, block: &Array<u8>) -> void {
+    push_frame(out, FRAME_HEADERS, COMPLETE, stream_id, block.as_slice());
+}
+
+/// The same, with the block written in hex.
+function push_headers(out: mut &Array<u8>, stream_id: u32, block: string) -> void {
+    mut bytes: Array<u8> = from_hex(block);
+    push_block(out, stream_id, &bytes);
+}
+
+/// An empty SETTINGS frame: what either side owes the other first.
+function push_settings(out: mut &Array<u8>) -> void {
+    mut none: Array<u8> = Array::<u8>::new();
+    push_frame(out, FRAME_SETTINGS, 0, 0, none.as_slice());
+}
+
+/// What a client sends before its first request.
+function client_opening() -> Array<u8> {
+    mut out: Array<u8> = Array::<u8>::new();
+    out.append(Str::new(PREFACE).as_bytes());
+    push_settings(&out);
+    return out;
+}
+
+function text_is(value: Str, expected: string) -> boolean {
+    return value.equals(&Str::new(expected));
+}
+
+/// Whether the header `name` holds exactly `expected`.
+function header_is(found: Option<String>, expected: string) -> boolean {
+    match (found) {
+        Option::Some(value) => { return text_is(value.as_str(), expected); }
+        Option::None        => { return false; }
     }
 }
 
-function bytes_eq(a: Slice<u8>, b: Slice<u8>) -> boolean {
+function bytes_equal(a: Slice<u8>, b: Slice<u8>) -> boolean {
     if (a.length() != b.length()) { return false; }
     mut i: i64 = 0;
     while (i < a.length()) {
-        match (a.get(i)) {
-            Option::Some(av) => {
-                match (b.get(i)) {
-                    Option::Some(bv) => { if (av != bv) { return false; } }
-                    Option::None     => { return false; }
-                }
-            }
-            Option::None => { return false; }
-        }
-        i++;
+        if (a.get(i) != b.get(i)) { return false; }
+        i = i + 1;
     }
     return true;
 }
 
-/// Check the field at `idx` in a decoded block equals name/value.
-function field_is(block: &Array<HeaderField>, idx: i64, name: Str, value: Str) -> boolean {
-    match (block.get_ref(idx)) {
-        Option::Some(f) => {
-            return (*f).name.as_str().equals(&name) && (*f).value.as_str().equals(&value);
-        }
-        Option::None => { return false; }
+// ---- RFC 7541 Appendix C ----------------------------------------------------
+
+/// C.4: three requests with Huffman-coded strings, on one connection.
+const C41: string = "828684418cf1e3c2e5f23a6ba0ab90f4ff";
+const C42: string = "828684be5886a8eb10649cbf";
+const C43: string = "828785bf408825a849e95ba97d7f8925a849e95bb8e8b4bf";
+/// C.6.1 and C.6.2: the first two Huffman-coded responses.  C.6.2's
+/// indexes name the same entries in a 4096-octet table as in C.6's
+/// 256-octet one, since nothing has been evicted yet in either.
+const C61: string = "488264025885aec3771a4b6196d07abe941054d444a8200595040b8166e082a62d1bff6e919d29ad171863c78f0b97c8e9ae82ae43d3";
+const C62: string = "4883640effc1c0bf";
+
+/// A server connection over `wire`, already through its handshake.
+async function server_over(wire: Array<u8>) -> Option<Http2Connection<MemTransport>> {
+    mut connection: Http2Connection<MemTransport> =
+        Http2Connection::<MemTransport>::new_server(BufStream::<MemTransport>::of(MemTransport::of(wire)));
+    match (await connection.handshake_server()) {
+        Result::Ok(_)  => { return Option::Some(connection); }
+        Result::Err(_) => { return Option::None; }
     }
 }
 
-// ---- Huffman --------------------------------------------------------------
+/// The C.4 requests decoded in order; the count of requests read, or a
+/// negative number naming the first field that came out wrong.
+async function decode_c4_requests() -> i64 {
+    mut wire: Array<u8> = client_opening();
+    push_headers(&wire, 1, C41);
+    push_headers(&wire, 3, C42);
+    push_headers(&wire, 5, C43);
+    mut connection: Http2Connection<MemTransport> = match (await server_over(wire)) {
+        Option::Some(c) => { c }
+        Option::None    => { return -1; }
+    };
 
-![test]
-function huffman_vector_www_example_com() -> Result<(), TestError> {
-    const input: Str = Str::new("www.example.com");
-    mut coded: Array<u8> = huffman::encode(input.as_bytes());
-    mut expected: Array<u8> = from_hex(Str::new("f1e3c2e5f23a6ba0ab90f4ff"));
-    const ok: boolean = bytes_eq(coded.as_slice(), expected.as_slice());
-    return expect(ok, Str::new("huffman('www.example.com') != RFC C.4.1 vector"));
-}
+    mut first: RequestOnStream = match (await connection.read_request()) {
+        Result::Ok(Option::Some(r)) => { r }
+        _                           => { return -2; }
+    };
+    if (!text_is(first.req.method.as_str(), "GET"))                         { return -3; }
+    if (!text_is(first.req.path.as_str(), "/"))                             { return -4; }
+    if (!header_is(first.req.headers.get(Str::new("host")), "www.example.com")) { return -5; }
 
-![test]
-function huffman_round_trip() -> Result<(), TestError> {
-    const samples: Str = Str::new("Mon, 21 Oct 2013 20:13:21 GMT");
-    mut coded: Array<u8> = huffman::encode(samples.as_bytes());
-    match (huffman::decode(coded.as_slice())) {
-        Option::Some(mut back) => {
-            const ok: boolean = bytes_eq(back.as_slice(), samples.as_bytes());
-            return expect(ok, Str::new("huffman round-trip mismatch"));
-        }
-        Option::None => {
-            return bail(Str::new("huffman decode returned None"));
-        }
+    mut second: RequestOnStream = match (await connection.read_request()) {
+        Result::Ok(Option::Some(r)) => { r }
+        _                           => { return -6; }
+    };
+    if (!header_is(second.req.headers.get(Str::new("host")), "www.example.com")) { return -7; }
+    if (!header_is(second.req.headers.get(Str::new("cache-control")), "no-cache")) { return -8; }
+
+    mut third: RequestOnStream = match (await connection.read_request()) {
+        Result::Ok(Option::Some(r)) => { r }
+        _                           => { return -9; }
+    };
+    if (!text_is(third.req.path.as_str(), "/index.html"))                   { return -10; }
+    if (!header_is(third.req.headers.get(Str::new("host")), "www.example.com")) { return -11; }
+    if (!header_is(third.req.headers.get(Str::new("custom-key")), "custom-value")) { return -12; }
+
+    match (await connection.read_request()) {
+        Result::Ok(Option::None) => { return 3; }
+        _                        => { return -13; }
     }
 }
 
 ![test]
-function huffman_decode_vector() -> Result<(), TestError> {
-    mut coded: Array<u8> = from_hex(Str::new("a8eb10649cbf"));   // "no-cache" (RFC C.4.2)
-    match (huffman::decode(coded.as_slice())) {
-        Option::Some(mut back) => {
-            const ok: boolean = bytes_eq(back.as_slice(), Str::new("no-cache").as_bytes());
-            return expect(ok, Str::new("huffman decode of C.4.2 vector != 'no-cache'"));
+function hpack_server_decodes_the_c4_requests() -> Result<(), TestError> {
+    return expect_eq(future::block_on(decode_c4_requests()), 3 as i64);
+}
+
+/// Each HEADERS block the client wrote, in order, after its preface.
+function written_blocks(out: &Array<u8>) -> Array<Array<u8>> {
+    mut blocks: Array<Array<u8>> = Array::<Array<u8>>::new();
+    const all: Slice<u8> = out.as_slice();
+    mut at: i64 = Str::new(PREFACE).length();
+    while (at + FRAME_HEADER_LEN <= all.length()) {
+        mut n: i64 = 0;
+        mut kind: u8 = 0;
+        match (all.get(at))     { Option::Some(b) => { n = (b as i64) << 16; } Option::None => { } }
+        match (all.get(at + 1)) { Option::Some(b) => { n = n | ((b as i64) << 8); } Option::None => { } }
+        match (all.get(at + 2)) { Option::Some(b) => { n = n | (b as i64); } Option::None => { } }
+        match (all.get(at + 3)) { Option::Some(b) => { kind = b; } Option::None => { } }
+        const start: i64 = at + FRAME_HEADER_LEN;
+        if (start + n > all.length()) { break; }
+        if (kind == FRAME_HEADERS) {
+            mut block: Array<u8> = Array::<u8>::new();
+            block.append(all.subslice(start, start + n));
+            blocks.push(block);
         }
-        Option::None => {
-            return bail(Str::new("huffman decode returned None"));
+        at = start + n;
+    }
+    return blocks;
+}
+
+/// The C.4 requests sent by a client connection that reads the C.6
+/// responses; the count of blocks written exactly as C.4 gives them, or a
+/// negative number naming the first thing that came out wrong.
+async function encode_c4_requests() -> i64 {
+    mut wire: Array<u8> = Array::<u8>::new();
+    push_settings(&wire);
+    push_headers(&wire, 1, C61);
+    push_headers(&wire, 3, C62);
+    push_headers(&wire, 5, "88");
+    mut connection: Http2Connection<MemTransport> =
+        Http2Connection::<MemTransport>::new_client(BufStream::<MemTransport>::of(MemTransport::of(wire)));
+    match (await connection.handshake_client()) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -1; }
+    }
+
+    mut first: Response = match (await connection.request(
+            Request::new(Method::Get, Str::new("/")), Str::new("http"), Str::new("www.example.com"))) {
+        Result::Ok(r)  => { r }
+        Result::Err(_) => { return -2; }
+    };
+    if (first.status.as_u16() != 302)                                          { return -3; }
+    if (!header_is(first.headers.get(Str::new("cache-control")), "private"))     { return -4; }
+    if (!header_is(first.headers.get(Str::new("date")), "Mon, 21 Oct 2013 20:13:21 GMT")) { return -5; }
+    if (!header_is(first.headers.get(Str::new("location")), "https://www.example.com")) { return -6; }
+
+    mut second: Response = match (await connection.request(
+            Request::new(Method::Get, Str::new("/")).with_header(Str::new("cache-control"), Str::new("no-cache")),
+            Str::new("http"), Str::new("www.example.com"))) {
+        Result::Ok(r)  => { r }
+        Result::Err(_) => { return -7; }
+    };
+    if (second.status.as_u16() != 307)                                         { return -8; }
+    if (!header_is(second.headers.get(Str::new("location")), "https://www.example.com")) { return -9; }
+    if (!header_is(second.headers.get(Str::new("date")), "Mon, 21 Oct 2013 20:13:21 GMT")) { return -10; }
+
+    mut third: Response = match (await connection.request(
+            Request::new(Method::Get, Str::new("/index.html")).with_header(Str::new("custom-key"), Str::new("custom-value")),
+            Str::new("https"), Str::new("www.example.com"))) {
+        Result::Ok(r)  => { r }
+        Result::Err(_) => { return -11; }
+    };
+    if (third.status.as_u16() != 200) { return -12; }
+
+    mut blocks: Array<Array<u8>> = written_blocks(&connection.connection().transport().outbox);
+    if (blocks.length() != 3) { return -13; }
+    mut matched: i64 = 0;
+    mut expected: [string; 3] = [C41, C42, C43];
+    mut i: i64 = 0;
+    while (i < 3) {
+        mut want: Array<u8> = from_hex(expected[i]);
+        match (blocks.get_ref(i)) {
+            Option::Some(got) => { if (bytes_equal(got.as_slice(), want.as_slice())) { matched = matched + 1; } }
+            Option::None      => { }
         }
+        i = i + 1;
+    }
+    return matched;
+}
+
+![test]
+function hpack_client_writes_the_c4_requests_byte_for_byte() -> Result<(), TestError> {
+    return expect_eq(future::block_on(encode_c4_requests()), 3 as i64);
+}
+
+// ---- what the vectors leave out ----------------------------------------------
+
+/// Two requests: the first carries `password: secret` as `first_field`
+/// (hex), the second names dynamic index 62.  1 when the second decodes to
+/// the stored field, 0 when it is refused, negative when the first came out
+/// wrong.
+async function second_names_index_62(first_field: string) -> i64 {
+    mut wire: Array<u8> = client_opening();
+    mut block: Array<u8> = from_hex("828684");
+    mut field: Array<u8> = from_hex(first_field);
+    block.append(field.as_slice());
+    push_block(&wire, 1, &block);
+    push_headers(&wire, 3, "828684be");
+    mut connection: Http2Connection<MemTransport> = match (await server_over(wire)) {
+        Option::Some(c) => { c }
+        Option::None    => { return -1; }
+    };
+    mut first: RequestOnStream = match (await connection.read_request()) {
+        Result::Ok(Option::Some(r)) => { r }
+        _                           => { return -2; }
+    };
+    if (!header_is(first.req.headers.get(Str::new("password")), "secret")) { return -3; }
+    match (await connection.read_request()) {
+        Result::Ok(Option::Some(r)) => {
+            if (header_is(r.req.headers.get(Str::new("password")), "secret")) { return 1; }
+            return -4;
+        }
+        Result::Ok(Option::None) => { return -5; }
+        Result::Err(_)           => { return 0; }
     }
 }
 
-// ---- integer codec --------------------------------------------------------
-
+/// A field sent never-indexed (C.2.3's encoding) is not stored, so the next
+/// block's index 62 names nothing and the block is refused.
 ![test]
-function integer_codec_rfc_examples() -> Result<(), TestError> {
-    // RFC 7541 section 5.1: 10 in a 5-bit prefix -> 0x0a.
-    mut a: Array<u8> = Array::<u8>::new();
-    hpack::encode_integer(&a, 5, 0x00, 10);
-    mut exp_a: Array<u8> = from_hex(Str::new("0a"));
-    const ok_a: boolean = bytes_eq(a.as_slice(), exp_a.as_slice());
-    expect(ok_a, Str::new("encode_integer(10, 5-bit) != 0x0a"))?;
+function hpack_never_indexed_field_is_not_stored() -> Result<(), TestError> {
+    return expect_eq(future::block_on(second_names_index_62("100870617373776f726406736563726574")), 0 as i64);
+}
 
-    // 1337 in a 5-bit prefix -> 0x1f 0x9a 0x0a.
-    mut b: Array<u8> = Array::<u8>::new();
-    hpack::encode_integer(&b, 5, 0x00, 1337);
-    mut exp_b: Array<u8> = from_hex(Str::new("1f9a0a"));
-    const ok_b: boolean = bytes_eq(b.as_slice(), exp_b.as_slice());
-    expect(ok_b, Str::new("encode_integer(1337, 5-bit) != 1f9a0a"))?;
+/// The control: the same field with incremental indexing is stored, and index
+/// 62 then names it.
+![test]
+function hpack_incrementally_indexed_field_is_stored() -> Result<(), TestError> {
+    return expect_eq(future::block_on(second_names_index_62("400870617373776f726406736563726574")), 1 as i64);
+}
 
-    // Decode them back.
-    mut wire: Array<u8> = from_hex(Str::new("1f9a0a"));
-    mut cur: Cursor = Cursor { pos: 0 };
-    match (hpack::decode_integer(wire.as_slice(), &cur, 5)) {
-        Option::Some(v) => {
-            return expect(v == 1337, Str::new("decode_integer(1f9a0a, 5-bit) != 1337"));
-        }
-        Option::None => {
-            return bail(Str::new("decode_integer returned None"));
-        }
+/// A block opening with the table size update `update` (hex) whose `:path`
+/// is a literal 1337 octets long (7-bit prefix: 0x7f then two continuation
+/// octets).  The path's length, or -1 when the block was refused.
+async function after_size_update(update: string) -> i64 {
+    mut wire: Array<u8> = client_opening();
+    mut block: Array<u8> = from_hex(update);
+    mut rest: Array<u8> = from_hex("8286047fba09");
+    block.append(rest.as_slice());
+    block.push(0x2f);
+    mut i: i64 = 1;
+    while (i < 1337) {
+        block.push(0x61);
+        i = i + 1;
+    }
+    push_block(&wire, 1, &block);
+    mut connection: Http2Connection<MemTransport> = match (await server_over(wire)) {
+        Option::Some(c) => { c }
+        Option::None    => { return -2; }
+    };
+    match (await connection.read_request()) {
+        Result::Ok(Option::Some(r)) => { return r.req.path.length(); }
+        _                           => { return -1; }
     }
 }
 
-// ---- HPACK decode of the RFC C.4 request examples -------------------------
-
+/// A size update to 4096 is 0x3f then two continuation octets in a 5-bit
+/// prefix, as the path's length is in a 7-bit one.
 ![test]
-function hpack_decode_c41() -> Result<(), TestError> {
-    // RFC 7541 C.4.1: Huffman-coded first request.
-    mut wire: Array<u8> = from_hex(Str::new("828684418cf1e3c2e5f23a6ba0ab90f4ff"));
-    mut dec: HpackDecoder = HpackDecoder::new(4096);
-    match (dec.decode(wire.as_slice())) {
-        Option::Some(mut block) => {
-            mut ok: boolean = block.length() == 4;
-            ok = ok && field_is(&block, 0, Str::new(":method"), Str::new("GET"));
-            ok = ok && field_is(&block, 1, Str::new(":scheme"), Str::new("http"));
-            ok = ok && field_is(&block, 2, Str::new(":path"), Str::new("/"));
-            ok = ok && field_is(&block, 3, Str::new(":authority"), Str::new("www.example.com"));
-            return expect(ok, Str::new("C.4.1 decode mismatch"));
-        }
-        Option::None => {
-            return bail(Str::new("C.4.1 decode returned None"));
-        }
-    }
+function hpack_integers_continue_past_their_prefix() -> Result<(), TestError> {
+    return expect_eq(future::block_on(after_size_update("3fe11f")), 1337 as i64);
 }
 
-// ---- encoder + decoder round-trip, including the dynamic table ------------
-
+/// A size update one octet past the 4096 the connection advertises refuses
+/// the block: the peer may not grow the table beyond what was offered.
 ![test]
-function hpack_round_trip_dynamic_table() -> Result<(), TestError> {
-    mut enc: HpackEncoder = HpackEncoder::new(4096);
-    mut dec: HpackDecoder = HpackDecoder::new(4096);
-
-    // First request: a custom header populates both dynamic tables.
-    mut b1: Array<u8> = Array::<u8>::new();
-    enc.encode_field(&b1, Str::new(":method"), Str::new("GET"), false);
-    enc.encode_field(&b1, Str::new(":path"), Str::new("/resource"), false);
-    enc.encode_field(&b1, Str::new("x-trace"), Str::new("abc123"), false);
-    mut r1_ok: boolean = false;
-    match (dec.decode(b1.as_slice())) {
-        Option::Some(mut block) => {
-            r1_ok = block.length() == 3
-                 && field_is(&block, 0, Str::new(":method"), Str::new("GET"))
-                 && field_is(&block, 1, Str::new(":path"), Str::new("/resource"))
-                 && field_is(&block, 2, Str::new("x-trace"), Str::new("abc123"));
-        }
-        Option::None => { }
-    }
-    expect(r1_ok, Str::new("round-trip request 1 mismatch"))?;
-
-    // Second request: the custom header should now resolve from the
-    // dynamic table on both sides (single-index indexed field).
-    mut b2: Array<u8> = Array::<u8>::new();
-    enc.encode_field(&b2, Str::new("x-trace"), Str::new("abc123"), false);
-    mut r2_ok: boolean = false;
-    match (dec.decode(b2.as_slice())) {
-        Option::Some(mut block) => {
-            r2_ok = block.length() == 1
-                 && field_is(&block, 0, Str::new("x-trace"), Str::new("abc123"));
-        }
-        Option::None => { }
-    }
-    // It must have used the indexed representation (1 byte: 0x80 | index).
-    const compact: boolean = b2.length() == 1;
-    expect(r2_ok, Str::new("round-trip request 2 mismatch"))?;
-    return expect(compact, Str::new("second send did not use the dynamic-table index"));
-}
-
-// ---- sensitive (never-indexed) header -------------------------------------
-
-![test]
-function hpack_sensitive_not_indexed() -> Result<(), TestError> {
-    mut enc: HpackEncoder = HpackEncoder::new(4096);
-    mut dec: HpackDecoder = HpackDecoder::new(4096);
-
-    mut b: Array<u8> = Array::<u8>::new();
-    enc.encode_field(&b, Str::new("authorization"), Str::new("secret-token"), true);
-    mut ok: boolean = false;
-    match (dec.decode(b.as_slice())) {
-        Option::Some(mut block) => {
-            ok = block.length() == 1
-              && field_is(&block, 0, Str::new("authorization"), Str::new("secret-token"));
-        }
-        Option::None => { }
-    }
-
-    // A second send must NOT collapse to an index, because never-indexed
-    // fields are not stored in the dynamic table.
-    mut b2: Array<u8> = Array::<u8>::new();
-    enc.encode_field(&b2, Str::new("authorization"), Str::new("secret-token"), true);
-    const not_indexed: boolean = b2.length() > 1;
-    expect(ok, Str::new("sensitive header round-trip mismatch"))?;
-    return expect(not_indexed, Str::new("sensitive header was stored in the dynamic table"));
+function hpack_size_update_past_the_advertised_limit_is_refused() -> Result<(), TestError> {
+    return expect_eq(future::block_on(after_size_update("3fe21f")), -1 as i64);
 }

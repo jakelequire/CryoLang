@@ -1,0 +1,204 @@
+/// Every check allocates through `GlobalAlloc`, which this project's
+/// `native_alloc` switch routes to the mmap-backed heap, and asserts what
+/// that heap guarantees.  A failing check prints its number and the program
+/// exits with it.
+namespace NativeHeapThroughGlobalAlloc::Main;
+
+import std::core::result::{ Result };
+import std::core::ptr::{ NonNull };
+import std::alloc::layout::{ Layout };
+import std::alloc::allocator::{ Allocator, AllocErrorKind, GlobalAlloc };
+import std::ffi::libc;
+
+/// Fill `p[0..n)` with a position-dependent pattern seeded by `seed`.
+function fill(p: u8*, n: u64, seed: u64) -> void {
+    for (mut i: u64 = 0; i < n; i++) {
+        p[i] = ((i * 131 + seed) & 255) as u8;
+    }
+}
+
+/// Whether `p[0..n)` still holds `fill(p, n, seed)`'s pattern.
+function holds(p: u8*, n: u64, seed: u64) -> boolean {
+    for (mut i: u64 = 0; i < n; i++) {
+        if (p[i] != (((i * 131 + seed) & 255) as u8)) { return false; }
+    }
+    return true;
+}
+
+/// A block of `size` bytes aligned to `align`, or null when refused.
+function take(size: u64, align: u64) -> u8* {
+    mut heap: GlobalAlloc = GlobalAlloc::new();
+    match (heap.allocate(Layout::new(size, align))) {
+        Result::Ok(p)  => { return p.as_ptr(); }
+        Result::Err(_) => { return null; }
+    }
+}
+
+function give(p: u8*, size: u64, align: u64) -> void {
+    mut heap: GlobalAlloc = GlobalAlloc::new();
+    heap.deallocate(NonNull::new(p), Layout::new(size, align));
+}
+
+/// `p`, a block of `old_size` bytes, grown or shrunk to `new_size` bytes;
+/// null when refused.
+function resize(p: u8*, old_size: u64, new_size: u64, align: u64) -> u8* {
+    mut heap: GlobalAlloc = GlobalAlloc::new();
+    match (heap.reallocate(NonNull::new(p), Layout::new(old_size, align), Layout::new(new_size, align))) {
+        Result::Ok(q)  => { return q.as_ptr(); }
+        Result::Err(_) => { return null; }
+    }
+}
+
+/// Every size-class boundary region round-trips a pattern in a 16-aligned
+/// block.
+function small_classes_round_trip() -> boolean {
+    const sizes: [u64; 8] = [1, 16, 17, 128, 129, 1024, 4096, 32768];
+    for (mut i: i64 = 0; i < 8; i++) {
+        const n: u64 = sizes[i];
+        const p: u8* = take(n, 16);
+        if (p == null || ((p as u64) & 15) != 0) { return false; }
+        fill(p, n, i as u64);
+        if (!holds(p, n, i as u64)) { return false; }
+        give(p, n, 16);
+    }
+    return true;
+}
+
+/// A freed small block is the next one its class hands out, while a second
+/// live block keeps the segment mapped.
+function free_list_reuses_the_block() -> boolean {
+    const keep: u8* = take(64, 16);
+    const a: u8* = take(64, 16);
+    if (keep == null || a == null) { return false; }
+    give(a, 64, 16);
+    const b: u8* = take(64, 16);
+    const same: boolean = b == a;
+    give(b, 64, 16);
+    give(keep, 64, 16);
+    return same;
+}
+
+/// A block above the small classes gets its own mapping and keeps its
+/// contents.
+function large_path_round_trip() -> boolean {
+    const n: u64 = 262144;
+    const p: u8* = take(n, 16);
+    if (p == null) { return false; }
+    fill(p, n, 7);
+    const kept: boolean = holds(p, n, 7);
+    give(p, n, 16);
+    return kept;
+}
+
+/// A large block is mapped on its own, behind its one-page header at the
+/// start of a 4 MiB-aligned mapping: it begins exactly one page past the
+/// boundary.  This is the check another allocator fails, which shows the
+/// others ran on the native heap.
+function large_block_sits_one_page_into_its_mapping() -> boolean {
+    const n: u64 = 262144;
+    const p: u8* = take(n, 16);
+    if (p == null) { return false; }
+    const offset: u64 = (p as u64) & (4194304 - 1);
+    give(p, n, 16);
+    return offset == 4096;
+}
+
+/// An over-aligned request is honoured.
+function over_aligned_requests() -> boolean {
+    const aligns: [u64; 4] = [32, 64, 4096, 65536];
+    for (mut i: i64 = 0; i < 4; i++) {
+        const al: u64 = aligns[i];
+        const p: u8* = take(100, al);
+        if (p == null || ((p as u64) & (al - 1)) != 0) { return false; }
+        give(p, 100, al);
+    }
+    return true;
+}
+
+/// Growing within one class keeps the block; growing across classes and
+/// into the large path moves it with its prefix; shrinking keeps the
+/// prefix.
+function reallocation_keeps_contents() -> boolean {
+    const p: u8* = take(100, 16);
+    if (p == null) { return false; }
+    fill(p, 100, 3);
+    const q: u8* = resize(p, 100, 112, 16);
+    if (q != p) { return false; }
+    const r: u8* = resize(q, 112, 5000, 16);
+    if (r == null || !holds(r, 100, 3)) { return false; }
+    const s: u8* = resize(r, 5000, 100000, 16);
+    if (s == null || !holds(s, 100, 3)) { return false; }
+    const t: u8* = resize(s, 100000, 64, 16);
+    if (t == null || !holds(t, 64, 3)) { return false; }
+    give(t, 64, 16);
+    return true;
+}
+
+/// Many live blocks of mixed classes keep their patterns through a churn of
+/// frees and refills.
+function interleaved_blocks_stay_intact() -> boolean {
+    mut ptrs: [u64; 256];
+    mut sizes: [u64; 256];
+    for (mut i: i64 = 0; i < 256; i++) {
+        mut n: u64 = ((i as u64) * 37 % 8000) + 1;
+        if (i % 61 == 0) { n = 50000 + (i as u64) * 100; }
+        const p: u8* = take(n, 16);
+        if (p == null) { return false; }
+        fill(p, n, i as u64);
+        ptrs[i] = p as u64;
+        sizes[i] = n;
+    }
+    for (mut i: i64 = 0; i < 256; i += 3) {
+        give(ptrs[i] as u8*, sizes[i], 16);
+        ptrs[i] = 0;
+    }
+    for (mut i: i64 = 0; i < 256; i++) {
+        if (ptrs[i] != 0 && !holds(ptrs[i] as u8*, sizes[i], i as u64)) { return false; }
+    }
+    for (mut i: i64 = 0; i < 256; i += 3) {
+        const p: u8* = take(sizes[i], 16);
+        if (p == null) { return false; }
+        fill(p, sizes[i], 1000 + i as u64);
+        ptrs[i] = p as u64;
+    }
+    for (mut i: i64 = 0; i < 256; i++) {
+        const seed: u64 = if (i % 3 == 0) { 1000 + i as u64 } else { i as u64 };
+        if (!holds(ptrs[i] as u8*, sizes[i], seed)) { return false; }
+        give(ptrs[i] as u8*, sizes[i], 16);
+    }
+    return true;
+}
+
+/// A zero-sized request is refused as one, before it reaches the heap.
+function zero_size_is_refused() -> boolean {
+    mut heap: GlobalAlloc = GlobalAlloc::new();
+    match (heap.allocate(Layout::new(0, 16))) {
+        Result::Ok(_)  => { return false; }
+        Result::Err(e) => { return e.kind == AllocErrorKind::ZeroSized; }
+    }
+}
+
+function main() -> int {
+    mut passed: i32 = 0;
+    mut first_failure: i32 = 0;
+    const results: [boolean; 8] = [
+        small_classes_round_trip(),
+        free_list_reuses_the_block(),
+        large_path_round_trip(),
+        large_block_sits_one_page_into_its_mapping(),
+        over_aligned_requests(),
+        reallocation_keeps_contents(),
+        interleaved_blocks_stay_intact(),
+        zero_size_is_refused(),
+    ];
+    for (mut i: i32 = 0; i < 8; i++) {
+        if (results[i]) {
+            passed += 1;
+        } else {
+            libc::printf("FAIL check %d\n", i + 1);
+            if (first_failure == 0) { first_failure = i + 1; }
+        }
+    }
+    libc::printf("native heap: %d of 8 checks passed\n", passed);
+    return first_failure;
+}
