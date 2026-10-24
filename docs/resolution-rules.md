@@ -176,6 +176,14 @@ yet is recorded with the change that builds it, not here.
      and those accessors are internals of the bucket layer rather than
      positions a caller computes.  (Jake)
 
+580. **A local of an `async function` is released where its scope ends,
+     exactly as in a function that never suspends.**  A local with a
+     destructor lives across every `await` between its declaration and
+     the end of its scope whether or not it is mentioned again, so it is
+     carried in the future; the end of the block, a `break`, `continue`
+     or `return` leaving it releases it, latest declared first.
+     Reassigning a carried local releases the value it displaces.  (Jake)
+
 ### 2026-10-22
 
 553. **A test project can set the compiler's environment and arguments,

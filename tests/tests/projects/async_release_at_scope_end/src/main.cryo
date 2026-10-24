@@ -1,0 +1,249 @@
+// A local of an `async function` is released where its scope ends, exactly
+// as in a function that never suspends: at the end of its block, or at a
+// `break`, `continue` or `return` that leaves it, in reverse declaration
+// order.  An `await` in between changes nothing, whether or not the local is
+// mentioned after it.
+//
+// Every case logs one digit per event into `rs_log`: a destructor appends
+// its value's tag, the body appends a marker (8 or 9) where it stands.  Each
+// expected number is what the same body logs with the `await`s deleted.
+//
+// `main` prints how many checks passed and exits 0 only when all did.
+namespace AsyncReleaseAtScopeEnd::Main;
+
+import std::fmt;
+import std::core::drop::{ Drop };
+import std::future;
+import std::future::ready::{ PendingThenReady };
+
+mut rs_log: i64 = 0;
+
+function rs_mark(digit: i64) -> void {
+    rs_log = rs_log * 10 + digit;
+}
+
+type struct Ticker {
+    tag: i64;
+}
+
+implement trait Drop for struct Ticker {
+    drop(mut &this) -> void {
+        rs_mark(this.tag);
+    }
+}
+
+function ticker(tag: i64) -> Ticker {
+    return Ticker { tag: tag };
+}
+
+function consume(t: Ticker) -> i64 {
+    return t.tag;
+}
+
+async function pause() -> i64 {
+    return await PendingThenReady::<i64>::new(1, 0);
+}
+
+async function unused_after_await() -> i64 {
+    const _t: Ticker = ticker(1);
+    const _x: i64 = await pause();
+    rs_mark(9);
+    return 1;
+}
+
+async function used_after_await() -> i64 {
+    const t: Ticker = ticker(1);
+    const _x: i64 = await pause();
+    rs_mark(9);
+    return t.tag;
+}
+
+async function declared_then_assigned() -> i64 {
+    mut t: Ticker;
+    t = ticker(1);
+    const _x: i64 = await pause();
+    rs_mark(9);
+    return 1;
+}
+
+async function one_each_side() -> i64 {
+    const _a: Ticker = ticker(1);
+    const _x: i64 = await pause();
+    const _b: Ticker = ticker(2);
+    rs_mark(9);
+    return 1;
+}
+
+async function both_before() -> i64 {
+    const _a: Ticker = ticker(1);
+    const _b: Ticker = ticker(2);
+    const _x: i64 = await pause();
+    rs_mark(9);
+    return 1;
+}
+
+async function falls_off_end() -> void {
+    const _a: Ticker = ticker(1);
+    const _x: i64 = await pause();
+    const _b: Ticker = ticker(2);
+    rs_mark(9);
+}
+
+async function inside_branch(c: boolean) -> i64 {
+    if (c) {
+        const _t: Ticker = ticker(3);
+        const _x: i64 = await pause();
+        rs_mark(8);
+    }
+    rs_mark(9);
+    return 1;
+}
+
+async function inside_bare_block() -> i64 {
+    const _a: Ticker = ticker(1);
+    {
+        const _t: Ticker = ticker(5);
+        const _x: i64 = await pause();
+        rs_mark(8);
+    }
+    rs_mark(9);
+    return 1;
+}
+
+async function inside_loop_body() -> i64 {
+    mut i: i64 = 0;
+    while (i < 2) {
+        const _t: Ticker = ticker(i + 1);
+        const _x: i64 = await pause();
+        rs_mark(8);
+        i = i + 1;
+    }
+    rs_mark(9);
+    return 1;
+}
+
+async function left_by_break() -> i64 {
+    loop {
+        const _t: Ticker = ticker(4);
+        const _x: i64 = await pause();
+        rs_mark(8);
+        break;
+    }
+    rs_mark(9);
+    return 1;
+}
+
+async function left_by_continue() -> i64 {
+    mut i: i64 = 0;
+    while (i < 2) {
+        i = i + 1;
+        const _t: Ticker = ticker(i);
+        const _x: i64 = await pause();
+        if (i < 2) { continue; }
+        rs_mark(8);
+    }
+    rs_mark(9);
+    return 1;
+}
+
+async function left_by_return(c: boolean) -> i64 {
+    const _a: Ticker = ticker(1);
+    const _x: i64 = await pause();
+    if (c) {
+        rs_mark(8);
+        return 2;
+    }
+    const _b: Ticker = ticker(2);
+    rs_mark(9);
+    return 1;
+}
+
+async function reassigned_after_await() -> i64 {
+    mut t: Ticker = ticker(1);
+    const _x: i64 = await pause();
+    t = ticker(2);
+    rs_mark(9);
+    return 1;
+}
+
+async function reassigned_in_branch(c: boolean) -> i64 {
+    mut t: Ticker = ticker(1);
+    const _x: i64 = await pause();
+    if (c) { t = ticker(2); }
+    rs_mark(9);
+    return 1;
+}
+
+async function moved_before_await() -> i64 {
+    const t: Ticker = ticker(1);
+    const tag: i64 = consume(t);
+    const _x: i64 = await pause();
+    rs_mark(9);
+    return tag;
+}
+
+/// `rs_log` is reset before each future is built, so it holds that case's
+/// events only.
+function rs_check(name: string, got: i64, want: i64, want_log: i64) -> i32 {
+    if (got == want && rs_log == want_log) { return 1; }
+    fmt::println(f"FAIL {name}: got {got} logging {rs_log}, want {want} logging {want_log}");
+    return 0;
+}
+
+function main() -> i32 {
+    mut passed: i32 = 0;
+    rs_log = 0;
+    passed += rs_check("unused_local_lives_across_the_await",
+        future::block_on(unused_after_await()), 1, 91);
+    rs_log = 0;
+    passed += rs_check("used_local_lives_across_the_await",
+        future::block_on(used_after_await()), 1, 91);
+    rs_log = 0;
+    passed += rs_check("assigned_local_lives_across_the_await",
+        future::block_on(declared_then_assigned()), 1, 91);
+    rs_log = 0;
+    passed += rs_check("locals_either_side_release_in_reverse",
+        future::block_on(one_each_side()), 1, 921);
+    rs_log = 0;
+    passed += rs_check("locals_before_the_await_release_in_reverse",
+        future::block_on(both_before()), 1, 921);
+    rs_log = 0;
+    future::block_on(falls_off_end());
+    passed += rs_check("void_body_releases_where_it_falls_off", 1, 1, 921);
+    rs_log = 0;
+    passed += rs_check("branch_local_released_at_branch_end",
+        future::block_on(inside_branch(true)), 1, 839);
+    rs_log = 0;
+    passed += rs_check("block_local_released_at_block_end",
+        future::block_on(inside_bare_block()), 1, 8591);
+    rs_log = 0;
+    passed += rs_check("loop_local_released_every_iteration",
+        future::block_on(inside_loop_body()), 1, 81829);
+    rs_log = 0;
+    passed += rs_check("break_releases_the_loop_body_locals",
+        future::block_on(left_by_break()), 1, 849);
+    rs_log = 0;
+    passed += rs_check("continue_releases_the_loop_body_locals",
+        future::block_on(left_by_continue()), 1, 1829);
+    rs_log = 0;
+    passed += rs_check("early_return_releases_what_is_live",
+        future::block_on(left_by_return(true)), 2, 81);
+    rs_log = 0;
+    passed += rs_check("late_return_releases_in_reverse",
+        future::block_on(left_by_return(false)), 1, 921);
+    rs_log = 0;
+    passed += rs_check("reassignment_releases_the_displaced_value",
+        future::block_on(reassigned_after_await()), 1, 192);
+    rs_log = 0;
+    passed += rs_check("branch_reassignment_releases_the_displaced_value",
+        future::block_on(reassigned_in_branch(true)), 1, 192);
+    rs_log = 0;
+    passed += rs_check("branch_skipped_keeps_the_first_value",
+        future::block_on(reassigned_in_branch(false)), 1, 91);
+    rs_log = 0;
+    passed += rs_check("moved_local_is_released_by_its_new_owner_only",
+        future::block_on(moved_before_await()), 1, 19);
+    fmt::println(f"async_release_at_scope_end: {passed} of 17 passed");
+    if (passed != 17) { return 1; }
+    return 0;
+}

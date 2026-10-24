@@ -3150,7 +3150,7 @@ Assignment releases the destination **only where the compiler can establish that
 | `xs[i] = v` with a run-time `i` | no single member for the compiler to track |
 | a module-level global | globals are never auto-dropped |
 
-A consequence worth knowing: a local of an `async function` that survives an `await` is lowered into a field of the generated future, so reassigning it becomes a store through `this` and does not release the displaced value. A by-value `async` parameter is materialized as a real local per state and does release it.
+A local or by-value parameter of an `async function` is a local for these rules even when it is carried in a field of the generated future: reassigning it releases the displaced value, and it is released at its scope's exits, exactly as in a function that never suspends (see [section 18.4](#184-how-an-async-function-is-compiled)).
 
 At those destinations, release the old value yourself. `Array::set` is the canonical example: it drops the previous occupant before reusing the slot, precisely because `this.ptr[index] = value` does not.
 
@@ -3791,7 +3791,8 @@ implement trait Future for struct Countdown {
 Each `async` function generates one struct - the state machine - plus a `Future` implementation for it. The original function becomes a constructor returning that struct.
 
 - A `state` field records which suspension point to resume at. Each poll dispatches on it and re-enters there.
-- Every parameter, and every local that is live across a suspension, becomes a field. A local used only between two suspensions stays an ordinary stack local.
+- Every parameter, and every local that is live across a suspension, becomes a field. A local with a destructor is live until the end of its scope, mentioned again or not, so it is a field whenever a suspension falls between its declaration and that end, and so are the later locals with destructors in the same function, which keeps the releases in reverse declaration order. A local without a destructor used only between two suspensions stays an ordinary stack local.
+- A local is released where its scope ends - the end of its block, or a `break`, `continue` or `return` that leaves it - latest declared first, exactly as in a function that never suspends ([section 15.2](#152-the-drop-trait)). An `await` in between does not move the release.
 - Every awaited sub-future is stored in a field and polled from the resuming state.
 - `Poll::Pending` from a sub-future records the state and returns `Pending`; the next poll resumes at that state.
 

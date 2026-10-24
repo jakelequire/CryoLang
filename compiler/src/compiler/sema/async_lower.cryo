@@ -137,6 +137,27 @@ type struct PollSm {
     // EXPLODED loop, which is exactly the source loop the edge targets.
     loop_cont:  [i64];
     loop_brk:   [i64];
+    // Parallel to the two above: how many scopes were open when the loop was
+    // entered, so a `break`/`continue` knows which scopes it leaves.
+    loop_scope: [i64];
+
+    // The source blocks the builder split across states, as scopes: the ones
+    // open at the current point (innermost last), and for each scope the state
+    // count when it ended. A local declared directly in a scope is recorded
+    // with the scope and the state count just after its declaration, so a
+    // scope that allocated a state after the declaration holds a suspend the
+    // local has to live across.
+    scope_open:      [i64];
+    scope_end_alloc: [i64];
+    scoped_keys:     [SymbolID];
+    scoped_scope:    [i64];
+    scoped_alloc:    [i64];
+
+    // One empty block per exit from a scope (its end, or a `break`/`continue`
+    // leaving it), in the state the exit runs in. Once the carriers are known,
+    // each is filled with the releases of the scope's carried locals.
+    exit_blocks: [Stmt*];
+    exit_scope:  [i64];
 
     // Bindings whose storage lives in the poll frame: the body's locals and
     // `match`-arm bindings (re-materialized on every poll) plus the parameters
@@ -399,6 +420,11 @@ type struct AsyncLower {
     // so a diagnostic about a local can name it as the user wrote it instead of
     // showing the internal `$L` suffix.
     frame_local_src: [SymbolStr];
+    // The binding of every temporary `mint_temp` hands out for the body being
+    // lowered.  A temporary stands for part of one statement, so it is not a
+    // local the source declared and is not held to the end of a scope.  Reset
+    // per function by `build_poll_body_sm`.
+    temp_keys: [SymbolID];
     // Declarations that stand for a binding declared elsewhere, beside that
     // binding.  A value that moves between the future and the poll frame is
     // re-declared in every state that takes it out - a parameter's shadow, a
@@ -483,7 +509,7 @@ type struct AsyncLower {
         return AsyncLower { arena: null, intern: null, ctx: null, resolver: null,
                             patterns: null, literals: null, members: null,
                             own_accesses: [], counter: 0,
-                            frame_locals: [], frame_local_src: [],
+                            frame_locals: [], frame_local_src: [], temp_keys: [],
                             stand_ins: [], stand_in_keys: [],
                             poll_self: SymbolID::invalid(), poll_cx: SymbolID::invalid(),
                             pending: [],
@@ -2025,10 +2051,10 @@ type struct AsyncLower {
                 // rather than writing through the pointer, because the field
                 // may be EMPTY here: a state that handed the value away and
                 // then reclaims it (`l = accepted.take_listener()`) has nothing
-                // to write through. Storing `Some(...)` is also what the source
-                // assignment means — overwriting a binding does not run the old
-                // value's destructor, so publishing a second payload the same
-                // way keeps the lowered code faithful to it.
+                // to write through. An assignment that is a statement of its
+                // own also releases the value it displaces (`release_displaced`);
+                // one nested in a larger expression has no statement to place
+                // that release in, and the displaced value is not released.
                 if (this.subst_carrier_armed() && this.name_is_whole_place(b.left, key)) {
                     b.right = this.option_some(b.right, this.subst_carrier_opt, span);
                     b.left  = this.carrier_field_expr(span);
@@ -2247,6 +2273,10 @@ type struct AsyncLower {
         if (s == null) { return; }
         match (s.kind) {
             StmtKind::Expr(es) => {
+                if (this.subst_carrier_armed() && this.reassigns_whole(es.expression, key)) {
+                    this.release_displaced(s, es, key, field, struct_ref, ty, span);
+                    return;
+                }
                 es.expression = this.subst_name_expr(es.expression, key, field, struct_ref, ty, span,
                                                      false);
             }
@@ -2320,6 +2350,45 @@ type struct AsyncLower {
             }
             StmtKind::Asm(_) | StmtKind::Break | StmtKind::Continue => {}
         }
+    }
+
+    /// True when `e` is `<name> = …`, assigning the whole carried value.
+    reassigns_whole(&this, e: ExpressionNode*, key: SymbolID) -> boolean {
+        if (e == null) { return false; }
+        const b: BinaryExpr* = ExpressionNode::binary_of(e);
+        if (b == null || b.op.kind != TokenType::Equal) { return false; }
+        return this.name_is_whole_place(b.left, key);
+    }
+
+    /// Rewrite the statement `<name> = <value>;` over a carried value into
+    ///
+    ///     { mut <new> = <value>; this.<carrier>.take(); this.<carrier> = Some(<new>); }
+    ///
+    /// so the value it displaces is released, as an assignment over a live
+    /// local releases it: after the new value is evaluated, which may still
+    /// read the old one, and before it is stored. A carrier emptied by a
+    /// give-away takes `None` and releases nothing.
+    release_displaced(mut &this, s: Stmt*, es: ExprStmt*, key: SymbolID, field: SymbolStr,
+                      struct_ref: TypeRef, ty: TypeRef, span: SourceSpan) -> void {
+        const b: BinaryExpr* = ExpressionNode::binary_of(es.expression);
+        const value: ExpressionNode* =
+            this.subst_name_expr(b.right, key, field, struct_ref, ty, span, true);
+        const fresh: MintedLocal = this.mint_temp("__new");
+        mut replaced: Stmt* = Stmt::block(span);
+        replaced.as_block().add_statement(
+            this.var_decl_stmt_bound(fresh.name, fresh.sym, true, ty, value, span));
+        replaced.as_block().add_statement(Stmt::expr_stmt(
+            this.method_call0(this.carrier_field_expr(span), LangItem::OptionTake,
+                              this.subst_carrier_opt, span), span));
+        b.right = this.option_some(this.ident_bound(fresh.name, fresh.sym, ty, span),
+                                   this.subst_carrier_opt, span);
+        b.left  = this.carrier_field_expr(span);
+        es.expression.set_resolved_type(this.subst_carrier_opt);
+        replaced.as_block().add_statement(Stmt::expr_stmt(es.expression, span));
+        s.kind = replaced.kind;
+        // The value lives in its field again, so later mentions go back to
+        // reaching it there.
+        this.subst_hoist_name = SymbolStr::empty();
     }
 
     /// The variable declared by a top-level `const/mut x = …;` statement
@@ -2540,17 +2609,49 @@ type struct AsyncLower {
     /// execution continues in after the block.
     lower_block_sm(mut &this, sm: PollSm*, blk_stmt: Stmt*, cur: i64) -> i64 {
         const blk: BlockStmt* = blk_stmt.as_block();
+        const scope: i64 = sm.scope_end_alloc.length();
+        sm.scope_end_alloc.push(-1);
+        sm.scope_open.push(scope);
         mut s: i64 = cur;
+        mut diverged: boolean = false;
         for (mut i: i64 = 0; i < blk.statements.length(); i++) {
-            if (!sm.ok) { return s; }
+            if (!sm.ok) { break; }
             const st: Stmt* = blk.statements[i];
             s = this.lower_stmt_sm(sm, st, s);
+            const declared: VarDecl* = this.stmt_decl_var(st);
+            if (declared != null) {
+                sm.scoped_keys.push(this.decl_key(declared));
+                sm.scoped_scope.push(scope);
+                sm.scoped_alloc.push(sm.blocks.length());
+            }
             // A `return`/`break`/`continue` transfers control off this block; a
             // following statement (unreachable source) would otherwise be emitted
             // AFTER the edge assignment and silently run before the arm falls off.
-            if (this.stmt_diverges(st)) { return s; }
+            if (this.stmt_diverges(st)) { diverged = true; break; }
         }
+        sm.scope_end_alloc[scope] = sm.blocks.length();
+        if (sm.ok && !diverged) { this.add_scope_exit(sm, s, scope); }
+        sm.scope_open.pop();
         return s;
+    }
+
+    /// Mark an exit from `scope` at the current end of state `state`: an empty
+    /// block that `promote_cross_state` fills with the releases of the scope's
+    /// carried locals once it knows which locals are carried.
+    add_scope_exit(mut &this, sm: PollSm*, state: i64, scope: i64) -> void {
+        const marker: Stmt* = Stmt::block(sm.span);
+        sm.blocks[state].as_block().add_statement(marker);
+        sm.exit_blocks.push(marker);
+        sm.exit_scope.push(scope);
+    }
+
+    /// Mark an exit from every scope a `break`/`continue` leaves, innermost
+    /// first: the scopes opened since the innermost exploded loop was entered.
+    leave_loop_scopes(mut &this, sm: PollSm*, state: i64) -> void {
+        const depth: i64 = sm.loop_scope[sm.loop_scope.length() - 1];
+        for (mut d: i64 = sm.scope_open.length() - 1; d >= depth; d--) {
+            this.add_scope_exit(sm, state, sm.scope_open[d]);
+        }
     }
 
     /// Lower a branch body (a block, or a bare statement / else-if) starting in
@@ -3741,6 +3842,7 @@ type struct AsyncLower {
                 "async: `break` outside a loop", span);
             sm.ok = false; return cur;
         }
+        this.leave_loop_scopes(sm, cur);
         this.sm_goto(sm, cur, sm.loop_brk[sm.loop_brk.length() - 1]);
         return cur;
     }
@@ -3751,6 +3853,7 @@ type struct AsyncLower {
                 "async: `continue` outside a loop", span);
             sm.ok = false; return cur;
         }
+        this.leave_loop_scopes(sm, cur);
         this.sm_goto(sm, cur, sm.loop_cont[sm.loop_cont.length() - 1]);
         return cur;
     }
@@ -3765,9 +3868,11 @@ type struct AsyncLower {
         this.sm_goto(sm, cur, body_entry);
         sm.loop_cont.push(body_entry);
         sm.loop_brk.push(after);
+        sm.loop_scope.push(sm.scope_open.length());
         const body_end: i64 = this.lower_branch_sm(sm, lp.body, body_entry);
         sm.loop_cont.pop();
         sm.loop_brk.pop();
+        sm.loop_scope.pop();
         if (!sm.ok) { return cur; }
         if (!this.stmt_diverges(lp.body)) { this.sm_goto(sm, body_end, body_entry); }
         return after;
@@ -3788,9 +3893,11 @@ type struct AsyncLower {
         this.emit_cond_dispatch(sm, hc.end, hc.expr, body_entry, after, span);
         sm.loop_cont.push(header);
         sm.loop_brk.push(after);
+        sm.loop_scope.push(sm.scope_open.length());
         const body_end: i64 = this.lower_branch_sm(sm, w.body, body_entry);
         sm.loop_cont.pop();
         sm.loop_brk.pop();
+        sm.loop_scope.pop();
         if (!sm.ok) { return cur; }
         if (!this.stmt_diverges(w.body)) { this.sm_goto(sm, body_end, header); }
         return after;
@@ -3807,9 +3914,11 @@ type struct AsyncLower {
         this.sm_goto(sm, cur, body_entry);
         sm.loop_cont.push(cond_state);
         sm.loop_brk.push(after);
+        sm.loop_scope.push(sm.scope_open.length());
         const body_end: i64 = this.lower_branch_sm(sm, d.body, body_entry);
         sm.loop_cont.pop();
         sm.loop_brk.pop();
+        sm.loop_scope.pop();
         if (!sm.ok) { return cur; }
         if (!this.stmt_diverges(d.body)) { this.sm_goto(sm, body_end, cond_state); }
         const hc: HoistedExpr = this.lower_hoisted(sm, d.condition, cond_state);
@@ -3849,9 +3958,11 @@ type struct AsyncLower {
         }
         sm.loop_cont.push(update_state);
         sm.loop_brk.push(after);
+        sm.loop_scope.push(sm.scope_open.length());
         const body_end: i64 = this.lower_branch_sm(sm, f.body, body_entry);
         sm.loop_cont.pop();
         sm.loop_brk.pop();
+        sm.loop_scope.pop();
         if (!sm.ok) { return cur; }
         if (!this.stmt_diverges(f.body)) { this.sm_goto(sm, body_end, update_state); }
         mut update_end: i64 = update_state;
@@ -5448,6 +5559,7 @@ type struct AsyncLower {
         // pass once every carrier is known; see `release_before_ready`.
         mut inplace_fields: [SymbolStr] = [];
         mut inplace_opts: [TypeRef] = [];
+        mut inplace_keys: [SymbolID] = [];
         for (mut b: i64 = 0; b < sm.blocks.length(); b++) {
             const blk: Stmt* = sm.blocks[b];
             for (mut i: i64 = 0; i < blk.as_block().statements.length(); i++) {
@@ -5459,6 +5571,22 @@ type struct AsyncLower {
                 }
             }
         }
+
+        // A local with a destructor is released where its scope ends, so it
+        // lives across every suspend between its declaration and there whether
+        // or not anything mentions it again. A scope's later locals are carried
+        // too once anything is, because the releases at a scope's exit run in
+        // reverse declaration order: a later local left in the frame would be
+        // released when its state's block ends, after the carried ones.
+        mut any_held_across: boolean = false;
+        for (mut d: i64 = 0; d < d_keys.length(); d++) {
+            const at: i64 = this.held_local_index(sm, d_keys[d],
+                DeclarationNode::var_of(d_nodes[d]).resolved_type);
+            if (at >= 0 && sm.scope_end_alloc[sm.scoped_scope[at]] > sm.scoped_alloc[at]) {
+                any_held_across = true;
+            }
+        }
+        mut held_keys: [SymbolID] = [];
 
         for (mut d: i64 = 0; d < d_keys.length(); d++) {
             const key: SymbolID = d_keys[d];
@@ -5473,6 +5601,14 @@ type struct AsyncLower {
             for (mut b: i64 = 0; b < sm.blocks.length(); b++) {
                 if (b != ds && this.block_reads_name(sm.blocks[b], key)) { cross = true; }
             }
+            // Held only for the order of the releases, it never outlives the
+            // state that declares it, so an address of the frame inside it
+            // stays valid for as long as it lives.
+            const held_at: i64 = this.held_local_index(sm, key, lty);
+            const held_across: boolean = held_at >= 0
+                && sm.scope_end_alloc[sm.scoped_scope[held_at]] > sm.scoped_alloc[held_at];
+            const held: boolean = held_across || (held_at >= 0 && any_held_across);
+            if (held) { held_keys.push(key); }
             // "Read in a later state" is only a proxy for "still live there", and
             // it misses the local a future was BUILT from and that the body never
             // mentions again: the future holds a view into it, is stashed in a
@@ -5483,6 +5619,8 @@ type struct AsyncLower {
             const borrowed: boolean = this.borrow_outlives_suspend(lty)
                                    && this.borrowed_by_awaited_future(sm, key);
             if (borrowed) { cross = true; }
+            const crosses_suspend: boolean = cross || held_across;
+            if (held) { cross = true; }
             if (!cross) { continue; }
 
             const lt: Type* = this.arena.lookup(lty);
@@ -5538,6 +5676,7 @@ type struct AsyncLower {
                 // whole defect. It is carried so that it stays owned, and dies
                 // with the future rather than with the block that lent it out.
                 if (borrowed) { needs_carry = true; }
+                if (held) { needs_carry = true; }
 
                 if (!needs_carry) {
                     // Nothing reads it across a state boundary: leave the value
@@ -5556,7 +5695,7 @@ type struct AsyncLower {
                     continue;
                 }
 
-                if (this.reject_frame_addr_carry(sm, vd_decl, key)) { return; }
+                if (crosses_suspend && this.reject_frame_addr_carry(sm, vd_decl, key)) { return; }
 
                 mut agg_args: [TypeRef] = [lty];
                 const opt_ty: TypeRef = this.ctx.generic_registry.instantiate(sm.opt_base, &agg_args);
@@ -5652,6 +5791,7 @@ type struct AsyncLower {
 
                 inplace_fields.push(afield);
                 inplace_opts.push(opt_ty);
+                inplace_keys.push(key);
 
                 sm.prom_field.push(afield);
                 sm.prom_tys.push(opt_ty);
@@ -5719,15 +5859,64 @@ type struct AsyncLower {
             sm.nprom += 1;
         }
 
-        // Once every carrier is known: run each in-place value's destructor at
-        // the completion return, where the block that owned it used to end,
-        // rather than leaving it to the future's own drop.
-        if (inplace_fields.length() > 0) {
-            for (mut b: i64 = 0; b < sm.blocks.length(); b++) {
-                this.release_before_ready(sm, sm.blocks[b],
-                                          &inplace_fields, &inplace_opts, span);
+        // Once every carrier is known: each exit from a scope releases the
+        // scope's carried locals, latest declared first, as the end of the
+        // scope would have.
+        for (mut m: i64 = 0; m < sm.exit_blocks.length(); m++) {
+            for (mut r: i64 = sm.scoped_keys.length() - 1; r >= 0; r--) {
+                if (sm.scoped_scope[r] != sm.exit_scope[m]) { continue; }
+                for (mut c: i64 = 0; c < inplace_keys.length(); c++) {
+                    if (!inplace_keys[c].equals(sm.scoped_keys[r])) { continue; }
+                    sm.exit_blocks[m].as_block().add_statement(
+                        this.agg_release_stmt(sm, inplace_fields[c], inplace_opts[c], span));
+                }
             }
         }
+        // A completion return leaves every scope at once, so it releases every
+        // in-place value, latest declared first; a scope already left holds
+        // nothing to release.
+        if (inplace_fields.length() > 0) {
+            mut latest_fields: [SymbolStr] = [];
+            mut latest_opts: [TypeRef] = [];
+            for (mut c: i64 = inplace_fields.length() - 1; c >= 0; c--) {
+                latest_fields.push(inplace_fields[c]);
+                latest_opts.push(inplace_opts[c]);
+            }
+            for (mut b: i64 = 0; b < sm.blocks.length(); b++) {
+                this.release_before_ready(sm, sm.blocks[b],
+                                          &latest_fields, &latest_opts, span);
+            }
+        }
+    }
+
+    /// The index of `key` among the locals declared directly in a scope the
+    /// builder split across states, when a local of type `ty` has a release
+    /// its scope's end must run; -1 otherwise. A temporary the lowering made
+    /// up stands for part of a statement rather than a declared local.
+    ///
+    /// An instantiation whose layout specialization has not produced yet
+    /// cannot say whether it owns anything, and is treated as owning: carrying
+    /// a value that has no destructor costs a field, while leaving one that has
+    /// in the frame releases it before the suspend. One that still names a
+    /// type parameter is the exception, since such a body cannot carry a value
+    /// it cannot read the shape of.
+    held_local_index(&this, sm: PollSm*, key: SymbolID, ty: TypeRef) -> i64 {
+        if (!ty.is_valid()) { return -1; }
+        for (mut t: i64 = 0; t < this.temp_keys.length(); t++) {
+            if (this.temp_keys[t].equals(key)) { return -1; }
+        }
+        mut owns: boolean = false;
+        if (this.ownership_unreadable(ty)) {
+            owns = !this.arena.contains_generic_param(ty);
+        } else {
+            owns = OwnershipQuery::needs_drop(this.arena, this.ctx.generic_registry,
+                                              this.intern, ty);
+        }
+        if (!owns) { return -1; }
+        for (mut r: i64 = 0; r < sm.scoped_keys.length(); r++) {
+            if (sm.scoped_keys[r].equals(key)) { return r; }
+        }
+        return -1;
     }
 
     // ---- pre-lowering `await` hoisting (statement-level ANF) ----
@@ -5750,6 +5939,7 @@ type struct AsyncLower {
         // which the rename has already run past.
         this.frame_locals.push(sym);
         this.frame_local_src.push(fresh);
+        this.temp_keys.push(sym);
         return MintedLocal { name: fresh, sym: sym };
     }
 
@@ -6393,6 +6583,10 @@ type struct AsyncLower {
             const span: SourceSpan = s.span;
             const src: SymbolStr = this.intern.intern("__ds");
             const src_id: SymbolID = this.resolver.alloc_synthetic_binding();
+            // The destructure moves every field out of it on the next line,
+            // so it is the initializer's temporary, not a local held to the
+            // end of the scope.
+            this.temp_keys.push(src_id);
             out.push(this.var_decl_stmt_bound(src, src_id, false, dd.resolved_type,
                                               dd.initializer, span));
             dd.initializer = this.ident_bound(src, src_id, dd.resolved_type, span);
@@ -7049,6 +7243,7 @@ type struct AsyncLower {
     build_poll_body_sm(mut &this, d: AsyncDecl*, node_decl: DeclarationNode*, sm: PollSm*) -> Stmt* {
         const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
         const span: SourceSpan = sm.span;
+        this.temp_keys = [];
         // Reduce every `await` to one of the three carrier shapes the state
         // machine explodes, so the passes below never meet one nested in an
         // expression. First, because the temporaries it introduces have to go
@@ -7857,7 +8052,10 @@ type struct AsyncLower {
             blocks: [], ok: true,
             fut_syms: [], fut_opt: [], naw: 0,
             prom_field: [], prom_tys: [], prom_opt: [], nprom: 0,
-            loop_cont: [], loop_brk: [],
+            loop_cont: [], loop_brk: [], loop_scope: [],
+            scope_open: [], scope_end_alloc: [],
+            scoped_keys: [], scoped_scope: [], scoped_alloc: [],
+            exit_blocks: [], exit_scope: [],
             frame_keys: [], borrow_ops: [],
             unit_output: this.is_void_type(declared_ref),
         };
