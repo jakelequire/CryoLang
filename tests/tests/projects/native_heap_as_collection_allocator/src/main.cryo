@@ -1,0 +1,64 @@
+/// The mmap-backed heap named as a collection's allocator, with
+/// `native_alloc` off, so `GlobalAlloc` stays on libc and only what names
+/// `NativeHeap` lives on the native heap.  A failing check prints its
+/// number and the program exits with it.
+namespace NativeHeapAsCollectionAllocator::Main;
+
+import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::alloc::layout::{ Layout };
+import std::alloc::allocator::{ Allocator, AllocErrorKind };
+import std::alloc::heap::{ NativeHeap };
+import std::collections::array::{ Array };
+import std::collections::hashmap::{ HashMap };
+import std::ffi::libc;
+
+function fail(check: i32) -> i32 {
+    libc::printf("check %d failed\n", check);
+    return check;
+}
+
+function main() -> i32 {
+    // 1. An array grows on the native heap through every size class into
+    //    the large path (8000 elements of 8 bytes is past the small-block
+    //    limit), keeping what it holds.
+    mut numbers: Array<i64, NativeHeap> = Array::<i64, NativeHeap>::new_in(NativeHeap::new());
+    for (mut i: i64 = 0; i < 8000; i++) { numbers.push(i); }
+    mut total: i64 = 0;
+    for (mut i: i64 = 0; i < numbers.length(); i++) {
+        match (numbers.get(i)) { Option::Some(n) => { total = total + n; } Option::None => { return fail(1); } }
+    }
+    if (total != 31996000) { return fail(1); }
+
+    // 2. It shrinks back to its length in place or by moving, still holding
+    //    the same elements.
+    numbers.truncate(10);
+    numbers.shrink_to_fit();
+    if (numbers.capacity() != 10) { return fail(2); }
+    match (numbers.get(9)) { Option::Some(n) => { if (n != 9) { return fail(2); } } Option::None => { return fail(2); } }
+
+    // 3. A hash map on the native heap, rehashing as it grows.
+    mut squares: HashMap<i64, i64, NativeHeap> =
+        HashMap::<i64, i64, NativeHeap>::new_in(NativeHeap::new());
+    for (mut i: i64 = 0; i < 500; i++) { squares.insert(i, i * i); }
+    const last: i64 = 499;
+    match (squares.get(&last)) { Option::Some(v) => { if (v != 249001) { return fail(3); } } Option::None => { return fail(3); } }
+
+    // 4. An over-aligned block straight from the allocator is aligned, and a
+    //    zero-sized request is refused.
+    mut heap: NativeHeap = NativeHeap::new();
+    match (heap.allocate(Layout::new(256, 4096))) {
+        Result::Ok(p) => {
+            if (((p.as_ptr() as u64) & 4095) != 0) { return fail(4); }
+            heap.deallocate(p, Layout::new(256, 4096));
+        }
+        Result::Err(_) => { return fail(4); }
+    }
+    match (heap.allocate(Layout::new(0, 8))) {
+        Result::Ok(_)  => { return fail(4); }
+        Result::Err(e) => { if (e.kind != AllocErrorKind::ZeroSized) { return fail(4); } }
+    }
+
+    libc::printf("native heap allocator: 4 of 4 checks passed\n");
+    return 0;
+}

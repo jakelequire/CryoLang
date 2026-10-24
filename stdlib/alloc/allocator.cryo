@@ -28,8 +28,8 @@ import std::collections::str::{ Str };
 import std::alloc::arena::{ GlobalArena };
 // Same one-way-edge shape as `arena`: `heap` is allocator-free (raw
 // `void*`/`u64` surface), so importing it here forms no cycle.  Supplies the
-// `native_alloc` backend arms below.
-import std::alloc::heap;
+// `native_alloc` backend arms and `NativeHeap`'s implementation below.
+import std::alloc::heap::{ NativeHeap };
 
 type enum AllocErrorKind {
     /// The underlying allocator returned null; the system is out of
@@ -260,6 +260,45 @@ implement trait Allocator for struct GlobalAlloc {
         }
         const raw: void* = backend_realloc(ptr.as_ptr() as void*,
                                            old_layout, new_layout);
+        if (raw == null) {
+            return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, new_layout));
+        }
+        return Result::Ok(NonNull::new(raw as u8*));
+    }
+}
+
+// NativeHeap: the mmap-backed heap, named directly.  Declared in `heap`,
+// implemented here because `heap` may not import this module.
+
+implement trait Allocator for struct NativeHeap {
+    allocate(mut &this, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+        if (layout.size() == 0) {
+            return Result::Err(AllocError::new(AllocErrorKind::ZeroSized, layout));
+        }
+        const raw: void* = heap::alloc(layout.size(), layout.alignment());
+        if (raw == null) {
+            return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, layout));
+        }
+        return Result::Ok(NonNull::new(raw as u8*));
+    }
+
+    /// The heap recovers a block's size from its address, so `layout`
+    /// carries nothing it needs.
+    deallocate(mut &this, ptr: NonNull<u8>, layout: Layout) -> void {
+        heap::free(ptr.as_ptr() as void*);
+    }
+
+    /// Grows or shrinks in place where the block's size class or mapping
+    /// allows, honouring the new alignment.
+    reallocate(mut &this,
+               ptr: NonNull<u8>,
+               old_layout: Layout,
+               new_layout: Layout) -> Result<NonNull<u8>, AllocError> {
+        if (new_layout.size() == 0) {
+            return Result::Err(AllocError::new(AllocErrorKind::ZeroSized, new_layout));
+        }
+        const raw: void* = heap::realloc(ptr.as_ptr() as void*, old_layout.size(),
+                                         new_layout.size(), new_layout.alignment());
         if (raw == null) {
             return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, new_layout));
         }

@@ -1,0 +1,60 @@
+/// A program builds a container of its own on `RawBuffer`, which keeps the
+/// storage while the container keeps the length.  A failing check prints
+/// its number and the program exits with it.
+namespace UserContainerOnRawBuffer::Main;
+
+import std::core::result::{ Result };
+import std::alloc::allocator::{ AllocError };
+import std::collections::raw_buffer::{ RawBuffer };
+import std::ffi::libc;
+
+/// A stack of `i64`.
+type struct Stack {
+    buffer: RawBuffer<i64>;
+    length: i64;
+
+    static new() -> Stack {
+        return Stack { buffer: RawBuffer::new(), length: 0 };
+    }
+
+    push(mut &this, value: i64) -> Result<(), AllocError> {
+        this.buffer.reserve(this.length, 1, 4)?;
+        this.buffer.ptr()[this.length] = value;
+        this.length = this.length + 1;
+        return Result::Ok(());
+    }
+
+    sum(&this) -> i64 {
+        mut total: i64 = 0;
+        for (mut i: i64 = 0; i < this.length; i++) {
+            total = total + this.buffer.ptr()[i];
+        }
+        return total;
+    }
+}
+
+function fail(check: i32) -> i32 {
+    libc::printf("check %d failed\n", check);
+    return check;
+}
+
+function main() -> i32 {
+    // 1. The buffer grows along the doubling curve, keeping what its owner
+    //    stored.
+    mut stack: Stack = Stack::new();
+    for (mut i: i64 = 1; i <= 10; i++) {
+        match (stack.push(i)) { Result::Ok(_) => { } Result::Err(_) => { return fail(1); } }
+    }
+    if (stack.sum() != 55 || stack.buffer.capacity() < 10) { return fail(1); }
+
+    // 2. It is resized exactly.
+    match (stack.buffer.resize(32)) { Result::Ok(_) => { } Result::Err(_) => { return fail(2); } }
+    if (stack.buffer.capacity() != 32 || stack.sum() != 55) { return fail(2); }
+
+    // 3. It shrinks back to what is used.
+    stack.buffer.shrink_to(stack.length);
+    if (stack.buffer.capacity() != 10 || stack.sum() != 55) { return fail(3); }
+
+    libc::printf("raw buffer container: 3 of 3 checks passed\n");
+    return 0;
+}

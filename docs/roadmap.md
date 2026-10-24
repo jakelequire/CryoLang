@@ -407,17 +407,17 @@ Left over from that: the async entry point calls `Executor::new` and
    outside the 1.0 stability promise.  Tests that reach internals are
    rewritten through the public API, or deleted where they pinned only
    an internal.  Anything borderline is listed for Jake rather than
-   hidden.  Built: `alloc::heap` and `net::http2::huffman`/`hpack` are
-   `internal module`s with every item marked; a connection codes its
+   hidden.  Built: `future::reactor` and `net::http2::huffman`/`hpack`
+   are `internal module`s with every item marked; a connection codes its
    header blocks through a public `HeaderCodec` it is generic over, whose
    default `HpackCodec` keeps the HPACK encoder and decoder private (588).
-   `collections::raw_buffer` and
-   `future::reactor` are public: `RawBuffer` with private fields, and the
-   reactor's registration and timer calls with its lifecycle internal.
-   `Array`'s, `HashMap`'s and `Pool`'s own grow helpers are private, and
-   `String`'s buffer is a private field.  HPACK is tested
-   through `Http2Connection` against RFC 7541's examples, and the heap
-   through `GlobalAlloc` with `native_alloc` on.  An `internal module` line now hides its
+   `collections::raw_buffer` is public, `RawBuffer` with private fields,
+   and so is `alloc::heap`, as the allocator `NativeHeap` with its raw
+   calls internal (589).  `Array`'s, `HashMap`'s and `Pool`'s own grow
+   helpers are private, and `String`'s buffer is a private field.  HPACK
+   is tested through `Http2Connection` against RFC 7541's examples, and
+   the heap through `GlobalAlloc` with `native_alloc` on and as a
+   collection's allocator without it.  An `internal module` line now hides its
    module from other packages whichever files a build loads, so the
    standard library's internal modules are refused at the import as a
    dependency's are.

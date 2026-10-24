@@ -1037,21 +1037,25 @@ type struct NameResolver {
         return out;
     }
 
-    /// The modules that declare a free function under the leaf `name`, as
-    /// the canonical names of those declarations - public or private, since
-    /// the note names the owner the writer has to spell, and whether the
-    /// owner then admits the writer is the visibility gate's answer.
+    /// The modules that offer the writing module a free function under the
+    /// leaf `name`, as the canonical names of those declarations.  The note
+    /// names the owner the writer has to spell, so a module offers only what
+    /// its export list holds for the writer: a function private to it, or
+    /// internal to another package or to an internal module, is left out,
+    /// since spelling its owner would only trade this error for `E0353`.
     module_declarers_of_leaf(&this, name: SymbolStr) -> [string] {
         mut out: [string] = [];
         if (this.ctx.module_graph == null) { return out; }
         const count: i64 = this.ctx.module_graph.module_count() as i64;
         for (mut m: i64 = 0; m < count; m++) {
             const info: ModuleInfo* = this.ctx.module_graph.get_module(m);
-            const found: SymbolID = this.resolver.module_binding(info.path(), name);
-            if (!found.is_valid()) { continue; }
-            const s: Symbol = this.resolver.get_symbol(found);
-            if (s.kind != SymbolKind::Function && s.kind != SymbolKind::Intrinsic) { continue; }
-            out.push(this.resolver.intern_table.resolve(this.resolver.qualified_name_of(&s)));
+            const offered: [SymbolID] = this.resolver.exports_named(info.path(), name);
+            for (mut k: i64 = 0; k < offered.length(); k++) {
+                const s: Symbol = this.resolver.get_symbol(offered[k]);
+                if (s.kind != SymbolKind::Function && s.kind != SymbolKind::Intrinsic) { continue; }
+                out.push(this.resolver.intern_table.resolve(this.resolver.qualified_name_of(&s)));
+                break;
+            }
         }
         return out;
     }
@@ -1073,10 +1077,10 @@ type struct NameResolver {
         };
         d = d.at_with_label(e.span, "not found in this scope");
         if (as_callee) {
-            // A leaf some other module declares - `free` in `std::ffi::libc`,
-            // `std::alloc::heap`, `std::core::intrinsics` - is not a typo of
-            // a name in scope; it is a name the writer has to say the owner
-            // of.
+            // A leaf some other module declares where the writer may call
+            // it - `free` in `std::ffi::libc` and `std::core::intrinsics` - is
+            // not a typo of a name in scope; it is a name the writer has to
+            // say the owner of.
             const declarers: [string] = this.module_declarers_of_leaf(node.name);
             if (declarers.length() > 0) {
                 mut spellings: string = "";

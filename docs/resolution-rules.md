@@ -167,7 +167,7 @@ yet is recorded with the change that builds it, not here.
      replaces 556.  A file compiled without the standard library is
      `cryo build --no-std`.  (Jake)
 
-587. **The standard library hides only its own plumbing.**  `internal`
+587. *The reactor and the heap: replaced by 589.* **The standard library hides only its own plumbing.**  `internal`
      marks what only the library itself uses; a lower-level API a program
      could build on stays public, and that nothing calls an item yet is
      never a reason to hide it.  `collections::raw_buffer` and
@@ -196,6 +196,23 @@ yet is recorded with the change that builds it, not here.
      HPACK writes never-indexed and does not store.  (Jake: a generic
      parameter with a default, and credential headers never indexed; the
      trait's methods and names, delegated)
+
+589. **`future::reactor` is internal, and the heap is public as the
+     allocator `NativeHeap`;** this replaces 587 for both.  The reactor
+     and everything in it reach the standard library alone, as before
+     587.  `alloc::heap` is a public module whose public item is
+     `NativeHeap`, a type implementing `Allocator` like `GlobalAlloc`, so
+     `Array<T, NativeHeap>` keeps its storage on the mmap-backed heap
+     whatever `GlobalAlloc` is backed by; the raw `alloc`, `free` and
+     `realloc` stay internal and the segment and lock machinery private.
+     (Jake; the name `NativeHeap`, delegated)
+
+590. **E0202's note names only the owners the writer may call.**  A
+     bare call nothing binds lists the modules that declare its leaf,
+     and a module counts only when its export list offers that function
+     to the writing module: not when it is private there, or internal to
+     another package or to an internal module, since spelling that owner
+     would only trade E0202 for E0353.  (Jake)
 
 ### 2026-10-23
 
