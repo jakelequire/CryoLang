@@ -1,0 +1,286 @@
+/// A program codes an HTTP/2 connection's header blocks with its own
+/// `HeaderCodec`: every field as a length-prefixed name and value, with a
+/// `!` before a sensitive one.  A client connection must write exactly that
+/// encoding and read its responses through it; a server connection must
+/// read its requests through it.  A failing check prints its number and the
+/// program exits with it.
+namespace Http2CustomHeaderCodec::Main;
+
+import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::core::slice::{ Slice };
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::future;
+import std::io::traits::{ AsyncTransport, Transfer };
+import std::io::buf::{ BufStream };
+import std::net::http::method::{ Method };
+import std::net::http::request::{ Request };
+import std::net::http::response::{ Response };
+import std::net::http2::codec::{ HeaderCodec, HeaderField };
+import std::net::http2::connection::{ Http2Connection, RequestOnStream };
+import std::ffi::libc;
+
+/// The octet before a sensitive field: `!`.
+const SENSITIVE_MARK: u8 = 0x21;
+
+/// Each field as one octet of name length, the name, one octet of value
+/// length and the value; a sensitive field is preceded by `!`.  Remembers
+/// nothing between blocks but the peer's table limit, which it records.
+type struct LengthPrefixedCodec {
+    peer_table_limit: i64;
+
+    static new() -> LengthPrefixedCodec {
+        return LengthPrefixedCodec { peer_table_limit: -1 };
+    }
+}
+
+implement trait HeaderCodec for struct LengthPrefixedCodec {
+    encode_field(mut &this, out: mut &Array<u8>, name: Str, value: Str, sensitive: boolean) -> void {
+        if (sensitive) { out.push(SENSITIVE_MARK); }
+        out.push(name.length() as u8);
+        out.append(name.as_bytes());
+        out.push(value.length() as u8);
+        out.append(value.as_bytes());
+    }
+
+    decode(mut &this, block: Slice<u8>) -> Option<Array<HeaderField>> {
+        mut fields: Array<HeaderField> = Array::<HeaderField>::new();
+        mut at: i64 = 0;
+        while (at < block.length()) {
+            if (block.get(at) == Option::Some(SENSITIVE_MARK)) { at = at + 1; }
+            match (read_text(block, &at)) {
+                Option::Some(name) => {
+                    match (read_text(block, &at)) {
+                        Option::Some(value) => { fields.push(HeaderField::new(name, value)); }
+                        Option::None        => { return Option::None; }
+                    }
+                }
+                Option::None => { return Option::None; }
+            }
+        }
+        return Option::Some(fields);
+    }
+
+    limit_encoder_table(mut &this, size: i64) -> void {
+        this.peer_table_limit = size;
+    }
+}
+
+/// The length-prefixed text at `*at`, moving `*at` past it; none when the
+/// block ends first.
+function read_text(block: Slice<u8>, at: mut &i64) -> Option<Str> {
+    mut length: i64 = 0;
+    match (block.get(*at)) {
+        Option::Some(n) => { length = n as i64; }
+        Option::None    => { return Option::None; }
+    }
+    const start: i64 = *at + 1;
+    if (start + length > block.length()) { return Option::None; }
+    *at = start + length;
+    return Option::Some(Str::from_raw(block.subslice(start, start + length).as_ptr(), length));
+}
+
+/// The encoding of `fields`, alternating names and values, sensitive where
+/// the name starts with `!` (which is not written).
+function encoded(fields: [string]) -> Array<u8> {
+    mut out: Array<u8> = Array::<u8>::new();
+    mut codec: LengthPrefixedCodec = LengthPrefixedCodec::new();
+    mut i: i64 = 0;
+    while (i + 1 < fields.length()) {
+        mut name: Str = Str::new(fields[i]);
+        mut sensitive: boolean = false;
+        if (name.as_bytes().get(0) == Option::Some(SENSITIVE_MARK)) {
+            sensitive = true;
+            name = name.sub_bytes(1, name.length());
+        }
+        codec.encode_field(&out, name, Str::new(fields[i + 1]), sensitive);
+        i = i + 2;
+    }
+    return out;
+}
+
+/// An in-memory transport: a read hands over what is left of `inbox`, a
+/// write appends to `outbox`, and an exhausted inbox reads as the peer
+/// closing.
+type struct MemTransport {
+    inbox:  Array<u8>;
+    ipos:   i64;
+    outbox: Array<u8>;
+
+    static of(inbox: Array<u8>) -> MemTransport {
+        return MemTransport { inbox: inbox, ipos: 0, outbox: Array::<u8>::new() };
+    }
+}
+
+implement trait AsyncTransport for struct MemTransport {
+    async read_into(mut &this, buf: Array<u8>) -> Transfer {
+        mut out: Array<u8> = buf;
+        mut take: i64 = this.inbox.length() - this.ipos;
+        if (take > out.length()) { take = out.length(); }
+        mut i: i64 = 0;
+        while (i < take) {
+            match (this.inbox.get(this.ipos + i)) {
+                Option::Some(byte) => { out.set(i, byte); }
+                Option::None       => { }
+            }
+            i = i + 1;
+        }
+        this.ipos = this.ipos + take;
+        out.truncate(take);
+        return Transfer { buf: out, result: Result::Ok(take) };
+    }
+
+    async write_from(mut &this, buf: Array<u8>) -> Transfer {
+        mut src: Array<u8> = buf;
+        this.outbox.append(src.as_slice());
+        const n: i64 = src.length();
+        return Transfer { buf: src, result: Result::Ok(n) };
+    }
+}
+
+const FRAME_HEADERS: u8 = 0x1;
+const FRAME_SETTINGS: u8 = 0x4;
+/// END_STREAM | END_HEADERS: a whole request or response in one frame.
+const COMPLETE: u8 = 0x5;
+const FRAME_HEADER_LEN: i64 = 9;
+const PREFACE: string = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// Append one frame: the 9-octet frame header, then `payload`.
+function push_frame(out: mut &Array<u8>, kind: u8, flags: u8, stream_id: u32, payload: Slice<u8>) -> void {
+    const n: i64 = payload.length();
+    out.push((n >> 16) as u8);
+    out.push((n >> 8) as u8);
+    out.push(n as u8);
+    out.push(kind);
+    out.push(flags);
+    out.push((stream_id >> 24) as u8);
+    out.push((stream_id >> 16) as u8);
+    out.push((stream_id >> 8) as u8);
+    out.push(stream_id as u8);
+    out.append(payload);
+}
+
+function push_settings(out: mut &Array<u8>) -> void {
+    mut none: Array<u8> = Array::<u8>::new();
+    push_frame(out, FRAME_SETTINGS, 0, 0, none.as_slice());
+}
+
+/// The first HEADERS block written after the client preface.
+function first_written_block(out: &Array<u8>) -> Array<u8> {
+    mut block: Array<u8> = Array::<u8>::new();
+    const all: Slice<u8> = out.as_slice();
+    mut at: i64 = Str::new(PREFACE).length();
+    while (at + FRAME_HEADER_LEN <= all.length()) {
+        mut n: i64 = 0;
+        mut kind: u8 = 0;
+        match (all.get(at))     { Option::Some(b) => { n = (b as i64) << 16; } Option::None => { } }
+        match (all.get(at + 1)) { Option::Some(b) => { n = n | ((b as i64) << 8); } Option::None => { } }
+        match (all.get(at + 2)) { Option::Some(b) => { n = n | (b as i64); } Option::None => { } }
+        match (all.get(at + 3)) { Option::Some(b) => { kind = b; } Option::None => { } }
+        const start: i64 = at + FRAME_HEADER_LEN;
+        if (start + n > all.length()) { break; }
+        if (kind == FRAME_HEADERS) {
+            block.append(all.subslice(start, start + n));
+            return block;
+        }
+        at = start + n;
+    }
+    return block;
+}
+
+function bytes_equal(a: Slice<u8>, b: Slice<u8>) -> boolean {
+    if (a.length() != b.length()) { return false; }
+    mut i: i64 = 0;
+    while (i < a.length()) {
+        if (a.get(i) != b.get(i)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+function header_is(found: Option<String>, expected: string) -> boolean {
+    match (found) {
+        Option::Some(value) => { return value.as_str().equals(&Str::new(expected)); }
+        Option::None        => { return false; }
+    }
+}
+
+/// A client connection on the custom codec: 0 when every check holds, or
+/// the number of the first that failed.
+async function client_checks() -> i32 {
+    mut wire: Array<u8> = Array::<u8>::new();
+    push_settings(&wire);
+    mut response: Array<u8> = encoded([":status", "201", "x-codec", "length-prefixed"]);
+    push_frame(&wire, FRAME_HEADERS, COMPLETE, 1, response.as_slice());
+    mut connection: Http2Connection<MemTransport, LengthPrefixedCodec> =
+        Http2Connection::<MemTransport, LengthPrefixedCodec>::new_client_with_codec(
+            BufStream::<MemTransport>::of(MemTransport::of(wire)), LengthPrefixedCodec::new());
+    match (await connection.handshake_client()) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return 1; }
+    }
+
+    // 2. The response decodes through the codec.
+    const sent: Request = Request::new(Method::Get, Str::new("/item"))
+        .with_header(Str::new("authorization"), Str::new("token"));
+    mut got: Response = match (await connection.request(sent, Str::new("https"), Str::new("example.org"))) {
+        Result::Ok(r)  => { r }
+        Result::Err(_) => { return 2; }
+    };
+    if (got.status.as_u16() != 201) { return 2; }
+    if (!header_is(got.headers.get(Str::new("x-codec")), "length-prefixed")) { return 2; }
+
+    // 3. The request's block is the codec's encoding, the credential marked
+    //    sensitive.
+    mut written: Array<u8> = first_written_block(&connection.connection().transport().outbox);
+    mut expected: Array<u8> = encoded([":method", "GET", ":scheme", "https", ":path", "/item",
+                                       ":authority", "example.org", "!authorization", "token"]);
+    if (!bytes_equal(written.as_slice(), expected.as_slice())) { return 3; }
+    return 0;
+}
+
+/// A server connection on the custom codec: 0 when every check holds, or
+/// the number of the first that failed.
+async function server_checks() -> i32 {
+    mut wire: Array<u8> = Array::<u8>::new();
+    wire.append(Str::new(PREFACE).as_bytes());
+    push_settings(&wire);
+    mut request: Array<u8> = encoded([":method", "POST", ":scheme", "http", ":path", "/submit",
+                                      ":authority", "example.org", "!cookie", "a=1"]);
+    push_frame(&wire, FRAME_HEADERS, COMPLETE, 1, request.as_slice());
+    mut connection: Http2Connection<MemTransport, LengthPrefixedCodec> =
+        Http2Connection::<MemTransport, LengthPrefixedCodec>::new_server_with_codec(
+            BufStream::<MemTransport>::of(MemTransport::of(wire)), LengthPrefixedCodec::new());
+    match (await connection.handshake_server()) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return 4; }
+    }
+
+    // 5. The request decodes through the codec.
+    mut received: RequestOnStream = match (await connection.read_request()) {
+        Result::Ok(Option::Some(r)) => { r }
+        _                           => { return 5; }
+    };
+    if (!received.req.method.as_str().equals(&Str::new("POST"))) { return 5; }
+    if (!received.req.path.as_str().equals(&Str::new("/submit"))) { return 5; }
+    if (!header_is(received.req.headers.get(Str::new("host")), "example.org")) { return 5; }
+    if (!header_is(received.req.headers.get(Str::new("cookie")), "a=1")) { return 5; }
+    return 0;
+}
+
+function main() -> i32 {
+    const client: i32 = future::block_on(client_checks());
+    if (client != 0) {
+        libc::printf("check %d failed\n", client);
+        return client;
+    }
+    const server: i32 = future::block_on(server_checks());
+    if (server != 0) {
+        libc::printf("check %d failed\n", server);
+        return server;
+    }
+    libc::printf("custom header codec: 5 of 5 checks passed\n");
+    return 0;
+}

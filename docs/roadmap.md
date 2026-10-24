@@ -408,8 +408,10 @@ Left over from that: the async entry point calls `Executor::new` and
    rewritten through the public API, or deleted where they pinned only
    an internal.  Anything borderline is listed for Jake rather than
    hidden.  Built: `alloc::heap` and `net::http2::huffman`/`hpack` are
-   `internal module`s with every item marked, and a connection's HPACK
-   encoder and decoder are private.  `collections::raw_buffer` and
+   `internal module`s with every item marked; a connection codes its
+   header blocks through a public `HeaderCodec` it is generic over, whose
+   default `HpackCodec` keeps the HPACK encoder and decoder private (588).
+   `collections::raw_buffer` and
    `future::reactor` are public: `RawBuffer` with private fields, and the
    reactor's registration and timer calls with its lifecycle internal.
    `Array`'s, `HashMap`'s and `Pool`'s own grow helpers are private, and

@@ -1,0 +1,86 @@
+///! Header-block coding for an HTTP/2 connection.
+///!
+///! A connection turns each request's or response's header list into a
+///! header block and back through a `HeaderCodec`.  `HpackCodec`, RFC 7541's
+///! HPACK, is the one every connection uses unless it is built with another:
+///! `Http2Connection<S>` is `Http2Connection<S, HpackCodec>`, and
+///! `Http2Connection<S, MyCodec>` codes its header blocks with `MyCodec`.
+///! Both ends of a connection must code the same way, so a codec other than
+///! HPACK is for a peer that speaks it.
+
+namespace std::net::http2::codec;
+
+import std::core::option::{ Option };
+import std::core::slice::{ Slice };
+import std::collections::array::{ Array };
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::net::http2::hpack::{ HpackDecoder, HpackEncoder };
+
+/// One header field. Owns its name and value bytes.
+type struct HeaderField {
+    name:  String;
+    value: String;
+
+    static new(name: Str, value: Str) -> HeaderField {
+        return HeaderField {
+            name:  String::from_str(name),
+            value: String::from_str(value)
+        };
+    }
+}
+
+implement trait Drop for struct HeaderField {
+    drop(mut &this) -> void { }
+}
+
+/// How a connection writes and reads header blocks.  A codec may keep
+/// state across the blocks of one connection, as HPACK's tables do; it
+/// sees every block of one direction in order.
+type trait HeaderCodec {
+    /// Append the encoding of the field `name: value` to `out`.  A
+    /// `sensitive` field carries a credential: a codec that remembers
+    /// fields for later blocks must not remember this one, and must tell
+    /// whatever relays the block not to either.
+    encode_field(mut &this, out: mut &Array<u8>, name: Str, value: Str, sensitive: boolean) -> void;
+
+    /// The fields `block` encodes, in order, or none when it is malformed
+    /// or decodes past what the codec accepts.
+    decode(mut &this, block: Slice<u8>) -> Option<Array<HeaderField>>;
+
+    /// The most the peer's decoder stores, as its
+    /// SETTINGS_HEADER_TABLE_SIZE says.  A codec that stores nothing
+    /// ignores it.
+    limit_encoder_table(mut &this, size: i64) -> void;
+}
+
+/// HPACK (RFC 7541): an encoder and a decoder, each with its own dynamic
+/// table.
+type struct HpackCodec {
+    private encoder: HpackEncoder;
+    private decoder: HpackDecoder;
+
+    /// A codec whose own decoder table holds at most `table_size` octets,
+    /// as the connection advertises it, and whose encoder starts at the
+    /// same size until the peer's SETTINGS says otherwise.
+    static new(table_size: i64) -> HpackCodec {
+        return HpackCodec {
+            encoder: HpackEncoder::new(table_size),
+            decoder: HpackDecoder::new(table_size)
+        };
+    }
+}
+
+implement trait HeaderCodec for struct HpackCodec {
+    encode_field(mut &this, out: mut &Array<u8>, name: Str, value: Str, sensitive: boolean) -> void {
+        this.encoder.encode_field(out, name, value, sensitive);
+    }
+
+    decode(mut &this, block: Slice<u8>) -> Option<Array<HeaderField>> {
+        return this.decoder.decode(block);
+    }
+
+    limit_encoder_table(mut &this, size: i64) -> void {
+        this.encoder.set_capacity(size);
+    }
+}

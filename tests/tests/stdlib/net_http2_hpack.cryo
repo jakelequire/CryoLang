@@ -9,8 +9,9 @@
 ///! comparison is byte-exact, because a header that decodes to the right
 ///! value from the wrong encoding is what a round trip alone cannot see.
 ///! The remaining cases cover what the vectors leave out: a never-indexed
-///! field is not stored, integers continue past a 5-bit and a 7-bit prefix,
-///! and an index past the dynamic table refuses the block.
+///! field is not stored, a client writes its credential headers
+///! never-indexed, integers continue past a 5-bit and a 7-bit prefix, and an
+///! index past the dynamic table refuses the block.
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::NetHttp2Hpack;
@@ -364,6 +365,66 @@ function hpack_never_indexed_field_is_not_stored() -> Result<(), TestError> {
 ![test]
 function hpack_incrementally_indexed_field_is_stored() -> Result<(), TestError> {
     return expect_eq(future::block_on(second_names_index_62("400870617373776f726406736563726574")), 1 as i64);
+}
+
+/// Whether `block` holds the two octets `first`, `second` in a row.
+function holds_pair(block: &Array<u8>, first: u8, second: u8) -> boolean {
+    const s: Slice<u8> = block.as_slice();
+    mut i: i64 = 0;
+    while (i + 1 < s.length()) {
+        if (s.get(i) == Option::Some(first) && s.get(i + 1) == Option::Some(second)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Two requests from a client connection, each carrying `authorization`
+/// and `cookie`; the count of the blocks it wrote that open both fields
+/// never-indexed with the static table's name - `authorization` is index
+/// 23 and `cookie` 32, which a 4-bit prefix writes as 0x1f then 8 and 17.
+/// The second block repeats them so, since a never-indexed field is not
+/// stored for the second to name.
+async function credential_headers_sent_never_indexed() -> i64 {
+    mut wire: Array<u8> = Array::<u8>::new();
+    push_settings(&wire);
+    push_headers(&wire, 1, "88");
+    push_headers(&wire, 3, "88");
+    mut connection: Http2Connection<MemTransport> =
+        Http2Connection::<MemTransport>::new_client(BufStream::<MemTransport>::of(MemTransport::of(wire)));
+    match (await connection.handshake_client()) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -1; }
+    }
+    mut i: i64 = 0;
+    while (i < 2) {
+        const sent: Request = Request::new(Method::Get, Str::new("/"))
+            .with_header(Str::new("Authorization"), Str::new("Basic dXNlcjpwYXNz"))
+            .with_header(Str::new("cookie"), Str::new("session=0123456789"));
+        match (await connection.request(sent, Str::new("https"), Str::new("www.example.com"))) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { return -2 - i; }
+        }
+        i = i + 1;
+    }
+    mut blocks: Array<Array<u8>> = written_blocks(&connection.connection().transport().outbox);
+    if (blocks.length() != 2) { return -4; }
+    mut sensitive: i64 = 0;
+    mut b: i64 = 0;
+    while (b < 2) {
+        match (blocks.get_ref(b)) {
+            Option::Some(block) => {
+                if (holds_pair(block, 0x1f, 0x08) && holds_pair(block, 0x1f, 0x11)) { sensitive = sensitive + 1; }
+            }
+            Option::None => { }
+        }
+        b = b + 1;
+    }
+    return sensitive;
+}
+
+![test]
+function hpack_client_sends_credential_headers_never_indexed() -> Result<(), TestError> {
+    return expect_eq(future::block_on(credential_headers_sent_never_indexed()), 2 as i64);
 }
 
 /// A block opening with the table size update `update` (hex) whose `:path`

@@ -21,6 +21,7 @@ import std::collections::array::{ Array };
 import std::collections::string::{ String };
 import std::collections::str::{ Str };
 import std::net::http2::huffman;
+import std::net::http2::codec::{ HeaderField };
 import std::core::mem;
 
 /// First HPACK index of the dynamic table: the static table holds 61
@@ -39,27 +40,9 @@ private const ENTRY_OVERHEAD: i64 = 32;
 /// step with the connection's advertised SETTINGS_MAX_HEADER_LIST_SIZE.
 private const MAX_DECODED_HEADER_LIST: i64 = 262144;
 
-/// One header field. Owns its name and value bytes.
-internal type struct HeaderField {
-    internal name:  String;
-    internal value: String;
-
-private:
-    static new(name: Str, value: Str) -> HeaderField {
-        return HeaderField {
-            name:  String::from_str(name),
-            value: String::from_str(value)
-        };
-    }
-
-    /// Storage size charged against the dynamic table budget.
-    entry_size(&this) -> i64 {
-        return this.name.length() + this.value.length() + ENTRY_OVERHEAD;
-    }
-}
-
-implement trait Drop for struct HeaderField {
-    drop(mut &this) -> void { }
+/// Storage size `field` is charged against the dynamic table budget.
+private function entry_size(field: &HeaderField) -> i64 {
+    return field.name.length() + field.value.length() + ENTRY_OVERHEAD;
 }
 
 /// A read position into a byte slice, threaded through the decode
@@ -96,7 +79,7 @@ private type struct DynTable {
     /// budget empties the table (RFC 7541 section 4.4).
     add(mut &this, name: Str, value: Str) -> void {
         mut field: HeaderField = HeaderField::new(name, value);
-        const added: i64 = field.entry_size();
+        const added: i64 = entry_size(&field);
         this.entries.insert(0, field);
         this.size = this.size + added;
         this.evict();
@@ -112,7 +95,7 @@ private type struct DynTable {
     evict(mut &this) -> void {
         while (this.size > this.max_size && this.entries.length() > 0) {
             mut old: HeaderField = this.entries.remove(this.entries.length() - 1);
-            this.size = this.size - old.entry_size();
+            this.size = this.size - entry_size(&old);
             mem::drop(old);
         }
     }
@@ -387,7 +370,7 @@ private:
     /// false return the caller drops `out`.
     static account_and_push(out: mut &Array<HeaderField>, field: HeaderField,
                             list_size: mut &i64) -> boolean {
-        *list_size = *list_size + field.entry_size();
+        *list_size = *list_size + entry_size(&field);
         if (*list_size > MAX_DECODED_HEADER_LIST) {
             return false;
         }

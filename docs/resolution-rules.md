@@ -182,6 +182,21 @@ yet is recorded with the change that builds it, not here.
      `Array::resize(new_length, value)` is the user's call.  (Jake;
      `Pool`'s `grow`, delegated)
 
+588. **An HTTP/2 connection codes its header blocks through a
+     `HeaderCodec` it is generic over, HPACK by default.**
+     `Http2Connection<S, C = HpackCodec>`: `net::http2::codec` holds the
+     public `HeaderField`, the trait `HeaderCodec` (`encode_field`,
+     `decode`, `limit_encoder_table`) and `HpackCodec`, a public type over
+     the internal `hpack` module's encoder and decoder, which stay
+     internal with `huffman`.  `new_client` and `new_server` build the
+     HPACK connection; `new_client_with_codec` and `new_server_with_codec`
+     take any codec.  `build_request` and `build_response` are public again
+     and take the decoded fields.  A connection encodes `authorization`,
+     `proxy-authorization`, `cookie` and `set-cookie` as sensitive, which
+     HPACK writes never-indexed and does not store.  (Jake: a generic
+     parameter with a default, and credential headers never indexed; the
+     trait's methods and names, delegated)
+
 ### 2026-10-23
 
 575. **Every length, position and size in the standard library is an

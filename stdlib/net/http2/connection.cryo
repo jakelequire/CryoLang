@@ -1,9 +1,12 @@
 ///! HTTP/2 connection (RFC 7540).
 ///!
-///! `Http2Connection<S>` drives the HTTP/2 protocol over any async transport
-///! `S` (a `TcpStream` for h2c, a `TlsStream` for h2). It owns the HPACK
-///! encoder/decoder, performs the connection preface + SETTINGS handshake, and
-///! exposes `request` (client) and `serve` (server). Requests and responses are
+///! `Http2Connection<S, C>` drives the HTTP/2 protocol over any async
+///! transport `S` (a `TcpStream` for h2c, a `TlsStream` for h2), coding its
+///! header blocks with the `HeaderCodec` `C`, HPACK's `HpackCodec` unless
+///! another is named. It owns the codec, performs the connection preface +
+///! SETTINGS handshake, and exposes `request` (client) and `serve` (server).
+///! A credential header (`authorization`, `proxy-authorization`, `cookie`,
+///! `set-cookie`) is encoded as sensitive, so HPACK never indexes it. Requests and responses are
 ///! the same `net::http` `Request` / `Response` types used by the HTTP/1.1
 ///! layer, so handlers and clients are written once.
 ///!
@@ -52,7 +55,7 @@ import std::net::http::headers::{ Headers };
 import std::net::http::request::{ Request };
 import std::net::http::response::{ Response };
 import std::net::http2::frame::{ Frame };
-import std::net::http2::hpack::{ HeaderField, HpackDecoder, HpackEncoder };
+import std::net::http2::codec::{ HeaderCodec, HeaderField, HpackCodec };
 import std::net::http2::settings::{ Settings };
 import std::future::poll;
 import std::future::waker;
@@ -94,10 +97,9 @@ type struct RequestOnStream {
     req:       Request;
 }
 
-type struct Http2Connection<S> {
+type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     conn:                  BufStream<S>;
-    private encoder:       HpackEncoder;
-    private decoder:       HpackDecoder;
+    private codec:         C;
     is_client:             boolean;
     next_stream_id:        u32;
     goaway_received:       boolean;
@@ -108,13 +110,20 @@ type struct Http2Connection<S> {
     conn_send_window:      i64;
     stream_send_window:    i64;
 
-    /// New client-side connection taking ownership of `conn`. Call
-    /// `handshake_client` before issuing requests.
+    /// New client-side connection taking ownership of `conn`, coding its
+    /// header blocks with HPACK. Call `handshake_client` before issuing
+    /// requests.
     static new_client(conn: BufStream<S>) -> Http2Connection<S> {
-        return Http2Connection::<S> {
+        return Http2Connection::<S>::new_client_with_codec(
+            conn, HpackCodec::new(LOCAL_HEADER_TABLE_SIZE as i64));
+    }
+
+    /// New client-side connection taking ownership of `conn`, coding its
+    /// header blocks with `codec`.
+    static new_client_with_codec(conn: BufStream<S>, codec: C) -> Http2Connection<S, C> {
+        return Http2Connection::<S, C> {
             conn:                  conn,
-            encoder:               HpackEncoder::new(LOCAL_HEADER_TABLE_SIZE as i64),
-            decoder:               HpackDecoder::new(LOCAL_HEADER_TABLE_SIZE as i64),
+            codec:                 codec,
             is_client:             true,
             next_stream_id:        1,
             goaway_received:       false,
@@ -125,12 +134,19 @@ type struct Http2Connection<S> {
         };
     }
 
-    /// New server-side connection over an accepted, already-buffered transport.
+    /// New server-side connection over an accepted, already-buffered
+    /// transport, coding its header blocks with HPACK.
     static new_server(conn: BufStream<S>) -> Http2Connection<S> {
-        return Http2Connection::<S> {
+        return Http2Connection::<S>::new_server_with_codec(
+            conn, HpackCodec::new(LOCAL_HEADER_TABLE_SIZE as i64));
+    }
+
+    /// New server-side connection over an accepted, already-buffered
+    /// transport, coding its header blocks with `codec`.
+    static new_server_with_codec(conn: BufStream<S>, codec: C) -> Http2Connection<S, C> {
+        return Http2Connection::<S, C> {
             conn:                  conn,
-            encoder:               HpackEncoder::new(LOCAL_HEADER_TABLE_SIZE as i64),
-            decoder:               HpackDecoder::new(LOCAL_HEADER_TABLE_SIZE as i64),
+            codec:                 codec,
             is_client:             false,
             next_stream_id:        2,
             goaway_received:       false,
@@ -240,7 +256,7 @@ type struct Http2Connection<S> {
             this.remote_max_frame = s.max_frame_size as i64;
             this.remote_initial_window = s.initial_window_size as i64;
             // Our encoder must not exceed the peer's decoder table size.
-            this.encoder.set_capacity(s.header_table_size as i64);
+            this.codec.limit_encoder_table(s.header_table_size as i64);
             // Acknowledge.
             this.conn.queue_h2_frame(frame::FRAME_SETTINGS, frame::FLAG_ACK, 0,
                                      Slice::from_raw(null as u8*, 0))?;
@@ -496,7 +512,10 @@ type struct Http2Connection<S> {
             }
         }
 
-        const built: Option<Response> = build_response(&this.decoder, block.as_slice(), body);
+        const built: Option<Response> = match (this.codec.decode(block.as_slice())) {
+            Option::Some(fields) => { build_response(fields, body) }
+            Option::None         => { mem::drop(body); Option::None }
+        };
         mem::drop(block);
         match (built) {
             Option::Some(resp) => { return Result::Ok(resp); }
@@ -600,7 +619,10 @@ type struct Http2Connection<S> {
             }
         }
 
-        const built: Option<Request> = build_request(&this.decoder, block.as_slice(), body);
+        const built: Option<Request> = match (this.codec.decode(block.as_slice())) {
+            Option::Some(fields) => { build_request(fields, body) }
+            Option::None         => { mem::drop(body); Option::None }
+        };
         mem::drop(block);
         match (built) {
             Option::Some(req) => {
@@ -653,10 +675,10 @@ type struct Http2Connection<S> {
 
     encode_request_headers(mut &this, out: mut &Array<u8>, req: &Request,
                            scheme: Str, authority: Str) -> void {
-        this.encoder.encode_field(out, Str::new(":method"), req.method.as_str(), false);
-        this.encoder.encode_field(out, Str::new(":scheme"), scheme, false);
-        this.encoder.encode_field(out, Str::new(":path"), req.path.as_str(), false);
-        this.encoder.encode_field(out, Str::new(":authority"), authority, false);
+        this.codec.encode_field(out, Str::new(":method"), req.method.as_str(), false);
+        this.codec.encode_field(out, Str::new(":scheme"), scheme, false);
+        this.codec.encode_field(out, Str::new(":path"), req.path.as_str(), false);
+        this.codec.encode_field(out, Str::new(":authority"), authority, false);
         this.encode_regular_headers(out, &req.headers);
     }
 
@@ -664,12 +686,13 @@ type struct Http2Connection<S> {
         mut buf: [u8; 5];
         const code: u64 = resp.status.as_u16() as u64;
         const digits: i64 = code.to_decimal_buf(&buf[0]);
-        this.encoder.encode_field(out, Str::new(":status"), Str::from_raw(&buf[0], digits), false);
+        this.codec.encode_field(out, Str::new(":status"), Str::from_raw(&buf[0], digits), false);
         this.encode_regular_headers(out, &resp.headers);
     }
 
     /// Emit every stored header except the HTTP/1-only connection-
-    /// specific fields that are forbidden in HTTP/2 (RFC 7540 section 8.1.2.2).
+    /// specific fields that are forbidden in HTTP/2 (RFC 7540 section 8.1.2.2),
+    /// a credential as sensitive.
     encode_regular_headers(mut &this, out: mut &Array<u8>, h: &Headers) -> void {
         const count: u64 = h.inner.bucket_count();
         mut i: u64 = 0;
@@ -679,7 +702,7 @@ type struct Http2Connection<S> {
                 if (node == null) { break; }
                 const name: Str = node.key.as_str();
                 if (!is_skippable(name)) {
-                    this.encoder.encode_field(out, name, node.value.as_str(), false);
+                    this.codec.encode_field(out, name, node.value.as_str(), is_credential(name));
                 }
                 node = node.next;
             }
@@ -688,9 +711,8 @@ type struct Http2Connection<S> {
     }
 }
 
-implement<S> trait Drop for struct Http2Connection<S> {
-    /// The HPACK encoder/decoder tables and the transport are released by
-    /// their fields. The connection owns the transport, so dropping this
+implement<S, C> trait Drop for struct Http2Connection<S, C> where C: HeaderCodec {
+    /// The codec and the transport are released by their fields. The connection owns the transport, so dropping this
     /// closes the socket.
     drop(mut &this) -> void { }
 }
@@ -713,14 +735,10 @@ function preface_bytes() -> Slice<u8> {
     return magic.as_bytes();
 }
 
-/// Build a `Response` from a decoded header block and body. Consumes
-/// `body`.
-private function build_response(decoder: mut &HpackDecoder, block: Slice<u8>, body: Array<u8>) -> Option<Response> {
+/// Build a `Response` from a decoded header block's fields and a body, or
+/// none when the fields carry no `:status`. Consumes both.
+function build_response(fields: Array<HeaderField>, body: Array<u8>) -> Option<Response> {
     mut body_local: Array<u8> = body;
-    mut fields: Array<HeaderField> = match (decoder.decode(block)) {
-        Option::Some(f) => { f }
-        Option::None    => { mem::drop(body_local); return Option::None; }
-    };
 
     mut code: u16 = 0;
     mut have_status: boolean = false;
@@ -761,14 +779,10 @@ private function build_response(decoder: mut &HpackDecoder, block: Slice<u8>, bo
     return Option::Some(resp);
 }
 
-/// Build a `Request` from a decoded header block and body. Consumes
-/// `body`.
-private function build_request(decoder: mut &HpackDecoder, block: Slice<u8>, body: Array<u8>) -> Option<Request> {
+/// Build a `Request` from a decoded header block's fields and a body, or
+/// none when the fields carry no `:method` or `:path`. Consumes both.
+function build_request(fields: Array<HeaderField>, body: Array<u8>) -> Option<Request> {
     mut body_local: Array<u8> = body;
-    mut fields: Array<HeaderField> = match (decoder.decode(block)) {
-        Option::Some(f) => { f }
-        Option::None    => { mem::drop(body_local); return Option::None; }
-    };
 
     mut method: Option<Method> = Option::None;
     mut path: Option<String> = Option::None;
@@ -895,6 +909,17 @@ function is_skippable(name_lower: Str) -> boolean {
     if (name_lower.equals(&Str::new("proxy-connection"))) { return true; }
     if (name_lower.equals(&Str::new("transfer-encoding"))) { return true; }
     if (name_lower.equals(&Str::new("upgrade"))) { return true; }
+    return false;
+}
+
+/// True for the header fields that carry a credential (RFC 7541 section
+/// 7.1.3): stored in a compression table, a guessable one could be
+/// recovered by a peer that can watch the table's effect on block sizes.
+private function is_credential(name_lower: Str) -> boolean {
+    if (name_lower.equals(&Str::new("authorization"))) { return true; }
+    if (name_lower.equals(&Str::new("proxy-authorization"))) { return true; }
+    if (name_lower.equals(&Str::new("cookie"))) { return true; }
+    if (name_lower.equals(&Str::new("set-cookie"))) { return true; }
     return false;
 }
 
