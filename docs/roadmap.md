@@ -414,7 +414,8 @@ Left over from that: the async entry point calls `Executor::new` and
    `collections::raw_buffer` is public, `RawBuffer` with private fields,
    and so is `alloc::heap`, as the allocator `NativeHeap` with its raw
    calls internal (589).  `Array`'s, `HashMap`'s and `Pool`'s own grow
-   helpers are private, and `String`'s buffer is a private field.  HPACK
+   helpers are private, `String`'s buffer is a private field, and so are
+   `Layout`'s size and alignment, behind its accessors.  HPACK
    is tested through `Http2Connection` against RFC 7541's examples, and
    the heap through `GlobalAlloc` with `native_alloc` on and as the
    allocator of an array, a hash map and a string without it.  An `internal module` line now hides its
