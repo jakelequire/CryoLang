@@ -1200,7 +1200,7 @@ while (i < 10) {
 
 ### 6.3 For Loops
 
-A C-style `for` with three components: declare-initialiser, condition, post-update. The loop variable is scoped to the loop body.
+A C-style `for` with three components: declare-initialiser, condition, post-update. The loop variable is scoped to the loop body. The post-update is an expression statement, run at the end of every iteration that reaches the back edge (after a `continue` too, never after a `break`), so a value it displaces by assignment, or an owning result it discards, is released there as at any other statement (see [section 15.2](#152-the-drop-trait)).
 
 ```cryo
 import std::fmt::{ printf };
@@ -3135,10 +3135,13 @@ implement trait Drop for Buffer {
 }
 ```
 
-Implementing `Drop` declares "I own resources that must be released." The compiler **automatically synthesises drop calls** for non-`Copy` `const`/`mut` bindings - the analyzer + synthesizer run unconditionally between `MoveCheck` and `TypeLowering`. A value is released at two points:
+Implementing `Drop` declares "I own resources that must be released." The compiler **automatically synthesises drop calls** for non-`Copy` `const`/`mut` bindings - the analyzer + synthesizer run unconditionally between `MoveCheck` and `TypeLowering`. A value is released at three points:
 
 - **Scope exit**, in reverse declaration order, at every exit from the declaring scope (block end, early `return`, `break`, `continue`).
 - **Assignment over a live value**: `x = new_value` releases whatever `x` held. Without this every reassignment of an owning type leaks the previous value, without bound in a loop.
+- **A discarded result**: an expression statement whose value is owning - a call result nobody binds, such as the option `o.replace(v)` hands back - releases it at the end of the statement.
+
+The last two are released at the statement that performs them, and every statement counts as one wherever it stands: a braceless loop body or `if` branch, and a `for` loop's update clause, release exactly as they would inside braces.
 
 Auto-drop covers `const x: T = ...` and `mut x: T = ...` declarations, and members of such a local reached by field or constant-index access (`x.f`, `x[0]`). It does **not** yet cover pattern bindings (`match` arms).
 

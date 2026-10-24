@@ -394,8 +394,9 @@ Left over from that: the async entry point calls `Executor::new` and
    generic type (`Pair<i64, Str>`, `Option<T>`) is emitted with every
    instantiation whose bound holds, as each of its other methods is,
    where `fmt<W>` was instantiated only when called: the compiler's code
-   grew by about a thirtieth.  Emitting a specialization's methods only
-   when called would take it back.
+   grew by about a thirtieth and the library archive by about a
+   twentieth, accepted for now (delegated).  "A generic type's methods
+   emitted only when called" below would take it back.
 3. **Every item marked.**  About 650 helpers used only in their own
    module become `private`; about 215 used across the library become
    `internal`; implementation modules become `internal module`:
@@ -408,6 +409,18 @@ Left over from that: the async entry point calls `Executor::new` and
    rewritten through the public API, or deleted where they pinned only
    an internal.  Anything borderline is listed for Jake rather than
    hidden.
+
+## A generic type's methods emitted only when called
+
+Every method of every specialization of a generic type is emitted, called
+or not, wherever its bound holds: `Array`'s unused indexing methods, and
+since `Display` and `Debug` stopped being generic, a `fmt` for every
+instantiation of `Option`, `Result`, `Pair` and the rest.  Emitting only
+the methods something reaches takes that code back for every
+specialization, not only formatting's.  It needs reachability over every
+reference to a specialization's method - codegen's own synthesized calls,
+trait-object tables and drop glue among them - where a missed one is a
+link failure.
 
 ## One dynamic array type
 
@@ -429,9 +442,8 @@ alike first.  What stays open:
   desugared there.
 - **Every method of an instantiated generic is emitted**, `Array`'s
   eleven `index` and `element_at` among them, used or not: about 1% of a
-  stripped binary.  Emitting only the used ones needs reachability over
-  every reference to a specialization's methods, codegen's own synthesized
-  calls among them, where a missed one is a link failure (373: accepted).
+  stripped binary (373: accepted); see "A generic type's methods emitted
+  only when called".
 - **The written spelling reaches declaration mismatches only.**  An
   argument mismatch shows the parameter as `[T]` even where the parameter
   was written `Array<T>`: the check holds the types, not the annotations.

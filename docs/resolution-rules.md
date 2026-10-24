@@ -144,6 +144,16 @@ yet is recorded with the change that builds it, not here.
      (`E0315`).  A method's object parameter takes a converting argument as
      a function's does.  (Jake; where the table is emitted, delegated)
 
+584. **A `for` loop's update clause is a statement, and every
+     control-flow child is walked as one.**  The update is an expression
+     statement run at the end of each iteration that reaches the back
+     edge; every pass, the async lowering among them, handles it as the
+     statement it is, so a value it displaces by assignment and an owning
+     result it discards are released there.  A braceless loop body, `if`
+     branch or statement arm releases what it displaces or discards
+     exactly as it would in braces.  (Jake: the update a statement;
+     braceless children, delegated)
+
 ### 2026-10-23
 
 575. **Every length, position and size in the standard library is an

@@ -1,0 +1,186 @@
+// A `for` loop's update clause is a statement run at the end of every
+// iteration that reaches the back edge, and a braceless loop body or branch
+// is a statement like any other: a value either one displaces by assignment,
+// and an owning result either one discards, is released there, in a function
+// that never suspends and in an async one alike.
+//
+// Every case logs one digit per event into `fu_log`: a destructor appends its
+// value's tag, the body appends 9 where it stands after the loop or branch.
+//
+// `main` prints how many checks passed and exits 0 only when all did.
+namespace ForUpdateAndBracelessBodyRelease::Main;
+
+import std::fmt;
+import std::core::drop::{ Drop };
+import std::core::option::{ Option };
+import std::future;
+import std::future::ready::{ PendingThenReady };
+
+mut fu_log: i64 = 0;
+
+function fu_mark(digit: i64) -> void {
+    fu_log = fu_log * 10 + digit;
+}
+
+type struct Ticker {
+    tag: i64;
+}
+
+implement trait Drop for struct Ticker {
+    drop(mut &this) -> void {
+        fu_mark(this.tag);
+    }
+}
+
+function ticker(tag: i64) -> Ticker {
+    return Ticker { tag: tag };
+}
+
+async function pause() -> i64 {
+    return await PendingThenReady::<i64>::new(1, 0);
+}
+
+async function ticker_later(tag: i64) -> Ticker {
+    const _x: i64 = await pause();
+    return ticker(tag);
+}
+
+function update_assigns() -> void {
+    mut t: Ticker = ticker(1);
+    mut i: i64 = 0;
+    for (i = 0; i < 1; t = ticker(2)) { i = i + 1; }
+    fu_mark(9);
+}
+
+function update_discards() -> void {
+    mut o: Option<Ticker> = Option::Some(ticker(1));
+    for (mut i: i64 = 0; i < 1; o.replace(ticker(2))) { i = i + 1; }
+    fu_mark(9);
+}
+
+function update_assigns_twice() -> void {
+    mut t: Ticker = ticker(1);
+    for (mut i: i64 = 0; i < 2; t = ticker(i + 2)) { i = i + 1; }
+    fu_mark(9);
+}
+
+function update_skipped_by_break() -> void {
+    mut t: Ticker = ticker(1);
+    for (mut i: i64 = 0; i < 5; t = ticker(2)) { break; }
+    fu_mark(9);
+}
+
+function braceless_loop_body_discards() -> void {
+    mut o: Option<Ticker> = Option::Some(ticker(1));
+    for (mut i: i64 = 0; i < 1; i++) o.replace(ticker(2));
+    fu_mark(9);
+}
+
+function braceless_branch_discards(go: boolean) -> void {
+    mut o: Option<Ticker> = Option::Some(ticker(1));
+    if (go) o.replace(ticker(2));
+    fu_mark(9);
+}
+
+function braceless_else_if_discards(first: boolean) -> void {
+    mut o: Option<Ticker> = Option::Some(ticker(1));
+    if (first) fu_mark(5); else if (!first) o.replace(ticker(2));
+    fu_mark(9);
+}
+
+async function async_update_assigns() -> void {
+    mut t: Ticker = ticker(1);
+    for (mut i: i64 = 0; i < 1; t = ticker(2)) {
+        const _x: i64 = await pause();
+        i = i + 1;
+    }
+    fu_mark(9);
+}
+
+async function async_update_discards() -> void {
+    mut o: Option<Ticker> = Option::Some(ticker(1));
+    for (mut i: i64 = 0; i < 1; o.replace(ticker(2))) {
+        const _x: i64 = await pause();
+        i = i + 1;
+    }
+    fu_mark(9);
+}
+
+async function async_update_awaits() -> void {
+    mut t: Ticker = ticker(1);
+    for (mut i: i64 = 0; i < 1; t = await ticker_later(2)) { i = i + 1; }
+    fu_mark(9);
+}
+
+async function async_carried_update_assigns() -> void {
+    mut t: Ticker = ticker(1);
+    const _x: i64 = await pause();
+    for (mut i: i64 = 0; i < 1; t = ticker(2)) { i = i + 1; }
+    fu_mark(9);
+}
+
+async function async_carried_update_discards() -> void {
+    mut o: Option<Ticker> = Option::Some(ticker(1));
+    const _x: i64 = await pause();
+    for (mut i: i64 = 0; i < 1; o.replace(ticker(2))) { i = i + 1; }
+    fu_mark(9);
+}
+
+async function async_braceless_loop_body_discards() -> void {
+    mut o: Option<Ticker> = Option::Some(ticker(1));
+    const _x: i64 = await pause();
+    for (mut i: i64 = 0; i < 1; i++) o.replace(ticker(2));
+    fu_mark(9);
+}
+
+function fu_check(name: string, want_log: i64) -> i32 {
+    if (fu_log == want_log) { return 1; }
+    fmt::println(f"FAIL {name}: log {fu_log}, expected {want_log}");
+    return 0;
+}
+
+function main() -> i32 {
+    mut passed: i32 = 0;
+    fu_log = 0;
+    update_assigns();
+    passed += fu_check("update_releases_the_displaced_value", 192);
+    fu_log = 0;
+    update_discards();
+    passed += fu_check("update_releases_its_discarded_result", 192);
+    fu_log = 0;
+    update_assigns_twice();
+    passed += fu_check("update_releases_on_every_iteration", 1394);
+    fu_log = 0;
+    update_skipped_by_break();
+    passed += fu_check("update_skipped_by_break_keeps_the_first_value", 91);
+    fu_log = 0;
+    braceless_loop_body_discards();
+    passed += fu_check("braceless_loop_body_releases_its_discarded_result", 192);
+    fu_log = 0;
+    braceless_branch_discards(true);
+    passed += fu_check("braceless_branch_releases_its_discarded_result", 192);
+    fu_log = 0;
+    braceless_else_if_discards(false);
+    passed += fu_check("braceless_else_if_releases_its_discarded_result", 192);
+    fu_log = 0;
+    future::block_on(async_update_assigns());
+    passed += fu_check("async_update_releases_the_displaced_value", 192);
+    fu_log = 0;
+    future::block_on(async_update_discards());
+    passed += fu_check("async_update_releases_its_discarded_result", 192);
+    fu_log = 0;
+    future::block_on(async_update_awaits());
+    passed += fu_check("async_update_with_an_await_releases_the_displaced_value", 192);
+    fu_log = 0;
+    future::block_on(async_carried_update_assigns());
+    passed += fu_check("async_update_releases_a_carried_displaced_value", 192);
+    fu_log = 0;
+    future::block_on(async_carried_update_discards());
+    passed += fu_check("async_update_over_a_carried_local_releases_its_result", 192);
+    fu_log = 0;
+    future::block_on(async_braceless_loop_body_discards());
+    passed += fu_check("async_braceless_loop_body_releases_its_discarded_result", 192);
+    fmt::println(f"for_update_and_braceless_body_release: {passed} of 13 passed");
+    if (passed != 13) { return 1; }
+    return 0;
+}

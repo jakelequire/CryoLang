@@ -1354,8 +1354,8 @@ type struct DropInserter {
 
         mut then_diverges: boolean = false;
         if (it.then_stmt != null) {
-            it.then_stmt = this.wrap_for_init(this.wrap_early_exit(it.then_stmt));
-            then_diverges = this.walk_stmt_in_place(it.then_stmt);
+            it.then_stmt = this.as_child_block(it.then_stmt);
+            then_diverges = this.walk_block(it.then_stmt);
         }
         const then_keys:  [u64] = this.moves_since_keys(snap);
         const then_lines: [i32] = this.moves_since_lines(snap);
@@ -1364,8 +1364,8 @@ type struct DropInserter {
 
         mut else_diverges: boolean = false;
         if (it.else_stmt != null) {
-            it.else_stmt = this.wrap_for_init(this.wrap_early_exit(it.else_stmt));
-            else_diverges = this.walk_stmt_in_place(it.else_stmt);
+            it.else_stmt = this.as_child_block(it.else_stmt);
+            else_diverges = this.walk_block(it.else_stmt);
         }
         const else_keys:  [u64] = this.moves_since_keys(snap);
         const else_lines: [i32] = this.moves_since_lines(snap);
@@ -1388,8 +1388,10 @@ type struct DropInserter {
 
     /// If `stmt` is a bare early-exit (return/break/continue), wrap it
     /// in a synthesized block so the block walker can splice cumulative
-    /// drops before it.  Otherwise return the stmt unchanged.  The
-    /// parser produces bare statements for `if (c) return;` shapes.
+    /// drops before it.  Otherwise return the stmt unchanged.  Only a
+    /// match-expression arm needs this: any other braceless body there is
+    /// the arm's value, and every other control-flow child goes through
+    /// `as_child_block`.
     wrap_early_exit(mut &this, stmt: Stmt*) -> Stmt* {
         if (stmt == null) { return stmt; }
         const exits: boolean = match (stmt.kind) {
@@ -1417,8 +1419,8 @@ type struct DropInserter {
         this.loop_boundary.push(this.scope_start_idx.length());
         this.branch_depth += 1;
         if (w.body != null) {
-            w.body = this.wrap_for_init(this.wrap_early_exit(w.body));
-            this.walk_stmt_in_place(w.body);
+            w.body = this.as_child_block(w.body);
+            this.walk_block(w.body);
         }
         this.branch_depth -= 1;
         this.loop_boundary.pop();
@@ -1431,8 +1433,8 @@ type struct DropInserter {
         this.loop_boundary.push(this.scope_start_idx.length());
         this.branch_depth += 1;
         if (w.body != null) {
-            w.body = this.wrap_for_init(this.wrap_early_exit(w.body));
-            this.walk_stmt_in_place(w.body);
+            w.body = this.as_child_block(w.body);
+            this.walk_block(w.body);
         }
         this.branch_depth -= 1;
         this.loop_boundary.pop();
@@ -1455,13 +1457,16 @@ type struct DropInserter {
         this.loop_boundary.push(this.scope_start_idx.length());
         this.branch_depth += 1;
         if (f.body != null) {
-            f.body = this.wrap_for_init(this.wrap_early_exit(f.body));
-            this.walk_stmt_in_place(f.body);
+            f.body = this.as_child_block(f.body);
+            this.walk_block(f.body);
         }
         // The update runs only after an iteration that reaches the back
         // edge, zero or more times, so it belongs with the body, as
         // MoveCheck walks it.
-        if (f.update != null) { this.walk_expr_read(f.update); }
+        if (f.update != null) {
+            f.update = this.as_child_block(f.update);
+            this.walk_block(f.update);
+        }
         this.branch_depth -= 1;
         this.loop_boundary.pop();
         this.restore_moves(snap);
@@ -1474,8 +1479,8 @@ type struct DropInserter {
         this.loop_boundary.push(this.scope_start_idx.length());
         this.branch_depth += 1;
         if (l.body != null) {
-            l.body = this.wrap_for_init(this.wrap_early_exit(l.body));
-            this.walk_stmt_in_place(l.body);
+            l.body = this.as_child_block(l.body);
+            this.walk_block(l.body);
         }
         this.branch_depth -= 1;
         this.loop_boundary.pop();
@@ -1684,16 +1689,16 @@ type struct DropInserter {
             // attributed to this arm and joined conditionally, and pattern
             // bindings it reads are seen as live.
             if (arm.guard != null) { this.walk_expr_read(arm.guard); }
-            arm.body = this.wrap_early_exit(arm.body);
-            // Statement arms only: a value arm's braceless body IS the yielded
-            // value, so block-wrapping it would swallow the arm's result.
-            if (!is_expr) { arm.body = this.wrap_for_init(arm.body); }
+            // A value arm's braceless body IS the yielded value, so
+            // block-wrapping it would swallow the arm's result: only an early
+            // exit there is wrapped.
+            arm.body = if (is_expr) { this.wrap_early_exit(arm.body) } else { this.as_child_block(arm.body) };
             const flag_before: boolean =
                 subj_sym.is_valid() && this.get_drop_flag(subj_sym.key()).is_valid();
             const arm_div: boolean = if (is_expr) {
                 this.walk_stmt_in_place_value(arm.body)
             } else {
-                this.walk_stmt_in_place(arm.body)
+                this.walk_block(arm.body)
             };
             const arm_keys:  [u64] = this.moves_since_keys(snap);
             const arm_lines: [i32] = this.moves_since_lines(snap);
@@ -1832,31 +1837,7 @@ type struct DropInserter {
         return false;
     }
 
-    /// Walk a statement in place; used by control-flow walkers that
-    /// don't rebuild a parent statement list.  For block statements
-    /// this recurses into walk_block; for non-block statements we wrap
-    /// it in a 1-element list and let walk_stmt_into route correctly.
-    /// Walk a statement that lives as a child of a control-flow node
-    /// (then/else of an if, body of a while, arm of a match, ...) without
-    /// rebuilding a parent statement list.  Returns the divergence flag
-    /// of the statement.  Bare early-exit branches should already have
-    /// been wrapped in a synthesized block by walk_if/etc. via
-    /// wrap_early_exit, so by the time we get here the statement is
-    /// either a Block or a non-early-exit shape.
-    walk_stmt_in_place(mut &this, stmt: Stmt*) -> boolean {
-        if (stmt == null) { return false; }
-        return match (stmt.kind) {
-            StmtKind::Block(_) => {
-                this.walk_block(stmt)
-            }
-            _ => {
-                mut throwaway: [Stmt*] = [];
-                this.walk_stmt_into(stmt, &throwaway)
-            }
-        };
-    }
-
-    /// `walk_stmt_in_place` for a match-*expression* arm body: a block
+    /// Walk a match-*expression* arm body: a block
     /// goes through `walk_value_block` (so the arm's trailing expression
     /// is treated as the yielded value), and a bare un-blocked expression
     /// statement is itself that value, walked in move context.
@@ -3398,7 +3379,7 @@ type struct DropInserter {
                     this.disq_scan_expr(init_var.initializer);
                 }
                 this.disq_scan_expr(f.condition);
-                this.disq_scan_expr(f.update);
+                this.collect_init_disqualifiers(f.update);
                 this.collect_init_disqualifiers(f.body);
             }
             StmtKind::Loop(l) => {
@@ -3849,26 +3830,6 @@ type struct DropInserter {
         return if_stmt;
     }
 
-    /// Cheap syntactic over-approximation of "this assignment might displace a
-    /// value that has to be released": a plain `=` whose destination is a
-    /// projection chain over a live droppable local.  Used only to decide
-    /// whether a braceless control-flow body needs block-wrapping, where a
-    /// false positive costs an empty block and a false negative loses the
-    /// release, so it deliberately answers before the moved-set is consulted.
-    assignment_may_displace(&this, expr: ExpressionNode*) -> boolean {
-        const b: BinaryExpr* = ExpressionNode::binary_of(expr);
-        if (b == null) { return false; }
-        if (b.op.kind != TokenType::Equal || b.left == null) { return false; }
-        mut kind: [u8]  = [];
-        mut key:  [u32] = [];
-        const root: SymbolID = this.collect_place_chain(b.left, &kind, &key);
-        if (!root.is_valid()) { return false; }
-        const slot: i64 = this.innermost_binding_slot(root);
-        if (slot < 0) { return false; }
-        return this.type_needs_drop(this.place_type_of(
-            this.binding_types[slot], &kind, &key, 0, kind.length()));
-    }
-
     /// Wrap `core` in `if (!<flag>) { core... }` so it runs only where the
     /// binding was not moved out.  Negative-polarity twin of
     /// `wrap_in_init_guard`; `make_conditional_drop_call` is the single-drop
@@ -3892,61 +3853,22 @@ type struct DropInserter {
         return if_stmt;
     }
 
-    /// Block-wrap a braceless control-flow body that assigns a
-    /// conditionally-initialized droppable local, so the `<flag> = true;`
-    /// synthesized after the assignment lands in a rebuilt statement list
-    /// instead of a throwaway (which `walk_stmt_in_place` uses for non-block
-    /// bodies).  Blocks already rebuild, so they pass through untouched.
-    wrap_for_init(mut &this, stmt: Stmt*) -> Stmt* {
+    /// A control-flow child statement - a branch, a loop body, a statement
+    /// arm, a `for`'s update - as the block it is walked as: itself when it
+    /// has braces, else a block holding it.  Walking a statement adds
+    /// statements around it (the release of a value it displaces or
+    /// discards, the drop flag it sets, the drops before an early exit), and
+    /// those need a statement list of the child's own to land in.  The
+    /// wrapping block emits nothing.
+    as_child_block(&this, stmt: Stmt*) -> Stmt* {
         if (stmt == null) { return stmt; }
         match (stmt.kind) {
             StmtKind::Block(_) => { return stmt; }
             _ => {}
         }
-        if (!this.stmt_assigns_tracked_init(stmt)) { return stmt; }
         const block: Stmt* = Stmt::block(stmt.span);
         block.as_block().statements.push(stmt);
         return block;
-    }
-
-    /// True if `stmt` (recursively) contains a plain assignment to a
-    /// conditionally-initialized droppable local currently in scope.
-    stmt_assigns_tracked_init(&this, stmt: Stmt*) -> boolean {
-        if (stmt == null) { return false; }
-        match (stmt.kind) {
-            StmtKind::Expr(e) => {
-                if (this.init_flag_for_assignment_target(e.expression).is_valid()) {
-                    return true;
-                }
-                // A release synthesized for an unconditionally-live
-                // destination carries no flag, so the check above misses it -
-                // and a braceless body is walked into a throwaway buffer,
-                // which would discard the release along with the copy it
-                // depends on.  Wrapping is inert, so answer on the syntax.
-                return this.assignment_may_displace(e.expression);
-            }
-            StmtKind::Block(b) => {
-                for (mut i: i64 = 0; i < b.statements.length(); i++) {
-                    if (this.stmt_assigns_tracked_init(b.statements[i])) { return true; }
-                }
-                return false;
-            }
-            StmtKind::If(it) => {
-                if (this.stmt_assigns_tracked_init(it.then_stmt)) { return true; }
-                return it.else_stmt != null &&
-                       this.stmt_assigns_tracked_init(it.else_stmt);
-            }
-            StmtKind::While(w)   => { return this.stmt_assigns_tracked_init(w.body); }
-            StmtKind::DoWhile(d) => { return this.stmt_assigns_tracked_init(d.body); }
-            StmtKind::For(f)     => { return this.stmt_assigns_tracked_init(f.body); }
-            StmtKind::Loop(l)    => { return this.stmt_assigns_tracked_init(l.body); }
-            StmtKind::UnsafeBlock(u) => {
-                return u.block != null && this.stmt_assigns_tracked_init(u.block);
-            }
-            // A match's arms, and a declaration's initializer, are not looked into.
-            StmtKind::Match(_) | StmtKind::StaticMatch(_) | StmtKind::Decl(_) | StmtKind::Return(_)
-            | StmtKind::Asm(_) | StmtKind::Break | StmtKind::Continue => { return false; }
-        }
     }
 
     /// Rewrite a call to the `drop_in_place` intrinsic, `drop_in_place::<T>(p)`

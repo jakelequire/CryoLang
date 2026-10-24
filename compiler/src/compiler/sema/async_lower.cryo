@@ -1071,7 +1071,7 @@ type struct AsyncLower {
                 }
                 this.rewrite_returns_expr(f.condition, poll_out, span);
                 this.rewrite_returns(f.body, poll_out, span);
-                this.rewrite_returns_expr(f.update, poll_out, span);
+                this.rewrite_returns(f.update, poll_out, span);
             }
             StmtKind::Loop(l) => {
                 this.rewrite_returns(l.body, poll_out, span);
@@ -1341,7 +1341,7 @@ type struct AsyncLower {
                 return this.expr_await_count(d.condition) + this.stmt_await_count(d.body);
             }
             StmtKind::For(f) => {
-                mut n: i64 = this.expr_await_count(f.condition) + this.expr_await_count(f.update)
+                mut n: i64 = this.expr_await_count(f.condition) + this.stmt_await_count(f.update)
                            + this.stmt_await_count(f.body);
                 if (!f.init.is_null()) {
                     if (DeclarationNode::var_of(f.init.as_decl()) != null) {
@@ -1876,7 +1876,7 @@ type struct AsyncLower {
                     return true;
                 }
                 return this.name_read_in_expr(f.condition, key)
-                    || this.name_read_in_expr(f.update, key)
+                    || this.name_read_in_stmt(f.update, key)
                     || this.name_read_in_stmt(f.body, key);
             }
             StmtKind::Loop(l) => { return this.name_read_in_stmt(l.body, key); }
@@ -2332,7 +2332,7 @@ type struct AsyncLower {
                     }
                 }
                 f.condition = this.subst_name_expr(f.condition, key, field, struct_ref, ty, span, false);
-                f.update    = this.subst_name_expr(f.update, key, field, struct_ref, ty, span, false);
+                this.subst_nested_stmt(f.update, key, field, struct_ref, ty, span);
                 this.subst_nested_stmt(f.body, key, field, struct_ref, ty, span);
             }
             StmtKind::Loop(l) => {
@@ -3954,15 +3954,8 @@ type struct AsyncLower {
         sm.loop_scope.pop();
         if (!sm.ok) { return cur; }
         if (!this.stmt_diverges(f.body)) { this.sm_goto(sm, body_end, update_state); }
-        mut update_end: i64 = update_state;
-        if (f.update != null) {
-            const hu: HoistedExpr = this.lower_hoisted(sm, f.update, update_state);
-            if (!sm.ok) { return cur; }
-            update_end = hu.end;
-            if (hu.expr != null) {
-                sm.blocks[update_end].as_block().add_statement(Stmt::expr_stmt(hu.expr, span));
-            }
-        }
+        const update_end: i64 = this.lower_branch_sm(sm, f.update, update_state);
+        if (!sm.ok) { return cur; }
         this.sm_goto(sm, update_end, header);
         return after;
     }
@@ -3971,10 +3964,10 @@ type struct AsyncLower {
     /// chain starting at `at`, and hand back what remains of `e` together with
     /// the state it must be evaluated in.
     ///
-    /// A loop's condition and update are rewritten HERE rather than by the
-    /// pre-lowering hoist because both are re-evaluated every iteration: lifting
-    /// them out to before the loop would run them once, and `continue` has to
-    /// re-enter them — which is exactly what their own state already is.
+    /// A loop's condition is rewritten HERE rather than by the pre-lowering
+    /// hoist because it is re-evaluated every iteration: lifting it out to
+    /// before the loop would run it once, and `continue` has to re-enter it —
+    /// which is exactly what its own state already is.
     lower_hoisted(mut &this, sm: PollSm*, e: ExpressionNode*, at: i64) -> HoistedExpr {
         if (e == null || this.expr_await_count(e) == 0) {
             return HoistedExpr { expr: e, end: at };
@@ -4318,7 +4311,7 @@ type struct AsyncLower {
                 if (r != 0) { return r; }
                 r = this.stmt_first_use(f.body, key);
                 if (r != 0) { return r; }
-                return this.expr_first_use(f.update, key);
+                return this.stmt_first_use(f.update, key);
             }
             StmtKind::Loop(l) => { return this.stmt_first_use(l.body, key); }
             StmtKind::Match(m) => {
@@ -4551,7 +4544,7 @@ type struct AsyncLower {
                 }
                 this.mark_last_use_expr(f.condition, key, false, out);
                 this.mark_last_use_stmt(f.body, key, out);
-                this.mark_last_use_expr(f.update, key, false, out);
+                this.mark_last_use_stmt(f.update, key, out);
             }
             StmtKind::Loop(l) => {
                 this.mark_last_use_stmt(l.body, key, out);
@@ -6439,9 +6432,10 @@ type struct AsyncLower {
             }
             StmtKind::For(f) => {
                 // The initializer runs once, before the loop, so what it lifts
-                // belongs ahead of the whole `for`. The condition and the update run
-                // per iteration and are rewritten during lowering instead, inside
-                // the states `continue` re-enters.
+                // belongs ahead of the whole `for`. The update is a statement run
+                // per iteration, so what it lifts stays inside it, as a body's
+                // does. The condition is rewritten during lowering instead,
+                // inside the state `continue` re-enters.
                 if (!f.init.is_null()) {
                     if (DeclarationNode::var_of(f.init.as_decl()) != null) {
                         mut vd: VarDecl* = DeclarationNode::var_of(f.init.as_decl());
@@ -6450,6 +6444,7 @@ type struct AsyncLower {
                         f.init = Node::Expr(this.hoist_toplevel(f.init.as_expr(), &pre));
                     }
                 }
+                f.update = this.hoist_branch(f.update);
                 f.body = this.hoist_branch(f.body);
             }
             // One holding an `await`, `break` or `continue` is refused by the
@@ -6875,7 +6870,7 @@ type struct AsyncLower {
                     }
                 }
                 this.rn_expr(map, f.condition);
-                this.rn_expr(map, f.update);
+                this.rn_stmt(map, f.update);
                 this.rn_stmt(map, f.body);
             }
             StmtKind::Loop(l) => { this.rn_stmt(map, l.body); }
@@ -7189,7 +7184,7 @@ type struct AsyncLower {
                     }
                 }
                 this.rb_expr(ctx, f.condition);
-                this.rb_expr(ctx, f.update);
+                this.rb_scoped(ctx, f.update);
                 this.rb_scoped(ctx, f.body);
                 this.rb_leave(ctx);
             }
