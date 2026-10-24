@@ -50,7 +50,9 @@ it without breaking existing code.
 - **Carried values live in place.** A value held across a suspension is built directly into its
   `Option<T>` field and stays there for the life of the future; it is reached through a pointer
   rather than moved in and out per state. A state that hands the value away takes it
-  (`take().unwrap()`); a state that rebuilds it republishes the field.
+  (`take().unwrap()`); a state that rebuilds it stores the new value with `replace(value)`, whose
+  result - the option it displaced - is an owning temporary, released as any discarded one is, so a
+  reassignment releases the displaced value wherever the same assignment over a live local does.
 - **A `&this` / `mut &this` receiver is re-addressed before every poll.** An async method stores the
   receiver's address in a `this$recv` field, and an owning receiver promoted across states is taken
   into a fresh block-local on each poll - so the address legitimately changes. The frame re-writes

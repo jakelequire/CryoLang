@@ -191,6 +191,12 @@ yet is recorded with the change that builds it, not here.
      that state's part of the scope, and then the carried ones; a
      completion `return` releases the carried values after the returned
      value is produced and after the stack locals it leaves.  (Jake)
+582. **`Option` has `replace(mut &this, value: T) -> Option<T>`, public
+     API and a language item.**  It stores `Some(value)` and returns the
+     previous option, the sole owner of what it held.  An async local
+     carried in its future is reassigned through it, wherever the
+     assignment stands, so the displaced value is released as an
+     assignment over a live local releases it.  (Jake)
 
 ### 2026-10-22
 

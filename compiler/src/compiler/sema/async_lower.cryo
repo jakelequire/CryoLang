@@ -2059,22 +2059,24 @@ type struct AsyncLower {
                 // place being written, which reaches into the value rather
                 // than handing it over.
                 b.right = this.subst_name_expr(b.right, key, field, struct_ref, ty, span, true);
-                // Rebuilding the whole carried value republishes the field
-                // rather than writing through the pointer, because the field
-                // may be EMPTY here: a state that handed the value away and
-                // then reclaims it (`l = accepted.take_listener()`) has nothing
-                // to write through. An assignment that is a statement of its
-                // own also releases the value it displaces (`release_displaced`);
-                // one nested in a larger expression has no statement to place
-                // that release in, and the displaced value is not released.
+                // Assigning the whole carried value stores it through
+                // `replace` rather than writing through the pointer, because
+                // the field may be EMPTY here: a state that handed the value
+                // away and then reclaims it (`l = accepted.take_listener()`)
+                // has nothing to write through.  `replace` hands back the
+                // option it displaces, an owning temporary released as any
+                // discarded one is - after the new value is evaluated, which
+                // may still read the old one - so the displaced value is
+                // released wherever an assignment over a live local releases
+                // it.  An emptied carrier hands back `None`, and releases
+                // nothing.
                 if (this.subst_carrier_armed() && this.name_is_whole_place(b.left, key)) {
-                    b.right = this.option_some(b.right, this.subst_carrier_opt, span);
-                    b.left  = this.carrier_field_expr(span);
-                    e.set_resolved_type(this.subst_carrier_opt);
+                    const stored: ExpressionNode* = this.method_call1(this.carrier_field_expr(span),
+                        LangItem::OptionReplace, b.right, this.subst_carrier_opt, span);
                     // The value lives in its field again, so later mentions go
                     // back to reaching it there.
                     this.subst_hoist_name = SymbolStr::empty();
-                    return e;
+                    return stored;
                 }
                 b.left  = this.subst_name_expr(b.left, key, field, struct_ref, ty, span, false);
                 return e;
@@ -2285,10 +2287,6 @@ type struct AsyncLower {
         if (s == null) { return; }
         match (s.kind) {
             StmtKind::Expr(es) => {
-                if (this.subst_carrier_armed() && this.reassigns_whole(es.expression, key)) {
-                    this.release_displaced(s, es, key, field, struct_ref, ty, span);
-                    return;
-                }
                 es.expression = this.subst_name_expr(es.expression, key, field, struct_ref, ty, span,
                                                      false);
             }
@@ -2362,45 +2360,6 @@ type struct AsyncLower {
             }
             StmtKind::Asm(_) | StmtKind::Break | StmtKind::Continue => {}
         }
-    }
-
-    /// True when `e` is `<name> = …`, assigning the whole carried value.
-    reassigns_whole(&this, e: ExpressionNode*, key: SymbolID) -> boolean {
-        if (e == null) { return false; }
-        const b: BinaryExpr* = ExpressionNode::binary_of(e);
-        if (b == null || b.op.kind != TokenType::Equal) { return false; }
-        return this.name_is_whole_place(b.left, key);
-    }
-
-    /// Rewrite the statement `<name> = <value>;` over a carried value into
-    ///
-    ///     { mut <new> = <value>; this.<carrier>.take(); this.<carrier> = Some(<new>); }
-    ///
-    /// so the value it displaces is released, as an assignment over a live
-    /// local releases it: after the new value is evaluated, which may still
-    /// read the old one, and before it is stored. A carrier emptied by a
-    /// give-away takes `None` and releases nothing.
-    release_displaced(mut &this, s: Stmt*, es: ExprStmt*, key: SymbolID, field: SymbolStr,
-                      struct_ref: TypeRef, ty: TypeRef, span: SourceSpan) -> void {
-        const b: BinaryExpr* = ExpressionNode::binary_of(es.expression);
-        const value: ExpressionNode* =
-            this.subst_name_expr(b.right, key, field, struct_ref, ty, span, true);
-        const fresh: MintedLocal = this.mint_temp("__new");
-        mut replaced: Stmt* = Stmt::block(span);
-        replaced.as_block().add_statement(
-            this.var_decl_stmt_bound(fresh.name, fresh.sym, true, ty, value, span));
-        replaced.as_block().add_statement(Stmt::expr_stmt(
-            this.method_call0(this.carrier_field_expr(span), LangItem::OptionTake,
-                              this.subst_carrier_opt, span), span));
-        b.right = this.option_some(this.ident_bound(fresh.name, fresh.sym, ty, span),
-                                   this.subst_carrier_opt, span);
-        b.left  = this.carrier_field_expr(span);
-        es.expression.set_resolved_type(this.subst_carrier_opt);
-        replaced.as_block().add_statement(Stmt::expr_stmt(es.expression, span));
-        s.kind = replaced.kind;
-        // The value lives in its field again, so later mentions go back to
-        // reaching it there.
-        this.subst_hoist_name = SymbolStr::empty();
     }
 
     /// The variable declared by a top-level `const/mut x = …;` statement
