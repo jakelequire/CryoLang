@@ -619,10 +619,20 @@ type struct TypeUtils {
     /// on `equals` and the call site materializes a temporary.  That is this
     /// predicate's purpose at a CALL; a plain `=` must not ask it, and asks
     /// `indirection_spelling_compatible` instead.
+    ///
+    /// A reference parameter borrows a value of its referent's type whatever
+    /// that type is, a pointer among them: `T*` binds `&T*`.  Peeling both
+    /// sides would compare `T` with `T*` there.  A pointer parameter is not
+    /// widened the same way, since a `T**` is how a callee writes a pointer
+    /// back, and a temporary would swallow the write.
     indirection_compatible(&this, arg_ty: TypeRef, param_ty: TypeRef) -> boolean {
         const a_peeled: TypeRef = this.peel_indirection(arg_ty);
         const p_peeled: TypeRef = this.peel_indirection(param_ty);
         if (!a_peeled.is_valid() && !p_peeled.is_valid()) { return false; }
+        const param_t: Type* = this.arena.lookup(param_ty);
+        if (param_t != null && param_t.kind == TypeKind::Reference && this.checker.is_same_type(arg_ty, p_peeled)) {
+            return true;
+        }
         const a_in: TypeRef = if (a_peeled.is_valid()) { a_peeled } else { arg_ty };
         const p_in: TypeRef = if (p_peeled.is_valid()) { p_peeled } else { param_ty };
         return this.checker.is_same_type(a_in, p_in);
@@ -663,7 +673,7 @@ type struct TypeUtils {
         const ty: Type* = this.arena.lookup(t);
         if (ty == null) { return false; }
         if (ty.kind == TypeKind::Void) { return false; }
-        return this.arg_type_part_is_concrete(t);
+        return this.arg_type_part_is_concrete(t, false);
     }
 
     /// Whether every part of `t` names a settled type - one a mismatch can be
@@ -679,7 +689,10 @@ type struct TypeUtils {
     /// where the question is instead "can this pin a type variable?" - left a
     /// callback field or parameter accepting any value at all, and the failure is
     /// a call through the slot into whatever was stored there.
-    arg_type_part_is_concrete(&this, t: TypeRef) -> boolean {
+    ///
+    /// An instantiation not yet minted is settled only when `unminted` is
+    /// true, and then only when each of its arguments is.
+    arg_type_part_is_concrete(&this, t: TypeRef, unminted: boolean) -> boolean {
         if (!t.is_valid()) { return false; }
         const ty: Type* = this.arena.lookup(t);
         if (ty == null) { return false; }
@@ -687,60 +700,63 @@ type struct TypeUtils {
         if (ty.kind == TypeKind::FunctionTemplate) { return false; }
         if (ty.kind == TypeKind::AssocProjection)  { return false; }
         if (ty.kind == TypeKind::Pointer) {
-            return this.arg_type_part_is_concrete(ty.as_pointer().pointee);
+            return this.arg_type_part_is_concrete(ty.as_pointer().pointee, unminted);
         }
         if (ty.kind == TypeKind::Reference) {
-            return this.arg_type_part_is_concrete(ty.as_reference().referent);
+            return this.arg_type_part_is_concrete(ty.as_reference().referent, unminted);
         }
         if (ty.kind == TypeKind::Array) {
-            return this.arg_type_part_is_concrete(ty.as_array().element);
+            return this.arg_type_part_is_concrete(ty.as_array().element, unminted);
         }
         if (ty.kind == TypeKind::Optional) {
-            return this.arg_type_part_is_concrete(ty.as_optional().wrapped);
+            return this.arg_type_part_is_concrete(ty.as_optional().wrapped, unminted);
         }
         if (ty.kind == TypeKind::Tuple) {
             const tt: TupleType* = ty.as_tuple();
             for (mut i: i64 = 0; i < tt.elements.length(); i++) {
-                if (!this.arg_type_part_is_concrete(tt.elements[i])) { return false; }
+                if (!this.arg_type_part_is_concrete(tt.elements[i], unminted)) { return false; }
             }
             return true;
         }
         if (ty.kind == TypeKind::Function) {
             const ft: FunctionType* = ty.as_function();
             for (mut i: i64 = 0; i < ft.param_types.length(); i++) {
-                if (!this.arg_type_part_is_concrete(ft.param_types[i])) { return false; }
+                if (!this.arg_type_part_is_concrete(ft.param_types[i], unminted)) { return false; }
             }
-            return this.arg_type_part_is_concrete(ft.return_type);
+            return this.arg_type_part_is_concrete(ft.return_type, unminted);
         }
         if (ty.kind == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = ty.as_instantiated();
-            if (!inst.has_resolved_type()) { return false; }
+            if (inst.has_resolved_type()) { return true; }
+            if (!unminted || inst.type_args.length() == 0) { return false; }
+            for (mut i: i64 = 0; i < inst.type_args.length(); i++) {
+                if (!this.arg_type_part_is_concrete(inst.type_args[i], unminted)) { return false; }
+            }
+            return true;
         }
         if (ty.kind == TypeKind::Object) {
             const args: [TypeRef] = ty.as_object().args;
             for (mut i: i64 = 0; i < args.length(); i++) {
-                if (!this.arg_type_part_is_concrete(args[i])) { return false; }
+                if (!this.arg_type_part_is_concrete(args[i], unminted)) { return false; }
             }
         }
         return true;
     }
 
-    /// Whether `t` names one type a generic enum constructor's instantiation
-    /// can be inferred from: a settled type, or an instantiation not yet
-    /// minted whose arguments each name one type.  Before monomorphization
-    /// `String<GlobalAlloc>` is such an instantiation, and it names one type
-    /// as surely as its specialization does; an argument that is a parameter,
-    /// or holds one, names none.
+    /// Whether `t` names one type: a settled type, or one whose
+    /// instantiations not yet minted each have arguments that name one
+    /// type.  Before monomorphization `String<GlobalAlloc>` is such an
+    /// instantiation, and it names one type as surely as its specialization
+    /// does - and so does `&String<GlobalAlloc>`, so the rule holds through
+    /// every pointer, reference and other compound, or an argument of that
+    /// type is never judged.  An argument that is a parameter, or holds one,
+    /// names none.
     arg_type_names_one_type(&this, t: TypeRef) -> boolean {
-        if (this.arg_type_is_concrete(t)) { return true; }
+        if (!t.is_valid()) { return false; }
         const ty: Type* = this.arena.lookup(t);
-        if (ty == null || ty.kind != TypeKind::InstantiatedType) { return false; }
-        const inst: InstantiatedType* = ty.as_instantiated();
-        if (inst.has_resolved_type() || inst.type_args.length() == 0) { return false; }
-        for (mut i: i64 = 0; i < inst.type_args.length(); i++) {
-            if (!this.arg_type_names_one_type(inst.type_args[i])) { return false; }
-        }
-        return true;
+        if (ty == null) { return false; }
+        if (ty.kind == TypeKind::Void) { return false; }
+        return this.arg_type_part_is_concrete(t, true);
     }
 
     /// Structural equality of two parameter-type lists by length and arena id;

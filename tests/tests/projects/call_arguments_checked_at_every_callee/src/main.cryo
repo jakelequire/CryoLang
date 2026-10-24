@@ -1,0 +1,122 @@
+// A call's arguments are checked against its callee's parameters, and an
+// argument converts to a trait object, whatever the callee is: a function
+// named, a static method, a function value held in a local or
+// returned by a call, or an enum variant whose instance is the enum itself,
+// the expected type's or the one written on the path.
+//
+// Each case passes a value to a trait-object parameter and calls through the
+// object; one that was not converted reads the value's first words as the
+// object's table and crashes, or returns what is not its total.
+//
+// `main` prints how many checks passed and exits 0 only when all did.
+namespace CallArgumentsCheckedAtEveryCallee::Main;
+
+import std::fmt;
+
+type trait Sink {
+    put(mut &this, v: i64) -> i64;
+}
+
+type struct Tally {
+    total: i64;
+}
+
+implement trait Sink for struct Tally {
+    put(mut &this, v: i64) -> i64 {
+        this.total = this.total + v;
+        return this.total;
+    }
+}
+
+type struct Holder {
+    sink: virtual mut &Sink;
+
+    static new(sink: virtual mut &Sink) -> Holder { return Holder { sink: sink }; }
+
+    put(mut &this, v: i64) -> i64 { return this.sink.put(v); }
+}
+
+type enum Slot {
+    Empty;
+    Full(virtual mut &Sink);
+}
+
+type enum Either<L, R> {
+    Left(L);
+    Right(R);
+}
+
+function put_one(sink: virtual mut &Sink) -> i64 {
+    return sink.put(1);
+}
+
+function put_through_raw(sink: virtual Sink*) -> i64 {
+    unsafe { return sink.put(1); }
+}
+
+function pick() -> (virtual mut &Sink) -> i64 {
+    return put_one;
+}
+
+function is_set(p: &i64*) -> boolean {
+    return *p != null;
+}
+
+mut checks_run: i64 = 0;
+mut checks_passed: i64 = 0;
+
+function check(name: string, ok: boolean) -> void {
+    checks_run += 1;
+    if (ok) {
+        checks_passed += 1;
+    } else {
+        fmt::printf("FAIL %s\n", name);
+    }
+}
+
+function main() -> i32 {
+    mut t: Tally = Tally { total: 0 };
+    check("function argument", put_one(&t) == 1);
+
+    mut h: Holder = Holder::new(&t);
+    check("static method argument", h.put(1) == 2);
+
+    const raw: Tally* = &t;
+    check("raw object argument", put_through_raw(raw) == 3);
+
+    const local_fn: (virtual mut &Sink) -> i64 = put_one;
+    check("call through a local function value", local_fn(&t) == 4);
+
+    check("call through a computed function value", pick()(&t) == 5);
+
+    const slot: Slot = Slot::Full(&t);
+    match (slot) {
+        Slot::Full(s) => { check("variant of a non-generic enum", s.put(1) == 6); }
+        Slot::Empty => { check("variant of a non-generic enum", false); }
+    }
+
+    mut maybe: Option<virtual mut &Sink> = Option::None;
+    maybe = Option::Some(&t);
+    match (maybe) {
+        Option::Some(s) => { check("variant whose instance the expected type names", s.put(1) == 7); }
+        Option::None => { check("variant whose instance the expected type names", false); }
+    }
+
+    const written: Either<virtual mut &Sink, i64> = Either::<virtual mut &Sink, i64>::Left(&t);
+    match (written) {
+        Either::Left(s) => { check("variant whose instance the path names", s.put(1) == 8); }
+        Either::Right(_) => { check("variant whose instance the path names", false); }
+    }
+
+    // A reference parameter borrows a value of its referent's type, a
+    // pointer among them.
+    mut x: i64 = 5;
+    const p: i64* = &x;
+    check("pointer borrowed for a reference to a pointer", is_set(p));
+    const borrow_fn: (&i64*) -> boolean = is_set;
+    check("pointer borrowed through a function value", borrow_fn(p));
+
+    fmt::printf("call_arguments_checked_at_every_callee: %lld of %lld passed\n", checks_passed, checks_run);
+    if (checks_passed != checks_run) { return 1; }
+    return 0;
+}

@@ -1228,7 +1228,7 @@ type struct CallResolver {
                     return ovl_ret;
                 }
             }
-            return this.resolve_direct_call(call_e, call, ident);
+            return this.resolve_direct_call(visitor, call_e, call, ident);
         }
         const callee_member: MemberAccessExpr* = ExpressionNode::member_access_of(callee_node);
         if (callee_member != null) {
@@ -1293,7 +1293,9 @@ type struct CallResolver {
         // A computed callee was typed above; a call through a function value
         // has that function's return type, as a call through a local does.
         if (computed_fn.is_valid()) {
-            return this.arena.lookup(computed_fn).as_function().return_type;
+            const computed_signature: FunctionType* = this.arena.lookup(computed_fn).as_function();
+            this.check_call_against_signature(visitor, call_e, call, "the called function value", computed_signature);
+            return computed_signature.return_type;
         }
         if (computed_type.is_valid()) {
             this.refuse_call_of_non_function(call.callee.span, computed_type);
@@ -2388,17 +2390,27 @@ type struct CallResolver {
         }
         const ft_raw: Type* = this.arena.lookup(overloads[0]);
         if (ft_raw == null || ft_raw.kind != TypeKind::Function) { return; }
-        const ft: FunctionType* = ft_raw.as_function();
+        this.check_call_against_signature(visitor, call_e, call,
+            fmt::format("function `%s`", this.intern.resolve(ident.name)), ft_raw.as_function());
+    }
+
+    /// The arguments of a call whose callee has the one signature `ft`,
+    /// checked against it: their count, then each against its parameter.
+    /// A function called by its name and a function value - a local, a
+    /// global, a computed callee - are checked here alike, since a value's
+    /// signature binds its arguments as surely as a declaration's.
+    /// `callee_text` names the callee in a count diagnostic.
+    check_call_against_signature(mut &this, visitor: SemaVisitor*, call_e: ExpressionNode*, call: CallExpr*,
+                                 callee_text: string, ft: FunctionType*) -> void {
         // A variadic callee's declared parameters are parameters: each must
         // be supplied and each is checked against its declared type.  Only
         // the tail past them is unconstrained.
         const expected: i64 = ft.param_types.length();
         const got: i64 = call.arguments.length();
         if (got < expected) {
-            const name: string = this.intern.resolve(ident.name);
             mut diag: Diagnostic = Diagnostic::error(
                 ErrorCode::E0216_TOO_FEW_ARGS,
-                fmt::format("function `%s` takes %s%lld argument(s) but %lld were supplied", name,
+                fmt::format("%s takes %s%lld argument(s) but %lld were supplied", callee_text,
                     if (ft.is_variadic) { "at least " } else { "" }, expected, got));
             diag = diag.at_with_label(call_e.span,
                 fmt::format("missing %lld argument%s", expected - got, if (expected - got == 1) { "" } else { "s" }));
@@ -2420,10 +2432,9 @@ type struct CallResolver {
             return;
         }
         if (got > expected && !ft.is_variadic) {
-            const name: string = this.intern.resolve(ident.name);
             mut diag: Diagnostic = Diagnostic::error(
                 ErrorCode::E0215_TOO_MANY_ARGS,
-                fmt::format("function `%s` takes %lld argument(s) but %lld were supplied", name, expected, got));
+                fmt::format("%s takes %lld argument(s) but %lld were supplied", callee_text, expected, got));
             diag = diag.at_with_label(call_e.span,
                 fmt::format("unexpected argument%s", if (got - expected == 1) { "" } else { "s" }));
             mut anchor_end_line: u32 = 0;
@@ -3494,7 +3505,8 @@ type struct CallResolver {
         return false;
     }
 
-    resolve_direct_call(mut &this, call_e: ExpressionNode*, call: CallExpr*, ident: IdentifierExpr*) -> TypeRef {
+    resolve_direct_call(mut &this, visitor: SemaVisitor*, call_e: ExpressionNode*, call: CallExpr*,
+                        ident: IdentifierExpr*) -> TypeRef {
         // The name layer's own answer for this callee, and the only one asked.
         // A local is a value: when its type is callable, the call's type is
         // that signature's return, whatever global shares the leaf.  A
@@ -3513,6 +3525,8 @@ type struct CallResolver {
                             const fp_t: Type* = this.arena.lookup(fp_local);
                             if (fp_t != null && fp_t.kind == TypeKind::Function) {
                                 call.callee.set_resolved_type(fp_local);
+                                this.check_call_against_signature(visitor, call_e, call,
+                                    fmt::format("`%s`", this.intern.resolve(ident.name)), fp_t.as_function());
                                 return fp_t.as_function().return_type;
                             }
                             // A local is a value, and one of no function type is
@@ -3555,6 +3569,8 @@ type struct CallResolver {
             const g_t: Type* = this.arena.lookup(global_ty);
             if (g_t != null && g_t.kind == TypeKind::Function) {
                 call.callee.set_resolved_type(global_ty);
+                this.check_call_against_signature(visitor, call_e, call,
+                    fmt::format("`%s`", this.intern.resolve(ident.name)), g_t.as_function());
                 return g_t.as_function().return_type;
             }
             this.refuse_call_of_non_function(call.callee.span, global_ty);
@@ -8520,7 +8536,6 @@ type struct CallResolver {
         if (enum_t == null || enum_t.kind != TypeKind::Enum) { return TypeRef::invalid(); }
         if (base.is_valid()) {
             scope_e.set_resolved_type(type_ref);
-            this.check_variant_arguments(scope, call, type_ref);
             return type_ref;
         }
         // Type arguments written on the variant (`Result::Ok::<i32, i32>(4)`)
@@ -8528,7 +8543,6 @@ type struct CallResolver {
         if (scope.generic_args.length() > 0) {
             const written: TypeRef = this.demanded_scope_type(type_ref, &scope.generic_args, scope_e.span);
             scope_e.set_resolved_type(written);
-            this.check_variant_arguments(scope, call, written);
             return written;
         }
         const promoted: TypeRef = this.promote_to_expected_instantiation(type_ref);
@@ -8556,36 +8570,33 @@ type struct CallResolver {
         return promoted;
     }
 
-    /// E0214 at each argument of a variant constructed in `instance` - named
-    /// by type arguments written on the path - that its payload type in that
-    /// instance does not accept.  The payload is the template's with the
-    /// instance's arguments substituted, so `Result::<i32, i32>::Ok("x")` is
-    /// checked against `i32`, not the template's `T`.
-    check_variant_arguments(mut &this, scope: ScopeResolutionExpr*, call: CallExpr*,
-                            instance: TypeRef) -> void {
-        if (call == null || !instance.is_valid()) { return; }
+    /// Whether the scope call `call` constructs an enum variant, and if so
+    /// each argument checked against its payload type in the enum the
+    /// construction made - the instance written on the path, the one the
+    /// expected type or the arguments determined, or a non-generic enum
+    /// itself - exactly as a function's argument is checked against its
+    /// parameter, conversions included.  The payload is the template's
+    /// with the instance's arguments substituted, so
+    /// `Result::<i32, i32>::Ok("x")` is checked against `i32`, not the
+    /// template's `T`.
+    check_variant_arguments(mut &this, visitor: SemaVisitor*, scope: ScopeResolutionExpr*,
+                            call: CallExpr*) -> boolean {
+        const instance: TypeRef = call.callee.resolved_type;
+        if (!instance.is_valid()) { return false; }
         const base: TypeRef = this.types.view_generic_base(instance);
-        if (!base.is_valid()) { return; }
-        const base_t: Type* = this.arena.lookup(base);
-        if (base_t == null || base_t.kind != TypeKind::Enum) { return; }
-        const et: EnumType* = base_t.as_enum();
+        const enum_t: Type* = this.arena.lookup(if (base.is_valid()) { base } else { instance });
+        if (enum_t == null || enum_t.kind != TypeKind::Enum) { return false; }
+        const et: EnumType* = enum_t.as_enum();
         const vi: i64 = et.variant_index(scope.member_name);
-        if (vi < 0) { return; }
-        const args: [TypeRef] = this.types.view_type_args_copy(instance);
-        const payload: [TypeRef] = this.substitute_payload_types(et.variants[vi].payload_types, base, &args);
-        const n: i64 = if (call.arguments.length() < payload.length()) { call.arguments.length() } else { payload.length() };
-        for (mut i: i64 = 0; i < n; i++) {
-            const arg: ExpressionNode* = call.arguments[i];
-            if (arg == null || !arg.resolved_type.is_valid()) { continue; }
-            const want: TypeRef = payload[i];
-            if (!this.types.arg_type_is_concrete(want) || !this.types.arg_type_is_concrete(arg.resolved_type)) { continue; }
-            if (this.checker.can_assign(arg.resolved_type, want)) { continue; }
-            this.diag.emit_type_mismatch_with_value(ErrorCode::E0214_ARGUMENT_MISMATCH, arg.span,
-                want, arg.resolved_type,
-                fmt::format("argument %lld of `%s` is its payload in `%s`", i + 1,
-                    this.intern.resolve(scope.member_name), this.types.type_display_name(instance)),
-                SourceSpan::none(), arg);
-        }
+        if (vi < 0) { return false; }
+        const instance_args: [TypeRef] = this.types.view_type_args_copy(instance);
+        const payload: [TypeRef] = if (base.is_valid()) {
+            this.substitute_payload_types(et.variants[vi].payload_types, base, &instance_args)
+        } else {
+            sema_copy_type_refs(&et.variants[vi].payload_types)
+        };
+        this.check_args_against_params(visitor, &call.arguments, payload.as_slice());
+        return true;
     }
 
     /// E0307 at each recorded variant still typed as its generic enum: no
@@ -9137,6 +9148,7 @@ type struct CallResolver {
                 overloads.push(this.ctx.decl_index.entry_signature(family[i]));
             }
         } else {
+            if (this.check_variant_arguments(visitor, scope, call)) { return; }
             const owner_ty: TypeRef = this.scope_owner_type(call.callee, scope);
             if (this.scope_is_generic_template(owner_ty, scope, call)) {
                 this.check_template_static_args(visitor, scope, call);

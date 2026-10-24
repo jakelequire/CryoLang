@@ -408,6 +408,8 @@ function apply(f: (int) -> int, x: int) -> int {
 
 This is how `Option::map`, `Result::and_then`, and the iterator combinators take their callback.
 
+A call through a function value - a parameter, a local, a global, or a value an expression computes, `pick()(x)` - supplies the arguments its type declares and is checked against them as a call of a function by its name is: too few or too many is refused (`E0216`, `E0215`), and so is an argument its parameter does not accept (`E0214`).
+
 A function value can be a named function or a **lambda expression**:
 `(params) -> Ret { body }`. The body is always brace-delimited; each parameter
 and the return type are written out explicitly.
@@ -1841,7 +1843,7 @@ const r: Result<string, int>  = Result::Ok("success");
 
 Each instantiation is an independent type at the machine level; `Option<int>` and `Option<string>` share no runtime representation.
 
-A variant constructs one instantiation, and something must say which: type arguments written on the path (`Option::<i32>::None`, `Result::Ok::<i32, i32>(4)`), the expected type (an annotation, a parameter, a return type), or the variant's own arguments (`Option::Some(42)` is an `Option<i32>`). A variant nothing instantiates - `const n = Option::None;`, or `Result::Ok(1)` with `E` unbound - is refused (`E0307`). Type arguments written on the path also type the payload: `Result::<i32, i32>::Ok("x")` is refused (`E0214`), and in `Option::<u8>::Some(200)` the literal is a `u8`.
+A variant constructs one instantiation, and something must say which: type arguments written on the path (`Option::<i32>::None`, `Result::Ok::<i32, i32>(4)`), the expected type (an annotation, a parameter, a return type), or the variant's own arguments (`Option::Some(42)` is an `Option<i32>`). A variant nothing instantiates - `const n = Option::None;`, or `Result::Ok(1)` with `E` unbound - is refused (`E0307`). A variant's arguments are checked against its payloads in the instantiation it constructs, as a call's are against its parameters, however that instantiation is named and in a non-generic enum too: `Result::<i32, i32>::Ok("x")`, `Option::Some(w)` where an `Option<i64>` is expected and `w` is a struct, and `Slot::Full(w)` for a `Full(i64)` payload are refused (`E0214`). An argument converts there as it does at a parameter, so `Option::Some(&c)` where an `Option<virtual &Shape>` is expected holds a trait object ([section 10.7](#107-trait-objects)), and in `Option::<u8>::Some(200)` the literal is a `u8`.
 
 ### 9.4 Methods on Enums
 
@@ -1866,6 +1868,8 @@ implement enum Option<T> {
     }
 }
 ```
+
+Two of `Option`'s methods move a value out of an option in place, each returning what it held as an `Option` of its own: `take(mut &this)` leaves `None` behind, and `replace(mut &this, value: T)` leaves `Some(value)`. The returned option is the only owner of the previous value, so releasing it - or discarding it, as `slot.replace(next);` does - releases what the option held, and nothing is released twice.
 
 See [section 12](#12-implement-blocks) for the full implement-block grammar.
 
@@ -2338,7 +2342,7 @@ const n: i32 = total([&sq, &r]);                 // 10
 
 **Type arguments.** The trait's arguments are written after its name, `virtual &Conv<i64>`: its type parameters first, then its associated types, each in the order the trait declares it, so `virtual mut &Iterator<i32>` binds `Iterator`'s `Item`. An object writes one argument for each of them, no more and no fewer (`E0307`: "`Iterator` takes 1 type argument in an object type, and 0 are written"). A generic function's parameter is inferred through an object's arguments as through an instantiation's.
 
-**Conversion.** A value becomes an object wherever it is checked against a declared object type - an initializer, an assignment, an argument, a return, a struct-literal field, an array element: `&c` becomes a `virtual &Shape` or a `virtual mut &Shape`, as it becomes a `&Circle` or a `mut &Circle` parameter; a pointer `c_ptr: Circle*` becomes a `virtual Shape*`. The object holds the value's address and the table of its type's implementation of the trait. An object converts to no other object, a reference to no `virtual Shape*`, and a pointer to no borrowed object (`E0200`).
+**Conversion.** A value becomes an object wherever it is checked against a declared object type - an initializer, an assignment, a return, a struct-literal field, an array element, and an argument, whatever the call's callee is: a function, a method, a function value held in a local or computed by an expression, or an enum variant whose payload is the object: `&c` becomes a `virtual &Shape` or a `virtual mut &Shape`, as it becomes a `&Circle` or a `mut &Circle` parameter; a pointer `c_ptr: Circle*` becomes a `virtual Shape*`. The object holds the value's address and the table of its type's implementation of the trait. An object converts to no other object, a reference to no `virtual Shape*`, and a pointer to no borrowed object (`E0200`).
 
 - The value's type must implement the trait, at the object's arguments: its implementation's trait arguments and associated types must be the ones the object writes (`E0315`: "`Square` does not implement `Shape`, so `&Square` cannot become `virtual &Shape`"; "`Square` does not implement `Conv<i32>`, ..." for a `Square` implementing only `Conv<i64>`).
 - A value whose implementation is generic does not convert yet, nor does a value of a type parameter, whose implementation is not known in the generic body (`E0315`).

@@ -1,4 +1,4 @@
-///! Option<T> - is_some/is_none/unwrap/unwrap_or, take, contains.
+///! Option<T> - is_some/is_none/unwrap/unwrap_or, take, replace, contains.
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::OptionT;
@@ -6,6 +6,7 @@ namespace CryoTests::Tests::Stdlib::OptionT;
 import std::core::result::{ Result };
 import std::core::option::{ Option };
 import std::core::cmp;
+import std::core::drop::{ Drop };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::test::error::{ TestError };
@@ -162,6 +163,52 @@ function take_on_non_copy_moves_value() -> Result<(), TestError> {
         Result::Ok(_) => { }
         Result::Err(e) => { return Result::Err(e); }
     }
+    return Result::Ok(());
+}
+
+// `replace` stores `Some(value)` and returns what the option held.
+![test]
+function replace_on_some_returns_previous() -> Result<(), TestError> {
+    mut held: Option<i32> = Option::Some(1);
+    const previous: Option<i32> = held.replace(2);
+    expect_eq(previous.unwrap(), 1)?;
+    expect_eq(held.unwrap(), 2)?;
+    return Result::Ok(());
+}
+
+![test]
+function replace_on_none_returns_none() -> Result<(), TestError> {
+    mut held: Option<i32> = Option::None;
+    const previous: Option<i32> = held.replace(3);
+    expect(previous.is_none(), Str::new("an empty option replaced returns None"))?;
+    expect_eq(held.unwrap(), 3)?;
+    return Result::Ok(());
+}
+
+mut replace_released: i64 = 0;
+
+type struct ReplaceCounted {
+    tag: i64;
+}
+
+implement trait Drop for struct ReplaceCounted {
+    drop(mut &this) -> void {
+        replace_released += this.tag;
+    }
+}
+
+// The displaced value is released once, when the returned option is -
+// here at once, the result being discarded - and the stored one with the
+// option itself.
+![test]
+function replace_releases_displaced_value_once() -> Result<(), TestError> {
+    replace_released = 0;
+    {
+        mut held: Option<ReplaceCounted> = Option::Some(ReplaceCounted { tag: 1 });
+        held.replace(ReplaceCounted { tag: 10 });
+        expect_eq(replace_released, 1)?;
+    }
+    expect_eq(replace_released, 11)?;
     return Result::Ok(());
 }
 
