@@ -859,53 +859,41 @@ implement struct Parser {
         return params;
     }
 
-    /// The type of a by-reference receiver of the type being parsed: inside a
-    /// struct/impl it is `&CurrentType`; inside a trait declaration it
-    /// is `&This`, a placeholder that impl-method resolution rewrites to each
-    /// concrete impl target.  A written `&this` and the receiver given to a
-    /// method that wrote none are typed by this one method.
+    /// The type of a by-reference receiver of the type being parsed: `&This`,
+    /// the type the method is declared on - in a generic type's body or an
+    /// implement block, that type over the parameters the declaration or
+    /// head writes, so every instantiation has the method; in a trait
+    /// declaration, a placeholder that impl-method resolution rewrites to
+    /// each concrete impl target.  It is never the type's NAME: a bare name
+    /// of a type whose every parameter has a default denotes the defaults'
+    /// instantiation, and a receiver spelled that way made the method one of
+    /// that instantiation alone.  A written `&this` and the receiver given
+    /// to a method that wrote none are typed by this one method.
     receiver_type_annotation(is_mutable: boolean, span: SourceSpan) -> TypeAnnotation* {
         mut inner: TypeAnnotation* = null;
-        if (this.current_type_name != "") {
-            const type_name: SymbolStr = this.ctx.intern(this.current_type_name);
-            // The receiver of `implement string { ... }` denotes the
-            // primitive, not a name to look up.  This synthesis runs from
-            // the impl target's TEXT rather than its token, so the token
-            // test that shapes every written annotation cannot be reached
-            // from here; asking the keyword table restores it.  Without
-            // this the receiver is a named annotation no scope can answer,
-            // and it resolves only by falling through a name lookup into
-            // the same primitive table the keyword names directly.
-            if (TokenType::from_keyword(Keyword::new(this.current_type_name)).is_primitive_type()) {
-                const prim_ann: PrimitiveAnnotation* = new PrimitiveAnnotation {
-                    name: type_name,
-                    span: span,
-                };
-                inner = new TypeAnnotation::Primitive(prim_ann);
-            } else if (this.current_type_name == "()") {
-                // The unit target is spelled `()`, which is not a keyword,
-                // so the primitive test above cannot reach it.  A WRITTEN
-                // `()` parses as the empty tuple, and the unit type has no
-                // named form - `ASTTypeSubstituter::rewrite_to_unit` states
-                // the same rule for substitution.  Synthesizing a name here
-                // would give `implement trait Drop for ()` a receiver that
-                // no scope can answer, purely because the receiver is typed
-                // from the target's TEXT rather than its syntax.
-                mut unit_elems: [TypeAnnotation*] = [];
-                const tup_ann: TupleAnnotation* = new TupleAnnotation {
-                    elements: unit_elems,
-                    span:     span,
-                };
-                inner = new TypeAnnotation::Tuple(tup_ann);
-            } else {
-                const named_ann: NamedAnnotation* = new NamedAnnotation {
-                    name: type_name,
-                    span: span,
-                    pre_resolved: TypeRef::invalid(),
-                    res: ResSlot::Pending,
-                };
-                inner = new TypeAnnotation::Named(named_ann);
-            }
+        // The receiver of `implement string { ... }` denotes the
+        // primitive, not a name to look up.  This synthesis runs from
+        // the impl target's TEXT rather than its token, so the token
+        // test that shapes every written annotation cannot be reached
+        // from here; asking the keyword table restores it.
+        if (TokenType::from_keyword(Keyword::new(this.current_type_name)).is_primitive_type()) {
+            const prim_ann: PrimitiveAnnotation* = new PrimitiveAnnotation {
+                name: this.ctx.intern(this.current_type_name),
+                span: span,
+            };
+            inner = new TypeAnnotation::Primitive(prim_ann);
+        } else if (this.current_type_name == "()") {
+            // The unit target is spelled `()`, which is not a keyword,
+            // so the primitive test above cannot reach it.  A WRITTEN
+            // `()` parses as the empty tuple, and the unit type has no
+            // named form - `ASTTypeSubstituter::rewrite_to_unit` states
+            // the same rule for substitution.
+            mut unit_elems: [TypeAnnotation*] = [];
+            const tup_ann: TupleAnnotation* = new TupleAnnotation {
+                elements: unit_elems,
+                span:     span,
+            };
+            inner = new TypeAnnotation::Tuple(tup_ann);
         } else {
             const tt_ann: ThisTypeAnnotation* = new ThisTypeAnnotation { span: span };
             inner = new TypeAnnotation::ThisType(tt_ann);
@@ -969,10 +957,7 @@ implement struct Parser {
 
         // Check for &this parameter (method self reference). Synthesize the
         // reference-to-receiver type annotation so FunctionSignature can
-        // resolve the self parameter: inside a struct/impl the receiver
-        // is `&CurrentType`; inside a trait declaration it is `&This`, a
-        // placeholder that downstream impl-method resolution rewrites to
-        // each concrete impl target.
+        // resolve the self parameter (`receiver_type_annotation`).
         if (this.check(TokenType::Amp) && this.peek_at(1).kind == TokenType::KwThis) {
             this.advance(); // consume '&'
             this.advance(); // consume 'this'

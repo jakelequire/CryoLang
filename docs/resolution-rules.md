@@ -214,6 +214,16 @@ yet is recorded with the change that builds it, not here.
      another package or to an internal module, since spelling that owner
      would only trade E0202 for E0353.  (Jake)
 
+591. **A method's receiver is `This`, never the owner's name.**  `&this`
+     and `mut &this` are typed as the type the method is declared on: a
+     generic type over its own parameters, an `implement` block's target
+     as its head writes it.  The owner's bare name denoted the defaults'
+     instantiation when every parameter of the owner has a default, so
+     each method of `String<A = GlobalAlloc>` and of `implement<A> trait
+     Eq for String<A>` was a method of `String<GlobalAlloc>` alone, and
+     `String<NativeHeap>` had none.  (Jake asked for the fix; the rule
+     follows from 98's `This` naming the enclosing type)
+
 ### 2026-10-23
 
 575. **Every length, position and size in the standard library is an

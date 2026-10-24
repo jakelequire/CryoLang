@@ -1,0 +1,123 @@
+/// A generic type whose every parameter has a default, instantiated with
+/// arguments other than the defaults: its own methods, the methods of a
+/// trait implemented for every instantiation, and its destructor are all
+/// methods of that instantiation.  A failing check prints its number and
+/// the program exits with it.
+namespace AllDefaultGenericOtherArguments::Main;
+
+import std::core::result::{ Result };
+import std::core::ptr::{ NonNull };
+import std::core::cmp::{ Eq };
+import std::core::drop::{ Drop };
+import std::alloc::layout::{ Layout };
+import std::alloc::allocator::{ Allocator, AllocError, GlobalAlloc };
+import std::collections::string::{ String };
+import std::ffi::libc;
+
+mut ALLOCATED: i64 = 0;
+mut RELEASED: i64 = 0;
+mut TALLIES_RELEASED: i64 = 0;
+
+/// An allocator that counts what it hands out and takes back.
+type struct Counting {
+    inner: GlobalAlloc;
+
+    static new() -> Counting {
+        return Counting { inner: GlobalAlloc::new() };
+    }
+}
+
+implement trait Allocator for struct Counting {
+    allocate(mut &this, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+        ALLOCATED = ALLOCATED + 1;
+        return this.inner.allocate(layout);
+    }
+    deallocate(mut &this, ptr: NonNull<u8>, layout: Layout) -> void {
+        RELEASED = RELEASED + 1;
+        this.inner.deallocate(ptr, layout);
+    }
+}
+
+type struct Plain { step: i64; }
+type struct Double { step: i64; }
+
+/// Every parameter defaulted, as `String<A = GlobalAlloc>` is.
+type struct Tally<S = Plain> {
+    step: S;
+    count: i64;
+
+    static with_step(step: S) -> Tally<S> {
+        return Tally::<S> { step: step, count: 0 };
+    }
+
+    bump(mut &this) -> void {
+        this.count = this.count + 1;
+    }
+
+    total(&this) -> i64 {
+        return this.count;
+    }
+}
+
+implement<S> trait Eq for struct Tally<S> {
+    equals(&this, other: &Tally<S>) -> boolean {
+        return this.count == other.count;
+    }
+}
+
+implement<S> trait Drop for struct Tally<S> {
+    drop(mut &this) -> void {
+        TALLIES_RELEASED = TALLIES_RELEASED + 1;
+    }
+}
+
+function fail(check: i32) -> i32 {
+    libc::printf("check %d failed\n", check);
+    return check;
+}
+
+/// Two tallies over a non-default argument, released when this returns.
+function tallies() -> i32 {
+    mut a: Tally<Double> = Tally::<Double>::with_step(Double { step: 2 });
+    mut b: Tally<Double> = Tally::<Double>::with_step(Double { step: 2 });
+    a.bump();
+    a.bump();
+    b.bump();
+    if (a.total() != 2) { return 1; }
+    if (a.equals(&b)) { return 2; }
+    b.bump();
+    if (!a.equals(&b)) { return 2; }
+    return 0;
+}
+
+/// Two strings on the counting allocator, released when this returns.
+function strings() -> i32 {
+    mut first: String<Counting> = String::<Counting>::new_in(Counting::new());
+    mut second: String<Counting> = String::<Counting>::new_in(Counting::new());
+    for (mut i: i64 = 0; i < 40; i++) {
+        first.push_byte(97 + (i % 26) as u8);
+        second.push_byte(97 + (i % 26) as u8);
+    }
+    if (first.length() != 40 || second.length() != 40) { return 4; }
+    if (!first.equals(&second)) { return 5; }
+    second.push_byte(33);
+    if (first.equals(&second)) { return 5; }
+    return 0;
+}
+
+function main() -> i32 {
+    // 1-2. The type's own methods and a trait's, on `Tally<Double>`.
+    const t: i32 = tallies();
+    if (t != 0) { return fail(t); }
+    // 3. Its destructor ran for both.
+    if (TALLIES_RELEASED != 2) { return fail(3); }
+
+    // 4-5. `String` over a program's own allocator: its methods and `Eq`.
+    const s: i32 = strings();
+    if (s != 0) { return fail(s); }
+    // 6. Both strings' storage came from the allocator and went back to it.
+    if (ALLOCATED == 0 || ALLOCATED != RELEASED) { return fail(6); }
+
+    libc::printf("all-default generic over other arguments: 6 of 6 checks passed\n");
+    return 0;
+}

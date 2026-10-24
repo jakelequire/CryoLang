@@ -416,8 +416,8 @@ Left over from that: the async entry point calls `Executor::new` and
    calls internal (589).  `Array`'s, `HashMap`'s and `Pool`'s own grow
    helpers are private, and `String`'s buffer is a private field.  HPACK
    is tested through `Http2Connection` against RFC 7541's examples, and
-   the heap through `GlobalAlloc` with `native_alloc` on and as a
-   collection's allocator without it.  An `internal module` line now hides its
+   the heap through `GlobalAlloc` with `native_alloc` on and as the
+   allocator of an array, a hash map and a string without it.  An `internal module` line now hides its
    module from other packages whichever files a build loads, so the
    standard library's internal modules are refused at the import as a
    dependency's are.

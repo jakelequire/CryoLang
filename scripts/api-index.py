@@ -87,10 +87,20 @@ OUT = os.path.join(ROOT, "docs", "stdlib-api.txt")
 
 NAMESPACE_RE = re.compile(r"^\s*namespace\s+([A-Za-z_][\w:]*)\s*;")
 TYPE_RE = re.compile(
-    r"^\s*(?:(public|private)\s+)?type\s+(struct|enum|union)\s+"
+    r"^\s*(?:(public|private|internal)\s+)?type\s+(struct|enum|union)\s+"
     r"([A-Za-z_]\w*)\s*(<[^{;]*>)?"
 )
-TRAIT_RE = re.compile(r"^\s*(?:(public|private)\s+)?trait\s+([A-Za-z_]\w*)\s*(<[^{;]*>)?")
+TRAIT_RE = re.compile(
+    r"^\s*(?:(public|private|internal)\s+)?type\s+trait\s+([A-Za-z_]\w*)\s*(<[^{;]*>)?"
+)
+# `private:` inside a body: the members after it take that visibility until
+# the next label.
+LABEL_RE = re.compile(r"^\s*(public|private|internal)\s*:\s*$")
+# The start of a function or method whose signature continues on later lines;
+# the lines are joined until its body or `;` opens.
+DECL_START_RE = re.compile(
+    r"^\s*(?:(?:public|private|internal)\s+)?(?:static\s+|function\s+)?[A-Za-z_]\w*\s*(?:<[^(]*>)?\s*\("
+)
 IMPL_RE = re.compile(
     r"^\s*implement\s*(?:<[^>]*>)?\s*trait\s+([A-Za-z_][\w:<>, ]*?)\s+for\s+([^{]+?)\s*\{?\s*$"
 )
@@ -103,15 +113,16 @@ INHERENT_IMPL_RE = re.compile(
     r"^\s*implement\s*(?:<[^>]*>)?\s*(?:(?:struct|enum|union)\s+)?([A-Za-z_]\w*)\s*(?:<[^{]*>)?\s*\{?\s*$"
 )
 FUNC_RE = re.compile(
-    r"^\s*(?:(public|private)\s+)?function\s+([A-Za-z_]\w*)\s*(<[^(]*>)?\s*\(([^)]*)\)"
+    r"^\s*(?:(public|private|internal)\s+)?function\s+([A-Za-z_]\w*)\s*(<[^(]*>)?\s*\(([^)]*)\)"
     r"\s*(?:->\s*([^{;]+?))?\s*[{;]"
 )
 # The type annotation may be left to the initializer.
-CONST_RE = re.compile(r"^\s*(?:(public|private)\s+)?const\s+([A-Z_][A-Z0-9_]*)\s*(?::\s*([^=;]+))?=")
-# A method inside a type body: optional `static`, a name, args, optional return.
+CONST_RE = re.compile(r"^\s*(?:(public|private|internal)\s+)?const\s+([A-Z_][A-Z0-9_]*)\s*(?::\s*([^=;]+))?=")
+# A method inside a type body: optional `static`, a name, args, optional
+# return; a trait's required method ends in `;`.
 METHOD_RE = re.compile(
-    r"^\s*(?:(public|private)\s+)?(static\s+)?([a-z_]\w*)\s*(<[^(]*>)?\s*\(([^)]*)\)"
-    r"\s*(?:->\s*([^{;]+?))?\s*\{"
+    r"^\s*(?:(public|private|internal)\s+)?(static\s+)?([a-z_]\w*)\s*(<[^(]*>)?\s*\(([^)]*)\)"
+    r"\s*(?:->\s*([^{;]+?))?\s*[{;]"
 )
 
 KEYWORDS = {"if", "while", "for", "switch", "match", "return", "else", "catch"}
@@ -149,12 +160,18 @@ def clean_sig(s):
     return re.sub(r"\s+", " ", s.strip()) if s else ""
 
 
+def tag(vis):
+    """The marker an entry is listed with: none for a public one."""
+    return vis if vis in ("private", "internal") else ""
+
+
 def scan_file(path):
     """Return (namespace, [entries]) for one .cryo file."""
     ns = None
     entries = []
     depth = 0
-    type_stack = []          # (name, depth_at_open)
+    type_stack = []          # [name, depth_at_open, current label]
+    pending = ""             # a signature's earlier lines, joined
     in_block_comment = False
 
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
@@ -184,24 +201,42 @@ def scan_file(path):
                 ns = m.group(1)
                 continue
 
+        in_body = bool(type_stack) and type_stack[-1][0] is not None
+        member_depth = depth == 0 or (in_body and depth == type_stack[-1][1] + 1)
+        if in_body and member_depth:
+            m = LABEL_RE.match(code)
+            if m:
+                type_stack[-1][2] = m.group(1)
+                continue
+        # A signature split over lines is matched once its last line is in.
+        # The lines before that hold no braces, so nothing is tracked for them.
+        if pending:
+            code = pending + " " + code.strip()
+            pending = ""
+        if (member_depth and DECL_START_RE.match(code)
+                and not any(c in code for c in "{};")):
+            pending = code
+            continue
+        label = type_stack[-1][2] if in_body else None
+
         opened_type = False
 
         # -- declarations that open a body -------------------------------
         m = TYPE_RE.match(code)
         if m:
             vis, kind, name, generics = m.group(1), m.group(2), m.group(3), m.group(4) or ""
-            entries.append(("type", f"{kind} {name}{clean_sig(generics)}", vis == "private"))
+            entries.append(("type", f"{kind} {name}{clean_sig(generics)}", tag(vis)))
             if "{" in code:
-                type_stack.append((name, depth))
+                type_stack.append([name, depth, None])
                 opened_type = True
 
         if not opened_type:
             m = TRAIT_RE.match(code)
             if m:
                 vis, name, generics = m.group(1), m.group(2), m.group(3) or ""
-                entries.append(("type", f"trait {name}{clean_sig(generics)}", vis == "private"))
+                entries.append(("type", f"trait {name}{clean_sig(generics)}", tag(vis)))
                 if "{" in code:
-                    type_stack.append((name, depth))
+                    type_stack.append([name, depth, None])
                     opened_type = True
 
         if not opened_type:
@@ -209,18 +244,18 @@ def scan_file(path):
             if m:
                 trait = clean_sig(m.group(1))
                 target = IMPL_TARGET_KW_RE.sub("", clean_sig(m.group(2)))
-                entries.append(("impl", f"{target}: implements {trait}", False))
+                entries.append(("impl", f"{target}: implements {trait}", ""))
                 if "{" in code:
                     # Body opens here; suppress method capture inside it -- an
                     # impl's methods belong to the trait, which lists them.
-                    type_stack.append((None, depth))
+                    type_stack.append([None, depth, None])
                 opened_type = True
 
         if not opened_type:
             m = INHERENT_IMPL_RE.match(code)
             if m and m.group(1) != "trait":
                 if "{" in code:
-                    type_stack.append((m.group(1), depth))
+                    type_stack.append([m.group(1), depth, None])
                 opened_type = True
 
         if not opened_type:
@@ -230,9 +265,9 @@ def scan_file(path):
                 sig = f"{name}{clean_sig(generics)}({clean_sig(args)})"
                 if ret:
                     sig += f" -> {clean_sig(ret)}"
-                entries.append(("fn", sig, vis == "private"))
+                entries.append(("fn", sig, tag(vis)))
 
-            elif type_stack and type_stack[-1][0] is not None:
+            elif in_body and member_depth:
                 m = METHOD_RE.match(code)
                 if m and m.group(3) not in KEYWORDS:
                     vis, static, name, generics, args, ret = m.groups()
@@ -241,7 +276,7 @@ def scan_file(path):
                     sig = f"{owner}{joiner}{name}{clean_sig(generics)}({clean_sig(args)})"
                     if ret:
                         sig += f" -> {clean_sig(ret)}"
-                    entries.append(("method", sig, vis == "private"))
+                    entries.append(("method", sig, tag(vis or label)))
 
             # A module's constant is at the top level and a type's directly in
             # the type's body or inherent block; one deeper is a function's
@@ -251,9 +286,9 @@ def scan_file(path):
                 vis, name, ty = m.groups()
                 decl = f"{name}: {clean_sig(ty)}" if ty else name
                 if depth == 0:
-                    entries.append(("const", decl, vis == "private"))
-                elif type_stack and type_stack[-1][0] is not None and depth == type_stack[-1][1] + 1:
-                    entries.append(("const", f"{type_stack[-1][0]}::{decl}", vis == "private"))
+                    entries.append(("const", decl, tag(vis)))
+                elif in_body and depth == type_stack[-1][1] + 1:
+                    entries.append(("const", f"{type_stack[-1][0]}::{decl}", tag(vis or label)))
 
         # -- brace tracking ----------------------------------------------
         depth += code.count("{") - code.count("}")
@@ -363,6 +398,7 @@ def render(by_ns):
     out.append("#   Type.name(...)    instance method")
     out.append("#   name(...)         free function")
     out.append("#   [private]         not reachable from another module")
+    out.append("#   [internal]        reachable only from the standard library")
     out.append("#")
     out.append(f"# {len(by_ns)} namespaces, {total} declarations.")
     out.append("")
@@ -371,20 +407,20 @@ def render(by_ns):
         info = by_ns[ns]
         seen = set()
         rows = []
-        for kind, sig, private in info["entries"]:
+        for kind, sig, vis in info["entries"]:
             key = (kind, sig)
             if key in seen:
                 continue
             seen.add(key)
-            rows.append((ORDER.get(kind, 9), sig, private))
+            rows.append((ORDER.get(kind, 9), sig, vis))
         if not rows:
             continue
         out.append("=" * 78)
         out.append(f"{ns}")
         out.append(f"    {info['file']}")
         out.append("=" * 78)
-        for _, sig, private in sorted(rows, key=lambda r: (r[0], r[1].lower())):
-            out.append(f"  {sig}{'   [private]' if private else ''}")
+        for _, sig, vis in sorted(rows, key=lambda r: (r[0], r[1].lower())):
+            out.append(f"  {sig}{f'   [{vis}]' if vis else ''}")
         out.append("")
 
     return "\n".join(out) + "\n"

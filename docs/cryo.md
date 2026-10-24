@@ -1595,6 +1595,8 @@ type struct Rect {
 
 The receiver shape is part of the signature, so a caller knows whether a method borrows or consumes the receiver without reading the body.
 
+The receiver is the type the method is declared on, `This`. In a generic type's body that is the type over its own parameters, and in an `implement` block the type its head names, so a method of `type struct String<A = GlobalAlloc>` is a method of `String<NativeHeap>` as much as of `String<GlobalAlloc>`, and a method of `implement<A> trait Eq for String<A>` is one of every `String<A>`. A parameter's default never narrows it: the defaults fill a parameter a *use* of the type leaves out, and the receiver is not a use.
+
 A method is reached only by calling it.  `r.area` with no call, where `area` is a method and no field has that name, names no value and is refused (E0204), with a suggestion to write `r.area()`.
 
 #### Struct-destructuring bindings

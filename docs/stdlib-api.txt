@@ -11,8 +11,9 @@
 #   Type.name(...)    instance method
 #   name(...)         free function
 #   [private]         not reachable from another module
+#   [internal]        reachable only from the standard library
 #
-# 155 namespaces, 4505 declarations.
+# 155 namespaces, 4790 declarations.
 
 ==============================================================================
 std::alloc::allocator
@@ -21,14 +22,19 @@ std::alloc::allocator
   enum AllocErrorKind
   struct AllocError
   struct GlobalAlloc
+  trait Allocator
   GlobalAlloc: implements Allocator
   NativeHeap: implements Allocator
   MAX_REALLOC_ALIGN: u64
   alloc(size: u64, align: u64) -> void*
   backend_alloc(layout: Layout) -> void*
   backend_free(ptr: void*, layout: Layout) -> void
+  backend_realloc(ptr: void*, old_layout: Layout, new_layout: Layout) -> void*
   free(ptr: void*, align: u64) -> void
   next_capacity(current: i64, required: i64, min_capacity: i64) -> i64
+  Allocator.allocate(mut &this, layout: Layout) -> Result<NonNull<u8>, AllocError>
+  Allocator.deallocate(mut &this, ptr: NonNull<u8>, layout: Layout) -> void
+  Allocator.reallocate(mut &this, ptr: NonNull<u8>, old_layout: Layout, new_layout: Layout) -> Result<NonNull<u8>, AllocError>
   AllocError.describe(&this) -> Str
   AllocError::new(kind: AllocErrorKind, layout: Layout) -> AllocError
   GlobalAlloc::new() -> GlobalAlloc
@@ -42,6 +48,8 @@ std::alloc::arc
   struct Weak<T, A = GlobalAlloc>
   Arc<T, A>: implements Drop
   Weak<T, A>: implements Drop
+  free_arc_inner<T, A>(inner_ptr: ArcInner<T, A>*) -> void where A: Allocator   [private]
+  release_weak<T, A>(inner_ptr: ArcInner<T, A>*) -> void where A: Allocator   [private]
   Arc.as_ptr(&this) -> T*
   Arc.clone(&this) -> Arc<T, A>
   Arc.downgrade(&this) -> Weak<T, A>
@@ -50,6 +58,7 @@ std::alloc::arc
   Arc.into_raw(mut this) -> ArcInner<T, A>*
   Arc.strong_count(&this) -> u64
   Arc.weak_count(&this) -> u64
+  Arc::decrement_strong_count(p: ArcInner<T, A>*) -> void where A: Allocator
   Arc::from_raw(p: ArcInner<T, A>*) -> Arc<T, A>
   Arc::increment_strong_count(p: ArcInner<T, A>*) -> void
   Arc::new(value: T) -> Arc<T, GlobalAlloc>
@@ -134,10 +143,12 @@ std::alloc::heap
   PAGE: u64   [private]
   SEGMENT_SIZE: u64   [private]
   SMALL_MAX: u64   [private]
+  alloc(size: u64, align: u64) -> void*   [internal]
   class_heads() -> SegmentHeader**   [private]
   class_index(size: u64) -> i64   [private]
   class_size(idx: i64) -> u64   [private]
   die(msg: u8*) -> void   [private]
+  free(ptr: void*) -> void   [internal]
   heap_yield() -> void   [private]
   large_alloc(size: u64, align: u64) -> void*   [private]
   lock() -> void   [private]
@@ -146,6 +157,7 @@ std::alloc::heap
   os_unmap(ptr: u8*, size: u64) -> void   [private]
   owning_segment(ptr: void*, who: u8*) -> SegmentHeader*   [private]
   page_round(n: u64) -> u64   [private]
+  realloc(ptr: void*, old_size: u64, new_size: u64, align: u64) -> void*   [internal]
   take_block(seg: SegmentHeader*) -> void*   [private]
   unlink_segment(seg: SegmentHeader*) -> void   [private]
   unlock() -> void   [private]
@@ -189,6 +201,7 @@ std::alloc::rc
   struct Weak<T, A = GlobalAlloc>
   Rc<T, A>: implements Drop
   Weak<T, A>: implements Drop
+  free_rc_inner<T, A>(inner_ptr: RcInner<T, A>*) -> void where A: Allocator   [private]
   Rc.as_ptr(&this) -> T*
   Rc.clone(&this) -> Rc<T, A>
   Rc.downgrade(&this) -> Weak<T, A>
@@ -234,9 +247,13 @@ std::collections::array
   SORT_INSERTION_CUTOFF: i64
   from_iter<I, T>(it: I) -> Array<T> where I: Iterator<T>
   sort_insertion<T>(ptr: T*, lo: i64, hi: i64) -> void where T: Ord
+  sort_insertion_by<T>(ptr: T*, lo: i64, hi: i64, less: (&T, &T) -> boolean) -> void
   sort_order_pair<T>(ptr: T*, i: i64, j: i64) -> void where T: Ord
+  sort_order_pair_by<T>(ptr: T*, i: i64, j: i64, less: (&T, &T) -> boolean) -> void
   sort_partition<T>(ptr: T*, lo: i64, hi: i64) -> i64 where T: Ord
+  sort_partition_by<T>(ptr: T*, lo: i64, hi: i64, less: (&T, &T) -> boolean) -> i64
   sort_range<T>(ptr: T*, lo: i64, hi: i64) -> void where T: Ord
+  sort_range_by<T>(ptr: T*, lo: i64, hi: i64, less: (&T, &T) -> boolean) -> void
   Array.append(mut &this, source: Slice<T>) -> void where T: Copy
   Array.as_ptr(&this) -> T*
   Array.as_slice(&this) -> Slice<T>
@@ -270,6 +287,7 @@ std::collections::array
   Array.truncate(mut &this, new_length: i64) -> void
   Array.try_append(mut &this, source: Slice<T>) -> Result<(), AllocError> where T: Copy
   Array.try_push(mut &this, value: T) -> Result<(), AllocError>
+  Array.try_resize(mut &this, new_length: i64, value: T) -> Result<(), AllocError> where T: Copy
   Array::new() -> Array<T, GlobalAlloc>
   Array::new_in(alloc: A) -> Array<T, A>
   Array::try_with_capacity_in(capacity: i64, alloc: A) -> Result<Array<T, A>, AllocError>
@@ -302,18 +320,32 @@ std::collections::hashmap
   SEED_GAMMA: u64
   SEED_MIX_1: u64
   SEED_MIX_2: u64
+  alloc_entry<K, V, A>(map: mut &HashMap<K, V, A>, h: u64, key: K, value: V) -> Result<Entry<K, V>*, AllocError> where A: Allocator
+  free_entry<K, V, A>(map: mut &HashMap<K, V, A>, entry: Entry<K, V>*) -> void where A: Allocator
   hash_int(value: u64) -> u64
+  hash_key<K>(key: &K, seed: u64) -> u64 where K: Hash
   hash_str(s: string) -> u64
   next_map_seed() -> u64
   next_pow2(n: u64) -> u64
   HashMap.bucket_count(&this) -> u64
   HashMap.clear(mut &this) -> void
+  HashMap.contains_key(&this, key: &K) -> boolean where K: Hash + Eq
   HashMap.entries(&this) -> implement Iterator<Pair<K*, V*>>
+  HashMap.get(&this, key: &K) -> Option<V> where K: Hash + Eq, V: Copy
   HashMap.get_bucket(&this, index: u64) -> Entry<K, V>*
+  HashMap.get_or_insert(mut &this, key: K, default: V) -> V* where K: Hash + Eq
+  HashMap.get_ref(&this, key: &K) -> Option<V*> where K: Hash + Eq
+  HashMap.insert(mut &this, key: K, value: V) -> Option<V> where K: Hash + Eq
   HashMap.is_empty(&this) -> boolean
+  HashMap.iter(&this) -> implement Iterator<Pair<K, V>> where K: Copy, V: Copy
+  HashMap.keys(&this) -> implement Iterator<K> where K: Copy
   HashMap.keys_ref(&this) -> implement Iterator<K*>
   HashMap.length(&this) -> i64
+  HashMap.remove(mut &this, key: &K) -> Option<V> where K: Hash + Eq
   HashMap.resize_buckets(mut &this, new_count: u64) -> Result<(), AllocError>   [private]
+  HashMap.try_get_or_insert(mut &this, key: K, default: V) -> Result<V*, AllocError> where K: Hash + Eq
+  HashMap.try_insert(mut &this, key: K, value: V) -> Result<Option<V>, AllocError> where K: Hash + Eq
+  HashMap.values(&this) -> implement Iterator<V> where V: Copy
   HashMap.values_ref(&this) -> implement Iterator<V*>
   HashMap::new() -> HashMap<K, V, GlobalAlloc>
   HashMap::new_in(alloc: A) -> HashMap<K, V, A>
@@ -333,9 +365,14 @@ std::collections::hashset
   HashSet<T, GlobalAlloc>: implements Default
   HashSetIter<T>: implements Iterator<T>
   HashSet.clear(mut &this) -> void
+  HashSet.contains(&this, value: &T) -> boolean where T: Hash + Eq
+  HashSet.insert(mut &this, value: T) -> boolean where T: Hash + Eq
   HashSet.is_empty(&this) -> boolean
+  HashSet.iter(&this) -> implement Iterator<T> where T: Copy
   HashSet.iter_ref(&this) -> implement Iterator<T*>
   HashSet.length(&this) -> i64
+  HashSet.remove(mut &this, value: &T) -> boolean where T: Hash + Eq
+  HashSet.try_insert(mut &this, value: T) -> Result<boolean, AllocError> where T: Hash + Eq
   HashSet::new() -> HashSet<T>
   HashSet::new_in(alloc: A) -> HashSet<T, A>
   HashSet::with_capacity(capacity: i64) -> HashSet<T>
@@ -360,6 +397,8 @@ std::collections::raw_buffer
   RawBuffer.capacity(&this) -> i64
   RawBuffer.into_raw(mut this) -> T*
   RawBuffer.ptr(&this) -> T*
+  RawBuffer.reserve(mut &this, used: i64, additional: i64, min_capacity: i64) -> Result<(), AllocError>
+  RawBuffer.reserve_exact(mut &this, used: i64, additional: i64) -> Result<(), AllocError>
   RawBuffer.resize(mut &this, new_capacity: i64) -> Result<(), AllocError>
   RawBuffer.shrink_to(mut &this, target: i64) -> void
   RawBuffer::new() -> RawBuffer<T>
@@ -442,8 +481,9 @@ std::collections::string
   String.length(&this) -> i64
   String.push<T>(mut &this, item: T) -> void
   String.push_byte(mut &this, byte: u8) -> void
-  String.push_one_byte(mut &this, byte: u8) -> Result<(), AllocError>
-  String.push_view_bytes(mut &this, source: Str) -> Result<(), AllocError>
+  String.push_display<D>(mut &this, item: D) -> Result<(), AllocError> where D: Display   [private]
+  String.push_one_byte(mut &this, byte: u8) -> Result<(), AllocError>   [private]
+  String.push_view_bytes(mut &this, source: Str) -> Result<(), AllocError>   [private]
   String.reserve(mut &this, additional: i64) -> Result<(), AllocError>
   String.reserve_exact(mut &this, additional: i64) -> Result<(), AllocError>
   String.shrink_to_fit(mut &this) -> void
@@ -476,10 +516,19 @@ std::core
   unreachable() -> never
 
 ==============================================================================
+std::core::clone
+    stdlib/core/clone.cryo
+==============================================================================
+  trait Clone
+  Clone.clone(&this) -> This
+
+==============================================================================
 std::core::cmp
     stdlib/core/cmp.cryo
 ==============================================================================
   enum Ordering
+  trait Eq
+  trait Ord
   char: implements Ord
   f32: implements Eq
   f32: implements Ord
@@ -499,6 +548,11 @@ std::core::cmp
   u64: implements Ord
   u8: implements Ord
   usize: implements Ord
+  clamp<T>(value: T, lo: T, hi: T) -> T where T: Ord
+  max<T>(a: T, b: T) -> T where T: Ord
+  min<T>(a: T, b: T) -> T where T: Ord
+  Eq.equals(&this, other: &This) -> boolean
+  Ord.compare(&this, other: &This) -> Ordering
   Ordering.is_ge(&this) -> boolean
   Ordering.is_gt(&this) -> boolean
   Ordering.is_le(&this) -> boolean
@@ -510,6 +564,10 @@ std::core::convert
     stdlib/core/convert.cryo
 ==============================================================================
   struct ConversionError
+  trait From<T>
+  trait Into<T>
+  trait TryFrom<T>
+  trait TryInto<T>
   f64: implements From<f32>
   i16: implements From<i8>
   i16: implements From<u8>
@@ -533,6 +591,24 @@ std::core::convert
   u64: implements TryFrom<i64>
   ConversionError.describe(&this) -> Str
   ConversionError::new(reason: string) -> ConversionError
+  From::from(value: T) -> This
+  Into.into(&this) -> T
+  TryFrom::try_from(value: T) -> Result<This, ConversionError>
+  TryInto.try_into(&this) -> Result<T, ConversionError>
+
+==============================================================================
+std::core::default
+    stdlib/core/default.cryo
+==============================================================================
+  trait Default
+  Default::default() -> This
+
+==============================================================================
+std::core::drop
+    stdlib/core/drop.cryo
+==============================================================================
+  trait Drop
+  Drop.drop(mut &this) -> void
 
 ==============================================================================
 std::core::hash
@@ -540,6 +616,8 @@ std::core::hash
 ==============================================================================
   struct DefaultHasher
   struct Fnv128Hasher
+  trait Hash
+  trait Hasher
   boolean: implements Hash
   char: implements Hash
   DefaultHasher: implements Hasher
@@ -561,6 +639,7 @@ std::core::hash
   FNV128_PRIME: u128
   FNV_OFFSET_BASIS: u64
   FNV_PRIME: u64
+  digest<T>(value: &T) -> u64 where T: Hash
   DefaultHasher::from_state(state: u64) -> DefaultHasher
   DefaultHasher::new() -> DefaultHasher
   DefaultHasher::offset_basis() -> u64
@@ -569,6 +648,12 @@ std::core::hash
   Fnv128Hasher.low64(&this) -> u64
   Fnv128Hasher::from_state(state: u128) -> Fnv128Hasher
   Fnv128Hasher::new() -> Fnv128Hasher
+  Hash.hash<H>(&this, hasher: mut &H) -> void where H: Hasher
+  Hasher.finish(&this) -> u64
+  Hasher.fold<T>(mut &this, value: T) -> void
+  Hasher.write_bytes(mut &this, bytes: Slice<u8>) -> void
+  Hasher.write_u8(mut &this, value: u8) -> void
+  Hasher.write_uint(mut &this, value: u128, byte_count: u32) -> void
 
 ==============================================================================
 std::core::intrinsics
@@ -591,6 +676,7 @@ std::core::iter
   struct SkipIter<I>
   struct TakeIter<I>
   struct ZipIter<I, J>
+  trait Iterator
   ChainIter<I, J>: implements Iterator<A>
   EnumerateIter<I>: implements Iterator<Pair<i64, I::Item>>
   FilterIter<I>: implements Iterator<I::Item>
@@ -601,10 +687,34 @@ std::core::iter
   ChainIter::new(first: I, second: J) -> ChainIter<I, J>
   EnumerateIter::new(inner: I) -> EnumerateIter<I>
   FilterIter::new(inner: I, pred: (&I::Item) -> boolean) -> FilterIter<I>
+  Iterator.all(mut &this, pred: (This::Item) -> boolean) -> boolean
+  Iterator.any(mut &this, pred: (This::Item) -> boolean) -> boolean
+  Iterator.chain<J>(this, other: J) -> ChainIter<This, J>
+  Iterator.count(mut &this) -> i64
+  Iterator.enumerate(this) -> EnumerateIter<This>
+  Iterator.filter(this, pred: (&This::Item) -> boolean) -> FilterIter<This>
+  Iterator.find(mut &this, pred: (&This::Item) -> boolean) -> Option<This::Item>
+  Iterator.fold<Acc>(mut &this, initial: Acc, f: (Acc, This::Item) -> Acc) -> Acc
+  Iterator.for_each(mut &this, f: (This::Item) -> void) -> void
+  Iterator.map<B>(this, f: (This::Item) -> B) -> MapIter<This, B>
+  Iterator.max(mut &this) -> Option<This::Item> where This::Item: Ord
+  Iterator.min(mut &this) -> Option<This::Item> where This::Item: Ord
+  Iterator.next(mut &this) -> Option<This::Item>
+  Iterator.skip(this, n: i64) -> SkipIter<This>
+  Iterator.take(this, n: i64) -> TakeIter<This>
+  Iterator.zip<J>(this, other: J) -> ZipIter<This, J>
   MapIter::new(inner: I, f: (I::Item) -> O) -> MapIter<I, O>
   SkipIter::new(inner: I, n: i64) -> SkipIter<I>
   TakeIter::new(inner: I, n: i64) -> TakeIter<I>
   ZipIter::new(first: I, second: J) -> ZipIter<I, J>
+
+==============================================================================
+std::core::marker
+    stdlib/core/marker.cryo
+==============================================================================
+  trait Copy
+  trait Send
+  trait Sync
 
 ==============================================================================
 std::core::mem
@@ -627,10 +737,32 @@ std::core::ops
 ==============================================================================
   struct Range<T>
   struct RangeInclusive<T>
+  trait Add<Rhs, Output>
+  trait Allocate
+  trait BitAnd<Rhs, Output>
+  trait BitNot<Output>
+  trait BitOr<Rhs, Output>
+  trait BitXor<Rhs, Output>
+  trait Deref<Target>
+  trait Div<Rhs, Output>
+  trait Index<Idx, Output>
+  trait Mul<Rhs, Output>
+  trait Neg<Output>
+  trait Not<Output>
+  trait Rem<Rhs, Output>
+  trait Shl<Rhs, Output>
+  trait Shr<Rhs, Output>
+  trait Step
+  trait Sub<Rhs, Output>
   Range<T>: implements Iterator<T>
   RangeInclusive<T>: implements Iterator<T>
+  Allocate::allocate(size: u64, align: u64) -> void*
+  Allocate::release(ptr: void*, align: u64) -> void
+  Deref.deref(&this) -> Target*
+  Index.index(&this, idx: Idx) -> Output*
   Range::new(start: T, end: T) -> Range<T>
   RangeInclusive::new(start: T, end: T) -> RangeInclusive<T>
+  Step.successor(&this) -> This
 
 ==============================================================================
 std::core::option
@@ -867,6 +999,7 @@ std::core::primitives
   u64.to_hex_upper_buf(&this, buffer: u8*) -> i64
   u64.to_oct_buf(&this, buffer: u8*) -> i64
   u64::to_hex_buf_with_table(value: u64, buffer: u8*, digits_table: u8*) -> i64
+  u64::to_hex_padded_buf_with_table(value: u64, buffer: u8*, width: i64, digits_table: u8*) -> i64
   u8.clamp(&this, lo: u8, hi: u8) -> u8
   u8.to_bin_buf(&this, buffer: u8*) -> i64
   u8.to_decimal_buf(&this, buffer: u8*) -> i64
@@ -896,6 +1029,8 @@ std::core::result
   Result<T, E>: implements Eq
   Result.and_then<U>(&this, op: (T) -> Result<U, E>) -> Result<U, E>
   Result.as_ref(&this) -> Result<T*, E*>
+  Result.contains(&this, value: &T) -> boolean where T: Eq
+  Result.contains_err(&this, error: &E) -> boolean where E: Eq
   Result.err(&this) -> Option<E>
   Result.expect(&this, message: string) -> T
   Result.is_err(&this) -> boolean
@@ -930,6 +1065,8 @@ std::core::varargs
     stdlib/core/varargs.cryo
 ==============================================================================
   struct VaArgs
+  trait VaArg
+  VaArg::__pluck(p: void*) -> This
   VaArgs.as_ptr(&this) -> void*
   VaArgs.next<T>(&this) -> T where T: VaArg
   VaArgs::new(va: void*) -> VaArgs
@@ -2236,6 +2373,8 @@ std::fmt::display
     stdlib/fmt/display.cryo
 ==============================================================================
   struct Formatter
+  trait Debug
+  trait Display
   AllocError: implements Debug
   AllocError: implements Display
   Array<T, A>: implements Debug
@@ -2299,6 +2438,8 @@ std::fmt::display
   usize: implements Display
   encode_utf8(scalar: u32, out: u8*) -> i64
   fmt_err(e: FmtError) -> Result<(), FmtError>   [private]
+  format_debug_to_string<T>(value: &T) -> Result<String, FmtError> where T: Debug
+  format_to_string<T>(value: &T) -> Result<String, FmtError> where T: Display
   write_debug_byte(f: mut &Formatter,byte: u8, quote: u8) -> Result<(), FmtError>
   write_debug_scalar(f: mut &Formatter,scalar: u32, quote: u8) -> Result<(), FmtError>
   write_float64(f: mut &Formatter,value: f64) -> Result<(), FmtError>   [private]
@@ -2311,6 +2452,8 @@ std::fmt::display
   write_u64_hex(f: mut &Formatter,value: u64) -> Result<(), FmtError>   [private]
   write_u64_hex_upper(f: mut &Formatter,value: u64) -> Result<(), FmtError>   [private]
   write_u64_oct(f: mut &Formatter,value: u64) -> Result<(), FmtError>   [private]
+  Debug.fmt(&this, f: mut &Formatter) -> Result<(), FmtError>
+  Display.fmt(&this, f: mut &Formatter) -> Result<(), FmtError>
   Formatter.get_writer(&this) -> virtual mut &FmtWrite
   Formatter.write_char(mut &this, c: char) -> Result<(), FmtError>
   Formatter.write_str(mut &this, source: Str) -> Result<(), FmtError>
@@ -2353,6 +2496,9 @@ std::fmt::float
 std::fmt::interp
     stdlib/fmt/interp.cryo
 ==============================================================================
+  fmt_append_debug<T>(out: String, value: &T) -> String where T: Debug
+  fmt_append_display<T>(out: String, value: &T) -> String where T: Display
+  fmt_append_fmt<T>(out: String, value: &T, spec: string) -> String where T: Display
   fmt_append_lit(out: String, text: string) -> String
   fmt_new() -> String
 
@@ -2376,6 +2522,7 @@ std::fmt::spec
   RADIX_OCT: u8
   align_of_byte(b: u8) -> u8
   ascii_hex_upper(buf: u8*, len: i64) -> void
+  fmt_display_body<T>(value: &T, spec: &FmtSpec) -> BodyText where T: Display
   fmt_float_body(val: f64, spec: &FmtSpec) -> BodyText
   fmt_pad(out: mut &String, body: Str, head_len: i64, spec: &FmtSpec) -> void
   fmt_parse_spec(spec: Str) -> FmtSpec
@@ -2393,9 +2540,12 @@ std::fmt::spec
 std::fmt::write
     stdlib/fmt/write.cryo
 ==============================================================================
+  trait FmtWrite
   Stderr: implements FmtWrite
   Stdout: implements FmtWrite
   String<GlobalAlloc>: implements FmtWrite
+  FmtWrite.write_char(mut &this, c: char) -> Result<(), FmtError>
+  FmtWrite.write_str(mut &this, source: Str) -> Result<(), FmtError>
 
 ==============================================================================
 std::fs::dir
@@ -2547,6 +2697,12 @@ std::fs::path
   PathBuf::new() -> PathBuf
 
 ==============================================================================
+std::future
+    stdlib/future/_module.cryo
+==============================================================================
+  block_on<F, R>(fut: F) -> R where F: Future<R>
+
+==============================================================================
 std::future::blocking
     stdlib/future/blocking.cryo
 ==============================================================================
@@ -2599,6 +2755,11 @@ std::future::combinator
   Timeout<F, O>: implements Future<Result<O, Elapsed>>
   Elapsed.deadline_nanos(&this) -> i64
   Elapsed::at(deadline: i64) -> Elapsed
+  Futures::join<A, B, OA, OB>(a: A, b: B) -> Join<A, B, OA, OB> where A: Future<OA>, B: Future<OB>
+  Futures::select<A, B, OA, OB>(a: A, b: B) -> Select<A, B, OA, OB> where A: Future<OA>, B: Future<OB>
+  Futures::timeout<F, O>(dur: Duration, fut: F) -> Timeout<F, O> where F: Future<O>
+  Futures::timeout_at<F, O>(deadline: Instant, fut: F) -> Timeout<F, O> where F: Future<O>
+  Futures::try_join<A, B, T1, T2, E>(a: A, b: B) -> TryJoin<A, B, T1, T2, E> where A: Future<Result<T1, E>>, B: Future<Result<T2, E>>
 
 ==============================================================================
 std::future::executor
@@ -2640,10 +2801,13 @@ std::future::executor
   exec_mtx_lock(b: u8*) -> void   [private]
   exec_mtx_unlock(b: u8*) -> void   [private]
   exec_spawn_worker(inner: ExecInner*, tbuf: u8*) -> i32   [private]
+  poll_boundary(poll_fn: (u8*, u8*, Context*) -> u8, fut: u8*, shared: u8*, cx: Context*, out_panic: PanicInfo*) -> u8
   run_poll(data: u8*) -> void
+  spawn_on<F, O>(inner: ExecInner*, fut: F) -> JoinHandle<O> where F: Future<O>
   task_decref(task: Task*) -> void   [private]
   task_drop_thunk<F>(fut_raw: u8*) -> void
   task_incref(task: Task*) -> void   [private]
+  task_poll_thunk<F, O>(fut_raw: u8*, shared_raw: u8*, cx: Context*) -> u8 where F: Future<O>
   task_wake(data: u8*) -> void
   waker_arc_clone(data: u8*) -> u8*
   waker_arc_drop(data: u8*) -> void
@@ -2653,6 +2817,9 @@ std::future::executor
   ExecInner.drain_cancelled(mut &this) -> void
   ExecInner.enqueue(mut &this, task: Task*) -> void
   ExecInner.take(mut &this) -> Task*
+  Executor.block_on<F, O>(mut &this, root: F) -> O where F: Future<O>
+  Executor.spawn<F, O>(mut &this, fut: F) -> JoinHandle<O> where F: Future<O>
+  Executor.spawn_detached<F, O>(mut &this, fut: F) -> void where F: Future<O>
   Executor::new() -> Executor
   Executor::with_threads(n: u32) -> Executor
   Executor::with_threads_and_blocking(n: u32, blocking: u32) -> Executor
@@ -2662,6 +2829,7 @@ std::future::executor
   JoinHandle.join(mut this) -> Result<O, JoinError>
   Task.drive(mut &this) -> boolean
   Task.finish(mut &this, outcome: u8) -> void
+  Task::new(poll_fn: (u8*, u8*, Context*) -> u8, drop_fn: (u8*) -> void, dispose_fn: (u8*, u8) -> void, fut: u8*, shared: u8*, exec: ExecInner*) -> Task
 
 ==============================================================================
 std::future::poll
@@ -2677,8 +2845,11 @@ std::future::reactor
     stdlib/future/reactor.cryo
 ==============================================================================
   struct AfdOp   [private]
+  struct Reactor   [internal]
   struct Registration   [private]
   struct Timer   [private]
+  INTEREST_READ: u32   [internal]
+  INTEREST_WRITE: u32   [internal]
   REG_BUCKETS: i32   [private]
   RT_MAX_EVENTS: i32   [private]
   afd_base_socket(fd: i32) -> u64   [private]
@@ -2701,6 +2872,25 @@ std::future::reactor
   rt_mtx_unlock(b: u8*) -> void   [private]
   rt_thread_join(tid: u64) -> void   [private]
   rt_thread_spawn(rt: Reactor*) -> u64   [private]
+  rt_wait(rt: Reactor*, out_fds: i32*, out_ready: u32*, max: i32, timeout_ms: i32) -> i32   [private]
+  Reactor.cancel(mut &this, fd: i32, direction: u32) -> void   [internal]
+  Reactor.cancel_timer(mut &this, id: u64) -> void   [internal]
+  Reactor.dispatch(mut &this, fd: i32, ready: u32) -> void   [private]
+  Reactor.find(&this, fd: i32) -> Registration*   [private]
+  Reactor.fire_expired(mut &this, now: i64) -> void   [private]
+  Reactor.insert(mut &this, fd: i32) -> Registration*   [private]
+  Reactor.next_timeout_ms(mut &this, now: i64) -> i32   [private]
+  Reactor.poll_once(mut &this, timeout_ms: i32) -> void   [private]
+  Reactor.register(mut &this, fd: i32, direction: u32, w: Waker) -> void   [internal]
+  Reactor.register_timer(mut &this, deadline: i64, w: Waker) -> u64   [internal]
+  Reactor.remove(mut &this, reg: Registration*) -> void   [private]
+  Reactor.run_once(mut &this) -> void   [private]
+  Reactor::current() -> Reactor*   [internal]
+  Reactor::free(rt: Reactor*) -> void   [internal]
+  Reactor::require() -> Reactor*   [internal]
+  Reactor::set_current(rt: Reactor*) -> void   [internal]
+  Reactor::start() -> Reactor*   [internal]
+  Reactor::stop(rt: Reactor*) -> void   [internal]
 
 ==============================================================================
 std::future::ready
@@ -2729,6 +2919,13 @@ std::future::timer
   Sleep::until(deadline: Instant) -> Sleep
 
 ==============================================================================
+std::future::traits
+    stdlib/future/traits.cryo
+==============================================================================
+  trait Future
+  Future.poll(mut &this, cx: Context*) -> Poll<This::Output>
+
+==============================================================================
 std::future::waker
     stdlib/future/waker.cryo
 ==============================================================================
@@ -2743,6 +2940,7 @@ std::future::waker
   Waker.clone(&this) -> Waker
   Waker.wake(&this) -> void
   Waker.wake_by_ref(&this) -> void
+  Waker::new(wake_fn: (u8*) -> void, clone_fn: (u8*) -> u8*, drop_fn: (u8*) -> void, data: u8*) -> Waker
   Waker::new_nonowning(wake_fn: (u8*) -> void, data: u8*) -> Waker
   Waker::noop() -> Waker
   Waker::replace(slot: Waker*, w: Waker) -> Waker
@@ -2773,6 +2971,8 @@ std::io::buf
   BufReader.consume(mut &this, amount: i64) -> void
   BufReader.fill_buf(mut &this) -> Result<Slice<u8>, IoError>
   BufReader.get_ref(&this) -> R*
+  BufReader::new(reader: R*) -> BufReader<R> where R: Read
+  BufReader::with_capacity(reader: R*, capacity: i64) -> BufReader<R> where R: Read
   BufStream.compact(mut &this) -> void
   BufStream.transport(mut &this) -> S*
   BufStream::of(inner: S) -> BufStream<S>
@@ -2781,7 +2981,11 @@ std::io::buf
   BufWriter.clear(mut &this) -> void
   BufWriter.flush_buffer(mut &this) -> Result<(), IoError>
   BufWriter.get_ref(&this) -> W*
+  BufWriter::new(writer: W*) -> BufWriter<W> where W: Write
+  BufWriter::with_capacity(writer: W*, capacity: i64) -> BufWriter<W> where W: Write
   LineWriter.get_ref(&this) -> W*
+  LineWriter::new(writer: W*) -> LineWriter<W> where W: Write
+  LineWriter::with_capacity(writer: W*, capacity: i64) -> LineWriter<W> where W: Write
 
 ==============================================================================
 std::io::cursor
@@ -2884,11 +3088,38 @@ std::io::traits
 ==============================================================================
   enum SeekFrom
   struct Transfer
+  trait AsyncRead
+  trait AsyncTransport
+  trait AsyncWrite
+  trait Read
+  trait Seek
+  trait Write
   BYTE_CR: u8
   BYTE_LF: u8
   READ_TO_END_CHUNK: i64
+  AsyncRead.buffered(&this) -> Slice<u8>
+  AsyncRead.consume(mut &this, count: i64) -> void
+  AsyncRead.scan_for(&this, delimiter: u8, from: i64) -> i64
+  AsyncRead.take_front(mut &this, count: i64) -> Result<Array<u8>, IoError>
+  AsyncWrite.pending(mut &this) -> Array<u8>*
+  AsyncWrite.queue<T>(mut &this, data: T) -> Result<(), IoError>
+  Read.read(mut &this, buffer: u8*, length: i64) -> Result<i64, IoError>
+  Read.read_all(mut &this, buffer: u8*, length: i64) -> Result<i64, IoError>
+  Read.read_byte(mut &this) -> Result<Option<u8>, IoError>
+  Read.read_char(mut &this) -> Result<Option<u32>, IoError>
+  Read.read_exact(mut &this, buffer: u8*, length: i64) -> Result<(), IoError>
+  Read.read_line(mut &this, out: mut &String) -> Result<i64, IoError>
+  Read.read_to_end(mut &this, out: mut &Array<u8>) -> Result<i64, IoError>
+  Read.read_to_string(mut &this, out: mut &String) -> Result<i64, IoError>
+  Read.read_until(mut &this, delimiter: u8, out: mut &Array<u8>) -> Result<i64, IoError>
+  Seek.rewind(mut &this) -> Result<(), IoError>
+  Seek.seek(mut &this, from: SeekFrom) -> Result<i64, IoError>
+  Seek.stream_position(mut &this) -> Result<i64, IoError>
   Transfer.outcome(&this) -> Result<i64, IoError>
   Transfer.take_buf(mut &this) -> Array<u8>
+  Write.flush(mut &this) -> Result<(), IoError>
+  Write.write<T>(mut &this, data: T) -> Result<(), IoError>
+  Write.write_some(mut &this, bytes: Slice<u8>) -> Result<i64, IoError>
 
 ==============================================================================
 std::json::error
@@ -2969,12 +3200,15 @@ std::json::serializer
   hex_nibble(n: u8) -> u8
   stringify(v: &JsonValue) -> String
   stringify_pretty(v: &JsonValue) -> String
+  write_array(out: mut &String, arr: &Array<JsonValue>, pretty: boolean, depth: u64) -> void
   write_indent(out: mut &String, depth: u64) -> void
   write_lit(out: mut &String, lit: string, lit_len: u64) -> void
   write_number(out: mut &String, n: &JsonNumber) -> void
+  write_object(out: mut &String, obj: &JsonObject, pretty: boolean, depth: u64) -> void
   write_pretty(out: mut &String, v: &JsonValue) -> void
   write_string(out: mut &String, s: Str) -> void
   write_value(out: mut &String, v: &JsonValue) -> void
+  write_value_inner(out: mut &String, v: &JsonValue, pretty: boolean, depth: u64) -> void
 
 ==============================================================================
 std::json::value
@@ -2983,8 +3217,10 @@ std::json::value
   enum JsonNumber
   enum JsonValue
   struct JsonObject
+  trait JsonExtract
   JsonObject: implements Drop
   JsonValue: implements Drop
+  JsonExtract.as<T>(&this) -> Option<T> where T: TryFrom<&JsonValue>
   JsonNumber.as_f64(&this) -> f64
   JsonNumber.as_i64(&this) -> Option<i64>
   JsonNumber.as_u64(&this) -> Option<u64>
@@ -3199,8 +3435,12 @@ std::net::http2::codec
 ==============================================================================
   struct HeaderField
   struct HpackCodec
+  trait HeaderCodec
   HeaderField: implements Drop
   HpackCodec: implements HeaderCodec
+  HeaderCodec.decode(mut &this, block: Slice<u8>) -> Option<Array<HeaderField>>
+  HeaderCodec.encode_field(mut &this, out: mut &Array<u8>, name: Str, value: Str, sensitive: boolean) -> void
+  HeaderCodec.limit_encoder_table(mut &this, size: i64) -> void
   HeaderField::new(name: Str, value: Str) -> HeaderField
   HpackCodec::new(table_size: i64) -> HpackCodec
 
@@ -3234,10 +3474,12 @@ std::net::http2::connection
   write_u31(out: u8*, value: u32) -> void
   Http2Connection.connection(mut &this) -> BufStream<S>*
   Http2Connection.encode_regular_headers(mut &this, out: mut &Array<u8>, h: &Headers) -> void
+  Http2Connection.encode_request_headers(mut &this, out: mut &Array<u8>, req: &Request, scheme: Str, authority: Str) -> void
   Http2Connection.encode_response_headers(mut &this, out: mut &Array<u8>, resp: &Response) -> void
   Http2Connection.goaway_seen(&this) -> boolean
   Http2Connection.process_control(mut &this, fr: &Frame) -> Result<boolean, IoError>
   Http2Connection.queue_ack_data(mut &this, stream_id: u32, n: i64) -> Result<(), IoError>
+  Http2Connection.queue_header_block(mut &this, stream_id: u32, block: Slice<u8>, end_stream: boolean) -> Result<(), IoError>
   Http2Connection.queue_settings(mut &this) -> Result<(), IoError>
   Http2Connection::new_client(conn: BufStream<S>) -> Http2Connection<S>
   Http2Connection::new_client_with_codec(conn: BufStream<S>, codec: C) -> Http2Connection<S, C>
@@ -3268,6 +3510,7 @@ std::net::http2::frame
   FRAME_WINDOW_UPDATE: u8
   MAX_FRAME_PAYLOAD: i64
   frame_byte_at(s: Slice<u8>, index: i64) -> u8
+  BufStream.queue_h2_frame(mut &this, ftype: u8, flags: u8, stream_id: u32, payload: Slice<u8>) -> Result<(), IoError>
   Frame.has_flag(&this, flag: u8) -> boolean
 
 ==============================================================================
@@ -3276,6 +3519,8 @@ std::net::http2::hpack
 ==============================================================================
   struct Cursor   [private]
   struct DynTable   [private]
+  struct HpackDecoder   [internal]
+  struct HpackEncoder   [internal]
   struct StaticEntry   [private]
   DynTable: implements Drop
   HpackDecoder: implements Drop
@@ -3298,6 +3543,17 @@ std::net::http2::hpack
   DynTable.length(&this) -> i64
   DynTable.set_max(mut &this, max_size: i64) -> void
   DynTable::new(max_size: i64) -> DynTable
+  HpackDecoder.decode(mut &this, data: Slice<u8>) -> Option<Array<HeaderField>>   [internal]
+  HpackDecoder.decode_literal(mut &this, data: Slice<u8>, cur: mut &Cursor, prefix_bits: u32, add: boolean) -> Option<HeaderField>   [private]
+  HpackDecoder.entry_at(&this, index: i64) -> Option<HeaderField>   [private]
+  HpackDecoder.name_at(&this, index: i64) -> Option<String>   [private]
+  HpackDecoder::account_and_push(out: mut &Array<HeaderField>, field: HeaderField, list_size: mut &i64) -> boolean   [private]
+  HpackDecoder::new(max_dynamic: i64) -> HpackDecoder   [internal]
+  HpackEncoder.encode_field(mut &this, out: mut &Array<u8>, name: Str, value: Str, sensitive: boolean) -> void   [internal]
+  HpackEncoder.find_full(&this, name: Str, value: Str) -> i64   [private]
+  HpackEncoder.find_name(&this, name: Str) -> i64   [private]
+  HpackEncoder.set_capacity(mut &this, max_size: i64) -> void   [internal]
+  HpackEncoder::new(max_dynamic: i64) -> HpackEncoder   [internal]
 
 ==============================================================================
 std::net::http2::huffman
@@ -3307,6 +3563,9 @@ std::net::http2::huffman
   HuffTree: implements Drop
   at(arr: &Array<i32>, index: i64) -> i32   [private]
   byte_at(s: Slice<u8>, index: i64) -> u8   [private]
+  decode(data: Slice<u8>) -> Option<Array<u8>>   [internal]
+  encode(data: Slice<u8>) -> Array<u8>   [internal]
+  encoded_len(data: Slice<u8>) -> i64   [internal]
   fill_tables(c: u32*, l: u8*) -> void   [private]
   HuffTree.add_node(mut &this) -> i32
   HuffTree.one_of(&this, node: i32) -> i32
@@ -3425,6 +3684,7 @@ std::net::http::router
   struct Router
   Route: implements Drop
   Router: implements Drop
+  match_path(pattern: Str, path: Str, kind: RouteKind, params: mut &HashMap<String, String>) -> boolean
   Router.del(mut &this, pattern: Str, handler: (Request) -> Response) -> &Router
   Router.del(mut &this, pattern: Str, handler: (Request) -> Response, kind: RouteKind) -> &Router
   Router.dispatch(&this, req: Request) -> Response
@@ -3732,6 +3992,7 @@ std::net::ws::frame
   is_control(op: OpCode) -> boolean
   op_from_u8(value: u8) -> Option<OpCode>
   op_to_u8(op: OpCode) -> u8
+  BufStream.queue_frame(mut &this, fin: boolean, opcode: OpCode, payload: Slice<u8>, mask: boolean) -> Result<(), IoError>
 
 ==============================================================================
 std::net::ws::handshake
@@ -3793,6 +4054,7 @@ std::process::child
   Child.send_signal(&this, sig: Signal) -> Result<(), IoError>
   Child.try_wait(mut &this) -> Result<Option<ExitStatus>, IoError>
   Child.wait(mut &this) -> Result<ExitStatus, IoError>
+  Child::new(pid: i32, handle: u64, stdin: Option<ChildStdin>, stdout: Option<ChildStdout>, stderr: Option<ChildStderr>) -> Child
   ChildStderr::from_fd(raw_fd: i32) -> ChildStderr
   ChildStdin::from_fd(raw_fd: i32) -> ChildStdin
   ChildStdout::from_fd(raw_fd: i32) -> ChildStdout
@@ -3812,6 +4074,7 @@ std::process::command
 ==============================================================================
   enum DrainOutcome
   enum Stdio
+  struct ArgvBuf   [internal]
   struct Command
   struct EnvEntry
   struct Output
@@ -3823,8 +4086,11 @@ std::process::command
   Output: implements Drop
   PipePair: implements Drop
   WinStdio: implements Drop
+  build_argv(program: &String, args: &Array<String>, storage: mut &Array<String>, argv: mut &ArgvBuf) -> Result<(), IoError>   [private]
   build_cmdline(cmd: &Command) -> String
   build_env_block(cmd: &Command) -> String
+  build_envp(envs: &Array<EnvEntry>, storage: mut &Array<String>, envp: mut &ArgvBuf) -> Result<(), IoError>   [private]
+  child_remap(setting: Stdio, pipe: &PipePair, target_fd: i32, is_input: boolean) -> boolean
   clone_command(cmd: &Command) -> Command
   close_pipe(pair: &PipePair) -> void
   collect_output(c: mut &Child) -> Result<Output, IoError>
@@ -3838,9 +4104,14 @@ std::process::command
   win_append_bytes(blk: &String, s: &String) -> void
   win_append_quoted(out: mut &String, arg: &String) -> void
   win_drain(fd_no: i32, chunk: u8*, chunk_len: i64, buf: mut &Array<u8>) -> Result<(), IoError>
+  win_drain_interleaved(so_fd0: i32, se_fd0: i32, chunk: u8*, chunk_len: i64, so_buf: mut &Array<u8>, se_buf: mut &Array<u8>) -> Result<(), IoError>
   win_env_key_matches(entry: u8*, key: &String) -> boolean
   win_peek_avail(fd_no: i32) -> i64
   win_setup_stdio(setting: Stdio, std_id: u32, is_input: boolean) -> WinStdio
+  ArgvBuf.as_ptr(&this) -> u8**   [internal]
+  ArgvBuf.get(&this, i: i64) -> u8*   [internal]
+  ArgvBuf.push(mut &this, p: u8*) -> Result<(), AllocError>   [internal]
+  ArgvBuf::new() -> ArgvBuf   [internal]
   Command.arg(mut &this, value: Str) -> void
   Command.cwd(mut &this, path: Str) -> void
   Command.env(mut &this, key: Str, value: Str) -> void
@@ -3911,6 +4182,7 @@ std::random::distribution
   struct UniformI64
   struct UniformU64
   struct WeightedIndex
+  trait Distribution<T>
   Bernoulli: implements Distribution<boolean>
   Exponential: implements Distribution<f64>
   Normal: implements Distribution<f64>
@@ -3921,6 +4193,7 @@ std::random::distribution
   WeightedIndex: implements Drop
   TWO_PI: f64
   Bernoulli::new(p: f64) -> Bernoulli
+  Distribution.sample<R>(&this, rng: mut &R) -> T where R: RandomSource
   Exponential::new(lambda: f64) -> Exponential
   Normal::new(mean: f64, std_dev: f64) -> Normal
   UniformF64::new(lo: f64, hi: f64) -> UniformF64
@@ -3960,6 +4233,20 @@ std::random::secure
   fill_secure_bytes(buf: u8*, len: u64) -> i64
   SecureRng.try_fill(&this, dst: Slice<u8>) -> Result<(), RandomError>
   SecureRng::new() -> SecureRng
+
+==============================================================================
+std::random::source
+    stdlib/random/source.cryo
+==============================================================================
+  trait RandomSource
+  RandomSource.choose<T>(mut &this, items: &Slice<T>) -> Option<T*>
+  RandomSource.fill(mut &this, dst: Slice<u8>) -> void
+  RandomSource.next<T>(mut &this) -> T
+  RandomSource.next_64(mut &this) -> u64
+  RandomSource.next_below(mut &this, bound: i64) -> i64
+  RandomSource.next_below_wide(mut &this, bound: u128) -> u128
+  RandomSource.next_range<T>(mut &this, lo: T, hi: T) -> T
+  RandomSource.shuffle<T>(mut &this, items: &Slice<T>) -> void
 
 ==============================================================================
 std::sync::atomic
@@ -4118,6 +4405,7 @@ std::sys
 ==============================================================================
   close(fd: i32) -> i64
   exit(code: i32) -> void
+  mmap(addr: u8*, length: u64, prot: i32, flags: i32, fd: i32, offset: i64) -> i64
   munmap(addr: u8*, length: u64) -> i64
   normalize(n: i64) -> i64
   open(path: u8*, flags: i32, mode: u32) -> i64
@@ -4567,6 +4855,7 @@ std::sys::syscall
   sys_close(fd: i32) -> i32
   sys_close_range(first: u32, last: u32, flags: u32) -> i32
   sys_connect(sockfd: i32, addr: u8*, addrlen: u32) -> i32
+  sys_copy_file_range(fd_in: i32, off_in: i64*, fd_out: i32, off_out: i64*, len: u64, flags: u32) -> i64
   sys_dup(oldfd: i32) -> i32
   sys_dup2(oldfd: i32, newfd: i32) -> i32
   sys_dup3(oldfd: i32, newfd: i32, flags: i32) -> i32
@@ -4585,6 +4874,7 @@ std::sys::syscall
   sys_fstat(fd: i32, buf: u8*) -> i32
   sys_fsync(fd: i32) -> i32
   sys_ftruncate(fd: i32, length: i64) -> i32
+  sys_futex(uaddr: u32*, op: i32, val: u32, timeout: u8*, uaddr2: u32*, val3: u32) -> i64
   sys_getcwd(buf: u8*, size: u64) -> i64
   sys_getdents64(fd: i32, dirp: u8*, count: u64) -> i64
   sys_getegid() -> u32
@@ -4598,10 +4888,12 @@ std::sys::syscall
   sys_inotify_add_watch(fd: i32, path: u8*, mask: u32) -> i32
   sys_inotify_init1(flags: i32) -> i32
   sys_inotify_rm_watch(fd: i32, wd: i32) -> i32
+  sys_io_uring_enter(fd: i32, to_submit: u32, min_complete: u32, flags: u32, sig: u8*, sigsz: u64) -> i32
   sys_io_uring_register(fd: i32, opcode: u32, arg: u8*, nr_args: u32) -> i32
   sys_io_uring_setup(entries: u32, params: u8*) -> i32
   sys_ioctl(fd: i32, request: u64, arg: u8*) -> i32
   sys_kill(pid: i32, sig: i32) -> i32
+  sys_landlock_add_rule(ruleset_fd: i32, rule_type: i32, rule_attr: u8*, flags: u32) -> i32
   sys_landlock_create_ruleset(attr: u8*, size: u64, flags: u32) -> i32
   sys_landlock_restrict_self(ruleset_fd: i32, flags: u32) -> i32
   sys_link(oldpath: u8*, newpath: u8*) -> i32
@@ -4612,6 +4904,7 @@ std::sys::syscall
   sys_memfd_create(name: u8*, flags: u32) -> i32
   sys_mkdir(path: u8*, mode: u32) -> i32
   sys_mlock(addr: u8*, length: u64) -> i32
+  sys_mmap(addr: u8*, length: u64, prot: i32, flags: i32, fd: i32, offset: i64) -> u8*
   sys_mprotect(addr: u8*, length: u64, prot: i32) -> i32
   sys_munlock(addr: u8*, length: u64) -> i32
   sys_munmap(addr: u8*, length: u64) -> i32
@@ -4628,6 +4921,7 @@ std::sys::syscall
   sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32
   sys_read(fd: i32, buf: u8*, count: u64) -> i64
   sys_readlink(path: u8*, buf: u8*, bufsize: u64) -> i64
+  sys_recvfrom(sockfd: i32, buf: u8*, len: u64, flags: i32, src_addr: u8*, addrlen: u32*) -> i64
   sys_rename(oldpath: u8*, newpath: u8*) -> i32
   sys_rmdir(path: u8*) -> i32
   sys_sched_getaffinity(pid: i32, cpusetsize: u64, mask: u8*) -> i32
@@ -4635,12 +4929,14 @@ std::sys::syscall
   sys_sched_yield() -> i32
   sys_seccomp(operation: u32, flags: u32, args: u8*) -> i32
   sys_sendfile(out_fd: i32, in_fd: i32, offset: i64*, count: u64) -> i64
+  sys_sendto(sockfd: i32, buf: u8*, len: u64, flags: i32, dest_addr: u8*, addrlen: u32) -> i64
   sys_set_tid_address(tidptr: i32*) -> i32
   sys_setgid(gid: u32) -> i32
   sys_setns(fd: i32, nstype: i32) -> i32
   sys_setuid(uid: u32) -> i32
   sys_signalfd(fd: i32, mask: u8*, flags: i32) -> i32
   sys_socket(domain: i32, sock_type: i32, protocol: i32) -> i32
+  sys_splice(fd_in: i32, off_in: i64*, fd_out: i32, off_out: i64*, len: u64, flags: u32) -> i64
   sys_stat(path: u8*, buf: u8*) -> i32
   sys_statx(dirfd: i32, path: u8*, flags: i32, mask: u32, buf: u8*) -> i32
   sys_symlink(target: u8*, linkpath: u8*) -> i32
@@ -4687,12 +4983,15 @@ std::test::assert
   bail_other(message: Str) -> Result<(), TestError>
   expect(condition: boolean, message: Str) -> Result<(), TestError>
   expect_close_f64(a: f64, b: f64, tolerance: f64) -> Result<(), TestError>
+  expect_eq<T>(a: T, b: T) -> Result<(), TestError> where T: Eq + Display
   expect_err<T, E>(r: &Result<T, E>, message: Str) -> Result<(), TestError>
   expect_false(condition: boolean, message: Str) -> Result<(), TestError>
+  expect_ne<T>(a: T, b: T) -> Result<(), TestError> where T: Eq + Display
   expect_none<T>(opt: &Option<T>, message: Str) -> Result<(), TestError>
   expect_ok<T, E>(r: &Result<T, E>, message: Str) -> Result<(), TestError>
   expect_some<T>(opt: &Option<T>, message: Str) -> Result<(), TestError>
   expect_true(condition: boolean, message: Str) -> Result<(), TestError>
+  format_eq_error<T>(a: &T, b: &T, relation: string) -> TestError where T: Display
 
 ==============================================================================
 std::test::descriptor
@@ -4710,6 +5009,13 @@ std::test::error
   TestError.message_str(&this) -> Str
   TestError::failed(message: Str) -> TestError
   TestError::other(message: Str) -> TestError
+
+==============================================================================
+std::test::fixture
+    stdlib/test/fixture.cryo
+==============================================================================
+  trait Fixture
+  Fixture::setup() -> Result<This, TestError>
 
 ==============================================================================
 std::test::runner
@@ -4754,6 +5060,7 @@ std::test::runner
   chip_fail(active: boolean) -> void
   chip_pass(active: boolean) -> void
   chip_skip(active: boolean) -> void
+  classify_outcome(exit_status: ExitStatus, should_panic: boolean, timeout_secs: u32) -> TestOutcome
   compact_begin_test(state: mut &ReporterState, name: Str) -> void
   compact_end_test(state: mut &ReporterState, outcome: TestOutcome) -> void
   compact_enter_group(state: mut &ReporterState, group: Str) -> void
@@ -4772,12 +5079,17 @@ std::test::runner
   plain_end_test(outcome: TestOutcome, was_should_panic: boolean) -> void
   plain_skipped(name: Str) -> void
   pretty_begin_test(state: mut &ReporterState, name: Str) -> void
+  pretty_end_test(opts: &RunOptions, outcome: TestOutcome, was_should_panic: boolean) -> void
   pretty_enter_group(state: mut &ReporterState, group: Str) -> void
   pretty_skipped(state: mut &ReporterState, opts: &RunOptions, name: Str) -> void
+  print_in_flight(descriptors: TestDescriptor*, count: u64, in_flight: &Array<boolean>, n_in_flight: u64, stalled_secs: u64) -> void
   print_outcome(outcome: TestOutcome, was_should_panic: boolean) -> void
   print_test_prefix(name: Str) -> void
   read_capture_file(path: &String, out: mut &String) -> void
   resolve_color_active(opts: &RunOptions) -> boolean
+  run_all(argc: i32, argv: u8**, descriptors: TestDescriptor*, count: u64) -> i32
+  run_child_single(idx: u64, descriptors: TestDescriptor*, count: u64, timeout_secs: u32) -> i32
+  run_one(d: TestDescriptor, idx: u64, timeout_secs: u32, capture: boolean) -> TestRun
   split_test_name(full: Str) -> SplitName
   test_worker(ctx: WorkerCtx) -> void
   Counters::new() -> Counters
@@ -4791,6 +5103,7 @@ std::test::runner
   TestRunner.report_begin(mut &this, name: Str) -> void
   TestRunner.report_end(mut &this, outcome: TestOutcome, was_should_panic: boolean) -> void
   TestRunner.report_finalize(mut &this) -> void
+  TestRunner.report_live_finish(&this, name: Str, outcome: TestOutcome, was_should_panic: boolean) -> void
   TestRunner.report_output(&this, name: Str, captured: &String) -> void
   TestRunner.report_skipped(mut &this, name: Str) -> void
   TestRunner.run(mut &this) -> i32
@@ -4843,18 +5156,24 @@ std::thread
   scope_trampoline<C>(arg: u8*) -> u8*
   sleep(nanos: u64) -> void
   sleep_ms(millis: u64) -> void
+  spawn<C, T>(ctx: C, body: (C) -> T) -> JoinHandle<T> where C: Send, T: Send
+  spawn_with_attr<C, T>(ctx: C, body: (C) -> T, stack_bytes: u64) -> Result<JoinHandle<T>, SpawnError> where C: Send, T: Send
   thread_body<C, T>(arg: u8*) -> void
   thread_trampoline<C, T>(arg: u8*) -> u32
   thread_trampoline<C, T>(arg: u8*) -> u8*
+  try_spawn<C, T>(ctx: C, body: (C) -> T) -> Result<JoinHandle<T>, SpawnError> where C: Send, T: Send
   yield_now() -> void
   Builder.name(mut this, n: Str) -> Builder
+  Builder.spawn<C, T>(this, ctx: C, body: (C) -> T) -> JoinHandle<T> where C: Send, T: Send
   Builder.stack_size(mut this, bytes: u64) -> Builder
+  Builder.try_spawn<C, T>(this, ctx: C, body: (C) -> T) -> Result<JoinHandle<T>, SpawnError> where C: Send, T: Send
   Builder::new() -> Builder
   JoinHandle.detach(mut this) -> void
   JoinHandle.id(&this) -> ThreadId
   JoinHandle.is_finished(&this) -> boolean
   JoinHandle.join(mut this) -> T
   Scope.join_all(mut &this) -> void
+  Scope.spawn<C>(mut &this, ctx: C, body: (C) -> void) -> void where C: Send
   Scope::new() -> Scope
   Scope::new_with_stack(stack_bytes: u64) -> Scope
   SpawnError::from_errno(rc: i32) -> SpawnError
@@ -4887,6 +5206,7 @@ std::time::clock
   FILETIME_TICKS_PER_SEC: i64
   FILETIME_TO_UNIX_TICKS: i64
   NSEC_PER_SEC: i64
+  diff_saturating(a_sec: i64, a_nsec: i64, b_sec: i64, b_nsec: i64) -> Duration   [private]
   read_monotonic() -> Instant   [private]
   read_realtime() -> SystemTime   [private]
   sleep(dur: Duration) -> void
@@ -4918,6 +5238,7 @@ std::time::datetime
   SECS_PER_HOUR: i64
   SECS_PER_MIN: i64
   YEARS_PER_ERA: i64
+  civil_from_days(days: i64, hour: u32, minute: u32, second: u32) -> DateTime   [private]
   write_pad(f: mut &Formatter, value: u64, width: i64) -> Result<(), FmtError>   [private]
   write_year(f: mut &Formatter, year: i64) -> Result<(), FmtError>   [private]
   DateTime.to_string(&this) -> String
