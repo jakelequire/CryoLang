@@ -73,15 +73,15 @@ import std::core::intrinsics;
 /// Interest/readiness bits. One `register` call arms exactly one direction;
 /// a descriptor may have both armed at once (by two futures, or one future
 /// waiting on each half of a socket).
-const INTEREST_READ:  u32 = 1;
-const INTEREST_WRITE: u32 = 2;
+internal const INTEREST_READ:  u32 = 1;
+internal const INTEREST_WRITE: u32 = 2;
 
 /// Registration hash buckets. A power of two: the bucket index is `fd & 63`,
 /// which is near-perfect for descriptors (small, densely allocated integers).
-const REG_BUCKETS: i32 = 64;
+private const REG_BUCKETS: i32 = 64;
 
 /// Readiness events drained from the OS per wait call.
-const RT_MAX_EVENTS: i32 = 64;
+private const RT_MAX_EVENTS: i32 = 64;
 
 
 /// One descriptor's slot in the reactor's table: which directions are armed,
@@ -94,7 +94,7 @@ const RT_MAX_EVENTS: i32 = 64;
 /// armed direction fires or is deregistered, so the table size tracks the
 /// number of parked operations and a leak is visible as an entry that outlives
 /// its future.
-type struct Registration {
+private type struct Registration {
     fd:            i32;
     interest:      u32;      // armed INTEREST_* bits
     read_waker:    Waker;    // fired on readable; `Waker::noop()` when unarmed
@@ -112,7 +112,7 @@ type struct Registration {
 /// `timers.deadline` (O(1)) and expiry a pop from the front, at the cost of an
 /// O(n) walk on insert; the wait bound is recomputed on every loop iteration
 /// while an insert happens once per armed sleep, so the cheap side is the hot one.
-type struct Timer {
+private type struct Timer {
     id:       u64;      // identifies this arming; never 0, never reused
     deadline: i64;      // monotonic nanoseconds, as `Instant::as_nanos` reports
     waker:    Waker;
@@ -131,13 +131,14 @@ type struct Timer {
 /// the poll tree. Null on threads that do not poll (the thread that called
 /// `block_on`, or any thread outside an executor).
 ![thread_local]
-mut g_current_reactor: Reactor* = null;
+private mut g_current_reactor: Reactor* = null;
 
 
 /// The I/O readiness driver for one `Executor`. Heap-allocated: worker threads
 /// and parked futures hold raw pointers to it, and the backend hands the OS
 /// interior addresses, so it must not move.
-type struct Reactor {
+internal type struct Reactor {
+private:
     mtx:      [u8; 40];              // guards the table (pthread_mutex_t / SRWLOCK)
     buckets:  [Registration*; 64];   // REG_BUCKETS chains, keyed by `fd & 63`
     poll_h:   i64;                 // epoll fd (Linux) / completion port (Windows)
@@ -148,6 +149,7 @@ type struct Reactor {
     timers:   Timer*;              // deadline-sorted chain; head is the earliest
     timer_seq: u64;                // last id handed out (0 means "nothing armed")
 
+internal:
     /// Create a reactor, open its OS backend, and start its I/O thread.
     /// Panics if the OS refuses any of the three: an executor without a working
     /// reactor would park I/O futures that could never be woken, so failing
@@ -336,7 +338,7 @@ type struct Reactor {
     /// Wait for readiness (up to `timeout_ms`; negative blocks indefinitely) and
     /// fire the wakers of every descriptor that became ready. The reactor thread
     /// calls this in a loop.
-    poll_once(mut &this, timeout_ms: i32) -> void {
+    private poll_once(mut &this, timeout_ms: i32) -> void {
         mut fds:   [i32; 64] = [0; 64];
         mut ready: [u32; 64] = [0; 64];
         const n: i32 = rt_wait(&this, &fds[0], &ready[0], RT_MAX_EVENTS, timeout_ms);
@@ -349,7 +351,7 @@ type struct Reactor {
     /// than the earliest armed timer allows, dispatch whatever became ready, then
     /// fire every timer that came due. Keeping the wait bound here leaves
     /// `poll_once` a pure "wait at most this long" primitive.
-    run_once(mut &this) -> void {
+    private run_once(mut &this) -> void {
         this.poll_once(this.next_timeout_ms(Instant::now().as_nanos()));
         this.fire_expired(Instant::now().as_nanos());
     }
@@ -806,7 +808,7 @@ private function rt_wait(rt: Reactor*, out_fds: i32*, out_ready: u32*,
 /// aligned: the NT layer rejects a misaligned `IO_STATUS_BLOCK`, and a struct of
 /// byte arrays would only be byte-aligned when it comes off the heap.
 ![target(windows)]
-type struct AfdOp {
+private type struct AfdOp {
     ovl:  [u64; 4];   // OVERLAPPED (32 bytes), doubling as the IO_STATUS_BLOCK
     info: [u64; 4];   // AFD_POLL_INFO (32 bytes) carrying exactly one handle
     fd:   i32;      // descriptor this poll was armed for

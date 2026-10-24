@@ -408,7 +408,13 @@ Left over from that: the async entry point calls `Executor::new` and
    outside the 1.0 stability promise.  Tests that reach internals are
    rewritten through the public API, or deleted where they pinned only
    an internal.  Anything borderline is listed for Jake rather than
-   hidden.
+   hidden.  Built: `collections::raw_buffer` and `future::reactor` are
+   `internal module`s with every item marked, and the fields naming
+   their types (`String`'s buffer, an executor's and every I/O future's
+   reactor) are private.  Open: in the standard library the `internal
+   module` line itself restricts nothing yet - its items are refused
+   only by their own markers - which is a compiler defect in the bug
+   log.
 
 ## A generic type's methods emitted only when called
 
