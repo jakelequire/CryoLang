@@ -1,0 +1,101 @@
+namespace TraitObjectGenericImplementation::Main;
+
+import TraitObjectGenericImplementation::Gauges::{ Gauge, Meter, Sink, Tank };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::fmt::write::{ FmtWrite };
+
+// A value whose type implements the trait by a generic implementation
+// converts to a trait object wherever any value does, at a concrete
+// instantiation.  The implementations are in another module, and `String`'s
+// `FmtWrite` in the standard library.
+
+type struct Holder {
+    sink: virtual mut &Sink;
+
+    static new(sink: virtual mut &Sink) -> Holder { return Holder { sink: sink }; }
+}
+
+type enum Slot {
+    Empty;
+    Full(virtual mut &Sink);
+}
+
+function put_one(sink: virtual mut &Sink) -> i64 {
+    return sink.put(1);
+}
+
+function put_raw(sink: virtual Sink*) -> i64 {
+    return sink.put(1);
+}
+
+function gives(t: mut &Tank<i64>) -> virtual mut &Sink {
+    return t;
+}
+
+function slotted(s: Slot) -> i64 {
+    return match (s) {
+        Slot::Full(sink) => { sink.put(1) }
+        Slot::Empty      => { 0 }
+    };
+}
+
+// The conversion is written in a generic body, at a type that is not the
+// body's parameter: each instance of the body names the same table.
+function fresh_label<T>(unused: T) -> i64 {
+    mut t: Tank<i16> = Tank::<i16> { total: 0, fill: 0 };
+    const s: virtual mut &Sink = &t;
+    return s.put(0) + s.label();
+}
+
+function write_through(w: virtual mut &FmtWrite) -> void {
+    w.write_str(Str::from("ab"));
+    w.write_char('c');
+}
+
+function main() -> i32 {
+    mut wide: Tank<i64> = Tank::<i64> { total: 0, fill: 0 };
+    mut narrow: Tank<i32> = Tank::<i32> { total: 0, fill: 0 };
+
+    // An initializer and an argument; a supertrait's method through the table.
+    const a: virtual mut &Sink = &wide;
+    if (a.put(1) != 9) { return 1; }
+    if (a.label() != 8000) { return 2; }
+    if (put_one(&narrow) != 5) { return 3; }
+    const b: virtual mut &Sink = &narrow;
+    if (b.label() != 4000) { return 4; }
+
+    // A static method, a function value, a variant, an `Option` payload.
+    const h: Holder = Holder::new(&wide);
+    if (h.sink.put(1) != 18) { return 5; }
+    const f: (virtual mut &Sink) -> i64 = put_one;
+    if (f(&narrow) != 10) { return 6; }
+    if (slotted(Slot::Full(&wide)) != 27) { return 7; }
+    const o: Option<virtual mut &Sink> = Option::Some(&narrow);
+    match (o) {
+        Option::Some(sink) => { if (sink.put(1) != 15) { return 8; } }
+        Option::None       => { return 9; }
+    }
+
+    // A return, an assignment, and a raw object.
+    mut c: virtual mut &Sink = gives(&wide);
+    if (c.put(1) != 36) { return 10; }
+    c = &narrow;
+    if (c.put(1) != 20) { return 11; }
+    if (put_raw(&wide as Tank<i64>*) != 45) { return 12; }
+
+    // Two instances of a generic body.
+    if (fresh_label(1) != 2002 || fresh_label(true) != 2002) { return 13; }
+
+    // An implementation for one instantiation of a generic type.
+    const g: Gauge<i64> = Gauge::<i64> { level: 7 };
+    const m: virtual &Meter = &g;
+    if (m.read() != 7) { return 14; }
+
+    // The standard library's `String`, through a written method and a
+    // default one.
+    mut text: String = String::new();
+    write_through(&text);
+    if (text.length() != 3) { return 15; }
+    return 0;
+}

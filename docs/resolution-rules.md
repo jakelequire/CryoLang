@@ -133,6 +133,17 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-24
+
+583. **A value whose type implements a trait by a generic implementation
+     converts to a trait object, at the instantiation it has,** which
+     answers 425.  The table is the copy of the implementation for that
+     instantiation, holding the copies of its supertraits' implementations
+     for it, and is emitted with the instantiation's methods, kept once per
+     link as they are.  A value of a type parameter still does not convert
+     (`E0315`).  A method's object parameter takes a converting argument as
+     a function's does.  (Jake; where the table is emitted, delegated)
+
 ### 2026-10-23
 
 575. **Every length, position and size in the standard library is an

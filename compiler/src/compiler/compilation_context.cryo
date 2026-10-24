@@ -16,7 +16,7 @@ import compiler::resolver::{ symbol_str, intern_table, qualified_name, resolver 
 import compiler::resolver::res::{ DeclVisibility, DefId, DefTable, DefKind, FamilyOwner, ResBase };
 import compiler::ast::node::{ Node };
 import compiler::ast::{ NamedAnnotation, Visibility };
-import compiler::ast::declaration::{ DeclarationNode, FunctionDecl, ImplBlock, MethodDecl };
+import compiler::ast::declaration::{ DeclarationNode, FunctionDecl, ImplBlock, MethodDecl, ObjectTableInstance };
 import compiler::ast::expression::{ ExpressionNode };
 import compiler::ast::pattern::{ DirectiveArgKind, DirectiveNode };
 import compiler::types::generic_registry::{ TemplateEntry };
@@ -180,9 +180,24 @@ type struct AliasDeclRef {
 }
 
 /// A trait implementation some conversion to a trait object names, which the
-/// list refers to without owning it.
+/// list refers to without owning it, and the source file of the module that
+/// emits its table: the one holding the implementation, or for a copy of a
+/// generic one, the one its specialization is placed in.
 type struct ObjectTableRef {
-    decl: DeclarationNode*;
+    decl:         DeclarationNode*;
+    owner_source: SymbolStr;
+}
+
+/// A conversion to a trait object of a value whose type implements the trait
+/// by a generic implementation, which has no table until monomorphization
+/// copies it for the value's type: the implementation, the value's type, and
+/// the implementation of each trait the table holds methods of, in the
+/// table's order, any of them a template too.  The list refers to the blocks
+/// without owning them.
+type struct ObjectInstanceDemand {
+    implementation: DeclarationNode*;
+    value:          TypeRef;
+    blocks:         [ImplBlock*];
 }
 
 /// A path whose scope segment names a type alias, which the list refers to
@@ -350,6 +365,10 @@ public:
     /// whenever the build's demand may have changed, as a module owning a
     /// specialization is.
     object_tables: [ObjectTableRef];
+    /// The conversions naming a generic implementation, each pair of
+    /// implementation and value type once, settled into `object_tables`
+    /// after monomorphization (`settle_object_instances`).
+    object_instance_demands: [ObjectInstanceDemand];
 
     // -- Inactive-region tracking (LSP tooling) --
     // Source spans of top-level declarations, methods, and inline `![dir] { }`
@@ -443,6 +462,7 @@ public:
             alias_paths:          [],
             c_refs:               [],
             object_tables:        [],
+            object_instance_demands: [],
             inactive_spans:       [],
             frontend_complete:    false,
             type_arena:    arena_ptr,
@@ -552,8 +572,10 @@ public:
     /// takes the table's symbol, which its module's codegen emits and every
     /// conversion names, and the implementations whose methods the table
     /// holds (`blocks`, in the table's order); its declaration is listed
-    /// once for the build cache.
-    note_object_table(mut &this, implementation: DeclarationNode*, blocks: [ImplBlock*]) -> void {
+    /// once for the build cache, with the source file of the module that
+    /// emits the table (`owner_source`).
+    note_object_table(mut &this, implementation: DeclarationNode*, blocks: [ImplBlock*],
+                      owner_source: SymbolStr) -> void {
         const block: ImplBlock* = DeclarationNode::impl_of(implementation);
         if (block == null || block.object_table_symbol.is_valid()) { return; }
         block.object_table_blocks = blocks;
@@ -563,7 +585,59 @@ public:
         const symbol: MangledName = MangledName::for_object_table(this.intern_table, this.type_arena,
             trait_qname, &block.trait_arg_types, owner_qname);
         block.object_table_symbol = this.intern_table.intern(symbol.as_string());
-        this.object_tables.push(ObjectTableRef { decl: implementation });
+        this.object_tables.push(ObjectTableRef { decl: implementation, owner_source: owner_source });
+    }
+
+    /// Record that a conversion names the generic `implementation` for a
+    /// value of `value`'s type; `blocks` as `note_object_table` takes them.
+    note_object_instance(mut &this, implementation: DeclarationNode*, value: TypeRef, blocks: [ImplBlock*]) -> void {
+        for (mut i: i64 = 0; i < this.object_instance_demands.length(); i++) {
+            const held: ObjectInstanceDemand* = &this.object_instance_demands[i];
+            if (held.implementation == implementation && held.value.equals(value)) { return; }
+        }
+        this.object_instance_demands.push(ObjectInstanceDemand {
+            implementation: implementation,
+            value:          value,
+            blocks:         blocks,
+        });
+    }
+
+    /// Give each generic implementation a conversion names the table of its
+    /// copy for the value's type, now that monomorphization has made and
+    /// placed the copies: the copy takes the table, built from the copies
+    /// of the other blocks the table holds methods of (a block that is not
+    /// generic stands for itself), and is emitted with the specialization
+    /// in the module the specialization is placed in.  A value's type that
+    /// no specialization copied leaves the implementation without a copy,
+    /// and code generation of a conversion naming it is an internal error.
+    settle_object_instances(mut &this) -> void {
+        if (this.monomorphizer == null) { return; }
+        for (mut i: i64 = 0; i < this.object_instance_demands.length(); i++) {
+            const demand: ObjectInstanceDemand* = &this.object_instance_demands[i];
+            const template: ImplBlock* = DeclarationNode::impl_of(demand.implementation);
+            mut owner_source: SymbolStr = SymbolStr::empty();
+            const copy: DeclarationNode* = this.monomorphizer.copy_of_implementation(template, demand.value,
+                &owner_source);
+            if (copy == null) { continue; }
+            mut blocks: [ImplBlock*] = [];
+            mut complete: boolean = true;
+            for (mut k: i64 = 0; k < demand.blocks.length(); k++) {
+                const block: ImplBlock* = demand.blocks[k];
+                if (!this.generic_registry.implementation_is_copied(block)) { blocks.push(block); continue; }
+                mut ignored: SymbolStr = SymbolStr::empty();
+                const block_copy: DeclarationNode* = this.monomorphizer.copy_of_implementation(block, demand.value, &ignored);
+                if (block_copy == null) { complete = false; break; }
+                blocks.push(DeclarationNode::impl_of(block_copy));
+            }
+            if (!complete) {
+                this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                    fmt::format("the specialization `%s` copied an implementation a trait-object table needs and not every other one it holds methods of",
+                        this.type_arena.format_display(this.type_arena.lookup(demand.value)))));
+                continue;
+            }
+            this.note_object_table(copy, blocks, owner_source);
+            template.object_instances.push(ObjectTableInstance { value: demand.value, block: DeclarationNode::impl_of(copy) });
+        }
     }
 
     /// Record that an injected AST node came from a specific template module.

@@ -2867,8 +2867,9 @@ type struct SemaVisitor {
     /// Convert `expr`, of type `from`, to the trait object `to`.  A borrowed
     /// object takes a reference to the value, in either form as a reference
     /// parameter does; a raw object takes a pointer.  The value's type must implement
-    /// the trait by a non-generic implementation, whose table the
-    /// conversion names; anything else that has the right shape is E0315.
+    /// the trait, whose implementation's table the conversion names - for a
+    /// generic implementation, its copy for the value's type; anything else
+    /// that has the right shape is E0315.
     /// An object converts to its own type alone, which needs no conversion.
     convert_to_object(mut &this, expr: ExpressionNode*, from: TypeRef, to: TypeRef) -> ObjectConversionOutcome {
         const target: Type* = this.arena.lookup(to);
@@ -2877,15 +2878,8 @@ type struct SemaVisitor {
             return ObjectConversionOutcome::Mismatch;
         }
         const object: ObjectType* = target.as_object();
-        mut value: TypeRef = TypeRef::invalid();
-        match (object.form) {
-            ObjectForm::Raw => {
-                if (source.kind == TypeKind::Pointer) { value = source.as_pointer().pointee; }
-            }
-            _ => {
-                if (source.kind == TypeKind::Reference) { value = source.as_reference().referent; }
-            }
-        }
+        const checker: TraitChecker = this.trait_checker();
+        const value: TypeRef = checker.object_value(object, from);
         const value_t: Type* = this.arena.lookup(value);
         if (value_t == null) { return ObjectConversionOutcome::Mismatch; }
 
@@ -2904,7 +2898,7 @@ type struct SemaVisitor {
                     shown_from, shown_to, shown_value, shown_trait), expr.span);
             return ObjectConversionOutcome::Refused;
         }
-        const implementation: DeclarationNode* = this.object_implementation(object, value);
+        const implementation: DeclarationNode* = checker.object_implementation(object, value);
         if (implementation == null) {
             this.ctx.emit_error_at(ErrorCode::E0315_OBJECT_CONVERSION,
                 fmt::format("`%s` does not implement `%s`, so `%s` cannot become `%s`",
@@ -2912,23 +2906,18 @@ type struct SemaVisitor {
             return ObjectConversionOutcome::Refused;
         }
         const block: ImplBlock* = DeclarationNode::impl_of(implementation);
-        // An implementation for a generic type's template is generic too:
-        // each instantiation has its own copy of the methods.
-        if (block.is_generic() || this.ctx.generic_registry.template_of(block.target_def()) != null) {
-            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0315_OBJECT_CONVERSION,
-                fmt::format("`%s` implements `%s` by a generic implementation, so `%s` cannot become `%s`",
-                    shown_value, shown_trait, shown_from, shown_to));
-            d = d.at(expr.span);
-            d = d.with_note("a value whose implementation is generic does not convert to a trait object yet");
-            this.ctx.emit_diagnostic(d);
-            return ObjectConversionOutcome::Refused;
-        }
         mut blocks: [ImplBlock*] = [];
         if (!this.object_table_implementations(expr, object, value, block, &blocks, shown_from, shown_to,
                 shown_value, shown_trait)) {
             return ObjectConversionOutcome::Refused;
         }
-        this.ctx.note_object_table(implementation, blocks);
+        // A generic implementation's table is its copy's for the value's
+        // type, which monomorphization makes.
+        if (this.ctx.generic_registry.implementation_is_copied(block)) {
+            this.ctx.note_object_instance(implementation, value, blocks);
+        } else {
+            this.ctx.note_object_table(implementation, blocks, this.intern.intern(implementation.source_file));
+        }
         return ObjectConversionOutcome::Converted(ExpressionNode::object_conversion(expr, value, block, to));
     }
 
@@ -3049,23 +3038,6 @@ type struct SemaVisitor {
                 fmt::format("`%s` does not implement `%s`, which `%s` requires, so `%s` cannot implement `%s`",
                     shown_owner, shown_base, shown_trait, shown_owner, shown_trait), span);
         }
-    }
-
-    /// The implementation of `object`'s trait for `value` whose where-clause
-    /// holds, among those binding the trait at the object's arguments
-    /// (`GenericRegistry::binds_trait_arguments`); null when there is none.
-    object_implementation(&this, object: ObjectType*, value: TypeRef) -> DeclarationNode* {
-        const registry: GenericRegistry* = this.ctx.generic_registry;
-        if (registry == null) { return null; }
-        const heads: [DeclarationNode*] = registry.heads_for(object.trait_def, value, this.intern);
-        const checker: TraitChecker = this.trait_checker();
-        for (mut i: i64 = 0; i < heads.length(); i++) {
-            const block: ImplBlock* = DeclarationNode::impl_of(heads[i]);
-            if (block == null) { continue; }
-            if (!registry.binds_trait_arguments(block, &object.args, this.intern)) { continue; }
-            if (checker.impl_applies(block, value, 0)) { return heads[i]; }
-        }
-        return null;
     }
 
     resolve_cast(mut &this, e: ExpressionNode*, cast: CastExpr*) -> TypeRef {

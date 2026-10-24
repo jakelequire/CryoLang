@@ -1,0 +1,83 @@
+namespace MethodObjectArgument::Main;
+
+// A method's trait-object parameter converts its argument as a function's
+// does: on a struct, on an array, on an instantiation of a generic struct
+// whose parameter is the object, in a trait's implementation, and for a raw
+// object; the value's implementation may be generic.
+
+type trait Sink {
+    put(mut &this, v: i64) -> i64;
+}
+
+type trait Feeder {
+    feed(&this, sink: virtual mut &Sink) -> i64;
+}
+
+type struct Plain {
+    total: i64;
+}
+
+implement trait Sink for struct Plain {
+    put(mut &this, v: i64) -> i64 { this.total = this.total + v; return this.total; }
+}
+
+type struct Tank<T> {
+    total: i64;
+    fill:  T;
+}
+
+implement<T> trait Sink for struct Tank<T> {
+    put(mut &this, v: i64) -> i64 { this.total = this.total + v * 100; return this.total; }
+}
+
+type struct Holder {
+    sink: virtual mut &Sink;
+
+    swap_in(mut &this, sink: virtual mut &Sink) -> void { this.sink = sink; }
+    put_raw(&this, sink: virtual Sink*) -> i64 { return sink.put(3); }
+}
+
+type struct Keeper<T> {
+    item: Option<T>;
+
+    set(mut &this, item: T) -> void { this.item = Option::Some(item); }
+}
+
+type struct Spoon {
+    amount: i64;
+}
+
+implement trait Feeder for struct Spoon {
+    feed(&this, sink: virtual mut &Sink) -> i64 { return sink.put(this.amount); }
+}
+
+function main() -> i32 {
+    mut first: Plain = Plain { total: 0 };
+    mut second: Plain = Plain { total: 10 };
+    mut tank: Tank<i64> = Tank::<i64> { total: 0, fill: 0 };
+
+    mut sinks: [virtual mut &Sink] = [];
+    sinks.push(&first);
+    sinks.push(&tank);
+    if (sinks[0].put(1) != 1) { return 1; }
+    if (sinks[1].put(1) != 100) { return 2; }
+
+    mut h: Holder = Holder { sink: &first };
+    h.swap_in(&second);
+    if (h.sink.put(1) != 11) { return 3; }
+    h.swap_in(&tank);
+    if (h.sink.put(1) != 200) { return 4; }
+    if (h.put_raw(&second as Plain*) != 14) { return 5; }
+
+    mut k: Keeper<virtual mut &Sink> = Keeper::<virtual mut &Sink> { item: Option::None };
+    k.set(&first);
+    match (k.item) {
+        Option::Some(s) => { if (s.put(1) != 2) { return 6; } }
+        Option::None    => { return 7; }
+    }
+
+    const spoon: Spoon = Spoon { amount: 5 };
+    if (spoon.feed(&first) != 7) { return 8; }
+    if (spoon.feed(&tank) != 700) { return 9; }
+    return 0;
+}

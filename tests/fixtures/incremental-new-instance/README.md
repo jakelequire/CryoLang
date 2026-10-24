@@ -10,6 +10,13 @@ defect needs a cached build followed by an edit.
    `std::thread` for a new instance, `Scope::spawn<JobB>`.  Built again
    incrementally over the first build's cache, it must link and exit 4.
 
+Each build also converts instantiations of `src/meters.cryo`'s `Gauge<T>`,
+which implements `Meter` generically, to trait objects; the edit converts a
+new one, `Gauge<i16>`, and a `String` to a `virtual mut &FmtWrite`.  The
+tables of those instantiations are emitted with them, in `meters.cryo`'s
+and `std::collections::string`'s objects, which the edit does not touch;
+reused from the first build, they would hold no such table.
+
 `spawn<C>` is a generic method written inside `type struct Scope { .. }`, so
 its instances are emitted in `std::thread`'s object, not in the module that
 calls it.  If that module is not recognised as owning a specialization, its

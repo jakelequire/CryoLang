@@ -2872,13 +2872,15 @@ type struct CallResolver {
                 const inst: InstantiatedType* = base_t.as_instantiated();
                 if (!inst.has_resolved_type()) {
                     // Not minted yet: the selection tried its template's
-                    // methods; a call it bound is checked where it is minted,
-                    // unless the receiver is a generic body's own
-                    // instantiation (`Array<T>`), whose copies are not checked.
+                    // methods, and the arguments are checked, and converted,
+                    // against them as the instantiation sees them - unless
+                    // the receiver is a generic body's own instantiation
+                    // (`Array<T>`) or one written with its parameters, whose
+                    // copies are checked where they are minted.
                     const own: boolean = this.symbolic.symbolic_params_settle(base_ref);
-                    if (own || (chosen_method == null && !this.types.contains_generic_param(base_ref))) {
+                    if (own || !this.types.contains_generic_param(base_ref)) {
                         this.check_args_on_template(visitor, call_e, call, member, base_ref,
-                            own && chosen_method == null);
+                            own && chosen_method == null, chosen_method != null && !own);
                     }
                     return;
                 }
@@ -3075,17 +3077,20 @@ type struct CallResolver {
     }
 
     /// `check_method_call_arg_types` for a call on an instantiation not yet
-    /// minted that the selection bound to nothing.  The candidates are the
-    /// ones `select_on_template` tried - the template's inherent methods,
-    /// then, when none has the member's name, the trait impls selected for
-    /// the instantiation - with their parameters seen through it (`push(x: T)`
-    /// on an `Array<i64>` takes an `i64`).  One candidate of the call's arity
-    /// checks the arguments against its parameters, as on a minted receiver;
-    /// several is an overload set none of which took them.  `unbound_in_body`
-    /// is a call on a generic body's own instantiation (`Array<T>`) the
-    /// selection bound to nothing, which nothing after this refuses.
+    /// minted.  The candidates are the ones `select_on_template` tried - the
+    /// template's inherent methods, then, when none has the member's name,
+    /// the trait impls selected for the instantiation - with their
+    /// parameters seen through it (`push(x: T)` on an `Array<i64>` takes an
+    /// `i64`).  One candidate of the call's arity checks the arguments
+    /// against its parameters, as on a minted receiver, converting each as
+    /// its parameter asks; several is an overload set none of which took
+    /// them, unless the selection `bound` the call to one of them.
+    /// `unbound_in_body` is a call on a generic body's own instantiation
+    /// (`Array<T>`) the selection bound to nothing, which nothing after this
+    /// refuses.
     check_args_on_template(mut &this, visitor: SemaVisitor*, call_e: ExpressionNode*, call: CallExpr*,
-                           member: MemberAccessExpr*, owner_inst: TypeRef, unbound_in_body: boolean) -> void {
+                           member: MemberAccessExpr*, owner_inst: TypeRef, unbound_in_body: boolean,
+                           bound: boolean) -> void {
         mut found: ArgCandidates = ArgCandidates::new(call.arguments.length());
         if (!this.collect_on_template(visitor, call, member, owner_inst, &found)) { return; }
         if (found.count == 1) {
@@ -3094,6 +3099,8 @@ type struct CallResolver {
             if (unbound_in_body && this.ctx.diagnostics.errors_since(snap) == 0) {
                 this.refuse_unbound_args(call, found.params.as_slice());
             }
+        } else if (bound) {
+            return;
         } else if (found.count > 1) {
             this.emit_no_matching_overload(call_e, call, member, owner_inst, &found.params, found.argc,
                 unbound_in_body);
@@ -4957,6 +4964,7 @@ type struct CallResolver {
             allow_implicit = false;
         }
         if (allow_implicit && this.checker.can_implicit_convert(arg, param)) { return true; }
+        if (pt != null && pt.kind == TypeKind::Object && this.converts_to_object(pt.as_object(), arg)) { return true; }
         if (ai < call.arguments.length() && call.arguments[ai] != null
                 && this.literals.int_literal_fits_target(call.arguments[ai], param)) {
             return true;
@@ -4977,6 +4985,18 @@ type struct CallResolver {
         }
         if (tier >= 3 && this.has_implicit_converter(arg, param)) { return true; }
         return false;
+    }
+
+    /// Whether an argument of type `arg` binds to a parameter of `object`'s
+    /// type: it has the object's form, and its value's type implements the
+    /// object's trait, or is a type parameter, whose conversion the argument
+    /// check refuses (`SemaVisitor::convert_to_object`, which makes the
+    /// conversion and checks the rest of what the table needs).
+    converts_to_object(&this, object: ObjectType*, arg: TypeRef) -> boolean {
+        const checker: TraitChecker = this.trait_checker();
+        const value: TypeRef = checker.object_value(object, arg);
+        if (!value.is_valid()) { return false; }
+        return this.types.contains_generic_param(value) || checker.object_implementation(object, value) != null;
     }
 
     /// The first method a generic template's declaration writes that is one

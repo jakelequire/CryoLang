@@ -16,7 +16,7 @@
 namespace compiler::types::trait_checker;
 
 import compiler::ast::{
-    declaration, expression, node, pattern, statement, TraitBound, TraitRef,
+    declaration, expression, node, ObjectForm, pattern, statement, TraitBound, TraitRef,
     TypeAnnotation
 };
 import compiler::types::{
@@ -191,6 +191,39 @@ type struct TraitChecker {
         if (!this.object_reaches_trait(object, trait_def)) { return false; }
         mut declaring: DefId = DefId::invalid();
         return this.object_bound_blocker(trait_def, &declaring) == null;
+    }
+
+    /// The type of the value an object of `object`'s form is made from
+    /// `source`: the referent of a reference for a borrowed object, in
+    /// either form as a reference parameter takes one, the pointee of a
+    /// pointer for a raw one; invalid when `source` has neither form.
+    object_value(&this, object: ObjectType*, source: TypeRef) -> TypeRef {
+        const t: Type* = this.arena.lookup(source);
+        if (t == null) { return TypeRef::invalid(); }
+        match (object.form) {
+            ObjectForm::Raw => {
+                if (t.kind == TypeKind::Pointer) { return t.as_pointer().pointee; }
+            }
+            _ => {
+                if (t.kind == TypeKind::Reference) { return t.as_reference().referent; }
+            }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// The implementation of `object`'s trait for `value` whose where-clause
+    /// holds, among those binding the trait at the object's arguments
+    /// (`GenericRegistry::binds_trait_arguments`); null when there is none.
+    object_implementation(&this, object: ObjectType*, value: TypeRef) -> DeclarationNode* {
+        if (this.generic_registry == null) { return null; }
+        const heads: [DeclarationNode*] = this.generic_registry.heads_for(object.trait_def, value, this.intern_table);
+        for (mut i: i64 = 0; i < heads.length(); i++) {
+            const block: ImplBlock* = DeclarationNode::impl_of(heads[i]);
+            if (block == null) { continue; }
+            if (!this.generic_registry.binds_trait_arguments(block, &object.args, this.intern_table)) { continue; }
+            if (this.impl_applies(block, value, 0)) { return heads[i]; }
+        }
+        return null;
     }
 
     /// Whether `trait_def` is the object's own trait or one of its

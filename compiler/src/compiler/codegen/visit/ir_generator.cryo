@@ -1531,11 +1531,23 @@ type struct IRGeneratorVisitor {
     }
 
     /// A value converted to a trait object: the pair of its address and its
-    /// implementation's table.
+    /// implementation's table, or for a generic implementation, its copy's
+    /// for the value's type.
     visit_object_conversion(mut &this, e: ExpressionNode*, node: ObjectConversionExpr*) -> Emitted {
         mut out: Emitted = Emitted::none();
         const data: LValue = this.dispatch.codegen_rvalue(this, node.operand);
-        const table: LValue = this.cg.decl.object_table_global(node.implementation);
+        const block: ImplBlock* = if (node.implementation.object_table_symbol.is_valid()) {
+            node.implementation
+        } else {
+            node.implementation.object_instance(node.source)
+        };
+        if (block == null) {
+            this.cg.diag.emit_error_at_span(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                "codegen: a conversion to a trait object names an implementation with no table for the value's type",
+                e.span);
+            return out;
+        }
+        const table: LValue = this.cg.decl.object_table_global(block);
         const pair_ty: LType = this.cg.type_mapper.map_type(e.resolved_type);
         mut pair: LValue = LValue { raw: llvm::LLVMGetUndef(pair_ty.raw) };
         pair = this.cg.builder.build_insert_value(pair, data, 0, "object.data");

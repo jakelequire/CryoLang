@@ -20,9 +20,9 @@ language server".  From there, in order, to the v1.0 freeze:
    `class-removal`: the class feature is deleted, each of its forms refused
    where it is written (E0117, ruling 465), and `virtual &T`,
    `virtual mut &T` and `virtual T*` dispatch through a table (rulings 285,
-   288, 289, 415).  Left for trait objects: owning boxes, upcasting, and
-   generic implementations as objects, the last revisited before the
-   freeze (ruling 425); see "Trait objects" below.
+   288, 289, 415), a generic implementation's at its instantiation (583).
+   Left for trait objects: owning boxes and upcasting; see "Trait objects"
+   below.
 4. **Associated constants on concrete types.**  Built, on
    `associated-constants`: `i32::MAX`, `f64::NAN`, `Duration::NANOS_PER_SEC`,
    with `max_value()` removed (ruling 510).  Trait constants used as
@@ -390,10 +390,6 @@ Left over from that: the async entry point calls `Executor::new` and
 2. **`Display` and `Debug` over a trait object:** one non-generic `fmt`
    writing through a `virtual mut &FmtWrite` held by `Formatter`, in
    place of `fmt<W>`; code size and the fmt suites measured first.
-   Waits on generic implementations as objects (see "Trait objects"):
-   `String`'s `FmtWrite` is an implementation for `String<GlobalAlloc>`,
-   an instantiation of a generic struct, which does not convert to an
-   object yet.
 3. **Every item marked.**  About 650 helpers used only in their own
    module become `private`; about 215 used across the library become
    `internal`; implementation modules become `internal module`:
@@ -488,13 +484,12 @@ implementations as objects.
   names.
 
 A supertrait's methods are reachable from a subtrait object directly: the
-table holds them.  Still to build:
+table holds them, and a value whose implementation is generic converts at
+its instantiation, whose copy of the implementation holds the table
+(ruling 583).  Still to build:
 
 - **Owning boxes**, above.
 - **Upcasting** a subtrait object to an object of one of its supertraits.
-- **Generic implementations as objects:** how a generic implementation
-  coerced to an object becomes a monomorphization root, including in the
-  incremental cache.
 
 ## The compiler pipeline: AST, HIR, MIR, LLVM
 
