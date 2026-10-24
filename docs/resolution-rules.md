@@ -167,6 +167,21 @@ yet is recorded with the change that builds it, not here.
      replaces 556.  A file compiled without the standard library is
      `cryo build --no-std`.  (Jake)
 
+587. **The standard library hides only its own plumbing.**  `internal`
+     marks what only the library itself uses; a lower-level API a program
+     could build on stays public, and that nothing calls an item yet is
+     never a reason to hide it.  `collections::raw_buffer` and
+     `future::reactor` are public modules: `RawBuffer` and its methods,
+     `resize` among them, with its fields private; the reactor's
+     `require`, `register`, `cancel`, `register_timer`, `cancel_timer`
+     and `INTEREST_READ`/`INTEREST_WRITE`, with `start`, `stop`, `free`
+     and `set_current` internal.  `alloc::heap` and the process-spawn
+     argument buffers stay internal.  A higher-level collection's own
+     grow helpers are private to its module (`Array::reserve_grow` and
+     `resize_storage`, `HashMap::resize_buckets`, `Pool`'s `grow`), where
+     `Array::resize(new_length, value)` is the user's call.  (Jake;
+     `Pool`'s `grow`, delegated)
+
 ### 2026-10-23
 
 575. **Every length, position and size in the standard library is an

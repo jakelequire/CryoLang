@@ -1,0 +1,225 @@
+/// A program writes its own I/O futures on the standard library's reactor -
+/// a timer through `register_timer` / `cancel_timer`, and descriptor readiness
+/// through `register` / `cancel` with the `INTEREST_*` bits - and builds a
+/// container of its own on `RawBuffer`.  A failing check prints its number
+/// and the program exits with it.
+namespace UserFutureThroughPublicReactor::Main;
+
+import std::core::drop::{ Drop };
+import std::core::result::{ Result };
+import std::alloc::allocator::{ AllocError };
+import std::collections::raw_buffer::{ RawBuffer };
+import std::future::{ Elapsed, Futures };
+import std::future::poll::{ Poll };
+import std::future::waker::{ Context };
+import std::future::traits::{ Future };
+import std::future::reactor::{ INTEREST_READ, INTEREST_WRITE, Reactor };
+import std::net::addr::socket_addr::{ SocketAddr };
+import std::net::socket::udp::{ UdpIo, UdpSendTo, UdpSocket };
+import std::collections::array::{ Array };
+import std::time::clock::{ Instant };
+import std::time::duration::{ Duration };
+import std::ffi::libc;
+
+/// Completes once the monotonic clock passes its deadline, parked on a reactor
+/// timer while it waits.  `polls` counts how often it was polled.
+type struct Deadline {
+    at:    i64;
+    id:    u64;
+    rt:    Reactor*;
+    polls: i64;
+
+    static after_millis(ms: i64) -> Deadline {
+        return Deadline { at: Instant::now().as_nanos() + ms * 1000000, id: 0, rt: null, polls: 0 };
+    }
+
+    disarm(mut &this) -> void {
+        if (this.rt != null) {
+            this.rt.cancel_timer(this.id);
+            this.rt = null;
+        }
+        this.id = 0;
+    }
+}
+
+implement trait Future for struct Deadline {
+    type Output = i64;
+
+    poll(mut &this, cx: Context*) -> Poll<i64> {
+        this.polls = this.polls + 1;
+        if (Instant::now().as_nanos() >= this.at) {
+            this.disarm();
+            return Poll::Ready(this.polls);
+        }
+        this.disarm();
+        mut rt: Reactor* = Reactor::require();
+        this.rt = rt;
+        this.id = rt.register_timer(this.at, cx.waker());
+        return Poll::Pending;
+    }
+}
+
+implement trait Drop for struct Deadline {
+    drop(mut &this) -> void {
+        this.disarm();
+    }
+}
+
+/// Waits for one readiness event in `direction` on `socket`, then completes
+/// with the number of polls it took.  Cancels an armed direction when dropped
+/// before the event came.
+type struct Readiness {
+    socket:    UdpSocket;
+    direction: u32;
+    rt:        Reactor*;
+    polls:     i64;
+
+    static on(socket: UdpSocket, direction: u32) -> Readiness {
+        return Readiness { socket: socket, direction: direction, rt: null, polls: 0 };
+    }
+}
+
+implement trait Future for struct Readiness {
+    type Output = i64;
+
+    poll(mut &this, cx: Context*) -> Poll<i64> {
+        this.polls = this.polls + 1;
+        if (this.rt != null) {
+            this.rt = null;
+            return Poll::Ready(this.polls);
+        }
+        mut rt: Reactor* = Reactor::require();
+        rt.register(this.socket.raw_fd(), this.direction, cx.waker());
+        this.rt = rt;
+        return Poll::Pending;
+    }
+}
+
+implement trait Drop for struct Readiness {
+    drop(mut &this) -> void {
+        if (this.rt != null) {
+            this.rt.cancel(this.socket.raw_fd(), this.direction);
+            this.rt = null;
+        }
+    }
+}
+
+/// Arms INTEREST_READ on a socket and cancels it in the same poll, then parks
+/// on a timer `ms` milliseconds out and completes with its poll count.
+type struct ArmThenCancel {
+    socket: UdpSocket;
+    timer:  Deadline;
+
+    static on(socket: UdpSocket, ms: i64) -> ArmThenCancel {
+        return ArmThenCancel { socket: socket, timer: Deadline::after_millis(ms) };
+    }
+}
+
+implement trait Future for struct ArmThenCancel {
+    type Output = i64;
+
+    poll(mut &this, cx: Context*) -> Poll<i64> {
+        if (this.timer.polls == 0) {
+            mut rt: Reactor* = Reactor::require();
+            rt.register(this.socket.raw_fd(), INTEREST_READ, cx.waker());
+            rt.cancel(this.socket.raw_fd(), INTEREST_READ);
+        }
+        return this.timer.poll(cx);
+    }
+}
+
+/// A stack of `i64` built on `RawBuffer`, which keeps the storage while the
+/// stack keeps the length.
+type struct Stack {
+    buffer: RawBuffer<i64>;
+    length: i64;
+
+    static new() -> Stack {
+        return Stack { buffer: RawBuffer::new(), length: 0 };
+    }
+
+    push(mut &this, value: i64) -> Result<(), AllocError> {
+        this.buffer.reserve(this.length, 1, 4)?;
+        this.buffer.ptr()[this.length] = value;
+        this.length = this.length + 1;
+        return Result::Ok(());
+    }
+
+    sum(&this) -> i64 {
+        mut total: i64 = 0;
+        for (mut i: i64 = 0; i < this.length; i++) {
+            total = total + this.buffer.ptr()[i];
+        }
+        return total;
+    }
+}
+
+function bound_socket() -> UdpSocket {
+    match (UdpSocket::bind(SocketAddr::localhost_v4(0))) {
+        Result::Ok(s)  => { return s; }
+        Result::Err(_) => { libc::exit(90); }
+    }
+    return UdpSocket::from_fd(-1);
+}
+
+function fail(check: i32) -> i32 {
+    libc::printf("check %d failed\n", check);
+    return check;
+}
+
+async function main() -> i32 {
+    // 1. A timer future parks and is woken by the reactor: polled once to arm,
+    //    once more when the timer fires.
+    const timer_polls: i64 = await Deadline::after_millis(20);
+    if (timer_polls < 2) { return fail(1); }
+
+    // 2. A timer future that loses a timeout is dropped while armed, and its
+    //    drop cancels the arming; the program goes on.
+    const lost: Result<i64, Elapsed> =
+        await Futures::timeout(Duration::from_millis(10), Deadline::after_millis(60000));
+    match (lost) { Result::Ok(_) => { return fail(2); } Result::Err(_) => { } }
+
+    // 3. A fresh UDP socket is writable at once: arming INTEREST_WRITE fires
+    //    the waker, and the second poll completes.
+    mut writable: UdpSocket = bound_socket();
+    match (writable.set_nonblocking(true)) { Result::Ok(_) => { } Result::Err(_) => { return fail(3); } }
+    const write_polls: i64 = await Readiness::on(writable, INTEREST_WRITE);
+    if (write_polls != 2) { return fail(3); }
+
+    // 4. A socket holding a datagram is readable: arming INTEREST_READ fires
+    //    the waker, and the second poll completes.
+    mut receiver: UdpSocket = bound_socket();
+    mut sender: UdpSocket = bound_socket();
+    match (receiver.set_nonblocking(true)) { Result::Ok(_) => { } Result::Err(_) => { return fail(4); } }
+    match (sender.set_nonblocking(true)) { Result::Ok(_) => { } Result::Err(_) => { return fail(4); } }
+    mut destination: SocketAddr = SocketAddr::localhost_v4(0);
+    match (receiver.local_addr()) { Result::Ok(a) => { destination = a; } Result::Err(_) => { return fail(4); } }
+    mut payload: Array<u8> = Array::<u8>::new();
+    payload.push(7);
+    mut sent: UdpIo = await UdpSendTo::start(sender, payload, destination);
+    match (sent.outcome()) { Result::Ok(_) => { } Result::Err(_) => { return fail(4); } }
+    const read_polls: i64 = await Readiness::on(receiver, INTEREST_READ);
+    if (read_polls != 2) { return fail(4); }
+
+    // 5. A direction armed and cancelled before it could fire leaves nothing
+    //    behind: the future then parks on a timer alone and completes.
+    mut silent: UdpSocket = bound_socket();
+    match (silent.set_nonblocking(true)) { Result::Ok(_) => { } Result::Err(_) => { return fail(5); } }
+    const cancelled_polls: i64 = await ArmThenCancel::on(silent, 20);
+    if (cancelled_polls < 2) { return fail(5); }
+
+    // 6. RawBuffer grows along the doubling curve, is resized exactly, and
+    //    shrinks back, keeping what its owner stored.
+    mut stack: Stack = Stack::new();
+    for (mut i: i64 = 1; i <= 10; i++) {
+        match (stack.push(i)) { Result::Ok(_) => { } Result::Err(_) => { return fail(6); } }
+    }
+    if (stack.sum() != 55 || stack.buffer.capacity() < 10) { return fail(6); }
+    match (stack.buffer.resize(32)) { Result::Ok(_) => { } Result::Err(_) => { return fail(6); } }
+    if (stack.buffer.capacity() != 32) { return fail(6); }
+    stack.buffer.shrink_to(stack.length);
+    if (stack.buffer.capacity() != 10 || stack.sum() != 55) { return fail(6); }
+
+    libc::printf("public reactor: 6 of 6 checks passed\n");
+    return 0;
+}

@@ -2766,17 +2766,15 @@ The namespace serves as the file's identity within the project. The compiler use
 A directory of related files uses a `_module.cryo` aggregator to declare which submodules exist and how far each reaches.
 
 ```cryo
-// stdlib/collections/_module.cryo
-namespace std::collections;
+// stdlib/alloc/_module.cryo
+namespace std::alloc;
 
-module collections::array;
+module alloc::box;
 module {
-    collections::str;
-    collections::string;
-    collections::hashmap;
-    collections::hashset;
+    alloc::layout;
+    alloc::allocator;
 }
-internal module collections::raw_buffer;
+internal module alloc::heap;
 ```
 
 A submodule is public: `module x;` declares one, and `module { a; b; }` declares several, each entry ending in `;`. `public module` is refused (`E0117`), since there is no other kind of module for `public` to tell it from. `internal module x;` and `internal module { a; b; }` declare submodules that reach only their own package, one cryoconfig project. An import or an export of an internal module from another package is refused (`E0353`), and so is a module declared under one, which reaches no further than its parent. The line that declares a module decides its reach even when nothing a program imports loads the file holding that line, as when the program imports the module directly. Everything an internal module declares reaches its package however it is marked: a `public` function in it called from another package is `E0353`, a type named from there is `E0503`, and a public signature may not name it (`E0506`, [section 13.4](#134-visibility)).
