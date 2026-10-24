@@ -390,6 +390,10 @@ Left over from that: the async entry point calls `Executor::new` and
 2. **`Display` and `Debug` over a trait object:** one non-generic `fmt`
    writing through a `virtual mut &FmtWrite` held by `Formatter`, in
    place of `fmt<W>`; code size and the fmt suites measured first.
+   Waits on generic implementations as objects (see "Trait objects"):
+   `String`'s `FmtWrite` is an implementation for `String<GlobalAlloc>`,
+   an instantiation of a generic struct, which does not convert to an
+   object yet.
 3. **Every item marked.**  About 650 helpers used only in their own
    module become `private`; about 215 used across the library become
    `internal`; implementation modules become `internal module`:
