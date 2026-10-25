@@ -415,7 +415,10 @@ Left over from that: the async entry point calls `Executor::new` and
    and so is `alloc::heap`, as the allocator `NativeHeap` with its raw
    calls internal (589).  `Array`'s, `HashMap`'s and `Pool`'s own grow
    helpers are private, `String`'s buffer is a private field, and so are
-   `Layout`'s size and alignment, behind its accessors.  HPACK
+   `Layout`'s size and alignment, behind its accessors.  `alloc` is
+   marked item by item but for `ArcInner`, the arena's and pool's
+   default sizes and `GlobalArena`'s four routing reads: `Box`'s fields are private behind `from_raw_in`, and
+   the growth curve `next_capacity` internal (592).  HPACK
    is tested through `Http2Connection` against RFC 7541's examples, and
    the heap through `GlobalAlloc` with `native_alloc` on and as the
    allocator of an array, a hash map and a string without it.  An `internal module` line now hides its

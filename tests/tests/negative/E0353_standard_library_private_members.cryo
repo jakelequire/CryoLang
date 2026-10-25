@@ -3,7 +3,12 @@
 // helpers `Array`, `HashMap` and `Pool` grow by are private to their own
 // modules, behind the public `reserve` and the allocation calls.  A
 // `Layout`'s size and alignment are read through its accessors, and one is
-// made only by its constructors, which check the alignment.
+// made only by its constructors, which check the alignment.  A `Box` is made
+// by its constructors and `from_raw`/`from_raw_in`, and its pointer read
+// through `as_ptr`; the handles of `Rc`, `Arc`, `Arena` and `Pool` keep their
+// state private, the growth curve collections share is internal, and the
+// allocator's platform calls, the arena's routing slot and the pool's free
+// list types are private to their modules.
 ![config(testing)]
 ![config(negative, E0353)]
 namespace CryoTests::Negative::E0353StandardLibraryPrivateMembers;
@@ -12,7 +17,13 @@ import std::alloc::heap::{ NativeHeap };
 import std::collections::array::{ Array };
 import std::collections::hashmap::{ HashMap };
 import std::alloc::layout::{ Layout };
-import std::alloc::pool::{ Pool };
+import std::alloc::pool::{ Pool, FreeNode };
+//~^ ERROR[E0353] `std::alloc::pool::FreeNode` is private and cannot be imported
+import std::alloc::box::{ Box };
+import std::alloc::rc::{ Rc };
+import std::alloc::arc::{ Arc };
+import std::alloc::arena::{ Arena };
+import std::alloc::allocator::{ GlobalAlloc };
 
 function main() -> int {
     const named: NativeHeap = NativeHeap::new();
@@ -41,5 +52,36 @@ function main() -> int {
     const forged: Layout = Layout { size: 8, alignment: 3 };
     //~^ ERROR[E0353] field `size` of `std::alloc::layout::Layout` is private
     //~^^ ERROR[E0353] field `alignment` of `std::alloc::layout::Layout` is private
+
+    const boxed: Box<i64> = Box::new(5);
+    const held: i64* = boxed.ptr;
+    //~^ ERROR[E0353] field `ptr` of `std::alloc::box::Box` is private
+    const owner: GlobalAlloc = boxed.alloc;
+    //~^ ERROR[E0353] field `alloc` of `std::alloc::box::Box` is private
+    const rebuilt: Box<i64> = Box::<i64, GlobalAlloc> { ptr: held, alloc: GlobalAlloc::new() };
+    //~^ ERROR[E0353] field `ptr` of `std::alloc::box::Box` is private
+    //~^^ ERROR[E0353] field `alloc` of `std::alloc::box::Box` is private
+
+    const next_size: i64 = allocator::next_capacity(1, 9, 4);
+    //~^ ERROR[E0353] `std::alloc::allocator::next_capacity` is internal and cannot be called
+    const platform: void* = allocator::backend_alloc(Layout::of::<i64>());
+    //~^ ERROR[E0353] `std::alloc::allocator::backend_alloc` is private and cannot be called
+    const ceiling: u64 = allocator::MAX_REALLOC_ALIGN;
+    //~^ ERROR[E0353] `std::alloc::allocator::MAX_REALLOC_ALIGN` is private and cannot be named
+
+    const counted: Rc<i64> = Rc::new(3);
+    const counted_header: u64 = counted.inner as u64;
+    //~^ ERROR[E0353] field `inner` of `std::alloc::rc::Rc` is private
+    const shared: Arc<i64> = Arc::new(4);
+    const shared_header: u64 = shared.inner as u64;
+    //~^ ERROR[E0353] field `inner` of `std::alloc::arc::Arc` is private
+
+    const region: Arena = Arena::new();
+    const chunk_bytes: u64 = region.chunk_size;
+    //~^ ERROR[E0353] field `chunk_size` of `std::alloc::arena::Arena` is private
+    const routed: u64 = arena::g_alloc_arena as u64;
+    //~^ ERROR[E0353] `std::alloc::arena::g_alloc_arena` is private and cannot be named
+    const free_slots: u64 = slots.free_list as u64;
+    //~^ ERROR[E0353] field `free_list` of `std::alloc::pool::Pool` is private
     return 0;
 }

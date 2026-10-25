@@ -5,7 +5,10 @@ namespace CryoTests::Tests::Stdlib::BoxT;
 
 import std::core::result::{ Result };
 import std::core::mem;
+import std::core::ptr::{ NonNull };
 import std::alloc::box::{ Box };
+import std::alloc::layout::{ Layout };
+import std::alloc::allocator::{ AllocError, Allocator, GlobalAlloc };
 import std::test::error::{ TestError };
 import std::test::assert::{ expect_eq };
 
@@ -58,6 +61,57 @@ function into_raw_then_from_raw_round_trip() -> Result<(), TestError> {
     mut b2: Box<i32> = Box::from_raw(raw);
     const got: i32 = *b2.as_ptr();
     match (expect_eq(got, 123)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+/// Counts, through the test's own locals, what it hands out and takes back.
+type struct BoxCountingAlloc {
+    allocated: i64*;
+    released:  i64*;
+}
+
+implement trait Allocator for struct BoxCountingAlloc {
+    allocate(mut &this, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+        *this.allocated = *this.allocated + 1;
+        mut global: GlobalAlloc = GlobalAlloc::new();
+        return global.allocate(layout);
+    }
+    deallocate(mut &this, ptr: NonNull<u8>, layout: Layout) -> void {
+        *this.released = *this.released + 1;
+        mut global: GlobalAlloc = GlobalAlloc::new();
+        global.deallocate(ptr, layout);
+    }
+}
+
+// A pointer given up by a box on another allocator is re-wrapped with that
+// allocator, and the new box frees it there when dropped.
+![test]
+function into_raw_then_from_raw_in_frees_through_the_allocator() -> Result<(), TestError> {
+    mut allocated: i64 = 0;
+    mut released: i64 = 0;
+    const b1: Box<i64, BoxCountingAlloc> = Box::<i64, BoxCountingAlloc>::new_in(
+        77, BoxCountingAlloc { allocated: &allocated, released: &released });
+    const raw: i64* = b1.into_raw();
+    mut b2: Box<i64, BoxCountingAlloc> = Box::<i64, BoxCountingAlloc>::from_raw_in(
+        raw, BoxCountingAlloc { allocated: &allocated, released: &released });
+    const got: i64 = *b2.as_ptr();
+    match (expect_eq(got, 77)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(released, 0)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    mem::drop(b2);
+    match (expect_eq(allocated, 1)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(released, 1)) {
         Result::Ok(_) => { }
         Result::Err(e) => { return Result::Err(e); }
     }

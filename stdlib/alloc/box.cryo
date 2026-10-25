@@ -24,8 +24,8 @@ public type struct Box<T, A = GlobalAlloc> where A: Allocator {
     // Raw (nullable) so `drop` can null it and stay idempotent: a
     // double drop is a no-op rather than a double free. Non-null for the
     // whole live lifetime; only the post-drop husk holds null.
-    ptr:   T*;
-    alloc: A;
+    private ptr:   T*;
+    private alloc: A;
 
     /// Allocate heap storage via `GlobalAlloc` and move `value` into it.
     /// Panics if the allocator refuses the request; use `try_new` to
@@ -84,13 +84,11 @@ public type struct Box<T, A = GlobalAlloc> where A: Allocator {
         return Result::Ok(Box::<T, A> { ptr: typed_ptr, alloc: a });
     }
 
-    /// Re-wrap a pointer previously produced by `into_raw` (or `leak`).
-    /// The pointer must have come from a `Box<T, GlobalAlloc>`; using
-    /// this constructor on a pointer that was allocated by a different
-    /// allocator yields a `Box` that will free with the wrong allocator
-    /// on drop.  Custom-allocator users that need this round-trip
-    /// should reconstitute the allocator + pointer themselves and
-    /// build `Box<T, A> { ptr: ..., alloc: ... }` directly.
+    /// Re-wrap a pointer previously produced by `into_raw` on a
+    /// `Box<T, GlobalAlloc>`.  A pointer allocated by any other allocator
+    /// yields a `Box` that frees it with the wrong one on drop; re-wrap
+    /// such a pointer with `from_raw_in`, passing its allocator.  Panics
+    /// on a null pointer.
     public static from_raw(raw: T*) -> Box<T, GlobalAlloc> {
         if (raw == null) {
             core::panic("Box::from_raw called with a null pointer", intrinsics::location());
@@ -99,6 +97,16 @@ public type struct Box<T, A = GlobalAlloc> where A: Allocator {
             ptr:   raw,
             alloc: GlobalAlloc::new()
         };
+    }
+
+    /// Re-wrap a pointer previously produced by `into_raw` on a
+    /// `Box<T, A>`, with the allocator that allocated it, which the box
+    /// frees it through on drop.  Panics on a null pointer.
+    public static from_raw_in(raw: T*, alloc: A) -> Box<T, A> {
+        if (raw == null) {
+            core::panic("Box::from_raw_in called with a null pointer", intrinsics::location());
+        }
+        return Box::<T, A> { ptr: raw, alloc: alloc };
     }
 
     /// Raw pointer to the owned value.  Valid for the lifetime of the
@@ -123,8 +131,9 @@ public type struct Box<T, A = GlobalAlloc> where A: Allocator {
     }
 
     /// Give up ownership and return the raw pointer.  The caller becomes
-    /// responsible for freeing the memory (typically via
-    /// `Box::from_raw`); dropping this box afterwards would double-free.
+    /// responsible for freeing the memory (typically via `Box::from_raw`,
+    /// or `Box::from_raw_in` for another allocator); dropping this box
+    /// afterwards would double-free.
     ///
     /// Takes `this` by value (consumes the receiver) and destructures
     /// the Box so the move-checker treats it as fully consumed;
@@ -132,14 +141,6 @@ public type struct Box<T, A = GlobalAlloc> where A: Allocator {
     /// allocator instance is destructured out and dropped at the end of
     /// this function; for `GlobalAlloc` that's a no-op.
     public into_raw(mut this) -> T* {
-        const { ptr, alloc }: Box<T, A> = this;
-        return ptr;
-    }
-
-    /// Bridge alias for `into_raw`, kept so legacy callers reading the
-    /// new stdlib can still spell "leak this allocation."  Same behavior:
-    /// give up ownership and return the raw pointer.
-    public leak(mut this) -> T* {
         const { ptr, alloc }: Box<T, A> = this;
         return ptr;
     }
@@ -157,16 +158,15 @@ public type struct Box<T, A = GlobalAlloc> where A: Allocator {
 /// Ownership obligation: every `Box` must have `drop` called exactly
 /// once before it goes out of scope.
 ///
-/// Note: `into_raw` and `leak` transfer ownership of both the value and
-/// the allocation to the caller, so T's drop is NOT called for those
-/// paths.
+/// Note: `into_raw` transfers ownership of both the value and the
+/// allocation to the caller, so T's drop is NOT called for that path.
 implement<T, A> trait Drop for struct Box<T, A>
 where A: Allocator {
     drop(mut &this) -> void {
         // Idempotent: a second drop of the same Box is a no-op rather
         // than a double free (matches the rest of the stdlib, whose Drop
-        // impls all null their pointer). `into_raw`/`leak` consume the
-        // Box so this path doesn't run after them.
+        // impls all null their pointer). `into_raw` consumes the Box so
+        // this path doesn't run after it.
         if (this.ptr == null) { return; }
         ptr::drop_in_place::<T>(this.ptr);
         const block: Layout = Layout::of::<T>();

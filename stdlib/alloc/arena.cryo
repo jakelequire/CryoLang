@@ -54,7 +54,7 @@ const DEFAULT_CHUNK_SIZE: u64 = 1048576;
 
 // Chunk: one contiguous region in the Arena's chunk list
 
-type struct Chunk {
+private type struct Chunk {
     data: u8*;
     capacity: u64;
     offset: u64;
@@ -140,25 +140,25 @@ type struct Chunk {
     }
 }
 
-type struct Arena {
-    head: Chunk*;
+public type struct Arena {
+    private head: Chunk*;
     // Allocation frontier: the chunk `bump` advances into on the fast
     // path. Distinct from `head` (the list anchor used by reset/capacity/
     // release) so that, after a `reset`, allocation can march back through
     // the already-allocated chunks and reuse them instead of prepending
     // fresh ones every cycle. `null` until the first chunk is allocated.
-    current: Chunk*;
-    chunk_size: u64;
+    private current: Chunk*;
+    private chunk_size: u64;
 
     /// Create an arena whose chunks are `DEFAULT_CHUNK_SIZE` bytes each.
-    static new() -> Arena {
+    public static new() -> Arena {
         return Arena { head: null, current: null, chunk_size: DEFAULT_CHUNK_SIZE };
     }
 
     /// Create an arena with a custom chunk size. Requests larger than
     /// `chunk_size` get their own chunk sized to fit, so the choice is a
     /// hint about *typical* allocation size, not a hard cap.
-    static with_chunk_size(chunk_size: u64) -> Arena {
+    public static with_chunk_size(chunk_size: u64) -> Arena {
         if (chunk_size == 0) {
             core::panic("Arena::with_chunk_size: chunk_size must be non-zero", intrinsics::location());
         }
@@ -174,7 +174,7 @@ type struct Arena {
     /// Previously allocated pointers are invalidated; callers must
     /// ensure no references survive this call. To actually release the
     /// chunks back to the platform allocator, drop the arena.
-    reset(mut &this) -> void {
+    public reset(mut &this) -> void {
         mut chunk: Chunk* = this.head;
         loop {
             if (chunk == null) { break; }
@@ -187,7 +187,7 @@ type struct Arena {
     }
 
     /// Total bytes currently held in chunks (including unused tail).
-    capacity(&this) -> u64 {
+    public capacity(&this) -> u64 {
         mut total: u64 = 0;
         mut chunk: Chunk* = this.head;
         loop {
@@ -199,7 +199,7 @@ type struct Arena {
     }
 
     /// Bytes handed out so far; this is the high-water mark for the arena.
-    used(&this) -> u64 {
+    public used(&this) -> u64 {
         mut total: u64 = 0;
         mut chunk: Chunk* = this.head;
         loop {
@@ -220,7 +220,7 @@ type struct Arena {
     /// Hand out `size` bytes aligned to `align` from the arena.  Returns
     /// `null` on out-of-memory or a zero-sized request.  Marches through
     /// the chunk list (reusing chunks emptied by `reset`) before growing.
-    bump(mut &this, size: u64, align: u64) -> void* {
+    public bump(mut &this, size: u64, align: u64) -> void* {
         if (size == 0) { return null; }
         const block: Layout = Layout::new(size, align);
 
@@ -277,7 +277,7 @@ type struct Arena {
     /// pointers so they are never handed to libc `free`.  Range-scan of
     /// the chunk list (mirrors `capacity`); a pointer one-past-the-end of
     /// a chunk is intentionally excluded.
-    owns(&this, ptr: void*) -> boolean {
+    public owns(&this, ptr: void*) -> boolean {
         const addr: u64 = ptr as u64;
         mut chunk: Chunk* = this.head;
         loop {
@@ -299,7 +299,7 @@ type struct Arena {
     /// only ever grows).  Otherwise a fresh block is allocated and the
     /// old contents copied; the old block is stranded until `reset`.
     /// Returns `null` on out-of-memory.
-    grow(mut &this, ptr: void*, old_size: u64, new_size: u64, align: u64) -> void* {
+    public grow(mut &this, ptr: void*, old_size: u64, new_size: u64, align: u64) -> void* {
         if (this.current != null) {
             const cur: Chunk* = this.current;
             const base: u64 = cur.data as u64;
@@ -334,7 +334,7 @@ type struct Arena {
     /// Release every chunk back to the platform allocator.  Invoked by the
     /// `Drop` impl in `alloc::arena_alloc`; exposed as an inherent method
     /// so the drop logic lives next to the allocation logic.
-    release(mut &this) -> void {
+    public release(mut &this) -> void {
         mut chunk: Chunk* = this.head;
         loop {
             if (chunk == null) { break; }
@@ -359,8 +359,8 @@ type struct Arena {
 // null/false, so the arena is physically incapable of activating - zero
 // user impact.
 
-mut g_alloc_arena: Arena* = null;
-mut g_alloc_arena_active: boolean = false;
+private mut g_alloc_arena: Arena* = null;
+private mut g_alloc_arena_active: boolean = false;
 
 /// The process-wide per-target arena routing slot.  Zero-sized: all state
 /// lives in the two module globals above (mirrors how `GlobalAlloc` is a ZST
@@ -368,14 +368,14 @@ mut g_alloc_arena_active: boolean = false;
 /// reallocate` route every heap allocation through these statics; the compiler
 /// driver `publish`es its arena and brackets `set_active` around the heavy
 /// pipeline.  Null/inactive everywhere else -> the consult branches are dead.
-type struct GlobalArena {
+public type struct GlobalArena {
     /// Publish `a` as THE per-target global arena.
-    static publish(a: Arena*) -> void { g_alloc_arena = a; }
+    public static publish(a: Arena*) -> void { g_alloc_arena = a; }
 
     /// Gate whether *new* allocations route to the arena.  Free/realloc
     /// routing does NOT consult this flag (see `holds`), so a buffer is never
     /// handed to libc `free` even after the arena is deactivated.
-    static set_active(active: boolean) -> void { g_alloc_arena_active = active; }
+    public static set_active(active: boolean) -> void { g_alloc_arena_active = active; }
 
     /// True when a fresh allocation should be served from the global arena.
     static routing() -> boolean {

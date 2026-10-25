@@ -224,6 +224,16 @@ yet is recorded with the change that builds it, not here.
      `String<NativeHeap>` had none.  (Jake asked for the fix; the rule
      follows from 98's `This` naming the enclosing type)
 
+592. **A `Box` is made only by its constructors, and gives its pointer up
+     only through `into_raw`.**  Its pointer and allocator are private
+     fields; `Box::from_raw_in(ptr, alloc)` re-wraps a pointer from a box
+     on any allocator, as `from_raw` does for `GlobalAlloc`'s, and `leak`,
+     which did what `into_raw` does, is gone.  `next_capacity`, the growth
+     curve `Array` and `RawBuffer` share, is internal; the allocator's
+     platform calls are private to it; `Rc`, `Arc`, `Weak`, `Arena` and
+     `Pool` keep their state in private fields.  (Jake; the rest of the
+     module's marking, delegated under 587)
+
 ### 2026-10-23
 
 575. **Every length, position and size in the standard library is an
