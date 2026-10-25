@@ -422,7 +422,8 @@ Left over from that: the async entry point calls `Executor::new` and
    mark every constant, type, field and wrapper `public` but `sys`'s
    private `normalize`; a function in an `extern` block can be written
    `internal` or `private` and not `public`, so the bindings there stay
-   public by the default.  HPACK
+   public by the default.  `encoding`'s base64 and SHA-1 helpers are
+   private, behind `encode`, `decode` and `sha1`.  HPACK
    is tested through `Http2Connection` against RFC 7541's examples, and
    the heap through `GlobalAlloc` with `native_alloc` on and as the
    allocator of an array, a hash map and a string without it.  An `internal module` line now hides its
