@@ -111,19 +111,19 @@ FunctionDecl       ::= Visibility? "async"? "function" Ident Generics?
 
 ExternDecl         ::= "extern" "function" Ident
                        "(" ParamList? ")" ("->" Type)? ";"
-                     | "extern" StringLit "{" ExternItem* "}"
+                     | Visibility? "extern" StringLit "{" ExternItem* "}"
 ExternItem         ::= ExternFn | ExternGlobal
-(*  An imported function is a top-level declaration of its module and
-    takes the top-level default: public unless `internal` or `private`
-    narrows it. *)
-ExternFn           ::= ("internal" | "private")? "function" Ident
+(*  An imported function or global is a top-level declaration of its
+    module.  Its own visibility decides its reach; without one it takes
+    the visibility written before `extern`, and public when none is. *)
+ExternFn           ::= Visibility? "function" Ident
                        "(" ParamList? ")" ("->" Type)? ";"
 
 (*  An imported global: storage the linked library owns.  The type is
     required and an initializer is rejected - there is nothing to infer
     from, and writing one would define the symbol here.  `mut`/`const`
     say what CRYO may do with it, not what the library may.        *)
-ExternGlobal       ::= ("mut" | "const") Ident ":" Type ";"
+ExternGlobal       ::= Visibility? ("mut" | "const") Ident ":" Type ";"
 
 (*  C-header import - a named-namespace form of `extern "C"` that
     asks the compiler to invoke clang on the listed headers and pull

@@ -2865,7 +2865,7 @@ const n: i32 = Tag(4);                // Labels's function
 | `internal`          | Accessible to every module of the declaring package - for items and members alike.       |
 | `private`           | Accessible only within the declaring module - for items and members alike.               |
 
-A **package** is one cryoconfig project: the program being built, each of its dependencies, each vendored library, and the standard library, which is one package. `internal` is written wherever `private` can be - on an item, a field, a method, a static, a type's constant, a function in an `extern` block, and as a member label `internal:` - and reaches every module of its own package and none of another's. A module is public; an `internal module` and everything it declares reach its package alone ([section 13.2](#132-module-aggregators)), so an item's reach is the narrower of its own and its module's.
+A **package** is one cryoconfig project: the program being built, each of its dependencies, each vendored library, and the standard library, which is one package. `internal` is written wherever `private` can be - on an item, a field, a method, a static, a type's constant, a function or global in an `extern` block or the block itself ([section 17.1](#171-extern-blocks)), and as a member label `internal:` - and reaches every module of its own package and none of another's. A module is public; an `internal module` and everything it declares reach its package alone ([section 13.2](#132-module-aggregators)), so an item's reach is the narrower of its own and its module's.
 
 Top-level items are **public by default**; mark an item `private` to confine it to its own module, or `internal` to its package. For top-level types (`struct` / `union` / `enum`, an alias and a trait), visibility is enforced across modules: naming a `private` type from another module, or an `internal` one from another package - in a type annotation, a struct literal, a bound, or a function signature - is rejected with `E0503`. Such a type remains fully usable where it is visible. A `private` function, constant or global named from another module, or an `internal` one from another package, by a path or an import, is `E0353`, as is a field, method or static reached so.
 
@@ -3548,7 +3548,19 @@ A function declared in an `extern` block is a top-level declaration of the
 module that holds the block, with the top-level visibility default: it is
 public - importable as `import ffi::libc::{ puts }` and nameable as
 `libc::puts` - unless written `private function`, which keeps it to that
-module.
+module, or `internal function`, which keeps it to its package. `public
+function` says the default outright.
+
+A visibility written before the block is the visibility of every function
+and imported global in it that writes none, so a block of public bindings is
+marked once. One written on the function or global itself decides its own:
+
+```cryo
+public extern "C" {
+    function strlen(s: u8*) -> u64;            // public, from the block
+    private function strerror(code: i32) -> u8*; // private: its own keyword
+}
+```
 
 An `extern` block also declares **imported globals** — variables whose storage
 belongs to the library being linked:
@@ -3581,7 +3593,8 @@ extern "C" {
 ```
 
 An imported global is reached like any other: bare inside its own module, and
-qualified (`Binding::gv_counter`) from outside.
+qualified (`Binding::gv_counter`) from outside. It takes a visibility as an
+imported function does: `private mut gv_counter: i32;` keeps it to its module.
 
 ### 17.2 C Header Import
 

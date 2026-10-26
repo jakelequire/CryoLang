@@ -133,6 +133,19 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-25
+
+593. **An `extern` block's functions are marked one by one or all at
+     once.**  `public`, `internal` or `private` may be written on a
+     function or a global inside an `extern` block, and before the block
+     itself (`public extern "C" { ... }`), where it is the visibility of
+     every function and global in the block that writes none.  One written
+     on the function or global decides its own, so a `private function` in
+     a `public extern` block is private.  A keyword written on an imported
+     global was dropped before, leaving it public.  (Jake; the block's
+     keyword as a default its members may override, and the same keywords
+     on globals, delegated)
+
 ### 2026-10-24
 
 583. **A value whose type implements a trait by a generic implementation

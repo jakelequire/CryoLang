@@ -356,6 +356,14 @@ implement struct Parser {
                 || tok.kind == TokenType::KwPrivate) {
             const vis_span: SourceSpan = this.span_from_token(tok);
             this.advance();
+            if (this.check(TokenType::KwExtern) && this.peek_at(1).kind != TokenType::KwModule) {
+                const marked: DeclarationNode* = this.parse_extern_block(Parser::written_visibility(tok.kind));
+                if (marked != null && doc != "") {
+                    marked.set_documentation(doc);
+                }
+                Parser::note_decl_modifier(Node::Decl(marked), vis_span);
+                return Node::Decl(marked);
+            }
             const decl: Node = this.parse_declaration(Parser::written_visibility(tok.kind), doc);
             Parser::note_decl_modifier(decl, vis_span);
             return decl;
@@ -388,7 +396,7 @@ implement struct Parser {
                 }
                 return Node::Decl(cext);
             }
-            const ext: DeclarationNode* = this.parse_extern_block();
+            const ext: DeclarationNode* = this.parse_extern_block(Visibility::Public);
             if (ext != null && doc != "") {
                 ext.set_documentation(doc);
             }
@@ -2436,8 +2444,11 @@ implement struct Parser {
         return decl;
     }
 
-    /// Parse an extern block: extern "C" { function declarations }
-    parse_extern_block() -> DeclarationNode* {
+    /// Parse an extern block: extern "C" { function declarations }.
+    /// `block_visibility` is the keyword written before `extern`, or public
+    /// when none was: the visibility of every function and global in the
+    /// block that does not write its own.
+    parse_extern_block(block_visibility: Visibility) -> DeclarationNode* {
         const start: Token = this.advance(); // consume 'extern'
         mut linkage: string = "C";
 
@@ -2467,13 +2478,15 @@ implement struct Parser {
             }
             if (this.check(TokenType::RBrace) || this.is_at_end()) { break; }
 
-            // An imported function is a top-level declaration of this module
-            // and takes the top-level default: public unless `internal` or
-            // `private` narrows it.  Declared private, `import libc::{ f }`
-            // binds nothing and every use of `f` is reachable only by its
-            // bare leaf.
-            mut ext_visibility: Visibility = Visibility::Public;
-            if (this.check(TokenType::KwPrivate) || this.check(TokenType::KwInternal)) {
+            // An imported function or global is a top-level declaration of
+            // this module.  Its own `public`, `internal` or `private` decides
+            // its reach;
+            // without one it takes the block's.  Declared private,
+            // `import libc::{ f }` binds nothing and every use of `f` is
+            // reachable only by its bare leaf.
+            mut ext_visibility: Visibility = block_visibility;
+            if (this.check(TokenType::KwPublic) || this.check(TokenType::KwPrivate)
+                    || this.check(TokenType::KwInternal)) {
                 ext_visibility = Parser::written_visibility(this.current().kind);
                 this.advance();
             }
@@ -2489,6 +2502,7 @@ implement struct Parser {
             } else if (this.check(TokenType::KwMut) || this.check(TokenType::KwConst)) {
                 const gvar: DeclarationNode* = this.parse_extern_global();
                 if (gvar != null) {
+                    DeclarationNode::var_of(gvar).visibility = ext_visibility;
                     for (mut pi: i64 = 0; pi < pending_dirs.length(); pi++) {
                         gvar.add_directive(pending_dirs[pi]);
                     }
