@@ -62,20 +62,20 @@ import std::future::waker;
 import std::future::traits;
 
 /// The 24-octet client connection preface (RFC 7540 section 3.5).
-const PREFACE_LEN: i64 = 24;
+public const PREFACE_LEN: i64 = 24;
 
 /// Values we advertise in our SETTINGS frame.
-const LOCAL_HEADER_TABLE_SIZE:   u32 = 4096;
-const LOCAL_ENABLE_PUSH:         u32 = 0;          // we never accept pushed streams
-const LOCAL_INITIAL_WINDOW_SIZE: u32 = 1048576;    // 1 MiB receive window per stream
-const LOCAL_MAX_FRAME_SIZE:      u32 = 16384;      // default; also our read cap
+private const LOCAL_HEADER_TABLE_SIZE:   u32 = 4096;
+private const LOCAL_ENABLE_PUSH:         u32 = 0;          // we never accept pushed streams
+private const LOCAL_INITIAL_WINDOW_SIZE: u32 = 1048576;    // 1 MiB receive window per stream
+private const LOCAL_MAX_FRAME_SIZE:      u32 = 16384;      // default; also our read cap
 // Cap on an assembled header block (HEADERS + CONTINUATION fragments). A
 // peer can otherwise stream CONTINUATION frames without END_HEADERS and
 // grow the buffer without bound (a CONTINUATION flood); and HPACK can
 // expand a small block into a large header list (a decompression bomb). We
 // advertise this as SETTINGS_MAX_HEADER_LIST_SIZE and the decoder enforces
 // the matching decoded-size ceiling (hpack::MAX_DECODED_HEADER_LIST).
-const LOCAL_MAX_HEADER_LIST_SIZE: u32 = 262144;    // 256 KiB
+private const LOCAL_MAX_HEADER_LIST_SIZE: u32 = 262144;    // 256 KiB
 // Cap on an assembled DATA body (the sum of all DATA frame payloads on a
 // stream).  Without it a peer streams DATA frames without END_STREAM and
 // grows the buffer without bound (a remote memory-exhaustion DoS), because
@@ -83,44 +83,44 @@ const LOCAL_MAX_HEADER_LIST_SIZE: u32 = 262144;    // 256 KiB
 // Mirrors the HTTP/1.1 `MAX_BODY` cap (16 MiB).  Checked at the top of the read
 // loop, so it overshoots by at most one frame before we stop replenishing and
 // fail.
-const LOCAL_MAX_BODY_SIZE: i64 = 16777216;         // 16 MiB
+private const LOCAL_MAX_BODY_SIZE: i64 = 16777216;         // 16 MiB
 
 /// The connection-level flow-control window initial value is fixed at
 /// 65535 octets (RFC 7540 section 6.9.2); it is not affected by SETTINGS.
-const DEFAULT_CONNECTION_WINDOW: i64 = 65535;
+public const DEFAULT_CONNECTION_WINDOW: i64 = 65535;
 
 /// A decoded request paired with the stream it arrived on. A plain
 /// carrier with no destructor: `serve` always moves `req` out to the
 /// handler, so the field is consumed exactly once.
-type struct RequestOnStream {
-    stream_id: u32;
-    req:       Request;
+public type struct RequestOnStream {
+    public stream_id: u32;
+    public req:       Request;
 }
 
-type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
-    conn:                  BufStream<S>;
-    private codec:         C;
-    is_client:             boolean;
-    next_stream_id:        u32;
-    goaway_received:       boolean;
+public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
+    private conn:                  BufStream<S>;
+    private codec:                 C;
+    private is_client:             boolean;
+    private next_stream_id:        u32;
+    private goaway_received:       boolean;
     // Peer parameters that bound what we send.
-    remote_max_frame:      i64;
-    remote_initial_window: i64;
+    private remote_max_frame:      i64;
+    private remote_initial_window: i64;
     // Send-side flow-control windows for the single active stream.
-    conn_send_window:      i64;
-    stream_send_window:    i64;
+    private conn_send_window:      i64;
+    private stream_send_window:    i64;
 
     /// New client-side connection taking ownership of `conn`, coding its
     /// header blocks with HPACK. Call `handshake_client` before issuing
     /// requests.
-    static new_client(conn: BufStream<S>) -> Http2Connection<S> {
+    public static new_client(conn: BufStream<S>) -> Http2Connection<S> {
         return Http2Connection::<S>::new_client_with_codec(
             conn, HpackCodec::new(LOCAL_HEADER_TABLE_SIZE as i64));
     }
 
     /// New client-side connection taking ownership of `conn`, coding its
     /// header blocks with `codec`.
-    static new_client_with_codec(conn: BufStream<S>, codec: C) -> Http2Connection<S, C> {
+    public static new_client_with_codec(conn: BufStream<S>, codec: C) -> Http2Connection<S, C> {
         return Http2Connection::<S, C> {
             conn:                  conn,
             codec:                 codec,
@@ -136,14 +136,14 @@ type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
 
     /// New server-side connection over an accepted, already-buffered
     /// transport, coding its header blocks with HPACK.
-    static new_server(conn: BufStream<S>) -> Http2Connection<S> {
+    public static new_server(conn: BufStream<S>) -> Http2Connection<S> {
         return Http2Connection::<S>::new_server_with_codec(
             conn, HpackCodec::new(LOCAL_HEADER_TABLE_SIZE as i64));
     }
 
     /// New server-side connection over an accepted, already-buffered
     /// transport, coding its header blocks with `codec`.
-    static new_server_with_codec(conn: BufStream<S>, codec: C) -> Http2Connection<S, C> {
+    public static new_server_with_codec(conn: BufStream<S>, codec: C) -> Http2Connection<S, C> {
         return Http2Connection::<S, C> {
             conn:                  conn,
             codec:                 codec,
@@ -160,12 +160,12 @@ type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     /// The buffered connection, for callers that need the transport itself
     /// (socket options, the negotiated ALPN protocol). Not for reading or
     /// writing — that would desynchronize the framing.
-    connection(mut &this) -> BufStream<S>* {
+    public connection(mut &this) -> BufStream<S>* {
         return &this.conn;
     }
 
     /// Has the peer sent a GOAWAY on this connection?
-    goaway_seen(&this) -> boolean {
+    public goaway_seen(&this) -> boolean {
         return this.goaway_received;
     }
 
@@ -174,7 +174,7 @@ type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     /// Client preface + SETTINGS exchange. Queues the magic and our SETTINGS
     /// and sends both in one flush, then reads frames (acking the peer's
     /// SETTINGS) until the peer's initial SETTINGS frame has been seen.
-    async handshake_client(mut &this) -> Result<(), IoError>
+    public async handshake_client(mut &this) -> Result<(), IoError>
     where S: AsyncTransport {
         push_all(this.conn.pending(), preface_bytes())?;
         this.queue_settings()?;
@@ -185,7 +185,7 @@ type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     /// Server side: validate the client preface, send our SETTINGS, then
     /// read frames (acking the peer's SETTINGS) until the client's
     /// initial SETTINGS frame has been seen.
-    async handshake_server(mut &this) -> Result<(), IoError>
+    public async handshake_server(mut &this) -> Result<(), IoError>
     where S: AsyncTransport {
         (await this.conn.ensure(PREFACE_LEN))?;
         // The buffer may already hold the client's SETTINGS frame behind the
@@ -204,7 +204,7 @@ type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
 
     /// Read frames until the peer's initial (non-ACK) SETTINGS frame arrives,
     /// handling every control frame that precedes it.
-    async await_peer_settings(mut &this) -> Result<(), IoError>
+    private async await_peer_settings(mut &this) -> Result<(), IoError>
     where S: AsyncTransport {
         loop {
             mut fr: Frame = (await this.conn.read_h2_frame(LOCAL_MAX_FRAME_SIZE as i64))?;
@@ -224,7 +224,7 @@ type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     }
 
     /// Queue our advertised SETTINGS frame. Synchronous; the caller flushes.
-    queue_settings(mut &this) -> Result<(), IoError> {
+    private queue_settings(mut &this) -> Result<(), IoError> {
         mut payload: Array<u8> = Array::<u8>::new();
         settings::push_entry(&payload, settings::SETTINGS_HEADER_TABLE_SIZE, LOCAL_HEADER_TABLE_SIZE);
         settings::push_entry(&payload, settings::SETTINGS_ENABLE_PUSH, LOCAL_ENABLE_PUSH);
@@ -248,7 +248,7 @@ type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     /// ACK, PING ACK) are QUEUED, and the caller flushes once it has released
     /// the frame — so the borrowed `fr` never has to survive a suspension, and
     /// this stays callable from every read loop without one.
-    process_control(mut &this, fr: &Frame) -> Result<boolean, IoError> {
+    private process_control(mut &this, fr: &Frame) -> Result<boolean, IoError> {
         if (fr.ftype == frame::FRAME_SETTINGS) {
             if (fr.has_flag(frame::FLAG_ACK)) { return Result::Ok(true); }
             mut s: Settings = Settings::defaults();
@@ -310,7 +310,7 @@ type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     /// Synchronous: however many fragments a block needs, they are assembled
     /// with no suspension between them and go out in one flush, so a peer never
     /// sees a header block interleaved with anything else.
-    queue_header_block(mut &this, stream_id: u32, block: Slice<u8>,
+    private queue_header_block(mut &this, stream_id: u32, block: Slice<u8>,
                        end_stream: boolean) -> Result<(), IoError> {
         const total: i64 = block.length();
         const max: i64 = this.remote_max_frame;
@@ -348,7 +348,7 @@ type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     ///
     /// Always flushes, even for an empty body, because the caller's header
     /// block is queued behind it and this is what puts it on the wire.
-    async send_body(mut &this, stream_id: u32, body: Array<u8>,
+    private async send_body(mut &this, stream_id: u32, body: Array<u8>,
                     end_stream: boolean) -> Result<(), IoError>
     where S: AsyncTransport {
         mut b: Array<u8> = body;
@@ -393,7 +393,7 @@ type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     /// Wait until both the stream and connection send windows are positive,
     /// processing incoming control frames (chiefly WINDOW_UPDATE) while we
     /// wait.
-    async ensure_send_window(mut &this) -> Result<(), IoError>
+    private async ensure_send_window(mut &this) -> Result<(), IoError>
     where S: AsyncTransport {
         while (this.stream_send_window <= 0 || this.conn_send_window <= 0) {
             mut fr: Frame = (await this.conn.read_h2_frame(LOCAL_MAX_FRAME_SIZE as i64))?;
@@ -410,7 +410,7 @@ type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
 
     /// Queue the WINDOW_UPDATEs that replenish our receive windows after
     /// consuming `n` octets of DATA. Synchronous; the caller flushes.
-    queue_ack_data(mut &this, stream_id: u32, n: i64) -> Result<(), IoError> {
+    private queue_ack_data(mut &this, stream_id: u32, n: i64) -> Result<(), IoError> {
         if (n == 0) { return Result::Ok(()); }
         mut conn_inc: [u8; 4];
         write_u31(&conn_inc[0], n as u32);
@@ -427,7 +427,7 @@ type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     /// Issue one request and read its response. `scheme` is "http" (h2c)
     /// or "https" (h2); `authority` becomes the `:authority` pseudo-
     /// header. Consumes `req`.
-    async request(mut &this, req: Request, scheme: Str, authority: Str) -> Result<Response, IoError>
+    public async request(mut &this, req: Request, scheme: Str, authority: Str) -> Result<Response, IoError>
     where S: AsyncTransport {
         mut request_local: Request = req;
         const sid: u32 = this.next_stream_id;
@@ -459,7 +459,7 @@ type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
 
     /// Read frames until the response on `sid` completes, assembling its header
     /// block and body.
-    async read_response(mut &this, sid: u32) -> Result<Response, IoError>
+    private async read_response(mut &this, sid: u32) -> Result<Response, IoError>
     where S: AsyncTransport {
         mut block: Array<u8> = Array::<u8>::new();
         mut body: Array<u8> = Array::<u8>::new();
@@ -528,7 +528,7 @@ type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     /// Serve requests on this connection, dispatching each to `handler`,
     /// until the peer closes the connection or sends GOAWAY. Performs the
     /// server handshake first.
-    async serve(mut &this, handler: (Request) -> Response) -> Result<(), IoError>
+    public async serve(mut &this, handler: (Request) -> Response) -> Result<(), IoError>
     where S: AsyncTransport {
         (await this.handshake_server())?;
         loop {
@@ -552,7 +552,7 @@ type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
 
     /// Read frames until one stream completes (END_STREAM), returning the
     /// assembled request. `None` means the connection closed cleanly.
-    async read_request(mut &this) -> Result<Option<RequestOnStream>, IoError>
+    public async read_request(mut &this) -> Result<Option<RequestOnStream>, IoError>
     where S: AsyncTransport {
         mut block: Array<u8> = Array::<u8>::new();
         mut body: Array<u8> = Array::<u8>::new();
@@ -633,7 +633,7 @@ type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     }
 
     /// Send a response on `sid`. Consumes `resp`.
-    async send_response(mut &this, sid: u32, resp: Response) -> Result<(), IoError>
+    public async send_response(mut &this, sid: u32, resp: Response) -> Result<(), IoError>
     where S: AsyncTransport {
         mut response: Response = resp;
         this.stream_send_window = this.remote_initial_window;
@@ -658,7 +658,7 @@ type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
 
     /// Send a GOAWAY with the given last-stream-id and error code, then
     /// stop. Best-effort; transport teardown is the caller's.
-    async send_goaway(mut &this, last_stream_id: u32, error_code: u32) -> Result<(), IoError>
+    public async send_goaway(mut &this, last_stream_id: u32, error_code: u32) -> Result<(), IoError>
     where S: AsyncTransport {
         mut payload: [u8; 8];
         write_u31(&payload[0], last_stream_id);
@@ -673,7 +673,7 @@ type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
 
     // ---- header (de)serialization ----------------------------------------
 
-    encode_request_headers(mut &this, out: mut &Array<u8>, req: &Request,
+    private encode_request_headers(mut &this, out: mut &Array<u8>, req: &Request,
                            scheme: Str, authority: Str) -> void {
         this.codec.encode_field(out, Str::new(":method"), req.method.as_str(), false);
         this.codec.encode_field(out, Str::new(":scheme"), scheme, false);
@@ -682,7 +682,7 @@ type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
         this.encode_regular_headers(out, &req.headers);
     }
 
-    encode_response_headers(mut &this, out: mut &Array<u8>, resp: &Response) -> void {
+    private encode_response_headers(mut &this, out: mut &Array<u8>, resp: &Response) -> void {
         mut buf: [u8; 5];
         const code: u64 = resp.status.as_u16() as u64;
         const digits: i64 = code.to_decimal_buf(&buf[0]);
@@ -693,20 +693,12 @@ type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     /// Emit every stored header except the HTTP/1-only connection-
     /// specific fields that are forbidden in HTTP/2 (RFC 7540 section 8.1.2.2),
     /// a credential as sensitive.
-    encode_regular_headers(mut &this, out: mut &Array<u8>, h: &Headers) -> void {
-        const count: u64 = h.inner.bucket_count();
-        mut i: u64 = 0;
-        while (i < count) {
-            mut node: hashmap::Entry<String, String>* = h.inner.get_bucket(i);
-            loop {
-                if (node == null) { break; }
-                const name: Str = node.key.as_str();
-                if (!is_skippable(name)) {
-                    this.codec.encode_field(out, name, node.value.as_str(), is_credential(name));
-                }
-                node = node.next;
+    private encode_regular_headers(mut &this, out: mut &Array<u8>, h: &Headers) -> void {
+        for (entry in h.entries()) {
+            const name: Str = entry.first.as_str();
+            if (!is_skippable(name)) {
+                this.codec.encode_field(out, name, entry.second.as_str(), is_credential(name));
             }
-            i++;
         }
     }
 }
@@ -721,7 +713,7 @@ implement<S, C> trait Drop for struct Http2Connection<S, C> where C: HeaderCodec
 
 /// Append every byte or report `OutOfMemory`; the outgoing buffer is the one
 /// place a preface's bytes can fail to fit.
-function push_all(out: Array<u8>*, bytes: Slice<u8>) -> Result<(), IoError> {
+private function push_all(out: Array<u8>*, bytes: Slice<u8>) -> Result<(), IoError> {
     match (out.try_append(bytes)) {
         Result::Ok(_)  => { return Result::Ok(()); }
         Result::Err(_) => { return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0)); }
@@ -730,14 +722,14 @@ function push_all(out: Array<u8>*, bytes: Slice<u8>) -> Result<(), IoError> {
 
 /// The connection preface octets. Built inline because a module-level
 /// `const Str` initialised from a literal is unreliable at runtime.
-function preface_bytes() -> Slice<u8> {
+public function preface_bytes() -> Slice<u8> {
     const magic: Str = Str::new("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
     return magic.as_bytes();
 }
 
 /// Build a `Response` from a decoded header block's fields and a body, or
 /// none when the fields carry no `:status`. Consumes both.
-function build_response(fields: Array<HeaderField>, body: Array<u8>) -> Option<Response> {
+public function build_response(fields: Array<HeaderField>, body: Array<u8>) -> Option<Response> {
     mut body_local: Array<u8> = body;
 
     mut code: u16 = 0;
@@ -781,7 +773,7 @@ function build_response(fields: Array<HeaderField>, body: Array<u8>) -> Option<R
 
 /// Build a `Request` from a decoded header block's fields and a body, or
 /// none when the fields carry no `:method` or `:path`. Consumes both.
-function build_request(fields: Array<HeaderField>, body: Array<u8>) -> Option<Request> {
+public function build_request(fields: Array<HeaderField>, body: Array<u8>) -> Option<Request> {
     mut body_local: Array<u8> = body;
 
     mut method: Option<Method> = Option::None;
@@ -862,7 +854,7 @@ function build_request(fields: Array<HeaderField>, body: Array<u8>) -> Option<Re
 
 /// Extract the header-block fragment from a HEADERS frame, stripping any
 /// padding and PRIORITY prefix.
-function header_fragment(fr: &Frame) -> Slice<u8> {
+private function header_fragment(fr: &Frame) -> Slice<u8> {
     const p: Slice<u8> = fr.payload.as_slice();
     mut start: i64 = 0;
     mut end: i64 = p.length();
@@ -879,7 +871,7 @@ function header_fragment(fr: &Frame) -> Slice<u8> {
 }
 
 /// Extract application data from a DATA frame, stripping any padding.
-function data_fragment(fr: &Frame) -> Slice<u8> {
+private function data_fragment(fr: &Frame) -> Slice<u8> {
     const p: Slice<u8> = fr.payload.as_slice();
     mut start: i64 = 0;
     mut end: i64 = p.length();
@@ -893,7 +885,7 @@ function data_fragment(fr: &Frame) -> Slice<u8> {
 }
 
 /// True for `:`-prefixed pseudo-header names.
-function is_pseudo(name: Str) -> boolean {
+private function is_pseudo(name: Str) -> boolean {
     match (name.byte_at(0)) {
         Option::Some(b) => { return b == 0x3A; }   // ':'
         Option::None    => { return false; }
@@ -902,7 +894,7 @@ function is_pseudo(name: Str) -> boolean {
 
 /// True for connection-specific header fields forbidden in HTTP/2, plus
 /// `host` (mapped to `:authority`).
-function is_skippable(name_lower: Str) -> boolean {
+private function is_skippable(name_lower: Str) -> boolean {
     if (name_lower.equals(&Str::new("host"))) { return true; }
     if (name_lower.equals(&Str::new("connection"))) { return true; }
     if (name_lower.equals(&Str::new("keep-alive"))) { return true; }
@@ -925,7 +917,7 @@ private function is_credential(name_lower: Str) -> boolean {
 
 /// Read a 31-bit big-endian value (top reserved bit masked off) from the
 /// first 4 bytes of `s`.
-function read_u31(s: Slice<u8>) -> u32 {
+private function read_u31(s: Slice<u8>) -> u32 {
     if (s.length() < 4) { return 0; }
     return (((byte_at(s, 0) & 0x7f) as u32) << 24)
          | ((byte_at(s, 1) as u32) << 16)
@@ -934,14 +926,14 @@ function read_u31(s: Slice<u8>) -> u32 {
 }
 
 /// Write a 31-bit big-endian value into 4 bytes (reserved bit clear).
-function write_u31(out: u8*, value: u32) -> void {
+private function write_u31(out: u8*, value: u32) -> void {
     out[0] = ((value >> 24) & 0x7f) as u8;
     out[1] = (value >> 16) as u8;
     out[2] = (value >> 8) as u8;
     out[3] = (value) as u8;
 }
 
-function slice_eq(a: Slice<u8>, b: Slice<u8>) -> boolean {
+private function slice_eq(a: Slice<u8>, b: Slice<u8>) -> boolean {
     if (a.length() != b.length()) { return false; }
     mut i: i64 = 0;
     while (i < a.length()) {
@@ -951,7 +943,7 @@ function slice_eq(a: Slice<u8>, b: Slice<u8>) -> boolean {
     return true;
 }
 
-function byte_at(s: Slice<u8>, index: i64) -> u8 {
+private function byte_at(s: Slice<u8>, index: i64) -> u8 {
     match (s.get(index)) {
         Option::Some(b) => { return b; }
         Option::None    => { return 0; }

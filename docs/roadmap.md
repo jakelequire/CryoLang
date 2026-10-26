@@ -428,7 +428,9 @@ Left over from that: the async entry point calls `Executor::new` and
    `encoding`'s base64 and SHA-1 helpers are
    private, behind `encode`, `decode` and `sha1`.  `net::sys` is public
    but for its own helpers, and `net::addr`, `dns` and `http` are marked
-   item by item (597), but for `Headers`' map and the shared `push_all`.
+   item by item (597), and the rest of `net` (599) - HTTP/2, HTTPS,
+   sockets, TLS and WebSocket - but for the HTTP/1 `push_all`, which
+   waits on whether `?` converts an error.
    A struct member's keyword follows its directives (598), and the
    attributed accessors (`length`, `capacity`, `Str::new`,
    `String::from_string`, `Location`'s four) are public.  HPACK

@@ -70,7 +70,7 @@ import std::future::reactor::{ INTEREST_READ, INTEREST_WRITE, Reactor };
 
 // Open a TCP socket of the family matching `addr` (AF_INET vs AF_INET6).
 // Lives here, not in `net::sys`, so `sys` stays free of net::addr::ip imports.
-function tcp_socket_for(addr: &SocketAddr) -> i32 {
+private function tcp_socket_for(addr: &SocketAddr) -> i32 {
     match (addr.ip) {
         IpAddr::V4(_) => { return sys::os_socket_tcp(); }
         IpAddr::V6(_) => { return sys::os_socket_tcp6(); }
@@ -79,14 +79,14 @@ function tcp_socket_for(addr: &SocketAddr) -> i32 {
 
 // TcpStream: connected socket
 
-type struct TcpStream {
-    fd: i32;
+public type struct TcpStream {
+    private fd: i32;
 
     /// Wrap a raw file descriptor. The caller transfers ownership;
     /// `drop` will close it. Used by `TcpAccept` to hand over the socket it
     /// produced, and to leave a closed placeholder behind when a future takes
     /// the real one.
-    static from_fd(sock: i32) -> TcpStream {
+    public static from_fd(sock: i32) -> TcpStream {
         return TcpStream { fd: sock };
     }
 
@@ -94,14 +94,14 @@ type struct TcpStream {
     /// ownership. The `TcpStream` still closes it on `drop`. Used by
     /// `net::tls` to hand the fd to OpenSSL's socket BIO (which is
     /// created `BIO_NOCLOSE`, so the fd stays this stream's to close).
-    raw_fd(&this) -> i32 {
+    public raw_fd(&this) -> i32 {
         return this.fd;
     }
 
     /// Close the write half. Signals "no more from me" without tearing
     /// down the read path. Useful for protocols where the client
     /// sends then reads to EOF.
-    shutdown_write(mut &this) -> Result<(), IoError> {
+    public shutdown_write(mut &this) -> Result<(), IoError> {
         if (sys::os_shutdown(this.fd, 1) < 0) {
             return Result::Err(sys::last_io_error());
         }
@@ -112,7 +112,7 @@ type struct TcpStream {
     /// `WouldBlock` instead of sleeping the calling thread. Required before this
     /// stream is used with `TcpRead`/`TcpWrite` — a blocking socket would stall
     /// an executor's whole worker thread inside the syscall.
-    set_nonblocking(mut &this, on: boolean) -> Result<(), IoError> {
+    public set_nonblocking(mut &this, on: boolean) -> Result<(), IoError> {
         if (sys::os_set_nonblocking(this.fd, on) < 0) {
             return Result::Err(sys::last_io_error());
         }
@@ -133,14 +133,14 @@ implement trait Drop for struct TcpStream {
 
 // TcpListener: bound + listening socket
 
-type struct TcpListener {
-    fd: i32;
+public type struct TcpListener {
+    private fd: i32;
 
     /// Bind + listen on `local` (IPv4 or IPv6). Sets `SO_REUSEADDR` so
     /// restarts don't wait out the TIME_WAIT window. Backlog defaults to
     /// 128, the same number Linux uses for `/proc/sys/net/core/somaxconn`
     /// these days.
-    static bind(local: SocketAddr) -> Result<TcpListener, IoError> {
+    public static bind(local: SocketAddr) -> Result<TcpListener, IoError> {
         // Pack first so an unsupported address family doesn't leak
         // a freshly-opened socket fd. 28 bytes holds a v6 sockaddr_in6.
         mut sockaddr_buf: [u8; 28];
@@ -171,19 +171,19 @@ type struct TcpListener {
 
     /// Wrap a raw listening descriptor. The caller transfers ownership;
     /// `drop` closes it. Used by `TcpAccept` to hand the listener back.
-    static from_fd(sock: i32) -> TcpListener {
+    public static from_fd(sock: i32) -> TcpListener {
         return TcpListener { fd: sock };
     }
 
     /// Borrow the underlying descriptor without transferring ownership.
-    raw_fd(&this) -> i32 {
+    public raw_fd(&this) -> i32 {
         return this.fd;
     }
 
     /// Put the listener in non-blocking mode, where `accept` returns
     /// `WouldBlock` instead of sleeping the calling thread. Required before
     /// this listener is used with `TcpAccept`.
-    set_nonblocking(mut &this, on: boolean) -> Result<(), IoError> {
+    public set_nonblocking(mut &this, on: boolean) -> Result<(), IoError> {
         if (sys::os_set_nonblocking(this.fd, on) < 0) {
             return Result::Err(sys::last_io_error());
         }
@@ -194,7 +194,7 @@ type struct TcpListener {
     /// this reports the kernel-assigned ephemeral port - the only way to
     /// learn it (and the hermetic alternative to guessing a fixed port).
     /// Handles both v4 and v6 listeners.
-    local_addr(&this) -> Result<SocketAddr, IoError> {
+    public local_addr(&this) -> Result<SocketAddr, IoError> {
         mut sockaddr_buf: [u8; 28];
         mut addrlen: u32 = 28;
         if (sys::os_getsockname(this.fd, &sockaddr_buf[0], &addrlen) < 0) {
@@ -227,14 +227,14 @@ implement trait Drop for struct TcpListener {
 /// refuses to let a field be moved out of the outcome while the outcome itself
 /// would still drop it. `take_stream` swaps in a closed placeholder, leaving
 /// nothing behind to close.
-type struct TcpIo {
-    stream: TcpStream;
-    buf:    Array<u8>;
-    result: Result<i64, IoError>;
+public type struct TcpIo {
+    private stream: TcpStream;
+    private buf:    Array<u8>;
+    private result: Result<i64, IoError>;
 
     /// Take the socket back. Calling it twice yields a closed stream the second
     /// time — the outcome holds the socket exactly once.
-    take_stream(mut &this) -> TcpStream {
+    public take_stream(mut &this) -> TcpStream {
         mut out: TcpStream = TcpStream::from_fd(-1);
         mem::swap::<TcpStream>(&out, &this.stream);
         return out;
@@ -244,14 +244,14 @@ type struct TcpIo {
     /// arrived; after a write it is untouched, so a caller with a short write
     /// still has the bytes it has not sent yet. Calling it twice yields an empty
     /// buffer the second time.
-    take_buf(mut &this) -> Array<u8> {
+    public take_buf(mut &this) -> Array<u8> {
         mut out: Array<u8> = Array::<u8>::new();
         mem::swap::<Array<u8>>(&out, &this.buf);
         return out;
     }
 
     /// How many bytes moved, or why none did.
-    outcome(&this) -> Result<i64, IoError> {
+    public outcome(&this) -> Result<i64, IoError> {
         return this.result;
     }
 }
@@ -259,19 +259,19 @@ type struct TcpIo {
 /// The outcome of an async `accept`: the listener handed back, plus the
 /// connection it produced. Both come out through their `take_*` methods, for
 /// the same reason as `TcpIo::take_stream`.
-type struct TcpAccepted {
-    listener: TcpListener;
-    result:   Result<TcpStream, IoError>;
+public type struct TcpAccepted {
+    private listener: TcpListener;
+    private result:   Result<TcpStream, IoError>;
 
     /// Take the listener back, so the next accept can be started on it.
-    take_listener(mut &this) -> TcpListener {
+    public take_listener(mut &this) -> TcpListener {
         mut out: TcpListener = TcpListener::from_fd(-1);
         mem::swap::<TcpListener>(&out, &this.listener);
         return out;
     }
 
     /// Take the accepted connection, or the error that prevented one.
-    take_result(mut &this) -> Result<TcpStream, IoError> {
+    public take_result(mut &this) -> Result<TcpStream, IoError> {
         mut out: Result<TcpStream, IoError> = Result::Err(IoError::new(IoErrorKind::Other, 0));
         mem::swap::<Result<TcpStream, IoError>>(&out, &this.result);
         return out;
@@ -292,9 +292,9 @@ type struct TcpAccepted {
 ///
 /// Dropping the future before it completes closes the connection and releases
 /// the buffer: cancelling a read on a socket nobody else holds destroys it.
-type struct TcpRead {
-    stream: TcpStream;
-    buf:    Array<u8>;
+public type struct TcpRead {
+    private stream: TcpStream;
+    private buf:    Array<u8>;
     private rt: Reactor*;   // set while parked; null once the operation is over
 
     /// Begin a read on `stream`, filling `buf` — both owned by this future until
@@ -303,7 +303,7 @@ type struct TcpRead {
     /// It reads up to `buf.length()` bytes. An array exposes only `[0, length)`,
     /// so a buffer from `with_capacity` alone has nothing to read into: size it
     /// with `resize(n, 0)`.
-    static start(stream: TcpStream, buf: Array<u8>) -> TcpRead {
+    public static start(stream: TcpStream, buf: Array<u8>) -> TcpRead {
         return TcpRead { stream: stream, buf: buf, rt: null };
     }
 
@@ -370,14 +370,14 @@ implement trait Drop for struct TcpRead {
 /// starts another write for the remainder, which is why the buffer comes back
 /// untouched. Owns the socket and the buffer exactly as `TcpRead` does, and for
 /// the same reason.
-type struct TcpWrite {
-    stream: TcpStream;
-    buf:    Array<u8>;
+public type struct TcpWrite {
+    private stream: TcpStream;
+    private buf:    Array<u8>;
     private rt: Reactor*;
 
     /// Begin a write of every byte in `buf` on `stream` — both owned by this
     /// future until it completes.
-    static start(stream: TcpStream, buf: Array<u8>) -> TcpWrite {
+    public static start(stream: TcpStream, buf: Array<u8>) -> TcpWrite {
         return TcpWrite { stream: stream, buf: buf, rt: null };
     }
 
@@ -427,12 +427,12 @@ implement trait Drop for struct TcpWrite {
 /// listener's non-blocking mode, so it is set here — it is about to be used with
 /// these same futures. Owns the listener for the duration and hands it back in
 /// the `TcpAccepted`, so a server loop starts the next accept from that.
-type struct TcpAccept {
-    listener: TcpListener;
+public type struct TcpAccept {
+    private listener: TcpListener;
     private rt: Reactor*;
 
     /// Begin an accept on `listener`, which this future owns until it completes.
-    static start(listener: TcpListener) -> TcpAccept {
+    public static start(listener: TcpListener) -> TcpAccept {
         return TcpAccept { listener: listener, rt: null };
     }
 
@@ -487,15 +487,15 @@ implement trait Drop for struct TcpAccept {
 /// handshake started when the future is created; each poll asks the OS whether
 /// it finished, parking on writability in between. The socket is closed if the
 /// future is dropped before it completes.
-type struct TcpConnect {
-    fd:      i32;         // < 0 once handed over, or if it could not be opened
-    addr:    [u8; 28];      // packed sockaddr, replayed to poll the connect
-    addrlen: u32;
-    err:     IoError;     // why `fd` is < 0 before the first poll
+public type struct TcpConnect {
+    private fd:      i32;         // < 0 once handed over, or if it could not be opened
+    private addr:    [u8; 28];      // packed sockaddr, replayed to poll the connect
+    private addrlen: u32;
+    private err:     IoError;     // why `fd` is < 0 before the first poll
     private rt: Reactor*;
 
     /// Open a non-blocking socket and start connecting to `remote`.
-    static start(remote: SocketAddr) -> TcpConnect {
+    public static start(remote: SocketAddr) -> TcpConnect {
         mut c: TcpConnect = TcpConnect { fd: -1, addr: [0; 28], addrlen: 0,
                                          err: IoError::new(IoErrorKind::Other, 0),
                                          rt:  null };

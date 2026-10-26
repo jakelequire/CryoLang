@@ -19,13 +19,15 @@ import std::io::traits;
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::collections::hashmap::{ HashMap };
+import std::collections::pair::{ Pair };
+import std::core::iter::{ Iterator };
 import std::collections::array::{ Array };
 import std::core::convert;
 import std::core::primitives;
 import std::core::mem;
 
 public type struct Headers {
-    inner: HashMap<String, String>;
+    private inner: HashMap<String, String>;
 
     public static new() -> Headers {
         return Headers { inner: HashMap::new() };
@@ -38,6 +40,18 @@ public type struct Headers {
 
     public is_empty(&this) -> boolean {
         return this.inner.is_empty();
+    }
+
+    /// Iterate over every stored header by shared borrow, yielding the
+    /// lowercase name and the value as stored. The pointers borrow the
+    /// headers' own storage and are invalidated by any `insert` or
+    /// `remove`. The order is unspecified.
+    public entries(&this) -> implement Iterator<Pair<String*, String*>> {
+        return HeaderEntries {
+            map: &this.inner,
+            bucket_index: 0,
+            current: null
+        };
     }
 
     /// Insert or replace. Name is normalized to lowercase; CR/LF bytes are
@@ -162,19 +176,11 @@ public type struct Headers {
     public encode_into(&this, out: Array<u8>*) -> Result<(), IoError> {
         const colon_sp: Slice<u8> = Slice::from_raw(": ", 2);
         const crlf: Slice<u8> = Slice::from_raw("\r\n", 2);
-        const count: u64 = this.inner.bucket_count();
-        mut i: u64 = 0;
-        while (i < count) {
-            mut node: hashmap::Entry<String, String>* = this.inner.get_bucket(i);
-            loop {
-                if (node == null) { break; }
-                push_all(out, node.key.as_bytes())?;
-                push_all(out, colon_sp)?;
-                push_all(out, node.value.as_bytes())?;
-                push_all(out, crlf)?;
-                node = node.next;
-            }
-            i++;
+        for (entry in this.entries()) {
+            push_all(out, entry.first.as_bytes())?;
+            push_all(out, colon_sp)?;
+            push_all(out, entry.second.as_bytes())?;
+            push_all(out, crlf)?;
         }
         return Result::Ok(());
     }
@@ -212,6 +218,34 @@ private function strip_crlf(s: Str) -> String {
         i = i + 1;
     }
     return out;
+}
+
+/// The cursor behind `Headers::entries`: the map's buckets in order, each
+/// bucket's chain from its head.
+private type struct HeaderEntries {
+    map: HashMap<String, String>*;
+    bucket_index: u64;
+    current: hashmap::Entry<String, String>*;
+}
+
+implement trait Iterator<Pair<String*, String*>> for struct HeaderEntries {
+    next(mut &this) -> Option<Pair<String*, String*>> {
+        loop {
+            if (this.current != null) {
+                const entry: hashmap::Entry<String, String>* = this.current;
+                this.current = entry.next;
+                return Option::Some(Pair::<String*, String*> {
+                    first: &entry.key,
+                    second: &entry.value
+                });
+            }
+            if (this.bucket_index >= this.map.bucket_count()) {
+                return Option::None;
+            }
+            this.current = this.map.get_bucket(this.bucket_index);
+            this.bucket_index = this.bucket_index + 1;
+        }
+    }
 }
 
 /// Drop every stored header.  `HashMap::drop` requires `K: Drop,

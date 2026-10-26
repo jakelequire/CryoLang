@@ -20,27 +20,26 @@ namespace std::net::tls::stream;
 import std::core::option;
 import std::core::result;
 import std::core::slice;
-import std::io::error::{ IoError, IoErrorKind };
 import std::io::traits;
-import std::ffi::libc;
 import std::ffi::openssl;
 import std::net::socket::tcp::{ TcpStream };
 
 /// Application-layer protocol negotiated during the handshake (ALPN).
-type enum AlpnProtocol {
+public type enum AlpnProtocol {
     None;
     Http11;
     H2;
 }
 
-type struct TlsStream {
-    ssl: void*;
-    inner: TcpStream;
+public type struct TlsStream {
+    private ssl: void*;
+    private inner: TcpStream;
 
-    /// Assemble from a completed handshake. Internal: the
-    /// connector/acceptor owns the `SSL_connect`/`SSL_accept` dance and
-    /// hands over the live `SSL*` plus the socket it's bound to.
-    static from_parts(ssl: void*, inner: TcpStream) -> TlsStream {
+    /// Assemble from a completed handshake: the live `SSL*` and the socket
+    /// it is bound to, both owned by the stream from here on. The
+    /// connector and acceptor call it once `SSL_connect`/`SSL_accept` is
+    /// done.
+    public static from_parts(ssl: void*, inner: TcpStream) -> TlsStream {
         return TlsStream { ssl: ssl, inner: inner };
     }
 
@@ -48,20 +47,20 @@ type struct TlsStream {
     /// re-issue `SSL_connect`/`SSL_read`/`SSL_write` against it directly rather
     /// than through the blocking `Read`/`Write` impls. The stream still owns it
     /// and frees it on `drop`.
-    ssl_ptr(&this) -> void* {
+    public ssl_ptr(&this) -> void* {
         return this.ssl;
     }
 
     /// The underlying socket descriptor, so a parked async operation can
     /// register its readiness interest with a `Reactor`. Ownership is unchanged:
     /// this stream still closes it.
-    raw_fd(&this) -> i32 {
+    public raw_fd(&this) -> i32 {
         return this.inner.raw_fd();
     }
 
     /// The ALPN protocol the peer agreed on, or `None` if ALPN wasn't
     /// offered / negotiated. Valid only after the handshake.
-    negotiated_alpn(&this) -> AlpnProtocol {
+    public negotiated_alpn(&this) -> AlpnProtocol {
         mut data: u8* = null;
         mut len: u32 = 0;
         openssl::SSL_get0_alpn_selected(this.ssl, &data, &len);
@@ -85,32 +84,4 @@ implement trait Drop for struct TlsStream {
             this.ssl = null;
         }
     }
-}
-
-/// Translate an `SSL_get_error` code into an `IoError`. `SYSCALL`
-/// without a queued error is an unexpected EOF (peer closed without
-/// close_notify); with a live `errno` it maps through `from_errno`.
-function ssl_error(code: i32) -> IoError {
-    // If-chain rather than `match`: the SSL codes are cross-module
-    // constants (`ffi::openssl`), and match patterns require local
-    // constants, so a `match` arm on `openssl::X` silently never fires.
-    if (code == openssl::SSL_ERROR_ZERO_RETURN) {
-        return IoError::new(IoErrorKind::NotConnected, 0);
-    }
-    if (code == openssl::SSL_ERROR_WANT_READ || code == openssl::SSL_ERROR_WANT_WRITE) {
-        return IoError::new(IoErrorKind::WouldBlock, 0);
-    }
-    if (code == openssl::SSL_ERROR_SYSCALL) {
-        return syscall_error();
-    }
-    if (code == openssl::SSL_ERROR_SSL) {
-        return IoError::new(IoErrorKind::InvalidData, 0);
-    }
-    return IoError::new(IoErrorKind::Other, code);
-}
-
-function syscall_error() -> IoError {
-    const e: i32 = libc::errno();
-    if (e != 0) { return IoError::from_errno(e); }
-    return IoError::new(IoErrorKind::UnexpectedEof, 0);
 }

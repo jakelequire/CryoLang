@@ -144,6 +144,25 @@ yet is recorded with the change that builds it, not here.
      that order.  (Jake for the order after directives; refusing the
      other order delegated)
 
+599. **The rest of `net` is marked item by item.**  `Headers` keeps its
+     map private and hands out its entries through a public `entries()`
+     iterator, which HTTP/2 walks.  An allocation failure converts to an
+     I/O error, `OutOfMemory`, through a public `From<AllocError>` for
+     `IoError`.  In HTTP/2 the protocol's constants (frame types, flags,
+     the frame header length, settings identifiers, the preface's length
+     and bytes, the default connection window) are public and the limits
+     the connection chooses for itself are private; `Frame`, `Settings`,
+     `HeaderField` and `RequestOnStream` are plain records with public
+     fields; `Http2Connection` keeps its state private behind its
+     handshake, request, serve and frame-level calls.  Sockets, TLS
+     streams and their futures keep their handles private behind public
+     methods; the TLS error normaliser is private to the futures that use
+     it; the unused ALPN length constant, which held the wrong length, is
+     deleted.  WebSocket's records and handshake functions are public and
+     its own caps private.  (Jake for headers, the conversion, the
+     preface, the normaliser and the constant; the rest delegated under
+     587)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

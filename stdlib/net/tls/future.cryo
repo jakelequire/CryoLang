@@ -55,14 +55,14 @@ private function interest_for(code: i32) -> u32 {
 /// their `take_*` methods — a `TlsStream` owns its `SSL*` and its socket and
 /// closes both when dropped, so the compiler refuses to let a field be moved out
 /// of the outcome while the outcome itself would still drop it.
-type struct TlsIo {
-    tls:    TlsStream;
-    buf:    Array<u8>;
-    result: Result<i64, IoError>;
+public type struct TlsIo {
+    private tls:    TlsStream;
+    private buf:    Array<u8>;
+    private result: Result<i64, IoError>;
 
     /// Take the stream back. Calling it twice yields a closed placeholder the
     /// second time — the outcome holds the stream exactly once.
-    take_stream(mut &this) -> TlsStream {
+    public take_stream(mut &this) -> TlsStream {
         mut out: TlsStream = TlsStream::from_parts(null, TcpStream::from_fd(-1));
         mem::swap::<TlsStream>(&out, &this.tls);
         return out;
@@ -71,14 +71,14 @@ type struct TlsIo {
     /// Take the buffer back. After a read it holds exactly the bytes that
     /// arrived; after a write it is untouched, so a caller with a short write
     /// still has the bytes it has not sent yet.
-    take_buf(mut &this) -> Array<u8> {
+    public take_buf(mut &this) -> Array<u8> {
         mut out: Array<u8> = Array::<u8>::new();
         mem::swap::<Array<u8>>(&out, &this.buf);
         return out;
     }
 
     /// How many bytes moved, or why none did.
-    outcome(&this) -> Result<i64, IoError> {
+    public outcome(&this) -> Result<i64, IoError> {
         return this.result;
     }
 }
@@ -89,15 +89,15 @@ type struct TlsIo {
 ///
 /// The socket must already be non-blocking; `TlsConnector::start_connect` and
 /// `TlsAcceptor::start_accept` set that up along with the `SSL*`.
-type struct TlsHandshake {
-    tls:       TlsStream;
-    is_client: boolean;
-    verify:    boolean;   // assert the verified result once the handshake lands
+public type struct TlsHandshake {
+    private tls:       TlsStream;
+    private is_client: boolean;
+    private verify:    boolean;   // assert the verified result once the handshake lands
     private rt: Reactor*;  // set while parked; null once the operation is over
-    armed:     u32;       // the one direction registered with `rt`
+    private armed:     u32;       // the one direction registered with `rt`
 
     /// Begin a handshake on `tls`, which this future owns until it completes.
-    static start(tls: TlsStream, is_client: boolean, verify: boolean) -> TlsHandshake {
+    public static start(tls: TlsStream, is_client: boolean, verify: boolean) -> TlsHandshake {
         return TlsHandshake { tls: tls, is_client: is_client, verify: verify, rt: null, armed: 0 };
     }
 
@@ -145,7 +145,7 @@ implement trait Future for struct TlsHandshake {
             rt.register(fd, want, cx.waker());
             return Poll::Pending;
         }
-        const err: IoError = stream::ssl_error(code);
+        const err: IoError = ssl_error(code);
         mut failed: TlsStream = this.release();
         mem::drop(failed);
         return Poll::Ready(Result::Err(err));
@@ -167,11 +167,11 @@ implement trait Drop for struct TlsHandshake {
 /// Read decrypted bytes as soon as the connection has some. Completes with the
 /// byte count — 0 means the peer sent `close_notify`, the TLS equivalent of EOF
 /// — or the error that ended it.
-type struct TlsRead {
-    tls:   TlsStream;
-    buf:   Array<u8>;
+public type struct TlsRead {
+    private tls:   TlsStream;
+    private buf:   Array<u8>;
     private rt: Reactor*;
-    armed: u32;
+    private armed: u32;
 
     /// Begin a read on `tls`, filling `buf` — both owned by this future until it
     /// completes.
@@ -179,7 +179,7 @@ type struct TlsRead {
     /// It reads up to `buf.length()` bytes. An array exposes only `[0, length)`,
     /// so a buffer from `with_capacity` alone has nothing to read into: size it
     /// with `resize(n, 0)`.
-    static start(tls: TlsStream, buf: Array<u8>) -> TlsRead {
+    public static start(tls: TlsStream, buf: Array<u8>) -> TlsRead {
         return TlsRead { tls: tls, buf: buf, rt: null, armed: 0 };
     }
 
@@ -219,7 +219,7 @@ implement trait Future for struct TlsRead {
             rt.register(fd, interest, cx.waker());
             return Poll::Pending;
         }
-        return this.finish(0, Result::Err(stream::ssl_error(code)));
+        return this.finish(0, Result::Err(ssl_error(code)));
     }
 }
 
@@ -237,15 +237,15 @@ implement trait Drop for struct TlsRead {
 /// Completes with the number of bytes accepted, which may be fewer than asked
 /// for — a caller with more to send starts another write for the remainder,
 /// which is why the buffer comes back untouched.
-type struct TlsWrite {
-    tls:   TlsStream;
-    buf:   Array<u8>;
+public type struct TlsWrite {
+    private tls:   TlsStream;
+    private buf:   Array<u8>;
     private rt: Reactor*;
-    armed: u32;
+    private armed: u32;
 
     /// Begin a write of every byte in `buf` on `tls` — both owned by this future
     /// until it completes.
-    static start(tls: TlsStream, buf: Array<u8>) -> TlsWrite {
+    public static start(tls: TlsStream, buf: Array<u8>) -> TlsWrite {
         return TlsWrite { tls: tls, buf: buf, rt: null, armed: 0 };
     }
 
@@ -279,7 +279,7 @@ implement trait Future for struct TlsWrite {
             rt.register(fd, interest, cx.waker());
             return Poll::Pending;
         }
-        return this.finish(Result::Err(stream::ssl_error(code)));
+        return this.finish(Result::Err(ssl_error(code)));
     }
 }
 
@@ -334,4 +334,32 @@ implement trait AsyncTransport for struct TlsStream {
 
         return Transfer { buf: io.take_buf(), result: io.outcome() };
     }
+}
+
+/// Translate an `SSL_get_error` code into an `IoError`. `SYSCALL`
+/// without a queued error is an unexpected EOF (peer closed without
+/// close_notify); with a live `errno` it maps through `from_errno`.
+private function ssl_error(code: i32) -> IoError {
+    // If-chain rather than `match`: the SSL codes are cross-module
+    // constants (`ffi::openssl`), and match patterns require local
+    // constants, so a `match` arm on `openssl::X` silently never fires.
+    if (code == openssl::SSL_ERROR_ZERO_RETURN) {
+        return IoError::new(IoErrorKind::NotConnected, 0);
+    }
+    if (code == openssl::SSL_ERROR_WANT_READ || code == openssl::SSL_ERROR_WANT_WRITE) {
+        return IoError::new(IoErrorKind::WouldBlock, 0);
+    }
+    if (code == openssl::SSL_ERROR_SYSCALL) {
+        return syscall_error();
+    }
+    if (code == openssl::SSL_ERROR_SSL) {
+        return IoError::new(IoErrorKind::InvalidData, 0);
+    }
+    return IoError::new(IoErrorKind::Other, code);
+}
+
+private function syscall_error() -> IoError {
+    const e: i32 = libc::errno();
+    if (e != 0) { return IoError::from_errno(e); }
+    return IoError::new(IoErrorKind::UnexpectedEof, 0);
 }
