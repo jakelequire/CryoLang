@@ -158,6 +158,14 @@ yet is recorded with the change that builds it, not here.
      extern` block of `core::panic_unwind`, read only by `catch_unwind`.
      (Jake; the hooks delegated under 587)
 
+595. **A `Duration`, an `Instant` and a `SystemTime` are read through
+     their accessors.**  Their seconds and nanoseconds are private fields
+     behind `as_secs`, `subsec_nanos`, `as_nanos` and `unix_secs`, so the
+     library's own clocks and timers call those; `Duration`'s unit
+     constants stay public, and the clocks' conversion constants and the
+     calendar algorithm's are private.  A `DateTime`'s fields are its
+     public data.  (Delegated under 587)
+
 ### 2026-10-24
 
 583. **A value whose type implements a trait by a generic implementation

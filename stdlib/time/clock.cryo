@@ -30,15 +30,15 @@ import std::ffi::libc::{ ClockId, clock_gettime, nanosleep, timespec };
 import std::sys::syscall::{ FILETIME, LARGE_INTEGER };
 import std::time::duration::{ Duration };
 
-const NSEC_PER_SEC: i64 = 1000000000;
+private const NSEC_PER_SEC: i64 = 1000000000;
 
 // Windows FILETIME epoch is 1601-01-01 UTC; Unix epoch is 1970-01-01.
 // The difference is exactly 11644473600 seconds (134774 days * 86400)
 // = 116444736000000000 100-ns ticks.  Subtract on every wall-clock read
 // so SystemTime carries Unix-epoch-relative seconds on both platforms.
-const FILETIME_TO_UNIX_TICKS: i64 = 116444736000000000;
-const FILETIME_TICKS_PER_SEC: i64 = 10000000;       // 100-ns intervals
-const FILETIME_NS_PER_TICK:   i64 = 100;            // ns per 100-ns tick
+private const FILETIME_TO_UNIX_TICKS: i64 = 116444736000000000;
+private const FILETIME_TICKS_PER_SEC: i64 = 10000000;       // 100-ns intervals
+private const FILETIME_NS_PER_TICK:   i64 = 100;            // ns per 100-ns tick
 
 /// Compute `(a_sec.a_nsec) - (b_sec.b_nsec)` as a `Duration`, borrowing
 /// from the seconds when the nanoseconds underflow and clamping the whole
@@ -61,27 +61,27 @@ private function diff_saturating(a_sec: i64, a_nsec: i64,
 
 /// A measurement of the monotonic clock. Opaque: the fields are the raw
 /// `timespec`, meaningful only relative to another `Instant`. POD.
-type struct Instant {
-    secs:  i64;
-    nanos: i64;
+public type struct Instant {
+    private secs:  i64;
+    private nanos: i64;
 
     /// Read the monotonic clock now.
-    static now() -> Instant {
+    public static now() -> Instant {
         return read_monotonic();
     }
 
     /// The time elapsed from `earlier` to `this` (saturating at zero).
-    duration_since(&this, earlier: &Instant) -> Duration {
+    public duration_since(&this, earlier: &Instant) -> Duration {
         return diff_saturating(this.secs, this.nanos, earlier.secs, earlier.nanos);
     }
 
     /// Alias for `duration_since`, naming the saturation explicitly.
-    saturating_duration_since(&this, earlier: &Instant) -> Duration {
+    public saturating_duration_since(&this, earlier: &Instant) -> Duration {
         return diff_saturating(this.secs, this.nanos, earlier.secs, earlier.nanos);
     }
 
     /// The time elapsed from `this` until now (saturating at zero).
-    elapsed(&this) -> Duration {
+    public elapsed(&this) -> Duration {
         const cur: Instant = Instant::now();
         return diff_saturating(cur.secs, cur.nanos, this.secs, this.nanos);
     }
@@ -91,17 +91,17 @@ type struct Instant {
     /// unspecified epoch (typically system boot) - so use it for lightweight
     /// elapsed-time math where the difference of two readings is all that
     /// matters and carrying a `Duration` would be overkill.
-    as_nanos(&this) -> i64 {
+    public as_nanos(&this) -> i64 {
         return this.secs * NSEC_PER_SEC + this.nanos;
     }
 
     /// `this + dur`, or `None` if the reading would overflow `i64`.
-    checked_add(&this, dur: &Duration) -> Option<Instant> {
-        if (dur.secs > (i64::MAX as u64)) { return Option::None; }
-        const add_secs: i64 = dur.secs as i64;
+    public checked_add(&this, dur: &Duration) -> Option<Instant> {
+        if (dur.as_secs() > (i64::MAX as u64)) { return Option::None; }
+        const add_secs: i64 = dur.as_secs() as i64;
         if (this.secs > i64::MAX - add_secs) { return Option::None; }
         mut sec:  i64 = this.secs + add_secs;
-        mut nsec: i64 = this.nanos + (dur.nanos as i64);
+        mut nsec: i64 = this.nanos + (dur.subsec_nanos() as i64);
         if (nsec >= NSEC_PER_SEC) {
             if (sec == i64::MAX) { return Option::None; }
             sec  = sec + 1;
@@ -111,10 +111,10 @@ type struct Instant {
     }
 
     /// `this - dur`, or `None` if the reading would go below zero.
-    checked_sub(&this, dur: &Duration) -> Option<Instant> {
-        const sub_secs: i64 = dur.secs as i64;
+    public checked_sub(&this, dur: &Duration) -> Option<Instant> {
+        const sub_secs: i64 = dur.as_secs() as i64;
         mut sec:  i64 = this.secs - sub_secs;
-        mut nsec: i64 = this.nanos - (dur.nanos as i64);
+        mut nsec: i64 = this.nanos - (dur.subsec_nanos() as i64);
         if (nsec < 0) {
             sec  = sec - 1;
             nsec = nsec + NSEC_PER_SEC;
@@ -146,47 +146,47 @@ implement trait Ord for struct Instant {
 /// `timespec`. `duration_since_epoch()` yields a Unix timestamp. Subject
 /// to NTP steps and manual changes; do not use for elapsed-time
 /// measurement. POD.
-type struct SystemTime {
-    secs:  i64;
-    nanos: i64;
+public type struct SystemTime {
+    private secs:  i64;
+    private nanos: i64;
 
     /// Read the wall clock now.
-    static now() -> SystemTime {
+    public static now() -> SystemTime {
         return read_realtime();
     }
 
     /// The Unix epoch (1970-01-01 00:00:00 UTC).
-    static unix_epoch() -> SystemTime {
+    public static unix_epoch() -> SystemTime {
         return SystemTime { secs: 0, nanos: 0 };
     }
 
     /// A wall-clock time from a whole-second Unix timestamp.
-    static from_unix_secs(secs: i64) -> SystemTime {
+    public static from_unix_secs(secs: i64) -> SystemTime {
         return SystemTime { secs: secs, nanos: 0 };
     }
 
     /// Whole seconds since the Unix epoch (may be negative before 1970).
-    unix_secs(&this) -> i64 { return this.secs; }
+    public unix_secs(&this) -> i64 { return this.secs; }
 
     /// Time since the Unix epoch. Saturates at zero for a clock set
     /// before 1970.
-    duration_since_epoch(&this) -> Duration {
+    public duration_since_epoch(&this) -> Duration {
         return diff_saturating(this.secs, this.nanos, 0, 0);
     }
 
     /// The time elapsed from `earlier` to `this` (saturating at zero).
     /// Only meaningful if the wall clock has not been stepped between the
     /// two readings.
-    duration_since(&this, earlier: &SystemTime) -> Duration {
+    public duration_since(&this, earlier: &SystemTime) -> Duration {
         return diff_saturating(this.secs, this.nanos, earlier.secs, earlier.nanos);
     }
 
     /// `this + dur`.
-    checked_add(&this, dur: &Duration) -> Option<SystemTime> {
-        const add_secs: i64 = dur.secs as i64;
+    public checked_add(&this, dur: &Duration) -> Option<SystemTime> {
+        const add_secs: i64 = dur.as_secs() as i64;
         if (this.secs > i64::MAX - add_secs) { return Option::None; }
         mut sec:  i64 = this.secs + add_secs;
-        mut nsec: i64 = this.nanos + (dur.nanos as i64);
+        mut nsec: i64 = this.nanos + (dur.subsec_nanos() as i64);
         if (nsec >= NSEC_PER_SEC) {
             sec  = sec + 1;
             nsec = nsec - NSEC_PER_SEC;
@@ -202,7 +202,7 @@ type struct SystemTime {
 /// `Sleep` is uninterruptible at the millisecond granularity it
 /// accepts.  Sub-millisecond `dur` rounds UP to 1 ms on Windows so a
 /// non-zero request always blocks.
-function sleep(dur: Duration) -> void {
+public function sleep(dur: Duration) -> void {
     sleep_for(dur);
 }
 
@@ -265,8 +265,8 @@ private function read_realtime() -> SystemTime {
 /// Block the current thread for at least `dur`.
 ![target(linux)]
 private function sleep_for(dur: Duration) -> void {
-    mut req: timespec = timespec { tv_sec:  dur.secs as i64,
-                                   tv_nsec: dur.nanos as i64 };
+    mut req: timespec = timespec { tv_sec:  dur.as_secs() as i64,
+                                   tv_nsec: dur.subsec_nanos() as i64 };
     mut rem: timespec = timespec { tv_sec: 0, tv_nsec: 0 };
     while (nanosleep(&req, &rem) != 0) {
         req = rem;
@@ -280,8 +280,8 @@ private function sleep_for(dur: Duration) -> void {
     // for at least one tick.  Whole seconds get the full millisecond
     // budget before clamping to u32::MAX (the longest single Sleep,
     // which the loop repeats until the full span elapses).
-    mut remaining_secs: u64 = dur.secs;
-    mut remaining_ns:   u32 = dur.nanos;
+    mut remaining_secs: u64 = dur.as_secs();
+    mut remaining_ns:   u32 = dur.subsec_nanos();
     if (remaining_secs == 0 && remaining_ns == 0) {
         return;
     }

@@ -422,7 +422,9 @@ Left over from that: the async entry point calls `Executor::new` and
    routing reads internal (594).  `ffi` and `sys` mark every constant,
    type, field and wrapper `public` but `sys`'s private `normalize`, and
    every `extern` block `public extern` (593); `core`'s unwind-runtime
-   hooks are a `private extern` block.  `encoding`'s base64 and SHA-1 helpers are
+   hooks are a `private extern` block.  `time`'s clocks and `Duration`
+   keep their seconds and nanoseconds private behind accessors (595).
+   `encoding`'s base64 and SHA-1 helpers are
    private, behind `encode`, `decode` and `sha1`.  HPACK
    is tested through `Http2Connection` against RFC 7541's examples, and
    the heap through `GlobalAlloc` with `native_alloc` on and as the
