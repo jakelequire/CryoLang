@@ -146,6 +146,18 @@ yet is recorded with the change that builds it, not here.
      keyword as a default its members may override, and the same keywords
      on globals, delegated)
 
+594. **The arena's and pool's default sizes are public; the global
+     arena's routing calls are internal.**  `arena::DEFAULT_CHUNK_SIZE`
+     and `pool::DEFAULT_SLOTS_PER_BLOCK` are the sizes `Arena::new` and
+     `Pool::new` choose, and a program may name them.  `GlobalArena`'s
+     `routing`, `take`, `holds` and `grow` are how `GlobalAlloc` serves
+     and releases a block from the published arena, and reach the
+     standard library alone; `publish` and `set_active` stay public.
+     The C bindings of `libc`, `syscall` and `openssl` are each a
+     `public extern` block, and the unwind runtime's hooks a `private
+     extern` block of `core::panic_unwind`, read only by `catch_unwind`.
+     (Jake; the hooks delegated under 587)
+
 ### 2026-10-24
 
 583. **A value whose type implements a trait by a generic implementation

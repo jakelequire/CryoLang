@@ -416,13 +416,13 @@ Left over from that: the async entry point calls `Executor::new` and
    calls internal (589).  `Array`'s, `HashMap`'s and `Pool`'s own grow
    helpers are private, `String`'s buffer is a private field, and so are
    `Layout`'s size and alignment, behind its accessors.  `alloc` is
-   marked item by item but for `ArcInner`, the arena's and pool's
-   default sizes and `GlobalArena`'s four routing reads: `Box`'s fields are private behind `from_raw_in`, and
-   the growth curve `next_capacity` internal (592).  `ffi` and `sys`
-   mark every constant, type, field and wrapper `public` but `sys`'s
-   private `normalize`; a function in an `extern` block can be written
-   `internal` or `private` and not `public`, so the bindings there stay
-   public by the default.  `encoding`'s base64 and SHA-1 helpers are
+   marked item by item but for `ArcInner`: `Box`'s fields are private
+   behind `from_raw_in`, the growth curve `next_capacity` internal (592),
+   the arena's and pool's default sizes public and `GlobalArena`'s four
+   routing reads internal (594).  `ffi` and `sys` mark every constant,
+   type, field and wrapper `public` but `sys`'s private `normalize`, and
+   every `extern` block `public extern` (593); `core`'s unwind-runtime
+   hooks are a `private extern` block.  `encoding`'s base64 and SHA-1 helpers are
    private, behind `encode`, `decode` and `sha1`.  HPACK
    is tested through `Http2Connection` against RFC 7541's examples, and
    the heap through `GlobalAlloc` with `native_alloc` on and as the

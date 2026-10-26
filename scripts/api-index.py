@@ -116,6 +116,9 @@ FUNC_RE = re.compile(
     r"^\s*(?:(public|private|internal)\s+)?function\s+([A-Za-z_]\w*)\s*(<[^(]*>)?\s*\(([^)]*)\)"
     r"\s*(?:->\s*([^{;]+?))?\s*[{;]"
 )
+# An extern block: a keyword before `extern` is the visibility of every
+# function in it that writes none.
+EXTERN_RE = re.compile(r"^\s*(?:(public|private|internal)\s+)?extern\s*\{")
 # The type annotation may be left to the initializer.
 CONST_RE = re.compile(r"^\s*(?:(public|private|internal)\s+)?const\s+([A-Z_][A-Z0-9_]*)\s*(?::\s*([^=;]+))?=")
 # A method inside a type body: optional `static`, a name, args, optional
@@ -172,6 +175,7 @@ def scan_file(path):
     depth = 0
     type_stack = []          # [name, depth_at_open, current label]
     pending = ""             # a signature's earlier lines, joined
+    extern_block = None      # [block keyword, depth_at_open]
     in_block_comment = False
 
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
@@ -259,13 +263,19 @@ def scan_file(path):
                 opened_type = True
 
         if not opened_type:
+            m = EXTERN_RE.match(code)
+            if m:
+                extern_block = [m.group(1), depth]
+
+        if not opened_type:
             m = FUNC_RE.match(code)
             if m and m.group(2) not in KEYWORDS:
                 vis, name, generics, args, ret = m.groups()
                 sig = f"{name}{clean_sig(generics)}({clean_sig(args)})"
                 if ret:
                     sig += f" -> {clean_sig(ret)}"
-                entries.append(("fn", sig, tag(vis)))
+                block_vis = extern_block[0] if extern_block else None
+                entries.append(("fn", sig, tag(vis or block_vis)))
 
             elif in_body and member_depth:
                 m = METHOD_RE.match(code)
@@ -294,6 +304,8 @@ def scan_file(path):
         depth += code.count("{") - code.count("}")
         while type_stack and depth <= type_stack[-1][1]:
             type_stack.pop()
+        if extern_block and depth <= extern_block[1]:
+            extern_block = None
 
     return ns, entries
 
