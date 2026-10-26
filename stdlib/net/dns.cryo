@@ -52,16 +52,16 @@ import std::future::blocking::{ BlockingJob, BlockingPool, JOB_PENDING };
 // AF_INET is 2 on every platform; AF_INET6 differs (Linux/BSD = 10,
 // Windows = 23). `getaddrinfo` reports the OS family value in `ai_family`,
 // so the Windows value must match or every IPv6/AAAA result is dropped.
-const AF_INET:  u32 = 2;
+private const AF_INET:  u32 = 2;
 ![target(unix)]
-const AF_INET6: u32 = 10;
+private const AF_INET6: u32 = 10;
 ![target(windows)]
-const AF_INET6: u32 = 23;
+private const AF_INET6: u32 = 23;
 
 /// The addresses a hostname resolved to. Owns the backing `Array`;
 /// call `drop` when done.
-type struct ResolvedAddrs {
-    addrs: Array<IpAddr>;
+public type struct ResolvedAddrs {
+    private addrs: Array<IpAddr>;
 
     /// Number of resolved addresses (>= 1 on a successful `resolve`).
     ![inline]
@@ -70,7 +70,7 @@ type struct ResolvedAddrs {
     }
 
     /// The i-th resolved address, or `None` if out of range.
-    get(&this, index: i64) -> Option<IpAddr> {
+    public get(&this, index: i64) -> Option<IpAddr> {
         return this.addrs.get(index);
     }
 
@@ -78,7 +78,7 @@ type struct ResolvedAddrs {
     /// the name resolved only to AAAA records. Callers that can dial a v6
     /// address should walk `get` instead; this exists for the layers that
     /// cannot yet.
-    first_ipv4(&this, port: u16) -> Option<SocketAddr> {
+    public first_ipv4(&this, port: u16) -> Option<SocketAddr> {
         mut i: i64 = 0;
         while (i < this.addrs.length()) {
             match (this.addrs.get(i)) {
@@ -102,7 +102,7 @@ implement trait Drop for struct ResolvedAddrs {
 /// RFC 3484 rules). `host` may be a name or a numeric literal - a
 /// numeric address resolves to itself. Fails with `NotFound` for an
 /// unknown name, `WouldBlock` for a temporary resolver failure.
-function resolve(host: Str) -> Result<ResolvedAddrs, IoError> {
+public function resolve(host: Str) -> Result<ResolvedAddrs, IoError> {
     // getaddrinfo needs a NUL-terminated node string.
     mut host_c: String = String::with_null(host);
 
@@ -157,7 +157,7 @@ function resolve(host: Str) -> Result<ResolvedAddrs, IoError> {
 /// Resolve `host` and pair every address with `port`, ready to hand to
 /// `TcpConnect::start` / `UdpSocket::connect`. The returned `Array`
 /// must be dropped by the caller.
-function lookup(host: Str, port: u16) -> Result<Array<SocketAddr>, IoError> {
+public function lookup(host: Str, port: u16) -> Result<Array<SocketAddr>, IoError> {
     mut resolved: ResolvedAddrs = resolve(host)?;
     mut out: Array<SocketAddr> = Array::<SocketAddr>::new();
     mut i: i64 = 0;
@@ -174,7 +174,7 @@ function lookup(host: Str, port: u16) -> Result<Array<SocketAddr>, IoError> {
 
 /// Resolve `host` to a single address - the first (most-preferred)
 /// record. The common case for "connect to this name".
-function resolve_one(host: Str) -> Result<IpAddr, IoError> {
+public function resolve_one(host: Str) -> Result<IpAddr, IoError> {
     mut resolved: ResolvedAddrs = resolve(host)?;
     const first: Option<IpAddr> = resolved.get(0);
     mem::drop(resolved);
@@ -198,13 +198,13 @@ function resolve_one(host: Str) -> Result<IpAddr, IoError> {
 /// block would need drop glue synthesized on a value the compiler cannot see is
 /// initialized. `produced` says whether either half was written at all — the
 /// pool can cancel a job before it ever runs — and `ok` says which one.
-type struct ResolveJob {
-    job:      BlockingJob;
-    host:     String;
-    addrs:    ResolvedAddrs;   // valid when `produced && ok`
-    err:      IoError;         // valid when `produced && !ok`
-    produced: boolean;
-    ok:       boolean;
+private type struct ResolveJob {
+    private job:      BlockingJob;
+    private host:     String;
+    private addrs:    ResolvedAddrs;   // valid when `produced && ok`
+    private err:      IoError;         // valid when `produced && !ok`
+    private produced: boolean;
+    private ok:       boolean;
 }
 
 /// `run_fn` for a `ResolveJob`: the blocking lookup, on a pool thread. A bare
@@ -213,7 +213,7 @@ type struct ResolveJob {
 /// `produced` is set last. Everything the collecting side reads is written
 /// before it, and the pool publishes the job's terminal status under its lock
 /// after this returns, which is what orders the two.
-function resolve_job_run(raw: u8*) -> void {
+private function resolve_job_run(raw: u8*) -> void {
     mut j: ResolveJob* = raw as ResolveJob*;
     match (resolve(j.host.as_str())) {
         Result::Ok(a)  => { j.addrs = a; j.ok = true;  }
@@ -226,7 +226,7 @@ function resolve_job_run(raw: u8*) -> void {
 /// collected, and free the block. Runs on whichever side let go of the block
 /// last. A collected answer leaves an empty `ResolvedAddrs` behind, so this
 /// stays correct whether or not anyone was still waiting.
-function resolve_job_free(raw: u8*) -> void {
+private function resolve_job_free(raw: u8*) -> void {
     mut j: ResolveJob* = raw as ResolveJob*;
     ptr::drop_in_place::<String>(&j.host);
     if (j.produced && j.ok) {
@@ -255,13 +255,13 @@ function resolve_job_free(raw: u8*) -> void {
 /// poll, so the spinning `future::block_on` driver still works. That is a
 /// blocking call on the polling thread, which is exactly what that driver
 /// already is. Run it on an `Executor` to get the offload.
-type struct Resolve {
-    host: Str;           // the request, until the job takes an owned copy
-    job:  ResolveJob*;   // null before the first poll and once the result is taken
+public type struct Resolve {
+    private host: Str;           // the request, until the job takes an owned copy
+    private job:  ResolveJob*;   // null before the first poll and once the result is taken
 
     /// Begin resolving `host`. Nothing is submitted until the first poll, so a
     /// `Resolve` that is never awaited costs nothing.
-    static start(host: Str) -> Resolve {
+    public static start(host: Str) -> Resolve {
         return Resolve { host: host, job: null };
     }
 
@@ -349,7 +349,7 @@ implement trait Drop for struct Resolve {
 /// Map a `getaddrinfo` `EAI_*` code to an `IoError`. `EAI_SYSTEM`
 /// defers to the live `errno`; everything else folds to the nearest
 /// kind with the raw code preserved.
-function eai_to_io(code: i32) -> IoError {
+private function eai_to_io(code: i32) -> IoError {
     // If-chain rather than `match`: `EAI_*` are cross-module constants
     // (`ffi::libc`), and `match` patterns require local constants, so an
     // arm on `libc::EAI_NONAME` would silently never fire.
@@ -372,7 +372,7 @@ function eai_to_io(code: i32) -> IoError {
 }
 
 /// Read a little-endian `u32` field at `base + off`.
-function read_u32(base: u8*, off: u64) -> u32 {
+private function read_u32(base: u8*, off: u64) -> u32 {
     return (base[off]       as u32)
          | ((base[off + 1]  as u32) << 8)
          | ((base[off + 2]  as u32) << 16)
@@ -382,7 +382,7 @@ function read_u32(base: u8*, off: u64) -> u32 {
 /// Read a little-endian pointer field (8 bytes) at `base + off` and
 /// reinterpret it as a `u8*`. This is how the `addrinfo` chain is
 /// walked: the kernel writes native-width pointers, we read them back.
-function read_ptr(base: u8*, off: u64) -> u8* {
+private function read_ptr(base: u8*, off: u64) -> u8* {
     mut v: u64 = 0;
     mut i: u64 = 0;
     while (i < 8) {
@@ -393,7 +393,7 @@ function read_ptr(base: u8*, off: u64) -> u8* {
 }
 
 /// Write a little-endian `u32` field at `base + off`.
-function write_u32(base: u8*, off: u64, value: u32) -> void {
+private function write_u32(base: u8*, off: u64, value: u32) -> void {
     base[off]     = (value)       as u8;
     base[off + 1] = (value >> 8)  as u8;
     base[off + 2] = (value >> 16) as u8;

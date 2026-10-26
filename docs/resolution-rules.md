@@ -148,6 +148,20 @@ yet is recorded with the change that builds it, not here.
      `private` keywords on an `extern` block stay the block's default, as
      593 built.  (Jake)
 
+597. **`net::sys` is a public low-level API.**  Its per-OS socket, DNS
+     and timeout shims and `ConnectStatus` are public, like `sys`'s; the
+     few functions that exist only to implement another one there (the
+     Winsock error normaliser, the connect-status probe behind
+     `os_connect_status`, the timeout packer) are private.  In
+     `net::addr`, `dns` and `http`, plain records keep public fields
+     (`IpV4Addr`, `SocketAddr`, `Url`, `Request`, `Response`); a type
+     that guards state keeps it private behind its methods
+     (`ResolvedAddrs`, `Resolve`, `Router`, `HttpServer`, `StatusCode`);
+     parse steps, formatting steps and the URL parser's byte constants
+     are private; the limits and defaults a program may name
+     (`HTTP_VERSION`, `MAX_BODY`, `DEFAULT_READ_TIMEOUT_SECS`, ...) are
+     public.  (Jake for `net::sys`; the rest delegated under 587)
+
 ### 2026-10-25
 
 593. **An `extern` block's functions are marked one by one or all at

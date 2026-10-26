@@ -426,7 +426,11 @@ Left over from that: the async entry point calls `Executor::new` and
    hooks are a `private extern` block.  `time`'s clocks and `Duration`
    keep their seconds and nanoseconds private behind accessors (595).
    `encoding`'s base64 and SHA-1 helpers are
-   private, behind `encode`, `decode` and `sha1`.  HPACK
+   private, behind `encode`, `decode` and `sha1`.  `net::sys` is public
+   but for its own helpers, and `net::addr`, `dns` and `http` are marked
+   item by item (597), but for `Headers`' map, the shared `push_all` and
+   members that carry an attribute in a struct body, which the parser
+   takes no keyword after.  HPACK
    is tested through `Http2Connection` against RFC 7541's examples, and
    the heap through `GlobalAlloc` with `native_alloc` on and as the
    allocator of an array, a hash map and a string without it.  An `internal module` line now hides its
