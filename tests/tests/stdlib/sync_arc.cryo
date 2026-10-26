@@ -284,3 +284,74 @@ function arc_weak_clone_bumps_weak_count() -> Result<(), TestError> {
     const wc: u64 = a.weak_count();
     return expect_eq(wc as i32, 2);
 }
+
+mut raw_payload_drops: i32 = 0;
+
+type struct RawCounted {
+    tag: i32;
+}
+
+implement trait Drop for struct RawCounted {
+    drop(mut &this) -> void {
+        raw_payload_drops = raw_payload_drops + 1;
+    }
+}
+
+// Wider than the two counts, so its value starts past them at 64, not 16.
+![align(64)]
+type struct AlignedCounted {
+    tag: i32;
+}
+
+implement trait Drop for struct AlignedCounted {
+    drop(mut &this) -> void {
+        raw_payload_drops = raw_payload_drops + 1;
+    }
+}
+
+![test]
+function arc_raw_pointer_is_the_value_and_round_trips() -> Result<(), TestError> {
+    raw_payload_drops = 0;
+    mut a: Arc<RawCounted> = Arc::new(RawCounted { tag: 41 });
+    const shared: RawCounted* = a.as_ptr();
+    const raw: RawCounted* = a.into_raw();
+    expect_true(raw == shared, Str::new("into_raw yields the value's own address"))?;
+    expect_eq(raw.tag, 41)?;
+
+    Arc::<RawCounted>::increment_strong_count(raw);
+    mut b: Arc<RawCounted> = Arc::<RawCounted>::from_raw(raw);
+    expect_eq(b.strong_count() as i32, 2)?;
+    expect_eq(b.as_ptr().tag, 41)?;
+
+    Arc::<RawCounted>::decrement_strong_count(raw);
+    expect_eq(b.strong_count() as i32, 1)?;
+    expect_eq(raw_payload_drops, 0)?;
+    mem::drop(b);
+    return expect_eq(raw_payload_drops, 1);
+}
+
+![test]
+function arc_raw_pointer_steps_back_over_alignment_padding() -> Result<(), TestError> {
+    raw_payload_drops = 0;
+    mut a: Arc<AlignedCounted> = Arc::new(AlignedCounted { tag: 7 });
+    mut w: Weak<AlignedCounted> = a.downgrade();
+    const raw: AlignedCounted* = a.into_raw();
+    expect_true(mem::is_aligned(raw as void*, 64), Str::new("value keeps its alignment"))?;
+
+    Arc::<AlignedCounted>::increment_strong_count(raw);
+    expect_eq(w.strong_count() as i32, 2)?;
+    Arc::<AlignedCounted>::decrement_strong_count(raw);
+    expect_eq(w.strong_count() as i32, 1)?;
+    expect_eq(raw_payload_drops, 0)?;
+
+    mut b: Arc<AlignedCounted> = Arc::<AlignedCounted>::from_raw(raw);
+    expect_eq(b.as_ptr().tag, 7)?;
+    mem::drop(b);
+    expect_eq(raw_payload_drops, 1)?;
+    mut got_none: boolean = false;
+    match (w.upgrade()) {
+        Option::Some(_) => { }
+        Option::None    => { got_none = true; }
+    }
+    return expect_true(got_none, Str::new("no Weak upgrades once the raw reference is balanced"));
+}

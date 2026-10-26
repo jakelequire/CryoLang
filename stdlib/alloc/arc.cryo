@@ -52,13 +52,15 @@ import std::alloc::layout::{ Layout };
 import std::alloc::allocator::{ AllocError, Allocator, GlobalAlloc };
 import std::sync::atomic::{ Atomic, MemoryOrder };
 import std::core::mem;
+import std::math;
 
 /// Heap-resident header shared by every `Arc<T, A>` and `Weak<T, A>` for one
 /// value.  The allocator instance lives here, not in the handles, so all of
 /// them agree on who frees the inner when the last reference drops.  Both
 /// counts are `Atomic<u64>` for lock-free increments and decrements; see the
-/// module docs for what `strong` and `weak` mean.
-type struct ArcInner<T, A> {
+/// module docs for what `strong` and `weak` mean.  `Arc::value_offset` depends
+/// on the counts coming first and `value` directly after them.
+private type struct ArcInner<T, A> {
     strong: Atomic<u64>;
     weak:   Atomic<u64>;
     value:  T;
@@ -209,46 +211,61 @@ public type struct Arc<T, A = GlobalAlloc> where A: Allocator {
         return Option::None;
     }
 
-    /// Consume this handle without touching the strong count, yielding the raw
-    /// header it referenced.  The caller inherits the one strong reference this
-    /// handle held and MUST later balance it - recover a handle with `from_raw`
-    /// and drop it, or call `decrement_strong_count` - or the value leaks.  The
-    /// consumed handle's own drop is suppressed (its `inner` is nulled), so
-    /// yielding the pointer here is not itself a decrement.  Enables a raw
-    /// `ArcInner*` to be parked in a `void*` slot (e.g. a manual-vtable waker)
-    /// outside the type system while still owning a reference.
-    public into_raw(mut this) -> ArcInner<T, A>* {
-        const p: ArcInner<T, A>* = this.inner;
+    /// Consume this handle without touching the strong count, yielding a
+    /// pointer to the shared value.  The caller inherits the one strong
+    /// reference this handle held and MUST later balance it - recover a handle
+    /// with `from_raw` and drop it, or call `decrement_strong_count` - or the
+    /// value leaks.  The consumed handle's own drop is suppressed (its `inner`
+    /// is nulled), so yielding the pointer here is not itself a decrement.
+    /// Enables a reference to be parked in a `void*` slot (e.g. a
+    /// manual-vtable waker) outside the type system while still owning it.
+    public into_raw(mut this) -> T* {
+        const value: T* = &this.inner.value;
         this.inner = null;
-        return p;
+        return value;
     }
 
     /// Reconstitute a handle from a pointer returned by `into_raw`, taking back
     /// ownership of exactly one strong reference; the returned handle's drop
-    /// balances it.  Undefined unless `p` came from `into_raw` (or an
-    /// `increment_strong_count`) on an `Arc<T, A>` of this exact type whose
-    /// reference has not already been balanced.
-    public static from_raw(p: ArcInner<T, A>*) -> Arc<T, A> {
-        return Arc::<T, A> { inner: p };
+    /// balances it.  Undefined unless `value` came from `into_raw` on an
+    /// `Arc<T, A>` of this exact type whose reference has not already been
+    /// balanced.
+    public static from_raw(value: T*) -> Arc<T, A> {
+        return Arc::<T, A> { inner: Arc::<T, A>::block_of(value) };
     }
 
-    /// Add one to the strong count of an `into_raw`'d header held only as a raw
+    /// Add one to the strong count of an `into_raw`'d value held only as a raw
     /// pointer (no live handle).  Pairs one-for-one with a later
     /// `decrement_strong_count`.  `Relaxed` matches `clone`: the new owner
     /// already shares a happens-before edge with the caller.
-    public static increment_strong_count(p: ArcInner<T, A>*) -> void {
-        p.strong.fetch_add(1, MemoryOrder::Relaxed);
+    public static increment_strong_count(value: T*) -> void {
+        Arc::<T, A>::block_of(value).strong.fetch_add(1, MemoryOrder::Relaxed);
     }
 
-    /// Remove one strong reference from a header held only as a raw pointer,
-    /// running the value's destructor and freeing the header if it was the
+    /// Remove one strong reference from a value held only as a raw pointer,
+    /// running the value's destructor and freeing the block if it was the
     /// last.  Balances one `into_raw` or `increment_strong_count` by routing
     /// through the handle `Drop`, so the release/acquire teardown ordering is
     /// identical.  Undefined if the reference was already balanced.
-    public static decrement_strong_count(p: ArcInner<T, A>*) -> void
+    public static decrement_strong_count(value: T*) -> void
     where A: Allocator {
-        mut a: Arc<T, A> = Arc::from_raw(p);
+        mut a: Arc<T, A> = Arc::from_raw(value);
         mem::drop(a);
+    }
+
+    /// Byte distance from the start of the shared block to its value: the two
+    /// counts in declaration order, then `T` at the next multiple of its own
+    /// alignment, so an over-aligned `T` sits further in than the counts'
+    /// size alone.
+    private static value_offset() -> u64 {
+        const weak_offset: u64 = math::align_up(sizeof(Atomic<u64>), alignof(Atomic<u64>));
+        return math::align_up(weak_offset + sizeof(Atomic<u64>), alignof(T));
+    }
+
+    /// The shared block whose value `value` points at.
+    private static block_of(value: T*) -> ArcInner<T, A>* {
+        const start: u8* = mem::offset::<u8>(value as u8*, -(Arc::<T, A>::value_offset() as i64));
+        return start as ArcInner<T, A>*;
     }
 }
 

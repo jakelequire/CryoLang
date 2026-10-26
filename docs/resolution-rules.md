@@ -133,6 +133,21 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-26
+
+596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
+     returns a `T*` to the value inside the shared block, and `from_raw`,
+     `increment_strong_count` and `decrement_strong_count` take that
+     `T*` and step back to the block, by an offset that rounds past the
+     two counts to `T`'s own alignment.  `ArcInner`, the block, is
+     private to `alloc::arc`, and the executor holds its tasks through
+     `Arc`'s raw API alone.  `Rc` has no raw API, so nothing changes
+     there.  `datetime`'s seconds per day, hour and minute are private to
+     it, and `Duration` has public `SECS_PER_MINUTE`, `SECS_PER_HOUR` and
+     `SECS_PER_DAY` beside `NANOS_PER_SEC`.  The `public`, `internal` and
+     `private` keywords on an `extern` block stay the block's default, as
+     593 built.  (Jake)
+
 ### 2026-10-25
 
 593. **An `extern` block's functions are marked one by one or all at

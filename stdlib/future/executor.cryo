@@ -60,7 +60,7 @@ import std::core::drop::{ Drop };
 import std::core::panic_unwind::{ PanicInfo };
 import std::alloc::layout::{ Layout };
 import std::alloc::allocator::{ AllocError, GlobalAlloc };
-import std::alloc::arc::{ Arc, ArcInner };
+import std::alloc::arc::{ Arc };
 import std::sync::atomic::{ Atomic, MemoryOrder };
 import std::ffi::libc::{
     pthread_cond_broadcast, pthread_cond_destroy, pthread_cond_init, pthread_cond_signal,
@@ -210,14 +210,12 @@ type struct Task {
     next:       Task*;
     exec:       ExecInner*;
     run_state:  Atomic<u8>;
-    self_arc:   ArcInner<Task, GlobalAlloc>*;   // the box's own Arc header (for incref/decref)
 
     /// Build a ready-to-enqueue task around a boxed future + its shared control
     /// block. `run_state` starts SCHEDULED (the caller enqueues immediately) and
     /// `next` is unlinked; the vtable fn-ptrs are the future's monomorphized
-    /// thunks. `self_arc` is null here — `spawn_on` wires it after `Arc::new`
-    /// places this value in its header. Returned by value and moved into that
-    /// `Arc<Task>`.
+    /// thunks. Returned by value and moved into an `Arc<Task>`, whose raw
+    /// value pointer every `Task*` then is.
     static new(poll_fn:    (u8*, u8*, Context*) -> u8,
                drop_fn:    (u8*) -> void,
                dispose_fn: (u8*, u8) -> void,
@@ -233,7 +231,6 @@ type struct Task {
             next:       null,
             exec:       exec,
             run_state:  Atomic::<u8>::new(ST_SCHEDULED),
-            self_arc:   null,
         };
     }
 
@@ -415,7 +412,7 @@ type struct ExecInner {
 /// and the wake path (handing the ready queue its own reference) call this; it
 /// pairs one-for-one with `task_decref`.
 private function task_incref(task: Task*) -> void {
-    Arc::<Task, GlobalAlloc>::increment_strong_count(task.self_arc);
+    Arc::<Task, GlobalAlloc>::increment_strong_count(task);
 }
 
 /// Release one strong reference to `task`'s box. The last release runs
@@ -423,7 +420,7 @@ private function task_incref(task: Task*) -> void {
 /// `task_incref`, the initial `Arc::new` scheduling reference, and each stored
 /// waker.
 private function task_decref(task: Task*) -> void {
-    Arc::<Task, GlobalAlloc>::decrement_strong_count(task.self_arc);
+    Arc::<Task, GlobalAlloc>::decrement_strong_count(task);
 }
 
 /// `Waker` `clone_fn` for an owning task waker: acquire a reference and return
@@ -698,21 +695,13 @@ where F: Future<O> {
     // Box the task inside an `Arc<Task>`: the strong count is the box's
     // lifetime. `Arc::new`'s initial count of 1 IS the scheduling reference,
     // handed to the ready queue by `into_raw` (which suppresses the handle's own
-    // drop). `self_arc` back-points at the header so `task_incref`/`task_decref`
-    // reach the count from any `Task*`.
-    // Box the task inside an `Arc<Task>`: the strong count is the box's
-    // lifetime. `Arc::new`'s initial count of 1 IS the scheduling reference,
-    // handed to the ready queue by `into_raw` (which suppresses the handle's own
-    // drop). `self_arc` back-points at the header so `task_incref`/`task_decref`
-    // reach the count from any `Task*`.
+    // drop). The `Task*` it yields is what `task_incref`/`task_decref` take.
     mut arc_res: Result<Arc<Task, GlobalAlloc>, AllocError> =
         Arc::try_new(Task::new(task_poll_thunk::<F, O>, task_drop_thunk::<F>,
                                dispose_shared_thunk::<O>, fbox as u8*, sh as u8*, inner));
     match (arc_res) {
         Result::Ok(arc) => {
-            const ap: ArcInner<Task, GlobalAlloc>* = arc.into_raw();
-            ap.value.self_arc = ap;
-            inner.enqueue(&ap.value);
+            inner.enqueue(arc.into_raw());
         }
         Result::Err(_)  => {
             // `try_new` dropped the Task value; its `Drop` finished it CANCELLED
