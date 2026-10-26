@@ -163,6 +163,17 @@ yet is recorded with the change that builds it, not here.
      preface, the normaliser and the constant; the rest delegated under
      587)
 
+600. **The unused-code lints run on the package being built.**  W0001,
+     W0002 and W0009 report a module that belongs to the package a build
+     is building, and no other: the standard library is linted by its own
+     build and not by a program's, and a dependency or vendored package by
+     its own build and not by its dependents'.  W0002 reports only a
+     private function or method; a public or internal one nothing in its
+     package calls is API for other packages, never reported and never
+     removed for that.  A private helper whose only callers are gated to
+     one target is gated to that target too, so no build carries it dead.
+     (Jake; gating target-only helpers delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that
