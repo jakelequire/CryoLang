@@ -135,6 +135,15 @@ yet is recorded with the change that builds it, not here.
 
 ### 2026-10-26
 
+598. **A member's visibility keyword comes after its directives.**  In
+     a struct or union body, `![inline] public length(&this)` marks the
+     method public, as the same order does on an implement-block method,
+     an `extern` function and a top-level item.  The keyword is read in
+     that one place, so `public ![inline] length` is refused in a struct
+     body as it already was everywhere else; no file in the tree wrote
+     that order.  (Jake for the order after directives; refusing the
+     other order delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

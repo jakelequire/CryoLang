@@ -179,7 +179,10 @@ AggregateDecl      ::= "type"? "struct" Ident Generics?
                                                         parameters; checked per instantiation *)
                        "{" Member* "}"
 
-Member             ::= Visibility? "static"? (Field | Method)
+(* A member's directives come before its visibility, as on an
+   implement-block method, an extern function and a top-level item:
+   `![inline] public length(&this) -> i64`.                          *)
+Member             ::= Directive* Visibility? "static"? (Field | Method)
                      | Visibility? MemberConstant
                      | VisibilityBlock          (* `public:` / `internal:` / `private:`
                                                    labels a run of subsequent members. *)
@@ -271,7 +274,7 @@ TargetType         ::= QualName GenericArgs?
                      | Primitive
                      | "()"                              (* unit type *)
 
-MethodImpl         ::= "static"? "async"?
+MethodImpl         ::= Directive* Visibility? "static"? "async"?
                        Ident Generics?
                        "(" ParamList? ")" ("->" Type)?
                        ("where" WhereClause)? Block

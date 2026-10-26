@@ -3356,6 +3356,17 @@ type struct AlignedData {
 }
 ```
 
+A declaration's directives come before everything else written on it, its visibility keyword included, wherever it is declared: at the top level, in a struct or union body, in an `implement` block and in an `extern` block.
+
+```cryo
+type struct Gauge {
+    private level: i64;
+
+    ![inline]
+    public reading(&this) -> i64 { return this.level; }
+}
+```
+
 ### 16.1 Recognised Attributes
 
 | Directive                                                 | Target                             | Description                                                                                                                                                                                                                                                                                                                                                                                                                     |
