@@ -303,6 +303,19 @@ yet is recorded with the change that builds it, not here.
      `Path::last_dot` are deleted.  (Jake for the names; the
      `last_separator` signature delegated)
 
+610. **`Str`, `Slice` and `Path` are marked item by item.**  `Str`,
+     `Slice<T>`, `Path` and `PathBuf` and all their methods are public,
+     their storage private behind `as_ptr`, `as_bytes`, `as_str` and
+     `as_path`.  `Str`'s `SplitIter`, `Chars` and `CharIndices` are
+     public, since `String`'s methods name them, with private fields; the
+     UTF-8 decoding step `decode_scalar`, its `REPLACEMENT_SCALAR` and the
+     integer parser's `I64_MIN_MAGNITUDE` are private.  `SliceIter` is
+     internal: `Slice` and `Array` both make one and no public signature
+     names it.  `Path`'s syntax constants are private and its static
+     queries (`is_separator`, `root_len`, `is_absolute_str`,
+     `last_separator`) public.  Base64 looks its alphabet up by indexing
+     a `Slice`, its own byte readers deleted.  (delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

@@ -459,7 +459,7 @@ Left over from that: the async entry point calls `Executor::new` and
    dependency's are.  The library's one-off helpers give way to general
    APIs its callers use directly (602): a byte classifies itself (608),
    and `Str` searches from either end while a `Slice` indexes and
-   compares (609).
+   compares (609).  `Str`, `Slice` and `Path` are marked (610).
    Open: `u8.to_ascii_uppercase`, which `Str.to_ascii_uppercase` still
    folds by hand for want of.
 

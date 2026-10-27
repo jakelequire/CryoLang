@@ -6,6 +6,7 @@
 namespace std::encoding::base64;
 
 import std::core::option::{ Option };
+import std::core::slice::{ Slice };
 import std::collections::array::{ Array };
 import std::collections::string::{ String };
 import std::collections::str::{ Str };
@@ -17,8 +18,8 @@ private const PAD: u8 = 0x3D;   // '='
 public function encode(data: u8*, len: i64) -> String {
     // The alphabet is a LOCAL const: a module-level `const Str = Str::new(..)`
     // reads back empty at runtime (fragile static init), which would make
-    // `sym` index an empty table and emit all-zero output.
-    const table: Str = Str::new("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/");
+    // the lookup index an empty table.
+    const table: Slice<u8> = Str::new("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/").as_bytes();
     mut out: String = String::with_capacity((len + 2) / 3 * 4);
 
     mut i: i64 = 0;
@@ -26,26 +27,26 @@ public function encode(data: u8*, len: i64) -> String {
         const n: u32 = ((data[i] as u32) << 16)
                      | ((data[i + 1] as u32) << 8)
                      |  (data[i + 2] as u32);
-        out.push_byte(sym(table,(n >> 18) & 0x3F));
-        out.push_byte(sym(table,(n >> 12) & 0x3F));
-        out.push_byte(sym(table,(n >> 6)  & 0x3F));
-        out.push_byte(sym(table,(n)       & 0x3F));
+        out.push_byte(table[(n >> 18) & 0x3F]);
+        out.push_byte(table[(n >> 12) & 0x3F]);
+        out.push_byte(table[(n >> 6)  & 0x3F]);
+        out.push_byte(table[(n)       & 0x3F]);
         i = i + 3;
     }
 
     const rest: i64 = len - i;
     if (rest == 1) {
         const n: u32 = (data[i] as u32) << 16;
-        out.push_byte(sym(table,(n >> 18) & 0x3F));
-        out.push_byte(sym(table,(n >> 12) & 0x3F));
+        out.push_byte(table[(n >> 18) & 0x3F]);
+        out.push_byte(table[(n >> 12) & 0x3F]);
         out.push_byte(PAD);
         out.push_byte(PAD);
     }
     if (rest == 2) {
         const n: u32 = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8);
-        out.push_byte(sym(table,(n >> 18) & 0x3F));
-        out.push_byte(sym(table,(n >> 12) & 0x3F));
-        out.push_byte(sym(table,(n >> 6)  & 0x3F));
+        out.push_byte(table[(n >> 18) & 0x3F]);
+        out.push_byte(table[(n >> 12) & 0x3F]);
+        out.push_byte(table[(n >> 6)  & 0x3F]);
         out.push_byte(PAD);
     }
     return out;
@@ -59,13 +60,14 @@ public function decode(source: Str) -> Option<Array<u8>> {
     mut out: Array<u8> = Array::<u8>::new();
     if (len == 0) { return Option::Some(out); }
 
+    const bytes: Slice<u8> = source.as_bytes();
     mut i: i64 = 0;
     while (i < len) {
         mut acc: u32 = 0;
         mut pads: u32 = 0;
         mut j: i64 = 0;
         while (j < 4) {
-            const ch: u8 = byte_at(source, i + j);
+            const ch: u8 = bytes[i + j];
             acc = acc << 6;
             if (ch == PAD) {
                 pads = pads + 1;
@@ -95,11 +97,6 @@ public function decode(source: Str) -> Option<Array<u8>> {
     return Option::Some(out);
 }
 
-/// The base64 symbol for a 6-bit value.
-private function sym(table: Str, value: u32) -> u8 {
-    return byte_at(table, value as i64);
-}
-
 /// Map a base64 character back to its 6-bit value, or `None`.
 private function decode_sym(ch: u8) -> Option<u8> {
     if (ch >= 0x41 && ch <= 0x5A) { return Option::Some(ch - 0x41); }        // A-Z -> 0..25
@@ -108,12 +105,4 @@ private function decode_sym(ch: u8) -> Option<u8> {
     if (ch == 0x2B) { return Option::Some(62); }                            // '+'
     if (ch == 0x2F) { return Option::Some(63); }                            // '/'
     return Option::None;
-}
-
-/// Byte access without the `Option` ceremony; callers stay in range.
-private function byte_at(s: Str, index: i64) -> u8 {
-    match (s.byte_at(index)) {
-        Option::Some(b) => { return b; }
-        Option::None    => { return 0; }
-    }
 }
