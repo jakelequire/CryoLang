@@ -1,0 +1,173 @@
+///! Checked and saturating integer arithmetic, floor division, radix
+///! parsing, and the single-precision float classes.
+///!
+///! Each checked operation is driven to both sides of the boundary it
+///! guards - the last value that fits and the first that does not - on a
+///! width computed in a wider one, on a 64-bit width checked directly, and
+///! on a width that delegates.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::IntegerArithmetic;
+
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::math::{ FpCategory };
+import std::collections::str::{ Str };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_eq };
+
+function bytes(text: string) -> Slice<u8> {
+    return Slice::from_raw(text as u8*, text.length() as i64);
+}
+
+![test]
+function checked_add_at_each_bound() -> Result<(), TestError> {
+    expect_eq((126 as i8).checked_add(1).unwrap_or(0), 127)?;
+    expect((127 as i8).checked_add(1).is_none(), Str::new("i8 past MAX"))?;
+    const minus_one_i8: i8 = -1;
+    expect(i8::MIN.checked_add(minus_one_i8).is_none(), Str::new("i8 past MIN"))?;
+    expect_eq((254 as u8).checked_add(1).unwrap_or(0), 255)?;
+    expect((255 as u8).checked_add(1).is_none(), Str::new("u8 past MAX"))?;
+    expect_eq((i64::MAX - 1).checked_add(1).unwrap_or(0), i64::MAX)?;
+    expect(i64::MAX.checked_add(1).is_none(), Str::new("i64 past MAX"))?;
+    expect(i64::MIN.checked_add(-1).is_none(), Str::new("i64 past MIN"))?;
+    expect((u64::MAX - 1).checked_add(1).is_some(), Str::new("u64 to MAX"))?;
+    expect(u64::MAX.checked_add(1).is_none(), Str::new("u64 past MAX"))?;
+    const one_u128: u128 = 1;
+    expect(u128::MAX.checked_add(one_u128).is_none(), Str::new("u128 past MAX"))?;
+    return expect(usize::MAX.checked_add(1).is_none(), Str::new("usize past MAX"));
+}
+
+![test]
+function checked_subtract_at_each_bound() -> Result<(), TestError> {
+    expect_eq((3 as u32).checked_subtract(3).unwrap_or(9), 0)?;
+    expect((3 as u32).checked_subtract(4).is_none(), Str::new("u32 below 0"))?;
+    const above_min_i16: i16 = i16::MIN + 1;
+    const minus_one_i16: i16 = -1;
+    expect_eq(above_min_i16.checked_subtract(1).unwrap_or(0), i16::MIN)?;
+    expect(i16::MIN.checked_subtract(1).is_none(), Str::new("i16 past MIN"))?;
+    expect(i16::MAX.checked_subtract(minus_one_i16).is_none(), Str::new("i16 past MAX"))?;
+    expect(i64::MIN.checked_subtract(1).is_none(), Str::new("i64 past MIN"))?;
+    expect(i64::MAX.checked_subtract(-1).is_none(), Str::new("i64 past MAX"))?;
+    expect_eq((0 as i64).checked_subtract(i64::MAX).unwrap_or(0), -i64::MAX)?;
+    return expect((1 as isize).checked_subtract(isize::MIN).is_none(), Str::new("isize past MAX"));
+}
+
+![test]
+function checked_multiply_at_each_bound() -> Result<(), TestError> {
+    expect_eq((65535 as i32).checked_multiply(32768).unwrap_or(0), 2147450880)?;
+    expect((65536 as i32).checked_multiply(32768).is_none(), Str::new("i32 past MAX"))?;
+    const minus_65536: i32 = -65536;
+    expect(minus_65536.checked_multiply(32769).is_none(), Str::new("i32 past MIN"))?;
+    expect_eq((4294967295 as u64).checked_multiply(4294967297).unwrap_or(0), u64::MAX)?;
+    expect((4294967296 as u64).checked_multiply(4294967296).is_none(), Str::new("u64 past MAX"))?;
+    expect((-1 as i64).checked_multiply(i64::MIN).is_none(), Str::new("-1 * i64::MIN"))?;
+    expect(i64::MIN.checked_multiply(-1).is_none(), Str::new("i64::MIN * -1"))?;
+    expect_eq((3037000499 as i64).checked_multiply(3037000499).unwrap_or(0), 9223372030926249001)?;
+    expect((3037000500 as i64).checked_multiply(3037000500).is_none(), Str::new("i64 square past MAX"))?;
+    return expect_eq((0 as i64).checked_multiply(i64::MIN).unwrap_or(1), 0);
+}
+
+![test]
+function saturating_clamps_to_the_bound_passed() -> Result<(), TestError> {
+    expect_eq((100 as i8).saturating_add(100), 127)?;
+    const minus_hundred: i8 = -100;
+    expect_eq(minus_hundred.saturating_add(minus_hundred), i8::MIN)?;
+    expect_eq(minus_hundred.saturating_subtract(100), i8::MIN)?;
+    expect_eq((200 as u8).saturating_add(100), 255)?;
+    expect_eq((5 as u16).saturating_subtract(9), 0)?;
+    expect_eq((70000 as u32).saturating_multiply(70000), u32::MAX)?;
+    expect_eq(i64::MAX.saturating_add(1), i64::MAX)?;
+    expect_eq(i64::MIN.saturating_subtract(1), i64::MIN)?;
+    expect_eq(i64::MIN.saturating_subtract(-1), i64::MIN + 1)?;
+    expect_eq(i64::MAX.saturating_subtract(-1), i64::MAX)?;
+    expect_eq(i64::MIN.saturating_multiply(-1), i64::MAX)?;
+    expect_eq(i64::MAX.saturating_multiply(-2), i64::MIN)?;
+    expect_eq(u64::MAX.saturating_multiply(2), u64::MAX)?;
+    expect_eq((3 as u64).saturating_subtract(4), 0)?;
+    return expect_eq((7 as i64).saturating_add(-9), -2);
+}
+
+![test]
+function floor_division_rounds_down() -> Result<(), TestError> {
+    expect_eq((7 as i64).divide_floor(2), 3)?;
+    expect_eq((-7 as i64).divide_floor(2), -4)?;
+    expect_eq((7 as i64).divide_floor(-2), -4)?;
+    expect_eq((-7 as i64).divide_floor(-2), 3)?;
+    expect_eq((-8 as i64).divide_floor(2), -4)?;
+    expect_eq((7 as i64).modulo_floor(2), 1)?;
+    expect_eq((-7 as i64).modulo_floor(2), 1)?;
+    expect_eq((7 as i64).modulo_floor(-2), -1)?;
+    expect_eq((-7 as i64).modulo_floor(-2), -1)?;
+    return expect_eq((-8 as i64).modulo_floor(2), 0);
+}
+
+![test]
+function parse_radix_reads_every_byte() -> Result<(), TestError> {
+    expect_eq(u64::parse_radix(bytes("18446744073709551615"), 10).unwrap_or(0), u64::MAX)?;
+    expect(u64::parse_radix(bytes("18446744073709551616"), 10).is_none(), Str::new("past u64::MAX"))?;
+    expect_eq(u64::parse_radix(bytes("ffFF"), 16).unwrap_or(0), 65535)?;
+    expect_eq(u64::parse_radix(bytes("zz"), 36).unwrap_or(0), 1295)?;
+    expect_eq(u64::parse_radix(bytes("0101"), 2).unwrap_or(0), 5)?;
+    expect(u64::parse_radix(bytes("12"), 2).is_none(), Str::new("a digit past the radix"))?;
+    expect(u64::parse_radix(bytes(""), 10).is_none(), Str::new("empty"))?;
+    expect(u64::parse_radix(bytes("1_0"), 10).is_none(), Str::new("a separator"))?;
+    expect(u64::parse_radix(bytes("+1"), 10).is_none(), Str::new("a sign"))?;
+    expect(u64::parse_radix(bytes("1"), 1).is_none(), Str::new("radix 1"))?;
+    return expect(u64::parse_radix(bytes("1"), 37).is_none(), Str::new("radix 37"));
+}
+
+![test]
+function parse_radix_prefix_stops_at_non_digit_or_overflow() -> Result<(), TestError> {
+    const run: (u64, i64) = u64::parse_radix_prefix(bytes("123abc"), 10).unwrap_or((0, 0));
+    expect_eq(run.0, 123)?;
+    expect_eq(run.1, 3)?;
+    const hex: (u64, i64) = u64::parse_radix_prefix(bytes("7fg"), 16).unwrap_or((0, 0));
+    expect_eq(hex.0, 127)?;
+    expect_eq(hex.1, 2)?;
+    const long: (u64, i64) = u64::parse_radix_prefix(bytes("184467440737095516159"), 10).unwrap_or((0, 0));
+    expect_eq(long.0, u64::MAX)?;
+    expect_eq(long.1, 20)?;
+    return expect(u64::parse_radix_prefix(bytes("x1"), 10).is_none(), Str::new("no leading digit"));
+}
+
+![test]
+function text_parsing_keeps_its_contracts() -> Result<(), TestError> {
+    expect_eq(u64::try_from(Str::new("18446744073709551615")).unwrap_or(0), u64::MAX)?;
+    expect(u64::try_from(Str::new("18446744073709551616")).is_err(), Str::new("decimal overflow"))?;
+    expect(u64::try_from(Str::new("12x")).is_err(), Str::new("decimal non-digit"))?;
+    expect_eq(Str::new("00000000000000ff").try_to_hex().unwrap_or(0), 255)?;
+    expect(Str::new("1ffffffffffffffff").try_to_hex().is_err(), Str::new("hex overflow"))?;
+    expect_eq("0x_ff".parse_int::<u64>(), 255)?;
+    expect_eq("-1".parse_int::<i64>(), -1)?;
+    expect_eq("18446744073709551617".parse_int::<u64>(), 1)?;
+    return expect_eq("0b1_0_1z".parse_int::<u8>(), 5);
+}
+
+![test]
+function single_precision_classes() -> Result<(), TestError> {
+    const subnormal: f32 = 1.0e-40;
+    const one: f32 = 1.0;
+    const zero: f32 = 0.0;
+    const negative_zero: f32 = -0.0;
+    expect(f32::INFINITY.is_infinite() && f32::NEG_INFINITY.is_infinite(), Str::new("infinities"))?;
+    expect(!f32::NAN.is_infinite() && !f32::NAN.is_finite(), Str::new("NaN is neither"))?;
+    expect(subnormal.is_finite() && !subnormal.is_normal(), Str::new("subnormal is not normal"))?;
+    expect(one.is_normal() && !zero.is_normal(), Str::new("one is normal, zero is not"))?;
+    expect(negative_zero.is_sign_negative() && !zero.is_sign_negative(), Str::new("the sign bit"))?;
+    expect_eq(category_ordinal(subnormal.classify()), 3)?;
+    expect_eq(category_ordinal(f32::NAN.classify()), 0)?;
+    expect_eq(category_ordinal(f32::NEG_INFINITY.classify()), 1)?;
+    expect_eq(category_ordinal(negative_zero.classify()), 2)?;
+    return expect_eq(category_ordinal(f32::MIN_POSITIVE.classify()), 4);
+}
+
+function category_ordinal(category: FpCategory) -> i32 {
+    return match (category) {
+        FpCategory::Nan       => { 0 }
+        FpCategory::Infinite  => { 1 }
+        FpCategory::Zero      => { 2 }
+        FpCategory::Subnormal => { 3 }
+        FpCategory::Normal    => { 4 }
+    };
+}

@@ -97,17 +97,16 @@ public type struct Instant {
 
     /// `this + dur`, or `None` if the reading would overflow `i64`.
     public checked_add(&this, dur: &Duration) -> Option<Instant> {
-        if (dur.as_secs() > (i64::MAX as u64)) { return Option::None; }
-        const add_secs: i64 = dur.as_secs() as i64;
-        if (this.secs > i64::MAX - add_secs) { return Option::None; }
-        mut sec:  i64 = this.secs + add_secs;
-        mut nsec: i64 = this.nanos + (dur.subsec_nanos() as i64);
+        mut carry: i128 = 0;
+        mut nsec:  i64 = this.nanos + (dur.subsec_nanos() as i64);
         if (nsec >= NSEC_PER_SEC) {
-            if (sec == i64::MAX) { return Option::None; }
-            sec  = sec + 1;
-            nsec = nsec - NSEC_PER_SEC;
+            carry = 1;
+            nsec  = nsec - NSEC_PER_SEC;
         }
-        return Option::Some(Instant { secs: sec, nanos: nsec });
+        // In `i128` the sum of an `i64`, a `u64` and the carry is exact.
+        const total: i128 = (this.secs as i128) + (dur.as_secs() as i128) + carry;
+        if (total > i64::MAX as i128) { return Option::None; }
+        return Option::Some(Instant { secs: total as i64, nanos: nsec });
     }
 
     /// `this - dur`, or `None` if the reading would go below zero.
@@ -181,17 +180,20 @@ public type struct SystemTime {
         return diff_saturating(this.secs, this.nanos, earlier.secs, earlier.nanos);
     }
 
-    /// `this + dur`.
+    /// `this + dur`, or `None` if the reading would overflow `i64`.
     public checked_add(&this, dur: &Duration) -> Option<SystemTime> {
-        const add_secs: i64 = dur.as_secs() as i64;
-        if (this.secs > i64::MAX - add_secs) { return Option::None; }
-        mut sec:  i64 = this.secs + add_secs;
-        mut nsec: i64 = this.nanos + (dur.subsec_nanos() as i64);
+        mut carry: i128 = 0;
+        mut nsec:  i64 = this.nanos + (dur.subsec_nanos() as i64);
         if (nsec >= NSEC_PER_SEC) {
-            sec  = sec + 1;
-            nsec = nsec - NSEC_PER_SEC;
+            carry = 1;
+            nsec  = nsec - NSEC_PER_SEC;
         }
-        return Option::Some(SystemTime { secs: sec, nanos: nsec });
+        // In `i128` the sum of an `i64`, a `u64` and the carry is exact,
+        // so one range check answers for every reading, a negative one
+        // included.
+        const total: i128 = (this.secs as i128) + (dur.as_secs() as i128) + carry;
+        if (total > i64::MAX as i128) { return Option::None; }
+        return Option::Some(SystemTime { secs: total as i64, nanos: nsec });
     }
 }
 

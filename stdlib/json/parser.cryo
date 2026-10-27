@@ -13,6 +13,7 @@ namespace std::json::parser;
 
 import std::core::option;
 import std::core::result::{ Result };
+import std::core::slice::{ Slice };
 import std::collections::array::{ Array };
 import std::collections::string::{ String };
 import std::collections::str::{ Str };
@@ -33,15 +34,11 @@ const COMMA: u8 = 44;   // ,
 const MINUS: u8 = 45;   // -
 const DOT:   u8 = 46;   // .
 const ZERO:  u8 = 48;   // 0
-const NINE:  u8 = 57;   // 9
 const COLON: u8 = 58;   // :
-const UPPER_A: u8 = 65; // A
 const UPPER_E: u8 = 69; // E
-const UPPER_F: u8 = 70; // F
 const LBRACK: u8 = 91;  // [
 const BACKSLASH: u8 = 92; // \
 const RBRACK: u8 = 93;  // ]
-const LOWER_A: u8 = 97; // a
 const LOWER_B: u8 = 98; // b
 const LOWER_E: u8 = 101; // e
 const LOWER_F: u8 = 102; // f
@@ -308,34 +305,21 @@ type struct Parser {
             return Result::Ok(JsonValue::Number(JsonNumber::Float(v)));
         }
 
-        // Integer path: parse digits directly without going through libc.
-        // For the negative case we accumulate as u64 and negate at the end;
-        // i64::MIN is exactly -2^63, which fits as u64 magnitude 2^63.
-        const U64_DIV10:    u64 = u64::MAX / 10;
+        // Integer path: the magnitude is read as a u64 and negated at the
+        // end; i64::MIN is exactly -2^63, which fits as u64 magnitude 2^63.
+        // Every byte from the sign to `end` was scanned as a digit above,
+        // so the only refusal left is overflow.
         const I64_MIN_MAG:  u64 = (i64::MAX as u64) + 1;   // |i64::MIN|
-        mut acc: u64 = 0;
-        mut i: u64 = start;
-        if (negative) { i = i + 1; }
-        mut overflow: boolean = false;
-        while (i < end) {
-            const d: u64 = (this.src[i] - ZERO) as u64;
-            // Check for overflow: if acc would exceed (u64::MAX - d) / 10.
-            if (acc > U64_DIV10) {
-                overflow = true;
-                break;
-            }
-            const next: u64 = acc * 10 + d;
-            if (next < acc) { overflow = true; break; }
-            acc = next;
-            i = i + 1;
-        }
-
-        if (overflow) {
+        const digits_start: u64 = if (negative) { start + 1 } else { start };
+        const magnitude: option::Option<u64> = u64::parse_radix(
+            Slice::from_raw(this.src + digits_start, (end - digits_start) as i64), 10);
+        if (magnitude.is_none()) {
             return Result::Err(this.err_at(
                 JsonErrorKind::InvalidNumber,
                 Str::new("integer overflow")
             ));
         }
+        const acc: u64 = magnitude.unwrap_or(0);
 
         if (negative) {
             if (acc > I64_MIN_MAG) {
@@ -477,28 +461,21 @@ type struct Parser {
                 Str::new("truncated \\u escape")
             ));
         }
-        mut v: u32 = 0;
-        mut i: u64 = 0;
-        while (i < 4) {
-            const b: u8 = this.src[this.pos];
-            mut nibble: u32 = 0;
-            if (b >= ZERO && b <= NINE) {
-                nibble = (b - ZERO) as u32;
-            } else if (b >= UPPER_A && b <= UPPER_F) {
-                nibble = ((b - UPPER_A) + 10) as u32;
-            } else if (b >= LOWER_A && b <= LOWER_F) {
-                nibble = ((b - LOWER_A) + 10) as u32;
-            } else {
-                return Result::Err(this.err_at(
-                    JsonErrorKind::InvalidUnicode,
-                    Str::new("non-hex digit in \\u escape")
-                ));
-            }
-            v = (v << 4) | nibble;
-            this.advance();
-            i = i + 1;
+        mut value: u64 = 0;
+        mut digits: i64 = 0;
+        match (u64::parse_radix_prefix(Slice::from_raw(this.src + this.pos, 4), 16)) {
+            option::Option::Some(run) => { value = run.0; digits = run.1; }
+            option::Option::None      => { }
         }
-        return Result::Ok(v);
+        // The error names the first byte that is no hex digit.
+        for (mut i: i64 = 0; i < digits; i++) { this.advance(); }
+        if (digits < 4) {
+            return Result::Err(this.err_at(
+                JsonErrorKind::InvalidUnicode,
+                Str::new("non-hex digit in \\u escape")
+            ));
+        }
+        return Result::Ok(value as u32);
     }
 
     // Arrays

@@ -318,37 +318,31 @@ public type struct Str {
         return CharIndices { bytes: this.bytes, length: this.length, pos: 0 };
     }
 
+    /// The value these bytes write as hexadecimal digits, every byte one.
     public try_to_hex(&this) -> Result<u64, ConversionError> {
+        return this.digits_value(16);
+    }
+
+    /// The value these bytes write as digits of `radix`, every byte one,
+    /// with the refusal saying which way they are not: empty, a byte that is
+    /// no digit, or a value past `u64::MAX` - a run of digits that stops
+    /// short on a byte that still starts a digit run stopped on overflow.
+    private digits_value(&this, radix: u32) -> Result<u64, ConversionError> {
         if (this.length() == 0) {
             return Result::Err(ConversionError::new("empty input"));
         }
-        if (this.length() > 16) {
-            return Result::Err(ConversionError::new("hex overflow (>16 digits)"));
-        }
-        mut value: u64 = 0;
-        mut i: i64 = 0;
-        while (i < this.length()) {
-            match (this.byte_at(i)) {
-                Option::Some(byte) => {
-                    mut digit: u64 = 0;
-                    if (byte >= 0x30 && byte <= 0x39) {
-                        digit = (byte - 0x30) as u64;
-                    } else if (byte >= 0x41 && byte <= 0x46) {
-                        digit = (byte - 0x41 + 10) as u64;
-                    } else if (byte >= 0x61 && byte <= 0x66) {
-                        digit = (byte - 0x61 + 10) as u64;
-                    } else {
-                        return Result::Err(ConversionError::new("non-hex byte"));
-                    }
-                    value = (value << 4) | digit;
-                }
-                Option::None => {
-                    return Result::Err(ConversionError::new("byte_at out of range"));
+        const bytes: Slice<u8> = this.as_bytes();
+        match (u64::parse_radix_prefix(bytes, radix)) {
+            Option::Some(parsed) => {
+                if (parsed.1 == bytes.length()) { return Result::Ok(parsed.0); }
+                const rest: Slice<u8> = bytes.subslice(parsed.1, bytes.length());
+                if (u64::parse_radix_prefix(rest, radix).is_some()) {
+                    return Result::Err(ConversionError::new("overflow"));
                 }
             }
-            i++;
+            Option::None => { }
         }
-        return Result::Ok(value);
+        return Result::Err(ConversionError::new("non-digit byte"));
     }
 }
 
@@ -558,41 +552,13 @@ implement trait Ord for struct Str {
 // so the `TryFrom<Str>` impl coexists with `TryFrom<i64>`,
 // `TryFrom<u64>`, etc. on the same target.
 //
-// Hex parsing lives below in a separate `try_to_hex(&this)` method on Str
+// Hex parsing lives above in a separate `try_to_hex(&this)` method on Str
 // since `TryFrom<Str>` can't distinguish decimal from hex on the same
 // source type.
 
 implement trait TryFrom<Str> for u64 {
     static try_from(source: Str) -> Result<u64, ConversionError> {
-        if (source.length() == 0) {
-            return Result::Err(ConversionError::new("empty input"));
-        }
-        mut value: u64 = 0;
-        mut i: i64 = 0;
-        while (i < source.length()) {
-            match (source.byte_at(i)) {
-                Option::Some(byte) => {
-                    if (!byte.is_digit()) {
-                        return Result::Err(ConversionError::new("non-digit byte"));
-                    }
-                    const digit: u64 = (byte - 0x30) as u64;
-                    // Overflow check: value * 10 + digit must fit in u64.
-                    // u64::MAX / 10 == 1844674407370955161 (remainder 5).
-                    if (value > 1844674407370955161) {
-                        return Result::Err(ConversionError::new("overflow"));
-                    }
-                    if (value == 1844674407370955161 && digit > 5) {
-                        return Result::Err(ConversionError::new("overflow"));
-                    }
-                    value = value * 10 + digit;
-                }
-                Option::None => {
-                    return Result::Err(ConversionError::new("byte_at out of range"));
-                }
-            }
-            i++;
-        }
-        return Result::Ok(value);
+        return source.digits_value(10);
     }
 }
 

@@ -463,6 +463,22 @@ yet is recorded with the change that builds it, not here.
      missing leaf E0201, as for a module path.  A primitive type may head
      a path pattern.  (Jake)
 
+620. **Checked and saturating integer arithmetic, one radix parser,
+     one `min`/`max`.**  The arithmetic operators still wrap; every
+     integer width also has `checked_add`, `checked_subtract` and
+     `checked_multiply` (`None` where the operator would wrap) and the
+     matching `saturating_*` (the bound the true result lies past), and
+     `i64` has `divide_floor` and `modulo_floor`.  `u64::parse_radix`
+     reads a run of digits that must be the whole input, and
+     `u64::parse_radix_prefix` the longest leading run that fits, with
+     its length; every digit loop over text delegates to them, and the
+     wrapping `parse_int` folds the runs so it wraps exactly as before.
+     `math::min`/`max` and `mem::align_up`/`align_down` are gone:
+     `cmp::min`/`max`/`clamp` order any `Ord` type, `math::align_up`
+     aligns a size, and `f32.min`/`max` and `f64.min`/`max` keep the
+     NaN-ignoring float `min`/`max`.  `f32` has `f64`'s class methods.
+     (Jake)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that
@@ -2811,7 +2827,7 @@ check is being deleted and the seals are what hold.  (Jake)
      the module graph reach a module through the graph, not through the
      door, so ruling 108's privacy is expressed by ordinary visibility.
 
-120. **`math::min` and `math::max` take `where T: Ord`**, so their
+120. *Superseded by ruling 620.* **`math::min` and `math::max` take `where T: Ord`**, so their
      comparisons are licensed by the bound under ruling 82.
 
      ```cryo
@@ -2829,7 +2845,7 @@ check is being deleted and the seals are what hold.  (Jake)
      function add<T>(a: T, b: T) -> T { return a + b; }   // error[E0229], names `T` and its bounds
      ```
 
-123. **The standard library's "frozen, no `checked_*`" overflow contract
+123. *Superseded by ruling 620.* **The standard library's "frozen, no `checked_*`" overflow contract
      exempts `checked_abs`**: it is the one checked operation ruling 112
      names, and the contract says so.
 
