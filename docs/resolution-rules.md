@@ -186,6 +186,16 @@ yet is recorded with the change that builds it, not here.
      judged where its types are concrete.  (Jake for the conversion; the
      error code delegated)
 
+602. **The standard library has no one-off helpers.**  A private helper
+     that restates an operation is replaced by a general API its callers
+     use directly; moving it elsewhere, into a type as a static method or
+     another module, is not a replacement.  Where no general API exists,
+     one is added and approved first.  Two public APIs for one operation
+     keep one: `File`'s `seek_set`, `seek_cur` and `seek_end` are deleted
+     for `Seek.seek(SeekFrom)`, and `JsonValue`'s `null_value`,
+     `float_value`, `string_value`, `empty_array` and `empty_object` for
+     the variants they wrapped.  (Jake)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that
