@@ -391,48 +391,25 @@ type struct TypeResolver {
     /// The trait of `bound`, written on a type that is not a parameter
     /// (`where HighError: From<E>`, `where Array<T>: Display`), that the
     /// type does not implement once the declaring template's parameters
-    /// `param_syms` are bound to `bindings`: the subject and the trait's
-    /// arguments are resolved with them put in, and an implementation must
-    /// bind the trait at those arguments with its own bounds holding.
+    /// `param_syms` are bound to `bindings` (`TraitChecker::unmet_written_trait`).
     /// `*out_subject` is the subject so resolved and `*out_trait` the trait
     /// as it is required, with its arguments (`From<OtherError>`).  Null
     /// when every trait has one, and when the subject or an argument still
     /// names a parameter, which the copy that binds it decides.
     unmet_written_bound(&this, bound: TraitBound*, param_syms: &[SymbolID], bindings: &[TypeRef],
                         out_subject: TypeRef*, out_trait: SymbolStr*) -> TraitRef* {
-        if (bound.has_projection_subject() || bound.subject_param().is_valid()) { return null; }
-        mut rc: ResolutionContext = ResolutionContext::new("");
-        rc.symbolic_no_demand = true;
+        mut subst: TypeSubstitution = TypeSubstitution::empty();
         for (mut i: i64 = 0; i < param_syms.length() && i < bindings.length(); i++) {
-            if (bindings[i].is_valid()) { rc.add_binding(param_syms[i], SymbolStr::empty(), bindings[i]); }
+            if (bindings[i].is_valid()) {
+                subst.add(this.arena.create_generic_param(param_syms[i], SymbolStr::empty(), i as u64), bindings[i]);
+            }
         }
-        const subject: TypeRef = this.resolve(bound.subject, &rc);
-        if (!subject.is_valid() || this.arena.contains_generic_param(subject)) { return null; }
         const checker: TraitChecker = TraitChecker::new(
             this.arena, this.generic_registry, this.intern_table, this.diagnostics);
-        for (mut ri: i64 = 0; ri < bound.trait_refs.length(); ri++) {
-            const tr: TraitRef* = &bound.trait_refs[ri];
-            // A bound refused where it is written is reported there.
-            if (tr.path.length() == 0 || tr.refused) { continue; }
-            mut args: [TypeRef] = [];
-            for (mut ai: i64 = 0; ai < tr.type_args.length(); ai++) {
-                const arg: TypeRef = this.resolve(tr.type_args[ai], &rc);
-                if (!arg.is_valid() || this.arena.contains_generic_param(arg)) { return null; }
-                args.push(arg);
-            }
-            if (checker.implementation_at(tr.definition(), &args, subject) == null) {
-                mut shown: string = this.intern_table.resolve(tr.path[tr.path.length() - 1]);
-                for (mut ai: i64 = 0; ai < args.length(); ai++) {
-                    shown = shown + (if (ai == 0) { "<" } else { ", " })
-                        + this.arena.format_display(this.arena.lookup(args[ai]));
-                }
-                if (args.length() > 0) { shown = shown + ">"; }
-                *out_subject = subject;
-                *out_trait = this.intern_table.intern(shown);
-                return tr;
-            }
-        }
-        return null;
+        const tr: TraitRef* = checker.unmet_written_trait(bound, &subst, 0, out_subject);
+        if (tr == null) { return null; }
+        *out_trait = this.intern_table.intern(checker.trait_as_required(tr, &subst));
+        return tr;
     }
 
     trait_arguments_along(&this, trait_def: DefId, args: &[TypeRef], declaring: DefId,
@@ -1384,6 +1361,32 @@ type struct TypeResolver {
                 _ => {}
             }
         }
+        this.resolve_written_bounds(&func.trait_bounds, res_ctx);
+    }
+
+    /// Resolve, in the declaration's context `res_ctx`, each bound of
+    /// `bounds` written on a type that is neither a parameter nor a
+    /// projection: its subject and its traits' arguments, in the
+    /// declaration's own parameters.  A bound already resolved keeps its
+    /// answer - a copy carries its template's - and one that does not
+    /// resolve yet is asked again on the next pass over the declaration.
+    resolve_written_bounds(&this, bounds: &[TraitBound], res_ctx: ResolutionContext*) -> void {
+        for (mut b: i64 = 0; b < bounds.length(); b++) {
+            const bound: TraitBound* = &bounds[b];
+            if (bound.subject_type.is_valid() || bound.has_projection_subject()
+                    || bound.subject_param().is_valid()) { continue; }
+            const subject: TypeRef = this.resolve(bound.subject, res_ctx);
+            if (!subject.is_valid()) { continue; }
+            for (mut r: i64 = 0; r < bound.trait_refs.length(); r++) {
+                const tr: TraitRef* = &bound.trait_refs[r];
+                mut args: [TypeRef] = [];
+                for (mut a: i64 = 0; a < tr.type_args.length(); a++) {
+                    args.push(this.resolve(tr.type_args[a], res_ctx));
+                }
+                tr.argument_types = args;
+            }
+            bound.subject_type = subject;
+        }
     }
 
     /// Infer the concrete type an `implement Trait` return annotation stands for,
@@ -2052,7 +2055,9 @@ private:
         const checker: TraitChecker = TraitChecker::new(
             this.arena, this.generic_registry, this.intern_table, this.diagnostics);
         mut concrete: TypeRef = TypeRef::invalid();
-        const tref: TraitRef* = checker.unsatisfied_trait_ref(bounds, &subst, &concrete);
+        // A bound written on a type is checked where every instantiation
+        // is, by the monomorphizer.
+        const tref: TraitRef* = checker.unsatisfied_trait_ref(bounds, &subst, false, &concrete);
         if (tref == null) { return true; }
         const trait_str: string = this.intern_table.resolve(tref.path[tref.path.length() - 1]);
         const concrete_t: Type* = this.arena.lookup(concrete);

@@ -724,9 +724,9 @@ a cast to reach it.
   cycle that crosses packages is E0501 too or an error of its own.
 - **`std::Range`.**  Nothing re-exports `Range` at the root of `std`, so the
   path is refused today.  Whether `stdlib/lib.cryo` exports it there is open.
-- **A `where` bound on a concrete type, beyond functions.**  A function's
-  or method's bound on any type directs paths, `?` and method calls (616).
-  On an `implement` block or a type declaration such a bound is parsed and
-  stamped, but the instantiation checks (`TraitChecker::bounds_satisfied*`)
-  look its subject up as a parameter and find none, so what it does there
-  is untested and unspecified.  Open.
+- **Overlap of implementations bounded on a type.**  Two `implement` blocks
+  whose heads overlap are refused when their bounds are on their own
+  parameters; a block with a bound written on another type (`where
+  HighError: From<E>`, 618) takes part in no overlap check, so two such
+  blocks for one instantiation are not reported.  Whether, and how, two
+  such bounds are compared is open.

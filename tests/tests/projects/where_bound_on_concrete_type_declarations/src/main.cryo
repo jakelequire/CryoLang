@@ -1,0 +1,111 @@
+/// A `where` bound written on a type that is not a parameter, on a type
+/// declaration or an `implement` block, means what it means on a function.
+/// In the declaration's methods it is an assumption: `HighError::from(e)`
+/// and a `?` into `HighError` are typed by it, and each instantiation calls
+/// the implementation its own `E` selects.  An instantiation of the type is
+/// checked against it, and an implementation applies only to the
+/// instantiations whose types satisfy it - a non-generic one only when the
+/// bound, written with no parameter, holds.
+namespace WhereBoundOnConcreteTypeDeclarations::Main;
+
+import std::core::convert::{ From };
+import std::ffi::libc::{ printf };
+
+type enum LowError { Bad(i32); }
+
+type enum MiddleError { Middle(i32); }
+
+type enum OtherError { Other(i32); }
+
+type struct HighError { code: i32; }
+
+implement trait From<LowError> for struct HighError {
+    static from(value: LowError) -> HighError {
+        match (value) { LowError::Bad(code) => { return HighError { code: 100 + code }; } }
+    }
+}
+
+implement trait From<MiddleError> for struct HighError {
+    static from(value: MiddleError) -> HighError {
+        match (value) { MiddleError::Middle(code) => { return HighError { code: 200 + code }; } }
+    }
+}
+
+type struct Converter<E> where HighError: From<E> {
+    tag: i32;
+
+    static convert(error: E) -> HighError { return HighError::from(error); }
+
+    static lift(result: Result<i32, E>) -> Result<i32, HighError> {
+        const value: i32 = result?;
+        return Result::Ok(value);
+    }
+}
+
+type trait Lift<E> {
+    static lift(error: E) -> HighError;
+}
+
+type struct Lifter<E> { tag: i32; }
+
+implement<E> trait Lift<E> for struct Lifter<E> where HighError: From<E> {
+    static lift(error: E) -> HighError { return HighError::from(error); }
+}
+
+type trait Describe { describe(&this) -> i32; }
+
+type struct Holder<E> { tag: i32; }
+
+implement<E> trait Describe for struct Holder<E> where HighError: From<E> {
+    describe(&this) -> i32 { return this.tag; }
+}
+
+function describe_any<T>(value: &T) -> i32 where T: Describe {
+    return value.describe();
+}
+
+type struct Plain { tag: i32; }
+
+implement trait Describe for struct Plain where HighError: From<LowError> {
+    describe(&this) -> i32 { return this.tag; }
+}
+
+function check(passed: i32, ok: boolean, what: string) -> i32 {
+    if (!ok) {
+        printf("FAILED: %s\n", what);
+        return passed;
+    }
+    return passed + 1;
+}
+
+function lifted_code(result: Result<i32, HighError>) -> i32 {
+    match (result) {
+        Result::Ok(_)      => { return -1; }
+        Result::Err(error) => { return error.code; }
+    }
+}
+
+function main() -> i32 {
+    mut passed: i32 = 0;
+    passed = check(passed, Converter::<LowError>::convert(LowError::Bad(3)).code == 103,
+        "a type's method under its bound converts through From<LowError>");
+    passed = check(passed, Converter::<MiddleError>::convert(MiddleError::Middle(4)).code == 204,
+        "a type's method under its bound converts through From<MiddleError>");
+    const low: Result<i32, LowError> = Result::Err(LowError::Bad(5));
+    passed = check(passed, lifted_code(Converter::<LowError>::lift(low)) == 105,
+        "`?` in a type's method converts through the type's bound");
+    passed = check(passed, Lifter::<LowError>::lift(LowError::Bad(6)).code == 106,
+        "an implementation's method under its bound converts through From<LowError>");
+    passed = check(passed, Lifter::<MiddleError>::lift(MiddleError::Middle(7)).code == 207,
+        "an implementation's method under its bound converts through From<MiddleError>");
+    const low_holder: Holder<LowError> = Holder::<LowError> { tag: 8 };
+    const middle_holder: Holder<MiddleError> = Holder::<MiddleError> { tag: 9 };
+    passed = check(passed, describe_any(&low_holder) == 8 && describe_any(&middle_holder) == 9,
+        "an implementation applies to the instantiations its bound holds for");
+    const plain: Plain = Plain { tag: 10 };
+    passed = check(passed, plain.describe() == 10 && describe_any(&plain) == 10,
+        "a non-generic implementation applies when its bound holds");
+    printf("where bound on a concrete type in declarations: %d of 7 checks passed\n", passed);
+    if (passed != 7) { return 1; }
+    return 0;
+}

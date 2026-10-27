@@ -418,8 +418,8 @@ yet is recorded with the change that builds it, not here.
      the trait's arguments are resolved with the call's type arguments put
      in, and an implementation binding the trait at those arguments must
      exist, or the call is E0306, naming the trait with its arguments.  On
-     an `implement` block or a type declaration such a bound is not yet
-     given a meaning (roadmap).  (Jake for the bound, the call-site
+     an `implement` block or a type declaration such a bound means the
+     same (618).  (Jake for the bound, the call-site
      check, and the subject's own member first, reversing a delegated
      choice that put the bound's first)
 
@@ -434,6 +434,22 @@ yet is recorded with the change that builds it, not here.
      bound's trait, since the parameter has no methods of its own.  The
      `?` conversion is directed through `From`, so a type's own `from`
      is never the conversion.  (Jake)
+
+618. **A bound on a type, written on a type declaration or an
+     `implement` block.**  The type layer resolves the subject and the
+     trait's arguments once, in the declaration's own parameters; every
+     check substitutes an instantiation's arguments into that resolution
+     and asks for an implementation binding the trait at the substituted
+     arguments, the one question 616's call-site check asks too.  In the
+     declaration's methods the bound is an assumption, as on a function.
+     A type declaration's instantiation whose types do not satisfy it is
+     E0306 at the bound, naming the instantiation and the trait with its
+     arguments; the check is made where every instantiation is
+     specialised, since the implementations it needs are attached after
+     a module's annotations are first resolved.  An `implement` block
+     applies to an instantiation only when its bound holds, so each copy
+     selects the implementation its own types satisfy; a block with no
+     parameters applies when the bound holds as written.  (Jake)
 
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,

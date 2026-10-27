@@ -2089,6 +2089,19 @@ function describe_it<T>(w: &Wrapper<T>) -> i32 where Wrapper<T>: Describe {
 }
 ```
 
+Such a bound may be written on a type declaration or an `implement` block as well, and means the same there. In the declaration's methods it is an assumption, as a function's is. On a type declaration it is checked for every instantiation: `Converter<OtherError>` below is refused (E0306), naming the bound and the trait with its arguments. On an `implement` block it is a condition on the implementation applying: `Holder<E>` implements `Describe` for exactly the `E` that `HighError` converts from, so a call needing `Holder<OtherError>: Describe` is refused, and a non-generic block (`implement trait Describe for Plain where HighError: From<LowError>`) applies when its bound holds as written.
+
+```cryo
+type struct Converter<E> where HighError: From<E> {
+    tag: i32;
+    static convert(error: E) -> HighError { return HighError::from(error); }
+}
+
+implement<E> trait Describe for struct Holder<E> where HighError: From<E> {
+    describe(&this) -> i32 { return this.tag; }
+}
+```
+
 Inside the body that declares it, a parameter has only the methods its bounds give it. A method call on a parameter that no bound in scope names — the function's `where` clause, the enclosing `implement` block's, or the type declaration's — is an error (E0358) where the call is written, whether or not anything instantiates the body.
 
 ```cryo

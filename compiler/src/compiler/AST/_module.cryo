@@ -748,6 +748,10 @@ type struct TraitRef {
     refused:  boolean;
     type_args: [TypeAnnotation*];
     span:      SourceSpan;
+    /// `type_args` resolved with the bound's `subject_type`, in the same
+    /// parameters; empty on a bound whose subject is a parameter or a
+    /// projection.
+    argument_types: [TypeRef];
 
     /// The trait's identity.  One accessor so a consumer never re-derives it
     /// from `path`; its path, where text is wanted, is the definition
@@ -780,10 +784,12 @@ implement trait Clone for struct TraitRef {
     clone(&this) -> TraitRef {
         mut path_c: [SymbolStr] = [];
         mut args_c: [TypeAnnotation*] = [];
+        mut types_c: [TypeRef] = [];
         for (mut i: i64 = 0; i < this.path.length(); i++)      { path_c.push(this.path[i]); }
         for (mut i: i64 = 0; i < this.type_args.length(); i++) { args_c.push(this.type_args[i]); }
+        for (mut i: i64 = 0; i < this.argument_types.length(); i++) { types_c.push(this.argument_types[i]); }
         return TraitRef { path: path_c, resolved: this.resolved, refused: this.refused,
-                          type_args: args_c, span: this.span };
+                          type_args: args_c, span: this.span, argument_types: types_c };
     }
 }
 
@@ -802,6 +808,13 @@ type struct TraitBound {
     subject:    TypeAnnotation*;
     trait_refs: [TraitRef];
     span:       SourceSpan;
+    /// A subject that is neither a parameter nor a projection, resolved by
+    /// the type layer in the declaring declaration's own parameters
+    /// (`Wrapper<T>` with `T` that declaration's): an instantiation's
+    /// subject is this with its arguments substituted.  Invalid for a
+    /// parameter or projection subject, and until the type layer resolves
+    /// the declaration.
+    subject_type: TypeRef;
 
     /// True when the subject is an associated-type projection.
     has_projection_subject(&this) -> boolean {
@@ -826,13 +839,15 @@ type struct TraitBound {
 /// A deep copy: each (owning) TraitRef is cloned into an independent buffer,
 /// so the result can be stored in a second owner without a double-free.  The
 /// subject is cloned with its stamp, so a specialization re-resolves it
-/// against its substituted parameters.
+/// against its substituted parameters; its resolution is the template's,
+/// in the template's parameters, which a check substitutes.
 implement trait Clone for struct TraitBound {
     clone(&this) -> TraitBound {
         return TraitBound {
-            subject:    TypeAnnotation::clone_ptr(this.subject),
-            trait_refs: this.trait_refs.clone(),
-            span:       this.span,
+            subject:      TypeAnnotation::clone_ptr(this.subject),
+            trait_refs:   this.trait_refs.clone(),
+            span:         this.span,
+            subject_type: this.subject_type,
         };
     }
 }

@@ -222,13 +222,65 @@ type struct TraitChecker {
     /// `args` (`GenericRegistry::binds_trait_arguments`) and whose
     /// where-clause holds; null when there is none.
     implementation_at(&this, trait_def: DefId, args: &[TypeRef], value: TypeRef) -> DeclarationNode* {
-        if (this.generic_registry == null) { return null; }
+        return this.implementation_at_depth(trait_def, args, value, 0);
+    }
+
+    /// `implementation_at`, sharing the recursion budget of the bound check
+    /// that asks it.
+    implementation_at_depth(&this, trait_def: DefId, args: &[TypeRef], value: TypeRef, depth: i32) -> DeclarationNode* {
+        if (this.generic_registry == null || depth >= 16) { return null; }
         const heads: [DeclarationNode*] = this.generic_registry.heads_for(trait_def, value, this.intern_table);
         for (mut i: i64 = 0; i < heads.length(); i++) {
             const block: ImplBlock* = DeclarationNode::impl_of(heads[i]);
             if (block == null) { continue; }
             if (!this.generic_registry.binds_trait_arguments(block, args, this.intern_table)) { continue; }
-            if (this.impl_applies(block, value, 0)) { return heads[i]; }
+            if (this.impl_applies(block, value, depth)) { return heads[i]; }
+        }
+        return null;
+    }
+
+    /// The trait `tr` names, as a diagnostic shows it: with the arguments a
+    /// bound on a type that is not a parameter gives it, substituted by
+    /// `subst` (`From<OtherError>`), else its leaf.
+    trait_as_required(&this, tr: TraitRef*, subst: TypeSubstitution*) -> string {
+        mut shown: string = this.intern_table.resolve(tr.path[tr.path.length() - 1]);
+        for (mut ai: i64 = 0; ai < tr.argument_types.length(); ai++) {
+            const arg: TypeRef = if (subst != null) { subst.apply(tr.argument_types[ai], this.arena) } else { tr.argument_types[ai] };
+            shown = shown + (if (ai == 0) { "<" } else { ", " }) + this.arena.format_display(this.arena.lookup(arg));
+        }
+        if (tr.argument_types.length() > 0) { shown = shown + ">"; }
+        return shown;
+    }
+
+    /// The trait of `bound`, written on a type that is neither a parameter
+    /// nor a projection (`where HighError: From<E>`, `where Wrapper<T>:
+    /// Describe`), that its subject does not implement once `subst` binds
+    /// the declaring declaration's parameters: the subject and the trait's
+    /// arguments, as the type layer resolved them in those parameters, are
+    /// substituted, and an implementation must bind the trait at those
+    /// arguments with its own bounds holding.  `*out_subject` is the
+    /// substituted subject.  Null when every trait has one, for a bound on
+    /// a parameter or a projection, and when the subject or an argument
+    /// still names a parameter, which the copy that binds it decides.
+    unmet_written_trait(&this, bound: TraitBound*, subst: TypeSubstitution*, depth: i32,
+                        out_subject: TypeRef*) -> TraitRef* {
+        if (!bound.subject_type.is_valid()) { return null; }
+        const subject: TypeRef = if (subst != null) { subst.apply(bound.subject_type, this.arena) } else { bound.subject_type };
+        if (!subject.is_valid() || this.arena.contains_generic_param(subject)) { return null; }
+        for (mut ri: i64 = 0; ri < bound.trait_refs.length(); ri++) {
+            const tr: TraitRef* = &bound.trait_refs[ri];
+            // A bound refused where it is written is reported there.
+            if (tr.path.length() == 0 || tr.refused) { continue; }
+            mut args: [TypeRef] = [];
+            for (mut ai: i64 = 0; ai < tr.argument_types.length(); ai++) {
+                const arg: TypeRef = if (subst != null) { subst.apply(tr.argument_types[ai], this.arena) } else { tr.argument_types[ai] };
+                if (!arg.is_valid() || this.arena.contains_generic_param(arg)) { return null; }
+                args.push(arg);
+            }
+            if (this.implementation_at_depth(tr.definition(), &args, subject, depth) == null) {
+                *out_subject = subject;
+                return tr;
+            }
         }
         return null;
     }
@@ -361,11 +413,14 @@ type struct TraitChecker {
         // `type_args[0]`.
         const subj_nargs: i64 = this.arena.inst_type_arg_count(subject);
         if (subj_nargs == 0) {
-            // No outer args to substitute through; bounds reference impl
-            // params that have no concrete value, so the impl's where
-            // clauses can't be checked. Conservatively report unsatisfied
-            // so we don't accidentally enable a body that would crash.
-            return false;
+            // No outer args to substitute through: a bound on an impl
+            // parameter has no concrete value to check, so the impl is
+            // refused rather than assumed; a bound written on a type names
+            // no parameter, and is checked as written.
+            for (mut bi: i64 = 0; bi < impl_block.where_bounds.length(); bi++) {
+                if (!impl_block.where_bounds[bi].subject_type.is_valid()) { return false; }
+            }
+            return this.bounds_satisfied_at_depth(impl_block.where_bounds, null, depth + 1);
         }
         // Map the impl's TARGET type args - the names the struct itself is
         // parameterized by (`I` in `for TakeIter<I>`) - to the concrete
@@ -472,9 +527,14 @@ type struct TraitChecker {
     /// Check whether every trait bound in `bounds` holds under `subst`.
     bounds_satisfied(&this, bounds: &[TraitBound], subst: TypeSubstitution*) -> boolean {
         if (bounds.length() == 0) { return true; }
+        mut unmet_subject: TypeRef = TypeRef::invalid();
+        for (mut bi: i64 = 0; bi < bounds.length(); bi++) {
+            if (this.unmet_written_trait(&bounds[bi], subst, 0, &unmet_subject) != null) { return false; }
+        }
         if (subst == null || subst.replacements.length() == 0) { return true; }
         for (mut bi: i64 = 0; bi < bounds.length(); bi++) {
             const bound: TraitBound* = &bounds[bi];
+            if (bound.subject_type.is_valid()) { continue; }
             // An associated-type-projection subject (`where This::Item: Ord`)
             // is not a substitutable param name; it is enforced structurally by
             // the method body's use of the bound trait's methods (a non-`Ord`
@@ -512,12 +572,22 @@ type struct TraitChecker {
     /// bound named, for a diagnostic that points at it.  A bound whose
     /// argument is missing from the substitution or still abstract is
     /// deferred, as `bounds_satisfied` defers it; `*out_concrete` is the
-    /// argument the failing bound was checked against.
+    /// argument the failing bound was checked against.  A bound written on
+    /// a type that is not a parameter (`unmet_written_trait`) is asked only
+    /// with `include_written`: the implementations it needs are attached
+    /// to their types after a module's annotations are first resolved, so
+    /// only a check made once every module is registered can answer it.
     unsatisfied_trait_ref(&this, bounds: &[TraitBound], subst: TypeSubstitution*,
-                          out_concrete: TypeRef*) -> TraitRef* {
+                          include_written: boolean, out_concrete: TypeRef*) -> TraitRef* {
         if (bounds.length() == 0 || subst == null) { return null; }
         for (mut bi: i64 = 0; bi < bounds.length(); bi++) {
             const bound: TraitBound* = &bounds[bi];
+            if (bound.subject_type.is_valid()) {
+                if (!include_written) { continue; }
+                const written: TraitRef* = this.unmet_written_trait(bound, subst, 0, out_concrete);
+                if (written != null) { return written; }
+                continue;
+            }
             if (bound.has_projection_subject()) { continue; }
             const concrete: TypeRef = this.lookup_subst_for_param(bound.subject_param(), subst);
             if (!concrete.is_valid()) { continue; }
@@ -540,9 +610,14 @@ type struct TraitChecker {
     bounds_satisfied_at_depth(&this, bounds: &[TraitBound],
                                subst: TypeSubstitution*, depth: i32) -> boolean {
         if (bounds.length() == 0) { return true; }
+        mut unmet_subject: TypeRef = TypeRef::invalid();
+        for (mut bi: i64 = 0; bi < bounds.length(); bi++) {
+            if (this.unmet_written_trait(&bounds[bi], subst, depth, &unmet_subject) != null) { return false; }
+        }
         if (subst == null || subst.replacements.length() == 0) { return true; }
         for (mut bi: i64 = 0; bi < bounds.length(); bi++) {
             const bound: TraitBound* = &bounds[bi];
+            if (bound.subject_type.is_valid()) { continue; }
             // Projection subject (`where This::Item: Ord`): enforced by the
             // method body, not filterable by param substitution here. Treat as
             // satisfied rather than failing the spec (matching `bounds_satisfied`).
