@@ -1104,7 +1104,20 @@ const out: int = data |> parse |> validate(strict);   // validate(parse(data), s
 const port: u16 = config_port() ?? env_port() ?? 8080;
 ```
 
-**Error propagation (`?`).** A postfix `?` on a `Result<T, E>` evaluates to `T` when the value is `Ok`, and otherwise returns that `Err(e)` unchanged from the enclosing function; on an `Option<T>` it yields `T` for `Some` and returns `None`. The enclosing function's return type must be a matching `Result` / `Option`. It is the concise form of a `match` that re-returns the error.
+**Error propagation (`?`).** A postfix `?` on a `Result<T, E>` evaluates to `T` when the value is `Ok`, and otherwise returns the error from the enclosing function; on an `Option<T>` it yields `T` for `Some` and returns `None`. The enclosing function's return type must be a matching `Result` / `Option`. It is the concise form of a `match` that re-returns the error.
+
+When the function returns `Result<U, F>` and `F` cannot hold an `E` as it is, the error is converted on the way out: `?` returns `Err(F::from(e))`, through `F`'s implementation of `std::core::convert::From<E>`. An `E` that `F` already holds is returned unchanged. With no `From<E>` for `F`, the `?` is refused (`E0214`); convert the error with `map_err` first, or implement the conversion.
+
+```cryo
+implement trait From<AllocError> for struct IoError {
+    static from(err: AllocError) -> IoError { return IoError::new(IoErrorKind::OutOfMemory, 0); }
+}
+
+function fill(out: mut &Array<u8>, bytes: Slice<u8>) -> Result<(), IoError> {
+    out.try_append(bytes)?;          // an AllocError leaves as an IoError
+    return Result::Ok(());
+}
+```
 
 ```cryo
 function load(path: string) -> Result<Config, IoError> {

@@ -174,6 +174,18 @@ yet is recorded with the change that builds it, not here.
      one target is gated to that target too, so no build carries it dead.
      (Jake; gating target-only helpers delegated)
 
+601. **`?` converts an error through `From`.**  On a `Result<T, E>` in a
+     function returning `Result<U, F>`, an `E` that `F` cannot hold as it
+     is goes out as `Err(F::from(e))`, through the language's `From`
+     (`![language("from")]`, its method `![language("from_from")]`); an
+     `E` that `F` already holds is returned unchanged, so every `?` that
+     compiled before means what it meant.  No implementation of
+     `From<E>` for `F` is E0214 at the `?`, naming the conversion that is
+     missing.  The conversion is chosen by the trait's identity and its
+     argument, never by a method spelled `from`.  A generic body is
+     judged where its types are concrete.  (Jake for the conversion; the
+     error code delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that
