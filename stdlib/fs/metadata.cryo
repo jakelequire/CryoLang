@@ -26,7 +26,7 @@ import std::core::option;
 import std::core::result::{ Result };
 import std::collections::string::{ String };
 import std::collections::str;
-import std::io::error::{ IoError, IoErrorKind };
+import std::io::error::{ IoError };
 import std::ffi::libc;
 import std::sys::syscall;
 import std::fs::path::{ Path };
@@ -173,22 +173,6 @@ function mode_from_attrs(attrs: u32, as_link: boolean) -> u32 {
     return libc::S_IFREG | WIN_PERM_FILE_RW;
 }
 
-/// Map a `GetLastError()` code to an `IoError`.  `os_code` carries the
-/// Win32 code verbatim (same convention as `net::sys` with WSA codes).
-![target(windows)]
-function win_error_to_io(code: u32) -> IoError {
-    if (code == syscall::ERROR_FILE_NOT_FOUND
-            || code == syscall::ERROR_PATH_NOT_FOUND
-            || code == syscall::ERROR_INVALID_NAME) {
-        return IoError::new(IoErrorKind::NotFound, code as i32);
-    }
-    if (code == syscall::ERROR_ACCESS_DENIED
-            || code == syscall::ERROR_SHARING_VIOLATION) {
-        return IoError::new(IoErrorKind::PermissionDenied, code as i32);
-    }
-    return IoError::new(IoErrorKind::Other, code as i32);
-}
-
 /// Handle-free attribute query (`GetFileAttributesExA`).  Reports the
 /// final path component ITSELF: a symlink/junction shows up as
 /// `FileType::Symlink` with the reparse point's own size/mtime, which is
@@ -203,7 +187,7 @@ function attr_metadata(p: Path) -> Result<Metadata, IoError> {
     const gle: u32 = syscall::GetLastError();
     mem::drop(c_path);
     if (ok == 0) {
-        return Result::Err(win_error_to_io(gle));
+        return Result::Err(IoError::from_windows_error(gle));
     }
     const bp: u8* = &buf[0];
     const attrs:   u32 = *((bp + WFAD_OFF_ATTRS) as u32*);
@@ -265,14 +249,14 @@ function metadata(p: Path) -> Result<Metadata, IoError> {
             // locked reparse point.
             return attr_metadata(p);
         }
-        return Result::Err(win_error_to_io(code));
+        return Result::Err(IoError::from_windows_error(code));
     }
     mut buf: [u8; 52];
     const ok: i32 = syscall::GetFileInformationByHandle(h, &buf[0]);
     const gle: u32 = syscall::GetLastError();
     syscall::CloseHandle(h);
     if (ok == 0) {
-        return Result::Err(win_error_to_io(gle));
+        return Result::Err(IoError::from_windows_error(gle));
     }
     const bp: u8* = &buf[0];
     const attrs: u32 = *((bp + BHFI_OFF_ATTRS) as u32*);

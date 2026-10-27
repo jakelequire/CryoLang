@@ -333,6 +333,21 @@ yet is recorded with the change that builds it, not here.
      for the shape and names; the module, `set_position` and the panicking
      write delegated)
 
+612. **An OS error becomes an `IoError` in `io::error`.**
+     `IoError::from_windows_error(code)` maps a Windows system error code
+     on every target - not found, permission denied, already exists, out
+     of memory, invalid input or data, broken pipe, end of file and
+     unsupported, the rest `Other` - keeping the code in `os_code`, and
+     `IoError::last_os_error()` reads the calling thread's last error,
+     `errno` on POSIX and `GetLastError` on Windows.  A Windows C-runtime
+     call still reports through `errno`, mapped by `from_errno`.  `fs`'s
+     own Windows mapper is deleted; Windows process creation, standard
+     stream setup, wait and kill report the failing call's error instead
+     of `Other` with code 0, and the POSIX-only paths read
+     `last_os_error`.  `io::error` is marked item by item: the kinds,
+     `IoError`'s fields and methods public, its errno table private.
+     (Jake for the two names; the mapped codes and the marking delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

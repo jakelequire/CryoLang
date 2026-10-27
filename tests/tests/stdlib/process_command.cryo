@@ -16,7 +16,7 @@ import std::core::drop;
 import std::core::mem;
 import std::collections::array::{ Array };
 import std::collections::str::{ Str };
-import std::io::error::{ IoError };
+import std::io::error::{ IoError, IoErrorKind };
 import std::io::traits;
 import std::process::command::{ Command, Output, Stdio };
 import std::process::child::{ Child, ChildStdout, ExitStatus };
@@ -102,7 +102,8 @@ function echo_foobar_expect() -> Str { return Str::new("foo bar\r\n"); }
 // Validate the outcome of running a nonexistent program.  POSIX: the forked
 // child `_exit(127)`s when execvp fails, so `status()` yields Ok(127).
 // Windows: CreateProcess fails for a missing image, so spawn/status returns
-// Err - that Err *is* the "command not found" signal.
+// Err - that Err *is* the "command not found" signal, carrying the system's
+// own code (ERROR_FILE_NOT_FOUND).
 ![target(unix)]
 function expect_missing(r: Result<ExitStatus, IoError>) -> Result<(), TestError> {
     match (r) {
@@ -114,7 +115,10 @@ function expect_missing(r: Result<ExitStatus, IoError>) -> Result<(), TestError>
 function expect_missing(r: Result<ExitStatus, IoError>) -> Result<(), TestError> {
     match (r) {
         Result::Ok(_)  => { return bail(Str::new("missing program unexpectedly spawned")); }
-        Result::Err(_) => { return Result::Ok(()); }
+        Result::Err(e) => {
+            expect(e.kind == IoErrorKind::NotFound, Str::new("missing program should be NotFound"))?;
+            return expect_eq(e.os_code, 2);
+        }
     }
 }
 

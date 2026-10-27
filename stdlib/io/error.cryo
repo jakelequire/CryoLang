@@ -9,59 +9,64 @@
 ///! errno on Windows (file/process I/O) and glibc errno on Linux; the base
 ///! codes (1-34) are identical on both, but the socket-range codes differ
 ///! (e.g. EADDRINUSE is 98 on glibc, 100 on msvcrt), so those are gated.
-///! Socket errors on Windows do NOT pass through here - `net::sys` maps
-///! `WSAGetLastError()` WSAE* codes directly. macOS/BSD are out of scope.
+///! `from_windows_error` maps a Windows system error code, and
+///! `last_os_error` reads the calling thread's last error from whichever
+///! of the two the OS keeps. Socket errors on Windows do NOT pass through
+///! here - `net::sys` maps `WSAGetLastError()` WSAE* codes directly.
+///! macOS/BSD are out of scope.
 
 namespace std::io::error;
 
 import std::collections::str;
 import std::core::convert::{ From };
 import std::alloc::allocator::{ AllocError };
+import std::ffi::libc;
+import std::sys::syscall;
 
 // errno constants shared by Linux glibc and Windows msvcrt (identical values).
-const ENOENT:        i32 = 2;
-const EINTR:         i32 = 4;
-const EIO:           i32 = 5;
-const EAGAIN:        i32 = 11; // same value as EWOULDBLOCK on Linux
-const ENOMEM:        i32 = 12;
-const EACCES:        i32 = 13;
-const EEXIST:        i32 = 17;
-const EINVAL:        i32 = 22;
-const EPIPE:         i32 = 32;
+private const ENOENT:        i32 = 2;
+private const EINTR:         i32 = 4;
+private const EIO:           i32 = 5;
+private const EAGAIN:        i32 = 11; // same value as EWOULDBLOCK on Linux
+private const ENOMEM:        i32 = 12;
+private const EACCES:        i32 = 13;
+private const EEXIST:        i32 = 17;
+private const EINVAL:        i32 = 22;
+private const EPIPE:         i32 = 32;
 
 // Socket-range codes: glibc and msvcrt assign different numbers. Gated so
 // each target maps its own values to the right `IoErrorKind`.
 ![target(linux)]
-const EADDRINUSE:    i32 = 98;
+private const EADDRINUSE:    i32 = 98;
 ![target(linux)]
-const EADDRNOTAVAIL: i32 = 99;
+private const EADDRNOTAVAIL: i32 = 99;
 ![target(linux)]
-const ECONNABORTED:  i32 = 103;
+private const ECONNABORTED:  i32 = 103;
 ![target(linux)]
-const ECONNRESET:    i32 = 104;
+private const ECONNRESET:    i32 = 104;
 ![target(linux)]
-const ENOTCONN:      i32 = 107;
+private const ENOTCONN:      i32 = 107;
 ![target(linux)]
-const ETIMEDOUT:     i32 = 110;
+private const ETIMEDOUT:     i32 = 110;
 ![target(linux)]
-const ECONNREFUSED:  i32 = 111;
+private const ECONNREFUSED:  i32 = 111;
 
 ![target(windows)]
-const EADDRINUSE:    i32 = 100;
+private const EADDRINUSE:    i32 = 100;
 ![target(windows)]
-const EADDRNOTAVAIL: i32 = 101;
+private const EADDRNOTAVAIL: i32 = 101;
 ![target(windows)]
-const ECONNABORTED:  i32 = 106;
+private const ECONNABORTED:  i32 = 106;
 ![target(windows)]
-const ECONNRESET:    i32 = 108;
+private const ECONNRESET:    i32 = 108;
 ![target(windows)]
-const ENOTCONN:      i32 = 128;
+private const ENOTCONN:      i32 = 128;
 ![target(windows)]
-const ETIMEDOUT:     i32 = 138;
+private const ETIMEDOUT:     i32 = 138;
 ![target(windows)]
-const ECONNREFUSED:  i32 = 107;
+private const ECONNREFUSED:  i32 = 107;
 
-type enum IoErrorKind {
+public type enum IoErrorKind {
     NotFound;
     PermissionDenied;
     AlreadyExists;
@@ -94,7 +99,7 @@ implement enum IoErrorKind {
     /// Short, stable diagnostic slug: `"not_found"`, `"permission_denied"`,
     /// etc. Mirrors `JsonErrorKind::label`. Returns a static string literal
     /// (no allocation, nothing to drop).
-    label(&this) -> string {
+    public label(&this) -> string {
         return match (this) {
             IoErrorKind::NotFound          => { "not_found"           }
             IoErrorKind::PermissionDenied  => { "permission_denied"   }
@@ -120,13 +125,14 @@ implement enum IoErrorKind {
     }
 }
 
-type struct IoError {
-    kind: IoErrorKind;
-    /// `errno` from the underlying syscall, or 0 if not applicable.
-    /// Useful for diagnostics; callers should branch on `kind`.
-    os_code: i32;
+public type struct IoError {
+    public kind: IoErrorKind;
+    /// The operating system's own code for the failure - an `errno`, or a
+    /// Windows system error code - or 0 if not applicable. Useful for
+    /// diagnostics; callers should branch on `kind`.
+    public os_code: i32;
 
-    static new(kind: IoErrorKind, os_code: i32) -> IoError {
+    public static new(kind: IoErrorKind, os_code: i32) -> IoError {
         return IoError { kind: kind, os_code: os_code };
     }
 
@@ -137,13 +143,13 @@ type struct IoError {
     /// numeric OS code lives in `os_code` for callers that want to print it
     /// alongside. Borrows a static string literal, so the view outlives any
     /// `IoError`.
-    describe(&this) -> str::Str {
+    public describe(&this) -> str::Str {
         return str::Str::new(this.kind.label());
     }
 
     /// Map a POSIX `errno` to an `IoError`. Unknown codes fold to
     /// `Other` with the numeric code preserved in `os_code`.
-    static from_errno(code: i32) -> IoError {
+    public static from_errno(code: i32) -> IoError {
         return match (code) {
             ENOENT        => { IoError { kind: IoErrorKind::NotFound,          os_code: code } }
             EINTR         => { IoError { kind: IoErrorKind::Interrupted,       os_code: code } }
@@ -163,6 +169,50 @@ type struct IoError {
             ECONNREFUSED  => { IoError { kind: IoErrorKind::ConnectionRefused, os_code: code } }
             _             => { IoError { kind: IoErrorKind::Other,             os_code: code } }
         }
+    }
+
+    /// Map a Windows system error code (what `GetLastError` reports) to
+    /// an `IoError`. Unknown codes fold to `Other` with the code preserved
+    /// in `os_code`. A pure mapping, available on every target.
+    public static from_windows_error(code: u32) -> IoError {
+        mut kind: IoErrorKind = IoErrorKind::Other;
+        if (code == syscall::ERROR_FILE_NOT_FOUND
+                || code == syscall::ERROR_PATH_NOT_FOUND
+                || code == syscall::ERROR_INVALID_NAME) {
+            kind = IoErrorKind::NotFound;
+        } else if (code == syscall::ERROR_ACCESS_DENIED
+                || code == syscall::ERROR_SHARING_VIOLATION) {
+            kind = IoErrorKind::PermissionDenied;
+        } else if (code == syscall::ERROR_FILE_EXISTS || code == syscall::ERROR_ALREADY_EXISTS) {
+            kind = IoErrorKind::AlreadyExists;
+        } else if (code == syscall::ERROR_NOT_ENOUGH_MEMORY) {
+            kind = IoErrorKind::OutOfMemory;
+        } else if (code == syscall::ERROR_INVALID_PARAMETER) {
+            kind = IoErrorKind::InvalidInput;
+        } else if (code == syscall::ERROR_INVALID_DATA) {
+            kind = IoErrorKind::InvalidData;
+        } else if (code == syscall::ERROR_BROKEN_PIPE) {
+            kind = IoErrorKind::BrokenPipe;
+        } else if (code == syscall::ERROR_HANDLE_EOF) {
+            kind = IoErrorKind::UnexpectedEof;
+        } else if (code == syscall::ERROR_NOT_SUPPORTED) {
+            kind = IoErrorKind::Unsupported;
+        }
+        return IoError { kind: kind, os_code: code as i32 };
+    }
+
+    /// The calling thread's last operating-system error: `errno` on POSIX
+    /// targets, `GetLastError` on Windows. Read it straight after the
+    /// failing call, before anything else can overwrite it. A Windows
+    /// C-runtime call reports through `errno` instead; map that with
+    /// `from_errno`.
+    ![target(unix)]
+    public static last_os_error() -> IoError {
+        return IoError::from_errno(libc::errno());
+    }
+    ![target(windows)]
+    public static last_os_error() -> IoError {
+        return IoError::from_windows_error(syscall::GetLastError());
     }
 }
 

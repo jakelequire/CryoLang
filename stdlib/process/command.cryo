@@ -381,7 +381,7 @@ function make_pipe_pair() -> PipePair {
 function create_pipe() -> Result<PipePair, IoError> {
     mut fds: [i32; 2];
     if (libc::pipe(&fds[0]) < 0) {
-        return Result::Err(IoError::from_errno(libc::errno()));
+        return Result::Err(IoError::last_os_error());
     }
     return Result::Ok(PipePair { read_end: fds[0], write_end: fds[1] });
 }
@@ -595,7 +595,7 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
     // 4. fork.
     const pid: i32 = libc::fork();
     if (pid < 0) {
-        const err: IoError = IoError::from_errno(libc::errno());
+        const err: IoError = IoError::last_os_error();
         close_pipe(&stdin_pipe);
         close_pipe(&stdout_pipe);
         close_pipe(&stderr_pipe);
@@ -845,7 +845,7 @@ function collect_output(c: mut &Child) -> Result<Output, IoError> {
 
         const pr: i32 = libc::poll(&polls[0], nfds, -1);
         if (pr < 0) {
-            const err: IoError = IoError::from_errno(libc::errno());
+            const err: IoError = IoError::last_os_error();
             match (err.kind) {
                 IoErrorKind::Interrupted => { continue; }
                 _ => { return Result::Err(err); }
@@ -921,7 +921,7 @@ function drain_nonblock(fd: i32, chunk: u8*, chunk_len: u64, buf: mut &Array<u8>
             continue;
         }
         if (n == 0) { return DrainOutcome::Eof; }
-        const err: IoError = IoError::from_errno(libc::errno());
+        const err: IoError = IoError::last_os_error();
         match (err.kind) {
             IoErrorKind::Interrupted => { continue; }
             IoErrorKind::WouldBlock  => { return DrainOutcome::Again; }
@@ -957,7 +957,6 @@ type struct WinStdio {
     parent_fd:    i32;   // parent pipe end as a CRT fd, or -1
     extra_close:  u8*;   // child pipe end the parent must close post-spawn, or null
     close_fd:     i32;   // caller CRT fd to close post-spawn (Stdio::Fd ownership), or -1
-    ok:           boolean;
 }
 
 ![target(windows)]
@@ -1105,9 +1104,10 @@ function build_env_block(cmd: &Command) -> String {
 
 // Wire one std stream for the child.  Piped creates an inheritable pipe and
 // bridges the parent end to a CRT fd; everything else inherits the parent's
-// corresponding std handle.
+// corresponding std handle.  A failure reports the error of the call that
+// failed, read straight after it.
 ![target(windows)]
-function win_setup_stdio(setting: Stdio, std_id: u32, is_input: boolean) -> WinStdio {
+function win_setup_stdio(setting: Stdio, std_id: u32, is_input: boolean) -> Result<WinStdio, IoError> {
     match (setting) {
         Stdio::Piped => {
             mut rd: u8* = null;
@@ -1116,18 +1116,18 @@ function win_setup_stdio(setting: Stdio, std_id: u32, is_input: boolean) -> WinS
                 nLength: 24, lpSecurityDescriptor: null, bInheritHandle: 1
             };
             if (syscall::CreatePipe(&rd, &wr, &sa as u8*, 0) == 0) {
-                return WinStdio { child_handle: null, parent_fd: -1, extra_close: null, close_fd: -1, ok: false };
+                return Result::Err(IoError::last_os_error());
             }
             if (is_input) {
                 // child reads `rd` (inheritable); parent writes `wr`.
                 syscall::SetHandleInformation(wr, syscall::HANDLE_FLAG_INHERIT, 0);
                 const f: i32 = libc::_open_osfhandle(wr as i64, 0);
-                return WinStdio { child_handle: rd, parent_fd: f, extra_close: rd, close_fd: -1, ok: true };
+                return Result::Ok(WinStdio { child_handle: rd, parent_fd: f, extra_close: rd, close_fd: -1 });
             }
             // child writes `wr` (inheritable); parent reads `rd`.
             syscall::SetHandleInformation(rd, syscall::HANDLE_FLAG_INHERIT, 0);
             const f: i32 = libc::_open_osfhandle(rd as i64, 0);
-            return WinStdio { child_handle: wr, parent_fd: f, extra_close: wr, close_fd: -1, ok: true };
+            return Result::Ok(WinStdio { child_handle: wr, parent_fd: f, extra_close: wr, close_fd: -1 });
         }
         Stdio::Null => {
             // Discard the child's stream by handing it an inheritable handle
@@ -1147,10 +1147,10 @@ function win_setup_stdio(setting: Stdio, std_id: u32, is_input: boolean) -> WinS
             // against a local -1, not syscall::INVALID_HANDLE_VALUE (a
             // cross-module const i64 that mis-evaluates).
             if ((h as i64) == -1) {
-                return WinStdio { child_handle: null, parent_fd: -1, extra_close: null, close_fd: -1, ok: false };
+                return Result::Err(IoError::last_os_error());
             }
             // Parent owns the NUL handle; close it after the child inherits it.
-            return WinStdio { child_handle: h, parent_fd: -1, extra_close: h, close_fd: -1, ok: true };
+            return Result::Ok(WinStdio { child_handle: h, parent_fd: -1, extra_close: h, close_fd: -1 });
         }
         Stdio::Fd(raw) => {
             // Recover the Win32 HANDLE backing the caller's CRT fd and
@@ -1160,34 +1160,32 @@ function win_setup_stdio(setting: Stdio, std_id: u32, is_input: boolean) -> WinS
             // original fd is closed too, since `Stdio::Fd` transfers ownership.
             const src: i64 = libc::_get_osfhandle(raw);
             if (src == -1) {
-                return WinStdio { child_handle: null, parent_fd: -1, extra_close: null, close_fd: -1, ok: false };
+                // A C-runtime call: it reports through `errno`.
+                return Result::Err(IoError::from_errno(libc::errno()));
             }
             mut dup: u8* = null;
             const cur: u8* = syscall::GetCurrentProcess();
             if (syscall::DuplicateHandle(cur, src as u8*, cur, &dup, 0, 1,
                                          syscall::DUPLICATE_SAME_ACCESS) == 0) {
-                return WinStdio { child_handle: null, parent_fd: -1, extra_close: null, close_fd: -1, ok: false };
+                return Result::Err(IoError::last_os_error());
             }
             // child inherits `dup`; parent closes both `dup` and the caller's fd.
-            return WinStdio { child_handle: dup, parent_fd: -1, extra_close: dup, close_fd: raw, ok: true };
+            return Result::Ok(WinStdio { child_handle: dup, parent_fd: -1, extra_close: dup, close_fd: raw });
         }
         _ => {
             // Inherit: hand the child our own std handle; nothing for the
             // parent to close or wrap.
-            return WinStdio { child_handle: syscall::GetStdHandle(std_id),
-                              parent_fd: -1, extra_close: null, close_fd: -1, ok: true };
+            return Result::Ok(WinStdio { child_handle: syscall::GetStdHandle(std_id),
+                                         parent_fd: -1, extra_close: null, close_fd: -1 });
         }
     }
 }
 
 ![target(windows)]
 function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
-    const sin:  WinStdio = win_setup_stdio(cmd.stdin_cfg,  syscall::STD_INPUT_HANDLE,  true);
-    if (!sin.ok)  { return Result::Err(IoError::new(IoErrorKind::Other, 0)); }
-    const sout: WinStdio = win_setup_stdio(cmd.stdout_cfg, syscall::STD_OUTPUT_HANDLE, false);
-    if (!sout.ok) { return Result::Err(IoError::new(IoErrorKind::Other, 0)); }
-    const serr: WinStdio = win_setup_stdio(cmd.stderr_cfg, syscall::STD_ERROR_HANDLE,  false);
-    if (!serr.ok) { return Result::Err(IoError::new(IoErrorKind::Other, 0)); }
+    const sin:  WinStdio = win_setup_stdio(cmd.stdin_cfg,  syscall::STD_INPUT_HANDLE,  true)?;
+    const sout: WinStdio = win_setup_stdio(cmd.stdout_cfg, syscall::STD_OUTPUT_HANDLE, false)?;
+    const serr: WinStdio = win_setup_stdio(cmd.stderr_cfg, syscall::STD_ERROR_HANDLE,  false)?;
 
     mut cmdline: String = build_cmdline(cmd);
 
@@ -1226,6 +1224,8 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
 
     const ok: i32 = syscall::CreateProcessA(null, cmdline.as_ptr(), null, null,
                                             1, 0, env_ptr, cwd_ptr, &si, &pi);
+    // Read before the closes below can overwrite it; used only on failure.
+    const create_error: IoError = IoError::last_os_error();
 
     // Parent closes the child's pipe ends now that they have been inherited.
     if (sin.extra_close  != null) { syscall::CloseHandle(sin.extra_close); }
@@ -1243,7 +1243,7 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
         if (sin.parent_fd  >= 0) { fd::close_fd(sin.parent_fd); }
         if (sout.parent_fd >= 0) { fd::close_fd(sout.parent_fd); }
         if (serr.parent_fd >= 0) { fd::close_fd(serr.parent_fd); }
-        return Result::Err(IoError::new(IoErrorKind::Other, 0));
+        return Result::Err(create_error);
     }
     syscall::CloseHandle(pi.hThread);
 

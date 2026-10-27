@@ -461,9 +461,12 @@ Left over from that: the async entry point calls `Executor::new` and
    and `Str` searches from either end while a `Slice` indexes and
    compares (609).  `Str`, `Slice` and `Path` are marked (610).
    Integers cross bytes through `ByteReader` and `ByteWriter`, and `u8`
-   folds to uppercase too (611).  Open: a writer over a fixed region -
-   SHA-1's digest, the generator's fill, `pack_sockaddr_in` and the IPv6
-   parser still store their bytes by hand.
+   folds to uppercase too (611).  An OS error becomes an `IoError` in
+   `io::error`, which is marked (612).  Open: a writer over a fixed
+   region - SHA-1's digest, the generator's fill, `pack_sockaddr_in` and
+   the IPv6 parser still store their bytes by hand - and whether the
+   Winsock and OpenSSL error mappers in `net` become `IoError`
+   constructors too.
 
 ## A generic type's methods emitted only when called
 

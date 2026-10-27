@@ -78,7 +78,7 @@ private function os_proc_wait(pid: i32, handle: u64) -> Result<ExitStatus, IoErr
             if (wstatus_is_alive(status)) { continue; }
             return Result::Ok(decode_wstatus(status));
         }
-        const err: IoError = IoError::from_errno(libc::errno());
+        const err: IoError = IoError::last_os_error();
         match (err.kind) {
             IoErrorKind::Interrupted => { }
             _ => { return Result::Err(err); }
@@ -88,9 +88,13 @@ private function os_proc_wait(pid: i32, handle: u64) -> Result<ExitStatus, IoErr
 ![target(windows)]
 private function os_proc_wait(pid: i32, handle: u64) -> Result<ExitStatus, IoError> {
     const h: u8* = handle as u8*;
-    syscall::WaitForSingleObject(h, 0xFFFFFFFF);   // INFINITE
+    if (syscall::WaitForSingleObject(h, 0xFFFFFFFF) == 0xFFFFFFFF) {   // INFINITE; WAIT_FAILED
+        return Result::Err(IoError::last_os_error());
+    }
     mut code: u32 = 0;
-    syscall::GetExitCodeProcess(h, &code);
+    if (syscall::GetExitCodeProcess(h, &code) == 0) {
+        return Result::Err(IoError::last_os_error());
+    }
     return Result::Ok(ExitStatus { code: code as i32, signal: 0, signaled: false });
 }
 
@@ -116,7 +120,7 @@ private function os_proc_try_wait(pid: i32, handle: u64) -> Result<Option<ExitSt
             return Result::Ok(Option::Some(decode_wstatus(status)));
         }
         if (rc == 0) { return Result::Ok(Option::None); }
-        const err: IoError = IoError::from_errno(libc::errno());
+        const err: IoError = IoError::last_os_error();
         match (err.kind) {
             IoErrorKind::Interrupted => { }
             _ => { return Result::Err(err); }
@@ -126,18 +130,24 @@ private function os_proc_try_wait(pid: i32, handle: u64) -> Result<Option<ExitSt
 ![target(windows)]
 private function os_proc_try_wait(pid: i32, handle: u64) -> Result<Option<ExitStatus>, IoError> {
     const h: u8* = handle as u8*;
-    if (syscall::WaitForSingleObject(h, 0) == 0x102) {   // WAIT_TIMEOUT
+    const waited: u32 = syscall::WaitForSingleObject(h, 0);
+    if (waited == 0x102) {   // WAIT_TIMEOUT
         return Result::Ok(Option::None);
     }
+    if (waited == 0xFFFFFFFF) {   // WAIT_FAILED
+        return Result::Err(IoError::last_os_error());
+    }
     mut code: u32 = 0;
-    syscall::GetExitCodeProcess(h, &code);
+    if (syscall::GetExitCodeProcess(h, &code) == 0) {
+        return Result::Err(IoError::last_os_error());
+    }
     return Result::Ok(Option::Some(ExitStatus { code: code as i32, signal: 0, signaled: false }));
 }
 
 ![target(unix)]
 private function os_proc_signal(pid: i32, handle: u64, sig: i32) -> Result<(), IoError> {
     if (libc::kill(pid, sig) < 0) {
-        return Result::Err(IoError::from_errno(libc::errno()));
+        return Result::Err(IoError::last_os_error());
     }
     return Result::Ok(());
 }
@@ -146,7 +156,7 @@ private function os_proc_signal(pid: i32, handle: u64, sig: i32) -> Result<(), I
     // No POSIX signals on Windows; any kill/send_signal terminates the
     // process (the specific signal number is not representable).
     if (syscall::TerminateProcess(handle as u8*, 1) == 0) {
-        return Result::Err(IoError::new(IoErrorKind::Other, 0));
+        return Result::Err(IoError::last_os_error());
     }
     return Result::Ok(());
 }
@@ -161,7 +171,7 @@ private function os_proc_reap(pid: i32, handle: u64, waited: boolean) -> void {
     loop {
         const rc: i32 = libc::waitpid(pid, &status, libc::WNOHANG);
         if (rc < 0) {
-            const err: IoError = IoError::from_errno(libc::errno());
+            const err: IoError = IoError::last_os_error();
             match (err.kind) {
                 IoErrorKind::Interrupted => { }
                 _ => { return; }

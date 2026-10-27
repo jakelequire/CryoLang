@@ -1,0 +1,54 @@
+///! An operating system's error codes mapped to `IoError`, and the calling
+///! thread's last error read back.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::IoErrorCodes;
+
+import std::core::result::{ Result };
+import std::collections::str::{ Str };
+import std::io::error::{ IoError, IoErrorKind };
+import std::ffi::libc;
+import std::sys::syscall;
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_eq };
+
+function expect_windows_code(code: u32, kind: IoErrorKind) -> Result<(), TestError> {
+    const error: IoError = IoError::from_windows_error(code);
+    expect(error.kind == kind, Str::new(error.kind.label()))?;
+    return expect_eq(error.os_code, code as i32);
+}
+
+![test]
+function windows_error_codes_map_to_kinds() -> Result<(), TestError> {
+    expect_windows_code(syscall::ERROR_FILE_NOT_FOUND, IoErrorKind::NotFound)?;
+    expect_windows_code(syscall::ERROR_PATH_NOT_FOUND, IoErrorKind::NotFound)?;
+    expect_windows_code(syscall::ERROR_ACCESS_DENIED, IoErrorKind::PermissionDenied)?;
+    expect_windows_code(syscall::ERROR_SHARING_VIOLATION, IoErrorKind::PermissionDenied)?;
+    expect_windows_code(syscall::ERROR_ALREADY_EXISTS, IoErrorKind::AlreadyExists)?;
+    expect_windows_code(syscall::ERROR_FILE_EXISTS, IoErrorKind::AlreadyExists)?;
+    expect_windows_code(syscall::ERROR_NOT_ENOUGH_MEMORY, IoErrorKind::OutOfMemory)?;
+    expect_windows_code(syscall::ERROR_INVALID_PARAMETER, IoErrorKind::InvalidInput)?;
+    expect_windows_code(syscall::ERROR_BROKEN_PIPE, IoErrorKind::BrokenPipe)?;
+    expect_windows_code(syscall::ERROR_HANDLE_EOF, IoErrorKind::UnexpectedEof)?;
+    expect_windows_code(syscall::ERROR_NOT_SUPPORTED, IoErrorKind::Unsupported)?;
+    return expect_windows_code(9999, IoErrorKind::Other);
+}
+
+![target(unix)]
+function set_last_error_to_not_found() -> i32 {
+    libc::set_errno(2);   // ENOENT
+    return 2;
+}
+![target(windows)]
+function set_last_error_to_not_found() -> i32 {
+    syscall::SetLastError(syscall::ERROR_FILE_NOT_FOUND);
+    return 2;
+}
+
+![test]
+function last_os_error_reads_the_thread_error() -> Result<(), TestError> {
+    const code: i32 = set_last_error_to_not_found();
+    const error: IoError = IoError::last_os_error();
+    expect(error.kind == IoErrorKind::NotFound, Str::new(error.kind.label()))?;
+    return expect_eq(error.os_code, code);
+}
