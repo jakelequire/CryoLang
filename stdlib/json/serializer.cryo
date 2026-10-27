@@ -61,15 +61,12 @@ function write_value_inner(out: mut &String, v: &JsonValue,
         // bound. Unreachable for any value the bundled parser produced (it
         // rejects nesting beyond Parser::MAX_DEPTH), so legitimate round-trips are
         // unaffected.
-        write_lit(out, "null", 4);
+        out.push("null");
         return;
     }
     match (v) {
-        JsonValue::Null      => { write_lit(out, "null", 4); }
-        JsonValue::Bool(b)   => {
-            if (b) { write_lit(out, "true", 4); }
-            else   { write_lit(out, "false", 5); }
-        }
+        JsonValue::Null      => { out.push("null"); }
+        JsonValue::Bool(b)   => { out.push(b); }
         JsonValue::Number(n) => { write_number(out, &n); }
         JsonValue::String(s) => { write_string(out, s.as_str()); }
         JsonValue::Array(arr) => {
@@ -92,7 +89,7 @@ function write_array(out: mut &String, arr: &Array<JsonValue>,
     if (pretty) { out.push_byte(10 as u8); }
     mut i: i64 = 0;
     while (i < arr.length()) {
-        if (pretty) { write_indent(out, depth + 1); }
+        if (pretty) { out.push_repeated(' ', ((depth + 1) * 2) as i64); }
         write_value_inner(out, &arr.ptr[i], pretty, depth + 1);
         if (i + 1 < arr.length()) {
             out.push_byte(44 as u8);   // ,
@@ -100,7 +97,7 @@ function write_array(out: mut &String, arr: &Array<JsonValue>,
         if (pretty) { out.push_byte(10 as u8); }
         i++;
     }
-    if (pretty) { write_indent(out, depth); }
+    if (pretty) { out.push_repeated(' ', (depth * 2) as i64); }
     out.push_byte(93 as u8);
 }
 
@@ -115,7 +112,7 @@ function write_object(out: mut &String, obj: &JsonObject,
     if (pretty) { out.push_byte(10 as u8); }
     mut i: i64 = 0;
     while (i < obj.length()) {
-        if (pretty) { write_indent(out, depth + 1); }
+        if (pretty) { out.push_repeated(' ', ((depth + 1) * 2) as i64); }
         match (obj.key_at(i)) {
             Option::Some(k) => { write_string(out, k); }
             Option::None    => { write_string(out, Str::new("")); }
@@ -126,7 +123,7 @@ function write_object(out: mut &String, obj: &JsonObject,
             Option::Some(vp) => {
                 write_value_inner(out, vp, pretty, depth + 1);
             }
-            Option::None => { write_lit(out, "null", 4); }
+            Option::None => { out.push("null"); }
         }
         if (i + 1 < obj.length()) {
             out.push_byte(44 as u8);
@@ -134,50 +131,16 @@ function write_object(out: mut &String, obj: &JsonObject,
         if (pretty) { out.push_byte(10 as u8); }
         i++;
     }
-    if (pretty) { write_indent(out, depth); }
+    if (pretty) { out.push_repeated(' ', (depth * 2) as i64); }
     out.push_byte(125 as u8);
-}
-
-function write_indent(out: mut &String, depth: u64) -> void {
-    mut n: u64 = 0;
-    const total: u64 = depth * 2;
-    while (n < total) {
-        out.push_byte(32 as u8);   // space
-        n++;
-    }
-}
-
-function write_lit(out: mut &String, lit: string, lit_len: u64) -> void {
-    const bytes: u8* = lit as u8*;
-    mut i: u64 = 0;
-    while (i < lit_len) {
-        out.push_byte(bytes[i]);
-        i++;
-    }
 }
 
 // Numbers
 
 function write_number(out: mut &String, n: &JsonNumber) -> void {
     match (n) {
-        JsonNumber::Int(v) => {
-            mut buf: [u8; 24];
-            const written: i64 = v.to_decimal_buf(&buf[0]);
-            mut i: i64 = 0;
-            while (i < written) {
-                out.push_byte(buf[i]);
-                i++;
-            }
-        }
-        JsonNumber::UInt(v) => {
-            mut buf: [u8; 24];
-            const written: i64 = v.to_decimal_buf(&buf[0]);
-            mut i: i64 = 0;
-            while (i < written) {
-                out.push_byte(buf[i]);
-                i++;
-            }
-        }
+        JsonNumber::Int(v)  => { out.push(v); }
+        JsonNumber::UInt(v) => { out.push(v); }
         JsonNumber::Float(v) => {
             // JSON (RFC 8259 section 6) has no representation for NaN or
             // infinity. The stdlib float writer formats those as the
@@ -192,10 +155,7 @@ function write_number(out: mut &String, n: &JsonNumber) -> void {
             // `NaN == 0.0` is false. One arithmetic op, no imports.
             const finite: boolean = (v - v) == 0.0;
             if (!finite) {
-                out.push_byte(110 as u8); // 'n'
-                out.push_byte(117 as u8); // 'u'
-                out.push_byte(108 as u8); // 'l'
-                out.push_byte(108 as u8); // 'l'
+                out.push("null");
             } else {
                 // Use the shortest representation that re-parses (via strtod)
                 // to the identical f64. The plain `to_buf` form is fixed at 6
@@ -205,11 +165,7 @@ function write_number(out: mut &String, n: &JsonNumber) -> void {
                 // staying compact for typical numbers.
                 mut buf: [u8; 32];
                 const written: i64 = v.to_buf_roundtrip(&buf[0]);
-                mut i: i64 = 0;
-                while (i < written) {
-                    out.push_byte(buf[i]);
-                    i++;
-                }
+                out.push(Str::from_raw(&buf[0], written));
             }
         }
     }

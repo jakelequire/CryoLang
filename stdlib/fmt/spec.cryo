@@ -25,7 +25,7 @@ import std::core::iter::{ Iterator };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::collections::pair::{ Pair };
-import std::fmt::display::{ Display, encode_utf8, format_to_string };
+import std::fmt::display::{ Display, format_to_string };
 import std::core::mem;
 
 /// No radix: format the value in its natural (decimal / Display) form.
@@ -147,15 +147,6 @@ function fmt_parse_spec(spec: Str) -> FmtSpec {
 // zero-fill after them). Padding is applied by `fmt_pad`.
 // ----------------------------------------------------------------------
 
-/// Uppercase the ASCII hex letters `a`-`f` in `buf[0, len)` in place.
-function ascii_hex_upper(buf: u8*, len: i64) -> void {
-    mut i: i64 = 0;
-    while (i < len) {
-        if (buf[i] >= 0x61 && buf[i] <= 0x66) { buf[i] = buf[i] - 0x20; }
-        i = i + 1;
-    }
-}
-
 /// Radix prefix for `#`: `0x` / `0o` / `0b`. Empty for decimal or when
 /// `alternate` is off.
 function radix_prefix(spec: &FmtSpec) -> Str {
@@ -174,16 +165,13 @@ function radix_digits(val: u64, spec: &FmtSpec) -> String {
     if (spec.radix == RADIX_HEX_LOWER) {
         digits = val.to_hex_buf(&buffer[0]);
     } else if (spec.radix == RADIX_HEX_UPPER) {
-        digits = val.to_hex_buf(&buffer[0]);
+        digits = val.to_hex_upper_buf(&buffer[0]);
     } else if (spec.radix == RADIX_OCT) {
         digits = val.to_oct_buf(&buffer[0]);
     } else if (spec.radix == RADIX_BIN) {
         digits = val.to_bin_buf(&buffer[0]);
     } else {
         digits = val.to_decimal_buf(&buffer[0]);
-    }
-    if (spec.radix == RADIX_HEX_UPPER) {
-        ascii_hex_upper(&buffer[0], digits);
     }
     mut out: String = String::new();
     out.push(Str::from_raw(&buffer[0], digits));
@@ -299,38 +287,10 @@ function truncate_scalars(s: Str, n: i64) -> Str {
     }
 }
 
-/// Count the Unicode scalars in `s`.
-function scalar_count(s: Str) -> i64 {
-    mut it: implement Iterator<u32> = s.chars();
-    mut n: i64 = 0;
-    loop {
-        match (it.next()) {
-            Option::Some(_) => { n = n + 1; }
-            Option::None => { break; }
-        }
-    }
-    return n;
-}
-
-/// Append the UTF-8 encoding of scalar `c` to `out` `count` times.
-function push_fill(out: mut &String, c: u32, count: i64) -> void {
-    mut buffer: [u8; 4];
-    const width: i64 = encode_utf8(c, &buffer[0]);
-    mut i: i64 = 0;
-    while (i < count) {
-        mut b: i64 = 0;
-        while (b < width) {
-            out.push_byte(buffer[b]);
-            b = b + 1;
-        }
-        i = i + 1;
-    }
-}
-
 /// Pad `body` to the spec's field width and append it to `out`. `head_len`
 /// is the leading sign/prefix run for sign-aware zero-fill.
 function fmt_pad(out: mut &String, body: Str, head_len: i64, spec: &FmtSpec) -> void {
-    const count: i64 = scalar_count(body);
+    const count: i64 = body.chars().count();
     if (count >= spec.width) {
         out.push(body);
         return;
@@ -340,31 +300,31 @@ function fmt_pad(out: mut &String, body: Str, head_len: i64, spec: &FmtSpec) -> 
     // Resolve alignment and fill, honouring the `0` flag when no explicit
     // alignment was given.
     mut align: u8 = spec.align;
-    mut fill: u32 = spec.fill;
+    mut fill: char = spec.fill as char;
     if (align == ALIGN_DEFAULT) {
-        if (spec.zero_pad) { align = ALIGN_RIGHT; fill = FILL_ZERO; }
+        if (spec.zero_pad) { align = ALIGN_RIGHT; fill = FILL_ZERO as char; }
         else { align = ALIGN_LEFT; }
     }
 
     if (align == ALIGN_LEFT) {
         out.push(body);
-        push_fill(out, fill, padn);
+        out.push_repeated(fill, padn);
         return;
     }
     if (align == ALIGN_CENTER) {
         const left: i64 = padn / 2;
-        push_fill(out, fill, left);
+        out.push_repeated(fill, left);
         out.push(body);
-        push_fill(out, fill, padn - left);
+        out.push_repeated(fill, padn - left);
         return;
     }
     // ALIGN_RIGHT. For a zero-fill, keep the sign/prefix leftmost.
     if (spec.zero_pad && head_len > 0) {
         out.push(body.sub_bytes(0, head_len));
-        push_fill(out, fill, padn);
+        out.push_repeated(fill, padn);
         out.push(body.sub_bytes(head_len, body.length()));
         return;
     }
-    push_fill(out, fill, padn);
+    out.push_repeated(fill, padn);
     out.push(body);
 }

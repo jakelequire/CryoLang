@@ -200,15 +200,12 @@ implement trait Display for string {
 }
 
 
-/// `char` is a 4-byte Unicode scalar. Encode it as UTF-8; emitting
-/// the low byte truncates non-ASCII scalars to garbage. Scalars in
-/// the surrogate range (0xD800..=0xDFFF) are not legal Unicode; they
-/// produce the replacement character U+FFFD.
+/// `char` is a 4-byte Unicode scalar, written UTF-8-encoded by the sink's
+/// `write_char`; a value in the surrogate range (0xD800..=0xDFFF) is not a
+/// scalar and is written as the replacement character U+FFFD.
 implement trait Display for char {
     fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
-        mut buffer: [u8; 4];
-        const length: i64 = encode_utf8(this as u32, &buffer[0]);
-        return f.write_str(Str::from_raw(&buffer[0], length));
+        return f.write_char(this);
     }
 }
 
@@ -225,52 +222,6 @@ where A: Allocator {
     }
 }
 
-
-// UTF-8 encoding for Display<char>
-
-/// Encode a Unicode scalar value as UTF-8 into `out`. Returns the
-/// number of bytes written (1-3 for valid scalars; 3 bytes for the
-/// replacement character when given an invalid scalar). `out` must
-/// hold at least 4 bytes.
-function encode_utf8(scalar: u32, out: u8*) -> i64 {
-    if (scalar < 0x80) {
-        out[0] = scalar as u8;
-        return 1;
-    }
-    if (scalar < 0x800) {
-        out[0] = (0xC0 | (scalar >> 6)) as u8;
-        out[1] = (0x80 | (scalar & 0x3F)) as u8;
-        return 2;
-    }
-    if (scalar >= 0xD800 && scalar <= 0xDFFF) {
-        // Surrogate halves are not valid Unicode scalars. Substitute
-        // U+FFFD (the replacement character) so consumers still see
-        // well-formed UTF-8.
-        return write_replacement(out);
-    }
-    if (scalar < 0x10000) {
-        out[0] = (0xE0 | (scalar >> 12)) as u8;
-        out[1] = (0x80 | ((scalar >> 6) & 0x3F)) as u8;
-        out[2] = (0x80 | (scalar & 0x3F)) as u8;
-        return 3;
-    }
-    if (scalar <= char::MAX as u32) {
-        out[0] = (0xF0 | (scalar >> 18)) as u8;
-        out[1] = (0x80 | ((scalar >> 12) & 0x3F)) as u8;
-        out[2] = (0x80 | ((scalar >> 6) & 0x3F)) as u8;
-        out[3] = (0x80 | (scalar & 0x3F)) as u8;
-        return 4;
-    }
-    return write_replacement(out);
-}
-
-function write_replacement(out: u8*) -> i64 {
-    // U+FFFD encodes as 0xEF 0xBF 0xBD.
-    out[0] = 0xEF;
-    out[1] = 0xBF;
-    out[2] = 0xBD;
-    return 3;
-}
 
 // Primitive Debug impls: default to Display for numeric types
 

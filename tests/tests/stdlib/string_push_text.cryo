@@ -1,0 +1,92 @@
+///! String.push of any Display, push_char, push_repeated, and the one
+///! UTF-8 encoder every char is written through.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::StringPushText;
+
+import std::core::result::{ Result };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::fmt::display::{ Display, Formatter };
+import std::fmt::error::{ FmtError };
+import std::fmt::write::{ FmtWrite };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_eq };
+
+type struct Meters {
+    amount: i32;
+}
+
+implement trait Display for struct Meters {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        f.write_str(Str::new("<"))?;
+        (Display for i32)::fmt(&this.amount, f)?;
+        return f.write_str(Str::new(" m>"));
+    }
+}
+
+![test]
+function push_appends_any_display_value() -> Result<(), TestError> {
+    mut s: String = String::new();
+    s.push(Meters { amount: 12 });
+    s.push(true);
+    s.push('x');
+    s.push(-7);
+    expect_eq(s.as_str(), Str::new("<12 m>truex-7"))?;
+    return Result::Ok(());
+}
+
+![test]
+function push_char_encodes_every_width() -> Result<(), TestError> {
+    mut s: String = String::new();
+    s.push_char(0x41 as char);       // 1 byte
+    s.push_char(0xE9 as char);       // 2 bytes: C3 A9
+    s.push_char(0x20AC as char);     // 3 bytes: E2 82 AC
+    s.push_char(0x1F600 as char);    // 4 bytes: F0 9F 98 80
+    expect_eq(s.length(), 10)?;
+    expect_eq(s.as_str().byte_at(1).unwrap_or(0), 0xC3 as u8)?;
+    expect_eq(s.as_str().byte_at(3).unwrap_or(0), 0xE2 as u8)?;
+    expect_eq(s.as_str().byte_at(6).unwrap_or(0), 0xF0 as u8)?;
+    expect_eq(s.as_str().byte_at(9).unwrap_or(0), 0x80 as u8)?;
+    return Result::Ok(());
+}
+
+![test]
+function push_char_writes_a_surrogate_as_the_replacement_character() -> Result<(), TestError> {
+    mut s: String = String::new();
+    s.push_char(0xD800 as char);
+    expect_eq(s.length(), 3)?;
+    expect_eq(s.as_str().byte_at(0).unwrap_or(0), 0xEF as u8)?;
+    expect_eq(s.as_str().byte_at(1).unwrap_or(0), 0xBF as u8)?;
+    expect_eq(s.as_str().byte_at(2).unwrap_or(0), 0xBD as u8)?;
+    return Result::Ok(());
+}
+
+![test]
+function write_char_on_a_sink_replaces_a_surrogate() -> Result<(), TestError> {
+    mut s: String = String::new();
+    match (s.write_char(0xDFFF as char)) {
+        Result::Ok(_) => { }
+        Result::Err(_) => { }
+    }
+    expect_eq(s.length(), 3)?;
+    expect_eq(s.as_str().byte_at(0).unwrap_or(0), 0xEF as u8)?;
+    expect_eq(s.as_str().byte_at(2).unwrap_or(0), 0xBD as u8)?;
+    return Result::Ok(());
+}
+
+![test]
+function push_repeated_appends_count_copies() -> Result<(), TestError> {
+    mut s: String = String::new();
+    s.push_repeated('-', 3);
+    s.push_repeated(0xE9 as char, 2);
+    s.push_repeated('z', 0);
+    s.push_repeated('z', -4);
+    s.push_repeated('.', 1);
+    expect_eq(s.length(), 8)?;
+    expect_eq(s.as_str().sub_bytes(0, 3), Str::new("---"))?;
+    expect_eq(s.as_str().byte_at(3).unwrap_or(0), 0xC3 as u8)?;
+    expect_eq(s.as_str().byte_at(5).unwrap_or(0), 0xC3 as u8)?;
+    expect_eq(s.as_str().byte_at(7).unwrap_or(0), 0x2E as u8)?;
+    return Result::Ok(());
+}

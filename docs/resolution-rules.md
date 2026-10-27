@@ -196,6 +196,17 @@ yet is recorded with the change that builds it, not here.
      `float_value`, `string_value`, `empty_array` and `empty_object` for
      the variants they wrapped.  (Jake)
 
+603. **`String.push` appends any `Display` value; one UTF-8 encoder.**
+     `push` and `try_push` take any `T: Display`: text is copied in, every
+     other type is formatted.  `push_char(c)` appends one scalar and
+     `push_repeated(c, count)` appends `count` copies.  Every `char` is
+     encoded by the one private encoder behind `FmtWrite.write_char`, which
+     writes a surrogate or an out-of-range value as U+FFFD; `char`'s
+     `Display` writes through `write_char`.  The format spec's fill, the
+     JSON escape decoder and serializer, the HTTP client's decimal writers
+     and the test runner's number text use these instead of their own
+     loops.  (Jake)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that
