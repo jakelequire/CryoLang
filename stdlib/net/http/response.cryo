@@ -77,13 +77,9 @@ public type struct Response {
     public set_body(mut &this, body: Array<u8>) -> void {
         mut _old_body: Array<u8> = this.body;
         this.body = body;
-        mut buffer: [u8; 24];
-        const body_len: i64 = this.body.length();
-        const digits: i64 = body_len.to_decimal_buf(&buffer[0]);
-        this.headers.insert(
-            Str::new("Content-Length"),
-            Str::from_raw(&buffer[0], digits)
-        );
+        mut length: Array<u8> = Array::<u8>::new();
+        length.write(f"{this.body.length()}").expect("Response::set_body: allocation failed");
+        this.headers.insert(Str::new("Content-Length"), Str::from_raw(length.as_ptr(), length.length()));
     }
 
     /// Parse a Status-Line (`HTTP/x.y SP code SP reason`, no CRLF) into
@@ -144,21 +140,7 @@ public type struct Response {
     /// layer above suspends exactly once, in the following `flush`.
     public encode_into(&this, out: Array<u8>*) -> Result<(), IoError> {
         const crlf: Slice<u8> = Slice::from_raw("\r\n", 2);
-        const sp: Slice<u8> = Slice::from_raw(" ", 1);
-        const http11: Slice<u8> = Slice::from_raw("HTTP/1.1", 8);
-
-        out.try_append(http11)?;
-        out.try_append(sp)?;
-        // StatusCode wraps a full u16, whose largest decimal form is
-        // "65535" (5 digits). `to_decimal_buf` writes exactly as many
-        // digits as the value needs, so the buffer must hold 5.
-        mut code_buf: [u8; 5];
-        const code_val: u64 = this.status.as_u16() as u64;
-        const code_digits: i64 = code_val.to_decimal_buf(&code_buf[0]);
-        out.try_append(Slice::<u8>::from_raw(&code_buf[0], code_digits))?;
-        out.try_append(sp)?;
-        out.try_append(this.status.reason_phrase().as_bytes())?;
-        out.try_append(crlf)?;
+        out.write(f"HTTP/1.1 {this.status} {this.status.reason_phrase()}\r\n")?;
 
         this.headers.encode_into(out)?;
 

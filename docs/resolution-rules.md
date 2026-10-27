@@ -378,6 +378,24 @@ yet is recorded with the change that builds it, not here.
      the warning; the variant-first reading of a type-led path, E0113 and
      reusing W0009 delegated)
 
+615. **A writer over a fixed region; Winsock errors map in `io::error`; a
+     byte array is a format target.**  `ByteWriter::over(region)` writes
+     into a `Slice<u8>` from its first byte and panics on a write past its
+     end; `position()` says how many bytes a writer has written, either
+     kind.  SHA-1's digest, the generator's `fill`, `pack_sockaddr_in` and
+     the IPv6 parser's groups write through one, and their own byte stores
+     (and the module `random::bits`) are deleted.  `IoError::from_wsa`
+     maps a Winsock code on every target, as `from_windows_error` maps a
+     system code, so the `WSAE*` codes it reads are declared on every
+     target; the network layer's own mapper is deleted.  `Array<u8>`
+     implements `FmtWrite`, appending the text's bytes, and `IoError`
+     converts from `FmtError` (its I/O error, or the allocation failure),
+     so the HTTP status line is written with `write(f"...")` and `?`, and
+     HTTP/2's `:status` and both `set_body`s' Content-Length are formatted
+     into a byte array, panicking where the array cannot grow.  (Jake for
+     `over`, `from_wsa` and the `FmtWrite` impl; `position`, the
+     `From<FmtError>` conversion and the ungated codes delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

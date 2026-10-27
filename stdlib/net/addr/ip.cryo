@@ -20,7 +20,7 @@ import std::core::result::{ Result };
 import std::core::convert::{ ConversionError };
 import std::core::slice::{ Slice };
 import std::collections::str::{ Str };
-import std::io::bytes::{ ByteReader };
+import std::io::bytes::{ ByteReader, ByteWriter };
 import std::fmt::display::{ Display, Formatter };
 import std::fmt::error::{ FmtError };
 
@@ -238,25 +238,15 @@ public type struct IpV6Addr {
             if (head_n + tail_n >= 8) { return Option::None; }
         }
 
+        // The head groups, the zero groups `::` stands for, then the tail
+        // groups flush to the end: eight groups, network order.
         mut segs: [u8; 16];
-        mut k: i64 = 0;
-        while (k < 16) { segs[k] = 0; k = k + 1; }
-        // Head groups at the front.
+        mut groups: ByteWriter = ByteWriter::over(Slice::<u8>::from_raw(&segs[0], 16));
         mut g: i64 = 0;
-        while (g < head_n) {
-            segs[g * 2]     = (head[g] >> 8) as u8;
-            segs[g * 2 + 1] = (head[g] & 0xFF) as u8;
-            g = g + 1;
-        }
-        // Tail groups flush to the end.
-        const tail_base: i64 = 8 - tail_n;
+        while (g < head_n) { groups.write_u16_big_endian(head[g]); g = g + 1; }
+        while (g < 8 - tail_n) { groups.write_u16_big_endian(0); g = g + 1; }
         g = 0;
-        while (g < tail_n) {
-            const slot: i64 = tail_base + g;
-            segs[slot * 2]     = (tail[g] >> 8) as u8;
-            segs[slot * 2 + 1] = (tail[g] & 0xFF) as u8;
-            g = g + 1;
-        }
+        while (g < tail_n) { groups.write_u16_big_endian(tail[g]); g = g + 1; }
         return Option::Some(IpV6Addr { segments: segs });
     }
 }

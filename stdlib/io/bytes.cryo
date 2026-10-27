@@ -3,7 +3,8 @@
 ///! `ByteReader` walks a borrowed `Slice<u8>` front to back, decoding one
 ///! integer per call; a read that needs more bytes than remain fails with
 ///! `UnexpectedEof` and leaves the position where it was. `ByteWriter`
-///! appends encoded integers to an `Array<u8>` it borrows.
+///! appends encoded integers to an `Array<u8>` it borrows, or writes them
+///! into a fixed region it is given.
 ///!
 ///! Every multi-byte method names its order in full - `big_endian` (most
 ///! significant byte first, the network order of the wire protocols) or
@@ -139,22 +140,44 @@ public type struct ByteReader {
     }
 }
 
-/// Encodes integers onto the end of a borrowed `Array<u8>`. A write
-/// panics if the array cannot grow, as `Array.push` does.
+/// Encodes integers onto the end of a borrowed `Array<u8>` (`new`), or
+/// into a fixed region of memory from its first byte (`over`). A write
+/// panics if the array cannot grow, as `Array.push` does, or if it would
+/// pass the end of the region.
 public type struct ByteWriter {
-    private out: mut &Array<u8>;
+    /// The array `new` appends to; null for a writer made by `over`.
+    private array: Array<u8>*;
+    /// The region `over` writes into; empty for a writer made by `new`.
+    private region: Slice<u8>;
+    private written: i64;
 
     /// A writer appending to `out`, after whatever it already holds.
     public static new(out: mut &Array<u8>) -> ByteWriter {
-        return ByteWriter { out: out };
+        return ByteWriter {
+            array:   out as Array<u8>*,
+            region:  Slice::<u8>::from_raw(null, 0),
+            written: 0,
+        };
+    }
+
+    /// A writer into `region`, from its first byte: a header packed into
+    /// a buffer a C call reads, a digest's output block.
+    public static over(region: Slice<u8>) -> ByteWriter {
+        return ByteWriter { array: null, region: region, written: 0 };
+    }
+
+    /// How many bytes this writer has written - into a region, the offset
+    /// of the next write.
+    public position(&this) -> i64 {
+        return this.written;
     }
 
     public write_u8(mut &this, value: u8) -> void {
-        this.out.push(value);
+        this.put(value);
     }
 
     public write_i8(mut &this, value: i8) -> void {
-        this.out.push(value as u8);
+        this.put(value as u8);
     }
 
     public write_u16_big_endian(mut &this, value: u16) -> void {
@@ -210,7 +233,7 @@ public type struct ByteWriter {
         mut shift: u64 = count * 8;
         while (shift > 0) {
             shift = shift - 8;
-            this.out.push((value >> shift) as u8);
+            this.put((value >> shift) as u8);
         }
     }
 
@@ -219,9 +242,22 @@ public type struct ByteWriter {
         mut rest: u64 = value;
         mut i: u64 = 0;
         while (i < count) {
-            this.out.push(rest as u8);
+            this.put(rest as u8);
             rest = rest >> 8;
             i = i + 1;
         }
+    }
+
+    private put(mut &this, value: u8) -> void {
+        if (this.array != null) {
+            this.array.push(value);
+        } else {
+            if (this.written >= this.region.length()) {
+                core::panic("ByteWriter: write past the end of its region", intrinsics::location());
+            }
+            const at: u8* = this.region.as_ptr();
+            at[this.written] = value;
+        }
+        this.written = this.written + 1;
     }
 }
