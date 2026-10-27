@@ -1,0 +1,130 @@
+/// A payload-less path in a pattern whose leading segments name a type is
+/// answered as the same path written as a value: a constant the type
+/// declares - a primitive's, a struct's, an enum's, one reached through an
+/// alias or an import - is compared against, and a variant of an enum stays
+/// that variant.  A constant that matched every value, or a variant read as
+/// a constant, would fail the check feeding a value it should not match.
+namespace TypePathPatternsCompare::Main;
+
+import std::ffi::libc::{ printf };
+import TypePathPatternsCompare::Gauges::{ Gauge };
+
+type struct Limits {
+    const TOP: i32 = 9;
+    const LOW: i32 = This::TOP - 8;
+}
+
+type Bounds = Limits;
+
+type enum Level { Quiet; Normal; Loud; }
+
+implement enum Level {
+    const DEFAULT: Level = Level::Normal;
+    const COUNT: i32 = 3;
+}
+
+function primitive(n: u32) -> i32 {
+    return match (n) {
+        u32::MAX => { 1 }
+        u32::MIN => { 2 }
+        _        => { 0 }
+    };
+}
+
+function own(n: i32) -> i32 {
+    return match (n) {
+        Bounds::TOP            => { 1 }
+        Limits::LOW | i32::MIN => { 2 }
+        Level::COUNT           => { 3 }
+        _                      => { 0 }
+    };
+}
+
+function in_payload(o: Option<u32>) -> i32 {
+    return match (o) {
+        Option::Some(u32::MAX) => { 1 }
+        Option::Some(_)        => { 2 }
+        Option::None           => { 0 }
+    };
+}
+
+function generic<T>(n: u8, t: T) -> i32 {
+    return match (n) {
+        u8::MAX => { 1 }
+        _       => { 0 }
+    };
+}
+
+function imported(n: i64) -> i32 {
+    return match (n) {
+        Gauge::FULL => { 1 }
+        _           => { 0 }
+    };
+}
+
+function statement(n: u16) -> i32 {
+    mut r: i32 = 0;
+    match (n) {
+        u16::MAX => { r = 7; }
+        _        => { r = 0; }
+    }
+    return r;
+}
+
+function enum_constant(l: Level) -> i32 {
+    return match (l) {
+        Level::DEFAULT => { 1 }
+        _              => { 0 }
+    };
+}
+
+function variant(l: Level) -> i32 {
+    return match (l) {
+        Level::Quiet  => { 1 }
+        Level::Normal => { 2 }
+        Level::Loud   => { 3 }
+    };
+}
+
+function check(passed: mut &i32, total: mut &i32, got: i32, want: i32, what: string) -> void {
+    *total = *total + 1;
+    if (got == want) {
+        *passed = *passed + 1;
+    } else {
+        printf("FAIL %s: got %d, want %d\n", what, got, want);
+    }
+}
+
+function main() -> i32 {
+    mut passed: i32 = 0;
+    mut total: i32 = 0;
+    check(&passed, &total, primitive(4294967295), 1, "a primitive's constant matches its value");
+    check(&passed, &total, primitive(0), 2, "a primitive's second constant");
+    check(&passed, &total, primitive(5), 0, "a primitive's constants do not match another value");
+    check(&passed, &total, own(9), 1, "a struct's constant through an alias");
+    check(&passed, &total, own(1), 2, "a computed constant in an alternative");
+    check(&passed, &total, own(-2147483648), 2, "a primitive's constant in an alternative");
+    check(&passed, &total, own(3), 3, "an enum's integer constant");
+    check(&passed, &total, own(5), 0, "struct constants do not match another value");
+    check(&passed, &total, in_payload(Option::Some(4294967295)), 1, "a primitive's constant in a payload");
+    check(&passed, &total, in_payload(Option::Some(3)), 2, "a payload constant does not match another value");
+    check(&passed, &total, in_payload(Option::None), 0, "a payload constant leaves other variants alone");
+    check(&passed, &total, generic(255, 1), 1, "a primitive's constant in a generic body");
+    check(&passed, &total, generic(254, true), 0, "a generic body's constant does not match another value");
+    check(&passed, &total, generic(255, "x"), 1, "a second copy of the generic body");
+    check(&passed, &total, imported(100), 1, "an imported type's constant");
+    check(&passed, &total, imported(99), 0, "an imported type's constant does not match another value");
+    check(&passed, &total, statement(65535), 7, "a primitive's constant in a match statement");
+    check(&passed, &total, statement(1), 0, "a match statement's constant does not match another value");
+    check(&passed, &total, enum_constant(Level::Normal), 1, "an enum's constant of the enum");
+    check(&passed, &total, enum_constant(Level::Quiet), 0, "an enum's constant does not match another variant");
+    check(&passed, &total, enum_constant(Level::Loud), 0, "an enum's constant does not match a third variant");
+    check(&passed, &total, variant(Level::Quiet), 1, "a variant beside the enum's constants stays a variant");
+    check(&passed, &total, variant(Level::Normal), 2, "a second variant");
+    check(&passed, &total, variant(Level::Loud), 3, "a third variant");
+    check(&passed, &total, primitive(u32::MAX - 1), 0, "one below a primitive's maximum");
+    check(&passed, &total, own(Limits::TOP), 1, "the constant's own value through the type");
+    check(&passed, &total, own(Level::COUNT), 3, "an enum's constant's own value");
+    printf("type path patterns compare: %d of %d checks passed\n", passed, total);
+    return if (passed == total) { 0 } else { 1 };
+}

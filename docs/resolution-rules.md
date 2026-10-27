@@ -451,6 +451,18 @@ yet is recorded with the change that builds it, not here.
      selects the implementation its own types satisfy; a block with no
      parameters applies when the bound holds as written.  (Jake)
 
+619. **A type path in a pattern means what it means as a value.**  A
+     payload-less path whose leading segments name a type (`u32::MAX`,
+     `Limits::TOP`, `Color::Red`) is walked by the name layer as the same
+     path written as a value, and the type layer answers its leaf: a
+     constant the type declares makes it a constant pattern, compared as
+     any other; otherwise it is the variant it names.  The type layer is
+     the only one that can answer, since an alias reaches its target's
+     constants and `implement` blocks in other modules add constants to a
+     type.  Through a type that is no enum, a method leaf is E0113 and a
+     missing leaf E0201, as for a module path.  A primitive type may head
+     a path pattern.  (Jake)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

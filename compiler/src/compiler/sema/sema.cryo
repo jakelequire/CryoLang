@@ -69,7 +69,7 @@ import compiler::ast::expression::{
 import compiler::ast::node::{ ProgramNode };
 import compiler::ast::node_locator::{ annotation_span };
 import compiler::ast::pattern::{
-    EnumPattern, MatchArmNode, Pattern, PatternKind, StaticMatchArmNode
+    ConstantPattern, EnumPattern, MatchArmNode, Pattern, PatternKind, StaticMatchArmNode
 };
 import compiler::ast::statement::{
     AsmBlockStmt, AsmOperand, BlockStmt, DeclStmt, DoWhileStmt, ExprStmt, ForStmt, IfStmt,
@@ -3277,12 +3277,57 @@ type struct SemaVisitor {
                 }
             }
             PatternKind::Enum(e) => {
+                if (e.path != null) {
+                    // `T::NAME` names the constant `T` declares when it
+                    // declares one, as the path does as a value; any other
+                    // leaf stays the variant it is written as.
+                    const scope: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(e.path);
+                    const owner: TypeRef = this.types.scope_qualifier_type(scope);
+                    if (this.path_type_constant(scope, owner).is_valid()) {
+                        this.resolve_expr(e.path);
+                        mut c: ConstantPattern* = ConstantPattern::new(e.variant_name);
+                        c.path = e.path;
+                        c.res.answer(Res::Def(scope.member_def));
+                        pat.kind = PatternKind::Constant(c);
+                        return;
+                    }
+                    const named: Type* = this.types.unwrap_to_enum(owner);
+                    if (named != null && named.kind != TypeKind::Enum) {
+                        this.refuse_type_path_pattern(pat, e, owner);
+                    }
+                    return;
+                }
                 for (mut i: i64 = 0; i < e.elements.length(); i++) {
                     this.resolve_constant_paths(e.sub_at(i));
                 }
             }
             _ => { }
         }
+    }
+
+    /// A payload-less path pattern through a type that is no enum and
+    /// declares no constant by the leaf's name names nothing it can be
+    /// compared against: a method is not a constant, and a missing member is
+    /// missing.  The pattern is kept as a refused constant, so nothing later
+    /// reads it as a variant of the subject.
+    refuse_type_path_pattern(mut &this, pat: Pattern*, e: EnumPattern*, owner: TypeRef) -> void {
+        const written: string = fmt::format("%s::%s",
+            this.intern.resolve(e.enum_name), this.intern.resolve(e.variant_name));
+        if (this.calls.owner_declares_member(owner, e.variant_name)) {
+            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0113_INVALID_PATTERN,
+                fmt::format("`%s` is not a constant, so it cannot be matched against", written));
+            d = d.at_with_label(pat.span, "not a constant");
+            d = d.with_note("a path in a pattern names an enum variant or a constant");
+            this.ctx.emit_diagnostic(d);
+        } else {
+            mut miss: Diagnostic = Diagnostic::error(ErrorCode::E0201_UNDEFINED_VARIABLE,
+                fmt::format("cannot find value `%s` in this scope", written));
+            miss = miss.at_with_label(pat.span, "not found in this scope");
+            this.ctx.emit_diagnostic(miss);
+        }
+        mut c: ConstantPattern* = ConstantPattern::new(e.variant_name);
+        c.res.answer(Res::Err);
+        pat.kind = PatternKind::Constant(c);
     }
 
     resolve_match_expr(mut &this, e: ExpressionNode*, match_expr: MatchExpr*) -> TypeRef {
@@ -4369,14 +4414,9 @@ type struct SemaVisitor {
     /// constant is reached only from its own module (E0353).
     scope_type_constant(mut &this, e: ExpressionNode*, scope: ScopeResolutionExpr*,
                         found: TypeRef) -> TypeRef {
-        if (!found.is_valid()) { return TypeRef::invalid(); }
-        const owner: DefId = this.ctx.decl_index.def_of(found, this.arena);
-        const def: DefId = this.ctx.const_table.type_constant(owner, scope.member_name);
+        const def: DefId = this.path_type_constant(scope, found);
         if (!def.is_valid()) { return TypeRef::invalid(); }
         const entry: GlobalEntry = this.ctx.decl_index.global_entry_of_def(def);
-        // A constant whose type never resolved was refused where it is
-        // declared, and a use of it reports nothing more.
-        if (!entry.valid) { return TypeRef::invalid(); }
         scope.member_def = def;
         scope.resolved_member = MemberPin::Global(entry.slot);
         const constant: VarDecl* = DeclarationNode::var_of(this.ctx.decl_index.declaration_of(def));
@@ -4390,6 +4430,19 @@ type struct SemaVisitor {
             this.ctx.emit_diagnostic(d);
         }
         return entry.type_ref;
+    }
+
+    /// The constant the path `T::NAME` names when `T` is a type (`found`)
+    /// that declares one, or invalid.  A constant whose type never resolved
+    /// was refused where it is declared, and names nothing here.
+    path_type_constant(&this, scope: ScopeResolutionExpr*, found: TypeRef) -> DefId {
+        if (!found.is_valid()) { return DefId::invalid(); }
+        const owner: DefId = this.ctx.decl_index.def_of(found, this.arena);
+        const def: DefId = this.ctx.const_table.type_constant(owner, scope.member_name);
+        if (!def.is_valid() || !this.ctx.decl_index.global_entry_of_def(def).valid) {
+            return DefId::invalid();
+        }
+        return def;
     }
 
     validate_enum_scope_member(mut &this, e: ExpressionNode*, scope_ty: TypeRef, scope: ScopeResolutionExpr*) -> void {

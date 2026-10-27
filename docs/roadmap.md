@@ -341,10 +341,9 @@ Left:
   used as values after v1.0; used as array lengths, not in v1.0;
 - a constant on a generic type (E0247 today), additive, after v1.0;
 - whether a constant may be used where a type argument is expected
-  (open);
-- a type's constant as a pattern (`u32::MAX =>`): a path whose leading
-  segments name a type is read as an enum variant, so it is refused as
-  one today; a module's constant is a pattern already.
+  (open).
+
+A type's constant is a pattern (`u32::MAX =>`), as a module's is.
 
 ## An internal compiler logger
 

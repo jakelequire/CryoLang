@@ -1461,14 +1461,16 @@ A pattern describes the shape of a value. When a value matches, any variables in
 | ------------------- | ------------------------------ | --------------------------------------- |
 | Literal             | `42`, `"hello"`, `true`, `'A'` | Exactly that value.                     |
 | Identifier          | `x`                            | Any value; binds it to `x`.             |
-| Constant            | `LIMIT`, `codes::NOT_FOUND`    | Exactly the constant's value.           |
+| Constant            | `LIMIT`, `codes::NOT_FOUND`, `u32::MAX` | Exactly the constant's value.  |
 | Wildcard            | `_`                            | Any value; discards it.                 |
 | Enum (unit)         | `Color::Red`                   | That variant, no payload.               |
 | Enum (with payload) | `Shape::Circle(r)`             | That variant; binds the payload to `r`. |
 | Range               | `'0'..'9'`                     | Any value in the range (inclusive).     |
 | Or                  | `pat \| pat \| pat`            | Any of the listed patterns.             |
 
-A name in a pattern - on its own or in a payload position - is a constant pattern when it names a constant where the pattern is written, wherever the constant is declared: in the same module, brought in by an import, or reached through a module path (`codes::NOT_FOUND`, `C::NOT_FOUND` through `import codes as C;`). It compares the subject against the constant. Any other name, including a local spelled like a constant, binds. A path naming a function or a `mut` global is refused (`E0113`), and a constant the writer cannot reach is refused as it is anywhere else (`E0353`). A path whose leading segments name a type names an enum variant.
+A name in a pattern - on its own or in a payload position - is a constant pattern when it names a constant where the pattern is written, wherever the constant is declared: in the same module, brought in by an import, or reached through a module path (`codes::NOT_FOUND`, `C::NOT_FOUND` through `import codes as C;`). It compares the subject against the constant. Any other name, including a local spelled like a constant, binds. A path naming a function or a `mut` global is refused (`E0113`), and a constant the writer cannot reach is refused as it is anywhere else (`E0353`).
+
+A payload-less path whose leading segments name a type means what the same path means as a value. A constant the type declares (`u32::MAX`, `Limits::TOP`, an enum's own constant, one reached through an alias of the type) is a constant pattern; a variant of an enum stays that variant. A type cannot declare a constant and another member by one name, so the two never compete. Through a type that is not an enum, a leaf naming no constant is refused: a method is not a constant (`E0113`), and a leaf the type does not declare names nothing (`E0201`).
 
 ```cryo
 import errors::{ NOT_FOUND };
@@ -1476,6 +1478,7 @@ import errors::{ NOT_FOUND };
 match (code) {
     NOT_FOUND           => { 1 }   // compares against errors::NOT_FOUND
     errors::DENIED      => { 2 }   // a qualified constant
+    u32::MAX            => { 4 }   // a constant the type declares
     other               => { 3 }   // not a constant: binds the subject
 }
 ```

@@ -2628,12 +2628,8 @@ type struct NameResolver {
     /// import alias, with that lane's refusals - and is kept on the pattern
     /// for sema to type as one.
     resolve_constant_path_pattern(mut &this, p: Pattern*, node: EnumPattern*) -> void {
-        const path: ExpressionNode* = ExpressionNode::scope_resolution_expr(
-            node.enum_name, node.variant_name, p.span);
-        mut scope: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(path);
-        scope.scope_span = node.enum_span;
-        scope.member_span = node.variant_span;
-        this.walk_expr(path);
+        const path: ExpressionNode* = this.walk_pattern_path(p, node);
+        const scope: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(path);
         mut c: ConstantPattern* = ConstantPattern::new(node.variant_name);
         c.path = path;
         p.kind = PatternKind::Constant(c);
@@ -2664,6 +2660,18 @@ type struct NameResolver {
             return;
         }
         c.res.answer(Res::Def(scope.member_def));
+    }
+
+    /// The payload-less path pattern `node` as the same path written as a
+    /// value, walked as one.
+    walk_pattern_path(mut &this, p: Pattern*, node: EnumPattern*) -> ExpressionNode* {
+        const path: ExpressionNode* = ExpressionNode::scope_resolution_expr(
+            node.enum_name, node.variant_name, p.span);
+        mut scope: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(path);
+        scope.scope_span = node.enum_span;
+        scope.member_span = node.variant_span;
+        this.walk_expr(path);
+        return path;
     }
 
     /// Record a module-level `const NAME = expr;` so its value can be folded.
@@ -4131,7 +4139,13 @@ implement trait Walk for struct NameResolver {
                 return;
             }
             match (prefix) {
-                ResSlot::Answered(r) => { node.set_res(r); }
+                ResSlot::Answered(Res::Err) => { node.set_res(Res::Err); }
+                ResSlot::Answered(r) => {
+                    node.set_res(r);
+                    // A type may declare a constant by the leaf's name, and
+                    // only the type layer can say whether it does.
+                    if (node.elements.length() == 0) { node.path = this.walk_pattern_path(p, node); }
+                }
                 _                    => { }
             }
         }

@@ -426,6 +426,8 @@ Pattern            ::= "_"
                      | Literal
                      | Ident                              (* binding *)
                      | QualName ("(" PatElem ("," PatElem)* ")")?  (* enum *)
+                     | Primitive "::" Ident               (* a primitive's
+                                                             constant, `u32::MAX` *)
                      | RangeBound ".." RangeBound         (* range, both bounds
                                                              same kind: char or
                                                              integer literal *)
@@ -434,6 +436,7 @@ RangeBound         ::= CharLit | "-"? IntLit
    destructuring: `Some(Some(n))`, `Branch(Leaf(x), r)`.                 *)
 PatElem            ::= "_" | "mut"? Ident | Literal
                      | QualName ("(" PatElem ("," PatElem)* ")")?  (* nested *)
+                     | Primitive "::" Ident
 
 
 (*  Types & Literals =========================================== *)
