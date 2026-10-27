@@ -1,0 +1,149 @@
+/// `?` on a `Result` whose error type differs from the enclosing function's
+/// converts the error through `From`: the error arm returns
+/// `Err(F::from(e))`.  Each check reaches the conversion by a different road -
+/// a user error type with two `From` implementations, the standard library's
+/// `From<AllocError> for IoError`, a primitive error type, a generic function
+/// and an `async` function - and an error the function already returns
+/// passes through unchanged.
+namespace TryConvertsErrorThroughFrom::Main;
+
+import std::core::convert::{ From };
+import std::ffi::libc::{ printf };
+import std::alloc::allocator::{ AllocError, AllocErrorKind };
+import std::alloc::layout::{ Layout };
+import std::io::error::{ IoError, IoErrorKind };
+import std::future::{ Sleep };
+import std::time::duration::{ Duration };
+
+type enum LowError { Bad(i32); }
+
+type enum MiddleError { Middle(i32); }
+
+type enum HighError { FromLow(i32); FromMiddle(i32); Own; }
+
+implement trait From<LowError> for enum HighError {
+    static from(value: LowError) -> HighError {
+        match (value) {
+            LowError::Bad(code) => { return HighError::FromLow(code); }
+        }
+    }
+}
+
+implement trait From<MiddleError> for enum HighError {
+    static from(value: MiddleError) -> HighError {
+        match (value) {
+            MiddleError::Middle(code) => { return HighError::FromMiddle(code); }
+        }
+    }
+}
+
+function low(fail: boolean) -> Result<i32, LowError> {
+    if (fail) { return Result::Err(LowError::Bad(7)); }
+    return Result::Ok(5);
+}
+
+function middle(fail: boolean) -> Result<i32, MiddleError> {
+    if (fail) { return Result::Err(MiddleError::Middle(9)); }
+    return Result::Ok(6);
+}
+
+function own(fail: boolean) -> Result<i32, HighError> {
+    if (fail) { return Result::Err(HighError::Own); }
+    return Result::Ok(4);
+}
+
+function high(fail_low: boolean, fail_middle: boolean, fail_own: boolean) -> Result<i32, HighError> {
+    const a: i32 = low(fail_low)?;
+    const b: i32 = middle(fail_middle)?;
+    const c: i32 = own(fail_own)?;
+    return Result::Ok(a + b + c);
+}
+
+function allocate(fail: boolean) -> Result<i32, AllocError> {
+    if (fail) { return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, Layout::new(64, 8))); }
+    return Result::Ok(3);
+}
+
+function read_buffer(fail: boolean) -> Result<i32, IoError> {
+    const n: i32 = allocate(fail)?;
+    return Result::Ok(n * 2);
+}
+
+implement trait From<LowError> for i64 {
+    static from(value: LowError) -> i64 {
+        match (value) {
+            LowError::Bad(code) => { return (code as i64) * -1; }
+        }
+    }
+}
+
+function status(fail: boolean) -> Result<i32, i64> {
+    const n: i32 = low(fail)?;
+    return Result::Ok(n + 1);
+}
+
+function lift<T>(value: Result<T, LowError>) -> Result<T, HighError> {
+    return Result::Ok(value?);
+}
+
+async function later(fail: boolean) -> Result<i32, HighError> {
+    await Sleep::new(Duration::from_millis(1));
+    const n: i32 = low(fail)?;
+    return Result::Ok(n * 10);
+}
+
+function check(passed: i32, condition: boolean, what: string) -> i32 {
+    if (!condition) {
+        printf("FAILED: %s\n", what);
+        return passed;
+    }
+    return passed + 1;
+}
+
+async function main() -> i32 {
+    mut passed: i32 = 0;
+
+    passed = check(passed, match (high(false, false, false)) {
+        Result::Ok(v) => { v == 15 }
+        Result::Err(_) => { false }
+    }, "every operand succeeds");
+
+    passed = check(passed, match (high(true, false, false)) {
+        Result::Err(HighError::FromLow(code)) => { code == 7 }
+        _ => { false }
+    }, "a LowError is converted by From<LowError>");
+
+    passed = check(passed, match (high(false, true, false)) {
+        Result::Err(HighError::FromMiddle(code)) => { code == 9 }
+        _ => { false }
+    }, "a MiddleError is converted by From<MiddleError>");
+
+    passed = check(passed, match (high(false, false, true)) {
+        Result::Err(HighError::Own) => { true }
+        _ => { false }
+    }, "the function's own error passes through unchanged");
+
+    passed = check(passed, match (read_buffer(true)) {
+        Result::Err(e) => { e.kind == IoErrorKind::OutOfMemory }
+        Result::Ok(_) => { false }
+    }, "an AllocError becomes an IoError");
+
+    passed = check(passed, match (status(true)) {
+        Result::Err(code) => { code == -7 }
+        Result::Ok(_) => { false }
+    }, "a LowError is converted into a primitive error type");
+
+    passed = check(passed, match (lift(low(true))) {
+        Result::Err(HighError::FromLow(code)) => { code == 7 }
+        _ => { false }
+    }, "a generic function converts");
+
+    passed = check(passed, match (await later(true)) {
+        Result::Err(HighError::FromLow(code)) => { code == 7 }
+        _ => { false }
+    }, "an async function converts");
+
+    printf("try converts errors through From: %d of 8 checks passed\n", passed);
+    if (passed != 8) { return 1; }
+    return 0;
+}

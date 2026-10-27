@@ -429,8 +429,10 @@ Left over from that: the async entry point calls `Executor::new` and
    private, behind `encode`, `decode` and `sha1`.  `net::sys` is public
    but for its own helpers, and `net::addr`, `dns` and `http` are marked
    item by item (597), and the rest of `net` (599) - HTTP/2, HTTPS,
-   sockets, TLS and WebSocket - but for the HTTP/1 `push_all`, which
-   waits on whether `?` converts an error.
+   sockets, TLS and WebSocket - so all of `net` is marked: its three
+   private `push_all` copies are gone, the encoders writing
+   `out.try_append(bytes)?` now that `?` converts an allocation error
+   into an I/O error through `From` (601).
    A struct member's keyword follows its directives (598), and the
    attributed accessors (`length`, `capacity`, `Str::new`,
    `String::from_string`, `Location`'s four) are public.  HPACK
@@ -594,6 +596,11 @@ language's features; each is a branch of its own after the merge.
 - **A reference-mutability check**, run before the async lowering (D37).
 - **The `raw` subcommand builds a module graph** as `check` and `build` do
   (D60).
+- **A checked conversion from an integer to an enum.**  `op as u8` reads an
+  enum's discriminant; nothing turns a `u8` back into a variant without a
+  hand-written `match`, so every wire format with an enum (WebSocket's
+  opcodes, HTTP/2's frame types) carries its own `op_from_u8`.  The
+  conversion answers `Option` (or `TryFrom`) for a value no variant holds.
 
 ## Paths through generic type aliases
 
