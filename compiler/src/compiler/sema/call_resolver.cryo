@@ -59,7 +59,7 @@ import compiler::ast::expression::{
     ArrayExpr, BinaryExpr, CallExpr, ExpressionNode, IdentifierExpr, LiteralExpr,
     MemberAccessExpr, ScopeResolutionExpr, UnaryExpr
 };
-import compiler::lex::{ TokenType };
+import compiler::lex::{ Token, TokenType };
 import compiler::sema::sema::{ ObjectConversionOutcome, SemaVisitor };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
@@ -913,6 +913,68 @@ type struct CallResolver {
         return out;
     }
 
+    /// An f-string written directly as an argument whose parameter is
+    /// `fmt::Arguments` records its pieces for the callee instead of
+    /// building a `String`: each `String` builder of its lowering is
+    /// replaced by the builder that records the same piece
+    /// (`LangItem::pieces_builder`), and the chain of pieces is borrowed by
+    /// `format_arguments_new`, which makes the `fmt::Arguments`.  The holes
+    /// are borrowed as the `String` builders borrow them, so they are read
+    /// when the callee writes the arguments, before the call returns.  Any
+    /// other argument, and an f-string anywhere else, is `argument` itself.
+    format_arguments_of(mut &this, argument: ExpressionNode*, slot: TypeRef) -> ExpressionNode* {
+        if (argument == null || !slot.is_valid()) { return argument; }
+        const registry: GenericRegistry* = this.ctx.get_generic_registry();
+        const arguments_def: DefId = registry.wellknown(LangItem::FormatArguments);
+        const make_def: DefId = registry.wellknown(LangItem::FormatArgumentsNew);
+        if (!arguments_def.is_valid() || !make_def.is_valid()) { return argument; }
+        if (!slot.equals(this.ctx.decl_index.type_of_def(arguments_def))) { return argument; }
+        if (!this.records_pieces(argument, registry, false)) { return argument; }
+        this.records_pieces(argument, registry, true);
+        const span: SourceSpan = argument.span;
+        const amp: Token = Token::new(TokenType::Amp, "&", span.start_line as int, span.start_col as int);
+        mut borrowed: ExpressionNode* = ExpressionNode::synthetic_unary(amp, argument, span);
+        borrowed.generated = true;
+        mut make: ExpressionNode* = ExpressionNode::identifier_expr(this.ctx.defs.leaf_of(make_def).spelling(), span);
+        make.generated = true;
+        ExpressionNode::identifier_of(make).res = ResSlot::Answered(Res::Def(make_def));
+        mut wrapped: ExpressionNode* = ExpressionNode::call_expr(make, span);
+        wrapped.generated = true;
+        ExpressionNode::call_of(wrapped).add_argument(borrowed);
+        return wrapped;
+    }
+
+    /// Whether `e` is an f-string's lowering: a call of a `String` builder,
+    /// written by the compiler, whose first argument is the lowering of the
+    /// text before it, down to the call that starts the `String`.  With
+    /// `replace`, each builder is replaced by its pieces builder, every
+    /// one claimed; without, only asks, so a chain is replaced whole or not
+    /// at all.
+    records_pieces(mut &this, e: ExpressionNode*, registry: GenericRegistry*, replace: boolean) -> boolean {
+        if (e == null || !e.generated) { return false; }
+        const call: CallExpr* = ExpressionNode::call_of(e);
+        if (call == null || call.callee == null) { return false; }
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(call.callee);
+        if (id == null) { return false; }
+        const callee: DefId = this.callee_def(id);
+        if (!callee.is_valid()) { return false; }
+        const items: [LangItem] = LangItem::all();
+        for (mut k: i64 = 0; k < items.length(); k++) {
+            const pieces_item: Option<LangItem> = items[k].pieces_builder();
+            if (pieces_item.is_none() || !callee.equals(registry.wellknown(items[k]))) { continue; }
+            const pieces: DefId = registry.wellknown(pieces_item.unwrap());
+            if (!pieces.is_valid()) { return false; }
+            if (replace) {
+                id.name = this.ctx.defs.leaf_of(pieces).spelling();
+                id.res = ResSlot::Answered(Res::Def(pieces));
+            }
+            // The builder that starts the `String` takes no text before it.
+            if (call.arguments.length() == 0) { return true; }
+            return this.records_pieces(call.arguments[0], registry, replace);
+        }
+        return false;
+    }
+
     resolve_call(mut &this, visitor: SemaVisitor*, call_e: ExpressionNode*, call: CallExpr*) -> TypeRef {
         // Closure-call rewrite: `f(args)` where `f` is a closure-struct value.
         this.lambda.maybe_rewrite_closure_call(call);
@@ -1002,12 +1064,13 @@ type struct CallResolver {
         for (mut i: i64 = 0; i < call.arguments.length(); i++) {
             mut push_expected: boolean = false;
             if (i < forced_expected.length() && forced_expected[i]) { push_expected = true; }
-            const arg: ExpressionNode* = call.arguments[i];
             // The slot this argument actually binds: the owner-substituted view
             // where there is one, the declared type otherwise.
             mut slot: TypeRef = TypeRef::invalid();
             if (i < param_types.length()) { slot = param_types[i]; }
             if (i < owner_hints.length() && owner_hints[i].is_valid()) { slot = owner_hints[i]; }
+            call.arguments[i] = this.format_arguments_of(call.arguments[i], slot);
+            const arg: ExpressionNode* = call.arguments[i];
             // A slot naming the callee's own parameters (`d: Option<T>`
             // before `T` is inferred) is no type in this body; the argument
             // types itself, and its type is what infers `T`.  Its array kind
@@ -4989,9 +5052,10 @@ type struct CallResolver {
 
     /// Whether an argument of type `arg` binds to a parameter of `object`'s
     /// type: it has the object's form, and its value's type implements the
-    /// object's trait, or is a type parameter, whose conversion the argument
-    /// check refuses (`SemaVisitor::convert_to_object`, which makes the
-    /// conversion and checks the rest of what the table needs).
+    /// object's trait, or names a type parameter, whose conversion the
+    /// argument check accepts or refuses (`SemaVisitor::convert_to_object`,
+    /// which makes the conversion and checks the rest of what the table
+    /// needs).
     converts_to_object(&this, object: ObjectType*, arg: TypeRef) -> boolean {
         const checker: TraitChecker = this.trait_checker();
         const value: TypeRef = checker.object_value(object, arg);

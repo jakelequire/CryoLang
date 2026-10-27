@@ -43,7 +43,7 @@ import compiler::ast::expression::{
     CalleePin,
     CallExpr,
     ExprKind, ExpressionNode, IdentifierExpr,
-    MemberAccessExpr, ScopeResolutionExpr
+    MemberAccessExpr, ObjectConversionExpr, ScopeResolutionExpr
 };
 import compiler::ast::node::{ ProgramNode };
 import compiler::ast::pattern::{ MatchArmNode, StaticMatchArmNode };
@@ -51,7 +51,7 @@ import compiler::ast::statement::{ Stmt, StmtKind };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::sink::{ DiagnosticSink };
 import compiler::mono::ast_resolver::{ MonoAstResolver };
-import compiler::mono::state::{ MonoState, SpecializationEntry };
+import compiler::mono::state::{ MonoState, SettledObjectConversion, SpecializationEntry };
 import compiler::mono::trait_specializer::{ MonoTraitSpecializer };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::res::{ FamilyOwner, Res, ResBase, ResSlot };
@@ -62,7 +62,7 @@ import compiler::resolver::mangled_name::{ MangleContext };
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{
-    ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
+    ArrayType, FunctionType, ObjectType, OptionalType, PointerType, ReferenceType, TupleType
 };
 import compiler::types::generic::{ InstantiatedType };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry, TemplateKind };
@@ -422,7 +422,10 @@ type struct MonoCallSpecializer {
                 this.walk_expr(te.false_expr, res_ctx, subst);
             }
             ExprKind::Cast(ce) => { this.walk_expr(ce.expression, res_ctx, subst); }
-            ExprKind::ObjectConversion(oc) => { this.walk_expr(oc.operand, res_ctx, subst); }
+            ExprKind::ObjectConversion(oc) => {
+                this.walk_expr(oc.operand, res_ctx, subst);
+                this.settle_object_conversion(expr, oc, subst);
+            }
             ExprKind::ArrayAccess(aa) => {
                 this.walk_expr(aa.array, res_ctx, subst);
                 this.walk_expr(aa.index, res_ctx, subst);
@@ -2549,6 +2552,47 @@ type struct MonoCallSpecializer {
             }
             _ => { null }
         };
+    }
+
+
+    /// A conversion to a trait object whose value's type named the generic
+    /// body's parameters, which the type check accepted because every copy's
+    /// type implements the trait (`SemaVisitor::implemented_in_every_copy`):
+    /// in this copy, its value's type is the copy's own (written by the
+    /// substituter that made the copy, or `subst`'s), and the conversion
+    /// names that type's implementation and table, recorded for the
+    /// compilation context to register.  A conversion sema settled, and the
+    /// template's own body, which is never emitted, are left as they are.
+    settle_object_conversion(mut &this, e: ExpressionNode*, oc: ObjectConversionExpr*,
+                             subst: TypeSubstitution*) -> void {
+        if (oc.implementation != null) { return; }
+        const value: TypeRef = if (subst != null) { subst.apply(oc.source, this.arena) } else { oc.source };
+        if (!value.is_valid() || this.arena.contains_generic_param(value)) { return; }
+        const object_t: Type* = this.arena.lookup(
+            if (subst != null) { subst.apply(e.resolved_type, this.arena) } else { e.resolved_type });
+        if (object_t == null || object_t.kind != TypeKind::Object) { return; }
+        const object: ObjectType* = object_t.as_object();
+        const checker: TraitChecker = TraitChecker::new(
+            this.arena, this.generic_registry, this.intern_table, this.diagnostics);
+        const implementation: DeclarationNode* = checker.object_implementation(object, value);
+        mut blocks: [ImplBlock*] = [];
+        if (implementation == null
+                || this.type_resolver.object_table_blocks(object, value, DeclarationNode::impl_of(implementation),
+                    &blocks).is_valid()) {
+            this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                fmt::format("`%s` has no implementation of `%s` in this copy of a generic body",
+                    this.arena.format_display(this.arena.lookup(value)), this.arena.format_display(object_t)))
+                .at(e.span));
+            this.state.error_count += 1;
+            return;
+        }
+        oc.source = value;
+        oc.implementation = DeclarationNode::impl_of(implementation);
+        this.state.settled_objects.push(SettledObjectConversion {
+            implementation: implementation,
+            value:          value,
+            blocks:         blocks,
+        });
     }
 
 

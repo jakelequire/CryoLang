@@ -2893,9 +2893,25 @@ type struct SemaVisitor {
             shown_to
         };
         if (this.arena.contains_generic_param(value)) {
-            this.ctx.emit_error_at(ErrorCode::E0315_OBJECT_CONVERSION,
-                fmt::format("`%s` cannot become `%s`: `%s` is a type parameter, whose implementation of `%s` is not known here",
-                    shown_from, shown_to, shown_value, shown_trait), expr.span);
+            // Each copy of the body has the table of its own type; which one
+            // is settled where monomorphization makes the copy.
+            if (this.implemented_in_every_copy(object, value)) {
+                return ObjectConversionOutcome::Converted(ExpressionNode::object_conversion(expr, value, null, to));
+            }
+            if (value_t.kind != TypeKind::GenericParam) {
+                this.ctx.emit_error_at(ErrorCode::E0315_OBJECT_CONVERSION,
+                    fmt::format("`%s` cannot become `%s`: `%s` names a type parameter, so whether it implements `%s` is not known here",
+                        shown_from, shown_to, shown_value, shown_trait), expr.span);
+                return ObjectConversionOutcome::Refused;
+            }
+            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0315_OBJECT_CONVERSION,
+                fmt::format("`%s` cannot become `%s`: `%s` is a type parameter, and no bound in scope says it implements `%s`",
+                    shown_from, shown_to, shown_value, shown_trait));
+            d = d.at(expr.span);
+            if (!this.arena.is_this_placeholder(value_t.as_generic_param())) {
+                d = d.help(fmt::format("bound it where it is declared: `where %s: %s`", shown_value, shown_trait));
+            }
+            this.ctx.emit_diagnostic(d);
             return ObjectConversionOutcome::Refused;
         }
         const implementation: DeclarationNode* = checker.object_implementation(object, value);
@@ -2911,49 +2927,52 @@ type struct SemaVisitor {
                 shown_value, shown_trait)) {
             return ObjectConversionOutcome::Refused;
         }
-        // A generic implementation's table is its copy's for the value's
-        // type, which monomorphization makes.
-        if (this.ctx.generic_registry.implementation_is_copied(block)) {
-            this.ctx.note_object_instance(implementation, value, blocks);
-        } else {
-            this.ctx.note_object_table(implementation, blocks, this.intern.intern(implementation.source_file));
-        }
+        this.ctx.note_object_conversion(implementation, value, blocks);
         return ObjectConversionOutcome::Converted(ExpressionNode::object_conversion(expr, value, block, to));
+    }
+
+    /// Whether every copy of the generic body being walked has an
+    /// implementation of `object`'s trait, at the object's arguments, for
+    /// `value`, a type that still names parameters: a type parameter whose
+    /// own bound names the trait at those arguments; `This` in a default of
+    /// the trait itself; and the receiver's type in a method of an
+    /// implementation of the trait that is walked over parameters - a
+    /// generic implementation, or one written for an instantiation, walked
+    /// over its template's.  Anything else is not known to implement the
+    /// trait in every copy.
+    implemented_in_every_copy(mut &this, object: ObjectType*, value: TypeRef) -> boolean {
+        const value_t: Type* = this.arena.lookup(value);
+        if (value_t == null) { return false; }
+        if (value_t.kind == TypeKind::GenericParam) {
+            const param: GenericParamType* = value_t.as_generic_param();
+            if (this.arena.is_this_placeholder(param)) {
+                return object.args.length() == 0 && this.state.symbolic_trait.equals(object.trait_type);
+            }
+            return this.binding.param_bound_gives_at(param, object.trait_def, &object.args);
+        }
+        const node: ImplBlock* = this.state.symbolic_impl_node;
+        if (node == null || !node.trait_def.equals(object.trait_def)) { return false; }
+        if (!value.equals(this.state.this_type)) { return false; }
+        return this.ctx.generic_registry.binds_trait_arguments(node, &object.args, this.intern);
     }
 
     /// The implementation for `value` of each trait the table of an object
     /// of `object`'s trait holds methods of, in the table's order, `own`
-    /// in the object's trait's place.  A supertrait's methods are in the
-    /// table too, so the type must implement each supertrait, at the
-    /// arguments the object gives it (`TypeResolver::object_trait_arguments`);
-    /// false, with E0315 reported, when it does not.
+    /// in the object's trait's place (`TypeResolver::object_table_blocks`);
+    /// false, with E0315 reported, when it does not implement a supertrait
+    /// the table holds methods of.
     object_table_implementations(mut &this, expr: ExpressionNode*, object: ObjectType*, value: TypeRef,
                                  own: ImplBlock*, blocks: mut &[ImplBlock*], shown_from: string,
                                  shown_to: string, shown_value: string, shown_trait: string) -> boolean {
-        const registry: GenericRegistry* = this.ctx.generic_registry;
-        const traits: [DefId] = registry.object_table_traits(object.trait_def);
-        const checker: TraitChecker = this.trait_checker();
-        for (mut k: i64 = 0; k < traits.length(); k++) {
-            if (traits[k].equals(object.trait_def)) { blocks.push(own); continue; }
-            const args: [TypeRef] = this.ctx.type_resolver.object_trait_arguments(object, traits[k]);
-            const shown_super: string = this.arena.display_with_arguments(
-                this.intern.resolve(this.ctx.defs.path_of(traits[k]).spelling()), &args);
-            const heads: [DeclarationNode*] = registry.heads_for(traits[k], value, this.intern);
-            mut found: ImplBlock* = null;
-            for (mut i: i64 = 0; i < heads.length(); i++) {
-                const candidate: ImplBlock* = DeclarationNode::impl_of(heads[i]);
-                if (candidate == null || !registry.binds_trait_arguments(candidate, &args, this.intern)) { continue; }
-                if (checker.impl_applies(candidate, value, 0)) { found = candidate; break; }
-            }
-            if (found == null) {
-                this.ctx.emit_error_at(ErrorCode::E0315_OBJECT_CONVERSION,
-                    fmt::format("`%s` does not implement `%s`, which `%s` requires, so `%s` cannot become `%s`",
-                        shown_value, shown_super, shown_trait, shown_from, shown_to), expr.span);
-                return false;
-            }
-            blocks.push(found);
-        }
-        return true;
+        const missing: DefId = this.ctx.type_resolver.object_table_blocks(object, value, own, blocks);
+        if (!missing.is_valid()) { return true; }
+        const args: [TypeRef] = this.ctx.type_resolver.object_trait_arguments(object, missing);
+        const shown_super: string = this.arena.display_with_arguments(
+            this.intern.resolve(this.ctx.defs.path_of(missing).spelling()), &args);
+        this.ctx.emit_error_at(ErrorCode::E0315_OBJECT_CONVERSION,
+            fmt::format("`%s` does not implement `%s`, which `%s` requires, so `%s` cannot become `%s`",
+                shown_value, shown_super, shown_trait, shown_from, shown_to), expr.span);
+        return false;
     }
 
     /// A binary operator with a trait object on either side, checked here

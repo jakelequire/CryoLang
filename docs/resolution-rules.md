@@ -238,6 +238,23 @@ yet is recorded with the change that builds it, not here.
      the types and the compressed form; the URL's port and userinfo and
      the bare status code delegated)
 
+606. **A bounded type parameter converts to a trait object.**  In a
+     generic body, a value whose type names a parameter becomes a trait
+     object where every copy of the body has an implementation of the
+     trait for it: a type parameter whose own bound names the trait at
+     the object's arguments (`where W: FmtWrite`), `This` in a default
+     of that trait itself, and the receiver of an implementation of the
+     trait whose methods are checked over parameters - a generic
+     implementation, or one written for an instantiation.  The template
+     is checked once and the conversion is settled in each copy, which
+     takes the table of its own type.  Anything else naming a parameter -
+     no bound, a bound naming another trait, `This` in another trait's
+     default - is E0315, and for a parameter the help names the bound to
+     add.  A supertrait's object, and an instantiation over a parameter
+     whose implementation holds for every argument, are not converted
+     yet.  (delegated; needed for `FmtWrite.write`, a default that makes
+     a `Formatter` over its receiver)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

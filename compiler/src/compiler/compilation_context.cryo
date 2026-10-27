@@ -12,6 +12,7 @@ import compiler::diag::{ config, diagnostic, ErrorCode, renderer, severity, sink
 import compiler::passes::pass_id::{ ProvisionSet };
 import compiler::types::{ type_ref, arena, resolver, generic_registry };
 import compiler::mono::monomorphizer::{ Monomorphizer };
+import compiler::mono::state::{ SettledObjectConversion };
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, resolver };
 import compiler::resolver::res::{ DeclVisibility, DefId, DefTable, DefKind, FamilyOwner, ResBase };
 import compiler::ast::node::{ Node };
@@ -588,6 +589,18 @@ public:
         this.object_tables.push(ObjectTableRef { decl: implementation, owner_source: owner_source });
     }
 
+    /// Record that a conversion names `implementation` for a value of
+    /// `value`'s type: its table, or for a generic implementation the table
+    /// of its copy for that type, which monomorphization makes.  `blocks` as
+    /// `note_object_table` takes them.
+    note_object_conversion(mut &this, implementation: DeclarationNode*, value: TypeRef, blocks: [ImplBlock*]) -> void {
+        if (this.generic_registry.implementation_is_copied(DeclarationNode::impl_of(implementation))) {
+            this.note_object_instance(implementation, value, blocks);
+            return;
+        }
+        this.note_object_table(implementation, blocks, this.intern_table.intern(implementation.source_file));
+    }
+
     /// Record that a conversion names the generic `implementation` for a
     /// value of `value`'s type; `blocks` as `note_object_table` takes them.
     note_object_instance(mut &this, implementation: DeclarationNode*, value: TypeRef, blocks: [ImplBlock*]) -> void {
@@ -610,8 +623,17 @@ public:
     /// in the module the specialization is placed in.  A value's type that
     /// no specialization copied leaves the implementation without a copy,
     /// and code generation of a conversion naming it is an internal error.
+    ///
+    /// The conversions monomorphization settled in copies of generic bodies
+    /// are recorded first, as sema records its own.
     settle_object_instances(mut &this) -> void {
         if (this.monomorphizer == null) { return; }
+        for (mut i: i64 = 0; i < this.monomorphizer.state.settled_objects.length(); i++) {
+            const settled: SettledObjectConversion* = &this.monomorphizer.state.settled_objects[i];
+            mut blocks: [ImplBlock*] = [];
+            for (mut k: i64 = 0; k < settled.blocks.length(); k++) { blocks.push(settled.blocks[k]); }
+            this.note_object_conversion(settled.implementation, settled.value, blocks);
+        }
         for (mut i: i64 = 0; i < this.object_instance_demands.length(); i++) {
             const demand: ObjectInstanceDemand* = &this.object_instance_demands[i];
             const template: ImplBlock* = DeclarationNode::impl_of(demand.implementation);

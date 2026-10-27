@@ -1,12 +1,24 @@
-// E0315: a value of a type parameter does not convert to a trait object,
-// because its implementation is not known in the generic body; a value of
-// an instantiation, whose implementation is generic, does.
+// E0315: a value whose type is a type parameter converts to a trait object
+// only where a bound in scope says it implements the trait, so every copy
+// of the body has a table for it.  A parameter with no bound, one bounded
+// by another trait, and `This` in a default of another trait are refused.
+// A value of an instantiation, whose implementation is generic, converts.
 ![config(testing)]
 ![config(negative, E0315)]
 namespace CryoTests::Negative::ObjectConversionGeneric;
 
 type trait Shape {
     area(&this) -> i32;
+}
+
+type trait Named {
+    name_length(&this) -> i32;
+
+    shaped_area(&this) -> i32 {
+        const s: virtual &Shape = &this;
+        //~^ ERROR[E0315] `&This` cannot become `virtual &CryoTests::Negative::ObjectConversionGeneric::Shape`: `This` is a type parameter, and no bound in scope says it implements `CryoTests::Negative::ObjectConversionGeneric::Shape`
+        return s.area();
+    }
 }
 
 type struct Wrap<T> {
@@ -17,14 +29,20 @@ implement<T> trait Shape for Wrap<T> {
     area(&this) -> i32 { return 1; }
 }
 
-function convert<T>(x: &T) -> i32 where T: Shape {
+function unbounded<T>(x: &T) -> i32 {
     const s: virtual &Shape = x;
-    //~^ ERROR[E0315] `&T` cannot become `virtual &CryoTests::Negative::ObjectConversionGeneric::Shape`: `T` is a type parameter, whose implementation of `CryoTests::Negative::ObjectConversionGeneric::Shape` is not known here
+    //~^ ERROR[E0315] `&T` cannot become `virtual &CryoTests::Negative::ObjectConversionGeneric::Shape`: `T` is a type parameter, and no bound in scope says it implements `CryoTests::Negative::ObjectConversionGeneric::Shape`
+    return 0;
+}
+
+function bounded_by_another<T>(x: &T) -> i32 where T: Named {
+    const s: virtual &Shape = x;
+    //~^ ERROR[E0315] `&T` cannot become `virtual &CryoTests::Negative::ObjectConversionGeneric::Shape`: `T` is a type parameter, and no bound in scope says it implements `CryoTests::Negative::ObjectConversionGeneric::Shape`
     return 0;
 }
 
 function main() -> int {
     const w: Wrap<i32> = Wrap::<i32> { value: 1 };
     const s: virtual &Shape = &w;
-    return s.area() + convert(&w);
+    return s.area() + unbounded(&w);
 }

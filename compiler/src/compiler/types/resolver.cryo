@@ -365,6 +365,35 @@ type struct TypeResolver {
         return out;
     }
 
+    /// The implementation for `value` of each trait the table of an object
+    /// of `object`'s trait holds methods of, in the table's order, `own`
+    /// in the object's trait's place, pushed onto `blocks`.  A supertrait's
+    /// methods are in the table too, so the type must implement each
+    /// supertrait at the arguments the object gives it
+    /// (`object_trait_arguments`).  The first supertrait it does not
+    /// implement, or invalid when it implements every one.
+    object_table_blocks(&this, object: ObjectType*, value: TypeRef, own: ImplBlock*,
+                        blocks: mut &[ImplBlock*]) -> DefId {
+        const registry: GenericRegistry* = this.generic_registry;
+        const traits: [DefId] = registry.object_table_traits(object.trait_def);
+        const checker: TraitChecker = TraitChecker::new(
+            this.arena, this.generic_registry, this.intern_table, this.diagnostics);
+        for (mut k: i64 = 0; k < traits.length(); k++) {
+            if (traits[k].equals(object.trait_def)) { blocks.push(own); continue; }
+            const args: [TypeRef] = this.object_trait_arguments(object, traits[k]);
+            const heads: [DeclarationNode*] = registry.heads_for(traits[k], value, this.intern_table);
+            mut found: ImplBlock* = null;
+            for (mut i: i64 = 0; i < heads.length(); i++) {
+                const candidate: ImplBlock* = DeclarationNode::impl_of(heads[i]);
+                if (candidate == null || !registry.binds_trait_arguments(candidate, &args, this.intern_table)) { continue; }
+                if (checker.impl_applies(candidate, value, 0)) { found = candidate; break; }
+            }
+            if (found == null) { return traits[k]; }
+            blocks.push(found);
+        }
+        return DefId::invalid();
+    }
+
     trait_arguments_along(&this, trait_def: DefId, args: &[TypeRef], declaring: DefId,
                           open: mut &[DefId], out: mut &[TypeRef]) -> boolean {
         const decl: TraitDecl* = this.generic_registry.get_trait_decl(trait_def);
