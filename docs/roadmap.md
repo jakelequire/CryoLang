@@ -729,6 +729,4 @@ a cast to reach it.
   On an `implement` block or a type declaration such a bound is parsed and
   stamped, but the instantiation checks (`TraitChecker::bounds_satisfied*`)
   look its subject up as a parameter and find none, so what it does there
-  is untested and unspecified.  The
-  impl-qualified path `(From<E> for HighError)::from(e)` is not directed by
-  a bound either.  Both are open.
+  is untested and unspecified.  Open.

@@ -1,0 +1,110 @@
+/// A type's own method outranks a trait's method of the same name, and a
+/// `where` bound on the type does not change that: under `where HighError:
+/// From<E>`, `HighError::from(e)` calls `HighError`'s own `from`.  The
+/// impl-qualified path `(From<E> for HighError)::from(e)` names the trait's
+/// method through the bound, and each instantiation calls the implementation
+/// its own `E` selects.  The same holds for a method call on an instantiation
+/// of a generic type, `wrapper.describe()` under `where Wrapper<T>: Describe`,
+/// and outside any generic body.  A `?` converts through `From` whatever
+/// other `from` the type declares.
+namespace WhereBoundOwnMethodFirst::Main;
+
+import std::core::convert::{ From };
+import std::ffi::libc::{ printf };
+
+type enum LowError { Bad(i32); }
+
+type enum MiddleError { Middle(i32); }
+
+type struct HighError {
+    code: i32;
+
+    static from<X>(value: X) -> HighError { return HighError { code: 1 }; }
+}
+
+implement trait From<LowError> for struct HighError {
+    static from(value: LowError) -> HighError {
+        match (value) { LowError::Bad(code) => { return HighError { code: 100 + code }; } }
+    }
+}
+
+implement trait From<MiddleError> for struct HighError {
+    static from(value: MiddleError) -> HighError {
+        match (value) { MiddleError::Middle(code) => { return HighError { code: 200 + code }; } }
+    }
+}
+
+function own<E>(error: E) -> HighError where HighError: From<E> {
+    return HighError::from(error);
+}
+
+function through_trait<E>(error: E) -> HighError where HighError: From<E> {
+    return (From<E> for HighError)::from(error);
+}
+
+function lift<E>(result: Result<i32, E>) -> Result<i32, HighError> where HighError: From<E> {
+    const value: i32 = result?;
+    return Result::Ok(value);
+}
+
+type trait Describe { describe(&this) -> i32; }
+
+type struct Wrapper<T> {
+    value: T;
+
+    describe(&this) -> i32 { return 1; }
+}
+
+implement trait Describe for struct Wrapper<i32> { describe(&this) -> i32 { return 2; } }
+
+implement trait Describe for struct Wrapper<i64> { describe(&this) -> i32 { return 3; } }
+
+function describe_own<T>(wrapper: &Wrapper<T>) -> i32 where Wrapper<T>: Describe {
+    return wrapper.describe();
+}
+
+function describe_through_trait<T>(wrapper: &Wrapper<T>) -> i32 where Wrapper<T>: Describe {
+    return (Describe for Wrapper<T>)::describe(wrapper);
+}
+
+function check(passed: i32, ok: boolean, what: string) -> i32 {
+    if (!ok) {
+        printf("FAILED: %s\n", what);
+        return passed;
+    }
+    return passed + 1;
+}
+
+function lifted_code(result: Result<i32, HighError>) -> i32 {
+    match (result) {
+        Result::Ok(_)      => { return -1; }
+        Result::Err(error) => { return error.code; }
+    }
+}
+
+function main() -> i32 {
+    mut passed: i32 = 0;
+    passed = check(passed, own(LowError::Bad(3)).code == 1, "a path under the bound calls the own `from` for LowError");
+    passed = check(passed, own(MiddleError::Middle(4)).code == 1, "a path under the bound calls the own `from` for MiddleError");
+    passed = check(passed, through_trait(LowError::Bad(3)).code == 103,
+        "the impl-qualified path under the bound calls From<LowError>");
+    passed = check(passed, through_trait(MiddleError::Middle(4)).code == 204,
+        "the impl-qualified path under the bound calls From<MiddleError>");
+    const low: Result<i32, LowError> = Result::Err(LowError::Bad(5));
+    passed = check(passed, lifted_code(lift(low)) == 105, "`?` converts through From<LowError>");
+    passed = check(passed, HighError::from(LowError::Bad(6)).code == 1, "a path outside a generic body calls the own `from`");
+    passed = check(passed, (From<LowError> for HighError)::from(LowError::Bad(6)).code == 106,
+        "the impl-qualified path outside a generic body calls From<LowError>");
+    const small: Wrapper<i32> = Wrapper::<i32> { value: 1 };
+    const large: Wrapper<i64> = Wrapper::<i64> { value: 1 };
+    passed = check(passed, describe_own(&small) == 1 && describe_own(&large) == 1,
+        "a method call under the bound calls the own `describe`");
+    passed = check(passed, describe_through_trait(&small) == 2, "the impl-qualified path under the bound calls Wrapper<i32>'s Describe");
+    passed = check(passed, describe_through_trait(&large) == 3, "the impl-qualified path under the bound calls Wrapper<i64>'s Describe");
+    passed = check(passed, small.describe() == 1, "a method call outside a generic body calls the own `describe`");
+    passed = check(passed, (Describe for Wrapper<i64>)::describe(&large) == 3,
+        "the impl-qualified path outside a generic body calls Wrapper<i64>'s Describe");
+    printf("own method first under a bound: %d of 12 checks passed\n", passed);
+    if (passed != 12) { return 1; }
+    return 0;
+}

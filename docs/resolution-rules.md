@@ -404,9 +404,12 @@ yet is recorded with the change that builds it, not here.
      use below asks it.  In a function's or method's body the bound is an
      assumption: a path through its subject whose member the bound's trait
      declares, and whose arguments that member takes at the bound's
-     arguments, is the trait's member; a `?` into the subject converts
-     through it (604); a method call on a value of a subject that still
-     names a parameter reaches the bound's trait first.  The path or call records the trait's member and
+     arguments, is the trait's member unless a method of the subject's
+     own takes them (617); a `?` into the subject converts through it
+     (604); a method call on a value of a subject that still names a
+     parameter reaches the bound's trait when the subject has no method
+     of its own of the name; the impl-qualified path `(From<E> for
+     HighError)::from(e)` is the bound's member.  The path or call records the trait's member and
      the parameters the bound gives it, and each copy of the body binds it
      to the implementation of the trait for the copy's subject whose
      method takes those parameters - two instantiations reach two
@@ -416,8 +419,21 @@ yet is recorded with the change that builds it, not here.
      in, and an implementation binding the trait at those arguments must
      exist, or the call is E0306, naming the trait with its arguments.  On
      an `implement` block or a type declaration such a bound is not yet
-     given a meaning (roadmap).  (Jake for the bound and the call-site
-     check; the precedence of a type's own path member delegated)
+     given a meaning (roadmap).  (Jake for the bound, the call-site
+     check, and the subject's own member first, reversing a delegated
+     choice that put the bound's first)
+
+617. **A type's own method outranks a trait's.**  Where a method call,
+     a `Type::member` path or a method value finds both a method the
+     type declares itself (inherent) and a trait's method of the same
+     name, and the arguments bind to both, it names the inherent one,
+     whichever is generic and whichever block is written first; the
+     impl-qualified path `(Tr for T)::m` names the trait's.  Two traits'
+     methods with no inherent one the arguments bind to remain a tie
+     (E0156).  A call through a parameter's bound still names the
+     bound's trait, since the parameter has no methods of its own.  The
+     `?` conversion is directed through `From`, so a type's own `from`
+     is never the conversion.  (Jake)
 
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
@@ -3481,7 +3497,7 @@ check is being deleted and the seals are what hold.  (Jake)
     a non-generic trait method of the same name that both apply to a call
     make the call ambiguous.**
 
-22. **Whenever an inherent method and a trait method of the same name both
+22. *Superseded by ruling 617.* **Whenever an inherent method and a trait method of the same name both
     apply to a call, the call is an ambiguity error**, in every combination
     of generic and non-generic receiver and method. There is no precedence
     rule. The caller writes `(Trait for Owner)::member(args)` or renames one
@@ -3507,7 +3523,7 @@ check is being deleted and the seals are what hold.  (Jake)
     function f<T>(x: &T) -> i32 where T: Nowhere { return 1; } // error[E0242]: cannot find trait `Nowhere` in this scope
     ```
 
-24. **Ruling 22's ambiguity is E0156**, the error for a name more than one
+24. *Superseded by ruling 617.* **Ruling 22's ambiguity is E0156**, the error for a name more than one
     trait provides, whose help already writes
     `(Trait for Owner)::member(args)`, with a primary line that names the
     inherent method.
@@ -3530,7 +3546,7 @@ check is being deleted and the seals are what hold.  (Jake)
     }
     ```
 
-26. **Ruling 22 covers static paths too.** When a trait implemented for the
+26. *Superseded by ruling 617.* **Ruling 22 covers static paths too.** When a trait implemented for the
     type also provides the member, `IgTn::go(&ig, 7)` is the E0156
     ambiguity, as `ig.go(7)` is; so are `T::m()` for a static method and
     `T::m` as a value. The explicit forms are `(Beta for IgTn)::go(...)` for
@@ -3541,7 +3557,7 @@ check is being deleted and the seals are what hold.  (Jake)
     const m: i64 = (Beta for IgTn)::go(&ig, 7);   // Beta's: 2
     ```
 
-27. **The E0156 wording for an inherent method beside a trait's is
+27. *Superseded by ruling 617.* **The E0156 wording for an inherent method beside a trait's is
     approved**: the primary line "`go` is both an inherent method of `IgTn`
     and provided by a trait implemented for it", the note "candidate #1: the
     inherent method `IgTn::go`", and the help "call the trait's method as

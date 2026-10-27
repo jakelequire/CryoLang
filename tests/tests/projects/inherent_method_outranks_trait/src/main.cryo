@@ -1,0 +1,115 @@
+/// A type's own (inherent) method outranks a trait's method of the same name
+/// that the arguments also bind to: the method call `recv.go(7)`, the path
+/// `Type::go(&recv, 7)`, a static `Type::make()` and the value `Type::go` all
+/// name the inherent method, whichever `implement` block is written first and
+/// whether the type or either method is generic.  The impl-qualified path
+/// `(Beta for Type)::go` names the trait's method.  Through a bound the call
+/// names the bound's trait, whatever the type it is instantiated with
+/// declares.
+namespace InherentMethodOutranksTrait::Main;
+
+import std::ffi::libc::{ printf };
+
+type trait Beta { go(&this, u: i32) -> i64; }
+
+type trait BetaG { go<U>(&this, u: U) -> i64; }
+
+type trait Gamma { go(&this, u: i32) -> i64; }
+
+type trait Make { static make() -> i64; }
+
+// Plain type, plain method: the trait block first, then the inherent one.
+type struct NnTf { v: i32; }
+implement trait Beta for NnTf { go(&this, u: i32) -> i64 { return 2; } }
+implement struct NnTf { go(&this, u: i32) -> i64 { return 1; } }
+
+// Plain type, plain method: the inherent block first.
+type struct NnIf { v: i32; }
+implement struct NnIf { go(&this, u: i32) -> i64 { return 1; } }
+implement trait Beta for NnIf { go(&this, u: i32) -> i64 { return 2; } }
+
+// Generic type, plain method.
+type struct GnTf<T> { v: T; }
+implement<T> trait Beta for GnTf<T> { go(&this, u: i32) -> i64 { return 2; } }
+implement<T> struct GnTf<T> { go(&this, u: i32) -> i64 { return 1; } }
+
+// Generic type, generic method.
+type struct GgTf<T> { v: T; }
+implement<T> trait BetaG for GgTf<T> { go<U>(&this, u: U) -> i64 { return 2; } }
+implement<T> struct GgTf<T> { go<U>(&this, u: U) -> i64 { return 1; } }
+
+// Plain type, generic method.
+type struct NgTf { v: i32; }
+implement trait BetaG for NgTf { go<U>(&this, u: U) -> i64 { return 2; } }
+implement struct NgTf { go<U>(&this, u: U) -> i64 { return 1; } }
+
+// An inherent method between two traits' methods.
+type struct Three { v: i32; }
+implement trait Beta for Three { go(&this, u: i32) -> i64 { return 2; } }
+implement struct Three { go(&this, u: i32) -> i64 { return 1; } }
+implement trait Gamma for Three { go(&this, u: i32) -> i64 { return 3; } }
+
+// A generic inherent method beside a plain trait one, on a plain type and on
+// a generic one.
+type struct IgTn { v: i32; }
+implement trait Beta for IgTn { go(&this, u: i32) -> i64 { return 2; } }
+implement struct IgTn { go<U>(&this, u: U) -> i64 { return 1; } }
+
+type struct GIgTn<T> { v: T; }
+implement<T> trait Beta for GIgTn<T> { go(&this, u: i32) -> i64 { return 2; } }
+implement<T> struct GIgTn<T> { go<U>(&this, u: U) -> i64 { return 1; } }
+
+// Static methods.
+type struct SNn { v: i32; }
+implement trait Make for SNn { static make() -> i64 { return 2; } }
+implement struct SNn { static make() -> i64 { return 1; } }
+
+function via_bound<T>(x: &T) -> i64 where T: Beta {
+    return x.go(0);
+}
+
+function via_bound_generic<T>(x: &T) -> i64 where T: BetaG {
+    return x.go::<i32>(0);
+}
+
+function check(passed: i32, ok: boolean, what: string) -> i32 {
+    if (!ok) {
+        printf("FAILED: %s\n", what);
+        return passed;
+    }
+    return passed + 1;
+}
+
+function main() -> i32 {
+    mut passed: i32 = 0;
+    const a: NnTf = NnTf { v: 5 };
+    const b: NnIf = NnIf { v: 5 };
+    const c: GnTf<i32> = GnTf::<i32> { v: 5 };
+    const e: GgTf<i32> = GgTf::<i32> { v: 5 };
+    const g: NgTf = NgTf { v: 5 };
+    const t: Three = Three { v: 5 };
+    const ig: IgTn = IgTn { v: 5 };
+    const gig: GIgTn<i32> = GIgTn::<i32> { v: 5 };
+    passed = check(passed, a.go(7) == 1 && b.go(7) == 1, "a method call names the inherent method, either block first");
+    passed = check(passed, c.go(7) == 1 && e.go::<i32>(7) == 1, "a method call on a generic type names the inherent method");
+    passed = check(passed, g.go::<i32>(7) == 1 && ig.go(7) == 1 && gig.go(7) == 1,
+        "a generic inherent method outranks a trait's");
+    passed = check(passed, t.go(7) == 1, "an inherent method outranks two traits' methods");
+    passed = check(passed, NnTf::go(&a, 7) == 1 && NnIf::go(&b, 7) == 1 && Three::go(&t, 7) == 1,
+        "a path names the inherent method");
+    passed = check(passed, NgTf::go::<i32>(&g, 7) == 1 && IgTn::go(&ig, 7) == 1,
+        "a path names a generic inherent method");
+    passed = check(passed, GnTf::<i32>::go(&c, 7) == 1 && GgTf::<i32>::go::<i32>(&e, 7) == 1
+        && GIgTn::<i32>::go(&gig, 7) == 1, "a path on a generic type names the inherent method");
+    passed = check(passed, SNn::make() == 1, "a static path names the inherent method");
+    const own = NnTf::go;
+    const traits = (Beta for NnTf)::go;
+    passed = check(passed, own(&a, 7) == 1 && traits(&a, 7) == 2, "a method value names the inherent method");
+    passed = check(passed, (Beta for NnTf)::go(&a, 7) == 2 && (Gamma for Three)::go(&t, 7) == 3
+        && (Make for SNn)::make() == 2, "the impl-qualified path names the trait's method");
+    passed = check(passed, via_bound::<IgTn>(&ig) == 2 && via_bound::<GnTf<i32>>(&c) == 2
+        && via_bound_generic::<GgTf<i32>>(&e) == 2, "a call through a bound names the bound's trait");
+    printf("inherent method outranks trait: %d of 11 checks passed\n", passed);
+    if (passed != 11) { return 1; }
+    return 0;
+}

@@ -2991,9 +2991,8 @@ type struct CallResolver {
         // them has the call's arity; the ones its trait impls deliver are
         // consulted only when none does.  Two traits providing the name is
         // an ambiguity reported here; an inherent method beside a trait
-        // method that also applies is one the selection reports
-        // (`report_inherent_trait_tie`), and the arguments are checked
-        // against the inherent method.  A call stamped with a trait (an
+        // method that also applies outranks it, and the arguments are
+        // checked against the inherent method.  A call stamped with a trait (an
         // operator's, a desugar's, a bound's) names that trait's method:
         // its candidates are that trait's methods alone.
         const want_trait: DefId = member.resolved_trait;
@@ -3111,7 +3110,7 @@ type struct CallResolver {
         }
 
         if (trait_ambiguous && !member.resolved_trait.is_valid()) {
-            this.report_method_call_tie(call, member, base_ref, &tie_traits, &tie_spans, null);
+            this.report_method_call_tie(call, member, base_ref, &tie_traits, &tie_spans);
             return;
         }
         // Several arity-matching signatures is an overload SET, not a reason to
@@ -3859,10 +3858,10 @@ type struct CallResolver {
         // a leaf comparison binds whichever of them registered first.
         //
         // Unstamped, the inherent methods and the trait methods are two
-        // sets and neither outranks the other: when both have a method the
-        // arguments bind to, whether either is generic, the call is
-        // ambiguous (`report_inherent_trait_tie`).  Within each set a
-        // generic method's own type parameters bind by unification with the
+        // sets, and the inherent set is asked first: a method of the
+        // receiver's own type the arguments bind to outranks any trait's,
+        // which the impl-qualified path names.  Within each set a generic
+        // method's own type parameters bind by unification with the
         // arguments, and the generic candidates are tried after the others.
         const want_trait: DefId = member.resolved_trait;
         mut sel: Selection = Selection::none();
@@ -3899,8 +3898,6 @@ type struct CallResolver {
             if (tmpl == null || !this.types.contains_generic_param(owner_inst)) {
                 this.report_generic_tie(visitor, call, member, base_ref, base_t,
                     methods_ref, &arg_types, tmpl, owner_inst, false, sel.chosen);
-                this.report_inherent_trait_tie(visitor, call, member, base_ref, base_t,
-                    methods_ref, &arg_types, tmpl, owner_inst, sel.chosen);
             }
             this.pin_minted_method(call, sel, base_ref);
             return this.commit_selection(visitor, call, sel);
@@ -4225,56 +4222,14 @@ type struct CallResolver {
         this.ctx.emit_diagnostic(d);
     }
 
-    /// An inherent method the arguments bind to (`inherent`) and a trait
-    /// method of the same name they bind to are both candidates for an
-    /// unstamped call, and neither outranks the other: the call is
-    /// ambiguous, reported with every trait that offers the method.  The
-    /// caller names the trait's method through the impl-qualified path,
-    /// `(Trait for Owner)::member(args)`, or renames one of them.  Silent
-    /// when no trait method applies.  Reported in a generic body's walk too:
-    /// the receiver is a minted type, whose call is pinned here and not
-    /// selected again for an instantiation.
-    report_inherent_trait_tie(mut &this, visitor: SemaVisitor*, call: CallExpr*, member: MemberAccessExpr*,
-                              base_ref: TypeRef, base_t: Type*,
-                              methods_ref: Slice<MethodInfo>, arg_types: &[TypeRef],
-                              tmpl: TemplateEntry*, owner_inst: TypeRef, inherent_decl: DeclarationNode*) -> void {
-        const inherent: MethodDecl* = DeclarationNode::method_of(inherent_decl);
-        if (inherent == null || inherent.func == null) { return; }
-        mut traits: [DefId] = [];
-        mut spans: [SourceSpan] = [];
-        // Every trait whose method applies, each asked alone: the trait set
-        // asked whole answers only its first.  Only the impls whose
-        // where-clauses hold for the receiver count, minted or not.
-        const subject: TypeRef = if (owner_inst.is_valid()) { owner_inst } else { base_ref };
-        const blocks: [ImplBlock*] = this.trait_checker().impls_of(subject);
-        for (mut ti: i64 = 0; ti < blocks.length(); ti++) {
-            const tid: DefId = blocks[ti].trait_def;
-            if (!tid.is_valid()) { continue; }
-            mut seen: boolean = false;
-            for (mut k: i64 = 0; k < traits.length(); k++) {
-                if (traits[k].equals(tid)) { seen = true; break; }
-            }
-            if (seen) { continue; }
-            mut one: Selection = Selection::none();
-            one.owner_inst = owner_inst;
-            if (!this.select_in_set(visitor, call, member, base_ref, base_t, methods_ref,
-                    arg_types, tmpl, tid, true, &one)) { continue; }
-            traits.push(tid);
-            const f_decl: DeclarationNode* = DeclarationNode::method_of(one.chosen).func;
-            spans.push(if (f_decl.has_name_span()) { f_decl.name_span } else { f_decl.span });
-        }
-        if (traits.length() == 0) { return; }
-        this.report_method_call_tie(call, member, subject, &traits, &spans, inherent.func);
-    }
-
     /// E0156 for a method call `recv.member(args)` on `owner`: the tie's
     /// help quotes the call's receiver and arguments as the impl-qualified
     /// form takes them.  See `report_trait_method_tie`.
     report_method_call_tie(mut &this, call: CallExpr*, member: MemberAccessExpr*, owner: TypeRef,
-                           traits: &[DefId], decl_spans: &[SourceSpan], inherent_decl: DeclarationNode*) -> void {
+                           traits: &[DefId], decl_spans: &[SourceSpan]) -> void {
         const args_text: string = this.receiver_call_args_text(call, member);
         this.report_trait_method_tie(call.callee.span, member.member, owner,
-            traits, decl_spans, args_text, true, inherent_decl);
+            traits, decl_spans, args_text, true);
     }
 
     /// A method call's arguments as the impl-qualified form writes them:
@@ -5918,14 +5873,22 @@ type struct CallResolver {
     /// bound's arguments, takes exactly the call's arguments, the call is
     /// that trait's member.  It is recorded as a path a bound on a parameter
     /// records, and each copy of the body binds it to the implementation of
-    /// the trait its own types select.  Returns the call's type as the trait
-    /// declares it, `This` being the owner; invalid when no bound directs
-    /// the call, which leaves it to the owner's own methods.
+    /// the trait its own types select.  A method of the owner's own that
+    /// takes the arguments outranks the bound's, as it outranks a trait's
+    /// anywhere; a path that names its trait (`directing_trait`) is that
+    /// trait's bound's alone.  Returns the call's type as the trait declares
+    /// it, `This` being the owner; invalid when no bound directs the call,
+    /// which leaves it to the owner's own methods.
     direct_bound_path(mut &this, visitor: SemaVisitor*, scope: ScopeResolutionExpr*, owner_ty: TypeRef,
                       call: CallExpr*) -> TypeRef {
-        if (!this.state.in_symbolic_check || scope.impl_trait != null || !owner_ty.is_valid()) {
+        if (!this.state.in_symbolic_check || !owner_ty.is_valid()) { return TypeRef::invalid(); }
+        // An impl-qualified path through a parameter is directed by its head
+        // where the parameter's own paths are.
+        if (scope.impl_trait != null && this.symbolic.symbolic_scope_is_generic_param(scope)) {
             return TypeRef::invalid();
         }
+        const directing: DefId = this.directing_trait(scope);
+        if (scope.impl_trait != null && !directing.is_valid()) { return TypeRef::invalid(); }
         const refs: [TraitRef*] = this.binding.bounds_on(owner_ty);
         if (refs.length() == 0) { return TypeRef::invalid(); }
         mut arg_types: [TypeRef] = [];
@@ -5934,8 +5897,12 @@ type struct CallResolver {
             if (!t.is_valid()) { return TypeRef::invalid(); }
             arg_types.push(t);
         }
+        if (!directing.is_valid() && this.own_static_member_takes(owner_ty, scope, call, &arg_types)) {
+            return TypeRef::invalid();
+        }
         for (mut r: i64 = 0; r < refs.length(); r++) {
             const tr: TraitRef* = refs[r];
+            if (directing.is_valid() && !tr.definition().equals(directing)) { continue; }
             const item: DefId = this.trait_item_def(tr.definition(), scope);
             if (!item.is_valid()) { continue; }
             const func_decl: DeclarationNode* = this.ctx.decl_index.method_func_of(item);
@@ -5961,6 +5928,54 @@ type struct CallResolver {
             return ret;
         }
         return TypeRef::invalid();
+    }
+
+    /// The trait a `Type::member` path names its member through: the head of
+    /// an impl-qualified path, else the trait a bound or the `?` conversion
+    /// directed it through.  Invalid on a path that names no trait.
+    directing_trait(&this, scope: ScopeResolutionExpr*) -> DefId {
+        if (scope.impl_trait != null) { return this.impl_head_trait(scope); }
+        return scope.resolved_trait;
+    }
+
+    /// Whether a method `owner` declares itself - not one a trait's
+    /// implementation delivers - takes `arg_types` as the path `scope`
+    /// passes them.  An instantiation not minted yet is asked through its
+    /// template's methods, read at the instantiation's arguments.
+    own_static_member_takes(mut &this, owner: TypeRef, scope: ScopeResolutionExpr*, call: CallExpr*,
+                            arg_types: &[TypeRef]) -> boolean {
+        mut family: TypeRef = owner;
+        const no_params: [TypeRef] = [];
+        mut owner_params: &[TypeRef] = &no_params;
+        mut owner_args: [TypeRef] = [];
+        const ot: Type* = this.arena.lookup(owner);
+        if (ot != null && ot.kind == TypeKind::InstantiatedType) {
+            family = ot.as_instantiated().generic_base;
+            const owner_template: TemplateEntry* = this.ctx.generic_registry.template_of_type(family);
+            if (owner_template == null) { return false; }
+            owner_params = &owner_template.param_types;
+            owner_args = this.inst_args(owner);
+        }
+        const entries: [OverloadId] = this.member_entries(FamilyOwner::Type(family), scope.member_name);
+        for (mut i: i64 = 0; i < entries.length(); i++) {
+            if (this.ctx.decl_index.entry_trait(entries[i]).is_valid()) { continue; }
+            const method_template: TemplateEntry* = this.static_entry_template(entries[i]);
+            if (method_template != null) {
+                if (this.template_fits(method_template, call, scope, arg_types)) { return true; }
+                continue;
+            }
+            const params: [TypeRef] = this.static_entry_params(entries[i], call, scope);
+            if (params.length() != arg_types.length()) { continue; }
+            mut takes: boolean = true;
+            for (mut k: i64 = 0; takes && k < params.length(); k++) {
+                const param: TypeRef = if (owner_params.length() > 0) {
+                    this.subst_params(owner_params, &owner_args, params[k])
+                } else { params[k] };
+                takes = this.overload_param_matches_arg(param, arg_types[k]);
+            }
+            if (takes) { return true; }
+        }
+        return false;
     }
 
     /// Report `refusal` for `scope` and mark the path refused, once however
@@ -6082,8 +6097,9 @@ type struct CallResolver {
     /// or an instantiation not built yet - the method it names, in the
     /// template's terms, where it is written: through an impl head, that
     /// trait's declared method; otherwise the method of the template's
-    /// family the arguments' count admits, a tie between an inherent method
-    /// and a trait's reported here as everywhere (`choose_entry`).  Every
+    /// family the arguments' count admits, an inherent method outranking a
+    /// trait's and a tie of traits reported here as everywhere
+    /// (`choose_entry`).  Every
     /// copy of the body carries it, and monomorphization binds it on the
     /// minted owner by identity.
     /// Records nothing for an owner with no template: its generic static
@@ -6328,8 +6344,8 @@ type struct CallResolver {
                 example = inst;
             }
         }
-        if (fits.length() == 1) { return fits[0]; }
-        if (fits.length() == 0) { return OverloadId::invalid(); }
+        const chosen: OverloadId = this.outranking_entry(&fits);
+        if (chosen.is_valid() || fits.length() == 0) { return chosen; }
         this.report_ambiguous_value(&fits, shown, span, value, example);
         *refused = true;
         return OverloadId::invalid();
@@ -6424,7 +6440,8 @@ type struct CallResolver {
                 example = ty;
             }
         }
-        if (fits.length() == 1) { return this.ctx.decl_index.entry_method(fits[0]); }
+        const chosen: OverloadId = this.outranking_entry(&fits);
+        if (chosen.is_valid()) { return this.ctx.decl_index.entry_method(chosen); }
         if (fits.length() == 0) { return null; }
         this.report_ambiguous_value(&fits, shown, scope_e.span, scope_e, example);
         *refused = true;
@@ -7331,30 +7348,40 @@ type struct CallResolver {
 
     /// The one entry of `fits` the `Type::method` path `path` names.  One
     /// fit is it.  Several fit when methods share the key and the arguments
-    /// bind to each, and no candidate outranks another: an inherent method
-    /// beside one or more traits' is a tie as two traits' are, reported here
-    /// where every candidate is in hand.  The caller names a trait's method
-    /// through the impl-qualified path, `(Trait for Owner)::member(args)`,
-    /// or renames one.  An inherent method in a tie stays bound, so the tie
-    /// is the one error the call reports; a tie of traits alone binds
+    /// bind to each: the owner's own (inherent) method outranks every
+    /// trait's, and the impl-qualified path `(Trait for Owner)::member(args)`
+    /// names a trait's.  Two traits' methods, with no inherent one, are a
+    /// tie, reported here where every candidate is in hand, and bind
     /// nothing.
     choose_entry(mut &this, fits: &[OverloadId], path_e: ExpressionNode*, path: ScopeResolutionExpr*,
                  call_e: ExpressionNode*, call: CallExpr*, owner: FamilyOwner) -> OverloadId {
+        const chosen: OverloadId = this.outranking_entry(fits);
+        if (chosen.is_valid() || fits.length() < 2) { return chosen; }
+        if (this.inherent_entry_count(fits) == 0) {
+            this.report_static_path_tie(fits, path_e, path, call, owner);
+            return OverloadId::invalid();
+        }
+        return this.report_static_generic_tie(fits, path_e, path, call_e, call, owner);
+    }
+
+    /// The entry of `fits` that outranks the others: the only one, or the
+    /// only inherent one beside trait entries.  Invalid when none does.
+    outranking_entry(&this, fits: &[OverloadId]) -> OverloadId {
         if (fits.length() == 1) { return fits[0]; }
-        mut inherent: OverloadId = OverloadId::invalid();
+        if (this.inherent_entry_count(fits) != 1) { return OverloadId::invalid(); }
+        for (mut i: i64 = 0; i < fits.length(); i++) {
+            if (!this.ctx.decl_index.entry_trait(fits[i]).is_valid()) { return fits[i]; }
+        }
+        return OverloadId::invalid();
+    }
+
+    /// How many entries of `fits` are the owner's own methods, not a trait's.
+    inherent_entry_count(&this, fits: &[OverloadId]) -> i64 {
         mut n: i64 = 0;
         for (mut i: i64 = 0; i < fits.length(); i++) {
-            if (!this.ctx.decl_index.entry_trait(fits[i]).is_valid()) { inherent = fits[i]; n = n + 1; }
+            if (!this.ctx.decl_index.entry_trait(fits[i]).is_valid()) { n = n + 1; }
         }
-        if (n == 1) {
-            this.report_static_path_tie(fits, path_e, path, call, inherent, owner);
-            return inherent;
-        }
-        if (n == 0 && fits.length() >= 2) {
-            this.report_static_path_tie(fits, path_e, path, call, OverloadId::invalid(), owner);
-        }
-        if (n >= 2) { return this.report_static_generic_tie(fits, path_e, path, call_e, call, owner); }
-        return OverloadId::invalid();
+        return n;
     }
 
     /// Several inherent entries of `fits` accept the arguments, so the
@@ -7410,24 +7437,18 @@ type struct CallResolver {
         return plain;
     }
 
-    /// `path` names a method every trait entry of `fits` provides through a
-    /// different trait - and `inherent`, when valid, an inherent method too
-    /// - and none of them outranks another.  The candidates are the
-    /// entries, each carrying where its declaration is written; the call
-    /// form's arguments are the receiver the trait-qualified call keeps.
+    /// `path` names a method every entry of `fits` provides through a
+    /// different trait, and none of them outranks another.  The candidates
+    /// are the entries, each carrying where its declaration is written; the
+    /// call form's arguments are the receiver the trait-qualified call keeps.
     report_static_path_tie(mut &this, fits: &[OverloadId], path_e: ExpressionNode*,
-                           path: ScopeResolutionExpr*, call: CallExpr*, inherent: OverloadId,
-                           owner: FamilyOwner) -> void {
+                           path: ScopeResolutionExpr*, call: CallExpr*, owner: FamilyOwner) -> void {
         mut traits: [DefId] = [];
         mut spans: [SourceSpan] = [];
         for (mut i: i64 = 0; i < fits.length(); i++) {
-            if (fits[i].equals(inherent)) { continue; }
             traits.push(this.ctx.decl_index.entry_trait(fits[i]));
             spans.push(this.ctx.decl_index.entry_span(fits[i]));
         }
-        const inh_decl: DeclarationNode* = this.ctx.decl_index.entry_method(inherent);
-        const inh: MethodDecl* = DeclarationNode::method_of(inh_decl);
-        const inh_func_decl: DeclarationNode* = if (inh != null) { inh.func } else { null };
         mut args_text: string = "";
         if (call != null && call.arguments.length() > 0) {
             const first: ExpressionNode* = call.arguments[0];
@@ -7443,7 +7464,7 @@ type struct CallResolver {
             FamilyOwner::Template(_) => { TypeRef::invalid() }
         };
         this.report_trait_method_tie(path_e.span, path.member_name, owner_t,
-            &traits, &spans, args_text, call != null, inh_func_decl);
+            &traits, &spans, args_text, call != null);
     }
 
     /// The source text under a single-line `span`, or "" when it spans lines
@@ -7459,8 +7480,8 @@ type struct CallResolver {
     }
 
     /// E0156: `member` is provided for `owner` by every trait in `traits`, at
-    /// the signature the use selects - and, when `inherent` is not null, by
-    /// that inherent method too, which outranks none of them.  A tie is an
+    /// the signature the use selects, and the owner has no method of its
+    /// own the use selects.  A tie is an
     /// error, never a pick by declaration or import order.  Each candidate
     /// is named where it is declared (`decl_spans`), and the help names the
     /// spelling that chooses a trait's: the impl-qualified path
@@ -7473,31 +7494,16 @@ type struct CallResolver {
     /// owner the tie is the same in every instantiation and is reported here.
     report_trait_method_tie(mut &this, span: SourceSpan, member: SymbolStr, owner: TypeRef,
                             traits: &[DefId], decl_spans: &[SourceSpan],
-                            args_text: string, is_call: boolean, inherent_decl: DeclarationNode*) -> void {
-        const inherent: FunctionDecl* = DeclarationNode::fn_of(inherent_decl);
-        if (this.state.in_symbolic_check && inherent == null
-                && this.types.contains_generic_param(owner)) { return; }
+                            args_text: string, is_call: boolean) -> void {
+        if (this.state.in_symbolic_check && this.types.contains_generic_param(owner)) { return; }
         if (!owner.is_valid()) { return; }
         // The owner as the impl-qualified form writes it: `GnTf<i32>`.
         const owner_display: string = this.arena.resolve_display_name_short(owner);
         const member_str: string = this.intern.resolve(member);
-        const primary: string = if (inherent != null) {
-            fmt::format("`%s` is both an inherent method of `%s` and provided by a trait implemented for it",
-                member_str, owner_display)
-        } else {
-            fmt::format("`%s` is provided by more than one trait implemented for `%s`", member_str, owner_display)
-        };
-        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0156_AMBIGUOUS_TRAIT_METHOD, primary);
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0156_AMBIGUOUS_TRAIT_METHOD,
+            fmt::format("`%s` is provided by more than one trait implemented for `%s`", member_str, owner_display));
         diag = diag.at_with_label(span,
             fmt::format("which `%s` is meant here is ambiguous", member_str));
-        // The inherent candidate is named first; the traits' number after it.
-        mut first_trait: i32 = 1;
-        if (inherent != null) {
-            const inh_note: string = fmt::format("candidate #1: the inherent method `%s::%s`", owner_display, member_str);
-            const inh_span: SourceSpan = if (inherent_decl.has_name_span()) { inherent_decl.name_span } else { inherent_decl.span };
-            diag = if (inh_span.has_location()) { diag.with_note_at(inh_note, inh_span) } else { diag.with_note(inh_note) };
-            first_trait = 2;
-        }
         // Two candidates of one leaf (`Alpha::Render`, `Omega::Render`) are
         // told apart only by their full paths; otherwise the leaf reads as
         // the program writes it.
@@ -7512,16 +7518,13 @@ type struct CallResolver {
             const trait_str: string = this.intern.shown(this.ctx.defs.path_of(traits[i]));
             const leaf: string = if (leaf_collides) { trait_str } else { QualifiedName::leaf_of(trait_str) };
             const note: string = fmt::format("candidate #%d: `%s::%s`, from `implement trait %s for %s`",
-                (i as i32) + first_trait, leaf, member_str, trait_str, owner_display);
+                (i as i32) + 1, leaf, member_str, trait_str, owner_display);
             diag = if (decl_spans[i].has_location()) { diag.with_note_at(note, decl_spans[i]) } else { diag.with_note(note) };
             const form: string = if (is_call) { fmt::format("`(%s for %s)::%s(%s)`", leaf, owner_display, member_str, args_text) }
                                  else { fmt::format("`(%s for %s)::%s`", leaf, owner_display, member_str) };
             help = if (help.length() == 0) { form } else { help + " or " + form };
         }
-        const help_line: string = if (inherent != null) {
-            fmt::format("neither outranks the other: call the trait's method as %s, or rename one of them", help)
-        } else { fmt::format("name the implementation the call is meant through: %s", help) };
-        diag = diag.help(help_line);
+        diag = diag.help(fmt::format("name the implementation the call is meant through: %s", help));
         this.ctx.emit_diagnostic(diag);
     }
 
@@ -7872,7 +7875,15 @@ type struct CallResolver {
     static_call_template(mut &this, owner: DefId, scope: ScopeResolutionExpr*, call: CallExpr*) -> TemplateEntry* {
         const leaf: SymbolStr = scope.member_name;
         if (!owner.is_valid() || !leaf.is_valid()) { return null; }
-        const entries: [OverloadId] = this.ctx.decl_index.lookup_family_entries(FamilyOwner::Def(owner), leaf);
+        const directing: DefId = this.directing_trait(scope);
+        const entries: [OverloadId] = if (directing.is_valid()) {
+            this.trait_delivered_entries(FamilyOwner::Def(owner), directing, leaf)
+        } else {
+            this.ctx.decl_index.lookup_family_entries(FamilyOwner::Def(owner), leaf)
+        };
+        if (directing.is_valid() && entries.length() < 2) {
+            return if (entries.length() == 1) { this.static_entry_template(entries[0]) } else { null };
+        }
         if (entries.length() < 2) { return this.ctx.member_template(ResBase::Def(owner), leaf); }
         if (call == null) { return null; }
         mut arg_types: [TypeRef] = [];
@@ -7883,8 +7894,9 @@ type struct CallResolver {
         }
         mut fits: [OverloadId] = this.select_static_overload(&entries, &arg_types, false, call, scope);
         if (fits.length() == 0) { fits = this.select_static_overload(&entries, &arg_types, true, call, scope); }
-        if (fits.length() != 1) { return null; }
-        return this.static_entry_template(fits[0]);
+        const chosen: OverloadId = this.outranking_entry(&fits);
+        if (!chosen.is_valid()) { return null; }
+        return this.static_entry_template(chosen);
     }
 
     /// The function template entry `e` is when it is a generic static
