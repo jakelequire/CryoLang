@@ -3464,22 +3464,19 @@ type struct SemaVisitor {
         const future_id: DefId = this.ctx.generic_registry.wellknown(LangItem::Future);
         if (!future_id.is_valid() || !func.origin_trait.equals(future_id)) { return TypeRef::invalid(); }
         if (!this.ctx.generic_registry.names_lang_method(func.name, LangItem::FuturePoll)) { return TypeRef::invalid(); }
-        // Read the Output off `Poll::Ready`'s payload rather than the return
-        // type's generic argument: once monomorphization has specialized it,
-        // `Poll<Output>` is a plain enum with no instantiation left to peel.
-        // The enum is the language's `Poll` by its declaration's identity
-        // (a specialized enum carries its template as `generic_base`), and
-        // `Ready` is read inside a type known to declare it.
-        const e: Type* = this.types.unwrap_to_enum(func.resolved_return_type);
-        if (e == null || e.kind != TypeKind::Enum) { return TypeRef::invalid(); }
-        const et: EnumType* = e.as_enum();
+        // The enum is the language's `Poll` by its declaration's identity, and
+        // the Output is its one type argument, read through the instantiation
+        // view.  The poll is walked while `Poll<Output>` is still an
+        // instantiation nothing has specialized, so only the view answers
+        // there; it answers for a specialized enum too, which keeps its
+        // template's arguments.  Read any other way, the walk of the poll
+        // judges a `?` the first walk refused against `Poll` itself and
+        // reports that the function does not return a `Result`.
         const poll_def: DefId = this.ctx.generic_registry.wellknown(LangItem::Poll);
         if (!poll_def.is_valid() || !this.enum_decl_def(func.resolved_return_type).equals(poll_def)) {
             return TypeRef::invalid();
         }
-        const ready: i64 = et.variant_index(this.intern.intern("Ready"));
-        if (ready < 0 || et.variants[ready].payload_types.length() != 1) { return TypeRef::invalid(); }
-        return et.variants[ready].payload_types[0];
+        return this.types.view_type_arg_at(func.resolved_return_type, 0);
     }
 
     /// 1 when `ty` is the language's `Result`, 2 when it is its `Option`, 0
