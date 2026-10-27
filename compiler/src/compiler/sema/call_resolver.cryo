@@ -1345,7 +1345,7 @@ type struct CallResolver {
             // candidates even when none was selected, which is what reports
             // the arguments that selected none.
             mut claimed: boolean = false;
-            const scope_ret: TypeRef = this.resolve_scope_call(ExpressionNode::scope_resolution_of(callee), call_e, call, &claimed);
+            const scope_ret: TypeRef = this.resolve_scope_call(visitor, ExpressionNode::scope_resolution_of(callee), call_e, call, &claimed);
             if (scope_ret.is_valid() || claimed) {
                 this.check_scope_call_arg_types(visitor, ExpressionNode::scope_resolution_of(callee), call_e, call);
             }
@@ -3357,7 +3357,8 @@ type struct CallResolver {
             // accept them.
             const binds: [TypeRef] = this.template_call_bindings(call, null, t, f_decl);
             mut unmet_arg: TypeRef = TypeRef::invalid();
-            if (this.unmet_call_bound(f_decl, &t.param_syms, &binds, &unmet_arg) != null) { continue; }
+            mut unmet_trait: SymbolStr = SymbolStr::empty();
+            if (this.unmet_call_bound(f_decl, &t.param_syms, &binds, &unmet_arg, &unmet_trait) != null) { continue; }
             generics.push(entries[i]);
         }
         if (!plain.is_valid() || generics.length() == 0) { return false; }
@@ -4776,7 +4777,7 @@ type struct CallResolver {
     bind_where_only_params(mut &this, block: ImplBlock*, view: TypeSubstitution*) -> void {
         for (mut bi: i64 = 0; bi < block.where_bounds.length(); bi++) {
             const bound: &TraitBound = &block.where_bounds[bi];
-            const subject: TypeRef = this.trait_checker().lookup_subst_for_param(bound.subject_sym, view);
+            const subject: TypeRef = this.trait_checker().lookup_subst_for_param(bound.subject_param(), view);
             if (!subject.is_valid()) { continue; }
             // A subject that is itself a type parameter gives its projections
             // (`concrete_trait_slots`), each what the parameter's own bound
@@ -5549,7 +5550,7 @@ type struct CallResolver {
             const bound: &TraitBound = &func.trait_bounds[bi];
             mut concrete: TypeRef = TypeRef::invalid();
             for (mut pi: i64 = 0; pi < tmpl.param_syms.length(); pi++) {
-                if (tmpl.param_syms[pi].equals(bound.subject_sym)) { concrete = inst.type_args[pi]; break; }
+                if (tmpl.param_syms[pi].equals(bound.subject_param())) { concrete = inst.type_args[pi]; break; }
             }
             if (!concrete.is_valid()) { continue; }
             for (mut ri: i64 = 0; ri < bound.trait_refs.length(); ri++) {
@@ -5570,7 +5571,7 @@ type struct CallResolver {
                             bound: &TraitBound, tref: &TraitRef, concrete: TypeRef) -> void {
         const method_str: string = this.intern.resolve(member.member);
         const trait_str:  string = this.intern.resolve(tref.path[tref.path.length() - 1]);
-        const param_str:  string = this.intern.resolve(bound.type_parameter);
+        const param_str:  string = TypeAnnotation::spell(bound.subject, this.intern);
         const conc_str:   string = this.types.type_display_name(concrete);
         const primary: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member_e.span };
         mut d: Diagnostic = Diagnostic::error(
@@ -5619,7 +5620,7 @@ type struct CallResolver {
             const bound: &TraitBound = &func.trait_bounds[bi];
             mut arg: TypeRef = TypeRef::invalid();
             for (mut pi: i64 = 0; pi < tmpl.param_syms.length(); pi++) {
-                if (tmpl.param_syms[pi].equals(bound.subject_sym)) { arg = inst.type_args[pi]; break; }
+                if (tmpl.param_syms[pi].equals(bound.subject_param())) { arg = inst.type_args[pi]; break; }
             }
             if (!arg.is_valid()) { continue; }
             const at: Type* = this.arena.lookup(arg);
@@ -5761,7 +5762,8 @@ type struct CallResolver {
     /// stores of the other kind are not asked.
     /// `claimed` is set when the owner the segment names declares the
     /// member (`try_resolve_static_method`).
-    resolve_scope_call(mut &this, scope: ScopeResolutionExpr*, call_e: ExpressionNode*, call: CallExpr*, claimed: boolean*) -> TypeRef {
+    resolve_scope_call(mut &this, visitor: SemaVisitor*, scope: ScopeResolutionExpr*, call_e: ExpressionNode*,
+                       call: CallExpr*, claimed: boolean*) -> TypeRef {
         mut names_module: boolean = false;
         match (scope.require_scope_res("scope-call owner kind")) {
             Res::Def(_) => { names_module = true; }
@@ -5779,6 +5781,8 @@ type struct CallResolver {
             // pair (`scope_owner_type`); no name is minted for it.
             const lookup_sym: SymbolStr = this.scope_owner_key(scope);
             const owner_ty: TypeRef = this.scope_owner_type(call.callee, scope);
+            const bound_ret: TypeRef = this.direct_bound_path(visitor, scope, owner_ty, call);
+            if (bound_ret.is_valid()) { return bound_ret; }
             const method_ret: TypeRef = this.try_resolve_static_method(scope, lookup_sym, owner_ty, call_e, call, claimed);
             if (method_ret.is_valid() || *claimed) { return method_ret; }
             const type_ret: TypeRef = this.try_resolve_type_or_variant(scope, owner_ty, call);
@@ -5801,9 +5805,10 @@ type struct CallResolver {
             };
             if (directing.is_valid() && !call.template_method.is_valid()) {
                 call.template_method = this.trait_item_def(directing, scope);
-                if (scope.impl_trait == null) {
-                    call.bound_params = this.binding.bound_method_params(
-                        this.symbolic.symbolic_scope_param_type(scope), directing,
+                const refs: [TraitRef*] = this.binding.bounds_naming(
+                    this.symbolic.symbolic_scope_param_type(scope), directing);
+                if (scope.impl_trait == null && refs.length() > 0) {
+                    call.bound_params = this.binding.bound_method_params(refs[0],
                         this.ctx.decl_index.method_func_of(call.template_method));
                 }
             }
@@ -5904,6 +5909,58 @@ type struct CallResolver {
         if (!scope.resolved_trait.is_valid()) { scope.set_resolved_trait(dir.named()); }
         if (!scope.resolved_trait.equals(dir.named())) { return TypeRef::invalid(); }
         return ret;
+    }
+
+    /// A static path through a type a `where` bound in scope is written on,
+    /// in the generic body being walked: `HighError::from(e)` under `where
+    /// HighError: From<E>`.  The bound is an assumption the body is typed
+    /// by, so when its trait declares the member and the member, at the
+    /// bound's arguments, takes exactly the call's arguments, the call is
+    /// that trait's member.  It is recorded as a path a bound on a parameter
+    /// records, and each copy of the body binds it to the implementation of
+    /// the trait its own types select.  Returns the call's type as the trait
+    /// declares it, `This` being the owner; invalid when no bound directs
+    /// the call, which leaves it to the owner's own methods.
+    direct_bound_path(mut &this, visitor: SemaVisitor*, scope: ScopeResolutionExpr*, owner_ty: TypeRef,
+                      call: CallExpr*) -> TypeRef {
+        if (!this.state.in_symbolic_check || scope.impl_trait != null || !owner_ty.is_valid()) {
+            return TypeRef::invalid();
+        }
+        const refs: [TraitRef*] = this.binding.bounds_on(owner_ty);
+        if (refs.length() == 0) { return TypeRef::invalid(); }
+        mut arg_types: [TypeRef] = [];
+        for (mut i: i64 = 0; i < call.arguments.length(); i++) {
+            const t: TypeRef = visitor.resolve_expr(call.arguments[i]);
+            if (!t.is_valid()) { return TypeRef::invalid(); }
+            arg_types.push(t);
+        }
+        for (mut r: i64 = 0; r < refs.length(); r++) {
+            const tr: TraitRef* = refs[r];
+            const item: DefId = this.trait_item_def(tr.definition(), scope);
+            if (!item.is_valid()) { continue; }
+            const func_decl: DeclarationNode* = this.ctx.decl_index.method_func_of(item);
+            const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
+            if (func == null || func.generic_params.length() > 0) { continue; }
+            const leaf: SymbolStr = tr.path[tr.path.length() - 1];
+            mut takes: boolean = func.parameters.length() == arg_types.length();
+            for (mut k: i64 = 0; takes && k < func.parameters.length(); k++) {
+                const p: VarDecl* = DeclarationNode::var_of(func.parameters[k]);
+                if (p == null || p.is_receiver() || !p.resolved_type.is_valid()) { takes = false; break; }
+                const param_ty: TypeRef = this.binding.subst_this_in_trait_return(
+                    this.binding.subst_bound_trait_args(p.resolved_type, leaf, tr), owner_ty);
+                if (!param_ty.equals(arg_types[k])) { takes = false; }
+            }
+            if (!takes) { continue; }
+            call.template_method = item;
+            call.bound_params = this.binding.bound_method_params(tr, func_decl);
+            scope.set_resolved_trait(tr.definition());
+            scope.spec_owner = owner_ty;
+            const ret: TypeRef = this.binding.subst_this_in_trait_return(
+                this.binding.subst_bound_trait_args(func.resolved_return_type, leaf, tr), owner_ty);
+            call.callee.set_resolved_type(ret);
+            return ret;
+        }
+        return TypeRef::invalid();
     }
 
     /// Report `refusal` for `scope` and mark the path refused, once however
@@ -7923,24 +7980,32 @@ type struct CallResolver {
     check_call_where_bounds(mut &this, at: SourceSpan, tmpl_decl: DeclarationNode*,
                             param_syms: &[SymbolID], bindings: &[TypeRef]) -> boolean {
         mut concrete: TypeRef = TypeRef::invalid();
-        const tref: TraitRef* = this.unmet_call_bound(tmpl_decl, param_syms, bindings, &concrete);
+        mut shown: SymbolStr = SymbolStr::empty();
+        const tref: TraitRef* = this.unmet_call_bound(tmpl_decl, param_syms, bindings, &concrete, &shown);
         if (tref == null) { return true; }
-        this.emit_free_call_bound_failure(at, tmpl_decl, tref, concrete, tref.path[tref.path.length() - 1]);
+        this.emit_free_call_bound_failure(at, tmpl_decl, tref, concrete, shown);
         return false;
     }
 
     /// The first where-clause bound of `tmpl` that the bound args in
     /// `bindings` do not satisfy, with the arg it fails written to
-    /// `out_concrete`; null when every bound holds (or the arg is still
-    /// abstract/skippable).  Reports nothing.
+    /// `out_concrete` and the trait as it is required to `out_trait`; null
+    /// when every bound holds (or the arg is still abstract/skippable).
+    /// Reports nothing.
     unmet_call_bound(mut &this, tmpl_decl: DeclarationNode*, param_syms: &[SymbolID],
-                     bindings: &[TypeRef], out_concrete: TypeRef*) -> TraitRef* {
+                     bindings: &[TypeRef], out_concrete: TypeRef*, out_trait: SymbolStr*) -> TraitRef* {
         const tmpl: FunctionDecl* = DeclarationNode::fn_of(tmpl_decl);
         for (mut bi: i64 = 0; bi < tmpl.trait_bounds.length(); bi++) {
             const bound: TraitBound* = &tmpl.trait_bounds[bi];
+            if (!bound.subject_param().is_valid()) {
+                const unmet: TraitRef* = this.ctx.type_resolver.unmet_written_bound(bound, param_syms, bindings,
+                    out_concrete, out_trait);
+                if (unmet != null) { return unmet; }
+                continue;
+            }
             mut idx: i64 = -1;
             for (mut pi: i64 = 0; pi < param_syms.length(); pi++) {
-                if (param_syms[pi].equals(bound.subject_sym)) { idx = pi; break; }
+                if (param_syms[pi].equals(bound.subject_param())) { idx = pi; break; }
             }
             if (idx < 0 || idx >= bindings.length()) { continue; }
             const concrete: TypeRef = bindings[idx];
@@ -7952,6 +8017,7 @@ type struct CallResolver {
                 if (tref.path.length() == 0 || tref.refused) { continue; }
                 if (!this.trait_checker().type_implements_trait(concrete, tref.definition(), 0)) {
                     *out_concrete = concrete;
+                    *out_trait = tref.path[tref.path.length() - 1];
                     return tref;
                 }
             }
@@ -9233,6 +9299,9 @@ type struct CallResolver {
             }
         } else {
             if (this.check_variant_arguments(visitor, scope, call)) { return; }
+            // A path a bound on its owner directs took its arguments, by
+            // identity, where it was directed (`direct_bound_path`).
+            if (scope.resolved_trait.is_valid() && !this.symbolic.symbolic_scope_is_generic_param(scope)) { return; }
             const owner_ty: TypeRef = this.scope_owner_type(call.callee, scope);
             if (this.scope_is_generic_template(owner_ty, scope, call)) {
                 this.check_template_static_args(visitor, scope, call);

@@ -594,7 +594,7 @@ type struct MonoCallSpecializer {
         const sr: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(callee_node);
         if (sr != null) {
             callee_scope_slot = &sr.scope_res;
-            this.bind_on_substituted_owner(call, sr);
+            this.bind_on_substituted_owner(call, sr, subst);
         } else if (ExpressionNode::identifier_of(callee_node) == null) {
             return;
         }
@@ -1506,12 +1506,26 @@ type struct MonoCallSpecializer {
         scope.set_resolved_callee(CalleePin::Decl(DeclarationNode::fn_of(m.func).overload_entry));
     }
 
-    bind_on_substituted_owner(mut &this, call: CallExpr*, scope: ScopeResolutionExpr*) -> void {
+    /// Bind a path call recorded on its owner - a parameter the copy's
+    /// substitution rewrote, or a type a bound is written on, which still
+    /// names the template's parameters until `subst` puts the copy's in.
+    bind_on_substituted_owner(mut &this, call: CallExpr*, scope: ScopeResolutionExpr*, subst: TypeSubstitution*) -> void {
         if (!scope.spec_owner.is_valid() || !call.template_method.is_valid()
                 || call.template_recv.is_valid() || call.resolved_type_args.length() > 0) { return; }
         const f_decl: DeclarationNode* = this.decl_index.method_func_of(call.template_method);
         const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
         if (f == null || f.generic_params.length() > 0) { return; }
+        if (!scope.scope_res.relative_param_sym().is_valid() && subst != null
+                && this.arena.contains_generic_param(scope.spec_owner)) {
+            const concrete: TypeRef = this.concretize_stashed_arg(scope.spec_owner, subst);
+            const ct: Type* = this.arena.lookup(concrete);
+            if (ct != null && ct.kind == TypeKind::InstantiatedType && !this.arena.contains_generic_param(concrete)) {
+                const ci: InstantiatedType* = ct.as_instantiated();
+                scope.spec_owner = this.generic_registry.instantiate(ci.generic_base, &ci.type_args);
+            } else if (concrete.is_valid()) {
+                scope.spec_owner = concrete;
+            }
+        }
         call.template_recv = scope.spec_owner;
         this.queue_bind(call);
     }
@@ -2610,10 +2624,19 @@ type struct MonoCallSpecializer {
         if (tmpl_func.trait_bounds.length() == 0) { return true; }
         for (mut bi: i64 = 0; bi < tmpl_func.trait_bounds.length(); bi++) {
             const bound: TraitBound* = &tmpl_func.trait_bounds[bi];
+            if (!bound.subject_param().is_valid()) {
+                mut subject: TypeRef = TypeRef::invalid();
+                mut shown: SymbolStr = SymbolStr::empty();
+                const unmet: TraitRef* = this.type_resolver.unmet_written_bound(bound, &entry.param_syms, bindings,
+                    &subject, &shown);
+                if (unmet == null) { continue; }
+                this.emit_call_bound_failure(call_e, tmpl_func_decl, unmet, subject, shown);
+                return false;
+            }
             // Position of this bound's type parameter = index into `bindings`.
             mut idx: i64 = -1;
             for (mut pi: i64 = 0; pi < entry.param_syms.length(); pi++) {
-                if (entry.param_syms[pi].equals(bound.subject_sym)) {
+                if (entry.param_syms[pi].equals(bound.subject_param())) {
                     idx = pi;
                     break;
                 }

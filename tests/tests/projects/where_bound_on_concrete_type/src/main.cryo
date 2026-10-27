@@ -1,0 +1,131 @@
+/// A `where` bound may be written on any type, not only on a type parameter:
+/// `where HighError: From<E>` or `where Wrapper<T>: Describe`.  Inside the
+/// body the bound is an assumption - `HighError::from(e)`, a `?` into
+/// `HighError` and `w.describe()` are typed by it - and each instantiation
+/// calls the implementation its own types select.  Two instantiations of one
+/// body reach two different implementations, through a static path, a `?`
+/// (in a plain and in an `async` function), and a method call, on a plain
+/// subject and on an instantiation of a generic type.
+namespace WhereBoundOnConcreteType::Main;
+
+import std::core::convert::{ From };
+import std::ffi::libc::{ printf };
+import std::future;
+
+type enum LowError { Bad(i32); }
+
+type enum MiddleError { Middle(i32); }
+
+type enum HighError { FromLow(i32); FromMiddle(i32); }
+
+implement trait From<LowError> for enum HighError {
+    static from(value: LowError) -> HighError {
+        match (value) { LowError::Bad(code) => { return HighError::FromLow(code); } }
+    }
+}
+
+implement trait From<MiddleError> for enum HighError {
+    static from(value: MiddleError) -> HighError {
+        match (value) { MiddleError::Middle(code) => { return HighError::FromMiddle(code); } }
+    }
+}
+
+function code_of(error: HighError) -> i32 {
+    match (error) {
+        HighError::FromLow(code)    => { return 100 + code; }
+        HighError::FromMiddle(code) => { return 200 + code; }
+    }
+}
+
+function lift<E>(result: Result<i32, E>) -> Result<i32, HighError> where HighError: From<E> {
+    const value: i32 = result?;
+    return Result::Ok(value + 1);
+}
+
+async function lift_later<E>(result: Result<i32, E>) -> Result<i32, HighError> where HighError: From<E> {
+    const value: i32 = result?;
+    return Result::Ok(value + 1);
+}
+
+function convert<E>(error: E) -> HighError where HighError: From<E> {
+    return HighError::from(error);
+}
+
+type struct Wrapper<T> { value: T; }
+
+implement trait From<LowError> for struct Wrapper<i32> {
+    static from(error: LowError) -> Wrapper<i32> {
+        match (error) { LowError::Bad(code) => { return Wrapper::<i32> { value: code * 10 }; } }
+    }
+}
+
+implement trait From<LowError> for struct Wrapper<i64> {
+    static from(error: LowError) -> Wrapper<i64> {
+        match (error) { LowError::Bad(code) => { return Wrapper::<i64> { value: (code * 1000) as i64 }; } }
+    }
+}
+
+function wrap<T, E>(error: E) -> Wrapper<T> where Wrapper<T>: From<E> {
+    return Wrapper::<T>::from(error);
+}
+
+function wrap_error<T, E>(result: Result<i32, E>) -> Result<i32, Wrapper<T>> where Wrapper<T>: From<E> {
+    const value: i32 = result?;
+    return Result::Ok(value);
+}
+
+type trait Describe { describe(&this) -> i32; }
+
+implement trait Describe for struct Wrapper<i32> { describe(&this) -> i32 { return 1; } }
+
+implement trait Describe for struct Wrapper<i64> { describe(&this) -> i32 { return 2; } }
+
+function describe_it<T>(wrapper: &Wrapper<T>) -> i32 where Wrapper<T>: Describe {
+    return wrapper.describe();
+}
+
+function check(passed: i32, ok: boolean, what: string) -> i32 {
+    if (!ok) {
+        printf("FAILED: %s\n", what);
+        return passed;
+    }
+    return passed + 1;
+}
+
+function error_code(result: Result<i32, HighError>) -> i32 {
+    match (result) {
+        Result::Ok(_)      => { return -1; }
+        Result::Err(error) => { return code_of(error); }
+    }
+}
+
+async function main() -> i32 {
+    mut passed: i32 = 0;
+    const low: Result<i32, LowError> = Result::Err(LowError::Bad(7));
+    passed = check(passed, error_code(lift(low)) == 107, "`?` converts through the From<LowError> implementation");
+    const middle: Result<i32, MiddleError> = Result::Err(MiddleError::Middle(9));
+    passed = check(passed, error_code(lift(middle)) == 209, "`?` converts through the From<MiddleError> implementation");
+    const fine: Result<i32, LowError> = Result::Ok(4);
+    passed = check(passed, match (lift(fine)) { Result::Ok(value) => { value == 5 } Result::Err(_) => { false } },
+        "`?` passes an Ok value through");
+    const later_low: Result<i32, LowError> = Result::Err(LowError::Bad(8));
+    passed = check(passed, error_code(await lift_later(later_low)) == 108, "an async `?` converts through From<LowError>");
+    const later_middle: Result<i32, MiddleError> = Result::Err(MiddleError::Middle(3));
+    passed = check(passed, error_code(await lift_later(later_middle)) == 203, "an async `?` converts through From<MiddleError>");
+    passed = check(passed, code_of(convert(LowError::Bad(3))) == 103, "a static path calls From<LowError>");
+    passed = check(passed, code_of(convert(MiddleError::Middle(4))) == 204, "a static path calls From<MiddleError>");
+    const small: Wrapper<i32> = wrap::<i32, LowError>(LowError::Bad(2));
+    passed = check(passed, small.value == 20, "a path on Wrapper<T> calls Wrapper<i32>'s from");
+    const large: Wrapper<i64> = wrap::<i64, LowError>(LowError::Bad(2));
+    passed = check(passed, large.value == 2000, "a path on Wrapper<T> calls Wrapper<i64>'s from");
+    const wrapped: Result<i32, LowError> = Result::Err(LowError::Bad(3));
+    passed = check(passed, match (wrap_error::<i32, LowError>(wrapped)) {
+        Result::Ok(_)      => { false }
+        Result::Err(error) => { error.value == 30 }
+    }, "`?` into Wrapper<T> converts through Wrapper<i32>'s from");
+    passed = check(passed, describe_it(&small) == 1, "a method call reaches Wrapper<i32>'s Describe");
+    passed = check(passed, describe_it(&large) == 2, "a method call reaches Wrapper<i64>'s Describe");
+    printf("where bound on a concrete type: %d of 12 checks passed\n", passed);
+    if (passed != 12) { return 1; }
+    return 0;
+}

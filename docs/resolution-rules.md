@@ -212,16 +212,15 @@ yet is recorded with the change that builds it, not here.
      that walk built; nothing walks an instance's copy again.  So in a
      generic function a `?` whose error conversion involves a type
      parameter is the conversion a `where` bound gives the function's
-     error type: `F: From<E>` exactly, the trait by identity and its
-     argument as written, and the `?` returns `Err(F::from(e))`, each
-     instance calling its own type's `from`.  With no such bound - none
-     at all, one naming another argument, or one written on a type that
-     is not a parameter (`where HighError: From<E>`) - the `?` is E0214
-     where it is written, whether or not anything instantiates the body,
-     and the help names the bound to add.  A conversion between concrete
-     types in a generic body is judged as anywhere else.  (delegated;
-     whether a bound written on a concrete type should direct a call is
-     open)
+     error type: `F: From<E>` or `HighError: From<E>` exactly, the trait
+     by identity and its argument as written, and the `?` returns
+     `Err(F::from(e))`, each instance calling the `from` its own types
+     select (616).  With no such bound - none at all, or one naming
+     another argument - the `?` is E0214 where it is written, whether or
+     not anything instantiates the body, and the help names the bound to
+     add.  A conversion between concrete types in a generic body is
+     judged as anywhere else.  (delegated; the bound on a concrete error
+     type Jake)
 
 605. **Addresses, URLs, methods and status codes are `Display`.**  An
      `IpV4Addr` writes dotted decimal; an `IpV6Addr` its canonical text
@@ -395,6 +394,30 @@ yet is recorded with the change that builds it, not here.
      into a byte array, panicking where the array cannot grow.  (Jake for
      `over`, `from_wsa` and the `FmtWrite` impl; `position`, the
      `From<FmtError>` conversion and the ungated codes delegated)
+
+616. **A `where` bound may be written on any type.**  A bound's subject is
+     a written type, stamped and resolved like every annotation: a
+     parameter (`T: Ord`), a projection (`This::Item: Ord`), a named type
+     (`HighError: From<E>`) or an instantiation (`Wrapper<T>: Describe`).
+     Which bound is written on a type is one question, asked by type
+     identity - a parameter is the one its declaration binds - and every
+     use below asks it.  In a function's or method's body the bound is an
+     assumption: a path through its subject whose member the bound's trait
+     declares, and whose arguments that member takes at the bound's
+     arguments, is the trait's member; a `?` into the subject converts
+     through it (604); a method call on a value of a subject that still
+     names a parameter reaches the bound's trait first.  The path or call records the trait's member and
+     the parameters the bound gives it, and each copy of the body binds it
+     to the implementation of the trait for the copy's subject whose
+     method takes those parameters - two instantiations reach two
+     implementations.  A path whose arguments the member does not take is
+     the subject's own, as without the bound.  At each call the subject and
+     the trait's arguments are resolved with the call's type arguments put
+     in, and an implementation binding the trait at those arguments must
+     exist, or the call is E0306, naming the trait with its arguments.  On
+     an `implement` block or a type declaration such a bound is not yet
+     given a meaning (roadmap).  (Jake for the bound and the call-site
+     check; the precedence of a type's own path member delegated)
 
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,

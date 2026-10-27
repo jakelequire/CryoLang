@@ -326,8 +326,7 @@ type struct MethodBinding {
                 t.as_assoc_projection(), walk, method_name, dir);
         }
         if (t.kind == TypeKind::GenericParam) {
-            return this.lookup_method_through_param_bounds(
-                t.as_generic_param(), walk, method_name, dir);
+            return this.lookup_method_through_bounds(walk, method_name, dir);
         }
         // A generic owner instantiated at a still-abstract argument (`H<S>` built
         // inside a generic function) is "unresolved" only in its ARGUMENTS: the
@@ -337,45 +336,51 @@ type struct MethodBinding {
         // substitutes it once the argument is bound. Without this the symbolic
         // path returns invalid and the call types as nothing, which an enclosing
         // `await` reports as an operand that does not implement `Future`.
+        // A `where` bound written on the instantiation itself (`where
+        // Wrapper<T>: Describe`) answers first, as a parameter's bound does.
         if (t.kind == TypeKind::InstantiatedType) {
+            const bound_ret: TypeRef = this.lookup_method_through_bounds(walk, method_name, dir);
+            if (bound_ret.is_valid()) { return bound_ret; }
             return this.resolve_method_return_via_template(walk, method_name, chosen_decl);
         }
         return TypeRef::invalid();
     }
 
-    /// Resolve `method_name` through the where-clause bounds naming the generic
-    /// parameter `param` (`where S: AsyncRead`).
+    /// Resolve `method_name` through the where-clause bounds written on the
+    /// receiver's type `recv`: a type parameter (`where S: AsyncRead`), or
+    /// any other type that still names one (`where Wrapper<T>: Describe`).
     ///
-    /// A parameter's bounds live on the enclosing function/impl node, not on
-    /// its type, so they are read there. The bare-parameter sibling of
+    /// Bounds live on the enclosing function/impl node, not on the type, so
+    /// they are read there. The sibling of
     /// `lookup_method_through_projection_bounds`.
     ///
     /// The function's bounds answer first, then the impl's, then the owner
     /// declaration's; `dir` notes every trait any of them answers through,
     /// so two traits providing the name leave the call undirected.
-    lookup_method_through_param_bounds(mut &this, param: GenericParamType*, recv: TypeRef,
-                                       method_name: SymbolStr, dir: BoundDirection*) -> TypeRef {
-        if (param == null) { return TypeRef::invalid(); }
+    lookup_method_through_bounds(mut &this, recv: TypeRef, method_name: SymbolStr,
+                                 dir: BoundDirection*) -> TypeRef {
+        const rt: Type* = this.arena.lookup(recv);
+        if (rt == null) { return TypeRef::invalid(); }
         // `This` in a trait's default method is bounded by that trait alone,
         // which no where-clause writes.
-        if (this.arena.is_this_placeholder(param)) {
+        if (rt.kind == TypeKind::GenericParam && this.arena.is_this_placeholder(rt.as_generic_param())) {
             if (!this.state.symbolic_trait.is_valid()) { return TypeRef::invalid(); }
             mut none: [TraitBound] = [];
-            return this.scan_param_bounds(&none, param, method_name, recv, this.state.symbolic_trait, true, dir);
+            return this.scan_bounds_on(&none, method_name, recv, this.state.symbolic_trait, true, dir);
         }
         mut out: TypeRef = TypeRef::invalid();
         if (this.state.symbolic_current_func != null) {
-            out = this.scan_param_bounds(&DeclarationNode::fn_of(this.state.symbolic_current_func).trait_bounds, param, method_name,
+            out = this.scan_bounds_on(&DeclarationNode::fn_of(this.state.symbolic_current_func).trait_bounds, method_name,
                 recv, TypeRef::invalid(), true, dir);
         }
         if (this.state.symbolic_impl_node != null) {
-            const r: TypeRef = this.scan_param_bounds(&this.state.symbolic_impl_node.where_bounds, param,
+            const r: TypeRef = this.scan_bounds_on(&this.state.symbolic_impl_node.where_bounds,
                 method_name, recv, TypeRef::invalid(), !out.is_valid(), dir);
             if (!out.is_valid()) { out = r; }
         }
         const owner_bounds: [TraitBound]* = this.owner_declared_bounds();
         if (owner_bounds != null) {
-            const r: TypeRef = this.scan_param_bounds(owner_bounds, param, method_name, recv,
+            const r: TypeRef = this.scan_bounds_on(owner_bounds, method_name, recv,
                 TypeRef::invalid(), !out.is_valid(), dir);
             if (!out.is_valid()) { out = r; }
         }
@@ -387,23 +392,17 @@ type struct MethodBinding {
     }
 
     /// The parameter types, after its receiver, of `func` - the declared
-    /// method of the trait `trait_def` - with the arguments of the `where`
-    /// bound on the parameter `param_ty` naming that trait substituted in:
-    /// what a call the bound directs to `func` passes (`[&JsonValue]` for
-    /// `T::try_from(v)` under `where T: TryFrom<&JsonValue>`).  Empty when
-    /// the trait has no parameters of its own, or no bound on `param_ty`
-    /// itself names it.
-    bound_method_params(mut &this, param_ty: TypeRef, trait_def: DefId,
-                        func_decl: DeclarationNode*) -> [TypeRef] {
+    /// method of the trait the bound's `tr` names - with the arguments `tr`
+    /// writes substituted in: what a call the bound directs to `func` passes
+    /// (`[&JsonValue]` for `T::try_from(v)` under `where T:
+    /// TryFrom<&JsonValue>`).  Empty when the trait has no parameters of its
+    /// own.
+    bound_method_params(mut &this, tr: TraitRef*, func_decl: DeclarationNode*) -> [TypeRef] {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         mut out: [TypeRef] = [];
-        if (func == null) { return out; }
-        const pt: Type* = this.arena.lookup(param_ty);
-        if (pt == null || pt.kind != TypeKind::GenericParam) { return out; }
-        const tdecl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(trait_def);
+        if (func == null || tr == null) { return out; }
+        const tdecl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(tr.definition());
         if (tdecl == null || tdecl.generic_params.length() == 0) { return out; }
-        const tr: TraitRef* = this.param_bound_naming(pt.as_generic_param(), trait_def);
-        if (tr == null) { return out; }
         const leaf: SymbolStr = tr.path[tr.path.length() - 1];
         for (mut i: i64 = 0; i < func.parameters.length(); i++) {
             const p_decl: DeclarationNode* = func.parameters[i];
@@ -415,71 +414,84 @@ type struct MethodBinding {
         return out;
     }
 
-    /// The trait of a `where` bound on `param` itself naming `trait_def`, by
-    /// identity: the enclosing function's bounds first, then the impl's,
-    /// then the owner declaration's, as `lookup_method_through_param_bounds`
-    /// asks them.  Null when none does.
-    param_bound_naming(&this, param: GenericParamType*, trait_def: DefId) -> TraitRef* {
+    /// The traits the `where` bounds in scope of the body being walked write
+    /// on `subject` naming `trait_def`, by identity: the enclosing
+    /// function's bounds first, then the impl's, then the owner
+    /// declaration's, as `lookup_method_through_param_bounds` asks them.
+    bounds_naming(mut &this, subject: TypeRef, trait_def: DefId) -> [TraitRef*] {
+        const all: [TraitRef*] = this.bounds_on(subject);
+        mut out: [TraitRef*] = [];
+        for (mut i: i64 = 0; i < all.length(); i++) {
+            if (all[i].definition().equals(trait_def)) { out.push(all[i]); }
+        }
+        return out;
+    }
+
+    /// Every trait the `where` bounds in scope of the body being walked
+    /// write on `subject`, in the order `bounds_naming` asks them.
+    bounds_on(mut &this, subject: TypeRef) -> [TraitRef*] {
+        mut out: [TraitRef*] = [];
         if (this.state.symbolic_current_func != null) {
-            const r: TraitRef* = MethodBinding::bound_ref_in(&DeclarationNode::fn_of(this.state.symbolic_current_func).trait_bounds, param, trait_def);
-            if (r != null) { return r; }
+            this.push_bounds_on(&DeclarationNode::fn_of(this.state.symbolic_current_func).trait_bounds, subject, &out);
         }
         if (this.state.symbolic_impl_node != null) {
-            const r: TraitRef* = MethodBinding::bound_ref_in(&this.state.symbolic_impl_node.where_bounds, param, trait_def);
-            if (r != null) { return r; }
+            this.push_bounds_on(&this.state.symbolic_impl_node.where_bounds, subject, &out);
         }
         const owner_bounds: [TraitBound]* = this.owner_declared_bounds();
-        if (owner_bounds != null) { return MethodBinding::bound_ref_in(owner_bounds, param, trait_def); }
-        return null;
+        if (owner_bounds != null) { this.push_bounds_on(owner_bounds, subject, &out); }
+        return out;
     }
 
-    /// Whether a `where` bound in scope of the body being walked - the
-    /// function's, the impl's or the owner declaration's - names `trait_def`
-    /// on `param` itself at exactly the arguments `args`, compared by
-    /// identity: `F: From<E>` gives `From<E>`, not `From<i32>`.
-    param_bound_gives_at(mut &this, param: GenericParamType*, trait_def: DefId, args: &[TypeRef]) -> boolean {
-        if (this.state.symbolic_current_func != null
-                && this.bounds_give_at(&DeclarationNode::fn_of(this.state.symbolic_current_func).trait_bounds, param, trait_def, args)) {
-            return true;
-        }
-        if (this.state.symbolic_impl_node != null
-                && this.bounds_give_at(&this.state.symbolic_impl_node.where_bounds, param, trait_def, args)) {
-            return true;
-        }
-        const owner_bounds: [TraitBound]* = this.owner_declared_bounds();
-        return owner_bounds != null && this.bounds_give_at(owner_bounds, param, trait_def, args);
-    }
-
-    bounds_give_at(mut &this, bounds: &[TraitBound], param: GenericParamType*, trait_def: DefId, args: &[TypeRef]) -> boolean {
+    push_bounds_on(mut &this, bounds: &[TraitBound], subject: TypeRef, out: mut &[TraitRef*]) -> void {
         for (mut bi: i64 = 0; bi < bounds.length(); bi++) {
             const b: TraitBound* = &bounds[bi];
-            if (!MethodBinding::bound_names_param(b, param)) { continue; }
+            if (!this.bound_is_on(b, subject)) { continue; }
             for (mut ti: i64 = 0; ti < b.trait_refs.length(); ti++) {
                 const tr: TraitRef* = &b.trait_refs[ti];
-                if (tr.path.length() == 0 || tr.refused || !tr.definition().equals(trait_def)) { continue; }
-                const written: [TypeRef] = this.bound_trait_arg_types(tr);
-                if (written.length() != args.length()) { continue; }
-                mut same: boolean = true;
-                for (mut k: i64 = 0; k < args.length(); k++) {
-                    if (!written[k].equals(args[k])) { same = false; }
-                }
-                if (same) { return true; }
+                if (tr.path.length() == 0 || tr.refused) { continue; }
+                out.push(tr);
             }
+        }
+    }
+
+    /// Whether a `where` bound in scope of the body being walked gives
+    /// `subject` the trait `trait_def` at exactly the arguments `args`,
+    /// compared by identity: `F: From<E>` gives `From<E>`, not `From<i32>`.
+    bound_gives_at(mut &this, subject: TypeRef, trait_def: DefId, args: &[TypeRef]) -> boolean {
+        const refs: [TraitRef*] = this.bounds_naming(subject, trait_def);
+        for (mut i: i64 = 0; i < refs.length(); i++) {
+            if (this.bound_writes_args(refs[i], args)) { return true; }
         }
         return false;
     }
 
-    static bound_ref_in(bounds: &[TraitBound], param: GenericParamType*, trait_def: DefId) -> TraitRef* {
-        for (mut bi: i64 = 0; bi < bounds.length(); bi++) {
-            const b: TraitBound* = &bounds[bi];
-            if (!MethodBinding::bound_names_param(b, param)) { continue; }
-            for (mut ti: i64 = 0; ti < b.trait_refs.length(); ti++) {
-                const tr: TraitRef* = &b.trait_refs[ti];
-                if (tr.path.length() == 0 || tr.refused) { continue; }
-                if (tr.definition().equals(trait_def)) { return tr; }
-            }
+    /// Whether the bound trait `tr` is written at exactly the arguments
+    /// `args`, compared by identity.
+    bound_writes_args(mut &this, tr: TraitRef*, args: &[TypeRef]) -> boolean {
+        const written: [TypeRef] = this.bound_trait_arg_types(tr);
+        if (written.length() != args.length()) { return false; }
+        for (mut k: i64 = 0; k < args.length(); k++) {
+            if (!written[k].equals(args[k])) { return false; }
         }
-        return null;
+        return true;
+    }
+
+    /// Whether the bound `b` is written on `subject`, compared by type
+    /// identity: a type parameter is the one its declaration binds, and any
+    /// other type is the bound's written subject resolved in the body being
+    /// walked.  A projection subject answers through its own door
+    /// (`bound_subject_is`).
+    bound_is_on(mut &this, b: TraitBound*, subject: TypeRef) -> boolean {
+        if (b.has_projection_subject()) { return false; }
+        const st: Type* = this.arena.lookup(subject);
+        if (st == null) { return false; }
+        if (st.kind == TypeKind::GenericParam) {
+            return MethodBinding::bound_names_param(b, st.as_generic_param());
+        }
+        if (b.subject_param().is_valid()) { return false; }
+        mut rc: ResolutionContext = ResolutionContext::new("");
+        this.symbolic.symbolic_bind_params(&rc);
+        return this.ctx.type_resolver.resolve(b.subject, &rc).equals(subject);
     }
 
     /// The `where` bounds written on the declaration of the type whose
@@ -605,27 +617,25 @@ type struct MethodBinding {
 
     /// Whether the bound `b` has `param` itself as its subject.
     static bound_names_param(b: TraitBound*, param: GenericParamType*) -> boolean {
-        return !b.has_projection_subject() && param.declared_by(b.subject_sym);
+        return !b.has_projection_subject() && param.declared_by(b.subject_param());
     }
 
-    /// Search `bounds` for a BARE-parameter bound on `param`; return the first
-    /// bound trait's method return with the bound's associated-type args
-    /// substituted and `This` rebased onto `recv`. The bare-subject sibling of
-    /// `scan_projection_bounds`.  `implied`, when valid, is a bound no
-    /// where-clause writes - the trait bounding `This` in its own default
-    /// methods - asked before `bounds`, with no associated-type arguments.
-    /// Every bound is asked, and each trait - the bound's, or the
-    /// supertrait's - whose declaration answers is noted in `dir`; the
+    /// Search `bounds` for a bound written on `recv` (`bound_is_on`); return
+    /// the first bound trait's method return with the bound's
+    /// associated-type args substituted and `This` rebased onto `recv`. The
+    /// sibling of `scan_projection_bounds`.  `implied`, when valid, is a
+    /// bound no where-clause writes - the trait bounding `This` in its own
+    /// default methods - asked before `bounds`, with no associated-type
+    /// arguments.  Every bound is asked, and each trait - the bound's, or
+    /// the supertrait's - whose declaration answers is noted in `dir`; the
     /// return is the first answer's, computed only when `need_ret`.
-    scan_param_bounds(mut &this, bounds: &[TraitBound], param: GenericParamType*,
-                      method_name: SymbolStr, recv: TypeRef, implied: TypeRef,
-                      need_ret: boolean, dir: BoundDirection*) -> TypeRef {
+    scan_bounds_on(mut &this, bounds: &[TraitBound], method_name: SymbolStr, recv: TypeRef,
+                      implied: TypeRef, need_ret: boolean, dir: BoundDirection*) -> TypeRef {
         mut out: TypeRef = TypeRef::invalid();
         const first: i64 = if (implied.is_valid()) { -1 } else { 0 };
         for (mut bi: i64 = first; bi < bounds.length(); bi++) {
             const b: TraitBound* = if (bi < 0) { null } else { &bounds[bi] };
-            if (b != null && b.has_projection_subject()) { continue; }
-            if (b != null && !param.declared_by(b.subject_sym)) { continue; }
+            if (b != null && !this.bound_is_on(b, recv)) { continue; }
             const refs: i64 = if (b == null) { 1 } else { b.trait_refs.length() };
             for (mut ti: i64 = 0; ti < refs; ti++) {
                 const tr: TraitRef* = if (b == null) { null } else { &b.trait_refs[ti] };
@@ -691,12 +701,12 @@ type struct MethodBinding {
         ctx.set_this_type(this.state.this_type);
         for (mut bi: i64 = 0; bi < func.trait_bounds.length(); bi++) {
             const b: TraitBound* = &func.trait_bounds[bi];
-            if (!b.has_projection_subject() || b.subject_type == null) { continue; }
+            if (!b.has_projection_subject()) { continue; }
             // The default's receiver is the projection itself, which carries
             // no indirection to peel; in the copy the projection is a type
             // that may (`T*`), and the receiver's peeling went through it.
             const subject: TypeRef = this.peel_all_indirection(this.reduce_assoc_projections(
-                this.ctx.type_resolver.resolve(b.subject_type, &ctx)));
+                this.ctx.type_resolver.resolve(b.subject, &ctx)));
             if (!subject.is_valid() || !subject.equals(recv)) { continue; }
             for (mut ti: i64 = 0; ti < b.trait_refs.length(); ti++) {
                 const tr: TraitRef* = &b.trait_refs[ti];
@@ -788,7 +798,7 @@ type struct MethodBinding {
 
     /// Search `bounds` for a BARE-parameter bound on `param` and return the
     /// first bound trait's declaration of `method_name` taking `arg_count`
-    /// arguments. The parameter-list sibling of `scan_param_bounds`.  Each
+    /// arguments. The parameter-list sibling of `scan_bounds_on`.  Each
     /// trait's methods are matched by the position the trait-method door
     /// gives the leaf.
     scan_param_bound_param_types(mut &this, bounds: &[TraitBound], param: GenericParamType*,
@@ -796,7 +806,7 @@ type struct MethodBinding {
         for (mut bi: i64 = 0; bi < bounds.length(); bi++) {
             const b: TraitBound* = &bounds[bi];
             if (b.has_projection_subject()) { continue; }
-            if (!param.declared_by(b.subject_sym)) { continue; }
+            if (!param.declared_by(b.subject_param())) { continue; }
             for (mut ti: i64 = 0; ti < b.trait_refs.length(); ti++) {
                 const tr: TraitRef* = &b.trait_refs[ti];
                 if (tr.path.length() == 0) { continue; }
@@ -838,8 +848,8 @@ type struct MethodBinding {
         mut out: TypeRef = TypeRef::invalid();
         for (mut bi: i64 = 0; bi < bounds.length(); bi++) {
             const b: TraitBound* = &bounds[bi];
-            if (b.subject_type == null) { continue; }
-            if (!this.bound_subject_is(b.subject_type, proj)) { continue; }
+            if (!b.has_projection_subject()) { continue; }
+            if (!this.bound_subject_is(b.subject, proj)) { continue; }
             for (mut ti: i64 = 0; ti < b.trait_refs.length(); ti++) {
                 const tr: TraitRef* = &b.trait_refs[ti];
                 if (tr.path.length() == 0) { continue; }
@@ -1013,7 +1023,7 @@ type struct MethodBinding {
         for (mut bi: i64 = 0; bi < mfunc.trait_bounds.length(); bi++) {
             const b: TraitBound* = &mfunc.trait_bounds[bi];
             if (!b.has_projection_subject()) { continue; }
-            const member: SymbolStr = this.projection_ann_member(b.subject_type);
+            const member: SymbolStr = this.projection_ann_member(b.subject);
             if (!member.is_valid()) { continue; }
             const assoc_idx: i64 = tdecl.assoc_type_index(member);
             if (assoc_idx < 0) { continue; }
@@ -1345,7 +1355,7 @@ type struct MethodBinding {
         if (this.state.symbolic_impl_node != null) {
             for (mut bi: i64 = 0; bi < this.state.symbolic_impl_node.where_bounds.length(); bi++) {
                 const bound: TraitBound* = &this.state.symbolic_impl_node.where_bounds[bi];
-                if (!gpt.declared_by(bound.subject_sym)) { continue; }
+                if (!gpt.declared_by(bound.subject_param())) { continue; }
                 for (mut ti: i64 = 0; ti < bound.trait_refs.length(); ti++) {
                     const tr: TraitRef* = &bound.trait_refs[ti];
                     if (tr.path.length() == 0) { continue; }
@@ -1356,7 +1366,7 @@ type struct MethodBinding {
         if (this.state.symbolic_current_func != null) {
             for (mut wi: i64 = 0; wi < DeclarationNode::fn_of(this.state.symbolic_current_func).trait_bounds.length(); wi++) {
                 const wb: TraitBound* = &DeclarationNode::fn_of(this.state.symbolic_current_func).trait_bounds[wi];
-                if (!gpt.declared_by(wb.subject_sym)) { continue; }
+                if (!gpt.declared_by(wb.subject_param())) { continue; }
                 for (mut ti: i64 = 0; ti < wb.trait_refs.length(); ti++) {
                     const tr: TraitRef* = &wb.trait_refs[ti];
                     if (tr.path.length() == 0) { continue; }
@@ -1971,7 +1981,7 @@ type struct MethodBinding {
         if (impl_node.where_bounds.length() == 0) { return; }
         for (mut bi: i64 = 0; bi < impl_node.where_bounds.length(); bi++) {
             const bound: TraitBound* = &impl_node.where_bounds[bi];
-            const subject: TypeRef = this.trait_checker().lookup_subst_for_param(bound.subject_sym, subst);
+            const subject: TypeRef = this.trait_checker().lookup_subst_for_param(bound.subject_param(), subst);
             if (!subject.is_valid()) { continue; }
             for (mut ti: i64 = 0; ti < bound.trait_refs.length(); ti++) {
                 const tr: TraitRef* = &bound.trait_refs[ti];
@@ -2030,9 +2040,9 @@ type struct MethodBinding {
         if (base == null || base.kind != TypeKind::GenericParam) { return t; }
         const trait_def: DefId = this.ctx.decl_index.def_of(proj.owning_trait, this.arena);
         if (!trait_def.is_valid()) { return t; }
-        const tr: TraitRef* = this.param_bound_naming(base.as_generic_param(), trait_def);
-        if (tr == null) { return t; }
-        return this.subst_bound_trait_args(t, tr.path[tr.path.length() - 1], tr);
+        const refs: [TraitRef*] = this.bounds_naming(proj.base, trait_def);
+        if (refs.length() == 0) { return t; }
+        return this.subst_bound_trait_args(t, refs[0].path[refs[0].path.length() - 1], refs[0]);
     }
 
     /// Recursively replace concrete-base associated-type projections in `ty` with

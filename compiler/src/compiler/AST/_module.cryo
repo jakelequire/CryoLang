@@ -794,44 +794,45 @@ implement trait Clone for struct TraitRef {
 /// `where T: Trait` is a single-element array; `where T: A + B` has two;
 /// each entry carries its own (possibly qualified) path.
 type struct TraitBound {
-    // The bound subject. A bare type parameter (`where T: Ord`) is named here
-    // and `subject_type` is null. An associated-type PROJECTION subject
-    // (`where This::Item: Ord`) leaves this empty and carries the projection
-    // annotation in `subject_type` instead - keeping `type_parameter` empty is
-    // what makes a projection bound spell no parameter.  The spelling is for
-    // text; a consumer asking WHICH parameter reads `subject_sym`.
-    type_parameter: SymbolStr;
-    // The symbol the bare subject's declaration bound, stamped by the name
-    // layer in the scope the clause is written in; invalid for a projection
-    // subject and for a spelling that names no parameter in that scope.  A
-    // clone keeps it: a `Res` names a definition, and the clone's syntax is
-    // the template's.
-    subject_sym:    SymbolID;
-    // Non-null only for a projection subject: the parsed `Base::Member`
-    // annotation (a `TypeAnnotation::Projection`). Null for a bare-param bound.
-    subject_type:   TypeAnnotation*;
-    trait_refs:     [TraitRef];
-    span:           SourceSpan;
+    // The type the bound constrains, as written: a type parameter
+    // (`where T: Ord`), an associated-type projection (`where This::Item:
+    // Ord`), or any other type (`where HighError: From<E>`, `where
+    // Array<T>: Display`).  The name layer stamps it like every annotation,
+    // and which parameter a bare subject names is read off that stamp.
+    subject:    TypeAnnotation*;
+    trait_refs: [TraitRef];
+    span:       SourceSpan;
 
-    /// True when the subject is an associated-type projection rather than a
-    /// bare type parameter.
+    /// True when the subject is an associated-type projection.
     has_projection_subject(&this) -> boolean {
-        return this.subject_type != null;
+        if (this.subject == null) { return false; }
+        return match (*this.subject) {
+            TypeAnnotation::Projection(_) => { true }
+            _                             => { false }
+        };
+    }
+
+    /// The type parameter the subject is, by the symbol its declaration
+    /// bound; invalid when the subject is any other type.
+    subject_param(&this) -> SymbolID {
+        if (this.subject == null) { return SymbolID::invalid(); }
+        return match (*this.subject) {
+            TypeAnnotation::Named(n) => { n.param_sym() }
+            _                        => { SymbolID::invalid() }
+        };
     }
 }
 
 /// A deep copy: each (owning) TraitRef is cloned into an independent buffer,
 /// so the result can be stored in a second owner without a double-free.  The
-/// projection subject, if any, is null-safe cloned so the specialization
-/// re-resolves `Base::Member` against its substituted base.
+/// subject is cloned with its stamp, so a specialization re-resolves it
+/// against its substituted parameters.
 implement trait Clone for struct TraitBound {
     clone(&this) -> TraitBound {
         return TraitBound {
-            type_parameter: this.type_parameter,
-            subject_sym:    this.subject_sym,
-            subject_type:   TypeAnnotation::clone_ptr(this.subject_type),
-            trait_refs:     this.trait_refs.clone(),
-            span:           this.span,
+            subject:    TypeAnnotation::clone_ptr(this.subject),
+            trait_refs: this.trait_refs.clone(),
+            span:       this.span,
         };
     }
 }

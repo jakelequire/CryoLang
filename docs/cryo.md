@@ -1142,7 +1142,7 @@ function fill(out: mut &Array<u8>, bytes: Slice<u8>) -> Result<(), IoError> {
 }
 ```
 
-In a generic function, a conversion from or into a type parameter is the one a bound gives: the function's error type is a parameter `F` with `where F: From<E>`, and each instantiation calls its own type's `from`. A body is typed by its bounds, so without such a bound the `?` is refused where it is written (`E0214`), whether or not anything instantiates the function. A bound written on a type that is not a parameter (`where IoError: From<E>`) gives nothing.
+In a generic function, a conversion that involves a type parameter is the one a bound gives the function's error type: a parameter `F` with `where F: From<E>`, or the error type as written, `where IoError: From<E>` ([section 10.3](#103-trait-bounds-with-where)), and each instantiation calls the `from` of the implementation its own types select. A body is typed by its bounds, so without such a bound - none, or one naming another argument - the `?` is refused where it is written (`E0214`), whether or not anything instantiates the function.
 
 ```cryo
 function lift<E, F>(r: Result<i32, E>) -> Result<i32, F> where F: From<E> {
@@ -2075,6 +2075,19 @@ function f<T>(x: &T) -> i32 where T: Nowhere { return 1; }    // error[E0242]: c
 ```
 
 A type's bound is checked once per instantiation: `Holder<Plain>` with a `Plain` that does not implement `Tagged` is an error (E0306) at the annotation that wrote it, with the bound as declared beside it. An instantiation reached without an annotation — a literal, a static call — is refused the same way where it is specialised.
+
+A function's or method's bound may be written on any type, not only on a parameter: a named type (`where HighError: From<E>`) or an instantiation (`where Wrapper<T>: Describe`). Inside the body the bound is an assumption, as a parameter's is: a path through the type (`HighError::from(e)`) whose arguments are the ones the bound's trait takes at the bound's arguments calls that trait's member, a `?` converts through it, and a method call on a value of the type (`w.describe()`) reaches the bound's trait. Each instantiation calls the implementation its own types select - `lift::<LowError>` the `From<LowError>` implementation, `lift::<MiddleError>` the `From<MiddleError>` one - and a call whose types select none is refused where it is written (E0306), naming the trait with its arguments: "the trait bound `HighError: From<OtherError>` is not satisfied". A path whose arguments the bound's trait does not take is the type's own, as without the bound.
+
+```cryo
+function lift<E>(r: Result<i32, E>) -> Result<i32, HighError> where HighError: From<E> {
+    const n: i32 = r?;                 // Err(HighError::from(e)), through the bound
+    return Result::Ok(n);
+}
+
+function describe_it<T>(w: &Wrapper<T>) -> i32 where Wrapper<T>: Describe {
+    return w.describe();               // Describe for Wrapper<i32>, or for Wrapper<i64>, per instantiation
+}
+```
 
 Inside the body that declares it, a parameter has only the methods its bounds give it. A method call on a parameter that no bound in scope names — the function's `where` clause, the enclosing `implement` block's, or the type declaration's — is an error (E0358) where the call is written, whether or not anything instantiates the body.
 

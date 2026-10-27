@@ -381,17 +381,58 @@ type struct TypeResolver {
         for (mut k: i64 = 0; k < traits.length(); k++) {
             if (traits[k].equals(object.trait_def)) { blocks.push(own); continue; }
             const args: [TypeRef] = this.object_trait_arguments(object, traits[k]);
-            const heads: [DeclarationNode*] = registry.heads_for(traits[k], value, this.intern_table);
-            mut found: ImplBlock* = null;
-            for (mut i: i64 = 0; i < heads.length(); i++) {
-                const candidate: ImplBlock* = DeclarationNode::impl_of(heads[i]);
-                if (candidate == null || !registry.binds_trait_arguments(candidate, &args, this.intern_table)) { continue; }
-                if (checker.impl_applies(candidate, value, 0)) { found = candidate; break; }
-            }
+            const found: DeclarationNode* = checker.implementation_at(traits[k], &args, value);
             if (found == null) { return traits[k]; }
-            blocks.push(found);
+            blocks.push(DeclarationNode::impl_of(found));
         }
         return DefId::invalid();
+    }
+
+    /// The trait of `bound`, written on a type that is not a parameter
+    /// (`where HighError: From<E>`, `where Array<T>: Display`), that the
+    /// type does not implement once the declaring template's parameters
+    /// `param_syms` are bound to `bindings`: the subject and the trait's
+    /// arguments are resolved with them put in, and an implementation must
+    /// bind the trait at those arguments with its own bounds holding.
+    /// `*out_subject` is the subject so resolved and `*out_trait` the trait
+    /// as it is required, with its arguments (`From<OtherError>`).  Null
+    /// when every trait has one, and when the subject or an argument still
+    /// names a parameter, which the copy that binds it decides.
+    unmet_written_bound(&this, bound: TraitBound*, param_syms: &[SymbolID], bindings: &[TypeRef],
+                        out_subject: TypeRef*, out_trait: SymbolStr*) -> TraitRef* {
+        if (bound.has_projection_subject() || bound.subject_param().is_valid()) { return null; }
+        mut rc: ResolutionContext = ResolutionContext::new("");
+        rc.symbolic_no_demand = true;
+        for (mut i: i64 = 0; i < param_syms.length() && i < bindings.length(); i++) {
+            if (bindings[i].is_valid()) { rc.add_binding(param_syms[i], SymbolStr::empty(), bindings[i]); }
+        }
+        const subject: TypeRef = this.resolve(bound.subject, &rc);
+        if (!subject.is_valid() || this.arena.contains_generic_param(subject)) { return null; }
+        const checker: TraitChecker = TraitChecker::new(
+            this.arena, this.generic_registry, this.intern_table, this.diagnostics);
+        for (mut ri: i64 = 0; ri < bound.trait_refs.length(); ri++) {
+            const tr: TraitRef* = &bound.trait_refs[ri];
+            // A bound refused where it is written is reported there.
+            if (tr.path.length() == 0 || tr.refused) { continue; }
+            mut args: [TypeRef] = [];
+            for (mut ai: i64 = 0; ai < tr.type_args.length(); ai++) {
+                const arg: TypeRef = this.resolve(tr.type_args[ai], &rc);
+                if (!arg.is_valid() || this.arena.contains_generic_param(arg)) { return null; }
+                args.push(arg);
+            }
+            if (checker.implementation_at(tr.definition(), &args, subject) == null) {
+                mut shown: string = this.intern_table.resolve(tr.path[tr.path.length() - 1]);
+                for (mut ai: i64 = 0; ai < args.length(); ai++) {
+                    shown = shown + (if (ai == 0) { "<" } else { ", " })
+                        + this.arena.format_display(this.arena.lookup(args[ai]));
+                }
+                if (args.length() > 0) { shown = shown + ">"; }
+                *out_subject = subject;
+                *out_trait = this.intern_table.intern(shown);
+                return tr;
+            }
+        }
+        return null;
     }
 
     trait_arguments_along(&this, trait_def: DefId, args: &[TypeRef], declaring: DefId,
@@ -1006,7 +1047,7 @@ type struct TypeResolver {
         if (impl_node == null) { return; }
         for (mut bi: i64 = 0; bi < impl_node.where_bounds.length(); bi++) {
             const bound: TraitBound* = &impl_node.where_bounds[bi];
-            const subject: TypeRef = bctx.lookup_binding(bound.subject_sym);
+            const subject: TypeRef = bctx.lookup_binding(bound.subject_param());
             if (!subject.is_valid()) { continue; }
             for (mut ti: i64 = 0; ti < bound.trait_refs.length(); ti++) {
                 const tr: TraitRef* = &bound.trait_refs[ti];
@@ -1125,7 +1166,7 @@ type struct TypeResolver {
         for (mut bi: i64 = 0; bi < trait_bounds.length(); bi++) {
             const bound: TraitBound* = &trait_bounds[bi];
             if (bound.has_projection_subject()) { continue; }
-            const s: i64 = this.param_slot(param_syms, bound.subject_sym);
+            const s: i64 = this.param_slot(param_syms, bound.subject_param());
             if (s < 0 || s >= ictx.bindings.length()) { continue; }
             const subject: TypeRef = ictx.bindings[s];
             if (!subject.is_valid()) { continue; }
@@ -1333,10 +1374,10 @@ type struct TypeResolver {
         for (mut b: i64 = 0; b < func.trait_bounds.length(); b++) {
             const bound: TraitBound* = &func.trait_bounds[b];
             if (!bound.has_projection_subject()) { continue; }
-            match (*bound.subject_type) {
+            match (*bound.subject) {
                 TypeAnnotation::Projection(proj) => {
                     if (proj.resolved.is_valid()) { continue; }
-                    const subject: TypeRef = this.resolve(bound.subject_type, res_ctx);
+                    const subject: TypeRef = this.resolve(bound.subject, res_ctx);
                     const st: Type* = this.arena.lookup(subject);
                     if (st != null && st.kind != TypeKind::AssocProjection) { proj.resolved = subject; }
                 }

@@ -724,9 +724,11 @@ a cast to reach it.
   cycle that crosses packages is E0501 too or an error of its own.
 - **`std::Range`.**  Nothing re-exports `Range` at the root of `std`, so the
   path is refused today.  Whether `stdlib/lib.cryo` exports it there is open.
-- **A `where` bound on a concrete type.**  `where HighError: From<E>` is
-  accepted, but a bound directs only a path through a parameter, so neither
-  `HighError::from(e)` nor `(From<E> for HighError)::from(e)` resolves
-  through it in the generic body, and a `?` converting `E` into `HighError`
-  is refused (604).  Whether such a bound should direct a call on its
-  concrete subject, or be refused where it is written, is open.
+- **A `where` bound on a concrete type, beyond functions.**  A function's
+  or method's bound on any type directs paths, `?` and method calls (616).
+  On an `implement` block or a type declaration such a bound is parsed and
+  stamped, but the instantiation checks (`TraitChecker::bounds_satisfied*`)
+  look its subject up as a parameter and find none, so what it does there
+  is untested and unspecified.  The
+  impl-qualified path `(From<E> for HighError)::from(e)` is not directed by
+  a bound either.  Both are open.
