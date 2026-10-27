@@ -316,6 +316,23 @@ yet is recorded with the change that builds it, not here.
      `last_separator`) public.  Base64 looks its alphabet up by indexing
      a `Slice`, its own byte readers deleted.  (delegated)
 
+611. **Integers cross bytes through `ByteReader` and `ByteWriter`.**
+     `io::bytes::ByteReader` decodes from a borrowed `Slice<u8>` and
+     `ByteWriter` appends to a borrowed `Array<u8>`, each with a read or
+     write for `u8`, `i8` and the 16-, 32- and 64-bit integers of both
+     signs, in `big_endian` and `little_endian` spelled out.  A read
+     needing more bytes than remain is `UnexpectedEof` and does not move;
+     the reader has `position`, `set_position` (past the end allowed, a
+     negative offset panics) and `remaining`.  A write panics where the
+     array cannot grow, as `push` does.  The library's wire headers (HTTP/2
+     frames, SETTINGS, WINDOW_UPDATE and GOAWAY, WebSocket lengths, mask
+     keys and close codes), the `addrinfo` walk and hints, the socket
+     timeout, the sockaddr family and port reads, an IPv6 group and the
+     generator's seed words use them; their byte helpers are deleted.
+     `u8` also has `to_ascii_uppercase`, which `Str`'s fold uses.  (Jake
+     for the shape and names; the module, `set_position` and the panicking
+     write delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

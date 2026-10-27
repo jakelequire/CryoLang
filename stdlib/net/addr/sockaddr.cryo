@@ -16,7 +16,9 @@ namespace std::net::addr::sockaddr;
 
 import std::core::option;
 import std::core::result::{ Result };
+import std::core::slice::{ Slice };
 import std::io::error::{ IoError };
+import std::io::bytes::{ ByteReader };
 import std::net::addr::ip::{ IpAddr, IpV4Addr, IpV6Addr };
 import std::net::addr::socket_addr::{ SocketAddr };
 
@@ -83,7 +85,10 @@ public function pack_sockaddr_in(out: u8*, addr: &SocketAddr) -> Result<u32, IoE
 /// order). The family at offset 0 is assumed `AF_INET`; the socket
 /// layer only ever creates v4 sockets, so a v6 reply can't appear here.
 public function unpack_sockaddr_in(buf: u8*) -> SocketAddr {
-    const port: u16 = ((buf[2] as u16) << 8) | (buf[3] as u16);
+    // The family and port of either family's layout, so the read cannot run short.
+    mut fields: ByteReader = ByteReader::new(Slice::from_raw(buf, 4));
+    fields.set_position(2);
+    const port: u16 = fields.read_u16_big_endian().unwrap();
     const v4: IpV4Addr = IpV4Addr::new(buf[4], buf[5], buf[6], buf[7]);
     return SocketAddr::new(IpAddr::V4(v4), port);
 }
@@ -93,9 +98,12 @@ public function unpack_sockaddr_in(buf: u8*) -> SocketAddr {
 /// `getsockname`-style readback where the socket may be either family.
 /// The buffer must be at least 28 bytes for the v6 case.
 public function unpack_sockaddr(buf: u8*) -> SocketAddr {
-    const fam: u16 = (buf[0] as u16) | ((buf[1] as u16) << 8);
+    // The family is in host order (little-endian on every supported
+    // target), the port in network order.
+    mut fields: ByteReader = ByteReader::new(Slice::from_raw(buf, 4));
+    const fam: u16 = fields.read_u16_little_endian().unwrap();
     if (fam == af_inet6()) {
-        const port: u16 = ((buf[2] as u16) << 8) | (buf[3] as u16);
+        const port: u16 = fields.read_u16_big_endian().unwrap();
         return SocketAddr::new(IpAddr::V6(IpV6Addr::from_buf(&buf[8])), port);
     }
     return unpack_sockaddr_in(buf);

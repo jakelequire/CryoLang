@@ -31,6 +31,7 @@ import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::core::slice::{ Slice };
 import std::io::error::{ IoError, IoErrorKind };
+import std::io::bytes::{ ByteReader, ByteWriter };
 import std::io::traits::{ AsyncTransport };
 import std::io::buf::{ BufStream };
 import std::collections::array::{ Array };
@@ -89,14 +90,13 @@ implement struct BufStream<S> {
         if (len < 126) {
             out.push(mask_bit | (len as u8));
         } else {
+            mut extended: ByteWriter = ByteWriter::new(out);
             if (len <= 0xFFFF) {
                 out.push(mask_bit | 126);
-                out.push((len >> 8) as u8);
-                out.push((len)      as u8);
+                extended.write_u16_big_endian(len as u16);
             } else {
                 out.push(mask_bit | 127);
-                mut s: i64 = 56;
-                while (s >= 0) { out.push((len >> (s as u64)) as u8); s = s - 8; }
+                extended.write_u64_big_endian(len);
             }
         }
 
@@ -149,16 +149,14 @@ implement struct BufStream<S> {
         mut len: u64 = (h1 & 0x7F) as u64;
         if (len == 126) {
             (await this.ensure(2))?;
-            const ext: Slice<u8> = this.buffered();
-            len = ((ext[0] as u64) << 8) | (ext[1] as u64);
+            mut extended: ByteReader = ByteReader::new(this.buffered());
+            len = (extended.read_u16_big_endian()?) as u64;
             this.consume(2);
         } else {
             if (len == 127) {
                 (await this.ensure(8))?;
-                const ext: Slice<u8> = this.buffered();
-                len = 0;
-                mut i: i64 = 0;
-                while (i < 8) { len = (len << 8) | (ext[i] as u64); i++; }
+                mut extended: ByteReader = ByteReader::new(this.buffered());
+                len = extended.read_u64_big_endian()?;
                 this.consume(8);
             }
         }
@@ -181,9 +179,8 @@ implement struct BufStream<S> {
         mut mask_key: u32 = 0;
         if (masked) {
             (await this.ensure(4))?;
-            const kv: Slice<u8> = this.buffered();
-            mask_key = ((kv[0] as u32) << 24) | ((kv[1] as u32) << 16)
-                     | ((kv[2] as u32) << 8)  |  (kv[3] as u32);
+            mut key: ByteReader = ByteReader::new(this.buffered());
+            mask_key = key.read_u32_big_endian()?;
             this.consume(4);
         }
 

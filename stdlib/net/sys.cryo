@@ -17,7 +17,9 @@
 namespace std::net::sys;
 
 import std::core::result::{ Result };
+import std::collections::array::{ Array };
 import std::io::error::{ IoError, IoErrorKind };
+import std::io::bytes::{ ByteWriter };
 import std::io::fd;
 import std::ffi::libc;
 import std::sys::syscall;
@@ -287,39 +289,23 @@ public function os_sock_error(fd: i32) -> i32 {
 // SO_RCVTIMEO/SO_SNDTIMEO: POSIX wants a 16-byte `struct timeval` (two host-
 // order i64s); Winsock wants a 4-byte DWORD of milliseconds.
 ![target(unix)]
+// Host order is little-endian on every supported target.
+![target(unix)]
 public function os_set_timeout(fd: i32, is_recv: boolean, secs: i64, usecs: i64) -> i32 {
-    mut buf: [u8; 16];
-    pack_i64_le(&buf[0], secs);
-    pack_i64_le(&buf[8], usecs);
+    mut timeval: Array<u8> = Array::<u8>::with_capacity(16);
+    mut fields: ByteWriter = ByteWriter::new(&timeval);
+    fields.write_i64_little_endian(secs);
+    fields.write_i64_little_endian(usecs);
     const opt: i32 = if (is_recv) { libc::SO_RCVTIMEO } else { libc::SO_SNDTIMEO };
-    return libc::setsockopt(fd, libc::SocketLevel::SOL_SOCKET, opt, &buf[0], 16);
+    return libc::setsockopt(fd, libc::SocketLevel::SOL_SOCKET, opt, timeval.as_ptr(), 16);
 }
 ![target(windows)]
 public function os_set_timeout(fd: i32, is_recv: boolean, secs: i64, usecs: i64) -> i32 {
-    const ms: u32 = (secs * 1000 + usecs / 1000) as u32;
-    mut buf: [u8; 4];
-    buf[0] = (ms)       as u8;
-    buf[1] = (ms >> 8)  as u8;
-    buf[2] = (ms >> 16) as u8;
-    buf[3] = (ms >> 24) as u8;
+    mut milliseconds: Array<u8> = Array::<u8>::with_capacity(4);
+    mut field: ByteWriter = ByteWriter::new(&milliseconds);
+    field.write_u32_little_endian((secs * 1000 + usecs / 1000) as u32);
     const opt: i32 = if (is_recv) { 4102 } else { 4101 };   // 0x1006 / 0x1005
-    return syscall::setsockopt(fd as u64, 65535, opt, &buf[0], 4);
-}
-
-// Little-endian pack of an i64 into 8 bytes (host order on the LE targets we
-// support).  Local to net::sys so the timeout helpers don't pull in a higher
-// layer.  Only the POSIX timeout writes a `timeval`.
-![target(unix)]
-private function pack_i64_le(out: u8*, value: i64) -> void {
-    const v: u64 = value as u64;
-    out[0] = (v)       as u8;
-    out[1] = (v >> 8)  as u8;
-    out[2] = (v >> 16) as u8;
-    out[3] = (v >> 24) as u8;
-    out[4] = (v >> 32) as u8;
-    out[5] = (v >> 40) as u8;
-    out[6] = (v >> 48) as u8;
-    out[7] = (v >> 56) as u8;
+    return syscall::setsockopt(fd as u64, 65535, opt, milliseconds.as_ptr(), 4);
 }
 
 // ---- errors ----------------------------------------------------------------

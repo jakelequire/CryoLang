@@ -1,0 +1,227 @@
+///! Fixed-width integers to and from bytes, in a stated byte order.
+///!
+///! `ByteReader` walks a borrowed `Slice<u8>` front to back, decoding one
+///! integer per call; a read that needs more bytes than remain fails with
+///! `UnexpectedEof` and leaves the position where it was. `ByteWriter`
+///! appends encoded integers to an `Array<u8>` it borrows.
+///!
+///! Every multi-byte method names its order in full - `big_endian` (most
+///! significant byte first, the network order of the wire protocols) or
+///! `little_endian` (least significant first) - so a call site says which
+///! layout it reads or writes, whatever the host's own order is.
+
+namespace std::io::bytes;
+
+import std::core::intrinsics;
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::collections::array::{ Array };
+import std::io::error::{ IoError, IoErrorKind };
+
+/// Decodes integers from a borrowed byte slice, advancing past each one.
+public type struct ByteReader {
+    private bytes: Slice<u8>;
+    private position: i64;
+
+    /// A reader at the first byte of `bytes`. The slice is borrowed: its
+    /// storage must outlive the reader.
+    public static new(bytes: Slice<u8>) -> ByteReader {
+        return ByteReader { bytes: bytes, position: 0 };
+    }
+
+    /// The offset of the next byte a read takes.
+    public position(&this) -> i64 {
+        return this.position;
+    }
+
+    /// Move to the absolute offset `position`. An offset past the end is
+    /// allowed, and every read from there fails; a negative one panics.
+    public set_position(mut &this, position: i64) -> void {
+        if (position < 0) {
+            core::panic("ByteReader::set_position: out of range", intrinsics::location());
+        }
+        this.position = position;
+    }
+
+    /// The number of bytes left to read, 0 at or past the end.
+    public remaining(&this) -> i64 {
+        if (this.position >= this.bytes.length()) { return 0; }
+        return this.bytes.length() - this.position;
+    }
+
+    public read_u8(mut &this) -> Result<u8, IoError> {
+        return Result::Ok((this.read_big_endian(1)?) as u8);
+    }
+
+    public read_i8(mut &this) -> Result<i8, IoError> {
+        return Result::Ok((this.read_big_endian(1)?) as i8);
+    }
+
+    public read_u16_big_endian(mut &this) -> Result<u16, IoError> {
+        return Result::Ok((this.read_big_endian(2)?) as u16);
+    }
+
+    public read_u16_little_endian(mut &this) -> Result<u16, IoError> {
+        return Result::Ok((this.read_little_endian(2)?) as u16);
+    }
+
+    public read_i16_big_endian(mut &this) -> Result<i16, IoError> {
+        return Result::Ok((this.read_big_endian(2)?) as i16);
+    }
+
+    public read_i16_little_endian(mut &this) -> Result<i16, IoError> {
+        return Result::Ok((this.read_little_endian(2)?) as i16);
+    }
+
+    public read_u32_big_endian(mut &this) -> Result<u32, IoError> {
+        return Result::Ok((this.read_big_endian(4)?) as u32);
+    }
+
+    public read_u32_little_endian(mut &this) -> Result<u32, IoError> {
+        return Result::Ok((this.read_little_endian(4)?) as u32);
+    }
+
+    public read_i32_big_endian(mut &this) -> Result<i32, IoError> {
+        return Result::Ok((this.read_big_endian(4)?) as i32);
+    }
+
+    public read_i32_little_endian(mut &this) -> Result<i32, IoError> {
+        return Result::Ok((this.read_little_endian(4)?) as i32);
+    }
+
+    public read_u64_big_endian(mut &this) -> Result<u64, IoError> {
+        return this.read_big_endian(8);
+    }
+
+    public read_u64_little_endian(mut &this) -> Result<u64, IoError> {
+        return this.read_little_endian(8);
+    }
+
+    public read_i64_big_endian(mut &this) -> Result<i64, IoError> {
+        return Result::Ok((this.read_big_endian(8)?) as i64);
+    }
+
+    public read_i64_little_endian(mut &this) -> Result<i64, IoError> {
+        return Result::Ok((this.read_little_endian(8)?) as i64);
+    }
+
+    /// Claim the next `count` bytes and return the offset of the first,
+    /// or fail with `UnexpectedEof`, without moving, when fewer remain.
+    private take(mut &this, count: i64) -> Result<i64, IoError> {
+        if (this.remaining() < count) {
+            return Result::Err(IoError::new(IoErrorKind::UnexpectedEof, 0));
+        }
+        const start: i64 = this.position;
+        this.position = start + count;
+        return Result::Ok(start);
+    }
+
+    private read_big_endian(mut &this, count: i64) -> Result<u64, IoError> {
+        const start: i64 = this.take(count)?;
+        mut value: u64 = 0;
+        mut i: i64 = 0;
+        while (i < count) {
+            value = (value << 8) | (this.bytes[start + i] as u64);
+            i = i + 1;
+        }
+        return Result::Ok(value);
+    }
+
+    private read_little_endian(mut &this, count: i64) -> Result<u64, IoError> {
+        const start: i64 = this.take(count)?;
+        mut value: u64 = 0;
+        mut i: i64 = count;
+        while (i > 0) {
+            i = i - 1;
+            value = (value << 8) | (this.bytes[start + i] as u64);
+        }
+        return Result::Ok(value);
+    }
+}
+
+/// Encodes integers onto the end of a borrowed `Array<u8>`. A write
+/// panics if the array cannot grow, as `Array.push` does.
+public type struct ByteWriter {
+    private out: mut &Array<u8>;
+
+    /// A writer appending to `out`, after whatever it already holds.
+    public static new(out: mut &Array<u8>) -> ByteWriter {
+        return ByteWriter { out: out };
+    }
+
+    public write_u8(mut &this, value: u8) -> void {
+        this.out.push(value);
+    }
+
+    public write_i8(mut &this, value: i8) -> void {
+        this.out.push(value as u8);
+    }
+
+    public write_u16_big_endian(mut &this, value: u16) -> void {
+        this.write_big_endian(value as u64, 2);
+    }
+
+    public write_u16_little_endian(mut &this, value: u16) -> void {
+        this.write_little_endian(value as u64, 2);
+    }
+
+    public write_i16_big_endian(mut &this, value: i16) -> void {
+        this.write_big_endian(value as u64, 2);
+    }
+
+    public write_i16_little_endian(mut &this, value: i16) -> void {
+        this.write_little_endian(value as u64, 2);
+    }
+
+    public write_u32_big_endian(mut &this, value: u32) -> void {
+        this.write_big_endian(value as u64, 4);
+    }
+
+    public write_u32_little_endian(mut &this, value: u32) -> void {
+        this.write_little_endian(value as u64, 4);
+    }
+
+    public write_i32_big_endian(mut &this, value: i32) -> void {
+        this.write_big_endian(value as u64, 4);
+    }
+
+    public write_i32_little_endian(mut &this, value: i32) -> void {
+        this.write_little_endian(value as u64, 4);
+    }
+
+    public write_u64_big_endian(mut &this, value: u64) -> void {
+        this.write_big_endian(value, 8);
+    }
+
+    public write_u64_little_endian(mut &this, value: u64) -> void {
+        this.write_little_endian(value, 8);
+    }
+
+    public write_i64_big_endian(mut &this, value: i64) -> void {
+        this.write_big_endian(value as u64, 8);
+    }
+
+    public write_i64_little_endian(mut &this, value: i64) -> void {
+        this.write_little_endian(value as u64, 8);
+    }
+
+    /// The low `count` bytes of `value`, most significant first.
+    private write_big_endian(mut &this, value: u64, count: u64) -> void {
+        mut shift: u64 = count * 8;
+        while (shift > 0) {
+            shift = shift - 8;
+            this.out.push((value >> shift) as u8);
+        }
+    }
+
+    /// The low `count` bytes of `value`, least significant first.
+    private write_little_endian(mut &this, value: u64, count: u64) -> void {
+        mut rest: u64 = value;
+        mut i: u64 = 0;
+        while (i < count) {
+            this.out.push(rest as u8);
+            rest = rest >> 8;
+            i = i + 1;
+        }
+    }
+}

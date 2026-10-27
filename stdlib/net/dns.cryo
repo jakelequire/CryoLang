@@ -39,7 +39,9 @@ import std::alloc::allocator::{ GlobalAlloc };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::collections::array::{ Array };
+import std::core::slice::{ Slice };
 import std::io::error::{ IoError, IoErrorKind };
+import std::io::bytes::{ ByteReader, ByteWriter };
 import std::ffi::libc;
 import std::net::addr::ip::{ IpAddr, IpV4Addr, IpV6Addr };
 import std::net::addr::socket_addr::{ SocketAddr };
@@ -106,17 +108,22 @@ public function resolve(host: Str) -> Result<ResolvedAddrs, IoError> {
     // getaddrinfo needs a NUL-terminated node string.
     mut host_c: String = String::with_null(host);
 
-    // Zeroed `struct addrinfo` hints: AF_UNSPEC (both families),
-    // SOCK_STREAM to collapse the per-socktype duplicate entries,
-    // AI_ADDRCONFIG to skip families with no configured interface.
-    mut hints: [u8; 48];
-    mut z: u64 = 0;
-    while (z < 48) { hints[z] = 0; z++; }
-    write_u32(&hints[0], 0, sys::dns_hint_flags());        // ai_flags
-    write_u32(&hints[0], 8, libc::SOCK_STREAM as u32);     // ai_socktype
+    // `struct addrinfo` hints: AF_UNSPEC (both families), SOCK_STREAM to
+    // collapse the per-socktype duplicate entries, AI_ADDRCONFIG to skip
+    // families with no configured interface. Four 32-bit fields, then
+    // four zeroed 8-byte slots (address length, address, canonical name
+    // and next, in either platform's order).
+    mut hints: Array<u8> = Array::<u8>::with_capacity(libc::SIZEOF_ADDRINFO as i64);
+    mut fields: ByteWriter = ByteWriter::new(&hints);
+    fields.write_u32_little_endian(sys::dns_hint_flags());       // ai_flags
+    fields.write_u32_little_endian(0);                           // ai_family
+    fields.write_u32_little_endian(libc::SOCK_STREAM as u32);    // ai_socktype
+    fields.write_u32_little_endian(0);                           // ai_protocol
+    mut slot: i64 = 0;
+    while (slot < 4) { fields.write_u64_little_endian(0); slot++; }
 
     mut res: u8* = null;
-    const rc: i32 = sys::os_getaddrinfo(host_c.as_ptr(), null, &hints[0], &res);
+    const rc: i32 = sys::os_getaddrinfo(host_c.as_ptr(), null, hints.as_ptr(), &res);
     if (rc != 0) {
         const err: IoError = eai_to_io(rc);
         mem::drop(host_c);
@@ -126,8 +133,15 @@ public function resolve(host: Str) -> Result<ResolvedAddrs, IoError> {
     mut addrs: Array<IpAddr> = Array::<IpAddr>::new();
     mut cur: u8* = res;
     while (cur != null) {
-        const family: u32 = read_u32(cur, 4);
-        const sa: u8* = read_ptr(cur, sys::ai_addr_offset());
+        // The entry is a whole `struct addrinfo`, so none of these reads
+        // can run short. Its fields are in host order, little-endian on
+        // every supported target.
+        mut entry: ByteReader = ByteReader::new(
+            Slice::from_raw(cur, libc::SIZEOF_ADDRINFO as i64));
+        entry.set_position(4);
+        const family: u32 = entry.read_u32_little_endian().unwrap();
+        entry.set_position(sys::ai_addr_offset() as i64);
+        const sa: u8* = entry.read_u64_little_endian().unwrap() as u8*;
         if (sa != null) {
             if (family == AF_INET) {
                 // sockaddr_in: sin_addr at offset 4, network order.
@@ -141,7 +155,8 @@ public function resolve(host: Str) -> Result<ResolvedAddrs, IoError> {
                 addrs.push(IpAddr::V6(IpV6Addr { segments: seg }));
             }
         }
-        cur = read_ptr(cur, 40);   // ai_next
+        entry.set_position(40);   // ai_next
+        cur = entry.read_u64_little_endian().unwrap() as u8*;
     }
 
     sys::os_freeaddrinfo(res);
@@ -369,33 +384,4 @@ private function eai_to_io(code: i32) -> IoError {
         return sys::last_io_error();
     }
     return IoError::new(IoErrorKind::Other, code);
-}
-
-/// Read a little-endian `u32` field at `base + off`.
-private function read_u32(base: u8*, off: u64) -> u32 {
-    return (base[off]       as u32)
-         | ((base[off + 1]  as u32) << 8)
-         | ((base[off + 2]  as u32) << 16)
-         | ((base[off + 3]  as u32) << 24);
-}
-
-/// Read a little-endian pointer field (8 bytes) at `base + off` and
-/// reinterpret it as a `u8*`. This is how the `addrinfo` chain is
-/// walked: the kernel writes native-width pointers, we read them back.
-private function read_ptr(base: u8*, off: u64) -> u8* {
-    mut v: u64 = 0;
-    mut i: u64 = 0;
-    while (i < 8) {
-        v = v | ((base[off + i] as u64) << (i * 8));
-        i++;
-    }
-    return v as u8*;
-}
-
-/// Write a little-endian `u32` field at `base + off`.
-private function write_u32(base: u8*, off: u64, value: u32) -> void {
-    base[off]     = (value)       as u8;
-    base[off + 1] = (value >> 8)  as u8;
-    base[off + 2] = (value >> 16) as u8;
-    base[off + 3] = (value >> 24) as u8;
 }

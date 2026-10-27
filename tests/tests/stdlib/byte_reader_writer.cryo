@@ -1,0 +1,88 @@
+///! Fixed-width integers read from and written to bytes in a stated order.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::ByteReaderWriter;
+
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::collections::array::{ Array };
+import std::io::bytes::{ ByteReader, ByteWriter };
+import std::io::error::{ IoErrorKind };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_eq };
+
+![test]
+function writer_lays_out_each_width_in_its_order() -> Result<(), TestError> {
+    mut out: Array<u8> = Array::<u8>::new();
+    mut writer: ByteWriter = ByteWriter::new(&out);
+    writer.write_u8(0xAB);
+    writer.write_u16_big_endian(0x0102);
+    writer.write_u16_little_endian(0x0102);
+    writer.write_u32_big_endian(0x01020304);
+    writer.write_u32_little_endian(0x01020304);
+    writer.write_u64_big_endian(0x0102030405060708);
+    writer.write_i16_big_endian(-2);
+    const expected: [u8; 23] = [
+        0xAB,
+        0x01, 0x02,
+        0x02, 0x01,
+        0x01, 0x02, 0x03, 0x04,
+        0x04, 0x03, 0x02, 0x01,
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0xFF, 0xFE
+    ];
+    expect_eq(out.length(), 23)?;
+    mut i: i64 = 0;
+    while (i < 23) {
+        expect_eq(out[i], expected[i])?;
+        i += 1;
+    }
+    return Result::Ok(());
+}
+
+![test]
+function reader_round_trips_the_writer() -> Result<(), TestError> {
+    mut out: Array<u8> = Array::<u8>::new();
+    mut writer: ByteWriter = ByteWriter::new(&out);
+    writer.write_i8(-5);
+    writer.write_i16_little_endian(-300);
+    writer.write_u32_little_endian(4000000000);
+    writer.write_i32_big_endian(-70000);
+    writer.write_u64_little_endian(0xFEDCBA9876543210);
+    writer.write_i64_big_endian(-1234567890123);
+    writer.write_i64_little_endian(9);
+
+    mut reader: ByteReader = ByteReader::new(out.as_slice());
+    expect_eq(reader.remaining(), 35)?;
+    expect_eq(reader.read_i8().unwrap(), -5 as i8)?;
+    expect_eq(reader.read_i16_little_endian().unwrap(), -300 as i16)?;
+    expect_eq(reader.read_u32_little_endian().unwrap(), 4000000000)?;
+    expect_eq(reader.read_i32_big_endian().unwrap(), -70000)?;
+    expect_eq(reader.read_u64_little_endian().unwrap(), 0xFEDCBA9876543210)?;
+    expect_eq(reader.read_i64_big_endian().unwrap(), -1234567890123)?;
+    expect_eq(reader.position(), 27)?;
+    expect_eq(reader.read_i64_little_endian().unwrap(), 9)?;
+    expect_eq(reader.remaining(), 0)?;
+    return Result::Ok(());
+}
+
+![test]
+function reader_refuses_a_short_read_without_moving() -> Result<(), TestError> {
+    const bytes: [u8; 3] = [0x12, 0x34, 0x56];
+    mut reader: ByteReader = ByteReader::new(Slice::from_raw(&bytes[0], 3));
+    match (reader.read_u32_big_endian()) {
+        Result::Ok(_)  => { expect_eq(true, false)?; }
+        Result::Err(e) => { expect_eq(e.kind == IoErrorKind::UnexpectedEof, true)?; }
+    }
+    expect_eq(reader.position(), 0)?;
+    expect_eq(reader.read_u16_big_endian().unwrap(), 0x1234)?;
+    expect_eq(reader.read_u16_little_endian().is_err(), true)?;
+    expect_eq(reader.read_u8().unwrap(), 0x56)?;
+    expect_eq(reader.read_u8().is_err(), true)?;
+    reader.set_position(1);
+    expect_eq(reader.read_u16_little_endian().unwrap(), 0x5634)?;
+    reader.set_position(10);
+    expect_eq(reader.remaining(), 0)?;
+    expect_eq(reader.read_u8().is_err(), true)?;
+    return Result::Ok(());
+}

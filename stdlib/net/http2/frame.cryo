@@ -35,6 +35,7 @@ import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::core::slice::{ Slice };
 import std::io::error::{ IoError, IoErrorKind };
+import std::io::bytes::{ ByteReader, ByteWriter };
 import std::io::traits::{ AsyncTransport };
 import std::io::buf::{ BufStream };
 import std::collections::array::{ Array };
@@ -98,15 +99,13 @@ implement struct BufStream<S> {
         const len: i64 = payload.length();
         mut out: Array<u8>* = this.pending();
 
-        out.push((len >> 16) as u8);
-        out.push((len >> 8) as u8);
-        out.push((len) as u8);
-        out.push(ftype);
-        out.push(flags);
-        out.push(((stream_id >> 24) & 0x7f) as u8);   // clear reserved bit
-        out.push((stream_id >> 16) as u8);
-        out.push((stream_id >> 8) as u8);
-        out.push((stream_id) as u8);
+        mut header: ByteWriter = ByteWriter::new(out);
+        // A 24-bit length: its top byte, then the low 16 bits.
+        header.write_u8((len >> 16) as u8);
+        header.write_u16_big_endian(len as u16);
+        header.write_u8(ftype);
+        header.write_u8(flags);
+        header.write_u32_big_endian(stream_id & 0x7fffffff);   // clear reserved bit
 
         if (len > 0) {
             out.try_append(payload)?;
@@ -124,23 +123,15 @@ implement struct BufStream<S> {
     public async read_h2_frame(mut &this, max_payload: i64) -> Result<Frame, IoError>
     where S: AsyncTransport {
         (await this.ensure(FRAME_HEADER_LEN))?;
-        const hdr: Slice<u8> = this.buffered();
-        const h0: u8    = hdr[0];
-        const h1: u8    = hdr[1];
-        const h2: u8    = hdr[2];
-        const ftype: u8 = hdr[3];
-        const flags: u8 = hdr[4];
-        const h5: u8    = hdr[5];
-        const h6: u8    = hdr[6];
-        const h7: u8    = hdr[7];
-        const h8: u8    = hdr[8];
+        mut header: ByteReader = ByteReader::new(this.buffered());
+        const length_high: u8 = header.read_u8()?;
+        const length_low: u16 = header.read_u16_big_endian()?;
+        const ftype: u8 = header.read_u8()?;
+        const flags: u8 = header.read_u8()?;
+        const stream_id: u32 = (header.read_u32_big_endian()?) & 0x7fffffff;
         this.consume(FRAME_HEADER_LEN);
 
-        const len: i64 = ((h0 as i64) << 16) | ((h1 as i64) << 8) | (h2 as i64);
-        const stream_id: u32 = (((h5 & 0x7f) as u32) << 24)
-                             | ((h6 as u32) << 16)
-                             | ((h7 as u32) << 8)
-                             | (h8 as u32);
+        const len: i64 = ((length_high as i64) << 16) | (length_low as i64);
 
         mut cap: i64 = max_payload;
         if (cap > MAX_FRAME_PAYLOAD) { cap = MAX_FRAME_PAYLOAD; }

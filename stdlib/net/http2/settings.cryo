@@ -10,6 +10,7 @@ namespace std::net::http2::settings;
 import std::core::option::{ Option };
 import std::core::slice::{ Slice };
 import std::collections::array::{ Array };
+import std::io::bytes::{ ByteReader, ByteWriter };
 
 public const SETTINGS_HEADER_TABLE_SIZE:      u16 = 0x1;
 public const SETTINGS_ENABLE_PUSH:            u16 = 0x2;
@@ -64,15 +65,12 @@ public type struct Settings {
     /// false if the payload length is not a multiple of 6.
     public apply_payload(mut &this, payload: Slice<u8>) -> boolean {
         if (payload.length() % 6 != 0) { return false; }
-        mut i: i64 = 0;
-        while (i < payload.length()) {
-            const id: u16 = ((payload[i] as u16) << 8) | (payload[i + 1] as u16);
-            const value: u32 = ((payload[i + 2] as u32) << 24)
-                             | ((payload[i + 3] as u32) << 16)
-                             | ((payload[i + 4] as u32) << 8)
-                             | (payload[i + 5] as u32);
+        mut entries: ByteReader = ByteReader::new(payload);
+        while (entries.remaining() > 0) {
+            // A whole number of entries remains, so neither read runs short.
+            const id: u16 = entries.read_u16_big_endian().unwrap();
+            const value: u32 = entries.read_u32_big_endian().unwrap();
             this.apply_one(id, value);
-            i = i + 6;
         }
         return true;
     }
@@ -80,10 +78,7 @@ public type struct Settings {
 
 /// Append a (identifier, value) entry to a SETTINGS payload buffer.
 public function push_entry(out: mut &Array<u8>, id: u16, value: u32) -> void {
-    out.push((id >> 8) as u8);
-    out.push((id) as u8);
-    out.push((value >> 24) as u8);
-    out.push((value >> 16) as u8);
-    out.push((value >> 8) as u8);
-    out.push((value) as u8);
+    mut entry: ByteWriter = ByteWriter::new(out);
+    entry.write_u16_big_endian(id);
+    entry.write_u32_big_endian(value);
 }
