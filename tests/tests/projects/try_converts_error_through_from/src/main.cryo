@@ -4,7 +4,9 @@
 /// a user error type with two `From` implementations, the standard library's
 /// `From<AllocError> for IoError`, a primitive error type, a generic function
 /// and an `async` function - and an error the function already returns
-/// passes through unchanged.
+/// passes through unchanged.  A conversion from or into a type parameter is
+/// the one a `where F: From<E>` bound gives, and each instance calls its own
+/// `from`, in a plain and in an `async` generic function.
 namespace TryConvertsErrorThroughFrom::Main;
 
 import std::core::convert::{ From };
@@ -92,6 +94,22 @@ async function later(fail: boolean) -> Result<i32, HighError> {
     return Result::Ok(n * 10);
 }
 
+function convert_bounded<E, F>(value: Result<i32, E>) -> Result<i32, F> where F: From<E> {
+    const n: i32 = value?;
+    return Result::Ok(n + 1);
+}
+
+function into_bounded<F>(fail: boolean) -> Result<i32, F> where F: From<MiddleError> {
+    const n: i32 = middle(fail)?;
+    return Result::Ok(n + 2);
+}
+
+async function later_bounded<E, F>(value: Result<i32, E>) -> Result<i32, F> where F: From<E> {
+    await Sleep::new(Duration::from_millis(1));
+    const n: i32 = value?;
+    return Result::Ok(n + 3);
+}
+
 function check(passed: i32, condition: boolean, what: string) -> i32 {
     if (!condition) {
         printf("FAILED: %s\n", what);
@@ -143,7 +161,30 @@ async function main() -> i32 {
         _ => { false }
     }, "an async function converts");
 
-    printf("try converts errors through From: %d of 8 checks passed\n", passed);
-    if (passed != 8) { return 1; }
+    const bounded: Result<i32, HighError> = convert_bounded(low(true));
+    passed = check(passed, match (bounded) {
+        Result::Err(HighError::FromLow(code)) => { code == 7 }
+        _ => { false }
+    }, "a bounded type parameter converts a parameter's error");
+
+    const bounded_ok: Result<i32, HighError> = convert_bounded(low(false));
+    passed = check(passed, match (bounded_ok) {
+        Result::Ok(v) => { v == 6 }
+        Result::Err(_) => { false }
+    }, "a bounded conversion passes a success through");
+
+    const into: Result<i32, HighError> = into_bounded(true);
+    passed = check(passed, match (into) {
+        Result::Err(HighError::FromMiddle(code)) => { code == 9 }
+        _ => { false }
+    }, "a bounded type parameter converts a concrete error");
+
+    passed = check(passed, match (await later_bounded::<MiddleError, HighError>(middle(true))) {
+        Result::Err(HighError::FromMiddle(code)) => { code == 9 }
+        _ => { false }
+    }, "an async generic function converts through its bound");
+
+    printf("try converts errors through From: %d of 12 checks passed\n", passed);
+    if (passed != 12) { return 1; }
     return 0;
 }

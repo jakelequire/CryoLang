@@ -433,6 +433,42 @@ type struct MethodBinding {
         return null;
     }
 
+    /// Whether a `where` bound in scope of the body being walked - the
+    /// function's, the impl's or the owner declaration's - names `trait_def`
+    /// on `param` itself at exactly the arguments `args`, compared by
+    /// identity: `F: From<E>` gives `From<E>`, not `From<i32>`.
+    param_bound_gives_at(mut &this, param: GenericParamType*, trait_def: DefId, args: &[TypeRef]) -> boolean {
+        if (this.state.symbolic_current_func != null
+                && this.bounds_give_at(&DeclarationNode::fn_of(this.state.symbolic_current_func).trait_bounds, param, trait_def, args)) {
+            return true;
+        }
+        if (this.state.symbolic_impl_node != null
+                && this.bounds_give_at(&this.state.symbolic_impl_node.where_bounds, param, trait_def, args)) {
+            return true;
+        }
+        const owner_bounds: [TraitBound]* = this.owner_declared_bounds();
+        return owner_bounds != null && this.bounds_give_at(owner_bounds, param, trait_def, args);
+    }
+
+    bounds_give_at(mut &this, bounds: &[TraitBound], param: GenericParamType*, trait_def: DefId, args: &[TypeRef]) -> boolean {
+        for (mut bi: i64 = 0; bi < bounds.length(); bi++) {
+            const b: TraitBound* = &bounds[bi];
+            if (!MethodBinding::bound_names_param(b, param)) { continue; }
+            for (mut ti: i64 = 0; ti < b.trait_refs.length(); ti++) {
+                const tr: TraitRef* = &b.trait_refs[ti];
+                if (tr.path.length() == 0 || tr.refused || !tr.definition().equals(trait_def)) { continue; }
+                const written: [TypeRef] = this.bound_trait_arg_types(tr);
+                if (written.length() != args.length()) { continue; }
+                mut same: boolean = true;
+                for (mut k: i64 = 0; k < args.length(); k++) {
+                    if (!written[k].equals(args[k])) { same = false; }
+                }
+                if (same) { return true; }
+            }
+        }
+        return false;
+    }
+
     static bound_ref_in(bounds: &[TraitBound], param: GenericParamType*, trait_def: DefId) -> TraitRef* {
         for (mut bi: i64 = 0; bi < bounds.length(); bi++) {
             const b: TraitBound* = &bounds[bi];

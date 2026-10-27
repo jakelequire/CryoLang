@@ -1119,6 +1119,15 @@ function fill(out: mut &Array<u8>, bytes: Slice<u8>) -> Result<(), IoError> {
 }
 ```
 
+In a generic function, a conversion from or into a type parameter is the one a bound gives: the function's error type is a parameter `F` with `where F: From<E>`, and each instantiation calls its own type's `from`. A body is typed by its bounds, so without such a bound the `?` is refused where it is written (`E0214`), whether or not anything instantiates the function. A bound written on a type that is not a parameter (`where IoError: From<E>`) gives nothing.
+
+```cryo
+function lift<E, F>(r: Result<i32, E>) -> Result<i32, F> where F: From<E> {
+    const n: i32 = r?;               // Err(F::from(e)) in every instance
+    return Result::Ok(n + 1);
+}
+```
+
 ```cryo
 function load(path: string) -> Result<Config, IoError> {
     const text: String = read_file(path)?;     // returns Err(e) on failure

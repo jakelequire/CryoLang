@@ -3608,19 +3608,28 @@ type struct SemaVisitor {
     /// `to::from(value)`, the conversion `?` applies to an error: the method
     /// the language's `From` claims, on the type it converts into.  The
     /// scope segment is answered with `to` itself - a declared type by its
-    /// definition, a primitive by its spelling - so nothing looks the type up
-    /// by name.
+    /// definition, a type parameter by its declaration, which a bound then
+    /// directs as it directs a written `F::from(e)`, a primitive by its
+    /// spelling - so nothing looks the type up by name.
     build_from_call(&this, to: TypeRef, value: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
         const method: DefId = this.ctx.generic_registry.wellknown(LangItem::FromFrom);
         const to_def: DefId = this.ctx.decl_index.def_of(to, this.ctx.type_arena);
-        const scope_name: SymbolStr = if (to_def.is_valid()) {
-            this.ctx.defs.leaf_of(to_def).spelling()
-        } else { this.intern.intern(this.arena.format_display(this.arena.lookup(to))) };
+        const to_param: GenericParamType* = this.as_type_param(to);
+        mut scope_name: SymbolStr = SymbolStr::empty();
+        if (to_def.is_valid()) {
+            scope_name = this.ctx.defs.leaf_of(to_def).spelling();
+        } else if (to_param != null) {
+            scope_name = to_param.param_name;
+        } else {
+            scope_name = this.intern.intern(this.arena.format_display(this.arena.lookup(to)));
+        }
         const scope: ExpressionNode* = ExpressionNode::scope_resolution_expr(
             scope_name, this.ctx.defs.leaf_of(method).spelling(), span);
         mut path: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(scope);
         if (to_def.is_valid()) {
             path.set_synthesized_ref(scope, to, to_def);
+        } else if (to_param != null) {
+            path.set_scope_res(Res::TypeRelative(ResBase::GenericParam(to_param.param_sym), 1));
         } else {
             scope.set_resolved_type(to);
             path.set_scope_res(Res::TypeRelative(ResBase::PrimTy(scope_name), 1));
@@ -3628,6 +3637,26 @@ type struct SemaVisitor {
         mut call: ExpressionNode* = ExpressionNode::call_expr(scope, span);
         ExpressionNode::call_of(call).add_argument(value);
         return call;
+    }
+
+    /// Whether a bound in scope gives the type parameter `to` the language's
+    /// `From<from>`.  A type that is not a parameter is given nothing by a
+    /// bound.
+    bound_gives_from(mut &this, from: TypeRef, to: TypeRef) -> boolean {
+        const param: GenericParamType* = this.as_type_param(to);
+        const from_trait: DefId = this.ctx.generic_registry.wellknown(LangItem::From);
+        if (param == null || !from_trait.is_valid()) { return false; }
+        const args: [TypeRef] = [from];
+        return this.binding.param_bound_gives_at(param, from_trait, &args);
+    }
+
+    /// The type parameter `t` is, or null for any other type.
+    as_type_param(&this, t: TypeRef) -> GenericParamType* {
+        const ty: Type* = this.arena.lookup(t);
+        if (ty == null || ty.kind != TypeKind::GenericParam) { return null; }
+        const param: GenericParamType* = ty.as_generic_param();
+        if (this.arena.is_this_placeholder(param)) { return null; }
+        return param;
     }
 
     /// Whether `to` implements the language's `From<from>`: an implementation
@@ -3715,20 +3744,34 @@ type struct SemaVisitor {
             const to_error: TypeRef = this.arena.inst_type_arg_at(fn_ret, 1);
             if (from_error.is_valid() && to_error.is_valid()
                     && !this.checker.can_assign(from_error, to_error)) {
-                // Which `From` applies is a question for the concrete walk.
-                if (this.arena.contains_generic_param(from_error) || this.arena.contains_generic_param(to_error)
-                        || this.symbolic.symbolic_type_unresolved(from_error)
-                        || this.symbolic.symbolic_type_unresolved(to_error)) {
-                    return TypeRef::invalid();
-                }
-                if (!this.implements_from(from_error, to_error)) {
+                // A generic body is typed once, by its bounds, and every copy
+                // of it carries what that walk built.  So a conversion from or
+                // into a type parameter is the one a bound gives the function's
+                // error type, `where F: From<E>`, and each copy calls its own
+                // instance's `from`.
+                const by_bound: boolean = this.arena.contains_generic_param(from_error)
+                    || this.arena.contains_generic_param(to_error);
+                const converts: boolean = if (by_bound) {
+                    this.bound_gives_from(from_error, to_error)
+                } else { this.implements_from(from_error, to_error) };
+                if (!converts) {
                     const from_shown: string = this.arena.resolve_display_name_short(from_error);
                     const to_shown: string = this.arena.resolve_display_name_short(to_error);
                     mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0214_ARGUMENT_MISMATCH,
                         fmt::format("the `?` operator cannot convert the error `%s` into `%s`", from_shown, to_shown));
-                    diag = diag.at_with_label(e.span, fmt::format("`%s` does not implement `From<%s>`", to_shown, from_shown));
-                    diag = diag.help(fmt::format("implement `From<%s>` for `%s`, or convert the error with `map_err` before the `?`",
-                        from_shown, to_shown));
+                    if (by_bound && this.as_type_param(to_error) != null) {
+                        diag = diag.at_with_label(e.span, fmt::format("no `where` bound gives `%s: From<%s>`", to_shown, from_shown));
+                        diag = diag.help(fmt::format("add `where %s: From<%s>` to the function, or convert the error with `map_err` before the `?`",
+                            to_shown, from_shown));
+                    } else if (by_bound) {
+                        diag = diag.at_with_label(e.span, fmt::format("`%s` is not a type parameter, so no bound gives it `From<%s>`", to_shown, from_shown));
+                        diag = diag.help(fmt::format("make the error type a parameter `F` with `where F: From<%s>`, or convert the error with `map_err` before the `?`",
+                            from_shown));
+                    } else {
+                        diag = diag.at_with_label(e.span, fmt::format("`%s` does not implement `From<%s>`", to_shown, from_shown));
+                        diag = diag.help(fmt::format("implement `From<%s>` for `%s`, or convert the error with `map_err` before the `?`",
+                            from_shown, to_shown));
+                    }
                     this.ctx.emit_diagnostic(diag);
                     return TypeRef::invalid();
                 }

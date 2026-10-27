@@ -183,8 +183,8 @@ yet is recorded with the change that builds it, not here.
      `From<E>` for `F` is E0214 at the `?`, naming the conversion that is
      missing.  The conversion is chosen by the trait's identity and its
      argument, never by a method spelled `from`.  A generic body is
-     judged where its types are concrete.  (Jake for the conversion; the
-     error code delegated)
+     judged by its bounds (604).  (Jake for the conversion; the error code
+     delegated)
 
 602. **The standard library has no one-off helpers.**  A private helper
      that restates an operation is replaced by a general API its callers
@@ -206,6 +206,22 @@ yet is recorded with the change that builds it, not here.
      JSON escape decoder and serializer, the HTTP client's decimal writers
      and the test runner's number text use these instead of their own
      loops.  (Jake)
+
+604. **A `?` in a generic body converts through a bound.**  A generic
+     body is typed once, by its bounds, and every instance carries what
+     that walk built; nothing walks an instance's copy again.  So in a
+     generic function a `?` whose error conversion involves a type
+     parameter is the conversion a `where` bound gives the function's
+     error type: `F: From<E>` exactly, the trait by identity and its
+     argument as written, and the `?` returns `Err(F::from(e))`, each
+     instance calling its own type's `from`.  With no such bound - none
+     at all, one naming another argument, or one written on a type that
+     is not a parameter (`where HighError: From<E>`) - the `?` is E0214
+     where it is written, whether or not anything instantiates the body,
+     and the help names the bound to add.  A conversion between concrete
+     types in a generic body is judged as anywhere else.  (delegated;
+     whether a bound written on a concrete type should direct a call is
+     open)
 
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
