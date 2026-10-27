@@ -53,6 +53,7 @@ import std::core::convert;
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
 import std::env;
 import std::io::error;
 import std::io::stdio::{ is_tty, Stderr, stderr };
@@ -558,44 +559,6 @@ function chip_skip(active: boolean) -> void {
     emit_ansi(active, ANSI_YELLOW);
     libc::printf("[skip]");
     emit_ansi(active, ANSI_RESET);
-}
-
-// Name splitting (for Pretty / Compact grouping)
-
-/// Group prefix + leaf name extracted from a `::`-delimited test name.
-///
-///   "CryoTests::Lang::SendSyncAutoDerive::sync_accepts_primitives"
-///         -> group = "CryoTests::Lang::SendSyncAutoDerive"
-///            leaf  = "sync_accepts_primitives"
-///
-/// Tests with no `::` (rare in practice; the test runner-synthesized
-/// names always carry the namespace) come back with an empty group
-/// and the full name as the leaf.
-type struct SplitName {
-    group: Str;
-    leaf:  Str;
-}
-
-function split_test_name(full: Str) -> SplitName {
-    const len: i64 = full.length();
-    if (len < 3) {
-        return SplitName { group: Str::new(""), leaf: full };
-    }
-    const ptr: u8* = full.as_ptr();
-    // Scan backwards for "::". The first match from the right is the
-    // separator between group and leaf.
-    mut i: i64 = len - 1;
-    while (i >= 1) {
-        if (ptr[i - 1] == 0x3A && ptr[i] == 0x3A) {
-            return SplitName {
-                group: full.sub_bytes(0, i - 1),
-                leaf:  full.sub_bytes(i + 1, len),
-            };
-        }
-        if (i == 1) { break; }
-        i = i - 1;
-    }
-    return SplitName { group: Str::new(""), leaf: full };
 }
 
 // Filter matching
@@ -1179,9 +1142,13 @@ function pretty_enter_group(state: mut &ReporterState, group: Str) -> void {
 /// `  leaf_name ... ` - indented in-flight prefix. Flushed before the
 /// fork so a hang at least shows which test was in flight.
 function pretty_begin_test(state: mut &ReporterState, name: Str) -> void {
-    const sn: SplitName = split_test_name(name);
-    pretty_enter_group(state, sn.group);
-    libc::printf("  %.*s ... ", sn.leaf.length() as i32, sn.leaf.as_ptr());
+    // A test's group is its namespace, everything before the last `::`; a
+    // name with none has an empty group.
+    const group_and_leaf: Pair<Str, Str> = name.rsplit_once(&Str::new("::"))
+        .unwrap_or(Pair::new(Str::new(""), name));
+    pretty_enter_group(state, group_and_leaf.first);
+    libc::printf("  %.*s ... ", group_and_leaf.second.length() as i32,
+                 group_and_leaf.second.as_ptr());
 }
 
 /// Verdict chip + trailing detail. Color-active state read from opts.
@@ -1283,8 +1250,9 @@ function compact_enter_group(state: mut &ReporterState, group: Str) -> void {
 /// Compact doesn't print anything per-test up front; the dot lands at
 /// end_test time.
 function compact_begin_test(state: mut &ReporterState, name: Str) -> void {
-    const sn: SplitName = split_test_name(name);
-    compact_enter_group(state, sn.group);
+    const group_and_leaf: Pair<Str, Str> = name.rsplit_once(&Str::new("::"))
+        .unwrap_or(Pair::new(Str::new(""), name));
+    compact_enter_group(state, group_and_leaf.first);
 }
 
 /// Append a dot/letter for this outcome and bump the per-group tally.

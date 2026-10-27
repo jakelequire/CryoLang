@@ -457,7 +457,9 @@ Left over from that: the async entry point calls `Executor::new` and
    module from other packages whichever files a build loads, so the
    standard library's internal modules are refused at the import as a
    dependency's are.  The library's one-off helpers give way to general
-   APIs its callers use directly (602): a byte classifies itself (608).
+   APIs its callers use directly (602): a byte classifies itself (608),
+   and `Str` searches from either end while a `Slice` indexes and
+   compares (609).
    Open: `u8.to_ascii_uppercase`, which `Str.to_ascii_uppercase` still
    folds by hand for want of.
 

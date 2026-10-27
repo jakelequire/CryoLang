@@ -18,6 +18,7 @@ import std::core::intrinsics;
 import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::core::convert::{ ConversionError };
+import std::core::slice::{ Slice };
 import std::collections::str::{ Str };
 import std::fmt::display::{ Display, Formatter };
 import std::fmt::error::{ FmtError };
@@ -191,16 +192,18 @@ public type struct IpV6Addr {
         if (n < 2) { return Option::None; }   // shortest legal is "::"
 
         // Locate the single "::" compression run (if any).
+        const double_colon: Str = Str::new("::");
         mut dcolon: i64 = n;             // index of the first ':' of "::", or n
-        mut i: i64 = 0;
-        while (i + 1 < n) {
-            if (ip_byte_eq(source, i, 0x3A) && ip_byte_eq(source, i + 1, 0x3A)) {
-                if (dcolon != n) { return Option::None; }   // two "::" runs
-                dcolon = i;
-                i = i + 2;
-            } else {
-                i = i + 1;
+        match (source.find(&double_colon)) {
+            Option::Some(first) => {
+                // A second run is refused. The search resumes past the
+                // first run's two colons, so ":::" is one run and a ':'.
+                if (source.sub_bytes(first + 2, n).contains(&double_colon)) {
+                    return Option::None;
+                }
+                dcolon = first;
             }
+            Option::None => { }
         }
 
         mut head: [u16; 8];                // groups before "::"
@@ -257,37 +260,20 @@ public type struct IpV6Addr {
     }
 }
 
-/// `source[index] == byte`, false if out of range.
-private function ip_byte_eq(source: Str, index: i64, byte: u8) -> boolean {
-    match (source.byte_at(index)) {
-        Option::Some(b) => { return b == byte; }
-        Option::None    => { return false; }
-    }
-}
-
-/// True if `source[start..end]` contains a '.'.
-private function ip_range_has_dot(source: Str, start: i64, end: i64) -> boolean {
-    mut i: i64 = start;
-    while (i < end) {
-        if (ip_byte_eq(source, i, 0x2E)) { return true; }
-        i = i + 1;
-    }
-    return false;
-}
-
 /// Parse the colon-separated 16-bit hex groups in `source[start..end]`
 /// into `out`, returning the group count, or `None` on malformed input.
 /// A trailing dotted-quad (embedded IPv4) expands into two groups.
 /// Rejects empty groups, >4 hex digits, and a v4 tail that isn't last.
 private function ip_parse_groups(source: Str, start: i64, end: i64, out: u16*) -> Option<i64> {
+    const bytes: Slice<u8> = source.as_bytes();
     mut count: i64 = 0;
     mut seg_start: i64 = start;
     mut i: i64 = start;
     while (i <= end) {
-        const at_sep: boolean = (i == end) || ip_byte_eq(source, i, 0x3A);
+        const at_sep: boolean = (i == end) || bytes[i] == 0x3A;
         if (at_sep) {
             if (i == seg_start) { return Option::None; }   // empty group
-            if (ip_range_has_dot(source, seg_start, i)) {
+            if (source.sub_bytes(seg_start, i).find_byte(0x2E).is_some()) {
                 // Embedded IPv4: only legal as the final piece, needs 2 slots.
                 if (i != end) { return Option::None; }
                 if (count > 6) { return Option::None; }
@@ -348,15 +334,11 @@ implement enum IpAddr {
 
     /// Detail-free variant of `parse`: `None` if the selected parser rejects.
     public static parse_opt(source: Str) -> Option<IpAddr> {
-        mut i: i64 = 0;
-        while (i < source.length()) {
-            if (ip_byte_eq(source, i, 0x3A)) {
-                match (IpV6Addr::parse_opt(source)) {
-                    Option::Some(v6) => { return Option::Some(IpAddr::V6(v6)); }
-                    Option::None     => { return Option::None; }
-                }
+        if (source.find_byte(0x3A).is_some()) {
+            match (IpV6Addr::parse_opt(source)) {
+                Option::Some(v6) => { return Option::Some(IpAddr::V6(v6)); }
+                Option::None     => { return Option::None; }
             }
-            i = i + 1;
         }
         match (IpV4Addr::parse_opt(source)) {
             Option::Some(v4) => { return Option::Some(IpAddr::V4(v4)); }

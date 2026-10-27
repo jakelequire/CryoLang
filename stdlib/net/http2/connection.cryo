@@ -192,7 +192,7 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
         // preface, so compare exactly the preface's worth of it. Nothing
         // suspends between here and the `consume`.
         const got: Slice<u8> = this.conn.buffered().subslice(0, PREFACE_LEN);
-        const good: boolean = slice_eq(got, preface_bytes());
+        const good: boolean = got == preface_bytes();
         this.conn.consume(PREFACE_LEN);
         if (!good) {
             return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
@@ -748,7 +748,7 @@ public function build_response(fields: Array<HeaderField>, body: Array<u8>) -> O
         match (fields.get_ref(j)) {
             Option::Some(f) => {
                 const name: Str = (*f).name.as_str();
-                if (!is_pseudo(name)) {
+                if (!name.starts_with(&Str::new(":"))) {
                     resp.headers.insert(name, (*f).value.as_str());
                 }
             }
@@ -829,7 +829,7 @@ public function build_request(fields: Array<HeaderField>, body: Array<u8>) -> Op
         match (fields.get_ref(j)) {
             Option::Some(f) => {
                 const name: Str = (*f).name.as_str();
-                if (!is_pseudo(name)) {
+                if (!name.starts_with(&Str::new(":"))) {
                     req.headers.insert(name, (*f).value.as_str());
                 }
             }
@@ -850,7 +850,8 @@ private function header_fragment(fr: &Frame) -> Slice<u8> {
     mut start: i64 = 0;
     mut end: i64 = p.length();
     if (fr.has_flag(frame::FLAG_PADDED)) {
-        const pad: i64 = byte_at(p, 0) as i64;
+        // An empty padded payload reads a pad length of 0 and yields nothing.
+        const pad: i64 = p.get(0).unwrap_or(0) as i64;
         start = 1;
         if (end >= pad) { end = end - pad; } else { return Slice::from_raw(p.as_ptr(), 0); }
     }
@@ -867,20 +868,13 @@ private function data_fragment(fr: &Frame) -> Slice<u8> {
     mut start: i64 = 0;
     mut end: i64 = p.length();
     if (fr.has_flag(frame::FLAG_PADDED)) {
-        const pad: i64 = byte_at(p, 0) as i64;
+        // An empty padded payload reads a pad length of 0 and yields nothing.
+        const pad: i64 = p.get(0).unwrap_or(0) as i64;
         start = 1;
         if (end >= pad) { end = end - pad; } else { return Slice::from_raw(p.as_ptr(), 0); }
     }
     if (start > end) { return Slice::from_raw(p.as_ptr(), 0); }
     return p.subslice(start, end);
-}
-
-/// True for `:`-prefixed pseudo-header names.
-private function is_pseudo(name: Str) -> boolean {
-    match (name.byte_at(0)) {
-        Option::Some(b) => { return b == 0x3A; }   // ':'
-        Option::None    => { return false; }
-    }
 }
 
 /// True for connection-specific header fields forbidden in HTTP/2, plus
@@ -910,10 +904,10 @@ private function is_credential(name_lower: Str) -> boolean {
 /// first 4 bytes of `s`.
 private function read_u31(s: Slice<u8>) -> u32 {
     if (s.length() < 4) { return 0; }
-    return (((byte_at(s, 0) & 0x7f) as u32) << 24)
-         | ((byte_at(s, 1) as u32) << 16)
-         | ((byte_at(s, 2) as u32) << 8)
-         | (byte_at(s, 3) as u32);
+    return (((s[0] & 0x7f) as u32) << 24)
+         | ((s[1] as u32) << 16)
+         | ((s[2] as u32) << 8)
+         | (s[3] as u32);
 }
 
 /// Write a 31-bit big-endian value into 4 bytes (reserved bit clear).
@@ -922,21 +916,4 @@ private function write_u31(out: u8*, value: u32) -> void {
     out[1] = (value >> 16) as u8;
     out[2] = (value >> 8) as u8;
     out[3] = (value) as u8;
-}
-
-private function slice_eq(a: Slice<u8>, b: Slice<u8>) -> boolean {
-    if (a.length() != b.length()) { return false; }
-    mut i: i64 = 0;
-    while (i < a.length()) {
-        if (byte_at(a, i) != byte_at(b, i)) { return false; }
-        i++;
-    }
-    return true;
-}
-
-private function byte_at(s: Slice<u8>, index: i64) -> u8 {
-    match (s.get(index)) {
-        Option::Some(b) => { return b; }
-        Option::None    => { return 0; }
-    }
 }

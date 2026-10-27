@@ -287,6 +287,22 @@ yet is recorded with the change that builds it, not here.
      drive-letter test and its byte case folds and digit range checks use
      these.  (Jake for the names and the whitespace set)
 
+609. **`Str` searches from either end; a `Slice` indexes and compares.**
+     `Str` has `rfind`, `find_byte`, `rfind_byte`, `split_once`,
+     `rsplit_once` (the text before and after the first or last
+     separator, neither half including it) and `equals_case_insensitive`
+     (ASCII letters folded, every other byte exact).  `Slice<T>`
+     implements `Index` for every integer type, as `Array` does - an
+     index outside `[0, length)` panics at the `xs[i]` - and `Eq` where
+     `T: Eq`, by length and elements, wherever the two point.  The
+     library's own byte readers, slice and string comparisons,
+     sentinel-returning searches and the test runner's name split use
+     these and are deleted; a read that may fall past the end of input a
+     peer controls keeps `get(i).unwrap_or(0)`.  `Path::last_separator`
+     answers `Option<i64>` instead of -1, and `Path::byte_or_zero` and
+     `Path::last_dot` are deleted.  (Jake for the names; the
+     `last_separator` signature delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

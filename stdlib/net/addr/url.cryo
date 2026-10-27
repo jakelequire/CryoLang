@@ -22,6 +22,7 @@ import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::core::convert;
 import std::collections::str::{ Str };
+import std::collections::pair::{ Pair };
 import std::fmt::display::{ Display, Formatter };
 import std::fmt::error::{ FmtError };
 
@@ -30,7 +31,6 @@ private const SLASH:    u8 = 0x2F;  // '/'
 private const QUESTION: u8 = 0x3F;  // '?'
 private const HASH:     u8 = 0x23;  // '#'
 private const AT:       u8 = 0x40;  // '@'
-private const LBRACKET: u8 = 0x5B;  // '['
 private const RBRACKET: u8 = 0x5D;  // ']'
 
 /// Why a URL failed to parse.
@@ -57,34 +57,6 @@ implement enum UrlError {
     }
 }
 
-/// Index of the first `byte` in `s`, or -1 if absent.
-private function index_of(s: Str, byte: u8) -> i64 {
-    const n: i64 = s.length();
-    mut i: i64 = 0;
-    while (i < n) {
-        match (s.byte_at(i)) {
-            Option::Some(b) => { if (b == byte) { return i; } }
-            Option::None    => { return -1; }
-        }
-        i = i + 1;
-    }
-    return -1;
-}
-
-/// Index of the last `byte` in `s`, or -1 if absent.
-private function last_index_of(s: Str, byte: u8) -> i64 {
-    mut i: i64 = s.length();
-    while (i > 0) {
-        const j: i64 = i - 1;
-        match (s.byte_at(j)) {
-            Option::Some(b) => { if (b == byte) { return j; } }
-            Option::None    => { return -1; }
-        }
-        i = j;
-    }
-    return -1;
-}
-
 /// Length of `s`'s leading run that stops at the first `/`, `?`, or `#` -
 /// i.e. where the authority ends and the path/query/fragment begins.
 private function authority_end(s: Str) -> i64 {
@@ -102,31 +74,13 @@ private function authority_end(s: Str) -> i64 {
     return n;
 }
 
-/// ASCII case-insensitive equality against a lowercase literal `lit`.
-private function eq_ci(s: Str, lit: string) -> boolean {
-    const other: Str = Str::new(lit);
-    const n: i64 = s.length();
-    if (n != other.length()) { return false; }
-    mut i: i64 = 0;
-    while (i < n) {
-        mut a: u8 = 0;
-        mut b: u8 = 0;
-        match (s.byte_at(i))     { Option::Some(x) => { a = x; } Option::None => { return false; } }
-        match (other.byte_at(i)) { Option::Some(x) => { b = x; } Option::None => { return false; } }
-        // `lit` is already lowercase.
-        if (a.to_ascii_lowercase() != b) { return false; }
-        i = i + 1;
-    }
-    return true;
-}
-
 /// The well-known default port for `scheme`, or 0 if none is known.
 private function default_port(scheme: Str) -> u16 {
-    if (eq_ci(scheme, "http"))  { return 80; }
-    if (eq_ci(scheme, "https")) { return 443; }
-    if (eq_ci(scheme, "ws"))    { return 80; }
-    if (eq_ci(scheme, "wss"))   { return 443; }
-    if (eq_ci(scheme, "ftp"))   { return 21; }
+    if (scheme.equals_case_insensitive(&Str::new("http")))  { return 80; }
+    if (scheme.equals_case_insensitive(&Str::new("https"))) { return 443; }
+    if (scheme.equals_case_insensitive(&Str::new("ws")))    { return 80; }
+    if (scheme.equals_case_insensitive(&Str::new("wss")))   { return 443; }
+    if (scheme.equals_case_insensitive(&Str::new("ftp")))   { return 21; }
     return 0;
 }
 
@@ -140,14 +94,14 @@ public type struct Url {
 
     /// Parse an absolute URL. See the module docs for the accepted shape.
     public static parse(source: Str) -> Result<Url, UrlError> {
-        const n: i64 = source.length();
-
         // 1. Split off the scheme at "://".
-        const sep: i64 = index_of_seq(source);
-        if (sep < 0) { return Result::Err(UrlError::MissingScheme); }
-        const scheme: Str = source.sub_bytes(0, sep);
+        const scheme_and_rest: Pair<Str, Str> = match (source.split_once(&Str::new("://"))) {
+            Option::Some(parts) => { parts }
+            Option::None        => { return Result::Err(UrlError::MissingScheme); }
+        };
+        const scheme: Str = scheme_and_rest.first;
         if (scheme.is_empty()) { return Result::Err(UrlError::EmptyScheme); }
-        const after: Str = source.sub_bytes(sep + 3, n);
+        const after: Str = scheme_and_rest.second;
 
         // 2. Authority is up to the first '/', '?' or '#'.
         const ae: i64 = authority_end(after);
@@ -156,35 +110,39 @@ public type struct Url {
 
         // 3. Drop any `user[:pass]@` userinfo; the host is what follows.
         mut host_port: Str = authority;
-        const at: i64 = last_index_of(authority, AT);
-        if (at >= 0) {
-            host_port = authority.sub_bytes(at + 1, authority.length());
+        match (authority.rfind_byte(AT)) {
+            Option::Some(at) => { host_port = authority.sub_bytes(at + 1, authority.length()); }
+            Option::None     => { }
         }
 
         // 4. Split host and optional port.
         mut host: Str = host_port;
         mut port: u16 = default_port(scheme);
-        if (!host_port.is_empty() && Url::byte0(host_port) == LBRACKET) {
+        if (host_port.starts_with(&Str::new("["))) {
             // IPv6 literal `[addr]` with an optional `:port` after `]`.
-            const close: i64 = index_of(host_port, RBRACKET);
-            if (close < 0) { return Result::Err(UrlError::EmptyHost); }
+            const close: i64 = match (host_port.find_byte(RBRACKET)) {
+                Option::Some(i) => { i }
+                Option::None    => { return Result::Err(UrlError::EmptyHost); }
+            };
             host = host_port.sub_bytes(1, close);
             const tail: Str = host_port.sub_bytes(close + 1, host_port.length());
             if (!tail.is_empty()) {
-                if (Url::byte0(tail) != COLON) { return Result::Err(UrlError::InvalidPort); }
+                if (!tail.starts_with(&Str::new(":"))) { return Result::Err(UrlError::InvalidPort); }
                 match (Url::parse_port(tail.sub_bytes(1, tail.length()))) {
                     Result::Ok(p)  => { port = p; }
                     Result::Err(e) => { return Result::Err(e); }
                 }
             }
         } else {
-            const colon: i64 = last_index_of(host_port, COLON);
-            if (colon >= 0) {
-                host = host_port.sub_bytes(0, colon);
-                match (Url::parse_port(host_port.sub_bytes(colon + 1, host_port.length()))) {
-                    Result::Ok(p)  => { port = p; }
-                    Result::Err(e) => { return Result::Err(e); }
+            match (host_port.rsplit_once(&Str::new(":"))) {
+                Option::Some(parts) => {
+                    host = parts.first;
+                    match (Url::parse_port(parts.second)) {
+                        Result::Ok(p)  => { port = p; }
+                        Result::Err(e) => { return Result::Err(e); }
+                    }
                 }
+                Option::None => { }
             }
         }
         if (host.is_empty()) { return Result::Err(UrlError::EmptyHost); }
@@ -193,18 +151,22 @@ public type struct Url {
         //    after the first '#'; query is between the first '?' and that '#'.
         mut pre_frag: Str = rest;
         mut fragment: Option<Str> = Option::None;
-        const hash: i64 = index_of(rest, HASH);
-        if (hash >= 0) {
-            fragment = Option::Some(rest.sub_bytes(hash + 1, rest.length()));
-            pre_frag = rest.sub_bytes(0, hash);
+        match (rest.split_once(&Str::new("#"))) {
+            Option::Some(parts) => {
+                pre_frag = parts.first;
+                fragment = Option::Some(parts.second);
+            }
+            Option::None => { }
         }
 
         mut path: Str = pre_frag;
         mut query: Option<Str> = Option::None;
-        const q: i64 = index_of(pre_frag, QUESTION);
-        if (q >= 0) {
-            query = Option::Some(pre_frag.sub_bytes(q + 1, pre_frag.length()));
-            path = pre_frag.sub_bytes(0, q);
+        match (pre_frag.split_once(&Str::new("?"))) {
+            Option::Some(parts) => {
+                path = parts.first;
+                query = Option::Some(parts.second);
+            }
+            Option::None => { }
         }
         if (path.is_empty()) { path = Str::new("/"); }
 
@@ -216,14 +178,6 @@ public type struct Url {
             query:    query,
             fragment: fragment
         });
-    }
-
-    /// `s`'s first byte (callers guard `!s.is_empty()` first).
-    private static byte0(s: Str) -> u8 {
-        match (s.byte_at(0)) {
-            Option::Some(b) => { return b; }
-            Option::None    => { return 0; }
-        }
     }
 
     /// Parse a non-empty decimal port into a `u16`.
@@ -244,7 +198,7 @@ implement trait Display for struct Url {
     fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         f.write_str(this.scheme)?;
         f.write_str(Str::new("://"))?;
-        const bracketed: boolean = index_of(this.host, COLON) >= 0;
+        const bracketed: boolean = this.host.find_byte(COLON).is_some();
         if (bracketed) { f.write_str(Str::new("["))?; }
         f.write_str(this.host)?;
         if (bracketed) { f.write_str(Str::new("]"))?; }
@@ -268,14 +222,5 @@ implement trait Display for struct Url {
             Option::None => { }
         }
         return Result::Ok(());
-    }
-}
-
-/// Index of the "://" scheme separator in `source`, or -1 if absent.
-private function index_of_seq(source: Str) -> i64 {
-    const needle: Str = Str::new("://");
-    match (source.find(&needle)) {
-        Option::Some(idx) => { return idx as i64; }
-        Option::None      => { return -1; }
     }
 }

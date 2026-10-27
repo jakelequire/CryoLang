@@ -114,7 +114,7 @@ public type struct WebSocket<S> {
             if (header.is_empty()) { break; }
             match (header_line_value(header.as_str(), Str::new("sec-websocket-accept"))) {
                 Option::Some(got) => {
-                    if (str_eq(got, expected.as_str())) { accept_ok = true; }
+                    if (got == expected.as_str()) { accept_ok = true; }
                 }
                 Option::None => { }
             }
@@ -325,64 +325,31 @@ private function build_message(data: Array<u8>, binary: boolean) -> Message {
 
 /// Status code from a response's first line (`HTTP/1.1 <code> ...`).
 private function status_code(head: Str) -> u64 {
-    const len: i64 = head.length();
+    const bytes: Slice<u8> = head.as_bytes();
+    const len: i64 = bytes.length();
     mut i: i64 = 0;
-    while (i < len && head_at(head, i) != 0x20) { i++; }   // skip "HTTP/1.1"
-    while (i < len && head_at(head, i) == 0x20) { i++; }   // skip spaces
+    while (i < len && bytes[i] != 0x20) { i++; }   // skip "HTTP/1.1"
+    while (i < len && bytes[i] == 0x20) { i++; }   // skip spaces
     mut code: u64 = 0;
-    while (i < len) {
-        const c: u8 = head_at(head, i);
-        if (!c.is_digit()) { break; }
-        code = code * 10 + ((c - 0x30) as u64);
+    while (i < len && bytes[i].is_digit()) {
+        code = code * 10 + ((bytes[i] - 0x30) as u64);
         i++;
     }
     return code;
 }
 
-/// The value of ONE header line when its name matches `name_lower`
+/// The value of ONE header line when its name matches `name`
 /// case-insensitively, as a view into that line. `read_line` has already
 /// stripped the terminator, so the value runs to the end of the line.
-private function header_line_value(line: Str, name_lower: Str) -> Option<Str> {
-    const len: i64 = line.length();
-    mut colon: i64 = len;
-    mut i: i64 = 0;
-    while (i < len) {
-        if (head_at(line, i) == 0x3A) { colon = i; break; }   // ':'
-        i++;
-    }
-    if (colon == len) { return Option::None; }
-    if (!eq_ignore_case(line.sub_bytes(0, colon), name_lower)) { return Option::None; }
-    mut vs: i64 = colon + 1;
-    while (vs < len && head_at(line, vs) == 0x20) { vs++; }   // strip leading SP
-    return Option::Some(line.sub_bytes(vs, len));
-}
-
-/// Case-insensitive equality of `a` against an already-lowercase `b`.
-private function eq_ignore_case(a: Str, b_lower: Str) -> boolean {
-    if (a.length() != b_lower.length()) { return false; }
-    mut i: i64 = 0;
-    while (i < a.length()) {
-        if (head_at(a, i).to_ascii_lowercase() != head_at(b_lower, i)) { return false; }
-        i++;
-    }
-    return true;
-}
-
-/// Byte equality of two `Str`s.
-private function str_eq(a: Str, b: Str) -> boolean {
-    if (a.length() != b.length()) { return false; }
-    mut i: i64 = 0;
-    while (i < a.length()) {
-        if (head_at(a, i) != head_at(b, i)) { return false; }
-        i++;
-    }
-    return true;
-}
-
-/// Byte access without `Option` ceremony; callers stay in range.
-private function head_at(s: Str, index: i64) -> u8 {
-    match (s.byte_at(index)) {
-        Option::Some(b) => { return b; }
-        Option::None    => { return 0; }
+private function header_line_value(line: Str, name: Str) -> Option<Str> {
+    match (line.split_once(&Str::new(":"))) {
+        Option::Some(parts) => {
+            if (!parts.first.equals_case_insensitive(&name)) { return Option::None; }
+            const value: Slice<u8> = parts.second.as_bytes();
+            mut start: i64 = 0;
+            while (start < value.length() && value[start] == 0x20) { start++; }   // strip leading SP
+            return Option::Some(parts.second.sub_bytes(start, value.length()));
+        }
+        Option::None => { return Option::None; }
     }
 }
