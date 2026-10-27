@@ -223,6 +223,21 @@ yet is recorded with the change that builds it, not here.
      whether a bound written on a concrete type should direct a call is
      open)
 
+605. **Addresses, URLs, methods and status codes are `Display`.**  An
+     `IpV4Addr` writes dotted decimal; an `IpV6Addr` its canonical text
+     (RFC 5952): lowercase hex groups without leading zeros, the longest
+     run of two or more zero groups written `::`, the first of equally
+     long runs, and no dotted tail; an `IpAddr` writes its address.  A
+     `SocketAddr` writes `ip:port`, an IPv6 address in brackets.  A `Url`
+     writes `scheme://host[:port]path[?query][#fragment]`: an IPv6 host
+     in brackets, the port only when it is not the scheme's default, and
+     no userinfo, which the parser does not keep.  A `Method` writes its
+     wire form and a `StatusCode` its code in decimal.  The HTTP client
+     writes its `Host` header through `SocketAddr`'s, so an IPv6 host is
+     sent compressed, and its own address writers are deleted.  (Jake for
+     the types and the compressed form; the URL's port and userinfo and
+     the bare status code delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

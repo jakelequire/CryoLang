@@ -22,7 +22,6 @@ import std::collections::array::{ Array };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::core::primitives;
-import std::net::addr::ip::{ IpAddr, IpV6Addr };
 import std::net::addr::socket_addr::{ SocketAddr };
 import std::net::socket::tcp::{ TcpConnect, TcpStream };
 import std::net::http::method::{ Method };
@@ -42,7 +41,8 @@ public type struct Client {
     /// `GET addr/path`. Sets Host to `addr`'s address:port.
     public async get(&this, addr: SocketAddr, path: Str) -> Result<Response, IoError> {
         mut req: Request = Request::new(Method::Get, path);
-        apply_host_header(&req, &addr);
+        const host: String = f"{addr}";
+        req.headers.insert(Str::new("Host"), host.as_str());
         return await send(addr, req);
     }
 
@@ -55,7 +55,8 @@ public type struct Client {
                content_type: Str,
                body: Array<u8>) -> Result<Response, IoError> {
         mut req: Request = Request::new(Method::Post, path);
-        apply_host_header(&req, &addr);
+        const host: String = f"{addr}";
+        req.headers.insert(Str::new("Host"), host.as_str());
         req.headers.insert(
             Str::new("Content-Type"),
             content_type
@@ -99,61 +100,5 @@ public async function send(addr: SocketAddr, req: Request) -> Result<Response, I
     }
 
     return await c.read_response();
-}
-
-/// Write `host: ip:port` into the request headers. IPv4 renders as
-/// `a.b.c.d:port`; an IPv6 literal is bracketed per RFC 3986: `[h:h:...]:port`.
-private function apply_host_header(req: mut &Request, addr: &SocketAddr) -> void {
-    mut buffer: String = String::with_capacity(48);
-    match (addr.ip) {
-        IpAddr::V4(v4) => {
-            buffer.push(v4.a);
-            buffer.push_byte(0x2E as u8);
-            buffer.push(v4.b);
-            buffer.push_byte(0x2E as u8);
-            buffer.push(v4.c);
-            buffer.push_byte(0x2E as u8);
-            buffer.push(v4.d);
-            buffer.push_byte(0x3A as u8);
-            buffer.push(addr.port);
-        }
-        IpAddr::V6(v6) => {
-            // RFC 3986: bracket the literal, with `:port` outside the brackets.
-            buffer.push_byte(0x5B as u8);                  // '['
-            push_v6_hextets(&buffer, &v6);
-            buffer.push_byte(0x5D as u8);                  // ']'
-            buffer.push_byte(0x3A as u8);
-            buffer.push(addr.port);
-        }
-    }
-    req.headers.insert(Str::new("Host"), buffer.as_str());
-}
-
-/// Eight colon-separated lowercase hex groups, no `::` compression (the
-/// uncompressed form is valid inside a bracketed Host).
-private function push_v6_hextets(buffer: mut &String, v6: &IpV6Addr) -> void {
-    mut g: i64 = 0;
-    while (g < 8) {
-        if (g > 0) { buffer.push_byte(0x3A as u8); }       // ':'
-        push_u16_hex(buffer, v6.group_at(g));
-        g = g + 1;
-    }
-}
-
-/// Lowercase hex of `value`, no leading zeros (at least one digit).
-private function push_u16_hex(buffer: mut &String, value: u16) -> void {
-    if (value == 0) { buffer.push_byte(0x30 as u8); return; }
-    mut tmp: [u8; 4];
-    mut n: u64 = 0;
-    mut v: u16 = value;
-    while (v > 0) {
-        const nib: u8 = (v & 0xF) as u8;
-        if (nib < 10) { tmp[n] = 0x30 + nib; }
-        else { tmp[n] = 0x61 + (nib - 10); }
-        n = n + 1;
-        v = v >> 4;
-    }
-    mut i: u64 = n;
-    while (i > 0) { i = i - 1; buffer.push_byte(tmp[i]); }
 }
 

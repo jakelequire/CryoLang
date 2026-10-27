@@ -19,6 +19,8 @@ import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::core::convert::{ ConversionError };
 import std::collections::str::{ Str };
+import std::fmt::display::{ Display, Formatter };
+import std::fmt::error::{ FmtError };
 
 public type struct IpV4Addr {
     public a: u8;
@@ -359,6 +361,65 @@ implement enum IpAddr {
         match (IpV4Addr::parse_opt(source)) {
             Option::Some(v4) => { return Option::Some(IpAddr::V4(v4)); }
             Option::None => { return Option::None; }
+        }
+    }
+}
+
+/// Dotted decimal, `a.b.c.d`.
+implement trait Display for struct IpV4Addr {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        (Display for u8)::fmt(&this.a, f)?;
+        f.write_str(Str::new("."))?;
+        (Display for u8)::fmt(&this.b, f)?;
+        f.write_str(Str::new("."))?;
+        (Display for u8)::fmt(&this.c, f)?;
+        f.write_str(Str::new("."))?;
+        return (Display for u8)::fmt(&this.d, f);
+    }
+}
+
+/// The canonical text form (RFC 5952): eight lowercase hex groups without
+/// leading zeros, the longest run of two or more zero groups written `::`
+/// (the first, when two runs are equally long).  `::1`, `fe80::1`,
+/// `2001:db8:0:1::`.
+implement trait Display for struct IpV6Addr {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        mut run_start: i64 = -1;
+        mut best_start: i64 = -1;
+        mut best_length: i64 = 1;
+        for (mut g: i64 = 0; g < 8; g++) {
+            if (this.group_at(g) != 0) {
+                run_start = -1;
+            } else {
+                if (run_start < 0) { run_start = g; }
+                if (g - run_start + 1 > best_length) {
+                    best_start = run_start;
+                    best_length = g - run_start + 1;
+                }
+            }
+        }
+        mut g: i64 = 0;
+        while (g < 8) {
+            if (g == best_start) {
+                f.write_str(Str::new("::"))?;
+                g += best_length;
+                continue;
+            }
+            if (g > 0 && g != best_start + best_length) { f.write_str(Str::new(":"))?; }
+            mut digits: [u8; 4];
+            const count: i64 = this.group_at(g).to_hex_buf(&digits[0]);
+            f.write_str(Str::from_raw(&digits[0], count))?;
+            g += 1;
+        }
+        return Result::Ok(());
+    }
+}
+
+implement trait Display for enum IpAddr {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        match (&this) {
+            IpAddr::V4(v4) => { return (Display for IpV4Addr)::fmt(&v4, f); }
+            IpAddr::V6(v6) => { return (Display for IpV6Addr)::fmt(&v6, f); }
         }
     }
 }
