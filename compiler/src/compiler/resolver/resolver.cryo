@@ -359,6 +359,13 @@ type struct Resolver {
     // corrupted on store/load).  [Pair<A,B>] sidesteps generic-over-array
     // codegen entirely.
     exports:              [Pair<SymbolID, ModulePath>];  // .first = exported symbol, .second = the module exporting it
+    // `exports` indexed by the exported name: each name's first and last
+    // entry, and beside each entry the next one of its name (-1 for none),
+    // in export order.  A name's entries are read without a walk over every
+    // module's exports.
+    export_first:         HashMap<u32, i64>;
+    export_last:          HashMap<u32, i64>;
+    export_next:          [i64];
 
 
     // Current context
@@ -437,6 +444,9 @@ type struct Resolver {
             referenced_records:   0,
             referenced_symbols:   -1,
             exports:              [],
+            export_first:         HashMap::<u32, i64>::new(),
+            export_last:          HashMap::<u32, i64>::new(),
+            export_next:          [],
             current_module:       ModulePath::none(),
             prelude_modules:      [],
             module_scopes:        HashMap::<ModuleKey, u64>::new(),            param_bounds:         [],
@@ -1094,7 +1104,15 @@ type struct Resolver {
 
     /// Register a symbol as exported from the current module.
     export_symbol(mut &this, sym_id: SymbolID) -> void {
+        const index: i64 = this.exports.length();
         this.exports.push(Pair::<SymbolID, ModulePath>::new(sym_id, this.current_module));
+        this.export_next.push(-1);
+        const name_id: u32 = this.get_symbol(sym_id).name.id;
+        match (this.export_last.get(&name_id)) {
+            Option::Some(last) => { this.export_next[last] = index; }
+            Option::None       => { this.export_first.insert(name_id, index); }
+        }
+        this.export_last.insert(name_id, index);
     }
 
     /// Get all exported symbols from a module.
@@ -1138,13 +1156,18 @@ type struct Resolver {
     /// reader that wants one of them chooses by kind.
     exports_named(&this, m: ModulePath, name: SymbolStr) -> [SymbolID] {
         mut out: [SymbolID] = [];
-        for (mut i: i64 = 0; i < this.exports.length(); i++) {
+        mut i: i64 = match (this.export_first.get(&name.id)) {
+            Option::Some(first) => { first }
+            Option::None        => { -1 }
+        };
+        while (i >= 0) {
             if (this.exports[i].second.equals(m)) {
                 const sym: Symbol = this.get_symbol(this.exports[i].first);
-                if (sym.name.equals(name) && this.offered_here(&sym)) {
+                if (this.offered_here(&sym)) {
                     out.push(this.declaration_of(this.exports[i].first));
                 }
             }
+            i = this.export_next[i];
         }
         return out;
     }
