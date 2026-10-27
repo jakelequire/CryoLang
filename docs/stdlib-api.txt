@@ -13,7 +13,7 @@
 #   [private]         not reachable from another module
 #   [internal]        reachable only from the standard library
 #
-# 155 namespaces, 4773 declarations.
+# 155 namespaces, 4791 declarations.
 
 ==============================================================================
 std::alloc::allocator
@@ -2453,6 +2453,7 @@ std::fmt::display
   Debug.fmt(&this, f: mut &Formatter) -> Result<(), FmtError>
   Display.fmt(&this, f: mut &Formatter) -> Result<(), FmtError>
   Formatter.get_writer(&this) -> virtual mut &FmtWrite
+  Formatter.write(mut &this, arguments: Arguments) -> Result<(), FmtError>
   Formatter.write_char(mut &this, c: char) -> Result<(), FmtError>
   Formatter.write_str(mut &this, source: Str) -> Result<(), FmtError>
   Formatter::new(writer: virtual mut &FmtWrite) -> Formatter
@@ -2494,11 +2495,31 @@ std::fmt::float
 std::fmt::interp
     stdlib/fmt/interp.cryo
 ==============================================================================
+  struct Arguments
+  struct DebugPiece<P, T>   [internal]
+  struct DisplayPiece<P, T>   [internal]
+  struct LiteralPiece<P>   [internal]
+  struct NoPieces   [internal]
+  struct SpecPiece<P, T>   [internal]
+  trait FormatPieces   [internal]
+  DebugPiece<P, T> where P: FormatPieces, T: Debug: implements FormatPieces
+  DisplayPiece<P, T> where P: FormatPieces, T: Display: implements FormatPieces
+  LiteralPiece<P> where P: FormatPieces: implements FormatPieces
+  NoPieces: implements FormatPieces
+  SpecPiece<P, T> where P: FormatPieces, T: Display: implements FormatPieces
   fmt_append_debug<T>(out: String, value: &T) -> String where T: Debug
   fmt_append_display<T>(out: String, value: &T) -> String where T: Display
   fmt_append_fmt<T>(out: String, value: &T, spec: string) -> String where T: Display
   fmt_append_lit(out: String, text: string) -> String
+  fmt_arguments_new(pieces: virtual &FormatPieces) -> Arguments   [internal]
   fmt_new() -> String
+  fmt_pieces_debug<P, T>(previous: P, value: &T) -> DebugPiece<P, T> where P: FormatPieces, T: Debug   [internal]
+  fmt_pieces_display<P, T>(previous: P, value: &T) -> DisplayPiece<P, T> where P: FormatPieces, T: Display   [internal]
+  fmt_pieces_literal<P>(previous: P, text: string) -> LiteralPiece<P> where P: FormatPieces   [internal]
+  fmt_pieces_new() -> NoPieces   [internal]
+  fmt_pieces_spec<P, T>(previous: P, value: &T, spec: string) -> SpecPiece<P, T> where P: FormatPieces, T: Display   [internal]
+  Arguments.write_to(&this, f: mut &Formatter) -> Result<(), FmtError>   [internal]
+  FormatPieces.write_pieces(&this, f: mut &Formatter) -> Result<(), FmtError>
 
 ==============================================================================
 std::fmt::spec
@@ -2513,6 +2534,7 @@ std::fmt::spec
   ALIGN_RIGHT: u8
   FILL_SPACE: u32
   FILL_ZERO: u32
+  NUMBER_BODY_BYTES: i64   [internal]
   RADIX_BIN: u8
   RADIX_HEX_LOWER: u8
   RADIX_HEX_UPPER: u8
@@ -2520,15 +2542,17 @@ std::fmt::spec
   RADIX_OCT: u8
   align_of_byte(b: u8) -> u8
   fmt_display_body<T>(value: &T, spec: &FmtSpec) -> BodyText where T: Display
-  fmt_float_body(val: f64, spec: &FmtSpec) -> BodyText
-  fmt_pad(out: mut &String, body: Str, head_len: i64, spec: &FmtSpec) -> void
+  fmt_float_body(val: f64, spec: &FmtSpec, out: u8*) -> BodyText
+  fmt_pad(f: mut &Formatter, body: Str, head_len: i64, spec: &FmtSpec) -> Result<(), FmtError>
   fmt_parse_spec(spec: Str) -> FmtSpec
-  fmt_sint_body(val: i64, masked: u64, spec: &FmtSpec) -> BodyText
-  fmt_uint_body(val: u64, spec: &FmtSpec) -> BodyText
+  fmt_sint_body(val: i64, masked: u64, spec: &FmtSpec, out: u8*) -> BodyText
+  fmt_uint_body(val: u64, spec: &FmtSpec, out: u8*) -> BodyText
   is_align_byte(b: u8) -> boolean
-  radix_digits(val: u64, spec: &FmtSpec) -> String
+  radix_digits(val: u64, spec: &FmtSpec, out: u8*) -> i64
   radix_prefix(spec: &FmtSpec) -> Str
   truncate_scalars(s: Str, n: i64) -> Str
+  BodyText.as_str(&this) -> Str
+  BodyText::number(digits: u8*, length: i64, head_len: i64) -> BodyText
   FmtSpec::empty() -> FmtSpec
 
 ==============================================================================
@@ -2536,10 +2560,9 @@ std::fmt::write
     stdlib/fmt/write.cryo
 ==============================================================================
   trait FmtWrite
-  Stderr: implements FmtWrite
-  Stdout: implements FmtWrite
   String<GlobalAlloc>: implements FmtWrite
   encode_utf8(scalar: u32, out: u8*) -> i64   [private]
+  FmtWrite.write(mut &this, arguments: Arguments) -> Result<(), FmtError>
   FmtWrite.write_char(mut &this, c: char) -> Result<(), FmtError>
   FmtWrite.write_str(mut &this, source: Str) -> Result<(), FmtError>
 
@@ -3190,7 +3213,6 @@ std::json::serializer
 ==============================================================================
   BSLASH: u8
   QUOTE_BYTE: u8
-  hex_nibble(n: u8) -> u8
   stringify(v: &JsonValue) -> String
   stringify_pretty(v: &JsonValue) -> String
   write_array(out: mut &String, arr: &Array<JsonValue>, pretty: boolean, depth: u64) -> void
@@ -5219,8 +5241,6 @@ std::time::datetime
   SECS_PER_MIN: i64   [private]
   YEARS_PER_ERA: i64   [private]
   civil_from_days(days: i64, hour: u32, minute: u32, second: u32) -> DateTime   [private]
-  write_pad(f: mut &Formatter, value: u64, width: i64) -> Result<(), FmtError>   [private]
-  write_year(f: mut &Formatter, year: i64) -> Result<(), FmtError>   [private]
   DateTime.to_string(&this) -> String
   DateTime::from_system_time(t: &SystemTime) -> DateTime
   DateTime::from_unix_secs(secs: i64) -> DateTime
@@ -5243,8 +5263,6 @@ std::time::duration
   Duration::SECS_PER_DAY: u64
   Duration::SECS_PER_HOUR: u64
   Duration::SECS_PER_MINUTE: u64
-  copy_str(buf: u8*, pos: i64, s: Str) -> i64   [private]
-  write_decimal(f: mut &Formatter, value: u64) -> Result<(), FmtError>   [private]
   write_fraction(f: mut &Formatter, nanos: u32) -> Result<(), FmtError>   [private]
   Duration.as_micros(&this) -> u64
   Duration.as_millis(&this) -> u64

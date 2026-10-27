@@ -1,27 +1,25 @@
 ///! FmtWrite: the sink trait every formatter writes through.
 ///!
-///! Parallels `io::Write` but with a distinct error type. A byte-level
-///! sink (`Stdout`, `File`, `TcpStream`, `BufWriter`) reports failure
-///! as `IoError`; a heap-backed sink (`String`) reports failure as
-///! `AllocError`. `FmtError` unifies both so `Display` and `Debug`
-///! have a single return shape regardless of where the bytes land.
+///! Parallels `io::Write` but with a distinct error type. A sink over a
+///! byte stream reports failure as `IoError`; a heap-backed sink
+///! (`String`) reports failure as `AllocError`. `FmtError` unifies both
+///! so `Display` and `Debug` have a single return shape regardless of
+///! where the bytes land.
 ///!
-///! Every sink that wants to be a format target implements this
-///! trait. Stdlib impls live here rather than alongside each sink
-///! because they all have the same two-line shape.
+///! Every sink that wants to be a format target implements this trait.
+///! A byte stream is written through `io::Write`, whose own `write` takes
+///! text as well as bytes; the standard library's format target is
+///! `String`, whose implementation lives here.
 
 namespace std::fmt::write;
 
-import std::core::option;
 import std::core::result::{ Result };
-import std::core::slice;
-import std::io::error;
-import std::io::traits;
-import std::io::stdio::{ Stderr, Stdout };
 import std::alloc::allocator::{ GlobalAlloc };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::fmt::error::{ FmtError };
+import std::fmt::display::{ Formatter };
+import std::fmt::interp::{ Arguments };
 
 type trait FmtWrite {
     /// Write `source` in full, returning when the whole view has been
@@ -41,6 +39,14 @@ type trait FmtWrite {
         mut buffer: [u8; 4];
         const length: i64 = encode_utf8(c as u32, &buffer[0]);
         return this.write_str(Str::from_raw(&buffer[0], length));
+    }
+
+    /// Write an f-string, `sink.write(f"x = {x}")`, formatting each hole
+    /// straight into this sink: an f-string written here is the
+    /// `Arguments` of its pieces, not a `String` (`fmt::Arguments`).
+    write(mut &this, arguments: Arguments) -> Result<(), FmtError> {
+        mut f: Formatter = Formatter::new(&this);
+        return arguments.write_to(&f);
     }
 }
 
@@ -76,24 +82,6 @@ private function encode_utf8(scalar: u32, out: u8*) -> i64 {
     out[2] = (0x80 | ((scalar >> 6) & 0x3F)) as u8;
     out[3] = (0x80 | (scalar & 0x3F)) as u8;
     return 4;
-}
-
-implement trait FmtWrite for struct Stdout {
-    write_str(mut &this, source: Str) -> Result<(), FmtError> {
-        match (this.write(source.as_bytes())) {
-            Result::Ok(_) => { return Result::Ok(()); }
-            Result::Err(err) => { return Result::Err(FmtError::Io(err)); }
-        }
-    }
-}
-
-implement trait FmtWrite for struct Stderr {
-    write_str(mut &this, source: Str) -> Result<(), FmtError> {
-        match (this.write(source.as_bytes())) {
-            Result::Ok(_) => { return Result::Ok(()); }
-            Result::Err(err) => { return Result::Err(FmtError::Io(err)); }
-        }
-    }
 }
 
 /// `String` as a format target. Errors bubble up as

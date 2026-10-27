@@ -1,0 +1,128 @@
+///! An f-string written as an `fmt::Arguments` argument: its pieces are
+///! written by the callee, each hole formatted straight into the sink
+///! when the callee writes them, through `FmtWrite.write` and
+///! `Formatter.write`.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::FmtArguments;
+
+import std::core::result::{ Result };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::fmt;
+import std::fmt::display::{ Display, Formatter };
+import std::fmt::error::{ FmtError };
+import std::fmt::write::{ FmtWrite };
+import std::time::duration::{ Duration };
+import std::time::datetime::{ DateTime };
+import std::json::serializer::{ stringify };
+import std::json::value::{ JsonValue };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_eq };
+
+/// How many times a `Tally` has been formatted.
+mut g_formatted: i64 = 0;
+
+type struct Tally {
+    mark: i32;
+}
+
+implement trait Display for struct Tally {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        g_formatted = g_formatted + 1;
+        return f.write(f"<{this.mark}>");
+    }
+}
+
+/// The count of formattings when the arguments arrive, then the text
+/// they write.
+function formatted_before_writing(arguments: fmt::Arguments, out: mut &String) -> i64 {
+    const before: i64 = g_formatted;
+    match (out.write(arguments)) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { }
+    }
+    return before;
+}
+
+/// A writer of its own: it gets `write` from the trait.
+type struct Counter {
+    bytes: i64;
+}
+
+implement trait FmtWrite for struct Counter {
+    write_str(mut &this, source: Str) -> Result<(), FmtError> {
+        this.bytes += source.length();
+        return Result::Ok(());
+    }
+}
+
+![test]
+function holes_are_formatted_when_the_callee_writes() -> Result<(), TestError> {
+    g_formatted = 0;
+    mut out: String = String::new();
+    const t: Tally = Tally { mark: 7 };
+    const before: i64 = formatted_before_writing(f"a {t} b", &out);
+    expect_eq(before, 0)?;
+    expect_eq(g_formatted, 1)?;
+    expect_eq(out.as_str(), Str::new("a <7> b"))?;
+    // The same f-string where a `String` is expected is formatted at once.
+    const eager: String = f"{t}";
+    expect_eq(g_formatted, 2)?;
+    expect_eq(eager.as_str(), Str::new("<7>"))?;
+    return Result::Ok(());
+}
+
+![test]
+function write_formats_every_kind_of_hole() -> Result<(), TestError> {
+    const x: i32 = 42;
+    const name: String = String::from("cryo");
+    mut out: String = String::new();
+    match (out.write(f"x = {x}, {name:?}, {x:#06x}, [{name:>6}], [{-5:04}], {{}}")) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { }
+    }
+    expect_eq(out.as_str(), Str::new("x = 42, \"cryo\", 0x002a, [  cryo], [-005], {}"))?;
+    mut empty: String = String::new();
+    match (empty.write(f"")) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { }
+    }
+    expect_eq(empty.length(), 0)?;
+    return Result::Ok(());
+}
+
+![test]
+function every_writer_has_write() -> Result<(), TestError> {
+    mut c: Counter = Counter { bytes: 0 };
+    const x: i64 = -12345;
+    match (c.write(f"{x}|{x:>8}")) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { }
+    }
+    expect_eq(c.bytes, 15)?;
+    return Result::Ok(());
+}
+
+![test]
+function library_writers_pad_and_escape() -> Result<(), TestError> {
+    // Year 1, then year -1 (ISO-8601 expanded form), each padded to four.
+    expect_eq(f"{DateTime::from_unix_secs(-62135596800)}".as_str(), Str::new("0001-01-01T00:00:00Z"))?;
+    expect_eq(f"{DateTime::from_unix_secs(-62198755200)}".as_str(), Str::new("-0001-01-01T00:00:00Z"))?;
+    // A control character other than the named escapes is `\u00XX`.
+    mut text: String = String::from("a");
+    text.push_byte(0x1F);
+    text.push_byte(0x62);
+    const json: String = stringify(&JsonValue::String(text));
+    expect_eq(json.as_str(), Str::new("\"a\\u001fb\""))?;
+    return Result::Ok(());
+}
+
+![test]
+function formatter_writes_an_f_string() -> Result<(), TestError> {
+    expect_eq(f"{Duration::from_millis(250)}".as_str(), Str::new("250ms"))?;
+    expect_eq(f"{Duration::from_millis(1500)}".as_str(), Str::new("1.5s"))?;
+    expect_eq(Duration::from_millis(1500).to_debug_string().as_str(),
+        Str::new("Duration { secs: 1, nanos: 500000000 }"))?;
+    return Result::Ok(());
+}

@@ -25,7 +25,8 @@ import std::core::iter::{ Iterator };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::collections::pair::{ Pair };
-import std::fmt::display::{ Display, format_to_string };
+import std::fmt::display::{ Display, format_to_string, Formatter };
+import std::fmt::error::{ FmtError };
 import std::core::mem;
 
 /// No radix: format the value in its natural (decimal / Display) form.
@@ -158,83 +159,62 @@ function radix_prefix(spec: &FmtSpec) -> Str {
     return Str::new("");
 }
 
-/// Render the magnitude `val` in the spec's radix into a `String`.
-function radix_digits(val: u64, spec: &FmtSpec) -> String {
-    mut buffer: [u8; 64];
-    mut digits: i64 = 0;
-    if (spec.radix == RADIX_HEX_LOWER) {
-        digits = val.to_hex_buf(&buffer[0]);
-    } else if (spec.radix == RADIX_HEX_UPPER) {
-        digits = val.to_hex_upper_buf(&buffer[0]);
-    } else if (spec.radix == RADIX_OCT) {
-        digits = val.to_oct_buf(&buffer[0]);
-    } else if (spec.radix == RADIX_BIN) {
-        digits = val.to_bin_buf(&buffer[0]);
-    } else {
-        digits = val.to_decimal_buf(&buffer[0]);
-    }
-    mut out: String = String::new();
-    out.push(Str::from_raw(&buffer[0], digits));
-    return out;
+/// The bytes a number's body needs at most: a sign or a two-byte radix
+/// prefix and 64 binary digits, or a float written with a precision.
+internal const NUMBER_BODY_BYTES: i64 = 72;
+
+/// Write the magnitude `val` in the spec's radix into `out`; the number
+/// of bytes written.
+function radix_digits(val: u64, spec: &FmtSpec, out: u8*) -> i64 {
+    if (spec.radix == RADIX_HEX_LOWER) { return val.to_hex_buf(out); }
+    if (spec.radix == RADIX_HEX_UPPER) { return val.to_hex_upper_buf(out); }
+    if (spec.radix == RADIX_OCT)       { return val.to_oct_buf(out); }
+    if (spec.radix == RADIX_BIN)       { return val.to_bin_buf(out); }
+    return val.to_decimal_buf(out);
 }
 
-/// Body for an unsigned integer: optional radix prefix + digits. `head`
-/// (out-param via the returned struct) is the prefix length.
-function fmt_uint_body(val: u64, spec: &FmtSpec) -> BodyText {
-    mut out: String = String::new();
+/// Body for an unsigned integer, written into `out` (`NUMBER_BODY_BYTES`):
+/// optional radix prefix + digits, the prefix its `head_len`.
+function fmt_uint_body(val: u64, spec: &FmtSpec, out: u8*) -> BodyText {
     mut head: i64 = 0;
-    const prefix: Str = radix_prefix(spec);
     if (spec.radix != RADIX_NONE) {
-        out.push(prefix);
+        const prefix: Str = radix_prefix(spec);
+        for (mut i: i64 = 0; i < prefix.length(); i++) { out[i] = prefix.as_ptr()[i]; }
         head = prefix.length();
     }
-    mut digits: String = radix_digits(val, spec);
-    out.push(digits.as_str());
-    mem::drop(digits);
-    return BodyText { text: out, head_len: head };
+    return BodyText::number(out, head + radix_digits(val, spec, out + head), head);
 }
 
-/// Body for a signed integer. Decimal keeps the sign; a radix formats the
-/// two's-complement bit pattern `masked` (already narrowed to the value's
-/// own width by the caller) with no sign: `-1i8` in hex is `ff`.
-function fmt_sint_body(val: i64, masked: u64, spec: &FmtSpec) -> BodyText {
+/// Body for a signed integer, written into `out` (`NUMBER_BODY_BYTES`).
+/// Decimal keeps the sign; a radix formats the two's-complement bit
+/// pattern `masked` (already narrowed to the value's own width by the
+/// caller) with no sign: `-1i8` in hex is `ff`.
+function fmt_sint_body(val: i64, masked: u64, spec: &FmtSpec, out: u8*) -> BodyText {
     if (spec.radix != RADIX_NONE) {
-        return fmt_uint_body(masked, spec);
+        return fmt_uint_body(masked, spec, out);
     }
-    mut out: String = String::new();
-    mut head: i64 = 0;
-    mut magnitude: u64 = val as u64;
-    if (val < 0) {
-        out.push_byte(0x2D);   // '-'
-        head = 1;
-        // Negate in u64 space so i64::MIN (whose magnitude overflows i64)
-        // still yields the right digits.
-        magnitude = (0 - val) as u64;
+    if (val >= 0) {
+        return BodyText::number(out, (val as u64).to_decimal_buf(out), 0);
     }
-    mut buffer: [u8; 20];
-    const digits: i64 = magnitude.to_decimal_buf(&buffer[0]) as i64;
-    out.push(Str::from_raw(&buffer[0], digits));
-    return BodyText { text: out, head_len: head };
+    out[0] = 0x2D;   // '-'
+    // Negate in u64 space so i64::MIN (whose magnitude overflows i64)
+    // still yields the right digits.
+    const magnitude: u64 = (0 - val) as u64;
+    return BodyText::number(out, 1 + magnitude.to_decimal_buf(out + 1), 1);
 }
 
-/// Body for a float. With a precision, uses fixed fractional digits;
-/// without, the default shortest round-trip form. The sign is part of
-/// the text, so `head_len` marks a leading `-` for zero-fill.
-function fmt_float_body(val: f64, spec: &FmtSpec) -> BodyText {
-    mut out: String = String::new();
-    if (spec.has_precision) {
-        mut buffer: [u8; 64];
-        const written: i64 = val.to_buf_with(&buffer[0], spec.precision as i64);
-        out.push(Str::from_raw(&buffer[0], written));
+/// Body for a float, written into `out` (`NUMBER_BODY_BYTES`). With a
+/// precision, uses fixed fractional digits; without, the form `Display`
+/// writes. The sign is part of the text, so `head_len` marks a leading
+/// `-` for zero-fill.
+function fmt_float_body(val: f64, spec: &FmtSpec, out: u8*) -> BodyText {
+    const written: i64 = if (spec.has_precision) {
+        val.to_buf_with(out, spec.precision as i64)
     } else {
-        match (format_to_string::<f64>(&val)) {
-            Result::Ok(s)  => { mut tmp: String = s; out.push(tmp.as_str()); mem::drop(tmp); }
-            Result::Err(_) => { }
-        }
-    }
-    mut head: i64 = 0;
-    if (out.length() > 0 && out.as_str().byte_at(0).unwrap_or(0) == 0x2D) { head = 1; }
-    return BodyText { text: out, head_len: head };
+        val.to_buf(out)
+    };
+    const head: i64 = if (written > 0 && out[0] == 0x2D) { 1 } else { 0 };
+    return BodyText::number(out, written, head);
 }
 
 /// Body for any Display value that is not an integer or float: render it,
@@ -246,23 +226,33 @@ where T: Display {
         Result::Ok(s)  => { mut tmp: String = s; out.push(tmp.as_str()); mem::drop(tmp); }
         Result::Err(_) => { }
     }
+    mut length: i64 = out.length();
     if (spec.has_precision) {
-        const truncated: Str = truncate_scalars(out.as_str(), spec.precision);
-        if (truncated.length() < out.length()) {
-            mut shorter: String = String::new();
-            shorter.push(truncated);
-            mem::drop(out);
-            out = shorter;
-        }
+        length = truncate_scalars(out.as_str(), spec.precision).length();
     }
-    return BodyText { text: out, head_len: 0 };
+    return BodyText { text: out, digits: null, length: length, head_len: 0 };
 }
 
 /// The rendered digits/text of a value plus the length of its leading
-/// sign/radix-prefix run (bytes that a `0` flag must keep leftmost).
+/// sign/radix-prefix run (bytes that a `0` flag must keep leftmost).  A
+/// number's body is the first `length` bytes at `digits`, a buffer its
+/// caller owns; any other value's is the first `length` bytes of `text`.
 type struct BodyText {
     text:     String;
+    digits:   u8*;
+    length:   i64;
     head_len: i64;
+
+    /// A number's body: `length` bytes at `digits`.
+    static number(digits: u8*, length: i64, head_len: i64) -> BodyText {
+        return BodyText { text: String::new(), digits: digits, length: length, head_len: head_len };
+    }
+
+    /// The body's text.
+    as_str(&this) -> Str {
+        if (this.digits != null) { return Str::from_raw(this.digits, this.length); }
+        return this.text.as_str().sub_bytes(0, this.length);
+    }
 }
 
 implement trait Drop for struct BodyText {
@@ -287,14 +277,11 @@ function truncate_scalars(s: Str, n: i64) -> Str {
     }
 }
 
-/// Pad `body` to the spec's field width and append it to `out`. `head_len`
+/// Write `body` through `f`, padded to the spec's field width. `head_len`
 /// is the leading sign/prefix run for sign-aware zero-fill.
-function fmt_pad(out: mut &String, body: Str, head_len: i64, spec: &FmtSpec) -> void {
+function fmt_pad(f: mut &Formatter, body: Str, head_len: i64, spec: &FmtSpec) -> Result<(), FmtError> {
     const count: i64 = body.chars().count();
-    if (count >= spec.width) {
-        out.push(body);
-        return;
-    }
+    if (count >= spec.width) { return f.write_str(body); }
     const padn: i64 = spec.width - count;
 
     // Resolve alignment and fill, honouring the `0` flag when no explicit
@@ -306,25 +293,18 @@ function fmt_pad(out: mut &String, body: Str, head_len: i64, spec: &FmtSpec) -> 
         else { align = ALIGN_LEFT; }
     }
 
-    if (align == ALIGN_LEFT) {
-        out.push(body);
-        out.push_repeated(fill, padn);
-        return;
-    }
-    if (align == ALIGN_CENTER) {
-        const left: i64 = padn / 2;
-        out.push_repeated(fill, left);
-        out.push(body);
-        out.push_repeated(fill, padn - left);
-        return;
-    }
-    // ALIGN_RIGHT. For a zero-fill, keep the sign/prefix leftmost.
-    if (spec.zero_pad && head_len > 0) {
-        out.push(body.sub_bytes(0, head_len));
-        out.push_repeated(fill, padn);
-        out.push(body.sub_bytes(head_len, body.length()));
-        return;
-    }
-    out.push_repeated(fill, padn);
-    out.push(body);
+    // How much of the fill goes before the body, and where in the body it
+    // goes: after the sign/prefix run for a right-aligned zero-fill, which
+    // keeps the sign/prefix leftmost.
+    mut before: i64 = padn;
+    if (align == ALIGN_LEFT) { before = 0; }
+    if (align == ALIGN_CENTER) { before = padn / 2; }
+    mut split: i64 = 0;
+    if (align == ALIGN_RIGHT && spec.zero_pad && head_len > 0) { split = head_len; }
+
+    if (split > 0) { f.write_str(body.sub_bytes(0, split))?; }
+    for (mut k: i64 = 0; k < before; k++) { f.write_char(fill)?; }
+    f.write_str(body.sub_bytes(split, body.length()))?;
+    for (mut k: i64 = before; k < padn; k++) { f.write_char(fill)?; }
+    return Result::Ok(());
 }

@@ -35,10 +35,11 @@ import std::core::result::{ Result };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::fmt::display::{ Debug, Display, Formatter };
+import std::fmt::error::{ FmtError };
 import std::core::mem;
 import std::fmt::spec::{
     BodyText, fmt_display_body, fmt_float_body, fmt_pad, fmt_parse_spec, fmt_sint_body,
-    fmt_uint_body, FmtSpec
+    fmt_uint_body, FmtSpec, NUMBER_BODY_BYTES
 };
 
 /// Start a fresh interpolation buffer.  The innermost call in an
@@ -90,34 +91,182 @@ where T: Debug {
 /// (width / fill / align / precision / radix). `spec` is the raw spec
 /// text after the colon; the compiler emits this helper only when that
 /// text is a valid spec (a bare `{expr}` and a `{expr:?}` still lower to
-/// `fmt_append_display` / `fmt_append_debug`).
-///
-/// The per-type dispatch lives here: `static match (T)` selects a body
-/// builder (integer decimal/radix, float, or generic Display) from
-/// `fmt::spec`; `fmt_pad` then applies the field width. Integers are
-/// rendered at their own width so a radix of a negative or narrow value
-/// shows the correct two's-complement digits.
+/// `fmt_append_display` / `fmt_append_debug`).  The hole is written as
+/// its piece writes it (`SpecPiece`).
 ![language("format_append_spec")]
 function fmt_append_fmt<T>(out: String, value: &T, spec: string) -> String
 where T: Display {
     mut s: String = out;
-    const fs: FmtSpec = fmt_parse_spec(Str::new(spec));
-    mut body: BodyText = static match (T) {
-        u8    => { fmt_uint_body(*value as u64, &fs) }
-        u16   => { fmt_uint_body(*value as u64, &fs) }
-        u32   => { fmt_uint_body(*value as u64, &fs) }
-        u64   => { fmt_uint_body(*value, &fs) }
-        usize => { fmt_uint_body(*value as u64, &fs) }
-        i8    => { fmt_sint_body(*value as i64, (*value as u8) as u64, &fs) }
-        i16   => { fmt_sint_body(*value as i64, (*value as u16) as u64, &fs) }
-        i32   => { fmt_sint_body(*value as i64, (*value as u32) as u64, &fs) }
-        i64   => { fmt_sint_body(*value, *value as u64, &fs) }
-        isize => { fmt_sint_body(*value as i64, *value as u64, &fs) }
-        f32   => { fmt_float_body(*value as f64, &fs) }
-        f64   => { fmt_float_body(*value, &fs) }
-        _     => { fmt_display_body::<T>(value, &fs) }
+    mut f: Formatter = Formatter::new(&s);
+    const piece: SpecPiece<NoPieces, T> = SpecPiece::<NoPieces, T> {
+        previous: NoPieces { },
+        value:    value,
+        spec:     spec,
     };
-    fmt_pad(&s, body.text.as_str(), body.head_len, &fs);
-    mem::drop(body);
+    match (piece.write_pieces(&f)) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { }
+    }
     return s;
+}
+
+/// Text formatted where it is written.  An f-string written directly as an
+/// argument whose parameter has this type is not built into a `String`:
+/// it becomes the f-string's pieces - its literal text, and a borrow of each
+/// hole's value - and the callee writes them through a `Formatter`
+/// (`FmtWrite.write`), each hole formatted straight into the sink.  An
+/// f-string anywhere else is a `String`.
+///
+/// The holes are borrowed for the call the arguments are passed to, the
+/// way a reference argument is borrowed, and are read when the arguments
+/// are written; an `Arguments` kept past that call names values that may
+/// be gone.
+![language("format_arguments")]
+type struct Arguments {
+private:
+    pieces: virtual &FormatPieces;
+
+internal:
+    /// Write the pieces through `f`, in the order the f-string has them,
+    /// stopping at the first that fails.  `FmtWrite.write` and
+    /// `Formatter.write` are how a program writes them.
+    write_to(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        return this.pieces.write_pieces(f);
+    }
+}
+
+/// The pieces of an f-string an `Arguments` writes: each piece writes the
+/// pieces before it, then itself.
+internal type trait FormatPieces {
+    write_pieces(&this, f: mut &Formatter) -> Result<(), FmtError>;
+}
+
+/// The `Arguments` of the pieces `pieces`.  Where an f-string is an
+/// `Arguments` argument, the compiler passes it this, borrowing the chain
+/// the pieces builders made.
+![language("format_arguments_new")]
+internal function fmt_arguments_new(pieces: virtual &FormatPieces) -> Arguments {
+    return Arguments { pieces: pieces };
+}
+
+/// No pieces: what the first piece of an f-string follows.
+internal type struct NoPieces { }
+
+implement trait FormatPieces for struct NoPieces {
+    write_pieces(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        return Result::Ok(());
+    }
+}
+
+/// The literal text `text`, after the pieces `previous`.
+internal type struct LiteralPiece<P> {
+    previous: P;
+    text:     string;
+}
+
+implement<P> trait FormatPieces for struct LiteralPiece<P> where P: FormatPieces {
+    write_pieces(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        this.previous.write_pieces(f)?;
+        return f.write_str(Str::new(this.text));
+    }
+}
+
+/// A `{value}` hole, written by `Display`, after the pieces `previous`.
+internal type struct DisplayPiece<P, T> {
+    previous: P;
+    value:    &T;
+}
+
+implement<P, T> trait FormatPieces for struct DisplayPiece<P, T> where P: FormatPieces, T: Display {
+    write_pieces(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        this.previous.write_pieces(f)?;
+        return this.value.fmt(f);
+    }
+}
+
+/// A `{value:?}` hole, written by `Debug`, after the pieces `previous`.
+internal type struct DebugPiece<P, T> {
+    previous: P;
+    value:    &T;
+}
+
+implement<P, T> trait FormatPieces for struct DebugPiece<P, T> where P: FormatPieces, T: Debug {
+    write_pieces(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        this.previous.write_pieces(f)?;
+        return this.value.fmt(f);
+    }
+}
+
+/// A `{value:spec}` hole after the pieces `previous`, `spec` the raw spec
+/// text.  `static match (T)` selects a body builder (integer decimal/radix,
+/// float, or generic Display) from `fmt::spec`; `fmt_pad` then applies the
+/// field width.  Integers are rendered at their own width so a radix of a
+/// negative or narrow value shows the correct two's-complement digits.
+internal type struct SpecPiece<P, T> {
+    previous: P;
+    value:    &T;
+    spec:     string;
+}
+
+implement<P, T> trait FormatPieces for struct SpecPiece<P, T> where P: FormatPieces, T: Display {
+    write_pieces(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        this.previous.write_pieces(f)?;
+        const value: &T = this.value;
+        const fs: FmtSpec = fmt_parse_spec(Str::new(this.spec));
+        // A number is rendered here, on the stack; only another value's
+        // `Display` text needs a `String`.
+        mut digits: [u8; NUMBER_BODY_BYTES];
+        const out: u8* = &digits[0];
+        mut body: BodyText = static match (T) {
+            u8    => { fmt_uint_body(*value as u64, &fs, out) }
+            u16   => { fmt_uint_body(*value as u64, &fs, out) }
+            u32   => { fmt_uint_body(*value as u64, &fs, out) }
+            u64   => { fmt_uint_body(*value, &fs, out) }
+            usize => { fmt_uint_body(*value as u64, &fs, out) }
+            i8    => { fmt_sint_body(*value as i64, (*value as u8) as u64, &fs, out) }
+            i16   => { fmt_sint_body(*value as i64, (*value as u16) as u64, &fs, out) }
+            i32   => { fmt_sint_body(*value as i64, (*value as u32) as u64, &fs, out) }
+            i64   => { fmt_sint_body(*value, *value as u64, &fs, out) }
+            isize => { fmt_sint_body(*value as i64, *value as u64, &fs, out) }
+            f32   => { fmt_float_body(*value as f64, &fs, out) }
+            f64   => { fmt_float_body(*value, &fs, out) }
+            _     => { fmt_display_body::<T>(value, &fs) }
+        };
+        const written: Result<(), FmtError> = fmt_pad(f, body.as_str(), body.head_len, &fs);
+        mem::drop(body);
+        return written;
+    }
+}
+
+/// The pieces builders: an f-string lowers to these, in place of the
+/// `String` builders above, where it is an `Arguments` argument.  Each
+/// takes the pieces before it by value and returns them with its own
+/// piece after.
+![language("format_pieces_new")]
+internal function fmt_pieces_new() -> NoPieces {
+    return NoPieces { };
+}
+
+![language("format_pieces_literal")]
+internal function fmt_pieces_literal<P>(previous: P, text: string) -> LiteralPiece<P>
+where P: FormatPieces {
+    return LiteralPiece::<P> { previous: previous, text: text };
+}
+
+![language("format_pieces_display")]
+internal function fmt_pieces_display<P, T>(previous: P, value: &T) -> DisplayPiece<P, T>
+where P: FormatPieces, T: Display {
+    return DisplayPiece::<P, T> { previous: previous, value: value };
+}
+
+![language("format_pieces_debug")]
+internal function fmt_pieces_debug<P, T>(previous: P, value: &T) -> DebugPiece<P, T>
+where P: FormatPieces, T: Debug {
+    return DebugPiece::<P, T> { previous: previous, value: value };
+}
+
+![language("format_pieces_spec")]
+internal function fmt_pieces_spec<P, T>(previous: P, value: &T, spec: string) -> SpecPiece<P, T>
+where P: FormatPieces, T: Display {
+    return SpecPiece::<P, T> { previous: previous, value: value, spec: spec };
 }

@@ -255,6 +255,27 @@ yet is recorded with the change that builds it, not here.
      yet.  (delegated; needed for `FmtWrite.write`, a default that makes
      a `Formatter` over its receiver)
 
+607. **An f-string passed as `fmt::Arguments` is written where it goes.**
+     An f-string written directly as an argument whose parameter is
+     `fmt::Arguments` is not built into a `String`: it becomes its
+     pieces - the literal text, and a borrow of each hole's value - and
+     the callee writes them through a `Formatter`, each hole formatted
+     straight into the sink when it is written.  Anywhere else - an
+     initializer, a return, a field, an argument whose parameter is
+     anything else, a generic `T` included - an f-string is a `String`,
+     so no stored value keeps a borrow of a hole past the call.
+     `FmtWrite.write(arguments)` is a default every sink gets, and
+     `Formatter.write(arguments)` writes through a formatter;
+     `String.push(f"...")` still builds the text first.  A number in a
+     hole with a spec is rendered on the stack.  `Stdout` and `Stderr`
+     are no longer `FmtWrite` sinks: they write text through
+     `io::Write.write`, whose name the default made ambiguous on them.
+     The duration and date-time `Display`s and the JSON control escape
+     write through `write`; their own decimal, padding and hex writers
+     are deleted.  (Jake for `write` on `FmtWrite`, the name
+     `fmt::Arguments` and the argument position; dropping `FmtWrite`
+     from `Stdout`/`Stderr` and `Formatter.write` delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that
