@@ -1,0 +1,106 @@
+/// A name in a pattern that names a constant compares the subject against
+/// that constant, wherever the constant is declared: in this module, brought
+/// in by a brace import, or reached through a path - the module's own path,
+/// its last segment, or an import alias.  The same holds in a payload
+/// position.  A constant that bound the subject instead would match every
+/// value, so each check feeds a value equal to the constant and one that is
+/// not.
+namespace ConstantPatternsCompare::Main;
+
+import std::ffi::libc::{ printf };
+import ConstantPatternsCompare::Codes::{ NOT_FOUND, DENIED };
+import ConstantPatternsCompare::Codes as C;
+
+const LOCAL_BUSY: u32 = 170;
+
+function imported(code: u32) -> i32 {
+    return match (code) {
+        NOT_FOUND => { 1 }
+        DENIED    => { 2 }
+        _         => { 0 }
+    };
+}
+
+function imported_statement(code: u32) -> i32 {
+    mut kind: i32 = 0;
+    match (code) {
+        NOT_FOUND => { kind = 1; }
+        DENIED    => { kind = 2; }
+        _         => { kind = 0; }
+    }
+    return kind;
+}
+
+function local(code: u32) -> i32 {
+    return match (code) {
+        LOCAL_BUSY => { 3 }
+        _          => { 0 }
+    };
+}
+
+function full_path(code: u32) -> i32 {
+    return match (code) {
+        ConstantPatternsCompare::Codes::NOT_FOUND => { 1 }
+        ConstantPatternsCompare::Codes::BUSY      => { 3 }
+        _                                         => { 0 }
+    };
+}
+
+function last_segment(code: u32) -> i32 {
+    return match (code) {
+        Codes::DENIED => { 2 }
+        Codes::BUSY   => { 3 }
+        _             => { 0 }
+    };
+}
+
+function through_alias(code: u32) -> i32 {
+    return match (code) {
+        C::NOT_FOUND => { 1 }
+        C::DENIED    => { 2 }
+        _            => { 0 }
+    };
+}
+
+function in_payload(code: Option<u32>) -> i32 {
+    return match (code) {
+        Option::Some(NOT_FOUND)  => { 1 }
+        Option::Some(LOCAL_BUSY) => { 3 }
+        Option::Some(_)          => { 9 }
+        Option::None             => { 0 }
+    };
+}
+
+function check(passed: mut &i32, total: mut &i32, got: i32, want: i32, what: string) -> void {
+    *total = *total + 1;
+    if (got == want) {
+        *passed = *passed + 1;
+    } else {
+        printf("FAIL %s: got %d, want %d\n", what, got, want);
+    }
+}
+
+function main() -> i32 {
+    mut passed: i32 = 0;
+    mut total: i32 = 0;
+    check(&passed, &total, imported(2), 1, "brace import matches its value");
+    check(&passed, &total, imported(5), 2, "brace import reaches the second arm");
+    check(&passed, &total, imported(7), 0, "brace import does not match another value");
+    check(&passed, &total, imported_statement(5), 2, "brace import in a match statement");
+    check(&passed, &total, imported_statement(7), 0, "brace import in a match statement, no match");
+    check(&passed, &total, local(170), 3, "module constant matches its value");
+    check(&passed, &total, local(7), 0, "module constant does not match another value");
+    check(&passed, &total, full_path(2), 1, "full module path");
+    check(&passed, &total, full_path(170), 3, "full module path, second arm");
+    check(&passed, &total, full_path(7), 0, "full module path, no match");
+    check(&passed, &total, last_segment(5), 2, "last-segment path");
+    check(&passed, &total, last_segment(7), 0, "last-segment path, no match");
+    check(&passed, &total, through_alias(2), 1, "import alias path");
+    check(&passed, &total, through_alias(7), 0, "import alias path, no match");
+    check(&passed, &total, in_payload(Option::Some(2)), 1, "imported constant in a payload");
+    check(&passed, &total, in_payload(Option::Some(170)), 3, "module constant in a payload");
+    check(&passed, &total, in_payload(Option::Some(7)), 9, "payload constants do not match another value");
+    check(&passed, &total, in_payload(Option::None), 0, "payload constants leave other variants alone");
+    printf("constant patterns compare: %d of %d checks passed\n", passed, total);
+    return if (passed == total) { 0 } else { 1 };
+}

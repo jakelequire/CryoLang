@@ -69,7 +69,7 @@ import compiler::ast::expression::{
 import compiler::ast::node::{ ProgramNode };
 import compiler::ast::node_locator::{ annotation_span };
 import compiler::ast::pattern::{
-    EnumPattern, MatchArmNode, Pattern, StaticMatchArmNode
+    EnumPattern, MatchArmNode, Pattern, PatternKind, StaticMatchArmNode
 };
 import compiler::ast::statement::{
     AsmBlockStmt, AsmOperand, BlockStmt, DeclStmt, DoWhileStmt, ExprStmt, ForStmt, IfStmt,
@@ -1138,6 +1138,7 @@ type struct SemaVisitor {
             const arm: MatchArmNode* = node.arms[i];
             if (arm == null) { continue; }
             const save: i64 = this.scopes.save_scope();
+            this.resolve_constant_paths_in_arm(arm);
             this.patterns.bind_arm_patterns(arm, subject_type, caller_backed);
             if (arm.guard != null) { this.resolve_condition(arm.guard); }
             if (arm.body != null) { this.dispatch_stmt(arm.body); }
@@ -3255,6 +3256,35 @@ type struct SemaVisitor {
         return this.branch_result_type(ternary.true_expr, true_type, false_type);
     }
 
+    /// Type the path each qualified constant pattern in `arm` was written as,
+    /// as the same path written as a value is typed: that is where a constant
+    /// the writer may not reach is refused.  A path the name layer already
+    /// refused is not typed again.
+    resolve_constant_paths_in_arm(mut &this, arm: MatchArmNode*) -> void {
+        for (mut i: i64 = 0; i < arm.patterns.length(); i++) {
+            this.resolve_constant_paths(arm.patterns[i]);
+        }
+    }
+
+    resolve_constant_paths(mut &this, pat: Pattern*) -> void {
+        if (pat == null) { return; }
+        match (pat.kind) {
+            PatternKind::Constant(c) => {
+                if (c.path == null) { return; }
+                match (c.res) {
+                    ResSlot::Answered(Res::Def(_)) => { this.resolve_expr(c.path); }
+                    _                              => { }
+                }
+            }
+            PatternKind::Enum(e) => {
+                for (mut i: i64 = 0; i < e.elements.length(); i++) {
+                    this.resolve_constant_paths(e.sub_at(i));
+                }
+            }
+            _ => { }
+        }
+    }
+
     resolve_match_expr(mut &this, e: ExpressionNode*, match_expr: MatchExpr*) -> TypeRef {
         const subject_type: TypeRef = this.resolve_expr(match_expr.subject);
         const caller_backed: boolean = this.subject_is_caller_backed(match_expr.subject);
@@ -3266,6 +3296,7 @@ type struct SemaVisitor {
             const arm: MatchArmNode* = match_expr.arms[i];
             if (arm == null || arm.body == null) { continue; }
             const save: i64 = this.scopes.save_scope();
+            this.resolve_constant_paths_in_arm(arm);
             this.patterns.bind_arm_patterns(arm, subject_type, caller_backed);
             if (arm.guard != null) { this.resolve_condition(arm.guard); }
             match (arm.body.kind) {

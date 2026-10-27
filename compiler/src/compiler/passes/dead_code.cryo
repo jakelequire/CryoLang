@@ -15,6 +15,10 @@
 ///!     literal divergence is considered (no `panic`/`noreturn` reasoning),
 ///!     which keeps the false-positive rate at essentially zero.
 ///!
+///!   * W0009 (unreachable match arm) - an arm written after an unguarded
+///!     arm whose pattern matches every value (`_` or a binding name).
+///!     Reported once per match, at the first such arm.
+///!
 ///!   * W0001 (unused variable) - a local `let`/`const`/`mut` binding that is
 ///!     never referenced.  A leading-underscore name (`_scratch`) opts out,
 ///!     as a deliberate mark of an unused name.  Destructuring bindings
@@ -65,13 +69,13 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     CallExpr,
-    ExprKind, ExpressionNode, LambdaExpr,
+    ExprKind, ExpressionNode, LambdaExpr, MatchExpr,
     MemberAccessExpr
 };
 import compiler::ast::walk::{ Walk };
 import compiler::ast::node::{ ProgramNode };
-import compiler::ast::pattern::{ MatchArmNode, StaticMatchArmNode };
-import compiler::ast::statement::{ BlockStmt, DeclStmt, Stmt, StmtKind };
+import compiler::ast::pattern::{ MatchArmNode, Pattern, StaticMatchArmNode };
+import compiler::ast::statement::{ BlockStmt, DeclStmt, MatchStmt, Stmt, StmtKind };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::resolution_map::{ ResolutionMap };
@@ -94,6 +98,56 @@ implement trait Walk for struct NonCapturingLambdaBodies {
     walk_lambda(mut &this, e: ExpressionNode*, n: LambdaExpr*) -> void {
         if (n.captured_names.length() > 0) { return; }
         if (n.body != null) { this.bodies.push(n.body); }
+        LambdaExpr::walk_children(n, this);
+    }
+}
+
+
+/// Every `match` in a body, statement or expression, at any depth: an arm
+/// written after an unguarded arm that matches every value can never be
+/// chosen (W0009).  Reported once per match, at the first such arm.  A
+/// capturing lambda's body is left to its closure's `__call__`, which is
+/// checked as a method.
+type struct UnreachableArms {
+    ctx: CompilationContext*;
+
+    check_arms(mut &this, arms: &[MatchArmNode*]) -> void {
+        mut catch_all: MatchArmNode* = null;
+        for (mut i: i64 = 0; i < arms.length(); i++) {
+            const arm: MatchArmNode* = arms[i];
+            if (arm == null || arm.generated) { continue; }
+            if (catch_all != null) {
+                if (!arm.span.has_location()) { return; }
+                mut diag: Diagnostic = Diagnostic::warning(
+                    ErrorCode::W0009_DEAD_CODE,
+                    "unreachable match arm: an earlier arm matches every value, so this arm can never be chosen");
+                diag = diag.at(arm.span);
+                diag = diag.also_at(catch_all.span, "this arm matches every value");
+                this.ctx.emit_diagnostic(diag);
+                return;
+            }
+            if (arm.guard != null) { continue; }
+            for (mut j: i64 = 0; j < arm.patterns.length(); j++) {
+                const pat: Pattern* = arm.patterns[j];
+                if (pat != null && pat.is_irrefutable()) { catch_all = arm; }
+            }
+        }
+    }
+}
+
+implement trait Walk for struct UnreachableArms {
+    walk_match_expr(mut &this, e: ExpressionNode*, n: MatchExpr*) -> void {
+        this.check_arms(&n.arms);
+        MatchExpr::walk_children(n, this);
+    }
+
+    walk_match_stmt(mut &this, s: Stmt*, n: MatchStmt*) -> void {
+        this.check_arms(&n.arms);
+        MatchStmt::walk_children(n, this);
+    }
+
+    walk_lambda(mut &this, e: ExpressionNode*, n: LambdaExpr*) -> void {
+        if (n.captured_names.length() > 0) { return; }
         LambdaExpr::walk_children(n, this);
     }
 }
@@ -219,6 +273,8 @@ type struct DeadCodeChecker {
         for (mut i: i64 = 0; i < lambdas.bodies.length(); i++) {
             this.check_stmt(lambdas.bodies[i]);
         }
+        mut arms: UnreachableArms = UnreachableArms { ctx: this.ctx };
+        arms.walk_stmt(func.body);
         this.body_resolved = true;
     }
 

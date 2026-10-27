@@ -712,13 +712,28 @@ type struct PatternEmitter {
                     this.cg.builder.build_cond_br(c, success_bb, miss_bb);
                 }
                 PatternElement::Sub(ps) => {
+                    const constant: ConstantPattern* = if (ps.pattern != null) {
+                        match (ps.pattern.kind) {
+                            PatternKind::Constant(k) => { k }
+                            _                        => { null }
+                        }
+                    } else { null };
                     const sub: EnumPattern* = if (ps.pattern != null) {
                         ps.pattern.enum_payload()
                     } else { null };
                     const nested_ty: EnumType* = if (sub != null) {
                         this.payload_enum_type(field_ref)
                     } else { null };
-                    if (nested_ty != null) {
+                    if (constant != null) {
+                        // The payload is compared against the constant as a
+                        // whole subject of the payload's type would be.
+                        const lv: LValue = this.cg.builder.build_load(field_llvm, field_ptr, "pat.fld");
+                        const cv: LValue = this.codegen_constant_value(constant, field_ref);
+                        if (!cv.is_valid()) { this.cg.builder.build_br(miss_bb); return; }
+                        const coerced: LValue = this.cg.expr_ops.coerce_icmp_operands(lv, cv, field_ref);
+                        const c: LValue = this.cg.builder.build_icmp(LIntPredicate::EQ, lv, coerced, "pat.eq");
+                        this.cg.builder.build_cond_br(c, success_bb, miss_bb);
+                    } else if (nested_ty != null) {
                         this.emit_enum_pattern_test(sub,
                             nested_ty, field_llvm, field_ptr, success_bb, miss_bb,
                             current_fn, name_prefix_text);

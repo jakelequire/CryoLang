@@ -359,6 +359,25 @@ yet is recorded with the change that builds it, not here.
      `is_infinite`, `is_finite` and `classify`; `rotate_right` and moving
      `is_normal` and `is_sign_negative` delegated)
 
+614. **A name in a pattern that names a constant compares against it.**
+     A bare name in a pattern, at the top or in a payload position, is
+     asked in the value namespace where the pattern is written - the
+     question an identifier in an expression asks - and when it names a
+     constant, wherever that constant is declared (this module, or another
+     brought in by an import), the pattern compares the subject against the
+     constant; anything else, a local of the same name included, makes the
+     name a fresh binding.  A payload-less path pattern whose leading
+     segments name a module or nothing (`codes::NOT_FOUND`, an import
+     alias's `C::NOT_FOUND`) is a value path, answered as the same path
+     written as a value is and typed as one, so an unreachable constant is
+     E0353 and an unknown leaf E0201; one naming a function or a `mut`
+     global is E0113.  Leading segments that name a type keep the path an
+     enum variant, so a type's own constant (`u32::MAX`) is not a pattern
+     yet.  An arm written after an unguarded arm that matches every value
+     (`_` or a binding) is W0009, once per `match`.  (Jake for the rule and
+     the warning; the variant-first reading of a type-led path, E0113 and
+     reusing W0009 delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

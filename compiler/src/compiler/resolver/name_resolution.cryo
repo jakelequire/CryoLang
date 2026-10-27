@@ -19,7 +19,8 @@ import compiler::diag::{ ErrorCode, snapshot, source_span, edit_distance };
 import compiler::diag::edit_distance::{ find_best_candidate };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::ast::{
-    GenericAnnotation, ImportStyle, NamedAnnotation, ObjectAnnotation, PatternBinding, ProjectionAnnotation,
+    GenericAnnotation, ImportStyle, NamedAnnotation, ObjectAnnotation, PatternBinding, PatternElement,
+    PatternSub, ProjectionAnnotation,
     TraitBound, TraitRef, TypeAnnotation, Visibility, declaration, expression, node,
     pattern, statement
 };
@@ -2581,6 +2582,98 @@ type struct NameResolver {
         }
     }
 
+    /// What a bare name written in a pattern compares against, or `Pending`
+    /// when it is a fresh binding.  The name is asked in the value namespace
+    /// where the pattern is written - the question an identifier in an
+    /// expression asks - and when the binding found names a constant,
+    /// declared in this module or brought in by an import, the pattern
+    /// compares the subject against that constant.  Asked any narrower, an
+    /// imported constant would bind the subject: its arm would match every
+    /// value and every arm after it would be dead.  A local of the same name
+    /// is found first and shadows the constant, so the pattern binds.
+    pattern_constant(mut &this, name: SymbolStr, span: SourceSpan) -> ResSlot {
+        const bound: SymbolID = this.resolver.lookup_value(name, this.resolver.current_scope);
+        if (!bound.is_valid()) { return ResSlot::Pending; }
+        const target: SymbolID = this.resolver.value_target(bound);
+        if (this.resolver.get_symbol(target).kind != SymbolKind::Constant) { return ResSlot::Pending; }
+        this.resolver.record_resolution(span, bound);
+        if (this.refuse_ambiguous_import(bound, name, span)) { return ResSlot::Answered(Res::Err); }
+        return this.bare_name_res(target);
+    }
+
+    /// Refuse a value name two imports from different modules bind, and say
+    /// so.  The scope keeps the first so a lookup lands somewhere, and the
+    /// record of the second is what says the first was never the answer.
+    /// Refused where the name is used, because an import brings a name into
+    /// scope and it is naming the item that needs it to name one.  A
+    /// declaration of the leaf in this module shadows every import of it and
+    /// clears the record, so this answers only the import-vs-import tie.
+    refuse_ambiguous_import(mut &this, bound: SymbolID, name: SymbolStr, span: SourceSpan) -> boolean {
+        if (this.resolver.get_symbol(bound).kind != SymbolKind::Import
+                || !this.resolver.is_ambiguous(name, Namespace::Value)) {
+            return false;
+        }
+        const mods: [ModulePath] = this.resolver.get_ambiguous_modules(name, Namespace::Value);
+        const leaf: string = this.resolver.intern_table.resolve(name);
+        const a: string = if (mods.length() > 0) { this.resolver.intern_table.shown(mods[0].decl_name()) } else { "" };
+        const b: string = if (mods.length() > 1) { this.resolver.intern_table.shown(mods[1].decl_name()) } else { "" };
+        mut d: Diagnostic = Diagnostic::error(
+            ErrorCode::E0154_AMBIGUOUS_CALL,
+            fmt::format("`%s` is ambiguous: it is imported from both `%s` and `%s`",
+                leaf, a, b));
+        d = d.at_with_label(span, "ambiguous name");
+        d = d.with_note(fmt::format(
+            "write the path out to say which one is meant, `%s::%s` or `%s::%s`",
+            a, leaf, b, leaf));
+        this.ctx.emit_diagnostic(d);
+        return true;
+    }
+
+    /// A payload-less path pattern whose leading segments name no type
+    /// (`codes::NOT_FOUND`) is a value path, and the value it names must be
+    /// a constant.  The path is answered exactly as the same path written in
+    /// an expression is - through a module, a module's last segment or an
+    /// import alias, with that lane's refusals - and is kept on the pattern
+    /// for sema to type as one.
+    resolve_constant_path_pattern(mut &this, p: Pattern*, node: EnumPattern*) -> void {
+        const path: ExpressionNode* = ExpressionNode::scope_resolution_expr(
+            node.enum_name, node.variant_name, p.span);
+        mut scope: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(path);
+        scope.scope_span = node.enum_span;
+        scope.member_span = node.variant_span;
+        this.walk_expr(path);
+        mut c: ConstantPattern* = ConstantPattern::new(node.variant_name);
+        c.path = path;
+        p.kind = PatternKind::Constant(c);
+        match (scope.scope_res) {
+            ResSlot::Answered(Res::Err) => { c.res.answer(Res::Err); return; }
+            _ => { }
+        }
+        const written: string = fmt::format("%s::%s",
+            this.resolver.intern_table.resolve(node.enum_name),
+            this.resolver.intern_table.resolve(node.variant_name));
+        if (!scope.member_def.is_valid()) {
+            mut miss: Diagnostic = Diagnostic::error(ErrorCode::E0201_UNDEFINED_VARIABLE,
+                fmt::format("cannot find value `%s` in this scope", written));
+            miss = miss.at_with_label(p.span, "not found in this scope");
+            this.ctx.emit_diagnostic(miss);
+            c.res.answer(Res::Err);
+            return;
+        }
+        const declared: DeclarationNode* = this.ctx.decl_index.declaration_of(scope.member_def);
+        const variable: VarDecl* = if (declared != null) { DeclarationNode::var_of(declared) } else { null };
+        if (variable == null || variable.is_mutable) {
+            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0113_INVALID_PATTERN,
+                fmt::format("`%s` is not a constant, so it cannot be matched against", written));
+            d = d.at_with_label(p.span, "not a constant");
+            d = d.with_note("a path in a pattern names an enum variant or a constant");
+            this.ctx.emit_diagnostic(d);
+            c.res.answer(Res::Err);
+            return;
+        }
+        c.res.answer(Res::Def(scope.member_def));
+    }
+
     /// Record a module-level `const NAME = expr;` so its value can be folded.
     ///
     /// Fixed array sizes (`[u8; NAME]`) are resolved long before codegen turns a
@@ -3680,36 +3773,11 @@ implement trait Walk for struct NameResolver {
             this.stamp_annotation_list(&node.generic_args);
             return;
         }
-        if (sym_id.is_valid()) {
-            this.resolver.record_resolution(e.span, sym_id);
-            // Two imports of one leaf from different modules bind the name to
-            // neither: the scope keeps the first so a lookup lands somewhere,
-            // and the record of the second is what says the first was never
-            // the answer.  Refused here, where the name is used, because an
-            // import brings a name into scope and it is naming the item that
-            // needs it to name one.  A declaration of the leaf in this module
-            // shadows every import of it and clears the record, so this is
-            // reached only for the import-vs-import tie.
-            const bound: Symbol = this.resolver.get_symbol(sym_id);
-            if (bound.kind == SymbolKind::Import
-                    && this.resolver.is_ambiguous(node.name, Namespace::Value)) {
-                const mods: [ModulePath] = this.resolver.get_ambiguous_modules(node.name, Namespace::Value);
-                const leaf: string = this.resolver.intern_table.resolve(node.name);
-                const a: string = if (mods.length() > 0) { this.resolver.intern_table.shown(mods[0].decl_name()) } else { "" };
-                const b: string = if (mods.length() > 1) { this.resolver.intern_table.shown(mods[1].decl_name()) } else { "" };
-                mut d: Diagnostic = Diagnostic::error(
-                    ErrorCode::E0154_AMBIGUOUS_CALL,
-                    fmt::format("`%s` is ambiguous: it is imported from both `%s` and `%s`",
-                        leaf, a, b));
-                d = d.at_with_label(e.span, "ambiguous name");
-                d = d.with_note(fmt::format(
-                    "write the path out to say which one is meant, `%s::%s` or `%s::%s`",
-                    a, leaf, b, leaf));
-                this.ctx.emit_diagnostic(d);
-                node.set_res(Res::Err);
-                this.stamp_annotation_list(&node.generic_args);
-                return;
-            }
+        this.resolver.record_resolution(e.span, sym_id);
+        if (this.refuse_ambiguous_import(sym_id, node.name, e.span)) {
+            node.set_res(Res::Err);
+            this.stamp_annotation_list(&node.generic_args);
+            return;
         }
         // Stamped from the lookup already performed, never a second one: the
         // scope this walk stands in is the scope the name was written in, and
@@ -4031,27 +4099,13 @@ implement trait Walk for struct NameResolver {
     }
 
     walk_binding_pattern(mut &this, p: Pattern*, node: BindingPattern*) -> void {
-        // A bare identifier pattern is normally a fresh binding. But if the
-        // name resolves to an existing `const`, it is a *value* pattern -
-        // compare the subject against the constant - not a binding: a named
-        // constant in a pattern is a value. Without this, a match
-        // like `match (code) { ENOENT => ...; EAGAIN => ... }` silently treats
-        // every const arm as a catch-all binding, so only the first arm ever
-        // runs.  The pattern becomes a `Constant` over the same name.
-        const sym: SymbolID = this.resolver.lookup(node.name, this.resolver.current_scope);
-        if (sym.is_valid()
-                && this.resolver.get_symbol(sym).kind == SymbolKind::Constant) {
-            this.resolver.record_resolution(p.span, sym);
-            mut c: ConstantPattern* = ConstantPattern::new(node.name);
-            // The same answer an identifier naming this constant gets,
-            // recorded on the node for the stage that compares against it.
-            match (this.bare_name_res(sym)) {
-                ResSlot::Answered(r) => { c.res.answer(r); }
-                _                    => { }
+        match (this.pattern_constant(node.name, p.span)) {
+            ResSlot::Answered(r) => {
+                mut c: ConstantPattern* = ConstantPattern::new(node.name);
+                c.res.answer(r);
+                p.kind = PatternKind::Constant(c);
             }
-            p.kind = PatternKind::Constant(c);
-        } else {
-            node.binding_sym = this.declare_pattern_binding(node.name, p.span);
+            _ => { node.binding_sym = this.declare_pattern_binding(node.name, p.span); }
         }
     }
 
@@ -4068,21 +4122,47 @@ implement trait Walk for struct NameResolver {
             // it is the annotation's question rather than the single-segment
             // scope lookup a bare value name gets.  `enum_span` is the
             // enum-path side of the pattern, which is what this stamp is
-            // about.
-            match (this.type_spelling_res(node.enum_name, node.enum_span)) {
+            // about.  Leading segments that name a module, or nothing, make a
+            // payload-less path a value path: the answer itself is the
+            // classification.
+            const prefix: ResSlot = this.type_spelling_res(node.enum_name, node.enum_span);
+            mut names_type: boolean = false;
+            match (prefix) {
+                ResSlot::Answered(Res::Def(d)) => {
+                    names_type = this.resolver.defs.kind_of(d) != DefKind::Module;
+                }
+                ResSlot::Answered(_) => { names_type = true; }
+                _                    => { }
+            }
+            if (!names_type && node.elements.length() == 0) {
+                this.resolve_constant_path_pattern(p, node);
+                return;
+            }
+            match (prefix) {
                 ResSlot::Answered(r) => { node.set_res(r); }
                 _                    => { }
             }
         }
 
-        // Declare each binding variable.  A nested pattern (`Some(Some(n))`)
-        // binds in the same arm scope and is walked as a pattern of its own,
-        // so its identifier is declared - or reclassified as a constant - by
-        // the one rule above.
+        // Each payload name is a binding or a constant by the rule a bare
+        // pattern name follows (`pattern_constant`); a constant is kept as a
+        // nested pattern comparing that payload against it.  A nested
+        // pattern (`Some(Some(n))`) binds in the same arm scope and is
+        // walked as a pattern of its own.
         for (mut i: i64 = 0; i < node.elements.length(); i++) {
             mut pb: PatternBinding* = node.binding_at(i);
             if (pb != null) {
-                pb.sym_id = this.declare_pattern_binding(pb.name, pb.span);
+                match (this.pattern_constant(pb.name, pb.span)) {
+                    ResSlot::Answered(r) => {
+                        mut c: ConstantPattern* = ConstantPattern::new(pb.name);
+                        c.res.answer(r);
+                        node.elements[i] = PatternElement::Sub(new PatternSub {
+                            pattern: Pattern::of(PatternKind::Constant(c), pb.span),
+                            span:    pb.span,
+                        });
+                    }
+                    _ => { pb.sym_id = this.declare_pattern_binding(pb.name, pb.span); }
+                }
                 continue;
             }
             const sub: Pattern* = node.sub_at(i);
