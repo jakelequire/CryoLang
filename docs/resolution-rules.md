@@ -348,6 +348,17 @@ yet is recorded with the change that builds it, not here.
      `IoError`'s fields and methods public, its errno table private.
      (Jake for the two names; the mapped codes and the marking delegated)
 
+613. **A float classifies itself and an integer rotates itself.**  `f64`
+     has `is_infinite`, `is_finite`, `is_normal`, `is_sign_negative` and
+     `classify` (answering `math::FpCategory`) beside `is_nan`, and the
+     free `math::is_nan`, `is_infinite`, `is_finite`, `is_normal`,
+     `is_sign_negative` and `classify` are deleted.  `u32` and `u64` have
+     `rotate_left` and `rotate_right` by a count taken modulo the width,
+     and SHA-1's and the generator's own rotate helpers and the float
+     formatter's class tests are deleted.  (Jake for `rotate_left`,
+     `is_infinite`, `is_finite` and `classify`; `rotate_right` and moving
+     `is_normal` and `is_sign_negative` delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

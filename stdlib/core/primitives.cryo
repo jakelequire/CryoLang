@@ -38,8 +38,10 @@ namespace std::core::primitives;
 
 import std::core::intrinsics;
 import std::core::option::{ Option };
+import std::core::mem;
 import std::alloc::allocator;
 import std::ffi::libc;
+import std::math::{ FpCategory };
 
 // Each integer type's `MAX_*_DIGITS` constants bound the digits its buffer
 // writers produce, so a caller sizes a buffer by them: a signed type's
@@ -413,6 +415,18 @@ implement u32 {
         return this;
     }
 
+    /// The bits shifted left by `n` (modulo 32), those leaving the top
+    /// re-entering at the bottom.
+    rotate_left(&this, n: u32) -> u32 {
+        return intrinsics::rotl32(this, n);
+    }
+
+    /// The bits shifted right by `n` (modulo 32), those leaving the bottom
+    /// re-entering at the top.
+    rotate_right(&this, n: u32) -> u32 {
+        return intrinsics::rotr32(this, n);
+    }
+
     to_decimal_buf(&this, buffer: u8*) -> i64 {
         const v: u64 = this as u64;
         return v.to_decimal_buf(buffer);
@@ -453,6 +467,18 @@ implement u64 {
         if (this < lo) { return lo; }
         if (this > hi) { return hi; }
         return this;
+    }
+
+    /// The bits shifted left by `n` (modulo 64), those leaving the top
+    /// re-entering at the bottom.
+    rotate_left(&this, n: u32) -> u64 {
+        return intrinsics::rotl64(this, n);
+    }
+
+    /// The bits shifted right by `n` (modulo 64), those leaving the bottom
+    /// re-entering at the top.
+    rotate_right(&this, n: u32) -> u64 {
+        return intrinsics::rotr64(this, n);
     }
 
     // Buffer-write formatting. Each writes into a caller-owned `u8*` and
@@ -1001,6 +1027,40 @@ implement f64 {
     /// `NaN != NaN`, so the cheapest portable check is self-comparison.
     is_nan(&this) -> boolean {
         return this != this;
+    }
+
+    // The class tests below read IEEE-754 bit classes through the `fpclass`
+    // intrinsic: no libm, no floating-point exceptions. Each test literal
+    // selects the classes that answer true, as documented on
+    // `intrinsics::fpclass`.
+
+    /// Positive or negative infinity.
+    is_infinite(&this) -> boolean {
+        return intrinsics::fpclass(this, 0x204);
+    }
+
+    /// Neither NaN nor infinite; zeros and subnormals included.
+    is_finite(&this) -> boolean {
+        return intrinsics::fpclass(this, 0x1F8);
+    }
+
+    /// Finite, nonzero and not subnormal.
+    is_normal(&this) -> boolean {
+        return intrinsics::fpclass(this, 0x108);
+    }
+
+    /// The raw IEEE-754 sign bit, so true for `-0.0` and a negative NaN too.
+    is_sign_negative(&this) -> boolean {
+        return (mem::transmute::<f64, u64>(this) >> 63) != 0;
+    }
+
+    /// The IEEE-754 category `this` falls in.
+    classify(&this) -> FpCategory {
+        if (intrinsics::fpclass(this, 0x003)) { return FpCategory::Nan; }
+        if (intrinsics::fpclass(this, 0x204)) { return FpCategory::Infinite; }
+        if (intrinsics::fpclass(this, 0x060)) { return FpCategory::Zero; }
+        if (intrinsics::fpclass(this, 0x090)) { return FpCategory::Subnormal; }
+        return FpCategory::Normal;
     }
 
     /// Square root: NaN for a negative `this`.
