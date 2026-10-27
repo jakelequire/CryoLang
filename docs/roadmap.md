@@ -456,7 +456,10 @@ Left over from that: the async entry point calls `Executor::new` and
    allocator of an array, a hash map and a string without it.  An `internal module` line now hides its
    module from other packages whichever files a build loads, so the
    standard library's internal modules are refused at the import as a
-   dependency's are.
+   dependency's are.  The library's one-off helpers give way to general
+   APIs its callers use directly (602): a byte classifies itself (608).
+   Open: `u8.to_ascii_uppercase`, which `Str.to_ascii_uppercase` still
+   folds by hand for want of.
 
 ## A generic type's methods emitted only when called
 

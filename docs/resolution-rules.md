@@ -276,6 +276,17 @@ yet is recorded with the change that builds it, not here.
      `fmt::Arguments` and the argument position; dropping `FmtWrite`
      from `Stdout`/`Stderr` and `Formatter.write` delegated)
 
+608. **A byte classifies itself, by `char`'s rules.**  `u8` has
+     `is_digit`, `is_alpha`, `is_hex_digit`, `is_whitespace` and
+     `to_ascii_lowercase`, each meaning what `char`'s method of that name
+     means, so a byte of a multi-byte UTF-8 sequence answers false and
+     folds to itself.  ASCII whitespace is one set everywhere: space,
+     tab, LF, VT, FF and CR, so `string.trim` now strips VT and FF as
+     `Str.trim` and `char.is_whitespace` already did.  The library's own
+     whitespace tests (`str::is_ascii_ws`, the `string` trim's), its
+     drive-letter test and its byte case folds and digit range checks use
+     these.  (Jake for the names and the whitespace set)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that
