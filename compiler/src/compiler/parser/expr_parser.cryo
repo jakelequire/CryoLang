@@ -819,27 +819,7 @@ implement struct Parser {
     /// Parse a numeric literal.
     parse_number_literal() -> ExpressionNode* {
         const tok: Token = this.advance();
-        // Determine if float or integer by checking for '.' or 'e'/'E'
-        // Special base literals (0x, 0b, 0o) are always integers.
-        mut kind: LiteralKind = LiteralKind::Integer;
-        mut is_special_base: boolean = false;
-        if (tok.lexeme.length() >= 2) {
-            if (tok.lexeme[0] == '0') {
-                const p: char = tok.lexeme[1];
-                if (p == 'x' || p == 'X' || p == 'b' || p == 'B' || p == 'o' || p == 'O') {
-                    is_special_base = true;
-                }
-            }
-        }
-        if (!is_special_base) {
-            for (mut i: i64 = 0; i < tok.lexeme.length(); i++) {
-                const c: char = tok.lexeme[i];
-                if (c == '.' || c == 'e' || c == 'E') {
-                    kind = LiteralKind::Float;
-                    break;
-                }
-            }
-        }
+        const kind: LiteralKind = if (tok.is_float) { LiteralKind::Float } else { LiteralKind::Integer };
         const lit: ExpressionNode* = ExpressionNode::literal(tok.lexeme, kind, this.span_from_token(tok));
         ExpressionNode::literal_of(lit).suffix = tok.numeric_suffix;
         return lit;
@@ -2401,7 +2381,7 @@ implement struct Parser {
                     if (this.match_tok(TokenType::Minus)) { sign = -1; }
                     const num_tok: Token = this.advance();
                     const ns: SourceSpan = this.span_from_token(num_tok);
-                    if (Parser::is_float_lexeme(num_tok.lexeme)) {
+                    if (num_tok.is_float) {
                         const fv: f64 = Lexer::float_literal_value(num_tok.lexeme).unwrap_or(0.0);
                         const signed_fv: f64 = if (sign < 0) { 0.0 - fv } else { fv };
                         const pf: PatternLiteralFloat* = new PatternLiteralFloat {
@@ -2409,8 +2389,7 @@ implement struct Parser {
                         };
                         pat.add_element(PatternElement::LiteralFloat(pf));
                     } else {
-                        const iv: i64 = Parser::parse_numeric_lexeme_i64(
-                            num_tok.lexeme);
+                        const iv: i64 = Parser::integer_token_value(num_tok);
                         const pi: PatternLiteralInt* = new PatternLiteralInt {
                             value: sign * iv, span: ns,
                         };
@@ -3238,24 +3217,23 @@ implement struct Parser {
         const size_tok: Token = this.current();
         mut size: i64 = 0;
         mut size_expr: ExpressionNode* = null;
-        if (size_tok.kind == TokenType::NumericConstant) {
-            // Decode the full numeric lexeme: this honours the `0x`/`0o`/`0b`
-            // base prefixes and `_` separators that a hand-rolled decimal
-            // scan would silently drop (`0xFF` must be 255, not 0).  A size
-            // that needs more than 64 bits would saturate to a meaningless
-            // value; reject it up front rather than build a garbage array
-            // type.
-            if (Parser::numeric_lexeme_overflows_u64(size_tok.lexeme)) {
+        if (size_tok.kind == TokenType::NumericConstant && !size_tok.is_float) {
+            // A size that needs more than 64 bits would saturate to a
+            // meaningless value; reject it up front rather than build a
+            // garbage array type.
+            const value: u128 = Lexer::integer_literal_value(size_tok.lexeme, size_tok.numeric_suffix)
+                .unwrap_or(u128::MAX);
+            if (value > u64::MAX as u128) {
                 this.report_error(ErrorCode::E0010_NUMBER_TOO_LARGE,
                     fmt::format("array size `%s` does not fit in 64 bits",
                         size_tok.lexeme));
             }
-            size = Parser::parse_numeric_lexeme_i64(size_tok.lexeme);
+            size = Parser::integer_token_value(size_tok);
             this.advance();
         } else {
-            // A named constant or computed size is fixed-pending until the
-            // type resolver folds `size_expr` - distinct from the dynamic
-            // array `[T]`.
+            // A named constant, a computed size or a float literal is
+            // fixed-pending until the type resolver folds `size_expr` -
+            // distinct from the dynamic array `[T]`.
             size      = ArrayAnnotation::fixed_pending_size();
             size_expr = this.parse_expression();
         }

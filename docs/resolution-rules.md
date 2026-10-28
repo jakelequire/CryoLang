@@ -825,6 +825,30 @@ yet is recorded with the change that builds it, not here.
      module hidden from the editor hides every path through it.  The
      extended hover still lists every member of a type.  (Jake)
 
+647. **An integer literal is read in one place, through
+     `u128::parse_literal`.**  `u128::parse_literal(text, radix)` reads an
+     integer literal's digits - digits of `radix`, with a `_` separator
+     allowed anywhere among them - and is `None` for no digit, a byte that
+     is neither, a value past `u128::MAX`, or a radix outside 2 to 36;
+     `u64::parse_literal` is the same and `None` past `u64::MAX` too.
+     Neither reads a sign, radix prefix or type suffix.  In the compiler,
+     `Lexer::integer_literal_value` reads a literal from its lexeme and the
+     suffix the lexer found, its prefix picking the radix; the parser's
+     array sizes, enum discriminants, payload patterns and directive
+     arguments, sema's width checks, the constant folder, drop insertion's
+     indices and codegen's 128-bit constants all ask it, and the readers
+     that 644 left on their own accumulation are gone.  The lexer records
+     whether a number is a float (it read a fraction or an exponent), so
+     `0xE` and `5usize` are integers.  A float literal where only an
+     integer stands - an enum discriminant, a directive argument or
+     `key = value` value (E0102), a fixed array's size (E0239) - is
+     refused; it used to be read as its integer part.  An integer literal
+     past `u128::MAX` is E0010 wherever it stands; it used to wrap.  `u8`
+     and `char` have `is_uppercase` and `is_lowercase`, for the ASCII
+     letters only, which the module loader's snake-case conversion and the
+     highlighter use.  (Jake; the name and shape, and the refusals,
+     delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

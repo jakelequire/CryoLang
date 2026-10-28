@@ -11,11 +11,9 @@ import compiler::ast::{ MemberPin, node, declaration };
 import compiler::types::user_defined::{ EnumType, EnumVariantInfo };
 import compiler::types::{ type_ref, type_base };
 import compiler::resolver::{ symbol_str };
-import std::ffi::libc;
 import compiler::ast::declaration::{ FunctionDecl, DeclarationNode, VarDecl };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::type_ref::{ TypeRef };
-import compiler::lex::lexer::{ Lexer };
 
 
 type struct CodegenUtil {
@@ -31,53 +29,6 @@ type struct CodegenUtil {
             }
             _ => { return null; }
         }
-    }
-
-    // Literal lexeme parsing
-    //
-    // Integer-literal parsing (hex/oct/bin/dec prefixes, sign, `_` separators)
-    // lives in the stdlib as the generic `string::parse_int<T>`; codegen calls
-    // `lexeme.parse_int<u64>()` directly.
-
-    /// Strip the sign, base prefix (`0x`/`0b`/`0o`), `_` separators, and any type
-    /// suffix from an integer-literal lexeme, returning the bare digit string and
-    /// writing the detected radix to `*out_radix`. Used to build i128/u128
-    /// constants via `LLVMConstIntOfString`, which takes digits + radix rather
-    /// than a 64-bit value (so it doesn't truncate literals above `u64::MAX`).
-    static int_literal_clean(s_text: string, out_radix: u8*) -> string {
-        const s: string = s_text;
-        *out_radix = 10;
-        if (s == null) { return "0"; }
-        const len: i64 = s.length() as i64;
-        mut i: i64 = 0;
-        // A leading sign belongs to the unary operator, not the literal, but
-        // tolerate it defensively.
-        if (len > 0 && (*(s + 0) as char == '-' || *(s + 0) as char == '+')) { i = 1; }
-
-        mut base: u8 = 10;
-        if (i + 1 < len && (*(s + i) as char) == '0') {
-            const p: char = *(s + i + 1) as char;
-            if (p == 'x' || p == 'X')      { base = 16; i += 2; }
-            else if (p == 'b' || p == 'B') { base = 2;  i += 2; }
-            else if (p == 'o' || p == 'O') { base = 8;  i += 2; }
-        }
-
-        mut buf: string = libc::malloc(len + 1) as string;
-        mut w: i64 = 0;
-        while (i < len) {
-            const c: char = *(s + i) as char;
-            if (c == '_') { i += 1; continue; }
-            // The start of the type suffix (i128/u128), or junk, is no hex digit.
-            const digit: i64 = c.hex_value() as i64;
-            if (digit < 0 || digit >= base as i64) { break; }
-            *(buf + w) = c;
-            w += 1;
-            i += 1;
-        }
-        *(buf + w) = '\0';
-        *out_radix = base;
-        if (w == 0) { return "0"; }
-        return buf;
     }
 
     // Function/method parameter shape

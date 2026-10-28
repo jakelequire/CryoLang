@@ -1639,14 +1639,17 @@ implement struct Parser {
             if (this.match_tok(TokenType::Minus)) { sign = -1; }
             else if (this.match_tok(TokenType::Plus)) { sign = 1; }
             const val_tok: Token = this.current();
-            if (val_tok.kind == TokenType::NumericConstant) {
+            if (val_tok.kind == TokenType::NumericConstant && !val_tok.is_float) {
                 this.advance();
-                const v: i64 = Parser::parse_numeric_lexeme_i64(val_tok.lexeme);
+                const v: i64 = Parser::integer_token_value(val_tok);
                 variant.set_explicit_value(sign * v);
             } else {
                 this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
                     fmt::format("expected integer literal after '=', found '%s'",
                         val_tok.lexeme));
+                // A float literal is a whole value in the integer's place;
+                // stepping over it keeps the variant list in step.
+                if (val_tok.kind == TokenType::NumericConstant) { this.advance(); }
             }
         }
 
@@ -2991,9 +2994,9 @@ implement struct Parser {
         }
 
         // Integer literal: 16, 0xFF, 0b101, ...
-        if (start.kind == TokenType::NumericConstant) {
+        if (start.kind == TokenType::NumericConstant && !start.is_float) {
             const tok: Token = this.advance();
-            const v: i64 = Parser::parse_numeric_lexeme_i64(tok.lexeme);
+            const v: i64 = Parser::integer_token_value(tok);
             return DirectiveArg::int_lit(v, tok.lexeme, this.span_from_token(tok));
         }
 
@@ -3033,7 +3036,7 @@ implement struct Parser {
 
         // Anything else is a syntax error inside a directive arg list.
         this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
-            fmt::format("expected directive argument (identifier, literal, or nested call), got '%s'",
+            fmt::format("expected directive argument (identifier, integer or string literal, or nested call), got '%s'",
                 start.lexeme));
         this.advance(); // skip the bad token to make progress
         return DirectiveArg::ident(start.lexeme, this.span_from_token(start));
@@ -3072,24 +3075,33 @@ implement struct Parser {
             }
             TokenType::NumericConstant => {
                 this.advance();
-                kv.value_kind = DirectiveArgKind::IntLit;
-                kv.int_value  = Parser::parse_numeric_lexeme_i64(v_tok.lexeme);
-                kv.str_value  = v_tok.lexeme;
+                if (v_tok.is_float) {
+                    this.report_directive_value_error(v_tok);
+                } else {
+                    kv.value_kind = DirectiveArgKind::IntLit;
+                    kv.int_value  = Parser::integer_token_value(v_tok);
+                    kv.str_value  = v_tok.lexeme;
+                }
             }
             TokenType::Identifier => {
                 this.advance();
                 kv.value_kind = DirectiveArgKind::Ident;
                 kv.str_value  = v_tok.lexeme;
             }
-            _ => {
-                this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
-                    fmt::format("expected literal or identifier after '=' in directive, got '%s'",
-                        v_tok.lexeme));
-            }
+            _ => { this.report_directive_value_error(v_tok); }
         }
 
         kv.span = this.span_from(key_tok);
         return kv;
+    }
+
+    /// E0102 for a `key = value` directive argument whose value is not one
+    /// a directive takes: a float literal, or a token that is no literal or
+    /// identifier at all.
+    report_directive_value_error(v_tok: Token) -> void {
+        this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
+            fmt::format("expected an integer, string or boolean literal or an identifier after '=' in directive, got '%s'",
+                v_tok.lexeme));
     }
 
 

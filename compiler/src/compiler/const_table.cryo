@@ -266,41 +266,6 @@ public:
         const canon: string = ResBase::primitive_of_alias(lexeme);
         return if (canon.length() > 0) { canon } else { lexeme };
     }
-
-
-    /// Decode an integer literal lexeme, honouring `0x`/`0o`/`0b` prefixes and
-    /// `_` separators.  None on overflow past u128 or on a stray character.
-    static parse_int_literal(text_text: string) -> Option<u128> {
-        const text: string = text_text;
-        if (text == null) { return Option::None; }
-        mut i: i64 = 0;
-        mut base: u128 = 10;
-        if (text[0] == '0' && text[1] != 0) {
-            const c: char = text[1];
-            if (c == 'x' || c == 'X') { base = 16; i = 2; }
-            else if (c == 'o' || c == 'O') { base = 8;  i = 2; }
-            else if (c == 'b' || c == 'B') { base = 2;  i = 2; }
-        }
-
-        mut acc: u128 = 0;
-        mut saw_digit: boolean = false;
-        while (text[i] != 0) {
-            const c: char = text[i];
-            i = i + 1;
-            if (c == '_') { continue; }
-            // A type suffix or stray character is no hex digit: -1.
-            const value: i32 = c.hex_value();
-            if (value < 0) { return Option::None; }
-            const d: u128 = value as u128;
-            if (d >= base) { return Option::None; }
-            // Overflow check before the multiply-add.
-            if (acc > (u128::MAX - d) / base) { return Option::None; }
-            acc = acc * base + d;
-            saw_digit = true;
-        }
-        if (!saw_digit) { return Option::None; }
-        return Option::Some(acc);
-    }
 }
 
 
@@ -534,17 +499,7 @@ type struct ConstEval {
                 return Option::Some(FoldedInteger::unsigned(Lexer::char_literal_value(lit.value) as u128));
             }
             if (lit.literal_kind != LiteralKind::Integer) { return Option::None; }
-            // `value` is the whole lexeme, suffix included; the lexer already
-            // found the boundary, so strip rather than re-derive it - a digit
-            // scan cannot tell `0x1f64` (no suffix) from `0x1u8`.
-            mut text: string = lit.value;
-            const slen: i64 = lit.suffix.length() as i64;
-            if (slen > 0) {
-                const vlen: i64 = lit.value.length() as i64;
-                if (vlen <= slen) { return Option::None; }
-                text = lit.value.substr(0, (vlen - slen) as i64);
-            }
-            return match (ConstantTable::parse_int_literal(text)) {
+            return match (Lexer::integer_literal_value(lit.value, lit.suffix)) {
                 Option::Some(v) => { Option::Some(FoldedInteger::unsigned(v)) }
                 Option::None    => { Option::None }
             };

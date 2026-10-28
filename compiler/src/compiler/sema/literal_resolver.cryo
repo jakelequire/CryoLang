@@ -17,6 +17,7 @@ import compiler::types::type_base::{ Type };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound;
 import compiler::lex;
+import compiler::lex::lexer::{ Lexer };
 import compiler::ast::{ LiteralKind, ObjectForm };
 import compiler::ast::expression::{ BinaryExpr, ExpressionNode, LiteralExpr, UnaryExpr };
 import compiler::diag::{ ErrorCode };
@@ -111,12 +112,22 @@ type struct LiteralResolver {
         // previously the suffix was validated by the lexer and then discarded,
         // so a contradiction was silently resolved in the context's favour.
         const suffixed: TypeRef = sema_numeric_suffix_type(this.arena, Keyword::new(lit.suffix));
+        // No integer type holds a value past `u128::MAX`, whatever the
+        // literal's position; the width bounds below stop at 64 bits.
+        if (Lexer::integer_literal_value(lit.value, lit.suffix).is_none()) {
+            this.ctx.emit_error_at(
+                ErrorCode::E0010_NUMBER_TOO_LARGE,
+                fmt::format("integer literal `%s` does not fit in 128 bits, the widest integer type",
+                    lit.value),
+                e.span);
+            return if (suffixed.is_valid()) { suffixed } else { this.arena.get_u64() };
+        }
         if (suffixed.is_valid()) {
             const st: Type* = this.arena.lookup(suffixed);
             if (st != null && st.kind == TypeKind::Int) {
                 const sit: IntegerKind = st.int_kind();
                 const smax: u64 = sema_int_unsigned_bound(sit.bit_width());
-                if (smax != 0 && int_literal_exceeds(lit.value, smax)) {
+                if (smax != 0 && int_literal_exceeds(lit, smax)) {
                     this.ctx.emit_error_at(
                         ErrorCode::E0010_NUMBER_TOO_LARGE,
                         fmt::format("integer literal `%s` is out of range for type `%s`",
@@ -137,7 +148,7 @@ type struct LiteralResolver {
                 // width.  128-bit bounds exceed u64, so they are left unchecked
                 // (sema_int_unsigned_bound returns 0 there).
                 const max_mag: u64 = sema_int_unsigned_bound(it.bit_width());
-                if (max_mag != 0 && int_literal_exceeds(lit.value, max_mag)) {
+                if (max_mag != 0 && int_literal_exceeds(lit, max_mag)) {
                     this.ctx.emit_error_at(
                         ErrorCode::E0010_NUMBER_TOO_LARGE,
                         fmt::format("integer literal `%s` is out of range for type `%s`",
@@ -155,7 +166,7 @@ type struct LiteralResolver {
                     // are representable as neither a positive nor the negative
                     // min - warn.
                     const signed_min_mag: u64 = (max_mag >> 1) + 1;
-                    if (int_literal_exceeds(lit.value, signed_min_mag)) {
+                    if (int_literal_exceeds(lit, signed_min_mag)) {
                         mut diag: Diagnostic = Diagnostic::warning(
                             ErrorCode::W0012_SIGNED_LITERAL_OUT_OF_RANGE,
                             fmt::format("integer literal `%s` is outside the range of signed type `%s`; it is stored as its two's-complement bit pattern (wraps to a negative value)",
@@ -177,7 +188,7 @@ type struct LiteralResolver {
             // A `char` holds a Unicode scalar value, so its bound is
             // `char::MAX`, not the 32-bit width's.
             if (exp != null && exp.kind == TypeKind::Char) {
-                if (int_literal_exceeds(lit.value, char::MAX as u64)) {
+                if (int_literal_exceeds(lit, char::MAX as u64)) {
                     this.ctx.emit_error_at(
                         ErrorCode::E0010_NUMBER_TOO_LARGE,
                         fmt::format("integer literal `%s` is out of range for type `char`, whose largest value is U+10FFFF",
@@ -189,7 +200,7 @@ type struct LiteralResolver {
         }
         // No integer expected-type hint: pick the narrowest default width that
         // holds the literal's magnitude (i32 -> i64 -> u64).
-        return sema_default_int_type(this.arena, lit.value);
+        return sema_default_int_type(this.arena, lit);
     }
 
     /// Type a float literal: a type suffix settles it, else adopt a float
@@ -255,7 +266,7 @@ type struct LiteralResolver {
                 return this.state.expected_type;
             }
         }
-        return sema_default_int_type(this.arena, lit.value);
+        return sema_default_int_type(this.arena, lit);
     }
 
     /// Whether the current `expected_type` hint is a concrete integer type (so a
@@ -276,7 +287,7 @@ type struct LiteralResolver {
         const it: IntegerKind = t.int_kind();
         const max_mag: u64 = sema_int_unsigned_bound(it.bit_width());
         if (max_mag == 0) { return false; }
-        return !int_literal_exceeds(lit.value, max_mag);
+        return !int_literal_exceeds(lit, max_mag);
     }
 
     /// Whether a constant integer expression (`8 * 10000 + 64 * 100`) keeps

@@ -12,6 +12,7 @@ import std::collections::str;
 import std::fmt;
 import std::fmt::float;
 import std::core::option::{ Option };
+import std::core::slice::{ Slice };
 import utils::keyword::{ Keyword };
 
 type struct Lexer {
@@ -325,7 +326,7 @@ private:
         const len: u64 = (this.current as i64 - start as i64) as u64;
         const lexeme: string = start.substr(0, len as i64);
 
-        return Token::new_number(lexeme, start_line, start_col, accepted_suffix);
+        return Token::new_number(lexeme, start_line, start_col, accepted_suffix, is_float);
     }
 
     lex_string(&this, quote: char) -> Token {
@@ -1281,6 +1282,28 @@ private:
             if (lexeme[i] != '_') { digits.push_byte(lexeme[i] as u8); }
         }
         return float::parse_f64(digits.into_raw());
+    }
+
+    /// The value of an integer literal from its lexeme and the type suffix
+    /// the lexer found in it (`""` for none): a `0x`, `0o` or `0b` prefix
+    /// picks the radix, the suffix is dropped, and a `_` separator may appear
+    /// anywhere among the digits.  `None` when the digits write a value past
+    /// `u128::MAX`.  The suffix is taken from the lexer rather than found
+    /// again here, because a digit scan cannot tell `0x1f64` (all hex digits)
+    /// from `0x1u8`.  The one reader of an integer literal's value, for an
+    /// expression, a folded constant, a pattern, an array size and an enum
+    /// discriminant alike.
+    public static integer_literal_value(lexeme: string, suffix: string) -> Option<u128> {
+        if (lexeme == null) { return Option::None; }
+        const text: Slice<u8> = Slice::from_raw(lexeme as u8*, lexeme.length() as i64 - suffix.length() as i64);
+        if (text.length() > 2 && text[0] == '0' as u8) {
+            const marker: u8 = text[1].to_ascii_lowercase();
+            const digits: Slice<u8> = text.subslice(2, text.length());
+            if (marker == 'x' as u8) { return u128::parse_literal(digits, 16); }
+            if (marker == 'o' as u8) { return u128::parse_literal(digits, 8); }
+            if (marker == 'b' as u8) { return u128::parse_literal(digits, 2); }
+        }
+        return u128::parse_literal(text, 10);
     }
 
     /// Encode Unicode codepoint `cp` (assumed <= 0x10FFFF) as UTF-8, appending

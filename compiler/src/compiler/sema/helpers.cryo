@@ -44,9 +44,9 @@ public function sema_int_unsigned_bound(width: u64) -> u64 {
 /// type that holds the magnitude keeps ordinary code on i32 while preventing a
 /// wide bare literal (e.g. an i64::MIN magnitude at a variadic boundary) from
 /// silently truncating to its low 32 bits.
-public function sema_default_int_type(arena: TypeArena*, value: string) -> TypeRef {
-    if (!int_literal_exceeds(value, i32::MAX as u64)) { return arena.get_i32(); }
-    if (!int_literal_exceeds(value, i64::MAX as u64)) { return arena.get_i64(); }
+public function sema_default_int_type(arena: TypeArena*, lit: LiteralExpr*) -> TypeRef {
+    if (!int_literal_exceeds(lit, i32::MAX as u64)) { return arena.get_i32(); }
+    if (!int_literal_exceeds(lit, i64::MAX as u64)) { return arena.get_i64(); }
     return arena.get_u64();
 }
 
@@ -260,45 +260,13 @@ public function int_literal_text_is_zero(s_text: string) -> boolean {
 }
 
 
-/// True when the integer-literal text `s` denotes a magnitude strictly greater
-/// than `max_mag` (or overflows u64).  Honors `0x`/`0b`/`0o` prefixes and `_`
-/// separators.  Returns false on malformed text so other passes own that error.
-public function int_literal_exceeds(s_text: string, max_mag: u64) -> boolean {
-    const s: string = s_text;
-    if (s == null) { return false; }
-    const len: i64 = s.length() as i64;
-    if (len == 0) { return false; }
-    mut i: i64 = 0;
-    mut radix: u64 = 10;
-    if (len >= 2 && s[0] == '0') {
-        const c1: char = s[1];
-        if (c1 == 'x' || c1 == 'X') { radix = 16; i = 2; }
-        else if (c1 == 'b' || c1 == 'B') { radix = 2; i = 2; }
-        else if (c1 == 'o' || c1 == 'O') { radix = 8; i = 2; }
-    }
-    mut acc: u64 = 0;
-    mut saw_digit: boolean = false;
-    while (i < len) {
-        const c: char = s[i];
-        if (c == '_') { i = i + 1; continue; }
-        // First non-digit is the type suffix (`i64`/`u64`/...): STOP and compare
-        // the magnitude parsed so far. Returning `false` (does-not-exceed) here
-        // wrongly classified a large suffixed literal (`9000000000i64`) as
-        // in-range, so `sema_default_int_type` picked `i32` and codegen
-        // truncated the value via `const_int(i32, ...)`. Mirrors the suffix-stop
-        // in `string_parse_radix_u64` / `int_literal_clean`.
-        if (!c.is_hex_digit()) { break; }
-        const d: u64 = c.hex_value() as u64;
-        if (d >= radix) { break; }
-        saw_digit = true;
-        // Overflow-checked acc = acc*radix + d.  Past u64 it can only be larger
-        // than any in-range bound, so report "exceeds".
-        if (acc > (u64::MAX - d) / radix) { return true; }
-        acc = acc * radix + d;
-        i = i + 1;
-    }
-    if (!saw_digit) { return false; }
-    return acc > max_mag;
+/// True when the integer literal `lit` writes a magnitude strictly greater
+/// than `max_mag`.  A literal past `u128::MAX` exceeds every bound.
+public function int_literal_exceeds(lit: LiteralExpr*, max_mag: u64) -> boolean {
+    return match (Lexer::integer_literal_value(lit.value, lit.suffix)) {
+        Option::Some(value) => { value > max_mag as u128 }
+        Option::None        => { true }
+    };
 }
 
 /// Fold a compile-time-constant integer expression to its value, for width

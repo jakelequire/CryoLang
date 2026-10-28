@@ -169,6 +169,10 @@ A shift's amount does not type the value shifted: a literal shifted by an amount
 
 An integer literal stored where a `char` is takes `char`, and must be at most `0x10FFFF`, the largest Unicode scalar value: `const c: char = 0x110000;` is refused (`E0010`).
 
+No integer type holds a value past `u128::MAX`, so an integer literal writing one is refused wherever it stands (`E0010`) rather than wrapped. A literal is a float only when it has a fraction or an exponent: `0xE` and `5usize` are integers. A float literal where only an integer stands - an enum discriminant, a directive argument, a fixed array's size - is refused rather than read as its integer part.
+
+The standard library reads a literal's digits the same way: `u128::parse_literal(text, radix)` and `u64::parse_literal(text, radix)` take digits of `radix` with `_` separators anywhere among them, and answer `None` for a value past the type's maximum, a byte that is neither a digit nor `_`, or no digit at all. Neither reads a sign, a radix prefix or a suffix; `u64::parse_radix` is the same without the separators.
+
 > **Trap.** Integer literals exceeding `i64::MAX` (e.g. `0xFFFF_FFFF_FFFF_FFFF`) wrap to negative when used inline against a `u64` operand. Hoist the literal into a `const u64 NAME = ...` binding to compare correctly.
 
 #### String and Character Literals
@@ -337,6 +341,8 @@ Every value in Cryo has a known type at compile time. A binding's type is either
 | `()`                          | The unit type. A value of this type carries no information.                                                                                      | 0                        |
 
 In performance-sensitive or cross-platform code, prefer the explicit-width forms (`i32`, `u64`, `f64`) so the layout is unambiguous. The shorthand aliases exist for ergonomics.
+
+`char` and `u8` classify ASCII with methods of the same names and meaning: `is_digit`, `is_alpha`, `is_hex_digit`, `is_whitespace`, `is_uppercase` (`A`-`Z`), `is_lowercase` (`a`-`z`), and the case folds `to_ascii_lowercase` and `to_ascii_uppercase`. A `char` outside ASCII, a non-ASCII letter among them, answers false to each test and folds to itself; so does a `u8` of 0x80 or above.
 
 `string` is a NUL-terminated raw byte pointer matching the C ABI. Inside the standard library, length-typed UTF-8 is modelled by [`Str`](#19-the-standard-library) (borrowed) and [`String`](#19-the-standard-library) (owned). The translation between them happens at the FFI boundary in `ffi::cstr`.
 

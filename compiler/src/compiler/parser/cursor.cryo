@@ -7,6 +7,7 @@
 namespace compiler::parser::cursor;
 
 import compiler::lex::{ Token, TokenType };
+import compiler::lex::lexer::{ Lexer };
 import compiler::diag::{ diagnostic, ErrorCode, source_span, suggestion };
 import compiler::ast::node::{ StaticAssertItem };
 import compiler::compilation_context::{ CompilationContext };
@@ -423,100 +424,16 @@ implement struct Parser {
             || kind == TokenType::DocCommentBlock;
     }
 
-    /// Parse a numeric-constant token's lexeme as a signed 64-bit integer.
-    /// Recognizes `0x` / `0X` hex, `0b` / `0B` binary, `0o` / `0O` octal,
-    /// and decimal, with optional leading sign and `_` digit separators.
-    /// A bare leading zero is decimal, not octal (`077` == 77).  Returns
-    /// 0 on a malformed lexeme; the lexer should have
-    /// already rejected those.  Mirrors the codegen-side parse_int_lexeme
-    /// so that enum discriminants, pattern integer literals, and codegen
-    /// agree on the value of every numeric constant.
-    static parse_numeric_lexeme_i64(s_text: string) -> i64 {
-        const s: string = s_text;
-        if (s == null) { return 0; }
-        const len: i64 = s.length() as i64;
-        if (len == 0) { return 0; }
-        mut i: i64 = 0;
-        mut negate: boolean = false;
-        if (s[0] == '-') { negate = true; i = 1; }
-        else if (s[0] == '+') { i = 1; }
-
-        mut base: i64 = 10;
-        if (i + 1 < len && s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X')) {
-            base = 16; i += 2;
-        } else if (i + 1 < len && s[i] == '0' && (s[i + 1] == 'b' || s[i + 1] == 'B')) {
-            base = 2;  i += 2;
-        } else if (i + 1 < len && s[i] == '0' && (s[i + 1] == 'o' || s[i + 1] == 'O')) {
-            base = 8;  i += 2;
-        }
-
-        // Accumulate in u64 with a hard overflow guard: a literal that needs
-        // more than 64 bits (e.g. `0x1_0000_0000_0000_0000` or a 25-digit
-        // decimal) would wrap silently to an arbitrary small/negative value
-        // - dangerous for the parser-side callers (fixed-array sizes, enum
-        // discriminants, pattern literals) that have no later value-range
-        // check. Saturate to u64::MAX instead so the value is at worst
-        // obviously-too-big (a giant array size fails loudly at codegen)
-        // rather than a plausible small wrap. The array-size caller also
-        // reports E0010 up front via `numeric_lexeme_overflows_u64`.
-        const u64_max: u64 = (0 as u64) - (1 as u64);
-        const ubase: u64 = base as u64;
-        mut acc: u64 = 0;
-        mut overflowed: boolean = false;
-        while (i < len) {
-            const c: char = s[i];
-            if (c == '_') { i += 1; continue; }
-            const digit: i64 = c.hex_value() as i64;
-            if (digit < 0 || digit >= base) { break; }
-            const ud: u64 = digit as u64;
-            // acc * ubase + ud overflows u64 if acc > (u64_max - ud) / ubase.
-            if (acc > (u64_max - ud) / ubase) {
-                overflowed = true;
-                break;
-            }
-            acc = acc * ubase + ud;
-            i += 1;
-        }
-        if (overflowed) { acc = u64_max; }
-
-        if (negate) { return -(acc as i64); }
-        return acc as i64;
-    }
-
-    /// True when the integer lexeme `s` needs more than 64 bits, i.e. when
-    /// `parse_numeric_lexeme_i64` would have to saturate. Lets a caller that
-    /// cares (the fixed-array-size path) report a precise diagnostic instead
-    /// of silently using the saturated value. Honours the `0x`/`0o`/`0b`
-    /// prefixes, `_` separators, and a leading sign, mirroring the parser.
-    static numeric_lexeme_overflows_u64(s_text: string) -> boolean {
-        const s: string = s_text;
-        if (s == null) { return false; }
-        const len: i64 = s.length() as i64;
-        if (len == 0) { return false; }
-        mut i: i64 = 0;
-        if (s[0] == '-' || s[0] == '+') { i = 1; }
-        mut base: i64 = 10;
-        if (i + 1 < len && s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X')) {
-            base = 16; i += 2;
-        } else if (i + 1 < len && s[i] == '0' && (s[i + 1] == 'b' || s[i + 1] == 'B')) {
-            base = 2;  i += 2;
-        } else if (i + 1 < len && s[i] == '0' && (s[i + 1] == 'o' || s[i + 1] == 'O')) {
-            base = 8;  i += 2;
-        }
-        const u64_max: u64 = (0 as u64) - (1 as u64);
-        const ubase: u64 = base as u64;
-        mut acc: u64 = 0;
-        while (i < len) {
-            const c: char = s[i];
-            if (c == '_') { i += 1; continue; }
-            const digit: i64 = c.hex_value() as i64;
-            if (digit < 0 || digit >= base) { break; }
-            const ud: u64 = digit as u64;
-            if (acc > (u64_max - ud) / ubase) { return true; }
-            acc = acc * ubase + ud;
-            i += 1;
-        }
-        return false;
+    /// The value of an integer NumericConstant token as a signed 64-bit
+    /// integer, for the readers the parser owns: an enum discriminant, a
+    /// pattern literal, a directive argument and a fixed array size.  A
+    /// value past `u64::MAX` saturates to it rather than wrapping to a
+    /// plausible small number, because none of those readers checks the
+    /// range later; the array-size reader reports it up front.
+    static integer_token_value(token: Token) -> i64 {
+        const value: u128 = Lexer::integer_literal_value(token.lexeme, token.numeric_suffix).unwrap_or(u128::MAX);
+        if (value > u64::MAX as u128) { return u64::MAX as i64; }
+        return value as i64;
     }
 
     /// Strip surrounding double-quote characters from a string-literal
@@ -533,20 +450,6 @@ implement struct Parser {
         const inner_len: i64 = len - 2;
         mut out: String = String::from_str(Str::from_raw((s + 1) as u8*, inner_len as u64));
         return out.into_raw();
-    }
-
-    /// True if `s` looks like a float literal (contains `.`, `e`, or `E`).
-    /// Used by pattern parsing to pick between LiteralInt and LiteralFloat
-    /// when the token kind alone (NumericConstant) doesn't distinguish them.
-    static is_float_lexeme(s_text: string) -> boolean {
-        const s: string = s_text;
-        if (s == null) { return false; }
-        const llen: u32 = s.length() as u32;
-        for (mut i: u32 = 0; i < llen; i++) {
-            const c: char = s[i];
-            if (c == '.' || c == 'e' || c == 'E') { return true; }
-        }
-        return false;
     }
 
     /// Merge two spans into one covering both.

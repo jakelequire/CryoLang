@@ -70,6 +70,18 @@ implement char {
         return (this >= 'A' && this <= 'Z') || (this >= 'a' && this <= 'z');
     }
 
+    /// ASCII uppercase letter: `A`-`Z`.  Every other scalar, a non-ASCII
+    /// letter among them, answers false.
+    public is_uppercase(&this) -> boolean {
+        return this >= 'A' && this <= 'Z';
+    }
+
+    /// ASCII lowercase letter: `a`-`z`.  Every other scalar, a non-ASCII
+    /// letter among them, answers false.
+    public is_lowercase(&this) -> boolean {
+        return this >= 'a' && this <= 'z';
+    }
+
     public is_alphanumeric(&this) -> boolean {
         return this.is_alpha() || this.is_digit();
     }
@@ -508,6 +520,16 @@ implement u8 {
         return (this >= 0x41 && this <= 0x5A) || (this >= 0x61 && this <= 0x7A);
     }
 
+    /// ASCII uppercase letter: `A`-`Z`.
+    public is_uppercase(&this) -> boolean {
+        return this >= 0x41 && this <= 0x5A;
+    }
+
+    /// ASCII lowercase letter: `a`-`z`.
+    public is_lowercase(&this) -> boolean {
+        return this >= 0x61 && this <= 0x7A;
+    }
+
     /// ASCII hexadecimal digit: `0`-`9`, `a`-`f`, or `A`-`F`.
     public is_hex_digit(&this) -> boolean {
         return this.is_digit()
@@ -824,6 +846,19 @@ implement u64 {
         return Option::Some((value, length));
     }
 
+    /// The value `text` writes in `radix` as the digits of an integer
+    /// literal, as `u128::parse_literal` reads them; `None` also when the
+    /// value passes `u64::MAX`.
+    public static parse_literal(text: Slice<u8>, radix: u32) -> Option<u64> {
+        match (u128::parse_literal(text, radix)) {
+            Option::Some(value) => {
+                if (value <= u64::MAX as u128) { return Option::Some(value as u64); }
+            }
+            Option::None => { }
+        }
+        return Option::None;
+    }
+
     /// The bits shifted left by `n` (modulo 64), those leaving the top
     /// re-entering at the bottom.
     public rotate_left(&this, n: u32) -> u64 {
@@ -1104,6 +1139,45 @@ implement u128 {
     /// `this * other`, or `u128::MAX` where the product passes it.
     public saturating_multiply(&this, other: u128) -> u128 {
         return this.checked_multiply(other).unwrap_or(u128::MAX);
+    }
+
+    /// The value `text` writes in `radix` as the digits of an integer
+    /// literal: digits of `radix` as `u64::parse_radix` reads them, with a
+    /// `_` separator allowed anywhere among them.  `None` when `text` holds
+    /// no digit, holds a byte that is neither a digit of `radix` nor `_`,
+    /// writes a value past `u128::MAX`, or `radix` is outside 2 to 36.  No
+    /// sign, radix prefix or type suffix is read.
+    public static parse_literal(text: Slice<u8>, radix: u32) -> Option<u128> {
+        mut value: u128 = 0;
+        mut saw_digit: boolean = false;
+        mut at: i64 = 0;
+        while (at < text.length()) {
+            if (text[at] == '_' as u8) {
+                at += 1;
+                continue;
+            }
+            // A run of digits ends at a separator, at a byte that is no
+            // digit, or before the digit that would carry it past
+            // `u64::MAX`; the next run starts there.  A run is at most 64
+            // digits of radix 2, so `radix` to the power of its length
+            // always fits a u128.
+            match (u64::parse_radix_prefix(text.subslice(at, text.length()), radix)) {
+                Option::Some(run) => {
+                    mut scale: u128 = 1;
+                    for (mut k: i64 = 0; k < run.1; k++) { scale = scale * radix as u128; }
+                    const shifted: Option<u128> = value.checked_multiply(scale);
+                    if (shifted.is_none()) { return Option::None; }
+                    const sum: Option<u128> = shifted.unwrap().checked_add(run.0 as u128);
+                    if (sum.is_none()) { return Option::None; }
+                    value = sum.unwrap();
+                    saw_digit = true;
+                    at += run.1;
+                }
+                Option::None => { return Option::None; }
+            }
+        }
+        if (!saw_digit) { return Option::None; }
+        return Option::Some(value);
     }
 
     /// Write `this` in base 10 into `buffer`. Returns bytes written.
