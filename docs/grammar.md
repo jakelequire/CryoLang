@@ -133,9 +133,9 @@ CHeaderImport      ::= "extern" "module" Ident ":=" StringLit
 CIncludeLine       ::= "#include" ( "<" /* path */ ">"
                                   | StringLit )
 
-IntrinsicDecl      ::= "intrinsic" "function" Ident
+IntrinsicDecl      ::= Visibility? "intrinsic" "function" Ident
                        "(" ParamList? ")" ("->" Type)? (Block | ";")
-                     | "intrinsic" "function" Ident Generics
+                     | Visibility? "intrinsic" "function" Ident Generics
                        "(" ParamList? ")" ("->" Type)? ("where" WhereClause)? ";"
 
 (*  A generic intrinsic has no body: it is typed and specialized as a

@@ -767,6 +767,17 @@ yet is recorded with the change that builds it, not here.
      `HashSetIter` holds one.  The compiler holds those iterators as
      `implement Iterator<Pair<K, V>>` locals.  (Jake)
 
+642. **The intrinsics and the primitives are marked.**  Every intrinsic is
+     public: they are the language's primitive operations, the
+     allocation, bit, atomic, float, trap, unwinding, directory-entry and
+     variadic ones alike.  `taken_panic_info` is public beside
+     `try_catch`, as the way a caller catching through it reads the
+     payload.  The primitives' constants and methods are public, but for
+     the digit-table step behind the integers' hex writers
+     (`to_hex_buf_with_table`, `to_hex_padded_buf_with_table`), which is
+     private.  An intrinsic declaration takes a visibility like any
+     function.  (Jake; the hex step delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that
