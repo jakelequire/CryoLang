@@ -622,6 +622,22 @@ yet is recorded with the change that builds it, not here.
      spec piece calls is internal, the rest private.  (Jake; each split
      delegated)
 
+632. **`io` and `fs` are marked.**  The I/O traits, `SeekFrom`, the
+     buffered readers and writers, `Cursor`, the standard streams with
+     their locks, `is_tty`, the descriptor numbers and calls of
+     `io::fd`, the newline constants, `read_dir`, the directory and file
+     calls, `DirEntry`, `ReadDir`, `OpenOptions` and `File` are public,
+     and so are the default buffer size, file mode and directory mode.
+     `Transfer` keeps public fields, since every `AsyncTransport`
+     implementation builds one.  Every buffer, cursor position, directory
+     handle and option switch is private behind the type's methods; a
+     buffered writer's drain, a stream's compaction, the options'
+     translation to `open` flags, the dirent and Win32 attribute decoding
+     and the standard streams' lock buffers are private.  `File`'s
+     descriptor is not marked: a caller hands it to a spawn by reading
+     and clearing it, and hiding it needs an accessor.  (Jake; each split
+     delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that
