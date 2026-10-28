@@ -652,6 +652,21 @@ yet is recorded with the change that builds it, not here.
      in `alloc` and `net` is written `private`.  (Jake; each split
      delegated)
 
+634. **`process` is marked.**  `Command`, `Stdio`, `Output`, `Child`,
+     its pipe handles with `from_fd`, `ExitStatus`'s methods, `SigNo`,
+     `Signal` and `id` are public.  A command's settings, an output's
+     captures and a signal's number are private behind their methods.
+     The spawn, pipe, environment and command-line steps, the Windows
+     stdio setup and drains, and the wait and drain futures with their
+     pool jobs are private, and `PipeDrain`, which a command's capture
+     awaits from another file, is internal.  `ExitStatus`'s fields and
+     `decode_wstatus` are not marked, because the test runner, whose
+     spawning is parked, builds the one and calls the other; nor are the
+     pipe handles' descriptors, which a capture takes by reading and
+     clearing, as a caller takes `File`'s.  The POSIX pipe helpers are
+     gated to POSIX, the only target that calls them.  (Jake; each split
+     delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

@@ -478,9 +478,11 @@ Left over from that: the async entry point calls `Executor::new` and
    `Command::shell` alone (627).  The compiler's C-literal, number,
    identifier and suffix helpers left `core` (628).  `fs::metadata` and
    `env` are marked (629), and so are `math`, `random` and `sync`
-   (630), `thread` and `fmt` (631), `io` and `fs` (632), and `json`
-   (633).  Open: whether `File`'s descriptor goes behind an accessor,
-   and whether the JSON `Parser` is public.  Open: whether
+   (630), `thread` and `fmt` (631), `io` and `fs` (632), `json` (633)
+   and `process` (634).  Open: whether `File`'s and the child pipes'
+   descriptors go behind an accessor, whether the JSON `Parser` is
+   public, and how `ExitStatus` is built once the test runner spawns
+   through `Command`.  Open: whether
    `string.is_under`, which the compiler asks of a module's file, gives
    way to a component-wise `Path` prefix test.  Open: a writer over a fixed
    region - SHA-1's digest, the generator's fill, `pack_sockaddr_in` and

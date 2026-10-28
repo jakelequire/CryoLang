@@ -107,7 +107,7 @@ private function os_proc_wait(pid: i32, handle: u64) -> Result<ExitStatus, IoErr
 /// Reachable only if a future change passes `WUNTRACED`/`WCONTINUED`; guarded
 /// here so the contract holds regardless.
 ![target(unix)]
-function wstatus_is_alive(wstatus: i32) -> boolean {
+private function wstatus_is_alive(wstatus: i32) -> boolean {
     return (wstatus & 0xFF) == 0x7F || wstatus == 0xFFFF;
 }
 
@@ -252,25 +252,25 @@ private function os_proc_close_dup(handle: u64) -> void {
 /// Result of a child's termination. Either it exited normally with
 /// a code, or it was killed by a signal. POSIX encodes both into a
 /// single `wstatus` word; `ExitStatus` is the decoded form.
-type struct ExitStatus {
+public type struct ExitStatus {
     code: i32;
     signal: i32;
     signaled: boolean;
 
     /// Convenience: did the child exit with status 0?
-    success(&this) -> boolean {
+    public success(&this) -> boolean {
         return !this.signaled && this.code == 0;
     }
 
     /// `Some(code)` for a normal exit, `None` if the child was
     /// killed by a signal.
-    exit_code(&this) -> Option<i32> {
+    public exit_code(&this) -> Option<i32> {
         if (this.signaled) { return Option::None; }
         return Option::Some(this.code);
     }
 
     /// `Some(signal)` if the child was killed by a signal.
-    terminating_signal(&this) -> Option<i32> {
+    public terminating_signal(&this) -> Option<i32> {
         if (this.signaled) { return Option::Some(this.signal); }
         return Option::None;
     }
@@ -305,10 +305,10 @@ function decode_wstatus(wstatus: i32) -> ExitStatus {
 // ChildStdin / Stdout / Stderr: fd wrappers with Write / Read
 
 /// Write end of a pipe whose read end is the child's stdin.
-type struct ChildStdin {
+public type struct ChildStdin {
     fd: i32;
 
-    static from_fd(raw_fd: i32) -> ChildStdin {
+    public static from_fd(raw_fd: i32) -> ChildStdin {
         return ChildStdin { fd: raw_fd };
     }
 
@@ -325,10 +325,10 @@ implement trait Write for struct ChildStdin {
 }
 
 /// Read end of a pipe whose write end is the child's stdout.
-type struct ChildStdout {
+public type struct ChildStdout {
     fd: i32;
 
-    static from_fd(raw_fd: i32) -> ChildStdout {
+    public static from_fd(raw_fd: i32) -> ChildStdout {
         return ChildStdout { fd: raw_fd };
     }
 }
@@ -340,10 +340,10 @@ implement trait Read for struct ChildStdout {
 }
 
 /// Read end of a pipe whose write end is the child's stderr.
-type struct ChildStderr {
+public type struct ChildStderr {
     fd: i32;
 
-    static from_fd(raw_fd: i32) -> ChildStderr {
+    public static from_fd(raw_fd: i32) -> ChildStderr {
         return ChildStderr { fd: raw_fd };
     }
 }
@@ -354,7 +354,7 @@ implement trait Read for struct ChildStderr {
     }
 }
 
-type struct Child {
+public type struct Child {
 private:
     pid: i32;
     // OS process HANDLE on Windows (for wait/kill/close); 0 on POSIX, where
@@ -476,14 +476,14 @@ public:
 /// The answer is stored as its two halves rather than as a `Result`, matching
 /// `ResolveJob`: `produced` says whether either half was written at all — the
 /// pool can cancel a job before it ever runs — and `ok` says which one.
-type struct ChildWaitJob {
-    job:      BlockingJob;
-    pid:      i32;
-    handle:   u64;         // this block's own reference; released by `_free`
-    status:   ExitStatus;  // valid when `produced && ok`
-    err:      IoError;     // valid when `produced && !ok`
-    produced: boolean;
-    ok:       boolean;
+private type struct ChildWaitJob {
+    private job:      BlockingJob;
+    private pid:      i32;
+    private handle:   u64;         // this block's own reference; released by `_free`
+    private status:   ExitStatus;  // valid when `produced && ok`
+    private err:      IoError;     // valid when `produced && !ok`
+    private produced: boolean;
+    private ok:       boolean;
 }
 
 /// `run_fn` for a `ChildWaitJob`: the blocking wait, on a pool thread. A bare
@@ -492,7 +492,7 @@ type struct ChildWaitJob {
 /// `produced` is set last. Everything the collecting side reads is written
 /// before it, and the pool publishes the job's terminal status under its lock
 /// after this returns, which is what orders the two.
-function child_wait_job_run(raw: u8*) -> void {
+private function child_wait_job_run(raw: u8*) -> void {
     mut j: ChildWaitJob* = raw as ChildWaitJob*;
     match (os_proc_wait(j.pid, j.handle)) {
         Result::Ok(s)  => { j.status = s; j.ok = true;  }
@@ -504,7 +504,7 @@ function child_wait_job_run(raw: u8*) -> void {
 /// `drop_fn` for a `ChildWaitJob`: release this block's process reference and
 /// free it. Runs on whichever side let go of the block last. The status halves
 /// are plain scalars, so an answer nobody collected needs no teardown.
-function child_wait_job_free(raw: u8*) -> void {
+private function child_wait_job_free(raw: u8*) -> void {
     mut j: ChildWaitJob* = raw as ChildWaitJob*;
     os_proc_close_dup(j.handle);
     mut alloc: GlobalAlloc = GlobalAlloc::new();
@@ -558,17 +558,17 @@ function child_wait_job_free(raw: u8*) -> void {
 /// completes on that first poll, so the spinning `future::block_on` driver still
 /// works. That is a blocking call on the polling thread, which is exactly what
 /// that driver already is.
-type struct ChildWait {
-    pid:     i32;
-    handle:  u64;            // the `Child`'s reference, valid while it is polled
-    exit_fd: i32;            // >= 0 once a pidfd is open; owned by this future
+private type struct ChildWait {
+    private pid:     i32;
+    private handle:  u64;            // the `Child`'s reference, valid while it is polled
+    private exit_fd: i32;            // >= 0 once a pidfd is open; owned by this future
     private rt: Reactor*;       // non-null while a registration is live
-    job:     ChildWaitJob*;  // non-null while a pool job is in flight
-    routed:  boolean;        // true once the first poll chose a route
+    private job:     ChildWaitJob*;  // non-null while a pool job is in flight
+    private routed:  boolean;        // true once the first poll chose a route
 
     /// Begin waiting on `pid` / `handle`. Nothing is opened or submitted until
     /// the first poll, so a `ChildWait` that is never awaited costs nothing.
-    static start(pid: i32, handle: u64) -> ChildWait {
+    private static start(pid: i32, handle: u64) -> ChildWait {
         return ChildWait {
             pid: pid,
             handle: handle,
@@ -754,13 +754,13 @@ private function pipe_fits_reactor() -> boolean { return false; }
 /// its side immediately while the pool thread is still inside `read`, so a
 /// borrowed descriptor could be closed out from under that thread and its
 /// number reused by an unrelated open.
-type struct PipeDrainJob {
-    job:      BlockingJob;
-    fd:       i32;         // this block's own descriptor; closed by `_free`
-    buf:      Array<u8>;   // valid when `produced && ok`
-    err:      IoError;     // valid when `produced && !ok`
-    produced: boolean;
-    ok:       boolean;
+private type struct PipeDrainJob {
+    private job:      BlockingJob;
+    private fd:       i32;         // this block's own descriptor; closed by `_free`
+    private buf:      Array<u8>;   // valid when `produced && ok`
+    private err:      IoError;     // valid when `produced && !ok`
+    private produced: boolean;
+    private ok:       boolean;
 }
 
 /// `run_fn` for a `PipeDrainJob`: the blocking drain, on a pool thread. A bare
@@ -769,7 +769,7 @@ type struct PipeDrainJob {
 /// `produced` is set last. Everything the collecting side reads is written
 /// before it, and the pool publishes the job's terminal status under its lock
 /// after this returns, which is what orders the two.
-function pipe_drain_job_run(raw: u8*) -> void {
+private function pipe_drain_job_run(raw: u8*) -> void {
     mut j: PipeDrainJob* = raw as PipeDrainJob*;
     mut pipe: BorrowedFileDescriptor = BorrowedFileDescriptor::new(j.fd);
     match (pipe.read_to_end(&j.buf)) {
@@ -781,7 +781,7 @@ function pipe_drain_job_run(raw: u8*) -> void {
 
 /// `drop_fn` for a `PipeDrainJob`: close this block's descriptor and free it,
 /// including any bytes nobody collected. Runs on whichever side let go last.
-function pipe_drain_job_free(raw: u8*) -> void {
+private function pipe_drain_job_free(raw: u8*) -> void {
     mut j: PipeDrainJob* = raw as PipeDrainJob*;
     if (j.fd >= 0) {
         fd::close_fd(j.fd);
@@ -819,18 +819,18 @@ function pipe_drain_job_free(raw: u8*) -> void {
 /// which would hang — a `PipeDrain` polled there drains inline and completes on
 /// that first poll. That blocks the polling thread, which is exactly what the
 /// spinning `future::block_on` driver already does.
-type struct PipeDrain {
-    fd:         i32;            // owned here until the job or `finish` takes it
-    buf:        Array<u8>;
+internal type struct PipeDrain {
+    private fd:         i32;            // owned here until the job or `finish` takes it
+    private buf:        Array<u8>;
     private rt: Reactor*;       // non-null while a registration is live
-    job:        PipeDrainJob*;  // non-null while a pool job is in flight
-    routed:     boolean;        // true once the first poll chose a route
-    on_reactor: boolean;        // which route that was
+    private job:        PipeDrainJob*;  // non-null while a pool job is in flight
+    private routed:     boolean;        // true once the first poll chose a route
+    private on_reactor: boolean;        // which route that was
 
     /// Begin draining `raw_fd`, which this future now owns. Nothing is read or
     /// submitted until the first poll, so a `PipeDrain` that is never awaited
     /// costs nothing beyond closing the descriptor.
-    static start(raw_fd: i32) -> PipeDrain {
+    internal static start(raw_fd: i32) -> PipeDrain {
         return PipeDrain {
             fd: raw_fd,
             buf: Array::new(),
