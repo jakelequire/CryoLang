@@ -24,6 +24,7 @@ import compiler::resolver::{ symbol_str, intern_table, qualified_name };
 import utils::log::{ Log, LogArea, LogLevel };
 import std::core::option::{ Option };
 import std::collections::hashmap::{ HashMap };
+import std::core::hash::{ DefaultHasher, Hasher };
 import std::fmt;
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::qualified_name::{ QualifiedName };
@@ -283,30 +284,20 @@ public:
     // variadic-ness, projection member/trait).  Nothing else participates in
     // identity.
 
-    /// Mix one 64-bit value into a structural hash (FNV-1a over its bytes).
-    hash_mix(&this, acc: u64, v: u64) -> u64 {
-        mut h: u64 = acc;
-        mut x: u64 = v;
-        for (mut i: i64 = 0; i < 8; i++) {
-            h = (h ^ (x & 255)) * 1099511628211;
-            x = x >> 8;
-        }
-        return h;
-    }
-
     /// Structural hash of a canonical type key.  Only ever a bucket selector -
     /// `entry_matches` decides identity, so a poor hash costs probes, never
     /// correctness.  The operand COUNT is mixed in so that `(a)` and `(a, a)`
     /// cannot land on the same key by accident.
     structural_hash(&this, kind: TypeKind, aux0: u64, aux1: u64, ops: &[TypeRef]) -> u64 {
-        mut h: u64 = 2166136261;
-        h = this.hash_mix(h, kind as u64);
-        h = this.hash_mix(h, aux0);
-        h = this.hash_mix(h, aux1);
+        mut hasher: DefaultHasher = DefaultHasher::new();
+        hasher.fold(kind as u64);
+        hasher.fold(aux0);
+        hasher.fold(aux1);
         for (mut i: i64 = 0; i < ops.length(); i++) {
-            h = this.hash_mix(h, ops[i].key());
+            hasher.fold(ops[i].key());
         }
-        return this.hash_mix(h, ops.length() as u64);
+        hasher.fold(ops.length() as u64);
+        return hasher.finish();
     }
 
     /// Exact comparison of a stored entry against a canonical key.

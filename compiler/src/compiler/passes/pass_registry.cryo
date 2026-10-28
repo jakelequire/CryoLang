@@ -73,6 +73,11 @@ import compiler::resolver::lang_item::{ LangModule, LangItem };
 import compiler::resolver::res::{ DefId, Res, ResBase };
 import compiler::ast::expression::{ ExpressionNode, MemberAccessExpr };
 import compiler::ast::pattern::{ Pattern };
+import std::thread;
+
+/// The stack the parser runs on: 64 MiB, reserved rather than committed, so
+/// the nesting limit trips long before the stack can run out.
+private const PARSER_STACK_BYTES: u64 = 64 << 20;
 
 
 // PassStats: Per-pass execution statistics
@@ -512,9 +517,15 @@ type struct PassRegistry {
             return PassResult::failure(1);
         }
 
-        // Create parser and parse
+        // The parser recurses once per level of nesting and refuses past its
+        // limit (E0111); a thread of its own gives that limit a stack many
+        // times what it needs, where the main thread's default stack is
+        // barely enough and runs out first when a parser frame grows.
         mut parser: Parser = Parser::from_context(ctx);
-        const root: ProgramNode* = parser.parse();
+        const parsing: thread::JoinHandle<ProgramNode*> = thread::Builder::new()
+            .stack_size(PARSER_STACK_BYTES)
+            .spawn::<Parser*, ProgramNode*>(&parser, (p: Parser*) -> ProgramNode* { return p.parse(); });
+        const root: ProgramNode* = parsing.join();
 
         if (root == null) {
             ctx.emit_error(ErrorCode::E0116_PARSE_EXCEPTION,

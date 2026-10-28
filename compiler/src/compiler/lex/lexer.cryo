@@ -341,7 +341,7 @@ private:
 
         while (!this.at_end() && this.peek() != quote) {
             if (this.peek() == '\\' && !this.at_end()) {
-                this.refuse_bad_octal_escape();
+                this.refuse_bad_escape(true);
                 this.advance(); // consume backslash
                 if (!this.at_end()) {
                     this.advance(); // consume escaped character
@@ -420,8 +420,9 @@ private:
 
             if (c == '\\') {
                 // A hole's own literals are lexed again with the hole and
-                // checked there.
-                if (depth == 0) { this.refuse_bad_octal_escape(); }
+                // checked there.  The `{` of a `\u{` opens a hole here, so
+                // no `\u` is a code point's escape in an f-string.
+                if (depth == 0) { this.refuse_bad_escape(false); }
                 this.advance(); // consume backslash
                 if (!this.at_end()) {
                     this.advance(); // consume escaped character
@@ -520,7 +521,7 @@ private:
 
         // Escape sequence
         if (this.peek() == '\\') {
-            if (this.refuse_bad_octal_escape()) {
+            if (this.refuse_bad_escape(true)) {
                 // Already reported: consume through the closing quote on this
                 // line so the rest is not also refused as a second
                 // character.
@@ -1032,37 +1033,52 @@ private:
     }
 
     /// With `current` on a literal's backslash, refuse a malformed octal
-    /// escape and return true; return false for anything else.  An octal
-    /// escape is one to three digits `0`-`7` spelling one byte, so `\8` and
-    /// `\9` name no escape, and a value past `\377` names no byte.  Either
-    /// would otherwise reach the escape pass, which keeps an unknown escape's
-    /// two characters and keeps only the low byte of a large value.
-    refuse_bad_octal_escape(&this) -> boolean {
+    /// escape or a `\u{...}` naming a surrogate and return true; return
+    /// false for anything else.  An octal escape is one to three digits
+    /// `0`-`7` spelling one byte, so `\8` and `\9` name no escape, and a
+    /// value past `\377` names no byte.  Either would otherwise reach the
+    /// escape pass, which keeps an unknown escape's two characters and keeps
+    /// only the low byte of a large value.  A surrogate, U+D800 to U+DFFF,
+    /// is no Unicode scalar value: no character holds one and UTF-8 has no
+    /// encoding of one.  `unicode_escapes` is false where `\u` spells no
+    /// code point.
+    refuse_bad_escape(&this, unicode_escapes: boolean) -> boolean {
         const first: char = this.peek_ahead(1);
-        mut ndig: i64 = 1;
+        mut width: i64 = 1;
+        mut code: ErrorCode = ErrorCode::E0013_BAD_OCTAL_ESCAPE;
         mut message: string = "";
         mut help: string = "";
-        if (first == '8' || first == '9') {
+        if (first == 'u') {
+            if (!unicode_escapes) { return false; }
+            mut body: i64 = 0;
+            const available: i64 = this.buffer_end as i64 - this.current as i64;
+            const value: i64 = Lexer::unicode_escape(this.current, 2, available, &body);
+            if (value < 0xD800 || value > 0xDFFF) { return false; }
+            width = 1 + body;
+            code = ErrorCode::E0006_INVALID_UNICODE;
+            message = "is a surrogate, not a character: U+D800 to U+DFFF are no Unicode scalar values";
+            help = "write a character above U+FFFF by its own code point (`\\u{1F600}`), not as a pair of surrogates";
+        } else if (first == '8' || first == '9') {
             message = "is not an escape: an octal escape's digits are `0` to `7`";
             help = "write the digit itself without a backslash, or a byte by its octal or hex value (`\\033` and `\\x1b` are both ESC)";
         } else {
             if (first < '0' || first > '7') { return false; }
-            const val: i64 = Lexer::octal_escape(this.current, 1, 4, &ndig);
+            const val: i64 = Lexer::octal_escape(this.current, 1, 4, &width);
             if (val <= u8::MAX as i64) { return false; }
             message = "is out of range: an octal escape is one byte, `\\0` to `\\377`";
             help = "write fewer digits; an escape ends after three, so `\\0123` is `\\012` and then `3`";
         }
         if (this.sink == null) { return true; }
-        const written: string = this.current.substr(0, 1 + ndig);
+        const written: string = this.current.substr(0, 1 + width);
         const span: SourceSpan = SourceSpan::new(
             this.path,
             this.current_location.line as u32,
             this.current_location.column as u32,
             this.current_location.line as u32,
-            (this.current_location.column + 1 + ndig as int) as u32
+            (this.current_location.column + 1 + width as int) as u32
         );
         mut diag: Diagnostic = Diagnostic::error(
-            ErrorCode::E0013_BAD_OCTAL_ESCAPE,
+            code,
             fmt::format("`%s` %s", written, message));
         diag = diag.at(span);
         diag = diag.help(help);
@@ -1147,7 +1163,7 @@ private:
                 buf.push_byte('\\' as u8);
                 buf.push_byte(esc as u8);
             } else if (esc == 'u') {
-                Lexer::encode_utf8(&buf, value);
+                buf.push_char(value as char);
             } else {
                 buf.push_byte(value as u8);
             }
@@ -1304,26 +1320,6 @@ private:
             if (marker == 'b' as u8) { return u128::parse_literal(digits, 2); }
         }
         return u128::parse_literal(text, 10);
-    }
-
-    /// Encode Unicode codepoint `cp` (assumed <= 0x10FFFF) as UTF-8, appending
-    /// its 1-4 bytes to `buf`.  Used by `process_escape_sequences` for `\u{HEX}`.
-    static encode_utf8(buf: mut &String, cp: i64) -> void {
-        if (cp <= 0x7F) {
-            buf.push_byte(cp as u8);
-        } else if (cp <= 0x7FF) {
-            buf.push_byte((0xC0 | (cp >> 6)) as u8);
-            buf.push_byte((0x80 | (cp & 0x3F)) as u8);
-        } else if (cp <= 0xFFFF) {
-            buf.push_byte((0xE0 | (cp >> 12)) as u8);
-            buf.push_byte((0x80 | ((cp >> 6) & 0x3F)) as u8);
-            buf.push_byte((0x80 | (cp & 0x3F)) as u8);
-        } else {
-            buf.push_byte((0xF0 | (cp >> 18)) as u8);
-            buf.push_byte((0x80 | ((cp >> 12) & 0x3F)) as u8);
-            buf.push_byte((0x80 | ((cp >> 6) & 0x3F)) as u8);
-            buf.push_byte((0x80 | (cp & 0x3F)) as u8);
-        }
     }
 }
 

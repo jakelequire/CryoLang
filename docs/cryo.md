@@ -196,11 +196,11 @@ Strings are enclosed in double quotes; characters in single quotes. Both share t
 | `\\` `\'` `\"` | the backslash or quote itself |
 | `\xHH` | the byte one or two hex digits spell |
 | `\OOO` | the byte one to three octal digits spell |
-| `\u{H...}` | the Unicode code point one or more hex digits spell, up to `10FFFF` |
+| `\u{H...}` | the Unicode scalar value one or more hex digits spell, up to `10FFFF` |
 
 An octal escape is one to three digits `0`-`7`, read as C reads them: the escape ends after three digits or at the first character that is not one, so `\0` is NUL, `"\033[1m"` is ESC and then `[1m`, `\177` is 127, and `"\0123"` is `\012` (newline) and then `3`. `\8` and `\9`, and an octal value above `\377`, are refused (`E0013`).
 
-In a string, `\u{...}` is the code point's UTF-8 bytes, so `"\u{e9}"` is the two bytes `C3 A9`; in a character it is the code point itself, so `'\u{42}'` is `'B'`. A `char` is 32 bits wide, so it holds every code point up to `10FFFF`: `'\u{1F600}'` is the code point U+1F600. A malformed `\u` (no braces, no digit, or past `10FFFF`), a `\x` with no hex digit, and an escape this table does not name (`\q`) are kept as written in a string; in a character, an escape the table does not name is the character after the backslash.
+In a string, `\u{...}` is the code point's UTF-8 bytes, so `"\u{e9}"` is the two bytes `C3 A9`; in a character it is the code point itself, so `'\u{42}'` is `'B'`. A `char` is 32 bits wide, so it holds every code point up to `10FFFF`: `'\u{1F600}'` is the code point U+1F600. A surrogate, `\u{D800}` to `\u{DFFF}`, is no scalar value - no character holds one and UTF-8 has no encoding of one - so it is refused in a string and in a character (`E0006`); a code point above `FFFF` is written whole, never as a pair of surrogates. A malformed `\u` (no braces, no digit, or past `10FFFF`), a `\x` with no hex digit, and an escape this table does not name (`\q`) are kept as written in a string; in a character, an escape the table does not name is the character after the backslash.
 
 A string literal keeps every byte it spells, a NUL among them: the constant the compiler emits for `"a\0b"` is `a`, NUL, `b` and the terminating NUL. A `string` is read up to its first NUL by what measures it, so `"a\0b".length()` is 1 while the bytes after the NUL are still there to be read through a pointer.
 

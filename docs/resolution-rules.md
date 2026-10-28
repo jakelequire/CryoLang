@@ -849,6 +849,33 @@ yet is recorded with the change that builds it, not here.
      highlighter use.  (Jake; the name and shape, and the refusals,
      delegated)
 
+648. **A surrogate escape is refused.**  `\u{D800}` to `\u{DFFF}` in a
+     string or a character literal is E0006: a surrogate is no Unicode
+     scalar value, so no `char` holds one and UTF-8 has no encoding of
+     one.  The lexer refuses it where it refuses a malformed octal escape,
+     so the escape decoder only ever meets a scalar value, and the
+     compiler encodes a string's `\u{...}` through `String.push_char`; its
+     own UTF-8 encoder is gone.  In an f-string the `{` after `\u` opens a
+     hole, so `\u` there spells no code point and is not checked.  (Jake;
+     the code and wording delegated)
+
+649. **The parser runs on a thread with a large stack.**  The parser
+     recurses once per level of nesting and refuses past its limit with
+     E0111; the limit and E0111 are unchanged.  It runs on a thread of its
+     own, made through `thread::Builder` with a 64 MiB stack, reserved
+     rather than committed, and the pass joins it before going on, so the
+     limit trips long before the stack runs out however large a parser
+     frame or a `Token` grows.  On the main thread's default stack it did
+     not: eight more bytes in `Token` overflowed the stack on a 400-deep
+     expression before E0111 could be reported.  (Jake; the stack size
+     delegated)
+
+650. **The type arena hashes through `DefaultHasher`.**  A canonical type
+     key's bucket is chosen by folding the kind, the two scalar
+     discriminators, each operand and the operand count into a
+     `DefaultHasher`; the arena's own FNV-1a mix is gone.  The hash only
+     selects a bucket - entry comparison decides identity.  (Jake)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that
