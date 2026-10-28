@@ -746,6 +746,21 @@ yet is recorded with the change that builds it, not here.
      serializer bounds its recursion by it.  (Jake; the constant's
      placement delegated)
 
+640. **The test runner spawns through `Command`.**  It re-executes the
+     test binary with `Command` on every target; POSIX captures through a
+     pipe with stderr merged into stdout and keeps the child's own
+     watchdog, and Windows captures into a temp file opened sharing read,
+     write and deletion and enforces the timeout with
+     `Child.wait_timeout`.  `wait_timeout(duration)` answers
+     `Ok(Some(status))` once the child has exited and `Ok(None)` when the
+     time is up, leaving it running.  `Stdio::SameAsStdout` sends stderr
+     wherever stdout goes and is refused, `InvalidInput`, on stdin or
+     stdout.  `OpenOptions.share(read, write, deletion)` is enforced on
+     Windows only, defaulting to read and write sharing; the parameter
+     is `deletion` because `delete` is a keyword.  `ExitStatus`'s fields
+     are private behind its accessors, and `decode_wstatus` is private
+     to POSIX.  (Jake; the variant's and the parameter's names delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

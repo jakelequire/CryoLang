@@ -2,7 +2,8 @@
 ///!
 ///! Produced by `Command::spawn`. Holds the pid and any pipe ends
 ///! the caller asked for. `wait` blocks until the child exits;
-///! `join` is its async spelling; `try_wait` polls; `kill` sends
+///! `join` is its async spelling; `try_wait` polls; `wait_timeout`
+///! waits at most a given time; `kill` sends
 ///! SIGKILL; `send_signal` sends any other. `ChildStdin` /
 ///! `ChildStdout` / `ChildStderr` implement `Write` / `Read` over a fd.
 ///!
@@ -39,7 +40,11 @@ import std::core::slice::{ Slice };
 import std::core::drop::{ Drop };
 import std::core::ptr::{ NonNull };
 import std::core::mem;
+import std::core::cmp::{ min };
 import std::collections::array::{ Array };
+import std::time::duration::{ Duration };
+import std::time::clock;
+import std::time::clock::{ Instant };
 import std::alloc::layout::{ Layout };
 import std::alloc::allocator::{ GlobalAlloc };
 import std::io::error::{ IoError, IoErrorKind };
@@ -132,6 +137,44 @@ private function os_proc_try_wait(pid: i32, handle: u64) -> Result<Option<ExitSt
 private function os_proc_try_wait(pid: i32, handle: u64) -> Result<Option<ExitStatus>, IoError> {
     const h: u8* = handle as u8*;
     const waited: u32 = syscall::WaitForSingleObject(h, 0);
+    if (waited == 0x102) {   // WAIT_TIMEOUT
+        return Result::Ok(Option::None);
+    }
+    if (waited == 0xFFFFFFFF) {   // WAIT_FAILED
+        return Result::Err(IoError::last_os_error());
+    }
+    mut code: u32 = 0;
+    if (syscall::GetExitCodeProcess(h, &code) == 0) {
+        return Result::Err(IoError::last_os_error());
+    }
+    return Result::Ok(Option::Some(ExitStatus { code: code as i32, signal: 0, signaled: false }));
+}
+
+// POSIX has no timed waitpid, so the wait polls `WNOHANG`, pausing between
+// tries for 1 ms at first and doubling up to 50 ms: a short-lived child is
+// seen promptly and a long-lived one costs few wakeups.
+![target(unix)]
+private function os_proc_wait_timeout(pid: i32, handle: u64, timeout: Duration) -> Result<Option<ExitStatus>, IoError> {
+    const started: Instant = Instant::now();
+    const longest_pause: Duration = Duration::from_millis(50);
+    mut pause: Duration = Duration::from_millis(1);
+    loop {
+        match (os_proc_try_wait(pid, handle)?) {
+            Option::Some(status) => { return Result::Ok(Option::Some(status)); }
+            Option::None         => { }
+        }
+        const remaining: Duration = timeout.saturating_sub(&started.elapsed());
+        if (remaining.is_zero()) { return Result::Ok(Option::None); }
+        clock::sleep(min(pause, remaining));
+        pause = min(pause.scale(2), longest_pause);
+    }
+}
+![target(windows)]
+private function os_proc_wait_timeout(pid: i32, handle: u64, timeout: Duration) -> Result<Option<ExitStatus>, IoError> {
+    const h: u8* = handle as u8*;
+    // INFINITE is 0xFFFFFFFF, so the longest finite wait is one below it.
+    const milliseconds: u32 = min(timeout.as_millis_ceil(), 0xFFFFFFFE) as u32;
+    const waited: u32 = syscall::WaitForSingleObject(h, milliseconds);
     if (waited == 0x102) {   // WAIT_TIMEOUT
         return Result::Ok(Option::None);
     }
@@ -253,9 +296,9 @@ private function os_proc_close_dup(handle: u64) -> void {
 /// a code, or it was killed by a signal. POSIX encodes both into a
 /// single `wstatus` word; `ExitStatus` is the decoded form.
 public type struct ExitStatus {
-    code: i32;
-    signal: i32;
-    signaled: boolean;
+    private code: i32;
+    private signal: i32;
+    private signaled: boolean;
 
     /// Convenience: did the child exit with status 0?
     public success(&this) -> boolean {
@@ -279,7 +322,8 @@ public type struct ExitStatus {
 /// Decode a POSIX `wstatus` word. The low 7 bits are the terminating
 /// signal (or 0 for normal exit); bits 8..15 are the exit code when
 /// bits 0..6 are zero.
-function decode_wstatus(wstatus: i32) -> ExitStatus {
+![target(unix)]
+private function decode_wstatus(wstatus: i32) -> ExitStatus {
     const termsig: i32 = wstatus & 0x7F;
     if (termsig == 0) {
         // Normal exit.
@@ -454,6 +498,24 @@ public:
     /// exited; `Ok(None)` means it's still running.
     try_wait(mut &this) -> Result<Option<ExitStatus>, IoError> {
         const r: Result<Option<ExitStatus>, IoError> = os_proc_try_wait(this.pid, this.handle);
+        match (r) {
+            Result::Ok(opt) => {
+                match (opt) {
+                    Option::Some(_) => { this.waited = true; }
+                    Option::None    => { }
+                }
+            }
+            Result::Err(_) => { }
+        }
+        return r;
+    }
+
+    /// Wait at most `timeout` for the child to exit.  `Ok(Some(status))`
+    /// means it exited; `Ok(None)` means it is still running when the time
+    /// is up, and is left running.  Like `wait`, it closes stdin first.
+    wait_timeout(mut &this, timeout: Duration) -> Result<Option<ExitStatus>, IoError> {
+        this.close_stdin();
+        const r: Result<Option<ExitStatus>, IoError> = os_proc_wait_timeout(this.pid, this.handle, timeout);
         match (r) {
             Result::Ok(opt) => {
                 match (opt) {

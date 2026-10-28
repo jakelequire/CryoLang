@@ -23,6 +23,7 @@ import std::process::child::{ Child, ChildStdout, ExitStatus };
 import std::fs::path::{ Path };
 import std::fs::file::{ File };
 import std::fs::dir::{ remove_file };
+import std::time::duration::{ Duration };
 import std::test::error::{ TestError };
 import std::test::assert::{ bail, expect, expect_eq, expect_false };
 
@@ -457,4 +458,110 @@ function output_large_stderr_no_deadlock_win() -> Result<(), TestError> {
         Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
     }
     return expect(got_stdout, Str::new("stdout 'done' terminator must be captured"));
+}
+
+// A child that keeps running for about five seconds, writing nothing.
+![target(unix)]
+function cmd_sleep() -> Command {
+    mut c: Command = Command::new(Str::new("/bin/sleep"));
+    c.arg(Str::new("5"));
+    return c;
+}
+![target(windows)]
+function cmd_sleep() -> Command {
+    mut c: Command = Command::new(Str::new("ping"));
+    c.arg(Str::new("-n")); c.arg(Str::new("6")); c.arg(Str::new("127.0.0.1"));
+    c.stdout(Stdio::Null);
+    return c;
+}
+
+// A child that writes "out" to stdout and then "err" to stderr.
+![target(unix)]
+function cmd_both_streams() -> Command {
+    mut c: Command = Command::new(Str::new("/bin/sh"));
+    c.arg(Str::new("-c")); c.arg(Str::new("echo out; echo err 1>&2"));
+    return c;
+}
+![target(windows)]
+function cmd_both_streams() -> Command {
+    mut c: Command = Command::new(Str::new("cmd"));
+    c.arg(Str::new("/c")); c.arg(Str::new("echo out& echo err 1>&2"));
+    return c;
+}
+
+![test]
+function wait_timeout_leaves_a_running_child_running() -> Result<(), TestError> {
+    mut cmd: Command = cmd_sleep();
+    match (cmd.spawn()) {
+        Result::Ok(handle) => {
+            mut c: Child = handle;
+            mut still_running: boolean = false;
+            match (c.wait_timeout(Duration::from_millis(100))) {
+                Result::Ok(finished) => { still_running = finished.is_none(); }
+                Result::Err(_) => { return bail(Str::new("wait_timeout failed")); }
+            }
+            mem::drop(c.kill());
+            mem::drop(c.wait());
+            return expect(still_running, Str::new("a sleeping child must still be running after 100 ms"));
+        }
+        Result::Err(_) => { return bail(Str::new("spawn of the sleeping child failed")); }
+    }
+}
+
+![test]
+function wait_timeout_reports_an_exited_child() -> Result<(), TestError> {
+    mut cmd: Command = cmd_true();
+    match (cmd.spawn()) {
+        Result::Ok(handle) => {
+            mut c: Child = handle;
+            match (c.wait_timeout(Duration::from_secs(30))) {
+                Result::Ok(finished) => {
+                    match (finished) {
+                        Option::Some(status) => {
+                            return expect(status.success(), Str::new("true must exit 0"));
+                        }
+                        Option::None => { return bail(Str::new("true still running after 30 s")); }
+                    }
+                }
+                Result::Err(_) => { return bail(Str::new("wait_timeout failed")); }
+            }
+        }
+        Result::Err(_) => { return bail(Str::new("spawn of true failed")); }
+    }
+}
+
+![test]
+function stderr_same_as_stdout_lands_in_the_stdout_pipe() -> Result<(), TestError> {
+    mut cmd: Command = cmd_both_streams();
+    cmd.stdout(Stdio::Piped);
+    cmd.stderr(Stdio::SameAsStdout);
+    mut bytes: Array<u8> = Array::new();
+    match (cmd.spawn()) {
+        Result::Ok(handle) => {
+            mut c: Child = handle;
+            expect(c.stderr.is_none(), Str::new("a merged stderr has no pipe of its own"))?;
+            mem::drop(c.stdout.unwrap_ptr().read_to_end(&bytes));
+            mem::drop(c.wait());
+        }
+        Result::Err(_) => { return bail(Str::new("spawn of the two-stream child failed")); }
+    }
+    const text: Str = Str::from_raw(bytes.as_ptr(), bytes.length() as u64);
+    expect(text.contains(&Str::new("out")), Str::new("stdout's line must be captured"))?;
+    return expect(text.contains(&Str::new("err")), Str::new("stderr's line must be captured with it"));
+}
+
+![test]
+function same_as_stdout_is_refused_for_stdout() -> Result<(), TestError> {
+    mut cmd: Command = cmd_true();
+    cmd.stdout(Stdio::SameAsStdout);
+    match (cmd.spawn()) {
+        Result::Ok(handle) => {
+            mut c: Child = handle;
+            mem::drop(c.wait());
+            return bail(Str::new("stdout cannot be the same as itself"));
+        }
+        Result::Err(e) => {
+            return expect(e.kind == IoErrorKind::InvalidInput, Str::new("refused with InvalidInput"));
+        }
+    }
 }

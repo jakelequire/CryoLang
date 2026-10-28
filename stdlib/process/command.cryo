@@ -92,6 +92,10 @@ public type enum Stdio {
     /// Use a specific fd. Ownership transfers; the spawn closes
     /// the fd in the parent after duping it into the child.
     Fd(i32);
+    /// Stderr only: write to wherever the child's stdout goes, so a
+    /// `Piped` stdout captures both streams, interleaved as written.
+    /// Spawning with it on stdin or stdout fails with `InvalidInput`.
+    SameAsStdout;
 }
 
 private type struct EnvEntry {
@@ -162,6 +166,16 @@ public type struct Command {
     /// fork + configure fds/env + execvp. Returns a `Child` the
     /// caller must eventually `wait` on.
     public spawn(&this) -> Result<Child, IoError> {
+        const misplaced: boolean = match (this.stdin_cfg) {
+            Stdio::SameAsStdout => { true }
+            _                   => { false }
+        } || match (this.stdout_cfg) {
+            Stdio::SameAsStdout => { true }
+            _                   => { false }
+        };
+        if (misplaced) {
+            return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
+        }
         return spawn_impl(this);
     }
 
@@ -427,6 +441,9 @@ private function child_remap(setting: Stdio, pipe: &PipePair, target_fd: i32,
             fd::close_fd(raw);
             return true;
         }
+        // Stdout is remapped before stderr, so fd 1 already names the
+        // child's stdout here.
+        Stdio::SameAsStdout => { return libc::dup2(1, target_fd) >= 0; }
     }
 }
 
@@ -1158,7 +1175,14 @@ private function win_setup_stdio(setting: Stdio, std_id: u32, is_input: boolean)
 private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
     const sin:  WinStdio = win_setup_stdio(cmd.stdin_cfg,  syscall::STD_INPUT_HANDLE,  true)?;
     const sout: WinStdio = win_setup_stdio(cmd.stdout_cfg, syscall::STD_OUTPUT_HANDLE, false)?;
-    const serr: WinStdio = win_setup_stdio(cmd.stderr_cfg, syscall::STD_ERROR_HANDLE,  false)?;
+    // A merged stderr is handed the handle stdout's wiring already made;
+    // that wiring owns it, so there is nothing more to close or wrap.
+    const serr: WinStdio = match (cmd.stderr_cfg) {
+        Stdio::SameAsStdout => {
+            WinStdio { child_handle: sout.child_handle, parent_fd: -1, extra_close: null, close_fd: -1 }
+        }
+        _ => { win_setup_stdio(cmd.stderr_cfg, syscall::STD_ERROR_HANDLE, false)? }
+    };
 
     mut cmdline: String = build_cmdline(cmd);
 

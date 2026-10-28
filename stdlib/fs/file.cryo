@@ -22,6 +22,7 @@ import std::collections::string::{ String };
 import std::collections::str::{ Str };
 import std::collections::array::{ Array };
 import std::ffi::libc;
+import std::sys::syscall;
 import std::fs::path::{ Path };
 import std::fs::metadata::{ Metadata, metadata };
 import std::core::mem;
@@ -41,6 +42,9 @@ public type struct OpenOptions {
     private truncate: boolean;
     private create: boolean;
     private create_new: boolean;
+    private share_read: boolean;
+    private share_write: boolean;
+    private share_delete: boolean;
 
     public static new() -> OpenOptions {
         return OpenOptions {
@@ -49,8 +53,22 @@ public type struct OpenOptions {
             append: false,
             truncate: false,
             create: false,
-            create_new: false
+            create_new: false,
+            share_read: true,
+            share_write: true,
+            share_delete: false
         };
+    }
+
+    /// What other opens of the same file may do while this one is open:
+    /// read it, write it, or delete or rename it.  The default shares
+    /// reading and writing but not deleting.  Only Windows enforces sharing;
+    /// elsewhere this does nothing.
+    public share(mut &this, read: boolean, write: boolean, deletion: boolean) -> OpenOptions {
+        this.share_read = read;
+        this.share_write = write;
+        this.share_delete = deletion;
+        return this;
     }
 
     public read(mut &this, value: boolean) -> OpenOptions {
@@ -87,11 +105,11 @@ public type struct OpenOptions {
         return File::open_with(p, this);
     }
 
-    /// Flatten the options into the platform `open`/`_open` flags bitmask.
-    /// The actual flag *values* are OS-specific (glibc and MSVCRT disagree
-    /// on `O_CREAT`/`O_TRUNC`/`O_APPEND`/`O_EXCL`), so the bit assembly
-    /// lives in the per-OS `open_flags_for` helpers below; a method body
-    /// can't be `![target(...)]`-gated, but a free function can.
+    /// Flatten the options into the platform's descriptor flags: POSIX
+    /// `open`'s, or on Windows `_open_osfhandle`'s.  The flags and their
+    /// values are OS-specific, so the bit assembly lives in the per-OS
+    /// `open_flags_for` helpers below; a method body can't be
+    /// `![target(...)]`-gated, but a free function can.
     private to_flags(&this) -> i32 {
         return open_flags_for(this);
     }
@@ -115,24 +133,58 @@ private function open_flags_for(o: &OpenOptions) -> i32 {
     return flags;
 }
 
-// MSVCRT `_open` flags. `ffi::libc`'s `O_*` constants are per-target, so
-// the same names carry the CRT's own bit layout here. `O_BINARY` is OR'd
-// in so the CRT does NOT do CRLF translation (text mode would corrupt
-// binary writes), and `O_NOINHERIT` is the close-on-exec analog (the
-// handle is not inherited by child processes).
+// The CRT's `_open` cannot ask for delete sharing, so Windows opens through
+// `CreateFileA` and wraps the HANDLE in a CRT descriptor; these are the
+// flags `_open_osfhandle` takes for that.  Without `_O_TEXT` the descriptor
+// is binary, so the CRT does no CRLF translation.
 ![target(windows)]
 private function open_flags_for(o: &OpenOptions) -> i32 {
     mut flags: i32 = 0;
-    if (o.read && o.write) { flags = libc::O_RDWR; }
-    else if (o.write) { flags = libc::O_WRONLY; }
-    else { flags = libc::O_RDONLY; }
+    if (!o.write) { flags = libc::O_RDONLY; }
     if (o.append) { flags = flags | libc::O_APPEND; }
-    if (o.truncate) { flags = flags | libc::O_TRUNC; }
-    if (o.create) { flags = flags | libc::O_CREAT; }
-    if (o.create_new) { flags = flags | libc::O_CREAT | libc::O_EXCL; }
-    flags = flags | libc::O_BINARY;
-    flags = flags | libc::O_NOINHERIT;
     return flags;
+}
+
+![target(unix)]
+private function open_descriptor(c_path: &String, options: &OpenOptions) -> Result<i32, IoError> {
+    const raw_fd: i32 = libc::open(c_path.as_ptr(), options.to_flags(), DEFAULT_CREATE_MODE);
+    if (raw_fd < 0) {
+        return Result::Err(IoError::from_errno(libc::errno()));
+    }
+    return Result::Ok(raw_fd);
+}
+
+// Access and creation follow the POSIX flags: reading unless only writing
+// was asked for, and `create`, `truncate` and `create_new` choose the same
+// dispositions `O_CREAT`, `O_TRUNC` and `O_EXCL` would.  The handle is not
+// inheritable, the analog of close-on-exec.
+![target(windows)]
+private function open_descriptor(c_path: &String, options: &OpenOptions) -> Result<i32, IoError> {
+    mut access: u32 = 0;
+    if (options.read || !options.write) { access = access | syscall::GENERIC_READ; }
+    if (options.write) { access = access | syscall::GENERIC_WRITE; }
+    mut share: u32 = 0;
+    if (options.share_read)   { share = share | syscall::FILE_SHARE_READ; }
+    if (options.share_write)  { share = share | syscall::FILE_SHARE_WRITE; }
+    if (options.share_delete) { share = share | syscall::FILE_SHARE_DELETE; }
+    mut disposition: u32 = syscall::OPEN_EXISTING;
+    if (options.create_new) { disposition = syscall::CREATE_NEW; }
+    else if (options.create && options.truncate) { disposition = syscall::CREATE_ALWAYS; }
+    else if (options.create) { disposition = syscall::OPEN_ALWAYS; }
+    else if (options.truncate) { disposition = syscall::TRUNCATE_EXISTING; }
+    const handle: u8* = syscall::CreateFileA(c_path.as_ptr(), access, share, null,
+        disposition, syscall::FILE_ATTRIBUTE_NORMAL, null);
+    // INVALID_HANDLE_VALUE, compared as a local -1.
+    if ((handle as i64) == -1) {
+        return Result::Err(IoError::last_os_error());
+    }
+    const raw_fd: i32 = libc::_open_osfhandle(handle as i64, options.to_flags());
+    if (raw_fd < 0) {
+        const failure: IoError = IoError::from_errno(libc::errno());
+        syscall::CloseHandle(handle);
+        return Result::Err(failure);
+    }
+    return Result::Ok(raw_fd);
 }
 
 public type struct File {
@@ -155,11 +207,7 @@ public type struct File {
 
     public static open_with(p: Path, options: &OpenOptions) -> Result<File, IoError> {
         mut c_path: String = String::with_null(p.as_str());
-        const raw_fd: i32 = libc::open(c_path.as_ptr(), options.to_flags(), DEFAULT_CREATE_MODE);
-        if (raw_fd < 0) {
-            return Result::Err(IoError::from_errno(libc::errno()));
-        }
-        return Result::Ok(File { fd: raw_fd });
+        return Result::Ok(File { fd: open_descriptor(&c_path, options)? });
     }
 
     /// Hand the descriptor over to the caller, who must close it, and leave

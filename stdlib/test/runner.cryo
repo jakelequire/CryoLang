@@ -1,8 +1,8 @@
-///! Test runner: fork-per-test driver.
+///! Test runner: process-per-test driver.
 ///!
 ///! `run_all` is the entry point the compiler-synthesized test main
 ///! calls with the descriptor table built from every `![test]` function
-///! in the project. Each test runs in its own forked child so a panic
+///! in the project. Each test runs in its own child process so a panic
 ///! or `Err` return in one test cannot take down the rest of the suite.
 ///!
 ///! Output is one line per test, human-readable; the trailing summary reports
@@ -33,8 +33,9 @@
 ///!   --show-output  Also print captured output for tests that pass, not
 ///!                  just failures. No effect with `--nocapture`.
 ///!   --timeout=N    Per-test wall-clock limit in seconds (default 60).
-///!                  A test exceeding it is killed (SIGALRM in the child)
-///!                  and reported as a timeout failure. `--timeout=0`
+///!                  A test exceeding it is killed (by SIGALRM in the
+///!                  child on POSIX, by the runner on Windows) and
+///!                  reported as a timeout failure. `--timeout=0`
 ///!                  disables the watchdog. Also set via the
 ///!                  `CRYO_TEST_TIMEOUT` environment variable.
 ///!
@@ -56,14 +57,18 @@ import std::collections::array::{ Array };
 import std::collections::pair::{ Pair };
 import std::env;
 import std::io::error;
-import std::io::fd::{ BorrowedFileDescriptor };
 import std::io::traits::{ Read };
 import std::io::stdio::{ is_tty, Stderr, stderr };
 import std::fmt::display;
 import std::ffi::libc;
 import std::sys::syscall::{ SYSTEM_INFO_PARTIAL };
-import std::process::child::{ ExitStatus, decode_wstatus };
-import std::process::command;
+import std::process;
+import std::process::child::{ Child, ExitStatus };
+import std::process::command::{ Command, Stdio };
+import std::fs::dir;
+import std::fs::file::{ File, OpenOptions };
+import std::fs::path::{ Path };
+import std::time::duration::{ Duration };
 import std::sync::atomic::{ Atomic, MemoryOrder };
 import std::sync::mpsc::{ TryRecvError };
 import std::thread;
@@ -216,12 +221,13 @@ private type enum TestOutcome {
     /// `![should_panic]` was set but the test exited 0; that is itself
     /// a failure.
     DidNotPanic;
-    /// The test exceeded the per-test wall-clock limit and was killed by
-    /// the `alarm()` watchdog (SIGALRM). Always a failure, even under
-    /// `![should_panic]`. Carries the configured limit in seconds.
+    /// The test exceeded the per-test wall-clock limit and was killed: by
+    /// its own `alarm()` watchdog (SIGALRM) on POSIX, by the runner on
+    /// Windows. Always a failure, even under `![should_panic]`. Carries the
+    /// configured limit in seconds.
     Timeout(u32);
-    /// Couldn't `fork()` or `waitpid()`; runner-internal error.
-    RunnerError(i32);            // errno
+    /// Couldn't spawn or wait for the child; runner-internal error.
+    RunnerError(i32);            // the OS error code, 0 when there is none
 }
 
 // TestRun: a finished test's outcome plus any captured output
@@ -591,121 +597,64 @@ private function name_matches(name: Str, opts: &RunOptions) -> boolean {
 ///
 /// `idx` is the test's position in `descriptors`: the child re-execs the
 /// test binary with `--test-runner-child=<idx>` so it runs exactly that
-/// one test (`run_child_single`).  Both platforms use the re-exec model -
-/// POSIX `fork`+`execv`, Windows `CreateProcess` - so `run_one` is safe to
-/// call concurrently from worker threads: the child only `execv`s (an
-/// async-signal-safe op) and never touches the forking thread's heap, so
-/// there is no malloc-lock-at-fork deadlock.
-![target(unix)]
+/// one test (`run_child_single`).  The spawn is `Command`'s, whose POSIX
+/// child only remaps descriptors and execs, so `run_one` is safe to call
+/// concurrently from worker threads.
 private function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
                  capture: boolean) -> TestRun {
-    // Drain libc-buffered stdio in the parent before fork so the child
-    // doesn't inherit a half-full FILE buffer and re-emit it on flush.
+    // Drain libc-buffered stdio first, so what the runner already printed
+    // reaches the terminal ahead of anything the child writes.
     libc::fflush(null);
 
-    // Resolve this executable's path so the child can re-exec it. All of
-    // the allocation below happens in the PARENT, before fork; the child
-    // path stays async-signal-safe (dup2/close/execv + _exit only).
-    mut exe_buf: [u8; 4096];
-    mut exe_path: String = String::with_null(Str::new("/proc/self/exe"));
-    const exe_n: i64 = libc::readlink(exe_path.as_ptr(), &exe_buf[0], 4095);
-    mem::drop(exe_path);
-    if (exe_n <= 0) {
-        return TestRun::bare(TestOutcome::RunnerError(libc::errno()));
+    const exe: Option<String> = env::current_exe();
+    if (exe.is_none()) {
+        return TestRun::bare(TestOutcome::RunnerError(0));
     }
-    exe_buf[exe_n as u64] = 0; // readlink does not NUL-terminate.
-
-    // `--timeout=<n>`: propagated so the re-exec'd child arms its own
-    // SIGALRM watchdog (the POSIX child times itself out; the parent just
-    // blocks in waitpid and classifies a SIGALRM kill as a timeout).
+    mut command: Command = Command::new(exe.unwrap().as_str());
+    // `--timeout=<n>`: a POSIX child arms its own watchdog with it.
     mut timeout_arg: String = String::new();
     timeout_arg.push(Str::new("--timeout="));
     timeout_arg.push(timeout_secs as u64);
-    timeout_arg.push_byte(0);
-
+    command.arg(timeout_arg.as_str());
     // `--test-runner-child=<idx>`: selects the single test to run.
     mut child_arg: String = String::new();
     child_arg.push(Str::new("--test-runner-child="));
     child_arg.push(idx);
-    child_arg.push_byte(0);
+    command.arg(child_arg.as_str());
+    return run_child(d, idx, &command, timeout_secs, capture);
+}
 
-    mut argv: command::ArgvBuf = command::ArgvBuf::new();
-    match (argv.push(&exe_buf[0]))         { Result::Ok(_) => { } Result::Err(_) => { } }
-    match (argv.push(timeout_arg.as_ptr())) { Result::Ok(_) => { } Result::Err(_) => { } }
-    match (argv.push(child_arg.as_ptr()))   { Result::Ok(_) => { } Result::Err(_) => { } }
-    match (argv.push(null))                 { Result::Ok(_) => { } Result::Err(_) => { } }
-
-    // Capture pipe: the child's stdout+stderr go to the write end, the parent
-    // drains the read end. Created in the parent before fork; a pipe() failure
-    // falls back to inherited stdio (rd/wr stay -1, captured stays empty).
-    mut rd: i32 = -1;
-    mut wr: i32 = -1;
+/// POSIX: the child's stdout and stderr share one pipe, drained to EOF
+/// before the child is reaped, so the wait never meets a child blocked on
+/// a full pipe.  The child's own SIGALRM watchdog ends a hung test, which
+/// closes the pipe, and `classify_outcome` reads the signal as a timeout.
+![target(unix)]
+private function run_child(d: TestDescriptor, idx: u64, command: mut &Command,
+                           timeout_secs: u32, capture: boolean) -> TestRun {
     if (capture) {
-        mut fds: [i32; 2];
-        if (libc::pipe(&fds[0]) == 0) {
-            rd = fds[0];
-            wr = fds[1];
-        }
+        command.stdout(Stdio::Piped);
+        command.stderr(Stdio::SameAsStdout);
     }
-
-    const pid: i32 = libc::fork();
-    if (pid < 0) {
-        const e: i32 = libc::errno();
-        if (rd >= 0) { libc::close(rd); }
-        if (wr >= 0) { libc::close(wr); }
-        mem::drop(argv); mem::drop(child_arg); mem::drop(timeout_arg);
-        return TestRun::bare(TestOutcome::RunnerError(e));
-    }
-
-    if (pid == 0) {
-        // Child: async-signal-safe only. Point stdout+stderr at the pipe's
-        // write end (dup2/close are signal-safe), then re-exec the test binary
-        // to run exactly this test; `_exit(127)` if exec fails (parent reads it
-        // as the standard "exec not found" code).
-        if (wr >= 0) {
-            libc::dup2(wr, 1);
-            libc::dup2(wr, 2);
-            libc::close(rd);
-            libc::close(wr);
-        }
-        libc::execv(&exe_buf[0], argv.as_ptr());
-        libc::_exit(127);
-    }
-
-    // Parent: close the write end so the read end sees EOF when the child
-    // exits, then drain fully BEFORE reaping (the active read keeps the pipe
-    // from backing up, so waitpid never deadlocks against a full buffer).
+    mut child: Child = match (command.spawn()) {
+        Result::Ok(spawned) => { spawned }
+        Result::Err(e) => { return TestRun::bare(TestOutcome::RunnerError(e.os_code)); }
+    };
     mut captured: String = String::new();
-    if (wr >= 0) { libc::close(wr); wr = -1; }
-    if (rd >= 0) {
+    if (child.stdout.is_some()) {
         // A hard read error stops the drain and keeps what already arrived.
         mut bytes: Array<u8> = Array::new();
-        mut pipe: BorrowedFileDescriptor = BorrowedFileDescriptor::new(rd);
-        mem::drop(pipe.read_to_end(&bytes));
+        mem::drop(child.stdout.unwrap_ptr().read_to_end(&bytes));
         captured.push(Str::from_raw(bytes.as_ptr(), bytes.length() as u64));
-        libc::close(rd);
-        rd = -1;
     }
-
-    // Wait for the child, retrying on EINTR.
-    mut status: i32 = 0;
-    loop {
-        const rc: i32 = libc::waitpid(pid, &status, 0);
-        if (rc >= 0) { break; }
-        const err: i32 = libc::errno();
-        if (err != libc::EINTR) {
-            mem::drop(argv); mem::drop(child_arg); mem::drop(timeout_arg);
-            return TestRun { outcome: TestOutcome::RunnerError(err), captured: captured };
+    match (child.wait()) {
+        Result::Ok(status) => {
+            const outcome: TestOutcome = classify_outcome(status, d.should_panic, timeout_secs);
+            return TestRun { outcome: outcome, captured: captured };
+        }
+        Result::Err(e) => {
+            return TestRun { outcome: TestOutcome::RunnerError(e.os_code), captured: captured };
         }
     }
-
-    mem::drop(argv);
-    mem::drop(child_arg);
-    mem::drop(timeout_arg);
-
-    const exit_status: ExitStatus = decode_wstatus(status);
-    const outcome: TestOutcome = classify_outcome(exit_status, d.should_panic, timeout_secs);
-    return TestRun { outcome: outcome, captured: captured };
 }
 
 /// Arm the per-test watchdog in a re-exec'd child. SIGALRM's default
@@ -753,188 +702,100 @@ private function run_child_single(idx: u64, descriptors: TestDescriptor*, count:
     }
 }
 
-/// Windows: read a finished capture temp file's full contents into `out`.
-/// The write handle must already be closed so the data is flushed and the
-/// open doesn't hit a sharing violation.
+/// Windows: capture goes to a per-test temp file rather than a pipe.  A file
+/// never fills, so the child cannot block on its output while the parent
+/// waits out the timeout, which is enforced here with `wait_timeout`: a
+/// Windows child has no watchdog of its own.  Without capture the child
+/// inherits stdio, so its output reaches the console live.
+///
+/// The file is named from (pid, test index), unique by construction, rather
+/// than by `GetTempFileNameA`, which probes a 16-bit name space: leaked
+/// capture files from killed runs fill that space, and once it saturates
+/// every name costs a scan of the whole directory.  A leaked file here is
+/// overwritten by a later run with the same pid instead.
+///
+/// Every open of the file shares delete: each in-flight capture file is
+/// inherited by every child spawned meanwhile, so a sibling may still hold
+/// it when this test is done, and removing it without delete sharing would
+/// fail and leak it into the temp directory.
 ![target(windows)]
-private function read_capture_file(path: &String, out: mut &String) -> void {
-    // Delete sharing here too: this handle is open across the sibling tests'
-    // spawns, so without it their `DeleteFileA` calls fail and leak. See the
-    // capture-file creation in `run_one` for the full story.
-    const h: u8* = syscall::CreateFileA(path.as_ptr(), syscall::GENERIC_READ,
-        syscall::FILE_SHARE_READ | syscall::FILE_SHARE_WRITE
-            | syscall::FILE_SHARE_DELETE, null,
-        syscall::OPEN_EXISTING, 0, null);
-    if ((h as i64) == -1) { return; }   // local -1, not the cross-module const
-    mut buf: [u8; 4096];
-    loop {
-        mut nread: u32 = 0;
-        const ok: i32 = syscall::ReadFile(h, &buf[0], 4096, &nread, null);
-        if (ok == 0) { break; }          // read error
-        if (nread == 0) { break; }    // EOF
-        out.push(Str::from_raw(&buf[0], nread as u64));
-    }
-    syscall::CloseHandle(h);
-}
-
-/// Windows: run one test in a fresh process.  No `fork`, so re-exec the test
-/// binary (GetModuleFileNameA) with `--test-runner-child=<idx>`, wait with the
-/// per-test timeout, and classify the exit code.  With `capture`, the child's
-/// stdout+stderr are redirected to a per-test temp file (a file can't deadlock
-/// on a full pipe buffer, so the parent's WaitForSingleObject timeout stays
-/// intact); the file is read back after the child exits.  Without `capture`
-/// stdio is inherited so output reaches the console live.  The timeout is
-/// enforced here in the parent rather than by an in-child watchdog.
-![target(windows)]
-private function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
-                 capture: boolean) -> TestRun {
-    libc::fflush(null);
-
-    mut exe_buf: [u8; 1024];
-    const n: u32 = libc::GetModuleFileNameA(null, &exe_buf[0], 1024);
-    if (n == 0 || n >= 1024) { return TestRun::bare(TestOutcome::RunnerError(0)); }
-    exe_buf[n as u64] = 0;
-
-    // Command line:  "<exe>" --test-runner-child=<idx>\0   (CreateProcessA may
-    // modify the buffer, so it's an owned String).
-    mut cmd: String = String::new();
-    cmd.push_byte(34);
-    mut k: u64 = 0;
-    while (k < n as u64) { cmd.push_byte(exe_buf[k]); k = k + 1; }
-    cmd.push_byte(34);
-    cmd.push(Str::new(" --test-runner-child="));
-    cmd.push(idx);
-    cmd.push_byte(0);
-
-    // Capture: redirect the child's stdout+stderr to a per-test temp file.
-    // A setup failure falls back to inherited stdio (have_cap stays false).
-    mut cap_handle: u8*     = null;
-    mut cap_path:   String  = String::new();
-    mut have_cap:   boolean = false;
+private function run_child(d: TestDescriptor, idx: u64, command: mut &Command,
+                           timeout_secs: u32, capture: boolean) -> TestRun {
+    mut capture_path: String = String::new();
+    mut have_capture: boolean = false;
     if (capture) {
-        mut dir_buf: [u8; 512];
-        const dl: u32 = syscall::GetTempPathA(512, &dir_buf[0]);
-        if (dl > 0 && dl < 512) {
-            // Name the capture file DETERMINISTICALLY from (pid, test index)
-            // rather than asking `GetTempFileNameA` for a unique one.
-            //
-            // `GetTempFileNameA(uUnique = 0)` PROBES the filesystem: it derives a
-            // candidate from the clock and then increments and retries until it
-            // finds a name that does not exist. It can only ever mint 65535 of
-            // them (a 16-bit space). A run that is killed part-way leaks its
-            // capture files, so `%TEMP%` accumulates `cyt*` entries across runs -
-            // and once that space SATURATES, every call scans essentially all
-            // 65535 names before succeeding, on every test, from every worker.
-            //
-            // Observed here: 65535 stale files had built up over six days, and
-            // the same 25-test subset took 110s instead of 1.18s (~93x), with
-            // 12 workers slower than 1 because they all probed the same
-            // saturated directory. Deleting the leftovers restored it instantly.
-            //
-            // (pid, idx) is unique BY CONSTRUCTION: no probing, no 65535 ceiling,
-            // and leaked files are simply overwritten by `CREATE_ALWAYS` on a
-            // later run with the same pid rather than poisoning the namespace.
-            mut path: String = String::new();
-            path.push(cstr_to_str(&dir_buf[0]));        // GetTempPathA ends in `\`
-            path.push(Str::new("cyt"));
-            path.push(syscall::GetCurrentProcessId() as u64);
-            path.push_byte(95);                        // '_'
-            path.push(idx);
-            path.push(Str::new(".tmp"));
-            path.push_byte(0);
-
-            mut sa: syscall::SECURITY_ATTRIBUTES = syscall::SECURITY_ATTRIBUTES {
-                nLength: 24, lpSecurityDescriptor: null, bInheritHandle: 1
-            };
-            // FILE_SHARE_DELETE matters: `bInheritHandles = TRUE` hands EVERY
-            // in-flight capture handle to EVERY child, so while sibling tests
-            // are running this file has open handles in other processes. Without
-            // delete sharing, the `DeleteFileA` after the read fails with a
-            // sharing violation and the file is LEAKED - which is how `%TEMP%`
-            // accumulated 65535 `cyt*` files over six days and saturated
-            // `GetTempFileNameA`. Measured: 1481 tests leaked ~1481 files per
-            // run before this flag; zero after.
-            const share: u32 = syscall::FILE_SHARE_READ | syscall::FILE_SHARE_WRITE
-                             | syscall::FILE_SHARE_DELETE;
-            const h: u8* = syscall::CreateFileA(path.as_ptr(), syscall::GENERIC_WRITE,
-                share, &sa as u8*,
-                syscall::CREATE_ALWAYS, 0, null);
-            if ((h as i64) != -1) {
-                cap_handle = h;
-                cap_path   = path;
-                have_cap   = true;
-            } else {
-                mem::drop(path);
+        mut directory: [u8; 512];
+        const directory_length: u32 = syscall::GetTempPathA(512, &directory[0]);
+        if (directory_length > 0 && directory_length < 512) {
+            capture_path.push(Str::from_raw(&directory[0], directory_length as u64));   // ends in `\`
+            capture_path.push(Str::new("cyt"));
+            capture_path.push(process::id() as u64);
+            capture_path.push_byte(95);                                                  // '_'
+            capture_path.push(idx);
+            capture_path.push(Str::new(".tmp"));
+            mut options: OpenOptions = OpenOptions::new();
+            options = options.write(true).create(true).truncate(true).share(true, true, true);
+            match (options.open(Path::from(capture_path.as_str()))) {
+                Result::Ok(opened) => {
+                    mut file: File = opened;
+                    command.stdout(Stdio::Fd(file.into_descriptor()));
+                    command.stderr(Stdio::SameAsStdout);
+                    have_capture = true;
+                }
+                // Capture falls back to inherited stdio.
+                Result::Err(_) => { }
             }
         }
     }
 
-    mut si: syscall::STARTUPINFOA = syscall::STARTUPINFOA {
-        cb: 104, lpReserved: null, lpDesktop: null, lpTitle: null,
-        dwX: 0, dwY: 0, dwXSize: 0, dwYSize: 0,
-        dwXCountChars: 0, dwYCountChars: 0, dwFillAttribute: 0,
-        dwFlags: 0, wShowWindow: 0, cbReserved2: 0,
-        lpReserved2: null, hStdInput: null, hStdOutput: null, hStdError: null
-    };
-    mut inherit: i32 = 0;
-    if (have_cap) {
-        // USESTDHANDLES needs all three handles valid and inheritable; hand
-        // the child our own stdin and the temp file for stdout+stderr.
-        si.dwFlags    = syscall::STARTF_USESTDHANDLES;
-        si.hStdInput  = syscall::GetStdHandle(syscall::STD_INPUT_HANDLE);
-        si.hStdOutput = cap_handle;
-        si.hStdError  = cap_handle;
-        inherit = 1;
-    }
-    mut pi: syscall::PROCESS_INFORMATION = syscall::PROCESS_INFORMATION {
-        hProcess: null, hThread: null, dwProcessId: 0, dwThreadId: 0
-    };
-    const ok: i32 = syscall::CreateProcessA(null, cmd.as_ptr(), null, null,
-                                            inherit, 0, null, null, &si, &pi);
-    mem::drop(cmd);
-    if (ok == 0) {
-        if (have_cap) {
-            syscall::CloseHandle(cap_handle);
-            syscall::DeleteFileA(cap_path.as_ptr());
+    mut child: Child = match (command.spawn()) {
+        Result::Ok(spawned) => { spawned }
+        Result::Err(e) => {
+            if (have_capture) { mem::drop(dir::remove_file(Path::from(capture_path.as_str()))); }
+            return TestRun::bare(TestOutcome::RunnerError(e.os_code));
         }
-        mem::drop(cap_path);
-        return TestRun::bare(TestOutcome::RunnerError(0));
-    }
-    syscall::CloseHandle(pi.hThread);
+    };
 
-    const ms: u32 = if (timeout_secs > 0) { timeout_secs * 1000 } else { 0xFFFFFFFF };
-    const w: u32 = syscall::WaitForSingleObject(pi.hProcess, ms);
-    if (w == 0x102) {   // WAIT_TIMEOUT
-        syscall::TerminateProcess(pi.hProcess, 1);
-        syscall::WaitForSingleObject(pi.hProcess, 0xFFFFFFFF);
-        syscall::CloseHandle(pi.hProcess);
-        mut cap_to: String = String::new();
-        if (have_cap) {
-            syscall::CloseHandle(cap_handle);
-            read_capture_file(&cap_path, &cap_to);
-            syscall::DeleteFileA(cap_path.as_ptr());
+    mut outcome: TestOutcome = TestOutcome::RunnerError(0);
+    if (timeout_secs > 0) {
+        match (child.wait_timeout(Duration::from_secs(timeout_secs as u64))) {
+            Result::Ok(finished) => {
+                match (finished) {
+                    Option::Some(status) => {
+                        outcome = classify_outcome(status, d.should_panic, timeout_secs);
+                    }
+                    Option::None => {
+                        mem::drop(child.kill());
+                        mem::drop(child.wait());
+                        outcome = TestOutcome::Timeout(timeout_secs);
+                    }
+                }
+            }
+            Result::Err(e) => { outcome = TestOutcome::RunnerError(e.os_code); }
         }
-        mem::drop(cap_path);
-        return TestRun { outcome: TestOutcome::Timeout(timeout_secs), captured: cap_to };
+    } else {
+        match (child.wait()) {
+            Result::Ok(status) => { outcome = classify_outcome(status, d.should_panic, timeout_secs); }
+            Result::Err(e)     => { outcome = TestOutcome::RunnerError(e.os_code); }
+        }
     }
-    mut code: u32 = 0;
-    syscall::GetExitCodeProcess(pi.hProcess, &code);
-    syscall::CloseHandle(pi.hProcess);
 
     mut captured: String = String::new();
-    if (have_cap) {
-        // Close the write handle first so the file is flushed and the reader
-        // doesn't trip a sharing violation, then read it back and delete it.
-        syscall::CloseHandle(cap_handle);
-        read_capture_file(&cap_path, &captured);
-        syscall::DeleteFileA(cap_path.as_ptr());
+    if (have_capture) {
+        mut options: OpenOptions = OpenOptions::new();
+        options = options.read(true).share(true, true, true);
+        match (options.open(Path::from(capture_path.as_str()))) {
+            Result::Ok(opened) => {
+                // A hard read error keeps what already arrived.
+                mut file: File = opened;
+                mut bytes: Array<u8> = Array::new();
+                mem::drop(file.read_to_end(&bytes));
+                captured.push(Str::from_raw(bytes.as_ptr(), bytes.length() as u64));
+            }
+            Result::Err(_) => { }
+        }
+        mem::drop(dir::remove_file(Path::from(capture_path.as_str())));
     }
-    mem::drop(cap_path);
-
-    // No signals on Windows: a plain normal-exit ExitStatus drives the same
-    // classifier the POSIX path uses.
-    const st: ExitStatus = ExitStatus { code: code as i32, signal: 0, signaled: false };
-    const outcome: TestOutcome = classify_outcome(st, d.should_panic, timeout_secs);
     return TestRun { outcome: outcome, captured: captured };
 }
 
@@ -953,10 +814,12 @@ private function classify_outcome(exit_status: ExitStatus, should_panic: boolean
     // A SIGALRM kill is our watchdog firing: always a timeout failure,
     // even for `![should_panic]` tests (a hung test is not a panic).
     const SIGALRM: i32 = 14;
-    if (exit_status.signaled && exit_status.signal == SIGALRM && timeout_secs > 0) {
+    const signaled: boolean = exit_status.terminating_signal().is_some();
+    const signal: i32 = exit_status.terminating_signal().unwrap_or(0);
+    if (signaled && signal == SIGALRM && timeout_secs > 0) {
         return TestOutcome::Timeout(timeout_secs);
     }
-    const clean_zero: boolean = !exit_status.signaled && exit_status.code == 0;
+    const clean_zero: boolean = exit_status.success();
     if (should_panic) {
         if (clean_zero) {
             return TestOutcome::DidNotPanic;
@@ -966,7 +829,7 @@ private function classify_outcome(exit_status: ExitStatus, should_panic: boolean
     if (clean_zero) {
         return TestOutcome::Pass;
     }
-    return TestOutcome::Fail(exit_status.code, exit_status.signal, exit_status.signaled);
+    return TestOutcome::Fail(exit_status.exit_code().unwrap_or(0), signal, signaled);
 }
 
 // Per-test framing
@@ -1000,7 +863,7 @@ private function print_outcome(outcome: TestOutcome, was_should_panic: boolean) 
             libc::printf("FAILED (timed out after %u s)\n", secs);
         }
         TestOutcome::RunnerError(code) => {
-            libc::printf("FAILED (runner error: errno=%d)\n", code);
+            libc::printf("FAILED (runner error: os error %d)\n", code);
         }
     }
 }
@@ -1143,7 +1006,7 @@ private function pretty_end_test(opts: &RunOptions, outcome: TestOutcome,
         }
         TestOutcome::RunnerError(code) => {
             chip_fail(opts.color_active);
-            libc::printf("  (runner error: errno=%d)\n", code);
+            libc::printf("  (runner error: os error %d)\n", code);
         }
     }
 }
@@ -1551,7 +1414,7 @@ private type struct TestRunner {
                 emit_ansi(active, ANSI_RED);
                 libc::printf("FAIL");
                 emit_ansi(active, ANSI_RESET);
-                libc::printf("  %.*s  (runner error: errno=%d)\n",
+                libc::printf("  %.*s  (runner error: os error %d)\n",
                     name.length() as i32, name.as_ptr(), code);
             }
         }
