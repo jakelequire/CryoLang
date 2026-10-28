@@ -136,20 +136,73 @@ private type struct Timer {
 private mut g_current_reactor: Reactor* = null;
 
 
+/// The registrations and the timers, reached only through the reactor's table
+/// lock.
+private type struct ReactorTable {
+    buckets:   [Registration*; 64];   // REG_BUCKETS chains, keyed by `fd & 63`
+    timers:    Timer*;                // deadline-sorted chain; head is the earliest
+    timer_seq: u64;                   // last id handed out (0 means "nothing armed")
+
+    /// The registration for `fd`, or null.
+    find(&this, fd: i32) -> Registration* {
+        mut r: Registration* = this.buckets[fd & (REG_BUCKETS - 1)];
+        while (r != null) {
+            if (r.fd == fd) { return r; }
+            r = r.next;
+        }
+        return null;
+    }
+
+    /// Create an empty (nothing armed) registration for `fd` and link it into
+    /// its bucket. The caller has checked there is none.
+    insert(mut &this, fd: i32) -> Registration* {
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        mut reg: Registration* = null;
+        match (alloc.allocate(Layout::of::<Registration>())) {
+            Result::Ok(raw) => { reg = raw.cast::<Registration>().as_ptr(); }
+            Result::Err(_)  => { panic("Reactor::register: registration allocation failed", intrinsics::location()); }
+        }
+        reg.fd            = fd;
+        reg.interest      = 0;
+        reg.read_waker    = Waker::noop();
+        reg.write_waker   = Waker::noop();
+        reg.next          = null;
+        reg.backend_added = false;
+        reg.os_state      = null;
+        const b: i32 = fd & (REG_BUCKETS - 1);
+        reg.next = this.buckets[b];
+        this.buckets[b] = reg;
+        return reg;
+    }
+
+    /// Unlink `reg` from its bucket.
+    unlink(mut &this, reg: Registration*) -> void {
+        const b: i32 = reg.fd & (REG_BUCKETS - 1);
+        mut cur:  Registration* = this.buckets[b];
+        mut prev: Registration* = null;
+        while (cur != null) {
+            if (cur == reg) {
+                if (prev == null) { this.buckets[b] = cur.next; }
+                else              { prev.next = cur.next; }
+                return;
+            }
+            prev = cur;
+            cur  = cur.next;
+        }
+    }
+}
+
 /// The I/O readiness driver for one `Executor`. Heap-allocated: worker threads
 /// and parked futures hold raw pointers to it, and the backend hands the OS
 /// interior addresses, so it must not move.
 internal type struct Reactor {
 private:
-    table_lock: Mutex<()>;           // guards the registrations and the timers
-    buckets:  [Registration*; 64];   // REG_BUCKETS chains, keyed by `fd & 63`
+    table:    Mutex<ReactorTable>;
     poll_h:   i64;                 // epoll fd (Linux) / completion port (Windows)
     kick_h:   i64;                 // eventfd (Linux) / unused (Windows)
     aux_h:    i64;                 // unused (Linux) / AFD helper handle (Windows)
     shutdown: Atomic<u8>;          // 1 once teardown has been signaled
     io_thread: Scope;              // the reactor thread, once started
-    timers:   Timer*;              // deadline-sorted chain; head is the earliest
-    timer_seq: u64;                // last id handed out (0 means "nothing armed")
 
 internal:
     /// Create a reactor, open its OS backend, and start its I/O thread.
@@ -163,15 +216,12 @@ internal:
             Result::Ok(raw) => { rt = raw.cast::<Reactor>().as_ptr(); }
             Result::Err(_)  => { panic("Reactor::start: allocation failed", intrinsics::location()); }
         }
-        rt.table_lock = Mutex::new(());
-        for (mut i: i32 = 0; i < REG_BUCKETS; i = i + 1) { rt.buckets[i] = null; }
+        rt.table = Mutex::new(ReactorTable { buckets: [null; 64], timers: null, timer_seq: 0 });
         rt.poll_h   = -1;
         rt.kick_h   = -1;
         rt.aux_h    = -1;
         rt.shutdown = Atomic::<u8>::new(0);
         rt.io_thread = Scope::new();
-        rt.timers    = null;
-        rt.timer_seq = 0;
         if (!rt_backend_open(rt)) {
             panic("Reactor::start: I/O readiness backend unavailable", intrinsics::location());
         }
@@ -196,35 +246,47 @@ internal:
         rt.shutdown.store(1, MemoryOrder::Release);
         rt_kick(rt);
         rt.io_thread.join_all();
-        // The thread is gone, so the table has exactly one accessor: no lock.
         // Releasing a still-armed waker here is what reclaims a task that parked
         // on I/O and was never woken; that release runs the task's destructor,
-        // which drops its future, which cancels — re-entering the table.
-        // Taking the wakers out and freeing the entry BEFORE they drop keeps
-        // that re-entry harmless: it finds the entry already gone.
+        // which drops its future, which cancels — re-entering the table under
+        // its lock. So one entry is taken out per lock acquisition, its wakers
+        // moved into locals and the entry freed, and the wakers drop after the
+        // unlock: the re-entry finds the entry already gone.
         for (mut b: i32 = 0; b < REG_BUCKETS; b = b + 1) {
             loop {
-                const reg: Registration* = rt.buckets[b];
+                mut wr: Waker = Waker::noop();
+                mut ww: Waker = Waker::noop();
+                const held: MutexGuard<ReactorTable, GlobalAlloc> = rt.table.lock();
+                const table: ReactorTable* = held.as_ptr();
+                const reg: Registration* = table.buckets[b];
+                if (reg != null) {
+                    wr = Waker::take(&reg.read_waker);
+                    ww = Waker::take(&reg.write_waker);
+                    reg.interest = 0;
+                    rt.remove(table, reg);
+                }
+                mem::drop(held);
                 if (reg == null) { break; }
-                mut wr: Waker = Waker::take(&reg.read_waker);
-                mut ww: Waker = Waker::take(&reg.write_waker);
-                reg.interest = 0;
-                rt.remove(reg);
-                mem::drop(wr);
-                mem::drop(ww);
+                // `wr` and `ww` drop here, outside the lock.
             }
         }
         // Same shape for the deadline chain: unlink and free each block before
         // releasing its waker, so a task reclaimed by that release re-enters a
         // list that no longer names it.
         loop {
-            const t: Timer* = rt.timers;
+            mut tw: Waker = Waker::noop();
+            const held: MutexGuard<ReactorTable, GlobalAlloc> = rt.table.lock();
+            const table: ReactorTable* = held.as_ptr();
+            const t: Timer* = table.timers;
+            if (t != null) {
+                table.timers = t.next;
+                tw = Waker::take(&t.waker);
+            }
+            mem::drop(held);
             if (t == null) { break; }
-            rt.timers = t.next;
-            mut tw: Waker = Waker::take(&t.waker);
             mut alloc: GlobalAlloc = GlobalAlloc::new();
             alloc.deallocate(NonNull::new(t as u8*), Layout::of::<Timer>());
-            mem::drop(tw);
+            // `tw` drops here, outside the lock.
         }
         rt_backend_close(rt);
     }
@@ -275,9 +337,10 @@ internal:
         // `failed` is this one handed straight back when the OS refuses.
         mut replaced: Waker = Waker::noop();
         mut failed:   Waker = Waker::noop();
-        const held: MutexGuard<(), GlobalAlloc> = this.table_lock.lock();
-        mut reg: Registration* = this.find(fd);
-        if (reg == null) { reg = this.insert(fd); }
+        const held: MutexGuard<ReactorTable, GlobalAlloc> = this.table.lock();
+        const table: ReactorTable* = held.as_ptr();
+        mut reg: Registration* = table.find(fd);
+        if (reg == null) { reg = table.insert(fd); }
         if ((direction & INTEREST_READ) != 0) { replaced = Waker::replace(&reg.read_waker, w); }
         else                                     { replaced = Waker::replace(&reg.write_waker, w); }
         reg.interest = reg.interest | direction;
@@ -289,7 +352,7 @@ internal:
             if ((direction & INTEREST_READ) != 0) { failed = Waker::take(&reg.read_waker); }
             else                                     { failed = Waker::take(&reg.write_waker); }
             reg.interest = reg.interest & ~direction;
-            if (reg.interest == 0) { this.remove(reg); }
+            if (reg.interest == 0) { this.remove(table, reg); }
         }
         mem::drop(held);
         failed.wake();
@@ -306,13 +369,14 @@ internal:
     /// reads or owns can close, so the registration is gone by then.
     cancel(mut &this, fd: i32, direction: u32) -> void {
         mut taken: Waker = Waker::noop();
-        const held: MutexGuard<(), GlobalAlloc> = this.table_lock.lock();
-        const reg: Registration* = this.find(fd);
+        const held: MutexGuard<ReactorTable, GlobalAlloc> = this.table.lock();
+        const table: ReactorTable* = held.as_ptr();
+        const reg: Registration* = table.find(fd);
         if (reg != null && (reg.interest & direction) != 0) {
             if ((direction & INTEREST_READ) != 0) { taken = Waker::take(&reg.read_waker); }
             else                                     { taken = Waker::take(&reg.write_waker); }
             reg.interest = reg.interest & ~direction;
-            if (reg.interest == 0) { this.remove(reg); }
+            if (reg.interest == 0) { this.remove(table, reg); }
             else                      { rt_arm(&this, reg); }
         }
         mem::drop(held);
@@ -360,19 +424,20 @@ internal:
         t.deadline = deadline;
         t.waker    = w;
         t.next     = null;
-        const held: MutexGuard<(), GlobalAlloc> = this.table_lock.lock();
-        this.timer_seq = this.timer_seq + 1;
-        t.id = this.timer_seq;
+        const held: MutexGuard<ReactorTable, GlobalAlloc> = this.table.lock();
+        const table: ReactorTable* = held.as_ptr();
+        table.timer_seq = table.timer_seq + 1;
+        t.id = table.timer_seq;
         const id: u64 = t.id;
         mut prev: Timer* = null;
-        mut cur:  Timer* = this.timers;
+        mut cur:  Timer* = table.timers;
         while (cur != null && cur.deadline <= deadline) {
             prev = cur;
             cur  = cur.next;
         }
         t.next = cur;
         mut is_head: boolean = false;
-        if (prev == null) { this.timers = t; is_head = true; }
+        if (prev == null) { table.timers = t; is_head = true; }
         else              { prev.next   = t; }
         mem::drop(held);
         if (is_head) { rt_kick(&this); }
@@ -386,12 +451,13 @@ internal:
         if (id == 0) { return; }
         mut taken: Waker  = Waker::noop();
         mut found: Timer* = null;
-        const held: MutexGuard<(), GlobalAlloc> = this.table_lock.lock();
+        const held: MutexGuard<ReactorTable, GlobalAlloc> = this.table.lock();
+        const table: ReactorTable* = held.as_ptr();
         mut prev: Timer* = null;
-        mut cur:  Timer* = this.timers;
+        mut cur:  Timer* = table.timers;
         while (cur != null) {
             if (cur.id == id) {
-                if (prev == null) { this.timers = cur.next; }
+                if (prev == null) { table.timers = cur.next; }
                 else              { prev.next   = cur.next; }
                 taken = Waker::take(&cur.waker);
                 found = cur;
@@ -416,8 +482,8 @@ internal:
     /// late is what a caller of `sleep` would actually notice. A deadline
     /// already past yields 0 — poll what is ready, then fire it.
     private next_timeout_ms(mut &this, now: i64) -> i32 {
-        const held: MutexGuard<(), GlobalAlloc> = this.table_lock.lock();
-        const head: Timer* = this.timers;
+        const held: MutexGuard<ReactorTable, GlobalAlloc> = this.table.lock();
+        const head: Timer* = held.as_ptr().timers;
         const armed: boolean = head != null;
         mut due: i64 = 0;
         if (armed) { due = head.deadline; }
@@ -438,10 +504,11 @@ internal:
         loop {
             mut w: Waker = Waker::noop();
             mut expired: Timer* = null;
-            const held: MutexGuard<(), GlobalAlloc> = this.table_lock.lock();
-            const head: Timer* = this.timers;
+            const held: MutexGuard<ReactorTable, GlobalAlloc> = this.table.lock();
+            const table: ReactorTable* = held.as_ptr();
+            const head: Timer* = table.timers;
             if (head != null && head.deadline <= now) {
-                this.timers = head.next;
+                table.timers = head.next;
                 w = Waker::take(&head.waker);
                 expired = head;
             }
@@ -465,8 +532,9 @@ internal:
     private dispatch(mut &this, fd: i32, ready: u32) -> void {
         mut wr: Waker = Waker::noop();
         mut ww: Waker = Waker::noop();
-        const held: MutexGuard<(), GlobalAlloc> = this.table_lock.lock();
-        const reg: Registration* = this.find(fd);
+        const held: MutexGuard<ReactorTable, GlobalAlloc> = this.table.lock();
+        const table: ReactorTable* = held.as_ptr();
+        const reg: Registration* = table.find(fd);
         if (reg != null) {
             if ((ready & reg.interest & INTEREST_READ) != 0) {
                 wr = Waker::take(&reg.read_waker);
@@ -476,7 +544,7 @@ internal:
                 ww = Waker::take(&reg.write_waker);
                 reg.interest = reg.interest & ~INTEREST_WRITE;
             }
-            if (reg.interest == 0) { this.remove(reg); }
+            if (reg.interest == 0) { this.remove(table, reg); }
             else                      { rt_arm(&this, reg); }
         }
         mem::drop(held);
@@ -486,59 +554,16 @@ internal:
         // wake above already handed the ready queue a fresh reference.
     }
 
-    /// The registration for `fd`, or null. Caller holds the table lock.
-    private find(&this, fd: i32) -> Registration* {
-        mut r: Registration* = this.buckets[fd & (REG_BUCKETS - 1)];
-        while (r != null) {
-            if (r.fd == fd) { return r; }
-            r = r.next;
-        }
-        return null;
-    }
-
-    /// Create an empty (nothing armed) registration for `fd` and link it into
-    /// its bucket. Caller holds the table lock and has checked there is none.
-    private insert(mut &this, fd: i32) -> Registration* {
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
-        mut reg: Registration* = null;
-        match (alloc.allocate(Layout::of::<Registration>())) {
-            Result::Ok(raw) => { reg = raw.cast::<Registration>().as_ptr(); }
-            Result::Err(_)  => { panic("Reactor::register: registration allocation failed", intrinsics::location()); }
-        }
-        reg.fd            = fd;
-        reg.interest      = 0;
-        reg.read_waker    = Waker::noop();
-        reg.write_waker   = Waker::noop();
-        reg.next          = null;
-        reg.backend_added = false;
-        reg.os_state      = null;
-        const b: i32 = fd & (REG_BUCKETS - 1);
-        reg.next = this.buckets[b];
-        this.buckets[b] = reg;
-        return reg;
-    }
-
-    /// Unlink `reg`, tell the OS to stop watching it, and free it. Caller holds
-    /// the table lock (or is the sole accessor during teardown).
+    /// Unlink `reg` from `table`, tell the OS to stop watching it, and free
+    /// it. `table` is the locked table `reg` belongs to.
     ///
     /// Only ever called with nothing armed: a waker is stored exactly while its
     /// direction is armed, so `interest == 0` means both slots hold no-ops and
     /// freeing the block loses nothing. A caller removing a registration that is
     /// still armed (teardown) takes the wakers out into locals of
     /// its own first, so they are released after the lock, never under it.
-    private remove(mut &this, reg: Registration*) -> void {
-        const b: i32 = reg.fd & (REG_BUCKETS - 1);
-        mut cur:  Registration* = this.buckets[b];
-        mut prev: Registration* = null;
-        while (cur != null) {
-            if (cur == reg) {
-                if (prev == null) { this.buckets[b] = cur.next; }
-                else              { prev.next = cur.next; }
-                break;
-            }
-            prev = cur;
-            cur  = cur.next;
-        }
+    private remove(mut &this, table: ReactorTable*, reg: Registration*) -> void {
+        table.unlink(reg);
         rt_disarm(&this, reg);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         alloc.deallocate(NonNull::new(reg as u8*), Layout::of::<Registration>());

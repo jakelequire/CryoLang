@@ -275,17 +275,35 @@ implement trait Drop for struct Task {
     }
 }
 
+/// The ready queue and the shutdown flag, reached only through the executor's
+/// queue lock.
+private type struct ReadyQueue {
+    head:     Task*;    // dequeue end (null when empty)
+    tail:     Task*;    // enqueue end
+    shutdown: boolean;  // set at Executor drop
+
+    /// Unlink and return the oldest queued task, or null when the queue is
+    /// empty.
+    pop(mut &this) -> Task* {
+        const t: Task* = this.head;
+        if (t == null) { return null; }
+        this.head = t.next;
+        if (this.head == null) { this.tail = null; }
+        t.next = null;
+        return t;
+    }
+}
+
 /// The shared executor state: a locked FIFO of ready tasks plus a second lock
 /// and condition variable joiners block on. Heap-pinned so a `Task`'s `exec`
 /// back-pointer and the worker threads reference a stable address.
 type struct ExecInner {
-    queue_lock: Mutex<()>;   // guards head/tail/shutdown
+    private queue: Mutex<ReadyQueue>;
     work_ready: CondVar;     // workers wait here for work
-    done_lock:  Mutex<()>;   // guards the completion signal
+    // Guards no data: a joiner's predicate is its task's handshake atomic, and
+    // this lock only orders that check against the finishing worker's notify.
+    done_lock:  Mutex<()>;
     task_done:  CondVar;     // joiners wait here for a task to finish
-    head:     Task*;    // dequeue end (null when empty)
-    tail:     Task*;    // enqueue end
-    shutdown: boolean;  // set at Executor drop; guarded by queue_lock
     private reactor: Reactor*; // the I/O driver this pool's workers publish while polling
     blocking: BlockingPool*;   // where workers offload calls the reactor cannot drive
 
@@ -293,14 +311,15 @@ type struct ExecInner {
     /// caller has already set `task.run_state = ST_SCHEDULED`, so a concurrent
     /// `wake()` sees SCHEDULED and does not double-link.
     enqueue(mut &this, task: Task*) -> void {
-        const held: MutexGuard<(), GlobalAlloc> = this.queue_lock.lock();
+        const held: MutexGuard<ReadyQueue, GlobalAlloc> = this.queue.lock();
+        const queue: ReadyQueue* = held.as_ptr();
         task.next = null;
-        if (this.tail == null) {
-            this.head = task;
-            this.tail = task;
+        if (queue.tail == null) {
+            queue.head = task;
+            queue.tail = task;
         } else {
-            this.tail.next = task;
-            this.tail = task;
+            queue.tail.next = task;
+            queue.tail = task;
         }
         this.work_ready.notify_one();
         mem::drop(held);
@@ -311,15 +330,13 @@ type struct ExecInner {
     /// worker can claim it), or null once shutdown is set (leaving any remaining
     /// queued tasks for `Executor::drop` to reclaim).
     take(mut &this) -> Task* {
-        mut held: MutexGuard<(), GlobalAlloc> = this.queue_lock.lock();
-        while (this.head == null && !this.shutdown) {
-            this.work_ready.wait(&this.queue_lock, &held);
+        mut held: MutexGuard<ReadyQueue, GlobalAlloc> = this.queue.lock();
+        const queue: ReadyQueue* = held.as_ptr();
+        while (queue.head == null && !queue.shutdown) {
+            this.work_ready.wait(&this.queue, &held);
         }
-        if (this.shutdown) { return null; }
-        const t: Task* = this.head;
-        this.head = t.next;
-        if (this.head == null) { this.tail = null; }
-        t.next = null;
+        if (queue.shutdown) { return null; }
+        const t: Task* = queue.pop();
         // Claim the task for this worker before releasing the lock, so a wake
         // between dequeue and poll takes the RUNNING→NOTIFIED path (deferred
         // reschedule) rather than re-linking an already-dequeued task.
@@ -329,17 +346,19 @@ type struct ExecInner {
     }
 
     /// Reclaim every still-queued task (called from `Executor::drop` after the
-    /// workers have joined, so no locking is needed). Releasing each task's
-    /// scheduling reference — the last reference for a never-driven task — runs
-    /// `Task::drop`, which finishes it CANCELLED (its future's drop + the
-    /// shared-block handshake) and frees the box; tasks never driven would
-    /// otherwise leak their boxed futures.
+    /// workers have joined). Releasing each task's scheduling reference — the
+    /// last reference for a never-driven task — runs `Task::drop`, which
+    /// finishes it CANCELLED (its future's drop + the shared-block handshake)
+    /// and frees the box; tasks never driven would otherwise leak their boxed
+    /// futures. One task is unlinked per lock acquisition and released after
+    /// the unlock: a future's drop can wake another task, which enqueues under
+    /// this same lock, and that task is then drained in turn.
     drain_cancelled(mut &this) -> void {
         loop {
-            const t: Task* = this.head;
-            if (t == null) { break; }
-            this.head = t.next;
-            if (this.head == null) { this.tail = null; }
+            const held: MutexGuard<ReadyQueue, GlobalAlloc> = this.queue.lock();
+            const t: Task* = held.as_ptr().pop();
+            mem::drop(held);
+            if (t == null) { return; }
             task_decref(t);
         }
     }
@@ -712,13 +731,10 @@ type struct Executor {
             Result::Ok(raw) => { inner = raw.cast::<ExecInner>().as_ptr(); }
             Result::Err(_)  => { panic("Executor::new: allocation failed", intrinsics::location()); }
         }
-        inner.queue_lock = Mutex::new(());
+        inner.queue      = Mutex::new(ReadyQueue { head: null, tail: null, shutdown: false });
         inner.work_ready = CondVar::new();
         inner.done_lock  = Mutex::new(());
         inner.task_done  = CondVar::new();
-        inner.head     = null;
-        inner.tail     = null;
-        inner.shutdown = false;
         // Before any worker starts: each publishes these handles as it comes up.
         // The blocking pool starts empty — it creates its first thread only if
         // something actually offloads work — so this costs an allocation.
@@ -790,8 +806,8 @@ implement trait Drop for struct Executor {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
         const inner: ExecInner* = this.inner;
-        const held: MutexGuard<(), GlobalAlloc> = inner.queue_lock.lock();
-        inner.shutdown = true;
+        const held: MutexGuard<ReadyQueue, GlobalAlloc> = inner.queue.lock();
+        held.as_ptr().shutdown = true;
         mem::drop(held);
         inner.work_ready.notify_all();
         // Join every worker (each exits `take()` once it observes shutdown).
@@ -800,8 +816,8 @@ implement trait Drop for struct Executor {
         this.workers.join_all();
         BlockingPool::stop(inner.blocking);
         Reactor::stop(inner.reactor);
-        // No workers and no reactor thread remain: safe to reclaim without
-        // locking. The reactor block stays alive across this drain because a
+        // No workers and no reactor thread remain. The reactor block stays
+        // alive across this drain because a
         // queued task's future may still cancel a registration or timer against
         // it as it is dropped; `Reactor::free` releases it once that is past.
         inner.drain_cancelled();

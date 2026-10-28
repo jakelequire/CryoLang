@@ -506,6 +506,27 @@ yet is recorded with the change that builds it, not here.
      never a fixed stand-in.  `thread::available_parallelism` is the one
      CPU count.  (Jake)
 
+623. **A NaN constant pattern is reported.**  A float constant pattern
+     whose value folds to NaN - `f64::NAN`, `f32::NAN`, a module
+     constant written `0.0 / 0.0` - can never match, since it compares
+     as `==` does, so it warns (`W0016`), at the top level and in a
+     payload position alike.  It is a warning, not a refusal: the arm
+     is well formed, only never chosen.  A constant whose value does
+     not fold is not known to be NaN and is not reported.  (Jake)
+
+624. **A lock holds the state it guards.**  The executor's ready
+     queue, the reactor's registrations and timers, the blocking pool's
+     job queue and threads, and an `mpsc` channel's queue and handle
+     counts each live inside their `Mutex` (`Mutex<ReadyQueue>`,
+     `Mutex<ReactorTable>`, `Mutex<PoolState>`, `Mutex<ChannelState<T>>`)
+     and are reached only through its guard, so no field can be read
+     without the lock.  Teardown takes the lock too, once the threads
+     are gone, unlinking one item per acquisition and releasing it after
+     the unlock, because releasing a task or a waker can re-enter the
+     same lock.  A lock that guards no data - the executor's completion
+     lock, whose predicate is each task's handshake atomic - stays a
+     `Mutex<()>`.  Behaviour is unchanged.  (Jake)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

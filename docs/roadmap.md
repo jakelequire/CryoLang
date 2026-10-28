@@ -468,7 +468,8 @@ Left over from that: the async entry point calls `Executor::new` and
    integer rotates itself (613).  The executor, the reactor, the
    blocking pool and the channels lock with `sync`'s `Mutex` and
    `CondVar` and start their threads through `thread`, which creates
-   every thread one way (622).  Open: a writer over a fixed
+   every thread one way (622), and each lock holds the state it guards
+   (624).  Open: a writer over a fixed
    region - SHA-1's digest, the generator's fill, `pack_sockaddr_in` and
    the IPv6 parser still store their bytes by hand - and whether the
    Winsock and OpenSSL error mappers in `net` become `IoError`

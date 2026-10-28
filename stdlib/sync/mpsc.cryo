@@ -30,9 +30,9 @@
 ///!
 ///! ## Implementation
 ///!
-///! A heap `ChannelInner<T>` holds a `Mutex` and a `CondVar`
-///! guarding a raw singly-linked node queue plus a live-sender count and
-///! a total-handle refcount. The inner is reclaimed when the last handle
+///! A heap `ChannelInner<T>` holds a `Mutex` over the channel's state - a
+///! raw singly-linked node queue plus a live-sender count and a
+///! total-handle refcount - and a `CondVar` the receiver waits on. The inner is reclaimed when the last handle
 ///! (sender or receiver) drops. Values move out of dequeued nodes through
 ///! raw pointers, so the move-checker treats each as a clean transfer
 ///! (no aliasing, no double-free).
@@ -58,15 +58,29 @@ type struct ChanNode<T> {
     value: T;
 }
 
-/// Shared channel state, reached through a raw pointer by every handle.
-type struct ChannelInner<T> {
-    lock:    Mutex<()>;      // guards every field below
-    ready:   CondVar;        // the receiver waits here for a value or the last sender
+/// The queue and the handle counts, reached only through the channel's lock.
+private type struct ChannelState<T> {
     head:    ChanNode<T>*;   // dequeue end (null when empty)
     tail:    ChanNode<T>*;   // enqueue end
-    senders: i64;            // live Sender handles (guarded by mutex)
-    refs:    i64;            // live Sender + Receiver handles (guarded by mutex)
+    senders: i64;            // live Sender handles
+    refs:    i64;            // live Sender + Receiver handles
     rx_open: boolean;        // receiver still alive
+
+    /// Unlink and return the oldest queued node, or null when the queue is
+    /// empty.
+    pop(mut &this) -> ChanNode<T>* {
+        const node: ChanNode<T>* = this.head;
+        if (node == null) { return null; }
+        this.head = (*node).next;
+        if (this.head == null) { this.tail = null; }
+        return node;
+    }
+}
+
+/// Shared channel state, reached through a raw pointer by every handle.
+type struct ChannelInner<T> {
+    private state: Mutex<ChannelState<T>>;
+    ready: CondVar;   // the receiver waits here for a value or the last sender
 }
 
 
@@ -79,13 +93,10 @@ function new_inner<T>() -> ChannelInner<T>* {
         Result::Ok(raw) => { inner = raw.cast::<ChannelInner<T>>().as_ptr(); }
         Result::Err(_)  => { core::panic("mpsc::channel: allocation failed", intrinsics::location()); }
     }
-    inner.lock    = Mutex::new(());
-    inner.ready   = CondVar::new();
-    inner.head    = null;
-    inner.tail    = null;
-    inner.senders = 0;
-    inner.refs    = 1;   // the Receiver
-    inner.rx_open = true;
+    inner.state = Mutex::new(ChannelState::<T> {
+        head: null, tail: null, senders: 0, refs: 1, rx_open: true   // one handle: the Receiver
+    });
+    inner.ready = CondVar::new();
     return inner;
 }
 
@@ -125,8 +136,9 @@ type struct Sender<T> {
     /// has already been dropped (the value is handed back unconsumed).
     send(&this, value: T) -> Result<(), SendError<T>> {
         const inner: ChannelInner<T>* = this.inner;
-        const held: MutexGuard<(), GlobalAlloc> = inner.lock.lock();
-        if (!inner.rx_open) {
+        const held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
+        const state: ChannelState<T>* = held.as_ptr();
+        if (!state.rx_open) {
             return Result::Err(SendError::<T> { value: value });
         }
         mut node: ChanNode<T>* = null;
@@ -142,12 +154,12 @@ type struct Sender<T> {
         // synthesized on the uninitialized destination.
         const slot: T* = &(*node).value;
         *slot = value;
-        if (inner.tail == null) {
-            inner.head = node;
-            inner.tail = node;
+        if (state.tail == null) {
+            state.head = node;
+            state.tail = node;
         } else {
-            (*inner.tail).next = node;
-            inner.tail = node;
+            (*state.tail).next = node;
+            state.tail = node;
         }
         // Wake one blocked receiver (there is at most one).
         inner.ready.notify_one();
@@ -158,9 +170,10 @@ type struct Sender<T> {
     /// Create another sender on the same channel (multi-producer).
     clone(&this) -> Sender<T> {
         const inner: ChannelInner<T>* = this.inner;
-        const held: MutexGuard<(), GlobalAlloc> = inner.lock.lock();
-        inner.senders = inner.senders + 1;
-        inner.refs    = inner.refs + 1;
+        const held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
+        const state: ChannelState<T>* = held.as_ptr();
+        state.senders = state.senders + 1;
+        state.refs    = state.refs + 1;
         mem::drop(held);
         return Sender::<T> { inner: inner };
     }
@@ -178,13 +191,14 @@ type struct Sender<T> {
 /// last sender (so a blocked `recv` observes disconnection); free the
 /// inner if this was the last handle of any kind.
 function release_sender<T>(inner: ChannelInner<T>*) -> void {
-    const held: MutexGuard<(), GlobalAlloc> = inner.lock.lock();
-    inner.senders = inner.senders - 1;
-    if (inner.senders == 0) {
+    const held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
+    const state: ChannelState<T>* = held.as_ptr();
+    state.senders = state.senders - 1;
+    if (state.senders == 0) {
         inner.ready.notify_all();
     }
-    inner.refs = inner.refs - 1;
-    const last: boolean = inner.refs == 0;
+    state.refs = state.refs - 1;
+    const last: boolean = state.refs == 0;
     mem::drop(held);
     if (last) { free_inner::<T>(inner); }
 }
@@ -210,9 +224,10 @@ type struct Receiver<T> {
     /// sender is alive.
     sender(&this) -> Sender<T> {
         const inner: ChannelInner<T>* = this.inner;
-        const held: MutexGuard<(), GlobalAlloc> = inner.lock.lock();
-        inner.senders = inner.senders + 1;
-        inner.refs    = inner.refs + 1;
+        const held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
+        const state: ChannelState<T>* = held.as_ptr();
+        state.senders = state.senders + 1;
+        state.refs    = state.refs + 1;
         mem::drop(held);
         return Sender::<T> { inner: inner };
     }
@@ -222,18 +237,17 @@ type struct Receiver<T> {
     /// drained.
     recv(&this) -> Result<T, RecvError> {
         const inner: ChannelInner<T>* = this.inner;
-        mut held: MutexGuard<(), GlobalAlloc> = inner.lock.lock();
-        while (inner.head == null && inner.senders > 0) {
-            inner.ready.wait(&inner.lock, &held);
+        mut held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
+        const state: ChannelState<T>* = held.as_ptr();
+        while (state.head == null && state.senders > 0) {
+            inner.ready.wait(&inner.state, &held);
         }
-        if (inner.head == null) {
+        const node: ChanNode<T>* = state.pop();
+        mem::drop(held);
+        if (node == null) {
             // No value and no senders left.
             return Result::Err(RecvError::Disconnected);
         }
-        const node: ChanNode<T>* = inner.head;
-        inner.head = (*node).next;
-        if (inner.head == null) { inner.tail = null; }
-        mem::drop(held);
         // Move the value out of the node, then free the node without running
         // the slot's destructor, so the value is owned exactly once.
         const slot: T* = &(*node).value;
@@ -249,14 +263,13 @@ type struct Receiver<T> {
     /// all senders have dropped.
     try_recv(&this) -> Result<T, TryRecvError> {
         const inner: ChannelInner<T>* = this.inner;
-        const held: MutexGuard<(), GlobalAlloc> = inner.lock.lock();
-        if (inner.head == null) {
-            if (inner.senders == 0) { return Result::Err(TryRecvError::Disconnected); }
+        const held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
+        const state: ChannelState<T>* = held.as_ptr();
+        const node: ChanNode<T>* = state.pop();
+        if (node == null) {
+            if (state.senders == 0) { return Result::Err(TryRecvError::Disconnected); }
             return Result::Err(TryRecvError::Empty);
         }
-        const node: ChanNode<T>* = inner.head;
-        inner.head = (*node).next;
-        if (inner.head == null) { inner.tail = null; }
         mem::drop(held);
         // Same balance as `recv`: the node is released without running the
         // slot's destructor, so the value is owned exactly once.
@@ -273,23 +286,21 @@ implement<T> trait Drop for struct Receiver<T> {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
         const inner: ChannelInner<T>* = this.inner;
-        const held: MutexGuard<(), GlobalAlloc> = inner.lock.lock();
-        inner.rx_open = false;
+        const held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
+        const state: ChannelState<T>* = held.as_ptr();
+        state.rx_open = false;
         // Drain and drop any values still queued: with the receiver gone
         // they would otherwise leak.
-        mut node: ChanNode<T>* = inner.head;
+        mut node: ChanNode<T>* = state.pop();
         while (node != null) {
-            const nxt: ChanNode<T>* = (*node).next;
             const slot: T* = &(*node).value;
             ptr::drop_in_place::<T>(slot);
             mut a: GlobalAlloc = GlobalAlloc::new();
             a.deallocate(NonNull::new(node as u8*), Layout::of::<ChanNode<T>>());
-            node = nxt;
+            node = state.pop();
         }
-        inner.head = null;
-        inner.tail = null;
-        inner.refs = inner.refs - 1;
-        const last: boolean = inner.refs == 0;
+        state.refs = state.refs - 1;
+        const last: boolean = state.refs == 0;
         mem::drop(held);
         if (last) { free_inner::<T>(inner); }
         this.inner = null;

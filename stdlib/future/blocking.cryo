@@ -141,7 +141,7 @@ type struct BlockingJob {
     /// takes it back out.
     arm(mut &this, w: Waker) -> u8 {
         const pool: BlockingPool* = this.pool;
-        const held: MutexGuard<(), GlobalAlloc> = pool.lock.lock();
+        const held: MutexGuard<PoolState, GlobalAlloc> = pool.state.lock();
         const st: u8 = this.status.load(MemoryOrder::Acquire);
         mut replaced: Waker = Waker::replace(&this.waker, w);
         mem::drop(held);
@@ -158,7 +158,7 @@ type struct BlockingJob {
     /// may free it.
     finish(mut &this, status: u8) -> void {
         const pool: BlockingPool* = this.pool;
-        const held: MutexGuard<(), GlobalAlloc> = pool.lock.lock();
+        const held: MutexGuard<PoolState, GlobalAlloc> = pool.state.lock();
         mut w: Waker = Waker::take(&this.waker);
         this.status.store(status, MemoryOrder::Release);
         mem::drop(held);
@@ -203,20 +203,35 @@ type struct BlockingJob {
 mut g_current_pool: BlockingPool* = null;
 
 
+/// The job queue and the pool's threads, reached only through the pool's lock.
+private type struct PoolState {
+    head:     BlockingJob*;   // dequeue end (null when empty)
+    tail:     BlockingJob*;   // enqueue end
+    shutdown: boolean;
+    idle:     u32;            // threads currently waiting on `work_ready`
+    // One handle per thread created so far. Joined by `stop`; the pool block
+    // is raw memory, so `free` releases the fields in place.
+    threads:  [ThreadJoinHandle<()>];
+
+    /// Unlink and return the oldest queued job, or null when the queue is
+    /// empty.
+    pop(mut &this) -> BlockingJob* {
+        const job: BlockingJob* = this.head;
+        if (job == null) { return null; }
+        this.head = job.next;
+        if (this.head == null) { this.tail = null; }
+        job.next = null;
+        return job;
+    }
+}
+
 /// A pool of OS threads running blocking jobs for one `Executor`.
 /// Heap-allocated: worker threads and submitted jobs hold raw pointers to it, so
 /// it must not move.
 type struct BlockingPool {
-    lock:       Mutex<()>;   // guards everything below, and every job's waker slot
-    work_ready: CondVar;     // threads wait here for work
-    head:     BlockingJob*;   // dequeue end (null when empty)
-    tail:     BlockingJob*;   // enqueue end
-    shutdown: boolean;
-    idle:     u32;      // threads currently waiting on `work_ready`
-    max:      u32;      // ceiling on the number of threads
-    // One handle per thread created so far. Joined by `stop`; the pool block
-    // is raw memory, so `free` releases the fields in place.
-    threads:  [ThreadJoinHandle<()>];
+    private state: Mutex<PoolState>;   // also guards every job's waker slot
+    work_ready: CondVar;            // threads wait here for work
+    max:        u32;                // ceiling on the number of threads; fixed at creation
 
     /// Create an empty pool with the default thread ceiling.
     static start() -> BlockingPool* {
@@ -238,14 +253,11 @@ type struct BlockingPool {
             Result::Ok(raw) => { p = raw.cast::<BlockingPool>().as_ptr(); }
             Result::Err(_)  => { panic("BlockingPool::with_max: allocation failed", intrinsics::location()); }
         }
-        p.lock       = Mutex::new(());
+        p.state = Mutex::new(PoolState {
+            head: null, tail: null, shutdown: false, idle: 0, threads: []
+        });
         p.work_ready = CondVar::new();
-        p.head     = null;
-        p.tail     = null;
-        p.shutdown = false;
-        p.idle     = 0;
-        p.max      = count;
-        p.threads  = [];
+        p.max        = count;
         return p;
     }
 
@@ -264,27 +276,29 @@ type struct BlockingPool {
     /// writing into a pool block that is about to be freed.
     static stop(p: BlockingPool*) -> void {
         if (p == null) { return; }
-        const held: MutexGuard<(), GlobalAlloc> = p.lock.lock();
-        p.shutdown = true;
+        const held: MutexGuard<PoolState, GlobalAlloc> = p.state.lock();
+        held.as_ptr().shutdown = true;
         mem::drop(held);
         p.work_ready.notify_all();
-        // No thread is created once shutdown is set, so `threads` has no
-        // other writer from here on.
+        // No thread is created once shutdown is set, so each pop below leaves
+        // one fewer. A thread is joined outside the lock: it needs the lock to
+        // see shutdown and leave.
         loop {
-            match (p.threads.pop()) {
+            const listed: MutexGuard<PoolState, GlobalAlloc> = p.state.lock();
+            const next: Option<ThreadJoinHandle<()>> = listed.as_ptr().threads.pop();
+            mem::drop(listed);
+            match (next) {
                 Option::Some(worker) => { worker.join(); }
                 Option::None         => { break; }
             }
         }
-        // The threads are gone, so the queue has exactly one accessor. `finish`
-        // takes the lock itself, which is why the jobs are unlinked one at a
-        // time rather than under a lock held across the loop.
+        // `finish` takes the lock itself, which is why the jobs are unlinked
+        // one at a time rather than under a lock held across the loop.
         loop {
-            const job: BlockingJob* = p.head;
-            if (job == null) { break; }
-            p.head = job.next;
-            if (p.head == null) { p.tail = null; }
-            job.next = null;
+            const queued: MutexGuard<PoolState, GlobalAlloc> = p.state.lock();
+            const job: BlockingJob* = queued.as_ptr().pop();
+            mem::drop(queued);
+            if (job == null) { return; }
             job.finish(JOB_CANCELLED);
         }
     }
@@ -321,14 +335,15 @@ type struct BlockingPool {
     /// life, and in exchange `threads` is never observed half-updated by
     /// `stop`, its only other reader.
     submit(mut &this, job: BlockingJob*) -> boolean {
-        const held: MutexGuard<(), GlobalAlloc> = this.lock.lock();
-        if (this.shutdown) { return false; }
+        const held: MutexGuard<PoolState, GlobalAlloc> = this.state.lock();
+        const state: PoolState* = held.as_ptr();
+        if (state.shutdown) { return false; }
         // Grow only when nothing is idle: an idle thread takes this job the
         // moment the lock is released.
-        const live: i64 = this.threads.length();
-        if (this.idle == 0 && live < this.max as i64) {
+        const live: i64 = state.threads.length();
+        if (state.idle == 0 && live < this.max as i64) {
             match (thread::try_spawn::<BlockingPool*, ()>(&this, blocking_worker)) {
-                Result::Ok(worker) => { this.threads.push(worker); }
+                Result::Ok(worker) => { state.threads.push(worker); }
                 Result::Err(_)     => {
                     // No thread exists and none can be created, so a queued
                     // job would sit here forever. Refuse it instead.
@@ -339,12 +354,12 @@ type struct BlockingPool {
         job.retain();        // the pool's reference
         job.pool = &this;
         job.next = null;
-        if (this.tail == null) {
-            this.head = job;
-            this.tail = job;
+        if (state.tail == null) {
+            state.head = job;
+            state.tail = job;
         } else {
-            this.tail.next = job;
-            this.tail = job;
+            state.tail.next = job;
+            state.tail = job;
         }
         this.work_ready.notify_one();
         mem::drop(held);
@@ -359,20 +374,18 @@ type struct BlockingPool {
     /// to be a free function to serve as a raw thread entry (`ExecInner::take`
     /// is public for the identical reason).
     take(mut &this) -> BlockingJob* {
-        mut held: MutexGuard<(), GlobalAlloc> = this.lock.lock();
-        while (this.head == null && !this.shutdown) {
+        mut held: MutexGuard<PoolState, GlobalAlloc> = this.state.lock();
+        const state: PoolState* = held.as_ptr();
+        while (state.head == null && !state.shutdown) {
             // `idle` is what `submit` reads to decide whether growing the pool
             // would buy anything, so it must count exactly the threads parked
             // on this wait.
-            this.idle = this.idle + 1;
-            this.work_ready.wait(&this.lock, &held);
-            this.idle = this.idle - 1;
+            state.idle = state.idle + 1;
+            this.work_ready.wait(&this.state, &held);
+            state.idle = state.idle - 1;
         }
-        if (this.shutdown) { return null; }
-        const job: BlockingJob* = this.head;
-        this.head = job.next;
-        if (this.head == null) { this.tail = null; }
-        job.next = null;
+        if (state.shutdown) { return null; }
+        const job: BlockingJob* = state.pop();
         mem::drop(held);
         return job;
     }

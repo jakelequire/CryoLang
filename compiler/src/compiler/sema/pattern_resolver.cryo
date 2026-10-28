@@ -25,6 +25,7 @@ import compiler::diag::{ diagnostic, ErrorCode, source_span, suggestion };
 import compiler::diag::edit_distance;
 import compiler::lex;
 import compiler::compilation_context::{ CompilationContext };
+import compiler::const_table::{ ConstEval };
 import compiler::sema::{ state, type_utils, symbolic_checker, scope_manager, helpers };
 import std::fmt;
 import compiler::ast::expression::{ ExpressionNode };
@@ -493,7 +494,16 @@ type struct PatternResolver {
             this.ctx.emit_diagnostic(diag);
             return;
         }
-        if (this.compares_by_value(constant_type)) { return; }
+        if (this.compares_by_value(constant_type)) {
+            if (this.constant_is_nan(c, constant_type)) {
+                mut warning: Diagnostic = Diagnostic::warning(ErrorCode::W0016_NAN_CONSTANT_PATTERN,
+                    fmt::format("constant `%s` is NaN, so this pattern never matches", written));
+                warning = warning.at_with_label(pat.span, "never matches");
+                warning = warning.with_note("NaN equals no value, NaN included; test a value with `is_nan()`");
+                this.ctx.emit_diagnostic(warning);
+            }
+            return;
+        }
         mut refusal: Diagnostic = Diagnostic::error(ErrorCode::E0113_INVALID_PATTERN,
             fmt::format("constant `%s` of type `%s` cannot be matched against", written,
                 this.arena.resolve_display_name(constant_type)));
@@ -501,6 +511,24 @@ type struct PatternResolver {
         refusal = refusal.with_note(
             "a constant pattern compares an integer, `char`, `boolean`, float, `string` or payload-less enum value");
         this.ctx.emit_diagnostic(refusal);
+    }
+
+    /// Whether `c` names a float constant whose value folds to NaN.  A float
+    /// constant compares as `==` does, so a NaN one equals no subject.  A
+    /// constant whose value does not fold is not known to be NaN.
+    constant_is_nan(&this, c: ConstantPattern*, constant_type: TypeRef) -> boolean {
+        const ty: Type* = this.arena.lookup(constant_type);
+        if (ty == null || ty.kind != TypeKind::Float || this.ctx.const_table == null) { return false; }
+        return match (c.res) {
+            ResSlot::Answered(Res::Def(d)) => {
+                const ev: ConstEval = ConstEval::new(this.ctx.const_table, this.ctx.intern_table, this.arena);
+                match (ev.fold_entry_real(this.ctx.const_table.index_of(d))) {
+                    Option::Some(value) => { value.is_nan() }
+                    Option::None        => { false }
+                }
+            }
+            _ => { false }
+        };
     }
 
     /// The type of the constant `c` names: the path it was written as, typed
