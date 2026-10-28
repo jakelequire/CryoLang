@@ -638,6 +638,20 @@ yet is recorded with the change that builds it, not here.
      and clearing it, and hiding it needs an accessor.  (Jake; each split
      delegated)
 
+633. **`json` is marked, and so are the members a primitive's and a
+     private type's blocks hold.**  `parse`, the serializers, `JsonValue`,
+     `JsonNumber`, `JsonObject`, `JsonExtract` and the error types are
+     public, `JsonError`'s position and message as fields, as its
+     documentation promises; `JsonObject`'s parallel arrays and index are
+     private behind its methods, and the parser's and serializer's byte
+     names, cursor and steps are private.  `Parser` itself, its
+     constructor, its value entry and `MAX_DEPTH`, which `JsonErrorKind`'s
+     documentation names, are not marked.  The float writers on `f32` and
+     `f64` are public, with `F64_MAX_DIGITS`, the buffer size their
+     contract names, and `DEFAULT_DECIMALS`.  A member of a private type
+     in `alloc` and `net` is written `private`.  (Jake; each split
+     delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that
