@@ -7,6 +7,8 @@
 ///! a member by its name: completion and the extended hover list them all.
 namespace lsp::handlers::members;
 
+import std::collections::str;
+import std::collections::string::{ String };
 import compiler::compilation_context::{ CompilationContext };
 import compiler::ast::node::{ ProgramNode };
 import compiler::ast::node_locator::{ NodeLocator };
@@ -170,13 +172,20 @@ type struct Members {
         mut out: [string] = [];
         const parent: string = if (m.is_valid()) { ctx.intern_table.shown(m.decl_name()) } else { "" };
         const skip: i64 = if (m.is_valid()) { parent.length() as i64 + 2 } else { 0 };
+        const separator: str::Str = str::Str::from("::");
         const n: u32 = ctx.module_graph.module_count();
         for (mut i: u32 = 0; i < n; i++) {
             const p: ModulePath = ctx.module_graph.get_module(i as i64).path();
             if (m.is_valid() && (p.equals(m) || !p.is_within(m, ctx.intern_table))) { continue; }
-            const full: string = ctx.intern_table.shown(p.decl_name());
-            const seg: string = Members::first_segment(full, skip);
-            if (seg.length() == 0) { continue; }
+            const full: str::Str = str::Str::from(ctx.intern_table.shown(p.decl_name()));
+            if (skip >= full.length()) { continue; }
+            const rest: str::Str = full.sub_bytes(skip, full.length());
+            const head: str::Str = match (rest.split_once(&separator)) {
+                Option::Some(parts) => { parts.first }
+                Option::None        => { rest }
+            };
+            if (head.length() == 0) { continue; }
+            const seg: string = String::from_str(head).into_raw();
             mut seen: boolean = false;
             for (mut k: i64 = 0; k < out.length(); k++) {
                 if (out[k].equals(&seg)) { seen = true; break; }
@@ -184,16 +193,5 @@ type struct Members {
             if (!seen) { out.push(seg); }
         }
         return out;
-    }
-
-    /// The segment of `path` starting at byte `from`, up to the next `::`.
-    static first_segment(path: string, from: i64) -> string {
-        const len: i64 = path.length() as i64;
-        if (from >= len) { return ""; }
-        mut end: i64 = from;
-        while (end < len && !(path[end] == ':' && end + 1 < len && path[end + 1] == ':')) {
-            end = end + 1;
-        }
-        return path.substr(from, end - from);
     }
 }

@@ -17,7 +17,9 @@ namespace compiler::resolver::qualified_name;
 
 import compiler::resolver::{ symbol_str, intern_table };
 import std::ffi::libc;
-import std::fmt;
+import std::collections::str::{ Str };
+import std::core::iter::{ Iterator };
+import compiler::lex::lexer::{ Lexer };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 
@@ -58,29 +60,10 @@ type struct QualifiedName {
             return qn;
         }
 
-        // Walk the string, splitting on "::"
-        mut start: i64 = 0;
-        mut i: i64 = 0;
-        mut len: i64 = text.length() as i64;
-
-        while (i < len) {
-            // Check for "::" at position i
-            if (i + 1 < len && text[i] == ':' && text[i + 1] == ':') {
-                if (i > start) {
-                    qn.parts.push(table.intern(text.substring(start as u32, (i - start) as u32)));
-                }
-                i += 2;
-                start = i;
-            } else {
-                i++;
-            }
+        const segments: [string] = text.split_nonempty("::");
+        for (mut i: i64 = 0; i < segments.length(); i++) {
+            qn.parts.push(table.intern(segments[i]));
         }
-
-        // Final segment after last "::" (or the whole string if no "::")
-        if (start < len) {
-            qn.parts.push(table.intern(text.substring(start as u32, (len - start) as u32)));
-        }
-
         return qn;
     }
 
@@ -148,19 +131,9 @@ type struct QualifiedName {
     /// resolved in scope, with every later segment resolved within whatever it
     /// named - so a caller deciding who owns a path needs this one specifically.
     static head_of(s: string) -> string {
-        const len: i64 = s.length() as i64;
-        for (mut i: i64 = 0; i + 1 < len; i++) {
-            if (s[i] == ':' && s[i + 1] == ':') {
-                if (i == 0) { return ""; }
-                const buf: i8* = libc::malloc((i + 1) as u64) as i8*;
-                for (mut j: i64 = 0; j < i; j++) {
-                    buf[j] = s[j] as i8;
-                }
-                buf[i] = 0 as i8;
-                return buf as string;
-            }
-        }
-        return s;
+        const separator: i64 = s.find("::");
+        if (separator < 0) { return s; }
+        return s.substr(0, separator);
     }
 
     /// Extract the last segment after the final "::" in a qualified-name
@@ -169,19 +142,9 @@ type struct QualifiedName {
     /// Operates on the raw-string form (for callers holding a flat name
     /// rather than a structured QualifiedName).
     static leaf_of(s: string) -> string {
-        const len: i64 = s.length() as i64;
-        mut last_sep: i64 = -1;
-        for (mut i: i64 = 0; i + 1 < len; i++) {
-            if (s[i] == ':' && s[i + 1] == ':') {
-                last_sep = i;
-            }
-        }
-        if (last_sep < 0) { return s; }
-        const start: i64 = last_sep + 2;
-        if (start >= len) { return ""; }
-        // Use format("%s") on the tail pointer to create a safe copy
-        const tail: string = s + start;
-        return fmt::format("%s", tail);
+        const separator: i64 = s.rfind("::");
+        if (separator < 0) { return s; }
+        return s.substr(separator + 2, s.length() - separator - 2);
     }
 
     /// How many "::"-separated segments a raw name string has.
@@ -191,16 +154,10 @@ type struct QualifiedName {
     /// this.  Empty is zero segments rather than one, so that a name and the
     /// absence of one do not report the same length.
     static segment_count(s: string) -> u32 {
-        const len: i64 = s.length() as i64;
-        if (len == 0) { return 0; }
-        mut n: u32 = 1;
-        for (mut i: i64 = 0; i + 1 < len; i++) {
-            if (s[i] == ':' && s[i + 1] == ':') {
-                n = n + 1;
-                i = i + 1;
-            }
-        }
-        return n;
+        if (s.length() == 0) { return 0; }
+        const separator: Str = Str::from("::");
+        mut segments: implement Iterator<Str> = Str::from(s).split(&separator);
+        return segments.count() as u32;
     }
 
     /// Inverse of `leaf_of`: return everything BEFORE the final "::".
@@ -210,23 +167,9 @@ type struct QualifiedName {
     /// Returns the empty string when the input has no "::" (single-segment
     /// names like a primitive have no parent path).
     static parent_of(s: string) -> string {
-        const len: i64 = s.length() as i64;
-        mut last_sep: i64 = -1;
-        for (mut i: i64 = 0; i + 1 < len; i++) {
-            if (s[i] == ':' && s[i + 1] == ':') {
-                last_sep = i;
-            }
-        }
-        if (last_sep <= 0) { return ""; }
-        // Copy the prefix [0, last_sep) into a fresh buffer.  format()
-        // doesn't implement the `%.*s` precision spec; build the string
-        // manually so the caller owns a stable copy.
-        const buf: i8* = libc::malloc((last_sep + 1) as u64) as i8*;
-        for (mut i: i64 = 0; i < last_sep; i++) {
-            buf[i] = s[i] as i8;
-        }
-        buf[last_sep] = 0 as i8;
-        return buf as string;
+        const separator: i64 = s.rfind("::");
+        if (separator <= 0) { return ""; }
+        return s.substr(0, separator);
     }
 
     /// Shorten every qualified path in `s` to its leaf, keeping all
@@ -252,17 +195,17 @@ type struct QualifiedName {
         mut i: i64 = 0;
         while (i < len) {
             const c: char = s[i];
-            if (c.is_alpha() || c == '_') {
+            if (Lexer::is_identifier_start(c)) {
                 // Scan an identifier path: <ident> ("::" <ident>)*
                 mut leaf_start: i64 = i;
-                while (i < len && ((s[i] as char).is_alphanumeric() || s[i] == '_')) { i += 1; }
+                while (i < len && Lexer::is_identifier_continue(s[i] as char)) { i += 1; }
                 while (i + 2 < len
                        && s[i] == ':' as i8
                        && s[i + 1] == ':' as i8
-                       && ((s[i + 2] as char).is_alpha() || s[i + 2] == '_')) {
+                       && Lexer::is_identifier_start(s[i + 2] as char)) {
                     i += 2;
                     leaf_start = i;
-                    while (i < len && ((s[i] as char).is_alphanumeric() || s[i] == '_')) { i += 1; }
+                    while (i < len && Lexer::is_identifier_continue(s[i] as char)) { i += 1; }
                 }
                 for (mut j: i64 = leaf_start; j < i; j++) {
                     buf[out_idx] = s[j] as i8;

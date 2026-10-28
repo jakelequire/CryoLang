@@ -21,7 +21,7 @@ import utils::log::{ Log, LogArea, LogLevel };
 import std::fmt;
 import std::fs::file;
 import std::fs::metadata::{ metadata };
-import std::fs::path::{ Path };
+import std::fs::path::{ Path, PathBuf };
 import std::fs::dir::{ ReadDir };
 import std::collections::{ hashmap, pair };
 import std::collections::string::{ String };
@@ -237,7 +237,7 @@ public:
                                      || this.project_root.eq(".")) {
                 rel
             } else {
-                fmt::format("%s/%s", this.project_root, rel)
+                Path::from(this.project_root).join(rel).into_raw()
             };
             Log::debug(LogArea::Loader, f"scanning extra root {root}");
             this.scan_all_project_files(intern, root);
@@ -269,7 +269,7 @@ public:
                 Option::Some(entry) => {
                     mut name_s: String = String::with_null(entry.name());
                     const name: string = name_s.as_ptr() as string;
-                    const full_path: string = fmt::format("%s/%s", dir, name);
+                    const full_path: string = Path::from(dir).join(name).into_raw();
                     if (metadata::is_dir(Path::from(full_path))) {
                         // `tests/negative/` holds compile-fail cases (files that
                         // are intentionally malformed so the compiler rejects
@@ -318,7 +318,7 @@ public:
                 Option::Some(entry) => {
                     mut name_s: String = String::with_null(entry.name());
                     const name: string = name_s.as_ptr() as string;
-                    const full_path: string = fmt::format("%s/%s", dir, name);
+                    const full_path: string = Path::from(dir).join(name).into_raw();
 
                     if (metadata::is_dir(Path::from(full_path))) {
                         // `tests/projects/` are independent sub-packages (see
@@ -421,7 +421,7 @@ public:
     resolve_import_path(&this, intern: InternTable*, written: SymbolStr, from_dir: string) -> string {
         const found: string = this.resolve_written_path(intern.resolve(written));
         if (found.length() > 0 || from_dir.length() == 0) { return found; }
-        return this.search_location(from_dir, ModuleLoader::replace_separator(intern.resolve(written)));
+        return this.search_location(from_dir, intern.resolve(written).replace("::", "/"));
     }
 
     /// `resolve_import_path`'s search before the writing file's directory.
@@ -479,8 +479,7 @@ public:
             return from_map.unwrap();
         }
 
-        // Convert :: to /
-        const fs_path: string = ModuleLoader::replace_separator(import_path);
+        const fs_path: string = import_path.replace("::", "/");
 
         // Search locations in priority order
         // 1. Project root
@@ -1089,39 +1088,36 @@ public:
     }
 
     static exists_under(base_dir: string, relative: string) -> boolean {
-        return metadata::exists(Path::from(fmt::format("%s/%s", base_dir, relative)));
+        const candidate: PathBuf = Path::from(base_dir).join(relative);
+        return metadata::exists(candidate.as_path());
     }
 
     /// `base_dir/relative`, each component of `relative` replaced by the
     /// entry of its directory that it names.
     static spelled_as_on_disk(base_dir: string, relative: string) -> string {
-        mut spelled: String = String::new();
+        mut spelled: PathBuf = PathBuf::from(base_dir);
         const separator: Str = Str::new("/");
         for (component in Str::new(relative).split(&separator)) {
-            const directory: string = if (spelled.is_empty()) { base_dir }
-                else { fmt::format("%s/%s", base_dir, spelled.as_cstr() as string) };
-            const entry: String = ModuleLoader::entry_named(directory, component);
-            if (!spelled.is_empty()) { spelled.push("/"); }
+            const entry: String = ModuleLoader::entry_named(spelled.as_path(), component);
             spelled.push(entry.as_str());
         }
-        return fmt::format("%s/%s", base_dir, spelled.as_cstr() as string);
+        return spelled.into_raw();
     }
 
     /// The entry of `directory` that `name` names: the one spelled exactly
     /// so, else the first equal to it ignoring ASCII case, else `name`.
-    static entry_named(directory: string, name: Str) -> String {
-        mut entries: ReadDir = match (dir::read_dir(Path::from(directory))) {
+    static entry_named(directory: Path, name: Str) -> String {
+        mut entries: ReadDir = match (dir::read_dir(directory)) {
             Result::Ok(r)  => { r }
             Result::Err(_) => { return String::from_str(name); }
         };
-        const folded: String = name.to_ascii_lowercase();
         mut found: Option<String> = Option::None;
         loop {
             match (entries.next()) {
                 Option::Some(entry) => {
                     const entry_name: Str = entry.name();
                     if (entry_name == name) { return String::from_str(name); }
-                    if (found.is_none() && entry_name.to_ascii_lowercase().as_str() == folded.as_str()) {
+                    if (found.is_none() && entry_name.equals_case_insensitive(&name)) {
                         found = Option::Some(String::from_str(entry_name));
                     }
                 }
@@ -1573,32 +1569,6 @@ public:
         return result;
     }
 
-    /// Replace :: with / in an import path.
-    static replace_separator(path: string) -> string {
-        const len: i64 = path.length() as i64;
-        if (len == 0) { return path; }
-
-        const buf: i8* = libc::malloc(len as u64 + 1) as i8*;
-        mut j: i64 = 0;
-
-        for (mut i: i64 = 0; i < len; i++) {
-            if (path[i] == 58 && i + 1 < len && path[i + 1] == 58) {  // '::'
-                const p: i8* = buf + j;
-                *p = 47 as i8;  // '/'
-                j += 1;
-                i += 1;  // skip second ':'
-            } else {
-                const p: i8* = buf + j;
-                const byte: i8 = path[i] as i8;
-                *p = byte;
-                j += 1;
-            }
-        }
-
-        const term: i8* = buf + j;
-        *term = 0 as i8;
-        return buf as string;
-    }
 
     /// Convert PascalCase/camelCase to snake_case, handling acronyms.
     /// "PassID" -> "pass_id", "ASTValidation" -> "ast_validation".

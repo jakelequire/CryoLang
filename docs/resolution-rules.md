@@ -802,6 +802,19 @@ yet is recorded with the change that builds it, not here.
      `IoError::from_wsa` are `match`es on the `syscall` constants.
      (Jake; the identifier rule's home delegated)
 
+645. **The compiler and the LSP split names and join paths through the
+     standard library.**  A qualified name's head, leaf, parent and segment
+     count are `string.find`, `rfind`, `substr` and `Str.split`;
+     `QualifiedName::leaf_of` is the one leaf operation, which bindgen and
+     completion use too.  `::` becomes `/` by `string.replace`, a name's
+     segments are `string.split_nonempty` or `Str.split`, and a module's
+     first segment below another is `Str.split_once`.  A directory and a
+     name are joined by `Path.join`, never `"%s/%s"`, so a directory
+     ending in a separator gets no second one and a segment carrying its
+     own root replaces the directory.  Where a project root of `.` means
+     "here", that test stays at the call site: `Path.join` does not drop a
+     `.`.  (Jake)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

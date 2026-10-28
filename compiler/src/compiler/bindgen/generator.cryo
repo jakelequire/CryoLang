@@ -52,6 +52,7 @@ import compiler::ast::declaration::{
 import compiler::ast::node::{ ProgramNode };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::qualified_name::{ QualifiedName };
 import utils::keyword::{ Keyword };
 
 /// Bump whenever the emitted binding format changes (a new field shape, a
@@ -656,7 +657,7 @@ type struct BindingSerializer {
                 // bare tag since it lives under this file's namespace.  Apply the
                 // same keyword-escape as the decl site so a reference to a
                 // keyword-named type stays consistent.
-                return BindingSerializer::ident(BindingSerializer::last_segment(
+                return BindingSerializer::ident(QualifiedName::leaf_of(
                     this.ctx.intern_table.resolve(n.name)));
             }
             TypeAnnotation::Array(a) => {
@@ -689,15 +690,6 @@ type struct BindingSerializer {
         return name;
     }
 
-    /// The segment after the final `::` (e.g. `RayLib::Color` -> `Color`).
-    static last_segment(s: string) -> string {
-        const n: i64 = s.length() as i64;
-        mut after: i64 = 0;
-        for (mut i: i64 = 0; i + 1 < n; i++) {
-            if (s[i] == ':' && s[i + 1] == ':') { after = i + 2; }
-        }
-        return s + after;
-    }
 
     static contains(list: &[string], s: string) -> boolean {
         for (mut i: i64 = 0; i < list.length(); i++) {
@@ -760,7 +752,7 @@ type struct VendorGenerator {
         // Build the shared clang args: `-I<abs include dir>` and `-D<define>`.
         mut extra: [u8*] = [];
         for (mut i: i64 = 0; i < include_dirs.length(); i++) {
-            const inc: string = VendorGenerator::join(source_path, include_dirs[i]);
+            const inc: string = Path::from(source_path).join(include_dirs[i]).into_raw();
             extra.push(fmt::format("-I%s", inc) as u8*);
         }
         for (mut i: i64 = 0; i < defines.length(); i++) {
@@ -969,18 +961,6 @@ type struct VendorGenerator {
         *arr = out;
     }
 
-    /// `<base>/<rel>` (or `rel` when already absolute-ish).
-    static join(base_text: string, rel_text: string) -> string {
-        const base: string = base_text;
-        const rel: string = rel_text;
-        if (rel.length() == 0) { return base; }
-        if (rel[0] == '/' || rel[0] == '\\'
-            || (rel.length() > 1 && rel[1] == ':')) {
-            return rel;   // already absolute (POSIX or Windows drive)
-        }
-        return fmt::format("%s/%s", base, rel);
-    }
-
     /// Resolve a manifest header name to an existing file: try each include dir
     /// under source_path, then source_path itself, then the name verbatim.
     static resolve_header(source_path_text: string, include_dirs: &[string],
@@ -988,11 +968,10 @@ type struct VendorGenerator {
         const header: string = header_text;
         const source_path: string = source_path_text;
         for (mut i: i64 = 0; i < include_dirs.length(); i++) {
-            const cand: string = fmt::format("%s/%s/%s",
-                source_path, include_dirs[i], header);
+            const cand: string = Path::from(source_path).join(include_dirs[i]).join(header).into_raw();
             if (metadata::exists(Path::from(cand))) { return cand; }
         }
-        const direct: string = fmt::format("%s/%s", source_path, header);
+        const direct: string = Path::from(source_path).join(header).into_raw();
         if (metadata::exists(Path::from(direct))) { return direct; }
         if (metadata::exists(Path::from(header))) { return header; }
         return "";
