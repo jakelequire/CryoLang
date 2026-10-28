@@ -479,6 +479,18 @@ yet is recorded with the change that builds it, not here.
      NaN-ignoring float `min`/`max`.  `f32` has `f64`'s class methods.
      (Jake)
 
+621. **A constant pattern is held to the subject's type.**  A constant
+     pattern - a bare name, a module path or a type path - matches only
+     a value of the constant's own type; any other is E0200 at the
+     pattern, as a literal of the wrong kind is, wherever the pattern
+     stands (a payload position is held to the payload's type).  A
+     constant of a type no pattern compares by value - a struct, an
+     enum with a payload - is E0113.  A float constant compares as `==`
+     does, ordered: a NaN constant matches nothing, a NaN subject
+     matches no constant, and `0.0` and `-0.0` match each other.  A
+     `string` constant compares by content, as a string literal pattern
+     does.  (Jake)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

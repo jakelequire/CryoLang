@@ -1,0 +1,102 @@
+/// A constant pattern compares the subject with the constant's value as the
+/// subject's own type compares: a float as `==` does - `0.0` and `-0.0`
+/// equal, NaN equal to nothing - and a `string` by content, in a payload as
+/// at the top.  A float constant compared bit for bit, or a string constant
+/// compared by address, would fail a check below.
+namespace ConstantPatternValuesCompare::Main;
+
+import std::ffi::libc::{ printf };
+
+const HALF: f64 = 0.5;
+const ZERO: f64 = 0.0;
+const NEGATIVE_ZERO: f64 = -0.0;
+const THIRD: f32 = 0.25;
+const GREETING: string = "hello";
+
+function wide(f: f64) -> i32 {
+    return match (f) {
+        HALF          => { 1 }
+        f64::INFINITY => { 2 }
+        f64::NAN      => { 3 }
+        _             => { 0 }
+    };
+}
+
+function zero(f: f64) -> i32 {
+    return match (f) {
+        NEGATIVE_ZERO => { 1 }
+        _             => { 0 }
+    };
+}
+
+function positive_zero(f: f64) -> i32 {
+    return match (f) {
+        ZERO => { 1 }
+        _    => { 0 }
+    };
+}
+
+function narrow(f: f32) -> i32 {
+    return match (f) {
+        THIRD    => { 1 }
+        f32::MAX => { 2 }
+        _        => { 0 }
+    };
+}
+
+function in_payload(o: Option<f64>) -> i32 {
+    return match (o) {
+        Option::Some(HALF) => { 1 }
+        Option::Some(_)    => { 2 }
+        Option::None       => { 0 }
+    };
+}
+
+function greeting(s: string) -> i32 {
+    return match (s) {
+        GREETING => { 1 }
+        _        => { 0 }
+    };
+}
+
+function greeting_in_payload(o: Option<string>) -> i32 {
+    return match (o) {
+        Option::Some(GREETING) => { 1 }
+        _                      => { 0 }
+    };
+}
+
+function check(passed: mut &i32, total: mut &i32, got: i32, want: i32, what: string) -> void {
+    *total = *total + 1;
+    if (got == want) { *passed = *passed + 1; } else { printf("FAIL %s: got %d, want %d\n", what, got, want); }
+}
+
+function main() -> i32 {
+    mut passed: i32 = 0;
+    mut total: i32 = 0;
+    // A string built at run time, at an address no constant shares.
+    mut built: string = "hel";
+    built = built + "lo";
+
+    check(&passed, &total, wide(0.5), 1, "f64 constant");
+    check(&passed, &total, wide(0.25), 0, "f64 other value");
+    check(&passed, &total, wide(f64::INFINITY), 2, "f64 infinity");
+    check(&passed, &total, wide(f64::NEG_INFINITY), 0, "f64 negative infinity");
+    check(&passed, &total, wide(f64::NAN), 0, "NaN subject matches no constant");
+    check(&passed, &total, zero(0.0), 1, "0.0 matches -0.0");
+    check(&passed, &total, zero(-0.0), 1, "-0.0 matches -0.0");
+    check(&passed, &total, positive_zero(-0.0), 1, "-0.0 matches 0.0");
+    check(&passed, &total, zero(f64::NAN), 0, "NaN against zero");
+    check(&passed, &total, narrow(0.25), 1, "f32 constant");
+    check(&passed, &total, narrow(f32::MAX), 2, "f32 type constant");
+    check(&passed, &total, narrow(0.5), 0, "f32 other value");
+    check(&passed, &total, in_payload(Option::Some(0.5)), 1, "float constant in a payload");
+    check(&passed, &total, in_payload(Option::Some(1.5)), 2, "float payload other value");
+    check(&passed, &total, greeting(built), 1, "string constant by content");
+    check(&passed, &total, greeting("help"), 0, "string other content");
+    check(&passed, &total, greeting_in_payload(Option::Some(built)), 1, "string constant in a payload");
+    check(&passed, &total, greeting_in_payload(Option::Some("x")), 0, "string payload other content");
+
+    printf("constant pattern values compare: %d of %d checks passed\n", passed, total);
+    return if (passed == total) { 0 } else { 1 };
+}

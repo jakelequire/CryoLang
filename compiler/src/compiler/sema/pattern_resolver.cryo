@@ -28,7 +28,7 @@ import compiler::compilation_context::{ CompilationContext };
 import compiler::sema::{ state, type_utils, symbolic_checker, scope_manager, helpers };
 import std::fmt;
 import compiler::ast::expression::{ ExpressionNode };
-import compiler::ast::pattern::{ EnumPattern, MatchArmNode, Pattern, PatternKind, RangePattern };
+import compiler::ast::pattern::{ ConstantPattern, EnumPattern, MatchArmNode, Pattern, PatternKind, RangePattern };
 import compiler::ast::statement::{ Stmt, StmtKind };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span::{ SourceSpan };
@@ -112,6 +112,7 @@ type struct PatternResolver {
                     }
                 }
                 PatternKind::Enum(e) => { this.bind_enum_pattern(e, subject_type, caller_backed); }
+                PatternKind::Constant(c) => { this.check_constant_pattern(pat, c, subject_type); }
                 _ => { }
             }
         }
@@ -441,7 +442,8 @@ type struct PatternResolver {
         } else { [] };
         for (mut j: i64 = 0; j < enum_pat.elements.length(); j++) {
             mut elem_ty: TypeRef = if (value_type.is_valid()) { this.arena.get_void() } else { TypeRef::invalid() };
-            if (j < payload_types.length() && payload_types[j].is_valid()) {
+            const payload_known: boolean = j < payload_types.length() && payload_types[j].is_valid();
+            if (payload_known) {
                 elem_ty = payload_types[j];
             } else if (value_type.is_valid()) {
                 elem_ty = value_type;
@@ -455,8 +457,79 @@ type struct PatternResolver {
                 continue;
             }
             const sub: Pattern* = enum_pat.sub_at(j);
-            if (sub != null) { this.bind_subpattern(sub, elem_ty, caller_backed); }
+            if (sub == null) { continue; }
+            match (sub.kind) {
+                // The subject's type stands in for a payload the variant does
+                // not declare; a constant is held to the payload alone.
+                PatternKind::Constant(c) => {
+                    if (payload_known) { this.check_constant_pattern(sub, c, elem_ty); }
+                }
+                _ => { this.bind_subpattern(sub, elem_ty, caller_backed); }
+            }
         }
+    }
+
+    /// Refuse a constant pattern that cannot be compared with a value of
+    /// `value_type`.  Codegen compares the value with the constant's value as
+    /// it would with a literal of the value's own type, so a constant of any
+    /// other type - a `u32` against an `i32`, an integer against a `boolean` -
+    /// would be read at the value's width and match a value it does not equal
+    /// (E0200).  A constant of a type no pattern compares by value - a struct,
+    /// an enum carrying a payload - has no comparison to emit (E0113).
+    check_constant_pattern(mut &this, pat: Pattern*, c: ConstantPattern*, value_type: TypeRef) -> void {
+        const constant_type: TypeRef = this.constant_pattern_type(c);
+        if (!value_type.is_valid() || !constant_type.is_valid()) { return; }
+        if (this.symbolic.symbolic_type_unresolved(value_type)
+                || this.symbolic.symbolic_type_unresolved(constant_type)) { return; }
+        const written: string = this.intern.resolve(c.name);
+        if (!value_type.equals(constant_type)) {
+            mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0200_TYPE_MISMATCH,
+                fmt::format("constant `%s` of type `%s` cannot match a value of type `%s`", written,
+                    this.arena.resolve_display_name(constant_type),
+                    this.arena.resolve_display_name(value_type)));
+            diag = diag.at_with_label(pat.span,
+                fmt::format("expected a constant of type `%s`", this.arena.resolve_display_name(value_type)));
+            diag = diag.with_note("a constant pattern compares only with a value of the constant's own type");
+            this.ctx.emit_diagnostic(diag);
+            return;
+        }
+        if (this.compares_by_value(constant_type)) { return; }
+        mut refusal: Diagnostic = Diagnostic::error(ErrorCode::E0113_INVALID_PATTERN,
+            fmt::format("constant `%s` of type `%s` cannot be matched against", written,
+                this.arena.resolve_display_name(constant_type)));
+        refusal = refusal.at_with_label(pat.span, "not comparable in a pattern");
+        refusal = refusal.with_note(
+            "a constant pattern compares an integer, `char`, `boolean`, float, `string` or payload-less enum value");
+        this.ctx.emit_diagnostic(refusal);
+    }
+
+    /// The type of the constant `c` names: the path it was written as, typed
+    /// by sema before the arm is bound, or the local or module-level constant
+    /// its name answers.  Invalid for a name refused where it was written.
+    constant_pattern_type(&this, c: ConstantPattern*) -> TypeRef {
+        if (c.path != null) { return c.path.resolved_type; }
+        return match (c.res) {
+            ResSlot::Answered(Res::Local(s)) => { this.scopes.type_of(s) }
+            ResSlot::Answered(Res::Def(_))   => { this.types.spelling_global(c.res) }
+            _                                => { TypeRef::invalid() }
+        };
+    }
+
+    /// Whether a pattern compares values of type `t` by value: the scalar
+    /// kinds, `string` by content, and an enum none of whose variants
+    /// carries a payload, by its tag.
+    compares_by_value(&this, t: TypeRef) -> boolean {
+        const ty: Type* = this.arena.lookup(t);
+        if (ty == null) { return false; }
+        return match (ty.kind) {
+            TypeKind::Int    => { true }
+            TypeKind::Char   => { true }
+            TypeKind::Bool   => { true }
+            TypeKind::Float  => { true }
+            TypeKind::String => { true }
+            TypeKind::Enum   => { ty.as_enum().is_simple_enum() }
+            _                => { false }
+        };
     }
 
     /// Bind names in an arbitrary nested pattern matched against `value_type`.

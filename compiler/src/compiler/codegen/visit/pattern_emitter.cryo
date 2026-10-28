@@ -443,17 +443,8 @@ type struct PatternEmitter {
                     }
                 }
                 PatternKind::Constant(constant) => {
-                    // The identifier names a `const`: compare the subject
-                    // against the constant's loaded value, like a literal arm.
-                    const pat_val: LValue =
-                        this.codegen_constant_value(constant, minfo.subject_ty);
-                    if (pat_val.is_valid()) {
-                        const coerced: LValue =
-                            this.cg.expr_ops.coerce_icmp_operands(subject, pat_val,
-                                                 minfo.subject_ty);
-                        cmp = this.cg.builder.build_icmp(LIntPredicate::EQ,
-                            subject, coerced, fmt::format("%s.cmp", name_prefix));
-                    }
+                    cmp = this.constant_pattern_test(subject, constant, minfo.subject_ty,
+                        fmt::format("%s.cmp", name_prefix));
                 }
                 PatternKind::Range(range) => {
                     // Inclusive `lo..hi` range: `lo <= subject && subject <= hi`.
@@ -728,10 +719,8 @@ type struct PatternEmitter {
                         // The payload is compared against the constant as a
                         // whole subject of the payload's type would be.
                         const lv: LValue = this.cg.builder.build_load(field_llvm, field_ptr, "pat.fld");
-                        const cv: LValue = this.codegen_constant_value(constant, field_ref);
-                        if (!cv.is_valid()) { this.cg.builder.build_br(miss_bb); return; }
-                        const coerced: LValue = this.cg.expr_ops.coerce_icmp_operands(lv, cv, field_ref);
-                        const c: LValue = this.cg.builder.build_icmp(LIntPredicate::EQ, lv, coerced, "pat.eq");
+                        const c: LValue = this.constant_pattern_test(lv, constant, field_ref, "pat.eq");
+                        if (!c.is_valid()) { this.cg.builder.build_br(miss_bb); return; }
                         this.cg.builder.build_cond_br(c, success_bb, miss_bb);
                     } else if (nested_ty != null) {
                         this.emit_enum_pattern_test(sub,
@@ -752,6 +741,27 @@ type struct PatternEmitter {
 
 
     // Pattern-value lowering
+
+    /// The test that `value`, of type `value_type`, equals the constant a
+    /// constant pattern names - sema has held the constant to that type.  A
+    /// float compares as `==` does, ordered: a NaN equals nothing, NaN
+    /// included, and `-0.0` equals `0.0`.  A string compares by content, as
+    /// a string literal pattern does.  Anything else compares as an integer.
+    /// Null when the constant has no value to compare.
+    constant_pattern_test(mut &this, value: LValue, constant: ConstantPattern*, value_type: TypeRef,
+                          name: string) -> LValue {
+        const pat_val: LValue = this.codegen_constant_value(constant, value_type);
+        if (!pat_val.is_valid()) { return LValue::null(); }
+        const t: Type* = this.cg.arena_type(value_type);
+        if (t != null && t.kind == TypeKind::Float) {
+            return this.cg.builder.build_fcmp(LRealPredicate::OEQ, value, pat_val, name);
+        }
+        if (t != null && t.kind == TypeKind::String) {
+            return this.cg.expr_ops.codegen_string_compare(value, pat_val, TokenType::EqualEqual);
+        }
+        const coerced: LValue = this.cg.expr_ops.coerce_icmp_operands(value, pat_val, value_type);
+        return this.cg.builder.build_icmp(LIntPredicate::EQ, value, coerced, name);
+    }
 
     /// A constant pattern's value, loaded for comparison: `res` says what
     /// the constant's name refers to.  A local constant is its slot; a
