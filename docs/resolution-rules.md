@@ -778,6 +778,11 @@ yet is recorded with the change that builds it, not here.
      private.  An intrinsic declaration takes a visibility like any
      function.  (Jake; the hex step delegated)
 
+643. **`hash_str` is gone.**  A string's hash is `core::hash::digest`,
+     which `hash_str` only delegated to; the compiler's resolution map and
+     the LSP's diagnostic ids call `digest` directly.  `hash_int` stays
+     public.  (Jake)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that
