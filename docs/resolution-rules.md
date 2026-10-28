@@ -584,6 +584,16 @@ yet is recorded with the change that builds it, not here.
      where they are used.  `string.is_under` stays until a general path
      API replaces it.  (Jake)
 
+629. **`fs::metadata` and `env` are marked.**  `metadata`,
+     `symlink_metadata`, `exists`, `is_file`, `is_dir`, `FileType` and
+     `Metadata` with its accessors are public; `Metadata`'s fields, the
+     platform record offsets, the synthesized Windows permission bits and
+     the decoding steps are private.  `env`'s functions are public, the
+     argument and environment vectors it holds are private, and
+     `set_args` and `set_env`, the language items the generated entry
+     point calls to publish them, are internal, as the f-string builders
+     are.  (Jake; internal for the two entry-point items delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

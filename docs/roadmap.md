@@ -476,7 +476,8 @@ Left over from that: the async entry point calls `Executor::new` and
    `time::clock::sleep`, and a `FILETIME` becomes a `SystemTime` one way
    (626).  A process exits through `sys::exit` and shells out through
    `Command::shell` alone (627).  The compiler's C-literal, number,
-   identifier and suffix helpers left `core` (628).  Open: whether
+   identifier and suffix helpers left `core` (628).  `fs::metadata` and
+   `env` are marked (629).  Open: whether
    `string.is_under`, which the compiler asks of a module's file, gives
    way to a component-wise `Path` prefix test.  Open: a writer over a fixed
    region - SHA-1's digest, the generator's fill, `pack_sockaddr_in` and
