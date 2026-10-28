@@ -761,6 +761,12 @@ yet is recorded with the change that builds it, not here.
      are private behind its accessors, and `decode_wstatus` is private
      to POSIX.  (Jake; the variant's and the parameter's names delegated)
 
+641. **`HashMapIter` is internal.**  It is reached only through
+     `HashMap::iter`'s opaque `implement Iterator<Pair<K, V>>`, like the
+     other adapters, and stays internal rather than private because
+     `HashSetIter` holds one.  The compiler holds those iterators as
+     `implement Iterator<Pair<K, V>>` locals.  (Jake)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that
