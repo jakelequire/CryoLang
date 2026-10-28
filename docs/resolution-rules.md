@@ -607,6 +607,21 @@ yet is recorded with the change that builds it, not here.
      condition variable's way to pair with a mutex.  A member of a private
      type is written `private`.  (Jake; each split delegated)
 
+631. **`thread` and `fmt` are marked.**  Spawning (`spawn`,
+     `spawn_with_attr`, `try_spawn`, `Builder`, `Scope`), `JoinHandle`,
+     `ThreadId`, `Thread`, `ThreadLocal`, the scheduling calls and
+     `MAX_THREAD_NAME`, the cap `Builder.name` truncates to, are public;
+     every handle's OS id and shared block, `ThreadId`'s word (it is
+     opaque, compared through `equals`), the result block, the start
+     payloads, their trampolines and the detached-thread reaper are
+     private.  `fmt`'s print calls, `Formatter` (its writer private behind
+     `get_writer`), `Display`, `Debug`, `FmtWrite`, `FmtError`,
+     `Arguments`, `parse_f64` and the to-string calls are public.  The
+     f-string `String` builders are internal language items, as the pieces
+     builders are.  `fmt::spec` is the f-string spec's plumbing: what the
+     spec piece calls is internal, the rest private.  (Jake; each split
+     delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

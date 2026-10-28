@@ -56,8 +56,9 @@ FNR == 1 { flush(); current = FILENAME; depth = 0; ctx = ""; owner = "" }
         }
     }
     if (key != "") {
-        keyword = override[FILENAME " " key]
-        if (keyword == "") keyword = default_keyword[FILENAME]
+        keyword = ""
+        if ((FILENAME " " key) in override) keyword = override[FILENAME " " key]
+        else if (FILENAME in default_keyword) keyword = default_keyword[FILENAME]
         if (keyword == "") { print "UNDECIDED: " FILENAME ":" FNR ": " key; failed[FILENAME] = 1 }
         else if (keyword != "none") {
             used[FILENAME " " key] = 1

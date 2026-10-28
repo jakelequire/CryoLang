@@ -146,11 +146,11 @@ private function os_set_thread_name(tid: u64, name: u8*) -> void {
 // ---------------------------------------------------------------------------
 
 /// Neither actor has reached its terminal point yet.
-const STATE_LIVE:        u8 = 0;
+private const STATE_LIVE:        u8 = 0;
 /// The spawned thread finished and stored its result.
-const STATE_THREAD_DONE: u8 = 1;
+private const STATE_THREAD_DONE: u8 = 1;
 /// The handle detached (or dropped); the result will never be read.
-const STATE_DETACHED:    u8 = 2;
+private const STATE_DETACHED:    u8 = 2;
 
 
 /// Heap control block shared between the spawned thread and the
@@ -158,18 +158,18 @@ const STATE_DETACHED:    u8 = 2;
 /// the thread exits. `result` storage is uninitialized until the thread
 /// writes it; the state machine guarantees no actor reads or drops it
 /// before the write happens-before.
-type struct Shared<T> {
-    state:  Atomic<u8>;
-    result: T;
+private type struct Shared<T> {
+    private state:  Atomic<u8>;
+    private result: T;
 }
 
 /// Heap input to the spawned thread: the body to run plus the moved-in
 /// context and a pointer to the shared control block. Consumed (and
 /// freed) by the trampoline as soon as the thread starts.
-type struct Payload<C, T> {
-    body:   (C) -> T;
-    ctx:    C;
-    shared: Shared<T>*;
+private type struct Payload<C, T> {
+    private body:   (C) -> T;
+    private ctx:    C;
+    private shared: Shared<T>*;
 }
 
 
@@ -178,7 +178,7 @@ type struct Payload<C, T> {
 /// agnostic; the gated `thread_trampoline` wrappers below adapt the C entry
 /// ABI (pthread returns `void*`, Win32's LPTHREAD_START_ROUTINE returns
 /// `DWORD`/`u32`) around this shared logic.
-function thread_body<C, T>(arg: u8*) -> void {
+private function thread_body<C, T>(arg: u8*) -> void {
     const p: Payload<C, T>* = arg as Payload<C, T>*;
     const body:   (C) -> T  = (*p).body;
     const shared: Shared<T>* = (*p).shared;
@@ -205,9 +205,9 @@ function thread_body<C, T>(arg: u8*) -> void {
 /// The C entry point handed to the OS thread creator. One monomorphization
 /// per `(C,T)`, addressable thanks to the generic function-reference fix.
 ![target(unix)]
-function thread_trampoline<C, T>(arg: u8*) -> u8* { thread_body::<C, T>(arg); return null; }
+private function thread_trampoline<C, T>(arg: u8*) -> u8* { thread_body::<C, T>(arg); return null; }
 ![target(windows)]
-function thread_trampoline<C, T>(arg: u8*) -> u32 { thread_body::<C, T>(arg); return 0; }
+private function thread_trampoline<C, T>(arg: u8*) -> u32 { thread_body::<C, T>(arg); return 0; }
 
 /// Create an OS thread running `entry(arg)`, where `entry` is a trampoline
 /// of the platform's entry ABI, and return its joinable id (a pthread id,
@@ -255,7 +255,7 @@ private function os_create_thread(entry: void*, arg: u8*, stack_bytes: u64) -> R
 /// Tear down a control block from the handle side (detach or drop).
 /// Mirrors the trampoline's handshake: announce detachment, and if the
 /// thread has already finished, reclaim the result and the block here.
-function reap_detached<T>(tid: u64, shared: Shared<T>*) -> void {
+private function reap_detached<T>(tid: u64, shared: Shared<T>*) -> void {
     // Let the OS reclaim the thread's own resources when it exits.
     os_detach(tid);
     const prev: u8 = (*shared).state.swap(STATE_DETACHED, MemoryOrder::AcqRel);
@@ -274,13 +274,13 @@ function reap_detached<T>(tid: u64, shared: Shared<T>*) -> void {
 /// Handle to a spawned thread. Carries the OS thread id and the shared
 /// control block. `T` is the body's return type; the context type `C` is
 /// erased (its storage was consumed on the thread).
-type struct JoinHandle<T> {
-    tid:    u64;
-    shared: Shared<T>*;
+public type struct JoinHandle<T> {
+    private tid:    u64;
+    private shared: Shared<T>*;
 
     /// Block until the thread finishes and return its result. Consumes
     /// the handle; the control block is freed here.
-    join(mut this) -> T {
+    public join(mut this) -> T {
         const { tid, shared }: JoinHandle<T> = this;
         os_join(tid);
         // Thread has exited and left the result (it observed STATE_LIVE,
@@ -301,19 +301,19 @@ type struct JoinHandle<T> {
     /// Detach: give up the ability to join. The thread runs to
     /// completion independently; its result is dropped. Consumes the
     /// handle.
-    detach(mut this) -> void {
+    public detach(mut this) -> void {
         const { tid, shared }: JoinHandle<T> = this;
         reap_detached::<T>(tid, shared);
     }
 
     /// True once the thread has finished running its body. Does not
     /// consume the handle and never blocks.
-    is_finished(&this) -> boolean {
+    public is_finished(&this) -> boolean {
         return (*this.shared).state.load(MemoryOrder::Acquire) != STATE_LIVE;
     }
 
     /// The spawned thread's id.
-    id(&this) -> ThreadId {
+    public id(&this) -> ThreadId {
         return ThreadId { raw: this.tid };
     }
 }
@@ -348,7 +348,7 @@ implement<T> trait Drop for struct JoinHandle<T> {
 /// compiles. The bound statically rejects the genuinely-unsafe types on
 /// the thread-safety deny-list (`Rc<T>` and the lock guards), closing the
 /// "move a non-thread-safe value into a thread" hole.
-function spawn<C, T>(ctx: C, body: (C) -> T) -> JoinHandle<T>
+public function spawn<C, T>(ctx: C, body: (C) -> T) -> JoinHandle<T>
 where C: Send, T: Send {
     match (spawn_with_attr::<C, T>(ctx, body, 0)) {
         Result::Ok(h)  => { return h; }
@@ -361,7 +361,7 @@ where C: Send, T: Send {
 /// Fallible spawn with an optional stack size (`0` == OS default). The
 /// per-OS thread creator (`os_create_thread`) applies it - via a
 /// `pthread_attr_t` on POSIX, or `CreateThread`'s `dwStackSize` on Windows.
-function spawn_with_attr<C, T>(ctx: C, body: (C) -> T,
+public function spawn_with_attr<C, T>(ctx: C, body: (C) -> T,
                                stack_bytes: u64) -> Result<JoinHandle<T>, SpawnError>
 where C: Send, T: Send {
     mut alloc: GlobalAlloc = GlobalAlloc::new();
@@ -401,7 +401,7 @@ where C: Send, T: Send {
 
 
 /// Why a spawn failed.
-type enum SpawnError {
+public type enum SpawnError {
     OutOfMemory;
     PermissionDenied;   // EPERM
     ResourceLimit;      // EAGAIN
@@ -410,7 +410,7 @@ type enum SpawnError {
 
 implement enum SpawnError {
     /// Map a `pthread_create` errno return to a `SpawnError`.
-    static from_errno(rc: i32) -> SpawnError {
+    public static from_errno(rc: i32) -> SpawnError {
         return match (rc) {
             1  => { SpawnError::PermissionDenied }  // EPERM
             11 => { SpawnError::ResourceLimit }     // EAGAIN
@@ -432,7 +432,7 @@ implement enum SpawnError {
 ///       Result::Err(e) => { /* back off / report */ }
 ///   }
 ///   ```
-function try_spawn<C, T>(ctx: C, body: (C) -> T) -> Result<JoinHandle<T>, SpawnError>
+public function try_spawn<C, T>(ctx: C, body: (C) -> T) -> Result<JoinHandle<T>, SpawnError>
 where C: Send, T: Send {
     return spawn_with_attr::<C, T>(ctx, body, 0);
 }
@@ -445,7 +445,7 @@ where C: Send, T: Send {
 // `pthread_setname_np` (POSIX); the stack size is applied by
 // `os_create_thread`.  The 15-byte limit is shared by both platforms - it is
 // the POSIX maximum, and well within Windows' SetThreadDescription bound.
-const MAX_THREAD_NAME: u64 = 15;
+public const MAX_THREAD_NAME: u64 = 15;
 
 /// A configurable thread spawn: set a stack size and/or an OS-visible
 /// thread name, then `spawn` (panics on failure) or `try_spawn` (returns
@@ -463,13 +463,13 @@ const MAX_THREAD_NAME: u64 = 15;
 /// POD: a `Builder` owns no resources (the name lives in a fixed inline
 /// buffer), so it is copied by value and needs no `drop`. The same
 /// `C: Send` / `T: Send` thread-safety bounds as `spawn` apply.
-type struct Builder {
-    stack_bytes: u64;       // 0 -> OS default stack size
-    name_buf:    [u8; 16];    // NUL-terminated C string for pthread_setname_np
-    name_len:    u64;       // 0 -> no name set
+public type struct Builder {
+    private stack_bytes: u64;       // 0 -> OS default stack size
+    private name_buf:    [u8; 16];    // NUL-terminated C string for pthread_setname_np
+    private name_len:    u64;       // 0 -> no name set
 
     /// A builder with default attributes: OS-default stack, no name.
-    static new() -> Builder {
+    public static new() -> Builder {
         mut nb: [u8; 16];
         mut i: u64 = 0;
         while (i < 16) { nb[i] = 0; i = i + 1; }
@@ -479,7 +479,7 @@ type struct Builder {
     /// Set the new thread's stack size in bytes. The OS rounds up to a
     /// page and enforces a platform minimum (`PTHREAD_STACK_MIN`); a size
     /// below it surfaces as a spawn error rather than a silent clamp.
-    stack_size(mut this, bytes: u64) -> Builder {
+    public stack_size(mut this, bytes: u64) -> Builder {
         this.stack_bytes = bytes;
         return this;
     }
@@ -487,7 +487,7 @@ type struct Builder {
     /// Set the OS-visible thread name, truncated to 15 bytes (the
     /// `pthread_setname_np` limit). Shows up in `/proc/<pid>/task/*/comm`,
     /// `ps -T`, `top -H`, and debuggers.
-    name(mut this, n: Str) -> Builder {
+    public name(mut this, n: Str) -> Builder {
         mut len: u64 = n.length() as u64;
         if (len > MAX_THREAD_NAME) { len = MAX_THREAD_NAME; }
         const src: u8* = n.as_ptr();
@@ -503,7 +503,7 @@ type struct Builder {
 
     /// Spawn with the configured attributes, panicking on failure. Use
     /// `try_spawn` for a fallible spawn.
-    spawn<C, T>(this, ctx: C, body: (C) -> T) -> JoinHandle<T>
+    public spawn<C, T>(this, ctx: C, body: (C) -> T) -> JoinHandle<T>
     where C: Send, T: Send {
         match (this.try_spawn::<C, T>(ctx, body)) {
             Result::Ok(h)  => { return h; }
@@ -516,7 +516,7 @@ type struct Builder {
     /// Spawn with the configured attributes, returning `Err(SpawnError)`
     /// if the OS rejects the configuration (e.g. an out-of-range stack
     /// size) or cannot create the thread.
-    try_spawn<C, T>(this, ctx: C, body: (C) -> T) -> Result<JoinHandle<T>, SpawnError>
+    public try_spawn<C, T>(this, ctx: C, body: (C) -> T) -> Result<JoinHandle<T>, SpawnError>
     where C: Send, T: Send {
         // The stack size is applied inside `os_create_thread` (a
         // `pthread_attr_t` on POSIX, `dwStackSize` on Windows), so the
@@ -544,42 +544,42 @@ type struct Builder {
 // ---------------------------------------------------------------------------
 
 /// An opaque OS thread identity. Compare with `==` via `equals`.
-type struct ThreadId {
-    raw: u64;
+public type struct ThreadId {
+    private raw: u64;
 
-    equals(&this, other: &ThreadId) -> boolean {
+    public equals(&this, other: &ThreadId) -> boolean {
         return os_thread_equal(this.raw, other.raw);
     }
 }
 
 /// A handle to a running thread (currently just its identity). Returned
 /// by `thread::current()`.
-type struct Thread {
-    id_: ThreadId;
+public type struct Thread {
+    private id_: ThreadId;
 
-    id(&this) -> ThreadId {
+    public id(&this) -> ThreadId {
         return this.id_;
     }
 }
 
 /// The thread invoking this call.
-function current() -> Thread {
+public function current() -> Thread {
     return Thread { id_: ThreadId { raw: os_thread_self() } };
 }
 
 /// Yield the remainder of the current timeslice to the scheduler.
-function yield_now() -> void {
+public function yield_now() -> void {
     os_yield();
 }
 
 /// Sleep the current thread for at least `nanos` nanoseconds, as
 /// `time::clock::sleep` does.
-function sleep(nanos: u64) -> void {
+public function sleep(nanos: u64) -> void {
     clock::sleep(Duration::from_nanos(nanos));
 }
 
 /// Sleep for at least `millis` milliseconds.
-function sleep_ms(millis: u64) -> void {
+public function sleep_ms(millis: u64) -> void {
     sleep(millis * 1000000);
 }
 
@@ -590,15 +590,15 @@ function sleep_ms(millis: u64) -> void {
 
 /// Heap input to a scoped thread: a void-returning body plus its moved-in
 /// context. Freed by the scope trampoline once the body has been invoked.
-type struct ScopePayload<C> {
-    body: (C) -> void;
-    ctx:  C;
+private type struct ScopePayload<C> {
+    private body: (C) -> void;
+    private ctx:  C;
 }
 
 /// Scoped-thread body: moves the context out, frees the payload, runs the
 /// body. Scoped bodies return no value, so there is no result/handshake
 /// machinery. The gated `scope_trampoline` wrappers adapt the C entry ABI.
-function scope_body<C>(arg: u8*) -> void {
+private function scope_body<C>(arg: u8*) -> void {
     const p: ScopePayload<C>* = arg as ScopePayload<C>*;
     const body: (C) -> void = (*p).body;
     const c: C = (*p).ctx;
@@ -608,9 +608,9 @@ function scope_body<C>(arg: u8*) -> void {
 }
 
 ![target(unix)]
-function scope_trampoline<C>(arg: u8*) -> u8* { scope_body::<C>(arg); return null; }
+private function scope_trampoline<C>(arg: u8*) -> u8* { scope_body::<C>(arg); return null; }
 ![target(windows)]
-function scope_trampoline<C>(arg: u8*) -> u32 { scope_body::<C>(arg); return 0; }
+private function scope_trampoline<C>(arg: u8*) -> u32 { scope_body::<C>(arg); return 0; }
 
 /// A thread scope. Every thread spawned through it is guaranteed to be
 /// joined before the scope is torn down (explicitly via `join_all()` or
@@ -629,19 +629,19 @@ function scope_trampoline<C>(arg: u8*) -> u32 { scope_body::<C>(arg); return 0; 
 /// (Cryo has no borrow checker, so the join-before-teardown discipline -
 /// not the type system - is what keeps borrowed data alive; do not let a
 /// scope outlive what its threads point at.)
-type struct Scope {
-    tids:        [u64];
-    stack_bytes: u64;   // per-thread stack; 0 -> OS default
+public type struct Scope {
+    private tids:        [u64];
+    private stack_bytes: u64;   // per-thread stack; 0 -> OS default
 
     /// Create an empty scope whose threads use the OS default stack size.
-    static new() -> Scope {
+    public static new() -> Scope {
         return Scope { tids: [], stack_bytes: 0 };
     }
 
     /// Create a scope whose threads each get a `stack_bytes`-byte stack. Use
     /// this for bodies that recurse deeply (e.g. driving LLVM codegen), where
     /// the ~1 MiB default worker stack would overflow. `0` means OS default.
-    static new_with_stack(stack_bytes: u64) -> Scope {
+    public static new_with_stack(stack_bytes: u64) -> Scope {
         return Scope { tids: [], stack_bytes: stack_bytes };
     }
 
@@ -651,7 +651,7 @@ type struct Scope {
     /// thread-creation failure. `C: Send` - a raw pointer into the scope's
     /// state qualifies (raw pointers are `Send`); a deny-listed type
     /// (`Rc`, a lock guard) does not.
-    spawn<C>(mut &this, ctx: C, body: (C) -> void) -> void
+    public spawn<C>(mut &this, ctx: C, body: (C) -> void) -> void
     where C: Send {
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         mut p: ScopePayload<C>* = null;
@@ -670,7 +670,7 @@ type struct Scope {
     /// Join every thread spawned so far, blocking until all have
     /// finished. Idempotent: clears the recorded set, so a later
     /// drop/join is a no-op.
-    join_all(mut &this) -> void {
+    public join_all(mut &this) -> void {
         const n: i64 = this.tids.length() as i64;
         for (mut i: i64 = 0; i < n; i = i + 1) {
             os_join(this.tids[i]);
@@ -697,7 +697,7 @@ implement trait Drop for struct Scope {
 /// default size for a worker pool. Clamped to at least 1 so a pool always
 /// makes progress. Best-effort: returns 1 if the OS query fails.
 ![target(unix)]
-function available_parallelism() -> u32 {
+public function available_parallelism() -> u32 {
     // _SC_NPROCESSORS_ONLN == 84 on Linux/glibc and the BSDs.
     const n: i64 = libc::sysconf(84);
     if (n <= 0) { return 1; }
@@ -705,7 +705,7 @@ function available_parallelism() -> u32 {
 }
 
 ![target(windows)]
-function available_parallelism() -> u32 {
+public function available_parallelism() -> u32 {
     mut si: syscall::SYSTEM_INFO_PARTIAL = syscall::SYSTEM_INFO_PARTIAL {
         wProcessorArchitecture: 0, wReserved: 0, dwPageSize: 0,
         lpMinimumApplicationAddress: null, lpMaximumApplicationAddress: null,
