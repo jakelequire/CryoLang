@@ -683,6 +683,22 @@ yet is recorded with the change that builds it, not here.
      queue, shared blocks, thunks and worker are private behind `spawn`,
      `block_on` and the join handle.  (Jake; each split delegated)
 
+636. **`collections` is marked.**  `Array`, `String`, `HashMap`,
+     `HashSet`, `Pair`, `RawBuffer` and `from_iter` are public with every
+     method.  An array's storage and allocator, a map's buckets, count,
+     allocator and seed, and a set's map are private behind their methods;
+     a pair keeps public fields, and so does a map's `Entry`, the node
+     `get_bucket` hands to a caller walking a map in place.  The sizes an
+     array, a string and a map start with, the sort steps, the per-process
+     seed generator, a map's seeded hashing and its node allocation are
+     private, while `hash_str` and `hash_int` stay public.  The iterator
+     adapters are private, with `KeysRefIter` internal for the set built
+     on it; `copied` and `cloned`, reached through `iter_ref`'s opaque
+     result, are public.  `HashMapIter` is not marked: the compiler names
+     it.  JSON reads its arrays through `get_ref` and indexing, and the
+     adapters' unused constructors are gone.  (Jake; each split
+     delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that
