@@ -4,7 +4,7 @@
 ///! for error reporting. RFC 8259 strict: no trailing commas, no
 ///! unquoted keys, no comments.
 ///!
-///! `Parser::MAX_DEPTH` caps object/array nesting to prevent stack-blowup on
+///! `MAX_DEPTH` caps object/array nesting to prevent stack-blowup on
 ///! adversarial inputs. The default is generous for hand-authored data
 ///! and tight enough that a malicious 1 MB blob of `[[[...]]]` cannot
 ///! exhaust the stack.
@@ -51,7 +51,11 @@ private const LOWER_U: u8 = 117; // u
 private const LBRACE: u8 = 123; // {
 private const RBRACE: u8 = 125; // }
 
-type struct Parser {
+/// Maximum nesting depth for arrays + objects, combined.  The serializer
+/// bounds its recursion by the same cap.
+internal const MAX_DEPTH: u64 = 256;
+
+private type struct Parser {
     private src:    u8*;
     private len:    u64;
     private pos:    u64;
@@ -59,10 +63,7 @@ type struct Parser {
     private column: u64;
     private depth:  u64;
 
-    /// Maximum nesting depth for arrays + objects, combined.
-    const MAX_DEPTH: u64 = 256;
-
-    static new(text: Str) -> Parser {
+    private static new(text: Str) -> Parser {
         return Parser {
             src:    text.as_ptr(),
             len:    text.length() as u64,
@@ -137,7 +138,7 @@ type struct Parser {
     /// Parse a single value. Caller is responsible for the surrounding
     /// `skip_ws` and trailing-data check; `parse(text)` is the public
     /// entry point that handles those.
-    parse_value(mut &this) -> Result<JsonValue, JsonError> {
+    private parse_value(mut &this) -> Result<JsonValue, JsonError> {
         if (this.eof()) { return Result::Err(this.err_eof()); }
         const b: u8 = this.peek();
         if (b == LBRACE) { return this.parse_object(); }
@@ -482,7 +483,7 @@ type struct Parser {
 
     private parse_array(mut &this) -> Result<JsonValue, JsonError> {
         this.depth = this.depth + 1;
-        if (this.depth > Parser::MAX_DEPTH) {
+        if (this.depth > MAX_DEPTH) {
             return Result::Err(this.err_at(
                 JsonErrorKind::DepthExceeded,
                 Str::new("nesting too deep")
@@ -527,7 +528,7 @@ type struct Parser {
 
     private parse_object(mut &this) -> Result<JsonValue, JsonError> {
         this.depth = this.depth + 1;
-        if (this.depth > Parser::MAX_DEPTH) {
+        if (this.depth > MAX_DEPTH) {
             return Result::Err(this.err_at(
                 JsonErrorKind::DepthExceeded,
                 Str::new("nesting too deep")
@@ -593,7 +594,9 @@ type struct Parser {
 /// Parse a complete JSON document. Returns the parsed value on success,
 /// or a `JsonError` pointing at the first byte that failed to parse.
 /// Trailing whitespace is allowed; trailing non-whitespace produces
-/// `JsonErrorKind::TrailingData`.
+/// `JsonErrorKind::TrailingData`.  Arrays and objects may nest at most
+/// 256 deep, counted together; deeper input fails with
+/// `JsonErrorKind::DepthExceeded`, so hostile input cannot exhaust the stack.
 public function parse(text: Str) -> Result<JsonValue, JsonError> {
     mut p: Parser = Parser::new(text);
     p.skip_ws();

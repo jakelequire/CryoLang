@@ -728,6 +728,24 @@ yet is recorded with the change that builds it, not here.
      `try_catch` caught, is left with `intrinsics`.  (Jake; each split
      delegated)
 
+639. **A path's ancestry is `Path.starts_with`, a descriptor leaves its
+     owner by `into_descriptor`, and the JSON parser is private.**
+     `Path.starts_with(base)` holds when `base` is the path or one of its
+     ancestors, comparing whole components, so `/a/bc` does not start
+     with `/a/b`; a `base` that is the path's whole root (`C:` before
+     `C:dir`) ends at a component, and the empty path is no one's base.
+     `string.is_under` is gone, and the compiler's origin and test
+     placement checks ask `Path.starts_with`, the stdlib check included.
+     `File`, `ChildStdin`, `ChildStdout` and `ChildStderr` keep their
+     descriptor private; `into_descriptor()` hands it to the caller and
+     leaves the owner closed, so its drop closes nothing.  A command's
+     output capture takes its pipes' descriptors that way and closes them
+     itself.  The JSON `Parser`, its `new` and `parse_value` are private
+     behind `parse`, whose documentation states the nesting limit; the
+     limit is a module constant `MAX_DEPTH`, internal because the
+     serializer bounds its recursion by it.  (Jake; the constant's
+     placement delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

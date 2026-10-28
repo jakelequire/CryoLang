@@ -51,6 +51,7 @@ import compiler::types::{ arena, compound, type_base, type_ref, TypeKind, user_d
 import compiler::resolver::symbol_str::{ SymbolStr };
 import utils::log::{ Log, LogArea, LogLevel };
 import std::fmt;
+import std::fs::path::{ Path };
 import compiler::ast::declaration::{
     DeclarationNode, DeclKind, EnumDecl, ExternBlock, FunctionDecl,
     ImplBlock, MethodDecl, StructDecl, TraitDecl, UnionDecl, VarDecl
@@ -1818,19 +1819,6 @@ type struct DirectiveProcessingPasses {
 
     // Test-module placement validation
 
-    /// True if `path` lies under `<project_root>/tests/` (recursively).
-    /// Computes the prefix once and does a byte-wise compare; matches the
-    /// path style cryoc uses internally (always project-relative or absolute,
-    /// never with `..`).
-    static file_is_under_tests_dir(project_root: string, file_path: string) -> boolean {
-        if (project_root.length() == 0) { return false; }
-        const prefix: string = fmt::format("%s/tests/", project_root);
-        const plen: i64 = prefix.length();
-        const flen: i64 = file_path.length();
-        if (flen < plen) { return false; }
-        return file_path.starts_with(prefix);
-    }
-
     /// Enforce the locked design's three placement rules.  Run once per
     /// module after the walk has populated `has_config_testing` and
     /// `has_test_directive`.
@@ -1854,15 +1842,18 @@ type struct DirectiveProcessingPasses {
         if (is_check_mode) { return; }
         const project_root: string = ctx.project_config.project_root;
         const file_path:    string = ctx.source_file;
+        const file:         Path   = Path::from(file_path);
 
         // The stdlib lives outside the project tree but still parses through
         // this pass; never apply test-mode rules to stdlib files.
-        if (ctx.options.stdlib_root.length() > 0
-                && file_path.starts_with(ctx.options.stdlib_root)) {
+        if (file.starts_with(Path::from(ctx.options.stdlib_root))) {
             return;
         }
 
-        const in_tests_dir: boolean = DirectiveProcessingPasses::file_is_under_tests_dir(project_root, file_path);
+        // Paths here are project-relative or absolute, never through `..`,
+        // so a component prefix is the whole question.
+        const in_tests_dir: boolean = project_root.length() > 0
+            && file.starts_with(Path::from(fmt::format("%s/tests", project_root)));
 
         // Rule 1: `![config(testing)]` must live under `tests/`.
         if (has_config_testing && !in_tests_dir) {

@@ -213,21 +213,17 @@ public type struct Command {
         const handle: Child = configured.spawn()?;
         mut c: Child = handle;
 
-        // Hand each descriptor to its drain and neuter the handle it came from.
-        // The handle stays in its slot so the `Child`'s teardown still runs, but
-        // with `-1` it closes nothing — the drain owns the descriptor now, and
+        // Hand each descriptor to its drain, leaving the handle it came from
+        // empty.  The handle stays in its slot so the `Child`'s teardown still
+        // runs, but it closes nothing — the drain owns the descriptor now, and
         // closing it twice could land on a number an unrelated open has reused.
         mut so_fd: i32 = -1;
         if (c.stdout.is_some()) {
-            mut hp: ChildStdout* = c.stdout.unwrap_ptr();
-            so_fd = hp.fd;
-            hp.fd = -1;
+            so_fd = c.stdout.unwrap_ptr().into_descriptor();
         }
         mut se_fd: i32 = -1;
         if (c.stderr.is_some()) {
-            mut hp2: ChildStderr* = c.stderr.unwrap_ptr();
-            se_fd = hp2.fd;
-            hp2.fd = -1;
+            se_fd = c.stderr.unwrap_ptr().into_descriptor();
         }
 
         mut drained: (Result<Array<u8>, IoError>, Result<Array<u8>, IoError>) =
@@ -799,32 +795,23 @@ private function collect_output(c: mut &Child) -> Result<Output, IoError> {
     mut stdout_buffer: Array<u8> = Array::new();
     mut stderr_buffer: Array<u8> = Array::new();
 
-    // Extract raw fds (i32 is Copy, so reading `h.fd` through the match
-    // arm doesn't consume the handle). Put each handle back into its
-    // slot so the existing Drop impls close the fds when `c` drops.
-    // Non-blocking is best-effort: if the kernel won't take the flag, a
-    // drain blocks in `read` instead, after poll(2) reported data.
+    // The drain owns both descriptors and closes them before the wait, so
+    // the handles left in `c` are empty.  Non-blocking is best-effort: if
+    // the kernel won't take the flag, a drain blocks in `read` instead,
+    // after poll(2) reported data.
     mut so_fd:   i32 = -1;
     mut so_open: boolean = false;
-    match (c.stdout) {
-        Option::Some(mut h) => {
-            so_fd   = h.fd;
-            so_open = true;
-            mem::drop(fd::set_nonblocking(so_fd, true));
-            c.stdout = Option::Some(h);
-        }
-        Option::None => { }
+    if (c.stdout.is_some()) {
+        so_fd   = c.stdout.unwrap_ptr().into_descriptor();
+        so_open = true;
+        mem::drop(fd::set_nonblocking(so_fd, true));
     }
     mut se_fd:   i32 = -1;
     mut se_open: boolean = false;
-    match (c.stderr) {
-        Option::Some(mut h) => {
-            se_fd   = h.fd;
-            se_open = true;
-            mem::drop(fd::set_nonblocking(se_fd, true));
-            c.stderr = Option::Some(h);
-        }
-        Option::None => { }
+    if (c.stderr.is_some()) {
+        se_fd   = c.stderr.unwrap_ptr().into_descriptor();
+        se_open = true;
+        mem::drop(fd::set_nonblocking(se_fd, true));
     }
 
     // A drain reads every byte available now: `read_to_end` stops at EOF
@@ -833,7 +820,8 @@ private function collect_output(c: mut &Child) -> Result<Output, IoError> {
     mut so_pipe: BorrowedFileDescriptor = BorrowedFileDescriptor::new(so_fd);
     mut se_pipe: BorrowedFileDescriptor = BorrowedFileDescriptor::new(se_fd);
     mut polls: [libc::pollfd; 2];
-    while (so_open || se_open) {
+    mut failure: Option<IoError> = Option::None;
+    while ((so_open || se_open) && failure.is_none()) {
         mut nfds:   u64 = 0;
         mut so_idx: i64 = -1;
         mut se_idx: i64 = -1;
@@ -857,7 +845,7 @@ private function collect_output(c: mut &Child) -> Result<Output, IoError> {
             const err: IoError = IoError::last_os_error();
             match (err.kind) {
                 IoErrorKind::Interrupted => { continue; }
-                _ => { return Result::Err(err); }
+                _ => { failure = Option::Some(err); continue; }
             }
         }
 
@@ -870,7 +858,7 @@ private function collect_output(c: mut &Child) -> Result<Output, IoError> {
                     Result::Err(e) => {
                         match (e.kind) {
                             IoErrorKind::WouldBlock => { }
-                            _ => { return Result::Err(e); }
+                            _ => { failure = Option::Some(e); continue; }
                         }
                     }
                 }
@@ -885,12 +873,19 @@ private function collect_output(c: mut &Child) -> Result<Output, IoError> {
                     Result::Err(e) => {
                         match (e.kind) {
                             IoErrorKind::WouldBlock => { }
-                            _ => { return Result::Err(e); }
+                            _ => { failure = Option::Some(e); }
                         }
                     }
                 }
             }
         }
+    }
+
+    if (so_fd >= 0) { fd::close_fd(so_fd); }
+    if (se_fd >= 0) { fd::close_fd(se_fd); }
+    match (failure) {
+        Option::Some(e) => { return Result::Err(e); }
+        Option::None    => { }
     }
 
     match (c.wait()) {
@@ -1320,24 +1315,21 @@ private function collect_output(c: mut &Child) -> Result<Output, IoError> {
     mut stderr_buffer: Array<u8> = Array::new();
     mut chunk: [u8; 4096];
 
+    // The drain owns both descriptors and closes them before the wait, so
+    // the handles left in `c` are empty.
     mut so_fd: i32 = -1;
-    match (c.stdout) {
-        Option::Some(mut h) => { so_fd = h.fd; c.stdout = Option::Some(h); }
-        Option::None => { }
-    }
+    if (c.stdout.is_some()) { so_fd = c.stdout.unwrap_ptr().into_descriptor(); }
     mut se_fd: i32 = -1;
-    match (c.stderr) {
-        Option::Some(mut h) => { se_fd = h.fd; c.stderr = Option::Some(h); }
-        Option::None => { }
-    }
+    if (c.stderr.is_some()) { se_fd = c.stderr.unwrap_ptr().into_descriptor(); }
 
+    mut failure: Option<IoError> = Option::None;
     if (so_fd >= 0 && se_fd >= 0) {
         // Both piped: interleave so neither full pipe buffer can wedge the
         // other (the sequential-drain deadlock).
         match (win_drain_interleaved(so_fd, se_fd, &chunk[0], 4096,
                                      &stdout_buffer, &stderr_buffer)) {
             Result::Ok(_)  => { }
-            Result::Err(e) => { return Result::Err(e); }
+            Result::Err(e) => { failure = Option::Some(e); }
         }
     } else if (so_fd >= 0) {
         // One stream has no second pipe to deadlock against: a blocking
@@ -1345,14 +1337,21 @@ private function collect_output(c: mut &Child) -> Result<Output, IoError> {
         mut so_pipe: BorrowedFileDescriptor = BorrowedFileDescriptor::new(so_fd);
         match (so_pipe.read_to_end(&stdout_buffer)) {
             Result::Ok(_)  => { }
-            Result::Err(e) => { return Result::Err(e); }
+            Result::Err(e) => { failure = Option::Some(e); }
         }
     } else if (se_fd >= 0) {
         mut se_pipe: BorrowedFileDescriptor = BorrowedFileDescriptor::new(se_fd);
         match (se_pipe.read_to_end(&stderr_buffer)) {
             Result::Ok(_)  => { }
-            Result::Err(e) => { return Result::Err(e); }
+            Result::Err(e) => { failure = Option::Some(e); }
         }
+    }
+
+    if (so_fd >= 0) { fd::close_fd(so_fd); }
+    if (se_fd >= 0) { fd::close_fd(se_fd); }
+    match (failure) {
+        Option::Some(e) => { return Result::Err(e); }
+        Option::None    => { }
     }
 
     match (c.wait()) {
