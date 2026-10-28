@@ -558,6 +558,18 @@ yet is recorded with the change that builds it, not here.
      dividing by floor so a time before 1970 keeps its nanoseconds in
      range.  (Jake; the last two delegated)
 
+627. **One way to exit, one way to shell out.**  `env::process_exit` is
+     gone: a process exits through `sys::exit`, which on Linux ends it at
+     once (`exit_group`) without flushing the C runtime's buffered output
+     or running its exit handlers, so a caller that printed through the C
+     runtime flushes first (`libc::fflush(null)`), as the compiler does
+     before it exits on an internal error.  `process::exec` and its
+     `shell` are gone: `Command::shell` is the one shell call.  The test
+     runner's `cxx` requirement asks whether `c++ --version` launches by
+     spawning it with both streams discarded, not through a shell, and is
+     unmet on Windows by name, where linking the C++ helper has a gap of
+     its own.  (Jake; the flush and the Windows rule delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

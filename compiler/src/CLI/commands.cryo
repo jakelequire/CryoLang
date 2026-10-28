@@ -19,7 +19,7 @@ import std::fs::metadata;
 import std::fs::dir;
 import std::core::intrinsics;
 import std::core::mem;
-import std::process::exec;
+import std::process::command::{ Command };
 import std::process;
 import std::thread;
 import std::sync::atomic::{ Atomic, MemoryOrder };
@@ -182,7 +182,7 @@ type struct ProjOutcome {
 //     `'build' is not recognized` - so the leading binary path must be
 //     rewritten to backslashes.  `sh` runs the path as-is.
 //     (`cryo test` still routes its forwarded-flag command through
-//     `exec::shell`, so the leading binary path is host-normalized.)
+//     `Command::shell`, so the leading binary path is host-normalized.)
 
 /// Rewrite a path's `/` to `\` so a `cmd`-executed command resolves it.
 /// Windows-host only; never referenced on the POSIX side.
@@ -277,7 +277,7 @@ function shell_jobs_worker(ctx: ShellJobs) -> void {
     loop {
         const k: u64 = (*ctx.cursor).fetch_add(1, MemoryOrder::Relaxed);
         if (k >= ctx.n) { break; }
-        ctx.status[k] = exec::shell(ctx.cmds[k]);
+        ctx.status[k] = Command::shell(ctx.cmds[k]);
         ctx.done[k].store(1, MemoryOrder::Release);
     }
 }
@@ -1475,7 +1475,7 @@ type struct Executor {
         // Windows.  The decoded exit code is surfaced so the caller's `$?`
         // matches what the inner binary returned; a negative value signals a
         // spawn failure.
-        const status: i32 = exec::shell(exec_path(result.output_path));
+        const status: i32 = Command::shell(exec_path(result.output_path));
         if (status < 0) {
             fmt::eprintf("Error: failed to spawn '%s'\n", result.output_path);
             return 1;
@@ -1596,7 +1596,7 @@ type struct Executor {
         // Flush parent stdio before spawning so the build's own output lands
         // before the child's.  Same precaution as `cmd_run`.
         libc::fflush(null);
-        const status: i32 = exec::shell(cmd);
+        const status: i32 = Command::shell(cmd);
         if (status < 0) {
             fmt::eprintf("Error: failed to spawn '%s'\n", result.output_path);
             return 1;
@@ -2387,13 +2387,11 @@ type struct Executor {
             // A C++ toolchain is available.  The C++ direct-mangled-binding test
             // links a `c++`-compiled helper by its Itanium-mangled symbols, so it
             // is meaningless without a C++ compiler (and the Itanium ABI) - skip
-            // cleanly on a host that has none (e.g. native MSVC Windows).
-            // Preserve the exact prior probe: on POSIX `sh` runs `c++
-            // --version` and discards output; on Windows `cmd` cannot honour
-            // the `/dev/null` redirect, so the probe fails and the C++ test
-            // skips (as it did before this migration) rather than unmasking a
-            // separate Windows C++ link gap.
-            return exec::shell("c++ --version > /dev/null 2>&1") == 0;
+            // cleanly on a host that has none.  On Windows the requirement is
+            // unmet on purpose, whatever is installed: linking that helper there
+            // has a gap of its own, which this test does not cover.
+            if (host_os_name() == "windows") { return false; }
+            return passes::CodegenPasses::tool_available("c++");
         }
         // Unreachable for project specs: unknown tokens were already rejected
         // as a hard failure by proj_first_unknown_requirement.

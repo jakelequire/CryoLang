@@ -474,7 +474,8 @@ Left over from that: the async entry point calls `Executor::new` and
    millisecond wait rounds through `Duration.as_millis_ceil`, a deadline
    saturates through `Instant.saturating_add`, `thread::sleep` is
    `time::clock::sleep`, and a `FILETIME` becomes a `SystemTime` one way
-   (626).  Open: a writer over a fixed
+   (626).  A process exits through `sys::exit` and shells out through
+   `Command::shell` alone (627).  Open: a writer over a fixed
    region - SHA-1's digest, the generator's fill, `pack_sockaddr_in` and
    the IPv6 parser still store their bytes by hand - and whether the
    Winsock and OpenSSL error mappers in `net` become `IoError`

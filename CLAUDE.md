@@ -136,10 +136,11 @@ not done. The remaining limits are here so nobody rediscovers them:
 - **A tag off `main` gets `release.yml`'s verify job and nothing else** - CI
   fires only on `main` or a manual dispatch. That job is the last gate before
   a published artifact; keep it in step with what the archive ships.
-- **The `cxx` requirement probe leaks the shell's stderr into the test
-  output.** On Windows `ffi_cpp_link`'s line reads `... The system cannot find
-  the path specified.` and its real verdict lands on the next line. Any parser
-  over `cryo test` output has to tolerate that. Compiler-side; unfixed.
+- **A Windows `make verify` baseline from before the `cxx` requirement stopped
+  probing through the shell still leaks `The system cannot find the path
+  specified.`** onto the last compile-fail file's line, which moves that
+  file's verdict to the next line where verify cannot name it. The tree's own
+  runner no longer prints it; a baseline that old does.
 
 Read the log's **own summary line**, not a chained exit code — `make test;
 echo $?; tail log` reports `tail`'s status.
