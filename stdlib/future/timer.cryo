@@ -40,20 +40,6 @@ import std::future::reactor::{ Reactor };
 import std::time::clock::{ Instant };
 import std::time::duration::{ Duration };
 
-/// `now + dur` as a monotonic-nanosecond deadline, saturating at `i64::MAX`,
-/// the largest monotonic-nanosecond reading, at every step.
-///
-/// Built from the `(secs, nanos)` pair rather than `Duration::as_nanos`, whose
-/// own `secs * 1e9` product wraps a `u64` past roughly 584 years; a wrapped
-/// deadline would land in the past and fire immediately, which is the opposite
-/// of what an over-long sleep should do.
-private function deadline_after(dur: Duration) -> i64 {
-    const now: i64 = Instant::now().as_nanos();
-    if (dur.as_secs() > i64::MAX as u64) { return i64::MAX; }
-    const secs_ns: i64 = (dur.as_secs() as i64).saturating_multiply(Duration::NANOS_PER_SEC as i64);
-    return now.saturating_add(secs_ns.saturating_add(dur.subsec_nanos() as i64));
-}
-
 /// A future that completes once the monotonic clock reaches its deadline.
 ///
 /// `rt` and `id` together name the arming held in the reactor: `id` is 0 and
@@ -67,8 +53,11 @@ type struct Sleep {
 
     /// Complete once `dur` has elapsed from now. A zero (or already-elapsed)
     /// duration completes on the first poll without touching the reactor.
+    /// Both steps saturate, so an over-long `dur` is due in the far future
+    /// rather than wrapping into the past and firing at once.
     static new(dur: Duration) -> Sleep {
-        return Sleep { deadline: deadline_after(dur), id: 0, rt: null };
+        const deadline: i64 = Instant::now().saturating_add(&dur).as_nanos();
+        return Sleep { deadline: deadline, id: 0, rt: null };
     }
 
     /// Complete at `deadline` on the monotonic clock. A deadline already in the

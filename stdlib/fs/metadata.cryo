@@ -29,6 +29,8 @@ import std::collections::str;
 import std::io::error::{ IoError };
 import std::ffi::libc;
 import std::sys::syscall;
+import std::sys::syscall::{ FILETIME };
+import std::time::clock::{ SystemTime };
 import std::fs::path::{ Path };
 import std::core::mem;
 
@@ -56,11 +58,6 @@ const BHFI_OFF_ATTRS:     u64 = 0;
 const BHFI_OFF_WTIME:     u64 = 20;
 const BHFI_OFF_SIZE_HIGH: u64 = 32;
 const BHFI_OFF_SIZE_LOW:  u64 = 36;
-
-// FILETIME (100-ns ticks since 1601-01-01 UTC) -> Unix epoch conversion;
-// same constants `std::time::clock` uses for the wall clock.
-const FILETIME_TO_UNIX_TICKS: u64 = 116444736000000000;
-const FILETIME_TICKS_PER_SEC: u64 = 10000000;
 
 // Synthesized POSIX permission bits for Windows entries (no octal
 // literals in Cryo; values are 0644 / 0444 / 0755 / 0555 / 0777).
@@ -145,13 +142,14 @@ function decode_stat(buf: u8*) -> Metadata {
     return Metadata { raw_mode: mode, byte_size: size, mtime_sec: mtime };
 }
 
-/// FILETIME (split into its two u32 halves) -> whole seconds since the
-/// Unix epoch.  A zero FILETIME (some virtual filesystems) maps to 0.
+/// The FILETIME at `at` as whole seconds since the Unix epoch.  A time
+/// before 1970 maps to 0, because a zero FILETIME is what some virtual
+/// filesystems report for "unknown".
 ![target(windows)]
-function filetime_to_unix_secs(lo: u32, hi: u32) -> i64 {
-    const ticks: u64 = ((hi as u64) << 32) | (lo as u64);
-    if (ticks < FILETIME_TO_UNIX_TICKS) { return 0; }
-    return ((ticks - FILETIME_TO_UNIX_TICKS) / FILETIME_TICKS_PER_SEC) as i64;
+private function filetime_unix_secs(at: u8*) -> i64 {
+    const secs: i64 = SystemTime::from_filetime(*(at as FILETIME*)).unix_secs();
+    if (secs < 0) { return 0; }
+    return secs;
 }
 
 /// Synthesize a POSIX `st_mode` from Win32 file attributes.
@@ -191,8 +189,6 @@ function attr_metadata(p: Path) -> Result<Metadata, IoError> {
     }
     const bp: u8* = &buf[0];
     const attrs:   u32 = *((bp + WFAD_OFF_ATTRS) as u32*);
-    const wt_lo:   u32 = *((bp + WFAD_OFF_WTIME) as u32*);
-    const wt_hi:   u32 = *((bp + WFAD_OFF_WTIME + 4) as u32*);
     const sz_hi:   u32 = *((bp + WFAD_OFF_SIZE_HIGH) as u32*);
     const sz_lo:   u32 = *((bp + WFAD_OFF_SIZE_LOW) as u32*);
     const is_link: boolean =
@@ -200,7 +196,7 @@ function attr_metadata(p: Path) -> Result<Metadata, IoError> {
     return Result::Ok(Metadata {
         raw_mode:  mode_from_attrs(attrs, is_link),
         byte_size: ((sz_hi as u64) << 32) | (sz_lo as u64),
-        mtime_sec: filetime_to_unix_secs(wt_lo, wt_hi),
+        mtime_sec: filetime_unix_secs(bp + WFAD_OFF_WTIME),
     });
 }
 
@@ -260,14 +256,12 @@ function metadata(p: Path) -> Result<Metadata, IoError> {
     }
     const bp: u8* = &buf[0];
     const attrs: u32 = *((bp + BHFI_OFF_ATTRS) as u32*);
-    const wt_lo: u32 = *((bp + BHFI_OFF_WTIME) as u32*);
-    const wt_hi: u32 = *((bp + BHFI_OFF_WTIME + 4) as u32*);
     const sz_hi: u32 = *((bp + BHFI_OFF_SIZE_HIGH) as u32*);
     const sz_lo: u32 = *((bp + BHFI_OFF_SIZE_LOW) as u32*);
     return Result::Ok(Metadata {
         raw_mode:  mode_from_attrs(attrs, false),
         byte_size: ((sz_hi as u64) << 32) | (sz_lo as u64),
-        mtime_sec: filetime_to_unix_secs(wt_lo, wt_hi),
+        mtime_sec: filetime_unix_secs(bp + BHFI_OFF_WTIME),
     });
 }
 

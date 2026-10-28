@@ -57,10 +57,12 @@ import std::alloc::allocator::{ GlobalAlloc };
 import std::collections::array;
 import std::collections::str::{ Str };
 import std::ffi::libc::{
-    nanosleep, pthread_attr_destroy, pthread_attr_init, pthread_attr_setstacksize,
+    pthread_attr_destroy, pthread_attr_init, pthread_attr_setstacksize,
     pthread_create, pthread_detach, pthread_equal, pthread_join, pthread_self,
-    pthread_setname_np, sched_yield, timespec
+    pthread_setname_np, sched_yield
 };
+import std::time::clock;
+import std::time::duration::{ Duration };
 import std::sys::syscall::{ SYSTEM_INFO_PARTIAL };
 import std::sync::atomic::{ Atomic, MemoryOrder };
 
@@ -113,23 +115,6 @@ private function os_yield() -> void { sched_yield(); }
 ![target(windows)]
 private function os_yield() -> void { syscall::SwitchToThread(); }
 
-![target(unix)]
-private function os_sleep_nanos(nanos: u64) -> void {
-    mut req: timespec = timespec { tv_sec: (nanos / 1000000000) as i64,
-                                   tv_nsec: (nanos % 1000000000) as i64 };
-    mut rem: timespec = timespec { tv_sec: 0, tv_nsec: 0 };
-    while (nanosleep(&req, &rem) != 0) {
-        req = rem;   // EINTR: resume with the kernel's remaining time.
-    }
-}
-![target(windows)]
-private function os_sleep_nanos(nanos: u64) -> void {
-    // Sleep takes whole milliseconds; round up so a sub-ms request still
-    // yields a non-zero sleep (>= 1ms) rather than busy-returning.
-    mut ms: u64 = (nanos + 999999) / 1000000;
-    if (ms == 0 && nanos > 0) { ms = 1; }
-    syscall::Sleep(ms as u32);
-}
 
 // Best-effort OS-visible thread name.  POSIX has pthread_setname_np; Windows
 // has SetThreadDescription, which takes a UTF-16 string applied to a thread
@@ -587,11 +572,10 @@ function yield_now() -> void {
     os_yield();
 }
 
-/// Sleep the current thread for at least `nanos` nanoseconds. On POSIX this
-/// restarts across signal interruptions (EINTR) so the full duration
-/// elapses; on Windows it rounds up to whole milliseconds.
+/// Sleep the current thread for at least `nanos` nanoseconds, as
+/// `time::clock::sleep` does.
 function sleep(nanos: u64) -> void {
-    os_sleep_nanos(nanos);
+    clock::sleep(Duration::from_nanos(nanos));
 }
 
 /// Sleep for at least `millis` milliseconds.

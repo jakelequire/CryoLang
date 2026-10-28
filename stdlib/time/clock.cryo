@@ -11,8 +11,8 @@
 ///!
 ///! `sleep(dur)` parks the current thread for at least `dur`.  POSIX
 ///! uses `nanosleep` with EINTR-restart; Windows uses `Sleep`
-///! (millisecond resolution).  All differences saturate at zero
-///! rather than wrapping.
+///! (millisecond resolution, rounded up).  All differences saturate at
+///! zero rather than wrapping.
 ///!
 ///! The OS-divergent readings (`read_monotonic` / `read_realtime` /
 ///! `sleep_for`) live as free helpers below; the public `Instant::now`
@@ -86,13 +86,14 @@ public type struct Instant {
         return diff_saturating(cur.secs, cur.nanos, this.secs, this.nanos);
     }
 
-    /// This reading as raw monotonic nanoseconds.  The absolute value is
-    /// meaningful only relative to another `Instant` - it counts from an
-    /// unspecified epoch (typically system boot) - so use it for lightweight
-    /// elapsed-time math where the difference of two readings is all that
-    /// matters and carrying a `Duration` would be overkill.
+    /// This reading as raw monotonic nanoseconds, saturating at `i64::MAX`.
+    /// The absolute value is meaningful only relative to another `Instant` -
+    /// it counts from an unspecified epoch (typically system boot) - so use
+    /// it for lightweight elapsed-time math where the difference of two
+    /// readings is all that matters and carrying a `Duration` would be
+    /// overkill.
     public as_nanos(&this) -> i64 {
-        return this.secs * NSEC_PER_SEC + this.nanos;
+        return this.secs.saturating_multiply(NSEC_PER_SEC).saturating_add(this.nanos);
     }
 
     /// `this + dur`, or `None` if the reading would overflow `i64`.
@@ -107,6 +108,14 @@ public type struct Instant {
         const total: i128 = (this.secs as i128) + (dur.as_secs() as i128) + carry;
         if (total > i64::MAX as i128) { return Option::None; }
         return Option::Some(Instant { secs: total as i64, nanos: nsec });
+    }
+
+    /// `this + dur`, or the latest reading an `Instant` can hold if the sum
+    /// would overflow, so a deadline computed from an over-long duration
+    /// lies in the far future rather than wrapping into the past.
+    public saturating_add(&this, dur: &Duration) -> Instant {
+        return this.checked_add(dur)
+            .unwrap_or(Instant { secs: i64::MAX, nanos: NSEC_PER_SEC - 1 });
     }
 
     /// `this - dur`, or `None` if the reading would go below zero.
@@ -162,6 +171,20 @@ public type struct SystemTime {
     /// A wall-clock time from a whole-second Unix timestamp.
     public static from_unix_secs(secs: i64) -> SystemTime {
         return SystemTime { secs: secs, nanos: 0 };
+    }
+
+    /// A Windows `FILETIME` (100-ns ticks since 1601-01-01 UTC) as a
+    /// wall-clock reading. Floor division keeps the nanoseconds in
+    /// `0..1e9` for a time before 1970 too.
+    internal static from_filetime(ft: FILETIME) -> SystemTime {
+        // Widened through u64 so the high half does not sign-extend.
+        const ticks: i64 = ((ft.dwHighDateTime as u64) << 32
+                          | (ft.dwLowDateTime  as u64)) as i64;
+        const unix_ticks: i64 = ticks - FILETIME_TO_UNIX_TICKS;
+        return SystemTime {
+            secs:  unix_ticks.divide_floor(FILETIME_TICKS_PER_SEC),
+            nanos: unix_ticks.modulo_floor(FILETIME_TICKS_PER_SEC) * FILETIME_NS_PER_TICK,
+        };
     }
 
     /// Whole seconds since the Unix epoch (may be negative before 1970).
@@ -252,16 +275,7 @@ private function read_realtime() -> SystemTime {
 private function read_realtime() -> SystemTime {
     mut ft: FILETIME = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
     syscall::GetSystemTimePreciseAsFileTime(&ft);
-    // Reassemble FILETIME's split halves into a single 64-bit count
-    // of 100-ns intervals since 1601-01-01.  The cast widens through
-    // u64 first so the high half doesn't sign-extend if its MSB is
-    // set somewhere far in the future.
-    const ft_ticks: i64 = ((ft.dwHighDateTime as u64) << 32
-                         | (ft.dwLowDateTime  as u64)) as i64;
-    const unix_ticks: i64 = ft_ticks - FILETIME_TO_UNIX_TICKS;
-    const secs:  i64 = unix_ticks / FILETIME_TICKS_PER_SEC;
-    const nanos: i64 = (unix_ticks % FILETIME_TICKS_PER_SEC) * FILETIME_NS_PER_TICK;
-    return SystemTime { secs: secs, nanos: nanos };
+    return SystemTime::from_filetime(ft);
 }
 
 /// Block the current thread for at least `dur`.
@@ -277,47 +291,14 @@ private function sleep_for(dur: Duration) -> void {
 
 ![target(windows)]
 private function sleep_for(dur: Duration) -> void {
-    // Sleep takes milliseconds as u32; the `+ 999999` rounds sub-ms
-    // sub-second remainders UP so a small non-zero `dur` always blocks
-    // for at least one tick.  Whole seconds get the full millisecond
-    // budget before clamping to u32::MAX (the longest single Sleep,
-    // which the loop repeats until the full span elapses).
-    mut remaining_secs: u64 = dur.as_secs();
-    mut remaining_ns:   u32 = dur.subsec_nanos();
-    if (remaining_secs == 0 && remaining_ns == 0) {
-        return;
-    }
-    const ms_max: u64 = 0xFFFFFFFE;  // leave room for the round-up
-    loop {
-        mut chunk: u64 = remaining_secs * 1000
-                       + ((remaining_ns as u64) + 999999) / 1000000;
-        if (chunk == 0) {
-            chunk = 1;  // any non-zero residual blocks for >= 1 ms
-        }
-        if (chunk > ms_max) { chunk = ms_max; }
+    // Sleep takes milliseconds as a u32, and u32::MAX means INFINITE, so a
+    // longer span is slept in chunks of one less.
+    const chunk_max: u64 = 0xFFFFFFFE;
+    mut remaining: u64 = dur.as_millis_ceil();
+    while (remaining > 0) {
+        mut chunk: u64 = remaining;
+        if (chunk > chunk_max) { chunk = chunk_max; }
         syscall::Sleep(chunk as u32);
-        // Subtract what we just slept off the remaining budget.
-        const slept_secs: u64 = chunk / 1000;
-        const slept_ms:   u64 = chunk - slept_secs * 1000;
-        if (remaining_secs >= slept_secs) {
-            remaining_secs = remaining_secs - slept_secs;
-        } else {
-            remaining_secs = 0;
-        }
-        const slept_ns: u64 = slept_ms * 1000000;
-        if ((remaining_ns as u64) >= slept_ns) {
-            remaining_ns = (remaining_ns as u64 - slept_ns) as u32;
-        } else if (remaining_secs > 0) {
-            // Borrow one second to cover the nanos underflow.
-            remaining_secs = remaining_secs - 1;
-            const borrowed_ns: u64 = (remaining_ns as u64)
-                                   + (NSEC_PER_SEC as u64) - slept_ns;
-            remaining_ns = borrowed_ns as u32;
-        } else {
-            remaining_ns = 0;
-        }
-        if (remaining_secs == 0 && remaining_ns == 0) {
-            break;
-        }
+        remaining = remaining - chunk;
     }
 }

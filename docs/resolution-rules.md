@@ -542,6 +542,22 @@ yet is recorded with the change that builds it, not here.
      drain whose buffer cannot grow now reports `OutOfMemory` rather
      than stopping the process.  (Jake)
 
+626. **Time converts one way.**  `Duration.as_millis_ceil()` is the
+     whole milliseconds a span takes, a partial one rounded up so a wait
+     never ends early, saturating at `u64::MAX`; Windows' `Sleep` and the
+     reactor's wait timeout both round through it.
+     `Instant.saturating_add(dur)` is `checked_add` that answers the
+     latest reading instead of `None`, and `Instant.as_nanos()` saturates
+     at `i64::MAX`, so a timer's deadline for an over-long sleep lies in
+     the far future instead of wrapping into the past.
+     `thread::sleep(nanos)` is `time::clock::sleep` and has no copy of
+     its own, which also leaves `clock`'s POSIX sleep the only
+     `Duration`-to-`timespec` conversion, so it needs none named.
+     `SystemTime::from_filetime` (internal) is the one `FILETIME`
+     conversion, for the wall clock and for a file's modification time,
+     dividing by floor so a time before 1970 keeps its nanoseconds in
+     range.  (Jake; the last two delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

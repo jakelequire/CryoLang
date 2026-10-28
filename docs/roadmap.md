@@ -470,7 +470,11 @@ Left over from that: the async entry point calls `Executor::new` and
    `CondVar` and start their threads through `thread`, which creates
    every thread one way (622), and each lock holds the state it guards
    (624).  A descriptor's non-blocking mode has one switch, and a drain
-   reads through a borrowed descriptor's `read_to_end` (625).  Open: a writer over a fixed
+   reads through a borrowed descriptor's `read_to_end` (625).  A
+   millisecond wait rounds through `Duration.as_millis_ceil`, a deadline
+   saturates through `Instant.saturating_add`, `thread::sleep` is
+   `time::clock::sleep`, and a `FILETIME` becomes a `SystemTime` one way
+   (626).  Open: a writer over a fixed
    region - SHA-1's digest, the generator's fill, `pack_sockaddr_in` and
    the IPv6 parser still store their bytes by hand - and whether the
    Winsock and OpenSSL error mappers in `net` become `IoError`
