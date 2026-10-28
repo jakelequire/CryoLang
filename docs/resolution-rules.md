@@ -570,6 +570,20 @@ yet is recorded with the change that builds it, not here.
      unmet on Windows by name, where linking the C++ helper has a gap of
      its own.  (Jake; the flush and the Windows rule delegated)
 
+628. **The compiler's own text rules stay in the compiler.**  `core`'s
+     `string` and `char` no longer carry the compiler's helpers:
+     `is_text_literal`, `is_float_literal`, `is_unsigned_literal`,
+     `parse_c_uint`, `strip_quotes`, `with_exe_suffix` and
+     `is_c_ident_start`/`is_c_ident_char` are gone.  The C importer
+     classifies a literal's spelling once, as text, float or integer, and
+     reads an integer constant's value and unsigned suffix in one pass
+     over `u64::parse_radix_prefix` (C's leading-`0` octal included); the
+     command line's and the codegen manifest's numbers parse with
+     `parse_int`; an identifier byte is `is_alphanumeric()` or `_`; a
+     quoted configuration value and an executable suffix are written out
+     where they are used.  `string.is_under` stays until a general path
+     API replaces it.  (Jake)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

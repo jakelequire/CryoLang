@@ -36,6 +36,13 @@ enum { FLAG_A = 1, FLAG_B = 2, FLAG_NEG = -3 };
 #define CIT_LET  'A'                /* char   -> `char` const (code point 65)    */
 #define CIT_SQUARE(x) ((x) * (x))   /* function-like: unbindable, reported-skipped */
 
+/* How C lexes a literal decides how it lowers. */
+#define CIT_OCTAL     0755          /* a leading 0 is octal: 493                 */
+#define CIT_LONG_U    10LU          /* a U after the L still makes it unsigned   */
+#define CIT_EXPONENT  1e3           /* a decimal exponent makes a float: 1000.0  */
+#define CIT_HEX_E     0xE           /* in hex an `e` is a digit: 14              */
+#define CIT_WIDE      L"w"          /* an encoding prefix still makes a string   */
+
 /* Bitfields share a storage unit: a per-field map would inflate the layout, so
  * the run collapses to one opaque storage blob.  sizeof must stay 8 (two `unsigned`
  * bitfields packed into the first 4-byte unit, then `c`). */
