@@ -699,6 +699,16 @@ yet is recorded with the change that builds it, not here.
      adapters' unused constructors are gone.  (Jake; each split
      delegated)
 
+637. **`test` is marked.**  The assertions, `TestError` with its
+     constructors and `message_str`, `Fixture` and the table-case
+     prefixes are public; the step `expect_eq` and `expect_ne` share to
+     build their message is private.  `TestDescriptor`, whose layout the
+     generated test main fills, and `run_all`, the entry it calls, are
+     internal language items, as the entry point's are.  Everything else
+     in the runner, its options, reporters, workers and child handling,
+     is private.  A reporter step and a worker result's take that nothing
+     called are gone.  (Jake; each split delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that
