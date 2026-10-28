@@ -441,12 +441,12 @@ type struct CodegenPasses {
     static stdlib_archive_path(stdlib_root_text: string, triple_text: string) -> string {
         const stdlib_root: string = stdlib_root_text;
         const triple: string = triple_text;
-        const per_target: string = fmt::format("%s/.bin/%s/libcryo.a",
-                                          stdlib_root, triple);
+        const bin_dir: PathBuf = Path::from(stdlib_root).join(".bin");
+        const per_target: string = bin_dir.join(triple).join("libcryo.a").into_raw();
         if (metadata::exists(Path::from(per_target))) {
             return per_target;
         }
-        return fmt::format("%s/.bin/libcryo.a", stdlib_root);
+        return bin_dir.join("libcryo.a").into_raw();
     }
 
     /// Locate the directory holding the runtime tier archives for `triple`, or
@@ -482,12 +482,12 @@ type struct CodegenPasses {
         match (env::var(Str::new("CRYO_HOME"))) {
             Option::Some(v) => {
                 mut s: String = v;
-                const home: string = s.as_cstr() as string;
+                const home: Path = Path::from(s.as_cstr() as string);
                 const hit_lib: string = CodegenPasses::runtime_dir_pick(
-                    fmt::format("%s/lib/cryo", home), triple_text, hosted);
+                    home.join("lib/cryo").into_raw(), triple_text, hosted);
                 if (hit_lib.length() > 0) { return hit_lib; }
                 const hit_rt: string = CodegenPasses::runtime_dir_pick(
-                    fmt::format("%s/runtime/.bin", home), triple_text, hosted);
+                    home.join("runtime/.bin").into_raw(), triple_text, hosted);
                 if (hit_rt.length() > 0) { return hit_rt; }
             }
             Option::None => {}
@@ -503,35 +503,25 @@ type struct CodegenPasses {
             Option::Some(s) => { self_exe = s.into_raw(); }
             Option::None    => {}
         }
-        const exe_len: i64 = self_exe.length() as i64;
-        if (exe_len > 0) {
-            mut exe_buf: i8* = self_exe as i8*;
-            // dirname: both separators terminate the scan, because
-            // `current_exe()` yields a backslash path on Windows.
-            mut dir_end: u64 = (exe_len - 1) as u64;
-            while (dir_end > 0) {
-                if (self_exe[dir_end] == '/' || self_exe[dir_end] == '\\') { break; }
-                dir_end -= 1;
-            }
-            if (dir_end > 0) {
-                exe_buf[dir_end] = 0;
-                const bindir: string = exe_buf as string;
+        match (Path::from(self_exe).parent()) {
+            Option::Some(bindir) => {
                 const hit_inst: string = CodegenPasses::runtime_dir_pick(
-                    fmt::format("%s/../lib/cryo", bindir), triple_text, hosted);
+                    bindir.join("../lib/cryo").into_raw(), triple_text, hosted);
                 if (hit_inst.length() > 0) { return hit_inst; }
                 const hit_dev: string = CodegenPasses::runtime_dir_pick(
-                    fmt::format("%s/../runtime/.bin", bindir), triple_text, hosted);
+                    bindir.join("../runtime/.bin").into_raw(), triple_text, hosted);
                 if (hit_dev.length() > 0) { return hit_dev; }
                 const hit_dev2: string = CodegenPasses::runtime_dir_pick(
-                    fmt::format("%s/../../runtime/.bin", bindir), triple_text, hosted);
+                    bindir.join("../../runtime/.bin").into_raw(), triple_text, hosted);
                 if (hit_dev2.length() > 0) { return hit_dev2; }
             }
+            Option::None => {}
         }
         // 3. Beside the resolved stdlib.  Covers an install that keeps the two
         //    together but places neither relative to the binary.
         if (ctx.options.stdlib_root.length() > 0) {
             const hit: string = CodegenPasses::runtime_dir_pick(
-                fmt::format("%s/../runtime/.bin", ctx.options.stdlib_root), triple_text, hosted);
+                Path::from(ctx.options.stdlib_root).join("../runtime/.bin").into_raw(), triple_text, hosted);
             if (hit.length() > 0) { return hit; }
         }
         return "";
@@ -1515,7 +1505,7 @@ type struct CodegenPasses {
         // predicted path diverges from the emitted one and caching breaks.
         const rel: string = compiler::build_manifest::Manifest::path_module(
             ctx.artifacts.ir.module_name);
-        const obj_path: string = fmt::format("%s/%s.o", output_dir, rel);
+        const obj_path: string = Path::from(output_dir).join(f"{rel}.o".as_str()).into_raw();
         // mkdir_p the object's PARENT (the namespace subdirs), which subsumes
         // `deps/` and any `--build-dir=...` prefix; a bare `mkdir` of the deep
         // path would fail and object emission would error "No such file or

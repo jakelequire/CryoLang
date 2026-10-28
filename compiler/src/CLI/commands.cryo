@@ -284,37 +284,39 @@ function shell_jobs_worker(ctx: ShellJobs) -> void {
 
 /// Per-process scratch path for capturing a negative test's compiler
 /// output.  Windows has no `/tmp`, so use `%TEMP%`/`%TMP%` and fall back
-/// to the current directory; the negative suite ran Linux-only before this.
+/// to the current directory.
 ![target(windows)]
 function neg_tmp_path() -> string {
+    mut name: String = f"cryo_negtest_{process::id()}.out";
     match (env::var(str::Str::new("TEMP"))) {
         Option::Some(v) => {
             mut s: String = v;
-            return fmt::format("%s\\cryo_negtest_%d.out", s.as_cstr() as string, process::id());
+            return path::Path::from(s.as_cstr() as string).join(name.as_str()).into_raw();
         }
         Option::None => {}
     }
     match (env::var(str::Str::new("TMP"))) {
         Option::Some(v) => {
             mut s: String = v;
-            return fmt::format("%s\\cryo_negtest_%d.out", s.as_cstr() as string, process::id());
+            return path::Path::from(s.as_cstr() as string).join(name.as_str()).into_raw();
         }
         Option::None => {}
     }
-    return fmt::format("cryo_negtest_%d.out", process::id());
+    return name.into_raw();
 }
 
 /// POSIX: honor `$TMPDIR`, else `/tmp`.
 ![target(unix)]
 function neg_tmp_path() -> string {
+    const name: String = f"cryo_negtest_{process::id()}.out";
     match (env::var(str::Str::new("TMPDIR"))) {
         Option::Some(v) => {
             mut s: String = v;
-            return fmt::format("%s/cryo_negtest_%d.out", s.as_cstr() as string, process::id());
+            return path::Path::from(s.as_cstr() as string).join(name.as_str()).into_raw();
         }
         Option::None => {}
     }
-    return fmt::format("/tmp/cryo_negtest_%d.out", process::id());
+    return path::Path::from("/tmp").join(name.as_str()).into_raw();
 }
 
 type enum CommandKind {
@@ -1108,11 +1110,11 @@ type struct Executor {
             libc::mkdir(src_path, 493);
         }
 
-        const main_path: string = fmt::format("%s/main.cryo", src_path);
+        const main_path: string = path::Path::from(src_path).join("main.cryo").into_raw();
         const ns_name: string = Executor::derive_namespace(name);
         if (!Executor::write_main_cryo(main_path, ns_name)) { return 1; }
 
-        const config_path: string = fmt::format("%s/cryoconfig", target_dir);
+        const config_path: string = path::Path::from(target_dir).join("cryoconfig").into_raw();
         if (!Executor::write_cryoconfig(config_path, name, src_dir, out_dir, ttype)) { return 1; }
 
         fmt::printf("\n  Created %s\n", config_path);
@@ -1611,7 +1613,7 @@ type struct Executor {
             mut jobs_value: string = "";
             if (args.has_arg("jobs")) { jobs_value = args.get_value("jobs"); }
             const jobs: u32 = Executor::suite_jobs(jobs_value);
-            const neg_dir: string = fmt::format("%s/tests/negative", proj_root);
+            const neg_dir: string = path::Path::from(proj_root).join("tests/negative").into_raw();
             const neg_res: NegSuiteResult =
                 Executor::run_negative_suite(self_exe, stdlib_abs, neg_dir,
                                              pattern, fmt_choice, col_choice, jobs);
@@ -1625,7 +1627,7 @@ type struct Executor {
             // tests/projects/ carrying a test.json. Driven via this compiler
             // as a subprocess (collect / build / run). Absent dir is a
             // clean no-op.
-            const proj_dir: string = fmt::format("%s/tests/projects", proj_root);
+            const proj_dir: string = path::Path::from(proj_root).join("tests/projects").into_raw();
             const proj_res: NegSuiteResult =
                 Executor::run_projects_suite(self_exe, stdlib_abs, proj_dir,
                                              pattern, fmt_choice, col_choice, jobs);
@@ -2510,7 +2512,7 @@ type struct Executor {
     /// subdirectory entry (not `.`/`..`) passing the optional `pattern`.
     static proj_marker_path(projects_dir_text: string, name: string) -> string {
         const projects_dir: string = projects_dir_text;
-        return fmt::format("%s/%s/test.json", projects_dir, name);
+        return path::Path::from(projects_dir).join(name).join("test.json").into_raw();
     }
 
     /// Run every multi-module test project under `projects_dir`. Each project
@@ -3228,8 +3230,7 @@ type struct Executor {
             return 0;
         }
 
-        const lock_path: string = fmt::format("%s/cryoconfig.lock",
-            config.project_root);
+        const lock_path: string = path::Path::from(config.project_root).join("cryoconfig.lock").into_raw();
         const outcome: dep_resolver::ResolveOutcome = dep_resolver::DepResolver::resolve(
             &config, mode, lock_path);
         if (outcome.failed) {
@@ -3296,7 +3297,7 @@ type struct Executor {
             }
         }
 
-        const manifest_path: string = fmt::format("%s/cryo-vendor.json", abs);
+        const manifest_path: string = path::Path::from(abs).join("cryo-vendor.json").into_raw();
         if (!metadata::exists(path::Path::from(manifest_path))) {
             fmt::eprintf("Error: no cryo-vendor.json manifest found at %s\n", manifest_path);
             fmt::eprintf("       a vendored library needs a manifest declaring its name,\n");
@@ -3347,7 +3348,7 @@ type struct Executor {
         mem::drop(root);
 
         const cache_dir: string = registry::VendorRegistry::cache_dir_for(key, triple);
-        const dest: string = fmt::format("%s/%s.cryo", cache_dir, name);
+        const dest: string = path::Path::from(cache_dir).join(f"{name}.cryo".as_str()).into_raw();
         mut produced: boolean = false;
 
         // Serialize the load -> (maybe generate) -> save against any other
