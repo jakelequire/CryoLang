@@ -24,7 +24,8 @@ import std::core::drop::{ Drop };
 import std::core::mem;
 import std::io::error::{ IoError, IoErrorKind };
 import std::io::fd;
-import std::io::traits;
+import std::io::fd::{ BorrowedFileDescriptor };
+import std::io::traits::{ Read };
 import std::collections::array::{ Array };
 import std::collections::raw_buffer::{ RawBuffer };
 import std::collections::str::{ Str };
@@ -795,18 +796,19 @@ function clone_command(cmd: &Command) -> Command {
 function collect_output(c: mut &Child) -> Result<Output, IoError> {
     mut stdout_buffer: Array<u8> = Array::new();
     mut stderr_buffer: Array<u8> = Array::new();
-    mut chunk: [u8; 4096];
 
     // Extract raw fds (i32 is Copy, so reading `h.fd` through the match
     // arm doesn't consume the handle). Put each handle back into its
     // slot so the existing Drop impls close the fds when `c` drops.
+    // Non-blocking is best-effort: if the kernel won't take the flag, a
+    // drain blocks in `read` instead, after poll(2) reported data.
     mut so_fd:   i32 = -1;
     mut so_open: boolean = false;
     match (c.stdout) {
         Option::Some(mut h) => {
             so_fd   = h.fd;
             so_open = true;
-            set_nonblock(so_fd);
+            mem::drop(fd::set_nonblocking(so_fd, true));
             c.stdout = Option::Some(h);
         }
         Option::None => { }
@@ -817,12 +819,17 @@ function collect_output(c: mut &Child) -> Result<Output, IoError> {
         Option::Some(mut h) => {
             se_fd   = h.fd;
             se_open = true;
-            set_nonblock(se_fd);
+            mem::drop(fd::set_nonblocking(se_fd, true));
             c.stderr = Option::Some(h);
         }
         Option::None => { }
     }
 
+    // A drain reads every byte available now: `read_to_end` stops at EOF
+    // (the writer closed its end) or with `WouldBlock` (nothing more yet,
+    // wait on poll again).
+    mut so_pipe: BorrowedFileDescriptor = BorrowedFileDescriptor::new(so_fd);
+    mut se_pipe: BorrowedFileDescriptor = BorrowedFileDescriptor::new(se_fd);
     mut polls: [libc::pollfd; 2];
     while (so_open || se_open) {
         mut nfds:   u64 = 0;
@@ -856,10 +863,14 @@ function collect_output(c: mut &Child) -> Result<Output, IoError> {
             const ev: i16 = polls[so_idx as u64].revents;
             const ready: i16 = ev & (libc::POLLIN | libc::POLLHUP | libc::POLLERR);
             if (ready != 0) {
-                match (drain_nonblock(so_fd, &chunk[0], 4096, &stdout_buffer)) {
-                    DrainOutcome::Eof       => { so_open = false; }
-                    DrainOutcome::Again     => { }
-                    DrainOutcome::Failed(e) => { return Result::Err(e); }
+                match (so_pipe.read_to_end(&stdout_buffer)) {
+                    Result::Ok(_)  => { so_open = false; }
+                    Result::Err(e) => {
+                        match (e.kind) {
+                            IoErrorKind::WouldBlock => { }
+                            _ => { return Result::Err(e); }
+                        }
+                    }
                 }
             }
         }
@@ -867,10 +878,14 @@ function collect_output(c: mut &Child) -> Result<Output, IoError> {
             const ev: i16 = polls[se_idx as u64].revents;
             const ready: i16 = ev & (libc::POLLIN | libc::POLLHUP | libc::POLLERR);
             if (ready != 0) {
-                match (drain_nonblock(se_fd, &chunk[0], 4096, &stderr_buffer)) {
-                    DrainOutcome::Eof       => { se_open = false; }
-                    DrainOutcome::Again     => { }
-                    DrainOutcome::Failed(e) => { return Result::Err(e); }
+                match (se_pipe.read_to_end(&stderr_buffer)) {
+                    Result::Ok(_)  => { se_open = false; }
+                    Result::Err(e) => {
+                        match (e.kind) {
+                            IoErrorKind::WouldBlock => { }
+                            _ => { return Result::Err(e); }
+                        }
+                    }
                 }
             }
         }
@@ -890,45 +905,6 @@ function collect_output(c: mut &Child) -> Result<Output, IoError> {
     }
 }
 
-/// Best-effort: switch `fd` to non-blocking by OR'ing `O_NONBLOCK`
-/// into its file-status flags. Failure is ignored - if the kernel
-/// won't take the flag we fall back to whatever poll(2) decides.
-![target(unix)]
-function set_nonblock(fd: i32) -> void {
-    const cur: i32 = libc::fcntl(fd, libc::F_GETFL, 0 as i64);
-    if (cur < 0) { return; }
-    libc::fcntl(fd, libc::F_SETFL, (cur | libc::O_NONBLOCK) as i64);
-}
-
-/// Outcome of one non-blocking drain cycle. `Eof` means the writer
-/// has closed its end; `Again` means EAGAIN/EWOULDBLOCK - there are
-/// no bytes available right now, wait on poll again.
-type enum DrainOutcome {
-    Eof;
-    Again;
-    Failed(IoError);
-}
-
-/// Read every available byte from `fd` into `buf`, returning the
-/// stopping reason. `fd` must already be in non-blocking mode.
-![target(unix)]
-function drain_nonblock(fd: i32, chunk: u8*, chunk_len: u64, buf: mut &Array<u8>) -> DrainOutcome {
-    loop {
-        const n: i64 = libc::read(fd, chunk, chunk_len);
-        if (n > 0) {
-            mut i: u64 = 0;
-            while (i < n as u64) { buf.push(chunk[i]); i = i + 1; }
-            continue;
-        }
-        if (n == 0) { return DrainOutcome::Eof; }
-        const err: IoError = IoError::last_os_error();
-        match (err.kind) {
-            IoErrorKind::Interrupted => { continue; }
-            IoErrorKind::WouldBlock  => { return DrainOutcome::Again; }
-            _ => { return DrainOutcome::Failed(err); }
-        }
-    }
-}
 
 
 // ===========================================================================
@@ -1258,21 +1234,6 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
                                  stdin_handle, stdout_handle, stderr_handle));
 }
 
-// Blocking drain of a CRT fd to EOF.  Used for the single-stream case where
-// there is no second pipe to deadlock against.
-![target(windows)]
-function win_drain(fd_no: i32, chunk: u8*, chunk_len: i64, buf: mut &Array<u8>) -> Result<(), IoError> {
-    loop {
-        match (fd::read_fd(fd_no, chunk, chunk_len)) {
-            Result::Ok(n) => {
-                if (n == 0) { return Result::Ok(()); }
-                mut i: i64 = 0;
-                while (i < n) { buf.push(chunk[i]); i = i + 1; }
-            }
-            Result::Err(e) => { return Result::Err(e); }
-        }
-    }
-}
 
 // Bytes immediately readable from a pipe-backed CRT fd without blocking, or
 // -1 when the write end has closed (EOF: PeekNamedPipe fails with
@@ -1377,12 +1338,16 @@ function collect_output(c: mut &Child) -> Result<Output, IoError> {
             Result::Err(e) => { return Result::Err(e); }
         }
     } else if (so_fd >= 0) {
-        match (win_drain(so_fd, &chunk[0], 4096, &stdout_buffer)) {
+        // One stream has no second pipe to deadlock against: a blocking
+        // drain to EOF.
+        mut so_pipe: BorrowedFileDescriptor = BorrowedFileDescriptor::new(so_fd);
+        match (so_pipe.read_to_end(&stdout_buffer)) {
             Result::Ok(_)  => { }
             Result::Err(e) => { return Result::Err(e); }
         }
     } else if (se_fd >= 0) {
-        match (win_drain(se_fd, &chunk[0], 4096, &stderr_buffer)) {
+        mut se_pipe: BorrowedFileDescriptor = BorrowedFileDescriptor::new(se_fd);
+        match (se_pipe.read_to_end(&stderr_buffer)) {
             Result::Ok(_)  => { }
             Result::Err(e) => { return Result::Err(e); }
         }

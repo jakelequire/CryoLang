@@ -527,6 +527,21 @@ yet is recorded with the change that builds it, not here.
      lock, whose predicate is each task's handshake atomic - stays a
      `Mutex<()>`.  Behaviour is unchanged.  (Jake)
 
+625. **One non-blocking switch, one borrowed reader.**
+     `io::fd::set_nonblocking(fd, on)` turns a descriptor's
+     non-blocking mode on or off, keeping its other file-status flags,
+     and returns the OS error on failure; on Windows a C runtime
+     descriptor has no such mode and the call fails with `Unsupported`.
+     `net::sys`'s POSIX switch delegates to it, and the process module's
+     two copies are gone.  `io::fd::BorrowedFileDescriptor` reads a
+     descriptor it does not own - dropping it closes nothing - through
+     `Read`, so a drain is `read_to_end`: to EOF for a blocking pipe, and
+     to `WouldBlock` for a non-blocking one, with every byte read before
+     it kept.  The child-output drains, `Command::output`'s collectors on
+     both systems and the test runner's capture read through it.  A
+     drain whose buffer cannot grow now reports `OutOfMemory` rather
+     than stopping the process.  (Jake)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

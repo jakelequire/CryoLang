@@ -17,6 +17,7 @@ import std::core::option;
 import std::core::result::{ Result };
 import std::core::slice::{ Slice };
 import std::io::error::{ IoError, IoErrorKind };
+import std::io::traits::{ Read };
 import std::ffi::libc;
 
 /// `read(2)` wrapper: retries on `EINTR`, maps every other failure
@@ -60,4 +61,47 @@ function write_fd(fd: i32, bytes: Slice<u8>) -> Result<i64, IoError> {
 /// the process's perspective either way.
 function close_fd(fd: i32) -> void {
     libc::close(fd);
+}
+
+/// Turn `fd`'s non-blocking mode on or off, keeping its other
+/// file-status flags.  In non-blocking mode a read with nothing
+/// available fails with `WouldBlock` instead of sleeping the thread.
+![target(unix)]
+public function set_nonblocking(fd: i32, on: boolean) -> Result<(), IoError> {
+    const flags: i32 = libc::fcntl(fd, libc::F_GETFL, 0 as i64);
+    if (flags < 0) { return Result::Err(IoError::last_os_error()); }
+    const next: i32 = if (on) { flags | libc::O_NONBLOCK } else { flags & ~libc::O_NONBLOCK };
+    if (libc::fcntl(fd, libc::F_SETFL, next as i64) < 0) {
+        return Result::Err(IoError::last_os_error());
+    }
+    return Result::Ok(());
+}
+
+/// A C runtime descriptor on Windows has no non-blocking mode: the
+/// request fails with `Unsupported`, and the descriptor keeps blocking.
+![target(windows)]
+public function set_nonblocking(fd: i32, on: boolean) -> Result<(), IoError> {
+    return Result::Err(IoError::new(IoErrorKind::Unsupported, 0));
+}
+
+/// A descriptor read through without being owned: dropping it closes
+/// nothing, so it reads a descriptor whose owner closes it, and `Read`'s
+/// own methods (`read_to_end`, `read_exact`, ...) work over any open
+/// descriptor.
+public type struct BorrowedFileDescriptor {
+private:
+    fd: i32;
+
+public:
+    /// Read `fd` without taking it over.  The caller keeps `fd` open for
+    /// as long as this value reads it.
+    static new(fd: i32) -> BorrowedFileDescriptor {
+        return BorrowedFileDescriptor { fd: fd };
+    }
+}
+
+implement trait Read for struct BorrowedFileDescriptor {
+    read(mut &this, buffer: u8*, length: i64) -> Result<i64, IoError> {
+        return read_fd(this.fd, buffer, length);
+    }
 }

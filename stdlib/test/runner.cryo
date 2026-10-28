@@ -56,6 +56,8 @@ import std::collections::array::{ Array };
 import std::collections::pair::{ Pair };
 import std::env;
 import std::io::error;
+import std::io::fd::{ BorrowedFileDescriptor };
+import std::io::traits::{ Read };
 import std::io::stdio::{ is_tty, Stderr, stderr };
 import std::fmt::display;
 import std::ffi::libc;
@@ -594,27 +596,6 @@ function name_matches(name: Str, opts: &RunOptions) -> boolean {
 /// call concurrently from worker threads: the child only `execv`s (an
 /// async-signal-safe op) and never touches the forking thread's heap, so
 /// there is no malloc-lock-at-fork deadlock.
-/// Drain a readable fd fully into `out` (read until EOF). Used to siphon a
-/// captured child's stdout+stderr off the pipe's read end. Retries on EINTR;
-/// stops on EOF (0) or any hard error. The parent drains BEFORE `waitpid`, so
-/// a child that fills the ~64KB pipe buffer can't deadlock against a parent
-/// blocked in wait.
-![target(unix)]
-function drain_fd_into(fd: i32, out: mut &String) -> void {
-    mut buf: [u8; 4096];
-    loop {
-        const n: i64 = libc::read(fd, &buf[0], 4096);
-        if (n > 0) {
-            out.push(Str::from_raw(&buf[0], n as u64));
-        } else if (n == 0) {
-            return;                                  // EOF: all write ends closed
-        } else {
-            if (libc::errno() == libc::EINTR) { continue; }
-            return;                                  // hard error; stop draining
-        }
-    }
-}
-
 ![target(unix)]
 function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
                  capture: boolean) -> TestRun {
@@ -697,7 +678,11 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
     mut captured: String = String::new();
     if (wr >= 0) { libc::close(wr); wr = -1; }
     if (rd >= 0) {
-        drain_fd_into(rd, &captured);
+        // A hard read error stops the drain and keeps what already arrived.
+        mut bytes: Array<u8> = Array::new();
+        mut pipe: BorrowedFileDescriptor = BorrowedFileDescriptor::new(rd);
+        mem::drop(pipe.read_to_end(&bytes));
+        captured.push(Str::from_raw(bytes.as_ptr(), bytes.length() as u64));
         libc::close(rd);
         rd = -1;
     }

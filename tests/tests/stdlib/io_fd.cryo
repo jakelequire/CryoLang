@@ -1,0 +1,70 @@
+///! `io::fd`: a descriptor read through without being owned, and a
+///! descriptor's non-blocking mode.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::IoFd;
+
+import std::core::result::{ Result };
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::io::error::{ IoError, IoErrorKind };
+import std::io::fd;
+import std::io::fd::{ BorrowedFileDescriptor };
+import std::io::traits::{ Read };
+import std::ffi::libc;
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_eq };
+
+/// `read_to_end` over a borrowed pipe end reads everything written before
+/// the write end closed, and dropping the borrow leaves the descriptor
+/// open: closing it afterwards still succeeds.
+![target(unix)]
+![test]
+function borrowed_descriptor_reads_to_end_and_leaves_it_open() -> Result<(), TestError> {
+    mut ends: [i32; 2] = [0; 2];
+    expect_eq(libc::pipe(&ends[0]), 0)?;
+    const text: Str = Str::new("drained");
+    expect_eq(libc::write(ends[1], text.as_ptr(), text.length() as u64), 7)?;
+    libc::close(ends[1]);
+    mut bytes: Array<u8> = Array::new();
+    {
+        mut pipe: BorrowedFileDescriptor = BorrowedFileDescriptor::new(ends[0]);
+        match (pipe.read_to_end(&bytes)) {
+            Result::Ok(n)  => { expect_eq(n, 7)?; }
+            Result::Err(e) => { return expect(false, Str::new(e.kind.label())); }
+        }
+    }
+    expect(Str::from_raw(bytes.as_ptr(), bytes.length() as u64) == text, Str::new("bytes read"))?;
+    return expect_eq(libc::close(ends[0]), 0);
+}
+
+/// In non-blocking mode a read of an empty pipe fails with `WouldBlock`;
+/// turning the mode off clears the flag again and keeps the others.
+![target(unix)]
+![test]
+function set_nonblocking_turns_the_flag_on_and_off() -> Result<(), TestError> {
+    mut ends: [i32; 2] = [0; 2];
+    expect_eq(libc::pipe(&ends[0]), 0)?;
+    const before: i32 = libc::fcntl(ends[0], libc::F_GETFL, 0 as i64);
+    expect(fd::set_nonblocking(ends[0], true).is_ok(), Str::new("set on"))?;
+    expect((libc::fcntl(ends[0], libc::F_GETFL, 0 as i64) & libc::O_NONBLOCK) != 0, Str::new("flag on"))?;
+    mut one: [u8; 1] = [0; 1];
+    expect_eq(libc::read(ends[0], &one[0], 1), -1)?;
+    const error: IoError = IoError::last_os_error();
+    expect(error.kind == IoErrorKind::WouldBlock, Str::new(error.kind.label()))?;
+    expect(fd::set_nonblocking(ends[0], false).is_ok(), Str::new("set off"))?;
+    expect_eq(libc::fcntl(ends[0], libc::F_GETFL, 0 as i64), before)?;
+    libc::close(ends[0]);
+    libc::close(ends[1]);
+    return Result::Ok(());
+}
+
+/// A C runtime descriptor on Windows has no non-blocking mode.
+![target(windows)]
+![test]
+function set_nonblocking_is_unsupported_on_a_runtime_descriptor() -> Result<(), TestError> {
+    match (fd::set_nonblocking(0, true)) {
+        Result::Ok(_)  => { return expect(false, Str::new("set_nonblocking succeeded")); }
+        Result::Err(e) => { return expect(e.kind == IoErrorKind::Unsupported, Str::new(e.kind.label())); }
+    }
+}

@@ -44,6 +44,7 @@ import std::alloc::layout::{ Layout };
 import std::alloc::allocator::{ GlobalAlloc };
 import std::io::error::{ IoError, IoErrorKind };
 import std::io::fd;
+import std::io::fd::{ BorrowedFileDescriptor };
 import std::io::traits::{ Read, Write };
 import std::ffi::libc;
 import std::sys::syscall;
@@ -743,41 +744,6 @@ private function pipe_fits_reactor() -> boolean { return true; }
 ![target(windows)]
 private function pipe_fits_reactor() -> boolean { return false; }
 
-/// Put `fd` in non-blocking mode so a drain can read it until it reports
-/// `WouldBlock` and only then park. Best-effort: a descriptor the kernel will
-/// not take the flag on still works, it just blocks in `read` once per park.
-/// Only the reactor route needs it — the pool route WANTS to block.
-![target(unix)]
-private function pipe_set_nonblock(fd: i32) -> void {
-    const cur: i32 = libc::fcntl(fd, libc::F_GETFL, 0 as i64);
-    if (cur < 0) { return; }
-    libc::fcntl(fd, libc::F_SETFL, (cur | libc::O_NONBLOCK) as i64);
-}
-
-![target(windows)]
-private function pipe_set_nonblock(fd: i32) -> void { return; }
-
-/// Read `fd` to EOF, appending into `buf`. Blocks the calling thread, so this
-/// is the body of a pool job and of the no-executor fallback — never of a poll
-/// that has a reactor to park on.
-private function pipe_drain_blocking(fd: i32, buf: mut &Array<u8>) -> Result<(), IoError> {
-    mut chunk: [u8; 4096];
-    loop {
-        match (fd::read_fd(fd, &chunk[0], 4096)) {
-            Result::Ok(n) => {
-                if (n == 0) { return Result::Ok(()); }
-                mut i: i64 = 0;
-                while (i < n) { buf.push(chunk[i]); i = i + 1; }
-            }
-            Result::Err(e) => {
-                match (e.kind) {
-                    IoErrorKind::Interrupted => { }
-                    _ => { return Result::Err(e); }
-                }
-            }
-        }
-    }
-}
 
 /// The block a `PipeDrain` hands to the blocking pool: the pool's job header,
 /// the descriptor to drain, and the bytes it collected.
@@ -805,7 +771,8 @@ type struct PipeDrainJob {
 /// after this returns, which is what orders the two.
 function pipe_drain_job_run(raw: u8*) -> void {
     mut j: PipeDrainJob* = raw as PipeDrainJob*;
-    match (pipe_drain_blocking(j.fd, &j.buf)) {
+    mut pipe: BorrowedFileDescriptor = BorrowedFileDescriptor::new(j.fd);
+    match (pipe.read_to_end(&j.buf)) {
         Result::Ok(_)  => { j.ok = true;  }
         Result::Err(e) => { j.err = e; j.ok = false; }
     }
@@ -895,9 +862,11 @@ type struct PipeDrain {
     }
 
     /// Close the descriptor and move the bytes out, pairing them with the
-    /// result. Clearing both is what keeps this future's `Drop` from closing a
-    /// descriptor twice and freeing a buffer it has just handed to the caller.
-    private finish(mut &this, result: Result<(), IoError>) -> Poll<Result<Array<u8>, IoError>> {
+    /// result of the drain that ended (its count is not needed: the bytes are
+    /// all in `buf`). Clearing both is what keeps this future's `Drop` from
+    /// closing a descriptor twice and freeing a buffer it has just handed to
+    /// the caller.
+    private finish(mut &this, result: Result<i64, IoError>) -> Poll<Result<Array<u8>, IoError>> {
         this.disarm();
         if (this.fd >= 0) {
             fd::close_fd(this.fd);
@@ -923,36 +892,31 @@ implement trait Future for struct PipeDrain {
             if (!this.routed) {
                 this.routed = true;
                 this.on_reactor = pipe_fits_reactor() && (Reactor::current() != null);
-                if (this.on_reactor) { pipe_set_nonblock(this.fd); }
+                // Best-effort: a descriptor the kernel will not take the flag
+                // on still works, it just blocks in `read` once per park.
+                if (this.on_reactor) { mem::drop(fd::set_nonblocking(this.fd, true)); }
             }
 
             if (this.on_reactor) {
-                mut chunk: [u8; 4096];
-                loop {
-                    match (fd::read_fd(this.fd, &chunk[0], 4096)) {
-                        Result::Ok(n) => {
-                            // A pipe reports EOF only once every write end has
-                            // closed, which for a captured stream means the
-                            // child has exited or closed it deliberately.
-                            if (n == 0) { return this.finish(Result::Ok(())); }
-                            mut i: i64 = 0;
-                            while (i < n) { this.buf.push(chunk[i]); i = i + 1; }
-                        }
-                        Result::Err(e) => {
-                            match (e.kind) {
-                                IoErrorKind::Interrupted => { }
-                                IoErrorKind::WouldBlock  => {
-                                    // Registering AFTER the failed read is what
-                                    // makes the race safe: bytes that arrived in
-                                    // between are still reported, because the
-                                    // reactor arms level-triggered.
-                                    mut rt: Reactor* = Reactor::require();
-                                    this.rt = rt;
-                                    rt.register(this.fd, INTEREST_READ, cx.waker());
-                                    return Poll::Pending;
-                                }
-                                _ => { return this.finish(Result::Err(e)); }
+                mut pipe: BorrowedFileDescriptor = BorrowedFileDescriptor::new(this.fd);
+                match (pipe.read_to_end(&this.buf)) {
+                    // A pipe reports EOF only once every write end has closed,
+                    // which for a captured stream means the child has exited
+                    // or closed it deliberately.
+                    Result::Ok(n)  => { return this.finish(Result::Ok(n)); }
+                    Result::Err(e) => {
+                        match (e.kind) {
+                            IoErrorKind::WouldBlock => {
+                                // Registering AFTER the failed read is what
+                                // makes the race safe: bytes that arrived in
+                                // between are still reported, because the
+                                // reactor arms level-triggered.
+                                mut rt: Reactor* = Reactor::require();
+                                this.rt = rt;
+                                rt.register(this.fd, INTEREST_READ, cx.waker());
+                                return Poll::Pending;
                             }
+                            _ => { return this.finish(Result::Err(e)); }
                         }
                     }
                 }
@@ -960,7 +924,8 @@ implement trait Future for struct PipeDrain {
 
             mut pool: BlockingPool* = BlockingPool::current();
             if (pool == null) {
-                mut inline_r: Result<(), IoError> = pipe_drain_blocking(this.fd, &this.buf);
+                mut inline_pipe: BorrowedFileDescriptor = BorrowedFileDescriptor::new(this.fd);
+                mut inline_r: Result<i64, IoError> = inline_pipe.read_to_end(&this.buf);
                 return this.finish(inline_r);
             }
             mut alloc: GlobalAlloc = GlobalAlloc::new();
@@ -988,7 +953,8 @@ implement trait Future for struct PipeDrain {
                 this.fd = j.fd;
                 j.fd    = -1;
                 j.job.release();
-                mut fallback_r: Result<(), IoError> = pipe_drain_blocking(this.fd, &this.buf);
+                mut fallback_pipe: BorrowedFileDescriptor = BorrowedFileDescriptor::new(this.fd);
+                mut fallback_r: Result<i64, IoError> = fallback_pipe.read_to_end(&this.buf);
                 return this.finish(fallback_r);
             }
             this.job = j;
