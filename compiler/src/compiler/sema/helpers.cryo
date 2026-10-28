@@ -25,6 +25,7 @@ import compiler::types::type_base::{ Type };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound;
 import utils::keyword::{ Keyword };
+import std::collections::str;
 
 
 /// The unsigned maximum of an N-bit integer width, `u8::MAX` to `u64::MAX`.
@@ -250,9 +251,7 @@ public function int_literal_text_is_zero(s_text: string) -> boolean {
         // A type suffix (`i64`/`u64`/...) begins with a non-hex-digit; stop there
         // so a suffixed zero (`0i64`) is still recognised as zero rather than
         // failing on the suffix's first letter.
-        const is_hex_digit: boolean = (c >= '0' && c <= '9')
-            || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-        if (!is_hex_digit) { break; }
+        if (!c.is_hex_digit()) { break; }
         if (c != '0') { return false; }
         saw_digit = true;
         i = i + 1;
@@ -282,17 +281,14 @@ public function int_literal_exceeds(s_text: string, max_mag: u64) -> boolean {
     while (i < len) {
         const c: char = s[i];
         if (c == '_') { i = i + 1; continue; }
-        mut d: u64 = 0;
-        if (c >= '0' && c <= '9') { d = (c - '0') as u64; }
-        else if (c >= 'a' && c <= 'f') { d = (c - 'a' + 10) as u64; }
-        else if (c >= 'A' && c <= 'F') { d = (c - 'A' + 10) as u64; }
         // First non-digit is the type suffix (`i64`/`u64`/...): STOP and compare
         // the magnitude parsed so far. Returning `false` (does-not-exceed) here
         // wrongly classified a large suffixed literal (`9000000000i64`) as
         // in-range, so `sema_default_int_type` picked `i32` and codegen
         // truncated the value via `const_int(i32, ...)`. Mirrors the suffix-stop
         // in `string_parse_radix_u64` / `int_literal_clean`.
-        else { break; }
+        if (!c.is_hex_digit()) { break; }
+        const d: u64 = c.hex_value() as u64;
         if (d >= radix) { break; }
         saw_digit = true;
         // Overflow-checked acc = acc*radix + d.  Past u64 it can only be larger
@@ -325,17 +321,14 @@ public function try_fold_const_integer(expr: ExpressionNode*) -> Option<i128> {
 /// non-digit character or empty input (callers distinguish "not a tuple index"
 /// from "out of bounds").  Plain decimal only.
 public function parse_tuple_index(s_text: string) -> i64 {
-    const s: string = s_text;
-    if (s == null) { return -1; }
-    const len: i64 = s.length() as i64;
-    if (len == 0) { return -1; }
-    mut acc: i64 = 0;
-    for (mut i: i64 = 0; i < len; i++) {
-        const c: char = s[i];
-        if (c < '0' || c > '9') { return -1; }
-        acc = acc * 10 + ((c - '0') as i64);
+    if (s_text == null) { return -1; }
+    match (u64::parse_radix(str::Str::from(s_text).as_bytes(), 10)) {
+        Option::Some(index) => {
+            if (index > i64::MAX as u64) { return -1; }
+            return index as i64;
+        }
+        Option::None => { return -1; }
     }
-    return acc;
 }
 
 /// Decode a range-pattern bound's interned text into a signed value for the
@@ -353,35 +346,7 @@ public function sema_decode_range_bound(s_text: string, kind: LiteralKind) -> i6
     }
 
     // Integer bound: optional sign, then 0x/0o/0b/decimal, '_' separators.
-    mut i: i64 = 0;
-    mut negate: boolean = false;
-    if (s[0] == '-') { negate = true; i = 1; }
-    else if (s[0] == '+') { i = 1; }
-
-    mut base: i64 = 10;
-    if (i + 1 < len && s[i] == '0' && (s[i+1] == 'x' || s[i+1] == 'X')) { base = 16; i += 2; }
-    else if (i + 1 < len && s[i] == '0' && (s[i+1] == 'b' || s[i+1] == 'B')) { base = 2; i += 2; }
-    else if (i + 1 < len && s[i] == '0' && (s[i+1] == 'o' || s[i+1] == 'O')) { base = 8; i += 2; }
-
-    mut acc: i64 = 0;
-    while (i < len) {
-        const c: char = s[i];
-        if (c == '_') { i += 1; continue; }
-        const digit: i64 = sema_hex_digit(c);
-        if (digit < 0 || digit >= base) { break; }
-        acc = acc * base + digit;
-        i += 1;
-    }
-    if (negate) { return 0 - acc; }
-    return acc;
-}
-
-/// Value of a single hex digit (0-9, a-f, A-F), or -1 if not a hex digit.
-public function sema_hex_digit(c: char) -> i64 {
-    if (c >= '0' && c <= '9') { return (c - '0') as i64; }
-    if (c >= 'a' && c <= 'f') { return (c - 'a' + 10) as i64; }
-    if (c >= 'A' && c <= 'F') { return (c - 'A' + 10) as i64; }
-    return -1;
+    return s.parse_int::<i64>();
 }
 
 

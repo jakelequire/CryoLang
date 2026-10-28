@@ -138,11 +138,11 @@ private:
             return this.lex_fstring();
         }
 
-        if (Lexer::is_alpha(c)) {
+        if (Lexer::is_identifier_start(c)) {
             return this.lex_identifier(start_line, start_col);
         }
 
-        if (Lexer::is_digit(c)) {
+        if (c.is_digit()) {
             return this.lex_number(start_line, start_col);
         }
 
@@ -169,7 +169,7 @@ private:
         const start: string = this.current - 1;
 
         while (!this.at_end()) {
-            if (Lexer::is_alnum(this.peek())) {
+            if (Lexer::is_identifier_continue(this.peek())) {
                 this.advance();
             } else {
                 break;
@@ -207,7 +207,7 @@ private:
             if (prefix == 'x' || prefix == 'X') {
                 this.advance(); // consume 'x'/'X'
 
-                while (!this.at_end() && (Lexer::is_hex_digit(this.peek()) || this.peek() == '_')) {
+                while (!this.at_end() && (this.peek().is_hex_digit() || this.peek() == '_')) {
                     if (this.peek() != '_') { saw_digit = true; }
                     this.advance();
                 }
@@ -254,16 +254,16 @@ private:
         }
 
         if (!is_special_base) {
-            while (!this.at_end() && (Lexer::is_digit(this.peek()) || this.peek() == '_')) {
+            while (!this.at_end() && (this.peek().is_digit() || this.peek() == '_')) {
                 this.advance();
             }
 
             if (!this.at_end() && this.peek() == '.') {
                 const next: char = this.peek_ahead(1);
-                if (Lexer::is_digit(next)) {
+                if (next.is_digit()) {
                     is_float = true;
                     this.advance(); // consume '.'
-                    while (!this.at_end() && (Lexer::is_digit(this.peek()) || this.peek() == '_')) {
+                    while (!this.at_end() && (this.peek().is_digit() || this.peek() == '_')) {
                         this.advance();
                     }
                 }
@@ -281,11 +281,11 @@ private:
                 // `1e+`, `2e-`. Without this they parse as the bare mantissa
                 // (sscanf("%lf") stops at the stray 'e'), silently valuing `1e`
                 // as 1.0. Mirror the empty-hex/bin/oct rejection above.
-                if (this.at_end() || !Lexer::is_digit(this.peek())) {
+                if (this.at_end() || !this.peek().is_digit()) {
                     return this.emit_error(ErrorCode::E0011_LEXING_EXCEPTION,
                         "malformed float literal: the exponent has no digits");
                 }
-                while (!this.at_end() && (Lexer::is_digit(this.peek()) || this.peek() == '_')) {
+                while (!this.at_end() && (this.peek().is_digit() || this.peek() == '_')) {
                     this.advance();
                 }
             }
@@ -297,10 +297,10 @@ private:
         // consumed everything base-appropriate, so `0x1f64` arrives here with
         // nothing left while `0x1u8` arrives with `u8`).
         mut accepted_suffix: string = "";
-        if (!this.at_end() && Lexer::is_alpha(this.peek())) {
+        if (!this.at_end() && Lexer::is_identifier_start(this.peek())) {
             const suffix_start: string = this.current;
 
-            while (!this.at_end() && Lexer::is_alnum(this.peek())) {
+            while (!this.at_end() && Lexer::is_identifier_continue(this.peek())) {
                 this.advance();
             }
 
@@ -535,7 +535,7 @@ private:
                 // Handle hex escape sequences (\xHH)
                 if (escape_char == 'x') {
                     mut i: int = 0;
-                    while (i < 2 && !this.at_end() && Lexer::is_hex_digit(this.peek())) {
+                    while (i < 2 && !this.at_end() && this.peek().is_hex_digit()) {
                         this.advance();
                         i++;
                     }
@@ -553,7 +553,7 @@ private:
                     // multi-character literal).
                     if (!this.at_end() && this.peek() == '{') {
                         this.advance(); // consume '{'
-                        while (!this.at_end() && Lexer::is_hex_digit(this.peek())) {
+                        while (!this.at_end() && this.peek().is_hex_digit()) {
                             this.advance();
                         }
                         if (!this.at_end() && this.peek() == '}') {
@@ -1069,23 +1069,19 @@ private:
         return true;
     }
 
+    /// Whether `c` may begin an identifier: an ASCII letter or `_`.
+    public static is_identifier_start(c: char) -> boolean {
+        return c.is_alpha() || c == '_';
+    }
+
+    /// Whether `c` may continue an identifier: an ASCII letter, digit or `_`.
+    public static is_identifier_continue(c: char) -> boolean {
+        return c.is_alphanumeric() || c == '_';
+    }
+
 private:
-    static is_alpha(c: char) -> boolean {
-        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
-    }
-
-    static is_digit(c: char) -> boolean {
-        return c >= '0' && c <= '9';
-    }
-
-    static is_alnum(c: char) -> boolean {
-        return Lexer::is_alpha(c) || Lexer::is_digit(c);
-    }
-
-    static is_hex_digit(c: char) -> boolean {
-        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-    }
-
+    // Narrower than `char.is_whitespace`: a vertical tab or form feed in
+    // source is an unexpected character, not a separator.
     static is_whitespace(c: char) -> boolean {
         return c == ' ' || c == '\t' || c == '\n' || c == '\r';
     }
@@ -1193,8 +1189,8 @@ private:
                 // One or two hex digits.  None is malformed, not a NUL.
                 mut val: i64 = 0;
                 mut digits: i64 = 0;
-                while (digits < 2 && at + 2 + digits < len && Lexer::is_hex_digit(*(text + at + 2 + digits))) {
-                    val = val * 16 + Lexer::hex_value(*(text + at + 2 + digits) as char);
+                while (digits < 2 && at + 2 + digits < len && (*(text + at + 2 + digits) as char).is_hex_digit()) {
+                    val = val * 16 + (*(text + at + 2 + digits) as char).hex_value() as i64;
                     digits += 1;
                 }
                 *spanned = 2 + digits;
@@ -1240,8 +1236,8 @@ private:
         mut i: i64 = at + 1;
         mut cp: i64 = 0;
         mut ndig: i64 = 0;
-        while (i < len && Lexer::is_hex_digit(*(text + i))) {
-            cp = cp * 16 + Lexer::hex_value(*(text + i) as char);
+        while (i < len && (*(text + i) as char).is_hex_digit()) {
+            cp = cp * 16 + (*(text + i) as char).hex_value() as i64;
             i += 1;
             ndig += 1;
         }
@@ -1285,14 +1281,6 @@ private:
             if (lexeme[i] != '_') { digits.push_byte(lexeme[i] as u8); }
         }
         return float::parse_f64(digits.into_raw());
-    }
-
-    /// A hex digit's value, 0 for any other character.
-    static hex_value(d: char) -> i64 {
-        if (d >= '0' && d <= '9') { return d as i64 - '0' as i64; }
-        if (d >= 'a' && d <= 'f') { return d as i64 - 'a' as i64 + 10; }
-        if (d >= 'A' && d <= 'F') { return d as i64 - 'A' as i64 + 10; }
-        return 0;
     }
 
     /// Encode Unicode codepoint `cp` (assumed <= 0x10FFFF) as UTF-8, appending

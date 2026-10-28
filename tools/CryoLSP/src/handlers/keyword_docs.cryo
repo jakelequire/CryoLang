@@ -27,6 +27,7 @@ import lsp::server::docs;
 import lsp::server::line_index;
 import lsp::protocol::lsp;
 import std::ffi::libc;
+import compiler::lex::lexer::{ Lexer };
 
 
 /// Try to render a keyword hover at `(line, character)` in `doc`.
@@ -51,14 +52,14 @@ public function try_keyword_hover(positions: &docs::Docs, doc: docs::Document*,
     // it up; if it sits at the start of the next word, the forward
     // walk does.
     mut start: i64 = byte_off;
-    while (start > 0 && KeywordLookup::is_ident_byte(ptr[start - 1])) { start = start - 1; }
+    while (start > 0 && Lexer::is_identifier_continue(ptr[start - 1] as char)) { start = start - 1; }
     mut end: i64 = byte_off;
-    while (end < len && KeywordLookup::is_ident_byte(ptr[end])) { end = end + 1; }
+    while (end < len && Lexer::is_identifier_continue(ptr[end] as char)) { end = end + 1; }
     if (start == end) { return Option::None; }
 
     // Identifiers can't start with a digit.  Bail before the table
     // lookup so number-literal cursors don't waste effort.
-    if (KeywordLookup::is_digit(ptr[start])) { return Option::None; }
+    if (ptr[start].is_digit()) { return Option::None; }
 
     // Build a NUL-terminated copy of the word so we can compare it
     // against `string` literals in `lookup_keyword_doc`.
@@ -121,33 +122,6 @@ public function try_keyword_hover(positions: &docs::Docs, doc: docs::Document*,
 
 type struct KeywordLookup {
 
-// Byte classification
-//
-// Keep these byte-level (not char-level) since the document text is
-// indexed via `text.as_ptr()` which yields `u8*`.  ASCII codes are
-// inlined as numeric literals - same idiom as `server::line_index`.
-
-static is_ident_byte(b: u8) -> boolean {
-    // 'a'..'z'
-    if (b >= 97 as u8 && b <= 122 as u8) { return true; }
-    // 'A'..'Z'
-    if (b >= 65 as u8 && b <= 90 as u8)  { return true; }
-    // '0'..'9'
-    if (b >= 48 as u8 && b <= 57 as u8)  { return true; }
-    // '_'
-    if (b == 95 as u8) { return true; }
-    return false;
-}
-
-static is_digit(b: u8) -> boolean {
-    return b >= 48 as u8 && b <= 57 as u8;
-}
-
-static is_space_byte(b: u8) -> boolean {
-    // space, tab, CR, LF
-    return b == 32 as u8 || b == 9 as u8 || b == 13 as u8 || b == 10 as u8;
-}
-
 /// True when the bytes starting at `after_mut` (the position just past a
 /// `mut` keyword) begin a `this` receiver: `mut &this` or the bare
 /// `mut this`.  Skips intervening whitespace and an optional `&`, then
@@ -157,11 +131,11 @@ static is_space_byte(b: u8) -> boolean {
 /// the `this` check and keeps its keyword doc.
 static mut_begins_this_receiver(ptr: u8*, len: i64, after_mut: i64) -> boolean {
     mut p: i64 = after_mut;
-    while (p < len && KeywordLookup::is_space_byte(ptr[p])) { p = p + 1; }
+    while (p < len && ptr[p].is_whitespace()) { p = p + 1; }
     // Optional `&` (0x26), then more whitespace.
     if (p < len && ptr[p] == 38 as u8) {
         p = p + 1;
-        while (p < len && KeywordLookup::is_space_byte(ptr[p])) { p = p + 1; }
+        while (p < len && ptr[p].is_whitespace()) { p = p + 1; }
     }
     // Require the exact word `this` (t=116 h=104 i=105 s=115).
     if (p + 4 > len)             { return false; }
@@ -170,7 +144,7 @@ static mut_begins_this_receiver(ptr: u8*, len: i64, after_mut: i64) -> boolean {
     if (ptr[p + 2] != 105 as u8) { return false; }
     if (ptr[p + 3] != 115 as u8) { return false; }
     // Word boundary: the char after `this` must not continue the identifier.
-    if (p + 4 < len && KeywordLookup::is_ident_byte(ptr[p + 4])) {
+    if (p + 4 < len && Lexer::is_identifier_continue(ptr[p + 4] as char)) {
         return false;
     }
     return true;
@@ -183,7 +157,7 @@ static mut_begins_this_receiver(ptr: u8*, len: i64, after_mut: i64) -> boolean {
 /// the AST namespace/member hover.  Colon byte is 58 (`:`).
 static preceded_by_scope_sep(ptr: u8*, word_start: i64) -> boolean {
     mut p: i64 = word_start;
-    while (p > 0 && KeywordLookup::is_space_byte(ptr[p - 1])) { p = p - 1; }
+    while (p > 0 && ptr[p - 1].is_whitespace()) { p = p - 1; }
     // Need two colons immediately before `p`.
     if (p < 2) { return false; }
     if (ptr[p - 1] != 58 as u8) { return false; }

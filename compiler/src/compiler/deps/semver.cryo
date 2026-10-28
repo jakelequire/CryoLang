@@ -46,59 +46,31 @@ type struct Version {
     /// `-rc.1` or `+build`) is accepted but discarded.  Returns
     /// `Version::invalid()` on malformed input.
     static parse(s_text: string) -> Version {
-        const s: string = s_text;
-        const len: i64 = s.length() as i64;
+        const bytes: Slice<u8> = str::Str::from(s_text).as_bytes();
+        const len: i64 = bytes.length();
         if (len == 0) { return Version::invalid(); }
 
         mut i: i64 = 0;
-        if (s[0] == 'v' || s[0] == 'V') { i = 1; }
+        if (bytes[0] == 'v' as u8 || bytes[0] == 'V' as u8) { i = 1; }
 
-        mut major: i64 = -1;
-        mut minor: i64 = -1;
-        mut patch: i64 = -1;
-
-        const after_major: i64 = Version::read_digits(s_text, i, len);
-        if (after_major == i) { return Version::invalid(); }
-        major = Version::read_int(s_text, i, after_major);
-        i = after_major;
-        if (i >= len || s[i] != '.') { return Version::invalid(); }
-        i += 1;
-
-        const after_minor: i64 = Version::read_digits(s_text, i, len);
-        if (after_minor == i) { return Version::invalid(); }
-        minor = Version::read_int(s_text, i, after_minor);
-        i = after_minor;
-        if (i >= len || s[i] != '.') { return Version::invalid(); }
-        i += 1;
-
-        const after_patch: i64 = Version::read_digits(s_text, i, len);
-        if (after_patch == i) { return Version::invalid(); }
-        patch = Version::read_int(s_text, i, after_patch);
+        // MAJOR, MINOR and PATCH: each a run of decimal digits, the three
+        // joined by `.`.  A run too long for a u64 ends before a digit, and
+        // is malformed.
+        mut parts: [i64; 3] = [0; 3];
+        for (mut part: i64 = 0; part < 3; part++) {
+            if (part > 0) {
+                if (i >= len || bytes[i] != '.' as u8) { return Version::invalid(); }
+                i += 1;
+            }
+            match (u64::parse_radix_prefix(bytes.subslice(i, len), 10)) {
+                Option::Some(run) => { parts[part] = run.0 as i64; i += run.1; }
+                Option::None      => { return Version::invalid(); }
+            }
+            if (i < len && bytes[i].is_digit()) { return Version::invalid(); }
+        }
         // Trailing pre-release/build metadata is ignored for ordering.
 
-        return Version { major: major, minor: minor, patch: patch, valid: true };
-    }
-
-    /// Walk past the run of ASCII digits in `s` starting at `i`, capped
-    /// at `end`.  Returns the index of the first non-digit (or `end`).
-    static read_digits(s_text: string, i: i64, end: i64) -> i64 {
-        const s: string = s_text;
-        mut p: i64 = i;
-        while (p < end && s[p] >= '0' && s[p] <= '9') {
-            p += 1;
-        }
-        return p;
-    }
-
-    /// Parse `s[start..end)` as a non-negative decimal integer.  Caller
-    /// must have established the range is all-digits via `read_digits`.
-    static read_int(s_text: string, start: i64, end: i64) -> i64 {
-        const s: string = s_text;
-        mut acc: i64 = 0;
-        for (mut p: i64 = start; p < end; p++) {
-            acc = acc * 10 + (s[p] - '0') as i64;
-        }
-        return acc;
+        return Version { major: parts[0], minor: parts[1], patch: parts[2], valid: true };
     }
 }
 

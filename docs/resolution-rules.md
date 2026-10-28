@@ -783,6 +783,25 @@ yet is recorded with the change that builds it, not here.
      the LSP's diagnostic ids call `digest` directly.  `hash_int` stays
      public.  (Jake)
 
+644. **The compiler and the LSP classify bytes and read numbers through the
+     standard library.**  An ASCII digit, letter, hex digit or case fold is
+     `u8`'s or `char`'s method of that name, a hex digit's value is
+     `char.hex_value`, a case-insensitive comparison is
+     `Str.equals_case_insensitive`, and a run of digits is read by
+     `u64::parse_radix` or `u64::parse_radix_prefix`, or a literal's text
+     by `string.parse_int`.  The literal readers that must see an overflow
+     across `_` separators (the parser's, sema's, the constant table's)
+     keep their own accumulation, over `char.hex_value`.
+     Cryo's identifier rule is answered in one place,
+     `Lexer::is_identifier_start` and `Lexer::is_identifier_continue`, which
+     the highlighter and the LSP ask too.  The lexer's whitespace stays
+     space, tab, line feed and carriage return: a vertical tab or form feed
+     in source is an unexpected character, so the lexer does not use
+     `char.is_whitespace`.  A tuple index too large for a `u64` is no tuple
+     index (E0204); it used to wrap.  `IoError::from_windows_error` and
+     `IoError::from_wsa` are `match`es on the `syscall` constants.
+     (Jake; the identifier rule's home delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

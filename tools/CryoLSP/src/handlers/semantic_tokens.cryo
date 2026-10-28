@@ -34,6 +34,7 @@ import compiler::ast::declaration::{
     DeclarationNode, DeclKind, ImportDecl, MethodDecl, ModuleDecl, VarDecl
 };
 import compiler::diag::source_span;
+import compiler::lex::lexer::{ Lexer };
 import compiler::resolver::res::{ DefId, DefKind };
 import compiler::resolver::symbol::{ Symbol, SymbolKind };
 
@@ -470,7 +471,7 @@ type struct SemanticTokenizer {
                     if (s == 43 as u8 || s == 45 as u8) { j = j + 1 as u32; }  // sign
                 }
                 const sym_start: u32 = j;
-                if (j < n && SemanticTokenizer::is_asm_ident_start(base[j as i64] as u8)) {
+                if (j < n && Lexer::is_identifier_start(base[j as i64] as char)) {
                     while (j < n && SemanticTokenizer::is_asm_ident_byte(base[j as i64] as u8)) {
                         j = j + 1 as u32;
                     }
@@ -492,8 +493,8 @@ type struct SemanticTokenizer {
             }
             // Bare number (displacement `8(%rax)`, `-16`, `0x10`).
             const is_neg_num: boolean = c == 45 as u8 && i + (1 as u32) < n
-                && SemanticTokenizer::is_asm_digit(base[(i + 1 as u32) as i64] as u8);
-            if (SemanticTokenizer::is_asm_digit(c) || is_neg_num) {
+                && (base[(i + 1 as u32) as i64] as u8).is_digit();
+            if (c.is_digit() || is_neg_num) {
                 mut j: u32 = if (is_neg_num) { i + 1 as u32 } else { i };
                 while (j < n && SemanticTokenizer::is_asm_number_byte(base[j as i64] as u8)) {
                     j = j + 1 as u32;
@@ -504,7 +505,7 @@ type struct SemanticTokenizer {
                 i = j; instr_started = true; continue;
             }
             // Identifier: `.directive`, `label:`, mnemonic, or symbol ref.
-            if (SemanticTokenizer::is_asm_ident_start(c) || c == 46 as u8) {   // '.'
+            if (Lexer::is_identifier_start(c as char) || c == 46 as u8) {   // '.'
                 const start: u32 = i;
                 mut j: u32 = i;
                 if (c == 46 as u8) { j = j + 1 as u32; }          // leading '.'
@@ -562,27 +563,14 @@ type struct SemanticTokenizer {
         }
     }
 
-    static is_asm_ident_start(b: u8) -> boolean {
-        return (b >= 65 as u8 && b <= 90 as u8)      // A-Z
-            || (b >= 97 as u8 && b <= 122 as u8)     // a-z
-            || b == 95 as u8;                         // _
-    }
-
     static is_asm_ident_byte(b: u8) -> boolean {
-        return SemanticTokenizer::is_asm_ident_start(b)
-            || (b >= 48 as u8 && b <= 57 as u8)      // 0-9
+        return Lexer::is_identifier_continue(b as char)
             || b == 46 as u8                          // .
             || b == 36 as u8;                         // $ (mangled symbols)
     }
 
-    static is_asm_digit(b: u8) -> boolean {
-        return b >= 48 as u8 && b <= 57 as u8;
-    }
-
     static is_asm_number_byte(b: u8) -> boolean {
-        return SemanticTokenizer::is_asm_digit(b)
-            || (b >= 97 as u8 && b <= 102 as u8)     // a-f
-            || (b >= 65 as u8 && b <= 70 as u8)      // A-F
+        return b.is_hex_digit()
             || b == 120 as u8 || b == 88 as u8        // x X (0x prefix)
             || b == 95 as u8;                         // _ digit separator
     }
