@@ -815,6 +815,16 @@ yet is recorded with the change that builds it, not here.
      "here", that test stays at the call site: `Path.join` does not drop a
      `.`.  (Jake)
 
+646. **Completion offers what the completing module may name.**  Member
+     completion (`x.`, `T::`) and module completion (`M::`, `import M::`)
+     judge each item from the module being edited as the compiler judges
+     the access: a private item only in its own module, an internal one in
+     any module of its package, a public one everywhere.  A field is
+     declared where its type is, a method where its declaration is
+     written, and a trait's method reaches wherever its trait does; a
+     module hidden from the editor hides every path through it.  The
+     extended hover still lists every member of a type.  (Jake)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

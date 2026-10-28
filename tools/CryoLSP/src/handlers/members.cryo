@@ -13,7 +13,7 @@ import compiler::compilation_context::{ CompilationContext };
 import compiler::ast::node::{ ProgramNode };
 import compiler::ast::node_locator::{ NodeLocator };
 import compiler::ast::declaration::{
-    DeclarationNode, DeclKind, EnumDecl, ImplBlock, MethodDecl,
+    DeclarationNode, DeclKind, EnumDecl, FieldDecl, FunctionDecl, ImplBlock, MethodDecl,
     StructDecl, UnionDecl, VarDecl
 };
 import compiler::module_graph::{ ModulePath };
@@ -152,24 +152,52 @@ type struct Members {
         };
     }
 
-    /// The public declarations module `m` exports, each as the declaration
-    /// it names rather than the binding that re-exports it.
-    static exports_of(ctx: CompilationContext*, m: ModulePath) -> [SymbolID] {
+    /// Whether code in module `from` may name the member `m` of the type
+    /// `owner`, judged as the compiler judges the access: a field is
+    /// declared where its type is, a method where its declaration is
+    /// written, and a trait's method reaches wherever the trait does.  A
+    /// variant reaches wherever its enum does.
+    static reachable_from(ctx: CompilationContext*, owner: DefId, m: &Member, from: ModulePath) -> boolean {
+        match (m) {
+            Member::Field(_, index) => {
+                const field: FieldDecl* = DeclarationNode::field_of(Members::field_decl(ctx, owner, index));
+                if (field == null) { return true; }
+                return ctx.reaches(field.visibility, ctx.declaring_module(owner), from);
+            }
+            Member::Variant(_, _) => { return true; }
+            Member::Method(md) => {
+                const func: FunctionDecl* = DeclarationNode::fn_of(md.func);
+                if (func != null && func.origin_trait.is_valid()) {
+                    return !ctx.hidden_from(func.origin_trait, from);
+                }
+                return ctx.reaches(md.visibility, ctx.module_of_file(md.func.span.file), from);
+            }
+            Member::Constant(d) => { return !ctx.hidden_from(d, from); }
+        }
+    }
+
+    /// The declarations module `m` exports that code in module `from` may
+    /// name, each as the declaration it names rather than the binding that
+    /// re-exports it.
+    static exports_of(ctx: CompilationContext*, m: ModulePath, from: ModulePath) -> [SymbolID] {
         mut out: [SymbolID] = [];
         const all: [SymbolID] = ctx.resolver.get_exports(m);
         for (mut i: i64 = 0; i < all.length(); i++) {
-            const s: Symbol = ctx.resolver.get_symbol(all[i]);
-            if (!s.visibility.is_public() || s.kind == SymbolKind::Refused) { continue; }
-            out.push(ctx.resolver.declaration_of(all[i]));
+            if (ctx.resolver.get_symbol(all[i]).kind == SymbolKind::Refused) { continue; }
+            const declared: SymbolID = ctx.resolver.declaration_of(all[i]);
+            if (ctx.hidden_from(ctx.resolver.get_symbol(declared).def, from)) { continue; }
+            out.push(declared);
         }
         return out;
     }
 
     /// The modules nested one level under `m`, or, for an invalid `m`, the
-    /// modules nested under none.  Each is named by its last segment, the
-    /// text a path continues with.
-    static submodules_of(ctx: CompilationContext*, m: ModulePath) -> [string] {
+    /// modules nested under none, that code in module `from` may name.
+    /// Each is named by its last segment, the text a path continues with;
+    /// a module hidden from `from` hides every path through it.
+    static submodules_of(ctx: CompilationContext*, m: ModulePath, from: ModulePath) -> [string] {
         mut out: [string] = [];
+        mut hidden: [string] = [];
         const parent: string = if (m.is_valid()) { ctx.intern_table.shown(m.decl_name()) } else { "" };
         const skip: i64 = if (m.is_valid()) { parent.length() as i64 + 2 } else { 0 };
         const separator: str::Str = str::Str::from("::");
@@ -186,12 +214,24 @@ type struct Members {
             };
             if (head.length() == 0) { continue; }
             const seg: string = String::from_str(head).into_raw();
+            if (head.length() == rest.length() && ctx.hidden_from(ctx.module_def_of(p), from)) {
+                hidden.push(seg);
+                continue;
+            }
             mut seen: boolean = false;
             for (mut k: i64 = 0; k < out.length(); k++) {
                 if (out[k].equals(&seg)) { seen = true; break; }
             }
             if (!seen) { out.push(seg); }
         }
-        return out;
+        mut reachable: [string] = [];
+        for (mut i: i64 = 0; i < out.length(); i++) {
+            mut is_hidden: boolean = false;
+            for (mut k: i64 = 0; k < hidden.length(); k++) {
+                if (hidden[k].equals(&out[i])) { is_hidden = true; break; }
+            }
+            if (!is_hidden) { reachable.push(out[i]); }
+        }
+        return reachable;
     }
 }
