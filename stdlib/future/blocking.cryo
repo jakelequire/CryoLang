@@ -80,9 +80,9 @@ import std::core::intrinsics;
 /// A job's lifecycle. `PENDING` is the only state in which a waker armed on the
 /// job will still be fired; the other two are terminal and mean the payload is
 /// safe to read (`DONE`) or was never produced (`CANCELLED`).
-const JOB_PENDING:   u8 = 0;
-const JOB_DONE:      u8 = 1;   // `run_fn` completed; the payload holds a result
-const JOB_CANCELLED: u8 = 2;   // the pool shut down before the job was reached
+public const JOB_PENDING:   u8 = 0;
+public const JOB_DONE:      u8 = 1;   // `run_fn` completed; the payload holds a result
+public const JOB_CANCELLED: u8 = 2;   // the pool shut down before the job was reached
 
 /// Default ceiling on pool threads. A pool thread is asleep in a syscall rather
 /// than competing for CPU, so this is sized for how many blocking calls a
@@ -95,7 +95,7 @@ const JOB_CANCELLED: u8 = 2;   // the pool shut down before the job was reached
 /// behind each other, and it deadlocks outright any caller that holds one job
 /// while waiting on a second. Threads are still created only on demand, so a
 /// generous ceiling costs nothing until the work actually arrives.
-const BLOCKING_DEFAULT_THREADS: u32 = 512;
+public const BLOCKING_DEFAULT_THREADS: u32 = 512;
 
 
 /// The header of a blocking job: the erased vtable, the waker to fire when the
@@ -104,14 +104,14 @@ const BLOCKING_DEFAULT_THREADS: u32 = 512;
 /// It must be the first field of the caller's block — `run_fn` and `drop_fn`
 /// receive this header's address and cast it back to the concrete type, which
 /// is only sound at offset 0.
-type struct BlockingJob {
-    rc:      Atomic<u32>;      // 2 while both the submitter and the pool hold it
-    status:  Atomic<u8>;       // JOB_*
-    run_fn:  (u8*) -> void;    // do the blocking work; the argument is this block
-    drop_fn: (u8*) -> void;    // release the payload and free this block
-    waker:   Waker;            // fired once, when the job leaves PENDING
-    next:    BlockingJob*;     // pool queue link
-    pool:    BlockingPool*;    // whose lock guards `waker`; null until submitted
+public type struct BlockingJob {
+    private rc:      Atomic<u32>;      // 2 while both the submitter and the pool hold it
+    private status:  Atomic<u8>;       // JOB_*
+    private run_fn:  (u8*) -> void;    // do the blocking work; the argument is this block
+    private drop_fn: (u8*) -> void;    // release the payload and free this block
+    private waker:   Waker;            // fired once, when the job leaves PENDING
+    private next:    BlockingJob*;     // pool queue link
+    private pool:    BlockingPool*;    // whose lock guards `waker`; null until submitted
 
     /// Prepare a freshly allocated block. The refcount starts at 1 — the
     /// submitter's own reference — and `submit` acquires the pool's second one
@@ -120,7 +120,7 @@ type struct BlockingJob {
     /// A static taking the block by pointer rather than a `mut &this` method:
     /// the memory is raw at this point, and `waker` is assigned (not swapped)
     /// exactly once here, before anything could be holding a waker in it.
-    static init(job: BlockingJob*, run_fn: (u8*) -> void, drop_fn: (u8*) -> void) -> void {
+    public static init(job: BlockingJob*, run_fn: (u8*) -> void, drop_fn: (u8*) -> void) -> void {
         job.rc      = Atomic::<u32>::new(1);
         job.status  = Atomic::<u8>::new(JOB_PENDING);
         job.run_fn  = run_fn;
@@ -139,7 +139,7 @@ type struct BlockingJob {
     /// caller that gets back anything but `JOB_PENDING` has the result already
     /// and simply ignores the waker it just stored — the block's last release
     /// takes it back out.
-    arm(mut &this, w: Waker) -> u8 {
+    public arm(mut &this, w: Waker) -> u8 {
         const pool: BlockingPool* = this.pool;
         const held: MutexGuard<PoolState, GlobalAlloc> = pool.state.lock();
         const st: u8 = this.status.load(MemoryOrder::Acquire);
@@ -156,7 +156,7 @@ type struct BlockingJob {
     /// The waker is taken out under the lock and woken after it, for the reason
     /// the module doc gives. Nothing touches the block after `release`, which
     /// may free it.
-    finish(mut &this, status: u8) -> void {
+    private finish(mut &this, status: u8) -> void {
         const pool: BlockingPool* = this.pool;
         const held: MutexGuard<PoolState, GlobalAlloc> = pool.state.lock();
         mut w: Waker = Waker::take(&this.waker);
@@ -171,7 +171,7 @@ type struct BlockingJob {
     /// Acquire one reference to this block, so it cannot be freed while the
     /// acquirer still names it. `init` hands out the first; `submit` takes the
     /// pool's. Pairs one-for-one with `release`.
-    retain(mut &this) -> void {
+    public retain(mut &this) -> void {
         this.rc.fetch_add(1, MemoryOrder::Relaxed);
     }
 
@@ -181,7 +181,7 @@ type struct BlockingJob {
     /// A waker can still be sitting here at that point: a future that armed one
     /// after the job had already finished stores it into a slot nobody will read
     /// again. Taking it out here is the only thing that releases it.
-    release(mut &this) -> void {
+    public release(mut &this) -> void {
         if (this.rc.fetch_sub(1, MemoryOrder::AcqRel) != 1) { return; }
         mut _waker: Waker = Waker::take(&this.waker);
         const df: (u8*) -> void = this.drop_fn;
@@ -200,22 +200,22 @@ type struct BlockingJob {
 /// that is not an executor worker — a future that wants to offload work must
 /// check for that and run the work itself.
 ![thread_local]
-mut g_current_pool: BlockingPool* = null;
+private mut g_current_pool: BlockingPool* = null;
 
 
 /// The job queue and the pool's threads, reached only through the pool's lock.
 private type struct PoolState {
-    head:     BlockingJob*;   // dequeue end (null when empty)
-    tail:     BlockingJob*;   // enqueue end
-    shutdown: boolean;
-    idle:     u32;            // threads currently waiting on `work_ready`
+    private head:     BlockingJob*;   // dequeue end (null when empty)
+    private tail:     BlockingJob*;   // enqueue end
+    private shutdown: boolean;
+    private idle:     u32;            // threads currently waiting on `work_ready`
     // One handle per thread created so far. Joined by `stop`; the pool block
     // is raw memory, so `free` releases the fields in place.
-    threads:  [ThreadJoinHandle<()>];
+    private threads:  [ThreadJoinHandle<()>];
 
     /// Unlink and return the oldest queued job, or null when the queue is
     /// empty.
-    pop(mut &this) -> BlockingJob* {
+    private pop(mut &this) -> BlockingJob* {
         const job: BlockingJob* = this.head;
         if (job == null) { return null; }
         this.head = job.next;
@@ -228,13 +228,13 @@ private type struct PoolState {
 /// A pool of OS threads running blocking jobs for one `Executor`.
 /// Heap-allocated: worker threads and submitted jobs hold raw pointers to it, so
 /// it must not move.
-type struct BlockingPool {
+public type struct BlockingPool {
     private state: Mutex<PoolState>;   // also guards every job's waker slot
-    work_ready: CondVar;            // threads wait here for work
-    max:        u32;                // ceiling on the number of threads; fixed at creation
+    private work_ready: CondVar;            // threads wait here for work
+    private max:        u32;                // ceiling on the number of threads; fixed at creation
 
     /// Create an empty pool with the default thread ceiling.
-    static start() -> BlockingPool* {
+    public static start() -> BlockingPool* {
         return BlockingPool::with_max(BLOCKING_DEFAULT_THREADS);
     }
 
@@ -244,7 +244,7 @@ type struct BlockingPool {
     /// so a program that never offloads anything never pays for a thread, and
     /// `max` costs nothing until it is reached. Panics only if the allocator
     /// refuses the pool block or its lock.
-    static with_max(max: u32) -> BlockingPool* {
+    public static with_max(max: u32) -> BlockingPool* {
         mut count: u32 = max;
         if (count == 0) { count = 1; }
         mut alloc: GlobalAlloc = GlobalAlloc::new();
@@ -274,7 +274,7 @@ type struct BlockingPool {
     /// interrupted, so a pool thread inside `getaddrinfo` holds up shutdown
     /// until the resolver answers. Detaching instead would leave a thread
     /// writing into a pool block that is about to be freed.
-    static stop(p: BlockingPool*) -> void {
+    public static stop(p: BlockingPool*) -> void {
         if (p == null) { return; }
         const held: MutexGuard<PoolState, GlobalAlloc> = p.state.lock();
         held.as_ptr().shutdown = true;
@@ -305,7 +305,7 @@ type struct BlockingPool {
 
     /// Release the pool block. Must run only after every future that could still
     /// let go of a job has been dropped — see `stop`.
-    static free(p: BlockingPool*) -> void {
+    public static free(p: BlockingPool*) -> void {
         if (p == null) { return; }
         ptr::drop_in_place::<BlockingPool>(p);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
@@ -314,13 +314,13 @@ type struct BlockingPool {
 
     /// The pool serving the current thread's polls, or null if this thread is
     /// not an executor worker.
-    static current() -> BlockingPool* {
+    public static current() -> BlockingPool* {
         return g_current_pool;
     }
 
     /// Publish `p` as this thread's pool. Called by an executor worker as it
     /// starts, so every future it polls can reach the pool.
-    static set_current(p: BlockingPool*) -> void {
+    internal static set_current(p: BlockingPool*) -> void {
         g_current_pool = p;
     }
 
@@ -334,7 +334,7 @@ type struct BlockingPool {
     /// thread creation's worth of lock hold at most `max` times in the pool's
     /// life, and in exchange `threads` is never observed half-updated by
     /// `stop`, its only other reader.
-    submit(mut &this, job: BlockingJob*) -> boolean {
+    public submit(mut &this, job: BlockingJob*) -> boolean {
         const held: MutexGuard<PoolState, GlobalAlloc> = this.state.lock();
         const state: PoolState* = held.as_ptr();
         if (state.shutdown) { return false; }
@@ -369,11 +369,7 @@ type struct BlockingPool {
     /// Block until a job is queued or shutdown is signaled. Returns the dequeued
     /// job, or null once shutdown is set — leaving anything still queued for
     /// `stop` to cancel.
-    ///
-    /// Not private only because its one caller is `blocking_worker`, which has
-    /// to be a free function to serve as a raw thread entry (`ExecInner::take`
-    /// is public for the identical reason).
-    take(mut &this) -> BlockingJob* {
+    private take(mut &this) -> BlockingJob* {
         mut held: MutexGuard<PoolState, GlobalAlloc> = this.state.lock();
         const state: PoolState* = held.as_ptr();
         while (state.head == null && !state.shutdown) {

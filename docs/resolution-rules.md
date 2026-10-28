@@ -667,6 +667,22 @@ yet is recorded with the change that builds it, not here.
      gated to POSIX, the only target that calls them.  (Jake; each split
      delegated)
 
+635. **`future` is marked.**  `Future`, `Poll`, `Waker`, `Context`,
+     `block_on`, the sample futures, `Sleep`, the combinators with
+     `Futures` and `Elapsed`, `Executor`, `JoinHandle` and `JoinError` are
+     public, and so is the blocking pool: `BlockingJob` with its `init`,
+     `arm`, `retain` and `release`, the job states, `BlockingPool` and its
+     default ceiling, since a caller embeds a job in a block of its own and
+     submits it.  A waker's vtable and data, a context's waker (read
+     through `waker()`), a sleep's deadline and arming, every combinator's
+     children and progress, and a job's header past its methods are
+     private; a job's state is read through `arm`.  The pool's queue, its
+     threads' loop and a job's completion are private, and
+     `BlockingPool::set_current`, which an executor worker calls to publish
+     its pool, is internal, as the reactor is.  The executor's tasks,
+     queue, shared blocks, thunks and worker are private behind `spawn`,
+     `block_on` and the join handle.  (Jake; each split delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that
