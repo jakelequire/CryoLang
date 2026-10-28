@@ -491,6 +491,21 @@ yet is recorded with the change that builds it, not here.
      `string` constant compares by content, as a string literal pattern
      does.  (Jake)
 
+622. **One mutex, one condition variable, one thread creator.**  The
+     executor, the reactor, the blocking pool and `mpsc` hold their
+     locks as `sync::Mutex` and `sync::CondVar` and start their threads
+     through `std::thread` (`Scope`, or `try_spawn` where a refused
+     thread is not fatal), with no per-OS copy of their own; a module
+     whose own type shares a name with one of `thread`'s imports it
+     under another name (`import std::thread::{ JoinHandle as
+     ThreadJoinHandle }`).  `thread` creates every thread through one
+     per-OS function: on Windows a requested stack size is a
+     reservation (`STACK_SIZE_PARAM_IS_A_RESERVATION`), committed as the
+     stack is used, and a refused spawn carries the OS's own reason - the
+     `pthread` return code, or `GetLastError` mapped to `SpawnError` -
+     never a fixed stand-in.  `thread::available_parallelism` is the one
+     CPU count.  (Jake)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

@@ -62,6 +62,8 @@ import std::core::drop;
 import std::alloc::layout::{ Layout };
 import std::alloc::allocator::{ GlobalAlloc };
 import std::sync::atomic::{ Atomic, MemoryOrder };
+import std::sync::mutex::{ Mutex, MutexGuard };
+import std::thread::{ Scope };
 import std::ffi::libc::{ EpollOp };
 import std::sys::syscall;
 import std::core::mem;
@@ -139,13 +141,13 @@ private mut g_current_reactor: Reactor* = null;
 /// interior addresses, so it must not move.
 internal type struct Reactor {
 private:
-    mtx:      [u8; 40];              // guards the table (pthread_mutex_t / SRWLOCK)
+    table_lock: Mutex<()>;           // guards the registrations and the timers
     buckets:  [Registration*; 64];   // REG_BUCKETS chains, keyed by `fd & 63`
     poll_h:   i64;                 // epoll fd (Linux) / completion port (Windows)
     kick_h:   i64;                 // eventfd (Linux) / unused (Windows)
     aux_h:    i64;                 // unused (Linux) / AFD helper handle (Windows)
     shutdown: Atomic<u8>;          // 1 once teardown has been signaled
-    thread:   u64;                 // the reactor thread (0 = not started)
+    io_thread: Scope;              // the reactor thread, once started
     timers:   Timer*;              // deadline-sorted chain; head is the earliest
     timer_seq: u64;                // last id handed out (0 means "nothing armed")
 
@@ -161,21 +163,19 @@ internal:
             Result::Ok(raw) => { rt = raw.cast::<Reactor>().as_ptr(); }
             Result::Err(_)  => { panic("Reactor::start: allocation failed", intrinsics::location()); }
         }
-        if (rt_mtx_init(&rt.mtx[0]) != 0) {
-            panic("Reactor::start: table mutex init failed", intrinsics::location());
-        }
+        rt.table_lock = Mutex::new(());
         for (mut i: i32 = 0; i < REG_BUCKETS; i = i + 1) { rt.buckets[i] = null; }
         rt.poll_h   = -1;
         rt.kick_h   = -1;
         rt.aux_h    = -1;
         rt.shutdown = Atomic::<u8>::new(0);
-        rt.thread   = 0;
+        rt.io_thread = Scope::new();
         rt.timers    = null;
         rt.timer_seq = 0;
         if (!rt_backend_open(rt)) {
             panic("Reactor::start: I/O readiness backend unavailable", intrinsics::location());
         }
-        rt.thread = rt_thread_spawn(rt);
+        rt.io_thread.spawn::<Reactor*>(rt, reactor_body);
         return rt;
     }
 
@@ -195,10 +195,7 @@ internal:
         if (rt == null) { return; }
         rt.shutdown.store(1, MemoryOrder::Release);
         rt_kick(rt);
-        if (rt.thread != 0) {
-            rt_thread_join(rt.thread);
-            rt.thread = 0;
-        }
+        rt.io_thread.join_all();
         // The thread is gone, so the table has exactly one accessor: no lock.
         // Releasing a still-armed waker here is what reclaims a task that parked
         // on I/O and was never woken; that release runs the task's destructor,
@@ -236,7 +233,7 @@ internal:
     /// still cancel against this reactor has been dropped — see `stop`.
     static free(rt: Reactor*) -> void {
         if (rt == null) { return; }
-        rt_mtx_destroy(&rt.mtx[0]);
+        ptr::drop_in_place::<Reactor>(rt);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         alloc.deallocate(NonNull::new(rt as u8*), Layout::of::<Reactor>());
     }
@@ -278,7 +275,7 @@ internal:
         // `failed` is this one handed straight back when the OS refuses.
         mut replaced: Waker = Waker::noop();
         mut failed:   Waker = Waker::noop();
-        rt_mtx_lock(&this.mtx[0]);
+        const held: MutexGuard<(), GlobalAlloc> = this.table_lock.lock();
         mut reg: Registration* = this.find(fd);
         if (reg == null) { reg = this.insert(fd); }
         if ((direction & INTEREST_READ) != 0) { replaced = Waker::replace(&reg.read_waker, w); }
@@ -294,7 +291,7 @@ internal:
             reg.interest = reg.interest & ~direction;
             if (reg.interest == 0) { this.remove(reg); }
         }
-        rt_mtx_unlock(&this.mtx[0]);
+        mem::drop(held);
         failed.wake();
         // `replaced` and `failed` drop here, outside the lock.
     }
@@ -309,7 +306,7 @@ internal:
     /// reads or owns can close, so the registration is gone by then.
     cancel(mut &this, fd: i32, direction: u32) -> void {
         mut taken: Waker = Waker::noop();
-        rt_mtx_lock(&this.mtx[0]);
+        const held: MutexGuard<(), GlobalAlloc> = this.table_lock.lock();
         const reg: Registration* = this.find(fd);
         if (reg != null && (reg.interest & direction) != 0) {
             if ((direction & INTEREST_READ) != 0) { taken = Waker::take(&reg.read_waker); }
@@ -318,7 +315,7 @@ internal:
             if (reg.interest == 0) { this.remove(reg); }
             else                      { rt_arm(&this, reg); }
         }
-        rt_mtx_unlock(&this.mtx[0]);
+        mem::drop(held);
         // `taken` drops here, outside the lock.
     }
 
@@ -363,7 +360,7 @@ internal:
         t.deadline = deadline;
         t.waker    = w;
         t.next     = null;
-        rt_mtx_lock(&this.mtx[0]);
+        const held: MutexGuard<(), GlobalAlloc> = this.table_lock.lock();
         this.timer_seq = this.timer_seq + 1;
         t.id = this.timer_seq;
         const id: u64 = t.id;
@@ -377,7 +374,7 @@ internal:
         mut is_head: boolean = false;
         if (prev == null) { this.timers = t; is_head = true; }
         else              { prev.next   = t; }
-        rt_mtx_unlock(&this.mtx[0]);
+        mem::drop(held);
         if (is_head) { rt_kick(&this); }
         return id;
     }
@@ -389,7 +386,7 @@ internal:
         if (id == 0) { return; }
         mut taken: Waker  = Waker::noop();
         mut found: Timer* = null;
-        rt_mtx_lock(&this.mtx[0]);
+        const held: MutexGuard<(), GlobalAlloc> = this.table_lock.lock();
         mut prev: Timer* = null;
         mut cur:  Timer* = this.timers;
         while (cur != null) {
@@ -403,7 +400,7 @@ internal:
             prev = cur;
             cur  = cur.next;
         }
-        rt_mtx_unlock(&this.mtx[0]);
+        mem::drop(held);
         if (found != null) {
             mut alloc: GlobalAlloc = GlobalAlloc::new();
             alloc.deallocate(NonNull::new(found as u8*), Layout::of::<Timer>());
@@ -419,12 +416,12 @@ internal:
     /// late is what a caller of `sleep` would actually notice. A deadline
     /// already past yields 0 — poll what is ready, then fire it.
     private next_timeout_ms(mut &this, now: i64) -> i32 {
-        rt_mtx_lock(&this.mtx[0]);
+        const held: MutexGuard<(), GlobalAlloc> = this.table_lock.lock();
         const head: Timer* = this.timers;
         const armed: boolean = head != null;
         mut due: i64 = 0;
         if (armed) { due = head.deadline; }
-        rt_mtx_unlock(&this.mtx[0]);
+        mem::drop(held);
         if (!armed) { return -1; }
         const delta: i64 = due - now;
         if (delta <= 0) { return 0; }
@@ -441,14 +438,14 @@ internal:
         loop {
             mut w: Waker = Waker::noop();
             mut expired: Timer* = null;
-            rt_mtx_lock(&this.mtx[0]);
+            const held: MutexGuard<(), GlobalAlloc> = this.table_lock.lock();
             const head: Timer* = this.timers;
             if (head != null && head.deadline <= now) {
                 this.timers = head.next;
                 w = Waker::take(&head.waker);
                 expired = head;
             }
-            rt_mtx_unlock(&this.mtx[0]);
+            mem::drop(held);
             if (expired == null) { return; }
             mut alloc: GlobalAlloc = GlobalAlloc::new();
             alloc.deallocate(NonNull::new(expired as u8*), Layout::of::<Timer>());
@@ -468,7 +465,7 @@ internal:
     private dispatch(mut &this, fd: i32, ready: u32) -> void {
         mut wr: Waker = Waker::noop();
         mut ww: Waker = Waker::noop();
-        rt_mtx_lock(&this.mtx[0]);
+        const held: MutexGuard<(), GlobalAlloc> = this.table_lock.lock();
         const reg: Registration* = this.find(fd);
         if (reg != null) {
             if ((ready & reg.interest & INTEREST_READ) != 0) {
@@ -482,7 +479,7 @@ internal:
             if (reg.interest == 0) { this.remove(reg); }
             else                      { rt_arm(&this, reg); }
         }
-        rt_mtx_unlock(&this.mtx[0]);
+        mem::drop(held);
         wr.wake();
         ww.wake();
         // Both wakers drop here, releasing the task references they held; the
@@ -557,76 +554,6 @@ private function reactor_body(rt: Reactor*) -> void {
         rt.run_once();
     }
 }
-
-// The OS thread entry ABIs differ (pthread returns `void*`, a Win32 start
-// routine returns `DWORD`), so each gets its own trampoline around the shared
-// body. Stored as a raw fn-ptr, hence free functions.
-![target(unix)]
-private function reactor_tramp(arg: u8*) -> u8* { reactor_body(arg as Reactor*); return null; }
-![target(windows)]
-private function reactor_tramp(arg: u8*) -> u32 { reactor_body(arg as Reactor*); return 0; }
-
-
-// ---------------------------------------------------------------------------
-// Per-OS thread + mutex primitives. These mirror the executor's: the reactor
-// keeps its own copies rather than importing them, so `future::reactor` stays
-// self-contained (importing `thread` into `future::*` would clash on the
-// `JoinHandle` leaf name). ConfigGating strips file-scope declarations only, so
-// every OS call lives in one of these gated free functions.
-// ---------------------------------------------------------------------------
-
-![target(unix)]
-private function rt_mtx_init(b: u8*) -> i32 { return libc::pthread_mutex_init(b, null); }
-![target(windows)]
-private function rt_mtx_init(b: u8*) -> i32 { syscall::InitializeSRWLock(b); return 0; }
-
-![target(unix)]
-private function rt_mtx_lock(b: u8*) -> void { libc::pthread_mutex_lock(b); }
-![target(windows)]
-private function rt_mtx_lock(b: u8*) -> void { syscall::AcquireSRWLockExclusive(b); }
-
-![target(unix)]
-private function rt_mtx_unlock(b: u8*) -> void { libc::pthread_mutex_unlock(b); }
-![target(windows)]
-private function rt_mtx_unlock(b: u8*) -> void { syscall::ReleaseSRWLockExclusive(b); }
-
-![target(unix)]
-private function rt_mtx_destroy(b: u8*) -> void { libc::pthread_mutex_destroy(b); }
-![target(windows)]
-private function rt_mtx_destroy(b: u8*) -> void { }
-
-/// Start the reactor thread on `rt`, returning its joinable id/handle.
-![target(unix)]
-private function rt_thread_spawn(rt: Reactor*) -> u64 {
-    mut tbuf: [u8; 8] = [0; 8];
-    const t: (u8*) -> u8* = reactor_tramp;
-    if (libc::pthread_create(&tbuf[0], null, t as void*, rt as u8*) != 0) {
-        panic("Reactor::start: reactor thread creation failed", intrinsics::location());
-    }
-    return *(&tbuf[0] as u64*);
-}
-![target(windows)]
-private function rt_thread_spawn(rt: Reactor*) -> u64 {
-    const t: (u8*) -> u32 = reactor_tramp;
-    const h: u8* = syscall::CreateThread(null, 0, t as void*, rt as u8*, 0, null);
-    if (h == null) {
-        panic("Reactor::start: reactor thread creation failed", intrinsics::location());
-    }
-    return h as u64;
-}
-
-![target(unix)]
-private function rt_thread_join(tid: u64) -> void {
-    mut ret: u8* = null;
-    libc::pthread_join(tid, &ret);
-}
-![target(windows)]
-private function rt_thread_join(tid: u64) -> void {
-    const h: u8* = tid as u8*;
-    syscall::WaitForSingleObject(h, 0xFFFFFFFF);
-    syscall::CloseHandle(h);
-}
-
 
 // ---------------------------------------------------------------------------
 // Linux backend: epoll + eventfd.

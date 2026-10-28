@@ -30,7 +30,7 @@
 ///!
 ///! ## Implementation
 ///!
-///! A heap `ChannelInner<T>` holds a pthread mutex + condition variable
+///! A heap `ChannelInner<T>` holds a `Mutex` and a `CondVar`
 ///! guarding a raw singly-linked node queue plus a live-sender count and
 ///! a total-handle refcount. The inner is reclaimed when the last handle
 ///! (sender or receiver) drops. Values move out of dequeued nodes through
@@ -46,67 +46,9 @@ import std::core::option;
 import std::core::drop::{ Drop };
 import std::alloc::layout::{ Layout };
 import std::alloc::allocator::{ GlobalAlloc };
-import std::ffi::libc::{
-    pthread_cond_broadcast, pthread_cond_destroy, pthread_cond_init, pthread_cond_signal,
-    pthread_cond_wait, pthread_mutex_destroy, pthread_mutex_init, pthread_mutex_lock,
-    pthread_mutex_unlock
-};
-import std::sys::syscall;
-
-
-// Per-OS channel lock/cond primitives.  The channel embeds its own mutex
-// ([u8; 40]) + cond ([u8; 48]) buffers; on Windows those hold an SRWLOCK (8B) +
-// CONDITION_VARIABLE (8B) with room to spare, and a zero buffer is the valid
-// init state for both platforms.  ConfigGating only evaluates file-scope
-// declarations, so every OS call lives in one of these gated free functions
-// and the methods/free-functions delegate.  See sync::mutex / sync::condvar.
-
-![target(unix)]
-private function chan_mtx_init(b: u8*) -> i32 { return pthread_mutex_init(b, null); }
-![target(windows)]
-private function chan_mtx_init(b: u8*) -> i32 { syscall::InitializeSRWLock(b); return 0; }
-
-![target(unix)]
-private function chan_mtx_lock(b: u8*) -> void { pthread_mutex_lock(b); }
-![target(windows)]
-private function chan_mtx_lock(b: u8*) -> void { syscall::AcquireSRWLockExclusive(b); }
-
-![target(unix)]
-private function chan_mtx_unlock(b: u8*) -> void { pthread_mutex_unlock(b); }
-![target(windows)]
-private function chan_mtx_unlock(b: u8*) -> void { syscall::ReleaseSRWLockExclusive(b); }
-
-![target(unix)]
-private function chan_mtx_destroy(b: u8*) -> void { pthread_mutex_destroy(b); }
-![target(windows)]
-private function chan_mtx_destroy(b: u8*) -> void { }
-
-![target(unix)]
-private function chan_cond_init(b: u8*) -> i32 { return pthread_cond_init(b, null); }
-![target(windows)]
-private function chan_cond_init(b: u8*) -> i32 { syscall::InitializeConditionVariable(b); return 0; }
-
-![target(unix)]
-private function chan_cond_destroy(b: u8*) -> void { pthread_cond_destroy(b); }
-![target(windows)]
-private function chan_cond_destroy(b: u8*) -> void { }
-
-![target(unix)]
-private function chan_cond_wait(c: u8*, m: u8*) -> void { pthread_cond_wait(c, m); }
-![target(windows)]
-private function chan_cond_wait(c: u8*, m: u8*) -> void {
-    syscall::SleepConditionVariableSRW(c, m, 0xFFFFFFFF, 0);
-}
-
-![target(unix)]
-private function chan_cond_signal(b: u8*) -> void { pthread_cond_signal(b); }
-![target(windows)]
-private function chan_cond_signal(b: u8*) -> void { syscall::WakeConditionVariable(b); }
-
-![target(unix)]
-private function chan_cond_broadcast(b: u8*) -> void { pthread_cond_broadcast(b); }
-![target(windows)]
-private function chan_cond_broadcast(b: u8*) -> void { syscall::WakeAllConditionVariable(b); }
+import std::core::mem;
+import std::sync::mutex::{ Mutex, MutexGuard };
+import std::sync::condvar::{ CondVar };
 
 
 /// A queued value plus a raw link to the next node. Allocated per `send`,
@@ -116,11 +58,10 @@ type struct ChanNode<T> {
     value: T;
 }
 
-/// Shared channel state. Heap-pinned: the pthread buffers must not move
-/// after init while threads block on them.
+/// Shared channel state, reached through a raw pointer by every handle.
 type struct ChannelInner<T> {
-    mutex:   [u8; 40];   // pthread_mutex_t (Linux x86_64)
-    cond:    [u8; 48];   // pthread_cond_t
+    lock:    Mutex<()>;      // guards every field below
+    ready:   CondVar;        // the receiver waits here for a value or the last sender
     head:    ChanNode<T>*;   // dequeue end (null when empty)
     tail:    ChanNode<T>*;   // enqueue end
     senders: i64;            // live Sender handles (guarded by mutex)
@@ -138,14 +79,8 @@ function new_inner<T>() -> ChannelInner<T>* {
         Result::Ok(raw) => { inner = raw.cast::<ChannelInner<T>>().as_ptr(); }
         Result::Err(_)  => { core::panic("mpsc::channel: allocation failed", intrinsics::location()); }
     }
-    const mtx: u8* = &inner.mutex[0];
-    const cnd: u8* = &inner.cond[0];
-    if (chan_mtx_init(mtx) != 0) {
-        core::panic("mpsc::channel: mutex init failed", intrinsics::location());
-    }
-    if (chan_cond_init(cnd) != 0) {
-        core::panic("mpsc::channel: cond init failed", intrinsics::location());
-    }
+    inner.lock    = Mutex::new(());
+    inner.ready   = CondVar::new();
     inner.head    = null;
     inner.tail    = null;
     inner.senders = 0;
@@ -154,12 +89,11 @@ function new_inner<T>() -> ChannelInner<T>* {
     return inner;
 }
 
-/// Tear down the pthread primitives and free the inner box. Called by the
-/// last handle to drop; the queue is expected empty (the receiver drains
-/// it on its way out).
+/// Release the lock and condition variable and free the inner box. Called
+/// by the last handle to drop; the queue is expected empty (the receiver
+/// drains it on its way out).
 function free_inner<T>(inner: ChannelInner<T>*) -> void {
-    chan_cond_destroy(&inner.cond[0]);
-    chan_mtx_destroy(&inner.mutex[0]);
+    ptr::drop_in_place::<ChannelInner<T>>(inner);
     mut alloc: GlobalAlloc = GlobalAlloc::new();
     alloc.deallocate(NonNull::new(inner as u8*), Layout::of::<ChannelInner<T>>());
 }
@@ -191,9 +125,8 @@ type struct Sender<T> {
     /// has already been dropped (the value is handed back unconsumed).
     send(&this, value: T) -> Result<(), SendError<T>> {
         const inner: ChannelInner<T>* = this.inner;
-        chan_mtx_lock(&inner.mutex[0]);
+        const held: MutexGuard<(), GlobalAlloc> = inner.lock.lock();
         if (!inner.rx_open) {
-            chan_mtx_unlock(&inner.mutex[0]);
             return Result::Err(SendError::<T> { value: value });
         }
         mut node: ChanNode<T>* = null;
@@ -201,7 +134,6 @@ type struct Sender<T> {
         match (alloc.allocate(Layout::of::<ChanNode<T>>())) {
             Result::Ok(raw) => { node = raw.cast::<ChanNode<T>>().as_ptr(); }
             Result::Err(_)  => {
-                chan_mtx_unlock(&inner.mutex[0]);
                 return Result::Err(SendError::<T> { value: value });
             }
         }
@@ -218,18 +150,18 @@ type struct Sender<T> {
             inner.tail = node;
         }
         // Wake one blocked receiver (there is at most one).
-        chan_cond_signal(&inner.cond[0]);
-        chan_mtx_unlock(&inner.mutex[0]);
+        inner.ready.notify_one();
+        mem::drop(held);
         return Result::Ok(());
     }
 
     /// Create another sender on the same channel (multi-producer).
     clone(&this) -> Sender<T> {
         const inner: ChannelInner<T>* = this.inner;
-        chan_mtx_lock(&inner.mutex[0]);
+        const held: MutexGuard<(), GlobalAlloc> = inner.lock.lock();
         inner.senders = inner.senders + 1;
         inner.refs    = inner.refs + 1;
-        chan_mtx_unlock(&inner.mutex[0]);
+        mem::drop(held);
         return Sender::<T> { inner: inner };
     }
 
@@ -246,14 +178,14 @@ type struct Sender<T> {
 /// last sender (so a blocked `recv` observes disconnection); free the
 /// inner if this was the last handle of any kind.
 function release_sender<T>(inner: ChannelInner<T>*) -> void {
-    chan_mtx_lock(&inner.mutex[0]);
+    const held: MutexGuard<(), GlobalAlloc> = inner.lock.lock();
     inner.senders = inner.senders - 1;
     if (inner.senders == 0) {
-        chan_cond_broadcast(&inner.cond[0]);
+        inner.ready.notify_all();
     }
     inner.refs = inner.refs - 1;
     const last: boolean = inner.refs == 0;
-    chan_mtx_unlock(&inner.mutex[0]);
+    mem::drop(held);
     if (last) { free_inner::<T>(inner); }
 }
 
@@ -278,10 +210,10 @@ type struct Receiver<T> {
     /// sender is alive.
     sender(&this) -> Sender<T> {
         const inner: ChannelInner<T>* = this.inner;
-        chan_mtx_lock(&inner.mutex[0]);
+        const held: MutexGuard<(), GlobalAlloc> = inner.lock.lock();
         inner.senders = inner.senders + 1;
         inner.refs    = inner.refs + 1;
-        chan_mtx_unlock(&inner.mutex[0]);
+        mem::drop(held);
         return Sender::<T> { inner: inner };
     }
 
@@ -290,19 +222,18 @@ type struct Receiver<T> {
     /// drained.
     recv(&this) -> Result<T, RecvError> {
         const inner: ChannelInner<T>* = this.inner;
-        chan_mtx_lock(&inner.mutex[0]);
+        mut held: MutexGuard<(), GlobalAlloc> = inner.lock.lock();
         while (inner.head == null && inner.senders > 0) {
-            chan_cond_wait(&inner.cond[0], &inner.mutex[0]);
+            inner.ready.wait(&inner.lock, &held);
         }
         if (inner.head == null) {
             // No value and no senders left.
-            chan_mtx_unlock(&inner.mutex[0]);
             return Result::Err(RecvError::Disconnected);
         }
         const node: ChanNode<T>* = inner.head;
         inner.head = (*node).next;
         if (inner.head == null) { inner.tail = null; }
-        chan_mtx_unlock(&inner.mutex[0]);
+        mem::drop(held);
         // Move the value out of the node, then free the node without running
         // the slot's destructor, so the value is owned exactly once.
         const slot: T* = &(*node).value;
@@ -318,17 +249,15 @@ type struct Receiver<T> {
     /// all senders have dropped.
     try_recv(&this) -> Result<T, TryRecvError> {
         const inner: ChannelInner<T>* = this.inner;
-        chan_mtx_lock(&inner.mutex[0]);
+        const held: MutexGuard<(), GlobalAlloc> = inner.lock.lock();
         if (inner.head == null) {
-            const disconnected: boolean = inner.senders == 0;
-            chan_mtx_unlock(&inner.mutex[0]);
-            if (disconnected) { return Result::Err(TryRecvError::Disconnected); }
+            if (inner.senders == 0) { return Result::Err(TryRecvError::Disconnected); }
             return Result::Err(TryRecvError::Empty);
         }
         const node: ChanNode<T>* = inner.head;
         inner.head = (*node).next;
         if (inner.head == null) { inner.tail = null; }
-        chan_mtx_unlock(&inner.mutex[0]);
+        mem::drop(held);
         // Same balance as `recv`: the node is released without running the
         // slot's destructor, so the value is owned exactly once.
         const slot: T* = &(*node).value;
@@ -344,7 +273,7 @@ implement<T> trait Drop for struct Receiver<T> {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
         const inner: ChannelInner<T>* = this.inner;
-        chan_mtx_lock(&inner.mutex[0]);
+        const held: MutexGuard<(), GlobalAlloc> = inner.lock.lock();
         inner.rx_open = false;
         // Drain and drop any values still queued: with the receiver gone
         // they would otherwise leak.
@@ -361,7 +290,7 @@ implement<T> trait Drop for struct Receiver<T> {
         inner.tail = null;
         inner.refs = inner.refs - 1;
         const last: boolean = inner.refs == 0;
-        chan_mtx_unlock(&inner.mutex[0]);
+        mem::drop(held);
         if (last) { free_inner::<T>(inner); }
         this.inner = null;
     }

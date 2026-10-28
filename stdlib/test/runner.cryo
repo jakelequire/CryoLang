@@ -576,32 +576,6 @@ function name_matches(name: Str, opts: &RunOptions) -> boolean {
     return name.contains(&pat);
 }
 
-// Worker-count detection
-
-/// Number of online CPUs, used as the default worker count. Clamped to
-/// at least 1 so the pool always makes progress.
-![target(unix)]
-function num_cpus() -> u32 {
-    // _SC_NPROCESSORS_ONLN == 84 on Linux/glibc and the BSDs.
-    const n: i64 = libc::sysconf(84);
-    if (n <= 0) { return 1; }
-    return n as u32;
-}
-
-![target(windows)]
-function num_cpus() -> u32 {
-    mut si: syscall::SYSTEM_INFO_PARTIAL = syscall::SYSTEM_INFO_PARTIAL {
-        wProcessorArchitecture: 0, wReserved: 0, dwPageSize: 0,
-        lpMinimumApplicationAddress: null, lpMaximumApplicationAddress: null,
-        dwActiveProcessorMask: 0, dwNumberOfProcessors: 0,
-        dwProcessorType: 0, dwAllocationGranularity: 0,
-        wProcessorLevel: 0, wProcessorRevision: 0
-    };
-    syscall::GetSystemInfo(&si as u8*);
-    if (si.dwNumberOfProcessors == 0) { return 1; }
-    return si.dwNumberOfProcessors;
-}
-
 // Single-test execution
 
 /// Run one test in its own child process and return the outcome the
@@ -1448,7 +1422,7 @@ function print_in_flight(descriptors: TestDescriptor*, count: u64,
 // methods, so the threaded state travels with the object instead of being
 // passed by reference through a pile of free functions.
 //
-// Target-gated primitives (`run_one`, `num_cpus`, `arm_watchdog`) and the
+// Target-gated primitives (`run_one`, `arm_watchdog`) and the
 // pool worker body (`test_worker`) stay free functions: the first because
 // `![target(...)]` variants can't be methods, the second because the worker
 // is handed to `thread::spawn` as a plain function pointer. The live drain
@@ -1854,7 +1828,7 @@ type struct TestRunner {
         // Resolve the worker count: explicit `--jobs`/`CRYO_TEST_JOBS`, else
         // the online CPU count. Clamp to at least 1.
         mut jobs: u32 = this.opts.jobs;
-        if (jobs == 0) { jobs = num_cpus(); }
+        if (jobs == 0) { jobs = thread::available_parallelism(); }
         if (jobs == 0) { jobs = 1; }
 
         // Pre-pass: count how many descriptors match the filter so the

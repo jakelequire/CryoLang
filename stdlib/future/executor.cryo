@@ -62,12 +62,11 @@ import std::alloc::layout::{ Layout };
 import std::alloc::allocator::{ AllocError, GlobalAlloc };
 import std::alloc::arc::{ Arc };
 import std::sync::atomic::{ Atomic, MemoryOrder };
-import std::ffi::libc::{
-    pthread_cond_broadcast, pthread_cond_destroy, pthread_cond_init, pthread_cond_signal,
-    pthread_cond_wait, pthread_create, pthread_join, pthread_mutex_destroy,
-    pthread_mutex_init, pthread_mutex_lock, pthread_mutex_unlock
-};
-import std::sys::syscall::{ SYSTEM_INFO_PARTIAL };
+import std::sync::mutex::{ Mutex, MutexGuard };
+import std::sync::condvar::{ CondVar };
+import std::thread;
+import std::thread::{ Scope };
+import std::core::mem;
 import std::collections::array;
 import std::future::poll::{ Poll };
 import std::future::waker::{ Context, Waker };
@@ -95,63 +94,6 @@ const ST_IDLE:      u8 = 0;   // not queued, not running
 const ST_SCHEDULED: u8 = 1;   // linked in the ready queue
 const ST_RUNNING:   u8 = 2;   // a worker is polling it
 const ST_NOTIFIED:  u8 = 3;   // woken while RUNNING; reschedule after the poll
-
-
-// ---------------------------------------------------------------------------
-// Per-OS lock/cond primitives. The executor embeds its own mutex ([u8; 40]) + cond
-// ([u8; 48]) buffers; on Windows those hold an SRWLOCK + CONDITION_VARIABLE with
-// room to spare, and a zero buffer is the valid init state for both platforms.
-// ConfigGating only evaluates file-scope declarations (never method bodies), so
-// every OS call lives in one of these gated free functions and the methods
-// delegate. See sync::mpsc, which uses the identical idiom.
-// ---------------------------------------------------------------------------
-
-![target(unix)]
-private function exec_mtx_init(b: u8*) -> i32 { return pthread_mutex_init(b, null); }
-![target(windows)]
-private function exec_mtx_init(b: u8*) -> i32 { syscall::InitializeSRWLock(b); return 0; }
-
-![target(unix)]
-private function exec_mtx_lock(b: u8*) -> void { pthread_mutex_lock(b); }
-![target(windows)]
-private function exec_mtx_lock(b: u8*) -> void { syscall::AcquireSRWLockExclusive(b); }
-
-![target(unix)]
-private function exec_mtx_unlock(b: u8*) -> void { pthread_mutex_unlock(b); }
-![target(windows)]
-private function exec_mtx_unlock(b: u8*) -> void { syscall::ReleaseSRWLockExclusive(b); }
-
-![target(unix)]
-private function exec_mtx_destroy(b: u8*) -> void { pthread_mutex_destroy(b); }
-![target(windows)]
-private function exec_mtx_destroy(b: u8*) -> void { }
-
-![target(unix)]
-private function exec_cond_init(b: u8*) -> i32 { return pthread_cond_init(b, null); }
-![target(windows)]
-private function exec_cond_init(b: u8*) -> i32 { syscall::InitializeConditionVariable(b); return 0; }
-
-![target(unix)]
-private function exec_cond_destroy(b: u8*) -> void { pthread_cond_destroy(b); }
-![target(windows)]
-private function exec_cond_destroy(b: u8*) -> void { }
-
-![target(unix)]
-private function exec_cond_wait(c: u8*, m: u8*) -> void { pthread_cond_wait(c, m); }
-![target(windows)]
-private function exec_cond_wait(c: u8*, m: u8*) -> void {
-    syscall::SleepConditionVariableSRW(c, m, 0xFFFFFFFF, 0);
-}
-
-![target(unix)]
-private function exec_cond_signal(b: u8*) -> void { pthread_cond_signal(b); }
-![target(windows)]
-private function exec_cond_signal(b: u8*) -> void { syscall::WakeConditionVariable(b); }
-
-![target(unix)]
-private function exec_cond_broadcast(b: u8*) -> void { pthread_cond_broadcast(b); }
-![target(windows)]
-private function exec_cond_broadcast(b: u8*) -> void { syscall::WakeAllConditionVariable(b); }
 
 
 /// Non-generic control header, laid out at offset 0 of every `TaskShared<O>`, so
@@ -311,9 +253,9 @@ type struct Task {
             // hs.swap above (Release) published HS_TASK_FIN — our last touch of
             // the block; the joiner observes it and then owns reading+freeing the
             // block, so we must not touch `ctl` after the broadcast below.
-            exec_mtx_lock(&exec.d_mutex[0]);
-            exec_cond_broadcast(&exec.d_cond[0]);
-            exec_mtx_unlock(&exec.d_mutex[0]);
+            const held: MutexGuard<(), GlobalAlloc> = exec.done_lock.lock();
+            exec.task_done.notify_all();
+            mem::drop(held);
         }
     }
 
@@ -333,18 +275,17 @@ implement trait Drop for struct Task {
     }
 }
 
-/// The shared executor state: a mutex+condvar-guarded FIFO of ready tasks plus a
-/// second mutex+condvar joiners block on. Heap-pinned so a `Task`'s `exec`
-/// back-pointer and the worker threads reference a stable address (the pthread
-/// buffers must not move after init while threads block on them).
+/// The shared executor state: a locked FIFO of ready tasks plus a second lock
+/// and condition variable joiners block on. Heap-pinned so a `Task`'s `exec`
+/// back-pointer and the worker threads reference a stable address.
 type struct ExecInner {
-    q_mutex:  [u8; 40];   // guards head/tail/shutdown (pthread_mutex_t, Linux x86_64)
-    q_cond:   [u8; 48];   // workers wait here for work (pthread_cond_t)
-    d_mutex:  [u8; 40];   // guards the completion signal
-    d_cond:   [u8; 48];   // joiners wait here for a task to finish
+    queue_lock: Mutex<()>;   // guards head/tail/shutdown
+    work_ready: CondVar;     // workers wait here for work
+    done_lock:  Mutex<()>;   // guards the completion signal
+    task_done:  CondVar;     // joiners wait here for a task to finish
     head:     Task*;    // dequeue end (null when empty)
     tail:     Task*;    // enqueue end
-    shutdown: boolean;  // set at Executor drop; guarded by q_mutex
+    shutdown: boolean;  // set at Executor drop; guarded by queue_lock
     private reactor: Reactor*; // the I/O driver this pool's workers publish while polling
     blocking: BlockingPool*;   // where workers offload calls the reactor cannot drive
 
@@ -352,7 +293,7 @@ type struct ExecInner {
     /// caller has already set `task.run_state = ST_SCHEDULED`, so a concurrent
     /// `wake()` sees SCHEDULED and does not double-link.
     enqueue(mut &this, task: Task*) -> void {
-        exec_mtx_lock(&this.q_mutex[0]);
+        const held: MutexGuard<(), GlobalAlloc> = this.queue_lock.lock();
         task.next = null;
         if (this.tail == null) {
             this.head = task;
@@ -361,8 +302,8 @@ type struct ExecInner {
             this.tail.next = task;
             this.tail = task;
         }
-        exec_cond_signal(&this.q_cond[0]);
-        exec_mtx_unlock(&this.q_mutex[0]);
+        this.work_ready.notify_one();
+        mem::drop(held);
     }
 
     /// Block until a task is ready or shutdown is signaled. Returns the dequeued
@@ -370,14 +311,11 @@ type struct ExecInner {
     /// worker can claim it), or null once shutdown is set (leaving any remaining
     /// queued tasks for `Executor::drop` to reclaim).
     take(mut &this) -> Task* {
-        exec_mtx_lock(&this.q_mutex[0]);
+        mut held: MutexGuard<(), GlobalAlloc> = this.queue_lock.lock();
         while (this.head == null && !this.shutdown) {
-            exec_cond_wait(&this.q_cond[0], &this.q_mutex[0]);
+            this.work_ready.wait(&this.queue_lock, &held);
         }
-        if (this.shutdown) {
-            exec_mtx_unlock(&this.q_mutex[0]);
-            return null;
-        }
+        if (this.shutdown) { return null; }
         const t: Task* = this.head;
         this.head = t.next;
         if (this.head == null) { this.tail = null; }
@@ -386,7 +324,7 @@ type struct ExecInner {
         // between dequeue and poll takes the RUNNING→NOTIFIED path (deferred
         // reschedule) rather than re-linking an already-dequeued task.
         t.run_state.store(ST_RUNNING, MemoryOrder::Release);
-        exec_mtx_unlock(&this.q_mutex[0]);
+        mem::drop(held);
         return t;
     }
 
@@ -597,72 +535,6 @@ function worker_body(inner: ExecInner*) -> void {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Per-OS worker-thread create/join + CPU count. The executor manages its own
-// pool (rather than depending on `thread::Scope`, whose public `JoinHandle`
-// leaf-name would collide with this module's) using the same pthread/Win32
-// primitives `thread` does. ConfigGating strips file-scope decls only, so these
-// stay free functions. `worker_tramp` adapts the C entry ABI (pthread returns
-// `void*`, Win32's start routine returns `DWORD`/`u32`) around `worker_body`.
-// ---------------------------------------------------------------------------
-
-![target(unix)]
-function worker_tramp(arg: u8*) -> u8* { worker_body(arg as ExecInner*); return null; }
-![target(windows)]
-function worker_tramp(arg: u8*) -> u32 { worker_body(arg as ExecInner*); return 0; }
-
-/// Create one worker thread running `worker_tramp(inner)`, writing its joinable
-/// id/handle into `tbuf` (8 bytes). Returns 0 on success, non-zero on failure.
-![target(unix)]
-private function exec_spawn_worker(inner: ExecInner*, tbuf: u8*) -> i32 {
-    const t: (u8*) -> u8* = worker_tramp;
-    return pthread_create(tbuf, null, t as void*, inner as u8*);
-}
-![target(windows)]
-private function exec_spawn_worker(inner: ExecInner*, tbuf: u8*) -> i32 {
-    const t: (u8*) -> u32 = worker_tramp;
-    const h: u8* = syscall::CreateThread(null, 0, t as void*, inner as u8*, 0, null);
-    if (h == null) { return 11; }
-    *(tbuf as u64*) = h as u64;
-    return 0;
-}
-
-/// Block until worker `tid` exits, releasing its OS resources.
-![target(unix)]
-private function exec_join_worker(tid: u64) -> void {
-    mut ret: u8* = null;
-    pthread_join(tid, &ret);
-}
-![target(windows)]
-private function exec_join_worker(tid: u64) -> void {
-    const h: u8* = tid as u8*;
-    syscall::WaitForSingleObject(h, 0xFFFFFFFF);   // INFINITE
-    syscall::CloseHandle(h);
-}
-
-/// Hardware-thread count (the natural pool size), clamped to >= 1. Best-effort:
-/// returns 1 if the OS query fails.
-![target(unix)]
-private function exec_cpu_count() -> u32 {
-    const n: i64 = libc::sysconf(84);   // _SC_NPROCESSORS_ONLN on Linux/glibc + BSD
-    if (n <= 0) { return 1; }
-    return n as u32;
-}
-![target(windows)]
-private function exec_cpu_count() -> u32 {
-    mut si: syscall::SYSTEM_INFO_PARTIAL = syscall::SYSTEM_INFO_PARTIAL {
-        wProcessorArchitecture: 0, wReserved: 0, dwPageSize: 0,
-        lpMinimumApplicationAddress: null, lpMaximumApplicationAddress: null,
-        dwActiveProcessorMask: 0, dwNumberOfProcessors: 0,
-        dwProcessorType: 0, dwAllocationGranularity: 0,
-        wProcessorLevel: 0, wProcessorRevision: 0
-    };
-    syscall::GetSystemInfo(&si as u8*);
-    if (si.dwNumberOfProcessors == 0) { return 1; }
-    return si.dwNumberOfProcessors;
-}
-
-
 /// Box `fut` + its shared control block, wrap them in a `Task` with the
 /// monomorphized vtable, and enqueue it. Generic-function references
 /// (`task_poll_thunk<F,O>` etc.) are taken here in a free generic function — the
@@ -743,11 +615,11 @@ type struct JoinHandle<O> {
         const exec:   ExecInner*     = this.exec;
         this.shared = null;
         const ctl: TaskCtl* = &shared.ctl;
-        exec_mtx_lock(&exec.d_mutex[0]);
+        mut held: MutexGuard<(), GlobalAlloc> = exec.done_lock.lock();
         while (ctl.hs.load(MemoryOrder::Acquire) != HS_TASK_FIN) {
-            exec_cond_wait(&exec.d_cond[0], &exec.d_mutex[0]);
+            exec.task_done.wait(&exec.done_lock, &held);
         }
-        exec_mtx_unlock(&exec.d_mutex[0]);
+        mem::drop(held);
         const outcome: u8 = ctl.outcome.load(MemoryOrder::Acquire);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         if (outcome == OUTCOME_READY) {
@@ -808,12 +680,12 @@ implement<O> trait Drop for struct JoinHandle<O> {
 /// completion condvar.
 ![language("executor")]
 type struct Executor {
-    inner:       ExecInner*;
-    worker_tids: [u64];   // joinable ids of the pool's worker threads
+    inner:   ExecInner*;
+    workers: Scope;   // the pool's worker threads
 
     /// Create an executor whose pool is sized to the hardware parallelism.
     static new() -> Executor {
-        return Executor::with_threads(exec_cpu_count());
+        return Executor::with_threads(thread::available_parallelism());
     }
 
     /// Create an executor with exactly `n` worker threads (clamped to >= 1 so the
@@ -840,10 +712,10 @@ type struct Executor {
             Result::Ok(raw) => { inner = raw.cast::<ExecInner>().as_ptr(); }
             Result::Err(_)  => { panic("Executor::new: allocation failed", intrinsics::location()); }
         }
-        if (exec_mtx_init(&inner.q_mutex[0]) != 0) { panic("Executor: queue mutex init failed", intrinsics::location()); }
-        if (exec_cond_init(&inner.q_cond[0]) != 0) { panic("Executor: queue cond init failed", intrinsics::location()); }
-        if (exec_mtx_init(&inner.d_mutex[0]) != 0) { panic("Executor: done mutex init failed", intrinsics::location()); }
-        if (exec_cond_init(&inner.d_cond[0]) != 0) { panic("Executor: done cond init failed", intrinsics::location()); }
+        inner.queue_lock = Mutex::new(());
+        inner.work_ready = CondVar::new();
+        inner.done_lock  = Mutex::new(());
+        inner.task_done  = CondVar::new();
         inner.head     = null;
         inner.tail     = null;
         inner.shutdown = false;
@@ -852,17 +724,11 @@ type struct Executor {
         // something actually offloads work — so this costs an allocation.
         inner.reactor  = Reactor::start();
         inner.blocking = BlockingPool::with_max(blocking);
-        mut tids: [u64] = [];
-        mut i: u32 = 0;
-        while (i < count) {
-            mut tbuf: [u8; 8] = [0; 8];
-            if (exec_spawn_worker(inner, &tbuf[0]) != 0) {
-                panic("Executor: worker thread creation failed", intrinsics::location());
-            }
-            tids.push(*(&tbuf[0] as u64*));
-            i = i + 1;
+        mut workers: Scope = Scope::new();
+        for (mut i: u32 = 0; i < count; i = i + 1) {
+            workers.spawn::<ExecInner*>(inner, worker_body);
         }
-        return Executor { inner: inner, worker_tids: tids };
+        return Executor { inner: inner, workers: workers };
     }
 
     /// Spawn `fut` and return a handle to its `Output`. Workers begin driving it
@@ -924,17 +790,14 @@ implement trait Drop for struct Executor {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
         const inner: ExecInner* = this.inner;
-        exec_mtx_lock(&inner.q_mutex[0]);
+        const held: MutexGuard<(), GlobalAlloc> = inner.queue_lock.lock();
         inner.shutdown = true;
-        exec_mtx_unlock(&inner.q_mutex[0]);
-        exec_cond_broadcast(&inner.q_cond[0]);
+        mem::drop(held);
+        inner.work_ready.notify_all();
         // Join every worker (each exits `take()` once it observes shutdown).
         // Must follow the shutdown+broadcast above, or the join would block
         // forever on threads still parked in `take()`.
-        const n: i64 = this.worker_tids.length() as i64;
-        for (mut i: i64 = 0; i < n; i = i + 1) {
-            exec_join_worker(this.worker_tids[i]);
-        }
+        this.workers.join_all();
         BlockingPool::stop(inner.blocking);
         Reactor::stop(inner.reactor);
         // No workers and no reactor thread remain: safe to reclaim without
@@ -946,10 +809,7 @@ implement trait Drop for struct Executor {
         inner.reactor = null;
         BlockingPool::free(inner.blocking);
         inner.blocking = null;
-        exec_cond_destroy(&inner.d_cond[0]);
-        exec_mtx_destroy(&inner.d_mutex[0]);
-        exec_cond_destroy(&inner.q_cond[0]);
-        exec_mtx_destroy(&inner.q_mutex[0]);
+        ptr::drop_in_place::<ExecInner>(inner);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         alloc.deallocate(NonNull::new(inner as u8*), Layout::of::<ExecInner>());
         this.inner = null;

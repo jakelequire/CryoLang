@@ -89,7 +89,7 @@ private function os_join(tid: u64) -> void {
 ![target(windows)]
 private function os_join(tid: u64) -> void {
     const h: u8* = tid as u8*;
-    syscall::WaitForSingleObject(h, 0xFFFFFFFF);   // INFINITE
+    syscall::WaitForSingleObject(h, syscall::INFINITE);
     syscall::CloseHandle(h);
 }
 
@@ -224,37 +224,46 @@ function thread_trampoline<C, T>(arg: u8*) -> u8* { thread_body::<C, T>(arg); re
 ![target(windows)]
 function thread_trampoline<C, T>(arg: u8*) -> u32 { thread_body::<C, T>(arg); return 0; }
 
-/// Create an OS thread running `thread_trampoline<C,T>(arg)`, writing the
-/// joinable id/handle into `tbuf` (8 bytes).  `stack_bytes == 0` requests
-/// the OS default stack.  Returns 0 on success, non-zero on failure.
-![target(linux)]
-private function os_create_thread<C, T>(tbuf: u8*, arg: u8*, stack_bytes: u64) -> i32 {
-    const tramp_fn: (u8*) -> u8* = thread_trampoline::<C, T>;
+/// Create an OS thread running `entry(arg)`, where `entry` is a trampoline
+/// of the platform's entry ABI, and return its joinable id (a pthread id,
+/// or the thread's HANDLE on Windows).  `stack_bytes == 0` requests the OS
+/// default stack.  A failure is the OS's own reason for it.
+![target(unix)]
+private function os_create_thread(entry: void*, arg: u8*, stack_bytes: u64) -> Result<u64, SpawnError> {
+    mut tbuf: [u8; 8] = [0; 8];
     if (stack_bytes == 0) {
-        return pthread_create(tbuf, null, tramp_fn as void*, arg);
+        const rc: i32 = pthread_create(&tbuf[0], null, entry, arg);
+        if (rc != 0) { return Result::Err(SpawnError::from_errno(rc)); }
+        return Result::Ok(*(&tbuf[0] as u64*));
     }
-    mut attr: [u8; 56];
-    mut i: u64 = 0;
-    while (i < 56) { attr[i] = 0; i = i + 1; }
-    if (pthread_attr_init(&attr[0]) != 0) { return 11; }   // EAGAIN
-    if (pthread_attr_setstacksize(&attr[0], stack_bytes) != 0) {
+    mut attr: [u8; 56] = [0; 56];
+    const init_rc: i32 = pthread_attr_init(&attr[0]);
+    if (init_rc != 0) { return Result::Err(SpawnError::from_errno(init_rc)); }
+    const size_rc: i32 = pthread_attr_setstacksize(&attr[0], stack_bytes);
+    if (size_rc != 0) {
         pthread_attr_destroy(&attr[0]);
-        return 22;   // EINVAL (out-of-range stack)
+        return Result::Err(SpawnError::from_errno(size_rc));
     }
-    const rc: i32 = pthread_create(tbuf, &attr[0], tramp_fn as void*, arg);
+    const rc: i32 = pthread_create(&tbuf[0], &attr[0], entry, arg);
     pthread_attr_destroy(&attr[0]);
-    return rc;
+    if (rc != 0) { return Result::Err(SpawnError::from_errno(rc)); }
+    return Result::Ok(*(&tbuf[0] as u64*));
 }
 ![target(windows)]
-private function os_create_thread<C, T>(tbuf: u8*, arg: u8*, stack_bytes: u64) -> i32 {
-    const tramp_fn: (u8*) -> u32 = thread_trampoline::<C, T>;
-    // dwStackSize = 0 means "default"; CreateThread takes the size directly,
-    // so no attribute object is needed.
-    const h: u8* = syscall::CreateThread(null, stack_bytes, tramp_fn as void*,
-                                         arg, 0, null);
-    if (h == null) { return 11; }   // surface as a resource-limit error
-    *(tbuf as u64*) = h as u64;     // store the HANDLE as the joinable id
-    return 0;
+private function os_create_thread(entry: void*, arg: u8*, stack_bytes: u64) -> Result<u64, SpawnError> {
+    // A requested size is the stack's reservation, committed as the thread
+    // touches it, so a large stack costs address space rather than memory.
+    mut flags: u32 = 0;
+    if (stack_bytes != 0) { flags = syscall::STACK_SIZE_PARAM_IS_A_RESERVATION; }
+    const h: u8* = syscall::CreateThread(null, stack_bytes, entry, arg, flags, null);
+    if (h != null) { return Result::Ok(h as u64); }
+    const code: u32 = syscall::GetLastError();
+    if (code == syscall::ERROR_NOT_ENOUGH_MEMORY || code == syscall::ERROR_OUTOFMEMORY) {
+        return Result::Err(SpawnError::OutOfMemory);
+    }
+    if (code == syscall::ERROR_ACCESS_DENIED) { return Result::Err(SpawnError::PermissionDenied); }
+    if (code == syscall::ERROR_MAX_THRDS_REACHED) { return Result::Err(SpawnError::ResourceLimit); }
+    return Result::Err(SpawnError::Other);
 }
 
 
@@ -391,18 +400,18 @@ where C: Send, T: Send {
     (*p).ctx    = ctx;
     (*p).shared = shared;
 
-    mut tbuf: [u8; 8] = [0; 8];
-    const rc: i32 = os_create_thread::<C, T>(&tbuf[0], p as u8*, stack_bytes);
-    if (rc != 0) {
-        // The thread never started, so we still own both boxes. The
-        // payload's `ctx` was moved in; release it in place so owned state
-        // inside it is not leaked, then free both boxes.
-        ptr::drop_in_place::<C>(&(*p).ctx);
-        alloc.deallocate(NonNull::new(p as u8*), Layout::of::<Payload<C, T>>());
-        alloc.deallocate(NonNull::new(shared as u8*), Layout::of::<Shared<T>>());
-        return Result::Err(SpawnError::from_errno(rc));
+    match (os_create_thread(thread_trampoline::<C, T> as void*, p as u8*, stack_bytes)) {
+        Result::Ok(tid) => { return Result::Ok(JoinHandle::<T> { tid: tid, shared: shared }); }
+        Result::Err(e)  => {
+            // The thread never started, so we still own both boxes. The
+            // payload's `ctx` was moved in; release it in place so owned
+            // state inside it is not leaked, then free both boxes.
+            ptr::drop_in_place::<C>(&(*p).ctx);
+            alloc.deallocate(NonNull::new(p as u8*), Layout::of::<Payload<C, T>>());
+            alloc.deallocate(NonNull::new(shared as u8*), Layout::of::<Shared<T>>());
+            return Result::Err(e);
+        }
     }
-    return Result::Ok(JoinHandle::<T> { tid: *(&tbuf[0] as u64*), shared: shared });
 }
 
 
@@ -619,40 +628,6 @@ function scope_trampoline<C>(arg: u8*) -> u8* { scope_body::<C>(arg); return nul
 ![target(windows)]
 function scope_trampoline<C>(arg: u8*) -> u32 { scope_body::<C>(arg); return 0; }
 
-/// Create an OS thread running `scope_trampoline<C>(arg)`, writing the
-/// joinable id/handle into `tbuf`. Returns 0 on success.
-![target(unix)]
-private function os_create_scope_thread<C>(tbuf: u8*, arg: u8*, stack_bytes: u64) -> i32 {
-    const t: (u8*) -> u8* = scope_trampoline::<C>;
-    if (stack_bytes == 0) {
-        return pthread_create(tbuf, null, t as void*, arg);
-    }
-    mut attr: [u8; 56];
-    mut i: u64 = 0;
-    while (i < 56) { attr[i] = 0; i = i + 1; }
-    if (pthread_attr_init(&attr[0]) != 0) { return 11; }
-    if (pthread_attr_setstacksize(&attr[0], stack_bytes) != 0) {
-        pthread_attr_destroy(&attr[0]);
-        return 22;
-    }
-    const rc: i32 = pthread_create(tbuf, &attr[0], t as void*, arg);
-    pthread_attr_destroy(&attr[0]);
-    return rc;
-}
-![target(windows)]
-private function os_create_scope_thread<C>(tbuf: u8*, arg: u8*, stack_bytes: u64) -> i32 {
-    const t: (u8*) -> u32 = scope_trampoline::<C>;
-    // STACK_SIZE_PARAM_IS_A_RESERVATION (0x10000): treat `stack_bytes` as the
-    // reserve (committed lazily) rather than an eager commit, so a large worker
-    // stack costs address space, not resident memory.
-    mut flags: u32 = 0;
-    if (stack_bytes != 0) { flags = 65536; }
-    const h: u8* = syscall::CreateThread(null, stack_bytes, t as void*, arg, flags, null);
-    if (h == null) { return 11; }
-    *(tbuf as u64*) = h as u64;
-    return 0;
-}
-
 /// A thread scope. Every thread spawned through it is guaranteed to be
 /// joined before the scope is torn down (explicitly via `join_all()` or
 /// automatically when the `Scope` drops), so scoped bodies may safely
@@ -702,10 +677,10 @@ type struct Scope {
         }
         (*p).body = body;
         (*p).ctx  = ctx;
-        mut tbuf: [u8; 8] = [0; 8];
-        const rc: i32 = os_create_scope_thread::<C>(&tbuf[0], p as u8*, this.stack_bytes);
-        if (rc != 0) { core::panic("Scope::spawn: thread creation failed", intrinsics::location()); }
-        this.tids.push(*(&tbuf[0] as u64*));
+        match (os_create_thread(scope_trampoline::<C> as void*, p as u8*, this.stack_bytes)) {
+            Result::Ok(tid) => { this.tids.push(tid); }
+            Result::Err(_)  => { core::panic("Scope::spawn: thread creation failed", intrinsics::location()); }
+        }
     }
 
     /// Join every thread spawned so far, blocking until all have

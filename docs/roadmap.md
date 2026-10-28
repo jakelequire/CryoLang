@@ -465,7 +465,10 @@ Left over from that: the async entry point calls `Executor::new` and
    Integers cross bytes through `ByteReader` and `ByteWriter`, and `u8`
    folds to uppercase too (611).  An OS error becomes an `IoError` in
    `io::error`, which is marked (612).  A float classifies itself and an
-   integer rotates itself (613).  Open: a writer over a fixed
+   integer rotates itself (613).  The executor, the reactor, the
+   blocking pool and the channels lock with `sync`'s `Mutex` and
+   `CondVar` and start their threads through `thread`, which creates
+   every thread one way (622).  Open: a writer over a fixed
    region - SHA-1's digest, the generator's fill, `pack_sockaddr_in` and
    the IPv6 parser still store their bytes by hand - and whether the
    Winsock and OpenSSL error mappers in `net` become `IoError`

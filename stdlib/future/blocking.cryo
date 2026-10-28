@@ -68,8 +68,10 @@ import std::core::drop;
 import std::alloc::layout::{ Layout };
 import std::alloc::allocator::{ GlobalAlloc };
 import std::sync::atomic::{ Atomic, MemoryOrder };
-import std::ffi::libc;
-import std::sys::syscall;
+import std::sync::mutex::{ Mutex, MutexGuard };
+import std::sync::condvar::{ CondVar };
+import std::thread;
+import std::thread::{ JoinHandle as ThreadJoinHandle };
 import std::future::waker::{ Waker };
 import std::core::mem;
 import std::core::intrinsics;
@@ -139,10 +141,10 @@ type struct BlockingJob {
     /// takes it back out.
     arm(mut &this, w: Waker) -> u8 {
         const pool: BlockingPool* = this.pool;
-        bp_mtx_lock(&pool.mtx[0]);
+        const held: MutexGuard<(), GlobalAlloc> = pool.lock.lock();
         const st: u8 = this.status.load(MemoryOrder::Acquire);
         mut replaced: Waker = Waker::replace(&this.waker, w);
-        bp_mtx_unlock(&pool.mtx[0]);
+        mem::drop(held);
         mem::drop(replaced);   // outside the lock: a waker's drop runs arbitrary code
         return st;
     }
@@ -156,10 +158,10 @@ type struct BlockingJob {
     /// may free it.
     finish(mut &this, status: u8) -> void {
         const pool: BlockingPool* = this.pool;
-        bp_mtx_lock(&pool.mtx[0]);
+        const held: MutexGuard<(), GlobalAlloc> = pool.lock.lock();
         mut w: Waker = Waker::take(&this.waker);
         this.status.store(status, MemoryOrder::Release);
-        bp_mtx_unlock(&pool.mtx[0]);
+        mem::drop(held);
         w.wake();
         this.release();
         // `w` drops here, releasing the task reference the stored waker held;
@@ -205,19 +207,16 @@ mut g_current_pool: BlockingPool* = null;
 /// Heap-allocated: worker threads and submitted jobs hold raw pointers to it, so
 /// it must not move.
 type struct BlockingPool {
-    mtx:      [u8; 40];   // guards everything below (pthread_mutex_t / SRWLOCK)
-    cv:       [u8; 48];   // threads wait here for work (pthread_cond_t)
+    lock:       Mutex<()>;   // guards everything below, and every job's waker slot
+    work_ready: CondVar;     // threads wait here for work
     head:     BlockingJob*;   // dequeue end (null when empty)
     tail:     BlockingJob*;   // enqueue end
     shutdown: boolean;
-    live:     u32;      // threads created so far
-    idle:     u32;      // threads currently waiting on `cv`
-    max:      u32;      // ceiling on `live`
-    // Joinable ids of the `live` threads, `max` entries wide. A raw allocation
-    // rather than a dynamic array: the pool block is raw memory that worker
-    // threads and submitted jobs hold a pointer into, so it holds no owning
-    // aggregate whose drop would have to be synthesized. `free` releases it.
-    tids:     u64*;
+    idle:     u32;      // threads currently waiting on `work_ready`
+    max:      u32;      // ceiling on the number of threads
+    // One handle per thread created so far. Joined by `stop`; the pool block
+    // is raw memory, so `free` releases the fields in place.
+    threads:  [ThreadJoinHandle<()>];
 
     /// Create an empty pool with the default thread ceiling.
     static start() -> BlockingPool* {
@@ -228,9 +227,8 @@ type struct BlockingPool {
     /// >= 1: a pool that could never create a thread would accept jobs and never
     /// reach them). No thread is started here — the first `submit` creates one,
     /// so a program that never offloads anything never pays for a thread, and
-    /// `max` costs only its slot in the id table. Panics only if the OS refuses
-    /// the lock primitives or the allocator refuses that table, either of which
-    /// would make every later `submit` unsound.
+    /// `max` costs nothing until it is reached. Panics only if the allocator
+    /// refuses the pool block or its lock.
     static with_max(max: u32) -> BlockingPool* {
         mut count: u32 = max;
         if (count == 0) { count = 1; }
@@ -240,23 +238,14 @@ type struct BlockingPool {
             Result::Ok(raw) => { p = raw.cast::<BlockingPool>().as_ptr(); }
             Result::Err(_)  => { panic("BlockingPool::with_max: allocation failed", intrinsics::location()); }
         }
-        if (bp_mtx_init(&p.mtx[0]) != 0) {
-            panic("BlockingPool::with_max: mutex init failed", intrinsics::location());
-        }
-        if (bp_cond_init(&p.cv[0]) != 0) {
-            panic("BlockingPool::with_max: condition variable init failed", intrinsics::location());
-        }
+        p.lock       = Mutex::new(());
+        p.work_ready = CondVar::new();
         p.head     = null;
         p.tail     = null;
         p.shutdown = false;
-        p.live     = 0;
         p.idle     = 0;
         p.max      = count;
-        match (alloc.allocate(Layout::array::<u64>(count as u64))) {
-            Result::Ok(raw) => { p.tids = raw.cast::<u64>().as_ptr(); }
-            Result::Err(_)  => { panic("BlockingPool::with_max: thread table allocation failed", intrinsics::location()); }
-        }
-        for (mut i: u32 = 0; i < count; i = i + 1) { p.tids[i] = 0; }
+        p.threads  = [];
         return p;
     }
 
@@ -275,14 +264,17 @@ type struct BlockingPool {
     /// writing into a pool block that is about to be freed.
     static stop(p: BlockingPool*) -> void {
         if (p == null) { return; }
-        bp_mtx_lock(&p.mtx[0]);
+        const held: MutexGuard<(), GlobalAlloc> = p.lock.lock();
         p.shutdown = true;
-        const n: u32 = p.live;
-        bp_mtx_unlock(&p.mtx[0]);
-        bp_cond_broadcast(&p.cv[0]);
-        for (mut i: u32 = 0; i < n; i = i + 1) {
-            bp_join_worker(p.tids[i]);
-            p.tids[i] = 0;
+        mem::drop(held);
+        p.work_ready.notify_all();
+        // No thread is created once shutdown is set, so `threads` has no
+        // other writer from here on.
+        loop {
+            match (p.threads.pop()) {
+                Option::Some(worker) => { worker.join(); }
+                Option::None         => { break; }
+            }
         }
         // The threads are gone, so the queue has exactly one accessor. `finish`
         // takes the lock itself, which is why the jobs are unlinked one at a
@@ -301,15 +293,8 @@ type struct BlockingPool {
     /// let go of a job has been dropped — see `stop`.
     static free(p: BlockingPool*) -> void {
         if (p == null) { return; }
-        bp_cond_destroy(&p.cv[0]);
-        bp_mtx_destroy(&p.mtx[0]);
+        ptr::drop_in_place::<BlockingPool>(p);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        // The id table is sized by `max`, so it must be released before the
-        // block that records it.
-        if (p.tids != null) {
-            alloc.deallocate(NonNull::new(p.tids as u8*), Layout::array::<u64>(p.max as u64));
-            p.tids = null;
-        }
         alloc.deallocate(NonNull::new(p as u8*), Layout::of::<BlockingPool>());
     }
 
@@ -333,26 +318,22 @@ type struct BlockingPool {
     ///
     /// A thread is created under the lock rather than after it. That costs one
     /// thread creation's worth of lock hold at most `max` times in the pool's
-    /// life, and in exchange `live` and `tids` are never observed half-updated
-    /// by `stop`, which is the only other reader of either.
+    /// life, and in exchange `threads` is never observed half-updated by
+    /// `stop`, its only other reader.
     submit(mut &this, job: BlockingJob*) -> boolean {
-        bp_mtx_lock(&this.mtx[0]);
-        if (this.shutdown) {
-            bp_mtx_unlock(&this.mtx[0]);
-            return false;
-        }
+        const held: MutexGuard<(), GlobalAlloc> = this.lock.lock();
+        if (this.shutdown) { return false; }
         // Grow only when nothing is idle: an idle thread takes this job the
         // moment the lock is released.
-        if (this.idle == 0 && this.live < this.max) {
-            mut tbuf: [u8; 8] = [0; 8];
-            if (bp_spawn_worker(&this, &tbuf[0]) == 0) {
-                this.tids[this.live] = *(&tbuf[0] as u64*);
-                this.live = this.live + 1;
-            } else if (this.live == 0) {
-                // No thread exists and none can be created, so a queued job
-                // would sit here forever. Refuse it instead.
-                bp_mtx_unlock(&this.mtx[0]);
-                return false;
+        const live: i64 = this.threads.length();
+        if (this.idle == 0 && live < this.max as i64) {
+            match (thread::try_spawn::<BlockingPool*, ()>(&this, blocking_worker)) {
+                Result::Ok(worker) => { this.threads.push(worker); }
+                Result::Err(_)     => {
+                    // No thread exists and none can be created, so a queued
+                    // job would sit here forever. Refuse it instead.
+                    if (live == 0) { return false; }
+                }
             }
         }
         job.retain();        // the pool's reference
@@ -365,8 +346,8 @@ type struct BlockingPool {
             this.tail.next = job;
             this.tail = job;
         }
-        bp_cond_signal(&this.cv[0]);
-        bp_mtx_unlock(&this.mtx[0]);
+        this.work_ready.notify_one();
+        mem::drop(held);
         return true;
     }
 
@@ -378,129 +359,34 @@ type struct BlockingPool {
     /// to be a free function to serve as a raw thread entry (`ExecInner::take`
     /// is public for the identical reason).
     take(mut &this) -> BlockingJob* {
-        bp_mtx_lock(&this.mtx[0]);
+        mut held: MutexGuard<(), GlobalAlloc> = this.lock.lock();
         while (this.head == null && !this.shutdown) {
             // `idle` is what `submit` reads to decide whether growing the pool
             // would buy anything, so it must count exactly the threads parked
             // on this wait.
             this.idle = this.idle + 1;
-            bp_cond_wait(&this.cv[0], &this.mtx[0]);
+            this.work_ready.wait(&this.lock, &held);
             this.idle = this.idle - 1;
         }
-        if (this.shutdown) {
-            bp_mtx_unlock(&this.mtx[0]);
-            return null;
-        }
+        if (this.shutdown) { return null; }
         const job: BlockingJob* = this.head;
         this.head = job.next;
         if (this.head == null) { this.tail = null; }
         job.next = null;
-        bp_mtx_unlock(&this.mtx[0]);
+        mem::drop(held);
         return job;
     }
 }
 
 
-/// A pool thread: run queued jobs until shutdown. The OS thread entry, so a free
+/// A pool thread: run queued jobs until shutdown. A thread's body, so a free
 /// function.
-private function blocking_worker(pool: BlockingPool*) -> void {
+private function blocking_worker(pool: BlockingPool*) -> () {
     loop {
         const job: BlockingJob* = pool.take();
-        if (job == null) { return; }
+        if (job == null) { return (); }
         const rf: (u8*) -> void = job.run_fn;
         rf(job as u8*);
         job.finish(JOB_DONE);
     }
-}
-
-
-// ---------------------------------------------------------------------------
-// Per-OS thread + lock primitives, mirroring the reactor's. This module keeps
-// its own rather than importing `thread`, which would clash on the `JoinHandle`
-// leaf name inside `future::*`. ConfigGating only strips file-scope
-// declarations, so every OS call lives in one of these gated free functions and
-// the methods delegate.
-// ---------------------------------------------------------------------------
-
-![target(unix)]
-private function bp_mtx_init(b: u8*) -> i32 { return libc::pthread_mutex_init(b, null); }
-![target(windows)]
-private function bp_mtx_init(b: u8*) -> i32 { syscall::InitializeSRWLock(b); return 0; }
-
-![target(unix)]
-private function bp_mtx_lock(b: u8*) -> void { libc::pthread_mutex_lock(b); }
-![target(windows)]
-private function bp_mtx_lock(b: u8*) -> void { syscall::AcquireSRWLockExclusive(b); }
-
-![target(unix)]
-private function bp_mtx_unlock(b: u8*) -> void { libc::pthread_mutex_unlock(b); }
-![target(windows)]
-private function bp_mtx_unlock(b: u8*) -> void { syscall::ReleaseSRWLockExclusive(b); }
-
-![target(unix)]
-private function bp_mtx_destroy(b: u8*) -> void { libc::pthread_mutex_destroy(b); }
-![target(windows)]
-private function bp_mtx_destroy(b: u8*) -> void { }
-
-![target(unix)]
-private function bp_cond_init(b: u8*) -> i32 { return libc::pthread_cond_init(b, null); }
-![target(windows)]
-private function bp_cond_init(b: u8*) -> i32 { syscall::InitializeConditionVariable(b); return 0; }
-
-![target(unix)]
-private function bp_cond_destroy(b: u8*) -> void { libc::pthread_cond_destroy(b); }
-![target(windows)]
-private function bp_cond_destroy(b: u8*) -> void { }
-
-![target(unix)]
-private function bp_cond_wait(c: u8*, m: u8*) -> void { libc::pthread_cond_wait(c, m); }
-![target(windows)]
-private function bp_cond_wait(c: u8*, m: u8*) -> void {
-    syscall::SleepConditionVariableSRW(c, m, 0xFFFFFFFF, 0);
-}
-
-![target(unix)]
-private function bp_cond_signal(b: u8*) -> void { libc::pthread_cond_signal(b); }
-![target(windows)]
-private function bp_cond_signal(b: u8*) -> void { syscall::WakeConditionVariable(b); }
-
-![target(unix)]
-private function bp_cond_broadcast(b: u8*) -> void { libc::pthread_cond_broadcast(b); }
-![target(windows)]
-private function bp_cond_broadcast(b: u8*) -> void { syscall::WakeAllConditionVariable(b); }
-
-// The OS thread entry ABIs differ (pthread returns `void*`, a Win32 start
-// routine returns `DWORD`), so each gets its own trampoline around the shared
-// body. Stored as a raw fn-ptr, hence free functions.
-![target(unix)]
-private function bp_worker_tramp(arg: u8*) -> u8* { blocking_worker(arg as BlockingPool*); return null; }
-![target(windows)]
-private function bp_worker_tramp(arg: u8*) -> u32 { blocking_worker(arg as BlockingPool*); return 0; }
-
-/// Create one pool thread, writing its joinable id/handle into `tbuf` (8 bytes).
-/// Returns 0 on success, non-zero if the OS refused.
-![target(unix)]
-private function bp_spawn_worker(pool: BlockingPool*, tbuf: u8*) -> i32 {
-    const t: (u8*) -> u8* = bp_worker_tramp;
-    return libc::pthread_create(tbuf, null, t as void*, pool as u8*);
-}
-![target(windows)]
-private function bp_spawn_worker(pool: BlockingPool*, tbuf: u8*) -> i32 {
-    const t: (u8*) -> u32 = bp_worker_tramp;
-    const h: u8* = syscall::CreateThread(null, 0, t as void*, pool as u8*, 0, null);
-    if (h == null) { return 11; }
-    *(tbuf as u64*) = h as u64;
-    return 0;
-}
-
-![target(unix)]
-private function bp_join_worker(tid: u64) -> void {
-    mut ret: u8* = null;
-    libc::pthread_join(tid, &ret);
-}
-![target(windows)]
-private function bp_join_worker(tid: u64) -> void {
-    const h: u8* = tid as u8*;
-    syscall::WaitForSingleObject(h, 0xFFFFFFFF);   // INFINITE
-    syscall::CloseHandle(h);
 }
