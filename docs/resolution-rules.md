@@ -594,6 +594,19 @@ yet is recorded with the change that builds it, not here.
      point calls to publish them, are internal, as the f-string builders
      are.  (Jake; internal for the two entry-point items delegated)
 
+630. **`math`, `random` and `sync` are marked.**  Every `math` constant
+     and function is public.  `random`'s generators, `RandomSource`,
+     `Distribution`, the distributions and `RandomError` are public; a
+     distribution that only stores its parameters keeps public fields,
+     while `Bernoulli`, which clamps its probability, `WeightedIndex` and
+     `Rng`'s state words are private, and the Box-Muller step reads
+     `math::TAU` rather than a copy of it.  Every lock, guard, channel
+     handle and `Atomic` is public with the pointer or value it holds
+     private; the heap-pinned records behind them and the channel's nodes
+     and steps are private, and `Mutex.raw_pthread_buf` is internal, the
+     condition variable's way to pair with a mutex.  A member of a private
+     type is written `private`.  (Jake; each split delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that
