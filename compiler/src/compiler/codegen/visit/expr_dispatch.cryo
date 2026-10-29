@@ -152,36 +152,7 @@ type struct ExprDispatch {
         const v: LValue = e.value;
 
         if (e.is_lvalue && v.is_valid()) {
-            // String-index special case: char is i32 but string storage
-            // is i8 per byte.  `codegen_array_access` returns the byte's
-            // i8* as lvalue; here we do the i8-load-and-zext so the
-            // value has the expected char/i32 type.  Generic map_type
-            // load would read 4 bytes from an i8 slot (walking into
-            // neighbouring bytes), which is wrong.
-            const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(expr);
-            if (aa != null) {
-                const arr_t: Type* = this.cg.arena_type(aa.array.resolved_type);
-                if (arr_t != null && arr_t.kind == TypeKind::String) {
-                    const byte: LValue = this.cg.builder.build_load(
-                        LType::i8(), v, "charbyte");
-                    return this.cg.builder.build_zext(byte, LType::i32(), "char");
-                }
-            }
-            // Same special case for `*string`: lex_token does
-            // `mut c: char = *this.current as char` to read one ASCII byte.
-            // The generic load reads `map_type(char) = i32` (4 bytes), which
-            // is wrong for an i8-sized backing store.  Emit i8-load + zext-to-i32.
-            const ue: UnaryExpr* = ExpressionNode::unary_of(expr);
-            if (ue != null) {
-                if (ue.op.kind == TokenType::Star) {
-                    const op_t: Type* = this.cg.arena_type(ue.operand.resolved_type);
-                    if (op_t != null && op_t.kind == TypeKind::String) {
-                        const byte: LValue = this.cg.builder.build_load(
-                            LType::i8(), v, "strbyte");
-                        return this.cg.builder.build_zext(byte, LType::i32(), "char");
-                    }
-                }
-            }
+            if (this.holds_char_in_a_byte(expr)) { return this.load_char_byte(v); }
             // Variadic bucket: `args` in a variadic function body is
             // bound to the va_list alloca (shape selected per-ABI by
             // `AbiClassifier::va_list_alloca_type`).  When referenced
@@ -205,6 +176,29 @@ type struct ExprDispatch {
             }
         }
         return v;
+    }
+
+    /// Whether `expr` is a `char` whose storage is one byte: an index of a
+    /// `string` (`s[i]`) or a dereference of one (`*s`).  Its place is the
+    /// byte's address, so the `char` is read by loading the byte and
+    /// widening it - a `char`-sized load would take the three bytes after it
+    /// too - and the place is never the address of a `char`.
+    holds_char_in_a_byte(&this, expr: ExpressionNode*) -> boolean {
+        mut text: ExpressionNode* = null;
+        const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(expr);
+        if (aa != null) { text = aa.array; }
+        const ue: UnaryExpr* = ExpressionNode::unary_of(expr);
+        if (ue != null && ue.op.kind == TokenType::Star) { text = ue.operand; }
+        if (text == null) { return false; }
+        const t: Type* = this.cg.arena_type(text.resolved_type);
+        return t != null && t.kind == TypeKind::String;
+    }
+
+    /// The `char` held in the byte at `place`, a place `holds_char_in_a_byte`
+    /// answered for.
+    load_char_byte(mut &this, place: LValue) -> LValue {
+        const byte: LValue = this.cg.builder.build_load(LType::i8(), place, "charbyte");
+        return this.cg.builder.build_zext(byte, LType::i32(), "char");
     }
 
     /// Codegen an expression, returning what it emitted, place or value,

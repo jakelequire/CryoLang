@@ -663,13 +663,20 @@ type struct CallEmitter {
             } else {
                 const obj_e: Emitted = this.dispatch.generate_expression(visitor, ma.object);
                 obj = obj_e.value;
+                mut addressable: boolean = obj_e.is_lvalue;
+                // A `char` held in a string's byte has no `char` storage to
+                // point at: its value is read out and spilled like an rvalue.
+                if (addressable && obj.is_valid() && this.dispatch.holds_char_in_a_byte(ma.object)) {
+                    obj = this.dispatch.load_char_byte(obj);
+                    addressable = false;
+                }
                 // A value-typed receiver that is an rvalue - a literal
                 // (`"x".method()`), a call result, or a method-chain result
                 // (`a.f().g()`) - has no backing storage, so emitting it
                 // gives the VALUE rather than an address.  Using that as
                 // `&this` is one indirection short and crashes the callee.
                 // Spill it to a fresh slot so `this` points at real memory.
-                if (obj.is_valid() && !obj_e.is_lvalue) {
+                if (obj.is_valid() && !addressable) {
                     const recv_ty: LType = LType { raw: llvm::LLVMTypeOf(obj.raw) };
                     const recv_slot: LValue = this.entry_spill_slot(recv_ty, "recvtmp");
                     this.cg.builder.build_store(obj, recv_slot);
