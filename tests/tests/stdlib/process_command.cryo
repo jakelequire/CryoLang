@@ -20,6 +20,7 @@ import std::io::error::{ IoError, IoErrorKind };
 import std::io::traits;
 import std::process::command::{ Command, Output, Stdio };
 import std::process::child::{ Child, ChildStdout, ExitStatus };
+import std::process::signal::{ Signal };
 import std::fs::path::{ Path };
 import std::fs::file::{ File };
 import std::fs::dir::{ remove_file };
@@ -503,6 +504,34 @@ function wait_timeout_leaves_a_running_child_running() -> Result<(), TestError> 
             mem::drop(c.kill());
             mem::drop(c.wait());
             return expect(still_running, Str::new("a sleeping child must still be running after 100 ms"));
+        }
+        Result::Err(_) => { return bail(Str::new("spawn of the sleeping child failed")); }
+    }
+}
+
+/// Windows has no user signals: sending one is refused, and the child is
+/// left running rather than terminated.
+![test]
+![target(windows)]
+function send_signal_other_than_kill_is_unsupported_on_windows() -> Result<(), TestError> {
+    mut cmd: Command = cmd_sleep();
+    match (cmd.spawn()) {
+        Result::Ok(handle) => {
+            mut c: Child = handle;
+            mut refused: boolean = false;
+            match (c.send_signal(Signal::user1())) {
+                Result::Ok(_)  => { }
+                Result::Err(e) => { refused = e.kind == IoErrorKind::Unsupported; }
+            }
+            mut still_running: boolean = false;
+            match (c.wait_timeout(Duration::from_millis(100))) {
+                Result::Ok(finished) => { still_running = finished.is_none(); }
+                Result::Err(_) => { }
+            }
+            mem::drop(c.kill());
+            mem::drop(c.wait());
+            expect(refused, Str::new("send_signal(user1) must be Unsupported on Windows"))?;
+            return expect(still_running, Str::new("the child must still be running after send_signal(user1)"));
         }
         Result::Err(_) => { return bail(Str::new("spawn of the sleeping child failed")); }
     }

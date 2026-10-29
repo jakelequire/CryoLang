@@ -197,8 +197,12 @@ private function os_proc_signal(pid: i32, handle: u64, sig: i32) -> Result<(), I
 }
 ![target(windows)]
 private function os_proc_signal(pid: i32, handle: u64, sig: i32) -> Result<(), IoError> {
-    // No POSIX signals on Windows; any kill/send_signal terminates the
-    // process (the specific signal number is not representable).
+    // No POSIX signals on Windows. Terminating the process is the one
+    // signal that can be delivered; any other is refused, never turned
+    // into a termination the caller did not ask for.
+    if (sig != Signal::kill().as_i32()) {
+        return Result::Err(IoError::new(IoErrorKind::Unsupported, 0));
+    }
     if (syscall::TerminateProcess(handle as u8*, 1) == 0) {
         return Result::Err(IoError::last_os_error());
     }
@@ -534,6 +538,8 @@ public:
         return this.send_signal(Signal::kill());
     }
 
+    /// Send `sig` to the child. Windows delivers only `Signal::kill()`,
+    /// as a termination; any other signal there is `Unsupported`.
     send_signal(&this, sig: Signal) -> Result<(), IoError> {
         return os_proc_signal(this.pid, this.handle, sig.as_i32());
     }

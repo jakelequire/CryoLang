@@ -29,6 +29,7 @@ import std::collections::string;
 import std::collections::array::{ Array };
 import std::future;
 import std::io::error;
+import std::io::error::{ IoErrorKind };
 import std::io::traits::{ AsyncTransport, Transfer };
 import std::io::buf::{ BufStream };
 import std::net::http::method;
@@ -180,4 +181,28 @@ function keep_alive_two_requests_one_buffer() -> Result<(), TestError> {
 function tiny_chunks_still_frame_correctly() -> Result<(), TestError> {
     const fills: i64 = future::block_on(hbp_two_requests(1));
     return expect_eq(fills, Str::new(TWO_REQUESTS).length() as i64);
+}
+
+/// A chunked request whose one chunk is itself a request line. Read as a
+/// bodiless request, it would leave that chunk to be parsed as a second,
+/// smuggled request; it must be refused instead.
+const CHUNKED_REQUEST: string =
+    "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n12\r\nGET /admin HTTP/1.1\r\n\r\n0\r\n\r\n";
+
+/// 0 when the chunked request is refused as `Unsupported`.
+async function hbp_chunked_request() -> i64 {
+    mut c: BufStream<MemTransport> =
+        BufStream::<MemTransport>::of(MemTransport::of(CHUNKED_REQUEST, 0));
+    match (await c.read_request()) {
+        Result::Ok(_)  => { return 1; }
+        Result::Err(e) => {
+            if (e.kind == IoErrorKind::Unsupported) { return 0; }
+            return 2;
+        }
+    }
+}
+
+![test]
+function transfer_encoding_request_is_refused() -> Result<(), TestError> {
+    return expect_eq(future::block_on(hbp_chunked_request()), 0 as i64);
 }

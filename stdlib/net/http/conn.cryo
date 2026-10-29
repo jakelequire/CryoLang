@@ -56,7 +56,9 @@ import std::future::traits;
 implement struct BufStream<S> {
     /// Read one complete request: request line, headers, and the body
     /// sized by `Content-Length`. A peer that closes mid-message is
-    /// `UnexpectedEof`; one that sends a malformed line is `InvalidData`.
+    /// `UnexpectedEof`; one that sends a malformed line is `InvalidData`;
+    /// a request whose body is framed by `Transfer-Encoding` is
+    /// `Unsupported`.
     public async read_request(mut &this) -> Result<Request, IoError>
     where S: AsyncTransport {
         mut line: String = (await this.read_line(request::MAX_HEADER_LINE))?;
@@ -75,8 +77,14 @@ implement struct BufStream<S> {
             }
         }
 
-        // Body, sized by Content-Length. No Content-Length means no body
-        // for this parser; chunked encoding is out of scope.
+        // A body framed by `Transfer-Encoding` has no length this parser
+        // reads. Taking the request as bodiless would leave the body on the
+        // connection, to be parsed as the next request.
+        if (req.headers.contains(str::Str::new("transfer-encoding"))) {
+            return Result::Err(IoError::new(IoErrorKind::Unsupported, 0));
+        }
+
+        // Body, sized by Content-Length. No Content-Length means no body.
         const declared: Option<i64> = req.headers.content_length()?;
         mut length: i64 = 0;
         match (declared) {

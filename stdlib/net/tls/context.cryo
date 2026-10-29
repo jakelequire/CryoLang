@@ -42,7 +42,10 @@ public type struct TlsConnector {
             return Result::Err(IoError::new(IoErrorKind::Other, 0));
         }
         // Load the OS CA bundle so verification can actually succeed.
-        openssl::SSL_CTX_set_default_verify_paths(ctx);
+        if (openssl::SSL_CTX_set_default_verify_paths(ctx) != 1) {
+            openssl::SSL_CTX_free(ctx);
+            return Result::Err(IoError::new(IoErrorKind::Other, 0));
+        }
         return Result::Ok(TlsConnector { ctx: ctx, verify: true });
     }
 
@@ -101,13 +104,21 @@ public type struct TlsConnector {
         }
         openssl::SSL_set_fd(ssl, inner.raw_fd());
 
+        // A name OpenSSL refuses (empty, or longer than 255 bytes) is a
+        // refused connection: going on would send no server name, and with
+        // verification on would check the chain but never the name.
         mut host_c: String = String::with_null(hostname);
-        openssl::ssl_set_sni(ssl, host_c.as_ptr());
-        if (this.verify) {
-            openssl::SSL_set1_host(ssl, host_c.as_ptr());
+        mut named: boolean = openssl::ssl_set_sni(ssl, host_c.as_ptr()) == 1;
+        if (named && this.verify) {
+            named = openssl::SSL_set1_host(ssl, host_c.as_ptr()) == 1;
             openssl::SSL_set_verify(ssl, openssl::SSL_VERIFY_PEER, null);
         }
         mem::drop(host_c);
+        if (!named) {
+            openssl::SSL_free(ssl);
+            mem::drop(inner);
+            return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
+        }
         return Result::Ok(TlsHandshake::start(TlsStream::from_parts(ssl, inner),
                                               true, this.verify));
     }
