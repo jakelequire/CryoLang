@@ -3393,6 +3393,7 @@ Two move/ownership hazards that are unambiguous memory errors, called out as the
 
 - **Loop-carried move** (`E0452`) - a value moved inside a loop and re-read on the next iteration would be freed twice.  A loop's condition, and a `for`'s update, run again at every back edge, so a value or field moved in them is refused, even when the body assigns it a new one, unless the body always leaves the loop with `break` or `return`.
 - **Returning the address of a local** (`E0455`) - `return &local;` hands back a pointer into the stack frame that is freed when the function returns. (`return &this` / `return &param` is fine - those are caller-backed.)
+- **A field moved out on some paths only** (`E0453`) - a field moved out of a local runs its owner's release without that field at scope exit, which is sound only when the move certainly happened.  So a field may be moved out of a local of a struct with no destructor in straight-line code, and is refused inside an `if`, `match` or loop body, on the right of `&&` or `||`, and in an arm of `?:` or of an `if` expression - each runs on some paths only.
 
 Cryo has **no borrow checker**. References and raw pointers are unchecked: aliasing, validity, and lifetimes are the programmer's responsibility (see [section 2](#2-type-system) and [section 14](#14-pointers-and-memory)). Move tracking enforces the moved-set above and nothing more: it does not prove that a reference or pointer outlives what it points to.
 
