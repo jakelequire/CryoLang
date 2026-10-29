@@ -1,5 +1,6 @@
 ///! Str/String search + slice methods: starts_with, ends_with, find,
-///! contains, trim family, to_ascii_uppercase, and split iteration.
+///! contains, trim family, to_ascii_uppercase, split iteration,
+///! strip_prefix/strip_suffix, common_prefix_length and replace.
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::StrSearch;
@@ -164,5 +165,76 @@ function equals_case_insensitive_folds_ascii_only() -> Result<(), TestError> {
     expect_true(!s.equals_case_insensitive(&Str::new("keep-aliv")), Str::new("shorter"))?;
     // "@" (0x40) and "`" (0x60) differ by the case bit but are not letters.
     expect_true(!Str::new("@").equals_case_insensitive(&Str::new("`")), Str::new("non-letters"))?;
+    return Result::Ok(());
+}
+
+![test]
+function strip_prefix_and_strip_suffix() -> Result<(), TestError> {
+    const s: Str = Str::new("lib/core.cryo");
+    expect_eq(s.strip_prefix(&Str::new("lib/")), Option::Some(Str::new("core.cryo")))?;
+    expect_eq(s.strip_suffix(&Str::new(".cryo")), Option::Some(Str::new("lib/core")))?;
+    expect_true(s.strip_prefix(&Str::new("core")).is_none(), Str::new("prefix absent"))?;
+    expect_true(s.strip_suffix(&Str::new("core")).is_none(), Str::new("suffix absent"))?;
+    expect_true(s.strip_prefix(&Str::new("lib/core.cryo!")).is_none(), Str::new("prefix longer"))?;
+    expect_eq(s.strip_prefix(&Str::new("")), Option::Some(s))?;
+    expect_eq(s.strip_suffix(&Str::new("")), Option::Some(s))?;
+    expect_eq(s.strip_suffix(&s), Option::Some(Str::new("")))?;
+    const owned: String = String::from("v1.0");
+    expect_eq(owned.strip_prefix(&Str::new("v")), Option::Some(Str::new("1.0")))?;
+    expect_eq(owned.strip_suffix(&Str::new(".0")), Option::Some(Str::new("v1")))?;
+    return Result::Ok(());
+}
+
+![test]
+function common_prefix_length_counts_shared_bytes() -> Result<(), TestError> {
+    const s: Str = Str::new("std::collections");
+    expect_eq(s.common_prefix_length(&Str::new("std::core")), 7)?;
+    expect_eq(s.common_prefix_length(&Str::new("std")), 3)?;
+    expect_eq(s.common_prefix_length(&Str::new("core")), 0)?;
+    expect_eq(s.common_prefix_length(&Str::new("")), 0)?;
+    expect_eq(s.common_prefix_length(&s), 16)?;
+    expect_eq(String::from("abc").common_prefix_length(&Str::new("abd")), 2)?;
+    return Result::Ok(());
+}
+
+![test]
+function replace_substitutes_every_occurrence() -> Result<(), TestError> {
+    const s: Str = Str::new("a-b--c-");
+    expect_eq(s.replace(&Str::new("-"), &Str::new("+")), String::from("a+b++c+"))?;
+    expect_eq(s.replace(&Str::new("--"), &Str::new("")), String::from("a-bc-"))?;
+    expect_eq(s.replace(&Str::new("-"), &Str::new("::")), String::from("a::b::::c::"))?;
+    expect_eq(s.replace(&Str::new("x"), &Str::new("y")), String::from("a-b--c-"))?;
+    expect_eq(s.replace(&Str::new(""), &Str::new("y")), String::from("a-b--c-"))?;
+    // Scanning resumes after each replaced match, so matches never overlap.
+    expect_eq(Str::new("aaa").replace(&Str::new("aa"), &Str::new("b")), String::from("ba"))?;
+    expect_eq(Str::new("").replace(&Str::new("a"), &Str::new("b")), String::from(""))?;
+    expect_eq(String::from("x.y").replace(&Str::new("."), &Str::new("/")), String::from("x/y"))?;
+    return Result::Ok(());
+}
+
+![test]
+function split_nonempty_drops_empty_pieces() -> Result<(), TestError> {
+    mut joined: String = String::new();
+    mut it: SplitIter = Str::new("::a::::bb::c::").split_nonempty(&Str::new("::"));
+    loop {
+        match (it.next()) {
+            Option::Some(piece) => {
+                joined.push(piece);
+                joined.push_byte(0x7C as u8); // '|'
+            }
+            Option::None => { break; }
+        }
+    }
+    expect_eq(joined, String::from("a|bb|c|"))?;
+    mut empty: SplitIter = Str::new("").split_nonempty(&Str::new(","));
+    expect_true(empty.next().is_none(), Str::new("empty input"))?;
+    mut separators: SplitIter = Str::new(",,").split_nonempty(&Str::new(","));
+    expect_true(separators.next().is_none(), Str::new("separators only"))?;
+    mut whole: SplitIter = Str::new("whole").split_nonempty(&Str::new(""));
+    expect_eq(whole.next(), Option::Some(Str::new("whole")))?;
+    expect_true(whole.next().is_none(), Str::new("empty separator yields once"))?;
+    const owned: String = String::from("/usr//lib/");
+    mut segments: SplitIter = owned.split_nonempty(&Str::new("/"));
+    expect_eq(segments.count(), 2)?;
     return Result::Ok(());
 }

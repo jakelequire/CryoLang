@@ -77,8 +77,8 @@ const MAX_MESSAGE_SIZE: i64 = 536870912;               // 512 MiB
 /// LSP worker stack.
 const BODY_CHUNK_SIZE: i64 = 65536;
 
-const HEADER_CONTENT_LENGTH:     string = "Content-Length:";
-const HEADER_CONTENT_LENGTH_LEN: i64    = 15;
+/// Matched case-sensitively: the protocol fixes the header's casing.
+const HEADER_CONTENT_LENGTH: string = "Content-Length:";
 
 
 // FrameCodec - LSP Content-Length frame reader/writer
@@ -120,17 +120,20 @@ type struct FrameCodec {
                         }
                         LineStatus::Read => {
                             saw_any_byte = true;
-                            if (FrameCodec::header_is_content_length(line_buf.as_str())) {
-                                match (FrameCodec::parse_content_length(line_buf.as_str())) {
-                                    Option::Some(n) => {
-                                        content_length = n;
-                                        got_length     = true;
-                                    }
-                                    Option::None => {
-                                        mem::drop(line_buf);
-                                        return Result::Err(FrameError::InvalidContentLength);
+                            match (line_buf.strip_prefix(&str::Str::from(HEADER_CONTENT_LENGTH))) {
+                                Option::Some(value) => {
+                                    match (FrameCodec::parse_decimal_skip_ws(value)) {
+                                        Option::Some(n) => {
+                                            content_length = n;
+                                            got_length     = true;
+                                        }
+                                        Option::None => {
+                                            mem::drop(line_buf);
+                                            return Result::Err(FrameError::InvalidContentLength);
+                                        }
                                     }
                                 }
+                                Option::None => { }
                             }
                             // Other headers (Content-Type, X-*) are ignored.
                         }
@@ -239,18 +242,6 @@ type struct FrameCodec {
             }
         }
         return Result::Ok(LineStatus::Read);                    // unreachable
-    }
-
-    /// Case-sensitive prefix check (LSP fixes the casing).
-    static header_is_content_length(line: str::Str) -> boolean {
-        if (line.length() < HEADER_CONTENT_LENGTH_LEN) { return false; }
-        const head: str::Str = line.sub_bytes(0, HEADER_CONTENT_LENGTH_LEN);
-        return head.equals(&str::Str::from(HEADER_CONTENT_LENGTH));
-    }
-
-    static parse_content_length(line: str::Str) -> Option<i64> {
-        return FrameCodec::parse_decimal_skip_ws(line.sub_bytes(
-            HEADER_CONTENT_LENGTH_LEN, line.length()));
     }
 
     /// Decimal digits with optional SP / HTAB around them.  `None` on

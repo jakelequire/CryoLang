@@ -220,6 +220,53 @@ public type struct Str {
         }
     }
 
+    /// The text after `prefix`, or `None` when this string does not begin
+    /// with it. An empty prefix always matches.
+    public strip_prefix(&this, prefix: &Str) -> Option<Str> {
+        if (!this.starts_with(prefix)) { return Option::None; }
+        return Option::Some(this.sub_bytes(prefix.length(), this.length));
+    }
+
+    /// The text before `suffix`, or `None` when this string does not end
+    /// with it. An empty suffix always matches.
+    public strip_suffix(&this, suffix: &Str) -> Option<Str> {
+        if (!this.ends_with(suffix)) { return Option::None; }
+        return Option::Some(this.sub_bytes(0, this.length - suffix.length()));
+    }
+
+    /// Length, in bytes, of the longest prefix this string shares with
+    /// `other`. **Not UTF-8-aware**: the shared bytes can end inside a
+    /// multi-byte scalar.
+    public common_prefix_length(&this, other: &Str) -> i64 {
+        mut i: i64 = 0;
+        while (i < this.length && i < other.length && this.bytes[i] == other.bytes[i]) {
+            i = i + 1;
+        }
+        return i;
+    }
+
+    /// A new `String` with every occurrence of `from` replaced by `to`,
+    /// scanning left to right without overlap. An empty `from` matches
+    /// nowhere, so the result is an unchanged copy.
+    public replace(&this, from: &Str, to: &Str) -> String {
+        mut out: String = String::with_capacity(this.length);
+        mut rest: Str = Str { bytes: this.bytes, length: this.length };
+        if (from.length() != 0) {
+            loop {
+                match (rest.split_once(from)) {
+                    Option::Some(halves) => {
+                        out.push(halves.first);
+                        out.push(*to);
+                        rest = halves.second;
+                    }
+                    Option::None => { break; }
+                }
+            }
+        }
+        out.push(rest);
+        return out;
+    }
+
     /// Equality with every ASCII letter's case ignored; every other byte
     /// must match exactly.
     public equals_case_insensitive(&this, other: &Str) -> boolean {
@@ -292,6 +339,22 @@ public type struct Str {
             sep_length: sep.length(),
             pos: 0,
             done: false,
+            skip_empty: false,
+        };
+    }
+
+    /// Iterator over the pieces between occurrences of `separator`, like
+    /// `split`, without the empty ones: a leading, trailing or doubled
+    /// separator yields nothing, and an empty string yields no piece.
+    public split_nonempty(&this, separator: &Str) -> implement Iterator<Str> {
+        return SplitIter {
+            bytes: this.bytes,
+            length: this.length,
+            sep_bytes: separator.bytes,
+            sep_length: separator.length(),
+            pos: 0,
+            done: false,
+            skip_empty: true,
         };
     }
 
@@ -347,8 +410,9 @@ public type struct Str {
 }
 
 /// Lazy iterator over the pieces of a `Str` separated by a byte
-/// sequence. Yields borrowed `Str` views; see `Str::split`. Borrows
-/// from the source `Str`, which must outlive the iterator.
+/// sequence. Yields borrowed `Str` views; see `Str::split` and
+/// `Str::split_nonempty`. Borrows from the source `Str`, which must
+/// outlive the iterator.
 ///
 /// Public: `String::split` names it in its return type.
 public type struct SplitIter {
@@ -358,38 +422,39 @@ public type struct SplitIter {
     private sep_length: i64;
     private pos:        i64;
     private done:       boolean;
+    private skip_empty: boolean;
 }
 
 implement trait Iterator<Str> for struct SplitIter {
     next(mut &this) -> Option<Str> {
-        if (this.done) { return Option::None; }
-        // An empty separator does not split: yield the whole string once.
-        if (this.sep_length == 0) {
-            this.done = true;
-            return Option::Some(Str { bytes: this.bytes, length: this.length });
-        }
-        if (this.sep_length <= this.length) {
-            const stop: i64 = this.length - this.sep_length;
-            mut i: i64 = this.pos;
-            while (i <= stop) {
-                if (libc::memcmp(
-                        (this.bytes + i) as void*,
-                        this.sep_bytes as void*, this.sep_length as u64) == 0) {
-                    const piece: Str = Str {
-                        bytes: this.bytes + this.pos, length: i - this.pos
-                    };
-                    this.pos = i + this.sep_length;
-                    return Option::Some(piece);
+        while (!this.done) {
+            // A piece runs to the next separator. With none left it is the
+            // remaining tail, and an empty separator does not split at all.
+            mut end: i64 = -1;
+            if (this.sep_length != 0 && this.sep_length <= this.length) {
+                const stop: i64 = this.length - this.sep_length;
+                mut i: i64 = this.pos;
+                while (end < 0 && i <= stop) {
+                    if (libc::memcmp(
+                            (this.bytes + i) as void*,
+                            this.sep_bytes as void*, this.sep_length as u64) == 0) {
+                        end = i;
+                    }
+                    i = i + 1;
                 }
-                i = i + 1;
+            }
+            const start: i64 = this.pos;
+            if (end < 0) {
+                end = this.length;
+                this.done = true;
+            } else {
+                this.pos = end + this.sep_length;
+            }
+            if (!this.skip_empty || end > start) {
+                return Option::Some(Str { bytes: this.bytes + start, length: end - start });
             }
         }
-        // No further separator: the final piece is the remaining tail.
-        const tail: Str = Str {
-            bytes: this.bytes + this.pos, length: this.length - this.pos
-        };
-        this.done = true;
-        return Option::Some(tail);
+        return Option::None;
     }
 }
 
