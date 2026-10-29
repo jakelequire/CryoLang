@@ -115,7 +115,6 @@ import compiler::types::resolver::{ ResolutionContext };
 import compiler::types::substitution::{ TypeSubstitution };
 import compiler::types::trait_checker::{ TraitChecker };
 import compiler::types::type_base::{ Type };
-import compiler::readonly_probe::{ ReadOnlyProbe };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{
     EnumType, EnumVariantInfo, FieldInfo, MethodInfo, StructType, TraitType, TypeAliasType
@@ -1738,11 +1737,7 @@ type struct SemaVisitor {
             ExprKind::ArrayAccess(a) => { this.member.resolve_array_access(this, expr, a) }
             ExprKind::Lambda(l) => { this.lambda.resolve_lambda(this, expr, l) }
             ExprKind::Await(a) => { this.resolve_await(expr, a) }
-            ExprKind::Call(c) => {
-                const call_type: TypeRef = this.calls.resolve_call(this, expr, c);
-                this.probe_call(c);
-                call_type
-            }
+            ExprKind::Call(c) => { this.calls.resolve_call(this, expr, c) }
         };
     }
 
@@ -2413,10 +2408,6 @@ type struct SemaVisitor {
                 rhs = this.resolve_expr(bin.right);
             }
             this.check_assignment_lvalue(bin.left);
-            if (ExpressionNode::identifier_of(bin.left) == null) {
-                const probe_class: i32 = this.probe_place_class(bin.left);
-                if (probe_class != 4) { this.probe_record("WRITE", probe_class, bin.left.span); }
-            }
             if (bin.op.kind == TokenType::Equal) {
                 this.lambda.refuse_stored_closure(rhs, lhs,
                     if (bin.right != null) { bin.right.span } else { e.span }, "an assigned place");
@@ -2742,139 +2733,6 @@ type struct SemaVisitor {
     
     }
 
-    // TEMPORARY - read-only borrow probe.
-    /// 0 writable or unknown, 1 `this` in a `&this` method, 2 through a
-    /// `&T`, 3 through a `const T*`, 4 a `const` binding.
-    probe_place_class(&this, e: ExpressionNode*) -> i32 {
-        if (e == null) { return 0; }
-        const id: IdentifierExpr* = ExpressionNode::identifier_of(e);
-        if (id != null) {
-            if (this.names_receiver(id)) {
-                if (this.state.this_is_by_ref && !this.state.this_is_mut) { return 1; }
-                return 0;
-            }
-            if (this.scopes.is_mutable(id.res.local_sym())) { return 0; }
-            return 4;
-        }
-        const ma: MemberAccessExpr* = ExpressionNode::member_access_of(e);
-        if (ma != null) { return this.probe_through(ma.object); }
-        const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(e);
-        if (aa != null) { return this.probe_through(aa.array); }
-        const u: UnaryExpr* = ExpressionNode::unary_of(e);
-        if (u != null && u.op.kind == TokenType::Star) { return this.probe_through(u.operand); }
-        return 0;
-    }
-
-    probe_through(&this, object: ExpressionNode*) -> i32 {
-        if (object == null) { return 0; }
-        const t: Type* = this.arena.lookup(object.resolved_type);
-        if (t == null) { return 0; }
-        if (t.kind == TypeKind::Reference) {
-            if (t.as_reference().is_mutable()) { return 0; }
-            return 2;
-        }
-        if (t.kind == TypeKind::Pointer) {
-            if (t.as_pointer().const_pointee) { return 3; }
-            return 0;
-        }
-        if (t.kind == TypeKind::String) { return 0; }
-        return this.probe_place_class(object);
-    }
-
-    probe_record(&this, action: string, place: i32, span: SourceSpan) -> void {
-        if (place == 0) { return; }
-        mut what: string = "BINDING";
-        if (place == 1) { what = "THIS"; }
-        if (place == 2) { what = "REF"; }
-        if (place == 3) { what = "CONSTPTR"; }
-        ReadOnlyProbe::record(fmt::format("%s|%s", action, what), span);
-    }
-
-    probe_writable_type(&this, ty: TypeRef) -> boolean {
-        const t: Type* = this.arena.lookup(ty);
-        if (t == null) { return false; }
-        if (t.kind == TypeKind::Reference) { return t.as_reference().is_mutable(); }
-        if (t.kind == TypeKind::Pointer) { return !t.as_pointer().const_pointee; }
-        return false;
-    }
-
-    probe_call(&this, call: CallExpr*) -> void {
-        const ma: MemberAccessExpr* = ExpressionNode::member_access_of(call.callee);
-        mut method: DeclarationNode* = null;
-        const entry: OverloadId = call.resolved_callee.decl_entry();
-        if (entry.is_valid()) { method = this.ctx.decl_index.entry_method(entry); }
-        if (method == null && call.template_method.is_valid()) {
-            method = this.ctx.decl_index.method_decl_of(call.template_method);
-        }
-        mut writable: [boolean] = [];
-        mut by_reference: [boolean] = [];
-        const m: MethodDecl* = DeclarationNode::method_of(method);
-        mut func: FunctionDecl* = null;
-        if (m != null && m.func != null) { func = DeclarationNode::fn_of(m.func); }
-        if (func == null && ma != null && ma.resolved_trait.is_valid() && ma.resolved_trait_slot >= 0) {
-            const trait_decl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(ma.resolved_trait);
-            if (trait_decl != null && ma.resolved_trait_slot < trait_decl.methods.length()) {
-                func = DeclarationNode::fn_of(trait_decl.methods[ma.resolved_trait_slot]);
-            }
-        }
-        if (func != null) {
-            for (mut i: i64 = 0; i < func.parameters.length(); i++) {
-                const p: VarDecl* = DeclarationNode::var_of(func.parameters[i]);
-                if (p == null) { return; }
-                if (p.is_receiver()) {
-                    mut receiver_writable: boolean = false;
-                    if (p.is_ref_receiver()) {
-                        receiver_writable = p.is_mutable;
-                    } else {
-                        receiver_writable = this.probe_writable_type(p.resolved_type);
-                    }
-                    if (ma != null) {
-                        if (receiver_writable) {
-                            this.probe_record("MUTCALL", this.probe_through(ma.object), call.callee.span);
-                        }
-                        continue;
-                    }
-                    writable.push(receiver_writable);
-                    by_reference.push(p.is_ref_receiver());
-                    continue;
-                }
-                writable.push(this.probe_writable_type(p.resolved_type));
-                const pt: Type* = this.arena.lookup(p.resolved_type);
-                by_reference.push(pt != null && pt.kind == TypeKind::Reference);
-            }
-        } else {
-            mut signature: TypeRef = TypeRef::invalid();
-            if (entry.is_valid()) { signature = this.ctx.decl_index.entry_signature(entry); }
-            if (!signature.is_valid() && call.callee != null) { signature = call.callee.resolved_type; }
-            const st: Type* = this.arena.lookup(signature);
-            if (st == null || st.kind != TypeKind::Function) { return; }
-            const ft: FunctionType* = st.as_function();
-            for (mut i: i64 = 0; i < ft.param_types.length(); i++) {
-                writable.push(this.probe_writable_type(ft.param_types[i]));
-                const pt: Type* = this.arena.lookup(ft.param_types[i]);
-                by_reference.push(pt != null && pt.kind == TypeKind::Reference);
-            }
-        }
-        for (mut i: i64 = 0; i < call.arguments.length() && i < writable.length(); i++) {
-            if (!writable[i]) { continue; }
-            const arg: ExpressionNode* = call.arguments[i];
-            if (arg == null) { continue; }
-            const u: UnaryExpr* = ExpressionNode::unary_of(arg);
-            if (u != null && u.op.kind == TokenType::Amp) {
-                this.probe_record("ADDR", this.probe_place_class(u.operand), arg.span);
-                continue;
-            }
-            const at: Type* = this.arena.lookup(arg.resolved_type);
-            if (at == null) { continue; }
-            if (at.kind == TypeKind::Reference) {
-                if (!at.as_reference().is_mutable()) { this.probe_record("REFVALUE", 2, arg.span); }
-                continue;
-            }
-            if (at.kind == TypeKind::Pointer) { continue; }
-            if (by_reference[i]) { this.probe_record("AUTOREF", this.probe_place_class(arg), arg.span); }
-        }
-    }
-
     resolve_unary(mut &this, e: ExpressionNode*, unary: UnaryExpr*) -> TypeRef {
         // Idempotent (see resolve_binary): a prior resolution may have rewritten
         // `-x` into `x.neg()`; return its type rather than re-rejecting.
@@ -2932,14 +2790,6 @@ type struct SemaVisitor {
             operand_type = this.resolve_expr(unary.operand);
         }
         if (!operand_type.is_valid()) { return TypeRef::invalid(); }
-        if (unary.op.kind == TokenType::Amp && this.probe_writable_type(this.state.expected_type)) {
-            this.probe_record("ADDR", this.probe_place_class(unary.operand), e.span);
-        }
-        if ((unary.op.kind == TokenType::PlusPlus || unary.op.kind == TokenType::MinusMinus)
-            && ExpressionNode::identifier_of(unary.operand) == null) {
-            const probe_class: i32 = this.probe_place_class(unary.operand);
-            if (probe_class != 4) { this.probe_record("WRITE", probe_class, e.span); }
-        }
         if (unary.op.kind == TokenType::Amp && !unary.is_synthetic && unary.operand != null
             && ExpressionNode::literal_of(unary.operand) != null) {
             this.ctx.emit_error_at(ErrorCode::E0223_INVALID_ADDRESS_OF,
@@ -5024,7 +4874,7 @@ type struct SemaVisitor {
         return true;
     }
 
-    stmt_always_returns(&this, stmt: Stmt*) -> boolean {
+    stmt_always_returns(mut &this, stmt: Stmt*) -> boolean {
         if (stmt == null) { return false; }
         match (stmt.kind) {
             StmtKind::Return(_) => { return true; }
