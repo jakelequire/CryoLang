@@ -2767,6 +2767,27 @@ type struct SemaVisitor {
                 "cannot take the address of a literal; `&` requires a place (variable, field, or index)", e.span);
             return TypeRef::invalid();
         }
+        // `s[i]` and `*s` on a `string` are a `char` read from one byte: there
+        // is no `char` in memory for a `char*` to point at, and reading
+        // through the byte's address as one takes the three bytes after it.
+        if (unary.op.kind == TokenType::Amp && !unary.is_synthetic && unary.operand != null) {
+            const indexed: ArrayAccessExpr* = ExpressionNode::array_access_of(unary.operand);
+            const dereferenced: UnaryExpr* = ExpressionNode::unary_of(unary.operand);
+            mut text: ExpressionNode* = null;
+            if (indexed != null) { text = indexed.array; }
+            if (dereferenced != null && dereferenced.op.kind == TokenType::Star) { text = dereferenced.operand; }
+            const text_type: Type* = if (text != null) { this.arena.lookup(text.resolved_type) } else { null };
+            if (text_type != null && text_type.kind == TypeKind::String) {
+                mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0223_INVALID_ADDRESS_OF,
+                    "cannot take the address of a byte of a `string`");
+                diag = diag.at_with_label(e.span, "a `string`'s byte is read as a `char`, which has no address");
+                diag = diag.help(if (indexed != null) {
+                    "write `s + i` for a pointer to the byte at index `i`"
+                } else { "the `string` itself is a pointer to its first byte" });
+                this.ctx.emit_diagnostic(diag);
+                return TypeRef::invalid();
+            }
+        }
         if (unary.op.kind == TokenType::Star) {
             const id: IdentifierExpr* = ExpressionNode::identifier_of(unary.operand);
             if (id != null && this.names_receiver(id)) { return operand_type; }

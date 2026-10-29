@@ -876,6 +876,14 @@ yet is recorded with the change that builds it, not here.
      `DefaultHasher`; the arena's own FNV-1a mix is gone.  The hash only
      selects a bucket - entry comparison decides identity.  (Jake)
 
+651. **A byte of a `string` has no address.**  `s[i]` and `*s` on a
+     `string` are a `char` read from one byte, widened; there is no `char`
+     in memory there, and reading through the byte's address as a `char*`
+     took the three bytes after it.  So `&s[i]` and `&*s` are refused,
+     E0223 as the address of a literal is, and the help names `s + i`, the
+     pointer to the byte.  Reading `s[i]` as a value, and a method called
+     on it, are unchanged.  (Jake; the code and wording delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

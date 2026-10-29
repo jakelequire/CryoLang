@@ -3079,6 +3079,8 @@ const ptr: int* = &x;       // ptr holds the address of x
 const val: int  = *ptr;     // val is 42
 ```
 
+A `string` is a pointer to bytes, and `s[i]` (or `*s`) reads the byte at `i` as a `char`. A `char` is wider than a byte, so there is no `char` in memory there to point at: `&s[i]` and `&*s` are refused (E0223). `s + i` is the pointer to the byte at `i`.
+
 Pointer indexing is supported: `ptr[0]` is `*ptr`, and `ptr[n]` accesses the n-th element from the pointer's base.  This holds whatever the pointer points at: `p[i]` with `p: [T]*` is the `i`-th array from `p`, not an element of the array `p` points at; write `(*p)[i]` for that.
 
 ### 14.2 Heap Allocation
