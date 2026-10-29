@@ -5893,7 +5893,7 @@ type struct CallResolver {
             if (!t.is_valid()) { return TypeRef::invalid(); }
             arg_types.push(t);
         }
-        if (!directing.is_valid() && this.own_static_member_takes(owner_ty, scope, call, &arg_types)) {
+        if (!directing.is_valid() && this.static_member_takes(owner_ty, scope, call, &arg_types, false)) {
             return TypeRef::invalid();
         }
         for (mut r: i64 = 0; r < refs.length(); r++) {
@@ -5934,12 +5934,13 @@ type struct CallResolver {
         return scope.resolved_trait;
     }
 
-    /// Whether a method `owner` declares itself - not one a trait's
-    /// implementation delivers - takes `arg_types` as the path `scope`
-    /// passes them.  An instantiation not minted yet is asked through its
-    /// template's methods, read at the instantiation's arguments.
-    own_static_member_takes(mut &this, owner: TypeRef, scope: ScopeResolutionExpr*, call: CallExpr*,
-                            arg_types: &[TypeRef]) -> boolean {
+    /// Whether a method of `owner`'s takes `arg_types` as the path `scope`
+    /// passes them: one it declares itself, and with `delivered` one a
+    /// trait's implementation delivers too.  An instantiation not minted
+    /// yet is asked through its template's methods, read at the
+    /// instantiation's arguments.
+    static_member_takes(mut &this, owner: TypeRef, scope: ScopeResolutionExpr*, call: CallExpr*,
+                        arg_types: &[TypeRef], delivered: boolean) -> boolean {
         mut family: TypeRef = owner;
         const no_params: [TypeRef] = [];
         mut owner_params: &[TypeRef] = &no_params;
@@ -5954,7 +5955,7 @@ type struct CallResolver {
         }
         const entries: [OverloadId] = this.member_entries(FamilyOwner::Type(family), scope.member_name);
         for (mut i: i64 = 0; i < entries.length(); i++) {
-            if (this.ctx.decl_index.entry_trait(entries[i]).is_valid()) { continue; }
+            if (!delivered && this.ctx.decl_index.entry_trait(entries[i]).is_valid()) { continue; }
             const method_template: TemplateEntry* = this.static_entry_template(entries[i]);
             if (method_template != null) {
                 if (this.template_fits(method_template, call, scope, arg_types)) { return true; }
@@ -7834,6 +7835,16 @@ type struct CallResolver {
         const owner_sym: SymbolStr = lookup_sym;
         if (this.owner_declares_member(owner_ref, scope.member_name)) {
             *claimed = true;
+            // A head for every type is one more candidate for the name: the
+            // arguments select it when they select none of the owner's own.
+            mut arg_types: [TypeRef] = [];
+            for (mut i: i64 = 0; i < call.arguments.length(); i++) {
+                if (call.arguments[i] != null) { arg_types.push(call.arguments[i].resolved_type); }
+            }
+            if (!this.static_member_takes(owner_ref, scope, call, &arg_types, true)) {
+                const blanket_ret: TypeRef = this.record_blanket_static_call(call, scope, owner_ty);
+                if (blanket_ret.is_valid()) { return blanket_ret; }
+            }
             mut resolved: TypeRef = this.type_static_call(call_e, call, scope, owner_ref, owner_sym);
             if (!call.resolved_callee.decl_entry().is_valid() && this.types.contains_generic_param(resolved)) {
                 const inferred: TypeRef = this.resolve_static_method_return_via_template(scope, call_e, call);
@@ -7869,9 +7880,10 @@ type struct CallResolver {
         return blanket_ret;
     }
 
-    /// A static call through a type's path to a method the type has only
+    /// A static call through a type's path to a method the type has
     /// through a head for every type (`i32::from(5)` with `implement<T>
-    /// trait From<T> for T`): the head whose trait declares the member and
+    /// trait From<T> for T`), with no method of its own of the name or none
+    /// the arguments select: the head whose trait declares the member and
     /// whose method, with the head's parameter bound to the owner, takes the
     /// arguments' types.  The call records the trait's method, the owner and
     /// the types the method takes, as a path a bound directs does, and

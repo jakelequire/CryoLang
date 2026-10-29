@@ -939,8 +939,10 @@ yet is recorded with the change that builds it, not here.
      through the trait needs it, in the type's module (a primitive's in the
      trait's), and only when the call passes what the copy's method takes,
      so no copy is emitted unused.  A call through a type's path reaches
-     it when the type declares no member of that name; a type with a
-     member of its own reaches it only through a bound (a known gap).
+     it when the arguments select none of the type's own members of that
+     name, its inherent ones and those its implementations deliver: the
+     head's method is one more candidate, and an inherent method that
+     takes the arguments outranks it.
      Coherence: such a head overlaps every head of its trait, whatever the
      target, that unifies with it once its parameter is bound to the
      other's target - `From<X> for X` and a second head for every type are
