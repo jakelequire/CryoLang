@@ -1,0 +1,63 @@
+// W0001: an unused local in an `async` body is reported where it is written,
+// under the name it is written with, as one in an ordinary body is - before
+// and after an `await`, in a branch and a loop, in an `async` method, and
+// when it owns a value that is carried across a later `await`.  A local read
+// after an `await` and a `_`-prefixed one are not reported.  An annotated
+// file is checked both ways: a W0001 on any other line fails the suite.
+![config(testing)]
+![config(negative, W0001)]
+namespace CryoTests::Negative::W0001AsyncBody;
+
+import std::future;
+import std::future::ready::{ Ready };
+import std::collections::string::{ String };
+
+async function no_await(v: i64) -> i64 {
+    const unused_no_await: i64 = 1;   //~ WARN[W0001] unused variable `unused_no_await`
+    return v;
+}
+
+async function around_await(v: i64) -> i64 {
+    const unused_before: i64 = 2;   //~ WARN[W0001] unused variable `unused_before`
+    const read_after: i64 = v + 1;
+    const _ignored: u64 = await Ready::<u64>::new(1);
+    const unused_after: i64 = 3;   //~ WARN[W0001] unused variable `unused_after`
+    return read_after;
+}
+
+async function owning_local_carried(v: i64) -> i64 {
+    mut unused_owned: String = String::from("held");   //~ WARN[W0001] unused variable `unused_owned`
+    const _ignored: u64 = await Ready::<u64>::new(1);
+    return v;
+}
+
+async function branch_and_loop(v: i64) -> i64 {
+    if (v > 0) {
+        const unused_in_branch: i64 = 4;   //~ WARN[W0001] unused variable `unused_in_branch`
+    }
+    mut i: i64 = 0;
+    while (i < 2) {
+        const unused_in_loop: u64 = await Ready::<u64>::new(1);   //~ WARN[W0001] unused variable `unused_in_loop`
+        i = i + 1;
+    }
+    return i;
+}
+
+type struct Counter {
+    count: i64;
+
+    async bump(mut &this) -> i64 {
+        const unused_in_method: i64 = 5;   //~ WARN[W0001] unused variable `unused_in_method`
+        this.count = this.count + 1;
+        return this.count;
+    }
+}
+
+function main() -> int {
+    mut c: Counter = Counter { count: 0 };
+    const total: i64 = future::block_on(no_await(1)) + future::block_on(around_await(1))
+        + future::block_on(owning_local_carried(1)) + future::block_on(branch_and_loop(1))
+        + future::block_on(c.bump());
+    if (total == 7) { return 0; }
+    return 1;
+}

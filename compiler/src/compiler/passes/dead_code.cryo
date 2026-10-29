@@ -249,32 +249,34 @@ type struct DeadCodeChecker {
     }
 
     /// Whether `func`'s body was name-resolved (so its locals are in `used`).
-    /// False for mono specialization clones, for trait-default methods
-    /// synthesized into an impl block (`is_synth_default`), and for a body the
-    /// compiler BUILT after resolution ran (`is_synthesized_body`, the `poll` of
-    /// an `async` lowering) - none of them is a body the resolver walked.
-    /// See the `body_resolved` field doc.
+    /// False for mono specialization clones and for trait-default methods
+    /// synthesized into an impl block (`is_synth_default`) - neither is a body
+    /// the resolver walked.  See the `body_resolved` field doc.
     is_body_resolved(&this, func_decl: DeclarationNode*) -> boolean {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
-        return !func.is_specialization && !func.is_synth_default
-            && !func.is_synthesized_body;
+        return !func.is_specialization && !func.is_synth_default;
     }
 
     /// `body_resolved` gates W0001 (see the field doc): pass false for bodies
     /// whose local references are absent from `used` (trait defaults, mono
-    /// clones); W0009 runs regardless.
+    /// clones); W0009 runs regardless.  An `async` function is judged by the
+    /// body it was written with: lowering moves its statements, renamed and
+    /// rewritten, into its future's `poll`, a body the compiler built, which
+    /// is skipped with the rest of those.
     check_fn(mut &this, func_decl: DeclarationNode*, body_resolved: boolean) -> void {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
-        if (func == null || func.body == null) { return; }
+        if (func == null || func.is_synthesized_body) { return; }
+        const body: Stmt* = if (func.written_body != null) { func.written_body } else { func.body };
+        if (body == null) { return; }
         this.body_resolved = body_resolved;
-        this.check_block(func.body);
+        this.check_block(body);
         mut lambdas: NonCapturingLambdaBodies = NonCapturingLambdaBodies { bodies: [] };
-        lambdas.walk_stmt(func.body);
+        lambdas.walk_stmt(body);
         for (mut i: i64 = 0; i < lambdas.bodies.length(); i++) {
             this.check_stmt(lambdas.bodies[i]);
         }
         mut arms: UnreachableArms = UnreachableArms { ctx: this.ctx };
-        arms.walk_stmt(func.body);
+        arms.walk_stmt(body);
         this.body_resolved = true;
     }
 
