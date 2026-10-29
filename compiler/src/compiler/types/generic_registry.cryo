@@ -922,9 +922,12 @@ type struct GenericRegistry {
     /// compared recursively.  A subject argument that is still
     /// abstract (a type parameter of the enclosing template) cannot refute a
     /// concrete one: the question is deferred to the concrete instantiation,
-    /// as a where-bound over an abstract argument is.  A written argument the
-    /// name layer did not stamp is recorded through `require` and refutes
-    /// nothing, so a head is never lost to a missing stamp.
+    /// as a where-bound over an abstract argument is.  A name that already
+    /// holds its type (`NamedAnnotation::pre_resolved`, which the compiler
+    /// attaches to annotations it writes itself) is that type, as the type
+    /// layer reads it, and is compared as one (`type_unifies`).  A written
+    /// argument the name layer did not stamp is recorded through `require`
+    /// and refutes nothing, so a head is never lost to a missing stamp.
     annotation_unifies(&this, ann: TypeAnnotation*, arg: TypeRef, intern: InternTable*) -> boolean {
         if (ann == null) { return true; }
         const at: Type* = this.arena.lookup(arg);
@@ -933,6 +936,7 @@ type struct GenericRegistry {
         }
         match (*ann) {
             TypeAnnotation::Named(n) => {
+                if (n.pre_resolved.is_valid()) { return this.type_unifies(n.pre_resolved, arg, intern); }
                 match (n.res.require("generic_registry:impl head argument")) {
                     Res::GenericParam(_) => { return true; }
                     Res::Def(d)          => { return d.equals(this.decls.def_of(arg, this.arena)); }
@@ -951,9 +955,27 @@ type struct GenericRegistry {
                 if (!this.annotation_unifies(g.base, arg, intern)) { return false; }
                 const n: i64 = this.arena.inst_type_arg_count(arg);
                 if (n == 0) { return true; }
-                if (g.args.length() != n) { return false; }
+                if (g.args.length() > n) { return false; }
+                // A position written without an argument holds its
+                // parameter's default (`Array<u8>` is `Array<u8, GlobalAlloc>`,
+                // the type `[u8]` is), so the default is what it unifies.
+                mut params: [DeclarationNode*] = [];
+                if (g.args.length() < n) {
+                    const template: TemplateEntry* = this.template_of(this.decls.def_of(arg, this.arena));
+                    if (template == null) { return false; }
+                    params = template.get_generic_params();
+                    if (params.length() != n) { return false; }
+                }
                 for (mut j: i64 = 0; j < n; j++) {
-                    if (!this.annotation_unifies(g.args[j], this.arena.inst_type_arg_at(arg, j), intern)) {
+                    mut written: TypeAnnotation* = null;
+                    if (j < g.args.length()) {
+                        written = g.args[j];
+                    } else {
+                        const param: GenericParamDecl* = DeclarationNode::generic_param_of(params[j]);
+                        if (param == null || !param.has_default_annotation()) { return false; }
+                        written = param.default_annotation;
+                    }
+                    if (!this.annotation_unifies(written, this.arena.inst_type_arg_at(arg, j), intern)) {
                         return false;
                     }
                 }
@@ -969,6 +991,39 @@ type struct GenericRegistry {
             }
             _ => { return true; }
         }
+    }
+
+    /// `annotation_unifies` for a written argument that is already a type:
+    /// a type parameter on either side cannot refute the other; a type of
+    /// a declaration must be one of the same declaration, its arguments
+    /// unifying position by position; a primitive must be that primitive,
+    /// and a pointer or reference one of the same form over a unifying type.
+    type_unifies(&this, written: TypeRef, arg: TypeRef, intern: InternTable*) -> boolean {
+        if (written.equals(arg)) { return true; }
+        const at: Type* = this.arena.lookup(arg);
+        const wt: Type* = this.arena.lookup(written);
+        if (at == null || wt == null) { return false; }
+        if (at.kind == TypeKind::GenericParam || wt.kind == TypeKind::GenericParam) { return true; }
+        const def: DefId = this.decls.def_of(written, this.arena);
+        if (def.is_valid()) {
+            if (!def.equals(this.decls.def_of(arg, this.arena))) { return false; }
+            const n: i64 = this.arena.inst_type_arg_count(written);
+            if (n != this.arena.inst_type_arg_count(arg)) { return false; }
+            for (mut j: i64 = 0; j < n; j++) {
+                if (!this.type_unifies(this.arena.inst_type_arg_at(written, j),
+                        this.arena.inst_type_arg_at(arg, j), intern)) { return false; }
+            }
+            return true;
+        }
+        const key: SymbolStr = this.arena.primitive_key_of(written, intern);
+        if (key.is_valid()) { return key.equals(this.arena.primitive_key_of(arg, intern)); }
+        if (wt.kind == TypeKind::Pointer && at.kind == TypeKind::Pointer) {
+            return this.type_unifies(wt.as_pointer().pointee, at.as_pointer().pointee, intern);
+        }
+        if (wt.kind == TypeKind::Reference && at.kind == TypeKind::Reference) {
+            return this.type_unifies(wt.as_reference().referent, at.as_reference().referent, intern);
+        }
+        return false;
     }
 
 

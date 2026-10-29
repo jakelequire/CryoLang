@@ -1,0 +1,54 @@
+// E0306: a `where` bound on a type parameter is checked at the trait's
+// arguments.  Every type implements `From` of itself, so `PbPlain` has a
+// `From`; it has none at `PbUnrelated`, and a call binding `F = PbPlain`,
+// `E = PbUnrelated` is refused where it is written, whether the body
+// converts with `F::from` or with `?`.  An associated type written
+// positionally is an argument too: `PbBytes` produces `[u8]`, not `[i32]`.
+![config(testing)]
+![config(negative, E0306)]
+namespace CryoTests::Negative::E0306ParameterBoundTraitArguments;
+
+import std::core::convert::{ From };
+
+type struct PbUnrelated { value: i64; }
+type struct PbRelated { value: i64; }
+type struct PbPlain { value: i64; }
+
+implement trait From<PbRelated> for struct PbPlain {
+    static from(source: PbRelated) -> PbPlain { return PbPlain { value: source.value }; }
+}
+
+function pb_convert<E, F>(source: E) -> F where F: From<E> {
+    return F::from(source);
+}
+
+function pb_lift<E, F>(source: Result<i32, E>) -> Result<i32, F> where F: From<E> {
+    const value: i32 = source?;
+    return Result::Ok(value);
+}
+
+type trait PbProduce {
+    type Output;
+    count(&this) -> i32;
+}
+
+type struct PbBytes { value: i32; }
+
+implement trait PbProduce for struct PbBytes {
+    type Output = Array<u8>;
+    count(&this) -> i32 { return this.value; }
+}
+
+function pb_count<P, O>(source: P) -> i32 where P: PbProduce<O> {
+    return source.count();
+}
+
+function main() -> int {
+    const bytes: i32 = pb_count::<PbBytes, [u8]>(PbBytes { value: 5 });
+    const wide: i32 = pb_count::<PbBytes, [i32]>(PbBytes { value: 6 });   //~ ERROR[E0306] the trait bound `CryoTests::Negative::E0306ParameterBoundTraitArguments::PbBytes: PbProduce<[i32]>` is not satisfied
+    const fine: PbPlain = pb_convert::<PbRelated, PbPlain>(PbRelated { value: 1 });
+    const same: PbPlain = pb_convert::<PbPlain, PbPlain>(PbPlain { value: 2 });
+    const lifted: Result<i32, PbPlain> = pb_lift::<PbRelated, PbPlain>(Result::Ok(3));
+    const refused: Result<i32, PbPlain> = pb_lift::<PbUnrelated, PbPlain>(Result::Ok(4));   //~ ERROR[E0306] the trait bound `CryoTests::Negative::E0306ParameterBoundTraitArguments::PbPlain: From<CryoTests::Negative::E0306ParameterBoundTraitArguments::PbUnrelated>` is not satisfied
+    return 0;
+}

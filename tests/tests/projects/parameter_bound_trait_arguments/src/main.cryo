@@ -1,0 +1,83 @@
+/// A `where` bound is checked at the trait's arguments.  An associated
+/// type written as `Array<u8>` is the type `[u8]`, whose allocator the
+/// annotation leaves to its default, so a bound naming `[u8]` holds,
+/// whether its subject is a parameter or a named type, inside `Result` or
+/// alone.  A bound `F: From<E>` holds through every type's `From` of
+/// itself and through a conversion the program writes.
+namespace ParameterBoundTraitArguments::Main;
+
+import std::core::convert::{ From };
+import std::ffi::libc::{ printf };
+
+type trait Produce {
+    type Output;
+    produce(&this) -> This::Output;
+}
+
+type struct Bytes { length: i64; }
+type struct Checked { length: i64; }
+
+implement trait Produce for struct Bytes {
+    type Output = Array<u8>;
+    produce(&this) -> Array<u8> {
+        mut out: [u8] = [];
+        for (mut i: i64 = 0; i < this.length; i++) { out.push(7); }
+        return out;
+    }
+}
+
+implement trait Produce for struct Checked {
+    type Output = Result<Array<u8>, i32>;
+    produce(&this) -> Result<Array<u8>, i32> {
+        if (this.length < 0) { return Result::Err(-1); }
+        mut out: [u8] = [];
+        for (mut i: i64 = 0; i < this.length; i++) { out.push(9); }
+        return Result::Ok(out);
+    }
+}
+
+function produce_through<P, O>(source: P) -> O where P: Produce<O> {
+    return source.produce();
+}
+
+function bytes_named<O>(source: Bytes) -> i64 where Bytes: Produce<O> {
+    return source.produce().length();
+}
+
+type struct Small { value: i64; }
+type struct Large { value: i64; }
+
+implement trait From<Small> for struct Large {
+    static from(source: Small) -> Large { return Large { value: source.value * 100 }; }
+}
+
+function convert<E, F>(source: E) -> F where F: From<E> {
+    return F::from(source);
+}
+
+function check(passed: i32, condition: boolean, what: string) -> i32 {
+    if (!condition) {
+        printf("FAILED: %s\n", what);
+        return passed;
+    }
+    return passed + 1;
+}
+
+function main() -> i32 {
+    mut passed: i32 = 0;
+    const through: [u8] = produce_through::<Bytes, [u8]>(Bytes { length: 3 });
+    passed = check(passed, through.length() == 3 && through[0] == 7,
+        "a parameter's bound at an associated type with a defaulted argument");
+    passed = check(passed, bytes_named::<[u8]>(Bytes { length: 2 }) == 2,
+        "a named type's bound at the same associated type");
+    const checked: Result<[u8], i32> = produce_through::<Checked, Result<[u8], i32>>(Checked { length: 4 });
+    passed = check(passed, match (checked) { Result::Ok(v) => { v.length() == 4 } Result::Err(_) => { false } },
+        "the defaulted argument nested inside another type");
+    passed = check(passed, convert::<Small, Small>(Small { value: 5 }).value == 5,
+        "a bound at a type's conversion from itself");
+    passed = check(passed, convert::<Small, Large>(Small { value: 6 }).value == 600,
+        "a bound at a conversion the program writes");
+    printf("parameter bounds: %d of 5 checks passed\n", passed);
+    if (passed != 5) { return 1; }
+    return 0;
+}

@@ -388,25 +388,36 @@ type struct TypeResolver {
         return DefId::invalid();
     }
 
-    /// The trait of `bound`, written on a type that is not a parameter
-    /// (`where HighError: From<E>`, `where Array<T>: Display`), that the
-    /// type does not implement once the declaring template's parameters
-    /// `param_syms` are bound to `bindings` (`TraitChecker::unmet_written_trait`).
+    /// The trait of `bound` that its subject does not implement once the
+    /// declaring template's parameters `param_syms` are bound to `bindings`:
+    /// a parameter's binding (`TraitChecker::unmet_parameter_trait`), or a
+    /// type that is not a parameter (`where HighError: From<E>`, `where
+    /// Array<T>: Display`; `TraitChecker::unmet_written_trait`).
     /// `*out_subject` is the subject so resolved and `*out_trait` the trait
     /// as it is required, with its arguments (`From<OtherError>`).  Null
-    /// when every trait has one, and when the subject or an argument still
-    /// names a parameter, which the copy that binds it decides.
+    /// when every trait has one, for a projection subject, and when the
+    /// subject or an argument still names a parameter, which the copy that
+    /// binds it decides.
     unmet_written_bound(&this, bound: TraitBound*, param_syms: &[SymbolID], bindings: &[TypeRef],
                         out_subject: TypeRef*, out_trait: SymbolStr*) -> TraitRef* {
         mut subst: TypeSubstitution = TypeSubstitution::empty();
+        mut subject: TypeRef = TypeRef::invalid();
         for (mut i: i64 = 0; i < param_syms.length() && i < bindings.length(); i++) {
             if (bindings[i].is_valid()) {
                 subst.add(this.arena.create_generic_param(param_syms[i], SymbolStr::empty(), i as u64), bindings[i]);
+                if (param_syms[i].equals(bound.subject_param())) { subject = bindings[i]; }
             }
         }
         const checker: TraitChecker = TraitChecker::new(
             this.arena, this.generic_registry, this.intern_table, this.diagnostics);
-        const tr: TraitRef* = checker.unmet_written_trait(bound, &subst, 0, out_subject);
+        mut tr: TraitRef* = null;
+        if (bound.subject_param().is_valid()) {
+            if (!subject.is_valid() || this.arena.contains_generic_param(subject)) { return null; }
+            tr = checker.unmet_parameter_trait(bound, subject, &subst, 0);
+            if (tr != null) { *out_subject = subject; }
+        } else {
+            tr = checker.unmet_written_trait(bound, &subst, 0, out_subject);
+        }
         if (tr == null) { return null; }
         *out_trait = this.intern_table.intern(checker.trait_as_required(tr, &subst));
         return tr;
@@ -1365,16 +1376,30 @@ type struct TypeResolver {
     }
 
     /// Resolve, in the declaration's context `res_ctx`, each bound of
-    /// `bounds` written on a type that is neither a parameter nor a
-    /// projection: its subject and its traits' arguments, in the
+    /// `bounds` written on a type that is not a projection: its traits'
+    /// arguments, and a subject that is not a parameter, in the
     /// declaration's own parameters.  A bound already resolved keeps its
     /// answer - a copy carries its template's - and one that does not
     /// resolve yet is asked again on the next pass over the declaration.
     resolve_written_bounds(&this, bounds: &[TraitBound], res_ctx: ResolutionContext*) -> void {
         for (mut b: i64 = 0; b < bounds.length(); b++) {
             const bound: TraitBound* = &bounds[b];
-            if (bound.subject_type.is_valid() || bound.has_projection_subject()
-                    || bound.subject_param().is_valid()) { continue; }
+            if (bound.has_projection_subject()) { continue; }
+            if (bound.subject_param().is_valid()) {
+                for (mut r: i64 = 0; r < bound.trait_refs.length(); r++) {
+                    const tr: TraitRef* = &bound.trait_refs[r];
+                    if (tr.argument_types.length() == tr.type_args.length()) { continue; }
+                    mut args: [TypeRef] = [];
+                    for (mut a: i64 = 0; a < tr.type_args.length(); a++) {
+                        const arg: TypeRef = this.resolve(tr.type_args[a], res_ctx);
+                        if (!arg.is_valid()) { break; }
+                        args.push(arg);
+                    }
+                    if (args.length() == tr.type_args.length()) { tr.argument_types = args; }
+                }
+                continue;
+            }
+            if (bound.subject_type.is_valid()) { continue; }
             const subject: TypeRef = this.resolve(bound.subject, res_ctx);
             if (!subject.is_valid()) { continue; }
             for (mut r: i64 = 0; r < bound.trait_refs.length(); r++) {

@@ -290,6 +290,38 @@ type struct TraitChecker {
         return null;
     }
 
+    /// The trait of `bound`, written on a type parameter, that `subject`,
+    /// the parameter's binding, does not implement.  A trait written with
+    /// arguments needs an implementation that binds it at those arguments,
+    /// substituted by `subst`: `From<T> for T` gives every type `From`, so
+    /// only the arguments tell `F: From<E>` from any other `From`.  A
+    /// trait written without arguments, and any trait on an object, whose
+    /// implementations the compiler makes, is `type_implements_trait`'s.
+    /// Null when every trait holds, and when an argument still names a
+    /// parameter, which the copy that binds it decides.
+    unmet_parameter_trait(&this, bound: TraitBound*, subject: TypeRef, subst: TypeSubstitution*,
+                          depth: i32) -> TraitRef* {
+        const subject_t: Type* = this.arena.lookup(subject);
+        const object: boolean = subject_t != null && subject_t.kind == TypeKind::Object;
+        for (mut ri: i64 = 0; ri < bound.trait_refs.length(); ri++) {
+            const tr: TraitRef* = &bound.trait_refs[ri];
+            // A bound refused where it is written is reported there.
+            if (tr.path.length() == 0 || tr.refused) { continue; }
+            if (object || tr.argument_types.length() == 0) {
+                if (!this.type_implements_trait(subject, tr.definition(), depth)) { return tr; }
+                continue;
+            }
+            mut args: [TypeRef] = [];
+            for (mut ai: i64 = 0; ai < tr.argument_types.length(); ai++) {
+                const arg: TypeRef = subst.apply(tr.argument_types[ai], this.arena);
+                if (!arg.is_valid() || this.arena.contains_generic_param(arg)) { return null; }
+                args.push(arg);
+            }
+            if (this.implementation_at_depth(tr.definition(), &args, subject, depth) == null) { return tr; }
+        }
+        return null;
+    }
+
     /// Whether `trait_def` is the object's own trait or one of its
     /// supertraits: the traits whose implementation the compiler makes for
     /// it.

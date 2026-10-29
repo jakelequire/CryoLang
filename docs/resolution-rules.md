@@ -967,6 +967,22 @@ yet is recorded with the change that builds it, not here.
      is a question for Jake.  (Jake: the traits, `ControlFlow`'s name and
      visibility, a single converting implementation; the shapes delegated)
 
+658. **A call's bound on a parameter is checked at the trait's
+     arguments.**  `where F: From<E>` at a call binding `F` and `E` holds
+     only where an implementation of `From` for `F` binds it at `E`
+     (`TraitChecker::unmet_parameter_trait`), as a bound on a named type
+     already was; asking only whether `F` implements `From` let every
+     call through after `From<T> for T`, and one with no conversion
+     stopped at the unbound `F::from` (E0900).  A trait written without
+     arguments, and any trait on an object, is still asked of the type
+     alone.  Head arguments are compared as the types they denote: one a
+     head leaves to its parameter's default is that default (`Array<u8>`
+     unifies with `[u8]`, `Array<u8, GlobalAlloc>`), and a name the
+     compiler wrote with its type already attached is compared as that
+     type.  An implementation's where-clause on a parameter is still
+     checked without the trait's arguments; whether it should be is a
+     question for Jake.  (the regression fix delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

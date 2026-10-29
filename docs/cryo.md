@@ -2091,6 +2091,8 @@ type enum Slot<T> where T: Tagged {
 
 Every trait a bound or a supertrait names must be one in scope where it is written; a name that finds none is refused there (E0242, "cannot find trait `X` in this scope"), whether or not anything calls through the bound.
 
+A call to a function or method with bounds is checked at the type arguments it binds, and a bound on a trait written with arguments holds only where an implementation binds the trait at those arguments: under `where F: From<E>`, `convert::<Unrelated, Plain>(x)` is refused where it is written (E0306, "the trait bound `Plain: From<Unrelated>` is not satisfied") although `Plain` implements `From` of itself. An associated type written positionally (`where P: Produce<O>`) is such an argument. An implementation's arguments are compared as the types they denote: `type Output = Array<u8>;` leaves `Array`'s allocator to its default, and is the type `[u8]`.
+
 ```cryo
 type trait Sub : Missing { go(&this) -> i32; }                // error[E0242]: cannot find trait `Missing` in this scope
 function f<T>(x: &T) -> i32 where T: Nowhere { return 1; }    // error[E0242]: cannot find trait `Nowhere` in this scope
