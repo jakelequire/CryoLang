@@ -6167,7 +6167,10 @@ type struct CallResolver {
         if (recv == null || !recv.resolved_type.is_valid()) { return true; }
         const owner_ty: TypeRef = this.trait_qualified_owner(recv.resolved_type);
         const owner_sym: SymbolStr = this.ctx.decl_index.lookup_type_name(owner_ty);
-        if (!owner_sym.is_valid()) { return true; }
+        if (!owner_sym.is_valid()) {
+            this.record_trait_call_on_instantiation(call, scope, owner_ty, trait_sym, member_sym);
+            return true;
+        }
         const entries: [OverloadId] = this.trait_delivered_entries(FamilyOwner::Type(owner_ty), trait_sym, member_sym);
         if (entries.length() == 0) {
             this.report_impl_qualified_miss(scope, owner_sym, owner_ty, trait_sym, member_sym);
@@ -6175,6 +6178,37 @@ type struct CallResolver {
         }
         this.pin_trait_delivered_call(call, scope, &entries);
         return true;
+    }
+
+    /// A call through a trait's path whose receiver is an instantiation
+    /// nothing has minted yet (`Show::show(h)` with `h: Holder<i64>`): the
+    /// implementation is its template's, whose methods are delivered under the
+    /// template, and the instance exists only once the instantiation is
+    /// minted.  So the call records the trait's method and the receiver's
+    /// type, as a path a bound directs does, and monomorphization binds it to
+    /// the receiver's implementation by the method's position.  Typed by the
+    /// template's method with the receiver's arguments put in.  A template
+    /// that does not implement the trait is refused as any owner is.
+    record_trait_call_on_instantiation(mut &this, call: CallExpr*, scope: ScopeResolutionExpr*,
+                                       owner_ty: TypeRef, trait_sym: DefId, member_sym: SymbolStr) -> void {
+        const base: TypeRef = this.arena.inst_generic_base(owner_ty);
+        if (!base.is_valid()) { return; }
+        const template: TemplateEntry* = this.ctx.generic_registry.template_of_type(base);
+        if (template == null) { return; }
+        const entries: [OverloadId] = this.trait_delivered_entries(FamilyOwner::Type(base), trait_sym, member_sym);
+        if (entries.length() == 0) {
+            this.report_impl_qualified_miss(scope, this.ctx.decl_index.lookup_type_name(base), owner_ty, trait_sym, member_sym);
+            return;
+        }
+        if (entries.length() != 1) { return; }
+        const item: DefId = this.trait_item_def(trait_sym, scope);
+        if (!item.is_valid()) { return; }
+        call.template_method = item;
+        scope.set_resolved_trait(trait_sym);
+        scope.spec_owner = owner_ty;
+        const owner_args: [TypeRef] = this.types.view_type_args_copy(owner_ty);
+        call.callee.set_resolved_type(this.subst_params(&template.param_types, &owner_args,
+            this.ctx.decl_index.entry_owner_return(entries[0])));
     }
 
     /// The registered name of the type a trait-qualified call's first
