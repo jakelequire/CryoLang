@@ -22,6 +22,7 @@
 
 namespace std::fmt::float;
 
+import std::core::cmp;
 import std::core::intrinsics;
 import std::core::option::{ Option };
 import std::core::primitives;
@@ -57,6 +58,12 @@ private const SMALL_THRESHOLD: f64 = 1.0e-4;
 /// f64 with 6 fractional digits and a 4-digit exponent fits well inside
 /// this. Callers who stack-allocate pick this size.
 public const F64_MAX_DIGITS: i64 = 32;
+
+/// Fractional places rounded by scaling into a `u64`. An f64 carries at
+/// most 17 significant decimal digits, so places past this are written as
+/// zeros; `10^17`, and the mantissa's carry check at `10^18`, still fit a
+/// `u64`, where a larger power would saturate the conversion.
+private const SCALED_DECIMALS: i64 = 17;
 
 // Extension methods on f32: widen to f64 and delegate.
 //
@@ -103,7 +110,8 @@ implement f64 {
 
     /// Variant with caller-chosen precision. `decimals` applies to the
     /// fixed-point form and to the mantissa of the scientific form; zero
-    /// or less writes no fractional digits.
+    /// or less writes no fractional digits. `buffer` must hold at least
+    /// `F64_MAX_DIGITS` bytes plus `decimals`.
     public to_buf_with(&this, buffer: u8*, decimals: i64) -> i64 {
         const value: f64 = this;
         const places: i64 = if (decimals > 0) { decimals } else { 0 };
@@ -189,8 +197,9 @@ private function write_fixed(buffer: u8*, value: f64, decimals: i64) -> i64 {
     // 0.9999996 at 6 dp), carry into the integer part so the two halves
     // stay consistent.  The fixed-point path only runs for
     // |v| < 1e16, so the carry adds at most one integer digit and the
-    // 32-byte caller buffer never overflows.
-    const scale: f64 = libc::pow(10.0, decimals as f64);
+    // caller's `F64_MAX_DIGITS + decimals` bytes never overflow.
+    const scaled_places: i64 = cmp::min(decimals, SCALED_DECIMALS);
+    const scale: f64 = libc::pow(10.0, scaled_places as f64);
     const scale_u: u64 = scale as u64;
     mut frac_scaled: u64 = ((value - (integer_part as f64)) * scale + 0.5) as u64;
     if (frac_scaled >= scale_u) {
@@ -201,7 +210,11 @@ private function write_fixed(buffer: u8*, value: f64, decimals: i64) -> i64 {
     mut cursor: i64 = integer_part.to_decimal_buf(buffer);
     buffer[cursor] = 0x2E; // '.'
     cursor = cursor + 1;
-    cursor = cursor + frac_scaled.to_decimal_padded_buf(buffer + cursor, decimals);
+    cursor = cursor + frac_scaled.to_decimal_padded_buf(buffer + cursor, scaled_places);
+    for (mut place: i64 = scaled_places; place < decimals; place++) {
+        buffer[cursor] = 0x30; // '0'
+        cursor = cursor + 1;
+    }
     return cursor;
 }
 
@@ -226,7 +239,7 @@ private function write_scientific(buffer: u8*, value: f64, decimals: i64) -> i64
     // "10.0e20" instead of the normalized "1.0e21". Detect that carry at the
     // requested precision and bump the exponent so the mantissa renormalizes to
     // ~1.0 before formatting.
-    const round_scale: f64 = libc::pow(10.0, decimals as f64);
+    const round_scale: f64 = libc::pow(10.0, cmp::min(decimals, SCALED_DECIMALS) as f64);
     if (((mantissa * round_scale) + 0.5) as u64 >= (10.0 * round_scale) as u64) {
         e = e + 1;
         mantissa = value / libc::pow(10.0, e as f64);

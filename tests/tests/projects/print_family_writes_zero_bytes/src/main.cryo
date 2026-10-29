@@ -1,0 +1,60 @@
+/// `println` and `eprintln` write every byte of their text, an embedded
+/// zero byte and what follows it included.  The program runs itself as a
+/// child, which prints a text holding a zero byte to both streams, and
+/// compares the child's captured bytes; the test runner's own capture reads
+/// its output as text and would stop at the zero.
+namespace PrintFamilyWritesZeroBytes::Main;
+
+import std::fmt;
+import std::env;
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::slice::{ Slice };
+import std::process::command::{ Command, Output };
+
+function text_with_zero() -> String {
+    mut text: String = String::from_str(Str::new("before"));
+    text.push_byte(0);
+    text.push(Str::new("after"));
+    return text;
+}
+
+/// The child's line, up to the newline (which a Windows text stream writes
+/// as two bytes).
+function holds_every_byte(bytes: Slice<u8>, name: string) -> boolean {
+    const want: String = text_with_zero();
+    const got: Str = Str::from_raw(bytes.as_ptr(), bytes.length());
+    if (got.starts_with(want.as_str())) { return true; }
+    fmt::println(f"{name}: {bytes.length()} bytes, wanted {want.length()} and a newline");
+    return false;
+}
+
+function main() -> i32 {
+    if (env::args().length() > 1) {
+        fmt::println(text_with_zero());
+        fmt::eprintln(text_with_zero());
+        return 0;
+    }
+    const program: Option<String> = env::current_exe();
+    if (program.is_none()) {
+        fmt::println("no path to this program");
+        return 1;
+    }
+    mut child: Command = Command::new(program.unwrap().as_str());
+    child.arg(Str::new("child"));
+    match (child.output()) {
+        Result::Ok(output) => {
+            const stdout_whole: boolean = holds_every_byte(output.stdout(), "stdout");
+            const stderr_whole: boolean = holds_every_byte(output.stderr(), "stderr");
+            if (stdout_whole && stderr_whole) {
+                fmt::println("every byte written");
+                return 0;
+            }
+            return 1;
+        }
+        Result::Err(_) => {
+            fmt::println("could not run the child");
+            return 1;
+        }
+    }
+}

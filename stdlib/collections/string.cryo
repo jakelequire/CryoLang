@@ -155,13 +155,19 @@ public type struct String<A = GlobalAlloc> {
 
     /// Append `count` copies of the scalar `c`, UTF-8-encoded, growing the
     /// string once.  Zero or less appends nothing.  Panics on allocation
-    /// failure.
+    /// failure, and when the total length overflows `i64`.
     public push_repeated(mut &this, c: char, count: i64) -> void {
         if (count <= 0) { return; }
         const start: i64 = this.length;
         this.push(c);
         const width: i64 = this.length - start;
-        match (this.reserve_exact(width * (count - 1))) {
+        const additional: i64 = match (width.checked_multiply(count - 1)) {
+            Option::Some(n) => { n }
+            Option::None => {
+                core::panic("String::push_repeated: length overflows i64", intrinsics::location())
+            }
+        };
+        match (this.reserve_exact(additional)) {
             Result::Ok(_) => { }
             Result::Err(_) => {
                 core::panic("String::push_repeated: allocation failed", intrinsics::location());
@@ -431,11 +437,13 @@ where A: Allocator {
     }
 }
 
+/// Hashes as its `Str` view does, so a `String` and a `Str` with the same
+/// bytes hash alike.
 implement<A> trait Hash for struct String<A>
 where A: Allocator {
     hash<H>(&this, hasher: mut &H) -> void
     where H: Hasher {
-        hasher.write_bytes(this.as_bytes());
+        this.as_str().hash(hasher);
     }
 }
 

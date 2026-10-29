@@ -19,6 +19,8 @@
 
 namespace std::fmt::spec;
 
+import std::alloc::allocator;
+import std::core::intrinsics;
 import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::core::iter::{ Iterator };
@@ -27,6 +29,7 @@ import std::collections::string::{ String };
 import std::collections::pair::{ Pair };
 import std::fmt::display::{ Display, format_to_string, Formatter };
 import std::fmt::error::{ FmtError };
+import std::fmt::float::{ F64_MAX_DIGITS };
 import std::core::mem;
 
 /// No radix: format the value in its natural (decimal / Display) form.
@@ -205,16 +208,31 @@ internal function fmt_sint_body(val: i64, masked: u64, spec: &FmtSpec, out: u8*)
 
 /// Body for a float, written into `out` (`NUMBER_BODY_BYTES`). With a
 /// precision, uses fixed fractional digits; without, the form `Display`
-/// writes. The sign is part of the text, so `head_len` marks a leading
-/// `-` for zero-fill.
+/// writes. A precision too long for `out` is written into an allocation
+/// sized to it and kept as the body's `String`. The sign is part of the
+/// text, so `head_len` marks a leading `-` for zero-fill.
 internal function fmt_float_body(val: f64, spec: &FmtSpec, out: u8*) -> BodyText {
+    const needed: i64 = if (spec.has_precision) { F64_MAX_DIGITS + spec.precision } else { F64_MAX_DIGITS };
+    mut digits: u8* = out;
+    if (needed > NUMBER_BODY_BYTES) {
+        digits = allocator::alloc(needed as u64, 1) as u8*;
+        if (digits == null) {
+            core::panic("fmt: allocation failed formatting a float", intrinsics::location());
+        }
+    }
     const written: i64 = if (spec.has_precision) {
-        val.to_buf_with(out, spec.precision as i64)
+        val.to_buf_with(digits, spec.precision)
     } else {
-        val.to_buf(out)
+        val.to_buf(digits)
     };
-    const head: i64 = if (written > 0 && out[0] == 0x2D) { 1 } else { 0 };
-    return BodyText::number(out, written, head);
+    const head: i64 = if (written > 0 && digits[0] == 0x2D) { 1 } else { 0 };
+    if (digits == out) {
+        return BodyText::number(out, written, head);
+    }
+    mut text: String = String::new();
+    text.push(Str::from_raw(digits, written));
+    allocator::free(digits as void*, 1);
+    return BodyText { text: text, digits: null, length: written, head_len: head };
 }
 
 /// Body for any Display value that is not an integer or float: render it,

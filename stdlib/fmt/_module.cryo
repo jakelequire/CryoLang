@@ -39,6 +39,7 @@ namespace std::fmt;
 import std::core::intrinsics;
 import std::ffi::libc;
 import std::alloc::allocator;
+import std::collections::str::{ Str };
 import std::collections::string::{ String };
 
 module {
@@ -114,13 +115,27 @@ public function printf(fmt: string, args...) -> i32 {
 /// format string to interpret here (a `%` in the text is data, not a
 /// directive).  We go through the real stdout (`printf "%.*s"`) so output
 /// stays interleaved with `printf` rather than landing on a second FILE*.
+/// `%s` stops at a zero byte even with a precision, so each run before an
+/// embedded zero is written by `%.*s` and the zero itself by `%c`.
 public function print(text: String) -> void {
-    libc::printf("%.*s", text.length() as i32, text.as_ptr());
+    mut rest: Str = text.as_str();
+    loop {
+        match (rest.find_byte(0)) {
+            Option::Some(at) => {
+                libc::printf("%.*s%c", at as i32, rest.as_ptr(), 0);
+                rest = rest.sub_bytes(at + 1, rest.length());
+            }
+            Option::None => {
+                libc::printf("%.*s", rest.length() as i32, rest.as_ptr());
+                return;
+            }
+        }
+    }
 }
 
 /// Like `print`, followed by a newline.
 public function println(text: String) -> void {
-    libc::printf("%.*s", text.length() as i32, text.as_ptr());
+    print(text);
     libc::putchar(0x0A);
 }
 
@@ -152,14 +167,14 @@ public function eprintf(fmt: string, args...) -> i32 {
 /// then drop it.  Display-based counterpart to `eprintf`.
 public function eprint(text: String) -> void {
     const stream: void* = fmt_stderr_stream();
-    libc::fprintf(stream, "%.*s", text.length() as i32, text.as_ptr());
+    libc::fwrite(text.as_ptr(), 1, text.length() as u64, stream);
     libc::fflush(stream);
 }
 
 /// Like `eprint`, followed by a newline.
 public function eprintln(text: String) -> void {
     const stream: void* = fmt_stderr_stream();
-    libc::fprintf(stream, "%.*s", text.length() as i32, text.as_ptr());
+    libc::fwrite(text.as_ptr(), 1, text.length() as u64, stream);
     libc::fputc(0x0A, stream);
     libc::fflush(stream);
 }
