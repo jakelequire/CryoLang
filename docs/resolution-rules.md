@@ -884,6 +884,26 @@ yet is recorded with the change that builds it, not here.
      pointer to the byte.  Reading `s[i]` as a value, and a method called
      on it, are unchanged.  (Jake; the code and wording delegated)
 
+652. **A `?` against its operand is the try operator.**  The postfix `?`
+     and the ternary's `?` are one token, and both are kept.  A `?` with
+     no space or comment between it and the token before it is the try
+     operator whatever follows, so `x?[i]`, `x?.y`, `x?.m()`, `x? - y`,
+     `x? * y` and `&x?` apply to `x?`.  A spaced `?` is the try operator
+     when what follows cannot begin an expression (`x ?;`), as before, and
+     the ternary's otherwise.  `?.` is no longer a token of its own: the
+     optional-chaining reservation is dropped, so `x?.y` is `(x?).y`.  A
+     ternary written against its condition with a name or a literal after
+     the `?` (`flag?a:b`) is E0100, reported at the `?` and parsed as the
+     ternary.  (Jake: drop `?.`, keep the ternary; the rule delegated)
+
+653. **A receiver is resolved under no expected type.**  The object a
+     member is reached on, or a method called on, is resolved with no type
+     wanted of it, and the operand of `&` with the pointee or referent of
+     the pointer or reference wanted of the `&`, or none.  A `match`
+     answers the type wanted of it, and a `?` is one: under the type
+     wanted of `(x?).field` it took that type as its own, and under the
+     `T*` wanted of `&f()?` the pointer.  (Jake; the code delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

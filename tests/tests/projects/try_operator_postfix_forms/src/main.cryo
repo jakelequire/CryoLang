@@ -1,0 +1,117 @@
+/// A `?` written against its operand is the try operator whatever follows
+/// it, so `x?[i]`, `x?.y`, `x? - y` and `x? * y` apply to `x?`, and `&x?`
+/// is the address of `x?`.  A `?` with a space before it is the ternary's
+/// when a true branch can follow, so `c ? -x : y` and `c ? *p : y` are
+/// ternaries.  The value of `x?` is the operand's payload wherever it is
+/// written: a member reached on `(x?)`, a method called on it, and the
+/// pointer `&f()?` take its type, not the type wanted of the whole
+/// expression.
+namespace TryOperatorPostfixForms::Main;
+
+import std::ffi::libc::{ printf };
+
+type struct Pair {
+    left: i32;
+    right: i64;
+
+    sum(&this) -> i64 { return this.left as i64 + this.right; }
+}
+
+function pair(fail: boolean) -> Result<Pair, i32> {
+    if (fail) { return Result::Err(7); }
+    return Result::Ok(Pair { left: 3, right: 40 });
+}
+
+function numbers(fail: boolean) -> Result<[i32; 3], i32> {
+    if (fail) { return Result::Err(8); }
+    return Result::Ok([10, 20, 30]);
+}
+
+function count(fail: boolean) -> Option<i32> {
+    if (fail) { return Option::None; }
+    return Option::Some(6);
+}
+
+function index_after(fail: boolean) -> Result<i32, i32> {
+    return Result::Ok(numbers(fail)?[1]);
+}
+
+function member_after(fail: boolean) -> Result<i64, i32> {
+    const right: i64 = pair(fail)?.right;
+    return Result::Ok(right);
+}
+
+function method_after(fail: boolean) -> Result<i64, i32> {
+    const total: i64 = pair(fail)?.sum();
+    return Result::Ok(total);
+}
+
+function minus_after(fail: boolean) -> Option<i32> {
+    return Option::Some(count(fail)? - 1);
+}
+
+function times_after(fail: boolean) -> Option<i32> {
+    return Option::Some(count(fail)? * 2);
+}
+
+function grouped_member(fail: boolean) -> Result<i64, i32> {
+    const right: i64 = (pair(fail)?).right;
+    return Result::Ok(right + (pair(fail)?).sum());
+}
+
+function address_of(fail: boolean) -> Result<i64, i32> {
+    const p: Pair* = &pair(fail)?;
+    return Result::Ok(p.right);
+}
+
+function ternaries(flag: boolean, x: i32) -> i32 {
+    const p: i32* = &x;
+    const negated: i32 = flag ? -x : x;
+    const read: i32 = flag ? *p : 0;
+    return negated + read;
+}
+
+function result_or(r: Result<i64, i32>) -> i64 {
+    match (r) {
+        Result::Ok(v) => { return v; }
+        Result::Err(e) => { return -(e as i64); }
+    }
+}
+
+function option_or(o: Option<i32>) -> i32 {
+    match (o) {
+        Option::Some(v) => { return v; }
+        Option::None => { return -1; }
+    }
+}
+
+function check(passed: i32, condition: boolean, what: string) -> i32 {
+    if (!condition) {
+        printf("FAILED: %s\n", what);
+        return passed;
+    }
+    return passed + 1;
+}
+
+function main() -> i32 {
+    mut passed: i32 = 0;
+    passed = check(passed, result_or(method_after(true)) == -7, "`x?.m()` returns the error");
+    passed = check(passed, match (index_after(false)) { Result::Ok(v) => { v == 20 } Result::Err(_) => { false } },
+        "`x?[i]` indexes the payload");
+    passed = check(passed, match (index_after(true)) { Result::Ok(_) => { false } Result::Err(e) => { e == 8 } },
+        "`x?[i]` returns the error");
+    passed = check(passed, result_or(member_after(false)) == 40, "`x?.y` reads the payload's field");
+    passed = check(passed, result_or(member_after(true)) == -7, "`x?.y` returns the error");
+    passed = check(passed, result_or(method_after(false)) == 43, "`x?.m()` calls the payload's method");
+    passed = check(passed, option_or(minus_after(false)) == 5, "`x? - y` subtracts from the payload");
+    passed = check(passed, option_or(minus_after(true)) == -1, "`x? - y` returns None");
+    passed = check(passed, option_or(times_after(false)) == 12, "`x? * y` multiplies the payload");
+    passed = check(passed, result_or(grouped_member(false)) == 83, "`(x?).y` and `(x?).m()` take the payload's type");
+    passed = check(passed, result_or(address_of(false)) == 40, "`&f()?` is a pointer to the payload");
+    passed = check(passed, result_or(address_of(true)) == -7, "`&f()?` returns the error");
+    passed = check(passed, ternaries(true, 4) == 0, "a spaced `?` before `-x` and `*p` is a ternary");
+    passed = check(passed, ternaries(false, 4) == 4, "a spaced `?` takes the ternary's false branch");
+    printf("try operator postfix forms: %d of 14 checks passed\n", passed);
+    if (passed != 14) { return 1; }
+    return 0;
+}

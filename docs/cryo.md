@@ -1119,7 +1119,7 @@ Only `mut` bindings can be assigned to.
 | `typeof(expr)` | Compile-time type of `expr`, used in type position.                                                                                          |
 | `new` `delete` | Heap allocation / deallocation.                                                                                                               |
 
-> **Reserved.** `?.` and `...` in call position are recognised by the lexer but not yet lowered. See [section 21](#21-reserved-syntax). (The range operators `..` / `..=` *are* fully lowered - see [section 5.7](#57-operator-precedence).)
+> **Reserved.** `...` in call position is recognised by the lexer but not yet lowered. See [section 21](#21-reserved-syntax). (The range operators `..` / `..=` *are* fully lowered - see [section 5.7](#57-operator-precedence).)
 
 **Pipeline (`|>`, `<|`).** The pipeline operators thread a value into a call. `x |> f` is `f(x)`; with an argument list the piped value is **prepended** - `x |> f(a, b)` is `f(x, a, b)`. The backward form **appends** instead - `f(a, b) <| x` is `f(a, b, x)`. Pipes are left-associative, so `x |> f |> g` is `g(f(x))`. They are a compile-time rewrite to an ordinary call, with no runtime cost.
 
@@ -1134,6 +1134,8 @@ const port: u16 = config_port() ?? env_port() ?? 8080;
 ```
 
 **Error propagation (`?`).** A postfix `?` on a `Result<T, E>` evaluates to `T` when the value is `Ok`, and otherwise returns the error from the enclosing function; on an `Option<T>` it yields `T` for `Some` and returns `None`. The enclosing function's return type must be a matching `Result` / `Option`. It is the concise form of a `match` that re-returns the error.
+
+A `?` written against its operand, with no space or comment between them, is this operator whatever follows it: `x?[i]`, `x?.field`, `x?.method()`, `x? - y` and `x? * y` all apply to `x?`, and `&f()?` is the address of `f()?`. A `?` with a space before it is the ternary's ([section 6.9](#69-ternary)) when a true branch can follow it, and the try operator when what follows cannot begin an expression (`x ?;`). The value of `x?` is the payload's type wherever it stands: `(x?).field` reaches the payload's field whatever type the whole expression is wanted as.
 
 When the function returns `Result<U, F>` and `F` cannot hold an `E` as it is, the error is converted on the way out: `?` returns `Err(F::from(e))`, through `F`'s implementation of `std::core::convert::From<E>`. An `E` that `F` already holds is returned unchanged. With no `From<E>` for `F`, the `?` is refused (`E0214`); convert the error with `map_err` first, or implement the conversion.
 
@@ -1359,6 +1361,8 @@ const abs: int = x >= 0 ? x : -x;
 ```
 
 The ternary is right-associative: `a ? b : c ? d : e` parses as `a ? b : (c ? d : e)`.
+
+The ternary's `?` takes a space before it. A `?` written against the condition is the postfix try operator ([section 5.6](#56-other-operators)), so `flag?a:b` is refused (E0100): write `flag ? a : b`.
 
 ### 6.10 Return
 
@@ -4294,7 +4298,6 @@ The lexer and grammar reserve the following forms because the language plans to 
 | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Raw strings `r"..."`                          | Reserved. Will treat backslashes literally (no escape processing). Today an `r` prefix lexes as a separate identifier followed by an ordinary string literal.                                                                                                                                    |
 | `yield`                                       | Parser accepts a `yield` expression; no generator semantics exist. `async` / `await` are fully implemented - see [section 18](#18-asynchronous-programming).                                                                                                                                     |
-| Optional chaining `?.`                        | Token reserved; not consumed by the parser.                                                                                                                                                                                                                                                      |
 | Spread `...` in calls / literals              | The token exists for variadic parameter declarations only.                                                                                                                                                                                                                                       |
 | Macros                                        | No macro system exists, and `macro` is **not** currently a reserved word (it lexes as an ordinary identifier). A future hygienic macro system may introduce one.                                                                                                                                 |
 | `![pure]`                                     | Reserved. Will assert the function has no observable side effects (enabling aggressive folding). Parsed as an unknown directive today (warning + no semantics).                                                                                                                                  |

@@ -640,14 +640,29 @@ implement struct Parser {
                 expr = ExpressionNode::unary_expr(op, expr, span);
                 mut un: UnaryExpr* = ExpressionNode::unary_of(expr);
                 un.is_postfix = true;
+            } else if (this.check(TokenType::Question) && this.question_against_operand()
+                       && match (this.peek_at(1).kind) {
+                              TokenType::Identifier | TokenType::NumericConstant | TokenType::CharConstant
+                              | TokenType::StringLiteral | TokenType::KwTrue | TokenType::KwFalse => { true }
+                              _ => { false }
+                          }) {
+                // A name or a literal never continues `x?`: this is a
+                // ternary written without the space before its `?`.  It is
+                // reported and parsed as the ternary, so nothing cascades.
+                this.report_invalid_at(ErrorCode::E0100_EXPECTED_TOKEN,
+                    "a `?` written against its operand is the try operator; a ternary's `?` takes a space before it (`cond ? a : b`)",
+                    this.span_from_token(this.current()));
+                break;
             } else if (this.check(TokenType::Question)
-                       && this.peek_at(1).kind.question_terminates()) {
-                // Postfix try operator `expr?`.  The lookahead distinguishes
-                // it from the ternary `?` (which `parse_conditional`, our
-                // caller, handles; see `try_question_terminates`.  The
-                // operand may itself be a try (`a()?` then more postfix),
-                // so the loop continues.  Sema lowers this to the
-                // equivalent `match` once the operand's type is known.
+                       && (this.question_against_operand() || this.peek_at(1).kind.question_terminates())) {
+                // Postfix try operator `expr?`, told from the ternary's `?`
+                // (which `parse_conditional`, our caller, handles): a `?`
+                // written against its operand is the try operator, so
+                // `x?[i]`, `x?.y` and `x? - y` apply to `x?`; a spaced one
+                // is when no true branch can follow it.  The operand may
+                // itself be a try (`a()?` then more postfix), so the loop
+                // continues.  Sema lowers this to the equivalent `match`
+                // once the operand's type is known.
                 const op: Token        = this.advance();
                 const span: SourceSpan = Parser::merge_spans(expr.span, this.span_from_token(op));
                 expr = ExpressionNode::try_expr(expr, span);

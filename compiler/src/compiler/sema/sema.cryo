@@ -1670,6 +1670,19 @@ type struct SemaVisitor {
         return result;
     }
 
+    /// The type of `receiver`, the object a member is reached on or a
+    /// method called on.  The type wanted of `obj.m` or `obj.m()` says
+    /// nothing of `obj`'s, so `obj` is resolved under no expected type: a
+    /// `match` (a `?` among them) resolved under one would take it as its
+    /// own.
+    resolve_receiver(mut &this, receiver: ExpressionNode*) -> TypeRef {
+        const outer_expected: TypeRef = this.state.expected_type;
+        this.state.expected_type = TypeRef::invalid();
+        const t: TypeRef = this.resolve_expr(receiver);
+        this.state.expected_type = outer_expected;
+        return t;
+    }
+
     /// The type of an expression whose kind has a payload; `resolve_expr`
     /// records it on the header.
     resolve_expr_shape(mut &this, expr: ExpressionNode*) -> TypeRef {
@@ -2759,7 +2772,23 @@ type struct SemaVisitor {
                 }
             }
         }
-        if (!operand_type.is_valid()) { operand_type = this.resolve_expr(unary.operand); }
+        if (!operand_type.is_valid() && unary.op.kind == TokenType::Amp) {
+            // `&x` wanted as a `T*` or a `&T` wants `x` as a `T`, and as
+            // nothing otherwise: a `match` (a `?` among them) resolved under
+            // the pointer would take the pointer as its own type.
+            const saved_expected: TypeRef = this.state.expected_type;
+            const wanted: Type* = this.arena.lookup(saved_expected);
+            this.state.expected_type = TypeRef::invalid();
+            if (wanted != null && wanted.kind == TypeKind::Pointer) {
+                this.state.expected_type = wanted.as_pointer().pointee;
+            } else if (wanted != null && wanted.kind == TypeKind::Reference) {
+                this.state.expected_type = wanted.as_reference().referent;
+            }
+            operand_type = this.resolve_expr(unary.operand);
+            this.state.expected_type = saved_expected;
+        } else if (!operand_type.is_valid()) {
+            operand_type = this.resolve_expr(unary.operand);
+        }
         if (!operand_type.is_valid()) { return TypeRef::invalid(); }
         if (unary.op.kind == TokenType::Amp && !unary.is_synthetic && unary.operand != null
             && ExpressionNode::literal_of(unary.operand) != null) {
