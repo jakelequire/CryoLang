@@ -911,6 +911,24 @@ yet is recorded with the change that builds it, not here.
      local `face`) is not read.  A surrogate there is E0006 as in a string
      literal.  (Jake)
 
+655. **An implementation's parameter that only its trait's arguments
+     write is bound by each call.**  In `implement<T, E, F> trait
+     Lift<Result<(), E>> for Outcome<T, F> where F: From<E>`, no
+     instantiation of `Outcome` binds `E`, and two calls may pass two
+     error types.  So each method whose parameters name such a parameter
+     is generic over it: a call binds it from its arguments - through the
+     type's path, from a generic function, or through a bound on the
+     trait - and has a copy of the method per binding.  It was bound once
+     per target, to the first trait argument its where-clause found, and
+     every call ran that copy.  A parameter a method names only in its
+     return, or that no method names, keeps the binding the where-clause
+     derives (`A` in `Iterator<A> for TakeIter<I> where I: Iterator<A>`).
+     The trait's declaration of the method writes none of these, so the
+     method still conforms.  A generic enum's static method with type
+     parameters of its own is resolved through its path as a struct's
+     is.  (Jake asked for the converting `FromResidual` impl, which has
+     this shape; the rule delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

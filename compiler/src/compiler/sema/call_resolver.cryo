@@ -6953,26 +6953,30 @@ type struct CallResolver {
 
     /// The generic owner's type parameters as the signature of its method
     /// `m` names them, one per owner parameter, into `out`.  The signature
-    /// names those of the block that declares the method: an inherent
-    /// `implement<T> struct Wrap<T>` block's own, which stand positionally
-    /// for the owner's, or the owner's when the method is declared in the
-    /// type's body.  `named` is every type parameter the signature names;
-    /// each block parameter is found among them by the symbol its
-    /// declaration bound, and one the signature never names is held by the
-    /// owner's, which nothing in the signature matches.  False when the
-    /// block's parameters do not stand one for one for the owner's.
+    /// names those of the block that declares the method - an `implement`
+    /// block's own, inherent or a trait's, each standing for the owner's
+    /// parameter at the position the head writes it (`implement<T, E, F>
+    /// trait Lift<Result<(), E>> for Outcome<T, F>`: `T` and `F`) - or the
+    /// owner's when the method is declared in the type's body.  `named` is
+    /// every type parameter the signature names; each block parameter is
+    /// found among them by the symbol its declaration bound, and one the
+    /// signature never names is held by the owner's, which nothing in the
+    /// signature matches.  False when the head writes a type, not a
+    /// parameter, at some position.
     owner_param_handles(&this, owner_entry: TemplateEntry*, m_decl: DeclarationNode*, named: &[TypeRef],
                         out: mut &[TypeRef]) -> boolean {
         for (mut b: i64 = 0; b < owner_entry.impl_blocks.length() && out.length() == 0; b++) {
             const block: ImplBlock* = DeclarationNode::impl_of(owner_entry.impl_blocks[b]);
-            if (block == null || block.trait_annotation != null) { continue; }
+            if (block == null) { continue; }
             if (!MethodDecl::is_method_of(m_decl, owner_entry.impl_blocks[b])) { continue; }
-            if (block.generic_params.length() != owner_entry.param_types.length()) { return false; }
-            for (mut i: i64 = 0; i < block.generic_params.length(); i++) {
+            if (block.target_args.length() != owner_entry.param_types.length()) { return false; }
+            for (mut i: i64 = 0; i < block.target_args.length(); i++) {
+                const written: SymbolID = GenericRegistry::head_param_of(block.target_args[i]);
+                if (!written.is_valid()) { return false; }
                 mut handle: TypeRef = owner_entry.param_types[i];
                 for (mut k: i64 = 0; k < named.length(); k++) {
                     const gt: Type* = this.arena.lookup(named[k]);
-                    if (gt != null && gt.as_generic_param().param_sym.equals(DeclarationNode::generic_param_of(block.generic_params[i]).sym_id)) {
+                    if (gt != null && gt.as_generic_param().param_sym.equals(written)) {
                         handle = named[k];
                     }
                 }
@@ -8086,7 +8090,8 @@ type struct CallResolver {
         if (tmpl == null || tmpl.ast_node == null) { return TypeRef::invalid(); }
         if (tmpl.param_types.length() == 0) { return TypeRef::invalid(); }
 
-        if (tmpl.kind != TemplateKind::Struct && tmpl.kind != TemplateKind::Union) { return TypeRef::invalid(); }
+        if (tmpl.kind != TemplateKind::Struct && tmpl.kind != TemplateKind::Union
+                && tmpl.kind != TemplateKind::Enum) { return TypeRef::invalid(); }
 
         // The method the path names, wherever the owner's method is written -
         // its declaration or an impl block of the template - static or taking

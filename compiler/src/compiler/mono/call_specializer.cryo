@@ -66,6 +66,7 @@ import compiler::types::compound::{
 };
 import compiler::types::generic::{ InstantiatedType };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry, TemplateKind };
+import compiler::types::inference::{ InferCtx };
 import compiler::types::trait_checker::{ TraitChecker };
 import compiler::types::resolver::{ ResolutionContext, TypeResolver };
 import compiler::types::substitution::{ TypeSubstitution };
@@ -1601,6 +1602,62 @@ type struct MonoCallSpecializer {
         return this.decl_index.entry_method(this.decl_index.method_entry_on(owner, d));
     }
 
+    /// Bind `call` to the instance of `m_decl`, a method of `owner`'s
+    /// implementation whose only type parameters are the ones its
+    /// implementation lends it (`FunctionDecl.inherited_params`), at the
+    /// arguments the call passes: each lent parameter is bound by unifying
+    /// the method's parameters with the types the directing bound gives the
+    /// call (`bound_params`), else the arguments' own.  Answers whether
+    /// `m_decl` is such a method; one whose parameters stay unbound is left
+    /// unpinned, as an unbound call is.
+    instantiate_lent_method(mut &this, call: CallExpr*, m_decl: DeclarationNode*, owner: TypeRef) -> boolean {
+        const m: MethodDecl* = DeclarationNode::method_of(m_decl);
+        if (m == null || m.func == null) { return false; }
+        const f: FunctionDecl* = DeclarationNode::fn_of(m.func);
+        if (f.inherited_params == 0 || f.written_params() > 0) { return false; }
+        mut formals: [TypeRef] = [];
+        for (mut i: i64 = 0; i < f.parameters.length(); i++) {
+            const p: VarDecl* = DeclarationNode::var_of(f.parameters[i]);
+            if (p != null && !p.is_receiver()) { formals.push(p.resolved_type); }
+        }
+        mut actuals: [TypeRef] = [];
+        if (call.bound_params.length() == formals.length()) {
+            for (mut i: i64 = 0; i < call.bound_params.length(); i++) { actuals.push(call.bound_params[i]); }
+        } else {
+            for (mut i: i64 = 0; i < call.arguments.length(); i++) {
+                if (call.arguments[i] != null) { actuals.push(call.arguments[i].resolved_type); }
+            }
+        }
+        if (actuals.length() != formals.length()) { return true; }
+        mut named: [TypeRef] = [];
+        for (mut i: i64 = 0; i < formals.length(); i++) { this.arena.generic_params_in(formals[i], &named); }
+        mut params: [TypeRef] = [];
+        for (mut g: i64 = 0; g < f.generic_params.length(); g++) {
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(f.generic_params[g]);
+            mut found: TypeRef = TypeRef::invalid();
+            for (mut k: i64 = 0; k < named.length(); k++) {
+                if (gp != null && this.arena.lookup(named[k]).as_generic_param().param_sym.equals(gp.sym_id)) { found = named[k]; }
+            }
+            if (!found.is_valid()) { return true; }
+            params.push(found);
+        }
+        mut infer: InferCtx = InferCtx::for_template(this.arena, params);
+        for (mut i: i64 = 0; i < formals.length(); i++) {
+            if (!actuals[i].is_valid() || !infer.unify(formals[i], actuals[i])) { return true; }
+        }
+        mut impl_node: DeclarationNode* = null;
+        const heads: [DeclarationNode*] = this.trait_heads_on(f.origin_trait, owner);
+        for (mut h: i64 = 0; h < heads.length(); h++) {
+            const block: ImplBlock* = DeclarationNode::impl_of(heads[h]);
+            for (mut mi: i64 = 0; block != null && mi < block.methods.length(); mi++) {
+                if (block.methods[mi] == m_decl) { impl_node = heads[h]; }
+            }
+        }
+        if (impl_node == null) { return true; }
+        this.pin_spec_entry(call, this.method_instance_entry(m_decl, impl_node, null, owner, &infer.bindings, null));
+        return true;
+    }
+
     /// Pin `call` to `m` when `m` is bound as it is written: one with type
     /// parameters of its own, or a default instantiated per call, is bound
     /// to an instance instead.
@@ -1726,7 +1783,8 @@ type struct MonoCallSpecializer {
                 const gm: MethodDecl* = DeclarationNode::method_of(gm_decl);
                 if (gm != null) { this.instantiate_generic_method(call, gm_decl, gm_impl, gm_owner, owner, null); }
             } else if (ExpressionNode::scope_resolution_of(call.callee) != null) {
-                this.pin_plain(call, this.path_method_on(call, owner));
+                const path_m: DeclarationNode* = this.path_method_on(call, owner);
+                if (!this.instantiate_lent_method(call, path_m, owner)) { this.pin_plain(call, path_m); }
             } else if (call.template_method.is_valid()) {
                 mut id_impl: DeclarationNode* = null;
                 mut id_owner: DeclarationNode* = null;
@@ -2273,6 +2331,7 @@ type struct MonoCallSpecializer {
         DeclarationNode::fn_of(spec_method.func).set_self_returning_default(false);
         DeclarationNode::fn_of(spec_method.func).set_lazy_self_growing(false);
         DeclarationNode::fn_of(spec_method.func).generic_params = [];
+        DeclarationNode::fn_of(spec_method.func).inherited_params = 0;
         DeclarationNode::fn_of(spec_method.func).set_resolved_return_type(TypeRef::invalid());
         for (mut i: i64 = 0; i < DeclarationNode::fn_of(spec_method.func).parameters.length(); i++) {
             const p_decl: DeclarationNode* = DeclarationNode::fn_of(spec_method.func).parameters[i];

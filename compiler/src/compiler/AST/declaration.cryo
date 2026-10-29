@@ -627,6 +627,14 @@ type struct FunctionDecl {
     /// resolution (an inherent method has no trait to resolve through), so it
     /// is a SEPARATE flag checked only at the materialization/codegen sites.
     is_lazy_self_growing:   boolean;
+    /// How many of `generic_params`, at its end, are its implementation's
+    /// rather than its own.  A parameter of an `implement` block written in
+    /// its trait's arguments and not in its target is bound by no
+    /// instantiation of the target, so it is a parameter of each method whose
+    /// signature names it, bound per call: `FromResidual<Result<(), E>> for
+    /// Result<T, F>` has an instance of `from_residual` per `E`.  The trait's
+    /// declaration of the method writes none of them.
+    inherited_params:       i64;
     /// `![symbol("name")]` linker-symbol override for an extern function.
     /// When `has_link_name` is set, codegen names the LLVM declaration
     /// `link_name` instead of the Cryo source name, so the symbol resolved
@@ -739,6 +747,7 @@ type struct FunctionDecl {
             is_intrinsic:              false,
             is_self_returning_default: false,
             is_lazy_self_growing:      false,
+            inherited_params:          0,
             link_name:                 "",
             has_link_name:             false,
             is_weak:                   false,
@@ -811,6 +820,11 @@ type struct FunctionDecl {
     set_intrinsic(mut &this, v: boolean) -> void                       { this.is_intrinsic = v; }
     set_self_returning_default(mut &this, v: boolean) -> void          { this.is_self_returning_default = v; }
     set_lazy_self_growing(mut &this, v: boolean) -> void               { this.is_lazy_self_growing = v; }
+
+    /// The type parameters the function's declaration writes: its own, not
+    /// those it takes from its implementation (`inherited_params`).
+    written_params(&this) -> i64 { return this.generic_params.length() - this.inherited_params; }
+
     set_return_type_annotation(mut &this, a: TypeAnnotation*) -> void  { this.return_type_annotation = a; }
     set_resolved_return_type(mut &this, t: TypeRef) -> void            { this.resolved_return_type = t; }
     set_origin_trait(mut &this, t: DefId) -> void                      { this.origin_trait = t; }
@@ -1809,6 +1823,37 @@ type struct ImplBlock {
         const at: i64 = this.trait_item_methods[slot];
         if (at < 0 || at >= this.methods.length()) { return null; }
         return this.methods[at];
+    }
+
+    /// Whether a method of the block takes the block's parameter `param` as
+    /// one of its own (`FunctionDecl.inherited_params`): each call binds it,
+    /// and no instantiation of the target does.
+    lends_param(&this, param: SymbolID) -> boolean {
+        for (mut mi: i64 = 0; mi < this.methods.length(); mi++) {
+            const method: MethodDecl* = DeclarationNode::method_of(this.methods[mi]);
+            if (method == null || method.func == null) { continue; }
+            const f: FunctionDecl* = DeclarationNode::fn_of(method.func);
+            for (mut g: i64 = f.written_params(); g < f.generic_params.length(); g++) {
+                const gp: GenericParamDecl* = DeclarationNode::generic_param_of(f.generic_params[g]);
+                if (gp != null && gp.sym_id.equals(param)) { return true; }
+            }
+        }
+        return false;
+    }
+
+    /// The parameter of the block's own that the head's target is, `T` in
+    /// `implement<T> trait From<T> for T`; invalid for a head whose target is
+    /// a type.
+    target_param(&this) -> SymbolID {
+        return match (this.res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::GenericParam(s) => { s }
+                    _                    => { SymbolID::invalid() }
+                }
+            }
+            _ => { SymbolID::invalid() }
+        };
     }
 
     /// The definition the head's target names, off its stamp; invalid for a

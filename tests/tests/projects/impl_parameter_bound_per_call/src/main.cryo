@@ -1,0 +1,87 @@
+/// `E` in `implement<T, E, F> trait Lift<Result<(), E>> for Outcome<T, F>`
+/// is written in the trait's arguments and not in the target, so no
+/// instantiation of `Outcome` binds it: each call does, from the argument it
+/// passes.  `High` converts from two error types, and each `E` runs its own
+/// copy of `lift`, whose `F::from` is that error's conversion - through the
+/// type's path, from a generic function, and through a bound on the trait.
+namespace ImplParameterBoundPerCall::Main;
+
+import std::ffi::libc::{ printf };
+import std::core::convert::{ From };
+
+type trait Lift<R> {
+    static lift(residual: R) -> This;
+}
+
+type enum Outcome<T, F> {
+    Good(T);
+    Bad(F);
+}
+
+implement<T, E, F> trait Lift<Result<(), E>> for enum Outcome<T, F> where F: From<E> {
+    static lift(residual: Result<(), E>) -> Outcome<T, F> {
+        match (residual) {
+            Result::Err(error) => { return Outcome::Bad(F::from(error)); }
+            Result::Ok(_) => { return Outcome::Bad(F::from(residual.unwrap_err())); }
+        }
+    }
+}
+
+type enum High {
+    FromLow(i32);
+    FromMiddle(i32);
+}
+
+type struct Low { code: i32; }
+type struct Middle { code: i32; }
+
+implement trait From<Low> for enum High {
+    static from(value: Low) -> High { return High::FromLow(value.code); }
+}
+
+implement trait From<Middle> for enum High {
+    static from(value: Middle) -> High { return High::FromMiddle(value.code); }
+}
+
+function code_of(outcome: Outcome<i32, High>) -> i32 {
+    match (outcome) {
+        Outcome::Good(_) => { return 0; }
+        Outcome::Bad(High::FromLow(code)) => { return code; }
+        Outcome::Bad(High::FromMiddle(code)) => { return code + 100; }
+    }
+}
+
+function lifted<E, F>(residual: Result<(), E>) -> Outcome<i32, F> where F: From<E> {
+    return Outcome::<i32, F>::lift(residual);
+}
+
+function bounded<R, O>(residual: R) -> O where O: Lift<R> {
+    return O::lift(residual);
+}
+
+function check(passed: i32, condition: boolean, what: string) -> i32 {
+    if (!condition) {
+        printf("FAILED: %s\n", what);
+        return passed;
+    }
+    return passed + 1;
+}
+
+function main() -> i32 {
+    mut passed: i32 = 0;
+    const low: Result<(), Low> = Result::Err(Low { code: 3 });
+    const middle: Result<(), Middle> = Result::Err(Middle { code: 4 });
+    passed = check(passed, code_of(Outcome::<i32, High>::lift(low)) == 3, "a Low through the type's path");
+    passed = check(passed, code_of(Outcome::<i32, High>::lift(middle)) == 104, "a Middle through the type's path");
+    passed = check(passed, code_of(lifted::<Low, High>(Result::Err(Low { code: 5 }))) == 5,
+        "a Low from a generic function");
+    passed = check(passed, code_of(lifted::<Middle, High>(Result::Err(Middle { code: 6 }))) == 106,
+        "a Middle from a generic function");
+    passed = check(passed, code_of(bounded::<Result<(), Middle>, Outcome<i32, High>>(Result::Err(Middle { code: 7 }))) == 107,
+        "a Middle through a bound on the trait");
+    passed = check(passed, code_of(bounded::<Result<(), Low>, Outcome<i32, High>>(Result::Err(Low { code: 8 }))) == 8,
+        "a Low through a bound on the trait");
+    printf("implementation parameters bound per call: %d of 6 checks passed\n", passed);
+    if (passed != 6) { return 1; }
+    return 0;
+}

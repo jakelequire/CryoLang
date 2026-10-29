@@ -2247,6 +2247,14 @@ The positional form scales to where-clause adapters, whose element flows from
 the source: `implement<I, A> trait Iterator<A> for struct TakeIter<I> where I:
 Iterator<A>` binds `Item := A := I::Item`.
 
+A parameter an implementation writes in its trait's arguments and not in its
+target is bound by each call when a method takes it in its parameters: in
+`implement<T, E, F> trait Lift<Result<(), E>> for enum Outcome<T, F> where F:
+From<E>`, `Outcome::<i32, High>::lift(r)` binds `E` from `r`, so a `High`
+converting from two error types runs a copy of `lift` for each.  A parameter
+no method takes in its parameters is the one the where-clause derives, as `A`
+is above.
+
 **Declaration-site bounds.** An associated type may carry a bound
 (`type Item: Copy;`). Every impl's concrete binding is checked against it - an
 impl whose `Item` does not satisfy the bound is rejected with `E0306`:

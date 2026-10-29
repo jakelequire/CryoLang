@@ -70,7 +70,7 @@ import compiler::types::compound::{
     ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
 };
 import compiler::types::generic::{ AssocProjectionType, InstantiatedType };
-import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry, TemplateKind };
+import compiler::types::generic_registry::{ GenericRegistry, HeadBinding, TemplateEntry, TemplateKind };
 import compiler::types::ownership::{ OwnershipQuery };
 import compiler::types::resolver::{ ResolutionContext, TypeResolver };
 import compiler::types::substitution::{ TypeSubstitution };
@@ -421,7 +421,7 @@ type struct TypeResolutionRunner {
             // declaration's are distinct types, so one map serves every method.
             const tm_decl: DeclarationNode* = decl.methods[slot];
             const tm: FunctionDecl* = DeclarationNode::fn_of(tm_decl);
-            if (tm.generic_params.length() == DeclarationNode::fn_of(m.func).generic_params.length()) {
+            if (tm.generic_params.length() == DeclarationNode::fn_of(m.func).written_params()) {
                 for (mut gi: i64 = 0; gi < tm.generic_params.length(); gi++) {
                     const tg_decl: DeclarationNode* = tm.generic_params[gi];
                     const tg: GenericParamDecl* = DeclarationNode::generic_param_of(tg_decl);
@@ -451,10 +451,10 @@ type struct TypeResolutionRunner {
                 fmt::format("`%s` %s in trait `%s`, but %s here", name, want, trait_name, have));
             return;
         }
-        if (tm.generic_params.length() != f.generic_params.length()) {
+        if (tm.generic_params.length() != f.written_params()) {
             this.report_conformance(f_decl.span,
                 fmt::format("`%s` has %lld type parameter(s) in trait `%s`, but %lld here",
-                    name, tm.generic_params.length(), trait_name, f.generic_params.length()));
+                    name, tm.generic_params.length(), trait_name, f.written_params()));
             return;
         }
 
@@ -1860,6 +1860,9 @@ type struct TypeResolutionPasses {
                 }
             }
         }
+        if (is_source_decl && node.is_trait_impl()) {
+            TypeResolutionPasses::lend_trait_argument_params(node);
+        }
         // The head's methods under the owner the index names, their returns
         // in the owner's parameters.
         mut head: TypeSubstitution = TypeResolutionPasses::impl_params_to_owner(node, ctx, arena);
@@ -2162,6 +2165,58 @@ type struct TypeResolutionPasses {
     /// Walk a trait_annotation to its leaf identifier: the bare trait name.
     /// Mirrors `specialization::extract_root_name` but is duplicated here
     /// to keep type_resolution.cryo self-contained.
+    /// Lend each method of `node` the parameters of the implementation its
+    /// trait's arguments write and its target does not
+    /// (`FunctionDecl.inherited_params`).  No instantiation of the target
+    /// binds such a parameter, and two uses may bind it to two types - `E` in
+    /// `FromResidual<Result<(), E>> for Result<T, F> where F: From<E>`, where
+    /// `F` converts from several errors - so a method whose parameters name
+    /// it is generic over it and each call binds it from its arguments.  A
+    /// method that names it only in its return cannot be bound by a call, and
+    /// keeps the binding the where-clause derives for the block
+    /// (`A` in `Iterator<A> for TakeN<I> where I: Iterator<A>`).  The
+    /// parameter keeps its one declaration, which every name in the block was
+    /// resolved to; it is appended after the method's own, once.
+    static lend_trait_argument_params(node: ImplBlock*) -> void {
+        const trait_generic: GenericAnnotation* = GenericRegistry::trait_generic_of(node.trait_annotation);
+        if (trait_generic == null) { return; }
+        for (mut pi: i64 = 0; pi < node.generic_params.length(); pi++) {
+            const param_decl: DeclarationNode* = node.generic_params[pi];
+            const param: GenericParamDecl* = DeclarationNode::generic_param_of(param_decl);
+            if (param == null || !param.sym_id.is_valid() || param.sym_id.equals(node.target_param())) { continue; }
+            if (TypeResolutionPasses::annotations_name(&node.target_args, param.sym_id)) { continue; }
+            if (!TypeResolutionPasses::annotations_name(&trait_generic.args, param.sym_id)) { continue; }
+            for (mut mi: i64 = 0; mi < node.methods.length(); mi++) {
+                const method: MethodDecl* = DeclarationNode::method_of(node.methods[mi]);
+                if (method == null || method.func == null) { continue; }
+                mut f: FunctionDecl* = DeclarationNode::fn_of(method.func);
+                if (f.is_synth_default) { continue; }
+                mut taken: [TypeAnnotation*] = [];
+                for (mut k: i64 = 0; k < f.parameters.length(); k++) {
+                    const p: VarDecl* = DeclarationNode::var_of(f.parameters[k]);
+                    if (p != null && !p.is_receiver()) { taken.push(p.type_annotation); }
+                }
+                if (!TypeResolutionPasses::annotations_name(&taken, param.sym_id)) { continue; }
+                mut lent: boolean = false;
+                for (mut g: i64 = 0; g < f.generic_params.length(); g++) {
+                    if (f.generic_params[g] == param_decl) { lent = true; }
+                }
+                if (lent) { continue; }
+                f.generic_params.push(param_decl);
+                f.inherited_params += 1;
+            }
+        }
+    }
+
+    /// Whether any of `annotations` names the parameter `param`.
+    static annotations_name(annotations: &[TypeAnnotation*], param: SymbolID) -> boolean {
+        const none: [HeadBinding] = [];
+        for (mut i: i64 = 0; i < annotations.length(); i++) {
+            if (GenericRegistry::head_occurs(param, annotations[i], &none)) { return true; }
+        }
+        return false;
+    }
+
     /// The stamp on the head's Named annotation, walking the same wrappers
     /// `extract_trait_leaf` walks; `Pending` when there is none.
     /// An impl head on a template writes every parameter of the template it
