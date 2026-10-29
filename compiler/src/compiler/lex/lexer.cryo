@@ -341,7 +341,7 @@ private:
 
         while (!this.at_end() && this.peek() != quote) {
             if (this.peek() == '\\' && !this.at_end()) {
-                this.refuse_bad_escape(true);
+                this.refuse_bad_escape();
                 this.advance(); // consume backslash
                 if (!this.at_end()) {
                     this.advance(); // consume escaped character
@@ -420,9 +420,17 @@ private:
 
             if (c == '\\') {
                 // A hole's own literals are lexed again with the hole and
-                // checked there.  The `{` of a `\u{` opens a hole here, so
-                // no `\u` is a code point's escape in an f-string.
-                if (depth == 0) { this.refuse_bad_escape(false); }
+                // checked there.  `\u{...}` is one escape: its braces open
+                // no hole, so it is consumed whole.
+                if (depth == 0) {
+                    this.refuse_bad_escape();
+                    if (this.peek_ahead(1) == 'u') {
+                        mut body: i64 = 0;
+                        Lexer::unicode_escape(this.current, 2, this.buffer_end as i64 - this.current as i64, &body);
+                        for (mut k: i64 = 0; k < 2 + body; k++) { this.advance(); }
+                        continue;
+                    }
+                }
                 this.advance(); // consume backslash
                 if (!this.at_end()) {
                     this.advance(); // consume escaped character
@@ -521,7 +529,7 @@ private:
 
         // Escape sequence
         if (this.peek() == '\\') {
-            if (this.refuse_bad_escape(true)) {
+            if (this.refuse_bad_escape()) {
                 // Already reported: consume through the closing quote on this
                 // line so the rest is not also refused as a second
                 // character.
@@ -1039,16 +1047,14 @@ private:
     /// escape pass, which keeps an unknown escape's two characters and keeps
     /// only the low byte of a large value.  A surrogate, U+D800 to U+DFFF,
     /// is no Unicode scalar value: no character holds one and UTF-8 has no
-    /// encoding of one.  `unicode_escapes` is false where `\u` spells no
-    /// code point.
-    refuse_bad_escape(&this, unicode_escapes: boolean) -> boolean {
+    /// encoding of one.
+    refuse_bad_escape(&this) -> boolean {
         const first: char = this.peek_ahead(1);
         mut width: i64 = 1;
         mut code: ErrorCode = ErrorCode::E0013_BAD_OCTAL_ESCAPE;
         mut message: string = "";
         mut help: string = "";
         if (first == 'u') {
-            if (!unicode_escapes) { return false; }
             mut body: i64 = 0;
             const available: i64 = this.buffer_end as i64 - this.current as i64;
             const value: i64 = Lexer::unicode_escape(this.current, 2, available, &body);

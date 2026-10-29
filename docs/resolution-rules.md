@@ -855,9 +855,8 @@ yet is recorded with the change that builds it, not here.
      one.  The lexer refuses it where it refuses a malformed octal escape,
      so the escape decoder only ever meets a scalar value, and the
      compiler encodes a string's `\u{...}` through `String.push_char`; its
-     own UTF-8 encoder is gone.  In an f-string the `{` after `\u` opens a
-     hole, so `\u` there spells no code point and is not checked.  (Jake;
-     the code and wording delegated)
+     own UTF-8 encoder is gone.  An f-string's `\u{...}` is refused the
+     same way (654).  (Jake; the code and wording delegated)
 
 649. **The parser runs on a thread with a large stack.**  The parser
      recurses once per level of nesting and refuses past its limit with
@@ -903,6 +902,14 @@ yet is recorded with the change that builds it, not here.
      answers the type wanted of it, and a `?` is one: under the type
      wanted of `(x?).field` it took that type as its own, and under the
      `T*` wanted of `&f()?` the pointer.  (Jake; the code delegated)
+
+654. **`\u{...}` in an f-string is one escape.**  The lexer and the
+     f-string's parse both pass over an escape as literal text and over
+     `\u{...}` whole, by the span the escape decoder reads, so its braces
+     open no hole: `f"\u{41}"` is `A`, where it was `\u` and a hole
+     holding `41`, and a name the hex digits spell (`\u{face}` beside a
+     local `face`) is not read.  A surrogate there is E0006 as in a string
+     literal.  (Jake)
 
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,

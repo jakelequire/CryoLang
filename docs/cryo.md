@@ -230,6 +230,9 @@ const s: String = f"x = {x}, opt = {opt:?}";   // "x = 42, opt = Some(7)"
   ```
 
   Only a `"` outside every `{...}` closes the f-string.
+- The text outside the holes takes the escapes a string literal takes.
+  `\u{H...}` is one escape there too, so its braces open no hole:
+  `f"\u{41}{n}"` is `A` followed by `n`.
 - A hole may carry a **format spec** after a colon:
 
   ```
