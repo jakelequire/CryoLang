@@ -1,0 +1,51 @@
+// E0358: inside a generic body, a method an implementation delivers under a
+// where-clause is a method of the receiver only where the body's bounds give
+// that clause, since every copy of the body binds the method the template
+// selects.  `Wrap<T>` has `dup` where `T: Dup`, and `Pair<E, F>` has `lift`
+// where `F: From<E>`: a body bounding `T: Dup`, or `F: From<E>` at those
+// arguments, calls them; one with no bound, or with `F: From` at another
+// argument, is refused at the call (it reached codegen unbound).
+![config(testing)]
+![config(negative, E0358)]
+namespace CryoTests::Negative::E0358MethodClauseNotGivenInGenericBody;
+
+import std::core::convert::{ From };
+
+type trait Dup { dup(&this) -> This; }
+
+type struct Wrap<T> { item: T; }
+
+implement trait Dup for i32 { dup(&this) -> i32 { return *this; } }
+
+implement<T> trait Dup for struct Wrap<T> where T: Dup {
+    dup(&this) -> Wrap<T> { return Wrap::<T> { item: this.item.dup() }; }
+}
+
+type trait Lift { lift(&this) -> i32; }
+
+type struct Pair<E, F> { first: E; second: F; }
+
+implement<E, F> trait Lift for struct Pair<E, F> where F: From<E> {
+    lift(&this) -> i32 { return 1; }
+}
+
+function cf_dup_bounded<T>(w: &Wrap<T>) -> Wrap<T> where T: Dup {
+    return w.dup();
+}
+
+function cf_dup_unbounded<T>(w: &Wrap<T>) -> Wrap<T> {
+    return w.dup(); //~ ERROR[E0358] the trait `Dup` is not implemented for `Wrap<T>`
+}
+
+function cf_lift_bounded<E, F>(p: &Pair<E, F>) -> i32 where F: From<E> {
+    return p.lift();
+}
+
+function cf_lift_other_argument<A, B, C>(p: &Pair<A, B>) -> i32 where B: From<C> {
+    return p.lift(); //~ ERROR[E0358] the trait `Lift` is not implemented for `Pair<A, B>`
+}
+
+function main() -> i32 {
+    const w: Wrap<i32> = Wrap::<i32> { item: 3 };
+    return cf_dup_bounded(&w).item + cf_dup_unbounded(&w).item;
+}

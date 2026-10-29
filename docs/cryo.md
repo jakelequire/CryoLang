@@ -2770,6 +2770,8 @@ A generic implementation with a where-clause implements the trait only for the i
 
 A bound in the clause that writes its trait with arguments holds only at those arguments: `implement<E, F> trait Lift for struct Pair<E, F> where F: From<E>` gives `Pair<Low, High>` a `lift` only where `High` implements `From<Low>`, and every type implementing `From` of itself does not make the clause hold for every pair. A parameter the implementation writes only in its trait's arguments takes the argument the trait is asked at: `implement<E, F> trait Convert<E> for struct Wrap<F> where F: From<E>` makes `Wrap<High>` a `Convert<Low>`, and a bound `W: Convert<Low>` passed a `Wrap<Plain>` is refused (E0306).
 
+Inside a generic body, a receiver whose type still names the body's parameters (`w: &Wrap<T>`) has such a method only where the body's own bounds give the clause, since every copy of the body calls the method the body selects: `w.dup()` under `implement<T> trait Dup for struct Wrap<T> where T: Dup` needs `where T: Dup` on the function, its implementation's, or its type's declaration, and is refused at the call without it (E0358, naming the bound to add). A clause whose trait takes arguments needs a bound at those arguments: `where F: From<G>` does not give `F: From<E>`.
+
 ### 12.3 Implement Blocks on Primitives
 
 Implement blocks may target primitive types, which is how the standard library hangs methods off `boolean`, the integer types, and `string`:

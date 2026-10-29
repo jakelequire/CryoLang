@@ -1007,6 +1007,24 @@ yet is recorded with the change that builds it, not here.
      still name an unbound parameter is left to the copy that binds it.
      (Jake)
 
+661. **A generic body states the bounds an implementation's where-clause
+     needs.**  A method call in a body the user wrote, on an
+     instantiation that still names the body's parameters, selects a
+     trait implementation's method only when the bounds in scope (the
+     function's, its implementation's, its type's declaration's) give
+     every bound of that implementation's where-clause, read in the
+     head's view of the instantiation: a parameter by a bound naming the
+     trait at the same arguments (a bound written without arguments gives
+     any), a type naming no parameter by an implementation, and an
+     instantiation naming one by an implementation whose own clause the
+     bounds give.  Otherwise the call is E0358 naming the bound to add;
+     every copy of the body binds the method the body selects, so one the
+     clause refutes reached codegen unbound (E0900).  An implementation's
+     copy of a trait default and a body the compiler made are checked
+     where they are written.  Measured before the change: no body in the
+     standard library, the compiler, the tests or the examples relied on
+     the gap.  (Jake)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that
