@@ -1969,14 +1969,25 @@ type struct MoveChecker {
         this.fatal += 1;
     }
 
+    /// E0453 for a field moved out of a value that drops it again, worded by
+    /// why the move is refused: the value's type implements `Drop`; the
+    /// field is moved on only some paths, so the owner cannot tell at scope
+    /// exit whether to drop it; or the value is of a shape whose fields are
+    /// not tracked one by one.
     emit_move_out_error(mut &this, e: ExpressionNode*, ma: MemberAccessExpr*) -> void {
         const field: string = this.intern.resolve(ma.member);
-        const headline: string = fmt::format(
-            "cannot move field '%s' out of a value that owns a destructor", field);
-        mut diag: Diagnostic = Diagnostic::error(
-            ErrorCode::E0453_DOUBLE_FREE, headline);
-        diag = diag.at_with_label(e.span,
-            "moving this field out leaves the source to drop it again at scope exit (double free)");
+        mut headline: string = fmt::format("cannot move field '%s' out of a value that drops it at scope exit", field);
+        mut label: string = "moving this field out leaves the source to drop it again at scope exit (double free)";
+        if (this.has_user_drop(ma.object.resolved_type)) {
+            headline = fmt::format("cannot move field '%s' out of a value that owns a destructor", field);
+        } else if (this.branch_depth != 0 && this.partial_move_shape(ma)) {
+            const owner: string = this.intern.resolve(ExpressionNode::identifier_of(ma.object).name);
+            headline = fmt::format("cannot move field '%s' out of `%s` on only some paths", field, owner);
+            label = fmt::format("moved only when this runs, so `%s` cannot tell at scope exit whether to drop `%s` (double free)",
+                owner, field);
+        }
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE, headline);
+        diag = diag.at_with_label(e.span, label);
         diag = diag.help(
             "swap the field out with `core::mem::swap`, leaving a valid value to be dropped in place; or use a `Copy` field type");
         this.ctx.emit_diagnostic(diag);

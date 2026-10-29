@@ -1025,6 +1025,14 @@ yet is recorded with the change that builds it, not here.
      standard library, the compiler, the tests or the examples relied on
      the gap.  (Jake)
 
+662. **No `ffi::cstr`; a chunked request is 501.**  The standard library
+     has no `CStr`/`CString`/`NulError`: a C string is a `string`, read
+     with `Str::new` and made with `String::with_null` / `as_cstr`, and
+     the specification no longer promises the module.  The HTTP/1 server
+     answers a first request framed by `Transfer-Encoding`, which it reads
+     but does not implement, with 501 Not Implemented; any other first
+     request it cannot read stays 400.  (Jake)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

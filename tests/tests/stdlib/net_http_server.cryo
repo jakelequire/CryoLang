@@ -246,6 +246,54 @@ function server_answers_a_truncated_request_with_400() -> Result<(), TestError> 
     return expect_eq(r, 400 as i64);
 }
 
+/// A whole request whose body is framed by `Transfer-Encoding: chunked`,
+/// which the server reads but does not implement: it answers 501, not 400.
+async function hs_chunked_client(port: u16) -> i64 {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -20; }
+    };
+    mut c: BufStream<TcpStream> = BufStream::<TcpStream>::of(sock);
+    const request: Slice<u8> =
+        Str::new("POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n").as_bytes();
+    match (c.pending().try_append(request)) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -21; }
+    }
+    match (await c.flush()) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -22; }
+    }
+    mut resp: Response = match (await c.read_response()) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -23; }
+    };
+    return resp.status.as_u16() as i64;
+}
+
+async function hs_chunked(listener: TcpListener, port: u16) -> i64 {
+    mut s: HttpServer = HttpServer::new(SocketAddr::localhost_v4(port), hs_echo_path);
+    const sel: Selected<Result<(), IoError>, i64> =
+        await Futures::select(s.run_on(listener), hs_chunked_client(port));
+    return match (sel) {
+        Selected::First(_)  => { -1 }
+        Selected::Second(v) => { v }
+    };
+}
+
+![test]
+function server_answers_a_chunked_request_with_501() -> Result<(), TestError> {
+    mut l: TcpListener = match (hs_bind()) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
+    };
+    const port: u16 = hs_port(&l);
+    if (port == 0) { return bail(Str::new("local_addr failed")); }
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(hs_chunked(l, port));
+    return expect_eq(r, 501 as i64);
+}
+
 /// Connect, then say NOTHING. The server's read cap is what has to end this;
 /// the client only reports how long the server took to hang up. A server that
 /// closed immediately (no cap applied, or the connection dropped for an

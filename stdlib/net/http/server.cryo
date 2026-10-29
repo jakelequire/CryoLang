@@ -214,8 +214,9 @@ public type struct HttpServer {
 
     /// Serve requests on `conn` until the client (or this server) signals
     /// close, a read exceeds the cap, or `MAX_REQUESTS_PER_CONNECTION` is
-    /// reached.  A parse failure on the FIRST request writes a canned 400;
-    /// failures on follow-up requests are taken as "peer gave up" and close
+    /// reached.  A FIRST request that cannot be read is answered 400, or 501
+    /// when it is one the server does not implement (`Unsupported`, a
+    /// chunked body); failures on follow-up requests are taken as "peer gave up" and close
     /// silently.  Write failures (peer gone) end the connection.  The accept
     /// loop always continues.
     ///
@@ -283,14 +284,17 @@ public type struct HttpServer {
                     }
                     if (!keep_alive) { return; }
                 }
-                Result::Err(_) => {
-                    // Only a malformed FIRST request is worth answering; a
-                    // failure later reads as the peer having given up.
+                Result::Err(refused) => {
+                    // Only a refused FIRST request is worth answering; a
+                    // failure later reads as the peer having given up.  A
+                    // request this server reads but does not implement (a
+                    // chunked body) is 501, any other 400.
                     if (served == 1) {
-                        mut bad: Response = Response::text(
-                            StatusCode::bad_request(),
-                            Str::new("Bad Request")
-                        );
+                        const status: StatusCode = match (refused.kind) {
+                            IoErrorKind::Unsupported => { StatusCode::not_implemented() }
+                            _                        => { StatusCode::bad_request() }
+                        };
+                        mut bad: Response = Response::text(status, status.reason_phrase());
                         match (bad.encode_into(c.pending())) {
                             Result::Ok(_)  => { }
                             Result::Err(_) => { return; }
