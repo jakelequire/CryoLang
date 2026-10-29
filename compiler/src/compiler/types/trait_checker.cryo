@@ -234,12 +234,12 @@ type struct TraitChecker {
             const block: ImplBlock* = DeclarationNode::impl_of(heads[i]);
             if (block == null) { continue; }
             const binds: boolean = if (block.target_param().is_valid()) {
-                this.generic_registry.blanket_binds(block, args, value, this.intern_table)
+                this.generic_registry.blanket_binds(block, trait_def, args, value, this.intern_table)
             } else {
-                this.generic_registry.binds_trait_arguments(block, args, this.intern_table)
+                this.generic_registry.binds_trait_arguments(block, trait_def, args, this.intern_table)
             };
             if (!binds) { continue; }
-            if (this.impl_applies(block, value, depth)) { return heads[i]; }
+            if (this.impl_applies_at(block, trait_def, args, value, depth)) { return heads[i]; }
         }
         return null;
     }
@@ -432,65 +432,120 @@ type struct TraitChecker {
     /// its where-clause holds for the subject.
     impl_applies(&this, head: ImplBlock*, subject: TypeRef, depth: i32) -> boolean {
         if (head == null) { return false; }
-        if (head.spec_owner.is_valid()) { return true; }
-        return this.impl_bounds_hold(head, subject, depth);
+        const no_trait_args: [TypeRef] = [];
+        return this.impl_applies_at(head, head.trait_def, &no_trait_args, subject, depth);
     }
 
-    /// Whether `impl_block`'s where-clause holds for `subject`: the head's
-    /// written target parameters bound to the subject's arguments, each bound
-    /// checked recursively.  A head with no where-clause holds outright.  A
-    /// subject that carries no arguments cannot bind the head's parameters,
-    /// so a bounded head is refused for it rather than assumed.
-    impl_bounds_hold(&this, impl_block: ImplBlock*, subject: TypeRef, depth: i32) -> boolean {
+    /// `impl_applies` for a head of `trait_def` asked at the trait arguments
+    /// `trait_args`, which also bind the head's parameters written in them.
+    impl_applies_at(&this, head: ImplBlock*, trait_def: DefId, trait_args: &[TypeRef], subject: TypeRef,
+                    depth: i32) -> boolean {
+        if (head == null) { return false; }
+        if (head.spec_owner.is_valid()) { return true; }
+        return this.impl_bounds_hold(head, trait_def, trait_args, subject, depth);
+    }
+
+    /// Whether `impl_block`'s where-clause holds for `subject` at the trait
+    /// arguments `trait_args`: the head's parameters bound to the subject's
+    /// arguments and to the parts of `trait_args` the head writes them in
+    /// (`E` in `implement<E, F> trait Conv<E> for Wrap<F> where F:
+    /// From<E>`, asked at `Conv<Low>`, is `Low`), each bound checked
+    /// recursively.  A head with no where-clause holds outright.  A bound on
+    /// a parameter nothing binds has no concrete value to check, so a
+    /// bounded head is refused for it rather than assumed.
+    impl_bounds_hold(&this, impl_block: ImplBlock*, trait_def: DefId, trait_args: &[TypeRef], subject: TypeRef,
+                     depth: i32) -> boolean {
         if (impl_block == null) { return false; }
         if (impl_block.where_bounds.length() == 0) { return true; }
+        mut bindings: TypeSubstitution = TypeSubstitution::empty();
         // A head for every type: its parameter is the subject itself.
         const target: SymbolID = impl_block.target_param();
         if (target.is_valid()) {
-            mut blanket: TypeSubstitution = TypeSubstitution::empty();
             for (mut gi: i64 = 0; gi < impl_block.generic_params.length(); gi++) {
                 const gp: GenericParamDecl* = DeclarationNode::generic_param_of(impl_block.generic_params[gi]);
                 if (gp != null && gp.sym_id.equals(target)) {
-                    blanket.add(this.arena.create_generic_param(gp.sym_id, gp.name, gi as u64), subject);
+                    bindings.add(this.arena.create_generic_param(gp.sym_id, gp.name, gi as u64), subject);
                 }
             }
-            return this.bounds_satisfied_at_depth(impl_block.where_bounds, &blanket, depth + 1);
         }
-        // Build a fresh substitution from the impl's generic params to
-        // the concrete type's args. For `implement<T> trait Eq for Option<T>`
-        // and `ty = Option<X>`, the impl's `T` maps to the InstantiatedType's
-        // `type_args[0]`.
-        const subj_nargs: i64 = this.arena.inst_type_arg_count(subject);
-        if (subj_nargs == 0) {
-            // No outer args to substitute through: a bound on an impl
-            // parameter has no concrete value to check, so the impl is
-            // refused rather than assumed; a bound written on a type names
-            // no parameter, and is checked as written.
+        // The impl's TARGET arguments - the names the type itself is
+        // parameterized by (`I` in `for TakeIter<I>`) - bound to the
+        // instantiation's.  A where-clause can introduce parameters the type
+        // does not carry (`A` in `implement<I, A> Iterator<A> for
+        // TakeIter<I> where I: Iterator<A>`), so the head is matched by its
+        // target arguments, never by its whole parameter list.
+        const subject_arg_count: i64 = this.arena.inst_type_arg_count(subject);
+        if (!target.is_valid() && subject_arg_count > 0) {
+            if (impl_block.target_args.length() != subject_arg_count) { return false; }
+            mut args: [TypeRef] = [];
+            for (mut gi: i64 = 0; gi < subject_arg_count; gi++) {
+                args.push(this.arena.inst_type_arg_at(subject, gi));
+            }
+            this.add_head_param_bindings(impl_block, &args, &bindings);
+        }
+        this.add_trait_argument_bindings(impl_block, trait_def, trait_args, &bindings);
+        if (!target.is_valid() && subject_arg_count == 0 && bindings.replacements.length() == 0) {
+            // A bound written on a type names no parameter, and is checked
+            // as written.
             for (mut bi: i64 = 0; bi < impl_block.where_bounds.length(); bi++) {
                 if (!impl_block.where_bounds[bi].subject_type.is_valid()) { return false; }
             }
             return this.bounds_satisfied_at_depth(impl_block.where_bounds, null, depth + 1);
         }
-        // Map the impl's TARGET type args - the names the struct itself is
-        // parameterized by (`I` in `for TakeIter<I>`) - to the concrete
-        // instantiation's args.  This is NOT the same as the impl's full
-        // generic-param list: a where-clause can introduce extra generics the
-        // struct doesn't carry (`A` in `implement<I, A> Iterator<A> for
-        // TakeIter<I> where I: Iterator<A>`), so keying off `generic_params`
-        // and requiring it to equal `type_args.length()` wrongly rejected every
-        // such impl (e.g. the nested `TakeIter<TakeIter<Range<i32>>>` while
-        // chaining).  The where-bound check below only needs the target params
-        // bound; it looks up bound subjects by name.
-        if (impl_block.target_args.length() != subj_nargs) {
-            return false;
+        return this.bounds_satisfied_at_depth(impl_block.where_bounds, &bindings, depth + 1);
+    }
+
+    /// Bind the parameters `impl_block`'s head writes in the arguments of
+    /// its trait, `trait_def`, to the parts of `trait_args` in their places:
+    /// `E` in `FromResidual<Result<(), E>>`, asked at `Result<(), IoError>`,
+    /// to `IoError`.  A parameter already bound keeps its binding.
+    add_trait_argument_bindings(&this, impl_block: ImplBlock*, trait_def: DefId, trait_args: &[TypeRef],
+                                subst: TypeSubstitution*) -> void {
+        if (trait_args.length() == 0 || this.generic_registry == null) { return; }
+        const decl: TraitDecl* = this.generic_registry.get_trait_decl(trait_def);
+        if (decl == null) { return; }
+        for (mut i: i64 = 0; i < trait_args.length(); i++) {
+            this.add_annotation_param_bindings(impl_block, impl_block.trait_slot_annotation(decl, i),
+                trait_args[i], subst);
         }
-        mut args: [TypeRef] = [];
-        for (mut gi: i64 = 0; gi < subj_nargs; gi++) {
-            args.push(this.arena.inst_type_arg_at(subject, gi));
+    }
+
+    /// Bind each parameter of `impl_block` that `ann` writes to the part of
+    /// `arg` in its place, unless it is bound already.
+    add_annotation_param_bindings(&this, impl_block: ImplBlock*, ann: TypeAnnotation*, arg: TypeRef,
+                                  subst: TypeSubstitution*) -> void {
+        if (ann == null || !arg.is_valid()) { return; }
+        const arg_t: Type* = this.arena.lookup(arg);
+        if (arg_t == null) { return; }
+        match (*ann) {
+            TypeAnnotation::Named(n) => {
+                const sym: SymbolID = n.param_sym();
+                if (!sym.is_valid() || this.lookup_subst_for_param(sym, subst).is_valid()) { return; }
+                for (mut gi: i64 = 0; gi < impl_block.generic_params.length(); gi++) {
+                    const gp: GenericParamDecl* = DeclarationNode::generic_param_of(impl_block.generic_params[gi]);
+                    if (gp == null || !gp.sym_id.equals(sym)) { continue; }
+                    subst.add(this.arena.create_generic_param(gp.sym_id, gp.name, gi as u64), arg);
+                    return;
+                }
+            }
+            TypeAnnotation::Generic(g) => {
+                const count: i64 = this.arena.inst_type_arg_count(arg);
+                for (mut j: i64 = 0; j < g.args.length() && j < count; j++) {
+                    this.add_annotation_param_bindings(impl_block, g.args[j], this.arena.inst_type_arg_at(arg, j), subst);
+                }
+            }
+            TypeAnnotation::Pointer(p) => {
+                if (arg_t.kind == TypeKind::Pointer) {
+                    this.add_annotation_param_bindings(impl_block, p.inner, arg_t.as_pointer().pointee, subst);
+                }
+            }
+            TypeAnnotation::Reference(r) => {
+                if (arg_t.kind == TypeKind::Reference) {
+                    this.add_annotation_param_bindings(impl_block, r.inner, arg_t.as_reference().referent, subst);
+                }
+            }
+            _ => {}
         }
-        mut nested: TypeSubstitution = TypeSubstitution::empty();
-        this.add_head_param_bindings(impl_block, &args, &nested);
-        return this.bounds_satisfied_at_depth(impl_block.where_bounds, &nested, depth + 1);
     }
 
     /// Bind the parameters an implement block's head writes to an
@@ -605,13 +660,7 @@ type struct TraitChecker {
                 // for a concrete H later.
                 continue;
             }
-            for (mut ri: i64 = 0; ri < bound.trait_refs.length(); ri++) {
-                const tref: TraitRef* = &bound.trait_refs[ri];
-                if (tref.path.length() == 0) { continue; }
-                if (!this.type_implements_trait(concrete, tref.definition(), 0)) {
-                    return false;
-                }
-            }
+            if (this.unmet_parameter_trait(bound, concrete, subst, 0) != null) { return false; }
         }
         return true;
     }
@@ -641,13 +690,10 @@ type struct TraitChecker {
             const concrete: TypeRef = this.lookup_subst_for_param(bound.subject_param(), subst);
             if (!concrete.is_valid()) { continue; }
             if (this.arena.contains_generic_param(concrete)) { continue; }
-            for (mut ri: i64 = 0; ri < bound.trait_refs.length(); ri++) {
-                const tref: TraitRef* = &bound.trait_refs[ri];
-                // A bound refused where it is written is reported there.
-                if (tref.path.length() == 0 || tref.refused) { continue; }
-                if (this.type_implements_trait(concrete, tref.definition(), 0)) { continue; }
+            const unmet: TraitRef* = this.unmet_parameter_trait(bound, concrete, subst, 0);
+            if (unmet != null) {
                 *out_concrete = concrete;
-                return tref;
+                return unmet;
             }
         }
         return null;
@@ -673,13 +719,7 @@ type struct TraitChecker {
             if (bound.has_projection_subject()) { continue; }
             const concrete: TypeRef = this.lookup_subst_for_param(bound.subject_param(), subst);
             if (!concrete.is_valid()) { return false; }
-            for (mut ri: i64 = 0; ri < bound.trait_refs.length(); ri++) {
-                const tref: TraitRef* = &bound.trait_refs[ri];
-                if (tref.path.length() == 0) { continue; }
-                if (!this.type_implements_trait(concrete, tref.definition(), depth)) {
-                    return false;
-                }
-            }
+            if (this.unmet_parameter_trait(bound, concrete, subst, depth) != null) { return false; }
         }
         return true;
     }

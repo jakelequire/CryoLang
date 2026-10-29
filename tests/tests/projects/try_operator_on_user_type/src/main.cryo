@@ -1,0 +1,182 @@
+/// `?` applies to any type that implements `Try`, in a function whose
+/// return type implements `FromResidual` of the operand's `Residual`.
+/// `Checked<T>` is a program's own `Try`, propagating into itself at the
+/// same and at another output type, in a plain and in a generic function.
+/// `Reading` breaks with a `Result<(), LowError>`, so a `?` on it returns
+/// early from a function returning a `Result`, its error converted through
+/// `From` as a `Result`'s own `?` converts it.  An implementation's
+/// where-clause is read at the trait's arguments: `Pair<LowError,
+/// HighError>` is `Lift` because `HighError: From<LowError>`, and
+/// `Wrap<HighError>` is `Convert<LowError>` for the same reason.
+namespace TryOperatorOnUserType::Main;
+
+import std::ffi::libc::{ printf };
+import std::core::convert::{ From };
+import std::core::ops::{ ControlFlow, FromResidual, Try };
+
+type enum Checked<T> {
+    Fine(T);
+    Failed(i32);
+}
+
+implement<T> trait Try for enum Checked<T> {
+    type Output = T;
+    type Residual = Checked<()>;
+
+    static from_output(output: T) -> Checked<T> { return Checked::Fine(output); }
+
+    branch(this) -> ControlFlow<Checked<()>, T> {
+        match (this) {
+            Checked::Fine(v) => { return ControlFlow::Continue(v); }
+            Checked::Failed(code) => { return ControlFlow::Break(Checked::Failed(code)); }
+        }
+    }
+}
+
+implement<T> trait FromResidual<Checked<()>> for enum Checked<T> {
+    static from_residual(residual: Checked<()>) -> Checked<T> {
+        match (residual) {
+            Checked::Failed(code) => { return Checked::Failed(code); }
+            Checked::Fine(_) => { return Checked::Failed(0); }
+        }
+    }
+}
+
+type struct LowError { code: i32; }
+
+type enum HighError {
+    FromLow(i32);
+    Own(i32);
+}
+
+implement trait From<LowError> for enum HighError {
+    static from(value: LowError) -> HighError { return HighError::FromLow(value.code); }
+}
+
+type struct Reading {
+    value: i32;
+    fault: i32;
+}
+
+implement trait Try for struct Reading {
+    type Output = i32;
+    type Residual = Result<(), LowError>;
+
+    static from_output(output: i32) -> Reading { return Reading { value: output, fault: 0 }; }
+
+    branch(this) -> ControlFlow<Result<(), LowError>, i32> {
+        if (this.fault != 0) { return ControlFlow::Break(Result::Err(LowError { code: this.fault })); }
+        return ControlFlow::Continue(this.value);
+    }
+}
+
+type trait Lift {
+    lift(&this) -> i32;
+}
+
+type struct Pair<E, F> {
+    first: E;
+    second: F;
+}
+
+implement<E, F> trait Lift for struct Pair<E, F> where F: From<E> {
+    lift(&this) -> i32 { return 1; }
+}
+
+type trait Convert<E> {
+    convert(&this) -> i32;
+}
+
+type struct Wrap<F> { inner: F; }
+
+implement<E, F> trait Convert<E> for struct Wrap<F> where F: From<E> {
+    convert(&this) -> i32 { return 2; }
+}
+
+function half(v: i32) -> Checked<i32> {
+    if (v % 2 != 0) { return Checked::Failed(v); }
+    return Checked::Fine(v / 2);
+}
+
+function quarter(v: i32) -> Checked<i32> {
+    const h: i32 = half(v)?;
+    return Checked::Fine(half(h)?);
+}
+
+function widened(v: i32) -> Checked<i64> {
+    return Checked::Fine(half(v)? as i64);
+}
+
+function passed_on<T>(c: Checked<T>) -> Checked<T> {
+    return Checked::Fine(c?);
+}
+
+function code_of(c: Checked<i32>) -> i32 {
+    match (c) {
+        Checked::Fine(v) => { return v; }
+        Checked::Failed(code) => { return 1000 + code; }
+    }
+}
+
+function read_high(r: Reading) -> Result<i32, HighError> {
+    return Result::Ok(r? + 1);
+}
+
+function read_low(r: Reading) -> Result<i32, LowError> {
+    return Result::Ok(r? + 2);
+}
+
+function high_code(result: Result<i32, HighError>) -> i32 {
+    match (result) {
+        Result::Ok(v) => { return v; }
+        Result::Err(HighError::FromLow(c)) => { return 100 + c; }
+        Result::Err(HighError::Own(c)) => { return 200 + c; }
+    }
+}
+
+function lifted<W>(w: &W) -> i32 where W: Lift {
+    return w.lift();
+}
+
+function converted<W>(w: &W) -> i32 where W: Convert<LowError> {
+    return w.convert();
+}
+
+function check(passed: i32, condition: boolean, what: string) -> i32 {
+    if (!condition) {
+        printf("FAILED: %s\n", what);
+        return passed;
+    }
+    return passed + 1;
+}
+
+function main() -> i32 {
+    mut passed: i32 = 0;
+    passed = check(passed, code_of(quarter(8)) == 2, "a user Try goes on twice");
+    passed = check(passed, code_of(quarter(6)) == 1003, "a user Try stops at the second ?");
+    passed = check(passed, code_of(quarter(5)) == 1005, "a user Try stops at the first ?");
+    const wide: i64 = match (widened(10)) {
+        Checked::Fine(v) => { v }
+        Checked::Failed(_) => { -1 }
+    };
+    passed = check(passed, wide == 5, "a user Try propagates into another output type");
+    passed = check(passed, code_of(passed_on::<i32>(half(4))) == 2, "a user Try in a generic function goes on");
+    passed = check(passed, code_of(passed_on::<i32>(Checked::Failed(9))) == 1009, "a user Try in a generic function stops");
+    passed = check(passed, high_code(read_high(Reading { value: 4, fault: 0 })) == 5, "a user Try goes on into a Result");
+    passed = check(passed, high_code(read_high(Reading { value: 4, fault: 7 })) == 107,
+        "a user Try's Result residual converts its error");
+    const low_code: i32 = match (read_low(Reading { value: 4, fault: 3 })) {
+        Result::Ok(v) => { v }
+        Result::Err(e) => { 300 + e.code }
+    };
+    passed = check(passed, low_code == 303, "a user Try's Result residual keeps the same error");
+    const pair: Pair<LowError, HighError> = Pair::<LowError, HighError> {
+        first: LowError { code: 1 }, second: HighError::Own(2)
+    };
+    passed = check(passed, lifted(&pair) == 1, "a where-clause holds at the head's arguments");
+    const wrap: Wrap<HighError> = Wrap::<HighError> { inner: HighError::Own(3) };
+    passed = check(passed, converted(&wrap) == 2, "a where-clause holds at the trait's arguments");
+    printf("try on a user type: %d of 11 checks passed\n", passed);
+    if (passed != 11) { return 1; }
+    return 0;
+}

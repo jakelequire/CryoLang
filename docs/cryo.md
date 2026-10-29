@@ -1138,7 +1138,7 @@ const out: int = data |> parse |> validate(strict);   // validate(parse(data), s
 const port: u16 = config_port() ?? env_port() ?? 8080;
 ```
 
-**Error propagation (`?`).** A postfix `?` on a `Result<T, E>` evaluates to `T` when the value is `Ok`, and otherwise returns the error from the enclosing function; on an `Option<T>` it yields `T` for `Some` and returns `None`. The enclosing function's return type must be a matching `Result` / `Option`. When the function returns `Result<U, F>` and `F` is not `E`, the error is converted through `From`: the function returns `Err(F::from(e))`, and `?` is refused (`E0214`) when no `From<E>` for `F` exists - in a generic function, when no `where F: From<E>` bound gives it.
+**Error propagation (`?`).** A postfix `?` on a `Result<T, E>` evaluates to `T` when the value is `Ok`, and otherwise returns the error from the enclosing function; on an `Option<T>` it yields `T` for `Some` and returns `None`. It applies to any value whose type implements `std::core::ops::Try` (`E0234` otherwise), in a function whose return type implements `FromResidual` of the operand's `Residual` (`E0235` otherwise): a `Result` or an `Option` returns into a matching `Result` / `Option`, and a program's own `Try` type into whatever return type it implements `FromResidual` for. That implementation's where-clause is read at the residual, and a `?` it does not hold for is refused (`E0306`). When the function returns `Result<U, F>` and `F` is not `E`, the error is converted through `From`: the function returns `Err(F::from(e))`, and `?` is refused (`E0214`) when no `From<E>` for `F` exists - in a generic function, when no `where F: From<E>` bound gives it.
 
 `x?` is `match (x.branch()) { ControlFlow::Continue(v) => { v } ControlFlow::Break(r) => { return R::from_residual(r); } }`, `R` the enclosing function's return type, through the standard library's `std::core::ops` traits: `Try`, whose `branch` splits a value into the `ControlFlow` it goes on with (`Continue`, its `Output`) or stops with (`Break`, its `Residual`), and `FromResidual<R>`, whose `from_residual` builds the function's return value from a residual. A `Result<T, E>`'s residual is the `Result<(), E>` holding its error, and `Result<U, F>` is built from it for any `E` that `F` has a `From` of - `F` from itself through the blanket `From<T> for T`, unchanged. An `Option<T>`'s residual is `Option<()>`.
 
@@ -2767,6 +2767,8 @@ implement trait Eq for i32 {
 ```
 
 A generic implementation with a where-clause implements the trait only for the instantiations whose arguments satisfy it: `implement<T> trait Clone for struct Array<T> where T: Clone` gives `[i32]` a `clone`, and gives none to `[Ref]` when `Ref` does not implement `Clone`. A call of such a method on an instantiation the clause refutes is refused where it is written (E0358, naming the trait and noting the where-clause).
+
+A bound in the clause that writes its trait with arguments holds only at those arguments: `implement<E, F> trait Lift for struct Pair<E, F> where F: From<E>` gives `Pair<Low, High>` a `lift` only where `High` implements `From<Low>`, and every type implementing `From` of itself does not make the clause hold for every pair. A parameter the implementation writes only in its trait's arguments takes the argument the trait is asked at: `implement<E, F> trait Convert<E> for struct Wrap<F> where F: From<E>` makes `Wrap<High>` a `Convert<Low>`, and a bound `W: Convert<Low>` passed a `Wrap<Plain>` is refused (E0306).
 
 ### 12.3 Implement Blocks on Primitives
 

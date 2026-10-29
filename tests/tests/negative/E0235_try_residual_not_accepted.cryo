@@ -1,0 +1,46 @@
+// E0235: a `?` on a type that implements `Try`, in a function whose return
+// type implements no `FromResidual` of what it propagates: `Checked<i32>`
+// returns early with a `Checked<()>`, and a `Result` is built only from a
+// `Result<(), E>`.
+![config(testing)]
+![config(negative, E0235)]
+namespace CryoTests::Negative::E0235TryResidualNotAccepted;
+
+import std::core::ops::{ ControlFlow, FromResidual, Try };
+import std::core::result::{ Result };
+
+type enum Checked<T> {
+    Fine(T);
+    Failed(i32);
+}
+
+implement<T> trait Try for enum Checked<T> {
+    type Output = T;
+    type Residual = Checked<()>;
+
+    static from_output(output: T) -> Checked<T> { return Checked::Fine(output); }
+
+    branch(this) -> ControlFlow<Checked<()>, T> {
+        match (this) {
+            Checked::Fine(v) => { return ControlFlow::Continue(v); }
+            Checked::Failed(code) => { return ControlFlow::Break(Checked::Failed(code)); }
+        }
+    }
+}
+
+function cf_half(v: i32) -> Checked<i32> {
+    if (v % 2 != 0) { return Checked::Failed(v); }
+    return Checked::Fine(v / 2);
+}
+
+function cf_outer(v: i32) -> Result<i32, i32> {
+    return Result::Ok(cf_half(v)? + 1);
+    //~^ ERROR[E0235] the `?` operator can only be used in a function whose return type implements `FromResidual<
+}
+
+function main() -> int {
+    match (cf_outer(4)) {
+        Result::Ok(v) => { return v; }
+        Result::Err(e) => { return 100 + e; }
+    }
+}

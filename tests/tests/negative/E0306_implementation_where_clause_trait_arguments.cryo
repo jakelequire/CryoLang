@@ -1,0 +1,56 @@
+// E0306: an implementation's where-clause on a parameter is read at the
+// arguments its trait takes, not as "implements the trait at all".  Every
+// type implements `From` of itself, so `where F: From<E>` holds only where an
+// implementation converts an `E`: `Pair<Low, Plain>` is no `Lift`, and
+// `Wrap<Plain>` is no `Convert<Low>` - there `E` is bound by the trait's
+// argument the bound asks for.
+![config(testing)]
+![config(negative, E0306)]
+namespace CryoTests::Negative::E0306ImplementationWhereClauseTraitArguments;
+
+import std::core::convert::{ From };
+
+type struct Low { v: i32; }
+type struct High { v: i32; }
+type struct Plain { v: i32; }
+
+implement trait From<Low> for struct High {
+    static from(l: Low) -> High { return High { v: l.v + 100 }; }
+}
+
+type trait Lift {
+    lift(&this) -> i32;
+}
+
+type struct Pair<E, F> { first: E; second: F; }
+
+implement<E, F> trait Lift for struct Pair<E, F> where F: From<E> {
+    lift(&this) -> i32 { return 1; }
+}
+
+type trait Convert<E> {
+    convert(&this) -> i32;
+}
+
+type struct Wrap<F> { inner: F; }
+
+implement<E, F> trait Convert<E> for struct Wrap<F> where F: From<E> {
+    convert(&this) -> i32 { return 2; }
+}
+
+function cf_lifted<W>(w: &W) -> i32 where W: Lift {
+    return w.lift();
+}
+
+function cf_converted<W>(w: &W) -> i32 where W: Convert<Low> {
+    return w.convert();
+}
+
+function main() -> int {
+    const good: Pair<Low, High> = Pair::<Low, High> { first: Low { v: 1 }, second: High { v: 2 } };
+    const bad: Pair<Low, Plain> = Pair::<Low, Plain> { first: Low { v: 1 }, second: Plain { v: 2 } };
+    const wrapped: Wrap<Plain> = Wrap::<Plain> { inner: Plain { v: 3 } };
+    return cf_lifted(&good)
+        + cf_lifted(&bad) //~ ERROR[E0306] the trait bound `CryoTests::Negative::E0306ImplementationWhereClauseTraitArguments::Pair<CryoTests::Negative::E0306ImplementationWhereClauseTraitArguments::Low, CryoTests::Negative::E0306ImplementationWhereClauseTraitArguments::Plain>: Lift` is not satisfied
+        + cf_converted(&wrapped); //~ ERROR[E0306] the trait bound
+}

@@ -3006,7 +3006,7 @@ type struct SemaVisitor {
         const node: ImplBlock* = this.state.symbolic_impl_node;
         if (node == null || !node.trait_def.equals(object.trait_def)) { return false; }
         if (!value.equals(this.state.this_type)) { return false; }
-        return this.ctx.generic_registry.binds_trait_arguments(node, &object.args, this.intern);
+        return this.ctx.generic_registry.binds_trait_arguments(node, object.trait_def, &object.args, this.intern);
     }
 
     /// The implementation for `value` of each trait the table of an object
@@ -3099,7 +3099,7 @@ type struct SemaVisitor {
             mut found: boolean = false;
             for (mut h: i64 = 0; h < heads.length() && !found; h++) {
                 const candidate: ImplBlock* = DeclarationNode::impl_of(heads[h]);
-                if (candidate == null || !registry.binds_trait_arguments(candidate, &base_args, this.intern)) { continue; }
+                if (candidate == null || !registry.binds_trait_arguments(candidate, base, &base_args, this.intern)) { continue; }
                 found = generic || checker.impl_applies(candidate, owner, 0);
             }
             if (found) { continue; }
@@ -3626,21 +3626,40 @@ type struct SemaVisitor {
         return this.types.view_type_arg_at(func.resolved_return_type, 0);
     }
 
-    /// 1 when `ty` is the language's `Result`, 2 when it is its `Option`, 0
-    /// otherwise - by the identity each declaration claimed
-    /// (`GenericRegistry::wellknown`), never by the variants an enum spells:
-    /// `type enum Outcome { Ok(i32); Err(i32); }` is another enum, and `?` on
-    /// it is refused as on any other.  An instantiation answers as its
-    /// template, resolved (a specialized enum carries its `generic_base`) or
-    /// not.
-    enum_try_shape(&this, ty: TypeRef) -> i32 {
-        const d: DefId = this.enum_decl_def(ty);
-        if (!d.is_valid()) { return 0; }
+    /// Whether `ty` is the language's `Result` - by the identity its
+    /// declaration claimed (`GenericRegistry::wellknown`), never by the
+    /// variants an enum spells.  An instantiation answers as its template,
+    /// resolved (a specialized enum carries its `generic_base`) or not.
+    is_language_result(&this, ty: TypeRef) -> boolean {
         const result_id: DefId = this.ctx.generic_registry.wellknown(LangItem::Result);
-        if (result_id.is_valid() && d.equals(result_id)) { return 1; }
-        const option_id: DefId = this.ctx.generic_registry.wellknown(LangItem::Option);
-        if (option_id.is_valid() && d.equals(option_id)) { return 2; }
-        return 0;
+        return result_id.is_valid() && this.enum_decl_def(ty).equals(result_id);
+    }
+
+    /// The `Residual` of the language's `Try` that `subject`'s implementation
+    /// binds: what a `?` on it returns early with.  Invalid when `subject`
+    /// has no implementation to read it from.
+    try_residual(&this, subject: TypeRef) -> TypeRef {
+        const try_decl: TraitDecl* = this.ctx.generic_registry.lang_trait_decl(LangItem::Try);
+        if (try_decl == null) { return TypeRef::invalid(); }
+        const slot: i64 = try_decl.assoc_type_index(this.intern.intern("Residual"));
+        mut rc: ResolutionContext = ResolutionContext::new("");
+        return this.ctx.type_resolver.resolve_concrete_member(subject, slot, try_decl, &rc);
+    }
+
+    /// The implementation of the language's `FromResidual<residual>` for
+    /// `to` whose head binds the trait at `residual`, its where-clause not
+    /// consulted; null when there is none.
+    from_residual_head(&this, to: TypeRef, residual: TypeRef) -> ImplBlock* {
+        const from_residual: DefId = this.ctx.generic_registry.wellknown(LangItem::FromResidual);
+        const args: [TypeRef] = [residual];
+        const heads: [DeclarationNode*] = this.ctx.generic_registry.heads_for(from_residual, to, this.intern);
+        for (mut i: i64 = 0; i < heads.length(); i++) {
+            const head: ImplBlock* = DeclarationNode::impl_of(heads[i]);
+            if (head != null && this.ctx.generic_registry.binds_trait_arguments(head, from_residual, &args, this.intern)) {
+                return head;
+            }
+        }
+        return null;
     }
 
     /// The declaration of the enum `ty` is, through references, pointers and
@@ -3813,38 +3832,61 @@ type struct SemaVisitor {
 
         if (!operand_type.is_valid()) { return TypeRef::invalid(); }
 
-        const operand_shape: i32 = this.enum_try_shape(operand_type);
-        if (operand_shape == 0) {
-            if (this.symbolic.symbolic_type_unresolved(operand_type)) { return TypeRef::invalid(); }
+        // A standard library without the traits `?` goes through cannot
+        // compile one: reported here, where the `?` is, naming the item.
+        const items: [LangItem] = [LangItem::Try, LangItem::TryBranch, LangItem::FromResidual,
+            LangItem::FromResidualFromResidual, LangItem::ControlFlow];
+        for (mut i: i64 = 0; i < items.length(); i++) {
+            if (this.ctx.generic_registry.wellknown(items[i]).is_valid()) { continue; }
+            mut missing: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                fmt::format("the `?` operator goes through the language item `%s`, and no declaration in this program is it",
+                    items[i].name()));
+            missing = missing.at_with_label(e.span, "desugared here");
+            this.ctx.emit_diagnostic(missing);
+            return TypeRef::invalid();
+        }
+
+        // The operand's type, through references and pointers, must implement
+        // the language's `Try`, by its implementation and never by the
+        // variants an enum spells: `type enum Outcome { Ok(i32); Err(i32); }`
+        // implements nothing it does not write.
+        const subject: TypeRef = this.trait_checker().receiver_core(operand_type);
+        if (!this.trait_checker().type_implements_trait(subject, this.ctx.generic_registry.wellknown(LangItem::Try), 0)) {
+            if (this.symbolic.symbolic_type_unresolved(subject)) { return TypeRef::invalid(); }
             const ot: Type* = this.arena.lookup(operand_type);
             const disp: string = if (ot != null) { this.arena.format_display(ot) } else { "?" };
             this.ctx.emit_error_at(ErrorCode::E0234_INVALID_TRY_OPERAND,
-                fmt::format("the `?` operator requires a `Result` or `Option` value, but the operand has type '%s'", disp), e.span);
+                fmt::format("the `?` operator requires a value whose type implements `Try`, but the operand has type '%s'", disp), e.span);
             return TypeRef::invalid();
         }
+        const residual: TypeRef = this.try_residual(subject);
+        if (!residual.is_valid()) { return TypeRef::invalid(); }
         // Inside a lowered `poll`, the async function's Output is what `?`
         // propagates out of; everywhere else it is the function's own return.
         const fn_ret: TypeRef = if (this.state.async_poll_output.is_valid()) {
             this.state.async_poll_output
         } else { this.state.return_type };
-        const fn_shape: i32 = this.enum_try_shape(fn_ret);
-        if (fn_shape != operand_shape) {
+        // The function's return type must implement `FromResidual` of what
+        // the operand returns early with.
+        const head: ImplBlock* = this.from_residual_head(fn_ret, residual);
+        if (head == null) {
             // A return type that still mentions an abstract parameter cannot
             // settle this. An `async` trait default body is walked once with its
             // return type ALREADY rewritten to the future it lowers to
             // (`This::…Fut`), before the walk that sees the declared output, and
             // judging a `?` against the future would reject every one of them.
-            // Deferring is what the shape check does with any not-yet-concrete
-            // type — the concrete walk is where a `?` can be shaped at all.
+            // The concrete walk is where such a `?` is judged.
             if (this.arena.contains_generic_param(fn_ret)) { return TypeRef::invalid(); }
             if (this.symbolic.symbolic_type_unresolved(fn_ret)
                     || this.symbolic.symbolic_type_unresolved(operand_type)) {
                 return TypeRef::invalid();
             }
-            const want: string = if (operand_shape == 1) { "Result" } else { "Option" };
+            const residual_shown: string = this.arena.resolve_display_name_short(residual);
             mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0235_TRY_OUTSIDE_RESULT_FN,
-                fmt::format("the `?` operator can only be used in a function that returns `%s`", want));
-            diag = diag.at_with_label(e.span, fmt::format("propagates a `%s`, but the enclosing function doesn't return one", want));
+                fmt::format("the `?` operator can only be used in a function whose return type implements `FromResidual<%s>`",
+                    residual_shown));
+            diag = diag.at_with_label(e.span, fmt::format("propagates a `%s`, but `%s` cannot be built from it",
+                residual_shown, this.arena.resolve_display_name_short(fn_ret)));
             const ann_span: SourceSpan = annotation_span(this.state.return_type_ann);
             if (ann_span.has_location()) {
                 const ret_repl: string = this.arena.resolve_display_name_short(operand_type);
@@ -3857,8 +3899,8 @@ type struct SemaVisitor {
         // (`Err(F::from(e))`, an `F` from itself unchanged).  One the
         // function's own error type cannot hold as it is needs a `From` that
         // converts it, and is refused here, at the `?`, when there is none.
-        if (operand_shape == 1) {
-            const from_error: TypeRef = this.arena.inst_type_arg_at(operand_type, 1);
+        if (this.is_language_result(subject) && this.is_language_result(fn_ret)) {
+            const from_error: TypeRef = this.arena.inst_type_arg_at(subject, 1);
             const to_error: TypeRef = this.arena.inst_type_arg_at(fn_ret, 1);
             if (from_error.is_valid() && to_error.is_valid()
                     && !this.checker.can_assign(from_error, to_error)) {
@@ -3891,19 +3933,22 @@ type struct SemaVisitor {
                     return TypeRef::invalid();
                 }
             }
-        }
-        // A standard library without the traits `?` goes through cannot
-        // compile one: reported here, where the `?` is, naming the item.
-        const items: [LangItem] = [LangItem::Try, LangItem::TryBranch, LangItem::FromResidual,
-            LangItem::FromResidualFromResidual, LangItem::ControlFlow];
-        for (mut i: i64 = 0; i < items.length(); i++) {
-            if (this.ctx.generic_registry.wellknown(items[i]).is_valid()) { continue; }
-            mut missing: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                fmt::format("the `?` operator goes through the language item `%s`, and no declaration in this program is it",
-                    items[i].name()));
-            missing = missing.at_with_label(e.span, "desugared here");
-            this.ctx.emit_diagnostic(missing);
-            return TypeRef::invalid();
+        } else if (!this.arena.contains_generic_param(fn_ret) && !this.arena.contains_generic_param(residual)) {
+            // Any other implementation's where-clause is read at the residual.
+            const residual_args: [TypeRef] = [residual];
+            if (!this.trait_checker().impl_applies_at(head, this.ctx.generic_registry.wellknown(LangItem::FromResidual),
+                    &residual_args, fn_ret, 0)) {
+                const residual_shown: string = this.arena.resolve_display_name_short(residual);
+                const ret_shown: string = this.arena.resolve_display_name_short(fn_ret);
+                mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
+                    fmt::format("the trait bound `%s: FromResidual<%s>` is not satisfied", ret_shown, residual_shown));
+                diag = diag.at_with_label(e.span, fmt::format("propagates a `%s` into a function that returns `%s`",
+                    residual_shown, ret_shown));
+                diag = diag.with_note(fmt::format("the implementation of `FromResidual<%s>` for `%s` has a where-clause these types do not satisfy",
+                    residual_shown, ret_shown));
+                this.ctx.emit_diagnostic(diag);
+                return TypeRef::invalid();
+            }
         }
         const desugared: ExpressionNode* = this.build_try_desugar(e, node, fn_ret);
         node.set_desugared(desugared);

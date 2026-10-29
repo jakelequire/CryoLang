@@ -1,0 +1,57 @@
+// E0306: the function's return type implements `FromResidual` of the
+// residual's shape only where a where-clause holds, and the clause is read at
+// the residual itself: `Report` takes a `Fault<C>` where `C: Describe`, and a
+// `?` that stops with a `Fault<boolean>` is refused at the `?`.
+![config(testing)]
+![config(negative, E0306)]
+namespace CryoTests::Negative::E0306TryFromResidualWhereClause;
+
+import std::core::ops::{ ControlFlow, FromResidual, Try };
+
+type trait Describe {
+    describe(&this) -> i32;
+}
+
+implement trait Describe for i32 {
+    describe(&this) -> i32 { return *this; }
+}
+
+type struct Fault<C> { cause: C; }
+
+type enum Probe<C> {
+    Value(i32);
+    Fail(C);
+}
+
+implement<C> trait Try for enum Probe<C> {
+    type Output = i32;
+    type Residual = Fault<C>;
+
+    static from_output(output: i32) -> Probe<C> { return Probe::Value(output); }
+
+    branch(this) -> ControlFlow<Fault<C>, i32> {
+        match (this) {
+            Probe::Value(v) => { return ControlFlow::Continue(v); }
+            Probe::Fail(cause) => { return ControlFlow::Break(Fault::<C> { cause: cause }); }
+        }
+    }
+}
+
+type struct Report { code: i32; }
+
+implement<C> trait FromResidual<Fault<C>> for struct Report where C: Describe {
+    static from_residual(residual: Fault<C>) -> Report { return Report { code: residual.cause.describe() }; }
+}
+
+function cf_described(p: Probe<i32>) -> Report {
+    return Report { code: p? };
+}
+
+function cf_undescribed(p: Probe<boolean>) -> Report {
+    return Report { code: p? };
+    //~^ ERROR[E0306] the trait bound `Report: FromResidual<Fault<boolean>>` is not satisfied
+}
+
+function main() -> int {
+    return cf_described(Probe::<i32>::Value(1)).code + cf_undescribed(Probe::<boolean>::Fail(true)).code;
+}

@@ -963,10 +963,8 @@ yet is recorded with the change that builds it, not here.
      `never` is no type argument, so the residual is the enum at `()`.
      One implementation, `FromResidual<Result<(), E>> for Result<T, F>
      where F: From<E>`, covers the same error (through `From<T> for T`)
-     and a converted one; `Option<T>` takes `Option<()>`.  `?` still
-     applies to a `Result` or an `Option` only, and E0234, E0235 and
-     E0214 are unchanged; opening it to another type implementing `Try`
-     is a question for Jake.  (Jake: the traits, `ControlFlow`'s name and
+     and a converted one; `Option<T>` takes `Option<()>`.  Which operands
+     and return types `?` accepts is 659.  (Jake: the traits, `ControlFlow`'s name and
      visibility, a single converting implementation; the shapes delegated)
 
 658. **A call's bound on a parameter is checked at the trait's
@@ -981,9 +979,33 @@ yet is recorded with the change that builds it, not here.
      head leaves to its parameter's default is that default (`Array<u8>`
      unifies with `[u8]`, `Array<u8, GlobalAlloc>`), and a name the
      compiler wrote with its type already attached is compared as that
-     type.  An implementation's where-clause on a parameter is still
-     checked without the trait's arguments; whether it should be is a
-     question for Jake.  (the regression fix delegated)
+     type.  An implementation's where-clause is checked the same way
+     (660).  (the regression fix delegated)
+
+659. **`?` applies to any type that implements `Try`.**  The operand's
+     type, through references and pointers, must implement the
+     language's `Try` (E0234 otherwise), and the enclosing function's
+     return type must have an implementation of `FromResidual` whose head
+     binds the trait at the operand's `Residual` (E0235 otherwise).  That
+     implementation's where-clause is read at the residual: for a
+     `Result` into a `Result` it is the error conversion, refused as
+     E0214 naming the `From` that is missing; for any other, E0306 naming
+     `FromResidual` at the residual.  A return type or residual that
+     still names a parameter is judged by the copy that binds it.
+     (Jake)
+
+660. **An implementation's where-clause on a parameter is checked at the
+     trait's arguments.**  `implement<E, F> trait Lift for Pair<E, F>
+     where F: From<E>` holds for `Pair<Low, High>` only where an
+     implementation of `From` for `High` binds it at `Low`, as 658 checks
+     a call's bound; asking only whether `High` implements `From` let
+     every pair through after `From<T> for T`.  The head's parameters are
+     bound by the subject's arguments and, when the trait is asked at
+     arguments (`W: Convert<Low>`, a `?`'s residual), by the parts of
+     those arguments the head writes them in: `E` in `implement<E, F>
+     trait Convert<E> for Wrap<F>` is `Low`.  A bound whose arguments
+     still name an unbound parameter is left to the copy that binds it.
+     (Jake)
 
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
