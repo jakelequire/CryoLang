@@ -1,0 +1,90 @@
+/// A call through a trait's path whose receiver is a type parameter,
+/// `Show::show(p)` with `p: &P` under `where P: Show`, runs the
+/// implementation of the type each copy of the body binds `P` to, as the
+/// method form `p.show()` does: through a trait without parameters, through
+/// a generic trait at the bound's arguments, with an argument after the
+/// receiver, on a receiver held by value, and on an instantiation.
+namespace TraitPathCallOnParameterReceiver::Main;
+
+import std::ffi::libc::{ printf };
+
+type trait Show {
+    show(&this) -> i32;
+}
+
+type trait Peek<R> {
+    peek(&this) -> R;
+}
+
+type trait Put<R> {
+    put(&this, value: R) -> i64;
+}
+
+type struct Plain { n: i32; }
+type struct Other { n: i32; }
+type struct Holder<T> { item: T; }
+
+implement trait Show for struct Plain {
+    show(&this) -> i32 { return this.n; }
+}
+
+implement trait Show for struct Other {
+    show(&this) -> i32 { return this.n * 10; }
+}
+
+implement trait Peek<i32> for struct Plain {
+    peek(&this) -> i32 { return this.n + 1; }
+}
+
+implement trait Put<i64> for struct Plain {
+    put(&this, value: i64) -> i64 { return value + 100; }
+}
+
+implement<T> trait Peek<T> for struct Holder<T> {
+    peek(&this) -> T { return this.item; }
+}
+
+function shown<P>(p: &P) -> i32 where P: Show {
+    return Show::show(p);
+}
+
+function shown_by_value<P>(p: P) -> i32 where P: Show {
+    return Show::show(&p);
+}
+
+function peeked<P>(p: &P) -> i32 where P: Peek<i32> {
+    const value: i32 = Peek::peek(p);
+    return value;
+}
+
+function peeked_wide<P>(p: &P) -> i64 where P: Peek<i64> {
+    return Peek::peek(p);
+}
+
+function put<P>(p: &P) -> i64 where P: Put<i64> {
+    return Put::put(p, 7);
+}
+
+function check(passed: i32, condition: boolean, what: string) -> i32 {
+    if (!condition) {
+        printf("FAILED: %s\n", what);
+        return passed;
+    }
+    return passed + 1;
+}
+
+function main() -> i32 {
+    mut passed: i32 = 0;
+    const plain: Plain = Plain { n: 9 };
+    const other: Other = Other { n: 4 };
+    const holder: Holder<i64> = Holder { item: 40 };
+    passed = check(passed, shown(&plain) == 9, "a trait without parameters, through a reference parameter");
+    passed = check(passed, shown(&other) == 40, "a second copy runs its own type's implementation");
+    passed = check(passed, shown_by_value(other) == 40, "a receiver held by value, borrowed at the call");
+    passed = check(passed, peeked(&plain) == 10, "a generic trait at the bound's argument");
+    passed = check(passed, peeked_wide(&holder) == 40, "a generic implementation on an instantiation");
+    passed = check(passed, put(&plain) == 107, "an argument after the receiver");
+    printf("parameter receiver trait paths: %d of 6 checks passed\n", passed);
+    if (passed != 6) { return 1; }
+    return 0;
+}

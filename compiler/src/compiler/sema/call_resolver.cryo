@@ -6170,6 +6170,11 @@ type struct CallResolver {
         const recv: ExpressionNode* = call.arguments[0];
         if (recv == null || !recv.resolved_type.is_valid()) { return true; }
         const owner_ty: TypeRef = this.trait_qualified_owner(recv.resolved_type);
+        const param: GenericParamType* = this.binding.receiver_type_param(recv.resolved_type);
+        if (this.state.in_symbolic_check && param != null) {
+            this.record_trait_call_on_parameter(call, scope, param, owner_ty, trait_sym);
+            return true;
+        }
         const owner_sym: SymbolStr = this.ctx.decl_index.lookup_type_name(owner_ty);
         if (!owner_sym.is_valid()) {
             this.record_trait_call_on_instantiation(call, scope, owner_ty, trait_sym, member_sym);
@@ -6213,6 +6218,83 @@ type struct CallResolver {
         const owner_args: [TypeRef] = this.types.view_type_args_copy(owner_ty);
         call.callee.set_resolved_type(this.subst_params(&template.param_types, &owner_args,
             this.ctx.decl_index.entry_owner_return(entries[0])));
+    }
+
+    /// A call through a trait's path whose receiver is a type parameter of
+    /// the body being walked (`Show::show(p)` with `p: &P` under `where P:
+    /// Show`): the implementation is that of the type each copy of the body
+    /// binds `P` to.  So the call records the trait's method and the
+    /// parameter, as `P::show(p)` under the bound does, and each copy binds
+    /// it on the type it substitutes.  Typed by the trait's declared return
+    /// at the bound's arguments, `This` being the parameter.  A parameter no
+    /// bound in scope gives the trait has no implementation of it to call,
+    /// whatever a copy binds it to, and is refused here.
+    record_trait_call_on_parameter(mut &this, call: CallExpr*, scope: ScopeResolutionExpr*,
+                                   param: GenericParamType*, owner_ty: TypeRef, trait_sym: DefId) -> void {
+        const item: DefId = this.trait_item_def(trait_sym, scope);
+        if (!item.is_valid()) { return; }
+        const func_decl: DeclarationNode* = this.ctx.decl_index.method_func_of(item);
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
+        if (func == null) { return; }
+        const tr: TraitRef* = this.parameter_trait_bound(call, owner_ty, trait_sym, func);
+        if (tr == null) {
+            const trait_leaf: string = QualifiedName::leaf_of(this.intern.shown(this.ctx.defs.path_of(trait_sym)));
+            const param_display: string = this.arena.format_generic_param(param);
+            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
+                fmt::format("`%s` does not implement `%s`", param_display, trait_leaf));
+            d = d.at_with_label(scope.scope_span,
+                fmt::format("no bound in scope gives `%s` the trait `%s`", param_display, trait_leaf));
+            d = d.help(fmt::format("add a `where %s: %s` bound", param_display, trait_leaf));
+            this.ctx.emit_diagnostic(d);
+            return;
+        }
+        call.template_method = item;
+        call.bound_params = this.binding.bound_method_params(tr, func_decl);
+        scope.set_resolved_trait(trait_sym);
+        scope.spec_owner = owner_ty;
+        call.callee.set_resolved_type(this.binding.subst_this_in_trait_return(
+            this.binding.subst_bound_trait_args(func.resolved_return_type, tr.path[tr.path.length() - 1], tr),
+            owner_ty));
+    }
+
+    /// The bound in scope that gives the type parameter `owner_ty` the trait
+    /// `trait_sym` a call through the trait's path, `call`, names `func` of:
+    /// the first whose parameters take the call's arguments exactly, else the
+    /// first, which the argument check then holds the call to.  Null when
+    /// no bound gives the parameter the trait.
+    parameter_trait_bound(mut &this, call: CallExpr*, owner_ty: TypeRef, trait_sym: DefId,
+                          func: FunctionDecl*) -> TraitRef* {
+        const refs: [TraitRef*] = this.binding.bounds_naming(owner_ty, trait_sym);
+        if (refs.length() == 0) { return null; }
+        for (mut r: i64 = 0; r < refs.length(); r++) {
+            const params: [TypeRef] = this.bound_path_params(refs[r], func, owner_ty);
+            mut takes: boolean = params.length() == call.arguments.length();
+            for (mut k: i64 = 0; takes && k < params.length(); k++) {
+                const arg: ExpressionNode* = call.arguments[k];
+                takes = arg != null && params[k].equals(arg.resolved_type);
+            }
+            if (takes) { return refs[r]; }
+        }
+        return refs[0];
+    }
+
+    /// The parameters, receiver first, of a trait's declared method `func`
+    /// as a call the bound `tr` on `owner_ty` directs passes them: the
+    /// bound's arguments put in for the trait's parameters and `owner_ty`
+    /// for `This`.
+    bound_path_params(mut &this, tr: TraitRef*, func: FunctionDecl*, owner_ty: TypeRef) -> [TypeRef] {
+        const leaf: SymbolStr = tr.path[tr.path.length() - 1];
+        mut out: [TypeRef] = [];
+        for (mut k: i64 = 0; k < func.parameters.length(); k++) {
+            const p: VarDecl* = DeclarationNode::var_of(func.parameters[k]);
+            if (p == null || !p.resolved_type.is_valid()) {
+                out.push(TypeRef::invalid());
+                continue;
+            }
+            out.push(this.binding.subst_this_in_trait_return(
+                this.binding.subst_bound_trait_args(p.resolved_type, leaf, tr), owner_ty));
+        }
+        return out;
     }
 
     /// The registered name of the type a trait-qualified call's first
@@ -9401,6 +9483,16 @@ type struct CallResolver {
             }
         } else {
             if (this.check_variant_arguments(visitor, scope, call)) { return; }
+            // A scope naming a TRAIT: the call's signature is the receiver's
+            // implementation's, not the trait declaration's (which registers
+            // no signature under `Trait::m`), or on a type parameter's
+            // receiver the declaration's at the bound directing the call.
+            const qualifier: TypeRef = this.types.scope_qualifier_type(scope);
+            const qt: Type* = this.arena.lookup(qualifier);
+            if (scope.impl_trait == null && qt != null && qt.kind == TypeKind::Trait) {
+                this.check_trait_qualified_args(visitor, this.ctx.decl_index.def_of(qualifier, this.ctx.type_arena), scope, call_e, call);
+                return;
+            }
             // A path a bound on its owner directs took its arguments, by
             // identity, where it was directed (`direct_bound_path`).
             if (scope.resolved_trait.is_valid() && !this.symbolic.symbolic_scope_is_generic_param(scope)) { return; }
@@ -9414,14 +9506,6 @@ type struct CallResolver {
             if (scope_str.length() == 0 || member_str.length() == 0) { return; }
             if (scope.impl_trait != null) {
                 this.check_impl_qualified_args(visitor, FamilyOwner::Type(owner_ty), scope, call_e, call);
-                return;
-            }
-            // A scope naming a TRAIT: the call's signature is the receiver's
-            // implementation's, not the trait declaration's (which registers
-            // no signature under `Trait::m`).
-            const qt: Type* = this.arena.lookup(this.types.scope_qualifier_type(scope));
-            if (qt != null && qt.kind == TypeKind::Trait) {
-                this.check_trait_qualified_args(visitor, this.ctx.decl_index.def_of(this.types.scope_qualifier_type(scope), this.ctx.type_arena), scope, call_e, call);
                 return;
             }
             overloads = this.ctx.decl_index.lookup_func_type_overloads(FamilyOwner::Type(owner_ty), scope.member_name);
@@ -9529,9 +9613,33 @@ type struct CallResolver {
         const recv: ExpressionNode* = call.arguments[0];
         if (recv == null || !recv.resolved_type.is_valid()) { return; }
         const owner_ty: TypeRef = this.trait_qualified_owner(recv.resolved_type);
+        if (this.state.in_symbolic_check && this.binding.receiver_type_param(recv.resolved_type) != null) {
+            this.check_parameter_trait_path_args(visitor, trait_sym, owner_ty, scope, call_e, call);
+            return;
+        }
         if (!this.ctx.decl_index.lookup_type_name(owner_ty).is_valid()) { return; }
         const entries: [OverloadId] = this.trait_delivered_entries(FamilyOwner::Type(owner_ty), trait_sym, scope.member_name);
         this.check_delivered_args(visitor, &entries, scope, call_e, call);
+    }
+
+    /// The argument check for a call through a trait's path on a type
+    /// parameter's receiver: against the trait's declared method at the
+    /// bound that directs the call (`parameter_trait_bound`), receiver
+    /// included.  A call no bound directs was refused where it was pinned.
+    check_parameter_trait_path_args(mut &this, visitor: SemaVisitor*, trait_sym: DefId, owner_ty: TypeRef,
+                                    scope: ScopeResolutionExpr*, call_e: ExpressionNode*, call: CallExpr*) -> void {
+        if (!call.template_method.is_valid()) { return; }
+        const func: FunctionDecl* = DeclarationNode::fn_of(this.ctx.decl_index.method_func_of(call.template_method));
+        if (func == null) { return; }
+        const tr: TraitRef* = this.parameter_trait_bound(call, owner_ty, trait_sym, func);
+        if (tr == null) { return; }
+        const params: [TypeRef] = this.bound_path_params(tr, func, owner_ty);
+        if (params.length() != call.arguments.length()) {
+            this.diag.emit_method_arity_error(call_e.span, scope.member_name, "method", params.length(),
+                call.arguments.length(), false);
+            return;
+        }
+        this.check_args_against_params(visitor, &call.arguments, params.as_slice());
     }
 
     /// Argument check against `entries`, the candidates a trait's
