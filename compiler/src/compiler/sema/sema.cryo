@@ -3660,29 +3660,37 @@ type struct SemaVisitor {
         return this.ctx.decl_index.def_of(if (base.is_valid()) { base } else { ty }, this.ctx.type_arena);
     }
 
-    /// `ret_ty` is the ENCLOSING FUNCTION's return type, not the operand's: the
-    /// `Err`/`None` this builds is the value returned on the error arm, so that
-    /// is the enum its scope segment names. The two agree on shape (the caller
-    /// rejects a mismatch) but not necessarily on instantiation, and only the
-    /// returned one is what the synthesized reference refers to.
+    /// `x?` is `match (x.branch()) { ControlFlow::Continue(v) => { v }
+    /// ControlFlow::Break(r) => { return R::from_residual(r); } }`: the
+    /// language's `Try::branch` splits the operand into the value the
+    /// expression goes on with or what the function returns early with, and
+    /// `FromResidual::from_residual` builds the function's return value from
+    /// that - for a `Result`, converting the error through `From`.  The call
+    /// is stamped with `Try` and the path directed through `FromResidual`, so
+    /// a method of the operand's own spelled `branch` is not the one called.
     ///
-    /// `convert_to`, when valid, is the function's error type, which differs
-    /// from the operand's and implements `From` of it: the error arm returns
-    /// `Err(convert_to::from(error))` instead of the error itself.
-    build_try_desugar(mut &this, e: ExpressionNode*, node: TryExpr*, is_result: boolean,
-                      operand_ty: TypeRef, ret_ty: TypeRef, convert_to: TypeRef) -> ExpressionNode* {
+    /// `ret_ty` is the ENCLOSING FUNCTION's return type, not the operand's:
+    /// the value the `Break` arm returns is built for it, and the two agree on
+    /// shape (the caller rejects a mismatch) but not necessarily on
+    /// instantiation.
+    build_try_desugar(mut &this, e: ExpressionNode*, node: TryExpr*, ret_ty: TypeRef) -> ExpressionNode* {
         const span: SourceSpan = e.span;
         this.state.try_counter += 1;
-        const enum_name: SymbolStr = this.intern.intern(if (is_result) { "Result" } else { "Option" });
-        const ok_variant: SymbolStr = this.intern.intern(if (is_result) { "Ok" } else { "Some" });
-        const err_variant: SymbolStr = this.intern.intern(if (is_result) { "Err" } else { "None" });
+        const registry: GenericRegistry* = this.ctx.generic_registry;
+        const flow: DefId = registry.wellknown(LangItem::ControlFlow);
+        const enum_name: SymbolStr = this.ctx.defs.leaf_of(flow).spelling();
+        const ok_variant: SymbolStr = this.intern.intern("Continue");
+        const err_variant: SymbolStr = this.intern.intern("Break");
         const ok_bind: SymbolStr = this.intern.intern(fmt::format("__cryo_try_%u", this.state.try_counter));
 
-        const desugar: ExpressionNode* = ExpressionNode::match_expr(node.operand, span);
+        const branch: ExpressionNode* = ExpressionNode::member_access_expr(node.operand,
+            this.ctx.defs.leaf_of(registry.wellknown(LangItem::TryBranch)).spelling(), span, span);
+        this.calls.stamp_trait_item(ExpressionNode::member_access_of(branch), registry.wellknown(LangItem::Try));
+        const desugar: ExpressionNode* = ExpressionNode::match_expr(ExpressionNode::call_expr(branch, span), span);
         mut match_expr: MatchExpr* = ExpressionNode::match_of(desugar);
         const ok_node: Pattern* = Pattern::enum_variant(enum_name, ok_variant, span);
         mut ok_pat: EnumPattern* = ok_node.enum_payload();
-        ok_pat.set_res(Res::Def(this.ctx.decl_index.def_of(operand_ty, this.ctx.type_arena)));
+        ok_pat.set_res(Res::Def(flow));
         // Both bindings are declared here, after name resolution ran, so each
         // takes its identity from the allocator and every use this builds
         // carries it: a later pass tracking the payload's move asks by it.
@@ -3703,38 +3711,17 @@ type struct SemaVisitor {
 
         const err_node: Pattern* = Pattern::enum_variant(enum_name, err_variant, span);
         mut err_pat: EnumPattern* = err_node.enum_payload();
-        err_pat.set_res(Res::Def(this.ctx.decl_index.def_of(operand_ty, this.ctx.type_arena)));
-        mut ret_value: ExpressionNode* = null;
-        if (is_result) {
-            const err_bind: SymbolStr = this.intern.intern(fmt::format("__cryo_try_err_%u", this.state.try_counter));
-            const err_sym: SymbolID = this.resolver.alloc_synthetic_binding();
-            const err_pb: PatternBinding* = new PatternBinding {
-                name: err_bind, span: span, sym_id: err_sym,
-                resolved_type: TypeRef::invalid(), written_mut: false
-            };
-            err_pat.add_element(PatternElement::Binding(err_pb));
-            const err_scope: ExpressionNode* = ExpressionNode::scope_resolution_expr(enum_name, err_variant, span);
-            ExpressionNode::scope_resolution_of(err_scope).set_synthesized_ref(err_scope, ret_ty,
-                this.ctx.decl_index.def_of(ret_ty, this.ctx.type_arena));
-            mut err_call: ExpressionNode* = ExpressionNode::call_expr(err_scope, span);
-            const err_ident: ExpressionNode* = ExpressionNode::identifier_expr(err_bind, span);
-            ExpressionNode::identifier_of(err_ident).set_res(Res::Local(err_sym));
-            if (convert_to.is_valid()) {
-                ExpressionNode::call_of(err_call).add_argument(this.build_from_call(convert_to, err_ident, span));
-            } else {
-                ExpressionNode::call_of(err_call).add_argument(err_ident);
-            }
-            ret_value = err_call;
-        } else {
-            const bare_err: ExpressionNode* =
-                ExpressionNode::scope_resolution_expr(enum_name, err_variant, span);
-            // The `Res` alone: a node that carries its type is answered from
-            // it and never walked, and the walk is what pins the variant
-            // codegen builds.  It types the value by the return it is in.
-            ExpressionNode::scope_resolution_of(bare_err).set_synthesized_res(
-                this.ctx.decl_index.def_of(ret_ty, this.ctx.type_arena));
-            ret_value = bare_err;
-        }
+        err_pat.set_res(Res::Def(flow));
+        const err_bind: SymbolStr = this.intern.intern(fmt::format("__cryo_try_residual_%u", this.state.try_counter));
+        const err_sym: SymbolID = this.resolver.alloc_synthetic_binding();
+        const err_pb: PatternBinding* = new PatternBinding {
+            name: err_bind, span: span, sym_id: err_sym,
+            resolved_type: TypeRef::invalid(), written_mut: false
+        };
+        err_pat.add_element(PatternElement::Binding(err_pb));
+        const err_ident: ExpressionNode* = ExpressionNode::identifier_expr(err_bind, span);
+        ExpressionNode::identifier_of(err_ident).set_res(Res::Local(err_sym));
+        mut ret_value: ExpressionNode* = this.build_from_residual_call(ret_ty, err_ident, span);
         // Inside the `poll` an `async fn` was lowered into, every `return`
         // carries `Poll::Ready(...)`. The lowering wrapped the returns it could
         // see, but this desugar is built after it ran — a `?` in a GENERIC body
@@ -3752,52 +3739,32 @@ type struct SemaVisitor {
         return desugar;
     }
 
-    /// `to::from(value)`, the conversion `?` applies to an error: the method
-    /// the language's `From` claims, on the type it converts into.  The
-    /// scope segment is answered with `to` itself - a declared type by its
-    /// definition, a type parameter by its declaration, which a bound then
-    /// directs as it directs a written `F::from(e)`, a primitive by its
-    /// spelling - so nothing looks the type up by name.  The path is
-    /// directed through `From`, so a method of `to`'s own named `from` is
-    /// not the conversion.
-    build_from_call(&this, to: TypeRef, value: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
-        const method: DefId = this.ctx.generic_registry.wellknown(LangItem::FromFrom);
+    /// `to::from_residual(residual)`, the value the `Break` arm of `?`'s
+    /// desugar returns: the method the language's `FromResidual` claims, on
+    /// the enclosing function's return type `to`, a `Result` or an `Option`.
+    /// The scope segment is answered with `to` itself, written with its
+    /// arguments as `Result::<T, F>::from_residual(r)` is, so nothing looks
+    /// the type up by name; the path is directed through `FromResidual`, so
+    /// a method of `to`'s own spelled `from_residual` is not the one called.
+    build_from_residual_call(&this, to: TypeRef, residual: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
+        const method: DefId = this.ctx.generic_registry.wellknown(LangItem::FromResidualFromResidual);
         const to_def: DefId = this.ctx.decl_index.def_of(to, this.ctx.type_arena);
-        const to_param: GenericParamType* = this.as_type_param(to);
-        mut scope_name: SymbolStr = SymbolStr::empty();
-        if (to_def.is_valid()) {
-            scope_name = this.ctx.defs.leaf_of(to_def).spelling();
-        } else if (to_param != null) {
-            scope_name = to_param.param_name;
-        } else {
-            scope_name = this.intern.intern(this.arena.format_display(this.arena.lookup(to)));
-        }
         const scope: ExpressionNode* = ExpressionNode::scope_resolution_expr(
-            scope_name, this.ctx.defs.leaf_of(method).spelling(), span);
+            this.ctx.defs.leaf_of(to_def).spelling(), this.ctx.defs.leaf_of(method).spelling(), span);
         mut path: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(scope);
-        path.set_resolved_trait(this.ctx.generic_registry.wellknown(LangItem::From));
-        if (to_def.is_valid()) {
-            path.set_synthesized_ref(scope, to, to_def);
-            // An instantiation is written with its arguments, as
-            // `Wrapper::<T>::from(e)` is: the path's owner is `to` itself,
-            // not its template.
-            for (mut i: i64 = 0; this.arena.inst_type_arg_at(to, i).is_valid(); i++) {
-                const arg: TypeRef = this.arena.inst_type_arg_at(to, i);
-                path.scope_generic_args.push(new TypeAnnotation::Named(new NamedAnnotation {
-                    name:         this.intern.intern(this.arena.format_display(this.arena.lookup(arg))),
-                    span:         span,
-                    pre_resolved: arg,
-                    res:          ResSlot::Pending,
-                }));
-            }
-        } else if (to_param != null) {
-            path.set_scope_res(Res::TypeRelative(ResBase::GenericParam(to_param.param_sym), 1));
-        } else {
-            scope.set_resolved_type(to);
-            path.set_scope_res(Res::TypeRelative(ResBase::PrimTy(scope_name), 1));
+        path.set_resolved_trait(this.ctx.generic_registry.wellknown(LangItem::FromResidual));
+        path.set_synthesized_ref(scope, to, to_def);
+        for (mut i: i64 = 0; this.arena.inst_type_arg_at(to, i).is_valid(); i++) {
+            const arg: TypeRef = this.arena.inst_type_arg_at(to, i);
+            path.scope_generic_args.push(new TypeAnnotation::Named(new NamedAnnotation {
+                name:         this.intern.intern(this.arena.format_display(this.arena.lookup(arg))),
+                span:         span,
+                pre_resolved: arg,
+                res:          ResSlot::Pending,
+            }));
         }
         mut call: ExpressionNode* = ExpressionNode::call_expr(scope, span);
-        ExpressionNode::call_of(call).add_argument(value);
+        ExpressionNode::call_of(call).add_argument(residual);
         return call;
     }
 
@@ -3808,15 +3775,6 @@ type struct SemaVisitor {
         if (!from_trait.is_valid()) { return false; }
         const args: [TypeRef] = [from];
         return this.binding.bound_gives_at(to, from_trait, &args);
-    }
-
-    /// The type parameter `t` is, or null for any other type.
-    as_type_param(&this, t: TypeRef) -> GenericParamType* {
-        const ty: Type* = this.arena.lookup(t);
-        if (ty == null || ty.kind != TypeKind::GenericParam) { return null; }
-        const param: GenericParamType* = ty.as_generic_param();
-        if (this.arena.is_this_placeholder(param)) { return null; }
-        return param;
     }
 
     /// Whether `to` implements the language's `From<from>`: an implementation
@@ -3895,10 +3853,10 @@ type struct SemaVisitor {
             this.ctx.emit_diagnostic(diag);
             return TypeRef::invalid();
         }
-        // An error the function's own error type cannot hold as it is goes
-        // through `From`: `Err(F::from(e))`.  One that can is returned
-        // unchanged, so a `?` that already compiled still means the same.
-        mut convert_to: TypeRef = TypeRef::invalid();
+        // The error `from_residual` returns is converted through `From`
+        // (`Err(F::from(e))`, an `F` from itself unchanged).  One the
+        // function's own error type cannot hold as it is needs a `From` that
+        // converts it, and is refused here, at the `?`, when there is none.
         if (operand_shape == 1) {
             const from_error: TypeRef = this.arena.inst_type_arg_at(operand_type, 1);
             const to_error: TypeRef = this.arena.inst_type_arg_at(fn_ret, 1);
@@ -3932,10 +3890,22 @@ type struct SemaVisitor {
                     this.ctx.emit_diagnostic(diag);
                     return TypeRef::invalid();
                 }
-                convert_to = to_error;
             }
         }
-        const desugared: ExpressionNode* = this.build_try_desugar(e, node, operand_shape == 1, operand_type, fn_ret, convert_to);
+        // A standard library without the traits `?` goes through cannot
+        // compile one: reported here, where the `?` is, naming the item.
+        const items: [LangItem] = [LangItem::Try, LangItem::TryBranch, LangItem::FromResidual,
+            LangItem::FromResidualFromResidual, LangItem::ControlFlow];
+        for (mut i: i64 = 0; i < items.length(); i++) {
+            if (this.ctx.generic_registry.wellknown(items[i]).is_valid()) { continue; }
+            mut missing: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                fmt::format("the `?` operator goes through the language item `%s`, and no declaration in this program is it",
+                    items[i].name()));
+            missing = missing.at_with_label(e.span, "desugared here");
+            this.ctx.emit_diagnostic(missing);
+            return TypeRef::invalid();
+        }
+        const desugared: ExpressionNode* = this.build_try_desugar(e, node, fn_ret);
         node.set_desugared(desugared);
         return this.resolve_expr(desugared);
     }

@@ -1,0 +1,100 @@
+/// `x?` is `match (x.branch()) { Continue(v) => v, Break(r) => return
+/// R::from_residual(r) }` over `std::core::ops`'s `Try`, `FromResidual` and
+/// `ControlFlow`, which a program can call as written: `branch` gives
+/// `Continue` with the value or `Break` with a `Result<(), E>` holding the
+/// error, and `from_residual` builds the function's `Result`, converting the
+/// error through `From` - an error type from itself through `From<T> for T`,
+/// which a type with no `from` of its own also answers through its path.
+/// The `?` forms - the same error, a converted one, inside a generic function
+/// at the same and at another error type, and an `Option` - give what they
+/// gave before the traits.
+namespace TryOperatorThroughTraits::Main;
+
+import std::ffi::libc::{ printf };
+import std::core::convert::{ From };
+import std::core::ops::{ ControlFlow, FromResidual, Try };
+
+type enum HighError {
+    FromLow(i32);
+    Own(i32);
+}
+
+type struct LowError { code: i32; }
+
+type struct Point { x: i32; }
+
+implement trait From<LowError> for enum HighError {
+    static from(value: LowError) -> HighError { return HighError::FromLow(value.code); }
+}
+
+function low(fail: boolean) -> Result<i32, LowError> {
+    if (fail) { return Result::Err(LowError { code: 3 }); }
+    return Result::Ok(5);
+}
+
+function own(fail: boolean) -> Result<i32, HighError> {
+    if (fail) { return Result::Err(HighError::Own(4)); }
+    return Result::Ok(6);
+}
+
+function code(result: Result<i32, HighError>) -> i32 {
+    match (result) {
+        Result::Ok(v) => { return v; }
+        Result::Err(HighError::FromLow(c)) => { return 100 + c; }
+        Result::Err(HighError::Own(c)) => { return 200 + c; }
+    }
+}
+
+function converted(fail: boolean) -> Result<i32, HighError> {
+    return Result::Ok(low(fail)? + 1);
+}
+
+function same(fail: boolean) -> Result<i32, HighError> {
+    return Result::Ok(own(fail)? + 1);
+}
+
+function generic_same<E>(result: Result<i32, E>) -> Result<i32, E> {
+    return Result::Ok(result? + 2);
+}
+
+function generic_converted<E, F>(result: Result<i32, E>) -> Result<i32, F> where F: From<E> {
+    return Result::Ok(result? + 3);
+}
+
+function doubled(value: Option<i32>) -> Option<i64> {
+    return Option::Some((value? as i64) * 2);
+}
+
+function check(passed: i32, condition: boolean, what: string) -> i32 {
+    if (!condition) {
+        printf("FAILED: %s\n", what);
+        return passed;
+    }
+    return passed + 1;
+}
+
+function main() -> i32 {
+    mut passed: i32 = 0;
+    const went_on: boolean = match (low(false).branch()) {
+        ControlFlow::Continue(v) => { v == 5 }
+        ControlFlow::Break(_) => { false }
+    };
+    passed = check(passed, went_on, "branch goes on with the Ok value");
+    const residual: Result<(), LowError> = match (low(true).branch()) {
+        ControlFlow::Continue(_) => { Result::Ok(()) }
+        ControlFlow::Break(r) => { r }
+    };
+    passed = check(passed, code(Result::<i32, HighError>::from_residual(residual)) == 103,
+        "from_residual converts the error it is given");
+    passed = check(passed, Point::from(Point { x: 7 }).x == 7, "a type converts from itself through its path");
+    passed = check(passed, code(converted(false)) == 6 && code(converted(true)) == 103, "a converted error");
+    passed = check(passed, code(same(false)) == 7 && code(same(true)) == 204, "the function's own error");
+    passed = check(passed, code(generic_same::<HighError>(own(true))) == 204, "the same error in a generic function");
+    passed = check(passed, code(generic_converted::<LowError, HighError>(low(true))) == 103,
+        "a converted error in a generic function");
+    passed = check(passed, doubled(Option::Some(4)).unwrap_or(-1) == 8, "an Option goes on");
+    passed = check(passed, doubled(Option::None).unwrap_or(-1) == -1, "an Option stops with None");
+    printf("try through traits: %d of 9 checks passed\n", passed);
+    if (passed != 9) { return 1; }
+    return 0;
+}

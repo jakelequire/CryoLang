@@ -948,6 +948,25 @@ yet is recorded with the change that builds it, not here.
      the head checked second.  (Jake chose the blanket `From<T> for T` and
      a sane coherence rule; the mechanism delegated)
 
+657. **`?` desugars through `Try` and `FromResidual`.**  `std::core::ops`
+     declares `ControlFlow<Break, Continue>` (variants `Continue` and
+     `Break`), `Try { type Output; type Residual; static
+     from_output(Output) -> This; branch(this) -> ControlFlow<Residual,
+     Output>; }` and `FromResidual<R> { static from_residual(R) -> This;
+     }`, each a language item.  `x?` is `match (x.branch()) {
+     Continue(v) => { v } Break(r) => { return R::from_residual(r); } }`,
+     `R` the enclosing function's return type, the call stamped with
+     `Try` and the path directed through `FromResidual`.  A `Result<T, E>`
+     breaks with `Result<(), E>` and an `Option<T>` with `Option<()>`:
+     `never` is no type argument, so the residual is the enum at `()`.
+     One implementation, `FromResidual<Result<(), E>> for Result<T, F>
+     where F: From<E>`, covers the same error (through `From<T> for T`)
+     and a converted one; `Option<T>` takes `Option<()>`.  `?` still
+     applies to a `Result` or an `Option` only, and E0234, E0235 and
+     E0214 are unchanged; opening it to another type implementing `Try`
+     is a question for Jake.  (Jake: the traits, `ControlFlow`'s name and
+     visibility, a single converting implementation; the shapes delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that
