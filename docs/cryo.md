@@ -2764,6 +2764,8 @@ implement trait Eq for i32 {
 }
 ```
 
+A generic implementation with a where-clause implements the trait only for the instantiations whose arguments satisfy it: `implement<T> trait Clone for struct Array<T> where T: Clone` gives `[i32]` a `clone`, and gives none to `[Ref]` when `Ref` does not implement `Clone`. A call of such a method on an instantiation the clause refutes is refused where it is written (E0358, naming the trait and noting the where-clause).
+
 ### 12.3 Implement Blocks on Primitives
 
 Implement blocks may target primitive types, which is how the standard library hangs methods off `boolean`, the integer types, and `string`:
