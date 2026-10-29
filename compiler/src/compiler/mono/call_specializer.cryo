@@ -67,6 +67,7 @@ import compiler::types::compound::{
 import compiler::types::generic::{ InstantiatedType };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry, TemplateKind };
 import compiler::types::inference::{ InferCtx };
+import compiler::module_graph::{ ModulePath };
 import compiler::types::trait_checker::{ TraitChecker };
 import compiler::types::resolver::{ ResolutionContext, TypeResolver };
 import compiler::types::substitution::{ TypeSubstitution };
@@ -1350,7 +1351,10 @@ type struct MonoCallSpecializer {
         for (mut i: i64 = 0; i < this.state.spec_entries.length(); i++) {
             const entry: SpecializationEntry* = &this.state.spec_entries[i];
             if (!entry.specialized_type.equals(recv_type)) { continue; }
-            specialized = true;
+            // An entry holding only the blocks placed on the type for it -
+            // an object's, a head for every type's - is not the type's own
+            // specialization, and its written heads still answer.
+            if (entry.ast_node != null) { specialized = true; }
             for (mut j: i64 = 0; j < entry.impl_nodes.length(); j++) {
                 const block: ImplBlock* = DeclarationNode::impl_of(entry.impl_nodes[j]);
                 if (block != null && block.is_trait_impl() && block.trait_def.equals(trait_def)) {
@@ -1359,9 +1363,129 @@ type struct MonoCallSpecializer {
             }
         }
         if (!specialized) {
-            heads = this.generic_registry.heads_for(trait_def, recv_type, this.intern_table);
+            // A head for every type answers through the copy placed on the
+            // type (`blanket_implementation`), never as written.
+            const written: [DeclarationNode*] = this.generic_registry.heads_for(trait_def, recv_type, this.intern_table);
+            for (mut i: i64 = 0; i < written.length(); i++) {
+                const block: ImplBlock* = DeclarationNode::impl_of(written[i]);
+                if (block != null && block.target_param().is_valid()) { continue; }
+                heads.push(written[i]);
+            }
         }
         return heads;
+    }
+
+    /// Place on `owner` the copy of each head of the trait the static path
+    /// call `call` names that is for every type and whose method takes what
+    /// the call passes: the types the directing bound gives it, else its
+    /// arguments' (`implement<T> trait From<T> for T` for `High::from(h)`
+    /// with `h: High`, and for no `High::from(low)`).  The copy is made once
+    /// per type and head (`blanket_implementation`); a head whose method the
+    /// call does not take places nothing, so no copy is emitted unused.
+    place_blanket_implementations(mut &this, call: CallExpr*, owner: TypeRef) -> void {
+        const d: DefId = call.template_method;
+        const slot: i64 = this.generic_registry.trait_item_position(d);
+        if (slot < 0 || this.arena.contains_generic_param(owner)) { return; }
+        const blanket: [DeclarationNode*] = this.generic_registry.blanket_heads_of(this.decl_index.defs.parent_of(d));
+        for (mut h: i64 = 0; h < blanket.length(); h++) {
+            const head: ImplBlock* = DeclarationNode::impl_of(blanket[h]);
+            const m: MethodDecl* = DeclarationNode::method_of(this.generic_registry.trait_item_method(head, slot));
+            if (m == null || m.func == null) { continue; }
+            mut subject: TypeSubstitution = MonoCallSpecializer::blanket_subject(head, owner, this.arena);
+            const f: FunctionDecl* = DeclarationNode::fn_of(m.func);
+            mut k: i64 = 0;
+            mut takes: boolean = true;
+            for (mut i: i64 = 0; i < f.parameters.length() && takes; i++) {
+                const p: VarDecl* = DeclarationNode::var_of(f.parameters[i]);
+                if (p == null || p.is_receiver()) { continue; }
+                mut given: TypeRef = TypeRef::invalid();
+                if (call.bound_params.length() > 0) {
+                    if (k < call.bound_params.length()) { given = call.bound_params[k]; }
+                } else if (k < call.arguments.length() && call.arguments[k] != null) {
+                    given = call.arguments[k].resolved_type;
+                }
+                if (!given.is_valid() || !subject.apply(p.resolved_type, this.arena).equals(given)) { takes = false; }
+                k += 1;
+            }
+            if (!takes || !this.trait_spec.trait_checker.impl_applies(head, owner, 0)) { continue; }
+            this.blanket_implementation(blanket[h], owner);
+        }
+    }
+
+    /// The substitution of a head for every type, `head`, that binds its
+    /// parameter - the one its target is - to `subject`.
+    static blanket_subject(head: ImplBlock*, subject: TypeRef, arena: TypeArena*) -> TypeSubstitution {
+        mut params: [TypeRef] = [];
+        mut types: [TypeRef] = [];
+        const target: SymbolID = head.target_param();
+        for (mut gi: i64 = 0; gi < head.generic_params.length(); gi++) {
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(head.generic_params[gi]);
+            if (gp == null || !gp.sym_id.equals(target)) { continue; }
+            params.push(arena.create_generic_param(gp.sym_id, gp.name, gi as u64));
+            types.push(subject);
+        }
+        return TypeSubstitution::from_params(&params, &types);
+    }
+
+    /// The implementation `head_decl`, a head for every type
+    /// (`implement<T> trait From<T> for T`), places on `subject`: a copy of
+    /// the block with its parameter bound to `subject`, resolved, its methods
+    /// registered under `subject` and the calls in its bodies specialized, as
+    /// a generic type's placed copy's are.  Made once per type and head,
+    /// under an entry of its own that places it in `subject`'s module - a
+    /// primitive's in the trait's - where it is a specialization like any
+    /// other, so two modules emitting it link as one.
+    blanket_implementation(mut &this, head_decl: DeclarationNode*, subject: TypeRef) -> DeclarationNode* {
+        const head: ImplBlock* = DeclarationNode::impl_of(head_decl);
+        for (mut i: i64 = 0; i < this.state.spec_entries.length(); i++) {
+            const entry: SpecializationEntry* = &this.state.spec_entries[i];
+            if (entry.ast_node != null || !entry.specialized_type.equals(subject)) { continue; }
+            for (mut j: i64 = 0; j < entry.impl_nodes.length(); j++) {
+                if (DeclarationNode::impl_of(entry.impl_nodes[j]).template == head) { return entry.impl_nodes[j]; }
+            }
+        }
+        mut binding: TypeSubstitution = MonoCallSpecializer::blanket_subject(head, subject, this.arena);
+        mut syms: [SymbolID] = [];
+        syms.push(head.target_param());
+        // Heap-allocated: the substituter holds the pointer and attaches
+        // types that outlive this call.
+        const subst_ptr: TypeSubstitution* =
+            allocator::alloc(sizeof(TypeSubstitution), 16) as TypeSubstitution*;
+        *subst_ptr = MonoCallSpecializer::blanket_subject(head, subject, this.arena);
+        mut cloner: ASTCloner = ASTCloner::for_monomorphization();
+        const copy_decl: DeclarationNode* = cloner.clone_decl(head_decl);
+        const block: ImplBlock* = DeclarationNode::impl_of(copy_decl);
+        mut substituter: ASTTypeSubstituter* = ASTTypeSubstituter::create(
+            subst_ptr, this.arena, this.intern_table, DefId::invalid(), SymbolStr::empty(), syms, subject);
+        substituter.types = this.type_resolver;
+        substituter.walk_decl(copy_decl);
+        block.generic_params = [];
+        block.template = head;
+        block.spec_owner = subject;
+        this.ast_resolver.resolve_specialized_impl(block, &binding, subject);
+        this.decl_index.register_methods_through(subject, block.methods, null, &block.trait_arg_types,
+            this.intern_table, this.arena, "mono/blanket implementation");
+        const subject_t: Type* = this.arena.lookup(subject);
+        const declared: boolean = subject_t != null
+            && (subject_t.kind == TypeKind::Struct || subject_t.kind == TypeKind::Enum);
+        const placed_in: ModulePath = if (declared) {
+            this.arena.declared_in(subject_t)
+        } else {
+            this.arena.declared_in(this.arena.lookup(this.decl_index.type_of_def(head.trait_def)))
+        };
+        mut impls: [DeclarationNode*] = [];
+        impls.push(copy_decl);
+        this.state.spec_entries.push(SpecializationEntry {
+            specialized_type:  subject,
+            ast_node:          null,
+            impl_nodes:        impls,
+            template_module:   placed_in,
+            instantiated_type: TypeRef::invalid(),
+            injected:          false,
+            owner_source:      SymbolStr::empty(),
+        });
+        this.specialize_calls_in_spec_decl(copy_decl, &binding);
+        return copy_decl;
     }
 
     /// Bind `call` to the receiver's method `m`, held by `impl_node` or
@@ -1783,6 +1907,7 @@ type struct MonoCallSpecializer {
                 const gm: MethodDecl* = DeclarationNode::method_of(gm_decl);
                 if (gm != null) { this.instantiate_generic_method(call, gm_decl, gm_impl, gm_owner, owner, null); }
             } else if (ExpressionNode::scope_resolution_of(call.callee) != null) {
+                this.place_blanket_implementations(call, owner);
                 const path_m: DeclarationNode* = this.path_method_on(call, owner);
                 if (!this.instantiate_lent_method(call, path_m, owner)) { this.pin_plain(call, path_m); }
             } else if (call.template_method.is_valid()) {

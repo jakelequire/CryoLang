@@ -26,7 +26,7 @@ import compiler::types::{
 import compiler::diag::{ diagnostic, ErrorCode, sink, source_span };
 import compiler::resolver::{ intern_table, symbol_str };
 import std::fmt;
-import compiler::ast::declaration::{ DeclarationNode, FunctionDecl, ImplBlock, MethodDecl, TraitDecl, VarDecl };
+import compiler::ast::declaration::{ DeclarationNode, FunctionDecl, GenericParamDecl, ImplBlock, MethodDecl, TraitDecl, VarDecl };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::sink::{ DiagnosticSink };
 import compiler::resolver::intern_table::{ InternTable };
@@ -233,7 +233,12 @@ type struct TraitChecker {
         for (mut i: i64 = 0; i < heads.length(); i++) {
             const block: ImplBlock* = DeclarationNode::impl_of(heads[i]);
             if (block == null) { continue; }
-            if (!this.generic_registry.binds_trait_arguments(block, args, this.intern_table)) { continue; }
+            const binds: boolean = if (block.target_param().is_valid()) {
+                this.generic_registry.blanket_binds(block, args, value, this.intern_table)
+            } else {
+                this.generic_registry.binds_trait_arguments(block, args, this.intern_table)
+            };
+            if (!binds) { continue; }
             if (this.impl_applies(block, value, depth)) { return heads[i]; }
         }
         return null;
@@ -407,6 +412,18 @@ type struct TraitChecker {
     impl_bounds_hold(&this, impl_block: ImplBlock*, subject: TypeRef, depth: i32) -> boolean {
         if (impl_block == null) { return false; }
         if (impl_block.where_bounds.length() == 0) { return true; }
+        // A head for every type: its parameter is the subject itself.
+        const target: SymbolID = impl_block.target_param();
+        if (target.is_valid()) {
+            mut blanket: TypeSubstitution = TypeSubstitution::empty();
+            for (mut gi: i64 = 0; gi < impl_block.generic_params.length(); gi++) {
+                const gp: GenericParamDecl* = DeclarationNode::generic_param_of(impl_block.generic_params[gi]);
+                if (gp != null && gp.sym_id.equals(target)) {
+                    blanket.add(this.arena.create_generic_param(gp.sym_id, gp.name, gi as u64), subject);
+                }
+            }
+            return this.bounds_satisfied_at_depth(impl_block.where_bounds, &blanket, depth + 1);
+        }
         // Build a fresh substitution from the impl's generic params to
         // the concrete type's args. For `implement<T> trait Eq for Option<T>`
         // and `ty = Option<X>`, the impl's `T` maps to the InstantiatedType's

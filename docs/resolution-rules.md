@@ -929,6 +929,25 @@ yet is recorded with the change that builds it, not here.
      is.  (Jake asked for the converting `FromResidual` impl, which has
      this shape; the rule delegated)
 
+656. **An implementation for every type.**  An implementation whose
+     target is a parameter of its own, `implement<T> trait From<T> for T`,
+     is filed under its trait alone.  A bound on the trait is satisfied by
+     it for any type whose arguments it binds - `From<T> for T` gives a
+     type `From` of itself and of nothing else - and its where-clause, if
+     any, is checked with the parameter bound to that type.  Monomorphization
+     places a copy of the implementation on a type the first time a call
+     through the trait needs it, in the type's module (a primitive's in the
+     trait's), and only when the call passes what the copy's method takes,
+     so no copy is emitted unused.  A call through a type's path reaches
+     it when the type declares no member of that name; a type with a
+     member of its own reaches it only through a bound (a known gap).
+     Coherence: such a head overlaps every head of its trait, whatever the
+     target, that unifies with it once its parameter is bound to the
+     other's target - `From<X> for X` and a second head for every type are
+     E0308, `From<i8> for i16` is not - and each pair is reported once, at
+     the head checked second.  (Jake chose the blanket `From<T> for T` and
+     a sane coherence rule; the mechanism delegated)
+
 596. **`Arc`'s raw pointer is a pointer to its value.**  `into_raw`
      returns a `T*` to the value inside the shared block, and `from_raw`,
      `increment_strong_count` and `decrement_strong_count` take that

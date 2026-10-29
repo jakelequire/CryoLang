@@ -7864,6 +7864,63 @@ type struct CallResolver {
             call.callee.set_resolved_type(tmpl_ret);
             return tmpl_ret;
         }
+        const blanket_ret: TypeRef = this.record_blanket_static_call(call, scope, owner_ty);
+        if (blanket_ret.is_valid()) { *claimed = true; }
+        return blanket_ret;
+    }
+
+    /// A static call through a type's path to a method the type has only
+    /// through a head for every type (`i32::from(5)` with `implement<T>
+    /// trait From<T> for T`): the head whose trait declares the member and
+    /// whose method, with the head's parameter bound to the owner, takes the
+    /// arguments' types.  The call records the trait's method, the owner and
+    /// the types the method takes, as a path a bound directs does, and
+    /// monomorphization places the head's copy on the owner and binds the
+    /// call to it.  Typed by the method's return with the parameter bound;
+    /// invalid when no such head takes the arguments, or the owner is still
+    /// a parameter, whose methods only a bound gives.
+    record_blanket_static_call(mut &this, call: CallExpr*, scope: ScopeResolutionExpr*, owner: TypeRef) -> TypeRef {
+        if (call == null || !owner.is_valid() || this.types.contains_generic_param(owner)) { return TypeRef::invalid(); }
+        for (mut h: i64 = 0; h < this.ctx.generic_registry.blanket_heads.length(); h++) {
+            const trait_def: DefId = this.ctx.generic_registry.blanket_heads[h].trait_id;
+            const head: ImplBlock* = DeclarationNode::impl_of(this.ctx.generic_registry.blanket_heads[h].block);
+            const item: DefId = this.trait_item_def(trait_def, scope);
+            if (head == null || !item.is_valid()) { continue; }
+            const slot: i64 = this.ctx.generic_registry.trait_item_position(item);
+            const m: MethodDecl* = DeclarationNode::method_of(this.ctx.generic_registry.trait_item_method(head, slot));
+            if (m == null || m.func == null) { continue; }
+            const f: FunctionDecl* = DeclarationNode::fn_of(m.func);
+            mut params: [TypeRef] = [];
+            mut types: [TypeRef] = [];
+            for (mut gi: i64 = 0; gi < head.generic_params.length(); gi++) {
+                const gp: GenericParamDecl* = DeclarationNode::generic_param_of(head.generic_params[gi]);
+                if (gp == null || !gp.sym_id.equals(head.target_param())) { continue; }
+                params.push(this.arena.create_generic_param(gp.sym_id, gp.name, gi as u64));
+                types.push(owner);
+            }
+            const subject: TypeSubstitution = TypeSubstitution::from_params(&params, &types);
+            mut taken: [TypeRef] = [];
+            for (mut i: i64 = 0; i < f.parameters.length(); i++) {
+                const p: VarDecl* = DeclarationNode::var_of(f.parameters[i]);
+                if (p != null && !p.is_receiver()) { taken.push(subject.apply(p.resolved_type, this.arena)); }
+            }
+            if (taken.length() != call.arguments.length()) { continue; }
+            mut takes: boolean = true;
+            for (mut i: i64 = 0; i < taken.length(); i++) {
+                const arg: ExpressionNode* = call.arguments[i];
+                if (arg == null || !arg.resolved_type.is_valid() || !this.checker.can_assign(arg.resolved_type, taken[i])) {
+                    takes = false;
+                }
+            }
+            if (!takes) { continue; }
+            call.template_method = item;
+            call.bound_params = taken;
+            scope.set_resolved_trait(trait_def);
+            scope.spec_owner = owner;
+            const ret: TypeRef = subject.apply(f.resolved_return_type, this.arena);
+            call.callee.set_resolved_type(ret);
+            return ret;
+        }
         return TypeRef::invalid();
     }
 

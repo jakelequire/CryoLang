@@ -1796,6 +1796,15 @@ type struct TypeResolutionPasses {
                     ctx.decl_index.impl_owner(node, "type_resolution/trait impl"), decl);
             }
         }
+        // A head whose target is a parameter of its own (`implement<T> trait
+        // From<T> for T`) is for every type: it is filed under its trait
+        // alone, and its methods belong to no owner until a type asks for
+        // them, when monomorphization places a copy of the block on that
+        // type (`MonoCallSpecializer::blanket_implementation`).
+        const blanket: boolean = node.is_trait_impl() && node.target_param().is_valid();
+        if (blanket) {
+            ctx.generic_registry.register_blanket_impl(node.trait_def, decl);
+        }
         // Trait-impl coherence (same file AND across modules).  A trait may be
         // implemented at most once per type.  The head's key is its
         // identities (`coherence_key_of`): same-leaf types in different
@@ -1807,9 +1816,9 @@ type struct TypeResolutionPasses {
         // no double report.  Source decls only: monomorphizer-injected spec
         // clones share heads across the modules that instantiate them and
         // would false-positive.
-        if (is_source_decl && node.is_trait_impl() && canonical_target.is_valid()) {
+        if (is_source_decl && node.is_trait_impl() && (canonical_target.is_valid() || blanket)) {
             mut coh_key: [u64] = [];
-            const keyed: boolean = TypeResolutionPasses::coherence_key_of(node, ctx, &coh_key);
+            const keyed: boolean = !blanket && TypeResolutionPasses::coherence_key_of(node, ctx, &coh_key);
             const prior: DeclarationNode* = if (keyed) {
                 ctx.generic_registry.register_coherence_head(&coh_key, decl)
             } else { null };
@@ -1859,10 +1868,12 @@ type struct TypeResolutionPasses {
                     ctx.emit_diagnostic(od);
                 }
             }
+            ctx.generic_registry.mark_overlap_checked(node.trait_def, decl);
         }
         if (is_source_decl && node.is_trait_impl()) {
             TypeResolutionPasses::lend_trait_argument_params(node);
         }
+        if (blanket) { return; }
         // The head's methods under the owner the index names, their returns
         // in the owner's parameters.
         mut head: TypeSubstitution = TypeResolutionPasses::impl_params_to_owner(node, ctx, arena);

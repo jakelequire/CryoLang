@@ -2046,6 +2046,8 @@ implement trait Shape for struct Sq {
 
 A trait has at most one implementation for any type, and that is decided by the heads alone. Two implementations of one trait whose heads unify - some type both would accept - are refused at the later one (`E0308`), whether the heads are identical, one generic and one concrete (`Show for Wrap<T>` beside `Show for Wrap<i32>`: a `Wrap<i32>` would select both), or told apart only by their `where` clauses (`Emit for Holder<T> where T: Alpha` beside `Emit for Holder<T> where T: Beta`: a bound narrows which types a head is for but nothing can prove two bounds disjoint). There is no specialisation and no selection by declaration order. Heads that no type satisfies together are distinct implementations: `Show for Pair<T, T>` beside `Show for Pair<i32, u8>`, or `From<i8> for u64` beside `From<u8> for u64`.
 
+An implementation's target may be a parameter of its own: `implement<T> trait Make<T> for T` implements `Make<T>` for every type `T`. A bound is satisfied by it (`where F: Make<E>` with `F` and `E` the same type), a call through a type's path reaches it when the type has no method of that name of its own (`i32::make(11)`), and each type runs its own copy of its methods. It overlaps every head of the trait that some type would satisfy together with it: `Make<Wide> for Wide` and a second `Make<U> for U` are refused (`E0308`), `Make<i32> for Wide` is not, since `Make<T> for T` gives `Wide` only `Make<Wide>`.
+
 ### 10.3 Trait Bounds with `where`
 
 A generic parameter is constrained to types that implement specific traits via a `where` clause:
