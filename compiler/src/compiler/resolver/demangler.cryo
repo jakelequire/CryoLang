@@ -120,13 +120,11 @@ type struct Cursor {
     /// generic-method symbol.
     try_parse_generic_blob(mut &this) -> string {
         const start: i64 = this.pos;
-        mut di: i64 = start;
-        while (di < this.len) {
-            const c: char = this.text[di];
-            if (!c.is_digit()) { break; }
-            di += 1;
-        }
-        const ndigits: i64 = di - start;
+        const rest: Slice<u8> = Slice::from_raw((this.text as u8*) + start, this.len - start);
+        const ndigits: i64 = match (u64::parse_radix_prefix(rest, 10)) {
+            Option::Some(run) => { run.1 }
+            Option::None      => { 0 }
+        };
         // Need at least two digits to split into outer + inner length prefixes.
         // A single-digit length can't be a fused double prefix, and an ordinary
         // identifier never starts with a digit, so a plain segment's length is
@@ -140,10 +138,7 @@ type struct Cursor {
         // after the owner can make the fused (too-large) length still fit, yet the
         // segment is just as wrapped.  Longest outer first (purely an ordering).
         for (mut k: i64 = ndigits - 1; k >= 1; k--) {
-            mut outer: i64 = 0;
-            for (mut j: i64 = start; j < start + k; j++) {
-                outer = outer * 10 + ((this.text[j] as i64) - ('0' as i64));
-            }
+            const outer: i64 = u64::parse_radix(rest.subslice(0, k), 10).unwrap_or(0) as i64;
             const inner_start: i64 = start + k;
             if (outer <= 0 || inner_start + outer > this.len) { continue; }
             const inner: string = this.text.substr(inner_start as i64, outer as i64);
@@ -152,12 +147,7 @@ type struct Cursor {
             if (!sub.ok || sub.pos != sub.len) { continue; }
             // Require the inner to actually be a generic instance (rendered
             // with `<...>`), so a coincidental plain-ident split can't match.
-            mut has_angle: boolean = false;
-            const rlen: i64 = rendered.length() as i64;
-            for (mut z: i64 = 0; z < rlen; z++) {
-                if (rendered[z] == '<') { has_angle = true; break; }
-            }
-            if (!has_angle) { continue; }
+            if (rendered.find("<") < 0) { continue; }
             this.pos = inner_start + outer;
             return rendered;
         }
