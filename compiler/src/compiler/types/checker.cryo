@@ -260,6 +260,12 @@ type struct TypeChecker {
                 if (drops_const) { return TypeCompatibility::ExplicitCast; }
                 return TypeCompatibility::Identical;
             }
+            // A read-only level is added at the outermost pointer only: a
+            // `u8**` seen as a `const u8**` would let a `const u8*` be stored
+            // where a `u8*` is read back, and written through.
+            if (this.inner_const_differs(from_ptr.pointee, to_ptr.pointee)) {
+                return TypeCompatibility::ExplicitCast;
+            }
             if (this.pointee_converts(from_ptr.pointee, to_ptr.pointee) && !drops_const) {
                 return TypeCompatibility::ImplicitConvert;
             }
@@ -574,6 +580,35 @@ type struct TypeChecker {
         const fp: PointerType* = f.as_pointer();
         const tp: PointerType* = t.as_pointer();
         return fp.const_pointee && !tp.const_pointee && fp.pointee.equals(tp.pointee);
+    }
+
+    /// True when `from` and `to` are pointers whose pointees disagree on
+    /// `const` below the outermost level (`u8**` to `const u8**`): only an
+    /// explicit `as` makes that conversion, and the sites that report a
+    /// refused pointer conversion name this cause apart from a dropped
+    /// `const`.
+    changes_inner_const(&this, from: TypeRef, to: TypeRef) -> boolean {
+        const f: Type* = this.arena.lookup(from);
+        const t: Type* = this.arena.lookup(to);
+        if (f == null || t == null) { return false; }
+        if (f.kind != TypeKind::Pointer || t.kind != TypeKind::Pointer) { return false; }
+        return this.inner_const_differs(f.as_pointer().pointee, t.as_pointer().pointee);
+    }
+
+    /// Whether two pointees that are both pointers disagree on `const` at
+    /// some level: `u8*` against `const u8*`, or `const (u8*)*` against
+    /// `u8**`.  Below the outermost level the levels must match exactly.
+    inner_const_differs(&this, from: TypeRef, to: TypeRef) -> boolean {
+        mut f: Type* = this.arena.lookup(from);
+        mut t: Type* = this.arena.lookup(to);
+        while (f != null && t != null && f.kind == TypeKind::Pointer && t.kind == TypeKind::Pointer) {
+            const fp: PointerType* = f.as_pointer();
+            const tp: PointerType* = t.as_pointer();
+            if (fp.const_pointee != tp.const_pointee) { return true; }
+            f = this.arena.lookup(fp.pointee);
+            t = this.arena.lookup(tp.pointee);
+        }
+        return false;
     }
 
     /// True when the type is one machine word holding an address: a raw
