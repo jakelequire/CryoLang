@@ -51,35 +51,56 @@ public type trait FromResidual<R> {
     static from_residual(residual: R) -> This;
 }
 
-/// `Deref<Target>` exposes the value a smart pointer points at. The
-/// returned `Target*` is mutable (Cryo pointers are not const-qualified),
-/// so this one trait covers both shared and mutable access - there is no
-/// separate `DerefMut`.
+/// `Deref<Target>` exposes, read-only, the value a smart pointer points at.
 ///
-/// The compiler rewrites `*b` into `*(b.deref())`; because the deref of the
-/// returned `Target*` is a place, the one impl serves reads (`v = *b`),
-/// writes (`*b = x`), and compound assignment (`*b += x`). Member access
-/// auto-derefs too: `b.field` / `b.method()` on a `Box<Foo>` coerce through
-/// `.deref()` (transitively) when the receiver type lacks the member.
-/// Type-directed and only fires when the primitive `*` / field rules do not
-/// apply, so raw pointers and references keep their native behavior.
+/// The compiler rewrites `*b` into `*(b.deref())` where `*b` is read
+/// (`v = *b`). Member access reads through it too: `b.field` / `b.method()`
+/// on a `Box<Foo>` go through `.deref()` (transitively) when the receiver
+/// type lacks the member. Type-directed and only fires when the primitive
+/// `*` / field rules do not apply, so raw pointers and references keep their
+/// native behavior. Writing through `*b` is `DerefMutable`'s.
 ![language("deref")]
 public type trait Deref<Target> {
     ![language("deref_deref")]
-    deref(&this) -> Target*;
+    deref(&this) -> const Target*;
 }
 
-/// `Index<Idx, Output>` is the contract for `container[idx]`-style access,
-/// returning a pointer to the element. The compiler rewrites `a[i]` into
-/// `*(a.index(i))`; because the deref of the returned `Output*` is a place, the
-/// one impl serves reads (`v = a[i]`), writes (`a[i] = v`), and compound
-/// assignment (`a[i] += v`). Type-directed and only fires when the primitive
-/// array/slice/string/pointer indexing rules do not apply, so built-in indexing
-/// stays on the native path. A `&T` container overloads exactly like a value.
+/// `DerefMutable<Target>` exposes, writable, the value a smart pointer
+/// points at. Where `*b` is written - assigned (`*b = x`), given a compound
+/// assignment (`*b += x`), or the receiver of a `mut &this` method, and
+/// likewise a member reached through `*b` - the compiler rewrites it into
+/// `*(b.deref_mutable())`, which needs `b` itself writable. A type that
+/// implements only `Deref` is read-only through `*`.
+![language("deref_mutable")]
+public type trait DerefMutable<Target> : Deref<Target> {
+    ![language("deref_mutable_deref_mutable")]
+    deref_mutable(mut &this) -> Target*;
+}
+
+/// `Index<Idx, Output>` is the contract for reading `container[idx]`,
+/// returning a read-only pointer to the element. The compiler rewrites
+/// `a[i]` into `*(a.index(i))` where `a[i]` is read (`v = a[i]`).
+/// Type-directed and only fires when the primitive array/slice/string/pointer
+/// indexing rules do not apply, so built-in indexing stays on the native
+/// path. A `&T` container overloads exactly like a value. Writing `a[i]` is
+/// `IndexMutable`'s.
 ![language("index")]
 public type trait Index<Idx, Output> {
     ![language("index_index")]
-    index(&this, idx: Idx) -> Output*;
+    index(&this, idx: Idx) -> const Output*;
+}
+
+/// `IndexMutable<Idx, Output>` is the contract for writing
+/// `container[idx]`, returning a writable pointer to the element. Where
+/// `a[i]` is written - assigned (`a[i] = v`), given a compound assignment
+/// (`a[i] += v`), or the receiver of a `mut &this` method, and likewise a
+/// member of it - the compiler rewrites it into `*(a.index_mutable(i))`,
+/// which needs `a` itself writable. A type that implements only `Index` is
+/// read-only through `[]`.
+![language("index_mutable")]
+public type trait IndexMutable<Idx, Output> : Index<Idx, Output> {
+    ![language("index_mutable_index_mutable")]
+    index_mutable(mut &this, idx: Idx) -> Output*;
 }
 
 /// `Allocate` is where `new` gets its memory and `delete` returns it.

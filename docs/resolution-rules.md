@@ -162,6 +162,20 @@ yet is recorded with the change that builds it, not here.
      reported; a write through a read-only place is E0250.  Like every
      retired code it is never given a new meaning.  (Jake)
 
+671. **`[]` and `*` read through `Index` and `Deref`, and write through
+     `IndexMutable` and `DerefMutable`.**  `index(&this, i)` returns
+     `const Output*` and `deref(&this)` returns `const Target*`; the
+     writable traits, each with the read-only one as its supertrait, have
+     `index_mutable(mut &this, i) -> Output*` and
+     `deref_mutable(mut &this) -> Target*`.  `a[i]` and `*b` - and a
+     member reached through `b`'s `Deref` - call the writable method where
+     the place is written: assigned, given a compound assignment, made the
+     receiver of a `mut &this` method, or holding a member that is; the
+     read-only method everywhere else.  The container or pointer is then
+     written as a `mut &this` receiver, so it must be writable (E0250), and
+     a type with only the read-only trait is refused naming the missing one
+     (E0229).  No `as` is needed anywhere on either path.  (Jake)
+
 ### 2026-10-29
 
 663. **A binding from a match on a borrow is writable exactly when the

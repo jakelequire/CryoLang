@@ -1,10 +1,12 @@
-///! Operator traits (`core::ops`): user `Deref` / `Index` impls.
+///! Operator traits (`core::ops`): user `Deref`/`DerefMutable` and
+///! `Index`/`IndexMutable` impls.
 ///!
 ///! Every overloadable operator has full sugar over user types: arithmetic
 ///! (`+ - * / %`), unary `-`, equality/relational (`== != < > <= >=`),
 ///! bitwise/shift (`& | ^ << >>` + their `&=`-style compound forms), unary
-///! complement (`!` / `~`), indexing (`[]` as read/write/compound), and
-///! dereference (`*b` as read/write/compound, plus `b.field` / `b.method()`
+///! complement (`!` / `~`), indexing (`[]` read through `index`, written and
+///! compound-assigned through `index_mutable`), and dereference (`*b` likewise
+///! through `deref` and `deref_mutable`, plus `b.field` / `b.method()`
 ///! member-access auto-deref coercion, transitively). All are incl. generic
 ///! and bounded-param dispatch. Operands passed by reference (`&T`) overload
 ///! exactly like values. The tests pin that sugar alongside the direct-method
@@ -16,7 +18,8 @@ namespace CryoTests::Tests::Lang::OperatorOverload;
 
 import std::core::result::{ Result };
 import std::core::ops::{
-    Add, BitAnd, BitNot, BitOr, BitXor, Deref, Index, Mul, Neg, Not, Shl, Shr
+    Add, BitAnd, BitNot, BitOr, BitXor, Deref, DerefMutable, Index, IndexMutable,
+    Mul, Neg, Not, Shl, Shr
 };
 import std::test::error::{ TestError };
 import std::test::assert::{ expect_eq };
@@ -25,15 +28,26 @@ import std::test::assert::{ expect_eq };
 type struct Boxed { value: i32; }
 
 implement trait Deref<i32> for Boxed {
-    deref(&this) -> i32* {
+    deref(&this) -> const i32* {
+        return &this.value;
+    }
+}
+
+implement trait DerefMutable<i32> for Boxed {
+    deref_mutable(mut &this) -> i32* {
         return &this.value;
     }
 }
 
 // Resolve `.deref()` through the `Deref` bound rather than the bare global
 // method name: bound-directed resolution is unambiguous.
-function deref_ptr<T, U>(x: &T) -> U* where T: Deref<U> {
+function deref_ptr<T, U>(x: &T) -> const U* where T: Deref<U> {
     return x.deref();
+}
+
+// The writable form, through a `DerefMutable` bound.
+function deref_mutable_ptr<T, U>(x: mut &T) -> U* where T: DerefMutable<U> {
+    return x.deref_mutable();
 }
 
 // A fixed 3-slot container implementing Index.
@@ -44,7 +58,15 @@ type struct Triple {
 }
 
 implement trait Index<u64, i32> for Triple {
-    index(&this, idx: u64) -> i32* {
+    index(&this, idx: u64) -> const i32* {
+        if (idx == 0) { return &this.a; }
+        if (idx == 1) { return &this.b; }
+        return &this.c;
+    }
+}
+
+implement trait IndexMutable<u64, i32> for Triple {
+    index_mutable(mut &this, idx: u64) -> i32* {
         if (idx == 0) { return &this.a; }
         if (idx == 1) { return &this.b; }
         return &this.c;
@@ -54,16 +76,16 @@ implement trait Index<u64, i32> for Triple {
 ![test]
 function deref_returns_pointer_to_value() -> Result<(), TestError> {
     const b: Boxed = Boxed { value: 41 };
-    const p: i32* = deref_ptr(&b);
+    const p: const i32* = deref_ptr(&b);
     return expect_eq(*p, 41);
 }
 
-// The Deref pointer aliases the receiver in place: writing through it
-// mutates the original `Boxed`.
+// The DerefMutable pointer aliases the receiver in place: writing through
+// it mutates the original `Boxed`.
 ![test]
 function deref_pointer_aliases_in_place() -> Result<(), TestError> {
     mut b: Boxed = Boxed { value: 1 };
-    const p: i32* = deref_ptr(&b);
+    const p: i32* = deref_mutable_ptr(&b);
     *p = 100;
     return expect_eq(b.value, 100);
 }
@@ -71,9 +93,9 @@ function deref_pointer_aliases_in_place() -> Result<(), TestError> {
 ![test]
 function index_reads_each_slot() -> Result<(), TestError> {
     const t: Triple = Triple { a: 10, b: 20, c: 30 };
-    const p0: i32* = t.index(0);
-    const p1: i32* = t.index(1);
-    const p2: i32* = t.index(2);
+    const p0: const i32* = t.index(0);
+    const p1: const i32* = t.index(1);
+    const p2: const i32* = t.index(2);
     match (expect_eq(*p0, 10)) {
         Result::Ok(_) => { }
         Result::Err(e) => { return Result::Err(e); }
@@ -85,26 +107,35 @@ function index_reads_each_slot() -> Result<(), TestError> {
     return expect_eq(*p2, 30);
 }
 
-// The Index pointer aliases the receiver in place.
+// The IndexMutable pointer aliases the receiver in place.
 ![test]
 function index_pointer_aliases_in_place() -> Result<(), TestError> {
     mut t: Triple = Triple { a: 1, b: 2, c: 3 };
-    const p: i32* = t.index(1);
+    const p: i32* = t.index_mutable(1);
     *p = 99;
     return expect_eq(t.b, 99);
 }
 
-// A container whose `index` bumps a counter it points at, so a compound
-// assignment that evaluated the LHS place twice would show `calls == 2`.
-// `index` takes `&this`, as `Index` declares it, so the count lives outside.
+// A container whose `index` adds 1 and `index_mutable` adds 10 to a counter
+// they point at, so a compound assignment that evaluated the LHS place
+// twice, or read it through `index` before writing it, would not show
+// `calls == 10`.  `index` takes `&this`, as `Index` declares it, so the
+// count lives outside.
 type struct Counted {
     slot:  i32;
     calls: i32*;
 }
 
 implement trait Index<i64, i32> for Counted {
-    index(&this, idx: i64) -> i32* {
+    index(&this, idx: i64) -> const i32* {
         *this.calls = *this.calls + 1;
+        return &this.slot;
+    }
+}
+
+implement trait IndexMutable<i64, i32> for Counted {
+    index_mutable(mut &this, idx: i64) -> i32* {
+        *this.calls = *this.calls + 10;
         return &this.slot;
     }
 }
@@ -117,7 +148,14 @@ type struct Wrap<T> {
 }
 
 implement<T> trait Index<i64, T> for struct Wrap<T> {
-    index(&this, idx: i64) -> T* {
+    index(&this, idx: i64) -> const T* {
+        if (idx == 0) { return &this.x; }
+        return &this.y;
+    }
+}
+
+implement<T> trait IndexMutable<i64, T> for struct Wrap<T> {
+    index_mutable(mut &this, idx: i64) -> T* {
         if (idx == 0) { return &this.x; }
         return &this.y;
     }
@@ -144,7 +182,8 @@ function index_sugar_reads() -> Result<(), TestError> {
     return expect_eq(t[2u64], 30);
 }
 
-// `[]` sugar as a write target: the desugar `*(t.index(i))` is a place.
+// `[]` sugar as a write target: written, `t[i]` desugars to
+// `*(t.index_mutable(i))`.
 ![test]
 function index_sugar_writes() -> Result<(), TestError> {
     mut t: Triple = Triple { a: 1, b: 2, c: 3 };
@@ -152,7 +191,8 @@ function index_sugar_writes() -> Result<(), TestError> {
     return expect_eq(t.b, 99);
 }
 
-// Compound assignment through `[]` calls `index` exactly once.
+// Compound assignment through `[]` calls `index_mutable` exactly once, and
+// `index` not at all; a read then calls `index` once.
 ![test]
 function index_sugar_compound_once() -> Result<(), TestError> {
     mut calls: i32 = 0;
@@ -162,11 +202,20 @@ function index_sugar_compound_once() -> Result<(), TestError> {
         Result::Ok(_)  => { }
         Result::Err(e) => { return Result::Err(e); }
     }
-    return expect_eq(calls, 1);
+    match (expect_eq(calls, 10)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    const read: i32 = c[0];
+    match (expect_eq(read, 12)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(calls, 11);
 }
 
-// Generic container: `[]` sugar reads and writes through a specialized
-// `Wrap<i32>::index`.
+// Generic container: `[]` sugar reads through a specialized
+// `Wrap<i32>::index` and writes through `Wrap<i32>::index_mutable`.
 ![test]
 function index_sugar_generic() -> Result<(), TestError> {
     mut w: Wrap<i32> = Wrap::<i32> { x: 100, y: 200 };
@@ -341,7 +390,10 @@ function reflected_scalar_times_vector() -> Result<(), TestError> {
 // the `*` desugar so `SmartBox<i32>::deref` gets specialized.
 type struct SmartBox<T> { slot: T; }
 implement<T> trait Deref<T> for struct SmartBox<T> {
-    deref(&this) -> T* { return &this.slot; }
+    deref(&this) -> const T* { return &this.slot; }
+}
+implement<T> trait DerefMutable<T> for struct SmartBox<T> {
+    deref_mutable(mut &this) -> T* { return &this.slot; }
 }
 
 // `*b` on a generic param bounded by `Deref`. By value: a `&T`
@@ -357,8 +409,9 @@ function deref_sugar_reads() -> Result<(), TestError> {
     return expect_eq(*b, 41);
 }
 
-// `*b` sugar as a write target: the desugar `*(b.deref())` is a place, so the
-// pointer aliases the receiver's storage in place.
+// `*b` sugar as a write target: written, `*b` desugars to
+// `*(b.deref_mutable())`, whose pointer aliases the receiver's storage in
+// place.
 ![test]
 function deref_sugar_writes() -> Result<(), TestError> {
     mut b: Boxed = Boxed { value: 1 };
@@ -374,8 +427,8 @@ function deref_sugar_compound() -> Result<(), TestError> {
     return expect_eq(b.value, 12);
 }
 
-// Generic container: `*b` reads and writes through a specialized
-// `SmartBox<i32>::deref`.
+// Generic container: `*b` reads through a specialized
+// `SmartBox<i32>::deref` and writes through `SmartBox<i32>::deref_mutable`.
 ![test]
 function deref_sugar_generic() -> Result<(), TestError> {
     mut g: SmartBox<i32> = SmartBox::<i32> { slot: 200 };
@@ -395,10 +448,11 @@ function deref_sugar_bounded_param() -> Result<(), TestError> {
 }
 
 // A Deref target that is not the value's first field: reading the value
-// itself instead of calling `deref` gives `tag`, not `slot`.
+// itself instead of calling `deref` gives `tag`, not `slot`.  Read-only
+// through `*`: it has no `DerefMutable`.
 type struct Tagged { tag: i32; slot: i32; }
 implement trait Deref<i32> for Tagged {
-    deref(&this) -> i32* { return &this.slot; }
+    deref(&this) -> const i32* { return &this.slot; }
 }
 
 // `*b` in a copy of a generic body calls the copy's `deref`.
@@ -420,19 +474,28 @@ implement Coord {
 // A smart pointer over Coord.
 type struct CoordBox { c: Coord; }
 implement trait Deref<Coord> for CoordBox {
-    deref(&this) -> Coord* { return &this.c; }
+    deref(&this) -> const Coord* { return &this.c; }
+}
+implement trait DerefMutable<Coord> for CoordBox {
+    deref_mutable(mut &this) -> Coord* { return &this.c; }
 }
 
 // A box over a box: exercises transitive (multi-hop) coercion.
 type struct CoordBoxBox { inner: CoordBox; }
 implement trait Deref<CoordBox> for CoordBoxBox {
-    deref(&this) -> CoordBox* { return &this.inner; }
+    deref(&this) -> const CoordBox* { return &this.inner; }
+}
+implement trait DerefMutable<CoordBox> for CoordBoxBox {
+    deref_mutable(mut &this) -> CoordBox* { return &this.inner; }
 }
 
 // A generic smart pointer: exercises mono descent into the coerced chain.
 type struct GBox<T> { held: T; }
 implement<T> trait Deref<T> for struct GBox<T> {
-    deref(&this) -> T* { return &this.held; }
+    deref(&this) -> const T* { return &this.held; }
+}
+implement<T> trait DerefMutable<T> for struct GBox<T> {
+    deref_mutable(mut &this) -> T* { return &this.held; }
 }
 
 // `b.field` auto-derefs through `.deref()` when the receiver lacks the field.
@@ -491,4 +554,64 @@ function deref_coercion_generic() -> Result<(), TestError> {
     }
     g.px = 44;
     return expect_eq(g.held.px, 44);
+}
+
+// A write two hops in goes through `deref_mutable` at both hops.
+![test]
+function deref_coercion_multi_hop_write() -> Result<(), TestError> {
+    mut b: CoordBoxBox = CoordBoxBox { inner: CoordBox { c: Coord { px: 1, py: 2 } } };
+    b.px = 7;
+    b.bump_x(8);
+    return expect_eq(b.inner.c.px, 8);
+}
+
+// `c[i] = v` on a generic param bounded by `IndexMutable`.
+function set_at<T>(c: mut &T, i: u64, v: i32) -> void where T: IndexMutable<u64, i32> {
+    c[i] = v;
+}
+
+![test]
+function index_sugar_bounded_param_writes() -> Result<(), TestError> {
+    mut t: Triple = Triple { a: 1, b: 2, c: 3 };
+    set_at(&t, 2, 30);
+    return expect_eq(t.c, 30);
+}
+
+// A container of containers: `g[i][j] = v` writes the inner element through
+// `index_mutable` at both levels, and `g[i].bump_x(v)` calls a `mut &this`
+// method on an element reached through `index_mutable`.
+type struct Grid { rows: Wrap<Triple>; }
+
+implement trait Index<i64, Triple> for Grid {
+    index(&this, idx: i64) -> const Triple* { return &this.rows[idx]; }
+}
+
+implement trait IndexMutable<i64, Triple> for Grid {
+    index_mutable(mut &this, idx: i64) -> Triple* { return &this.rows[idx]; }
+}
+
+![test]
+function index_sugar_nested_write() -> Result<(), TestError> {
+    mut g: Grid = Grid {
+        rows: Wrap::<Triple> { x: Triple { a: 1, b: 2, c: 3 }, y: Triple { a: 4, b: 5, c: 6 } },
+    };
+    g[1][2u64] = 60;
+    g[0][0u64] += 10;
+    match (expect_eq(g.rows.x.a, 11)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(g.rows.y.c, 60);
+}
+
+![test]
+function index_sugar_element_receiver() -> Result<(), TestError> {
+    mut w: Wrap<Coord> = Wrap::<Coord> { x: Coord { px: 1, py: 1 }, y: Coord { px: 2, py: 2 } };
+    w[1].bump_x(20);
+    w[0].px = 10;
+    match (expect_eq(w.x.px, 10)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(w.y.px, 20);
 }

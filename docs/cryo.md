@@ -400,7 +400,7 @@ mut   v:   [int];       // dynamic: `Array<int>`, growable, heap-backed
 mut   w:   Array<int>;  // the same type as `v`, written out
 ```
 
-A fixed array does not convert to a dynamic one: `const d: [int] = buf;` is refused (E0200).  A dynamic array has `Array`'s methods, iterates with `for` as `Array` does, and is indexed through `Array`'s `Index` implementations: `xs[i]` is `*(xs.index(i))`, for an index of any integer type, in a generic body as anywhere else.  An index out of range panics, and the report names the `xs[i]` that wrote it (`![caller_location]`, [section 4.5](#45-intrinsic-functions)).
+A fixed array does not convert to a dynamic one: `const d: [int] = buf;` is refused (E0200).  A dynamic array has `Array`'s methods, iterates with `for` as `Array` does, and is indexed through `Array`'s `Index` and `IndexMutable` implementations: a read `xs[i]` is `*(xs.index(i))` and a written one `*(xs.index_mutable(i))` ([section 10.6](#106-operator-overloading)), for an index of any integer type, in a generic body as anywhere else.  An index out of range panics, and the report names the `xs[i]` that wrote it (`![caller_location]`, [section 4.5](#45-intrinsic-functions)).
 
 Diagnostics and the editor spell an array the way the annotation that declared it wrote it: one written `[i32]` shows as `[i32]`, one written `Array<i32>` as `Array<i32>`.  The spelling is for display only.  A type no annotation wrote, an inferred one, shows as `[T]` when its allocator is the default and as `Array<T, A>` otherwise.
 
@@ -2195,7 +2195,7 @@ function halve<T>(x: T) -> T {
 | `Eq`                                                                                                          | Equality (backs `==` / `!=`; see [section 10.6](#106-operator-overloading)).                                      |
 | `Ord` (`: Eq`)                                                                                                | Total ordering via `compare(...) -> Ordering` (backs `< > <= >=`).                                                |
 | `Hash`                                                                                                        | Type-level hashing into a `Hasher`.                                                                               |
-| `Add`/`Sub`/`Mul`/`Div`/`Rem`, `Neg`, `BitAnd`/`BitOr`/`BitXor`/`Shl`/`Shr`, `Not`/`BitNot`, `Index`, `Deref` | Operator overloading - see [section 10.6](#106-operator-overloading).                                             |
+| `Add`/`Sub`/`Mul`/`Div`/`Rem`, `Neg`, `BitAnd`/`BitOr`/`BitXor`/`Shl`/`Shr`, `Not`/`BitNot`, `Index`/`IndexMutable`, `Deref`/`DerefMutable` | Operator overloading - see [section 10.6](#106-operator-overloading).                                             |
 | `Iterator`                                                                                                    | Lazy sequence with an associated `Item` and `next() -> Option<Item>` (see [section 10.5](#105-associated-types)). |
 | `From<T>` / `Into<T>`                                                                                         | Infallible conversions.                                                                                           |
 | `TryFrom<T>` / `TryInto<T>`                                                                                   | Fallible conversions returning `Result`.                                                                          |
@@ -2318,8 +2318,10 @@ implement the arithmetic traits. The operator traits live in
 | `==` `!=`              | `Eq`                                  | `a == b` -> `a.equals(&b)`, `a != b` -> `!a.equals(&b)`      |
 | `<` `>` `<=` `>=`      | `Ord` (`: Eq`)                        | `a < b` -> `a.compare(&b).is_lt()` (`is_gt`/`is_le`/`is_ge`) |
 | `<=>`                  | `Ord` (`: Eq`)                        | `a <=> b` -> `a.compare(&b)`                                 |
-| `a[i]`                 | `Index<Idx, Output>`                  | `a[i]` -> `*(a.index(i))`                                    |
-| `*a` (deref)           | `Deref<Target>`                       | `*a` -> `*(a.deref())`                                       |
+| `a[i]` read            | `Index<Idx, Output>`                  | `a[i]` -> `*(a.index(i))`                                    |
+| `a[i]` written         | `IndexMutable<Idx, Output>`           | `a[i]` -> `*(a.index_mutable(i))`                            |
+| `*a` (deref) read      | `Deref<Target>`                       | `*a` -> `*(a.deref())`                                       |
+| `*a` (deref) written   | `DerefMutable<Target>`                | `*a` -> `*(a.deref_mutable())`                               |
 
 Each arithmetic/bitwise trait carries `Rhs` and `Output` type parameters, so an
 operator can mix types (add a scalar to a vector, shift by a plain integer) and
@@ -2375,44 +2377,63 @@ named `compare` it has.
 `a.add(&b)` and stores the result back into `a`. This holds for every binary
 arithmetic, bitwise, and shift operator (`+= -= *= /= %= &= |= ^= <<= >>=`).
 
-**Indexing.** `Index<Idx, Output>::index` returns a **pointer** (`Output*`), so
-the desugar `a[i]` -> `*(a.index(i))` is a *place*: one implementation serves
-reads (`v = a[i]`), writes (`a[i] = v`), and compound assignment (`a[i] += v`).
-Fixed-array, string and pointer indexing keep their native path.  A type may
-implement `Index` once per index type; the call is answered by the
-implementation whose `Idx` is the index's own type.  `Array<T>` and `[T]` are
-indexed this way: the standard library implements `Index` for `Array<T>` once
-per integer type, marked `![inline]`, so `xs[i]` takes an index of any integer
-type, costs no call, and an index at or past the length (a negative one
-included) panics.  In a generic body, a container whose type
-carries the body's parameters (`xs: &Array<T>`) is indexed through its own
-implementation exactly as a concrete one is.
+**Indexing.** `a[i]` is read through `Index<Idx, Output>` and written
+through `IndexMutable<Idx, Output>`, which has `Index` as its supertrait.
+`index(&this, i)` returns a **read-only pointer** (`const Output*`), so a read
+`v = a[i]` is `*(a.index(i))`.  `index_mutable(mut &this, i)` returns a
+writable one (`Output*`), and `a[i]` is `*(a.index_mutable(i))` wherever it is
+written: assigned (`a[i] = v`), given a compound assignment (`a[i] += v`, one
+call), made the receiver of a `mut &this` method (`a[i].push(x)`), or holding
+a member that is (`a[i].x = v`).  Writing calls a `mut &this` method on `a`,
+so `a` must itself be writable, as for any write (E0250); a type that
+implements only `Index` is read-only through `[]`, and writing it is refused
+naming the missing trait (E0229).  Fixed-array, string and pointer indexing
+keep their native path.  A type may implement each trait once per index type;
+the call is answered by the implementation whose `Idx` is the index's own
+type.  `Array<T>` and `[T]` are indexed this way: the standard library
+implements `Index` and `IndexMutable` for `Array<T>` once per integer type,
+marked `![inline]`, so `xs[i]` takes an index of any integer type, costs no
+call, and an index at or past the length (a negative one included) panics.
+In a generic body, a container whose type carries the body's parameters
+(`xs: &Array<T>`) is indexed through its own implementations exactly as a
+concrete one is, and a type parameter is written through `[]` only under an
+`IndexMutable` bound.
 
 ```cryo
 type struct Grid { cells: [i32; 9]; }
 implement trait Index<u64, i32> for struct Grid {
-    index(&this, i: u64) -> i32* { return &this.cells[i]; }
+    index(&this, i: u64) -> const i32* { return &this.cells[i]; }
+}
+implement trait IndexMutable<u64, i32> for struct Grid {
+    index_mutable(mut &this, i: u64) -> i32* { return &this.cells[i]; }
 }
 mut g: Grid = ...;
-g[0] = 42;        // *(g.index(0)) = 42
-g[0] += 1;        // index called once
+const first: i32 = g[0];  // *(g.index(0))
+g[0] = 42;                // *(g.index_mutable(0)) = 42
+g[0] += 1;                // index_mutable called once
 ```
 
-**Dereference and auto-deref.** `Deref<Target>::deref` also returns a pointer
-(`Target*`), so `*b` -> `*(b.deref())` is likewise a place (read/write/compound).
-Member access **coerces** through `Deref` too: when a receiver lacks a field or
-method but implements `Deref`, `b.field` / `b.method()` retry on the pointee
-(transitively), inserting the `.deref()` chain for you - the smart-pointer
-pattern.
+**Dereference and auto-deref.** `*b` is read through `Deref<Target>` and
+written through `DerefMutable<Target>` (supertrait `Deref`), by the same rule:
+`deref(&this)` returns `const Target*` and a read `*b` is `*(b.deref())`;
+`deref_mutable(mut &this)` returns `Target*` and a written `*b` is
+`*(b.deref_mutable())`.  Member access **coerces** through them too: when a
+receiver lacks a field or method but implements `Deref`, `b.field` /
+`b.method()` retry on the pointee (transitively), inserting the `.deref()`
+chain for you - or the `.deref_mutable()` chain, where the member is written
+or the method takes `mut &this` - the smart-pointer pattern.
 
 ```cryo
 type struct Boxed<T> { value: T; }
 implement<T> trait Deref<T> for struct Boxed<T> {
-    deref(&this) -> T* { return &this.value; }
+    deref(&this) -> const T* { return &this.value; }
+}
+implement<T> trait DerefMutable<T> for struct Boxed<T> {
+    deref_mutable(mut &this) -> T* { return &this.value; }
 }
 mut b: Boxed<Vec2> = Boxed::<Vec2> { value: Vec2 { x: 1, y: 2 } };
 const v: Vec2 = *b;   // *(b.deref())
-b.x = 10;             // auto-deref: (*b.deref()).x - b has no field `x`
+b.x = 10;             // auto-deref: (*b.deref_mutable()).x - b has no field `x`
 ```
 
 **Reference operands.** A by-reference operand (`&T`, the common
