@@ -71,7 +71,7 @@ implement struct Parser {
     /// table, diagnostics).  Used by f-string hole desugaring.  A separate
     /// parser is used so the hole's token stream never displaces this
     /// parser's own (owned) tokens.
-    parse_expr_from_tokens(toks: [Token]) -> ExpressionNode* {
+    parse_expr_from_tokens(&this, toks: [Token]) -> ExpressionNode* {
         mut sub: Parser = Parser::new(toks, this.source_file, this.ctx);
         return sub.parse_expression();
     }
@@ -80,7 +80,7 @@ implement struct Parser {
     /// statement (for, if, while, etc.).  Unlike parse_block_statement(),
     /// semicolons are optional before '}' (the last expression in the block
     /// is the arm's return value).
-    parse_inner_block() -> Stmt* {
+    parse_inner_block(mut &this) -> Stmt* {
         // BRACE_DEPTH_LIMIT: nested blocks (`{{{...}}}`, and the block bodies
         // of nested `if`/`match`/`while`/`for`) recurse through here with no
         // expression-level bracketing for the unary/expr/type guards to catch,
@@ -194,7 +194,7 @@ implement struct Parser {
     // Entry Point
 
     /// Parse the entire program, producing a ProgramNode.
-    parse() -> ProgramNode* {
+    parse(mut &this) -> ProgramNode* {
         // Skip leading comments/doc comments
         this.collect_doc_comments();
 
@@ -306,7 +306,7 @@ implement struct Parser {
     /// Parse a module-scope `static_assert(cond)` or
     /// `static_assert(cond, "message")`. The leading `static_assert` identifier
     /// is current. Stashes a StaticAssertItem; emits nothing to the AST.
-    parse_static_assert() -> void {
+    parse_static_assert(mut &this) -> void {
         const start: Token = this.advance(); // consume the `static_assert` keyword
         this.consume(TokenType::LParen, "'('");
         const cond: ExpressionNode* = this.parse_expression();
@@ -333,7 +333,7 @@ implement struct Parser {
 
     /// Dispatch to the appropriate declaration or statement parser based on
     /// the current token.
-    parse_top_level() -> Node {
+    parse_top_level(mut &this) -> Node {
         if (Log::enabled(LogArea::Parse, LogLevel::Trace)) {
             Log::trace(LogArea::Parse, f"top-level item at '{this.current().lexeme}'");
         }
@@ -441,7 +441,7 @@ implement struct Parser {
     }
 
     /// Parse a declaration based on the current token.
-    parse_declaration(visibility: Visibility, doc_text: string) -> Node {
+    parse_declaration(mut &this, visibility: Visibility, doc_text: string) -> Node {
         const doc: string = doc_text;
         if (Log::enabled(LogArea::Parse, LogLevel::Trace)) {
             Log::trace(LogArea::Parse, f"declaration at '{this.current().lexeme}'");
@@ -573,7 +573,7 @@ implement struct Parser {
     /// Parse a variable declaration: const/mut name: Type = expr;
     /// The variable name may be a keyword used as an identifier
     /// (e.g. `mut string: String`, `const default: i32`).
-    parse_variable_declaration() -> DeclarationNode* {
+    parse_variable_declaration(mut &this) -> DeclarationNode* {
         const start: Token = this.current();
         const is_mutable: boolean = this.current().kind == TokenType::KwMut;
         this.advance(); // consume 'const' or 'mut'
@@ -619,7 +619,7 @@ implement struct Parser {
 
     /// Parse a struct destructure declaration: `const { f1, f2: alias, mut f3 }: T = expr;`.
     /// Caller has confirmed the next-after-const/mut token is `{`.
-    parse_destructure_decl() -> DeclarationNode* {
+    parse_destructure_decl(mut &this) -> DeclarationNode* {
         const start: Token = this.current();
         const is_mutable: boolean = this.current().kind == TokenType::KwMut;
         this.advance(); // consume 'const' or 'mut'
@@ -714,7 +714,7 @@ implement struct Parser {
     /// Parse a function declaration: `function name<T>(params) -> RetType { body }`.
     /// The leading `function` keyword is optional: trait bodies use the
     /// keyword-less `name(params) -> RetType;` form for declarations.
-    parse_function_declaration(visibility: Visibility) -> DeclarationNode* {
+    parse_function_declaration(mut &this, visibility: Visibility) -> DeclarationNode* {
         const start: Token = this.current();
         if (this.check(TokenType::KwFunction)) {
             this.advance(); // consume 'function'
@@ -772,7 +772,7 @@ implement struct Parser {
     /// "`form` is not part of Cryo", the span labelled with what the form is,
     /// and a help line saying what to write instead.  The caller consumes the
     /// form and parses on, so what follows it is still checked.
-    refuse_removed_form(span: SourceSpan, form: string, label: string, help: string) -> void {
+    refuse_removed_form(mut &this, span: SourceSpan, form: string, label: string, help: string) -> void {
         this.error_count += 1;
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0117_REMOVED_FORM,
             fmt::format("`%s` is not part of Cryo", form));
@@ -783,7 +783,7 @@ implement struct Parser {
 
     /// Refuse `protected` (`protected:` when `is_block`) at its keyword and
     /// consume it.
-    refuse_protected(is_block: boolean) -> void {
+    refuse_protected(mut &this, is_block: boolean) -> void {
         mut span: SourceSpan = this.span_from_token(this.current());
         this.advance();
         if (is_block) {
@@ -798,7 +798,7 @@ implement struct Parser {
 
     /// At a `virtual` or `override` member modifier: refuse it and consume
     /// it, so the method it modifies parses as an ordinary method.
-    refuse_member_modifier() -> void {
+    refuse_member_modifier(mut &this) -> void {
         if (!this.at_removed_modifier(TokenType::KwVirtual) && !this.at_removed_modifier(TokenType::KwOverride)) { return; }
         const tok: Token = this.advance();
         this.refuse_removed_form(this.span_from_token(tok), tok.lexeme, "a method modifier",
@@ -807,7 +807,7 @@ implement struct Parser {
 
     /// Whether the cursor is at keyword `kw` used as a modifier, not as the
     /// name of a method (`protected()`), which a keyword may be.
-    at_removed_modifier(kw: TokenType) -> boolean {
+    at_removed_modifier(&this, kw: TokenType) -> boolean {
         if (!this.check(kw)) { return false; }
         const next: TokenType = this.peek_at(1).kind;
         return next != TokenType::LParen && next != TokenType::LAngle;
@@ -817,7 +817,7 @@ implement struct Parser {
     /// (`...`) and named (`name...`) variadic markers. Shared by free-fn,
     /// method, and refused-constructor parsing so the variadic-detection
     /// rules don't drift across the three sites.
-    parse_function_param_list_into(func_decl: DeclarationNode*) -> void {
+    parse_function_param_list_into(mut &this, func_decl: DeclarationNode*) -> void {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         this.consume(TokenType::LParen, "'('");
         if (!this.check(TokenType::RParen)) {
@@ -840,7 +840,7 @@ implement struct Parser {
     /// instead of producing a parameter; the named form `args...` sets
     /// `this.pending_named_variadic` after pushing the parameter. Callers
     /// forward either flag onto the function node they're building.
-    parse_parameter_list() -> [DeclarationNode*] {
+    parse_parameter_list(mut &this) -> [DeclarationNode*] {
         mut params: [DeclarationNode*] = [];
         this.pending_bare_variadic  = false;
         this.pending_named_variadic = false;
@@ -877,7 +877,7 @@ implement struct Parser {
     /// instantiation, and a receiver spelled that way made the method one of
     /// that instantiation alone.  A written `&this` and the receiver given
     /// to a method that wrote none are typed by this one method.
-    receiver_type_annotation(is_mutable: boolean, span: SourceSpan) -> TypeAnnotation* {
+    receiver_type_annotation(&this, is_mutable: boolean, span: SourceSpan) -> TypeAnnotation* {
         mut inner: TypeAnnotation* = null;
         // The receiver of `implement string { ... }` denotes the
         // primitive, not a name to look up.  This synthesis runs from
@@ -920,7 +920,7 @@ implement struct Parser {
     /// instead of a case every later stage re-derives.  Its span is zero-width
     /// at the method's name: a report about it points at the method, and it
     /// covers no written text.
-    give_receiver(func_decl: DeclarationNode*, is_static: boolean) -> void {
+    give_receiver(&this, func_decl: DeclarationNode*, is_static: boolean) -> void {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || is_static) { return; }
         for (mut i: i64 = 0; i < func.parameters.length(); i++) {
@@ -939,7 +939,7 @@ implement struct Parser {
 
     /// `give_receiver` over every method of a type body or an impl block, once
     /// each method's `static` is known.
-    give_receivers(methods: &[DeclarationNode*]) -> void {
+    give_receivers(&this, methods: &[DeclarationNode*]) -> void {
         for (mut i: i64 = 0; i < methods.length(); i++) {
             const m_decl: DeclarationNode* = methods[i];
             const m: MethodDecl* = DeclarationNode::method_of(m_decl);
@@ -948,7 +948,7 @@ implement struct Parser {
     }
 
     /// Parse a single parameter: [mut] name: Type [= default]
-    parse_parameter() -> DeclarationNode* {
+    parse_parameter(mut &this) -> DeclarationNode* {
         const start: Token = this.current();
         mut is_mutable: boolean = false;
         // Span of the leading `mut` keyword if present; otherwise an
@@ -1042,7 +1042,7 @@ implement struct Parser {
 
     /// Parse a struct declaration: type struct Name<T> { fields, methods }.
     /// `type class` is refused at its keywords and parsed as a struct.
-    parse_struct_declaration() -> DeclarationNode* {
+    parse_struct_declaration(mut &this) -> DeclarationNode* {
         const start: Token = this.advance(); // consume 'type'
         const kw: Token = this.advance();    // consume 'struct' (or 'class')
         if (kw.kind == TokenType::KwClass) {
@@ -1096,7 +1096,7 @@ implement struct Parser {
     /// Parse a union declaration: type union Name<T> { fields, methods }
     /// Shares the struct member-grammar; an untagged C-style union where all
     /// fields overlap at offset 0 (see UnionDecl).
-    parse_union_declaration() -> DeclarationNode* {
+    parse_union_declaration(mut &this) -> DeclarationNode* {
         const start: Token = this.advance(); // consume 'type'
         this.advance(); // consume 'union'
 
@@ -1137,7 +1137,7 @@ implement struct Parser {
     /// visibility.  Members default to public; a `public:` or `private:`
     /// block sets the visibility of the members after it, and an inline
     /// `public` or `private` that of one member.
-    parse_type_body(struct_node: StructDecl*, union_node: UnionDecl*) -> void {
+    parse_type_body(mut &this, struct_node: StructDecl*, union_node: UnionDecl*) -> void {
         mut current_visibility: Visibility = Visibility::Public;
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
@@ -1325,7 +1325,7 @@ implement struct Parser {
     /// Refuse a constructor `Name(params) [: Base(args)] [-> T] { body }`
     /// written in a type body, and consume it.  A base-constructor
     /// initializer in it is refused as well, where it is written.
-    refuse_constructor() -> void {
+    refuse_constructor(mut &this) -> void {
         const start: Token = this.advance(); // the type's name
         const func: FunctionDecl* = FunctionDecl::new(this.intern_lexeme(start));
         const func_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(func), this.span_from_token(start));
@@ -1350,7 +1350,7 @@ implement struct Parser {
 
     /// Refuse a destructor `~Name() { body }` (or `~Name() = default;`)
     /// written in a type body, and consume it.
-    refuse_destructor() -> void {
+    refuse_destructor(mut &this) -> void {
         const start: Token = this.advance(); // consume '~'
         const name_tok: Token = this.consume(TokenType::Identifier, "type name");
         this.consume(TokenType::LParen, "'('");
@@ -1372,7 +1372,7 @@ implement struct Parser {
     /// `async` read as modifiers only when what follows is neither a parameter
     /// list nor a generic-parameter list. Without this test, declaring a method
     /// called `async` or `static` would stop parsing.
-    at_method_modifier() -> boolean {
+    at_method_modifier(&this) -> boolean {
         if (!this.check(TokenType::KwStatic) && !this.check(TokenType::KwAsync)) { return false; }
         const next: TokenType = this.peek_at(1).kind;
         return next != TokenType::LParen && next != TokenType::LAngle;
@@ -1383,7 +1383,7 @@ implement struct Parser {
     /// and `async static f()` are the same declaration. `prefix` seeds the
     /// returned extent, so a visibility keyword already consumed by the caller
     /// stays part of the member's `outer_span()`.
-    consume_method_modifiers(prefix: SourceSpan) -> MethodModifiers {
+    consume_method_modifiers(mut &this, prefix: SourceSpan) -> MethodModifiers {
         mut m: MethodModifiers = MethodModifiers {
             is_static: false, is_async: false, span: prefix };
         while (this.at_method_modifier()) {
@@ -1400,7 +1400,7 @@ implement struct Parser {
     /// `const(...)` or `const<T>(...)` a method, and `const` followed by a
     /// name begins a constant.  A keyword in the name's place is a constant
     /// too, refused for its name where the declaration is parsed.
-    at_member_constant(offset: i64) -> boolean {
+    at_member_constant(&this, offset: i64) -> boolean {
         if (this.peek_at(offset).kind != TokenType::KwConst) { return false; }
         const name: TokenType = this.peek_at(offset + 1).kind;
         return name == TokenType::Identifier || name.is_keyword();
@@ -1412,7 +1412,7 @@ implement struct Parser {
     /// one written without an initializer is refused (E0248), as a module
     /// constant is not, because nothing could give a type's constant its
     /// value later.  Null when the declaration does not parse.
-    parse_member_constant(visibility: Visibility) -> DeclarationNode* {
+    parse_member_constant(mut &this, visibility: Visibility) -> DeclarationNode* {
         const name: string = this.peek_at(1).lexeme;
         const decl: DeclarationNode* = this.parse_variable_declaration();
         const constant: VarDecl* = DeclarationNode::var_of(decl);
@@ -1432,7 +1432,7 @@ implement struct Parser {
     /// block.  A constant is a module-level item, so a type declared inside
     /// a function body cannot have one (E0249): the constant is parsed,
     /// refused and dropped, and null is returned.
-    parse_type_constant(visibility: Visibility, is_async: boolean, modifier_span: SourceSpan,
+    parse_type_constant(mut &this, visibility: Visibility, is_async: boolean, modifier_span: SourceSpan,
                         doc: string) -> DeclarationNode* {
         if (is_async) {
             this.report_invalid_at(ErrorCode::E0364_INVALID_ASYNC_MEMBER,
@@ -1453,7 +1453,7 @@ implement struct Parser {
 
     /// Parse a constant written where no constant may be, so that the
     /// refusal is reported once and the rest of the member is consumed.
-    refuse_member_constant(code: ErrorCode, message: string) -> void {
+    refuse_member_constant(mut &this, code: ErrorCode, message: string) -> void {
         const decl: DeclarationNode* = this.parse_variable_declaration();
         if (decl != null) { this.report_invalid_at(code, message, decl.name_span); }
     }
@@ -1461,7 +1461,7 @@ implement struct Parser {
     /// Parse a static method.  The `static` that selected this path is still
     /// at the cursor and is consumed here; a `static` / `async` run may
     /// follow it.
-    parse_static_method(visibility: Visibility, is_async: boolean) -> DeclarationNode* {
+    parse_static_method(mut &this, visibility: Visibility, is_async: boolean) -> DeclarationNode* {
         this.advance(); // consume `static`
         const extra: MethodModifiers = this.consume_method_modifiers(SourceSpan::none());
 
@@ -1475,7 +1475,7 @@ implement struct Parser {
     }
 
     /// Parse a method: name<T>(params) -> RetType { body }
-    parse_method(visibility: Visibility) -> DeclarationNode* {
+    parse_method(mut &this, visibility: Visibility) -> DeclarationNode* {
         const start: Token = this.current();
         const name_tok: Token = this.advance(); // consume method name
         const name: SymbolStr = this.intern_lexeme(name_tok);
@@ -1526,7 +1526,7 @@ implement struct Parser {
     }
 
     /// Parse a field declaration: name: Type [= default];
-    parse_field_declaration() -> DeclarationNode* {
+    parse_field_declaration(mut &this) -> DeclarationNode* {
         const start: Token = this.current();
         const name_tok: Token = this.advance(); // consume field name
         const f: FieldDecl* = FieldDecl::new(this.intern_lexeme(name_tok));
@@ -1548,7 +1548,7 @@ implement struct Parser {
     }
 
     /// Parse an enum declaration: type enum Name<T> { variants }
-    parse_enum_declaration() -> DeclarationNode* {
+    parse_enum_declaration(mut &this) -> DeclarationNode* {
         const start: Token = this.advance(); // consume 'type'
         this.advance(); // consume 'enum'
 
@@ -1612,7 +1612,7 @@ implement struct Parser {
     }
 
     /// Parse an enum variant: Name; or Name(Type); or Name = value;
-    parse_enum_variant() -> DeclarationNode* {
+    parse_enum_variant(mut &this) -> DeclarationNode* {
         const start: Token = this.current();
         const name_tok: Token = this.consume(TokenType::Identifier, "variant name");
         const name: SymbolStr = this.intern_lexeme(name_tok);
@@ -1660,7 +1660,7 @@ implement struct Parser {
     }
 
     /// Parse a trait declaration: type trait Name<T> [: Base] { methods }
-    parse_trait_declaration() -> DeclarationNode* {
+    parse_trait_declaration(mut &this) -> DeclarationNode* {
         const start: Token = this.advance(); // consume 'type'
         this.advance(); // consume 'trait'
 
@@ -1772,7 +1772,7 @@ implement struct Parser {
     /// `type Item;` or `type Item: Copy + Clone;`. The leading `type` keyword
     /// is consumed here. Declaration-site bounds are captured as trait refs
     /// (empty for the unbounded form).
-    parse_assoc_type_decl() -> AssocTypeDeclNode* {
+    parse_assoc_type_decl(mut &this) -> AssocTypeDeclNode* {
         const start: Token = this.advance(); // consume 'type'
         const name_tok: Token = this.consume(TokenType::Identifier, "associated type name");
 
@@ -1796,7 +1796,7 @@ implement struct Parser {
     }
 
     /// Parse a type alias: type Alias = Target; or type Alias<T> = Target;
-    parse_type_alias_declaration() -> DeclarationNode* {
+    parse_type_alias_declaration(mut &this) -> DeclarationNode* {
         const start: Token = this.advance(); // consume 'type'
         const name_tok: Token = this.consume(TokenType::Identifier, "type alias name");
         const alias: TypeAliasDecl* = TypeAliasDecl::new(this.intern_lexeme(name_tok));
@@ -1820,20 +1820,20 @@ implement struct Parser {
     }
 
     /// Parse an import declaration (5 styles).
-    parse_import_declaration() -> DeclarationNode* {
+    parse_import_declaration(mut &this) -> DeclarationNode* {
         return this.parse_import_form(false);
     }
 
     /// Parse an export declaration: the import form minus the wildcard.
     /// `export A::B::{X, Y};`, `export A::B as C;`, `export A::B;`.
-    parse_export_declaration() -> DeclarationNode* {
+    parse_export_declaration(mut &this) -> DeclarationNode* {
         return this.parse_import_form(true);
     }
 
     /// Shared body of `import` and `export`.  They differ in exactly two
     /// places - whether a `*` form is accepted, and the flag stamped on the
     /// node - so they share one production rather than drifting as two.
-    parse_import_form(is_export: boolean) -> DeclarationNode* {
+    parse_import_form(mut &this, is_export: boolean) -> DeclarationNode* {
         const start: Token = this.advance(); // consume 'import' / 'export'
 
         // Build module path incrementally: A::B::C
@@ -1975,7 +1975,7 @@ implement struct Parser {
 
     /// Parse a namespace declaration: namespace A::B;
     /// Accepts keywords as path segments (e.g., std::collections::string).
-    parse_namespace_declaration() -> DeclarationNode* {
+    parse_namespace_declaration(mut &this) -> DeclarationNode* {
         const start: Token = this.advance(); // consume 'namespace'
         mut qn: QualifiedName = QualifiedName::empty();
         mut seg_names: [SymbolStr] = [];
@@ -2018,7 +2018,7 @@ implement struct Parser {
 
     /// Whether the current token starts a sub-module line: `module` or
     /// `internal module`, or `module`, which is refused there.
-    at_module_declaration() -> boolean {
+    at_module_declaration(&this) -> boolean {
         const kind: TokenType = this.current().kind;
         if (kind == TokenType::KwModule) { return true; }
         return (kind == TokenType::KwInternal || kind == TokenType::KwPublic)
@@ -2029,7 +2029,7 @@ implement struct Parser {
     /// group of entries each ending in `;`, `module { a; b; }` and
     /// `internal module { c; }`, one declaration per entry.  Accepts
     /// keywords as path segments (`module collections::string;`).
-    parse_module_declarations() -> [DeclarationNode*] {
+    parse_module_declarations(mut &this) -> [DeclarationNode*] {
         const start: Token = this.current();
         mut visibility: Visibility = Visibility::Public;
         if (this.check(TokenType::KwInternal)) {
@@ -2063,7 +2063,7 @@ implement struct Parser {
 
     /// One sub-module's path and its `;`, declared at `visibility`; its span
     /// runs from `start`.
-    parse_module_entry(start: Token, visibility: Visibility) -> DeclarationNode* {
+    parse_module_entry(mut &this, start: Token, visibility: Visibility) -> DeclarationNode* {
         mut name_tok: Token = this.current();
         if (name_tok.kind == TokenType::Identifier || name_tok.kind.is_keyword()) {
             this.advance();
@@ -2120,7 +2120,7 @@ implement struct Parser {
     ///   2: `<struct|enum|union> <Path>[<args>] for ...` form
     ///       (`trait` missing AND a spurious kind tag is sitting in the
     ///       trait position; kind tags belong on the target after `for`)
-    detect_missing_trait_form() -> int {
+    detect_missing_trait_form(&this) -> int {
         mut off: int = 0;
         mut had_kind_tag: boolean = false;
         const first: TokenType = this.peek_at(0).kind;
@@ -2168,7 +2168,7 @@ implement struct Parser {
         return false;
     }
 
-    parse_implementation_block() -> DeclarationNode* {
+    parse_implementation_block(mut &this) -> DeclarationNode* {
         const start: Token = this.advance(); // consume 'implement'
 
         // (G2) Optional `<T, ...>` directly after `implement`: generic params
@@ -2452,7 +2452,7 @@ implement struct Parser {
     /// `block_visibility` is the keyword written before `extern`, or public
     /// when none was: the visibility of every function and global in the
     /// block that does not write its own.
-    parse_extern_block(block_visibility: Visibility) -> DeclarationNode* {
+    parse_extern_block(mut &this, block_visibility: Visibility) -> DeclarationNode* {
         const start: Token = this.advance(); // consume 'extern'
         mut linkage: string = "C";
 
@@ -2525,7 +2525,7 @@ implement struct Parser {
     /// Parse the CImport form: `extern module name := "C" { #include "..." }`
     /// 'extern' is current. The keyword-led spelling groups with other `extern`
     /// declarations and reuses the existing `module` keyword.
-    parse_extern_module_cimport() -> DeclarationNode* {
+    parse_extern_module_cimport(mut &this) -> DeclarationNode* {
         const start: Token = this.advance(); // consume 'extern'
         this.advance();                      // consume 'module'
         const alias_tok: Token = this.current();
@@ -2539,7 +2539,7 @@ implement struct Parser {
     /// Shared tail for both CImport spellings: with `start` at the leading
     /// `extern` token and the cursor positioned at the linkage string, parse
     /// `"C" { #include ... }` into a namespace-aliased extern block.
-    finish_cimport_block(alias: SymbolStr, start: Token) -> DeclarationNode* {
+    finish_cimport_block(mut &this, alias: SymbolStr, start: Token) -> DeclarationNode* {
         mut linkage: string = "C";
 
         // Linkage type: "C"
@@ -2615,7 +2615,7 @@ implement struct Parser {
     }
 
     /// Parse an extern function declaration (no body).
-    parse_extern_function(visibility: Visibility) -> DeclarationNode* {
+    parse_extern_function(mut &this, visibility: Visibility) -> DeclarationNode* {
         const func_decl: DeclarationNode* = this.parse_function_declaration(visibility);
         return func_decl;
     }
@@ -2629,7 +2629,7 @@ implement struct Parser {
     /// cannot be inferred because there is nothing to infer it from.  `mut` and
     /// `const` still say what CRYO may do with it - `const` is not a promise
     /// about the library, which remains free to change the value.
-    parse_extern_global() -> DeclarationNode* {
+    parse_extern_global(mut &this) -> DeclarationNode* {
         const decl: DeclarationNode* = this.parse_variable_declaration();
         if (decl == null) { return null; }
         mut node: VarDecl* = DeclarationNode::var_of(decl);
@@ -2686,7 +2686,7 @@ implement struct Parser {
     /// Parse an intrinsic declaration:
     ///   intrinsic name(params) -> RetType { body }
     ///   intrinsic function name(params) -> RetType;    (stdlib form)
-    parse_intrinsic_declaration() -> DeclarationNode* {
+    parse_intrinsic_declaration(mut &this) -> DeclarationNode* {
         const start: Token = this.advance(); // consume 'intrinsic'
         // Allow optional 'function' keyword: intrinsic function malloc(...)
         if (this.check(TokenType::KwFunction)) {
@@ -2744,7 +2744,7 @@ implement struct Parser {
     ///   intrinsic function name<T, ..>(params) -> RetType where .. ;
     /// It is a generic function with no body, and is typed and specialized
     /// as one; its entries carry the kind its name lowers as.
-    parse_generic_intrinsic_declaration() -> DeclarationNode* {
+    parse_generic_intrinsic_declaration(mut &this) -> DeclarationNode* {
         const start: Token = this.advance(); // consume 'intrinsic'
         this.advance(); // consume 'function'
         const name_tok: Token = this.consume(TokenType::Identifier, "intrinsic name");
@@ -2783,7 +2783,7 @@ implement struct Parser {
     /// `where` clause at all.  Only function-shaped declarations and impl
     /// blocks can, so on a type declaration the bound has no replacement to
     /// suggest and the diagnostic must not name one.
-    parse_generic_params(where_allowed: boolean) -> [DeclarationNode*] {
+    parse_generic_params(mut &this, where_allowed: boolean) -> [DeclarationNode*] {
         mut params: [DeclarationNode*] = [];
         this.advance(); // consume '<'
 
@@ -2853,7 +2853,7 @@ implement struct Parser {
     /// Parse trait bounds: `where T: Trait, U: A + B, W: io::Write,
     /// Array<T>: Display`.  Each bound is one written type with one or more
     /// `+`-separated trait refs. Each ref may itself be a `::`-qualified path.
-    parse_trait_bounds() -> [TraitBound] {
+    parse_trait_bounds(mut &this) -> [TraitBound] {
         mut bounds: [TraitBound] = [];
         this.advance(); // consume 'where'
 
@@ -2899,7 +2899,7 @@ implement struct Parser {
     /// reference: `Name`, `path::to::Name`, `Name<T>`, `Name<T, U>`, or
     /// `path::to::Name<T>`.  Returns the captured path segments, any
     /// generic-arg annotations, and the source span.
-    parse_trait_ref() -> TraitRef {
+    parse_trait_ref(mut &this) -> TraitRef {
         const start: Token = this.current();
         const head_tok: Token = this.consume(TokenType::Identifier, "trait name");
         mut path: [SymbolStr] = [];
@@ -2932,7 +2932,7 @@ implement struct Parser {
     /// identifier OR any keyword token whose lexeme is an identifier-shaped
     /// word (`inline`, `static`, `extern`, `if`, `unsafe`, ...) so the
     /// directive vocabulary isn't artificially limited by reserved words.
-    consume_directive_name() -> Token {
+    consume_directive_name(mut &this) -> Token {
         const tok: Token = this.current();
         if (tok.kind == TokenType::Identifier || tok.kind.is_keyword()) {
             return this.advance();
@@ -2947,7 +2947,7 @@ implement struct Parser {
     /// can be: bare identifier, string literal, integer literal, boolean
     /// literal, `key = value` pair, or a nested directive call
     /// (e.g. `![cfg(any(unix, windows))]`).
-    parse_directive() -> DirectiveNode* {
+    parse_directive(mut &this) -> DirectiveNode* {
         const start: Token = this.advance(); // consume '!['
 
         const kind_tok: Token = this.consume_directive_name();
@@ -2973,7 +2973,7 @@ implement struct Parser {
     /// Parse a single directive argument.  Uses the same grammar whether
     /// the argument appears at the top level (`![attr(arg, ...)]`) or
     /// inside a nested call (`cfg(any(unix))`).
-    parse_directive_arg() -> DirectiveArg {
+    parse_directive_arg(mut &this) -> DirectiveArg {
         const start: Token = this.current();
 
         // Boolean literal: true / false
@@ -3044,7 +3044,7 @@ implement struct Parser {
 
     /// Helper: build a `key = value` arg given that `key` and `=` are
     /// already consumed.  Caller passes the identifier token for `key`.
-    parse_directive_kv(key_tok: Token) -> DirectiveArg {
+    parse_directive_kv(mut &this, key_tok: Token) -> DirectiveArg {
         const v_tok: Token = this.current();
         mut kv: DirectiveArg = DirectiveArg {
             kind:       DirectiveArgKind::KeyValue,
@@ -3098,7 +3098,7 @@ implement struct Parser {
     /// E0102 for a `key = value` directive argument whose value is not one
     /// a directive takes: a float literal, or a token that is no literal or
     /// identifier at all.
-    report_directive_value_error(v_tok: Token) -> void {
+    report_directive_value_error(mut &this, v_tok: Token) -> void {
         this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
             fmt::format("expected an integer, string or boolean literal or an identifier after '=' in directive, got '%s'",
                 v_tok.lexeme));
@@ -3108,7 +3108,7 @@ implement struct Parser {
     // Statement Parsing
 
     /// Parse a statement based on the current token.
-    parse_statement() -> Stmt* {
+    parse_statement(mut &this) -> Stmt* {
         if (Log::enabled(LogArea::Parse, LogLevel::Trace)) {
             Log::trace(LogArea::Parse, f"statement at '{this.current().lexeme}'");
         }
@@ -3224,7 +3224,7 @@ implement struct Parser {
     }
 
     /// Parse a block statement: { statement* }
-    parse_block_statement() -> Stmt* {
+    parse_block_statement(mut &this) -> Stmt* {
         // BRACE_DEPTH_LIMIT: see parse_inner_block. Nested block statements
         // (and the bodies of nested if/match/while/for, which route here)
         // recurse with no expression-bracketing token to bound them, so a
@@ -3287,7 +3287,7 @@ implement struct Parser {
     }
 
     /// Parse an if statement: if (cond) stmt [else stmt]
-    parse_if_statement() -> Stmt* {
+    parse_if_statement(mut &this) -> Stmt* {
         const start: Token = this.advance(); // consume 'if'
         const condition: ExpressionNode* = this.parse_paren_condition();
 
@@ -3303,7 +3303,7 @@ implement struct Parser {
     }
 
     /// Parse a while statement: while (cond) stmt
-    parse_while_statement() -> Stmt* {
+    parse_while_statement(mut &this) -> Stmt* {
         const start: Token = this.advance(); // consume 'while'
         const condition: ExpressionNode* = this.parse_paren_condition();
 
@@ -3312,14 +3312,14 @@ implement struct Parser {
     }
 
     /// Parse a loop statement: loop { body }
-    parse_loop_statement() -> Stmt* {
+    parse_loop_statement(mut &this) -> Stmt* {
         const start: Token = this.advance(); // consume 'loop'
         const body: Stmt* = this.parse_statement_or_block();
         return Stmt::loop_stmt(body, this.span_from(start));
     }
 
     /// Parse a do-while statement: do stmt while (cond);
-    parse_do_while_statement() -> Stmt* {
+    parse_do_while_statement(mut &this) -> Stmt* {
         const start: Token = this.advance(); // consume 'do'
         const body: Stmt* = this.parse_statement_or_block();
         this.consume(TokenType::KwWhile, "'while'");
@@ -3330,7 +3330,7 @@ implement struct Parser {
 
     /// Parse a for statement: for (init; cond; update) body
     /// or for-in: for (item in collection) body
-    parse_for_statement() -> Stmt* {
+    parse_for_statement(mut &this) -> Stmt* {
         const start: Token = this.advance(); // consume 'for'
         // The surrounding `()` are optional: `for (x in it)` and `for x in it`
         // (and the C-style `for init; cond; upd`) are both accepted.  When
@@ -3437,7 +3437,7 @@ implement struct Parser {
     /// vars) supplies its type.  The user's loop variable is bound by the
     /// `Some(x)` arm pattern, which already means `break` / `continue` /
     /// `return` inside the body behave like an ordinary `loop`.
-    build_for_in_desugar(iter_tok: Token, collection: ExpressionNode*,
+    build_for_in_desugar(&this, iter_tok: Token, collection: ExpressionNode*,
                          body: Stmt*, full_span: SourceSpan) -> Stmt* {
         const iter_span: SourceSpan = this.span_from_token(iter_tok);
         const user_name: SymbolStr  = this.intern_lexeme(iter_tok);
@@ -3522,7 +3522,7 @@ implement struct Parser {
     }
 
     /// Parse a match statement: match (expr) { arms }
-    parse_match_statement() -> Stmt* {
+    parse_match_statement(mut &this) -> Stmt* {
         const start: Token = this.advance(); // consume 'match'
         const subject: ExpressionNode* = this.parse_paren_condition();
         this.consume(TokenType::LBrace, "'{'");
@@ -3555,7 +3555,7 @@ implement struct Parser {
     /// Parse a static match statement: `static match (Type) { type-arms }`.
     /// Used when arms yield no value. Reuses parse_static_match_arm, whose
     /// arm blocks parse full statements through parse_inner_block.
-    parse_static_match_statement() -> Stmt* {
+    parse_static_match_statement(mut &this) -> Stmt* {
         const start: Token = this.advance(); // consume 'static'
         this.advance();                      // consume 'match'
         this.consume(TokenType::LParen, "'('");
@@ -3587,7 +3587,7 @@ implement struct Parser {
     /// Uses shared parse_match_arm_patterns() for pattern + '=>', then
     /// handles the body as a full block (declarations, statements, expressions).
     /// See also: parse_expr_match_arm() for expression context.
-    parse_match_arm() -> MatchArmNode* {
+    parse_match_arm(mut &this) -> MatchArmNode* {
         const start: Token = this.current();
         mut arm: MatchArmNode* = this.parse_match_arm_patterns();
 
@@ -3608,7 +3608,7 @@ implement struct Parser {
     }
 
     /// Parse a return statement: return [expr];
-    parse_return_statement() -> Stmt* {
+    parse_return_statement(mut &this) -> Stmt* {
         const start: Token = this.advance(); // consume 'return'
         mut expr: ExpressionNode* = null;
 
@@ -3631,21 +3631,21 @@ implement struct Parser {
     }
 
     /// Parse a break statement: break;
-    parse_break_statement() -> Stmt* {
+    parse_break_statement(mut &this) -> Stmt* {
         const start: Token = this.advance(); // consume 'break'
         this.consume(TokenType::Semicolon, "';'");
         return Stmt::break_stmt(this.span_from(start));
     }
 
     /// Parse a continue statement: continue;
-    parse_continue_statement() -> Stmt* {
+    parse_continue_statement(mut &this) -> Stmt* {
         const start: Token = this.advance(); // consume 'continue'
         this.consume(TokenType::Semicolon, "';'");
         return Stmt::continue_stmt(this.span_from(start));
     }
 
     /// Parse an expression statement: expr;
-    parse_expression_statement() -> Stmt* {
+    parse_expression_statement(mut &this) -> Stmt* {
         const expr: ExpressionNode* = this.parse_expression();
         if (expr == null) {
             // Try to recover
@@ -3659,7 +3659,7 @@ implement struct Parser {
     }
 
     /// Parse an unsafe block: unsafe { ... }
-    parse_unsafe_block() -> Stmt* {
+    parse_unsafe_block(mut &this) -> Stmt* {
         const start: Token = this.advance(); // consume 'unsafe'
         const block: Stmt* = this.parse_block_statement();
         return Stmt::unsafe_block(block, this.span_from(start));
@@ -3685,7 +3685,7 @@ implement struct Parser {
     ///   `${x:"rax"}`  pin to a specific register
     ///   `${x:m}`      memory operand (passed by address)
     ///   `${x:i}`      immediate ; `${x:r}` explicit general register
-    parse_asm_block(pending: [DirectiveNode*], is_module: boolean) -> Stmt* {
+    parse_asm_block(mut &this, pending: [DirectiveNode*], is_module: boolean) -> Stmt* {
         const start: Token = this.advance(); // consume 'asm'
         const node: AsmBlockStmt* = AsmBlockStmt::new();
         node.is_module_level = is_module;
@@ -3870,7 +3870,7 @@ implement struct Parser {
     }
 
     /// Helper: parse a statement that should be a block, or wrap in one.
-    parse_statement_or_block() -> Stmt* {
+    parse_statement_or_block(mut &this) -> Stmt* {
         if (this.check(TokenType::LBrace)) {
             return this.parse_block_statement();
         }

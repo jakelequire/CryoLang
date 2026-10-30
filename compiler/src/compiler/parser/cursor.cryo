@@ -147,7 +147,7 @@ implement struct Parser {
 
 
     /// Peek at the current token without consuming it.
-    current() -> Token {
+    current(&this) -> Token {
         if (this.pos >= this.tokens.length()) {
             return Token::eof(0, 0);
         }
@@ -155,7 +155,7 @@ implement struct Parser {
     }
 
     /// Peek at a token at offset from current position.
-    peek_at(offset: i64) -> Token {
+    peek_at(&this, offset: i64) -> Token {
         const idx: i64 = this.pos + offset;
         if (idx < 0 || idx >= this.tokens.length()) {
             return Token::eof(0, 0);
@@ -165,7 +165,7 @@ implement struct Parser {
 
     /// Whether the current token, a `?`, is written against the token
     /// before it, with no space or comment between them.
-    question_against_operand() -> boolean {
+    question_against_operand(&this) -> boolean {
         if (this.pos < 1 || this.pos >= this.tokens.length()) { return false; }
         const before: Token = this.tokens[this.pos - 1];
         const question: Token = this.tokens[this.pos];
@@ -174,7 +174,7 @@ implement struct Parser {
 
     /// Consume the current token and return it.
     /// Skips over comments and doc comments, tracking bracket depth.
-    advance() -> Token {
+    advance(mut &this) -> Token {
         if (this.pos >= this.tokens.length()) {
             return Token::eof(0, 0);
         }
@@ -216,7 +216,7 @@ implement struct Parser {
     }
 
     /// Check if the current token is of the given kind.
-    check(kind: TokenType) -> boolean {
+    check(&this, kind: TokenType) -> boolean {
         return this.current().kind == kind;
     }
 
@@ -224,13 +224,13 @@ implement struct Parser {
     /// position: a paren-less condition set `no_struct_lit_depth`, and we are
     /// still at that same bracketing depth (not inside a `(` / `[` group that
     /// would make a following `{` unambiguous again).  See `no_struct_lit_depth`.
-    struct_lit_suppressed() -> boolean {
+    struct_lit_suppressed(&this) -> boolean {
         return this.no_struct_lit_depth >= 0
             && (this.paren_depth + this.bracket_depth) == this.no_struct_lit_depth;
     }
 
     /// Consume and return true if the current token matches the given kind.
-    match_tok(kind: TokenType) -> boolean {
+    match_tok(mut &this, kind: TokenType) -> boolean {
         if (this.check(kind)) {
             this.advance();
             return true;
@@ -240,7 +240,7 @@ implement struct Parser {
 
     /// Expect and consume a token of the given kind.
     /// Reports an error and enters panic mode if the token doesn't match.
-    consume(kind: TokenType, message: string) -> Token {
+    consume(mut &this, kind: TokenType, message: string) -> Token {
         if (this.check(kind)) {
             return this.advance();
         }
@@ -284,7 +284,7 @@ implement struct Parser {
     /// real token.  This turns "expected ';'" into a one-click fix for
     /// the missing-semicolon / missing-comma / missing-paren cases that
     /// dominate parser-error UX.
-    error_expected_with_insert(kind: TokenType, expected: string) -> void {
+    error_expected_with_insert(mut &this, kind: TokenType, expected: string) -> void {
         const tok: Token = this.current();
         const message: string = fmt::format("expected %s, found '%s'", expected, tok.lexeme);
         const literal: string = Parser::literal_for_token(kind);
@@ -338,7 +338,7 @@ implement struct Parser {
     }
 
     /// Check if we've reached the end of the token stream.
-    is_at_end() -> boolean {
+    is_at_end(&this) -> boolean {
         return this.pos >= this.tokens.length() || this.check(TokenType::EOF);
     }
 
@@ -346,7 +346,7 @@ implement struct Parser {
     /// `source_length` (set by the lexer) rather than `lexeme.length()`
     /// These differ for string literals, where the escape-processed
     /// lexeme is shorter than the original source extent.
-    span_from_token(tok: Token) -> SourceSpan {
+    span_from_token(&this, tok: Token) -> SourceSpan {
         const end_col: u32 = tok.column as u32 + tok.source_length as u32;
         return SourceSpan::new(
             this.source_file,
@@ -356,7 +356,7 @@ implement struct Parser {
     }
 
     /// Get the span of the current token.
-    current_span() -> SourceSpan {
+    current_span(&this) -> SourceSpan {
         return this.span_from_token(this.current());
     }
 
@@ -367,7 +367,7 @@ implement struct Parser {
     /// find the actual end of the consumed range; without this, a
     /// `namespace X;` followed by `///` doc comments on later lines
     /// gets a span ending at the last doc comment instead of `;`.
-    span_from(start: Token) -> SourceSpan {
+    span_from(&this, start: Token) -> SourceSpan {
         const idx: i64 = this.last_consumed_index();
         if (idx >= 0 && idx < this.tokens.length()) {
             const end_tok: Token = this.tokens[idx];
@@ -384,7 +384,7 @@ implement struct Parser {
     /// The index of the last token consumed.  `advance()` steps over the
     /// comments after each real token, so `tokens[pos - 1]` may be one of
     /// those; this walks back past them.  -1 before the first token.
-    last_consumed_index() -> i64 {
+    last_consumed_index(&this) -> i64 {
         mut idx: i64 = this.pos - 1;
         while (idx >= 0 && idx < this.tokens.length() && Parser::is_comment(this.tokens[idx].kind)) {
             idx -= 1;
@@ -394,7 +394,7 @@ implement struct Parser {
 
     /// The index of `tok`, a token already consumed: the one at its line
     /// and column, searched back from the cursor.
-    consumed_index_of(tok: Token) -> i64 {
+    consumed_index_of(&this, tok: Token) -> i64 {
         mut idx: i64 = this.pos - 1;
         while (idx >= 0) {
             const at: Token = this.tokens[idx];
@@ -408,7 +408,7 @@ implement struct Parser {
     /// `to`, comments left out and one space wherever the source had any
     /// between two tokens: a construct quoted back in a diagnostic, or the
     /// pieces a suggested rewrite is assembled from.
-    tokens_text(from: i64, to: i64) -> string {
+    tokens_text(&this, from: i64, to: i64) -> string {
         mut text: string = "";
         mut have_prev: boolean = false;
         mut prev_line: int = 0;
@@ -484,7 +484,7 @@ implement struct Parser {
 
 
     /// Report an error at the current position.
-    report_error(code: ErrorCode, message: string) -> void {
+    report_error(mut &this, code: ErrorCode, message: string) -> void {
         this.panic_mode = true;
         this.error_count += 1;
         this.ctx.emit_error_at(code, message, this.current_span());
@@ -495,20 +495,20 @@ implement struct Parser {
     /// Unlike `report_error*`, this leaves `panic_mode` clear: the token stream
     /// is still synchronized, and entering panic mode would abandon the rest of
     /// the construct mid-expression and bury the real shape of the declaration.
-    report_invalid_at(code: ErrorCode, message: string, span: SourceSpan) -> void {
+    report_invalid_at(mut &this, code: ErrorCode, message: string, span: SourceSpan) -> void {
         this.error_count += 1;
         this.ctx.emit_error_at(code, message, span);
     }
 
     /// Report "expected X, found Y" error.
-    error_expected(expected: string) -> void {
+    error_expected(mut &this, expected: string) -> void {
         const tok: Token = this.current();
         const message: string = fmt::format("expected %s, found '%s'", expected, tok.lexeme);
         this.report_error(ErrorCode::E0100_EXPECTED_TOKEN, message);
     }
 
     /// Report "unexpected token X" error.
-    error_unexpected() -> void {
+    error_unexpected(mut &this) -> void {
         const tok: Token = this.current();
         const message: string = fmt::format("unexpected token '%s'", tok.lexeme);
         this.report_error(ErrorCode::E0101_UNEXPECTED_TOKEN, message);
@@ -517,7 +517,7 @@ implement struct Parser {
 
     /// Consume tokens until we find a synchronization point.
     /// Clears panic_mode when a recovery point is reached.
-    synchronize() -> void {
+    synchronize(mut &this) -> void {
         this.panic_mode = false;
 
         while (!this.is_at_end()) {
@@ -547,7 +547,7 @@ implement struct Parser {
     }
 
     /// Check if the current token could start a declaration.
-    is_declaration_start() -> boolean {
+    is_declaration_start(&this) -> boolean {
         return Parser::opens_declaration(this.current().kind);
     }
 
@@ -557,7 +557,7 @@ implement struct Parser {
     /// an assignment to the local: it compiled, and the local read whatever
     /// its slot held.  Keywords are not identifiers there.  A
     /// keyword that opens nothing (`default`, `string`) stays a legal name.
-    refuse_declaration_keyword_name(tok: Token, what: string) -> void {
+    refuse_declaration_keyword_name(mut &this, tok: Token, what: string) -> void {
         if (!Parser::opens_declaration(tok.kind)) { return; }
         this.report_invalid_at(ErrorCode::E0100_EXPECTED_TOKEN,
             fmt::format("expected %s, found `%s`, which is a reserved word", what, tok.lexeme),
@@ -592,7 +592,7 @@ implement struct Parser {
     }
 
     /// Check if the current token could start a statement.
-    is_statement_start() -> boolean {
+    is_statement_start(&this) -> boolean {
         const kind: TokenType = this.current().kind;
         return match (kind) {
             TokenType::KwIf       => { true }
@@ -612,7 +612,7 @@ implement struct Parser {
 
     /// Check if current token is a keyword that starts a statement (excludes LBrace).
     /// Used in match arm blocks where '{' could be an expression block.
-    is_statement_keyword() -> boolean {
+    is_statement_keyword(&this) -> boolean {
         const kind: TokenType = this.current().kind;
         return match (kind) {
             TokenType::KwIf       => { true }
@@ -633,12 +633,12 @@ implement struct Parser {
 
 
     /// Intern a token's lexeme via the compilation context.
-    intern_lexeme(tok: Token) -> SymbolStr {
+    intern_lexeme(&this, tok: Token) -> SymbolStr {
         return this.ctx.intern(tok.lexeme);
     }
 
     /// Skip doc comment tokens and accumulate their text.
-    collect_doc_comments() -> void {
+    collect_doc_comments(mut &this) -> void {
         while (this.pos < this.tokens.length()) {
             const tok: Token = this.current();
             match (&tok.kind) {
@@ -681,7 +681,7 @@ implement struct Parser {
     /// `take_documentation` exempts it from the blank-line adjacency
     /// rule: every file in the tree separates its `///!` banner from
     /// the `namespace` decl with a blank line.
-    pending_doc_is_bang_banner() -> boolean {
+    pending_doc_is_bang_banner(&this) -> boolean {
         if (this.pending_doc_comments.length() == 0) { return false; }
         const first: string = this.pending_doc_comments[0];
         if (first == null) { return false; }
@@ -699,7 +699,7 @@ implement struct Parser {
     /// `///!` inner-doc banners are exempt (see
     /// `pending_doc_is_bang_banner`): they document the module and
     /// conventionally sit a blank line above the `namespace` decl.
-    take_documentation() -> string {
+    take_documentation(mut &this) -> string {
         if (this.pending_doc_comments.length() == 0) {
             return "";
         }
@@ -723,12 +723,12 @@ implement struct Parser {
     }
 
     /// Increment scope depth.
-    enter_scope() -> void {
+    enter_scope(mut &this) -> void {
         this.scope_depth += 1;
     }
 
     /// Decrement scope depth.
-    exit_scope() -> void {
+    exit_scope(mut &this) -> void {
         this.scope_depth -= 1;
     }
 
@@ -737,7 +737,7 @@ implement struct Parser {
     /// raise `pending_right_angle` so the *next* `consume_right_angle()`
     /// (closing the outer generic) finds the virtual second `>` without
     /// re-reading the token stream.
-    consume_right_angle() -> void {
+    consume_right_angle(mut &this) -> void {
         if (this.pending_right_angle) {
             this.pending_right_angle = false;
             return;

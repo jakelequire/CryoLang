@@ -133,6 +133,21 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-29
+
+663. **A binding from a match on a borrow is writable exactly when the
+     borrow is.**  A match on a `mut &T` or a writable `T*` binds its
+     payloads as writable places, so `&value` of such a binding may be
+     handed to a writer; the same match on a `&T` or a `const T*` binds
+     them read-only.  (Jake)
+
+664. **An accessor handing out a pointer into a read-only receiver is
+     decided per accessor.**  A `&this` method returning a pointer into
+     `this` returns `const T*` where its callers only read through it,
+     and becomes a `mut &this` method returning `T*` where they write.
+     A `&this` method never hands out a writable pointer into `this`.
+     (Jake)
+
 ### 2026-10-26
 
 598. **A member's visibility keyword comes after its directives.**  In
