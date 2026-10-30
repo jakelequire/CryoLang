@@ -106,7 +106,10 @@ import utils::keyword::{ Keyword };
 /// symbol - each translation unit gets its own copy - but it is how a C API
 /// states a constant too wide for an enum, which is what Vulkan's 64-bit flag
 /// bits are; 309 of them were reported unbound in a vulkan_core.h run.
-const GENERATOR_VERSION: i64 = 19;
+/// 19 -> 20: a C pointer to `const` binds as a read-only pointer at that
+/// level, a read-only level above another pointer grouped: `const char*
+/// const*` is `const (const i8*)*`.
+const GENERATOR_VERSION: i64 = 20;
 
 /// Renders bindgen-emitted AST decls to `.cryo` source under `namespace ns`.
 type struct BindingSerializer {
@@ -649,8 +652,18 @@ type struct BindingSerializer {
                 return this.ctx.intern_table.resolve(p.name);
             }
             TypeAnnotation::Pointer(p) => {
-                // C const is frontend-only; Cryo FFI lowers `const T*` as `T*`.
-                return this.render_type(p.inner) + "*";
+                // A C pointer to `const` is a read-only pointer at that level.
+                // An ungrouped `const` marks the innermost pointer of a run,
+                // so a read-only level above another pointer groups it:
+                // `const char* const*` is `const (const u8*)*`.
+                const pointee: string = this.render_type(p.inner);
+                if (!p.is_const) { return pointee + "*"; }
+                const grouped: boolean = p.inner != null && match (*p.inner) {
+                    TypeAnnotation::Pointer(_) => { true }
+                    _                          => { false }
+                };
+                if (grouped) { return "const (" + pointee + ")*"; }
+                return "const " + pointee + "*";
             }
             TypeAnnotation::Named(n) => {
                 // The importer qualified this as `<ns>::Tag`; strip back to the

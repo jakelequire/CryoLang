@@ -44,3 +44,10 @@ static const unsigned long long VC_WIDE_FLAG = 0x100000000ull;
 enum VcKind { VC_KIND_NONE = 0, VC_KIND_SOME = 7 };
 
 int vc_touch(int x);
+
+/* Read-only pointer levels: each `const` a declaration writes on a pointee is
+ * a read-only level of the bound pointer, and a read-only level above another
+ * pointer is grouped - `const char* const*` binds as `const (const i8*)*`. */
+const char* vc_name(void);
+int vc_count_lines(const char* const* lines, int count);
+int vc_fill(char* const* slots, int count);

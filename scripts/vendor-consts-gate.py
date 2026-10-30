@@ -88,6 +88,9 @@ GENERATED_MUST_CONTAIN = [
     "type enum VcKind",
     "VC_KIND_SOME = 7;",
     "function vc_touch(",
+    "function vc_name() -> const i8*;",
+    "lines: const (const i8*)*",
+    "slots: const (i8*)*",
 ]
 
 

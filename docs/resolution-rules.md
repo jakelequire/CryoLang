@@ -156,6 +156,15 @@ yet is recorded with the change that builds it, not here.
      receiver, directly or through a call, and `&this` otherwise.
      (Jake)
 
+666. **A read-only level above another pointer groups that pointer.**
+     `const` stays in front and marks the pointee of the first `*`; a
+     parenthesised pointer type after it is that pointee, so
+     `const (const u8*)*` is a read-only pointer to read-only pointers to
+     `u8` (C's `const char* const*`).  The parentheses group one pointer
+     level and are written only where a level is nested; anything else in
+     them is refused.  Types print in this form, and generated bindings
+     write it for each `const` level of a C declaration.  (Jake)
+
 ### 2026-10-26
 
 598. **A member's visibility keyword comes after its directives.**  In

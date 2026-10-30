@@ -441,7 +441,9 @@ implement struct Parser {
             // `(T, U)`, unit `()`, grouping `(T)` - is read by the paren
             // parser the annotation grammar uses; parse_base_type has no
             // `(` branch.  A bracketed array type `[T; N]` likewise.
-            if (this.check(TokenType::LParen)) {
+            if (pending_const && this.check(TokenType::LParen)) {
+                target = this.parse_read_only_group();
+            } else if (this.check(TokenType::LParen)) {
                 target = this.parse_paren_type();
             } else if (this.check(TokenType::LSquare)) {
                 target = this.parse_bracket_array_type();
@@ -2792,6 +2794,9 @@ implement struct Parser {
         // matching C (top-level const on a by-value param is meaningless).
         if (this.check(TokenType::KwConst)) {
             const const_tok: Token = this.advance();
+            if (this.check(TokenType::LParen)) {
+                return this.parse_read_only_pointer_to_group(const_tok);
+            }
             const cbase: TypeAnnotation* = this.parse_base_type();
             if (cbase == null) { return null; }
             return this.parse_type_suffixes_q(cbase, true, const_tok);
@@ -2802,6 +2807,43 @@ implement struct Parser {
         const base: TypeAnnotation* = this.parse_base_type();
         if (base == null) { return null; }
         return this.parse_type_suffixes(base, base_tok);
+    }
+
+    /// Parse `const (P)*` after its `const`: a read-only pointer whose
+    /// pointee is the pointer type `P`.  An ungrouped `const` marks the
+    /// innermost pointer of a run, so a group is how a level above it is
+    /// made read-only: `const (const u8*)*` points at read-only pointers to
+    /// read-only bytes.  The group holds one pointer type and is itself
+    /// pointed at; a group of anything else, or one no `*` follows, is
+    /// refused, and parsing goes on with the group as the pointee.
+    parse_read_only_pointer_to_group(mut &this, const_tok: Token) -> TypeAnnotation* {
+        const group: TypeAnnotation* = this.parse_read_only_group();
+        if (group == null) { return null; }
+        return this.parse_type_suffixes_q(group, true, const_tok);
+    }
+
+    /// Parse the group of a `const (P)*`, at its `(`, and refuse a group
+    /// that is not one pointer type, or that no `*` follows.
+    parse_read_only_group(mut &this) -> TypeAnnotation* {
+        const group_from: i64 = this.pos;
+        const open: Token = this.current();
+        const group: TypeAnnotation* = this.parse_paren_type();
+        if (group == null) { return null; }
+        const group_text: string = this.tokens_text(group_from, this.last_consumed_index() + 1);
+        const grouped_pointer: boolean = match (*group) {
+            TypeAnnotation::Pointer(_) => { true }
+            _                          => { false }
+        };
+        if (!grouped_pointer) {
+            this.report_invalid_at(ErrorCode::E0104_EXPECTED_TYPE, fmt::format(
+                "the parentheses after `const` group a pointer type, and `%s` is not one; a read-only pointer to it is written without them",
+                group_text), this.span_from(open));
+        } else if (!this.check(TokenType::Star)) {
+            this.report_error(ErrorCode::E0100_EXPECTED_TOKEN, fmt::format(
+                "expected `*` after `const %s`: `const` marks what a pointer points at, so the group must be pointed at",
+                group_text));
+        }
+        return group;
     }
 
     /// Parse a trait object type after its `virtual`: `&Trait`, `mut
