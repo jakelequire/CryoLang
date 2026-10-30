@@ -151,6 +151,17 @@ yet is recorded with the change that builds it, not here.
      which borrow is wanted, and a read-only place never gives a writable
      one.  (Jake)
 
+669. **`as_ref` borrows read-only; `as_mutable_ref` borrows writable.**
+     `Option::as_ref(&this)` returns `Option<const T*>` and
+     `Result::as_ref(&this)` returns `Result<const T*, const E*>`; the
+     writable forms are `as_mutable_ref(mut &this)`, returning
+     `Option<T*>` and `Result<T*, E*>`.  A caller that writes through the
+     borrow calls `as_mutable_ref`.  (Jake)
+
+670. **E0217 is reserved.**  It named a const violation and was never
+     reported; a write through a read-only place is E0250.  Like every
+     retired code it is never given a new meaning.  (Jake)
+
 ### 2026-10-29
 
 663. **A binding from a match on a borrow is writable exactly when the

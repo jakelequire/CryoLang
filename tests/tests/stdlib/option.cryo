@@ -299,19 +299,31 @@ function eq_option_f64_unequal_payloads() -> Result<(), TestError> {
     return Result::Ok(());
 }
 
-// `as_ref` borrows the payload IN PLACE: the returned pointer must alias
-// the receiver's payload, not a copy.  Writing through it changes the
-// original `Option`.  (If `as_ref` had copied the payload to a temporary,
-// the write would be lost and `opt` would still read 10.)  This is the
-// soundness pin for the borrowing accessor.
+// `as_mutable_ref` borrows the payload IN PLACE: the returned pointer must
+// alias the receiver's payload, not a copy.  Writing through it changes the
+// original `Option`.  (If it had copied the payload to a temporary, the
+// write would be lost and `opt` would still read 10.)  This is the
+// soundness pin for the borrowing accessors.
 ![test]
-function as_ref_some_aliases_in_place() -> Result<(), TestError> {
+function as_mutable_ref_some_aliases_in_place() -> Result<(), TestError> {
     mut opt: Option<i32> = Option::Some(10);
-    match (opt.as_ref()) {
+    match (opt.as_mutable_ref()) {
         Option::Some(p) => { *p = 99; }
-        Option::None => { return bail(Str::new("as_ref on Some returned None")); }
+        Option::None => { return bail(Str::new("as_mutable_ref on Some returned None")); }
     }
     return expect_eq(opt.unwrap(), 99);
+}
+
+// The read-only borrow aliases the same payload the writable one does.
+![test]
+function as_ref_and_as_mutable_ref_alias_one_payload() -> Result<(), TestError> {
+    mut opt: Option<i32> = Option::Some(4);
+    const read: const i32* = opt.as_ref().unwrap();
+    match (opt.as_mutable_ref()) {
+        Option::Some(p) => { *p = 40; }
+        Option::None => { return bail(Str::new("as_mutable_ref on Some returned None")); }
+    }
+    return expect_eq(*read, 40);
 }
 
 // Reading through the borrow yields the stored value, and the receiver
@@ -331,9 +343,9 @@ function as_ref_some_reads_without_consuming() -> Result<(), TestError> {
     return expect_eq(opt.unwrap_or(0), 7);
 }
 
-// Calls a method ON the as_ref result (Option<i32*>), which forces
-// Option<i32*> to full materialization. The lazy-instantiation fix must
-// keep Option<i32*>::as_ref deferred so this does NOT re-tower.
+// Calls a method ON the as_ref result (Option<const i32*>), which forces
+// Option<const i32*> to full materialization. The lazy instantiation must
+// keep Option<const i32*>::as_ref deferred so this does NOT re-tower.
 ![test]
 function as_ref_none_is_none() -> Result<(), TestError> {
     const opt: Option<i32> = Option::None;
