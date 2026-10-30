@@ -185,6 +185,16 @@ yet is recorded with the change that builds it, not here.
      the only way from it to a `T*`.  With nothing wanted, ruling 668
      holds.  (Jake)
 
+673. **A type is written through `[]` or `*` only where it is read through
+     them, at the same index type and with the same element.**
+     `IndexMutable<Idx, Output>` has `Index<Idx, Output>` as its supertrait
+     and `DerefMutable<Target>` has `Deref<Target>`, with the writable
+     trait's own arguments, so an implementation of the writable trait for
+     a type without the read-only one at those arguments - none at all, one
+     for another index type, or one with another element or target - is
+     refused where it is written (E0312).  Reading and writing `a[i]` or
+     `*b` therefore always reach the same type.  (Jake)
+
 ### 2026-10-29
 
 663. **A binding from a match on a borrow is writable exactly when the

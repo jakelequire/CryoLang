@@ -2380,7 +2380,11 @@ named `compare` it has.
 arithmetic, bitwise, and shift operator (`+= -= *= /= %= &= |= ^= <<= >>=`).
 
 **Indexing.** `a[i]` is read through `Index<Idx, Output>` and written
-through `IndexMutable<Idx, Output>`, which has `Index` as its supertrait.
+through `IndexMutable<Idx, Output>`, which has `Index<Idx, Output>` as its
+supertrait: a type that implements `IndexMutable` at an index type
+implements `Index` at the same one, with the same `Output`, or the
+`IndexMutable` implementation is refused (E0312), so reading and writing
+`a[i]` always reach the same element type.
 `index(&this, i)` returns a **read-only pointer** (`const Output*`), so a read
 `v = a[i]` is `*(a.index(i))`.  `index_mutable(mut &this, i)` returns a
 writable one (`Output*`), and `a[i]` is `*(a.index_mutable(i))` wherever it is
@@ -2416,7 +2420,9 @@ g[0] += 1;                // index_mutable called once
 ```
 
 **Dereference and auto-deref.** `*b` is read through `Deref<Target>` and
-written through `DerefMutable<Target>` (supertrait `Deref`), by the same rule:
+written through `DerefMutable<Target>` (supertrait `Deref<Target>`, so a
+type written through `*` is read through it, as the same `Target`; E0312
+otherwise), by the same rule:
 `deref(&this)` returns `const Target*` and a read `*b` is `*(b.deref())`;
 `deref_mutable(mut &this)` returns `Target*` and a written `*b` is
 `*(b.deref_mutable())`.  Member access **coerces** through them too: when a
