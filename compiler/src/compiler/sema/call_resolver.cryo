@@ -30,7 +30,7 @@ namespace compiler::sema::call_resolver;
 
 import compiler::types::{
     type_ref, type_base, arena, compound, user_defined, generic, substitution,
-    inference, trait_checker, generic_registry, resolver, checker, ownership, TypeKind
+    inference, trait_checker, generic_registry, resolver, checker, ownership, RefMutability, TypeKind
 };
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, mangled_name };
 import compiler::ast::{
@@ -60,7 +60,7 @@ import compiler::ast::expression::{
     MemberAccessExpr, ScopeResolutionExpr, UnaryExpr
 };
 import compiler::lex::{ Token, TokenType };
-import compiler::sema::sema::{ ObjectConversionOutcome, SemaVisitor };
+import compiler::sema::sema::{ ObjectConversionOutcome, PlaceAccess, SemaVisitor };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::diag::source_span::{ SourceSpan };
@@ -2766,6 +2766,29 @@ type struct CallResolver {
         return this.types.arg_type_names_one_type(ty) || this.symbolic.symbolic_params_settle(ty);
     }
 
+    /// E0251 where a read-only borrow is passed for a parameter that writes
+    /// through it (`mut &T`, `virtual mut &Trait`, a `T*` whose pointee is
+    /// not `const`); true when it reported.  An argument `&x` was typed
+    /// before its parameter was known, so it is judged here as it would
+    /// have been under the parameter's type: a borrow for writing of a
+    /// writable place, retyped `mut &T`, and refused of a read-only one.
+    refuses_read_only_argument(mut &this, visitor: SemaVisitor*, arg: ExpressionNode*, param_ty: TypeRef) -> boolean {
+        if (!this.types.gives_write_access(param_ty)) { return false; }
+        const arg_t: Type* = this.arena.lookup(arg.resolved_type);
+        if (arg_t == null || arg_t.kind != TypeKind::Reference || arg_t.as_reference().is_mutable()) { return false; }
+        const borrow: UnaryExpr* = ExpressionNode::unary_of(arg);
+        if (borrow != null && borrow.op.kind == TokenType::Amp && borrow.desugared_call == null
+                && borrow.operand != null) {
+            const writable: boolean = visitor.place_access(borrow.operand).is_writable();
+            borrow.operand = visitor.borrow_for_writing(borrow.operand, arg.span);
+            if (!writable) { return true; }
+            arg.set_resolved_type(this.arena.get_reference_to(arg_t.as_reference().referent, RefMutability::Mutable));
+            return false;
+        }
+        visitor.refuse_read_only_borrow(PlaceAccess::Borrow, arg, arg.span);
+        return true;
+    }
+
     /// Per-argument type checking for a 1:1 arg/param list.  Flags only hard
     /// category mismatches / lossy narrowing / same-width sign reinterpret;
     /// synthesizes implicit conversions where registered.
@@ -2776,6 +2799,7 @@ type struct CallResolver {
             if (i >= args.length()) { break; }
             const arg: ExpressionNode* = args[i];
             if (arg == null) { continue; }
+            if (this.refuses_read_only_argument(visitor, arg, param_types.get(i).unwrap())) { continue; }
             // Inside a `static match (T)` arm, `T` reads as the arm's type on
             // both sides, a field typed `T` (`&this.value`) as surely as a local.
             const arg_ty:   TypeRef = this.symbolic.symbolic_narrowed(arg.resolved_type);

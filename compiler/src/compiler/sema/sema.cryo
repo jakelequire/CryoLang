@@ -3057,13 +3057,27 @@ type struct SemaVisitor {
     /// read-only; nothing when it is writable.
     refuse_read_only_write(mut &this, access: PlaceAccess, holder: ExpressionNode*, span: SourceSpan, what: string) -> void {
         if (access.is_writable()) { return; }
+        this.ctx.emit_diagnostic(this.read_only_report(ErrorCode::E0250_WRITE_THROUGH_READ_ONLY,
+            access, holder, span, what, "written here"));
+    }
+
+    /// E0251 where a writable borrow or pointer is taken of a place inside
+    /// `holder` while `access` says it is read-only; nothing when it is
+    /// writable.
+    refuse_read_only_borrow(mut &this, access: PlaceAccess, holder: ExpressionNode*, span: SourceSpan) -> void {
+        if (access.is_writable()) { return; }
+        this.ctx.emit_diagnostic(this.read_only_report(ErrorCode::E0251_READ_ONLY_FOR_WRITABLE,
+            access, holder, span, "take a writable borrow of", "borrowed for writing here"));
+    }
+
+    /// The report of a write (`what`, labelled `label`) to a place held
+    /// behind `holder` that `access` makes read-only.
+    read_only_report(&this, code: ErrorCode, access: PlaceAccess, holder: ExpressionNode*, span: SourceSpan,
+                     what: string, label: string) -> Diagnostic {
         // A place read through `Index` or `Deref` is written through the
         // value it is read out of, which is what makes it read-only.
         const read: ExpressionNode* = this.trait_read_receiver(holder);
-        if (read != null) {
-            this.refuse_read_only_write(access, read, span, what);
-            return;
-        }
+        if (read != null) { return this.read_only_report(code, access, read, span, what, label); }
         const id: IdentifierExpr* = ExpressionNode::identifier_of(holder);
         mut through: string = "";
         if (this.names_receiver(id)) {
@@ -3078,8 +3092,8 @@ type struct SemaVisitor {
             PlaceAccess::ConstBinding => { fmt::format("cannot %s a place held by a `const` binding", what) }
             _ => { fmt::format("cannot %s a place reached through %s, which is read-only", what, through) }
         };
-        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0250_WRITE_THROUGH_READ_ONLY, message);
-        diag = diag.at_with_label(span, "written here");
+        mut diag: Diagnostic = Diagnostic::error(code, message);
+        diag = diag.at_with_label(span, label);
         match (access) {
             PlaceAccess::ReadOnlyPointer => {
                 diag = diag.help("nothing is written through a `const T*`; take a `T*` where the place is written");
@@ -3098,7 +3112,7 @@ type struct SemaVisitor {
                 }
             }
         }
-        this.ctx.emit_diagnostic(diag);
+        return diag;
     }
 
     resolve_unary(mut &this, e: ExpressionNode*, unary: UnaryExpr*) -> TypeRef {
@@ -3218,24 +3232,37 @@ type struct SemaVisitor {
             this.ctx.emit_error_at(ErrorCode::E0230_INVALID_UNARY_OP, result.error_message, e.span);
             return operand_type;
         }
-        if (unary.op.kind == TokenType::Amp) {
-            if (this.state.expected_type.is_valid()) {
-                const exp_type: Type* = this.arena.lookup(this.state.expected_type);
-                if (exp_type != null && exp_type.kind == TypeKind::Reference) {
-                    const exp_ref: ReferenceType* = exp_type.as_reference();
-                    if (exp_ref.is_mutable()) {
-                        return this.arena.get_reference_to(operand_type, RefMutability::Mutable);
-                    }
-                }
-                // A mutably borrowed object borrows its value as a mutable
-                // reference would.
-                if (exp_type != null && exp_type.kind == TypeKind::Object
-                        && exp_type.as_object().form == ObjectForm::MutableBorrowed) {
-                    return this.arena.get_reference_to(operand_type, RefMutability::Mutable);
-                }
-            }
+        // `&x` taken where write access is wanted is a writable borrow.
+        if (unary.op.kind == TokenType::Amp && this.types.gives_write_access(this.state.expected_type)) {
+            unary.operand = this.borrow_for_writing(unary.operand, e.span);
+            return this.arena.get_reference_to(operand_type, RefMutability::Mutable);
         }
         return result.result_type;
+    }
+
+    /// `place`, borrowed for writing: refused (E0251) where it is
+    /// read-only, and otherwise made the write it is (`route_write`), so
+    /// `&a[i]` borrows through `index_mutable`.  Returns the place to
+    /// borrow.
+    borrow_for_writing(mut &this, place: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
+        const access: PlaceAccess = this.place_access(place);
+        if (!access.is_writable()) {
+            this.refuse_read_only_borrow(access, this.place_holder(place), span);
+            return place;
+        }
+        return this.route_write(place);
+    }
+
+    /// What holds `place`, which decides whether it is writable: the
+    /// object of a member, the container of an element; `place` itself
+    /// for a binding or a `*`, whose report names the pointer it reads
+    /// through.
+    place_holder(&this, place: ExpressionNode*) -> ExpressionNode* {
+        const ma: MemberAccessExpr* = ExpressionNode::member_access_of(place);
+        if (ma != null && ma.object != null) { return ma.object; }
+        const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(place);
+        if (aa != null && aa.array != null) { return aa.array; }
+        return place;
     }
 
     /// The type a `sizeof`/`alignof` measures, resolved from its annotation

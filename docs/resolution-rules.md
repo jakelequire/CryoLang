@@ -176,6 +176,15 @@ yet is recorded with the change that builds it, not here.
      a type with only the read-only trait is refused naming the missing one
      (E0229).  No `as` is needed anywhere on either path.  (Jake)
 
+672. **Where write access is wanted, `&x` is a writable borrow, and a
+     read-only place never gives one.**  `&x` taken where a `mut &T`, a
+     `virtual mut &Trait` or a `T*` whose pointee is not `const` is wanted
+     - a parameter, a declared type, a `return`, an assigned place - is a
+     writable borrow; of a read-only place it is refused (E0251).  A `&T`
+     converts implicitly to `const T*` and to nothing writable; `as` is
+     the only way from it to a `T*`.  With nothing wanted, ruling 668
+     holds.  (Jake)
+
 ### 2026-10-29
 
 663. **A binding from a match on a borrow is writable exactly when the

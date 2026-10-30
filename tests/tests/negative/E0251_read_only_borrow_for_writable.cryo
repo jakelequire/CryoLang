@@ -1,0 +1,60 @@
+///! Write access is never made out of read access.  `&x` taken where a
+///! writable borrow or pointer is wanted - a `mut &T`, a `virtual mut
+///! &Trait`, a `T*` whose pointee is not `const` - is refused when `x` is
+///! read-only: held by a `const` binding, or reached through a `&T`, a
+///! `const T*` or the receiver of a `&this` method.  So is a `&T` value
+///! passed for a writable parameter.  A `&T` converts to `const T*`, and to
+///! a writable `T*` only through `as`.
+
+![config(testing)]
+![config(negative, E0251)]
+namespace CryoTests::Negative::E0251ReadOnlyBorrowForWritable;
+
+type trait Shape {
+    scale(mut &this, k: i32) -> void;
+}
+
+type struct Square {
+    side: i32;
+
+    side_pointer(&this) -> i32* {
+        return &this.side;
+        //~^ ERROR[E0251] cannot take a writable borrow of a place reached through the `&this` receiver, which is read-only
+    }
+}
+
+implement trait Shape for Square {
+    scale(mut &this, k: i32) -> void { this.side = this.side * k; }
+}
+
+function write_through(p: i32*) -> void { *p = 0; }
+function write_borrow(r: mut &i32) -> void { *r = 0; }
+function resize(s: virtual mut &Shape) -> void { s.scale(2); }
+
+function from_borrow(r: &i32, xs: &[i32], cp: const i32*) -> void {
+    write_through(r);
+    //~^ ERROR[E0251] cannot take a writable borrow of a place reached through `&i32`, which is read-only
+    write_borrow(r);
+    //~^ ERROR[E0251] cannot take a writable borrow of a place reached through `&i32`, which is read-only
+    write_through(&xs[0]);
+    //~^ ERROR[E0251] cannot take a writable borrow of a place reached through `&[i32]`, which is read-only
+    const p: i32* = &*cp;
+    //~^ ERROR[E0251] cannot take a writable borrow of a place reached through `const i32*`, which is read-only
+}
+
+function main() -> int {
+    const a: i32 = 1;
+    write_through(&a);
+    //~^ ERROR[E0251] cannot take a writable borrow of a place held by a `const` binding
+    write_borrow(&a);
+    //~^ ERROR[E0251] cannot take a writable borrow of a place held by a `const` binding
+    const p: i32* = &a;
+    //~^ ERROR[E0251] cannot take a writable borrow of a place held by a `const` binding
+    const s: Square = Square { side: 2 };
+    resize(&s);
+    //~^ ERROR[E0251] cannot take a writable borrow of a place held by a `const` binding
+    const r: &i32 = &a;
+    const q: i32* = r;
+    //~^ ERROR[E0200] mismatched types
+    return *p + *q;
+}
