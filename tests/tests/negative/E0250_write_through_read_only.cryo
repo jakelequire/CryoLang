@@ -1,0 +1,80 @@
+///! A place reached through a read-only borrow (`&T`, `virtual &Trait`, the
+///! receiver of a `&this` method) or a read-only pointer (`const T*`) is not
+///! written: not assigned, not given a compound assignment, and no `mut &this`
+///! method is called on it.  Nor is a `mut &this` method called on a `const`
+///! binding, or on a binding a `match` took from a read-only value.
+
+![config(testing)]
+![config(negative, E0250)]
+namespace CryoTests::Negative::E0250WriteThroughReadOnly;
+
+type trait Shape {
+    scale(mut &this, k: i32) -> void;
+}
+
+type struct Counter {
+    count: i32;
+
+    bump(mut &this) -> void { this.count += 1; }
+
+    reset(&this) -> void {
+        this.count = 0;
+        //~^ ERROR[E0250] cannot assign to a place reached through the `&this` receiver, which is read-only
+    }
+
+    bump_twice(&this) -> void {
+        this.bump();
+        //~^ ERROR[E0250] cannot call a `mut &this` method on a place reached through the `&this` receiver, which is read-only
+    }
+}
+
+implement trait Shape for Counter {
+    scale(mut &this, k: i32) -> void { this.count = this.count * k; }
+}
+
+type enum Slot { Filled(Counter); Empty; }
+
+function through_borrow(c: &Counter) -> void {
+    c.count = 1;
+    //~^ ERROR[E0250] cannot assign to a place reached through `&Counter`, which is read-only
+    c.count += 1;
+    //~^ ERROR[E0250] cannot assign to a place reached through `&Counter`, which is read-only
+    c.bump();
+    //~^ ERROR[E0250] cannot call a `mut &this` method on a place reached through `&Counter`, which is read-only
+}
+
+function through_read_only_pointer(c: const Counter*, n: const i32*) -> void {
+    c.count = 1;
+    //~^ ERROR[E0250] cannot assign to a place reached through `const Counter*`, which is read-only
+    (*c).bump();
+    //~^ ERROR[E0250] cannot call a `mut &this` method on a place reached through `const Counter*`, which is read-only
+    *n = 2;
+    //~^ ERROR[E0250] cannot assign to a place reached through `const i32*`, which is read-only
+}
+
+function element_through_borrow(xs: &[i64]) -> void {
+    xs[0] = 1;
+    //~^ ERROR[E0250] cannot assign to a place reached through `&[i64]`, which is read-only
+}
+
+function through_read_only_object(s: virtual &Shape) -> void {
+    s.scale(2);
+    //~^ ERROR[E0250] cannot call a `mut &this` method on a place reached through `virtual &Shape`, which is read-only
+}
+
+function binding_from_read_only(s: &Slot) -> void {
+    match (s) {
+        Slot::Filled(c) => {
+            c.bump();
+            //~^ ERROR[E0250] cannot call a `mut &this` method on a place held by a `const` binding
+        }
+        Slot::Empty => { }
+    }
+}
+
+function main() -> int {
+    const c: Counter = Counter { count: 0 };
+    c.bump();
+    //~^ ERROR[E0250] cannot call a `mut &this` method on a place held by a `const` binding
+    return 0;
+}

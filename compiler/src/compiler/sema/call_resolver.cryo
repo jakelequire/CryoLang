@@ -5247,6 +5247,10 @@ type struct CallResolver {
                 0, member.generic_args.length(), at);
             return TypeRef::invalid();
         }
+        if (this.writes_receiver(method)) {
+            visitor.refuse_read_only_write(visitor.access_within(member.object), member.object,
+                member.member_span, "call a `mut &this` method on");
+        }
         const func: FunctionDecl* = DeclarationNode::fn_of(method);
         const resolver: TypeResolver* = this.ctx.type_resolver;
         mut params: [TypeRef] = [];
@@ -5283,6 +5287,19 @@ type struct CallResolver {
         return returned;
     }
 
+    /// Whether `chosen` - a method, or a trait's method held as its
+    /// function - takes a `mut &this` receiver.
+    writes_receiver(&this, chosen: DeclarationNode*) -> boolean {
+        const method: MethodDecl* = DeclarationNode::method_of(chosen);
+        if (method != null && method.is_static) { return false; }
+        const func: FunctionDecl* = DeclarationNode::fn_of(if (method != null) { method.func } else { chosen });
+        if (func == null || func.parameters.length() == 0) { return false; }
+        const receiver: VarDecl* = DeclarationNode::var_of(func.parameters[0]);
+        if (receiver == null || !receiver.is_ref_receiver() || !receiver.has_resolved_type()) { return false; }
+        const t: Type* = this.arena.lookup(receiver.resolved_type);
+        return t != null && t.kind == TypeKind::Reference && t.as_reference().is_mutable();
+    }
+
     /// The type of a method call.  Which method it names was answered by
     /// the selection (`bind_method_on_receiver`), whose answer is `selected`;
     /// `args_refused` is whether the argument check reported this call.
@@ -5292,6 +5309,10 @@ type struct CallResolver {
         const obj_type: TypeRef = visitor.resolve_receiver(member.object);
         if (!obj_type.is_valid()) {
             return TypeRef::invalid();
+        }
+        if (this.writes_receiver(selected.chosen)) {
+            visitor.refuse_read_only_write(visitor.access_within(member.object), member.object,
+                member.member_span, "call a `mut &this` method on");
         }
         if (this.symbolic.symbolic_is_generic_owner_receiver(obj_type)) {
             // A nested generic-method call on the still-generic owner (`this.try_push(item)`

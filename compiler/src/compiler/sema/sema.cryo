@@ -136,6 +136,28 @@ type enum ObjectConversionOutcome {
 }
 
 
+/// What stops a place being written (`SemaVisitor::place_access`).
+type enum PlaceAccess {
+    Writable;
+    /// Reached last through a read-only borrow: a `&T`, a `virtual &Trait`,
+    /// or the receiver of a `&this` method.
+    Borrow;
+    /// Reached last through a read-only pointer, `const T*`.
+    ReadOnlyPointer;
+    /// Held by a `const` binding, through no indirection.
+    ConstBinding;
+}
+
+implement enum PlaceAccess {
+    is_writable(&this) -> boolean {
+        return match (this) {
+            PlaceAccess::Writable => { true }
+            _                     => { false }
+        };
+    }
+}
+
+
 /// Operator -> (language trait, method) overloading map. `valid == false` means
 /// the operator is not overloadable; `negate` flags `!=`, which lowers to
 /// `!a.equals(&b)`. `ord_pred` (non-empty only for the relational operators
@@ -1136,12 +1158,13 @@ type struct SemaVisitor {
     visit_match_stmt(mut &this, stmt: Stmt*, node: MatchStmt*) -> void {
         const subject_type: TypeRef = this.resolve_expr(node.subject);
         const caller_backed: boolean = this.subject_is_caller_backed(node.subject);
+        const writable: boolean = this.match_binds_writable(node.subject);
         for (mut i: i64 = 0; i < node.arms.length(); i++) {
             const arm: MatchArmNode* = node.arms[i];
             if (arm == null) { continue; }
             const save: i64 = this.scopes.save_scope();
             this.resolve_constant_paths_in_arm(arm);
-            this.patterns.bind_arm_patterns(arm, subject_type, caller_backed);
+            this.patterns.bind_arm_patterns(arm, subject_type, caller_backed, writable);
             if (arm.guard != null) { this.resolve_condition(arm.guard); }
             if (arm.body != null) { this.dispatch_stmt(arm.body); }
             this.scopes.restore_scope(save);
@@ -2752,8 +2775,12 @@ type struct SemaVisitor {
         const ma: MemberAccessExpr* = ExpressionNode::member_access_of(lhs);
         if (ma != null) {
             if (ma.object == null) { return; }
-            const recv_t: Type* = this.arena.lookup(ma.object.resolved_type);
-            if (recv_t != null && (recv_t.kind == TypeKind::Pointer || recv_t.kind == TypeKind::Reference)) { return; }
+            const through: Option<PlaceAccess> = this.indirection_access(ma.object.resolved_type);
+            if (through.is_some()) {
+                this.refuse_read_only_write(through.unwrap(), ma.object, lhs.span, "assign to");
+                return;
+            }
+            if (this.refuses_held_write(ma.object, lhs.span)) { return; }
             if (this.symbolic.symbolic_type_unresolved(ma.object.resolved_type)) { return; }
             this.check_assignment_lvalue(ma.object);
             return;
@@ -2765,12 +2792,152 @@ type struct SemaVisitor {
         const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(lhs);
         if (aa != null) {
             if (aa.array == null) { return; }
-            const arr_t: Type* = this.arena.lookup(aa.array.resolved_type);
-            if (arr_t != null && (arr_t.kind == TypeKind::Pointer || arr_t.kind == TypeKind::Reference)) { return; }
+            const through: Option<PlaceAccess> = this.indirection_access(aa.array.resolved_type);
+            if (through.is_some()) {
+                this.refuse_read_only_write(through.unwrap(), aa.array, lhs.span, "assign to");
+                return;
+            }
+            if (this.refuses_held_write(aa.array, lhs.span)) { return; }
             if (this.symbolic.symbolic_type_unresolved(aa.array.resolved_type)) { return; }
             this.check_assignment_lvalue(aa.array);
+            return;
         }
-    
+        const un: UnaryExpr* = ExpressionNode::unary_of(lhs);
+        if (un != null && un.op.kind == TokenType::Star && un.desugared_call == null && un.operand != null) {
+            const through: Option<PlaceAccess> = this.indirection_access(un.operand.resolved_type);
+            if (through.is_some()) {
+                this.refuse_read_only_write(through.unwrap(), un.operand, lhs.span, "assign to");
+            }
+        }
+    }
+
+    /// E0250 where a place inside `holder`, a value reached through no
+    /// indirection of its own, is written while something further out
+    /// makes it read-only: a `&this` receiver, or a read-only pointer
+    /// dereferenced.  A `const` binding is left to E0218, asked of the
+    /// binding itself.
+    refuses_held_write(mut &this, holder: ExpressionNode*, span: SourceSpan) -> boolean {
+        const held: PlaceAccess = this.place_access(holder);
+        return match (held) {
+            PlaceAccess::Borrow          => { this.refuse_read_only_write(held, holder, span, "assign to"); true }
+            PlaceAccess::ReadOnlyPointer => { this.refuse_read_only_write(held, holder, span, "assign to"); true }
+            _                            => { false }
+        };
+    }
+
+    /// What stops `place` being written.  A place reached through an
+    /// indirection is as writable as the last indirection on the way to
+    /// it, so `r.x` with `r: &(Foo*)` is written through the writable
+    /// pointer and `p.x` with `p: const Foo*` is read-only; a place reached
+    /// through none is as writable as the binding holding it.  A value no
+    /// binding holds - a call's result, a literal - is the program's own.
+    place_access(&this, place: ExpressionNode*) -> PlaceAccess {
+        if (place == null) { return PlaceAccess::Writable; }
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(place);
+        if (id != null) {
+            if (this.names_receiver(id)) {
+                if (this.state.this_is_by_ref && !this.state.this_is_mut) { return PlaceAccess::Borrow; }
+                return PlaceAccess::Writable;
+            }
+            const sym: SymbolID = id.res.local_sym();
+            if (!sym.is_valid() || this.scopes.is_mutable(sym)) { return PlaceAccess::Writable; }
+            return PlaceAccess::ConstBinding;
+        }
+        const ma: MemberAccessExpr* = ExpressionNode::member_access_of(place);
+        if (ma != null) { return this.access_within(ma.object); }
+        const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(place);
+        if (aa != null) { return this.access_within(aa.array); }
+        const un: UnaryExpr* = ExpressionNode::unary_of(place);
+        if (un != null && un.op.kind == TokenType::Star && un.desugared_call == null && un.operand != null) {
+            const through: Option<PlaceAccess> = this.indirection_access(un.operand.resolved_type);
+            if (through.is_some()) { return through.unwrap(); }
+        }
+        return PlaceAccess::Writable;
+    }
+
+    /// What stops a place inside `holder` being written: the last
+    /// indirection of `holder`'s type, or `holder` itself where it is none.
+    access_within(&this, holder: ExpressionNode*) -> PlaceAccess {
+        if (holder == null) { return PlaceAccess::Writable; }
+        const through: Option<PlaceAccess> = this.indirection_access(holder.resolved_type);
+        if (through.is_some()) { return through.unwrap(); }
+        return this.place_access(holder);
+    }
+
+    /// How writable a place reached through a value of type `t` is, or
+    /// none when `t` is no indirection.  The last indirection before the
+    /// value decides: `&T`, `const T*` and `virtual &Trait` read, `mut &T`,
+    /// `T*`, `virtual mut &Trait` and `virtual Trait*` write.
+    indirection_access(&this, t: TypeRef) -> Option<PlaceAccess> {
+        mut last: Option<PlaceAccess> = Option::None;
+        mut walk: Type* = this.arena.lookup(t);
+        while (walk != null) {
+            match (walk.kind) {
+                TypeKind::Pointer => {
+                    const pt: PointerType* = walk.as_pointer();
+                    last = Option::Some(if (pt.const_pointee) { PlaceAccess::ReadOnlyPointer } else { PlaceAccess::Writable });
+                    walk = this.arena.lookup(pt.pointee);
+                }
+                TypeKind::Reference => {
+                    const rt: ReferenceType* = walk.as_reference();
+                    last = Option::Some(if (rt.is_mutable()) { PlaceAccess::Writable } else { PlaceAccess::Borrow });
+                    walk = this.arena.lookup(rt.referent);
+                }
+                TypeKind::Object => {
+                    if (walk.as_object().form == ObjectForm::Borrowed) { return Option::Some(PlaceAccess::Borrow); }
+                    return Option::Some(PlaceAccess::Writable);
+                }
+                TypeKind::InstantiatedType => {
+                    const inst: InstantiatedType* = walk.as_instantiated();
+                    if (!inst.has_resolved_type()) { return last; }
+                    walk = this.arena.lookup(inst.resolved_type);
+                }
+                _ => { return last; }
+            }
+        }
+        return last;
+    }
+
+    /// E0250 where a place held behind `holder` is written (`what`: "assign
+    /// to", "call a `mut &this` method on") while `access` says it is
+    /// read-only; nothing when it is writable.
+    refuse_read_only_write(mut &this, access: PlaceAccess, holder: ExpressionNode*, span: SourceSpan, what: string) -> void {
+        if (access.is_writable()) { return; }
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(holder);
+        mut through: string = "";
+        if (this.names_receiver(id)) {
+            through = "the `&this` receiver";
+        } else {
+            // A dereference names the pointer it reads through.
+            const un: UnaryExpr* = ExpressionNode::unary_of(holder);
+            const shown: TypeRef = if (un != null && un.operand != null) { un.operand.resolved_type } else { holder.resolved_type };
+            through = fmt::format("`%s`", this.arena.resolve_display_name_short(shown));
+        }
+        const message: string = match (access) {
+            PlaceAccess::ConstBinding => { fmt::format("cannot %s a place held by a `const` binding", what) }
+            _ => { fmt::format("cannot %s a place reached through %s, which is read-only", what, through) }
+        };
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0250_WRITE_THROUGH_READ_ONLY, message);
+        diag = diag.at_with_label(span, "written here");
+        match (access) {
+            PlaceAccess::ReadOnlyPointer => {
+                diag = diag.help("nothing is written through a `const T*`; take a `T*` where the place is written");
+            }
+            PlaceAccess::ConstBinding => {
+                diag = diag.help("declare the binding with `mut` to write it");
+            }
+            _ => {
+                const holder_t: Type* = this.arena.lookup(holder.resolved_type);
+                if (this.names_receiver(id)) {
+                    diag = diag.help("the method takes `&this`; declare it `mut &this` to write its receiver");
+                } else if (holder_t != null && holder_t.kind == TypeKind::Object) {
+                    diag = diag.help("a `virtual &Trait` only reads; take a `virtual mut &Trait` where the value is written");
+                } else {
+                    diag = diag.help("a `&T` only reads; take a `mut &T` where the place is written");
+                }
+            }
+        }
+        this.ctx.emit_diagnostic(diag);
     }
 
     resolve_unary(mut &this, e: ExpressionNode*, unary: UnaryExpr*) -> TypeRef {
@@ -3425,6 +3592,7 @@ type struct SemaVisitor {
     resolve_match_expr(mut &this, e: ExpressionNode*, match_expr: MatchExpr*) -> TypeRef {
         const subject_type: TypeRef = this.resolve_expr(match_expr.subject);
         const caller_backed: boolean = this.subject_is_caller_backed(match_expr.subject);
+        const writable: boolean = this.match_binds_writable(match_expr.subject);
         this.patterns.check_duplicate_default_arm(match_expr.arms);
         const outer_expected: TypeRef = this.state.expected_type;
         mut result_type: TypeRef = TypeRef::invalid();
@@ -3434,7 +3602,7 @@ type struct SemaVisitor {
             if (arm == null || arm.body == null) { continue; }
             const save: i64 = this.scopes.save_scope();
             this.resolve_constant_paths_in_arm(arm);
-            this.patterns.bind_arm_patterns(arm, subject_type, caller_backed);
+            this.patterns.bind_arm_patterns(arm, subject_type, caller_backed, writable);
             if (arm.guard != null) { this.resolve_condition(arm.guard); }
             match (arm.body.kind) {
                 StmtKind::Block(block) => {
@@ -5078,6 +5246,20 @@ type struct SemaVisitor {
         if (et == null || et.kind != TypeKind::Enum) { return false; }
         const e: EnumType* = et.as_enum();
         return e.variant_index(leaf) >= 0;
+    }
+
+    /// Whether the bindings a `match` on `subject` makes may be written.
+    /// They follow the matched value: a match on `&x` binds as writably as
+    /// `x` is (the borrow is taken with nothing expected of it), one on a
+    /// borrow or a pointer as writably as its last indirection reaches, and
+    /// one on a value as writably as the place holding it.
+    match_binds_writable(&this, subject: ExpressionNode*) -> boolean {
+        if (subject == null) { return true; }
+        const u: UnaryExpr* = ExpressionNode::unary_of(subject);
+        if (u != null && u.op.kind == TokenType::Amp && u.desugared_call == null && u.operand != null) {
+            return this.place_access(u.operand).is_writable();
+        }
+        return this.access_within(subject).is_writable();
     }
 
     /// Whether a `match` subject's storage belongs to the CALLER rather than to

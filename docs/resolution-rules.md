@@ -144,6 +144,13 @@ yet is recorded with the change that builds it, not here.
      (E0222), with `(*p).x` as the way to write it.  A refused access
      never reaches code generation.  (Jake)
 
+668. **With nothing expected of it, `&x` is exactly as writable as `x`.**
+     A borrow taken where no type asks for one - a `match` subject among
+     them - is a writable borrow of a writable place and a read-only
+     borrow of a read-only one; where a type is expected, that type says
+     which borrow is wanted, and a read-only place never gives a writable
+     one.  (Jake)
+
 ### 2026-10-29
 
 663. **A binding from a match on a borrow is writable exactly when the

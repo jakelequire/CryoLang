@@ -99,9 +99,11 @@ type struct PatternResolver {
     /// reached through a by-reference parameter), which makes every binding taken
     /// from it an alias of the caller's storage rather than of a frame copy.  The
     /// return-escape check needs that distinction to tell an in-place accessor
-    /// from a dangling one.
+    /// from a dangling one.  `writable` says whether the matched value may be
+    /// written, which every binding taken from it follows: a written `mut`
+    /// only asks that alternatives agree.
     bind_arm_patterns(mut &this, arm: MatchArmNode*, subject_type: TypeRef,
-                      caller_backed: boolean) -> void {
+                      caller_backed: boolean, writable: boolean) -> void {
         for (mut i: i64 = 0; i < arm.patterns.length(); i++) {
             const pat: Pattern* = arm.patterns[i];
             if (pat == null) { continue; }
@@ -109,10 +111,10 @@ type struct PatternResolver {
                 PatternKind::Binding(b) => {
                     b.binding_type = subject_type;
                     if (subject_type.is_valid()) {
-                        this.bind_arm_name(b.binding_sym, subject_type, caller_backed);
+                        this.bind_arm_name(b.binding_sym, subject_type, caller_backed, writable);
                     }
                 }
-                PatternKind::Enum(e) => { this.bind_enum_pattern(e, subject_type, caller_backed); }
+                PatternKind::Enum(e) => { this.bind_enum_pattern(e, subject_type, caller_backed, writable); }
                 PatternKind::Constant(c) => { this.check_constant_pattern(pat, c, subject_type); }
                 _ => { }
             }
@@ -229,17 +231,17 @@ type struct PatternResolver {
     /// When the subject was reached through a by-reference parameter the
     /// binding aliases the caller's storage, so `return &name` is not a
     /// dangling return.
-    bind_arm_name(mut &this, sym: SymbolID, ty: TypeRef, caller_backed: boolean) -> void {
-        this.scopes.declare(sym, ty, false);
+    bind_arm_name(mut &this, sym: SymbolID, ty: TypeRef, caller_backed: boolean, writable: boolean) -> void {
+        this.scopes.declare(sym, ty, writable);
         if (caller_backed && sym.is_valid()) { this.state.alias_bindings.insert(sym.table_key()); }
     }
 
     /// Bind a variant payload's name `sym` to `ty`, and remember it as a
     /// payload: over a by-value subject it is a copy in this frame, and a
     /// `return &payload` dangles (E0455).
-    bind_payload(mut &this, sym: SymbolID, ty: TypeRef, caller_backed: boolean) -> void {
+    bind_payload(mut &this, sym: SymbolID, ty: TypeRef, caller_backed: boolean, writable: boolean) -> void {
         if (sym.is_valid()) { this.state.payload_bindings.insert(sym.table_key()); }
-        this.bind_arm_name(sym, ty, caller_backed);
+        this.bind_arm_name(sym, ty, caller_backed, writable);
     }
 
     /// Resolve the positional payload types of `enum_pat`'s variant against a value
@@ -434,7 +436,7 @@ type struct PatternResolver {
     /// Bind the names of an enum pattern matched against a value of `value_type`,
     /// recursing into nested sub-patterns; each element binds against its payload.
     bind_enum_pattern(mut &this, enum_pat: EnumPattern*, value_type: TypeRef,
-                      caller_backed: boolean) -> void {
+                      caller_backed: boolean, writable: boolean) -> void {
         // A subject with no type was refused where it was written; its
         // bindings get no type either, where the variant's template would
         // bind them to its own parameters and every use would report again.
@@ -454,7 +456,7 @@ type struct PatternResolver {
             if (pb != null) {
                 pb.resolved_type = elem_ty;
                 // Remember the binding so a `return &payload` is caught (E0455).
-                this.bind_payload(pb.sym_id, elem_ty, caller_backed);
+                this.bind_payload(pb.sym_id, elem_ty, caller_backed, writable);
                 continue;
             }
             const sub: Pattern* = enum_pat.sub_at(j);
@@ -465,7 +467,7 @@ type struct PatternResolver {
                 PatternKind::Constant(c) => {
                     if (payload_known) { this.check_constant_pattern(sub, c, elem_ty); }
                 }
-                _ => { this.bind_subpattern(sub, elem_ty, caller_backed); }
+                _ => { this.bind_subpattern(sub, elem_ty, caller_backed, writable); }
             }
         }
     }
@@ -563,16 +565,16 @@ type struct PatternResolver {
     /// Bind names in an arbitrary nested pattern matched against `value_type`.
     /// Only identifier bindings and nested enum patterns introduce names.
     bind_subpattern(mut &this, pat: Pattern*, value_type: TypeRef,
-                    caller_backed: boolean) -> void {
+                    caller_backed: boolean, writable: boolean) -> void {
         if (pat == null) { return; }
         match (pat.kind) {
             PatternKind::Binding(b) => {
                 b.binding_type = value_type;
                 if (value_type.is_valid()) {
-                    this.bind_arm_name(b.binding_sym, value_type, caller_backed);
+                    this.bind_arm_name(b.binding_sym, value_type, caller_backed, writable);
                 }
             }
-            PatternKind::Enum(e) => { this.bind_enum_pattern(e, value_type, caller_backed); }
+            PatternKind::Enum(e) => { this.bind_enum_pattern(e, value_type, caller_backed, writable); }
             _ => { }
         }
     }
