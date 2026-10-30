@@ -76,10 +76,6 @@ type struct PlaceEmitter {
     /// attach a source snippet to any diagnostic we emit.
     codegen_member_access(mut &this, object_ptr: LValue, object_type: TypeRef, object_is_lvalue: boolean, member: SymbolStr, pin: MemberPin, pin_carried: boolean, site_span: SourceSpan) -> Emitted {
         mut out: Emitted = Emitted::none();
-        // Auto-deref: if the object is a pointer/reference (e.g., `node: ExprStmt*`
-        // stored in an alloca), load the pointer value so we can GEP into the struct.
-        // `node.field` on a pointer is an implicit
-        // deref.  Applied once per call; GEP'd field pointers stay as struct pointers.
         mut obj_ptr: LValue = object_ptr;
         mut obj_type: TypeRef = object_type;
         mut t: Type* = this.cg.arena_type(obj_type);
@@ -97,7 +93,18 @@ type struct PlaceEmitter {
             inst_depth += 1;
         }
 
-        if (t != null && (t.kind == TypeKind::Pointer || t.kind == TypeKind::Reference)) {
+        // Every pointer or reference layer sema read through (any number of
+        // borrows, one raw pointer at most) is one load.  `object_ptr` is a
+        // slot holding the outermost layer only when the object is an
+        // lvalue; an rvalue (`obj.as_ptr().count`) already IS that layer's
+        // pointer value, and loading it once more would read the struct's
+        // first word as an address.  Each inner layer is a slot the outer
+        // one points at, so it is always loaded.  A pointee may itself be a
+        // resolved instantiation (`HashMapEntry<u32, i64>` behind a
+        // `HashMapEntry<u32, i64>*`), unwrapped so the kind dispatch below
+        // sees the concrete struct or array.
+        mut holds_slot: boolean = object_is_lvalue;
+        while (t != null && (t.kind == TypeKind::Pointer || t.kind == TypeKind::Reference)) {
             if (t.kind == TypeKind::Pointer) {
                 const pt: PointerType* = t.as_pointer();
                 obj_type = pt.pointee;
@@ -106,34 +113,19 @@ type struct PlaceEmitter {
                 obj_type = rt.referent;
             }
             t = this.cg.arena_type(obj_type);
-
-            // Load the pointer value through the alloca (only when `object_ptr`
-            // really is an lvalue pointing at a ptr slot). Under opaque pointers
-            // every value has LLVM type `ptr`, so the kind check alone can't
-            // distinguish a slot from a raw rvalue; the previous version
-            // ALWAYS loaded, which over-derefed any pointer rvalue (e.g. the
-            // result of `obj.as_ptr().count` where `as_ptr()` already returned
-            // the pointer value, not a slot containing it). Threading the
-            // semantic lvalue flag through is the only reliable signal.
-            if (object_is_lvalue && obj_ptr.is_valid()) {
+            if (holds_slot && obj_ptr.is_valid()) {
                 obj_ptr = this.cg.builder.build_load(LType::pointer_to(LType::i8()),
                                                 obj_ptr, "autoderef");
             }
-        }
-
-        // The pointee of a Pointer/Reference may itself be an InstantiatedType
-        // (e.g. `HashMapEntry<u32, i64>` sitting in the arena as the pointee of a
-        // `HashMapEntry<u32, i64>*`). Mirror the pre-Pointer unwrap above so the
-        // kind dispatch below sees the concrete Struct/Array; without this,
-        // field_idx stays -1, the access silently emits no IR, and the
-        // half-emitted basic block gets stripped by `is_function_body_valid`.
-        mut inst_depth2: i32 = 0;
-        while (t != null && t.kind == TypeKind::InstantiatedType && inst_depth2 < 5) {
-            const inst: InstantiatedType* = t.as_instantiated();
-            if (!inst.has_resolved_type()) { break; }
-            obj_type = inst.resolved_type;
-            t = this.cg.arena_type(obj_type);
-            inst_depth2 += 1;
+            holds_slot = true;
+            mut inst_depth2: i32 = 0;
+            while (t != null && t.kind == TypeKind::InstantiatedType && inst_depth2 < 5) {
+                const inst: InstantiatedType* = t.as_instantiated();
+                if (!inst.has_resolved_type()) { break; }
+                obj_type = inst.resolved_type;
+                t = this.cg.arena_type(obj_type);
+                inst_depth2 += 1;
+            }
         }
 
         if (t == null) {

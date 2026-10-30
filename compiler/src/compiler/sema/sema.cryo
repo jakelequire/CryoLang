@@ -1675,12 +1675,52 @@ type struct SemaVisitor {
     /// nothing of `obj`'s, so `obj` is resolved under no expected type: a
     /// `match` (a `?` among them) resolved under one would take it as its
     /// own.
+    ///
+    /// `.` reads through any number of borrows but through one raw pointer
+    /// at most: a receiver whose type holds two raw pointers on the way to
+    /// its value (`Foo**`, `&(Foo**)`) is refused here, so a member is never
+    /// reached through a pointer the program did not dereference.
     resolve_receiver(mut &this, receiver: ExpressionNode*) -> TypeRef {
         const outer_expected: TypeRef = this.state.expected_type;
         this.state.expected_type = TypeRef::invalid();
         const t: TypeRef = this.resolve_expr(receiver);
         this.state.expected_type = outer_expected;
+        if (t.is_valid() && this.raw_pointers_before_value(t) > 1) {
+            mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0222_INVALID_DEREF,
+                fmt::format("`.` reads through one raw pointer, and `%s` holds more than one",
+                    this.arena.resolve_display_name_short(t)));
+            diag = diag.at_with_label(receiver.span, "more than one raw pointer before the value");
+            diag = diag.help("dereference every raw pointer but the last with `*`: `(*p).x` for `p: Foo**`");
+            this.ctx.emit_diagnostic(diag);
+            return TypeRef::invalid();
+        }
         return t;
+    }
+
+    /// How many raw pointers `.` would step through on `t` to reach a
+    /// value: borrows and resolved instantiations are passed over, and the
+    /// walk ends at the first type that is neither.
+    raw_pointers_before_value(&this, t: TypeRef) -> i32 {
+        mut count: i32 = 0;
+        mut walk: Type* = this.arena.lookup(t);
+        while (walk != null) {
+            match (walk.kind) {
+                TypeKind::Pointer => {
+                    count += 1;
+                    walk = this.arena.lookup(walk.as_pointer().pointee);
+                }
+                TypeKind::Reference => {
+                    walk = this.arena.lookup(walk.as_reference().referent);
+                }
+                TypeKind::InstantiatedType => {
+                    const inst: InstantiatedType* = walk.as_instantiated();
+                    if (!inst.has_resolved_type()) { return count; }
+                    walk = this.arena.lookup(inst.resolved_type);
+                }
+                _ => { return count; }
+            }
+        }
+        return count;
     }
 
     /// The type of an expression whose kind has a payload; `resolve_expr`

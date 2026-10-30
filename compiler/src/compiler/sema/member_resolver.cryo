@@ -463,8 +463,9 @@ type struct MemberResolver {
     /// here by the receiver's type and the written leaf, and its coordinates
     /// are handed back for every later stage to read.
     ///
-    /// One source per receiver shape, never a second try.  Auto-deref is one
-    /// pointer or reference layer.  An instantiation with no resolved type,
+    /// One source per receiver shape, never a second try.  Auto-deref steps
+    /// through every pointer and reference layer; the receiver was already
+    /// refused if more than one of them is a raw pointer.  An instantiation with no resolved type,
     /// and a generic template itself, is read off the template's declaration:
     /// the arena type of a template holds no fields.  Everything else - a
     /// struct or union, a resolved instantiation, an array's `length` - is
@@ -474,44 +475,28 @@ type struct MemberResolver {
     field_of(&this, recv: TypeRef, leaf: SymbolStr) -> FieldAnswer {
         mut owner: TypeRef = recv;
         mut t: Type* = this.arena.lookup(owner);
-        if (t == null) { return FieldAnswer::none(); }
-        if (t.kind == TypeKind::Pointer) {
-            owner = t.as_pointer().pointee;
-            t = this.arena.lookup(owner);
-        } else if (t.kind == TypeKind::Reference) {
-            owner = t.as_reference().referent;
-            t = this.arena.lookup(owner);
-        }
-        if (t == null) { return FieldAnswer::none(); }
-        if (t.kind == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = t.as_instantiated();
-            if (!inst.has_resolved_type()) {
-                return this.template_field(inst.generic_base, recv, leaf);
+        while (t != null) {
+            if (t.kind == TypeKind::Pointer) {
+                owner = t.as_pointer().pointee;
+            } else if (t.kind == TypeKind::Reference) {
+                owner = t.as_reference().referent;
+            } else if (t.kind == TypeKind::InstantiatedType) {
+                const inst: InstantiatedType* = t.as_instantiated();
+                if (!inst.has_resolved_type()) {
+                    return this.template_field(inst.generic_base, recv, leaf);
+                }
+                owner = inst.resolved_type;
+            } else {
+                break;
             }
-            owner = inst.resolved_type;
             t = this.arena.lookup(owner);
-            if (t == null) { return FieldAnswer::none(); }
         }
+        if (t == null) { return FieldAnswer::none(); }
         const reg: GenericRegistry* = this.ctx.get_generic_registry();
         if (t.kind == TypeKind::Struct && reg != null && reg.is_template(owner)) {
             return this.template_field(owner, recv, leaf);
         }
-        // A concrete type's fields, read off its arena entry.  A pointer or
-        // reference still standing here is stepped through once more, and a
-        // resolved instantiation reached that way is resolved once more.
-        if (t.kind == TypeKind::Pointer) {
-            t = this.arena.lookup(t.as_pointer().pointee);
-        } else if (t.kind == TypeKind::Reference) {
-            t = this.arena.lookup(t.as_reference().referent);
-        }
-        if (t == null) { return FieldAnswer::none(); }
-        if (t.kind == TypeKind::InstantiatedType) {
-            const inner: InstantiatedType* = t.as_instantiated();
-            if (inner.has_resolved_type()) {
-                t = this.arena.lookup(inner.resolved_type);
-                if (t == null) { return FieldAnswer::none(); }
-            }
-        }
+        // A concrete type's fields, read off its arena entry.
         if (t.kind == TypeKind::Struct) {
             mut st: StructType* = t.as_struct();
             const i: i64 = st.field_position(leaf);

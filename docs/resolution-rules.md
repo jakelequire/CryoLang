@@ -133,6 +133,17 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-30
+
+667. **`.` reads through any number of borrows and one raw pointer.**
+     Field access and method calls step through every `&` and `mut &`
+     level in front of the value, but through at most one raw pointer
+     (`T*` or `const T*`), counted over the whole chain whatever the
+     order of its levels: `r.x` with `r: &(&Foo)`, `&(Foo*)` or
+     `(&Foo)*` reads the field, and `p.x` with `p: Foo**` is refused
+     (E0222), with `(*p).x` as the way to write it.  A refused access
+     never reaches code generation.  (Jake)
+
 ### 2026-10-29
 
 663. **A binding from a match on a borrow is writable exactly when the

@@ -382,6 +382,8 @@ The receiver shape on a method is part of its signature: a `&this` method may no
 
 Reading the value a reference refers to is explicit in arithmetic and comparison: `*x == 7`, `*x % 2`. Writing `x == 7` or `x % 2` with `x: &int` is an error, never a comparison of the reference itself ([section 5.2](#52-comparison)). Member access reads through the reference: `h.tag` with `h: &Heap`.
 
+**How far `.` reads.** A field access or method call steps through every reference in front of the value and through one raw pointer: `r.x` reads the field with `r: &(&Foo)`, `r: &(Foo*)` or `p: (&Foo)*`. A second raw pointer anywhere in the chain is refused (`E0222`), since reading through it is a dereference the program should write: `p.x` with `p: Foo**` is written `(*p).x`. The rule counts the raw pointers before the value, so `xs.first().unwrap().x` on a `[Foo*]`, whose `first()` gives a `Foo**`, is refused the same way.
+
 ### 2.4 Array Types
 
 Cryo has two array types: the **fixed array** `[T; N]`, which holds its `N` elements in place, and the **dynamic array** `[T]`, growable and heap-backed.  The dynamic array is the standard library's `Array<T>` with the default allocator: `[T]` is a spelling of that type, not a second one, so a `[T]` and an `Array<T>` are interchangeable everywhere.  An array with another allocator is written out, `Array<T, A>`; `[T]` never names one.
@@ -1110,7 +1112,7 @@ Only `mut` bindings can be assigned to.
 
 | Operator       | Description                                                                                                                                   |
 | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `->`           | Return-type arrow. Not a member-access operator: `.` auto-dereferences pointers, so write `p.field`, never `p->field`.                        |
+| `->`           | Return-type arrow. Not a member-access operator: `.` auto-dereferences pointers (one raw pointer, any number of references; section 2.3), so write `p.field`, never `p->field`. |
 | `=>`           | Pattern-to-body separator inside `match`.                                                                                                     |
 | `::`           | Scope resolution: static methods, enum variants, module members.                                                                              |
 | `?` `:`        | Ternary conditional.                                                                                                                          |

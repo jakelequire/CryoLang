@@ -653,13 +653,31 @@ type struct CallEmitter {
             const ma: MemberAccessExpr* = ExpressionNode::member_access_of(node.callee);
             // For pointer/reference receivers (e.g. `runner: Runner*`),
             // the receiver value is itself the `this` pointer; load it
-            // out of the local slot.  For value receivers (`runner: Runner`),
-            // take the lvalue address as `this`.
+            // out of the local slot.  A layer behind it (`r: &(Runner*)`)
+            // holds the next pointer, loaded in turn until the value the
+            // method is declared on: methods belong to that value, never
+            // to a pointer.  For value receivers (`runner: Runner`), take
+            // the lvalue address as `this`.
             const recv_t: Type* = this.cg.arena_type(ma.object.resolved_type);
             mut obj: LValue = LValue::null();
             if (recv_t != null && (recv_t.kind == TypeKind::Pointer
                                 || recv_t.kind == TypeKind::Reference)) {
                 obj = this.dispatch.codegen_rvalue(visitor,ma.object);
+                mut layer: Type* = recv_t;
+                while (layer != null) {
+                    const inner: TypeRef = if (layer.kind == TypeKind::Pointer) {
+                        layer.as_pointer().pointee
+                    } else {
+                        layer.as_reference().referent
+                    };
+                    layer = this.cg.arena_type(inner);
+                    if (layer == null || (layer.kind != TypeKind::Pointer && layer.kind != TypeKind::Reference)) {
+                        break;
+                    }
+                    if (obj.is_valid()) {
+                        obj = this.cg.builder.build_load(LType::pointer_to(LType::i8()), obj, "recvderef");
+                    }
+                }
             } else {
                 const obj_e: Emitted = this.dispatch.generate_expression(visitor, ma.object);
                 obj = obj_e.value;
