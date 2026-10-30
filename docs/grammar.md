@@ -153,6 +153,8 @@ ParamList          ::= Param ("," Param)* ("," VariadicParam)?
 Param              ::= Ident ":" Type
                      | "&this" | "mut" "&this"    (* borrowing receiver *)
                      | "this"  | "mut" "this"     (* by-value (consuming) receiver *)
+                       (* A method that is not `static` writes its receiver
+                          first; one with none is refused (E0118). *)
 VariadicParam      ::= Ident ":" Type "..."
 
 WhereClause        ::= Ident ":" TraitBound ("+" TraitBound)*

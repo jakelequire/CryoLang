@@ -148,6 +148,14 @@ yet is recorded with the change that builds it, not here.
      A `&this` method never hands out a writable pointer into `this`.
      (Jake)
 
+665. **Every instance method writes its receiver.**  A method that is
+     not `static` and writes none of `&this`, `mut &this` and `this` is
+     refused where it is named (E0118, a new code), with a help naming
+     the three forms; it is no longer taken as `&this`.  Each receiver
+     says what the method does: `mut &this` where it writes the
+     receiver, directly or through a call, and `&this` otherwise.
+     (Jake)
+
 ### 2026-10-26
 
 598. **A member's visibility keyword comes after its directives.**  In

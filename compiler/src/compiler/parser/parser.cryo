@@ -914,19 +914,27 @@ implement struct Parser {
         return new TypeAnnotation::Reference(ref_ann);
     }
 
-    /// Give a non-static method the receiver its source did not write.  Every
-    /// instance method takes one, and a method that writes none takes it by reference, as
-    /// `&this`; synthesizing it here makes that one parameter, declared once,
-    /// instead of a case every later stage re-derives.  Its span is zero-width
-    /// at the method's name: a report about it points at the method, and it
+    /// Refuse a non-static method its source wrote no receiver for (E0118):
+    /// every instance method says whether it reads the receiver, writes it
+    /// or takes it by value.  The method is then given `&this`, so later
+    /// stages see the parameter every method has and report nothing more
+    /// about it; that receiver's span is zero-width at the method's name and
     /// covers no written text.
-    give_receiver(&this, func_decl: DeclarationNode*, is_static: boolean) -> void {
+    require_receiver(mut &this, func_decl: DeclarationNode*, is_static: boolean) -> void {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || is_static) { return; }
         for (mut i: i64 = 0; i < func.parameters.length(); i++) {
             if (DeclarationNode::var_of(func.parameters[i]).is_receiver()) { return; }
         }
         const at: SourceSpan = if (func_decl.name_span.has_location()) { func_decl.name_span } else { func_decl.span };
+        const name: string = this.ctx.get_intern_table().resolve(func.name);
+        this.error_count += 1;
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0118_MISSING_RECEIVER,
+            fmt::format("method `%s` does not say how it takes its receiver", name));
+        diag = diag.at_with_label(at, "no receiver written");
+        diag = diag.help(
+            "write `&this` first among its parameters to read the receiver, `mut &this` to change it, or `this` to take it by value; a method with no receiver is `static`");
+        this.ctx.emit_diagnostic(diag);
         const span: SourceSpan = SourceSpan::new(at.file, at.start_line, at.start_col,
                                                  at.start_line, at.start_col);
         mut param: VarDecl* = VarDecl::new(this.ctx.intern("&this"));
@@ -937,13 +945,13 @@ implement struct Parser {
         func.parameters.insert(0, param_decl);
     }
 
-    /// `give_receiver` over every method of a type body or an impl block, once
-    /// each method's `static` is known.
-    give_receivers(&this, methods: &[DeclarationNode*]) -> void {
+    /// `require_receiver` over every method of a type body or an impl block,
+    /// once each method's `static` is known.
+    require_receivers(mut &this, methods: &[DeclarationNode*]) -> void {
         for (mut i: i64 = 0; i < methods.length(); i++) {
             const m_decl: DeclarationNode* = methods[i];
             const m: MethodDecl* = DeclarationNode::method_of(m_decl);
-            if (m != null) { this.give_receiver(m.func, m.is_static); }
+            if (m != null) { this.require_receiver(m.func, m.is_static); }
         }
     }
 
@@ -1318,8 +1326,8 @@ implement struct Parser {
             this.advance();
         }
 
-        if (struct_node != null) { this.give_receivers(&struct_node.methods); }
-        if (union_node != null)  { this.give_receivers(&union_node.methods); }
+        if (struct_node != null) { this.require_receivers(&struct_node.methods); }
+        if (union_node != null)  { this.require_receivers(&union_node.methods); }
     }
 
     /// Refuse a constructor `Name(params) [: Base(args)] [-> T] { body }`
@@ -1751,7 +1759,7 @@ implement struct Parser {
                 if (func != null) {
                     if (is_static) { func.set_static(true); }
                     if (trait_mods.is_async) { func.set_async(true); }
-                    this.give_receiver(func_decl, is_static);
+                    this.require_receiver(func_decl, is_static);
                     for (mut pi: i64 = 0; pi < pending_dirs.length(); pi++) {
                         func_decl.add_directive(pending_dirs[pi]);
                     }
@@ -2442,7 +2450,7 @@ implement struct Parser {
         }
 
         this.consume(TokenType::RBrace, "'}'");
-        this.give_receivers(&node.methods);
+        this.require_receivers(&node.methods);
         this.current_type_name = "";
         decl.span = this.span_from(start);
         return decl;
