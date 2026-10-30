@@ -647,9 +647,8 @@ type struct MethodBinding {
                 // by bare leaf alone, and a qualified key there misses silently.
                 //
                 // A bound gives its subject its trait's methods, then each
-                // supertrait's, nearest first.  The bound's arguments are the
-                // named trait's, not a supertrait's, so a supertrait's return
-                // has only `This` rebased.
+                // supertrait's, nearest first, with the arguments the bound
+                // gives the trait that declares the method.
                 const bound_def: DefId = if (tr == null) {
                     this.ctx.decl_index.def_of(implied, this.arena) } else { tr.definition() };
                 const members: [TraitMember] = this.ctx.generic_registry.trait_members_declaring(bound_def, method_name);
@@ -663,12 +662,11 @@ type struct MethodBinding {
                         dir.note(members[k].trait_def);
                     }
                     if (need_ret && !out.is_valid()) {
-                        if (tr == null || !own) {
+                        if (tr == null) {
                             out = this.subst_this_in_trait_return(ret, recv);
                         } else {
-                            const leaf: SymbolStr = tr.path[tr.path.length() - 1];
-                            const sub: TypeRef = this.subst_bound_trait_args(ret, leaf, tr);
-                            out = this.subst_this_in_trait_return(sub, recv);
+                            out = this.subst_this_in_trait_return(
+                                this.subst_bound_declaring_args(ret, tr, members[k].trait_def), recv);
                         }
                     }
                     break;
@@ -716,13 +714,7 @@ type struct MethodBinding {
                 if (!answered.is_valid()) { continue; }
                 dir.note(answered);
                 if (out.is_valid()) { continue; }
-                // The bound's arguments are the named trait's, not a
-                // supertrait's, so a supertrait's return has only `This`
-                // rebased.
-                if (answered.equals(tr.definition())) {
-                    ret = this.subst_bound_trait_args(ret, tr.path[tr.path.length() - 1], tr);
-                }
-                out = this.subst_this_in_trait_return(ret, recv_type);
+                out = this.subst_this_in_trait_return(this.subst_bound_declaring_args(ret, tr, answered), recv_type);
             }
         }
         return out;
@@ -853,24 +845,18 @@ type struct MethodBinding {
             for (mut ti: i64 = 0; ti < b.trait_refs.length(); ti++) {
                 const tr: const TraitRef* = &b.trait_refs[ti];
                 if (tr.path.length() == 0) { continue; }
-                // Identity for the registry lookup, leaf for the assoc-arg
-                // substitution: `subst_bound_trait_args` reaches
-                // `get_trait_decl`, which is keyed by bare leaf alone.
                 // The bound's trait first, then its supertraits nearest first.
-                const leaf: SymbolStr = tr.path[tr.path.length() - 1];
                 mut ret: TypeRef = TypeRef::invalid();
                 const answered: DefId = this.bound_trait_declaring(tr, method_name, &ret);
                 if (!answered.is_valid()) { continue; }
                 dir.note(answered);
                 if (need_ret && !out.is_valid()) {
-                    // A supertrait's return has only `This` rebased: the
-                    // bound's arguments are the named trait's.
-                    // Bound-supplied assoc args first (`Future<i64>` ->
-                    // Output); any `This` the bound left unbound then
+                    // Bound-supplied args first (`Future<i64>` -> Output),
+                    // as the bound gives them to the trait declaring the
+                    // method; any `This` the bound left unbound then
                     // rebases onto the projection receiver rather than
                     // dangling.
-                    out = if (!answered.equals(tr.definition())) { this.subst_this_in_trait_return(ret, recv) } else {
-                        this.subst_this_in_trait_return(this.subst_bound_trait_args(ret, leaf, tr), recv) };
+                    out = this.subst_this_in_trait_return(this.subst_bound_declaring_args(ret, tr, answered), recv);
                 }
             }
         }
@@ -915,9 +901,38 @@ type struct MethodBinding {
         const tdecl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(tr.definition());
         if (tdecl == null) { return ret; }
         if (tdecl.generic_params.length() == 0 && tdecl.assoc_types.length() == 0) { return ret; }
+        const args: [TypeRef] = this.bound_argument_positions(tr);
+        return this.ctx.type_resolver.substitute_trait_arguments(ret, tr.definition(), &args);
+    }
+
+    /// `ret`, declared by `declaring` - the bound `tr`'s own trait or one
+    /// of its supertraits - with the arguments the bound gives `declaring`
+    /// put in: the bound's own for its trait, and for a supertrait what the
+    /// trait writes on it with the bound's arguments put in, so a method
+    /// `index` reached through `where T: IndexMutable<u64, i32>` returns
+    /// `const i32*` as it would through `where T: Index<u64, i32>`.
+    subst_bound_declaring_args(mut &this, ret: TypeRef, tr: const TraitRef*, declaring: DefId) -> TypeRef {
+        if (declaring.equals(tr.definition())) {
+            return this.subst_bound_trait_args(ret, tr.path[tr.path.length() - 1], tr);
+        }
+        const own: [TypeRef] = this.bound_argument_positions(tr);
+        mut open: [DefId] = [];
+        mut along: [TypeRef] = [];
+        if (!this.ctx.type_resolver.trait_arguments_along(tr.definition(), &own, declaring, &open, &along)) {
+            return ret;
+        }
+        return this.ctx.type_resolver.substitute_trait_arguments(ret, declaring, &along);
+    }
+
+    /// What the bound `tr` writes for each position of its trait: the
+    /// trait's parameters, then its associated types; invalid at a position
+    /// it leaves unwritten.
+    bound_argument_positions(mut &this, tr: const TraitRef*) -> [TypeRef] {
+        mut args: [TypeRef] = [];
+        const tdecl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(tr.definition());
+        if (tdecl == null) { return args; }
         mut rc: ResolutionContext = ResolutionContext::new("");
         this.symbolic.symbolic_bind_params(&rc);
-        mut args: [TypeRef] = [];
         const positions: i64 = tdecl.generic_params.length() + tdecl.assoc_types.length();
         for (mut i: i64 = 0; i < positions; i++) {
             args.push(if (i < tr.type_args.length()) {
@@ -926,7 +941,7 @@ type struct MethodBinding {
                 TypeRef::invalid()
             });
         }
-        return this.ctx.type_resolver.substitute_trait_arguments(ret, tr.definition(), &args);
+        return args;
     }
 
     /// The projected member name of a projection type-annotation, or empty for

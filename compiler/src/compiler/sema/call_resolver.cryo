@@ -5255,6 +5255,7 @@ type struct CallResolver {
         if (this.writes_receiver(method)) {
             visitor.refuse_read_only_write(visitor.access_within(member.object), member.object,
                 member.member_span, "call a `mut &this` method on");
+            member.object = visitor.route_write(member.object);
         }
         const func: FunctionDecl* = DeclarationNode::fn_of(method);
         const resolver: TypeResolver* = this.ctx.type_resolver;
@@ -5318,6 +5319,7 @@ type struct CallResolver {
         if (this.writes_receiver(selected.chosen)) {
             visitor.refuse_read_only_write(visitor.access_within(member.object), member.object,
                 member.member_span, "call a `mut &this` method on");
+            member.object = visitor.route_write(member.object);
         }
         if (this.symbolic.symbolic_is_generic_owner_receiver(obj_type)) {
             // A nested generic-method call on the still-generic owner (`this.try_push(item)`
@@ -5541,8 +5543,14 @@ type struct CallResolver {
         const coerced: TypeRef = this.member.try_deref_coercion(visitor, member_e, member);
         if (coerced.is_valid()) {
             // The call names the method on the coerced receiver, bound here
-            // where it is written.
-            this.bind_method_on_receiver(visitor, call, member, member.object.resolved_type);
+            // where it is written; a `mut &this` one writes the pointee, so
+            // through `deref_mutable`.
+            const on_target: Selection = this.bind_method_on_receiver(visitor, call, member, member.object.resolved_type);
+            if (this.writes_receiver(on_target.chosen)) {
+                visitor.refuse_read_only_write(visitor.access_within(member.object), member.object,
+                    member.member_span, "call a `mut &this` method on");
+                member.object = visitor.route_write(member.object);
+            }
             this.binding.stash_method_call_bindings(member.object.resolved_type, member, call, null);
             member_e.set_resolved_type(coerced);
             return coerced;

@@ -2471,6 +2471,7 @@ type struct SemaVisitor {
                 rhs = this.resolve_expr(bin.right);
             }
             this.check_assignment_lvalue(bin.left);
+            bin.left = this.route_write(bin.left);
             if (bin.op.kind == TokenType::Equal) {
                 this.lambda.refuse_stored_closure(rhs, lhs,
                     if (bin.right != null) { bin.right.span } else { e.span }, "an assigned place");
@@ -2803,12 +2804,163 @@ type struct SemaVisitor {
             return;
         }
         const un: UnaryExpr* = ExpressionNode::unary_of(lhs);
-        if (un != null && un.op.kind == TokenType::Star && un.desugared_call == null && un.operand != null) {
+        if (un == null || un.op.kind != TokenType::Star || un.operand == null) { return; }
+        // Written as `index_mutable` or `deref_mutable` on the value read,
+        // so that value is the place written.
+        const read: ExpressionNode* = this.trait_read_receiver(lhs);
+        if (read != null) {
+            const through: Option<PlaceAccess> = this.indirection_access(read.resolved_type);
+            if (through.is_some()) {
+                this.refuse_read_only_write(through.unwrap(), read, lhs.span, "assign to");
+                return;
+            }
+            if (this.refuses_held_write(read, lhs.span)) { return; }
+            if (this.symbolic.symbolic_type_unresolved(read.resolved_type)) { return; }
+            this.check_assignment_lvalue(read);
+            return;
+        }
+        if (un.desugared_call == null) {
             const through: Option<PlaceAccess> = this.indirection_access(un.operand.resolved_type);
             if (through.is_some()) {
                 this.refuse_read_only_write(through.unwrap(), un.operand, lhs.span, "assign to");
             }
         }
+    }
+
+    /// The value `place` is read out of through `Index` or `Deref`: `a` of
+    /// `a[i]` and `b` of `*b` where they call `index` and `deref`, and `b`
+    /// of a member reached through `b`'s `deref`.  Null for any other
+    /// place.  Such a place is written by calling `index_mutable` or
+    /// `deref_mutable` on that value instead, so the place is exactly as
+    /// writable as the value.
+    trait_read_receiver(&this, place: ExpressionNode*) -> ExpressionNode* {
+        if (place == null) { return null; }
+        const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(place);
+        if (aa != null) {
+            if (aa.desugared_call == null) { return null; }
+            return this.trait_call_receiver(aa.desugared_call);
+        }
+        const un: UnaryExpr* = ExpressionNode::unary_of(place);
+        if (un == null || un.op.kind != TokenType::Star) { return null; }
+        if (un.desugared_call != null) { return this.trait_call_receiver(un.desugared_call); }
+        return this.trait_call_receiver(place);
+    }
+
+    /// `r` of `star`, a desugar `*(r.index(i))`, `*(r.deref())` or either
+    /// written form of them; null for any other expression.
+    trait_call_receiver(&this, star: ExpressionNode*) -> ExpressionNode* {
+        const member: MemberAccessExpr* = this.trait_desugar_member(star);
+        if (member == null) { return null; }
+        return member.object;
+    }
+
+    /// The callee `r.m` of `star` where it is a desugar `*(r.m(..))` whose
+    /// `m` is the method of `Index`, `IndexMutable`, `Deref` or
+    /// `DerefMutable`; null for anything else, a `*` written over such a
+    /// call by the program among them.
+    trait_desugar_member(&this, star: ExpressionNode*) -> MemberAccessExpr* {
+        const un: UnaryExpr* = ExpressionNode::unary_of(star);
+        if (un == null || un.op.kind != TokenType::Star || !un.is_synthetic) { return null; }
+        const call: CallExpr* = ExpressionNode::call_of(un.operand);
+        if (call == null) { return null; }
+        const member: MemberAccessExpr* = ExpressionNode::member_access_of(call.callee);
+        if (member == null || member.object == null || !member.resolved_trait.is_valid()) { return null; }
+        const registry: GenericRegistry* = this.ctx.generic_registry;
+        if (member.resolved_trait.equals(registry.wellknown(LangItem::Index))
+                || member.resolved_trait.equals(registry.wellknown(LangItem::IndexMutable))
+                || member.resolved_trait.equals(registry.wellknown(LangItem::Deref))
+                || member.resolved_trait.equals(registry.wellknown(LangItem::DerefMutable))) {
+            return member;
+        }
+        return null;
+    }
+
+    /// `place`, about to be written, with every read through `Index` or
+    /// `Deref` on the way into it made the write it is: `a[i]` calls
+    /// `index_mutable` where it called `index`, `*b` and a member reached
+    /// through `b` call `deref_mutable` where they called `deref`.  A place
+    /// reached through an indirection is written through that indirection
+    /// and is left as it is.  Returns the place to write, which is `place`
+    /// itself unless `place` was such a read in its own right.
+    route_write(mut &this, place: ExpressionNode*) -> ExpressionNode* {
+        if (place == null) { return place; }
+        const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(place);
+        if (aa != null) {
+            if (aa.desugared_call != null) {
+                aa.desugared_call = this.writable_trait_read(aa.desugared_call);
+            } else if (aa.array != null && this.indirection_access(aa.array.resolved_type).is_none()) {
+                aa.array = this.route_write(aa.array);
+            }
+            return place;
+        }
+        const un: UnaryExpr* = ExpressionNode::unary_of(place);
+        if (un != null && un.op.kind == TokenType::Star) {
+            if (un.desugared_call != null) {
+                un.desugared_call = this.writable_trait_read(un.desugared_call);
+                return place;
+            }
+            return this.writable_trait_read(place);
+        }
+        const ma: MemberAccessExpr* = ExpressionNode::member_access_of(place);
+        if (ma != null && ma.object != null && this.indirection_access(ma.object.resolved_type).is_none()) {
+            ma.object = this.route_write(ma.object);
+        }
+        return place;
+    }
+
+    /// The read `star`, `*(r.index(i))` or `*(r.deref())`, rebuilt as the
+    /// write `*(r.index_mutable(i))` or `*(r.deref_mutable())` and
+    /// resolved.  `star` itself where it is no such read, where `r` is not
+    /// writable (the write's own check reports it), or where no declaration
+    /// claims the writable trait.  An `r` that does not implement the
+    /// writable trait is refused (E0229): its `[]` or `*` only reads.
+    writable_trait_read(mut &this, star: ExpressionNode*) -> ExpressionNode* {
+        const member: MemberAccessExpr* = this.trait_desugar_member(star);
+        if (member == null) { return star; }
+        const registry: GenericRegistry* = this.ctx.generic_registry;
+        mut writer_trait: LangItem = LangItem::IndexMutable;
+        mut writer: LangItem = LangItem::IndexMutableIndexMutable;
+        mut written_through: string = "[]";
+        if (member.resolved_trait.equals(registry.wellknown(LangItem::Deref))) {
+            writer_trait = LangItem::DerefMutable;
+            writer = LangItem::DerefMutableDerefMutable;
+            written_through = "*";
+        } else if (!member.resolved_trait.equals(registry.wellknown(LangItem::Index))) {
+            return star;
+        }
+        if (!registry.wellknown(writer).is_valid()) { return star; }
+        if (!this.access_within(member.object).is_writable()) { return star; }
+        // A type parameter has the trait by a bound in scope, as its read did.
+        const param: GenericParamType* = this.binding.receiver_type_param(member.object.resolved_type);
+        const writes: boolean = if (param != null) {
+            this.binding.param_bounded_by(param, registry.wellknown(writer_trait))
+        } else {
+            this.receiver_implements(member.object.resolved_type, registry.wellknown(writer_trait))
+        };
+        if (!writes) {
+            const shown: string = registry.lang_item_shown(writer_trait, this.ctx.intern_table);
+            const name: string = this.arena.resolve_display_name_short(
+                this.receiver_subject(member.object.resolved_type));
+            mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0229_INVALID_BINARY_OP,
+                fmt::format("cannot write through `%s` on `%s`, which does not implement `%s`",
+                    written_through, name, shown));
+            diag = diag.at_with_label(star.span, "written here");
+            diag = diag.help(fmt::format("`%s` only reads; add `implement trait %s ... for %s` to write through it",
+                written_through, shown, name));
+            this.ctx.diagnostics.emit(diag);
+            return star;
+        }
+        const callee: ExpressionNode* = this.member.lang_method_callee(member.object, writer, star.span);
+        if (callee == null) { return star; }
+        const read: CallExpr* = ExpressionNode::call_of(ExpressionNode::unary_of(star).operand);
+        mut write: ExpressionNode* = ExpressionNode::call_expr(callee, star.span);
+        for (mut i: i64 = 0; i < read.arguments.length(); i++) {
+            ExpressionNode::call_of(write).add_argument(read.arguments[i]);
+        }
+        const written: ExpressionNode* =
+            ExpressionNode::synthetic_unary(ExpressionNode::unary_of(star).op, write, star.span);
+        if (!this.resolve_expr(written).is_valid()) { return star; }
+        return written;
     }
 
     /// E0250 where a place inside `holder`, a value reached through no
@@ -2847,6 +2999,8 @@ type struct SemaVisitor {
         if (ma != null) { return this.access_within(ma.object); }
         const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(place);
         if (aa != null) { return this.access_within(aa.array); }
+        const read: ExpressionNode* = this.trait_read_receiver(place);
+        if (read != null) { return this.access_within(read); }
         const un: UnaryExpr* = ExpressionNode::unary_of(place);
         if (un != null && un.op.kind == TokenType::Star && un.desugared_call == null && un.operand != null) {
             const through: Option<PlaceAccess> = this.indirection_access(un.operand.resolved_type);
@@ -2903,6 +3057,13 @@ type struct SemaVisitor {
     /// read-only; nothing when it is writable.
     refuse_read_only_write(mut &this, access: PlaceAccess, holder: ExpressionNode*, span: SourceSpan, what: string) -> void {
         if (access.is_writable()) { return; }
+        // A place read through `Index` or `Deref` is written through the
+        // value it is read out of, which is what makes it read-only.
+        const read: ExpressionNode* = this.trait_read_receiver(holder);
+        if (read != null) {
+            this.refuse_read_only_write(access, read, span, what);
+            return;
+        }
         const id: IdentifierExpr* = ExpressionNode::identifier_of(holder);
         mut through: string = "";
         if (this.names_receiver(id)) {
