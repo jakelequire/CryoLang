@@ -128,14 +128,15 @@ def default_server_path():
     return os.path.join(REPO_ROOT, "tools", "CryoLSP", "build", exe)
 
 
-def server_env():
+def server_env(stdlib):
     """The server links LLVM-C; on Windows its DLL lives in the toolchain.
     The compiler's logger is switched off, so `quiet_stderr` checks hold
-    whatever the caller's shell sets."""
+    whatever the caller's shell sets.  `stdlib` is the server's
+    CRYO_STDLIB, the repository's own when None."""
     env = dict(os.environ)
     env.pop("CRYO_LOG", None)
     env.pop("CRYO_LOG_FILE", None)
-    env["CRYO_STDLIB"] = os.path.join(REPO_ROOT, "stdlib")
+    env["CRYO_STDLIB"] = stdlib or os.path.join(REPO_ROOT, "stdlib")
     extra = [os.path.join(REPO_ROOT, ".toolchains", "llvm-win", "bin"),
              os.path.join(REPO_ROOT, "bin")]
     extra = [p for p in extra if os.path.isdir(p)]
@@ -150,11 +151,11 @@ class Server:
     are kept in order so a check can wait for one.
     """
 
-    def __init__(self, path, cwd):
+    def __init__(self, path, cwd, stdlib=None):
         self.proc = subprocess.Popen(
             [path],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            cwd=cwd, env=server_env(),
+            cwd=cwd, env=server_env(stdlib),
         )
         self._next_id = 0
         self._lock = threading.Condition()
@@ -1043,22 +1044,21 @@ def uri_tail(uri):
     return uri.replace("%3A", ":").replace("%3a", ":").replace("\\", "/").lower()
 
 
-def run_stdlib_files(server_path, c):
+def run_stdlib_files(server_path, c, label, root, stdlib):
     """A jump from a project into the standard library, followed the way an
     editor follows it: the library's file is opened, and questions are asked
     in it.  The library is analysed as part of the project, so its files are
     answered from that analysis and opening one starts no analysis of its
     own (no diagnostics are published for it).  The library's files carry no
-    markers, so positions are found by their text."""
-    label = "stdlib files"
+    markers, so positions are found by their text.  The editor opens a
+    library file by its plain path, however the server found the library."""
     print(label)
     failed_before = len(c.failed)
-    root = os.path.join(FIXTURES, "stdlib_jump")
     main_rel = "src/main.cryo"
     with open(os.path.join(root, main_rel), "r", encoding="utf-8", newline="") as fh:
         main_text = fh.read()
     main_uri = uri_for(os.path.join(root, main_rel))
-    srv = Server(server_path, root)
+    srv = Server(server_path, root, stdlib)
     try:
         initialize(srv, root, c, label)
         srv.notify("textDocument/didOpen", {"textDocument": {
@@ -1147,7 +1147,19 @@ def main():
         run_protocol_errors(server_path, c)
         run_during_analysis(server_path, c)
         run_outside_project(server_path, c)
-        run_stdlib_files(server_path, c)
+        run_stdlib_files(server_path, c, "stdlib files",
+                         os.path.join(FIXTURES, "stdlib_jump"), None)
+        # A project outside the repository, so no search upward from its
+        # files reaches the library, with the library found by a root
+        # spelled through `..`, as one found beside the server's binary is.
+        outside = tempfile.mkdtemp(prefix="cryolsp-stdlib-")
+        try:
+            root = os.path.join(outside, "stdlib_jump")
+            shutil.copytree(os.path.join(FIXTURES, "stdlib_jump"), root)
+            run_stdlib_files(server_path, c, "stdlib files, library root spelled through ..", root,
+                             os.path.join(REPO_ROOT, "tools") + "/../stdlib")
+        finally:
+            shutil.rmtree(outside, ignore_errors=True)
     for name in sorted(os.listdir(FIXTURES)):
         root = os.path.join(FIXTURES, name)
         if only is not None and name != only:

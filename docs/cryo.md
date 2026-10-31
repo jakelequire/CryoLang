@@ -4740,3 +4740,5 @@ The compiler resolves the stdlib root from the first source that matches:
 6. `<project_root>/../stdlib` - in-tree fallback
 
 Most installs need none of these: the binary-relative default (4) finds the stdlib shipped alongside `cryo`. Projects living outside the Cryo repo pin a specific stdlib with `[project] stdlib_root`.
+
+The root found is used as its canonical absolute path - `..` and `.` resolved, and on Windows its separators written `/` - however the source spelled it, so every stdlib file has one spelling in diagnostics, panic locations, debug information and the language server.

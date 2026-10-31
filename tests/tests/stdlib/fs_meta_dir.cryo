@@ -16,10 +16,10 @@ import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::io::error;
 import std::io::traits;
-import std::fs::path::{ Path };
+import std::fs::path::{ Path, PathBuf };
 import std::fs::file::{ File, read_to_string, write };
 import std::fs::metadata::{ exists, metadata };
-import std::fs::dir::{ create_dir, DirEntry, read_dir, ReadDir, remove_dir, remove_file };
+import std::fs::dir::{ canonicalize, create_dir, DirEntry, read_dir, ReadDir, remove_dir, remove_file };
 import std::ffi::libc;
 import std::test::error::{ TestError };
 import std::test::assert::{ bail, expect_eq, expect_true };
@@ -100,6 +100,56 @@ function exists_true_and_false() -> Result<(), TestError> {
     const present: boolean = exists(p);
     libc::unlink(p.as_str().as_ptr());
     expect_true(present, Str::new("present after create"))?;
+    return Result::Ok(());
+}
+
+// A path through `..`, written with the host temp directory's own
+// separators, names the same directory as the direct path, and its
+// canonical spelling is separated by `/` alone.
+![test]
+function canonicalize_resolves_parent_with_forward_separators() -> Result<(), TestError> {
+    mut dirbuf: [i8; 256];
+    const dn: i32 = libc::snprintf((&dirbuf[0]) as u8*, 256, "%s/cryo_md_canon_%d",
+                                         temp_root(), libc::getpid());
+    const dpath: Path = Path::from(Str::from_raw((&dirbuf[0]) as u8*, dn as u64));
+    mut innerbuf: [i8; 256];
+    const inn: i32 = libc::snprintf((&innerbuf[0]) as u8*, 256, "%s/cryo_md_canon_%d/inner",
+                                          temp_root(), libc::getpid());
+    const inner: Path = Path::from(Str::from_raw((&innerbuf[0]) as u8*, inn as u64));
+    mut throughbuf: [i8; 256];
+    const tn: i32 = libc::snprintf((&throughbuf[0]) as u8*, 256, "%s/cryo_md_canon_%d/inner/..",
+                                         temp_root(), libc::getpid());
+    const through: Path = Path::from(Str::from_raw((&throughbuf[0]) as u8*, tn as u64));
+
+    match (create_dir(dpath)) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return bail(Str::new("create_dir failed")); }
+    }
+    match (create_dir(inner)) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { remove_dir(dpath); return bail(Str::new("create_dir inner failed")); }
+    }
+    const direct: Result<PathBuf, std::io::error::IoError> = canonicalize(dpath);
+    const parent: Result<PathBuf, std::io::error::IoError> = canonicalize(through);
+    match (remove_dir(inner)) { Result::Ok(_) => { } Result::Err(_) => { } }
+    match (remove_dir(dpath)) { Result::Ok(_) => { } Result::Err(_) => { } }
+
+    match (direct) {
+        Result::Ok(d) => {
+            match (parent) {
+                Result::Ok(p) => {
+                    expect_true(p.as_path().as_str().equals(&d.as_path().as_str()),
+                                Str::new("the path through .. is the direct path"))?;
+                    expect_true(!d.as_path().as_str().contains(&Str::new("\\")),
+                                Str::new("no backslash in the canonical path"))?;
+                    expect_true(!d.as_path().as_str().contains(&Str::new("..")),
+                                Str::new("no .. in the canonical path"))?;
+                }
+                Result::Err(_) => { return bail(Str::new("canonicalize through .. failed")); }
+            }
+        }
+        Result::Err(_) => { return bail(Str::new("canonicalize failed")); }
+    }
     return Result::Ok(());
 }
 
