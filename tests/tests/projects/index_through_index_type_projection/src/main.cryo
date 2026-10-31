@@ -1,0 +1,112 @@
+// `[]` typed through the index type's own trait: one implementation of
+// `Index` and `IndexMutable` per type, whose `Output` is a projection on the
+// index type (`I::Output` under `where I: Position<T>`).  A call binds `I`
+// from its argument, and the projection reduces through the index type's
+// implementation of `Position<T>`, whose own parameter `T` only the trait's
+// arguments carry.  The same holds on a type that is not generic, and for an
+// implementation that lists its parameters in another order than its target.
+namespace IndexThroughIndexTypeProjection::Main;
+
+import std::ffi::libc;
+import std::core::ops::{ Index, IndexMutable };
+
+type struct Cells<T> {
+    a: T; b: T;
+}
+
+type struct Grid {
+    a: i32; b: i32;
+}
+
+type trait Position<T> {
+    type Output;
+    in_cells(this, cells: &Cells<T>) -> const This::Output*;
+    in_cells_mutable(this, cells: mut &Cells<T>) -> This::Output*;
+}
+
+implement<T> trait Position<T> for i64 {
+    type Output = T;
+    in_cells(this, cells: &Cells<T>) -> const T* {
+        if (this == 0) { return &cells.a; }
+        return &cells.b;
+    }
+    in_cells_mutable(this, cells: mut &Cells<T>) -> T* {
+        if (this == 0) { return &cells.a; }
+        return &cells.b;
+    }
+}
+
+implement<T> trait Position<T> for u8 {
+    type Output = T;
+    in_cells(this, cells: &Cells<T>) -> const T* {
+        if (this == 0) { return &cells.a; }
+        return &cells.b;
+    }
+    in_cells_mutable(this, cells: mut &Cells<T>) -> T* {
+        if (this == 0) { return &cells.a; }
+        return &cells.b;
+    }
+}
+
+implement<T, I> trait Index<I> for struct Cells<T> where I: Position<T> {
+    type Output = I::Output;
+    index(&this, idx: I) -> const I::Output* {
+        return idx.in_cells(this);
+    }
+}
+
+implement<T, I> trait IndexMutable<I> for struct Cells<T> where I: Position<T> {
+    index_mutable(mut &this, idx: I) -> I::Output* {
+        return idx.in_cells_mutable(this);
+    }
+}
+
+type trait Lane {
+    is_first(this) -> boolean;
+}
+
+implement trait Lane for i64 { is_first(this) -> boolean { return this == 0; } }
+
+implement<I> trait Index<I> for struct Grid where I: Lane {
+    type Output = i32;
+    index(&this, idx: I) -> const i32* {
+        if (idx.is_first()) { return &this.a; }
+        return &this.b;
+    }
+}
+
+// The implementation's parameters are its own, related to the type's only
+// through its head: `T` is `Row`'s argument wherever the list puts it.
+type struct Row<T> {
+    a: T; b: T;
+}
+
+implement<I, T> trait Index<I> for struct Row<T> where I: Lane {
+    type Output = T;
+    index(&this, idx: I) -> const T* {
+        if (idx.is_first()) { return &this.a; }
+        return &this.b;
+    }
+}
+
+function second<C>(c: &C) -> i32 where C: Index<i64, i32> {
+    return c[1 as i64];
+}
+
+function main() -> int {
+    mut c: Cells<i32> = Cells::<i32> { a: 3, b: 4 };
+    const read: i32 = c[1 as i64];
+    if (read != 4) { return 1; }
+    if (*c.index(0 as u8) != 3) { return 2; }
+    c[0 as u8] = 10;
+    if (c[0 as i64] != 10) { return 3; }
+    if (second(&c) != 4) { return 4; }
+    const g: Grid = Grid { a: 7, b: 8 };
+    const cell: i32 = g[1 as i64];
+    if (cell != 8 || second(&g) != 8) { return 5; }
+    const r: Row<i32> = Row::<i32> { a: 11, b: 12 };
+    const first: i32 = r[0 as i64];
+    if (first != 11 || second(&r) != 12) { return 6; }
+    libc::printf("index through index type projection ok\n");
+    return 0;
+}

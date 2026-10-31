@@ -2305,9 +2305,26 @@ holds for a call a bound answers and for an operator: with
 `c[0 as u8]` and `c[1 as i64]` each run the copy of `index` at their index
 type, and so does `c[i]` in a body bounded by `C: Index<i64, i32>`.  A bound
 on such a parameter is checked by each call that binds it, not when the
-type is asked whether it implements the trait.  A parameter
+type is asked whether it implements the trait: `c[true]` is refused at the
+index with `E0306`.  A parameter
 no method takes in its parameters is the one the where-clause derives, as `A`
 is above.
+
+The type the call returns is read with the parameter bound.  With
+`implement<T, I> trait Index<I> for struct Cells<T> where I: Position<T>`
+binding `type Output = I::Output`, `c[1 as i64]` on a `Cells<i32>` is the
+`Output` of `i64`'s implementation of `Position<i32>`.  That implementation,
+`implement<T> trait Position<T> for i64`, has a parameter only its trait's
+arguments carry as well, and the projection binds it to `i32`.  An
+implementation's parameters are its own and relate to the type's only
+through its head, whatever order it lists them in.
+
+An implementation whose every parameter is lent to its methods is its
+target's own, not a template its instantiations copy, so the target need
+not be generic: `implement<K> trait Scale<K> for struct Meter where K:
+Position` gives `Meter` a `scale` generic over `K`, whose calls each bind
+`K`, and its methods that take no lent parameter are `Meter`'s plain
+methods.
 
 **Declaration-site bounds.** An associated type may carry a bound
 (`type Item: Copy;`). Every impl's concrete binding is checked against it - an

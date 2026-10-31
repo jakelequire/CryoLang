@@ -5458,6 +5458,10 @@ type struct CallResolver {
             return TypeRef::invalid();
         }
         this.binding.stash_method_call_bindings(obj_type, member, call, selected.chosen);
+        if (!this.check_lent_parameter_bounds(member.member_span, selected.chosen, call,
+                visitor.receiver_subject(obj_type))) {
+            return TypeRef::invalid();
+        }
 
         mut lookup_ref: TypeRef = obj_type;
         mut base_t: Type* = this.arena.lookup(obj_type);
@@ -8385,6 +8389,58 @@ type struct CallResolver {
         if (tref == null) { return true; }
         this.emit_free_call_bound_failure(at, tmpl_decl, tref, concrete, shown);
         return false;
+    }
+
+    /// E0306 for a method call that binds a parameter the method's
+    /// implementation lends it (`call.resolved_type_args`, in the method's
+    /// declaration order) to a type that does not meet a bound the
+    /// implementation writes on it (`K` in `implement<K> trait Scale<K> for
+    /// Meter where K: Position`).  The implementation's own parameters are
+    /// the receiver's arguments in its head.  Emits the failure and returns
+    /// false on the first unmet bound; true when every bound holds or the
+    /// call binds no lent parameter.
+    check_lent_parameter_bounds(mut &this, at: SourceSpan, chosen: DeclarationNode*, call: CallExpr*,
+                                recv: TypeRef) -> boolean {
+        const m: MethodDecl* = DeclarationNode::method_of(chosen);
+        if (m == null || m.func == null) { return true; }
+        const f: FunctionDecl* = DeclarationNode::fn_of(m.func);
+        if (f.inherited_params == 0 || call.resolved_type_args.length() != f.generic_params.length()) {
+            return true;
+        }
+        mut syms: [SymbolID] = [];
+        for (mut i: i64 = 0; i < f.generic_params.length(); i++) {
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(f.generic_params[i]);
+            if (gp == null) { return true; }
+            syms.push(gp.sym_id);
+        }
+        const block: ImplBlock* = DeclarationNode::impl_of(this.binding.method_site(chosen, null, recv));
+        if (block == null) { return true; }
+        const checker: TraitChecker = this.trait_checker();
+        mut subst: TypeSubstitution = TypeSubstitution::empty();
+        mut recv_args: [TypeRef] = [];
+        for (mut i: i64 = 0; i < this.arena.inst_type_arg_count(recv); i++) {
+            recv_args.push(this.arena.inst_type_arg_at(recv, i));
+        }
+        checker.add_head_param_bindings(block, &recv_args, &subst);
+        for (mut i: i64 = f.written_params(); i < syms.length(); i++) {
+            subst.add(this.arena.create_generic_param(syms[i], SymbolStr::empty(), i as u64), call.resolved_type_args[i]);
+        }
+        for (mut bi: i64 = 0; bi < block.where_bounds.length(); bi++) {
+            const bound: const TraitBound* = &block.where_bounds[bi];
+            mut lent_at: i64 = -1;
+            for (mut i: i64 = f.written_params(); i < syms.length(); i++) {
+                if (syms[i].equals(bound.subject_param())) { lent_at = i; }
+            }
+            if (lent_at < 0) { continue; }
+            const concrete: TypeRef = call.resolved_type_args[lent_at];
+            if (this.arena.contains_generic_param(concrete)) { continue; }
+            const unmet: const TraitRef* = checker.unmet_parameter_trait(bound, concrete, &subst, 0);
+            if (unmet == null) { continue; }
+            this.emit_free_call_bound_failure(at, m.func, unmet, concrete,
+                this.intern.intern(checker.trait_as_required(unmet, &subst)));
+            return false;
+        }
+        return true;
     }
 
     /// The first where-clause bound of `tmpl` that the bound args in

@@ -133,6 +133,24 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-31
+
+676. **A parameter an implementation lends its methods is the call's, its
+     bound included.**  A parameter an implementation writes in its
+     trait's arguments and not in its target is a type parameter of each
+     method that takes it, bound by each call from its arguments; the
+     type the call returns is read with it bound, and a projection on it
+     reduces through the argument's implementation, binding that
+     implementation's own trait-argument parameters from the projection's
+     arguments.  A where-clause bound on such a parameter is checked by
+     the call (E0306 at the call), never when the type is asked whether
+     it implements the trait.  An
+     implementation whose every parameter is lent is its target's own,
+     not a template, so its target need not be generic.  An
+     implementation's parameters relate to the type's only through its
+     head, never by their position in its list.  (Follows Jake's
+     `SliceIndex<T>` decision; the details delegated)
+
 ### 2026-10-30
 
 667. **`.` reads through any number of borrows and one raw pointer.**

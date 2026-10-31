@@ -1589,7 +1589,11 @@ type struct MethodBinding {
 
         mut found: DeclarationNode* = null;
         const empty_params: [DeclarationNode*] = [];
+        // A type declaration's parameters are its instantiation's arguments,
+        // in order; an implement block's are its own, related to the type's
+        // only through its head (`owner_impl`).
         mut owner_params: &[DeclarationNode*] = &empty_params;
+        mut owner_impl: ImplBlock* = null;
         // Template key: an instantiation (`Array<i32>`) keys off its generic base; a
         // BARE template struct used directly as a receiver (`this` in `implement
         // FmtWrite for struct String`, where `this` is the un-parameterized `String`,
@@ -1613,7 +1617,7 @@ type struct MethodBinding {
                 const d: DefId = if (DeclarationNode::fn_of(chosen.func).def.is_valid()) { DeclarationNode::fn_of(chosen.func).def } else { DeclarationNode::fn_of(chosen.func).copy_of };
                 chosen_func = this.ctx.decl_index.method_func_of(d);
             } else if (DeclarationNode::impl_of(site) != null) {
-                owner_params = &(DeclarationNode::impl_of(site)).generic_params;
+                owner_impl = DeclarationNode::impl_of(site);
             } else if (DeclarationNode::struct_of(site) != null) {
                 owner_params = &(DeclarationNode::struct_of(site)).generic_params;
             } else if (DeclarationNode::union_of(site) != null) {
@@ -1636,9 +1640,7 @@ type struct MethodBinding {
         if (!by_identity && member.resolved_trait.is_valid()) {
             found = this.find_generic_method_in_trait_impls(
                 recv_type, member.member, member.resolved_trait, &trait_impl_block);
-            if (found != null && trait_impl_block != null) {
-                owner_params = &trait_impl_block.generic_params;
-            }
+            if (found != null) { owner_impl = trait_impl_block; }
         }
         if (!by_identity && found == null && tmpl != null && tmpl.ast_node != null) {
             const tmpl_named: [DeclarationNode*] = this.ctx.decl_index.methods_named(FamilyOwner::Template(tmpl.def), member.member);
@@ -1659,7 +1661,7 @@ type struct MethodBinding {
                     const m: MethodDecl* = DeclarationNode::method_of(m_decl);
                     if (m != null) {
                         found = m_decl;
-                        owner_params = &ib.generic_params;
+                        owner_impl = ib;
                         break;
                     }
                 }
@@ -1684,9 +1686,7 @@ type struct MethodBinding {
         if (!by_identity && found == null) {
             found = this.find_generic_method_in_trait_impls(
                 recv_type, member.member, DefId::invalid(), &trait_impl_block);
-            if (found != null && trait_impl_block != null) {
-                owner_params = &trait_impl_block.generic_params;
-            }
+            if (found != null) { owner_impl = trait_impl_block; }
         }
         mut orig_func: DeclarationNode* = null;
         if (found != null) {
@@ -1713,7 +1713,26 @@ type struct MethodBinding {
         // hand back an unscoped context, and every caller discards it when
         // `*out_func` is null.
 
-        if (recv_base.is_valid()) {
+        if (owner_impl != null) {
+            // A parameter the head writes as a target argument (`U` in
+            // `.. for Wrap<U>`) is the receiver's argument in its place; one
+            // only the trait's arguments carry is lent to the method, and the
+            // call binds it.
+            if (owner_impl.target_args.length() == recv_nargs) {
+                for (mut i: i64 = 0; i < recv_nargs; i++) {
+                    const ta: TypeAnnotation* = owner_impl.target_args[i];
+                    if (ta == null) { continue; }
+                    match (*ta) {
+                        TypeAnnotation::Named(n) => {
+                            if (n.param_sym().is_valid()) {
+                                owner_ctx.add_binding(n.param_sym(), n.name, this.types.view_type_arg_at(recv_type, i));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        } else if (recv_base.is_valid()) {
             const n_owner: i64 = if (owner_params.length() < recv_nargs) {
                 owner_params.length()
             } else {
