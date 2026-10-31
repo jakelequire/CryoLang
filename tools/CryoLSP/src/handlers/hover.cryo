@@ -19,7 +19,7 @@ import compiler::ast::declaration::{
     DeclarationNode, DeclKind, EnumVariant, FieldDecl, FunctionDecl,
     MethodDecl, VarDecl
 };
-import compiler::resolver::res::{ DefId, DefKind };
+import compiler::resolver::res::{ DeclVisibility, DefId, DefKind };
 import compiler::resolver::symbol::{ Symbol, SymbolKind };
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::types::type_ref::{ TypeRef };
@@ -48,18 +48,20 @@ public function handle_hover_verbose(docs: mut &docs::Docs, projects: mut &sessi
 }
 
 
-/// A target shown as text: one line of Cryo, and the doc comment of the
-/// declaration it names.
+/// A target shown as text: one line of Cryo, under the directives written
+/// above the declaration it names, and that declaration's doc comment.
 type struct Shown {
     ctx:   CompilationContext*;
     text:  string;
+    /// `![...]` lines, one per directive, each ending in a newline.
+    directives: string;
     doc:   string;
     /// How paths and types are written: as the cursor's scope writes them,
     /// or in full.
     names: Names;
 
     static new(names: Names) -> Shown {
-        return Shown { ctx: names.ctx, text: "", doc: "", names: names };
+        return Shown { ctx: names.ctx, text: "", directives: "", doc: "", names: names };
     }
 
     /// The hover at the request's position; `expanded`, a type's members
@@ -143,27 +145,39 @@ type struct Shown {
             return;
         }
         this.doc = decl.documentation;
+        for (mut i: i64 = 0; i < decl.attached_directives.length(); i++) {
+            this.directives = this.directives + "![" + decl.attached_directives[i].to_text() + "]\n";
+        }
+        // How far the definition reaches, as its registration recorded it:
+        // what is written, or the default where nothing is.  A method's is
+        // its declaration's, which its owner's scope declares it with.
+        const reach: string = match (this.ctx.defs.visibility_of(d)) {
+            DeclVisibility::Unrecorded => { "" }
+            DeclVisibility::Public     => { "public " }
+            DeclVisibility::Internal   => { "internal " }
+            DeclVisibility::Private    => { "private " }
+        };
         match (decl.kind) {
             DeclKind::Method(m) => {
                 if (m.func != null) {
-                    this.text = this.signature(d, m.func, m.is_static);
+                    this.text = m.visibility.label() + " " + this.signature(d, m.func, m.is_static);
                     if (this.doc.length() == 0) { this.doc = m.func.documentation; }
                 }
             }
-            DeclKind::Function(_) => { this.text = this.signature(d, decl, false); }
+            DeclKind::Function(_) => { this.text = reach + this.signature(d, decl, false); }
             DeclKind::Intrinsic(f) => {
-                this.text = "intrinsic function " + this.path(d) + "("
-                    + this.params(&f.parameters, false) + ") -> "
+                this.text = reach + "intrinsic function " + this.path(d) + "("
+                    + this.params(&f.parameters, false, f.is_variadic) + ") -> "
                     + this.type_text(f.resolved_return_type);
             }
-            DeclKind::TypeAlias(_) => { this.text = "type " + this.path(d); }
-            DeclKind::Enum(_)      => { this.text = "type enum " + this.path(d); }
-            DeclKind::Trait(_)     => { this.text = "type trait " + this.path(d); }
-            DeclKind::Union(_)     => { this.text = "type union " + this.path(d); }
-            DeclKind::Struct(_)    => { this.text = "type struct " + this.path(d); }
+            DeclKind::TypeAlias(_) => { this.text = reach + "type " + this.path(d); }
+            DeclKind::Enum(_)      => { this.text = reach + "type enum " + this.path(d); }
+            DeclKind::Trait(_)     => { this.text = reach + "type trait " + this.path(d); }
+            DeclKind::Union(_)     => { this.text = reach + "type union " + this.path(d); }
+            DeclKind::Struct(_)    => { this.text = reach + "type struct " + this.path(d); }
             DeclKind::Variable(v)  => {
                 const kw: string = if (v.is_mutable) { "mut " } else { "const " };
-                this.text = kw + this.path(d) + ": "
+                this.text = reach + kw + this.path(d) + ": "
                     + this.names.type_text_written(v.resolved_type, v.type_annotation);
             }
             DeclKind::Import(_) | DeclKind::Module(_) | DeclKind::Impl(_)
@@ -185,19 +199,32 @@ type struct Shown {
         // An instance method's first parameter is its receiver, written
         // `this`, `&this` or `mut &this`, and shown as written.
         const receiver: boolean = is_method && !is_static;
-        return head + this.path(d) + "(" + this.params(&f.parameters, receiver) + ") -> "
+        return head + this.path(d) + "(" + this.params(&f.parameters, receiver, f.is_variadic) + ") -> "
             + this.names.type_text_written(f.resolved_return_type, f.return_type_annotation);
     }
 
-    params(&this, ps: &[DeclarationNode*], receiver: boolean) -> string {
+    /// The parameters as written.  A `variadic` function's last parameter
+    /// written with no type is its named rest (`args...`); with none, the
+    /// rest is a bare `...`.
+    params(&this, ps: &[DeclarationNode*], receiver: boolean, variadic: boolean) -> string {
         mut out: string = "";
+        mut named_rest: boolean = false;
         for (mut i: i64 = 0; i < ps.length(); i++) {
             if (i > 0) { out = out + ", "; }
             const p: VarDecl* = DeclarationNode::var_of(ps[i]);
+            // The receiver's name is its spelling (`&this`, `this`); a
+            // `mut` written before it is the parameter's mutability.
+            if (i == 0 && receiver && p.is_mutable) { out = out + "mut "; }
             out = out + this.ctx.intern_table.resolve(p.name);
-            if (i > 0 || !receiver) {
+            if (variadic && i == ps.length() - 1 && p.type_annotation == null) {
+                out = out + "...";
+                named_rest = true;
+            } else if (i > 0 || !receiver) {
                 out = out + ": " + this.names.type_text_written(p.resolved_type, p.type_annotation);
             }
+        }
+        if (variadic && !named_rest) {
+            out = if (ps.length() > 0) { out + ", ..." } else { "..." };
         }
         return out;
     }
@@ -225,7 +252,10 @@ type struct Shown {
         const h: DeclarationNode* = Members::field_decl(this.ctx, owner, index);
         if (h == null) { return; }
         const fd: FieldDecl* = DeclarationNode::field_of(h);
-        this.text = "field " + this.path(owner) + "::" + this.ctx.intern_table.resolve(fd.name)
+        for (mut i: i64 = 0; i < h.attached_directives.length(); i++) {
+            this.directives = this.directives + "![" + h.attached_directives[i].to_text() + "]\n";
+        }
+        this.text = fd.visibility.label() + " field " + this.path(owner) + "::" + this.ctx.intern_table.resolve(fd.name)
             + ": " + this.names.type_text_written(fd.resolved_type, fd.type_annotation);
         this.doc = h.documentation;
     }
@@ -272,6 +302,7 @@ type struct Shown {
     reply(&this, docs: &docs::Docs, a: &Answer) -> value::JsonValue {
         mut body: String = String::with_capacity(64);
         body.push("```cryo\n");
+        body.push(this.directives);
         body.push(this.text);
         body.push("\n```");
         const doc: string = Shown::clean_doc(this.doc);

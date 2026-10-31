@@ -959,15 +959,18 @@ implement struct Parser {
     parse_parameter(mut &this) -> DeclarationNode* {
         const start: Token = this.current();
         mut is_mutable: boolean = false;
-        // Span of the leading `mut` keyword if present; otherwise an
-        // anchor for "insert `mut` here" - used by E0218 to suggest
-        // marking a param mutable in place.
-        mut kw_span: SourceSpan = SourceSpan::none();
+        // Span of the leading `mut` keyword if present; otherwise a
+        // zero-width anchor where the parameter starts, which is where
+        // `mut ` is inserted - E0218's fix for a parameter, E0250's for a
+        // `&this` receiver.
+        const at: SourceSpan = this.span_from_token(start);
+        mut kw_span: SourceSpan = SourceSpan::new(at.file, at.start_line, at.start_col,
+                                                  at.start_line, at.start_col);
 
         // Optional 'mut' keyword
         if (this.check(TokenType::KwMut)) {
             is_mutable = true;
-            kw_span = this.span_from_token(start);
+            kw_span = at;
             this.advance();
         }
 
@@ -982,6 +985,7 @@ implement struct Parser {
             mut param: VarDecl* = VarDecl::new(pname);
             const param_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(param), span);
             param.set_mutable(is_mutable);
+            param.set_kw_span(kw_span);
             // One of the two places the receiver's spelling is read; every
             // later stage asks the mark.
             param.set_receiver(ReceiverForm::ByReference);
@@ -1011,14 +1015,6 @@ implement struct Parser {
             param.set_receiver(ReceiverForm::ByValue);
         }
         param_decl.set_name_span(this.span_from_token(name_tok));
-        // If no `mut` keyword was consumed, point kw_span at a zero-width
-        // anchor just before the parameter name so a downstream E0218
-        // fix can insert `mut ` at exactly the right place.
-        if (!kw_span.has_location()) {
-            const ns: SourceSpan = this.span_from_token(name_tok);
-            kw_span = SourceSpan::new(ns.file, ns.start_line, ns.start_col,
-                                      ns.start_line, ns.start_col);
-        }
         param.set_kw_span(kw_span);
 
         // Variadic parameter: name... (e.g., args...). Signal the caller

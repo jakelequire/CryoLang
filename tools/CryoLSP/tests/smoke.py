@@ -68,7 +68,8 @@ check passes only on an error reply whose message holds `refused`.
 A `codeAction` check ("at", "code", "old", "new_text") waits for a
 diagnostic of `code` underlining `old` at `at`, asks for the actions on it, and
 passes when one quickfix replaces exactly `old`'s width there with
-`new_text`.
+`new_text`.  A fix that edits elsewhere names that place with "fix_at" and
+the text it replaces there with "fix_old" ("" for an insertion).
 
 A semantic-tokens check names, per position, the token that must start
 there: its type, then any modifiers it must carry (it may carry more), or
@@ -665,6 +666,8 @@ def run_code_action_check(srv, fx, chk, c, name):
     if resp is None or "error" in resp:
         c.ok(False, name, "no answer: %r" % resp)
         return
+    # A fix may edit somewhere other than the text it underlines.
+    fix_pos = fx.at(chk["fix_at"])[1] if "fix_at" in chk else pos
     fixes = []
     for action in resp.get("result") or []:
         if action.get("kind") != "quickfix":
@@ -672,12 +675,13 @@ def run_code_action_check(srv, fx, chk, c, name):
         for euri, edits in ((action.get("edit") or {}).get("changes") or {}).items():
             for e in edits:
                 r = e["range"]
-                fixes.append((same_uri(euri, uri), r["start"] == pos,
-                              r["end"]["line"] == pos["line"],
-                              r["end"]["character"] - pos["character"], e["newText"]))
-    want = (True, True, True, len(chk["old"]), chk["new_text"])
+                fixes.append((same_uri(euri, uri), r["start"] == fix_pos,
+                              r["end"]["line"] == fix_pos["line"],
+                              r["end"]["character"] - fix_pos["character"], e["newText"]))
+    replaced = chk.get("fix_old", "") if "fix_at" in chk else chk["old"]
+    want = (True, True, True, len(replaced), chk["new_text"])
     c.ok(want in fixes, name, "want a quickfix replacing %r with %r, got %r"
-         % (chk["old"], chk["new_text"], fixes))
+         % (replaced, chk["new_text"], fixes))
 
 
 def run_signature_check(srv, fx, chk, c, name):
@@ -1084,7 +1088,7 @@ def run_stdlib_files(server_path, c, label, root, stdlib):
         std_root = os.path.join(REPO_ROOT, "stdlib")
         n_before = len(srv._notifications)
         opened = {}
-        for rel in ("io/_module.cryo", "io/error.cryo"):
+        for rel in ("io/_module.cryo", "io/error.cryo", "ffi/libc.cryo"):
             path = os.path.join(std_root, *rel.split("/"))
             with open(path, "r", encoding="utf-8", newline="") as fh:
                 opened[rel] = (uri_for(path), fh.read())
@@ -1112,6 +1116,23 @@ def run_stdlib_files(server_path, c, label, root, stdlib):
              and any(same_uri(r.get("uri", ""), main_uri) for r in refs),
              "%s: references from a library file reach its own uses and the project's" % label,
              "got %r" % [(r.get("uri", "").rsplit("/", 1)[-1], r["range"]["start"]) for r in refs][:12])
+
+        # A library file opened after the analysis that holds it is dimmed
+        # where it is gated to the other OS, and only there.
+        libc_uri, libc_text = opened["ffi/libc.cryo"]
+        regions = srv.wait_notification("cryo/inactiveRegions",
+                                        lambda p: same_uri(p.get("uri", ""), libc_uri), timeout=60)
+        other_os, this_os = ("linux", "windows") if os.name == "nt" else ("windows", "linux")
+
+        def errno_line(atom):
+            return find_position(libc_text, "![target(%s)]\npublic function errno" % atom)["line"] + 1
+
+        def dimmed(line):
+            return any(r["start"]["line"] <= line <= r["end"]["line"]
+                       for r in (regions or {}).get("regions", []))
+        c.ok(regions is not None and dimmed(errno_line(other_os)) and not dimmed(errno_line(this_os)),
+             "%s: a library file is dimmed where it is gated to the other OS" % label,
+             "got %r" % (regions,))
 
         time.sleep(1.0)
         own = [m for m in srv._notifications[n_before:]

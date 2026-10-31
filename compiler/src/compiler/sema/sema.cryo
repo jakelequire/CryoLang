@@ -956,6 +956,7 @@ type struct SemaVisitor {
         this.state.in_lambda_depth     = 0;
         this.state.current_lambda      = null;
 
+        mut receiver_kw_span: SourceSpan = SourceSpan::none();
         for (mut i: i64 = 0; i < func.parameters.length(); i++) {
             const param_decl: DeclarationNode* = func.parameters[i];
             const param: VarDecl* = DeclarationNode::var_of(param_decl);
@@ -970,7 +971,10 @@ type struct SemaVisitor {
                        && param.type_annotation == null) {
                 ty = this.arena.get_pointer_to(this.arena.get_void());
             }
-            if (param.is_receiver()) { this.state.receiver_sym = param.sym_id; }
+            if (param.is_receiver()) {
+                this.state.receiver_sym = param.sym_id;
+                receiver_kw_span = param.kw_span;
+            }
             if (param.is_ref_receiver()) {
                 this.state.this_is_mut = param.is_mutable;
                 this.state.this_is_by_ref = true;
@@ -982,6 +986,7 @@ type struct SemaVisitor {
         }
         if (fn_this_type.is_valid() && this.state.receiver_sym.is_valid()) {
             this.scopes.declare(this.state.receiver_sym, fn_this_type, this.state.this_is_mut);
+            this.scopes.set_kw_span(this.state.receiver_sym, receiver_kw_span);
             this.state.param_bindings.insert(this.state.receiver_sym.table_key());
         }
     }
@@ -3113,6 +3118,12 @@ type struct SemaVisitor {
                 const holder_t: Type* = this.arena.lookup(holder.resolved_type);
                 if (this.names_receiver(id)) {
                     diag = diag.help("the method takes `&this`; declare it `mut &this` to write its receiver");
+                    // The receiver's anchor is where `mut ` goes before `&this`.
+                    const kw: SourceSpan = this.scopes.kw_span_of(this.state.receiver_sym);
+                    if (kw.has_location() && kw.start_line == kw.end_line && kw.start_col == kw.end_col) {
+                        diag = diag.suggest(Suggestion::machine_applicable(kw, "mut ",
+                            "declare the receiver `mut &this`"));
+                    }
                 } else if (holder_t != null && holder_t.kind == TypeKind::Object) {
                     diag = diag.help("a `virtual &Trait` only reads; take a `virtual mut &Trait` where the value is written");
                 } else {
