@@ -195,6 +195,20 @@ yet is recorded with the change that builds it, not here.
      refused where it is written (E0312).  Reading and writing `a[i]` or
      `*b` therefore always reach the same type.  (Jake)
 
+674. **An associated type is projected at its trait's arguments.**  A type
+     may implement a trait with parameters once per argument list, each
+     implementation binding the trait's associated types for itself.
+     `T::Out` under `where T: Get<boolean>` is the `Out` of `T`'s
+     `Get<boolean>` implementation, whatever `T`'s other implementations
+     of `Get` bind.  `This::Out` in a trait or an implementation is taken
+     at the trait's own arguments there, and a supertrait's associated
+     type at the arguments the trait writes on that supertrait, so a
+     generic implementation of `Writer<i64> : Reader<i64>` for `Pair<T>`
+     names `Reader<i64>`'s binding for `Pair<T>` as `This::Output`.  A
+     parameter bounded twice by the trait declaring the type (`where T:
+     Get<i64>, T: Get<boolean>`) has two of it, and the projection is
+     refused as ambiguous (E0203).  (Jake)
+
 ### 2026-10-29
 
 663. **A binding from a match on a borrow is writable exactly when the

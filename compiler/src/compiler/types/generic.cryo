@@ -160,6 +160,12 @@ type struct AssocProjectionType {
     base:          TypeRef;     // The projected-over type (usually a GenericParam)
     member:        SymbolStr;   // The associated-type name (e.g. `Item`), for display and mangling
     owning_trait:  TypeRef;     // Trait that declares `member` (invalid = the source names none)
+    /// The arguments of `owning_trait`'s own parameters the projection is
+    /// taken at, one per parameter: `T::Out` under `where T: Get<boolean>`
+    /// is `Out` of `Get<boolean>`, which a type implementing `Get` twice
+    /// binds apart from `Get<i64>`'s.  An invalid argument is one the
+    /// projection does not fix, and any implementation answers for it.
+    trait_args:    [TypeRef];
     /// The member's position among `owning_trait`'s associated types, as the
     /// `assoc-type` door answered where the projection was made; every reader
     /// that reduces or matches the projection asks by it, never by `member`.
@@ -167,14 +173,27 @@ type struct AssocProjectionType {
     slot:          i64;
     resolved_type: TypeRef;     // Filled at monomorphization
 
-    static new(base: TypeRef, member: SymbolStr, owning_trait: TypeRef, slot: i64) -> AssocProjectionType* {
+    static new(base: TypeRef, member: SymbolStr, owning_trait: TypeRef, trait_args: &[TypeRef],
+               slot: i64) -> AssocProjectionType* {
+        mut args: [TypeRef] = [];
+        for (mut i: i64 = 0; i < trait_args.length(); i++) { args.push(trait_args[i]); }
         return new AssocProjectionType {
             base:          base,
             member:        member,
             owning_trait:  owning_trait,
+            trait_args:    args,
             slot:          slot,
             resolved_type: TypeRef::invalid(),
         };
+    }
+
+    /// Whether two lists of a trait's arguments can name the same instance
+    /// of it: no position both fix holds different types.
+    static arguments_agree(a: &[TypeRef], b: &[TypeRef]) -> boolean {
+        for (mut i: i64 = 0; i < a.length() && i < b.length(); i++) {
+            if (a[i].is_valid() && b[i].is_valid() && !a[i].equals(b[i])) { return false; }
+        }
+        return true;
     }
 
     set_resolved_type(mut &this, resolved: TypeRef) -> void {

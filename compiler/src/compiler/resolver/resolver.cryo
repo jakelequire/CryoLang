@@ -29,6 +29,17 @@ import std::core::iter::{ Iterator };
 import std::collections::pair::{ Pair };
 import std::core::mem;
 import std::core::intrinsics;
+import compiler::ast::{ TypeAnnotation };
+
+/// A trait a `where` clause bounds a type parameter by, with the arguments
+/// the clause writes on it: the trait's own parameters, then its associated
+/// types, as written, so `T::Out` under `where T: Get<boolean>` can be read
+/// at `Get<boolean>` and not at another of `T`'s implementations of `Get`.
+type struct ParamBound {
+    param:     SymbolID;
+    trait_def: DefId;
+    arguments: [TypeAnnotation*];
+}
 
 /// One name bound directly in a scope, with the TIER it occupies.  A scope's
 /// bindings are ordered:
@@ -404,11 +415,10 @@ type struct Resolver {
     /// third of them populated, and a save/restore mechanism necessary to
     /// paper over it.
     module_scopes: HashMap<ModuleKey, u64>;
-    /// The traits a `where` clause bounds each type parameter by: `.first`
-    /// the parameter's symbol, `.second` the trait's definition.  `S::Item`
+    /// The traits a `where` clause bounds each type parameter by.  `S::Item`
     /// is `Item` of whichever of these traits declares it; a trait the
     /// parameter is not bounded by does not answer it, however it is spelled.
-    param_bounds:  [Pair<SymbolID, DefId>];
+    param_bounds:  [ParamBound];
 
     /// The declaration each import binding names, by the binding's key.  An
     /// import of a leaf binds every declaration the module offers under it,
@@ -456,22 +466,52 @@ type struct Resolver {
         };
     }
 
-    /// Record that the type parameter `param` is bounded by the trait `bound`.
-    record_param_bound(mut &this, param: SymbolID, bound: DefId) -> void {
+    /// Record that the type parameter `param` is bounded by the trait `bound`
+    /// at the written `arguments`.  The same written bound recorded again
+    /// adds nothing.
+    record_param_bound(mut &this, param: SymbolID, bound: DefId, arguments: &[TypeAnnotation*]) -> void {
         if (!param.is_valid() || !bound.is_valid()) { return; }
         for (mut i: i64 = 0; i < this.param_bounds.length(); i++) {
-            if (this.param_bounds[i].first.equals(param) && this.param_bounds[i].second.equals(bound)) { return; }
+            const known: ParamBound* = &this.param_bounds[i];
+            if (!known.param.equals(param) || !known.trait_def.equals(bound)) { continue; }
+            if (known.arguments.length() != arguments.length()) { continue; }
+            mut same: boolean = true;
+            for (mut a: i64 = 0; a < arguments.length(); a++) {
+                if (known.arguments[a] != arguments[a]) { same = false; break; }
+            }
+            if (same) { return; }
         }
-        this.param_bounds.push(Pair::<SymbolID, DefId>::new(param, bound));
+        mut written: [TypeAnnotation*] = [];
+        for (mut a: i64 = 0; a < arguments.length(); a++) { written.push(arguments[a]); }
+        this.param_bounds.push(ParamBound { param: param, trait_def: bound, arguments: written });
     }
 
     /// The traits the type parameter `param` is bounded by, in the order its
-    /// `where` clauses name them.
+    /// `where` clauses name them, each once.
     bounds_of_param(&this, param: SymbolID) -> [DefId] {
         mut out: [DefId] = [];
         if (!param.is_valid()) { return out; }
         for (mut i: i64 = 0; i < this.param_bounds.length(); i++) {
-            if (this.param_bounds[i].first.equals(param)) { out.push(this.param_bounds[i].second); }
+            if (!this.param_bounds[i].param.equals(param)) { continue; }
+            mut seen: boolean = false;
+            for (mut k: i64 = 0; k < out.length(); k++) {
+                if (out[k].equals(this.param_bounds[i].trait_def)) { seen = true; break; }
+            }
+            if (!seen) { out.push(this.param_bounds[i].trait_def); }
+        }
+        return out;
+    }
+
+    /// Each bound of `param` by the trait `trait_def`, as recorded: a
+    /// parameter bounded by `Get<i64>` and `Get<boolean>` has two.  The
+    /// records are the resolver's own, read in place, and stay where they
+    /// are once name resolution has recorded every bound.
+    bounds_of_param_by(&this, param: SymbolID, trait_def: DefId) -> [const ParamBound*] {
+        mut out: [const ParamBound*] = [];
+        if (!param.is_valid()) { return out; }
+        for (mut i: i64 = 0; i < this.param_bounds.length(); i++) {
+            const known: const ParamBound* = &this.param_bounds[i];
+            if (known.param.equals(param) && known.trait_def.equals(trait_def)) { out.push(known); }
         }
         return out;
     }

@@ -46,7 +46,7 @@ import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::sink::{ DiagnosticSink };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::intern_table::{ InternTable };
-import compiler::resolver::resolver::{ Resolver };
+import compiler::resolver::resolver::{ Resolver, ParamBound };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::types::arena::{ TypeArena };
@@ -340,11 +340,15 @@ type struct TypeResolver {
             out = by_param.apply(out, this.arena);
         }
         const trait_ty: TypeRef = this.decl_index.type_of_def(trait_def);
+        mut own: [TypeRef] = [];
+        for (mut g: i64 = 0; g < decl.generic_params.length(); g++) {
+            own.push(if (g < args.length()) { args[g] } else { TypeRef::invalid() });
+        }
         for (mut a: i64 = 0; a < decl.assoc_types.length(); a++) {
             if (decl.assoc_types[a] == null) { continue; }
             const at: i64 = decl.generic_params.length() + a;
             if (at >= args.length() || !args[at].is_valid()) { continue; }
-            out = this.arena.substitute_assoc_slot(out, trait_ty, a, args[at]);
+            out = this.arena.substitute_assoc_slot(out, trait_ty, &own, a, args[at]);
         }
         return out;
     }
@@ -632,7 +636,102 @@ type struct TypeResolver {
     /// looks up that type's impl binding (wired in Stage 3b).
     project_from_base(&this, base_ty: TypeRef, proj: ProjectionAnnotation*,
                       ctx: ResolutionContext*) -> TypeRef {
-        return this.project_member(base_ty, proj.member, this.projection_trait(proj), ctx);
+        const trait_ty: TypeRef = this.projection_trait(proj);
+        const trait_args: [TypeRef] = this.projection_trait_arguments(proj, trait_ty, ctx);
+        return this.project_member(base_ty, proj.member, trait_ty, &trait_args, ctx);
+    }
+
+    /// The arguments of the trait `trait_ty`'s own parameters a written
+    /// projection is taken at (`AssocProjectionType.trait_args`):
+    /// `I::Item` reads them off the bound of `I` that answers it, `This::Item`
+    /// off the trait `This` stands for, as its parameters stand in `ctx` -
+    /// themselves in the trait's declaration, the implementation's arguments
+    /// in an implementation.  A member of a supertrait is read at what the
+    /// trait writes on that supertrait.
+    projection_trait_arguments(&this, proj: ProjectionAnnotation*, trait_ty: TypeRef,
+                               ctx: ResolutionContext*) -> [TypeRef] {
+        mut out: [TypeRef] = [];
+        if (proj == null || !trait_ty.is_valid() || this.decl_index == null || this.generic_registry == null) { return out; }
+        const declaring: DefId = this.decl_index.def_of(trait_ty, this.arena);
+        if (proj.rooted_at.is_valid()) { return this.bound_trait_arguments(proj.rooted_at, declaring, ctx); }
+        if (!proj.owner_trait.is_valid()) { return out; }
+        const owner: TraitDecl* = this.generic_registry.get_trait_decl(proj.owner_trait);
+        if (owner == null) { return out; }
+        mut own: [TypeRef] = [];
+        for (mut g: i64 = 0; g < owner.generic_params.length(); g++) {
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(owner.generic_params[g]);
+            if (gp == null) { own.push(TypeRef::invalid()); continue; }
+            const bound: TypeRef = ctx.lookup_binding(gp.sym_id);
+            own.push(if (bound.is_valid()) { bound } else { this.arena.create_generic_param(gp.sym_id, gp.name, g as u64) });
+        }
+        return this.declaring_trait_arguments(proj.owner_trait, &own, declaring);
+    }
+
+    /// The arguments of `declaring`'s own parameters that the trait
+    /// `trait_def`, given `args` for its own parameters and associated types,
+    /// reaches it at through its supertraits (`trait_arguments_along`); each
+    /// invalid when no path reaches it.
+    declaring_trait_arguments(&this, trait_def: DefId, args: &[TypeRef], declaring: DefId) -> [TypeRef] {
+        mut out: [TypeRef] = [];
+        if (this.generic_registry == null) { return out; }
+        const decl: TraitDecl* = this.generic_registry.get_trait_decl(declaring);
+        if (decl == null) { return out; }
+        mut open: [DefId] = [];
+        mut along: [TypeRef] = [];
+        const reached: boolean = this.trait_arguments_along(trait_def, args, declaring, &open, &along);
+        for (mut g: i64 = 0; g < decl.generic_params.length(); g++) {
+            out.push(if (reached && g < along.length()) { along[g] } else { TypeRef::invalid() });
+        }
+        return out;
+    }
+
+    /// The arguments of `declaring`'s own parameters at which the bound of
+    /// the type parameter `param` that reaches `declaring` names it, the
+    /// bound's written arguments resolved in `ctx`: `Get<boolean>` gives
+    /// `[boolean]`.  The name layer refuses a projection two bounds answer,
+    /// so there is at most one such bound; with none, every argument is
+    /// invalid.
+    bound_trait_arguments(&this, param: SymbolID, declaring: DefId, ctx: ResolutionContext*) -> [TypeRef] {
+        if (this.name_resolver != null && this.generic_registry != null) {
+            const bounds: [DefId] = this.name_resolver.bounds_of_param(param);
+            for (mut b: i64 = 0; b < bounds.length(); b++) {
+                const reaches: [DefId] = this.generic_registry.trait_and_supertraits(bounds[b]);
+                mut reached: boolean = false;
+                for (mut r: i64 = 0; r < reaches.length(); r++) {
+                    if (reaches[r].equals(declaring)) { reached = true; break; }
+                }
+                if (!reached) { continue; }
+                const records: [const ParamBound*] = this.name_resolver.bounds_of_param_by(param, bounds[b]);
+                if (records.length() == 0) { continue; }
+                const written: [TypeRef] = this.written_trait_arguments(
+                    &records[0].arguments, records[0].arguments.length(), ctx);
+                return this.declaring_trait_arguments(bounds[b], &written, declaring);
+            }
+        }
+        const unwritten: [TypeRef] = [];
+        return this.declaring_trait_arguments(declaring, &unwritten, declaring);
+    }
+
+    /// The arguments a written bound gives its trait's own parameters,
+    /// resolved in `ctx` (`written_trait_arguments`); empty when it names no
+    /// registered trait.
+    bound_generic_arguments(&this, tr: const TraitRef*, ctx: ResolutionContext*) -> [TypeRef] {
+        mut out: [TypeRef] = [];
+        if (this.generic_registry == null) { return out; }
+        const decl: TraitDecl* = this.generic_registry.get_trait_decl(tr.definition());
+        if (decl == null) { return out; }
+        return this.written_trait_arguments(&tr.type_args, decl.generic_params.length(), ctx);
+    }
+
+    /// The first `count` of a bound's written trait arguments resolved in
+    /// `ctx`, at most one per written argument; one that does not resolve is
+    /// invalid and fixes nothing.
+    written_trait_arguments(&this, arguments: &[TypeAnnotation*], count: i64, ctx: ResolutionContext*) -> [TypeRef] {
+        mut out: [TypeRef] = [];
+        for (mut a: i64 = 0; a < arguments.length() && a < count; a++) {
+            out.push(if (arguments[a] == null) { TypeRef::invalid() } else { this.resolve(arguments[a], ctx) });
+        }
+        return out;
     }
 
     /// The trait a written projection names: `I::Item` names the one among
@@ -656,22 +755,22 @@ type struct TypeResolver {
     /// `member` is written where the projection is; the `assoc-type` door
     /// turns it into the type's position in the trait, and nothing after
     /// asks by the leaf again.
-    project_member(&this, base_ty: TypeRef, member: SymbolStr,
-                   owning_trait: TypeRef, ctx: ResolutionContext*) -> TypeRef {
+    project_member(&this, base_ty: TypeRef, member: SymbolStr, owning_trait: TypeRef,
+                   trait_args: &[TypeRef], ctx: ResolutionContext*) -> TypeRef {
         const owner: TraitDecl* = this.trait_decl_of(owning_trait);
         const slot: i64 = if (owner == null) { -1 } else { owner.assoc_type_index(member) };
-        if (slot >= 0) { return this.project_slot(base_ty, owning_trait, slot); }
+        if (slot >= 0) { return this.project_slot(base_ty, owning_trait, trait_args, slot); }
         // The source names no trait, or the trait declares no such type: the
         // name layer refused the projection where it is written, and there
         // is nothing to project.
         return TypeRef::invalid();
     }
 
-    /// Project the `slot`-th associated type of the trait `owning_trait` off a
-    /// resolved base type, as `project_member` does once the door has
-    /// answered.  A generic-param base yields a symbolic projection; a
-    /// concrete one is read off its impl.
-    project_slot(&this, base_ty: TypeRef, owning_trait: TypeRef, slot: i64) -> TypeRef {
+    /// Project the `slot`-th associated type of the trait `owning_trait`,
+    /// taken at `trait_args`, off a resolved base type, as `project_member`
+    /// does once the door has answered.  A generic-param base yields a
+    /// symbolic projection; a concrete one is read off its impl.
+    project_slot(&this, base_ty: TypeRef, owning_trait: TypeRef, trait_args: &[TypeRef], slot: i64) -> TypeRef {
         const bt: Type* = this.arena.lookup(base_ty);
         if (bt == null) { return TypeRef::invalid(); }
         const owner: TraitDecl* = this.trait_decl_of(owning_trait);
@@ -684,10 +783,16 @@ type struct TypeResolver {
         // not `Option<IntSeq::Item>`). Fall back to a symbolic projection if no
         // such impl/binding is found (a later pass diagnoses the real error).
         if (bt.kind != TypeKind::GenericParam && bt.kind != TypeKind::AssocProjection) {
-            const concrete: TypeRef = this.concrete_projection(base_ty, slot, owning_trait);
+            const concrete: TypeRef = this.concrete_projection(base_ty, slot, owning_trait, trait_args);
             if (concrete.is_valid()) { return concrete; }
         }
-        return this.arena.create_assoc_projection(base_ty, owner.assoc_types[slot].name, owning_trait, slot);
+        // One argument per parameter, so a projection that fixes none is one
+        // type however the asker spelled "none".
+        mut args: [TypeRef] = [];
+        for (mut g: i64 = 0; g < owner.generic_params.length(); g++) {
+            args.push(if (g < trait_args.length()) { trait_args[g] } else { TypeRef::invalid() });
+        }
+        return this.arena.create_assoc_projection(base_ty, owner.assoc_types[slot].name, owning_trait, &args, slot);
     }
 
     /// The registered declaration of the trait `trait_ty`, or null when it
@@ -698,13 +803,14 @@ type struct TypeResolver {
     }
 
     /// The `slot`-th associated type of the trait `owning_trait` read off the
-    /// concrete `base_ty`'s impl, or invalid - as it is when `owning_trait`
-    /// is invalid (the projection names no trait) or names no registered
-    /// trait.
-    concrete_projection(&this, base_ty: TypeRef, slot: i64, owning_trait: TypeRef) -> TypeRef {
+    /// concrete `base_ty`'s impl of it at `trait_args`, or invalid - as it is
+    /// when `owning_trait` is invalid (the projection names no trait) or
+    /// names no registered trait.
+    concrete_projection(&this, base_ty: TypeRef, slot: i64, owning_trait: TypeRef,
+                        trait_args: &[TypeRef]) -> TypeRef {
         const owner: TraitDecl* = this.trait_decl_of(owning_trait);
         mut rc: ResolutionContext = ResolutionContext::new("");
-        return this.resolve_concrete_member(base_ty, slot, owner, &rc);
+        return this.resolve_concrete_member(base_ty, slot, owner, trait_args, &rc);
     }
 
     /// `ty` with each associated-type projection whose base is concrete
@@ -723,7 +829,11 @@ type struct TypeResolver {
                 const proj: AssocProjectionType* = t.as_assoc_projection();
                 if (proj.resolved_type.is_valid()) { return proj.resolved_type; }
                 const base: TypeRef = this.reduce_projections(proj.base, memo);
-                const reduced: TypeRef = this.concrete_projection(base, proj.slot, proj.owning_trait);
+                mut trait_args: [TypeRef] = [];
+                for (mut i: i64 = 0; i < proj.trait_args.length(); i++) {
+                    trait_args.push(this.reduce_projections(proj.trait_args[i], memo));
+                }
+                const reduced: TypeRef = this.concrete_projection(base, proj.slot, proj.owning_trait, &trait_args);
                 if (!reduced.is_valid()) { return ty; }
                 if (memo) { proj.set_resolved_type(reduced); }
                 return reduced;
@@ -826,9 +936,11 @@ type struct TypeResolver {
     /// is asking about - and only that trait answers.  Null means the source
     /// names none, and then there is no answer: which of `Base`'s traits
     /// declaring something of that name was meant is not a question a
-    /// search can settle.  Invalid when nothing applies.
-    resolve_concrete_member(&this, base_ty_in: TypeRef, slot: i64,
-                            owner: TraitDecl*, ctx: ResolutionContext*) -> TypeRef {
+    /// search can settle.  Of `Base`'s implementations of it, the one that
+    /// binds the trait at `trait_args` answers (an invalid argument, or an
+    /// empty list, fixes nothing).  Invalid when nothing applies.
+    resolve_concrete_member(&this, base_ty_in: TypeRef, slot: i64, owner: TraitDecl*,
+                            trait_args: &[TypeRef], ctx: ResolutionContext*) -> TypeRef {
         if (this.generic_registry == null) { return TypeRef::invalid(); }
         // The base is used directly whether it is a pre-mono InstantiatedType
         // wrapper or a post-mono concrete spec: `carries_impl_key` asks the
@@ -870,7 +982,7 @@ type struct TypeResolver {
             // binding; a placed clone has substituted them away.
             const impl_node: ImplBlock* = DeclarationNode::impl_of(
                 this.generic_registry.template_head_for(
-                    this.generic_registry.trait_decl_keys[i], base_ty, this.intern_table));
+                    this.generic_registry.trait_decl_keys[i], trait_args, base_ty, this.intern_table));
             if (impl_node == null) { continue; }
 
             const ann: TypeAnnotation* = impl_node.trait_slot_annotation(
@@ -966,7 +1078,10 @@ type struct TypeResolver {
     /// slot the impl leaves unbound is invalid; empty when `subject` has no
     /// impl of the trait.  `Count` with `type Item = i32;` in its impl body
     /// and `Range<i32>` with `Iterator<T>` in its head both answer `[i32]`.
-    concrete_trait_slots(&this, subject: TypeRef, trait_id: DefId) -> [TypeRef] {
+    /// The impl is the one binding the trait at `trait_args`, the trait's
+    /// own parameters' arguments as far as the asker knows them (an invalid
+    /// one, or an empty list, fixes nothing).
+    concrete_trait_slots(&this, subject: TypeRef, trait_id: DefId, trait_args: &[TypeRef]) -> [TypeRef] {
         mut out: [TypeRef] = [];
         if (this.generic_registry == null) { return out; }
         // An object gives its trait, and each supertrait, the arguments
@@ -985,12 +1100,12 @@ type struct TypeResolver {
             const trait_ty: TypeRef = this.decl_index.type_of_def(trait_id);
             for (mut gi: i64 = 0; gi < param_trait.generic_params.length(); gi++) { out.push(TypeRef::invalid()); }
             for (mut ai: i64 = 0; ai < param_trait.assoc_types.length(); ai++) {
-                out.push(this.project_slot(subject, trait_ty, ai));
+                out.push(this.project_slot(subject, trait_ty, trait_args, ai));
             }
             return out;
         }
         const impl_node: ImplBlock* = DeclarationNode::impl_of(
-            this.generic_registry.template_head_for(trait_id, subject, this.intern_table));
+            this.generic_registry.template_head_for(trait_id, trait_args, subject, this.intern_table));
         if (impl_node == null) { return out; }
         const tdecl: TraitDecl* = this.generic_registry.get_trait_decl(trait_id);
         if (tdecl == null) { return out; }
@@ -1044,12 +1159,15 @@ type struct TypeResolver {
                     this.generic_registry.get_trait_decl(tr.definition());
                 if (tdecl == null) { continue; }
                 const ngp: i64 = tdecl.generic_params.length();
+                // The implementation answering is the one at the bound's own
+                // arguments, as far as they are already known.
+                const trait_args: [TypeRef] = this.bound_generic_arguments(tr, bctx);
                 // A generic-parameter slot (`A` in `I: Iterator<A>`) is what
                 // the subject's own impl of the trait writes there, itself
                 // derived from that impl's where-clause when it must be - so
                 // a chain of adapters bottoms out at its source.
                 if (ngp > 0 && tr.type_args.length() > 0) {
-                    const slots: [TypeRef] = this.concrete_trait_slots(subject, tr.definition());
+                    const slots: [TypeRef] = this.concrete_trait_slots(subject, tr.definition(), &trait_args);
                     for (mut gi: i64 = 0; gi < ngp && gi < tr.type_args.length() && gi < slots.length(); gi++) {
                         if (tr.type_args[gi] == null || !slots[gi].is_valid()) { continue; }
                         this.bind_where_arg_into_ctx(tr.type_args[gi], slots[gi], bctx);
@@ -1068,9 +1186,9 @@ type struct TypeResolver {
                     // to read: its member is its projection (`A` in
                     // `I: Iterator<A>` is `I::Item`).
                     const derived: TypeRef = if (this.arena.lookup(subject).kind == TypeKind::GenericParam) {
-                        this.concrete_trait_slots(subject, tr.definition())[ngp + assoc_idx]
+                        this.concrete_trait_slots(subject, tr.definition(), &trait_args)[ngp + assoc_idx]
                     } else {
-                        this.resolve_concrete_member(subject, assoc_idx, tdecl, bctx)
+                        this.resolve_concrete_member(subject, assoc_idx, tdecl, &trait_args, bctx)
                     };
                     if (derived.is_valid()) {
                         this.bind_where_arg_into_ctx(arg_ann, derived, bctx);
@@ -1166,6 +1284,19 @@ type struct TypeResolver {
                 const tdecl: TraitDecl* = this.generic_registry.get_trait_decl(tr.definition());
                 if (tdecl == null) { continue; }
                 const ngp: i64 = tdecl.generic_params.length();
+                // The bound's own arguments, as far as they are known yet:
+                // a bare parameter by its inferred binding, anything else as
+                // written, so the implementation answering is the one at them.
+                mut trait_args: [TypeRef] = [];
+                mut unbound: ResolutionContext = ResolutionContext::new("");
+                for (mut gi: i64 = 0; gi < ngp && gi < tr.type_args.length(); gi++) {
+                    const at: i64 = this.where_arg_param_slot(tr.type_args[gi], param_syms);
+                    trait_args.push(if (at >= 0 && at < ictx.bindings.length()) {
+                        ictx.bindings[at]
+                    } else {
+                        this.resolve(tr.type_args[gi], &unbound)
+                    });
+                }
                 for (mut ai: i64 = 0; ai < tr.type_args.length(); ai++) {
                     // Positional args fill the trait's own generic params first,
                     // then its associated types; only the assoc-type slots derive.
@@ -1196,11 +1327,11 @@ type struct TypeResolver {
                         // base specializes, so it derives nothing here.
                         if (j < 0) { continue; }
                         const sym_d: TypeRef = this.project_slot(
-                            subject, this.decl_index.type_of_def(tdecl.def), assoc_idx);
+                            subject, this.decl_index.type_of_def(tdecl.def), &trait_args, assoc_idx);
                         if (sym_d.is_valid()) { ictx.bind_slot(j, sym_d); }
                         continue;
                     }
-                    const derived: TypeRef = this.resolve_concrete_member(subject, assoc_idx, tdecl, &rc);
+                    const derived: TypeRef = this.resolve_concrete_member(subject, assoc_idx, tdecl, &trait_args, &rc);
                     if (!derived.is_valid() || this.arena.contains_generic_param(derived)) { continue; }
                     if (j >= 0) {
                         ictx.bind_slot(j, derived);
@@ -1942,8 +2073,11 @@ private:
                     const member_sym: SymbolStr = this.intern_table.intern(member_str);
                     // `I::Item` is `Item` of the trait `I` is bounded by, not of
                     // any trait that declares something spelled `Item`.
-                    const proj: TypeRef = this.project_member(
-                        prefix_ty, member_sym, this.bound_declaring(slot.relative_param_sym(), member_sym), ctx);
+                    const declaring: TypeRef = this.bound_declaring(slot.relative_param_sym(), member_sym);
+                    const declaring_def: DefId = if (this.decl_index == null) { DefId::invalid() } else {
+                        this.decl_index.def_of(declaring, this.arena) };
+                    const trait_args: [TypeRef] = this.bound_trait_arguments(slot.relative_param_sym(), declaring_def, ctx);
+                    const proj: TypeRef = this.project_member(prefix_ty, member_sym, declaring, &trait_args, ctx);
                     if (proj.is_valid()) {
                         return proj;
                     }

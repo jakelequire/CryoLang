@@ -2001,7 +2001,8 @@ type struct MethodBinding {
             for (mut ti: i64 = 0; ti < bound.trait_refs.length(); ti++) {
                 const tr: const TraitRef* = &bound.trait_refs[ti];
                 if (tr.path.length() == 0) { continue; }
-                const concrete_args: [TypeRef] = this.ctx.type_resolver.concrete_trait_slots(subject, tr.definition());
+                const bound_args: [TypeRef] = this.ctx.type_resolver.bound_generic_arguments(tr, res_ctx);
+                const concrete_args: [TypeRef] = this.ctx.type_resolver.concrete_trait_slots(subject, tr.definition(), &bound_args);
                 if (tr.type_args.length() > concrete_args.length()) { continue; }
                 for (mut ai: i64 = 0; ai < tr.type_args.length(); ai++) {
                     const ta: TypeAnnotation* = tr.type_args[ai];
@@ -2056,8 +2057,13 @@ type struct MethodBinding {
         const trait_def: DefId = this.ctx.decl_index.def_of(proj.owning_trait, this.arena);
         if (!trait_def.is_valid()) { return t; }
         const refs: [const TraitRef*] = this.bounds_naming(proj.base, trait_def);
-        if (refs.length() == 0) { return t; }
-        return this.subst_bound_trait_args(t, refs[0].path[refs[0].path.length() - 1], refs[0]);
+        // The bound naming the trait at the projection's arguments.
+        for (mut r: i64 = 0; r < refs.length(); r++) {
+            const written: [TypeRef] = this.bound_argument_positions(refs[r]);
+            if (!AssocProjectionType::arguments_agree(&written, &proj.trait_args)) { continue; }
+            return this.subst_bound_trait_args(t, refs[r].path[refs[r].path.length() - 1], refs[r]);
+        }
+        return t;
     }
 
     /// Recursively replace concrete-base associated-type projections in `ty` with
@@ -2074,7 +2080,11 @@ type struct MethodBinding {
                 const proj: AssocProjectionType* = t.as_assoc_projection();
                 if (proj.resolved_type.is_valid()) { return this.projection_through_param_bound(proj.resolved_type); }
                 const base: TypeRef = this.reduce_assoc_projections(proj.base);
-                const reduced: TypeRef = this.ctx.type_resolver.concrete_projection(base, proj.slot, proj.owning_trait);
+                mut trait_args: [TypeRef] = [];
+                for (mut i: i64 = 0; i < proj.trait_args.length(); i++) {
+                    trait_args.push(this.reduce_assoc_projections(proj.trait_args[i]));
+                }
+                const reduced: TypeRef = this.ctx.type_resolver.concrete_projection(base, proj.slot, proj.owning_trait, &trait_args);
                 if (reduced.is_valid()) {
                     proj.set_resolved_type(reduced);
                     return this.projection_through_param_bound(reduced);

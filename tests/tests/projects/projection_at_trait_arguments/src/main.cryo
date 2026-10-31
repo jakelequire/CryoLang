@@ -1,0 +1,99 @@
+// A type implementing a trait with a parameter twice binds the trait's
+// associated type once per implementation, and a projection is read at the
+// trait's arguments its bound writes: under `where T: Get<boolean>`,
+// `T::Out` is `Table`'s `Get<boolean>` binding, `boolean`, and never its
+// `Get<i64>` binding, `i32`.  The arguments may be the caller's own
+// parameter, bound per call, and a method's own `where` reads them too.  A
+// generic implementation of a subtrait names its supertrait's associated
+// type as `This::Output`, read at the arguments the subtrait writes on the
+// supertrait, in the implementation's own parameters.
+namespace ProjectionAtTraitArguments::Main;
+
+import std::ffi::libc;
+
+type trait Get<K> {
+    type Out;
+    get(&this, k: K) -> This::Out;
+}
+
+type struct Table { small: i32; flag: boolean; }
+
+implement trait Get<i64> for struct Table {
+    type Out = i32;
+    get(&this, k: i64) -> i32 { return this.small + k as i32; }
+}
+
+implement trait Get<boolean> for struct Table {
+    type Out = boolean;
+    get(&this, k: boolean) -> boolean { return this.flag && k; }
+}
+
+function fetch_flag<T>(t: &T) -> T::Out where T: Get<boolean> {
+    return t.get(true);
+}
+
+function fetch_small<T>(t: &T) -> T::Out where T: Get<i64> {
+    return t.get(5);
+}
+
+function fetch_at<T, K>(t: &T, k: K) -> T::Out where T: Get<K> {
+    return t.get(k);
+}
+
+type struct Holder<T> {
+    inner: T;
+
+    flag(&this) -> T::Out where T: Get<boolean> {
+        return this.inner.get(true);
+    }
+}
+
+type trait Reader<Idx> {
+    type Output;
+    read(&this, idx: Idx) -> const This::Output*;
+}
+
+type trait Writer<Idx> : Reader<Idx> {
+    write(mut &this, idx: Idx) -> This::Output*;
+}
+
+type struct Pair<T> { first: T; second: T; }
+
+implement<T> trait Reader<i64> for struct Pair<T> {
+    type Output = T;
+    read(&this, idx: i64) -> const T* {
+        if (idx == 0) { return &this.first; }
+        return &this.second;
+    }
+}
+
+implement<T> trait Writer<i64> for struct Pair<T> {
+    write(mut &this, idx: i64) -> T* {
+        if (idx == 0) { return &this.first; }
+        return &this.second;
+    }
+}
+
+function main() -> int {
+    const t: Table = Table { small: 1000, flag: true };
+    const flag: boolean = fetch_flag(&t);
+    const small: i32 = fetch_small(&t);
+    if (!flag || small != 1005) { return 1; }
+
+    const flag_at: boolean = fetch_at(&t, true);
+    const small_at: i32 = fetch_at(&t, 7 as i64);
+    if (!flag_at || small_at != 1007) { return 2; }
+
+    const h: Holder<Table> = Holder::<Table> { inner: Table { small: 1, flag: true } };
+    const held: boolean = h.flag();
+    if (!held) { return 3; }
+
+    mut p: Pair<i32> = Pair::<i32> { first: 3, second: 4 };
+    const w: i32* = p.write(1);
+    *w = 9;
+    const r: const i32* = p.read(1);
+    if (*r != 9) { return 4; }
+
+    libc::printf("projection at trait arguments ok\n");
+    return 0;
+}

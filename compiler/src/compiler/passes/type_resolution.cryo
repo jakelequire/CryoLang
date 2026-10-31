@@ -511,7 +511,7 @@ type struct TypeResolutionRunner {
     /// trait's terms are read in the implementation's (`terms`), `t` taken
     /// in the trait's terms while `trait_side` holds and in the
     /// implementation's once a term has been replaced.  Walks the two side
-    /// by side and builds no type, so asking leaves the arena as it was.  An
+    /// by side, building no type but what reducing a projection needs.  An
     /// unresolved side is not a disagreement: its own diagnostic is already
     /// reported.
     same_type(&this, t: TypeRef, f: TypeRef, terms: &ImplTerms, trait_side: boolean) -> boolean {
@@ -602,20 +602,31 @@ type struct TypeResolutionRunner {
 
     /// The type projection `p` names: the implementation's binding when its
     /// base is the type implemented for, else the binding the base's own
-    /// implementation gives; invalid when neither answers.
+    /// implementation of `p`'s trait at `p`'s arguments gives - for the type
+    /// implemented for, over the head's own arguments (`Pair<T>`), so a
+    /// supertrait's binding in terms of them reads in this implementation's
+    /// terms; invalid when neither answers.
     bound_projection(&this, p: AssocProjectionType*, terms: &ImplTerms, trait_side: boolean) -> TypeRef {
         mut base: TypeRef = p.base;
+        mut trait_args: [TypeRef] = [];
+        for (mut i: i64 = 0; i < p.trait_args.length(); i++) { trait_args.push(p.trait_args[i]); }
         if (trait_side) {
             if (base.equals(terms.this_ph)) { base = terms.owner; }
             const mapped: TypeRef = terms.subst.get(base);
             if (mapped.is_valid()) { base = mapped; }
+            for (mut i: i64 = 0; i < trait_args.length(); i++) {
+                trait_args[i] = terms.subst.apply(trait_args[i], this.arena);
+            }
         }
         if (p.owning_trait.equals(terms.trait_ty) && this.is_self(base, terms)) {
             if (p.slot >= 0 && p.slot < terms.assoc.length()) { return terms.assoc[p.slot]; }
             return TypeRef::invalid();
         }
-        return this.resolver.concrete_projection(if (this.is_self(base, terms)) { terms.owner } else { base },
-                                                 p.slot, p.owning_trait);
+        if (this.is_self(base, terms)) {
+            base = if (terms.self_args.length() == 0) { terms.owner } else {
+                this.arena.create_instantiation(terms.owner, &terms.self_args) };
+        }
+        return this.resolver.concrete_projection(base, p.slot, p.owning_trait, &trait_args);
     }
 
     shown_type(&this, ty: TypeRef) -> string {
@@ -2438,6 +2449,12 @@ type struct TypeResolutionPasses {
         if (node == null || ctx == null || arena == null) { return; }
         const this_ty: TypeRef = arena.this_placeholder(ctx.intern("This"));
         if (!this_ty.is_valid()) { return; }
+        // The future is the trait's at its own parameters.
+        mut own_args: [TypeRef] = [];
+        for (mut g: i64 = 0; g < node.generic_params.length(); g++) {
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(node.generic_params[g]);
+            own_args.push(if (gp == null) { TypeRef::invalid() } else { arena.create_generic_param(gp.sym_id, gp.name, g as u64) });
+        }
         for (mut i: i64 = 0; i < node.methods.length(); i++) {
             const func_decl: DeclarationNode* = node.methods[i];
             const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
@@ -2464,7 +2481,7 @@ type struct TypeResolutionPasses {
             // position for every reader that would otherwise mint it again.
             func.set_async_fut_slot(slot);
             func.set_resolved_return_type(
-                arena.create_assoc_projection(this_ty, assoc, trait_ref, slot));
+                arena.create_assoc_projection(this_ty, assoc, trait_ref, &own_args, slot));
         }
     }
 

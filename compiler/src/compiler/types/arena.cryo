@@ -649,14 +649,17 @@ public:
     }
 
     /// Get or create a symbolic associated-type projection `Base::Member`.
-    /// Deduplicated by (base, the member's position in the trait, the trait)
-    /// so the same projection always shares one arena slot - important so
-    /// the monomorphizer's `set_resolved_type` reaches every reference.
-    /// `slot` is that position (`AssocProjectionType.slot`), which the caller
-    /// asked the `assoc-type` door for; a projection no trait answers is
-    /// refused where it is written and never reaches here.
-    create_assoc_projection(mut &this, base: TypeRef, member: SymbolStr, owning_trait: TypeRef, slot: i64) -> TypeRef {
+    /// Deduplicated by (base, the member's position in the trait, the trait,
+    /// the trait's arguments) so the same projection always shares one arena
+    /// slot - important so the monomorphizer's `set_resolved_type` reaches
+    /// every reference.  `slot` is that position
+    /// (`AssocProjectionType.slot`), which the caller asked the `assoc-type`
+    /// door for; a projection no trait answers is refused where it is written
+    /// and never reaches here.
+    create_assoc_projection(mut &this, base: TypeRef, member: SymbolStr, owning_trait: TypeRef,
+                            trait_args: &[TypeRef], slot: i64) -> TypeRef {
         mut ops: [TypeRef] = [base];
+        for (mut i: i64 = 0; i < trait_args.length(); i++) { ops.push(trait_args[i]); }
         const aux0: u64 = slot as u64;
         const aux1: u64 = owning_trait.key();
 
@@ -664,63 +667,73 @@ public:
         if (hit.is_valid()) { return hit; }
 
         const ref: TypeRef = this.alloc_type(
-            TypeData::AssocProjection(AssocProjectionType::new(base, member, owning_trait, slot)));
+            TypeData::AssocProjection(AssocProjectionType::new(base, member, owning_trait, trait_args, slot)));
         this.intern_record(TypeKind::AssocProjection, aux0, aux1, &ops, ref);
         return ref;
     }
 
     /// Replace every projection of the `slot`-th associated type of the trait
-    /// `trait_ty` inside `ty` with `repl`, rebuilding the enclosing type
-    /// structurally.  Keyed on the projected associated type, whatever the
-    /// projection's base.
+    /// `trait_ty` at `trait_args` inside `ty` with `repl`, rebuilding the
+    /// enclosing type structurally.  Keyed on the projected associated type,
+    /// whatever the projection's base; a projection is at `trait_args`
+    /// unless some argument both fix differs (`AssocProjectionType.trait_args`).
     ///
     /// It deliberately does NOT cache onto the `AssocProjectionType`: the
     /// projection is trait-relative (`This::Output` as written in the trait declaration)
     /// and interned once, so it is shared by every bound over that trait -
     /// pinning one bound's answer would leak into all the others.
-    substitute_assoc_slot(mut &this, ty: TypeRef, trait_ty: TypeRef, slot: i64, repl: TypeRef) -> TypeRef {
+    substitute_assoc_slot(mut &this, ty: TypeRef, trait_ty: TypeRef, trait_args: &[TypeRef],
+                          slot: i64, repl: TypeRef) -> TypeRef {
         if (!ty.is_valid()) { return ty; }
         const t: Type* = this.lookup(ty);
         if (t == null) { return ty; }
         match (t.kind) {
             TypeKind::AssocProjection => {
                 const proj: AssocProjectionType* = t.as_assoc_projection();
-                if (proj.slot == slot && proj.owning_trait.equals(trait_ty)) { return repl; }
-                const base: TypeRef = this.substitute_assoc_slot(proj.base, trait_ty, slot, repl);
-                if (base.equals(proj.base)) { return ty; }
-                return this.create_assoc_projection(base, proj.member, proj.owning_trait, proj.slot);
+                if (proj.slot == slot && proj.owning_trait.equals(trait_ty)
+                    && AssocProjectionType::arguments_agree(&proj.trait_args, trait_args)) { return repl; }
+                const base: TypeRef = this.substitute_assoc_slot(proj.base, trait_ty, trait_args, slot, repl);
+                mut changed_p: boolean = !base.equals(proj.base);
+                mut new_trait_args: [TypeRef] = [];
+                for (mut i: i64 = 0; i < proj.trait_args.length(); i++) {
+                    const na: TypeRef = this.substitute_assoc_slot(proj.trait_args[i], trait_ty, trait_args, slot, repl);
+                    new_trait_args.push(na);
+                    if (!na.equals(proj.trait_args[i])) { changed_p = true; }
+                }
+                if (!changed_p) { return ty; }
+                return this.create_assoc_projection(base, proj.member, proj.owning_trait, &new_trait_args, proj.slot);
             }
             TypeKind::Pointer => {
                 const p: PointerType* = t.as_pointer();
-                const inner: TypeRef = this.substitute_assoc_slot(p.pointee, trait_ty, slot, repl);
+                const inner: TypeRef = this.substitute_assoc_slot(p.pointee, trait_ty, trait_args, slot, repl);
                 if (inner.equals(p.pointee)) { return ty; }
                 return this.get_pointer_to_q(inner, p.const_pointee);
             }
             TypeKind::Reference => {
                 const r: ReferenceType* = t.as_reference();
-                const inner: TypeRef = this.substitute_assoc_slot(r.referent, trait_ty, slot, repl);
+                const inner: TypeRef = this.substitute_assoc_slot(r.referent, trait_ty, trait_args, slot, repl);
                 if (inner.equals(r.referent)) { return ty; }
                 return this.get_reference_to(inner, r.mutability);
             }
             TypeKind::Array => {
                 const a: ArrayType* = t.as_array();
-                const inner: TypeRef = this.substitute_assoc_slot(a.element, trait_ty, slot, repl);
+                const inner: TypeRef = this.substitute_assoc_slot(a.element, trait_ty, trait_args, slot, repl);
                 if (inner.equals(a.element)) { return ty; }
                 return this.get_array_of(inner, a.size);
             }
             TypeKind::Optional => {
                 const o: OptionalType* = t.as_optional();
-                const inner: TypeRef = this.substitute_assoc_slot(o.wrapped, trait_ty, slot, repl);
+                const inner: TypeRef = this.substitute_assoc_slot(o.wrapped, trait_ty, trait_args, slot, repl);
                 if (inner.equals(o.wrapped)) { return ty; }
                 return this.get_optional_of(inner);
             }
             TypeKind::Function => {
                 const f: FunctionType* = t.as_function();
-                const new_ret: TypeRef = this.substitute_assoc_slot(f.return_type, trait_ty, slot, repl);
+                const new_ret: TypeRef = this.substitute_assoc_slot(f.return_type, trait_ty, trait_args, slot, repl);
                 mut changed: boolean = !new_ret.equals(f.return_type);
                 mut new_params: [TypeRef] = [];
                 for (mut i: i64 = 0; i < f.param_types.length(); i++) {
-                    const np: TypeRef = this.substitute_assoc_slot(f.param_types[i], trait_ty, slot, repl);
+                    const np: TypeRef = this.substitute_assoc_slot(f.param_types[i], trait_ty, trait_args, slot, repl);
                     new_params.push(np);
                     if (!np.equals(f.param_types[i])) { changed = true; }
                 }
@@ -732,7 +745,7 @@ public:
                 mut changed_t: boolean = false;
                 mut new_elems: [TypeRef] = [];
                 for (mut i: i64 = 0; i < tup.elements.length(); i++) {
-                    const ne: TypeRef = this.substitute_assoc_slot(tup.elements[i], trait_ty, slot, repl);
+                    const ne: TypeRef = this.substitute_assoc_slot(tup.elements[i], trait_ty, trait_args, slot, repl);
                     new_elems.push(ne);
                     if (!ne.equals(tup.elements[i])) { changed_t = true; }
                 }
@@ -744,7 +757,7 @@ public:
                 mut changed_i: boolean = false;
                 mut new_args: [TypeRef] = [];
                 for (mut i: i64 = 0; i < inst.type_args.length(); i++) {
-                    const na: TypeRef = this.substitute_assoc_slot(inst.type_args[i], trait_ty, slot, repl);
+                    const na: TypeRef = this.substitute_assoc_slot(inst.type_args[i], trait_ty, trait_args, slot, repl);
                     new_args.push(na);
                     if (!na.equals(inst.type_args[i])) { changed_i = true; }
                 }
@@ -1078,6 +1091,7 @@ public:
             TypeKind::AssocProjection => {
                 const proj: AssocProjectionType* = t.as_assoc_projection();
                 this.generic_params_in(proj.base, out);
+                for (mut i: i64 = 0; i < proj.trait_args.length(); i++) { this.generic_params_in(proj.trait_args[i], out); }
             }
             TypeKind::Pointer   => { this.generic_params_in(t.as_pointer().pointee, out); }
             TypeKind::Reference => { this.generic_params_in(t.as_reference().referent, out); }

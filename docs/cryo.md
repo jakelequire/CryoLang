@@ -2244,6 +2244,37 @@ function first<I>(it: mut &I) -> Option<I::Item> where I: DoubleEnded {   // Ite
 type struct Loose<I> { f: () -> I::Item; }   // error[E0203]: associated type `Item` not found for `I`
 ```
 
+**A trait with parameters.** A type may implement a trait that has generic
+parameters more than once, at different arguments, and each implementation
+binds the trait's associated types for itself. A projection is taken at the
+arguments its bound writes: under `where T: Get<boolean>`, `T::Out` is the
+`Out` of `T`'s `Get<boolean>` implementation. `This::Out` is taken at the
+trait's own arguments where it is written, and an associated type of a
+supertrait at the arguments the trait writes on that supertrait:
+
+```cryo
+type trait Get<K> { type Out; get(&this, k: K) -> This::Out; }
+
+implement trait Get<i64> for struct Table { type Out = i32;     get(&this, k: i64) -> i32 { ... } }
+implement trait Get<boolean> for struct Table { type Out = boolean; get(&this, k: boolean) -> boolean { ... } }
+
+function flag<T>(t: &T) -> T::Out where T: Get<boolean> { return t.get(true); }   // `boolean` for a Table
+
+type trait Reader<Idx> { type Output; read(&this, i: Idx) -> const This::Output*; }
+type trait Writer<Idx> : Reader<Idx> { write(mut &this, i: Idx) -> This::Output*; }   // Reader<Idx>'s Output
+
+implement<T> trait Reader<i64> for struct Pair<T> { type Output = T; read(&this, i: i64) -> const T* { ... } }
+implement<T> trait Writer<i64> for struct Pair<T> { write(mut &this, i: i64) -> T* { ... } }   // This::Output is T
+```
+
+A parameter bounded by the same trait twice has two such types, so the
+projection is refused as ambiguous (E0203, "ambiguous associated type `Out`
+in bounds of `T`"):
+
+```cryo
+function both<T>(t: &T) -> T::Out where T: Get<i64>, T: Get<boolean> { ... }   // error[E0203]
+```
+
 **Binding the associated type.** An implementation binds each associated type
 in one of two ways:
 
