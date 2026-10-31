@@ -2299,7 +2299,13 @@ A parameter an implementation writes in its trait's arguments and not in its
 target is bound by each call when a method takes it in its parameters: in
 `implement<T, E, F> trait Lift<Result<(), E>> for enum Outcome<T, F> where F:
 From<E>`, `Outcome::<i32, High>::lift(r)` binds `E` from `r`, so a `High`
-converting from two error types runs a copy of `lift` for each.  A parameter
+converting from two error types runs a copy of `lift` for each.  The same
+holds for a call a bound answers and for an operator: with
+`implement<T, I> trait Index<I, T> for struct Cells<T> where I: Position`,
+`c[0 as u8]` and `c[1 as i64]` each run the copy of `index` at their index
+type, and so does `c[i]` in a body bounded by `C: Index<i64, i32>`.  A bound
+on such a parameter is checked by each call that binds it, not when the
+type is asked whether it implements the trait.  A parameter
 no method takes in its parameters is the one the where-clause derives, as `A`
 is above.
 
