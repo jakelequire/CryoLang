@@ -818,6 +818,9 @@ def run_protocol(server_path, c):
         for cap in ("hoverProvider", "completionProvider", "definitionProvider",
                     "semanticTokensProvider"):
             c.ok(cap in caps, "protocol: advertises %s" % cap)
+        triggers = (caps.get("completionProvider") or {}).get("triggerCharacters") or []
+        c.ok(all(t in triggers for t in (".", ":", "{")),
+             "protocol: completion is triggered by `.`, `:` and an import's `{`", "got %r" % triggers)
 
         main_rel = "src/main.cryo"
         with open(os.path.join(root, main_rel), "r", encoding="utf-8", newline="") as fh:

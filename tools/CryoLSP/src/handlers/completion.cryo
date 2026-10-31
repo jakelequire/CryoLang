@@ -160,6 +160,17 @@ type struct Completer {
             this.modules_under(ModulePath::none());
             return;
         }
+        const path_end: i64 = Completer::brace_path_end(line, p);
+        if (path_end >= 0) {
+            const start: i64 = Completer::path_start(line, path_end);
+            if (Completer::after_import(line, start)) {
+                this.import_entries(line.sub_bytes(start, path_end));
+                return;
+            }
+        }
+        // `{` is a trigger for an import's brace list; anywhere else it
+        // opens a block, where nothing is offered until a name is begun.
+        if (p == end && p >= 1 && b[p - 1] == '{' as u8) { return; }
         this.bare();
         this.keywords();
     }
@@ -187,6 +198,23 @@ type struct Completer {
             return s;
         }
         return s;
+    }
+
+    /// When byte `at` is inside a brace list opened as `A::B::{` - after
+    /// the `{`, entries written so far and their commas - the byte where
+    /// the path before `::{` ends; -1 otherwise.
+    static brace_path_end(line: str::Str, at: i64) -> i64 {
+        const b: u8* = line.as_ptr();
+        mut k: i64 = at;
+        while (k > 0 && (b[k - 1] == ' ' as u8 || b[k - 1] == '\t' as u8 || b[k - 1] == ',' as u8
+                         || Lexer::is_identifier_continue(b[k - 1] as char))) {
+            k = k - 1;
+        }
+        if (k == 0 || b[k - 1] != '{' as u8) { return -1; }
+        mut e: i64 = k - 1;
+        while (e > 0 && (b[e - 1] == ' ' as u8 || b[e - 1] == '\t' as u8)) { e = e - 1; }
+        if (e < 3 || b[e - 1] != ':' as u8 || b[e - 2] != ':' as u8) { return -1; }
+        return e - 2;
     }
 
     /// Whether the text before byte `at` is the keyword `import` or
@@ -465,6 +493,17 @@ type struct Completer {
         if (this.ctx == null) { return; }
         const m: ModulePath = this.ctx.module_graph.module_path_over(this.intern(written), this.ctx.intern_table);
         if (m.is_valid()) { this.modules_under(m); }
+    }
+
+    /// What a brace entry of `import <written>::{ ... }` can name: the
+    /// module's exports this module may see, and the modules under it.
+    import_entries(mut &this, written: str::Str) -> void {
+        if (this.ctx == null) { return; }
+        const m: ModulePath = this.ctx.module_graph.module_of_written_path(this.intern(written));
+        if (!m.is_valid()) { return; }
+        const syms: [SymbolID] = Members::exports_of(this.ctx, m, this.module);
+        for (mut i: i64 = 0; i < syms.length(); i++) { this.symbol_item(syms[i]); }
+        this.modules_under(m);
     }
 
     modules_under(mut &this, m: ModulePath) -> void {
