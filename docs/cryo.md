@@ -2301,7 +2301,7 @@ target is bound by each call when a method takes it in its parameters: in
 From<E>`, `Outcome::<i32, High>::lift(r)` binds `E` from `r`, so a `High`
 converting from two error types runs a copy of `lift` for each.  The same
 holds for a call a bound answers and for an operator: with
-`implement<T, I> trait Index<I, T> for struct Cells<T> where I: Position`,
+`implement<T, I> trait Index<I> for struct Cells<T> where I: Position`,
 `c[0 as u8]` and `c[1 as i64]` each run the copy of `index` at their index
 type, and so does `c[i]` in a body bounded by `C: Index<i64, i32>`.  A bound
 on such a parameter is checked by each call that binds it, not when the
@@ -2357,10 +2357,10 @@ implement the arithmetic traits. The operator traits live in
 | `==` `!=`              | `Eq`                                  | `a == b` -> `a.equals(&b)`, `a != b` -> `!a.equals(&b)`      |
 | `<` `>` `<=` `>=`      | `Ord` (`: Eq`)                        | `a < b` -> `a.compare(&b).is_lt()` (`is_gt`/`is_le`/`is_ge`) |
 | `<=>`                  | `Ord` (`: Eq`)                        | `a <=> b` -> `a.compare(&b)`                                 |
-| `a[i]` read            | `Index<Idx, Output>`                  | `a[i]` -> `*(a.index(i))`                                    |
-| `a[i]` written         | `IndexMutable<Idx, Output>`           | `a[i]` -> `*(a.index_mutable(i))`                            |
-| `*a` (deref) read      | `Deref<Target>`                       | `*a` -> `*(a.deref())`                                       |
-| `*a` (deref) written   | `DerefMutable<Target>`                | `*a` -> `*(a.deref_mutable())`                               |
+| `a[i]` read            | `Index<Idx>` (`type Output`)          | `a[i]` -> `*(a.index(i))`                                    |
+| `a[i]` written         | `IndexMutable<Idx>` (`: Index<Idx>`)  | `a[i]` -> `*(a.index_mutable(i))`                            |
+| `*a` (deref) read      | `Deref` (`type Target`)               | `*a` -> `*(a.deref())`                                       |
+| `*a` (deref) written   | `DerefMutable` (`: Deref`)            | `*a` -> `*(a.deref_mutable())`                               |
 
 Each arithmetic/bitwise trait carries `Rhs` and `Output` type parameters, so an
 operator can mix types (add a scalar to a vector, shift by a plain integer) and
@@ -2416,12 +2416,16 @@ named `compare` it has.
 `a.add(&b)` and stores the result back into `a`. This holds for every binary
 arithmetic, bitwise, and shift operator (`+= -= *= /= %= &= |= ^= <<= >>=`).
 
-**Indexing.** `a[i]` is read through `Index<Idx, Output>` and written
-through `IndexMutable<Idx, Output>`, which has `Index<Idx, Output>` as its
-supertrait: a type that implements `IndexMutable` at an index type
-implements `Index` at the same one, with the same `Output`, or the
-`IndexMutable` implementation is refused (E0312), so reading and writing
-`a[i]` always reach the same element type.
+**Indexing.** `a[i]` is read through `Index<Idx>` and written through
+`IndexMutable<Idx>`, which has `Index<Idx>` as its supertrait.  The element
+type is `Index`'s associated type `Output`, which each implementation of
+`Index` binds in its body (`type Output = i32;`) and `IndexMutable` reads as
+`This::Output`: a type that implements `IndexMutable` at an index type
+implements `Index` at the same one, or the `IndexMutable` implementation is
+refused (E0312), and an `index_mutable` returning another element than that
+`Output` is refused too (E0312), so reading and writing `a[i]` always reach
+the same element type.  A bound may write the `Output` it needs after the
+index type, `where C: Index<u64, i32>`.
 `index(&this, i)` returns a **read-only pointer** (`const Output*`), so a read
 `v = a[i]` is `*(a.index(i))`.  `index_mutable(mut &this, i)` returns a
 writable one (`Output*`), and `a[i]` is `*(a.index_mutable(i))` wherever it is
@@ -2444,10 +2448,11 @@ concrete one is, and a type parameter is written through `[]` only under an
 
 ```cryo
 type struct Grid { cells: [i32; 9]; }
-implement trait Index<u64, i32> for struct Grid {
+implement trait Index<u64> for struct Grid {
+    type Output = i32;
     index(&this, i: u64) -> const i32* { return &this.cells[i]; }
 }
-implement trait IndexMutable<u64, i32> for struct Grid {
+implement trait IndexMutable<u64> for struct Grid {
     index_mutable(mut &this, i: u64) -> i32* { return &this.cells[i]; }
 }
 mut g: Grid = ...;
@@ -2456,10 +2461,10 @@ g[0] = 42;                // *(g.index_mutable(0)) = 42
 g[0] += 1;                // index_mutable called once
 ```
 
-**Dereference and auto-deref.** `*b` is read through `Deref<Target>` and
-written through `DerefMutable<Target>` (supertrait `Deref<Target>`, so a
-type written through `*` is read through it, as the same `Target`; E0312
-otherwise), by the same rule:
+**Dereference and auto-deref.** `*b` is read through `Deref`, whose
+associated type `Target` is the pointee, and written through `DerefMutable`
+(supertrait `Deref`, so a type written through `*` is read through it, as
+the same `Target`; E0312 otherwise), by the same rule:
 `deref(&this)` returns `const Target*` and a read `*b` is `*(b.deref())`;
 `deref_mutable(mut &this)` returns `Target*` and a written `*b` is
 `*(b.deref_mutable())`.  Member access **coerces** through them too: when a
@@ -2470,10 +2475,11 @@ or the method takes `mut &this` - the smart-pointer pattern.
 
 ```cryo
 type struct Boxed<T> { value: T; }
-implement<T> trait Deref<T> for struct Boxed<T> {
+implement<T> trait Deref for struct Boxed<T> {
+    type Target = T;
     deref(&this) -> const T* { return &this.value; }
 }
-implement<T> trait DerefMutable<T> for struct Boxed<T> {
+implement<T> trait DerefMutable for struct Boxed<T> {
     deref_mutable(mut &this) -> T* { return &this.value; }
 }
 mut b: Boxed<Vec2> = Boxed::<Vec2> { value: Vec2 { x: 1, y: 2 } };

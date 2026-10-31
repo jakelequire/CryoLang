@@ -209,6 +209,16 @@ yet is recorded with the change that builds it, not here.
      Get<i64>, T: Get<boolean>`) has two of it, and the projection is
      refused as ambiguous (E0203).  (Jake)
 
+675. **`Index` and `Deref` name their element as an associated type.**
+     `Index<Idx>` declares `type Output;` and `Deref` declares
+     `type Target;`; `IndexMutable<Idx> : Index<Idx>` and
+     `DerefMutable : Deref` declare none of their own and write
+     `This::Output*` and `This::Target*`, the read-only implementation's
+     binding.  This replaces the element as a type parameter in rulings
+     671 and 673: the writable trait still needs the read-only one at the
+     same index type, and its method can no longer name another element.
+     (Jake)
+
 ### 2026-10-29
 
 663. **A binding from a match on a borrow is writable exactly when the
