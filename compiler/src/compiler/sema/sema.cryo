@@ -136,16 +136,20 @@ type enum ObjectConversionOutcome {
 }
 
 
-/// What stops a place being written (`SemaVisitor::place_access`).
+/// What stops a place being written (`SemaVisitor::place_access`), with
+/// the expression that decides it: the indirection the place is reached
+/// through last, or the binding holding it.  A report names that
+/// expression, not the place's immediate holder: `this.items.push(x)` in a
+/// `&this` method is refused for the receiver, not for `this.items`.
 type enum PlaceAccess {
     Writable;
     /// Reached last through a read-only borrow: a `&T`, a `virtual &Trait`,
     /// or the receiver of a `&this` method.
-    Borrow;
+    Borrow(ExpressionNode*);
     /// Reached last through a read-only pointer, `const T*`.
-    ReadOnlyPointer;
+    ReadOnlyPointer(ExpressionNode*);
     /// Held by a `const` binding, through no indirection.
-    ConstBinding;
+    ConstBinding(ExpressionNode*);
 }
 
 implement enum PlaceAccess {
@@ -153,6 +157,17 @@ implement enum PlaceAccess {
         return match (this) {
             PlaceAccess::Writable => { true }
             _                     => { false }
+        };
+    }
+
+    /// The expression that makes the place read-only; null when it is
+    /// writable.
+    decided_by(&this) -> ExpressionNode* {
+        return match (this) {
+            PlaceAccess::Writable           => { null }
+            PlaceAccess::Borrow(e)          => { e }
+            PlaceAccess::ReadOnlyPointer(e) => { e }
+            PlaceAccess::ConstBinding(e)    => { e }
         };
     }
 }
@@ -2789,9 +2804,9 @@ type struct SemaVisitor {
         const ma: MemberAccessExpr* = ExpressionNode::member_access_of(lhs);
         if (ma != null) {
             if (ma.object == null) { return; }
-            const through: Option<PlaceAccess> = this.indirection_access(ma.object.resolved_type);
+            const through: Option<PlaceAccess> = this.indirection_access(ma.object);
             if (through.is_some()) {
-                this.refuse_read_only_write(through.unwrap(), ma.object, lhs.span, "assign to");
+                this.refuse_read_only_write(through.unwrap(), lhs.span, "assign to");
                 return;
             }
             if (this.refuses_held_write(ma.object, lhs.span)) { return; }
@@ -2806,9 +2821,9 @@ type struct SemaVisitor {
         const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(lhs);
         if (aa != null) {
             if (aa.array == null) { return; }
-            const through: Option<PlaceAccess> = this.indirection_access(aa.array.resolved_type);
+            const through: Option<PlaceAccess> = this.indirection_access(aa.array);
             if (through.is_some()) {
-                this.refuse_read_only_write(through.unwrap(), aa.array, lhs.span, "assign to");
+                this.refuse_read_only_write(through.unwrap(), lhs.span, "assign to");
                 return;
             }
             if (this.refuses_held_write(aa.array, lhs.span)) { return; }
@@ -2822,9 +2837,9 @@ type struct SemaVisitor {
         // so that value is the place written.
         const read: ExpressionNode* = this.trait_read_receiver(lhs);
         if (read != null) {
-            const through: Option<PlaceAccess> = this.indirection_access(read.resolved_type);
+            const through: Option<PlaceAccess> = this.indirection_access(read);
             if (through.is_some()) {
-                this.refuse_read_only_write(through.unwrap(), read, lhs.span, "assign to");
+                this.refuse_read_only_write(through.unwrap(), lhs.span, "assign to");
                 return;
             }
             if (this.refuses_held_write(read, lhs.span)) { return; }
@@ -2833,9 +2848,9 @@ type struct SemaVisitor {
             return;
         }
         if (un.desugared_call == null) {
-            const through: Option<PlaceAccess> = this.indirection_access(un.operand.resolved_type);
+            const through: Option<PlaceAccess> = this.indirection_access(un.operand);
             if (through.is_some()) {
-                this.refuse_read_only_write(through.unwrap(), un.operand, lhs.span, "assign to");
+                this.refuse_read_only_write(through.unwrap(), lhs.span, "assign to");
             }
         }
     }
@@ -2901,7 +2916,7 @@ type struct SemaVisitor {
         if (aa != null) {
             if (aa.desugared_call != null) {
                 aa.desugared_call = this.writable_trait_read(aa.desugared_call);
-            } else if (aa.array != null && this.indirection_access(aa.array.resolved_type).is_none()) {
+            } else if (aa.array != null && this.indirection_access(aa.array).is_none()) {
                 aa.array = this.route_write(aa.array);
             }
             return place;
@@ -2915,7 +2930,7 @@ type struct SemaVisitor {
             return this.writable_trait_read(place);
         }
         const ma: MemberAccessExpr* = ExpressionNode::member_access_of(place);
-        if (ma != null && ma.object != null && this.indirection_access(ma.object.resolved_type).is_none()) {
+        if (ma != null && ma.object != null && this.indirection_access(ma.object).is_none()) {
             ma.object = this.route_write(ma.object);
         }
         return place;
@@ -2984,9 +2999,9 @@ type struct SemaVisitor {
     refuses_held_write(mut &this, holder: ExpressionNode*, span: SourceSpan) -> boolean {
         const held: PlaceAccess = this.place_access(holder);
         return match (held) {
-            PlaceAccess::Borrow          => { this.refuse_read_only_write(held, holder, span, "assign to"); true }
-            PlaceAccess::ReadOnlyPointer => { this.refuse_read_only_write(held, holder, span, "assign to"); true }
-            _                            => { false }
+            PlaceAccess::Borrow(_)          => { this.refuse_read_only_write(held, span, "assign to"); true }
+            PlaceAccess::ReadOnlyPointer(_) => { this.refuse_read_only_write(held, span, "assign to"); true }
+            _                               => { false }
         };
     }
 
@@ -3001,12 +3016,12 @@ type struct SemaVisitor {
         const id: IdentifierExpr* = ExpressionNode::identifier_of(place);
         if (id != null) {
             if (this.names_receiver(id)) {
-                if (this.state.this_is_by_ref && !this.state.this_is_mut) { return PlaceAccess::Borrow; }
+                if (this.state.this_is_by_ref && !this.state.this_is_mut) { return PlaceAccess::Borrow(place); }
                 return PlaceAccess::Writable;
             }
             const sym: SymbolID = id.res.local_sym();
             if (!sym.is_valid() || this.scopes.is_mutable(sym)) { return PlaceAccess::Writable; }
-            return PlaceAccess::ConstBinding;
+            return PlaceAccess::ConstBinding(place);
         }
         const ma: MemberAccessExpr* = ExpressionNode::member_access_of(place);
         if (ma != null) { return this.access_within(ma.object); }
@@ -3016,7 +3031,7 @@ type struct SemaVisitor {
         if (read != null) { return this.access_within(read); }
         const un: UnaryExpr* = ExpressionNode::unary_of(place);
         if (un != null && un.op.kind == TokenType::Star && un.desugared_call == null && un.operand != null) {
-            const through: Option<PlaceAccess> = this.indirection_access(un.operand.resolved_type);
+            const through: Option<PlaceAccess> = this.indirection_access(un.operand);
             if (through.is_some()) { return through.unwrap(); }
         }
         return PlaceAccess::Writable;
@@ -3026,32 +3041,33 @@ type struct SemaVisitor {
     /// indirection of `holder`'s type, or `holder` itself where it is none.
     access_within(&this, holder: ExpressionNode*) -> PlaceAccess {
         if (holder == null) { return PlaceAccess::Writable; }
-        const through: Option<PlaceAccess> = this.indirection_access(holder.resolved_type);
+        const through: Option<PlaceAccess> = this.indirection_access(holder);
         if (through.is_some()) { return through.unwrap(); }
         return this.place_access(holder);
     }
 
-    /// How writable a place reached through a value of type `t` is, or
-    /// none when `t` is no indirection.  The last indirection before the
-    /// value decides: `&T`, `const T*` and `virtual &Trait` read, `mut &T`,
-    /// `T*`, `virtual mut &Trait` and `virtual Trait*` write.
-    indirection_access(&this, t: TypeRef) -> Option<PlaceAccess> {
+    /// How writable a place reached through the value `through` is, decided
+    /// by `through`, or none when its type is no indirection.  The last
+    /// indirection before the value decides: `&T`, `const T*` and
+    /// `virtual &Trait` read, `mut &T`, `T*`, `virtual mut &Trait` and
+    /// `virtual Trait*` write.
+    indirection_access(&this, through: ExpressionNode*) -> Option<PlaceAccess> {
         mut last: Option<PlaceAccess> = Option::None;
-        mut walk: Type* = this.arena.lookup(t);
+        mut walk: Type* = this.arena.lookup(through.resolved_type);
         while (walk != null) {
             match (walk.kind) {
                 TypeKind::Pointer => {
                     const pt: PointerType* = walk.as_pointer();
-                    last = Option::Some(if (pt.const_pointee) { PlaceAccess::ReadOnlyPointer } else { PlaceAccess::Writable });
+                    last = Option::Some(if (pt.const_pointee) { PlaceAccess::ReadOnlyPointer(through) } else { PlaceAccess::Writable });
                     walk = this.arena.lookup(pt.pointee);
                 }
                 TypeKind::Reference => {
                     const rt: ReferenceType* = walk.as_reference();
-                    last = Option::Some(if (rt.is_mutable()) { PlaceAccess::Writable } else { PlaceAccess::Borrow });
+                    last = Option::Some(if (rt.is_mutable()) { PlaceAccess::Writable } else { PlaceAccess::Borrow(through) });
                     walk = this.arena.lookup(rt.referent);
                 }
                 TypeKind::Object => {
-                    if (walk.as_object().form == ObjectForm::Borrowed) { return Option::Some(PlaceAccess::Borrow); }
+                    if (walk.as_object().form == ObjectForm::Borrowed) { return Option::Some(PlaceAccess::Borrow(through)); }
                     return Option::Some(PlaceAccess::Writable);
                 }
                 TypeKind::InstantiatedType => {
@@ -3065,32 +3081,28 @@ type struct SemaVisitor {
         return last;
     }
 
-    /// E0250 where a place held behind `holder` is written (`what`: "assign
-    /// to", "call a `mut &this` method on") while `access` says it is
-    /// read-only; nothing when it is writable.
-    refuse_read_only_write(mut &this, access: PlaceAccess, holder: ExpressionNode*, span: SourceSpan, what: string) -> void {
+    /// E0250 where a place is written (`what`: "assign to", "call a
+    /// `mut &this` method on") while `access` says it is read-only; nothing
+    /// when it is writable.
+    refuse_read_only_write(mut &this, access: PlaceAccess, span: SourceSpan, what: string) -> void {
         if (access.is_writable()) { return; }
         this.ctx.emit_diagnostic(this.read_only_report(ErrorCode::E0250_WRITE_THROUGH_READ_ONLY,
-            access, holder, span, what, "written here"));
+            access, span, what, "written here"));
     }
 
-    /// E0251 where a writable borrow or pointer is taken of a place inside
-    /// `holder` while `access` says it is read-only; nothing when it is
-    /// writable.
-    refuse_read_only_borrow(mut &this, access: PlaceAccess, holder: ExpressionNode*, span: SourceSpan) -> void {
+    /// E0251 where a writable borrow or pointer is taken of a place while
+    /// `access` says it is read-only; nothing when it is writable.
+    refuse_read_only_borrow(mut &this, access: PlaceAccess, span: SourceSpan) -> void {
         if (access.is_writable()) { return; }
         this.ctx.emit_diagnostic(this.read_only_report(ErrorCode::E0251_READ_ONLY_FOR_WRITABLE,
-            access, holder, span, "take a writable borrow of", "borrowed for writing here"));
+            access, span, "take a writable borrow of", "borrowed for writing here"));
     }
 
-    /// The report of a write (`what`, labelled `label`) to a place held
-    /// behind `holder` that `access` makes read-only.
-    read_only_report(&this, code: ErrorCode, access: PlaceAccess, holder: ExpressionNode*, span: SourceSpan,
+    /// The report of a write (`what`, labelled `label`) to a place that
+    /// `access` makes read-only, naming the expression that decides it.
+    read_only_report(&this, code: ErrorCode, access: PlaceAccess, span: SourceSpan,
                      what: string, label: string) -> Diagnostic {
-        // A place read through `Index` or `Deref` is written through the
-        // value it is read out of, which is what makes it read-only.
-        const read: ExpressionNode* = this.trait_read_receiver(holder);
-        if (read != null) { return this.read_only_report(code, access, read, span, what, label); }
+        const holder: ExpressionNode* = access.decided_by();
         const id: IdentifierExpr* = ExpressionNode::identifier_of(holder);
         mut through: string = "";
         if (this.names_receiver(id)) {
@@ -3102,16 +3114,16 @@ type struct SemaVisitor {
             through = fmt::format("`%s`", this.arena.resolve_display_name_short(shown));
         }
         const message: string = match (access) {
-            PlaceAccess::ConstBinding => { fmt::format("cannot %s a place held by a `const` binding", what) }
+            PlaceAccess::ConstBinding(_) => { fmt::format("cannot %s a place held by a `const` binding", what) }
             _ => { fmt::format("cannot %s a place reached through %s, which is read-only", what, through) }
         };
         mut diag: Diagnostic = Diagnostic::error(code, message);
         diag = diag.at_with_label(span, label);
         match (access) {
-            PlaceAccess::ReadOnlyPointer => {
+            PlaceAccess::ReadOnlyPointer(_) => {
                 diag = diag.help("nothing is written through a `const T*`; take a `T*` where the place is written");
             }
-            PlaceAccess::ConstBinding => {
+            PlaceAccess::ConstBinding(_) => {
                 diag = diag.help("declare the binding with `mut` to write it");
             }
             _ => {
@@ -3266,22 +3278,10 @@ type struct SemaVisitor {
     borrow_for_writing(mut &this, place: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
         const access: PlaceAccess = this.place_access(place);
         if (!access.is_writable()) {
-            this.refuse_read_only_borrow(access, this.place_holder(place), span);
+            this.refuse_read_only_borrow(access, span);
             return place;
         }
         return this.route_write(place);
-    }
-
-    /// What holds `place`, which decides whether it is writable: the
-    /// object of a member, the container of an element; `place` itself
-    /// for a binding or a `*`, whose report names the pointer it reads
-    /// through.
-    place_holder(&this, place: ExpressionNode*) -> ExpressionNode* {
-        const ma: MemberAccessExpr* = ExpressionNode::member_access_of(place);
-        if (ma != null && ma.object != null) { return ma.object; }
-        const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(place);
-        if (aa != null && aa.array != null) { return aa.array; }
-        return place;
     }
 
     /// The type a `sizeof`/`alignof` measures, resolved from its annotation
