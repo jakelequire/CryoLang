@@ -92,6 +92,16 @@ that label must exist and its detail hold the text.  It may carry
 `"trigger": ":"`: it is then sent as the editor
 sends one the typed character triggered, not as one the user invoked.
 
+A fixture may name vendored libraries, `"vendor": {"Widgets":
+"bindings/Widgets.cryo"}`: each is registered, with that file as its
+bindings, in a registry under a temporary CRYO_HOME, so `import
+vendor::Widgets` reaches it and the machine's own registry is never read.
+Such a fixture runs from a copy in a temporary directory, since an analysis
+writes the copy of the bindings it compiles into the project's build folder,
+and its server runs from outside the project.  A check naming the bindings
+file (`bindings/Widgets.cryo@spin`) means that copy, the file a jump into
+the library lands in.
+
 A position check may carry `"quiet_stderr": true`: it then also fails when the
 server writes to stderr while answering, which with `CRYO_LOG` unset it never
 should, a buffer that does not parse included.  `expandHover` asks `cryo/expandHover`, the
@@ -129,15 +139,18 @@ def default_server_path():
     return os.path.join(REPO_ROOT, "tools", "CryoLSP", "build", exe)
 
 
-def server_env(stdlib):
+def server_env(stdlib, home):
     """The server links LLVM-C; on Windows its DLL lives in the toolchain.
     The compiler's logger is switched off, so `quiet_stderr` checks hold
     whatever the caller's shell sets.  `stdlib` is the server's
-    CRYO_STDLIB, the repository's own when None."""
+    CRYO_STDLIB, the repository's own when None; `home` its CRYO_HOME, the
+    caller's when None."""
     env = dict(os.environ)
     env.pop("CRYO_LOG", None)
     env.pop("CRYO_LOG_FILE", None)
     env["CRYO_STDLIB"] = stdlib or os.path.join(REPO_ROOT, "stdlib")
+    if home is not None:
+        env["CRYO_HOME"] = home
     extra = [os.path.join(REPO_ROOT, ".toolchains", "llvm-win", "bin"),
              os.path.join(REPO_ROOT, "bin")]
     extra = [p for p in extra if os.path.isdir(p)]
@@ -152,11 +165,11 @@ class Server:
     are kept in order so a check can wait for one.
     """
 
-    def __init__(self, path, cwd, stdlib=None):
+    def __init__(self, path, cwd, stdlib=None, home=None):
         self.proc = subprocess.Popen(
             [path],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            cwd=cwd, env=server_env(stdlib),
+            cwd=cwd, env=server_env(stdlib, home),
         )
         self._next_id = 0
         self._lock = threading.Condition()
@@ -357,7 +370,17 @@ class Fixture:
             self.markers[key] = position_of(text, offset)
 
     def uri(self, rel):
-        return uri_for(os.path.join(self.root, rel))
+        return uri_for(os.path.join(self.root, self.compiled_path(rel)))
+
+    def compiled_path(self, rel):
+        """The file an analysis reads `rel` as: for a vendored library's
+        bindings, the copy in the build folder's `vendor/<Name>/`."""
+        for name, bindings in self.spec.get("vendor", {}).items():
+            if bindings == rel:
+                host = "host-windows" if os.name == "nt" else "host"
+                return os.path.join("build", "target", "release", host, "vendor",
+                                    name, name + ".cryo")
+        return rel
 
     def at(self, ref):
         """`file@marker` -> (rel, position).  A missing marker is an error.
@@ -746,10 +769,33 @@ def shutdown(srv, c, label):
         c.ok(False, "%s: exits 0 after shutdown and exit" % label, "timed out")
 
 
+def register_vendor(home, fx):
+    """Write a registry under CRYO_HOME `home` holding the fixture's
+    vendored libraries, each with its bindings file cached for the host."""
+    libraries = []
+    for name, bindings in sorted(fx.spec["vendor"].items()):
+        libraries.append({
+            "key": name.lower(), "name": name, "source_path": fx.root,
+            "binding_source": "manual", "headers": [], "include_dirs": [],
+            "defines": [], "language": "", "std": "", "link": {},
+            "cache": [{"triple": "host", "file": os.path.join(fx.root, bindings), "key": ""}]})
+    vendor = os.path.join(home, "cache", "vendor")
+    os.makedirs(vendor)
+    with open(os.path.join(vendor, "registry.json"), "w", encoding="utf-8") as fh:
+        json.dump({"schema_version": 1, "libraries": libraries}, fh)
+
+
 def run_fixture(server_path, fx, c):
     print("fixture %s" % fx.name)
     failed_before = len(c.failed)
-    srv = Server(server_path, fx.root)
+    home = None
+    if "vendor" in fx.spec:
+        home = tempfile.mkdtemp(prefix="cryolsp-vendor-")
+        copy = os.path.join(home, "project", fx.name)
+        shutil.copytree(fx.root, copy)
+        fx = Fixture(copy)
+        register_vendor(home, fx)
+    srv = Server(server_path, home or fx.root, home=home)
     try:
         caps = initialize(srv, fx.root, c, fx.name)
         fx.legend = (caps.get("semanticTokensProvider") or {}).get("legend", {})
@@ -783,6 +829,8 @@ def run_fixture(server_path, fx, c):
     finally:
         srv.stop()
         report_stderr(srv, c, failed_before)
+        if home is not None:
+            shutil.rmtree(home, ignore_errors=True)
 
 
 def change(srv, fx, rel, version, save):
