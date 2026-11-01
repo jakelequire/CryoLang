@@ -2,8 +2,10 @@
 ///!
 ///! The target at the position (`identity`) shown as the declaration it
 ///! names - a signature, a type's head, a binding with its type - followed
-///! by the declaration's doc comment.  A position with no target falls to
-///! the keyword table; anything else answers `null`.
+///! by the declaration's doc comment.  A position with no target on an
+///! import path's earlier segment shows the path, in a string literal or an
+///! f-string the string; elsewhere it falls to the keyword table, and
+///! anything else answers `null`.
 namespace lsp::handlers::hover;
 
 import std::core::option;
@@ -14,22 +16,31 @@ import std::json::value;
 import std::ffi::libc;
 
 import compiler::compilation_context::{ CompilationContext };
-import compiler::ast::{  TypeAnnotation };
+import compiler::ast::{ LiteralKind, TypeAnnotation };
 import compiler::ast::declaration::{
     DeclarationNode, DeclKind, EnumVariant, FieldDecl, FunctionDecl,
-    MethodDecl, VarDecl
+    ImportDecl, MethodDecl, VarDecl
 };
-import compiler::resolver::res::{ DeclVisibility, DefId, DefKind };
+import compiler::module_graph::{ ModulePath };
+import compiler::ast::expression::{
+    CallExpr, ExpressionNode, IdentifierExpr, LiteralExpr, UnaryExpr
+};
+import compiler::ast::node::{ Node };
+import compiler::ast::node_locator;
+import compiler::ast::walk::{ Walk };
+import compiler::resolver::lang_item::{ LangItem };
+import compiler::resolver::res::{ DeclVisibility, DefId, DefKind, Res, ResSlot };
 import compiler::resolver::symbol::{ Symbol, SymbolKind };
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::types::type_ref::{ TypeRef };
 
 import lsp::handlers::definition::{ Declared };
-import lsp::handlers::identity::{ Answer, Asked, Target };
+import lsp::handlers::identity::{ Answer, Asked, Locator, Target };
 import lsp::handlers::keyword_docs;
 import lsp::handlers::members::{ Member, Members };
 import lsp::handlers::names::{ Names };
 import lsp::server::docs;
+import lsp::server::line_index::{ Columns };
 import lsp::server::session;
 import lsp::protocol::lsp;
 
@@ -92,6 +103,14 @@ type struct Shown {
         }
         match (docs.get(asked.uri)) {
             Option::Some(doc) => {
+                if (asked.ctx != null && asked.module_idx >= 0 && asked.cursor.line > 0) {
+                    mut shown: Shown = Shown::new(
+                        Names::in_module(asked.ctx, asked.module_idx, asked.cursor.line, asked.cursor.col));
+                    const path: Answer = shown.import_prefix(&asked);
+                    if (shown.text.length() > 0) { return shown.reply(docs, &path); }
+                    const at: Answer = shown.string_at(doc, &asked);
+                    if (shown.text.length() > 0) { return shown.reply(docs, &at); }
+                }
                 match (keyword_docs::try_keyword_hover(docs, doc, asked.line, asked.character)) {
                     Option::Some(json) => { return json; }
                     Option::None       => { }
@@ -268,6 +287,128 @@ type struct Shown {
         this.doc = v.documentation;
     }
 
+    /// A segment of an import's path before its last - `std` or `core` in
+    /// `import std::core::intrinsics;` - as the path written through it and
+    /// the modules under that path this module may name, one line each.  A
+    /// module is loaded only when something imports it, so the path need
+    /// not name a module the analysis holds; nothing when no module is
+    /// under it.
+    import_prefix(mut &this, asked: &Asked) -> Answer {
+        const at: Node? = Locator::node_at(this.ctx, this.ctx.module_graph.get_module_ast(asked.module_idx as u32),
+                                          asked.cursor.line, asked.cursor.col);
+        if (at.is_none()) { return Answer::nothing(); }
+        const d: DeclarationNode* = at.unwrap().as_decl();
+        if (d == null) { return Answer::nothing(); }
+        const imp: ImportDecl* = match (d.kind) {
+            DeclKind::Import(i) => { i }
+            _                   => { null }
+        };
+        if (imp == null) { return Answer::nothing(); }
+        mut segment: i64 = -1;
+        for (mut k: i64 = 0; k < imp.path_segment_spans.length() - 1; k++) {
+            if (node_locator::span_contains(imp.path_segment_spans[k], asked.cursor.line, asked.cursor.col)) {
+                segment = k;
+            }
+        }
+        if (segment < 0) { return Answer::nothing(); }
+        mut written: String = String::with_capacity(32);
+        for (mut k: i64 = 0; k <= segment; k++) {
+            if (k > 0) { written.push("::"); }
+            written.push(this.ctx.intern_table.resolve(imp.path_segments[k]));
+        }
+        const shown_path: string = written.into_raw();
+        const m: ModulePath = this.ctx.module_graph.module_path_over(
+            this.ctx.intern_table.intern(shown_path), this.ctx.intern_table);
+        if (!m.is_valid()) { return Answer::nothing(); }
+        const from: ModulePath = this.ctx.module_graph.get_module(asked.module_idx).path();
+        const subs: [string] = Members::submodules_of(this.ctx, m, from);
+        mut out: String = String::from_str(str::Str::from(shown_path));
+        for (mut i: i64 = 0; i < subs.length(); i++) {
+            out.push("\n    module ");
+            out.push(subs[i]);
+        }
+        this.text = out.into_raw();
+        return Answer::of(Target::Nothing, imp.path_segment_spans[segment], TypeRef::invalid());
+    }
+
+    /// The string written at the position, as its text in its type: a
+    /// literal `string("text")[13]`, its byte count after it; an f-string
+    /// `f"{name: string} is {age: i32}" -> String`, each hole's type written
+    /// in it and its format spec left out.  The answer is where the string
+    /// is written; nothing when no string is, or when the text the analysis
+    /// read does not spell it on one line.
+    string_at(mut &this, doc: &docs::Document, asked: &Asked) -> Answer {
+        const at: Node? = Locator::node_at(this.ctx, this.ctx.module_graph.get_module_ast(asked.module_idx as u32),
+                                          asked.cursor.line, asked.cursor.col);
+        if (at.is_none()) { return Answer::nothing(); }
+        mut under: StringUnder = StringUnder { ctx: this.ctx, line: asked.cursor.line,
+                                               col: asked.cursor.col, found: null };
+        under.walk_node(at.unwrap());
+        const e: ExpressionNode* = under.found;
+        if (e == null || e.span.end_line != e.span.start_line) { return Answer::nothing(); }
+        const line: str::Str = if (doc.has_snap) {
+            doc.snap_line_text(e.span.start_line - 1)
+        } else {
+            doc.line_text(e.span.start_line - 1)
+        };
+        const start: i64 = Columns::compiler_to_byte(line, e.span.start_col);
+        const end: i64 = Columns::compiler_to_byte(line, e.span.end_col);
+        const b: u8* = line.as_ptr();
+        if (end - start < 2 || b[end - 1] != '"' as u8) { return Answer::nothing(); }
+        mut out: String = String::with_capacity(end - start + 32);
+        const literal: LiteralExpr* = ExpressionNode::literal_of(e);
+        if (literal != null) {
+            out.push(this.type_text(e.resolved_type));
+            out.push("(");
+            out.push(line.sub_bytes(start, end));
+            out.push(")[");
+            out.push(literal.byte_length);
+            out.push("]");
+            this.text = out.into_raw();
+            return Answer::of(Target::Nothing, e.span, e.resolved_type);
+        }
+        // The holes, in the order written: the lowering appends each piece
+        // to the lowering of the text before it, so the last hole is the
+        // outermost call's.
+        mut holes: [ExpressionNode*] = [];
+        mut c: CallExpr* = ExpressionNode::call_of(e);
+        while (c != null && c.arguments.length() > 0) {
+            if (c.arguments.length() >= 2) {
+                const reference: UnaryExpr* = ExpressionNode::unary_of(c.arguments[1]);
+                if (reference != null) { holes.push(reference.operand); }
+            }
+            c = ExpressionNode::call_of(c.arguments[0]);
+        }
+        // Each hole is written back as `{` + its expression's text + its
+        // type + `}`, through the `}` that closes it; the text between holes
+        // is copied as written.
+        mut from: i64 = start;
+        for (mut i: i64 = holes.length() - 1; i >= 0; i--) {
+            const hole: ExpressionNode* = holes[i];
+            if (hole.span.start_line != e.span.start_line || hole.span.end_line != e.span.start_line) {
+                return Answer::nothing();
+            }
+            const hole_start: i64 = Columns::compiler_to_byte(line, hole.span.start_col);
+            const hole_end: i64 = Columns::compiler_to_byte(line, hole.span.end_col);
+            mut open: i64 = hole_start - 1;
+            while (open > from && (b[open] == ' ' as u8 || b[open] == '\t' as u8)) { open = open - 1; }
+            mut close: i64 = hole_end;
+            while (close < end && b[close] != '}' as u8) { close = close + 1; }
+            if (open < from || b[open] != '{' as u8 || close >= end) { return Answer::nothing(); }
+            out.push(line.sub_bytes(from, open + 1));
+            out.push(line.sub_bytes(hole_start, hole_end));
+            out.push(": ");
+            out.push(this.type_text(hole.resolved_type));
+            out.push("}");
+            from = close + 1;
+        }
+        out.push(line.sub_bytes(from, end));
+        out.push(" -> ");
+        out.push(this.type_text(e.resolved_type));
+        this.text = out.into_raw();
+        return Answer::of(Target::Nothing, e.span, e.resolved_type);
+    }
+
     /// The members of the type `d`, one line each, for the extended hover:
     /// a field's name and type, a variant's name, a method's signature.
     members(mut &this, d: DefId) -> void {
@@ -366,5 +507,66 @@ type struct Shown {
         while (out > 0 && buf[out - 1] == '\n' as i8) { out = out - 1; }
         buf[out] = 0 as i8;
         return buf as string;
+    }
+}
+
+
+/// The string under a position: the string literal written there, or the
+/// f-string whose lowering holds it.  An f-string lowers to a chain of
+/// builder calls the compiler wrote, every one at the f-string's span; the
+/// first met, the outermost, stands for the f-string.  The walk goes down
+/// from the innermost written node holding the position, so a string met
+/// later at another span is inside the one before it - an f-string in a
+/// hole of another - and is the answer.
+type struct StringUnder {
+    ctx:   CompilationContext*;
+    line:  u32;
+    col:   u32;
+    found: ExpressionNode*;
+
+    consider(mut &this, e: ExpressionNode*) -> void {
+        if (!node_locator::span_contains(e.span, this.line, this.col)) { return; }
+        if (this.found != null && this.found.span.start_line == e.span.start_line
+                && this.found.span.start_col == e.span.start_col
+                && this.found.span.end_line == e.span.end_line
+                && this.found.span.end_col == e.span.end_col) {
+            return;
+        }
+        this.found = e;
+    }
+
+    /// Whether `call` calls one of the builders an f-string lowers to,
+    /// either the ones that build a `String` or the ones that record pieces.
+    builds_fstring(&this, call: CallExpr*) -> boolean {
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(call.callee);
+        if (id == null) { return false; }
+        const callee: DefId = match (&id.res) {
+            ResSlot::Answered(r) => {
+                match (r) { Res::Def(d) => { d } _ => { DefId::invalid() } }
+            }
+            _ => { DefId::invalid() }
+        };
+        if (!callee.is_valid()) { return false; }
+        const items: [LangItem] = LangItem::all();
+        for (mut k: i64 = 0; k < items.length(); k++) {
+            const pieces: Option<LangItem> = items[k].pieces_builder();
+            if (pieces.is_none()) { continue; }
+            if (callee.equals(this.ctx.generic_registry.wellknown(items[k]))
+                    || callee.equals(this.ctx.generic_registry.wellknown(pieces.unwrap()))) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+implement trait Walk for struct StringUnder {
+    walk_literal(mut &this, e: ExpressionNode*, n: LiteralExpr*) -> void {
+        if (!e.generated && n.literal_kind == LiteralKind::String) { this.consider(e); }
+    }
+
+    walk_call(mut &this, e: ExpressionNode*, n: CallExpr*) -> void {
+        if (e.generated && this.builds_fstring(n)) { this.consider(e); }
+        CallExpr::walk_children(n, this);
     }
 }
