@@ -144,6 +144,19 @@ yet is recorded with the change that builds it, not here.
      same.  A module's `.ll` is written only on request (`--emit-llvm`,
      `emit_llvm`), which `selfhost-check` makes.  (Jake)
 
+680. **`Array` and `Slice` are indexed through one implementation each,
+     generic over the index type.**  `Index<I>` and `IndexMutable<I>` are
+     implemented once for `Array<T, A>` and once for `Slice<T>`, under
+     `I: SliceIndex<T>`, with `type Output = I::Output`.  `SliceIndex<T>`
+     lives in `std::core::slice` and is implemented for every integer type
+     with `type Output = T`; it is `internal`, so a program can neither
+     name nor implement it, and an index of any other type is refused at
+     the `[]` naming the unmet bound.  It replaces one implementation per
+     integer type.  An index outside the container panics naming it
+     (`Array: index out of range`, `Slice: index out of range`).  (Jake for
+     the trait, its name, its place, its integer implementations and its
+     whole-trait `internal`)
+
 ### 2026-11-01
 
 677. **A primitive implements the trait of every operator that applies to

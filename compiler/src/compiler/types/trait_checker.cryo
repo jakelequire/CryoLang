@@ -17,7 +17,7 @@ namespace compiler::types::trait_checker;
 
 import compiler::ast::{
     declaration, expression, node, ObjectForm, pattern, statement, TraitBound, TraitRef,
-    TypeAnnotation
+    TypeAnnotation, Visibility
 };
 import compiler::types::{
     generic, user_defined, compound, type_base, arena, type_ref,
@@ -381,12 +381,25 @@ type struct TraitChecker {
     /// implementation can be written for an object, so an object is told to
     /// give way to a type that implements the trait: one whose trait reaches
     /// `trait_def` is blocked by a method a table cannot hold, and one whose
-    /// trait does not reach it never implements it.  Any other type gets
-    /// `written_help`, the site's own advice.
+    /// trait does not reach it never implements it.  An internal trait can
+    /// be implemented only in the package that declares it, so the advice
+    /// to implement it is withheld and a type that does is asked for.  Any
+    /// other type gets `written_help`, the site's own advice.
     bound_failure_help(&this, ty: TypeRef, trait_def: DefId, trait_shown: string, ty_shown: string,
                        written_help: string) -> string {
         const t: Type* = this.arena.lookup(ty);
-        if (t == null || t.kind != TypeKind::Object) { return written_help; }
+        if (t == null || t.kind != TypeKind::Object) {
+            const decl: TraitDecl* = if (this.generic_registry != null) {
+                this.generic_registry.get_trait_decl(trait_def)
+            } else {
+                null
+            };
+            if (decl != null && decl.visibility == Visibility::Internal) {
+                return fmt::format("use a type that implements `%s` in place of `%s`; `%s` is internal, so only its own package implements it",
+                    trait_shown, ty_shown, this.intern_table.resolve(decl.name));
+            }
+            return written_help;
+        }
         if (this.generic_registry != null && this.object_reaches_trait(t.as_object(), trait_def)) {
             return fmt::format("use a type that implements `%s` in place of `%s`, or an object of a trait whose methods a table can hold",
                 trait_shown, ty_shown);

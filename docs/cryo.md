@@ -2462,10 +2462,18 @@ implements only `Index` is read-only through `[]`, and writing it is refused
 naming the missing trait (E0229).  Fixed-array, string and pointer indexing
 keep their native path.  A type may implement each trait once per index type;
 the call is answered by the implementation whose `Idx` is the index's own
-type.  `Array<T>` and `[T]` are indexed this way: the standard library
-implements `Index` and `IndexMutable` for `Array<T>` once per integer type,
-marked `![inline]`, so `xs[i]` takes an index of any integer type, costs no
-call, and an index at or past the length (a negative one included) panics.
+type.  `Array<T>`, `[T]` and `Slice<T>` are indexed this way: the standard
+library implements `Index` and `IndexMutable` for each once, generic over
+the index type `I` under `I: SliceIndex<T>`, a trait of its own that every
+integer type implements with `type Output = T`.  Each `xs[i]` binds `I` to
+the index's type, so it takes an index of any integer type; the methods are
+`![inline]`, so it costs no call; and an index at or past the length (a
+negative one included) panics.  `SliceIndex` is internal to the standard
+library: a program can neither name nor implement it, and an index of
+another type is refused at the `[]` naming the bound it does not meet
+(`E0306`).  The help such a refusal carries asks for a type that implements
+the trait, never for an implementation of an internal trait outside its
+package.
 In a generic body, a container whose type carries the body's parameters
 (`xs: &Array<T>`) is indexed through its own implementations exactly as a
 concrete one is, and a type parameter is written through `[]` only under an
