@@ -70,7 +70,7 @@ const FLAG_SET_DELAY_MS: u64 = 50;
 type struct FlagJob {
     job:     BlockingJob;
     flag:    Atomic<u32>;    // 1 once the sibling task has run
-    barrier: Atomic<u32>*;   // shared arrival count, or null
+    barrier: mut Atomic<u32>*;   // shared arrival count, or null
     need:    u32;            // arrivals required before this job may finish
     saw:     u32;            // 1 if both conditions were met within the bound
 }
@@ -81,7 +81,7 @@ type struct FlagJob {
 /// Polls rather than blocking on a condvar because what is being tested is that
 /// this call can spin for seconds without costing the executor anything.
 function flag_job_run(raw: u8*) -> void {
-    mut j: FlagJob* = raw as FlagJob*;
+    mut j: mut FlagJob* = raw as mut FlagJob*;
     if (j.barrier != null) { j.barrier.fetch_add(1, MemoryOrder::AcqRel); }
     // The bound is real elapsed time, not a count of 5ms sleeps. Under a loaded
     // machine a 5ms sleep takes many times that, and it does not stretch by the
@@ -113,9 +113,9 @@ function flag_job_free(raw: u8*) -> void {
 
 /// Allocate and initialize a `FlagJob`, or null if the heap refused. Pass a null
 /// `barrier` for a job that answers to the flag alone.
-function flag_job_new(barrier: Atomic<u32>*, need: u32) -> FlagJob* {
+function flag_job_new(barrier: Atomic<u32>*, need: u32) -> mut FlagJob* {
     mut alloc: GlobalAlloc = GlobalAlloc::new();
-    mut j: FlagJob* = null;
+    mut j: mut FlagJob* = null;
     match (alloc.allocate(Layout::of::<FlagJob>())) {
         Result::Ok(raw) => { j = raw.cast::<FlagJob>().as_ptr(); }
         Result::Err(_)  => { return null; }
@@ -132,7 +132,7 @@ function flag_job_new(barrier: Atomic<u32>*, need: u32) -> FlagJob* {
 /// local because the pool threads outlive the frame that starts them.
 function counter_new() -> Atomic<u32>* {
     mut alloc: GlobalAlloc = GlobalAlloc::new();
-    mut c: Atomic<u32>* = null;
+    mut c: mut Atomic<u32>* = null;
     match (alloc.allocate(Layout::of::<Atomic<u32>>())) {
         Result::Ok(raw) => { c = raw.cast::<Atomic<u32>>().as_ptr(); }
         Result::Err(_)  => { return null; }
@@ -150,16 +150,16 @@ function counter_free(c: Atomic<u32>*) -> void {
 /// shape `dns::Resolve` has, kept minimal so a failure here points at the pool
 /// rather than at name resolution.
 type struct FlagFuture {
-    j:         FlagJob*;   // null once the result has been collected
+    j:         mut FlagJob*;   // null once the result has been collected
     submitted: boolean;
 
-    static start(j: FlagJob*) -> FlagFuture {
+    static start(j: mut FlagJob*) -> FlagFuture {
         return FlagFuture { j: j, submitted: false };
     }
 
     private let_go(mut &this) -> void {
         if (this.j == null) { return; }
-        const j: FlagJob* = this.j;
+        const j: mut FlagJob* = this.j;
         this.j = null;
         j.job.release();
     }
@@ -170,7 +170,7 @@ implement trait Future for struct FlagFuture {
 
     poll(mut &this, cx: Context*) -> Poll<i64> {
         if (!this.submitted) {
-            mut pool: BlockingPool* = BlockingPool::current();
+            mut pool: mut BlockingPool* = BlockingPool::current();
             if (pool == null) { this.let_go(); return Poll::Ready(-1); }
             if (!pool.submit(&this.j.job)) { this.let_go(); return Poll::Ready(-2); }
             this.submitted = true;
@@ -192,13 +192,13 @@ implement trait Drop for struct FlagFuture {
 
 /// The sibling: sleep, then set the flag the pool thread is waiting on. Reaching
 /// this at all is the thing under test.
-async function set_flag(j: FlagJob*) -> i64 {
+async function set_flag(j: mut FlagJob*) -> i64 {
     await Sleep::new(Duration::from_millis(FLAG_SET_DELAY_MS));
     j.flag.store(1, MemoryOrder::Release);
     return 1;
 }
 
-async function handshake(j: FlagJob*) -> i64 {
+async function handshake(j: mut FlagJob*) -> i64 {
     const pair: (i64, i64) = await Futures::join(FlagFuture::start(j), set_flag(j));
     if (pair.1 != 1) { return -3; }
     return pair.0;
@@ -206,7 +206,7 @@ async function handshake(j: FlagJob*) -> i64 {
 
 ![test]
 function blocking_job_runs_off_the_executor() -> Result<(), TestError> {
-    const j: FlagJob* = flag_job_new(null, 0);
+    const j: mut FlagJob* = flag_job_new(null, 0);
     if (j == null) { return bail(Str::new("FlagJob allocation failed")); }
     // ONE worker: if the job ran on it, nothing else on this executor could.
     mut ex: Executor = Executor::with_threads(1);
@@ -215,7 +215,7 @@ function blocking_job_runs_off_the_executor() -> Result<(), TestError> {
 }
 
 /// Two jobs awaited together.
-async function two_flags(x: FlagJob*, y: FlagJob*) -> i64 {
+async function two_flags(x: mut FlagJob*, y: mut FlagJob*) -> i64 {
     const p: (i64, i64) = await Futures::join(FlagFuture::start(x), FlagFuture::start(y));
     if (p.0 != 1) { return -10; }
     if (p.1 != 1) { return -11; }
@@ -231,7 +231,7 @@ async function two_flags(x: FlagJob*, y: FlagJob*) -> i64 {
 /// job instead refuses to finish until all four have ARRIVED, so a pool that
 /// serializes them deadlocks its first job against three that never start, and
 /// it reports 0 at its bound.
-async function four_way(a: FlagJob*, b: FlagJob*, c: FlagJob*, d: FlagJob*) -> i64 {
+async function four_way(a: mut FlagJob*, b: mut FlagJob*, c: mut FlagJob*, d: mut FlagJob*) -> i64 {
     const p: ((i64, i64), i64) =
         await Futures::join(Futures::join(two_flags(a, b), two_flags(c, d)),
                             set_flag_all(a, b, c, d));
@@ -241,7 +241,7 @@ async function four_way(a: FlagJob*, b: FlagJob*, c: FlagJob*, d: FlagJob*) -> i
     return 0;
 }
 
-async function set_flag_all(a: FlagJob*, b: FlagJob*, c: FlagJob*, d: FlagJob*) -> i64 {
+async function set_flag_all(a: mut FlagJob*, b: mut FlagJob*, c: mut FlagJob*, d: mut FlagJob*) -> i64 {
     await Sleep::new(Duration::from_millis(FLAG_SET_DELAY_MS));
     a.flag.store(1, MemoryOrder::Release);
     b.flag.store(1, MemoryOrder::Release);
@@ -254,10 +254,10 @@ async function set_flag_all(a: FlagJob*, b: FlagJob*, c: FlagJob*, d: FlagJob*) 
 function blocking_pool_runs_jobs_concurrently() -> Result<(), TestError> {
     const arrived: Atomic<u32>* = counter_new();
     if (arrived == null) { return bail(Str::new("barrier allocation failed")); }
-    const a: FlagJob* = flag_job_new(arrived, 4);
-    const b: FlagJob* = flag_job_new(arrived, 4);
-    const c: FlagJob* = flag_job_new(arrived, 4);
-    const d: FlagJob* = flag_job_new(arrived, 4);
+    const a: mut FlagJob* = flag_job_new(arrived, 4);
+    const b: mut FlagJob* = flag_job_new(arrived, 4);
+    const c: mut FlagJob* = flag_job_new(arrived, 4);
+    const d: mut FlagJob* = flag_job_new(arrived, 4);
     if (a == null || b == null || c == null || d == null) {
         counter_free(arrived);
         return bail(Str::new("FlagJob allocation failed"));
@@ -275,7 +275,7 @@ function blocking_pool_runs_jobs_concurrently() -> Result<(), TestError> {
 /// still inside `run_fn`, so the block outlives it; nothing may be freed twice
 /// and the executor must still shut down. `Elapsed` is the expected answer —
 /// the point is that the teardown after it is clean.
-async function abandon_in_flight(j: FlagJob*) -> i64 {
+async function abandon_in_flight(j: mut FlagJob*) -> i64 {
     match (await Futures::timeout(Duration::from_millis(60), FlagFuture::start(j))) {
         Result::Ok(_)  => { return -20; }   // the flag is never set here
         Result::Err(_) => { return 1; }
@@ -315,17 +315,17 @@ const CEILING_WAIT_MS: u64 = 60000;
 /// behaviour: a pool that ignored `max` entirely would pass the first.
 ![test]
 function blocking_pool_default_ceiling_admits_more_than_eight() -> Result<(), TestError> {
-    mut pool: BlockingPool* = BlockingPool::start();
+    mut pool: mut BlockingPool* = BlockingPool::start();
     const arrived: Atomic<u32>* = counter_new();
     if (arrived == null) {
         BlockingPool::stop(pool);
         BlockingPool::free(pool);
         return bail(Str::new("barrier allocation failed"));
     }
-    mut jobs: [FlagJob*] = [];
+    mut jobs: [mut FlagJob*] = [];
     mut i: u32 = 0;
     while (i < CEILING_PROBE) {
-        const j: FlagJob* = flag_job_new(arrived, CEILING_PROBE);
+        const j: mut FlagJob* = flag_job_new(arrived, CEILING_PROBE);
         if (j == null) { break; }
         jobs.push(j);
         i = i + 1;
@@ -363,16 +363,16 @@ function blocking_pool_a_configured_ceiling_is_enforced() -> Result<(), TestErro
     // Two threads, three jobs that each demand all three be running. The third
     // cannot start until one of the first two finishes, so the barrier is
     // unreachable while they wait and they must both give up at their bound.
-    mut pool: BlockingPool* = BlockingPool::with_max(2);
+    mut pool: mut BlockingPool* = BlockingPool::with_max(2);
     const arrived: Atomic<u32>* = counter_new();
     if (arrived == null) {
         BlockingPool::stop(pool);
         BlockingPool::free(pool);
         return bail(Str::new("barrier allocation failed"));
     }
-    const a: FlagJob* = flag_job_new(arrived, 3);
-    const b: FlagJob* = flag_job_new(arrived, 3);
-    const c: FlagJob* = flag_job_new(arrived, 3);
+    const a: mut FlagJob* = flag_job_new(arrived, 3);
+    const b: mut FlagJob* = flag_job_new(arrived, 3);
+    const c: mut FlagJob* = flag_job_new(arrived, 3);
     if (a == null || b == null || c == null) {
         BlockingPool::stop(pool);
         BlockingPool::free(pool);
@@ -425,7 +425,7 @@ function blocking_pool_a_configured_ceiling_is_enforced() -> Result<(), TestErro
 /// blocking ceiling is two. None can see all three running: the first two get
 /// threads and time out at the barrier, and the third, run once one of them
 /// releases its thread, times out too.
-async function three_flags(x: FlagJob*, y: FlagJob*, z: FlagJob*) -> i64 {
+async function three_flags(x: mut FlagJob*, y: mut FlagJob*, z: mut FlagJob*) -> i64 {
     const p: ((i64, i64), i64) =
         await Futures::join(Futures::join(FlagFuture::start(x), FlagFuture::start(y)),
                             FlagFuture::start(z));
@@ -446,9 +446,9 @@ async function three_flags(x: FlagJob*, y: FlagJob*, z: FlagJob*) -> i64 {
 function executor_blocking_ceiling_reaches_the_pool() -> Result<(), TestError> {
     const arrived: Atomic<u32>* = counter_new();
     if (arrived == null) { return bail(Str::new("barrier allocation failed")); }
-    const x: FlagJob* = flag_job_new(arrived, 3);
-    const y: FlagJob* = flag_job_new(arrived, 3);
-    const z: FlagJob* = flag_job_new(arrived, 3);
+    const x: mut FlagJob* = flag_job_new(arrived, 3);
+    const y: mut FlagJob* = flag_job_new(arrived, 3);
+    const z: mut FlagJob* = flag_job_new(arrived, 3);
     if (x == null || y == null || z == null) {
         counter_free(arrived);
         return bail(Str::new("FlagJob allocation failed"));
@@ -467,7 +467,7 @@ function executor_blocking_ceiling_reaches_the_pool() -> Result<(), TestError> {
 
 ![test]
 function dropping_a_future_leaves_its_job_to_the_pool() -> Result<(), TestError> {
-    const j: FlagJob* = flag_job_new(null, 0);
+    const j: mut FlagJob* = flag_job_new(null, 0);
     if (j == null) { return bail(Str::new("FlagJob allocation failed")); }
     // A reference of this function's own. Without it the block would belong
     // entirely to the pool the moment the future is dropped, and naming `j`
