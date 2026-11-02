@@ -2852,7 +2852,7 @@ type struct SemaVisitor {
             return;
         }
         if (un.desugared_call == null) {
-            const through: Option<PlaceAccess> = this.indirection_access(un.operand);
+            const through: Option<PlaceAccess> = this.dereference_access(un.operand);
             if (through.is_some()) {
                 this.refuse_read_only_write(through.unwrap(), lhs.span, "assign to");
             }
@@ -3035,7 +3035,7 @@ type struct SemaVisitor {
         if (read != null) { return this.access_within(read); }
         const un: UnaryExpr* = ExpressionNode::unary_of(place);
         if (un != null && un.op.kind == TokenType::Star && un.desugared_call == null && un.operand != null) {
-            const through: Option<PlaceAccess> = this.indirection_access(un.operand);
+            const through: Option<PlaceAccess> = this.dereference_access(un.operand);
             if (through.is_some()) { return through.unwrap(); }
         }
         return PlaceAccess::Writable;
@@ -3056,6 +3056,22 @@ type struct SemaVisitor {
     /// `virtual &Trait` read, `mut &T`, `T*`, `virtual mut &Trait` and
     /// `virtual Trait*` write.
     indirection_access(&this, through: ExpressionNode*) -> Option<PlaceAccess> {
+        return this.access_through_indirections(through, false);
+    }
+
+    /// How writable the place `*pointer` is, or none when `pointer`'s type
+    /// is no indirection.  A `*` strips one level, so only the outermost
+    /// indirection decides: `*p = q` with `p: (&Node)*` writes the borrow
+    /// the pointer points at, and with `p: &(Node*)` writes through the
+    /// read-only borrow.
+    dereference_access(&this, pointer: ExpressionNode*) -> Option<PlaceAccess> {
+        return this.access_through_indirections(pointer, true);
+    }
+
+    /// The walk `indirection_access` and `dereference_access` share: the
+    /// access the last indirection of `through`'s type gives, or the first
+    /// one's when `outermost_only`.
+    access_through_indirections(&this, through: ExpressionNode*, outermost_only: boolean) -> Option<PlaceAccess> {
         mut last: Option<PlaceAccess> = Option::None;
         mut walk: Type* = this.arena.lookup(through.resolved_type);
         while (walk != null) {
@@ -3063,11 +3079,13 @@ type struct SemaVisitor {
                 TypeKind::Pointer => {
                     const pt: PointerType* = walk.as_pointer();
                     last = Option::Some(if (pt.const_pointee) { PlaceAccess::ReadOnlyPointer(through) } else { PlaceAccess::Writable });
+                    if (outermost_only) { return last; }
                     walk = this.arena.lookup(pt.pointee);
                 }
                 TypeKind::Reference => {
                     const rt: ReferenceType* = walk.as_reference();
                     last = Option::Some(if (rt.is_mutable()) { PlaceAccess::Writable } else { PlaceAccess::Borrow(through) });
+                    if (outermost_only) { return last; }
                     walk = this.arena.lookup(rt.referent);
                 }
                 TypeKind::Object => {
@@ -3134,10 +3152,12 @@ type struct SemaVisitor {
                 const holder_t: Type* = this.arena.lookup(holder.resolved_type);
                 if (this.names_receiver(id)) {
                     diag = diag.help("the method takes `&this`; declare it `mut &this` to write its receiver");
-                    // The receiver's anchor is where `mut ` goes before `&this`.
+                    // The receiver's anchor is where `mut ` goes before `&this`,
+                    // or the `const` of a `const &this` that `mut` replaces.
                     const kw: SourceSpan = this.scopes.kw_span_of(this.state.receiver_sym);
-                    if (kw.has_location() && kw.start_line == kw.end_line && kw.start_col == kw.end_col) {
-                        diag = diag.suggest(Suggestion::machine_applicable(kw, "mut ",
+                    if (kw.has_location() && kw.start_line == kw.end_line) {
+                        const written: string = if (kw.start_col == kw.end_col) { "mut " } else { "mut" };
+                        diag = diag.suggest(Suggestion::machine_applicable(kw, written,
                             "declare the receiver `mut &this`"));
                     }
                 } else if (holder_t != null && holder_t.kind == TypeKind::Object) {

@@ -16,7 +16,7 @@ import compiler::ast::{
     ImplTraitAnnotation, LiteralKind, MemberPin, NamedAnnotation, node, ObjectAnnotation,
     ObjectForm, pattern,
     PatternBinding, PatternElement, PatternLiteralFloat, PatternLiteralInt,
-    PatternSub, PatternWildcard, PointerAnnotation, PrimitiveAnnotation,
+    PatternSub, PatternWildcard, PointerAnnotation, PointerMark, PrimitiveAnnotation,
     ProjectionAnnotation, ReferenceAnnotation, statement, ThisTypeAnnotation,
     TupleAnnotation, TypeAnnotation, TypeofAnnotation
 };
@@ -427,22 +427,21 @@ implement struct Parser {
             this.advance();
             mut target: TypeAnnotation* = null;
             const target_tok: Token = this.current();
-            // `as const T*` casts to a pointer-to-const; the const binds
-            // to the first pointer suffix (threaded via
+            // `as const T*` and `as mut T*` cast to a marked pointer; the
+            // mark binds to the first pointer suffix (threaded via
             // parse_type_suffixes_q).
-            mut pending_const: boolean = false;
-            if (this.check(TokenType::KwConst)) {
-                this.advance();
-                pending_const = true;
-            }
+            mut mark: PointerMark = this.parse_pointer_mark();
             // The target's base first, then its suffixes selectively: `x as
             // u64 * 8` is (x as u64) * 8, not x as (u64*) followed by an
             // orphaned 8.  A parenthesized base - function `(T) -> R`, tuple
             // `(T, U)`, unit `()`, grouping `(T)` - is read by the paren
             // parser the annotation grammar uses; parse_base_type has no
             // `(` branch.  A bracketed array type `[T; N]` likewise.
-            if (pending_const && this.check(TokenType::LParen)) {
-                target = this.parse_read_only_group();
+            if (mark.is_written() && this.check(TokenType::LParen)) {
+                target = this.parse_pointee_group(mark);
+                // A group no `*` follows is refused there; its mark binds
+                // nothing.
+                if (!this.check(TokenType::Star)) { mark = PointerMark::Unmarked; }
             } else if (this.check(TokenType::LParen)) {
                 target = this.parse_paren_type();
             } else if (this.check(TokenType::LSquare)) {
@@ -459,9 +458,11 @@ implement struct Parser {
             // start an expression (;  )  }  ]  ,  as  EOF); otherwise it is
             // multiplication.  `?` is unambiguous.
             if (this.check(TokenType::Star) && this.is_star_pointer_suffix()) {
-                target = this.parse_type_suffixes_q(target, pending_const, target_tok);
+                target = this.parse_type_suffixes_q(target, mark, target_tok);
             } else if (!this.check(TokenType::Star)) {
-                target = this.parse_type_suffixes_q(target, pending_const, target_tok);
+                target = this.parse_type_suffixes_q(target, mark, target_tok);
+            } else {
+                this.refuse_unpointed_mark(mark);
             }
             const span: SourceSpan = Parser::merge_spans(expr.span, this.current_span());
             expr = ExpressionNode::cast_expr(expr, target, span);
@@ -2787,19 +2788,28 @@ implement struct Parser {
             return this.parse_object_type();
         }
 
-        // `const T*` FFI pointer-to-const. The `const` qualifies the pointee,
-        // so it binds to the first pointer suffix (`parse_type_suffixes`
-        // consumes the pending flag for the nearest `*`). A `const` with no
-        // following `*` has no representation on a value type and is dropped,
-        // matching C (top-level const on a by-value param is meaningless).
-        if (this.check(TokenType::KwConst)) {
-            const const_tok: Token = this.advance();
+        // `const &T` is `&T`, a read-only borrow written with the keyword
+        // that marks a read-only pointer.
+        if (this.check(TokenType::KwConst) && this.peek_at(1).kind == TokenType::Amp) {
+            this.advance(); // consume `const`
+            return this.parse_reference_type_with_mutability(false);
+        }
+
+        // `const T*` and `mut T*`: the keyword marks the pointee read-only
+        // or writable, so it binds to the first pointer suffix
+        // (`parse_type_suffixes_q` consumes the mark at the nearest `*`). A
+        // `const` with no following `*` has no representation on a value
+        // type and is dropped, matching C (top-level const on a by-value
+        // param is meaningless); a `mut` with none is refused.
+        if (this.check(TokenType::KwConst) || this.check(TokenType::KwMut)) {
+            const mark_tok: Token = this.current();
+            const mark: PointerMark = this.parse_pointer_mark();
             if (this.check(TokenType::LParen)) {
-                return this.parse_read_only_pointer_to_group(const_tok);
+                return this.parse_marked_pointer_to_group(mark, mark_tok);
             }
-            const cbase: TypeAnnotation* = this.parse_base_type();
-            if (cbase == null) { return null; }
-            return this.parse_type_suffixes_q(cbase, true, const_tok);
+            const marked_base: TypeAnnotation* = this.parse_base_type();
+            if (marked_base == null) { return null; }
+            return this.parse_type_suffixes_q(marked_base, mark, mark_tok);
         }
 
         // Base type + optional suffixes
@@ -2809,41 +2819,70 @@ implement struct Parser {
         return this.parse_type_suffixes(base, base_tok);
     }
 
-    /// Parse `const (P)*` after its `const`: a read-only pointer whose
-    /// pointee is the pointer type `P`.  An ungrouped `const` marks the
-    /// innermost pointer of a run, so a group is how a level above it is
-    /// made read-only: `const (const u8*)*` points at read-only pointers to
-    /// read-only bytes.  The group holds one pointer type and is itself
-    /// pointed at; a group of anything else, or one no `*` follows, is
-    /// refused, and parsing goes on with the group as the pointee.
-    parse_read_only_pointer_to_group(mut &this, const_tok: Token) -> TypeAnnotation* {
-        const group: TypeAnnotation* = this.parse_read_only_group();
-        if (group == null) { return null; }
-        return this.parse_type_suffixes_q(group, true, const_tok);
+    /// Consume the `const` or `mut` in front of a pointer type, if one is
+    /// there, and answer the mark it writes.
+    parse_pointer_mark(mut &this) -> PointerMark {
+        if (this.match_tok(TokenType::KwConst)) { return PointerMark::ReadOnly; }
+        if (this.match_tok(TokenType::KwMut)) { return PointerMark::Writable; }
+        return PointerMark::Unmarked;
     }
 
-    /// Parse the group of a `const (P)*`, at its `(`, and refuse a group
-    /// that is not one pointer type, or that no `*` follows.
-    parse_read_only_group(mut &this) -> TypeAnnotation* {
+    /// Parse `const (P)*` or `mut (P)*` after its keyword: a pointer whose
+    /// pointee, the pointer or borrow type `P`, is marked read-only or
+    /// writable.  An ungrouped keyword marks the innermost pointer of a
+    /// run, so a group is how a level above it is marked: `const (const
+    /// u8*)*` points at read-only pointers to read-only bytes.  A borrow is
+    /// grouped because `mut &T*` is a writable borrow of a `T*`.  The group
+    /// holds one pointer or borrow type and is itself pointed at; a group of
+    /// anything else, or one no `*` follows, is refused, and parsing goes on
+    /// with the group as the pointee.
+    parse_marked_pointer_to_group(mut &this, mark: PointerMark, mark_tok: Token) -> TypeAnnotation* {
+        const group: TypeAnnotation* = this.parse_pointee_group(mark);
+        if (group == null) { return null; }
+        if (!this.check(TokenType::Star)) {
+            // Refused by the group already; the mark has no pointer to bind.
+            return this.parse_type_suffixes(group, mark_tok);
+        }
+        return this.parse_type_suffixes_q(group, mark, mark_tok);
+    }
+
+    /// Parse the group of a `const (P)*` or `mut (P)*`, at its `(`, and
+    /// refuse a group that is not one pointer or borrow type, or that no
+    /// `*` follows.
+    parse_pointee_group(mut &this, mark: PointerMark) -> TypeAnnotation* {
         const group_from: i64 = this.pos;
         const open: Token = this.current();
         const group: TypeAnnotation* = this.parse_paren_type();
         if (group == null) { return null; }
         const group_text: string = this.tokens_text(group_from, this.last_consumed_index() + 1);
-        const grouped_pointer: boolean = match (*group) {
-            TypeAnnotation::Pointer(_) => { true }
-            _                          => { false }
+        const grouped_indirection: boolean = match (*group) {
+            TypeAnnotation::Pointer(_)   => { true }
+            TypeAnnotation::Reference(_) => { true }
+            _                            => { false }
         };
-        if (!grouped_pointer) {
+        if (!grouped_indirection) {
             this.report_invalid_at(ErrorCode::E0104_EXPECTED_TYPE, fmt::format(
-                "the parentheses after `const` group a pointer type, and `%s` is not one; a read-only pointer to it is written without them",
-                group_text), this.span_from(open));
+                "the parentheses after `%s` group a pointer or a borrow type, and `%s` is neither; a `%s` pointer to it is written without them",
+                mark.keyword(), group_text, mark.keyword()), this.span_from(open));
         } else if (!this.check(TokenType::Star)) {
             this.report_error(ErrorCode::E0100_EXPECTED_TOKEN, fmt::format(
-                "expected `*` after `const %s`: `const` marks what a pointer points at, so the group must be pointed at",
-                group_text));
+                "expected `*` after `%s %s`: `%s` marks what a pointer points at, so the group must be pointed at",
+                mark.keyword(), group_text, mark.keyword()));
         }
         return group;
+    }
+
+    /// Refuse a `mut` that no pointer follows: it marks what a pointer
+    /// points at, and a value type has nothing it could mark.
+    refuse_unpointed_mark(mut &this, mark: PointerMark) -> void {
+        const refused: boolean = match (mark) {
+            PointerMark::Writable => { true }
+            _                     => { false }
+        };
+        if (refused) {
+            this.report_error(ErrorCode::E0100_EXPECTED_TOKEN,
+                "expected `*` after a type written with `mut`: `mut` marks what a pointer points at, so a pointer must follow");
+        }
     }
 
     /// Parse a trait object type after its `virtual`: `&Trait`, `mut
@@ -3097,21 +3136,23 @@ implement struct Parser {
     /// type the suffixes apply to (a group's `(`, a `const`); each wrapper's
     /// span runs from it through the suffix's last token.
     parse_type_suffixes(mut &this, base: TypeAnnotation*, start: Token) -> TypeAnnotation* {
-        return this.parse_type_suffixes_q(base, false, start);
+        return this.parse_type_suffixes_q(base, PointerMark::Unmarked, start);
     }
 
-    /// As `parse_type_suffixes`, but `pending_const` marks the pointee of the
-    /// nearest `*` suffix as const (`const T*`). The flag is consumed by the
-    /// first pointer only; subsequent levels default to non-const.
+    /// As `parse_type_suffixes`, but `mark` is written in front of the
+    /// type: `const` marks the pointee of the nearest `*` suffix read-only
+    /// (`const T*`), `mut` writable (`mut T*`).  The mark is consumed by the
+    /// first pointer only; subsequent levels are unmarked.  A `mut` no
+    /// pointer consumes is refused.
     ///
     /// A `[` after a type is an array written postfix, `T[]` or `T[N]`,
     /// which is refused: one E0104 for the whole suffix run, carrying the
     /// run rewritten in brackets as its fix.  The run is still read into the
     /// array it spells, so the declaration around it parses on with no
     /// follow-on error.
-    parse_type_suffixes_q(mut &this, base: TypeAnnotation*, pending_const: boolean, start: Token) -> TypeAnnotation* {
+    parse_type_suffixes_q(mut &this, base: TypeAnnotation*, mark: PointerMark, start: Token) -> TypeAnnotation* {
         mut result: TypeAnnotation* = base;
-        mut ptr_const: boolean = pending_const;
+        mut pending: PointerMark = mark;
         // The suffix run rewritten in brackets, once a postfix `[` is read.
         mut postfix_array: boolean = false;
         mut rewritten: string = "";
@@ -3136,10 +3177,10 @@ implement struct Parser {
                 this.advance();
                 const ptr_ann: PointerAnnotation* = new PointerAnnotation {
                     inner:    result,
-                    is_const: ptr_const,
+                    is_const: pending.reads_only(),
                     span:     this.span_from(start),
                 };
-                ptr_const = false; // const binds to the innermost pointer only
+                pending = PointerMark::Unmarked; // a mark binds to the innermost pointer only
                 result = new TypeAnnotation::Pointer(ptr_ann);
                 if (postfix_array) { rewritten = rewritten + "*"; }
             }
@@ -3204,6 +3245,7 @@ implement struct Parser {
                 fmt::format("write `%s`", rewritten)));
             this.ctx.emit_diagnostic(diag);
         }
+        this.refuse_unpointed_mark(pending);
         return result;
     }
 

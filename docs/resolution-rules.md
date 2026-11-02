@@ -164,6 +164,22 @@ yet is recorded with the change that builds it, not here.
      writing more than its trait's positions keeps E0317.  E0307 keeps
      its other refusals.  (Jake)
 
+682. **A pointer is read-only unless it is written `mut`, as a borrow is.**
+     A bare `T*` points at a `T` that is only read through it, and
+     `mut T*` is the pointer that writes; `const T*` stays as a synonym
+     for the read-only form, and `const &T` and `const &this` are accepted
+     as synonyms for `&T` and `&this`.  A write through any read-only form
+     is refused with the codes a write through `const T*` already gets.
+     `mut` marks the pointee of the first `*` after it and groups a level
+     above another pointer as `const` does (ruling 666), so `mut (u8*)*`
+     writes the pointers it points at.  The group also holds a borrow,
+     after either keyword, since `mut &T*` is a writable borrow of a `T*`:
+     `mut (&T)*` is the writable pointer to a borrow, `const (&T)*` the
+     read-only one.  Code that only reads through a pointer keeps the bare
+     form; nothing adds `const` for style.  (Jake for the flip; the
+     grouped borrow is the only spelling it leaves for a writable pointer
+     to a borrow)
+
 ### 2026-11-01
 
 677. **A primitive implements the trait of every operator that applies to

@@ -152,6 +152,7 @@ ParamList          ::= Param ("," Param)* ("," VariadicParam)?
                      | VariadicParam
 Param              ::= Ident ":" Type
                      | "&this" | "mut" "&this"    (* borrowing receiver *)
+                     | "const" "&this"            (* `&this`, written with `const` *)
                      | "this"  | "mut" "this"     (* by-value (consuming) receiver *)
                        (* A method that is not `static` writes its receiver
                           first; one with none is refused (E0118). *)
@@ -448,17 +449,21 @@ PatElem            ::= "_" | "mut"? Ident | Literal
    array is written only in brackets: a type followed by `[` is refused
    (E0104), with the bracketed spelling as its fix.                          *)
 Type               ::= Type "*"                            (* pointer *)
-                     | "const" BaseType "*" ("*")*          (* read-only pointer: the `const`
+                     | PointerMark BaseType "*" ("*")*      (* marked pointer: the keyword
                                                               marks the pointee of the first
                                                               `*`, so `const u8**` is a pointer
-                                                              to read-only pointers *)
-                     | "const" "(" Type ")" "*" ("*")*      (* read-only pointer to a pointer:
-                                                              the group is one pointer type,
-                                                              `const (const u8*)*`; any other
-                                                              group is refused (E0104), and so
-                                                              is one no `*` follows (E0100) *)
+                                                              to read-only pointers; a `mut`
+                                                              no `*` follows is refused (E0100) *)
+                     | PointerMark "(" Type ")" "*" ("*")*  (* marked pointer to a pointer or
+                                                              a borrow: the group is one
+                                                              pointer or borrow type,
+                                                              `const (const u8*)*`,
+                                                              `mut (&T)*`; any other group is
+                                                              refused (E0104), and so is one no
+                                                              `*` follows (E0100) *)
                      | "&" "mut"? Type                     (* reference *)
                      | "mut" "&" Type                      (* mut-ref alt form *)
+                     | "const" "&" Type                    (* `&T`, written with `const` *)
                      | "[" Type "]"                        (* dynamic array *)
                      | "[" Type ";" Expr "]"               (* fixed array; the length is a
                                                               compile-time integer *)
@@ -478,6 +483,8 @@ Type               ::= Type "*"                            (* pointer *)
                                                               belongs to the object, so
                                                               `virtual T**` points at one *)
                      | BaseType
+PointerMark        ::= "const"                             (* the pointee is only read *)
+                     | "mut"                               (* the pointee is written *)
 BaseType           ::= Primitive | "This" | QualName GenericArgs?
 Primitive          ::= "void" | "boolean" | "char" | "string"
                      | "int"  | "i8" | "i16" | "i32" | "i64" | "i128"

@@ -1,0 +1,73 @@
+// The keywords written in front of a pointer or a borrow type.  `mut T*` is
+// a pointer whose pointee is written through it, and `const T*` one whose
+// pointee is only read.  The keyword marks the pointee of the first `*`
+// after it; a level above another pointer, or above a borrow, is marked by
+// grouping that type: `mut (u8*)*` writes the pointers it reaches, `mut
+// (&Node)*` the borrows.  `const &T` is `&T` and `const &this` is `&this`.
+// Each check writes or reads through the form and compares the value on the
+// other side, so a spelling that marked a different level would either be
+// refused or read the wrong value.
+namespace PointerMarkSpellings::Main;
+
+import std::ffi::libc;
+
+type struct Node {
+    v: i64;
+
+    value(const &this) -> i64 { return this.v; }
+
+    doubled(const &this) -> i64 { return this.value() * 2; }
+}
+
+function store(p: mut i64*, v: i64) -> void { *p = v; }
+
+function store_through_slot(slots: mut (mut u8*)*, at: i64, v: u8) -> void {
+    slots[0][at] = v;
+}
+
+function replace_first(slots: mut (u8*)*, with: mut u8*) -> void { *slots = with; }
+
+function rebind(p: mut (&Node)*, to: &Node) -> void { *p = to; }
+
+function read_through_borrow(p: const (&Node)*) -> i64 { return p.v; }
+
+function read_borrow(n: const &Node) -> i64 { return n.v; }
+
+function main() -> i32 {
+    mut x: i64 = 1;
+    store(&x, 41);
+    if (x != 41) { return 1; }
+
+    mut bytes: [u8; 3] = [1, 2, 3];
+    mut writable_slots: [mut u8*] = [&bytes[0]];
+    store_through_slot(&writable_slots[0], 2, 9);
+    if (bytes[2] != 9) { return 2; }
+
+    mut first: [u8; 2] = [1, 2];
+    mut second: [u8; 2] = [7, 8];
+    mut slots: [u8*] = [&first[0]];
+    replace_first(&slots[0], &second[0]);
+    if (slots[0][1] != 8) { return 3; }
+
+    const a: Node = Node { v: 3 };
+    const b: Node = Node { v: 5 };
+    mut held: &Node = &a;
+    rebind(&held, &b);
+    if (held.v != 5) { return 4; }
+    if (read_through_borrow(&held) != 5) { return 5; }
+
+    const by_keyword: const &Node = &a;
+    const plain: &Node = by_keyword;
+    if (read_borrow(plain) + read_borrow(&b) != 8) { return 6; }
+
+    if (a.doubled() != 6) { return 7; }
+
+    mut y: i64 = 0;
+    const erased: void* = &y as void*;
+    const typed: mut i64* = erased as mut i64*;
+    *typed = 12;
+    if (y != 12) { return 8; }
+
+    libc::printf("pointer mark spellings ok\n");
+    return 0;
+}

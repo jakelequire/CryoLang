@@ -70,13 +70,13 @@ public function try_keyword_hover(positions: &docs::Docs, doc: docs::Document*,
     word_buf.truncate(word_len);
     const word_cstr: string = word_buf.as_ptr() as string;
 
-    // Receiver `mut &this` / `mut this`: the `mut` there belongs to the
-    // receiver, not a standalone modifier.  Suppress the keyword doc so the
-    // hover falls through to the AST path, which renders the receiver as
-    // `this: mut &Type` - the same hover `&` and `this` already resolve to,
-    // so the whole `mut &this` reads as one receiver.
-    if (libc::strcmp(word_cstr, "mut") == 0
-            && KeywordLookup::mut_begins_this_receiver(ptr, len, end)) {
+    // Receiver `mut &this` / `mut this` / `const &this`: the keyword there
+    // belongs to the receiver, not a standalone modifier.  Suppress the
+    // keyword doc so the hover falls through to the AST path, which renders
+    // the receiver as `this: mut &Type` - the same hover `&` and `this`
+    // already resolve to, so the whole `mut &this` reads as one receiver.
+    if ((libc::strcmp(word_cstr, "mut") == 0 || libc::strcmp(word_cstr, "const") == 0)
+            && KeywordLookup::keyword_begins_this_receiver(ptr, len, end)) {
         mem::drop(word_buf);
         return Option::None;
     }
@@ -122,15 +122,15 @@ public function try_keyword_hover(positions: &docs::Docs, doc: docs::Document*,
 
 type struct KeywordLookup {
 
-/// True when the bytes starting at `after_mut` (the position just past a
-/// `mut` keyword) begin a `this` receiver: `mut &this` or the bare
-/// `mut this`.  Skips intervening whitespace and an optional `&`, then
-/// requires the exact word `this` at a word boundary.  Used to route a
-/// hover on the `mut` of a receiver to the receiver hover instead of the
-/// `mut` keyword doc.  A `mut &T` reference parameter (non-`this`) fails
-/// the `this` check and keeps its keyword doc.
-static mut_begins_this_receiver(ptr: u8*, len: i64, after_mut: i64) -> boolean {
-    mut p: i64 = after_mut;
+/// True when the bytes starting at `after_keyword` (the position just past
+/// a `mut` or `const` keyword) begin a `this` receiver: `mut &this`,
+/// `const &this` or the bare `mut this`.  Skips intervening whitespace and
+/// an optional `&`, then requires the exact word `this` at a word boundary.
+/// Used to route a hover on the keyword of a receiver to the receiver hover
+/// instead of the keyword doc.  A `mut &T` reference parameter (non-`this`)
+/// fails the `this` check and keeps its keyword doc.
+static keyword_begins_this_receiver(ptr: u8*, len: i64, after_keyword: i64) -> boolean {
+    mut p: i64 = after_keyword;
     while (p < len && ptr[p].is_whitespace()) { p = p + 1; }
     // Optional `&` (0x26), then more whitespace.
     if (p < len && ptr[p] == 38 as u8) {
@@ -233,7 +233,7 @@ static lookup_keyword_doc(s: string) -> string {
         return "## where\nAttaches trait bounds to generic parameters.\n\n### Syntax\n```cryo\nfunction max<T>(a: T, b: T) -> T where T: Ord {\n    if (a > b) { return a; }\n    return b;\n}\n```\n\n### Notes\n- Multiple bounds: `where T: Ord, U: Drop`\n- `where`-clauses go between the parameter list and the return type or body";
     }
     if (s == "const") {
-        return "## const\nImmutable binding. The value cannot be reassigned, and the binding holds for the entire scope.\n\n### Syntax\n```cryo\nconst PI: f64 = 3.14159;\nconst name: Str = Str::from(\"cryo\");\n```\n\n### Notes\n- Top-level `const` is a global with static storage\n- Local `const` is a stack binding the compiler treats as immutable\n- For mutable bindings, use `mut`";
+        return "## const\nImmutable binding. The value cannot be reassigned, and the binding holds for the entire scope.\n\n### Syntax\n```cryo\nconst PI: f64 = 3.14159;\nconst name: Str = Str::from(\"cryo\");\n```\n\n### Notes\n- Top-level `const` is a global with static storage\n- Local `const` is a stack binding the compiler treats as immutable\n- For mutable bindings, use `mut`\n- In a type, `const T*` is a pointer whose pointee is only read, and `const (u8*)*` marks the level above a grouped pointer or borrow\n- `const &T` is `&T`, and `const &this` is `&this`";
     }
     if (s == "static") {
         return "## static\nDeclares a static method on a type, or - outside `implement` blocks - a static-storage global.\n\n### Syntax\n```cryo\nimplement Point {\n    static origin() -> Point { return Point { x: 0, y: 0 }; }\n}\n```\n\n### Notes\n- Static methods have no `&this` receiver - call them as `Point::origin()`\n- Free `static` globals live for the program's lifetime";
@@ -303,7 +303,7 @@ static lookup_keyword_doc(s: string) -> string {
         return "## protected\nNot part of Cryo: refused (E0117).\n\n### Instead\nWrite `private:` (visible within the module) or `public:`.";
     }
     if (s == "mut") {
-        return "## mut\nMarks a binding, parameter, or receiver as mutable.\n\n### Syntax\n```cryo\nmut count: i32 = 0;\nfunction push(mut &this, v: i32) -> void { ... }\n```\n\n### Notes\n- `mut x` - the binding can be reassigned\n- `mut &this` - the method can mutate the receiver\n- `mut &T` - a mutable reference to `T`\n- `mut x: T = ...;` is the local-variable form; pair with `const` for immutable bindings";
+        return "## mut\nMarks a binding, parameter, or receiver as mutable.\n\n### Syntax\n```cryo\nmut count: i32 = 0;\nfunction push(mut &this, v: i32) -> void { ... }\n```\n\n### Notes\n- `mut x` - the binding can be reassigned\n- `mut &this` - the method can mutate the receiver\n- `mut &T` - a mutable reference to `T`\n- `mut T*` - a pointer whose pointee is written through it; `mut (u8*)*` and `mut (&T)*` mark the level above a grouped pointer or borrow\n- `mut x: T = ...;` is the local-variable form; pair with `const` for immutable bindings";
     }
     if (s == "move") {
         return "## move\nLambda prefix that opts a closure into capture-by-move semantics: each non-Copy capture consumes the outer binding at the lambda's construction site, the synthesized closure-struct takes ownership of the value, and its Drop releases it at scope exit.\n\n### Syntax\n```cryo\nconst p: SomeOwning = ...;\nconst f = move () -> i32 { return p.field; };\n// `p` is consumed here; using it below is E0452.\n```\n\n### Notes\n- Sema flips a lambda's `is_move` flag automatically whenever a non-Copy capture is taken, so the keyword is **optional** for the common case\n- Useful as an explicit signal when handing closures to `thread::spawn` or any API where capture-by-move makes the consumption visible at the call site\n- Has no effect on a Copy-only closure (Copy types don't drop), so writing `move` there is a harmless documentation marker";
