@@ -146,6 +146,15 @@ yet is recorded with the change that builds it, not here.
      where-clause is checked at an instance call as a free function's is
      (E0306 at the call).  (Jake)
 
+678. **A bound writing more trait arguments than its trait has positions
+     is refused where it is written, under a code of its own.**  The
+     positions are the trait's type parameters, then its own associated
+     types; a supertrait's associated types are not among them.  The
+     refusal is E0317, at the bound - a where clause's, a supertrait, an
+     associated type's declared bound - and the bound is not checked
+     again at a call.  (Jake for the new code; its number, wording and
+     reach delegated)
+
 ### 2026-10-31
 
 676. **A parameter an implementation lends its methods is the call's, its

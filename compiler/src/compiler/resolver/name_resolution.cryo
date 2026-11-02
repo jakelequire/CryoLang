@@ -1846,7 +1846,8 @@ type struct NameResolver {
     /// Only a definition is an identity.  A type parameter leaves the field
     /// empty.  A spelling that names nothing is refused where it is written,
     /// as a trait (E0242): a bound or a supertrait no trait answers would
-    /// otherwise compile until something asks it for a method.
+    /// otherwise compile until something asks it for a method.  So is one
+    /// writing more arguments than its trait has positions (E0317).
     stamp_trait_ref_identity(mut &this, tref: TraitRef*) -> void {
         if (tref == null || tref.path.length() == 0) { return; }
         if (tref.resolved.is_valid()) { return; }
@@ -1858,7 +1859,10 @@ type struct NameResolver {
         match (this.type_spelling_res(spelled, tref.span)) {
             ResSlot::Answered(r) => {
                 match (r) {
-                    Res::Def(q) => { tref.resolved = q; }
+                    Res::Def(q) => {
+                        tref.resolved = q;
+                        this.refuse_bound_argument_count(tref);
+                    }
                     _           => { }
                 }
             }
@@ -2375,16 +2379,8 @@ type struct NameResolver {
         const expected: i64 = decl.generic_params.length() + decl.assoc_types.length();
         if (written == expected) { return; }
         o.refused = true;
-        const intern: InternTable* = this.resolver.intern_table;
-        mut names: string = "";
-        for (mut i: i64 = 0; i < decl.generic_params.length(); i++) {
-            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(decl.generic_params[i]);
-            names = names + (if (names.length() > 0) { ", " } else { "" }) + "`" + intern.resolve(gp.name) + "`";
-        }
-        for (mut i: i64 = 0; i < decl.assoc_types.length(); i++) {
-            names = names + (if (names.length() > 0) { ", " } else { "" }) + "`" + intern.resolve(decl.assoc_types[i].name) + "`";
-        }
-        const shown: string = intern.resolve(decl.name);
+        const names: string = this.trait_positions_shown(decl);
+        const shown: string = this.resolver.intern_table.resolve(decl.name);
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
             fmt::format("`%s` takes %lld type argument%s in an object type, and %lld %s written",
                 shown, expected, if (expected == 1) { "" } else { "s" }, written,
@@ -2394,6 +2390,52 @@ type struct NameResolver {
             d = d.with_note(fmt::format("an object type writes the trait's type parameters, then its associated types, in the order they are declared: %s", names));
         }
         this.ctx.emit_diagnostic(d);
+    }
+
+    /// E0317 at a bound - a where clause's, a supertrait, an associated
+    /// type's declared bound - that writes more type arguments than its
+    /// trait has parameters and associated types together.  The arguments
+    /// fill the parameters, then the associated types, in the order the
+    /// trait declares them; one past them fills nothing.  A supertrait's
+    /// associated types are not positions of the trait's.  The bound is
+    /// refused, so a call it is unmet at does not report it again.
+    refuse_bound_argument_count(&this, tref: TraitRef*) -> void {
+        const decl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(tref.resolved);
+        if (decl == null) { return; }
+        const most: i64 = decl.generic_params.length() + decl.assoc_types.length();
+        const written: i64 = tref.type_args.length();
+        if (written <= most) { return; }
+        tref.refused = true;
+        const shown: string = this.resolver.intern_table.resolve(decl.name);
+        const counted: string = if (most == 0) {
+            "no type arguments"
+        } else {
+            fmt::format("at most %lld type argument%s", most, if (most == 1) { "" } else { "s" })
+        };
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0317_TOO_MANY_TRAIT_ARGUMENTS,
+            fmt::format("`%s` takes %s in a bound, and %lld %s written",
+                shown, counted, written, if (written == 1) { "is" } else { "are" }));
+        d = d.at_with_label(tref.span, "too many type arguments");
+        if (most > 0) {
+            d = d.with_note(fmt::format("a bound writes the trait's type parameters, then its own associated types, in the order they are declared: %s",
+                this.trait_positions_shown(decl)));
+        }
+        this.ctx.emit_diagnostic(d);
+    }
+
+    /// The trait's type parameters, then its associated types, as a
+    /// diagnostic lists them: "`Idx`, `Output`".
+    trait_positions_shown(&this, decl: TraitDecl*) -> string {
+        const intern: InternTable* = this.resolver.intern_table;
+        mut names: string = "";
+        for (mut i: i64 = 0; i < decl.generic_params.length(); i++) {
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(decl.generic_params[i]);
+            names = names + (if (names.length() > 0) { ", " } else { "" }) + "`" + intern.resolve(gp.name) + "`";
+        }
+        for (mut i: i64 = 0; i < decl.assoc_types.length(); i++) {
+            names = names + (if (names.length() > 0) { ", " } else { "" }) + "`" + intern.resolve(decl.assoc_types[i].name) + "`";
+        }
+        return names;
     }
 
     /// E0316 at a trait object in an `extern` function's signature: the C
