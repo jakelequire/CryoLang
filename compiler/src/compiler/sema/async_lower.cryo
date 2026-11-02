@@ -602,8 +602,8 @@ type struct AsyncLower {
         return -1;
     }
 
-    wire(mut &this, arena: TypeArena*, intern: mut InternTable*, ctx: mut CompilationContext*,
-         patterns: PatternResolver*, literals: LiteralResolver*,
+    wire(mut &this, arena: mut TypeArena*, intern: mut InternTable*, ctx: mut CompilationContext*,
+         patterns: mut PatternResolver*, literals: LiteralResolver*,
          members: MemberResolver*) -> void {
         this.arena    = arena;
         this.intern   = intern;
@@ -928,7 +928,7 @@ type struct AsyncLower {
     /// The base is spelled canonically for the reason `lookup_future_type`
     /// gives: this annotation is emitted by the lowering, so the module being
     /// lowered does not get to say what `Poll` means in it.
-    poll_type_ann(mut &this, arg: mut TypeAnnotation*, span: SourceSpan) -> TypeAnnotation* {
+    poll_type_ann(mut &this, arg: mut TypeAnnotation*, span: SourceSpan) -> mut TypeAnnotation* {
         const poll_q: SymbolStr = this.poll_identity();
         mut gen: GenericAnnotation* = new GenericAnnotation {
             base: this.named_ann_def(poll_q,
@@ -1395,7 +1395,7 @@ type struct AsyncLower {
     /// Replace the top-level `await e` in a carrier statement with `repl` (the
     /// identifier bound to the awaited result). The carrier then runs, on
     /// resume, reading the result instead of the (removed) await.
-    rewrite_carrier_await(&this, stmt: Stmt*, repl: ExpressionNode*) -> void {
+    rewrite_carrier_await(&this, stmt: Stmt*, repl: mut ExpressionNode*) -> void {
         if (stmt == null) { return; }
         match (stmt.kind) {
             StmtKind::Decl(ds) => {
@@ -1657,7 +1657,7 @@ type struct AsyncLower {
 
     /// Declare a synthetic local nothing needs to name by identity afterwards.
     var_decl_stmt(mut &this, name: SymbolStr, mutable: boolean, ty: TypeRef,
-                  init: ExpressionNode*, span: SourceSpan) -> Stmt* {
+                  init: mut ExpressionNode*, span: SourceSpan) -> Stmt* {
         return this.var_decl_stmt_bound(
             name, this.resolver.alloc_synthetic_binding(),
             mutable, ty, init, span);
@@ -1668,7 +1668,7 @@ type struct AsyncLower {
     /// not a later one that reuses the spelling.
     var_decl_stmt_bound(mut &this, name: SymbolStr, sym: SymbolID,
                         mutable: boolean, ty: TypeRef,
-                        init: ExpressionNode*, span: SourceSpan) -> Stmt* {
+                        init: mut ExpressionNode*, span: SourceSpan) -> Stmt* {
         mut vd: mut VarDecl* = VarDecl::new(name);
         const vd_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(vd), span);
         vd.set_sym_id(sym);
@@ -1707,13 +1707,13 @@ type struct AsyncLower {
                     this.param_field_type(sm, slot_ty), sm.struct_ref, true, span), p.sym_id));
                 continue;
             }
-            const access: ExpressionNode* = this.own_field(sm.struct_ref, fname, slot_ty, span);
+            const access: mut ExpressionNode* = this.own_field(sm.struct_ref, fname, slot_ty, span);
             mut shadow: mut VarDecl* = VarDecl::new(fname);
             const shadow_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(shadow), span);
             shadow.set_sym_id(this.resolver.alloc_synthetic_binding());
             shadow.set_mutable(false);
             shadow.set_resolved_type(slot_ty);
-            shadow.set_initializer(access as ExpressionNode*);
+            shadow.set_initializer(access);
             const shadow_stmt: Stmt* = Stmt::decl_stmt(shadow_decl, span);
             body.add_statement(this.stand_in(shadow_stmt, p.sym_id));
         }
@@ -1922,7 +1922,7 @@ type struct AsyncLower {
     /// type the name had in the body, so the rewritten expression type-checks
     /// exactly where the original did.
     subst_target(mut &this, field: SymbolStr, struct_ref: TypeRef, ty: TypeRef,
-                 span: SourceSpan) -> ExpressionNode* {
+                 span: SourceSpan) -> mut ExpressionNode* {
         if (this.subst_mode == this.subst_to_local()) {
             return this.ident_bound(field, this.subst_local_sym, ty, span);
         }
@@ -1940,7 +1940,7 @@ type struct AsyncLower {
     /// empty the field at that site: `take` clears the discriminant, leaving
     /// exactly one owner. Aliasing the payload instead would give the callee
     /// and the field each a claim on it, and both would run its destructor.
-    subst_giveaway_target(mut &this, ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
+    subst_giveaway_target(mut &this, ty: TypeRef, span: SourceSpan) -> mut ExpressionNode* {
         mut fld: mut ExpressionNode* = this.carrier_field_expr(span);
         mut take_call: mut ExpressionNode* =
             this.method_call0(fld, LangItem::OptionTake, this.subst_carrier_opt, span);
@@ -1969,7 +1969,7 @@ type struct AsyncLower {
     /// would point at `async function f()` instead of at the line that handed
     /// the value away, naming a place the reader cannot find.
     hoist_giveaway(mut &this, name: SymbolStr, ty: TypeRef, use_span: SourceSpan,
-                   span: SourceSpan) -> ExpressionNode* {
+                   span: SourceSpan) -> mut ExpressionNode* {
         // No list to receive the declaration, or a position that only runs on
         // some paths: keep the take inline, exactly as before this existed.
         if (this.subst_cond_depth > 0 || !this.subst_can_hoist) {
@@ -2397,7 +2397,7 @@ type struct AsyncLower {
         return null;
     }
 
-    set_decl_stmt_init(&this, ds: DeclStmt*, init: ExpressionNode*) -> void {
+    set_decl_stmt_init(&this, ds: DeclStmt*, init: mut ExpressionNode*) -> void {
         if (ds == null || ds.declaration == null) { return; }
         if (DeclarationNode::var_of(ds.declaration) != null) {
             (DeclarationNode::var_of(ds.declaration)).initializer = init;
@@ -3254,7 +3254,7 @@ type struct AsyncLower {
         const subp_sym: SymbolStr = this.intern.intern(fmt::format("__subp_%lld", k));
         const subp_id:  SymbolID  = this.resolver.alloc_synthetic_binding();
         const fi_ptr: TypeRef = this.arena.get_pointer_to(fi);
-        mut subp_call: ExpressionNode* = this.method_call0(
+        mut subp_call: mut ExpressionNode* = this.method_call0(
             this.own_field(sm.struct_ref, fut_sym, fut_opt, span),
             LangItem::OptionUnwrapPtr, fi_ptr, span);
         sm.blocks[resume].as_block().add_statement(
@@ -3284,7 +3284,7 @@ type struct AsyncLower {
             this.ctx.generic_registry.instantiate(sm.poll_base, &sub_poll_args);
         const poll_sym: SymbolStr = this.intern.intern(fmt::format("__poll_%lld", k));
         const poll_id:  SymbolID  = this.resolver.alloc_synthetic_binding();
-        mut poll_call: ExpressionNode* = this.method_call1(
+        mut poll_call: mut ExpressionNode* = this.method_call1(
             this.ident_bound(subp_sym, subp_id, fi_ptr, span), LangItem::FuturePoll,
             this.ident_bound(sm.cx_sym, this.poll_cx, sm.ctx_ptr_ty, span), sub_poll_out, span);
         sm.blocks[resume].as_block().add_statement(
@@ -3307,7 +3307,7 @@ type struct AsyncLower {
         // loop awaiting again finds the slot empty: the rebuild assigns over the
         // field, and an assignment overwrites without dropping what was there.
         const done_sym: SymbolStr = this.intern.intern(fmt::format("__done_%lld", k));
-        mut done_take: ExpressionNode* = this.method_call0(
+        mut done_take: mut ExpressionNode* = this.method_call0(
             this.own_field(sm.struct_ref, fut_sym, fut_opt, span),
             LangItem::OptionTake, fut_opt, span);
         sm.blocks[resume].as_block().add_statement(this.var_decl_stmt(done_sym, true, fut_opt, done_take, span));
@@ -4834,7 +4834,7 @@ type struct AsyncLower {
                   span: SourceSpan) -> Stmt* {
         mut fld: mut ExpressionNode* = this.own_field(struct_ref, field, opt_ty, span);
         mut take_call: mut ExpressionNode* = this.method_call0(fld, LangItem::OptionTake, opt_ty, span);
-        mut unwrap_call: ExpressionNode* = this.method_call0(take_call, LangItem::OptionUnwrap, lty, span);
+        mut unwrap_call: mut ExpressionNode* = this.method_call0(take_call, LangItem::OptionUnwrap, lty, span);
         return this.var_decl_stmt_bound(name, sym, mutable, lty, unwrap_call, span);
     }
 
@@ -4850,7 +4850,7 @@ type struct AsyncLower {
                       opt_ty: TypeRef, lty_ptr: TypeRef, span: SourceSpan) -> Stmt* {
         mut fld: mut ExpressionNode* = this.own_field(
             sm.struct_ref, field, opt_ty, span);
-        mut call: ExpressionNode* = this.method_call0(fld, LangItem::OptionUnwrapPtr, lty_ptr, span);
+        mut call: mut ExpressionNode* = this.method_call0(fld, LangItem::OptionUnwrapPtr, lty_ptr, span);
         return this.var_decl_stmt(ptr_name, true, lty_ptr, call, span);
     }
 
@@ -5186,7 +5186,7 @@ type struct AsyncLower {
     /// the block's reads of a promoted local reach the reloaded value.
     prepend_load(mut &this, blk: Stmt*, name: SymbolStr, key: SymbolID,
                  field: SymbolStr, ty: TypeRef, struct_ref: TypeRef, span: SourceSpan) -> void {
-        mut ld: ExpressionNode* = this.own_field(struct_ref, field, ty, span);
+        mut ld: mut ExpressionNode* = this.own_field(struct_ref, field, ty, span);
         mut rebuilt: [Stmt*] = [this.stand_in(this.var_decl_stmt(name, false, ty, ld, span), key)];
         for (mut i: i64 = 0; i < blk.as_block().statements.length(); i++) { rebuilt.push(blk.as_block().statements[i]); }
         blk.as_block().statements = rebuilt;
@@ -5935,7 +5935,7 @@ type struct AsyncLower {
 
     /// `!(<e>)`. Marked synthetic for the same reason `deref`/`addr_of` are: the
     /// checks that constrain user syntax skip compiler-built nodes.
-    not_expr(&this, e: mut ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
+    not_expr(&this, e: mut ExpressionNode*, span: SourceSpan) -> mut ExpressionNode* {
         const bang: Token = Token::new(TokenType::Exclaim, "!",
                                        span.start_line as int, span.start_col as int);
         mut u: mut ExpressionNode* = ExpressionNode::synthetic_unary(bang, e, span);
@@ -5992,8 +5992,8 @@ type struct AsyncLower {
     /// (`force`) and it is not a pure read. Returns what the parent should hold
     /// in its place.
     hoist_operand(mut &this, e: mut ExpressionNode*, force: boolean,
-                  pre: mut HoistPre*) -> ExpressionNode* {
-        mut r: ExpressionNode* = this.hoist_expr(e, pre);
+                  pre: mut HoistPre*) -> mut ExpressionNode* {
+        mut r: mut ExpressionNode* = this.hoist_expr(e, pre);
         if (!force || r == null) { return r; }
         if (this.await_transparent(r)) { return r; }
         const ty: TypeRef = r.resolved_type;
@@ -6209,7 +6209,7 @@ type struct AsyncLower {
     /// — an index, the object of a member access — are lifted. Lifting the place
     /// itself would assign to a copy.
     hoist_place(mut &this, e: mut ExpressionNode*, force: boolean,
-                pre: mut HoistPre*) -> ExpressionNode* {
+                pre: mut HoistPre*) -> mut ExpressionNode* {
         if (e == null) { return null; }
         mut place_hoist_aa: mut ArrayAccessExpr* = ExpressionNode::array_access_of(e);
         if (place_hoist_aa != null) {
@@ -6240,7 +6240,7 @@ type struct AsyncLower {
     hoist_short_circuit(mut &this, e: ExpressionNode*, b: BinaryExpr*, pre: mut HoistPre*) -> mut ExpressionNode* {
         const span: SourceSpan = e.span;
         const bool_ty: TypeRef = this.arena.get_bool();
-        mut left: ExpressionNode* = this.hoist_expr(b.left, pre);
+        mut left: mut ExpressionNode* = this.hoist_expr(b.left, pre);
         const t: MintedLocal = this.mint_temp("__sc");
         pre.push(this.var_decl_stmt_bound(t.name, t.sym, true, bool_ty, left, span));
 
@@ -7420,7 +7420,7 @@ type struct AsyncLower {
             this.ctx.defs.leaf_of(exec_id).spelling(), this.intern.intern("new"), span);
         ExpressionNode::scope_resolution_of(ex_scope).set_synthesized_ref(ex_scope, exec_ty,
             this.ctx.decl_index.def_of(exec_ty, this.ctx.type_arena));
-        mut ex_new: ExpressionNode* = ExpressionNode::call_expr(
+        mut ex_new: mut ExpressionNode* = ExpressionNode::call_expr(
             ex_scope, span);
         mut ex_decl: mut VarDecl* = VarDecl::new(ex_sym);
         ex_decl.set_sym_id(this.resolver.alloc_synthetic_binding());
@@ -7607,7 +7607,7 @@ type struct AsyncLower {
         if (owner.method != null && !DeclarationNode::method_of(owner.method).is_static && owner.ty.is_valid()) {
             mut recv: mut VarDecl* = null;
             for (mut i: i64 = 0; i < node.parameters.length(); i++) {
-                const p: VarDecl* = DeclarationNode::var_of(node.parameters[i]);
+                const p: mut VarDecl* = DeclarationNode::var_of(node.parameters[i]);
                 if (this.is_receiver_param(p)) { recv = p; }
             }
             if (recv == null) {
@@ -7916,7 +7916,7 @@ type struct AsyncLower {
         f.visibility = Visibility::Public;
         f.resolved_type = ty;
         if (d.generic) {
-            mut ann: TypeAnnotation* = this.type_ann_for(ty, &d.fut_params, span);
+            mut ann: mut TypeAnnotation* = this.type_ann_for(ty, &d.fut_params, span);
             if (ann == null) {
                 this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
                     fmt::format("async: a generic `async function` cannot carry a value of type `%s` across a suspend; give it a concrete type",

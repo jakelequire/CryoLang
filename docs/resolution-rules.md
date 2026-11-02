@@ -200,6 +200,16 @@ yet is recorded with the change that builds it, not here.
      write through a read-only pointer says to take a `mut T*`.  (the
      printing follows ruling 682's spelling; no question was put)
 
+685. **A read-only pointer never fills a writable slot, whether or not a
+     pointee is a type parameter.**  A `T*` (or a `&T`) does not become a
+     `mut T*` by assignment, by a struct literal's field, by a field's
+     default or by an argument, in a generic body as in any other; the
+     only way across is an explicit `as`.  A generic body is checked once,
+     against its own parameters, and its copies are not checked again, so
+     a pair the body's check skipped would never be judged.  The argument
+     note says the parameter writes through the pointer and to pass a
+     `mut` one.  (Jake)
+
 ### 2026-11-01
 
 677. **A primitive implements the trait of every operator that applies to

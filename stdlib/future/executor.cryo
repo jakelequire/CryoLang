@@ -133,7 +133,7 @@ private function detach_shared<O>(sh: mut TaskShared<O>*) -> void {
         if (outcome == OUTCOME_READY) {
             ptr::drop_in_place::<O>(&sh.result);
         }
-        alloc.deallocate(NonNull::new(sh as u8*), Layout::of::<TaskShared<O>>());
+        alloc.deallocate(NonNull::new(sh as mut u8*), Layout::of::<TaskShared<O>>());
     }
     // else: task still running; it frees the block when it observes GONE.
 }
@@ -144,12 +144,12 @@ private function detach_shared<O>(sh: mut TaskShared<O>*) -> void {
 /// 0, the `TaskCtl`). `next` links the ready queue; `exec` lets a `Waker` reach
 /// the queue/condvars; `run_state` is the concurrent-poll guard (module doc).
 private type struct Task {
-    private poll_fn:    (u8*, u8*, Context*) -> u8;   // (fut, shared, cx) -> 1 Ready / 0 Pending
-    private drop_fn:    (u8*) -> void;                 // drop the boxed future, free its box
-    private dispose_fn: (u8*, u8) -> void;             // (shared, drop_result) -> free the shared block
-    private fut:        u8*;
-    private shared:     u8*;
-    private next:       Task*;
+    private poll_fn:    (mut u8*, mut u8*, Context*) -> u8;   // (fut, shared, cx) -> 1 Ready / 0 Pending
+    private drop_fn:    (mut u8*) -> void;                     // drop the boxed future, free its box
+    private dispose_fn: (mut u8*, u8) -> void;                 // (shared, drop_result) -> free the shared block
+    private fut:        mut u8*;
+    private shared:     mut u8*;
+    private next:       mut Task*;
     private exec:       mut ExecInner*;
     private run_state:  Atomic<u8>;
 
@@ -158,11 +158,11 @@ private type struct Task {
     /// `next` is unlinked; the vtable fn-ptrs are the future's monomorphized
     /// thunks. Returned by value and moved into an `Arc<Task>`, whose raw
     /// value pointer every `Task*` then is.
-    private static new(poll_fn:    (u8*, u8*, Context*) -> u8,
-               drop_fn:    (u8*) -> void,
-               dispose_fn: (u8*, u8) -> void,
-               fut:        u8*,
-               shared:     u8*,
+    private static new(poll_fn:    (mut u8*, mut u8*, Context*) -> u8,
+               drop_fn:    (mut u8*) -> void,
+               dispose_fn: (mut u8*, u8) -> void,
+               fut:        mut u8*,
+               shared:     mut u8*,
                exec:       mut ExecInner*) -> Task {
         return Task {
             poll_fn:    poll_fn,
@@ -236,7 +236,7 @@ private type struct Task {
     private finish(mut &this, outcome: u8) -> void {
         const ctl:  mut TaskCtl*      = this.shared as mut TaskCtl*;
         const exec: ExecInner*    = this.exec;
-        const df:   (u8*) -> void = this.drop_fn;
+        const df:   (mut u8*) -> void = this.drop_fn;
         df(this.fut);
         this.fut = null;
         ctl.outcome.store(outcome, MemoryOrder::Release);
@@ -244,7 +244,7 @@ private type struct Task {
         if (prev == HS_HANDLE_GONE) {
             // No handle will read the block: dispose it here (drop the stored
             // result only on READY). This swap was our last touch of the block.
-            const disp: (u8*, u8) -> void = this.dispose_fn;
+            const disp: (mut u8*, u8) -> void = this.dispose_fn;
             mut drop_result: u8 = 0;
             if (outcome == OUTCOME_READY) { drop_result = 1; }
             disp(this.shared, drop_result);
@@ -305,7 +305,7 @@ private type struct ExecInner {
     private done_lock:  Mutex<()>;
     private task_done:  CondVar;     // joiners wait here for a task to finish
     private reactor: mut Reactor*; // the I/O driver this pool's workers publish while polling
-    private blocking: BlockingPool*;   // where workers offload calls the reactor cannot drive
+    private blocking: mut BlockingPool*;   // where workers offload calls the reactor cannot drive
 
     /// Link `task` at the tail of the ready queue and wake one worker. The
     /// caller has already set `task.run_state = ST_SCHEDULED`, so a concurrent
@@ -432,9 +432,9 @@ private function task_wake(data: u8*) -> void {
 /// poll call plus a slot for its status byte. All-`Copy` (fn-ptr + raw pointers),
 /// so it owns nothing and is never dropped.
 private type struct PollCtx {
-    private poll_fn: (u8*, u8*, Context*) -> u8;
-    private fut:     u8*;
-    private shared:  u8*;
+    private poll_fn: (mut u8*, mut u8*, Context*) -> u8;
+    private fut:     mut u8*;
+    private shared:  mut u8*;
     private cx:      Context*;
     private status:  u8;
 }
@@ -446,7 +446,7 @@ private type struct PollCtx {
 /// fn-ptr, so it must be a free function. Mirrors `panic_unwind::run_catch_body`.
 private function run_poll(data: u8*) -> void {
     const pc: mut PollCtx* = data as mut PollCtx*;
-    const pf: (u8*, u8*, Context*) -> u8 = pc.poll_fn;
+    const pf: (mut u8*, mut u8*, Context*) -> u8 = pc.poll_fn;
     pc.status = pf(pc.fut, pc.shared, pc.cx);
 }
 
@@ -456,7 +456,7 @@ private function run_poll(data: u8*) -> void {
 /// compile error / undefined symbols under `--panic=abort`. Must be a file-scope
 /// free function — ConfigGating strips declarations, not method bodies.
 ![config(panic_unwind)]
-private function poll_boundary(poll_fn: (u8*, u8*, Context*) -> u8, fut: u8*, shared: u8*,
+private function poll_boundary(poll_fn: (mut u8*, mut u8*, Context*) -> u8, fut: mut u8*, shared: mut u8*,
                        cx: Context*, out_panic: mut PanicInfo*) -> u8 {
     mut pc: PollCtx = PollCtx { poll_fn: poll_fn, fut: fut, shared: shared,
                                cx: cx, status: 0 };
@@ -473,7 +473,7 @@ private function poll_boundary(poll_fn: (u8*, u8*, Context*) -> u8, fut: u8*, sh
 /// aborts the whole process (the accepted degradation — no per-task isolation
 /// without unwinding). `out_panic` is unused here.
 ![config(not(panic_unwind))]
-private function poll_boundary(poll_fn: (u8*, u8*, Context*) -> u8, fut: u8*, shared: u8*,
+private function poll_boundary(poll_fn: (mut u8*, mut u8*, Context*) -> u8, fut: mut u8*, shared: mut u8*,
                        cx: Context*, out_panic: PanicInfo*) -> u8 {
     return poll_fn(fut, shared, cx);
 }
@@ -485,7 +485,7 @@ private function poll_boundary(poll_fn: (u8*, u8*, Context*) -> u8, fut: u8*, sh
 /// `thread_body` idiom). Reports readiness as a byte (1 Ready, 0 Pending). A
 /// vtable fn-ptr, addressed via the generic-function-reference mechanism (proven
 /// by `thread::thread_trampoline`), so it must be a free function.
-private function task_poll_thunk<F, O>(fut_raw: u8*, shared_raw: u8*, cx: Context*) -> u8
+private function task_poll_thunk<F, O>(fut_raw: mut u8*, shared_raw: mut u8*, cx: Context*) -> u8
 where F: Future<O> {
     const fut: F* = fut_raw as F*;
     match (fut.poll(cx)) {
@@ -507,7 +507,7 @@ where F: Future<O> {
 /// `F` to *declare* a `drop` method, which a hand-written future may but a
 /// compiler-generated one (an `async function`'s state machine) never does. A
 /// vtable fn-ptr, so a free function.
-private function task_drop_thunk<F>(fut_raw: u8*) -> void {
+private function task_drop_thunk<F>(fut_raw: mut u8*) -> void {
     const fut: F* = fut_raw as F*;
     // Sound because the box is released below without running the pointee's
     // destructor, so taking the future out leaves exactly one owner.
@@ -522,7 +522,7 @@ private function task_drop_thunk<F>(fut_raw: u8*) -> void {
 /// drop the stored `result` (only valid on the READY path), then free the block.
 /// The one shared-block op the type-erased executor cannot do without `O`, so it
 /// is captured as a per-`O` vtable fn-ptr.
-private function dispose_shared_thunk<O>(shared_raw: u8*, drop_result: u8) -> void {
+private function dispose_shared_thunk<O>(shared_raw: mut u8*, drop_result: u8) -> void {
     const sh: TaskShared<O>* = shared_raw as TaskShared<O>*;
     if (drop_result == 1) {
         ptr::drop_in_place::<O>(&sh.result);
@@ -577,7 +577,7 @@ where F: Future<O> {
     match (alloc.allocate(Layout::of::<F>())) {
         Result::Ok(raw) => { fbox = raw.cast::<F>().as_ptr(); }
         Result::Err(_)  => {
-            alloc.deallocate(NonNull::new(sh as u8*), Layout::of::<TaskShared<O>>());
+            alloc.deallocate(NonNull::new(sh as mut u8*), Layout::of::<TaskShared<O>>());
             panic("Executor::spawn: future allocation failed", intrinsics::location());
         }
     }
@@ -589,7 +589,7 @@ where F: Future<O> {
     // drop). The `Task*` it yields is what `task_incref`/`task_decref` take.
     mut arc_res: Result<Arc<Task, GlobalAlloc>, AllocError> =
         Arc::try_new(Task::new(task_poll_thunk::<F, O>, task_drop_thunk::<F>,
-                               dispose_shared_thunk::<O>, fbox as u8*, sh as u8*, inner));
+                               dispose_shared_thunk::<O>, fbox as mut u8*, sh as mut u8*, inner));
     match (arc_res) {
         Result::Ok(arc) => {
             inner.enqueue(arc.into_raw());
@@ -597,7 +597,7 @@ where F: Future<O> {
         Result::Err(_)  => {
             // `try_new` dropped the Task value; its `Drop` finished it CANCELLED
             // and dropped the boxed future, so only the shared block remains.
-            alloc.deallocate(NonNull::new(sh as u8*), Layout::of::<TaskShared<O>>());
+            alloc.deallocate(NonNull::new(sh as mut u8*), Layout::of::<TaskShared<O>>());
             panic("Executor::spawn: task allocation failed", intrinsics::location());
         }
     }
@@ -630,7 +630,7 @@ public type struct JoinHandle<O> {
         // (it no-ops on a null `shared`) — the "consume" a destructure would give,
         // without a `: JoinHandle<O>` annotation (which misresolves to
         // `thread::JoinHandle` under `import thread`).
-        const shared: TaskShared<O>* = this.shared;
+        const shared: mut TaskShared<O>* = this.shared;
         const exec:   ExecInner*     = this.exec;
         this.shared = null;
         const ctl: TaskCtl* = &shared.ctl;
@@ -644,15 +644,15 @@ public type struct JoinHandle<O> {
         if (outcome == OUTCOME_READY) {
             const rptr: O* = &shared.result;
             const out:  O  = *rptr;
-            alloc.deallocate(NonNull::new(shared as u8*), Layout::of::<TaskShared<O>>());
+            alloc.deallocate(NonNull::new(shared as mut u8*), Layout::of::<TaskShared<O>>());
             return Result::Ok(out);
         }
         if (outcome == OUTCOME_PANICKED) {
             const info: PanicInfo = ctl.panic;
-            alloc.deallocate(NonNull::new(shared as u8*), Layout::of::<TaskShared<O>>());
+            alloc.deallocate(NonNull::new(shared as mut u8*), Layout::of::<TaskShared<O>>());
             return Result::Err(JoinError::Panicked(info));
         }
-        alloc.deallocate(NonNull::new(shared as u8*), Layout::of::<TaskShared<O>>());
+        alloc.deallocate(NonNull::new(shared as mut u8*), Layout::of::<TaskShared<O>>());
         return Result::Err(JoinError::Cancelled);
     }
 
@@ -827,7 +827,7 @@ implement trait Drop for struct Executor {
         inner.blocking = null;
         ptr::drop_in_place::<ExecInner>(inner);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        alloc.deallocate(NonNull::new(inner as u8*), Layout::of::<ExecInner>());
+        alloc.deallocate(NonNull::new(inner as mut u8*), Layout::of::<ExecInner>());
         this.inner = null;
     }
 }

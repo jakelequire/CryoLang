@@ -116,7 +116,7 @@ private type struct SegmentHeader {
     private payload_off: u64;
     private used: u64;
     private fresh_off: u64;
-    private free_head: u8*;
+    private free_head: mut u8*;
     private prev: mut SegmentHeader*;
     private next: mut SegmentHeader*;
 }
@@ -214,7 +214,7 @@ private function die(msg: u8*) -> void {
 // here (callers round). `os_unmap` returns a mapping to the OS.
 
 ![target(unix)]
-private function os_map_aligned(size: u64) -> u8* {
+private function os_map_aligned(size: u64) -> mut u8* {
     // Over-map by one segment, then trim the head below the first aligned
     // boundary and the tail above `aligned + size`. Both trims are precise
     // munmaps, so exactly [aligned, aligned+size) survives.
@@ -234,7 +234,7 @@ private function os_map_aligned(size: u64) -> u8* {
     if (tail > 0) {
         sys::munmap((aligned + size) as u8*, tail);
     }
-    return aligned as u8*;
+    return aligned as mut u8*;
 }
 
 ![target(unix)]
@@ -243,7 +243,7 @@ private function os_unmap(ptr: u8*, size: u64) -> void {
 }
 
 ![target(windows)]
-private function os_map_aligned(size: u64) -> u8* {
+private function os_map_aligned(size: u64) -> mut u8* {
     // VirtualAlloc can't trim a reservation, so alignment uses the classic
     // reserve/release/re-reserve dance: reserve oversized to LEARN an
     // aligned address, release, then reserve exactly there. Another thread
@@ -258,7 +258,7 @@ private function os_map_aligned(size: u64) -> u8* {
         const aligned: u64 = ((probe as u64) + mask) & ~mask;
         syscall::VirtualFree(probe, 0, syscall::MEM_RELEASE);
         const ty: u32 = syscall::MEM_COMMIT | syscall::MEM_RESERVE;
-        const got: u8* = syscall::VirtualAlloc(aligned as u8*, size, ty,
+        const got: mut u8* = syscall::VirtualAlloc(aligned as u8*, size, ty,
                                                syscall::PAGE_READWRITE);
         if (got != null) { return got; }
         attempt = attempt + 1;
@@ -316,11 +316,11 @@ private function class_size(idx: i64) -> u64 {
 /// The class-head slot array, mapping its page on first use.
 private function class_heads() -> mut (mut SegmentHeader*)* {
     if (g_heads == null) {
-        const page: u8* = os_map_aligned(PAGE);
+        const page: mut u8* = os_map_aligned(PAGE);
         if (page == null) {
             die("cannot map heap control block" as u8*);
         }
-        g_heads = page as mut SegmentHeader**;
+        g_heads = page as mut (mut SegmentHeader*)*;
     }
     return g_heads;
 }
@@ -328,7 +328,7 @@ private function class_heads() -> mut (mut SegmentHeader*)* {
 /// Map and initialize a fresh small segment for `idx`, linked at the front
 /// of its class list. Returns null on OOM.
 private function new_segment(idx: i64) -> mut SegmentHeader* {
-    const base: u8* = os_map_aligned(SEGMENT_SIZE);
+    const base: mut u8* = os_map_aligned(SEGMENT_SIZE);
     if (base == null) { return null; }
     const seg: mut SegmentHeader* = base as mut SegmentHeader*;
     seg.magic = MAGIC_SMALL;
@@ -350,18 +350,18 @@ private function new_segment(idx: i64) -> mut SegmentHeader* {
 
 /// Take one block from `seg` (free list first, then the bump frontier).
 /// Returns null when the segment is full.
-private function take_block(seg: mut SegmentHeader*) -> void* {
+private function take_block(seg: mut SegmentHeader*) -> mut void* {
     if (seg.free_head != null) {
-        const block: u8* = seg.free_head;
-        seg.free_head = *(block as u8**);
+        const block: mut u8* = seg.free_head;
+        seg.free_head = *(block as (mut u8*)*);
         seg.used = seg.used + 1;
-        return block as void*;
+        return block as mut void*;
     }
     if (seg.fresh_off + seg.block_size <= seg.map_size) {
         const block: u64 = (seg as u64) + seg.fresh_off;
         seg.fresh_off = seg.fresh_off + seg.block_size;
         seg.used = seg.used + 1;
-        return block as void*;
+        return block as mut void*;
     }
     return null;
 }
@@ -388,7 +388,7 @@ private function page_round(n: u64) -> u64 {
 
 /// Allocate `size` bytes aligned to `align` (a non-zero power of two).
 /// Returns null on OOM or when `size` is 0.
-internal function alloc(size: u64, align: u64) -> void* {
+internal function alloc(size: u64, align: u64) -> mut void* {
     if (size == 0) { return null; }
     if (align <= GRAN && size <= SMALL_MAX) {
         const idx: i64 = class_index(size);
@@ -398,7 +398,7 @@ internal function alloc(size: u64, align: u64) -> void* {
         // until the front segment fills.
         mut seg: mut SegmentHeader* = class_heads()[idx];
         while (seg != null) {
-            const block: void* = take_block(seg);
+            const block: mut void* = take_block(seg);
             if (block != null) {
                 if (seg.prev != null) {
                     unlink_segment(seg);
@@ -418,7 +418,7 @@ internal function alloc(size: u64, align: u64) -> void* {
             unlock();
             return null;
         }
-        const block: void* = take_block(fresh);
+        const block: mut void* = take_block(fresh);
         unlock();
         return block;
     }
@@ -426,7 +426,7 @@ internal function alloc(size: u64, align: u64) -> void* {
 }
 
 /// Dedicated aligned mapping for a large or over-aligned request.
-private function large_alloc(size: u64, align: u64) -> void* {
+private function large_alloc(size: u64, align: u64) -> mut void* {
     if (align >= SEGMENT_SIZE) {
         // The payload sits `max(page, align)` past the header; at
         // `align >= SEGMENT_SIZE` the mask in `owning_segment` would land
@@ -437,7 +437,7 @@ private function large_alloc(size: u64, align: u64) -> void* {
     mut off: u64 = DATA_OFF;
     if (align > off) { off = align; }
     const map_size: u64 = page_round(off + size);
-    const base: u8* = os_map_aligned(map_size);
+    const base: mut u8* = os_map_aligned(map_size);
     if (base == null) { return null; }
     const seg: mut SegmentHeader* = base as mut SegmentHeader*;
     seg.magic = MAGIC_LARGE;
@@ -450,7 +450,7 @@ private function large_alloc(size: u64, align: u64) -> void* {
     seg.free_head = null;
     seg.prev = null;
     seg.next = null;
-    return ((base as u64) + off) as void*;
+    return ((base as u64) + off) as mut void*;
 }
 
 /// Recover the segment header owning `ptr`, aborting on a foreign pointer.
@@ -466,7 +466,7 @@ private function owning_segment(ptr: void*, who: u8*) -> mut SegmentHeader* {
 }
 
 /// Return `ptr` (from `alloc`) to the heap. Null is a no-op.
-internal function free(ptr: void*) -> void {
+internal function free(ptr: mut void*) -> void {
     if (ptr == null) { return; }
     const seg: mut SegmentHeader* = owning_segment(ptr, "free" as u8*);
     if (seg.magic == MAGIC_LARGE) {
@@ -474,7 +474,7 @@ internal function free(ptr: void*) -> void {
         return;
     }
     lock();
-    const block: u8* = ptr as u8*;
+    const block: mut u8* = ptr as mut u8*;
     *(block as mut (mut u8*)*) = seg.free_head;
     seg.free_head = block;
     seg.used = seg.used - 1;
@@ -494,8 +494,8 @@ internal function free(ptr: void*) -> void {
 /// or null on OOM (in which case `ptr` remains valid). `old_size` is the
 /// caller's bookkeeping of the live byte count; the copy is clamped to the
 /// block's actual capacity as a defense against stale bookkeeping.
-internal function realloc(ptr: void*, old_size: u64,
-                             new_size: u64, align: u64) -> void* {
+internal function realloc(ptr: mut void*, old_size: u64,
+                             new_size: u64, align: u64) -> mut void* {
     if (ptr == null) { return alloc(new_size, align); }
     if (new_size == 0) { return null; }
     const seg: SegmentHeader* = owning_segment(ptr, "realloc" as u8*);
@@ -506,7 +506,7 @@ internal function realloc(ptr: void*, old_size: u64,
     if (new_size <= seg.block_size && off_ok) {
         return ptr;
     }
-    const np: void* = alloc(new_size, align);
+    const np: mut void* = alloc(new_size, align);
     if (np == null) { return null; }
     mut copy: u64 = old_size;
     if (new_size < copy) { copy = new_size; }

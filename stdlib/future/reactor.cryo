@@ -102,7 +102,7 @@ private type struct Registration {
     private interest:      u32;      // armed INTEREST_* bits
     private read_waker:    Waker;    // fired on readable; `Waker::noop()` when unarmed
     private write_waker:   Waker;    // fired on writable; `Waker::noop()` when unarmed
-    private next:          Registration*;
+    private next:          mut Registration*;
     private backend_added: boolean;  // the OS knows this descriptor (epoll set membership)
     private os_state:      u8*;      // backend-owned per-registration block; null on Linux
 }
@@ -119,7 +119,7 @@ private type struct Timer {
     private id:       u64;      // identifies this arming; never 0, never reused
     private deadline: i64;      // monotonic nanoseconds, as `Instant::as_nanos` reports
     private waker:    Waker;
-    private next:     Timer*;
+    private next:     mut Timer*;
 }
 
 // Stored wakers are taken out and swapped with `Waker::take` / `Waker::replace`
@@ -156,7 +156,7 @@ private type struct ReactorTable {
 
     /// Create an empty (nothing armed) registration for `fd` and link it into
     /// its bucket. The caller has checked there is none.
-    private insert(mut &this, fd: i32) -> Registration* {
+    private insert(mut &this, fd: i32) -> mut Registration* {
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         mut reg: mut Registration* = null;
         match (alloc.allocate(Layout::of::<Registration>())) {
@@ -179,7 +179,7 @@ private type struct ReactorTable {
     /// Unlink `reg` from its bucket.
     private unlink(mut &this, reg: Registration*) -> void {
         const b: i32 = reg.fd & (REG_BUCKETS - 1);
-        mut cur:  Registration* = this.buckets[b];
+        mut cur:  mut Registration* = this.buckets[b];
         mut prev: mut Registration* = null;
         while (cur != null) {
             if (cur == reg) {
@@ -210,7 +210,7 @@ internal:
     /// Panics if the OS refuses any of the three: an executor without a working
     /// reactor would park I/O futures that could never be woken, so failing
     /// loudly at construction beats hanging later.
-    static start() -> Reactor* {
+    static start() -> mut Reactor* {
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         mut rt: mut Reactor* = null;
         match (alloc.allocate(Layout::of::<Reactor>())) {
@@ -286,7 +286,7 @@ internal:
             mem::drop(held);
             if (t == null) { break; }
             mut alloc: GlobalAlloc = GlobalAlloc::new();
-            alloc.deallocate(NonNull::new(t as u8*), Layout::of::<Timer>());
+            alloc.deallocate(NonNull::new(t as mut u8*), Layout::of::<Timer>());
             // `tw` drops here, outside the lock.
         }
         rt_backend_close(rt);
@@ -294,11 +294,11 @@ internal:
 
     /// Release the reactor block. Must run only after every future that could
     /// still cancel against this reactor has been dropped — see `stop`.
-    static free(rt: Reactor*) -> void {
+    static free(rt: mut Reactor*) -> void {
         if (rt == null) { return; }
         ptr::drop_in_place::<Reactor>(rt);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        alloc.deallocate(NonNull::new(rt as u8*), Layout::of::<Reactor>());
+        alloc.deallocate(NonNull::new(rt as mut u8*), Layout::of::<Reactor>());
     }
 
     /// The reactor driving the current thread's polls, or null if this thread is
@@ -309,7 +309,7 @@ internal:
 
     /// Publish `rt` as this thread's reactor. Called by an executor worker as it
     /// starts, so every future it polls can reach the reactor.
-    static set_current(rt: Reactor*) -> void {
+    static set_current(rt: mut Reactor*) -> void {
         g_current_reactor = rt;
     }
 
@@ -431,7 +431,7 @@ internal:
         t.id = table.timer_seq;
         const id: u64 = t.id;
         mut prev: mut Timer* = null;
-        mut cur:  Timer* = table.timers;
+        mut cur:  mut Timer* = table.timers;
         while (cur != null && cur.deadline <= deadline) {
             prev = cur;
             cur  = cur.next;
@@ -451,7 +451,7 @@ internal:
     cancel_timer(mut &this, id: u64) -> void {
         if (id == 0) { return; }
         mut taken: Waker  = Waker::noop();
-        mut found: Timer* = null;
+        mut found: mut Timer* = null;
         const held: MutexGuard<ReactorTable, GlobalAlloc> = this.table.lock();
         const table: mut ReactorTable* = held.as_ptr();
         mut prev: mut Timer* = null;
@@ -470,7 +470,7 @@ internal:
         mem::drop(held);
         if (found != null) {
             mut alloc: GlobalAlloc = GlobalAlloc::new();
-            alloc.deallocate(NonNull::new(found as u8*), Layout::of::<Timer>());
+            alloc.deallocate(NonNull::new(found as mut u8*), Layout::of::<Timer>());
         }
         // `taken` drops here, outside the lock.
     }
@@ -504,7 +504,7 @@ internal:
     private fire_expired(mut &this, now: i64) -> void {
         loop {
             mut w: Waker = Waker::noop();
-            mut expired: Timer* = null;
+            mut expired: mut Timer* = null;
             const held: MutexGuard<ReactorTable, GlobalAlloc> = this.table.lock();
             const table: mut ReactorTable* = held.as_ptr();
             const head: mut Timer* = table.timers;
@@ -516,7 +516,7 @@ internal:
             mem::drop(held);
             if (expired == null) { return; }
             mut alloc: GlobalAlloc = GlobalAlloc::new();
-            alloc.deallocate(NonNull::new(expired as u8*), Layout::of::<Timer>());
+            alloc.deallocate(NonNull::new(expired as mut u8*), Layout::of::<Timer>());
             w.wake();
             // `w` drops at the end of this iteration, outside the lock.
         }
@@ -567,7 +567,7 @@ internal:
         table.unlink(reg);
         rt_disarm(&this, reg);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        alloc.deallocate(NonNull::new(reg as u8*), Layout::of::<Registration>());
+        alloc.deallocate(NonNull::new(reg as mut u8*), Layout::of::<Registration>());
     }
 }
 
@@ -863,8 +863,8 @@ private function rt_backend_close(rt: mut Reactor*) -> void {
             if (removed == 0) { break; }
             for (mut i: u32 = 0; i < removed; i = i + 1) {
                 const e:   u8* = &entries[0] + ((i as i64) * 32);
-                const ovl: u8* = *((e + 8) as u64*) as u8*;
-                if (ovl != null) { afd_op_free(ovl as AfdOp*); }
+                const ovl: mut u8* = *((e + 8) as u64*) as mut u8*;
+                if (ovl != null) { afd_op_free(ovl as mut AfdOp*); }
             }
         }
         syscall::CloseHandle(iocp);
@@ -873,9 +873,9 @@ private function rt_backend_close(rt: mut Reactor*) -> void {
 }
 
 ![target(windows)]
-private function afd_op_free(op: AfdOp*) -> void {
+private function afd_op_free(op: mut AfdOp*) -> void {
     mut alloc: GlobalAlloc = GlobalAlloc::new();
-    alloc.deallocate(NonNull::new(op as u8*), Layout::of::<AfdOp>());
+    alloc.deallocate(NonNull::new(op as mut u8*), Layout::of::<AfdOp>());
 }
 
 /// Arm `reg` by issuing one AFD poll for its current interest. Any poll already
@@ -971,9 +971,9 @@ private function rt_wait(rt: Reactor*, out_fds: mut i32*, out_ready: mut u32*,
     mut out: i32 = 0;
     for (mut i: u32 = 0; i < removed; i = i + 1) {
         const e:   u8* = &entries[0] + ((i as i64) * 32);
-        const ovl: u8* = *((e + 8) as u64*) as u8*;
+        const ovl: mut u8* = *((e + 8) as u64*) as mut u8*;
         if (ovl == null) { continue; }        // the kick
-        mut op: AfdOp* = ovl as AfdOp*;
+        mut op: mut AfdOp* = ovl as mut AfdOp*;
         // NumberOfHandles is 0 when the poll was cancelled rather than satisfied
         // (the socket closed, or teardown): report nothing for it.
         const info: u8* = afd_info(op);

@@ -107,10 +107,10 @@ public const BLOCKING_DEFAULT_THREADS: u32 = 512;
 public type struct BlockingJob {
     private rc:      Atomic<u32>;      // 2 while both the submitter and the pool hold it
     private status:  Atomic<u8>;       // JOB_*
-    private run_fn:  (u8*) -> void;    // do the blocking work; the argument is this block
-    private drop_fn: (u8*) -> void;    // release the payload and free this block
-    private waker:   Waker;            // fired once, when the job leaves PENDING
-    private next:    BlockingJob*;     // pool queue link
+    private run_fn:  (mut u8*) -> void;    // do the blocking work; the argument is this block
+    private drop_fn: (mut u8*) -> void;    // release the payload and free this block
+    private waker:   Waker;                // fired once, when the job leaves PENDING
+    private next:    mut BlockingJob*;     // pool queue link
     private pool:    BlockingPool*;    // whose lock guards `waker`; null until submitted
 
     /// Prepare a freshly allocated block. The refcount starts at 1 — the
@@ -120,7 +120,7 @@ public type struct BlockingJob {
     /// A static taking the block by pointer rather than a `mut &this` method:
     /// the memory is raw at this point, and `waker` is assigned (not swapped)
     /// exactly once here, before anything could be holding a waker in it.
-    public static init(job: mut BlockingJob*, run_fn: (u8*) -> void, drop_fn: (u8*) -> void) -> void {
+    public static init(job: mut BlockingJob*, run_fn: (mut u8*) -> void, drop_fn: (mut u8*) -> void) -> void {
         job.rc      = Atomic::<u32>::new(1);
         job.status  = Atomic::<u8>::new(JOB_PENDING);
         job.run_fn  = run_fn;
@@ -184,8 +184,8 @@ public type struct BlockingJob {
     public release(mut &this) -> void {
         if (this.rc.fetch_sub(1, MemoryOrder::AcqRel) != 1) { return; }
         mut _waker: Waker = Waker::take(&this.waker);
-        const df: (u8*) -> void = this.drop_fn;
-        df(&this as u8*);
+        const df: (mut u8*) -> void = this.drop_fn;
+        df(&this as mut u8*);
         // `_waker` drops here, AFTER the block is gone. A task reclaimed by that
         // release drops its future, which lets go of a job that no longer
         // exists — harmless only because it holds its own reference, never a
@@ -305,11 +305,11 @@ public type struct BlockingPool {
 
     /// Release the pool block. Must run only after every future that could still
     /// let go of a job has been dropped — see `stop`.
-    public static free(p: BlockingPool*) -> void {
+    public static free(p: mut BlockingPool*) -> void {
         if (p == null) { return; }
         ptr::drop_in_place::<BlockingPool>(p);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        alloc.deallocate(NonNull::new(p as u8*), Layout::of::<BlockingPool>());
+        alloc.deallocate(NonNull::new(p as mut u8*), Layout::of::<BlockingPool>());
     }
 
     /// The pool serving the current thread's polls, or null if this thread is
@@ -320,7 +320,7 @@ public type struct BlockingPool {
 
     /// Publish `p` as this thread's pool. Called by an executor worker as it
     /// starts, so every future it polls can reach the pool.
-    internal static set_current(p: BlockingPool*) -> void {
+    internal static set_current(p: mut BlockingPool*) -> void {
         g_current_pool = p;
     }
 
@@ -394,8 +394,8 @@ private function blocking_worker(pool: mut BlockingPool*) -> () {
     loop {
         const job: mut BlockingJob* = pool.take();
         if (job == null) { return (); }
-        const rf: (u8*) -> void = job.run_fn;
-        rf(job as u8*);
+        const rf: (mut u8*) -> void = job.run_fn;
+        rf(job as mut u8*);
         job.finish(JOB_DONE);
     }
 }

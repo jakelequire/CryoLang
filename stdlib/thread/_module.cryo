@@ -178,7 +178,7 @@ private type struct Payload<C, T> {
 /// agnostic; the gated `thread_trampoline` wrappers below adapt the C entry
 /// ABI (pthread returns `void*`, Win32's LPTHREAD_START_ROUTINE returns
 /// `DWORD`/`u32`) around this shared logic.
-private function thread_body<C, T>(arg: u8*) -> void {
+private function thread_body<C, T>(arg: mut u8*) -> void {
     const p: Payload<C, T>* = arg as Payload<C, T>*;
     const body:   (C) -> T  = (*p).body;
     const shared: mut Shared<T>* = (*p).shared;
@@ -198,16 +198,16 @@ private function thread_body<C, T>(arg: u8*) -> void {
     const prev: u8 = (*shared).state.swap(STATE_THREAD_DONE, MemoryOrder::AcqRel);
     if (prev == STATE_DETACHED) {
         ptr::drop_in_place::<T>(rptr);
-        alloc.deallocate(NonNull::new(shared as u8*), Layout::of::<Shared<T>>());
+        alloc.deallocate(NonNull::new(shared as mut u8*), Layout::of::<Shared<T>>());
     }
 }
 
 /// The C entry point handed to the OS thread creator. One monomorphization
 /// per `(C,T)`, addressable thanks to the generic function-reference fix.
 ![target(unix)]
-private function thread_trampoline<C, T>(arg: u8*) -> u8* { thread_body::<C, T>(arg); return null; }
+private function thread_trampoline<C, T>(arg: mut u8*) -> u8* { thread_body::<C, T>(arg); return null; }
 ![target(windows)]
-private function thread_trampoline<C, T>(arg: u8*) -> u32 { thread_body::<C, T>(arg); return 0; }
+private function thread_trampoline<C, T>(arg: mut u8*) -> u32 { thread_body::<C, T>(arg); return 0; }
 
 /// Create an OS thread running `entry(arg)`, where `entry` is a trampoline
 /// of the platform's entry ABI, and return its joinable id (a pthread id,
@@ -264,7 +264,7 @@ private function reap_detached<T>(tid: u64, shared: mut Shared<T>*) -> void {
         const rptr: T* = &(*shared).result;
         ptr::drop_in_place::<T>(rptr);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        alloc.deallocate(NonNull::new(shared as u8*), Layout::of::<Shared<T>>());
+        alloc.deallocate(NonNull::new(shared as mut u8*), Layout::of::<Shared<T>>());
     }
     // Otherwise the thread is still running and will reclaim the block
     // when it observes STATE_DETACHED.
@@ -293,7 +293,7 @@ public type struct JoinHandle<T> {
         unsafe {
             const out: T = *rptr;
             mut alloc: GlobalAlloc = GlobalAlloc::new();
-            alloc.deallocate(NonNull::new(shared as u8*), Layout::of::<Shared<T>>());
+            alloc.deallocate(NonNull::new(shared as mut u8*), Layout::of::<Shared<T>>());
             return out;
         }
     }
@@ -377,7 +377,7 @@ where C: Send, T: Send {
     match (alloc.allocate(Layout::of::<Payload<C, T>>())) {
         Result::Ok(raw) => { p = raw.cast::<Payload<C, T>>().as_ptr(); }
         Result::Err(_)  => {
-            alloc.deallocate(NonNull::new(shared as u8*), Layout::of::<Shared<T>>());
+            alloc.deallocate(NonNull::new(shared as mut u8*), Layout::of::<Shared<T>>());
             return Result::Err(SpawnError::OutOfMemory);
         }
     }
@@ -392,8 +392,8 @@ where C: Send, T: Send {
             // payload's `ctx` was moved in; release it in place so owned
             // state inside it is not leaked, then free both boxes.
             ptr::drop_in_place::<C>(&(*p).ctx);
-            alloc.deallocate(NonNull::new(p as u8*), Layout::of::<Payload<C, T>>());
-            alloc.deallocate(NonNull::new(shared as u8*), Layout::of::<Shared<T>>());
+            alloc.deallocate(NonNull::new(p as mut u8*), Layout::of::<Payload<C, T>>());
+            alloc.deallocate(NonNull::new(shared as mut u8*), Layout::of::<Shared<T>>());
             return Result::Err(e);
         }
     }
@@ -598,7 +598,7 @@ private type struct ScopePayload<C> {
 /// Scoped-thread body: moves the context out, frees the payload, runs the
 /// body. Scoped bodies return no value, so there is no result/handshake
 /// machinery. The gated `scope_trampoline` wrappers adapt the C entry ABI.
-private function scope_body<C>(arg: u8*) -> void {
+private function scope_body<C>(arg: mut u8*) -> void {
     const p: ScopePayload<C>* = arg as ScopePayload<C>*;
     const body: (C) -> void = (*p).body;
     const c: C = (*p).ctx;
@@ -608,9 +608,9 @@ private function scope_body<C>(arg: u8*) -> void {
 }
 
 ![target(unix)]
-private function scope_trampoline<C>(arg: u8*) -> u8* { scope_body::<C>(arg); return null; }
+private function scope_trampoline<C>(arg: mut u8*) -> u8* { scope_body::<C>(arg); return null; }
 ![target(windows)]
-private function scope_trampoline<C>(arg: u8*) -> u32 { scope_body::<C>(arg); return 0; }
+private function scope_trampoline<C>(arg: mut u8*) -> u32 { scope_body::<C>(arg); return 0; }
 
 /// A thread scope. Every thread spawned through it is guaranteed to be
 /// joined before the scope is torn down (explicitly via `join_all()` or

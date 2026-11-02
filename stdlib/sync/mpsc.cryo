@@ -54,13 +54,13 @@ import std::sync::condvar::{ CondVar };
 /// A queued value plus a raw link to the next node. Allocated per `send`,
 /// freed when the value is dequeued (or when the channel is torn down).
 private type struct ChanNode<T> {
-    private next:  ChanNode<T>*;
+    private next:  mut ChanNode<T>*;
     private value: T;
 }
 
 /// The queue and the handle counts, reached only through the channel's lock.
 private type struct ChannelState<T> {
-    private head:    ChanNode<T>*;   // dequeue end (null when empty)
+    private head:    mut ChanNode<T>*;   // dequeue end (null when empty)
     private tail:    mut ChanNode<T>*;   // enqueue end
     private senders: i64;            // live Sender handles
     private refs:    i64;            // live Sender + Receiver handles
@@ -68,8 +68,8 @@ private type struct ChannelState<T> {
 
     /// Unlink and return the oldest queued node, or null when the queue is
     /// empty.
-    private pop(mut &this) -> ChanNode<T>* {
-        const node: ChanNode<T>* = this.head;
+    private pop(mut &this) -> mut ChanNode<T>* {
+        const node: mut ChanNode<T>* = this.head;
         if (node == null) { return null; }
         this.head = (*node).next;
         if (this.head == null) { this.tail = null; }
@@ -86,7 +86,7 @@ private type struct ChannelInner<T> {
 
 /// Allocate + initialize a fresh `ChannelInner<T>` owned solely by the
 /// receiver `channel` returns (no senders yet; one live handle).
-private function new_inner<T>() -> ChannelInner<T>* {
+private function new_inner<T>() -> mut ChannelInner<T>* {
     mut alloc: GlobalAlloc = GlobalAlloc::new();
     mut inner: mut ChannelInner<T>* = null;
     match (alloc.allocate(Layout::of::<ChannelInner<T>>())) {
@@ -103,10 +103,10 @@ private function new_inner<T>() -> ChannelInner<T>* {
 /// Release the lock and condition variable and free the inner box. Called
 /// by the last handle to drop; the queue is expected empty (the receiver
 /// drains it on its way out).
-private function free_inner<T>(inner: ChannelInner<T>*) -> void {
+private function free_inner<T>(inner: mut ChannelInner<T>*) -> void {
     ptr::drop_in_place::<ChannelInner<T>>(inner);
     mut alloc: GlobalAlloc = GlobalAlloc::new();
-    alloc.deallocate(NonNull::new(inner as u8*), Layout::of::<ChannelInner<T>>());
+    alloc.deallocate(NonNull::new(inner as mut u8*), Layout::of::<ChannelInner<T>>());
 }
 
 
@@ -130,7 +130,7 @@ public type enum TryRecvError {
 
 /// The sending half of a channel. Cloneable for multiple producers.
 public type struct Sender<T> {
-    private inner: ChannelInner<T>*;
+    private inner: mut ChannelInner<T>*;
 
     /// Enqueue `value`. Returns `Err(SendError{value})` if the receiver
     /// has already been dropped (the value is handed back unconsumed).
@@ -169,7 +169,7 @@ public type struct Sender<T> {
 
     /// Create another sender on the same channel (multi-producer).
     public clone(&this) -> Sender<T> {
-        const inner: ChannelInner<T>* = this.inner;
+        const inner: mut ChannelInner<T>* = this.inner;
         const held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
         const state: mut ChannelState<T>* = held.as_ptr();
         state.senders = state.senders + 1;
@@ -190,7 +190,7 @@ public type struct Sender<T> {
 /// Decrement the sender/handle counts; wake the receiver if this was the
 /// last sender (so a blocked `recv` observes disconnection); free the
 /// inner if this was the last handle of any kind.
-private function release_sender<T>(inner: ChannelInner<T>*) -> void {
+private function release_sender<T>(inner: mut ChannelInner<T>*) -> void {
     const held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
     const state: mut ChannelState<T>* = held.as_ptr();
     state.senders = state.senders - 1;
@@ -215,7 +215,7 @@ implement<T> trait Drop for struct Sender<T> {
 /// The receiving half of a channel, and the channel's owner. Not
 /// cloneable (single consumer); mint producers with `sender()`.
 public type struct Receiver<T> {
-    private inner: ChannelInner<T>*;
+    private inner: mut ChannelInner<T>*;
 
     /// Create a new `Sender<T>` feeding this channel. Call once per
     /// producer (each returned sender is independently owned and may be
@@ -223,7 +223,7 @@ public type struct Receiver<T> {
     /// alternative. The channel stays open for `recv` as long as any
     /// sender is alive.
     public sender(&this) -> Sender<T> {
-        const inner: ChannelInner<T>* = this.inner;
+        const inner: mut ChannelInner<T>* = this.inner;
         const held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
         const state: mut ChannelState<T>* = held.as_ptr();
         state.senders = state.senders + 1;
@@ -242,7 +242,7 @@ public type struct Receiver<T> {
         while (state.head == null && state.senders > 0) {
             inner.ready.wait(&inner.state, &held);
         }
-        const node: ChanNode<T>* = state.pop();
+        const node: mut ChanNode<T>* = state.pop();
         mem::drop(held);
         if (node == null) {
             // No value and no senders left.
@@ -254,7 +254,7 @@ public type struct Receiver<T> {
         mut value: T;
         unsafe { value = *slot; }
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        alloc.deallocate(NonNull::new(node as u8*), Layout::of::<ChanNode<T>>());
+        alloc.deallocate(NonNull::new(node as mut u8*), Layout::of::<ChanNode<T>>());
         return Result::Ok(value);
     }
 
@@ -265,7 +265,7 @@ public type struct Receiver<T> {
         const inner: ChannelInner<T>* = this.inner;
         const held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
         const state: mut ChannelState<T>* = held.as_ptr();
-        const node: ChanNode<T>* = state.pop();
+        const node: mut ChanNode<T>* = state.pop();
         if (node == null) {
             if (state.senders == 0) { return Result::Err(TryRecvError::Disconnected); }
             return Result::Err(TryRecvError::Empty);
@@ -277,7 +277,7 @@ public type struct Receiver<T> {
         mut value: T;
         unsafe { value = *slot; }
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        alloc.deallocate(NonNull::new(node as u8*), Layout::of::<ChanNode<T>>());
+        alloc.deallocate(NonNull::new(node as mut u8*), Layout::of::<ChanNode<T>>());
         return Result::Ok(value);
     }
 }
@@ -285,18 +285,18 @@ public type struct Receiver<T> {
 implement<T> trait Drop for struct Receiver<T> {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
-        const inner: ChannelInner<T>* = this.inner;
+        const inner: mut ChannelInner<T>* = this.inner;
         const held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
         const state: mut ChannelState<T>* = held.as_ptr();
         state.rx_open = false;
         // Drain and drop any values still queued: with the receiver gone
         // they would otherwise leak.
-        mut node: ChanNode<T>* = state.pop();
+        mut node: mut ChanNode<T>* = state.pop();
         while (node != null) {
             const slot: T* = &(*node).value;
             ptr::drop_in_place::<T>(slot);
             mut a: GlobalAlloc = GlobalAlloc::new();
-            a.deallocate(NonNull::new(node as u8*), Layout::of::<ChanNode<T>>());
+            a.deallocate(NonNull::new(node as mut u8*), Layout::of::<ChanNode<T>>());
             node = state.pop();
         }
         state.refs = state.refs - 1;

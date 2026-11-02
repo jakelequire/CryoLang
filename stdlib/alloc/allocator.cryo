@@ -136,17 +136,17 @@ internal function next_capacity(current: i64, required: i64, min_capacity: i64) 
 // the native heap is proven).  All three return null for "out of memory".
 
 ![config(not(native_alloc))]
-private function backend_alloc(layout: Layout) -> void* {
+private function backend_alloc(layout: Layout) -> mut void* {
     return libc::aligned_alloc(layout.alignment(), layout.padded_size());
 }
 
 ![config(native_alloc)]
-private function backend_alloc(layout: Layout) -> void* {
+private function backend_alloc(layout: Layout) -> mut void* {
     return heap::alloc(layout.size(), layout.alignment());
 }
 
 ![config(not(native_alloc))]
-private function backend_free(ptr: void*, layout: Layout) -> void {
+private function backend_free(ptr: mut void*, layout: Layout) -> void {
     // Pair with `backend_alloc`'s `aligned_alloc`: over-aligned blocks
     // (Windows `_aligned_malloc`) need `_aligned_free`, selected by the
     // layout's alignment.  On POSIX this collapses to plain `free`.
@@ -154,15 +154,15 @@ private function backend_free(ptr: void*, layout: Layout) -> void {
 }
 
 ![config(native_alloc)]
-private function backend_free(ptr: void*, layout: Layout) -> void {
+private function backend_free(ptr: mut void*, layout: Layout) -> void {
     // The native heap recovers the block size from the pointer itself
     // (segment-header mask), so the layout carries no information it needs.
     heap::free(ptr);
 }
 
 ![config(not(native_alloc))]
-private function backend_realloc(ptr: void*, old_layout: Layout,
-                                 new_layout: Layout) -> void* {
+private function backend_realloc(ptr: mut void*, old_layout: Layout,
+                                 new_layout: Layout) -> mut void* {
     // `realloc` only guarantees alignment up to `max_align_t`
     // (MAX_REALLOC_ALIGN = 16).  Any over-aligned type - a
     // `![align(32)]`/`![align(64)]` aggregate or a SIMD vector - must go
@@ -170,7 +170,7 @@ private function backend_realloc(ptr: void*, old_layout: Layout,
     // grow; otherwise realloc may return a merely-16-aligned buffer and
     // every subsequent aligned load/store is UB.
     if (new_layout.alignment() > MAX_REALLOC_ALIGN) {
-        const np: void* = backend_alloc(new_layout);
+        const np: mut void* = backend_alloc(new_layout);
         if (np == null) { return null; }
         mut copy_size: u64 = old_layout.size();
         if (new_layout.size() < copy_size) {
@@ -184,8 +184,8 @@ private function backend_realloc(ptr: void*, old_layout: Layout,
 }
 
 ![config(native_alloc)]
-private function backend_realloc(ptr: void*, old_layout: Layout,
-                                 new_layout: Layout) -> void* {
+private function backend_realloc(ptr: mut void*, old_layout: Layout,
+                                 new_layout: Layout) -> mut void* {
     // The native heap handles over-alignment and in-place growth itself.
     return heap::realloc(ptr, old_layout.size(),
                                      new_layout.size(),
@@ -211,27 +211,27 @@ implement trait Allocator for struct GlobalAlloc {
         // Per-target arena routing.  Active only inside the compiler driver's
         // bracket (global null/inactive everywhere else -> branch not taken).
         if (GlobalArena::routing()) {
-            const ap: void* = GlobalArena::take(layout.size(), layout.alignment());
+            const ap: mut void* = GlobalArena::take(layout.size(), layout.alignment());
             if (ap != null) {
-                return Result::Ok(NonNull::new(ap as u8*));
+                return Result::Ok(NonNull::new(ap as mut u8*));
             }
             return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, layout));
         }
-        const raw: void* = backend_alloc(layout);
+        const raw: mut void* =backend_alloc(layout);
         if (raw == null) {
             return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, layout));
         }
-        return Result::Ok(NonNull::new(raw as u8*));
+        return Result::Ok(NonNull::new(raw as mut u8*));
     }
 
     deallocate(mut &this, ptr: NonNull<u8>, layout: Layout) -> void {
         // Arena-owned blocks are bulk-reclaimed at `reset`; never hand them
         // to the backend.  Consulted regardless of the active flag (the
         // central correctness rule: an arena pointer must not reach `free`).
-        if (GlobalArena::holds(ptr.as_ptr() as void*)) {
+        if (GlobalArena::holds(ptr.as_ptr() as mut void*)) {
             return;
         }
-        backend_free(ptr.as_ptr() as void*, layout);
+        backend_free(ptr.as_ptr() as mut void*, layout);
     }
 
     /// Override the default: both backends have a real `realloc` (libc's, or
@@ -247,23 +247,23 @@ implement trait Allocator for struct GlobalAlloc {
         // Arena-owned blocks grow inside the arena (frontier grow-in-place or
         // alloc-new + copy); never hand them to the backend.  Consulted
         // regardless of the active flag, same correctness rule as `deallocate`.
-        if (GlobalArena::holds(ptr.as_ptr() as void*)) {
-            const np: void* = GlobalArena::grow(
+        if (GlobalArena::holds(ptr.as_ptr() as mut void*)) {
+            const np: mut void* = GlobalArena::grow(
                 ptr.as_ptr() as mut void*,
                 old_layout.size(),
                 new_layout.size(),
                 new_layout.alignment());
             if (np != null) {
-                return Result::Ok(NonNull::new(np as u8*));
+                return Result::Ok(NonNull::new(np as mut u8*));
             }
             return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, new_layout));
         }
-        const raw: void* = backend_realloc(ptr.as_ptr() as void*,
+        const raw: mut void* = backend_realloc(ptr.as_ptr() as mut void*,
                                            old_layout, new_layout);
         if (raw == null) {
             return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, new_layout));
         }
-        return Result::Ok(NonNull::new(raw as u8*));
+        return Result::Ok(NonNull::new(raw as mut u8*));
     }
 }
 
@@ -275,17 +275,17 @@ implement trait Allocator for struct NativeHeap {
         if (layout.size() == 0) {
             return Result::Err(AllocError::new(AllocErrorKind::ZeroSized, layout));
         }
-        const raw: void* = heap::alloc(layout.size(), layout.alignment());
+        const raw: mut void* =heap::alloc(layout.size(), layout.alignment());
         if (raw == null) {
             return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, layout));
         }
-        return Result::Ok(NonNull::new(raw as u8*));
+        return Result::Ok(NonNull::new(raw as mut u8*));
     }
 
     /// The heap recovers a block's size from its address, so `layout`
     /// carries nothing it needs.
     deallocate(mut &this, ptr: NonNull<u8>, layout: Layout) -> void {
-        heap::free(ptr.as_ptr() as void*);
+        heap::free(ptr.as_ptr() as mut void*);
     }
 
     /// Grows or shrinks in place where the block's size class or mapping
@@ -297,12 +297,12 @@ implement trait Allocator for struct NativeHeap {
         if (new_layout.size() == 0) {
             return Result::Err(AllocError::new(AllocErrorKind::ZeroSized, new_layout));
         }
-        const raw: void* = heap::realloc(ptr.as_ptr() as void*, old_layout.size(),
+        const raw: mut void* = heap::realloc(ptr.as_ptr() as mut void*, old_layout.size(),
                                          new_layout.size(), new_layout.alignment());
         if (raw == null) {
             return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, new_layout));
         }
-        return Result::Ok(NonNull::new(raw as u8*));
+        return Result::Ok(NonNull::new(raw as mut u8*));
     }
 }
 
@@ -317,14 +317,14 @@ implement trait Allocator for struct NativeHeap {
 /// guarded; returns null on OOM so the emitter's existing null-check on the
 /// old `malloc` result is unchanged.
 ![language("alloc")]
-public function alloc(size: u64, align: u64) -> void* {
+public function alloc(size: u64, align: u64) -> mut void* {
     mut sz: u64 = size;
     if (sz == 0) { sz = 1; }
     mut al: u64 = align;
     if (al == 0) { al = 16; }
     mut ga: GlobalAlloc = GlobalAlloc::new();
     const r: Result<NonNull<u8>, AllocError> = ga.allocate(Layout::new(sz, al));
-    if (r.is_ok()) { return r.unwrap().as_ptr() as void*; }
+    if (r.is_ok()) { return r.unwrap().as_ptr() as mut void*; }
     return null;
 }
 
@@ -333,10 +333,10 @@ public function alloc(size: u64, align: u64) -> void* {
 /// boundary) and frees libc-owned ones.  `align` must match the `new` site;
 /// `deallocate` ignores the layout size, so a 1-byte placeholder is fine.
 ![language("dealloc")]
-public function free(ptr: void*, align: u64) -> void {
+public function free(ptr: mut void*, align: u64) -> void {
     if (ptr == null) { return; }
     mut al: u64 = align;
     if (al == 0) { al = 16; }
     mut ga: GlobalAlloc = GlobalAlloc::new();
-    ga.deallocate(NonNull::new(ptr as u8*), Layout::new(1, al));
+    ga.deallocate(NonNull::new(ptr as mut u8*), Layout::new(1, al));
 }

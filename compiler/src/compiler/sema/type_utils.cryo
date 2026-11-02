@@ -54,7 +54,7 @@ type struct TypeUtils {
         return TypeUtils { arena: null, intern: null, ctx: null, checker: null };
     }
 
-    wire(mut &this, arena: TypeArena*, intern: InternTable*,
+    wire(mut &this, arena: mut TypeArena*, intern: InternTable*,
                     ctx: CompilationContext*, checker: TypeChecker*) -> void {
         this.arena   = arena;
         this.intern  = intern;
@@ -626,7 +626,7 @@ type struct TypeUtils {
     /// widened the same way, since a `T**` is how a callee writes a pointer
     /// back, and a temporary would swallow the write.
     indirection_compatible(&this, arg_ty: TypeRef, param_ty: TypeRef) -> boolean {
-        if (this.widens_read_only_borrow(arg_ty, param_ty)) { return false; }
+        if (this.widens_read_only(arg_ty, param_ty)) { return false; }
         const a_peeled: TypeRef = this.peel_indirection(arg_ty);
         const p_peeled: TypeRef = this.peel_indirection(param_ty);
         if (!a_peeled.is_valid() && !p_peeled.is_valid()) { return false; }
@@ -652,25 +652,29 @@ type struct TypeUtils {
     /// store into the 64-bit pointer slot, leaving the high half of the previous
     /// pointer in place.
     indirection_spelling_compatible(&this, from_ty: TypeRef, to_ty: TypeRef) -> boolean {
-        if (this.widens_read_only_borrow(from_ty, to_ty)) { return false; }
+        if (this.widens_read_only(from_ty, to_ty)) { return false; }
         const f_peeled: TypeRef = this.peel_indirection(from_ty);
         const t_peeled: TypeRef = this.peel_indirection(to_ty);
         if (!f_peeled.is_valid() || !t_peeled.is_valid()) { return false; }
         return this.checker.is_same_type(f_peeled, t_peeled);
     }
 
-    /// Whether `from` is a read-only borrow (`&T`) and `to` gives write
-    /// access to what it refers to: no spelling of an indirection makes a
-    /// read-only borrow writable.
-    widens_read_only_borrow(&this, from: TypeRef, to: TypeRef) -> boolean {
+    /// Whether `from` only reads what it refers to (a `&T` borrow or a `T*`
+    /// pointer) and `to` gives write access to it: no spelling of an
+    /// indirection makes a read-only one writable.
+    widens_read_only(&this, from: TypeRef, to: TypeRef) -> boolean {
         const f: Type* = this.arena.lookup(from);
-        if (f == null || f.kind != TypeKind::Reference || f.as_reference().is_mutable()) { return false; }
-        return this.gives_write_access(to);
+        if (f == null) { return false; }
+        const reads_only: boolean = match (f.kind) {
+            TypeKind::Reference => { !f.as_reference().is_mutable() }
+            TypeKind::Pointer   => { f.as_pointer().const_pointee }
+            _                   => { false }
+        };
+        return reads_only && this.gives_write_access(to);
     }
 
     /// Whether a value of type `t` gives write access to what it refers
-    /// to: `mut &T`, `virtual mut &Trait`, or a `T*` whose pointee is not
-    /// `const`.
+    /// to: `mut &T`, `virtual mut &Trait`, or a `mut T*`.
     gives_write_access(&this, t: TypeRef) -> boolean {
         const ty: Type* = this.arena.lookup(t);
         if (ty == null) { return false; }
