@@ -448,17 +448,17 @@ PatElem            ::= "_" | "mut"? Ident | Literal
    before them, so `(&T)*` needs its parentheses and `&T*` is `&(T*)`.  An
    array is written only in brackets: a type followed by `[` is refused
    (E0104), with the bracketed spelling as its fix.                          *)
-Type               ::= Type "*"                            (* pointer *)
+Type               ::= Type "*"                            (* pointer, read-only *)
                      | PointerMark ( BaseType | "[" Type ( ";" Expr )? "]" ) "*" ("*")*
                                                            (* marked pointer: the keyword
                                                               marks the pointee of the first
-                                                              `*`, so `const u8**` is a pointer
-                                                              to read-only pointers; a `mut`
+                                                              `*`, so `mut u8**` is a pointer
+                                                              to writable pointers; a `mut`
                                                               no `*` follows is refused (E0100) *)
                      | PointerMark "(" Type ")" "*" ("*")*  (* marked pointer to a pointer or
                                                               a borrow: the group is one
                                                               pointer or borrow type,
-                                                              `const (const u8*)*`,
+                                                              `mut (mut u8*)*`,
                                                               `mut (&T)*`; any other group is
                                                               refused (E0104), and so is one no
                                                               `*` follows (E0100) *)
@@ -484,7 +484,8 @@ Type               ::= Type "*"                            (* pointer *)
                                                               belongs to the object, so
                                                               `virtual T**` points at one *)
                      | BaseType
-PointerMark        ::= "const"                             (* the pointee is only read *)
+PointerMark        ::= "const"                             (* the pointee is only read, as
+                                                              with no mark *)
                      | "mut"                               (* the pointee is written *)
 BaseType           ::= Primitive | "This" | QualName GenericArgs?
 Primitive          ::= "void" | "boolean" | "char" | "string"

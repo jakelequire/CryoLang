@@ -191,6 +191,15 @@ yet is recorded with the change that builds it, not here.
      `JsonObject::get_mutable(mut &this, key: Str) -> Option<mut
      JsonValue*>` that of `JsonObject::get`.  (Jake)
 
+684. **A pointer is printed as it is written by default: a read-only one
+     bare, a writable one with `mut`.**  Diagnostics, hovers and the API
+     index name `T*` for a read-only pointer and `mut T*` for a writable
+     one, grouping a writable level above another pointer or a borrow
+     (`mut (u8*)*`, `mut (&Node)*`) and a pointer to a borrow
+     (`(&Node)*`); `const` is never printed for a pointer.  The help on a
+     write through a read-only pointer says to take a `mut T*`.  (the
+     printing follows ruling 682's spelling; no question was put)
+
 ### 2026-11-01
 
 677. **A primitive implements the trait of every operator that applies to

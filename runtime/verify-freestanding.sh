@@ -219,18 +219,18 @@ APP
 cat > "$WORK/alloc.cryo" <<'APP'
 namespace RtVerifyApp;
 extern "C" {
-    function __cryo_alloc(size: u64, align: u64) -> u8*;
+    function __cryo_alloc(size: u64, align: u64) -> mut u8*;
     function __cryo_dealloc(ptr: u8*, size: u64, align: u64) -> void;
 }
 function main() -> int {
     const n: u64 = 4096;
-    const p: u8* = __cryo_alloc(n, 64);
+    const p: mut u8* = __cryo_alloc(n, 64);
     if (p == null) { return 1; }
     if ((p as u64) % 64 != 0) { return 2; }
     for (mut i: u64 = 0; i < n; i++) { p[i] = (i % 251) as u8; }
     for (mut i: u64 = 0; i < n; i++) { if (p[i] != (i % 251) as u8) { return 3; } }
     __cryo_dealloc(p, n, 64);
-    const q: u8* = __cryo_alloc(64, 8);
+    const q: mut u8* = __cryo_alloc(64, 8);
     if (q == null) { return 4; }
     if ((q as u64) % 8 != 0) { return 5; }
     q[0] = 42;
@@ -269,12 +269,12 @@ type struct Box { v: i64; }
 extern "C" {
     function __cryo_argc() -> i64;
     function __cryo_backtrace() -> void;
-    function __cryo_alloc(size: u64, align: u64) -> u8*;
+    function __cryo_alloc(size: u64, align: u64) -> mut u8*;
     function __cryo_dealloc(ptr: u8*, size: u64, align: u64) -> void;
 }
 function main() -> int {
     __cryo_backtrace();
-    const p: u8* = __cryo_alloc(256, 16);
+    const p: mut u8* = __cryo_alloc(256, 16);
     if (p == null) { return 70; }
     p[0] = 9;
     __cryo_dealloc(p, 256, 16);

@@ -55,4 +55,3 @@ one; the history keeps it.
 |---|---|---|
 | `annotate-negative-tests.py` | Writes `//~` annotations into compile-fail files from a real `cryo check` run, keeping only ones that verify | a person adding a negative test |
 | `install-lsp-windows.cmd` | Windows host: packages `tools/CryoAnalyzer` and installs it into VS Code, replacing the installed extension | `make install-lsp` (Windows) |
-| `pointer-flip/` | The audit-compiler patch, codemod and hand-mark script that mark written pointers `mut` ahead of a bare `T*` becoming read-only; its README has the procedure | a person sweeping an area for the pointer flip |
