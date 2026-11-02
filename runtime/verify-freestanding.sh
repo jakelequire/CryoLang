@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Acceptance check for the freestanding runtime workspace, on both supported
-# OSes. Builds every tier once via the workspace `cryoconfig` (one `cryo build`
-# → .bin/libcryort-*.a), then exercises two properties per target:
+# OSes. Builds every tier once per target via the workspace `cryoconfig` (one
+# `cryo build` → libcryort-*.a in this run's own directory, so the tree's
+# `runtime/.bin/<triple>/` tiers are left as they were), then exercises two
+# properties per target:
 #
 #   core   — a user `main` returning N, linked against libcryort-core.a alone,
 #            exits with N (the entry round-trips main's return as exit code).
@@ -290,14 +292,12 @@ APP
 
 # --- Linux -----------------------------------------------------------------
 run_linux() {
-    # Hosted tier rebuilt too: the wipe takes it with the freestanding ones, and
-    # every hosted link needs it to resolve `__cryo_panic`.
-    ( cd "$RT_DIR" && rm -rf .bin && "$CRYO" build >/dev/null )
-    ( cd "$RT_DIR/hosted" && "$CRYO" build >/dev/null )
-    local core_a="$RT_DIR/.bin/libcryort-core.a"
-    local abort_a="$RT_DIR/.bin/libcryort-panic-abort.a"
-    local alloc_a="$RT_DIR/.bin/libcryort-alloc.a"
-    local bt_a="$RT_DIR/.bin/libcryort-backtrace.a"
+    local tiers="$WORK/tiers-linux"
+    ( cd "$RT_DIR" && "$CRYO" build --no-incremental --build-dir="$tiers" >/dev/null )
+    local core_a="$tiers/libcryort-core.a"
+    local abort_a="$tiers/libcryort-panic-abort.a"
+    local alloc_a="$tiers/libcryort-alloc.a"
+    local bt_a="$tiers/libcryort-backtrace.a"
 
     # No-libc guarantee: every link below is `-nostdlib` (+ freestanding), so a
     # stray libc dependency would fail to resolve at link time. The link
@@ -357,9 +357,10 @@ run_linux() {
     if [ "$gg" -eq 4 ]; then echo "linux args ok: argc 4 + argv contents match"
     else echo "linux args FAIL: exit $gg (want 4; 90=argc 91-93=argv[n] 94=null)"; fail=1; fi
 
-    # driver-link: no linker arguments from us — `cryo build` alone.
+    # driver-link: no linker arguments from us — `cryo build` alone, finding
+    # this run's tiers through CRYO_RUNTIME.
     set +e
-    ( cd "$WORK/exeapp" && rm -rf .bin && "$CRYO" build ) > "$WORK/drv-linux.log" 2>&1
+    ( cd "$WORK/exeapp" && rm -rf .bin && CRYO_RUNTIME="$tiers" "$CRYO" build ) > "$WORK/drv-linux.log" 2>&1
     "$WORK/exeapp/.bin/rt-verify-exe" one two; local dg=$?
     set -e
     if [ "$dg" -eq 3 ]; then echo "linux driver-link ok: cryo build produced a running freestanding exe"
@@ -382,16 +383,12 @@ run_windows() {
         note_skip windows "need $mingw and wine"; return 0
     fi
     local tgt="x86_64-pc-windows-gnu"
-    # The `rm -rf .bin` also removes the hosted abort tier, which lives in the
-    # same directory and which every HOSTED link needs to resolve `__cryo_panic`.
-    # Rebuild it alongside so this gate leaves a tree that can still link an
-    # ordinary program, not just a freestanding one.
-    ( cd "$RT_DIR" && rm -rf .bin && "$CRYO" build --target="$tgt" --no-incremental >/dev/null )
-    ( cd "$RT_DIR/hosted" && "$CRYO" build --target="$tgt" --no-incremental >/dev/null )
-    local core_a="$RT_DIR/.bin/libcryort-core.a"
-    local abort_a="$RT_DIR/.bin/libcryort-panic-abort.a"
-    local alloc_a="$RT_DIR/.bin/libcryort-alloc.a"
-    local bt_a="$RT_DIR/.bin/libcryort-backtrace.a"
+    local tiers="$WORK/tiers-windows"
+    ( cd "$RT_DIR" && "$CRYO" build --target="$tgt" --no-incremental --build-dir="$tiers" >/dev/null )
+    local core_a="$tiers/libcryort-core.a"
+    local abort_a="$tiers/libcryort-panic-abort.a"
+    local alloc_a="$tiers/libcryort-alloc.a"
+    local bt_a="$tiers/libcryort-backtrace.a"
 
     local fail=0
 
@@ -460,7 +457,7 @@ run_windows() {
     # Choosing the per-target driver is part of what this check verifies, so it
     # has to be the compiler's choice and not ours.
     set +e
-    ( cd "$WORK/exeapp" && rm -rf .bin && env -u CRYO_CC "$CRYO" build --target="$tgt" --no-incremental ) > "$WORK/drv-win.log" 2>&1
+    ( cd "$WORK/exeapp" && rm -rf .bin && env -u CRYO_CC CRYO_RUNTIME="$tiers" "$CRYO" build --target="$tgt" --no-incremental ) > "$WORK/drv-win.log" 2>&1
     WINEDEBUG=-all wine "$WORK/exeapp/.bin/rt-verify-exe.exe" one two 2>/dev/null; local dg=$?
     set -e
     if [ "$dg" -eq 3 ]; then echo "windows driver-link ok: cryo build produced a running freestanding exe (wine)"
