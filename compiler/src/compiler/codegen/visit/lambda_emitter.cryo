@@ -22,7 +22,6 @@ import compiler::types::{ type_ref, resolver };
 import compiler::ast::{ declaration, expression, MemberPin, node, statement };
 import compiler::resolver::{ symbol_str, intern_table };
 import compiler::types::arena::{ TypeArena };
-import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{ DeclarationNode, VarDecl };
 import compiler::ast::expression::{
@@ -30,6 +29,7 @@ import compiler::ast::expression::{
 };
 import compiler::ast::statement::{ Stmt, StmtKind };
 import compiler::codegen::visit::ir_generator::{ IRGeneratorVisitor };
+import compiler::codegen::abi::{ SignaturePlan };
 import compiler::codegen::context::{ CodegenContext };
 import compiler::codegen::llvm_types::{ LBasicBlock, LType, LTypeKind, LValue };
 import compiler::resolver::intern_table::{ InternTable };
@@ -111,74 +111,68 @@ type struct LambdaEmitter {
         };
 
         // Resolve return type
-        mut ret_ty: LType = LType::void_type();
-        if (node.return_type.is_valid()) {
-            // Sema already filled it in.
-            const mapped: LType = this.cg.type_mapper.map_type(node.return_type);
-            if (mapped.is_valid()) { ret_ty = mapped; }
-        } else if (node.return_type_ann != null) {
+        mut ret_ref: TypeRef = node.return_type;
+        if (!ret_ref.is_valid() && node.return_type_ann != null) {
             mut res_ctx: ResolutionContext = ResolutionContext::new("");
             // Written at the lambda, inside a body, and resolved there.
-            const ret_ref: TypeRef = ctx_ptr.type_resolver.resolve(node.return_type_ann, &res_ctx);
-            if (ret_ref.is_valid()) {
-                const mapped: LType = this.cg.type_mapper.map_type(ret_ref);
-                if (mapped.is_valid()) { ret_ty = mapped; }
-            }
+            ret_ref = ctx_ptr.type_resolver.resolve(node.return_type_ann, &res_ctx);
+        }
+        mut ret_ty: LType = LType::void_type();
+        if (ret_ref.is_valid()) {
+            const mapped: LType = this.cg.type_mapper.map_type(ret_ref);
+            if (mapped.is_valid()) { ret_ty = mapped; }
         }
 
         // Resolve parameter types
         const param_count: u32 = node.parameters.length() as u32;
-        const param_buf: void* = libc::malloc(param_count as u64 * 8);
-        const param_slots: void** = param_buf as void**;
-        mut params_valid: boolean = true;
-
         mut res_ctx2: ResolutionContext = ResolutionContext::new("");
         // Same body, same module as the return annotation above.
 
         mut param_refs: [TypeRef] = [];
+        mut param_tys: [LType] = [];
         for (mut i: u32 = 0; i < param_count; i++) {
             const param_decl: DeclarationNode* = node.parameters[i];
             const param: VarDecl* = DeclarationNode::var_of(param_decl);
-            mut param_ty: LType = LType::null();
-
-            if (param.resolved_type.is_valid()) {
-                param_ty = this.cg.type_mapper.map_type(param.resolved_type);
-            } else if (param.type_annotation != null) {
-                const pref: TypeRef = ctx_ptr.type_resolver.resolve(
-                    param.type_annotation, &res_ctx2);
-                param_refs.push(pref);
-                if (pref.is_valid()) {
-                    param_ty = this.cg.type_mapper.map_type(pref);
-                }
+            mut pref: TypeRef = param.resolved_type;
+            if (!pref.is_valid() && param.type_annotation != null) {
+                pref = ctx_ptr.type_resolver.resolve(param.type_annotation, &res_ctx2);
             }
-
+            const param_ty: LType = if (pref.is_valid()) {
+                this.cg.type_mapper.map_type(pref)
+            } else {
+                LType::null()
+            };
             if (!param_ty.is_valid()) {
                 this.cg.diag.emit_warning_at_span(ErrorCode::E0600_CODEGEN_FAILED,
                     fmt::format("lambda: cannot resolve type for parameter '%s'; lambda skipped",
                         intern.resolve(param.name)),
                     param_decl.span);
-                params_valid = false;
-                break;
+                out.value     = LValue::null();
+                out.is_lvalue = false;
+                return out;
             }
-            param_slots[i] = param_ty.raw;
+            param_refs.push(pref);
+            param_tys.push(param_ty);
         }
 
-        if (!params_valid) {
-            libc::free(param_buf);
+        // The lambda is called through a function value, whose call site
+        // lowers its signature through the ABI plan; it is declared through
+        // the same plan, so both agree on where the result and each
+        // argument travel.
+        const plan: SignaturePlan = this.cg.abi.classify_signature(&param_refs, ret_ref, false);
+        if (!plan.llvm_fn_type.is_valid()) {
             out.value     = LValue::null();
             out.is_lvalue = false;
             return out;
         }
-
-        // Build LLVM function
-        const fn_type: LType  = LType::function_type(ret_ty, param_buf, param_count, false);
-        libc::free(param_buf);
-        const fn_val: LValue  = this.cg.llvm_module.add_function(MangledName::new(lam_name), fn_type);
+        const fn_val: LValue  = this.cg.llvm_module.add_function(MangledName::new(lam_name), plan.llvm_fn_type);
         if (!fn_val.is_valid()) {
             out.value     = LValue::null();
             out.is_lvalue = false;
             return out;
         }
+        const sret_pointee: LType = if (plan.sret_slot) { plan.return_plan.pointee_ty } else { LType::null() };
+        this.cg.abi.apply_signature_attributes(fn_val, sret_pointee, &plan.param_plans);
 
         // Register so that cross-module references can find it.
         const lam_sym: SymbolStr = intern.intern(lam_name);
@@ -198,25 +192,13 @@ type struct LambdaEmitter {
         this.cg.builder.position_at_end(entry_bb);
         this.cg.values.push_scope();
 
-        // Bind each parameter to an alloca so the body can refer to them.
+        // Bind each parameter as a function's prologue does, after the
+        // hidden result slot when there is one.
+        mut llvm_idx: u32 = if (plan.sret_slot) { 1 } else { 0 } as u32;
         for (mut pi: u32 = 0; pi < param_count; pi++) {
-            const param_decl: DeclarationNode* = node.parameters[pi];
-            const param: VarDecl* = DeclarationNode::var_of(param_decl);
-            const param_name: string  = intern.resolve(param.name);
-
-            // Re-derive the LLVM type for the alloca.
-            mut p_ty: LType = LType::null();
-            if (param.resolved_type.is_valid()) {
-                p_ty = this.cg.type_mapper.map_type(param.resolved_type);
-            } else if (pi < param_refs.length() as u32 && param_refs[pi as i64].is_valid()) {
-                p_ty = this.cg.type_mapper.map_type(param_refs[pi as i64]);
-            }
-            if (!p_ty.is_valid()) { continue; }
-
-            const alloca: LValue = this.cg.flow.create_entry_alloca(fn_val, param_name, p_ty);
-            const arg:    LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, pi) };
-            this.cg.builder.build_store(arg, alloca);
-            this.cg.values.set(param.sym_id, alloca);
+            const param: VarDecl* = DeclarationNode::var_of(node.parameters[pi]);
+            llvm_idx += this.cg.decl.bind_incoming_parameter(
+                fn_val, llvm_idx, param, param_refs[pi as i64], param_tys[pi as i64]);
         }
 
         // Generate the body: the small generate_block loop, inline.

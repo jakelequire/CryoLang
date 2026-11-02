@@ -1,0 +1,52 @@
+///! A lambda is called through a function value, whose call site passes each
+///! argument and takes the result the way the calling convention places a
+///! value of that size: an aggregate of more than 16 bytes through a hidden
+///! pointer (returned) or a pointer to a copy (passed), one of 9 to 16 bytes
+///! in two registers, and one of at most 8 bytes in one.  The lambda's own
+///! body receives and returns them the same way, or the call reads a result
+///! the body never wrote.  Each lambda below is reached only through a
+///! function value, and each shape is checked on both sides of the call.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::LambdaAggregateCallingConvention;
+
+import std::core::result::{ Result };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_eq };
+
+type struct Wide { a: i64; b: i64; c: i64; }
+type struct Middle { a: i64; b: i32; }
+type struct Narrow { a: i32; b: i32; }
+
+![test]
+function wide_result_reaches_the_caller() -> Result<(), TestError> {
+    const make: () -> Wide = () -> Wide { return Wide { a: 1, b: 2, c: 3 }; };
+    const w: Wide = make();
+    expect_eq(w.a, 1)?;
+    expect_eq(w.b, 2)?;
+    return expect_eq(w.c, 3);
+}
+
+![test]
+function wide_argument_reaches_the_body() -> Result<(), TestError> {
+    const weigh: (Wide) -> i64 = (w: Wide) -> i64 { return w.a * 100 + w.b * 10 + w.c; };
+    return expect_eq(weigh(Wide { a: 4, b: 5, c: 6 }), 456);
+}
+
+![test]
+function middle_argument_and_result_cross_in_registers() -> Result<(), TestError> {
+    const bump: (Middle, i64) -> Middle = (m: Middle, by: i64) -> Middle {
+        return Middle { a: m.a + by, b: m.b + 1 };
+    };
+    const m: Middle = bump(Middle { a: 40, b: 7 }, 2);
+    expect_eq(m.a, 42)?;
+    return expect_eq(m.b as i64, 8);
+}
+
+![test]
+function narrow_argument_and_result_cross_in_one_register() -> Result<(), TestError> {
+    const swap: (Narrow) -> Narrow = (n: Narrow) -> Narrow { return Narrow { a: n.b, b: n.a }; };
+    const n: Narrow = swap(Narrow { a: 3, b: 9 });
+    expect_eq(n.a as i64, 9)?;
+    return expect_eq(n.b as i64, 3);
+}

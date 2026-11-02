@@ -1,7 +1,8 @@
 /// Codegen Passes
 ///
-/// Entry points for the four codegen passes: IRGeneration, Optimization,
-/// ObjectEmission, and Linking.  Called by PassRegistry::run_pass().
+/// Entry points for the three codegen passes: IRGeneration, ObjectEmission
+/// (which optimizes each module before emitting it), and Linking.  Called
+/// by PassRegistry::run_pass().
 
 namespace compiler::codegen::passes;
 import std::env;
@@ -976,8 +977,8 @@ type struct CodegenPasses {
             }
         }
 
-        // `![inline]` is honoured at every optimization level, and a project
-        // build runs no IR optimization pipeline: inline its calls here.
+        // `![inline]` is honoured at every optimization level, and level 0's
+        // pipeline runs no inliner: inline its calls here.
         const ai_opts: void* = llvm::LLVMCreatePassBuilderOptions();
         const ai_rc: i32 = llvm::LLVMRunPasses(cg.llvm_module.raw, "always-inline", tm.raw, ai_opts);
         llvm::LLVMDisposePassBuilderOptions(ai_opts);
@@ -1005,81 +1006,6 @@ type struct CodegenPasses {
         tm.dispose();
 
         return PassResult::from_snapshot(ctx.diagnostics, snap);
-    }
-
-
-    /// Optimization pass.  Runs LLVM's new pass manager on the module.
-    static run_optimization(ctx: CompilationContext*) -> PassResult {
-        if (!ctx.artifacts.ir.is_valid()) {
-            return PassResult::ok();
-        }
-
-        if (Log::enabled(LogArea::Codegen, LogLevel::Debug)) {
-            Log::debug(LogArea::Codegen, f"optimizing module {ctx.artifacts.ir.module_name} at O{ctx.options.opt_level}");
-        }
-
-        // O0: skip the IR optimization pipeline entirely. This leaves the
-        // generated allocas / loads / stores intact (no mem2reg, no
-        // inlining, no folding) so an O0 build stays debuggable and maps
-        // cleanly back to source. The backend TargetMachine level below
-        // still governs instruction selection / register allocation.
-        if (ctx.options.opt_level == 0) {
-            Log::debug(LogArea::Codegen, "optimization level 0: skipping the ir optimization pipeline");
-            return PassResult::ok();
-        }
-
-        const opt_triple: string = ctx.options.target_triple;
-        // A triple LLVM has no target for is reported by object emission.
-        mut tm: LTargetMachine = match (LTargetMachine::create_target_machine_with_opt(
-                opt_triple, ctx.options.opt_level as i32)) {
-            Result::Ok(machine) => { machine }
-            Result::Err(_)      => { return PassResult::ok(); }
-        };
-
-        // Run the default optimization pipeline at the configured level.
-        const opts: void* = llvm::LLVMCreatePassBuilderOptions();
-        const passes: string = fmt::format("default<O%u>", ctx.options.opt_level);
-        const result: i32 = llvm::LLVMRunPasses(
-            ctx.artifacts.ir.llvm_module, passes, tm.raw, opts);
-        llvm::LLVMDisposePassBuilderOptions(opts);
-
-        if (result != 0) {
-            tm.dispose();
-            ctx.emit_error(ErrorCode::E0605_OPTIMIZATION_FAILED,
-                fmt::format("LLVM optimization pipeline failed for module '%s' (error code %d)",
-                    ctx.artifacts.ir.module_name, result));
-            return PassResult::failure(1);
-        }
-
-        // Re-verify after optimization.  Optimization passes can introduce
-        // verifier failures (malformed intrinsics, dropped metadata, etc.)
-        // and we'd rather fail here than ship a broken object file.
-        mut verify_err: i8* = null;
-        const verify_rc: i32 = llvm::LLVMVerifyModule(
-            ctx.artifacts.ir.llvm_module, 2, &verify_err as void*);
-        tm.dispose();
-        if (verify_rc != 0) {
-            mut diag: Diagnostic = Diagnostic::error(
-                ErrorCode::E0605_OPTIMIZATION_FAILED,
-                fmt::format("LLVM module verification failed after optimization for '%s'",
-                    ctx.artifacts.ir.module_name));
-            if (verify_err != null) {
-                const max_len: i64 = 2048;
-                const err_len: i64 = (verify_err as string).length();
-                mut note_body: string = verify_err as string;
-                if (err_len > max_len) {
-                    mut tr: String = String::from_str(Str::from_raw(verify_err as u8*, max_len));
-                    note_body = tr.into_raw();
-                }
-                diag = diag.with_note("LLVM reports: " + note_body);
-                llvm::LLVMDisposeMessage(verify_err as void*);
-            }
-            ctx.diagnostics.emit(diag);
-            return PassResult::failure(1);
-        }
-        if (verify_err != null) { llvm::LLVMDisposeMessage(verify_err as void*); }
-
-        return PassResult::ok();
     }
 
 
@@ -1353,7 +1279,7 @@ type struct CodegenPasses {
 
     /// Child-process entry for the multi-process object emitter: parse a
     /// module's bitcode from `bc_path` (written by the main process) in a FRESH
-    /// per-process LLVM context and emit its object to `o_path`.  Runs in its
+    /// per-process LLVM context, optimize it, and emit its object to `o_path`.  Runs in its
     /// own process, so there is no shared LLVM global state to race - the whole
     /// point of going multi-process instead of multi-thread.  Answers why
     /// the object was not emitted, when it was not.
@@ -1372,7 +1298,11 @@ type struct CodegenPasses {
         match (LTargetMachine::create_target_machine_with_opt(eff, opt_level as i32)) {
             Result::Ok(machine) => {
                 mut tm: LTargetMachine = machine;
-                emitted = tm.emit_to_file(m, o_path_text, LFileType::Object);
+                if (tm.run_optimization_pipeline(m, opt_level)) {
+                    emitted = tm.emit_to_file(m, o_path_text, LFileType::Object);
+                } else {
+                    emitted = Result::Err(f"LLVM's optimization pipeline failed for '{bc_path_text}'");
+                }
                 tm.dispose();
             }
             Result::Err(reason) => {
@@ -1398,6 +1328,13 @@ type struct CodegenPasses {
     static report_emit_workers_failed(ctx: CompilationContext*, mut reason: String) -> void {
         ctx.emit_error(ErrorCode::E0647_LLVM_BACKEND_FAILED,
             fmt::format("the out-of-process object emitter failed: %s", reason.as_cstr() as string));
+    }
+
+    /// E0605: LLVM refused to run its optimization pipeline over the module
+    /// that was to be emitted at `path`.
+    static report_optimization_failure(ctx: CompilationContext*, path: string) -> void {
+        ctx.emit_error(ErrorCode::E0605_OPTIMIZATION_FAILED,
+            fmt::format("LLVM's optimization pipeline failed for the module emitted at '%s'", path));
     }
 
     /// E0647: LLVM could not write the object or assembly file at `path`,
@@ -1440,6 +1377,11 @@ type struct CodegenPasses {
         };
 
         const mod: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
+        if (!tm.run_optimization_pipeline(mod, ctx.options.opt_level)) {
+            tm.dispose();
+            CodegenPasses::report_optimization_failure(ctx, target.emit_path);
+            return PassResult::failure(1);
+        }
         const emitted: Result<(), String> = tm.emit_to_file(mod, target.emit_path, target.emit_type);
         tm.dispose();
         match (emitted) {
@@ -2408,12 +2350,13 @@ type struct EmitJob {
     triple:          string;
     opt_level:       u32;
     should_register: boolean;
+    optimization_failed: boolean;   // result: LLVM refused the IR pipeline
     ok:              boolean;   // result: emission succeeded
     err_msg:         string;    // LLVM error message on failure (worker-set;
                                 // the main thread reports it and disposes it)
 }
 
-/// Emit ONE module's object file from its own standalone LLVM context (the
+/// Optimize and emit ONE module's object file from its own standalone LLVM context (the
 /// in-process serial path).  Touches only LLVM state private to this job - 
 /// never `ctx`, the arena, or the intern table.  The target machine is created
 /// per-job (cheap); `init_native_target` must already have run (it has, during
@@ -2432,6 +2375,12 @@ function codegen_emit_job(job: EmitJob*) -> void {
     // main thread after every worker has joined (LLVM disposal must not
     // interleave with emit).
     if ((*job).tm == null || (*job).llvm_module == null) {
+        (*job).ok = false;
+        return;
+    }
+    const machine: LTargetMachine = LTargetMachine { raw: (*job).tm };
+    if (!machine.run_optimization_pipeline(LModule { raw: (*job).llvm_module }, (*job).opt_level)) {
+        (*job).optimization_failed = true;
         (*job).ok = false;
         return;
     }

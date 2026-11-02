@@ -133,6 +133,17 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-11-02
+
+679. **Every build runs LLVM's IR optimizer over each module before it is
+     emitted.**  At `O1` to `O3` (the `release` profile, `--opt-level`, a
+     cryoconfig's `optimize`) that is LLVM's default pipeline at that
+     level; at `O0` (the `debug` profile) it is SROA alone, which keeps
+     locals in registers and otherwise leaves the code as written.  The
+     compiler's own build is a project build like any other and gets the
+     same.  A module's `.ll` is written only on request (`--emit-llvm`,
+     `emit_llvm`), which `selfhost-check` makes.  (Jake)
+
 ### 2026-11-01
 
 677. **A primitive implements the trait of every operator that applies to

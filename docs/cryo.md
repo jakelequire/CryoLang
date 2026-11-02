@@ -4582,6 +4582,15 @@ default = "release"                 # release | debug
 An explicit `[compiler] optimize` overrides the profile's level; `--opt-level=N`
 overrides everything; `-g` forces debug info on regardless of profile.
 
+The level decides what runs over each module's IR before its object is
+emitted.  At `O1`..`O3` that is LLVM's full optimization pipeline at that
+level.  At `O0` it is one light pass that keeps local variables in registers
+instead of in memory and otherwise leaves the code as written, so a debug
+build stays quick to compile and steps line by line.  `![inline]` functions
+are inlined at every level, `O0` included.  The `.ll` a build writes when
+asked (`emit_llvm`, `--emit-llvm`) is each module's IR as generated, with
+`![inline]` calls inlined and before this optimization.
+
 **Build directory layout.** The final artifact is **hoisted** to the root of
 `output_dir` so it runs as `build/<name>` regardless of profile; everything
 else lives under a visible, per-profile cache (`target/<profile>/`) grouped by
