@@ -2661,6 +2661,8 @@ A written type takes at most as many type arguments as its declaration has param
 
 A default resolves **in the module where the type is declared**, not at the use site: writing `Array<int>` fills in `GlobalAlloc` as `collections::array`'s own scope sees it, so the user never imports `GlobalAlloc` to use the default. A user who writes `Array<int, GlobalAlloc>` names `GlobalAlloc` themselves and needs it in scope, because they wrote it. This is the general rule - a name resolves in the scope where it is written - and it is also why a function body, a type alias's right-hand side and an `implement` body resolve where they are written. A name that exists nowhere is an error in every position, expression and type-argument positions included: `sizeof(Nope)`, `1 as Nope` and `Array<Nope>` are refused, not silently accepted.
 
+A use inside the type's own body is a use like any other, so a spelling means one thing wherever it is written: in `String<A>`'s methods a bare `String` - in a signature, or as a struct literal `String { .. }` - is `String<GlobalAlloc>`, not the `String<A>` the method belongs to, and the literal's fields are `String<GlobalAlloc>`'s fields. A literal of the owner itself names its arguments: `String::<A> { .. }`.
+
 A default fills a parameter that a *use* leaves out. An **`implement` head is not a use**: it names every parameter of the template it is written for, either as parameters of its own or as a concrete instantiation, and a head that leaves one out is an error (E0302), whether every parameter has a default or only the trailing ones do. `implement trait Display for String` would read as an impl for every `String<A>` while binding only `String<GlobalAlloc>`, so the writer says which is meant:
 
 ```cryo

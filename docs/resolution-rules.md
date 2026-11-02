@@ -210,6 +210,14 @@ yet is recorded with the change that builds it, not here.
      note says the parameter writes through the pointer and to pass a
      `mut` one.  (Jake)
 
+686. **A bare struct literal takes the type's defaults inside the type's
+     own body too.**  In the methods of a generic type whose parameters
+     all have defaults, `String { .. }` is a `String<GlobalAlloc>`, as a
+     bare `String` in a return type is, and its fields are judged as
+     `String<GlobalAlloc>`'s; one spelling has one meaning wherever it is
+     written.  A literal of the owner itself is written with its
+     arguments, `String::<A> { .. }`.  (Jake)
+
 ### 2026-11-01
 
 677. **A primitive implements the trait of every operator that applies to
