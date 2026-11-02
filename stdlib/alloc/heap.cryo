@@ -117,8 +117,8 @@ private type struct SegmentHeader {
     private used: u64;
     private fresh_off: u64;
     private free_head: u8*;
-    private prev: SegmentHeader*;
-    private next: SegmentHeader*;
+    private prev: mut SegmentHeader*;
+    private next: mut SegmentHeader*;
 }
 
 // Global state
@@ -128,7 +128,7 @@ private type struct SegmentHeader {
 // metadata never touches libc either. `g_lock` guards every read/write of
 // heap metadata (class lists and all header fields).
 
-private mut g_heads: SegmentHeader** = null;
+private mut g_heads: mut (mut SegmentHeader*)* = null;
 private mut g_lock: u32 = 0;
 
 /// Number of failed acquire attempts before a waiter yields its timeslice.
@@ -314,23 +314,23 @@ private function class_size(idx: i64) -> u64 {
 // Internals (all called with the lock held)
 
 /// The class-head slot array, mapping its page on first use.
-private function class_heads() -> SegmentHeader** {
+private function class_heads() -> mut (mut SegmentHeader*)* {
     if (g_heads == null) {
         const page: u8* = os_map_aligned(PAGE);
         if (page == null) {
             die("cannot map heap control block" as u8*);
         }
-        g_heads = page as SegmentHeader**;
+        g_heads = page as mut SegmentHeader**;
     }
     return g_heads;
 }
 
 /// Map and initialize a fresh small segment for `idx`, linked at the front
 /// of its class list. Returns null on OOM.
-private function new_segment(idx: i64) -> SegmentHeader* {
+private function new_segment(idx: i64) -> mut SegmentHeader* {
     const base: u8* = os_map_aligned(SEGMENT_SIZE);
     if (base == null) { return null; }
-    const seg: SegmentHeader* = base as SegmentHeader*;
+    const seg: mut SegmentHeader* = base as mut SegmentHeader*;
     seg.magic = MAGIC_SMALL;
     seg.class_idx = idx;
     seg.block_size = class_size(idx);
@@ -340,8 +340,8 @@ private function new_segment(idx: i64) -> SegmentHeader* {
     seg.fresh_off = DATA_OFF;
     seg.free_head = null;
     seg.prev = null;
-    const hs: SegmentHeader** = class_heads();
-    const old: SegmentHeader* = hs[idx];
+    const hs: mut (mut SegmentHeader*)* = class_heads();
+    const old: mut SegmentHeader* = hs[idx];
     seg.next = old;
     if (old != null) { old.prev = seg; }
     hs[idx] = seg;
@@ -350,7 +350,7 @@ private function new_segment(idx: i64) -> SegmentHeader* {
 
 /// Take one block from `seg` (free list first, then the bump frontier).
 /// Returns null when the segment is full.
-private function take_block(seg: SegmentHeader*) -> void* {
+private function take_block(seg: mut SegmentHeader*) -> void* {
     if (seg.free_head != null) {
         const block: u8* = seg.free_head;
         seg.free_head = *(block as u8**);
@@ -396,13 +396,13 @@ internal function alloc(size: u64, align: u64) -> void* {
         // First-fit walk of the class list. A hit that isn't already the
         // head is moved to the front so repeated allocation stays O(1)
         // until the front segment fills.
-        mut seg: SegmentHeader* = class_heads()[idx];
+        mut seg: mut SegmentHeader* = class_heads()[idx];
         while (seg != null) {
             const block: void* = take_block(seg);
             if (block != null) {
                 if (seg.prev != null) {
                     unlink_segment(seg);
-                    const hs: SegmentHeader** = class_heads();
+                    const hs: mut (mut SegmentHeader*)* = class_heads();
                     seg.prev = null;
                     seg.next = hs[idx];
                     if (hs[idx] != null) { hs[idx].prev = seg; }
@@ -413,7 +413,7 @@ internal function alloc(size: u64, align: u64) -> void* {
             }
             seg = seg.next;
         }
-        const fresh: SegmentHeader* = new_segment(idx);
+        const fresh: mut SegmentHeader* = new_segment(idx);
         if (fresh == null) {
             unlock();
             return null;
@@ -439,7 +439,7 @@ private function large_alloc(size: u64, align: u64) -> void* {
     const map_size: u64 = page_round(off + size);
     const base: u8* = os_map_aligned(map_size);
     if (base == null) { return null; }
-    const seg: SegmentHeader* = base as SegmentHeader*;
+    const seg: mut SegmentHeader* = base as mut SegmentHeader*;
     seg.magic = MAGIC_LARGE;
     seg.class_idx = -1;
     seg.block_size = map_size - off;
@@ -454,8 +454,8 @@ private function large_alloc(size: u64, align: u64) -> void* {
 }
 
 /// Recover the segment header owning `ptr`, aborting on a foreign pointer.
-private function owning_segment(ptr: void*, who: u8*) -> SegmentHeader* {
-    const seg: SegmentHeader* = ((ptr as u64) & ~(SEGMENT_SIZE - 1)) as SegmentHeader*;
+private function owning_segment(ptr: void*, who: u8*) -> mut SegmentHeader* {
+    const seg: mut SegmentHeader* = ((ptr as u64) & ~(SEGMENT_SIZE - 1)) as mut SegmentHeader*;
     if (seg.magic != MAGIC_SMALL && seg.magic != MAGIC_LARGE) {
         libc::printf("native_heap: %s: foreign or corrupt pointer %p\n",
                            who, ptr);
@@ -468,14 +468,14 @@ private function owning_segment(ptr: void*, who: u8*) -> SegmentHeader* {
 /// Return `ptr` (from `alloc`) to the heap. Null is a no-op.
 internal function free(ptr: void*) -> void {
     if (ptr == null) { return; }
-    const seg: SegmentHeader* = owning_segment(ptr, "free" as u8*);
+    const seg: mut SegmentHeader* = owning_segment(ptr, "free" as u8*);
     if (seg.magic == MAGIC_LARGE) {
         os_unmap(seg as u8*, seg.map_size);
         return;
     }
     lock();
     const block: u8* = ptr as u8*;
-    *(block as u8**) = seg.free_head;
+    *(block as mut (mut u8*)*) = seg.free_head;
     seg.free_head = block;
     seg.used = seg.used - 1;
     if (seg.used == 0) {

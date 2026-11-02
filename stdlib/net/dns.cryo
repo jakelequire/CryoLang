@@ -229,7 +229,7 @@ private type struct ResolveJob {
 /// before it, and the pool publishes the job's terminal status under its lock
 /// after this returns, which is what orders the two.
 private function resolve_job_run(raw: u8*) -> void {
-    mut j: ResolveJob* = raw as ResolveJob*;
+    mut j: mut ResolveJob* = raw as mut ResolveJob*;
     match (resolve(j.host.as_str())) {
         Result::Ok(a)  => { j.addrs = a; j.ok = true;  }
         Result::Err(e) => { j.err   = e; j.ok = false; }
@@ -272,7 +272,7 @@ private function resolve_job_free(raw: u8*) -> void {
 /// already is. Run it on an `Executor` to get the offload.
 public type struct Resolve {
     private host: Str;           // the request, until the job takes an owned copy
-    private job:  ResolveJob*;   // null before the first poll and once the result is taken
+    private job:  mut ResolveJob*;   // null before the first poll and once the result is taken
 
     /// Begin resolving `host`. Nothing is submitted until the first poll, so a
     /// `Resolve` that is never awaited costs nothing.
@@ -285,7 +285,7 @@ public type struct Resolve {
     /// was its last reference, so a lookup still running keeps it alive.
     private let_go(mut &this) -> void {
         if (this.job == null) { return; }
-        const j: ResolveJob* = this.job;
+        const j: mut ResolveJob* = this.job;
         this.job = null;
         j.job.release();
     }
@@ -296,12 +296,12 @@ implement trait Future for struct Resolve {
 
     poll(mut &this, cx: Context*) -> Poll<Result<ResolvedAddrs, IoError>> {
         if (this.job == null) {
-            mut pool: BlockingPool* = BlockingPool::current();
+            mut pool: mut BlockingPool* = BlockingPool::current();
             if (pool == null) {
                 return Poll::Ready(resolve(this.host));
             }
             mut alloc: GlobalAlloc = GlobalAlloc::new();
-            mut j: ResolveJob* = null;
+            mut j: mut ResolveJob* = null;
             match (alloc.allocate(Layout::of::<ResolveJob>())) {
                 Result::Ok(raw) => { j = raw.cast::<ResolveJob>().as_ptr(); }
                 Result::Err(_)  => {
@@ -326,7 +326,7 @@ implement trait Future for struct Resolve {
         // that finished between polls is collected here rather than parked on
         // again — and a waker stored a moment before the answer landed cannot be
         // the one nobody fires.
-        mut j: ResolveJob* = this.job;
+        mut j: mut ResolveJob* = this.job;
         if (j.job.arm(cx.waker()) == JOB_PENDING) {
             return Poll::Pending;
         }

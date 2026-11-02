@@ -134,19 +134,19 @@ private type struct Timer {
 /// the poll tree. Null on threads that do not poll (the thread that called
 /// `block_on`, or any thread outside an executor).
 ![thread_local]
-private mut g_current_reactor: Reactor* = null;
+private mut g_current_reactor: mut Reactor* = null;
 
 
 /// The registrations and the timers, reached only through the reactor's table
 /// lock.
 private type struct ReactorTable {
-    private buckets:   [Registration*; 64];   // REG_BUCKETS chains, keyed by `fd & 63`
-    private timers:    Timer*;                // deadline-sorted chain; head is the earliest
+    private buckets:   [mut Registration*; 64];   // REG_BUCKETS chains, keyed by `fd & 63`
+    private timers:    mut Timer*;                // deadline-sorted chain; head is the earliest
     private timer_seq: u64;                   // last id handed out (0 means "nothing armed")
 
     /// The registration for `fd`, or null.
-    private find(&this, fd: i32) -> Registration* {
-        mut r: Registration* = this.buckets[fd & (REG_BUCKETS - 1)];
+    private find(&this, fd: i32) -> mut Registration* {
+        mut r: mut Registration* = this.buckets[fd & (REG_BUCKETS - 1)];
         while (r != null) {
             if (r.fd == fd) { return r; }
             r = r.next;
@@ -158,7 +158,7 @@ private type struct ReactorTable {
     /// its bucket. The caller has checked there is none.
     private insert(mut &this, fd: i32) -> Registration* {
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        mut reg: Registration* = null;
+        mut reg: mut Registration* = null;
         match (alloc.allocate(Layout::of::<Registration>())) {
             Result::Ok(raw) => { reg = raw.cast::<Registration>().as_ptr(); }
             Result::Err(_)  => { panic("Reactor::register: registration allocation failed", intrinsics::location()); }
@@ -180,7 +180,7 @@ private type struct ReactorTable {
     private unlink(mut &this, reg: Registration*) -> void {
         const b: i32 = reg.fd & (REG_BUCKETS - 1);
         mut cur:  Registration* = this.buckets[b];
-        mut prev: Registration* = null;
+        mut prev: mut Registration* = null;
         while (cur != null) {
             if (cur == reg) {
                 if (prev == null) { this.buckets[b] = cur.next; }
@@ -212,7 +212,7 @@ internal:
     /// loudly at construction beats hanging later.
     static start() -> Reactor* {
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        mut rt: Reactor* = null;
+        mut rt: mut Reactor* = null;
         match (alloc.allocate(Layout::of::<Reactor>())) {
             Result::Ok(raw) => { rt = raw.cast::<Reactor>().as_ptr(); }
             Result::Err(_)  => { panic("Reactor::start: allocation failed", intrinsics::location()); }
@@ -226,7 +226,7 @@ internal:
         if (!rt_backend_open(rt)) {
             panic("Reactor::start: I/O readiness backend unavailable", intrinsics::location());
         }
-        rt.io_thread.spawn::<Reactor*>(rt, reactor_body);
+        rt.io_thread.spawn::<mut Reactor*>(rt, reactor_body);
         return rt;
     }
 
@@ -242,7 +242,7 @@ internal:
     /// `cancel_timer` against this reactor. Those find an empty table and do
     /// nothing, which they could not do safely against freed memory. `free`
     /// releases the block once that drain is past.
-    static stop(rt: Reactor*) -> void {
+    static stop(rt: mut Reactor*) -> void {
         if (rt == null) { return; }
         rt.shutdown.store(1, MemoryOrder::Release);
         rt_kick(rt);
@@ -258,8 +258,8 @@ internal:
                 mut wr: Waker = Waker::noop();
                 mut ww: Waker = Waker::noop();
                 const held: MutexGuard<ReactorTable, GlobalAlloc> = rt.table.lock();
-                const table: ReactorTable* = held.as_ptr();
-                const reg: Registration* = table.buckets[b];
+                const table: mut ReactorTable* = held.as_ptr();
+                const reg: mut Registration* = table.buckets[b];
                 if (reg != null) {
                     wr = Waker::take(&reg.read_waker);
                     ww = Waker::take(&reg.write_waker);
@@ -277,8 +277,8 @@ internal:
         loop {
             mut tw: Waker = Waker::noop();
             const held: MutexGuard<ReactorTable, GlobalAlloc> = rt.table.lock();
-            const table: ReactorTable* = held.as_ptr();
-            const t: Timer* = table.timers;
+            const table: mut ReactorTable* = held.as_ptr();
+            const t: mut Timer* = table.timers;
             if (t != null) {
                 table.timers = t.next;
                 tw = Waker::take(&t.waker);
@@ -303,7 +303,7 @@ internal:
 
     /// The reactor driving the current thread's polls, or null if this thread is
     /// not an executor worker.
-    static current() -> Reactor* {
+    static current() -> mut Reactor* {
         return g_current_reactor;
     }
 
@@ -317,8 +317,8 @@ internal:
     /// one. Called by a future at the moment it is about to park: returning
     /// `Pending` with nowhere to register a waker would hang the task forever,
     /// so failing loudly here beats failing silently later.
-    static require() -> Reactor* {
-        mut rt: Reactor* = g_current_reactor;
+    static require() -> mut Reactor* {
+        mut rt: mut Reactor* = g_current_reactor;
         if (rt == null) {
             panic("async I/O requires an Executor: no reactor on this thread", intrinsics::location());
         }
@@ -339,8 +339,8 @@ internal:
         mut replaced: Waker = Waker::noop();
         mut failed:   Waker = Waker::noop();
         const held: MutexGuard<ReactorTable, GlobalAlloc> = this.table.lock();
-        const table: ReactorTable* = held.as_ptr();
-        mut reg: Registration* = table.find(fd);
+        const table: mut ReactorTable* = held.as_ptr();
+        mut reg: mut Registration* = table.find(fd);
         if (reg == null) { reg = table.insert(fd); }
         if ((direction & INTEREST_READ) != 0) { replaced = Waker::replace(&reg.read_waker, w); }
         else                                     { replaced = Waker::replace(&reg.write_waker, w); }
@@ -371,8 +371,8 @@ internal:
     cancel(mut &this, fd: i32, direction: u32) -> void {
         mut taken: Waker = Waker::noop();
         const held: MutexGuard<ReactorTable, GlobalAlloc> = this.table.lock();
-        const table: ReactorTable* = held.as_ptr();
-        const reg: Registration* = table.find(fd);
+        const table: mut ReactorTable* = held.as_ptr();
+        const reg: mut Registration* = table.find(fd);
         if (reg != null && (reg.interest & direction) != 0) {
             if ((direction & INTEREST_READ) != 0) { taken = Waker::take(&reg.read_waker); }
             else                                     { taken = Waker::take(&reg.write_waker); }
@@ -417,7 +417,7 @@ internal:
     /// bound at all, and nothing else would break that wait in time.
     register_timer(mut &this, deadline: i64, w: Waker) -> u64 {
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        mut t: Timer* = null;
+        mut t: mut Timer* = null;
         match (alloc.allocate(Layout::of::<Timer>())) {
             Result::Ok(raw) => { t = raw.cast::<Timer>().as_ptr(); }
             Result::Err(_)  => { panic("Reactor::register_timer: allocation failed", intrinsics::location()); }
@@ -426,11 +426,11 @@ internal:
         t.waker    = w;
         t.next     = null;
         const held: MutexGuard<ReactorTable, GlobalAlloc> = this.table.lock();
-        const table: ReactorTable* = held.as_ptr();
+        const table: mut ReactorTable* = held.as_ptr();
         table.timer_seq = table.timer_seq + 1;
         t.id = table.timer_seq;
         const id: u64 = t.id;
-        mut prev: Timer* = null;
+        mut prev: mut Timer* = null;
         mut cur:  Timer* = table.timers;
         while (cur != null && cur.deadline <= deadline) {
             prev = cur;
@@ -453,9 +453,9 @@ internal:
         mut taken: Waker  = Waker::noop();
         mut found: Timer* = null;
         const held: MutexGuard<ReactorTable, GlobalAlloc> = this.table.lock();
-        const table: ReactorTable* = held.as_ptr();
-        mut prev: Timer* = null;
-        mut cur:  Timer* = table.timers;
+        const table: mut ReactorTable* = held.as_ptr();
+        mut prev: mut Timer* = null;
+        mut cur:  mut Timer* = table.timers;
         while (cur != null) {
             if (cur.id == id) {
                 if (prev == null) { table.timers = cur.next; }
@@ -506,8 +506,8 @@ internal:
             mut w: Waker = Waker::noop();
             mut expired: Timer* = null;
             const held: MutexGuard<ReactorTable, GlobalAlloc> = this.table.lock();
-            const table: ReactorTable* = held.as_ptr();
-            const head: Timer* = table.timers;
+            const table: mut ReactorTable* = held.as_ptr();
+            const head: mut Timer* = table.timers;
             if (head != null && head.deadline <= now) {
                 table.timers = head.next;
                 w = Waker::take(&head.waker);
@@ -534,8 +534,8 @@ internal:
         mut wr: Waker = Waker::noop();
         mut ww: Waker = Waker::noop();
         const held: MutexGuard<ReactorTable, GlobalAlloc> = this.table.lock();
-        const table: ReactorTable* = held.as_ptr();
-        const reg: Registration* = table.find(fd);
+        const table: mut ReactorTable* = held.as_ptr();
+        const reg: mut Registration* = table.find(fd);
         if (reg != null) {
             if ((ready & reg.interest & INTEREST_READ) != 0) {
                 wr = Waker::take(&reg.read_waker);
@@ -563,7 +563,7 @@ internal:
     /// freeing the block loses nothing. A caller removing a registration that is
     /// still armed (teardown) takes the wakers out into locals of
     /// its own first, so they are released after the lock, never under it.
-    private remove(mut &this, table: ReactorTable*, reg: Registration*) -> void {
+    private remove(mut &this, table: mut ReactorTable*, reg: mut Registration*) -> void {
         table.unlink(reg);
         rt_disarm(&this, reg);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
@@ -575,7 +575,7 @@ internal:
 /// The reactor thread: wait for readiness or a deadline and fire wakers until
 /// teardown. A kick (see `rt_kick`) breaks the wait so shutdown — and a newly
 /// armed earliest timer — is observed promptly.
-private function reactor_body(rt: Reactor*) -> void {
+private function reactor_body(rt: mut Reactor*) -> void {
     while (rt.shutdown.load(MemoryOrder::Acquire) == 0) {
         rt.run_once();
     }
@@ -598,13 +598,13 @@ private function reactor_body(rt: Reactor*) -> void {
 /// at offset 4 would be misaligned.
 ![target(unix)]
 private function epoll_event_pack(slot: u8*, events: u32, fd: u32) -> void {
-    *(slot as u32*)       = events;
-    *((slot + 4) as u32*) = fd;
-    *((slot + 8) as u32*) = 0;
+    *(slot as mut u32*)       = events;
+    *((slot + 4) as mut u32*) = fd;
+    *((slot + 8) as mut u32*) = 0;
 }
 
 ![target(unix)]
-private function rt_backend_open(rt: Reactor*) -> boolean {
+private function rt_backend_open(rt: mut Reactor*) -> boolean {
     const ep: i32 = libc::epoll_create1(libc::EPOLL_CLOEXEC);
     if (ep < 0) { return false; }
     // Counting eventfd, non-blocking so draining a kick never stalls the
@@ -628,7 +628,7 @@ private function rt_backend_open(rt: Reactor*) -> boolean {
 }
 
 ![target(unix)]
-private function rt_backend_close(rt: Reactor*) -> void {
+private function rt_backend_close(rt: mut Reactor*) -> void {
     if (rt.kick_h >= 0) { libc::close(rt.kick_h as i32); rt.kick_h = -1; }
     if (rt.poll_h >= 0) { libc::close(rt.poll_h as i32); rt.poll_h = -1; }
 }
@@ -637,7 +637,7 @@ private function rt_backend_close(rt: Reactor*) -> void {
 /// modifies it thereafter; `EPOLLONESHOT` means every delivery must be followed
 /// by another arm before more events arrive.
 ![target(unix)]
-private function rt_arm(rt: Reactor*, reg: Registration*) -> boolean {
+private function rt_arm(rt: Reactor*, reg: mut Registration*) -> boolean {
     mut events: u32 = libc::EPOLLONESHOT;
     if ((reg.interest & INTEREST_READ) != 0) {
         events = events | libc::EPOLLIN | libc::EPOLLRDHUP;
@@ -657,7 +657,7 @@ private function rt_arm(rt: Reactor*, reg: Registration*) -> boolean {
 }
 
 ![target(unix)]
-private function rt_disarm(rt: Reactor*, reg: Registration*) -> void {
+private function rt_disarm(rt: Reactor*, reg: mut Registration*) -> void {
     if (!reg.backend_added) { return; }
     // Pre-2.6.9 kernels reject a null event on DEL; pass a scratch one.
     mut slot: [u8; 12] = [0; 12];
@@ -680,7 +680,7 @@ private function rt_kick(rt: Reactor*) -> void {
 /// consumed here and never reported. A timeout, an interrupted call, or an
 /// error all report zero — the caller simply waits again.
 ![target(unix)]
-private function rt_wait(rt: Reactor*, out_fds: i32*, out_ready: u32*,
+private function rt_wait(rt: Reactor*, out_fds: mut i32*, out_ready: mut u32*,
                          max: i32, timeout_ms: i32) -> i32 {
     mut buf: [u8; 768] = [0; 768];   // RT_MAX_EVENTS * sizeof(struct epoll_event)
     mut cap: i32 = max;
@@ -766,7 +766,7 @@ private function afd_info(op: AfdOp*) -> u8* { return &op.info[0] as u8*; }
 /// length in characters. Written out character by character because Cryo string
 /// literals are UTF-8 and the NT object manager takes UTF-16.
 ![target(windows)]
-private function afd_device_path(out: u16*) -> u32 {
+private function afd_device_path(out: mut u16*) -> u32 {
     const ascii: string = "\\Device\\Afd\\Cryo";
     mut i: u32 = 0;
     while (ascii[i as u64] != 0u8) {
@@ -792,7 +792,7 @@ private function afd_base_socket(fd: i32) -> u64 {
 }
 
 ![target(windows)]
-private function rt_backend_open(rt: Reactor*) -> boolean {
+private function rt_backend_open(rt: mut Reactor*) -> boolean {
     // INVALID_HANDLE_VALUE with no existing port creates a fresh port. It must
     // be the full-width all-ones pointer: a narrower -1 widens to a merely
     // invalid handle, which the call rejects instead of treating as "create".
@@ -807,17 +807,17 @@ private function rt_backend_open(rt: Reactor*) -> boolean {
     // in BYTES, not characters.
     mut uni_buf: [u64; 2] = [0; 2];
     const uni: u8* = &uni_buf[0] as u8*;
-    *(uni as u16*)         = (chars * 2) as u16;
-    *((uni + 2) as u16*)   = (chars * 2) as u16;
-    *((uni + 8) as u64*)   = &path[0] as u64;
+    *(uni as mut u16*)         = (chars * 2) as u16;
+    *((uni + 2) as mut u16*)   = (chars * 2) as u16;
+    *((uni + 8) as mut u64*)   = &path[0] as u64;
 
     // OBJECT_ATTRIBUTES { u32 Length; u8* RootDirectory; u8* ObjectName;
     //                     u32 Attributes; u8* SecurityDescriptor;
     //                     u8* SecurityQualityOfService }
     mut oa_buf: [u64; 6] = [0; 6];
     const oa: u8* = &oa_buf[0] as u8*;
-    *(oa as u32*)         = syscall::SIZEOF_OBJECT_ATTRIBUTES as u32;
-    *((oa + 16) as u64*)  = uni as u64;
+    *(oa as mut u32*)         = syscall::SIZEOF_OBJECT_ATTRIBUTES as u32;
+    *((oa + 16) as mut u64*)  = uni as u64;
 
     mut iosb_buf: [u64; 2] = [0; 2];
     const iosb: u8* = &iosb_buf[0] as u8*;
@@ -846,7 +846,7 @@ private function rt_backend_open(rt: Reactor*) -> boolean {
 /// arrives on the port as a cancelled completion, so draining afterwards frees
 /// all their blocks. Closing in the other order would strand them.
 ![target(windows)]
-private function rt_backend_close(rt: Reactor*) -> void {
+private function rt_backend_close(rt: mut Reactor*) -> void {
     if (rt.aux_h >= 0) {
         syscall::CloseHandle(rt.aux_h as u8*);
         rt.aux_h = -1;
@@ -882,7 +882,7 @@ private function afd_op_free(op: AfdOp*) -> void {
 /// in flight is left alone: it is one-shot and, once this newer one is armed,
 /// its completion is at worst a spurious wake the shared core drops.
 ![target(windows)]
-private function rt_arm(rt: Reactor*, reg: Registration*) -> boolean {
+private function rt_arm(rt: Reactor*, reg: mut Registration*) -> boolean {
     if (rt.aux_h < 0) { return false; }
     // AFD reports the failure and shutdown events regardless, so ask for them
     // explicitly and map them onto whichever direction is waiting: a future woken
@@ -898,7 +898,7 @@ private function rt_arm(rt: Reactor*, reg: Registration*) -> boolean {
     }
 
     mut alloc: GlobalAlloc = GlobalAlloc::new();
-    mut op: AfdOp* = null;
+    mut op: mut AfdOp* = null;
     match (alloc.allocate(Layout::of::<AfdOp>())) {
         Result::Ok(raw) => { op = raw.cast::<AfdOp>().as_ptr(); }
         Result::Err(_)  => { return false; }
@@ -910,12 +910,12 @@ private function rt_arm(rt: Reactor*, reg: Registration*) -> boolean {
     //                 { u8* Handle; u32 Events; i32 Status } Handles[1] }
     // Timeout is INT64_MAX: the wait belongs to the completion port, not to AFD.
     const info: u8* = afd_info(op);
-    *(info as i64*)         = i64::MAX;
-    *((info + 8) as u32*)   = 1;
-    *((info + 12) as u32*)  = 0;
-    *((info + 16) as u64*)  = afd_base_socket(reg.fd);
-    *((info + 24) as u32*)  = events;
-    *((info + 28) as i32*)  = 0;
+    *(info as mut i64*)         = i64::MAX;
+    *((info + 8) as mut u32*)   = 1;
+    *((info + 12) as mut u32*)  = 0;
+    *((info + 16) as mut u64*)  = afd_base_socket(reg.fd);
+    *((info + 24) as mut u32*)  = events;
+    *((info + 28) as mut i32*)  = 0;
 
     // `ApcContext` is the op block, so the completion identifies this poll; the
     // overlapped's first 16 bytes serve as the IO_STATUS_BLOCK.
@@ -941,7 +941,7 @@ private function rt_arm(rt: Reactor*, reg: Registration*) -> boolean {
 /// naturally is what keeps its block's lifetime simple — a cancellation would
 /// have to be waited for anyway.
 ![target(windows)]
-private function rt_disarm(rt: Reactor*, reg: Registration*) -> void {
+private function rt_disarm(rt: Reactor*, reg: mut Registration*) -> void {
     reg.backend_added = false;
 }
 
@@ -954,7 +954,7 @@ private function rt_kick(rt: Reactor*) -> void {
 }
 
 ![target(windows)]
-private function rt_wait(rt: Reactor*, out_fds: i32*, out_ready: u32*,
+private function rt_wait(rt: Reactor*, out_fds: mut i32*, out_ready: mut u32*,
                          max: i32, timeout_ms: i32) -> i32 {
     if (rt.poll_h < 0) { return 0; }
     mut entries: [u8; 2048] = [0; 2048];   // RT_MAX_EVENTS * SIZEOF_OVERLAPPED_ENTRY

@@ -2825,7 +2825,7 @@ type struct SemaVisitor {
         const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(lhs);
         if (aa != null) {
             if (aa.array == null) { return; }
-            const through: Option<PlaceAccess> = this.indirection_access(aa.array);
+            const through: Option<PlaceAccess> = this.index_access(aa.array);
             if (through.is_some()) {
                 this.refuse_read_only_write(through.unwrap(), lhs.span, "assign to");
                 return;
@@ -3030,7 +3030,12 @@ type struct SemaVisitor {
         const ma: MemberAccessExpr* = ExpressionNode::member_access_of(place);
         if (ma != null) { return this.access_within(ma.object); }
         const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(place);
-        if (aa != null) { return this.access_within(aa.array); }
+        if (aa != null) {
+            if (aa.array == null) { return PlaceAccess::Writable; }
+            const through: Option<PlaceAccess> = this.index_access(aa.array);
+            if (through.is_some()) { return through.unwrap(); }
+            return this.place_access(aa.array);
+        }
         const read: ExpressionNode* = this.trait_read_receiver(place);
         if (read != null) { return this.access_within(read); }
         const un: UnaryExpr* = ExpressionNode::unary_of(place);
@@ -3066,6 +3071,23 @@ type struct SemaVisitor {
     /// read-only borrow.
     dereference_access(&this, pointer: ExpressionNode*) -> Option<PlaceAccess> {
         return this.access_through_indirections(pointer, true);
+    }
+
+    /// How writable an element of `array` is, or none when its type is no
+    /// indirection.  Indexing a pointer reads through that pointer alone -
+    /// `p[i]` is `*(p + i)` - so its own level decides, whatever the
+    /// element points at and whatever borrow holds the pointer: `p[0] = q`
+    /// with `p: (const u8*)*` writes the writable outer level.  Any other
+    /// indexed value is reached through its indirections as a member is.
+    index_access(&this, array: ExpressionNode*) -> Option<PlaceAccess> {
+        mut walk: Type* = this.arena.lookup(array.resolved_type);
+        while (walk != null && walk.kind == TypeKind::Reference) {
+            walk = this.arena.lookup(walk.as_reference().referent);
+        }
+        if (walk != null && walk.kind == TypeKind::Pointer) {
+            return Option::Some(if (walk.as_pointer().const_pointee) { PlaceAccess::ReadOnlyPointer(array) } else { PlaceAccess::Writable });
+        }
+        return this.indirection_access(array);
     }
 
     /// The walk `indirection_access` and `dereference_access` share: the

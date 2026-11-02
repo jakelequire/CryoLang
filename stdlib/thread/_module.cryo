@@ -169,7 +169,7 @@ private type struct Shared<T> {
 private type struct Payload<C, T> {
     private body:   (C) -> T;
     private ctx:    C;
-    private shared: Shared<T>*;
+    private shared: mut Shared<T>*;
 }
 
 
@@ -181,7 +181,7 @@ private type struct Payload<C, T> {
 private function thread_body<C, T>(arg: u8*) -> void {
     const p: Payload<C, T>* = arg as Payload<C, T>*;
     const body:   (C) -> T  = (*p).body;
-    const shared: Shared<T>* = (*p).shared;
+    const shared: mut Shared<T>* = (*p).shared;
     // Move the context out of the payload, then release the payload box;
     // `ctx` now solely owns whatever heap state it carried.
     const c: C = (*p).ctx;
@@ -190,7 +190,7 @@ private function thread_body<C, T>(arg: u8*) -> void {
 
     // Run the user body and publish the result. Writing through a raw
     // `T*` avoids drop-synthesis on the (uninitialized) destination.
-    const rptr: T* = &(*shared).result;
+    const rptr: mut T* = &(*shared).result;
     *rptr = body(c);
 
     // Handshake: announce completion. If the handle already detached, no
@@ -255,7 +255,7 @@ private function os_create_thread(entry: void*, arg: u8*, stack_bytes: u64) -> R
 /// Tear down a control block from the handle side (detach or drop).
 /// Mirrors the trampoline's handshake: announce detachment, and if the
 /// thread has already finished, reclaim the result and the block here.
-private function reap_detached<T>(tid: u64, shared: Shared<T>*) -> void {
+private function reap_detached<T>(tid: u64, shared: mut Shared<T>*) -> void {
     // Let the OS reclaim the thread's own resources when it exits.
     os_detach(tid);
     const prev: u8 = (*shared).state.swap(STATE_DETACHED, MemoryOrder::AcqRel);
@@ -276,7 +276,7 @@ private function reap_detached<T>(tid: u64, shared: Shared<T>*) -> void {
 /// erased (its storage was consumed on the thread).
 public type struct JoinHandle<T> {
     private tid:    u64;
-    private shared: Shared<T>*;
+    private shared: mut Shared<T>*;
 
     /// Block until the thread finishes and return its result. Consumes
     /// the handle; the control block is freed here.
@@ -366,14 +366,14 @@ public function spawn_with_attr<C, T>(ctx: C, body: (C) -> T,
 where C: Send, T: Send {
     mut alloc: GlobalAlloc = GlobalAlloc::new();
 
-    mut shared: Shared<T>* = null;
+    mut shared: mut Shared<T>* = null;
     match (alloc.allocate(Layout::of::<Shared<T>>())) {
         Result::Ok(raw) => { shared = raw.cast::<Shared<T>>().as_ptr(); }
         Result::Err(_)  => { return Result::Err(SpawnError::OutOfMemory); }
     }
     (*shared).state = Atomic::<u8>::new(STATE_LIVE);
 
-    mut p: Payload<C, T>* = null;
+    mut p: mut Payload<C, T>* = null;
     match (alloc.allocate(Layout::of::<Payload<C, T>>())) {
         Result::Ok(raw) => { p = raw.cast::<Payload<C, T>>().as_ptr(); }
         Result::Err(_)  => {
@@ -654,7 +654,7 @@ public type struct Scope {
     public spawn<C>(mut &this, ctx: C, body: (C) -> void) -> void
     where C: Send {
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        mut p: ScopePayload<C>* = null;
+        mut p: mut ScopePayload<C>* = null;
         match (alloc.allocate(Layout::of::<ScopePayload<C>>())) {
             Result::Ok(raw) => { p = raw.cast::<ScopePayload<C>>().as_ptr(); }
             Result::Err(_)  => { core::panic("Scope::spawn: alloc failed", intrinsics::location()); }

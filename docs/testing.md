@@ -361,6 +361,11 @@ kept apart, so `expect` can say which stream a line belongs on:
   relative to the project; it is removed before the command runs and after
   it is read, so what is checked is always this run's.
 
+A `.cryo` file named in `arguments` makes a `build` project a single-file
+build of that file (the directory then needs no `cryoconfig`), so the flags
+a single-file build takes are tested the same way:
+`"arguments": ["main.cryo", "--dev"]`.
+
 ```json
 {
   "outcome": "build",

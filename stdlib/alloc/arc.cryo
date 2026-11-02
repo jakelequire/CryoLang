@@ -82,7 +82,7 @@ where A: Allocator {
 /// group's shared unit) and free the header if it was the last.  The
 /// `Release` on the decrement plus the `Acquire` fence on the final path
 /// order the free after every prior weak release from any thread.
-private function release_weak<T, A>(inner_ptr: ArcInner<T, A>*) -> void
+private function release_weak<T, A>(inner_ptr: mut ArcInner<T, A>*) -> void
 where A: Allocator {
     const prev: u64 = inner_ptr.weak.fetch_sub(1, MemoryOrder::Release);
     if (prev == 1) {
@@ -95,7 +95,7 @@ public type struct Arc<T, A = GlobalAlloc> where A: Allocator {
     // Raw (nullable) so each handle's `drop` can null it and stay
     // idempotent.  Non-null while the handle is live; only a post-drop
     // husk holds null.
-    private inner: ArcInner<T, A>*;
+    private inner: mut ArcInner<T, A>*;
 
     /// Allocate a new `Arc` backed by `GlobalAlloc` with an initial
     /// count of 1.  Panics on allocation failure; use `try_new`.
@@ -125,7 +125,7 @@ public type struct Arc<T, A = GlobalAlloc> where A: Allocator {
         const header: Layout = Layout::of::<ArcInner<T, GlobalAlloc>>();
         const raw: NonNull<u8> = alloc.allocate(header)?;
         const typed: NonNull<ArcInner<T, GlobalAlloc>> = raw.cast::<ArcInner<T, GlobalAlloc>>();
-        const inner_ptr: ArcInner<T, GlobalAlloc>* = typed.as_ptr();
+        const inner_ptr: mut ArcInner<T, GlobalAlloc>* = typed.as_ptr();
         inner_ptr.strong = Atomic::<u64>::new(1);
         inner_ptr.weak   = Atomic::<u64>::new(1);
         inner_ptr.value  = value;
@@ -141,7 +141,7 @@ public type struct Arc<T, A = GlobalAlloc> where A: Allocator {
         const header: Layout = Layout::of::<ArcInner<T, A>>();
         const raw: NonNull<u8> = a.allocate(header)?;
         const typed: NonNull<ArcInner<T, A>> = raw.cast::<ArcInner<T, A>>();
-        const inner_ptr: ArcInner<T, A>* = typed.as_ptr();
+        const inner_ptr: mut ArcInner<T, A>* = typed.as_ptr();
         inner_ptr.strong = Atomic::<u64>::new(1);
         inner_ptr.weak   = Atomic::<u64>::new(1);
         inner_ptr.value  = value;
@@ -156,7 +156,7 @@ public type struct Arc<T, A = GlobalAlloc> where A: Allocator {
     /// the cloning thread, so no further synchronization is needed at
     /// clone time.
     public clone(&this) -> Arc<T, A> {
-        const inner_ptr: ArcInner<T, A>* = this.inner;
+        const inner_ptr: mut ArcInner<T, A>* = this.inner;
         inner_ptr.strong.fetch_add(1, MemoryOrder::Relaxed);
         return Arc::<T, A> { inner: this.inner };
     }
@@ -165,7 +165,7 @@ public type struct Arc<T, A = GlobalAlloc> where A: Allocator {
     /// (`Relaxed` suffices: the new `Weak` shares a happens-before with this
     /// thread already) but not the strong count.
     public downgrade(&this) -> Weak<T, A> {
-        const inner_ptr: ArcInner<T, A>* = this.inner;
+        const inner_ptr: mut ArcInner<T, A>* = this.inner;
         inner_ptr.weak.fetch_add(1, MemoryOrder::Relaxed);
         return Weak::<T, A> { inner: this.inner };
     }
@@ -219,8 +219,8 @@ public type struct Arc<T, A = GlobalAlloc> where A: Allocator {
     /// is nulled), so yielding the pointer here is not itself a decrement.
     /// Enables a reference to be parked in a `void*` slot (e.g. a
     /// manual-vtable waker) outside the type system while still owning it.
-    public into_raw(mut this) -> T* {
-        const value: T* = &this.inner.value;
+    public into_raw(mut this) -> mut T* {
+        const value: mut T* = &this.inner.value;
         this.inner = null;
         return value;
     }
@@ -263,9 +263,9 @@ public type struct Arc<T, A = GlobalAlloc> where A: Allocator {
     }
 
     /// The shared block whose value `value` points at.
-    private static block_of(value: T*) -> ArcInner<T, A>* {
-        const start: u8* = mem::offset::<u8>(value as u8*, -(Arc::<T, A>::value_offset() as i64));
-        return start as ArcInner<T, A>*;
+    private static block_of(value: T*) -> mut ArcInner<T, A>* {
+        const start: u8* = mem::offset::<u8>(value as mut u8*, -(Arc::<T, A>::value_offset() as i64));
+        return start as mut ArcInner<T, A>*;
     }
 }
 
@@ -275,7 +275,7 @@ public type struct Arc<T, A = GlobalAlloc> where A: Allocator {
 public type struct Weak<T, A = GlobalAlloc> {
     // Nullable, like `Arc::inner`: a dangling `Weak::new()` carries null and
     // a dropped handle is nulled for idempotency.
-    private inner: ArcInner<T, A>*;
+    private inner: mut ArcInner<T, A>*;
 
     /// A `Weak` that never upgrades.  Allocates nothing; `upgrade` always
     /// returns `None`.
@@ -294,7 +294,7 @@ public type struct Weak<T, A = GlobalAlloc> {
     /// after the producer's writes.
     public upgrade(&this) -> Option<Arc<T, A>> {
         if (this.inner == null) { return Option::None; }
-        const inner_ptr: ArcInner<T, A>* = this.inner;
+        const inner_ptr: mut ArcInner<T, A>* = this.inner;
         mut n: u64 = inner_ptr.strong.load(MemoryOrder::Relaxed);
         loop {
             if (n == 0) { return Option::None; }
@@ -309,7 +309,7 @@ public type struct Weak<T, A = GlobalAlloc> {
     /// Another `Weak` to the same value.  Bumps the weak count.
     public clone(&this) -> Weak<T, A> {
         if (this.inner != null) {
-            const inner_ptr: ArcInner<T, A>* = this.inner;
+            const inner_ptr: mut ArcInner<T, A>* = this.inner;
             inner_ptr.weak.fetch_add(1, MemoryOrder::Relaxed);
         }
         return Weak::<T, A> { inner: this.inner };
@@ -336,7 +336,7 @@ implement<T, A> trait Drop for struct Arc<T, A>
 where A: Allocator {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
-        const inner_ptr: ArcInner<T, A>* = this.inner;
+        const inner_ptr: mut ArcInner<T, A>* = this.inner;
         // `fetch_sub` returns the value BEFORE the decrement, so the
         // last owner is the one that observes `1` here.
         const prev: u64 = inner_ptr.strong.fetch_sub(1, MemoryOrder::Release);
@@ -361,7 +361,7 @@ implement<T, A> trait Drop for struct Weak<T, A>
 where A: Allocator {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
-        const inner_ptr: ArcInner<T, A>* = this.inner;
+        const inner_ptr: mut ArcInner<T, A>* = this.inner;
         release_weak::<T, A>(inner_ptr);
         this.inner = null;
     }

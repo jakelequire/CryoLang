@@ -1,0 +1,322 @@
+diff --git a/compiler/src/compiler/diag/config.cryo b/compiler/src/compiler/diag/config.cryo
+index 7098ef31..4e43bb8a 100644
+--- a/compiler/src/compiler/diag/config.cryo
++++ b/compiler/src/compiler/diag/config.cryo
+@@ -26,7 +26,7 @@ type struct DiagConfig {
+         return DiagConfig {
+             colors:             color_on,
+             context_lines:      2,
+-            max_errors:         500,
++            max_errors:         0,
+             warnings_as_errors: false,
+             suppressed_codes:   [],
+         };
+diff --git a/compiler/src/compiler/parser/expr_parser.cryo b/compiler/src/compiler/parser/expr_parser.cryo
+index fa83dbca..4639140b 100644
+--- a/compiler/src/compiler/parser/expr_parser.cryo
++++ b/compiler/src/compiler/parser/expr_parser.cryo
+@@ -3177,7 +3177,7 @@ implement struct Parser {
+                 this.advance();
+                 const ptr_ann: PointerAnnotation* = new PointerAnnotation {
+                     inner:    result,
+-                    is_const: pending.reads_only(),
++                    is_const: !pending.is_written() || pending.reads_only(),
+                     span:     this.span_from(start),
+                 };
+                 pending = PointerMark::Unmarked; // a mark binds to the innermost pointer only
+diff --git a/compiler/src/compiler/sema/diagnostics.cryo b/compiler/src/compiler/sema/diagnostics.cryo
+index ec1e3b86..647ebdcd 100644
+--- a/compiler/src/compiler/sema/diagnostics.cryo
++++ b/compiler/src/compiler/sema/diagnostics.cryo
+@@ -21,7 +21,13 @@ import compiler::diag::{ diagnostic, edit_distance, ErrorCode, source_span, sugg
+ import compiler::types::{ type_ref, type_base, arena, compound, user_defined, TypeKind };
+ import compiler::resolver::{ symbol_str, intern_table, qualified_name };
+ import compiler::compilation_context::{ CompilationContext };
+-import compiler::decl_index::{ DeclarationIndex };
++import compiler::decl_index::{ DeclarationIndex, OverloadId };
++import compiler::ast::declaration::{ FieldDecl, FunctionDecl, StructDecl, VarDecl };
++import compiler::ast::{ MemberPin, PointerAnnotation };
++import compiler::ast::expression::{ CalleePin };
++import compiler::resolver::res::{ DefId, ResSlot };
++import compiler::resolver::symbol_id::{ SymbolID };
++import compiler::lex::{ TokenType };
+ import compiler::ast::{ expression, LiteralKind, node, TypeAnnotation };
+ import compiler::lex;
+ import compiler::sema::{ state, helpers, type_utils };
+@@ -162,6 +168,7 @@ type struct Diagnostics {
+                         expected: TypeRef, expected_name: string, found: TypeRef,
+                         context_msg: string, context_span: SourceSpan,
+                         value_expr: ExpressionNode*) -> void {
++        if (value_expr != null) { this.audit_value(value_expr, found, expected, span); }
+         const found_name: string = this.types.type_display_name(found);
+ 
+         mut diag: Diagnostic = Diagnostic::error(code, "mismatched types");
+@@ -184,6 +191,197 @@ type struct Diagnostics {
+         this.ctx.emit_diagnostic(diag);
+     }
+ 
++    audit_line(&this, span: SourceSpan) -> void {
++        fmt::printf("AUDIT\t%s\t%u\t%u\t%u\t%u\n", span.file, span.start_line, span.start_col, span.end_line, span.end_col);
++    }
++
++    audit_miss(&this, at: SourceSpan, why: string) -> void {
++        fmt::printf("AUDIT-MISS\t%s\t%u\t%u\t%s\n", at.file, at.start_line, at.start_col, why);
++    }
++
++    audit_strip(&this, ty: TypeRef) -> TypeRef {
++        mut walk: TypeRef = ty;
++        for (mut i: i32 = 0; i < 8; i++) {
++            const t: Type* = this.arena.lookup(walk);
++            if (t == null) { return walk; }
++            if (t.kind == TypeKind::Pointer) { walk = t.as_pointer().pointee; }
++            else if (t.kind == TypeKind::Reference) { walk = t.as_reference().referent; }
++            else { return walk; }
++        }
++        return walk;
++    }
++
++    audit_inner(&this, ann: TypeAnnotation*) -> TypeAnnotation* {
++        if (ann == null) { return null; }
++        return match (*ann) {
++            TypeAnnotation::Pointer(p)   => { p.inner }
++            TypeAnnotation::Reference(r) => { r.inner }
++            TypeAnnotation::Array(a)     => { a.element }
++            _                            => { null }
++        };
++    }
++
++    audit_function(&this, decl: DeclarationNode*) -> FunctionDecl* {
++        if (decl == null) { return null; }
++        if (DeclarationNode::fn_of(decl) != null) { return DeclarationNode::fn_of(decl); }
++        if (DeclarationNode::method_of(decl) != null) { return DeclarationNode::fn_of(DeclarationNode::method_of(decl).func); }
++        return null;
++    }
++
++    audit_pinned(&this, pin: CalleePin) -> FunctionDecl* {
++        return match (pin) {
++            CalleePin::Decl(entry) => { this.audit_function(this.ctx.decl_index.entry_decl(entry)) }
++            CalleePin::Instance(t) => {
++                this.audit_function(this.ctx.decl_index.declaration_of(this.ctx.decl_index.def_of(t, this.arena)))
++            }
++            _ => { null }
++        };
++    }
++
++    audit_callee(&this, call: CallExpr*) -> FunctionDecl* {
++        mut f: FunctionDecl* = this.audit_pinned(call.resolved_callee);
++        if (f != null) { return f; }
++        if (call.named_method.is_valid()) {
++            f = this.audit_function(this.ctx.decl_index.method_func_of(call.named_method));
++            if (f != null) { return f; }
++        }
++        const path: expression::ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(call.callee);
++        if (path != null) {
++            f = this.audit_pinned(path.resolved_callee);
++            if (f != null) { return f; }
++        }
++        const id: expression::IdentifierExpr* = ExpressionNode::identifier_of(call.callee);
++        if (id != null) {
++            const def: DefId = match (id.res) {
++                ResSlot::Answered(r) => { r.def_id() }
++                _                    => { DefId::invalid() }
++            };
++            if (def.is_valid()) { return this.audit_function(this.ctx.decl_index.declaration_of(def)); }
++        }
++        return null;
++    }
++
++    audit_origin(&this, e: ExpressionNode*, depth: i32) -> TypeAnnotation* {
++        if (e == null || depth > 12) { return null; }
++        const id: expression::IdentifierExpr* = ExpressionNode::identifier_of(e);
++        if (id != null) {
++            const sym: SymbolID = id.res.local_sym();
++            if (sym.is_valid()) {
++                match (this.state.audit_vars.get(&sym.table_key())) {
++                    Option::Some(v) => {
++                        if (v.type_annotation != null) { return v.type_annotation; }
++                        return this.audit_origin(v.initializer, depth + 1);
++                    }
++                    Option::None => { return null; }
++                }
++            }
++            const def: DefId = match (id.res) {
++                ResSlot::Answered(r) => { r.def_id() }
++                _                    => { DefId::invalid() }
++            };
++            if (!def.is_valid()) { return null; }
++            const gv: VarDecl* = DeclarationNode::var_of(this.ctx.decl_index.declaration_of(def));
++            if (gv == null) { return null; }
++            if (gv.type_annotation != null) { return gv.type_annotation; }
++            return this.audit_origin(gv.initializer, depth + 1);
++        }
++        const ma: expression::MemberAccessExpr* = ExpressionNode::member_access_of(e);
++        if (ma != null) {
++            mut index: i64 = -1;
++            match (ma.resolved_member) {
++                MemberPin::Field(i) => { index = i; }
++                _                   => { }
++            }
++            if (index < 0 || ma.object == null) { return null; }
++            const def: DefId = this.ctx.decl_index.def_of(this.audit_strip(ma.object.resolved_type), this.arena);
++            if (!def.is_valid()) { return null; }
++            const sd: StructDecl* = DeclarationNode::struct_of(this.ctx.decl_index.declaration_of(def));
++            if (sd == null || index >= sd.fields.length()) { return null; }
++            const fd: FieldDecl* = DeclarationNode::field_of(sd.fields[index]);
++            if (fd == null) { return null; }
++            return fd.type_annotation;
++        }
++        const call: CallExpr* = ExpressionNode::call_of(e);
++        if (call != null) {
++            const f: FunctionDecl* = this.audit_callee(call);
++            if (f == null) { return null; }
++            return f.return_type_annotation;
++        }
++        const cast: expression::CastExpr* = ExpressionNode::cast_of(e);
++        if (cast != null) { return cast.target_annotation; }
++        const aa: expression::ArrayAccessExpr* = ExpressionNode::array_access_of(e);
++        if (aa != null) {
++            if (aa.desugared_call != null) { return null; }
++            return this.audit_inner(this.audit_origin(aa.array, depth + 1));
++        }
++        const un: expression::UnaryExpr* = ExpressionNode::unary_of(e);
++        if (un != null && un.op.kind == TokenType::Star && un.desugared_call == null) {
++            return this.audit_inner(this.audit_origin(un.operand, depth + 1));
++        }
++        return null;
++    }
++
++    /// A write through `holder` was refused: report the deepest read-only
++    /// pointer level of the annotation declaring it.
++    audit_holder(&this, holder: ExpressionNode*, at: SourceSpan) -> void {
++        mut ann: TypeAnnotation* = this.audit_origin(holder, 0);
++        if (ann == null) { this.audit_miss(at, "holder"); return; }
++        mut ty: TypeRef = holder.resolved_type;
++        mut chosen: PointerAnnotation* = null;
++        for (mut i: i32 = 0; i < 16 && ann != null; i++) {
++            const t: Type* = this.arena.lookup(ty);
++            if (t == null) { break; }
++            if (t.kind == TypeKind::Pointer) {
++                const pa: PointerAnnotation* = match (*ann) {
++                    TypeAnnotation::Pointer(p) => { p }
++                    _                          => { null }
++                };
++                if (pa == null) { break; }
++                if (t.as_pointer().const_pointee) { chosen = pa; }
++                ann = pa.inner;
++                ty = t.as_pointer().pointee;
++            } else if (t.kind == TypeKind::Reference) {
++                ann = this.audit_inner(ann);
++                ty = t.as_reference().referent;
++            } else {
++                break;
++            }
++        }
++        if (chosen == null) { this.audit_miss(at, "holder-level"); return; }
++        this.audit_line(chosen.span);
++    }
++
++    /// A read-only value met a writable slot: report each pointer level of
++    /// the annotation declaring the value that is read-only where the slot's
++    /// is writable.
++    audit_value(&this, value: ExpressionNode*, found: TypeRef, expected: TypeRef, at: SourceSpan) -> void {
++        const ft: Type* = this.arena.lookup(found);
++        const xt: Type* = this.arena.lookup(expected);
++        if (ft == null || xt == null || ft.kind != TypeKind::Pointer || xt.kind != TypeKind::Pointer) { return; }
++        const ann: TypeAnnotation* = this.audit_origin(value, 0);
++        if (ann == null) { this.audit_miss(at, "value"); return; }
++        if (!this.audit_walk(ann, found, expected)) { this.audit_miss(at, "value-level"); }
++    }
++
++    audit_walk(&this, ann: TypeAnnotation*, found: TypeRef, expected: TypeRef) -> boolean {
++        if (ann == null) { return false; }
++        const ft: Type* = this.arena.lookup(found);
++        const xt: Type* = this.arena.lookup(expected);
++        if (ft == null || xt == null || ft.kind != TypeKind::Pointer || xt.kind != TypeKind::Pointer) { return false; }
++        const pa: PointerAnnotation* = match (*ann) {
++            TypeAnnotation::Pointer(p) => { p }
++            _                          => { null }
++        };
++        if (pa == null) { return false; }
++        mut reported: boolean = false;
++        if (ft.as_pointer().const_pointee && !xt.as_pointer().const_pointee) {
++            this.audit_line(pa.span);
++            reported = true;
++        }
++        if (this.audit_walk(pa.inner, ft.as_pointer().pointee, xt.as_pointer().pointee)) { reported = true; }
++        return reported;
++    }
++
+     /// The kind of type `ty`, or `Void` when it names none.
+     kind_or_void(&this, ty: TypeRef) -> TypeKind {
+         const t: Type* = this.arena.lookup(ty);
+diff --git a/compiler/src/compiler/sema/sema.cryo b/compiler/src/compiler/sema/sema.cryo
+index d1ffeabd..85626997 100644
+--- a/compiler/src/compiler/sema/sema.cryo
++++ b/compiler/src/compiler/sema/sema.cryo
+@@ -976,6 +976,7 @@ type struct SemaVisitor {
+             const param_decl: DeclarationNode* = func.parameters[i];
+             const param: VarDecl* = DeclarationNode::var_of(param_decl);
+             if (param == null) { continue; }
++            if (param.sym_id.is_valid()) { this.state.audit_vars.insert(param.sym_id.table_key(), param); }
+             // A parameter whose annotation failed to resolve was reported
+             // where it was written; it is bound with NO type, so a use of it
+             // is silent rather than a second report about `void`.
+@@ -1531,6 +1532,7 @@ type struct SemaVisitor {
+         }
+         this.scopes.declare(var_node.sym_id, ty, is_mut);
+         this.scopes.set_kw_span(var_node.sym_id, var_node.kw_span);
++        if (var_node.sym_id.is_valid()) { this.state.audit_vars.insert(var_node.sym_id.table_key(), var_node); }
+     }
+ 
+     visit_destructure(mut &this, d: DeclarationNode*, node: DestructureDecl*) -> void {
+@@ -3108,6 +3110,10 @@ type struct SemaVisitor {
+     /// when it is writable.
+     refuse_read_only_write(mut &this, access: PlaceAccess, span: SourceSpan, what: string) -> void {
+         if (access.is_writable()) { return; }
++        match (access) {
++            PlaceAccess::ReadOnlyPointer(h) => { this.diag.audit_holder(h, span); }
++            _                               => { }
++        }
+         this.ctx.emit_diagnostic(this.read_only_report(ErrorCode::E0250_WRITE_THROUGH_READ_ONLY,
+             access, span, what, "written here"));
+     }
+@@ -3116,6 +3122,10 @@ type struct SemaVisitor {
+     /// `access` says it is read-only; nothing when it is writable.
+     refuse_read_only_borrow(mut &this, access: PlaceAccess, span: SourceSpan) -> void {
+         if (access.is_writable()) { return; }
++        match (access) {
++            PlaceAccess::ReadOnlyPointer(h) => { this.diag.audit_holder(h, span); }
++            _                               => { }
++        }
+         this.ctx.emit_diagnostic(this.read_only_report(ErrorCode::E0251_READ_ONLY_FOR_WRITABLE,
+             access, span, "take a writable borrow of", "borrowed for writing here"));
+     }
+diff --git a/compiler/src/compiler/sema/state.cryo b/compiler/src/compiler/sema/state.cryo
+index a7106604..eee80e7e 100644
+--- a/compiler/src/compiler/sema/state.cryo
++++ b/compiler/src/compiler/sema/state.cryo
+@@ -23,7 +23,7 @@ import compiler::ast::{ TypeAnnotation };
+ import compiler::ast::node;
+ import compiler::ast::expression::{ CallExpr, ExpressionNode, LambdaExpr };
+ import compiler::resolver::symbol_str::{ SymbolStr };
+-import compiler::ast::declaration::{ FunctionDecl, DeclarationNode, GenericParamDecl, ImplBlock };
++import compiler::ast::declaration::{ FunctionDecl, DeclarationNode, GenericParamDecl, ImplBlock, VarDecl };
+ import compiler::resolver::res::{ DefKey };
+ import compiler::decl_index::{ OverloadId };
+ import compiler::resolver::symbol_id::{ SymbolID, SymbolKey };
+@@ -131,6 +131,7 @@ type struct SemaState {
+     // escaping a stack slot - the return-escape check flags only
+     // `&<body-local>`.
+     param_bindings:   HashSet<SymbolKey>;
++    audit_vars:       HashMap<SymbolKey, VarDecl*>;
+     // True while inside a method whose receiver is `&this` / `mut &this`.  A
+     // by-value `this` receiver lives in THIS frame, so it is not caller-backed.
+     this_is_by_ref: boolean;
+@@ -231,6 +232,7 @@ type struct SemaState {
+             payload_bindings: HashSet::<SymbolKey>::new(),
+             alias_bindings:   HashSet::<SymbolKey>::new(),
+             param_bindings:   HashSet::<SymbolKey>::new(),
++            audit_vars:       HashMap::<SymbolKey, VarDecl*>::new(),
+             this_is_by_ref:  false,
+             receiver_sym:    SymbolID::invalid(),
+             current_func: null,

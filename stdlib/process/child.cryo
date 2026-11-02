@@ -584,7 +584,7 @@ private type struct ChildWaitJob {
 /// before it, and the pool publishes the job's terminal status under its lock
 /// after this returns, which is what orders the two.
 private function child_wait_job_run(raw: u8*) -> void {
-    mut j: ChildWaitJob* = raw as ChildWaitJob*;
+    mut j: mut ChildWaitJob* = raw as mut ChildWaitJob*;
     match (os_proc_wait(j.pid, j.handle)) {
         Result::Ok(s)  => { j.status = s; j.ok = true;  }
         Result::Err(e) => { j.err    = e; j.ok = false; }
@@ -653,8 +653,8 @@ private type struct ChildWait {
     private pid:     i32;
     private handle:  u64;            // the `Child`'s reference, valid while it is polled
     private exit_fd: i32;            // >= 0 once a pidfd is open; owned by this future
-    private rt: Reactor*;       // non-null while a registration is live
-    private job:     ChildWaitJob*;  // non-null while a pool job is in flight
+    private rt: mut Reactor*;       // non-null while a registration is live
+    private job:     mut ChildWaitJob*;  // non-null while a pool job is in flight
     private routed:  boolean;        // true once the first poll chose a route
 
     /// Begin waiting on `pid` / `handle`. Nothing is opened or submitted until
@@ -689,7 +689,7 @@ private type struct ChildWait {
     /// running on a pool thread keeps it alive.
     private let_go(mut &this) -> void {
         if (this.job == null) { return; }
-        const j: ChildWaitJob* = this.job;
+        const j: mut ChildWaitJob* = this.job;
         this.job = null;
         j.job.release();
     }
@@ -738,14 +738,14 @@ implement trait Future for struct ChildWait {
                 // after the failed reap above is what makes the race safe -
                 // an exit in between is still reported, because the reactor
                 // arms level-triggered.
-                mut rt: Reactor* = Reactor::require();
+                mut rt: mut Reactor* = Reactor::require();
                 this.rt = rt;
                 rt.register(this.exit_fd, INTEREST_READ, cx.waker());
                 return Poll::Pending;
             }
 
             // Route 2: a pool thread.
-            mut pool: BlockingPool* = BlockingPool::current();
+            mut pool: mut BlockingPool* = BlockingPool::current();
             if (pool == null) {
                 return Poll::Ready(os_proc_wait(this.pid, this.handle));
             }
@@ -761,7 +761,7 @@ implement trait Future for struct ChildWait {
                 }
             }
             mut alloc: GlobalAlloc = GlobalAlloc::new();
-            mut j: ChildWaitJob* = null;
+            mut j: mut ChildWaitJob* = null;
             match (alloc.allocate(Layout::of::<ChildWaitJob>())) {
                 Result::Ok(raw) => { j = raw.cast::<ChildWaitJob>().as_ptr(); }
                 Result::Err(_)  => {
@@ -789,7 +789,7 @@ implement trait Future for struct ChildWait {
         // finished between polls is collected here rather than parked on again -
         // and a waker stored a moment before the child exited cannot be the one
         // nobody fires.
-        mut j: ChildWaitJob* = this.job;
+        mut j: mut ChildWaitJob* = this.job;
         if (j.job.arm(cx.waker()) == JOB_PENDING) {
             return Poll::Pending;
         }
@@ -861,7 +861,7 @@ private type struct PipeDrainJob {
 /// before it, and the pool publishes the job's terminal status under its lock
 /// after this returns, which is what orders the two.
 private function pipe_drain_job_run(raw: u8*) -> void {
-    mut j: PipeDrainJob* = raw as PipeDrainJob*;
+    mut j: mut PipeDrainJob* = raw as mut PipeDrainJob*;
     mut pipe: BorrowedFileDescriptor = BorrowedFileDescriptor::new(j.fd);
     match (pipe.read_to_end(&j.buf)) {
         Result::Ok(_)  => { j.ok = true;  }
@@ -873,7 +873,7 @@ private function pipe_drain_job_run(raw: u8*) -> void {
 /// `drop_fn` for a `PipeDrainJob`: close this block's descriptor and free it,
 /// including any bytes nobody collected. Runs on whichever side let go last.
 private function pipe_drain_job_free(raw: u8*) -> void {
-    mut j: PipeDrainJob* = raw as PipeDrainJob*;
+    mut j: mut PipeDrainJob* = raw as mut PipeDrainJob*;
     if (j.fd >= 0) {
         fd::close_fd(j.fd);
         j.fd = -1;
@@ -913,8 +913,8 @@ private function pipe_drain_job_free(raw: u8*) -> void {
 internal type struct PipeDrain {
     private fd:         i32;            // owned here until the job or `finish` takes it
     private buf:        Array<u8>;
-    private rt: Reactor*;       // non-null while a registration is live
-    private job:        PipeDrainJob*;  // non-null while a pool job is in flight
+    private rt: mut Reactor*;       // non-null while a registration is live
+    private job:        mut PipeDrainJob*;  // non-null while a pool job is in flight
     private routed:     boolean;        // true once the first poll chose a route
     private on_reactor: boolean;        // which route that was
 
@@ -947,7 +947,7 @@ internal type struct PipeDrain {
     /// running on a pool thread keeps it alive.
     private let_go(mut &this) -> void {
         if (this.job == null) { return; }
-        const j: PipeDrainJob* = this.job;
+        const j: mut PipeDrainJob* = this.job;
         this.job = null;
         j.job.release();
     }
@@ -1002,7 +1002,7 @@ implement trait Future for struct PipeDrain {
                                 // makes the race safe: bytes that arrived in
                                 // between are still reported, because the
                                 // reactor arms level-triggered.
-                                mut rt: Reactor* = Reactor::require();
+                                mut rt: mut Reactor* = Reactor::require();
                                 this.rt = rt;
                                 rt.register(this.fd, INTEREST_READ, cx.waker());
                                 return Poll::Pending;
@@ -1013,14 +1013,14 @@ implement trait Future for struct PipeDrain {
                 }
             }
 
-            mut pool: BlockingPool* = BlockingPool::current();
+            mut pool: mut BlockingPool* = BlockingPool::current();
             if (pool == null) {
                 mut inline_pipe: BorrowedFileDescriptor = BorrowedFileDescriptor::new(this.fd);
                 mut inline_r: Result<i64, IoError> = inline_pipe.read_to_end(&this.buf);
                 return this.finish(inline_r);
             }
             mut alloc: GlobalAlloc = GlobalAlloc::new();
-            mut j: PipeDrainJob* = null;
+            mut j: mut PipeDrainJob* = null;
             match (alloc.allocate(Layout::of::<PipeDrainJob>())) {
                 Result::Ok(raw) => { j = raw.cast::<PipeDrainJob>().as_ptr(); }
                 Result::Err(_)  => {
@@ -1054,7 +1054,7 @@ implement trait Future for struct PipeDrain {
         // that finished between polls is collected here rather than parked on
         // again — and a waker stored a moment before the pipe closed cannot be
         // the one nobody fires.
-        mut jc: PipeDrainJob* = this.job;
+        mut jc: mut PipeDrainJob* = this.job;
         if (jc.job.arm(cx.waker()) == JOB_PENDING) {
             return Poll::Pending;
         }

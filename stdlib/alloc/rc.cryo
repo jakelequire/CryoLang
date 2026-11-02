@@ -74,7 +74,7 @@ public type struct Rc<T, A = GlobalAlloc> where A: Allocator {
     // idempotent: a double drop of the same handle is a no-op rather
     // than an over-decrement / use-after-free. Non-null while the handle
     // is live; only the post-drop husk holds null.
-    private inner: RcInner<T, A>*;
+    private inner: mut RcInner<T, A>*;
 
     /// Allocate a new `Rc` backed by `GlobalAlloc` with an initial count
     /// of 1.  Panics if the allocator refuses the request; use
@@ -109,7 +109,7 @@ public type struct Rc<T, A = GlobalAlloc> where A: Allocator {
         const header: Layout = Layout::of::<RcInner<T, GlobalAlloc>>();
         const raw: NonNull<u8> = alloc.allocate(header)?;
         const typed: NonNull<RcInner<T, GlobalAlloc>> = raw.cast::<RcInner<T, GlobalAlloc>>();
-        const inner_ptr: RcInner<T, GlobalAlloc>* = typed.as_ptr();
+        const inner_ptr: mut RcInner<T, GlobalAlloc>* = typed.as_ptr();
         inner_ptr.strong = 1;
         inner_ptr.weak   = 1;
         inner_ptr.value  = value;
@@ -125,7 +125,7 @@ public type struct Rc<T, A = GlobalAlloc> where A: Allocator {
         const header: Layout = Layout::of::<RcInner<T, A>>();
         const raw: NonNull<u8> = a.allocate(header)?;
         const typed: NonNull<RcInner<T, A>> = raw.cast::<RcInner<T, A>>();
-        const inner_ptr: RcInner<T, A>* = typed.as_ptr();
+        const inner_ptr: mut RcInner<T, A>* = typed.as_ptr();
         inner_ptr.strong = 1;
         inner_ptr.weak   = 1;
         inner_ptr.value  = value;
@@ -137,7 +137,7 @@ public type struct Rc<T, A = GlobalAlloc> where A: Allocator {
     /// strong count; the two handles are interchangeable.  Allocator
     /// is shared through the inner pointer; no copy needed.
     public clone(&this) -> Rc<T, A> {
-        const inner_ptr: RcInner<T, A>* = this.inner;
+        const inner_ptr: mut RcInner<T, A>* = this.inner;
         inner_ptr.strong = inner_ptr.strong + 1;
         return Rc::<T, A> { inner: this.inner };
     }
@@ -145,7 +145,7 @@ public type struct Rc<T, A = GlobalAlloc> where A: Allocator {
     /// A non-owning `Weak` handle to the same value.  Bumps the weak count
     /// but not the strong count, so it will not keep the value alive.
     public downgrade(&this) -> Weak<T, A> {
-        const inner_ptr: RcInner<T, A>* = this.inner;
+        const inner_ptr: mut RcInner<T, A>* = this.inner;
         inner_ptr.weak = inner_ptr.weak + 1;
         return Weak::<T, A> { inner: this.inner };
     }
@@ -199,7 +199,7 @@ public type struct Rc<T, A = GlobalAlloc> where A: Allocator {
 public type struct Weak<T, A = GlobalAlloc> {
     // Nullable, like `Rc::inner`: a dangling `Weak::new()` carries null and
     // a dropped handle is nulled for idempotency.
-    private inner: RcInner<T, A>*;
+    private inner: mut RcInner<T, A>*;
 
     /// A `Weak` that never upgrades.  Allocates nothing; `upgrade` always
     /// returns `None`.  Useful as a placeholder before a cycle is wired up.
@@ -213,7 +213,7 @@ public type struct Weak<T, A = GlobalAlloc> {
     /// returned `Rc` keeps the value alive.
     public upgrade(&this) -> Option<Rc<T, A>> {
         if (this.inner == null) { return Option::None; }
-        const inner_ptr: RcInner<T, A>* = this.inner;
+        const inner_ptr: mut RcInner<T, A>* = this.inner;
         if (inner_ptr.strong == 0) { return Option::None; }
         inner_ptr.strong = inner_ptr.strong + 1;
         return Option::Some(Rc::<T, A> { inner: inner_ptr });
@@ -222,7 +222,7 @@ public type struct Weak<T, A = GlobalAlloc> {
     /// Another `Weak` to the same value.  Bumps the weak count.
     public clone(&this) -> Weak<T, A> {
         if (this.inner != null) {
-            const inner_ptr: RcInner<T, A>* = this.inner;
+            const inner_ptr: mut RcInner<T, A>* = this.inner;
             inner_ptr.weak = inner_ptr.weak + 1;
         }
         return Weak::<T, A> { inner: this.inner };
@@ -249,7 +249,7 @@ where A: Allocator {
         // over-decrement (and, for the last owner, a use-after-free on the
         // freed header). Other live clones keep their own non-null inner.
         if (this.inner == null) { return; }
-        const inner_ptr: RcInner<T, A>* = this.inner;
+        const inner_ptr: mut RcInner<T, A>* = this.inner;
         inner_ptr.strong = inner_ptr.strong - 1;
         if (inner_ptr.strong == 0) {
             // Last strong owner: drop the shared value, then release the
@@ -272,7 +272,7 @@ implement<T, A> trait Drop for struct Weak<T, A>
 where A: Allocator {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
-        const inner_ptr: RcInner<T, A>* = this.inner;
+        const inner_ptr: mut RcInner<T, A>* = this.inner;
         inner_ptr.weak = inner_ptr.weak - 1;
         if (inner_ptr.weak == 0) {
             // Strong is already 0 here: while any `Rc` lived, its shared
