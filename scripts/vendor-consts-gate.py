@@ -90,7 +90,7 @@ GENERATED_MUST_CONTAIN = [
     "function vc_touch(",
     "function vc_name() -> const i8*;",
     "lines: const (const i8*)*",
-    "slots: const (i8*)*",
+    "slots: const (mut i8*)*",
 ]
 
 

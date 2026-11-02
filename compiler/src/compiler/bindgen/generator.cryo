@@ -109,7 +109,9 @@ import utils::keyword::{ Keyword };
 /// 19 -> 20: a C pointer to `const` binds as a read-only pointer at that
 /// level, a read-only level above another pointer grouped: `const char*
 /// const*` is `const (const i8*)*`.
-const GENERATOR_VERSION: i64 = 20;
+/// 20 -> 21: every other C pointer level binds as a writable pointer spelled
+/// `mut`: `char**` is `mut (mut i8*)*`.
+const GENERATOR_VERSION: i64 = 21;
 
 /// Renders bindgen-emitted AST decls to `.cryo` source under `namespace ns`.
 type struct BindingSerializer {
@@ -652,18 +654,19 @@ type struct BindingSerializer {
                 return this.ctx.intern_table.resolve(p.name);
             }
             TypeAnnotation::Pointer(p) => {
-                // A C pointer to `const` is a read-only pointer at that level.
-                // An ungrouped `const` marks the innermost pointer of a run,
-                // so a read-only level above another pointer groups it:
-                // `const char* const*` is `const (const u8*)*`.
+                // A C pointer to `const` is a read-only pointer at that level,
+                // and any other a writable one.  An ungrouped mark binds to
+                // the innermost pointer of a run, so a level above another
+                // pointer groups it: `char**` is `mut (mut i8*)*`, and
+                // `const char* const*` is `const (const i8*)*`.
                 const pointee: string = this.render_type(p.inner);
-                if (!p.is_const) { return pointee + "*"; }
+                const mark: string = if (p.is_const) { "const " } else { "mut " };
                 const grouped: boolean = p.inner != null && match (*p.inner) {
                     TypeAnnotation::Pointer(_) => { true }
                     _                          => { false }
                 };
-                if (grouped) { return "const (" + pointee + ")*"; }
-                return "const " + pointee + "*";
+                if (grouped) { return mark + "(" + pointee + ")*"; }
+                return mark + pointee + "*";
             }
             TypeAnnotation::Named(n) => {
                 // The importer qualified this as `<ns>::Tag`; strip back to the
@@ -748,7 +751,7 @@ type struct VendorGenerator {
     /// cache check (catching edits to transitively-included headers).
     static generate(ns: string, source_path: string, headers: &[string],
                     include_dirs: &[string], defines: &[string],
-                    out_inputs: [string]*, language: string, cpp_std: string) -> string {
+                    out_inputs: mut [string]*, language: string, cpp_std: string) -> string {
         mut ctx: CompilationContext = CompilationContext::new(
             BuildOptions::defaults(CompileMode::SingleFile), "<vendor-bindgen>", null);
         // The importer pushes top-level type decls into the AST root; give it a
@@ -961,7 +964,7 @@ type struct VendorGenerator {
 
     /// De-duplicate a path list in place, preserving first-seen order (so the
     /// depfile and thus the fold order are stable across regenerations).
-    static dedup_in_place(arr: [string]*) -> void {
+    static dedup_in_place(arr: mut [string]*) -> void {
         mut out: [string] = [];
         for (mut i: i64 = 0; i < (*arr).length(); i++) {
             const item: string = (*arr)[i];

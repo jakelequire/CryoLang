@@ -12,10 +12,10 @@ index 7098ef31..4e43bb8a 100644
              suppressed_codes:   [],
          };
 diff --git a/compiler/src/compiler/parser/expr_parser.cryo b/compiler/src/compiler/parser/expr_parser.cryo
-index fa83dbca..4639140b 100644
+index a054e295..e1608f1d 100644
 --- a/compiler/src/compiler/parser/expr_parser.cryo
 +++ b/compiler/src/compiler/parser/expr_parser.cryo
-@@ -3177,7 +3177,7 @@ implement struct Parser {
+@@ -3182,7 +3182,7 @@ implement struct Parser {
                  this.advance();
                  const ptr_ann: PointerAnnotation* = new PointerAnnotation {
                      inner:    result,
@@ -24,8 +24,124 @@ index fa83dbca..4639140b 100644
                      span:     this.span_from(start),
                  };
                  pending = PointerMark::Unmarked; // a mark binds to the innermost pointer only
+diff --git a/compiler/src/compiler/sema/call_resolver.cryo b/compiler/src/compiler/sema/call_resolver.cryo
+index 3ae5a251..d432437f 100644
+--- a/compiler/src/compiler/sema/call_resolver.cryo
++++ b/compiler/src/compiler/sema/call_resolver.cryo
+@@ -2525,7 +2525,7 @@ type struct CallResolver {
+             this.ctx.diagnostics.emit(diag);
+             return;
+         }
+-        this.check_args_against_params(visitor, &call.arguments, ft.param_types.as_slice());
++        this.state.audit_call = call; this.check_args_against_params(visitor, &call.arguments, ft.param_types.as_slice());
+     }
+ 
+     /// The signatures of the function family the definition `def` names, in
+@@ -3154,7 +3154,9 @@ type struct CallResolver {
+         }
+         if (found) {
+             const params: [TypeRef] = this.method_call_params(call, chosen_fn, &chosen);
++            this.state.audit_call = call; this.state.audit_fn = chosen_fn;
+             this.check_args_against_params(visitor, &call.arguments, params.as_slice());
++            this.state.audit_fn = null;
+             return;
+         }
+         if (variadic_ok) { return; }
+@@ -3182,7 +3184,7 @@ type struct CallResolver {
+         if (!this.collect_on_template(visitor, call, member, owner_inst, &found)) { return; }
+         if (found.count == 1) {
+             const snap: DiagnosticSnapshot = this.ctx.diagnostics.snapshot();
+-            this.check_args_against_params(visitor, &call.arguments, found.params.as_slice());
++            this.state.audit_call = call; this.check_args_against_params(visitor, &call.arguments, found.params.as_slice());
+             if (unbound_in_body && this.ctx.diagnostics.errors_since(snap) == 0) {
+                 this.refuse_unbound_args(call, found.params.as_slice());
+             }
+@@ -3204,6 +3206,7 @@ type struct CallResolver {
+     /// `u64`), and the body's copies, which bind by that rule, are not
+     /// checked - so this is the only place the call can be refused.
+     refuse_unbound_args(mut &this, call: CallExpr*, params: Slice<TypeRef>) -> void {
++        this.state.audit_call = call;
+         for (mut i: i64 = 0; i < call.arguments.length() && i < params.length(); i++) {
+             const arg: ExpressionNode* = call.arguments[i];
+             if (arg == null) { continue; }
+@@ -4409,7 +4412,7 @@ type struct CallResolver {
+         }
+         const params: [TypeRef] = this.free_call_params(entry, call, &decl, &decl);
+         this.retype_literal_array_arguments(visitor, call, &params);
+-        this.check_args_against_params(visitor, &call.arguments, params.as_slice());
++        this.state.audit_call = call; this.check_args_against_params(visitor, &call.arguments, params.as_slice());
+     }
+ 
+     /// An array literal of polymorphic literals was typed by its literals'
+@@ -5315,7 +5318,7 @@ type struct CallResolver {
+                 call.arguments.length(), false);
+             return TypeRef::invalid();
+         }
+-        this.check_args_against_params(visitor, &call.arguments, params.as_slice());
++        this.state.audit_call = call; this.check_args_against_params(visitor, &call.arguments, params.as_slice());
+         call.callee.set_resolved_type(returned);
+         return returned;
+     }
+@@ -9185,7 +9188,7 @@ type struct CallResolver {
+         } else {
+             sema_copy_type_refs(&et.variants[vi].payload_types)
+         };
+-        this.check_args_against_params(visitor, &call.arguments, payload.as_slice());
++        this.state.audit_call = call; this.check_args_against_params(visitor, &call.arguments, payload.as_slice());
+         return true;
+     }
+ 
+@@ -9777,7 +9780,7 @@ type struct CallResolver {
+                     const params: [TypeRef] = this.free_call_params(
+                         if (callee.is_valid()) { this.ctx.generic_registry.template_of(callee) } else { null },
+                         call, &ft.param_types, &ft.param_types);
+-                    this.check_args_against_params(visitor, &call.arguments, params.as_slice());
++                    this.state.audit_call = call; this.check_args_against_params(visitor, &call.arguments, params.as_slice());
+                 } else {
+                     this.diag.emit_method_arity_error(call_e.span, scope.member_name, "function",
+                         expected, got, ft.is_variadic);
+@@ -9839,7 +9842,7 @@ type struct CallResolver {
+             const open: boolean = this.types.contains_generic_param(pt) || this.types.contains_unresolved_projection(pt);
+             params.push(if (open) { TypeRef::invalid() } else { pt });
+         }
+-        this.check_args_against_params(visitor, &call.arguments, params.as_slice());
++        this.state.audit_call = call; this.check_args_against_params(visitor, &call.arguments, params.as_slice());
+     }
+ 
+     /// Argument check for an impl-qualified call, `(Beta for P)::go(&p)`:
+@@ -9895,7 +9898,7 @@ type struct CallResolver {
+                 call.arguments.length(), false);
+             return;
+         }
+-        this.check_args_against_params(visitor, &call.arguments, params.as_slice());
++        this.state.audit_call = call; this.check_args_against_params(visitor, &call.arguments, params.as_slice());
+     }
+ 
+     /// Argument check against `entries`, the candidates a trait's
+@@ -9933,7 +9936,7 @@ type struct CallResolver {
+             }
+             if (fits != 1) { return; }
+         }
+-        this.check_args_against_params(visitor, &call.arguments, chosen.param_types.as_slice());
++        this.state.audit_call = call; this.check_args_against_params(visitor, &call.arguments, chosen.param_types.as_slice());
+     }
+ 
+     /// Argument type-check for a `Type::method(args)` static call whose callee is
+@@ -10005,10 +10008,10 @@ type struct CallResolver {
+                     for (mut ci: i64 = 0; ci < m.param_types.length(); ci++) { fit_params.push(m.param_types[ci]); }
+                 }
+             }
+-            if (fit_count == 1) { this.check_args_against_params(visitor, &call.arguments, fit_params.as_slice()); }
++            if (fit_count == 1) { this.state.audit_call = call; this.check_args_against_params(visitor, &call.arguments, fit_params.as_slice()); }
+             return;
+         }
+-        if (found) { this.check_args_against_params(visitor, &call.arguments, chosen.as_slice()); return; }
++        if (found) { this.state.audit_call = call; this.check_args_against_params(visitor, &call.arguments, chosen.as_slice()); return; }
+         if (variadic_ok) { return; }
+         if (name_seen > 0) {
+             this.diag.emit_method_arity_error(call_e.span, scope.member_name, "static method", uniq_arity, argc, false);
 diff --git a/compiler/src/compiler/sema/diagnostics.cryo b/compiler/src/compiler/sema/diagnostics.cryo
-index ec1e3b86..647ebdcd 100644
+index 13a4266b..0cd4156e 100644
 --- a/compiler/src/compiler/sema/diagnostics.cryo
 +++ b/compiler/src/compiler/sema/diagnostics.cryo
 @@ -21,7 +21,13 @@ import compiler::diag::{ diagnostic, edit_distance, ErrorCode, source_span, sugg
@@ -43,15 +159,26 @@ index ec1e3b86..647ebdcd 100644
  import compiler::ast::{ expression, LiteralKind, node, TypeAnnotation };
  import compiler::lex;
  import compiler::sema::{ state, helpers, type_utils };
-@@ -162,6 +168,7 @@ type struct Diagnostics {
+@@ -153,15 +159,18 @@ type struct Diagnostics {
+                            expected: TypeRef, expected_ann: TypeAnnotation*, found: TypeRef,
+                            context_msg: string, context_span: SourceSpan,
+                            value_expr: ExpressionNode*) -> void {
++        this.state.audit_slot = expected_ann;
+         this.emit_mismatch_shown(code, span, expected,
+             this.types.written_display_name(expected, expected_ann),
+             found, context_msg, context_span, value_expr);
++        this.state.audit_slot = null;
+     }
+ 
+     emit_mismatch_shown(mut &this, code: ErrorCode, span: SourceSpan,
                          expected: TypeRef, expected_name: string, found: TypeRef,
                          context_msg: string, context_span: SourceSpan,
                          value_expr: ExpressionNode*) -> void {
-+        if (value_expr != null) { this.audit_value(value_expr, found, expected, span); }
++        if (value_expr != null) { this.audit_value(value_expr, found, expected, span, context_msg); }
          const found_name: string = this.types.type_display_name(found);
  
          mut diag: Diagnostic = Diagnostic::error(code, "mismatched types");
-@@ -184,6 +191,197 @@ type struct Diagnostics {
+@@ -184,6 +193,332 @@ type struct Diagnostics {
          this.ctx.emit_diagnostic(diag);
      }
  
@@ -83,6 +210,21 @@ index ec1e3b86..647ebdcd 100644
 +            TypeAnnotation::Array(a)     => { a.element }
 +            _                            => { null }
 +        };
++    }
++
++    /// The element annotation of the `[T]` an annotation reaches through its
++    /// pointers and borrows.
++    audit_element(&this, ann: TypeAnnotation*) -> TypeAnnotation* {
++        mut walk: TypeAnnotation* = ann;
++        for (mut i: i32 = 0; i < 8 && walk != null; i++) {
++            match (*walk) {
++                TypeAnnotation::Pointer(p)   => { walk = p.inner; }
++                TypeAnnotation::Reference(r) => { walk = r.inner; }
++                TypeAnnotation::Array(a)     => { return a.element; }
++                _                            => { return null; }
++            }
++        }
++        return null;
 +    }
 +
 +    audit_function(&this, decl: DeclarationNode*) -> FunctionDecl* {
@@ -136,8 +278,12 @@ index ec1e3b86..647ebdcd 100644
 +                        if (v.type_annotation != null) { return v.type_annotation; }
 +                        return this.audit_origin(v.initializer, depth + 1);
 +                    }
-+                    Option::None => { return null; }
++                    Option::None => { }
 +                }
++                return match (this.state.audit_payloads.get(&sym.table_key())) {
++                    Option::Some(a) => { a }
++                    Option::None    => { null }
++                };
 +            }
 +            const def: DefId = match (id.res) {
 +                ResSlot::Answered(r) => { r.def_id() }
@@ -175,8 +321,13 @@ index ec1e3b86..647ebdcd 100644
 +        if (cast != null) { return cast.target_annotation; }
 +        const aa: expression::ArrayAccessExpr* = ExpressionNode::array_access_of(e);
 +        if (aa != null) {
-+            if (aa.desugared_call != null) { return null; }
++            if (aa.desugared_call != null) { return this.audit_element(this.audit_origin(aa.array, depth + 1)); }
 +            return this.audit_inner(this.audit_origin(aa.array, depth + 1));
++        }
++        const bin: expression::BinaryExpr* = ExpressionNode::binary_of(e);
++        if (bin != null && bin.desugared_call == null
++                && (bin.op.kind == TokenType::Plus || bin.op.kind == TokenType::Minus)) {
++            return this.audit_origin(bin.left, depth + 1);
 +        }
 +        const un: expression::UnaryExpr* = ExpressionNode::unary_of(e);
 +        if (un != null && un.op.kind == TokenType::Star && un.desugared_call == null) {
@@ -218,13 +369,124 @@ index ec1e3b86..647ebdcd 100644
 +    /// A read-only value met a writable slot: report each pointer level of
 +    /// the annotation declaring the value that is read-only where the slot's
 +    /// is writable.
-+    audit_value(&this, value: ExpressionNode*, found: TypeRef, expected: TypeRef, at: SourceSpan) -> void {
++    audit_value(&this, value: ExpressionNode*, found: TypeRef, expected: TypeRef, at: SourceSpan,
++                context_msg: string) -> void {
++        mut slot: TypeAnnotation* = this.state.audit_slot;
++        if (slot == null && this.state.audit_call != null && context_msg.starts_with("argument ")) {
++            mut n: i64 = 0;
++            for (mut k: i64 = 1; k <= 64 && n == 0; k++) {
++                if (context_msg.starts_with(fmt::format("argument %lld ", k))) { n = k; }
++            }
++            const f: FunctionDecl* = if (this.state.audit_fn != null) {
++                this.audit_function(this.state.audit_fn)
++            } else {
++                this.audit_callee(this.state.audit_call)
++            };
++            if (f != null && n >= 1 && n <= f.parameters.length()) {
++                const p: VarDecl* = DeclarationNode::var_of(f.parameters[n - 1]);
++                if (p != null) { slot = p.type_annotation; }
++            }
++        }
++        mut ann: TypeAnnotation* = this.audit_origin(value, 0);
++        mut ft_ref: TypeRef = found;
++        const ft: Type* = this.arena.lookup(found);
++        const un: expression::UnaryExpr* = ExpressionNode::unary_of(value);
++        if (ann == null && un != null && un.op.kind == TokenType::Amp && ft != null && ft.kind == TypeKind::Reference) {
++            // `&x` met a pointer slot: x's own annotation is a level below.
++            const xt0: Type* = this.arena.lookup(expected);
++            if (xt0 != null && (xt0.kind == TypeKind::Pointer || xt0.kind == TypeKind::Reference)) {
++                const inner: TypeAnnotation* = this.audit_origin(un.operand, 0);
++                const slot_inner: TypeAnnotation* = this.audit_inner(slot);
++                if (inner == null && slot_inner == null) { this.audit_miss(at, "value"); return; }
++                const below: TypeRef = if (xt0.kind == TypeKind::Pointer) {
++                    xt0.as_pointer().pointee
++                } else {
++                    xt0.as_reference().referent
++                };
++                if (!this.audit_pair(inner, slot_inner, ft.as_reference().referent, below, true)) {
++                    this.audit_miss(at, if (slot == null) { "borrow-noslot" } else { "borrow-level" });
++                }
++                return;
++            }
++        }
++        if (ann == null && slot == null) { this.audit_miss(at, "value"); return; }
++        if (!this.audit_pair(ann, slot, ft_ref, expected, false)) {
++            this.audit_miss(at, if (slot == null) { "value-level-noslot" } else { "value-level" });
++        }
++    }
++
++    /// Walk the value's annotation and the slot's beside the two types:
++    /// a read-only level of the value where the slot's is writable marks
++    /// the value's; below the top, where the two must match exactly, a
++    /// writable level of the value where the slot's is read-only marks the
++    /// slot's.
++    audit_pair(&this, value: TypeAnnotation*, slot: TypeAnnotation*, found: TypeRef, expected: TypeRef,
++               exact: boolean) -> boolean {
 +        const ft: Type* = this.arena.lookup(found);
 +        const xt: Type* = this.arena.lookup(expected);
-+        if (ft == null || xt == null || ft.kind != TypeKind::Pointer || xt.kind != TypeKind::Pointer) { return; }
-+        const ann: TypeAnnotation* = this.audit_origin(value, 0);
-+        if (ann == null) { this.audit_miss(at, "value"); return; }
-+        if (!this.audit_walk(ann, found, expected)) { this.audit_miss(at, "value-level"); }
++        if (ft == null || xt == null) { return false; }
++        if (ft.kind == TypeKind::Pointer && xt.kind == TypeKind::Pointer) {
++            const vp: PointerAnnotation* = this.audit_pointer(value);
++            const sp: PointerAnnotation* = this.audit_pointer(slot);
++            mut reported: boolean = false;
++            const fc: boolean = ft.as_pointer().const_pointee;
++            const xc: boolean = xt.as_pointer().const_pointee;
++            if (fc && !xc && vp != null) { this.audit_line(vp.span); reported = true; }
++            if (!fc && xc && exact && sp != null) { this.audit_line(sp.span); reported = true; }
++            const vi: TypeAnnotation* = if (vp != null) { vp.inner } else { null };
++            const si: TypeAnnotation* = if (sp != null) { sp.inner } else { null };
++            if ((vi != null || si != null)
++                    && this.audit_pair(vi, si, ft.as_pointer().pointee, xt.as_pointer().pointee, true)) {
++                reported = true;
++            }
++            return reported;
++        }
++        if (ft.kind == TypeKind::Reference && xt.kind == TypeKind::Reference) {
++            return this.audit_pair(this.audit_inner(value), this.audit_inner(slot),
++                ft.as_reference().referent, xt.as_reference().referent, true);
++        }
++        if (ft.kind != TypeKind::Reference && xt.kind == TypeKind::Reference) {
++            // A value borrowed for the slot.
++            return this.audit_pair(value, this.audit_inner(slot), found, xt.as_reference().referent, true);
++        }
++        if (ft.kind == TypeKind::Array && xt.kind == TypeKind::Array) {
++            return this.audit_pair(this.audit_element(value), this.audit_element(slot),
++                ft.as_array().element, xt.as_array().element, true);
++        }
++        if (ft.kind == TypeKind::InstantiatedType && xt.kind == TypeKind::InstantiatedType) {
++            const fa: [TypeRef] = ft.as_instantiated().type_args;
++            const xa: [TypeRef] = xt.as_instantiated().type_args;
++            if (fa.length() != xa.length()) { return false; }
++            mut reported: boolean = false;
++            for (mut i: i64 = 0; i < fa.length(); i++) {
++                if (this.audit_pair(this.audit_argument(value, i, fa.length()), this.audit_argument(slot, i, fa.length()),
++                        fa[i], xa[i], true)) {
++                    reported = true;
++                }
++            }
++            return reported;
++        }
++        return false;
++    }
++
++    audit_pointer(&this, ann: TypeAnnotation*) -> PointerAnnotation* {
++        if (ann == null) { return null; }
++        return match (*ann) {
++            TypeAnnotation::Pointer(p) => { p }
++            _                          => { null }
++        };
++    }
++
++    /// The `i`th type argument an annotation writes: a generic's, or the
++    /// element of a `[T]` written for a one-argument instance.
++    audit_argument(&this, ann: TypeAnnotation*, i: i64, count: i64) -> TypeAnnotation* {
++        if (ann == null) { return null; }
++        match (*ann) {
++            TypeAnnotation::Generic(g) => { if (i < g.args.length()) { return g.args[i]; } }
++            TypeAnnotation::Array(a)   => { if (i == 0) { return a.element; } }
++            _                          => { }
++        }
++        return null;
 +    }
 +
 +    audit_walk(&this, ann: TypeAnnotation*, found: TypeRef, expected: TypeRef) -> boolean {
@@ -249,8 +511,68 @@ index ec1e3b86..647ebdcd 100644
      /// The kind of type `ty`, or `Void` when it names none.
      kind_or_void(&this, ty: TypeRef) -> TypeKind {
          const t: Type* = this.arena.lookup(ty);
+diff --git a/compiler/src/compiler/sema/pattern_resolver.cryo b/compiler/src/compiler/sema/pattern_resolver.cryo
+index d091e638..118ec119 100644
+--- a/compiler/src/compiler/sema/pattern_resolver.cryo
++++ b/compiler/src/compiler/sema/pattern_resolver.cryo
+@@ -16,7 +16,8 @@ import compiler::types::{
+     type_ref, type_base, arena, compound, user_defined, generic, substitution, generic_registry, TypeKind
+ };
+ import compiler::resolver::{ symbol_str, intern_table };
+-import compiler::resolver::res::{ Res, ResSlot };
++import compiler::resolver::res::{ DefId, Res, ResSlot };
++import compiler::ast::declaration::{ DeclarationNode, EnumDecl, EnumVariant };
+ import compiler::ast::{
+     expression, LiteralKind, MemberPin, node, pattern, PatternBinding,
+     PatternElement, statement
+@@ -457,8 +458,17 @@ type struct PatternResolver {
+                 pb.resolved_type = elem_ty;
+                 // Remember the binding so a `return &payload` is caught (E0455).
+                 this.bind_payload(pb.sym_id, elem_ty, caller_backed, writable);
++                this.audit_payload(enum_pat, j, pb.sym_id);
+                 continue;
+             }
++            const audit_sub: Pattern* = enum_pat.sub_at(j);
++            if (audit_sub != null) {
++                match (audit_sub.kind) {
++                    PatternKind::Binding(bp) => { this.audit_payload(enum_pat, j, bp.binding_sym); }
++                    _                        => { }
++                }
++            }
++
+             const sub: Pattern* = enum_pat.sub_at(j);
+             if (sub == null) { continue; }
+             match (sub.kind) {
+@@ -472,6 +482,27 @@ type struct PatternResolver {
+         }
+     }
+ 
++    /// Record the payload annotation the `j`th element of `enum_pat` binds.
++    audit_payload(mut &this, enum_pat: EnumPattern*, j: i64, sym: SymbolID) -> void {
++        if (!sym.is_valid()) { return; }
++        mut vi: i64 = -1;
++        match (enum_pat.resolved_member) {
++            MemberPin::Variant(v) => { vi = v; }
++            _                     => { }
++        }
++        if (vi < 0) { return; }
++        const def: DefId = match (enum_pat.res) {
++            ResSlot::Answered(r) => { r.def_id() }
++            _                    => { DefId::invalid() }
++        };
++        if (!def.is_valid()) { return; }
++        const ed: EnumDecl* = DeclarationNode::enum_of(this.ctx.decl_index.declaration_of(def));
++        if (ed == null || vi >= ed.variants.length()) { return; }
++        const ev: EnumVariant* = DeclarationNode::variant_of(ed.variants[vi]);
++        if (ev == null || j >= ev.associated_types.length()) { return; }
++        this.state.audit_payloads.insert(sym.table_key(), ev.associated_types[j]);
++    }
++
+     /// Refuse a constant pattern that cannot be compared with a value of
+     /// `value_type`.  Codegen compares the value with the constant's value as
+     /// it would with a literal of the value's own type, so a constant of any
 diff --git a/compiler/src/compiler/sema/sema.cryo b/compiler/src/compiler/sema/sema.cryo
-index d1ffeabd..85626997 100644
+index e52d970d..5cc49ea3 100644
 --- a/compiler/src/compiler/sema/sema.cryo
 +++ b/compiler/src/compiler/sema/sema.cryo
 @@ -976,6 +976,7 @@ type struct SemaVisitor {
@@ -268,8 +590,21 @@ index d1ffeabd..85626997 100644
 +        if (var_node.sym_id.is_valid()) { this.state.audit_vars.insert(var_node.sym_id.table_key(), var_node); }
      }
  
-     visit_destructure(mut &this, d: DeclarationNode*, node: DestructureDecl*) -> void {
-@@ -3108,6 +3110,10 @@ type struct SemaVisitor {
+     visit_destructure(mut &this, d: DeclarationNode*, node: mut DestructureDecl*) -> void {
+@@ -2520,10 +2522,12 @@ type struct SemaVisitor {
+                     ObjectConversionOutcome::Refused => { }
+                     ObjectConversionOutcome::Mismatch => {
+                         const value_span: SourceSpan = if (bin.right != null) { bin.right.span } else { e.span };
++                        this.state.audit_slot = this.diag.audit_origin(bin.left, 0);
+                         this.diag.emit_type_mismatch_with_value(
+                             ErrorCode::E0200_TYPE_MISMATCH, value_span, lhs, rhs,
+                             "the value assigned here doesn't match the type of the assignment target",
+                             bin.left.span, bin.right);
++                        this.state.audit_slot = null;
+                     }
+                 }
+             }
+@@ -3130,6 +3134,10 @@ type struct SemaVisitor {
      /// when it is writable.
      refuse_read_only_write(mut &this, access: PlaceAccess, span: SourceSpan, what: string) -> void {
          if (access.is_writable()) { return; }
@@ -280,7 +615,7 @@ index d1ffeabd..85626997 100644
          this.ctx.emit_diagnostic(this.read_only_report(ErrorCode::E0250_WRITE_THROUGH_READ_ONLY,
              access, span, what, "written here"));
      }
-@@ -3116,6 +3122,10 @@ type struct SemaVisitor {
+@@ -3138,6 +3146,10 @@ type struct SemaVisitor {
      /// `access` says it is read-only; nothing when it is writable.
      refuse_read_only_borrow(mut &this, access: PlaceAccess, span: SourceSpan) -> void {
          if (access.is_writable()) { return; }
@@ -292,7 +627,7 @@ index d1ffeabd..85626997 100644
              access, span, "take a writable borrow of", "borrowed for writing here"));
      }
 diff --git a/compiler/src/compiler/sema/state.cryo b/compiler/src/compiler/sema/state.cryo
-index a7106604..eee80e7e 100644
+index ede48ad3..64a379f4 100644
 --- a/compiler/src/compiler/sema/state.cryo
 +++ b/compiler/src/compiler/sema/state.cryo
 @@ -23,7 +23,7 @@ import compiler::ast::{ TypeAnnotation };
@@ -304,19 +639,27 @@ index a7106604..eee80e7e 100644
  import compiler::resolver::res::{ DefKey };
  import compiler::decl_index::{ OverloadId };
  import compiler::resolver::symbol_id::{ SymbolID, SymbolKey };
-@@ -131,6 +131,7 @@ type struct SemaState {
+@@ -131,6 +131,11 @@ type struct SemaState {
      // escaping a stack slot - the return-escape check flags only
      // `&<body-local>`.
      param_bindings:   HashSet<SymbolKey>;
 +    audit_vars:       HashMap<SymbolKey, VarDecl*>;
++    audit_payloads:   HashMap<SymbolKey, TypeAnnotation*>;
++    audit_call:       CallExpr*;
++    audit_fn:         DeclarationNode*;
++    audit_slot:       TypeAnnotation*;
      // True while inside a method whose receiver is `&this` / `mut &this`.  A
      // by-value `this` receiver lives in THIS frame, so it is not caller-backed.
      this_is_by_ref: boolean;
-@@ -231,6 +232,7 @@ type struct SemaState {
+@@ -231,6 +236,11 @@ type struct SemaState {
              payload_bindings: HashSet::<SymbolKey>::new(),
              alias_bindings:   HashSet::<SymbolKey>::new(),
              param_bindings:   HashSet::<SymbolKey>::new(),
 +            audit_vars:       HashMap::<SymbolKey, VarDecl*>::new(),
++            audit_payloads:   HashMap::<SymbolKey, TypeAnnotation*>::new(),
++            audit_call:       null,
++            audit_fn:         null,
++            audit_slot:       null,
              this_is_by_ref:  false,
              receiver_sym:    SymbolID::invalid(),
              current_func: null,

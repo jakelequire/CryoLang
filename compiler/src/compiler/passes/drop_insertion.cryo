@@ -1081,7 +1081,7 @@ type struct DropInserter {
     /// Returns true if `stmt` always diverges (any path through the
     /// program reaching this point cannot fall through to the next
     /// statement in the enclosing block).
-    walk_stmt_into(mut &this, stmt: Stmt*, out: [Stmt*]*) -> boolean {
+    walk_stmt_into(mut &this, stmt: Stmt*, out: mut [Stmt*]*) -> boolean {
         const outer_writes: boolean = this.stmt_writes_flags;
         this.stmt_writes_flags = false;
         const d: boolean = this.walk_stmt_kind(stmt, out);
@@ -1089,7 +1089,7 @@ type struct DropInserter {
         return d;
     }
 
-    walk_stmt_kind(mut &this, stmt: Stmt*, out: [Stmt*]*) -> boolean {
+    walk_stmt_kind(mut &this, stmt: Stmt*, out: mut [Stmt*]*) -> boolean {
         return match (stmt.kind) {
             StmtKind::Return(r) => {
                 const ret_snap: i64 = this.snapshot_moves();
@@ -1338,7 +1338,7 @@ type struct DropInserter {
     // ---- control-flow walks ---------------------------------------------
 
     walk_if(mut &this, s: Stmt*, it: mut IfStmt*,
-            out: [Stmt*]*) -> boolean {
+            out: mut [Stmt*]*) -> boolean {
         if (it == null) { return false; }
         // The condition runs on every path, so a field moved out in it is an
         // unconditional partial move: walked outside the branch depth, as
@@ -1589,7 +1589,7 @@ type struct DropInserter {
     walk_match_arms(mut &this, m: Stmt*,
                     subject: ExpressionNode*,
                     arms: &[mut MatchArmNode*], is_expr: boolean,
-                    out: [Stmt*]*, cleanup_out: [Stmt*]*) -> boolean {
+                    out: mut [Stmt*]*, cleanup_out: mut [Stmt*]*) -> boolean {
         if (subject != null) { this.walk_expr_read(subject); }
         // `--panic=unwind`: a non-exhaustive match emits a `no_match` guard that
         // raises through `__cryo_panic`; snapshot the frame's live-local drops
@@ -1879,7 +1879,7 @@ type struct DropInserter {
     /// branches and flag-written on neither is definitely moved, and gets
     /// no flag.
     merge_branches_if(mut &this, s: Stmt*, it: mut IfStmt*,
-                       out: [Stmt*]*, snap: i64,
+                       out: mut [Stmt*]*, snap: i64,
                        then_keys: [u64], then_lines: [i32], then_gov: [boolean],
                        then_diverges: boolean,
                        else_keys: [u64], else_lines: [i32], else_gov: [boolean],
@@ -2007,7 +2007,7 @@ type struct DropInserter {
     /// on the paths that moved).  Records the binding -> flag mapping so
     /// maybe_append_drop emits a conditional drop later.
     synth_flag_for_branch(mut &this, s: Stmt*, it: mut IfStmt*,
-                            out: [Stmt*]*,
+                            out: mut [Stmt*]*,
                             binding: u64, move_line: i32,
                             branch_is_then: boolean, splice: boolean) -> void {
         // Already has a flag? Idempotent re-use - just splice the
@@ -2042,7 +2042,7 @@ type struct DropInserter {
     /// diverging arms, irrelevant variants) leave the flag at `false`
     /// so the scope-exit conditional drop fires correctly.
     synth_flag_for_match_arms(mut &this, m: Stmt*,
-                                out: [Stmt*]*,
+                                out: mut [Stmt*]*,
                                 move_line: i32,
                                 arms: &[mut MatchArmNode*], arm_count: i64,
                                 arm_move_keys: &[u64],
@@ -2084,7 +2084,7 @@ type struct DropInserter {
     /// in the then-branch when there's no explicit else.  The implicit
     /// else moves nothing, so every then-move is conditional.
     synth_flags_for_then_only_moves(mut &this, s: Stmt*, it: mut IfStmt*,
-                                      out: [Stmt*]*,
+                                      out: mut [Stmt*]*,
                                       then_keys: &[u64],
                                       then_lines: &[i32],
                                       then_gov: &[boolean]) -> void {
@@ -2158,7 +2158,7 @@ type struct DropInserter {
     /// Append synthetic drops for the top scope's bindings (reverse
     /// declaration order) to `out`.  Skips bindings that have already
     /// been moved on the current path and bindings whose type is Copy.
-    append_top_scope_drops(mut &this, out: [Stmt*]*) -> void {
+    append_top_scope_drops(mut &this, out: mut [Stmt*]*) -> void {
         const start: i64 = this.top_scope_start();
         const end:   i64 = this.binding_names.length();
         for (mut i: i64 = end - 1; i >= start; i--) {
@@ -2168,7 +2168,7 @@ type struct DropInserter {
 
     /// Append drops for every live scope down to `min_scope`, innermost
     /// first, reverse declaration order within each scope.
-    append_drops_to_depth(mut &this, out: [Stmt*]*, min_scope: i64) -> void {
+    append_drops_to_depth(mut &this, out: mut [Stmt*]*, min_scope: i64) -> void {
         const total_scopes: i64 = this.scope_start_idx.length();
         if (total_scopes == 0 || min_scope >= total_scopes) { return; }
         const stop: i64 = if (min_scope < 0) { 0 } else { min_scope };
@@ -2187,7 +2187,7 @@ type struct DropInserter {
 
     /// Drops for every live scope, innermost first.  Used before
     /// `return`: the function exits, so every scope gets dropped.
-    append_cumulative_drops(mut &this, out: [Stmt*]*) -> void {
+    append_cumulative_drops(mut &this, out: mut [Stmt*]*) -> void {
         this.append_drops_to_depth(out, 0);
     }
 
@@ -2202,7 +2202,7 @@ type struct DropInserter {
     /// to emit a plain `call` instead of an `invoke`.  Gated on panic=unwind by
     /// the caller.  Shared by every panic origin: ordinary calls and the
     /// synthesized div/no-match/new-overflow guards.
-    snapshot_unwind_cleanup(mut &this, out: [Stmt*]*) -> void {
+    snapshot_unwind_cleanup(mut &this, out: mut [Stmt*]*) -> void {
         mut sched: [Stmt*] = [];
         // In-flight arguments of enclosing calls first - they were constructed
         // most recently (dropped first) and the cumulative pass skips them (they
@@ -2223,7 +2223,7 @@ type struct DropInserter {
     /// plain `.drop()` with no init/move-flag guard is exact. The binding's
     /// storage is untouched by the pending move (owning aggregates pass by
     /// pointer to the source alloca; the callee never ran), so the drop is safe.
-    append_pending_arg_drops(mut &this, out: [Stmt*]*) -> void {
+    append_pending_arg_drops(mut &this, out: mut [Stmt*]*) -> void {
         for (mut i: i64 = this.pending_arg_ids.length() - 1; i >= 0; i--) {
             const key: u64 = this.pending_arg_ids[i];
             if (key == 0) { continue; }
@@ -2270,7 +2270,7 @@ type struct DropInserter {
     /// Drops for scopes inside the current loop body.  Used before
     /// `break`/`continue`: those exit the enclosing loop only, so
     /// bindings declared OUTSIDE the loop must NOT be dropped here.
-    append_loop_exit_drops(mut &this, out: [Stmt*]*) -> void {
+    append_loop_exit_drops(mut &this, out: mut [Stmt*]*) -> void {
         if (this.loop_boundary.length() == 0) {
             // No enclosing loop; `break`/`continue` outside a loop
             // would be a sema error already; emit nothing.
@@ -2431,7 +2431,7 @@ type struct DropInserter {
     /// `name.drop()` for partially-moved bindings.  Mirrors codegen's
     /// `emit_field_drops`, but emitted as AST so it lowers through the normal
     /// `.drop()` path.
-    append_partial_drops(mut &this, out: [Stmt*]*, name: PassLocal,
+    append_partial_drops(mut &this, out: mut [Stmt*]*, name: PassLocal,
                          ty: TypeRef, key: u64, span: SourceSpan) -> void {
         const t: Type* = this.aggregate_type_of(ty);
         if (t == null) {
@@ -2485,7 +2485,7 @@ type struct DropInserter {
         return stmt;
     }
 
-    maybe_append_drop(mut &this, out: [Stmt*]*, idx: i64) -> void {
+    maybe_append_drop(mut &this, out: mut [Stmt*]*, idx: i64) -> void {
         const key:  u64       = this.binding_syms[idx].key();
         const ty:   TypeRef   = this.binding_types[idx];
         const span: SourceSpan = this.binding_spans[idx];
@@ -2694,7 +2694,7 @@ type struct DropInserter {
     /// moved" on the path that had not moved it, and the value was released
     /// twice.
     append_move_flag_writes(mut &this, snapshot: i64, expr: ExpressionNode*,
-                            out: [Stmt*]*, span: SourceSpan) -> void {
+                            out: mut [Stmt*]*, span: SourceSpan) -> void {
         mut written: [u64] = [];
         for (mut i: i64 = snapshot; i < this.moved_keys.length(); i++) {
             const k: u64 = this.moved_keys[i];
@@ -2742,7 +2742,7 @@ type struct DropInserter {
     /// The temporary is deliberately NOT registered as a binding: its release
     /// is emitted right here, and a scope-exit drop would be a second one.
     emit_assign_drop(mut &this, stmt: Stmt*,
-                     out: [Stmt*]*) -> void {
+                     out: mut [Stmt*]*) -> void {
         const span: SourceSpan = stmt.span;
         const ty: TypeRef = this.pend_assign_ty;
         const place: ExpressionNode* = this.build_place_expr(
@@ -2811,7 +2811,7 @@ type struct DropInserter {
     /// drop fires at statement end, matching where most systems languages
     /// destroy a discarded temporary.
     emit_discarded_temp_drop(mut &this, expr: ExpressionNode*,
-                              out: [Stmt*]*, span: SourceSpan) -> void {
+                              out: mut [Stmt*]*, span: SourceSpan) -> void {
         const ty: TypeRef = expr.resolved_type;
         const tmp: PassLocal = this.mint_local(this.intern.intern(
             fmt::format("__drop_tmp%d", this.discard_seq)));
@@ -2840,7 +2840,7 @@ type struct DropInserter {
     /// tracking (gated on subject.kind == Identifier) now fires properly,
     /// so an arm that moves the payload out suppresses the subject's glue.
     hoist_match_subject(mut &this, m: mut MatchStmt*,
-                        out: [Stmt*]*) -> void {
+                        out: mut [Stmt*]*) -> void {
         if (m == null || m.subject == null) { return; }
         const span: SourceSpan = m.subject.span;
         const ty: TypeRef = m.subject.resolved_type;
@@ -3102,7 +3102,7 @@ type struct DropInserter {
     /// and never run the destructor its author wrote.  This is the same rule
     /// `partial_move_allowed` applies to moving a field out of such a type.
     attach_member_flags(mut &this, name: SymbolStr, sym: SymbolID, ty: TypeRef,
-                        span: SourceSpan, out: [Stmt*]*) -> boolean {
+                        span: SourceSpan, out: mut [Stmt*]*) -> boolean {
         const slot: i64 = this.binding_syms.length() - 1;
         if (!sym.is_valid() || slot < 0 || this.binding_syms[slot].key() != sym.key()) {
             return false;
@@ -3270,7 +3270,7 @@ type struct DropInserter {
     /// most recently declared first.  Members moved out of the owner are
     /// skipped for the same reason `append_partial_drops` skips them: the
     /// source no longer owns that storage.
-    append_member_drops(mut &this, out: [Stmt*]*, slot: i64) -> void {
+    append_member_drops(mut &this, out: mut [Stmt*]*, slot: i64) -> void {
         const base:    PassLocal  = this.local_at(slot);
         const base_ty: TypeRef    = this.binding_types[slot];
         const span:    SourceSpan = this.binding_spans[slot];
@@ -3591,7 +3591,7 @@ type struct DropInserter {
     /// A failure never leaves a partial chain behind: every push happens after
     /// the recursive call has already succeeded.
     collect_place_chain(&this, expr: ExpressionNode*,
-                        out_kind: [u8]*, out_key: [u32]*) -> SymbolID {
+                        out_kind: mut [u8]*, out_key: mut [u32]*) -> SymbolID {
         if (expr == null) { return SymbolID::invalid(); }
         const id: IdentifierExpr* = ExpressionNode::identifier_of(expr);
         if (id != null) {
