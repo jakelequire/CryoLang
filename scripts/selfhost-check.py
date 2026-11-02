@@ -230,7 +230,8 @@ def make_stages():
         Stage(
             src="compiler", via="stage-2", to="build/self/s3",
             cwd=ROOT / "compiler",
-            cmd=[str(STAGE2), "build", "--no-incremental", "--build-dir=build/self/s3"],
+            cmd=[str(STAGE2), "build", "--no-incremental", "--build-dir=build/self/s3",
+                 "--emit-llvm"],
         ),
         # ------------------------------------------------------------------
         # Round 3: stage-3 -> stage-4  (byte-identity gate)
@@ -243,7 +244,8 @@ def make_stages():
         Stage(
             src="compiler", via="stage-3", to="build/self/s4",
             cwd=ROOT / "compiler",
-            cmd=[str(STAGE3), "build", "--no-incremental", "--build-dir=build/self/s4"],
+            cmd=[str(STAGE3), "build", "--no-incremental", "--build-dir=build/self/s4",
+                 "--emit-llvm"],
         ),
     ]
 

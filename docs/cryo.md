@@ -4557,7 +4557,9 @@ never off):
 `no_runtime = true` normally implies `no_std = true`: a freestanding link drops
 `libcryo.a`, so any stdlib symbol the program references would fail to resolve.
 A freestanding program supplies its own entry point (an `![naked] _start`);
-without one the linker warns that `_start` is missing.
+without one the linker warns that `_start` is missing.  The optimizer never
+turns a freestanding program's code into a call to a C library function it
+did not write (a byte loop into `memset`), since nothing would answer it.
 
 `![config(no_runtime)]` / `![config(not(no_runtime))]` gate a declaration on the
 freestanding build flag, exactly like the OS atoms (`![config(linux)]`, …).
