@@ -157,6 +157,13 @@ yet is recorded with the change that builds it, not here.
      the trait, its name, its place, its integer implementations and its
      whole-trait `internal`)
 
+681. **E0317 is the wrong number of trait arguments, in a bound and in an
+     object type alike.**  An object type writing more or fewer type
+     arguments than its trait's parameters and associated types is
+     refused with E0317, not E0307, in the words ruling 491 keeps; a bound
+     writing more than its trait's positions keeps E0317.  E0307 keeps
+     its other refusals.  (Jake)
+
 ### 2026-11-01
 
 677. **A primitive implements the trait of every operator that applies to
