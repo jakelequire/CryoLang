@@ -261,10 +261,22 @@ public type struct HashMap<K, V, A = GlobalAlloc> where A: Allocator {
 
     /// Iterate over the values by shared borrow, yielding `V*`. Sound for any
     /// `V` (owning or Copy). Same borrow/invalidation contract as `entries`;
-    /// use this to read or mutate owning values in place without the `V: Copy`
-    /// gate on `values`.
+    /// use this to read owning values in place without the `V: Copy` gate on
+    /// `values`, and `values_mutable` to change them.
     public values_ref(&this) -> implement Iterator<V*> {
         return ValuesRefIter::<K, V> {
+            buckets: this.buckets,
+            bucket_count: this.bucket_count,
+            bucket_index: 0,
+            current: null
+        };
+    }
+
+    /// Iterate over the values by writable borrow, yielding `mut V*`: the
+    /// way to change owning values in place. Same invalidation contract as
+    /// `entries`, and the same order as `values_ref`.
+    public values_mutable(mut &this) -> implement Iterator<mut V*> {
+        return ValuesMutableIter::<K, V> {
             buckets: this.buckets,
             bucket_count: this.bucket_count,
             bucket_index: 0,
@@ -302,10 +314,10 @@ public type struct HashMap<K, V, A = GlobalAlloc> where A: Allocator {
         return Option::None;
     }
 
-    /// Like `get`, but returns a borrow (raw pointer) into the entry's
-    /// stored value rather than a copy.  Use when the value owns heap
-    /// resources you don't want to clone, or when callers need to
-    /// mutate the stored value in place.
+    /// Like `get`, but returns a read-only borrow (raw pointer) into the
+    /// entry's stored value rather than a copy.  Use when the value owns
+    /// heap resources you don't want to clone; `get_mutable` is the
+    /// borrow to change the stored value in place through.
     ///
     /// The returned pointer is valid until the next mutation that
     /// removes this key or drops the map.  `resize_buckets` is safe;
@@ -319,6 +331,26 @@ public type struct HashMap<K, V, A = GlobalAlloc> where A: Allocator {
         const h: u64 = hash_key(key, this.seed);
         const index: u64 = h & (this.bucket_count - 1);
         mut node: Entry<K, V>* = this.buckets[index];
+        loop {
+            if (node == null) { break; }
+            if (node.hash == h && node.key.equals(key)) {
+                return Option::Some(&node.value);
+            }
+            node = node.next;
+        }
+        return Option::None;
+    }
+
+    /// Like `get_ref`, but the borrow is writable: change the stored
+    /// value in place through it.  Valid for as long as `get_ref`'s.
+    public get_mutable(mut &this, key: &K) -> Option<mut V*>
+    where K: Hash + Eq {
+        if (this.bucket_count == 0) {
+            return Option::None;
+        }
+        const h: u64 = hash_key(key, this.seed);
+        const index: u64 = h & (this.bucket_count - 1);
+        mut node: mut Entry<K, V>* = this.buckets[index];
         loop {
             if (node == null) { break; }
             if (node.hash == h && node.key.equals(key)) {
@@ -652,20 +684,21 @@ implement<K, V> trait Iterator<V> for struct ValuesIter<K, V> {
     }
 }
 
-// Borrow-yielding iterators: EntriesRefIter / KeysRefIter / ValuesRefIter.
+// Borrow-yielding iterators: EntriesRefIter / KeysRefIter / ValuesRefIter /
+// ValuesMutableIter.
 //
 // Same bucket-major state machine and invalidation contract as the by-value
 // iterators above, but each `next()` hands out a borrow (`K*` / `V*` /
-// `Pair<K*, V*>`) into the live entry rather than a bitcopy. That makes them
-// UNGATED - no `K: Copy` / `V: Copy` - so they walk maps of owning types
-// (`HashMap<String, Foo>`) that the Copy-gated `iter`/`keys`/`values` reject.
-// The yielded pointers alias map-owned storage, so they are read/mutate views,
-// not values to move out of.
+// `Pair<K*, V*>`, or `mut V*` for ValuesMutableIter) into the live entry
+// rather than a bitcopy. That makes them UNGATED - no `K: Copy` /
+// `V: Copy` - so they walk maps of owning types (`HashMap<String, Foo>`)
+// that the Copy-gated `iter`/`keys`/`values` reject. The yielded pointers
+// alias map-owned storage, so they are views, not values to move out of.
 //
 // `EntriesRefIter` mirrors `HashMapIter`; the projections mirror
-// `KeysIter`/`ValuesIter`. `KeysRefIter` is `public` because `HashSet::iter_ref`
-// wraps it (a public type may back a private one); the other two are only
-// produced as opaque `implement Iterator<...>` and stay private.
+// `KeysIter`/`ValuesIter`. `KeysRefIter` is `internal` because
+// `HashSet::iter_ref` wraps it; the others are only produced as opaque
+// `implement Iterator<...>` and stay private.
 
 private type struct EntriesRefIter<K, V> {
     private buckets: Entry<K, V>**;
@@ -730,6 +763,30 @@ implement<K, V> trait Iterator<V*> for struct ValuesRefIter<K, V> {
         loop {
             if (this.current != null) {
                 const entry: Entry<K, V>* = this.current;
+                this.current = entry.next;
+                return Option::Some(&entry.value);
+            }
+            if (this.bucket_index >= this.bucket_count) {
+                return Option::None;
+            }
+            this.current = this.buckets[this.bucket_index];
+            this.bucket_index = this.bucket_index + 1;
+        }
+    }
+}
+
+private type struct ValuesMutableIter<K, V> {
+    private buckets: (mut Entry<K, V>*)*;
+    private bucket_count: u64;
+    private bucket_index: u64;
+    private current: mut Entry<K, V>*;
+}
+
+implement<K, V> trait Iterator<mut V*> for struct ValuesMutableIter<K, V> {
+    next(mut &this) -> Option<mut V*> {
+        loop {
+            if (this.current != null) {
+                const entry: mut Entry<K, V>* = this.current;
                 this.current = entry.next;
                 return Option::Some(&entry.value);
             }

@@ -180,6 +180,17 @@ yet is recorded with the change that builds it, not here.
      grouped borrow is the only spelling it leaves for a writable pointer
      to a borrow)
 
+683. **A lookup that hands out a pointer has a read-only form and a
+     writable one, and code that writes takes the writable one.**
+     `Slice::as_const_ptr(&this)` returns the read-only `const T*` where
+     `as_ptr` returns `mut T*`, and `mem::const_offset<T>(ptr: const T*,
+     count) -> const T*` is `mem::offset`'s read-only counterpart.
+     `HashMap::get_mutable(mut &this, key: &K) -> Option<mut V*>` and
+     `HashMap::values_mutable(mut &this)`, yielding `mut V*`, are the
+     writable counterparts of `get_ref` and `values_ref`, and
+     `JsonObject::get_mutable(mut &this, key: Str) -> Option<mut
+     JsonValue*>` that of `JsonObject::get`.  (Jake)
+
 ### 2026-11-01
 
 677. **A primitive implements the trait of every operator that applies to
