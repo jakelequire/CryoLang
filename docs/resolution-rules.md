@@ -133,6 +133,19 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-11-01
+
+677. **A primitive implements the trait of every operator that applies to
+     it natively.**  Each integer and floating-point type implements
+     `Add`, `Sub`, `Mul`, `Div`, `Rem` and `Neg`, each integer type
+     `BitAnd`, `BitOr`, `BitXor`, `Shl`, `Shr` and `BitNot`, and `boolean`
+     `Not`, each with the type itself as every argument (`i32: Add<i32,
+     i32>`), so a bound on an operator trait admits the primitive at a
+     free call and at a method call alike.  The operator on a primitive
+     still compiles to the native instruction.  A method's own
+     where-clause is checked at an instance call as a free function's is
+     (E0306 at the call).  (Jake)
+
 ### 2026-10-31
 
 676. **A parameter an implementation lends its methods is the call's, its

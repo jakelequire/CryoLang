@@ -2360,8 +2360,16 @@ no runtime dispatch and the result monomorphises like any other method call.
 The rewrite is **type-directed** and **LHS-driven**: `a OP b` dispatches on the
 type of `a`, and it only fires when the built-in rule does not already apply.
 Primitive arithmetic (`1 + 2`), pointer stepping, and native integer/pointer
-comparison keep emitting raw instructions - primitives deliberately do **not**
-implement the arithmetic traits. The operator traits live in
+comparison keep emitting raw instructions. Every primitive type implements the
+trait of each operator that applies to it natively, with itself as operand and
+result (`i32: Add<i32, i32>`): the arithmetic traits and `Neg` on every integer
+and floating-point type, the bitwise and shift traits and `BitNot` on every
+integer type, and `Not` on `boolean`. So a bound such as `T: Add<T, T>` admits
+`i32` and `f64`, at a free call and at a method call alike, and `x.add(&y)` may
+be written on a primitive; the operator itself, in a generic body's copy at a
+primitive as anywhere else, still compiles to the native instruction. `char`'s
+mixed arithmetic (`c - '0'`) is not a trait implementation. The operator traits
+live in
 [`stdlib/core/ops.cryo`](../stdlib/core/ops.cryo) (`Eq`/`Ord` are in
 [`stdlib/core/cmp.cryo`](../stdlib/core/cmp.cryo)).
 

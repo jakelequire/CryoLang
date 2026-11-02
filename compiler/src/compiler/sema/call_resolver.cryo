@@ -5458,7 +5458,7 @@ type struct CallResolver {
             return TypeRef::invalid();
         }
         this.binding.stash_method_call_bindings(obj_type, member, call, selected.chosen);
-        if (!this.check_lent_parameter_bounds(member.member_span, selected.chosen, call,
+        if (!this.check_method_call_bounds(member.member_span, selected.chosen, call,
                 visitor.receiver_subject(obj_type))) {
             return TypeRef::invalid();
         }
@@ -8391,20 +8391,22 @@ type struct CallResolver {
         return false;
     }
 
-    /// E0306 for a method call that binds a parameter the method's
-    /// implementation lends it (`call.resolved_type_args`, in the method's
-    /// declaration order) to a type that does not meet a bound the
-    /// implementation writes on it (`K` in `implement<K> trait Scale<K> for
-    /// Meter where K: Position`).  The implementation's own parameters are
-    /// the receiver's arguments in its head.  Emits the failure and returns
-    /// false on the first unmet bound; true when every bound holds or the
-    /// call binds no lent parameter.
-    check_lent_parameter_bounds(mut &this, at: SourceSpan, chosen: DeclarationNode*, call: CallExpr*,
-                                recv: TypeRef) -> boolean {
+    /// E0306 for a method call that binds one of the method's type
+    /// parameters (`call.resolved_type_args`, in the method's declaration
+    /// order) to a type that does not meet a bound on it: one the method's
+    /// own where-clause writes (`scale<U>(&this, n: U) -> U where U:
+    /// Add<U, U>`), as a free call's is checked, or one the method's
+    /// implementation writes on a parameter it lends the method (`K` in
+    /// `implement<K> trait Scale<K> for Meter where K: Position`).  The
+    /// implementation's own parameters are the receiver's arguments in its
+    /// head.  Emits the failure and returns false on the first unmet bound;
+    /// true when every bound holds or the call binds no parameter.
+    check_method_call_bounds(mut &this, at: SourceSpan, chosen: DeclarationNode*, call: CallExpr*,
+                             recv: TypeRef) -> boolean {
         const m: MethodDecl* = DeclarationNode::method_of(chosen);
         if (m == null || m.func == null) { return true; }
         const f: FunctionDecl* = DeclarationNode::fn_of(m.func);
-        if (f.inherited_params == 0 || call.resolved_type_args.length() != f.generic_params.length()) {
+        if (f.generic_params.length() == 0 || call.resolved_type_args.length() != f.generic_params.length()) {
             return true;
         }
         mut syms: [SymbolID] = [];
@@ -8413,6 +8415,8 @@ type struct CallResolver {
             if (gp == null) { return true; }
             syms.push(gp.sym_id);
         }
+        if (!this.check_call_where_bounds(at, m.func, &syms, &call.resolved_type_args)) { return false; }
+        if (f.inherited_params == 0) { return true; }
         const block: ImplBlock* = DeclarationNode::impl_of(this.binding.method_site(chosen, null, recv));
         if (block == null) { return true; }
         const checker: TraitChecker = this.trait_checker();

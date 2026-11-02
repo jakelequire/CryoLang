@@ -2324,7 +2324,7 @@ type struct SemaVisitor {
     /// share `This`, so `2 == vec` can never match a primitive's own comparison
     /// impl, and attempting it would only risk a spurious diagnostic.
     reflected_operator_overload_expr(mut &this, lhs_expr: ExpressionNode*, lhs: TypeRef,
-                                     rhs_expr: ExpressionNode*, map: OperatorTraitMap,
+                                     rhs_expr: ExpressionNode*, rhs: TypeRef, map: OperatorTraitMap,
                                      op_tok: Token, span: SourceSpan) -> ExpressionNode* {
         if (!map.valid) { return null; }
         if (map.ord_pred != "" || map.lang == LangItem::Eq) { return null; }
@@ -2335,10 +2335,14 @@ type struct SemaVisitor {
         const is_primitive: boolean = lt.kind == TypeKind::Int || lt.kind == TypeKind::Float
                                    || lt.kind == TypeKind::Char || lt.kind == TypeKind::Bool;
         if (!is_primitive) { return null; }
-        // Gate on the impl EXISTING on the primitive before building anything,
-        // so a plain `2 * 3`-shaped error never materializes a bogus call.
-        const impl_block: ImplBlock* = this.trait_checker().select_impl(
-            this.ctx.generic_registry.wellknown(map.lang), lhs, 0);
+        // Gate on an impl on the primitive whose `Rhs` is the right operand's
+        // type before building anything: the primitive's own `Add<i32, i32>`
+        // does not make `1 + s` a call, so a plain type error never
+        // materializes a bogus one.
+        const trait_id: DefId = this.ctx.generic_registry.wellknown(map.lang);
+        const rhs_args: [TypeRef] = [rhs];
+        const found: DeclarationNode* = this.trait_checker().implementation_at(trait_id, &rhs_args, lhs);
+        const impl_block: ImplBlock* = DeclarationNode::impl_of(found);
         if (impl_block == null || !impl_block.trait_def.is_valid()) { return null; }
         const method_sym: SymbolStr = this.intern.intern(map.method);
         mut desugared: ExpressionNode* =
@@ -2735,7 +2739,7 @@ type struct SemaVisitor {
                 // primitives, so this is the one place the right operand's user
                 // type can pull in an impl hung on the primitive.
                 const rde: ExpressionNode* = this.reflected_operator_overload_expr(
-                    bin.left, lhs, bin.right, map, bin.op, e.span);
+                    bin.left, lhs, bin.right, rhs, map, bin.op, e.span);
                 if (rde != null) { bin.desugared_call = rde; return rde.resolved_type; }
                 if (this.emit_operator_missing_impl(lhs, map, bin.op.kind, e.span)) {
                     return TypeRef::invalid();
