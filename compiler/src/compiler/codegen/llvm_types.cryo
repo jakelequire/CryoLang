@@ -161,7 +161,7 @@ type enum LFileType : i32 {
 // LLVMModule: Wrapper around LLVMModuleRef
 
 type struct LModule {
-    raw: void*;
+    raw: mut void*;
 
     static create(name: string) -> LModule {
         return LModule { raw: llvm::LLVMModuleCreateWithNameInContext(
@@ -189,11 +189,11 @@ type struct LModule {
     /// function (a byte loop into `memset`) nor assumes what one does.  A
     /// freestanding build links no C library to answer such a call.
     forbid_library_calls(&this) -> void {
-        const context: void* = llvm::LLVMGetModuleContext(this.raw);
-        mut current: void* = llvm::LLVMGetFirstFunction(this.raw);
+        const context: mut void* = llvm::LLVMGetModuleContext(this.raw);
+        mut current: mut void* = llvm::LLVMGetFirstFunction(this.raw);
         while (current != null) {
             if (llvm::LLVMGetFirstBasicBlock(current) != null) {
-                const attr: void* = llvm::LLVMCreateStringAttribute(
+                const attr: mut void* = llvm::LLVMCreateStringAttribute(
                     context, "no-builtins", 11 as u32, "", 0 as u32);
                 llvm::LLVMAddAttributeAtIndex(current, 0xFFFFFFFF as u32, attr);
             }
@@ -213,18 +213,18 @@ type struct LModule {
     /// file's memory buffer internally, so there is nothing to dispose on the
     /// success path.
     static parse_ir_file(path: string, ctx: LContext) -> LModule {
-        mut membuf: void* = null;
+        mut membuf: mut void* = null;
         mut err: i8* = null;
         if (llvm::LLVMCreateMemoryBufferWithContentsOfFile(
-                path, &membuf as void*, &err as void*) != 0) {
-            if (err != null) { llvm::LLVMDisposeMessage(err as void*); }
+                path, &membuf as mut void*, &err as mut void*) != 0) {
+            if (err != null) { llvm::LLVMDisposeMessage(err as mut void*); }
             return LModule::null();
         }
-        mut out_mod: void* = null;
+        mut out_mod: mut void* = null;
         mut perr: i8* = null;
         if (llvm::LLVMParseIRInContext(
-                ctx.raw, membuf, &out_mod as void*, &perr as void*) != 0) {
-            if (perr != null) { llvm::LLVMDisposeMessage(perr as void*); }
+                ctx.raw, membuf, &out_mod as mut void*, &perr as mut void*) != 0) {
+            if (perr != null) { llvm::LLVMDisposeMessage(perr as mut void*); }
             return LModule::null();
         }
         return LModule { raw: out_mod };
@@ -254,7 +254,7 @@ type struct LModule {
     /// is owned by the module - do NOT dispose it.
     abi_size_of(&this, ty: LType) -> u64 {
         if (!ty.is_valid()) { return 0; }
-        const td: void* = llvm::LLVMGetModuleDataLayout(this.raw);
+        const td: mut void* = llvm::LLVMGetModuleDataLayout(this.raw);
         if (td == null) { return 0; }
         return llvm::LLVMABISizeOfType(td, ty.raw);
     }
@@ -268,7 +268,7 @@ type struct LModule {
     /// allocation site.
     abi_align_of(&this, ty: LType) -> u64 {
         if (!ty.is_valid()) { return 0; }
-        const td: void* = llvm::LLVMGetModuleDataLayout(this.raw);
+        const td: mut void* = llvm::LLVMGetModuleDataLayout(this.raw);
         if (td == null) { return 0; }
         return llvm::LLVMABIAlignmentOfType(td, ty.raw) as u64;
     }
@@ -281,7 +281,7 @@ type struct LModule {
     /// while the offsets do not.
     offset_of_element(&this, ty: LType, idx: u32) -> u64 {
         if (!ty.is_valid()) { return 0; }
-        const td: void* = llvm::LLVMGetModuleDataLayout(this.raw);
+        const td: mut void* = llvm::LLVMGetModuleDataLayout(this.raw);
         if (td == null) { return 0; }
         return llvm::LLVMOffsetOfElement(td, ty.raw, idx);
     }
@@ -303,7 +303,7 @@ type struct LModule {
     /// so a duplicate-add would produce thousands of `.N`-renamed declares
     /// per module.
     add_function(&this, name: MangledName, fn_type: LType) -> LValue {
-        const existing: void* = llvm::LLVMGetNamedFunction(this.raw, name.as_string());
+        const existing: mut void* = llvm::LLVMGetNamedFunction(this.raw, name.as_string());
         if (existing != null) {
             return LValue { raw: existing };
         }
@@ -325,10 +325,10 @@ type struct LModule {
 /// the lib+bin builds in the never-disposed global context.  Single-threaded
 /// compiler -> a module-level global needs no synchronisation (same argument
 /// as `g_ast_arena` / `g_shared_type_cache`).
-mut g_codegen_context: void* = null;
+mut g_codegen_context: mut void* = null;
 
 type struct LContext {
-    raw: void*;
+    raw: mut void*;
 
     static create() -> LContext {
         return LContext { raw: llvm::LLVMContextCreate() };
@@ -393,7 +393,7 @@ public function set_codegen_context_new_keep_prior() -> void {
 
 /// Parallel-codegen: the currently-published codegen context, captured into an
 /// emit job so the worker can dispose it after `emit_to_file`.
-public function current_codegen_context() -> void* {
+public function current_codegen_context() -> mut void* {
     return g_codegen_context;
 }
 
@@ -409,7 +409,7 @@ public function clear_codegen_context_ptr() -> void {
 // LBuilder: Wrapper around LLVMBuilderRef
 
 type struct LBuilder {
-    raw: void*;
+    raw: mut void*;
 
     static create() -> LBuilder {
         return LBuilder { raw: llvm::LLVMCreateBuilderInContext(LContext::current().raw) };
@@ -612,14 +612,14 @@ type struct LBuilder {
         if (val.raw == null || ptr.raw == null) { return LValue::null(); }
         // Guard: never store a void-typed value; LLVM's DataLayout::getAlignment
         // enters undefined behavior on unsized types, causing infinite recursion.
-        const val_ty: void* = llvm::LLVMTypeOf(val.raw);
+        const val_ty: mut void* = llvm::LLVMTypeOf(val.raw);
         if (val_ty != null && LType::kind_of(val_ty) == LTypeKind::Void) {
             return LValue::null();
         }
         return LValue { raw: llvm::LLVMBuildStore(this.raw, val.raw, ptr.raw) };
     }
 
-    build_gep(&this, ty: LType, ptr: LValue, indices: void*, num_indices: u32, name: string) -> LValue {
+    build_gep(&this, ty: LType, ptr: LValue, indices: mut void*, num_indices: u32, name: string) -> LValue {
         if (ty.raw == null || ptr.raw == null) { return LValue::null(); }
         return LValue { raw: llvm::LLVMBuildGEP2(this.raw, ty.raw, ptr.raw, indices, num_indices, name) };
     }
@@ -655,7 +655,7 @@ type struct LBuilder {
     /// `build_load`, which is non-atomic.
     build_atomic_load(&this, ty: LType, ptr: LValue, order: i32, align_bytes: u32, name: string) -> LValue {
         if (ty.raw == null || ptr.raw == null) { return LValue::null(); }
-        const inst: void* = llvm::LLVMBuildLoad2(this.raw, ty.raw, ptr.raw, name);
+        const inst: mut void* = llvm::LLVMBuildLoad2(this.raw, ty.raw, ptr.raw, name);
         if (inst == null) { return LValue::null(); }
         llvm::LLVMSetOrdering(inst, order);
         llvm::LLVMSetAlignment(inst, align_bytes);
@@ -665,7 +665,7 @@ type struct LBuilder {
     /// Emits `store atomic Val, Ptr ordering, align Bytes`.
     build_atomic_store(&this, val: LValue, ptr: LValue, order: i32, align_bytes: u32) -> LValue {
         if (val.raw == null || ptr.raw == null) { return LValue::null(); }
-        const inst: void* = llvm::LLVMBuildStore(this.raw, val.raw, ptr.raw);
+        const inst: mut void* = llvm::LLVMBuildStore(this.raw, val.raw, ptr.raw);
         if (inst == null) { return LValue::null(); }
         llvm::LLVMSetOrdering(inst, order);
         llvm::LLVMSetAlignment(inst, align_bytes);
@@ -774,7 +774,7 @@ type struct LBuilder {
         return LValue { raw: llvm::LLVMBuildPhi(this.raw, ty.raw, name) };
     }
 
-    build_call(&this, fn_ty: LType, fn_val: LValue, args: void*, num_args: u32, name: string) -> LValue {
+    build_call(&this, fn_ty: LType, fn_val: LValue, args: mut void*, num_args: u32, name: string) -> LValue {
         if (fn_ty.raw == null || fn_val.raw == null) { return LValue::null(); }
         return LValue { raw: llvm::LLVMBuildCall2(this.raw, fn_ty.raw, fn_val.raw, args, num_args, name) };
     }
@@ -783,7 +783,7 @@ type struct LBuilder {
     /// normal return and to `catch_bb` (a landing-pad block) if the callee
     /// unwinds.  Used only under `--panic=unwind` at panic-capable call sites
     /// that have live droppable locals to clean up.
-    build_invoke(&this, fn_ty: LType, fn_val: LValue, args: void*, num_args: u32,
+    build_invoke(&this, fn_ty: LType, fn_val: LValue, args: mut void*, num_args: u32,
                  then_bb: LBasicBlock, catch_bb: LBasicBlock, name: string) -> LValue {
         if (fn_ty.raw == null || fn_val.raw == null) { return LValue::null(); }
         return LValue { raw: llvm::LLVMBuildInvoke2(this.raw, fn_ty.raw, fn_val.raw,
@@ -825,7 +825,7 @@ type struct LBuilder {
 // LValue: Wrapper around LLVMValueRef
 
 type struct LValue {
-    raw: void*;
+    raw: mut void*;
 
     static null() -> LValue {
         return LValue { raw: null };
@@ -919,7 +919,7 @@ type struct LValue {
 
     /// Add incoming values to this phi node.  `values` and `blocks` are
     /// parallel arrays of LLVMValueRef and LLVMBasicBlockRef raw pointers.
-    add_incoming(&this, values: void*, blocks: void*, count: u32) -> void {
+    add_incoming(&this, values: mut void*, blocks: mut void*, count: u32) -> void {
         llvm::LLVMAddIncoming(this.raw, values, blocks, count);
     }
 
@@ -933,7 +933,7 @@ type struct LValue {
 // LType: Wrapper around LLVMTypeRef
 
 type struct LType {
-    raw: void*;
+    raw: mut void*;
 
     static null() -> LType {
         return LType { raw: null };
@@ -1016,7 +1016,7 @@ type struct LType {
         return LType { raw: llvm::LLVMVectorType(element.raw, count) };
     }
 
-    static function_type(ret: LType, params: void*, param_count: u32, is_var_arg: boolean) -> LType {
+    static function_type(ret: LType, params: mut void*, param_count: u32, is_var_arg: boolean) -> LType {
         return LType { raw: llvm::LLVMFunctionType(ret.raw, params, param_count, is_var_arg as i32) };
     }
 
@@ -1032,7 +1032,7 @@ type struct LType {
         return LType { raw: llvm::LLVMGetTypeByName2(ctx.raw, name.as_string()) };
     }
 
-    static literal_struct(elements: void*, count: u32, packed: boolean) -> LType {
+    static literal_struct(elements: mut void*, count: u32, packed: boolean) -> LType {
         return LType { raw: llvm::LLVMStructTypeInContext(
             LContext::current().raw, elements, count, packed as i32) };
     }
@@ -1040,7 +1040,7 @@ type struct LType {
 
     // ----- Struct body -----
 
-    set_struct_body(&this, elements: void*, count: u32, packed: boolean) -> void {
+    set_struct_body(&this, elements: mut void*, count: u32, packed: boolean) -> void {
         llvm::LLVMStructSetBody(this.raw, elements, count, packed as i32);
     }
 
@@ -1085,7 +1085,7 @@ type struct LType {
     }
 
 
-    static const_struct(values: void*, count: u32, packed: boolean) -> LValue {
+    static const_struct(values: mut void*, count: u32, packed: boolean) -> LValue {
         // MUST build in the current per-module context, not the implicit global
         // one: the context-less `LLVMConstStruct` interns the anonymous struct
         // constant in the GLOBAL LLVMContext, so the same constant would be
@@ -1097,11 +1097,11 @@ type struct LType {
             LContext::current().raw, values, count, packed as i32) };
     }
 
-    static const_named_struct(ty: LType, values: void*, count: u32) -> LValue {
+    static const_named_struct(ty: LType, values: mut void*, count: u32) -> LValue {
         return LValue { raw: llvm::LLVMConstNamedStruct(ty.raw, values, count) };
     }
 
-    static const_array(element_ty: LType, values: void*, count: u32) -> LValue {
+    static const_array(element_ty: LType, values: mut void*, count: u32) -> LValue {
         return LValue { raw: llvm::LLVMConstArray(element_ty.raw, values, count) };
     }
 
@@ -1118,7 +1118,7 @@ type struct LType {
     /// Typed wrapper around `LLVMGetTypeKind` for raw `LLVMTypeRef` handles
     /// (where wrapping in an `LType` first would just be ceremony).  Mirrors
     /// `LType::kind()` and lets callers branch on `LTypeKind::Void` etc.
-    static kind_of(raw: void*) -> LTypeKind {
+    static kind_of(raw: mut void*) -> LTypeKind {
         return llvm::LLVMGetTypeKind(raw) as LTypeKind;
     }
 }
@@ -1127,7 +1127,7 @@ type struct LType {
 // LBasicBlock: Wrapper around LLVMBasicBlockRef
 
 type struct LBasicBlock {
-    raw: void*;
+    raw: mut void*;
 
     static null() -> LBasicBlock {
         return LBasicBlock { raw: null };
@@ -1165,7 +1165,7 @@ type struct LBasicBlock {
 // LTargetMachine: Wrapper around LLVMTargetMachineRef
 
 type struct LTargetMachine {
-    raw: void*;
+    raw: mut void*;
 
     static null() -> LTargetMachine {
         return LTargetMachine { raw: null };
@@ -1183,7 +1183,7 @@ type struct LTargetMachine {
     }
 
     get_data_layout_string(&this) -> string {
-        const td: void* = llvm::LLVMCreateTargetDataLayout(this.raw);
+        const td: mut void* = llvm::LLVMCreateTargetDataLayout(this.raw);
         const str: string = llvm::LLVMCopyStringRepOfTargetData(td) as string;
         llvm::LLVMDisposeTargetData(td);
         return str;
@@ -1194,7 +1194,7 @@ type struct LTargetMachine {
     emit_to_file(&this, llmodule: LModule, filename: string, file_type: LFileType) -> Result<(), String> {
         mut err_msg: i8* = null;
         const result: i32 = llvm::LLVMTargetMachineEmitToFile(
-            this.raw, llmodule.raw, filename, file_type as i32, &err_msg as void*);
+            this.raw, llmodule.raw, filename, file_type as i32, &err_msg as mut void*);
         const reason: String = LTargetMachine::take_message(err_msg);
         if (result != 0) {
             return Result::Err(reason);
@@ -1215,7 +1215,7 @@ type struct LTargetMachine {
             2 => { "default<O2>" }
             _ => { "default<O3>" }
         };
-        const options: void* = llvm::LLVMCreatePassBuilderOptions();
+        const options: mut void* = llvm::LLVMCreatePassBuilderOptions();
         const result: i32 = llvm::LLVMRunPasses(llmodule.raw, pipeline, this.raw, options);
         llvm::LLVMDisposePassBuilderOptions(options);
         return result == 0;
@@ -1226,7 +1226,7 @@ type struct LTargetMachine {
     static take_message(message: i8*) -> String {
         if (message == null) { return String::new(); }
         const owned: String = String::from_string(message as string);
-        llvm::LLVMDisposeMessage(message as void*);
+        llvm::LLVMDisposeMessage(message as mut void*);
         return owned;
     }
 
@@ -1270,7 +1270,7 @@ type struct LTargetMachine {
             // and emit MSVC-style code the mingw linker can't resolve).
             effective = LTargetMachine::get_default_triple();
         }
-        mut target: void* = null;
+        mut target: mut void* = null;
         mut err_msg: i8* = null;
 
         // Register the backend here rather than trusting the caller.  LLVM's
@@ -1288,13 +1288,13 @@ type struct LTargetMachine {
         // every target-machine creation is free.
         LTargetMachine::init_native_target();
 
-        const found: i32 = llvm::LLVMGetTargetFromTriple(effective, &target as void*, &err_msg as void*);
+        const found: i32 = llvm::LLVMGetTargetFromTriple(effective, &target as mut void*, &err_msg as mut void*);
         const reason: String = LTargetMachine::take_message(err_msg);
         if (found != 0) {
             return Result::Err(reason);
         }
 
-        const tm: void* = llvm::LLVMCreateTargetMachine(
+        const tm: mut void* = llvm::LLVMCreateTargetMachine(
             target, effective, "generic", "",
             level,
             LRelocMode::PIC as i32,

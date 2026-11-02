@@ -248,16 +248,16 @@ type struct OperatorTraitMap {
 type struct SemaVisitor {
     // -- Immutable environment + the by-value checker (handed to collaborators
     //    as pointers via wire()) --
-    arena:    TypeArena*;
+    arena:    mut TypeArena*;
     checker:  TypeChecker;
-    intern:   InternTable*;
-    ctx:      CompilationContext*;
+    intern:   mut InternTable*;
+    ctx:      mut CompilationContext*;
     this_sym: SymbolStr;
     /// The allocator the `?` desugaring takes its bindings' identities from.
     /// That desugaring declares two bindings after name resolution has run,
     /// and a binding's identity comes from the one allocator that hands them
     /// out.  Held from `wire()`, one door; never asked by name.
-    resolver: Resolver*;
+    resolver: mut Resolver*;
 
     // -- Shared mutable per-pass state (shared by pointer) --
     state: SemaState;
@@ -277,9 +277,9 @@ type struct SemaVisitor {
 
     /// Build from the compilation context (declaration lookups go through
     /// ctx.decl_index, so no AST scan here).
-    static build(ctx: CompilationContext*) -> SemaVisitor {
-        const arena: TypeArena* = ctx.type_arena;
-        const intern: InternTable* = ctx.get_intern_table();
+    static build(ctx: mut CompilationContext*) -> SemaVisitor {
+        const arena: mut TypeArena* = ctx.type_arena;
+        const intern: mut InternTable* = ctx.get_intern_table();
         return SemaVisitor {
             arena:       arena,
             checker:     TypeChecker::new(arena, ctx.decl_index),
@@ -327,9 +327,9 @@ type struct SemaVisitor {
     /// A wired visitor for a pass that synthesizes calls after sema has run
     /// (drop insertion, codegen's drop glue).  Leaked to a stable address the
     /// way `run_sema` does, because the collaborators hold back-pointers.
-    static synthesized_binder(ctx: CompilationContext*) -> SemaVisitor* {
+    static synthesized_binder(ctx: mut CompilationContext*) -> mut SemaVisitor* {
         const _box_v: Box<SemaVisitor> = Box::<SemaVisitor>::new(SemaVisitor::build(ctx));
-        const v: SemaVisitor* = _box_v.into_raw();
+        const v: mut SemaVisitor* = _box_v.into_raw();
         v.wire();
         return v;
     }
@@ -342,12 +342,12 @@ type struct SemaVisitor {
     /// pointer receiver is a `Copy` value with no destructor: it never
     /// reaches its pointee's.
     bind_destructor_call(mut &this, call_e: ExpressionNode*) -> void {
-        const call: CallExpr* = ExpressionNode::call_of(call_e);
+        const call: mut CallExpr* = ExpressionNode::call_of(call_e);
         if (call == null || call.callee == null) { return; }
         if (ExpressionNode::member_access_of(call.callee) == null) { return; }
         const member: MemberAccessExpr* = ExpressionNode::member_access_of(call.callee);
         if (member.object == null || !member.object.resolved_type.is_valid()) { return; }
-        this.calls.bind_destructor(this as SemaVisitor*, call, member.object.resolved_type);
+        this.calls.bind_destructor(this as mut SemaVisitor*, call, member.object.resolved_type);
     }
 
     /// A fresh trait checker over the shared arena + registry (a 4-pointer view).
@@ -546,7 +546,7 @@ type struct SemaVisitor {
         mut needs_restore: boolean = false;
         const template_mod: ModulePath = this.types.find_template_module(stmt.as_decl());
         if (template_mod.is_valid()) {
-            const resolver: Resolver* = this.ctx.get_resolver();
+            const resolver: mut Resolver* = this.ctx.get_resolver();
             if (resolver != null) {
                 saved_scope = resolver.get_current_scope_id();
                 const template_scope: u64 = resolver.find_module_scope(template_mod);
@@ -561,7 +561,7 @@ type struct SemaVisitor {
         }
         this.dispatch_node(stmt);
         if (needs_restore) {
-            const resolver: Resolver* = this.ctx.get_resolver();
+            const resolver: mut Resolver* = this.ctx.get_resolver();
             if (resolver != null) {
                 resolver.restore_scope(saved_module, saved_scope);
             }
@@ -664,7 +664,7 @@ type struct SemaVisitor {
         this.state.symbolic_trait = saved_trait;
     }
 
-    visit_impl(mut &this, decl: DeclarationNode*, node: ImplBlock*) -> void {
+    visit_impl(mut &this, decl: DeclarationNode*, node: mut ImplBlock*) -> void {
         this.check_supertraits_implemented(decl, node);
         if (node.is_template()) {
             const impl_target: TypeRef = this.ctx.decl_index.impl_owner(node, "sema/visit:ImplBlock");
@@ -850,7 +850,7 @@ type struct SemaVisitor {
         swap(&this.state.symbolic_method_param_nodes, &saved_method_nodes);
         this.state.current_owner_type = owner_type;
         this.state.in_symbolic_check  = true;
-        const ar: TypeArena* = this.arena;
+        const ar: mut TypeArena* = this.arena;
         const saved_no_demand: boolean = if (ar != null) { ar.symbolic_no_demand_active } else { false };
         if (ar != null) { ar.set_symbolic_no_demand(true); }
         mut method_nodes: [DeclarationNode*] = [];
@@ -1023,7 +1023,7 @@ type struct SemaVisitor {
         this.resolve_expr(node.expression);
     }
 
-    visit_return(mut &this, stmt: Stmt*, node: ReturnStmt*) -> void {
+    visit_return(mut &this, stmt: Stmt*, node: mut ReturnStmt*) -> void {
         if (node.expression != null) {
             const saved_expected: TypeRef = this.state.expected_type;
             const declared: TypeRef = this.symbolic.symbolic_narrowed(this.state.return_type);
@@ -1064,7 +1064,7 @@ type struct SemaVisitor {
     /// Type `cond` and require it to be exactly `boolean`: a condition is
     /// held to the rule a value assigned to `boolean` is, and no other type
     /// converts to one.
-    resolve_condition(mut &this, cond: ExpressionNode*) -> void {
+    resolve_condition(mut &this, cond: mut ExpressionNode*) -> void {
         const ty: TypeRef = this.resolve_expr(cond);
         if (cond == null || !ty.is_valid() || !this.assignment_judgeable(ty)) { return; }
         const want: TypeRef = this.arena.get_bool();
@@ -1105,7 +1105,7 @@ type struct SemaVisitor {
                 }
             } else if (DeclarationNode::var_of(node.init.as_decl()) != null) {
                 const decl: DeclarationNode* = node.init.as_decl();
-                const var_node: VarDecl* = DeclarationNode::var_of(decl);
+                const var_node: mut VarDecl* = DeclarationNode::var_of(decl);
                 if (var_node.type_annotation == null) {
                     const init_e: ExpressionNode* = var_node.initializer;
                     const init_is_lambda: boolean = ExpressionNode::lambda_of(init_e) != null;
@@ -1201,7 +1201,7 @@ type struct SemaVisitor {
         this.patterns.check_literal_patterns(node.arms, subject_type);
     }
 
-    visit_static_match_stmt(mut &this, stmt: Stmt*, node: StaticMatchStmt*) -> void {
+    visit_static_match_stmt(mut &this, stmt: Stmt*, node: mut StaticMatchStmt*) -> void {
         if (node.arms.length() == 0) { return; }
         if (node.arms.length() > 1 && !this.state.in_symbolic_check) {
             this.ctx.emit_error_at(ErrorCode::E0645_NO_STATIC_MATCH_ARM,
@@ -1223,13 +1223,13 @@ type struct SemaVisitor {
     visit_decl_stmt(mut &this, stmt: Stmt*, node: DeclStmt*) -> void {
         if (node.declaration == null) { return; }
         const decl: DeclarationNode* = node.declaration;
-        const dd: DestructureDecl* = DeclarationNode::destructure_of(node.declaration);
+        const dd: mut DestructureDecl* = DeclarationNode::destructure_of(node.declaration);
         if (dd != null) {
             this.visit_destructure(node.declaration, dd);
             return;
         }
         if (DeclarationNode::var_of(decl) == null) { return; }
-        const var_node: VarDecl* = DeclarationNode::var_of(decl);
+        const var_node: mut VarDecl* = DeclarationNode::var_of(decl);
         this.check_var_decl(node.declaration, var_node);
         this.register_var_decl_local(var_node);
     }
@@ -1244,7 +1244,7 @@ type struct SemaVisitor {
     ///
     /// Guarded on `is_global` so this cannot become a second answering path for
     /// a local; the statement form and the for-loop form own those.
-    visit_var(mut &this, decl: DeclarationNode*, node: VarDecl*) -> void {
+    visit_var(mut &this, decl: DeclarationNode*, node: mut VarDecl*) -> void {
         if (node == null || !node.is_global) { return; }
         if (node.owner != null) { this.refuse_constant_member_clash(decl, node); }
         if (this.typed_before_bodies(node)) { return; }
@@ -1291,7 +1291,7 @@ type struct SemaVisitor {
         for (mut i: i64 = 0; i < root.statements.length(); i++) {
             const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null || DeclarationNode::var_of(stmt) == null) { continue; }
-            const var_node: VarDecl* = DeclarationNode::var_of(stmt);
+            const var_node: mut VarDecl* = DeclarationNode::var_of(stmt);
             if (!var_node.is_global || !this.typed_before_bodies(var_node)) { continue; }
             const registered: boolean = var_node.resolved_type.is_valid();
             const decl: DeclarationNode* = stmt;
@@ -1308,7 +1308,7 @@ type struct SemaVisitor {
     /// E0200 agreement between the two.  Shared by the statement form and the
     /// module-level form - they reach sema through different visitors and must
     /// not answer this differently.
-    check_var_decl(mut &this, decl: DeclarationNode*, var_node: VarDecl*) -> void {
+    check_var_decl(mut &this, decl: DeclarationNode*, var_node: mut VarDecl*) -> void {
 
         // A type-less binding with no initializer has nothing to infer from.
         // With an initializer, the binding's type is inferred from it below
@@ -1355,19 +1355,19 @@ type struct SemaVisitor {
                 if (arr_t != null && arr_t.kind == TypeKind::Array) {
                     const at: ArrayType* = arr_t.as_array();
                     {
-                        const orig_init: ExpressionNode* = var_node.initializer;
+                        const orig_init: mut ExpressionNode* = var_node.initializer;
                         const sp: SourceSpan = orig_init.span;
-                        const zero_lit: ExpressionNode* = ExpressionNode::literal("0", LiteralKind::Integer, sp);
-                        const idx: ExpressionNode* = ExpressionNode::array_access_expr(orig_init, zero_lit, sp);
+                        const zero_lit: mut ExpressionNode* = ExpressionNode::literal("0", LiteralKind::Integer, sp);
+                        const idx: mut ExpressionNode* = ExpressionNode::array_access_expr(orig_init, zero_lit, sp);
                         const amp_tok: Token = Token::new(TokenType::Amp, "&", sp.start_line as int, sp.start_col as int);
-                        const amp: ExpressionNode* =
+                        const amp: mut ExpressionNode* =
                             ExpressionNode::synthetic_unary(amp_tok, idx, sp);
                         const n_str: string = fmt::format("%ld", at.size);
-                        const n_lit: ExpressionNode* = ExpressionNode::literal(n_str, LiteralKind::Integer, sp);
+                        const n_lit: mut ExpressionNode* = ExpressionNode::literal(n_str, LiteralKind::Integer, sp);
                         const slice_sym: SymbolStr = this.intern.intern("Slice");
                         const from_raw_sym: SymbolStr = this.intern.intern("from_raw");
-                        const sr_e: ExpressionNode* = ExpressionNode::scope_resolution_expr(slice_sym, from_raw_sym, sp);
-                        mut sr: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(sr_e);
+                        const sr_e: mut ExpressionNode* = ExpressionNode::scope_resolution_expr(slice_sym, from_raw_sym, sp);
+                        mut sr: mut ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(sr_e);
                         // The reference is to the stdlib `Slice`, which the
                         // prelude carries so this lowering can name it - the
                         // one declaration it means, whatever the writing
@@ -1380,8 +1380,8 @@ type struct SemaVisitor {
                             name: SymbolStr::empty(), span: sp, pre_resolved: at.element,
                             res: ResSlot::Pending,
                         };
-                        const elt_ann: TypeAnnotation* = new TypeAnnotation::Named(elt_named);
-                        mut gen_args: [TypeAnnotation*] = [];
+                        const elt_ann: mut TypeAnnotation* = new TypeAnnotation::Named(elt_named);
+                        mut gen_args: [mut TypeAnnotation*] = [];
                         gen_args.push(elt_ann);
                         sr.set_scope_generic_args(gen_args);
                         mut call: ExpressionNode* = ExpressionNode::call_expr(sr_e, sp);
@@ -1402,9 +1402,9 @@ type struct SemaVisitor {
                     if (owner_ref.is_valid()) {
                         if (this.ctx.decl_index.lookup_family_entries(
                                 FamilyOwner::Type(owner_ref), this.intern.intern("iter")).length() > 0) {
-                            const orig_init: ExpressionNode* = var_node.initializer;
+                            const orig_init: mut ExpressionNode* = var_node.initializer;
                             const wrap_span: SourceSpan = orig_init.span;
-                            mut iter_member: ExpressionNode* = ExpressionNode::member_access_expr(orig_init, this.intern.intern("iter"), wrap_span, wrap_span);
+                            mut iter_member: mut ExpressionNode* = ExpressionNode::member_access_expr(orig_init, this.intern.intern("iter"), wrap_span, wrap_span);
                             mut iter_call: ExpressionNode* = ExpressionNode::call_expr(iter_member, wrap_span);
                             var_node.set_initializer(iter_call);
                             init_type = this.resolve_expr(var_node.initializer);
@@ -1533,7 +1533,7 @@ type struct SemaVisitor {
         this.scopes.set_kw_span(var_node.sym_id, var_node.kw_span);
     }
 
-    visit_destructure(mut &this, d: DeclarationNode*, node: DestructureDecl*) -> void {
+    visit_destructure(mut &this, d: DeclarationNode*, node: mut DestructureDecl*) -> void {
         if (!node.has_resolved_type() && node.type_annotation != null) {
             mut res_ctx: ResolutionContext = this.body_res_ctx();
             this.symbolic.symbolic_bind_params(&res_ctx);
@@ -1710,7 +1710,7 @@ type struct SemaVisitor {
 
     // -- The authoritative expression dispatch --
 
-    resolve_expr(mut &this, expr: ExpressionNode*) -> TypeRef {
+    resolve_expr(mut &this, expr: mut ExpressionNode*) -> TypeRef {
         if (expr == null) { return TypeRef::invalid(); }
         if (expr.has_resolved_type()) {
             return expr.resolved_type;
@@ -1730,7 +1730,7 @@ type struct SemaVisitor {
     /// at most: a receiver whose type holds two raw pointers on the way to
     /// its value (`Foo**`, `&(Foo**)`) is refused here, so a member is never
     /// reached through a pointer the program did not dereference.
-    resolve_receiver(mut &this, receiver: ExpressionNode*) -> TypeRef {
+    resolve_receiver(mut &this, receiver: mut ExpressionNode*) -> TypeRef {
         const outer_expected: TypeRef = this.state.expected_type;
         this.state.expected_type = TypeRef::invalid();
         const t: TypeRef = this.resolve_expr(receiver);
@@ -1775,7 +1775,7 @@ type struct SemaVisitor {
 
     /// The type of an expression whose kind has a payload; `resolve_expr`
     /// records it on the header.
-    resolve_expr_shape(mut &this, expr: ExpressionNode*) -> TypeRef {
+    resolve_expr_shape(mut &this, expr: mut ExpressionNode*) -> TypeRef {
         return match (expr.kind) {
             ExprKind::Sizeof(s) => {
                 if (!s.operand_type.is_valid()) {
@@ -1944,7 +1944,7 @@ type struct SemaVisitor {
         return id.res.local_sym().key() == this.state.receiver_sym.key();
     }
 
-    resolve_identifier(mut &this, e: ExpressionNode*, ident: IdentifierExpr*) -> TypeRef {
+    resolve_identifier(mut &this, e: ExpressionNode*, ident: mut IdentifierExpr*) -> TypeRef {
         if (this.names_receiver(ident)) {
             if (this.state.this_type.is_valid()) { return this.state.this_type; }
             if (e.resolved_type.is_valid()) { return e.resolved_type; }
@@ -2069,12 +2069,12 @@ type struct SemaVisitor {
     /// the trait's IDENTITY - the canonical name the impl that was found
     /// declares, or the bound's - never the operator table's leaf: two traits
     /// can share a leaf, and a leaf would let the wrong one's method win.
-    build_operator_call(mut &this, receiver: ExpressionNode*, method: SymbolStr,
-                        trait_id: DefId, rhs: ExpressionNode*, op_tok: Token,
-                        span: SourceSpan) -> ExpressionNode* {
-        const member: ExpressionNode* = ExpressionNode::member_access_expr(receiver, method, span, span);
+    build_operator_call(mut &this, receiver: mut ExpressionNode*, method: SymbolStr,
+                        trait_id: DefId, rhs: mut ExpressionNode*, op_tok: Token,
+                        span: SourceSpan) -> mut ExpressionNode* {
+        const member: mut ExpressionNode* = ExpressionNode::member_access_expr(receiver, method, span, span);
         this.calls.stamp_trait_item(ExpressionNode::member_access_of(member), trait_id);
-        mut call: ExpressionNode* = ExpressionNode::call_expr(member, span);
+        mut call: mut ExpressionNode* = ExpressionNode::call_expr(member, span);
         if (rhs != null) {
             // The trait method takes `rhs: &Rhs`.  When the operand is already a
             // reference (`&Rhs`, e.g. a by-reference parameter or `&scratch[0]`),
@@ -2098,7 +2098,7 @@ type struct SemaVisitor {
     /// the entry chosen by its signature: a program's own `append` on
     /// `string` taking anything else is another overload, and not it.
     /// Nothing for any other operator or operand.
-    pin_string_append(mut &this, bin: BinaryExpr*, op: TokenType, lhs: TypeRef) -> void {
+    pin_string_append(mut &this, bin: mut BinaryExpr*, op: TokenType, lhs: TypeRef) -> void {
         if (op != TokenType::Plus) { return; }
         const lt: Type* = this.arena.lookup(lhs);
         if (lt == null || lt.kind != TypeKind::String) { return; }
@@ -2159,8 +2159,8 @@ type struct SemaVisitor {
     /// null when no overload applies (caller keeps the primitive path or errors).
     /// Only a concrete user type (Struct/Enum/Instantiated) with a
     /// registered trait impl overloads.
-    operator_overload_expr(mut &this, receiver: ExpressionNode*, ty: TypeRef,
-                           rhs: ExpressionNode*, map: OperatorTraitMap,
+    operator_overload_expr(mut &this, receiver: mut ExpressionNode*, ty: TypeRef,
+                           rhs: mut ExpressionNode*, map: OperatorTraitMap,
                            op_tok: Token, span: SourceSpan,
                            deref_ref: boolean) -> ExpressionNode* {
         if (!map.valid) { return null; }
@@ -2253,17 +2253,17 @@ type struct SemaVisitor {
 
     /// The operator's call on `trait_id`'s method, wrapped as `map` says,
     /// and resolved.
-    operator_desugar(mut &this, receiver: ExpressionNode*, rhs: ExpressionNode*,
+    operator_desugar(mut &this, receiver: mut ExpressionNode*, rhs: mut ExpressionNode*,
                      map: OperatorTraitMap, trait_id: DefId, op_tok: Token,
                      span: SourceSpan) -> ExpressionNode* {
         const method_sym: SymbolStr = this.intern.intern(map.method);
-        mut desugared: ExpressionNode* =
+        mut desugared: mut ExpressionNode* =
             this.build_operator_call(receiver, method_sym, trait_id, rhs, op_tok, span);
         // Relational operators: wrap the `compare` call in an `Ordering`
         // predicate - `a < b` -> `a.compare(&b).is_lt()`.
         if (map.ord_pred != "") {
             const pred_sym: SymbolStr = this.intern.intern(map.ord_pred);
-            const pred_member: ExpressionNode* =
+            const pred_member: mut ExpressionNode* =
                 ExpressionNode::member_access_expr(desugared, pred_sym, span, span);
             desugared = ExpressionNode::call_expr(pred_member, span) as ExpressionNode*;
         }
@@ -2323,8 +2323,8 @@ type struct SemaVisitor {
     /// free type parameter.  `Eq`/`Ord` are excluded: their receiver and operand
     /// share `This`, so `2 == vec` can never match a primitive's own comparison
     /// impl, and attempting it would only risk a spurious diagnostic.
-    reflected_operator_overload_expr(mut &this, lhs_expr: ExpressionNode*, lhs: TypeRef,
-                                     rhs_expr: ExpressionNode*, rhs: TypeRef, map: OperatorTraitMap,
+    reflected_operator_overload_expr(mut &this, lhs_expr: mut ExpressionNode*, lhs: TypeRef,
+                                     rhs_expr: mut ExpressionNode*, rhs: TypeRef, map: OperatorTraitMap,
                                      op_tok: Token, span: SourceSpan) -> ExpressionNode* {
         if (!map.valid) { return null; }
         if (map.ord_pred != "" || map.lang == LangItem::Eq) { return null; }
@@ -2345,7 +2345,7 @@ type struct SemaVisitor {
         const impl_block: ImplBlock* = DeclarationNode::impl_of(found);
         if (impl_block == null || !impl_block.trait_def.is_valid()) { return null; }
         const method_sym: SymbolStr = this.intern.intern(map.method);
-        mut desugared: ExpressionNode* =
+        mut desugared: mut ExpressionNode* =
             this.build_operator_call(lhs_expr, method_sym, impl_block.trait_def, rhs_expr, op_tok, span);
         const rty: TypeRef = this.resolve_expr(desugared);
         if (!rty.is_valid()) { return null; }
@@ -2471,7 +2471,7 @@ type struct SemaVisitor {
         this.ctx.emit_diagnostic(diag);
     }
 
-    resolve_binary(mut &this, e: ExpressionNode*, bin: BinaryExpr*) -> TypeRef {
+    resolve_binary(mut &this, e: ExpressionNode*, bin: mut BinaryExpr*) -> TypeRef {
         // Idempotent: if a previous resolution already rewrote this operator
         // into a trait-method call, return its type without re-running
         // `check_binary_op` (which would re-reject the user-typed operands and
@@ -2916,7 +2916,7 @@ type struct SemaVisitor {
     /// itself unless `place` was such a read in its own right.
     route_write(mut &this, place: ExpressionNode*) -> ExpressionNode* {
         if (place == null) { return place; }
-        const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(place);
+        const aa: mut ArrayAccessExpr* = ExpressionNode::array_access_of(place);
         if (aa != null) {
             if (aa.desugared_call != null) {
                 aa.desugared_call = this.writable_trait_read(aa.desugared_call);
@@ -2925,7 +2925,7 @@ type struct SemaVisitor {
             }
             return place;
         }
-        const un: UnaryExpr* = ExpressionNode::unary_of(place);
+        const un: mut UnaryExpr* = ExpressionNode::unary_of(place);
         if (un != null && un.op.kind == TokenType::Star) {
             if (un.desugared_call != null) {
                 un.desugared_call = this.writable_trait_read(un.desugared_call);
@@ -2933,7 +2933,7 @@ type struct SemaVisitor {
             }
             return this.writable_trait_read(place);
         }
-        const ma: MemberAccessExpr* = ExpressionNode::member_access_of(place);
+        const ma: mut MemberAccessExpr* = ExpressionNode::member_access_of(place);
         if (ma != null && ma.object != null && this.indirection_access(ma.object).is_none()) {
             ma.object = this.route_write(ma.object);
         }
@@ -2982,14 +2982,14 @@ type struct SemaVisitor {
             this.ctx.diagnostics.emit(diag);
             return star;
         }
-        const callee: ExpressionNode* = this.member.lang_method_callee(member.object, writer, star.span);
+        const callee: mut ExpressionNode* = this.member.lang_method_callee(member.object, writer, star.span);
         if (callee == null) { return star; }
         const read: CallExpr* = ExpressionNode::call_of(ExpressionNode::unary_of(star).operand);
-        mut write: ExpressionNode* = ExpressionNode::call_expr(callee, star.span);
+        mut write: mut ExpressionNode* = ExpressionNode::call_expr(callee, star.span);
         for (mut i: i64 = 0; i < read.arguments.length(); i++) {
             ExpressionNode::call_of(write).add_argument(read.arguments[i]);
         }
-        const written: ExpressionNode* =
+        const written: mut ExpressionNode* =
             ExpressionNode::synthetic_unary(ExpressionNode::unary_of(star).op, write, star.span);
         if (!this.resolve_expr(written).is_valid()) { return star; }
         return written;
@@ -3192,7 +3192,7 @@ type struct SemaVisitor {
         return diag;
     }
 
-    resolve_unary(mut &this, e: ExpressionNode*, unary: UnaryExpr*) -> TypeRef {
+    resolve_unary(mut &this, e: ExpressionNode*, unary: mut UnaryExpr*) -> TypeRef {
         // Idempotent (see resolve_binary): a prior resolution may have rewritten
         // `-x` into `x.neg()`; return its type rather than re-rejecting.
         if (unary.desugared_call != null) {
@@ -3384,7 +3384,7 @@ type struct SemaVisitor {
     /// generic implementation, its copy for the value's type; anything else
     /// that has the right shape is E0315.
     /// An object converts to its own type alone, which needs no conversion.
-    convert_to_object(mut &this, expr: ExpressionNode*, from: TypeRef, to: TypeRef) -> ObjectConversionOutcome {
+    convert_to_object(mut &this, expr: mut ExpressionNode*, from: TypeRef, to: TypeRef) -> ObjectConversionOutcome {
         const target: Type* = this.arena.lookup(to);
         const source: Type* = this.arena.lookup(from);
         if (expr == null || target == null || source == null || target.kind != TypeKind::Object) {
@@ -3434,8 +3434,8 @@ type struct SemaVisitor {
                     shown_value, shown_trait, shown_from, shown_to), expr.span);
             return ObjectConversionOutcome::Refused;
         }
-        const block: ImplBlock* = DeclarationNode::impl_of(implementation);
-        mut blocks: [ImplBlock*] = [];
+        const block: mut ImplBlock* = DeclarationNode::impl_of(implementation);
+        mut blocks: [mut ImplBlock*] = [];
         if (!this.object_table_implementations(expr, object, value, block, &blocks, shown_from, shown_to,
                 shown_value, shown_trait)) {
             return ObjectConversionOutcome::Refused;
@@ -3463,7 +3463,7 @@ type struct SemaVisitor {
             }
             return this.binding.bound_gives_at(value, object.trait_def, &object.args);
         }
-        const node: ImplBlock* = this.state.symbolic_impl_node;
+        const node: mut ImplBlock* = this.state.symbolic_impl_node;
         if (node == null || !node.trait_def.equals(object.trait_def)) { return false; }
         if (!value.equals(this.state.this_type)) { return false; }
         return this.ctx.generic_registry.binds_trait_arguments(node, object.trait_def, &object.args, this.intern);
@@ -3475,7 +3475,7 @@ type struct SemaVisitor {
     /// false, with E0315 reported, when it does not implement a supertrait
     /// the table holds methods of.
     object_table_implementations(mut &this, expr: ExpressionNode*, object: ObjectType*, value: TypeRef,
-                                 own: ImplBlock*, blocks: mut &[ImplBlock*], shown_from: string,
+                                 own: mut ImplBlock*, blocks: mut &[mut ImplBlock*], shown_from: string,
                                  shown_to: string, shown_value: string, shown_trait: string) -> boolean {
         const missing: DefId = this.ctx.type_resolver.object_table_blocks(object, value, own, blocks);
         if (!missing.is_valid()) { return true; }
@@ -3527,7 +3527,7 @@ type struct SemaVisitor {
     /// implementation's supertrait implementation must have its
     /// where-clause hold for the type; a generic one's type arguments are
     /// not known here, so the supertrait's head unifying with it is enough.
-    check_supertraits_implemented(mut &this, decl: DeclarationNode*, node: ImplBlock*) -> void {
+    check_supertraits_implemented(mut &this, decl: DeclarationNode*, node: mut ImplBlock*) -> void {
         if (!node.is_trait_impl() || node.spec_owner.is_valid()) { return; }
         const registry: GenericRegistry* = this.ctx.generic_registry;
         const trait_decl: TraitDecl* = registry.get_trait_decl(node.trait_def);
@@ -3558,7 +3558,7 @@ type struct SemaVisitor {
             const heads: [DeclarationNode*] = registry.heads_for(base, owner, this.intern);
             mut found: boolean = false;
             for (mut h: i64 = 0; h < heads.length() && !found; h++) {
-                const candidate: ImplBlock* = DeclarationNode::impl_of(heads[h]);
+                const candidate: mut ImplBlock* = DeclarationNode::impl_of(heads[h]);
                 if (candidate == null || !registry.binds_trait_arguments(candidate, base, &base_args, this.intern)) { continue; }
                 found = generic || checker.impl_applies(candidate, owner, 0);
             }
@@ -3572,7 +3572,7 @@ type struct SemaVisitor {
         }
     }
 
-    resolve_cast(mut &this, e: ExpressionNode*, cast: CastExpr*) -> TypeRef {
+    resolve_cast(mut &this, e: ExpressionNode*, cast: mut CastExpr*) -> TypeRef {
         // The operand of an explicit cast is not bounded by the SURROUNDING
         // annotation.  `as` names its own target, and performing a conversion
         // the operand would not survive implicitly is the whole reason to write
@@ -3778,7 +3778,7 @@ type struct SemaVisitor {
         }
     }
 
-    resolve_constant_paths(mut &this, pat: Pattern*) -> void {
+    resolve_constant_paths(mut &this, pat: mut Pattern*) -> void {
         if (pat == null) { return; }
         match (pat.kind) {
             PatternKind::Constant(c) => {
@@ -3797,7 +3797,7 @@ type struct SemaVisitor {
                     const owner: TypeRef = this.types.scope_qualifier_type(scope);
                     if (this.path_type_constant(scope, owner).is_valid()) {
                         this.resolve_expr(e.path);
-                        mut c: ConstantPattern* = ConstantPattern::new(e.variant_name);
+                        mut c: mut ConstantPattern* = ConstantPattern::new(e.variant_name);
                         c.path = e.path;
                         c.res.answer(Res::Def(scope.member_def));
                         pat.kind = PatternKind::Constant(c);
@@ -3822,7 +3822,7 @@ type struct SemaVisitor {
     /// compared against: a method is not a constant, and a missing member is
     /// missing.  The pattern is kept as a refused constant, so nothing later
     /// reads it as a variant of the subject.
-    refuse_type_path_pattern(mut &this, pat: Pattern*, e: EnumPattern*, owner: TypeRef) -> void {
+    refuse_type_path_pattern(mut &this, pat: mut Pattern*, e: EnumPattern*, owner: TypeRef) -> void {
         const written: string = fmt::format("%s::%s",
             this.intern.resolve(e.enum_name), this.intern.resolve(e.variant_name));
         if (this.calls.owner_declares_member(owner, e.variant_name)) {
@@ -3837,7 +3837,7 @@ type struct SemaVisitor {
             miss = miss.at_with_label(pat.span, "not found in this scope");
             this.ctx.emit_diagnostic(miss);
         }
-        mut c: ConstantPattern* = ConstantPattern::new(e.variant_name);
+        mut c: mut ConstantPattern* = ConstantPattern::new(e.variant_name);
         c.res.answer(Res::Err);
         pat.kind = PatternKind::Constant(c);
     }
@@ -3895,7 +3895,7 @@ type struct SemaVisitor {
         return result_type;
     }
 
-    resolve_static_match_expr(mut &this, e: ExpressionNode*, sm: StaticMatchExpr*) -> TypeRef {
+    resolve_static_match_expr(mut &this, e: ExpressionNode*, sm: mut StaticMatchExpr*) -> TypeRef {
         if (sm == null || sm.arms.length() == 0) { return TypeRef::invalid(); }
         if (sm.arms.length() > 1 && !this.state.in_symbolic_check) {
             this.ctx.emit_error_at(ErrorCode::E0645_NO_STATIC_MATCH_ARM,
@@ -4042,9 +4042,9 @@ type struct SemaVisitor {
     /// `poll` body.  The `Res` alone and no type: a node that carries its type
     /// is answered from it and never walked, and the walk of the `return` it
     /// is built into is what pins the variant.
-    make_poll_ready(&this, value: ExpressionNode*, poll_out: TypeRef,
+    make_poll_ready(&this, value: mut ExpressionNode*, poll_out: TypeRef,
                     span: SourceSpan) -> ExpressionNode* {
-        const scope: ExpressionNode* = ExpressionNode::scope_resolution_expr(
+        const scope: mut ExpressionNode* = ExpressionNode::scope_resolution_expr(
             this.async_lower.poll_identity(), this.intern.intern("Ready"), span);
         ExpressionNode::scope_resolution_of(scope).set_synthesized_res(
             this.ctx.decl_index.def_of(poll_out, this.ctx.type_arena));
@@ -4111,12 +4111,12 @@ type struct SemaVisitor {
     /// The implementation of the language's `FromResidual<residual>` for
     /// `to` whose head binds the trait at `residual`, its where-clause not
     /// consulted; null when there is none.
-    from_residual_head(&this, to: TypeRef, residual: TypeRef) -> ImplBlock* {
+    from_residual_head(&this, to: TypeRef, residual: TypeRef) -> mut ImplBlock* {
         const from_residual: DefId = this.ctx.generic_registry.wellknown(LangItem::FromResidual);
         const args: [TypeRef] = [residual];
         const heads: [DeclarationNode*] = this.ctx.generic_registry.heads_for(from_residual, to, this.intern);
         for (mut i: i64 = 0; i < heads.length(); i++) {
-            const head: ImplBlock* = DeclarationNode::impl_of(heads[i]);
+            const head: mut ImplBlock* = DeclarationNode::impl_of(heads[i]);
             if (head != null && this.ctx.generic_registry.binds_trait_arguments(head, from_residual, &args, this.intern)) {
                 return head;
             }
@@ -4154,7 +4154,7 @@ type struct SemaVisitor {
     /// the value the `Break` arm returns is built for it, and the two agree on
     /// shape (the caller rejects a mismatch) but not necessarily on
     /// instantiation.
-    build_try_desugar(mut &this, e: ExpressionNode*, node: TryExpr*, ret_ty: TypeRef) -> ExpressionNode* {
+    build_try_desugar(mut &this, e: ExpressionNode*, node: TryExpr*, ret_ty: TypeRef) -> mut ExpressionNode* {
         const span: SourceSpan = e.span;
         this.state.try_counter += 1;
         const registry: GenericRegistry* = this.ctx.generic_registry;
@@ -4164,13 +4164,13 @@ type struct SemaVisitor {
         const err_variant: SymbolStr = this.intern.intern("Break");
         const ok_bind: SymbolStr = this.intern.intern(fmt::format("__cryo_try_%u", this.state.try_counter));
 
-        const branch: ExpressionNode* = ExpressionNode::member_access_expr(node.operand,
+        const branch: mut ExpressionNode* = ExpressionNode::member_access_expr(node.operand,
             this.ctx.defs.leaf_of(registry.wellknown(LangItem::TryBranch)).spelling(), span, span);
         this.calls.stamp_trait_item(ExpressionNode::member_access_of(branch), registry.wellknown(LangItem::Try));
-        const desugar: ExpressionNode* = ExpressionNode::match_expr(ExpressionNode::call_expr(branch, span), span);
-        mut match_expr: MatchExpr* = ExpressionNode::match_of(desugar);
-        const ok_node: Pattern* = Pattern::enum_variant(enum_name, ok_variant, span);
-        mut ok_pat: EnumPattern* = ok_node.enum_payload();
+        const desugar: mut ExpressionNode* = ExpressionNode::match_expr(ExpressionNode::call_expr(branch, span), span);
+        mut match_expr: mut MatchExpr* = ExpressionNode::match_of(desugar);
+        const ok_node: mut Pattern* = Pattern::enum_variant(enum_name, ok_variant, span);
+        mut ok_pat: mut EnumPattern* = ok_node.enum_payload();
         ok_pat.set_res(Res::Def(flow));
         // Both bindings are declared here, after name resolution ran, so each
         // takes its identity from the allocator and every use this builds
@@ -4181,17 +4181,17 @@ type struct SemaVisitor {
             resolved_type: TypeRef::invalid(), written_mut: false
         };
         ok_pat.add_element(PatternElement::Binding(ok_pb));
-        mut ok_arm: MatchArmNode* = MatchArmNode::new(span);
+        mut ok_arm: mut MatchArmNode* = MatchArmNode::new(span);
         ok_arm.add_pattern(ok_node);
-        const ok_ident: ExpressionNode* = ExpressionNode::identifier_expr(ok_bind, span);
+        const ok_ident: mut ExpressionNode* = ExpressionNode::identifier_expr(ok_bind, span);
         ExpressionNode::identifier_of(ok_ident).set_res(Res::Local(ok_sym));
         const ok_block: Stmt* = Stmt::block(span);
         ok_block.as_block().add_statement(Stmt::expr_stmt(ok_ident, span));
         ok_arm.set_body(ok_block);
         match_expr.add_arm(ok_arm);
 
-        const err_node: Pattern* = Pattern::enum_variant(enum_name, err_variant, span);
-        mut err_pat: EnumPattern* = err_node.enum_payload();
+        const err_node: mut Pattern* = Pattern::enum_variant(enum_name, err_variant, span);
+        mut err_pat: mut EnumPattern* = err_node.enum_payload();
         err_pat.set_res(Res::Def(flow));
         const err_bind: SymbolStr = this.intern.intern(fmt::format("__cryo_try_residual_%u", this.state.try_counter));
         const err_sym: SymbolID = this.resolver.alloc_synthetic_binding();
@@ -4200,9 +4200,9 @@ type struct SemaVisitor {
             resolved_type: TypeRef::invalid(), written_mut: false
         };
         err_pat.add_element(PatternElement::Binding(err_pb));
-        const err_ident: ExpressionNode* = ExpressionNode::identifier_expr(err_bind, span);
+        const err_ident: mut ExpressionNode* = ExpressionNode::identifier_expr(err_bind, span);
         ExpressionNode::identifier_of(err_ident).set_res(Res::Local(err_sym));
-        mut ret_value: ExpressionNode* = this.build_from_residual_call(ret_ty, err_ident, span);
+        mut ret_value: mut ExpressionNode* = this.build_from_residual_call(ret_ty, err_ident, span);
         // Inside the `poll` an `async fn` was lowered into, every `return`
         // carries `Poll::Ready(...)`. The lowering wrapped the returns it could
         // see, but this desugar is built after it ran — a `?` in a GENERIC body
@@ -4211,7 +4211,7 @@ type struct SemaVisitor {
         if (this.state.async_poll_output.is_valid()) {
             ret_value = this.make_poll_ready(ret_value, this.state.return_type, span);
         }
-        mut err_arm: MatchArmNode* = MatchArmNode::new(span);
+        mut err_arm: mut MatchArmNode* = MatchArmNode::new(span);
         err_arm.add_pattern(err_node);
         const err_block: Stmt* = Stmt::block(span);
         err_block.as_block().add_statement(Stmt::return_stmt(ret_value, span));
@@ -4227,12 +4227,12 @@ type struct SemaVisitor {
     /// arguments as `Result::<T, F>::from_residual(r)` is, so nothing looks
     /// the type up by name; the path is directed through `FromResidual`, so
     /// a method of `to`'s own spelled `from_residual` is not the one called.
-    build_from_residual_call(&this, to: TypeRef, residual: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
+    build_from_residual_call(&this, to: TypeRef, residual: mut ExpressionNode*, span: SourceSpan) -> mut ExpressionNode* {
         const method: DefId = this.ctx.generic_registry.wellknown(LangItem::FromResidualFromResidual);
         const to_def: DefId = this.ctx.decl_index.def_of(to, this.ctx.type_arena);
-        const scope: ExpressionNode* = ExpressionNode::scope_resolution_expr(
+        const scope: mut ExpressionNode* = ExpressionNode::scope_resolution_expr(
             this.ctx.defs.leaf_of(to_def).spelling(), this.ctx.defs.leaf_of(method).spelling(), span);
-        mut path: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(scope);
+        mut path: mut ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(scope);
         path.set_resolved_trait(this.ctx.generic_registry.wellknown(LangItem::FromResidual));
         path.set_synthesized_ref(scope, to, to_def);
         for (mut i: i64 = 0; this.arena.inst_type_arg_at(to, i).is_valid(); i++) {
@@ -4244,7 +4244,7 @@ type struct SemaVisitor {
                 res:          ResSlot::Pending,
             }));
         }
-        mut call: ExpressionNode* = ExpressionNode::call_expr(scope, span);
+        mut call: mut ExpressionNode* = ExpressionNode::call_expr(scope, span);
         ExpressionNode::call_of(call).add_argument(residual);
         return call;
     }
@@ -4267,7 +4267,7 @@ type struct SemaVisitor {
         }
         const heads: [DeclarationNode*] = this.ctx.generic_registry.heads_for(from_trait, to, this.intern);
         for (mut i: i64 = 0; i < heads.length(); i++) {
-            const head: ImplBlock* = DeclarationNode::impl_of(heads[i]);
+            const head: mut ImplBlock* = DeclarationNode::impl_of(heads[i]);
             if (head == null || head.trait_arg_types.length() != 1) { continue; }
             if (!this.checker.is_same_type(from, head.trait_arg_types[0])) { continue; }
             if (this.trait_checker().impl_applies(head, to, 0)) { return true; }
@@ -4275,7 +4275,7 @@ type struct SemaVisitor {
         return false;
     }
 
-    resolve_try_expr(mut &this, e: ExpressionNode*, node: TryExpr*) -> TypeRef {
+    resolve_try_expr(mut &this, e: ExpressionNode*, node: mut TryExpr*) -> TypeRef {
         // The operand is resolved on EVERY visit, including one that reuses an
         // existing desugar: call-specialization and dispatch annotation both
         // walk `operand` (never `desugared`), so a specialization whose operand
@@ -4330,7 +4330,7 @@ type struct SemaVisitor {
         } else { this.state.return_type };
         // The function's return type must implement `FromResidual` of what
         // the operand returns early with.
-        const head: ImplBlock* = this.from_residual_head(fn_ret, residual);
+        const head: mut ImplBlock* = this.from_residual_head(fn_ret, residual);
         if (head == null) {
             // A return type that still mentions an abstract parameter cannot
             // settle this. An `async` trait default body is walked once with its
@@ -4412,7 +4412,7 @@ type struct SemaVisitor {
                 return TypeRef::invalid();
             }
         }
-        const desugared: ExpressionNode* = this.build_try_desugar(e, node, fn_ret);
+        const desugared: mut ExpressionNode* = this.build_try_desugar(e, node, fn_ret);
         node.set_desugared(desugared);
         return this.resolve_expr(desugared);
     }
@@ -4470,7 +4470,7 @@ type struct SemaVisitor {
                                                      e.span);
     }
 
-    resolve_struct_literal(mut &this, e: ExpressionNode*, lit: StructExpr*) -> TypeRef {
+    resolve_struct_literal(mut &this, e: ExpressionNode*, lit: mut StructExpr*) -> TypeRef {
         mut struct_ref: TypeRef = TypeRef::invalid();
         // Monomorphization records a specialized literal's instantiation as the
         // arena id itself, which IS `(definition, arguments)` already resolved.
@@ -4541,7 +4541,7 @@ type struct SemaVisitor {
         const saved_expected: TypeRef = this.state.expected_type;
         for (mut i: i64 = 0; i < lit.field_inits.length(); i++) {
             const field_init: FieldInit = lit.field_inits[i];
-            const value_expr: ExpressionNode* = field_init.value;
+            const value_expr: mut ExpressionNode* = field_init.value;
             mut field_type: TypeRef = TypeRef::invalid();
             // The field this initializer names, found by the member door as a
             // `.field` access finds it - and recorded on the initializer by its
@@ -4679,11 +4679,11 @@ type struct SemaVisitor {
     /// and type-check it against the field type (E0200 on mismatch), then append
     /// it to the literal as a synthetic field-init so codegen fills the field.
     /// The default is a standalone expression - it never sees the other fields.
-    fill_field_default(mut &this, e: ExpressionNode*, lit: StructExpr*, field: const FieldInfo*,
+    fill_field_default(mut &this, e: ExpressionNode*, lit: mut StructExpr*, field: const FieldInfo*,
                        index: i64, name: SymbolStr) -> void {
         if (field.default_value == null) { return; }
         mut cloner: ASTCloner = ASTCloner::new();
-        const cloned: ExpressionNode* = cloner.clone_expr(field.default_value);
+        const cloned: mut ExpressionNode* = cloner.clone_expr(field.default_value);
         if (cloned == null) { return; }
         const field_type: TypeRef = field.field_type;
         const saved: TypeRef = this.state.expected_type;
@@ -4691,7 +4691,7 @@ type struct SemaVisitor {
         else { this.state.expected_type = TypeRef::invalid(); }
         const value_type: TypeRef = this.resolve_expr(cloned);
         this.state.expected_type = saved;
-        mut value: ExpressionNode* = cloned;
+        mut value: mut ExpressionNode* = cloned;
         if (field_type.is_valid() && value_type.is_valid()) {
             const skip: boolean = this.types.contains_generic_param(value_type)
                 || this.types.contains_generic_param(field_type);
@@ -4807,7 +4807,7 @@ type struct SemaVisitor {
         return value_ft;
     }
 
-    resolve_scope_resolution(mut &this, e: ExpressionNode*, scope: ScopeResolutionExpr*) -> TypeRef {
+    resolve_scope_resolution(mut &this, e: ExpressionNode*, scope: mut ScopeResolutionExpr*) -> TypeRef {
         // The qualifier's type is the resolver's own answer for this segment,
         // a primitive included.  A stamp that makes no type claim names a
         // module or a type parameter, and the index holds no type under
@@ -4941,7 +4941,7 @@ type struct SemaVisitor {
     /// registration on the path; invalid otherwise.  The owner is the type
     /// `found` is, so an alias reaches its target's constants.  A `private`
     /// constant is reached only from its own module (E0353).
-    scope_type_constant(mut &this, e: ExpressionNode*, scope: ScopeResolutionExpr*,
+    scope_type_constant(mut &this, e: ExpressionNode*, scope: mut ScopeResolutionExpr*,
                         found: TypeRef) -> TypeRef {
         const def: DefId = this.path_type_constant(scope, found);
         if (!def.is_valid()) { return TypeRef::invalid(); }
@@ -4974,7 +4974,7 @@ type struct SemaVisitor {
         return def;
     }
 
-    validate_enum_scope_member(mut &this, e: ExpressionNode*, scope_ty: TypeRef, scope: ScopeResolutionExpr*) -> void {
+    validate_enum_scope_member(mut &this, e: ExpressionNode*, scope_ty: TypeRef, scope: mut ScopeResolutionExpr*) -> void {
         const t: Type* = this.arena.lookup(scope_ty);
         if (t == null || t.kind != TypeKind::Enum) { return; }
         const et: EnumType* = t.as_enum();
@@ -4999,7 +4999,7 @@ type struct SemaVisitor {
         this.ctx.diagnostics.emit(d);
     }
 
-    resolve_new_expr(mut &this, expr: ExpressionNode*, new_expr: NewExpr*) -> TypeRef {
+    resolve_new_expr(mut &this, expr: ExpressionNode*, new_expr: mut NewExpr*) -> TypeRef {
         for (mut i: i64 = 0; i < new_expr.arguments.length(); i++) { this.resolve_expr(new_expr.arguments[i]); }
         if (new_expr.has_array_size()) { this.resolve_expr(new_expr.array_size); }
         // `new T { .. }` places the literal it holds, so the literal's type is
@@ -5096,7 +5096,7 @@ type struct SemaVisitor {
         return n.bits as i64;
     }
 
-    resolve_array_literal(mut &this, e: ExpressionNode*, arr: ArrayExpr*) -> TypeRef {
+    resolve_array_literal(mut &this, e: ExpressionNode*, arr: mut ArrayExpr*) -> TypeRef {
         const dynamic_elem: TypeRef = this.expected_dynamic_element();
         mut elem_expected: TypeRef = dynamic_elem;
         if (!elem_expected.is_valid() && this.state.expected_type.is_valid()) {
@@ -5656,8 +5656,8 @@ type struct SemaVisitor {
     }
 
     opaque_assoc_item_mismatch(mut &this, bound_ann: TypeAnnotation*, concrete: TypeRef,
-                               out_expected: TypeRef*, out_actual: TypeRef*,
-                               out_trait: SymbolStr*, out_item: SymbolStr*) -> boolean {
+                               out_expected: mut TypeRef*, out_actual: mut TypeRef*,
+                               out_trait: mut SymbolStr*, out_item: mut SymbolStr*) -> boolean {
         if (bound_ann == null) { return false; }
         mut gen: GenericAnnotation* = null;
         match (*bound_ann) {
@@ -5749,7 +5749,7 @@ type struct SemanticPasses {
 
     /// Walk all function bodies and fill resolved_type on every ExpressionNode.
     /// Runs once, before monomorphization; a copy carries what it decided.
-    static run_sema(ctx: CompilationContext*) -> PassResult {
+    static run_sema(ctx: mut CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
         const arena: TypeArena* = ctx.type_arena;
         if (arena == null) {
@@ -5766,7 +5766,7 @@ type struct SemanticPasses {
         // `Box<..>::new(..).into_raw()` leaves `T` unbound - see codegen's
         // `_box_gen` two-step).
         const _box_v: Box<SemaVisitor> = Box::<SemaVisitor>::new(SemaVisitor::build(ctx));
-        const v: SemaVisitor* = _box_v.into_raw();
+        const v: mut SemaVisitor* = _box_v.into_raw();
         v.wire();
         v.visit_program(root);
 

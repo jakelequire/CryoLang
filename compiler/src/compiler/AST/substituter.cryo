@@ -53,8 +53,8 @@ import compiler::ast::walk::{ Walk };
 
 type struct ASTTypeSubstituter {
     subst:             TypeSubstitution*;
-    arena:             TypeArena*;
-    intern_table:      InternTable*;
+    arena:             mut TypeArena*;
+    intern_table:      mut InternTable*;
     /// The declaration being specialized, or an invalid id when the caller
     /// specializes none of its own (a method signature re-substituted under
     /// its owner's arguments, a trait default's bodies).  A written name
@@ -81,11 +81,11 @@ type struct ASTTypeSubstituter {
     /// the implementation binds; null where a copy's types are not written.
     types:             TypeResolver*;
 
-    static create(subst: TypeSubstitution*, arena: TypeArena*,
-                  intern_table: InternTable*,
+    static create(subst: TypeSubstitution*, arena: mut TypeArena*,
+                  intern_table: mut InternTable*,
                   template: DefId, spec_name: SymbolStr,
                   param_syms: [SymbolID],
-                  spec_typeref: TypeRef) -> ASTTypeSubstituter* {
+                  spec_typeref: TypeRef) -> mut ASTTypeSubstituter* {
         return new ASTTypeSubstituter {
             subst:        subst,
             arena:        arena,
@@ -131,7 +131,7 @@ type struct ASTTypeSubstituter {
     /// could only be selected wrongly.  A method call's declaration belongs
     /// to its receiver, which the substitution may change; the copy binds it
     /// again from the definition the call records.
-    drop_stale_callee_pin(&this, node: CallExpr*) -> void {
+    drop_stale_callee_pin(&this, node: mut CallExpr*) -> void {
         const callee: ExpressionNode* = node.callee;
         if (node.resolved_callee.decl_entry().is_valid() && callee != null
                 && (ExpressionNode::identifier_of(callee) != null
@@ -143,7 +143,7 @@ type struct ASTTypeSubstituter {
 
     /// Write a copied expression's type: the type its template's expression
     /// had, which the clone carries, as this copy sees it (`in_copy`).
-    substitute_type(&this, node: ExpressionNode*) -> void {
+    substitute_type(&this, node: mut ExpressionNode*) -> void {
         if (this.subst == null || !node.resolved_type.is_valid()) { return; }
         node.set_resolved_type(this.in_copy(node.resolved_type));
     }
@@ -174,7 +174,7 @@ type struct ASTTypeSubstituter {
     /// and no pass over the copy would pin it again.  A path whose scope
     /// segment the substitution rewrote (`T::make`, the template's own type)
     /// may name another owner's member in the copy.
-    drop_stale_callee_pin(&this, node: ScopeResolutionExpr*, retargeted: boolean) -> void {
+    drop_stale_callee_pin(&this, node: mut ScopeResolutionExpr*, retargeted: boolean) -> void {
         if (!retargeted && node.resolved_callee.decl_entry().is_valid()) { return; }
         node.set_resolved_callee(CalleePin::None);
     }
@@ -255,7 +255,7 @@ type struct ASTTypeSubstituter {
 
     /// Substitute type parameters in a type annotation.
     /// Returns a new annotation if changes were made, or the original if not.
-    substitute_annotation(&this, ann: TypeAnnotation*) -> TypeAnnotation* {
+    substitute_annotation(&this, ann: mut TypeAnnotation*) -> mut TypeAnnotation* {
         if (ann == null) { return null; }
 
         match (*ann) {
@@ -335,7 +335,7 @@ type struct ASTTypeSubstituter {
 
     // Annotation substitution helpers
 
-    substitute_named_annotation(&this, ann: TypeAnnotation*, named: NamedAnnotation*) -> TypeAnnotation* {
+    substitute_named_annotation(&this, ann: mut TypeAnnotation*, named: mut NamedAnnotation*) -> mut TypeAnnotation* {
         // Associated-type projection on a generic param written as a FLAT
         // qualified name (`I::Item` - only `This::Item` is a Projection node).
         // The stamp says which parameter the path is rooted at; when it is one
@@ -358,9 +358,9 @@ type struct ASTTypeSubstituter {
                     pre_resolved: base_pre,
                     res: ResSlot::Pending,
                 };
-                const base_ann: TypeAnnotation* =
+                const base_ann: mut TypeAnnotation* =
                     new TypeAnnotation::Named(base_named);
-                const proj: ProjectionAnnotation* = new ProjectionAnnotation {
+                const proj: mut ProjectionAnnotation* = new ProjectionAnnotation {
                     base:         base_ann,
                     member:       member_sym,
                     rooted_at:    named.relative_param_sym(),
@@ -436,7 +436,7 @@ type struct ASTTypeSubstituter {
         return ann;
     }
 
-    substitute_function_annotation(&this, ann: TypeAnnotation*, func: FunctionAnnotation*) -> TypeAnnotation* {
+    substitute_function_annotation(&this, ann: mut TypeAnnotation*, func: FunctionAnnotation*) -> mut TypeAnnotation* {
         // In-place: recurse into params and return type (cloned AST)
         for (mut i: i64 = 0; i < func.parameters.length(); i++) {
             this.substitute_annotation(func.parameters[i]);
@@ -445,7 +445,7 @@ type struct ASTTypeSubstituter {
         return ann;
     }
 
-    substitute_tuple_annotation(&this, ann: TypeAnnotation*, tup: TupleAnnotation*) -> TypeAnnotation* {
+    substitute_tuple_annotation(&this, ann: mut TypeAnnotation*, tup: TupleAnnotation*) -> mut TypeAnnotation* {
         // In-place: recurse into elements (cloned AST)
         for (mut i: i64 = 0; i < tup.elements.length(); i++) {
             this.substitute_annotation(tup.elements[i]);
@@ -453,7 +453,7 @@ type struct ASTTypeSubstituter {
         return ann;
     }
 
-    substitute_generic_annotation(&this, ann: TypeAnnotation*, gen: GenericAnnotation*) -> TypeAnnotation* {
+    substitute_generic_annotation(&this, ann: mut TypeAnnotation*, gen: GenericAnnotation*) -> mut TypeAnnotation* {
         // A Generic is a self-reference to the outer type ONLY when its
         // base names the template AND its args (BEFORE substitution)
         // are exactly the outer type's generic param names in declaration
@@ -496,7 +496,7 @@ type struct ASTTypeSubstituter {
     /// self-reference; the trailing defaulted positions still resolve
     /// to whatever the current spec used. Empty `args` is also a self-
     /// reference (a bare unparameterized name).
-    args_are_outer_param_refs(&this, args: &[TypeAnnotation*]) -> boolean {
+    args_are_outer_param_refs(&this, args: &[mut TypeAnnotation*]) -> boolean {
         if (args.length() > this.param_syms.length()) { return false; }
         for (mut i: i64 = 0; i < args.length(); i++) {
             const a: TypeAnnotation* = args[i];
@@ -531,8 +531,8 @@ type struct ASTTypeSubstituter {
     /// Substitute type parameters in generic arg annotations.
     /// Delegates to substitute_annotation() for each element, preserving
     /// the full structure (pointers, arrays, nested generics, etc.).
-    substitute_generic_type_args(&this, args: &[TypeAnnotation*]) -> [TypeAnnotation*] {
-        mut result: [TypeAnnotation*] = [];
+    substitute_generic_type_args(&this, args: &[mut TypeAnnotation*]) -> [mut TypeAnnotation*] {
+        mut result: [mut TypeAnnotation*] = [];
         for (mut i: i64 = 0; i < args.length(); i++) {
             result.push(this.substitute_annotation(args[i]));
         }
@@ -550,7 +550,7 @@ type struct ASTTypeSubstituter {
     }
 
     /// Rewrite a TypeAnnotation* in-place from Named to Primitive variant.
-    static rewrite_to_primitive(ann: TypeAnnotation*, name: SymbolStr, span: SourceSpan) -> void {
+    static rewrite_to_primitive(ann: mut TypeAnnotation*, name: SymbolStr, span: SourceSpan) -> void {
         const prim: PrimitiveAnnotation* = new PrimitiveAnnotation { name: name, span: span };
         *ann = TypeAnnotation::Primitive(prim);
     }
@@ -564,7 +564,7 @@ type struct ASTTypeSubstituter {
     /// resolves to nothing.  `is_const` is the argument's own: a `const T*`
     /// argument written through the parameter stays the same type, not a
     /// second, writable one.
-    static rewrite_to_pointer(ann: TypeAnnotation*, inner_name: SymbolStr,
+    static rewrite_to_pointer(ann: mut TypeAnnotation*, inner_name: SymbolStr,
                                 inner_pre_resolved: TypeRef, is_const: boolean, span: SourceSpan) -> void {
         const inner_named: NamedAnnotation* = new NamedAnnotation {
             name: inner_name,
@@ -572,7 +572,7 @@ type struct ASTTypeSubstituter {
             pre_resolved: inner_pre_resolved,
             res: ResSlot::Pending,
         };
-        const inner_ann: TypeAnnotation* = new TypeAnnotation::Named(inner_named);
+        const inner_ann: mut TypeAnnotation* = new TypeAnnotation::Named(inner_named);
         const ptr: PointerAnnotation* = new PointerAnnotation { inner: inner_ann, is_const: is_const, span: span };
         *ann = TypeAnnotation::Pointer(ptr);
     }
@@ -580,8 +580,8 @@ type struct ASTTypeSubstituter {
     /// Rewrite a TypeAnnotation* in-place to the empty-tuple (unit) annotation.
     /// Used when a generic param is substituted with `()`, which is not a Named
     /// type and cannot survive as Named("()") through the resolver.
-    static rewrite_to_unit(ann: TypeAnnotation*, span: SourceSpan) -> void {
-        mut empty_elems: [TypeAnnotation*] = [];
+    static rewrite_to_unit(ann: mut TypeAnnotation*, span: SourceSpan) -> void {
+        mut empty_elems: [mut TypeAnnotation*] = [];
         const tup: TupleAnnotation* = new TupleAnnotation { elements: empty_elems, span: span };
         *ann = TypeAnnotation::Tuple(tup);
     }
@@ -593,7 +593,7 @@ type struct ASTTypeSubstituter {
 implement trait Walk for struct ASTTypeSubstituter {
     // Declarations: substitute annotations
 
-    walk_struct(mut &this, d: DeclarationNode*, node: StructDecl*) -> void {
+    walk_struct(mut &this, d: DeclarationNode*, node: mut StructDecl*) -> void {
         // Rename + generic_params clearing happen at clone time via
         // ASTCloner::for_specialization; this walk only rewrites annotations.
         for (mut i: i64 = 0; i < node.fields.length(); i++) {
@@ -604,7 +604,7 @@ implement trait Walk for struct ASTTypeSubstituter {
         }
     }
 
-    walk_union(mut &this, d: DeclarationNode*, node: UnionDecl*) -> void {
+    walk_union(mut &this, d: DeclarationNode*, node: mut UnionDecl*) -> void {
         // Mirror StructDecl: walk field/method annotations for substitution.
         for (mut i: i64 = 0; i < node.fields.length(); i++) {
             this.walk_field(node.fields[i], DeclarationNode::field_of(node.fields[i]));
@@ -623,7 +623,7 @@ implement trait Walk for struct ASTTypeSubstituter {
         }
     }
 
-    walk_function(mut &this, node_decl: DeclarationNode*, node: FunctionDecl*) -> void {
+    walk_function(mut &this, node_decl: DeclarationNode*, node: mut FunctionDecl*) -> void {
         // Substitute parameter type annotations
         for (mut i: i64 = 0; i < node.parameters.length(); i++) {
             this.walk_var(node.parameters[i], DeclarationNode::var_of(node.parameters[i]));
@@ -649,7 +649,7 @@ implement trait Walk for struct ASTTypeSubstituter {
         }
     }
 
-    walk_destructure(mut &this, d: DeclarationNode*, node: DestructureDecl*) -> void {
+    walk_destructure(mut &this, d: DeclarationNode*, node: mut DestructureDecl*) -> void {
         // The decided types - the destructured value's and each binding's -
         // as this copy sees them.
         if (this.subst != null) {
@@ -666,7 +666,7 @@ implement trait Walk for struct ASTTypeSubstituter {
         DestructureDecl::walk_children(node, this);
     }
 
-    walk_impl(mut &this, d: DeclarationNode*, node: ImplBlock*) -> void {
+    walk_impl(mut &this, d: DeclarationNode*, node: mut ImplBlock*) -> void {
         if (node.trait_annotation != null) {
             this.substitute_annotation(node.trait_annotation);
         }
@@ -680,18 +680,18 @@ implement trait Walk for struct ASTTypeSubstituter {
         ImplBlock::walk_children(node, this);
     }
 
-    walk_type_alias(mut &this, d: DeclarationNode*, node: TypeAliasDecl*) -> void {
+    walk_type_alias(mut &this, d: DeclarationNode*, node: mut TypeAliasDecl*) -> void {
         if (node.target_annotation != null) {
             node.target_annotation = this.substitute_annotation(node.target_annotation);
         }
     }
 
-    walk_trait(mut &this, d: DeclarationNode*, node: TraitDecl*) -> void {
+    walk_trait(mut &this, d: DeclarationNode*, node: mut TraitDecl*) -> void {
         node.generic_params = [];
         TraitDecl::walk_children(node, this);
     }
 
-    walk_cast(mut &this, e: ExpressionNode*, node: CastExpr*) -> void {
+    walk_cast(mut &this, e: mut ExpressionNode*, node: mut CastExpr*) -> void {
         this.substitute_type(e);
         CastExpr::walk_children(node, this);
         if (node.target_annotation != null) {
@@ -705,7 +705,7 @@ implement trait Walk for struct ASTTypeSubstituter {
 
     // Expression visitors: rewrite generic_args
 
-    walk_call(mut &this, e: ExpressionNode*, node: CallExpr*) -> void {
+    walk_call(mut &this, e: mut ExpressionNode*, node: mut CallExpr*) -> void {
         this.substitute_type(e);
         CallExpr::walk_children(node, this);
         if (node.generic_args.length() > 0) {
@@ -756,14 +756,14 @@ implement trait Walk for struct ASTTypeSubstituter {
     /// types (`thread_trampoline<C,T>` -> `thread_trampoline<String,String>`)
     /// so the monomorphizer's discovery walk can resolve them and pin the
     /// specialized callee. Ordinary identifiers (no turbofish) are untouched.
-    walk_identifier(mut &this, e: ExpressionNode*, node: IdentifierExpr*) -> void {
+    walk_identifier(mut &this, e: mut ExpressionNode*, node: mut IdentifierExpr*) -> void {
         this.substitute_type(e);
         if (node.generic_args.length() > 0) {
             node.generic_args = this.substitute_generic_type_args(node.generic_args);
         }
     }
 
-    walk_new(mut &this, e: ExpressionNode*, node: NewExpr*) -> void {
+    walk_new(mut &this, e: mut ExpressionNode*, node: mut NewExpr*) -> void {
         this.substitute_type(e);
         const is_self: boolean = this.names_template(node.res)
             && (node.generic_args.length() == 0
@@ -794,7 +794,7 @@ implement trait Walk for struct ASTTypeSubstituter {
         node.carry_resolved_member();
     }
 
-    walk_struct_literal(mut &this, e: ExpressionNode*, node: StructExpr*) -> void {
+    walk_struct_literal(mut &this, e: mut ExpressionNode*, node: mut StructExpr*) -> void {
         this.substitute_type(e);
         // A self-reference denotes the enclosing specialization, and it is
         // recorded as the arena id that specialization already has - not by
@@ -829,7 +829,7 @@ implement trait Walk for struct ASTTypeSubstituter {
         }
     }
 
-    walk_scope_resolution(mut &this, e: ExpressionNode*, node: ScopeResolutionExpr*) -> void {
+    walk_scope_resolution(mut &this, e: mut ExpressionNode*, node: mut ScopeResolutionExpr*) -> void {
         this.substitute_type(e);
         // ScopeResolution carries TWO arg lists:
         //   * scope_generic_args: args on the scope (`Pair<T>::method`)
@@ -898,7 +898,7 @@ implement trait Walk for struct ASTTypeSubstituter {
         }
     }
 
-    walk_sizeof(mut &this, e: ExpressionNode*, node: SizeofExpr*) -> void {
+    walk_sizeof(mut &this, e: mut ExpressionNode*, node: mut SizeofExpr*) -> void {
         this.substitute_type(e);
         // Substitute generic params inside the operand annotation
         // (e.g., `HashMapEntry<K, V>` -> `HashMapEntry<S, j>`).
@@ -908,7 +908,7 @@ implement trait Walk for struct ASTTypeSubstituter {
         }
     }
 
-    walk_alignof(mut &this, e: ExpressionNode*, node: AlignofExpr*) -> void {
+    walk_alignof(mut &this, e: mut ExpressionNode*, node: mut AlignofExpr*) -> void {
         this.substitute_type(e);
         if (node.type_ann != null) {
             this.substitute_annotation(node.type_ann);
@@ -916,17 +916,17 @@ implement trait Walk for struct ASTTypeSubstituter {
         }
     }
 
-    walk_typeof(mut &this, e: ExpressionNode*, node: TypeofExpr*) -> void {
+    walk_typeof(mut &this, e: mut ExpressionNode*, node: TypeofExpr*) -> void {
         this.substitute_type(e);
         TypeofExpr::walk_children(node, this);
     }
 
-    walk_delete(mut &this, e: ExpressionNode*, node: DeleteExpr*) -> void {
+    walk_delete(mut &this, e: mut ExpressionNode*, node: DeleteExpr*) -> void {
         this.substitute_type(e);
         DeleteExpr::walk_children(node, this);
     }
 
-    walk_object_conversion(mut &this, e: ExpressionNode*, node: ObjectConversionExpr*) -> void {
+    walk_object_conversion(mut &this, e: mut ExpressionNode*, node: mut ObjectConversionExpr*) -> void {
         this.substitute_type(e);
         // A conversion the type check left to each copy names its value's
         // type as the template wrote it; the copy names its own, for
@@ -935,17 +935,17 @@ implement trait Walk for struct ASTTypeSubstituter {
         ObjectConversionExpr::walk_children(node, this);
     }
 
-    walk_await(mut &this, e: ExpressionNode*, node: AwaitExpr*) -> void {
+    walk_await(mut &this, e: mut ExpressionNode*, node: AwaitExpr*) -> void {
         this.substitute_type(e);
         AwaitExpr::walk_children(node, this);
     }
 
-    walk_yield(mut &this, e: ExpressionNode*, node: YieldExpr*) -> void {
+    walk_yield(mut &this, e: mut ExpressionNode*, node: YieldExpr*) -> void {
         this.substitute_type(e);
         YieldExpr::walk_children(node, this);
     }
 
-    walk_try(mut &this, e: ExpressionNode*, node: TryExpr*) -> void {
+    walk_try(mut &this, e: mut ExpressionNode*, node: TryExpr*) -> void {
         this.substitute_type(e);
         // Monomorphization runs before sema lowers `?`, so only `operand`
         // is populated here; recurse into `desugared` too if a post-sema
@@ -964,7 +964,7 @@ implement trait Walk for struct ASTTypeSubstituter {
         }
     }
 
-    walk_static_match_stmt(mut &this, s: Stmt*, node: StaticMatchStmt*) -> void {
+    walk_static_match_stmt(mut &this, s: Stmt*, node: mut StaticMatchStmt*) -> void {
         node.scrutinee = this.substitute_annotation(node.scrutinee);
         for (mut i: i64 = 0; i < node.arms.length(); i++) {
             this.walk_static_match_arm(node.arms[i]);
@@ -974,7 +974,7 @@ implement trait Walk for struct ASTTypeSubstituter {
     /// Walk a static-match arm: rewrite the type pattern (T -> concrete) and
     /// the body. Dead arms are substituted harmlessly here; the monomorphizer
     /// prunes them before any type-checking sees them.
-    walk_static_match_arm(mut &this, arm: StaticMatchArmNode*) -> void {
+    walk_static_match_arm(mut &this, arm: mut StaticMatchArmNode*) -> void {
         for (mut i: i64 = 0; i < arm.type_patterns.length(); i++) {
             arm.type_patterns[i] = this.substitute_annotation(arm.type_patterns[i]);
         }
@@ -985,7 +985,7 @@ implement trait Walk for struct ASTTypeSubstituter {
     /// walked.
     walk_match_arm(mut &this, arm: MatchArmNode*) -> void {
         for (mut j: i64 = 0; j < arm.patterns.length(); j++) {
-            const pat: Pattern* = arm.patterns[j];
+            const pat: mut Pattern* = arm.patterns[j];
             match (pat.kind) {
                 PatternKind::Enum(n) => { this.walk_enum_pattern(pat, n); }
                 // Other pattern kinds have no type annotations to substitute
@@ -997,7 +997,7 @@ implement trait Walk for struct ASTTypeSubstituter {
 
     // Expressions: the decided type, then the children
 
-    walk_binary(mut &this, e: ExpressionNode*, node: BinaryExpr*) -> void {
+    walk_binary(mut &this, e: mut ExpressionNode*, node: BinaryExpr*) -> void {
         this.substitute_type(e);
         BinaryExpr::walk_children(node, this);
         // Rewrite the operator-overload call's stashed type-args (T -> concrete)
@@ -1005,23 +1005,23 @@ implement trait Walk for struct ASTTypeSubstituter {
         this.walk_expr(node.desugared_call);
     }
 
-    walk_unary(mut &this, e: ExpressionNode*, node: UnaryExpr*) -> void {
+    walk_unary(mut &this, e: mut ExpressionNode*, node: UnaryExpr*) -> void {
         this.substitute_type(e);
         UnaryExpr::walk_children(node, this);
         this.walk_expr(node.desugared_call);
     }
 
-    walk_ternary(mut &this, e: ExpressionNode*, node: TernaryExpr*) -> void {
+    walk_ternary(mut &this, e: mut ExpressionNode*, node: TernaryExpr*) -> void {
         this.substitute_type(e);
         TernaryExpr::walk_children(node, this);
     }
 
-    walk_if_expr(mut &this, e: ExpressionNode*, node: IfExpr*) -> void {
+    walk_if_expr(mut &this, e: mut ExpressionNode*, node: IfExpr*) -> void {
         this.substitute_type(e);
         IfExpr::walk_children(node, this);
     }
 
-    walk_match_expr(mut &this, e: ExpressionNode*, node: MatchExpr*) -> void {
+    walk_match_expr(mut &this, e: mut ExpressionNode*, node: MatchExpr*) -> void {
         this.substitute_type(e);
         this.walk_expr(node.subject);
         for (mut i: i64 = 0; i < node.arms.length(); i++) {
@@ -1029,7 +1029,7 @@ implement trait Walk for struct ASTTypeSubstituter {
         }
     }
 
-    walk_static_match_expr(mut &this, e: ExpressionNode*, node: StaticMatchExpr*) -> void {
+    walk_static_match_expr(mut &this, e: mut ExpressionNode*, node: mut StaticMatchExpr*) -> void {
         this.substitute_type(e);
         node.scrutinee = this.substitute_annotation(node.scrutinee);
         for (mut i: i64 = 0; i < node.arms.length(); i++) {
@@ -1037,17 +1037,17 @@ implement trait Walk for struct ASTTypeSubstituter {
         }
     }
 
-    walk_array_literal(mut &this, e: ExpressionNode*, node: ArrayExpr*) -> void {
+    walk_array_literal(mut &this, e: mut ExpressionNode*, node: ArrayExpr*) -> void {
         this.substitute_type(e);
         ArrayExpr::walk_children(node, this);
     }
 
-    walk_tuple_literal(mut &this, e: ExpressionNode*, node: TupleExpr*) -> void {
+    walk_tuple_literal(mut &this, e: mut ExpressionNode*, node: TupleExpr*) -> void {
         this.substitute_type(e);
         TupleExpr::walk_children(node, this);
     }
 
-    walk_lambda(mut &this, e: ExpressionNode*, node: LambdaExpr*) -> void {
+    walk_lambda(mut &this, e: mut ExpressionNode*, node: LambdaExpr*) -> void {
         this.substitute_type(e);
         for (mut i: i64 = 0; i < node.parameters.length(); i++) {
             this.walk_var(node.parameters[i], DeclarationNode::var_of(node.parameters[i]));
@@ -1055,7 +1055,7 @@ implement trait Walk for struct ASTTypeSubstituter {
         this.walk_stmt(node.body);
     }
 
-    walk_array_access(mut &this, e: ExpressionNode*, node: ArrayAccessExpr*) -> void {
+    walk_array_access(mut &this, e: mut ExpressionNode*, node: ArrayAccessExpr*) -> void {
         this.substitute_type(e);
         ArrayAccessExpr::walk_children(node, this);
         // Rewrite the index-overload call's stashed type-args (T -> concrete)
@@ -1064,7 +1064,7 @@ implement trait Walk for struct ASTTypeSubstituter {
         this.walk_expr(node.desugared_call);
     }
 
-    walk_member_access(mut &this, e: ExpressionNode*, node: MemberAccessExpr*) -> void {
+    walk_member_access(mut &this, e: mut ExpressionNode*, node: mut MemberAccessExpr*) -> void {
         this.substitute_type(e);
         MemberAccessExpr::walk_children(node, this);
         if (node.generic_args.length() > 0) {
@@ -1075,7 +1075,7 @@ implement trait Walk for struct ASTTypeSubstituter {
         node.carry_resolved_member();
     }
 
-    walk_enum_pattern(mut &this, p: Pattern*, node: EnumPattern*) -> void {
+    walk_enum_pattern(mut &this, p: mut Pattern*, node: mut EnumPattern*) -> void {
         if (this.names_template(node.res)) {
             node.enum_name = this.spec_name;
         }
@@ -1100,7 +1100,7 @@ implement trait Walk for struct ASTTypeSubstituter {
         }
     }
 
-    walk_var(mut &this, d: DeclarationNode*, node: VarDecl*) -> void {
+    walk_var(mut &this, d: DeclarationNode*, node: mut VarDecl*) -> void {
         if (this.subst != null && node.resolved_type.is_valid()) {
             node.resolved_type = this.in_copy(node.resolved_type);
         }
@@ -1110,7 +1110,7 @@ implement trait Walk for struct ASTTypeSubstituter {
         VarDecl::walk_children(node, this);
     }
 
-    walk_field(mut &this, d: DeclarationNode*, node: FieldDecl*) -> void {
+    walk_field(mut &this, d: DeclarationNode*, node: mut FieldDecl*) -> void {
         if (node.type_annotation != null) {
             node.type_annotation = this.substitute_annotation(node.type_annotation);
         }

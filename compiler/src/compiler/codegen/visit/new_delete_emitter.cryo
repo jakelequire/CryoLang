@@ -58,10 +58,10 @@ import compiler::codegen::visit::enum_variant_emitter::{ EnumVariantEmitter };
 
 
 type struct NewDeleteEmitter {
-    cg:           CodegenContext*;
+    cg:           mut CodegenContext*;
     state:        VisitorState*;
-    dispatch:     ExprDispatch*;
-    enum_variant: EnumVariantEmitter*;
+    dispatch:     mut ExprDispatch*;
+    enum_variant: mut EnumVariantEmitter*;
 
     static null() -> NewDeleteEmitter {
         return NewDeleteEmitter {
@@ -85,7 +85,7 @@ type struct NewDeleteEmitter {
     /// The implementation of the language's `Allocate` that `new` of `ty`
     /// takes its storage from and `delete` returns it to: the struct's own;
     /// null when there is none, and the global allocator serves it.
-    allocator_of(mut &this, ty: TypeRef) -> ImplBlock* {
+    allocator_of(mut &this, ty: TypeRef) -> mut ImplBlock* {
         const registry: GenericRegistry* = this.cg.ctx.generic_registry;
         const trait_id: DefId = registry.wellknown(LangItem::Allocate);
         if (!trait_id.is_valid()) { return null; }
@@ -98,7 +98,7 @@ type struct NewDeleteEmitter {
     /// to: the one it writes, or the copy of the trait's default.  Null,
     /// reported, when the implementation has no function code generation
     /// can call.
-    allocator_method(mut &this, block: ImplBlock*, item: LangItem, span: SourceSpan) -> LValue {
+    allocator_method(mut &this, block: mut ImplBlock*, item: LangItem, span: SourceSpan) -> LValue {
         const registry: GenericRegistry* = this.cg.ctx.generic_registry;
         const m: MethodDecl* = DeclarationNode::method_of(registry.trait_item_method(
             block, registry.trait_item_position(registry.wellknown(item))));
@@ -115,7 +115,7 @@ type struct NewDeleteEmitter {
 
     // new T { fields } / new E::V(args)
 
-    emit_new(mut &this, visitor: IRGeneratorVisitor*, e: ExpressionNode*, node: NewExpr*) -> Emitted {
+    emit_new(mut &this, visitor: mut IRGeneratorVisitor*, e: ExpressionNode*, node: NewExpr*) -> Emitted {
         mut out: Emitted = Emitted::none();
         // Array allocation `new T[n]` is handled up front: it allocates raw
         // memory and the element may be a primitive (`new int[100]`) whose
@@ -194,7 +194,7 @@ type struct NewDeleteEmitter {
         // else shares the canonical GlobalAlloc via the shared funnel. The
         // bitcast and struct init below are the same whichever allocator
         // supplied the storage.
-        const alloc_block: ImplBlock* = this.allocator_of(type_ref);
+        const alloc_block: mut ImplBlock* = this.allocator_of(type_ref);
         mut alloc_fn: LValue = LValue::null();
         if (alloc_block != null) {
             alloc_fn = this.allocator_method(alloc_block, LangItem::AllocateAllocate, e.span);
@@ -245,8 +245,8 @@ type struct NewDeleteEmitter {
                         // upper 4 bytes of the i64 slot uninitialised, and a
                         // `size < 0` check then sees a huge positive number.
                         // Mirrors codegen_struct_literal and codegen_local_var.
-                        const field_llvm_ty: void* = llvm::LLVMStructGetTypeAtIndex(mapped.raw, sf_fidx as u32);
-                        const val_ty_raw: void* = llvm::LLVMTypeOf(val.raw);
+                        const field_llvm_ty: mut void* = llvm::LLVMStructGetTypeAtIndex(mapped.raw, sf_fidx as u32);
+                        const val_ty_raw: mut void* = llvm::LLVMTypeOf(val.raw);
                         if (field_llvm_ty != null && val_ty_raw != null
                                 && LType::kind_of(field_llvm_ty) == LTypeKind::Integer
                                 && LType::kind_of(val_ty_raw) == LTypeKind::Integer) {
@@ -290,7 +290,7 @@ type struct NewDeleteEmitter {
     /// The element type is read from the sema-resolved `T*` result type so
     /// primitive elements (whose name is a keyword, not a decl-index entry)
     /// resolve the same way user types do.
-    emit_new_array(mut &this, visitor: IRGeneratorVisitor*, e: ExpressionNode*, node: NewExpr*) -> Emitted {
+    emit_new_array(mut &this, visitor: mut IRGeneratorVisitor*, e: ExpressionNode*, node: NewExpr*) -> Emitted {
         mut out: Emitted = Emitted::none();
         const result_t: Type* = this.cg.arena_type(e.resolved_type);
         if (result_t == null || result_t.kind != TypeKind::Pointer) {
@@ -340,7 +340,7 @@ type struct NewDeleteEmitter {
 
         // An element type with an `Allocate` takes the block from it, as
         // `new` of one does.  Array allocations use a fixed 16 alignment.
-        const alloc_block: ImplBlock* = this.allocator_of(elem_ref);
+        const alloc_block: mut ImplBlock* = this.allocator_of(elem_ref);
         mut alloc_fn: LValue = LValue::null();
         if (alloc_block != null) {
             alloc_fn = this.allocator_method(alloc_block, LangItem::AllocateAllocate, e.span);
@@ -372,7 +372,7 @@ type struct NewDeleteEmitter {
     /// element counts are non-negative, so a narrower value is zero-extended;
     /// an i64 passes through; a wider value is truncated (defensive).
     widen_to_i64(mut &this, v: LValue) -> LValue {
-        const raw_ty: void* = llvm::LLVMTypeOf(v.raw);
+        const raw_ty: mut void* = llvm::LLVMTypeOf(v.raw);
         if (LType::kind_of(raw_ty) != LTypeKind::Integer) { return v; }
         const bits: u32 = llvm::LLVMGetIntTypeWidth(raw_ty);
         if (bits == 64) { return v; }
@@ -382,7 +382,7 @@ type struct NewDeleteEmitter {
 
     // delete ptr
 
-    emit_delete(mut &this, visitor: IRGeneratorVisitor*, e: ExpressionNode*, node: DeleteExpr*) -> Emitted {
+    emit_delete(mut &this, visitor: mut IRGeneratorVisitor*, e: ExpressionNode*, node: DeleteExpr*) -> Emitted {
         mut out: Emitted = Emitted::none();
         const span: SourceSpan = e.span;
         // `delete ptr` is the manual-memory dual of an end-of-scope drop:
@@ -400,7 +400,7 @@ type struct NewDeleteEmitter {
         // identical pointer.
         const operand_type: TypeRef = node.operand.resolved_type;
         const arena_ptr: TypeArena* = this.cg.get_arena();
-        const intern_ptr: InternTable* = this.cg.get_intern();
+        const intern_ptr: mut InternTable* = this.cg.get_intern();
         const registry_ptr: GenericRegistry* = this.cg.ctx.generic_registry;
 
         mut pointee: TypeRef = TypeRef::invalid();
@@ -417,7 +417,7 @@ type struct NewDeleteEmitter {
         // does not own it.
         mut release_fn: LValue = LValue::null();
         if (pointee.is_valid()) {
-            const alloc_block: ImplBlock* = this.allocator_of(pointee);
+            const alloc_block: mut ImplBlock* = this.allocator_of(pointee);
             if (alloc_block != null) {
                 release_fn = this.allocator_method(alloc_block, LangItem::AllocateRelease, span);
                 if (!release_fn.is_valid()) {
@@ -467,18 +467,18 @@ type struct NewDeleteEmitter {
             this.cg.values.bind_transient(recv_bind, slot);
 
             const drop_sym: SymbolStr = intern_ptr.intern("drop");
-            const recv: ExpressionNode* = ExpressionNode::identifier_expr(recv_sym, span);
+            const recv: mut ExpressionNode* = ExpressionNode::identifier_expr(recv_sym, span);
             ExpressionNode::identifier_of(recv).set_res(Res::Local(recv_bind));
             recv.set_resolved_type(node.operand.resolved_type);
             const deref_tok: Token = Token::new(TokenType::Star, "*",
                 span.start_line as int, span.start_col as int);
-            mut target: ExpressionNode* = ExpressionNode::synthetic_unary(
+            mut target: mut ExpressionNode* = ExpressionNode::synthetic_unary(
                 deref_tok, recv, span);
             target.set_resolved_type(pointee);
-            mut member: ExpressionNode* = ExpressionNode::member_access_expr(
+            mut member: mut ExpressionNode* = ExpressionNode::member_access_expr(
                 target, drop_sym, span, span);
             member.set_resolved_type(TypeRef::invalid());
-            mut call: ExpressionNode* = ExpressionNode::call_expr(
+            mut call: mut ExpressionNode* = ExpressionNode::call_expr(
                 member, span);
             this.cg.bind_destructor_call(call);
             mut stmt: Stmt* = Stmt::expr_stmt(

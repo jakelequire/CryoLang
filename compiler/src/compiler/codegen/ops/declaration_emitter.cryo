@@ -79,8 +79,8 @@ import compiler::codegen::state::function_registry::{ FunctionRegistry };
 
 /// A module's DWARF builder and file, both null unless `-g`.
 type struct DebugInfoState {
-    builder: void*;
-    file:    void*;
+    builder: mut void*;
+    file:    mut void*;
 
     static off() -> DebugInfoState {
         return DebugInfoState { builder: null, file: null };
@@ -103,19 +103,19 @@ type struct StartedGlobals {
 type struct DeclarationEmitter {
     llvm_module: LModule*;
     builder:     LBuilder*;
-    type_mapper: TypeMapper*;
-    abi:         AbiClassifier*;
-    values:      ValueTable*;
-    functions:   FunctionRegistry*;
-    globals:     GlobalRegistry*;
-    str_cache:   StringCache*;
-    flow:        IRFlowEmitter*;
-    resolver:    SymbolResolver*;
-    expr_ops:    ExprOps*;
-    intrinsics:  IntrinsicEmitter*;
+    type_mapper: mut TypeMapper*;
+    abi:         mut AbiClassifier*;
+    values:      mut ValueTable*;
+    functions:   mut FunctionRegistry*;
+    globals:     mut GlobalRegistry*;
+    str_cache:   mut StringCache*;
+    flow:        mut IRFlowEmitter*;
+    resolver:    mut SymbolResolver*;
+    expr_ops:    mut ExprOps*;
+    intrinsics:  mut IntrinsicEmitter*;
     diag:        DiagSink*;
     debug_info:  DebugInfoState*;
-    ctx:         CompilationContext*;
+    ctx:         mut CompilationContext*;
     started:     StartedGlobals;
 
     /// While a `![caller_location]` function's body is emitted, the trailing
@@ -184,12 +184,12 @@ type struct DeclarationEmitter {
     // Small ctx-routed accessors (inlined so DeclarationEmitter doesn't
     // have to import the parent Context module).
 
-    get_intern(&this) -> InternTable* {
+    get_intern(&this) -> mut InternTable* {
         const c: CompilationContext* = this.ctx;
         return c.intern_table;
     }
 
-    get_arena(&this) -> TypeArena* {
+    get_arena(&this) -> mut TypeArena* {
         const c: CompilationContext* = this.ctx;
         return c.type_arena;
     }
@@ -205,7 +205,7 @@ type struct DeclarationEmitter {
     }
 
     intern_str(&this, text: string) -> SymbolStr {
-        const i: InternTable* = this.get_intern();
+        const i: mut InternTable* = this.get_intern();
         return i.intern(text);
     }
 
@@ -360,7 +360,7 @@ type struct DeclarationEmitter {
         if (node == null || is_program_main) { return; }
         if (!node.is_specialization || !fn_val.is_valid()) { return; }
         fn_val.set_linkage(LLinkage::WeakODR);
-        const comdat: void* = llvm::LLVMGetOrInsertComdat(
+        const comdat: mut void* = llvm::LLVMGetOrInsertComdat(
             this.llvm_module.raw, fn_name.as_string());
         if (comdat != null) { llvm::LLVMSetComdat(fn_val.raw, comdat); }
     }
@@ -383,7 +383,7 @@ type struct DeclarationEmitter {
         // unresolved on the Windows cross-link.
         if (node.is_weak) {
             fn_val.set_linkage(LLinkage::WeakAny);
-            const comdat: void* = llvm::LLVMGetOrInsertComdat(
+            const comdat: mut void* = llvm::LLVMGetOrInsertComdat(
                 this.llvm_module.raw, fn_name.as_string());
             if (comdat != null) { llvm::LLVMSetComdat(fn_val.raw, comdat); }
         }
@@ -493,8 +493,8 @@ type struct DeclarationEmitter {
             const ret_ty: LType = this.map_return_type(node_decl);
             if (!ret_ty.is_valid()) { return; }
             const argv_ty: LType = LType::pointer_to(LType::pointer_to(LType::i8()));
-            const buf: void* = libc::malloc(3 * 8);
-            const slots: void** = buf as void**;
+            const buf: mut void* = libc::malloc(3 * 8);
+            const slots: mut (mut void*)* = buf as mut (mut void*)*;
             slots[0] = LType::i32().raw;
             slots[1] = argv_ty.raw;
             slots[2] = argv_ty.raw;
@@ -641,14 +641,14 @@ type struct DeclarationEmitter {
         const word: LType = LType::pointer_to(LType::i8());
         const owner: TypeRef = this.ctx.decl_index.impl_owner(block, "codegen/trait-object table");
         const n: u32 = DeclarationEmitter::object_table_word(registry.object_table_method_count(block.trait_def)) as u32;
-        const buf: void* = libc::malloc(n as u64 * 8);
-        const words: void** = buf as void**;
+        const buf: mut void* = libc::malloc(n as u64 * 8);
+        const words: mut (mut void*)* = buf as mut (mut void*)*;
         words[0] = drop_word.raw;
         words[1] = llvm::LLVMConstIntToPtr(this.expr_ops.codegen_sizeof(owner).raw, word.raw);
         words[2] = llvm::LLVMConstIntToPtr(this.expr_ops.codegen_alignof(owner).raw, word.raw);
         for (mut k: i64 = 0; k < traits.length(); k++) {
             const decl: TraitDecl* = registry.get_trait_decl(traits[k]);
-            const implementation: ImplBlock* = block.object_table_blocks[k];
+            const implementation: mut ImplBlock* = block.object_table_blocks[k];
             for (mut slot: i64 = 0; slot < decl.methods.length(); slot++) {
                 mut f: LValue = LType::const_null(word);
                 if (registry.method_object_unavailable(decl.methods[slot]).length() == 0) {
@@ -677,7 +677,7 @@ type struct DeclarationEmitter {
         // and so is its table: one definition kept per link.
         if (block.template != null) {
             global.set_linkage(LLinkage::WeakODR);
-            const comdat: void* = llvm::LLVMGetOrInsertComdat(this.llvm_module.raw, shown);
+            const comdat: mut void* = llvm::LLVMGetOrInsertComdat(this.llvm_module.raw, shown);
             if (comdat != null) { llvm::LLVMSetComdat(global.raw, comdat); }
         } else {
             global.set_linkage(LLinkage::External);
@@ -785,8 +785,8 @@ type struct DeclarationEmitter {
             // anonymous LLVM literal struct so the signature reads
             // e.g. `{i64, i64}` - matches what `build_llvm_fn_type`
             // produces for free functions taking the same return.
-            const dp_buf: void* = libc::malloc(2 * 8);
-            const dp_slots: void** = dp_buf as void**;
+            const dp_buf: mut void* = libc::malloc(2 * 8);
+            const dp_slots: mut (mut void*)* = dp_buf as mut (mut void*)*;
             dp_slots[0] = ret_plan.llvm_slots[0].raw;
             dp_slots[1] = ret_plan.llvm_slots[1].raw;
             ret_ty = LType::literal_struct(dp_buf, 2, false);
@@ -912,8 +912,8 @@ type struct DeclarationEmitter {
 
         const total_params: u32 = total_user_slots + sret_inc;
 
-        const buf: void* = libc::malloc(total_params as u64 * 8);
-        const slots: void** = buf as void**;
+        const buf: mut void* = libc::malloc(total_params as u64 * 8);
+        const slots: mut (mut void*)* = buf as mut (mut void*)*;
 
         // Parallel array tracking the byval pointee for each LLVM
         // parameter slot.  `LType::null()` for slots that are NOT
@@ -1382,20 +1382,20 @@ type struct DeclarationEmitter {
         const pos: i64 = this.ctx.active_order_position;
         const priority: u64 = 101 + (if (pos < 0) { 0 } else { pos }) as u64;
         const ptr_ty: LType = LType::pointer_to(LType::i8());
-        const fields: void* = libc::malloc(3 * 8);
-        const field_tys: void** = fields as void**;
+        const fields: mut void* = libc::malloc(3 * 8);
+        const field_tys: mut (mut void*)* = fields as mut (mut void*)*;
         field_tys[0] = LType::i32().raw;
         field_tys[1] = ptr_ty.raw;
         field_tys[2] = ptr_ty.raw;
         const entry_ty: LType = LType::literal_struct(fields, 3, false);
-        const vals: void* = libc::malloc(3 * 8);
-        const entry_vals: void** = vals as void**;
+        const vals: mut void* = libc::malloc(3 * 8);
+        const entry_vals: mut (mut void*)* = vals as mut (mut void*)*;
         entry_vals[0] = LType::const_int(LType::i32(), priority, false).raw;
         entry_vals[1] = fn_val.raw;
         entry_vals[2] = LType::const_pointer_null(ptr_ty).raw;
         const entry: LValue = LType::const_struct(vals, 3, false);
-        const one: void* = libc::malloc(8);
-        const entries: void** = one as void**;
+        const one: mut void* = libc::malloc(8);
+        const entries: mut (mut void*)* = one as mut (mut void*)*;
         entries[0] = entry.raw;
         const ctors: LValue = this.llvm_module.add_global(LType::array_of(entry_ty, 1),
                                                           MangledName::new("llvm.global_ctors"));
@@ -1445,12 +1445,12 @@ type struct DeclarationEmitter {
     /// per-argument types and per-statement line granularity are follow-ups).
     emit_debug_subprogram(mut &this, fn_val: LValue, node_decl: DeclarationNode*) -> void {
         const node: FunctionDecl* = DeclarationNode::fn_of(node_decl);
-        const ctx_ptr: CompilationContext* = this.ctx;
+        const ctx_ptr: mut CompilationContext* = this.ctx;
         if (!this.debug_info.is_on()) { return; }
         if (!fn_val.is_valid()) { return; }
 
-        const dib:  void* = this.debug_info.builder;
-        const file: void* = this.debug_info.file;
+        const dib:  mut void* = this.debug_info.builder;
+        const file: mut void* = this.debug_info.file;
 
         mut line: u32 = node_decl.span.start_line;
         if (line == 0) { line = 1; }
@@ -1465,9 +1465,9 @@ type struct DeclarationEmitter {
         // only; release emits no debug info so the double emission was silently
         // tolerated). Reusing the existing subprogram keeps every instruction in
         // the function scoped to one SP.
-        mut sp: void* = llvm::LLVMGetSubprogram(fn_val.raw);
+        mut sp: mut void* = llvm::LLVMGetSubprogram(fn_val.raw);
         if (sp == null) {
-            const subroutine_ty: void* = llvm::LLVMDIBuilderCreateSubroutineType(
+            const subroutine_ty: mut void* = llvm::LLVMDIBuilderCreateSubroutineType(
                 dib, file, null, 0, 0);
 
             // DW_AT_name: the function's declaration key (e.g.
@@ -1509,7 +1509,7 @@ type struct DeclarationEmitter {
         // Debug metadata is context-scoped; build it in the same per-target
         // context as the module/builder (LContext::current()), not the global
         // one, or LLVM asserts on a context mismatch.
-        const loc: void* = llvm::LLVMDIBuilderCreateDebugLocation(
+        const loc: mut void* = llvm::LLVMDIBuilderCreateDebugLocation(
             LContext::current().raw, line, col, sp, null);
         llvm::LLVMSetCurrentDebugLocation2(this.builder.raw, loc);
     }
@@ -1660,8 +1660,8 @@ type struct DeclarationEmitter {
             this.builder.build_store(lo_arg, alloca);
             // GEP at byte offset 8 via an i8 base, mirroring the call-site
             // DirectPair expansion.
-            const idx_buf: void* = libc::malloc(8);
-            const idx_slots: void** = idx_buf as void**;
+            const idx_buf: mut void* = libc::malloc(8);
+            const idx_slots: mut (mut void*)* = idx_buf as mut (mut void*)*;
             idx_slots[0] = LType::const_int(LType::i64(), 8, false).raw;
             const hi_ptr: LValue = this.builder.build_gep(
                 LType::i8(), alloca, idx_buf, 1, "param.hi.ptr");
@@ -1776,10 +1776,10 @@ type struct DeclarationEmitter {
         // Forward every parameter (argc/argv/envp, or the user signature) to
         // __cryo_user_main.
         const nparams: u32 = llvm::LLVMCountParamTypes(fn_type.raw);
-        mut arg_buf: void* = null;
+        mut arg_buf: mut void* = null;
         if (nparams > 0) {
             arg_buf = libc::malloc(nparams as u64 * 8);
-            const arg_slots: void** = arg_buf as void**;
+            const arg_slots: mut (mut void*)* = arg_buf as mut (mut void*)*;
             for (mut i: u32 = 0; i < nparams; i++) {
                 arg_slots[i] = wrapper.get_param(i).raw;
             }
@@ -1869,14 +1869,14 @@ type struct DeclarationEmitter {
         const fn_val: LValue = this.builder.get_insert_block().get_parent();
         if (fn_val.is_valid()) {
             const entry_bb: void* = llvm::LLVMGetEntryBasicBlock(fn_val.raw);
-            mut bb: void* = llvm::LLVMGetFirstBasicBlock(fn_val.raw);
+            mut bb: mut void* = llvm::LLVMGetFirstBasicBlock(fn_val.raw);
             while (bb != null) {
                 const lbb: LBasicBlock = LBasicBlock { raw: bb };
                 if (!lbb.has_terminator()) {
                     const is_empty: boolean = llvm::LLVMGetFirstInstruction(bb) == null;
                     mut no_preds: boolean = false;
                     if (bb != entry_bb) {
-                        const bb_val: void* = llvm::LLVMBasicBlockAsValue(bb);
+                        const bb_val: mut void* = llvm::LLVMBasicBlockAsValue(bb);
                         no_preds = llvm::LLVMGetFirstUse(bb_val) == null;
                     }
                     if (is_empty || no_preds) {
@@ -2039,8 +2039,8 @@ type struct DeclarationEmitter {
                             raw: llvm::LLVMGetParam(fn_val.raw, sret_off + 1) };
                         this.builder.build_store(lo_arg, slot);
                         const i8_ty: LType = LType::i8();
-                        const idx_buf: void* = libc::malloc(8);
-                        const idx_slots: void** = idx_buf as void**;
+                        const idx_buf: mut void* = libc::malloc(8);
+                        const idx_slots: mut (mut void*)* = idx_buf as mut (mut void*)*;
                         const eight: LValue = LType::const_int(LType::i64(), 8, false);
                         idx_slots[0] = eight.raw;
                         const hi_ptr: LValue = this.builder.build_gep(
@@ -2299,13 +2299,13 @@ type struct DeclarationEmitter {
         mut field_count: i64 = -1;
         if (layout.kind == TypeKind::Struct) { field_count = layout.as_struct().fields.length(); }
         if (field_count < 0 || sl.field_inits.length() != field_count) { return LValue::null(); }
-        const buf: void* = libc::malloc((n as u64) * 8);
-        const slots: void** = buf as void**;
+        const buf: mut void* = libc::malloc((n as u64) * 8);
+        const slots: mut (mut void*)* = buf as mut (mut void*)*;
         // Zero every element first, so any padding element is a well-formed
         // constant even though no field initializer names it.
         mut ok: boolean = true;
         for (mut z: u32 = 0; z < n; z++) {
-            const zty: void* = llvm::LLVMStructGetTypeAtIndex(ty.raw, z);
+            const zty: mut void* = llvm::LLVMStructGetTypeAtIndex(ty.raw, z);
             const zval: LValue = LType::const_null(LType { raw: zty });
             if (!zval.is_valid()) { ok = false; break; }
             slots[z as i64] = zval.raw;
@@ -2319,7 +2319,7 @@ type struct DeclarationEmitter {
             if (field < 0) { ok = false; break; }
             const elem: i64 = mapper.field_element_index(layout, field);
             if (elem < 0 || elem as u32 >= n) { ok = false; break; }
-            const fty_raw: void* = llvm::LLVMStructGetTypeAtIndex(ty.raw, elem as u32);
+            const fty_raw: mut void* = llvm::LLVMStructGetTypeAtIndex(ty.raw, elem as u32);
             const fty: LType = LType { raw: fty_raw };
             const fexpr: ExpressionNode* = sl.field_inits[i as i64].value;
             const slot: LValue = this.const_element(fty, fexpr);
@@ -2423,8 +2423,8 @@ type struct DeclarationEmitter {
             return LValue::null();
         }
 
-        const buf: void* = libc::malloc((n as u64) * 8);
-        const slots: void** = buf as void**;
+        const buf: mut void* = libc::malloc((n as u64) * 8);
+        const slots: mut (mut void*)* = buf as mut (mut void*)*;
         mut ok: boolean = true;
         for (mut i: u32 = 0; i < n; i++) {
             const idx: i64 = if (is_repeat) { 0 } else { i as i64 };

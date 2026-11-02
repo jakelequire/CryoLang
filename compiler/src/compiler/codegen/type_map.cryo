@@ -65,10 +65,10 @@ type struct TypeMapperCache {
     // make `map_type` one of the hottest frontend functions (~5% self-time),
     // since every call scans the whole cache; hashed lookup avoids the
     // scan.  Same idea as `FunctionRegistry`.
-    cache: HashMap<u64, void*>;
+    cache: HashMap<u64, mut void*>;
 
     static new() -> TypeMapperCache {
-        return TypeMapperCache { cache: HashMap::<u64, void*>::new() };
+        return TypeMapperCache { cache: HashMap::<u64, mut void*>::new() };
     }
 
     lookup(&this, id: u64) -> LType {
@@ -84,7 +84,7 @@ type struct TypeMapperCache {
 
     /// Lazy-init accessor for the cross-module type cache.  Idempotent;
     /// every call after the first returns the same handle.
-    static get_shared_type_cache() -> TypeMapperCache* {
+    static get_shared_type_cache() -> mut TypeMapperCache* {
         if (g_shared_type_cache == null) {
             const _box: Box<TypeMapperCache> = Box::<TypeMapperCache>::new(TypeMapperCache::new());
             g_shared_type_cache = _box.into_raw();
@@ -102,7 +102,7 @@ type struct TypeMapperCache {
     }
 }
 
-mut g_shared_type_cache: TypeMapperCache* = null;
+mut g_shared_type_cache: mut TypeMapperCache* = null;
 
 
 type struct TypeMapper {
@@ -114,7 +114,7 @@ type struct TypeMapper {
     // codegen-path TypeMapper is wired with the CompilationContext's sink so
     // an unmappable field fails the compile instead of shipping a corrupt
     // layout.
-    diag:   DiagnosticSink*;
+    diag:   mut DiagnosticSink*;
     // The module whose data layout answers "how big is this body?" when a
     // type's declared size has to be reproduced (see `tail_padding_for`).
     // Borrowed, set by `wire()` once the owning CodegenContext is at its
@@ -124,7 +124,7 @@ type struct TypeMapper {
     // costs the padding: the layout audit reports the resulting disagreement.
     llvm_module: LModule*;
 
-    static new(arena: TypeArena*, intern: InternTable*, diag: DiagnosticSink*) -> TypeMapper {
+    static new(arena: TypeArena*, intern: InternTable*, diag: mut DiagnosticSink*) -> TypeMapper {
         return TypeMapper {
             arena:  arena,
             intern: intern,
@@ -199,7 +199,7 @@ type struct TypeMapper {
     /// it is non-zero only for a member whose declared alignment exceeds what
     /// its own members give it.  Unions overlap at offset 0 and packed structs
     /// are dense; neither can have one.
-    struct_field_slot(&this, st: StructType*, field_idx: i64, gap_out: u64*) -> i64 {
+    struct_field_slot(&this, st: StructType*, field_idx: i64, gap_out: mut u64*) -> i64 {
         if (gap_out != null) { *gap_out = 0; }
         if (st == null || field_idx < 0 || field_idx >= st.fields.length()) { return -1; }
         if (st.is_union || st.repr_packed) { return field_idx; }
@@ -267,9 +267,9 @@ type struct TypeMapper {
     /// when the front end's size is the SMALLER of the two - that is a
     /// front-end layout defect, and padding would hide it instead of fixing
     /// it.
-    tail_padding_for(&this, fe_size: u64, slots: void*, n: u32, packed: boolean) -> u64 {
+    tail_padding_for(&this, fe_size: u64, slots: mut void*, n: u32, packed: boolean) -> u64 {
         if (this.llvm_module == null || fe_size == 0 || n == 0) { return 0; }
-        const raw: void** = slots as void**;
+        const raw: mut void** = slots as mut void**;
         for (mut i: u32 = 0; i < n; i++) {
             const ft: LType = LType { raw: raw[i] };
             if (!ft.is_valid()) { return 0; }
@@ -286,15 +286,15 @@ type struct TypeMapper {
     /// Install `slots[0..n]` as `llvm_ty`'s body, appending `[pad x i8]` when
     /// the declared size needs it.  One `set_struct_body` call either way: a
     /// second one on an already-filled identified struct is not allowed.
-    set_body_with_padding(&this, llvm_ty: LType, slots: void*, n: u32,
+    set_body_with_padding(&this, llvm_ty: LType, slots: mut void*, n: u32,
                           packed: boolean, pad: u64) -> void {
         if (pad == 0) {
             llvm_ty.set_struct_body(slots, n, packed);
             return;
         }
         const total: u32 = n + 1;
-        const buf: void* = libc::malloc(total as u64 * 8);
-        const dst: void** = buf as void**;
+        const buf: mut void* = libc::malloc(total as u64 * 8);
+        const dst: mut (mut void*)* = buf as mut (mut void*)*;
         const src: void** = slots as void**;
         for (mut i: u32 = 0; i < n; i++) { dst[i] = src[i]; }
         dst[n] = LType::array_of(LType::i8(), pad as u32).raw;
@@ -313,7 +313,7 @@ type struct TypeMapper {
         const msg: string = fmt::format(
             "codegen: type '%s' has %u field(s) whose type could not be lowered to LLVM (first at field index %u); the type was left without a layout. This is a compiler bug -- an un-substituted generic parameter or unresolved type reached codegen. Please report it.",
             struct_name, bad_count, first_bad);
-        const sink: DiagnosticSink* = this.diag;
+        const sink: mut DiagnosticSink* = this.diag;
         sink.emit(Diagnostic::error(ErrorCode::E0600_CODEGEN_FAILED, msg));
     }
 
@@ -440,8 +440,8 @@ type struct TypeMapper {
     /// address of its table, whatever the form.
     map_object(mut &this) -> LType {
         const word: LType = LType::pointer_to(LType::i8());
-        const buf: void* = libc::malloc(16);
-        const slots: void** = buf as void**;
+        const buf: mut void* = libc::malloc(16);
+        const slots: mut (mut void*)* = buf as mut (mut void*)*;
         slots[0] = word.raw;
         slots[1] = word.raw;
         const result: LType = LType::literal_struct(buf, 2, false);
@@ -470,8 +470,8 @@ type struct TypeMapper {
     /// Tuple -> anonymous struct { elem0, elem1, ... }
     map_tuple(mut &this, t: TupleType*) -> LType {
         const n: u32 = t.elements.length() as u32;
-        const buf: void* = libc::malloc(n as u64 * 8);
-        const slots: void** = buf as void**;
+        const buf: mut void* = libc::malloc(n as u64 * 8);
+        const slots: mut (mut void*)* = buf as mut (mut void*)*;
         mut has_null: boolean = false;
         for (mut i: u32 = 0; i < n; i++) {
             const mapped: LType = this.map_type(t.elements[i]);
@@ -495,8 +495,8 @@ type struct TypeMapper {
         const wrapped: LType = this.map_type(t.wrapped);
         if (!wrapped.is_valid()) { return LType::null(); }
         const i1_ty: LType = LType::i1();
-        const buf: void* = libc::malloc(16);
-        const slots: void** = buf as void**;
+        const buf: mut void* = libc::malloc(16);
+        const slots: mut (mut void*)* = buf as mut (mut void*)*;
         slots[0] = wrapped.raw;
         slots[1] = i1_ty.raw;
         const result: LType = LType::literal_struct(buf, 2, false);
@@ -568,8 +568,8 @@ type struct TypeMapper {
             else if (u_align == 8) { elem = LType::i64(); }
             const count: u32 = (u_size / u_align) as u32;
             const blob: LType = LType::array_of(elem, count);
-            const ubuf: void* = libc::malloc(8);
-            const uslots: void** = ubuf as void**;
+            const ubuf: mut void* = libc::malloc(8);
+            const uslots: mut (mut void*)* = ubuf as mut (mut void*)*;
             uslots[0] = blob.raw;
             llvm_ty.set_struct_body(ubuf, 1, false);
             libc::free(ubuf);
@@ -586,8 +586,8 @@ type struct TypeMapper {
         // at most one filler per field, plus the tail.
         const n: u32 = t.fields.length() as u32;
         if (n > 0) {
-            const buf: void* = libc::malloc((n as u64 * 2 + 1) * 8);
-            const slots: void** = buf as void**;
+            const buf: mut void* = libc::malloc((n as u64 * 2 + 1) * 8);
+            const slots: mut (mut void*)* = buf as mut (mut void*)*;
             // A field whose type can't be lowered to LLVM means an
             // un-substituted generic or unresolved type reached codegen -- a
             // compiler bug.  We must NOT invent a placeholder layout: that
@@ -718,8 +718,8 @@ type struct TypeMapper {
         // variant's payload is zero-sized, elem_count=0 keeps the layout
         // as a 2-field struct rather than collapsing to a raw i32.
         const i32_ty: LType = LType::i32();
-        const buf: void* = libc::malloc(16);
-        const slots: void** = buf as void**;
+        const buf: mut void* = libc::malloc(16);
+        const slots: mut (mut void*)* = buf as mut (mut void*)*;
         slots[0] = i32_ty.raw;
         const payload_ty: LType = LType::array_of(elem_ty, elem_count);
         slots[1] = payload_ty.raw;
@@ -761,7 +761,7 @@ type struct TypeMapper {
     }
 
     store_cache(mut &this, id: u64, ty: LType) -> void {
-        const cache: TypeMapperCache* = TypeMapperCache::get_shared_type_cache();
+        const cache: mut TypeMapperCache* = TypeMapperCache::get_shared_type_cache();
         cache.store(id, ty);
     }
 }

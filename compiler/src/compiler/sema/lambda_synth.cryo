@@ -73,16 +73,16 @@ import std::core::mem::{ swap };
 import std::core::option::{ Option };
 
 type struct LambdaSynth {
-    arena:    TypeArena*;
-    intern:   InternTable*;
-    ctx:      CompilationContext*;
-    state:    SemaState*;
+    arena:    mut TypeArena*;
+    intern:   mut InternTable*;
+    ctx:      mut CompilationContext*;
+    state:    mut SemaState*;
     symbolic: SymbolicChecker*;
-    scopes:   ScopeManager*;
+    scopes:   mut ScopeManager*;
     /// The allocator a synthesized binding's identity comes from.  The shadow
     /// locals this synthesis writes into a closure body are declared after
     /// name resolution ran, so nothing else can say which binding each is.
-    resolver: Resolver*;
+    resolver: mut Resolver*;
 
     static null() -> LambdaSynth {
         return LambdaSynth {
@@ -91,7 +91,7 @@ type struct LambdaSynth {
         };
     }
 
-    wire(mut &this, arena: TypeArena*, intern: InternTable*, ctx: CompilationContext*,
+    wire(mut &this, arena: TypeArena*, intern: InternTable*, ctx: mut CompilationContext*,
                     state: SemaState*, symbolic: SymbolicChecker*, scopes: ScopeManager*) -> void {
         this.arena    = arena;
         this.intern   = intern;
@@ -106,7 +106,7 @@ type struct LambdaSynth {
     /// Type a lambda: resolve its param/return types, walk its body in a fresh
     /// per-function frame (capturing free variables), and return either the
     /// synthesised closure-struct type (capturing) or a function type (non-capturing).
-    resolve_lambda(mut &this, visitor: SemaVisitor*, e: ExpressionNode*, node: LambdaExpr*) -> TypeRef {
+    resolve_lambda(mut &this, visitor: mut SemaVisitor*, e: ExpressionNode*, node: mut LambdaExpr*) -> TypeRef {
         // One-shot guard: a capturing lambda an earlier walk already lowered
         // carries its closure-struct type - return it, don't re-lower.
         if (node.is_capturing() && e.has_resolved_type()
@@ -122,7 +122,7 @@ type struct LambdaSynth {
         mut param_types: [TypeRef] = [];
         for (mut i: i64 = 0; i < node.parameters.length(); i++) {
             const p_decl: DeclarationNode* = node.parameters[i];
-            const p: VarDecl* = DeclarationNode::var_of(p_decl);
+            const p: mut VarDecl* = DeclarationNode::var_of(p_decl);
             if (p == null) { continue; }
             mut pty: TypeRef = p.resolved_type;
             if (!pty.is_valid() && p.type_annotation != null) {
@@ -152,7 +152,7 @@ type struct LambdaSynth {
         const saved_expected:  TypeRef         = this.state.expected_type;
         const saved_loop:      i32             = this.state.loop_depth;
         const saved_lambda_depth: i32                   = this.state.in_lambda_depth;
-        const saved_current_lam:  LambdaExpr*           = this.state.current_lambda;
+        const saved_current_lam:  mut LambdaExpr*           = this.state.current_lambda;
         mut saved_bindings: HashMap<SymbolKey, LocalBinding> = HashMap::<SymbolKey, LocalBinding>::new();
         mut saved_binding_undo: [SymbolKey] = [];
         mut saved_binding_prev: [LocalBinding] = [];
@@ -290,7 +290,7 @@ type struct LambdaSynth {
     /// The receiver of a method synthesized on a closure struct: the struct by
     /// reference, with a binding of its own, as every method's receiver is.
     closure_receiver(mut &this, struct_ref: TypeRef, span: SourceSpan) -> DeclarationNode* {
-        mut recv: VarDecl* = VarDecl::new(this.intern.intern("&this"));
+        mut recv: mut VarDecl* = VarDecl::new(this.intern.intern("&this"));
         const recv_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(recv), span);
         recv.set_receiver(ReceiverForm::ByReference);
         recv.set_sym_id(this.resolver.alloc_synthetic_binding());
@@ -303,20 +303,20 @@ type struct LambdaSynth {
     /// for a capturing lambda written at `span`; returns the closure struct's
     /// TypeRef.
     synthesize_closure_struct(mut &this, lambda: LambdaExpr*, span: SourceSpan) -> TypeRef {
-        const ctx_ptr: CompilationContext* = this.ctx;
-        const intern_ptr: InternTable* = this.intern;
-        const arena_ptr: TypeArena* = this.arena;
+        const ctx_ptr: mut CompilationContext* = this.ctx;
+        const intern_ptr: mut InternTable* = this.intern;
+        const arena_ptr: mut TypeArena* = this.arena;
 
         const closure_def: DefId = this.mint_closure_def(span);
         const qual_name: SymbolStr = ctx_ptr.defs.path_of(closure_def).spelling();
 
         // 1. The struct declaration and its fields.
-        const struct_decl: StructDecl* = StructDecl::new(qual_name);
-        const struct_header: DeclarationNode* = DeclarationNode::of(DeclKind::Struct(struct_decl), span);
+        const struct_decl: mut StructDecl* = StructDecl::new(qual_name);
+        const struct_header: mut DeclarationNode* = DeclarationNode::of(DeclKind::Struct(struct_decl), span);
         struct_header.generated = true;
 
         for (mut i: i64 = 0; i < lambda.captured_names.length(); i++) {
-            mut field: FieldDecl* = FieldDecl::new(lambda.captured_names[i]);
+            mut field: mut FieldDecl* = FieldDecl::new(lambda.captured_names[i]);
             field.visibility = Visibility::Public;
             field.resolved_type = lambda.captured_types[i];
             struct_decl.fields.push(DeclarationNode::of(DeclKind::Field(field), span));
@@ -327,7 +327,7 @@ type struct LambdaSynth {
             qual_name, ctx_ptr.declaring_module(closure_def));
         const struct_t: Type* = arena_ptr.lookup(struct_ref);
         if (struct_t != null && struct_t.kind == TypeKind::Struct) {
-            const st: StructType* = struct_t.as_struct();
+            const st: mut StructType* = struct_t.as_struct();
             mut infos: [FieldInfo] = [];
             for (mut i: i64 = 0; i < lambda.captured_names.length(); i++) {
                 infos.push(FieldInfo::new(
@@ -339,7 +339,7 @@ type struct LambdaSynth {
         // 3. `__call__` FunctionDecl: the closure struct by reference, then
         // the lambda's own parameters.
         const call_name: SymbolStr = intern_ptr.intern("__call__");
-        mut call_fn: FunctionDecl* = FunctionDecl::new(call_name);
+        mut call_fn: mut FunctionDecl* = FunctionDecl::new(call_name);
         const call_fn_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(call_fn), span);
         call_fn.written_in = FunctionDecl::written_in_of(this.state.current_func);
         call_fn.set_resolved_return_type(lambda.return_type);
@@ -352,17 +352,17 @@ type struct LambdaSynth {
 
         // 4. __call__ body: `{ const cap_i = this.cap_i; <lambda body> }`.
         const body_block: Stmt* = Stmt::block(span);
-        const body: BlockStmt* = body_block.as_block();
+        const body: mut BlockStmt* = body_block.as_block();
         const this_ident_sym: SymbolStr = intern_ptr.intern("this");
         const cap_registry: GenericRegistry* = this.ctx.get_generic_registry();
         for (mut i: i64 = 0; i < lambda.captured_names.length(); i++) {
             const cap_name: SymbolStr = lambda.captured_names[i];
             const cap_ty:   TypeRef   = lambda.captured_types[i];
 
-            const this_ident: ExpressionNode* = ExpressionNode::identifier_expr(this_ident_sym, span);
+            const this_ident: mut ExpressionNode* = ExpressionNode::identifier_expr(this_ident_sym, span);
             this_ident.set_resolved_type(struct_ref);
             ExpressionNode::identifier_of(this_ident).set_res(Res::Local(call_recv.sym_id));
-            const access: ExpressionNode* = ExpressionNode::member_access_expr(
+            const access: mut ExpressionNode* = ExpressionNode::member_access_expr(
                 this_ident, cap_name, span, span);
             access.set_resolved_type(cap_ty);
             // Capture `i` is field `i` of the struct laid out above; nothing
@@ -374,8 +374,8 @@ type struct LambdaSynth {
             // the shadow takes its identity.  With a fresh one, a move of the
             // capture inside the body names no declaration of `__call__`, and
             // the checks keyed by binding never see it.
-            mut shadow: VarDecl* = VarDecl::new(cap_name);
-            const shadow_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(shadow), span);
+            mut shadow: mut VarDecl* = VarDecl::new(cap_name);
+            const shadow_decl: mut DeclarationNode* = DeclarationNode::of(DeclKind::Variable(shadow), span);
             shadow_decl.generated = true;
             shadow.set_sym_id(if (lambda.captured_syms[i].is_valid()) {
                 lambda.captured_syms[i]
@@ -404,7 +404,7 @@ type struct LambdaSynth {
         call_fn.set_body(body_block);
 
         // 5. MethodDecl + attach.
-        mut method: MethodDecl* = MethodDecl::new(call_fn_decl);
+        mut method: mut MethodDecl* = MethodDecl::new(call_fn_decl);
         const method_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Method(method), span);
         call_fn.def = ctx_ptr.define_method(closure_def, call_fn.name, span,
             method_decl);
@@ -415,7 +415,7 @@ type struct LambdaSynth {
 
         // 6. Populate StructType.methods so overload resolution finds `__call__`.
         if (struct_t != null && struct_t.kind == TypeKind::Struct) {
-            const st: StructType* = struct_t.as_struct();
+            const st: mut StructType* = struct_t.as_struct();
             mut method_param_types: [TypeRef] = [];
             for (mut pi: i64 = 0; pi < call_fn.parameters.length(); pi++) {
                 const pp_decl: DeclarationNode* = call_fn.parameters[pi];
@@ -443,7 +443,7 @@ type struct LambdaSynth {
         mut method_arr: [DeclarationNode*] = [method_decl];
         ctx_ptr.decl_index.register_methods(
             struct_ref, method_arr, intern_ptr, arena_ptr, "closure/struct methods");
-        const drop_impl: DeclarationNode* = this.closure_drop_impl(lambda, struct_decl, struct_ref, span);
+        const drop_impl: mut DeclarationNode* = this.closure_drop_impl(lambda, struct_decl, struct_ref, span);
 
         // 8. Inject into ProgramNode so subsequent passes walk it.
         if (ctx_ptr.artifacts.ast.root != null) {
@@ -465,8 +465,8 @@ type struct LambdaSynth {
     /// destructor, it is what a written `f.drop()` and the scope-exit
     /// release both reach.
     closure_drop_impl(mut &this, lambda: LambdaExpr*, struct_decl: StructDecl*,
-                      struct_ref: TypeRef, span: SourceSpan) -> DeclarationNode* {
-        const registry_ptr: GenericRegistry* = this.ctx.get_generic_registry();
+                      struct_ref: TypeRef, span: SourceSpan) -> mut DeclarationNode* {
+        const registry_ptr: mut GenericRegistry* = this.ctx.get_generic_registry();
         mut has_noncopy_capture: boolean = false;
         for (mut di: i64 = 0; di < lambda.captured_names.length(); di++) {
             if (!OwnershipQuery::is_copy(this.arena, registry_ptr, this.intern, lambda.captured_types[di])) {
@@ -479,13 +479,13 @@ type struct LambdaSynth {
         if (!drop_id.is_valid()) { return null; }
 
         const drop_name: SymbolStr = this.intern.intern("drop");
-        mut drop_fn: FunctionDecl* = FunctionDecl::new(drop_name);
+        mut drop_fn: mut FunctionDecl* = FunctionDecl::new(drop_name);
         const drop_fn_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(drop_fn), span);
         drop_fn.set_resolved_return_type(this.arena.get_void());
         drop_fn.set_origin_trait(drop_id);
         drop_fn.add_parameter(this.closure_receiver(struct_ref, span));
         drop_fn.set_body(Stmt::block(span));
-        mut drop_method: MethodDecl* = MethodDecl::new(drop_fn_decl);
+        mut drop_method: mut MethodDecl* = MethodDecl::new(drop_fn_decl);
         const drop_method_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Method(drop_method), span);
         drop_fn.def = this.ctx.define_method(struct_decl.def, drop_name, span,
             drop_method_decl);
@@ -493,12 +493,12 @@ type struct LambdaSynth {
         drop_method.set_static(false);
         drop_method.set_sink(false);
 
-        const impl_node: ImplBlock* = ImplBlock::new(struct_decl.name);
-        const impl_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Impl(impl_node), span);
+        const impl_node: mut ImplBlock* = ImplBlock::new(struct_decl.name);
+        const impl_decl: mut DeclarationNode* = DeclarationNode::of(DeclKind::Impl(impl_node), span);
         // A synthesized head is walked by no resolver, so the synthesizer,
         // which holds both definitions, records what it names.
         impl_node.res.answer(Res::Def(struct_decl.def));
-        mut trait_ann: NamedAnnotation* = new NamedAnnotation {
+        mut trait_ann: mut NamedAnnotation* = new NamedAnnotation {
             name: this.intern.intern("Drop"), span: span, pre_resolved: TypeRef::invalid(),
             res: ResSlot::Pending,
         };
@@ -547,7 +547,7 @@ type struct LambdaSynth {
 
     /// If `call.callee` is a closure-struct local, rewrite `f(args)` to
     /// `f.__call__(args)` in place.
-    maybe_rewrite_closure_call(mut &this, call: CallExpr*) -> void {
+    maybe_rewrite_closure_call(mut &this, call: mut CallExpr*) -> void {
         if (call == null || call.callee == null) { return; }
         const ident: IdentifierExpr* = ExpressionNode::identifier_of(call.callee);
         if (ident == null) { return; }
@@ -577,7 +577,7 @@ type struct LambdaSynth {
     /// A callee declared in another module has no AST in this root and is
     /// not specialized here; that is the reach of the pass, not a lookup
     /// that failed.
-    try_specialize_for_closure_args(mut &this, call: CallExpr*, ident: IdentifierExpr*,
+    try_specialize_for_closure_args(mut &this, call: mut CallExpr*, ident: IdentifierExpr*,
                                     selected: OverloadId) -> void {
         if (call == null || ident == null) { return; }
 
@@ -681,11 +681,11 @@ type struct LambdaSynth {
         const spec_func_decl: DeclarationNode* = cloner.clone_decl(orig_func_decl);
         if (spec_func_decl == null) { return; }
         if (DeclarationNode::fn_of(spec_func_decl) == null) { return; }
-        mut spec_func: FunctionDecl* = DeclarationNode::fn_of(spec_func_decl);
+        mut spec_func: mut FunctionDecl* = DeclarationNode::fn_of(spec_func_decl);
 
         for (mut i: i64 = 0; i < spec_func.parameters.length(); i++) {
             const p_decl: DeclarationNode* = spec_func.parameters[i];
-            mut p: VarDecl* = DeclarationNode::var_of(p_decl);
+            mut p: mut VarDecl* = DeclarationNode::var_of(p_decl);
             if (p == null) { continue; }
             mut sub_ty: TypeRef = TypeRef::invalid();
             for (mut si: i64 = 0; si < sub_indices.length(); si++) {

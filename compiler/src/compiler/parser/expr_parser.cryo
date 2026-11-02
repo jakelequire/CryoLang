@@ -68,14 +68,14 @@ implement struct Parser {
     // Expression Parsing: Entry Points
 
     /// Top-level expression entry point.
-    parse_expression(mut &this) -> ExpressionNode* {
+    parse_expression(mut &this) -> mut ExpressionNode* {
         return this.parse_assignment();
     }
 
     /// Parse assignment expression (right-associative).
     /// assignment = pipe ( ( '=' | '+=' | ... ) assignment )?
-    parse_assignment(mut &this) -> ExpressionNode* {
-        mut left: ExpressionNode* = this.parse_pipe();
+    parse_assignment(mut &this) -> mut ExpressionNode* {
+        mut left: mut ExpressionNode* = this.parse_pipe();
         if (left == null || this.panic_mode) { return left; }
 
         if (this.current().kind.is_assignment_op()) {
@@ -90,7 +90,7 @@ implement struct Parser {
             }
             const op: Token = this.advance();
             this.expr_depth += 1;
-            const right: ExpressionNode* = this.parse_assignment();
+            const right: mut ExpressionNode* = this.parse_assignment();
             this.expr_depth -= 1;
             if (right == null) {
                 this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
@@ -122,15 +122,15 @@ implement struct Parser {
     /// is `a ?? (b ?? c)`, which is what makes the chain type-check:
     /// each `??` is `Option<T> ?? T -> T`, so the rightmost operand is the
     /// bare `T` fallback and every operand to its left is an `Option<T>`.
-    parse_pipe(mut &this) -> ExpressionNode* {
-        mut left: ExpressionNode* = this.parse_conditional();
+    parse_pipe(mut &this) -> mut ExpressionNode* {
+        mut left: mut ExpressionNode* = this.parse_conditional();
         if (left == null || this.panic_mode) { return left; }
 
         // Left-associative pipe chain.
         while (this.check(TokenType::PipeGreater)
                 || this.check(TokenType::LessPipe)) {
             const op: Token = this.advance();
-            const right: ExpressionNode* = this.parse_conditional();
+            const right: mut ExpressionNode* = this.parse_conditional();
             if (right == null) {
                 this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
                     fmt::format("expected expression after '%s'", op.lexeme));
@@ -159,7 +159,7 @@ implement struct Parser {
             }
             const op_tok: Token = this.advance();
             this.expr_depth += 1;
-            const right: ExpressionNode* = this.parse_pipe();
+            const right: mut ExpressionNode* = this.parse_pipe();
             this.expr_depth -= 1;
             if (right == null) {
                 this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
@@ -178,11 +178,11 @@ implement struct Parser {
     /// callable (identifier, member access, or scope resolution) that we
     /// wrap in a fresh call).  `value` is the piped operand; `prepend` puts
     /// it first (`|>`), otherwise last (`<|`).
-    desugar_pipe(&this, callable: ExpressionNode*, value: ExpressionNode*,
+    desugar_pipe(&this, callable: mut ExpressionNode*, value: mut ExpressionNode*,
                  prepend: boolean, span: SourceSpan) -> ExpressionNode* {
         if (ExpressionNode::call_of(callable) != null) {
-            mut call: CallExpr* = ExpressionNode::call_of(callable);
-            mut new_args: [ExpressionNode*] = [];
+            mut call: mut CallExpr* = ExpressionNode::call_of(callable);
+            mut new_args: [mut ExpressionNode*] = [];
             if (prepend) {
                 new_args.push(value);
                 for (mut i: i64 = 0; i < call.arguments.length(); i++) {
@@ -219,33 +219,33 @@ implement struct Parser {
     /// No user expression can begin at the operator's column, so stamping the
     /// synthesized nodes there cannot collide with one.  `match_expr` keeps the
     /// full extent because it is not a name and nothing records against it.
-    desugar_null_coalesce(&this, left: ExpressionNode*, right: ExpressionNode*,
+    desugar_null_coalesce(&this, left: mut ExpressionNode*, right: mut ExpressionNode*,
                           span: SourceSpan, op_span: SourceSpan) -> ExpressionNode* {
         g_coalesce_counter += 1;
         const bind_str:  string    = fmt::format("__cryo_coalesce_%u", g_coalesce_counter);
         const bind_name: SymbolStr = this.ctx.intern(bind_str);
 
         const match_expr: ExpressionNode* = ExpressionNode::match_expr(left, span);
-        mut coalesce: MatchExpr* = ExpressionNode::match_of(match_expr);
+        mut coalesce: mut MatchExpr* = ExpressionNode::match_of(match_expr);
 
         // Some(v) => { v }
-        const some_pat: Pattern* = this.lang_variant_pattern(LangItem::Option, "Some", op_span);
+        const some_pat: mut Pattern* = this.lang_variant_pattern(LangItem::Option, "Some", op_span);
         const pb: PatternBinding* = new PatternBinding {
             name: bind_name, span: op_span, sym_id: SymbolID::invalid(),
             resolved_type: TypeRef::invalid(), written_mut: false
         };
         some_pat.enum_payload().add_element(PatternElement::Binding(pb));
-        mut some_arm: MatchArmNode* = MatchArmNode::new(op_span);
+        mut some_arm: mut MatchArmNode* = MatchArmNode::new(op_span);
         some_arm.add_pattern(some_pat);
-        const some_ident: ExpressionNode* = ExpressionNode::identifier_expr(bind_name, op_span);
+        const some_ident: mut ExpressionNode* = ExpressionNode::identifier_expr(bind_name, op_span);
         const some_block: Stmt* = Stmt::block(op_span);
         some_block.as_block().add_statement(Stmt::expr_stmt(some_ident, op_span));
         some_arm.set_body(some_block);
         coalesce.add_arm(some_arm);
 
         // None => { b }
-        const none_pat: Pattern* = this.lang_variant_pattern(LangItem::Option, "None", op_span);
-        mut none_arm: MatchArmNode* = MatchArmNode::new(op_span);
+        const none_pat: mut Pattern* = this.lang_variant_pattern(LangItem::Option, "None", op_span);
+        mut none_arm: mut MatchArmNode* = MatchArmNode::new(op_span);
         none_arm.add_pattern(none_pat);
         const none_block: Stmt* = Stmt::block(right.span);
         none_block.as_block().add_statement(Stmt::expr_stmt(right, right.span));
@@ -265,8 +265,8 @@ implement struct Parser {
     /// a module declaring its own `Option` would otherwise have its enum
     /// matched against the language's value and refused.  The node takes
     /// the claiming declaration's spelling when it is settled.
-    lang_variant_pattern(&this, item: LangItem, variant: string, span: SourceSpan) -> Pattern* {
-        mut pat: Pattern* = Pattern::enum_variant(
+    lang_variant_pattern(&this, item: LangItem, variant: string, span: SourceSpan) -> mut Pattern* {
+        mut pat: mut Pattern* = Pattern::enum_variant(
             this.ctx.intern(item.name()), this.ctx.intern(variant), span);
         pat.enum_payload().res = ResSlot::Lang(item);
         this.ctx.note_lang_ref(Node::Pattern(pat), item);
@@ -275,8 +275,8 @@ implement struct Parser {
 
     /// Parse ternary conditional (right-associative).
     /// conditional = binary ( '?' expression ':' conditional )?
-    parse_conditional(mut &this) -> ExpressionNode* {
-        mut expr: ExpressionNode* = this.parse_binary_expression(2);
+    parse_conditional(mut &this) -> mut ExpressionNode* {
+        mut expr: mut ExpressionNode* = this.parse_binary_expression(2);
         if (expr == null || this.panic_mode) { return expr; }
 
         if (this.check(TokenType::Question)) {
@@ -291,7 +291,7 @@ implement struct Parser {
             }
             this.advance();
             this.expr_depth += 1;
-            const true_expr: ExpressionNode* = this.parse_expression();
+            const true_expr: mut ExpressionNode* = this.parse_expression();
             if (true_expr == null) {
                 this.expr_depth -= 1;
                 this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
@@ -299,7 +299,7 @@ implement struct Parser {
                 return expr;
             }
             this.consume(TokenType::Colon, "':'");
-            const false_expr: ExpressionNode* = this.parse_conditional();
+            const false_expr: mut ExpressionNode* = this.parse_conditional();
             this.expr_depth -= 1;
             if (false_expr == null) {
                 this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
@@ -315,8 +315,8 @@ implement struct Parser {
 
     /// Pratt-style precedence-climbing binary expression parser.
     /// binary = cast ( binop binary )*
-    parse_binary_expression(mut &this, min_prec: int) -> ExpressionNode* {
-        mut left: ExpressionNode* = this.parse_cast();
+    parse_binary_expression(mut &this, min_prec: int) -> mut ExpressionNode* {
+        mut left: mut ExpressionNode* = this.parse_cast();
         if (left == null || this.panic_mode) { return left; }
 
         // A left-associative operator chain (`a + b + c + ...`) is parsed
@@ -343,7 +343,7 @@ implement struct Parser {
             }
 
             const op: Token = this.advance();
-            const right: ExpressionNode* = this.parse_binary_expression(prec + 1);
+            const right: mut ExpressionNode* = this.parse_binary_expression(prec + 1);
             if (right == null) {
                 // `a < b >` with nothing an expression can start with after
                 // it is the shape a generic-argument list spelled without its
@@ -378,10 +378,10 @@ implement struct Parser {
                     TokenType::Amp, "&", op.line, op.column);
                 // Compiler-synthesized address-of a temporary: exempt from
                 // the user-facing "no address-of a literal" check (E0223).
-                const ref_right: ExpressionNode* =
+                const ref_right: mut ExpressionNode* =
                     ExpressionNode::synthetic_unary(amp_tok, right, right.span);
                 const compare_name: SymbolStr = this.ctx.intern("compare");
-                mut member: ExpressionNode* = ExpressionNode::member_access_expr(
+                mut member: mut ExpressionNode* = ExpressionNode::member_access_expr(
                     left, compare_name, this.span_from_token(op), span);
                 ExpressionNode::member_access_of(member).trait_required = true;
                 this.ctx.note_lang_ref(Node::Expr(member), LangItem::Ord);
@@ -401,7 +401,7 @@ implement struct Parser {
                     if (op.kind == TokenType::DotDotEq) { LangItem::RangeInclusive } else { LangItem::Range };
                 const ctor_scope: SymbolStr = this.ctx.intern(range_item.name());
                 const new_name: SymbolStr = this.ctx.intern("new");
-                const sr: ExpressionNode* = ExpressionNode::scope_resolution_expr(
+                const sr: mut ExpressionNode* = ExpressionNode::scope_resolution_expr(
                     ctor_scope, new_name, span);
                 ExpressionNode::scope_resolution_of(sr).scope_res = ResSlot::Lang(range_item);
                 this.ctx.note_lang_ref(Node::Expr(sr), range_item);
@@ -419,13 +419,13 @@ implement struct Parser {
     }
 
     /// Parse cast expression: unary ( 'as' type )*
-    parse_cast(mut &this) -> ExpressionNode* {
-        mut expr: ExpressionNode* = this.parse_unary();
+    parse_cast(mut &this) -> mut ExpressionNode* {
+        mut expr: mut ExpressionNode* = this.parse_unary();
         if (expr == null || this.panic_mode) { return expr; }
 
         while (this.check(TokenType::KwAs)) {
             this.advance();
-            mut target: TypeAnnotation* = null;
+            mut target: mut TypeAnnotation* = null;
             const target_tok: Token = this.current();
             // `as const T*` and `as mut T*` cast to a marked pointer; the
             // mark binds to the first pointer suffix (threaded via
@@ -473,7 +473,7 @@ implement struct Parser {
 
     /// Parse unary prefix expression.
     /// unary = ( '-' | '!' | '*' | '&' | '~' | '++' | '--' ) unary | postfix
-    parse_unary(mut &this) -> ExpressionNode* {
+    parse_unary(mut &this) -> mut ExpressionNode* {
         if (this.current().kind.is_unary_prefix_op()) {
             // Guard against unbounded recursion on pathological prefix
             // chains like `----...x` / `!!!...x`: each operator recurses
@@ -489,7 +489,7 @@ implement struct Parser {
             }
             const op: Token = this.advance();
             this.unary_depth += 1;
-            const operand: ExpressionNode* = this.parse_unary();
+            const operand: mut ExpressionNode* = this.parse_unary();
             this.unary_depth -= 1;
             if (operand == null) {
                 this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
@@ -508,14 +508,14 @@ implement struct Parser {
     // Primary + Postfix
 
     /// Parse a primary expression and then handle any postfix operations.
-    parse_primary_with_postfix(mut &this) -> ExpressionNode* {
-        mut expr: ExpressionNode* = this.parse_primary();
+    parse_primary_with_postfix(mut &this) -> mut ExpressionNode* {
+        mut expr: mut ExpressionNode* = this.parse_primary();
         if (expr == null || this.panic_mode) { return expr; }
         return this.parse_postfix(expr);
     }
 
     /// Parse postfix operations: call, index, member access, ++/--.
-    parse_postfix(mut &this, mut expr: ExpressionNode*) -> ExpressionNode* {
+    parse_postfix(mut &this, mut expr: mut ExpressionNode*) -> mut ExpressionNode* {
         // Postfix chains (`a.b.b.b...`, `a()()()...`, `a[i][i]...`) are parsed
         // iteratively but build a left-leaning tree whose height equals the
         // chain length; later recursive AST walks descend it and overflow the
@@ -567,7 +567,7 @@ implement struct Parser {
                 // E0154 ambiguity detector.
                 this.advance();
                 mut scope_name: SymbolStr = SymbolStr::empty();
-                mut carried_gen_args: [TypeAnnotation*] = [];
+                mut carried_gen_args: [mut TypeAnnotation*] = [];
                 const psr: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(expr);
                 if (psr != null) {
                     // An impl-qualified path names one member of one
@@ -624,7 +624,7 @@ implement struct Parser {
                 const qname: SymbolStr = this.ctx.intern_table.intern(
                     fmt::format("%s::%s", scope_s, member_s));
                 // Deep-clone the member generic args; `sr` owns its pointees.
-                mut sl_gen: [TypeAnnotation*] = [];
+                mut sl_gen: [mut TypeAnnotation*] = [];
                 for (mut gi: i64 = 0; gi < sr.generic_args.length(); gi++) {
                     sl_gen.push(TypeAnnotation::clone_ptr(sr.generic_args[gi]));
                 }
@@ -641,7 +641,7 @@ implement struct Parser {
                 const op: Token        = this.advance();
                 const span: SourceSpan = Parser::merge_spans(expr.span, this.span_from_token(op));
                 expr = ExpressionNode::unary_expr(op, expr, span);
-                mut un: UnaryExpr* = ExpressionNode::unary_of(expr);
+                mut un: mut UnaryExpr* = ExpressionNode::unary_of(expr);
                 un.is_postfix = true;
             } else if (this.check(TokenType::Question) && this.question_against_operand()
                        && match (this.peek_at(1).kind) {
@@ -680,7 +680,7 @@ implement struct Parser {
     // Primary Expressions
 
     /// Parse a primary expression (literals, identifiers, grouping, etc.).
-    parse_primary(mut &this) -> ExpressionNode* {
+    parse_primary(mut &this) -> mut ExpressionNode* {
         if (Log::enabled(LogArea::Parse, LogLevel::Trace)) {
             Log::trace(LogArea::Parse, f"primary expression at '{this.current().lexeme}'");
         }
@@ -718,7 +718,7 @@ implement struct Parser {
         if (tok.kind == TokenType::KwThis) {
             const ttok: Token = this.advance();
             const name: SymbolStr = this.intern_lexeme(ttok);
-            const id: ExpressionNode* = ExpressionNode::identifier_expr(name, this.span_from_token(ttok));
+            const id: mut ExpressionNode* = ExpressionNode::identifier_expr(name, this.span_from_token(ttok));
             ExpressionNode::identifier_of(id).is_this_keyword = true;
             return id;
         }
@@ -787,9 +787,9 @@ implement struct Parser {
                     "expected '(' after 'move' to begin lambda parameter list");
                 return null;
             }
-            mut inner: ExpressionNode* = this.parse_paren_expr_or_lambda();
+            mut inner: mut ExpressionNode* = this.parse_paren_expr_or_lambda();
             if (inner == null) { return null; }
-            mut lambda: LambdaExpr* = ExpressionNode::lambda_of(inner);
+            mut lambda: mut LambdaExpr* = ExpressionNode::lambda_of(inner);
             if (lambda == null) {
                 this.report_error(ErrorCode::E0111_INVALID_SYNTAX,
                     "'move' must be followed by a lambda expression");
@@ -821,7 +821,7 @@ implement struct Parser {
         if (tok.kind.is_keyword()) {
             const ktok: Token = this.advance();
             const name: SymbolStr = this.intern_lexeme(ktok);
-            const id: ExpressionNode* = ExpressionNode::identifier_expr(name, this.span_from_token(ktok));
+            const id: mut ExpressionNode* = ExpressionNode::identifier_expr(name, this.span_from_token(ktok));
             ExpressionNode::identifier_of(id).is_this_type_keyword = ktok.kind == TokenType::KwThisType;
             return id;
         }
@@ -835,24 +835,24 @@ implement struct Parser {
     // Primary Helpers
 
     /// Parse a numeric literal.
-    parse_number_literal(mut &this) -> ExpressionNode* {
+    parse_number_literal(mut &this) -> mut ExpressionNode* {
         const tok: Token = this.advance();
         const kind: LiteralKind = if (tok.is_float) { LiteralKind::Float } else { LiteralKind::Integer };
-        const lit: ExpressionNode* = ExpressionNode::literal(tok.lexeme, kind, this.span_from_token(tok));
+        const lit: mut ExpressionNode* = ExpressionNode::literal(tok.lexeme, kind, this.span_from_token(tok));
         ExpressionNode::literal_of(lit).suffix = tok.numeric_suffix;
         return lit;
     }
 
     /// Parse a string literal.
-    parse_string_literal(mut &this) -> ExpressionNode* {
+    parse_string_literal(mut &this) -> mut ExpressionNode* {
         const tok: Token = this.advance();
-        const lit: ExpressionNode* = ExpressionNode::literal(tok.lexeme, LiteralKind::String, this.span_from_token(tok));
+        const lit: mut ExpressionNode* = ExpressionNode::literal(tok.lexeme, LiteralKind::String, this.span_from_token(tok));
         ExpressionNode::literal_of(lit).byte_length = tok.text_length;
         return lit;
     }
 
     /// Parse a character literal.
-    parse_char_literal(mut &this) -> ExpressionNode* {
+    parse_char_literal(mut &this) -> mut ExpressionNode* {
         const tok: Token = this.advance();
         return ExpressionNode::literal(tok.lexeme, LiteralKind::Char, this.span_from_token(tok));
     }
@@ -877,7 +877,7 @@ implement struct Parser {
     /// `format_append_spec` with the spec as a string; `{expr}` and
     /// `{expr:?}` still lower to `format_append_display` /
     /// `format_append_debug`.
-    parse_fstring(mut &this) -> ExpressionNode* {
+    parse_fstring(mut &this) -> mut ExpressionNode* {
         const tok: Token = this.advance();
         // Stash the span so the desugar helpers can read it from a field
         // rather than taking it as a by-value struct parameter.
@@ -886,7 +886,7 @@ implement struct Parser {
         const len: i64 = raw.length() as i64;
 
         // acc := format_new()
-        mut acc: ExpressionNode* = this.fstr_call(LangItem::FormatNew);
+        mut acc: mut ExpressionNode* = this.fstr_call(LangItem::FormatNew);
 
         // Literal runs are tracked as `[chunk_start, i)` index ranges into
         // `raw` and materialised with `substr` - no manual byte buffer.  A
@@ -991,7 +991,7 @@ implement struct Parser {
                     }
                     sc += 1;
                 }
-                const inner: ExpressionNode* = this.fstr_parse_hole(
+                const inner: mut ExpressionNode* = this.fstr_parse_hole(
                     expr_src, hole_line, hole_col);
                 chunk_start = j + 1; // literal run resumes past the closing '}'
                 i = j + 1;
@@ -1003,7 +1003,7 @@ implement struct Parser {
                 // &inner: synthetic address-of, exempt from the user-facing
                 // no-address-of-a-literal check (E0223) so `f"{42}"` works.
                 const amp: Token = Token::new(TokenType::Amp, "&", tok.line, tok.column);
-                mut ref_node: ExpressionNode* = ExpressionNode::synthetic_unary(amp, inner, this.fstr_span);
+                mut ref_node: mut ExpressionNode* = ExpressionNode::synthetic_unary(amp, inner, this.fstr_span);
                 ref_node.generated = true;
 
                 if (helper_kind == 2) {
@@ -1042,14 +1042,14 @@ implement struct Parser {
     /// `format_append_literal(acc, "<escape-processed>")` call.  No-op when
     /// empty.
     /// Uses `this.fstr_span` for synthesized node spans.
-    fstr_flush_range(&this, acc: ExpressionNode*, raw_text: string,
+    fstr_flush_range(&this, acc: mut ExpressionNode*, raw_text: string,
                      start: i64, end: i64) -> ExpressionNode* {
         const raw: string = raw_text;
         if (end <= start) { return acc; }
         const text_raw: string = raw.substr(start, end - start);
         const text: String = Lexer::process_escape_sequences(text_raw);
         const byte_length: i64 = text.length() as i64;
-        mut lit: ExpressionNode* = ExpressionNode::literal(text.into_raw(), LiteralKind::String, this.fstr_span);
+        mut lit: mut ExpressionNode* = ExpressionNode::literal(text.into_raw(), LiteralKind::String, this.fstr_span);
         ExpressionNode::literal_of(lit).byte_length = byte_length;
         lit.generated = true;
         return this.fstr_call2(LangItem::FormatAppendLiteral, acc, lit);
@@ -1062,18 +1062,18 @@ implement struct Parser {
     /// builder's visibility is never in question.  The f-string's text
     /// spells neither the call nor its callee, so both are marked as the
     /// compiler's; the holes among its arguments are written code.
-    fstr_call(&this, item: LangItem) -> ExpressionNode* {
-        mut id: ExpressionNode* = ExpressionNode::identifier_expr(this.ctx.intern(item.name()), this.fstr_span);
+    fstr_call(&this, item: LangItem) -> mut ExpressionNode* {
+        mut id: mut ExpressionNode* = ExpressionNode::identifier_expr(this.ctx.intern(item.name()), this.fstr_span);
         id.generated = true;
         ExpressionNode::identifier_of(id).res = ResSlot::Lang(item);
         this.ctx.note_lang_ref(Node::Expr(id), item);
-        mut call: ExpressionNode* = ExpressionNode::call_expr(id, this.fstr_span);
+        mut call: mut ExpressionNode* = ExpressionNode::call_expr(id, this.fstr_span);
         call.generated = true;
         return call;
     }
 
     /// Build a two-argument call of the builder `item`, `item(a, b)`.
-    fstr_call2(&this, item: LangItem, a: ExpressionNode*, b: ExpressionNode*) -> ExpressionNode* {
+    fstr_call2(&this, item: LangItem, a: mut ExpressionNode*, b: mut ExpressionNode*) -> ExpressionNode* {
         const call: ExpressionNode* = this.fstr_call(item);
         ExpressionNode::call_of(call).add_argument(a);
         ExpressionNode::call_of(call).add_argument(b);
@@ -1092,7 +1092,7 @@ implement struct Parser {
     /// would sit at 1:1 and collide in the resolution map, so a local used only
     /// inside an f-string looks unreferenced (W0001 false positive) and LSP
     /// hover/def point nowhere.
-    fstr_parse_hole(&this, src_text: string, base_line: int, base_col: int) -> ExpressionNode* {
+    fstr_parse_hole(&this, src_text: string, base_line: int, base_col: int) -> mut ExpressionNode* {
         mut lx: Lexer = Lexer::new("<fstring>", src_text, this.ctx.diagnostics);
         lx.seed_location(base_line, base_col);
         const hole_toks: [Token] = lx.lex();
@@ -1118,12 +1118,12 @@ implement struct Parser {
     /// that lowers a `{expr:spec}` hole. `spec` is the raw spec text; it
     /// is passed verbatim as a string literal (no escape processing) and
     /// re-parsed at runtime by `std::fmt::spec::fmt_parse_spec`.
-    fstr_call_fmt(&this, acc: ExpressionNode*, ref_node: ExpressionNode*,
+    fstr_call_fmt(&this, acc: mut ExpressionNode*, ref_node: mut ExpressionNode*,
                   spec: string) -> ExpressionNode* {
         const call: ExpressionNode* = this.fstr_call(LangItem::FormatAppendSpec);
         ExpressionNode::call_of(call).add_argument(acc);
         ExpressionNode::call_of(call).add_argument(ref_node);
-        mut lit: ExpressionNode* = ExpressionNode::literal(spec, LiteralKind::String, this.fstr_span);
+        mut lit: mut ExpressionNode* = ExpressionNode::literal(spec, LiteralKind::String, this.fstr_span);
         lit.generated = true;
         ExpressionNode::call_of(call).add_argument(lit);
         return call;
@@ -1230,10 +1230,10 @@ implement struct Parser {
     }
 
     /// Parse an identifier, handling scope resolution, generic calls, and struct literals.
-    parse_identifier_or_call(mut &this) -> ExpressionNode* {
+    parse_identifier_or_call(mut &this) -> mut ExpressionNode* {
         const tok: Token = this.advance();
         const name: SymbolStr = this.intern_lexeme(tok);
-        mut expr: ExpressionNode* = ExpressionNode::identifier_expr(name, this.span_from_token(tok));
+        mut expr: mut ExpressionNode* = ExpressionNode::identifier_expr(name, this.span_from_token(tok));
 
         // Generic arguments on the name: `Name::<T, U>`.  A bare `<` after a
         // name is a comparison, whatever the name binds.
@@ -1248,17 +1248,17 @@ implement struct Parser {
     /// `f::<T>(..)`, a struct literal `Name::<T> { .. }`, a scope step
     /// `Name::<T>::member`, or the generic function itself as a value
     /// (`tramp::<i32>` passed, cast or assigned).  The cursor is on the `<`.
-    parse_generic_head(mut &this, expr: ExpressionNode*, name: SymbolStr, tok: Token) -> ExpressionNode* {
-        mut head: ExpressionNode* = expr;
-        const gen_args: [TypeAnnotation*] = this.parse_generic_args();
+    parse_generic_head(mut &this, expr: mut ExpressionNode*, name: SymbolStr, tok: Token) -> mut ExpressionNode* {
+        mut head: mut ExpressionNode* = expr;
+        const gen_args: [mut TypeAnnotation*] = this.parse_generic_args();
 
         if (this.check(TokenType::LParen)) {
-            mut call: ExpressionNode* = ExpressionNode::call_expr(head, head.span);
+            mut call: mut ExpressionNode* = ExpressionNode::call_expr(head, head.span);
             ExpressionNode::call_of(call).set_generic_args(gen_args);
             this.advance(); // consume '('
             if (!this.check(TokenType::RParen)) {
                 while (true) {
-                    const arg: ExpressionNode* = this.parse_expression();
+                    const arg: mut ExpressionNode* = this.parse_expression();
                     if (arg != null) {
                         ExpressionNode::call_of(call).add_argument(arg);
                     }
@@ -1287,13 +1287,13 @@ implement struct Parser {
 
     /// What may follow a name, with or without generic arguments: a scope
     /// step `Name::member` and a struct literal `Name { field: value }`.
-    parse_identifier_tail(mut &this, expr_in: ExpressionNode*, name: SymbolStr, tok: Token) -> ExpressionNode* {
-        mut expr: ExpressionNode* = expr_in;
+    parse_identifier_tail(mut &this, expr_in: mut ExpressionNode*, name: SymbolStr, tok: Token) -> mut ExpressionNode* {
+        mut expr: mut ExpressionNode* = expr_in;
 
         // Check for scope resolution without generic args: Name::member
         if (this.check(TokenType::ColonColon)) {
             this.advance(); // consume '::'
-            const no_gen_args: [TypeAnnotation*] = [];
+            const no_gen_args: [mut TypeAnnotation*] = [];
             expr = this.parse_scope_member(name, no_gen_args, this.span_from_token(tok));
         }
 
@@ -1311,7 +1311,7 @@ implement struct Parser {
         // modules (member generic args carry through for `Module::Type<T> {}`).
         if (this.check(TokenType::LBrace) && !this.struct_lit_suppressed() && this.is_struct_literal_ahead()) {
             mut lit_name: SymbolStr = name;
-            mut lit_gen: [TypeAnnotation*] = [];
+            mut lit_gen: [mut TypeAnnotation*] = [];
             const sr: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(expr);
             if (sr != null) {
                 const scope_s: string  = this.ctx.intern_table.resolve(sr.scope_name);
@@ -1360,9 +1360,9 @@ implement struct Parser {
     }
 
     /// Parse the body of a struct literal after the name and optional generic args.
-    parse_struct_literal_body(mut &this, name: SymbolStr, gen_args: [TypeAnnotation*], start: Token) -> ExpressionNode* {
-        mut lit_e: ExpressionNode* = ExpressionNode::struct_expr(name, this.span_from_token(start));
-        mut lit: StructExpr* = ExpressionNode::struct_of(lit_e);
+    parse_struct_literal_body(mut &this, name: SymbolStr, gen_args: [mut TypeAnnotation*], start: Token) -> mut ExpressionNode* {
+        mut lit_e: mut ExpressionNode* = ExpressionNode::struct_expr(name, this.span_from_token(start));
+        mut lit: mut StructExpr* = ExpressionNode::struct_of(lit_e);
         if (gen_args.length() > 0) {
             lit.set_generic_args(gen_args);
         }
@@ -1384,7 +1384,7 @@ implement struct Parser {
             const field_name: SymbolStr = this.intern_lexeme(field_tok);
 
             // Shorthand field init: { field } is sugar for { field: field }
-            mut value: ExpressionNode* = null;
+            mut value: mut ExpressionNode* = null;
             if (this.check(TokenType::Colon)) {
                 this.advance(); // consume ':'
                 value = this.parse_expression();
@@ -1414,7 +1414,7 @@ implement struct Parser {
     }
 
     /// Parse parenthesized expression, tuple literal, or lambda.
-    parse_paren_expr_or_lambda(mut &this) -> ExpressionNode* {
+    parse_paren_expr_or_lambda(mut &this) -> mut ExpressionNode* {
         // Guard against unbounded recursion on pathological input like
         // `((((((...))))))`: each nested group recurses through
         // parse_expression, and a few thousand levels overflow the native
@@ -1464,7 +1464,7 @@ implement struct Parser {
         }
 
         // Parse as expression (possibly tuple)
-        const first: ExpressionNode* = this.parse_expression();
+        const first: mut ExpressionNode* = this.parse_expression();
         if (first == null) {
             this.consume(TokenType::RParen, "')'");
             return null;
@@ -1472,12 +1472,12 @@ implement struct Parser {
 
         // Check for tuple: (expr, expr, ...)
         if (this.check(TokenType::Comma)) {
-            mut tup_e: ExpressionNode* = ExpressionNode::tuple_expr(this.span_from_token(start));
-            mut tup: TupleExpr* = ExpressionNode::tuple_of(tup_e);
+            mut tup_e: mut ExpressionNode* = ExpressionNode::tuple_expr(this.span_from_token(start));
+            mut tup: mut TupleExpr* = ExpressionNode::tuple_of(tup_e);
             tup.add_element(first);
             while (this.match_tok(TokenType::Comma)) {
                 if (this.check(TokenType::RParen)) { break; }
-                const elem: ExpressionNode* = this.parse_expression();
+                const elem: mut ExpressionNode* = this.parse_expression();
                 if (elem != null) {
                     tup.add_element(elem);
                 }
@@ -1555,7 +1555,7 @@ implement struct Parser {
     /// name, a type by name with arguments or a primitive, as an impl head's
     /// target is, and the trait is a name with arguments as an impl head's
     /// trait is.
-    parse_impl_qualified_path(mut &this, start: Token) -> ExpressionNode* {
+    parse_impl_qualified_path(mut &this, start: Token) -> mut ExpressionNode* {
         const trait_ann: TypeAnnotation* = this.parse_type_annotation();
         this.consume(TokenType::KwFor, "'for'");
         const target_ann: TypeAnnotation* = this.parse_type_annotation();
@@ -1581,7 +1581,7 @@ implement struct Parser {
         }
 
         mut scope_name: SymbolStr = SymbolStr::empty();
-        mut scope_args: [TypeAnnotation*] = [];
+        mut scope_args: [mut TypeAnnotation*] = [];
         match (*target_ann) {
             TypeAnnotation::Named(n)     => { scope_name = n.name; }
             TypeAnnotation::Primitive(p) => { scope_name = p.name; }
@@ -1612,7 +1612,7 @@ implement struct Parser {
             return null;
         }
         this.advance(); // consume '::'
-        const sr: ExpressionNode* = this.parse_scope_member(scope_name, scope_args, head_span);
+        const sr: mut ExpressionNode* = this.parse_scope_member(scope_name, scope_args, head_span);
         ExpressionNode::scope_resolution_of(sr).set_impl_trait(trait_ann);
         return sr;
     }
@@ -1621,13 +1621,13 @@ implement struct Parser {
     /// Lambdas accept a stripped-down parameter form: `name` or `name: Type`,
     /// without `mut`, default values, or variadics, all of which
     /// `parse_parameter_list` accepts.
-    parse_lambda_expression(mut &this, start: Token) -> ExpressionNode* {
+    parse_lambda_expression(mut &this, start: Token) -> mut ExpressionNode* {
         mut params: [DeclarationNode*] = [];
         mut reported_untyped: boolean = false;
         while (!this.check(TokenType::RParen) && !this.is_at_end()) {
             const name_tok: Token = this.consume(TokenType::Identifier, "parameter name");
             const pname: SymbolStr = this.intern_lexeme(name_tok);
-            mut param: VarDecl* = VarDecl::new(pname);
+            mut param: mut VarDecl* = VarDecl::new(pname);
             const param_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(param), this.span_from_token(name_tok));
 
             if (this.match_tok(TokenType::Colon)) {
@@ -1666,11 +1666,11 @@ implement struct Parser {
     ///   () -> T { return value; }   (block body)
     ///   () -> T expr                (expression body)
     ///   (x: A) -> C { ... }         (block body with params)
-    parse_lambda_after_params(mut &this, params: [DeclarationNode*], start: Token) -> ExpressionNode* {
+    parse_lambda_after_params(mut &this, params: [DeclarationNode*], start: Token) -> mut ExpressionNode* {
         this.consume(TokenType::Arrow, "'->'");
 
-        mut lambda_e: ExpressionNode* = ExpressionNode::lambda_expr(this.span_from_token(start));
-        mut lambda: LambdaExpr* = ExpressionNode::lambda_of(lambda_e);
+        mut lambda_e: mut ExpressionNode* = ExpressionNode::lambda_expr(this.span_from_token(start));
+        mut lambda: mut LambdaExpr* = ExpressionNode::lambda_of(lambda_e);
         for (mut i: i64 = 0; i < params.length(); i++) {
             lambda.add_parameter(params[i]);
         }
@@ -1703,7 +1703,7 @@ implement struct Parser {
             // Consume the candidate expression so we don't cascade into a
             // parse-recovery storm.  Wrap it as a discarded statement; the
             // E0108 above is the user-facing error.
-            const body_expr: ExpressionNode* = this.parse_expression();
+            const body_expr: mut ExpressionNode* = this.parse_expression();
             if (body_expr != null) {
                 const expr_stmt: Stmt* = Stmt::expr_stmt(body_expr, body_expr.span);
                 const block: Stmt* = Stmt::block(body_expr.span);
@@ -1717,7 +1717,7 @@ implement struct Parser {
     }
 
     /// Parse an array literal: [ expr, expr, ... ]
-    parse_array_literal(mut &this) -> ExpressionNode* {
+    parse_array_literal(mut &this) -> mut ExpressionNode* {
         // BRACKET_DEPTH_LIMIT: nested array literals (`[[[...]]]`) recurse
         // through parse_expression for each element, overflowing the native
         // stack (SIGSEGV) on pathological depth. `bracket_depth` is maintained
@@ -1729,11 +1729,11 @@ implement struct Parser {
             return null;
         }
         const start: Token = this.advance(); // consume '['
-        mut arr_e: ExpressionNode* = ExpressionNode::array_expr(this.span_from_token(start));
-        mut arr: ArrayExpr* = ExpressionNode::array_of(arr_e);
+        mut arr_e: mut ExpressionNode* = ExpressionNode::array_expr(this.span_from_token(start));
+        mut arr: mut ArrayExpr* = ExpressionNode::array_of(arr_e);
 
         if (!this.check(TokenType::RSquare)) {
-            const first: ExpressionNode* = this.parse_expression();
+            const first: mut ExpressionNode* = this.parse_expression();
             if (first != null) {
                 arr.add_element(first);
 
@@ -1748,7 +1748,7 @@ implement struct Parser {
                     // Regular array: [a, b, c]
                     while (this.match_tok(TokenType::Comma)) {
                         if (this.check(TokenType::RSquare)) { break; }
-                        const elem: ExpressionNode* = this.parse_expression();
+                        const elem: mut ExpressionNode* = this.parse_expression();
                         if (elem != null) {
                             arr.add_element(elem);
                         }
@@ -1779,7 +1779,7 @@ implement struct Parser {
         return out;
     }
 
-    parse_new_expression(mut &this) -> ExpressionNode* {
+    parse_new_expression(mut &this) -> mut ExpressionNode* {
         const start: Token = this.advance(); // consume 'new'
         // The target type is usually a user-defined name (Identifier), but
         // `new T[n]` array allocation also accepts a primitive element type
@@ -1802,8 +1802,8 @@ implement struct Parser {
         mut path: string = type_tok.lexeme;
         path = this.append_path_segments(path);
         mut type_name: SymbolStr = this.ctx.intern(path);
-        mut new_e: ExpressionNode* = ExpressionNode::new_expr(type_name, this.span_from_token(start));
-        mut node: NewExpr* = ExpressionNode::new_of(new_e);
+        mut new_e: mut ExpressionNode* = ExpressionNode::new_expr(type_name, this.span_from_token(start));
+        mut node: mut NewExpr* = ExpressionNode::new_of(new_e);
 
         // Optional generic args on the type: `new Type<T>(...)`.  The operand
         // of `new` is a type, so a `<` here is never a comparison.
@@ -1811,7 +1811,7 @@ implement struct Parser {
         // unconditionally here and never read afterwards, so a branch-local
         // binding leaves nothing conditionally moved past the if.
         if (this.check(TokenType::LAngle)) {
-            const scope_gen_args: [TypeAnnotation*] = this.parse_generic_args();
+            const scope_gen_args: [mut TypeAnnotation*] = this.parse_generic_args();
             node.set_generic_args(scope_gen_args);
         }
 
@@ -1829,7 +1829,7 @@ implement struct Parser {
             this.advance();
             if (!this.check(TokenType::RParen)) {
                 while (true) {
-                    const arg: ExpressionNode* = this.parse_expression();
+                    const arg: mut ExpressionNode* = this.parse_expression();
                     if (arg != null) {
                         node.add_argument(arg);
                     }
@@ -1847,7 +1847,7 @@ implement struct Parser {
             // (drop frees each node, like `ASTCloner::clone_type_annotations`),
             // so the struct literal must get its own cloned nodes - a shallow
             // pointer copy would let both arrays free the same nodes.
-            mut gen: [TypeAnnotation*] = [];
+            mut gen: [mut TypeAnnotation*] = [];
             for (mut gi: i64 = 0; gi < node.generic_args.length(); gi++) { gen.push(TypeAnnotation::clone_ptr(node.generic_args[gi])); }
             node.struct_init = this.parse_struct_literal_body(type_name, gen, start);
             new_e.span = this.span_from_token(start);
@@ -1868,50 +1868,50 @@ implement struct Parser {
 
     /// Parse sizeof(Type): supports qualified names and generic args.
     /// sizeof(Foo), sizeof(Foo::Bar), sizeof(RcControlBlock<T>)
-    parse_sizeof_expression(mut &this) -> ExpressionNode* {
+    parse_sizeof_expression(mut &this) -> mut ExpressionNode* {
         const start: Token = this.advance(); // consume 'sizeof'
         this.consume(TokenType::LParen, "'('");
-        const ann: TypeAnnotation* = this.parse_type_annotation();
+        const ann: mut TypeAnnotation* = this.parse_type_annotation();
         this.consume(TokenType::RParen, "')'");
         return ExpressionNode::sizeof_expr(ann, this.span_from(start));
     }
 
     /// Parse alignof(Type): supports qualified names and generic args.
-    parse_alignof_expression(mut &this) -> ExpressionNode* {
+    parse_alignof_expression(mut &this) -> mut ExpressionNode* {
         const start: Token = this.advance(); // consume 'alignof'
         this.consume(TokenType::LParen, "'('");
-        const ann: TypeAnnotation* = this.parse_type_annotation();
+        const ann: mut TypeAnnotation* = this.parse_type_annotation();
         this.consume(TokenType::RParen, "')'");
         return ExpressionNode::alignof_expr(ann, this.span_from(start));
     }
 
     /// Parse typeof(expr)
-    parse_typeof_expression(mut &this) -> ExpressionNode* {
+    parse_typeof_expression(mut &this) -> mut ExpressionNode* {
         const start: Token = this.advance(); // consume 'typeof'
         this.consume(TokenType::LParen, "'('");
-        const operand: ExpressionNode* = this.parse_expression();
+        const operand: mut ExpressionNode* = this.parse_expression();
         this.consume(TokenType::RParen, "')'");
         return ExpressionNode::typeof_expr(operand, this.span_from(start));
     }
 
     /// Parse delete expr
-    parse_delete_expression(mut &this) -> ExpressionNode* {
+    parse_delete_expression(mut &this) -> mut ExpressionNode* {
         const start: Token = this.advance(); // consume 'delete'
-        const operand: ExpressionNode* = this.parse_unary();
+        const operand: mut ExpressionNode* = this.parse_unary();
         return ExpressionNode::delete_expr(operand, this.span_from(start));
     }
 
     /// Parse await expr
-    parse_await_expression(mut &this) -> ExpressionNode* {
+    parse_await_expression(mut &this) -> mut ExpressionNode* {
         const start: Token = this.advance(); // consume 'await'
-        const operand: ExpressionNode* = this.parse_unary();
+        const operand: mut ExpressionNode* = this.parse_unary();
         return ExpressionNode::await_expr(operand, this.span_from(start));
     }
 
     /// Parse yield [expr]: value is optional (bare yield)
-    parse_yield_expression(mut &this) -> ExpressionNode* {
+    parse_yield_expression(mut &this) -> mut ExpressionNode* {
         const start: Token = this.advance(); // consume 'yield'
-        mut operand: ExpressionNode* = null;
+        mut operand: mut ExpressionNode* = null;
         // yield without value if followed by ; or }
         if (!this.check(TokenType::Semicolon) && !this.check(TokenType::RBrace)) {
             operand = this.parse_expression();
@@ -1926,10 +1926,10 @@ implement struct Parser {
     ///                         condition's own bracketing depth is suppressed so
     ///                         the following `{` is unambiguously the body; wrap
     ///                         a genuine struct-valued condition in `()`.
-    parse_paren_condition(mut &this) -> ExpressionNode* {
+    parse_paren_condition(mut &this) -> mut ExpressionNode* {
         if (this.check(TokenType::LParen)) {
             this.consume(TokenType::LParen, "'('");
-            const expr: ExpressionNode* = this.parse_expression();
+            const expr: mut ExpressionNode* = this.parse_expression();
             this.consume(TokenType::RParen, "')'");
             return expr;
         }
@@ -1939,26 +1939,26 @@ implement struct Parser {
     /// Parse a full expression with bare struct literals suppressed at the
     /// current bracketing depth (see `struct_lit_suppressed`).  Used for the
     /// paren-less forms of `if`/`while`/`for`/`match` conditions.
-    parse_expr_no_struct_lit(mut &this) -> ExpressionNode* {
+    parse_expr_no_struct_lit(mut &this) -> mut ExpressionNode* {
         const saved: int = this.no_struct_lit_depth;
         this.no_struct_lit_depth = this.paren_depth + this.bracket_depth;
-        const expr: ExpressionNode* = this.parse_expression();
+        const expr: mut ExpressionNode* = this.parse_expression();
         this.no_struct_lit_depth = saved;
         return expr;
     }
 
     /// Parse if expression: if (cond) { then } else { else }
-    parse_if_expression(mut &this) -> ExpressionNode* {
+    parse_if_expression(mut &this) -> mut ExpressionNode* {
         const start: Token = this.advance(); // consume 'if'
-        const condition: ExpressionNode* = this.parse_paren_condition();
+        const condition: mut ExpressionNode* = this.parse_paren_condition();
 
         // Then branch: expect a block with a single expression
         this.consume(TokenType::LBrace, "'{'");
-        const then_expr: ExpressionNode* = this.parse_expression();
+        const then_expr: mut ExpressionNode* = this.parse_expression();
         this.consume(TokenType::RBrace, "'}'");
 
         // Else branch
-        mut else_expr: ExpressionNode* = null;
+        mut else_expr: mut ExpressionNode* = null;
         if (this.match_tok(TokenType::KwElse)) {
             this.consume(TokenType::LBrace, "'{'");
             else_expr = this.parse_expression();
@@ -1970,17 +1970,17 @@ implement struct Parser {
     }
 
     /// Parse match expression: match (subject) { arms }
-    parse_match_expression(mut &this) -> ExpressionNode* {
+    parse_match_expression(mut &this) -> mut ExpressionNode* {
         const start: Token = this.advance(); // consume 'match'
-        const subject: ExpressionNode* = this.parse_paren_condition();
+        const subject: mut ExpressionNode* = this.parse_paren_condition();
         this.consume(TokenType::LBrace, "'{'");
 
-        mut match_expr: ExpressionNode* = ExpressionNode::match_expr(subject, this.span_from_token(start));
-        mut payload: MatchExpr* = ExpressionNode::match_of(match_expr);
+        mut match_expr: mut ExpressionNode* = ExpressionNode::match_expr(subject, this.span_from_token(start));
+        mut payload: mut MatchExpr* = ExpressionNode::match_of(match_expr);
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
             const before_pos: i64 = this.pos;
-            const arm: MatchArmNode* = this.parse_expr_match_arm();
+            const arm: mut MatchArmNode* = this.parse_expr_match_arm();
             if (arm != null) {
                 payload.add_arm(arm);
             }
@@ -2004,21 +2004,21 @@ implement struct Parser {
     /// The scrutinee and each arm's left-hand side are TYPE annotations
     /// (commonly the generic parameter `T`); a `_` arm is the wildcard
     /// default. Arm bodies parse exactly like regular match-expression arms.
-    parse_static_match_expression(mut &this) -> ExpressionNode* {
+    parse_static_match_expression(mut &this) -> mut ExpressionNode* {
         const start: Token = this.advance(); // consume 'static'
         this.advance();                      // consume 'match'
         this.consume(TokenType::LParen, "'('");
-        const scrutinee: TypeAnnotation* = this.parse_type_annotation();
+        const scrutinee: mut TypeAnnotation* = this.parse_type_annotation();
         this.consume(TokenType::RParen, "')'");
         this.consume(TokenType::LBrace, "'{'");
 
-        mut sm: ExpressionNode* = ExpressionNode::static_match_expr(
+        mut sm: mut ExpressionNode* = ExpressionNode::static_match_expr(
             scrutinee, this.span_from_token(start));
-        mut payload: StaticMatchExpr* = ExpressionNode::static_match_of(sm);
+        mut payload: mut StaticMatchExpr* = ExpressionNode::static_match_of(sm);
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
             const before_pos: i64 = this.pos;
-            const arm: StaticMatchArmNode* = this.parse_static_match_arm();
+            const arm: mut StaticMatchArmNode* = this.parse_static_match_arm();
             if (arm != null) {
                 payload.add_arm(arm);
             }
@@ -2039,9 +2039,9 @@ implement struct Parser {
     /// `_ => body`. A `_` leaves `type_patterns` empty (wildcard). Body is a
     /// block or a single expression wrapped in a block, mirroring
     /// parse_expr_match_arm.
-    parse_static_match_arm(mut &this) -> StaticMatchArmNode* {
+    parse_static_match_arm(mut &this) -> mut StaticMatchArmNode* {
         const start: Token = this.current();
-        mut arm: StaticMatchArmNode* = StaticMatchArmNode::new(
+        mut arm: mut StaticMatchArmNode* = StaticMatchArmNode::new(
             this.span_from_token(start));
 
         if (this.check(TokenType::Identifier) && this.current().lexeme == "_") {
@@ -2051,7 +2051,7 @@ implement struct Parser {
             // `u8 | u16 | u32 => { ... }` matches if the scrutinee equals ANY of
             // the listed types (same `|` alternation as a regular match arm).
             while (true) {
-                const ty: TypeAnnotation* = this.parse_type_annotation();
+                const ty: mut TypeAnnotation* = this.parse_type_annotation();
                 if (ty != null) { arm.add_type_pattern(ty); }
                 if (!this.match_tok(TokenType::Pipe)) { break; }
             }
@@ -2063,7 +2063,7 @@ implement struct Parser {
             const block: Stmt* = this.parse_inner_block();
             arm.set_body(block);
         } else {
-            const body_expr: ExpressionNode* = this.parse_expression();
+            const body_expr: mut ExpressionNode* = this.parse_expression();
             if (body_expr != null) {
                 const stmt: Stmt* = Stmt::expr_stmt(body_expr, body_expr.span);
                 const block: Stmt* = Stmt::block(body_expr.span);
@@ -2079,13 +2079,13 @@ implement struct Parser {
     /// Parse match arm patterns and the '=>' arrow.
     /// Returns a MatchArmNode with patterns set but body NOT set.
     /// Shared between expression match and statement match.
-    parse_match_arm_patterns(mut &this) -> MatchArmNode* {
+    parse_match_arm_patterns(mut &this) -> mut MatchArmNode* {
         const start: Token = this.current();
-        mut arm: MatchArmNode* = MatchArmNode::new(this.span_from_token(start));
+        mut arm: mut MatchArmNode* = MatchArmNode::new(this.span_from_token(start));
 
         // Parse pattern(s) separated by |
         while (true) {
-            const pat: Pattern* = this.parse_pattern_internal();
+            const pat: mut Pattern* = this.parse_pattern_internal();
             if (pat != null) {
                 arm.add_pattern(pat);
             }
@@ -2113,9 +2113,9 @@ implement struct Parser {
     /// Uses shared parse_match_arm_patterns() for pattern + '=>', then
     /// handles the body as a single expression (possibly braced).
     /// See also: Parser::parse_match_arm() for statement context.
-    parse_expr_match_arm(mut &this) -> MatchArmNode* {
+    parse_expr_match_arm(mut &this) -> mut MatchArmNode* {
         const start: Token = this.current();
-        mut arm: MatchArmNode* = this.parse_match_arm_patterns();
+        mut arm: mut MatchArmNode* = this.parse_match_arm_patterns();
 
         // Body is either a block, which may hold any statement, or a single
         // expression.
@@ -2124,7 +2124,7 @@ implement struct Parser {
             this.promote_value_block_tail(block);
             arm.set_body(block);
         } else {
-            const body_expr: ExpressionNode* = this.parse_expression();
+            const body_expr: mut ExpressionNode* = this.parse_expression();
             if (body_expr != null) {
                 const stmt: Stmt* = Stmt::expr_stmt(body_expr, body_expr.span);
                 const block: Stmt* = Stmt::block(body_expr.span);
@@ -2175,10 +2175,10 @@ implement struct Parser {
     /// across by pointer and keep their bindings, guards and bodies (and
     /// their identity, which later passes rely on).
     match_stmt_as_expr(&this, s: Stmt*, ms: MatchStmt*) -> Stmt* {
-        const me_node: ExpressionNode* = ExpressionNode::match_expr(ms.subject, s.span);
-        mut me: MatchExpr* = ExpressionNode::match_of(me_node);
+        const me_node: mut ExpressionNode* = ExpressionNode::match_expr(ms.subject, s.span);
+        mut me: mut MatchExpr* = ExpressionNode::match_of(me_node);
         for (mut i: i64 = 0; i < ms.arms.length(); i++) {
-            const a: MatchArmNode* = ms.arms[i];
+            const a: mut MatchArmNode* = ms.arms[i];
             // These arms were parsed in STATEMENT context, so their own bodies
             // were never treated as value blocks.  Promoting this node makes
             // them value blocks, so their tails need the same treatment — which
@@ -2195,7 +2195,7 @@ implement struct Parser {
 
 
     /// Parse a pattern (internal, used by match expressions and statements).
-    parse_pattern_internal(mut &this) -> Pattern* {
+    parse_pattern_internal(mut &this) -> mut Pattern* {
         const start: Token = this.current();
 
         // Wildcard: _
@@ -2272,7 +2272,7 @@ implement struct Parser {
     /// the same kind: the two bounds share a single `literal_kind`, so a
     /// mixed `'a'..9` would make codegen decode one end with the wrong
     /// reader.  Such cases are rejected here rather than silently miscompiled.
-    finish_range_pattern(mut &this, pat: Pattern*) -> Pattern* {
+    finish_range_pattern(mut &this, pat: mut Pattern*) -> mut Pattern* {
         if (!this.check(TokenType::DotDot)
             && !this.check(TokenType::DotDotEq)) { return pat; }
 
@@ -2335,7 +2335,7 @@ implement struct Parser {
     /// final identifier becomes the variant name.  The match-arm consumer
     /// (sema) only needs the enum's resolved type; the joined string is
     /// purely for diagnostics.
-    parse_enum_pattern_internal(mut &this) -> Pattern* {
+    parse_enum_pattern_internal(mut &this) -> mut Pattern* {
         const start: Token = this.current();
         const first_tok: Token = this.advance(); // first identifier
         this.consume(TokenType::ColonColon, "'::'");
@@ -2357,9 +2357,9 @@ implement struct Parser {
             variant_tok = this.consume(TokenType::Identifier, "variant name");
         }
 
-        mut node: Pattern* = Pattern::enum_variant(
+        mut node: mut Pattern* = Pattern::enum_variant(
             this.ctx.intern(enum_path), this.intern_lexeme(variant_tok), this.span_from_token(start));
-        mut pat: EnumPattern* = node.enum_payload();
+        mut pat: mut EnumPattern* = node.enum_payload();
         pat.set_segment_spans(
             Parser::merge_spans(this.span_from_token(first_tok),
                                     this.span_from_token(path_end_tok)),
@@ -2387,7 +2387,7 @@ implement struct Parser {
                     // `Branch(Leaf(x), r)`. A qualified `Ident::...` element is
                     // itself a path pattern; recurse and store it as a Sub
                     // element (sema/codegen destructure it level by level).
-                    const sub: Pattern* = this.parse_enum_pattern_internal();
+                    const sub: mut Pattern* = this.parse_enum_pattern_internal();
                     const ps: PatternSub* = new PatternSub {
                         pattern: sub,
                         span:    sub.span,
@@ -2445,7 +2445,7 @@ implement struct Parser {
     // Postfix Helpers
 
     /// Parse function call arguments: callee(arg1, arg2, ...)
-    parse_call_args(mut &this, callee: ExpressionNode*) -> ExpressionNode* {
+    parse_call_args(mut &this, callee: mut ExpressionNode*) -> ExpressionNode* {
         // PAREN_DEPTH_LIMIT: nested calls (`f(f(f(...)))`) recurse through
         // parse_expression for each argument, overflowing the native stack
         // (SIGSEGV) on pathological depth. `paren_depth` is maintained by
@@ -2457,7 +2457,7 @@ implement struct Parser {
             return null;
         }
         this.advance(); // consume '('
-        mut call: ExpressionNode* = ExpressionNode::call_expr(callee, callee.span);
+        mut call: mut ExpressionNode* = ExpressionNode::call_expr(callee, callee.span);
 
         // If the callee is a member access whose name carried explicit type
         // arguments (`obj.method<T>`), promote those onto the call so the
@@ -2469,7 +2469,7 @@ implement struct Parser {
                 // array, and `TypeAnnotation*[]` owns its pointees, so the call
                 // node and the member-access node must each get their own cloned
                 // nodes - a shallow pointer copy double-frees the shared nodes.
-                mut ga_copy: [TypeAnnotation*] = [];
+                mut ga_copy: [mut TypeAnnotation*] = [];
                 for (mut gi: i64 = 0; gi < ma.generic_args.length(); gi++) { ga_copy.push(TypeAnnotation::clone_ptr(ma.generic_args[gi])); }
                 ExpressionNode::call_of(call).set_generic_args(ga_copy);
             }
@@ -2477,7 +2477,7 @@ implement struct Parser {
 
         if (!this.check(TokenType::RParen)) {
             while (true) {
-                const arg: ExpressionNode* = this.parse_expression();
+                const arg: mut ExpressionNode* = this.parse_expression();
                 if (arg != null) {
                     ExpressionNode::call_of(call).add_argument(arg);
                 }
@@ -2493,7 +2493,7 @@ implement struct Parser {
     }
 
     /// Parse array access: array[index]
-    parse_array_access_expr(mut &this, array: ExpressionNode*) -> ExpressionNode* {
+    parse_array_access_expr(mut &this, array: mut ExpressionNode*) -> ExpressionNode* {
         // BRACKET_DEPTH_LIMIT: nested index expressions (`a[a[a[...]]]`)
         // recurse through parse_expression for the index, overflowing the
         // native stack (SIGSEGV) on pathological depth. `bracket_depth` is
@@ -2506,14 +2506,14 @@ implement struct Parser {
             return null;
         }
         this.advance(); // consume '['
-        const index: ExpressionNode* = this.parse_expression();
+        const index: mut ExpressionNode* = this.parse_expression();
         const end: Token = this.consume(TokenType::RSquare, "']'");
         const span: SourceSpan = Parser::merge_spans(array.span, this.span_from_token(end));
         return ExpressionNode::array_access_expr(array, index, span);
     }
 
     /// Parse member access: object.member or object.method<T, U>
-    parse_member_access_expr(mut &this, object: ExpressionNode*) -> ExpressionNode* {
+    parse_member_access_expr(mut &this, object: mut ExpressionNode*) -> ExpressionNode* {
         this.advance(); // consume '.'
         // Tuple field access: `t.0`, `t.1`, etc. Accept a numeric constant
         // as the member name. The lexeme ("0", "1", ...) is interned as a
@@ -2553,7 +2553,7 @@ implement struct Parser {
                 const tok_span: SourceSpan = this.span_from_token(member_tok);
                 const inner_span: SourceSpan = Parser::merge_spans(
                     object.span, tok_span);
-                const inner: ExpressionNode* = ExpressionNode::member_access_expr(
+                const inner: mut ExpressionNode* = ExpressionNode::member_access_expr(
                     object, first_sym, tok_span, inner_span);
                 return ExpressionNode::member_access_expr(inner, rest_sym, tok_span, inner_span);
             }
@@ -2567,7 +2567,7 @@ implement struct Parser {
         // Explicit type arguments on the member: `obj.method::<T, U>(...)`.
         if (this.at_turbofish()) {
             this.advance(); // consume '::'
-            const member_gen_args: [TypeAnnotation*] = this.parse_generic_args();
+            const member_gen_args: [mut TypeAnnotation*] = this.parse_generic_args();
             ExpressionNode::member_access_of(node).set_generic_args(member_gen_args);
         }
 
@@ -2582,7 +2582,7 @@ implement struct Parser {
     /// `scope_name`       - the left-hand identifier (e.g. "Foo" in Foo::bar)
     /// `scope_gen_args`   - generic args on the scope (e.g. <T> in Foo<T>::bar), empty if none
     /// `start_span`       - span of the left-hand side (for merged span)
-    parse_scope_member(mut &this, scope_name: SymbolStr, scope_gen_args: [TypeAnnotation*], start_span: SourceSpan) -> ExpressionNode* {
+    parse_scope_member(mut &this, scope_name: SymbolStr, scope_gen_args: [mut TypeAnnotation*], start_span: SourceSpan) -> mut ExpressionNode* {
         // Accept identifiers and any keyword as member names after '::'.
         // Keywords like `new`, `default`, `function`, `optional`, `type`
         // can all be used as static method / variant names.
@@ -2595,8 +2595,8 @@ implement struct Parser {
         const member_name: SymbolStr = this.intern_lexeme(member_tok);
         const member_span: SourceSpan = this.span_from_token(member_tok);
         const span: SourceSpan = Parser::merge_spans(start_span, member_span);
-        const sr_e: ExpressionNode* = ExpressionNode::scope_resolution_expr(scope_name, member_name, span);
-        mut sr: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(sr_e);
+        const sr_e: mut ExpressionNode* = ExpressionNode::scope_resolution_expr(scope_name, member_name, span);
+        mut sr: mut ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(sr_e);
         // Record the scope/member token spans separately so LSP hover can
         // resolve each side of `Scope::member` independently.
         sr.set_segment_spans(start_span, member_span);
@@ -2609,7 +2609,7 @@ implement struct Parser {
         // Generic args on the member itself: `Foo::bar::<U>`.
         if (this.at_turbofish()) {
             this.advance(); // consume '::'
-            const member_gen_args: [TypeAnnotation*] = this.parse_generic_args();
+            const member_gen_args: [mut TypeAnnotation*] = this.parse_generic_args();
             sr.set_generic_args(member_gen_args);
         }
 
@@ -2656,8 +2656,8 @@ implement struct Parser {
     /// Parse generic type arguments: <T1, T2*, Array<int>, ...>
     /// Returns structured TypeAnnotation nodes, preserving pointer, array,
     /// optional, and nested generic structure.
-    parse_generic_args(mut &this) -> [TypeAnnotation*] {
-        mut args: [TypeAnnotation*] = [];
+    parse_generic_args(mut &this) -> [mut TypeAnnotation*] {
+        mut args: [mut TypeAnnotation*] = [];
         this.advance(); // consume '<'
 
         while (!this.check(TokenType::RAngle) &&
@@ -2686,7 +2686,7 @@ implement struct Parser {
                 this.skip_past_generic_args();
                 return args;
             }
-            const ann: TypeAnnotation* = this.parse_type_annotation();
+            const ann: mut TypeAnnotation* = this.parse_type_annotation();
             if (ann != null) {
                 args.push(ann);
             } else {
@@ -2724,7 +2724,7 @@ implement struct Parser {
     // Type Annotation Parsing
 
     /// Parse a full type annotation.
-    parse_type_annotation(mut &this) -> TypeAnnotation* {
+    parse_type_annotation(mut &this) -> mut TypeAnnotation* {
         // TYPE_DEPTH_LIMIT: every nested type form (&T, Option<T>, (T), T?)
         // recurses through here, and `&`/`?` nesting has no bracketing token
         // for advance() to count, so `&&&&...T` / `Option<Option<...>>` /
@@ -2736,12 +2736,12 @@ implement struct Parser {
             return null;
         }
         this.type_depth += 1;
-        const result: TypeAnnotation* = this.parse_type_annotation_inner();
+        const result: mut TypeAnnotation* = this.parse_type_annotation_inner();
         this.type_depth -= 1;
         return result;
     }
 
-    parse_type_annotation_inner(mut &this) -> TypeAnnotation* {
+    parse_type_annotation_inner(mut &this) -> mut TypeAnnotation* {
         // Reference types: &T, &mut T, or the alternate `mut &T` form
         // (mut before ampersand) used by stdlib-next.
         if (this.check(TokenType::Amp)) {
@@ -2759,7 +2759,7 @@ implement struct Parser {
         // `(&T)?`.
         if (this.check(TokenType::LParen)) {
             const open: Token = this.current();
-            const group: TypeAnnotation* = this.parse_paren_type();
+            const group: mut TypeAnnotation* = this.parse_paren_type();
             if (group == null) { return null; }
             return this.parse_type_suffixes(group, open);
         }
@@ -2768,7 +2768,7 @@ implement struct Parser {
         // to the whole array: `[T]*`, `[T]?`.
         if (this.check(TokenType::LSquare)) {
             const open_sq: Token = this.current();
-            const arr: TypeAnnotation* = this.parse_bracket_array_type();
+            const arr: mut TypeAnnotation* = this.parse_bracket_array_type();
             if (arr == null) { return null; }
             return this.parse_type_suffixes(arr, open_sq);
         }
@@ -2795,8 +2795,9 @@ implement struct Parser {
             return this.parse_reference_type_with_mutability(false);
         }
 
-        // `const T*` and `mut T*`: the keyword marks the pointee read-only
-        // or writable, so it binds to the first pointer suffix
+        // `const T*` and `mut T*`, `T` a named type or an array type
+        // (`[u8]*`): the keyword marks the pointee read-only or
+        // writable, so it binds to the first pointer suffix
         // (`parse_type_suffixes_q` consumes the mark at the nearest `*`). A
         // `const` with no following `*` has no representation on a value
         // type and is dropped, matching C (top-level const on a by-value
@@ -2807,14 +2808,18 @@ implement struct Parser {
             if (this.check(TokenType::LParen)) {
                 return this.parse_marked_pointer_to_group(mark, mark_tok);
             }
-            const marked_base: TypeAnnotation* = this.parse_base_type();
+            const marked_base: mut TypeAnnotation* = if (this.check(TokenType::LSquare)) {
+                this.parse_bracket_array_type()
+            } else {
+                this.parse_base_type()
+            };
             if (marked_base == null) { return null; }
             return this.parse_type_suffixes_q(marked_base, mark, mark_tok);
         }
 
         // Base type + optional suffixes
         const base_tok: Token = this.current();
-        const base: TypeAnnotation* = this.parse_base_type();
+        const base: mut TypeAnnotation* = this.parse_base_type();
         if (base == null) { return null; }
         return this.parse_type_suffixes(base, base_tok);
     }
@@ -2836,8 +2841,8 @@ implement struct Parser {
     /// holds one pointer or borrow type and is itself pointed at; a group of
     /// anything else, or one no `*` follows, is refused, and parsing goes on
     /// with the group as the pointee.
-    parse_marked_pointer_to_group(mut &this, mark: PointerMark, mark_tok: Token) -> TypeAnnotation* {
-        const group: TypeAnnotation* = this.parse_pointee_group(mark);
+    parse_marked_pointer_to_group(mut &this, mark: PointerMark, mark_tok: Token) -> mut TypeAnnotation* {
+        const group: mut TypeAnnotation* = this.parse_pointee_group(mark);
         if (group == null) { return null; }
         if (!this.check(TokenType::Star)) {
             // Refused by the group already; the mark has no pointer to bind.
@@ -2849,10 +2854,10 @@ implement struct Parser {
     /// Parse the group of a `const (P)*` or `mut (P)*`, at its `(`, and
     /// refuse a group that is not one pointer or borrow type, or that no
     /// `*` follows.
-    parse_pointee_group(mut &this, mark: PointerMark) -> TypeAnnotation* {
+    parse_pointee_group(mut &this, mark: PointerMark) -> mut TypeAnnotation* {
         const group_from: i64 = this.pos;
         const open: Token = this.current();
-        const group: TypeAnnotation* = this.parse_paren_type();
+        const group: mut TypeAnnotation* = this.parse_paren_type();
         if (group == null) { return null; }
         const group_text: string = this.tokens_text(group_from, this.last_consumed_index() + 1);
         const grouped_indirection: boolean = match (*group) {
@@ -2887,7 +2892,7 @@ implement struct Parser {
 
     /// Parse a trait object type after its `virtual`: `&Trait`, `mut
     /// &Trait`, or `Trait*`, the trait a base type with its arguments.
-    parse_object_type(mut &this) -> TypeAnnotation* {
+    parse_object_type(mut &this) -> mut TypeAnnotation* {
         const start: Token = this.advance(); // consume `virtual`
         mut form: ObjectForm = ObjectForm::Raw;
         if (this.check(TokenType::KwMut) && this.peek_at(1).kind == TokenType::Amp) {
@@ -2897,7 +2902,7 @@ implement struct Parser {
         } else if (this.match_tok(TokenType::Amp)) {
             form = ObjectForm::Borrowed;
         }
-        const trait_annotation: TypeAnnotation* = this.parse_base_type();
+        const trait_annotation: mut TypeAnnotation* = this.parse_base_type();
         if (trait_annotation == null) { return null; }
         match (form) {
             ObjectForm::Raw => { this.consume(TokenType::Star, "'*'"); }
@@ -2916,12 +2921,12 @@ implement struct Parser {
     /// (`Named` or `Generic`, e.g. `Iterator<i32>`); pointer/array/optional
     /// suffixes are not meaningful on a trait bound, so `parse_base_type` is
     /// used directly rather than `parse_type_annotation`.
-    parse_impl_trait_type(mut &this) -> TypeAnnotation* {
+    parse_impl_trait_type(mut &this) -> mut TypeAnnotation* {
         const start: Token = this.current();
         this.advance(); // consume `implement`
-        mut bounds: [TypeAnnotation*] = [];
+        mut bounds: [mut TypeAnnotation*] = [];
         while (true) {
-            const bound: TypeAnnotation* = this.parse_base_type();
+            const bound: mut TypeAnnotation* = this.parse_base_type();
             if (bound == null) { break; }
             bounds.push(bound);
             if (!this.match_tok(TokenType::Plus)) { break; }
@@ -2951,7 +2956,7 @@ implement struct Parser {
         if (this.check(TokenType::KwThisType)) { return this.parse_base_type(); }
 
         const head_tok: Token = this.consume(TokenType::Identifier, "type parameter");
-        mut base_ann: TypeAnnotation* = new TypeAnnotation::Named(
+        mut base_ann: mut TypeAnnotation* = new TypeAnnotation::Named(
             new NamedAnnotation {
                 name:         this.intern_lexeme(head_tok),
                 span:         this.span_from_token(head_tok),
@@ -2978,7 +2983,7 @@ implement struct Parser {
     }
 
     /// Parse a base type (primitive, `This`, or named).
-    parse_base_type(mut &this) -> TypeAnnotation* {
+    parse_base_type(mut &this) -> mut TypeAnnotation* {
         const tok: Token = this.current();
 
         // Void
@@ -2999,7 +3004,7 @@ implement struct Parser {
         // can't be flattened into an identifier qualified-name like `I::Item`).
         if (tok.kind == TokenType::KwThisType) {
             this.advance();
-            mut base_ann: TypeAnnotation* = new TypeAnnotation::ThisType(
+            mut base_ann: mut TypeAnnotation* = new TypeAnnotation::ThisType(
                 new ThisTypeAnnotation { span: this.span_from_token(tok) }
             );
             while (this.check(TokenType::ColonColon)) {
@@ -3028,7 +3033,7 @@ implement struct Parser {
         if (tok.kind == TokenType::KwTypeof) {
             this.advance();
             this.consume(TokenType::LParen, "'('");
-            const operand: ExpressionNode* = this.parse_expression();
+            const operand: mut ExpressionNode* = this.parse_expression();
             this.consume(TokenType::RParen, "')'");
             const to: TypeofAnnotation* = new TypeofAnnotation {
                 operand:  operand,
@@ -3081,7 +3086,7 @@ implement struct Parser {
             // Generic arguments: `Type<A, B>`.  Type position - a `<` after a
             // type name is never a comparison.
             if (this.check(TokenType::LAngle)) {
-                const base_ann: TypeAnnotation* = new TypeAnnotation::Named(
+                const base_ann: mut TypeAnnotation* = new TypeAnnotation::Named(
                     new NamedAnnotation {
                         name: name,
                         span: path_span,
@@ -3090,7 +3095,7 @@ implement struct Parser {
                     }
                 );
 
-                const type_args: [TypeAnnotation*] = this.parse_generic_args();
+                const type_args: [mut TypeAnnotation*] = this.parse_generic_args();
 
                 const gen_ann: GenericAnnotation* = new GenericAnnotation {
                     base: base_ann,
@@ -3135,7 +3140,7 @@ implement struct Parser {
     /// Parse type suffixes: `*` and `?`.  `start` is the first token of the
     /// type the suffixes apply to (a group's `(`, a `const`); each wrapper's
     /// span runs from it through the suffix's last token.
-    parse_type_suffixes(mut &this, base: TypeAnnotation*, start: Token) -> TypeAnnotation* {
+    parse_type_suffixes(mut &this, base: mut TypeAnnotation*, start: Token) -> mut TypeAnnotation* {
         return this.parse_type_suffixes_q(base, PointerMark::Unmarked, start);
     }
 
@@ -3150,8 +3155,8 @@ implement struct Parser {
     /// run rewritten in brackets as its fix.  The run is still read into the
     /// array it spells, so the declaration around it parses on with no
     /// follow-on error.
-    parse_type_suffixes_q(mut &this, base: TypeAnnotation*, mark: PointerMark, start: Token) -> TypeAnnotation* {
-        mut result: TypeAnnotation* = base;
+    parse_type_suffixes_q(mut &this, base: mut TypeAnnotation*, mark: PointerMark, start: Token) -> mut TypeAnnotation* {
+        mut result: mut TypeAnnotation* = base;
         mut pending: PointerMark = mark;
         // The suffix run rewritten in brackets, once a postfix `[` is read.
         mut postfix_array: boolean = false;
@@ -3210,7 +3215,7 @@ implement struct Parser {
             // any module, exactly as a hand-written `Option<T>` does.
             else if (this.check(TokenType::Question)) {
                 const question: Token = this.advance();
-                const opt_base: TypeAnnotation* = new TypeAnnotation::Named(
+                const opt_base: mut TypeAnnotation* = new TypeAnnotation::Named(
                     new NamedAnnotation {
                         name:         this.ctx.intern("Option"),
                         span:         this.span_from_token(question),
@@ -3218,7 +3223,7 @@ implement struct Parser {
                         res: ResSlot::Pending,
                     }
                 );
-                mut opt_args: [TypeAnnotation*] = [];
+                mut opt_args: [mut TypeAnnotation*] = [];
                 opt_args.push(result);
                 const opt_gen: GenericAnnotation* = new GenericAnnotation {
                     base: opt_base,
@@ -3273,19 +3278,19 @@ implement struct Parser {
     /// `[T, U]` is the removed bracket tuple.  It is reported at its `[` and
     /// read through its `]` as the tuple `(T, U)` it spells, so the
     /// declaration around it parses on with no follow-on error.
-    parse_bracket_array_type(mut &this) -> TypeAnnotation* {
+    parse_bracket_array_type(mut &this) -> mut TypeAnnotation* {
         const open: Token = this.advance(); // consume `[`
-        const element: TypeAnnotation* = this.parse_type_annotation();
+        const element: mut TypeAnnotation* = this.parse_type_annotation();
         if (element == null) { return null; }
         if (this.check(TokenType::Comma)) {
             this.report_invalid_at(ErrorCode::E0104_EXPECTED_TYPE,
                 "bracket tuple types '[T, U]' are no longer supported; use '(T, U)'",
                 this.span_from_token(open));
-            mut elements: [TypeAnnotation*] = [];
+            mut elements: [mut TypeAnnotation*] = [];
             elements.push(element);
             while (this.match_tok(TokenType::Comma)) {
                 if (this.check(TokenType::RSquare)) { break; }
-                const next: TypeAnnotation* = this.parse_type_annotation();
+                const next: mut TypeAnnotation* = this.parse_type_annotation();
                 if (next == null) { return null; }
                 elements.push(next);
             }
@@ -3305,7 +3310,7 @@ implement struct Parser {
 
     /// The heap-backed dynamic array of `element`, its closing `]` consumed;
     /// the span runs from `start`.
-    dynamic_array_type(&this, element: TypeAnnotation*, start: Token) -> TypeAnnotation* {
+    dynamic_array_type(&this, element: mut TypeAnnotation*, start: Token) -> mut TypeAnnotation* {
         const arr_ann: ArrayAnnotation* = new ArrayAnnotation {
             element:   element,
             size:      ArrayAnnotation::heap_dynamic_size(),
@@ -3323,10 +3328,10 @@ implement struct Parser {
     /// bound.  The expression MUST be retained: discarding it leaves the size
     /// permanently unknown, and an array whose size never resolves is emitted
     /// as a descriptor with no storage behind it.
-    finish_fixed_array_type(mut &this, element: TypeAnnotation*, start: Token) -> TypeAnnotation* {
+    finish_fixed_array_type(mut &this, element: mut TypeAnnotation*, start: Token) -> mut TypeAnnotation* {
         const size_tok: Token = this.current();
         mut size: i64 = 0;
-        mut size_expr: ExpressionNode* = null;
+        mut size_expr: mut ExpressionNode* = null;
         if (size_tok.kind == TokenType::NumericConstant && !size_tok.is_float) {
             // A size that needs more than 64 bits would saturate to a
             // meaningless value; reject it up front rather than build a
@@ -3360,7 +3365,7 @@ implement struct Parser {
     /// Parse a reference type: `&T` or `&mut T`. The leading `&` is at
     /// current position; mutability is determined by an optional `mut`
     /// after the ampersand.
-    parse_reference_type(mut &this) -> TypeAnnotation* {
+    parse_reference_type(mut &this) -> mut TypeAnnotation* {
         const start: Token = this.advance(); // consume '&'
         mut is_mutable: boolean = false;
         if (this.check(TokenType::KwMut)) {
@@ -3372,14 +3377,14 @@ implement struct Parser {
 
     /// Parse a reference type when the caller has already consumed a
     /// leading `mut` modifier (the `mut &T` form). Current must be `&`.
-    parse_reference_type_with_mutability(mut &this, is_mutable: boolean) -> TypeAnnotation* {
+    parse_reference_type_with_mutability(mut &this, is_mutable: boolean) -> mut TypeAnnotation* {
         const start: Token = this.advance(); // consume '&'
         return this.finish_reference_type(start, is_mutable);
     }
 
     /// Inner-type + node assembly shared by both reference forms.
-    finish_reference_type(mut &this, start: Token, is_mutable: boolean) -> TypeAnnotation* {
-        const inner: TypeAnnotation* = this.parse_type_annotation();
+    finish_reference_type(mut &this, start: Token, is_mutable: boolean) -> mut TypeAnnotation* {
+        const inner: mut TypeAnnotation* = this.parse_type_annotation();
         if (inner == null) { return null; }
         const ref_ann: ReferenceAnnotation* = new ReferenceAnnotation {
             inner:      inner,
@@ -3401,14 +3406,14 @@ implement struct Parser {
     /// type) are the two disambiguators.  Suffixes after the `)` are the
     /// caller's: a cast target reads a `*` there as multiplication when an
     /// operand follows it.
-    parse_paren_type(mut &this) -> TypeAnnotation* {
+    parse_paren_type(mut &this) -> mut TypeAnnotation* {
         const start: Token = this.advance(); // consume '('
 
-        mut params: [TypeAnnotation*] = [];
+        mut params: [mut TypeAnnotation*] = [];
         mut trailing_comma: boolean = false;
         if (!this.check(TokenType::RParen)) {
             while (true) {
-                const param: TypeAnnotation* = this.parse_type_annotation();
+                const param: mut TypeAnnotation* = this.parse_type_annotation();
                 if (param != null) {
                     params.push(param);
                 }
@@ -3428,7 +3433,7 @@ implement struct Parser {
         // Function type: (params) -> return_type   (covers `() -> R` too).
         if (this.check(TokenType::Arrow)) {
             this.advance();
-            const ret: TypeAnnotation* = this.parse_type_annotation();
+            const ret: mut TypeAnnotation* = this.parse_type_annotation();
             const fn_ann: FunctionAnnotation* = new FunctionAnnotation {
                 parameters:  params,
                 return_type: ret,

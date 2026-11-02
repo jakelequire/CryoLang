@@ -67,7 +67,7 @@ type struct SpecInjector {
     /// template's clone - as an ordinary injected declaration.  A named one
     /// is already in the index and is left alone: a second registration of
     /// the same declaration is a second writer of every key it holds.
-    static register(node: DeclarationNode*, spec_type: TypeRef, ctx: CompilationContext*) -> void {
+    static register(node: DeclarationNode*, spec_type: TypeRef, ctx: mut CompilationContext*) -> void {
         if (node == null) { return; }
         const named: boolean = spec_type.is_valid()
             && (DeclarationNode::struct_of(node) != null
@@ -81,7 +81,7 @@ type struct SpecInjector {
     /// Register a newly injected specialized declaration into the DeclarationIndex
     /// so that sema can look it up without rescanning the AST.
     /// Delegates to the shared TypeResolutionPasses::register_decl_in_index().
-    static register_injected_decl(stmt: DeclarationNode*, ctx: CompilationContext*) -> void {
+    static register_injected_decl(stmt: DeclarationNode*, ctx: mut CompilationContext*) -> void {
         // Injected spec clones, not source decls: pass is_source_decl=false so
         // they are skipped by the cross-module coherence check (their canonical
         // targets recur across every module that instantiates the template).
@@ -104,7 +104,7 @@ type struct SpecializationPasses {
     /// Scans the AST for generic declarations (structs, enums, functions,
     /// traits) and registers them in the GenericRegistry.  Also associates impl
     /// blocks with their target template.
-    static run_template_registration(ctx: CompilationContext*) -> PassResult {
+    static run_template_registration(ctx: mut CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
         const root: ProgramNode* = ctx.artifacts.ast.root;
@@ -115,14 +115,14 @@ type struct SpecializationPasses {
         }
 
         // Get the generic registry (which now holds both templates and instantiations)
-        const registry: GenericRegistry* = ctx.generic_registry;
+        const registry: mut GenericRegistry* = ctx.generic_registry;
         if (registry == null) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                            "TemplateRegistration: no generic registry");
             return PassResult::failure(1);
         }
 
-        const arena: TypeArena* = ctx.type_arena;
+        const arena: mut TypeArena* = ctx.type_arena;
 
         // Walk top-level statements
         for (mut i: i64 = 0; i < root.statements.length(); i++) {
@@ -217,18 +217,18 @@ type struct SpecializationPasses {
     // Pass 2: Monomorphization
 
     /// Creates a Monomorphizer and processes all pending generic instantiations.
-    static run_monomorphization(ctx: CompilationContext*) -> PassResult {
+    static run_monomorphization(ctx: mut CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
         // Get required components
-        const arena: TypeArena* = ctx.type_arena;
+        const arena: mut TypeArena* = ctx.type_arena;
         if (arena == null) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                            "Monomorphization: no TypeArena");
             return PassResult::failure(1);
         }
 
-        const generic_reg: GenericRegistry* = ctx.generic_registry;
+        const generic_reg: mut GenericRegistry* = ctx.generic_registry;
         if (generic_reg == null) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                            "Monomorphization: generic registry not initialized");
@@ -237,7 +237,7 @@ type struct SpecializationPasses {
 
         // Reuse existing monomorphizer across modules (batch compilation),
         // or create one on first use.
-        mut mono_ptr: Monomorphizer* = ctx.monomorphizer;
+        mut mono_ptr: mut Monomorphizer* = ctx.monomorphizer;
         const module_sym: SymbolStr = ctx.intern(ctx.source_file);
         if (mono_ptr != null) {
             // Subsequent module: clear transient state, keep specialization cache
@@ -329,10 +329,10 @@ type struct SpecializationPasses {
     // independent of demand order.  Splitting registration (here, per demander)
     // from placement (there, per owner) keeps discovery unchanged while
     // making a spec's object-file home a function of its template.
-    static run_generic_expression_resolution(ctx: CompilationContext*) -> PassResult {
+    static run_generic_expression_resolution(ctx: mut CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
-        mut mono: Monomorphizer* = ctx.monomorphizer;
+        mut mono: mut Monomorphizer* = ctx.monomorphizer;
         if (mono == null) {
             // No monomorphizer means no generics were used; that's OK.
             return PassResult::ok();
@@ -350,7 +350,7 @@ type struct SpecializationPasses {
             const reg_start: i64 = mono.get_injection_cursor();
             const reg_end: i64 = mono.spec_count();
             for (mut i: i64 = reg_start; i < reg_end; i++) {
-                const entry: SpecializationEntry* = mono.spec_entry_at(i);
+                const entry: mut SpecializationEntry* = mono.spec_entry_at(i);
                 SpecializationPasses::register_spec(ctx, mono, entry);
             }
             mono.advance_injection_cursor();
@@ -509,8 +509,8 @@ type struct SpecializationPasses {
     /// AST nodes, and re-register its impl methods.  Runs under the DEMANDING
     /// module's `ctx` so discovery and DI state stay consistent.  Does NOT place
     /// the AST into any root - that is Phase 6a-iii's job.
-    static register_spec(ctx: CompilationContext*, mono: Monomorphizer*,
-                         entry: SpecializationEntry*) -> void {
+    static register_spec(ctx: mut CompilationContext*, mono: Monomorphizer*,
+                         entry: mut SpecializationEntry*) -> void {
         const arena: TypeArena* = ctx.type_arena;
         const module_sym: SymbolStr = ctx.intern(ctx.source_file);
 
@@ -629,7 +629,7 @@ type struct SpecializationPasses {
             SymbolStr::empty()
         };
         for (mut j: i64 = 0; j < entry.impl_nodes.length(); j++) {
-            const impl_node: ImplBlock* = DeclarationNode::impl_of(entry.impl_nodes[j]);
+            const impl_node: mut ImplBlock* = DeclarationNode::impl_of(entry.impl_nodes[j]);
             // Bounds-violating impls were dropped pre-clone by
             // `Monomorphizer::filter_bounds_violating_impls`; any
             // impl reaching here is fully applicable to this spec.
@@ -692,13 +692,13 @@ type struct SpecializationPasses {
         }
     }
 
-    static route_specializations_to_owners(ctx: CompilationContext*) -> PassResult {
+    static route_specializations_to_owners(ctx: mut CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
-        mut mono: Monomorphizer* = ctx.monomorphizer;
+        mut mono: mut Monomorphizer* = ctx.monomorphizer;
         if (mono == null) { return PassResult::ok(); }
 
-        const root: ProgramNode* = ctx.artifacts.ast.root;
+        const root: mut ProgramNode* = ctx.artifacts.ast.root;
         if (root == null) { return PassResult::ok(); }
 
         const my_src: SymbolStr = ctx.intern(ctx.source_file);
@@ -706,7 +706,7 @@ type struct SpecializationPasses {
         const total: i64 = mono.spec_count();
         mut place_count: i64 = 0;
         for (mut i: i64 = 0; i < total; i++) {
-            mut entry: SpecializationEntry* = mono.spec_entry_at(i);
+            mut entry: mut SpecializationEntry* = mono.spec_entry_at(i);
             if (entry.injected) { continue; }
             if (!entry.owner_source.is_valid()) { continue; }
             if (!entry.owner_source.equals(my_src)) { continue; }
@@ -734,7 +734,7 @@ type struct SpecializationPasses {
 
     /// Walks all types in the arena and asserts that every InstantiatedType
     /// has a valid resolved_type.
-    static run_generic_validation(ctx: CompilationContext*) -> PassResult {
+    static run_generic_validation(ctx: mut CompilationContext*) -> PassResult {
         return SpecializationPasses::run_generic_validation_impl(ctx);
     }
 
@@ -754,7 +754,7 @@ type struct SpecializationPasses {
     static register_generic_template(name: SymbolStr, generic_params: &[DeclarationNode*],
                                        ast_node: DeclarationNode*, kind: TemplateKind,
                                        def: DefId,
-                                       registry: GenericRegistry*, arena: TypeArena*,
+                                       registry: mut GenericRegistry*, arena: mut TypeArena*,
                                        ctx: CompilationContext*) -> void {
         if (generic_params.length() == 0) { return; }
 
@@ -819,8 +819,8 @@ type struct SpecializationPasses {
     /// method's definition has the owner it is declared on as its parent,
     /// whichever file the methods were written in.
     static register_static_method_templates(methods: &[DeclarationNode*],
-                                              registry: GenericRegistry*,
-                                              arena: TypeArena*,
+                                              registry: mut GenericRegistry*,
+                                              arena: mut TypeArena*,
                                               ctx: CompilationContext*) -> void {
         if (methods.length() == 0) { return; }
 
@@ -877,7 +877,7 @@ type struct SpecializationPasses {
     /// per-call.
     static register_inherent_owner(
             owner: TypeRef, owner_ast: DeclarationNode*,
-            registry: GenericRegistry*) -> void {
+            registry: mut GenericRegistry*) -> void {
         if (owner_ast == null) { return; }
         // Under the declaration's own type and nothing else: two modules'
         // same-leaf declarations are two types, so a reader holding a
@@ -885,7 +885,7 @@ type struct SpecializationPasses {
         registry.register_inherent_owner(owner, owner_ast);
     }
 
-    static register_impl_block(decl: DeclarationNode*, registry: GenericRegistry*,
+    static register_impl_block(decl: DeclarationNode*, registry: mut GenericRegistry*,
                                  ctx: CompilationContext*) -> void {
         const node: ImplBlock* = DeclarationNode::impl_of(decl);
         // The key a template is registered under is the target's canonical
@@ -913,7 +913,7 @@ type struct SpecializationPasses {
             // `implement Layout { static array<T> }` is legal source.
             // (Only the STATIC templates: instance-method dispatch on an impl
             // block already goes through `register_inherent_impl_block` above.)
-            const arena: TypeArena* = ctx.type_arena;
+            const arena: mut TypeArena* = ctx.type_arena;
             if (arena != null) {
                 SpecializationPasses::register_static_method_templates(
                     node.methods, registry, arena, ctx);
@@ -932,7 +932,7 @@ type struct SpecializationPasses {
         }
     }
 
-    static run_generic_validation_impl(ctx: CompilationContext*) -> PassResult {
+    static run_generic_validation_impl(ctx: mut CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
         const arena: TypeArena* = ctx.type_arena;

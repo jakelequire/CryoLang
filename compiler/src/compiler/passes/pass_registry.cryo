@@ -187,7 +187,7 @@ type struct PassRegistry {
     }
 
     /// Run all passes in order.  Returns true if no fatal pass failed.
-    run_all(mut &this, ctx: CompilationContext*) -> boolean {
+    run_all(mut &this, ctx: mut CompilationContext*) -> boolean {
         if (!this.validated) {
             Log::error(LogArea::Driver, "pipeline run before it was validated");
             return false;
@@ -271,7 +271,7 @@ type struct PassRegistry {
     /// Pass implementations are inlined here to avoid cross-namespace
     /// free function resolution issues.  As the compiler matures, these
     /// can be refactored into separate modules.
-    static run_pass(id: PassID, ctx: CompilationContext*) -> PassResult {
+    static run_pass(id: PassID, ctx: mut CompilationContext*) -> PassResult {
         const meta: PassMetadata = id.metadata();
 
         return match (id) {
@@ -373,7 +373,7 @@ type struct PassRegistry {
     // Lexing Pass
 
     /// Reads the source file and tokenizes it.  Populates ctx.artifacts.tokens.
-    static run_lexing_pass(ctx: CompilationContext*) -> PassResult {
+    static run_lexing_pass(ctx: mut CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
         const source_path: string = ctx.source_file;
 
@@ -504,7 +504,7 @@ type struct PassRegistry {
     // Parsing Pass
 
     /// Parses the token stream into an AST.
-    static run_parsing_pass(ctx: CompilationContext*) -> PassResult {
+    static run_parsing_pass(ctx: mut CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
         // Verify we have tokens
@@ -519,10 +519,10 @@ type struct PassRegistry {
         // times what it needs, where the main thread's default stack is
         // barely enough and runs out first when a parser frame grows.
         mut parser: Parser = Parser::from_context(ctx);
-        const parsing: thread::JoinHandle<ProgramNode*> = thread::Builder::new()
+        const parsing: thread::JoinHandle<mut ProgramNode*> = thread::Builder::new()
             .stack_size(PARSER_STACK_BYTES)
-            .spawn::<Parser*, ProgramNode*>(&parser, (p: Parser*) -> ProgramNode* { return p.parse(); });
-        const root: ProgramNode* = parsing.join();
+            .spawn::<mut Parser*, mut ProgramNode*>(&parser, (p: mut Parser*) -> mut ProgramNode* { return p.parse(); });
+        const root: mut ProgramNode* = parsing.join();
 
         if (root == null) {
             ctx.emit_error(ErrorCode::E0116_PARSE_EXCEPTION,
@@ -550,7 +550,7 @@ type struct PassRegistry {
     // AST Validation Pass: delegates to ASTValidationPass::run()
 
     /// Validates the parsed AST for structural correctness.
-    static run_ast_validation_pass(ctx: CompilationContext*) -> PassResult {
+    static run_ast_validation_pass(ctx: mut CompilationContext*) -> PassResult {
         return ASTValidationPass::run(ctx);
     }
 
@@ -575,12 +575,12 @@ type struct PassRegistry {
     /// Walks top-level declarations to create Type objects in the arena.
     /// This pass bridges the gap between name resolution and type resolution:
     /// after this pass, every declared struct/enum/trait has a TypeRef.
-    static run_type_declaration_pass(ctx: CompilationContext*) -> PassResult {
+    static run_type_declaration_pass(ctx: mut CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
         ctx.install_prelude_modules();
 
-        const arena: TypeArena* = ctx.type_arena;
+        const arena: mut TypeArena* = ctx.type_arena;
 
         // Get the AST root
         const root: ProgramNode* = ctx.artifacts.ast.root;
@@ -693,7 +693,7 @@ type struct PassRegistry {
                     if (node.is_generic()) {
                         const alias_ty: Type* = arena.lookup(alias_ref);
                         if (alias_ty != null && alias_ty.kind == TypeKind::TypeAlias) {
-                            const alias_obj: TypeAliasType* = alias_ty.as_alias();
+                            const alias_obj: mut TypeAliasType* = alias_ty.as_alias();
                             alias_obj.is_generic = true;
                         }
                     }
@@ -792,7 +792,7 @@ type struct PassRegistry {
     /// Claim each method `methods` holds that is a language item, as a
     /// type is claimed where its identity is first known.  The directive
     /// sits on the method's own declaration, its function on `m.func`.
-    static claim_method_items(ctx: CompilationContext*, methods: &[DeclarationNode*]) -> void {
+    static claim_method_items(ctx: mut CompilationContext*, methods: &[DeclarationNode*]) -> void {
         for (mut i: i64 = 0; i < methods.length(); i++) {
             const m_decl: DeclarationNode* = methods[i];
             const m: MethodDecl* = DeclarationNode::method_of(m_decl);
@@ -804,7 +804,7 @@ type struct PassRegistry {
     /// A primitive's definition: a root of the definition tree, its spelling
     /// the leaf, the same id the name layer registered it as when a method
     /// was written on it.
-    static primitive_def(ctx: CompilationContext*, spelling: string) -> DefId {
+    static primitive_def(ctx: mut CompilationContext*, spelling: string) -> DefId {
         return ctx.defs.primitive(ctx.intern(spelling));
     }
 
@@ -820,7 +820,7 @@ type struct PassRegistry {
     /// claimed it, for what prints the node: a diagnostic, the tree dump.
     /// A member name (`next`, `compare`) is the trait's method and is not
     /// the item's spelling.
-    static settle_lang_refs(ctx: CompilationContext*) -> void {
+    static settle_lang_refs(ctx: mut CompilationContext*) -> void {
         mut kept: i64 = 0;
         for (mut i: i64 = 0; i < ctx.lang_refs.length(); i++) {
             const r: LangRef = ctx.lang_refs[i];
@@ -846,7 +846,7 @@ type struct PassRegistry {
                         // The trait and its method's position, as an operator's
                         // desugar is stamped: a call a bound answers in a
                         // generic body is selected by the position.
-                        mut access: MemberAccessExpr* = ExpressionNode::member_access_of(e);
+                        mut access: mut MemberAccessExpr* = ExpressionNode::member_access_of(e);
                         access.set_resolved_trait_item(id,
                             ctx.generic_registry.trait_item_slot(id, access.member));
                     } else if (ExpressionNode::identifier_of(e) != null) {
@@ -879,7 +879,7 @@ type struct PassRegistry {
             return PassResult::ok();
         }
 
-        const root: ProgramNode* = ctx.artifacts.ast.root;
+        const root: mut ProgramNode* = ctx.artifacts.ast.root;
         if (root == null) {
             return PassResult::ok();
         }
@@ -951,7 +951,7 @@ type struct PassRegistry {
     /// known modules in the ModuleGraph.  In whole-program multi-module mode,
     /// module discovery has already happened, so this pass is a validation step.
     /// For single-file mode, imports are not expected (unless auto-imported).
-    static run_import_resolution_pass(ctx: CompilationContext*) -> PassResult {
+    static run_import_resolution_pass(ctx: mut CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
         const root: ProgramNode* = ctx.artifacts.ast.root;

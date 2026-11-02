@@ -449,7 +449,8 @@ PatElem            ::= "_" | "mut"? Ident | Literal
    array is written only in brackets: a type followed by `[` is refused
    (E0104), with the bracketed spelling as its fix.                          *)
 Type               ::= Type "*"                            (* pointer *)
-                     | PointerMark BaseType "*" ("*")*      (* marked pointer: the keyword
+                     | PointerMark ( BaseType | "[" Type ( ";" Expr )? "]" ) "*" ("*")*
+                                                           (* marked pointer: the keyword
                                                               marks the pointee of the first
                                                               `*`, so `const u8**` is a pointer
                                                               to read-only pointers; a `mut`

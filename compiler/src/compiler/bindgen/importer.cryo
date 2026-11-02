@@ -205,7 +205,7 @@ type struct ImportReport {
     /// Append this report's entries into `dst` (the `cryo vendor` generator's
     /// accumulator).  `string`s are non-owning pointers into leaked `format`
     /// buffers, so copying them out survives this report's own array drop.
-    merge_into(&this, dst: ImportReport*) -> void {
+    merge_into(&this, dst: mut ImportReport*) -> void {
         for (mut i: i64 = 0; i < this.skipped.length(); i++) {
             dst.skipped.push(this.skipped[i]);
         }
@@ -243,8 +243,8 @@ type struct ImportReport {
 /// The C-header import engine: one object per translation unit, plus the static
 /// pass entry and path-resolution helpers.
 type struct Importer {
-    extern_node:    ExternBlock*;
-    ctx:            CompilationContext*;
+    extern_node:    mut ExternBlock*;
+    ctx:            mut CompilationContext*;
     /// The libclang translation unit, needed by `emit_macro` to tokenize a
     /// macro definition's extent (`clang_tokenize`).
     tu:             void*;
@@ -262,7 +262,7 @@ type struct Importer {
     /// cursor can populate the empty node left by an earlier forward-decl
     /// cursor (libclang visits `struct Foo;` then `struct Foo {...}`).
     struct_names:   [SymbolStr];
-    struct_nodes:   [StructDecl*];
+    struct_nodes:   [mut StructDecl*];
     /// Every type declaration this import emitted, by its C tag - the
     /// import's own namespace - for pinning the references it made to them.
     type_decl_tags:  [SymbolStr];
@@ -272,7 +272,7 @@ type struct Importer {
     /// Transient targets for the nested walks (set just before the synchronous
     /// `clang_visitChildren`, read by the nested visitors).  `cur_enum_int`
     /// points at a stack-local CXType live for the duration of the walk.
-    cur_enum:       EnumDecl*;
+    cur_enum:       mut EnumDecl*;
     cur_enum_int:   CXType*;
     /// Transient per-NAMED-enum dup-value tracking.  C enums permit several
     /// constants to share a value (deliberate aliases - e.g. SDL's
@@ -364,7 +364,7 @@ type struct Importer {
     /// `functions_only` are derived from the extern block; the type mapper is
     /// wired with the same (ctx, namespace), so every declaration and every
     /// reference the engine synthesizes is keyed under `<mod>::alias`.
-    static new(extern_node: ExternBlock*, functions_only: boolean, ctx: CompilationContext*,
+    static new(extern_node: mut ExternBlock*, functions_only: boolean, ctx: mut CompilationContext*,
                tu: void*) -> Importer {
         const alias: ModulePath = extern_node.binding_namespace;
         return Importer {
@@ -423,7 +423,7 @@ type struct Importer {
     /// own `#include <stddef.h>` does not drag glibc's ~100 internal typedefs
     /// into the alias namespace.
     static visit_decl(cursor: CXCursor, parent: CXCursor, client: void*) -> i32 {
-        const imp: Importer* = client as Importer*;
+        const imp: mut Importer* = client as mut Importer*;
 
         if (cursor.is_in_system_header()) {
             return clang::VISIT_CONTINUE;
@@ -493,7 +493,7 @@ type struct Importer {
     /// collected list is processed by `populate_record_fields` with look-ahead.
     static visit_collect_member(cursor: CXCursor, parent: CXCursor, client: void*) -> i32 {
         const k: i32 = clang::clang_getCursorKind(cursor);
-        const imp: Importer* = client as Importer*;
+        const imp: mut Importer* = client as mut Importer*;
         if (k == clang::CURSOR_FIELD_DECL) {
             imp.field_cursors.push(cursor);
         } else if ((k == clang::CURSOR_STRUCT_DECL || k == clang::CURSOR_UNION_DECL)
@@ -508,7 +508,7 @@ type struct Importer {
     /// sub-records are ignored here - accessors only cover named members.
     static visit_collect_acc_member(cursor: CXCursor, parent: CXCursor, client: void*) -> i32 {
         if (clang::clang_getCursorKind(cursor) == clang::CURSOR_FIELD_DECL) {
-            const imp: Importer* = client as Importer*;
+            const imp: mut Importer* = client as mut Importer*;
             imp.acc_members.push(cursor);
         }
         return clang::VISIT_CONTINUE;
@@ -520,7 +520,7 @@ type struct Importer {
         if (clang::clang_getCursorKind(cursor) != clang::CURSOR_ENUM_CONSTANT_DECL) {
             return clang::VISIT_CONTINUE;
         }
-        const imp: Importer* = client as Importer*;
+        const imp: mut Importer* = client as mut Importer*;
         imp.add_enum_const_from(cursor);
         return clang::VISIT_CONTINUE;
     }
@@ -531,7 +531,7 @@ type struct Importer {
         if (clang::clang_getCursorKind(cursor) != clang::CURSOR_ENUM_CONSTANT_DECL) {
             return clang::VISIT_CONTINUE;
         }
-        const imp: Importer* = client as Importer*;
+        const imp: mut Importer* = client as mut Importer*;
         imp.add_anon_const_from(cursor);
         return clang::VISIT_CONTINUE;
     }
@@ -545,7 +545,7 @@ type struct Importer {
     }
 
     /// The StructDecl previously emitted for `name`, or null.
-    find_struct(&this, name: SymbolStr) -> StructDecl* {
+    find_struct(&this, name: SymbolStr) -> mut StructDecl* {
         for (mut i: i64 = 0; i < this.struct_names.length(); i++) {
             if (this.struct_names[i].equals(name)) { return this.struct_nodes[i]; }
         }
@@ -612,12 +612,12 @@ type struct Importer {
     /// Only integers: a string/char/float initializer is already in range for
     /// what it was mapped to, and a cast there would say nothing.
     widen_integer_init(mut &this, type_annotation: TypeAnnotation*,
-                       init: ExpressionNode*) -> ExpressionNode* {
+                       init: mut ExpressionNode*) -> ExpressionNode* {
         if (init == null || type_annotation == null) { return init; }
         const lit: LiteralExpr* = ExpressionNode::literal_of(init);
         if (lit == null || lit.literal_kind != LiteralKind::Integer) { return init; }
         // The declaration owns `type_annotation`; the cast needs its own copy.
-        const target: TypeAnnotation* = TypeAnnotation::clone_ptr(type_annotation);
+        const target: mut TypeAnnotation* = TypeAnnotation::clone_ptr(type_annotation);
         if (target == null) { return init; }
         return ExpressionNode::cast_expr(init, target, SourceSpan::none());
     }
@@ -626,8 +626,8 @@ type struct Importer {
     /// shape both anonymous-enum constants and object-like `#define` macros
     /// lower to.  `binding_namespace` keeps it reachable only as `alias::name`.
     emit_alias_const(mut &this, name_sym: SymbolStr,
-                     type_annotation: TypeAnnotation*, init: ExpressionNode*) -> void {
-        mut vnode: VarDecl* = VarDecl::new(name_sym);
+                     type_annotation: TypeAnnotation*, init: mut ExpressionNode*) -> void {
+        mut vnode: mut VarDecl* = VarDecl::new(name_sym);
         const vnode_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(vnode), SourceSpan::none());
         vnode.is_global = true;
         vnode.is_mutable = false;
@@ -643,7 +643,7 @@ type struct Importer {
         const name_sym: SymbolStr = cursor.intern_spelling(this.ctx);
         const nargs: i32 = clang::clang_Cursor_getNumArguments(cursor);
 
-        mut func: FunctionDecl* = FunctionDecl::new(name_sym);
+        mut func: mut FunctionDecl* = FunctionDecl::new(name_sym);
         const func_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(func), SourceSpan::none());
         func.return_type_annotation = this.types.map(clang::clang_getCursorResultType(cursor));
 
@@ -652,7 +652,7 @@ type struct Importer {
             const arg: CXCursor = clang::clang_Cursor_getArgument(cursor, i as u32);
             const ptype: TypeAnnotation* = this.types.map(clang::clang_getCursorType(arg));
             const pname: SymbolStr = arg.intern_arg_name(i, this.ctx);
-            mut pnode: VarDecl* = VarDecl::new(pname);
+            mut pnode: mut VarDecl* = VarDecl::new(pname);
             const pnode_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(pnode), SourceSpan::none());
             pnode.type_annotation = ptype;
             params.push(pnode_decl);
@@ -723,7 +723,7 @@ type struct Importer {
     /// only gathers callables, which `emit_cxx_methods` then binds or reports.
     static visit_collect_cxx_method(cursor: CXCursor, parent: CXCursor, client: void*) -> i32 {
         const k: i32 = clang::clang_getCursorKind(cursor);
-        const imp: Importer* = client as Importer*;
+        const imp: mut Importer* = client as mut Importer*;
         if (k == clang::CURSOR_CXX_METHOD
                 || k == clang::CURSOR_CONSTRUCTOR
                 || k == clang::CURSOR_DESTRUCTOR
@@ -769,7 +769,7 @@ type struct Importer {
         // Build the data-member struct (find-or-create + dedup live in emit_record).
         this.emit_record(cursor, false);
         if (this.cxx_method_cursors.length() == 0) { return; }
-        const impl: ImplBlock* = ImplBlock::new(owner_sym);
+        const impl: mut ImplBlock* = ImplBlock::new(owner_sym);
         mut bound: i64 = 0;
         for (mut i: i64 = 0; i < this.cxx_method_cursors.length(); i++) {
             if (this.emit_cxx_method(impl, this.cxx_method_cursors[i], owner_str)) {
@@ -798,7 +798,7 @@ type struct Importer {
 
     /// Bind one C++ member function into `impl` as a body-less `![symbol]` method,
     /// or skip + report it.  Returns true when a method was added.
-    emit_cxx_method(mut &this, impl: ImplBlock*, cursor: CXCursor,
+    emit_cxx_method(mut &this, impl: mut ImplBlock*, cursor: CXCursor,
                     owner_str: string) -> boolean {
         const k: i32 = clang::clang_getCursorKind(cursor);
         const mname: string = this.spelling_of(cursor);
@@ -849,7 +849,7 @@ type struct Importer {
         }
 
         const is_static: boolean = cursor.is_static_method();
-        mut func: FunctionDecl* = FunctionDecl::new(cursor.intern_spelling(this.ctx));
+        mut func: mut FunctionDecl* = FunctionDecl::new(cursor.intern_spelling(this.ctx));
         const func_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(func), SourceSpan::none());
         func.return_type_annotation = this.types.map(clang::clang_getCursorResultType(cursor));
         func.visibility = Visibility::Public;
@@ -864,7 +864,7 @@ type struct Importer {
         // `const T*`, so an immutable Cryo `&this` is the faithful receiver.
         if (!is_static) {
             const recv_tok: string = if (cursor.is_const_method()) { "&this" } else { "mut &this" };
-            mut recv: VarDecl* = VarDecl::new(this.ctx.intern_table.intern(recv_tok));
+            mut recv: mut VarDecl* = VarDecl::new(this.ctx.intern_table.intern(recv_tok));
             recv.set_receiver(ReceiverForm::ByReference);
             recv.type_annotation = null;
             func.parameters.push(DeclarationNode::of(DeclKind::Variable(recv), SourceSpan::none()));
@@ -875,7 +875,7 @@ type struct Importer {
             const arg: CXCursor = clang::clang_Cursor_getArgument(cursor, i as u32);
             const ptype: TypeAnnotation* = this.types.map(clang::clang_getCursorType(arg));
             const pname: SymbolStr = arg.intern_arg_name(i, this.ctx);
-            mut pnode: VarDecl* = VarDecl::new(pname);
+            mut pnode: mut VarDecl* = VarDecl::new(pname);
             const pnode_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(pnode), SourceSpan::none());
             pnode.type_annotation = ptype;
             func.parameters.push(pnode_decl);
@@ -883,7 +883,7 @@ type struct Importer {
         func.is_variadic =
             clang::clang_isFunctionTypeVariadic(clang::clang_getCursorType(cursor)) != 0;
 
-        mut method: MethodDecl* = MethodDecl::new(func_decl);
+        mut method: mut MethodDecl* = MethodDecl::new(func_decl);
         const method_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Method(method), SourceSpan::none());
         method.set_visibility(Visibility::Public);
         method.set_static(is_static);
@@ -929,7 +929,7 @@ type struct Importer {
             const size: i64 = clang::clang_Type_getSizeOf(ct);
             const align: i64 = clang::clang_Type_getAlignOf(ct);
             if (size <= 0) { return; }
-            const unode: UnionDecl* = UnionDecl::new(name_sym);
+            const unode: mut UnionDecl* = UnionDecl::new(name_sym);
             unode.binding_namespace = this.alias;
             unode.repr_c = true;
             // Keep the C ABI alignment even when a member is approximated to a
@@ -944,7 +944,7 @@ type struct Importer {
             return;
         }
 
-        mut node: StructDecl* = this.find_struct(name_sym);
+        mut node: mut StructDecl* = this.find_struct(name_sym);
         if (node == null) {
             node = StructDecl::new(name_sym);
             node.binding_namespace = this.alias;
@@ -973,7 +973,7 @@ type struct Importer {
     /// dedups, and reported so the reduced fidelity is visible.
     emit_opaque_tag(mut &this, name_sym: SymbolStr, is_union: boolean) -> void {
         if (this.name_seen(name_sym)) { return; }
-        const node: StructDecl* = StructDecl::new(name_sym);
+        const node: mut StructDecl* = StructDecl::new(name_sym);
         node.binding_namespace = this.alias;
         node.repr_c = true;
         this.seen_names.push(name_sym);
@@ -1001,7 +1001,7 @@ type struct Importer {
     /// Any approximation raises the struct's `min_alignment` to libclang's
     /// authoritative figure, so an opaque blob (alignment 1) can't lower the
     /// record's overall alignment below the C ABI.  Each lossy member is reported.
-    populate_record_fields(mut &this, node: StructDecl*, record_cursor: CXCursor) -> void {
+    populate_record_fields(mut &this, node: mut StructDecl*, record_cursor: CXCursor) -> void {
         const rec_type: CXType = clang::clang_getCursorType(record_cursor);
         const struct_size: i64 = clang::clang_Type_getSizeOf(rec_type);
         const sname: string = this.ctx.intern_table.resolve(node.name);
@@ -1021,7 +1021,7 @@ type struct Importer {
                 const al: i64 = clang::clang_Type_getAlignOf(ct);
                 const fname: SymbolStr =
                     this.ctx.intern_table.intern(fmt::format("_anon%d", anon_n));
-                mut fnode: FieldDecl* = FieldDecl::new(fname);
+                mut fnode: mut FieldDecl* = FieldDecl::new(fname);
                 fnode.type_annotation = this.types.aligned_blob(sz, al);
                 node.fields.push(DeclarationNode::of(DeclKind::Field(fnode), SourceSpan::none()));
                 // Both an anonymous union (members overlay at offset 0) and an
@@ -1071,7 +1071,7 @@ type struct Importer {
 
                 const fname: SymbolStr =
                     this.ctx.intern_table.intern(fmt::format("_bitfield%d", bits_n));
-                mut fnode: FieldDecl* = FieldDecl::new(fname);
+                mut fnode: mut FieldDecl* = FieldDecl::new(fname);
                 fnode.type_annotation = this.types.array(this.types.prim("u8"), span);
                 node.fields.push(DeclarationNode::of(DeclKind::Field(fnode), SourceSpan::none()));
                 // Restore field access: a shift/mask get/set per UNSIGNED bitfield
@@ -1097,7 +1097,7 @@ type struct Importer {
             // the struct alignment is corrected and the loss is reported.
             const ftype: CXType = clang::clang_getCursorType(cur);
             const fname: SymbolStr = cur.intern_spelling(this.ctx);
-            mut fnode: FieldDecl* = FieldDecl::new(fname);
+            mut fnode: mut FieldDecl* = FieldDecl::new(fname);
             fnode.type_annotation = this.types.map(ftype);
             node.fields.push(DeclarationNode::of(DeclKind::Field(fnode), SourceSpan::none()));
             if (ftype.is_anonymous_record()) {
@@ -1121,7 +1121,7 @@ type struct Importer {
     /// anonymous nested record *member* (a nameless `struct {...};`/`union {...};` with no
     /// FieldDecl) has no name to bind, so it becomes an aligned opaque blob `_anonN`
     /// (Cryo has no anonymous union fields).  Each lossy member is reported.
-    populate_union_fields(mut &this, node: UnionDecl*) -> void {
+    populate_union_fields(mut &this, node: mut UnionDecl*) -> void {
         const uname: string = this.ctx.intern_table.resolve(node.name);
         mut anon_n: i32 = 0;
         for (mut i: i64 = 0; i < this.field_cursors.length(); i++) {
@@ -1135,7 +1135,7 @@ type struct Importer {
                 const al: i64 = clang::clang_Type_getAlignOf(ct);
                 const fname: SymbolStr =
                     this.ctx.intern_table.intern(fmt::format("_anon%d", anon_n));
-                mut fnode: FieldDecl* = FieldDecl::new(fname);
+                mut fnode: mut FieldDecl* = FieldDecl::new(fname);
                 fnode.type_annotation = this.types.aligned_blob(sz, al);
                 node.fields.push(DeclarationNode::of(DeclKind::Field(fnode), SourceSpan::none()));
                 this.report.approx(fmt::format("anonymous member in union '%s' -> field '_anon%d': %lld-byte opaque blob (no field access)",
@@ -1147,7 +1147,7 @@ type struct Importer {
             // Named member: a native union field of the member's mapped type.
             const ftype: CXType = clang::clang_getCursorType(cur);
             const fname: SymbolStr = cur.intern_spelling(this.ctx);
-            mut fnode: FieldDecl* = FieldDecl::new(fname);
+            mut fnode: mut FieldDecl* = FieldDecl::new(fname);
             fnode.type_annotation = this.types.map(ftype);
             node.fields.push(DeclarationNode::of(DeclKind::Field(fnode), SourceSpan::none()));
             if (ftype.is_anonymous_record()) {
@@ -1163,7 +1163,7 @@ type struct Importer {
     /// the member's byte offset (0 for every union member; the field offset for an
     /// anon-struct member).  A member of bitfield/anonymous type is skipped (no
     /// faithful scalar reinterpret).  Returns the member count covered.
-    add_reinterpret_accessors(mut &this, node: StructDecl*, blob_field: SymbolStr,
+    add_reinterpret_accessors(mut &this, node: mut StructDecl*, blob_field: SymbolStr,
                               record_cursor: CXCursor) -> i32 {
         this.acc_members = [];
         clang::clang_visitChildren(record_cursor, Importer::visit_collect_acc_member, this as void*);
@@ -1200,7 +1200,7 @@ type struct Importer {
     /// reinterpreted as a native backing integer.  Returns 0 (no accessors) when
     /// the blob has no native backing width (`span` not in {1,2,4,8}); signed
     /// bitfields are skipped (left opaque) to avoid a sign-extension miscompile.
-    emit_bitfield_accessors(mut &this, node: StructDecl*, blob_field: SymbolStr,
+    emit_bitfield_accessors(mut &this, node: mut StructDecl*, blob_field: SymbolStr,
                             span: i64, start_byte: i64, run_lo: i64, run_hi: i64) -> i32 {
         mut backing: string = "";
         if      (span == 1) { backing = "u8"; }
@@ -1274,7 +1274,7 @@ type struct Importer {
         }
         if (this.name_seen(name_sym)) { return; }
 
-        const enode: EnumDecl* = EnumDecl::new(name_sym);
+        const enode: mut EnumDecl* = EnumDecl::new(name_sym);
         enode.binding_namespace = this.alias;
         enode.repr_c = true;
         enode.discriminant_annotation =
@@ -1304,7 +1304,7 @@ type struct Importer {
             const dval:  i64       = this.cur_enum_dup_values[i];
             const ty: TypeAnnotation* =
                 this.types.named(name_sym);
-            mut lit: ExpressionNode* = ExpressionNode::literal(
+            mut lit: mut ExpressionNode* = ExpressionNode::literal(
                 fmt::format("%llu", dval as u64), LiteralKind::Integer, SourceSpan::none());
             this.emit_alias_const(dname, ty, lit);
             this.ec_names.push(dname);
@@ -1334,7 +1334,7 @@ type struct Importer {
                 return;
             }
         }
-        const vnode: EnumVariant* = EnumVariant::new(cname);
+        const vnode: mut EnumVariant* = EnumVariant::new(cname);
         vnode.set_explicit_value(value);
         this.cur_enum.variants.push(DeclarationNode::of(DeclKind::Variant(vnode), SourceSpan::none()));
         this.cur_enum_values.push(value);
@@ -1359,7 +1359,7 @@ type struct Importer {
         // reproducing C's value exactly (-1 in an `int` enum -> 0xFFFFFFFF).
         const v: i64 = clang::clang_getEnumConstantDeclValue(cursor);
         const v_str: string = fmt::format("%llu", v as u64);
-        mut lit: ExpressionNode* = ExpressionNode::literal(v_str, LiteralKind::Integer, SourceSpan::none());
+        mut lit: mut ExpressionNode* = ExpressionNode::literal(v_str, LiteralKind::Integer, SourceSpan::none());
         this.emit_alias_const(cname, this.types.map(*this.cur_enum_int), lit);
         // W2: record (empty owning tag => an alias resolves it as a plain int).
         this.ec_names.push(cname);
@@ -1404,7 +1404,7 @@ type struct Importer {
             return;
         }
 
-        mut vnode: VarDecl* = VarDecl::new(name_sym);
+        mut vnode: mut VarDecl* = VarDecl::new(name_sym);
         const vnode_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(vnode), SourceSpan::none());
         vnode.is_global        = true;
         vnode.is_extern_import = true;
@@ -1444,7 +1444,7 @@ type struct Importer {
         }
         if (this.name_seen(name_sym)) { return; }
 
-        const ta: TypeAliasDecl* = TypeAliasDecl::new(name_sym);
+        const ta: mut TypeAliasDecl* = TypeAliasDecl::new(name_sym);
         ta.binding_namespace = this.alias;
         ta.target_annotation = this.types.map(underlying);
 
@@ -1533,7 +1533,7 @@ type struct Importer {
             // fail to re-parse without this.
             const ftext: string = if (neg) { "-" + Importer::strip_float_suffix(spell) }
                                   else      { Importer::strip_float_suffix(spell) };
-            mut flit: ExpressionNode* = ExpressionNode::literal(ftext, LiteralKind::Float, SourceSpan::none());
+            mut flit: mut ExpressionNode* = ExpressionNode::literal(ftext, LiteralKind::Float, SourceSpan::none());
             this.emit_alias_const(name_sym, this.types.prim("f64"), flit);
             this.record_macro_const(name_sym, "f64", ftext, true);
             clang::clang_disposeTokens(this.tu, toks, ntok);
@@ -1559,7 +1559,7 @@ type struct Importer {
                         else { if (mag <= i64::MAX as u64) { "i64" } else { "u64" } };
         }
         const itext: string = fmt::format("%llu", value_u64);
-        mut ilit: ExpressionNode* =
+        mut ilit: mut ExpressionNode* =
             ExpressionNode::literal(itext, LiteralKind::Integer, SourceSpan::none());
         this.emit_alias_const(name_sym, this.types.prim(type_name), ilit);
         this.record_macro_const(name_sym, type_name, itext, false);
@@ -1753,7 +1753,7 @@ type struct Importer {
         if (clang::clang_getCursorKind(cursor) != clang::CURSOR_VAR_DECL) {
             return clang::VISIT_CONTINUE;
         }
-        const imp: Importer* = client as Importer*;
+        const imp: mut Importer* = client as mut Importer*;
         const digits: Option<Str> = Str::new(imp.spelling_of(cursor)).strip_prefix(&Str::new(PROBE_PREFIX));
         if (digits.is_none()) { return clang::VISIT_CONTINUE; }
         const idx: i64 = u64::parse_radix(digits.unwrap().as_bytes(), 10).unwrap_or(0) as i64;
@@ -1807,14 +1807,14 @@ type struct Importer {
                 type_name = if (wide) { "i64" } else { "i32" };
             }
             const itext: string = fmt::format("%llu", value_u64);
-            mut ilit: ExpressionNode* =
+            mut ilit: mut ExpressionNode* =
                 ExpressionNode::literal(itext, LiteralKind::Integer, SourceSpan::none());
             this.emit_alias_const(name_sym, this.types.prim(type_name), ilit);
             this.record_macro_const(name_sym, type_name, itext, false);
         } else if (kind == clang::EVAL_FLOAT) {
             mut ftext: string = fmt::format("%.17g", clang::clang_EvalResult_getAsDouble(ev));
             if (!Importer::has_float_marker(ftext)) { ftext = ftext + ".0"; }
-            mut flit: ExpressionNode* =
+            mut flit: mut ExpressionNode* =
                 ExpressionNode::literal(ftext, LiteralKind::Float, SourceSpan::none());
             this.emit_alias_const(name_sym, this.types.prim("f64"), flit);
             this.record_macro_const(name_sym, "f64", ftext, true);
@@ -1825,7 +1825,7 @@ type struct Importer {
                 // table copies, and the serializer re-escapes on the way out.
                 const text: string = this.ctx.intern_table.resolve(
                     this.ctx.intern_table.intern(raw as string));
-                mut slit: ExpressionNode* =
+                mut slit: mut ExpressionNode* =
                     ExpressionNode::literal(text, LiteralKind::String, SourceSpan::none());
                 this.emit_alias_const(name_sym, this.types.prim("string"),
                                       slit);
@@ -1870,7 +1870,7 @@ type struct Importer {
             } else {
                 this.types.named(tag)
             };
-            mut lit: ExpressionNode* =
+            mut lit: mut ExpressionNode* =
                 ExpressionNode::literal(fmt::format("%llu", value as u64), LiteralKind::Integer, SourceSpan::none());
             this.emit_alias_const(name_sym, ty, lit);
             return true;
@@ -1881,7 +1881,7 @@ type struct Importer {
             if (!this.mac_names[i].equals(tsym)) { continue; }
             const kind: LiteralKind =
                 if (this.mac_floats[i]) { LiteralKind::Float } else { LiteralKind::Integer };
-            mut lit: ExpressionNode* =
+            mut lit: mut ExpressionNode* =
                 ExpressionNode::literal(this.mac_texts[i], kind, SourceSpan::none());
             this.emit_alias_const(name_sym, this.types.prim(this.mac_types[i]), lit);
             this.record_macro_const(name_sym, this.mac_types[i], this.mac_texts[i], this.mac_floats[i]);
@@ -1891,7 +1891,7 @@ type struct Importer {
         // Bound type: a `type` alias.
         for (mut i: i64 = 0; i < this.type_names.length(); i++) {
             if (!this.type_names[i].equals(tsym)) { continue; }
-            const ta: TypeAliasDecl* = TypeAliasDecl::new(name_sym);
+            const ta: mut TypeAliasDecl* = TypeAliasDecl::new(name_sym);
             ta.binding_namespace = this.alias;
             ta.target_annotation = this.types.named(tsym);
             this.seen_names.push(name_sym);
@@ -1935,13 +1935,13 @@ type struct Importer {
     /// default, so the wrapper is visible as `<Ns>::<alias>` with no modifier.
     emit_forwarding_wrapper(mut &this, alias_name: SymbolStr, target_fn_decl: DeclarationNode*) -> void {
         const target_fn: FunctionDecl* = DeclarationNode::fn_of(target_fn_decl);
-        mut wrapper: FunctionDecl* = FunctionDecl::new(alias_name);
+        mut wrapper: mut FunctionDecl* = FunctionDecl::new(alias_name);
         const wrapper_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(wrapper), SourceSpan::none());
         wrapper.visibility = Visibility::Public;
         wrapper.return_type_annotation = target_fn.return_type_annotation;
 
         mut params: [DeclarationNode*] = [];
-        mut call_args: [ExpressionNode*] = [];
+        mut call_args: [mut ExpressionNode*] = [];
         for (mut i: i64 = 0; i < target_fn.parameters.length(); i++) {
             const tp_decl: DeclarationNode* = target_fn.parameters[i];
             const tp: VarDecl* = DeclarationNode::var_of(tp_decl);
@@ -1949,7 +1949,7 @@ type struct Importer {
             if (this.ctx.intern_table.resolve(pname).eq("")) {
                 pname = this.ctx.intern_table.intern(fmt::format("arg%lld", i));
             }
-            mut pnode: VarDecl* = VarDecl::new(pname);
+            mut pnode: mut VarDecl* = VarDecl::new(pname);
             const pnode_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Variable(pnode), SourceSpan::none());
             pnode.type_annotation = tp.type_annotation;
             params.push(pnode_decl);
@@ -1957,8 +1957,8 @@ type struct Importer {
         }
         wrapper.parameters = params;
 
-        const callee: ExpressionNode* = ExpressionNode::identifier_expr(target_fn.name, SourceSpan::none());
-        mut call: ExpressionNode* = ExpressionNode::call_expr(callee, SourceSpan::none());
+        const callee: mut ExpressionNode* = ExpressionNode::identifier_expr(target_fn.name, SourceSpan::none());
+        mut call: mut ExpressionNode* = ExpressionNode::call_expr(callee, SourceSpan::none());
         ExpressionNode::call_of(call).arguments = call_args;
 
         const block: Stmt* = Stmt::block(SourceSpan::none());
@@ -2029,8 +2029,8 @@ type struct Importer {
         // Build the struct literal in field-declaration order (the codegen
         // const-aggregate path zips positionally, so order must match).
         const qualified: SymbolStr = this.types.qualify_under_alias(struct_node.name);
-        const slit_e: ExpressionNode* = ExpressionNode::struct_expr(qualified, SourceSpan::none());
-        mut slit: StructExpr* = ExpressionNode::struct_of(slit_e);
+        const slit_e: mut ExpressionNode* = ExpressionNode::struct_expr(qualified, SourceSpan::none());
+        mut slit: mut StructExpr* = ExpressionNode::struct_of(slit_e);
         for (mut i: i64 = 0; i < struct_node.fields.length(); i++) {
             const raw: string = vals[i];
             mut lk: LiteralKind = LiteralKind::Integer;
@@ -2038,7 +2038,7 @@ type struct Importer {
             const kind: CLiteralKind = CLiteralKind::of(Str::new(raw));
             if (kind == CLiteralKind::Text) { return false; } // not a numeric color value
             if (kind == CLiteralKind::Float) { lk = LiteralKind::Float; text = Importer::strip_float_suffix(raw); }
-            mut vlit: ExpressionNode* = ExpressionNode::literal(text, lk, SourceSpan::none());
+            mut vlit: mut ExpressionNode* = ExpressionNode::literal(text, lk, SourceSpan::none());
             slit.add_field_init(FieldInit {
                 field_name: DeclarationNode::field_of(struct_node.fields[i]).name,
                 value:      vlit,
@@ -2120,7 +2120,7 @@ type struct Importer {
         const type_name: string =
             if (acc >= i32::MIN as i64 && acc <= i32::MAX as i64) { "i32" } else { "i64" };
         const text: string = fmt::format("%llu", acc as u64);
-        mut ilit: ExpressionNode* = ExpressionNode::literal(text, LiteralKind::Integer, SourceSpan::none());
+        mut ilit: mut ExpressionNode* = ExpressionNode::literal(text, LiteralKind::Integer, SourceSpan::none());
         this.emit_alias_const(name_sym, this.types.prim(type_name), ilit);
         this.record_macro_const(name_sym, type_name, text, false);
         return true;
@@ -2149,7 +2149,7 @@ type struct Importer {
         // or exponent) so it doesn't re-lex as an integer.
         mut text: string = fmt::format("%.17g", acc);
         if (!Importer::has_float_marker(text)) { text = text + ".0"; }
-        mut flit: ExpressionNode* = ExpressionNode::literal(text, LiteralKind::Float, SourceSpan::none());
+        mut flit: mut ExpressionNode* = ExpressionNode::literal(text, LiteralKind::Float, SourceSpan::none());
         this.emit_alias_const(name_sym, this.types.prim("f64"), flit);
         this.record_macro_const(name_sym, "f64", text, true);
         return true;
@@ -2158,7 +2158,7 @@ type struct Importer {
     /// Resolve a single operand token to an i64: an integer literal (base-0 C
     /// lexing), a bound INT macro const, or an enum constant.  Returns false for
     /// a float/text literal or a float macro const (the float path handles those).
-    arith_operand_int(&this, tok: CXToken, out: i64*) -> boolean {
+    arith_operand_int(&this, tok: CXToken, out: mut i64*) -> boolean {
         const k: i32 = clang::clang_getTokenKind(tok);
         const sp: string = tok.spelling(this.tu, this.ctx);
         if (k == clang::TOKEN_LITERAL) {
@@ -2186,7 +2186,7 @@ type struct Importer {
     /// Resolve a single arithmetic operand token to an f64: a numeric literal
     /// (any C float/int suffix stripped) or a bound macro const referenced by
     /// name.  Returns false for anything else.
-    arith_operand(&this, tok: CXToken, out: f64*) -> boolean {
+    arith_operand(&this, tok: CXToken, out: mut f64*) -> boolean {
         const k: i32 = clang::clang_getTokenKind(tok);
         const sp: string = tok.spelling(this.tu, this.ctx);
         if (k == clang::TOKEN_LITERAL) {
@@ -2265,13 +2265,13 @@ type struct Importer {
         if (q == '"') {
             const decoded: String = Lexer::process_escape_sequences(inner);
             const byte_length: i64 = decoded.length() as i64;
-            mut slit: ExpressionNode* =
+            mut slit: mut ExpressionNode* =
                 ExpressionNode::literal(decoded.into_raw(), LiteralKind::String, SourceSpan::none());
             ExpressionNode::literal_of(slit).byte_length = byte_length;
             this.emit_alias_const(name_sym, this.types.prim("string"), slit);
         } else {
             const cp: u64 = Lexer::char_literal_value(inner) as u64;
-            mut clit: ExpressionNode* =
+            mut clit: mut ExpressionNode* =
                 ExpressionNode::literal(fmt::format("%llu", cp), LiteralKind::Integer, SourceSpan::none());
             this.emit_alias_const(name_sym, this.types.prim("char"), clit);
         }
@@ -2279,7 +2279,7 @@ type struct Importer {
 
     /// Pass entry: walk top-level statements for C-import extern blocks, and
     /// for each resolve its includes and import their C function prototypes.
-    static run(ctx: CompilationContext*) -> PassResult {
+    static run(ctx: mut CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
         const root: ProgramNode* = ctx.artifacts.ast.root;
 
@@ -2291,7 +2291,7 @@ type struct Importer {
         for (mut i: i64 = 0; i < root.statements.length(); i++) {
             const node: DeclarationNode* = root.statements[i].as_decl();
             if (node == null) { continue; }
-            const extern_node: ExternBlock* = DeclarationNode::extern_of(node);
+            const extern_node: mut ExternBlock* = DeclarationNode::extern_of(node);
             if (extern_node == null || !extern_node.is_c_import()) { continue; }
             // `![functions_only]` is written on the block's declaration.
             const functions_only: boolean =
@@ -2345,8 +2345,8 @@ type struct Importer {
 
     /// Parse a local quoted header (`#include "foo.h"`) from its resolved
     /// path and emit its function prototypes.  Returns the count.
-    static import_local_header(resolved_path_text: string, extern_node: ExternBlock*,
-                               functions_only: boolean, ctx: CompilationContext*) -> i32 {
+    static import_local_header(resolved_path_text: string, extern_node: mut ExternBlock*,
+                               functions_only: boolean, ctx: mut CompilationContext*) -> i32 {
         const resolved_path: string = resolved_path_text;
         mut no_extra: [u8*] = [];
         return Importer::collect_from_tu(resolved_path as u8*, null, 0,
@@ -2358,8 +2358,8 @@ type struct Importer {
     /// a one-line `#include <...>` to libclang as an in-memory unsaved file - 
     /// libclang resolves it against its own system search path.  The header
     /// name is validated to path-safe characters first.
-    static import_system_header(header_text: string, extern_node: ExternBlock*,
-                                functions_only: boolean, ctx: CompilationContext*) -> i32 {
+    static import_system_header(header_text: string, extern_node: mut ExternBlock*,
+                                functions_only: boolean, ctx: mut CompilationContext*) -> i32 {
         const header: string = header_text;
         if (!Importer::is_safe_header_name(header)) {
             ctx.diagnostics.emit(Diagnostic::error(
@@ -2390,7 +2390,7 @@ type struct Importer {
     /// file's own location, via `clang_getLocationForOffset`, drives the filter).
     static visit_inclusion(included_file: void*, inclusion_stack: CXSourceLocation*,
                            include_len: u32, client: void*) -> void {
-        const imp: Importer* = client as Importer*;
+        const imp: mut Importer* = client as mut Importer*;
         // Drop system headers first (already covered by the libclang-version
         // fold); this also avoids allocating a path string for files we discard.
         const loc: CXSourceLocation =
@@ -2418,9 +2418,9 @@ type struct Importer {
     /// for the generator's include-graph `.deps` sidecar; null on the inline
     /// path skips the inclusion walk entirely.
     static collect_from_tu(source_filename: u8*, unsaved: CXUnsavedFile*, num_unsaved: u32,
-                           extra_args: &[u8*], label: string, extern_node: ExternBlock*,
+                           extra_args: &[u8*], label: string, extern_node: mut ExternBlock*,
                            functions_only: boolean,
-                           ctx: CompilationContext*, out_report: ImportReport*,
+                           ctx: mut CompilationContext*, out_report: mut ImportReport*,
                            out_inputs: [string]*, lang_text: string, cpp_std_text: string) -> i32 {
         const cpp_std: string = cpp_std_text;
         const lang: string = lang_text;

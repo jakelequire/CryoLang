@@ -67,13 +67,13 @@ import compiler::resolver::mangled_name::{ MangledName };
 type struct ExprOps {
     llvm_module: LModule*;
     builder:     LBuilder*;
-    type_mapper: TypeMapper*;
-    abi:         AbiClassifier*;
-    values:      ValueTable*;
-    functions:   FunctionRegistry*;
-    flow:        IRFlowEmitter*;
-    resolver:    SymbolResolver*;
-    intrinsics:  IntrinsicEmitter*;
+    type_mapper: mut TypeMapper*;
+    abi:         mut AbiClassifier*;
+    values:      mut ValueTable*;
+    functions:   mut FunctionRegistry*;
+    flow:        mut IRFlowEmitter*;
+    resolver:    mut SymbolResolver*;
+    intrinsics:  mut IntrinsicEmitter*;
     diag:        DiagSink*;
     ctx:         CompilationContext*;
 
@@ -188,7 +188,7 @@ type struct ExprOps {
     /// layout, so unresolved `InstantiatedType` wrappers (whose Cryo
     /// `size_bytes()` would be 0) still classify correctly - `map_type`
     /// resolves them where the classifier's source-type unwrap cannot.
-    agg_register_size(mut &this, actual_ty: void*,
+    agg_register_size(mut &this, actual_ty: mut void*,
                       arg_ty_ref: TypeRef, ak: LTypeKind) -> u64 {
         if (ak == LTypeKind::Struct) {
             return this.llvm_module.abi_size_of(LType { raw: actual_ty });
@@ -226,7 +226,7 @@ type struct ExprOps {
 
     intern_str(&this, text: string) -> SymbolStr {
         const c: CompilationContext* = this.ctx;
-        const i: InternTable* = c.intern_table;
+        const i: mut InternTable* = c.intern_table;
         return i.intern(text);
     }
 
@@ -471,8 +471,8 @@ type struct ExprOps {
         mut strcmp_fn: LValue = this.llvm_module.get_named_function(MangledName::new("strcmp"));
         if (!strcmp_fn.is_valid()) {
             const i8_ptr: LType = LType::pointer_to(LType::i8());
-            const param_buf: void* = libc::malloc(16);
-            const params: void** = param_buf as void**;
+            const param_buf: mut void* = libc::malloc(16);
+            const params: mut (mut void*)* = param_buf as mut (mut void*)*;
             params[0] = i8_ptr.raw;
             params[1] = i8_ptr.raw;
             const strcmp_ty: LType = LType::function_type(LType::i32(), param_buf, 2, false);
@@ -482,8 +482,8 @@ type struct ExprOps {
         }
 
         const strcmp_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(strcmp_fn.raw) };
-        const arg_buf: void* = libc::malloc(16);
-        const args: void** = arg_buf as void**;
+        const arg_buf: mut void* = libc::malloc(16);
+        const args: mut (mut void*)* = arg_buf as mut (mut void*)*;
         args[0] = lhs.raw;
         args[1] = rhs.raw;
         const cmp_result: LValue = this.builder.build_call(strcmp_ty, strcmp_fn, arg_buf, 2, "strcmp");
@@ -591,7 +591,7 @@ type struct ExprOps {
     /// type so the full slot is written; same idea for the trunc direction
     /// (an i64 expression initialising an i32 slot).
     init_store_value(mut &this, init_val: LValue, llvm_ty: LType, ty: TypeRef) -> LValue {
-        const init_ty_raw: void* = llvm::LLVMTypeOf(init_val.raw);
+        const init_ty_raw: mut void* = llvm::LLVMTypeOf(init_val.raw);
         if (init_ty_raw == null
                 || LType::kind_of(init_ty_raw) != LTypeKind::Integer
                 || LType::kind_of(llvm_ty.raw) != LTypeKind::Integer) {
@@ -765,14 +765,14 @@ type struct ExprOps {
     /// implementing 4 of these branches, so a call that needed an expanded 9-16
     /// byte aggregate arg AND any of the missing coercions on another arg passed a
     /// wrong-typed value silently.
-    coerce_call_arg(mut &this, expected_ty: void*, arg_val_in: LValue,
+    coerce_call_arg(mut &this, expected_ty: mut void*, arg_val_in: LValue,
                     arg_ty_ref: TypeRef, slot_index: u32,
                     expected_count: u32) -> LValue {
         mut arg_val: LValue = arg_val_in;
         // Every spill slot below goes through `coercion_slot`, not
         // `build_alloca`: a coerced call inside a loop body would otherwise
         // allocate a fresh slot per iteration.
-        const actual_ty: void* = llvm::LLVMTypeOf(arg_val.raw);
+        const actual_ty: mut void* = llvm::LLVMTypeOf(arg_val.raw);
         // Compare by LLVM type kind first to dispatch to
         // shape-aware coercion branches (ptr<->struct, ptr<->int,
         // struct->scalar, etc.).  When kinds match we fall
@@ -828,7 +828,7 @@ type struct ExprOps {
                 mut handled: boolean = false;
                 const opcode: i32 = llvm::LLVMGetInstructionOpcode(arg_val.raw);
                 if (opcode == 27) {
-                    const ptr_operand: void* = llvm::LLVMGetOperand(arg_val.raw, 0);
+                    const ptr_operand: mut void* = llvm::LLVMGetOperand(arg_val.raw, 0);
                     if (ptr_operand != null) {
                         arg_val = LValue { raw: ptr_operand };
                         handled = true;
@@ -862,7 +862,7 @@ type struct ExprOps {
                 mut handled_f: boolean = false;
                 const opcode_f: i32 = llvm::LLVMGetInstructionOpcode(arg_val.raw);
                 if (opcode_f == 27) {
-                    const ptr_operand_f: void* = llvm::LLVMGetOperand(arg_val.raw, 0);
+                    const ptr_operand_f: mut void* = llvm::LLVMGetOperand(arg_val.raw, 0);
                     if (ptr_operand_f != null) {
                         arg_val = LValue { raw: ptr_operand_f };
                         handled_f = true;
@@ -915,7 +915,7 @@ type struct ExprOps {
                     // address values) keep the legitimate inttoptr
                     // below.
                     mut handled_i: boolean = false;
-                    const ptr_operand_i: void* = llvm::LLVMGetOperand(arg_val.raw, 0);
+                    const ptr_operand_i: mut void* = llvm::LLVMGetOperand(arg_val.raw, 0);
                     if (ptr_operand_i != null) {
                         arg_val = LValue { raw: ptr_operand_i };
                         handled_i = true;
@@ -1028,7 +1028,7 @@ type struct ExprOps {
     /// single activation emits exactly one invoke (args are fully emitted
     /// before this point, so no nested call re-enters the armed state).
     build_call_maybe_invoke(mut &this, fn_ty: LType, fn_val: LValue,
-                            args: void*, num_args: u32, name: string) -> LValue {
+                            args: mut void*, num_args: u32, name: string) -> LValue {
         if (this.invoke_active) {
             this.invoke_active = false;
             const then_bb: LBasicBlock = this.invoke_normal;
@@ -1051,8 +1051,8 @@ type struct ExprOps {
         mut fn: LValue = this.llvm_module.get_named_function(MangledName::new("__cryo_personality_v0"));
         if (fn.is_valid()) { return fn; }
         const ptr_ty: LType = LType::pointer_to(LType::i8());
-        const param_buf: void* = libc::malloc(40);
-        const param_slots: void** = param_buf as void**;
+        const param_buf: mut void* = libc::malloc(40);
+        const param_slots: mut (mut void*)* = param_buf as mut (mut void*)*;
         param_slots[0] = LType::i32().raw;
         param_slots[1] = LType::i32().raw;
         param_slots[2] = LType::i64().raw;
@@ -1067,8 +1067,8 @@ type struct ExprOps {
     /// selector).  LLVM uniques literal struct types by structure within a
     /// context, so this returns the same type on every call in a module.
     landingpad_type(mut &this) -> LType {
-        const elems_buf: void* = libc::malloc(16);
-        const elems: void** = elems_buf as void**;
+        const elems_buf: mut void* = libc::malloc(16);
+        const elems: mut (mut void*)* = elems_buf as mut (mut void*)*;
         elems[0] = LType::pointer_to(LType::i8()).raw;
         elems[1] = LType::i32().raw;
         const t: LType = LType::literal_struct(elems_buf, 2, false);
@@ -1128,7 +1128,7 @@ type struct ExprOps {
     /// so a drop that itself unwinds propagates without re-entering this pad; the
     /// arg-temp invoke path is suppressed across both replays so a drop-call does
     /// not re-drop the stack.
-    emit_cleanup_landingpad_sched(mut &this, visitor: IRGeneratorVisitor*, sched: [Stmt*]*,
+    emit_cleanup_landingpad_sched(mut &this, visitor: mut IRGeneratorVisitor*, sched: [Stmt*]*,
                                   cur_fn: LValue, lpad_bb: LBasicBlock) -> void {
         const saved_bb: LBasicBlock = this.builder.get_insert_block();
         const pers: LValue = this.get_or_decl_personality();
@@ -1161,13 +1161,13 @@ type struct ExprOps {
     /// (`unreachable` on the normal edge).  Callers gate this on
     /// `ctx.options.unwinds()` and keep the `abort` trap on the default path,
     /// so emitted IR is unchanged there.
-    emit_panic_diverge_cleanup(mut &this, visitor: IRGeneratorVisitor*, sched: [Stmt*]*,
+    emit_panic_diverge_cleanup(mut &this, visitor: mut IRGeneratorVisitor*, sched: [Stmt*]*,
                                msg: LValue, loc: LValue) -> void {
         const panic_fn: LValue = this.intrinsics.get_or_decl_cryo_panic();
         if (!panic_fn.is_valid()) { return; }
         const fty: LType = LType { raw: llvm::LLVMGlobalGetValueType(panic_fn.raw) };
-        const arg_buf: void* = libc::malloc(16);
-        const arg_slots: void** = arg_buf as void**;
+        const arg_buf: mut void* = libc::malloc(16);
+        const arg_slots: mut (mut void*)* = arg_buf as mut (mut void*)*;
         arg_slots[0] = msg.raw;
         arg_slots[1] = loc.raw;
 
@@ -1201,7 +1201,7 @@ type struct ExprOps {
     /// `span`, cleaning up via `emit_panic_diverge_cleanup`.  The shared body
     /// of every synthesized-check raise (div-by-zero, non-exhaustive match,
     /// `new[]` overflow).
-    emit_check_raise(mut &this, visitor: IRGeneratorVisitor*, sched: [Stmt*]*,
+    emit_check_raise(mut &this, visitor: mut IRGeneratorVisitor*, sched: [Stmt*]*,
                      span: SourceSpan, message: string) -> void {
         const msg: LValue = this.builder.build_global_string_ptr(message, "check.msg");
         this.emit_panic_diverge_cleanup(visitor, sched, msg, this.intrinsics.location_global(span));
@@ -1233,7 +1233,7 @@ type struct ExprOps {
         // ptr era), LLVMCountParamTypes still works on function types.
         // Also try LLVMCountParams on the callee value as fallback.
         mut expected_count: u32 = llvm::LLVMCountParamTypes(callee_type.raw);
-        mut param_types_buf: void* = null;
+        mut param_types_buf: mut void* = null;
         if (expected_count > 0 && expected_count <= 64) {
             param_types_buf = libc::malloc(expected_count as u64 * 8);
             llvm::LLVMGetParamTypes(callee_type.raw, param_types_buf);
@@ -1255,9 +1255,9 @@ type struct ExprOps {
         }
 
         // Build argument array, coercing integer widths where needed.
-        const buf: void* = libc::malloc(n as u64 * 8);
-        const slots: void** = buf as void**;
-        const param_types: void** = param_types_buf as void**;
+        const buf: mut void* = libc::malloc(n as u64 * 8);
+        const slots: mut (mut void*)* = buf as mut (mut void*)*;
+        const param_types: mut void** = param_types_buf as mut void**;
         for (mut i: u32 = 0; i < n; i++) {
             mut arg_val: LValue = args[i as i64].first;
             const arg_ty_ref: TypeRef = args[i as i64].second;
@@ -1322,16 +1322,16 @@ type struct ExprOps {
                                   param_types_buf: void*, expected_count: u32,
                                   name: string) -> LValue {
         const n: u32 = args.length() as u32;
-        const param_types: void** = param_types_buf as void**;
-        const buf: void* = libc::malloc(expected_count as u64 * 8);
-        const slots: void** = buf as void**;
+        const param_types: mut void** = param_types_buf as mut void**;
+        const buf: mut void* = libc::malloc(expected_count as u64 * 8);
+        const slots: mut (mut void*)* = buf as mut (mut void*)*;
 
         mut source_idx: u32 = 0;
         mut llvm_slot_idx: u32 = 0;
         while (source_idx < n && llvm_slot_idx < expected_count) {
             mut arg_val: LValue = args[source_idx as i64].first;
             const arg_ty_ref: TypeRef = args[source_idx as i64].second;
-            const expected_ty: void* = param_types[llvm_slot_idx];
+            const expected_ty: mut void* = param_types[llvm_slot_idx];
             // A null argument means an upstream codegen failure already
             // produced (and queued) a diagnostic for the argument
             // expression - e.g. an unresolved nested callee. Bail rather
@@ -1342,7 +1342,7 @@ type struct ExprOps {
                 libc::free(buf);
                 return LValue::null();
             }
-            const actual_ty: void* = llvm::LLVMTypeOf(arg_val.raw);
+            const actual_ty: mut void* = llvm::LLVMTypeOf(arg_val.raw);
             const ek: LTypeKind = LType::kind_of(expected_ty);
             const ak: LTypeKind = LType::kind_of(actual_ty);
 
@@ -1430,8 +1430,8 @@ type struct ExprOps {
 
                 // Hi half: GEP `i8, ptr %src, i64 8` then load.
                 const i8_ty: LType = LType::i8();
-                const idx_buf: void* = libc::malloc(8);
-                const idx_arr: void** = idx_buf as void**;
+                const idx_buf: mut void* = libc::malloc(8);
+                const idx_arr: mut (mut void*)* = idx_buf as mut (mut void*)*;
                 const eight: LValue = LType::const_int(LType::i64(), 8, false);
                 idx_arr[0] = eight.raw;
                 const hi_ptr: LValue = this.builder.build_gep(
@@ -1501,7 +1501,7 @@ type struct ExprOps {
     /// `append_entry` is the `append` a string `+` was bound to where it is
     /// written (`BinaryExpr::append_entry`).
     codegen_binary(mut &this, lhs_val: LValue, rhs_val: LValue, op_kind: TokenType, result_type: TypeRef, rhs_type: TypeRef,
-                   append_entry: OverloadId, visitor: IRGeneratorVisitor*, div_sched: [Stmt*]*, div_span: SourceSpan) -> LValue {
+                   append_entry: OverloadId, visitor: mut IRGeneratorVisitor*, div_sched: [Stmt*]*, div_span: SourceSpan) -> LValue {
         mut out_value: LValue = LValue::null();
         if (!lhs_val.is_valid() || !rhs_val.is_valid()) {
             out_value = LValue::null();
@@ -1533,13 +1533,13 @@ type struct ExprOps {
             if (op_kind == TokenType::Plus) {
                 // Decide concat vs pointer-advance by the RHS's LLVM type.
                 // Both operands are already rvalues at this point.
-                const rhs_llvm: void* = llvm::LLVMTypeOf(rhs_val.raw);
+                const rhs_llvm: mut void* = llvm::LLVMTypeOf(rhs_val.raw);
                 if (rhs_llvm != null && LType::kind_of(rhs_llvm) == LTypeKind::Integer) {
                     // string + int -> GEP i8 for pointer arithmetic.
                     // Caller uses this idiom for substring-from-offset,
                     // C-string walking, etc.
-                    const buf: void* = libc::malloc(8);
-                    const slots: void** = buf as void**;
+                    const buf: mut void* = libc::malloc(8);
+                    const slots: mut (mut void*)* = buf as mut (mut void*)*;
                     slots[0] = rhs_val.raw;
                     out_value = this.builder.build_gep(
                         LType::i8(), lhs_val, buf, 1, "ptradv");
@@ -1588,8 +1588,8 @@ type struct ExprOps {
                 // this, `-` fell through to the null-return below and
                 // silently miscompiled.
                 const neg: LValue = this.builder.build_neg(rhs_val, "stroff.neg");
-                const buf: void* = libc::malloc(8);
-                const slots: void** = buf as void**;
+                const buf: mut void* = libc::malloc(8);
+                const slots: mut (mut void*)* = buf as mut (mut void*)*;
                 slots[0] = neg.raw;
                 out_value = this.builder.build_gep(
                     LType::i8(), lhs_val, buf, 1, "ptrret");
@@ -1627,7 +1627,7 @@ type struct ExprOps {
                 mut lhs_tag: LValue = lhs_val;
                 mut rhs_tag: LValue = rhs_val;
                 // Check if this is an ADT enum (struct type in LLVM) or simple (i32).
-                const lhs_llvm_ty: void* = llvm::LLVMTypeOf(lhs_val.raw);
+                const lhs_llvm_ty: mut void* = llvm::LLVMTypeOf(lhs_val.raw);
                 if (lhs_llvm_ty != null && LType::kind_of(lhs_llvm_ty) == LTypeKind::Struct) {
                     // ADT enum: extract the discriminant tag at field 0
                     // before comparing.  Skipping this would feed the
@@ -1686,8 +1686,8 @@ type struct ExprOps {
                 if (op_kind == TokenType::Minus) {
                     idx = this.builder.build_neg(rhs_val, "gep.neg");
                 }
-                const buf: void* = libc::malloc(8);
-                const slots: void** = buf as void**;
+                const buf: mut void* = libc::malloc(8);
+                const slots: mut (mut void*)* = buf as mut (mut void*)*;
                 slots[0] = idx.raw;
                 out_value = this.builder.build_gep(
                     pointee_lty, lhs_val, buf, 1, "ptradv");
@@ -1737,8 +1737,8 @@ type struct ExprOps {
         // extend the narrower one to match the wider.
         mut lhs: LValue = lhs_val;
         mut rhs: LValue = rhs_val;
-        const lhs_ty: void* = llvm::LLVMTypeOf(lhs.raw);
-        const rhs_ty: void* = llvm::LLVMTypeOf(rhs.raw);
+        const lhs_ty: mut void* = llvm::LLVMTypeOf(lhs.raw);
+        const rhs_ty: mut void* = llvm::LLVMTypeOf(rhs.raw);
         const lhs_kind: LTypeKind = LType::kind_of(lhs_ty);
         const rhs_kind: LTypeKind = LType::kind_of(rhs_ty);
         const lhs_fp: boolean = lhs_kind == LTypeKind::Float
@@ -1756,7 +1756,7 @@ type struct ExprOps {
         if (lhs_ty != null && rhs_ty != null && (lhs_fp || rhs_fp)
                 && (lhs_fp || lhs_kind == LTypeKind::Integer)
                 && (rhs_fp || rhs_kind == LTypeKind::Integer)) {
-            mut target_raw: void* = lhs_ty;
+            mut target_raw: mut void* = lhs_ty;
             if (!lhs_fp) {
                 target_raw = rhs_ty;
             } else if (rhs_fp && rhs_kind == LTypeKind::Double
@@ -2070,8 +2070,8 @@ type struct ExprOps {
     /// builds (default), so the guard has no steady-state runtime cost
     /// when the compiler can prove safety statically.
     emit_int_div_guard(mut &this, lhs: LValue, rhs: LValue, is_signed: boolean,
-                       visitor: IRGeneratorVisitor*, div_sched: [Stmt*]*, div_span: SourceSpan) -> void {
-        const rhs_ty_raw: void* = llvm::LLVMTypeOf(rhs.raw);
+                       visitor: mut IRGeneratorVisitor*, div_sched: [Stmt*]*, div_span: SourceSpan) -> void {
+        const rhs_ty_raw: mut void* = llvm::LLVMTypeOf(rhs.raw);
         if (rhs_ty_raw == null) { return; }
         const rhs_ty: LType = LType { raw: rhs_ty_raw };
         const zero: LValue = LType::const_int(rhs_ty, 0 as u64, false);
@@ -2080,7 +2080,7 @@ type struct ExprOps {
 
         mut trap_cond: LValue = is_zero;
         if (is_signed) {
-            const lhs_ty_raw: void* = llvm::LLVMTypeOf(lhs.raw);
+            const lhs_ty_raw: mut void* = llvm::LLVMTypeOf(lhs.raw);
             const lhs_ty: LType = LType { raw: lhs_ty_raw };
             const width: u32 = llvm::LLVMGetIntTypeWidth(lhs_ty_raw);
             // -1 is all-ones in two's complement at any width; const_int
@@ -2143,7 +2143,7 @@ type struct ExprOps {
     /// can never overflow, so the guard is elided. Leaves the builder at the
     /// ok block; mirrors `emit_int_div_guard`'s trap shape.
     emit_array_mul_guard(mut &this, count_i64: LValue, elem_size: u64,
-                         visitor: IRGeneratorVisitor*, ovf_sched: [Stmt*]*, ovf_span: SourceSpan) -> void {
+                         visitor: mut IRGeneratorVisitor*, ovf_sched: [Stmt*]*, ovf_span: SourceSpan) -> void {
         if (elem_size <= (1 as u64)) { return; }
         const u64_max: u64 = (0 as u64) - (1 as u64);
         const max_count: u64 = u64_max / elem_size;
@@ -2212,8 +2212,8 @@ type struct ExprOps {
     coerce_icmp_operands(mut &this, lhs: LValue, rhs: LValue,
                          subj_ty: TypeRef) -> LValue {
         if (!lhs.is_valid() || !rhs.is_valid()) { return rhs; }
-        const lhs_ty_raw: void* = llvm::LLVMTypeOf(lhs.raw);
-        const rhs_ty_raw: void* = llvm::LLVMTypeOf(rhs.raw);
+        const lhs_ty_raw: mut void* = llvm::LLVMTypeOf(lhs.raw);
+        const rhs_ty_raw: mut void* = llvm::LLVMTypeOf(rhs.raw);
         if (LType::kind_of(lhs_ty_raw) != LTypeKind::Integer) { return rhs; }
         if (LType::kind_of(rhs_ty_raw) != LTypeKind::Integer) { return rhs; }
         const lhs_bits: u32 = llvm::LLVMGetIntTypeWidth(lhs_ty_raw);
@@ -2499,7 +2499,7 @@ type struct ExprOps {
                         // Normalise to a struct value before storing
                         // through the sret slot.
                         mut store_val: LValue = val;
-                        const got_ty_raw: void* = llvm::LLVMTypeOf(val.raw);
+                        const got_ty_raw: mut void* = llvm::LLVMTypeOf(val.raw);
                         if (LType::kind_of(got_ty_raw) == LTypeKind::Pointer) {
                             store_val = this.builder.build_load(
                                 sret_pointee, val, "sret.load");
@@ -2510,9 +2510,9 @@ type struct ExprOps {
                         return;
                     }
 
-                    const fn_ty_raw: void* = llvm::LLVMGlobalGetValueType(fn.raw);
+                    const fn_ty_raw: mut void* = llvm::LLVMGlobalGetValueType(fn.raw);
                     if (LType::kind_of(fn_ty_raw) == LTypeKind::Function) {
-                        const ret_ty_raw: void* = llvm::LLVMGetReturnType(fn_ty_raw);
+                        const ret_ty_raw: mut void* = llvm::LLVMGetReturnType(fn_ty_raw);
                         if (LType::kind_of(ret_ty_raw) == LTypeKind::Void) {
                             this.emit_va_end_if_variadic();
                             this.builder.build_ret_void();
@@ -2531,7 +2531,7 @@ type struct ExprOps {
                         // see that file for the structural-comparison
                         // rationale (Cryo's void* != doesn't reliably
                         // distinguish distinct LLVM type handles).
-                        const got_ty_raw: void* = llvm::LLVMTypeOf(val.raw);
+                        const got_ty_raw: mut void* = llvm::LLVMTypeOf(val.raw);
                         if (got_ty_raw != null && got_ty_raw != ret_ty_raw) {
                             const ret_k: LTypeKind = LType::kind_of(ret_ty_raw);
                             const got_k: LTypeKind = LType::kind_of(got_ty_raw);
@@ -2594,12 +2594,12 @@ type struct ExprOps {
         const fn: LValue = cur_bb.get_parent();
         if (!fn.is_valid()) { return val; }
 
-        const fn_ty_raw: void* = llvm::LLVMGlobalGetValueType(fn.raw);
+        const fn_ty_raw: mut void* = llvm::LLVMGlobalGetValueType(fn.raw);
         if (LType::kind_of(fn_ty_raw) != LTypeKind::Function) {
             return val;
         }
-        const want_ty_raw: void* = llvm::LLVMGetReturnType(fn_ty_raw);
-        const got_ty_raw: void* = llvm::LLVMTypeOf(val.raw);
+        const want_ty_raw: mut void* = llvm::LLVMGetReturnType(fn_ty_raw);
+        const got_ty_raw: mut void* = llvm::LLVMTypeOf(val.raw);
 
         const want_kind: LTypeKind = LType::kind_of(want_ty_raw);
         const got_kind:  LTypeKind = LType::kind_of(got_ty_raw);
@@ -2623,7 +2623,7 @@ type struct ExprOps {
         if (want_kind == LTypeKind::Pointer && got_kind == LTypeKind::Struct) {
             const opcode: i32 = llvm::LLVMGetInstructionOpcode(val.raw);
             if (opcode == 27) {
-                const ptr_operand: void* = llvm::LLVMGetOperand(val.raw, 0);
+                const ptr_operand: mut void* = llvm::LLVMGetOperand(val.raw, 0);
                 if (ptr_operand != null) {
                     return LValue { raw: ptr_operand };
                 }

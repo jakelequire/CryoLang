@@ -222,7 +222,7 @@ type struct CodegenPasses {
     /// puts it in that error; a command that succeeds has its output printed
     /// here, as it would have been (a linker's warnings).  The log is
     /// removed on success and kept on failure, beside the response file.
-    static run_tool(cmd_text: string, log_path_text: string, out: string*) -> i32 {
+    static run_tool(cmd_text: string, log_path_text: string, out: mut string*) -> i32 {
         const log_path: string = log_path_text;
         const rc: i32 = CodegenPasses::capture_tool(cmd_text, log_path_text, out);
         const text: string = *out;
@@ -236,7 +236,7 @@ type struct CodegenPasses {
     /// Run a toolchain command with its combined output captured to
     /// `log_path`, and answer its exit code, the output in `*out`.  The log
     /// is left in place and nothing is printed: the caller decides both.
-    static capture_tool(cmd_text: string, log_path_text: string, out: string*) -> i32 {
+    static capture_tool(cmd_text: string, log_path_text: string, out: mut string*) -> i32 {
         const cmd: string = cmd_text;
         const log_path: string = log_path_text;
         const rc: i32 = Command::shell(fmt::format("%s > %s 2>&1", cmd,
@@ -687,8 +687,8 @@ type struct CodegenPasses {
                 const st0: StructType* = t.as_struct();
                 const nf: u32 = st0.fields.length() as u32;
                 if (!st0.is_union && nf > 0) {
-                    const fbuf: void* = libc::malloc(nf as u64 * 8);
-                    const fslots: void** = fbuf as void**;
+                    const fbuf: mut void* = libc::malloc(nf as u64 * 8);
+                    const fslots: mut (mut void*)* = fbuf as mut (mut void*)*;
                     // Read the cache; do NOT map.  Mapping here would add
                     // entries the module never asked for, and the next
                     // module would then find them cached -- an instrument
@@ -773,7 +773,7 @@ type struct CodegenPasses {
 
     /// IRGeneration pass.  Creates an LLVM module, walks the AST, and
     /// produces LLVM IR.  Stores result in ctx.artifacts.ir.
-    static run_ir_generation(ctx: CompilationContext*) -> PassResult {
+    static run_ir_generation(ctx: mut CompilationContext*) -> PassResult {
         // If an earlier pass (name resolution, sema, move-check, ...) already
         // reported an error, the program is ill-typed and any IR we produce is
         // unsound - e.g. a wrong-arity call lowers to an LLVM `call` with the
@@ -805,7 +805,7 @@ type struct CodegenPasses {
         // CompilationContext is already large on the stack, and CodegenContext
         // adds ~400+ bytes of arrays and maps per module.
         const _box_cg: Box<CodegenContext> = Box::<CodegenContext>::new(CodegenContext::new(ctx, module_name));
-        const cg: CodegenContext* = _box_cg.into_raw();
+        const cg: mut CodegenContext* = _box_cg.into_raw();
         // Two-phase init step 2: wire back-pointers on sub-components now
         // that `cg` is at its stable heap address.  Wiring before the move
         // into the Box would leave back-pointers dangling at the source.
@@ -852,7 +852,7 @@ type struct CodegenPasses {
         // so sub-emitters can hold stable `state: VisitorState*` back-pointers
         // into `gen.state`; same two-phase pattern as `CodegenContext` above.
         const _box_gen: Box<IRGeneratorVisitor> = Box::<IRGeneratorVisitor>::new(IRGeneratorVisitor::new(cg));
-        const gen: IRGeneratorVisitor* = _box_gen.into_raw();
+        const gen: mut IRGeneratorVisitor* = _box_gen.into_raw();
         // Two-phase init step 2: wire back-pointers on sub-emitters now
         // that `gen` is at its stable heap address.  No-op while the
         // visitor's sub-emitter set is empty; the call site is in place
@@ -897,9 +897,9 @@ type struct CodegenPasses {
         // LLVMVerifyModule (which crashes on null function types).
         mut has_corrupt: boolean = false;
         {
-            mut fn_val: void* = llvm::LLVMGetFirstFunction(cg.llvm_module.raw);
+            mut fn_val: mut void* = llvm::LLVMGetFirstFunction(cg.llvm_module.raw);
             while (fn_val != null) {
-                const fn_ty: void* = llvm::LLVMGlobalGetValueType(fn_val);
+                const fn_ty: mut void* = llvm::LLVMGlobalGetValueType(fn_val);
                 if (fn_ty == null) {
                     const fn_name: string = llvm::LLVMGetValueName(fn_val) as string;
                     Log::error(LogArea::Codegen, f"corrupt function '{fn_name}' in module {module_name}: null type");
@@ -913,7 +913,7 @@ type struct CodegenPasses {
                     }
                     const param_count: u32 = llvm::LLVMCountParamTypes(fn_ty);
                     if (param_count > 0) {
-                        const param_buf: void* = libc::malloc(param_count as u64 * 8);
+                        const param_buf: mut void* = libc::malloc(param_count as u64 * 8);
                         llvm::LLVMGetParamTypes(fn_ty, param_buf);
                         const slots: void** = param_buf as void**;
                         for (mut pi: u32 = 0; pi < param_count; pi++) {
@@ -935,7 +935,7 @@ type struct CodegenPasses {
         } else {
             // Verify the LLVM module.
             mut verify_err: i8* = null;
-            const verify_result: i32 = llvm::LLVMVerifyModule(cg.llvm_module.raw, 2, &verify_err as void*);
+            const verify_result: i32 = llvm::LLVMVerifyModule(cg.llvm_module.raw, 2, &verify_err as mut void*);
             if (verify_result != 0) {
                 // Print verifier output directly so the user can see which
                 // module / function the verifier choked on. Then emit a
@@ -962,7 +962,7 @@ type struct CodegenPasses {
                 }
                 ctx.diagnostics.emit(diag);
                 if (verify_err != null) {
-                    llvm::LLVMDisposeMessage(verify_err as void*);
+                    llvm::LLVMDisposeMessage(verify_err as mut void*);
                 }
                 ctx.artifacts.unverified_ir = IROutput {
                     llvm_module: cg.llvm_module.raw,
@@ -973,7 +973,7 @@ type struct CodegenPasses {
                 return PassResult::failure(1);
             }
             if (verify_err != null) {
-                llvm::LLVMDisposeMessage(verify_err as void*);
+                llvm::LLVMDisposeMessage(verify_err as mut void*);
             }
         }
 
@@ -983,7 +983,7 @@ type struct CodegenPasses {
 
         // `![inline]` is honoured at every optimization level, and level 0's
         // pipeline runs no inliner: inline its calls here.
-        const ai_opts: void* = llvm::LLVMCreatePassBuilderOptions();
+        const ai_opts: mut void* = llvm::LLVMCreatePassBuilderOptions();
         const ai_rc: i32 = llvm::LLVMRunPasses(cg.llvm_module.raw, "always-inline", tm.raw, ai_opts);
         llvm::LLVMDisposePassBuilderOptions(ai_opts);
         if (ai_rc != 0) {
@@ -1088,7 +1088,7 @@ type struct CodegenPasses {
 
     /// Copy bytes from `*cursor` up to (not including) the next '\n' into a
     /// fresh NUL-terminated string, then advance `*cursor` past the '\n'.
-    static scan_line(p: u8*, n: i64, cursor: i64*) -> string {
+    static scan_line(p: u8*, n: i64, cursor: mut i64*) -> string {
         const start: i64 = *cursor;
         mut i: i64 = start;
         while (i < n && p[i] != 10) { i = i + 1; }
@@ -1320,7 +1320,7 @@ type struct CodegenPasses {
     }
 
     /// E0647: LLVM has no target for `triple`, for LLVM's `reason`.
-    static report_missing_target(ctx: CompilationContext*, triple: string, mut reason: String) -> void {
+    static report_missing_target(ctx: mut CompilationContext*, triple: string, mut reason: String) -> void {
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0647_LLVM_BACKEND_FAILED,
             fmt::format("LLVM has no target for the triple '%s': %s", triple, reason.as_cstr() as string));
         d = d.help("name a triple this compiler's LLVM supports, with `--target` or cryoconfig's `target_triple`; `cryo version --triple` prints the host's");
@@ -1329,21 +1329,21 @@ type struct CodegenPasses {
 
     /// E0647: the out-of-process emitter's workers could not be run, or one
     /// of them failed, for `reason`.
-    static report_emit_workers_failed(ctx: CompilationContext*, mut reason: String) -> void {
+    static report_emit_workers_failed(ctx: mut CompilationContext*, mut reason: String) -> void {
         ctx.emit_error(ErrorCode::E0647_LLVM_BACKEND_FAILED,
             fmt::format("the out-of-process object emitter failed: %s", reason.as_cstr() as string));
     }
 
     /// E0605: LLVM refused to run its optimization pipeline over the module
     /// that was to be emitted at `path`.
-    static report_optimization_failure(ctx: CompilationContext*, path: string) -> void {
+    static report_optimization_failure(ctx: mut CompilationContext*, path: string) -> void {
         ctx.emit_error(ErrorCode::E0605_OPTIMIZATION_FAILED,
             fmt::format("LLVM's optimization pipeline failed for the module emitted at '%s'", path));
     }
 
     /// E0647: LLVM could not write the object or assembly file at `path`,
     /// for LLVM's `reason`, which may be empty.
-    static report_emit_failure(ctx: CompilationContext*, path: string, mut reason: String) -> void {
+    static report_emit_failure(ctx: mut CompilationContext*, path: string, mut reason: String) -> void {
         if (reason.is_empty()) {
             ctx.emit_error(ErrorCode::E0647_LLVM_BACKEND_FAILED,
                 fmt::format("LLVM could not emit '%s'", path));
@@ -1353,7 +1353,7 @@ type struct CodegenPasses {
             fmt::format("LLVM could not emit '%s': %s", path, reason.as_cstr() as string));
     }
 
-    static run_object_emission(ctx: CompilationContext*) -> PassResult {
+    static run_object_emission(ctx: mut CompilationContext*) -> PassResult {
         if (!ctx.artifacts.ir.is_valid()) {
             return PassResult::ok();
         }
@@ -1463,19 +1463,19 @@ type struct CodegenPasses {
     /// Dump the LLVM module to a `.ll` text file at `path`.  Skips the
     /// target machine entirely; IR text is target-independent and the
     /// only failure mode is filesystem (permissions, missing parent).
-    static emit_ir_text(ctx: CompilationContext*, path_text: string) -> PassResult {
+    static emit_ir_text(ctx: mut CompilationContext*, path_text: string) -> PassResult {
         const path: string = path_text;
-        const mod_ref: void* = ctx.artifacts.ir.llvm_module;
+        const mod_ref: mut void* = ctx.artifacts.ir.llvm_module;
         mut err: i8* = null;
-        const rc: i32 = llvm::LLVMPrintModuleToFile(mod_ref, path, &err as void*);
+        const rc: i32 = llvm::LLVMPrintModuleToFile(mod_ref, path, &err as mut void*);
         if (rc != 0) {
             const note: string = if (err != null) { err as string } else { "(no detail)" };
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 fmt::format("failed to write IR text to %s: %s", path, note));
-            if (err != null) { llvm::LLVMDisposeMessage(err as void*); }
+            if (err != null) { llvm::LLVMDisposeMessage(err as mut void*); }
             return PassResult::failure(1);
         }
-        if (err != null) { llvm::LLVMDisposeMessage(err as void*); }
+        if (err != null) { llvm::LLVMDisposeMessage(err as mut void*); }
         ctx.artifacts.linked = LinkedOutput { object_file_path: path };
         Log::debug(LogArea::Codegen, f"emitted ir text {path}");
         return PassResult::ok();
@@ -1487,7 +1487,7 @@ type struct CodegenPasses {
     /// executable at `{output_dir}/{project_name}` (build root).  Pulls link
     /// libs/paths from the parsed cryoconfig, and tacks on the stdlib
     /// archive whenever `no_std` is not set.
-    static run_linking(ctx: CompilationContext*) -> PassResult {
+    static run_linking(ctx: mut CompilationContext*) -> PassResult {
         if (ctx.artifacts.object_files.length() == 0) {
             // Nothing to link: library/stdlib batch build, or codegen
             // was disabled (LSP mode).  Not an error.
@@ -1785,7 +1785,7 @@ type struct CodegenPasses {
     /// `<root>/../stdlib/.bin/libcryo.a`); Library targets use
     /// `lib<project_name>.a` per the usual convention.
     /// `ar rcs` is idempotent; re-runs overwrite the archive cleanly.
-    static bundle_archive(ctx: CompilationContext*) -> PassResult {
+    static bundle_archive(ctx: mut CompilationContext*) -> PassResult {
         if (ctx.project_config == null) {
             return PassResult::ok();
         }
@@ -1805,7 +1805,7 @@ type struct CodegenPasses {
     /// "link-twice" path, where a `[[bin]]` derives `lib<name>.a` from its own
     /// object set (minus the entry module) instead of a second full compile.
     static bundle_object_list(
-        ctx: CompilationContext*, archive_path_text: string, objs: &[string]
+        ctx: mut CompilationContext*, archive_path_text: string, objs: &[string]
     ) -> PassResult {
         const archive_path: string = archive_path_text;
         // Invoke `<ar> rcs <archive> @<response-file>`.  `r` replaces stale
@@ -1889,11 +1889,11 @@ type struct CodegenPasses {
     /// return true.  Used by the cascade-strip pass to identify callers of
     /// stripped same-module siblings (e.g. `Array<T>::quicksort` calling a
     /// stripped `Array<T>::partition`).
-    static function_calls_stripped(cg: CodegenContext*, fn_val: void*) -> boolean {
+    static function_calls_stripped(cg: CodegenContext*, fn_val: mut void*) -> boolean {
         if (fn_val == null) { return false; }
-        mut bb: void* = llvm::LLVMGetFirstBasicBlock(fn_val);
+        mut bb: mut void* = llvm::LLVMGetFirstBasicBlock(fn_val);
         while (bb != null) {
-            mut inst: void* = llvm::LLVMGetFirstInstruction(bb);
+            mut inst: mut void* = llvm::LLVMGetFirstInstruction(bb);
             while (inst != null) {
                 // LLVMOpcode::Call = 45 in the LLVM-C enum (verify via
                 // `<llvm-c/Core.h>`, same value across LLVM 14-20).  CallBr
@@ -1923,16 +1923,16 @@ type struct CodegenPasses {
     /// The handles go on `cg.debug_info` for the function prologue to attach
     /// per-function DISubprograms; `LLVMDIBuilderFinalize` must be called
     /// before verification. No-op when debug info is off.
-    static setup_debug_info(ctx: CompilationContext*, cg: CodegenContext*) -> void {
+    static setup_debug_info(ctx: CompilationContext*, cg: mut CodegenContext*) -> void {
         if (!ctx.options.debug_info) { return; }
-        const module_raw: void* = cg.llvm_module.raw;
+        const module_raw: mut void* = cg.llvm_module.raw;
 
-        const dib: void* = llvm::LLVMCreateDIBuilder(module_raw);
+        const dib: mut void* = llvm::LLVMCreateDIBuilder(module_raw);
 
         // DIFile: use the module's source path as the file name and "." as the
         // directory; debuggers join the two.
         const src: string = ctx.source_file;
-        const file: void* = llvm::LLVMDIBuilderCreateFile(
+        const file: mut void* = llvm::LLVMDIBuilderCreateFile(
             dib, src, src.length(), ".", 1);
         cg.debug_info = DebugInfoState { builder: dib, file: file };
 
@@ -1959,11 +1959,11 @@ type struct CodegenPasses {
         // LContext::current()), so these module-flag constants match the
         // module's context rather than the global one.
         const ver_key: string = "Debug Info Version";
-        const dver: void* = llvm::LLVMValueAsMetadata(
+        const dver: mut void* = llvm::LLVMValueAsMetadata(
             llvm::LLVMConstInt(LType::i32().raw, 3, 0));
         llvm::LLVMAddModuleFlag(module_raw, 1, ver_key, ver_key.length(), dver);
         const dwarf_key: string = "Dwarf Version";
-        const dwarf: void* = llvm::LLVMValueAsMetadata(
+        const dwarf: mut void* = llvm::LLVMValueAsMetadata(
             llvm::LLVMConstInt(LType::i32().raw, 4, 0));
         llvm::LLVMAddModuleFlag(module_raw, 1, dwarf_key, dwarf_key.length(), dwarf);
     }
@@ -1979,11 +1979,11 @@ type struct CodegenPasses {
     /// already reported by `report_invalid_function_body`; cascade entries
     /// are downstream noise that exists only to avoid the worse alternative
     /// of a half-built body that fails LLVM verification.
-    static cascade_strip_dependents(cg: CodegenContext*) -> void {
+    static cascade_strip_dependents(cg: mut CodegenContext*) -> void {
         mut iterations: i32 = 0;
         while (iterations < 16) {
             mut newly_stripped: i32 = 0;
-            mut fn_val: void* = llvm::LLVMGetFirstFunction(cg.llvm_module.raw);
+            mut fn_val: mut void* = llvm::LLVMGetFirstFunction(cg.llvm_module.raw);
             while (fn_val != null) {
                 const next_fn: void* = llvm::LLVMGetNextFunction(fn_val);
                 // Only consider functions WITH a body.
@@ -2276,7 +2276,7 @@ type struct EmitTarget {
 // found the `LLVMAppendBasicBlock` (global-context) leak; keep it as a guard
 // against reintroducing that whole class of bug.
 // ---------------------------------------------------------------------------
-function ctx_audit_type(ty: void*, mod_ctx: void*, seen: [void*]*,
+function ctx_audit_type(ty: mut void*, mod_ctx: void*, seen: [void*]*,
                         mod_name: string, whence: string) -> void {
     if (ty == null) { return; }
     for (mut i: i64 = 0; i < (*seen).length() as i64; i++) {
@@ -2301,29 +2301,29 @@ function ctx_audit_type(ty: void*, mod_ctx: void*, seen: [void*]*,
     }
 }
 
-function ctx_audit_module(module_raw: void*, mod_name: string) -> void {
+function ctx_audit_module(module_raw: mut void*, mod_name: string) -> void {
     const mod_ctx: void* = llvm::LLVMGetModuleContext(module_raw);
     mut seen: [void*] = [];
-    mut g: void* = llvm::LLVMGetFirstGlobal(module_raw);
+    mut g: mut void* = llvm::LLVMGetFirstGlobal(module_raw);
     while (g != null) {
         ctx_audit_type(llvm::LLVMGlobalGetValueType(g), mod_ctx, &seen, mod_name, "global-valtype");
-        const init: void* = llvm::LLVMGetInitializer(g);
+        const init: mut void* = llvm::LLVMGetInitializer(g);
         if (init != null) {
             ctx_audit_type(llvm::LLVMTypeOf(init), mod_ctx, &seen, mod_name, "global-init");
         }
         g = llvm::LLVMGetNextGlobal(g);
     }
-    mut f: void* = llvm::LLVMGetFirstFunction(module_raw);
+    mut f: mut void* = llvm::LLVMGetFirstFunction(module_raw);
     while (f != null) {
         ctx_audit_type(llvm::LLVMGlobalGetValueType(f), mod_ctx, &seen, mod_name, "fn-type");
-        mut bb: void* = llvm::LLVMGetFirstBasicBlock(f);
+        mut bb: mut void* = llvm::LLVMGetFirstBasicBlock(f);
         while (bb != null) {
-            mut inst: void* = llvm::LLVMGetFirstInstruction(bb);
+            mut inst: mut void* = llvm::LLVMGetFirstInstruction(bb);
             while (inst != null) {
                 ctx_audit_type(llvm::LLVMTypeOf(inst), mod_ctx, &seen, mod_name, "inst-type");
                 const nops: i32 = llvm::LLVMGetNumOperands(inst);
                 for (mut k: i32 = 0; k < nops; k++) {
-                    const op: void* = llvm::LLVMGetOperand(inst, k as u32);
+                    const op: mut void* = llvm::LLVMGetOperand(inst, k as u32);
                     if (op != null) {
                         ctx_audit_type(llvm::LLVMTypeOf(op), mod_ctx, &seen, mod_name, "operand-type");
                     }
@@ -2346,9 +2346,9 @@ type struct EmitJob {
     // raw LLVM emit call and defers error reporting to the main thread), so the
     // compiler's single-threaded bump arena is never accessed off the main
     // thread - no round-trip, no arena pause.
-    llvm_module:     void*;     // LLVMModuleRef (live), owned by this job
-    llvm_context:    void*;     // its LLVMContextRef, owned by this job
-    tm:              void*;     // LLVMTargetMachineRef, built on the main thread
+    llvm_module:     mut void*;     // LLVMModuleRef (live), owned by this job
+    llvm_context:    mut void*;     // its LLVMContextRef, owned by this job
+    tm:              mut void*;     // LLVMTargetMachineRef, built on the main thread
     emit_path:       string;
     emit_type:       LFileType;
     triple:          string;
@@ -2367,7 +2367,7 @@ type struct EmitJob {
 /// IRGeneration).  A top-level function (not a method/lambda), a form usable
 /// as a thread entry point; emission is serial in-process here and
 /// out-of-process for large builds.
-function codegen_emit_job(job: EmitJob*) -> void {
+function codegen_emit_job(job: mut EmitJob*) -> void {
     // Emit this module's live IR directly with its main-thread-built target
     // machine.  Deliberately ALLOCATION-FREE on the Cryo side: it makes the raw
     // LLVM emit call and, on error, stashes the LLVM message pointer in the job
@@ -2391,7 +2391,7 @@ function codegen_emit_job(job: EmitJob*) -> void {
     mut err: i8* = null;
     const rc: i32 = llvm::LLVMTargetMachineEmitToFile(
         (*job).tm, (*job).llvm_module, (*job).emit_path,
-        (*job).emit_type as i32, &err as void*);
+        (*job).emit_type as i32, &err as mut void*);
     // Hand the LLVM error string to the main thread instead of discarding it
     // (storing the raw pointer allocates nothing on the Cryo side); the
     // main thread reports it and disposes it.
@@ -2407,7 +2407,7 @@ function codegen_emit_job(job: EmitJob*) -> void {
 /// no lock.  `jobs` is the array's stable base pointer: the producer stops
 /// pushing before any worker is spawned, so no realloc can move it mid-emit.
 type struct EmitWorkerCtx {
-    jobs:   EmitJob*;   // stable base of the finalized job array (not owned)
+    jobs:   mut EmitJob*;   // stable base of the finalized job array (not owned)
     count:  i64;        // total job count
     start:  u32;        // this worker's first index
     stride: u32;        // number of workers (round-robin step)

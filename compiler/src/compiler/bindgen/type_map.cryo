@@ -61,29 +61,29 @@ function scalar_name(k: i32) -> string {
 /// CXType -> Cryo TypeAnnotation mapper.  Holds the compilation context and the
 /// import's alias namespace so neither has to be threaded through the recursion.
 type struct CTypeMapper {
-    ctx:   CompilationContext*;
+    ctx:   mut CompilationContext*;
     /// The import's extern-module alias's module (`<mod>::alias`; none for
     /// the functions-only path, in which records collapse to `void*`).
     alias: ModulePath;
 
-    static new(ctx: CompilationContext*, alias: ModulePath) -> CTypeMapper {
+    static new(ctx: mut CompilationContext*, alias: ModulePath) -> CTypeMapper {
         return CTypeMapper { ctx: ctx, alias: alias };
     }
 
     /// Heap-allocate a PrimitiveAnnotation wrapped in a TypeAnnotation.
-    prim(&this, name: string) -> TypeAnnotation* {
+    prim(&this, name: string) -> mut TypeAnnotation* {
         const sym: SymbolStr = this.ctx.intern_table.intern(name);
         const p: PrimitiveAnnotation* = new PrimitiveAnnotation { name: sym, span: SourceSpan::none() };
-        const ann: TypeAnnotation* = libc::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
+        const ann: mut TypeAnnotation* = libc::malloc(sizeof(TypeAnnotation)) as mut TypeAnnotation*;
         *ann = TypeAnnotation::Primitive(p);
         return ann;
     }
 
     /// Heap-allocate a PointerAnnotation wrapped in a TypeAnnotation.  `is_const`
     /// marks `const T*` (the pointee is const - frontend-only flag).
-    ptr(&this, inner: TypeAnnotation*, is_const: boolean) -> TypeAnnotation* {
+    ptr(&this, inner: mut TypeAnnotation*, is_const: boolean) -> mut TypeAnnotation* {
         const p: PointerAnnotation* = new PointerAnnotation { inner: inner, is_const: is_const, span: SourceSpan::none() };
-        const ann: TypeAnnotation* = libc::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
+        const ann: mut TypeAnnotation* = libc::malloc(sizeof(TypeAnnotation)) as mut TypeAnnotation*;
         *ann = TypeAnnotation::Pointer(p);
         return ann;
     }
@@ -98,33 +98,33 @@ type struct CTypeMapper {
     /// module).  It is listed on the context instead: the importer pins it to
     /// the declaration it emitted for `tag`, and the name layer answers it
     /// with that declaration's id once it is declared.
-    named(&this, tag: SymbolStr) -> TypeAnnotation* {
-        const n: NamedAnnotation* = new NamedAnnotation {
+    named(&this, tag: SymbolStr) -> mut TypeAnnotation* {
+        const n: mut NamedAnnotation* = new NamedAnnotation {
             name: this.qualify_under_alias(tag), span: SourceSpan::none(), pre_resolved: TypeRef::invalid(),
             res: ResSlot::Pending,
         };
-        const ann: TypeAnnotation* = libc::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
+        const ann: mut TypeAnnotation* = libc::malloc(sizeof(TypeAnnotation)) as mut TypeAnnotation*;
         *ann = TypeAnnotation::Named(n);
         this.ctx.c_refs.push(CRecordRef { ann: n, alias: this.alias, tag: tag, decl: null });
         return ann;
     }
 
     /// Heap-allocate a fixed-size ArrayAnnotation (`[T; N]`).
-    array(&this, element: TypeAnnotation*, size: i64) -> TypeAnnotation* {
-        const arr: ArrayAnnotation* = new ArrayAnnotation { element: element, size: size,
+    array(&this, element: mut TypeAnnotation*, size: i64) -> mut TypeAnnotation* {
+        const arr: mut ArrayAnnotation* = new ArrayAnnotation { element: element, size: size,
                                                             size_expr: null, span: SourceSpan::none() };
-        const ann: TypeAnnotation* = libc::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
+        const ann: mut TypeAnnotation* = libc::malloc(sizeof(TypeAnnotation)) as mut TypeAnnotation*;
         *ann = TypeAnnotation::Array(arr);
         return ann;
     }
 
     /// Heap-allocate a FunctionAnnotation (`(params) -> ret`) - a Cryo function
     /// pointer type.
-    fnptr(&this, params: [TypeAnnotation*], ret: TypeAnnotation*) -> TypeAnnotation* {
+    fnptr(&this, params: [mut TypeAnnotation*], ret: mut TypeAnnotation*) -> mut TypeAnnotation* {
         const f: FunctionAnnotation* = new FunctionAnnotation {
             parameters: params, return_type: ret, span: SourceSpan::none()
         };
-        const ann: TypeAnnotation* = libc::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
+        const ann: mut TypeAnnotation* = libc::malloc(sizeof(TypeAnnotation)) as mut TypeAnnotation*;
         *ann = TypeAnnotation::Function(f);
         return ann;
     }
@@ -135,7 +135,7 @@ type struct CTypeMapper {
     /// alignment (so the array's natural alignment matches C's) and `N` spans the
     /// byte size.  C records have `size % align == 0`, so the division is exact.
     /// A field of this type round-trips by value but offers no member access.
-    aligned_blob(&this, size: i64, align: i64) -> TypeAnnotation* {
+    aligned_blob(&this, size: i64, align: i64) -> mut TypeAnnotation* {
         mut elem_bytes: i64 = align;
         if (elem_bytes != 1 && elem_bytes != 2 && elem_bytes != 4 && elem_bytes != 8) {
             // Non-power-of-two or >8 (e.g. 16-byte `long double`): the widest
@@ -198,7 +198,7 @@ type struct CTypeMapper {
     }
 
     /// Map a libclang type to a Cryo TypeAnnotation.
-    map(&this, t: CXType) -> TypeAnnotation* {
+    map(&this, t: CXType) -> mut TypeAnnotation* {
         // C `va_list` (canonicalizes to the unnameable platform
         // `__va_list_tag[1]`) maps to the first-class `va_list` type - checked
         // BEFORE canonicalization, which would otherwise lose the va_list
@@ -215,12 +215,12 @@ type struct CTypeMapper {
             // Function-pointer pointee -> a Cryo `(Args) -> Ret` type (already a
             // pointer-shaped value in Cryo, so no extra Pointer wrapper).
             if (pc.kind == clang::TK_FunctionProto || pc.kind == clang::TK_FunctionNoProto) {
-                mut params: [TypeAnnotation*] = [];
+                mut params: [mut TypeAnnotation*] = [];
                 const nargs: i32 = clang::clang_getNumArgTypes(pc);
                 for (mut i: i32 = 0; i < nargs; i++) {
                     params.push(this.map(clang::clang_getArgType(pc, i as u32)));
                 }
-                const ret: TypeAnnotation* = this.map(clang::clang_getResultType(pc));
+                const ret: mut TypeAnnotation* = this.map(clang::clang_getResultType(pc));
                 return this.fnptr(params, ret);
             }
             const is_const: boolean = clang::clang_isConstQualifiedType(pointee) != 0;
@@ -239,7 +239,7 @@ type struct CTypeMapper {
                     return this.ptr(this.prim("void"), is_const);
                 }
             }
-            const inner: TypeAnnotation* = this.map(pointee);
+            const inner: mut TypeAnnotation* = this.map(pointee);
             return this.ptr(inner, is_const);
         }
 
@@ -253,7 +253,7 @@ type struct CTypeMapper {
         }
 
         if (k == clang::TK_ConstantArray) {
-            const elem: TypeAnnotation* = this.map(clang::clang_getArrayElementType(c));
+            const elem: mut TypeAnnotation* = this.map(clang::clang_getArrayElementType(c));
             return this.array(elem, clang::clang_getArraySize(c));
         }
 

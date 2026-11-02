@@ -83,22 +83,22 @@ type struct UnpinnedCall {
 }
 
 type struct MonoCallSpecializer {
-    arena:            TypeArena*;
-    generic_registry: GenericRegistry*;
-    intern_table:     InternTable*;
-    diagnostics:      DiagnosticSink*;
+    arena:            mut TypeArena*;
+    generic_registry: mut GenericRegistry*;
+    intern_table:     mut InternTable*;
+    diagnostics:      mut DiagnosticSink*;
     type_resolver:    TypeResolver*;
-    decl_index:       DeclarationIndex*;
-    state:            MonoState*;
-    trait_spec:       MonoTraitSpecializer*;
-    ast_resolver:     MonoAstResolver*;
+    decl_index:       mut DeclarationIndex*;
+    state:            mut MonoState*;
+    trait_spec:       mut MonoTraitSpecializer*;
+    ast_resolver:     mut MonoAstResolver*;
     current_source_file: SymbolStr;
     /// Calls bound by identity to a method of a receiver or owner whose
     /// instantiation was not minted when the call was walked: a copy's body
     /// is walked once, when it is made, often before the instantiations it
     /// names are.  Each is bound once the instantiation is registered
     /// (`bind_queued_calls`).
-    queued_binds:     [CallExpr*];
+    queued_binds:     [mut CallExpr*];
     /// A generic owner's methods taken as values (`Wrap::get`) whose owner
     /// instance was not minted when the value was walked; each is bound to
     /// that instance's method once it is (`bind_queued_calls`).
@@ -583,7 +583,7 @@ type struct MonoCallSpecializer {
     /// resolve it, and queue the instantiation.  Bindings come from sema's stash
     /// (`call.resolved_type_args`); a call without a stash is outside sema's
     /// visibility and is left unspecialized.
-    specialize_free_call(mut &this, call_e: ExpressionNode*, call: CallExpr*,
+    specialize_free_call(mut &this, call_e: ExpressionNode*, call: mut CallExpr*,
                          res_ctx: ResolutionContext*, subst: TypeSubstitution*) -> void {
         if (call == null) { return; }
         if (call.resolved_callee.is_some()) { return; }
@@ -593,7 +593,7 @@ type struct MonoCallSpecializer {
         // A path's scope segment's own answer, which says whether it names a
         // type or a module.
         mut callee_scope_slot: ResSlot* = null;
-        const sr: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(callee_node);
+        const sr: mut ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(callee_node);
         if (sr != null) {
             callee_scope_slot = &sr.scope_res;
             this.bind_on_substituted_owner(call, sr, subst);
@@ -689,7 +689,7 @@ type struct MonoCallSpecializer {
     /// on the node (`value_template` applied to `value_type_args`),
     /// concretized by the active specialization - and queue the
     /// instantiation.  No-op for an identifier with none.
-    specialize_fn_value_ref(mut &this, ident: IdentifierExpr*, subst: TypeSubstitution*) -> void {
+    specialize_fn_value_ref(mut &this, ident: mut IdentifierExpr*, subst: TypeSubstitution*) -> void {
         if (ident == null) { return; }
         if (ident.value_type_args.length() == 0 || ident.resolved_callee.is_some()) { return; }
         if (this.generic_registry == null) { return; }
@@ -700,7 +700,7 @@ type struct MonoCallSpecializer {
 
     /// The path form of `specialize_fn_value_ref`: a module's generic
     /// function taken as a value, `m::idf`.
-    specialize_path_fn_value(mut &this, scope: ScopeResolutionExpr*, subst: TypeSubstitution*) -> void {
+    specialize_path_fn_value(mut &this, scope: mut ScopeResolutionExpr*, subst: TypeSubstitution*) -> void {
         if (!scope.value_template.is_valid() || scope.resolved_callee.is_some()) { return; }
         if (this.generic_registry == null) { return; }
         const inst: TypeRef = this.value_instance(
@@ -737,7 +737,7 @@ type struct MonoCallSpecializer {
     /// the stores the receiver's method sets are read from; false when none
     /// holds it.  This is where an instance of `m` is added.
     method_placement(&this, m_decl: DeclarationNode*, recv_type: TypeRef,
-                     out_impl: DeclarationNode**, out_owner: DeclarationNode**) -> boolean {
+                     out_impl: mut (mut DeclarationNode*)*, out_owner: mut (mut DeclarationNode*)*) -> boolean {
         for (mut i: i64 = 0; i < this.state.spec_entries.length(); i++) {
             const entry: SpecializationEntry* = &this.state.spec_entries[i];
             if (!entry.specialized_type.equals(recv_type)) { continue; }
@@ -783,7 +783,7 @@ type struct MonoCallSpecializer {
     ///     an unresolved adapter inst alone, and
     ///     the run_monomorphization walk/drain FIXPOINT resolves the chained call on a
     ///     later iteration (sema pre-types adapter returns as concrete InstantiatedTypes).
-    specialize_method_call(mut &this, call: CallExpr*, subst: TypeSubstitution*) -> void {
+    specialize_method_call(mut &this, call: mut CallExpr*, subst: TypeSubstitution*) -> void {
         if (call == null) { return; }
         // A call naming its method by definition is bound by that identity
         // once its receiver is minted, to the receiver's own method.  What
@@ -876,7 +876,7 @@ type struct MonoCallSpecializer {
         // object (`object_default_method`).
         if (this.arena.object_behind_receiver(recv_type) != null) {
             if (ma != null && t.kind == TypeKind::Object) {
-                mut object_block: DeclarationNode* = null;
+                mut object_block: mut DeclarationNode* = null;
                 const default_decl: DeclarationNode* = this.object_default_method(ma, recv_type, &object_block);
                 if (default_decl != null) {
                     this.bind_receiver_method(call, default_decl, object_block, null, recv_type, subst);
@@ -917,15 +917,15 @@ type struct MonoCallSpecializer {
         // receiver's method for it, found by identity.  Nothing is found by
         // the member's name.
         if (path_method == null && call.template_method.is_valid()) {
-            mut id_impl: DeclarationNode* = null;
-            mut id_owner: DeclarationNode* = null;
+            mut id_impl: mut DeclarationNode* = null;
+            mut id_owner: mut DeclarationNode* = null;
             const id_m_decl: DeclarationNode* = this.receiver_method_of(call.template_method, recv_type, &id_impl, &id_owner);
             this.bind_receiver_method(call, id_m_decl, id_impl, id_owner, recv_type, subst);
             if (is_unresolved_inst) { this.queue_bind(call); }
             return;
         }
         if (ma != null && ma.resolved_trait.is_valid() && ma.resolved_trait_slot >= 0) {
-            mut item_impl: DeclarationNode* = null;
+            mut item_impl: mut DeclarationNode* = null;
             const item_m_decl: DeclarationNode* = this.trait_item_on(call, ma, recv_type, &item_impl);
             const item_m: MethodDecl* = DeclarationNode::method_of(item_m_decl);
             // A parameter the implementation lends the method (`I` in
@@ -944,8 +944,8 @@ type struct MonoCallSpecializer {
         // nothing: it is left unbound, and `report_unbound_calls` refuses it
         // once monomorphization ends.  Nothing is found by the member's name.
         if (path_method == null) { return; }
-        mut impl_node: DeclarationNode* = null;
-        mut inherent_owner_ast: DeclarationNode* = null;
+        mut impl_node: mut DeclarationNode* = null;
+        mut inherent_owner_ast: mut DeclarationNode* = null;
         if (!this.method_placement(path_method, recv_type, &impl_node, &inherent_owner_ast)) { return; }
         this.instantiate_generic_method(call, path_method, impl_node, inherent_owner_ast, recv_type, subst);
     }
@@ -953,7 +953,7 @@ type struct MonoCallSpecializer {
     /// Bind `call` to the instance of `orig_method` - the receiver's method,
     /// held by `impl_node` or declared on `inherent_owner_ast` - at the
     /// type arguments sema stashed on the call (`method_instance_entry`).
-    instantiate_generic_method(mut &this, call: CallExpr*, orig_method_decl: DeclarationNode*,
+    instantiate_generic_method(mut &this, call: mut CallExpr*, orig_method_decl: DeclarationNode*,
                                impl_node: DeclarationNode*, inherent_owner_ast: DeclarationNode*,
                                recv_type: TypeRef, subst: TypeSubstitution*) -> void {
         this.pin_spec_entry(call, this.method_instance_entry(orig_method_decl, impl_node, inherent_owner_ast,
@@ -1012,7 +1012,7 @@ type struct MonoCallSpecializer {
         const made: OverloadId = this.state.method_instance(recv_type, def_slot, &bindings);
         if (made.is_valid()) { return made; }
 
-        mut copy_subst: TypeSubstitution* = null;
+        mut copy_subst: mut TypeSubstitution* = null;
         const spec_method_decl: DeclarationNode* = this.specialize_method(
             orig_method_decl, &orig_func.generic_params, &bindings, recv_type,
             DeclarationNode::impl_of(impl_node), &copy_subst);
@@ -1171,8 +1171,8 @@ type struct MonoCallSpecializer {
     /// it is a copy of; every other method is the receiver's index entry for
     /// `d` - the declaration itself, or the receiver's copy of it - placed
     /// by its identity.  Null when the receiver has neither.
-    receiver_method_of(&this, d: DefId, recv_type: TypeRef, out_impl: DeclarationNode**,
-                       out_owner_ast: DeclarationNode**) -> DeclarationNode* {
+    receiver_method_of(&this, d: DefId, recv_type: TypeRef, out_impl: mut (mut DeclarationNode*)*,
+                       out_owner_ast: mut (mut DeclarationNode*)*) -> DeclarationNode* {
         const deferred_decl: DeclarationNode* = this.deferred_copy_of(d, recv_type, out_impl);
         const deferred: MethodDecl* = DeclarationNode::method_of(deferred_decl);
         if (deferred != null) { return deferred_decl; }
@@ -1186,7 +1186,7 @@ type struct MonoCallSpecializer {
     /// receiver's methods are read from - those placed under its
     /// specialization, then the trait impls selected for it - and the block
     /// holding it (`out_impl`); null when none holds one.
-    deferred_copy_of(&this, d: DefId, recv_type: TypeRef, out_impl: DeclarationNode**) -> DeclarationNode* {
+    deferred_copy_of(&this, d: DefId, recv_type: TypeRef, out_impl: mut (mut DeclarationNode*)*) -> DeclarationNode* {
         for (mut i: i64 = 0; i < this.state.spec_entries.length(); i++) {
             const entry: SpecializationEntry* = &this.state.spec_entries[i];
             if (!entry.specialized_type.equals(recv_type)) { continue; }
@@ -1232,7 +1232,7 @@ type struct MonoCallSpecializer {
     /// emitted; any other receiver's are the registry's heads selected for
     /// it.
     trait_item_on(&this, call: CallExpr*, ma: MemberAccessExpr*, recv_type: TypeRef,
-                  out_impl: DeclarationNode**) -> DeclarationNode* {
+                  out_impl: mut (mut DeclarationNode*)*) -> DeclarationNode* {
         if (this.generic_registry == null) { return null; }
         const heads: [DeclarationNode*] = this.trait_heads_on(ma.resolved_trait, recv_type);
         mut head: DeclarationNode* = null;
@@ -1261,7 +1261,7 @@ type struct MonoCallSpecializer {
     /// it (`out_impl`); null when the table holds the method, and the call
     /// goes through it.
     object_default_method(mut &this, ma: MemberAccessExpr*, object: TypeRef,
-                          out_impl: DeclarationNode**) -> DeclarationNode* {
+                          out_impl: mut (mut DeclarationNode*)*) -> DeclarationNode* {
         if (!ma.resolved_trait.is_valid() || ma.resolved_trait_slot < 0) { return null; }
         const decl: TraitDecl* = this.generic_registry.get_trait_decl(ma.resolved_trait);
         if (decl == null || ma.resolved_trait_slot >= decl.methods.length()) { return null; }
@@ -1290,7 +1290,7 @@ type struct MonoCallSpecializer {
                 if (held != null && held.trait_def.equals(trait_def)) { return entry.impl_nodes[j]; }
             }
         }
-        const block: ImplBlock* = ImplBlock::new(decl.name);
+        const block: mut ImplBlock* = ImplBlock::new(decl.name);
         block.trait_def = trait_def;
         block.spec_owner = object;
         block.trait_annotation = new TypeAnnotation::Named(new NamedAnnotation {
@@ -1316,18 +1316,18 @@ type struct MonoCallSpecializer {
             const func: FunctionDecl* = DeclarationNode::fn_of(decl.methods[m]);
             if (func == null || !func.has_body()) { continue; }
             if (this.generic_registry.method_object_unavailable(decl.methods[m]).length() == 0) { continue; }
-            const copy_decl: DeclarationNode* = cloner.copy_decl(decl.methods[m]);
+            const copy_decl: mut DeclarationNode* = cloner.copy_decl(decl.methods[m]);
             copy_decl.set_source_file(trait_file);
-            const copy: FunctionDecl* = DeclarationNode::fn_of(copy_decl);
+            const copy: mut FunctionDecl* = DeclarationNode::fn_of(copy_decl);
             copy.set_synth_default(true);
             copy.set_self_returning_default(true);
-            mut method: MethodDecl* = MethodDecl::new(copy_decl);
+            mut method: mut MethodDecl* = MethodDecl::new(copy_decl);
             method.set_static(copy.is_static);
-            const method_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Method(method), copy_decl.span);
+            const method_decl: mut DeclarationNode* = DeclarationNode::of(DeclKind::Method(method), copy_decl.span);
             method_decl.set_source_file(trait_file);
             block.methods.push(method_decl);
         }
-        const block_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Impl(block), SourceSpan::none());
+        const block_decl: mut DeclarationNode* = DeclarationNode::of(DeclKind::Impl(block), SourceSpan::none());
         block_decl.set_source_file(trait_file);
         mut impls: [DeclarationNode*] = [];
         impls.push(block_decl);
@@ -1397,7 +1397,7 @@ type struct MonoCallSpecializer {
         if (slot < 0 || this.arena.contains_generic_param(owner)) { return; }
         const blanket: [DeclarationNode*] = this.generic_registry.blanket_heads_of(this.decl_index.defs.parent_of(d));
         for (mut h: i64 = 0; h < blanket.length(); h++) {
-            const head: ImplBlock* = DeclarationNode::impl_of(blanket[h]);
+            const head: mut ImplBlock* = DeclarationNode::impl_of(blanket[h]);
             const m: MethodDecl* = DeclarationNode::method_of(this.generic_registry.trait_item_method(head, slot));
             if (m == null || m.func == null) { continue; }
             mut subject: TypeSubstitution = MonoCallSpecializer::blanket_subject(head, owner, this.arena);
@@ -1423,7 +1423,7 @@ type struct MonoCallSpecializer {
 
     /// The substitution of a head for every type, `head`, that binds its
     /// parameter - the one its target is - to `subject`.
-    static blanket_subject(head: ImplBlock*, subject: TypeRef, arena: TypeArena*) -> TypeSubstitution {
+    static blanket_subject(head: ImplBlock*, subject: TypeRef, arena: mut TypeArena*) -> TypeSubstitution {
         mut params: [TypeRef] = [];
         mut types: [TypeRef] = [];
         const target: SymbolID = head.target_param();
@@ -1458,13 +1458,13 @@ type struct MonoCallSpecializer {
         syms.push(head.target_param());
         // Heap-allocated: the substituter holds the pointer and attaches
         // types that outlive this call.
-        const subst_ptr: TypeSubstitution* =
-            allocator::alloc(sizeof(TypeSubstitution), 16) as TypeSubstitution*;
+        const subst_ptr: mut TypeSubstitution* =
+            allocator::alloc(sizeof(TypeSubstitution), 16) as mut TypeSubstitution*;
         *subst_ptr = MonoCallSpecializer::blanket_subject(head, subject, this.arena);
         mut cloner: ASTCloner = ASTCloner::for_monomorphization();
         const copy_decl: DeclarationNode* = cloner.clone_decl(head_decl);
-        const block: ImplBlock* = DeclarationNode::impl_of(copy_decl);
-        mut substituter: ASTTypeSubstituter* = ASTTypeSubstituter::create(
+        const block: mut ImplBlock* = DeclarationNode::impl_of(copy_decl);
+        mut substituter: mut ASTTypeSubstituter* = ASTTypeSubstituter::create(
             subst_ptr, this.arena, this.intern_table, DefId::invalid(), SymbolStr::empty(), syms, subject);
         substituter.types = this.type_resolver;
         substituter.walk_decl(copy_decl);
@@ -1506,7 +1506,7 @@ type struct MonoCallSpecializer {
     /// generic body's parameters, has no method of its own to bind to: the
     /// call is bound once it is minted (`bind_queued_calls`), or in each
     /// copy that substitutes the parameters.
-    bind_receiver_method(mut &this, call: CallExpr*, m_decl: DeclarationNode*, impl_node: DeclarationNode*,
+    bind_receiver_method(mut &this, call: mut CallExpr*, m_decl: DeclarationNode*, impl_node: DeclarationNode*,
                          owner_ast: DeclarationNode*, recv_type: TypeRef,
                          subst: TypeSubstitution*) -> void {
         const m: MethodDecl* = DeclarationNode::method_of(m_decl);
@@ -1561,7 +1561,7 @@ type struct MonoCallSpecializer {
         return out;
     }
 
-    queue_bind(mut &this, call: CallExpr*) -> void {
+    queue_bind(mut &this, call: mut CallExpr*) -> void {
         if (!call.resolved_callee.is_some()) { this.queued_binds.push(call); }
     }
 
@@ -1569,7 +1569,7 @@ type struct MonoCallSpecializer {
     /// definition, to the receiver's own method for it.  A receiver still
     /// written in a generic body's parameters is bound in each copy that
     /// substitutes them; one not minted yet, once it is.
-    bind_named_call(mut &this, call: CallExpr*, subst: TypeSubstitution*) -> void {
+    bind_named_call(mut &this, call: mut CallExpr*, subst: TypeSubstitution*) -> void {
         if (call.resolved_callee.is_some() || !call.template_recv.is_valid()) { return; }
         mut recv: TypeRef = call.template_recv;
         if (subst != null) { recv = subst.apply(recv, this.arena); }
@@ -1597,7 +1597,7 @@ type struct MonoCallSpecializer {
     /// identity.  A method with type parameters of its own is not a value
     /// bound as written, and an owner not yet minted has no entries; both
     /// are left unpinned.
-    bind_path_value(mut &this, scope_e: ExpressionNode*, scope: ScopeResolutionExpr*, subst: TypeSubstitution*) -> void {
+    bind_path_value(mut &this, scope_e: ExpressionNode*, scope: mut ScopeResolutionExpr*, subst: TypeSubstitution*) -> void {
         if (!scope.template_method.is_valid() || !scope.spec_owner.is_valid()
                 || scope.resolved_callee.is_some()) { return; }
         if (this.arena.contains_generic_param(scope.spec_owner)) {
@@ -1628,8 +1628,8 @@ type struct MonoCallSpecializer {
         // A method with type parameters of its own is the instance at the
         // arguments the type check kept on the path.
         if (DeclarationNode::fn_of(m.func).generic_params.length() > 0) {
-            mut impl_node: DeclarationNode* = null;
-            mut owner_ast: DeclarationNode* = null;
+            mut impl_node: mut DeclarationNode* = null;
+            mut owner_ast: mut DeclarationNode* = null;
             if (!this.method_placement(m_decl, owner, &impl_node, &owner_ast)) { return; }
             const inst: OverloadId = this.method_instance_entry(m_decl, impl_node, owner_ast, owner,
                 &scope.value_type_args, subst);
@@ -1643,7 +1643,7 @@ type struct MonoCallSpecializer {
     /// Bind a path call recorded on its owner - a parameter the copy's
     /// substitution rewrote, or a type a bound is written on, which still
     /// names the template's parameters until `subst` puts the copy's in.
-    bind_on_substituted_owner(mut &this, call: CallExpr*, scope: ScopeResolutionExpr*, subst: TypeSubstitution*) -> void {
+    bind_on_substituted_owner(mut &this, call: mut CallExpr*, scope: mut ScopeResolutionExpr*, subst: TypeSubstitution*) -> void {
         if (!scope.spec_owner.is_valid() || !call.template_method.is_valid()
                 || call.template_recv.is_valid() || call.resolved_type_args.length() > 0) { return; }
         const f_decl: DeclarationNode* = this.decl_index.method_func_of(call.template_method);
@@ -1743,7 +1743,7 @@ type struct MonoCallSpecializer {
     /// call (`bound_params`), else the arguments' own.  Answers whether
     /// `m_decl` is such a method; one whose parameters stay unbound is left
     /// unpinned, as an unbound call is.
-    instantiate_lent_method(mut &this, call: CallExpr*, m_decl: DeclarationNode*, owner: TypeRef) -> boolean {
+    instantiate_lent_method(mut &this, call: mut CallExpr*, m_decl: DeclarationNode*, owner: TypeRef) -> boolean {
         const m: MethodDecl* = DeclarationNode::method_of(m_decl);
         if (m == null || m.func == null) { return false; }
         const f: FunctionDecl* = DeclarationNode::fn_of(m.func);
@@ -1794,7 +1794,7 @@ type struct MonoCallSpecializer {
     /// Pin `call` to `m` when `m` is bound as it is written: one with type
     /// parameters of its own, or a default instantiated per call, is bound
     /// to an instance instead.
-    pin_plain(mut &this, call: CallExpr*, m_decl: DeclarationNode*) -> void {
+    pin_plain(mut &this, call: mut CallExpr*, m_decl: DeclarationNode*) -> void {
         const m: MethodDecl* = DeclarationNode::method_of(m_decl);
         if (m == null || m.func == null || DeclarationNode::fn_of(m.func).generic_params.length() > 0
                 || DeclarationNode::fn_of(m.func).is_self_returning_default || DeclarationNode::fn_of(m.func).is_lazy_self_growing) { return; }
@@ -1893,9 +1893,9 @@ type struct MonoCallSpecializer {
     /// walked (`bind_receiver_method`).  Any other is bound only as
     /// written.  A call whose receiver is still not minted stays queued.
     bind_queued_calls(mut &this) -> void {
-        mut still: [CallExpr*] = [];
+        mut still: [mut CallExpr*] = [];
         for (mut i: i64 = 0; i < this.queued_binds.length(); i++) {
-            const call: CallExpr* = this.queued_binds[i];
+            const call: mut CallExpr* = this.queued_binds[i];
             if (call.resolved_callee.is_some()) { continue; }
             const owner: TypeRef = this.receiver_owner(call.template_recv);
             const ot: Type* = this.arena.lookup(owner);
@@ -1910,8 +1910,8 @@ type struct MonoCallSpecializer {
             if (call.named_method.is_valid()) {
                 this.pin_plain(call, this.named_method_on(call.named_method, owner));
             } else if (own_params != null && own_params.generic_params.length() > 0) {
-                mut gm_impl: DeclarationNode* = null;
-                mut gm_owner: DeclarationNode* = null;
+                mut gm_impl: mut DeclarationNode* = null;
+                mut gm_owner: mut DeclarationNode* = null;
                 const gm_decl: DeclarationNode* = this.receiver_method_of(call.template_method, owner, &gm_impl, &gm_owner);
                 const gm: MethodDecl* = DeclarationNode::method_of(gm_decl);
                 if (gm != null) { this.instantiate_generic_method(call, gm_decl, gm_impl, gm_owner, owner, null); }
@@ -1920,12 +1920,12 @@ type struct MonoCallSpecializer {
                 const path_m: DeclarationNode* = this.path_method_on(call, owner);
                 if (!this.instantiate_lent_method(call, path_m, owner)) { this.pin_plain(call, path_m); }
             } else if (call.template_method.is_valid()) {
-                mut id_impl: DeclarationNode* = null;
-                mut id_owner: DeclarationNode* = null;
+                mut id_impl: mut DeclarationNode* = null;
+                mut id_owner: mut DeclarationNode* = null;
                 const id_decl: DeclarationNode* = this.receiver_method_of(call.template_method, owner, &id_impl, &id_owner);
                 this.bind_receiver_method(call, id_decl, id_impl, id_owner, owner, null);
             } else {
-                mut item_impl: DeclarationNode* = null;
+                mut item_impl: mut DeclarationNode* = null;
                 const item_decl: DeclarationNode* = this.trait_item_on(call, ExpressionNode::member_access_of(call.callee), owner, &item_impl);
                 if (!this.instantiate_lent_method(call, item_decl, owner)) { this.pin_plain(call, item_decl); }
             }
@@ -2060,17 +2060,17 @@ type struct MonoCallSpecializer {
     /// of `impl_node`: `made` when an earlier call instantiated it, else an
     /// instance minted now, registered, and walked for the calls its body
     /// makes.  The pin is the instance's registered entry.
-    instantiate_deferred(mut &this, call: CallExpr*, orig_decl: DeclarationNode*, impl_node: DeclarationNode*,
+    instantiate_deferred(mut &this, call: mut CallExpr*, orig_decl: DeclarationNode*, impl_node: DeclarationNode*,
                          recv_type: TypeRef, made_decl: DeclarationNode*) -> boolean {
         const made: MethodDecl* = DeclarationNode::method_of(made_decl);
         if (made != null) {
             this.pin_spec_entry(call, DeclarationNode::fn_of(made.func).overload_entry);
             return true;
         }
-        const block: ImplBlock* = DeclarationNode::impl_of(impl_node);
+        const block: mut ImplBlock* = DeclarationNode::impl_of(impl_node);
         mut empty_params: [DeclarationNode*] = [];
         mut empty_args: [TypeRef] = [];
-        mut copy_subst: TypeSubstitution* = null;
+        mut copy_subst: mut TypeSubstitution* = null;
         const spec_method_decl: DeclarationNode* = this.specialize_method(
             orig_decl, &empty_params, &empty_args, recv_type, block, &copy_subst);
         const spec_method: MethodDecl* = DeclarationNode::method_of(spec_method_decl);
@@ -2103,12 +2103,12 @@ type struct MonoCallSpecializer {
     /// -> stash_static_owner_bindings), so this just instantiates the owner, enqueues
     /// it (the worklist drain materializes + DI-registers its methods), and pins the
     /// combined `<spec-owner>::<method>` callee.  Returns true when handled.
-    specialize_static_method_on_generic_owner(mut &this, call: CallExpr*,
+    specialize_static_method_on_generic_owner(mut &this, call: mut CallExpr*,
                                               scope: ScopeResolutionExpr*,
                                               subst: TypeSubstitution*) -> boolean {
         if (call == null || scope == null) { return false; }
         if (call.resolved_callee.is_some()) { return false; }
-        const registry: GenericRegistry* = this.generic_registry;
+        const registry: mut GenericRegistry* = this.generic_registry;
         if (registry == null) { return false; }
         // The owner is the declaration the scope segment's stamp names, under
         // the canonical name the registry is keyed by.  The spelling is any
@@ -2181,9 +2181,9 @@ type struct MonoCallSpecializer {
     /// the owner spec entry does not exist yet: the owner is enqueued and the
     /// call is left UNPINNED so the walk/drain fixpoint (specialization.cryo)
     /// re-visits it once the entry materializes.
-    specialize_generic_path_method(mut &this, call: CallExpr*, scope: ScopeResolutionExpr*,
+    specialize_generic_path_method(mut &this, call: mut CallExpr*, scope: ScopeResolutionExpr*,
                                    entry: const TemplateEntry*, subst: TypeSubstitution*) -> boolean {
-        const registry: GenericRegistry* = this.generic_registry;
+        const registry: mut GenericRegistry* = this.generic_registry;
         if (registry == null) { return false; }
 
         // Owner binds: scope turbofish, else template defaults.
@@ -2207,8 +2207,8 @@ type struct MonoCallSpecializer {
             return true;
         }
         const recv_type: TypeRef = spec_entry.specialized_type;
-        mut impl_node: DeclarationNode* = null;
-        mut owner_ast: DeclarationNode* = null;
+        mut impl_node: mut DeclarationNode* = null;
+        mut owner_ast: mut DeclarationNode* = null;
         const m_decl: DeclarationNode* = this.receiver_method_of(call.template_method, recv_type, &impl_node, &owner_ast);
         const m: MethodDecl* = DeclarationNode::method_of(m_decl);
         if (m != null) { this.instantiate_generic_method(call, m_decl, impl_node, owner_ast, recv_type, subst); }
@@ -2266,7 +2266,7 @@ type struct MonoCallSpecializer {
     /// either way recover the `(generic_base, type_args)` and bind each template
     /// param (reconstructed by name+index, matching the body's interned ref) to the
     /// receiver's concrete arg.  No-op when the owner isn't a generic instantiation.
-    add_owner_param_bindings(&this, subst: TypeSubstitution*, owner_type: TypeRef) -> void {
+    add_owner_param_bindings(&this, subst: mut TypeSubstitution*, owner_type: TypeRef) -> void {
         if (this.generic_registry == null) { return; }
         // The owner's `(generic_base, type_args)` read directly: a pre-mono wrapper
         // answers from its own node, a post-mono concrete from its intrinsic
@@ -2372,7 +2372,7 @@ type struct MonoCallSpecializer {
     specialize_method(mut &this, original_decl: DeclarationNode*,
                       params: &[DeclarationNode*], args: &[TypeRef],
                       owner_type: TypeRef, owner_impl: ImplBlock*,
-                      out_subst: TypeSubstitution**) -> DeclarationNode* {
+                      out_subst: mut (mut TypeSubstitution*)*) -> DeclarationNode* {
         const original: MethodDecl* = DeclarationNode::method_of(original_decl);
         if (original == null || original.func == null) { return null; }
         if (params.length() != args.length()) { return null; }
@@ -2448,14 +2448,14 @@ type struct MonoCallSpecializer {
                 }
             }
         }
-        const subst_ptr: TypeSubstitution* =
-            allocator::alloc(sizeof(TypeSubstitution), 16) as TypeSubstitution*;
+        const subst_ptr: mut TypeSubstitution* =
+            allocator::alloc(sizeof(TypeSubstitution), 16) as mut TypeSubstitution*;
         *subst_ptr = subst_val;
         *out_subst = subst_ptr;
 
         mut cloner: ASTCloner = ASTCloner::for_monomorphization();
         const spec_method_decl: DeclarationNode* = cloner.copy_decl(original_decl);
-        mut spec_method: MethodDecl* = DeclarationNode::method_of(spec_method_decl);
+        mut spec_method: mut MethodDecl* = DeclarationNode::method_of(spec_method_decl);
         if (spec_method == null || spec_method.func == null) { return null; }
         spec_method.spec_of = original_decl;
         // The clone is a concrete specialization, not a deferred template:
@@ -2470,7 +2470,7 @@ type struct MonoCallSpecializer {
         DeclarationNode::fn_of(spec_method.func).set_resolved_return_type(TypeRef::invalid());
         for (mut i: i64 = 0; i < DeclarationNode::fn_of(spec_method.func).parameters.length(); i++) {
             const p_decl: DeclarationNode* = DeclarationNode::fn_of(spec_method.func).parameters[i];
-            const p: VarDecl* = DeclarationNode::var_of(p_decl);
+            const p: mut VarDecl* = DeclarationNode::var_of(p_decl);
             if (p != null) { p.set_resolved_type(TypeRef::invalid()); }
         }
 
@@ -2485,7 +2485,7 @@ type struct MonoCallSpecializer {
         const empty_sym: SymbolStr = SymbolStr::empty();
         // No template and no spec id: this rewrites a method's parameters
         // only, so no name in it denotes a specialization being built.
-        mut substituter: ASTTypeSubstituter* = ASTTypeSubstituter::create(
+        mut substituter: mut ASTTypeSubstituter* = ASTTypeSubstituter::create(
             subst_ptr, this.arena, this.intern_table,
             DefId::invalid(), empty_sym, ps_owned,
             TypeRef::invalid());
@@ -2512,7 +2512,7 @@ type struct MonoCallSpecializer {
             this.type_resolver.resolve_func_signature(spec_method.func, &res_ctx);
             for (mut i: i64 = 0; i < DeclarationNode::fn_of(spec_method.func).parameters.length(); i++) {
                 const p_decl: DeclarationNode* = DeclarationNode::fn_of(spec_method.func).parameters[i];
-                const p: VarDecl* = DeclarationNode::var_of(p_decl);
+                const p: mut VarDecl* = DeclarationNode::var_of(p_decl);
                 if (p == null) { continue; }
                 if (p.resolved_type.is_valid()) { continue; }
                 if (p.is_ref_receiver()) {
@@ -2540,7 +2540,7 @@ type struct MonoCallSpecializer {
         if (n_clone_params == n_orig_params) {
             for (mut i: i64 = 0; i < n_clone_params; i++) {
                 const p_decl: DeclarationNode* = DeclarationNode::fn_of(spec_method.func).parameters[i];
-                const p: VarDecl* = DeclarationNode::var_of(p_decl);
+                const p: mut VarDecl* = DeclarationNode::var_of(p_decl);
                 const op_decl: DeclarationNode* = DeclarationNode::fn_of(original.func).parameters[i];
                 const op: VarDecl* = DeclarationNode::var_of(op_decl);
                 if (p == null || op == null) { continue; }
@@ -2559,7 +2559,7 @@ type struct MonoCallSpecializer {
         }
         for (mut i: i64 = 0; i < DeclarationNode::fn_of(spec_method.func).parameters.length(); i++) {
             const sp_decl: DeclarationNode* = DeclarationNode::fn_of(spec_method.func).parameters[i];
-            const sp: VarDecl* = DeclarationNode::var_of(sp_decl);
+            const sp: mut VarDecl* = DeclarationNode::var_of(sp_decl);
             if (sp != null && sp.resolved_type.is_valid()) {
                 sp.set_resolved_type(subst_ptr.apply(sp.resolved_type, this.arena));
             }
@@ -2572,7 +2572,7 @@ type struct MonoCallSpecializer {
         }
         for (mut i: i64 = 0; i < DeclarationNode::fn_of(spec_method.func).parameters.length(); i++) {
             const sp2_decl: DeclarationNode* = DeclarationNode::fn_of(spec_method.func).parameters[i];
-            const sp2: VarDecl* = DeclarationNode::var_of(sp2_decl);
+            const sp2: mut VarDecl* = DeclarationNode::var_of(sp2_decl);
             if (sp2 != null && sp2.resolved_type.is_valid()) {
                 sp2.set_resolved_type(this.trait_spec.reduce_projections(sp2.resolved_type));
             }
@@ -2730,7 +2730,7 @@ type struct MonoCallSpecializer {
 
     /// Pin `call` to the spec's entry: the call's final answer, which every
     /// pass after monomorphization reads.
-    pin_spec_entry(mut &this, call: CallExpr*, entry: OverloadId) -> void {
+    pin_spec_entry(mut &this, call: mut CallExpr*, entry: OverloadId) -> void {
         if (!entry.is_valid()) { return; }
         call.set_resolved_callee(CalleePin::Decl(entry));
     }
@@ -2771,7 +2771,7 @@ type struct MonoCallSpecializer {
     /// names that type's implementation and table, recorded for the
     /// compilation context to register.  A conversion sema settled, and the
     /// template's own body, which is never emitted, are left as they are.
-    settle_object_conversion(mut &this, e: ExpressionNode*, oc: ObjectConversionExpr*,
+    settle_object_conversion(mut &this, e: ExpressionNode*, oc: mut ObjectConversionExpr*,
                              subst: TypeSubstitution*) -> void {
         if (oc.implementation != null) { return; }
         const value: TypeRef = if (subst != null) { subst.apply(oc.source, this.arena) } else { oc.source };
@@ -2783,7 +2783,7 @@ type struct MonoCallSpecializer {
         const checker: TraitChecker = TraitChecker::new(
             this.arena, this.generic_registry, this.intern_table, this.diagnostics);
         const implementation: DeclarationNode* = checker.object_implementation(object, value);
-        mut blocks: [ImplBlock*] = [];
+        mut blocks: [mut ImplBlock*] = [];
         if (implementation == null
                 || this.type_resolver.object_table_blocks(object, value, DeclarationNode::impl_of(implementation),
                     &blocks).is_valid()) {

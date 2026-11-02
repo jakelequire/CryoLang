@@ -190,10 +190,10 @@ implement trait Clone for struct ResolutionContext {
 
 
 type struct TypeResolver {
-    arena:            TypeArena*;
-    intern_table:     InternTable*;
-    generic_registry: GenericRegistry*;
-    name_resolver:    Resolver*;
+    arena:            mut TypeArena*;
+    intern_table:     mut InternTable*;
+    generic_registry: mut GenericRegistry*;
+    name_resolver:    mut Resolver*;
     decl_index:       DeclarationIndex*;
     /// File -> declaring namespace, for annotations this resolver re-resolves on
     /// behalf of syntax it did not itself walk to.  An assoc-type binding comes
@@ -202,19 +202,19 @@ type struct TypeResolver {
     /// only the annotation's own file can.
     module_graph:     ModuleGraph*;
     /// Folded module-level integer constants, for `[T; NAME]` array sizes.
-    const_table:      ConstantTable*;
-    diagnostics:      DiagnosticSink*;
+    const_table:      mut ConstantTable*;
+    diagnostics:      mut DiagnosticSink*;
 
     /// Construct with all required dependencies.
     ///
     /// All registries are mandatory; callers must supply them. This
     /// prevents silent fallback paths where instantiations bypass the
     /// GenericRegistry and become invisible to the Monomorphizer.
-    static new(arena: TypeArena*, intern_table: InternTable*,
-               generic_registry: GenericRegistry*,
-               name_resolver: Resolver*,
+    static new(arena: mut TypeArena*, intern_table: mut InternTable*,
+               generic_registry: mut GenericRegistry*,
+               name_resolver: mut Resolver*,
                decl_index: DeclarationIndex*,
-               const_table: ConstantTable*,
+               const_table: mut ConstantTable*,
                module_graph: ModuleGraph*) -> TypeResolver {
         return TypeResolver {
             arena:            arena,
@@ -245,7 +245,7 @@ type struct TypeResolver {
     /// A size that will not fold is reported rather than left pending: a
     /// pending size reaches codegen as an array descriptor with no storage
     /// behind it, and every access through it is then a wild pointer.
-    array_size_of(&this, a: ArrayAnnotation*) -> i64 {
+    array_size_of(&this, a: mut ArrayAnnotation*) -> i64 {
         if (a.size != ArrayAnnotation::fixed_pending_size()) { return a.size; }
         if (a.size_expr == null) { return a.size; }
 
@@ -376,8 +376,8 @@ type struct TypeResolver {
     /// supertrait at the arguments the object gives it
     /// (`object_trait_arguments`).  The first supertrait it does not
     /// implement, or invalid when it implements every one.
-    object_table_blocks(&this, object: ObjectType*, value: TypeRef, own: ImplBlock*,
-                        blocks: mut &[ImplBlock*]) -> DefId {
+    object_table_blocks(&this, object: ObjectType*, value: TypeRef, own: mut ImplBlock*,
+                        blocks: mut &[mut ImplBlock*]) -> DefId {
         const registry: GenericRegistry* = this.generic_registry;
         const traits: [DefId] = registry.object_table_traits(object.trait_def);
         const checker: TraitChecker = TraitChecker::new(
@@ -403,7 +403,7 @@ type struct TypeResolver {
     /// subject or an argument still names a parameter, which the copy that
     /// binds it decides.
     unmet_written_bound(&this, bound: TraitBound*, param_syms: &[SymbolID], bindings: &[TypeRef],
-                        out_subject: TypeRef*, out_trait: SymbolStr*) -> const TraitRef* {
+                        out_subject: mut TypeRef*, out_trait: mut SymbolStr*) -> const TraitRef* {
         mut subst: TypeSubstitution = TypeSubstitution::empty();
         mut subject: TypeRef = TypeRef::invalid();
         for (mut i: i64 = 0; i < param_syms.length() && i < bindings.length(); i++) {
@@ -726,7 +726,7 @@ type struct TypeResolver {
     /// The first `count` of a bound's written trait arguments resolved in
     /// `ctx`, at most one per written argument; one that does not resolve is
     /// invalid and fixes nothing.
-    written_trait_arguments(&this, arguments: &[TypeAnnotation*], count: i64, ctx: ResolutionContext*) -> [TypeRef] {
+    written_trait_arguments(&this, arguments: &[mut TypeAnnotation*], count: i64, ctx: ResolutionContext*) -> [TypeRef] {
         mut out: [TypeRef] = [];
         for (mut a: i64 = 0; a < arguments.length() && a < count; a++) {
             out.push(if (arguments[a] == null) { TypeRef::invalid() } else { this.resolve(arguments[a], ctx) });
@@ -826,7 +826,7 @@ type struct TypeResolver {
         if (t == null) { return ty; }
         match (t.kind) {
             TypeKind::AssocProjection => {
-                const proj: AssocProjectionType* = t.as_assoc_projection();
+                const proj: mut AssocProjectionType* = t.as_assoc_projection();
                 if (proj.resolved_type.is_valid()) { return proj.resolved_type; }
                 const base: TypeRef = this.reduce_projections(proj.base, memo);
                 mut trait_args: [TypeRef] = [];
@@ -980,7 +980,7 @@ type struct TypeResolver {
             if (assoc_pos < 0 || assoc_pos >= tdecl.assoc_types.length()) { continue; }
             // The WRITTEN head, whose positional trait arguments carry the
             // binding; a placed clone has substituted them away.
-            const impl_node: ImplBlock* = DeclarationNode::impl_of(
+            const impl_node: mut ImplBlock* = DeclarationNode::impl_of(
                 this.generic_registry.template_head_for(
                     this.generic_registry.trait_decl_keys[i], trait_args, base_ty, this.intern_table));
             if (impl_node == null) { continue; }
@@ -1105,7 +1105,7 @@ type struct TypeResolver {
             }
             return out;
         }
-        const impl_node: ImplBlock* = DeclarationNode::impl_of(
+        const impl_node: mut ImplBlock* = DeclarationNode::impl_of(
             this.generic_registry.template_head_for(trait_id, trait_args, subject, this.intern_table));
         if (impl_node == null) { return out; }
         const tdecl: TraitDecl* = this.generic_registry.get_trait_decl(trait_id);
@@ -1141,8 +1141,8 @@ type struct TypeResolver {
     /// `i32`.  The target binds no such parameter, so without this the
     /// implementation's members that name it have no answer.  An invalid
     /// argument fixes nothing; a parameter already bound keeps its binding.
-    bind_trait_argument_params(&this, impl_node: ImplBlock*, tdecl: TraitDecl*, trait_args: &[TypeRef],
-                               bctx: ResolutionContext*) -> void {
+    bind_trait_argument_params(&this, impl_node: mut ImplBlock*, tdecl: TraitDecl*, trait_args: &[TypeRef],
+                               bctx: mut ResolutionContext*) -> void {
         for (mut i: i64 = 0; i < trait_args.length() && i < tdecl.generic_params.length(); i++) {
             this.bind_where_arg_into_ctx(impl_node.trait_slot_annotation(tdecl, i), trait_args[i], bctx);
         }
@@ -1161,7 +1161,7 @@ type struct TypeResolver {
     /// source. Only simple `Named` param args are bound (a projection or
     /// concrete arg names no generic to derive); existing bindings are kept.
     derive_where_assoc_bindings(&this, impl_node: ImplBlock*,
-                                bctx: ResolutionContext*) -> void {
+                                bctx: mut ResolutionContext*) -> void {
         if (impl_node == null) { return; }
         for (mut bi: i64 = 0; bi < impl_node.where_bounds.length(); bi++) {
             const bound: TraitBound* = &impl_node.where_bounds[bi];
@@ -1220,7 +1220,7 @@ type struct TypeResolver {
     /// Mirrors the monomorphizer's `bind_where_arg_param`. Existing bindings are
     /// kept (the Self-type substitution already fixed any struct params).
     bind_where_arg_into_ctx(&this, ta: TypeAnnotation*, concrete: TypeRef,
-                            bctx: ResolutionContext*) -> void {
+                            bctx: mut ResolutionContext*) -> void {
         if (ta == null || !concrete.is_valid()) { return; }
         match (*ta) {
             TypeAnnotation::Named(n) => {
@@ -1281,7 +1281,7 @@ type struct TypeResolver {
     /// unspecialized (E0636). Outside the symbolic walk an abstract subject has no
     /// findable impl, so it still derives nothing.
     project_where_bound_params_into(&this, trait_bounds: &[TraitBound],
-                                    param_syms: &[SymbolID], ictx: InferCtx*,
+                                    param_syms: &[SymbolID], ictx: mut InferCtx*,
                                     source_file: string, symbolic: boolean) -> void {
         if (this.generic_registry == null) { return; }
         for (mut bi: i64 = 0; bi < trait_bounds.length(); bi++) {
@@ -1421,7 +1421,7 @@ type struct TypeResolver {
     /// and `check_call_where_bounds` is what rejects a bound the subject really
     /// fails to satisfy.
     bind_where_arg_params_from(&this, ta: TypeAnnotation*, param_syms: &[SymbolID],
-                               actual: TypeRef, ictx: InferCtx*) -> void {
+                               actual: TypeRef, ictx: mut InferCtx*) -> void {
         if (ta == null || !actual.is_valid()) { return; }
         match (*ta) {
             TypeAnnotation::Named(n) => {
@@ -1458,7 +1458,7 @@ type struct TypeResolver {
     /// on each parameter VarDecl.
     resolve_func_signature(&this, func_decl: DeclarationNode*,
                            res_ctx: ResolutionContext*) -> void {
-        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
+        const func: mut FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return; }
         if (Log::enabled(LogArea::Types, LogLevel::Trace)) {
             Log::trace(LogArea::Types, f"resolving the signature of '{this.intern_table.resolve(func.name)}': {func.parameters.length()} parameters");
@@ -1489,7 +1489,7 @@ type struct TypeResolver {
         // Resolve parameter types
         for (mut i: i64 = 0; i < func.parameters.length(); i++) {
             const param_decl: DeclarationNode* = func.parameters[i];
-            const param: VarDecl* = DeclarationNode::var_of(param_decl);
+            const param: mut VarDecl* = DeclarationNode::var_of(param_decl);
             if (param == null) { continue; }
             if (param.type_annotation != null && !param.resolved_type.is_valid()) {
                 const ptype: TypeRef = this.resolve(param.type_annotation, res_ctx);
@@ -1529,11 +1529,11 @@ type struct TypeResolver {
     /// resolve yet is asked again on the next pass over the declaration.
     resolve_written_bounds(&this, bounds: mut &[TraitBound], res_ctx: ResolutionContext*) -> void {
         for (mut b: i64 = 0; b < bounds.length(); b++) {
-            const bound: TraitBound* = &bounds[b];
+            const bound: mut TraitBound* = &bounds[b];
             if (bound.has_projection_subject()) { continue; }
             if (bound.subject_param().is_valid()) {
                 for (mut r: i64 = 0; r < bound.trait_refs.length(); r++) {
-                    const tr: TraitRef* = &bound.trait_refs[r];
+                    const tr: mut TraitRef* = &bound.trait_refs[r];
                     if (tr.argument_types.length() == tr.type_args.length()) { continue; }
                     mut args: [TypeRef] = [];
                     for (mut a: i64 = 0; a < tr.type_args.length(); a++) {
@@ -1549,7 +1549,7 @@ type struct TypeResolver {
             const subject: TypeRef = this.resolve(bound.subject, res_ctx);
             if (!subject.is_valid()) { continue; }
             for (mut r: i64 = 0; r < bound.trait_refs.length(); r++) {
-                const tr: TraitRef* = &bound.trait_refs[r];
+                const tr: mut TraitRef* = &bound.trait_refs[r];
                 mut args: [TypeRef] = [];
                 for (mut a: i64 = 0; a < tr.type_args.length(); a++) {
                     args.push(this.resolve(tr.type_args[a], res_ctx));
@@ -1573,9 +1573,9 @@ type struct TypeResolver {
     /// downstream error rather than a silent miscompile).
     infer_impl_trait_return(&this, func_decl: DeclarationNode*,
                             res_ctx: ResolutionContext*) -> void {
-        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
+        const func: mut FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.return_type_annotation == null) { return; }
-        mut imp: ImplTraitAnnotation* = null;
+        mut imp: mut ImplTraitAnnotation* = null;
         match (*func.return_type_annotation) {
             TypeAnnotation::ImplTrait(node) => { imp = node; }
             _ => { return; }
@@ -1614,9 +1614,9 @@ type struct TypeResolver {
             pre_resolved: TypeRef::invalid(),
             res:          sl.res,
         };
-        mut result_ann: TypeAnnotation* = new TypeAnnotation::Named(name_ann);
+        mut result_ann: mut TypeAnnotation* = new TypeAnnotation::Named(name_ann);
         if (sl.generic_args.length() > 0) {
-            mut cloned_args: [TypeAnnotation*] = [];
+            mut cloned_args: [mut TypeAnnotation*] = [];
             for (mut i: i64 = 0; i < sl.generic_args.length(); i++) {
                 cloned_args.push(TypeAnnotation::clone_ptr(sl.generic_args[i]));
             }
@@ -1662,7 +1662,7 @@ type struct TypeResolver {
                    res_ctx: ResolutionContext*) -> void {
         for (mut i: i64 = 0; i < fields.length(); i++) {
             const field_decl: DeclarationNode* = fields[i];
-            const field: FieldDecl* = DeclarationNode::field_of(field_decl);
+            const field: mut FieldDecl* = DeclarationNode::field_of(field_decl);
             if (field == null) { continue; }
             if (field.type_annotation != null && !field.resolved_type.is_valid()) {
                 const ftype: TypeRef = this.resolve(field.type_annotation, res_ctx);
@@ -1682,7 +1682,7 @@ type struct TypeResolver {
     /// LLVM signature, producing a 0-arg `define` for what should be a
     /// 1-arg method.
     resolve_method_signatures(&this, methods: &[DeclarationNode*],
-                              res_ctx: ResolutionContext*,
+                              res_ctx: mut ResolutionContext*,
                               owner_type: TypeRef,
                               owner_def: DefId,
                               owner_args: &[TypeRef]) -> void {
@@ -1774,7 +1774,7 @@ type struct TypeResolver {
             if (method.is_static || !owner_type.is_valid()) { continue; }
             for (mut p: i64 = 0; p < DeclarationNode::fn_of(method.func).parameters.length(); p++) {
                 const param_decl: DeclarationNode* = DeclarationNode::fn_of(method.func).parameters[p];
-                const param: VarDecl* = DeclarationNode::var_of(param_decl);
+                const param: mut VarDecl* = DeclarationNode::var_of(param_decl);
                 if (param == null || param.resolved_type.is_valid()) { continue; }
                 if (param.is_value_receiver()) {
                     param.resolved_type = owner_type;
@@ -1863,7 +1863,7 @@ type struct TypeResolver {
     /// this lets `&This` parameters and `-> This` returns resolve to a real
     /// TypeRef that downstream substitution can rewrite per-impl.
     resolve_trait_method_signatures(&this, methods: &[DeclarationNode*],
-                                    res_ctx: ResolutionContext*) -> void {
+                                    res_ctx: mut ResolutionContext*) -> void {
         if (!res_ctx.this_type.is_valid()) {
             const this_name: SymbolStr = this.intern_table.intern("This");
             // Every trait shares the arena's one `This` placeholder.

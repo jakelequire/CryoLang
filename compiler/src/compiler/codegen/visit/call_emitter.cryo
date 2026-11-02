@@ -76,10 +76,10 @@ import compiler::codegen::visit::enum_variant_emitter::{ EnumVariantEmitter };
 
 
 type struct CallEmitter {
-    cg:           CodegenContext*;
+    cg:           mut CodegenContext*;
     state:        VisitorState*;
-    dispatch:     ExprDispatch*;
-    enum_variant: EnumVariantEmitter*;
+    dispatch:     mut ExprDispatch*;
+    enum_variant: mut EnumVariantEmitter*;
 
     /// Monotonic counter for naming the synthetic locals that hold enum
     /// payload pointers during drop-glue expansion (see emit_enum_drop_glue).
@@ -125,7 +125,7 @@ type struct CallEmitter {
     /// program that does not declare `Location` passes null, and can make
     /// no `location()` call to read it.
     push_caller_location(mut &this, args: [Pair<LValue, TypeRef>]*, span: SourceSpan) -> void {
-        const arena: TypeArena* = this.cg.get_arena();
+        const arena: mut TypeArena* = this.cg.get_arena();
         const ptr_ty: TypeRef = SymbolResolver::caller_location_params(arena)[0];
         if (this.cg.decl.caller_location.is_valid()) {
             (*args).push(Pair::<LValue, TypeRef>::new(this.cg.decl.caller_location, ptr_ty));
@@ -180,7 +180,7 @@ type struct CallEmitter {
         // through to the spill path.
         const opcode: i32 = llvm::LLVMGetInstructionOpcode(v.raw);
         if (opcode == 27) {
-            const operand: void* = llvm::LLVMGetOperand(v.raw, 0);
+            const operand: mut void* = llvm::LLVMGetOperand(v.raw, 0);
             if (operand != null) { return LValue { raw: operand }; }
         }
         const ty: LType = LType { raw: llvm::LLVMTypeOf(v.raw) };
@@ -213,7 +213,7 @@ type struct CallEmitter {
     /// come from `plan`, classified from the value's Cryo function type.
     /// `leading` goes before the call's own arguments: the receiver of a
     /// call through a trait object, nothing for any other call.
-    call_through_value(mut &this, visitor: IRGeneratorVisitor*, e: ExpressionNode*, node: CallExpr*,
+    call_through_value(mut &this, visitor: mut IRGeneratorVisitor*, e: ExpressionNode*, node: CallExpr*,
                        fn_ptr: LValue, plan: SignaturePlan, leading: [Pair<LValue, TypeRef>]) -> Emitted {
         mut out: Emitted = Emitted::none();
         // The seam returns `void` when sret applies, else the Direct
@@ -255,7 +255,7 @@ type struct CallEmitter {
     /// reference or pointer to it is the object's address, loaded through
     /// each level.  A call whose method the table does not hold is an
     /// internal error, never a call bound some other way.
-    call_through_object(mut &this, visitor: IRGeneratorVisitor*, e: ExpressionNode*, node: CallExpr*,
+    call_through_object(mut &this, visitor: mut IRGeneratorVisitor*, e: ExpressionNode*, node: CallExpr*,
                         ma: MemberAccessExpr*, object_t: Type*) -> Emitted {
         mut out: Emitted = Emitted::none();
         const registry: GenericRegistry* = this.cg.ctx.generic_registry;
@@ -296,8 +296,8 @@ type struct CallEmitter {
         const word: LType = LType::pointer_to(LType::i8());
         const data: LValue = this.cg.builder.build_extract_value(object, 0, "object.data");
         const table: LValue = this.cg.builder.build_extract_value(object, 1, "object.table");
-        const index_buf: void* = libc::malloc(8);
-        const index_slots: void** = index_buf as void**;
+        const index_buf: mut void* = libc::malloc(8);
+        const index_slots: mut (mut void*)* = index_buf as mut (mut void*)*;
         index_slots[0] = LType::const_int(LType::i64(), DeclarationEmitter::object_table_word(index) as u64, false).raw;
         const at: LValue = this.cg.builder.build_gep(word, table, index_buf, 1, "object.slot");
         libc::free(index_buf);
@@ -319,7 +319,7 @@ type struct CallEmitter {
     /// slot, so the equal-types check leaves it alone.
     reshape_call_result(mut &this, e: ExpressionNode*, result: LValue) -> LValue {
         if (!result.is_valid() || !e.resolved_type.is_valid()) { return result; }
-        const got_raw: void* = llvm::LLVMTypeOf(result.raw);
+        const got_raw: mut void* = llvm::LLVMTypeOf(result.raw);
         const expected_lty: LType = this.cg.type_mapper.map_type(e.resolved_type);
         const got_kind: LTypeKind = LType::kind_of(got_raw);
         const needs_coerce: boolean = expected_lty.is_valid()
@@ -353,7 +353,7 @@ type struct CallEmitter {
     /// visitor's dispatch delegates here, passing itself as `visitor:
     /// IRGeneratorVisitor*` so argument expressions can recurse through
     /// `dispatch.codegen_rvalue`.
-    emit(mut &this, visitor: IRGeneratorVisitor*, e: ExpressionNode*, node: CallExpr*) -> Emitted {
+    emit(mut &this, visitor: mut IRGeneratorVisitor*, e: ExpressionNode*, node: CallExpr*) -> Emitted {
         mut out: Emitted = Emitted::none();
         mut callee_val: LValue = LValue::null();
 
@@ -922,18 +922,18 @@ type struct CallEmitter {
     /// consumed-receiver path (`make().consume(g())`).
     record_arg_temp_slot(mut &this, slot: LValue, ty: TypeRef, span: SourceSpan) -> void {
         if (!slot.is_valid() || !ty.is_valid()) { return; }
-        const intern: InternTable* = this.cg.get_intern();
+        const intern: mut InternTable* = this.cg.get_intern();
         const nm: SymbolStr = intern.intern(fmt::format("__argtemp_%d", this.glue_seq));
         this.glue_seq = this.glue_seq + 1;
         const nm_sym: SymbolID = this.cg.ctx.resolver.alloc_synthetic_binding();
         this.cg.values.set(nm_sym, slot);
-        const id_node: ExpressionNode* = ExpressionNode::identifier_expr(nm, span);
+        const id_node: mut ExpressionNode* = ExpressionNode::identifier_expr(nm, span);
         ExpressionNode::identifier_of(id_node).set_res(Res::Local(nm_sym));
         id_node.set_resolved_type(ty);
         const drop_sym: SymbolStr = intern.intern("drop");
-        mut da: ExpressionNode* = ExpressionNode::member_access_expr(
+        mut da: mut ExpressionNode* = ExpressionNode::member_access_expr(
             id_node, drop_sym, span, span);
-        mut call: ExpressionNode* = ExpressionNode::call_expr(da, span);
+        mut call: mut ExpressionNode* = ExpressionNode::call_expr(da, span);
         this.cg.bind_destructor_call(call);
         mut stmt: Stmt* = Stmt::expr_stmt(call, span);
         this.cg.expr_ops.push_arg_temp_drop(stmt);
@@ -1008,7 +1008,7 @@ type struct CallEmitter {
     /// The schedule-driven core lives on `ExprOps` (reachable from the
     /// synthesized-check origins too); this forwards the ordinary-call schedule
     /// to it.
-    emit_cleanup_landingpad(mut &this, visitor: IRGeneratorVisitor*, node: CallExpr*,
+    emit_cleanup_landingpad(mut &this, visitor: mut IRGeneratorVisitor*, node: CallExpr*,
                             cur_fn: LValue, lpad_bb: LBasicBlock) -> void {
         this.cg.expr_ops.emit_cleanup_landingpad_sched(
             visitor, &node.unwind_cleanup, cur_fn, lpad_bb);
@@ -1032,7 +1032,7 @@ type struct CallEmitter {
     /// call is a function call, or names an intrinsic the dispatcher
     /// declines (an arity it does not take), which then goes through the
     /// pin as a call.
-    emit_pinned_intrinsic(mut &this, visitor: IRGeneratorVisitor*, e: ExpressionNode*,
+    emit_pinned_intrinsic(mut &this, visitor: mut IRGeneratorVisitor*, e: ExpressionNode*,
                           node: CallExpr*) -> Option<Emitted> {
         const kind: IntrinsicKind = this.pinned_intrinsic_kind(node);
         if (kind == IntrinsicKind::Call) { return Option::None; }
@@ -1064,7 +1064,7 @@ type struct CallEmitter {
 
     /// `intrinsics::panic(message, loc)`: the funnel, given the message and
     /// the address of `loc`.
-    emit_panic(mut &this, visitor: IRGeneratorVisitor*, node: CallExpr*) -> Emitted {
+    emit_panic(mut &this, visitor: mut IRGeneratorVisitor*, node: CallExpr*) -> Emitted {
         const msg: LValue = this.dispatch.codegen_rvalue(visitor, node.arguments[0]);
         const loc: LValue = this.location_address(this.dispatch.codegen_rvalue(visitor, node.arguments[1]));
         // `--panic=unwind` direct-panic drop-completeness: route the panic
@@ -1099,7 +1099,7 @@ type struct CallEmitter {
     /// (innermost-first) before the unwind continues, then `resume`s.  Reuses
     /// `node.unwind_cleanup` (DropInsertion populates it for EVERY call, panic
     /// included).
-    emit_panic_unwind(mut &this, visitor: IRGeneratorVisitor*, node: CallExpr*,
+    emit_panic_unwind(mut &this, visitor: mut IRGeneratorVisitor*, node: CallExpr*,
                       msg: LValue, loc: LValue) -> Emitted {
         mut out: Emitted = Emitted::none();
         const cur_fn: LValue = this.get_current_function();
@@ -1113,8 +1113,8 @@ type struct CallEmitter {
 
         const panic_fn: LValue = this.cg.intrinsics.get_or_decl_cryo_panic();
         const fty: LType = LType { raw: llvm::LLVMGlobalGetValueType(panic_fn.raw) };
-        const arg_buf: void* = libc::malloc(16);
-        const arg_slots: void** = arg_buf as void**;
+        const arg_buf: mut void* = libc::malloc(16);
+        const arg_slots: mut (mut void*)* = arg_buf as mut (mut void*)*;
         arg_slots[0] = msg.raw;
         arg_slots[1] = loc.raw;
 
@@ -1164,7 +1164,7 @@ type struct CallEmitter {
     /// `__cryo_panic_taken_*` symbols.  The default path never reaches here (the
     /// stdlib `catch_unwind` is generic and uninstantiated unless a program
     /// calls it), so this leaves the default IR byte-identical.
-    emit_catch_unwind(mut &this, visitor: IRGeneratorVisitor*, e: ExpressionNode*,
+    emit_catch_unwind(mut &this, visitor: mut IRGeneratorVisitor*, e: ExpressionNode*,
                       node: CallExpr*) -> Emitted {
         mut out: Emitted = Emitted::none();
         if (node.arguments.length() != 2) {
@@ -1195,14 +1195,14 @@ type struct CallEmitter {
 
         // Trampoline LLVM type: `void (ptr)`.
         const ptr_ty: LType = LType::pointer_to(LType::i8());
-        const param_buf: void* = libc::malloc(8);
-        const param_slots: void** = param_buf as void**;
+        const param_buf: mut void* = libc::malloc(8);
+        const param_slots: mut (mut void*)* = param_buf as mut (mut void*)*;
         param_slots[0] = ptr_ty.raw;
         const body_fty: LType = LType::function_type(LType::void_type(), param_buf, 1, false);
         libc::free(param_buf);
 
-        const arg_buf: void* = libc::malloc(8);
-        const arg_slots: void** = arg_buf as void**;
+        const arg_buf: mut void* = libc::malloc(8);
+        const arg_slots: mut (mut void*)* = arg_buf as mut (mut void*)*;
         arg_slots[0] = data_ptr.raw;
 
         const bool_ty: LType = LType::i1();
@@ -1247,12 +1247,12 @@ type struct CallEmitter {
         // Merge: caught flag.
         this.cg.builder.position_at_end(done_bb);
         const phi: LValue = this.cg.builder.build_phi(bool_ty, "cu.caught");
-        const vals_buf: void* = libc::malloc(16);
-        const vals: void** = vals_buf as void**;
+        const vals_buf: mut void* = libc::malloc(16);
+        const vals: mut (mut void*)* = vals_buf as mut (mut void*)*;
         vals[0] = false_val.raw;
         vals[1] = true_val.raw;
-        const blks_buf: void* = libc::malloc(16);
-        const blks: void** = blks_buf as void**;
+        const blks_buf: mut void* = libc::malloc(16);
+        const blks: mut (mut void*)* = blks_buf as mut (mut void*)*;
         blks[0] = cont_bb.raw;
         blks[1] = lpad_bb.raw;
         phi.add_incoming(vals_buf, blks_buf, 2);
@@ -1300,7 +1300,7 @@ type struct CallEmitter {
     /// caller suppresses the "no method" error.  Structs recurse
     /// into each droppable field in place; other aggregate kinds are not yet
     /// expanded and return true as a no-op (keeping today's behavior).
-    emit_drop_glue(mut &this, visitor: IRGeneratorVisitor*, receiver: ExpressionNode*,
+    emit_drop_glue(mut &this, visitor: mut IRGeneratorVisitor*, receiver: mut ExpressionNode*,
                    ty: TypeRef) -> boolean {
         const arena: TypeArena* = this.cg.get_arena();
         if (arena == null) { return false; }
@@ -1353,13 +1353,13 @@ type struct CallEmitter {
     /// branch), so the element access is built exactly like a struct field's
     /// and re-enters the normal `.drop()` lowering - elements without a user
     /// drop recurse back through glue.
-    emit_tuple_element_drops(mut &this, visitor: IRGeneratorVisitor*,
-                             receiver: ExpressionNode*, tt: TupleType*) -> void {
+    emit_tuple_element_drops(mut &this, visitor: mut IRGeneratorVisitor*,
+                             receiver: mut ExpressionNode*, tt: TupleType*) -> void {
         if (tt == null) { return; }
         const arena: TypeArena* = this.cg.get_arena();
         if (arena == null) { return; }
         const registry: GenericRegistry* = this.cg.ctx.generic_registry;
-        const intern: InternTable* = this.cg.get_intern();
+        const intern: mut InternTable* = this.cg.get_intern();
         const drop_sym: SymbolStr = intern.intern("drop");
         for (mut i: i64 = 0; i < tt.elements.length(); i++) {
             const elem_type: TypeRef = tt.elements[i];
@@ -1367,15 +1367,15 @@ type struct CallEmitter {
                 continue;
             }
             const idx_sym: SymbolStr = intern.intern(fmt::format("%ld", i));
-            mut elem_access: ExpressionNode* = ExpressionNode::member_access_expr(
+            mut elem_access: mut ExpressionNode* = ExpressionNode::member_access_expr(
                 receiver, idx_sym, receiver.span, receiver.span);
             elem_access.set_resolved_type(elem_type);
             // Minted after the last sema walk: the element is the i-th.
             ExpressionNode::member_access_of(elem_access).set_resolved_member(MemberPin::Field(i));
-            mut drop_access: ExpressionNode* = ExpressionNode::member_access_expr(
+            mut drop_access: mut ExpressionNode* = ExpressionNode::member_access_expr(
                 elem_access, drop_sym,
                 receiver.span, receiver.span);
-            mut call: ExpressionNode* = ExpressionNode::call_expr(
+            mut call: mut ExpressionNode* = ExpressionNode::call_expr(
                 drop_access, receiver.span);
             this.cg.bind_destructor_call(call);
             mut stmt: Stmt* = Stmt::expr_stmt(
@@ -1388,27 +1388,27 @@ type struct CallEmitter {
     /// `receiver[i].drop()` calls.  Re-enters the normal `.drop()` lowering
     /// per element, so elements that themselves lack a user drop recurse
     /// through glue (e.g. an array of structs of strings drops every string).
-    emit_fixed_array_drops(mut &this, visitor: IRGeneratorVisitor*,
-                           receiver: ExpressionNode*, at: ArrayType*) -> void {
+    emit_fixed_array_drops(mut &this, visitor: mut IRGeneratorVisitor*,
+                           receiver: mut ExpressionNode*, at: ArrayType*) -> void {
         if (at == null) { return; }
         const arena: TypeArena* = this.cg.get_arena();
         if (arena == null) { return; }
-        const intern: InternTable* = this.cg.get_intern();
+        const intern: mut InternTable* = this.cg.get_intern();
         const drop_sym: SymbolStr = intern.intern("drop");
         const idx_type: TypeRef = arena.get_i64();
         const n: i64 = at.size;
         for (mut i: i64 = 0; i < n; i++) {
             const idx_str: string = fmt::format("%ld", i);
-            mut idx_lit: ExpressionNode* = ExpressionNode::literal(
+            mut idx_lit: mut ExpressionNode* = ExpressionNode::literal(
                 idx_str, LiteralKind::Integer, receiver.span);
             idx_lit.set_resolved_type(idx_type);
-            mut arr_access: ExpressionNode* = ExpressionNode::array_access_expr(
+            mut arr_access: mut ExpressionNode* = ExpressionNode::array_access_expr(
                 receiver, idx_lit, receiver.span);
             arr_access.set_resolved_type(at.element);
-            mut drop_access: ExpressionNode* = ExpressionNode::member_access_expr(
+            mut drop_access: mut ExpressionNode* = ExpressionNode::member_access_expr(
                 arr_access, drop_sym,
                 receiver.span, receiver.span);
-            mut call: ExpressionNode* = ExpressionNode::call_expr(
+            mut call: mut ExpressionNode* = ExpressionNode::call_expr(
                 drop_access, receiver.span);
             this.cg.bind_destructor_call(call);
             mut stmt: Stmt* = Stmt::expr_stmt(
@@ -1422,27 +1422,27 @@ type struct CallEmitter {
     /// drops, Copy no-ops, and recursive glue).  In place: the member access
     /// yields a pointer into the receiver, so a leaf drop nulls that storage
     /// and any later re-drop is a no-op.
-    emit_field_drops(mut &this, visitor: IRGeneratorVisitor*, receiver: ExpressionNode*,
+    emit_field_drops(mut &this, visitor: mut IRGeneratorVisitor*, receiver: mut ExpressionNode*,
                      fields: &[FieldInfo]) -> void {
         const arena: TypeArena* = this.cg.get_arena();
         const registry: GenericRegistry* = this.cg.ctx.generic_registry;
-        const intern: InternTable* = this.cg.get_intern();
+        const intern: mut InternTable* = this.cg.get_intern();
         const drop_sym: SymbolStr = intern.intern("drop");
         for (mut i: i64 = 0; i < fields.length(); i++) {
             const f: FieldInfo = fields[i];
             if (!OwnershipQuery::needs_drop(arena, registry, intern, f.field_type)) {
                 continue;
             }
-            mut field_access: ExpressionNode* = ExpressionNode::member_access_expr(
+            mut field_access: mut ExpressionNode* = ExpressionNode::member_access_expr(
                 receiver, f.decl_name().spelling(), receiver.span, receiver.span);
             field_access.set_resolved_type(f.field_type);
             // Minted after the last sema walk: the field is the i-th of the
             // aggregate's own list, which is the list walked here.
             ExpressionNode::member_access_of(field_access).set_resolved_member(MemberPin::Field(i));
-            mut drop_access: ExpressionNode* = ExpressionNode::member_access_expr(
+            mut drop_access: mut ExpressionNode* = ExpressionNode::member_access_expr(
                 field_access, drop_sym,
                 receiver.span, receiver.span);
-            mut call: ExpressionNode* = ExpressionNode::call_expr(
+            mut call: mut ExpressionNode* = ExpressionNode::call_expr(
                 drop_access, receiver.span);
             this.cg.bind_destructor_call(call);
             mut stmt: Stmt* = Stmt::expr_stmt(
@@ -1457,14 +1457,14 @@ type struct CallEmitter {
     /// registered as a synthetic named lvalue and dropped via the normal
     /// `.drop()` lowering (so a payload that itself lacks a user drop recurses
     /// through glue).  `enum_ref` is the concrete (peeled) enum TypeRef.
-    emit_enum_drop_glue(mut &this, visitor: IRGeneratorVisitor*, receiver: ExpressionNode*,
+    emit_enum_drop_glue(mut &this, visitor: mut IRGeneratorVisitor*, receiver: mut ExpressionNode*,
                         et: EnumType*, enum_ref: TypeRef) -> void {
         if (et == null) { return; }
         if (et.is_simple_enum()) { return; }   // no payloads -> nothing to drop
 
         const arena: TypeArena* = this.cg.get_arena();
         const registry: GenericRegistry* = this.cg.ctx.generic_registry;
-        const intern: InternTable* = this.cg.get_intern();
+        const intern: mut InternTable* = this.cg.get_intern();
         const drop_sym: SymbolStr = intern.intern("drop");
 
         // Count variants with at least one droppable payload (switch arity).
@@ -1522,8 +1522,8 @@ type struct CallEmitter {
                     mut field_ptr_raw: LValue = payload_ptr;
                     if (offsets[pos] != 0) {
                         const byte_off: LValue = LType::const_int(LType::i64(), offsets[pos], false);
-                        const obuf: void* = libc::malloc(8);
-                        const obuf_arr: void** = obuf as void**;
+                        const obuf: mut void* = libc::malloc(8);
+                        const obuf_arr: mut (mut void*)* = obuf as mut (mut void*)*;
                         obuf_arr[0] = byte_off.raw;
                         field_ptr_raw = this.cg.builder.build_gep(
                             LType::i8(), payload_ptr, obuf, 1, "glue.field.ptr");
@@ -1540,12 +1540,12 @@ type struct CallEmitter {
                     this.glue_seq = this.glue_seq + 1;
                     const nm_sym: SymbolID = this.cg.ctx.resolver.alloc_synthetic_binding();
                     this.cg.values.set(nm_sym, field_ptr);
-                    const id_node: ExpressionNode* = ExpressionNode::identifier_expr(nm, receiver.span);
+                    const id_node: mut ExpressionNode* = ExpressionNode::identifier_expr(nm, receiver.span);
                     ExpressionNode::identifier_of(id_node).set_res(Res::Local(nm_sym));
                     id_node.set_resolved_type(pt);
-                    mut da: ExpressionNode* = ExpressionNode::member_access_expr(
+                    mut da: mut ExpressionNode* = ExpressionNode::member_access_expr(
                         id_node, drop_sym, receiver.span, receiver.span);
-                    mut call: ExpressionNode* = ExpressionNode::call_expr(
+                    mut call: mut ExpressionNode* = ExpressionNode::call_expr(
                         da, receiver.span);
                     this.cg.bind_destructor_call(call);
                     mut stmt: Stmt* = Stmt::expr_stmt(
