@@ -55,7 +55,7 @@ public const DEFAULT_CHUNK_SIZE: u64 = 1048576;
 // Chunk: one contiguous region in the Arena's chunk list
 
 private type struct Chunk {
-    private data: u8*;
+    private data: mut u8*;
     private capacity: u64;
     private offset: u64;
     private next: mut Chunk*;
@@ -67,13 +67,13 @@ private type struct Chunk {
     private static alloc(capacity: u64) -> mut Chunk* {
         const header: mut void* = libc::malloc(sizeof(Chunk));
         if (header == null) { return null; }
-        const data: void* = Chunk::os_alloc(capacity);
+        const data: mut u8* = Chunk::os_alloc(capacity);
         if (data == null) {
             libc::free(header);
             return null;
         }
         const chunk: mut Chunk* = header as mut Chunk*;
-        chunk.data = data as u8*;
+        chunk.data = data;
         chunk.capacity = capacity;
         chunk.offset = 0;
         chunk.next = null;
@@ -83,7 +83,7 @@ private type struct Chunk {
     /// Free a chunk produced by `alloc`: its OS-mapped `data` buffer back to
     /// the OS, then the C-heap header.  Consumes `chunk`; do not touch it after.
     private static dealloc(chunk: mut Chunk*) -> void {
-        Chunk::os_free(chunk.data as void*, chunk.capacity);
+        Chunk::os_free(chunk.data, chunk.capacity);
         libc::free(chunk as mut void*);
     }
 
@@ -92,34 +92,34 @@ private type struct Chunk {
     /// than via `malloc`) is what lets `dealloc` reclaim RSS deterministically,
     /// independent of glibc's main-heap retention heuristics.
     ![target(unix)]
-    private static os_alloc(size: u64) -> void* {
+    private static os_alloc(size: u64) -> mut u8* {
         const prot: i32 = libc::PROT_READ | libc::PROT_WRITE;
         const flags: i32 = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
-        const p: u8* = libc::mmap(null, size, prot, flags, -1, 0);
+        const p: mut u8* = libc::mmap(null, size, prot, flags, -1, 0);
         // mmap signals failure with MAP_FAILED == (void*)-1, not null.
         const addr: u64 = p as u64;
         if (addr == 0xFFFFFFFFFFFFFFFF) { return null; }
-        return p as void*;
+        return p;
     }
 
     ![target(windows)]
-    private static os_alloc(size: u64) -> void* {
+    private static os_alloc(size: u64) -> mut u8* {
         const ty: u32 = syscall::MEM_COMMIT | syscall::MEM_RESERVE;
-        const p: u8* = syscall::VirtualAlloc(null, size, ty, syscall::PAGE_READWRITE);
-        return p as void*;   // VirtualAlloc returns null on failure
+        // VirtualAlloc returns null on failure.
+        return syscall::VirtualAlloc(null, size, ty, syscall::PAGE_READWRITE);
     }
 
     /// Return a buffer obtained from `os_alloc` to the OS.  `size` is the
     /// chunk's stored `capacity`, so the unmap always has its length.
     ![target(unix)]
-    private static os_free(ptr: void*, size: u64) -> void {
-        libc::munmap(ptr as u8*, size);
+    private static os_free(ptr: mut u8*, size: u64) -> void {
+        libc::munmap(ptr, size);
     }
 
     ![target(windows)]
-    private static os_free(ptr: void*, size: u64) -> void {
+    private static os_free(ptr: mut u8*, size: u64) -> void {
         // MEM_RELEASE requires dwSize == 0 and frees the entire reservation.
-        syscall::VirtualFree(ptr as u8*, 0, syscall::MEM_RELEASE);
+        syscall::VirtualFree(ptr, 0, syscall::MEM_RELEASE);
     }
 
     /// Bump this chunk's high-water mark forward enough to fit `block` at the

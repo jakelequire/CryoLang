@@ -1,0 +1,54 @@
+// E0214: what writes memory takes a writable pointer to it - the destination
+// of `memcpy`, `memset` and `snprintf`, the buffer `Read::read` fills, and
+// what `munmap` and `intrinsics::free` release.  A read-only pointer is
+// refused as that argument, the same as for any `mut T*` parameter; a buffer
+// declared writable where it is made is accepted.
+![config(testing)]
+![config(negative, E0214)]
+namespace CryoTests::Negative::E0214DestinationTakesAWritablePointer;
+
+import std::core::intrinsics;
+import std::ffi::libc;
+import std::io::traits::{ Read };
+import std::io::error::{ IoError };
+
+type struct Empty { }
+
+implement trait Read for struct Empty {
+    read(mut &this, buffer: mut u8*, length: i64) -> Result<i64, IoError> {
+        return Result::Ok(0);
+    }
+}
+
+function copy_into_read_only(dest: u8*, src: u8*) -> void {
+    libc::memcpy(dest, src, 4);             //~ ERROR[E0214] mismatched types
+}
+
+function zero_read_only(dest: void*) -> void {
+    libc::memset(dest, 0, 4);               //~ ERROR[E0214] mismatched types
+}
+
+function format_into_read_only(dest: u8*) -> void {
+    libc::snprintf(dest, 4, "%d", 1);       //~ ERROR[E0214] mismatched types
+}
+
+function read_into_read_only(source: mut &Empty, dest: u8*) -> void {
+    source.read(dest, 4);                   //~ ERROR[E0214] mismatched types
+}
+
+function unmap_read_only(region: u8*) -> void {
+    libc::munmap(region, 4096);             //~ ERROR[E0214] mismatched types
+}
+
+function release_read_only(block: void*) -> void {
+    intrinsics::free(block);                //~ ERROR[E0214] mismatched types
+}
+
+function main() -> int {
+    mut bytes: [u8; 8] = [0; 8];
+    libc::memset(&bytes[0], 0, 8);
+    const block: mut void* = intrinsics::malloc(8);
+    libc::memcpy(block, &bytes[0], 8);
+    intrinsics::free(block);
+    return 0;
+}

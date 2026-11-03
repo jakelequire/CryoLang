@@ -948,8 +948,8 @@ See [section 17](#17-foreign-function-interface) for full FFI semantics, includi
 `intrinsic function` declares a function that the compiler lowers directly to LLVM IR rather than emitting a real call. The standard library uses intrinsics for primitives such as heap allocation, bit operations, atomics, float operations, and the panic mechanism.
 
 ```cryo
-intrinsic function malloc(size: u64) -> void*;
-intrinsic function free(ptr: void*) -> void;
+intrinsic function malloc(size: u64) -> mut void*;
+intrinsic function free(ptr: mut void*) -> void;
 intrinsic function popcount64(value: u64) -> u32;
 intrinsic function sqrt64(value: f64) -> f64;
 intrinsic function panic(message: string, loc: Location) -> never;
@@ -1990,7 +1990,7 @@ Inside the trait body, `This` refers to the implementing type. Methods may have 
 
 ```cryo
 type trait Read {
-    read(mut &this, buf: u8*, len: i64) -> Result<i64, IoError>;
+    read(mut &this, buf: mut u8*, len: i64) -> Result<i64, IoError>;
 
     /// Default: keep reading until end-of-stream or error.
     read_all(mut &this, out: mut &Array<u8>) -> Result<i64, IoError> {
@@ -2627,10 +2627,10 @@ import std::core::ptr;
 import std::core::intrinsics::{ malloc, free };
 
 type struct Box<T> {
-    ptr: T*;
+    ptr: mut T*;
 
     static new(value: T) -> Box<T> {
-        const p: T* = malloc(sizeof(T)) as T*;
+        const p: mut T* = malloc(sizeof(T));
         *p = value;
         return Box { ptr: p };
     }
@@ -2645,7 +2645,7 @@ type struct Box<T> {
 implement<T> trait Drop for Box<T> {
     drop(mut &this) -> void {
         ptr::drop_in_place::<T>(this.ptr);   // release the boxed value
-        free(this.ptr as void*);             // then its storage
+        free(this.ptr);                      // then its storage
     }
 }
 ```
@@ -3238,9 +3238,9 @@ Pointer indexing is supported: `ptr[0]` is `*ptr`, and `ptr[n]` accesses the n-t
 ```cryo
 import std::core::intrinsics::{ malloc, free };
 
-const buf: u8* = malloc(1024) as u8*;
+const buf: mut u8* = malloc(1024);
 buf[0] = 0xFF;
-free(buf as void*);
+free(buf);
 ```
 
 A bare `malloc`, `free` or `realloc` means a declaration in scope, as any bare name does: the module's own `intrinsic function`, an `extern "C"` it declares, or an import. With no such declaration in the writing module the bare name is an **error**, and the fix is to say which one is meant - `libc::free` for the C allocator, `allocator::free` for the Cryo one. There is no freestanding exception: under `no_std` the name is declared (extern or intrinsic), so the rule holds there as everywhere.
@@ -3262,14 +3262,14 @@ delete o;
 const arr: int* = new int[100];
 ```
 
-`new T[n]` allocates room for `n` contiguous `T` and yields a `T*`. The memory is **uninitialized** - it is the typed equivalent of `malloc(n * sizeof(T))`. Free it with `free(arr as void*)`. For constructed, growable, bounds-checked storage prefer `Array<T>`.
+`new T[n]` allocates room for `n` contiguous `T` and yields a `T*`. The memory is **uninitialized** - it is the typed equivalent of `malloc(n * sizeof(T))`. Free it with `intrinsics::free(arr)`. For constructed, growable, bounds-checked storage prefer `Array<T>`.
 
 **Where `new` gets its memory (`Allocate`).** `new` and `delete` are sugar over the trait `std::core::ops::Allocate`, as `a[i]` is over `Index` and `*p` over `Deref`:
 
 ```cryo
 type trait Allocate {
-    static allocate(size: u64, align: u64) -> void*;
-    static release(ptr: void*, align: u64) -> void { }
+    static allocate(size: u64, align: u64) -> mut void*;
+    static release(ptr: mut void*, align: u64) -> void { }
 }
 ```
 
@@ -3286,9 +3286,9 @@ type struct Node {
 }
 
 implement trait Allocate for struct Node {
-    static allocate(size: u64, align: u64) -> void* {
+    static allocate(size: u64, align: u64) -> mut void* {
         g_used = (g_used + align - 1) & ~(align - 1);
-        const p: void* = (&g_pool[g_used as i64]) as void*;
+        const p: mut void* = &g_pool[g_used as i64];
         g_used = g_used + size;
         return p;
     }
@@ -3374,11 +3374,11 @@ import std::core::intrinsics::{ free };
 //         drop(mut &this) -> void;
 //     }
 
-type struct Buffer { data: u8*; }
+type struct Buffer { data: mut u8*; }
 
 implement trait Drop for Buffer {
     drop(mut &this) -> void {
-        free(this.data as void*);
+        free(this.data);
     }
 }
 ```
@@ -3459,7 +3459,7 @@ implement trait Drop for Session {
 >
 > implement trait Drop for Buffer {
 >     drop(mut &this) -> void {
->         if (this.data != null) { free(this.data as void*); }
+>         if (this.data != null) { free(this.data); }
 >         this.data = null;                   // REQUIRED, not defensive style
 >     }
 > }

@@ -135,11 +135,20 @@ yet is recorded with the change that builds it, not here.
 
 ### 2026-11-03
 
-690. **What releases memory takes a writable pointer.**  `libc::free`,
-     `libc::aligned_free` and `_aligned_free` take a `mut u8*`, as
-     `realloc` does, and `Allocate::release` a `mut void*`.  A caller
-     declares the pointer it frees writable where the allocation is made;
-     it does not widen a read-only one with `as`.  (Jake)
+690. **What releases or writes memory takes a writable pointer, and what
+     allocates returns one.**  `libc::free`, `libc::aligned_free` and
+     `_aligned_free` take a `mut u8*`, as `realloc` does, and
+     `Allocate::release` a `mut void*`; so do `intrinsics::free` and
+     `realloc`, `munmap`, `mremap`, `VirtualFree`, `freeaddrinfo`,
+     `regfree` and `freelocale`.  `intrinsics::malloc`, `mmap` and
+     `Allocate::allocate` return a writable pointer, as `libc::malloc`
+     does, and so does `getaddrinfo`'s result.  The destination of
+     `memcpy`, `memmove`, `memccpy`, `memset`, the `str*cpy`/`str*cat`
+     family, `sprintf`, `snprintf` and `vsnprintf` is writable, as is
+     every library function's buffer it fills (`Read::read`, the
+     `to_*_buf` formatters, `mem::copy` and `mem::zero`).  A caller
+     declares the pointer writable where the allocation is made; it does
+     not widen a read-only one with `as`.  (Jake)
 
 691. **The census requires a test from every project judged on its exit
      code.**  A `collect` project passes when its own `cryo test` exits 0,
