@@ -111,17 +111,13 @@ implement trait Drop for Analysis {
 
 
 type struct Project {
-    /// The cryoconfig's path, or the lone file's path; for a workspace
-    /// `[[lib]]` member, the cryoconfig's path and the member's name.
+    /// Which analysis a file belongs to (`Projects::key_for`).
     key:     String;
     /// NUL-terminated cryoconfig path; empty for a lone file.
     config:  String;
     /// The cryoconfig as parsed when the project was made; the defaults for
     /// a lone file.
     layout:  ProjectConfig;
-    /// The `[[lib]]` member whose source_dir holds this project's files, or
-    /// -1: each member is a library of its own, analysed apart.
-    member:  i64;
     /// The analysis that answers questions; `ctx` null until one parsed.
     current: Analysis;
     /// An open or a save made an analysis owed.
@@ -145,12 +141,11 @@ type struct Project {
     /// one to publish again when the compiler resumes after its hook.
     building: mut arena::Arena*;
 
-    static new(key: str::Str, config: str::Str, layout: ProjectConfig, member: i64) -> Project {
+    static new(key: str::Str, config: str::Str, layout: ProjectConfig) -> Project {
         return Project {
             key:         String::from_str(key),
             config:      PathFinder::build_cstring_buffer(config),
             layout:      layout,
-            member:      member,
             current:     Analysis::none(),
             owed:        false,
             analysed:    false,
@@ -261,25 +256,18 @@ type struct Project {
     }
 
     /// Whether file `path` belongs to this project: it is under the same
-    /// cryoconfig, and under this project's `[[lib]]` member when it has one.
+    /// cryoconfig and its key is this project's.
     owns(&this, path: str::Str) -> boolean {
         mut cfg: String = PathFinder::discover_project_cryoconfig(path);
-        const yes: boolean = if (cfg.length() == 0) {
-            path.equals(&this.key.as_str())
+        mut key: String = if (cfg.length() == 0 || cfg.as_str().equals(&this.config.as_str())) {
+            Projects::key_for(cfg.as_str(), &this.layout, path)
         } else {
-            cfg.as_str().equals(&this.config.as_str()) && this.layout_member(path) == this.member
+            String::new()
         };
+        const yes: boolean = key.as_str().equals(&this.key.as_str());
+        mem::drop(key);
         mem::drop(cfg);
         return yes;
-    }
-
-    /// The `[[lib]]` member of this project's cryoconfig whose source_dir
-    /// holds file `path`, or -1.
-    layout_member(&this, path: str::Str) -> i64 {
-        mut c: String = PathFinder::build_cstring_buffer(path);
-        const member: i64 = this.layout.library_member_holding(c.as_ptr() as string);
-        mem::drop(c);
-        return member;
     }
 
     /// The analysis whose diagnostics are owed: the last one, adopted or not.
@@ -289,10 +277,11 @@ type struct Project {
     }
 
     /// Why the published analysis did not read this project's file `path`,
-    /// or None when it did: the compiler stopped before finding the
-    /// project's modules, and why, or nothing the project builds imports
-    /// the file.  Module discovery follows imports, so such a file is never
-    /// compiled and nothing in it can be answered.
+    /// or could not be finished, or None when neither: the compiler stopped
+    /// before finding the project's modules, and why; nothing the project
+    /// builds imports the file (module discovery follows imports, so such a
+    /// file is never compiled and nothing in it can be answered); or an
+    /// error with no place in any file, which no squiggle can carry.
     file_notice(&this, path: str::Str) -> Option<String> {
         if (!this.analysed) { return Option::None; }
         const ctx: compilation_context::CompilationContext* = this.published_analysis().ctx;
@@ -303,13 +292,18 @@ type struct Project {
         mut c: String = PathFinder::build_cstring_buffer(path);
         const found: boolean = ctx.module_graph.find_module_by_path(c.as_ptr() as string) >= 0;
         mem::drop(c);
-        if (found) { return Option::None; }
-        if (ctx.modules_discovered) {
+        if (!found && ctx.modules_discovered) {
             return Option::Some(String::from_str(
                 "Cryo did not analyse this file: nothing the project builds imports it, so the compiler never reads it"));
         }
-        mut text: String = String::from_str(
-            "Cryo did not analyse this file: the compiler stopped while finding the project's modules");
+        // Discovery stopped: every error that stopped it, with its place.
+        // Otherwise: only the errors that have no place.
+        mut text: String = if (found) {
+            String::from_str("Cryo could not finish analysing this project")
+        } else {
+            String::from_str("Cryo did not analyse this file: the compiler stopped while finding the project's modules")
+        };
+        mut listed: i64 = 0;
         const diags: &[diagnostic::Diagnostic] = &ctx.diagnostics.diagnostics;
         for (mut i: i64 = 0; i < diags.length(); i++) {
             const d: &diagnostic::Diagnostic = &diags[i];
@@ -317,13 +311,28 @@ type struct Project {
                 Severity::Error => { true }
                 _               => { false }
             };
-            if (!is_error) { continue; }
+            if (!is_error || (found && d.span.has_location())) { continue; }
+            listed = listed + 1;
             text.push("; ");
             if (d.span.has_location()) {
                 text.push(str::Str::new(d.span.file));
                 text.push(f":{d.span.start_line}: ");
             }
             text.push(str::Str::new(d.message));
+        }
+        if (found && listed == 0) {
+            mem::drop(text);
+            return Option::None;
+        }
+        // A notice as long as a module cycle's is cut at a character's
+        // start: the editor shows it on one line.
+        const limit: i64 = 600;
+        if (text.length() > limit) {
+            mut cut: i64 = limit;
+            const bytes: Slice<u8> = text.as_bytes();
+            while (cut > 0 && (bytes[cut] & 192) == 128) { cut = cut - 1; }
+            text.truncate(cut);
+            text.push(" ...");
         }
         return Option::Some(text);
     }
@@ -374,6 +383,28 @@ type struct Projects {
         return null;
     }
 
+    /// The key of the analysis file `path` belongs to, under cryoconfig
+    /// `config` as `layout` parses it: the cryoconfig, then the `[[bin]]`
+    /// whose entry point the file is or the `[[lib]]` member holding it,
+    /// each analysed apart because each is a program of its own; or the
+    /// path itself when there is no cryoconfig.
+    static key_for(config: str::Str, layout: &ProjectConfig, path: str::Str) -> String {
+        if (config.length() == 0) { return String::from_str(path); }
+        mut key: String = String::from_str(config);
+        mut c: String = PathFinder::build_cstring_buffer(path);
+        const binary: i64 = layout.binary_with_entry(c.as_ptr() as string);
+        const member: i64 = layout.library_member_holding(c.as_ptr() as string);
+        mem::drop(c);
+        if (binary >= 0) {
+            key.push("#bin:");
+            key.push(str::Str::new(layout.bins[binary].name));
+        } else if (member >= 0) {
+            key.push("#lib:");
+            key.push(str::Str::new(layout.libs[member].name));
+        }
+        return key;
+    }
+
     /// The parsed cryoconfig at `config`: an existing project's, or else
     /// read from disk.
     layout_of(&this, config: str::Str) -> ProjectConfig {
@@ -406,28 +437,18 @@ type struct Projects {
     project_for(mut &this, path: str::Str) -> mut Project* {
         const held: mut Project* = this.library_holder(path);
         if (held != null) { return held; }
-        // The key: the nearest cryoconfig at or above the file's directory,
-        // then the name of the `[[lib]]` member holding it; or the path
-        // itself when there is no cryoconfig.
         mut cfg: String = PathFinder::discover_project_cryoconfig(path);
         const layout: ProjectConfig = if (cfg.length() > 0) {
             this.layout_of(cfg.as_str())
         } else {
             ProjectConfig::default()
         };
-        mut c: String = PathFinder::build_cstring_buffer(path);
-        const member: i64 = layout.library_member_holding(c.as_ptr() as string);
-        mem::drop(c);
-        mut key: String = if (cfg.length() > 0) { String::from_str(cfg.as_str()) } else { String::from_str(path) };
-        if (member >= 0) {
-            key.push("#");
-            key.push(str::Str::new(layout.libs[member].name));
-        }
+        mut key: String = Projects::key_for(cfg.as_str(), &layout, path);
         match (this.by_key.get_mutable(&key)) {
             Option::Some(p) => { mem::drop(key); mem::drop(cfg); return p; }
             Option::None    => { }
         }
-        const p: Project = Project::new(key.as_str(), cfg.as_str(), layout, member);
+        const p: Project = Project::new(key.as_str(), cfg.as_str(), layout);
         mem::drop(cfg);
         this.by_key.insert(String::from_str(key.as_str()), p);
         match (this.by_key.get_mutable(&key)) {

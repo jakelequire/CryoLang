@@ -371,7 +371,7 @@ public:
             this.module_lines.push(ModuleLine {
                 written:     scan.submodule_paths[s],
                 from_dir:    file_path.parent_dir(),
-                declarer:    file_path.to_ascii_lower(),
+                declarer:    ModuleGraph::module_key(file_path),
                 is_internal: scan.submodule_internal[s],
                 target:      "",
                 resolved:    false,
@@ -388,8 +388,8 @@ public:
     declared_internal(mut &this, intern: InternTable*, norm_path: string) -> boolean {
         for (mut k: i64 = 0; k < this.module_lines.length(); k++) {
             if (this.module_lines[k].resolved) { continue; }
-            this.module_lines[k].target = this.resolve_import_path(
-                intern, this.module_lines[k].written, this.module_lines[k].from_dir).to_ascii_lower();
+            this.module_lines[k].target = ModuleGraph::module_key(this.resolve_import_path(
+                intern, this.module_lines[k].written, this.module_lines[k].from_dir));
             this.module_lines[k].resolved = true;
         }
         mut chain: [string] = [norm_path];
@@ -527,7 +527,7 @@ public:
         const lib: string = import_path + 8;
         const idx: i64 = this.vendor_registry.find_index(lib);
         if (idx < 0) { return; }
-        this.vendor_modules.insert(resolved.to_ascii_lower(),
+        this.vendor_modules.insert(ModuleGraph::module_key(resolved),
             "vendor::" + this.vendor_registry.entries[idx].name);
         const key: string = this.vendor_registry.entries[idx].key;
         for (mut i: i64 = 0; i < this.used_vendor_keys.length(); i++) {
@@ -626,13 +626,16 @@ public:
     /// Recursively discover a module and its imports.
     discover_module(mut &this, intern: mut InternTable*,
                     graph: mut ModuleGraph*, sink: mut DiagnosticSink*,
-                    file_path: string) -> boolean {
+                    written_path: string) -> boolean {
         // Check if already loaded (case-insensitive on Windows).
         // Different import paths can resolve to the same file with different
         // casing (e.g., "src/Compiler/Passes/Sema.cryo" vs
-        // "src/compiler/passes/sema.cryo").  Lowercasing ensures we only
-        // load and register each physical file once.
-        const norm_path: string = file_path.to_ascii_lower();
+        // "src/compiler/passes/sema.cryo") or with `.` segments
+        // (`<root>/./core/x.cryo` from a `source_dir` of `.`).  The key
+        // ensures we only load and register each physical file once, and
+        // the module keeps the one spelling.
+        const file_path: string = ModuleGraph::module_spelling(written_path);
+        const norm_path: string = ModuleGraph::module_key(file_path);
 
         if (this.is_loaded(norm_path)) { return true; }
 
@@ -792,7 +795,7 @@ public:
                 // `scanned_ns` rather than degrading the edge to the written
                 // import path, which names no module.
                 const scanned: string =
-                    match (this.scanned_ns.get(&resolved.to_ascii_lower())) {
+                    match (this.scanned_ns.get(&ModuleGraph::module_key(resolved))) {
                         Option::Some(ns) => { ns }
                         Option::None     => { "" }
                     };
@@ -841,7 +844,7 @@ public:
                 // Mid-load inside a cycle - same case as the dependency edge
                 // above; the namespace is known even though the graph entry
                 // is not written yet.
-                match (this.scanned_ns.get(&item_resolved.to_ascii_lower())) {
+                match (this.scanned_ns.get(&ModuleGraph::module_key(item_resolved))) {
                     Option::Some(ns) => {
                         info.add_imported_namespace(RecordedEdge::written_as(intern.intern(ns)));
                         continue;
@@ -922,7 +925,7 @@ public:
                 }
                 // Mid-load inside a cycle: the graph entry is not written yet,
                 // but the namespace is already known.
-                match (this.scanned_ns.get(&exp_resolved.to_ascii_lower())) {
+                match (this.scanned_ns.get(&ModuleGraph::module_key(exp_resolved))) {
                     Option::Some(ns) => {
                         const ns_sym: SymbolStr = intern.intern(ns);
                         if (!braced) { info.add_reexport(RecordedEdge::written_as(ns_sym)); }
@@ -976,7 +979,7 @@ public:
                     info.add_imported_namespace(RecordedEdge::to(graph.modules[eby_path].path()));
                     continue;
                 }
-                match (this.scanned_ns.get(&eitem_resolved.to_ascii_lower())) {
+                match (this.scanned_ns.get(&ModuleGraph::module_key(eitem_resolved))) {
                     Option::Some(ns) => {
                         const ens: SymbolStr = intern.intern(ns);
                         info.add_reexport(RecordedEdge::written_as(ens));
@@ -1025,7 +1028,7 @@ public:
                 } else {
                     // Mid-load (cycle): the graph entry is not written yet, but
                     // the namespace is known.  Same case as the import edge.
-                    match (this.scanned_ns.get(&sub_resolved.to_ascii_lower())) {
+                    match (this.scanned_ns.get(&ModuleGraph::module_key(sub_resolved))) {
                         Option::Some(ns) => {
                             info.add_submodule(RecordedEdge::written_as(intern.intern(ns)), sub_at);
                         }
@@ -1520,7 +1523,7 @@ public:
     /// continues the namespace `owner_file` declares into; "" when the owner
     /// has not been scanned or no file declares that namespace.
     sub_module_file(&this, intern: InternTable*, owner_file: string, rest: SymbolStr) -> string {
-        match (this.scanned_ns.get(&owner_file.to_ascii_lower())) {
+        match (this.scanned_ns.get(&ModuleGraph::module_key(owner_file))) {
             Option::Some(owner_ns) => {
                 match (this.ns_map.get(&fmt::format("%s::%s", owner_ns, intern.resolve(rest)))) {
                     Option::Some(sub_file) => { return sub_file; }

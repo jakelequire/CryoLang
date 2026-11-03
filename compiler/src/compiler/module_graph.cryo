@@ -15,6 +15,8 @@ import utils::log::{ Log, LogArea, LogLevel };
 import std::collections::hashmap::{ HashMap };
 import std::ffi::libc;
 import std::fmt;
+import std::fs::path::{ Path };
+import std::collections::string::{ String };
 import std::core::hash::{ Hash, Hasher };
 import std::core::cmp::{ Eq };
 import compiler::resolver::intern_table::{ InternTable };
@@ -1003,15 +1005,53 @@ public:
         return SymbolStr::empty();
     }
 
-    /// Find a module's index by its file path (case-insensitive).
-    /// Returns -1 if not found.
+    /// Find a module's index by its file path (case-insensitive), however
+    /// its `.` segments are written.  Returns -1 if not found.
     find_module_by_path(&this, path: string) -> i64 {
+        const spelling: string = ModuleGraph::module_spelling(path);
         for (mut i: i64 = 0; i < this.modules.length(); i++) {
-            if (ModuleGraph::paths_equal_ignore_case(this.modules[i].file_path, path)) {
+            if (ModuleGraph::paths_equal_ignore_case(this.modules[i].file_path, spelling)) {
                 return i;
             }
         }
         return -1;
+    }
+
+    /// A module file's path with every `.` segment after the first dropped,
+    /// so `<root>/./core/x.cryo` and `<root>/core/x.cryo` are one file
+    /// written one way.  A leading `.` stays: it is how a relative path
+    /// starts.  Every module is registered under this spelling, so its
+    /// spans name the file as an editor does.
+    static module_spelling(path: string) -> string {
+        const n: i64 = path.length() as i64;
+        mut has_dot_segment: boolean = false;
+        for (mut i: i64 = 1; i < n; i++) {
+            if ((path[i] as u8) == 46 && Path::is_separator(path[i - 1] as u8)
+                    && (i + 1 == n || Path::is_separator(path[i + 1] as u8))) {
+                has_dot_segment = true;
+                break;
+            }
+        }
+        if (!has_dot_segment) { return path; }
+        mut out: String = String::with_capacity(n);
+        mut start: i64 = 0;
+        while (start <= n) {
+            mut end: i64 = start;
+            while (end < n && !Path::is_separator(path[end] as u8)) { end++; }
+            const dot: boolean = end - start == 1 && (path[start] as u8) == 46;
+            if (!dot || start == 0) {
+                for (mut i: i64 = start; i < end; i++) { out.push_byte(path[i] as u8); }
+                if (end < n) { out.push_byte(path[end] as u8); }
+            }
+            start = end + 1;
+        }
+        return out.into_raw();
+    }
+
+    /// The loader's key for a module file: its spelling, lower-cased, as
+    /// paths compare on a case-insensitive filesystem.
+    static module_key(path: string) -> string {
+        return ModuleGraph::module_spelling(path).to_ascii_lower();
     }
 
     /// Get the parsed AST for a module by index.
