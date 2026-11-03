@@ -2631,14 +2631,19 @@ type struct Executor {
     }
 
     /// Print one project's PASS/FAIL line in the active format. `detail` is
-    /// shown after a FAIL (e.g. "expected E0200").
+    /// shown after a FAIL (e.g. "expected E0200"), and after a PASS when the
+    /// verdict carries one (a collect project's "12 tests").
     static proj_report(is_pretty: boolean, is_compact: boolean,
                        color_on: boolean, passed: boolean, detail_text: string) -> void {
         const detail: string = detail_text;
         if (passed) {
             if (is_compact)      { fmt::printf("."); }
-            else if (is_pretty)  { Executor::neg_chip_pass(color_on); fmt::printf("\n"); }
-            else                 { fmt::printf("ok\n"); }
+            else if (is_pretty)  {
+                Executor::neg_chip_pass(color_on);
+                if (detail.length() > 0) { fmt::printf("  (%s)\n", detail); } else { fmt::printf("\n"); }
+            } else {
+                if (detail.length() > 0) { fmt::printf("ok (%s)\n", detail); } else { fmt::printf("ok\n"); }
+            }
         } else {
             if (is_compact)      { fmt::printf("F"); }
             else if (is_pretty)  {
@@ -2808,6 +2813,34 @@ type struct Executor {
             } else {
                 passed = st == 0;
                 if (!passed) { detail = "project tests failed"; }
+            }
+            // A run whose test discovery found nothing exits 0 as well, so the
+            // run's own count goes on the project's line: the exit code alone
+            // cannot tell the two apart.
+            if (passed) {
+                const newline: str::Str = str::Str::new("\n");
+                const summary: str::Str = str::Str::new("unit test summary");
+                const passed_row: str::Str = str::Str::new("passed");
+                const failed_row: str::Str = str::Str::new("failed");
+                mut in_summary: boolean = false;
+                mut tests_ran: u64 = 0;
+                for (raw in str::Str::new(Executor::read_file_or_empty(tmp_text)).split(&newline)) {
+                    const line: str::Str = raw.trim();
+                    if (line.equals(&summary)) {
+                        in_summary = true;
+                        continue;
+                    }
+                    if (!in_summary) { continue; }
+                    match (line.strip_prefix(&passed_row)) {
+                        Option::Some(count) => { tests_ran = tests_ran + u64::parse_literal(count.trim().as_bytes(), 10).unwrap_or(0); }
+                        Option::None => {}
+                    }
+                    match (line.strip_prefix(&failed_row)) {
+                        Option::Some(count) => { tests_ran = tests_ran + u64::parse_literal(count.trim().as_bytes(), 10).unwrap_or(0); }
+                        Option::None => {}
+                    }
+                }
+                detail = if (tests_ran == 1) { "1 test" } else { fmt::format("%llu tests", tests_ran) };
             }
         }
         return ProjOutcome { passed: passed, detail: detail };

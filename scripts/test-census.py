@@ -25,6 +25,7 @@ entry the roster golden pins:
     compile-fail  passed + failed                      == pinned negative files
     projects      passed + failed + skipped + ignored  == pinned projects
     projects      every pinned project was REACHED, by name
+    projects      every collect project that passed ran at least one test
 
 Each is an identity, not a floor, and each holds on every host even though the
 outcomes do not: a project gated to another OS is skipped rather than absent,
@@ -74,6 +75,9 @@ UNIT_LINE = re.compile(r"^(?:(?:ok|FAIL|skip)\s+(\S+)|test ([^\s(]\S*) \.\.\.)")
 # leak in a probe.
 PROJ_SKIP = re.compile(r"skipped \(requires (.+?)\)\s*$")
 PROJ_IGNORE = re.compile(r"(?:^|\.\.\. )ignored\s*$")
+# A passing project's verdict.  A collect project's carries the number of
+# unit tests its own run reported: `ok (12 tests)`.
+PROJ_OK = re.compile(r"(?:^|\.\.\. )ok(?: \((\d+) tests?\))?\s*$")
 
 
 def roster_check():
@@ -88,7 +92,7 @@ def roster_check():
 
 def pinned():
     """(unit NAMES, negative count, project NAMES, unit entries gated to
-    another OS) from the roster golden.
+    another OS, collect project NAMES) from the roster golden.
 
     The golden is a union across hosts, so a unit test gated to another OS is
     pinned here and never compiled: it is excused from the unit names, by the
@@ -100,6 +104,7 @@ def pinned():
     neg = 0
     unit = set()
     projects = set()
+    collect = set()
     elsewhere = []
     with open(GOLDEN, "r", encoding="utf-8") as fh:
         for raw in fh:
@@ -109,13 +114,16 @@ def pinned():
             if line.startswith("negative "):
                 neg += 1
             elif line.startswith("project "):
-                projects.add(line.split(None, 1)[1].split(":", 1)[0])
+                name = line.split(None, 1)[1].split(":", 1)[0]
+                projects.add(name)
+                if " outcome=collect " in line:
+                    collect.add(name)
             elif ": test" in line:
                 if rc.gated_elsewhere(line, gated):
                     elsewhere.append(line)
                 else:
                     unit.add(line.rsplit(": test", 1)[0])
-    return unit, neg, projects, elsewhere
+    return unit, neg, projects, elsewhere, collect
 
 
 def parse(lines):
@@ -134,6 +142,7 @@ def parse(lines):
     unit_names = []
     skipped = []
     ignored = 0
+    passed_counts = {}
     last_project = None
     current = None
     for raw in lines:
@@ -161,13 +170,17 @@ def parse(lines):
         if PROJ_IGNORE.search(line.strip()):
             ignored += 1
             continue
+        m = PROJ_OK.search(line.strip())
+        if m and last_project is not None:
+            passed_counts[last_project] = int(m.group(1) or 0)
+            continue
         if current:
             m = ROW.match(line)
             if m:
                 blocks[current][m.group(1)] = int(m.group(2))
             elif line.strip().startswith("result"):
                 current = None
-    return blocks, reached, unit_names, skipped, ignored
+    return blocks, reached, unit_names, skipped, ignored, passed_counts
 
 
 def main():
@@ -212,8 +225,8 @@ def main():
     sys.stdout.flush()
     code = proc.wait()
 
-    want_unit, want_neg, want_projects, unit_elsewhere = pinned()
-    blocks, reached, unit_names, skipped, ignored = parse(captured)
+    want_unit, want_neg, want_projects, unit_elsewhere, collect = pinned()
+    blocks, reached, unit_names, skipped, ignored, passed_counts = parse(captured)
 
     problems = []
 
@@ -275,6 +288,13 @@ def main():
         for name in sorted(set(reached) - want_projects):
             problems.append("projects: %s ran but is not pinned; re-pin the "
                             "roster" % name)
+        # A collect project is judged on its exit code, and a run whose test
+        # discovery found nothing exits 0 too; the count it ran is the only
+        # thing that tells the two apart.
+        for name in sorted(collect & set(passed_counts)):
+            if passed_counts[name] < 1:
+                problems.append("projects: %s passed on its exit code with no "
+                                "tests run" % name)
 
     print()
     print("test-census: roster pins %d unit, %d compile-fail, %d project(s)"

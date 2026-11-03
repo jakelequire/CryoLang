@@ -201,7 +201,8 @@ Tests and gates
   make test-list         List the discovered unit tests without running them.
   make test-census       The same run as test, with each suite's count, and
                          the unit tests and projects by name, asserted
-                         against tests/test-roster.txt (evidence).
+                         against tests/test-roster.txt (evidence); a passing
+                         collect project must have run at least one test.
   make roster-check      The discovered roster against tests/test-roster.txt
                          (ARGS=--merge after adding, --update after removing).
   make verify            Build once; census, examples, lsp-check, cross-check,

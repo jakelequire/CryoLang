@@ -141,6 +141,12 @@ yet is recorded with the change that builds it, not here.
      declares the pointer it frees writable where the allocation is made;
      it does not widen a read-only one with `as`.  (Jake)
 
+691. **The census requires a test from every project judged on its exit
+     code.**  A `collect` project passes when its own `cryo test` exits 0,
+     and a run whose test discovery found nothing exits 0 too, so the
+     runner prints the run's unit-test count on the project's line and the
+     census refuses a passing `collect` project that ran none.  (Jake)
+
 ### 2026-11-02
 
 679. **Every build runs LLVM's IR optimizer over each module before it is

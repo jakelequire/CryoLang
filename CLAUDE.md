@@ -106,11 +106,13 @@ not done. The remaining limits are here so nobody rediscovers them:
   `![target]`-gated elsewhere in the SOURCE, and drops one whose test is
   actually gone.
 - **`outcome: "collect"` ignores every `expect` field.** `project_outcome`
-  (`compiler/src/CLI/commands.cryo`) checks the child's exit code and nothing
-  else, so a `collect` project whose `![test]` discovery broke runs zero
-  tests, exits 0, and passes. Writing assertions into such a `test.json` does
-  not make them run. `grep -l '"collect"' tests/tests/projects/*/test.json`
-  lists the projects that use this fixture.
+  (`compiler/src/CLI/commands.cryo`) passes a `collect` project on the
+  child's exit code and nothing else, so writing assertions into such a
+  `test.json` does not make them run. What it does add is the child's own
+  unit-test count on the verdict (`ok (12 tests)`), and `make test-census`
+  refuses a passing `collect` project that ran none - a broken `![test]`
+  discovery exits 0 too. `make test` does not check the count. The roster
+  golden marks these projects `outcome=collect`.
 - **A compile-fail file with no `//~` annotation asserts a code and nothing
   else** - not the line, not the symbol, not the absence of a cascade. Write
   the annotations; `scripts/annotate-negative-tests.py` generates them from a
