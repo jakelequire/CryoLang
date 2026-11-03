@@ -197,7 +197,7 @@ private type struct Task {
         // is never the last: `cx`'s drop cannot free the box mid-poll.
         task_incref(&this);
         mut cx: Context = Context::new(Waker::new(task_wake, waker_arc_clone,
-                                                  waker_arc_drop, &this as u8*));
+                                                  waker_arc_drop, &this as mut u8*));
         mut pinfo: PanicInfo = PanicInfo { msg: "", file: "", line: 0 };
         const status: u8 = poll_boundary(this.poll_fn, this.fut, this.shared, &cx, &pinfo);
         if (status == 2) {
@@ -383,24 +383,24 @@ private function task_decref(task: Task*) -> void {
 /// `Waker` `clone_fn` for an owning task waker: acquire a reference and return
 /// the same `Task*` handle, so the clone keeps the task alive until it drops. A
 /// bare fn-ptr stored in the `Waker` vtable, so a free function.
-private function waker_arc_clone(data: u8*) -> u8* {
+private function waker_arc_clone(data: mut u8*) -> mut u8* {
     task_incref(data as Task*);
     return data;
 }
 
 /// `Waker` `drop_fn` for an owning task waker: release the reference the waker
 /// held. A bare fn-ptr stored in the `Waker` vtable, so a free function.
-private function waker_arc_drop(data: u8*) -> void {
+private function waker_arc_drop(data: mut u8*) -> void {
     task_decref(data as Task*);
 }
 
 /// The waker callback: `data` is the `Task*`. Reschedule it via the atomic
 /// run-state so it is enqueued at most once and never polled by two workers —
 /// see the module doc. Must be a free function: it is stored in the `Waker`
-/// vtable as a raw `(u8*) -> void` and invoked as `wake_fn(data)`, and Cryo
+/// vtable as a raw `(mut u8*) -> void` and invoked as `wake_fn(data)`, and Cryo
 /// cannot take a static method's address as a fn-ptr value (it resolves to the
 /// type, not the method) — nor could an instance method's `this`-ABI match.
-private function task_wake(data: u8*) -> void {
+private function task_wake(data: mut u8*) -> void {
     const task: mut Task* = data as mut Task*;
     loop {
         const s: u8 = task.run_state.load(MemoryOrder::Acquire);
@@ -444,7 +444,7 @@ private type struct PollCtx {
 /// status. If the poll panics, control unwinds out before the store — straight
 /// through this frame, which owns no droppable locals — to the catch pad. A bare
 /// fn-ptr, so it must be a free function. Mirrors `panic_unwind::run_catch_body`.
-private function run_poll(data: u8*) -> void {
+private function run_poll(data: mut u8*) -> void {
     const pc: mut PollCtx* = data as mut PollCtx*;
     const pf: (mut u8*, mut u8*, Context*) -> u8 = pc.poll_fn;
     pc.status = pf(pc.fut, pc.shared, pc.cx);
@@ -460,8 +460,8 @@ private function poll_boundary(poll_fn: (mut u8*, mut u8*, Context*) -> u8, fut:
                        cx: Context*, out_panic: mut PanicInfo*) -> u8 {
     mut pc: PollCtx = PollCtx { poll_fn: poll_fn, fut: fut, shared: shared,
                                cx: cx, status: 0 };
-    const tramp: (u8*) -> void = run_poll;
-    const caught: boolean = intrinsics::try_catch(tramp as void*, &pc as void*);
+    const tramp: (mut u8*) -> void = run_poll;
+    const caught: boolean = intrinsics::try_catch(tramp as void*, &pc as mut void*);
     if (caught) {
         *out_panic = panic_unwind::taken_panic_info();
         return 2;

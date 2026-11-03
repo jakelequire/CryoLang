@@ -59,12 +59,16 @@ import std::math;
 /// them agree on who frees the inner when the last reference drops.  Both
 /// counts are `Atomic<u64>` for lock-free increments and decrements; see the
 /// module docs for what `strong` and `weak` mean.  `Arc::value_offset` depends
-/// on the counts coming first and `value` directly after them.
+/// on the counts coming first and `value` directly after them.  `block` is the
+/// header's own writable address, stored when it is allocated: a value pointer
+/// handed back to the raw API only locates the header, and every write goes
+/// through `block`.
 private type struct ArcInner<T, A> {
     private strong: Atomic<u64>;
     private weak:   Atomic<u64>;
     private value:  T;
     private alloc:  A;
+    private block:  mut ArcInner<T, A>*;
 }
 
 /// Free the header through its own stored allocator, after the value has
@@ -130,6 +134,7 @@ public type struct Arc<T, A = GlobalAlloc> where A: Allocator {
         inner_ptr.weak   = Atomic::<u64>::new(1);
         inner_ptr.value  = value;
         inner_ptr.alloc  = alloc;
+        inner_ptr.block  = inner_ptr;
         return Result::Ok(Arc::<T, GlobalAlloc> { inner: inner_ptr });
     }
 
@@ -146,6 +151,7 @@ public type struct Arc<T, A = GlobalAlloc> where A: Allocator {
         inner_ptr.weak   = Atomic::<u64>::new(1);
         inner_ptr.value  = value;
         inner_ptr.alloc  = a;
+        inner_ptr.block  = inner_ptr;
         return Result::Ok(Arc::<T, A> { inner: inner_ptr });
     }
 
@@ -262,10 +268,12 @@ public type struct Arc<T, A = GlobalAlloc> where A: Allocator {
         return math::align_up(weak_offset + sizeof(Atomic<u64>), alignof(T));
     }
 
-    /// The shared block whose value `value` points at.
+    /// The shared block whose value `value` points at.  The value pointer only
+    /// finds the header; the writable pointer is the one the header stored.
     private static block_of(value: T*) -> mut ArcInner<T, A>* {
-        const start: u8* = mem::offset::<u8>(value as mut u8*, -(Arc::<T, A>::value_offset() as i64));
-        return start as mut ArcInner<T, A>*;
+        const start: u8* = mem::const_offset::<u8>(value as u8*, -(Arc::<T, A>::value_offset() as i64));
+        const header: ArcInner<T, A>* = start as ArcInner<T, A>*;
+        return header.block;
     }
 }
 

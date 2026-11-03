@@ -218,6 +218,21 @@ yet is recorded with the change that builds it, not here.
      written.  A literal of the owner itself is written with its
      arguments, `String::<A> { .. }`.  (Jake)
 
+687. **`Arc` writes its shared block only through a writable pointer it
+     kept.**  The block stores its own writable address when it is
+     allocated.  The raw API is unchanged - `from_raw`,
+     `increment_strong_count` and `decrement_strong_count` take a
+     read-only `T*` to the value - and that pointer only finds the block,
+     read-only; the counts are changed through the stored address.  A read-only pointer is never widened to reach them.
+     (Jake)
+
+688. **A waker's callbacks take a writable data pointer.**  `Waker`'s
+     `wake_fn`, `clone_fn` and `drop_fn` are `(mut u8*) -> void` and
+     `(mut u8*) -> mut u8*`, and its data is a `mut u8*`, because the
+     executor's callbacks change the task the data names.  The catch
+     primitive's data is a `mut void*` for the same reason: its
+     trampoline may store through it.  (Jake)
+
 ### 2026-11-01
 
 677. **A primitive implements the trait of every operator that applies to
