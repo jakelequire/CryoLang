@@ -463,7 +463,7 @@ type struct DiagRenderer {
         //    back to the single-span snippet.
         if (diag.span.has_location()) {
             this.load_source(diag.span.file);
-            if (this.has_same_file_secondary(diag)) {
+            if (this.has_same_file_secondary(diag) || diag.other_sites().length() > 0) {
                 this.render_combined_snippet(diag);
             } else {
                 // Prefer the primary label's caption for the inline caret
@@ -471,8 +471,7 @@ type struct DiagRenderer {
                 // to surface `expected X, found Y` separately from the
                 // headline).  Falls back to the headline for legacy
                 // emission sites that only call `at(span)`.
-                const caption: string = this.primary_label_caption(diag);
-                this.render_snippet(diag.span, diag.severity, caption);
+                this.render_snippet(diag.span, diag.severity, diag.primary_caption());
             }
         }
 
@@ -535,24 +534,6 @@ type struct DiagRenderer {
         DiagSink::emit_raw(this.out, "================================================================================");
         DiagSink::emit_raw(this.out, reset);
         DiagSink::emit_raw(this.out, "\n");
-    }
-
-    /// The inline caption to print under the caret for a single-snippet
-    /// render.  Returns the primary label's message when an emission
-    /// site set one via `at_with_label`; otherwise falls back to the
-    /// diagnostic's headline so legacy `at(span)` callers keep their
-    /// "Header line repeats under the caret" output unchanged.
-    primary_label_caption(&this, diag: &Diagnostic) -> string {
-        for (mut i: i64 = 0; i < diag.labels.length(); i++) {
-            const lbl: SpanLabel = diag.labels[i];
-            if (!lbl.is_primary)             { continue; }
-            if (!lbl.span.has_location())    { continue; }
-            if (lbl.span.start_line != diag.span.start_line) { continue; }
-            if (lbl.span.start_col  != diag.span.start_col)  { continue; }
-            if (lbl.message == "")           { continue; }
-            return lbl.message;
-        }
-        return diag.message;
     }
 
     /// True if the diagnostic has at least one secondary label that
@@ -772,19 +753,27 @@ type struct DiagRenderer {
         }
         const line_width: u32 = this.line_number_width(max_line);
 
-        // Header arrow:  --> file:line:col  (always anchored at primary)
-        DiagSink::emit_raw(out, this.lead());
-        DiagSink::emit_raw(out, bold);
-        DiagSink::emit_raw(out, blue);
-        DiagSink::emit_raw(out, "-->");
-        DiagSink::emit_raw(out, reset);
-        DiagSink::emit_raw(out, " ");
-        DiagSink::emit_raw(out, primary_span.file);
-        DiagSink::emit_raw(out, ":");
-        DiagSink::emit_int(out, primary_span.start_line as u64);
-        DiagSink::emit_raw(out, ":");
-        DiagSink::emit_int(out, primary_span.start_col as u64);
-        DiagSink::emit_raw(out, "\n");
+        // Header arrows:  --> file:line:col  at the primary, then one per
+        // other place a folded report names, so every place reads as a
+        // location of its own.
+        mut arrows: [SourceSpan] = [];
+        arrows.push(primary_span);
+        const others: [SourceSpan] = diag.other_sites();
+        for (mut i: i64 = 0; i < others.length(); i++) { arrows.push(others[i]); }
+        for (mut i: i64 = 0; i < arrows.length(); i++) {
+            DiagSink::emit_raw(out, this.lead());
+            DiagSink::emit_raw(out, bold);
+            DiagSink::emit_raw(out, blue);
+            DiagSink::emit_raw(out, "-->");
+            DiagSink::emit_raw(out, reset);
+            DiagSink::emit_raw(out, " ");
+            DiagSink::emit_raw(out, arrows[i].file);
+            DiagSink::emit_raw(out, ":");
+            DiagSink::emit_int(out, arrows[i].start_line as u64);
+            DiagSink::emit_raw(out, ":");
+            DiagSink::emit_int(out, arrows[i].start_col as u64);
+            DiagSink::emit_raw(out, "\n");
+        }
 
         this.render_margin(line_width);
 
@@ -1585,7 +1574,9 @@ type struct DiagRenderer {
     }
 
     /// Print a summary line:  "aborting due to N errors; M warnings emitted"
-    print_summary(&this, error_count: u32, warning_count: u32) -> void {
+    /// `error_reports` is how many reports the errors were rendered as; it
+    /// is named only when grouping made it fewer than the errors.
+    print_summary(&this, error_count: u32, warning_count: u32, error_reports: u32) -> void {
         const bold: string  = this.color_bold();
         const red: string   = this.color_red();
         const reset: string = this.color_reset();
@@ -1598,6 +1589,12 @@ type struct DiagRenderer {
             DiagSink::emit_int(out, error_count as u64);
             DiagSink::emit_raw(out, " error");
             DiagSink::emit_raw(out, if (error_count == 1) { "" } else { "s" });
+            if (error_reports < error_count) {
+                DiagSink::emit_raw(out, " in ");
+                DiagSink::emit_int(out, error_reports as u64);
+                DiagSink::emit_raw(out, " report");
+                DiagSink::emit_raw(out, if (error_reports == 1) { "" } else { "s" });
+            }
             if (warning_count > 0) {
                 DiagSink::emit_raw(out, "; ");
                 DiagSink::emit_int(out, warning_count as u64);

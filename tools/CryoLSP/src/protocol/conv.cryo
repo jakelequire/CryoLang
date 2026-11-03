@@ -195,7 +195,14 @@ type struct DiagnosticConverter {
         mut arr: Array<value::JsonValue> = Array::<value::JsonValue>::with_capacity(diags.length());
         for (mut i: i64 = 0; i < diags.length(); i++) {
             if (DiagnosticConverter::diag_is_for_path(&diags[i], fs_path)) {
-                arr.push(DiagnosticConverter::diag_to_json(&diags[i], &renderer, cache, positions));
+                // Each place keeps its own squiggle; the report it belongs
+                // to - every place of one cause, folded - is what the full
+                // view renders and what links the places to each other.
+                const indices: [i64] = diagnostic::Diagnostic::sites_sharing_cause(diags, i);
+                mut sites: [diagnostic::Diagnostic] = [];
+                for (mut k: i64 = 0; k < indices.length(); k++) { sites.push(diags[indices[k]].clone()); }
+                const report: diagnostic::Diagnostic = if (sites.length() == 1) { sites[0].clone() } else { diagnostic::Diagnostic::report_of(sites) };
+                arr.push(DiagnosticConverter::diag_to_json(&diags[i], &report, &renderer, cache, positions));
             }
         }
         match (notice) {
@@ -270,9 +277,21 @@ type struct DiagnosticConverter {
     /// are skipped - the diagnostic's own `range` already covers the primary
     /// site - and so are spanless children: they have no editor position,
     /// but the rendered `message` still carries their text.
-    static related_information_array(diag: &diagnostic::Diagnostic,
+    static related_information_array(diag: &diagnostic::Diagnostic, report: &diagnostic::Diagnostic,
                                      positions: &docs::Docs) -> Array<value::JsonValue> {
         mut arr: Array<value::JsonValue> = Array::<value::JsonValue>::new();
+
+        // The other places of the folded report this diagnostic belongs
+        // to: the one fix settles them all.
+        if (report.other_sites().length() > 0) {
+            for (mut i: i64 = 0; i < report.labels.length(); i++) {
+                const label: span_label::SpanLabel = report.labels[i];
+                if (!label.is_primary || !label.span.has_location()) { continue; }
+                if (label.span.same_as(&diag.span)) { continue; }
+                const text: string = fmt::format("same cause: %s", label.message);
+                arr.push(DiagnosticConverter::related_info_json(label.span.file, label.span, text, positions));
+            }
+        }
 
         for (mut i: i64 = 0; i < diag.labels.length(); i++) {
             const label: span_label::SpanLabel = diag.labels[i];
@@ -403,7 +422,7 @@ type struct DiagnosticConverter {
     /// `diagId` that's also stamped on the diagnostic's `data` field, so
     /// the editor's "open rendered diagnostic" code action can fetch the
     /// full report back later.
-    static diag_to_json(diag: &diagnostic::Diagnostic,
+    static diag_to_json(diag: &diagnostic::Diagnostic, report: &diagnostic::Diagnostic,
                         renderer: mut renderer::DiagRenderer*,
                         cache: mut diag_render_cache::DiagRenderCache*,
                         positions: &docs::Docs) -> value::JsonValue {
@@ -436,7 +455,7 @@ type struct DiagnosticConverter {
         // Render once for the cache so the virtual-doc view can fetch the
         // full report on demand.  Kept separate from the inline message
         // above by design.
-        mut rendered: String = renderer.render_to_string(diag);
+        mut rendered: String = renderer.render_to_string(report);
 
         // diagId: stable across publishes; the cache key + the value
         // the editor extension passes to `cryo/renderedDiagnostic`.
@@ -463,7 +482,7 @@ type struct DiagnosticConverter {
 
         // relatedInformation: clickable navigation to every secondary span
         // and located child diagnostic.
-        o.put("relatedInformation", value::JsonValue::Array(DiagnosticConverter::related_information_array(diag, positions)));
+        o.put("relatedInformation", value::JsonValue::Array(DiagnosticConverter::related_information_array(diag, report, positions)));
 
         return value::JsonValue::Object(o);
     }

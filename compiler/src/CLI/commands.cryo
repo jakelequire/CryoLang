@@ -1765,8 +1765,24 @@ type struct Executor {
         const file_name: str::Str = str::Str::new(fname_text);
         // The diagnostic whose header was read last, until its first arrow.
         mut pending: Option<NegDiag> = Option::None;
+        // The diagnostic just placed, while arrows follow its first one: a
+        // report of several places gives each its own arrow, stacked under
+        // the header, and each is a diagnostic of that code at that line.
+        mut stacked: Option<NegDiag> = Option::None;
         for (raw in str::Str::new(out_text).split(&newline)) {
             const line: str::Str = raw.trim_end();
+            if (stacked.is_some()) {
+                if (line.trim_start().starts_with(&arrow)) {
+                    const head: NegDiag = stacked.unwrap();
+                    const site_line: i64 = Executor::neg_arrow_line(line);
+                    if (line.contains(&file_name) && site_line >= 0) {
+                        diags.push(NegDiag { line: site_line, severity: head.severity,
+                                             code: head.code, message: head.message });
+                    }
+                    continue;
+                }
+                stacked = Option::None;
+            }
             mut severity: string = "";
             if (line.starts_with(&error_header)) { severity = "error"; }
             else if (line.starts_with(&warning_header)) { severity = "warning"; }
@@ -1791,7 +1807,11 @@ type struct Executor {
             pending = Option::None;
             if (!line.contains(&file_name)) { continue; }
             diagnostic.line = Executor::neg_arrow_line(line);
-            if (diagnostic.line >= 0) { diags.push(diagnostic); }
+            if (diagnostic.line >= 0) {
+                stacked = Option::Some(NegDiag { line: diagnostic.line, severity: diagnostic.severity,
+                                                 code: diagnostic.code, message: diagnostic.message });
+                diags.push(diagnostic);
+            }
         }
         return diags;
     }

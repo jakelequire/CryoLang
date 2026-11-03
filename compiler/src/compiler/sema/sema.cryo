@@ -2817,7 +2817,7 @@ type struct SemaVisitor {
             if (ma.object == null) { return; }
             const through: Option<PlaceAccess> = this.indirection_access(ma.object);
             if (through.is_some()) {
-                this.refuse_read_only_write(through.unwrap(), lhs.span, "assign to");
+                this.refuse_read_only_write(through.unwrap(), lhs.span);
                 return;
             }
             if (this.refuses_held_write(ma.object, lhs.span)) { return; }
@@ -2834,7 +2834,7 @@ type struct SemaVisitor {
             if (aa.array == null) { return; }
             const through: Option<PlaceAccess> = this.index_access(aa.array);
             if (through.is_some()) {
-                this.refuse_read_only_write(through.unwrap(), lhs.span, "assign to");
+                this.refuse_read_only_write(through.unwrap(), lhs.span);
                 return;
             }
             if (this.refuses_held_write(aa.array, lhs.span)) { return; }
@@ -2850,7 +2850,7 @@ type struct SemaVisitor {
         if (read != null) {
             const through: Option<PlaceAccess> = this.indirection_access(read);
             if (through.is_some()) {
-                this.refuse_read_only_write(through.unwrap(), lhs.span, "assign to");
+                this.refuse_read_only_write(through.unwrap(), lhs.span);
                 return;
             }
             if (this.refuses_held_write(read, lhs.span)) { return; }
@@ -2861,7 +2861,7 @@ type struct SemaVisitor {
         if (un.desugared_call == null) {
             const through: Option<PlaceAccess> = this.dereference_access(un.operand);
             if (through.is_some()) {
-                this.refuse_read_only_write(through.unwrap(), lhs.span, "assign to");
+                this.refuse_read_only_write(through.unwrap(), lhs.span);
             }
         }
     }
@@ -3010,8 +3010,8 @@ type struct SemaVisitor {
     refuses_held_write(mut &this, holder: ExpressionNode*, span: SourceSpan) -> boolean {
         const held: PlaceAccess = this.place_access(holder);
         return match (held) {
-            PlaceAccess::Borrow(_)          => { this.refuse_read_only_write(held, span, "assign to"); true }
-            PlaceAccess::ReadOnlyPointer(_) => { this.refuse_read_only_write(held, span, "assign to"); true }
+            PlaceAccess::Borrow(_)          => { this.refuse_read_only_write(held, span); true }
+            PlaceAccess::ReadOnlyPointer(_) => { this.refuse_read_only_write(held, span); true }
             _                               => { false }
         };
     }
@@ -3132,13 +3132,20 @@ type struct SemaVisitor {
         return last;
     }
 
-    /// E0250 where a place is written (`what`: "assign to", "call a
-    /// `mut &this` method on") while `access` says it is read-only; nothing
-    /// when it is writable.
-    refuse_read_only_write(mut &this, access: PlaceAccess, span: SourceSpan, what: string) -> void {
+    /// E0250 where a place is assigned while `access` says it is read-only;
+    /// nothing when it is writable.
+    refuse_read_only_write(mut &this, access: PlaceAccess, span: SourceSpan) -> void {
         if (access.is_writable()) { return; }
         this.ctx.emit_diagnostic(this.read_only_report(ErrorCode::E0250_WRITE_THROUGH_READ_ONLY,
-            access, span, what, "written here"));
+            access, span, "assign to", "written here"));
+    }
+
+    /// E0250 where a `mut &this` method is called on a place `access` says
+    /// is read-only; nothing when it is writable.
+    refuse_read_only_call(mut &this, access: PlaceAccess, span: SourceSpan) -> void {
+        if (access.is_writable()) { return; }
+        this.ctx.emit_diagnostic(this.read_only_report(ErrorCode::E0250_WRITE_THROUGH_READ_ONLY,
+            access, span, "call a `mut &this` method on", "mutating call here"));
     }
 
     /// E0251 where a writable borrow or pointer is taken of a place while
@@ -3188,6 +3195,15 @@ type struct SemaVisitor {
                         const written: string = if (kw.start_col == kw.end_col) { "mut " } else { "mut" };
                         diag = diag.suggest(Suggestion::machine_applicable(kw, written,
                             "declare the receiver `mut &this`"));
+                    }
+                    // Every change made through one `&this` is the one problem
+                    // of how the receiver is declared.
+                    const method: FunctionDecl* = DeclarationNode::fn_of(this.state.current_func);
+                    if (method != null && kw.has_location()) {
+                        diag = diag.caused_by(
+                            fmt::format("receiver:%s:%u:%u", kw.file, kw.start_line, kw.start_col),
+                            fmt::format("method `%s` changes its receiver, which it takes as a read-only `&this`",
+                                this.intern.resolve(method.name)));
                     }
                 } else if (holder_t != null && holder_t.kind == TypeKind::Object) {
                     diag = diag.help("a `virtual &Trait` only reads; take a `virtual mut &Trait` where the value is written");

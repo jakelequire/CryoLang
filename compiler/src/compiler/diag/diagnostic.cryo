@@ -23,6 +23,14 @@ type struct Diagnostic {
     labels:      [SpanLabel];
     children:    [Diagnostic];
     suggestions: [Suggestion];
+    // What the diagnostic blames - a declaration, a missing import - as a key
+    // naming it, "" when nothing is blamed.  Diagnostics of one cause whose
+    // suggestions are the same edits are one problem written in several
+    // places, and are reported once with every place labelled.
+    cause:       string;
+    // The headline of that one report, written about the cause rather than
+    // about any one place.
+    cause_headline: string;
 
     /// Create an error diagnostic (no location yet; attach with at()).
     static error(code: ErrorCode, message: string) -> Diagnostic {
@@ -34,6 +42,8 @@ type struct Diagnostic {
             labels:      [],
             children:    [],
             suggestions: [],
+            cause:       "",
+            cause_headline: "",
         };
     }
 
@@ -47,6 +57,8 @@ type struct Diagnostic {
             labels:      [],
             children:    [],
             suggestions: [],
+            cause:       "",
+            cause_headline: "",
         };
     }
 
@@ -82,6 +94,8 @@ type struct Diagnostic {
             labels:      [],
             children:    [],
             suggestions: [],
+            cause:       "",
+            cause_headline: "",
         };
         mut r: Diagnostic = this.clone();
         r.children.push(child);
@@ -100,6 +114,8 @@ type struct Diagnostic {
             labels:      child_labels,
             children:    [],
             suggestions: [],
+            cause:       "",
+            cause_headline: "",
         };
         mut r: Diagnostic = this.clone();
         r.children.push(child);
@@ -116,6 +132,8 @@ type struct Diagnostic {
             labels:      [],
             children:    [],
             suggestions: [],
+            cause:       "",
+            cause_headline: "",
         };
         mut r: Diagnostic = this.clone();
         r.children.push(child);
@@ -134,6 +152,119 @@ type struct Diagnostic {
         mut r: Diagnostic = this.clone();
         r.suggestions.push(suggestion);
         return r;
+    }
+
+    /// Blame `key` for the diagnostic, with `headline` the message of the one
+    /// report every diagnostic of that cause is folded into.
+    caused_by(&this, key: string, headline: string) -> Diagnostic {
+        mut r: Diagnostic = this.clone();
+        r.cause = key;
+        r.cause_headline = headline;
+        return r;
+    }
+
+    /// True when `other` is the same problem: the same cause, the same
+    /// severity, in the same file, and a fix made of the same edits, so
+    /// applying it once settles both.
+    shares_cause_with(&this, other: &Diagnostic) -> boolean {
+        if (this.cause == "" || this.cause != other.cause) { return false; }
+        if (this.severity != other.severity) { return false; }
+        if (this.span.file != other.span.file) { return false; }
+        if (this.suggestions.length() != other.suggestions.length()) { return false; }
+        for (mut i: i64 = 0; i < this.suggestions.length(); i++) {
+            if (!this.suggestions[i].same_edits(&other.suggestions[i])) { return false; }
+        }
+        return true;
+    }
+
+    /// The indices of the diagnostics in `all` that are the same problem as
+    /// `all[index]`, in order, `index` among them.
+    static sites_sharing_cause(all: &[Diagnostic], index: i64) -> [i64] {
+        mut out: [i64] = [];
+        for (mut j: i64 = 0; j < all.length(); j++) {
+            if (j == index || all[index].shares_cause_with(&all[j])) { out.push(j); }
+        }
+        return out;
+    }
+
+    /// The one report of `sites`, diagnostics of one cause: headed by the
+    /// earliest site and worded by the cause's headline, with every site's
+    /// caret under its own caption, the sites' other labels once each, and
+    /// the help and fix once.  A site reported under another code says so
+    /// in a note.
+    static report_of(sites: [Diagnostic]) -> Diagnostic {
+        mut order: [i64] = [];
+        for (mut i: i64 = 0; i < sites.length(); i++) {
+            mut at: i64 = order.length();
+            while (at > 0 && sites[i].span.starts_before(&sites[order[at - 1]].span)) { at -= 1; }
+            order.insert(at, i);
+        }
+        const head: &Diagnostic = &sites[order[0]];
+        mut labels: [SpanLabel] = [];
+        for (mut k: i64 = 0; k < order.length(); k++) {
+            const site: &Diagnostic = &sites[order[k]];
+            labels.push(SpanLabel::primary(site.span, site.primary_caption()));
+        }
+        for (mut k: i64 = 0; k < order.length(); k++) {
+            const site: &Diagnostic = &sites[order[k]];
+            for (mut l: i64 = 0; l < site.labels.length(); l++) {
+                const label: SpanLabel = site.labels[l];
+                if (label.is_primary) { continue; }
+                mut seen: boolean = false;
+                for (mut m: i64 = 0; m < labels.length(); m++) {
+                    if (labels[m].span.same_as(&label.span) && labels[m].message == label.message) { seen = true; break; }
+                }
+                if (!seen) { labels.push(label); }
+            }
+        }
+        mut r: Diagnostic = Diagnostic {
+            severity:    head.severity,
+            code:        head.code,
+            message:     if (head.cause_headline == "") { head.message } else { head.cause_headline },
+            span:        head.span,
+            labels:      labels,
+            children:    head.children.clone(),
+            suggestions: head.suggestions.clone(),
+            cause:       head.cause,
+            cause_headline: head.cause_headline,
+        };
+        for (mut k: i64 = 1; k < order.length(); k++) {
+            const site: &Diagnostic = &sites[order[k]];
+            if (site.code != head.code) {
+                r = r.with_note(fmt::format("line %u is also reported as `%s`",
+                    site.span.start_line, site.code.format()));
+            }
+        }
+        return r;
+    }
+
+    /// The caption under this diagnostic's own caret: its primary label's,
+    /// or the headline where no label at its span has one.
+    primary_caption(&this) -> string {
+        for (mut i: i64 = 0; i < this.labels.length(); i++) {
+            const label: SpanLabel = this.labels[i];
+            if (!label.is_primary)             { continue; }
+            if (!label.span.has_location())    { continue; }
+            if (label.span.start_line != this.span.start_line) { continue; }
+            if (label.span.start_col  != this.span.start_col)  { continue; }
+            if (label.message == "")           { continue; }
+            return label.message;
+        }
+        return this.message;
+    }
+
+    /// The places of this report other than its head: every primary label
+    /// away from `span`.  Empty for a diagnostic that is not a folded report.
+    other_sites(&this) -> [SourceSpan] {
+        mut out: [SourceSpan] = [];
+        if (this.cause == "") { return out; }
+        for (mut i: i64 = 0; i < this.labels.length(); i++) {
+            const label: SpanLabel = this.labels[i];
+            if (!label.is_primary || !label.span.has_location()) { continue; }
+            if (label.span.same_as(&this.span)) { continue; }
+            out.push(label.span);
+        }
+        return out;
     }
 
     /// Append a `did you mean` help and a machine-applicable suggestion when
@@ -185,6 +316,8 @@ implement trait Clone for struct Diagnostic {
             labels:      labels_c,
             children:    this.children.clone(),
             suggestions: this.suggestions.clone(),
+            cause:       this.cause,
+            cause_headline: this.cause_headline,
         };
     }
 }

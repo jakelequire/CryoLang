@@ -168,6 +168,40 @@ type struct DiagnosticSink {
         }
     }
 
+    /// The reports the collected diagnostics make: each diagnostic alone,
+    /// except that diagnostics sharing a cause and a fix are one report, at
+    /// the place the first of them was emitted.
+    reports(&this) -> [Diagnostic] {
+        mut taken: [boolean] = [];
+        for (mut i: i64 = 0; i < this.diagnostics.length(); i++) { taken.push(false); }
+        mut out: [Diagnostic] = [];
+        for (mut i: i64 = 0; i < this.diagnostics.length(); i++) {
+            if (taken[i]) { continue; }
+            const indices: [i64] = Diagnostic::sites_sharing_cause(&this.diagnostics, i);
+            mut sites: [Diagnostic] = [];
+            for (mut k: i64 = 0; k < indices.length(); k++) {
+                taken[indices[k]] = true;
+                sites.push(this.diagnostics[indices[k]].clone());
+            }
+            if (sites.length() == 1) {
+                out.push(sites[0].clone());
+            } else {
+                out.push(Diagnostic::report_of(sites));
+            }
+        }
+        return out;
+    }
+
+    /// The number of error reports `reports` makes.
+    error_report_count(&this) -> u32 {
+        const reports: [Diagnostic] = this.reports();
+        mut count: u32 = 0;
+        for (mut i: i64 = 0; i < reports.length(); i++) {
+            if (reports[i].severity.is_error()) { count += 1; }
+        }
+        return count;
+    }
+
     /// Render every collected diagnostic, non-errors first then errors,
     /// so errors land at the tail right above the abort summary where
     /// they're most visible. Within each group, emission order is
@@ -181,30 +215,31 @@ type struct DiagnosticSink {
         if (this.suppressed_vendor_warnings > 0) {
             Log::debug(LogArea::Diag, f"suppressed {this.suppressed_vendor_warnings} warnings from generated vendor bindings");
         }
+        const reports: [Diagnostic] = this.reports();
         if (this.renderer != null) {
-            for (mut i: i64 = 0; i < this.diagnostics.length(); i++) {
-                if (!this.diagnostics[i].severity.is_error()) {
-                    this.renderer.render(&this.diagnostics[i]);
+            for (mut i: i64 = 0; i < reports.length(); i++) {
+                if (!reports[i].severity.is_error()) {
+                    this.renderer.render(&reports[i]);
                 }
             }
-            for (mut i: i64 = 0; i < this.diagnostics.length(); i++) {
-                if (this.diagnostics[i].severity.is_error()) {
-                    this.renderer.render(&this.diagnostics[i]);
+            for (mut i: i64 = 0; i < reports.length(); i++) {
+                if (reports[i].severity.is_error()) {
+                    this.renderer.render(&reports[i]);
                 }
             }
         } else {
             // Fall-back path with no renderer attached. Goes to stderr so
             // LSP-mode callers (which speak JSON-RPC over stdout) are not
             // corrupted if a flush sneaks through.
-            for (mut i: i64 = 0; i < this.diagnostics.length(); i++) {
-                if (!this.diagnostics[i].severity.is_error()) {
-                    DiagSink::emit_raw(null, this.diagnostics[i].to_string());
+            for (mut i: i64 = 0; i < reports.length(); i++) {
+                if (!reports[i].severity.is_error()) {
+                    DiagSink::emit_raw(null, reports[i].to_string());
                     DiagSink::emit_raw(null, "\n");
                 }
             }
-            for (mut i: i64 = 0; i < this.diagnostics.length(); i++) {
-                if (this.diagnostics[i].severity.is_error()) {
-                    DiagSink::emit_raw(null, this.diagnostics[i].to_string());
+            for (mut i: i64 = 0; i < reports.length(); i++) {
+                if (reports[i].severity.is_error()) {
+                    DiagSink::emit_raw(null, reports[i].to_string());
                     DiagSink::emit_raw(null, "\n");
                 }
             }

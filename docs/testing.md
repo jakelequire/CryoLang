@@ -273,6 +273,14 @@ cleanly or emits a different code. Name each file after the code it asserts
 (`E0214_free_function.cryo`) and use collision-proof identifiers (e.g. a `cf_`
 prefix) so a snippet can't shadow a stdlib symbol.
 
+A `//~ ERROR[<CODE>] <message>` comment (`//~^` for the line above) pins a
+diagnostic to its line, and every diagnostic in the file must be pinned. When
+several diagnostics share one cause and one fix - every change a method makes
+through its `&this` receiver - the compiler prints them as one report with an
+`-->` arrow per place, stacked under the header. Each place is still a
+diagnostic of the report's code at its own line, carrying the report's
+headline, and each needs its own `//~`.
+
 ---
 
 ## 7. Multi-module test projects
