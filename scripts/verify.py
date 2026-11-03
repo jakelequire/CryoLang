@@ -452,7 +452,7 @@ def census_failures(log, examples_log):
         lines = fh.readlines()
     with io.open(examples_log, encoding="utf-8", errors="replace") as fh:
         examples = fh.readlines()
-    blocks, _, _, _ = census.parse(lines)
+    blocks = census.parse(lines)[0]
     accounted = any(l.startswith("test-census: OK") for l in lines)
     # A project's own run may echo unit-test lines; the unit suite's end at
     # its summary.

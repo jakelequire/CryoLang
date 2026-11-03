@@ -233,6 +233,13 @@ yet is recorded with the change that builds it, not here.
      primitive's data is a `mut void*` for the same reason: its
      trampoline may store through it.  (Jake)
 
+689. **The test census reconciles the unit suite by name.**  Every unit
+     test the roster pins for this host must have run, and every one that
+     ran must be pinned, as the projects already are; a renamed test, or
+     one deleted beside one added, keeps the count and is refused.  The
+     census refuses `--quiet`, which drops the per-test lines it reads.
+     (Jake)
+
 ### 2026-11-01
 
 677. **A primitive implements the trait of every operator that applies to

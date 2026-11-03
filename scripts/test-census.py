@@ -21,6 +21,7 @@ entry the roster golden pins:
     unit          passed + failed + ignored + filtered == pinned unit entries,
                                                         less those gated to
                                                         another OS
+    unit          every pinned unit test RAN, by name, and no other did
     compile-fail  passed + failed                      == pinned negative files
     projects      passed + failed + skipped + ignored  == pinned projects
     projects      every pinned project was REACHED, by name
@@ -59,6 +60,11 @@ ROW = re.compile(r"^\s*(passed|failed|ignored|filtered)\s+(\d+)\s*$")
 BLOCK = re.compile(r"^\s*(unit test|compile-fail|projects) summary\s*$")
 # plain format: one line per project the runner reached, whatever the verdict.
 PROJ_LINE = re.compile(r"^test \(project\) (\S+) \.\.\.")
+# One line per unit test that ran or was ignored: `ok    <name>` (or `FAIL`,
+# `skip`) from the parallel runner, `test <name> ... ok` from the sequential
+# one.  The negative and project lines carry a parenthesised kind after `test`
+# and do not match.
+UNIT_LINE = re.compile(r"^(?:(?:ok|FAIL|skip)\s+(\S+)|test ([^\s(]\S*) \.\.\.)")
 # The verdict tokens are matched WHEREVER they land rather than as the tail of
 # the line above, because they do not reliably land there.  The `cxx`
 # requirement probe shells out without redirecting stderr, so on Windows the
@@ -81,17 +87,18 @@ def roster_check():
 
 
 def pinned():
-    """(unit count, negative count, project NAMES, unit entries gated to
+    """(unit NAMES, negative count, project NAMES, unit entries gated to
     another OS) from the roster golden.
 
     The golden is a union across hosts, so a unit test gated to another OS is
-    pinned here and never compiled: it is excused from the unit count, by the
+    pinned here and never compiled: it is excused from the unit names, by the
     same reading of the source roster-check waives it by.  A test gated to
     this host, or to none, is still owed.
     """
     rc = roster_check()
     gated = rc.gated_tests()
-    unit = neg = 0
+    neg = 0
+    unit = set()
     projects = set()
     elsewhere = []
     with open(GOLDEN, "r", encoding="utf-8") as fh:
@@ -107,7 +114,7 @@ def pinned():
                 if rc.gated_elsewhere(line, gated):
                     elsewhere.append(line)
                 else:
-                    unit += 1
+                    unit.add(line.rsplit(": test", 1)[0])
     return unit, neg, projects, elsewhere
 
 
@@ -124,12 +131,17 @@ def parse(lines):
     """
     blocks = {}
     reached = []
+    unit_names = []
     skipped = []
     ignored = 0
     last_project = None
     current = None
     for raw in lines:
         line = raw.rstrip("\n").rstrip("\r")
+        if "unit test" not in blocks:
+            m = UNIT_LINE.match(line.strip())
+            if m:
+                unit_names.append(m.group(1) or m.group(2))
         m = BLOCK.match(line)
         if m:
             current = m.group(1)
@@ -155,7 +167,7 @@ def parse(lines):
                 blocks[current][m.group(1)] = int(m.group(2))
             elif line.strip().startswith("result"):
                 current = None
-    return blocks, reached, skipped, ignored
+    return blocks, reached, unit_names, skipped, ignored
 
 
 def main():
@@ -179,6 +191,10 @@ def main():
                          "parses the runner output and cannot certify a format "
                          "it was not written against\n")
         return 1
+    if any(a in ("-q", "--quiet") for a in extra):
+        sys.stderr.write("test-census: --quiet drops the per-test lines the "
+                         "census reconciles unit tests by name against\n")
+        return 1
     if any(not a.startswith("-") for a in extra):
         sys.stderr.write("test-census: a test-name PATTERN filters all three "
                          "suites, which is the exact shape of the hole this "
@@ -197,7 +213,7 @@ def main():
     code = proc.wait()
 
     want_unit, want_neg, want_projects, unit_elsewhere = pinned()
-    blocks, reached, skipped, ignored = parse(captured)
+    blocks, reached, unit_names, skipped, ignored = parse(captured)
 
     problems = []
 
@@ -216,8 +232,16 @@ def main():
                 % (name, total, want,
                    ", ".join("%s %d" % (t, got.get(t, 0)) for t in terms)))
 
-    census("unit", "unit test", want_unit,
+    census("unit", "unit test", len(want_unit),
            ("passed", "failed", "ignored", "filtered"))
+    # By NAME as well: a renamed test, or one deleted beside one added, keeps
+    # the count and is a different corpus.
+    if "unit test" in blocks:
+        for name in sorted(want_unit - set(unit_names)):
+            problems.append("unit: %s is pinned but did not run" % name)
+        for name in sorted(set(unit_names) - want_unit):
+            problems.append("unit: %s ran but is not pinned; re-pin the "
+                            "roster" % name)
     census("compile-fail", "compile-fail", want_neg, ("passed", "failed"))
 
     proj = blocks.get("projects")
@@ -254,7 +278,7 @@ def main():
 
     print()
     print("test-census: roster pins %d unit, %d compile-fail, %d project(s)"
-          % (want_unit, want_neg, len(want_projects)))
+          % (len(want_unit), want_neg, len(want_projects)))
     for ln in unit_elsewhere:
         print("  gated    %s (not built on this host)" % ln.rsplit(": test", 1)[0])
     for name, reason in skipped:
