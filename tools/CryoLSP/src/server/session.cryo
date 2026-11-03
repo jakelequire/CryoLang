@@ -2,7 +2,8 @@
 ///!
 ///! A project is the cryoconfig a file's directory or one of its parents
 ///! holds, or, for a file under no cryoconfig, the file alone as its own
-///! entry point.  A file an analysed project holds as a library module (the
+///! entry point.  A workspace's `[[lib]]` members are separate libraries,
+///! so a file under a member's source_dir is a project of that member.  A file an analysed project holds as a library module (the
 ///! standard library's, a dependency's) is answered from that project's
 ///! analysis instead, and is never analysed as a project of its own while
 ///! one holds it: a jump into the standard library lands in the analysis
@@ -43,6 +44,7 @@ import std::alloc::arena;
 
 import compiler::compilation_context::{ SourceOverride, YieldHook };
 import compiler::module_graph::{ ModuleGraph, ModuleOrigin };
+import compiler::project_config::{ ProjectConfig };
 import compiler::instance;
 import compiler::codegen::ast_arena;
 
@@ -107,10 +109,17 @@ implement trait Drop for Analysis {
 
 
 type struct Project {
-    /// The cryoconfig's path, or the lone file's path.
+    /// The cryoconfig's path, or the lone file's path; for a workspace
+    /// `[[lib]]` member, the cryoconfig's path and the member's name.
     key:     String;
     /// NUL-terminated cryoconfig path; empty for a lone file.
     config:  String;
+    /// The cryoconfig as parsed when the project was made; the defaults for
+    /// a lone file.
+    layout:  ProjectConfig;
+    /// The `[[lib]]` member whose source_dir holds this project's files, or
+    /// -1: each member is a library of its own, analysed apart.
+    member:  i64;
     /// The analysis that answers questions; `ctx` null until one parsed.
     current: Analysis;
     /// An open or a save made an analysis owed.
@@ -134,10 +143,12 @@ type struct Project {
     /// one to publish again when the compiler resumes after its hook.
     building: mut arena::Arena*;
 
-    static new(key: str::Str, config: str::Str) -> Project {
+    static new(key: str::Str, config: str::Str, layout: ProjectConfig, member: i64) -> Project {
         return Project {
             key:         String::from_str(key),
             config:      PathFinder::build_cstring_buffer(config),
+            layout:      layout,
+            member:      member,
             current:     Analysis::none(),
             owed:        false,
             analysed:    false,
@@ -247,12 +258,26 @@ type struct Project {
         };
     }
 
-    /// Whether file `path` belongs to this project.
+    /// Whether file `path` belongs to this project: it is under the same
+    /// cryoconfig, and under this project's `[[lib]]` member when it has one.
     owns(&this, path: str::Str) -> boolean {
-        mut k: String = Projects::key_for(path);
-        const yes: boolean = k.as_str().equals(&this.key.as_str());
-        mem::drop(k);
+        mut cfg: String = PathFinder::discover_project_cryoconfig(path);
+        const yes: boolean = if (cfg.length() == 0) {
+            path.equals(&this.key.as_str())
+        } else {
+            cfg.as_str().equals(&this.config.as_str()) && this.layout_member(path) == this.member
+        };
+        mem::drop(cfg);
         return yes;
+    }
+
+    /// The `[[lib]]` member of this project's cryoconfig whose source_dir
+    /// holds file `path`, or -1.
+    layout_member(&this, path: str::Str) -> i64 {
+        mut c: String = PathFinder::build_cstring_buffer(path);
+        const member: i64 = this.layout.library_member_holding(c.as_ptr() as string);
+        mem::drop(c);
+        return member;
     }
 
     /// The analysis whose diagnostics are owed: the last one, adopted or not.
@@ -307,13 +332,16 @@ type struct Projects {
         return null;
     }
 
-    /// The key of the project `path` belongs to: the nearest cryoconfig at
-    /// or above its directory, or the path itself when there is none.
-    static key_for(path: str::Str) -> String {
-        const cfg: String = PathFinder::discover_project_cryoconfig(path);
-        if (cfg.length() > 0) { return cfg; }
-        mem::drop(cfg);
-        return String::from_str(path);
+    /// The parsed cryoconfig at `config`: an existing project's, or else
+    /// read from disk.
+    layout_of(&this, config: str::Str) -> ProjectConfig {
+        for (p in this.by_key.values_ref()) {
+            if (p.config.as_str().equals(&config)) { return p.layout.clone(); }
+        }
+        mut c: String = PathFinder::build_cstring_buffer(config);
+        const layout: ProjectConfig = ProjectConfig::parse(c.as_ptr() as string);
+        mem::drop(c);
+        return layout;
     }
 
     /// The analysed project holding file `path` as a library module
@@ -336,14 +364,29 @@ type struct Projects {
     project_for(mut &this, path: str::Str) -> mut Project* {
         const held: mut Project* = this.library_holder(path);
         if (held != null) { return held; }
-        mut key: String = Projects::key_for(path);
+        // The key: the nearest cryoconfig at or above the file's directory,
+        // then the name of the `[[lib]]` member holding it; or the path
+        // itself when there is no cryoconfig.
+        mut cfg: String = PathFinder::discover_project_cryoconfig(path);
+        const layout: ProjectConfig = if (cfg.length() > 0) {
+            this.layout_of(cfg.as_str())
+        } else {
+            ProjectConfig::default()
+        };
+        mut c: String = PathFinder::build_cstring_buffer(path);
+        const member: i64 = layout.library_member_holding(c.as_ptr() as string);
+        mem::drop(c);
+        mut key: String = if (cfg.length() > 0) { String::from_str(cfg.as_str()) } else { String::from_str(path) };
+        if (member >= 0) {
+            key.push("#");
+            key.push(str::Str::new(layout.libs[member].name));
+        }
         match (this.by_key.get_mutable(&key)) {
-            Option::Some(p) => { mem::drop(key); return p; }
+            Option::Some(p) => { mem::drop(key); mem::drop(cfg); return p; }
             Option::None    => { }
         }
-        const lone: boolean = key.as_str().equals(&path);
-        const config: str::Str = if (lone) { str::Str::from("") } else { key.as_str() };
-        const p: Project = Project::new(key.as_str(), config);
+        const p: Project = Project::new(key.as_str(), cfg.as_str(), layout, member);
+        mem::drop(cfg);
         this.by_key.insert(String::from_str(key.as_str()), p);
         match (this.by_key.get_mutable(&key)) {
             Option::Some(q) => { mem::drop(key); return q; }

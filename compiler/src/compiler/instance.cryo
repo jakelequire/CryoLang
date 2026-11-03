@@ -503,9 +503,15 @@ type struct CompilerInstance {
         //
         // Heuristic:
         //   1. If the focus is a `[[bin]]` entry_point, use that bin view.
-        //   2. Else if a `[lib]` is present, use the lib view.
-        //   3. Else use the first `[[bin]]`.
-        // Single-target configs fall through unchanged.
+        //   2. Else if the focus lies under a `[[lib]]` member's source_dir,
+        //      use that member's view.
+        //   3. Else if a `[lib]` is present, use the lib view.
+        //   4. Else use the first `[[bin]]`, or else the first `[[lib]]`
+        //      member: a file every member shares (a `source_paths` tree)
+        //      is reached from any of them.
+        // Single-target configs fall through unchanged.  A workspace left
+        // unviewed has no source_dir and no entry point, so its discovery
+        // finds nothing to compile.
         if (config.is_multi_target()) {
             mut chosen: i64 = -1;
             for (mut bi: i64 = 0; bi < config.bins.length(); bi++) {
@@ -516,16 +522,23 @@ type struct CompilerInstance {
                     break;
                 }
             }
+            const member: i64 = config.library_member_holding(focus_path);
             if (chosen >= 0) {
                 // BinTarget is Copy; pull the selection out before `config`
                 // is moved into make_bin_view so the read isn't after-move.
                 const sel: BinTarget = config.bins[chosen];
                 config = CompilerInstance::make_bin_view(config, sel);
+            } else if (member >= 0) {
+                const sel: LibTarget = config.libs[member];
+                config = CompilerInstance::make_lib_member_view(config, sel);
             } else if (config.lib.is_present()) {
                 config = CompilerInstance::make_lib_view(config);
             } else if (config.bins.length() > 0) {
                 const sel: BinTarget = config.bins[0];
                 config = CompilerInstance::make_bin_view(config, sel);
+            } else if (config.libs.length() > 0) {
+                const sel: LibTarget = config.libs[0];
+                config = CompilerInstance::make_lib_member_view(config, sel);
             }
         }
         return this.compile_project_to_context(config, CompileMode::Lsp, overlays);
