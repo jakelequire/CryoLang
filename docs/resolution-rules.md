@@ -133,6 +133,14 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-11-03
+
+690. **What releases memory takes a writable pointer.**  `libc::free`,
+     `libc::aligned_free` and `_aligned_free` take a `mut u8*`, as
+     `realloc` does, and `Allocate::release` a `mut void*`.  A caller
+     declares the pointer it frees writable where the allocation is made;
+     it does not widen a read-only one with `as`.  (Jake)
+
 ### 2026-11-02
 
 679. **Every build runs LLVM's IR optimizer over each module before it is

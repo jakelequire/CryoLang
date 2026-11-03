@@ -25,7 +25,6 @@ import std::fs::metadata::{ metadata };
 import std::fs::path::{ Path };
 import std::collections::hashmap::{ HashMap };
 import std::collections::string::{ String };
-import std::ffi::libc;
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::severity::{ Severity };
 import compiler::diag::source_span::{ SourceSpan };
@@ -357,15 +356,10 @@ type struct DiagRenderer {
     /// Print one source line through the syntax highlighter, with
     /// tabs expanded to spaces on the way out so caret math (which
     /// counts cells, not bytes) lines up with what the terminal
-    /// actually renders.  The expanded copy is heap-allocated and
-    /// freed after the print; the original cached line is untouched.
-    print_source_line(&this, out: void*, line_text_text: string) -> void {
-        const line_text: string = line_text_text;
-        const expanded: string = DiagRenderer::expand_tabs(line_text_text);
-        syntax_highlighter::print_line(out, expanded, this.config.colors);
-        if (expanded != line_text) {
-            libc::free(expanded as void*);
-        }
+    /// actually renders.  The original cached line is untouched.
+    print_source_line(&this, out: void*, line_text: string) -> void {
+        mut expanded: String = DiagRenderer::expand_tabs(line_text);
+        syntax_highlighter::print_line(out, expanded.as_cstr() as string, this.config.colors);
     }
 
     /// Return the ANSI color code for a given severity level.
@@ -1341,8 +1335,9 @@ type struct DiagRenderer {
         // source bytes.  The renderer's tab-expansion + visual-column
         // math then handles alignment for tab-indented files exactly
         // like it does for the primary snippet.
-        const patched: string = DiagRenderer::splice_replacement(orig_line,
+        mut patched_line: String = DiagRenderer::splice_replacement(orig_line,
             part.span.start_col, part.span.end_col, part.replacement);
+        const patched: string = patched_line.as_cstr() as string;
 
         // Line-number column width matches the patched line's natural
         // digit count (no artificial minimum, matching the primary snippet).
@@ -1398,10 +1393,6 @@ type struct DiagRenderer {
         }
         DiagSink::emit_raw(out, reset);
         DiagSink::emit_raw(out, "\n");
-
-        if (patched != orig_line) {
-            libc::free(patched as void*);
-        }
     }
 
     /// Render a multi-line suggestion.  Called from `render_suggestion_part`
@@ -1434,8 +1425,9 @@ type struct DiagRenderer {
         // visually "changes": it now carries the appended punctuation
         // (`,`) or whatever leads off the multi-line edit.
         const first_seg: string = DiagRenderer::substring_bytes(part.replacement, 0, first_nl);
-        const patched_first: string = DiagRenderer::splice_replacement(orig_line,
+        mut patched_first_line: String = DiagRenderer::splice_replacement(orig_line,
             part.span.start_col, part.span.end_col, first_seg);
+        const patched_first: string = patched_first_line.as_cstr() as string;
 
         // Indent for inserted lines = anchor line's leading whitespace.
         const indent_n: i64 = DiagRenderer::leading_whitespace_count(orig_line);
@@ -1627,12 +1619,11 @@ type struct DiagRenderer {
     /// Build a copy of `line` with every `\t` replaced by enough spaces
     /// to reach the next tab stop.  Pass through ASCII and UTF-8 bytes
     /// verbatim - they print 1 cell per codepoint either way; the math
-    /// in `byte_col_to_visual` cancels the multi-byte cost.  Returns a
-    /// freshly allocated string the caller owns; the source-cache copy
-    /// is left untouched.
-    static expand_tabs(line_text: string) -> string {
+    /// in `byte_col_to_visual` cancels the multi-byte cost.  The
+    /// source-cache copy is left untouched.
+    static expand_tabs(line_text: string) -> String {
         const line: string = line_text;
-        if (line == "") { return ""; }
+        if (line == "") { return String::new(); }
         const len: i64 = line.length() as i64;
         mut s: String = String::with_capacity(len as u64);
         mut col: u32 = 0;
@@ -1649,7 +1640,7 @@ type struct DiagRenderer {
                 if ((ch & 0xC0) != 0x80) { col = col + 1; }
             }
         }
-        return s.into_raw();
+        return s;
     }
 
     /// Convert a 1-indexed byte column on `line` into a 1-indexed cell
@@ -1685,16 +1676,14 @@ type struct DiagRenderer {
     /// (both 1-indexed).  Used by the suggestion renderer to build a
     /// patched-source-line view from a single edit.
     ///
-    /// Out-of-bounds columns clamp to the line bounds.  Returns a freshly
-    /// allocated string the caller owns; if no change would be made the
-    /// original line is returned unchanged (caller should test pointer
-    /// identity before freeing).
+    /// Out-of-bounds columns clamp to the line bounds.  An edit that changes
+    /// nothing returns a copy of the line.
     static splice_replacement(line_text: string, start_col: u32, end_col: u32,
-                                replacement_text: string) -> string {
+                                replacement_text: string) -> String {
         const line: string = line_text;
         const replacement: string = replacement_text;
-        if (line == "")              { return line; }
-        if (start_col == 0)          { return line; }
+        if (line == "")              { return String::new(); }
+        if (start_col == 0)          { return String::from_string(line); }
 
         const line_len: i64 = line.length() as i64;
         mut start: i64 = (start_col - 1) as i64;
@@ -1711,9 +1700,8 @@ type struct DiagRenderer {
             replacement.length() as i64
         };
 
-        // No-op edit: an empty replacement over a zero-width span.  Don't
-        // bother allocating.
-        if (start == end && repl_len == 0) { return line; }
+        // No-op edit: an empty replacement over a zero-width span.
+        if (start == end && repl_len == 0) { return String::from_string(line); }
 
         const tail_len: i64 = line_len - end;
         const out_len: i64 = start + repl_len + tail_len;
@@ -1732,7 +1720,7 @@ type struct DiagRenderer {
             const src_tail: i8* = (line as i8*) + end;
             s.push(Str::from_raw(src_tail as u8*, tail_len as u64));
         }
-        return s.into_raw();
+        return s;
     }
 
     /// Extract bytes `[start..end)` of `s` into a freshly-allocated, NUL-
