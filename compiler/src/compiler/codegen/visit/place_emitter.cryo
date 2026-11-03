@@ -103,8 +103,14 @@ type struct PlaceEmitter {
         // resolved instantiation (`HashMapEntry<u32, i64>` behind a
         // `HashMapEntry<u32, i64>*`), unwrapped so the kind dispatch below
         // sees the concrete struct or array.
+        // A wide reference is the slice's own words: a slot holding one
+        // already holds the slice, and an rvalue one is copied to a slot.
         mut holds_slot: boolean = object_is_lvalue;
         while (t != null && (t.kind == TypeKind::Pointer || t.kind == TypeKind::Reference)) {
+            const wide: boolean = t.is_wide_reference();
+            if (wide && !holds_slot) {
+                obj_ptr = this.cg.place_of_reference(obj_ptr, t);
+            }
             if (t.kind == TypeKind::Pointer) {
                 const pt: PointerType* = t.as_pointer();
                 obj_type = pt.pointee;
@@ -113,7 +119,7 @@ type struct PlaceEmitter {
                 obj_type = rt.referent;
             }
             t = this.cg.arena_type(obj_type);
-            if (holds_slot && obj_ptr.is_valid()) {
+            if (holds_slot && obj_ptr.is_valid() && !wide) {
                 obj_ptr = this.cg.builder.build_load(LType::pointer_to(LType::i8()),
                                                 obj_ptr, "autoderef");
             }
@@ -314,8 +320,13 @@ type struct PlaceEmitter {
                 out.is_lvalue = false;
                 return out;
             }
+            // A wide reference's slot already holds the slice.
             mut header_ptr: LValue = array_val;
-            if (array_is_lvalue) {
+            if (t.is_wide_reference()) {
+                if (!array_is_lvalue) {
+                    header_ptr = this.cg.place_of_reference(array_val, t);
+                }
+            } else if (array_is_lvalue) {
                 header_ptr = this.cg.builder.build_load(
                     LType::pointer_to(LType::i8()), array_val, "refderef");
             }

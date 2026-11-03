@@ -147,6 +147,16 @@ yet is recorded with the change that builds it, not here.
      runner prints the run's unit-test count on the project's line and the
      census refuses a passing `collect` project that ran none.  (Jake)
 
+692. **A reference to the slice item is the slice's two words.**
+     `&Slice<T>` and `mut &Slice<T>` hold the elements' address and their
+     count, not the address of a slice: 16 bytes, passed and returned as
+     the slice by value is, `&s` copying the slice's words, and a slice
+     given for a slice reference passed as itself; a slice's `&this`
+     method receives the two words too.  Holding no slice's address, it
+     converts to no pointer and no pointer to it, `as` makes no pointer of
+     it, and a slice becomes no trait object.  Which type is the slice is the `![language("slice")]`
+     claim, never a name.  (Jake; the pointer and object conversions delegated)
+
 ### 2026-11-02
 
 679. **Every build runs LLVM's IR optimizer over each module before it is

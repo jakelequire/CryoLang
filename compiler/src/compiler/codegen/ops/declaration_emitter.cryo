@@ -861,8 +861,12 @@ type struct DeclarationEmitter {
                 });
                 continue;
             }
+            // A `&this` on the slice item is a slice reference, the slice's
+            // two words, classified below as any slice reference is.
+            const receiver_t: Type* = this.arena_type(param.resolved_type);
             const is_amp_this: boolean =
-                param.is_ref_receiver() && this_ty.is_valid();
+                param.is_ref_receiver() && this_ty.is_valid()
+                && !(receiver_t != null && receiver_t.is_wide_reference());
             const is_val_this: boolean =
                 param.is_value_receiver()
                 && target_mapped.is_valid() && param.type_annotation == null;
@@ -1997,12 +2001,21 @@ type struct DeclarationEmitter {
             };
             // LLVM index for the receiver is `sret_off` (0 normally, 1 when sret).
             const arg0: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, sret_off) };
+            // A `&this` on the slice item receives the slice's two words, as
+            // a by-value `this` receives its value: `this` is the slot that
+            // holds them.
+            const receiver_t: Type* = if (explicit_ref_idx >= 0) {
+                this.arena_type(DeclarationNode::var_of(func.parameters[explicit_ref_idx]).resolved_type)
+            } else {
+                null
+            };
+            const wide_receiver: boolean = receiver_t != null && receiver_t.is_wide_reference();
 
             // Number of LLVM slots the receiver occupies, so the user-param
             // loop below starts at the right index.  Default 1 (a pointer for
             // `&this`/typed, a single coerced value for a small by-value `this`).
             mut recv_slots: u32 = 1;
-            if (explicit_val_idx >= 0) {
+            if (explicit_val_idx >= 0 || wide_receiver) {
                 // By-value `this`: alloca it so downstream code (member access,
                 // method calls) can treat `this` as a pointer uniformly.  The
                 // receiver follows the same ABI as any by-value parameter: a

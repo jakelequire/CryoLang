@@ -228,8 +228,9 @@ type struct CallEmitter {
             // A by-value argument in a `&T` slot passes its address, as at a
             // direct call: the pointer's type is a reference, whatever the
             // value's LLVM shape (a fixed-size array has no value-to-pointer
-            // coercion at the call).
-            if (node.arguments[ai].autoref && av.is_valid()) {
+            // coercion at the call).  A slice is its own wide reference.
+            if (node.arguments[ai].autoref && av.is_valid()
+                    && !this.cg.get_arena().is_slice(node.arguments[ai].resolved_type)) {
                 av = this.address_of_value(av);
             }
             call_args.push(Pair::<LValue, TypeRef>::new(av, node.arguments[ai].resolved_type));
@@ -662,7 +663,10 @@ type struct CallEmitter {
             mut obj: LValue = LValue::null();
             if (recv_t != null && (recv_t.kind == TypeKind::Pointer
                                 || recv_t.kind == TypeKind::Reference)) {
-                obj = this.dispatch.codegen_rvalue(visitor,ma.object);
+                // A wide reference is the slice itself: a receiver that is
+                // one is given a slot, and a slot holding one behind another
+                // layer is already the slice's place.
+                obj = this.cg.place_of_reference(this.dispatch.codegen_rvalue(visitor, ma.object), recv_t);
                 mut layer: Type* = recv_t;
                 while (layer != null) {
                     const inner: TypeRef = if (layer.kind == TypeKind::Pointer) {
@@ -674,7 +678,7 @@ type struct CallEmitter {
                     if (layer == null || (layer.kind != TypeKind::Pointer && layer.kind != TypeKind::Reference)) {
                         break;
                     }
-                    if (obj.is_valid()) {
+                    if (obj.is_valid() && !layer.is_wide_reference()) {
                         obj = this.cg.builder.build_load(LType::pointer_to(LType::i8()), obj, "recvderef");
                     }
                 }
@@ -733,8 +737,11 @@ type struct CallEmitter {
             // reference (`&T`) parameter, so pass the value's ADDRESS, not
             // the value itself.  Without this, a scalar would be `inttoptr`'d
             // and a pointer-shaped value (`string`) passed one indirection
-            // short, then dereferenced by the callee -> crash.
-            if (node.arguments[i].autoref && arg.is_valid()) {
+            // short, then dereferenced by the callee -> crash.  A slice bound
+            // to a slice reference is passed as itself: the wide reference
+            // is its two words.
+            if (node.arguments[i].autoref && arg.is_valid()
+                    && !this.cg.get_arena().is_slice(node.arguments[i].resolved_type)) {
                 arg = this.address_of_value(arg);
             }
             if (va_ft != null && i < va_ft.param_types.length() && arg.is_valid()) {

@@ -3457,6 +3457,12 @@ type struct SemaVisitor {
         } else {
             shown_to
         };
+        if (this.arena.is_slice(value)) {
+            this.ctx.emit_error_at(ErrorCode::E0315_OBJECT_CONVERSION,
+                fmt::format("`%s` cannot become `%s`: an object holds its value's address, and a slice is borrowed as its two words, never by address",
+                    shown_from, shown_to), expr.span);
+            return ObjectConversionOutcome::Refused;
+        }
         if (this.arena.contains_generic_param(value)) {
             // Each copy of the body has the table of its own type; which one
             // is settled where monomorphization makes the copy.
@@ -3661,7 +3667,14 @@ type struct SemaVisitor {
             else { this.refuse_unresolved_body_annotation(cast.target_annotation); }
         }
         const to_ty: TypeRef = cast.resolved_target;
-        if (from_ty.is_valid() && to_ty.is_valid()
+        const from_t: Type* = this.arena.lookup(from_ty);
+        if (from_t != null && to_ty.is_valid() && from_t.is_wide_reference() && !from_ty.equals(to_ty)) {
+            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0208_INVALID_CAST,
+                fmt::format("cannot cast `%s` to `%s`: a slice reference holds the slice's address and length, not the address of a slice",
+                    this.types.type_display_name(from_ty), this.types.type_display_name(to_ty)));
+            d = d.at_with_label(e.span, "no conversion makes this value");
+            this.ctx.emit_diagnostic(d);
+        } else if (from_ty.is_valid() && to_ty.is_valid()
             && !this.cast_operand_is_byref_receiver(cast.expression)
             && this.types.arg_type_is_concrete(from_ty) && this.types.arg_type_is_concrete(to_ty)
             && this.is_aggregate_scalar_cast(from_ty, to_ty)) {

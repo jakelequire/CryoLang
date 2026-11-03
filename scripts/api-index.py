@@ -112,8 +112,12 @@ IMPL_TARGET_KW_RE = re.compile(r"^(?:struct|enum|union)\s+")
 INHERENT_IMPL_RE = re.compile(
     r"^\s*implement\s*(?:<[^>]*>)?\s*(?:(?:struct|enum|union)\s+)?([A-Za-z_]\w*)\s*(?:<[^{]*>)?\s*\{?\s*$"
 )
+# A parameter list, its parentheses balanced two levels deep: a grouped
+# type `mut (mut u8*)*` and a function type `(T) -> U` hold their own, and
+# a function type's parameter may be one (`(A, (B) -> C) -> D`).
+PARAMS = r"\(((?:[^()]|\((?:[^()]|\([^()]*\))*\))*)\)"
 FUNC_RE = re.compile(
-    r"^\s*(?:(public|private|internal)\s+)?function\s+([A-Za-z_]\w*)\s*(<[^(]*>)?\s*\(([^)]*)\)"
+    r"^\s*(?:(public|private|internal)\s+)?function\s+([A-Za-z_]\w*)\s*(<[^(]*>)?\s*" + PARAMS +
     r"\s*(?:->\s*([^{;]+?))?\s*[{;]"
 )
 # An extern block: a keyword before `extern` is the visibility of every
@@ -124,7 +128,7 @@ CONST_RE = re.compile(r"^\s*(?:(public|private|internal)\s+)?const\s+([A-Z_][A-Z
 # A method inside a type body: optional `static`, a name, args, optional
 # return; a trait's required method ends in `;`.
 METHOD_RE = re.compile(
-    r"^\s*(?:(public|private|internal)\s+)?(static\s+)?([a-z_]\w*)\s*(<[^(]*>)?\s*\(([^)]*)\)"
+    r"^\s*(?:(public|private|internal)\s+)?(static\s+)?([a-z_]\w*)\s*(<[^(]*>)?\s*" + PARAMS +
     r"\s*(?:->\s*([^{;]+?))?\s*[{;]"
 )
 

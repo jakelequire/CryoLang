@@ -247,7 +247,7 @@ type struct BinaryUnaryEmitter {
 
     // Unary expressions
 
-    emit_unary(mut &this, visitor: mut IRGeneratorVisitor*, node: UnaryExpr*) -> Emitted {
+    emit_unary(mut &this, visitor: mut IRGeneratorVisitor*, e: ExpressionNode*, node: UnaryExpr*) -> Emitted {
         mut out: Emitted = Emitted::none();
         const op: TokenType = node.op.kind;
         // Operator overloading: sema rewrote a unary operator on a user type into
@@ -274,8 +274,9 @@ type struct BinaryUnaryEmitter {
             if (is_ptr_like) {
                 // Pointer/reference operand: codegen_rvalue loads the
                 // operand's value (the pointer itself), giving us the
-                // address to dereference.
-                deref_addr = this.dispatch.codegen_rvalue(visitor, node.operand);
+                // address to dereference.  A wide reference's value is the
+                // slice itself, which is given a slot to be a place.
+                deref_addr = this.cg.place_of_reference(this.dispatch.codegen_rvalue(visitor, node.operand), op_t);
             } else {
                 // Value-typed operand reached `*`; this is the
                 // method-receiver case where sema types `this` as the
@@ -314,6 +315,14 @@ type struct BinaryUnaryEmitter {
             const v: LValue = operand_e.value;
             if (!v.is_valid()) {
                 out.value = LValue::null();
+                out.is_lvalue = false;
+                return out;
+            }
+            // A wide reference is the slice's own words: read from the
+            // operand's place, or the rvalue itself.
+            const borrowed: Type* = this.cg.arena_type(e.resolved_type);
+            if (borrowed != null && borrowed.is_wide_reference()) {
+                out.value = if (operand_e.is_lvalue) { this.cg.reference_to_place(v, e.resolved_type) } else { v };
                 out.is_lvalue = false;
                 return out;
             }

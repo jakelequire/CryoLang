@@ -154,6 +154,10 @@ type struct TypeArena {
     dynamic_array_base:    TypeRef;
     dynamic_array_alloc:   TypeRef;
 
+    // The slice item's template, invalid until the item is claimed and in a
+    // build with no slice item.  See `set_slice_template`.
+    slice_template:        TypeRef;
+
 private:
     /// The allocator of this arena's handles, and its only one: every
     /// handle is made by `alloc_type`, so the handle at position `i` names
@@ -201,6 +205,7 @@ public:
             this_param:          TypeRef::invalid(),
             dynamic_array_base:  TypeRef::invalid(),
             dynamic_array_alloc: TypeRef::invalid(),
+            slice_template:      TypeRef::invalid(),
         };
 
         arena.init_primitives();
@@ -444,9 +449,29 @@ public:
         const hit: TypeRef = this.intern_find(TypeKind::Reference, aux, 0, &ops);
         if (hit.is_valid()) { return hit; }
 
-        const ref: TypeRef = this.alloc_type(TypeData::Reference(ReferenceType::new(referent, mutability)));
+        const wide: boolean = this.is_slice(referent);
+        const ref: TypeRef = this.alloc_type(TypeData::Reference(ReferenceType::new(referent, mutability, wide)));
         this.intern_record(TypeKind::Reference, aux, 0, &ops, ref);
         return ref;
+    }
+
+    /// Record the slice item's template, which makes every reference to
+    /// one of its instances wide.  Set when the item is claimed, before any
+    /// written type is resolved, so no reference to a slice is interned
+    /// before it.
+    set_slice_template(mut &this, template: TypeRef) -> void {
+        this.slice_template = template;
+    }
+
+    /// Whether `ty` is the slice item or one of its instances, written
+    /// directly or through an alias.
+    is_slice(&this, ty: TypeRef) -> boolean {
+        if (!this.slice_template.is_valid()) { return false; }
+        const t: Type* = this.lookup(ty);
+        if (t != null && t.kind == TypeKind::TypeAlias && t.as_alias().has_target()) {
+            return this.is_slice(t.as_alias().target);
+        }
+        return ty.equals(this.slice_template) || this.inst_generic_base(ty).equals(this.slice_template);
     }
 
     /// Get or create the trait object type of the trait `trait_type` (whose
