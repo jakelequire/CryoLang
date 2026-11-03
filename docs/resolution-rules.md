@@ -166,6 +166,20 @@ yet is recorded with the change that builds it, not here.
      it, and a slice becomes no trait object.  Which type is the slice is the `![language("slice")]`
      claim, never a name.  (Jake; the pointer and object conversions delegated)
 
+693. **A container's reference converts to a slice reference through the
+     slice traits.**  Where a `&Slice<T>` is wanted - an argument, a
+     `return`, a declared binding's initializer, an assigned place, a
+     field of a struct literal - a `&A` or `mut &A` whose `A` implements
+     the `![language("as_slice")]` trait at `T` is given as `A`'s
+     `as_slice()`; where a `mut &Slice<T>` is wanted, a `mut &A` whose `A`
+     implements the `![language("as_mutable_slice")]` trait is given as
+     its `as_mutable_slice()`.  A type parameter converts by a bound
+     naming the trait.  A read-only borrow never becomes a writable slice:
+     a `&A` where a `mut &Slice<T>` is wanted is refused (`E0251`), and
+     `&x` of a writable `x` is the writable borrow there, as for any
+     `mut &T`.  A value, rather than a reference to one, does not convert.
+     Which traits these are is the claims, never their names.  (Jake)
+
 ### 2026-11-02
 
 679. **Every build runs LLVM's IR optimizer over each module before it is

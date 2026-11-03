@@ -123,11 +123,12 @@ import std::core::mem::{ swap };
 import std::core::option::{ Option };
 
 
-/// What converting a value to a trait object answered
-/// (`SemaVisitor::convert_to_object`).
-type enum ObjectConversionOutcome {
-    /// The target is no trait object, or the value is not of a form that
-    /// becomes one: the site reports its own mismatch.
+/// What converting a value through a trait answered
+/// (`SemaVisitor::convert_through_trait`).
+type enum TraitConversionOutcome {
+    /// The target is neither a trait object nor a slice reference, or the
+    /// value is not of a form that becomes one: the site reports its own
+    /// mismatch.
     Mismatch;
     /// Refused, and the refusal reported.
     Refused;
@@ -1040,10 +1041,10 @@ type struct SemaVisitor {
                 this.lambda.refuse_stored_closure(expr_type, declared,
                     if (node.expression != null) { node.expression.span } else { stmt.span }, "a returned value");
                 if (!this.checker.can_assign(expr_type, declared)) {
-                    match (this.convert_to_object(node.expression, expr_type, declared)) {
-                        ObjectConversionOutcome::Converted(c) => { node.expression = c; }
-                        ObjectConversionOutcome::Refused => { }
-                        ObjectConversionOutcome::Mismatch => {
+                    match (this.convert_through_trait(node.expression, expr_type, declared)) {
+                        TraitConversionOutcome::Converted(c) => { node.expression = c; }
+                        TraitConversionOutcome::Refused => { }
+                        TraitConversionOutcome::Mismatch => {
                             const value_span: SourceSpan = if (node.expression != null) { node.expression.span } else { stmt.span };
                             const ann_span: SourceSpan = annotation_span(this.state.return_type_ann);
                             this.diag.emit_declared_mismatch(
@@ -1476,13 +1477,13 @@ type struct SemaVisitor {
                 this.lambda.refuse_stored_closure(init_type, var_node.resolved_type,
                     if (var_node.initializer != null) { var_node.initializer.span } else { decl.span }, "a variable");
                 if (!this.checker.can_assign(init_type, var_node.resolved_type)) {
-                    match (this.convert_to_object(var_node.initializer, init_type, var_node.resolved_type)) {
-                        ObjectConversionOutcome::Converted(c) => {
+                    match (this.convert_through_trait(var_node.initializer, init_type, var_node.resolved_type)) {
+                        TraitConversionOutcome::Converted(c) => {
                             var_node.set_initializer(c);
                             init_type = var_node.resolved_type;
                         }
-                        ObjectConversionOutcome::Refused => { }
-                        ObjectConversionOutcome::Mismatch => {
+                        TraitConversionOutcome::Refused => { }
+                        TraitConversionOutcome::Mismatch => {
                             const conv: mut ExpressionNode* = this.calls.build_implicit_conversion(
                                 this, var_node.initializer, init_type, var_node.resolved_type);
                             if (conv != null) {
@@ -2538,10 +2539,10 @@ type struct SemaVisitor {
                 && this.symbolic.symbolic_judgeable(lhs) && this.symbolic.symbolic_judgeable(rhs)
                 && !this.checker.can_assign(rhs, lhs)
                 && !this.types.indirection_spelling_compatible(rhs, lhs)) {
-                match (this.convert_to_object(bin.right, rhs, lhs)) {
-                    ObjectConversionOutcome::Converted(c) => { bin.right = c; }
-                    ObjectConversionOutcome::Refused => { }
-                    ObjectConversionOutcome::Mismatch => {
+                match (this.convert_through_trait(bin.right, rhs, lhs)) {
+                    TraitConversionOutcome::Converted(c) => { bin.right = c; }
+                    TraitConversionOutcome::Refused => { }
+                    TraitConversionOutcome::Mismatch => {
                         const value_span: SourceSpan = if (bin.right != null) { bin.right.span } else { e.span };
                         this.diag.emit_type_mismatch_with_value(
                             ErrorCode::E0200_TYPE_MISMATCH, value_span, lhs, rhs,
@@ -3429,6 +3430,58 @@ type struct SemaVisitor {
             operand.span);
     }
 
+    /// Convert `expr`, of type `from`, where `to` is wanted and a trait
+    /// makes the one into the other: to a trait object through the trait the
+    /// object names, to a slice reference through the slice traits.
+    convert_through_trait(mut &this, expr: mut ExpressionNode*, from: TypeRef, to: TypeRef) -> TraitConversionOutcome {
+        const target: Type* = this.arena.lookup(to);
+        if (target != null && target.is_wide_reference()) {
+            return this.convert_to_slice_reference(expr, from, to);
+        }
+        return this.convert_to_object(expr, from, to);
+    }
+
+    /// Convert `expr`, a reference to a container, to the slice reference
+    /// `to` by calling the container's slice method: `&A` or `mut &A` for a
+    /// `&Slice<T>` through `A`'s `AsSlice`, `mut &A` for a `mut &Slice<T>`
+    /// through its `AsMutableSlice`.  A read-only borrow never becomes a
+    /// writable slice: `&A` for a `mut &Slice<T>` is refused (E0251) where
+    /// `A` has the writable trait.  Anything else - a value that is no
+    /// reference, a container with no such trait, a slice of another
+    /// element type - is a mismatch for the site to report.
+    convert_to_slice_reference(mut &this, expr: mut ExpressionNode*, from: TypeRef, to: TypeRef) -> TraitConversionOutcome {
+        const target: Type* = this.arena.lookup(to);
+        const source: Type* = this.arena.lookup(from);
+        if (expr == null || target == null || source == null || source.kind != TypeKind::Reference
+                || this.arena.is_slice(source.as_reference().referent)) {
+            return TraitConversionOutcome::Mismatch;
+        }
+        const writable: boolean = target.as_reference().is_mutable();
+        const registry: GenericRegistry* = this.ctx.generic_registry;
+        const trait_id: DefId = registry.wellknown(if (writable) { LangItem::AsMutableSlice } else { LangItem::AsSlice });
+        if (!trait_id.is_valid()) { return TraitConversionOutcome::Mismatch; }
+        // A type parameter has the trait by a bound in scope.
+        const param: GenericParamType* = this.binding.receiver_type_param(from);
+        const converts: boolean = if (param != null) {
+            this.binding.param_bounded_by(param, trait_id)
+        } else {
+            this.receiver_implements(from, trait_id)
+        };
+        if (!converts) { return TraitConversionOutcome::Mismatch; }
+        if (writable && !source.as_reference().is_mutable()) {
+            this.refuse_read_only_borrow(PlaceAccess::Borrow(expr), expr.span);
+            return TraitConversionOutcome::Refused;
+        }
+        const method: LangItem = if (writable) { LangItem::AsMutableSliceAsMutableSlice } else { LangItem::AsSliceAsSlice };
+        const callee: mut ExpressionNode* = this.member.lang_method_callee(expr, method, expr.span);
+        if (callee == null) { return TraitConversionOutcome::Mismatch; }
+        mut call: mut ExpressionNode* = ExpressionNode::call_expr(callee, expr.span);
+        call.generated = true;
+        const made: TypeRef = this.resolve_expr(call);
+        if (!made.is_valid() || !this.checker.can_assign(made, to)) { return TraitConversionOutcome::Mismatch; }
+        return TraitConversionOutcome::Converted(call);
+    }
+
     /// Convert `expr`, of type `from`, to the trait object `to`.  A borrowed
     /// object takes a reference to the value, in either form as a reference
     /// parameter does; a raw object takes a pointer.  The value's type must implement
@@ -3436,17 +3489,17 @@ type struct SemaVisitor {
     /// generic implementation, its copy for the value's type; anything else
     /// that has the right shape is E0315.
     /// An object converts to its own type alone, which needs no conversion.
-    convert_to_object(mut &this, expr: mut ExpressionNode*, from: TypeRef, to: TypeRef) -> ObjectConversionOutcome {
+    convert_to_object(mut &this, expr: mut ExpressionNode*, from: TypeRef, to: TypeRef) -> TraitConversionOutcome {
         const target: Type* = this.arena.lookup(to);
         const source: Type* = this.arena.lookup(from);
         if (expr == null || target == null || source == null || target.kind != TypeKind::Object) {
-            return ObjectConversionOutcome::Mismatch;
+            return TraitConversionOutcome::Mismatch;
         }
         const object: ObjectType* = target.as_object();
         const checker: TraitChecker = this.trait_checker();
         const value: TypeRef = checker.object_value(object, from);
         const value_t: Type* = this.arena.lookup(value);
-        if (value_t == null) { return ObjectConversionOutcome::Mismatch; }
+        if (value_t == null) { return TraitConversionOutcome::Mismatch; }
 
         const shown_from: string = this.arena.format_display(source);
         const shown_to: string = this.arena.format_display(target);
@@ -3461,19 +3514,19 @@ type struct SemaVisitor {
             this.ctx.emit_error_at(ErrorCode::E0315_OBJECT_CONVERSION,
                 fmt::format("`%s` cannot become `%s`: an object holds its value's address, and a slice is borrowed as its two words, never by address",
                     shown_from, shown_to), expr.span);
-            return ObjectConversionOutcome::Refused;
+            return TraitConversionOutcome::Refused;
         }
         if (this.arena.contains_generic_param(value)) {
             // Each copy of the body has the table of its own type; which one
             // is settled where monomorphization makes the copy.
             if (this.implemented_in_every_copy(object, value)) {
-                return ObjectConversionOutcome::Converted(ExpressionNode::object_conversion(expr, value, null, to));
+                return TraitConversionOutcome::Converted(ExpressionNode::object_conversion(expr, value, null, to));
             }
             if (value_t.kind != TypeKind::GenericParam) {
                 this.ctx.emit_error_at(ErrorCode::E0315_OBJECT_CONVERSION,
                     fmt::format("`%s` cannot become `%s`: `%s` names a type parameter, so whether it implements `%s` is not known here",
                         shown_from, shown_to, shown_value, shown_trait), expr.span);
-                return ObjectConversionOutcome::Refused;
+                return TraitConversionOutcome::Refused;
             }
             mut d: Diagnostic = Diagnostic::error(ErrorCode::E0315_OBJECT_CONVERSION,
                 fmt::format("`%s` cannot become `%s`: `%s` is a type parameter, and no bound in scope says it implements `%s`",
@@ -3483,23 +3536,23 @@ type struct SemaVisitor {
                 d = d.help(fmt::format("bound it where it is declared: `where %s: %s`", shown_value, shown_trait));
             }
             this.ctx.emit_diagnostic(d);
-            return ObjectConversionOutcome::Refused;
+            return TraitConversionOutcome::Refused;
         }
         const implementation: DeclarationNode* = checker.object_implementation(object, value);
         if (implementation == null) {
             this.ctx.emit_error_at(ErrorCode::E0315_OBJECT_CONVERSION,
                 fmt::format("`%s` does not implement `%s`, so `%s` cannot become `%s`",
                     shown_value, shown_trait, shown_from, shown_to), expr.span);
-            return ObjectConversionOutcome::Refused;
+            return TraitConversionOutcome::Refused;
         }
         const block: mut ImplBlock* = DeclarationNode::impl_of(implementation);
         mut blocks: [mut ImplBlock*] = [];
         if (!this.object_table_implementations(expr, object, value, block, &blocks, shown_from, shown_to,
                 shown_value, shown_trait)) {
-            return ObjectConversionOutcome::Refused;
+            return TraitConversionOutcome::Refused;
         }
         this.ctx.note_object_conversion(implementation, value, blocks);
-        return ObjectConversionOutcome::Converted(ExpressionNode::object_conversion(expr, value, block, to));
+        return TraitConversionOutcome::Converted(ExpressionNode::object_conversion(expr, value, block, to));
     }
 
     /// Whether every copy of the generic body being walked has an
@@ -4651,10 +4704,10 @@ type struct SemaVisitor {
                     || !this.symbolic.symbolic_names_one_type(field_type);
                 this.lambda.refuse_stored_closure(value_type, field_type, value_expr.span, "a field");
                 if (!skip && !this.checker.can_assign(value_type, field_type)) {
-                    match (this.convert_to_object(value_expr, value_type, field_type)) {
-                        ObjectConversionOutcome::Converted(c) => { lit.field_inits[i].value = c; }
-                        ObjectConversionOutcome::Refused => { }
-                        ObjectConversionOutcome::Mismatch => {
+                    match (this.convert_through_trait(value_expr, value_type, field_type)) {
+                        TraitConversionOutcome::Converted(c) => { lit.field_inits[i].value = c; }
+                        TraitConversionOutcome::Refused => { }
+                        TraitConversionOutcome::Mismatch => {
                             const field_name_str: string = this.intern.resolve(field_init.field_name);
                             this.diag.emit_type_mismatch_with_value(
                                 ErrorCode::E0200_TYPE_MISMATCH, value_expr.span, field_type, value_type,
@@ -4768,10 +4821,10 @@ type struct SemaVisitor {
                 || !this.symbolic.symbolic_names_one_type(field_type);
             this.lambda.refuse_stored_closure(value_type, field_type, cloned.span, "a field");
             if (!skip && !this.checker.can_assign(value_type, field_type)) {
-                match (this.convert_to_object(cloned, value_type, field_type)) {
-                    ObjectConversionOutcome::Converted(c) => { value = c; }
-                    ObjectConversionOutcome::Refused => { }
-                    ObjectConversionOutcome::Mismatch => {
+                match (this.convert_through_trait(cloned, value_type, field_type)) {
+                    TraitConversionOutcome::Converted(c) => { value = c; }
+                    TraitConversionOutcome::Refused => { }
+                    TraitConversionOutcome::Mismatch => {
                         const nm: string = this.intern.resolve(name);
                         this.diag.emit_type_mismatch_with_value(
                             ErrorCode::E0200_TYPE_MISMATCH, cloned.span, field_type, value_type,
@@ -5188,13 +5241,13 @@ type struct SemaVisitor {
             if (!target.is_valid()) { target = elem_type; }
             this.lambda.refuse_stored_closure(t, target, arr.elements[i].span, "an array element");
             if (target.is_valid() && t.is_valid() && !this.checker.can_assign(t, target)) {
-                match (this.convert_to_object(arr.elements[i], t, target)) {
-                    ObjectConversionOutcome::Converted(c) => {
+                match (this.convert_through_trait(arr.elements[i], t, target)) {
+                    TraitConversionOutcome::Converted(c) => {
                         arr.elements[i] = c;
                         t = target;
                     }
-                    ObjectConversionOutcome::Refused => { }
-                    ObjectConversionOutcome::Mismatch => {
+                    TraitConversionOutcome::Refused => { }
+                    TraitConversionOutcome::Mismatch => {
                         this.diag.emit_type_mismatch_with_value(
                             ErrorCode::E0200_TYPE_MISMATCH, arr.elements[i].span, target, t,
                             "array elements must all have the same type", SourceSpan::none(), arr.elements[i]);
