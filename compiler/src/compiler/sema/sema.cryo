@@ -2787,6 +2787,24 @@ type struct SemaVisitor {
         return this.types.arg_type_is_concrete(ty) || this.symbolic.symbolic_params_settle(ty);
     }
 
+    /// `d`, a change to the binding `sym` (spelled `name`) that was declared
+    /// without `mut`, with its declaration labelled and the fix that declares
+    /// it `mut`; `d` unchanged when the binding has no declaration to edit.
+    /// Every change to one binding is the problem of how it is declared, so
+    /// the diagnostics the fix settles are one report.
+    with_mut_binding_fix(&this, d: Diagnostic, sym: SymbolID, name: string) -> Diagnostic {
+        const kw: SourceSpan = this.scopes.kw_span_of(sym);
+        if (!kw.has_location()) { return d.clone(); }
+        // The anchor is the `const` that `mut` replaces, or the zero-width
+        // point before a parameter where `mut ` is inserted.
+        const replaces: boolean = kw.end_col > kw.start_col;
+        mut r: Diagnostic = d.also_at(kw, if (replaces) { "declared `const` here" } else { "declared here without `mut`" });
+        r = r.suggest(Suggestion::machine_applicable(kw, if (replaces) { "mut" } else { "mut " },
+            fmt::format("make `%s` mutable", name)));
+        return r.caused_by(fmt::format("binding:%s:%u:%u", kw.file, kw.start_line, kw.start_col),
+            fmt::format("`%s` is changed, but it is declared without `mut`", name));
+    }
+
     check_assignment_lvalue(mut &this, lhs: ExpressionNode*) -> void {
         if (lhs == null) { return; }
         const id: IdentifierExpr* = ExpressionNode::identifier_of(lhs);
@@ -2798,18 +2816,10 @@ type struct SemaVisitor {
             mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0218_IMMUTABLE_ASSIGNMENT,
                 fmt::format("cannot assign to immutable variable `%s`", name_str));
             diag = diag.at_with_label(lhs.span, "this binding is immutable");
-            const kw: SourceSpan = this.scopes.kw_span_of(sym);
-            if (kw.has_location()) {
-                const kw_len: u32 = if (kw.end_col > kw.start_col) { kw.end_col - kw.start_col } else { 0 };
-                if (kw_len == 0) {
-                    diag = diag.suggest(Suggestion::machine_applicable(kw, "mut ", fmt::format("make `%s` mutable", name_str)));
-                } else {
-                    diag = diag.suggest(Suggestion::machine_applicable(kw, "mut", fmt::format("make `%s` mutable", name_str)));
-                }
-            } else {
+            if (!this.scopes.kw_span_of(sym).has_location()) {
                 diag = diag.with_note("declare the binding with `mut` instead of `const` to allow reassignment");
             }
-            this.ctx.diagnostics.emit(diag);
+            this.ctx.diagnostics.emit(this.with_mut_binding_fix(diag, sym, name_str));
             return;
         }
         const ma: MemberAccessExpr* = ExpressionNode::member_access_of(lhs);
@@ -3183,6 +3193,9 @@ type struct SemaVisitor {
             }
             PlaceAccess::ConstBinding(_) => {
                 diag = diag.help("declare the binding with `mut` to write it");
+                if (id != null) {
+                    diag = this.with_mut_binding_fix(diag, id.res.local_sym(), this.intern.resolve(id.name));
+                }
             }
             _ => {
                 const holder_t: Type* = this.arena.lookup(holder.resolved_type);

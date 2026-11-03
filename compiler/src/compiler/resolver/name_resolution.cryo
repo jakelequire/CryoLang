@@ -18,6 +18,7 @@ import compiler::const_table::{ ConstantTable };
 import compiler::diag::{ ErrorCode, snapshot, source_span, edit_distance };
 import compiler::diag::edit_distance::{ find_best_candidate };
 import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::suggestion::{ Suggestion };
 import compiler::ast::{
     GenericAnnotation, ImportStyle, NamedAnnotation, ObjectAnnotation, PatternBinding, PatternElement,
     PatternSub, ProjectionAnnotation,
@@ -1248,6 +1249,24 @@ type struct NameResolver {
         return best;
     }
 
+    /// `d`, a name written at `span` out of reach, with the fix `import
+    /// <imported>;` as help and as an edit adding that line after the file's
+    /// imports.  Every name the one import would reach is the same missing
+    /// import, so the diagnostics it fixes are one report.
+    with_import_fix(&this, d: Diagnostic, span: SourceSpan, imported: string) -> Diagnostic {
+        const line: string = fmt::format("import %s;", imported);
+        mut r: Diagnostic = d.help(fmt::format("add `%s` to bring it into scope", line));
+        const root: ProgramNode* = this.ctx.artifacts.ast.root;
+        if (root == null || root.span.file != span.file) { return r; }
+        const after: u32 = root.import_anchor_line();
+        if (after == 0) { return r; }
+        const at: SourceSpan = SourceSpan::new(span.file, after + 1, 1, after + 1, 1);
+        r = r.suggest(Suggestion::machine_applicable(at, fmt::format("%s\n", line),
+            fmt::format("import `%s`", imported)));
+        return r.caused_by(fmt::format("import:%s:%s", span.file, imported),
+            fmt::format("names from `%s` are used here, and this file does not import it", imported));
+    }
+
     /// Refuse a written type spelling that no scope binds and no module
     /// owns, where it is written, with the help a writer needs; true when a
     /// diagnostic was made, so the caller stamps `Err` and the report is
@@ -1298,8 +1317,7 @@ type struct NameResolver {
                     fmt::format("`%s` is not reachable from this module", prefix));
                 d = d.at_with_label(span, "not reachable in this scope");
                 d = d.with_note(fmt::format("`%s` is the module it would name", owner));
-                d = d.with_note(fmt::format("add `import %s;` to bring it into scope", owner));
-                this.ctx.emit_diagnostic(d);
+                this.ctx.emit_diagnostic(this.with_import_fix(d, span, owner));
                 return true;
             }
             mut d: Diagnostic = Diagnostic::error(this.not_found_code(),
@@ -1347,8 +1365,7 @@ type struct NameResolver {
                 // shorter, equally correct import.
                 d = d.with_note(fmt::format("`%s` is declared in `%s`", written, owner));
                 if (offered) {
-                    d = d.with_note(fmt::format("add `import %s;` to bring it into scope",
-                        this.reaching_import_for(owner_path)));
+                    d = this.with_import_fix(d, span, this.reaching_import_for(owner_path));
                 } else {
                     // A private declaration is outside its module's export
                     // set, and an internal one is offered to its own package
@@ -1763,9 +1780,7 @@ type struct NameResolver {
                 // unreachable is that its first segment binds to nothing here,
                 // and only the full path fixes that.
                 d = d.with_note(fmt::format("`%s` is the module it would name", owner));
-                d = d.with_note(
-                    fmt::format("add `import %s;` to bring it into scope", owner));
-                this.ctx.emit_diagnostic(d);
+                this.ctx.emit_diagnostic(this.with_import_fix(d, node.scope_span, owner));
                 node.set_scope_res(Res::Err);
             } else {
                 // Binds in scope: a type wearing a module's spelling.  The
