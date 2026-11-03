@@ -82,7 +82,7 @@ import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::edit_distance::{ find_best_candidate };
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::diag::source_span::{ SourceSpan };
-import compiler::diag::suggestion::{ Applicability, Suggestion };
+import compiler::diag::suggestion::{ Applicability, Suggestion, SuggestionPart };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::resolver::{ Resolver };
 import compiler::resolver::symbol_str::{ SymbolStr };
@@ -1748,6 +1748,22 @@ type struct SemaVisitor {
                     this.arena.resolve_display_name_short(t)));
             diag = diag.at_with_label(receiver.span, "more than one raw pointer before the value");
             diag = diag.help("dereference every raw pointer but the last with `*`: `(*p).x` for `p: Foo**`");
+            // A `*` strips a raw pointer only when one is outermost; a borrow
+            // in front of the pointers would take the first `*` itself.
+            const at: SourceSpan = receiver.span;
+            const outer: Type* = this.arena.lookup(t);
+            if (outer != null && outer.kind == TypeKind::Pointer
+                    && at.has_location() && at.start_line == at.end_line && at.end_col > at.start_col) {
+                mut stars: string = "(";
+                for (mut k: i32 = 1; k < this.raw_pointers_before_value(t); k++) { stars = fmt::format("%s*", stars); }
+                mut parts: [SuggestionPart] = [];
+                parts.push(SuggestionPart::new(SourceSpan::new(at.file, at.start_line, at.start_col,
+                                                               at.start_line, at.start_col), stars));
+                parts.push(SuggestionPart::new(SourceSpan::new(at.file, at.end_line, at.end_col,
+                                                               at.end_line, at.end_col), ")"));
+                diag = diag.suggest(Suggestion::multipart(parts, "dereference the outer pointers",
+                    Applicability::MachineApplicable));
+            }
             this.ctx.emit_diagnostic(diag);
             return TypeRef::invalid();
         }

@@ -758,8 +758,10 @@ implement struct Parser {
 
         // Function body or semicolon (forward declaration)
         if (this.check(TokenType::LBrace)) {
+            const this_before: i64 = this.this_written;
             const body: Stmt* = this.parse_block_statement();
             func.set_body(body);
+            func.body_names_this = this.this_written > this_before;
         } else {
             this.consume(TokenType::Semicolon, "';' or '{'");
         }
@@ -819,7 +821,9 @@ implement struct Parser {
     /// rules don't drift across the three sites.
     parse_function_param_list_into(mut &this, func_decl: DeclarationNode*) -> void {
         const func: mut FunctionDecl* = DeclarationNode::fn_of(func_decl);
-        this.consume(TokenType::LParen, "'('");
+        const open: SourceSpan = this.span_from_token(this.consume(TokenType::LParen, "'('"));
+        func.receiver_anchor = SourceSpan::new(open.file, open.start_line, open.end_col,
+                                               open.start_line, open.end_col);
         if (!this.check(TokenType::RParen)) {
             const params: [DeclarationNode*] = this.parse_parameter_list();
             for (mut i: i64 = 0; i < params.length(); i++) {
@@ -934,6 +938,25 @@ implement struct Parser {
         diag = diag.at_with_label(at, "no receiver written");
         diag = diag.help(
             "write `&this` first among its parameters to read the receiver, `mut &this` to change it, or `this` to take it by value; a method with no receiver is `static`");
+        // A body that never names `this` most likely meant a static method;
+        // one that does needs a receiver, and which one is the author's call
+        // until the body's writes are known.
+        const anchor: SourceSpan = func.receiver_anchor;
+        const separator: string = if (func.parameters.length() > 0) { ", " } else { "" };
+        if (!func.body_names_this && func_decl.name_span.has_location()) {
+            const before_name: SourceSpan = SourceSpan::new(at.file, at.start_line, at.start_col,
+                                                            at.start_line, at.start_col);
+            diag = diag.suggest(Suggestion::single(before_name, "static ",
+                fmt::format("make `%s` static", name), Applicability::MaybeIncorrect));
+        }
+        if (anchor.has_location()) {
+            diag = diag.suggest(Suggestion::single(anchor, fmt::format("&this%s", separator),
+                "read the receiver: `&this`", Applicability::MaybeIncorrect));
+            if (func.body_names_this) {
+                diag = diag.suggest(Suggestion::single(anchor, fmt::format("mut &this%s", separator),
+                    "change the receiver: `mut &this`", Applicability::MaybeIncorrect));
+            }
+        }
         this.ctx.emit_diagnostic(diag);
         const span: SourceSpan = SourceSpan::new(at.file, at.start_line, at.start_col,
                                                  at.start_line, at.start_col);
@@ -1527,8 +1550,10 @@ implement struct Parser {
 
         // Body or semicolon
         if (this.check(TokenType::LBrace)) {
+            const this_before: i64 = this.this_written;
             const body: Stmt* = this.parse_block_statement();
             func.set_body(body);
+            func.body_names_this = this.this_written > this_before;
         } else {
             this.consume(TokenType::Semicolon, "';' or '{'");
         }
