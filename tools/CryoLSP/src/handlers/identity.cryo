@@ -384,15 +384,19 @@ type struct Locator {
 
     /// What a member access names: the method the call it is the callee of
     /// names, or the field its pin holds.
+    /// What a member names: the field it resolved to, called or not (a
+    /// field of a function type is called through), or else the method
+    /// the call around it calls.
     member_target(&this, m: MemberAccessExpr*, call: CallExpr*) -> Target {
-        if (call != null) { return this.call_target(call); }
         match (&m.resolved_member) {
             MemberPin::Field(index) => {
                 if (m.object == null) { return Target::Nothing; }
                 return this.field_target(m.object.resolved_type, index);
             }
-            _ => { return Target::Nothing; }
+            _ => { }
         }
+        if (call != null) { return this.call_target(call); }
+        return Target::Nothing;
     }
 
     struct_literal(&this, e: ExpressionNode*, sl: StructExpr*) -> Answer {
@@ -545,16 +549,19 @@ type struct Locator {
             PatternKind::Constant(c) => {
                 return Answer::of(this.res_target(&c.res), at, TypeRef::invalid());
             }
-            PatternKind::Enum(ep) => { return this.enum_pattern(ep); }
+            PatternKind::Enum(ep) => { return this.enum_pattern(ep, p.generated); }
             _ => { return Answer::nothing(); }
         }
     }
 
-    enum_pattern(&this, ep: EnumPattern*) -> Answer {
-        if (this.holds(ep.enum_span)) {
+    /// A pattern the compiler wrote (a `for` loop's `Some(x)`) has no type
+    /// or variant written at its spans, which are the binding's: only its
+    /// elements answer.
+    enum_pattern(&this, ep: EnumPattern*, generated: boolean) -> Answer {
+        if (!generated && this.holds(ep.enum_span)) {
             return Answer::of(this.res_target(&ep.res), ep.enum_span, TypeRef::invalid());
         }
-        if (this.holds(ep.variant_span)) {
+        if (!generated && this.holds(ep.variant_span)) {
             match (&ep.resolved_member) {
                 MemberPin::Variant(ord) => {
                     const owner: DefId = this.res_def(&ep.res);

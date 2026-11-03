@@ -35,13 +35,15 @@ import lsp::handlers::identity::{ Locator, Target };
 /// One written name: where it is, what it names, whether it is the name's
 /// declaration, and whether it declares a method's receiver (`&this`).
 /// `inferred` is the type the compiler gave a variable declared with no
-/// type written, invalid otherwise.
+/// type written, invalid otherwise.  `called` is the type of a name a call
+/// calls (`callback(x)`), invalid for a name that is not a callee.
 type struct Use {
     span:     SourceSpan;
     target:   Target;
     decl:     boolean;
     receiver: boolean;
     inferred: TypeRef;
+    called:   TypeRef;
 }
 
 
@@ -101,7 +103,7 @@ type struct Uses {
         if (span.start_line == 0 || target.is_nothing()) { return; }
         if (span.file == null || !span.file.eq(this.file)) { return; }
         this.out.push(Use { span: span, target: target, decl: decl, receiver: receiver,
-                            inferred: TypeRef::invalid() });
+                            inferred: TypeRef::invalid(), called: TypeRef::invalid() });
     }
 
     /// A name written at `span` and spelled with `length` bytes, whose
@@ -370,19 +372,25 @@ type struct Uses {
         match (p.kind) {
             PatternKind::Binding(b)  => { this.add(p.span, Target::Local(b.binding_sym), true); }
             PatternKind::Constant(c) => { this.add(p.span, this.loc.res_target(&c.res), false); }
-            PatternKind::Enum(ep)    => { this.enum_pattern(ep); }
+            PatternKind::Enum(ep)    => { this.enum_pattern(ep, p.generated); }
             _                        => { }
         }
     }
 
-    enum_pattern(mut &this, ep: EnumPattern*) -> void {
-        const owner: DefId = this.loc.res_def(&ep.res);
-        this.add(ep.enum_span, this.loc.res_target(&ep.res), false);
-        match (&ep.resolved_member) {
-            MemberPin::Variant(ord) => {
-                if (owner.is_valid()) { this.add(ep.variant_span, Target::Variant(owner, ord), false); }
+    /// An enum pattern's type and variant, then its elements.  A pattern
+    /// the compiler wrote (a `for` loop's `Some(x)`) has no type or variant
+    /// written at its spans, which are the binding's; only its elements are
+    /// the user's.
+    enum_pattern(mut &this, ep: EnumPattern*, generated: boolean) -> void {
+        if (!generated) {
+            const owner: DefId = this.loc.res_def(&ep.res);
+            this.add(ep.enum_span, this.loc.res_target(&ep.res), false);
+            match (&ep.resolved_member) {
+                MemberPin::Variant(ord) => {
+                    if (owner.is_valid()) { this.add(ep.variant_span, Target::Variant(owner, ord), false); }
+                }
+                _ => { }
             }
-            _ => { }
         }
         for (mut i: i64 = 0; i < ep.elements.length(); i++) {
             match (ep.elements[i]) {
@@ -409,9 +417,17 @@ type struct Uses {
         const n: ExpressionNode* = e;
         if (n.generated) {
             // The compiler wrote it, so it names nothing; the written code
-            // it wraps - an f-string's holes, a converted operand - is
-            // walked.
-            if (ExpressionNode::call_of(n) != null) { this.exprs(&ExpressionNode::call_of(e).arguments); }
+            // it wraps - an f-string's holes, a converted operand, the
+            // collection a `for` loop calls `.iter()` on - is walked.  A
+            // callee the compiler wrote too is walked for the receiver
+            // under it.
+            const gen_call: CallExpr* = ExpressionNode::call_of(n);
+            if (gen_call != null) {
+                if (gen_call.callee != null && gen_call.callee.generated) { this.expr(gen_call.callee, null); }
+                this.exprs(&gen_call.arguments);
+            }
+            const gen_member: MemberAccessExpr* = ExpressionNode::member_access_of(n);
+            if (gen_member != null) { this.expr(gen_member.object, null); }
             const gen_un: UnaryExpr* = ExpressionNode::unary_of(n);
             if (gen_un != null) { this.expr(gen_un.operand, null); }
             return;
@@ -423,12 +439,18 @@ type struct Uses {
                 this.annotations(&c.generic_args);
             }
             ExprKind::Identifier(id) => {
-                if (!id.is_this_keyword) { this.add(n.span, this.loc.res_target(&id.res), false); }
+                if (!id.is_this_keyword) {
+                    const before: i64 = this.out.length();
+                    this.add(n.span, this.loc.res_target(&id.res), false);
+                    if (call != null && this.out.length() > before) { this.out[before].called = n.resolved_type; }
+                }
                 this.annotations(&id.generic_args);
             }
             ExprKind::MemberAccess(m) => {
                 this.expr(m.object, null);
+                const before: i64 = this.out.length();
                 this.add(m.member_span, this.loc.member_target(m, call), false);
+                if (call != null && this.out.length() > before) { this.out[before].called = n.resolved_type; }
                 this.annotations(&m.generic_args);
             }
             ExprKind::ScopeResolution(s) => {

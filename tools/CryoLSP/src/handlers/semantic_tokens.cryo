@@ -37,6 +37,8 @@ import compiler::diag::source_span;
 import compiler::lex::lexer::{ Lexer };
 import compiler::resolver::res::{ DefId, DefKind };
 import compiler::resolver::symbol::{ Symbol, SymbolKind };
+import compiler::types;
+import compiler::types::type_base;
 
 import lsp::handlers::identity::{ Target };
 import lsp::handlers::uses::{ Use, Uses };
@@ -123,6 +125,10 @@ type struct SemanticTokenizer {
         match (&u.target) {
             Target::Def(d) => { this.def_token(u.span, d, decl); }
             Target::Local(s) => {
+                if (this.calls_function_value(u)) {
+                    this.emit_span(u.span, lsp::protocol::semantic_tokens::TYPE_FUNCTION, decl);
+                    return;
+                }
                 const sym: Symbol = this.ctx.resolver.get_symbol(s);
                 if (sym.kind == SymbolKind::Parameter) {
                     this.emit_span(u.span, lsp::protocol::semantic_tokens::TYPE_PARAMETER, decl);
@@ -139,7 +145,12 @@ type struct SemanticTokenizer {
                 this.emit_span(u.span, lsp::protocol::semantic_tokens::TYPE_TYPE_PARAM, decl);
             }
             Target::Field(_, _) => {
-                this.emit_span(u.span, lsp::protocol::semantic_tokens::TYPE_PROPERTY, decl);
+                const field_type: u32 = if (this.calls_function_value(u)) {
+                    lsp::protocol::semantic_tokens::TYPE_FUNCTION
+                } else {
+                    lsp::protocol::semantic_tokens::TYPE_PROPERTY
+                };
+                this.emit_span(u.span, field_type, decl);
             }
             Target::Variant(_, _) => {
                 this.emit_span(u.span, lsp::protocol::semantic_tokens::TYPE_ENUM_MEMBER, decl);
@@ -147,6 +158,15 @@ type struct SemanticTokenizer {
             // A primitive keeps the grammar's colour.
             _ => { }
         }
+    }
+
+    /// Whether `u` is a local or a field that a call calls and whose type
+    /// is a function type: a function called through a pointer, coloured as
+    /// the call it is.  A name merely written before `(` is not one.
+    calls_function_value(&this, u: &Use) -> boolean {
+        if (!u.called.is_valid()) { return false; }
+        const called: type_base::Type* = this.ctx.type_arena.lookup(u.called);
+        return called != null && called.kind == types::TypeKind::Function;
     }
 
     /// A definition's name: its kind, and for a type the kind of type its
