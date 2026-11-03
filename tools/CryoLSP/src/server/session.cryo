@@ -45,6 +45,8 @@ import std::alloc::arena;
 import compiler::compilation_context::{ SourceOverride, YieldHook };
 import compiler::module_graph::{ ModuleGraph, ModuleOrigin };
 import compiler::project_config::{ ProjectConfig };
+import compiler::diag::diagnostic;
+import compiler::diag::severity::{ Severity };
 import compiler::instance;
 import compiler::codegen::ast_arena;
 
@@ -284,6 +286,46 @@ type struct Project {
     published_analysis(&this) -> const Analysis* {
         if (this.last.ctx != null) { return &this.last; }
         return &this.current;
+    }
+
+    /// Why the published analysis did not read this project's file `path`,
+    /// or None when it did: the compiler stopped before finding the
+    /// project's modules, and why, or nothing the project builds imports
+    /// the file.  Module discovery follows imports, so such a file is never
+    /// compiled and nothing in it can be answered.
+    file_notice(&this, path: str::Str) -> Option<String> {
+        if (!this.analysed) { return Option::None; }
+        const ctx: compilation_context::CompilationContext* = this.published_analysis().ctx;
+        if (ctx == null) {
+            return Option::Some(String::from_str(
+                "Cryo did not analyse this file: the compiler stopped before it began analysing the project"));
+        }
+        mut c: String = PathFinder::build_cstring_buffer(path);
+        const found: boolean = ctx.module_graph.find_module_by_path(c.as_ptr() as string) >= 0;
+        mem::drop(c);
+        if (found) { return Option::None; }
+        if (ctx.modules_discovered) {
+            return Option::Some(String::from_str(
+                "Cryo did not analyse this file: nothing the project builds imports it, so the compiler never reads it"));
+        }
+        mut text: String = String::from_str(
+            "Cryo did not analyse this file: the compiler stopped while finding the project's modules");
+        const diags: &[diagnostic::Diagnostic] = &ctx.diagnostics.diagnostics;
+        for (mut i: i64 = 0; i < diags.length(); i++) {
+            const d: &diagnostic::Diagnostic = &diags[i];
+            const is_error: boolean = match (d.severity) {
+                Severity::Error => { true }
+                _               => { false }
+            };
+            if (!is_error) { continue; }
+            text.push("; ");
+            if (d.span.has_location()) {
+                text.push(str::Str::new(d.span.file));
+                text.push(f":{d.span.start_line}: ");
+            }
+            text.push(str::Str::new(d.message));
+        }
+        return Option::Some(text);
     }
 
     set_focus(mut &this, path: str::Str) -> void {

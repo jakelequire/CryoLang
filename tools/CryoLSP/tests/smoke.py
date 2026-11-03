@@ -34,7 +34,10 @@ checks.json:
         {"name": "...", "method": "completion", "at": "...",
          "includes": ["..."], "excludes": ["..."]},
         {"name": "...", "method": "diagnostics", "file": "src/main.cryo",
-         "expect": [{"code": "W0001", "at": "src/main.cryo@marker"}]},
+         "expect": [{"code": "W0001", "at": "src/main.cryo@marker",
+                     "message": "part of the text"}]},
+         an expected diagnostic's "message" is optional; "code": null is
+         one with no code, the server's own notice of a file not analysed
         {"name": "...", "method": "references" | "documentHighlight",
          "at": "...", "declaration": true, "expect": ["src/b.cryo@marker", ...]},
         {"name": "...", "method": "documentSymbol", "file": "src/b.cryo",
@@ -472,18 +475,28 @@ def run_check(srv, fx, chk, c):
     if method == "diagnostics":
         uri = fx.uri(chk["file"])
         want = sorted((d["code"],) + tuple(fx.at(d["at"])[1].values()) for d in chk["expect"])
+        texts = [((d["code"],) + tuple(fx.at(d["at"])[1].values()), d["message"])
+                 for d in chk["expect"] if "message" in d]
 
         def got_of(params):
             return sorted((d.get("code"), d["range"]["start"]["line"],
                            d["range"]["start"]["character"]) for d in params.get("diagnostics", []))
+
+        def says(params, key, text):
+            return any((d.get("code"), d["range"]["start"]["line"], d["range"]["start"]["character"]) == key
+                       and text in d.get("message", "") for d in params.get("diagnostics", []))
         params = srv.wait_notification(
             "textDocument/publishDiagnostics",
-            lambda p: same_uri(p.get("uri", ""), uri) and got_of(p) == want,
+            lambda p: same_uri(p.get("uri", ""), uri) and got_of(p) == want
+            and all(says(p, key, text) for key, text in texts),
             timeout=COLD_TIMEOUT)
         if params is None:
             last = srv.wait_notification("textDocument/publishDiagnostics",
                                          lambda p: same_uri(p.get("uri", ""), uri), timeout=0)
-            c.ok(False, name, "want %r, last published %r" % (want, got_of(last) if last else None))
+            c.ok(False, name, "want %r saying %r, last published %r" % (
+                want, [t for _, t in texts],
+                [(d.get("code"), d["range"]["start"]["line"], d["range"]["start"]["character"],
+                  d.get("message", "")) for d in last.get("diagnostics", [])] if last else None))
         else:
             c.ok(True, name)
         return

@@ -33,6 +33,7 @@ import compiler::diag::renderer;
 
 import lsp::server::diag_render_cache;
 import lsp::server::docs;
+import lsp::protocol::lsp;
 import std::ffi::libc;
 import std::fmt;
 
@@ -176,6 +177,7 @@ type struct DiagnosticConverter {
     /// the filter, an editor showing `main.cryo` would render diagnostics
     /// from sibling files at made-up positions in the active buffer.
     static build_publish_params(uri: str::Str, diags: &[diagnostic::Diagnostic],
+                                notice: Option<String>,
                                 cache: mut diag_render_cache::DiagRenderCache*,
                                 positions: &docs::Docs) -> value::JsonValue {
         // Open a publish cycle for this URI: drops the cache entries this
@@ -196,12 +198,29 @@ type struct DiagnosticConverter {
                 arr.push(DiagnosticConverter::diag_to_json(&diags[i], &renderer, cache, positions));
             }
         }
+        match (notice) {
+            Option::Some(text) => { arr.push(DiagnosticConverter::notice_json(text)); }
+            Option::None       => { }
+        }
         mem::drop(fs_path_owned);
 
         mut params: value::JsonObject = value::JsonObject::new();
         params.put("uri", value::JsonValue::from(uri));
         params.put("diagnostics", value::JsonValue::Array(arr));
         return value::JsonValue::Object(params);
+    }
+
+    /// A warning at the start of the document saying `message`: what the
+    /// server says of a file the analysis did not read, which has no place
+    /// of its own in the source.
+    static notice_json(message: String) -> value::JsonValue {
+        const origin: lsp::Position = lsp::Position::new(0, 0);
+        mut o: value::JsonObject = value::JsonObject::new();
+        o.put("range", lsp::Range::new(origin, origin).to_json());
+        o.put("severity", value::JsonValue::int_value(2));
+        o.put("source", value::JsonValue::from("cryolsp"));
+        o.put("message", value::JsonValue::String(message));
+        return value::JsonValue::Object(o);
     }
 
     /// True when this diagnostic's source span belongs to `fs_path`.
