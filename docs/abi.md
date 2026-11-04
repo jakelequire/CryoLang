@@ -80,9 +80,10 @@ a caller-made copy.
 
 A reference to the slice item (`&Slice<T>`, `mut &Slice<T>`) lowers to
 the slice itself, `{ ptr, i64 }`: the elements' address, then their count.
-It is classified as the slice is - a 16-byte aggregate of two INTEGER
-eightbytes - so a slice reference and a slice by value travel the same
-way: a `DirectPair` on SysV, a pointer to a caller-made copy on Win64.
+It is classified as the slice's struct is - a 16-byte aggregate of two
+INTEGER eightbytes - and travels that way: a `DirectPair` on SysV, a
+pointer to a caller-made copy on Win64.  A slice is only borrowed, so this
+is the one way a slice crosses a call.
 A `&this` method of the slice takes its receiver the same way; the
 prologue binds `this` to the slot holding the received words, as for a
 by-value `this`.

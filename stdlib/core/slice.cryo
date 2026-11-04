@@ -1,9 +1,13 @@
 ///! Slice<T>: a borrowed view into a contiguous sequence.
 ///!
-///! `Slice<T>` is `(pointer, length)`. Algorithms operate on slices;
-///! collections expose `as_slice()` so algorithms need only be written
-///! once. A slice does not own its storage; the backing memory must
-///! outlive every slice that refers to it.
+///! A slice is only ever borrowed: `&Slice<T>` reads the elements and
+///! `mut &Slice<T>` writes them, and either is the two words
+///! `(pointer, length)`. Algorithms take slice references; a container
+///! hands its elements out through `AsSlice<T>` and `AsMutableSlice<T>`,
+///! and a reference to such a container converts to a slice reference
+///! where one is wanted, so algorithms need only be written once. A slice
+///! does not own its storage; the backing memory must outlive every slice
+///! that refers to it.
 
 namespace std::core::slice;
 
@@ -14,16 +18,44 @@ import std::core::iter::{ Iterator };
 import std::core::option::{ Option };
 import std::core::mem;
 
+/// A container whose elements can be read as a slice. Where a `&Slice<T>`
+/// is wanted, a `&A` or `mut &A` of such a container is given as its
+/// `as_slice()`.
+![language("as_slice")]
+public type trait AsSlice<T> {
+    ![language("as_slice_as_slice")]
+    as_slice(&this) -> &Slice<T>;
+}
+
+/// A container whose elements can be written through a slice. Where a
+/// `mut &Slice<T>` is wanted, a `mut &A` of such a container is given as
+/// its `as_mutable_slice()`.
+![language("as_mutable_slice")]
+public type trait AsMutableSlice<T> {
+    ![language("as_mutable_slice_as_mutable_slice")]
+    as_mutable_slice(mut &this) -> mut &Slice<T>;
+}
+
+/// The elements are reached through `ptr`, declared read-only: through a
+/// `mut &Slice<T>` it reads as a writable pointer, through a `&Slice<T>`
+/// as the read-only one it is.
 ![language("slice")]
 public type struct Slice<T> {
-    private ptr: mut T*;
+    private ptr: T*;
     private length: i64;
 
-    /// Construct from a raw pointer, possibly read-only, and a length. The caller certifies
-    /// that `[ptr, ptr + length)` is valid initialized memory while the slice exists, that
-    /// `length` is not negative, and that nothing writes through a slice of a read-only pointer.
-    public static from_raw(ptr: const T*, length: i64) -> Slice<T> {
-        return Slice::<T> { ptr: ptr as mut T*, length: length };
+    /// The `length` elements at `ptr`, to read. The caller certifies that
+    /// `[ptr, ptr + length)` is valid initialized memory while the slice is
+    /// used and that `length` is not negative.
+    public static from_raw(ptr: const T*, length: i64) -> &Slice<T> {
+        return &Slice::<T> { ptr: ptr, length: length };
+    }
+
+    /// The `length` elements at `ptr`, to read and write. The caller
+    /// certifies what `from_raw` asks, and that nothing else reads or writes
+    /// the elements while the slice is written through.
+    public static from_raw_mutable(ptr: mut T*, length: i64) -> mut &Slice<T> {
+        return &Slice::<T> { ptr: ptr, length: length };
     }
 
     ![inline]
@@ -57,27 +89,33 @@ public type struct Slice<T> {
         return Option::Some(mem::const_offset(this.ptr, index));
     }
 
-    /// Raw pointer to the first element. Callers must respect `length`.
-    public as_ptr(&this) -> mut T* {
+    /// Read-only raw pointer to the first element. Callers must respect
+    /// `length`.
+    public as_ptr(&this) -> T* {
         return this.ptr;
     }
 
-    /// Read-only raw pointer to the first element: `as_ptr` for a caller
-    /// that only reads. Callers must respect `length`.
-    public as_const_ptr(&this) -> const T* {
+    /// Writable raw pointer to the first element. Callers must respect
+    /// `length`.
+    public as_mutable_ptr(mut &this) -> mut T* {
         return this.ptr;
     }
 
-    /// The sub-slice `[start, end)`. Panics if `start` is negative,
+    /// The sub-slice `[start, end)`, to read. Panics if `start` is negative,
     /// `start > end`, or `end > length`.
-    public subslice(&this, start: i64, end: i64) -> Slice<T> {
+    public subslice(&this, start: i64, end: i64) -> &Slice<T> {
         if (start < 0 || start > end || end > this.length) {
             core::panic("Slice::subslice: out of range", intrinsics::location());
         }
-        return Slice::<T> {
-            ptr: mem::offset(this.ptr, start),
-            length: end - start
-        };
+        return Slice::from_raw(mem::const_offset(this.ptr, start), end - start);
+    }
+
+    /// The sub-slice `[start, end)`, to write. Panics as `subslice` does.
+    public subslice_mutable(mut &this, start: i64, end: i64) -> mut &Slice<T> {
+        if (start < 0 || start > end || end > this.length) {
+            core::panic("Slice::subslice_mutable: out of range", intrinsics::location());
+        }
+        return Slice::from_raw_mutable(mem::offset(this.ptr, start), end - start);
     }
 
     /// Return an iterator that yields each element by value (bitwise

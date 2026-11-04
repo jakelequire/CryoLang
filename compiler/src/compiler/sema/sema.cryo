@@ -3419,6 +3419,20 @@ type struct SemaVisitor {
             this.ctx.emit_error_at(ErrorCode::E0230_INVALID_UNARY_OP, result.error_message, e.span);
             return operand_type;
         }
+        // `*r` of a slice reference would make a slice value, which is never
+        // held (E0252): the slice's elements are reached through `r` itself.
+        if (unary.op.kind == TokenType::Star && !unary.is_synthetic) {
+            const pointed: Type* = this.arena.lookup(operand_type);
+            if (pointed != null && pointed.is_wide_reference()) {
+                mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0252_SLICE_HELD_AS_VALUE,
+                    fmt::format("`*` of `%s` would hold the slice as a value, and a slice is only borrowed",
+                        this.arena.resolve_display_name_short(operand_type)));
+                diag = diag.at_with_label(e.span, "a slice read out of its reference");
+                diag = diag.help("use the reference itself: its methods, `[i]` and `length()` reach the elements");
+                this.ctx.emit_diagnostic(diag);
+                return TypeRef::invalid();
+            }
+        }
         // `&x` taken where write access is wanted is a writable borrow.
         if (unary.op.kind == TokenType::Amp && this.types.gives_write_access(this.state.expected_type)) {
             unary.operand = this.borrow_for_writing(unary.operand, e.span);

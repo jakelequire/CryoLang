@@ -9,7 +9,7 @@
 ///!
 ///! Indexing, `push`, and `pop` operate at the end in amortized O(1);
 ///! `get` and `set` are O(1).  Algorithms that don't need ownership
-///! take `Slice<T>`; call `as_slice()` at the boundary.
+///! take `&Slice<T>`, which a `&Array<T>` converts to.
 ///!
 ///! Growth doubles capacity (min 4 on first allocation).
 
@@ -18,7 +18,7 @@ namespace std::collections::array;
 import std::core::intrinsics;
 import std::core::option::{ Option };
 import std::core::result::{ Result };
-import std::core::slice::{ Slice, SliceIndex, SliceIter };
+import std::core::slice::{ AsMutableSlice, AsSlice, Slice, SliceIndex, SliceIter };
 import std::core::mem;
 import std::core::ptr::{ NonNull };
 import std::core::drop::{ Drop };
@@ -148,12 +148,6 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// (`push`, `reserve`, `shrink_to_fit`).
     public as_ptr(&this) -> mut T* {
         return this.ptr;
-    }
-
-    /// Borrow the initialized prefix. Slice is invalidated by any
-    /// reallocating method.
-    public as_slice(&this) -> Slice<T> {
-        return Slice::from_raw(this.ptr, this.length);
     }
 
     /// Iterate over the elements in order, yielding each by value
@@ -422,7 +416,7 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// owning `T` both arrays would end up owning the same heap buffers and
     /// double-free on drop. For owning `T`, append elements one at a time
     /// with `push` after cloning, or move them out of `source` by index.
-    public append(mut &this, source: Slice<T>) -> void where T: Copy {
+    public append(mut &this, source: &Slice<T>) -> void where T: Copy {
         match (this.try_append(source)) {
             Result::Ok(_) => { return; }
             Result::Err(_) => {
@@ -435,7 +429,7 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// partial copies are impossible; either all elements are appended
     /// or none are. Gated on `T: Copy` (see `append`): the append is a
     /// bitwise `memcpy` out of the borrowed `source`.
-    public try_append(mut &this, source: Slice<T>) -> Result<(), AllocError> where T: Copy {
+    public try_append(mut &this, source: &Slice<T>) -> Result<(), AllocError> where T: Copy {
         const add: i64 = source.length();
         if (add == 0) { return Result::Ok(()); }
         this.reserve_grow(add)?;
@@ -604,6 +598,19 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
 /// own source (`no method named `require` found on type `ResSlot``): it
 /// still reads an element (`MethodInfo`, `TemplateEntry`, `Scope`, ...)
 /// after the array that held it is dropped.
+// The initialized prefix, as a slice. Invalidated by any reallocating
+// method (`push`, `reserve`, `shrink_to_fit`).
+implement<T, A> trait AsSlice<T> for struct Array<T, A> {
+    as_slice(&this) -> &Slice<T> {
+        return Slice::from_raw(this.ptr, this.length);
+    }
+}
+implement<T, A> trait AsMutableSlice<T> for struct Array<T, A> {
+    as_mutable_slice(mut &this) -> mut &Slice<T> {
+        return Slice::from_raw_mutable(this.ptr, this.length);
+    }
+}
+
 implement<T, A> trait Drop for struct Array<T, A>
 where T: Drop, A: Allocator {
     drop(mut &this) -> void {

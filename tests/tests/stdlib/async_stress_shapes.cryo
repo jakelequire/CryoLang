@@ -27,7 +27,6 @@ namespace CryoTests::Tests::Stdlib::AsyncStressShapes;
 
 import std::core::result::{ Result };
 import std::core::option::{ Option };
-import std::core::slice::{ Slice };
 import std::core::mem;
 import std::collections::array::{ Array };
 import std::collections::str::{ Str };
@@ -1108,9 +1107,9 @@ type struct AssBorrowed {
         return AssBorrowed { buf: v };
     }
 
-    /// A borrow: the returned `Slice` points into `buf`'s heap block and records
-    /// nothing about the value it came from.
-    view(&this) -> Slice<u8> { return this.buf.as_slice(); }
+    /// A view held by value: the returned `Str` points into `buf`'s heap block
+    /// and records nothing about the value it came from.
+    view(&this) -> Str { return Str::from_raw(this.buf.as_ptr(), this.buf.length()); }
 }
 
 implement trait Drop for struct AssBorrowed {
@@ -1121,13 +1120,13 @@ implement trait Drop for struct AssBorrowed {
 
 /// Suspends BEFORE reading the view, so the read lands after the caller's
 /// declaring state has fallen off its end.
-async function ass_eat(bytes: Slice<u8>) -> u64 {
+async function ass_eat(bytes: Str) -> u64 {
     const _t: u64 = await PendingThenReady::<u64>::new(1, 0);
     mut sum: u64 = 0;
     mut i: i64 = 0;
     while (i < bytes.length()) {
         mut b: u8 = 0;
-        match (bytes.get(i)) { Option::Some(x) => { b = x; } Option::None => { } }
+        match (bytes.as_bytes().get(i)) { Option::Some(x) => { b = x; } Option::None => { } }
         sum = sum * 256 + (b as u64);
         i = i + 1;
     }
@@ -1235,13 +1234,13 @@ function async_borrowed_view_in_a_loop() -> Result<(), TestError> {
     return expect_eq(ASS_DROPS, 1 as i64);
 }
 
-/// A `Slice<u8>` taken straight off an `Array<u8>` local -- no wrapper struct,
-/// so the borrow is of a stdlib container rather than of a user destructor.
+/// A view taken straight off an `Array<u8>` local -- no wrapper struct, so the
+/// view is of a stdlib container rather than of a user destructor.
 async function ass_borrow_array_local() -> u64 {
     mut arr: Array<u8> = Array::<u8>::new();
     arr.push(0x6d);
     arr.push(0x30);
-    const got: u64 = await ass_eat(arr.as_slice());
+    const got: u64 = await ass_eat(Str::from_raw(arr.as_ptr(), arr.length()));
     return got;
 }
 
@@ -1256,7 +1255,7 @@ function async_borrowed_slice_from_an_array_local() -> Result<(), TestError> {
 async function ass_borrow_string_local() -> u64 {
     mut msg: String = String::from_str(Str::new("m"));
     msg.push_byte(0x30);
-    const got: u64 = await ass_eat(msg.as_str().as_bytes());
+    const got: u64 = await ass_eat(msg.as_str());
     return got;
 }
 
@@ -1268,7 +1267,7 @@ function async_borrowed_str_from_a_string_local() -> Result<(), TestError> {
 /// CONTROL: a view of a static literal borrows no local at all, so it must keep
 /// working whatever the carry rule does.
 async function ass_borrow_static_literal() -> u64 {
-    const got: u64 = await ass_eat(Str::new("m0").as_bytes());
+    const got: u64 = await ass_eat(Str::new("m0"));
     return got;
 }
 

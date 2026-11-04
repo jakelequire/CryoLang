@@ -59,6 +59,7 @@ import compiler::diag::edit_distance::{ find_best_candidate };
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::diag::suggestion::{ Suggestion };
+import compiler::ast::node_locator::{ annotation_span };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::resolver::resolver::{ Resolver };
@@ -128,6 +129,81 @@ type struct ImplementorStamp {
 implement trait Walk for struct ImplementorStamp {
     walk_scope_resolution(mut &this, e: mut ExpressionNode*, node: mut ScopeResolutionExpr*) -> void {
         node.name_implementor(this.owner, &this.params, e.span);
+    }
+}
+
+/// The walk that refuses the slice item written as a value (E0252).  A
+/// slice is only borrowed: in a written type it stands directly under a `&`
+/// or `mut &` and nowhere else - not as a binding's, a field's, a
+/// parameter's or a return's own type, not as a type argument, not as a
+/// pointer's pointee.  A slice reference is the slice's two words, so no
+/// slice needs storage of its own to be referred to.  `slice` is the
+/// claimed item, never a name.
+type struct SliceValueCheck {
+    ctx:   mut CompilationContext*;
+    slice: DefId;
+
+    /// `ann` and every type it is built from; `borrowed` when `ann` is the
+    /// referent of a `&` or `mut &`.
+    check(mut &this, ann: TypeAnnotation*, borrowed: boolean) -> void {
+        if (ann == null) { return; }
+        match (*ann) {
+            TypeAnnotation::Named(n) => {
+                if (n != null && !borrowed) { this.refuse_if_slice(n, ann); }
+            }
+            TypeAnnotation::Generic(g) => {
+                if (g == null) { return; }
+                match (*g.base) {
+                    TypeAnnotation::Named(base) => { if (!borrowed) { this.refuse_if_slice(base, ann); } }
+                    _                           => { this.check(g.base, false); }
+                }
+                for (mut i: i64 = 0; i < g.args.length(); i++) { this.check(g.args[i], false); }
+            }
+            TypeAnnotation::Reference(r) => { if (r != null) { this.check(r.inner, true); } }
+            TypeAnnotation::Pointer(p)   => { if (p != null) { this.check(p.inner, false); } }
+            TypeAnnotation::Array(a)     => { if (a != null) { this.check(a.element, false); } }
+            TypeAnnotation::Tuple(t) => {
+                if (t != null) {
+                    for (mut i: i64 = 0; i < t.elements.length(); i++) { this.check(t.elements[i], false); }
+                }
+            }
+            TypeAnnotation::Function(f) => {
+                if (f != null) {
+                    for (mut i: i64 = 0; i < f.parameters.length(); i++) { this.check(f.parameters[i], false); }
+                    this.check(f.return_type, false);
+                }
+            }
+            TypeAnnotation::Object(o) => { if (o != null) { this.check(o.trait_annotation, false); } }
+            TypeAnnotation::ImplTrait(it) => {
+                if (it != null) {
+                    for (mut i: i64 = 0; i < it.bounds.length(); i++) { this.check(it.bounds[i], false); }
+                }
+            }
+            TypeAnnotation::Projection(p) => { if (p != null) { this.check(p.base, false); } }
+            _ => { }
+        }
+    }
+
+    /// E0252 at `written` when `name` is the slice item.
+    refuse_if_slice(mut &this, name: NamedAnnotation*, written: TypeAnnotation*) -> void {
+        const d: DefId = match (name.res) {
+            ResSlot::Answered(r) => { r.def_id() }
+            _                    => { DefId::invalid() }
+        };
+        if (!d.is_valid() || !d.equals(this.slice)) { return; }
+        const shown: string = this.ctx.intern_table.shown(this.ctx.defs.leaf_of(d));
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0252_SLICE_HELD_AS_VALUE,
+            fmt::format("a `%s` is only borrowed, never held as a value", shown));
+        diag = diag.at_with_label(annotation_span(written), "a slice held by value");
+        diag = diag.help(fmt::format("write `&%s<T>` to read its elements, or `mut &%s<T>` to write them",
+            shown, shown));
+        this.ctx.emit_diagnostic(diag);
+    }
+}
+
+implement trait Walk for struct SliceValueCheck {
+    walk_annotation(mut &this, ann: TypeAnnotation*) -> void {
+        this.check(ann, false);
     }
 }
 
@@ -3886,6 +3962,10 @@ type struct TypeResolutionPasses {
 
         // -- Phase 4: Register declarations in the DeclarationIndex, and
         //    resolve and register top-level global variables
+        mut slice_values: SliceValueCheck = SliceValueCheck {
+            ctx:   ctx,
+            slice: ctx.get_generic_registry().wellknown(LangItem::Slice),
+        };
         for (mut i: i64 = 0; i < root.statements.length(); i++) {
             const stmt: DeclarationNode* = root.statements[i].as_decl();
             if (stmt == null) { continue; }
@@ -3893,6 +3973,7 @@ type struct TypeResolutionPasses {
             // Register in DeclarationIndex (shared logic with Specialization).
             TypeResolutionPasses::register_decl_in_index(stmt, ctx, true);
             TypeResolutionPasses::refuse_private_in_signatures(stmt, ctx);
+            slice_values.walk_decl(stmt);
 
             // Phase 4-specific: resolve and register top-level global variables
             const var_node: mut VarDecl* = DeclarationNode::var_of(stmt);
