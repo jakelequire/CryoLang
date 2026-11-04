@@ -304,25 +304,8 @@ implement struct Parser {
         // expression - exactly where the user expects it.  When there's
         // no prior token (start of input), fall through to the unadorned
         // error so we don't synthesise a span at column 0.
-        mut anchor_line: u32 = 0;
-        mut anchor_col:  u32 = 0;
-        mut found_prev:  boolean = false;
-        mut idx: i64 = this.pos - 1;
-        while (idx >= 0 && idx < this.tokens.length()) {
-            const k: TokenType = this.tokens[idx].kind;
-            if (k == TokenType::Comment
-                    || k == TokenType::DocCommentLine
-                    || k == TokenType::DocCommentBlock) {
-                idx -= 1;
-                continue;
-            }
-            const prev: Token = this.tokens[idx];
-            anchor_line = prev.line as u32;
-            anchor_col  = prev.column as u32 + prev.source_length as u32;
-            found_prev  = true;
-            break;
-        }
-        if (!found_prev) {
+        const insert_span: SourceSpan = this.end_of_last_consumed();
+        if (!insert_span.has_location()) {
             this.report_error(ErrorCode::E0100_EXPECTED_TOKEN, message);
             return;
         }
@@ -332,10 +315,6 @@ implement struct Parser {
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0100_EXPECTED_TOKEN, message);
         diag = diag.at(this.current_span());
-        const insert_span: SourceSpan = SourceSpan::new(
-            this.source_file,
-            anchor_line, anchor_col,
-            anchor_line, anchor_col);
         diag = diag.suggest(Suggestion::machine_applicable(
             insert_span, literal,
             fmt::format("insert `%s` here", literal)));
@@ -395,6 +374,14 @@ implement struct Parser {
             idx -= 1;
         }
         return idx;
+    }
+
+    /// The zero-width point just after the last token consumed, where text
+    /// written after it goes; no location before the first token.
+    end_of_last_consumed(&this) -> SourceSpan {
+        const idx: i64 = this.last_consumed_index();
+        if (idx < 0 || idx >= this.tokens.length()) { return SourceSpan::none(); }
+        return this.span_from_token(this.tokens[idx]).end_point();
     }
 
     /// The index of `tok`, a token already consumed: the one at its line

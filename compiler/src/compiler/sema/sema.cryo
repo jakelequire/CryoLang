@@ -2421,13 +2421,18 @@ type struct SemaVisitor {
         if (!map.valid) { return false; }
         const lang_def: DefId = this.ctx.generic_registry.wellknown(map.lang);
         if (!lang_def.is_valid()) { return false; }
-        if (this.refuse_unlicensed_operand(op, map, lang_def, lhs, span)) { return true; }
+        const right: TypeRef = if (unary) { TypeRef::invalid() } else { rhs };
+        if (this.refuse_unlicensed_operand(op, map, lang_def, lhs, right, true, span)) { return true; }
         if (unary) { return false; }
-        return this.refuse_unlicensed_operand(op, map, lang_def, rhs, span);
+        return this.refuse_unlicensed_operand(op, map, lang_def, rhs, TypeRef::invalid(), false, span);
     }
 
+    /// The refusal of `ty`, an operand of `op` its bounds do not license.
+    /// The left operand, `receives`, is the one the operator's trait is
+    /// implemented by, so its refusal carries the bound that licenses it;
+    /// `right` is the right operand's type, invalid for a unary operator.
     refuse_unlicensed_operand(mut &this, op: TokenType, map: OperatorTraitMap, lang_def: DefId,
-                              ty: TypeRef, span: SourceSpan) -> boolean {
+                              ty: TypeRef, right: TypeRef, receives: boolean, span: SourceSpan) -> boolean {
         const t: Type* = this.arena.lookup(ty);
         if (t == null || t.kind == TypeKind::Pointer) { return false; }
         const param: GenericParamType* = this.binding.receiver_type_param(ty);
@@ -2459,9 +2464,61 @@ type struct SemaVisitor {
             diag = diag.with_note(fmt::format(
                 "`%s` is bounded by %s; none of them is `%s` or has it as a supertrait", shown, listed, trait_path));
         }
-        diag = diag.help(fmt::format("add the bound: `where %s: %s`", shown, trait_path));
-        this.ctx.emit_diagnostic(diag);
+        // An operator's trait takes the right operand's type, when there is
+        // one, then the result's.  The result is taken to be the parameter
+        // itself, which is a guess, so a bound with arguments may be wrong.
+        const trait_decl: TraitDecl* = this.ctx.generic_registry.lang_trait_decl(map.lang);
+        const arity: i64 = if (trait_decl == null) { -1 } else { trait_decl.generic_params.length() };
+        const right_t: Type* = this.arena.lookup(right);
+        const right_text: string = if (right_t == null) { "" } else { this.arena.format_display(right_t) };
+        mut bound: string = trait_path;
+        mut applicability: Applicability = Applicability::MachineApplicable;
+        if (arity == 2 && right_text != "") {
+            bound = fmt::format("%s<%s, %s>", trait_path, right_text, shown);
+            applicability = Applicability::MaybeIncorrect;
+        } else if (arity == 1 && !right.is_valid()) {
+            bound = fmt::format("%s<%s>", trait_path, shown);
+            applicability = Applicability::MaybeIncorrect;
+        } else if (arity != 0) {
+            bound = "";
+        }
+        if (!receives || bound == "") {
+            diag = diag.help(fmt::format("add the bound: `where %s: %s`", shown, trait_path));
+            this.ctx.emit_diagnostic(diag);
+            return true;
+        }
+        this.ctx.emit_diagnostic(this.with_bound_fix(diag, param, shown, bound, applicability));
         return true;
+    }
+
+    /// `d`, a use of the type parameter `param` (spelled `shown`) that its
+    /// bounds do not allow, with the fix adding `bound` to the bounds of the
+    /// function being checked: after the parameter's own bound when one of
+    /// its `where` clause names it, as another bound of the clause when it
+    /// names others, or as a new clause after the signature.  A function
+    /// with no written signature to edit gets the bound as help instead.
+    /// Every use the one bound settles is one report.
+    with_bound_fix(&this, d: Diagnostic, param: GenericParamType*, shown: string, bound: string,
+                   applicability: Applicability) -> Diagnostic {
+        const func: FunctionDecl* = DeclarationNode::fn_of(this.state.symbolic_current_func);
+        if (func == null || !func.bounds_anchor.has_location()) {
+            return d.help(fmt::format("add the bound: `where %s: %s`", shown, bound));
+        }
+        mut at: SourceSpan = func.bounds_anchor;
+        mut text: string = if (func.trait_bounds.length() == 0) {
+            fmt::format(" where %s: %s", shown, bound)
+        } else {
+            fmt::format(", %s: %s", shown, bound)
+        };
+        for (mut i: i64 = 0; i < func.trait_bounds.length(); i++) {
+            if (!MethodBinding::bound_names_param(&func.trait_bounds[i], param)) { continue; }
+            at = func.trait_bounds[i].span.end_point();
+            text = fmt::format(" + %s", bound);
+        }
+        const r: Diagnostic = d.suggest(Suggestion::single(at, text,
+            fmt::format("add the bound `%s: %s`", shown, bound), applicability));
+        return r.caused_by(fmt::format("bound:%s:%u:%u:%s:%s", at.file, at.start_line, at.start_col, shown, bound),
+            fmt::format("`%s` is used in ways its bounds do not allow: it needs `%s: %s`", shown, shown, bound));
     }
 
     /// Warn when two DIFFERENT concrete numeric types meet in one operation.
