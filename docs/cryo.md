@@ -2481,7 +2481,12 @@ type.  `Array<T>`, `[T]` and `Slice<T>` are indexed this way: the standard
 library implements `Index` and `IndexMutable` for each once, generic over
 the index type `I` under `I: SliceIndex<T>`, a trait of its own that every
 integer type implements with `type Output = T`.  Each `xs[i]` binds `I` to
-the index's type, so it takes an index of any integer type; the methods are
+the index's type, so it takes an index of any integer type, and inside an
+implementation for one of them `this[i]` is the element in that
+implementation's own parameters (`T`), which a method called on it is
+selected for.  A type parameter is indexed only through a bound that gives
+it `Index`, and a type nothing indexes is refused at the `[]` (E0200), in a
+generic body as anywhere else; the methods are
 `![inline]`, so it costs no call; and an index at or past the length (a
 negative one included) panics.  `SliceIndex` is internal to the standard
 library: a program can neither name nor implement it, and an index of

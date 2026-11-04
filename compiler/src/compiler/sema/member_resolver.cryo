@@ -722,32 +722,27 @@ type struct MemberResolver {
 
         const result: TypeCheckResult = this.checker.check_index_access(array_type, index_type);
         if (result.success) { return result.result_type; }
+        // A type parameter a bound gives `Index` is indexed through that
+        // bound where it is written: the desugar's call is answered by the
+        // bound and records it, and every copy of the body carries that
+        // record.
         if (unresolved) {
-            // A type parameter a bound gives `Index` is indexed through that
-            // bound where it is written: the desugar's call is answered by
-            // the bound and records it, and every copy of the body carries
-            // that record.  A user aggregate carrying the parameters
-            // (`&Array<T>`) is indexed through its own implementation, here
-            // as for a concrete base: the copies specialize the call the
-            // desugar holds and build no desugar of their own.
             const bounded: mut ExpressionNode* = this.try_bounded_index(visitor, e, access, array_type);
             if (bounded != null) {
                 access.desugared_call = bounded;
                 return bounded.resolved_type;
             }
-            const owned: mut ExpressionNode* = this.try_index_overload(visitor, e, access, array_type);
-            if (owned != null) {
-                access.desugared_call = owned;
-                return owned.resolved_type;
-            }
-            return TypeRef::invalid();
         }
 
         // Index operator overloading: `check_index_access` rejected a base with
-        // no primitive indexing rule.  A concrete user aggregate (or a generic
-        // param bounded by `Index`) that implements `Index<Idx>` rewrites
-        // `a[i]` into `*(a.index(i))` - the deref of the returned `Output*` is a
-        // place, so the one desugar serves read / write / compound assignment.
+        // no primitive indexing rule.  A user aggregate that implements
+        // `Index<Idx>` rewrites `a[i]` into `*(a.index(i))` - the deref of the
+        // returned `Output*` is a place, so the one desugar serves read / write
+        // / compound assignment.  One carrying the walked body's parameters
+        // (`&Array<T>`) is indexed so as a concrete one is: the copies of the
+        // body specialize the call the desugar holds and build no desugar of
+        // their own.  A base nothing indexes is refused here whether or not
+        // it names parameters; left untyped, any declared type would accept it.
         // Fixed arrays, strings, pointers and references to them all succeed
         // above and never reach here.
         const snap: DiagnosticSnapshot = this.ctx.diagnostics.snapshot();
@@ -806,7 +801,17 @@ type struct MemberResolver {
                 && t.kind != TypeKind::Enum && t.kind != TypeKind::InstantiatedType) {
             return null;
         }
-        if (this.trait_checker().select_impl(index_id, base_ty, 0) == null) { return null; }
+        // A base written in the walked body's own parameters (`Array<T, A>`
+        // inside an implementation for it) has an implementation whose
+        // where-clause only the bounds in scope can confirm (`A: Allocator`),
+        // and the desugar's call is selected against those bounds, refusing
+        // a clause they do not give.  The trait checker knows no scope, so it
+        // is asked only of a concrete base.
+        if (this.types.contains_generic_param(base_ty)) {
+            if (this.ctx.generic_registry.heads_for(index_id, base_ty, this.intern).length() == 0) { return null; }
+        } else if (this.trait_checker().select_impl(index_id, base_ty, 0) == null) {
+            return null;
+        }
         return this.build_index_desugar(visitor, e, access);
     }
 
@@ -871,6 +876,15 @@ type struct MemberResolver {
             rdepth += 1;
         }
         if (t == null) { return false; }
+        // A type parameter is indexed only through a bound that gives it
+        // `Index`; none in scope does.
+        if (t.kind == TypeKind::GenericParam) {
+            const param_name: string = this.arena.format_display(t);
+            this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH,
+                fmt::format("`%s` cannot be indexed with `[]`; no bound in scope gives it `Index<Idx>`",
+                    param_name), span);
+            return true;
+        }
         const is_user: boolean = t.kind == TypeKind::Struct
                               || t.kind == TypeKind::Enum || t.kind == TypeKind::InstantiatedType;
         if (!is_user) { return false; }

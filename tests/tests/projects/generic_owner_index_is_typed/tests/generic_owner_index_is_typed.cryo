@@ -1,0 +1,137 @@
+///! Inside an implementation for a generic type, `this[i]` is the element
+///! and `this.index(i)` the pointer to it, typed in the implementation's own
+///! parameters.  The index's implementation writes its index type as a
+///! parameter of its own (`implement<T, I> trait Index<I> for struct
+///! Slice<T>`), which the call binds; the element type is what that binding
+///! gives.  So the element is stored and read as the element type, and a
+///! method called on it is the element type's.
+
+![config(testing)]
+namespace GenericOwnerIndexIsTyped::Tests;
+
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::core::hash::{ Hash, Hasher, DefaultHasher };
+import std::collections::array::{ Array };
+import std::alloc::allocator::{ Allocator };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_eq };
+
+type struct Point {
+    x: i64;
+    y: i64;
+}
+
+type trait Picks<T> {
+    pick(&this, at: i64) -> &T;
+}
+
+implement<T> trait Picks<T> for struct Slice<T> {
+    pick(&this, at: i64) -> &T {
+        const element: &T = &this[at];
+        return element;
+    }
+}
+
+type trait Points<T> {
+    point_at(&this, at: i64) -> T*;
+}
+
+implement<T> trait Points<T> for struct Slice<T> {
+    point_at(&this, at: i64) -> T* {
+        const pointer: T* = this.index(at);
+        return pointer;
+    }
+}
+
+implement<T, A> trait Points<T> for struct Array<T, A> where A: Allocator {
+    point_at(&this, at: i64) -> T* {
+        const pointer: T* = this.index(at);
+        return pointer;
+    }
+}
+
+type trait Digestible {
+    digest_into<H>(&this, hasher: mut &H) -> void where H: Hasher;
+}
+
+implement<T> trait Digestible for struct Slice<T> where T: Hash {
+    digest_into<H>(&this, hasher: mut &H) -> void
+    where H: Hasher {
+        for (mut i: i64 = 0; i < this.length(); i++) {
+            this[i].hash(hasher);
+        }
+    }
+}
+
+implement<T, A> trait Digestible for struct Array<T, A> where T: Hash, A: Allocator {
+    digest_into<H>(&this, hasher: mut &H) -> void
+    where H: Hasher {
+        for (mut i: i64 = 0; i < this.length(); i++) {
+            this[i].hash(hasher);
+        }
+    }
+}
+
+![test]
+function element_of_a_slice_is_read_as_the_element_type() -> Result<(), TestError> {
+    const narrow: [i32; 3] = [7, 8, 9];
+    const narrow_view: &Slice<i32> = &narrow;
+    expect_eq(*narrow_view.pick(1), 8)?;
+    const wide: [u64; 3] = [70000000000, 80000000000, 90000000000];
+    const wide_view: &Slice<u64> = &wide;
+    return expect_eq(*wide_view.pick(2), 90000000000);
+}
+
+![test]
+function element_of_a_slice_is_a_whole_aggregate() -> Result<(), TestError> {
+    const points: [Point; 2] = [Point { x: 1, y: 2 }, Point { x: 3, y: 4 }];
+    const view: &Slice<Point> = &points;
+    const second: &Point = view.pick(1);
+    expect_eq(second.x, 3)?;
+    return expect_eq(second.y, 4);
+}
+
+![test]
+function index_of_a_slice_points_at_the_element() -> Result<(), TestError> {
+    const values: [i64; 3] = [5, 6, 7];
+    const view: &Slice<i64> = &values;
+    return expect_eq(*view.point_at(2), 7);
+}
+
+![test]
+function index_of_an_array_points_at_the_element() -> Result<(), TestError> {
+    mut values: Array<u64> = Array::<u64>::new();
+    values.push(11);
+    values.push(90000000000);
+    expect_eq(*values.point_at(1), 90000000000)?;
+    return expect_eq(*values.point_at(0), 11);
+}
+
+![test]
+function method_on_an_element_is_the_element_types() -> Result<(), TestError> {
+    const values: [i32; 3] = [4, 5, 6];
+    const view: &Slice<i32> = &values;
+    mut through_owner: DefaultHasher = DefaultHasher::new();
+    view.digest_into(&through_owner);
+    mut direct: DefaultHasher = DefaultHasher::new();
+    values[0].hash(&direct);
+    values[1].hash(&direct);
+    values[2].hash(&direct);
+    return expect_eq(through_owner.finish(), direct.finish());
+}
+
+![test]
+function method_on_an_array_element_is_the_element_types() -> Result<(), TestError> {
+    mut values: Array<u64> = Array::<u64>::new();
+    values.push(90000000000);
+    values.push(3);
+    mut through_owner: DefaultHasher = DefaultHasher::new();
+    values.digest_into(&through_owner);
+    mut direct: DefaultHasher = DefaultHasher::new();
+    const first: u64 = 90000000000;
+    const second: u64 = 3;
+    first.hash(&direct);
+    second.hash(&direct);
+    return expect_eq(through_owner.finish(), direct.finish());
+}
