@@ -118,6 +118,10 @@ type struct ProjSpec {
     /// `fails` and appends `error[E0200]` to `output_contains`.
     output_contains: [string];
     output_excludes: [string];
+    /// Every entry must appear in the combined output after the previous
+    /// entry: the order of what is printed, which `output_contains` cannot
+    /// say.
+    output_in_order: [string];
     /// Environment prerequisites (test.json `requires`): the project runs only
     /// where every token holds, and is otherwise SKIPPED with a reason (not a
     /// failure).  Recognized tokens: `"display"` (an X11/Wayland display is
@@ -154,7 +158,7 @@ type struct ProjSpec {
     static empty() -> ProjSpec {
         return ProjSpec {
             outcome: 0, ignore: false, exit_code: 0, fails: false, stdout_sub: "",
-            output_contains: [], output_excludes: [], requires: [],
+            output_contains: [], output_excludes: [], output_in_order: [], requires: [],
             environment: [], arguments: [], stderr_contains: [], stderr_excludes: [],
             stdout_line_prefixes: [], stderr_line_prefixes: [],
             file: "", file_contains: [], file_excludes: []
@@ -2344,6 +2348,7 @@ type struct Executor {
                 }
                 Executor::read_strings(ep, "output_contains", &spec.output_contains);
                 Executor::read_strings(ep, "output_excludes", &spec.output_excludes);
+                Executor::read_strings(ep, "output_in_order", &spec.output_in_order);
                 Executor::read_strings(ep, "stderr_contains", &spec.stderr_contains);
                 Executor::read_strings(ep, "stderr_excludes", &spec.stderr_excludes);
                 Executor::read_strings(ep, "stdout_line_prefixes", &spec.stdout_line_prefixes);
@@ -2751,6 +2756,22 @@ type struct Executor {
                 if (out.contains(spec.output_excludes[i])) {
                     passed = false;
                     detail = fmt::format("output must not contain \"%s\"", spec.output_excludes[i]);
+                }
+            }
+            mut rest: string = out;
+            for (mut i: i64 = 0; passed && i < spec.output_in_order.length(); i++) {
+                const entry: string = spec.output_in_order[i];
+                const at: i64 = rest.find(entry);
+                if (at < 0) {
+                    passed = false;
+                    detail = if (i == 0) {
+                        fmt::format("output missing \"%s\"", entry)
+                    } else {
+                        fmt::format("output missing \"%s\" after \"%s\"", entry, spec.output_in_order[i - 1])
+                    };
+                } else {
+                    const past: i64 = at + (entry.length() as i64);
+                    rest = rest.substring(past as u32, ((rest.length() as i64) - past) as u32);
                 }
             }
             for (mut i: i64 = 0; passed && i < spec.stderr_contains.length(); i++) {

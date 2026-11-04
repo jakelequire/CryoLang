@@ -368,6 +368,9 @@ kept apart, so `expect` can say which stream a line belongs on:
 
 - `stderr_contains` / `stderr_excludes` - substrings of stderr alone
   (`output_contains` / `output_excludes` read both streams together);
+- `output_in_order` - substrings of both streams together, each after the
+  one before it: the order things are printed in, which a contains list
+  cannot say;
 - `stdout_line_prefixes` / `stderr_line_prefixes` - every non-empty line of
   that stream must start with one of these, so a line nobody expected fails
   the project whatever it says;

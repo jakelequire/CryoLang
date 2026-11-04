@@ -169,8 +169,11 @@ type struct DiagnosticSink {
     }
 
     /// The reports the collected diagnostics make: each diagnostic alone,
-    /// except that diagnostics sharing a cause and a fix are one report, at
-    /// the place the first of them was emitted.
+    /// except that diagnostics sharing a cause and a fix are one report,
+    /// headed at its earliest place.  They are in the order of where each
+    /// is headed in the source - file, line, column - whatever order the
+    /// stages emitted them in; reports headed at one place, and those with
+    /// no place, which come last, keep their emission order.
     reports(&this) -> [Diagnostic] {
         mut taken: [boolean] = [];
         for (mut i: i64 = 0; i < this.diagnostics.length(); i++) { taken.push(false); }
@@ -189,7 +192,13 @@ type struct DiagnosticSink {
                 out.push(Diagnostic::report_of(sites));
             }
         }
-        return out;
+        mut ordered: [Diagnostic] = [];
+        for (mut k: i64 = 0; k < out.length(); k++) {
+            mut at: i64 = ordered.length();
+            while (at > 0 && out[k].span.starts_before(&ordered[at - 1].span)) { at -= 1; }
+            ordered.insert(at, out[k].clone());
+        }
+        return ordered;
     }
 
     /// The number of error reports `reports` makes.
@@ -202,10 +211,10 @@ type struct DiagnosticSink {
         return count;
     }
 
-    /// Render every collected diagnostic, non-errors first then errors,
-    /// so errors land at the tail right above the abort summary where
-    /// they're most visible. Within each group, emission order is
-    /// preserved. Call this once at the end of compilation, before
+    /// Render every collected report, non-errors first then errors, so
+    /// errors land at the tail right above the abort summary where they're
+    /// most visible.  Within each group, reports are in source order (see
+    /// `reports`).  Call this once at the end of compilation, before
     /// print_summary, to flush the deferred terminal output.
     flush(mut &this) -> void {
         // Dropped vendor warnings stay recoverable without costing the ordinary
