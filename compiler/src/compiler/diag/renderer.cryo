@@ -1238,9 +1238,114 @@ type struct DiagRenderer {
         this.print_message(out, sug.message, "");
         DiagSink::emit_raw(out, "\n");
 
-        for (mut i: i64 = 0; i < sug.parts.length(); i++) {
-            this.render_suggestion_part(sug.parts[i]);
+        // The edits a fix makes to one source line are drawn as that line
+        // with all of them made: drawn apart, each copy of the line shows
+        // only part of the change.
+        mut i: i64 = 0;
+        while (i < sug.parts.length()) {
+            const head: SuggestionPart = sug.parts[i];
+            mut line_parts: [SuggestionPart] = [];
+            line_parts.push(head);
+            mut j: i64 = i + 1;
+            while (j < sug.parts.length()) {
+                const next: SuggestionPart = sug.parts[j];
+                const one_line: boolean = head.span.has_location() && next.span.has_location()
+                    && head.span.file == next.span.file
+                    && head.span.start_line == head.span.end_line
+                    && next.span.start_line == next.span.end_line
+                    && next.span.start_line == head.span.start_line
+                    && !head.replacement.contains("\n") && !next.replacement.contains("\n");
+                if (!one_line) { break; }
+                line_parts.push(next);
+                j += 1;
+            }
+            if (line_parts.length() == 1) {
+                this.render_suggestion_part(head);
+            } else {
+                this.render_suggestion_line(line_parts);
+            }
+            i = j;
         }
+    }
+
+    /// Render several edits to one source line, in source order and not
+    /// overlapping, as the line with all of them made, a glyph run under
+    /// each (see `render_suggestion_part` for the glyphs).
+    render_suggestion_line(mut &this, parts: [SuggestionPart]) -> void {
+        const blue:  string = this.color_blue();
+        const green: string = this.color_green();
+        const reset: string = this.color_reset();
+        const bold:  string = this.color_bold();
+        const out: void* = this.out;
+        const first: SuggestionPart = parts[0];
+        this.load_source(first.span.file);
+        const orig_line: string = this.get_line(first.span.file, first.span.start_line);
+        if (orig_line == "") {
+            for (mut k: i64 = 0; k < parts.length(); k++) { this.render_suggestion_part(parts[k]); }
+            return;
+        }
+        // Spliced from the right, so the columns of the parts left of each
+        // splice still hold.
+        mut patched_line: String = DiagRenderer::splice_replacement(orig_line,
+            parts[parts.length() - 1].span.start_col, parts[parts.length() - 1].span.end_col,
+            parts[parts.length() - 1].replacement);
+        for (mut k: i64 = parts.length() - 2; k >= 0; k--) {
+            patched_line = DiagRenderer::splice_replacement(patched_line.as_cstr() as string,
+                parts[k].span.start_col, parts[k].span.end_col, parts[k].replacement);
+        }
+        const patched: string = patched_line.as_cstr() as string;
+        const line_width: u32 = this.line_number_width(first.span.start_line);
+
+        this.render_margin(line_width);
+        DiagSink::emit_raw(out, this.lead());
+        DiagSink::emit_raw(out, bold);
+        DiagSink::emit_raw(out, blue);
+        DiagSink::emit_uint(out, first.span.start_line as u64, line_width as i32);
+        DiagSink::emit_raw(out, reset);
+        DiagSink::emit_raw(out, " ");
+        DiagSink::emit_raw(out, blue);
+        DiagSink::emit_raw(out, "|");
+        DiagSink::emit_raw(out, reset);
+        DiagSink::emit_raw(out, " ");
+        this.print_source_line(out, patched);
+        DiagSink::emit_raw(out, "\n");
+
+        this.emit_gutter_blank(out, line_width, " ");
+        // A part's column in the patched line is its own, moved by what the
+        // parts left of it added or removed.
+        mut shift: i64 = 0;
+        mut cursor: u32 = 0;
+        for (mut k: i64 = 0; k < parts.length(); k++) {
+            const part: SuggestionPart = parts[k];
+            const span_len: i64 = if (part.span.end_col > part.span.start_col) {
+                (part.span.end_col - part.span.start_col) as i64
+            } else {
+                0
+            };
+            const repl_len: i64 = part.replacement.length() as i64;
+            mut glyph: string = "~";
+            if (span_len > 0 && repl_len == 0)      { glyph = "-"; }
+            else if (span_len == 0 && repl_len > 0) { glyph = "+"; }
+            const at: u32 = ((part.span.start_col as i64) + shift) as u32;
+            const visual_start: u32 = DiagRenderer::byte_col_to_visual(patched, at);
+            const ul_start: u32 = if (visual_start > 0) { visual_start - 1 } else { 0 };
+            const ul_len: u32 = if (repl_len > 0) {
+                DiagRenderer::byte_range_visual_width(patched, at, at + repl_len as u32)
+            } else {
+                1
+            };
+            while (cursor < ul_start) {
+                DiagSink::emit_raw(out, " ");
+                cursor += 1;
+            }
+            DiagSink::emit_raw(out, bold);
+            DiagSink::emit_raw(out, green);
+            for (mut t: u32 = 0; t < ul_len; t++) { DiagSink::emit_raw(out, glyph); }
+            DiagSink::emit_raw(out, reset);
+            cursor = ul_start + ul_len;
+            shift += repl_len - span_len;
+        }
+        DiagSink::emit_raw(out, "\n");
     }
 
     /// Render one (span, replacement) edit as a patched source-line
