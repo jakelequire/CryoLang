@@ -566,20 +566,23 @@ type struct AsyncLower {
     /// Put the DECLARED return type back on a pending `async` node for the
     /// duration of its body walk, and return what was displaced.
     ///
-    /// Only a METHOD needs this. A free function's callers resolve through the
-    /// declaration index, so `declare` can repoint the index and hand the node
-    /// straight back to the body check. A method's callers resolve through the
-    /// NODE, so `declare` has to leave the future type on it — otherwise a
-    /// caller whose body is typed before the callee's own (the callee declared
-    /// lower in the type) sees the declared Output and reports that it does not
-    /// implement `Future`. The body's `return`s still produce the Output, so
-    /// that type is swapped back in here and out again by `end_body_check`.
+    /// A method and a generic function need this. A non-generic free
+    /// function's callers resolve through the declaration index, so `declare`
+    /// can repoint the index and hand the node straight back to the body
+    /// check. A method's callers, and a generic function's, read the NODE (a
+    /// generic call substitutes into the template's own return), so `declare`
+    /// has to leave the future type on it — otherwise a caller whose body is
+    /// typed before the callee's own sees the declared Output and reports that
+    /// it does not implement `Future`, and a callee whose lowering is refused
+    /// leaves its callers holding the Output. The body's `return`s still
+    /// produce the Output, so that type is swapped back in here and out again
+    /// by `end_body_check`.
     ///
-    /// Invalid (and a no-op) for anything that is not a pending `async` method.
+    /// Invalid (and a no-op) for anything else.
     begin_body_check(mut &this, node_decl: DeclarationNode*) -> TypeRef {
         const node: mut FunctionDecl* = DeclarationNode::fn_of(node_decl);
         const i: i64 = this.pending_index(node_decl);
-        if (i < 0 || !this.pending[i].ok || this.pending[i].method == null) {
+        if (i < 0 || !this.pending[i].ok || (this.pending[i].method == null && !this.pending[i].generic)) {
             return TypeRef::invalid();
         }
         const displaced: TypeRef = node.resolved_return_type;
@@ -7809,14 +7812,16 @@ type struct AsyncLower {
         } else {
             // Retire the stale Output-return entry first so only the
             // struct-return signature answers for this declaration; its
-            // sibling overloads keep their own entries.  The node itself
+            // sibling overloads keep their own entries.  A non-generic node
             // carries the struct type only for the duration of the
             // registration, which reads it off the node; the DECLARED type
             // goes back afterwards, because the body is still typed and
-            // `check_function_returns`-checked against it.
+            // `check_function_returns`-checked against it.  A generic one's
+            // callers read the node, so it keeps the future type, as a
+            // method's does.
             this.ctx.decl_index.retire_entry(node.overload_entry);
             TypeResolutionPasses::register_decl_in_index(node_decl, this.ctx, true);
-            node.set_resolved_return_type(declared_ref);
+            if (!generic) { node.set_resolved_return_type(declared_ref); }
         }
 
         d.poll_fn     = poll_fn_decl;

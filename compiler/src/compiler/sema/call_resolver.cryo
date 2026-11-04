@@ -2448,9 +2448,12 @@ type struct CallResolver {
     /// `tmpl` failed, and whether it did: two arguments that bind one
     /// parameter to different types, or arguments that leave one unbound.  A
     /// call with no arguments that leaves one unbound is not reported here:
-    /// what fixes such a parameter, if anything, is the call's context; nor
-    /// is an unjudged inference, whose open parameter an argument nothing
-    /// typed, or a where-bound, may hold.
+    /// what fixes such a parameter, if anything, is the call's context.  An
+    /// unjudged inference, whose open parameter an argument nothing typed,
+    /// or a where-bound, may hold, is reported only by the where-bounds
+    /// themselves: a bound subject that implements the bound's trait at no
+    /// arguments at all is E0306, and one that has an implementation is
+    /// left to whatever broke its projection.
     failed_inference_reported(mut &this, call_e: ExpressionNode*, call: CallExpr*, entry: const TemplateEntry*,
                               inference: &CallInference) -> boolean {
         const tmpl: FunctionDecl* = DeclarationNode::fn_of(entry.ast_node);
@@ -2460,7 +2463,9 @@ type struct CallResolver {
             return true;
         }
         if (inference.all_bound() || call.arguments.length() == 0) { return false; }
-        if (inference.misfit < 0 && inference.unjudged) { return false; }
+        if (inference.misfit < 0 && inference.unjudged) {
+            return !this.check_call_where_bounds(call_e.span, entry.ast_node, &entry.param_syms, &inference.bindings);
+        }
         this.emit_unbound_from_arguments(call_e, call, tmpl, inference.misfit);
         return true;
     }
@@ -6017,7 +6022,9 @@ type struct CallResolver {
     /// and types share one namespace, so a segment is never both, and the
     /// stores of the other kind are not asked.
     /// `claimed` is set when the owner the segment names declares the
-    /// member (`try_resolve_static_method`).
+    /// member (`try_resolve_static_method`), and when the module it names
+    /// declares the function and the call to it is refused
+    /// (`resolve_module_qualified_function`).
     resolve_scope_call(mut &this, visitor: mut SemaVisitor*, scope: mut ScopeResolutionExpr*, call_e: ExpressionNode*,
                        call: mut CallExpr*, claimed: mut boolean*) -> TypeRef {
         mut names_module: boolean = false;
@@ -6029,8 +6036,8 @@ type struct CallResolver {
             _           => { }
         }
         if (names_module) {
-            const fn_ret: TypeRef = this.try_resolve_module_function(scope, call_e, call);
-            if (fn_ret.is_valid()) { return fn_ret; }
+            const fn_ret: TypeRef = this.try_resolve_module_function(scope, call_e, call, claimed);
+            if (fn_ret.is_valid() || *claimed) { return fn_ret; }
         } else {
             // A segment written with arguments (`Wrap::<i32>::make()`) is
             // asked as the instantiation they make of its template, by that
@@ -9406,8 +9413,10 @@ type struct CallResolver {
         return this.ctx.generic_registry.instantiate(base_ref, &bindings);
     }
 
-    try_resolve_module_function(mut &this, scope: ScopeResolutionExpr*, call_e: ExpressionNode*, call: mut CallExpr*) -> TypeRef {
-        const q_ret: TypeRef = this.resolve_module_qualified_function(scope.scope_name, scope.member_name, call_e, call, scope);
+    try_resolve_module_function(mut &this, scope: ScopeResolutionExpr*, call_e: ExpressionNode*, call: mut CallExpr*,
+                                claimed: mut boolean*) -> TypeRef {
+        const q_ret: TypeRef = this.resolve_module_qualified_function(scope.scope_name, scope.member_name, call_e, call, scope,
+            claimed);
         if (q_ret.is_valid()) { call.callee.set_resolved_type(q_ret); return q_ret; }
         return TypeRef::invalid();
     }
@@ -9479,8 +9488,12 @@ type struct CallResolver {
     ///
     /// `call` is for the visibility gate and the template specialization below
     /// it, not for choosing the module - that question is already answered.
+    /// `claimed` is set when the call to the function the module declares is
+    /// refused and reported here, so the path is not reported as naming
+    /// nothing as well.
     resolve_module_qualified_function(mut &this, scope_name: SymbolStr, member_name: SymbolStr,
-                                      call_e: ExpressionNode*, call: mut CallExpr*, scope: ScopeResolutionExpr*) -> TypeRef {
+                                      call_e: ExpressionNode*, call: mut CallExpr*, scope: ScopeResolutionExpr*,
+                                      claimed: mut boolean*) -> TypeRef {
         const callee: DefId = this.resolve_module_qualified_def(scope);
         if (!callee.is_valid()) { return TypeRef::invalid(); }
         const ret: TypeRef = this.overload_return_type(this.ctx.decl_index.func_type_of_def(callee));
@@ -9542,7 +9555,10 @@ type struct CallResolver {
                 const tfn: FunctionDecl* = DeclarationNode::fn_of(tfn_decl);
                 if (tfn != null && tmpl.param_types.length() > 0 && tfn.parameters.length() == call.arguments.length()) {
                     const inference: CallInference = this.infer_call_bindings(call, tmpl, tfn_decl);
-                    if (this.failed_inference_reported(call_e, call, tmpl, &inference)) { return TypeRef::invalid(); }
+                    if (this.failed_inference_reported(call_e, call, tmpl, &inference)) {
+                        *claimed = true;
+                        return TypeRef::invalid();
+                    }
                     if (inference.all_bound()) {
                         mut stash: [TypeRef] = [];
                         for (mut i: i64 = 0; i < inference.bindings.length(); i++) { stash.push(inference.bindings[i]); }

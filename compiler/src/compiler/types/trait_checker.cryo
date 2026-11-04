@@ -298,7 +298,9 @@ type struct TraitChecker {
     /// trait written without arguments, and any trait on an object, whose
     /// implementations the compiler makes, is `type_implements_trait`'s.
     /// Null when every trait holds, and when an argument still names a
-    /// parameter, which the copy that binds it decides.
+    /// parameter, which the copy that binds it decides - unless the subject
+    /// is concrete and implements the trait at no arguments at all, which
+    /// no binding of the argument can change (`i32` for `F: Future<R>`).
     unmet_parameter_trait(&this, bound: const TraitBound*, subject: TypeRef, subst: TypeSubstitution*,
                           depth: i32) -> const TraitRef* {
         const subject_t: Type* = this.arena.lookup(subject);
@@ -314,7 +316,13 @@ type struct TraitChecker {
             mut args: [TypeRef] = [];
             for (mut ai: i64 = 0; ai < tr.argument_types.length(); ai++) {
                 const arg: TypeRef = subst.apply(tr.argument_types[ai], this.arena);
-                if (!arg.is_valid() || this.arena.contains_generic_param(arg)) { return null; }
+                if (!arg.is_valid() || this.arena.contains_generic_param(arg)) {
+                    if (this.arena.contains_generic_param(subject) || this.generic_registry == null
+                            || this.generic_registry.heads_for(tr.definition(), subject, this.intern_table).length() > 0) {
+                        return null;
+                    }
+                    return tr;
+                }
                 args.push(arg);
             }
             if (this.implementation_at_depth(tr.definition(), &args, subject, depth) == null) { return tr; }

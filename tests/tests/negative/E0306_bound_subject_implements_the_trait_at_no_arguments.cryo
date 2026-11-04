@@ -1,0 +1,63 @@
+// Compile-fail test: a generic call whose where-bound projects a type
+// parameter off a bound subject (`R` in `F: CfProduces<R>`), given a subject
+// that implements the bound's trait at no arguments at all, is refused at
+// the call for the unmet bound - through a bare call, a module's path and a
+// type's static method alike - rather than reaching code generation with
+// the parameter unbound.  The calls given a subject that implements the
+// trait, which binds `R` through its implementation, are the controls.
+![config(testing)]
+![config(negative, E0306)]
+namespace CryoTests::Negative::E0306BoundSubjectImplementsTheTraitAtNoArguments;
+
+import std::future;
+import std::future::poll::{ Poll };
+import std::future::waker::{ Context };
+import std::future::traits::{ Future };
+
+type trait CfProduces<R> {
+    produce(mut &this) -> R;
+}
+
+type struct CfCounter {
+    next: u64;
+}
+
+implement trait CfProduces<u64> for CfCounter {
+    produce(mut &this) -> u64 {
+        this.next = this.next + 1;
+        return this.next;
+    }
+}
+
+function cf_run<F, R>(source: F) -> R where F: CfProduces<R> {
+    mut held: F = source;
+    return held.produce();
+}
+
+type struct CfRunner {
+    static run<F, R>(source: F) -> R where F: CfProduces<R> {
+        mut held: F = source;
+        return held.produce();
+    }
+}
+
+type struct CfReady {
+    value: i32;
+}
+
+implement trait Future<i32> for CfReady {
+    poll(mut &this, cx: Context*) -> Poll<i32> {
+        return Poll::Ready(this.value);
+    }
+}
+
+function main() -> int {
+    const plain: i32 = 5;
+    cf_run(plain);                                     //~ ERROR[E0306] the trait bound
+    CfRunner::run(plain);                              //~ ERROR[E0306] the trait bound
+    future::block_on(plain);                           //~ ERROR[E0306] the trait bound
+    const counted: u64 = cf_run(CfCounter { next: 0 });
+    const run_counted: u64 = CfRunner::run(CfCounter { next: 1 });
+    const ready: i32 = future::block_on(CfReady { value: 7 });
+    return 0;
+}
