@@ -155,6 +155,17 @@ yet is recorded with the change that builds it, not here.
      `AsMutableSlice<T>` live in `core::slice`; `String.as_bytes()` gives a
      `&Slice<u8>` and `Str` stays a value.  (Jake)
 
+696. **A fixed array's reference converts to a slice reference, answered by
+     the compiler.**  No implementation can name `N`, so where a
+     `&Slice<T>` is wanted a `&[T; N]` or `mut &[T; N]` is the slice over
+     its `N` elements, and where a `mut &Slice<T>` is wanted a
+     `mut &[T; N]` is the slice that writes them - at the places and with
+     the refusals of the container conversion: read-only never becomes
+     writable (`E0251`), and a value or another element type does not
+     convert.  The slice is made from the array's address and `N`, never by
+     indexing it, so `[T; 0]` gives the empty slice; `for` over a fixed
+     array iterates that same slice.  (Jake)
+
 ### 2026-11-03
 
 690. **What releases or writes memory takes a writable pointer, and what

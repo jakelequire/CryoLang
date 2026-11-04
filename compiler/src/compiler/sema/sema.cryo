@@ -28,7 +28,7 @@ import compiler::diag::{
 import compiler::const_table::{ ConstEval, FoldedInteger };
 import compiler::ast::{
     cloner, declaration, expression, GenericAnnotation, ImplTraitAnnotation, LiteralKind,
-    MemberPin, NamedAnnotation, node, node_locator, ObjectForm, pattern, PatternBinding, PatternElement,
+    MemberPin, NamedAnnotation, node, node_locator, ObjectForm, pattern, PatternBinding, PatternElement, PointerAnnotation,
     statement, TraitRef, TypeAnnotation, Visibility
 };
 import compiler::passes::pass_id::{ PassResult, Provision };
@@ -1354,46 +1354,12 @@ type struct SemaVisitor {
             if (var_node.is_auto && init_type.is_valid() && var_node.initializer != null) {
                 const arr_t: Type* = this.arena.lookup(init_type);
                 if (arr_t != null && arr_t.kind == TypeKind::Array) {
-                    const at: ArrayType* = arr_t.as_array();
-                    {
-                        const orig_init: mut ExpressionNode* = var_node.initializer;
-                        const sp: SourceSpan = orig_init.span;
-                        const zero_lit: mut ExpressionNode* = ExpressionNode::literal("0", LiteralKind::Integer, sp);
-                        const idx: mut ExpressionNode* = ExpressionNode::array_access_expr(orig_init, zero_lit, sp);
-                        const amp_tok: Token = Token::new(TokenType::Amp, "&", sp.start_line as int, sp.start_col as int);
-                        const amp: mut ExpressionNode* =
-                            ExpressionNode::synthetic_unary(amp_tok, idx, sp);
-                        const n_str: string = fmt::format("%ld", at.size);
-                        const n_lit: mut ExpressionNode* = ExpressionNode::literal(n_str, LiteralKind::Integer, sp);
-                        const slice_sym: SymbolStr = this.intern.intern("Slice");
-                        const from_raw_sym: SymbolStr = this.intern.intern("from_raw");
-                        const sr_e: mut ExpressionNode* = ExpressionNode::scope_resolution_expr(slice_sym, from_raw_sym, sp);
-                        mut sr: mut ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(sr_e);
-                        // The reference is to the stdlib `Slice`, which the
-                        // prelude carries so this lowering can name it - the
-                        // one declaration it means, whatever the writing
-                        // module's own scope holds under that leaf.  A
-                        // synthesizer owes its node the definition it refers
-                        // to, and this one knows it without a lookup.
-                        sr.set_synthesized_res(
-                            this.ctx.generic_registry.wellknown(LangItem::Slice));
-                        mut elt_named: NamedAnnotation* = new NamedAnnotation {
-                            name: SymbolStr::empty(), span: sp, pre_resolved: at.element,
-                            res: ResSlot::Pending,
-                        };
-                        const elt_ann: mut TypeAnnotation* = new TypeAnnotation::Named(elt_named);
-                        mut gen_args: [mut TypeAnnotation*] = [];
-                        gen_args.push(elt_ann);
-                        sr.set_scope_generic_args(gen_args);
-                        mut call: mut ExpressionNode* = ExpressionNode::call_expr(sr_e, sp);
-                        // Nothing spells `Slice::from_raw(...)`: only the
-                        // array under its arguments is written here.
-                        call.generated = true;
-                        ExpressionNode::call_of(call).add_argument(amp);
-                        ExpressionNode::call_of(call).add_argument(n_lit);
-                        var_node.set_initializer(call);
-                        init_type = this.resolve_expr(var_node.initializer);
-                    }
+                    const orig_init: mut ExpressionNode* = var_node.initializer;
+                    const sp: SourceSpan = orig_init.span;
+                    const amp_tok: Token = Token::new(TokenType::Amp, "&", sp.start_line as int, sp.start_col as int);
+                    const reference: mut ExpressionNode* = ExpressionNode::synthetic_unary(amp_tok, orig_init, sp);
+                    var_node.set_initializer(this.fixed_array_slice(reference, arr_t.as_array(), false, sp));
+                    init_type = this.resolve_expr(var_node.initializer);
                 }
                 // The loop calls `Iterator::next` on this binding, so the
                 // scrutinee is an iterator when its type implements the
@@ -3528,6 +3494,17 @@ type struct SemaVisitor {
             return TraitConversionOutcome::Mismatch;
         }
         const writable: boolean = target.as_reference().is_mutable();
+        const referent: Type* = this.arena.lookup(source.as_reference().referent);
+        if (referent != null && referent.kind == TypeKind::Array) {
+            if (writable && !source.as_reference().is_mutable()) {
+                this.refuse_read_only_borrow(PlaceAccess::Borrow(expr), expr.span);
+                return TraitConversionOutcome::Refused;
+            }
+            const slice: mut ExpressionNode* = this.fixed_array_slice(expr, referent.as_array(), writable, expr.span);
+            const sliced: TypeRef = this.resolve_expr(slice);
+            if (!sliced.is_valid() || !this.checker.can_assign(sliced, to)) { return TraitConversionOutcome::Mismatch; }
+            return TraitConversionOutcome::Converted(slice);
+        }
         const registry: GenericRegistry* = this.ctx.generic_registry;
         const trait_id: DefId = registry.wellknown(if (writable) { LangItem::AsMutableSlice } else { LangItem::AsSlice });
         if (!trait_id.is_valid()) { return TraitConversionOutcome::Mismatch; }
@@ -3551,6 +3528,48 @@ type struct SemaVisitor {
         const made: TypeRef = this.resolve_expr(call);
         if (!made.is_valid() || !this.checker.can_assign(made, to)) { return TraitConversionOutcome::Mismatch; }
         return TraitConversionOutcome::Converted(call);
+    }
+
+    /// The slice over the elements of the fixed array `reference` refers
+    /// to: `Slice::from_raw(reference as T*, N)`, or
+    /// `Slice::from_raw_mutable(reference as mut T*, N)` when `writable`.  No
+    /// implementation can name `N`, so the compiler answers for a fixed
+    /// array where a container answers through `AsSlice`.  The array's
+    /// address is its first element's, so the reference is read once and
+    /// nothing indexes the array: a `[T; 0]` gives the empty slice.
+    fixed_array_slice(mut &this, reference: mut ExpressionNode*, array: ArrayType*, writable: boolean,
+                      span: SourceSpan) -> mut ExpressionNode* {
+        mut element_named: NamedAnnotation* = new NamedAnnotation {
+            name: SymbolStr::empty(), span: span, pre_resolved: array.element, res: ResSlot::Pending,
+        };
+        const element_pointer: mut TypeAnnotation* = new TypeAnnotation::Pointer(new PointerAnnotation {
+            inner: new TypeAnnotation::Named(element_named), is_const: !writable, span: span,
+        });
+        mut first: mut ExpressionNode* = ExpressionNode::cast_expr(reference, element_pointer, span);
+        first.generated = true;
+        const length: mut ExpressionNode* = ExpressionNode::literal(fmt::format("%ld", array.size), LiteralKind::Integer, span);
+        const constructor: string = if (writable) { "from_raw_mutable" } else { "from_raw" };
+        const path: mut ExpressionNode* = ExpressionNode::scope_resolution_expr(
+            this.intern.intern("Slice"), this.intern.intern(constructor), span);
+        mut scope: mut ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(path);
+        // The path means the slice language item, whatever the writing
+        // module's own scope holds under the leaf `Slice`: a synthesizer owes
+        // its node the definition it refers to, and this one knows it without
+        // a lookup.
+        scope.set_synthesized_res(this.ctx.generic_registry.wellknown(LangItem::Slice));
+        mut element_named_argument: NamedAnnotation* = new NamedAnnotation {
+            name: SymbolStr::empty(), span: span, pre_resolved: array.element, res: ResSlot::Pending,
+        };
+        mut generic_arguments: [mut TypeAnnotation*] = [];
+        generic_arguments.push(new TypeAnnotation::Named(element_named_argument));
+        scope.set_scope_generic_args(generic_arguments);
+        mut call: mut ExpressionNode* = ExpressionNode::call_expr(path, span);
+        // Nothing spells the call: only the array under its arguments is
+        // written here.
+        call.generated = true;
+        ExpressionNode::call_of(call).add_argument(first);
+        ExpressionNode::call_of(call).add_argument(length);
+        return call;
     }
 
     /// Convert `expr`, of type `from`, to the trait object `to`.  A borrowed

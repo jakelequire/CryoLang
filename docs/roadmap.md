@@ -41,10 +41,11 @@ language server".  From there, in order, to the v1.0 freeze:
    - `&this` enforced as read-only (D37), with const pointers following;
    - `Read` taking a `Slice`;
    - `Slice` finished: `s[i]`, `Eq`, borrowed-only `&Slice<T>` and
-     `mut &Slice<T>` with `AsSlice`/`AsMutableSlice` and the container
-     conversion are built; `Hash`, `s.slice(1..4)`, and `as_slice()` and
-     the conversion on fixed-size arrays (compiler-answered, since no
-     implementation can name `N`) are not;
+     `mut &Slice<T>` with `AsSlice`/`AsMutableSlice`, the container
+     conversion and the fixed-size array's conversion (compiler-answered,
+     since no implementation can name `N`) are built; `Hash`,
+     `s.slice(1..4)`, and `as_slice()` written on a fixed-size array are
+     not;
    - `implement Trait` in type position: the concrete type hidden, the
      return promise checked at the function, and a refusal of its own in
      parameters, fields, aliases and type arguments (rulings 428-430);
