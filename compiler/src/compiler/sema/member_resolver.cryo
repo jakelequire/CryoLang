@@ -141,7 +141,7 @@ type struct MemberResolver {
             }
             this.pin_field(member, &through,
                 if (member.member_span.has_location()) { member.member_span } else { member_e.span });
-            return through.ty;
+            return this.field_read_type(visitor, member.object, obj_type, &through);
         }
 
         // Tuple positional access (`t.0`); walks past pointer/reference/inst wrappers.
@@ -209,7 +209,7 @@ type struct MemberResolver {
         const fa: FieldAnswer = this.field_of(obj_type, member.member);
         if (fa.found()) {
             this.pin_field(member, &fa, acc_span);
-            return fa.ty;
+            return this.field_read_type(visitor, member.object, obj_type, &fa);
         }
 
         // Symbolic walk: an unwrapped `void`/abstract receiver - defer.
@@ -606,6 +606,30 @@ type struct MemberResolver {
             return true;
         }
         return false;
+    }
+
+    /// The type the field `fa` of `object`, of type `obj_type`, is read as:
+    /// the field's own type, except for the slice item's element pointer,
+    /// which is as writable as the place the slice is reached through.  A
+    /// slice's two words carry no mark of their own, so what may be done
+    /// with its elements is decided by how the slice is held: through a
+    /// `mut &Slice<T>`, the receiver of a `mut &this` method or a writable
+    /// binding the pointer, declared read-only, reads as a `mut T*`, and
+    /// through a `&Slice<T>`, a `&this` receiver or a `const` binding as the
+    /// read-only `T*` it is declared.
+    field_read_type(&this, visitor: SemaVisitor*, object: ExpressionNode*, obj_type: TypeRef,
+                    fa: &FieldAnswer) -> TypeRef {
+        const field: Type* = this.arena.lookup(fa.ty);
+        if (field == null || field.kind != TypeKind::Pointer || !field.as_pointer().const_pointee) { return fa.ty; }
+        mut held: TypeRef = obj_type;
+        mut inner: TypeRef = this.types.peel_indirection(held);
+        while (inner.is_valid()) {
+            held = inner;
+            inner = this.types.peel_indirection(held);
+        }
+        if (!this.arena.is_slice(held)) { return fa.ty; }
+        if (!visitor.access_within(object).is_writable()) { return fa.ty; }
+        return this.arena.get_pointer_to_q(field.as_pointer().pointee, false);
     }
 
     /// Record the field the door found on the access, and ask its

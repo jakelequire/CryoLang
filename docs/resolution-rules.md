@@ -133,6 +133,20 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-11-04
+
+694. **The slice's element pointer is as writable as the place the slice
+     is reached through.**  The slice item declares its element pointer
+     read-only, `T*`; read through a writable place - a `mut &Slice<T>`,
+     the receiver of a `mut &this` method, a writable binding, a
+     `mut Slice<T>*` - it is a `mut T*`, and through a `&Slice<T>`, a
+     `&this` receiver, a `const` binding or a `Slice<T>*` it is the `T*` it
+     is declared.  A slice's two words carry no mark of their own, so the
+     borrow decides whether its elements are written, and constructing a
+     slice from a read-only pointer needs no cast.  Which field is the
+     element pointer is the claimed slice item's pointer field, never a
+     name.  (Jake)
+
 ### 2026-11-03
 
 690. **What releases or writes memory takes a writable pointer, and what
