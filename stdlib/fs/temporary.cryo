@@ -1,0 +1,172 @@
+///! Temporary files and directories, removed when they are dropped.
+///!
+///!     const scratch: TempDirectory = TempDirectory::create()?;
+///!     File::write_text(scratch.path().join("input.txt").as_path(), "data")?;
+///!     // ... the directory and everything in it is removed here
+///!
+///! Each is created under `env::temp_directory()` with a name of random
+///! hex digits from `SecureRng`, and created exclusively - `O_EXCL` /
+///! `CREATE_NEW` for a file, a failing `mkdir` for a directory - so two
+///! processes never share one. A name already taken is retried with
+///! another. `keep` hands the path over and leaves the entry in place.
+
+namespace std::fs::temporary;
+
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::core::drop::{ Drop };
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::io::error::{ IoError, IoErrorKind };
+import std::io::fd;
+import std::random::secure::{ SecureRng };
+import std::env;
+import std::fs::path::{ Path, PathBuf };
+import std::fs::file::{ File, OpenOptions };
+import std::fs::directory::{ Directory };
+
+/// Names tried before creation gives up on finding an unused one.
+private const NAME_ATTEMPTS: i64 = 64;
+
+/// Random bytes in a name; each is two hex digits.
+private const NAME_BYTES: i64 = 8;
+
+/// A directory that is removed, with everything in it, when this value is
+/// dropped.
+public type struct TempDirectory {
+    private location: PathBuf;
+    private kept: boolean;
+
+    /// A new, empty directory under the temporary directory.
+    public static create() -> Result<TempDirectory, IoError> {
+        mut attempts: i64 = 0;
+        loop {
+            const candidate: PathBuf = TempDirectory::unused_name()?;
+            match (Directory::create(candidate.as_path())) {
+                Result::Ok(_) => {
+                    return Result::Ok(TempDirectory { location: candidate, kept: false });
+                }
+                Result::Err(error) => {
+                    attempts = attempts + 1;
+                    match (error.kind) {
+                        IoErrorKind::AlreadyExists => {
+                            if (attempts < NAME_ATTEMPTS) { continue; }
+                            return Result::Err(error);
+                        }
+                        _ => { return Result::Err(error); }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Where the directory is.
+    public path(&this) -> Path {
+        return this.location.as_path();
+    }
+
+    /// Leave the directory in place when this value is dropped, and return
+    /// its path.
+    public keep(mut this) -> PathBuf {
+        this.kept = true;
+        return PathBuf::from(this.location.as_path().as_str());
+    }
+
+    /// `<temporary directory>/cryo-<16 random hex digits>`: a name, not yet
+    /// an entry; the caller's exclusive creation decides whether it is free.
+    private static unused_name() -> Result<PathBuf, IoError> {
+        mut bytes: [u8; NAME_BYTES];
+        const random: SecureRng = SecureRng::new();
+        match (random.try_fill(Slice::<u8>::from_raw(&bytes[0], NAME_BYTES))) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { return Result::Err(IoError::new(IoErrorKind::Other, 0)); }
+        }
+        const digits: Str = Str::new("0123456789abcdef");
+        mut name: String = String::from_str(Str::new("cryo-"));
+        for (mut i: i64 = 0; i < NAME_BYTES; i++) {
+            name.push_byte(digits.as_bytes()[(bytes[i] >> 4) as i64]);
+            name.push_byte(digits.as_bytes()[(bytes[i] & 0x0F) as i64]);
+        }
+        return Result::Ok(env::temp_directory().join(name.as_str()));
+    }
+}
+
+/// The directory goes with everything in it; a failure to remove it is
+/// not reported, as a drop has no one to report to.
+implement trait Drop for struct TempDirectory {
+    drop(mut &this) -> void {
+        if (!this.kept) {
+            match (Directory::remove_all(this.location.as_path())) {
+                Result::Ok(_)  => { }
+                Result::Err(_) => { }
+            }
+        }
+    }
+}
+
+/// A file, open for reading and writing, that is closed and removed when
+/// this value is dropped.
+public type struct TempFile {
+    private location: PathBuf;
+    private handle: File;
+    private kept: boolean;
+
+    /// A new, empty file under the temporary directory, open for reading
+    /// and writing.
+    public static create() -> Result<TempFile, IoError> {
+        mut options: OpenOptions = OpenOptions::new();
+        options = options.read(true).write(true).create_new(true).share(true, true, true);
+        mut attempts: i64 = 0;
+        loop {
+            const candidate: PathBuf = TempDirectory::unused_name()?;
+            match (File::open_with(candidate.as_path(), &options)) {
+                Result::Ok(opened) => {
+                    return Result::Ok(TempFile { location: candidate, handle: opened, kept: false });
+                }
+                Result::Err(error) => {
+                    attempts = attempts + 1;
+                    match (error.kind) {
+                        IoErrorKind::AlreadyExists => {
+                            if (attempts < NAME_ATTEMPTS) { continue; }
+                            return Result::Err(error);
+                        }
+                        _ => { return Result::Err(error); }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Where the file is.
+    public path(&this) -> Path {
+        return this.location.as_path();
+    }
+
+    /// The open file, to read, write and seek.
+    public file(mut &this) -> mut &File {
+        return &this.handle;
+    }
+
+    /// Leave the file in place when this value is dropped, and return its
+    /// path. The file is still closed then.
+    public keep(mut this) -> PathBuf {
+        this.kept = true;
+        return PathBuf::from(this.location.as_path().as_str());
+    }
+}
+
+/// Close the file first - Windows removes an open file only when every
+/// handle allows it - then remove it. A failure to remove it is not
+/// reported, as a drop has no one to report to.
+implement trait Drop for struct TempFile {
+    drop(mut &this) -> void {
+        const descriptor: i32 = this.handle.into_descriptor();
+        if (descriptor >= 0) { fd::close_fd(descriptor); }
+        if (!this.kept) {
+            match (File::remove(this.location.as_path())) {
+                Result::Ok(_)  => { }
+                Result::Err(_) => { }
+            }
+        }
+    }
+}

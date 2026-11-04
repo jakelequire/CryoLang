@@ -420,6 +420,8 @@ entry_point = "src/tool/main.cryo"
 ### Working with files
 
 ```cryo
+import std::collections::string::{ String };
+import std::fmt::{ println };
 import std::fs::{ Directory, File, Path };
 import std::io::error::{ IoError };
 
@@ -440,7 +442,11 @@ function tidy() -> Result<(), IoError> {
 A failure prints with the path it happened at: `not found: config.toml`.
 A path can be written as a string where one is expected. For anything
 beyond one whole-file call, `File::open` / `File::create` / `OpenOptions`
-give a handle that implements `Read`, `Write` and `Seek`.
+give a handle that implements `Read`, `Write` and `Seek`; read it a line
+at a time with `for (line in BufReader::new(&file).lines()) { ... }`.
+`TempDirectory::create()` and `TempFile::create()` give scratch space that
+is removed when the value is dropped. [`examples/15-files`](./examples/15-files/)
+runs all of it.
 
 The **prelude** (auto-imported into every file) currently re-exports `core::panic`, `core::option`, `core::result`, `core::primitives`, `core::intrinsics`, `core::varargs`, `core::slice`, `core::ops`, `core::iter`, `collections::array`, `alloc::box`, and `alloc::rc`.
 

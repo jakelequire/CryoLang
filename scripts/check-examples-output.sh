@@ -32,7 +32,7 @@ CRYO="${CRYO:-$ROOT/bin/cryo}"
 export CRYO_STDLIB="${CRYO_STDLIB:-$ROOT/stdlib}"
 
 # Deterministic, input-free examples only.
-EXAMPLES=(02-fizzbuzz 07-shapes 10-expr-interpreter 13-closures)
+EXAMPLES=(02-fizzbuzz 07-shapes 10-expr-interpreter 13-closures 15-files)
 
 fail=0
 

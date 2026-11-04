@@ -1,0 +1,85 @@
+///! Files - reading, writing and listing with `std::fs`.
+///!
+///! Everything happens in a temporary directory that is removed, with
+///! everything in it, when the program ends.
+///!
+///! What this example demonstrates:
+///!   - `File::write_text` / `append_text` / `read_text` - a whole file in
+///!     one call, with a string literal as the path;
+///!   - `BufReader.lines()` - a file one line at a time;
+///!   - `Directory::create_all`, `File::copy`, `Directory::entries` - making,
+///!     filling and listing directories;
+///!   - `TempDirectory` - scratch space that cleans up after itself;
+///!   - an `IoError` - it says what went wrong and at which path.
+///!
+///! Run with:  cryo run
+
+namespace Main;
+
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::fs::{ Directory, File, Path, PathBuf, TempDirectory };
+import std::io::buf::{ BufReader };
+import std::io::error::{ IoError };
+import std::fmt::{ println };
+
+function tour(root: Path) -> Result<(), IoError> {
+    // A whole file in one call each.
+    const notes: PathBuf = root.join("notes.txt");
+    File::write_text(notes.as_path(), "buy milk\n")?;
+    File::append_text(notes.as_path(), "call home\nwater the plants\n")?;
+    const text: String = File::read_text(notes.as_path())?;
+    const size: i64 = text.length();
+    println(f"notes.txt holds {size} bytes");
+
+    // One line at a time.
+    mut file: File = File::open(notes.as_path())?;
+    mut number: i64 = 0;
+    for (line in BufReader::new(&file).lines()) {
+        const item: String = line?;
+        number = number + 1;
+        println(f"  {number}. {item.as_str()}");
+    }
+
+    // Directories: make a nested one, copy into it, list the top.
+    Directory::create_all(root.join("archive/2026").as_path())?;
+    const copied: i64 = File::copy(notes.as_path(), root.join("archive/2026/notes.txt").as_path())?;
+    println(f"copied {copied} bytes into archive/2026");
+    mut files: i64 = 0;
+    mut directories: i64 = 0;
+    for (entry in Directory::entries(root)?) {
+        if (entry.is_file()) { files = files + 1; }
+        if (entry.is_directory()) { directories = directories + 1; }
+    }
+    println(f"the top holds {files} file and {directories} directory");
+
+    // A failure names its path.
+    match (File::read_text(root.join("missing.txt").as_path())) {
+        Result::Ok(_) => { println("missing.txt exists?"); }
+        Result::Err(error) => {
+            const name: Str = error.path().unwrap().file_name().unwrap();
+            println(f"reading it fails: {error.describe()}: {name}");
+        }
+    }
+    return Result::Ok(());
+}
+
+function main() -> int {
+    match (TempDirectory::create()) {
+        Result::Err(error) => {
+            println(f"no temporary directory: {error}");
+            return 1;
+        }
+        Result::Ok(scratch) => {
+            match (tour(scratch.path())) {
+                Result::Ok(_) => { return 0; }
+                Result::Err(error) => {
+                    println(f"error: {error}");
+                    return 1;
+                }
+            }
+        }
+    }
+}

@@ -14,8 +14,13 @@ namespace std::env;
 import std::core::intrinsics;
 import std::core::option::{ Option };
 import std::core::result;
+import std::core::result::{ Result };
 import std::core::slice;
+import std::core::slice::{ Slice };
 import std::collections::array::{ Array };
+import std::encoding::utf16::{ Utf16 };
+import std::fs::path::{ PathBuf };
+import std::sys::syscall;
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::collections::pair::{ Pair };
@@ -157,6 +162,41 @@ public function remove_var(name: Str) -> boolean {
     mut empty: [u8; 1] = [0];
     const rc: i32 = libc::_putenv_s(n.as_ptr(), &empty[0]);
     return rc == 0;
+}
+
+/// The directory for temporary files: `TMPDIR` if it is set and not
+/// empty, else `/tmp`.
+![target(unix)]
+public function temp_directory() -> PathBuf {
+    match (var(Str::new("TMPDIR"))) {
+        Option::Some(directory) => {
+            if (!directory.is_empty()) { return PathBuf::from(directory.as_str()); }
+        }
+        Option::None => { }
+    }
+    return PathBuf::from(Str::new("/tmp"));
+}
+
+/// The directory for temporary files, as Windows chooses it
+/// (`GetTempPathW`: `TMP`, `TEMP`, `USERPROFILE`, then the Windows
+/// directory), with `/` separators and no trailing separator; the
+/// Windows directory's `Temp` if that call fails.
+![target(windows)]
+public function temp_directory() -> PathBuf {
+    mut units: [u16; 1024];
+    const count: u32 = syscall::GetTempPathW(1024, &units[0]);
+    if (count > 0 && count < 1024) {
+        mut length: i64 = count as i64;
+        for (mut i: i64 = 0; i < length; i++) {
+            if (units[i] == 0x5C) { units[i] = 0x2F; }       // '\' -> '/'
+        }
+        if (length > 1 && units[length - 1] == 0x2F) { length = length - 1; }
+        match (Utf16::decode(Slice::<u16>::from_raw(&units[0], length))) {
+            Result::Ok(text) => { return PathBuf::from(text.as_str()); }
+            Result::Err(_)   => { }
+        }
+    }
+    return PathBuf::from(Str::new("C:/Windows/Temp"));
 }
 
 /// The process's current working directory as an owned `String`.

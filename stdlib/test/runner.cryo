@@ -66,7 +66,7 @@ import std::process;
 import std::process::child::{ Child, ExitStatus };
 import std::process::command::{ Command, Stdio };
 import std::fs::file::{ File, OpenOptions };
-import std::fs::path::{ Path };
+import std::fs::path::{ Path, PathBuf };
 import std::time::duration::{ Duration };
 import std::sync::atomic::{ Atomic, MemoryOrder };
 import std::sync::mpsc::{ TryRecvError };
@@ -723,27 +723,24 @@ private function run_child(d: TestDescriptor, idx: u64, command: mut &Command,
     mut capture_path: String = String::new();
     mut have_capture: boolean = false;
     if (capture) {
-        mut directory: [u8; 512];
-        const directory_length: u32 = syscall::GetTempPathA(512, &directory[0]);
-        if (directory_length > 0 && directory_length < 512) {
-            capture_path.push(Str::from_raw(&directory[0], directory_length as u64));   // ends in `\`
-            capture_path.push(Str::new("cyt"));
-            capture_path.push(process::id() as u64);
-            capture_path.push_byte(95);                                                  // '_'
-            capture_path.push(idx);
-            capture_path.push(Str::new(".tmp"));
-            mut options: OpenOptions = OpenOptions::new();
-            options = options.write(true).create(true).truncate(true).share(true, true, true);
-            match (options.open(Path::from(capture_path.as_str()))) {
-                Result::Ok(opened) => {
-                    mut file: File = opened;
-                    command.stdout(Stdio::Fd(file.into_descriptor()));
-                    command.stderr(Stdio::SameAsStdout);
-                    have_capture = true;
-                }
-                // Capture falls back to inherited stdio.
-                Result::Err(_) => { }
+        mut name: String = String::from_str(Str::new("cyt"));
+        name.push(process::id() as u64);
+        name.push_byte(95);                                                              // '_'
+        name.push(idx);
+        name.push(Str::new(".tmp"));
+        const location: PathBuf = env::temp_directory().join(name.as_str());
+        capture_path.push(location.as_path().as_str());
+        mut options: OpenOptions = OpenOptions::new();
+        options = options.write(true).create(true).truncate(true).share(true, true, true);
+        match (options.open(capture_path.as_str())) {
+            Result::Ok(opened) => {
+                mut file: File = opened;
+                command.stdout(Stdio::Fd(file.into_descriptor()));
+                command.stderr(Stdio::SameAsStdout);
+                have_capture = true;
             }
+            // Capture falls back to inherited stdio.
+            Result::Err(_) => { }
         }
     }
 

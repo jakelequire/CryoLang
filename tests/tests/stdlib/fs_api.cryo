@@ -1,9 +1,10 @@
 ///! The fs API on real files: whole-file reads and writes, errors that name
 ///! their path, directories and their listings, path queries, non-ASCII
-///! names, and the UTF-8 and UTF-16 checks underneath.
+///! names, line reading, temporary files and directories, and the UTF-8
+///! and UTF-16 checks underneath.
 ///!
-///! Each test works in its own directory under the OS temp directory and
-///! removes it before returning.
+///! Each test works in a `TempDirectory` of its own, which is removed when
+///! the test returns, failing or not.
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::FsApi;
@@ -16,31 +17,13 @@ import std::collections::string::{ String };
 import std::collections::array::{ Array };
 import std::io::error::{ IoError, IoErrorKind };
 import std::encoding::utf16::{ Utf16 };
-import std::fs::{ Directory, File, Path, PathBuf };
+import std::fs::{ Directory, File, Path, PathBuf, TempDirectory, TempFile };
+import std::io::buf::{ BufReader };
+import std::io::traits::{ Write };
 import std::fmt::display::{ Display, format_to_string };
 import std::core::mem;
-import std::env;
-import std::process;
 import std::test::error::{ TestError };
 import std::test::assert::{ bail, expect, expect_eq };
-
-/// An empty directory of this test's own: `<temp>/cryo_fs_api_<pid>_<tag>`.
-function scratch(tag: Str) -> Result<PathBuf, TestError> {
-    const root: String = match (env::var(Str::new("TEMP"))) {
-        Option::Some(temp) => { temp }
-        Option::None       => { String::from_str(Str::new("/tmp")) }
-    };
-    mut name: String = String::from_str(Str::new("cryo_fs_api_"));
-    name.push(process::id());
-    name.push(Str::new("_"));
-    name.push(tag);
-    const directory: PathBuf = PathBuf::from(root.as_str()).join(name.as_str());
-    if (directory.as_path().exists()) {
-        Directory::remove_all(directory.as_path())?;
-    }
-    Directory::create_all(directory.as_path())?;
-    return Result::Ok(directory);
-}
 
 /// What `value` prints as.
 function shown<T>(value: &T) -> String where T: Display {
@@ -52,33 +35,34 @@ function shown<T>(value: &T) -> String where T: Display {
 
 ![test]
 function read_text_returns_what_write_text_wrote() -> Result<(), TestError> {
-    const directory: PathBuf = scratch("text")?;
+    const scratch: TempDirectory = TempDirectory::create()?;
+    const directory: Path = scratch.path();
     const file: PathBuf = directory.join("notes.txt");
     File::write_text(file.as_path(), "first line\nna\u{ef}ve caf\u{e9}\n")?;
     const text: String = File::read_text(file.as_path())?;
     expect(text.as_str() == Str::new("first line\nna\u{ef}ve caf\u{e9}\n"), "read_text returns the text write_text wrote")?;
     const bytes: Array<u8> = File::read_bytes(file.as_path())?;
     expect_eq(bytes.length(), text.length())?;
-    Directory::remove_all(directory.as_path())?;
     return Result::Ok(());
 }
 
 ![test]
 function append_text_adds_to_the_end() -> Result<(), TestError> {
-    const directory: PathBuf = scratch("append")?;
+    const scratch: TempDirectory = TempDirectory::create()?;
+    const directory: Path = scratch.path();
     const file: PathBuf = directory.join("log.txt");
     File::append_text(file.as_path(), "one\n")?;
     File::append_text(file.as_path(), "two\n")?;
     File::append_text(file.as_path(), "three\n")?;
     const text: String = File::read_text(file.as_path())?;
     expect(text.as_str() == Str::new("one\ntwo\nthree\n"), "each append lands after the last")?;
-    Directory::remove_all(directory.as_path())?;
     return Result::Ok(());
 }
 
 ![test]
 function read_text_refuses_bytes_that_are_not_utf8() -> Result<(), TestError> {
-    const directory: PathBuf = scratch("not_utf8")?;
+    const scratch: TempDirectory = TempDirectory::create()?;
+    const directory: Path = scratch.path();
     const file: PathBuf = directory.join("binary.dat");
     mut bytes: [u8; 4] = [0x61, 0xFF, 0x62, 0x0A];
     File::write_bytes(file.as_path(), Slice::<u8>::from_raw(&bytes[0], 4))?;
@@ -97,13 +81,13 @@ function read_text_refuses_bytes_that_are_not_utf8() -> Result<(), TestError> {
     }
     const raw: Array<u8> = File::read_bytes(file.as_path())?;
     expect_eq(raw.length(), 4)?;
-    Directory::remove_all(directory.as_path())?;
     return Result::Ok(());
 }
 
 ![test]
 function a_failure_prints_with_its_path() -> Result<(), TestError> {
-    const directory: PathBuf = scratch("missing")?;
+    const scratch: TempDirectory = TempDirectory::create()?;
+    const directory: Path = scratch.path();
     const missing: PathBuf = directory.join("absent.txt");
     match (File::open(missing.as_path())) {
         Result::Ok(_) => { return bail("opened a file that does not exist"); }
@@ -118,13 +102,13 @@ function a_failure_prints_with_its_path() -> Result<(), TestError> {
             expect(text.as_str() == expected.as_str(), "Display prints the description, then the path")?;
         }
     }
-    Directory::remove_all(directory.as_path())?;
     return Result::Ok(());
 }
 
 ![test]
 function entries_lists_names_paths_and_kinds() -> Result<(), TestError> {
-    const directory: PathBuf = scratch("entries")?;
+    const scratch: TempDirectory = TempDirectory::create()?;
+    const directory: Path = scratch.path();
     const top: PathBuf = directory.join("top");
     Directory::create_all(top.join("inner/deeper").as_path())?;
     const file: PathBuf = top.join("one.txt");
@@ -146,15 +130,15 @@ function entries_lists_names_paths_and_kinds() -> Result<(), TestError> {
     expect(saw_directory, "the subdirectory is listed as a directory")?;
     Directory::remove_all(top.as_path())?;
     expect(!top.as_path().exists(), "remove_all removes the tree")?;
-    Directory::remove_all(directory.as_path())?;
     return Result::Ok(());
 }
 
 ![test]
 function remove_refuses_a_directory_with_entries() -> Result<(), TestError> {
-    const directory: PathBuf = scratch("full")?;
+    const scratch: TempDirectory = TempDirectory::create()?;
+    const directory: Path = scratch.path();
     File::write_text(directory.join("kept.txt").as_path(), "x")?;
-    match (Directory::remove(directory.as_path())) {
+    match (Directory::remove(directory)) {
         Result::Ok(_) => { return bail("removed a directory that has an entry"); }
         Result::Err(error) => {
             match (error.kind) {
@@ -163,13 +147,13 @@ function remove_refuses_a_directory_with_entries() -> Result<(), TestError> {
             }
         }
     }
-    Directory::remove_all(directory.as_path())?;
     return Result::Ok(());
 }
 
 ![test]
 function rename_to_replaces_an_existing_target() -> Result<(), TestError> {
-    const directory: PathBuf = scratch("rename")?;
+    const scratch: TempDirectory = TempDirectory::create()?;
+    const directory: Path = scratch.path();
     const from: PathBuf = directory.join("from.txt");
     const to: PathBuf = directory.join("to.txt");
     File::write_text(from.as_path(), "moved")?;
@@ -178,28 +162,28 @@ function rename_to_replaces_an_existing_target() -> Result<(), TestError> {
     expect(!from.as_path().exists(), "the old name is gone")?;
     const text: String = File::read_text(to.as_path())?;
     expect(text.as_str() == Str::new("moved"), "the target holds the moved file")?;
-    Directory::remove_all(directory.as_path())?;
     return Result::Ok(());
 }
 
 ![test]
 function path_queries_tell_files_from_directories() -> Result<(), TestError> {
-    const directory: PathBuf = scratch("queries")?;
+    const scratch: TempDirectory = TempDirectory::create()?;
+    const directory: Path = scratch.path();
     const file: PathBuf = directory.join("plain.txt");
     File::write_text(file.as_path(), "abc")?;
     expect(file.as_path().exists() && file.as_path().is_file(), "a file exists and is a file")?;
     expect(!file.as_path().is_directory(), "a file is not a directory")?;
-    expect(directory.as_path().is_directory(), "a directory is a directory")?;
+    expect(directory.is_directory(), "a directory is a directory")?;
     const absent: PathBuf = directory.join("absent");
     expect(!absent.as_path().exists() && !absent.as_path().is_file(), "nothing is at a missing path")?;
     expect_eq(file.as_path().metadata()?.length(), 3)?;
-    Directory::remove_all(directory.as_path())?;
     return Result::Ok(());
 }
 
 ![test]
 function non_ascii_names_round_trip() -> Result<(), TestError> {
-    const directory: PathBuf = scratch("names")?;
+    const scratch: TempDirectory = TempDirectory::create()?;
+    const directory: Path = scratch.path();
     const folder: PathBuf = directory.join("r\u{e9}pertoire-\u{65e5}\u{672c}");
     Directory::create(folder.as_path())?;
     const file: PathBuf = folder.join("na\u{ef}ve-\u{1f600}.txt");
@@ -212,17 +196,17 @@ function non_ascii_names_round_trip() -> Result<(), TestError> {
     }
     expect(listed, "the listing spells the non-ASCII name as it was created")?;
     mut folder_listed: boolean = false;
-    for (entry in Directory::entries(directory.as_path())?) {
+    for (entry in Directory::entries(directory)?) {
         if (entry.name() == Str::new("r\u{e9}pertoire-\u{65e5}\u{672c}")) { folder_listed = entry.is_directory(); }
     }
     expect(folder_listed, "the non-ASCII directory is listed as a directory")?;
-    Directory::remove_all(directory.as_path())?;
     return Result::Ok(());
 }
 
 ![test]
 function set_length_cuts_and_extends() -> Result<(), TestError> {
-    const directory: PathBuf = scratch("length")?;
+    const scratch: TempDirectory = TempDirectory::create()?;
+    const directory: Path = scratch.path();
     const path: PathBuf = directory.join("sized.dat");
     mut file: File = File::create(path.as_path())?;
     file.write("0123456789")?;
@@ -235,7 +219,77 @@ function set_length_cuts_and_extends() -> Result<(), TestError> {
     const bytes: Array<u8> = File::read_bytes(path.as_path())?;
     expect_eq(bytes[3], 0x33)?;
     expect_eq(bytes[7], 0)?;
-    Directory::remove_all(directory.as_path())?;
+    return Result::Ok(());
+}
+
+![test]
+function lines_yields_each_line_without_its_ending() -> Result<(), TestError> {
+    const scratch: TempDirectory = TempDirectory::create()?;
+    const path: PathBuf = scratch.path().join("lines.txt");
+    File::write_text(path.as_path(), "one\r\ntwo\n\nlast")?;
+    mut file: File = File::open(path.as_path())?;
+    mut seen: Array<String> = Array::<String>::new();
+    for (line in BufReader::new(&file).lines()) {
+        seen.push(line?);
+    }
+    expect_eq(seen.length(), 4)?;
+    expect(seen[0].as_str() == Str::new("one"), "a CRLF ending is stripped")?;
+    expect(seen[1].as_str() == Str::new("two"), "an LF ending is stripped")?;
+    expect(seen[2].as_str().is_empty(), "an empty line is a line")?;
+    expect(seen[3].as_str() == Str::new("last"), "a last line without an ending is a line")?;
+    return Result::Ok(());
+}
+
+![test]
+function lines_refuses_a_line_that_is_not_utf8() -> Result<(), TestError> {
+    const scratch: TempDirectory = TempDirectory::create()?;
+    const path: PathBuf = scratch.path().join("mixed.txt");
+    mut bytes: [u8; 6] = [0x61, 0x0A, 0xC3, 0x28, 0x0A, 0x62];
+    File::write_bytes(path.as_path(), Slice::<u8>::from_raw(&bytes[0], 6))?;
+    mut file: File = File::open(path.as_path())?;
+    mut verdicts: Array<boolean> = Array::<boolean>::new();
+    for (line in BufReader::new(&file).lines()) {
+        verdicts.push(line.is_ok());
+    }
+    expect_eq(verdicts.length(), 3)?;
+    expect(verdicts[0] && !verdicts[1] && verdicts[2], "only the malformed line is an error")?;
+    return Result::Ok(());
+}
+
+![test]
+function temp_directory_is_removed_when_dropped() -> Result<(), TestError> {
+    mut remembered: String = String::new();
+    {
+        const scratch: TempDirectory = TempDirectory::create()?;
+        File::write_text(scratch.path().join("inside.txt").as_path(), "x")?;
+        Directory::create(scratch.path().join("nested").as_path())?;
+        expect(scratch.path().is_directory(), "the directory exists while held")?;
+        remembered.push(scratch.path().as_str());
+    }
+    expect(!Path::from(remembered.as_str()).exists(), "dropping it removes it and its contents")?;
+    return Result::Ok(());
+}
+
+![test]
+function temp_directory_keep_leaves_it_in_place() -> Result<(), TestError> {
+    const scratch: TempDirectory = TempDirectory::create()?;
+    const kept: PathBuf = scratch.keep();
+    expect(kept.as_path().is_directory(), "a kept directory outlives its value")?;
+    Directory::remove_all(kept.as_path())?;
+    return Result::Ok(());
+}
+
+![test]
+function temp_file_is_removed_when_dropped() -> Result<(), TestError> {
+    mut remembered: String = String::new();
+    {
+        mut scratch: TempFile = TempFile::create()?;
+        scratch.file().write("written through the handle")?;
+        const text: String = File::read_text(scratch.path())?;
+        expect(text.as_str() == Str::new("written through the handle"), "the file holds what was written")?;
+        remembered.push(scratch.path().as_str());
+    }
+    expect(!Path::from(remembered.as_str()).exists(), "dropping it closes and removes it")?;
     return Result::Ok(());
 }
 

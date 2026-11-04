@@ -28,6 +28,7 @@ import std::core::result::{ Result };
 import std::core::slice::{ Slice };
 import std::core::ptr::{ NonNull };
 import std::core::drop::{ Drop };
+import std::core::iter::{ Iterator };
 import std::alloc::layout::{ Layout };
 import std::alloc::allocator::{ GlobalAlloc };
 import std::collections::str::{ Str };
@@ -53,7 +54,7 @@ private const BYTE_LF: u8 = 0x0A;
 /// Coalesces writes destined for `W` into larger flushes. The inner
 /// writer is borrowed via pointer; the caller owns it and drops it.
 public type struct BufWriter<W> where W: Write {
-    private writer: W*;
+    private writer: mut W*;
     private buffer: mut u8*;
     private capacity: i64;
     private length: i64;
@@ -64,7 +65,7 @@ public type struct BufWriter<W> where W: Write {
     /// The `W: Write` bound lives on construction; instance methods
     /// don't restate it since no `BufWriter<W>` can exist without
     /// having gone through here first.
-    public static new(writer: W*) -> BufWriter<W>
+    public static new(writer: mut W*) -> BufWriter<W>
     where W: Write {
         return BufWriter::with_capacity(writer, DEFAULT_BUFFER_SIZE);
     }
@@ -72,7 +73,7 @@ public type struct BufWriter<W> where W: Write {
     /// Wrap with an explicit buffer size. A `capacity` of zero or less is
     /// permitted but degenerate: no buffer is allocated and every write
     /// hits the sink directly. Panics on allocation failure.
-    public static with_capacity(writer: W*, capacity: i64) -> BufWriter<W>
+    public static with_capacity(writer: mut W*, capacity: i64) -> BufWriter<W>
     where W: Write {
         mut buffer: mut u8* = null;
         mut size: i64 = 0;
@@ -193,12 +194,12 @@ where W: Write {
 public type struct LineWriter<W> {
     private inner: BufWriter<W>;
 
-    public static new(writer: W*) -> LineWriter<W>
+    public static new(writer: mut W*) -> LineWriter<W>
     where W: Write {
         return LineWriter::with_capacity(writer, DEFAULT_BUFFER_SIZE);
     }
 
-    public static with_capacity(writer: W*, capacity: i64) -> LineWriter<W>
+    public static with_capacity(writer: mut W*, capacity: i64) -> LineWriter<W>
     where W: Write {
         return LineWriter::<W> {
             inner: BufWriter::with_capacity(writer, capacity)
@@ -290,7 +291,7 @@ implement<W> trait Drop for struct LineWriter<W> {
 ///
 /// Borrows the inner reader via pointer. Caller owns it.
 public type struct BufReader<R> where R: Read {
-    private reader: R*;
+    private reader: mut R*;
     private buffer: mut u8*;
     private capacity: i64;
     /// First unread byte in the buffer.
@@ -298,12 +299,12 @@ public type struct BufReader<R> where R: Read {
     /// One past the last filled byte.
     private filled: i64;
 
-    public static new(reader: R*) -> BufReader<R>
+    public static new(reader: mut R*) -> BufReader<R>
     where R: Read {
         return BufReader::with_capacity(reader, DEFAULT_BUFFER_SIZE);
     }
 
-    public static with_capacity(reader: R*, capacity: i64) -> BufReader<R>
+    public static with_capacity(reader: mut R*, capacity: i64) -> BufReader<R>
     where R: Read {
         if (capacity <= 0) {
             core::panic("BufReader::with_capacity: capacity must be > 0", intrinsics::location());
@@ -368,6 +369,43 @@ public type struct BufReader<R> where R: Read {
         ));
     }
 
+    /// The rest of the source, one line at a time: each item is an owned
+    /// `String` without its `\n` or `\r\n`, or the error that stopped the
+    /// reading. A last line with no line ending is still a line.
+    ///
+    ///     mut file: File = File::open("data.txt")?;
+    ///     for (line in BufReader::new(&file).lines()) {
+    ///         const text: String = line?;
+    ///     }
+    public lines(this) -> Lines<R> {
+        return Lines::<R> { reader: this };
+    }
+}
+
+/// The lines of a `BufReader`; see `BufReader.lines`.
+public type struct Lines<R> where R: Read {
+    private reader: BufReader<R>;
+}
+
+/// A line that is not UTF-8 is an `InvalidData` error, after which the
+/// next line is read as usual.
+implement<R> trait Iterator<Result<String, IoError>> for struct Lines<R>
+where R: Read {
+    next(mut &this) -> Option<Result<String, IoError>> {
+        mut line: String = String::new();
+        match (this.reader.read_line(&line)) {
+            Result::Err(error) => { return Option::Some(Result::Err(error)); }
+            Result::Ok(count) => {
+                if (count == 0) { return Option::None; }
+            }
+        }
+        if (line.as_str().ends_with(&Str::new("\n"))) { line.truncate(line.length() - 1); }
+        if (line.as_str().ends_with(&Str::new("\r"))) { line.truncate(line.length() - 1); }
+        if (Str::from_utf8(line.as_str().as_bytes()).is_err()) {
+            return Option::Some(Result::Err(IoError::new(IoErrorKind::InvalidData, 0)));
+        }
+        return Option::Some(Result::Ok(line));
+    }
 }
 
 implement<R> trait Read for struct BufReader<R>
