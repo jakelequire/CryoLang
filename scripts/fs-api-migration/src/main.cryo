@@ -1,0 +1,224 @@
+///! One-off codemod: rewrites calls of the fs free functions in the files
+///! named on the command line, in place.
+///!
+///!   `file::read_to_string(p)` -> `File::read_text(p)`, and the other
+///!   whole-file and directory functions to their `File::`/`Directory::`
+///!   statics, keeping the arguments;
+///!   `metadata::exists(p)`     -> `p.exists()`, and the other queries to
+///!   methods on the path, parenthesizing an argument that is not one term.
+///!
+///! A call is recognized only with its module qualifier, not preceded by an
+///! identifier character or `:`. `import std::fs::dir...` lines are dropped
+///! (the module is gone) and an import of `File` or `Directory` is added
+///! where the rewritten text names one and no import does. Imports of the
+///! other modules are left for the compiler's warnings to point at.
+
+namespace FsApiMigration;
+
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::collections::array::{ Array };
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::fs::{ File };
+import std::env;
+import std::fmt::{ println };
+
+type struct Rule {
+    needle: Str;
+    replacement: Str;
+    // A postfix rule turns `needle ARG )` into `ARG.replacement()`; a
+    // prefix rule swaps the needle for `replacement` and keeps the rest.
+    postfix: boolean;
+
+    static new(needle: Str, replacement: Str, postfix: boolean) -> Rule {
+        return Rule { needle: needle, replacement: replacement, postfix: postfix };
+    }
+}
+
+function rules() -> Array<Rule> {
+    mut all: Array<Rule> = Array::<Rule>::new();
+    all.push(Rule::new("file::read_to_string(", "File::read_text(", false));
+    all.push(Rule::new("file::read(", "File::read_bytes(", false));
+    all.push(Rule::new("file::write(", "File::write_bytes(", false));
+    all.push(Rule::new("file::copy(", "File::copy(", false));
+    all.push(Rule::new("dir::remove_file(", "File::remove(", false));
+    all.push(Rule::new("dir::create_dir_all(", "Directory::create_all(", false));
+    all.push(Rule::new("dir::create_dir(", "Directory::create(", false));
+    all.push(Rule::new("dir::remove_dir_all(", "Directory::remove_all(", false));
+    all.push(Rule::new("dir::remove_dir(", "Directory::remove(", false));
+    all.push(Rule::new("dir::read_dir(", "Directory::entries(", false));
+    all.push(Rule::new("metadata::exists(", "exists", true));
+    all.push(Rule::new("metadata::is_dir(", "is_directory", true));
+    all.push(Rule::new("metadata::is_file(", "is_file", true));
+    all.push(Rule::new("metadata::metadata(", "metadata", true));
+    all.push(Rule::new("metadata::symlink_metadata(", "symlink_metadata", true));
+    all.push(Rule::new("dir::canonicalize(", "canonicalize", true));
+    return all;
+}
+
+function is_identifier_byte(byte: u8) -> boolean {
+    return byte.is_alpha() || byte.is_digit() || byte == '_' as u8 || byte == ':' as u8;
+}
+
+/// Index of the `)` closing the call whose arguments start at `start`,
+/// skipping string literals; -1 if there is none.
+function closing_paren(bytes: Slice<u8>, start: i64) -> i64 {
+    mut depth: i64 = 0;
+    mut i: i64 = start;
+    while (i < bytes.length()) {
+        const byte: u8 = bytes[i];
+        if (byte == '"' as u8) {
+            i = i + 1;
+            while (i < bytes.length() && bytes[i] != '"' as u8) {
+                if (bytes[i] == '\\' as u8) { i = i + 1; }
+                i = i + 1;
+            }
+        } else if (byte == '(' as u8) {
+            depth = depth + 1;
+        } else if (byte == ')' as u8) {
+            if (depth == 0) { return i; }
+            depth = depth - 1;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Whether `argument` has a space outside parentheses and strings, so it
+/// is more than one term and needs parentheses before a `.method()`.
+function needs_parentheses(argument: Str) -> boolean {
+    const bytes: Slice<u8> = argument.as_bytes();
+    mut depth: i64 = 0;
+    mut in_string: boolean = false;
+    for (mut i: i64 = 0; i < bytes.length(); i++) {
+        const byte: u8 = bytes[i];
+        if (in_string) {
+            if (byte == '\\' as u8) { i = i + 1; }
+            else if (byte == '"' as u8) { in_string = false; }
+        } else if (byte == '"' as u8) { in_string = true; }
+        else if (byte == '(' as u8) { depth = depth + 1; }
+        else if (byte == ')' as u8) { depth = depth - 1; }
+        else if (byte == ' ' as u8 && depth == 0) { return true; }
+    }
+    return false;
+}
+
+function rewrite_calls(text: Str, all: &Array<Rule>) -> String {
+    const bytes: Slice<u8> = text.as_bytes();
+    mut out: String = String::with_capacity(text.length());
+    mut i: i64 = 0;
+    while (i < bytes.length()) {
+        mut matched: boolean = false;
+        if (i == 0 || !is_identifier_byte(bytes[i - 1])) {
+            for (mut r: i64 = 0; r < all.length(); r++) {
+                const rule: Rule = all[r];
+                if (!text.sub_bytes(i, text.length()).starts_with(&rule.needle)) { continue; }
+                const arguments_start: i64 = i + rule.needle.length();
+                if (!rule.postfix) {
+                    out.push(rule.replacement);
+                    i = arguments_start;
+                    matched = true;
+                    break;
+                }
+                const close: i64 = closing_paren(bytes, arguments_start);
+                if (close < 0) { continue; }
+                const argument: Str = text.sub_bytes(arguments_start, close);
+                if (needs_parentheses(argument)) {
+                    out.push("(");
+                    out.push(argument);
+                    out.push(")");
+                } else {
+                    out.push(argument);
+                }
+                out.push(".");
+                out.push(rule.replacement);
+                out.push("()");
+                i = close + 1;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            out.push_byte(bytes[i]);
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+/// Whether an import line in `text` binds `name`.
+function imports_name(text: Str, name: Str) -> boolean {
+    for (line in text.split(&Str::new("\n"))) {
+        if (!line.trim().starts_with(&Str::new("import "))) { continue; }
+        const braces: Option<i64> = line.find_byte('{' as u8);
+        if (braces.is_none()) { continue; }
+        const inside: Str = line.sub_bytes(braces.unwrap() + 1, line.length());
+        for (part in inside.split(&Str::new(","))) {
+            mut entry: Str = part.trim();
+            if (entry.ends_with(&Str::new("};"))) { entry = entry.sub_bytes(0, entry.length() - 2).trim(); }
+            if (entry == name) { return true; }
+        }
+    }
+    return false;
+}
+
+/// Drop `import std::fs::dir` lines and add the imports the rewrite needs,
+/// before the first remaining `import std::fs::` line (or the first import).
+function fix_imports(text: Str) -> String {
+    mut ending: Str = Str::new("\n");
+    if (text.contains(&Str::new("\r\n"))) { ending = Str::new("\r\n"); }
+    mut needed: String = String::new();
+    if (text.contains(&Str::new("Directory::")) && !imports_name(text, "Directory")) {
+        needed.push("import std::fs::directory::{ Directory };");
+        needed.push(ending);
+    }
+    if (text.contains(&Str::new("File::")) && !imports_name(text, "File")) {
+        needed.push("import std::fs::file::{ File };");
+        needed.push(ending);
+    }
+    mut out: String = String::with_capacity(text.length() + needed.length());
+    mut placed: boolean = needed.is_empty();
+    mut first: boolean = true;
+    for (line in text.split(&Str::new("\n"))) {
+        const trimmed: Str = line.trim();
+        if (trimmed.starts_with(&Str::new("import std::fs::dir;"))
+                || trimmed.starts_with(&Str::new("import std::fs::dir::"))
+                || trimmed.starts_with(&Str::new("import std::fs::metadata::{ metadata };"))) {
+            continue;
+        }
+        if (!first) { out.push("\n"); }
+        if (!placed && (trimmed.starts_with(&Str::new("import std::fs::")) || trimmed.starts_with(&Str::new("import std::io")))) {
+            out.push(needed.as_str());
+            placed = true;
+        }
+        out.push(line);
+        first = false;
+    }
+    return out;
+}
+
+function main() -> i32 {
+    const arguments: Array<String> = env::args();
+    const all: Array<Rule> = rules();
+    mut changed: i64 = 0;
+    for (mut a: i64 = 1; a < arguments.length(); a++) {
+        const name: Str = arguments[a].as_str();
+        match (File::read_text(name)) {
+            Result::Err(error) => { println(f"skipped: {error}"); }
+            Result::Ok(text) => {
+                const calls: String = rewrite_calls(text.as_str(), &all);
+                const result: String = fix_imports(calls.as_str());
+                if (result.as_str() != text.as_str()) {
+                    match (File::write_text(name, result.as_str())) {
+                        Result::Ok(_) => { changed = changed + 1; }
+                        Result::Err(error) => { println(f"not written: {error}"); }
+                    }
+                }
+            }
+        }
+    }
+    println(f"rewrote {changed} file(s)");
+    return 0;
+}

@@ -405,7 +405,7 @@ entry_point = "src/tool/main.cryo"
 | `fmt`         | `Display`, `Debug`, `Formatter`, `FmtWrite`. Heap-free integer and float writers. `print` / `println` / `eprint` / `eprintln`.                                                                                                                                                           |
 | `json`        | RFC 8259 parser + serializer. `JsonValue`, `JsonNumber`, ordered `JsonObject`.                                                                                                                                                                                                              |
 | `encoding`    | Byte<->text codecs: `base64` (RFC 4648) `encode`/`decode`, and `sha1` (RFC 3174) 20-byte digest.                                                                                                                                                                                            |
-| `fs`          | `Path` / `PathBuf`. `OpenOptions` builder, `File` (`Read + Write`). Path manipulation.                                                                                                                                                                                                      |
+| `fs`          | `File` (one call to read or write a whole file, or an open handle that is `Read + Write + Seek`), `Directory` (create, list, remove), `Path` / `PathBuf` (path text, and what is at the path). Every error names its path.                                                                   |
 | `ffi`         | The C ABI boundary. `libc` houses every `extern "C"` the stdlib needs. `cstr` for `CStr` / `CString`.                                                                                                                                                                                       |
 | `env`         | `args()`, `var()`, `set_var()`, `remove_var()`.                                                                                                                                                                                                                                             |
 | `math`        | Thin libm wrappers: trig, log/exp, roots, rounding. `PI`, `TAU`, `E`.                                                                                                                                                                                                                       |
@@ -416,6 +416,31 @@ entry_point = "src/tool/main.cryo"
 | `sync`        | A generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`), `MemoryOrder`, `fence`, `Mutex<T>`, `RwLock<T>`, `CondVar`, `Once`, `Barrier`.                                                                                                                              |
 | `thread`      | `ThreadLocal<T>` via POSIX TLS, `thread::spawn` / `try_spawn` / `JoinHandle<T>` (returns the body's value on `join`), `spawn_with_attr`, scoped threads (`thread::Scope`), `current` / `yield_now` / `sleep` / `sleep_ms`. Channels live in `sync::mpsc` (`channel`, `Sender`, `Receiver`). |
 | `test`        | The built-in unit-test framework.                                                                                                                                                                                                                                                           |
+
+### Working with files
+
+```cryo
+import std::fs::{ Directory, File, Path };
+import std::io::error::{ IoError };
+
+function tidy() -> Result<(), IoError> {
+    const config: String = File::read_text("config.toml")?;      // the whole file, checked as UTF-8
+    File::write_text("copy.toml", config.as_str())?;            // create or replace
+    File::append_text("log.txt", "started\n")?;                 // add to the end
+
+    Directory::create_all("build/cache")?;                      // with every missing parent
+    for (entry in Directory::entries("src")?) {                 // name, full path, kind
+        if (entry.is_file()) { println(f"{entry.path().as_str()}"); }
+    }
+    if (Path::from("build/old").exists()) { Directory::remove_all("build/old")?; }
+    return Result::Ok(());
+}
+```
+
+A failure prints with the path it happened at: `not found: config.toml`.
+A path can be written as a string where one is expected. For anything
+beyond one whole-file call, `File::open` / `File::create` / `OpenOptions`
+give a handle that implements `Read`, `Write` and `Seek`.
 
 The **prelude** (auto-imported into every file) currently re-exports `core::panic`, `core::option`, `core::result`, `core::primitives`, `core::intrinsics`, `core::varargs`, `core::slice`, `core::ops`, `core::iter`, `collections::array`, `alloc::box`, and `alloc::rc`.
 
@@ -530,7 +555,7 @@ for the full 1.0 release notes.
 - `async` / `await` as a first-class language feature: `async` functions, methods, and trait methods compiled into state machines, `await` anywhere an expression may appear, and `async function main`. Futures are ordinary movable structs - no hidden allocation, no pinning discipline - which the language buys by rejecting a reference held live across a suspend (`E0455`) and carrying owned values across it for you. See [`docs/cryo.md` section 18](./docs/cryo.md#18-asynchronous-programming).
 - `std::future`: a worker-pool `Executor` with `spawn` / `JoinHandle`, a readiness reactor (epoll on Linux, `\Device\Afd` + IOCP on Windows), `Sleep` timers, a blocking thread pool for work no reactor can drive, and the `join` / `try_join` / `select` / `timeout` combinators. Cancelling a future is a plain drop.
 - Networking, async throughout: `TcpStream` / `TcpListener`, `UdpSocket`, and OpenSSL-backed `TlsStream`. HTTP/1.1 server (keep-alive, read timeouts), client, and router; HTTP/2 (HPACK + single-stream framing) and WebSocket (RFC 6455). JSON parser and serializer.
-- Filesystem: `File` / `OpenOptions`, whole-path `read` / `write` / `copy`, `remove_file`, `create_dir` / `create_dir_all`, `read_dir`, `rename`, `canonicalize`, and `metadata` / `symlink_metadata`.
+- Filesystem: `File` (`read_text` / `read_bytes` / `write_text` / `append_text` / `copy` / `remove`, and `Read + Write + Seek` handles through `OpenOptions`), `Directory` (`create_all`, `entries`, `remove_all`), and `Path` queries (`exists`, `metadata`, `rename_to`, `canonicalize`); errors name their path, and Windows uses the wide-character calls.
 - `time` (`Duration`, `Instant`, `SystemTime`, `sleep`) and `random` (xoshiro256\*\* `Rng` plus a `getrandom`-backed CSPRNG).
 - POSIX subprocess spawning with `fork + execve`, with async spellings for the operations that wait: `Child::join`, `Command::collect`, `Command::run`.
 - Git-backed dependencies with a lockfile and content-addressed cache.

@@ -1,0 +1,310 @@
+///! The fs API on real files: whole-file reads and writes, errors that name
+///! their path, directories and their listings, path queries, non-ASCII
+///! names, and the UTF-8 and UTF-16 checks underneath.
+///!
+///! Each test works in its own directory under the OS temp directory and
+///! removes it before returning.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::FsApi;
+
+import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::core::slice::{ Slice };
+import std::collections::str::{ Str, Utf8Error };
+import std::collections::string::{ String };
+import std::collections::array::{ Array };
+import std::io::error::{ IoError, IoErrorKind };
+import std::encoding::utf16::{ Utf16 };
+import std::fs::{ Directory, File, Path, PathBuf };
+import std::fmt::display::{ Display, format_to_string };
+import std::core::mem;
+import std::env;
+import std::process;
+import std::test::error::{ TestError };
+import std::test::assert::{ bail, expect, expect_eq };
+
+/// An empty directory of this test's own: `<temp>/cryo_fs_api_<pid>_<tag>`.
+function scratch(tag: Str) -> Result<PathBuf, TestError> {
+    const root: String = match (env::var(Str::new("TEMP"))) {
+        Option::Some(temp) => { temp }
+        Option::None       => { String::from_str(Str::new("/tmp")) }
+    };
+    mut name: String = String::from_str(Str::new("cryo_fs_api_"));
+    name.push(process::id());
+    name.push(Str::new("_"));
+    name.push(tag);
+    const directory: PathBuf = PathBuf::from(root.as_str()).join(name.as_str());
+    if (directory.as_path().exists()) {
+        Directory::remove_all(directory.as_path())?;
+    }
+    Directory::create_all(directory.as_path())?;
+    return Result::Ok(directory);
+}
+
+/// What `value` prints as.
+function shown<T>(value: &T) -> String where T: Display {
+    match (format_to_string(value)) {
+        Result::Ok(text) => { return text; }
+        Result::Err(_)   => { return String::new(); }
+    }
+}
+
+![test]
+function read_text_returns_what_write_text_wrote() -> Result<(), TestError> {
+    const directory: PathBuf = scratch("text")?;
+    const file: PathBuf = directory.join("notes.txt");
+    File::write_text(file.as_path(), "first line\nna\u{ef}ve caf\u{e9}\n")?;
+    const text: String = File::read_text(file.as_path())?;
+    expect(text.as_str() == Str::new("first line\nna\u{ef}ve caf\u{e9}\n"), "read_text returns the text write_text wrote")?;
+    const bytes: Array<u8> = File::read_bytes(file.as_path())?;
+    expect_eq(bytes.length(), text.length())?;
+    Directory::remove_all(directory.as_path())?;
+    return Result::Ok(());
+}
+
+![test]
+function append_text_adds_to_the_end() -> Result<(), TestError> {
+    const directory: PathBuf = scratch("append")?;
+    const file: PathBuf = directory.join("log.txt");
+    File::append_text(file.as_path(), "one\n")?;
+    File::append_text(file.as_path(), "two\n")?;
+    File::append_text(file.as_path(), "three\n")?;
+    const text: String = File::read_text(file.as_path())?;
+    expect(text.as_str() == Str::new("one\ntwo\nthree\n"), "each append lands after the last")?;
+    Directory::remove_all(directory.as_path())?;
+    return Result::Ok(());
+}
+
+![test]
+function read_text_refuses_bytes_that_are_not_utf8() -> Result<(), TestError> {
+    const directory: PathBuf = scratch("not_utf8")?;
+    const file: PathBuf = directory.join("binary.dat");
+    mut bytes: [u8; 4] = [0x61, 0xFF, 0x62, 0x0A];
+    File::write_bytes(file.as_path(), Slice::<u8>::from_raw(&bytes[0], 4))?;
+    match (File::read_text(file.as_path())) {
+        Result::Ok(_) => { return bail("read_text accepted a 0xFF byte"); }
+        Result::Err(error) => {
+            match (error.kind) {
+                IoErrorKind::InvalidData => { }
+                _ => { return bail("the failure is not InvalidData"); }
+            }
+            match (error.path()) {
+                Option::Some(at) => { expect(at.as_str() == file.as_path().as_str(), "the error names the file")?; }
+                Option::None     => { return bail("the error names no path"); }
+            }
+        }
+    }
+    const raw: Array<u8> = File::read_bytes(file.as_path())?;
+    expect_eq(raw.length(), 4)?;
+    Directory::remove_all(directory.as_path())?;
+    return Result::Ok(());
+}
+
+![test]
+function a_failure_prints_with_its_path() -> Result<(), TestError> {
+    const directory: PathBuf = scratch("missing")?;
+    const missing: PathBuf = directory.join("absent.txt");
+    match (File::open(missing.as_path())) {
+        Result::Ok(_) => { return bail("opened a file that does not exist"); }
+        Result::Err(error) => {
+            match (error.kind) {
+                IoErrorKind::NotFound => { }
+                _ => { return bail("the failure is not NotFound"); }
+            }
+            mut expected: String = String::from_str(Str::new("not found: "));
+            expected.push(missing.as_path().as_str());
+            const text: String = shown(&error);
+            expect(text.as_str() == expected.as_str(), "Display prints the description, then the path")?;
+        }
+    }
+    Directory::remove_all(directory.as_path())?;
+    return Result::Ok(());
+}
+
+![test]
+function entries_lists_names_paths_and_kinds() -> Result<(), TestError> {
+    const directory: PathBuf = scratch("entries")?;
+    const top: PathBuf = directory.join("top");
+    Directory::create_all(top.join("inner/deeper").as_path())?;
+    const file: PathBuf = top.join("one.txt");
+    File::write_text(file.as_path(), "1")?;
+    mut count: i64 = 0;
+    mut saw_file: boolean = false;
+    mut saw_directory: boolean = false;
+    for (entry in Directory::entries(top.as_path())?) {
+        count = count + 1;
+        if (entry.name() == Str::new("one.txt")) {
+            saw_file = entry.is_file() && entry.path().as_str() == file.as_path().as_str();
+        }
+        if (entry.name() == Str::new("inner")) {
+            saw_directory = entry.is_directory();
+        }
+    }
+    expect_eq(count, 2)?;
+    expect(saw_file, "the file is listed as a file, with its full path")?;
+    expect(saw_directory, "the subdirectory is listed as a directory")?;
+    Directory::remove_all(top.as_path())?;
+    expect(!top.as_path().exists(), "remove_all removes the tree")?;
+    Directory::remove_all(directory.as_path())?;
+    return Result::Ok(());
+}
+
+![test]
+function remove_refuses_a_directory_with_entries() -> Result<(), TestError> {
+    const directory: PathBuf = scratch("full")?;
+    File::write_text(directory.join("kept.txt").as_path(), "x")?;
+    match (Directory::remove(directory.as_path())) {
+        Result::Ok(_) => { return bail("removed a directory that has an entry"); }
+        Result::Err(error) => {
+            match (error.kind) {
+                IoErrorKind::DirectoryNotEmpty => { }
+                _ => { return bail("the failure is not DirectoryNotEmpty"); }
+            }
+        }
+    }
+    Directory::remove_all(directory.as_path())?;
+    return Result::Ok(());
+}
+
+![test]
+function rename_to_replaces_an_existing_target() -> Result<(), TestError> {
+    const directory: PathBuf = scratch("rename")?;
+    const from: PathBuf = directory.join("from.txt");
+    const to: PathBuf = directory.join("to.txt");
+    File::write_text(from.as_path(), "moved")?;
+    File::write_text(to.as_path(), "replaced")?;
+    from.as_path().rename_to(to.as_path())?;
+    expect(!from.as_path().exists(), "the old name is gone")?;
+    const text: String = File::read_text(to.as_path())?;
+    expect(text.as_str() == Str::new("moved"), "the target holds the moved file")?;
+    Directory::remove_all(directory.as_path())?;
+    return Result::Ok(());
+}
+
+![test]
+function path_queries_tell_files_from_directories() -> Result<(), TestError> {
+    const directory: PathBuf = scratch("queries")?;
+    const file: PathBuf = directory.join("plain.txt");
+    File::write_text(file.as_path(), "abc")?;
+    expect(file.as_path().exists() && file.as_path().is_file(), "a file exists and is a file")?;
+    expect(!file.as_path().is_directory(), "a file is not a directory")?;
+    expect(directory.as_path().is_directory(), "a directory is a directory")?;
+    const absent: PathBuf = directory.join("absent");
+    expect(!absent.as_path().exists() && !absent.as_path().is_file(), "nothing is at a missing path")?;
+    expect_eq(file.as_path().metadata()?.length(), 3)?;
+    Directory::remove_all(directory.as_path())?;
+    return Result::Ok(());
+}
+
+![test]
+function non_ascii_names_round_trip() -> Result<(), TestError> {
+    const directory: PathBuf = scratch("names")?;
+    const folder: PathBuf = directory.join("r\u{e9}pertoire-\u{65e5}\u{672c}");
+    Directory::create(folder.as_path())?;
+    const file: PathBuf = folder.join("na\u{ef}ve-\u{1f600}.txt");
+    File::write_text(file.as_path(), "ok")?;
+    const text: String = File::read_text(file.as_path())?;
+    expect(text.as_str() == Str::new("ok"), "a file with a non-ASCII name reads back")?;
+    mut listed: boolean = false;
+    for (entry in Directory::entries(folder.as_path())?) {
+        listed = entry.name() == Str::new("na\u{ef}ve-\u{1f600}.txt") && entry.is_file();
+    }
+    expect(listed, "the listing spells the non-ASCII name as it was created")?;
+    mut folder_listed: boolean = false;
+    for (entry in Directory::entries(directory.as_path())?) {
+        if (entry.name() == Str::new("r\u{e9}pertoire-\u{65e5}\u{672c}")) { folder_listed = entry.is_directory(); }
+    }
+    expect(folder_listed, "the non-ASCII directory is listed as a directory")?;
+    Directory::remove_all(directory.as_path())?;
+    return Result::Ok(());
+}
+
+![test]
+function set_length_cuts_and_extends() -> Result<(), TestError> {
+    const directory: PathBuf = scratch("length")?;
+    const path: PathBuf = directory.join("sized.dat");
+    mut file: File = File::create(path.as_path())?;
+    file.write("0123456789")?;
+    file.set_length(4)?;
+    expect_eq(file.metadata()?.length(), 4)?;
+    file.set_length(8)?;
+    expect_eq(file.metadata()?.length(), 8)?;
+    file.sync_all()?;
+    mem::drop(file);
+    const bytes: Array<u8> = File::read_bytes(path.as_path())?;
+    expect_eq(bytes[3], 0x33)?;
+    expect_eq(bytes[7], 0)?;
+    Directory::remove_all(directory.as_path())?;
+    return Result::Ok(());
+}
+
+![test]
+function stem_and_with_extension() -> Result<(), TestError> {
+    expect(Path::from("a/notes.txt").stem().unwrap() == Str::new("notes"), "stem drops the extension")?;
+    expect(Path::from("a.tar.gz").stem().unwrap() == Str::new("a.tar"), "stem drops only the last extension")?;
+    expect(Path::from(".bashrc").stem().unwrap() == Str::new(".bashrc"), "a leading dot is no extension")?;
+    expect(Path::from("a/").stem().is_none(), "a path ending in a separator has no stem")?;
+    const renamed: PathBuf = Path::from("a/notes.txt").with_extension("md");
+    expect(renamed.as_path().as_str() == Str::new("a/notes.md"), "with_extension replaces the extension")?;
+    const added: PathBuf = Path::from("a/notes").with_extension("md");
+    expect(added.as_path().as_str() == Str::new("a/notes.md"), "with_extension adds one")?;
+    const removed: PathBuf = Path::from("a/notes.txt").with_extension("");
+    expect(removed.as_path().as_str() == Str::new("a/notes"), "an empty extension removes it")?;
+    return Result::Ok(());
+}
+
+![test]
+function str_from_utf8_finds_where_text_stops_being_utf8() -> Result<(), TestError> {
+    expect(Str::from_utf8(Str::new("h\u{e9}llo \u{1f600}").as_bytes()).is_ok(), "well-formed text is accepted")?;
+    mut stray: [u8; 2] = [0x61, 0x80];
+    match (Str::from_utf8(Slice::<u8>::from_raw(&stray[0], 2))) {
+        Result::Ok(_) => { return bail("a stray continuation byte was accepted"); }
+        Result::Err(error) => {
+            expect_eq(error.valid_up_to, 1)?;
+            expect(error.error_length.is_some(), "a malformed byte has a length")?;
+            const text: String = shown(&error);
+            expect(text.as_str() == Str::new("invalid UTF-8 at byte 1"), "Display says where")?;
+        }
+    }
+    mut cut: [u8; 3] = [0x61, 0xE2, 0x82];
+    match (Str::from_utf8(Slice::<u8>::from_raw(&cut[0], 3))) {
+        Result::Ok(_) => { return bail("a sequence cut short was accepted"); }
+        Result::Err(error) => {
+            expect_eq(error.valid_up_to, 1)?;
+            expect(error.error_length.is_none(), "a sequence cut short has no length")?;
+        }
+    }
+    mut surrogate: [u8; 3] = [0xED, 0xA0, 0x80];
+    expect(Str::from_utf8(Slice::<u8>::from_raw(&surrogate[0], 3)).is_err(), "an encoded surrogate is refused")?;
+    mut overlong: [u8; 2] = [0xC0, 0xAF];
+    expect(Str::from_utf8(Slice::<u8>::from_raw(&overlong[0], 2)).is_err(), "an overlong form is refused")?;
+    return Result::Ok(());
+}
+
+![test]
+function utf16_round_trips_and_refuses_lone_surrogates() -> Result<(), TestError> {
+    const units: Array<u16> = Utf16::encode("a\u{20ac}\u{1f600}");
+    expect_eq(units.length(), 5)?;
+    expect_eq(units[1], 0x20AC)?;
+    expect_eq(units[2], 0xD83D)?;
+    expect_eq(units[3], 0xDE00)?;
+    expect_eq(units[4], 0)?;
+    match (Utf16::decode(units.as_slice().subslice(0, 4))) {
+        Result::Ok(text) => {
+            expect(text.as_str() == Str::new("a\u{20ac}\u{1f600}"), "decode undoes encode")?;
+        }
+        Result::Err(_) => { return bail("decode refused what encode produced"); }
+    }
+    mut lone: [u16; 1] = [0xDC00];
+    expect(Utf16::decode(Slice::<u16>::from_raw(&lone[0], 1)).is_err(), "a lone low surrogate is refused")?;
+    mut trailing: [u16; 2] = [0x61, 0xD83D];
+    match (Utf16::decode(Slice::<u16>::from_raw(&trailing[0], 2))) {
+        Result::Ok(_) => { return bail("a trailing high surrogate was accepted"); }
+        Result::Err(error) => {
+            expect_eq(error.valid_up_to, 1)?;
+            expect(error.error_length.is_none(), "a high surrogate at the end could still be completed")?;
+        }
+    }
+    return Result::Ok(());
+}

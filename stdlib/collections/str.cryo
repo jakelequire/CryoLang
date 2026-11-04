@@ -59,6 +59,26 @@ public type struct Str {
         };
     }
 
+    /// Borrow `bytes` as a `Str` if they are well-formed UTF-8: the checked
+    /// constructor, where `from` and `from_raw` take the caller's word for
+    /// it. Overlong forms, surrogate halves, scalars above U+10FFFF and a
+    /// sequence cut short are refused, and the error says where.
+    public static from_utf8(bytes: Slice<u8>) -> Result<Str, Utf8Error> {
+        const start: u8* = bytes.as_ptr();
+        const length: i64 = bytes.length();
+        mut position: i64 = 0;
+        while (position < length) {
+            const step: Pair<u32, i64> = decode_scalar(start, length, position);
+            // The decoder answers a malformed sequence with the replacement
+            // scalar over ONE byte; a real U+FFFD in the text spans three.
+            if (step.first == REPLACEMENT_SCALAR && step.second == 1) {
+                return Result::Err(Utf8Error::found_at(start, length, position));
+            }
+            position = position + step.second;
+        }
+        return Result::Ok(Str { bytes: start, length: length });
+    }
+
     /// Byte length. For a UTF-8 string, `length() >= char_count`.
     ![inline]
     public length(&this) -> i64 {
@@ -455,6 +475,44 @@ implement trait Iterator<Str> for struct SplitIter {
             }
         }
         return Option::None;
+    }
+}
+
+/// Where a byte sequence stops being UTF-8; see `Str::from_utf8`.
+public type struct Utf8Error {
+    /// How many bytes from the start are well-formed UTF-8.
+    public valid_up_to: i64;
+    /// `Some(1)` when the byte at `valid_up_to` starts no well-formed
+    /// sequence, so decoding resumes one byte later; `None` when the input
+    /// ends part-way through a multi-byte sequence, which more input could
+    /// still complete.
+    public error_length: Option<i64>;
+
+    /// What went wrong, as a borrowed `Str`; `Display` adds the position.
+    public describe(&this) -> Str {
+        if (this.error_length.is_none()) {
+            return Str::new("incomplete UTF-8 sequence");
+        }
+        return Str::new("invalid UTF-8");
+    }
+
+    /// The error for the malformed sequence at `position`. A lead byte
+    /// followed only by continuation bytes up to the end of the input is a
+    /// sequence cut short rather than a malformed one.
+    private static found_at(bytes: u8*, length: i64, position: i64) -> Utf8Error {
+        const lead: u8 = bytes[position];
+        mut needed: i64 = 0;
+        if ((lead & 0xE0) == 0xC0) { needed = 1; }
+        else if ((lead & 0xF0) == 0xE0) { needed = 2; }
+        else if ((lead & 0xF8) == 0xF0) { needed = 3; }
+        if (needed > 0 && position + 1 + needed > length) {
+            mut next: i64 = position + 1;
+            while (next < length && (bytes[next] & 0xC0) == 0x80) { next = next + 1; }
+            if (next == length) {
+                return Utf8Error { valid_up_to: position, error_length: Option::None };
+            }
+        }
+        return Utf8Error { valid_up_to: position, error_length: Option::Some(1) };
     }
 }
 

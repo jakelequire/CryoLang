@@ -29,12 +29,19 @@
 namespace std::fs::path;
 
 import std::core::option::{ Option };
-import std::core::result;
-import std::core::slice;
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
 import std::core::drop::{ Drop };
+import std::core::mem;
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
+import std::collections::array::{ Array };
 import std::alloc::allocator::{ Allocator, GlobalAlloc };
+import std::io::error::{ IoError, IoErrorKind };
+import std::encoding::utf16::{ Utf16 };
+import std::fs::metadata::{ Metadata };
+import std::ffi::libc;
+import std::sys::syscall;
 
 private const SEPARATOR:     u8 = 0x2F;  // '/'
 private const BACKSLASH:     u8 = 0x5C;  // '\'
@@ -54,13 +61,21 @@ private const WINDOWS_SYNTAX: boolean = false;
 public type struct Path {
     private inner: Str;
 
-    /// Borrow a `Str` as a `Path`.  A NUL-terminated `string` (C-string /
-    /// `i8*`) converts implicitly at the call site via `Str`'s `![implicit]`
-    /// `new`, so `Path::from("/tmp")` and `Path::from(some_str)` both work;
-    /// a C-string's terminating NUL is not part of the path bytes.  The
-    /// borrowed bytes must outlive the `Path`.
+    /// Borrow a `Str` as a `Path`.  Marked `![implicit]`, so a `Str` passed
+    /// where a `Path` is wanted converts at the call site:
+    /// `File::open(name)` with `name: Str`.  The borrowed bytes must
+    /// outlive the `Path`.
+    ![implicit]
     public static from(source: Str) -> Path {
         return Path { inner: source };
+    }
+
+    /// Borrow a NUL-terminated `string` (a literal, say) as a `Path`; the
+    /// NUL is not part of the path.  Marked `![implicit]`, so
+    /// `File::read_text("config.toml")` needs no wrapping.
+    ![implicit]
+    public static new(text: string) -> Path {
+        return Path { inner: Str::new(text) };
     }
 
     public as_str(&this) -> Str {
@@ -280,6 +295,152 @@ public type struct Path {
         mut buf: PathBuf = PathBuf::from(this.inner);
         buf.push(segment);
         return buf;
+    }
+
+    /// The final component without its extension, or `None` when there is
+    /// no final component (see `file_name`):
+    ///
+    ///   `notes.txt`   -> Some("notes")
+    ///   `a.tar.gz`    -> Some("a.tar")    (only the last extension goes)
+    ///   `.bashrc`     -> Some(".bashrc")  (a leading dot is no extension)
+    ///   `Makefile`    -> Some("Makefile")
+    public stem(&this) -> Option<Str> {
+        match (this.file_name()) {
+            Option::None => { return Option::None; }
+            Option::Some(name) => {
+                match (this.extension()) {
+                    Option::Some(extension) => {
+                        return Option::Some(name.sub_bytes(0, name.length() - extension.length() - 1));
+                    }
+                    Option::None => { return Option::Some(name); }
+                }
+            }
+        }
+    }
+
+    /// A copy of this path whose final component carries `extension`
+    /// instead of its own: `a/notes.txt` with `md` is `a/notes.md`, and
+    /// `a/notes` with `md` is `a/notes.md`. An empty `extension` removes
+    /// the extension. A path with no final component (`a/`, `/`) is copied
+    /// unchanged.
+    public with_extension(&this, extension: Str) -> PathBuf {
+        match (this.stem()) {
+            Option::None => { return PathBuf::from(this.inner); }
+            Option::Some(stem) => {
+                const name_start: i64 = this.inner.length() - this.file_name().unwrap().length();
+                mut result: PathBuf = PathBuf::from(this.inner.sub_bytes(0, name_start + stem.length()));
+                if (!extension.is_empty()) {
+                    result.inner.push_byte(DOT);
+                    result.inner.push(extension);
+                }
+                return result;
+            }
+        }
+    }
+
+    // What is at this path, whatever kind of entry it is. Each failure names
+    // the path.
+
+    /// Whether anything exists at this path. A failure to look - a
+    /// directory on the way that cannot be searched - also answers `false`;
+    /// `metadata` says which it was.
+    public exists(&this) -> boolean {
+        return Metadata::of(*this).is_ok();
+    }
+
+    /// Whether this path names a regular file, following a final symlink.
+    public is_file(&this) -> boolean {
+        match (Metadata::of(*this)) {
+            Result::Ok(found) => { return found.is_file(); }
+            Result::Err(_)    => { return false; }
+        }
+    }
+
+    /// Whether this path names a directory, following a final symlink.
+    public is_directory(&this) -> boolean {
+        match (Metadata::of(*this)) {
+            Result::Ok(found) => { return found.is_directory(); }
+            Result::Err(_)    => { return false; }
+        }
+    }
+
+    /// What is at this path, following a final symlink.
+    public metadata(&this) -> Result<Metadata, IoError> {
+        return Metadata::of(*this);
+    }
+
+    /// What is at this path, reporting a final symlink as itself.
+    public symlink_metadata(&this) -> Result<Metadata, IoError> {
+        return Metadata::of_link(*this);
+    }
+
+    /// Move whatever is at this path - a file or a directory - to `target`,
+    /// replacing a file already there. Atomic within one filesystem; across
+    /// two it fails, and the entry must be copied instead.
+    ![target(unix)]
+    public rename_to(&this, target: Path) -> Result<(), IoError> {
+        mut c_from: String = String::with_null(this.inner);
+        mut c_to: String = String::with_null(target.inner);
+        const rc: i32 = libc::rename(c_from.as_ptr(), c_to.as_ptr());
+        const err: i32 = libc::errno();
+        mem::drop(c_to);
+        mem::drop(c_from);
+        if (rc != 0) {
+            return Result::Err(IoError::from_errno(err).with_path(*this));
+        }
+        return Result::Ok(());
+    }
+    ![target(windows)]
+    public rename_to(&this, target: Path) -> Result<(), IoError> {
+        const wide_from: Array<u16> = Utf16::encode(this.inner);
+        const wide_to: Array<u16> = Utf16::encode(target.inner);
+        if (syscall::MoveFileExW(wide_from.as_ptr(), wide_to.as_ptr(),
+                syscall::MOVEFILE_REPLACE_EXISTING) == 0) {
+            return Result::Err(IoError::last_os_error().with_path(*this));
+        }
+        return Result::Ok(());
+    }
+
+    /// This path made absolute and free of `.`, `..` and symlinks
+    /// (`realpath(3)`). The entry must exist.
+    ///
+    /// Windows makes the path absolute and resolves `.` and `..` lexically
+    /// (`GetFullPathNameW`), without resolving symlinks or requiring the
+    /// entry to exist, and keeps a `subst` drive as written. Its separators
+    /// come back as `/`, as `join` writes them, so one file has one
+    /// canonical spelling on every host.
+    ![target(unix)]
+    public canonicalize(&this) -> Result<PathBuf, IoError> {
+        mut c_path: String = String::with_null(this.inner);
+        mut buffer: [u8; 4096];
+        const resolved: u8* = libc::realpath(c_path.as_ptr(), &buffer[0]);
+        const err: i32 = libc::errno();
+        mem::drop(c_path);
+        if (resolved == null) {
+            return Result::Err(IoError::from_errno(err).with_path(*this));
+        }
+        return Result::Ok(PathBuf::from(Str::from_raw(&buffer[0], libc::strlen(&buffer[0]) as i64)));
+    }
+    ![target(windows)]
+    public canonicalize(&this) -> Result<PathBuf, IoError> {
+        const wide: Array<u16> = Utf16::encode(this.inner);
+        mut buffer: [u16; 4096];
+        const count: u32 = syscall::GetFullPathNameW(wide.as_ptr(), 4096, &buffer[0], null);
+        if (count == 0 || count >= 4096) {
+            return Result::Err(IoError::last_os_error().with_path(*this));
+        }
+        for (mut i: i64 = 0; i < (count as i64); i++) {
+            if (buffer[i] == (BACKSLASH as u16)) { buffer[i] = SEPARATOR as u16; }
+        }
+        match (Utf16::decode(Slice::<u16>::from_raw(&buffer[0], count as i64))) {
+            Result::Ok(text) => {
+                const owned: PathBuf = PathBuf { inner: text };
+                return Result::Ok(owned);
+            }
+            Result::Err(_) => {
+                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0).with_path(*this));
+            }
+        }
     }
 }
 

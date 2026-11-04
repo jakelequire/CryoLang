@@ -1,17 +1,29 @@
-///! File: Read/Write over a file descriptor.
+///! File: one open file, and the operations on a whole file at once.
 ///!
-///! Opening a file returns a `File` that implements both `Read` and
-///! `Write`. Callers compose with `fmt::Formatter` or read-all
-///! helpers without caring that the destination is a file.
+///! The common cases are one call each:
 ///!
-///! `File` wraps a raw `i32` fd. The obligations are the POSIX ones:
-///! every `open` pairs with a `drop` (which `close`s), and no
-///! `File::drop` should be skipped or double-invoked.
+///!     const text: String = File::read_text("config.toml")?;
+///!     File::write_text("out.txt", text.as_str())?;
+///!     File::append_text("log.txt", "started\n")?;
+///!
+///! For more than one read or write, open a `File`: it implements `Read`,
+///! `Write` and `Seek`, so code written against the I/O traits (and the
+///! `BufReader` / `BufWriter` in `io::buf`) works on it unchanged. The file
+///! is closed when the `File` is dropped. `OpenOptions` asks for anything
+///! other than "read" (`open`) or "create or truncate, then write"
+///! (`create`): appending, read and write together, or exclusive creation.
+///!
+///! Every failure from an operation that names a path carries that path,
+///! so it prints as `not found: config.toml`.
+///!
+///! `File` wraps a C-runtime descriptor (an `i32`). On Windows the file is
+///! opened with `CreateFileW` and the HANDLE wrapped in a descriptor, so a
+///! path is passed to the OS as UTF-16 and any name the filesystem holds
+///! can be opened.
 
 namespace std::fs::file;
 
-import std::core::intrinsics;
-import std::core::option;
+import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::core::slice::{ Slice };
 import std::core::drop::{ Drop };
@@ -21,10 +33,12 @@ import std::io::traits::{ Read, Seek, SeekFrom, Write };
 import std::collections::string::{ String };
 import std::collections::str::{ Str };
 import std::collections::array::{ Array };
+import std::encoding::utf16::{ Utf16 };
 import std::ffi::libc;
 import std::sys::syscall;
+import std::sys::syscall::{ LARGE_INTEGER };
 import std::fs::path::{ Path };
-import std::fs::metadata::{ Metadata, metadata };
+import std::fs::metadata::{ Metadata };
 import std::core::mem;
 
 // POSIX `open` flags and `lseek` whence values live in `ffi::libc`
@@ -33,8 +47,15 @@ import std::core::mem;
 // Default mode for newly created files: 0644.
 public const DEFAULT_CREATE_MODE: u32 = 420;
 
-// OpenOptions: what you're asking the OS for
+/// Bytes moved per `read` while copying a file.
+private const COPY_CHUNK: i64 = 65536;
 
+/// What to ask the OS for when opening a file; `File::open_with` (or
+/// `open` here) opens it.
+///
+///     mut options: OpenOptions = OpenOptions::new();
+///     options = options.append(true).create(true);
+///     mut log: File = options.open("log.txt")?;
 public type struct OpenOptions {
     private read: boolean;
     private write: boolean;
@@ -71,143 +92,318 @@ public type struct OpenOptions {
         return this;
     }
 
+    /// Open for reading.
     public read(mut &this, value: boolean) -> OpenOptions {
         this.read = value;
         return this;
     }
 
+    /// Open for writing, at the start of the file unless `append` is set.
     public write(mut &this, value: boolean) -> OpenOptions {
         this.write = value;
         return this;
     }
 
+    /// Every write goes to the end of the file, whatever another writer
+    /// did since. Implies writing.
     public append(mut &this, value: boolean) -> OpenOptions {
         this.append = value;
         return this;
     }
 
+    /// Empty an existing file on opening it.
     public truncate(mut &this, value: boolean) -> OpenOptions {
         this.truncate = value;
         return this;
     }
 
+    /// Create the file if it does not exist.
     public create(mut &this, value: boolean) -> OpenOptions {
         this.create = value;
         return this;
     }
 
+    /// Create the file, failing with `AlreadyExists` if anything is
+    /// already there. The check and the creation are one step, so two
+    /// processes cannot both succeed.
     public create_new(mut &this, value: boolean) -> OpenOptions {
         this.create_new = value;
         return this;
     }
 
-    public open(&this, p: Path) -> Result<File, IoError> {
-        return File::open_with(p, this);
+    /// Open `path` with these options; the same as `File::open_with`.
+    public open(&this, path: Path) -> Result<File, IoError> {
+        return File::open_with(path, this);
     }
 
-    /// Flatten the options into the platform's descriptor flags: POSIX
-    /// `open`'s, or on Windows `_open_osfhandle`'s.  The flags and their
-    /// values are OS-specific, so the bit assembly lives in the per-OS
-    /// `open_flags_for` helpers below; a method body can't be
-    /// `![target(...)]`-gated, but a free function can.
-    private to_flags(&this) -> i32 {
-        return open_flags_for(this);
+    /// Whether the descriptor needs write access.
+    private writes(&this) -> boolean {
+        return this.write || this.append;
     }
-}
 
-// POSIX `open` flags: glibc/Linux values, straight from `<fcntl.h>` (the
-// constants in `ffi::libc`). Close-on-exec by default so a concurrent
-// `fork`+`exec` (e.g. via `process::Command`) does not leak this fd into
-// the child; callers that need it to survive an exec can `dup` it.
-![target(unix)]
-private function open_flags_for(o: &OpenOptions) -> i32 {
-    mut flags: i32 = 0;
-    if (o.read && o.write) { flags = libc::O_RDWR; }
-    else if (o.write) { flags = libc::O_WRONLY; }
-    else { flags = libc::O_RDONLY; }
-    if (o.append) { flags = flags | libc::O_APPEND; }
-    if (o.truncate) { flags = flags | libc::O_TRUNC; }
-    if (o.create) { flags = flags | libc::O_CREAT; }
-    if (o.create_new) { flags = flags | libc::O_CREAT | libc::O_EXCL; }
-    flags = flags | libc::O_CLOEXEC;
-    return flags;
-}
-
-// The CRT's `_open` cannot ask for delete sharing, so Windows opens through
-// `CreateFileA` and wraps the HANDLE in a CRT descriptor; these are the
-// flags `_open_osfhandle` takes for that.  Without `_O_TEXT` the descriptor
-// is binary, so the CRT does no CRLF translation.
-![target(windows)]
-private function open_flags_for(o: &OpenOptions) -> i32 {
-    mut flags: i32 = 0;
-    if (!o.write) { flags = libc::O_RDONLY; }
-    if (o.append) { flags = flags | libc::O_APPEND; }
-    return flags;
-}
-
-![target(unix)]
-private function open_descriptor(c_path: &String, options: &OpenOptions) -> Result<i32, IoError> {
-    const raw_fd: i32 = libc::open(c_path.as_ptr(), options.to_flags(), DEFAULT_CREATE_MODE);
-    if (raw_fd < 0) {
-        return Result::Err(IoError::from_errno(libc::errno()));
+    /// The POSIX `open` flags: glibc/Linux values, from `<fcntl.h>` (the
+    /// constants in `ffi::libc`). Close-on-exec, so a concurrent
+    /// `fork`+`exec` (e.g. via `process::Command`) does not leak the
+    /// descriptor into the child; a caller that needs it to survive an exec
+    /// can `dup` it.
+    ![target(unix)]
+    private descriptor_flags(&this) -> i32 {
+        mut flags: i32 = 0;
+        if (this.read && this.writes()) { flags = libc::O_RDWR; }
+        else if (this.writes()) { flags = libc::O_WRONLY; }
+        else { flags = libc::O_RDONLY; }
+        if (this.append) { flags = flags | libc::O_APPEND; }
+        if (this.truncate) { flags = flags | libc::O_TRUNC; }
+        if (this.create) { flags = flags | libc::O_CREAT; }
+        if (this.create_new) { flags = flags | libc::O_CREAT | libc::O_EXCL; }
+        return flags | libc::O_CLOEXEC;
     }
-    return Result::Ok(raw_fd);
-}
 
-// Access and creation follow the POSIX flags: reading unless only writing
-// was asked for, and `create`, `truncate` and `create_new` choose the same
-// dispositions `O_CREAT`, `O_TRUNC` and `O_EXCL` would.  The handle is not
-// inheritable, the analog of close-on-exec.
-![target(windows)]
-private function open_descriptor(c_path: &String, options: &OpenOptions) -> Result<i32, IoError> {
-    mut access: u32 = 0;
-    if (options.read || !options.write) { access = access | syscall::GENERIC_READ; }
-    if (options.write) { access = access | syscall::GENERIC_WRITE; }
-    mut share: u32 = 0;
-    if (options.share_read)   { share = share | syscall::FILE_SHARE_READ; }
-    if (options.share_write)  { share = share | syscall::FILE_SHARE_WRITE; }
-    if (options.share_delete) { share = share | syscall::FILE_SHARE_DELETE; }
-    mut disposition: u32 = syscall::OPEN_EXISTING;
-    if (options.create_new) { disposition = syscall::CREATE_NEW; }
-    else if (options.create && options.truncate) { disposition = syscall::CREATE_ALWAYS; }
-    else if (options.create) { disposition = syscall::OPEN_ALWAYS; }
-    else if (options.truncate) { disposition = syscall::TRUNCATE_EXISTING; }
-    const handle: u8* = syscall::CreateFileA(c_path.as_ptr(), access, share, null,
-        disposition, syscall::FILE_ATTRIBUTE_NORMAL, null);
-    // INVALID_HANDLE_VALUE, compared as a local -1.
-    if ((handle as i64) == -1) {
-        return Result::Err(IoError::last_os_error());
+    /// The flags `_open_osfhandle` takes for the HANDLE `CreateFileW`
+    /// opened. Without `_O_TEXT` the descriptor is binary, so the C runtime
+    /// does no CRLF translation.
+    ![target(windows)]
+    private descriptor_flags(&this) -> i32 {
+        mut flags: i32 = 0;
+        if (!this.writes()) { flags = libc::O_RDONLY; }
+        if (this.append) { flags = flags | libc::O_APPEND; }
+        return flags;
     }
-    const raw_fd: i32 = libc::_open_osfhandle(handle as i64, options.to_flags());
-    if (raw_fd < 0) {
-        const failure: IoError = IoError::from_errno(libc::errno());
-        syscall::CloseHandle(handle);
-        return Result::Err(failure);
-    }
-    return Result::Ok(raw_fd);
 }
 
 public type struct File {
     private fd: i32;
 
-    /// Open `p` for reading. Fails with `NotFound`, `PermissionDenied`,
-    /// or a mapped `errno`-derived kind on failure.
-    public static open(p: Path) -> Result<File, IoError> {
+    /// Open `path` for reading.
+    public static open(path: Path) -> Result<File, IoError> {
         mut options: OpenOptions = OpenOptions::new();
         options = options.read(true);
-        return File::open_with(p, &options);
+        return File::open_with(path, &options);
     }
 
-    /// Create (or truncate) `p` for writing.
-    public static create(p: Path) -> Result<File, IoError> {
+    /// Open `path` for writing, creating the file or emptying an existing
+    /// one.
+    public static create(path: Path) -> Result<File, IoError> {
         mut options: OpenOptions = OpenOptions::new();
         options = options.write(true).create(true).truncate(true);
-        return File::open_with(p, &options);
+        return File::open_with(path, &options);
     }
 
-    public static open_with(p: Path, options: &OpenOptions) -> Result<File, IoError> {
-        mut c_path: String = String::with_null(p.as_str());
-        return Result::Ok(File { fd: open_descriptor(&c_path, options)? });
+    /// Open `path` as `options` ask. A failure names `path`.
+    ![target(unix)]
+    public static open_with(path: Path, options: &OpenOptions) -> Result<File, IoError> {
+        mut c_path: String = String::with_null(path.as_str());
+        const descriptor: i32 = libc::open(c_path.as_ptr(), options.descriptor_flags(), DEFAULT_CREATE_MODE);
+        const err: i32 = libc::errno();
+        mem::drop(c_path);
+        if (descriptor < 0) {
+            return Result::Err(IoError::from_errno(err).with_path(path));
+        }
+        return Result::Ok(File { fd: descriptor });
+    }
+
+    /// Open `path` as `options` ask: the read and write access, sharing
+    /// and creation the POSIX flags would choose, with a HANDLE that is not
+    /// inherited (the analog of close-on-exec). The C runtime's `_open`
+    /// cannot ask for delete sharing, so the HANDLE comes from `CreateFileW`
+    /// and is wrapped in a descriptor. A failure names `path`.
+    ![target(windows)]
+    public static open_with(path: Path, options: &OpenOptions) -> Result<File, IoError> {
+        mut access: u32 = 0;
+        if (options.read || !options.writes()) { access = access | syscall::GENERIC_READ; }
+        if (options.writes()) { access = access | syscall::GENERIC_WRITE; }
+        mut share: u32 = 0;
+        if (options.share_read)   { share = share | syscall::FILE_SHARE_READ; }
+        if (options.share_write)  { share = share | syscall::FILE_SHARE_WRITE; }
+        if (options.share_delete) { share = share | syscall::FILE_SHARE_DELETE; }
+        mut disposition: u32 = syscall::OPEN_EXISTING;
+        if (options.create_new) { disposition = syscall::CREATE_NEW; }
+        else if (options.create && options.truncate) { disposition = syscall::CREATE_ALWAYS; }
+        else if (options.create) { disposition = syscall::OPEN_ALWAYS; }
+        else if (options.truncate) { disposition = syscall::TRUNCATE_EXISTING; }
+        const wide: Array<u16> = Utf16::encode(path.as_str());
+        const handle: u8* = syscall::CreateFileW(wide.as_ptr(), access, share, null,
+            disposition, syscall::FILE_ATTRIBUTE_NORMAL, null);
+        // INVALID_HANDLE_VALUE is `(HANDLE)-1`.
+        if ((handle as i64) == -1) {
+            return Result::Err(IoError::last_os_error().with_path(path));
+        }
+        const descriptor: i32 = libc::_open_osfhandle(handle as i64, options.descriptor_flags());
+        if (descriptor < 0) {
+            const failure: IoError = IoError::from_errno(libc::errno());
+            syscall::CloseHandle(handle);
+            return Result::Err(failure.with_path(path));
+        }
+        return Result::Ok(File { fd: descriptor });
+    }
+
+    /// The whole of the file at `path` as text. Fails with `InvalidData`
+    /// if the bytes are not UTF-8; every failure names `path`.
+    public static read_text(path: Path) -> Result<String, IoError> {
+        mut file: File = File::open(path)?;
+        mut text: String = String::new();
+        // The size is a hint for one allocation, not a limit: a file that
+        // grows while it is read is read to its new end.
+        match (file.metadata()) {
+            Result::Ok(found) => { text.reserve(found.length())?; }
+            Result::Err(_)    => { }
+        }
+        match (file.read_to_string(&text)) {
+            Result::Ok(_)      => { return Result::Ok(text); }
+            Result::Err(error) => { return Result::Err(error.with_path(path)); }
+        }
+    }
+
+    /// The whole of the file at `path` as bytes. Every failure names
+    /// `path`.
+    public static read_bytes(path: Path) -> Result<Array<u8>, IoError> {
+        mut file: File = File::open(path)?;
+        mut bytes: Array<u8> = Array::<u8>::new();
+        match (file.metadata()) {
+            Result::Ok(found) => { bytes.reserve(found.length())?; }
+            Result::Err(_)    => { }
+        }
+        match (file.read_to_end(&bytes)) {
+            Result::Ok(_)      => { return Result::Ok(bytes); }
+            Result::Err(error) => { return Result::Err(error.with_path(path)); }
+        }
+    }
+
+    /// Make the file at `path` hold exactly `text`, creating it if needed.
+    public static write_text(path: Path, text: Str) -> Result<(), IoError> {
+        return File::write_bytes(path, text.as_bytes());
+    }
+
+    /// Make the file at `path` hold exactly `bytes`, creating it if needed.
+    /// Every failure names `path`.
+    public static write_bytes(path: Path, bytes: Slice<u8>) -> Result<(), IoError> {
+        mut file: File = File::create(path)?;
+        match (file.write(bytes)) {
+            Result::Ok(_)      => { return Result::Ok(()); }
+            Result::Err(error) => { return Result::Err(error.with_path(path)); }
+        }
+    }
+
+    /// Add `text` to the end of the file at `path`, creating it if needed.
+    /// Every failure names `path`.
+    public static append_text(path: Path, text: Str) -> Result<(), IoError> {
+        mut options: OpenOptions = OpenOptions::new();
+        options = options.append(true).create(true);
+        mut file: File = File::open_with(path, &options)?;
+        match (file.write(text)) {
+            Result::Ok(_)      => { return Result::Ok(()); }
+            Result::Err(error) => { return Result::Err(error.with_path(path)); }
+        }
+    }
+
+    /// Copy the contents of the file at `from` to `to`, returning the
+    /// number of bytes copied. `to` is created or emptied first, then given
+    /// `from`'s Unix permission bits; on Windows the contents are copied
+    /// and the ACLs are not. `from` must be a regular file: a directory
+    /// fails with `IsADirectory`. A failure part-way leaves what was written
+    /// of `to` in place. Each failure names the path it happened at.
+    public static copy(from: Path, to: Path) -> Result<i64, IoError> {
+        const info: Metadata = from.metadata()?;
+        if (info.is_directory()) {
+            return Result::Err(IoError::new(IoErrorKind::IsADirectory, 0).with_path(from));
+        }
+        if (!info.is_file()) {
+            return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0).with_path(from));
+        }
+        mut source: File = File::open(from)?;
+        mut destination: File = File::create(to)?;
+        mut total: i64 = 0;
+        mut chunk: [u8; COPY_CHUNK];
+        loop {
+            const count: i64 = match (source.read(&chunk[0], COPY_CHUNK)) {
+                Result::Ok(count)  => { count }
+                Result::Err(error) => { return Result::Err(error.with_path(from)); }
+            };
+            if (count == 0) { break; }
+            match (destination.write(Slice::<u8>::from_raw(&chunk[0], count))) {
+                Result::Ok(_)      => { }
+                Result::Err(error) => { return Result::Err(error.with_path(to)); }
+            }
+            total = total + count;
+        }
+        match (destination.take_permissions_of(info)) {
+            Result::Ok(_)      => { return Result::Ok(total); }
+            Result::Err(error) => { return Result::Err(error.with_path(to)); }
+        }
+    }
+
+    /// Delete the file at `path`. A directory is refused; see
+    /// `Directory::remove`.
+    ![target(unix)]
+    public static remove(path: Path) -> Result<(), IoError> {
+        mut c_path: String = String::with_null(path.as_str());
+        const rc: i32 = libc::unlink(c_path.as_ptr());
+        const err: i32 = libc::errno();
+        mem::drop(c_path);
+        if (rc != 0) {
+            return Result::Err(IoError::from_errno(err).with_path(path));
+        }
+        return Result::Ok(());
+    }
+    ![target(windows)]
+    public static remove(path: Path) -> Result<(), IoError> {
+        const wide: Array<u16> = Utf16::encode(path.as_str());
+        if (syscall::DeleteFileW(wide.as_ptr()) == 0) {
+            return Result::Err(IoError::last_os_error().with_path(path));
+        }
+        return Result::Ok(());
+    }
+
+    /// What the open file is: its type, size and modification time.
+    public metadata(&this) -> Result<Metadata, IoError> {
+        return Metadata::of_descriptor(this.fd);
+    }
+
+    /// Cut the file to `length` bytes, or extend it with zero bytes to
+    /// that length. The read/write position does not move.
+    ![target(unix)]
+    public set_length(mut &this, length: i64) -> Result<(), IoError> {
+        if (libc::ftruncate(this.fd, length) != 0) {
+            return Result::Err(IoError::last_os_error());
+        }
+        return Result::Ok(());
+    }
+    ![target(windows)]
+    public set_length(mut &this, length: i64) -> Result<(), IoError> {
+        const handle: u8* = this.handle()?;
+        mut position: LARGE_INTEGER = LARGE_INTEGER { QuadPart: 0 };
+        if (syscall::SetFilePointerEx(handle, LARGE_INTEGER { QuadPart: 0 }, &position,
+                syscall::FILE_CURRENT) == 0) {
+            return Result::Err(IoError::last_os_error());
+        }
+        if (syscall::SetFilePointerEx(handle, LARGE_INTEGER { QuadPart: length }, null,
+                syscall::FILE_BEGIN) == 0) {
+            return Result::Err(IoError::last_os_error());
+        }
+        const cut: i32 = syscall::SetEndOfFile(handle);
+        const failure: IoError = IoError::last_os_error();
+        syscall::SetFilePointerEx(handle, position, null, syscall::FILE_BEGIN);
+        if (cut == 0) { return Result::Err(failure); }
+        return Result::Ok(());
+    }
+
+    /// Wait until everything written to the file is on the storage device,
+    /// metadata included. Writes reach the OS without this; it is for data
+    /// that must survive a power failure.
+    ![target(unix)]
+    public sync_all(mut &this) -> Result<(), IoError> {
+        if (libc::fsync(this.fd) != 0) {
+            return Result::Err(IoError::last_os_error());
+        }
+        return Result::Ok(());
+    }
+    ![target(windows)]
+    public sync_all(mut &this) -> Result<(), IoError> {
+        const handle: u8* = this.handle()?;
+        if (syscall::FlushFileBuffers(handle) == 0) {
+            return Result::Err(IoError::last_os_error());
+        }
+        return Result::Ok(());
     }
 
     /// Hand the descriptor over to the caller, who must close it, and leave
@@ -217,6 +413,31 @@ public type struct File {
         const descriptor: i32 = this.fd;
         this.fd = -1;
         return descriptor;
+    }
+
+    /// The HANDLE the C runtime keeps for this descriptor.
+    ![target(windows)]
+    private handle(&this) -> Result<u8*, IoError> {
+        const handle: i64 = libc::_get_osfhandle(this.fd);
+        if (handle == -1) {
+            return Result::Err(IoError::from_errno(libc::errno()));
+        }
+        return Result::Ok(handle as u8*);
+    }
+
+    /// Give this file the Unix permission bits `info` reports. Windows has
+    /// no permission bits to give - access there is governed by ACLs - so
+    /// there it does nothing.
+    ![target(unix)]
+    private take_permissions_of(mut &this, info: Metadata) -> Result<(), IoError> {
+        if (libc::fchmod(this.fd, info.permissions()) != 0) {
+            return Result::Err(IoError::last_os_error());
+        }
+        return Result::Ok(());
+    }
+    ![target(windows)]
+    private take_permissions_of(mut &this, info: Metadata) -> Result<(), IoError> {
+        return Result::Ok(());
     }
 }
 
@@ -242,10 +463,8 @@ implement trait Seek for struct File {
     }
 }
 
-/// Close the file descriptor. Ownership obligation: every `File` must
-/// have `drop` called before going out of scope. Calling more than once
-/// is a bug the kernel may not catch; the second `close` could race
-/// against an unrelated `open` that reused the same fd.
+/// Close the file descriptor. A `File` given away by `into_descriptor`
+/// closes nothing.
 implement trait Drop for struct File {
     drop(mut &this) -> void {
         if (this.fd >= 0) {
@@ -266,95 +485,9 @@ implement trait Write for struct File {
         return fd::write_fd(this.fd, bytes);
     }
 
+    /// `write(2)` is unbuffered, so there is nothing to push; `sync_all`
+    /// asks for durability.
     flush(mut &this) -> Result<(), IoError> {
-        // `write(2)` is unbuffered at the syscall layer. `fsync` is a
-        // caller concern; most writes don't need durability
-        // guarantees and `fsync` is expensive.
         return Result::Ok(());
     }
-}
-
-// Convenience helpers
-
-/// Read the entire contents of `p` into a fresh `Array<u8>`. Panics
-/// on allocation failure; caller handles I/O failure via the Result.
-public function read(p: Path) -> Result<Array<u8>, IoError> {
-    const handle: File = File::open(p)?;
-    mut file: File = handle;
-    mut out: Array<u8> = Array::new();
-    mut chunk: [u8; 4096];
-    loop {
-        const n: i64 = file.read(&chunk[0], 4096)?;
-        if (n == 0) { break; }
-        out.append(Slice::<u8>::from_raw(&chunk[0], n));
-    }
-    return Result::Ok(out);
-}
-
-/// Write `bytes` to `p`, creating or truncating.
-public function write(p: Path, bytes: Slice<u8>) -> Result<(), IoError> {
-    const handle: File = File::create(p)?;
-    mut file: File = handle;
-    return file.write(bytes);
-}
-
-/// Read the entire contents of `p` into a fresh `String`. The bytes are
-/// taken verbatim; no UTF-8 validation is performed (the caller is
-/// responsible for that if it matters). Panics on allocation failure;
-/// I/O failure surfaces through the `Result`.
-public function read_to_string(p: Path) -> Result<String, IoError> {
-    mut data: Array<u8> = read(p)?;
-    mut out: String = String::from_str(Str::from(data.as_slice()));
-    mem::drop(data);
-    return Result::Ok(out);
-}
-
-/// Copy the contents of `from` to `to`, returning the number of bytes
-/// copied. `to` is created if missing and truncated if it already
-/// exists; the source's Unix permission bits are then applied to it,
-/// mirroring `cp` (and `std::fs::copy`). `from` must be a regular file -
-/// copying a directory (or other non-regular entry) fails with
-/// `InvalidInput`. On an I/O failure mid-copy the partially written
-/// destination is left in place and the error is returned as-is.
-public function copy(from: Path, to: Path) -> Result<i64, IoError> {
-    const info: Metadata = metadata::metadata(from)?;
-    if (!info.is_file()) {
-        return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
-    }
-
-    const src_handle: File = File::open(from)?;
-    mut src: File = src_handle;
-    const dst_handle: File = File::create(to)?;
-    mut dst: File = dst_handle;
-
-    mut total: i64 = 0;
-    mut chunk: [u8; 65536];
-    loop {
-        const n: i64 = src.read(&chunk[0], 65536)?;
-        if (n == 0) { break; }
-        dst.write(Slice::<u8>::from_raw(&chunk[0], n))?;
-        total = total + n;
-    }
-
-    // Mirror the source's permission bits onto the destination.  Unix
-    // mode bits are a libc concept; Windows has no analog (file access
-    // is governed by ACLs through a separate API surface), so the
-    // Windows side accepts the default attributes the `create` above
-    // produced and returns success.  On Windows the
-    // contents are copied, the ACLs are not.
-    mirror_permissions(&dst, info)?;
-    return Result::Ok(total);
-}
-
-![target(unix)]
-private function mirror_permissions(dst: &File, info: Metadata) -> Result<(), IoError> {
-    if (libc::fchmod(dst.fd, info.permissions()) != 0) {
-        return Result::Err(IoError::last_os_error());
-    }
-    return Result::Ok(());
-}
-
-![target(windows)]
-private function mirror_permissions(dst: &File, info: Metadata) -> Result<(), IoError> {
-    return Result::Ok(());
 }

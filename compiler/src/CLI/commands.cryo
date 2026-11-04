@@ -2,6 +2,7 @@ namespace cli::commands;
 
 import std::fmt;
 import std::env;
+import std::fs::file::{ File };
 import std::io::stdio;
 import compiler::{ compilation_context, instance, project_config };
 import compiler::codegen::{ llvm_types, passes };
@@ -17,7 +18,6 @@ import std::collections::pair::{ Pair };
 import std::fs::file;
 import std::fs::path;
 import std::fs::metadata;
-import std::fs::dir;
 import std::core::intrinsics;
 import std::core::mem;
 import std::process::command::{ Command };
@@ -818,7 +818,7 @@ type struct Executor {
         const exe: string = build_manifest::Manifest::self_exe_path();
         mut size: string = "";
         if (exe.length() > 0) {
-            match (metadata::metadata(path::Path::from(exe))) {
+            match (path::Path::from(exe).metadata()) {
                 Result::Ok(m) => { size = fmt::format("%d bytes", m.length()); }
                 Result::Err(_) => {}
             }
@@ -1674,7 +1674,7 @@ type struct Executor {
     /// Read a file's full contents, or "" if it can't be opened.
     static read_file_or_empty(path_text: string) -> string {
         const path: string = path_text;
-        match (file::read_to_string(path::Path::from(path))) {
+        match (File::read_text(path::Path::from(path))) {
             Result::Ok(s)  => { return s.into_raw(); }
             Result::Err(_) => { return ""; }
         }
@@ -2102,7 +2102,7 @@ type struct Executor {
                 Executor::wait_job(done.as_ptr(), k);
                 const out_path: string = Executor::job_tmp_path(tmp, k);
                 const out: string = Executor::read_file_or_empty(out_path);
-                dir::remove_file(path::Path::from(out_path));
+                File::remove(path::Path::from(out_path));
                 // Warning codes (`W....`) render as `warning[Wxxxx]`; everything else
                 // as `error[Exxxx]`.  A warning-only file still exits 0, but the suite
                 // asserts on the rendered marker, not the exit status.
@@ -2235,7 +2235,7 @@ type struct Executor {
             if (idx < 0) { return false; }
             const f: string = reg.entries[idx].cache_file_for(
                 registry::VendorRegistry::normalize_triple(""));
-            return f.length() > 0 && metadata::exists(path::Path::from(f));
+            return f.length() > 0 && path::Path::from(f).exists();
         }
         if (req.starts_with("os:")) {
             // The project's sources hard-use one platform's surface (e.g.
@@ -2425,7 +2425,7 @@ type struct Executor {
             if (pn != "." && pn != ".."
                 && (pattern == "" || pn.contains(pattern))) {
                 const tj: string = Executor::proj_marker_path(projects_dir, pn);
-                if (metadata::exists(path::Path::from(tj))) { to_run += 1; }
+                if (path::Path::from(tj).exists()) { to_run += 1; }
             }
             pre_entry = libc::readdir(pre_dp);
         }
@@ -2474,7 +2474,7 @@ type struct Executor {
             if (name == "." || name == "..") { continue; }
             if (pattern != "" && !name.contains(pattern)) { continue; }
             const tj: string = Executor::proj_marker_path(projects_dir, name);
-            if (!metadata::exists(path::Path::from(tj))) { continue; }
+            if (!path::Path::from(tj).exists()) { continue; }
 
             const content: string = Executor::read_file_or_empty(tj);
             mut spec: ProjSpec = ProjSpec::empty();
@@ -2505,7 +2505,7 @@ type struct Executor {
                     const unmet: string = Executor::proj_first_unmet_requirement(&spec.requires);
                     if (unmet.length() > 0) {
                         verdict = 4; reason = unmet;
-                    } else if (!metadata::exists(path::Path::from(proj_dir))) {
+                    } else if (!path::Path::from(proj_dir).exists()) {
                         verdict = 5; reason = proj_dir;
                     }
                 }
@@ -2604,8 +2604,8 @@ type struct Executor {
                         if (err.length() > 0) { fmt::printf("%s\n", err); }
                     }
                 }
-                dir::remove_file(path::Path::from(out_path));
-                dir::remove_file(path::Path::from(Executor::stderr_path(out_path)));
+                File::remove(path::Path::from(out_path));
+                File::remove(path::Path::from(Executor::stderr_path(out_path)));
                 ran += 1;
             }
         }
@@ -2694,7 +2694,7 @@ type struct Executor {
     static remove_project_file(proj_dir: string, spec: &ProjSpec) -> void {
         if (spec.file.length() > 0) {
             const file_path: path::PathBuf = path::Path::from(proj_dir).join(spec.file);
-            dir::remove_file(file_path.as_path());
+            File::remove(file_path.as_path());
         }
     }
 
@@ -2802,7 +2802,7 @@ type struct Executor {
             }
             if (passed && spec.file.length() > 0) {
                 const file_path: string = path::Path::from(proj_dir).join(spec.file).into_raw();
-                if (!metadata::exists(path::Path::from(file_path))) {
+                if (!path::Path::from(file_path).exists()) {
                     passed = false;
                     detail = fmt::format("no file %s", spec.file);
                 }
@@ -3226,7 +3226,7 @@ type struct Executor {
         // Resolve to an absolute path (the registry stores absolute roots so
         // `import vendor::Name` works from any project directory).
         mut abs: string = "";
-        match (dir::canonicalize(path::Path::from(path))) {
+        match (path::Path::from(path).canonicalize()) {
             Result::Ok(pb)  => { abs = pb.into_raw(); }
             Result::Err(_)  => {
                 fmt::eprintf("Error: cannot resolve vendor path '%s' (does it exist?).\n", path);
@@ -3235,14 +3235,14 @@ type struct Executor {
         }
 
         const manifest_path: string = path::Path::from(abs).join("cryo-vendor.json").into_raw();
-        if (!metadata::exists(path::Path::from(manifest_path))) {
+        if (!path::Path::from(manifest_path).exists()) {
             fmt::eprintf("Error: no cryo-vendor.json manifest found at %s\n", manifest_path);
             fmt::eprintf("       a vendored library needs a manifest declaring its name,\n");
             fmt::eprintf("       headers, link libraries, and (Stage 1) a bindings_file.\n");
             return 1;
         }
         mut content: string = "";
-        match (file::read_to_string(path::Path::from(manifest_path))) {
+        match (File::read_text(path::Path::from(manifest_path))) {
             Result::Ok(s)  => { content = s.into_raw(); }
             Result::Err(_) => {
                 fmt::eprintf("Error: cannot read %s\n", manifest_path);
@@ -3323,7 +3323,7 @@ type struct Executor {
             // Escape hatch: copy pre-written bindings verbatim into the cache.
             // (No provenance key: a hand-supplied file is always re-copied.)
             const src: string = path::Path::from(abs).join(bindings_file).into_raw();
-            if (!metadata::exists(path::Path::from(src))) {
+            if (!path::Path::from(src).exists()) {
                 lock.release();
                 fmt::eprintf("Error: bindings_file '%s' not found at %s\n", bindings_file, src);
                 return 1;
@@ -3350,7 +3350,7 @@ type struct Executor {
                 norm_triple, prev_file, entry.lang_arg());
             const hit: boolean = !force
                 && prev_key != "" && prev_key == prov_key
-                && prev_file != "" && metadata::exists(path::Path::from(prev_file));
+                && prev_file != "" && path::Path::from(prev_file).exists();
             if (hit) {
                 fmt::printf("Bindings for '%s' are up to date for triple '%s' (cache hit).\n",
                     name, norm_triple);
@@ -3559,7 +3559,7 @@ type struct Executor {
         for (mut oi: i64 = 0; oi < order.length(); oi++) {
             const i: i64 = order[oi];
             const gone: boolean =
-                !metadata::exists(path::Path::from(reg.entries[i].source_path));
+                !path::Path::from(reg.entries[i].source_path).exists();
             mut title: string = reg.entries[i].key;
             if (gone) {
                 missing++;
@@ -3607,7 +3607,7 @@ type struct Executor {
         mut doomed: [string] = [];
         mut paths:  [string] = [];
         for (mut i: i64 = total - 1; i >= 0; i--) {
-            if (!metadata::exists(path::Path::from(reg.entries[i].source_path))) {
+            if (!path::Path::from(reg.entries[i].source_path).exists()) {
                 doomed.push(reg.entries[i].key);
                 paths.push(reg.entries[i].source_path);
                 reg.remove_at(i);
@@ -3678,7 +3678,7 @@ type struct Executor {
                 continue;
             }
             const src: string = reg.entries[i].source_path;
-            if (!metadata::exists(path::Path::from(src))) {
+            if (!path::Path::from(src).exists()) {
                 fmt::eprintf("Error: source path for '%s' is gone: %s\n",
                     reg.entries[i].key, src);
                 failures += 1;
@@ -3711,7 +3711,7 @@ type struct Executor {
         const dest: string = dest_text;
         const src: string = src_text;
         mut text: string = "";
-        match (file::read_to_string(path::Path::from(src))) {
+        match (File::read_text(path::Path::from(src))) {
             Result::Ok(s)  => { text = s.into_raw(); }
             Result::Err(_) => { return false; }
         }

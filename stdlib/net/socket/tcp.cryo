@@ -45,7 +45,7 @@
 
 namespace std::net::socket::tcp;
 
-import std::core::option;
+import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::core::slice;
 import std::core::drop::{ Drop };
@@ -491,25 +491,25 @@ public type struct TcpConnect {
     private fd:      i32;         // < 0 once handed over, or if it could not be opened
     private addr:    [u8; 28];      // packed sockaddr, replayed to poll the connect
     private addrlen: u32;
-    private err:     IoError;     // why `fd` is < 0 before the first poll
+    private err:     Option<IoError>;  // why `fd` is < 0 before the first poll
     private rt: mut Reactor*;
 
     /// Open a non-blocking socket and start connecting to `remote`.
     public static start(remote: SocketAddr) -> TcpConnect {
         mut c: TcpConnect = TcpConnect { fd: -1, addr: [0; 28], addrlen: 0,
-                                         err: IoError::new(IoErrorKind::Other, 0),
+                                         err: Option::None,
                                          rt:  null };
         match (sockaddr::pack_sockaddr_in(&c.addr[0], &remote)) {
             Result::Ok(len) => { c.addrlen = len; }
-            Result::Err(e)  => { c.err = e; return c; }
+            Result::Err(e)  => { c.err = Option::Some(e); return c; }
         }
         const sock: i32 = tcp_socket_for(&remote);
         if (sock < 0) {
-            c.err = sys::last_io_error();
+            c.err = Option::Some(sys::last_io_error());
             return c;
         }
         if (sys::os_set_nonblocking(sock, true) < 0) {
-            c.err = sys::last_io_error();
+            c.err = Option::Some(sys::last_io_error());
             sys::os_close_sock(sock);
             return c;
         }
@@ -535,7 +535,14 @@ implement trait Future for struct TcpConnect {
 
     poll(mut &this, cx: Context*) -> Poll<Result<TcpStream, IoError>> {
         if (this.fd < 0) {
-            return Poll::Ready(Result::Err(this.err));
+            // The failure that left no socket is handed out once; a poll
+            // after the future finished has no socket and no error left.
+            match (this.err.take()) {
+                Option::Some(e) => { return Poll::Ready(Result::Err(e)); }
+                Option::None    => {
+                    return Poll::Ready(Result::Err(IoError::new(IoErrorKind::NotConnected, 0)));
+                }
+            }
         }
         // Asking the OS how the handshake is going is per-OS (see
         // `os_connect_status`); what to do with each answer is not.
@@ -553,7 +560,6 @@ implement trait Future for struct TcpConnect {
                 const failed: i32 = this.fd;
                 this.fd  = -1;
                 this.rt  = null;
-                this.err = e;
                 sys::os_close_sock(failed);
                 return Poll::Ready(Result::Err(e));
             }

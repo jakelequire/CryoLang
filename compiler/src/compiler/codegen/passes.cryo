@@ -9,10 +9,9 @@ import std::env;
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::core::slice::{ Slice };
-import std::fs::dir;
+import std::fs::file::{ File };
 import std::fs::path::{ Path, PathBuf };
 import std::fs::file;
-import std::fs::metadata::{ metadata };
 import std::process::command::{ Command, Output, Stdio };
 import std::process::child::{ Child };
 
@@ -228,7 +227,7 @@ type struct CodegenPasses {
         const text: string = *out;
         if (rc == 0) {
             if (text.length() > 0) { fmt::eprintf("%s", text); }
-            dir::remove_file(Path::from(log_path));
+            File::remove(Path::from(log_path));
         }
         return rc;
     }
@@ -242,7 +241,7 @@ type struct CodegenPasses {
         const rc: i32 = Command::shell(fmt::format("%s > %s 2>&1", cmd,
             CodegenPasses::link_quote(log_path_text)));
         mut text: string = "";
-        match (file::read_to_string(Path::from(log_path))) {
+        match (File::read_text(Path::from(log_path))) {
             Result::Ok(t)  => { text = t.into_raw(); }
             Result::Err(_) => { }
         }
@@ -260,7 +259,7 @@ type struct CodegenPasses {
         mut out: string = "";
         const rc: i32 = CodegenPasses::capture_tool(
             fmt::format("%s -print-file-name=libgcc_eh.a", driver), log_path_text, &out);
-        dir::remove_file(Path::from(log_path_text));
+        File::remove(Path::from(log_path_text));
         const answer: string = out;
         return rc == 0 && (answer.contains("/") || answer.contains("\\"));
     }
@@ -408,7 +407,7 @@ type struct CodegenPasses {
             false => { "libcryort-core.a" }
         };
         const archive: PathBuf = Path::from(dir).join(base);
-        return metadata::exists(archive.as_path());
+        return archive.as_path().exists();
     }
 
     /// Prefer `<dir>/<triple>`, fall back to `<dir>`, else "".  Always returns a
@@ -444,7 +443,7 @@ type struct CodegenPasses {
         const triple: string = triple_text;
         const bin_dir: PathBuf = Path::from(stdlib_root).join(".bin");
         const per_target: string = bin_dir.join(triple).join("libcryo.a").into_raw();
-        if (metadata::exists(Path::from(per_target))) {
+        if (Path::from(per_target).exists()) {
             return per_target;
         }
         return bin_dir.join("libcryo.a").into_raw();
@@ -578,7 +577,7 @@ type struct CodegenPasses {
     static hoist_binary(src_text: string, dst_text: string) -> i32 {
         const dst: string = dst_text;
         const src: string = src_text;
-        match (file::copy(Path::from(src), Path::from(dst))) {
+        match (File::copy(Path::from(src), Path::from(dst))) {
             Result::Ok(_)  => { return 0; }
             Result::Err(_) => { return 1; }
         }
@@ -597,7 +596,7 @@ type struct CodegenPasses {
             text.push_byte(34 as u8);           // "
             text.push_byte(10 as u8);           // \n
         }
-        const ok: boolean = match (file::write(Path::from(path), text.as_bytes())) {
+        const ok: boolean = match (File::write_bytes(Path::from(path), text.as_bytes())) {
             Result::Ok(_)  => { true }
             Result::Err(_) => { false }
         };
@@ -1128,7 +1127,7 @@ type struct CodegenPasses {
                            worker_count: u32) -> i32 {
         const manifest_path: string = manifest_path_text;
         mut content: String = String::new();
-        match (file::read_to_string(Path::from(manifest_path))) {
+        match (File::read_text(Path::from(manifest_path))) {
             Result::Ok(s)  => { content = s; }
             Result::Err(_) => {
                 fmt::eprintln(f"__emit-obj: cannot read manifest {manifest_path}");
@@ -1159,7 +1158,7 @@ type struct CodegenPasses {
                         Result::Ok(_) => { }
                         Result::Err(reason) => {
                             const note: Path = Path::from(CodegenPasses::failure_note_path(ol));
-                            match (file::write(note,
+                            match (File::write_bytes(note,
                                     Slice::<u8>::from_raw(reason.as_str().as_ptr(), reason.length()))) {
                                 Result::Ok(_)  => { }
                                 Result::Err(_) => {
@@ -1201,7 +1200,7 @@ type struct CodegenPasses {
             // A note an earlier build left would read as this build's failure.
             CodegenPasses::remove_previous_output(CodegenPasses::failure_note_path((*obj)[k]));
         }
-        match (file::write(Path::from(manifest_path),
+        match (File::write_bytes(Path::from(manifest_path),
                            Slice::<u8>::from_raw(mf.as_str().as_ptr(), mf.length()))) {
             Result::Ok(_)  => { }
             Result::Err(_) => {
@@ -1262,7 +1261,7 @@ type struct CodegenPasses {
     /// `object_path`, removed as it is read; none when it left no note.
     static take_failure_note(object_path: string) -> Option<String> {
         const note: string = CodegenPasses::failure_note_path(object_path);
-        match (file::read_to_string(Path::from(note))) {
+        match (File::read_text(Path::from(note))) {
             Result::Ok(reason) => {
                 CodegenPasses::remove_previous_output(note);
                 return Option::Some(reason);
@@ -1275,7 +1274,7 @@ type struct CodegenPasses {
     /// removed cannot be overwritten either, so the write that follows
     /// fails and says so.
     static remove_previous_output(path: string) -> void {
-        match (dir::remove_file(Path::from(path))) {
+        match (File::remove(Path::from(path))) {
             Result::Ok(_)  => { }
             Result::Err(_) => { }
         }
@@ -1726,7 +1725,7 @@ type struct CodegenPasses {
         // The response file has served its purpose; remove it so it doesn't
         // linger in the per-profile dir (best-effort - a failed unlink is
         // harmless).
-        dir::remove_file(Path::from(link_rsp_path));
+        File::remove(Path::from(link_rsp_path));
 
         Log::debug(LogArea::Link, f"linked executable {exe_path}");
 
@@ -1860,7 +1859,7 @@ type struct CodegenPasses {
             return PassResult::failure(1);
         }
         // Drop the response file now the archiver has read it (best-effort).
-        dir::remove_file(Path::from(rsp_path));
+        File::remove(Path::from(rsp_path));
 
         Log::debug(LogArea::Link, f"archived {archive_path} ({objs.length()} objects)");
         return PassResult::ok();

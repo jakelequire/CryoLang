@@ -1,0 +1,343 @@
+///! Directory: creating, removing and listing directories.
+///!
+///!     Directory::create_all("build/cache")?;
+///!     for (entry in Directory::entries("src")?) {
+///!         if (entry.is_file()) { println(f"{entry.path().as_str()}"); }
+///!     }
+///!     Directory::remove_all("build")?;
+///!
+///! Every failure names the path it happened at. A listing skips `.` and
+///! `..`, and its order is the filesystem's own.
+///!
+///! Linux lists with `opendir`/`readdir`; Windows with
+///! `FindFirstFileW`/`FindNextFileW`, so names outside the ANSI code page
+///! come back intact.
+
+namespace std::fs::directory;
+
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::core::iter::{ Iterator };
+import std::core::drop::{ Drop };
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::collections::array::{ Array };
+import std::encoding::utf16::{ Utf16 };
+import std::io::error::{ IoError, IoErrorKind };
+import std::ffi::libc;
+import std::sys::syscall;
+import std::fs::path::{ Path, PathBuf };
+import std::fs::metadata::{ FileType, Metadata };
+import std::fs::file::{ File };
+import std::core::mem;
+
+// Default mode for a newly created directory: 0755.
+public const DEFAULT_DIR_MODE: u32 = 493;
+
+// `struct dirent` on Linux x86_64 / glibc: `d_type` at 18, `d_name` at 19.
+private const DIRENT_OFF_TYPE: u64 = 18;
+private const DIRENT_OFF_NAME: u64 = 19;
+private const DT_UNKNOWN: u8 = 0;
+private const DT_DIR: u8 = 4;
+private const DT_REG: u8 = 8;
+private const DT_LNK: u8 = 10;
+
+// WIN32_FIND_DATAW: dwFileAttributes u32 @ 0, then three FILETIMEs, the
+// size, two reserved words, and cFileName (260 UTF-16 units) @ 44; the
+// short name follows. 592 bytes in all.
+private const FIND_DATA_SIZE:     i64 = 592;
+private const FIND_OFF_NAME:      u64 = 44;
+private const FIND_NAME_UNITS:    i64 = 260;
+
+/// Directories, by path. Every operation is a static.
+public type struct Directory {
+    /// Create the directory `path`. Its parent must exist; see
+    /// `create_all`. Fails with `AlreadyExists` if anything is there.
+    ![target(unix)]
+    public static create(path: Path) -> Result<(), IoError> {
+        mut c_path: String = String::with_null(path.as_str());
+        const rc: i32 = libc::mkdir(c_path.as_ptr(), DEFAULT_DIR_MODE);
+        const err: i32 = libc::errno();
+        mem::drop(c_path);
+        if (rc != 0) {
+            return Result::Err(IoError::from_errno(err).with_path(path));
+        }
+        return Result::Ok(());
+    }
+    ![target(windows)]
+    public static create(path: Path) -> Result<(), IoError> {
+        const wide: Array<u16> = Utf16::encode(path.as_str());
+        if (syscall::CreateDirectoryW(wide.as_ptr(), null) == 0) {
+            return Result::Err(IoError::last_os_error().with_path(path));
+        }
+        return Result::Ok(());
+    }
+
+    /// Create the directory `path` and every missing directory above it.
+    /// A directory already there is success, including one another process
+    /// creates at the same moment; anything else in the way is not.
+    public static create_all(path: Path) -> Result<(), IoError> {
+        if (path.is_directory()) { return Result::Ok(()); }
+        match (path.parent()) {
+            Option::Some(parent) => {
+                if (!parent.is_empty() && !parent.is_directory()) {
+                    Directory::create_all(parent)?;
+                }
+            }
+            Option::None => { }
+        }
+        match (Directory::create(path)) {
+            Result::Ok(_) => { return Result::Ok(()); }
+            Result::Err(error) => {
+                match (error.kind) {
+                    IoErrorKind::AlreadyExists => {
+                        if (path.is_directory()) { return Result::Ok(()); }
+                        return Result::Err(error);
+                    }
+                    _ => { return Result::Err(error); }
+                }
+            }
+        }
+    }
+
+    /// Remove the empty directory `path`. A directory with entries fails
+    /// with `DirectoryNotEmpty`; see `remove_all`.
+    ![target(unix)]
+    public static remove(path: Path) -> Result<(), IoError> {
+        mut c_path: String = String::with_null(path.as_str());
+        const rc: i32 = libc::rmdir(c_path.as_ptr());
+        const err: i32 = libc::errno();
+        mem::drop(c_path);
+        if (rc != 0) {
+            return Result::Err(IoError::from_errno(err).with_path(path));
+        }
+        return Result::Ok(());
+    }
+    ![target(windows)]
+    public static remove(path: Path) -> Result<(), IoError> {
+        const wide: Array<u16> = Utf16::encode(path.as_str());
+        if (syscall::RemoveDirectoryW(wide.as_ptr()) == 0) {
+            return Result::Err(IoError::last_os_error().with_path(path));
+        }
+        return Result::Ok(());
+    }
+
+    /// Remove the directory `path` and everything in it. A symlink inside
+    /// is removed itself; what it points at is left alone. Stops at the
+    /// first failure, which names the entry it could not remove.
+    public static remove_all(path: Path) -> Result<(), IoError> {
+        mut entries: DirectoryEntries = Directory::entries(path)?;
+        loop {
+            match (entries.next()) {
+                Option::Some(entry) => {
+                    if (entry.is_directory()) {
+                        Directory::remove_all(entry.path())?;
+                    } else if (entry.directory_link) {
+                        Directory::remove(entry.path())?;
+                    } else {
+                        File::remove(entry.path())?;
+                    }
+                }
+                Option::None => { break; }
+            }
+        }
+        // The listing holds the directory open; close it before removing.
+        mem::drop(entries);
+        return Directory::remove(path);
+    }
+
+    /// The entries of the directory `path`, without `.` and `..`.
+    ![target(unix)]
+    public static entries(path: Path) -> Result<DirectoryEntries, IoError> {
+        mut c_path: String = String::with_null(path.as_str());
+        const stream: void* = libc::opendir(c_path.as_ptr());
+        const err: i32 = libc::errno();
+        mem::drop(c_path);
+        if (stream == null) {
+            return Result::Err(IoError::from_errno(err).with_path(path));
+        }
+        return Result::Ok(DirectoryEntries {
+            handle: stream,
+            directory: PathBuf::from(path.as_str()),
+            find_data: [0; FIND_DATA_SIZE],
+            pending: false
+        });
+    }
+    ![target(windows)]
+    public static entries(path: Path) -> Result<DirectoryEntries, IoError> {
+        const pattern: PathBuf = path.join("*");
+        const wide: Array<u16> = Utf16::encode(pattern.as_path().as_str());
+        mut listing: DirectoryEntries = DirectoryEntries {
+            handle: null,
+            directory: PathBuf::from(path.as_str()),
+            find_data: [0; FIND_DATA_SIZE],
+            pending: true
+        };
+        const handle: u8* = syscall::FindFirstFileW(wide.as_ptr(), &listing.find_data[0]);
+        if ((handle as i64) == -1) {
+            return Result::Err(IoError::last_os_error().with_path(path));
+        }
+        listing.handle = handle as void*;
+        return Result::Ok(listing);
+    }
+}
+
+/// One entry of a directory listing: its name, its full path (the listed
+/// directory joined with the name), and what kind of entry it is.
+public type struct DirectoryEntry {
+    private entry_path: PathBuf;
+    private name_length: i64;
+    private kind: FileType;
+    // A symlink or junction to a directory: Windows removes one with
+    // `RemoveDirectoryW`, not `DeleteFileW`. Always false on Linux, where
+    // `unlink` removes any symlink.
+    private directory_link: boolean;
+
+    /// The entry's own name, with no directory part.
+    public name(&this) -> Str {
+        const full: Str = this.entry_path.as_path().as_str();
+        return full.sub_bytes(full.length() - this.name_length, full.length());
+    }
+
+    /// The listed directory joined with the entry's name.
+    public path(&this) -> Path {
+        return this.entry_path.as_path();
+    }
+
+    /// The kind of entry, from the listing itself; a symlink is reported
+    /// as `Symlink`, not as what it points at.
+    public file_type(&this) -> FileType {
+        return this.kind;
+    }
+
+    public is_file(&this) -> boolean {
+        return match (this.kind) { FileType::File => { true } _ => { false } };
+    }
+
+    public is_directory(&this) -> boolean {
+        return match (this.kind) { FileType::Directory => { true } _ => { false } };
+    }
+
+    public is_symlink(&this) -> boolean {
+        return match (this.kind) { FileType::Symlink => { true } _ => { false } };
+    }
+
+    /// What is at the entry's path, following a symlink.
+    public metadata(&this) -> Result<Metadata, IoError> {
+        return this.entry_path.as_path().metadata();
+    }
+}
+
+/// A directory listing in progress: an iterator of `DirectoryEntry`.
+/// Holds the directory open until it is dropped.
+public type struct DirectoryEntries {
+    // The `DIR*` on Linux, the find HANDLE on Windows.
+    private handle: void*;
+    private directory: PathBuf;
+    // Windows: the WIN32_FIND_DATAW the last find call filled, and whether
+    // it holds an entry `next` has not handed out yet (`FindFirstFileW`
+    // reports the first entry itself).
+    private find_data: [u8; FIND_DATA_SIZE];
+    private pending: boolean;
+
+    /// The entry named `name` in the listed directory.
+    private entry(&this, name: Str, kind: FileType, directory_link: boolean) -> DirectoryEntry {
+        return DirectoryEntry {
+            entry_path: this.directory.join(name),
+            name_length: name.length(),
+            kind: kind,
+            directory_link: directory_link
+        };
+    }
+
+    /// The next entry `readdir` reports, `.` and `..` skipped. A
+    /// filesystem that leaves the type unknown in the listing is asked
+    /// with `lstat`.
+    ![target(unix)]
+    private next_entry(mut &this) -> Option<DirectoryEntry> {
+        loop {
+            const record: u8* = libc::readdir(this.handle);
+            if (record == null) { return Option::None; }
+            const name_at: u8* = record + DIRENT_OFF_NAME;
+            const name: Str = Str::from_raw(name_at, libc::strlen(name_at) as i64);
+            if (name == Str::new(".") || name == Str::new("..")) { continue; }
+            const tag: u8 = *(record + DIRENT_OFF_TYPE);
+            mut kind: FileType = FileType::Other;
+            if (tag == DT_DIR) { kind = FileType::Directory; }
+            else if (tag == DT_REG) { kind = FileType::File; }
+            else if (tag == DT_LNK) { kind = FileType::Symlink; }
+            mut found: DirectoryEntry = this.entry(name, kind, false);
+            if (tag == DT_UNKNOWN) {
+                match (Metadata::of_link(found.path())) {
+                    Result::Ok(info)  => { found.kind = info.file_type(); }
+                    Result::Err(_)    => { }
+                }
+            }
+            return Option::Some(found);
+        }
+    }
+
+    /// The next entry the find calls report, `.` and `..` skipped. A name
+    /// that is not valid UTF-16 (an unpaired surrogate, which NTFS allows)
+    /// has no `Str` form and is skipped.
+    ![target(windows)]
+    private next_entry(mut &this) -> Option<DirectoryEntry> {
+        loop {
+            if (!this.pending) {
+                if (syscall::FindNextFileW(this.handle as u8*, &this.find_data[0]) == 0) {
+                    return Option::None;
+                }
+            }
+            this.pending = false;
+            const data: u8* = &this.find_data[0];
+            const attributes: u32 = *(data as u32*);
+            const units: u16* = (data + FIND_OFF_NAME) as u16*;
+            mut count: i64 = 0;
+            while (count < FIND_NAME_UNITS && units[count] != 0) { count = count + 1; }
+            match (Utf16::decode(Slice::<u16>::from_raw(units, count))) {
+                Result::Err(_) => { continue; }
+                Result::Ok(text) => {
+                    const name: Str = text.as_str();
+                    if (name == Str::new(".") || name == Str::new("..")) { continue; }
+                    const is_link: boolean = (attributes & syscall::FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+                    const is_directory: boolean = (attributes & syscall::FILE_ATTRIBUTE_DIRECTORY) != 0;
+                    mut kind: FileType = FileType::File;
+                    if (is_link) { kind = FileType::Symlink; }
+                    else if (is_directory) { kind = FileType::Directory; }
+                    return Option::Some(this.entry(name, kind, is_link && is_directory));
+                }
+            }
+        }
+    }
+
+    ![target(unix)]
+    private close(mut &this) -> void {
+        libc::closedir(this.handle);
+    }
+    ![target(windows)]
+    private close(mut &this) -> void {
+        syscall::FindClose(this.handle as u8*);
+    }
+}
+
+implement trait Iterator<DirectoryEntry> for struct DirectoryEntries {
+    next(mut &this) -> Option<DirectoryEntry> {
+        if (this.handle == null) { return Option::None; }
+        return this.next_entry();
+    }
+}
+
+implement trait Drop for struct DirectoryEntries {
+    drop(mut &this) -> void {
+        if (this.handle != null) {
+            this.close();
+            this.handle = null;
+        }
+    }
+}
+
+/// The owned path is released by its field after this body.
+implement trait Drop for struct DirectoryEntry {
+    drop(mut &this) -> void { }
+}

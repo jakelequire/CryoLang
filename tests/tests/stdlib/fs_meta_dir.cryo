@@ -16,10 +16,7 @@ import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::io::error;
 import std::io::traits;
-import std::fs::path::{ Path, PathBuf };
-import std::fs::file::{ File, read_to_string, write };
-import std::fs::metadata::{ exists, metadata };
-import std::fs::dir::{ canonicalize, create_dir, DirEntry, read_dir, ReadDir, remove_dir, remove_file };
+import std::fs::{ Directory, DirectoryEntries, DirectoryEntry, File, Path, PathBuf };
 import std::ffi::libc;
 import std::test::error::{ TestError };
 import std::test::assert::{ bail, expect_eq, expect_true };
@@ -49,12 +46,12 @@ function read_to_string_roundtrip() -> Result<(), TestError> {
     mut namebuf: [u8; 256];
     const p: Path = tmp_file(&namebuf[0], "rts");
     const payload: Str = Str::new("line one\nline two\n");
-    match (write(p, payload.as_bytes())) {
+    match (File::write_bytes(p, payload.as_bytes())) {
         Result::Ok(_)  => { }
         Result::Err(_) => { return bail(Str::new("write failed")); }
     }
     mut got: String = String::new();
-    match (read_to_string(p)) {
+    match (File::read_text(p)) {
         Result::Ok(s)  => { got = s; }
         Result::Err(_) => { libc::unlink(p.as_str().as_ptr()); return bail(Str::new("read_to_string failed")); }
     }
@@ -69,15 +66,15 @@ function metadata_reports_file() -> Result<(), TestError> {
     mut namebuf: [u8; 256];
     const p: Path = tmp_file(&namebuf[0], "meta");
     const payload: Str = Str::new("12345");   // 5 bytes
-    match (write(p, payload.as_bytes())) {
+    match (File::write_bytes(p, payload.as_bytes())) {
         Result::Ok(_)  => { }
         Result::Err(_) => { return bail(Str::new("write failed")); }
     }
     mut is_file: boolean = false;
     mut is_dir: boolean = true;
     mut size: i64 = 0;
-    match (metadata(p)) {
-        Result::Ok(m)  => { is_file = m.is_file(); is_dir = m.is_dir(); size = m.length(); }
+    match (p.metadata()) {
+        Result::Ok(m)  => { is_file = m.is_file(); is_dir = m.is_directory(); size = m.length(); }
         Result::Err(_) => { libc::unlink(p.as_str().as_ptr()); return bail(Str::new("metadata failed")); }
     }
     libc::unlink(p.as_str().as_ptr());
@@ -92,12 +89,12 @@ function exists_true_and_false() -> Result<(), TestError> {
     mut namebuf: [u8; 256];
     const p: Path = tmp_file(&namebuf[0], "exists");
     // Not created yet.
-    expect_true(!exists(p), Str::new("absent before create"))?;
-    match (write(p, Str::new("x").as_bytes())) {
+    expect_true(!p.exists(), Str::new("absent before create"))?;
+    match (File::write_bytes(p, Str::new("x").as_bytes())) {
         Result::Ok(_)  => { }
         Result::Err(_) => { return bail(Str::new("write failed")); }
     }
-    const present: boolean = exists(p);
+    const present: boolean = p.exists();
     libc::unlink(p.as_str().as_ptr());
     expect_true(present, Str::new("present after create"))?;
     return Result::Ok(());
@@ -121,18 +118,18 @@ function canonicalize_resolves_parent_with_forward_separators() -> Result<(), Te
                                          temp_root(), libc::getpid());
     const through: Path = Path::from(Str::from_raw(&throughbuf[0], tn as u64));
 
-    match (create_dir(dpath)) {
+    match (Directory::create(dpath)) {
         Result::Ok(_)  => { }
         Result::Err(_) => { return bail(Str::new("create_dir failed")); }
     }
-    match (create_dir(inner)) {
+    match (Directory::create(inner)) {
         Result::Ok(_)  => { }
-        Result::Err(_) => { remove_dir(dpath); return bail(Str::new("create_dir inner failed")); }
+        Result::Err(_) => { Directory::remove(dpath); return bail(Str::new("create_dir inner failed")); }
     }
-    const direct: Result<PathBuf, std::io::error::IoError> = canonicalize(dpath);
-    const parent: Result<PathBuf, std::io::error::IoError> = canonicalize(through);
-    match (remove_dir(inner)) { Result::Ok(_) => { } Result::Err(_) => { } }
-    match (remove_dir(dpath)) { Result::Ok(_) => { } Result::Err(_) => { } }
+    const direct: Result<PathBuf, std::io::error::IoError> = dpath.canonicalize();
+    const parent: Result<PathBuf, std::io::error::IoError> = through.canonicalize();
+    match (Directory::remove(inner)) { Result::Ok(_) => { } Result::Err(_) => { } }
+    match (Directory::remove(dpath)) { Result::Ok(_) => { } Result::Err(_) => { } }
 
     match (direct) {
         Result::Ok(d) => {
@@ -160,7 +157,7 @@ function create_read_remove_dir() -> Result<(), TestError> {
                                          temp_root(), libc::getpid());
     const dpath: Path = Path::from(Str::from_raw(&dirbuf[0], dn as u64));
 
-    match (create_dir(dpath)) {
+    match (Directory::create(dpath)) {
         Result::Ok(_)  => { }
         Result::Err(_) => { return bail(Str::new("create_dir failed")); }
     }
@@ -170,21 +167,21 @@ function create_read_remove_dir() -> Result<(), TestError> {
     const fn2: i32 = libc::snprintf(&filebuf[0], 256, "%s/cryo_md_dir_%d/entry.dat",
                                           temp_root(), libc::getpid());
     const fpath: Path = Path::from(Str::from_raw(&filebuf[0], fn2 as u64));
-    match (write(fpath, Str::new("hi").as_bytes())) {
+    match (File::write_bytes(fpath, Str::new("hi").as_bytes())) {
         Result::Ok(_)  => { }
-        Result::Err(_) => { remove_dir(dpath); return bail(Str::new("write in dir failed")); }
+        Result::Err(_) => { Directory::remove(dpath); return bail(Str::new("write in dir failed")); }
     }
 
     // read_dir should surface exactly the one entry "entry.dat".
     mut found: boolean = false;
     mut count: u64 = 0;
-    match (read_dir(dpath)) {
+    match (Directory::entries(dpath)) {
         Result::Ok(rd) => {
-            mut it: ReadDir = rd;
+            mut it: DirectoryEntries = rd;
             loop {
                 match (it.next()) {
                     Option::Some(e) => {
-                        mut entry: DirEntry = e;
+                        mut entry: DirectoryEntry = e;
                         count = count + 1;
                         if (entry.name().equals(&Str::new("entry.dat"))) { found = true; }
                     }
@@ -193,14 +190,14 @@ function create_read_remove_dir() -> Result<(), TestError> {
             }
         }
         Result::Err(_) => {
-            remove_file(fpath); remove_dir(dpath);
+            File::remove(fpath); Directory::remove(dpath);
             return bail(Str::new("read_dir failed"));
         }
     }
 
     // Cleanup.
-    match (remove_file(fpath)) { Result::Ok(_) => { } Result::Err(_) => { } }
-    match (remove_dir(dpath))  { Result::Ok(_) => { } Result::Err(_) => { } }
+    match (File::remove(fpath)) { Result::Ok(_) => { } Result::Err(_) => { } }
+    match (Directory::remove(dpath))  { Result::Ok(_) => { } Result::Err(_) => { } }
 
     expect_eq(count, 1u64)?;
     expect_true(found, Str::new("entry.dat found"))?;
@@ -211,7 +208,7 @@ function create_read_remove_dir() -> Result<(), TestError> {
 function file_seek_cur_end_and_position() -> Result<(), TestError> {
     mut namebuf: [u8; 256];
     const p: Path = tmp_file(&namebuf[0], "seek");
-    match (write(p, Str::new("0123456789").as_bytes())) {
+    match (File::write_bytes(p, Str::new("0123456789").as_bytes())) {
         Result::Ok(_)  => { }
         Result::Err(_) => { return bail(Str::new("write failed")); }
     }

@@ -19,10 +19,7 @@ import compiler::vendor::registry::{ VendorRegistry };
 import compiler::deps::lockfile::{ LockedVendor };
 import utils::log::{ Log, LogArea, LogLevel };
 import std::fmt;
-import std::fs::file;
-import std::fs::metadata::{ metadata };
-import std::fs::path::{ Path, PathBuf };
-import std::fs::dir::{ ReadDir };
+import std::fs::{ Directory, DirectoryEntries, File, Path, PathBuf };
 import std::collections::{ hashmap, pair };
 import std::collections::string::{ String };
 import std::collections::str::{ Str };
@@ -206,7 +203,7 @@ public:
             Option::Some(content) => { return content; }
             Option::None          => { }
         }
-        match (file::read_to_string(Path::from(file_path))) {
+        match (File::read_text(Path::from(file_path))) {
             Result::Ok(s)  => { return s.into_raw(); }
             Result::Err(_) => { return ""; }
         }
@@ -258,7 +255,7 @@ public:
     discover_tests_directory(mut &this, intern: mut InternTable*,
                              graph: mut ModuleGraph*, sink: mut DiagnosticSink*,
                              dir: string) -> boolean {
-        mut rd: ReadDir = match (dir::read_dir(Path::from(dir))) {
+        mut rd: DirectoryEntries = match (Directory::entries(Path::from(dir))) {
             Result::Ok(r)  => { r }
             Result::Err(_) => { return true; }
         };
@@ -270,7 +267,7 @@ public:
                     mut name_s: String = String::with_null(entry.name());
                     const name: string = name_s.as_ptr() as string;
                     const full_path: string = Path::from(dir).join(name).into_raw();
-                    if (metadata::is_dir(Path::from(full_path))) {
+                    if (Path::from(full_path).is_directory()) {
                         // `tests/negative/` holds compile-fail cases (files that
                         // are intentionally malformed so the compiler rejects
                         // them) and `tests/projects/` holds independent test
@@ -308,7 +305,7 @@ public:
     /// Recursively walk a directory, lex every .cryo file to extract its
     /// namespace declaration, and register namespace -> file_path in ns_map.
     scan_all_project_files(mut &this, intern: mut InternTable*, dir: string) -> void {
-        mut rd: ReadDir = match (dir::read_dir(Path::from(dir))) {
+        mut rd: DirectoryEntries = match (Directory::entries(Path::from(dir))) {
             Result::Ok(r)  => { r }
             Result::Err(_) => { return; }
         };
@@ -320,7 +317,7 @@ public:
                     const name: string = name_s.as_ptr() as string;
                     const full_path: string = Path::from(dir).join(name).into_raw();
 
-                    if (metadata::is_dir(Path::from(full_path))) {
+                    if (Path::from(full_path).is_directory()) {
                         // `tests/projects/` are independent sub-packages (see
                         // `discover_tests_directory`); don't scan their
                         // namespaces into this project's resolution map.
@@ -354,7 +351,7 @@ public:
         // the buffer (the file may be new and unsaved).
         const is_override: boolean =
             SourceOverride::content_for(&this.lsp_overrides, file_path).is_some();
-        if (!is_override && !metadata::exists(Path::from(file_path))) { return; }
+        if (!is_override && !Path::from(file_path).exists()) { return; }
 
         mut scan_sink: DiagnosticSink = DiagnosticSink::new();
         const source: string = this.source_for(file_path);
@@ -441,7 +438,7 @@ public:
             const triple: string =
                 VendorRegistry::normalize_triple(this.triple_for_lib(lib));
             const f: string = this.vendor_registry.entries[idx].cache_file_for(triple);
-            if (f.length() > 0 && metadata::exists(Path::from(f))) {
+            if (f.length() > 0 && Path::from(f).exists()) {
                 // Surface the binding in the project build tree: copy the
                 // cache file into `<vendor_build_root>/<Name>/<Name>.cryo` and
                 // compile THAT, so the generated `.cryo` sits alongside its
@@ -455,7 +452,7 @@ public:
                     const dest: string = Path::from(this.vendor_build_root).join(name)
                         .join(f"{name}.cryo".as_str()).into_raw();
                     ProjectConfig::mkdir_p(dest.parent_dir());
-                    match (file::copy(Path::from(f), Path::from(dest))) {
+                    match (File::copy(Path::from(f), Path::from(dest))) {
                         Result::Ok(_)  => { return dest; }
                         Result::Err(_) => { return f; }
                     }
@@ -654,7 +651,7 @@ public:
         // Verify the file exists, unless an open buffer holds its content.
         const is_override: boolean =
             SourceOverride::content_for(&this.lsp_overrides, file_path).is_some();
-        if (!is_override && !metadata::exists(Path::from(file_path))) {
+        if (!is_override && !Path::from(file_path).exists()) {
             const msg: string = fmt::format("module file not found: '%s'", file_path);
             sink.emit(Diagnostic::error(ErrorCode::E0500_MODULE_NOT_FOUND, msg));
             return false;
@@ -1092,7 +1089,7 @@ public:
 
     static exists_under(base_dir: string, relative: string) -> boolean {
         const candidate: PathBuf = Path::from(base_dir).join(relative);
-        return metadata::exists(candidate.as_path());
+        return candidate.as_path().exists();
     }
 
     /// `base_dir/relative`, each component of `relative` replaced by the
@@ -1110,7 +1107,7 @@ public:
     /// The entry of `directory` that `name` names: the one spelled exactly
     /// so, else the first equal to it ignoring ASCII case, else `name`.
     static entry_named(directory: Path, name: Str) -> String {
-        mut entries: ReadDir = match (dir::read_dir(directory)) {
+        mut entries: DirectoryEntries = match (Directory::entries(directory)) {
             Result::Ok(r)  => { r }
             Result::Err(_) => { return String::from_str(name); }
         };

@@ -31,9 +31,8 @@ import std::process;
 import std::sys::syscall;
 import compiler::deps::cache::{ Cache };
 import compiler::project_config::{ ProjectConfig };
-import std::fs::dir;
+import std::fs::directory::{ Directory };
 import std::fs::file::{ File, OpenOptions };
-import std::fs::metadata::{ metadata };
 import std::fs::path::{ Path };
 import std::fmt;
 import std::thread;
@@ -159,7 +158,7 @@ type struct VendorRegistry {
     /// `<cache_root>/vendor`: the vendor subtree of the shared cache.
     static vendor_root() -> string {
         const root: string = Path::from(Cache::cache_root()).join("vendor").into_raw();
-        dir::create_dir_all(Path::from(root));
+        Directory::create_all(Path::from(root));
         return root;
     }
 
@@ -172,7 +171,7 @@ type struct VendorRegistry {
     static cache_dir_for(key: string, triple: string) -> string {
         const d: string = Path::from(VendorRegistry::vendor_root()).join(key)
             .join(VendorRegistry::normalize_triple(triple)).into_raw();
-        dir::create_dir_all(Path::from(d));
+        Directory::create_all(Path::from(d));
         return d;
     }
 
@@ -241,11 +240,11 @@ type struct VendorRegistry {
     /// vendor` rewrites it cleanly).
     static load_global() -> VendorRegistry {
         const path: string = VendorRegistry::registry_path();
-        if (!metadata::exists(Path::from(path))) {
+        if (!Path::from(path).exists()) {
             return VendorRegistry::empty();
         }
         mut content: string = "";
-        match (file::read_to_string(Path::from(path))) {
+        match (File::read_text(Path::from(path))) {
             Result::Ok(s)  => { content = s.into_raw(); }
             Result::Err(_) => { return VendorRegistry::empty(); }
         }
@@ -300,40 +299,18 @@ type struct VendorRegistry {
 
         const tmp: string = fmt::format("%s.tmp.%d", path, process::id());
         text.push_byte(10 as u8);        // trailing newline (matches prior fputs)
-        match (file::write(Path::from(tmp), text.as_bytes())) {
+        match (File::write_bytes(Path::from(tmp), text.as_bytes())) {
             Result::Ok(_)  => {}
             Result::Err(_) => { mem::drop(text); return false; }
         }
         mem::drop(text);
-        if (!VendorRegistry::replace_file_atomic(tmp, path)) {
-            dir::remove_file(Path::from(tmp));   // leave no stray temp file on a failed swap
+        // `rename_to` replaces an existing registry in one step, so a reader
+        // never sees it half written.
+        if (Path::from(tmp).rename_to(path).is_err()) {
+            File::remove(tmp);   // leave no stray temp file on a failed swap
             return false;
         }
         return true;
-    }
-
-    /// Atomically replace `path` with `tmp` (the just-written registry).
-    ///
-    /// POSIX `rename()` replaces an existing destination atomically, but the
-    /// Windows CRT `rename()` FAILS when the destination already exists - so
-    /// every `cryo vendor` after the first (once `registry.json` exists) errored
-    /// with "failed to write the vendor registry" on Windows.  Win32
-    /// `MoveFileExA` with `MOVEFILE_REPLACE_EXISTING` (0x1) is the atomic-replace
-    /// equivalent.  Returns true on success.
-    ![target(windows)]
-    static replace_file_atomic(tmp_text: string, path_text: string) -> boolean {
-        const path: string = path_text;
-        const tmp: string = tmp_text;
-        return syscall::MoveFileExA(tmp, path, 0x1) != 0;
-    }
-    ![target(unix)]
-    static replace_file_atomic(tmp_text: string, path_text: string) -> boolean {
-        const path: string = path_text;
-        const tmp: string = tmp_text;
-        match (dir::rename(Path::from(tmp), Path::from(path))) {
-            Result::Ok(_)  => { return true; }
-            Result::Err(_) => { return false; }
-        }
     }
 
     // Link merge
@@ -577,7 +554,7 @@ type struct VendorLock {
     /// on a handle returned from a timed-out `acquire`.
     release(mut &this) -> void {
         if (this.held) {
-            dir::remove_file(Path::from(this.path));
+            File::remove(Path::from(this.path));
             this.held = false;
         }
     }

@@ -5,6 +5,10 @@
 ///! `Other` variant exists for platform-specific errors that don't
 ///! fit the taxonomy.
 ///!
+///! An error from an operation that named a path carries that path, so a
+///! report reads `not found: config.toml` rather than a bare kind. The
+///! path is owned, which makes `IoError` a value that moves.
+///!
 ///! The errno table is per-OS gated. `from_errno` is fed msvcrt's C-runtime
 ///! errno on Windows (file/process I/O) and glibc errno on Linux; the base
 ///! codes (1-34) are identical on both, but the socket-range codes differ
@@ -17,9 +21,11 @@
 
 namespace std::io::error;
 
+import std::core::option::{ Option };
 import std::collections::str;
 import std::core::convert::{ From };
 import std::alloc::allocator::{ AllocError };
+import std::fs::path::{ Path, PathBuf };
 import std::ffi::libc;
 import std::sys::syscall;
 
@@ -27,15 +33,23 @@ import std::sys::syscall;
 private const ENOENT:        i32 = 2;
 private const EINTR:         i32 = 4;
 private const EIO:           i32 = 5;
+private const EBADF:         i32 = 9;
 private const EAGAIN:        i32 = 11; // same value as EWOULDBLOCK on Linux
 private const ENOMEM:        i32 = 12;
 private const EACCES:        i32 = 13;
 private const EEXIST:        i32 = 17;
+private const ENOTDIR:       i32 = 20;
+private const EISDIR:        i32 = 21;
 private const EINVAL:        i32 = 22;
+private const ENOSPC:        i32 = 28;
+private const EROFS:         i32 = 30;
 private const EPIPE:         i32 = 32;
 
-// Socket-range codes: glibc and msvcrt assign different numbers. Gated so
-// each target maps its own values to the right `IoErrorKind`.
+// Socket-range codes and ENOTEMPTY: glibc and msvcrt assign different
+// numbers. Gated so each target maps its own values to the right
+// `IoErrorKind`.
+![target(linux)]
+private const ENOTEMPTY:     i32 = 39;
 ![target(linux)]
 private const EADDRINUSE:    i32 = 98;
 ![target(linux)]
@@ -51,6 +65,8 @@ private const ETIMEDOUT:     i32 = 110;
 ![target(linux)]
 private const ECONNREFUSED:  i32 = 111;
 
+![target(windows)]
+private const ENOTEMPTY:     i32 = 41;
 ![target(windows)]
 private const EADDRINUSE:    i32 = 100;
 ![target(windows)]
@@ -70,6 +86,18 @@ public type enum IoErrorKind {
     NotFound;
     PermissionDenied;
     AlreadyExists;
+    /// A path component that had to be a directory is not one.
+    NotADirectory;
+    /// A directory was named where a file was wanted.
+    IsADirectory;
+    /// A directory to be removed still has entries.
+    DirectoryNotEmpty;
+    /// The device or volume has no space left.
+    StorageFull;
+    /// The filesystem is mounted, or the medium is, read-only.
+    ReadOnlyFilesystem;
+    /// The file descriptor or handle names no open file.
+    InvalidDescriptor;
     ConnectionRefused;
     ConnectionReset;
     ConnectionAborted;
@@ -79,6 +107,8 @@ public type enum IoErrorKind {
     BrokenPipe;
     Interrupted;
     InvalidInput;
+    /// The bytes do not have the form the operation needs, such as text
+    /// that is not UTF-8.
     InvalidData;
     TimedOut;
     WriteZero;
@@ -101,26 +131,65 @@ implement enum IoErrorKind {
     /// (no allocation, nothing to drop).
     public label(&this) -> string {
         return match (this) {
-            IoErrorKind::NotFound          => { "not_found"           }
-            IoErrorKind::PermissionDenied  => { "permission_denied"   }
-            IoErrorKind::AlreadyExists     => { "already_exists"      }
-            IoErrorKind::ConnectionRefused => { "connection_refused"  }
-            IoErrorKind::ConnectionReset   => { "connection_reset"    }
-            IoErrorKind::ConnectionAborted => { "connection_aborted"  }
-            IoErrorKind::NotConnected      => { "not_connected"       }
-            IoErrorKind::AddrInUse         => { "addr_in_use"         }
-            IoErrorKind::AddrNotAvailable  => { "addr_not_available"  }
-            IoErrorKind::BrokenPipe        => { "broken_pipe"         }
-            IoErrorKind::Interrupted       => { "interrupted"         }
-            IoErrorKind::InvalidInput      => { "invalid_input"       }
-            IoErrorKind::InvalidData       => { "invalid_data"        }
-            IoErrorKind::TimedOut          => { "timed_out"           }
-            IoErrorKind::WriteZero         => { "write_zero"          }
-            IoErrorKind::UnexpectedEof     => { "unexpected_eof"      }
-            IoErrorKind::WouldBlock        => { "would_block"         }
-            IoErrorKind::OutOfMemory       => { "out_of_memory"       }
-            IoErrorKind::Unsupported       => { "unsupported"         }
-            IoErrorKind::Other             => { "other"               }
+            IoErrorKind::NotFound           => { "not_found"            }
+            IoErrorKind::PermissionDenied   => { "permission_denied"    }
+            IoErrorKind::AlreadyExists      => { "already_exists"       }
+            IoErrorKind::NotADirectory      => { "not_a_directory"      }
+            IoErrorKind::IsADirectory       => { "is_a_directory"       }
+            IoErrorKind::DirectoryNotEmpty  => { "directory_not_empty"  }
+            IoErrorKind::StorageFull        => { "storage_full"         }
+            IoErrorKind::ReadOnlyFilesystem => { "read_only_filesystem" }
+            IoErrorKind::InvalidDescriptor  => { "invalid_descriptor"   }
+            IoErrorKind::ConnectionRefused  => { "connection_refused"   }
+            IoErrorKind::ConnectionReset    => { "connection_reset"     }
+            IoErrorKind::ConnectionAborted  => { "connection_aborted"   }
+            IoErrorKind::NotConnected       => { "not_connected"        }
+            IoErrorKind::AddrInUse          => { "addr_in_use"          }
+            IoErrorKind::AddrNotAvailable   => { "addr_not_available"   }
+            IoErrorKind::BrokenPipe         => { "broken_pipe"          }
+            IoErrorKind::Interrupted        => { "interrupted"          }
+            IoErrorKind::InvalidInput       => { "invalid_input"        }
+            IoErrorKind::InvalidData        => { "invalid_data"         }
+            IoErrorKind::TimedOut           => { "timed_out"            }
+            IoErrorKind::WriteZero          => { "write_zero"           }
+            IoErrorKind::UnexpectedEof      => { "unexpected_eof"       }
+            IoErrorKind::WouldBlock         => { "would_block"          }
+            IoErrorKind::OutOfMemory        => { "out_of_memory"        }
+            IoErrorKind::Unsupported        => { "unsupported"          }
+            IoErrorKind::Other              => { "other"                }
+        };
+    }
+
+    /// What went wrong, as a phrase a person reads: `"not found"`,
+    /// `"permission denied"`. A static string literal.
+    public description(&this) -> string {
+        return match (this) {
+            IoErrorKind::NotFound           => { "not found"                         }
+            IoErrorKind::PermissionDenied   => { "permission denied"                 }
+            IoErrorKind::AlreadyExists      => { "already exists"                    }
+            IoErrorKind::NotADirectory      => { "not a directory"                   }
+            IoErrorKind::IsADirectory       => { "is a directory"                    }
+            IoErrorKind::DirectoryNotEmpty  => { "directory not empty"               }
+            IoErrorKind::StorageFull        => { "no space left on the device"       }
+            IoErrorKind::ReadOnlyFilesystem => { "read-only filesystem"              }
+            IoErrorKind::InvalidDescriptor  => { "invalid file descriptor"           }
+            IoErrorKind::ConnectionRefused  => { "connection refused"                }
+            IoErrorKind::ConnectionReset    => { "connection reset"                  }
+            IoErrorKind::ConnectionAborted  => { "connection aborted"                }
+            IoErrorKind::NotConnected       => { "not connected"                     }
+            IoErrorKind::AddrInUse          => { "address in use"                    }
+            IoErrorKind::AddrNotAvailable   => { "address not available"             }
+            IoErrorKind::BrokenPipe         => { "broken pipe"                       }
+            IoErrorKind::Interrupted        => { "interrupted"                       }
+            IoErrorKind::InvalidInput       => { "invalid input"                     }
+            IoErrorKind::InvalidData        => { "invalid data"                      }
+            IoErrorKind::TimedOut           => { "timed out"                         }
+            IoErrorKind::WriteZero          => { "the sink accepted no bytes"        }
+            IoErrorKind::UnexpectedEof      => { "unexpected end of file"            }
+            IoErrorKind::WouldBlock         => { "the operation would block"         }
+            IoErrorKind::OutOfMemory        => { "out of memory"                     }
+            IoErrorKind::Unsupported        => { "unsupported"                       }
+            IoErrorKind::Other              => { "operating system error"            }
         };
     }
 }
@@ -131,44 +200,68 @@ public type struct IoError {
     /// Windows system error code - or 0 if not applicable. Useful for
     /// diagnostics; callers should branch on `kind`.
     public os_code: i32;
+    private failed_path: Option<PathBuf>;
 
     public static new(kind: IoErrorKind, os_code: i32) -> IoError {
-        return IoError { kind: kind, os_code: os_code };
+        return IoError { kind: kind, os_code: os_code, failed_path: Option::None };
     }
 
-    /// A short, stable description of what went wrong, as a borrowed `Str`.
-    /// This is the convergent accessor every stdlib error type exposes
-    /// (`describe(&this) -> Str`); `Display`/`Debug` for `IoError` delegate
-    /// to it. Backed by the kind's diagnostic slug (e.g. `"not_found"`); the
-    /// numeric OS code lives in `os_code` for callers that want to print it
-    /// alongside. Borrows a static string literal, so the view outlives any
-    /// `IoError`.
+    /// What went wrong, as a borrowed `Str`: the kind's description
+    /// (`"not found"`), without the path. This is the convergent accessor
+    /// every stdlib error type exposes (`describe(&this) -> Str`). `Display`
+    /// prints it followed by the path, when there is one. Borrows a static
+    /// string literal, so the view outlives any `IoError`.
     public describe(&this) -> str::Str {
-        return str::Str::new(this.kind.label());
+        return str::Str::new(this.kind.description());
+    }
+
+    /// The path the failed operation named, if it named one.
+    public path(&this) -> Option<Path> {
+        return match (this.failed_path.as_ref()) {
+            Option::Some(owned) => { Option::Some(owned.as_path()) }
+            Option::None        => { Option::None }
+        };
+    }
+
+    /// This error, naming `path` as the one the operation failed on. An
+    /// error that already names a path keeps it: the innermost operation
+    /// knows best which path it could not reach.
+    public with_path(mut this, path: Path) -> IoError {
+        if (this.failed_path.is_none()) {
+            this.failed_path = Option::Some(PathBuf::from(path.as_str()));
+        }
+        return this;
     }
 
     /// Map a POSIX `errno` to an `IoError`. Unknown codes fold to
     /// `Other` with the numeric code preserved in `os_code`.
     public static from_errno(code: i32) -> IoError {
-        return match (code) {
-            ENOENT        => { IoError { kind: IoErrorKind::NotFound,          os_code: code } }
-            EINTR         => { IoError { kind: IoErrorKind::Interrupted,       os_code: code } }
-            EIO           => { IoError { kind: IoErrorKind::Other,             os_code: code } }
-            EAGAIN        => { IoError { kind: IoErrorKind::WouldBlock,        os_code: code } }
-            ENOMEM        => { IoError { kind: IoErrorKind::OutOfMemory,       os_code: code } }
-            EACCES        => { IoError { kind: IoErrorKind::PermissionDenied,  os_code: code } }
-            EEXIST        => { IoError { kind: IoErrorKind::AlreadyExists,     os_code: code } }
-            EINVAL        => { IoError { kind: IoErrorKind::InvalidInput,      os_code: code } }
-            EPIPE         => { IoError { kind: IoErrorKind::BrokenPipe,        os_code: code } }
-            EADDRINUSE    => { IoError { kind: IoErrorKind::AddrInUse,         os_code: code } }
-            EADDRNOTAVAIL => { IoError { kind: IoErrorKind::AddrNotAvailable,  os_code: code } }
-            ECONNABORTED  => { IoError { kind: IoErrorKind::ConnectionAborted, os_code: code } }
-            ECONNRESET    => { IoError { kind: IoErrorKind::ConnectionReset,   os_code: code } }
-            ENOTCONN      => { IoError { kind: IoErrorKind::NotConnected,      os_code: code } }
-            ETIMEDOUT     => { IoError { kind: IoErrorKind::TimedOut,          os_code: code } }
-            ECONNREFUSED  => { IoError { kind: IoErrorKind::ConnectionRefused, os_code: code } }
-            _             => { IoError { kind: IoErrorKind::Other,             os_code: code } }
-        }
+        const kind: IoErrorKind = match (code) {
+            ENOENT        => { IoErrorKind::NotFound }
+            EINTR         => { IoErrorKind::Interrupted }
+            EIO           => { IoErrorKind::Other }
+            EBADF         => { IoErrorKind::InvalidDescriptor }
+            EAGAIN        => { IoErrorKind::WouldBlock }
+            ENOMEM        => { IoErrorKind::OutOfMemory }
+            EACCES        => { IoErrorKind::PermissionDenied }
+            EEXIST        => { IoErrorKind::AlreadyExists }
+            ENOTDIR       => { IoErrorKind::NotADirectory }
+            EISDIR        => { IoErrorKind::IsADirectory }
+            EINVAL        => { IoErrorKind::InvalidInput }
+            ENOSPC        => { IoErrorKind::StorageFull }
+            EROFS         => { IoErrorKind::ReadOnlyFilesystem }
+            EPIPE         => { IoErrorKind::BrokenPipe }
+            ENOTEMPTY     => { IoErrorKind::DirectoryNotEmpty }
+            EADDRINUSE    => { IoErrorKind::AddrInUse }
+            EADDRNOTAVAIL => { IoErrorKind::AddrNotAvailable }
+            ECONNABORTED  => { IoErrorKind::ConnectionAborted }
+            ECONNRESET    => { IoErrorKind::ConnectionReset }
+            ENOTCONN      => { IoErrorKind::NotConnected }
+            ETIMEDOUT     => { IoErrorKind::TimedOut }
+            ECONNREFUSED  => { IoErrorKind::ConnectionRefused }
+            _             => { IoErrorKind::Other }
+        };
+        return IoError::new(kind, code);
     }
 
     /// Map a Windows system error code (what `GetLastError` reports) to
@@ -184,6 +277,13 @@ public type struct IoError {
             syscall::ERROR_FILE_EXISTS | syscall::ERROR_ALREADY_EXISTS => {
                 IoErrorKind::AlreadyExists
             }
+            syscall::ERROR_DIRECTORY         => { IoErrorKind::NotADirectory }
+            syscall::ERROR_DIR_NOT_EMPTY     => { IoErrorKind::DirectoryNotEmpty }
+            syscall::ERROR_DISK_FULL | syscall::ERROR_HANDLE_DISK_FULL => {
+                IoErrorKind::StorageFull
+            }
+            syscall::ERROR_WRITE_PROTECT     => { IoErrorKind::ReadOnlyFilesystem }
+            syscall::ERROR_INVALID_HANDLE    => { IoErrorKind::InvalidDescriptor }
             syscall::ERROR_NOT_ENOUGH_MEMORY => { IoErrorKind::OutOfMemory }
             syscall::ERROR_INVALID_PARAMETER => { IoErrorKind::InvalidInput }
             syscall::ERROR_INVALID_DATA      => { IoErrorKind::InvalidData }
@@ -192,7 +292,7 @@ public type struct IoError {
             syscall::ERROR_NOT_SUPPORTED     => { IoErrorKind::Unsupported }
             _                                => { IoErrorKind::Other }
         };
-        return IoError { kind: kind, os_code: code as i32 };
+        return IoError::new(kind, code as i32);
     }
 
     /// Map a Winsock error code (what `WSAGetLastError`, or a socket's
@@ -211,7 +311,7 @@ public type struct IoError {
             syscall::WSAENOTCONN     => { IoErrorKind::NotConnected }
             _                        => { IoErrorKind::Other }
         };
-        return IoError { kind: kind, os_code: code };
+        return IoError::new(kind, code);
     }
 
     /// The calling thread's last operating-system error: `errno` on POSIX

@@ -222,20 +222,28 @@ public type trait Read {
         }
     }
 
-    /// Read every remaining byte into `out` as UTF-8. Convenience
-    /// wrapper around `read_to_end` for the common "slurp text from
-    /// this source" case. The bytes are **not** validated; the
-    /// caller certifies the source is UTF-8 (or accepts the
-    /// consequences of invalid continuation bytes in a `String`).
+    /// Read every remaining byte and append it to `out` as text, returning
+    /// the number of bytes appended. The bytes must be well-formed UTF-8: if
+    /// they are not, `out` is left as it was and the read fails with
+    /// `InvalidData`. The check runs once over everything read, so a
+    /// character split across two reads is whole by then.
     read_to_string(mut &this, out: mut &String) -> Result<i64, IoError> {
+        const start: i64 = out.length();
         mut scratch: [u8; READ_TO_END_CHUNK];
-        mut total: i64 = 0;
         loop {
             match (this.read(&scratch[0], READ_TO_END_CHUNK)) {
                 Result::Ok(n) => {
-                    if (n == 0) { return Result::Ok(total); }
+                    if (n == 0) {
+                        const appended: Str = out.as_str().sub_bytes(start, out.length());
+                        match (Str::from_utf8(appended.as_bytes())) {
+                            Result::Ok(_)  => { return Result::Ok(out.length() - start); }
+                            Result::Err(_) => {
+                                out.truncate(start);
+                                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                            }
+                        }
+                    }
                     out.try_push(Str::from_raw(&scratch[0], n))?;
-                    total = total + n;
                 }
                 Result::Err(err) => {
                     match (err.kind) {

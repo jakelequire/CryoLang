@@ -1,45 +1,51 @@
 ///! File metadata: a typed `Metadata` snapshot of a path's type, size,
 ///! and modification time.
 ///!
-///! POSIX: `stat(2)` / `lstat(2)`.  `struct stat` is opaque across glibc
-///! versions, so it is read as a 144-byte buffer (`SIZEOF_STAT`) and the
+///! Read it through `Path.metadata()`, `Path.symlink_metadata()`,
+///! `File.metadata()` or `DirectoryEntry.metadata()`; the queries here are
+///! the platform plumbing behind those.
+///!
+///! POSIX: `stat(2)` / `lstat(2)` / `fstat(2)`.  `struct stat` is opaque
+///! across glibc versions, so it is read as a 144-byte buffer and the
 ///! needed fields are pulled out by their Linux x86_64 offsets:
 ///! `st_mode` @ 24 (u32), `st_size` @ 48 (u64), `st_mtim.tv_sec` @ 88
 ///! (i64).  A future per-arch split would gate these offsets the way
 ///! `sys::syscall` gates its numbers.
 ///!
-///! Windows: the Win32 file API, NOT msvcrt's `stat` shims - msvcrt lays
-///! `struct stat` out completely differently from glibc, so decoding it
-///! with the offsets above would return garbage.  `metadata` opens an
-///! attribute-only handle (`CreateFileA` with access 0 +
-///! `FILE_FLAG_BACKUP_SEMANTICS` so directories open too) and reads
-///! `GetFileInformationByHandle`, which
-///! follows symlinks like `stat(2)`.  `symlink_metadata` uses
-///! `GetFileAttributesExA`, which reports the reparse point itself like
-///! `lstat(2)`.  Windows has no POSIX permission bits, so `raw_mode` is
-///! SYNTHESIZED there: type bits from the file attributes plus 0644/0444
-///! (files, by read-only attribute) or 0755/0555 (directories).
+///! Windows: the wide-character Win32 file API, NOT msvcrt's `stat` shims -
+///! msvcrt lays `struct stat` out completely differently from glibc, and
+///! its narrow paths cannot name a file outside the ANSI code page.
+///! `Metadata::of` opens an attribute-only handle (`CreateFileW` with
+///! access 0 + `FILE_FLAG_BACKUP_SEMANTICS` so directories open too) and
+///! reads `GetFileInformationByHandle`, which follows symlinks like
+///! `stat(2)`.  `Metadata::of_link` uses `GetFileAttributesExW`, which
+///! reports the reparse point itself like `lstat(2)`.  Windows has no POSIX
+///! permission bits, so `raw_mode` is SYNTHESIZED there: type bits from the
+///! file attributes plus 0644/0444 (files, by read-only attribute) or
+///! 0755/0555 (directories).
 
 namespace std::fs::metadata;
 
 import std::core::option;
 import std::core::result::{ Result };
-import std::collections::string::{ String };
-import std::collections::str;
+import std::collections::array::{ Array };
 import std::io::error::{ IoError };
+import std::encoding::utf16::{ Utf16 };
 import std::ffi::libc;
 import std::sys::syscall;
 import std::sys::syscall::{ FILETIME };
 import std::time::clock::{ SystemTime };
 import std::fs::path::{ Path };
+import std::collections::string::{ String };
 import std::core::mem;
 
-// `struct stat` field byte-offsets on Linux x86_64 / glibc.
+// `struct stat` field byte-offsets on Linux x86_64 / glibc, and its size.
 private const STAT_OFF_MODE:      u64 = 24;
 private const STAT_OFF_SIZE:      u64 = 48;
 private const STAT_OFF_MTIME_SEC: u64 = 88;
+private const SIZEOF_STAT:        i64 = 144;
 
-// WIN32_FILE_ATTRIBUTE_DATA byte-offsets (`GetFileAttributesExA` output):
+// WIN32_FILE_ATTRIBUTE_DATA byte-offsets (`GetFileAttributesExW` output):
 //   dwFileAttributes u32 @ 0, ftCreationTime FILETIME @ 4,
 //   ftLastAccessTime @ 12, ftLastWriteTime @ 20,
 //   nFileSizeHigh u32 @ 28, nFileSizeLow u32 @ 32.  36 bytes total.
@@ -70,7 +76,7 @@ private const WIN_PERM_LINK:    u32 = 511;
 /// The broad category of a filesystem entry.
 public type enum FileType {
     File;
-    Dir;
+    Directory;
     Symlink;
     Other;
 }
@@ -80,7 +86,7 @@ implement enum FileType {
     public static from_mode(mode: u32) -> FileType {
         const masked: u32 = mode & libc::S_IFMT;
         if (masked == libc::S_IFREG) { return FileType::File; }
-        if (masked == libc::S_IFDIR) { return FileType::Dir; }
+        if (masked == libc::S_IFDIR) { return FileType::Directory; }
         if (masked == libc::S_IFLNK) { return FileType::Symlink; }
         return FileType::Other;
     }
@@ -101,7 +107,7 @@ public type struct Metadata {
         return (this.raw_mode & libc::S_IFMT) == libc::S_IFREG;
     }
 
-    public is_dir(&this) -> boolean {
+    public is_directory(&this) -> boolean {
         return (this.raw_mode & libc::S_IFMT) == libc::S_IFDIR;
     }
 
@@ -131,183 +137,174 @@ public type struct Metadata {
     public modified_secs(&this) -> i64 {
         return this.mtime_sec;
     }
-}
 
-/// Decode a filled `struct stat` buffer into a `Metadata`.
-![target(linux)]
-private function decode_stat(buf: u8*) -> Metadata {
-    const mode: u32 = *((buf + STAT_OFF_MODE) as u32*);
-    const size: u64 = *((buf + STAT_OFF_SIZE) as u64*);
-    const mtime: i64 = *((buf + STAT_OFF_MTIME_SEC) as i64*);
-    return Metadata { raw_mode: mode, byte_size: size, mtime_sec: mtime };
-}
-
-/// The FILETIME at `at` as whole seconds since the Unix epoch.  A time
-/// before 1970 maps to 0, because a zero FILETIME is what some virtual
-/// filesystems report for "unknown".
-![target(windows)]
-private function filetime_unix_secs(at: u8*) -> i64 {
-    const secs: i64 = SystemTime::from_filetime(*(at as FILETIME*)).unix_secs();
-    if (secs < 0) { return 0; }
-    return secs;
-}
-
-/// Synthesize a POSIX `st_mode` from Win32 file attributes.
-/// `as_link` selects the symlink type bits; the caller decides it from
-/// `FILE_ATTRIBUTE_REPARSE_POINT` on the no-follow path (the follow
-/// path never reports a link, mirroring `stat(2)`).
-![target(windows)]
-private function mode_from_attrs(attrs: u32, as_link: boolean) -> u32 {
-    if (as_link) {
-        return libc::S_IFLNK | WIN_PERM_LINK;
-    }
-    const readonly: boolean =
-        (attrs & syscall::FILE_ATTRIBUTE_READONLY) != 0;
-    if ((attrs & syscall::FILE_ATTRIBUTE_DIRECTORY) != 0) {
-        if (readonly) { return libc::S_IFDIR | WIN_PERM_DIR_RO; }
-        return libc::S_IFDIR | WIN_PERM_DIR_RW;
-    }
-    if (readonly) { return libc::S_IFREG | WIN_PERM_FILE_RO; }
-    return libc::S_IFREG | WIN_PERM_FILE_RW;
-}
-
-/// Handle-free attribute query (`GetFileAttributesExA`).  Reports the
-/// final path component ITSELF: a symlink/junction shows up as
-/// `FileType::Symlink` with the reparse point's own size/mtime, which is
-/// exactly `lstat(2)` semantics.  Also the fallback for `metadata` when
-/// a share-mode conflict blocks opening a handle.
-![target(windows)]
-private function attr_metadata(p: Path) -> Result<Metadata, IoError> {
-    mut c_path: String = String::with_null(p.as_str());
-    mut buf: [u8; 36];
-    const ok: i32 = syscall::GetFileAttributesExA(
-        c_path.as_ptr(), syscall::GetFileExInfoStandard, &buf[0]);
-    const gle: u32 = syscall::GetLastError();
-    mem::drop(c_path);
-    if (ok == 0) {
-        return Result::Err(IoError::from_windows_error(gle));
-    }
-    const bp: u8* = &buf[0];
-    const attrs:   u32 = *((bp + WFAD_OFF_ATTRS) as u32*);
-    const sz_hi:   u32 = *((bp + WFAD_OFF_SIZE_HIGH) as u32*);
-    const sz_lo:   u32 = *((bp + WFAD_OFF_SIZE_LOW) as u32*);
-    const is_link: boolean =
-        (attrs & syscall::FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-    return Result::Ok(Metadata {
-        raw_mode:  mode_from_attrs(attrs, is_link),
-        byte_size: ((sz_hi as u64) << 32) | (sz_lo as u64),
-        mtime_sec: filetime_unix_secs(bp + WFAD_OFF_WTIME),
-    });
-}
-
-/// Metadata for `p`, following symlinks (`stat(2)`).
-![target(linux)]
-public function metadata(p: Path) -> Result<Metadata, IoError> {
-    mut c_path: String = String::with_null(p.as_str());
-    mut buf: [u8; 144];
-    const rc: i32 = libc::stat(c_path.as_ptr(), &buf[0]);
-    const err: i32 = libc::errno();
-    mem::drop(c_path);
-    if (rc != 0) {
-        return Result::Err(IoError::from_errno(err));
-    }
-    return Result::Ok(decode_stat(&buf[0]));
-}
-
-/// Metadata for `p`, following symlinks.  Opens an attribute-only
-/// handle (access 0, all share modes, `FILE_FLAG_BACKUP_SEMANTICS` so
-/// directories open too) and reads `GetFileInformationByHandle`;
-/// `CreateFileA` without `FILE_FLAG_OPEN_REPARSE_POINT` resolves a
-/// final symlink to its target, mirroring `stat(2)`.
-![target(windows)]
-public function metadata(p: Path) -> Result<Metadata, IoError> {
-    mut c_path: String = String::with_null(p.as_str());
-    const share: u32 = syscall::FILE_SHARE_READ
-        | syscall::FILE_SHARE_WRITE
-        | syscall::FILE_SHARE_DELETE;
-    const h: u8* = syscall::CreateFileA(c_path.as_ptr(), 0, share,
-        null, syscall::OPEN_EXISTING,
-        syscall::FILE_FLAG_BACKUP_SEMANTICS, null);
-    // Capture the error BEFORE dropping the path: `drop` frees heap
-    // memory and any intervening API call may overwrite the thread's
-    // last-error slot.
-    const open_err: u32 = syscall::GetLastError();
-    mem::drop(c_path);
-    // Compare against a local -1: `INVALID_HANDLE_VALUE` is `(HANDLE)-1`.
-    if ((h as i64) == -1) {
-        const code: u32 = open_err;
-        if (code == syscall::ERROR_SHARING_VIOLATION
-                || code == syscall::ERROR_ACCESS_DENIED) {
-            // Another process holds the file with a conflicting share
-            // mode (or ACLs block handle opens); the attributes are
-            // still queryable without a handle.  The fallback does not
-            // follow a final symlink - acceptable degradation for a
-            // locked reparse point.
-            return attr_metadata(p);
+    /// Metadata for `path`, following a final symlink (`stat(2)`).  A
+    /// failure names `path`.
+    ![target(linux)]
+    internal static of(path: Path) -> Result<Metadata, IoError> {
+        mut c_path: String = String::with_null(path.as_str());
+        mut buffer: [u8; SIZEOF_STAT];
+        const rc: i32 = libc::stat(c_path.as_ptr(), &buffer[0]);
+        const err: i32 = libc::errno();
+        mem::drop(c_path);
+        if (rc != 0) {
+            return Result::Err(IoError::from_errno(err).with_path(path));
         }
-        return Result::Err(IoError::from_windows_error(code));
+        return Result::Ok(Metadata::from_stat(&buffer[0]));
     }
-    mut buf: [u8; 52];
-    const ok: i32 = syscall::GetFileInformationByHandle(h, &buf[0]);
-    const gle: u32 = syscall::GetLastError();
-    syscall::CloseHandle(h);
-    if (ok == 0) {
-        return Result::Err(IoError::from_windows_error(gle));
+
+    /// Metadata for `path` without following a final symlink (`lstat(2)`).
+    ![target(linux)]
+    internal static of_link(path: Path) -> Result<Metadata, IoError> {
+        mut c_path: String = String::with_null(path.as_str());
+        mut buffer: [u8; SIZEOF_STAT];
+        const rc: i32 = libc::lstat(c_path.as_ptr(), &buffer[0]);
+        const err: i32 = libc::errno();
+        mem::drop(c_path);
+        if (rc != 0) {
+            return Result::Err(IoError::from_errno(err).with_path(path));
+        }
+        return Result::Ok(Metadata::from_stat(&buffer[0]));
     }
-    const bp: u8* = &buf[0];
-    const attrs: u32 = *((bp + BHFI_OFF_ATTRS) as u32*);
-    const sz_hi: u32 = *((bp + BHFI_OFF_SIZE_HIGH) as u32*);
-    const sz_lo: u32 = *((bp + BHFI_OFF_SIZE_LOW) as u32*);
-    return Result::Ok(Metadata {
-        raw_mode:  mode_from_attrs(attrs, false),
-        byte_size: ((sz_hi as u64) << 32) | (sz_lo as u64),
-        mtime_sec: filetime_unix_secs(bp + BHFI_OFF_WTIME),
-    });
-}
 
-/// Metadata for `p` without following a final symlink.  On POSIX this is
-/// `lstat(2)`; on Windows it is the handle-free attribute query, which
-/// reports the reparse point itself (see `attr_metadata`).
-![target(linux)]
-public function symlink_metadata(p: Path) -> Result<Metadata, IoError> {
-    mut c_path: String = String::with_null(p.as_str());
-    mut buf: [u8; 144];
-    const rc: i32 = libc::lstat(c_path.as_ptr(), &buf[0]);
-    const err: i32 = libc::errno();
-    mem::drop(c_path);
-    if (rc != 0) {
-        return Result::Err(IoError::from_errno(err));
+    /// Metadata for the open file `descriptor` (`fstat(2)`).
+    ![target(linux)]
+    internal static of_descriptor(descriptor: i32) -> Result<Metadata, IoError> {
+        mut buffer: [u8; SIZEOF_STAT];
+        if (libc::fstat(descriptor, &buffer[0]) != 0) {
+            return Result::Err(IoError::last_os_error());
+        }
+        return Result::Ok(Metadata::from_stat(&buffer[0]));
     }
-    return Result::Ok(decode_stat(&buf[0]));
-}
 
-![target(windows)]
-public function symlink_metadata(p: Path) -> Result<Metadata, IoError> {
-    return attr_metadata(p);
-}
-
-/// True if `p` exists (any type). Uses `access(2)` with `F_OK` (0).
-/// A non-existence answer is not distinguished from a permission error
-/// on an intermediate directory; use `metadata` if you need the reason.
-public function exists(p: Path) -> boolean {
-    mut c_path: String = String::with_null(p.as_str());
-    const rc: i32 = libc::access(c_path.as_ptr(), 0);
-    mem::drop(c_path);
-    return rc == 0;
-}
-
-/// True if `p` exists and is a regular file.
-public function is_file(p: Path) -> boolean {
-    match (metadata(p)) {
-        Result::Ok(m)  => { return m.is_file(); }
-        Result::Err(_) => { return false; }
+    /// Decode a filled `struct stat` buffer.
+    ![target(linux)]
+    private static from_stat(buffer: u8*) -> Metadata {
+        const mode: u32 = *((buffer + STAT_OFF_MODE) as u32*);
+        const size: u64 = *((buffer + STAT_OFF_SIZE) as u64*);
+        const mtime: i64 = *((buffer + STAT_OFF_MTIME_SEC) as i64*);
+        return Metadata { raw_mode: mode, byte_size: size, mtime_sec: mtime };
     }
-}
 
-/// True if `p` exists and is a directory.
-public function is_dir(p: Path) -> boolean {
-    match (metadata(p)) {
-        Result::Ok(m)  => { return m.is_dir(); }
-        Result::Err(_) => { return false; }
+    /// Metadata for `path`, following a final symlink.  Opens an
+    /// attribute-only handle (access 0, all share modes,
+    /// `FILE_FLAG_BACKUP_SEMANTICS` so directories open too);
+    /// `CreateFileW` without `FILE_FLAG_OPEN_REPARSE_POINT` resolves a
+    /// final symlink to its target, mirroring `stat(2)`.  A failure names
+    /// `path`.
+    ![target(windows)]
+    internal static of(path: Path) -> Result<Metadata, IoError> {
+        const wide: Array<u16> = Utf16::encode(path.as_str());
+        const share: u32 = syscall::FILE_SHARE_READ
+            | syscall::FILE_SHARE_WRITE
+            | syscall::FILE_SHARE_DELETE;
+        const handle: u8* = syscall::CreateFileW(wide.as_ptr(), 0, share,
+            null, syscall::OPEN_EXISTING,
+            syscall::FILE_FLAG_BACKUP_SEMANTICS, null);
+        // Read the error before anything else can overwrite the thread's
+        // last-error slot.
+        const open_error: u32 = syscall::GetLastError();
+        // INVALID_HANDLE_VALUE is `(HANDLE)-1`.
+        if ((handle as i64) == -1) {
+            if (open_error == syscall::ERROR_SHARING_VIOLATION
+                    || open_error == syscall::ERROR_ACCESS_DENIED) {
+                // Another process holds the file with a conflicting share
+                // mode (or ACLs block handle opens); the attributes are
+                // still queryable without a handle.  That query does not
+                // follow a final symlink - acceptable for a locked
+                // reparse point.
+                return Metadata::of_link(path);
+            }
+            return Result::Err(IoError::from_windows_error(open_error).with_path(path));
+        }
+        const answer: Result<Metadata, IoError> = Metadata::of_handle(handle);
+        syscall::CloseHandle(handle);
+        return match (answer) {
+            Result::Ok(found)  => { Result::Ok(found) }
+            Result::Err(error) => { Result::Err(error.with_path(path)) }
+        };
+    }
+
+    /// Metadata for `path` without following a final symlink: the
+    /// handle-free attribute query, which reports a symlink or junction as
+    /// `FileType::Symlink` with the reparse point's own size and time, as
+    /// `lstat(2)` does.
+    ![target(windows)]
+    internal static of_link(path: Path) -> Result<Metadata, IoError> {
+        const wide: Array<u16> = Utf16::encode(path.as_str());
+        mut buffer: [u8; 36];
+        const ok: i32 = syscall::GetFileAttributesExW(
+            wide.as_ptr(), syscall::GetFileExInfoStandard, &buffer[0]);
+        if (ok == 0) {
+            return Result::Err(IoError::last_os_error().with_path(path));
+        }
+        const at: u8* = &buffer[0];
+        const attributes: u32 = *((at + WFAD_OFF_ATTRS) as u32*);
+        const size_high:  u32 = *((at + WFAD_OFF_SIZE_HIGH) as u32*);
+        const size_low:   u32 = *((at + WFAD_OFF_SIZE_LOW) as u32*);
+        const is_link: boolean =
+            (attributes & syscall::FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+        return Result::Ok(Metadata {
+            raw_mode:  Metadata::mode_from_attributes(attributes, is_link),
+            byte_size: ((size_high as u64) << 32) | (size_low as u64),
+            mtime_sec: Metadata::filetime_unix_secs(at + WFAD_OFF_WTIME),
+        });
+    }
+
+    /// Metadata for the open file `descriptor`, through the HANDLE the C
+    /// runtime keeps for it.
+    ![target(windows)]
+    internal static of_descriptor(descriptor: i32) -> Result<Metadata, IoError> {
+        const handle: i64 = libc::_get_osfhandle(descriptor);
+        if (handle == -1) {
+            return Result::Err(IoError::from_errno(libc::errno()));
+        }
+        return Metadata::of_handle(handle as u8*);
+    }
+
+    ![target(windows)]
+    private static of_handle(handle: u8*) -> Result<Metadata, IoError> {
+        mut buffer: [u8; 52];
+        if (syscall::GetFileInformationByHandle(handle, &buffer[0]) == 0) {
+            return Result::Err(IoError::last_os_error());
+        }
+        const at: u8* = &buffer[0];
+        const attributes: u32 = *((at + BHFI_OFF_ATTRS) as u32*);
+        const size_high:  u32 = *((at + BHFI_OFF_SIZE_HIGH) as u32*);
+        const size_low:   u32 = *((at + BHFI_OFF_SIZE_LOW) as u32*);
+        return Result::Ok(Metadata {
+            raw_mode:  Metadata::mode_from_attributes(attributes, false),
+            byte_size: ((size_high as u64) << 32) | (size_low as u64),
+            mtime_sec: Metadata::filetime_unix_secs(at + BHFI_OFF_WTIME),
+        });
+    }
+
+    /// The FILETIME at `at` as whole seconds since the Unix epoch.  A time
+    /// before 1970 maps to 0, because a zero FILETIME is what some virtual
+    /// filesystems report for "unknown".
+    ![target(windows)]
+    private static filetime_unix_secs(at: u8*) -> i64 {
+        const secs: i64 = SystemTime::from_filetime(*(at as FILETIME*)).unix_secs();
+        if (secs < 0) { return 0; }
+        return secs;
+    }
+
+    /// Synthesize a POSIX `st_mode` from Win32 file attributes.  `as_link`
+    /// selects the symlink type bits; the no-follow query decides it from
+    /// `FILE_ATTRIBUTE_REPARSE_POINT` (the following query never reports a
+    /// link, as `stat(2)` does not).
+    ![target(windows)]
+    private static mode_from_attributes(attributes: u32, as_link: boolean) -> u32 {
+        if (as_link) {
+            return libc::S_IFLNK | WIN_PERM_LINK;
+        }
+        const read_only: boolean =
+            (attributes & syscall::FILE_ATTRIBUTE_READONLY) != 0;
+        if ((attributes & syscall::FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            if (read_only) { return libc::S_IFDIR | WIN_PERM_DIR_RO; }
+            return libc::S_IFDIR | WIN_PERM_DIR_RW;
+        }
+        if (read_only) { return libc::S_IFREG | WIN_PERM_FILE_RO; }
+        return libc::S_IFREG | WIN_PERM_FILE_RW;
     }
 }
