@@ -53,32 +53,32 @@ import std::sync::mutex::{ Mutex, MutexGuard };
 // Return convention follows pthread (0 == success).
 
 ![target(unix)]
-private function cond_init_raw(buf: u8*) -> i32 { return pthread_cond_init(buf, null); }
+private function cond_init_raw(buf: mut u8*) -> i32 { return pthread_cond_init(buf, null); }
 ![target(windows)]
-private function cond_init_raw(buf: u8*) -> i32 { syscall::InitializeConditionVariable(buf); return 0; }
+private function cond_init_raw(buf: mut u8*) -> i32 { syscall::InitializeConditionVariable(buf); return 0; }
 
 ![target(unix)]
-private function cond_wait_raw(cond: u8*, mtx: u8*) -> i32 { return pthread_cond_wait(cond, mtx); }
+private function cond_wait_raw(cond: mut u8*, mtx: mut u8*) -> i32 { return pthread_cond_wait(cond, mtx); }
 ![target(windows)]
-private function cond_wait_raw(cond: u8*, mtx: u8*) -> i32 {
+private function cond_wait_raw(cond: mut u8*, mtx: mut u8*) -> i32 {
     if (syscall::SleepConditionVariableSRW(cond, mtx, syscall::INFINITE, 0) != 0) { return 0; }
     return 1;
 }
 
 ![target(unix)]
-private function cond_signal_raw(buf: u8*) -> void { pthread_cond_signal(buf); }
+private function cond_signal_raw(buf: mut u8*) -> void { pthread_cond_signal(buf); }
 ![target(windows)]
-private function cond_signal_raw(buf: u8*) -> void { syscall::WakeConditionVariable(buf); }
+private function cond_signal_raw(buf: mut u8*) -> void { syscall::WakeConditionVariable(buf); }
 
 ![target(unix)]
-private function cond_broadcast_raw(buf: u8*) -> void { pthread_cond_broadcast(buf); }
+private function cond_broadcast_raw(buf: mut u8*) -> void { pthread_cond_broadcast(buf); }
 ![target(windows)]
-private function cond_broadcast_raw(buf: u8*) -> void { syscall::WakeAllConditionVariable(buf); }
+private function cond_broadcast_raw(buf: mut u8*) -> void { syscall::WakeAllConditionVariable(buf); }
 
 ![target(unix)]
-private function cond_destroy_raw(buf: u8*) -> void { pthread_cond_destroy(buf); }
+private function cond_destroy_raw(buf: mut u8*) -> void { pthread_cond_destroy(buf); }
 ![target(windows)]
-private function cond_destroy_raw(buf: u8*) -> void { }
+private function cond_destroy_raw(buf: mut u8*) -> void { }
 
 
 // 48-byte opaque pthread_cond_t buffer, heap-pinned for address
@@ -109,7 +109,7 @@ public type struct CondVar {
         const raw: NonNull<u8> = alloc.allocate(header)?;
         const typed: NonNull<CondVarInner> = raw.cast::<CondVarInner>();
         const inner_ptr: mut CondVarInner* = typed.as_ptr();
-        const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
+        const buf_ptr: mut u8* = &inner_ptr.pthread_buf[0];
         const rc: i32 = cond_init_raw(buf_ptr);
         if (rc != 0) {
             alloc.deallocate(raw, header);
@@ -129,8 +129,8 @@ public type struct CondVar {
     /// unchanged at the Cryo level (pthread internally unlocks /
     /// relocks the underlying buffer).
     public wait<T, A>(&this, mutex: &Mutex<T, A>, guard: mut &MutexGuard<T, A>) -> void {
-        const cond_buf:  u8* = &this.inner.pthread_buf[0];
-        const mutex_buf: u8* = mutex.raw_pthread_buf();
+        const cond_buf:  mut u8* = &this.inner.pthread_buf[0];
+        const mutex_buf: mut u8* = mutex.raw_pthread_buf();
         const rc: i32 = cond_wait_raw(cond_buf, mutex_buf);
         if (rc != 0) {
             core::panic("CondVar::wait: cond_wait_raw failed", intrinsics::location());
@@ -142,7 +142,7 @@ public type struct CondVar {
     /// standard pthread semantics; the producer should arrange for
     /// the consumer to check the predicate before sleeping).
     public notify_one(&this) -> void {
-        const buf_ptr: u8* = &this.inner.pthread_buf[0];
+        const buf_ptr: mut u8* = &this.inner.pthread_buf[0];
         cond_signal_raw(buf_ptr);
     }
 
@@ -150,7 +150,7 @@ public type struct CondVar {
     /// variable.  Spurious wake-ups are possible regardless; the
     /// consumer must re-check the predicate after waking.
     public notify_all(&this) -> void {
-        const buf_ptr: u8* = &this.inner.pthread_buf[0];
+        const buf_ptr: mut u8* = &this.inner.pthread_buf[0];
         cond_broadcast_raw(buf_ptr);
     }
 }
@@ -158,8 +158,8 @@ public type struct CondVar {
 implement trait Drop for struct CondVar {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
-        const inner_ptr: CondVarInner* = this.inner;
-        const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
+        const inner_ptr: mut CondVarInner* = this.inner;
+        const buf_ptr: mut u8* = &inner_ptr.pthread_buf[0];
         cond_destroy_raw(buf_ptr);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         const header: Layout = Layout::of::<CondVarInner>();

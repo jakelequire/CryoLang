@@ -168,9 +168,16 @@ yet is recorded with the change that builds it, not here.
      `memcpy`, `memmove`, `memccpy`, `memset`, the `str*cpy`/`str*cat`
      family, `sprintf`, `snprintf` and `vsnprintf` is writable, as is
      every library function's buffer it fills (`Read::read`, the
-     `to_*_buf` formatters, `mem::copy` and `mem::zero`).  A caller
-     declares the pointer writable where the allocation is made; it does
-     not widen a read-only one with `as`.  (Jake)
+     `to_*_buf` formatters, `mem::copy` and `mem::zero`).  Every C function
+     the library binds by hand takes a writable pointer wherever it writes
+     through one: the buffer `read`, `recv`, `fread` and `fgets` fill, the
+     record `stat` and `GetFileInformationByHandle` fill, the lock a
+     `pthread_mutex_lock` or `AcquireSRWLockExclusive` takes, and every
+     out-parameter (`waitpid`'s status, `accept`'s address and length,
+     `strtol`'s end pointer); what it only reads stays read-only, and an
+     opaque handle stays the read-only pointer it is.  A caller declares
+     the pointer writable where the allocation is made; it does not widen
+     a read-only one with `as`.  (Jake)
 
 691. **The census requires a test from every project judged on its exit
      code.**  A `collect` project passes when its own `cryo test` exits 0,

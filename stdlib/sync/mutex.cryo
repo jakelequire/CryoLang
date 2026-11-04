@@ -62,19 +62,19 @@ import std::sys::syscall;
 // "lock busy" to EBUSY=16 for `try_lock`).
 
 ![target(unix)]
-private function mutex_init_raw(buf: u8*) -> i32 { return pthread_mutex_init(buf, null); }
+private function mutex_init_raw(buf: mut u8*) -> i32 { return pthread_mutex_init(buf, null); }
 ![target(windows)]
-private function mutex_init_raw(buf: u8*) -> i32 { syscall::InitializeSRWLock(buf); return 0; }
+private function mutex_init_raw(buf: mut u8*) -> i32 { syscall::InitializeSRWLock(buf); return 0; }
 
 ![target(unix)]
-private function mutex_lock_raw(buf: u8*) -> i32 { return pthread_mutex_lock(buf); }
+private function mutex_lock_raw(buf: mut u8*) -> i32 { return pthread_mutex_lock(buf); }
 ![target(windows)]
-private function mutex_lock_raw(buf: u8*) -> i32 { syscall::AcquireSRWLockExclusive(buf); return 0; }
+private function mutex_lock_raw(buf: mut u8*) -> i32 { syscall::AcquireSRWLockExclusive(buf); return 0; }
 
 ![target(unix)]
-private function mutex_trylock_raw(buf: u8*) -> i32 { return pthread_mutex_trylock(buf); }
+private function mutex_trylock_raw(buf: mut u8*) -> i32 { return pthread_mutex_trylock(buf); }
 ![target(windows)]
-private function mutex_trylock_raw(buf: u8*) -> i32 {
+private function mutex_trylock_raw(buf: mut u8*) -> i32 {
     // TryAcquireSRWLockExclusive returns nonzero on success; pthread returns
     // 0 on success and EBUSY (16) when the lock is already held.
     if (syscall::TryAcquireSRWLockExclusive(buf) != 0) { return 0; }
@@ -82,15 +82,15 @@ private function mutex_trylock_raw(buf: u8*) -> i32 {
 }
 
 ![target(unix)]
-private function mutex_unlock_raw(buf: u8*) -> void { pthread_mutex_unlock(buf); }
+private function mutex_unlock_raw(buf: mut u8*) -> void { pthread_mutex_unlock(buf); }
 ![target(windows)]
-private function mutex_unlock_raw(buf: u8*) -> void { syscall::ReleaseSRWLockExclusive(buf); }
+private function mutex_unlock_raw(buf: mut u8*) -> void { syscall::ReleaseSRWLockExclusive(buf); }
 
 // SRWLOCK has no teardown; pthread mutexes do.
 ![target(unix)]
-private function mutex_destroy_raw(buf: u8*) -> void { pthread_mutex_destroy(buf); }
+private function mutex_destroy_raw(buf: mut u8*) -> void { pthread_mutex_destroy(buf); }
 ![target(windows)]
-private function mutex_destroy_raw(buf: u8*) -> void { }
+private function mutex_destroy_raw(buf: mut u8*) -> void { }
 
 
 // Heap-pinned mutex backing: holds the pthread buffer plus the
@@ -124,7 +124,7 @@ public type struct MutexGuard<T, A> {
 implement<T, A> trait Drop for struct MutexGuard<T, A> {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
-        const buf_ptr: u8* = &this.inner.pthread_buf[0];
+        const buf_ptr: mut u8* = &this.inner.pthread_buf[0];
         mutex_unlock_raw(buf_ptr);
         this.inner = null;
     }
@@ -169,7 +169,7 @@ public type struct Mutex<T, A = GlobalAlloc> where A: Allocator {
         const typed: NonNull<MutexInner<T, GlobalAlloc>> =
             raw.cast::<MutexInner<T, GlobalAlloc>>();
         const inner_ptr: mut MutexInner<T, GlobalAlloc>* = typed.as_ptr();
-        const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
+        const buf_ptr: mut u8* = &inner_ptr.pthread_buf[0];
         const rc: i32 = mutex_init_raw(buf_ptr);
         if (rc != 0) {
             alloc.deallocate(raw, header);
@@ -186,7 +186,7 @@ public type struct Mutex<T, A = GlobalAlloc> where A: Allocator {
         const raw: NonNull<u8> = a.allocate(header)?;
         const typed: NonNull<MutexInner<T, A>> = raw.cast::<MutexInner<T, A>>();
         const inner_ptr: mut MutexInner<T, A>* = typed.as_ptr();
-        const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
+        const buf_ptr: mut u8* = &inner_ptr.pthread_buf[0];
         const rc: i32 = mutex_init_raw(buf_ptr);
         if (rc != 0) {
             a.deallocate(raw, header);
@@ -203,7 +203,7 @@ public type struct Mutex<T, A = GlobalAlloc> where A: Allocator {
     /// `pthread_mutex_lock` (`EINVAL` from a recursively-locked
     /// non-recursive mutex or a destroyed mutex).
     public lock(&this) -> MutexGuard<T, A> {
-        const buf_ptr: u8* = &this.inner.pthread_buf[0];
+        const buf_ptr: mut u8* = &this.inner.pthread_buf[0];
         const rc: i32 = mutex_lock_raw(buf_ptr);
         if (rc != 0) {
             core::panic("Mutex::lock: mutex_lock_raw failed", intrinsics::location());
@@ -215,7 +215,7 @@ public type struct Mutex<T, A = GlobalAlloc> where A: Allocator {
     /// lock was acquired; `None` when the lock was already held by
     /// another thread.
     public try_lock(&this) -> Option<MutexGuard<T, A>> {
-        const buf_ptr: u8* = &this.inner.pthread_buf[0];
+        const buf_ptr: mut u8* = &this.inner.pthread_buf[0];
         const rc: i32 = mutex_trylock_raw(buf_ptr);
         if (rc == 0) {
             return Option::Some(MutexGuard::<T, A> { inner: this.inner });
@@ -226,7 +226,7 @@ public type struct Mutex<T, A = GlobalAlloc> where A: Allocator {
     /// Raw pointer to the inner pthread buffer.  Used by `CondVar`
     /// to pair the mutex with a condition variable in
     /// `pthread_cond_wait`; not a stable public API.
-    internal raw_pthread_buf(&this) -> u8* {
+    internal raw_pthread_buf(&this) -> mut u8* {
         return &this.inner.pthread_buf[0];
     }
 }
@@ -239,8 +239,8 @@ implement<T, A> trait Drop for struct Mutex<T, A>
 where A: Allocator {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
-        const inner_ptr: MutexInner<T, A>* = this.inner;
-        const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
+        const inner_ptr: mut MutexInner<T, A>* = this.inner;
+        const buf_ptr: mut u8* = &inner_ptr.pthread_buf[0];
         mutex_destroy_raw(buf_ptr);
         ptr::drop_in_place::<T>(&inner_ptr.value);
         mut alloc: A = inner_ptr.alloc;

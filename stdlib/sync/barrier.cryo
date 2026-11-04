@@ -35,11 +35,11 @@ import std::sys::syscall;
 // (1) to exactly one thread and FALSE (0) to the others - both fit that test.
 
 ![target(unix)]
-private function barrier_init_raw(buf: u8*, count: u32) -> i32 {
+private function barrier_init_raw(buf: mut u8*, count: u32) -> i32 {
     return pthread_barrier_init(buf, null, count);
 }
 ![target(windows)]
-private function barrier_init_raw(buf: u8*, count: u32) -> i32 {
+private function barrier_init_raw(buf: mut u8*, count: u32) -> i32 {
     // lSpinCount = -1 -> default spin.  Returns TRUE on success; map to the
     // pthread convention (0 == success).
     if (syscall::InitializeSynchronizationBarrier(buf, count as i32, -1) != 0) { return 0; }
@@ -47,16 +47,16 @@ private function barrier_init_raw(buf: u8*, count: u32) -> i32 {
 }
 
 ![target(unix)]
-private function barrier_wait_raw(buf: u8*) -> i32 { return pthread_barrier_wait(buf); }
+private function barrier_wait_raw(buf: mut u8*) -> i32 { return pthread_barrier_wait(buf); }
 ![target(windows)]
-private function barrier_wait_raw(buf: u8*) -> i32 {
+private function barrier_wait_raw(buf: mut u8*) -> i32 {
     return syscall::EnterSynchronizationBarrier(buf, 0);
 }
 
 ![target(unix)]
-private function barrier_destroy_raw(buf: u8*) -> void { pthread_barrier_destroy(buf); }
+private function barrier_destroy_raw(buf: mut u8*) -> void { pthread_barrier_destroy(buf); }
 ![target(windows)]
-private function barrier_destroy_raw(buf: u8*) -> void { syscall::DeleteSynchronizationBarrier(buf); }
+private function barrier_destroy_raw(buf: mut u8*) -> void { syscall::DeleteSynchronizationBarrier(buf); }
 
 
 private type struct BarrierInner {
@@ -89,7 +89,7 @@ public type struct Barrier {
             Result::Ok(raw) => {
                 const typed: NonNull<BarrierInner> = raw.cast::<BarrierInner>();
                 const inner_ptr: mut BarrierInner* = typed.as_ptr();
-                const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
+                const buf_ptr: mut u8* = &inner_ptr.pthread_buf[0];
                 const rc: i32 = barrier_init_raw(buf_ptr, count);
                 if (rc != 0) {
                     core::panic("Barrier::new: barrier_init_raw failed", intrinsics::location());
@@ -108,7 +108,7 @@ public type struct Barrier {
     /// threads.  The barrier is automatically reset for the next
     /// cycle once all waiters resume.
     public wait(&this) -> BarrierWaitResult {
-        const buf_ptr: u8* = &this.inner.pthread_buf[0];
+        const buf_ptr: mut u8* = &this.inner.pthread_buf[0];
         const rc: i32 = barrier_wait_raw(buf_ptr);
         // POSIX returns PTHREAD_BARRIER_SERIAL_THREAD (-1, but a
         // positive sentinel on glibc) for the leader; 0 for the
@@ -123,8 +123,8 @@ public type struct Barrier {
 implement trait Drop for struct Barrier {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
-        const inner_ptr: BarrierInner* = this.inner;
-        const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
+        const inner_ptr: mut BarrierInner* = this.inner;
+        const buf_ptr: mut u8* = &inner_ptr.pthread_buf[0];
         barrier_destroy_raw(buf_ptr);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         const header: Layout = Layout::of::<BarrierInner>();
