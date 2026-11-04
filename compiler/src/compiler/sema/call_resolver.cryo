@@ -172,6 +172,38 @@ type struct ArgCandidates {
     }
 }
 
+/// What inferring a generic call's type arguments found: a binding per
+/// parameter (invalid where none was found), or the argument whose type
+/// conflicts with what an earlier one bound, and the first argument whose
+/// type does not have its parameter's shape (`[u64; 4]` for `&[T; 3]`).
+/// An argument whose type is not known - one an earlier error left
+/// untyped, or one inference does not read - leaves the inference
+/// `unjudged`: such an argument may be what binds a parameter left open,
+/// so nothing can be said about the call from the rest.
+type struct CallInference {
+    bindings:          [TypeRef];
+    conflict_argument: i64;
+    conflict_from:     TypeRef;
+    conflict_to:       TypeRef;
+    misfit:            i64;
+    unjudged:          boolean;
+
+    static new() -> CallInference {
+        return CallInference {
+            bindings: [], conflict_argument: -1, conflict_from: TypeRef::invalid(),
+            conflict_to: TypeRef::invalid(), misfit: -1, unjudged: false,
+        };
+    }
+
+    /// Whether every parameter was bound.
+    all_bound(&this) -> boolean {
+        for (mut i: i64 = 0; i < this.bindings.length(); i++) {
+            if (!this.bindings[i].is_valid()) { return false; }
+        }
+        return true;
+    }
+}
+
 type struct CallResolver {
     arena:    mut TypeArena*;
     intern:   mut InternTable*;
@@ -1823,83 +1855,16 @@ type struct CallResolver {
             }
         } else {
             if (tmpl.parameters.length() != call.arguments.length()) { return TypeRef::invalid(); }
-            mut pids: [TypeRef] = [];
-            for (mut i: i64 = 0; i < entry.param_types.length(); i++) { pids.push(entry.param_types[i]); }
-            mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
-
-            // PASS A - non-literal args; reject two concrete actuals for one T (E0214).
-            for (mut i: i64 = 0; i < call.arguments.length(); i++) {
-                const param_decl: DeclarationNode* = tmpl.parameters[i];
-                const param: VarDecl* = DeclarationNode::var_of(param_decl);
-                if (param == null || !param.resolved_type.is_valid()) { continue; }
-                const arg: ExpressionNode* = call.arguments[i];
-                if (this.sema_arg_is_polymorphic_literal(arg)) { continue; }
-                if (this.bind_from_variant_payload(&ictx, param.resolved_type, arg)) { continue; }
-                if (!this.free_infer_arg_reliable(arg)) { continue; }
-                const actual: TypeRef = arg.resolved_type;
-                if (!actual.is_valid()) { continue; }
-                ictx.conflict_from = TypeRef::invalid();
-                ictx.conflict_to   = TypeRef::invalid();
-                ictx.unify(param.resolved_type, actual);
-                if (ictx.conflict_from.is_valid() && ictx.conflict_to.is_valid()
-                        && this.free_infer_type_concrete(ictx.conflict_from)
-                        && this.free_infer_type_concrete(ictx.conflict_to)) {
-                    this.emit_free_infer_conflict(call_e, call, tmpl.name, arg, ictx.conflict_from, ictx.conflict_to);
-                    return TypeRef::invalid();
-                }
-            }
-            // PASS D first for what the arguments bound: a param a where-bound
-            // projects is what the bound requires, which the expected type
-            // below must not decide instead.
-            this.project_where_bound_params(tmpl_decl, entry, &ictx);
-            // PASS B - recover unbound params from a CONCRETE expected type.
-            if (this.state.expected_type.is_valid() && tmpl.resolved_return_type.is_valid()
-                    && !this.types.contains_generic_param(this.state.expected_type)) {
-                mut any_unbound: boolean = false;
-                for (mut i: i64 = 0; i < ictx.bindings.length(); i++) {
-                    if (!ictx.bindings[i].is_valid()) { any_unbound = true; break; }
-                }
-                if (any_unbound) { ictx.unify(tmpl.resolved_return_type, this.state.expected_type); }
-            }
-            // PASS C - literal fallback (a polymorphic literal adopts a pinned numeric T).
-            for (mut i: i64 = 0; i < call.arguments.length(); i++) {
-                const param_decl: DeclarationNode* = tmpl.parameters[i];
-                const param: VarDecl* = DeclarationNode::var_of(param_decl);
-                if (param == null || !param.resolved_type.is_valid()) { continue; }
-                const arg: ExpressionNode* = call.arguments[i];
-                if (!this.sema_arg_is_polymorphic_literal(arg)) { continue; }
-                const lit_actual: TypeRef = arg.resolved_type;
-                if (!lit_actual.is_valid()) { continue; }
-                const f_idx: i64 = ictx.binding_index(this.literal_slot(param.resolved_type, arg));
-                if (f_idx >= 0 && ictx.bindings[f_idx].is_valid()) {
-                    const bnd: TypeRef = ictx.bindings[f_idx];
-                    if (this.free_infer_type_concrete(bnd) && !this.literal_adopts_binding(bnd)) {
-                        this.emit_free_infer_conflict(call_e, call, tmpl.name, arg, bnd,
-                            this.literal_slot(lit_actual, arg));
-                        return TypeRef::invalid();
-                    }
-                    continue;
-                }
-                ictx.unify(param.resolved_type, lit_actual);
-            }
-            // PASS D - fill a param that appears only in a where-bound (the `R`
-            // in `where F: Future<R>`) by projecting it off the now-bound subject
-            // (`R = F::Output`), so a return-only bound param resolves from the
-            // arguments alone - no turbofish or expected-type context required.
-            this.project_where_bound_params(tmpl_decl, entry, &ictx);
-
-            for (mut i: i64 = 0; i < bindings.length(); i++) { bindings[i] = ictx.bindings[i]; }
-
-            mut all_bound: boolean = true;
-            for (mut i: i64 = 0; i < bindings.length(); i++) {
-                if (!bindings[i].is_valid()) { all_bound = false; break; }
-            }
-            if (!all_bound) {
-                if (tmpl.is_implicit && call.arguments.length() == 0 && !this.state.expected_type.is_valid()) {
-                    this.emit_free_cannot_infer(call_e, call, tmpl.name);
-                }
+            const inference: CallInference = this.infer_call_bindings(call, entry, tmpl_decl);
+            if (inference.conflict_argument < 0 && !inference.all_bound() && tmpl.is_implicit
+                    && call.arguments.length() == 0 && !this.state.expected_type.is_valid()) {
+                this.emit_free_cannot_infer(call_e, call, tmpl.name);
                 return TypeRef::invalid();
             }
+            if (this.failed_inference_reported(call_e, call, entry, &inference) || !inference.all_bound()) {
+                return TypeRef::invalid();
+            }
+            for (mut i: i64 = 0; i < bindings.length(); i++) { bindings[i] = inference.bindings[i]; }
         }
 
         // E0306 - where-clause bound satisfaction for the bound type args.
@@ -2296,34 +2261,76 @@ type struct CallResolver {
             this.state.in_symbolic_check);
     }
 
-    /// PASS A/B/C argument inference returning the per-param bindings (no
-    /// diagnostics), used by the module-scoped scope-resolution path.
+    /// The type arguments the arguments of `call` bind, one per parameter of
+    /// the generic function `tmpl_decl`; empty when the arguments conflict
+    /// or leave one unbound.  Reports nothing: for the readers that ask
+    /// whether a function fits a call, and for the paths whose call is
+    /// reported where its arguments are checked.
     infer_free_call_bindings(mut &this, call: CallExpr*, entry: const TemplateEntry*,
                              tmpl_decl: DeclarationNode*) -> [TypeRef] {
         const tmpl: FunctionDecl* = DeclarationNode::fn_of(tmpl_decl);
         mut empty: [TypeRef] = [];
         if (entry.param_types.length() == 0) { return empty; }
         if (tmpl.parameters.length() != call.arguments.length()) { return empty; }
+        const inference: CallInference = this.infer_call_bindings(call, entry, tmpl_decl);
+        if (inference.conflict_argument >= 0 || !inference.all_bound()) { return empty; }
+        return inference.bindings;
+    }
+
+    /// Infer the type arguments of `call` to the generic function `tmpl_decl`
+    /// (its template `entry`) from the call's arguments and expected type.
+    /// The one inference every call of a generic function is answered by,
+    /// whether it is written bare, through a module or as an owner's static
+    /// method, and whether the caller reports what it finds or only asks.
+    ///
+    /// In order: each argument that is no polymorphic literal binds through
+    /// its parameter's type; a parameter only a where-bound names is
+    /// projected off its bound subject; a parameter still open is read off a
+    /// concrete expected type through the return; a polymorphic literal
+    /// adopts the type its parameter was given, or binds it; the where-bound
+    /// projection again for what the literals bound.  The arity is the
+    /// caller's to have checked.
+    infer_call_bindings(mut &this, call: CallExpr*, entry: const TemplateEntry*,
+                        tmpl_decl: DeclarationNode*) -> CallInference {
+        const tmpl: FunctionDecl* = DeclarationNode::fn_of(tmpl_decl);
         mut pids: [TypeRef] = [];
         for (mut i: i64 = 0; i < entry.param_types.length(); i++) { pids.push(entry.param_types[i]); }
         mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
+        mut inference: CallInference = CallInference::new();
 
         for (mut i: i64 = 0; i < call.arguments.length(); i++) {
-            const param_decl: DeclarationNode* = tmpl.parameters[i];
-            const param: VarDecl* = DeclarationNode::var_of(param_decl);
+            const param: VarDecl* = DeclarationNode::var_of(tmpl.parameters[i]);
             if (param == null || !param.resolved_type.is_valid()) { continue; }
             const arg: ExpressionNode* = call.arguments[i];
             if (this.sema_arg_is_polymorphic_literal(arg)) { continue; }
-            if (!this.free_infer_arg_reliable(arg)) { continue; }
-            const actual: TypeRef = arg.resolved_type;
-            if (!actual.is_valid()) { continue; }
+            if (this.bind_from_variant_payload(&ictx, param.resolved_type, arg)) { continue; }
+            if (!this.free_infer_arg_reliable(arg) || !arg.resolved_type.is_valid()) {
+                inference.unjudged = true;
+                continue;
+            }
+            // A container given for a slice reference is converted to one by
+            // the argument check, and its element binds the slice's.
+            const actual: TypeRef = this.binding.slice_reference_for_argument(param.resolved_type, arg.resolved_type);
             ictx.conflict_from = TypeRef::invalid();
             ictx.conflict_to   = TypeRef::invalid();
-            ictx.unify(param.resolved_type, actual);
+            const fits: boolean = ictx.unify(param.resolved_type, actual);
             if (ictx.conflict_from.is_valid() && ictx.conflict_to.is_valid()
                     && this.free_infer_type_concrete(ictx.conflict_from)
                     && this.free_infer_type_concrete(ictx.conflict_to)) {
-                return empty;
+                inference.conflict_argument = i;
+                inference.conflict_from = ictx.conflict_from;
+                inference.conflict_to = ictx.conflict_to;
+                return inference;
+            }
+            if (!fits && !ictx.conflict_from.is_valid()) {
+                // A generic type's bare template (`Option` for an `Option::None`
+                // nothing instantiates) is no type an argument has.
+                const template: const TemplateEntry* = this.ctx.generic_registry.template_of_type(actual);
+                if (!this.free_infer_type_concrete(actual) || (template != null && template.base_type.equals(actual))) {
+                    inference.unjudged = true;
+                } else if (inference.misfit < 0) {
+                    inference.misfit = i;
+                }
             }
         }
         // A param a where-bound projects off a bound subject is what the bound
@@ -2338,27 +2345,34 @@ type struct CallResolver {
             if (any_unbound) { ictx.unify(tmpl.resolved_return_type, this.state.expected_type); }
         }
         for (mut i: i64 = 0; i < call.arguments.length(); i++) {
-            const param_decl: DeclarationNode* = tmpl.parameters[i];
-            const param: VarDecl* = DeclarationNode::var_of(param_decl);
+            const param: VarDecl* = DeclarationNode::var_of(tmpl.parameters[i]);
             if (param == null || !param.resolved_type.is_valid()) { continue; }
             const arg: ExpressionNode* = call.arguments[i];
             if (!this.sema_arg_is_polymorphic_literal(arg)) { continue; }
             const lit_actual: TypeRef = arg.resolved_type;
             if (!lit_actual.is_valid()) { continue; }
-            const f_idx: i64 = ictx.binding_index(param.resolved_type);
-            if (f_idx >= 0 && ictx.bindings[f_idx].is_valid()) { continue; }
+            const f_idx: i64 = ictx.binding_index(this.literal_slot(param.resolved_type, arg));
+            if (f_idx >= 0 && ictx.bindings[f_idx].is_valid()) {
+                const bnd: TypeRef = ictx.bindings[f_idx];
+                if (this.free_infer_type_concrete(bnd) && !this.literal_adopts_binding(bnd)) {
+                    inference.conflict_argument = i;
+                    inference.conflict_from = bnd;
+                    inference.conflict_to = this.literal_slot(lit_actual, arg);
+                    return inference;
+                }
+                continue;
+            }
             ictx.unify(param.resolved_type, lit_actual);
         }
-        // PASS D - project a where-bound-only param off its now-bound subject
-        // (mirrors `check_generic_free_call`; keeps the qualified scope path,
-        // e.g. `future::block_on(fut)`, in step with the bare-identifier path).
         this.project_where_bound_params(tmpl_decl, entry, &ictx);
-        mut bindings: [TypeRef] = [];
-        for (mut i: i64 = 0; i < ictx.bindings.length(); i++) { bindings.push(ictx.bindings[i]); }
-        for (mut i: i64 = 0; i < bindings.length(); i++) {
-            if (!bindings[i].is_valid()) { return empty; }
+        // A parameter a where-bound projects off a bound subject (`R` in
+        // `F: Future<R>`) is left open when the subject's implementation
+        // answers nothing: whether it has one is the bound's to judge.
+        if (this.ctx.type_resolver.bound_leaves_param_open(&tmpl.trait_bounds, &entry.param_syms, &ictx)) {
+            inference.unjudged = true;
         }
-        return bindings;
+        for (mut i: i64 = 0; i < ictx.bindings.length(); i++) { inference.bindings.push(ictx.bindings[i]); }
+        return inference;
     }
 
     /// Stash the generic type-arg bindings for a TYPE-scoped generic static-method
@@ -2427,6 +2441,54 @@ type struct CallResolver {
         d = d.at(call_e.span);
         d = d.with_note("`![implicit]` recovers the type argument from the expected type, but this call is not in a typed context (e.g. a `const x: T = ...` initializer)");
         d = d.help(fmt::format("write the type argument explicitly, e.g. `%s<T>(...)`", fn_str));
+        this.ctx.emit_diagnostic(d);
+    }
+
+    /// Report why inferring `call`'s type arguments to the generic function
+    /// `tmpl` failed, and whether it did: two arguments that bind one
+    /// parameter to different types, or arguments that leave one unbound.  A
+    /// call with no arguments that leaves one unbound is not reported here:
+    /// what fixes such a parameter, if anything, is the call's context; nor
+    /// is an unjudged inference, whose open parameter an argument nothing
+    /// typed, or a where-bound, may hold.
+    failed_inference_reported(mut &this, call_e: ExpressionNode*, call: CallExpr*, entry: const TemplateEntry*,
+                              inference: &CallInference) -> boolean {
+        const tmpl: FunctionDecl* = DeclarationNode::fn_of(entry.ast_node);
+        if (inference.conflict_argument >= 0) {
+            this.emit_free_infer_conflict(call_e, call, tmpl.name, call.arguments[inference.conflict_argument],
+                inference.conflict_from, inference.conflict_to);
+            return true;
+        }
+        if (inference.all_bound() || call.arguments.length() == 0) { return false; }
+        if (inference.misfit < 0 && inference.unjudged) { return false; }
+        this.emit_unbound_from_arguments(call_e, call, tmpl, inference.misfit);
+        return true;
+    }
+
+    /// A generic call whose arguments leave a type parameter unbound.  When
+    /// an argument's type does not have its parameter's shape (`misfit`, its
+    /// index: `[u64; 4]` for `&[T; 3]`, an `i64` for `[T]`), that argument is
+    /// the error (E0214), as it would be for a parameter with no type
+    /// parameters; otherwise nothing among the arguments fixes the
+    /// parameter, and the call must write it (E0307).  Left unreported, the
+    /// call would reach code generation with no function to call.
+    emit_unbound_from_arguments(mut &this, call_e: ExpressionNode*, call: CallExpr*, tmpl: FunctionDecl*,
+                                misfit: i64) -> void {
+        const fn_str: string = this.intern.resolve(tmpl.name);
+        if (misfit >= 0) {
+            const arg: ExpressionNode* = call.arguments[misfit];
+            const param: VarDecl* = DeclarationNode::var_of(tmpl.parameters[misfit]);
+            this.diag.emit_type_mismatch_with_value(
+                ErrorCode::E0214_ARGUMENT_MISMATCH, arg.span, param.resolved_type, arg.resolved_type,
+                fmt::format("argument %lld doesn't match the parameter's declared type", misfit + 1),
+                SourceSpan::none(), arg);
+            return;
+        }
+        mut d: Diagnostic = Diagnostic::error(
+            ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
+            fmt::format("cannot infer the type argument for `%s` from its arguments", fn_str));
+        d = d.at(call_e.span);
+        d = d.help(fmt::format("write the type argument explicitly, e.g. `%s::<T>(...)`", fn_str));
         this.ctx.emit_diagnostic(d);
     }
 
@@ -4535,7 +4597,7 @@ type struct CallResolver {
         for (mut i: i64 = 0; i < decl.length() && i < call.arguments.length(); i++) {
             const arg: ExpressionNode* = call.arguments[i];
             if (arg == null || !arg.resolved_type.is_valid()) { continue; }
-            ictx.unify(decl[i], arg.resolved_type);
+            ictx.unify(decl[i], this.binding.slice_reference_for_argument(decl[i], arg.resolved_type));
         }
         mut subst: TypeSubstitution = TypeSubstitution::from_params(&ictx.params, &ictx.bindings);
         return this.params_seen_through(&subst, &decl, params);
@@ -5112,7 +5174,7 @@ type struct CallResolver {
         }
         for (mut pi: i64 = 0; pi < fixed; pi++) {
             const param: TypeRef = params.get(pi).unwrap();
-            if (ictx.unify(param, arg_types[pi])) { continue; }
+            if (ictx.unify(param, this.binding.slice_reference_for_argument(param, arg_types[pi]))) { continue; }
             mut subst: TypeSubstitution = TypeSubstitution::from_params(ictx.params, ictx.bindings);
             mut bound: TypeRef = TypeRef::invalid();
             if (view != null) {
@@ -8379,7 +8441,15 @@ type struct CallResolver {
         // The method's own type args: explicit turbofish (on the member or,
         // as a fallback, the scope), else argument inference + where-bound
         // projection (the free-function inference, which runs PASS D).
-        const binds: [TypeRef] = this.template_call_bindings(call, scope, entry, tmpl_decl);
+        mut binds: [TypeRef] = [];
+        if (call.generic_args.length() == 0 && scope.generic_args.length() == 0) {
+            if (tmpl.parameters.length() != call.arguments.length()) { return TypeRef::invalid(); }
+            const inference: CallInference = this.infer_call_bindings(call, entry, tmpl_decl);
+            if (this.failed_inference_reported(call_e, call, entry, &inference)) { return TypeRef::invalid(); }
+            for (mut i: i64 = 0; i < inference.bindings.length(); i++) { binds.push(inference.bindings[i]); }
+        } else {
+            binds = this.template_call_bindings(call, scope, entry, tmpl_decl);
+        }
         if (binds.length() != entry.param_types.length()) { return TypeRef::invalid(); }
         // Every arg must BIND; it need not yet be CONCRETE.  Called from inside a
         // generic body the args carry the enclosing template's parameters
@@ -9470,13 +9540,14 @@ type struct CallResolver {
                 }
                 const tfn_decl: DeclarationNode* = tmpl.ast_node;
                 const tfn: FunctionDecl* = DeclarationNode::fn_of(tfn_decl);
-                if (tfn != null) {
-                    mut binds: [TypeRef] = this.infer_free_call_bindings(call, tmpl, tfn_decl);
-                    if (binds.length() > 0) {
+                if (tfn != null && tmpl.param_types.length() > 0 && tfn.parameters.length() == call.arguments.length()) {
+                    const inference: CallInference = this.infer_call_bindings(call, tmpl, tfn_decl);
+                    if (this.failed_inference_reported(call_e, call, tmpl, &inference)) { return TypeRef::invalid(); }
+                    if (inference.all_bound()) {
                         mut stash: [TypeRef] = [];
-                        for (mut i: i64 = 0; i < binds.length(); i++) { stash.push(binds[i]); }
+                        for (mut i: i64 = 0; i < inference.bindings.length(); i++) { stash.push(inference.bindings[i]); }
                         call.set_resolved_type_args(stash);
-                        const cret: TypeRef = this.subst_free_call_return(tmpl, &binds, ret);
+                        const cret: TypeRef = this.subst_free_call_return(tmpl, &inference.bindings, ret);
                         if (cret.is_valid()) { return cret; }
                     }
                 }

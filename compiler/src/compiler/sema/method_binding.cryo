@@ -22,8 +22,9 @@ namespace compiler::sema::method_binding;
 
 import compiler::types::{
     type_ref, type_base, arena, compound, user_defined, generic, substitution,
-    inference, trait_checker, generic_registry, resolver, ownership, TypeKind
+    inference, trait_checker, generic_registry, resolver, ownership, RefMutability, TypeKind
 };
+import compiler::resolver::lang_item::{ LangItem };
 import compiler::resolver::{ symbol_str, intern_table };
 import compiler::resolver::res::{ Res };
 import compiler::ast::{
@@ -1883,9 +1884,8 @@ type struct MethodBinding {
                 const arg: ExpressionNode* = call.arguments[first_arg + i];
                 if (arg == null) { return []; }
                 if (this.method_arg_is_polymorphic_literal(arg)) { continue; }
-                const actual: TypeRef = arg.resolved_type;
-                if (!actual.is_valid()) { return []; }
-                ictx.unify(formals[i], actual);
+                if (!arg.resolved_type.is_valid()) { return []; }
+                ictx.unify(formals[i], this.slice_reference_for_argument(formals[i], arg.resolved_type));
             }
             // PASS B - recover still-unbound method params from a CONCRETE
             // expected type via the return annotation. Not gated on `is_implicit`:
@@ -2173,6 +2173,45 @@ type struct MethodBinding {
             }
             _ => { return ty; }
         }
+    }
+
+    /// The type an argument of type `actual` is inferred from for a
+    /// parameter of type `param`: the slice reference it converts to when
+    /// `param` is a slice reference and `actual` a reference to a container
+    /// that converts - `&Slice<E>` for a `&[E; N]`, the return of its
+    /// `AsSlice` (`AsMutableSlice` for a `mut &Slice<T>`) for a container -
+    /// and `actual` itself otherwise.  Every inference of a generic call's
+    /// type arguments reads an argument through this, so a container binds
+    /// the slice's element wherever the argument check converts it.  The
+    /// element of a writable and a read-only slice is the same; whether the
+    /// borrow may write is the argument check's to refuse.
+    slice_reference_for_argument(mut &this, param: TypeRef, actual: TypeRef) -> TypeRef {
+        const param_t: Type* = this.arena.lookup(param);
+        const actual_t: Type* = this.arena.lookup(actual);
+        if (param_t == null || actual_t == null || !param_t.is_wide_reference()
+                || actual_t.kind != TypeKind::Reference || actual_t.is_wide_reference()) {
+            return actual;
+        }
+        const writable: boolean = param_t.as_reference().is_mutable();
+        const container: TypeRef = actual_t.as_reference().referent;
+        const container_t: Type* = this.arena.lookup(container);
+        if (container_t == null) { return actual; }
+        const mutability: RefMutability = if (writable) { RefMutability::Mutable } else { RefMutability::Immutable };
+        if (container_t.kind == TypeKind::Array) {
+            const element: [TypeRef] = [container_t.as_array().element];
+            const slice: TypeRef = this.arena.create_instantiation(this.arena.slice_template, &element);
+            return this.arena.get_reference_to(slice, mutability);
+        }
+        const trait_id: DefId = this.ctx.generic_registry.wellknown(
+            if (writable) { LangItem::AsMutableSlice } else { LangItem::AsSlice });
+        if (!trait_id.is_valid() || this.trait_checker().select_impl(trait_id, container, 0) == null) {
+            return actual;
+        }
+        const method: DefId = this.ctx.generic_registry.wellknown(
+            if (writable) { LangItem::AsMutableSliceAsMutableSlice } else { LangItem::AsSliceAsSlice });
+        const converted: TypeRef = this.resolve_trait_impl_method_return(container, this.ctx.defs.leaf_of(method).spelling());
+        if (!converted.is_valid()) { return actual; }
+        return converted;
     }
 
     /// Mono-after-sema: resolve a trait-impl method's return for a CONCRETE

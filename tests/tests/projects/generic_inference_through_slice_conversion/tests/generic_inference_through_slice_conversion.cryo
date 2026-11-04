@@ -1,0 +1,124 @@
+///! A fixed array or a container given for a `&Slice<T>` parameter converts
+///! to a slice at the call, and the call's `T` is inferred as the element of
+///! the slice it converts to.  The values are wider than 32 bits, so an
+///! element read as the default integer type would not compare equal; the
+///! callers give no expected type, so only the argument can bind `T`.
+
+![config(testing)]
+namespace GenericInferenceThroughSliceConversion::Tests;
+
+import GenericInferenceThroughSliceConversion::Helpers;
+import GenericInferenceThroughSliceConversion::Helpers::{ Tally };
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::collections::array::{ Array };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_eq };
+
+type struct Point {
+    x: i64;
+    y: i64;
+}
+
+function last_of<T>(items: &Slice<T>) -> T {
+    return items[items.length() - 1];
+}
+
+function count_of<T>(items: &Slice<T>) -> i64 {
+    return items.length();
+}
+
+function fill_with<T>(items: mut &Slice<T>, value: T) -> void {
+    for (mut i: i64 = 0; i < items.length(); i++) {
+        items[i] = value;
+    }
+}
+
+function last_of_three<U>(items: &[U; 3]) -> U {
+    return last_of(items);
+}
+
+![test]
+function fixed_array_binds_the_element() -> Result<(), TestError> {
+    const wide: [u64; 3] = [70000000000, 80000000000, 90000000000];
+    expect_eq(last_of(&wide), 90000000000)?;
+    return expect_eq(count_of(&wide), 3);
+}
+
+![test]
+function array_binds_the_element() -> Result<(), TestError> {
+    mut values: Array<u64> = Array::<u64>::new();
+    values.push(11);
+    values.push(90000000000);
+    expect_eq(last_of(&values), 90000000000)?;
+    return expect_eq(count_of(&values), 2);
+}
+
+![test]
+function aggregate_element_is_bound() -> Result<(), TestError> {
+    const points: [Point; 2] = [Point { x: 1, y: 2 }, Point { x: 3, y: 4 }];
+    const last: Point = last_of(&points);
+    expect_eq(last.x, 3)?;
+    return expect_eq(last.y, 4);
+}
+
+![test]
+function writable_fixed_array_binds_the_element() -> Result<(), TestError> {
+    mut buffer: [u64; 3] = [1, 2, 3];
+    fill_with(&buffer, 90000000000);
+    expect_eq(buffer[0], 90000000000)?;
+    return expect_eq(buffer[2], 90000000000);
+}
+
+![test]
+function writable_array_binds_the_element() -> Result<(), TestError> {
+    mut values: Array<u64> = Array::<u64>::new();
+    values.push(1);
+    values.push(2);
+    fill_with(&values, 90000000000);
+    expect_eq(values[0], 90000000000)?;
+    return expect_eq(values[1], 90000000000);
+}
+
+![test]
+function element_of_a_generic_body_is_bound() -> Result<(), TestError> {
+    const wide: [u64; 3] = [1, 2, 90000000000];
+    return expect_eq(last_of_three(&wide), 90000000000);
+}
+
+![test]
+function call_through_the_module_binds_the_element() -> Result<(), TestError> {
+    const wide: [u64; 2] = [1, 90000000000];
+    mut values: Array<u64> = Array::<u64>::new();
+    values.push(90000000001);
+    expect_eq(Helpers::last_of(&wide), 90000000000)?;
+    return expect_eq(Helpers::last_of(&values), 90000000001);
+}
+
+![test]
+function static_method_binds_the_element() -> Result<(), TestError> {
+    const wide: [u64; 4] = [1, 2, 3, 90000000000];
+    mut values: Array<u64> = Array::<u64>::new();
+    values.push(1);
+    expect_eq(Tally::count_of(&wide), 4)?;
+    return expect_eq(Tally::count_of(&values), 1);
+}
+
+![test]
+function instance_method_binds_the_element() -> Result<(), TestError> {
+    const wide: [u64; 4] = [1, 2, 3, 90000000000];
+    mut values: Array<u64> = Array::<u64>::new();
+    values.push(90000000001);
+    mut tally: Tally = Tally { total: 0 };
+    tally.add_all(&wide);
+    tally.add_all(&values);
+    expect_eq(tally.total, 5)?;
+    expect_eq(tally.last_seen(&wide), 90000000000)?;
+    return expect_eq(tally.last_seen(&values), 90000000001);
+}
+
+![test]
+function empty_fixed_array_binds_the_element() -> Result<(), TestError> {
+    const none: [u64; 0] = [];
+    return expect_eq(count_of(&none), 0);
+}
