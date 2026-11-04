@@ -8,6 +8,8 @@ namespace compiler::diag::diagnostic;
 import compiler::diag::{ ErrorCode, edit_distance, severity, source_span, span_label, suggestion };
 import compiler::diag::edit_distance::{ find_best_candidate };
 import std::fmt;
+import std::core::hash::{ DefaultHasher, Hasher };
+import std::collections::string::{ String };
 import compiler::diag::severity::{ Severity };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::diag::span_label::{ SpanLabel };
@@ -235,7 +237,29 @@ type struct Diagnostic {
                     site.span.start_line, site.code.format()));
             }
         }
+        // Named first among the notes, under the snippet it names.
+        r = r.with_note(fmt::format("report %s: these %lld places are one problem, and one fix settles them",
+            r.report_id(), order.length()));
+        const naming: Diagnostic = r.children.remove(r.children.length() - 1);
+        r.children.insert(0, naming);
         return r;
+    }
+
+    /// The name of a report folded from several places: `diag-` and ten hex
+    /// digits of a hash of its code, headline, file name and first place.
+    /// The same input names it the same in every build, and the language
+    /// server, which spells the file's path otherwise, names it the same.
+    /// Empty for a diagnostic that is not a folded report.
+    report_id(&this) -> string {
+        if (this.other_sites().length() == 0) { return ""; }
+        const key: string = fmt::format("%s|%s|%s|%u|%u", this.code.format(), this.message,
+            this.span.file.basename(), this.span.start_line, this.span.start_col);
+        mut hasher: DefaultHasher = DefaultHasher::new();
+        const n: i64 = key.length() as i64;
+        for (mut i: i64 = 0; i < n; i++) { hasher.write_u8(key[i] as u8); }
+        const digits: u64 = hasher.finish() >> 24;
+        mut id: String = f"diag-{digits:010X}";
+        return id.into_raw();
     }
 
     /// The caption under this diagnostic's own caret: its primary label's,
