@@ -29,6 +29,8 @@ import compiler::sema::helpers::{
 };
 import std::fmt;
 import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::diag::suggestion::{ Suggestion };
 import compiler::types::{ IntegerKind, TypeKind };
 import utils::keyword::{ Keyword };
 
@@ -245,7 +247,19 @@ type struct LiteralResolver {
             ErrorCode::W0014_REDUNDANT_NUMERIC_SUFFIX,
             fmt::format("redundant type suffix `%s` on numeric literal `%s`; the surrounding context already types it",
                 lit.suffix, lit.value));
-        diag = diag.at(e.span);
+        diag = diag.at_with_label(e.span, "the suffix changes nothing here");
+        // The suffix ends the literal as written, with the `_` that may
+        // separate it from the digits.
+        const value: string = lit.value;
+        const value_len: i64 = value.length() as i64;
+        mut cut: i64 = lit.suffix.length() as i64;
+        if (cut < value_len && value[value_len - cut - 1] == '_') { cut += 1; }
+        if (e.span.start_line == e.span.end_line && cut > 0 && (e.span.end_col as i64) > cut) {
+            const written: SourceSpan = SourceSpan::new(e.span.file, e.span.end_line,
+                e.span.end_col - (cut as u32), e.span.end_line, e.span.end_col);
+            diag = diag.suggest(Suggestion::machine_applicable(written, "",
+                fmt::format("remove the suffix `%s`", lit.suffix)));
+        }
         this.ctx.emit_diagnostic(diag);
     }
 

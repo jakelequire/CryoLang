@@ -4492,8 +4492,16 @@ type struct SemaVisitor {
             if (this.symbolic.symbolic_type_unresolved(subject)) { return TypeRef::invalid(); }
             const ot: Type* = this.arena.lookup(operand_type);
             const disp: string = if (ot != null) { this.arena.format_display(ot) } else { "?" };
-            this.ctx.emit_error_at(ErrorCode::E0234_INVALID_TRY_OPERAND,
-                fmt::format("the `?` operator requires a value whose type implements `Try`, but the operand has type '%s'", disp), e.span);
+            mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0234_INVALID_TRY_OPERAND,
+                fmt::format("the `?` operator requires a value whose type implements `Try`, but the operand has type `%s`", disp));
+            diag = diag.at_with_label(e.span, fmt::format("`%s` does not implement `Try`", disp));
+            // The `?` is the expression's last character.
+            if (e.span.has_location() && e.span.end_col > 0) {
+                const mark: SourceSpan = SourceSpan::new(e.span.file, e.span.end_line, e.span.end_col - 1,
+                                                         e.span.end_line, e.span.end_col);
+                diag = diag.suggest(Suggestion::single(mark, "", "remove the `?`", Applicability::MaybeIncorrect));
+            }
+            this.ctx.emit_diagnostic(diag);
             return TypeRef::invalid();
         }
         const residual: TypeRef = this.try_residual(subject);
@@ -5172,11 +5180,15 @@ type struct SemaVisitor {
         const member:    string = this.intern.resolve(scope.member_name);
         mut cands: [string] = [];
         for (mut i: i64 = 0; i < et.variants.length(); i++) { cands.push(et.variants[i].display_name(this.intern)); }
-        const best: string = find_best_candidate(member, cands);
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0640_INVALID_ENUM_VARIANT_ACCESS,
             fmt::format("enum `%s` has no variant `%s`", enum_name, member));
         d = d.at_with_label(e.span, "unknown variant");
-        if (best.length() > 0) { d = d.help(fmt::format("did you mean `%s::%s`?", enum_name, best)); }
+        if (scope.member_span.has_location() && !scope.member_span.same_as(&e.span)) {
+            d = d.did_you_mean(member, cands, "variant", scope.member_span);
+        } else {
+            const best: string = find_best_candidate(member, cands);
+            if (best.length() > 0) { d = d.help(fmt::format("did you mean `%s::%s`?", enum_name, best)); }
+        }
         this.ctx.diagnostics.emit(d);
     }
 

@@ -278,8 +278,13 @@ type struct Diagnostics {
     /// candidates disagree on arity (overloaded), giving a generic message.
     /// `variadic` names a callee whose `expected` is the count of its declared
     /// parameters, each required, with an unconstrained tail past them.
-    emit_method_arity_error(mut &this, at: SourceSpan, name: SymbolStr,
-                            kind: string, expected: i64, got: i64, variadic: boolean) -> void {
+    /// `params` are the parameter types when the callee is known, and empty
+    /// when the candidates only agree on a count; a missing argument's fix
+    /// names its type, so it is offered only with them.
+    emit_method_arity_error(mut &this, call_e: ExpressionNode*, name: SymbolStr,
+                            kind: string, expected: i64, got: i64, variadic: boolean,
+                            params: &[TypeRef]) -> void {
+        const at: SourceSpan = call_e.span;
         const nm: string = this.intern.resolve(name);
         if (expected < 0) {
             mut d: Diagnostic = Diagnostic::error(
@@ -297,6 +302,9 @@ type struct Diagnostics {
             d = d.at_with_label(at,
                 fmt::format("missing %lld argument%s", expected - got,
                     if (expected - got == 1) { "" } else { "s" }));
+            if (params.length() == expected) {
+                d = this.with_missing_arguments_fix(d, call_e, params, got);
+            }
             this.ctx.diagnostics.emit(d);
             return;
         }
@@ -306,7 +314,53 @@ type struct Diagnostics {
                    kind, nm, expected, got));
         d = d.at_with_label(at,
             fmt::format("unexpected argument%s", if (got - expected == 1) { "" } else { "s" }));
+        const call: CallExpr* = ExpressionNode::call_of(call_e);
+        if (call != null) { d = this.with_extra_arguments_fix(d, call_e, &call.arguments, expected); }
         this.ctx.diagnostics.emit(d);
+    }
+
+    /// `d`, a call `call_e` given `got` arguments where `params` are
+    /// required, with the fix appending a placeholder for each missing one,
+    /// spelled by its type, before the closing `)`.
+    with_missing_arguments_fix(&this, d: Diagnostic, call_e: ExpressionNode*, params: &[TypeRef],
+                               got: i64) -> Diagnostic {
+        const expected: i64 = params.length();
+        if (!call_e.span.has_location() || call_e.span.end_col == 0 || got >= expected) { return d.clone(); }
+        mut repl: string = "";
+        for (mut k: i64 = got; k < expected; k++) {
+            const pname: string = this.arena.resolve_display_name_short(params[k]);
+            const sep: string = if (k == 0) { "" } else { ", " };
+            repl = fmt::format("%s%s<%s>", repl, sep, pname);
+        }
+        const ins: SourceSpan = SourceSpan::new(
+            call_e.span.file, call_e.span.end_line, call_e.span.end_col - 1,
+            call_e.span.end_line, call_e.span.end_col - 1);
+        return d.suggest(Suggestion::single(ins, repl,
+            if (expected - got == 1) { "provide the missing argument" } else { "provide the missing arguments" },
+            Applicability::HasPlaceholders));
+    }
+
+    /// `d`, a call `call_e` given more `arguments` than its `expected`, with
+    /// the fix removing those past them, from the end of the last one kept
+    /// to the closing `)`.
+    with_extra_arguments_fix(&this, d: Diagnostic, call_e: ExpressionNode*, arguments: &[mut ExpressionNode*],
+                             expected: i64) -> Diagnostic {
+        const got: i64 = arguments.length();
+        if (got <= expected || !call_e.span.has_location() || call_e.span.end_col == 0) { return d.clone(); }
+        const kept: ExpressionNode* = if (expected == 0) { arguments[0] } else { arguments[expected - 1] };
+        if (kept == null || !kept.span.has_location()) { return d.clone(); }
+        const from: SourceSpan = if (expected == 0) {
+            SourceSpan::new(kept.span.file, kept.span.start_line, kept.span.start_col,
+                            kept.span.start_line, kept.span.start_col)
+        } else {
+            kept.span.end_point()
+        };
+        const removal: SourceSpan = SourceSpan::new(
+            call_e.span.file, from.start_line, from.start_col,
+            call_e.span.end_line, call_e.span.end_col - 1);
+        return d.suggest(Suggestion::machine_applicable(removal, "",
+            if (got - expected == 1) { "remove the extra argument" }
+            else { fmt::format("remove the %lld extra arguments", got - expected) }));
     }
 
     /// Fold a same-named candidate's parameter count into a running unique-arity

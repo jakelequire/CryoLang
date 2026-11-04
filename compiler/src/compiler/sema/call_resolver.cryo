@@ -2473,21 +2473,7 @@ type struct CallResolver {
                     if (ft.is_variadic) { "at least " } else { "" }, expected, got));
             diag = diag.at_with_label(call_e.span,
                 fmt::format("missing %lld argument%s", expected - got, if (expected - got == 1) { "" } else { "s" }));
-            if (call_e.span.has_location() && call_e.span.end_col > 0) {
-                mut repl: string = "";
-                for (mut k: i64 = got; k < expected; k++) {
-                    const pname: string = this.arena.resolve_display_name_short(ft.param_types[k]);
-                    const sep: string = if (k == 0) { "" } else { ", " };
-                    repl = fmt::format("%s%s<%s>", repl, sep, pname);
-                }
-                const ins: SourceSpan = SourceSpan::new(
-                    call_e.span.file, call_e.span.end_line, call_e.span.end_col - 1,
-                    call_e.span.end_line, call_e.span.end_col - 1);
-                diag = diag.suggest(Suggestion::single(ins, repl,
-                    if (expected - got == 1) { "provide the missing argument" } else { "provide the missing arguments" },
-                    Applicability::HasPlaceholders));
-            }
-            this.ctx.diagnostics.emit(diag);
+            this.ctx.diagnostics.emit(this.diag.with_missing_arguments_fix(diag, call_e, &ft.param_types, got));
             return;
         }
         if (got > expected && !ft.is_variadic) {
@@ -2496,33 +2482,7 @@ type struct CallResolver {
                 fmt::format("%s takes %lld argument(s) but %lld were supplied", callee_text, expected, got));
             diag = diag.at_with_label(call_e.span,
                 fmt::format("unexpected argument%s", if (got - expected == 1) { "" } else { "s" }));
-            mut anchor_end_line: u32 = 0;
-            mut anchor_end_col:  u32 = 0;
-            mut anchor_ok:       boolean = false;
-            if (expected == 0) {
-                if (call.arguments.length() > 0 && call.arguments[0] != null
-                        && call.arguments[0].span.has_location()) {
-                    anchor_end_line = call.arguments[0].span.start_line;
-                    anchor_end_col  = call.arguments[0].span.start_col;
-                    anchor_ok = true;
-                }
-            } else {
-                const last_keep: ExpressionNode* = call.arguments[expected - 1];
-                if (last_keep != null && last_keep.span.has_location()) {
-                    anchor_end_line = last_keep.span.end_line;
-                    anchor_end_col  = last_keep.span.end_col;
-                    anchor_ok = true;
-                }
-            }
-            if (anchor_ok && call_e.span.has_location() && call_e.span.end_col > 0) {
-                const removal: SourceSpan = SourceSpan::new(
-                    call_e.span.file, anchor_end_line, anchor_end_col,
-                    call_e.span.end_line, call_e.span.end_col - 1);
-                diag = diag.suggest(Suggestion::machine_applicable(removal, "",
-                    if (got - expected == 1) { "remove the extra argument" }
-                    else { fmt::format("remove the %lld extra arguments", got - expected) }));
-            }
-            this.ctx.diagnostics.emit(diag);
+            this.ctx.diagnostics.emit(this.diag.with_extra_arguments_fix(diag, call_e, &call.arguments, expected));
             return;
         }
         this.check_args_against_params(visitor, &call.arguments, ft.param_types.as_slice());
@@ -2554,7 +2514,8 @@ type struct CallResolver {
         }
         if (any_variadic || matches) { return; }
         const expected_for_msg: i64 = if (uniq_arity >= 0) { uniq_arity } else { -1 };
-        this.diag.emit_method_arity_error(call_e.span, ident.name, "function", expected_for_msg, got, false);
+        const no_params: [TypeRef] = [];
+        this.diag.emit_method_arity_error(call_e, ident.name, "function", expected_for_msg, got, false, &no_params);
     }
 
     /// Non-emitting category check: do the call's args fit `params`?  Non-concrete
@@ -3004,6 +2965,9 @@ type struct CallResolver {
         // because this runs at every method call and only the error path needs
         // the strings.
         mut cand_params: [TypeRef] = [];
+        // The first candidate's parameter types: when it is the only one of
+        // the name, a count diagnostic spells the missing arguments by them.
+        mut first_params: [TypeRef] = [];
 
         const empty_minfo: [MethodInfo] = [];
         mut methods_ref: &[MethodInfo] = &empty_minfo;
@@ -3037,6 +3001,9 @@ type struct CallResolver {
                 if (this.method_type_is_variadic(m.function_type)) { variadic_ok = true; continue; }
                 name_seen  += 1;
                 uniq_arity  = this.diag.note_arity(uniq_arity, m.param_types.length());
+                if (name_seen == 1) {
+                    for (mut fi: i64 = 0; fi < m.param_types.length(); fi++) { first_params.push(m.param_types[fi]); }
+                }
                 if (m.param_types.length() != argc) { continue; }
                 for (mut ci: i64 = 0; ci < m.param_types.length(); ci++) {
                     cand_params.push(m.param_types[ci]);
@@ -3118,6 +3085,9 @@ type struct CallResolver {
                         }
                         name_seen  += 1;
                         uniq_arity  = this.diag.note_arity(uniq_arity, tparams.length());
+                        if (name_seen == 1) {
+                            for (mut fi: i64 = 0; fi < tparams.length(); fi++) { first_params.push(tparams[fi]); }
+                        }
                         if (tparams.length() != argc) { mem::drop(tparams); continue; }
                         for (mut ci: i64 = 0; ci < tparams.length(); ci++) {
                             cand_params.push(tparams[ci]);
@@ -3171,7 +3141,8 @@ type struct CallResolver {
         }
         if (variadic_ok) { return; }
         if (name_seen > 0) {
-            this.diag.emit_method_arity_error(call_e.span, member.member, "method", uniq_arity, argc, false);
+            if (name_seen > 1) { first_params = []; }
+            this.diag.emit_method_arity_error(call_e, member.member, "method", uniq_arity, argc, false, &first_params);
         }
     }
 
@@ -3204,8 +3175,9 @@ type struct CallResolver {
             this.emit_no_matching_overload(call_e, call, member, owner_inst, &found.params, found.argc,
                 unbound_in_body);
         } else if (!found.variadic && found.name_seen > 0) {
-            this.diag.emit_method_arity_error(call_e.span, member.member, "method", found.uniq_arity,
-                found.argc, false);
+            const no_params: [TypeRef] = [];
+            this.diag.emit_method_arity_error(call_e, member.member, "method", found.uniq_arity,
+                found.argc, false, &no_params);
         }
     }
 
@@ -5323,8 +5295,8 @@ type struct CallResolver {
         }
         member.set_resolved_trait_item(declaring, slot);
         if (call.arguments.length() != params.length()) {
-            this.diag.emit_method_arity_error(call_e.span, member.member, "method", params.length(),
-                call.arguments.length(), false);
+            this.diag.emit_method_arity_error(call_e, member.member, "method", params.length(),
+                call.arguments.length(), false, &params);
             return TypeRef::invalid();
         }
         this.check_args_against_params(visitor, &call.arguments, params.as_slice());
@@ -9791,8 +9763,8 @@ type struct CallResolver {
                         call, &ft.param_types, &ft.param_types);
                     this.check_args_against_params(visitor, &call.arguments, params.as_slice());
                 } else {
-                    this.diag.emit_method_arity_error(call_e.span, scope.member_name, "function",
-                        expected, got, ft.is_variadic);
+                    this.diag.emit_method_arity_error(call_e, scope.member_name, "function",
+                        expected, got, ft.is_variadic, &ft.param_types);
                 }
             }
             return;
@@ -9903,8 +9875,8 @@ type struct CallResolver {
         if (tr == null) { return; }
         const params: [TypeRef] = this.bound_path_params(tr, func, owner_ty);
         if (params.length() != call.arguments.length()) {
-            this.diag.emit_method_arity_error(call_e.span, scope.member_name, "method", params.length(),
-                call.arguments.length(), false);
+            this.diag.emit_method_arity_error(call_e, scope.member_name, "method", params.length(),
+                call.arguments.length(), false, &params);
             return;
         }
         this.check_args_against_params(visitor, &call.arguments, params.as_slice());
@@ -9929,7 +9901,8 @@ type struct CallResolver {
             if (ft.param_types.length() == argc) { of_arity.push(ft); }
         }
         if (of_arity.length() == 0) {
-            this.diag.emit_method_arity_error(call_e.span, scope.member_name, "method", uniq_arity, argc, false);
+            const no_params: [TypeRef] = [];
+            this.diag.emit_method_arity_error(call_e, scope.member_name, "method", uniq_arity, argc, false, &no_params);
             return;
         }
         // Several of the arity are one implementation's overloads: the one
@@ -10023,7 +9996,8 @@ type struct CallResolver {
         if (found) { this.check_args_against_params(visitor, &call.arguments, chosen.as_slice()); return; }
         if (variadic_ok) { return; }
         if (name_seen > 0) {
-            this.diag.emit_method_arity_error(call_e.span, scope.member_name, "static method", uniq_arity, argc, false);
+            const no_params: [TypeRef] = [];
+            this.diag.emit_method_arity_error(call_e, scope.member_name, "static method", uniq_arity, argc, false, &no_params);
         }
     }
 }

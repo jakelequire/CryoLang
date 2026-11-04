@@ -392,14 +392,16 @@ type struct NameResolver {
 
     /// E0243: the explicit import written at `at` brings in `name`, which the
     /// explicit import binding `first` already brought into this scope.
-    /// Refused at the second import, where the collision is written.
-    refuse_repeated_import(&this, name: SymbolStr, at: SourceSpan, first: SymbolID) -> void {
+    /// Refused at the second import, where the collision is written.  When
+    /// that import brings in nothing else, removing it is the fix.
+    refuse_repeated_import(&this, name: SymbolStr, at: SourceSpan, first: SymbolID, whole: boolean) -> void {
         const shown: string = this.resolver.intern_table.resolve(name);
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0243_NAME_IMPORTED_TWICE,
             fmt::format("`%s` is imported twice", shown));
         d = d.at_with_label(at, fmt::format("`%s` is imported again here", shown));
         d = d.with_note_at("first imported here", this.resolver.get_symbol(first).declaring_span);
         d = d.help("remove one of the imports, or import one under another name with `as`");
+        if (whole) { d = d.suggest(Suggestion::machine_applicable(at, "", "remove this import")); }
         this.ctx.emit_diagnostic(d);
     }
 
@@ -2913,7 +2915,7 @@ type struct NameResolver {
     /// offering is named so the writer can see what to write instead; a
     /// close spelling is offered as the fix.
     refuse_unoffered_import(&this, decl: DeclarationNode*, node: ImportDecl*, m: ModulePath,
-                            resolved_module: string, name_str: string) -> void {
+                            resolved_module: string, name_str: string, entry_span: SourceSpan) -> void {
         const offered: [string] = this.offered_leaves(m, resolved_module);
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0502_INVALID_IMPORT,
@@ -2933,6 +2935,15 @@ type struct NameResolver {
         const best: string = find_best_candidate(name_str, offered);
         if (best != "") {
             d = d.help(fmt::format("a name with a similar spelling is offered: `%s`", best));
+            // A spelling another entry already writes would import it twice.
+            mut written: boolean = false;
+            for (mut j: i64 = 0; j < node.specific_imports.length(); j++) {
+                if (this.resolver.intern_table.resolve(node.specific_imports[j]) == best) { written = true; }
+            }
+            if (entry_span.has_location() && !written) {
+                d = d.suggest(Suggestion::machine_applicable(entry_span, best,
+                    fmt::format("did you mean `%s`?", best)));
+            }
         }
         if (count == 0) {
             d = d.with_note(fmt::format("`%s` offers no public name", resolved_module));
@@ -3211,7 +3222,8 @@ type struct NameResolver {
                         if (first.is_valid()) {
                             now = 2;
                             if (!refused_twice) {
-                                this.refuse_repeated_import(bind_as, decl.span, first);
+                                this.refuse_repeated_import(bind_as, decl.span, first,
+                                    node.specific_imports.length() <= 1);
                                 refused_twice = true;
                             }
                         }
@@ -3261,7 +3273,8 @@ type struct NameResolver {
                         // use site - which may never exist - to say so.  The
                         // import is where the name is written, and what the
                         // module DOES offer is what a writer needs to fix it.
-                        this.refuse_unoffered_import(decl, node, imported, resolved_module, name_str);
+                        this.refuse_unoffered_import(decl, node, imported, resolved_module, name_str,
+                            if (i < node.specific_spans.length()) { node.specific_spans[i] } else { SourceSpan::none() });
                         this.resolver.declare_refused(bind_as, decl.span);
                         continue;
                     }
