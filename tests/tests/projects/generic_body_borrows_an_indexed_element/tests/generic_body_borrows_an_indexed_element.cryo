@@ -1,0 +1,189 @@
+///! In a generic body, `[]` on a container written in the body's own
+///! parameters (`&Array<T, A>` under `A: Allocator`) is the container's
+///! index call, whatever the access is used for: borrowed and bound, borrowed
+///! and returned, borrowed for writing, assigned, read by value, or the
+///! receiver of a method.  The values are wide enough that an element read
+///! from the wrong place, or from no place, does not pass for the right one.
+
+![config(testing)]
+namespace GenericBodyBorrowsAnIndexedElement::Tests;
+
+import std::core::result::{ Result };
+import std::core::ops::{ Index, IndexMutable };
+import std::core::slice::{ Slice };
+import std::collections::array::{ Array };
+import std::alloc::allocator::{ Allocator, GlobalAlloc };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_eq };
+
+type struct Point {
+    x: i64;
+    y: i64;
+}
+
+type trait Weighs {
+    weight(&this) -> u64;
+}
+
+implement trait Weighs for u64 {
+    weight(&this) -> u64 { return *this * 2; }
+}
+
+function borrow_bound<T, A>(items: &Array<T, A>, at: i64) -> &T where A: Allocator {
+    const element: &T = &items[at];
+    return element;
+}
+
+function borrow_returned<T, A>(items: &Array<T, A>, at: i64) -> &T where A: Allocator {
+    return &items[at];
+}
+
+function borrow_default_allocator<T>(items: &Array<T>, at: i64) -> &T {
+    const element: &T = &items[at];
+    return element;
+}
+
+function borrow_for_writing<T, A>(items: mut &Array<T, A>, at: i64) -> mut &T where A: Allocator {
+    const element: mut &T = &items[at];
+    return element;
+}
+
+function overwrite<A>(items: mut &Array<u64, A>, at: i64, value: u64) -> void where A: Allocator {
+    items[at] = value;
+}
+
+function read_value<A>(items: &Array<u64, A>, at: i64) -> u64 where A: Allocator {
+    const element: u64 = items[at];
+    return element;
+}
+
+function weight_at<T, A>(items: &Array<T, A>, at: i64) -> u64 where T: Weighs, A: Allocator {
+    return items[at].weight();
+}
+
+function borrow_from_slice_for_writing<T>(items: mut &Slice<T>, at: i64) -> mut &T {
+    const element: mut &T = &items[at];
+    return element;
+}
+
+type trait Picks<T> {
+    pick(&this, at: i64) -> &T;
+}
+
+implement<T, A> trait Picks<T> for struct Array<T, A> where A: Allocator {
+    pick(&this, at: i64) -> &T {
+        const element: &T = &this[at];
+        return element;
+    }
+}
+
+/// A container of its own whose index implementation has a where-clause
+/// only the bounds in a generic body's scope confirm.
+type struct Shelf<T, A> {
+    items: Array<T, A>;
+}
+
+implement<T, A> trait Index<i64> for struct Shelf<T, A> where A: Allocator {
+    type Output = T;
+    index(&this, at: i64) -> const T* { return this.items.index(at); }
+}
+
+implement<T, A> trait IndexMutable<i64> for struct Shelf<T, A> where A: Allocator {
+    index_mutable(mut &this, at: i64) -> mut T* { return this.items.index_mutable(at); }
+}
+
+function borrow_from_shelf<T, A>(shelf: &Shelf<T, A>, at: i64) -> &T where A: Allocator {
+    const element: &T = &shelf[at];
+    return element;
+}
+
+function overwrite_on_shelf<T, A>(shelf: mut &Shelf<T, A>, at: i64, value: T) -> void where A: Allocator {
+    shelf[at] = value;
+}
+
+function wide_values() -> Array<u64> {
+    mut values: Array<u64> = Array::<u64>::new();
+    values.push(11);
+    values.push(90000000000);
+    values.push(90000000001);
+    return values;
+}
+
+![test]
+function borrowed_element_bound_then_returned() -> Result<(), TestError> {
+    const values: Array<u64> = wide_values();
+    expect_eq(*borrow_bound(&values, 1), 90000000000)?;
+    return expect_eq(*borrow_bound(&values, 2), 90000000001);
+}
+
+![test]
+function borrowed_element_returned_directly() -> Result<(), TestError> {
+    const values: Array<u64> = wide_values();
+    return expect_eq(*borrow_returned(&values, 1), 90000000000);
+}
+
+![test]
+function borrowed_element_under_the_default_allocator() -> Result<(), TestError> {
+    const values: Array<u64> = wide_values();
+    return expect_eq(*borrow_default_allocator(&values, 2), 90000000001);
+}
+
+![test]
+function borrowed_aggregate_element() -> Result<(), TestError> {
+    mut points: Array<Point> = Array::<Point>::new();
+    points.push(Point { x: 1, y: 2 });
+    points.push(Point { x: 70000000000, y: 80000000000 });
+    const second: &Point = borrow_bound(&points, 1);
+    expect_eq(second.x, 70000000000)?;
+    return expect_eq(second.y, 80000000000);
+}
+
+![test]
+function element_borrowed_for_writing_writes_the_array() -> Result<(), TestError> {
+    mut values: Array<u64> = wide_values();
+    *borrow_for_writing(&values, 0) = 90000000002;
+    expect_eq(values[0], 90000000002)?;
+    return expect_eq(values[1], 90000000000);
+}
+
+![test]
+function element_assigned_writes_the_array() -> Result<(), TestError> {
+    mut values: Array<u64> = wide_values();
+    overwrite(&values, 2, 90000000003);
+    expect_eq(values[2], 90000000003)?;
+    return expect_eq(values[0], 11);
+}
+
+![test]
+function element_read_by_value() -> Result<(), TestError> {
+    const values: Array<u64> = wide_values();
+    return expect_eq(read_value(&values, 1), 90000000000);
+}
+
+![test]
+function element_is_a_method_receiver() -> Result<(), TestError> {
+    const values: Array<u64> = wide_values();
+    return expect_eq(weight_at(&values, 2), 180000000002);
+}
+
+![test]
+function slice_element_borrowed_for_writing_writes_the_storage() -> Result<(), TestError> {
+    mut storage: [u64; 3] = [1, 2, 3];
+    const view: mut &Slice<u64> = &storage;
+    *borrow_from_slice_for_writing(view, 1) = 90000000004;
+    return expect_eq(storage[1], 90000000004);
+}
+
+![test]
+function element_borrowed_inside_an_implementation_for_the_array() -> Result<(), TestError> {
+    const values: Array<u64> = wide_values();
+    return expect_eq(*values.pick(2), 90000000001);
+}
+
+![test]
+function element_of_a_container_whose_index_has_a_where_clause() -> Result<(), TestError> {
+    mut shelf: Shelf<u64, GlobalAlloc> =Shelf { items: wide_values() };
+    expect_eq(*borrow_from_shelf(&shelf, 1), 90000000000)?;
+    overwrite_on_shelf(&shelf, 0, 90000000005);
+    return expect_eq(*borrow_from_shelf(&shelf, 0), 90000000005);
+}
