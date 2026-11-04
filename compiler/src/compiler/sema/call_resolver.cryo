@@ -1298,9 +1298,24 @@ type struct CallResolver {
             const arg_snap: DiagnosticSnapshot = this.ctx.diagnostics.snapshot();
             this.lambda.reject_closure_struct_args_in_non_free_call(call,
                 "passing a capturing closure as a method-call argument");
-            const receiver_t: Type* = this.arena.object_behind_receiver(visitor.resolve_receiver(callee_member.object));
+            const receiver_type: TypeRef = visitor.resolve_receiver(callee_member.object);
+            const receiver_t: Type* = this.arena.object_behind_receiver(receiver_type);
             if (receiver_t != null) {
                 return this.resolve_object_call(visitor, call_e, call, callee_member, receiver_t);
+            }
+            // A fixed array, or a reference to one, has the two slice
+            // methods, which the compiler answers.
+            mut array_t: Type* = this.arena.lookup(receiver_type);
+            if (array_t != null && array_t.kind == TypeKind::Reference) {
+                array_t = this.arena.lookup(array_t.as_reference().referent);
+            }
+            if (array_t != null && array_t.kind == TypeKind::Array) {
+                const registry: GenericRegistry* = this.ctx.generic_registry;
+                const writable: boolean = registry.names_lang_method(callee_member.member, LangItem::AsMutableSliceAsMutableSlice);
+                if (writable || registry.names_lang_method(callee_member.member, LangItem::AsSliceAsSlice)) {
+                    return this.resolve_fixed_array_slice_call(visitor, call_e, call, callee_member,
+                        array_t.as_array(), writable);
+                }
             }
             if (callee_member.trait_required && !this.receiver_has_required_trait(visitor, callee_member)) {
                 return TypeRef::invalid();
@@ -5211,6 +5226,42 @@ type struct CallResolver {
             || ty.kind == TypeKind::Bool || ty.kind == TypeKind::Char
             || ty.kind == TypeKind::Unit || ty.kind == TypeKind::Void
             || ty.kind == TypeKind::Never;
+    }
+
+    /// `values.as_slice()` or `values.as_mutable_slice()` on a fixed array,
+    /// or on a reference to one: the slice over its elements, built as the
+    /// conversion of a fixed array's reference to a slice reference builds
+    /// it (`SemaVisitor::fixed_array_slice`), since no implementation can
+    /// name the array's length.  A writable slice is taken only of a
+    /// writable array or through a writable reference (E0251 otherwise).
+    /// The call is rewritten in place into the slice's construction and
+    /// typed as that call.
+    resolve_fixed_array_slice_call(mut &this, visitor: mut SemaVisitor*, call_e: ExpressionNode*, call: mut CallExpr*,
+                                   member: mut MemberAccessExpr*, array: ArrayType*, writable: boolean) -> TypeRef {
+        if (call.arguments.length() != 0) {
+            const no_params: [TypeRef] = [];
+            this.diag.emit_method_arity_error(call_e, member.member, "method", 0, call.arguments.length(), false, &no_params);
+            return TypeRef::invalid();
+        }
+        const span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { call_e.span };
+        const receiver_t: Type* = this.arena.lookup(member.object.resolved_type);
+        mut reference: mut ExpressionNode* = member.object;
+        if (receiver_t.kind == TypeKind::Reference) {
+            if (writable && !receiver_t.as_reference().is_mutable()) {
+                visitor.refuse_read_only_borrow(PlaceAccess::Borrow(member.object), span);
+                return TypeRef::invalid();
+            }
+        } else {
+            if (writable) { member.object = visitor.borrow_for_writing(member.object, span); }
+            const object_span: SourceSpan = member.object.span;
+            const amp: Token = Token::new(TokenType::Amp, "&", object_span.start_line as int, object_span.start_col as int);
+            reference = ExpressionNode::synthetic_unary(amp, member.object, object_span);
+        }
+        const slice: ExpressionNode* = visitor.fixed_array_slice(reference, array, writable, call_e.span);
+        const built: CallExpr* = ExpressionNode::call_of(slice);
+        call.callee = built.callee;
+        for (mut i: i64 = 0; i < built.arguments.length(); i++) { call.add_argument(built.arguments[i]); }
+        return this.resolve_call(visitor, call_e, call);
     }
 
     /// The type of a call through the trait object `receiver_t`, the

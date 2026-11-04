@@ -166,6 +166,16 @@ yet is recorded with the change that builds it, not here.
      indexing it, so `[T; 0]` gives the empty slice; `for` over a fixed
      array iterates that same slice.  (Jake)
 
+697. **A fixed array has the slice methods, answered by the compiler as
+     the conversion is.**  `values.as_slice()` on a `[T; N]`, a `&[T; N]` or
+     a `mut &[T; N]` is the `&Slice<T>` over its elements, and
+     `values.as_mutable_slice()` on a writable `[T; N]` or a `mut &[T; N]`
+     the `mut &Slice<T>` that writes them: the same slice the conversion
+     builds, so read-only never becomes writable (`E0251`) and `[T; 0]`
+     gives the empty slice.  The methods are the slice traits' own, named
+     by the trait's method and not by spelling; neither needs its trait in
+     scope, since no implementation is looked up.  (Dispatch, for Jake)
+
 ### 2026-11-03
 
 690. **What releases or writes memory takes a writable pointer, and what

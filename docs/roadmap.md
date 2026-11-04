@@ -42,10 +42,9 @@ language server".  From there, in order, to the v1.0 freeze:
    - `Read` taking a `Slice`;
    - `Slice` finished: `s[i]`, `Eq`, borrowed-only `&Slice<T>` and
      `mut &Slice<T>` with `AsSlice`/`AsMutableSlice`, the container
-     conversion and the fixed-size array's conversion (compiler-answered,
-     since no implementation can name `N`) are built; `Hash`,
-     `s.slice(1..4)`, and `as_slice()` written on a fixed-size array are
-     not;
+     conversion and the fixed-size array's conversion and slice methods
+     (compiler-answered, since no implementation can name `N`) are built;
+     `Hash` and `s.slice(1..4)` are not;
    - `implement Trait` in type position: the concrete type hidden, the
      return promise checked at the function, and a refusal of its own in
      parameters, fields, aliases and type arguments (rulings 428-430);
