@@ -232,8 +232,9 @@ Tests and gates
   make selfhost-check    Byte-identity fixed point.  Linux host: the 6-stage
                          chain, then the Windows chain under wine (a skipped
                          arm fails unless ARGS=--allow-skipped-arm).  Windows
-                         host: a native cryo.exe pre-check, then the Linux
-                         chain through WSL.
+                         host: the Linux chain in WSL, from a digest-checked
+                         copy of its sources on WSL's own filesystem, at the
+                         same time as the Windows chain natively.
   make api-index         Regenerate docs/stdlib-api.txt.
   make api-index-check   Fail if docs/stdlib-api.txt is stale.
 
@@ -263,7 +264,10 @@ Side effects beyond the named output
   lsp             overwrites bin/cryolsp; fails while an editor holds it open.
   install-lsp     uninstalls the VS Code extension it replaces.
   pin             rewrites both pins; copies LLVM-C.dll and libclang.dll to bin/.
-  selfhost-check  deletes stdlib/.bin and compiler/build.
+  selfhost-check  Linux host: deletes stdlib/.bin and compiler/build.  Windows
+                  host: rewrites stdlib/.bin/<triple> and compiler/build/self,
+                  and keeps the Linux arm's copy of its sources in WSL's
+                  ~/.cache/cryo-selfhost/.
   test, examples, lsp-check and every gate that needs the compiler rebuild
                   it first when any .cryo under compiler/src or stdlib is
                   newer than it.
@@ -519,18 +523,16 @@ endif
 #                 wine-based Windows chain.  Without the mingw toolchain,
 #                 wine and .toolchains that arm is skipped, and a skipped arm
 #                 fails the check unless ARGS=--allow-skipped-arm says so.
-#   Windows host: runs a Windows-native pre-check using bin/cryo.exe
-#                 (smoke + stdlib byte-identity against the WSL Linux
-#                 cross-compiled IR), then delegates the full 6-stage
-#                 Linux chain to WSL.  Requires wsl.exe on PATH.
+#   Windows host: runs the 6-stage Linux chain in WSL, from a copy of its
+#                 sources on WSL's own filesystem (refused unless its digest
+#                 is the working tree's), at the same time as the 6-stage
+#                 Windows chain natively.  Requires wsl.exe on PATH.
 ifeq ($(HOST_OS),windows)
 # The wrapper checks for python + wsl.exe, then drives selfhost-check.py.
 # Same single-line shape as `pin` so it Just Works whether you invoked
 # `make` from cmd / PowerShell or from MSYS2 / Git Bash.
 # `runtime-tiers` first: the check's stage-2 and stage-3 rounds are hosted links
-# that need libcryort-panic-abort-hosted.a to resolve `__cryo_panic`.  It wipes
-# stdlib/.bin and compiler/build but not runtime/.bin, so building the tiers up
-# front survives every round.
+# that need libcryort-panic-abort-hosted.a to resolve `__cryo_panic`.
 selfhost-check: runtime-tiers
 	scripts\selfhost-check-windows.cmd $(ARGS)
 else

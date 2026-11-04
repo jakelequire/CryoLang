@@ -144,6 +144,66 @@ WIPE_PATHS = [
     ROOT / "stdlib"   / ".bin",
 ]
 
+# What the Linux arm reads: the pin and four source trees.  `--mirror` copies
+# exactly these into a directory on a native Linux filesystem, without the
+# build outputs the arm wipes or rebuilds, and runs the arm there - reading the
+# working tree through WSL's /mnt/c costs the arm most of its time.  It refuses
+# to start unless the copy's digest is the working tree's.
+MIRRORED = ["bin/cryo", "compiler", "runtime", "stdlib", "scripts"]
+MIRROR_SKIPPED = ["compiler/build", "stdlib/.bin", "runtime/.bin"]
+
+
+def tree_digest(root: Path):
+    """sha256 over every file of MIRRORED under `root` (path and content, in
+    path order), skipping MIRROR_SKIPPED and `__pycache__`.  Returns the hex
+    digest and the number of files."""
+    files = []
+    for top in MIRRORED:
+        p = root / top
+        if p.is_file():
+            files.append(top)
+            continue
+        for dirpath, dirnames, filenames in os.walk(p):
+            rel = Path(dirpath).relative_to(root).as_posix()
+            dirnames[:] = [d for d in dirnames if d != "__pycache__"
+                           and f"{rel}/{d}" not in MIRROR_SKIPPED]
+            files.extend(f"{rel}/{f}" for f in filenames)
+    whole = hashlib.sha256()
+    for rel in sorted(files):
+        whole.update(rel.encode() + b"\0" + hashlib.sha256((root / rel).read_bytes()).digest())
+    return whole.hexdigest(), len(files)
+
+
+def run_from_mirror(args) -> int:
+    """Copy MIRRORED into `args.mirror`, refuse unless the copy's digest is
+    the working tree's, then run the Linux arm from the copy."""
+    mirror = Path(os.path.expanduser(args.mirror)).resolve()
+    if not shutil.which("rsync"):
+        print(f"{C.RED}✗ --mirror needs rsync{C.RESET}")
+        return 2
+    (mirror / "bin").mkdir(parents=True, exist_ok=True)
+    excludes = ["--exclude=__pycache__/"] + [f"--exclude=/{p}/" for p in MIRROR_SKIPPED]
+    trees = [str(ROOT / top) for top in MIRRORED if top != "bin/cryo"]
+    copied = subprocess.run(["rsync", "-a", "--delete", "--delete-excluded", *excludes,
+                             *trees, f"{mirror}/"]).returncode
+    copied = copied or subprocess.run(["rsync", "-a", str(BOOT), str(mirror / "bin" / "cryo")]).returncode
+    if copied != 0:
+        print(f"{C.RED}✗ copying the sources into {mirror} failed (rsync exit {copied}){C.RESET}")
+        return 2
+    work, nwork = tree_digest(ROOT)
+    copy, ncopy = tree_digest(mirror)
+    print(f"{C.BOLD}==> Linux arm runs from {mirror}{C.RESET}")
+    print(f"  {C.DIM}working tree:{C.RESET} {work}  {C.DIM}({nwork} files){C.RESET}")
+    print(f"  {C.DIM}mirror:      {C.RESET} {copy}  {C.DIM}({ncopy} files){C.RESET}")
+    if work != copy:
+        print(f"{C.RED}{C.BOLD}✗ the mirror does not hold the working tree; refusing to run from it{C.RESET}")
+        return 1
+    sys.stdout.flush()
+    cmd = [sys.executable, str(mirror / "scripts" / "selfhost-check.py"), "--no-windows"]
+    cmd += (["-v"] if args.verbose else []) + (["--keep-logs"] if args.keep_logs else [])
+    cmd += ["--allow-skipped-arm"] if args.allow_skipped_arm else []
+    return subprocess.run(cmd).returncode
+
 # ---------------------------------------------------------------------------
 # Color helper (honors NO_COLOR; only colorizes on a TTY)
 # ---------------------------------------------------------------------------
@@ -809,11 +869,10 @@ def finish_arms(arms: list, allow_skipped: bool) -> int:
 #
 # The selfhost stages build Linux ELF artifacts rooted at bin/cryo, so they
 # can't run natively on Windows.  On a Windows host we re-invoke this script
-# inside WSL and stream its output verbatim, so `make selfhost-check` looks
-# and behaves like a native Linux run - same header, stage rows, live ticker,
-# and fixed-point gate.  The wine-based [w1]-[w4] cross-verify is skipped here
-# (--no-windows): it's redundant on Windows and wine doesn't run under the
-# non-interactive WSL invocation.  WSL is required.
+# inside WSL with --mirror, log its output and print it once it finishes; the
+# Windows chain runs natively meanwhile.  The wine-based [w1]-[w4]
+# cross-verify is skipped here (--no-windows): it's redundant on Windows and
+# wine doesn't run under the non-interactive WSL invocation.  WSL is required.
 # ---------------------------------------------------------------------------
 
 
@@ -847,13 +906,14 @@ def _wsl_path(p: Path) -> str | None:
 
 
 def main_windows(args) -> int:
-    """Windows-host entry point: two sections, the same 6-stage self-host.
+    """Windows-host entry point: two sections, the same 6-stage self-host,
+    run at the same time.
 
       1. Linux section - runs inside WSL (the Linux stages build ELF artifacts
-         rooted at bin/cryo, which can't run natively on Windows).  Streamed
-         verbatim so it looks like a native Linux run.  --no-windows so the WSL
-         child doesn't also try the windows section (wine can't, and we run it
-         natively below).
+         rooted at bin/cryo, which can't run natively on Windows), from a
+         digest-checked copy of its sources on WSL's own filesystem
+         (--mirror).  --no-windows so the WSL child doesn't also try the
+         windows section (wine can't, and we run it natively below).
       2. Windows section - bin/cryo.exe through the same 6 stages, run NATIVELY
          on this Windows host."""
     if not shutil.which("wsl.exe"):
@@ -867,28 +927,41 @@ def main_windows(args) -> int:
         print(f"  {C.DIM}Is the repo visible inside your default WSL distro?{C.RESET}")
         return 2
 
-    # 1. Linux section via WSL.  The child prints the Linux experience straight
-    #    to this console; --no-windows so it doesn't also run a windows section.
+    # 1. Linux section via WSL, from a mirror on WSL's own filesystem (one per
+    #    checkout, under the WSL user's ~/.cache), and at the same time as the
+    #    Windows section: the two arms share no directory.  --no-windows so the
+    #    child doesn't also run a windows section.  Its output goes to a log,
+    #    printed once it finishes.
+    if not args.keep_logs and LOG_DIR.exists():
+        shutil.rmtree(LOG_DIR)
+    ensure_dir(LOG_DIR)
+    mirror = "~/.cache/cryo-selfhost/" + hashlib.sha256(str(ROOT).encode()).hexdigest()[:12]
     inner = ("cd '" + wsl_root + "' && python3 scripts/selfhost-check.py --no-windows"
+             + " --mirror " + mirror
              + (" -v" if args.verbose else "")
              + (" --keep-logs" if args.keep_logs else ""))
-    # Flush so our (possibly buffered) stdout doesn't interleave with the child
-    # writing directly to the underlying console fd.
+    linux_log = LOG_DIR / "linux-arm.log"
+    print(f"{C.BOLD}==> Linux arm: WSL, from {mirror}, alongside the Windows arm{C.RESET}"
+          f"  {C.DIM}(output: {linux_log.relative_to(ROOT)}){C.RESET}")
     sys.stdout.flush()
-    sys.stderr.flush()
-    rc = subprocess.run(["wsl.exe", "--", "bash", "-lc", inner]).returncode
-    if rc != 0:
-        # The child printed its own arms; it is the authority on the Linux one.
-        return rc
-
-    # 2. Windows section natively (bin/cryo.exe through the same 6 stages).
-    #    This is the host that can run BOTH arms, so it is the one whose green
-    #    licenses "the fixed point holds on both hosts" - it must not be
-    #    reachable with the windows arm skipped.
-    st, why = run_windows_selfhost([], verbose=args.verbose)
-    arms = [("linux", "ok", "verified in WSL (see above)"),
+    with open(linux_log, "w", encoding="utf-8") as out:
+        linux = subprocess.Popen(["wsl.exe", "--", "bash", "-lc", inner],
+                                 stdout=out, stderr=subprocess.STDOUT)
+        # 2. Windows section natively (bin/cryo.exe through the same 6 stages).
+        #    This is the host that can run BOTH arms, so it is the one whose
+        #    green licenses "the fixed point holds on both hosts" - it must not
+        #    be reachable with the windows arm skipped.
+        st, why = run_windows_selfhost([], verbose=args.verbose)
+        rc = linux.wait()
+    print()
+    print(f"{C.BOLD}==> Linux arm output{C.RESET}")
+    print(linux_log.read_text(encoding="utf-8", errors="replace"))
+    # The child printed its own arms; it is the authority on the Linux one.
+    arms = [("linux", "ok" if rc == 0 else "fail",
+             "verified in WSL (see above)" if rc == 0 else f"exit {rc} (see above)"),
             ("windows", st, why)]
-    return finish_arms(arms, args.allow_skipped_arm)
+    status = finish_arms(arms, args.allow_skipped_arm)
+    return rc if rc != 0 else status
 
 
 # ---------------------------------------------------------------------------
@@ -920,7 +993,13 @@ def main():
                         help="exit 0 even though an arm could not run here.  Records "
                              "a partial verification deliberately; without it a "
                              "skipped arm fails the gate.")
+    parser.add_argument("--mirror", metavar="DIR",
+                        help="run the Linux arm from a copy of its sources in DIR, "
+                             "refused unless the copy's digest is the working tree's")
     args = parser.parse_args()
+
+    if args.mirror:
+        return run_from_mirror(args)
 
     # Windows host: native pre-check + WSL Linux chain.  This branch never
     # touches BOOT (bin/cryo, the Linux ELF) directly - it routes the Linux
