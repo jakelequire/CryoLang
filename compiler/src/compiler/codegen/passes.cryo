@@ -40,6 +40,8 @@ import compiler::types::arena::{ TypeArena };
 import compiler::types::type_base::{ Type };
 import compiler::types::user_defined::{ FieldInfo, StructType };
 import std::core::mem;
+import std::sync::atomic::{ Atomic, MemoryOrder };
+import std::thread;
 import compiler::resolver::mangled_name::{ MangledName };
 
 
@@ -2375,8 +2377,8 @@ function codegen_emit_job(job: mut EmitJob*) -> void {
     // a worker never touches the compiler's single-threaded bump arena, and the
     // per-module context isolation makes the concurrent LLVM emit itself safe.
     // The module, context, and target machine are disposed by the caller on the
-    // main thread after every worker has joined (LLVM disposal must not
-    // interleave with emit).
+    // main thread once this job is done; the context is this job's own, so
+    // disposing it touches nothing another worker is emitting.
     if ((*job).tm == null || (*job).llvm_module == null) {
         (*job).ok = false;
         return;
@@ -2398,33 +2400,41 @@ function codegen_emit_job(job: mut EmitJob*) -> void {
     (*job).ok = rc == 0;
 }
 
-/// Per-worker context for the IN-PROCESS THREADED object emitter
-/// (`CompilerInstance::emit_jobs_threaded`).  Each worker owns a disjoint,
-/// round-robin slice `[start, start+stride, start+2*stride, ...]` of a shared,
-/// already-finalized `EmitJob` array - disjoint indices mean no two workers
-/// ever touch the same job, so the only writes (`job.ok`) never alias and need
-/// no lock.  `jobs` is the array's stable base pointer: the producer stops
-/// pushing before any worker is spawned, so no realloc can move it mid-emit.
-type struct EmitWorkerCtx {
-    jobs:   mut EmitJob*;   // stable base of the finalized job array (not owned)
-    count:  i64;        // total job count
-    start:  u32;        // this worker's first index
-    stride: u32;        // number of workers (round-robin step)
+/// The in-process threaded emitter's job queue, moved into each worker by
+/// value.  The pointers alias storage the main thread sized for every module
+/// before any worker started, so nothing they point into moves while a worker
+/// runs.  The main thread fills `jobs[k]` and only then raises `published`
+/// past `k` (release); a worker takes the next index off `cursor`, waits until
+/// that index is published, emits it, and stores `done[k]` (release).  The
+/// main thread reads a job's results or disposes it only after seeing `done`
+/// (acquire).  Once the last job is published the main thread sets `closed`,
+/// and a worker holding an index past the last published one stops.
+type struct EmitQueue {
+    jobs:      mut EmitJob*;
+    done:      mut Atomic<u32>*;
+    cursor:    mut Atomic<u64>*;
+    published: mut Atomic<u64>*;
+    closed:    mut Atomic<u32>*;
 }
 
-/// Thread entry for the in-process threaded emitter.  A plain top-level
-/// function (not a lambda) so its body may freely call the generic LLVM
-/// wrappers inside `codegen_emit_job` - a lambda handed to the generic
-/// `Scope::spawn` cannot (see [[closure-generic-fn-limits]]).  Emits only this
-/// worker's round-robin slice; `init_native_target` already ran on the main
-/// thread during IR generation, and each `codegen_emit_job` builds its OWN
-/// target machine, so nothing here mutates process-global LLVM state.
-function emit_worker_entry(wc: EmitWorkerCtx*) -> void {
-    const cnt:    i64 = (*wc).count;
-    const stride: i64 = (*wc).stride as i64;
-    mut j: i64 = (*wc).start as i64;
-    while (j < cnt) {
-        codegen_emit_job(&((*wc).jobs)[j]);
-        j = j + stride;
+/// Pool worker body.  A plain top-level function: it is handed to
+/// `Scope::spawn` as a function pointer, and a lambda handed to the generic
+/// `spawn` could not call the generic LLVM wrappers `codegen_emit_job` uses.
+/// It allocates no Cryo memory (nor does `codegen_emit_job`), so the main
+/// thread keeps the bump arena to itself while it generates the next module's
+/// IR; every module lives in its own LLVM context, so emitting one shares no
+/// LLVM state with the main thread's work on another.
+function emit_queue_worker(queue: EmitQueue) -> void {
+    loop {
+        const k: u64 = (*queue.cursor).fetch_add(1, MemoryOrder::Relaxed);
+        while (k >= (*queue.published).load(MemoryOrder::Acquire)) {
+            if ((*queue.closed).load(MemoryOrder::Acquire) != 0
+                    && k >= (*queue.published).load(MemoryOrder::Acquire)) {
+                return;
+            }
+            thread::sleep_ms(1);
+        }
+        codegen_emit_job(&queue.jobs[k]);
+        queue.done[k].store(1, MemoryOrder::Release);
     }
 }

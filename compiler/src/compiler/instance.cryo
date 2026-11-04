@@ -37,6 +37,7 @@ import utils::log::{ Log, LogArea, LogLevel };
 import std::fmt;
 import std::fs::path::{ Path };
 import std::env;
+import std::sync::atomic::{ Atomic, MemoryOrder };
 import std::thread;
 import std::time::clock::{ Instant };
 import std::collections::string::{ String };
@@ -48,9 +49,9 @@ import compiler::artifacts::{ ASTOutput, IROutput, TokenStream };
 import compiler::ast::declaration::{ DeclarationNode, ImportDecl };
 import compiler::ast::dumper::{ ASTDumper };
 import compiler::ast::node::{ ProgramNode };
-import compiler::codegen::llvm_types::{ LContext, LModule, LTargetMachine };
+import compiler::codegen::llvm_types::{ LContext, LFileType, LModule, LTargetMachine };
 import compiler::codegen::passes::{
-    codegen_emit_job, CodegenPasses, emit_worker_entry, EmitJob, EmitTarget, EmitWorkerCtx
+    codegen_emit_job, CodegenPasses, emit_queue_worker, EmitJob, EmitQueue, EmitTarget
 };
 import compiler::codegen::test_main_codegen::{ TestMainCodegen };
 import compiler::compilation_context::{
@@ -1973,14 +1974,13 @@ type struct CompilerInstance {
             // `cg_threads` workers.  Default mode is IN-PROCESS THREADED: each
             // module has its own `LLVMContext` + target machine, so a
             // thread-enabled libLLVM emits them concurrently with no shared
-            // mutable state (the recipe ThinLTO uses).  Two alternates via
+            // mutable state.  Two alternates via
             // `CRYO_CODEGEN_MODE`:
             //   * "process" - each object compiled by a child `cryo __emit-obj`
             //     from bitcode (full process isolation; costs a bitcode
             //     round-trip). Kept as a fallback / cross-check.
             //   * "serial" - force single-threaded in-process emit.
-            // `cg_threads == 1` is serial regardless of mode.  Threaded emit is
-            // batched to at most `cg_batch_cap` live modules (a peak-RSS guard).
+            // `cg_threads == 1` is serial regardless of mode.
             const cg_mode: string = CompilerInstance::codegen_mode();
             mut multiproc: boolean = cg_mode == "process"
                 && cg_threads > 1 && n >= CODEGEN_MULTIPROC_MIN_MODULES;
@@ -2008,12 +2008,15 @@ type struct CompilerInstance {
                     }
                 }
             }
-            // In-flight cap for the threaded path: bounds live LLVM contexts so
-            // the whole target's modules never sit in memory at once.  `serial`
-            // mode (or a 1-thread build) caps at 1 -> flush every module
-            // immediately, byte-identical to the serial path.
-            mut cg_batch_cap: u32 = cg_threads;
-            if (cg_mode == "serial" || cg_threads <= 1) { cg_batch_cap = 1; }
+            // The threaded path hands each module to a pool of `cg_threads`
+            // workers as soon as its IR exists, and goes on generating the
+            // next module while they emit; `serial` mode (or a 1-thread build)
+            // emits each module on this thread before generating the next.
+            // Live modules are capped so the whole target's modules never sit
+            // in memory at once: the main thread waits for one to finish
+            // before generating past the cap.
+            const cg_threaded: boolean = !multiproc && cg_mode != "serial" && cg_threads > 1;
+            const cg_live_cap: u32 = cg_threads + 2;
 
             // The per-TARGET codegen context (published before sema/mono) is
             // superseded by per-MODULE contexts below; dispose it up front so
@@ -2034,9 +2037,39 @@ type struct CompilerInstance {
             mut mp_obj: [string] = [];
             mut mp_pos: [u32] = [];
 
-            // In-process serial fallback batch (used when `!multiproc`).
+            // In-process emit jobs (used when `!multiproc`), one per module
+            // handed to an emitter, with its topo position in `cg_pos`.  On the
+            // threaded path the table is sized for every module before a worker
+            // starts (see `EmitQueue`); slot `cg_filled` is the next to fill.
             mut cg_jobs: [EmitJob] = [];
             mut cg_pos:  [u32] = [];
+            mut cg_done: [Atomic<u32>] = [];
+            mut cg_cursor:    Atomic<u64> = Atomic::<u64>::new(0);
+            mut cg_published: Atomic<u64> = Atomic::<u64>::new(0);
+            mut cg_closed:    Atomic<u32> = Atomic::<u32>::new(0);
+            mut cg_filled: u64 = 0;
+            mut cg_live:   u32 = 0;
+            mut cg_emit_failed: boolean = false;
+            // 64 MiB worker stacks: LLVM's SelectionDAG recurses deep and
+            // overflows the ~1 MiB default thread stack.
+            mut cg_pool: thread::Scope = thread::Scope::new_with_stack(64 * 1024 * 1024);
+            if (cg_threaded) {
+                for (mut r: u32 = 0; r < n; r++) {
+                    cg_jobs.push(EmitJob {
+                        llvm_module: null, llvm_context: null, tm: null,
+                        emit_path: "", emit_type: LFileType::Object, triple: "",
+                        opt_level: 0, should_register: false,
+                        optimization_failed: false, ok: false, err_msg: null as string
+                    });
+                    cg_done.push(Atomic::<u32>::new(0));
+                }
+                for (mut w: u32 = 0; w < cg_threads; w++) {
+                    cg_pool.spawn::<EmitQueue>(EmitQueue {
+                        jobs: cg_jobs.as_mutable_ptr(), done: cg_done.as_mutable_ptr(),
+                        cursor: &cg_cursor, published: &cg_published, closed: &cg_closed
+                    }, emit_queue_worker);
+                }
+            }
 
             // Every analysed `![inline]` body, for the modules calling one to
             // copy.  A cached module was not analysed and offers none; the
@@ -2053,8 +2086,10 @@ type struct CompilerInstance {
                 // generation on that error and come back empty, so going on
                 // reports each of them as a codegen failure of its own - a
                 // line per module, none of them true, printed ahead of the
-                // one error that is.
-                if (ctx.diagnostics.has_errors()) {
+                // one error that is.  A module the pool failed to emit stops
+                // the loop the same way; its report is made with the others,
+                // in topo order, after the pool has finished.
+                if (ctx.diagnostics.has_errors() || cg_emit_failed) {
                     break;
                 }
                 const _mi: ModuleInfo* = &ctx.module_graph.modules[order[i]];
@@ -2196,18 +2231,17 @@ type struct CompilerInstance {
                     continue;
                 }
 
-                // In-process THREADED emit (ZERO-COPY).  Hand the worker the LIVE
-                // module in its own context, plus a target machine built HERE on
-                // the main thread (LLVM target setup is single-threaded, and this
-                // keeps the worker allocation-free).  The module + context stay
-                // alive - owned by the job - until the batch flush disposes them
-                // after join; `set_codegen_context_new_keep_prior` (next
+                // In-process emit (ZERO-COPY).  Hand the job the LIVE module in
+                // its own context, plus a target machine built HERE on the main
+                // thread (LLVM target setup is single-threaded, and this keeps
+                // the worker allocation-free).  The module + context stay alive -
+                // owned by the job - until the job is done and this thread
+                // disposes it; `set_codegen_context_new_keep_prior` (next
                 // iteration) mints a fresh context without touching this one.
                 // Every module is fully self-contained in its own context, so
-                // concurrent emit shares no LLVM state.  Jobs accumulate until the
-                // batch reaches `cg_batch_cap`, then emit across `cg_threads`
-                // workers; `cg_batch_cap == 1` flushes one at a time, byte-
-                // identical to a serial build.
+                // a worker's emit shares no LLVM state with the IR this thread
+                // generates meanwhile, and each object is the same whichever
+                // worker emits it, or when.
                 const cg_tri: string = CodegenPasses::effective_triple(ctx);
                 mut cg_tm: LTargetMachine = match (LTargetMachine::create_target_machine_with_opt(
                         cg_tri, ctx.options.opt_level as i32)) {
@@ -2223,7 +2257,7 @@ type struct CompilerInstance {
                         continue;
                     }
                 };
-                cg_jobs.push(EmitJob {
+                const cg_job: EmitJob = EmitJob {
                     llvm_module:     ctx.artifacts.ir.llvm_module,
                     llvm_context:    compiler::codegen::llvm_types::current_codegen_context(),
                     tm:              cg_tm.raw,
@@ -2235,27 +2269,56 @@ type struct CompilerInstance {
                     optimization_failed: false,
                     ok:              false,
                     err_msg:         null as string
-                });
+                };
                 cg_pos.push(i);
                 // Detach the module from ctx (the job owns it now); do NOT
-                // dispose the context here - the job holds it until post-join.
+                // dispose the context here - the job holds it until it is done.
                 ctx.artifacts.ir = IROutput::empty();
                 pipeline.reset();
 
-                if (cg_jobs.length() as u32 >= cg_batch_cap) {
-                    CompilerInstance::emit_jobs_threaded(&cg_jobs, cg_threads);
+                if (!cg_threaded) {
+                    cg_jobs.push(cg_job);
+                    CompilerInstance::emit_jobs_serial(&cg_jobs);
                     CompilerInstance::record_emitted_jobs(ctx, &cg_jobs, &cg_pos, &cg_obj);
                     cg_jobs.clear();
                     cg_pos.clear();
+                    continue;
+                }
+
+                cg_jobs[cg_filled] = cg_job;
+                cg_filled = cg_filled + 1;
+                cg_live = cg_live + 1;
+                cg_published.store(cg_filled, MemoryOrder::Release);
+                // Dispose every job the pool has finished, then wait while the
+                // live modules are at the cap.  A failed job stops the loop at
+                // its next iteration; it is reported below with the rest.
+                loop {
+                    for (mut d: u64 = 0; d < cg_filled; d++) {
+                        if (cg_jobs[d].llvm_context != null
+                                && cg_done[d].load(MemoryOrder::Acquire) != 0) {
+                            if (!cg_jobs[d].ok) { cg_emit_failed = true; }
+                            CompilerInstance::dispose_emit_job(&cg_jobs[d]);
+                            cg_live = cg_live - 1;
+                        }
+                    }
+                    if (cg_live < cg_live_cap) { break; }
+                    thread::sleep_ms(1);
                 }
             }
 
-            // Flush any remaining accumulated jobs (the final partial batch).
-            if (cg_jobs.length() > 0) {
-                CompilerInstance::emit_jobs_threaded(&cg_jobs, cg_threads);
+            // Close the pool: every worker emits what is published and stops.
+            // The jobs still live are disposed here, then every job's object
+            // is recorded (and every failure reported) in topo order.
+            if (cg_threaded) {
+                cg_closed.store(1, MemoryOrder::Release);
+                cg_pool.join_all();
+                cg_jobs.truncate(cg_filled as i64);
+                for (mut d: i64 = 0; d < cg_jobs.length(); d++) {
+                    if (cg_jobs[d].llvm_context != null) {
+                        CompilerInstance::dispose_emit_job(&cg_jobs[d]);
+                    }
+                }
                 CompilerInstance::record_emitted_jobs(ctx, &cg_jobs, &cg_pos, &cg_obj);
-                cg_jobs.clear();
-                cg_pos.clear();
             }
 
             // Fan the multi-process emit out to child processes, then record
@@ -3393,64 +3456,38 @@ type struct CompilerInstance {
         }
     }
 
-    /// Emit a batch of ready modules' objects IN-PROCESS on the main thread
-    /// (the serial path: `CRYO_CODEGEN_MODE=serial` / a 1-thread or tiny build).
-    /// Emits each live module, then disposes the modules/contexts/target
-    /// machines (`dispose_emit_jobs`).
+    /// Emit ready modules' objects IN-PROCESS on the main thread (the serial
+    /// path: `CRYO_CODEGEN_MODE=serial` / a 1-thread build), disposing each
+    /// job's module, context and target machine after its emit.
     static emit_jobs_serial(jobs: mut [EmitJob]*) -> void {
         const cnt: i64 = (*jobs).length() as i64;
         for (mut j: i64 = 0; j < cnt; j++) {
             codegen_emit_job(&(*jobs)[j]);
-        }
-        CompilerInstance::dispose_emit_jobs(jobs);
-    }
-
-    /// Dispose every job's target machine, module, and context.  Runs on the
-    /// MAIN thread after all emits complete (LLVM disposal must not interleave
-    /// with concurrent emit).
-    static dispose_emit_jobs(jobs: [EmitJob]*) -> void {
-        const cnt: i64 = (*jobs).length() as i64;
-        for (mut j: i64 = 0; j < cnt; j++) {
-            if ((*jobs)[j].tm != null) {
-                mut t: LTargetMachine = LTargetMachine { raw: (*jobs)[j].tm };
-                t.dispose();
-            }
-            if ((*jobs)[j].llvm_module != null) {
-                mut m: LModule = LModule { raw: (*jobs)[j].llvm_module };
-                m.dispose();
-            }
-            if ((*jobs)[j].llvm_context != null) {
-                mut c: LContext = LContext { raw: (*jobs)[j].llvm_context };
-                c.dispose();
-            }
+            CompilerInstance::dispose_emit_job(&(*jobs)[j]);
         }
     }
 
-    /// Emit a batch of ready modules' objects IN-PROCESS across a thread pool - 
-    /// the true multi-threaded codegen path.  ZERO-COPY: each job carries its
-    /// LIVE module in its own `LLVMContext` plus a main-thread-built target
-    /// machine; a worker just runs `LLVMTargetMachineEmitToFile`.  Two things
-    /// make this safe with a thread-enabled libLLVM (`LLVMIsMultithreaded()==1`
-    /// on both the linked Linux `libLLVM.so` and the Windows `LLVM-C.dll`):
-    ///   1. Every module is fully self-contained in its own context (the context
-    ///      auditor confirms NO type leaks into the shared global context - the
-    ///      last such leak was `LLVMAppendBasicBlock`, now `...InContext`), so
-    ///      concurrent emit over disjoint modules touches no shared LLVM state.
-    ///   2. A worker allocates NO Cryo memory (raw emit call; error reporting
-    ///      deferred to the main thread), so the compiler's single-threaded bump
-    ///      arena is never accessed off the main thread - no pause needed.
-    /// A standalone C++ harness driving the same concurrent emit over these
-    /// modules never faults, confirming the LLVM side was never the problem.
-    ///
-    /// Correctness invariants:
-    ///   * The caller finalizes `jobs` (no more pushes) BEFORE calling here, so
-    ///     the base pointer the workers index is stable - no realloc dangles it.
-    ///   * Workers take DISJOINT round-robin slices, so the only writes
-    ///     (`job.ok`) never alias; no lock is needed.
-    ///   * Modules/contexts/target machines are disposed on the MAIN thread
-    ///     after every worker has joined (`dispose_emit_jobs`).
-    ///   * Workers get 64 MiB stacks: LLVM's SelectionDAG recurses deep and
-    ///     overflows the ~1 MiB default thread stack.
+    /// Dispose a finished job's target machine, module, and context, on the
+    /// MAIN thread, and clear them so the job reads as disposed.  Its results
+    /// (`ok`, `err_msg`, `emit_path`) stay for `record_emitted_jobs`.
+    static dispose_emit_job(job: mut EmitJob*) -> void {
+        if ((*job).tm != null) {
+            mut t: LTargetMachine = LTargetMachine { raw: (*job).tm };
+            t.dispose();
+            (*job).tm = null;
+        }
+        if ((*job).llvm_module != null) {
+            mut m: LModule = LModule { raw: (*job).llvm_module };
+            m.dispose();
+            (*job).llvm_module = null;
+        }
+        if ((*job).llvm_context != null) {
+            mut c: LContext = LContext { raw: (*job).llvm_context };
+            c.dispose();
+            (*job).llvm_context = null;
+        }
+    }
+
     /// The name of the module sitting at `pos` in the topological codegen
     /// order, for a failure message.
     ///
@@ -3492,44 +3529,8 @@ type struct CompilerInstance {
         }
     }
 
-    /// `nthreads <= 1` (or a single job) runs the batch inline via
-    /// `emit_jobs_serial`, keeping a serial build byte-identical.
-    static emit_jobs_threaded(jobs: mut [EmitJob]*, nthreads: u32) -> void {
-        const cnt: i64 = (*jobs).length() as i64;
-        if (cnt <= 0) { return; }
-        if (nthreads <= 1 || cnt <= 1) {
-            CompilerInstance::emit_jobs_serial(jobs);
-            return;
-        }
-
-        mut nw: u32 = nthreads;
-        if ((nw as i64) > cnt) { nw = cnt as u32; }
-
-        // Build the per-worker contexts COMPLETELY before spawning any thread:
-        // each `EmitWorkerCtx` points at `wcs`'s own storage, so a push after a
-        // worker held a pointer into it could realloc and dangle. Fill first,
-        // then spawn.
-        const base: mut EmitJob* = (*jobs).as_mutable_ptr();
-        mut wcs: [EmitWorkerCtx] = [];
-        for (mut w: u32 = 0; w < nw; w++) {
-            wcs.push(EmitWorkerCtx { jobs: base, count: cnt, start: w, stride: nw });
-        }
-
-        // 64 MiB per-worker stacks (SelectionDAG recursion depth).  No arena
-        // pause: the workers are allocation-free (see the doc comment), so the
-        // single-threaded arena is untouched while they run.
-        mut s: thread::Scope = thread::Scope::new_with_stack(64 * 1024 * 1024);
-        for (mut w: u32 = 0; w < nw; w++) {
-            s.spawn::<EmitWorkerCtx*>(&wcs[w], emit_worker_entry);
-        }
-        s.join_all();
-
-        // All workers joined; dispose on the main thread.
-        CompilerInstance::dispose_emit_jobs(jobs);
-    }
-
     /// Record each emitted job's object at its module's topo position in
-    /// `objects`, and report each job that failed.
+    /// `objects`, and report each job that failed, in job order.
     static record_emitted_jobs(ctx: mut CompilationContext*, jobs: [EmitJob]*,
                                positions: [u32]*, objects: mut [string]*) -> void {
         for (mut b: i64 = 0; b < (*jobs).length() as i64; b++) {
