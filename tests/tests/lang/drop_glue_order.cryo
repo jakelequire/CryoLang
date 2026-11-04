@@ -1,0 +1,199 @@
+///! The ORDER drop glue releases a value's parts in, and that each part is
+///! released exactly once, for every shape glue handles: struct fields,
+///! variant payloads, tuple elements, fixed-array elements, the fields a
+///! destructor leaves behind, values nested through all of them, a recursive
+///! type through a `Box`, and a frame released by unwinding.
+///!
+///! A type's glue is one function per module, called from every site that
+///! releases a value of the type, so the same type released at two sites, in
+///! two functions, and nested inside two different owners is asserted too.
+///!
+///! Each `Probe` release appends its tag to a module log, so `123` reads
+///! "1, then 2, then 3": a missed release drops a digit, a second release
+///! repeats one, and a reordering permutes them.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::DropGlueOrder;
+
+import std::alloc::box::{ Box };
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::core::intrinsics;
+import std::core::panic_unwind::{ catch_unwind, PanicInfo };
+import std::core::result::{ Result };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_eq, expect_true };
+
+mut g_log: i64 = 0;
+function reset() -> void { g_log = 0; }
+
+/// Appends a decimal digit per release.
+function note(tag: i64) -> void {
+    g_log = g_log * 10 + tag;
+}
+
+type struct Probe { tag: i64; }
+implement trait Drop for struct Probe {
+    drop(mut &this) -> void { note(this.tag); }
+}
+
+type struct Triple { a: Probe; b: Probe; c: Probe; }
+type struct Pair { first: Probe; second: Probe; }
+type struct Outer { head: Probe; middle: Option<Pair>; count: i64; tail: Probe; }
+
+type enum Shape {
+    Empty;
+    Two(Probe, i64, Probe);
+    Nested(Pair, Probe);
+}
+
+type enum Chain {
+    End;
+    Link(Probe, Box<Chain>);
+}
+
+/// Body marker: 9.  Its fields are released after the body returns.
+type struct Owner { kept: Probe; maybe: Option<Probe>; }
+implement trait Drop for struct Owner {
+    drop(mut &this) -> void { note(9); }
+}
+
+function pair(first: i64, second: i64) -> Pair {
+    return Pair { first: Probe { tag: first }, second: Probe { tag: second } };
+}
+
+![test]
+function struct_fields_release_in_declaration_order() -> Result<(), TestError> {
+    reset();
+    { mut _t: Triple = Triple { a: Probe { tag: 1 }, b: Probe { tag: 2 }, c: Probe { tag: 3 } }; }
+    return expect_eq(g_log, 123);
+}
+
+![test]
+function enum_inside_struct_releases_between_its_neighbours() -> Result<(), TestError> {
+    reset();
+    {
+        mut _o: Outer = Outer {
+            head: Probe { tag: 1 }, middle: Option::Some(pair(2, 3)), count: 0, tail: Probe { tag: 4 }
+        };
+    }
+    return expect_eq(g_log, 1234);
+}
+
+![test]
+function absent_variant_releases_nothing_between_neighbours() -> Result<(), TestError> {
+    reset();
+    { mut _o: Outer = Outer { head: Probe { tag: 1 }, middle: Option::None, count: 0, tail: Probe { tag: 4 } }; }
+    return expect_eq(g_log, 14);
+}
+
+![test]
+function variant_payloads_release_in_position_order() -> Result<(), TestError> {
+    reset();
+    { mut _s: Shape = Shape::Two(Probe { tag: 1 }, 7, Probe { tag: 2 }); }
+    expect_eq(g_log, 12)?;
+    reset();
+    { mut _s: Shape = Shape::Nested(pair(3, 4), Probe { tag: 5 }); }
+    expect_eq(g_log, 345)?;
+    reset();
+    { mut _s: Shape = Shape::Empty; }
+    return expect_eq(g_log, 0);
+}
+
+![test]
+function tuple_elements_release_in_position_order() -> Result<(), TestError> {
+    reset();
+    { mut _t: (Probe, i64, Pair) = (Probe { tag: 1 }, 5, pair(2, 3)); }
+    return expect_eq(g_log, 123);
+}
+
+![test]
+function fixed_array_elements_release_in_index_order() -> Result<(), TestError> {
+    reset();
+    { mut _arr: [Pair; 2] = [pair(1, 2), pair(3, 4)]; }
+    return expect_eq(g_log, 1234);
+}
+
+/// Filled element by element, each element is a member tracked on its own,
+/// so scope exit releases them in reverse order of writing; the release of
+/// each is still the element type's glue.
+![test]
+function fixed_array_filled_by_element_releases_the_later_element_first() -> Result<(), TestError> {
+    reset();
+    {
+        mut arr: [Pair; 2];
+        arr[0] = pair(1, 2);
+        arr[1] = pair(3, 4);
+    }
+    return expect_eq(g_log, 3412);
+}
+
+![test]
+function destructor_body_runs_before_its_fields() -> Result<(), TestError> {
+    reset();
+    { mut _o: Owner = Owner { kept: Probe { tag: 1 }, maybe: Option::Some(Probe { tag: 2 }) }; }
+    expect_eq(g_log, 912)?;
+    reset();
+    { mut _o: Owner = Owner { kept: Probe { tag: 1 }, maybe: Option::None }; }
+    return expect_eq(g_log, 91);
+}
+
+/// Each element is released by its destructor and then its own fields'
+/// glue, in index order, through the container's destructor.
+![test]
+function container_elements_release_in_index_order() -> Result<(), TestError> {
+    reset();
+    {
+        mut xs: Array<Owner> = Array::<Owner>::new();
+        xs.push(Owner { kept: Probe { tag: 1 }, maybe: Option::Some(Probe { tag: 2 }) });
+        xs.push(Owner { kept: Probe { tag: 3 }, maybe: Option::None });
+    }
+    return expect_eq(g_log, 91293);
+}
+
+![test]
+function recursive_type_releases_through_its_box() -> Result<(), TestError> {
+    reset();
+    {
+        mut _c: Chain = Chain::Link(Probe { tag: 1 },
+            Box::new(Chain::Link(Probe { tag: 2 }, Box::new(Chain::End))));
+    }
+    return expect_eq(g_log, 12);
+}
+
+function release_a_pair(first: i64, second: i64) -> void {
+    mut _p: Pair = pair(first, second);
+}
+
+function release_a_shape(first: i64, second: i64, third: i64) -> void {
+    mut _s: Shape = Shape::Nested(pair(first, second), Probe { tag: third });
+}
+
+![test]
+function one_type_released_at_many_sites_releases_each_value_once() -> Result<(), TestError> {
+    reset();
+    release_a_pair(1, 2);
+    { mut _p: Pair = pair(3, 4); }
+    release_a_shape(5, 6, 7);
+    release_a_pair(8, 9);
+    return expect_eq(g_log, 123456789);
+}
+
+/// Unwinds with two owning locals live; their releases run in the cleanup
+/// pad, the later local first.
+function unwinds_through_owning_locals() -> i64 {
+    const p: Pair = pair(3, 4);
+    const o: Option<Pair> = Option::Some(pair(1, 2));
+    if (p.first.tag == 3 && o.is_some()) {
+        intrinsics::panic("unwinding through owned values", intrinsics::location());
+    }
+    return 0;
+}
+
+![test]
+function unwinding_releases_each_live_value_once() -> Result<(), TestError> {
+    reset();
+    const outcome: Result<i64, PanicInfo> = catch_unwind::<i64>(unwinds_through_owning_locals);
+    expect_true(outcome.is_err(), Str::new("the panic must reach catch_unwind"))?;
+    return expect_eq(g_log, 1234);
+}

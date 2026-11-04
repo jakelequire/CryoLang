@@ -34,6 +34,7 @@ import compiler::ast::{
 };
 import compiler::lex;
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, mangled_name };
+import std::collections::hashmap::{ HashMap };
 import std::collections::pair::{ Pair };
 import std::ffi::libc;
 import std::fmt;
@@ -68,7 +69,7 @@ import compiler::types::generic_registry::{ GenericRegistry };
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::types::ownership::{ OwnershipQuery };
 import compiler::types::type_base::{ Type };
-import compiler::types::type_ref::{ TypeRef };
+import compiler::types::type_ref::{ TypeKey, TypeRef };
 import compiler::types::user_defined::{
     EnumType, EnumVariantInfo, FieldInfo, StructType
 };
@@ -85,13 +86,27 @@ type struct CallEmitter {
     /// payload pointers during drop-glue expansion (see emit_enum_drop_glue).
     glue_seq:     i64;
 
+    /// This module's drop glue: one internal function per released type,
+    /// called from every site that releases a value of it.  `drop_glue_index`
+    /// answers a type's position in the two parallel lists; bodies are
+    /// written after the module's own functions, in that order, and
+    /// `drop_glue_written` counts the ones written so far.
+    drop_glue_index:     HashMap<TypeKey, i64>;
+    drop_glue_types:     [TypeRef];
+    drop_glue_functions: [LValue];
+    drop_glue_written:   i64;
+
     static null() -> CallEmitter {
         return CallEmitter {
-            cg:           null,
-            state:        null,
-            dispatch:     null,
-            enum_variant: null,
-            glue_seq:     0,
+            cg:                  null,
+            state:               null,
+            dispatch:            null,
+            enum_variant:        null,
+            glue_seq:            0,
+            drop_glue_index:     HashMap::<TypeKey, i64>::new(),
+            drop_glue_types:     [],
+            drop_glue_functions: [],
+            drop_glue_written:   0,
         };
     }
 
@@ -1302,11 +1317,12 @@ type struct CallEmitter {
         return ct.as_function();
     }
 
-    /// Drop-glue expansion for an aggregate with no user-written `drop`.
-    /// Returns true when the receiver type is a kind glue handles, so the
-    /// caller suppresses the "no method" error.  Structs recurse
-    /// into each droppable field in place; other aggregate kinds are not yet
-    /// expanded and return true as a no-op (keeping today's behavior).
+    /// The release of an aggregate with no destructor of its own, or of a
+    /// destructor's type's fields after the destructor returns: a call, on
+    /// the receiver's place, to the type's drop glue (`drop_glue_function`).
+    /// Returns true when the receiver's type is a kind glue handles, so the
+    /// caller suppresses the "no method" error; a type none of whose parts
+    /// owns anything is released by no call at all.
     emit_drop_glue(mut &this, visitor: mut IRGeneratorVisitor*, receiver: mut ExpressionNode*,
                    ty: TypeRef) -> boolean {
         const arena: TypeArena* = this.cg.get_arena();
@@ -1324,34 +1340,159 @@ type struct CallEmitter {
             guard = guard + 1;
         }
         if (t == null) { return false; }
+        if (!this.has_droppable_parts(t)) { return true; }
 
+        // Glue releases in place, through the receiver's own storage: a part
+        // it releases is nulled where it lives, so a later release of the
+        // same storage finds nothing.
+        const emitted: Emitted = this.dispatch.generate_expression(visitor, receiver);
+        if (!emitted.value.is_valid()) { return true; }
+        if (!emitted.is_lvalue) {
+            mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                "internal: the value this release drops has no storage of its own; every release the compiler builds names a place");
+            diag = diag.at(receiver.span);
+            this.cg.diag.emit(diag);
+            return true;
+        }
+        this.call_drop_glue(visitor, this.drop_glue_function(cur), emitted.value);
+        return true;
+    }
+
+    /// Whether a value of `t` (a peeled type) owns anything its drop glue
+    /// would release: a struct field, a variant payload, a fixed array's
+    /// element or a tuple element whose type needs drop.  Any other kind owns
+    /// nothing - a user-written `T?` is `Option<T>`, an enum.
+    has_droppable_parts(&this, t: Type*) -> boolean {
+        const arena: TypeArena* = this.cg.get_arena();
+        const registry: GenericRegistry* = this.cg.ctx.generic_registry;
+        const intern: mut InternTable* = this.cg.get_intern();
         if (t.kind == TypeKind::Struct) {
             const st: StructType* = t.as_struct();
-            this.emit_field_drops(visitor, receiver, st.fields);
-            return true;
+            for (mut i: i64 = 0; i < st.fields.length(); i++) {
+                if (OwnershipQuery::needs_drop(arena, registry, intern, st.fields[i].field_type)) {
+                    return true;
+                }
+            }
+            return false;
         }
         if (t.kind == TypeKind::Enum) {
             const et: EnumType* = t.as_enum();
-            this.emit_enum_drop_glue(visitor, receiver, et, cur);
-            return true;
+            if (et.is_simple_enum()) { return false; }
+            for (mut vi: i64 = 0; vi < et.variants.length(); vi++) {
+                if (OwnershipQuery::any_needs_drop(arena, registry, intern,
+                        et.variants[vi].payload_types, 0)) {
+                    return true;
+                }
+            }
+            return false;
         }
         if (t.kind == TypeKind::Array) {
             const at: ArrayType* = t.as_array();
-            // A fixed array owns its elements in place: drop each.
-            if (OwnershipQuery::needs_drop(arena, this.cg.ctx.generic_registry,
-                                           this.cg.get_intern(), at.element)) {
-                this.emit_fixed_array_drops(visitor, receiver, at);
-            }
-            return true;
+            return at.size > 0 && OwnershipQuery::needs_drop(arena, registry, intern, at.element);
         }
         if (t.kind == TypeKind::Tuple) {
             const tt: TupleType* = t.as_tuple();
-            this.emit_tuple_element_drops(visitor, receiver, tt);
-            return true;
+            for (mut i: i64 = 0; i < tt.elements.length(); i++) {
+                if (OwnershipQuery::needs_drop(arena, registry, intern, tt.elements[i])) {
+                    return true;
+                }
+            }
+            return false;
         }
-        // User-written `T?` desugars to Option<T> (an Enum, handled above), so
-        // no Optional type reaches here; anything else that does owns nothing.
-        return true;
+        return false;
+    }
+
+    /// The drop glue of `glue_type` (a peeled type with droppable parts) in
+    /// this module: `void (ptr)`, releasing in place every droppable part of
+    /// the value its argument points at.  Declared on first use; its body is
+    /// written by `emit_drop_glue_bodies`.  Internal, so every module that
+    /// releases the type holds its own copy, which no other module links
+    /// against.
+    drop_glue_function(mut &this, glue_type: TypeRef) -> LValue {
+        match (this.drop_glue_index.get(&glue_type.table_key())) {
+            Option::Some(k) => { return this.drop_glue_functions[k]; }
+            Option::None    => { }
+        }
+        const k: i64 = this.drop_glue_types.length();
+        const param_buf: mut void* = libc::malloc(8);
+        const param_tys: mut (mut void*)* = param_buf as mut (mut void*)*;
+        param_tys[0] = LType::pointer_to(LType::i8()).raw;
+        const fn_ty: LType = LType::function_type(LType::void_type(), param_buf, 1, false);
+        libc::free(param_buf);
+        const fn_val: LValue = this.cg.llvm_module.add_function(
+            MangledName::new(fmt::format("__cryo.drop.%ld", k)), fn_ty);
+        fn_val.set_linkage(LLinkage::Internal);
+        this.drop_glue_index.insert(glue_type.table_key(), k);
+        this.drop_glue_types.push(glue_type);
+        this.drop_glue_functions.push(fn_val);
+        return fn_val;
+    }
+
+    /// Call the drop glue `glue` on `place`.  While an enclosing call's
+    /// argument temporaries are live, a release that unwinds must drop them
+    /// too, so the call is an `invoke` into a pad that does.
+    call_drop_glue(mut &this, visitor: mut IRGeneratorVisitor*, glue: LValue, place: LValue) -> void {
+        const fn_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(glue.raw) };
+        const arg_buf: mut void* = libc::malloc(8);
+        const arg_slots: mut (mut void*)* = arg_buf as mut (mut void*)*;
+        arg_slots[0] = place.raw;
+        const cur_fn: LValue = this.get_current_function();
+        if (this.cg.ctx.options.unwinds() && this.cg.expr_ops.has_live_arg_temps() && cur_fn.is_valid()) {
+            const cont_bb: LBasicBlock = LBasicBlock::append(cur_fn, "invoke.cont");
+            const lpad_bb: LBasicBlock = LBasicBlock::append(cur_fn, "invoke.lpad");
+            this.cg.expr_ops.invoke_active = true;
+            this.cg.expr_ops.invoke_normal = cont_bb;
+            this.cg.expr_ops.invoke_lpad   = lpad_bb;
+            this.cg.expr_ops.build_call_maybe_invoke(fn_ty, glue, arg_buf, 1, "");
+            mut no_locals: [Stmt*] = [];
+            this.cg.expr_ops.emit_cleanup_landingpad_sched(visitor, &no_locals, cur_fn, lpad_bb);
+        } else {
+            this.cg.builder.build_call(fn_ty, glue, arg_buf, 1, "");
+        }
+        libc::free(arg_buf);
+    }
+
+    /// Write the body of every drop glue declared so far, including the
+    /// glue those bodies declare in turn.  Answers whether it wrote any, so
+    /// the module's last pass can tell when nothing is left to write.  Each
+    /// body is the in-place release of the value at its parameter, built
+    /// from the same `.drop()` lowering a release site uses, so a part with
+    /// a destructor calls it and a part without one calls its own glue.
+    emit_drop_glue_bodies(mut &this, visitor: mut IRGeneratorVisitor*) -> boolean {
+        const wrote: boolean = this.drop_glue_written < this.drop_glue_types.length();
+        while (this.drop_glue_written < this.drop_glue_types.length()) {
+            const k: i64 = this.drop_glue_written;
+            this.drop_glue_written = k + 1;
+            const glue_type: TypeRef = this.drop_glue_types[k];
+            const fn_val: LValue = this.drop_glue_functions[k];
+            this.cg.builder.position_at_end(LBasicBlock::append(fn_val, "entry"));
+            // The function has no source of its own, so no debug location
+            // from the last body emitted may reach it.
+            if (this.cg.debug_info.is_on()) {
+                llvm::LLVMSetCurrentDebugLocation2(this.cg.builder.raw, null);
+            }
+            this.cg.values.push_scope();
+            const span: SourceSpan = SourceSpan::none();
+            const value_sym: SymbolID = this.cg.ctx.resolver.alloc_synthetic_binding();
+            this.cg.values.set(value_sym, LValue { raw: llvm::LLVMGetParam(fn_val.raw, 0) });
+            const value: mut ExpressionNode* = ExpressionNode::identifier_expr(
+                this.cg.get_intern().intern("value"), span);
+            ExpressionNode::identifier_of(value).set_res(Res::Local(value_sym));
+            value.set_resolved_type(glue_type);
+            const t: Type* = this.cg.get_arena().lookup(glue_type);
+            if (t.kind == TypeKind::Struct) {
+                this.emit_field_drops(visitor, value, t.as_struct().fields);
+            } else if (t.kind == TypeKind::Enum) {
+                this.emit_enum_drop_glue(visitor, value, t.as_enum(), glue_type);
+            } else if (t.kind == TypeKind::Array) {
+                this.emit_fixed_array_drops(visitor, value, t.as_array());
+            } else if (t.kind == TypeKind::Tuple) {
+                this.emit_tuple_element_drops(visitor, value, t.as_tuple());
+            }
+            this.cg.values.pop_scope();
+            this.cg.builder.build_ret_void();
+        }
+        return wrote;
     }
 
     /// Drop each owning element of a tuple in place via synthesized

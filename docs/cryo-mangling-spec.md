@@ -128,6 +128,14 @@ function a table's first word points at, releasing the value, is internal to
 the table's module and named `__cryo.release.` followed by the table's symbol;
 it is no mangled symbol, and no other module links against it.
 
+A type with no `Drop` implementation of its own that owns something through
+its fields, variant payloads or elements is released by its drop glue: a
+function of the value's address, defined once in each module that releases a
+value of the type and called from every such release. It is internal to that
+module and named `__cryo.drop.` followed by a number the module assigns in the
+order it first releases each type; like the release function above, it is no
+mangled symbol, and no other module links against it.
+
 A trait's default that an object's table cannot hold (`map`, `filter`, `take` of
 `Iterator`), compiled for an object a bound is met by, is a plain method and
 carries no tag. Its path is the trait's, then one segment that is the object

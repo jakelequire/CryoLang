@@ -148,6 +148,10 @@ type struct IRGeneratorVisitor {
     /// block, method body).
     decl_visit: DeclVisitEmitter;
 
+    /// How many of the resolver's queued `![inline]` copies have bodies in
+    /// this module (see `emit_inline_copies`).
+    inline_copies_written: i64;
+
     static new(cg: mut CodegenContext*) -> IRGeneratorVisitor {
         return IRGeneratorVisitor {
             cg:           cg,
@@ -162,6 +166,7 @@ type struct IRGeneratorVisitor {
             bin_un:       BinaryUnaryEmitter::null(),
             places:       PlaceEmitter::null(),
             decl_visit:   DeclVisitEmitter::null(),
+            inline_copies_written: 0,
         };
     }
 
@@ -326,6 +331,12 @@ type struct IRGeneratorVisitor {
 
         this.emit_inline_copies();
         this.decl_visit.emit_global_initializers(this);
+        // Drop glue last: every release site is written by now.  A glue body
+        // may call a destructor whose inline copy is not yet queued, and an
+        // inline copy may release a type whose glue is not yet declared.
+        while (this.calls.emit_drop_glue_bodies(this)) {
+            this.emit_inline_copies();
+        }
         return true;
     }
 
@@ -333,12 +344,12 @@ type struct IRGeneratorVisitor {
     /// defines and this one calls, `available_externally`: the optimizer
     /// inlines it and discards it, and the defining module's definition
     /// answers any call left.  A copy's own calls may queue more copies.
+    /// Each queued copy is written once, however often this is called.
     emit_inline_copies(mut &this) -> void {
         const di: DeclarationIndex* = this.cg.ctx.decl_index;
-        mut k: i64 = 0;
-        while (k < this.cg.resolver.inline_copies.length()) {
-            const id: OverloadId = this.cg.resolver.inline_copies[k];
-            k += 1;
+        while (this.inline_copies_written < this.cg.resolver.inline_copies.length()) {
+            const id: OverloadId = this.cg.resolver.inline_copies[this.inline_copies_written];
+            this.inline_copies_written += 1;
             match (di.inline_body(id)) {
                 Option::Some(body) => {
                     const d: DeclarationNode* = di.entry_decl(id);
