@@ -891,6 +891,8 @@ const n: int    = identity::<int>(42);
 const s: string = identity::<string>("hello");
 ```
 
+Without the turbofish the type arguments are inferred from the arguments: each argument's type is matched against its parameter's, part by part, through references, pointers, instantiations, function types, fixed arrays of the same length and tuples of the same arity. With `third<T>(values: &[T; 3])` and `values: [u64; 3]`, `third(&values)` calls `third::<u64>`; with `second_of<T>(pair: (i32, T))` and `pair: (i32, u64)`, `second_of(pair)` calls `second_of::<u64>`. A tuple's positions are read in a generic body whatever its elements are: `pair.1` there is a `T`.
+
 Each call produces a fully specialised version of the function. See [section 11.6 Monomorphisation](#116-monomorphisation).
 
 In expression position `<` opens generic arguments **only immediately after `::`**; anywhere else it is the comparison operator. So `identity::<int>(42)`, `Array::<int>::new()`, `Pair::<int, int> { first: 1, second: 2 }`, `obj.method::<T>(x)` and `Scope::method::<T>(x)` name a specialization, while `g(LIMIT < x, MAXV > (y))` is two comparisons whatever `LIMIT` and `MAXV` are - the same text never means two things by where its names were declared. Every `::` after the arguments is an ordinary path step. Type position is unaffected: `Array<int>` in an annotation, a `where` bound or a `static match` arm, and `new Array<int>(..)`, are written as before, because a `<` after a type name is never a comparison.

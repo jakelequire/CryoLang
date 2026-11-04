@@ -124,27 +124,10 @@ type struct MemberResolver {
         const obj_type: TypeRef = visitor.resolve_receiver(member.object);
         if (!obj_type.is_valid()) { return TypeRef::invalid(); }
 
-        // Symbolic walk: a `void`/abstract receiver is unresolved, not
-        // fieldless - except the abstract generic owner itself (`this.value`
-        // in a `Box<T>` method), whose fields its template declares, and an
-        // instantiation not yet minted (`node.key` on an `Entry<K, V>*`),
-        // whose field is its template's seen through the arguments.  A call
-        // on such a field (`node.key.equals(key)` under `where K: Eq`) is
-        // typed, and so directed by the bound, where it is written.
-        const unresolved: boolean = this.symbolic.symbolic_type_unresolved(obj_type);
-        if (unresolved && !this.symbolic.symbolic_is_generic_owner_receiver(obj_type)) {
-            const through: FieldAnswer = this.field_of(obj_type, member.member);
-            if (!through.found()) {
-                const param: GenericParamType* = this.binding.receiver_type_param(obj_type);
-                if (param != null) { this.report_param_receiver_field(member_e, member, param); }
-                return TypeRef::invalid();
-            }
-            this.pin_field(member, &through,
-                if (member.member_span.has_location()) { member.member_span } else { member_e.span });
-            return this.field_read_type(visitor, member.object, obj_type, &through);
-        }
-
-        // Tuple positional access (`t.0`); walks past pointer/reference/inst wrappers.
+        // Tuple positional access (`t.0`); walks past pointer/reference/inst
+        // wrappers.  A position is the tuple's whatever its elements are, so
+        // `pair.1` on a `(i32, T)` is answered, and pinned, in a generic body
+        // too: the instance's body carries the pin the template's walk set.
         mut walk_ty: TypeRef = obj_type;
         mut walk_t: Type* = this.arena.lookup(walk_ty);
         mut depth: i32 = 0;
@@ -191,6 +174,27 @@ type struct MemberResolver {
             member.set_resolved_member(MemberPin::Field(idx));
             return tup.elements[idx];
         }
+
+        // Symbolic walk: a `void`/abstract receiver is unresolved, not
+        // fieldless - except the abstract generic owner itself (`this.value`
+        // in a `Box<T>` method), whose fields its template declares, and an
+        // instantiation not yet minted (`node.key` on an `Entry<K, V>*`),
+        // whose field is its template's seen through the arguments.  A call
+        // on such a field (`node.key.equals(key)` under `where K: Eq`) is
+        // typed, and so directed by the bound, where it is written.
+        const unresolved: boolean = this.symbolic.symbolic_type_unresolved(obj_type);
+        if (unresolved && !this.symbolic.symbolic_is_generic_owner_receiver(obj_type)) {
+            const through: FieldAnswer = this.field_of(obj_type, member.member);
+            if (!through.found()) {
+                const param: GenericParamType* = this.binding.receiver_type_param(obj_type);
+                if (param != null) { this.report_param_receiver_field(member_e, member, param); }
+                return TypeRef::invalid();
+            }
+            this.pin_field(member, &through,
+                if (member.member_span.has_location()) { member.member_span } else { member_e.span });
+            return this.field_read_type(visitor, member.object, obj_type, &through);
+        }
+
         // A trait object reaches its value only through the trait's methods;
         // the value's fields are not known where the object is used.
         if (walk_t != null && walk_t.kind == TypeKind::Object) {
