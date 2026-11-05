@@ -423,7 +423,7 @@ else
 pin: pin-linux-impl pin-windows-impl
 
 pin-linux-impl: cryo
-	@$(PYTHON) scripts/cryo-pin.py --source "$(STAGE2)" --pin "$(PIN)"
+	@$(PYTHON) scripts/cryo-pin.py --source "$(STAGE2)" --pin "$(PIN)" --stamp-profile=$(CRYO_PROFILE)
 
 pin-windows-impl:
 	@if command -v $(MINGW_GCC) >/dev/null 2>&1 && [ -f "$(WIN_LLVM_LIB)" ] && [ -f "$(WIN_CLANG_LIB)" ]; then \
@@ -438,7 +438,8 @@ pin-windows-impl:
 	fi
 
 _pin-windows-do: cryo-exe
-	@$(PYTHON) scripts/cryo-pin.py --source "$(STAGE2_EXE)" --pin "$(PIN_EXE)" --strip-tool $(MINGW_STRIP)
+	@$(PYTHON) scripts/cryo-pin.py --source "$(STAGE2_EXE)" --pin "$(PIN_EXE)" --strip-tool $(MINGW_STRIP) \
+		--stamper "$(STAGE2)" --stamp-profile=$(CRYO_PROFILE)
 	@cp -f "$(WIN_LLVM_DLL)" "$(ROOT)/bin/LLVM-C.dll" 2>/dev/null \
 		&& echo "==> Runtime LLVM-C.dll copied to bin/ (gitignored)" || true
 	@cp -f "$(WIN_CLANG_DLL)" "$(ROOT)/bin/libclang.dll" 2>/dev/null \

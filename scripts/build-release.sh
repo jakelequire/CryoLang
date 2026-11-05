@@ -217,11 +217,13 @@ build_linux() {
 
     local out="${ROOT}/compiler/build/release-static/cryo"
     [ -x "$out" ] || { echo "error: static cryo not produced at $out" >&2; exit 1; }
-    # The checkout it was built from, for `cryo version`; `make cryo` and
-    # `make cryo-exe` stamp the binaries they link the same way.
-    ( cd "$ROOT" && "${ROOT}/bin/cryo" stamp "$out" --profile=release )
     cp "$out" "${stage}/bin/cryo"
     strip "${stage}/bin/cryo" 2>/dev/null || true
+    # The checkout it was built from, for `cryo version`; `make cryo` and
+    # `make cryo-exe` stamp the binaries they link the same way.  Stamped
+    # after stripping: the stamp records the size and digest of the bytes
+    # that ship, which the compiler then reads instead of hashing itself.
+    ( cd "$ROOT" && "${ROOT}/bin/cryo" stamp "${stage}/bin/cryo" --profile=release )
 
     # Confirm it really is fully static: no libLLVM runtime dep, and no
     # dynamic loader at all (glibc ldd: "not a dynamic executable";

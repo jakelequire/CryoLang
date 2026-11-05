@@ -15,7 +15,8 @@ Usage:
 
 Exit codes:
     0  pin refreshed
-    1  source binary missing or copy/strip failed
+    1  source binary missing, copy/strip failed, or the stripped pin could
+       not be stamped again
 """
 
 import argparse
@@ -102,6 +103,21 @@ def strip_binary(path: Path, tool: str = "strip") -> bool:
     return r.returncode == 0
 
 
+def restamp(path: Path, stamper: Path, profile: str) -> bool:
+    # `cryo stamp` records the binary's size and the digest of its bytes
+    # with the stamp read as zeros; a compiler whose recorded size matches
+    # its own reads that digest instead of hashing itself on every run.
+    # Stripping rewrites the bytes after `make cryo` stamped them, so the
+    # stripped pin is stamped again, by a compiler of the same source.
+    excludes = ",".join(spec[2:] for spec in _PIN_OUTPUTS)
+    r = subprocess.run(
+        [str(stamper), "stamp", str(path), f"--profile={profile}",
+         f"--exclude={excludes}"],
+        cwd=str(ROOT),
+    )
+    return r.returncode == 0
+
+
 def write_sidecar(pin: Path, source: Path, stripped: bool) -> Path:
     sidecar = pin.with_suffix(pin.suffix + ".pin.txt") if pin.suffix else pin.parent / (pin.name + ".pin.txt")
     size = pin.stat().st_size
@@ -158,6 +174,12 @@ def main() -> int:
     ap.add_argument("--strip-tool", default="strip",
                     help="strip executable to use (default: strip; for a "
                          "Windows .exe pass x86_64-w64-mingw32-strip)")
+    ap.add_argument("--stamper", type=Path, default=None,
+                    help="a runnable compiler of the same source; stamps the "
+                         "pin again after stripping (default: the source "
+                         "binary)")
+    ap.add_argument("--stamp-profile", default="release",
+                    help="the profile the stamp records (default: release)")
     args = ap.parse_args()
 
     source: Path = args.source
@@ -178,6 +200,12 @@ def main() -> int:
         if not stripped:
             print(f"    (warning: '{args.strip_tool}' unavailable or failed; "
                   f"binary not stripped)", file=sys.stderr)
+    if stripped:
+        stamper = args.stamper if args.stamper is not None else source
+        if not restamp(pin, stamper, args.stamp_profile):
+            print(f"ERROR: {stamper} could not stamp the stripped {pin}",
+                  file=sys.stderr)
+            return 1
 
     sidecar = write_sidecar(pin, source, stripped)
 
