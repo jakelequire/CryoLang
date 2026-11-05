@@ -285,6 +285,52 @@ type struct LModule {
         return llvm::LLVMOffsetOfElement(td, ty.raw, idx);
     }
 
+    /// Remove the functions and data local to this module that nothing
+    /// refers to, until none is left: removing one can leave what only it
+    /// referred to unused.
+    remove_unreferenced_locals(&this) -> void {
+        mut removed: boolean = true;
+        while (removed) {
+            removed = false;
+            mut f: mut void* = llvm::LLVMGetFirstFunction(this.raw);
+            while (f != null) {
+                const next_function: mut void* = llvm::LLVMGetNextFunction(f);
+                const candidate: LValue = LValue { raw: f };
+                if (candidate.is_local() && llvm::LLVMGetFirstUse(f) == null) {
+                    llvm::LLVMDeleteFunction(f);
+                    removed = true;
+                }
+                f = next_function;
+            }
+            mut g: mut void* = llvm::LLVMGetFirstGlobal(this.raw);
+            while (g != null) {
+                const next_global: mut void* = llvm::LLVMGetNextGlobal(g);
+                const candidate: LValue = LValue { raw: g };
+                if (candidate.is_local() && llvm::LLVMGetFirstUse(g) == null) {
+                    llvm::LLVMDeleteGlobal(g);
+                    removed = true;
+                }
+                g = next_global;
+            }
+        }
+    }
+
+    /// Whether this module defines any function or global, and so has an
+    /// object worth emitting.
+    defines_anything(&this) -> boolean {
+        mut f: mut void* = llvm::LLVMGetFirstFunction(this.raw);
+        while (f != null) {
+            if (llvm::LLVMGetFirstBasicBlock(f) != null) { return true; }
+            f = llvm::LLVMGetNextFunction(f);
+        }
+        mut g: mut void* = llvm::LLVMGetFirstGlobal(this.raw);
+        while (g != null) {
+            if (llvm::LLVMGetInitializer(g) != null) { return true; }
+            g = llvm::LLVMGetNextGlobal(g);
+        }
+        return false;
+    }
+
     get_named_function(&this, name: MangledName) -> LValue {
         return LValue { raw: llvm::LLVMGetNamedFunction(this.raw, name.as_string()) };
     }
@@ -852,6 +898,77 @@ type struct LValue {
 
     set_linkage(&this, linkage: LLinkage) -> void {
         llvm::LLVMSetLinkage(this.raw, linkage as i32);
+    }
+
+    /// A global's or function's name, in LLVM's own storage: valid while the
+    /// value lives.
+    name(&this) -> string {
+        return llvm::LLVMGetValueName(this.raw) as string;
+    }
+
+    /// Whether this global or function is local to its object: internal or
+    /// private, so no other object links against it.
+    is_local(&this) -> boolean {
+        const linkage: i32 = llvm::LLVMGetLinkage(this.raw);
+        return linkage == LLinkage::Internal as i32 || linkage == LLinkage::Private as i32;
+    }
+
+    /// Whether this function or global is defined here - has a body or an
+    /// initializer - and another object can link against it: neither local
+    /// to its object nor a copy the optimizer may only read.
+    is_linkable_definition(&this) -> boolean {
+        const linkage: i32 = llvm::LLVMGetLinkage(this.raw);
+        const defined: boolean = if (llvm::LLVMIsAFunction(this.raw) != null) {
+            llvm::LLVMGetFirstBasicBlock(this.raw) != null
+        } else {
+            llvm::LLVMGetInitializer(this.raw) != null
+        };
+        return defined && !this.is_local()
+            && linkage != LLinkage::AvailableExternally as i32
+            && linkage != LLinkage::Appending as i32;
+    }
+
+    /// Turn this function or global's definition into a declaration of the
+    /// same symbol, for another object to define.  A body's instructions
+    /// have their values replaced first, so erasing them leaves no use of
+    /// one behind, and its blocks go once no branch names them.
+    make_declaration(&this) -> void {
+        if (llvm::LLVMIsAFunction(this.raw) != null) {
+            mut block: mut void* = llvm::LLVMGetFirstBasicBlock(this.raw);
+            while (block != null) {
+                mut inst: mut void* = llvm::LLVMGetFirstInstruction(block);
+                while (inst != null) {
+                    const ty: mut void* = llvm::LLVMTypeOf(inst);
+                    if (LType::kind_of(ty) != LTypeKind::Void) {
+                        llvm::LLVMReplaceAllUsesWith(inst, llvm::LLVMGetUndef(ty));
+                    }
+                    inst = llvm::LLVMGetNextInstruction(inst);
+                }
+                block = llvm::LLVMGetNextBasicBlock(block);
+            }
+            block = llvm::LLVMGetFirstBasicBlock(this.raw);
+            while (block != null) {
+                mut inst: mut void* = llvm::LLVMGetFirstInstruction(block);
+                while (inst != null) {
+                    const next_inst: mut void* = llvm::LLVMGetNextInstruction(inst);
+                    llvm::LLVMInstructionEraseFromParent(inst);
+                    inst = next_inst;
+                }
+                block = llvm::LLVMGetNextBasicBlock(block);
+            }
+            block = llvm::LLVMGetFirstBasicBlock(this.raw);
+            while (block != null) {
+                const next_block: mut void* = llvm::LLVMGetNextBasicBlock(block);
+                llvm::LLVMDeleteBasicBlock(block);
+                block = next_block;
+            }
+            llvm::LLVMSetPersonalityFn(this.raw, null);
+            llvm::LLVMSetSubprogram(this.raw, null);
+        } else {
+            llvm::LLVMSetInitializer(this.raw, null);
+        }
+        this.set_linkage(LLinkage::External);
+        llvm::LLVMSetComdat(this.raw, null);
     }
 
     /// Add a clause to a `landingpad` value: `clause_val` is a type-info

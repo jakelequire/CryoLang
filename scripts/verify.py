@@ -24,7 +24,12 @@ Then it hashes the objects the census and the examples sweep compiled - the
 same population the object comparison has always used (every `.o` under a
 `build/` directory in tests/, and under examples/*/build) - from the runs that
 produced them.  A separate hashing run would compile the whole suite a second
-time to produce byte-identical objects.
+time to produce byte-identical objects.  The stdlib archives those programs
+link (`stdlib/.bin/<triple>/prebuilt/`, built by the compiler that links them)
+are a third population, cleared before each run and named by target and
+stdlib root so two compilers' archives line up; a stdlib module's object that
+only the baseline has, when the tree's programs link an archive, is counted as
+replaced by the archive rather than as missing.
 
 `--baseline REV` compares those objects against the ones a baseline compiler
 produces over the SAME population: a compiler built from REV's compiler/src
@@ -109,6 +114,9 @@ GATES = {
 }
 # The gates whose objects are compared.  A baseline run needs only these.
 POPULATION_GATES = ("census", "examples")
+# The object populations hashed: what the census and the examples sweep
+# compile, and the stdlib archives their programs link.
+POPULATIONS = ("tests", "examples", "stdlib")
 
 
 def rel(p):
@@ -160,19 +168,64 @@ def build_dirs():
     return out
 
 
+def prebuilt_dirs():
+    """Every directory holding prebuilt stdlib archives, one per target."""
+    bin_dir = os.path.join(ROOT, "stdlib", ".bin")
+    if not os.path.isdir(bin_dir):
+        return []
+    return [os.path.join(bin_dir, t, "prebuilt") for t in sorted(os.listdir(bin_dir))
+            if os.path.isdir(os.path.join(bin_dir, t, "prebuilt"))]
+
+
 def wipe_population():
-    for d in build_dirs():
+    # The stdlib archives programs link are built by the compiler that links
+    # them, so a run's archives are its own only when none is left over.
+    for d in build_dirs() + prebuilt_dirs():
         shutil.rmtree(d, ignore_errors=True)
-    left = build_dirs()
+    left = build_dirs() + prebuilt_dirs()
     if left:
         raise SystemExit("verify: could not clear %s; a warm build compiles "
                          "nothing and hashes stale objects" % rel(left[0]))
 
 
-def hash_objects(base, out_path):
-    """sha256 of every .o under a build/ directory below `base`; returns the count."""
+def prebuilt_rows():
+    """sha256 rows of every object in the stdlib archives the run built, each
+    named by its target, the stdlib root its manifest was keyed with (the
+    census and the examples spell it differently) and its path in the build,
+    so two compilers' archives line up whatever their keys."""
     rows = []
-    for dirpath, _, files in os.walk(os.path.join(ROOT, base)):
+    labels = {}
+    for pre in prebuilt_dirs():
+        triple = os.path.basename(os.path.dirname(pre))
+        for key in sorted(os.listdir(pre)):
+            home = os.path.join(pre, key)
+            manifest = os.path.join(home, "stdlib.manifest")
+            if not os.path.isfile(manifest):
+                continue
+            with io.open(manifest, encoding="utf-8", errors="replace") as fh:
+                head = fh.read(4096).splitlines()
+            root = next((l[5:].strip() for l in head if l.startswith("root ")), "?")
+            options = next((l[8:].strip() for l in head if l.startswith("options ")), "?")
+            label = "stdlib-archive/%s/%s" % (triple, re.sub(r"[^\w.-]+", "_", root + " " + options))
+            if label in labels:
+                raise SystemExit("verify: two stdlib archives, %s and %s, record the same root and "
+                                 "options; their objects cannot be told apart"
+                                 % (rel(labels[label]), rel(home)))
+            labels[label] = home
+            for dirpath, _, files in os.walk(home):
+                for f in files:
+                    if f.endswith(".o"):
+                        p = os.path.join(dirpath, f)
+                        rows.append("%s  %s/%s" % (file_sha(p), label,
+                                                   os.path.relpath(p, home).replace(os.sep, "/")))
+    return rows
+
+
+def hash_objects(base, out_path):
+    """sha256 of every .o under a build/ directory below `base`, or of the
+    stdlib archives' objects when `base` is "stdlib"; returns the count."""
+    rows = []
+    for dirpath, _, files in os.walk(os.path.join(ROOT, base)) if base != "stdlib" else ():
         parts = rel(dirpath).split("/")
         if "build" not in parts:
             continue
@@ -180,6 +233,8 @@ def hash_objects(base, out_path):
             if f.endswith(".o"):
                 p = os.path.join(dirpath, f)
                 rows.append("%s  %s" % (file_sha(p), rel(p)))
+    if base == "stdlib":
+        rows = prebuilt_rows()
     rows.sort(key=lambda r: r[66:])
     with io.open(out_path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write("\n".join(rows) + ("\n" if rows else ""))
@@ -233,7 +288,7 @@ def population(cryo, tag, logdir, env, names):
     wipe_population()
     results = run_gates(names, cryo, logdir, env)
     counts = {}
-    for base in ("tests", "examples"):
+    for base in POPULATIONS:
         counts[base] = hash_objects(base, os.path.join(logdir, "%s.%s.sha256" % (tag, base)))
     return results, counts
 
@@ -649,6 +704,12 @@ def selftest():
          [] if declarations_between("p b\n", "p a\n") == {"p": "b"} else ["bad"], 0),
         ("declarations: a removed line declares nothing",
          [] if declarations_between("", "p a\n") == {} else ["bad"], 0),
+        ("archive: a stdlib object the tree takes from the archive",
+         split_replaced(["p/build/x/std/deps/std/io.o"], True)[1], 0),
+        ("archive: a program's own object missing from the tree",
+         split_replaced(["p/build/x/local/deps/main.o"], True)[1], 1),
+        ("archive: a stdlib object missing when no archive was linked",
+         split_replaced(["p/build/x/std/deps/std/io.o"], False)[1], 1),
     ]
     bad = 0
     for label, problems, want in cases:
@@ -681,7 +742,18 @@ def judge_unit_moves(suffixes, a, b):
     return problems
 
 
-def compare(tag_a, a_path, b_path, limit, excluded=(), units=None, problems=None):
+def split_replaced(only_baseline, replaced_by_archive):
+    """(replaced, still only-baseline): a stdlib module's object only the
+    baseline has is one whose every definition the tree's program takes from
+    the stdlib archive - when the tree's programs link one - and the
+    archive's objects are compared as their own population.  Any other
+    object only the baseline has is missing from the tree."""
+    replaced = [p for p in only_baseline if replaced_by_archive and "/std/deps/" in p]
+    return replaced, [p for p in only_baseline if p not in set(replaced)]
+
+
+def compare(tag_a, a_path, b_path, limit, excluded=(), units=None, problems=None,
+            replaced_by_archive=False):
     a, b = read_hashes(a_path), read_hashes(b_path)
     if units:
         found = judge_unit_moves(units, a, b)
@@ -701,11 +773,23 @@ def compare(tag_a, a_path, b_path, limit, excluded=(), units=None, problems=None
         if drop_a or drop_b:
             print("  %-9s declared projects' objects left out: baseline %d, tree %d"
                   % (tag_a, len(drop_a), len(drop_b)))
+    if tag_a == "stdlib":
+        # An archive only one run built came from a gate only that run ran.
+        archive = lambda p: "/".join(p.split("/")[1:3])
+        common = {archive(p) for p in a} & {archive(p) for p in b}
+        unpaired = [p for p in list(a) + list(b) if archive(p) not in common]
+        a = {p: h for p, h in a.items() if archive(p) in common}
+        b = {p: h for p, h in b.items() if archive(p) in common}
+        if unpaired:
+            print("  %-9s archive objects of a stdlib root only one run used, left out: %d"
+                  % (tag_a, len(unpaired)))
     moved = sorted(p for p in a.keys() & b.keys() if a[p] != b[p])
     only_a = sorted(a.keys() - b.keys())
     only_b = sorted(b.keys() - a.keys())
+    replaced, only_a = split_replaced(only_a, replaced_by_archive)
     print("  %-9s baseline %5d  tree %5d  moved %d  only-baseline %d  only-tree %d"
-          % (tag_a, len(a), len(b), len(moved), len(only_a), len(only_b)))
+          "  replaced by the archive %d"
+          % (tag_a, len(a), len(b), len(moved), len(only_a), len(only_b), len(replaced)))
     for label, items in (("moved", moved), ("only-baseline", only_a), ("only-tree", only_b)):
         for p in items[:limit]:
             print("      %-13s %s" % (label, p))
@@ -806,8 +890,10 @@ def main():
                                      os.path.join(bdir, "examples.log"))
             # The census and the examples may fail on declared programs; every
             # other gate must pass outright.
+            # A baseline compiler that links no stdlib archive builds none, so
+            # the archive population alone may be empty.
             complete = all(r["ok"] for r in bres if r["name"] not in ("census", "examples")) \
-                and all(bcounts.values()) \
+                and bcounts["tests"] and bcounts["examples"] \
                 and all(r["ok"] or declared or fixed for r in bres
                         if r["name"] in ("census", "examples"))
             if not complete:
@@ -824,7 +910,7 @@ def main():
             return 1
         if not os.path.isfile(os.path.join(cached, "base.tests.sha256")):
             os.makedirs(cached, exist_ok=True)
-            for base in ("tests", "examples"):
+            for base in POPULATIONS:
                 shutil.copyfile(os.path.join(bdir, "base.%s.sha256" % base),
                                 os.path.join(cached, "base.%s.sha256" % base))
             with io.open(os.path.join(cached, "base.failed"), "w", encoding="utf-8") as fh:
@@ -836,6 +922,9 @@ def main():
     report_gates(results)
     ok = all(r["ok"] for r in results)
     hashed = [b for b, g in (("tests", "census"), ("examples", "examples")) if g in names]
+    if "census" in names or "examples" in names:
+        print("  objects   %-8s %d (%s)" % ("stdlib", counts["stdlib"],
+                                             rel(os.path.join(logdir, "tree.stdlib.sha256"))))
     for base in hashed:
         print("  objects   %-8s %d (%s)" % (base, counts[base],
                                              rel(os.path.join(logdir, "tree.%s.sha256" % base))))
@@ -849,12 +938,13 @@ def main():
         diff = 0
         units = {n: unit_object_suffix(n) for n in fixed if declared_kind(n) == "unit"}
         unit_problems = []
-        for base in ("tests", "examples"):
+        for base in POPULATIONS:
             diff += compare(base, os.path.join(base_counts, "base.%s.sha256" % base),
                             os.path.join(logdir, "tree.%s.sha256" % base), args.list_limit,
                             excluded=set(declared) | set(fixed),
                             units=units if base == "tests" else None,
-                            problems=unit_problems)
+                            problems=unit_problems,
+                            replaced_by_archive=counts["stdlib"] > 0)
         for p in unit_problems:
             print("verify: FAIL -- %s" % p)
             ok = False

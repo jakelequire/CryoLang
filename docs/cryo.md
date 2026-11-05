@@ -831,7 +831,7 @@ mut it         = arr.iter();   // inferred: the concrete iterator type
 mut y: int;                     // declared without an initialiser; assigned later
 ```
 
-**Globals.** Module-level `const` declares an immutable global; module-level `mut` declares mutable global state. Use the latter sparingly. An initializer that is a constant expression is folded into the program: a number, a `null` or string literal, an array literal of those, and a struct literal writing every field with one of those; array and struct literals nest in each other. Any other - a call, another global's value - is computed once, before `main` runs, a module's globals after those of the modules it imports, in the order they are declared. A folded integer constant's value is its initializer's wrapped to the declared type, the value the program reads at run time: with `const B: u8 = 100;`, `const A: u8 = B + 200;` is 44 wherever it is used - an array size, a `static_assert`, another constant's initializer - never 300. Read as a value, an integer of any width, boolean, `char` or float constant whose initializer folds is compiled as that value itself rather than as a read of its global; the global remains, and `&NAME` is its address. A `![thread_local]` global gets its folded initializer in every thread's copy, so its initializer must fold: one that would be computed would reach the main thread's copy only, and is refused (`E0646`).
+**Globals.** Module-level `const` declares an immutable global; module-level `mut` declares mutable global state. Use the latter sparingly. An initializer that is a constant expression is folded into the program: a number, a `null` or string literal, an array literal of those, and a struct literal writing every field with one of those; array and struct literals nest in each other. Any other - a call, another global's value - is computed once, before `main` runs, a module's globals after those of the modules it imports, in the order they are declared. The standard library's are computed before any of the program's, its modules in one order whichever of them a program reaches: the order of the standard library's own build. A folded integer constant's value is its initializer's wrapped to the declared type, the value the program reads at run time: with `const B: u8 = 100;`, `const A: u8 = B + 200;` is 44 wherever it is used - an array size, a `static_assert`, another constant's initializer - never 300. Read as a value, an integer of any width, boolean, `char` or float constant whose initializer folds is compiled as that value itself rather than as a read of its global; the global remains, and `&NAME` is its address. A `![thread_local]` global gets its folded initializer in every thread's copy, so its initializer must fold: one that would be computed would reach the main thread's copy only, and is refused (`E0646`).
 
 ```cryo
 const VERSION:    string = "1.0.0";
@@ -4640,7 +4640,7 @@ build/
         +-- <name>.ll               # combined LLVM IR          (when emit_llvm)
         +-- build-manifest.json     # per-profile metadata + fingerprint
         +-- std/                    # standard library package
-        |   +-- deps/  *.o          #   per-module objects
+        |   +-- deps/  *.o          #   per-module objects: what the stdlib archive lacks
         |   +-- ir/    *.ll         #   per-module IR (when emit_llvm)
         +-- local/                  # the local project package
         |   +-- deps/  *.o
@@ -4650,6 +4650,16 @@ build/
             +-- deps/  *.o
             +-- ir/    *.ll
 ```
+
+An executable takes the standard library's code from an archive the stdlib
+is compiled into once, in `<stdlib>/.bin/<triple>/prebuilt/<key>/`: its
+`std/` objects hold only the generic instances the archive lacks, and a
+library a `[[bin]]` derives from its own objects holds the same.  The key is
+the compiler, every stdlib source, the stdlib root as spelled, the target and
+the optimization, debug-info and panic settings; when no archive has the
+build's key, the compiler builds one first, with itself.  A build on the
+native heap (`native_alloc`), and a `[lib]` built on its own, compile the
+stdlib modules they reach.
 
 `cryo build` is incremental: if no input changed (sources, the resolved knobs,
 the compiler binary, or the linked stdlib) and the artifact still exists, the

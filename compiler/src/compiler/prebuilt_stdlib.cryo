@@ -1,0 +1,499 @@
+///! The stdlib, compiled once and linked by every program.
+///!
+///! A program's build still reads and checks the stdlib modules it reaches -
+///! monomorphization needs their generic bodies - but generates no code for
+///! what the stdlib's own build already compiled into its archive.  That
+///! build writes a manifest beside the archive: every symbol the archive
+///! defines, and each module's place in the build and whether it has
+///! startup code.  A program's build strips those symbols' bodies from its
+///! stdlib modules, keeping only the generic instances the archive lacks,
+///! and links the archive.
+///!
+///! The archive is exact by its key: the compiler's own bytes, every stdlib
+///! source, the stdlib root as spelled (panic locations embed it), the
+///! target and the code-shaping options.  It lives in a directory named by
+///! the key, so a change to any of them names a directory that does not
+///! exist yet, and the build makes it by running the stdlib's build with the
+///! same compiler and options.  An archive whose manifest records another
+///! key is refused.
+
+namespace compiler::prebuilt_stdlib;
+
+import compiler::artifacts::{ ArchivedModule };
+import compiler::build_manifest::{ ContentHasher, Manifest };
+import compiler::codegen::{ llvm };
+import compiler::codegen::llvm_types::{ LModule, LValue };
+import utils::log::{ Log, LogArea };
+import std::fmt;
+import std::thread;
+import std::core::hash::{ Hasher };
+import std::collections::hashset::{ HashSet };
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::fs::directory::{ Directory, DirectoryEntries };
+import std::fs::file::{ File };
+import std::fs::path::{ Path };
+import std::process::command::{ Command, Output };
+import std::time::clock::{ SystemTime };
+
+const MANIFEST_NAME:   string = "stdlib.manifest";
+const MANIFEST_FORMAT: string = "cryo-stdlib-manifest 1";
+const ARCHIVE_NAME:    string = "libcryo.a";
+
+/// Startup code runs lowest priority first; LLVM reserves those below 101.
+const STARTUP_BASE: u32 = 101;
+/// The priorities the stdlib's modules run their startup code at, one per
+/// module in the order of the stdlib's own build.  Every other module's come
+/// after them, so a program's startup code runs after the stdlib's whichever
+/// stdlib modules it reaches.
+const STDLIB_STARTUP_SLOTS: u32 = 1000;
+
+/// A lock older than this is taken to be left by a build that died.
+const LOCK_EXPIRY_SECONDS: i64 = 600;
+
+/// How many archives a stdlib root keeps per target: one per compiler and
+/// option set in use at once (a selfhost's stages, verify's two compilers
+/// under two stdlib spellings).
+const ARCHIVES_KEPT: i64 = 6;
+
+/// One module of the archive, as its manifest records it.
+type struct PrebuiltModule {
+    namespace_name: string;
+    rank:           u32;
+    startup:        boolean;
+    object:         string;
+}
+
+type struct PrebuiltStdlib {
+    directory: string;
+    key:       string;
+    modules:   [PrebuiltModule];
+    symbols:   HashSet<string>;
+
+    /// The priority a module's startup code runs at.  In the stdlib's own
+    /// build it is the module's place in that build; in any other build,
+    /// its place after every stdlib module's.
+    static startup_priority(stdlib_build: boolean, position: i64) -> u32 {
+        const place: u32 = if (position < 0) { 0 } else { position as u32 };
+        if (stdlib_build) {
+            return STARTUP_BASE + place;
+        }
+        return STARTUP_BASE + STDLIB_STARTUP_SLOTS + place;
+    }
+
+    /// The key of the archive a build with these options links: every input
+    /// that decides the archive's bytes.
+    static key_of(stdlib_root_text: string, triple_text: string, opt_level: u32,
+                  debug_info: boolean, unwinds: boolean) -> string {
+        const stdlib_root: string = stdlib_root_text;
+        const triple: string = triple_text;
+        mut h: ContentHasher = ContentHasher::new();
+        h.fold(MANIFEST_FORMAT);
+        h.fold(Manifest::compiler_fingerprint());
+        h.fold(stdlib_root);
+        h.fold(triple);
+        h.fold(opt_level as u64);
+        h.fold(debug_info);
+        h.fold(unwinds);
+        PrebuiltStdlib::fold_sources(&h, stdlib_root, "");
+        return Manifest::hex128(h.finish128());
+    }
+
+    /// Fold every stdlib source under `root`/`relative` - each `.cryo` file
+    /// and `cryoconfig`, by its path relative to the root and its bytes - in
+    /// name order, so the digest does not depend on how the directory lists.
+    /// Directories whose name starts with `.` hold build outputs and are not
+    /// read.
+    static fold_sources(h: mut ContentHasher*, root_text: string, relative_text: string) -> void {
+        const root: string = root_text;
+        const relative: string = relative_text;
+        const directory: string = if (relative.length() == 0) { root } else {
+            Path::from(root).join(relative).into_raw()
+        };
+        mut entries: DirectoryEntries = match (Directory::entries(Path::from(directory))) {
+            Result::Ok(r)  => { r }
+            Result::Err(_) => { h.fold("<unlistable>"); h.fold(relative); return; }
+        };
+        mut names: [string] = [];
+        loop {
+            match (entries.next()) {
+                Option::Some(entry) => {
+                    mut name: String = String::from_str(entry.name());
+                    names.push(name.into_raw());
+                }
+                Option::None => { break; }
+            }
+        }
+        names.sort();
+        for (mut i: i64 = 0; i < names.length(); i++) {
+            const name: string = names[i];
+            if (name.starts_with(".")) { continue; }
+            const child: string = if (relative.length() == 0) { name } else { relative + "/" + name };
+            const full: string = Path::from(root).join(child).into_raw();
+            if (Path::from(full).is_directory()) {
+                PrebuiltStdlib::fold_sources(h, root, child);
+            } else if (name.ends_with(".cryo") || name == "cryoconfig") {
+                h.fold(child);
+                Manifest::fold_file::<ContentHasher>(h, full);
+            }
+        }
+    }
+
+    /// The directory the archive with `key` lives in.
+    static directory_for(stdlib_root: string, triple: string, key: string) -> string {
+        return Path::from(stdlib_root).join(".bin").join(triple).join("prebuilt").join(key).into_raw();
+    }
+
+    archive(&this) -> string {
+        return Path::from(this.directory).join(ARCHIVE_NAME).into_raw();
+    }
+
+    /// Whether the archive defines `name`.
+    defines(&this, name: string) -> boolean {
+        return this.symbols.contains(&name);
+    }
+
+    /// The archive's module named `namespace_name`, or -1.
+    module_index(&this, namespace_name: string) -> i64 {
+        for (mut i: i64 = 0; i < this.modules.length(); i++) {
+            if (this.modules[i].namespace_name == namespace_name) { return i; }
+        }
+        return -1;
+    }
+
+    /// The archive in `directory`, when its manifest reads and records `key`.
+    static open(directory_text: string, key_text: string) -> Option<PrebuiltStdlib> {
+        const directory: string = directory_text;
+        const key: string = key_text;
+        const manifest: string = Path::from(directory).join(MANIFEST_NAME).into_raw();
+        mut text: string = "";
+        match (File::read_text(Path::from(manifest))) {
+            Result::Ok(t)  => { text = t.into_raw(); }
+            Result::Err(_) => { return Option::None; }
+        }
+        mut lines: [string] = [];
+        const bytes: u8* = text as u8*;
+        const length: i64 = text.length();
+        mut start: i64 = 0;
+        for (mut at: i64 = 0; at < length; at++) {
+            if (bytes[at] == 10) {
+                mut line: String = String::from_str(Str::from_raw(bytes + start, (at - start) as u64));
+                lines.push(line.into_raw());
+                start = at + 1;
+            }
+        }
+        if (lines.length() < 2 || lines[0] != MANIFEST_FORMAT || lines[1] != "key " + key) {
+            return Option::None;
+        }
+        mut found: PrebuiltStdlib = PrebuiltStdlib {
+            directory: directory,
+            key:       key,
+            modules:   [],
+            symbols:   HashSet::<string>::with_capacity(lines.length()),
+        };
+        for (mut i: i64 = 2; i < lines.length(); i++) {
+            const line: string = lines[i];
+            if (line.starts_with("symbol ")) {
+                found.symbols.insert(line.substr(7, line.length() - 7));
+            } else if (line.starts_with("module ")) {
+                // module <rank> <startup> <namespace> <object>
+                const fields: [string] = line.split(" ");
+                if (fields.length() < 5) { return Option::None; }
+                const object_start: i64 = fields[0].length() + fields[1].length()
+                    + fields[2].length() + fields[3].length() + 4;
+                const object: string = line.substr(object_start, line.length() - object_start);
+                found.modules.push(PrebuiltModule {
+                    namespace_name: fields[3],
+                    rank:           fields[1].parse_int::<u32>(),
+                    startup:        fields[2] == "1",
+                    object:         Path::from(directory).join(object).into_raw(),
+                });
+            }
+        }
+        if (!Path::from(found.archive()).exists()) { return Option::None; }
+        return Option::Some(found);
+    }
+
+    /// The archive for a build with these options: opened when it exists,
+    /// built by running the stdlib's own build with this compiler when it
+    /// does not.  Builds racing to make one wait on a lock beside it; the
+    /// archive only appears, by a rename, once it is whole.
+    static ensure(stdlib_root_text: string, triple_text: string, opt_level: u32,
+                  debug_info: boolean, unwinds: boolean) -> Result<PrebuiltStdlib, String> {
+        const stdlib_root: string = stdlib_root_text;
+        const triple: string = triple_text;
+        const key: string = PrebuiltStdlib::key_of(stdlib_root, triple, opt_level, debug_info, unwinds);
+        const directory: string = PrebuiltStdlib::directory_for(stdlib_root, triple, key);
+        match (PrebuiltStdlib::open(directory, key)) {
+            Option::Some(found) => { return Result::Ok(found); }
+            Option::None => { }
+        }
+        const lock: string = directory + ".lock";
+        match (Directory::create_all(Path::from(PrebuiltStdlib::directory_for(stdlib_root, triple, "")))) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { }
+        }
+        loop {
+            match (Directory::create(Path::from(lock))) {
+                Result::Ok(_) => { break; }
+                Result::Err(_) => { }
+            }
+            match (PrebuiltStdlib::open(directory, key)) {
+                Option::Some(found) => { return Result::Ok(found); }
+                Option::None => { }
+            }
+            // A lock older than any stdlib build takes was left by one that died.
+            const expired: boolean = match (Path::from(lock).metadata()) {
+                Result::Ok(m)  => { SystemTime::now().unix_secs() - m.modified_secs() > LOCK_EXPIRY_SECONDS }
+                Result::Err(_) => { false }
+            };
+            if (expired) {
+                PrebuiltStdlib::release(lock);
+                continue;
+            }
+            thread::sleep_ms(200);
+        }
+        // Another build may have finished it between the last look and the lock.
+        match (PrebuiltStdlib::open(directory, key)) {
+            Option::Some(found) => {
+                PrebuiltStdlib::release(lock);
+                return Result::Ok(found);
+            }
+            Option::None => { }
+        }
+        const failure: String = PrebuiltStdlib::build(stdlib_root, triple, opt_level, debug_info,
+                                                      unwinds, directory);
+        PrebuiltStdlib::release(lock);
+        if (failure.length() > 0) {
+            return Result::Err(failure);
+        }
+        match (PrebuiltStdlib::open(directory, key)) {
+            Option::Some(found) => { return Result::Ok(found); }
+            Option::None => { }
+        }
+        return Result::Err(String::from_str(Str::new(fmt::format(
+            "the stdlib archive built in %s does not record the key %s this build asked for",
+            directory, key))));
+    }
+
+    static release(lock: string) -> void {
+        match (Directory::remove_all(Path::from(lock))) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { }
+        }
+    }
+
+    /// Run the stdlib's build into a scratch directory beside `directory`
+    /// and move it into place.  Answers the failure, or an empty string.
+    static build(stdlib_root: string, triple: string, opt_level: u32, debug_info: boolean,
+                 unwinds: boolean, directory: string) -> String {
+        const scratch: string = directory + ".building";
+        match (Directory::remove_all(Path::from(scratch))) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { }
+        }
+        const exe: string = Manifest::self_exe_path();
+        if (exe.length() == 0) {
+            return String::from_str(Str::new("the running compiler's own path is unknown, so it cannot build the stdlib archive"));
+        }
+        mut command: Command = Command::new(Str::new(exe));
+        command.arg(Str::new("build"));
+        command.arg(Str::new(stdlib_root));
+        command.arg(Str::new(fmt::format("--build-dir=%s", scratch)));
+        command.arg(Str::new("--no-incremental"));
+        command.arg(Str::new(fmt::format("--opt-level=%u", opt_level)));
+        command.arg(Str::new(if (unwinds) { "--panic=unwind" } else { "--panic=abort" }));
+        command.arg(Str::new(fmt::format("--target=%s", triple)));
+        if (debug_info) { command.arg(Str::new("-g")); }
+        Log::debug(LogArea::Driver, f"building the stdlib archive in {scratch}");
+        match (command.output()) {
+            Result::Ok(result) => {
+                mut output: Output = result;
+                if (!output.status().success()) {
+                    mut report: String = String::from_str(Str::new(fmt::format(
+                        "building the stdlib archive in %s failed:\n", scratch)));
+                    report.push(Str::from_raw(output.stdout().as_ptr(), output.stdout().length() as u64));
+                    report.push(Str::from_raw(output.stderr().as_ptr(), output.stderr().length() as u64));
+                    return report;
+                }
+            }
+            Result::Err(_) => {
+                return String::from_str(Str::new(fmt::format("could not run %s to build the stdlib archive", exe)));
+            }
+        }
+        // What is in the directory now records another key or is not whole -
+        // a build holding the lock found no archive there it could open - so
+        // nobody can be using it.
+        match (Directory::remove_all(Path::from(directory))) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { }
+        }
+        match (Path::from(scratch).rename_to(Path::from(directory))) {
+            Result::Ok(_) => { }
+            Result::Err(_) => {
+                match (Directory::remove_all(Path::from(scratch))) {
+                    Result::Ok(_)  => { }
+                    Result::Err(_) => { }
+                }
+            }
+        }
+        // Every compiler rebuilt keys a new archive, so the older ones would
+        // pile up: only the newest ARCHIVES_KEPT stay.
+        const parent: string = PrebuiltStdlib::directory_for(stdlib_root, triple, "");
+        mut kept: [string] = [];
+        mut kept_times: [i64] = [];
+        match (Directory::entries(Path::from(parent))) {
+            Result::Ok(listing) => {
+                mut entries: DirectoryEntries = listing;
+                loop {
+                    match (entries.next()) {
+                        Option::Some(entry) => {
+                            mut name: String = String::from_str(entry.name());
+                            const raw_name: string = name.into_raw();
+                            const at: string = Path::from(parent).join(raw_name).into_raw();
+                            if (raw_name.contains(".") || !Path::from(at).is_directory()) { continue; }
+                            const time: i64 = match (Path::from(at).metadata()) {
+                                Result::Ok(m)  => { m.modified_secs() }
+                                Result::Err(_) => { 0 }
+                            };
+                            kept.push(at);
+                            kept_times.push(time);
+                        }
+                        Option::None => { break; }
+                    }
+                }
+            }
+            Result::Err(_) => { }
+        }
+        for (mut i: i64 = 0; i < kept.length(); i++) {
+            mut newer: i64 = 0;
+            for (mut k: i64 = 0; k < kept.length(); k++) {
+                if (kept_times[k] > kept_times[i] || (kept_times[k] == kept_times[i] && k > i)) {
+                    newer = newer + 1;
+                }
+            }
+            if (newer >= ARCHIVES_KEPT && kept[i] != directory) {
+                match (Directory::remove_all(Path::from(kept[i]))) {
+                    Result::Ok(_)  => { }
+                    Result::Err(_) => { }
+                }
+            }
+        }
+        return String::new();
+    }
+
+    /// Strip from a program's stdlib module every definition the archive
+    /// holds, and the startup code the archive runs for it, leaving
+    /// declarations the archive resolves at link time; then remove the
+    /// module's own functions and data nothing refers to any more.  Answers
+    /// whether the module still defines anything, and so has an object to
+    /// emit.
+    strip(&this, unit: LModule, namespace_name: string) -> boolean {
+        mut f: mut void* = llvm::LLVMGetFirstFunction(unit.raw);
+        while (f != null) {
+            const candidate: LValue = LValue { raw: f };
+            f = llvm::LLVMGetNextFunction(f);
+            if (candidate.is_linkable_definition() && this.defines(candidate.name())) {
+                candidate.make_declaration();
+            }
+        }
+        const archived: boolean = this.module_index(namespace_name) >= 0;
+        mut g: mut void* = llvm::LLVMGetFirstGlobal(unit.raw);
+        while (g != null) {
+            const candidate: LValue = LValue { raw: g };
+            g = llvm::LLVMGetNextGlobal(g);
+            if (candidate.name() == "llvm.global_ctors") {
+                if (archived) { llvm::LLVMDeleteGlobal(candidate.raw); }
+            } else if (candidate.is_linkable_definition() && this.defines(candidate.name())) {
+                candidate.make_declaration();
+            }
+        }
+        unit.remove_unreferenced_locals();
+        return unit.defines_anything();
+    }
+
+    /// What the stdlib's own build records of a module for the manifest:
+    /// every function and datum it defines that other objects can link
+    /// against, and whether it has startup code.
+    static archived_module(unit: LModule, namespace_name_text: string, rank: u32,
+                           object_text: string) -> ArchivedModule {
+        const namespace_name: string = namespace_name_text;
+        const object: string = object_text;
+        mut symbols: [string] = [];
+        mut startup: boolean = false;
+        mut f: mut void* = llvm::LLVMGetFirstFunction(unit.raw);
+        while (f != null) {
+            const candidate: LValue = LValue { raw: f };
+            if (candidate.is_linkable_definition()) { symbols.push(fmt::format("%s", candidate.name())); }
+            f = llvm::LLVMGetNextFunction(f);
+        }
+        mut g: mut void* = llvm::LLVMGetFirstGlobal(unit.raw);
+        while (g != null) {
+            const candidate: LValue = LValue { raw: g };
+            const name: string = candidate.name();
+            if (name == "llvm.global_ctors") {
+                startup = true;
+            } else if (candidate.is_linkable_definition() && !name.starts_with("llvm.")) {
+                symbols.push(fmt::format("%s", name));
+            }
+            g = llvm::LLVMGetNextGlobal(g);
+        }
+        return ArchivedModule {
+            namespace_name: namespace_name,
+            rank:           rank,
+            startup:        startup,
+            object:         object,
+            symbols:        symbols,
+        };
+    }
+
+    /// Write the manifest of the archive in `directory`, the stdlib's own
+    /// build's records in build order.  Answers the failure, or "".
+    static write_manifest(directory_text: string, key_text: string, stdlib_root_text: string,
+                          triple_text: string, opt_level: u32, debug_info: boolean,
+                          unwinds: boolean, modules: &[ArchivedModule]) -> string {
+        const directory: string = directory_text;
+        const key: string = key_text;
+        const stdlib_root: string = stdlib_root_text;
+        const triple: string = triple_text;
+        if (modules.length() as u32 > STDLIB_STARTUP_SLOTS) {
+            return fmt::format("the stdlib has %d modules and its startup code is ordered in %u places",
+                modules.length(), STDLIB_STARTUP_SLOTS);
+        }
+        mut text: String = String::new();
+        text.push(Str::new(MANIFEST_FORMAT));
+        text.push_byte(10 as u8);
+        text.push(Str::new("key " + key));
+        text.push_byte(10 as u8);
+        text.push(Str::new("root " + stdlib_root));
+        text.push_byte(10 as u8);
+        // What the key folds besides the compiler and the sources, readable.
+        text.push(Str::new(fmt::format("options %s O%u %s %s", triple, opt_level,
+            if (debug_info) { "debug-info" } else { "no-debug-info" },
+            if (unwinds) { "unwind" } else { "abort" })));
+        text.push_byte(10 as u8);
+        const prefix: string = directory + "/";
+        for (mut i: i64 = 0; i < modules.length(); i++) {
+            const object: string = modules[i].object;
+            const relative: string = if (object.starts_with(prefix)) {
+                object.substr(prefix.length(), object.length() - prefix.length())
+            } else {
+                object
+            };
+            text.push(Str::new(fmt::format("module %u %s %s %s", modules[i].rank,
+                if (modules[i].startup) { "1" } else { "0" }, modules[i].namespace_name, relative)));
+            text.push_byte(10 as u8);
+        }
+        for (mut i: i64 = 0; i < modules.length(); i++) {
+            for (mut s: i64 = 0; s < modules[i].symbols.length(); s++) {
+                text.push(Str::new("symbol " + modules[i].symbols[s]));
+                text.push_byte(10 as u8);
+            }
+        }
+        const path: string = Path::from(directory).join(MANIFEST_NAME).into_raw();
+        match (File::write_bytes(Path::from(path), text.as_bytes())) {
+            Result::Ok(_)  => { return ""; }
+            Result::Err(_) => { return fmt::format("cannot write the stdlib manifest %s", path); }
+        }
+    }
+}

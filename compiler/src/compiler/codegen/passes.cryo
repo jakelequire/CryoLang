@@ -20,8 +20,9 @@ import compiler::types::{ arena, type_base, type_ref, TypeKind, user_defined };
 import compiler::codegen::visit::ir_generator::{ IRGeneratorVisitor };
 import compiler::compilation_context::{ CompilationContext, OutputOverride };
 import compiler::project_config::{ ProjectConfig, TargetType };
-import compiler::module_graph::{ ModuleInfo };
+import compiler::module_graph::{ ModuleInfo, ModuleOrigin };
 import compiler::artifacts::{ IROutput, LinkedOutput };
+import compiler::prebuilt_stdlib::{ PrebuiltStdlib };
 import compiler::diag::{ diagnostic, ErrorCode, sink, snapshot };
 import compiler::ast::node::{ ProgramNode };
 import compiler::passes::pass_id::{ PassResult };
@@ -1575,6 +1576,32 @@ type struct CodegenPasses {
 
         mut cmd: string = fmt::format("%s -o %s @\"%s\"",
             link_cfg.driver, CodegenPasses::link_quote(exe_path), link_rsp_path);
+        // The prebuilt stdlib archive (`prebuilt_stdlib`) supplies what the
+        // program's stdlib modules' objects no longer define.  It comes right
+        // after the objects, ahead of the libraries the project names: its
+        // members call into those (`std::net::tls` into the OpenSSL a
+        // project using it lists), and a library is searched only for what
+        // is undefined when the linker reaches it.  The members holding the
+        // startup code of a stdlib module the program reaches are named
+        // whole before it: nothing refers to startup code, so the linker
+        // would leave those members out.
+        if (ctx.prebuilt_stdlib != null) {
+            for (mut p: i64 = 0; p < ctx.module_graph.topo_order.length(); p++) {
+                const info: ModuleInfo* = &ctx.module_graph.modules[ctx.module_graph.topo_order[p]];
+                const is_stdlib_module: boolean = match (info.origin) {
+                    ModuleOrigin::Stdlib => { true }
+                    _ => { false }
+                };
+                if (!is_stdlib_module) { continue; }
+                const namespace_name: string = ctx.intern_table.shown(info.path().decl_name());
+                const at: i64 = ctx.prebuilt_stdlib.module_index(namespace_name);
+                if (at < 0 || !ctx.prebuilt_stdlib.modules[at].startup) { continue; }
+                ctx.artifacts.record_startup(namespace_name,
+                    PrebuiltStdlib::startup_priority(true, ctx.prebuilt_stdlib.modules[at].rank as i64));
+                cmd = fmt::format("%s %s", cmd, CodegenPasses::link_quote(ctx.prebuilt_stdlib.modules[at].object));
+            }
+            cmd = fmt::format("%s %s", cmd, CodegenPasses::link_quote(ctx.prebuilt_stdlib.archive()));
+        }
         // `no_runtime`: freestanding link.  `-nostartfiles` drops crt0 (the
         // runtime provides its own `_start`), `-nostdlib` drops the default
         // libc/libm and the compiler runtime.  The stdlib archive and
@@ -1664,15 +1691,12 @@ type struct CodegenPasses {
             }
             cmd = fmt::format("%s %s", cmd, llvm_static);
         }
-        // Stdlib archive: the stdlib build emits `<stdlib_root>/.bin/libcryo.a`
-        // (see bundle_archive); pull it in for host builds unless the
-        // project opted out via `no_std`.  Cross-compile builds don't
-        // append the archive - it's ABI-incompatible with the target
-        // and the per-target stdlib .o files are already in the link
-        // line (cryo re-compiles every reachable std module when
-        // target != host).
-        if (link_cfg.use_stdlib_archive && !cfg.no_std && !cfg.no_runtime
-                && ctx.options.stdlib_root.length() > 0) {
+        // A build that compiles the stdlib modules it reaches itself appends
+        // the archive `make stdlib` built for a host target, which then
+        // supplies nothing those objects lack.  A program linking the prebuilt
+        // archive named it after its objects, above.
+        if (ctx.prebuilt_stdlib == null && link_cfg.use_stdlib_archive && !cfg.no_std
+                && !cfg.no_runtime && ctx.options.stdlib_root.length() > 0) {
             const stdlib_archive: string = CodegenPasses::stdlib_archive_path(
                 ctx.options.stdlib_root, effective_triple);
             cmd = fmt::format("%s %s", cmd, CodegenPasses::link_quote(stdlib_archive));
@@ -1710,6 +1734,7 @@ type struct CodegenPasses {
         }
 
         Log::debug(LogArea::Link, f"linking {ctx.artifacts.object_files.length()} objects into {exe_path}");
+        Log::debug(LogArea::Link, f"startup order: {ctx.artifacts.startup_order()}");
         Log::debug(LogArea::Link, f"link command: {cmd}");
 
         mut link_out: string = "";
@@ -1798,7 +1823,23 @@ type struct CodegenPasses {
         // Archive lands at the build root (`<output_dir>/lib<name>.a`).
         ProjectConfig::mkdir_p(cfg.output_dir);
         const archive_path: string = cfg.lib_archive_path(archive_name);
-        return CodegenPasses::bundle_object_list(ctx, archive_path, &ctx.artifacts.object_files);
+        const bundled: PassResult = CodegenPasses::bundle_object_list(ctx, archive_path, &ctx.artifacts.object_files);
+        if (!bundled.success || !ctx.module_graph.builds_standard_library) {
+            return bundled;
+        }
+        // The stdlib's archive carries its manifest, keyed as a program's
+        // build with the same options asks for it, the root spelled as this
+        // build was given it.
+        const key: string = PrebuiltStdlib::key_of(cfg.project_root, ctx.options.target_triple,
+            ctx.options.opt_level, ctx.options.debug_info, ctx.options.unwinds());
+        const failure: string = PrebuiltStdlib::write_manifest(cfg.output_dir, key, cfg.project_root,
+            ctx.options.target_triple, ctx.options.opt_level, ctx.options.debug_info,
+            ctx.options.unwinds(), &ctx.artifacts.archived);
+        if (failure.length() > 0) {
+            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR, failure);
+            return PassResult::failure(1);
+        }
+        return bundled;
     }
 
     /// Archive an explicit object list into `archive_path`.  The shared core of

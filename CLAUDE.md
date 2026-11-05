@@ -518,6 +518,16 @@ with no diff to check it against.
   arm's stage logs stay there, and its output is in
   `build-logs/selfhost-check/linux-arm.log`.  On a Linux host the check still
   deletes `compiler/build` and `stdlib/.bin`: run `make cryo` after it.
+- **A program links the stdlib from `stdlib/.bin/<triple>/prebuilt/<key>/`**,
+  an archive the compiler builds on first use by running the stdlib's own
+  build with itself; the key is the compiler's bytes, every stdlib source,
+  the stdlib root AS SPELLED, the target and the code-shaping options, so a
+  compiler rebuild or a stdlib edit means one ~8 s archive build on the next
+  program build, and the newest six archives are kept. Its stdlib modules'
+  objects hold only the generic instances the archive lacks (most are
+  empty). verify hashes the archives as a third population (`stdlib`); a
+  baseline compiler that links none leaves that population empty and its
+  stdlib modules' objects count as "replaced by the archive".
 - A scratch project outside the repo cannot find the stdlib — set
   `CRYO_STDLIB`. `compiler/build/cryo` cannot find it from another directory;
   `bin/cryo` can.

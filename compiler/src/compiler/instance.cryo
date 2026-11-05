@@ -42,7 +42,9 @@ import std::thread;
 import std::time::clock::{ Instant };
 import std::collections::string::{ String };
 import std::collections::str::{ Str };
-import std::core::hash::{ Fnv128Hasher };
+import compiler::build_manifest::{ ContentHasher };
+import compiler::prebuilt_stdlib::{ PrebuiltStdlib };
+import compiler::codegen::passes::{ LinkerConfig };
 import std::core::mem;
 import std::ffi::libc;
 import compiler::artifacts::{ ASTOutput, IROutput, TokenStream };
@@ -1347,6 +1349,35 @@ type struct CompilerInstance {
             }
         }
 
+        // A program links the stdlib archive in place of generating code for
+        // the stdlib modules it reaches, so the archive is opened - or built
+        // with this compiler - before anything below reads its key.  The
+        // archive serves a hosted program on the libc heap that links an
+        // executable (and the library a bin derives from its own objects,
+        // which holds what they hold); a build of another shape compiles the
+        // stdlib modules it reaches itself.
+        const links_prebuilt_stdlib: boolean = ctx.options.mode.codegen_enabled()
+            && !config.no_std && stdlib_root.length() > 0
+            && config.requires_entry_point()
+            && !ctx.options.output.is_unlinked_artifact()
+            && !ctx.options.freestanding() && !ctx.options.native_heap()
+            && LinkerConfig::linker_config_for_triple(ctx.options.target_triple).supported;
+        if (links_prebuilt_stdlib) {
+            match (PrebuiltStdlib::ensure(stdlib_root, ctx.options.target_triple,
+                    ctx.options.opt_level, ctx.options.debug_info, ctx.options.unwinds())) {
+                Result::Ok(found) => {
+                    ctx.prebuilt_stdlib = Box::<PrebuiltStdlib>::new(found).into_raw();
+                    Log::debug(LogArea::Driver, f"linking the stdlib archive {ctx.prebuilt_stdlib.archive()}");
+                }
+                Result::Err(reason) => {
+                    mut text: String = reason;
+                    ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR, text.as_cstr() as string);
+                    ctx.diagnostics.flush();
+                    return CompilationResult::failed(ctx.diagnostics.error_count, 0);
+                }
+            }
+        }
+
         // Incremental whole-build fingerprint + short-circuit.
         //
         // Build the input set (every discovered module, in topo order) and a
@@ -1390,7 +1421,9 @@ type struct CompilerInstance {
                     origin_kind:    ModuleInfo::origin_kind_label(minfo.origin),
                 });
             }
-            if (!config.no_std && stdlib_root.length() > 0) {
+            if (ctx.prebuilt_stdlib != null) {
+                manifest_stdlib_archive = ctx.prebuilt_stdlib.archive();
+            } else if (!config.no_std && stdlib_root.length() > 0) {
                 // Same per-target resolution the link uses, so the
                 // freshness dependency names the archive that will actually
                 // be linked rather than a flat path another target may own.
@@ -1586,7 +1619,11 @@ type struct CompilerInstance {
         //     reachable there) => unaffected by unrelated edits.
         // Bias is toward rebuilding: anything unprovable disables the cache.
         // ====================================================================
-        if (do_incremental && ctx.project_config != null) {
+        // The stdlib's own build records every module's definitions for its
+        // archive's manifest, which a module served from the cache would not
+        // give, so it reuses no module's object.
+        if (do_incremental && ctx.project_config != null
+                && !ctx.module_graph.builds_standard_library) {
             pm_active = true;
 
             // Per-module source hashes (indexed by module index).
@@ -1599,8 +1636,11 @@ type struct CompilerInstance {
                     mi.file_path));
             }
 
+            // A stdlib module's object holds what the archive lacks, so the
+            // archive's key is part of every module's.
             const pm_tool_fp: u128 = compiler::build_manifest::Manifest::toolchain_fingerprint(
-                ctx.project_config, ctx.options.opt_level, ctx.options.debug_info);
+                ctx.project_config, ctx.options.opt_level, ctx.options.debug_info,
+                if (ctx.prebuilt_stdlib != null) { ctx.prebuilt_stdlib.key } else { "" });
 
             // Spec ownership.  A spec whose owner can't be attributed to a
             // module would let a stale .o win, so disable the cache (full
@@ -1654,7 +1694,7 @@ type struct CompilerInstance {
             }
 
             // Global digest over every module's source hash, in topo order.
-            mut pm_global_h: Fnv128Hasher = Fnv128Hasher::new();
+            mut pm_global_h: ContentHasher = ContentHasher::new();
             pm_global_h.fold(pm_tool_fp);
             for (mut i: u32 = 0; i < n; i++) {
                 pm_global_h.fold(pm_src_h[order[i] as i64]);
@@ -1711,7 +1751,7 @@ type struct CompilerInstance {
             for (mut m: u32 = 0; m < n; m++) {
                 const mi: ModuleInfo* = &ctx.module_graph.modules[m];
                 const ns: string = ctx.intern_table.shown(mi.path().decl_name());
-                mut k: Fnv128Hasher = Fnv128Hasher::new();
+                mut k: ContentHasher = ContentHasher::new();
                 k.fold(pm_tool_fp);
                 if (pm_owns_spec[m as i64]) {
                     k.fold("owner");
@@ -2181,12 +2221,34 @@ type struct CompilerInstance {
                     Option::None => { }
                 }
 
+                // A stdlib module of a program linking the stdlib archive keeps
+                // only what the archive does not define; one left with nothing
+                // has no object.
+                const is_stdlib_module: boolean = match (mod_info.origin) {
+                    ModuleOrigin::Stdlib => { true }
+                    _ => { false }
+                };
+                const keeps_object: boolean = ctx.prebuilt_stdlib == null || !is_stdlib_module
+                    || ctx.prebuilt_stdlib.strip(LModule { raw: ctx.artifacts.ir.llvm_module }, mod_name);
+
                 // Write the `.ll` text dump while the module is still on the main
                 // thread (before it is handed to a worker), when --emit-llvm is
                 // set via CLI flag or cryoconfig args.
                 if (ctx.options.emit_llvm) {
                     CompilerInstance::write_module_ir(
                         ctx, mod_info, mod_name, ctx.artifacts.ir.llvm_module);
+                }
+
+                if (!keeps_object) {
+                    // An object an earlier build left would be taken for this
+                    // build's by the module cache.
+                    CodegenPasses::remove_previous_output(CodegenPasses::resolve_emit_target(ctx).emit_path);
+                    mut emptied: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
+                    emptied.dispose();
+                    ctx.artifacts.ir = IROutput::empty();
+                    compiler::codegen::llvm_types::dispose_codegen_context();
+                    pipeline.reset();
+                    continue;
                 }
 
                 // Resolve WHERE/HOW to emit on the MAIN thread (needs ctx + the
@@ -2209,6 +2271,13 @@ type struct CompilerInstance {
                 // emitted: an emit that writes nothing then leaves nothing,
                 // and is refused, instead of leaving the old object to link.
                 CodegenPasses::remove_previous_output(tgt.emit_path);
+
+                // The stdlib's own build records what each module's object
+                // defines, for the manifest beside its archive.
+                if (ctx.module_graph.builds_standard_library) {
+                    ctx.artifacts.record_archived(PrebuiltStdlib::archived_module(
+                        LModule { raw: ctx.artifacts.ir.llvm_module }, mod_name, i, tgt.emit_path));
+                }
 
                 if (multiproc) {
                     // Serialize the module to bitcode and dispose it immediately

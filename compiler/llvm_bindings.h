@@ -93,6 +93,9 @@ LLVMValueRef   LLVMGetOperand(LLVMValueRef Val, unsigned Index);
 int            LLVMGetNumOperands(LLVMValueRef Val);
 LLVMValueRef   LLVMGetFirstInstruction(LLVMBasicBlockRef BB);
 LLVMValueRef   LLVMGetNextInstruction(LLVMValueRef Inst);
+void           LLVMInstructionEraseFromParent(LLVMValueRef Inst);
+void           LLVMReplaceAllUsesWith(LLVMValueRef OldVal, LLVMValueRef NewVal);
+LLVMBool       LLVMIsDeclaration(LLVMValueRef Global);
 
 
 /* ===================================================================
@@ -276,6 +279,7 @@ void         LLVMSetInitializer(LLVMValueRef GlobalVar, LLVMValueRef ConstantVal
 void         LLVMSetGlobalConstant(LLVMValueRef GlobalVar, LLVMBool IsConstant);
 void         LLVMSetThreadLocal(LLVMValueRef GlobalVar, LLVMBool IsThreadLocal);
 void         LLVMSetUnnamedAddress(LLVMValueRef Global, int UnnamedAddr);
+void         LLVMDeleteGlobal(LLVMValueRef GlobalVar);
 
 
 /* ===================================================================
@@ -292,6 +296,7 @@ LLVMBasicBlockRef LLVMGetFirstBasicBlock(LLVMValueRef Fn);
 LLVMBasicBlockRef LLVMGetLastBasicBlock(LLVMValueRef Fn);
 LLVMBasicBlockRef LLVMGetNextBasicBlock(LLVMBasicBlockRef BB);
 unsigned          LLVMCountBasicBlocks(LLVMValueRef Fn);
+void              LLVMDeleteFunction(LLVMValueRef Fn);
 
 
 /* ===================================================================

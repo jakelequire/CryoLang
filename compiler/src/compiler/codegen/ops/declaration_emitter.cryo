@@ -20,6 +20,8 @@ import compiler::codegen::state::{ value_table, function_registry, global_regist
 import compiler::codegen::ops::{ ir_flow_emitter, symbol_resolver, intrinsic_emitter, expr_ops };
 import compiler::compilation_context::{ CompilationContext };
 import compiler::const_table::{ ConstEval };
+import compiler::module_graph::{ ModuleInfo };
+import compiler::prebuilt_stdlib::{ PrebuiltStdlib };
 import compiler::decl_index::{ DeclarationIndex };
 import compiler::diag::{ diagnostic, ErrorCode, source_span };
 import compiler::types::{
@@ -1377,14 +1379,18 @@ type struct DeclarationEmitter {
     }
 
     /// Close the initializer `begin_global_initializer` opened and have it
-    /// run before `main`.  Its priority is the module's place in the build
-    /// order, so a module's initializer runs after those of the modules it
-    /// depends on, whose globals its own initializers may read.
+    /// run before `main`.  Its priority follows the module's place in the
+    /// build order, so a module's initializer runs after those of the modules
+    /// it depends on, whose globals its own initializers may read; a
+    /// program's come after every stdlib module's (`startup_priority`).
     finish_global_initializer(mut &this, fn_val: LValue) -> void {
         this.values.pop_scope();
         this.builder.build_ret_void();
-        const pos: i64 = this.ctx.active_order_position;
-        const priority: u64 = 101 + (if (pos < 0) { 0 } else { pos }) as u64;
+        const priority: u32 = PrebuiltStdlib::startup_priority(
+            this.ctx.module_graph.builds_standard_library, this.ctx.active_order_position);
+        const info: ModuleInfo* = &this.ctx.module_graph.modules[this.ctx.active_module_index];
+        this.ctx.artifacts.record_startup(
+            this.ctx.intern_table.shown(info.path().decl_name()), priority);
         const ptr_ty: LType = LType::pointer_to(LType::i8());
         const fields: mut void* = libc::malloc(3 * 8);
         const field_tys: mut (mut void*)* = fields as mut (mut void*)*;
@@ -1394,7 +1400,7 @@ type struct DeclarationEmitter {
         const entry_ty: LType = LType::literal_struct(fields, 3, false);
         const vals: mut void* = libc::malloc(3 * 8);
         const entry_vals: mut (mut void*)* = vals as mut (mut void*)*;
-        entry_vals[0] = LType::const_int(LType::i32(), priority, false).raw;
+        entry_vals[0] = LType::const_int(LType::i32(), priority as u64, false).raw;
         entry_vals[1] = fn_val.raw;
         entry_vals[2] = LType::const_pointer_null(ptr_ty).raw;
         const entry: LValue = LType::const_struct(vals, 3, false);

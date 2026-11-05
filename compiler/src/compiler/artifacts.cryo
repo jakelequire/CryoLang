@@ -90,6 +90,25 @@ type struct LinkedOutput {
 
 }
 
+/// A module's startup code - the function computing its started globals -
+/// and the priority it runs at: the lower runs first.
+type struct StartupCode {
+    module_name: string;
+    priority:    u32;
+}
+
+/// What the stdlib's own build records of each module for the archive's
+/// manifest: its place in the build, whether it has startup code, its
+/// object, and every symbol the object defines that another object can
+/// link against.
+type struct ArchivedModule {
+    namespace_name: string;
+    rank:           u32;
+    startup:        boolean;
+    object:         string;
+    symbols:        [string];
+}
+
 /// Collects outputs from every compilation phase.
 /// Passes write their results here; downstream passes read from here.
 type struct PhaseArtifacts {
@@ -104,6 +123,14 @@ type struct PhaseArtifacts {
     // Multi-module codegen: accumulated per-module object file paths.
     object_files: [string];
 
+    /// The startup code of every module this build generated code for, and
+    /// of every module whose startup code the program takes from the
+    /// stdlib archive.
+    startup: [StartupCode];
+
+    /// The stdlib's own build: every module it archives, in build order.
+    archived: [ArchivedModule];
+
     static new() -> PhaseArtifacts {
         return PhaseArtifacts {
             tokens:            TokenStream::empty(),
@@ -112,7 +139,38 @@ type struct PhaseArtifacts {
             unverified_ir:     IROutput::empty(),
             linked:            LinkedOutput::empty(),
             object_files:      [],
+            startup:           [],
+            archived:          [],
         };
+    }
+
+    record_archived(mut &this, entry: ArchivedModule) -> void {
+        this.archived.push(entry);
+    }
+
+    record_startup(mut &this, module_name_text: string, priority: u32) -> void {
+        const module_name: string = module_name_text;
+        this.startup.push(StartupCode { module_name: module_name, priority: priority });
+    }
+
+    /// The modules with startup code, in the order it runs, comma-separated.
+    startup_order(&this) -> string {
+        mut order: [i64] = [];
+        for (mut i: i64 = 0; i < this.startup.length(); i++) {
+            mut at: i64 = order.length();
+            order.push(i);
+            while (at > 0 && this.startup[order[at - 1]].priority > this.startup[i].priority) {
+                order[at] = order[at - 1];
+                at = at - 1;
+            }
+            order[at] = i;
+        }
+        mut text: string = "";
+        for (mut k: i64 = 0; k < order.length(); k++) {
+            if (k > 0) { text = text + ", "; }
+            text = text + this.startup[order[k]].module_name;
+        }
+        return text;
     }
 
     /// Record an emitted object file path.  Accessed through `mut &this`

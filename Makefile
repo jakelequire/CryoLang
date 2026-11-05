@@ -270,10 +270,14 @@ Side effects beyond the named output
                   ~/.cache/cryo-selfhost/.
   test, examples, lsp-check and every gate that needs the compiler rebuild
                   it first when any .cryo under compiler/src or stdlib is
-                  newer than it.
+                  newer than it.  Any build of a program by a compiler that
+                  has no stdlib archive for its key builds one into
+                  stdlib/.bin/<triple>/prebuilt/<key>/ and removes all but
+                  the newest six there.
   verify          runs `make check-fast` from inside itself, and keeps a
                   clone and baseline compilers under .verify/ until
-                  `make clean`.
+                  `make clean`; clears stdlib/.bin/*/prebuilt/ before each
+                  population run.
   install         writes symlinks outside the repository (may need sudo).
 endef
 

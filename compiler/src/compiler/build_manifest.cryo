@@ -4,7 +4,7 @@
 ///! `<output_dir>/target/<profile>/` and a machine-readable fingerprint
 ///! sidecar under `<output_dir>/target/<profile>/local/incremental/<name>.fp`.
 ///!
-///! The fingerprint is a 128-bit FNV-1a digest over EVERY build input:
+///! The fingerprint is a 128-bit digest (`ContentHasher`) over EVERY build input:
 ///!   - the compiler binary's own bytes (so a changed compiler rebuilds),
 ///!   - the resolved knobs (opt level, debug info, emit-llvm, no-std,
 ///!     target triple, profile, and the `[link]` lists),
@@ -38,7 +38,7 @@
 ///! The whole-build fingerprint, up-to-date check, and `build-manifest.json`
 ///! write are bundled on the `Manifest` object, which captures the build's
 ///! config + resolved knobs once so the per-build inputs aren't threaded
-///! through every call. The pure FNV/hex folding helpers stay free because
+///! through every call. The pure digest/hex folding helpers stay free because
 ///! the per-module-key loop in `instance.cryo` folds them directly.
 
 namespace compiler::build_manifest;
@@ -55,9 +55,143 @@ import std::collections::string::{ String };
 import std::collections::array::{ Array };
 import std::json::{ value, serializer };
 import std::collections::str::{ Str };
-import std::core::hash::{ Fnv128Hasher };
+import std::core::hash::{ Hasher };
+import std::core::slice::{ Slice };
 import std::core::mem;
 import std::json::value::{ JsonObject, JsonValue };
+
+/// The running compiler's digest, once taken (`Manifest::compiler_fingerprint`).
+mut g_compiler_fingerprint: u128 = 0;
+mut g_compiler_fingerprint_taken: boolean = false;
+
+const CONTENT_C1: u64 = 0x87c37b91114253d5;
+const CONTENT_C2: u64 = 0x4cf5ad432745937f;
+
+/// The 128-bit digest every build fingerprint and cache key is taken with:
+/// MurmurHash3's x64 128-bit construction, sixteen bytes a step.  A digest
+/// of the compiler's own executable is part of every build's key, so the
+/// hasher's speed over tens of megabytes is the cost of every build.  Bytes
+/// fed one at a time and bytes fed as a run give the same digest.
+type struct ContentHasher {
+    h1:     u64;
+    h2:     u64;
+    /// Bytes not yet making a whole sixteen-byte block, in `tail[0..tail_length]`.
+    tail:   [u8; 16];
+    tail_length: u64;
+    length: u64;
+
+    static new() -> ContentHasher {
+        return ContentHasher { h1: 0, h2: 0, tail: [0; 16], tail_length: 0, length: 0 };
+    }
+
+    static rotate_left(x: u64, r: u64) -> u64 {
+        return (x << r) | (x >> (64 - r));
+    }
+
+    static final_mix(k_in: u64) -> u64 {
+        mut k: u64 = k_in;
+        k = k ^ (k >> 33);
+        k = k * 0xff51afd7ed558ccd;
+        k = k ^ (k >> 33);
+        k = k * 0xc4ceb9fe1a85ec53;
+        k = k ^ (k >> 33);
+        return k;
+    }
+
+    /// The little-endian word at `p`, read a byte at a time so it needs no
+    /// alignment.
+    static word_at(p: u8*) -> u64 {
+        return (p[0] as u64) | ((p[1] as u64) << 8) | ((p[2] as u64) << 16)
+            | ((p[3] as u64) << 24) | ((p[4] as u64) << 32) | ((p[5] as u64) << 40)
+            | ((p[6] as u64) << 48) | ((p[7] as u64) << 56);
+    }
+
+    mix_block(mut &this, low: u64, high: u64) -> void {
+        mut k1: u64 = low * CONTENT_C1;
+        k1 = ContentHasher::rotate_left(k1, 31) * CONTENT_C2;
+        this.h1 = this.h1 ^ k1;
+        this.h1 = ContentHasher::rotate_left(this.h1, 27) + this.h2;
+        this.h1 = this.h1 * 5 + 0x52dce729;
+        mut k2: u64 = high * CONTENT_C2;
+        k2 = ContentHasher::rotate_left(k2, 33) * CONTENT_C1;
+        this.h2 = this.h2 ^ k2;
+        this.h2 = ContentHasher::rotate_left(this.h2, 31) + this.h1;
+        this.h2 = this.h2 * 5 + 0x38495ab5;
+    }
+
+    /// Feed `count` bytes starting at `data`.
+    write_run(mut &this, data: u8*, count: i64) -> void {
+        mut i: i64 = 0;
+        while (i < count && this.tail_length > 0) {
+            this.write_u8(data[i]);
+            i = i + 1;
+        }
+        while (i + 16 <= count) {
+            this.mix_block(ContentHasher::word_at(data + i), ContentHasher::word_at(data + i + 8));
+            this.length = this.length + 16;
+            i = i + 16;
+        }
+        while (i < count) {
+            this.write_u8(data[i]);
+            i = i + 1;
+        }
+    }
+
+    /// The full 128-bit digest, first half high.
+    finish128(&this) -> u128 {
+        mut h1: u64 = this.h1;
+        mut h2: u64 = this.h2;
+        mut k1: u64 = 0;
+        mut k2: u64 = 0;
+        for (mut i: u64 = 0; i < this.tail_length; i++) {
+            if (i < 8) {
+                k1 = k1 | ((this.tail[i] as u64) << (i * 8));
+            } else {
+                k2 = k2 | ((this.tail[i] as u64) << ((i - 8) * 8));
+            }
+        }
+        if (this.tail_length > 8) {
+            k2 = k2 * CONTENT_C2;
+            k2 = ContentHasher::rotate_left(k2, 33) * CONTENT_C1;
+            h2 = h2 ^ k2;
+        }
+        if (this.tail_length > 0) {
+            k1 = k1 * CONTENT_C1;
+            k1 = ContentHasher::rotate_left(k1, 31) * CONTENT_C2;
+            h1 = h1 ^ k1;
+        }
+        const total: u64 = this.length + this.tail_length;
+        h1 = h1 ^ total;
+        h2 = h2 ^ total;
+        h1 = h1 + h2;
+        h2 = h2 + h1;
+        h1 = ContentHasher::final_mix(h1);
+        h2 = ContentHasher::final_mix(h2);
+        h1 = h1 + h2;
+        h2 = h2 + h1;
+        return ((h1 as u128) << 64) | (h2 as u128);
+    }
+}
+
+implement trait Hasher for struct ContentHasher {
+    write_u8(mut &this, value: u8) -> void {
+        this.tail[this.tail_length] = value;
+        this.tail_length = this.tail_length + 1;
+        if (this.tail_length == 16) {
+            this.mix_block(ContentHasher::word_at(&this.tail[0]), ContentHasher::word_at(&this.tail[8]));
+            this.length = this.length + 16;
+            this.tail_length = 0;
+        }
+    }
+
+    write_bytes(mut &this, bytes: &Slice<u8>) -> void {
+        this.write_run(bytes.as_ptr(), bytes.length());
+    }
+
+    finish(&this) -> u64 {
+        return this.finish128() as u64;
+    }
+}
 
 /// A source module feeding the build, as the fingerprint + manifest see it.
 type struct ModuleEntry {
@@ -190,7 +324,7 @@ type struct Manifest {
 
     /// Combined fingerprint over every build input.
     compute_fingerprint(&this, modules: &[ModuleEntry]) -> u128 {
-        mut h: Fnv128Hasher = Fnv128Hasher::new();
+        mut h: ContentHasher = ContentHasher::new();
         h.fold(Manifest::compiler_fingerprint());
         // Resolved knobs.
         h.fold(this.opt_level as u64);
@@ -341,13 +475,15 @@ type struct Manifest {
     /// perturbs the fingerprint. The byte count is mixed in last as a length
     /// guard. File reading is compiler-specific, so this lives here and drives
     /// the canonical `Hasher::fold` for the actual byte mixing.
-    static fold_file(h: mut Fnv128Hasher*, path_text: string) -> void {
-        Manifest::fold_file_contents(h, path_text, false);
+    static fold_file<H>(h: mut H*, path_text: string) -> void
+    where H: Hasher {
+        Manifest::fold_file_contents::<H>(h, path_text, false);
     }
 
     /// `fold_file`, reading a binary's build stamp as zeros when
     /// `clear_stamp` is set.
-    static fold_file_contents(h: mut Fnv128Hasher*, path_text: string, clear_stamp: boolean) -> void {
+    static fold_file_contents<H>(h: mut H*, path_text: string, clear_stamp: boolean) -> void
+    where H: Hasher {
         const path: string = path_text;
         if (!Path::from(path).exists()) {
             h.fold("<missing>");
@@ -361,9 +497,7 @@ type struct Manifest {
                 if (clear_stamp) {
                     StampSlot::clear_text(d, n);
                 }
-                for (mut i: i64 = 0; i < n; i++) {
-                    h.fold(d[i]);
-                }
+                h.write_bytes(Slice::from_raw(d, n));
                 mem::drop(bytes);
                 h.fold(n);
             }
@@ -383,47 +517,54 @@ type struct Manifest {
         }
     }
 
-    /// FNV-1a digest of the running compiler's own bytes. Changes whenever the
+    /// Digest of the running compiler's own bytes. Changes whenever the
     /// compiler changes, invalidating every cached build it produced.  The
     /// build stamp reads as zeros: `cryo stamp` rewrites it in place and it
     /// changes nothing the compiler emits, so a new stamp is not a new
     /// compiler.
+    /// Taken once per process: the binary does not change while it runs.
     static compiler_fingerprint() -> u128 {
+        if (g_compiler_fingerprint_taken) { return g_compiler_fingerprint; }
         const exe: string = Manifest::self_exe_path();
-        mut h: Fnv128Hasher = Fnv128Hasher::new();
+        mut h: ContentHasher = ContentHasher::new();
         if (exe.length() == 0) {
             h.fold("<unknown-compiler>");
-            return h.finish128();
+        } else {
+            Manifest::fold_file_contents(&h, exe, true);
         }
-        Manifest::fold_file_contents(&h, exe, true);
-        return h.finish128();
+        g_compiler_fingerprint = h.finish128();
+        g_compiler_fingerprint_taken = true;
+        return g_compiler_fingerprint;
     }
 
-    /// FNV-1a digest of a SINGLE module's identity + content, mirroring exactly
+    /// Digest of a SINGLE module's identity + content, mirroring exactly
     /// the per-module folding `Manifest::compute_fingerprint` does (namespace +
     /// output subtree + full file bytes). Used as the atom of every per-module
     /// cache key; folding `origin_subdir` means relocating a module between
     /// packages (which changes where its `.o` lands) invalidates its key.
     static module_source_hash(namespace_name: string, origin_subdir: string,
                                 source_path: string) -> u128 {
-        mut h: Fnv128Hasher = Fnv128Hasher::new();
+        mut h: ContentHasher = ContentHasher::new();
         h.fold(namespace_name);
         h.fold(origin_subdir);
         Manifest::fold_file(&h, source_path);
         return h.finish128();
     }
 
-    /// FNV-1a digest of the toolchain inputs that affect EVERY object file: the
-    /// compiler's own bytes plus the resolved codegen knobs. Deliberately
-    /// excludes the source modules, the stdlib archive, and the `[link]` lists - 
-    /// those are folded per-module (sources) or only affect the final link
-    /// (archive / link lists), not an individual `.o`. Every per-module key
-    /// folds this, so a changed compiler or a `--dev`/`--release` switch
-    /// invalidates the whole per-module cache.
+    /// Digest of the toolchain inputs that affect EVERY object file: the
+    /// compiler's own bytes, the key of the stdlib archive the program links
+    /// ("" when it links none) - a stdlib module's object holds only what the
+    /// archive lacks - and the resolved codegen knobs. Deliberately excludes
+    /// the source modules and the `[link]` lists - those are folded per-module
+    /// (sources) or only affect the final link, not an individual `.o`. Every
+    /// per-module key folds this, so a changed compiler or a
+    /// `--dev`/`--release` switch invalidates the whole per-module cache.
     static toolchain_fingerprint(cfg: ProjectConfig*, opt_level: u32,
-                                   debug_info: boolean) -> u128 {
-        mut h: Fnv128Hasher = Fnv128Hasher::new();
+                                   debug_info: boolean, stdlib_key_text: string) -> u128 {
+        const stdlib_key: string = stdlib_key_text;
+        mut h: ContentHasher = ContentHasher::new();
         h.fold(Manifest::compiler_fingerprint());
+        h.fold(stdlib_key);
         h.fold(opt_level as u64);
         const dbg_b:  u8 = if (debug_info)    { 1 } else { 0 };
         const ell_b:  u8 = if (cfg.emit_llvm) { 1 } else { 0 };

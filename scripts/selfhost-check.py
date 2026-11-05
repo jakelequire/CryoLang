@@ -690,6 +690,50 @@ def _compare_ir_trees(root_a: Path, root_b: Path):
     return True, (len(a), total)
 
 
+def archive_dirs(stdlib_root: Path) -> set:
+    """The stdlib archives programs have had built under `stdlib_root`, one
+    directory per key (`.bin/<triple>/prebuilt/<key>`)."""
+    return {p for p in (stdlib_root / ".bin").glob("*/prebuilt/*")
+            if p.is_dir() and "." not in p.name}
+
+
+def record_stage_archive(stage, stdlib_root: Path, seen: set, built: dict):
+    """After a compiler stage, the stdlib archive it built for the compiler it
+    linked: a stage compiler builds its own, keyed by its own bytes."""
+    now = archive_dirs(stdlib_root)
+    if stage.src == "compiler":
+        built[stage.via] = sorted(now - seen)
+    seen |= now
+
+
+def compare_stage_archives(built: dict):
+    """(True, (nmods, bytes)), (False, first differing module) or (None,
+    reason): stage-2 and stage-3 must each have built one stdlib archive, and
+    the two must hold byte-identical IR.  Every program links the stdlib from
+    its archive, so the stdlib's code is checked here, where the stage-3 and
+    stage-4 IR no longer holds it."""
+    s2, s3 = built.get("stage-2", []), built.get("stage-3", [])
+    if len(s2) != 1 or len(s3) != 1:
+        return None, (f"stage-2 built {len(s2)} stdlib archive(s) and stage-3 "
+                      f"{len(s3)}; each builds its own")
+    return _compare_ir_trees(s2[0], s3[0])
+
+
+def report_stage_archives(prefix: str, built: dict) -> bool:
+    ok, detail = compare_stage_archives(built)
+    if ok:
+        nmods, total = detail
+        print(f"  {C.GREEN}{C.BOLD}✓ STDLIB ARCHIVES OK{C.RESET}  {prefix}stage-2 and stage-3 "
+              f"built byte-identical stdlib IR ({nmods} modules, {total:,} bytes)")
+        return True
+    if ok is None:
+        print(f"  {C.RED}✗ cannot compare {prefix}stdlib archives:{C.RESET} {detail}")
+    else:
+        print(f"  {C.RED}{C.BOLD}✗ STDLIB ARCHIVES DIFFER{C.RESET}  {prefix}first differing "
+              f"module: {detail}")
+    return False
+
+
 def run_windows_selfhost(runner: list, verbose: bool = False) -> str:
     """Windows section: the 6-stage byte-identity self-host with bin/cryo.exe.
     `runner` is [] (native, Windows host) or ['wine'] (Linux host).  Returns
@@ -746,9 +790,11 @@ def run_windows_selfhost(runner: list, verbose: bool = False) -> str:
     stages = make_windows_stages(runner, env)
     start = time.perf_counter()
     times: list = []
+    seen, built = archive_dirs(ROOT / "stdlib"), {}
     for i, stage in enumerate(stages, 1):
         ok, elapsed = run_stage(i, len(stages), stage, wlog / f"stage-{i:02d}.log", verbose)
         times.append((stage.label, elapsed, ok))
+        record_stage_archive(stage, ROOT / "stdlib", seen, built)
         if not ok:
             print_summary(times, time.perf_counter() - start)
             print()
@@ -794,6 +840,8 @@ def run_windows_selfhost(runner: list, verbose: bool = False) -> str:
     else:
         print(f"  {C.RED}{C.BOLD}✗ FIXED POINT BROKEN{C.RESET}  first differing module: {detail}")
         result = ("fail", f"first differing module: {detail}")
+    if not report_stage_archives("windows ", built) and result[0] == "ok":
+        result = ("fail", "the stage-2 and stage-3 stdlib archives differ or are missing")
 
     print_summary(times, time.perf_counter() - start)
     return result
@@ -1038,11 +1086,13 @@ def main():
     stages = make_stages()
     total_start = time.perf_counter()
     times: list = []
+    seen, built = archive_dirs(ROOT / "stdlib"), {}
 
     for i, stage in enumerate(stages, 1):
         log_path = LOG_DIR / f"stage-{i:02d}.log"
         ok, elapsed = run_stage(i, len(stages), stage, log_path, args.verbose)
         times.append((stage.label, elapsed, ok))
+        record_stage_archive(stage, ROOT / "stdlib", seen, built)
         if not ok:
             total = time.perf_counter() - total_start
             print_summary(times, total)
@@ -1120,6 +1170,8 @@ def main():
         for line in head:
             print(f"  {C.DIM}│{C.RESET} {line}")
         print(f"  {C.RED}{hr(72)}{C.RESET}")
+        result_ok = False
+    if not report_stage_archives("", built):
         result_ok = False
 
     total = time.perf_counter() - total_start
