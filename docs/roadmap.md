@@ -147,9 +147,9 @@ Windows release zip and builds and runs a hello-world with it under wine,
 the way the release workflow does before it publishes.
 
 **Warnings.**  A clean build of the compiler, the standard library's own
-build and the editor's build each report 0 warnings.  Compare warnings only
-from a clean build: an incremental build does not replay a cached module's
-warnings.
+build and the editor's build each report 0 warnings.  An incremental build
+reports the same warnings as a clean one: every module is analysed in every
+build, and a build that reported warnings is never "up to date".
 
 **`--baseline` cannot reach `main`.**  `make verify ARGS="--baseline REV"`
 fails for any revision before the version stamp, `main` included (ruling

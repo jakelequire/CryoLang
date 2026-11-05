@@ -698,30 +698,6 @@ type struct CompilerInstance {
         return CompilationResult::ok(last_output);
     }
 
-    /// Union the import closure of the compiler-injected module `ns` into
-    /// `out`, for folding into every per-module cache key.
-    ///
-    /// Absent is not an error: the prelude is skipped under `no_std` and the
-    /// f-string runtime is only discovered when an f-string is actually used,
-    /// so a missing module simply contributes nothing.  A closure that comes
-    /// back SHORT is different, and raises `out_short` - the widened key would
-    /// then be missing inputs exactly like an unresolvable dependency name,
-    /// and the caller declines to serve those modules from cache.
-    mark_implicit_closure(&this, ctx: CompilationContext*, m: LangModule, n: u32,
-                          out: mut [boolean]*, out_short: mut boolean*) -> void {
-        if (ctx == null || out == null) { return; }
-        const idx: i64 = ctx.module_graph.find_module_index(
-            ctx.module_graph.lang_module(m, ctx.intern_table));
-        if (idx < 0 || idx >= n as i64) { return; }
-        mut short_walk: boolean = false;
-        const clos: [boolean] =
-            ctx.module_graph.compute_import_closure(idx as u32, n, &short_walk);
-        for (mut i: u32 = 0; i < n; i++) {
-            if (clos[i as i64]) { (*out)[i as i64] = true; }
-        }
-        if (short_walk && out_short != null) { *out_short = true; }
-    }
-
     /// Compile a single target view of a project.  Shared between the
     /// legacy single-target path and each iteration of
     /// `compile_project_multi`.
@@ -923,6 +899,8 @@ type struct CompilerInstance {
         mut tm_sema_end:       i64 = 0;
         mut tm_codegen_end:    i64 = 0;
         mut tm_link_end:       i64 = 0;
+        // Main-thread time generating IR, inside "codegen and objects".
+        mut tm_ir_generation:  i64 = 0;
 
         const root_path: string = config.discovery_root_path();
         const stdlib_root: string = ctx.options.stdlib_root;
@@ -1401,18 +1379,18 @@ type struct CompilerInstance {
         mut manifest_stdlib_archive: string = "";
         mut build_fp_hex: string = "";
 
-        // Per-module incremental cache.  Computed after Specialization (section below),
-        // consumed by the SemanticAnalysis/Codegen skip and the success-path sidecar write.
-        //   pm_cached[m]   : module index m may reuse its on-disk .o
-        //   pm_objectless[m]: module m wrote no object (reused or built so)
-        //   pm_key_names[m]: namespace of module m (parallel to pm_key_hex)
-        //   pm_key_hex[m]  : current cache key of module m
+        // Per-module incremental cache: a module whose object is emitted or
+        // reused records its key, written for the next build on success.
+        //   pm_key_names[k]: namespace of the k-th recorded module
+        //   pm_key_hex[k]  : its key
         //   pm_active      : the per-module cache is in effect this build
-        mut pm_cached:    [boolean] = [];
-        mut pm_objectless: [boolean] = [];
         mut pm_key_names: [string]  = [];
         mut pm_key_hex:   [string]  = [];
         mut pm_active:    boolean    = false;
+        mut pm_toolchain: u128       = 0;
+        mut pm_prior:     build_manifest::ModuleKeyTable = compiler::build_manifest::ModuleKeyTable::empty();
+        mut pm_reused:    u32        = 0;
+        mut pm_emitted:   u32        = 0;
         if (do_incremental) {
             for (mut i: u32 = 0; i < n; i++) {
                 const minfo: ModuleInfo* = &ctx.module_graph.modules[order[i]];
@@ -1602,220 +1580,26 @@ type struct CompilerInstance {
 
         tm_mono_end = Instant::now().as_nanos();
 
-        // ====================================================================
-        // Per-module incremental cache: decide which modules can reuse their
-        // on-disk object file instead of re-running SemanticAnalysis + Codegen.
-        // Whole-program monomorphization (Phases 1-6a) has just finished, so
-        // spec ownership and every module's source are final.  Two key
-        // formulas (see build_manifest.cryo for the soundness argument):
-        //   - a module that OWNS specializations folds a GLOBAL digest of all
-        //     source hashes (its .o embeds instances whose type-args can come
-        //     from any consumer) => rebuild on any source change;
-        //   - a module that owns none folds only its transitive import
-        //     closure's source hashes (every layout its .o can depend on is
-        //     reachable there) => unaffected by unrelated edits.
-        // Bias is toward rebuilding: anything unprovable disables the cache.
-        // ====================================================================
+        // Per-module incremental cache.  Every module is analysed and has its
+        // IR generated in every build; what a module served from the cache
+        // skips is the backend.  Its key is the bitcode it generates under
+        // this toolchain, and an object is a function of exactly those two,
+        // so the key covers every input - layouts, inlined bodies, the
+        // instances routed to the module, an implementation chosen in a
+        // third module - and an edit that changes no module's IR reuses it.
         // The stdlib's own build records every module's definitions for its
         // archive's manifest, which a module served from the cache would not
         // give, so it reuses no module's object.
         if (do_incremental && ctx.project_config != null
                 && !ctx.module_graph.builds_standard_library) {
             pm_active = true;
-
-            // Per-module source hashes (indexed by module index).
-            mut pm_src_h: [u128] = [];
-            for (mut m: u32 = 0; m < n; m++) {
-                const mi: ModuleInfo* = &ctx.module_graph.modules[m];
-                pm_src_h.push(compiler::build_manifest::Manifest::module_source_hash(
-                    ctx.intern_table.shown(mi.path().decl_name()),
-                    ModuleInfo::origin_subdir(mi.origin, mi.origin_name),
-                    mi.file_path));
-            }
-
             // A stdlib module's object holds what the archive lacks, so the
             // archive's key is part of every module's.
-            const pm_tool_fp: u128 = compiler::build_manifest::Manifest::toolchain_fingerprint(
+            pm_toolchain = compiler::build_manifest::Manifest::toolchain_fingerprint(
                 ctx.project_config, ctx.options.opt_level, ctx.options.debug_info,
                 if (ctx.prebuilt_stdlib != null) { ctx.prebuilt_stdlib.key } else { "" });
-
-            // Spec ownership.  A spec whose owner can't be attributed to a
-            // module would let a stale .o win, so disable the cache (full
-            // rebuild) rather than risk a miscompile.
-            mut pm_owns_spec: [boolean] = [];
-            for (mut m: u32 = 0; m < n; m++) { pm_owns_spec.push(false); }
-            if (ctx.monomorphizer != null) {
-                const sc: i64 = ctx.monomorphizer.spec_count();
-                for (mut s: i64 = 0; s < sc; s++) {
-                    const os: SymbolStr = ctx.monomorphizer.spec_owner_source_at(s);
-                    if (!os.is_valid()) { pm_active = false; continue; }
-                    const oidx: i64 = ctx.module_graph.find_module_by_path(
-                        ctx.intern_table.resolve(os));
-                    if (oidx >= 0 && oidx < n as i64) {
-                        pm_owns_spec[oidx] = true;
-                    } else {
-                        pm_active = false;
-                    }
-                }
-                // Generic-METHOD specs (attached to an impl block / receiver decl)
-                // are not in `spec_entries`; their emitting module is recorded
-                // separately.  Flag it too - otherwise an upstream owner that only a
-                // DOWNSTREAM module's spec demand reaches (`Logger` -> `Stderr::write<Str>`
-                // in `io::stdio`) is misclassified as a leaf, its stale object (which
-                // predates the spec) is reused, and the definition is missing at link.
-                const mc: i64 = ctx.monomorphizer.spec_owner_file_count();
-                for (mut s: i64 = 0; s < mc; s++) {
-                    const src: SymbolStr = ctx.monomorphizer.spec_owner_file_at(s);
-                    if (!src.is_valid()) { pm_active = false; continue; }
-                    const midx: i64 = ctx.module_graph.find_module_by_path(
-                        ctx.intern_table.resolve(src));
-                    if (midx >= 0 && midx < n as i64) {
-                        pm_owns_spec[midx] = true;
-                    } else {
-                        pm_active = false;
-                    }
-                }
-            }
-            // A trait-object table is emitted in the module holding its
-            // implementation, or its specialization's, on the demand of any
-            // module that converts to it, so that module is keyed as an
-            // owner is.
-            for (mut s: i64 = 0; s < ctx.object_tables.length(); s++) {
-                const tidx: i64 = ctx.module_graph.find_module_by_path(
-                    ctx.intern_table.resolve(ctx.object_tables[s].owner_source));
-                if (tidx >= 0 && tidx < n as i64) {
-                    pm_owns_spec[tidx] = true;
-                } else {
-                    pm_active = false;
-                }
-            }
-
-            // Global digest over every module's source hash, in topo order.
-            mut pm_global_h: ContentHasher = ContentHasher::new();
-            pm_global_h.fold(pm_tool_fp);
-            for (mut i: u32 = 0; i < n; i++) {
-                pm_global_h.fold(pm_src_h[order[i] as i64]);
-            }
-            const pm_global: u128 = pm_global_h.finish128();
-
-            const pm_prior: build_manifest::ModuleKeyTable =
-                compiler::build_manifest::ModuleKeyTable::read_module_keys(ctx.project_config.module_keys_path());
-
-            // Per-module key (indexed by module index, parallel arrays).
-            // `pm_closure_ok` clears for any module whose import closure came
-            // back short; such a module is never served from cache.
-            mut pm_closure_ok: [boolean] = [];
-            for (mut m: u32 = 0; m < n; m++) {
-                pm_cached.push(false);
-                pm_objectless.push(false);
-                pm_closure_ok.push(true);
-            }
-
-            // Modules the compiler loads on a module's behalf - the prelude,
-            // and the f-string runtime when an f-string appears anywhere - are
-            // force-discovered AFTER the import graph is built and never get a
-            // dependency edge from the modules that go on to import them.  The
-            // closure walk therefore cannot reach them, and unlike an
-            // unresolvable dependency name nothing reports the gap: the walk
-            // completes, just short.  A layout change to a prelude-reachable
-            // type would leave every consumer's key unchanged while its `.o`
-            // still had the old field offsets baked in.
-            //
-            // Folded into every leaf key rather than repaired by adding the
-            // edges: `dependencies` also drives name resolution and link
-            // order, and which modules actually receive the injection is not
-            // settled until AutoImport runs, so widening the key is the change
-            // that cannot be wrong in the dangerous direction.  Owner modules
-            // already fold the global digest and so are covered.
-            mut pm_implicit: [boolean] = [];
-            for (mut i: u32 = 0; i < n; i++) { pm_implicit.push(false); }
-            mut pm_implicit_short: boolean = false;
-            if (ctx.options.mode.auto_imports_enabled() && !config.no_std) {
-                this.mark_implicit_closure(ctx, LangModule::Prelude, n,
-                                           &pm_implicit, &pm_implicit_short);
-                if (ctx.module_graph.uses_fstring) {
-                    this.mark_implicit_closure(ctx, LangModule::Interp, n,
-                                               &pm_implicit, &pm_implicit_short);
-                }
-            }
-            // A module calling an `![inline]` function embeds a copy of its
-            // body, so every leaf key folds the source of each module that
-            // writes or holds one (a placed specialization), imported or
-            // not.  Folded in with the implicit set.
-            mut pm_inline: [boolean] = [];
-            for (mut m: u32 = 0; m < n; m++) {
-                const islot: void** = (ast_buf as void**) + m;
-                const writes: boolean = InlineBodies::writes_inline_body(*islot as ProgramNode*);
-                pm_inline.push(writes);
-                if (writes) { pm_implicit[m as i64] = true; }
-            }
-            for (mut m: u32 = 0; m < n; m++) {
-                const mi: ModuleInfo* = &ctx.module_graph.modules[m];
-                const ns: string = ctx.intern_table.shown(mi.path().decl_name());
-                mut k: ContentHasher = ContentHasher::new();
-                k.fold(pm_tool_fp);
-                if (pm_owns_spec[m as i64]) {
-                    k.fold("owner");
-                    k.fold(pm_global);
-                } else {
-                    k.fold("leaf");
-                    mut clos_incomplete: boolean = false;
-                    const clos: [boolean] =
-                        ctx.module_graph.compute_import_closure(m, n, &clos_incomplete);
-                    for (mut i: u32 = 0; i < n; i++) {
-                        // The implicit set is unioned in rather than folded
-                        // separately so a module reached BOTH ways still folds
-                        // exactly once and the key stays order-stable.
-                        if (clos[order[i] as i64] || pm_implicit[order[i] as i64]) {
-                            k.fold(pm_src_h[order[i] as i64]);
-                        }
-                    }
-                    // An unresolvable dependency name left the closure short, so
-                    // this key doesn't cover everything the module was compiled
-                    // against.  Rebuild rather than risk a stale `.o`.
-                    if (clos_incomplete) { pm_closure_ok[m as i64] = false; }
-                    // Same reasoning for the implicit set: if the prelude's own
-                    // closure came back short, the widened key is short too.
-                    if (pm_implicit_short) { pm_closure_ok[m as i64] = false; }
-                }
-                pm_key_names.push(ns);
-                pm_key_hex.push(compiler::build_manifest::Manifest::hex128(k.finish128()));
-            }
-
-            // Cached if the prior key matches AND the .o is still on disk, or
-            // the prior build of that key wrote none.
-            if (pm_active) {
-                for (mut m: u32 = 0; m < n; m++) {
-                    if (!pm_closure_ok[m as i64]) { continue; }
-                    const mi: ModuleInfo* = &ctx.module_graph.modules[m];
-                    const prior_k: string = pm_prior.lookup(pm_key_names[m as i64]);
-                    if (prior_k == "") { continue; }
-                    if (prior_k != pm_key_hex[m as i64]) { continue; }
-                    const objp: string = Path::from(ctx.project_config.deps_dir_for(
-                            ModuleInfo::origin_subdir(mi.origin, mi.origin_name)))
-                        .join(f"{compiler::build_manifest::Manifest::path_module(ctx.intern_table.shown(mi.path().decl_name()))}.o".as_str())
-                        .into_raw();
-                    const objectless: boolean = pm_prior.produced_no_object(pm_key_names[m as i64]);
-                    if (objectless || Path::from(objp).exists()) {
-                        pm_cached[m as i64] = true;
-                        pm_objectless[m as i64] = objectless;
-                    }
-                }
-                // A rebuilt module copies `![inline]` bodies from the modules
-                // holding them, which must then be analysed in this build too.
-                mut any_rebuilt: boolean = false;
-                for (mut m: u32 = 0; m < n; m++) {
-                    if (!pm_cached[m as i64]) { any_rebuilt = true; }
-                }
-                if (any_rebuilt) {
-                    for (mut m: u32 = 0; m < n; m++) {
-                        if (pm_inline[m as i64]) {
-                            pm_cached[m as i64] = false;
-                            pm_objectless[m as i64] = false;
-                        }
-                    }
-                }
-            }
+            pm_prior = compiler::build_manifest::ModuleKeyTable::read_module_keys(
+                ctx.project_config.module_keys_path());
         }
 
         // Semantic analysis: GenericValidation + MoveCheck + DropInsertion +
@@ -1849,12 +1633,6 @@ type struct CompilerInstance {
 
         mut phase6_failed: boolean = false;
         for (mut i: u32 = 0; i < n; i++) {
-            // Cached module: its source + dependencies are unchanged, so its
-            // bodies already type-/move-checked clean in the build that
-            // produced the reusable .o.  Skip sema/lowering entirely; nothing
-            // downstream (cross-module descriptors, other modules' codegen,
-            // linking) reads a cached module's lowered AST.
-            if (pm_active && pm_cached[order[i] as i64]) { continue; }
             CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
@@ -1956,18 +1734,6 @@ type struct CompilerInstance {
                 if (n_dep > 0) { fmt::printf(", %u dep", n_dep); }
                 if (n_vendor > 0) { fmt::printf(", %u vendor", n_vendor); }
                 fmt::printf(" module(s)\n");
-
-                // Report how many modules' objects are being reused from the
-                // per-module incremental cache vs. recompiled this build.
-                if (pm_active) {
-                    mut n_reused: u32 = 0;
-                    for (mut si: u32 = 0; si < n; si++) {
-                        if (pm_cached[order[si] as i64]) { n_reused += 1; }
-                    }
-                    if (n_reused > 0) {
-                        fmt::println(f"  reusing {n_reused} cached object(s), recompiling {n - n_reused}");
-                    }
-                }
             }
 
             // Per-module LLVM IR (`.ll`) output dir is computed PER MODULE at
@@ -2119,10 +1885,8 @@ type struct CompilerInstance {
             }
 
             // Every analysed `![inline]` body, for the modules calling one to
-            // copy.  A cached module was not analysed and offers none; the
-            // cache never reuses a module holding one while it rebuilds any.
+            // copy.
             for (mut r: u32 = 0; r < n; r++) {
-                if (pm_active && pm_cached[r as i64]) { continue; }
                 const rslot: void** = (ast_buf as void**) + r;
                 InlineBodies::record(ctx, *rslot as ProgramNode*);
             }
@@ -2144,21 +1908,6 @@ type struct CompilerInstance {
                 if (Log::enabled(LogArea::Driver, LogLevel::Debug)) {
                     Log::debug(LogArea::Driver, f"generating module {i} of {n}: {_mn}");
                 }
-                // Cached module: reuse the on-disk object instead of
-                // regenerating IR + emitting it.  Recorded at this topo
-                // position; registered with everything else below.
-                if (pm_active && pm_cached[order[i] as i64]) {
-                    if (pm_objectless[order[i] as i64]) { continue; }
-                    cg_obj[i as i64] = Path::from(ctx.project_config.deps_dir_for(
-                            ModuleInfo::origin_subdir(_mi.origin, _mi.origin_name)))
-                        .join(f"{compiler::build_manifest::Manifest::path_module(_mn)}.o".as_str())
-                        .into_raw();
-                    if (Log::enabled(LogArea::Driver, LogLevel::Debug)) {
-                        Log::debug(LogArea::Driver, f"reused the cached object {cg_obj[i as i64]}");
-                    }
-                    continue;
-                }
-
                 // Fresh per-module LLVM context - KEPT alive: its emit job owns
                 // it and disposes it after `emit_to_file`, so it must not be
                 // freed here (a concurrent worker may still be reading it).  The
@@ -2188,7 +1937,9 @@ type struct CompilerInstance {
                 ctx.provisions.mark(Provision::BodiesTypeChecked);
                 ctx.provisions.mark(Provision::TypesLowered);
 
+                const tm_ir_start: i64 = Instant::now().as_nanos();
                 const _gen_ok: boolean = pipeline.run_all(ctx);
+                tm_ir_generation = tm_ir_generation + (Instant::now().as_nanos() - tm_ir_start);
 
                 const mod_info: ModuleInfo* = &ctx.module_graph.modules[order[i]];
                 const mod_name: string = ctx.intern_table.shown(mod_info.path().decl_name());
@@ -2251,7 +2002,6 @@ type struct CompilerInstance {
                     // An object an earlier build left would be linked as this
                     // build's; the module cache records that there is none.
                     CodegenPasses::remove_previous_output(CodegenPasses::resolve_emit_target(ctx).emit_path);
-                    if (pm_active) { pm_objectless[order[i] as i64] = true; }
                     mut emptied: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
                     emptied.dispose();
                     ctx.artifacts.ir = IROutput::empty();
@@ -2274,6 +2024,32 @@ type struct CompilerInstance {
                     compiler::codegen::llvm_types::dispose_codegen_context();
                     pipeline.reset();
                     continue;
+                }
+
+                // The object an earlier build emitted from this very bitcode
+                // is this build's object.
+                if (pm_active) {
+                    mut key_hasher: ContentHasher = ContentHasher::new();
+                    key_hasher.fold(pm_toolchain);
+                    const keyed_module: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
+                    keyed_module.fold_bitcode(&key_hasher);
+                    const key: string = compiler::build_manifest::Manifest::hex128(key_hasher.finish128());
+                    pm_key_names.push(mod_name);
+                    pm_key_hex.push(key);
+                    if (pm_prior.lookup(mod_name) == key && Path::from(tgt.emit_path).exists()) {
+                        cg_obj[i as i64] = tgt.emit_path;
+                        pm_reused += 1;
+                        if (Log::enabled(LogArea::Driver, LogLevel::Debug)) {
+                            Log::debug(LogArea::Driver, f"reused the cached object {tgt.emit_path}");
+                        }
+                        mut reused_module: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
+                        reused_module.dispose();
+                        ctx.artifacts.ir = IROutput::empty();
+                        compiler::codegen::llvm_types::dispose_codegen_context();
+                        pipeline.reset();
+                        continue;
+                    }
+                    pm_emitted += 1;
                 }
 
                 // An earlier build's object is removed before this one is
@@ -2441,6 +2217,10 @@ type struct CompilerInstance {
             // The last per-module context was disposed above; NULL the global
             // (do not dispose) before the target-end teardown, or it double-frees.
             compiler::codegen::llvm_types::clear_codegen_context_ptr();
+
+            if (pm_reused > 0 && !ctx.options.mode.skip_user_main()) {
+                fmt::println(f"  reusing {pm_reused} cached object(s), recompiling {pm_emitted}");
+            }
 
             // Register every module's object in topo order - link-stable
             // regardless of the order objects finished emitting.
@@ -2636,15 +2416,14 @@ type struct CompilerInstance {
             const manifest: build_manifest::Manifest = compiler::build_manifest::Manifest::new(
                 ctx.project_config, ctx.options.opt_level, ctx.options.debug_info,
                 manifest_stdlib_archive);
-            manifest.write_fingerprint(build_fp_hex);
+            manifest.write_fingerprint(build_fp_hex, ctx.diagnostics.has_warnings());
             manifest.write_manifest(&mod_entries, build_fp_hex, &manifest_artifacts);
-            // Per-module cache keys for the NEXT build to consult.  Written
-            // whenever they were computed: every module not marked cached was
-            // just recompiled, so its key now matches its on-disk .o.
-            if (pm_key_names.length() > 0) {
+            // Per-module cache keys for the NEXT build to consult: every
+            // module with an object, emitted or reused, under the key of the
+            // bitcode that object was emitted from.
+            if (pm_active) {
                 compiler::build_manifest::ModuleKeyTable::write_module_keys(
-                    ctx.project_config.module_keys_path(),
-                    &pm_key_names, &pm_key_hex, &pm_objectless);
+                    ctx.project_config.module_keys_path(), &pm_key_names, &pm_key_hex);
             }
         }
 
@@ -2668,6 +2447,7 @@ type struct CompilerInstance {
             Log::info(LogArea::Time, CompilerInstance::timing_line("sema and lowering", tm_sema_end - tm_mono_end, total));
             if (tm_codegen_end > 0) {
                 Log::info(LogArea::Time, CompilerInstance::timing_line("codegen and objects", tm_codegen_end - tm_sema_end, total));
+                Log::info(LogArea::Time, CompilerInstance::timing_line("  of which IR generation", tm_ir_generation, total));
             }
             if (tm_link_end > 0) {
                 Log::info(LogArea::Time, CompilerInstance::timing_line("link", tm_link_end - tm_codegen_end, total));

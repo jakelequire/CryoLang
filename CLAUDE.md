@@ -83,18 +83,14 @@ So:
 Most of these were, at some point, reporting success for work they had
 not done. The remaining limits are here so nobody rediscovers them:
 
-- **A compiler warning total from an incremental build is not a count.** A
-  module reused from cache skips the stage after monomorphization, and its
-  warnings from that stage (unused variables, unused functions, unreachable
-  code among them) are not replayed: the same source reads fewer warnings
-  after a comment is added to a leaf file than it does clean. Take a warning
-  total only after `rm -rf compiler/build`, and compare two builds' warnings
-  as SETS (code, file, line), never as totals. The skip is
-  `if (pm_active && pm_cached[...]) { continue; }` in
-  `compiler/src/compiler/instance.cryo`; the fix is to store each reused
-  module's warnings beside its object and replay them, and it is not done.
-  This was diagnosed once already and lost, because it lived only in a
-  status document's prose.
+- **An incremental build reports every warning, and "up to date" means
+  there were none.** Every module is analysed and has its IR generated in
+  every build; the cache skips only the backend of a module whose bitcode is
+  unchanged, so warnings never depend on what was cached. A build that
+  reported warnings records no whole-build fingerprint, so the next one
+  analyses again rather than printing "is up to date". Compare two builds'
+  warnings as SETS (code, file, line) all the same: a total hides one
+  warning traded for another.
 - **`make test` passes on an exit code.** A suite that ran nothing prints no
   header, no summary and no explanation, and exits 0 with `OVERALL PASS`.
   Use `make test-census` wherever the run is being taken as evidence; it
@@ -524,8 +520,7 @@ with no diff to check it against.
   archive is built in place under `<key>.lock` and opens only once its
   manifest, renamed into place last, is there. Its stdlib modules'
   objects hold only the generic instances the archive lacks, and one left
-  with nothing writes no object (the module cache records that, `none` in
-  its `.modkeys` line, and reuses it). verify hashes the archives as a third population (`stdlib`); a
+  with nothing writes no object. verify hashes the archives as a third population (`stdlib`); a
   baseline compiler that links none leaves that population empty and its
   stdlib modules' objects count as "replaced by the archive".
 - A scratch project outside the repo cannot find the stdlib — set

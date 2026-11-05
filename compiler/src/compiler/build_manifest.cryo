@@ -16,24 +16,12 @@
 ///! the frontend even runs.
 ///!
 ///! When the whole-build fingerprint DOES differ, a per-module cache (the
-///! `*.modkeys` sidecar) decides which modules' objects can be reused so the
-///! backend (Phase 6b sema + Phase 7 codegen, which measurement puts at ~90%
-///! of build time) only re-runs for modules that actually changed. Because
-///! Cryo monomorphizes across ALL modules before per-module codegen (Phase
-///! 6a), a module's `.o` is not a pure function of its own source - so the
-///! per-module key is computed two ways (see `module_source_hash` /
-///! `toolchain_fingerprint` here and the key derivation in
-///! `instance.cryo::run_project`):
-///!   - a module that OWNS specializations (its `.o` embeds monomorphized
-///!     instances whose type-args can come from any consumer) folds a GLOBAL
-///!     digest of every module's source hash - it rebuilds whenever any
-///!     source changes (conservative but always sound);
-///!   - a module that owns NO specializations folds only the source hashes of
-///!     its transitive import closure - every type whose layout its `.o`
-///!     depends on is reachable through that closure, so a leaf edit leaves
-///!     unrelated modules cached.
-///! Bias is always toward rebuilding: a false cache miss is merely slow, a
-///! false hit is a miscompile.
+///! `*.modkeys` sidecar) decides which modules' objects can be reused, so the
+///! backend runs only for modules whose object would change.  A module's
+///! object is a function of the bitcode its IR generation produces and the
+///! toolchain (`toolchain_fingerprint`), so its key is a digest of exactly
+///! those: the front end and IR generation run for every module in every
+///! build, and a module whose bitcode is unchanged reuses its object.
 ///!
 ///! The whole-build fingerprint, up-to-date check, and `build-manifest.json`
 ///! write are bundled on the `Manifest` object, which captures the build's
@@ -63,9 +51,6 @@ import std::json::value::{ JsonObject, JsonValue };
 /// The running compiler's digest, once taken (`Manifest::compiler_fingerprint`).
 mut g_compiler_fingerprint: u128 = 0;
 mut g_compiler_fingerprint_taken: boolean = false;
-
-/// The `*.modkeys` field marking a module whose build wrote no object.
-const OBJECTLESS_MARK: string = "none";
 
 const CONTENT_C1: u64 = 0x87c37b91114253d5;
 const CONTENT_C2: u64 = 0x4cf5ad432745937f;
@@ -206,28 +191,14 @@ type struct ModuleEntry {
 
 
 /// Prior per-module cache keys, loaded from the `*.modkeys` sidecar. Parallel
-/// `names`/`keys`/`objectless` arrays; `lookup` returns the stored key hex for
-/// a namespace or "" when absent (a never-before-seen module always rebuilds).
-/// `objectless` marks a module whose build wrote no object - a stdlib module
-/// the stdlib archive leaves empty - which is as reusable as one whose object
-/// is on disk.
+/// `names`/`keys` arrays; `lookup` returns the stored key hex for a namespace
+/// or "" when absent (a never-before-seen module always rebuilds).
 type struct ModuleKeyTable {
     names:      [string];
     keys:       [string];
-    objectless: [boolean];
 
     static empty() -> ModuleKeyTable {
-        return ModuleKeyTable { names: [], keys: [], objectless: [] };
-    }
-
-    /// Whether the module's recorded build wrote no object.
-    produced_no_object(&this, name: string) -> boolean {
-        for (mut i: i64 = 0; i < this.names.length(); i++) {
-            if (this.names[i].eq(name)) {
-                return this.objectless[i];
-            }
-        }
-        return false;
+        return ModuleKeyTable { names: [], keys: [] };
     }
 
     lookup(&this, name: string) -> string {
@@ -271,48 +242,34 @@ type struct ModuleKeyTable {
             while (i < n && data[i] != 9 && data[i] != 10) { i = i + 1; }
             mut name: string = "";
             mut keyh: string = "";
-            mut objectless: boolean = false;
             if (i < n && data[i] == 9) {
                 name = ModuleKeyTable::modkeys_slice(data, name_start, i - name_start);
                 i = i + 1;                       // skip TAB
                 const key_start: u64 = i;
                 while (i < n && data[i] != 9 && data[i] != 10) { i = i + 1; }
                 keyh = ModuleKeyTable::modkeys_slice(data, key_start, i - key_start);
-                if (i < n && data[i] == 9) {
-                    i = i + 1;                   // skip TAB
-                    const mark_start: u64 = i;
-                    while (i < n && data[i] != 10) { i = i + 1; }
-                    objectless = ModuleKeyTable::modkeys_slice(data, mark_start, i - mark_start) == OBJECTLESS_MARK;
-                }
-            } else {
-                // No TAB before end-of-line: skip the rest of this line.
-                while (i < n && data[i] != 10) { i = i + 1; }
             }
+            // Anything after the key is not part of the table.
+            while (i < n && data[i] != 10) { i = i + 1; }
             if (i < n && data[i] == 10) { i = i + 1; }   // skip newline
             if (name.length() > 0 && keyh.length() > 0) {
                 t.names.push(name);
                 t.keys.push(keyh);
-                t.objectless.push(objectless);
             }
         }
         return t;
     }
 
-    /// Write the `*.modkeys` sidecar (`namespace<TAB>keyhex` per line, then
-    /// `<TAB>none` for a module that wrote no object). The caller must have
-    /// created the incremental dir (e.g. via `Manifest::write_fingerprint`,
-    /// which always runs alongside this on the success path).
-    static write_module_keys(path: string, names: &[string],
-                               keys: &[string], objectless: &[boolean]) -> void {
+    /// Write the `*.modkeys` sidecar (`namespace<TAB>keyhex` per line). The
+    /// caller must have created the incremental dir (e.g. via
+    /// `Manifest::write_fingerprint`, which always runs alongside this on the
+    /// success path).
+    static write_module_keys(path: string, names: &[string], keys: &[string]) -> void {
         mut text: String = String::new();
         for (mut i: i64 = 0; i < names.length(); i++) {
             text.push(Str::new(names[i]));
             text.push_byte(9 as u8);     // TAB
             text.push(Str::new(keys[i]));
-            if (objectless[i]) {
-                text.push_byte(9 as u8);
-                text.push(Str::new(OBJECTLESS_MARK));
-            }
             text.push_byte(10 as u8);    // LF
         }
         match (File::write_bytes(Path::from(path), text.as_bytes())) {
@@ -402,12 +359,26 @@ type struct Manifest {
         return true;
     }
 
-    /// Write the fingerprint sidecar (`incremental/inputs.fp`), creating the
-    /// incremental dir first.
-    write_fingerprint(&this, fp_hex_text: string) -> void {
+    /// Write the fingerprint sidecar (`incremental/inputs.fp`) the next
+    /// build's short-circuit compares, creating the incremental dir first.
+    /// A build that reported warnings records none: skipping the next build
+    /// would skip reporting them, so the next build analyses the program
+    /// again, and reuses every object whose bitcode is unchanged.
+    write_fingerprint(&this, fp_hex_text: string, reported_warnings: boolean) -> void {
         const fp_hex: string = fp_hex_text;
         ProjectConfig::mkdir_p(this.cfg.incremental_dir());
         const path: string = this.cfg.fingerprint_path();
+        if (reported_warnings) {
+            if (Path::from(path).exists()) {
+                match (File::remove(Path::from(path))) {
+                    Result::Ok(_)  => {}
+                    Result::Err(_) => {
+                        fmt::eprintln(f"warning: cannot remove the build fingerprint {path}; the next build may skip reporting this build's warnings");
+                    }
+                }
+            }
+            return;
+        }
         mut text: String = String::new();
         text.push(Str::new(fp_hex));
         text.push_byte(10 as u8);        // LF
@@ -565,20 +536,6 @@ type struct Manifest {
         g_compiler_fingerprint = h.finish128();
         g_compiler_fingerprint_taken = true;
         return g_compiler_fingerprint;
-    }
-
-    /// Digest of a SINGLE module's identity + content, mirroring exactly
-    /// the per-module folding `Manifest::compute_fingerprint` does (namespace +
-    /// output subtree + full file bytes). Used as the atom of every per-module
-    /// cache key; folding `origin_subdir` means relocating a module between
-    /// packages (which changes where its `.o` lands) invalidates its key.
-    static module_source_hash(namespace_name: string, origin_subdir: string,
-                                source_path: string) -> u128 {
-        mut h: ContentHasher = ContentHasher::new();
-        h.fold(namespace_name);
-        h.fold(origin_subdir);
-        Manifest::fold_file(&h, source_path);
-        return h.finish128();
     }
 
     /// Digest of the toolchain inputs that affect EVERY object file: the

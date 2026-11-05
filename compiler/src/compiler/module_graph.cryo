@@ -269,9 +269,6 @@ public:
     /// discovery has finished (`ModuleGraph::set_visible_modules`); the
     /// relation a written module path is judged reachable by.
     visible:              [ModulePath];
-    /// Recorded dependencies the graph holds no module for.  A dependency
-    /// closure that met one is incomplete (`compute_import_closure`).
-    unresolved_dependencies: u32;
 
     // Source origin, classified by the orchestrator after discovery from the
     // module's `file_path` (under stdlib_root => Stdlib, under a dependency
@@ -303,7 +300,6 @@ public:
             written_submodule_at: [],
             written_reexports:    [],
             visible:              [],
-            unresolved_dependencies: 0,
             origin:             ModuleOrigin::Local,
             origin_name:        "",
             def:                DefId::invalid(),
@@ -754,8 +750,7 @@ public:
     /// Turn every module's recorded edges into the modules they name, once,
     /// when discovery has finished and the graph holds every module an edge
     /// can name.  A recorded namespace the graph holds no module for names
-    /// nothing: a dependency's is counted, so a closure over it knows it is
-    /// incomplete; any other edge carries no module to see.
+    /// nothing.
     resolve_edges(mut &this) -> void {
         for (mut i: i64 = 0; i < this.modules.length(); i++) {
             // A module is no dependency of its own: `import A::{ X };` records
@@ -764,12 +759,9 @@ public:
             // ("blocked by itself").  The edge orders nothing, and the brace
             // items are recorded separately as visibility edges.  A module
             // re-exporting itself is dropped for the same reason.
-            mut unresolved: u32 = 0;
-            this.modules[i].dependencies = this.modules_of(&this.modules[i].written_dependencies, i, false, &unresolved);
-            this.modules[i].unresolved_dependencies = unresolved;
-            mut ignored: u32 = 0;
-            this.modules[i].imported_namespaces = this.modules_of(&this.modules[i].written_imported, -1, true, &ignored);
-            this.modules[i].submodules = this.modules_of(&this.modules[i].written_submodules, -1, true, &ignored);
+            this.modules[i].dependencies = this.modules_of(&this.modules[i].written_dependencies, i, false);
+            this.modules[i].imported_namespaces = this.modules_of(&this.modules[i].written_imported, -1, true);
+            this.modules[i].submodules = this.modules_of(&this.modules[i].written_submodules, -1, true);
             mut sites: [SubmoduleSite] = [];
             for (mut k: i64 = 0; k < this.modules[i].written_submodules.length(); k++) {
                 const m: ModulePath = this.edge_module(&this.modules[i].written_submodules[k]);
@@ -783,7 +775,7 @@ public:
             }
             this.modules[i].submodule_sites = sites;
             this.modules[i].written_submodule_at = [];
-            this.modules[i].reexports = this.modules_of(&this.modules[i].written_reexports, i, true, &ignored);
+            this.modules[i].reexports = this.modules_of(&this.modules[i].written_reexports, i, true);
             this.modules[i].written_dependencies = [];
             this.modules[i].written_imported = [];
             this.modules[i].written_submodules = [];
@@ -810,19 +802,16 @@ public:
     }
 
     /// The modules a recorded list of namespaces names, in order; one the
-    /// graph holds no module for is left out and counted in `*out_unresolved`.
-    /// The module at index `except` (-1 for none) is left out, and with
-    /// `once` a module recorded twice appears once, where it was first
-    /// recorded - both judged by the module, after the namespace is resolved.
-    modules_of(&this, written: &[RecordedEdge], except: i64, once: boolean, out_unresolved: mut u32*) -> [ModulePath] {
+    /// graph holds no module for is left out.  The module at index `except`
+    /// (-1 for none) is left out, and with `once` a module recorded twice
+    /// appears once, where it was first recorded - both judged by the module,
+    /// after the namespace is resolved.
+    modules_of(&this, written: &[RecordedEdge], except: i64, once: boolean) -> [ModulePath] {
         mut out: [ModulePath] = [];
         mut seen: [i64] = [];
         for (mut i: i64 = 0; i < written.length(); i++) {
             const m: ModulePath = this.edge_module(&written[i]);
-            if (!m.is_valid()) {
-                *out_unresolved = *out_unresolved + 1;
-                continue;
-            }
+            if (!m.is_valid()) { continue; }
             const idx: i64 = this.find_module_index(m);
             if (idx == except) { continue; }
             if (once) {
@@ -1142,50 +1131,6 @@ public:
         return this.topo_order.length() == (n as i64);
     }
 
-    /// Transitive import closure of module `root` (including `root` itself),
-    /// returned as a per-module-index boolean set of length `n`.  Follows
-    /// `ModuleInfo.dependencies` edges via the name index; dependencies that
-    /// resolve to no module (external / unresolved) are simply skipped.  Used
-    /// by the per-module incremental cache to fold exactly the source hashes
-    /// whose type layouts a non-spec-owning module's object file can depend on.
-    /// `out_incomplete` is set when a dependency name encountered during the
-    /// walk doesn't resolve to a module index in range.  The closure returned
-    /// is then a STRICT SUBSET of the real one, which is unsafe to key a cache
-    /// on: the unreached module's source hash never folds into the consumer's
-    /// key, so editing it leaves the key unchanged while the consumer's `.o`
-    /// still has the old declarations baked in.  Callers must decline to reuse
-    /// a cached object for that module rather than trust a short closure.
-    /// A missing edge is not a conservative approximation - it is the
-    /// non-conservative direction.
-    compute_import_closure(&this, root: u32, n: u32, out_incomplete: mut boolean*) -> [boolean] {
-        if (out_incomplete != null) { *out_incomplete = false; }
-        mut visited: [boolean] = [];
-        for (mut i: u32 = 0; i < n; i++) { visited.push(false); }
-        if (root >= n) { return visited; }
-        // BFS over a queue with a cursor (no pop needed).
-        mut queue: [u32] = [];
-        queue.push(root);
-        visited[root as i64] = true;
-        mut head: i64 = 0;
-        while (head < queue.length()) {
-            const cur: u32 = queue[head];
-            head = head + 1;
-            const info: const ModuleInfo* = &this.modules[cur];
-            if (info.unresolved_dependencies > 0 && out_incomplete != null) { *out_incomplete = true; }
-            for (mut d: i64 = 0; d < info.dependencies.length(); d++) {
-                const didx: i64 = this.find_module_index(info.dependencies[d]);
-                if (didx < 0 || didx >= n as i64) {
-                    if (out_incomplete != null) { *out_incomplete = true; }
-                    continue;
-                }
-                if (!visited[didx]) {
-                    visited[didx] = true;
-                    queue.push(didx as u32);
-                }
-            }
-        }
-        return visited;
-    }
 
 
     // Free helper for topological sort (avoids method-in-complex-function issues)

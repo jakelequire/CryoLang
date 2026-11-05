@@ -19,6 +19,9 @@ reused from the first build, they would hold no such table.
 
 `spawn<C>` is a generic method written inside `type struct Scope { .. }`, so
 its instances are emitted in `std::thread`'s object, not in the module that
-calls it.  If that module is not recognised as owning a specialization, its
-object from the first build - which has no `spawn<JobB>` - is reused, and
-the link fails on the undefined symbol.
+calls it.  If the cache reused that module's object from the first build -
+which has no `spawn<JobB>` - the link would fail on the undefined symbol.
+
+`src/steady.cryo` is the one module the edit neither touches nor asks for
+anything new: its object is the one the second build must reuse, which is
+what shows the cache was in effect while the others were emitted again.
