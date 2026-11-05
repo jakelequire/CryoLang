@@ -244,7 +244,7 @@ Tests and gates
   make vendor-check      Every constant shape survives `cryo vendor`.
   make verify-freestanding  Runtime tiers' freestanding acceptance check
                          (POSIX only; refuses on Windows).
-  make selfhost-check    Byte-identity fixed point.  Linux host: the 6-stage
+  make selfhost-check    Byte-identity fixed point.  Linux host: the Linux
                          chain, then the Windows chain under wine (a skipped
                          arm fails unless ARGS=--allow-skipped-arm).  Windows
                          host: the Linux chain in WSL, from a digest-checked
@@ -556,13 +556,13 @@ endif
 # streaming subprocess output.
 #
 # The script is host-aware:
-#   Linux host:   runs the full 6-stage Linux chain natively, then the
+#   Linux host:   runs the full Linux chain natively, then the
 #                 wine-based Windows chain.  Without the mingw toolchain,
 #                 wine and .toolchains that arm is skipped, and a skipped arm
 #                 fails the check unless ARGS=--allow-skipped-arm says so.
-#   Windows host: runs the 6-stage Linux chain in WSL, from a copy of its
+#   Windows host: runs the Linux chain in WSL, from a copy of its
 #                 sources on WSL's own filesystem (refused unless its digest
-#                 is the working tree's), at the same time as the 6-stage
+#                 is the working tree's), at the same time as the
 #                 Windows chain natively.  Requires wsl.exe on PATH.
 ifeq ($(HOST_OS),windows)
 # The wrapper checks for python + wsl.exe, then drives selfhost-check.py.

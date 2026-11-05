@@ -39,7 +39,7 @@
 #     <llvm-mingw>/bin/llvm-ar.exe - CRYO_AR (archiver, wine-runnable)
 #
 # scripts/selfhost-check.py points CRYO_CC/CRYO_AR at the llvm-mingw bits and
-# runs the full 6-stage windows byte-identity self-host under wine.  Idempotent:
+# runs the full windows byte-identity self-host under wine.  Idempotent:
 # re-running with the artifacts already in place is a no-op unless --force.
 #
 # Requires (host): curl, tar (xz), unzip, llvm-readobj-20,
@@ -221,7 +221,7 @@ Ship BOTH DLLs next to cryo.exe at runtime: LLVM-C.dll and libclang.dll.
 
 Cross-build + self-host under wine:
 
-  make selfhost-check            # runs the windows 6-stage gate after the linux one
+  make selfhost-check            # runs the windows gate after the linux one
   # or just smoke-test a cross-build:
   cd compiler && CRYO_STDLIB=\$PWD/../stdlib \\
     CRYO_CC=${MINGW_CLANG} CRYO_AR=${MINGW_AR} \\

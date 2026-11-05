@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-selfhost-check: build the Cryo compiler through 3 rounds (6 stages) and
-verify that stage-3 and stage-4 produce byte-identical IR.
+selfhost-check: build the Cryo compiler through 3 rounds and verify that
+stage-3 and stage-4 produce byte-identical IR, and that the stdlib archives
+stage-2 and stage-3 build hold byte-identical IR.
 
 The chain is rooted at the pinned `bin/cryo` self-hosted binary, not the
 legacy C++ bootstrap. That binary is the canonical entry point for the
@@ -23,15 +24,13 @@ top-level clutter:
     compiler/build/                 (stage-2 - also what `make cryo` builds)
     compiler/build/self/s3/         (stage-3 compiler)
     compiler/build/self/s4/         (stage-4 compiler - IR-identity gate)
-    stdlib/.bin/                    (built by pin - canonical link target)
-    stdlib/.bin/self/s2/            (rebuilt by stage-2; smoke-test only)
-    stdlib/.bin/self/s3/            (rebuilt by stage-3; smoke-test only)
+    stdlib/.bin/<triple>/           (built by pin - what the pin links)
+    stdlib/.bin/<triple>/prebuilt/  (one archive per stage compiler)
 
-The `.bin/self/sN` archives are written by their corresponding compiler
-stage but never read back - every compiler stage links against the
-canonical `<stdlib>/.bin/<triple>/libcryo.a` produced in round 1. Rebuilding
-stdlib at each round is a smoke test that the stage's codegen handles
-the stdlib source, not a link dependency.
+A compiler stage links the stdlib from an archive its own compiler builds on
+first use, keyed by that compiler's bytes, so stage-2 and stage-3 each build
+one while building the next stage; those two are compared.  The pin links
+the `.bin/<triple>/libcryo.a` round 1 builds.
 
 Usage:
     python3 scripts/selfhost-check.py            # (or `make selfhost-check`)
@@ -283,11 +282,6 @@ def make_stages():
         # Round 2: stage-2 -> stage-3  (nested under self/)
         # ------------------------------------------------------------------
         Stage(
-            src="stdlib", via="stage-2", to=".bin/self/s2",
-            cwd=ROOT / "stdlib",
-            cmd=[str(STAGE2), "build", "--no-incremental", "--build-dir=.bin/self/s2"],
-        ),
-        Stage(
             src="compiler", via="stage-2", to="build/self/s3",
             cwd=ROOT / "compiler",
             cmd=[str(STAGE2), "build", "--no-incremental", "--build-dir=build/self/s3",
@@ -296,11 +290,6 @@ def make_stages():
         # ------------------------------------------------------------------
         # Round 3: stage-3 -> stage-4  (byte-identity gate)
         # ------------------------------------------------------------------
-        Stage(
-            src="stdlib", via="stage-3", to=".bin/self/s3",
-            cwd=ROOT / "stdlib",
-            cmd=[str(STAGE3), "build", "--no-incremental", "--build-dir=.bin/self/s3"],
-        ),
         Stage(
             src="compiler", via="stage-3", to="build/self/s4",
             cwd=ROOT / "compiler",
@@ -450,7 +439,7 @@ def print_summary(times, total):
 #     the `#include "llvm_bindings.h"` preprocess (CRYO_CC) and the final link;
 #     `llvm-ar.exe` is the archiver wine can launch (CRYO_AR).
 #
-# So the Windows section runs the SAME 6-stage byte-identity self-host as the
+# So the Windows section runs the SAME byte-identity self-host as the
 # Linux chain, booting from bin/cryo.exe: each stage cross-links a runnable
 # cryo.exe (mingw + windows libLLVM-C), runs it under wine to build the next,
 # and the stage-3/stage-4 per-module IR is compared for the fixed point.
@@ -571,7 +560,7 @@ def _config_without_bin(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Windows 6-stage byte-identity self-host
+# Windows byte-identity self-host
 #
 # The exact mirror of the Linux chain (make_stages / run_stage / fixed point)
 # but booting from bin/cryo.exe.  `runner` prefixes every command: [] runs
@@ -592,11 +581,8 @@ WIN_BOOT = ROOT / "bin" / "cryo.exe"
 # Linux `sN` stages, so a Windows host running the Linux chain under WSL into
 # the same repo still doesn't collide.
 _WIN_STAGE_DIRS = [
-    ROOT / "stdlib"   / ".bin"  / "self" / "win-s1",
     ROOT / "compiler" / "build" / "self" / "win-s2",
-    ROOT / "stdlib"   / ".bin"  / "self" / "win-s2",
     ROOT / "compiler" / "build" / "self" / "win-s3",
-    ROOT / "stdlib"   / ".bin"  / "self" / "win-s3",
     ROOT / "compiler" / "build" / "self" / "win-s4",
 ]
 WIN_S2_EXE = ROOT / "compiler" / "build" / "self" / "win-s2" / "cryo.exe"
@@ -612,7 +598,7 @@ WIN_S4_EXE = ROOT / "compiler" / "build" / "self" / "win-s4" / "cryo.exe"
 
 
 def make_windows_stages(runner: list, env: dict) -> list:
-    """Six windows stages mirroring make_stages(), booting from bin/cryo.exe.
+    """The windows stages, mirroring make_stages(), booting from bin/cryo.exe.
     Compiler stages pass --emit-llvm so the fixed point can compare per-module
     IR (windows builds don't write the linked cryo.ll)."""
     boot, s2, s3 = str(WIN_BOOT), str(WIN_S2_EXE), str(WIN_S3_EXE)
@@ -636,15 +622,13 @@ def make_windows_stages(runner: list, env: dict) -> list:
         Stage("runtime",  "pinned",  f".bin/{wt}",          rt,            list(runner) + tiers + [f"--build-dir=.bin/{wt}"], env),
         Stage("runtime",  "pinned",  f".bin/{wt} (hosted)", rt / "hosted", list(runner) + tiers + [f"--build-dir=../.bin/{wt}"], env),
         # Round 1 writes the CANONICAL per-target archive, as the Linux chain
-        # does, because the compiler stages below link it.  Sending it to
-        # `.bin/self/win-s1` instead left this chain silently reusing whatever
-        # a previous `make cryo` had put at the canonical path -- so it passed
-        # only in a tree that already held a matching archive.
+        # does, because the pin links it when it builds stage-2.  An archive
+        # written anywhere else leaves the chain linking whatever a previous
+        # `make cryo` put at the canonical path, so it passes only in a tree
+        # that already holds a matching one.
         Stage("stdlib",   "pinned",  f".bin/{wt}",          sl, build(boot, f".bin/{wt}"), env),
         Stage("compiler", "pinned",  "build/self/win-s2", cm, build(boot, "build/self/win-s2"), env),
-        Stage("stdlib",   "stage-2", ".bin/self/win-s2",  sl, build(s2,   ".bin/self/win-s2"), env),
         Stage("compiler", "stage-2", "build/self/win-s3", cm, build(s2,   "build/self/win-s3", emit=True), env),
-        Stage("stdlib",   "stage-3", ".bin/self/win-s3",  sl, build(s3,   ".bin/self/win-s3"), env),
         Stage("compiler", "stage-3", "build/self/win-s4", cm, build(s3,   "build/self/win-s4", emit=True), env),
     ]
 
@@ -735,7 +719,7 @@ def report_stage_archives(prefix: str, built: dict) -> bool:
 
 
 def run_windows_selfhost(runner: list, verbose: bool = False) -> str:
-    """Windows section: the 6-stage byte-identity self-host with bin/cryo.exe.
+    """Windows section: the byte-identity self-host with bin/cryo.exe.
     `runner` is [] (native, Windows host) or ['wine'] (Linux host).  Returns
     (status, reason) with status 'ok' / 'skip' / 'fail'.  The reason travels
     with the status because the run's arm summary has to be readable on its
@@ -743,7 +727,7 @@ def run_windows_selfhost(runner: list, verbose: bool = False) -> str:
     nobody checks."""
     native = not runner
     print()
-    print(f"{C.BOLD}==> Windows 6-stage byte-identity gate "
+    print(f"{C.BOLD}==> Windows byte-identity gate "
           f"(boot: bin/cryo.exe, {'native' if native else 'wine'}){C.RESET}")
 
     if not WIN_BOOT.exists():
@@ -850,7 +834,7 @@ def run_windows_selfhost(runner: list, verbose: bool = False) -> str:
 # ---------------------------------------------------------------------------
 # What the run actually verified.
 #
-# This gate certifies the branch, and it has two arms: the Linux 6-stage chain
+# This gate certifies the branch, and it has two arms: the Linux chain
 # and the Windows one.  Both mapped a SKIPPED arm to exit 0 - so an environment
 # without wine ran half the gate and reported success, and "the fixed point
 # holds on both hosts" was a claim about a run nobody could tell apart from a
@@ -954,7 +938,7 @@ def _wsl_path(p: Path) -> str | None:
 
 
 def main_windows(args) -> int:
-    """Windows-host entry point: two sections, the same 6-stage self-host,
+    """Windows-host entry point: two sections, the same self-host,
     run at the same time.
 
       1. Linux section - runs inside WSL (the Linux stages build ELF artifacts
@@ -962,7 +946,7 @@ def main_windows(args) -> int:
          digest-checked copy of its sources on WSL's own filesystem
          (--mirror).  --no-windows so the WSL child doesn't also try the
          windows section (wine can't, and we run it natively below).
-      2. Windows section - bin/cryo.exe through the same 6 stages, run NATIVELY
+      2. Windows section - bin/cryo.exe through the same stages, run NATIVELY
          on this Windows host."""
     if not shutil.which("wsl.exe"):
         print(f"{C.RED}✗ wsl.exe not on PATH{C.RESET}")
@@ -995,7 +979,7 @@ def main_windows(args) -> int:
     with open(linux_log, "w", encoding="utf-8") as out:
         linux = subprocess.Popen(["wsl.exe", "--", "bash", "-lc", inner],
                                  stdout=out, stderr=subprocess.STDOUT)
-        # 2. Windows section natively (bin/cryo.exe through the same 6 stages).
+        # 2. Windows section natively (bin/cryo.exe through the same stages).
         #    This is the host that can run BOTH arms, so it is the one whose
         #    green licenses "the fixed point holds on both hosts" - it must not
         #    be reachable with the windows arm skipped.
@@ -1027,7 +1011,7 @@ def ensure_boot():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Cryo selfhost byte-identity check (3 rounds, 6 stages, rooted at bin/cryo).",
+        description="Cryo selfhost byte-identity check (3 rounds, rooted at bin/cryo).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--verbose", "-v", action="store_true",
@@ -1059,7 +1043,7 @@ def main():
         return 2
 
     print()
-    print(f"{C.BOLD}selfhost-check{C.RESET}  {C.DIM} - 6-stage byte-identity gate (boot: bin/cryo){C.RESET}")
+    print(f"{C.BOLD}selfhost-check{C.RESET}  {C.DIM} - byte-identity gate (boot: bin/cryo){C.RESET}")
     print(f"  {C.DIM}root:{C.RESET} {ROOT}")
     print(f"  {C.DIM}logs:{C.RESET} {LOG_DIR.relative_to(ROOT)}/")
     print()
@@ -1072,11 +1056,9 @@ def main():
     wipe_paths(WIPE_PATHS)
     # Pre-create the nested `self/sN` parent dirs.  The compiler uses
     # `mkdir(path, mode)` (single-level) rather than `mkdir -p` when
-    # honoring --build-dir, so it can't create `.bin/self/s2/obj/` if
-    # `.bin/self/` doesn't exist yet.
+    # honoring --build-dir, so it can't create `build/self/s3/obj/` if
+    # `build/self/` doesn't exist yet.
     for p in [
-        ROOT / "stdlib"   / ".bin" / "self" / "s2",
-        ROOT / "stdlib"   / ".bin" / "self" / "s3",
         ROOT / "compiler" / "build" / "self" / "s3",
         ROOT / "compiler" / "build" / "self" / "s4",
     ]:
@@ -1100,7 +1082,7 @@ def main():
             print(f"{C.RED}{C.BOLD}✗ FAILED at stage {i}/{len(stages)}{C.RESET}")
             return 1
 
-    # All stages passed.  Keep the per-stage [N/6] rows on screen - the run
+    # All stages passed.  Keep the per-stage [N/M] rows on screen - the run
     # reads the same live and after-the-fact (no collapse).
 
     # Byte-identity verification
@@ -1177,7 +1159,7 @@ def main():
     total = time.perf_counter() - total_start
     print_summary(times, total)
 
-    # Windows section: the same 6-stage self-host with bin/cryo.exe, under wine
+    # Windows section: the same self-host with bin/cryo.exe, under wine
     # on this Linux host.  Only attempted once the Linux fixed point holds -
     # a broken Linux arm makes the Windows one uninformative, not optional.
     arms = [("linux", "ok" if result_ok else "fail",
