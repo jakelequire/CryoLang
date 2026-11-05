@@ -4051,7 +4051,9 @@ check is being deleted and the seals are what hold.  (Jake)
 
 75. **`CalleePin::intrinsic_kind` may live in the AST file.**
 
-76. **`Array` keeps `where T: Drop` until the compiler's use-after-drop is
+76. *Ended: the compiler no longer reads an array after releasing it, and
+    `Array` releases every element type, a no-op for one that owns nothing.*
+    **`Array` keeps `where T: Drop` until the compiler's use-after-drop is
     fixed.** That fix is queued.
 
 77. **Inside a generic template, a call keeps the method it was written

@@ -261,9 +261,10 @@ State it as a pair, because only the pair is evidence:
 
 Without the first half you have shown that a gate fails on a broken tree,
 which was never in doubt. Without the second you have shown nothing at all.
-Both halves go in the commit message, named concretely: *"the old gate printed
-`OK (N tests)` over a tree with a project's marker deleted"* is checkable;
-*"now catches missing markers"* is a claim.
+Both halves go in the session's report and handoff, named concretely: *"the
+old gate printed `OK (N tests)` over a tree with a project's marker deleted"*
+is checkable; *"now catches missing markers"* is a claim. They do not go in
+the commit message, which says what the gate now refuses and why.
 
 This is the same discipline as predicting the measurement, applied to the
 instrument rather than to the code, and it is the only way to tell a gate that
@@ -472,7 +473,8 @@ error / missing check / cosmetic / infrastructure) and where it came from.
   cite internal bookkeeping: no ruling numbers ("Rulings 149-158"), old
   ledger entries ("8.540"), session numbers, `HANDOFF.md` sections, audit files or
   store/slice labels. Those are dead references within months; state the
-  behaviour or rule itself instead.
+  behaviour or rule itself instead. Nor does it carry proof: no measured
+  figures, no gate before/after checks - those belong in the report.
 - Cryo has no `else if` in an if-**expression**; statements are fine.
 - Basic `grep` has no `\t` — use `grep -P` for tab-separated audit streams.
 

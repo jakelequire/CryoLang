@@ -1428,15 +1428,16 @@ type struct MoveChecker {
             // below passes `real=false`, which skips both checks.
             if (b.right != null) { this.check_field_move_out(b.right); }
             if (b.right != null) { this.check_deref_move_out(b.right); }
+            if (b.right != null) { this.check_array_field_move_out(b.right); }
             const left_id: IdentifierExpr* = ExpressionNode::identifier_of(b.left);
             if (left_id != null) {
                 // Plain assignment to a bare identifier is a pure write: it
                 // reinitializes the binding rather than reading it.  MOVE the
                 // RHS (real=false: mark a bare-ident non-Copy RHS moved so a
-                // later use surfaces as E0452, WITHOUT applying the real-move
-                // array-move-out checks - the assignment path never ran those
-                // and doing so would false-positive on the swap-remove idiom
-                // `a[i] = a[last]` and on shallow array-field copies).  This
+                // later use surfaces as E0452, WITHOUT applying the element
+                // move-out check, which would refuse the swap-remove idiom
+                // `a[i] = a[last]`; an array field read through a pointer is
+                // checked above).  This
                 // aligns move_check's move set with drop_insertion, which also
                 // moves the RHS of every `=` and suppresses its scope-exit
                 // drop; walking the RHS in read context here instead would
@@ -2047,7 +2048,9 @@ type struct MoveChecker {
         const field_ty: TypeRef = expr.resolved_type;
         if (!field_ty.is_valid()) { return; }
         const t: Type* = this.arena.lookup(field_ty);
-        if (t == null || t.kind != TypeKind::Array) { return; }
+        if (t == null) { return; }
+        // `[T]` is `Array<T>`; `[T; N]` holds its elements inline.
+        if (t.kind != TypeKind::Array && !this.arena.default_array_element_of(t).is_valid()) { return; }
         // Only an owning (droppable) array buffer double-frees on copy.
         if (!this.type_needs_drop(field_ty)) { return; }
         // The owned-value-place form is already handled by
