@@ -294,19 +294,11 @@ prod_uninstall() {
 dev_run() {
     [ -z "$PREFIX" ] && PREFIX="/usr/local"
 
-    local SCRIPT_PATH REPO_ROOT SRC_BIN SRC_STDLIB SRC_STDLIB_ARCHIVE SRC_LSP
+    local SCRIPT_PATH REPO_ROOT SRC_BIN SRC_STDLIB SRC_LSP
     SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$0")"
     REPO_ROOT="$(dirname "$SCRIPT_PATH")"
     SRC_BIN="${REPO_ROOT}/bin/cryo"
     SRC_STDLIB="${REPO_ROOT}/stdlib"
-    # The archive lives under `.bin/<triple>/` in a build tree and at the flat
-    # path in an installed one; this is only an existence probe deciding whether
-    # to run `make stdlib`, and the compiler resolves the real path itself.
-    SRC_STDLIB_ARCHIVE="${SRC_STDLIB}/.bin/libcryo.a"
-    _src_triple="$("${SRC_BIN}" version --triple 2>/dev/null || true)"
-    if [ -n "${_src_triple}" ] && [ -f "${SRC_STDLIB}/.bin/${_src_triple}/libcryo.a" ]; then
-        SRC_STDLIB_ARCHIVE="${SRC_STDLIB}/.bin/${_src_triple}/libcryo.a"
-    fi
     SRC_LSP=""
     if [ -x "${REPO_ROOT}/bin/cryolsp" ]; then
         SRC_LSP="${REPO_ROOT}/bin/cryolsp"
@@ -359,10 +351,6 @@ dev_run() {
     fi
 
     if [ "$ACTION" = "install" ]; then
-        if [ ! -f "$SRC_STDLIB_ARCHIVE" ]; then
-            log_info "building stdlib archive via 'make stdlib'..."
-            ( cd "$REPO_ROOT" && make stdlib ) >/dev/null || die "'make stdlib' failed."
-        fi
         run mkdir -p "$(dirname "$DEST_BIN")" "$DEST_SHARE"
         run ln -sfn "$SRC_BIN" "$DEST_BIN"
         log_ok "linked: ${DEST_BIN}"

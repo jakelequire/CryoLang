@@ -24,13 +24,12 @@ top-level clutter:
     compiler/build/                 (stage-2 - also what `make cryo` builds)
     compiler/build/self/s3/         (stage-3 compiler)
     compiler/build/self/s4/         (stage-4 compiler - IR-identity gate)
-    stdlib/.bin/<triple>/           (built by pin - what the pin links)
-    stdlib/.bin/<triple>/prebuilt/  (one archive per stage compiler)
+    stdlib/.bin/<triple>/prebuilt/  (one archive per compiler, the pin's too)
 
 A compiler stage links the stdlib from an archive its own compiler builds on
-first use, keyed by that compiler's bytes, so stage-2 and stage-3 each build
-one while building the next stage; those two are compared.  The pin links
-the `.bin/<triple>/libcryo.a` round 1 builds.
+first use, keyed by that compiler's bytes, so the pin, stage-2 and stage-3
+each build one while building the next stage; stage-2's and stage-3's are
+compared.
 
 Usage:
     python3 scripts/selfhost-check.py            # (or `make selfhost-check`)
@@ -261,18 +260,7 @@ def make_stages():
         ),
         # ------------------------------------------------------------------
         # Round 1: pinned boot -> stage-2  (default build dirs)
-        #
-        # The stdlib archive goes to `.bin/<triple>`, which is where the link
-        # resolves it from.  Writing it flat here would leave every compiler
-        # stage linking whatever `make stdlib` last left in the per-target
-        # directory instead of the archive this round just produced.
         # ------------------------------------------------------------------
-        Stage(
-            src="stdlib", via="pinned", to=f".bin/{host_triple}",
-            cwd=ROOT / "stdlib",
-            cmd=[str(BOOT), "build", "--no-incremental",
-                 f"--build-dir=.bin/{host_triple}"],
-        ),
         Stage(
             src="compiler", via="pinned", to="build",
             cwd=ROOT / "compiler",
@@ -609,7 +597,7 @@ def make_windows_stages(runner: list, env: dict) -> list:
             cmd.append("--emit-llvm")
         return cmd
 
-    sl, cm = ROOT / "stdlib", ROOT / "compiler"
+    cm = ROOT / "compiler"
     rt = ROOT / "runtime"
     # Runtime tiers first, for the same reason as the Linux chain: stage-2
     # onwards link against `__cryo_panic`.  Built with the WINDOWS boot
@@ -621,12 +609,6 @@ def make_windows_stages(runner: list, env: dict) -> list:
     return [
         Stage("runtime",  "pinned",  f".bin/{wt}",          rt,            list(runner) + tiers + [f"--build-dir=.bin/{wt}"], env),
         Stage("runtime",  "pinned",  f".bin/{wt} (hosted)", rt / "hosted", list(runner) + tiers + [f"--build-dir=../.bin/{wt}"], env),
-        # Round 1 writes the CANONICAL per-target archive, as the Linux chain
-        # does, because the pin links it when it builds stage-2.  An archive
-        # written anywhere else leaves the chain linking whatever a previous
-        # `make cryo` put at the canonical path, so it passes only in a tree
-        # that already holds a matching one.
-        Stage("stdlib",   "pinned",  f".bin/{wt}",          sl, build(boot, f".bin/{wt}"), env),
         Stage("compiler", "pinned",  "build/self/win-s2", cm, build(boot, "build/self/win-s2"), env),
         Stage("compiler", "stage-2", "build/self/win-s3", cm, build(s2,   "build/self/win-s3", emit=True), env),
         Stage("compiler", "stage-3", "build/self/win-s4", cm, build(s3,   "build/self/win-s4", emit=True), env),
@@ -690,21 +672,31 @@ def record_stage_archive(stage, stdlib_root: Path, seen: set, built: dict):
     seen |= now
 
 
-def compare_stage_archives(built: dict):
-    """(True, (nmods, bytes)), (False, first differing module) or (None,
-    reason): stage-2 and stage-3 must each have built one stdlib archive, and
-    the two must hold byte-identical IR.  Every program links the stdlib from
-    its archive, so the stdlib's code is checked here, where the stage-3 and
-    stage-4 IR no longer holds it."""
+def compare_stage_archives(built: dict, stage2: Path, stage3: Path):
+    """(True, (nmods, bytes)), (True, None), (False, first differing module) or
+    (None, reason): stage-2 and stage-3 must each have built one stdlib
+    archive, and the two must hold byte-identical IR.  Every program links the
+    stdlib from its archive, so the stdlib's code is checked here, where the
+    stage-3 and stage-4 IR no longer holds it.  A stage-3 byte-identical to
+    stage-2 - a pin built from the same compiler source, on a host whose link
+    is reproducible - has stage-2's key, so it links stage-2's archive and
+    builds none: (True, None)."""
     s2, s3 = built.get("stage-2", []), built.get("stage-3", [])
+    if (len(s2) == 1 and not s3 and stage2.is_file() and stage3.is_file()
+            and stage2.read_bytes() == stage3.read_bytes()):
+        return True, None
     if len(s2) != 1 or len(s3) != 1:
         return None, (f"stage-2 built {len(s2)} stdlib archive(s) and stage-3 "
                       f"{len(s3)}; each builds its own")
     return _compare_ir_trees(s2[0], s3[0])
 
 
-def report_stage_archives(prefix: str, built: dict) -> bool:
-    ok, detail = compare_stage_archives(built)
+def report_stage_archives(prefix: str, built: dict, stage2: Path, stage3: Path) -> bool:
+    ok, detail = compare_stage_archives(built, stage2, stage3)
+    if ok and detail is None:
+        print(f"  {C.GREEN}{C.BOLD}✓ STDLIB ARCHIVES OK{C.RESET}  {prefix}stage-2 and stage-3 "
+              f"are byte-identical compilers, so they link one archive")
+        return True
     if ok:
         nmods, total = detail
         print(f"  {C.GREEN}{C.BOLD}✓ STDLIB ARCHIVES OK{C.RESET}  {prefix}stage-2 and stage-3 "
@@ -824,7 +816,7 @@ def run_windows_selfhost(runner: list, verbose: bool = False) -> str:
     else:
         print(f"  {C.RED}{C.BOLD}✗ FIXED POINT BROKEN{C.RESET}  first differing module: {detail}")
         result = ("fail", f"first differing module: {detail}")
-    if not report_stage_archives("windows ", built) and result[0] == "ok":
+    if not report_stage_archives("windows ", built, WIN_S2_EXE, WIN_S3_EXE) and result[0] == "ok":
         result = ("fail", "the stage-2 and stage-3 stdlib archives differ or are missing")
 
     print_summary(times, time.perf_counter() - start)
@@ -1153,7 +1145,7 @@ def main():
             print(f"  {C.DIM}│{C.RESET} {line}")
         print(f"  {C.RED}{hr(72)}{C.RESET}")
         result_ok = False
-    if not report_stage_archives("", built):
+    if not report_stage_archives("", built, STAGE2, STAGE3):
         result_ok = False
 
     total = time.perf_counter() - total_start

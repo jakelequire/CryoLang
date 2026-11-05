@@ -219,8 +219,7 @@ Follow this in order. Do not skip to step 5.
 
 2. **Check your instruments before your code.** A missing or half-built
    artifact reads exactly like a regression:
-   - `stdlib/.bin/libcryo.a` present? If not: `make stdlib runtime-tiers`.
-   - `runtime/.bin` left holding objects for the other OS? Same fix.
+   - `runtime/.bin/<triple>/` holding the tier archives? If not: `make runtime-tiers`.
    - Anything rebuilding in another process right now? Wait for it.
    - Did you edit a source file while a long build was running? That reads as
      a broken fixed point. Re-run before believing it.
@@ -507,23 +506,16 @@ with no diff to check it against.
   named from `cryo version --triple`, asked of the compiler because a native
   triple comes from a toolchain probe; an empty answer is a hard error, since
   building flat is the failure this prevents.
-- The stdlib archive builds to `stdlib/.bin/<triple>/libcryo.a` for the same
-  reason, so a WSL-native `make stdlib` no longer overwrites the Windows one.
-  A flat `stdlib/.bin/libcryo.a` is the pre-split layout and is removed by the
-  `stdlib` target; the flat path stays meaningful for an INSTALLED tree, which
-  holds one target by construction, and a release stages it there.
-- **`make selfhost-check` on Windows empties `stdlib/.bin/x86_64-pc-windows-gnu/`**
-  while it runs, and rebuilds the archive there from the pin.  Start no other
-  build during it - one that links while the archive is gone fails, naming the
-  flat `stdlib/.bin/libcryo.a`.  Its Linux arm runs inside WSL from a copy of
+- **`make selfhost-check`'s Linux arm runs inside WSL** from a copy of
   the sources it reads, in `~/.cache/cryo-selfhost/<checkout>/` on WSL's own
   filesystem, refused unless the copy's digest matches the working tree's; the
   arm's stage logs stay there, and its output is in
   `build-logs/selfhost-check/linux-arm.log`.  On a Linux host the check still
   deletes `compiler/build` and `stdlib/.bin`: run `make cryo` after it.
-- **A program links the stdlib from `stdlib/.bin/<triple>/prebuilt/<key>/`**,
-  an archive the compiler builds on first use by running the stdlib's own
-  build with itself; the key is the compiler's bytes, every stdlib source,
+- **Every program links the stdlib from `stdlib/.bin/<triple>/prebuilt/<key>/`**
+  - the pin building the compiler too; there is no `make stdlib` - an archive
+  the compiler builds on first use by running the stdlib's own build with
+  itself; the key is the compiler's bytes, every stdlib source,
   the stdlib root AS SPELLED, the target and the code-shaping options, so a
   compiler rebuild or a stdlib edit means one ~8 s archive build on the next
   program build. Each use rewrites the archive's `last-use`; a build that
@@ -543,12 +535,14 @@ with no diff to check it against.
   clone.
 - Copy the compiler out of the build tree before running it as an instrument,
   or it hits `ETXTBSY` overwriting itself.
-- **Build artifacts do not switch branches with you.** `stdlib/.bin/<triple>/`
+- **Build artifacts do not switch branches with you.** `runtime/.bin/<triple>/`
   and `compiler/build/` are gitignored, so they survive a `git checkout` and
-  still hold whatever the *other* branch's sources produced. `make cryo`
-  rebuilds them from wherever you were standing. After switching branches, run
-  `make stdlib && make cryo` before believing any result — a stale archive
-  reads exactly like a regression, and a green run over it means nothing.
+  still hold whatever the *other* branch's sources produced; `make cryo`
+  rebuilds them by timestamp, which a checkout does not always move. After
+  switching branches, `rm -rf compiler/build` and run `make cryo` before
+  believing any result. (A stdlib archive is keyed by its sources and the
+  compiler's bytes, so a stale one is never linked.) A branch from before the
+  pin linked archives still needs its own `make stdlib`.
 - Module discovery is **import-driven**: a file nothing imports is never
   compiled, so a test project can silently exercise nothing.
 - **The project COUNT is the evidence, not the word PASS.** `cryo test` echoes

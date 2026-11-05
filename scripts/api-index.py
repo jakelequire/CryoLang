@@ -11,8 +11,9 @@ so a stale index is a CI failure rather than a wrong answer.
 
 TWO SOURCES, DELIBERATELY
 -------------------------
-1. THE ARCHIVE (authoritative).  `nm` over `stdlib/.bin/libcryo.a`, decoded by
-   the compiler's OWN demangler (`cryo demangle`), not by a regex here. A
+1. THE ARCHIVE (authoritative).  `nm` over the newest stdlib archive a build
+   made under `stdlib/.bin/<triple>/prebuilt/`, decoded by the compiler's OWN
+   demangler (`cryo demangle`), not by a regex here. A
    symbol in the archive provably exists -- it linked. This is the ground
    truth for free functions.
 
@@ -58,26 +59,28 @@ CRYO = os.path.join(
 
 
 def _archive_path() -> str:
-    """The stdlib archive built for THIS host.
+    """The newest stdlib archive a build made for THIS host, or "".
 
-    One archive per target lives under `.bin/<triple>/`, so two hosts sharing a
-    checkout no longer overwrite each other's `libcryo.a`; the flat path is what
-    a single-target tree and an installed toolchain look like. The triple is
-    asked of the compiler for the same reason the build system asks it: a native
-    triple comes from a toolchain probe and cannot be derived here.
+    A build links the archive under `.bin/<triple>/prebuilt/<key>/` that its
+    compiler and options key, building it first when it is missing; any of
+    them defines the same symbols for the cross-check.  The triple is asked of
+    the compiler for the same reason the build system asks it: a native triple
+    comes from a toolchain probe and cannot be derived here.
     """
-    flat = os.path.join(ROOT, "stdlib", ".bin", "libcryo.a")
     if not os.path.exists(CRYO):
-        return flat
+        return ""
     try:
         triple = subprocess.run([CRYO, "version", "--triple"],
                                 capture_output=True, text=True).stdout.strip()
     except OSError:
-        return flat
-    if not triple:
-        return flat
-    per_target = os.path.join(ROOT, "stdlib", ".bin", triple, "libcryo.a")
-    return per_target if os.path.exists(per_target) else flat
+        return ""
+    prebuilt = os.path.join(ROOT, "stdlib", ".bin", triple, "prebuilt")
+    if not triple or not os.path.isdir(prebuilt):
+        return ""
+    archives = [os.path.join(prebuilt, key, "libcryo.a") for key in os.listdir(prebuilt)]
+    archives = [a for a in archives
+                if os.path.isfile(a) and os.path.isfile(os.path.join(os.path.dirname(a), "stdlib.manifest"))]
+    return max(archives, key=os.path.getmtime) if archives else ""
 
 
 ARCHIVE = _archive_path()
@@ -339,8 +342,8 @@ def scan_stdlib():
 def archive_symbols():
     """Free-function signatures that provably linked, via nm + cryo demangle.
     Returns (set_of_names, note) -- note explains any degradation."""
-    if not os.path.exists(ARCHIVE):
-        return set(), "archive not built (run `make stdlib`); source scan only"
+    if not ARCHIVE:
+        return set(), "no stdlib archive built yet (any program build makes one); source scan only"
     if not os.path.exists(CRYO):
         return set(), "bin/cryo not present; source scan only"
     try:
