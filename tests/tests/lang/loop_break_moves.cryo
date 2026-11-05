@@ -1,0 +1,242 @@
+///! A `break` leaves its loop with the moves made before it.
+///!
+///! A binding declared outside a loop and moved on the path that reaches a
+///! `break` is gone after the loop on that exit only: the loop's own exit,
+///! and any other `break`, still hold it.  Each value must be released
+///! exactly once on every path: by whoever received it when the `break` ran,
+///! at its own scope exit when it did not.  The nested-`if` cases move a
+///! binding inside a block that an outer branch may skip, so the flag that
+///! records the move is declared in a block that does not always run.
+///! Each test records the releases as a bitmask of ids plus a count, so a
+///! value released twice shows as a count above the number of ids, one never
+///! released as a missing bit.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::LoopBreakMoves;
+
+import std::core::result::{ Result };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_eq };
+
+mut g_mask:  i32 = 0;
+mut g_count: i32 = 0;
+
+function reset() -> void { g_mask = 0; g_count = 0; }
+
+type struct Tracked { id: i32; }
+
+implement trait Drop for struct Tracked {
+    drop(mut &this) -> void {
+        g_mask  = g_mask | (1 << this.id);
+        g_count = g_count + 1;
+    }
+}
+
+function consume(t: Tracked) -> void { }
+
+function released() -> i32 { return g_mask * 100 + g_count; }
+
+function expected(mask: i32, count: i32) -> i32 { return mask * 100 + count; }
+
+// ---- control -----------------------------------------------------------------
+
+![test]
+function control_counter_sees_a_second_release() -> Result<(), TestError> {
+    reset();
+    {
+        const _first:  Tracked = Tracked { id: 0 };
+        const _second: Tracked = Tracked { id: 0 };
+    }
+    return expect_eq(released(), expected(0x01, 2));
+}
+
+// ---- `while`: moved, then `break` --------------------------------------------
+
+function while_move_then_break(n: i32, at: i32) -> i32 {
+    reset();
+    {
+        const x: Tracked = Tracked { id: 0 };
+        mut i: i32 = 0;
+        while (i < n) {
+            if (i == at) { consume(x); break; }
+            i = i + 1;
+        }
+        if (g_count > 1) { return -1; }
+    }
+    return released();
+}
+
+![test]
+function while_break_taken() -> Result<(), TestError> {
+    return expect_eq(while_move_then_break(3, 1), expected(0x01, 1));
+}
+
+![test]
+function while_break_not_taken() -> Result<(), TestError> {
+    return expect_eq(while_move_then_break(3, 9), expected(0x01, 1));
+}
+
+![test]
+function while_no_iteration() -> Result<(), TestError> {
+    return expect_eq(while_move_then_break(0, 0), expected(0x01, 1));
+}
+
+// ---- the `break` sits inside a nested `if` ----------------------------------
+
+function nested_move_then_break(n: i32, outer: boolean) -> i32 {
+    reset();
+    {
+        const x: Tracked = Tracked { id: 0 };
+        mut i: i32 = 0;
+        while (i < n) {
+            if (outer) {
+                if (i == 1) { consume(x); break; }
+            }
+            i = i + 1;
+        }
+    }
+    return released();
+}
+
+![test]
+function nested_break_taken() -> Result<(), TestError> {
+    return expect_eq(nested_move_then_break(3, true), expected(0x01, 1));
+}
+
+![test]
+function nested_break_skipped() -> Result<(), TestError> {
+    return expect_eq(nested_move_then_break(3, false), expected(0x01, 1));
+}
+
+// ---- `for`, `loop` and `do`-`while` -----------------------------------------
+
+function for_move_then_break(n: i32, at: i32) -> i32 {
+    reset();
+    {
+        const x: Tracked = Tracked { id: 0 };
+        for (mut i: i32 = 0; i < n; i++) {
+            if (i == at) { consume(x); break; }
+        }
+    }
+    return released();
+}
+
+![test]
+function for_break_taken() -> Result<(), TestError> {
+    return expect_eq(for_move_then_break(4, 2), expected(0x01, 1));
+}
+
+![test]
+function for_break_not_taken() -> Result<(), TestError> {
+    return expect_eq(for_move_then_break(4, 7), expected(0x01, 1));
+}
+
+function loop_two_breaks(which: i32) -> i32 {
+    reset();
+    {
+        const a: Tracked = Tracked { id: 0 };
+        const b: Tracked = Tracked { id: 1 };
+        loop {
+            if (which == 0) { consume(a); break; }
+            if (which == 1) { consume(b); break; }
+            break;
+        }
+    }
+    return released();
+}
+
+![test]
+function loop_first_break() -> Result<(), TestError> {
+    return expect_eq(loop_two_breaks(0), expected(0x03, 2));
+}
+
+![test]
+function loop_second_break() -> Result<(), TestError> {
+    return expect_eq(loop_two_breaks(1), expected(0x03, 2));
+}
+
+![test]
+function loop_plain_break() -> Result<(), TestError> {
+    return expect_eq(loop_two_breaks(2), expected(0x03, 2));
+}
+
+function do_while_move_then_break(n: i32, at: i32) -> i32 {
+    reset();
+    {
+        const x: Tracked = Tracked { id: 0 };
+        mut i: i32 = 0;
+        do {
+            if (i == at) { consume(x); break; }
+            i = i + 1;
+        } while (i < n);
+    }
+    return released();
+}
+
+![test]
+function do_while_break_taken() -> Result<(), TestError> {
+    return expect_eq(do_while_move_then_break(3, 0), expected(0x01, 1));
+}
+
+![test]
+function do_while_break_not_taken() -> Result<(), TestError> {
+    return expect_eq(do_while_move_then_break(3, 5), expected(0x01, 1));
+}
+
+// ---- an inner loop's `break` moves a binding of the outer loop's scope ------
+
+function inner_loop_break(at: i32) -> i32 {
+    reset();
+    {
+        const x: Tracked = Tracked { id: 0 };
+        mut i: i32 = 0;
+        while (i < 2) {
+            mut j: i32 = 0;
+            while (j < 3) {
+                if (j == at) { consume(x); break; }
+                j = j + 1;
+            }
+            i = i + j;
+            break;
+        }
+    }
+    return released();
+}
+
+![test]
+function inner_loop_break_taken() -> Result<(), TestError> {
+    return expect_eq(inner_loop_break(1), expected(0x01, 1));
+}
+
+![test]
+function inner_loop_break_not_taken() -> Result<(), TestError> {
+    return expect_eq(inner_loop_break(9), expected(0x01, 1));
+}
+
+// ---- a move in a block an outer branch may skip -----------------------------
+
+function nested_if_move(outer: boolean, inner: boolean) -> i32 {
+    reset();
+    {
+        const x: Tracked = Tracked { id: 0 };
+        if (outer) {
+            if (inner) { consume(x); }
+        }
+    }
+    return released();
+}
+
+![test]
+function nested_if_both_taken() -> Result<(), TestError> {
+    return expect_eq(nested_if_move(true, true), expected(0x01, 1));
+}
+
+![test]
+function nested_if_inner_skipped() -> Result<(), TestError> {
+    return expect_eq(nested_if_move(true, false), expected(0x01, 1));
+}
+
+![test]
+function nested_if_outer_skipped() -> Result<(), TestError> {
+    return expect_eq(nested_if_move(false, true), expected(0x01, 1));
+}

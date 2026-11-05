@@ -1,0 +1,45 @@
+// E0452: a `break` leaves its loop with the moves made before it, so a
+// binding declared outside the loop and moved on the path to a `break` is
+// possibly moved after the loop.  Reading it there would release its storage
+// twice.
+![config(testing)]
+![config(negative, E0452)]
+namespace CryoTests::Negative::LoopBreakMoveThenUse;
+import std::ffi::libc;
+
+type struct Heap {
+    p: mut void*;
+}
+
+implement trait Drop for struct Heap {
+    drop(mut &this) -> void { libc::free(this.p); }
+}
+
+function consume(h: Heap) -> void { }
+
+function from_while(n: int) -> void {
+    const named: Heap = Heap { p: libc::malloc(16) };
+    mut i: int = 0;
+    while (i < n) {
+        if (i == 1) { consume(named); break; }
+        i = i + 1;
+    }
+    consume(named);   //~ ERROR[E0452] use of moved value 'named'
+}
+
+function from_nested_loop(n: int) -> void {
+    const named: Heap = Heap { p: libc::malloc(16) };
+    loop {
+        for (mut i: int = 0; i < n; i++) {
+            if (i == 2) { consume(named); break; }
+        }
+        break;
+    }
+    consume(named);   //~ ERROR[E0452] use of moved value 'named'
+}
+
+function main() -> int {
+    from_while(3);
+    from_nested_loop(3);
+    return 0;
+}

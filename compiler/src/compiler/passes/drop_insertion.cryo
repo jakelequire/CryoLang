@@ -174,6 +174,29 @@ type struct ArmMoveLog {
 }
 
 
+/// A loop whose body is being walked.  `break` and `continue` release only
+/// the scopes from `scope_boundary` on; a `break` leaves with the moved-set
+/// it has, so the bindings declared outside the loop it moved since
+/// `move_snapshot` are moved after the loop on that exit only.  Their flags
+/// are declared in `declarations`, ahead of the loop statement.
+type struct LoopFrame {
+    scope_boundary: i64;
+    move_snapshot:  i64;
+    declarations:   mut [Stmt*]*;
+    exits_start:    i64;
+}
+
+/// A binding declared outside a loop that a `break` out of it moved.  When
+/// the move did not write the binding's flag on that path, `writes` is the
+/// block ahead of the `break` that receives the write once the loop's join
+/// knows the flag; otherwise it is null.
+type struct LoopExitMove {
+    key:    u64;
+    line:   i32;
+    writes: Stmt*;
+}
+
+
 type struct DropInserter {
     ctx:      mut CompilationContext*;
     arena:    TypeArena*;
@@ -306,13 +329,14 @@ type struct DropInserter {
     /// place (see `assign_drop_for_target`) rather than needing its own flag.
     pw_whole:  [u64];
 
-    /// Stack of "loop boundary depths".  When walk_while/walk_for/
-    /// walk_loop is processing a loop body, the current scope_stack
-    /// length at entry is pushed here; `break`/`continue` then know to
-    /// limit cumulative drops to scopes at index >= top-of-stack.
-    /// Without this, a break would drop bindings declared OUTSIDE the
-    /// loop, which are still live after the loop exits.
-    loop_boundary: [i64];
+    /// The loops being walked, innermost last.  Without a frame's boundary,
+    /// a break would drop bindings declared OUTSIDE the loop, which are
+    /// still live after the loop exits.
+    loops: [LoopFrame];
+
+    /// The moves every enclosing loop's `break`s made so far; a loop's own
+    /// start at its frame's `exits_start`.
+    loop_exit_moves: [LoopExitMove];
 
     /// Moved-set on the current control-flow path, encoded the same way
     /// as MoveCheck: parallel-array (key, line) so snapshot/restore is
@@ -528,7 +552,8 @@ type struct DropInserter {
             statement_flag_writes: [],
             statement_flag_writes_start: 0,
             flag_declarations: null,
-            loop_boundary:   [],
+            loops:           [],
+            loop_exit_moves: [],
             moved_keys:      [],
             moved_lines:     [],
             moved_gov:       [],
@@ -961,7 +986,8 @@ type struct DropInserter {
         this.binding_definit = [];
         this.pend_assign_node = null;
         this.assign_seq      = 0;
-        this.loop_boundary   = [];
+        this.loops           = [];
+        this.loop_exit_moves = [];
         this.moved_keys  = [];
         this.moved_lines = [];
         this.moved_gov   = [];
@@ -1214,6 +1240,7 @@ type struct DropInserter {
                 // scopes.  Bindings declared OUTSIDE the loop survive
                 // the `break` and continue to live in the post-loop
                 // code, so they must NOT be dropped here.
+                this.record_break_moves(out, stmt.span);
                 this.append_loop_exit_drops(out);
                 out.push(stmt);
                 true
@@ -1501,39 +1528,30 @@ type struct DropInserter {
     walk_while(mut &this, w: mut WhileStmt*) -> void {
         if (w == null) { return; }
         if (w.condition != null) { this.walk_expr_read(w.condition); }
-        // Loops run their body 0+ times.  Any move inside the body
-        // either doesn't happen (0 iterations) or may set up a
-        // use-after-move on the next iteration.  Snapshot/restore so
-        // the post-loop state matches the pre-loop state; a body-
-        // internal move is invisible past the loop.  Loop-carried
-        // double-frees are caught by MoveCheck (fatal_on_failure)
-        // before this pass runs, so the suppressed move can't cause
-        // unsoundness here.
-        const snap: i64 = this.snapshot_moves();
-        this.loop_boundary.push(this.scope_start_idx.length());
+        // Loops run their body 0+ times.  A body move that reaches the
+        // back edge is refused by MoveCheck (fatal_on_failure) before this
+        // pass runs, so the loop's own exit sees the pre-loop moved-set;
+        // only a `break` carries body moves past the loop (`leave_loop`).
+        this.enter_loop();
         this.branch_depth += 1;
         if (w.body != null) {
             w.body = this.as_child_block(w.body);
             this.walk_block(w.body);
         }
         this.branch_depth -= 1;
-        this.loop_boundary.pop();
-        this.restore_moves(snap);
+        this.leave_loop(null);
     }
 
     walk_do_while(mut &this, w: mut DoWhileStmt*) -> void {
         if (w == null) { return; }
-        const snap: i64 = this.snapshot_moves();
-        this.loop_boundary.push(this.scope_start_idx.length());
+        this.enter_loop();
         this.branch_depth += 1;
         if (w.body != null) {
             w.body = this.as_child_block(w.body);
             this.walk_block(w.body);
         }
         this.branch_depth -= 1;
-        this.loop_boundary.pop();
-        this.restore_moves(snap);
-        if (w.condition != null) { this.walk_expr_read(w.condition); }
+        this.leave_loop(w.condition);
     }
 
     walk_for(mut &this, f: mut ForStmt*) -> void {
@@ -1547,8 +1565,7 @@ type struct DropInserter {
             this.walk_var_decl(f.init.as_decl());
         }
         if (f.condition != null) { this.walk_expr_read(f.condition); }
-        const snap: i64 = this.snapshot_moves();
-        this.loop_boundary.push(this.scope_start_idx.length());
+        this.enter_loop();
         this.branch_depth += 1;
         if (f.body != null) {
             f.body = this.as_child_block(f.body);
@@ -1562,23 +1579,104 @@ type struct DropInserter {
             this.walk_block(f.update);
         }
         this.branch_depth -= 1;
-        this.loop_boundary.pop();
-        this.restore_moves(snap);
+        this.leave_loop(null);
         this.pop_scope();
     }
 
     walk_loop(mut &this, l: mut LoopStmt*) -> void {
         if (l == null) { return; }
-        const snap: i64 = this.snapshot_moves();
-        this.loop_boundary.push(this.scope_start_idx.length());
+        this.enter_loop();
         this.branch_depth += 1;
         if (l.body != null) {
             l.body = this.as_child_block(l.body);
             this.walk_block(l.body);
         }
         this.branch_depth -= 1;
-        this.loop_boundary.pop();
-        this.restore_moves(snap);
+        this.leave_loop(null);
+    }
+
+    /// Begin walking a loop statement's body.  Its flags are declared where
+    /// the loop statement's own are, ahead of it.
+    enter_loop(mut &this) -> void {
+        this.loops.push(LoopFrame {
+            scope_boundary: this.scope_start_idx.length(),
+            move_snapshot:  this.snapshot_moves(),
+            declarations:   this.flag_declarations,
+            exits_start:    this.loop_exit_moves.length(),
+        });
+    }
+
+    /// Finish the innermost loop.  The path that leaves through the loop's
+    /// own exit has the moved-set the loop began with: a move that reaches
+    /// the back edge is refused by MoveCheck before this pass runs.  `after`
+    /// (a do-while's condition) runs on that path only.  Each binding a
+    /// `break` moved is then moved on some exits, so it is marked moved and
+    /// governed by its flag, which every such `break` writes.
+    leave_loop(mut &this, after: ExpressionNode*) -> void {
+        const frame: LoopFrame = this.loops[this.loops.length() - 1];
+        this.loops.pop();
+        this.restore_moves(frame.move_snapshot);
+        if (after != null) { this.walk_expr_read(after); }
+        mut written: i64 = 0;
+        for (mut i: i64 = frame.exits_start; i < this.loop_exit_moves.length(); i++) {
+            const exit: LoopExitMove = this.loop_exit_moves[i];
+            if (exit.writes != null) {
+                mut flag: PassLocal = this.get_drop_flag(exit.key);
+                if (!flag.is_valid()) {
+                    flag = this.fresh_drop_flag(exit.key);
+                    frame.declarations.push(this.make_drop_flag_decl(flag,
+                        this.binding_span_for(exit.key, exit.writes.span)));
+                    this.register_drop_flag(exit.key, flag);
+                }
+                exit.writes.as_block().statements.push(this.make_drop_flag_set(flag,
+                    this.line_only_span(exit.line, exit.writes.span)));
+                written += 1;
+            }
+            if (!this.is_moved_id(exit.key)) {
+                this.moved_keys.push(exit.key);
+                this.moved_lines.push(exit.line);
+                this.moved_gov.push(true);
+            }
+        }
+        while (this.loop_exit_moves.length() > frame.exits_start) {
+            this.loop_exit_moves.pop();
+        }
+        if (written > 0 && Log::enabled(LogArea::Drop, LogLevel::Debug)) {
+            Log::debug(LogArea::Drop, f"a loop's breaks write {written} drop flag(s) in module {this.ctx.namespace_display()}");
+        }
+    }
+
+    /// A `break` leaves the innermost loop with the moved-set it has here.
+    /// Each binding declared outside the loop and moved since the loop began
+    /// is recorded for the loop's join; when its move did not write its flag
+    /// on this path, the `break` is preceded by a block the join writes the
+    /// flag into.
+    record_break_moves(mut &this, out: mut [Stmt*]*, span: SourceSpan) -> void {
+        if (this.loops.length() == 0) { return; }
+        const frame: LoopFrame = this.loops[this.loops.length() - 1];
+        const outer_bindings_end: i64 = if (frame.scope_boundary < this.scope_start_idx.length()) {
+            this.scope_start_idx[frame.scope_boundary]
+        } else {
+            this.binding_names.length()
+        };
+        mut writes: Stmt* = null;
+        for (mut i: i64 = frame.move_snapshot; i < this.moved_keys.length(); i++) {
+            const key: u64 = this.moved_keys[i];
+            if (key == 0) { continue; }
+            const slot: i64 = this.slot_of(key);
+            if (slot < 0 || slot >= outer_bindings_end) { continue; }
+            mut exit_writes: Stmt* = null;
+            if (!this.moved_gov[i]) {
+                if (writes == null) {
+                    writes = Stmt::block(span);
+                    out.push(writes);
+                }
+                exit_writes = writes;
+            }
+            this.loop_exit_moves.push(LoopExitMove {
+                key: key, line: this.moved_lines[i], writes: exit_writes,
+            });
+        }
     }
 
     /// Walk a match's subject and arms as N independent control-flow
@@ -2373,13 +2471,12 @@ type struct DropInserter {
     /// `break`/`continue`: those exit the enclosing loop only, so
     /// bindings declared OUTSIDE the loop must NOT be dropped here.
     append_loop_exit_drops(mut &this, out: mut [Stmt*]*) -> void {
-        if (this.loop_boundary.length() == 0) {
+        if (this.loops.length() == 0) {
             // No enclosing loop; `break`/`continue` outside a loop
             // would be a sema error already; emit nothing.
             return;
         }
-        const boundary: i64 = this.loop_boundary[this.loop_boundary.length() - 1];
-        this.append_drops_to_depth(out, boundary);
+        this.append_drops_to_depth(out, this.loops[this.loops.length() - 1].scope_boundary);
     }
 
     /// True if a value of type `ty` must be dropped at scope/statement exit:

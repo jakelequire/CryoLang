@@ -85,6 +85,25 @@ type struct BranchResult {
     }
 }
 
+/// A loop whose body is being walked, as the lengths its own entries start
+/// at: the moves made inside it, the body's declarations in
+/// `captured_decl_keys`, the bindings staged as carried into it, and the
+/// moves its `break`s and `continue`s left with.
+type struct LoopWalk {
+    moves_start:        i64;
+    declarations_start: i64;
+    carried_start:      i64;
+    breaks_start:       i64;
+    continues_start:    i64;
+}
+
+/// A binding declared outside a loop that was moved on a path leaving the
+/// loop's body through a `break` or a `continue`.
+type struct LoopExitMove {
+    key:  u64;
+    span: SourceSpan;
+}
+
 
 type struct MoveChecker {
     ctx:      mut CompilationContext*;
@@ -152,6 +171,14 @@ type struct MoveChecker {
     capture_decls:      boolean;
     captured_decl_keys: [u64];
     carried_keys:       [u64];
+
+    /// The loops being walked, innermost last, and the moves each one's
+    /// `break`s and `continue`s left with so far.  A `break`'s moves hold
+    /// after the loop; a `continue`'s reach the back edge, as a move at the
+    /// end of the body does.
+    loop_walks:     [LoopWalk];
+    break_moves:    [LoopExitMove];
+    continue_moves: [LoopExitMove];
 
     /// Names bound by an enum/match pattern in an enclosing arm (e.g. `pair`
     /// in `Some(pair) => ...`).  These are by-value payload bindings the
@@ -265,6 +292,9 @@ type struct MoveChecker {
             capture_decls:      false,
             captured_decl_keys: [],
             carried_keys:       [],
+            loop_walks:         [],
+            break_moves:        [],
+            continue_moves:     [],
             pat_binding_keys:   [],
             pm_binding:         [],
             pm_field:           [],
@@ -290,6 +320,9 @@ type struct MoveChecker {
         this.capture_decls      = false;
         this.captured_decl_keys = [];
         this.carried_keys       = [];
+        this.loop_walks         = [];
+        this.break_moves        = [];
+        this.continue_moves     = [];
         this.pat_binding_keys   = [];
         this.pm_binding         = [];
         this.pm_field           = [];
@@ -1132,7 +1165,35 @@ type struct MoveChecker {
             StmtKind::Loop(lp) => {
                 this.walk_loop_body(lp.body, null, null);
             }
-            StmtKind::Asm(_) | StmtKind::Break | StmtKind::Continue => {}
+            StmtKind::Break    => { this.record_loop_exit(true); }
+            StmtKind::Continue => { this.record_loop_exit(false); }
+            StmtKind::Asm(_) => {}
+        }
+    }
+
+    /// A `break` or `continue` leaves the innermost loop's body with the
+    /// moved-set it has here: every binding declared outside the body that
+    /// the body moved, other than one staged as carried into it (already
+    /// refused at its re-move), is recorded as a move of the `break`
+    /// (`is_break`) or the `continue`.
+    record_loop_exit(mut &this, is_break: boolean) -> void {
+        if (this.loop_walks.length() == 0) { return; }
+        const walk: LoopWalk = this.loop_walks[this.loop_walks.length() - 1];
+        for (mut i: i64 = walk.moves_start; i < this.moved_keys.length(); i++) {
+            const key: u64 = this.moved_keys[i];
+            if (!this.moved_real[i]) { continue; }
+            if (this.is_body_local(key, walk.declarations_start)) { continue; }
+            mut carried: boolean = false;
+            for (mut c: i64 = walk.carried_start; c < this.carried_keys.length(); c++) {
+                if (this.carried_keys[c] == key) { carried = true; }
+            }
+            if (carried) { continue; }
+            const exit: LoopExitMove = LoopExitMove { key: key, span: this.moved_spans[i] };
+            if (is_break) {
+                this.break_moves.push(exit);
+            } else {
+                this.continue_moves.push(exit);
+            }
         }
     }
 
@@ -1149,9 +1210,9 @@ type struct MoveChecker {
     /// outer bindings survive moved (excluding body-local declarations,
     /// which are fresh each iteration), then a real walk with those
     /// bindings staged as moved-on-entry surfaces the re-move at its
-    /// site. Branch handling stays conservative (snapshot/restore), so
-    /// only UNCONDITIONAL loop-carried moves are flagged - zero false
-    /// positives, at the cost of missing moves guarded by an inner `if`.
+    /// site.  A path reaches the back edge by falling off the end of the
+    /// body or through a `continue`; a move made on a path that leaves
+    /// through a `break` reaches neither, and holds after the loop instead.
     ///
     /// The back edge re-evaluates `update`, then `condition` (either may be
     /// null), so both walks walk them after the body, unless the body always
@@ -1169,6 +1230,14 @@ type struct MoveChecker {
         const snap:       i64 = this.snapshot_moves();
         const cap_snap:   i64 = this.captured_decl_keys.length();
         const carry_snap: i64 = this.carried_keys.length();
+        const walk: LoopWalk = LoopWalk {
+            moves_start:        snap,
+            declarations_start: cap_snap,
+            carried_start:      carry_snap,
+            breaks_start:       this.break_moves.length(),
+            continues_start:    this.continue_moves.length(),
+        };
+        this.loop_walks.push(walk);
 
         // discovery walk: silent, capture body-local declarations
         const prev_suppress: boolean = this.suppress_emit;
@@ -1176,21 +1245,33 @@ type struct MoveChecker {
         this.suppress_emit = true;
         this.capture_decls = true;
         this.walk_stmt(body);
+        const falls_through: boolean = !this.always_diverges(body);
         if (loops_back) { this.walk_back_edge(update, condition); }
         this.suppress_emit = prev_suppress;
         this.capture_decls = prev_capture;
 
-        // Stage outer bindings the body left moved at the back-edge as
-        // carried.  Skip body-locals (fresh each iteration) and bindings
+        // Stage outer bindings moved on a path that reaches the back edge
+        // as carried: the end of a body that falls through, and every
+        // `continue`.  Skip body-locals (fresh each iteration) and bindings
         // whose only move was an autoref'd call argument (`moved_real`
         // false) - those don't duplicate the value into a dropped copy.
-        for (mut i: i64 = snap; i < this.moved_keys.length(); i++) {
-            const k: u64 = this.moved_keys[i];
-            if (!this.moved_real[i]) { continue; }
-            if (this.is_body_local(k, cap_snap)) { continue; }
-            this.carried_keys.push(k);
+        if (falls_through) {
+            for (mut i: i64 = snap; i < this.moved_keys.length(); i++) {
+                const k: u64 = this.moved_keys[i];
+                if (!this.moved_real[i]) { continue; }
+                if (this.is_body_local(k, cap_snap)) { continue; }
+                this.carried_keys.push(k);
+            }
         }
-        this.truncate_captured(cap_snap);
+        for (mut i: i64 = walk.continues_start; i < this.continue_moves.length(); i++) {
+            const k: u64 = this.continue_moves[i].key;
+            mut staged: boolean = false;
+            for (mut c: i64 = carry_snap; c < this.carried_keys.length(); c++) {
+                if (this.carried_keys[c] == k) { staged = true; }
+            }
+            if (!staged) { this.carried_keys.push(k); }
+        }
+        this.truncate_loop_exits(walk);
         this.restore_moves(snap);
 
         // real walk: carried bindings are moved-on-entry, so the
@@ -1205,11 +1286,26 @@ type struct MoveChecker {
         this.walk_stmt(body);
         if (loops_back) { this.walk_back_edge(update, condition); }
 
-        // A loop may run zero times; body-internal moves don't propagate
-        // to the following code.
+        // The loop's own exit holds the moved-set it began with: a loop may
+        // run zero times, and a move reaching the back edge was refused
+        // above.  A `break` leaves with its own moves, so they hold after
+        // the loop too.
         this.truncate_carried(carry_snap);
         this.restore_moves(snap);
+        for (mut i: i64 = walk.breaks_start; i < this.break_moves.length(); i++) {
+            const exit: LoopExitMove = this.break_moves[i];
+            this.mark_moved_key(exit.key, exit.span, true);
+        }
+        this.truncate_loop_exits(walk);
+        this.truncate_captured(cap_snap);
+        this.loop_walks.pop();
         this.branch_depth -= 1;
+    }
+
+    /// Forget the `break` and `continue` moves `walk`'s loop recorded.
+    truncate_loop_exits(mut &this, walk: LoopWalk) -> void {
+        while (this.break_moves.length() > walk.breaks_start) { this.break_moves.pop(); }
+        while (this.continue_moves.length() > walk.continues_start) { this.continue_moves.pop(); }
     }
 
     /// Walk what the back edge evaluates: a `for`'s update, then the
