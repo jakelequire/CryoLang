@@ -822,13 +822,10 @@ endif
 # which is a hard error here: building flat is the bug this target exists to
 # prevent, so it must not be the fallback.
 #
-# `--no-incremental` stays.  The incremental cache tracks SOURCE freshness and
-# not the target the objects were built for, so a directory left holding
-# another target's archives reports `cryort-core is up to date`, skips the
-# re-archive, and exits 0 with the wrong objects still in place - measured in
-# both directions.  The per-target split makes that unreachable through this
-# target, but the skip is a live defect in its own right and the tier sources
-# are small enough that forcing the re-emit costs seconds.
+# The tiers build incrementally: the whole-build fingerprint folds the
+# resolved target triple and every code-shaping option, so a directory left
+# holding another target's archives is rebuilt rather than reported up to
+# date, and an unchanged tier module reuses its object.
 #
 # The tiers are rebuilt when a runtime source or the pin is newer than the
 # tier archive written last, so a build that changes nothing launches no
@@ -839,14 +836,14 @@ ifeq ($(HOST_OS),windows)
 $(RUNTIME_TIERS_A): $(RUNTIME_SOURCES) $(PIN_EXE)
 	$(if $(strip $(HOST_TRIPLE)),,$(error runtime-tiers: `cryo version --triple` returned nothing; the pinned compiler is too old))
 	@echo "==> Building runtime tiers for $(HOST_TRIPLE) via bin/cryo.exe"
-	@cd runtime && "$(subst /,\,$(PIN_EXE))" build --no-incremental --build-dir=.bin/$(HOST_TRIPLE)
-	@cd runtime\hosted && "$(subst /,\,$(PIN_EXE))" build --no-incremental --build-dir=../.bin/$(HOST_TRIPLE)
+	@cd runtime && "$(subst /,\,$(PIN_EXE))" build --build-dir=.bin/$(HOST_TRIPLE)
+	@cd runtime\hosted && "$(subst /,\,$(PIN_EXE))" build --build-dir=../.bin/$(HOST_TRIPLE)
 else
 $(RUNTIME_TIERS_A): $(RUNTIME_SOURCES) $(PIN)
 	$(if $(strip $(HOST_TRIPLE)),,$(error runtime-tiers: `cryo version --triple` returned nothing; the pinned compiler is too old))
 	@echo "==> Building runtime tiers for $(HOST_TRIPLE) via bin/cryo"
-	@cd runtime && "$(PIN)" build --no-incremental --build-dir=.bin/$(HOST_TRIPLE)
-	@cd runtime/hosted && "$(PIN)" build --no-incremental --build-dir=../.bin/$(HOST_TRIPLE)
+	@cd runtime && "$(PIN)" build --build-dir=.bin/$(HOST_TRIPLE)
+	@cd runtime/hosted && "$(PIN)" build --build-dir=../.bin/$(HOST_TRIPLE)
 endif
 
 # The same tiers cross-built for the windows triple, for `cryo-exe`.  They land
@@ -861,8 +858,8 @@ endif
 runtime-tiers-win: $(PIN)
 	@if command -v $(MINGW_GCC) >/dev/null 2>&1; then \
 		echo "==> Building runtime tiers for $(WIN_TRIPLE) via bin/cryo"; \
-		( cd runtime && "$(PIN)" build --target=$(WIN_TRIPLE) --no-incremental --build-dir=.bin/$(WIN_TRIPLE) >/dev/null ); \
-		( cd runtime/hosted && "$(PIN)" build --target=$(WIN_TRIPLE) --no-incremental --build-dir=../.bin/$(WIN_TRIPLE) >/dev/null ); \
+		( cd runtime && "$(PIN)" build --target=$(WIN_TRIPLE) --build-dir=.bin/$(WIN_TRIPLE) >/dev/null ); \
+		( cd runtime/hosted && "$(PIN)" build --target=$(WIN_TRIPLE) --build-dir=../.bin/$(WIN_TRIPLE) >/dev/null ); \
 	else \
 		echo "==> [skip] windows runtime tiers: $(MINGW_GCC) absent."; \
 	fi
