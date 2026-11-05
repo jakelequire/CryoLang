@@ -287,8 +287,9 @@ Side effects beyond the named output
                   it first when any .cryo under compiler/src or stdlib is
                   newer than it.  Any build of a program by a compiler that
                   has no stdlib archive for its key builds one into
-                  stdlib/.bin/<triple>/prebuilt/<key>/ and removes all but
-                  the newest six there.
+                  stdlib/.bin/<triple>/prebuilt/<key>/ and removes those
+                  there beyond the six used most recently and idle for an
+                  hour.
   verify          runs `make check-fast` from inside itself, and keeps a
                   clone and baseline compilers under .verify/ until
                   `make clean`; clears stdlib/.bin/*/prebuilt/ before each

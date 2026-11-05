@@ -526,7 +526,11 @@ with no diff to check it against.
   build with itself; the key is the compiler's bytes, every stdlib source,
   the stdlib root AS SPELLED, the target and the code-shaping options, so a
   compiler rebuild or a stdlib edit means one ~8 s archive build on the next
-  program build, and the newest six archives are kept. Its stdlib modules'
+  program build. Each use rewrites the archive's `last-use`; a build that
+  makes a new one removes those beyond the six used most recently, never one
+  used within the hour (a concurrent build may be about to link it). The
+  archive is built in place under `<key>.lock` and opens only once its
+  manifest, renamed into place last, is there. Its stdlib modules'
   objects hold only the generic instances the archive lacks (most are
   empty). verify hashes the archives as a third population (`stdlib`); a
   baseline compiler that links none leaves that population empty and its

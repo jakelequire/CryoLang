@@ -33,6 +33,7 @@ import std::collections::str::{ Str };
 import std::fs::directory::{ Directory, DirectoryEntries };
 import std::fs::file::{ File };
 import std::fs::path::{ Path };
+import std::io::error::{ IoErrorKind };
 import std::process::command::{ Command, Output };
 import std::time::clock::{ SystemTime };
 
@@ -55,6 +56,17 @@ const LOCK_EXPIRY_SECONDS: i64 = 600;
 /// option set in use at once (a selfhost's stages, verify's two compilers
 /// under two stdlib spellings).
 const ARCHIVES_KEPT: i64 = 6;
+
+/// An archive used this recently is kept whatever newer ones exist: longer
+/// than any build holds an archive between opening it and linking it.
+const ARCHIVE_IDLE_SECONDS: i64 = 3600;
+
+/// The file an archive's every use rewrites, so its time is the last use.
+const LAST_USE_NAME: string = "last-use";
+
+/// Lock attempts refused with the lock absent (200 ms apart) before the
+/// refusal is reported rather than waited out.
+const LOCK_REFUSALS_REPORTED: i64 = 25;
 
 /// One module of the archive, as its manifest records it.
 type struct PrebuiltModule {
@@ -217,7 +229,8 @@ type struct PrebuiltStdlib {
     /// The archive for a build with these options: opened when it exists,
     /// built by running the stdlib's own build with this compiler when it
     /// does not.  Builds racing to make one wait on a lock beside it; the
-    /// archive only appears, by a rename, once it is whole.
+    /// one holding it builds the archive in place, and the archive opens only
+    /// once its manifest, published last, is there.
     static ensure(stdlib_root_text: string, triple_text: string, opt_level: u32,
                   debug_info: boolean, unwinds: boolean) -> Result<PrebuiltStdlib, String> {
         const stdlib_root: string = stdlib_root_text;
@@ -225,21 +238,42 @@ type struct PrebuiltStdlib {
         const key: string = PrebuiltStdlib::key_of(stdlib_root, triple, opt_level, debug_info, unwinds);
         const directory: string = PrebuiltStdlib::directory_for(stdlib_root, triple, key);
         match (PrebuiltStdlib::open(directory, key)) {
-            Option::Some(found) => { return Result::Ok(found); }
+            Option::Some(found) => { found.record_use(); return Result::Ok(found); }
             Option::None => { }
         }
         const lock: string = directory + ".lock";
-        match (Directory::create_all(Path::from(PrebuiltStdlib::directory_for(stdlib_root, triple, "")))) {
+        const parent: string = PrebuiltStdlib::directory_for(stdlib_root, triple, "");
+        match (Directory::create_all(Path::from(parent))) {
             Result::Ok(_)  => { }
-            Result::Err(_) => { }
+            Result::Err(error) => {
+                return Result::Err(f"cannot make {parent} to build the stdlib archive in: {error}");
+            }
         }
+        // Windows refuses to create a directory whose deletion is pending, so
+        // a lock another build is releasing can fail to be taken with access
+        // denied for a moment; only a failure that outlasts that is reported.
+        mut refusals: i64 = 0;
         loop {
             match (Directory::create(Path::from(lock))) {
                 Result::Ok(_) => { break; }
-                Result::Err(_) => { }
+                Result::Err(error) => {
+                    const held: boolean = match (error.kind) {
+                        IoErrorKind::AlreadyExists => { true }
+                        _                          => { Path::from(lock).exists() }
+                    };
+                    if (held) {
+                        refusals = 0;
+                    } else {
+                        refusals = refusals + 1;
+                        if (refusals > LOCK_REFUSALS_REPORTED) {
+                            return Result::Err(
+                                f"cannot take the lock {lock} to build the stdlib archive: {error}");
+                        }
+                    }
+                }
             }
             match (PrebuiltStdlib::open(directory, key)) {
-                Option::Some(found) => { return Result::Ok(found); }
+                Option::Some(found) => { found.record_use(); return Result::Ok(found); }
                 Option::None => { }
             }
             // A lock older than any stdlib build takes was left by one that died.
@@ -257,6 +291,7 @@ type struct PrebuiltStdlib {
         match (PrebuiltStdlib::open(directory, key)) {
             Option::Some(found) => {
                 PrebuiltStdlib::release(lock);
+                found.record_use();
                 return Result::Ok(found);
             }
             Option::None => { }
@@ -268,7 +303,11 @@ type struct PrebuiltStdlib {
             return Result::Err(failure);
         }
         match (PrebuiltStdlib::open(directory, key)) {
-            Option::Some(found) => { return Result::Ok(found); }
+            Option::Some(found) => {
+                found.record_use();
+                PrebuiltStdlib::prune(parent, directory);
+                return Result::Ok(found);
+            }
             Option::None => { }
         }
         return Result::Err(String::from_str(Str::new(fmt::format(
@@ -283,14 +322,49 @@ type struct PrebuiltStdlib {
         }
     }
 
-    /// Run the stdlib's build into a scratch directory beside `directory`
-    /// and move it into place.  Answers the failure, or an empty string.
-    static build(stdlib_root: string, triple: string, opt_level: u32, debug_info: boolean,
-                 unwinds: boolean, directory: string) -> String {
-        const scratch: string = directory + ".building";
-        match (Directory::remove_all(Path::from(scratch))) {
+    /// Note that a build is about to link this archive, so a prune spares it.
+    /// A tree this build cannot write to is one it never prunes either, so a
+    /// use that cannot be recorded costs nothing.
+    record_use(&this) -> void {
+        const record: string = Path::from(this.directory).join(LAST_USE_NAME).into_raw();
+        match (File::write_text(Path::from(record), Str::new(""))) {
             Result::Ok(_)  => { }
             Result::Err(_) => { }
+        }
+    }
+
+    /// When the archive in `directory` was last used: its use record, else
+    /// its manifest, else the directory itself (a build that died before
+    /// writing a manifest).  0 when none of them can be read.
+    static last_use_secs(directory: string) -> i64 {
+        const candidates: [string] = [
+            Path::from(directory).join(LAST_USE_NAME).into_raw(),
+            Path::from(directory).join(MANIFEST_NAME).into_raw(),
+            directory,
+        ];
+        for (mut i: i64 = 0; i < candidates.length(); i++) {
+            match (Path::from(candidates[i]).metadata()) {
+                Result::Ok(m)  => { return m.modified_secs(); }
+                Result::Err(_) => { }
+            }
+        }
+        return 0;
+    }
+
+    /// Run the stdlib's build into `directory`, under its lock.  The build
+    /// writes the manifest last, so nothing opens the archive before it is
+    /// whole.  Answers the failure, or an empty string.
+    static build(stdlib_root: string, triple: string, opt_level: u32, debug_info: boolean,
+                 unwinds: boolean, directory: string) -> String {
+        // An archive directory that does not open was left by a build that
+        // died, or by a prune that failed partway: nothing links from it.
+        if (Path::from(directory).exists()) {
+            match (Directory::remove_all(Path::from(directory))) {
+                Result::Ok(_) => { }
+                Result::Err(error) => {
+                    return f"cannot clear {directory} to build the stdlib archive in it: {error}";
+                }
+            }
         }
         const exe: string = Manifest::self_exe_path();
         if (exe.length() == 0) {
@@ -299,19 +373,19 @@ type struct PrebuiltStdlib {
         mut command: Command = Command::new(Str::new(exe));
         command.arg(Str::new("build"));
         command.arg(Str::new(stdlib_root));
-        command.arg(Str::new(fmt::format("--build-dir=%s", scratch)));
+        command.arg(Str::new(fmt::format("--build-dir=%s", directory)));
         command.arg(Str::new("--no-incremental"));
         command.arg(Str::new(fmt::format("--opt-level=%u", opt_level)));
         command.arg(Str::new(if (unwinds) { "--panic=unwind" } else { "--panic=abort" }));
         command.arg(Str::new(fmt::format("--target=%s", triple)));
         if (debug_info) { command.arg(Str::new("-g")); }
-        Log::debug(LogArea::Driver, f"building the stdlib archive in {scratch}");
+        Log::debug(LogArea::Driver, f"building the stdlib archive in {directory}");
         match (command.output()) {
             Result::Ok(result) => {
                 mut output: Output = result;
                 if (!output.status().success()) {
                     mut report: String = String::from_str(Str::new(fmt::format(
-                        "building the stdlib archive in %s failed:\n", scratch)));
+                        "building the stdlib archive in %s failed:\n", directory)));
                     report.push(Str::from_raw(output.stdout().as_ptr(), output.stdout().length() as u64));
                     report.push(Str::from_raw(output.stderr().as_ptr(), output.stderr().length() as u64));
                     return report;
@@ -321,27 +395,20 @@ type struct PrebuiltStdlib {
                 return String::from_str(Str::new(fmt::format("could not run %s to build the stdlib archive", exe)));
             }
         }
-        // What is in the directory now records another key or is not whole -
-        // a build holding the lock found no archive there it could open - so
-        // nobody can be using it.
-        match (Directory::remove_all(Path::from(directory))) {
-            Result::Ok(_)  => { }
-            Result::Err(_) => { }
-        }
-        match (Path::from(scratch).rename_to(Path::from(directory))) {
-            Result::Ok(_) => { }
-            Result::Err(_) => {
-                match (Directory::remove_all(Path::from(scratch))) {
-                    Result::Ok(_)  => { }
-                    Result::Err(_) => { }
-                }
-            }
-        }
-        // Every compiler rebuilt keys a new archive, so the older ones would
-        // pile up: only the newest ARCHIVES_KEPT stay.
-        const parent: string = PrebuiltStdlib::directory_for(stdlib_root, triple, "");
-        mut kept: [string] = [];
-        mut kept_times: [i64] = [];
+        return String::new();
+    }
+
+    /// Every compiler rebuilt keys a new archive, so the older ones would
+    /// pile up: remove those under `parent` beyond the ARCHIVES_KEPT used
+    /// most recently.  Spared whatever their rank: `built` (this build's),
+    /// one being built (its lock is held), and one used within
+    /// ARCHIVE_IDLE_SECONDS, which a build running beside this one may be
+    /// about to link.  An archive stops opening when its manifest goes, so
+    /// that goes first: a removal that fails partway leaves a directory no
+    /// build links, which the next build of its key clears.
+    static prune(parent: string, built: string) -> void {
+        mut archives: [string] = [];
+        mut last_uses: [i64] = [];
         match (Directory::entries(Path::from(parent))) {
             Result::Ok(listing) => {
                 mut entries: DirectoryEntries = listing;
@@ -352,34 +419,40 @@ type struct PrebuiltStdlib {
                             const raw_name: string = name.into_raw();
                             const at: string = Path::from(parent).join(raw_name).into_raw();
                             if (raw_name.contains(".") || !Path::from(at).is_directory()) { continue; }
-                            const time: i64 = match (Path::from(at).metadata()) {
-                                Result::Ok(m)  => { m.modified_secs() }
-                                Result::Err(_) => { 0 }
-                            };
-                            kept.push(at);
-                            kept_times.push(time);
+                            archives.push(at);
+                            last_uses.push(PrebuiltStdlib::last_use_secs(at));
                         }
                         Option::None => { break; }
                     }
                 }
             }
-            Result::Err(_) => { }
+            Result::Err(_) => { return; }
         }
-        for (mut i: i64 = 0; i < kept.length(); i++) {
+        const now: i64 = SystemTime::now().unix_secs();
+        for (mut i: i64 = 0; i < archives.length(); i++) {
             mut newer: i64 = 0;
-            for (mut k: i64 = 0; k < kept.length(); k++) {
-                if (kept_times[k] > kept_times[i] || (kept_times[k] == kept_times[i] && k > i)) {
+            for (mut k: i64 = 0; k < archives.length(); k++) {
+                if (last_uses[k] > last_uses[i] || (last_uses[k] == last_uses[i] && k > i)) {
                     newer = newer + 1;
                 }
             }
-            if (newer >= ARCHIVES_KEPT && kept[i] != directory) {
-                match (Directory::remove_all(Path::from(kept[i]))) {
+            if (newer < ARCHIVES_KEPT || archives[i] == built
+                    || now - last_uses[i] <= ARCHIVE_IDLE_SECONDS
+                    || Path::from(archives[i] + ".lock").exists()) {
+                continue;
+            }
+            const manifest: string = Path::from(archives[i]).join(MANIFEST_NAME).into_raw();
+            if (Path::from(manifest).exists()) {
+                match (File::remove(Path::from(manifest))) {
                     Result::Ok(_)  => { }
-                    Result::Err(_) => { }
+                    Result::Err(_) => { continue; }
                 }
             }
+            match (Directory::remove_all(Path::from(archives[i]))) {
+                Result::Ok(_)  => { }
+                Result::Err(_) => { }
+            }
         }
-        return String::new();
     }
 
     /// Strip from a program's stdlib module every definition the archive
@@ -490,10 +563,23 @@ type struct PrebuiltStdlib {
                 text.push_byte(10 as u8);
             }
         }
+        // A build opens the archive as soon as the manifest is there, so it
+        // appears whole, by a rename, or not at all.
         const path: string = Path::from(directory).join(MANIFEST_NAME).into_raw();
-        match (File::write_bytes(Path::from(path), text.as_bytes())) {
+        const partial: string = path + ".partial";
+        match (File::write_bytes(Path::from(partial), text.as_bytes())) {
+            Result::Ok(_)  => { }
+            Result::Err(error) => {
+                mut report: String = f"cannot write the stdlib manifest: {error}";
+                return report.into_raw();
+            }
+        }
+        match (Path::from(partial).rename_to(Path::from(path))) {
             Result::Ok(_)  => { return ""; }
-            Result::Err(_) => { return fmt::format("cannot write the stdlib manifest %s", path); }
+            Result::Err(error) => {
+                mut report: String = f"cannot publish the stdlib manifest as {path}: {error}";
+                return report.into_raw();
+            }
         }
     }
 }
