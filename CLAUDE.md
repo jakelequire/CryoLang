@@ -26,7 +26,8 @@ make test                # unit + compile-fail + project suites
 make test-census         # the same run, with the suite COUNTS and unit/project NAMES asserted
 make verify              # build once; census, examples, lsp, cross, incr, check-fast CONCURRENTLY,
                          # objects hashed; ARGS="--baseline HEAD --require-identical" proves
-                         # a change moved no compiled output (baseline built in .verify/, cached);
+                         # a change moved no compiled output (baseline built in .verify/, cached;
+                         # its results recorded per program, so a new test re-runs only itself);
                          # a change that makes a refused program compile DECLARES its project in
                          # tests/started-compiling (refused before, builds now); one that corrects
                          # a program the baseline built, in tests/started-passing

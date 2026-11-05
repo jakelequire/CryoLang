@@ -35,9 +35,14 @@ replaced by the archive rather than as missing.
 produces over the SAME population: a compiler built from REV's compiler/src
 with everything else taken from the working tree, which is what "this change
 moved no compiled output" means.  The baseline compiler is built in a clone
-under `.verify/`, never by stashing the working tree, and both it and its
-object hashes are cached by the bytes that decide them, so a session pays for
-a given baseline once.
+under `.verify/`, never by stashing the working tree, and cached by the bytes
+that decide it.  Its objects and verdicts are recorded per program - the unit
+suite, each test project, each compile-fail file, each example, and the
+stdlib archives each sweep links - keyed by the baseline compiler's bytes,
+the inputs every program reads and the program's own files (with what its
+cryoconfig reaches outside its directory), so a change that adds or edits a
+test runs the baseline over that program alone: `cryo test <name>` for each,
+the whole census when every census program has no record.
 
 Every count this relies on is printed.  A zero is only evidence when the
 instrument can report non-zero, so the object counts are floors: a hash list
@@ -221,24 +226,31 @@ def prebuilt_rows():
     return rows
 
 
-def hash_objects(base, out_path):
-    """sha256 of every .o under a build/ directory below `base`, or of the
-    stdlib archives' objects when `base` is "stdlib"; returns the count."""
+def object_rows(base):
+    """sha256 rows of every .o under a build/ directory below `base`."""
     rows = []
-    for dirpath, _, files in os.walk(os.path.join(ROOT, base)) if base != "stdlib" else ():
-        parts = rel(dirpath).split("/")
-        if "build" not in parts:
+    for dirpath, _, files in os.walk(os.path.join(ROOT, base)):
+        if "build" not in rel(dirpath).split("/"):
             continue
         for f in files:
             if f.endswith(".o"):
                 p = os.path.join(dirpath, f)
                 rows.append("%s  %s" % (file_sha(p), rel(p)))
-    if base == "stdlib":
-        rows = prebuilt_rows()
-    rows.sort(key=lambda r: r[66:])
+    return rows
+
+
+def write_rows(rows, out_path):
+    """Write hash rows sorted by path; returns the count."""
+    rows = sorted(rows, key=lambda r: r[66:])
     with io.open(out_path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write("\n".join(rows) + ("\n" if rows else ""))
     return len(rows)
+
+
+def hash_objects(base, out_path):
+    """sha256 of every .o under a build/ directory below `base`, or of the
+    stdlib archives' objects when `base` is "stdlib"; returns the count."""
+    return write_rows(prebuilt_rows() if base == "stdlib" else object_rows(base), out_path)
 
 
 def read_hashes(path):
@@ -383,14 +395,293 @@ def baseline_compiler(rev, env):
     return exe, home, sha
 
 
-def population_key(cryo):
-    """The bytes that decide what the population compiles to under `cryo`."""
-    h = hashlib.sha256(file_sha(cryo).encode())
-    digest(listed(["tests", "examples", "stdlib", "runtime", "bin"]), h=h)
-    # The procedure that takes the hashes decides them too (how the stdlib is
-    # spelled to each run, which flags a build gets).
-    digest(["scripts/verify.py", "scripts/test-census.py", "scripts/examples-gate.py"], h=h)
-    return h.hexdigest()[:16]
+# ---- the baseline, one program at a time -----------------------------------
+#
+# The baseline's objects and verdicts are recorded per PROGRAM: the unit
+# suite (every unit-test file builds into one binary), each test project,
+# each compile-fail file, each example, and the stdlib archives each of the
+# two sweeps links.  A record is keyed by the baseline compiler's bytes, the
+# inputs every program reads, and the program's own files with the ones its
+# cryoconfig reaches outside its directory, so a change that adds or edits a
+# test runs the baseline over that test alone.  A record whose inputs
+# changed has another key and is never read.
+
+UNIT_SUITE = "unit suite"
+CENSUS_ARCHIVES = "archives/census"
+EXAMPLE_ARCHIVES = "archives/examples"
+# Files under tests/ the census reads to judge a run, not to build one.
+BOOKKEEPING = {"tests/test-roster.txt", "tests/started-compiling", "tests/started-passing"}
+# The procedure that takes the hashes decides them too (how the stdlib is
+# spelled to each run, which flags a build gets).
+PROCEDURE = ["scripts/verify.py", "scripts/test-census.py", "scripts/examples-gate.py"]
+NEG_LINE = re.compile(r"^test \(negative\) (\S+) \.\.\.")
+PROJ_REACHED = re.compile(r"^test \(project\) (\S+) \.\.\.")
+EXAMPLE_OK = re.compile(r"^\s*ok\s+(examples/\S+)")
+QUOTED = re.compile(r'"([^"]+)"')
+
+
+def reached_outside(project_dir, seen):
+    """Every file a project's cryoconfig names outside its directory - a
+    `path` dependency, a static library - and, for a directory holding a
+    cryoconfig, what that one names in turn."""
+    out = []
+    config = os.path.join(ROOT, project_dir, "cryoconfig")
+    if not os.path.isfile(config):
+        return out
+    with io.open(config, encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    for value in QUOTED.findall(text):
+        target = os.path.normpath(os.path.join(ROOT, project_dir, value))
+        if not os.path.exists(target) or not target.startswith(ROOT + os.sep):
+            continue
+        name = rel(target)
+        if name == project_dir or name.startswith(project_dir + "/") or name in seen:
+            continue
+        seen.add(name)
+        out += listed([name])
+        if os.path.isdir(target):
+            out += reached_outside(name, seen)
+    return out
+
+
+def programs():
+    """{program: its own files}, for every program the census and the
+    examples sweep build or check, named as the declaration files name them."""
+    tests = listed(["tests/tests"])
+    out = {UNIT_SUITE: [f for f in tests if not f.startswith((PROJECTS + "/", "tests/tests/negative/"))]}
+    for f in tests:
+        if f.startswith("tests/tests/negative/") and f.endswith(".cryo"):
+            out[NEGATIVE + f.rsplit("/", 1)[1]] = [f]
+    roots = [(PROJECTS, d, "") for d in sorted(os.listdir(os.path.join(ROOT, PROJECTS)))
+             if os.path.isfile(os.path.join(ROOT, PROJECTS, d, "test.json"))]
+    roots += [("examples", d, EXAMPLE) for d in sorted(os.listdir(os.path.join(ROOT, "examples")))
+              if os.path.isfile(os.path.join(ROOT, "examples", d, "cryoconfig"))]
+    for parent, d, prefix in roots:
+        home = parent + "/" + d
+        out[prefix + d] = listed([home]) + reached_outside(home, set())
+    return out
+
+
+def shared_inputs():
+    """The files every program's build reads."""
+    return (listed(["stdlib", "runtime", "bin"]) + PROCEDURE
+            + [f for f in listed(["tests"]) if not f.startswith("tests/tests/") and f not in BOOKKEEPING])
+
+
+def program_keys(exe, owned):
+    shared = digest(shared_inputs(), h=hashlib.sha256(file_sha(exe).encode())).hexdigest()
+    keys = {name: digest(files, h=hashlib.sha256((shared + "\0" + name).encode())).hexdigest()[:32]
+            for name, files in owned.items()}
+    for name in (CENSUS_ARCHIVES, EXAMPLE_ARCHIVES):
+        keys[name] = hashlib.sha256((shared + "\0" + name).encode()).hexdigest()[:32]
+    return keys
+
+
+def read_record(path):
+    """{"verdict", "unit_failed", "unit_counts", "rows"} from a record file."""
+    rec = {"verdict": None, "unit_failed": [], "unit_counts": None, "rows": []}
+    with io.open(path, encoding="utf-8") as fh:
+        for line in fh:
+            tag, _, rest = line.rstrip("\n").partition(" ")
+            if tag == "verdict":
+                rec["verdict"] = rest
+            elif tag == "unit-failed":
+                rec["unit_failed"].append(rest)
+            elif tag == "unit-counts":
+                rec["unit_counts"] = [int(n) for n in rest.split()]
+            elif tag == "row":
+                rec["rows"].append(rest)
+    return rec
+
+
+def write_record(path, name, rec):
+    lines = ["name " + name, "verdict " + rec["verdict"]]
+    lines += ["unit-failed " + n for n in rec["unit_failed"]]
+    if rec["unit_counts"] is not None:
+        lines.append("unit-counts " + " ".join(str(n) for n in rec["unit_counts"]))
+    lines += ["row " + r for r in rec["rows"]]
+    tmp = path + ".tmp"
+    with io.open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+
+
+def owner_of(path):
+    """The program an object belongs to, by where its build wrote it."""
+    if path.startswith("tests/build/"):
+        return UNIT_SUITE
+    if path.startswith(PROJECTS + "/"):
+        return path[len(PROJECTS) + 1:].split("/", 1)[0]
+    if path.startswith("examples/"):
+        return EXAMPLE + path.split("/")[1]
+    return None
+
+
+def census_records(lines, names, rows):
+    """The records `names` get from one census run's output and the objects
+    it left: a program with no verdict line in it gets none."""
+    census = census_module()
+    out = {}
+    end = next((i for i, l in enumerate(lines) if census.BLOCK.match(l.rstrip())), len(lines))
+    verdicts = {}
+    for l in lines:
+        m = PROJ_REACHED.match(l)
+        if m:
+            verdicts[m.group(1)] = "ok"
+        m = NEG_LINE.match(l)
+        if m:
+            verdicts[NEGATIVE + m.group(1)] = "ok"
+    for l in lines:
+        m = PROJ_FAILED.match(l)
+        if m:
+            verdicts[m.group(1)] = "FAILED"
+        m = NEG_FAILED.match(l)
+        if m:
+            verdicts[NEGATIVE + m.group(1)] = "FAILED"
+    if UNIT_SUITE in names:
+        blocks, _, unit_names, _, _, _ = census.parse(lines)
+        counts = blocks.get("unit test")
+        # The unit suite is accounted for when every unit test the roster
+        # pins on this host ran, by name, and no other did.
+        if counts is not None and set(unit_names) == census.pinned()[0]:
+            failed = sorted({m.group(1) for m in map(UNIT_FAILED.match, lines[:end]) if m})
+            verdicts[UNIT_SUITE] = "FAILED" if failed else "ok"
+            out[UNIT_SUITE] = {"verdict": verdicts[UNIT_SUITE], "unit_failed": failed,
+                               "unit_counts": [counts.get(t, 0) for t in
+                                               ("passed", "failed", "ignored", "filtered")],
+                               "rows": []}
+    for name in names:
+        if name in verdicts and name not in out:
+            out[name] = {"verdict": verdicts[name], "unit_failed": [], "unit_counts": None,
+                         "rows": []}
+    for r in rows:
+        owner = owner_of(r[66:])
+        if owner in out:
+            out[owner]["rows"].append(r)
+    return out
+
+
+def run_census_programs(exe, names, everything, logdir, env):
+    """Run the census over `names` with `exe`: all of it at once when
+    `everything`, else one filtered run per program - the unit suite's tests
+    by their namespace, which no project or compile-fail file name holds, and
+    every other program by its name.  Returns the output lines of each run."""
+    patterns = [""] if everything else \
+        ["CryoTests::" if n == UNIT_SUITE else n[len(NEGATIVE):] if n.startswith(NEGATIVE) else n
+         for n in sorted(names)]
+    runs = []
+    for i, pattern in enumerate(patterns):
+        log = os.path.join(logdir, "census-%03d.log" % i)
+        argv = [exe, "test", "--format=plain"] + ([pattern] if pattern else [])
+        with open(log, "wb") as fh:
+            subprocess.run(argv, cwd=os.path.join(ROOT, "tests"), env=env, stdout=fh,
+                           stderr=subprocess.STDOUT)
+        with io.open(log, encoding="utf-8", errors="replace") as fh:
+            runs.append(fh.readlines())
+    return runs
+
+
+def baseline_programs(exe, home, bdir, env):
+    """The baseline's object lists (written to `bdir` as base.<population>.sha256)
+    and its census verdict, the tuple `judge_baseline_census` reads (accounted,
+    unit failed, compile-fail failed, failed programs), from the records of every
+    program; the programs with no record are run first and recorded.  Returns
+    None when a program that ran left no verdict."""
+    owned = programs()
+    keys = program_keys(exe, owned)
+    store = os.path.join(home, "programs")
+    os.makedirs(store, exist_ok=True)
+    have = {n: read_record(os.path.join(store, k)) for n, k in keys.items()
+            if os.path.isfile(os.path.join(store, k))}
+    missing = sorted(set(keys) - set(have))
+    examples = [n for n in owned if n.startswith(EXAMPLE)]
+    census_side = [n for n in owned if not n.startswith(EXAMPLE)]
+    # The archives a sweep links are built by the programs that link them, so
+    # a sweep whose archives have no record runs again.
+    if EXAMPLE_ARCHIVES in missing:
+        missing = sorted(set(missing) | set(examples))
+    if CENSUS_ARCHIVES in missing and not set(census_side) & set(missing):
+        missing.append(UNIT_SUITE)
+    run_examples = [n for n in missing if n.startswith(EXAMPLE)]
+    run_census = [n for n in missing if n in census_side]
+    print("verify: baseline programs: %d recorded, %d to run (unit suite %s, %d project(s), "
+          "%d compile-fail file(s), %d example(s))"
+          % (len(keys) - len(missing), len(missing), "yes" if UNIT_SUITE in run_census else "no",
+             sum(declared_kind(n) == "project" for n in run_census),
+             sum(n.startswith(NEGATIVE) for n in run_census), len(run_examples)))
+    wipe_population()
+    fresh = {}
+    if run_examples:
+        # The sweep builds every example; each is recorded.
+        res = run_gate("examples", exe, bdir, env)
+        report_gates([res])
+        with io.open(res["log"], encoding="utf-8", errors="replace") as fh:
+            ex_lines = fh.readlines()
+        failed = {m.group(1) for m in map(EXAMPLE_FAILED.match, ex_lines) if m}
+        built = {m.group(1) for m in map(EXAMPLE_OK.match, ex_lines) if m}
+        for n in examples:
+            if n in failed or n in built:
+                fresh[n] = {"verdict": "FAILED" if n in failed else "ok", "unit_failed": [],
+                            "unit_counts": None, "rows": []}
+        for r in object_rows("examples"):
+            if owner_of(r[66:]) in fresh:
+                fresh[owner_of(r[66:])]["rows"].append(r)
+        fresh[EXAMPLE_ARCHIVES] = {"verdict": "ok", "unit_failed": [], "unit_counts": None,
+                                   "rows": prebuilt_rows()}
+        for d in prebuilt_dirs():
+            shutil.rmtree(d, ignore_errors=True)
+    if run_census:
+        t0 = time.monotonic()
+        everything = set(run_census) == set(census_side)
+        runs = run_census_programs(exe, run_census, everything, bdir, env)
+        print("  census    %d run(s) in %.1f s" % (len(runs), time.monotonic() - t0))
+        rows = object_rows("tests")
+        if everything:
+            fresh.update(census_records([l for r in runs for l in r], run_census, rows))
+        else:
+            for name, lines in zip(sorted(run_census), runs):
+                fresh.update(census_records(lines, [name], rows))
+        fresh[CENSUS_ARCHIVES] = {"verdict": "ok", "unit_failed": [], "unit_counts": None,
+                                  "rows": prebuilt_rows()}
+    unanswered = [n for n in missing if n not in fresh]
+    if unanswered:
+        print("verify: FAIL -- the baseline run gave no verdict for %d program(s): %s"
+              % (len(unanswered), " ".join(unanswered[:10])))
+        return None
+    # A run over some programs builds only the archives those link; the
+    # record keeps every archive the sweep's programs have linked.
+    for name in (CENSUS_ARCHIVES, EXAMPLE_ARCHIVES):
+        if name in fresh and name in have:
+            rows = {r[66:]: r for r in have[name]["rows"]}
+            for r in fresh[name]["rows"]:
+                if rows.setdefault(r[66:], r) != r:
+                    print("verify: FAIL -- the baseline built %s again with other bytes" % r[66:])
+                    return None
+            fresh[name]["rows"] = list(rows.values())
+    for name, rec in fresh.items():
+        write_record(os.path.join(store, keys[name]), name, rec)
+    have.update(fresh)
+    # Two sweeps link the same archive when they build the stdlib with the
+    # same root and options; their records then name the same objects, and
+    # must agree on them.
+    by_path = {base: {} for base in POPULATIONS}
+    for name, rec in sorted(have.items()):
+        base = "stdlib" if name.startswith("archives/") else \
+            "examples" if name.startswith(EXAMPLE) else "tests"
+        for r in rec["rows"]:
+            if by_path[base].setdefault(r[66:], r) != r:
+                print("verify: FAIL -- two baseline records disagree on %s" % r[66:])
+                return None
+    lists = {base: list(rows.values()) for base, rows in by_path.items()}
+    for base, rows in lists.items():
+        write_rows(rows, os.path.join(bdir, "base.%s.sha256" % base))
+    unit = have[UNIT_SUITE]
+    failed = sorted({n for n, r in have.items() if r["verdict"] == "FAILED" and n != UNIT_SUITE}
+                    | set(unit["unit_failed"]))
+    neg_failed = sum(n.startswith(NEGATIVE) and r["verdict"] == "FAILED" for n, r in have.items())
+    print("verify: baseline objects  tests %d  examples %d  stdlib %d"
+          % (len(lists["tests"]), len(lists["examples"]), len(lists["stdlib"])))
+    return (True, unit["unit_counts"][1], neg_failed, failed), lists
 
 
 # ---- programs a change makes compile ---------------------------------------
@@ -491,33 +782,6 @@ def census_module():
     census = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(census)
     return census
-
-
-def census_unit_failed(lines):
-    """The unit suite's failed count as the census reads it from `lines`."""
-    return census_module().parse(lines)[0].get("unit test", {}).get("failed", -1)
-
-
-def census_failures(log, examples_log):
-    """(verdict accounted?, unit failed, compile-fail failed, failed programs):
-    the projects, negative files and examples by their declaration names, and
-    the unit tests the unit suite itself failed by their full names."""
-    census = census_module()
-    with io.open(log, encoding="utf-8", errors="replace") as fh:
-        lines = fh.readlines()
-    with io.open(examples_log, encoding="utf-8", errors="replace") as fh:
-        examples = fh.readlines()
-    blocks = census.parse(lines)[0]
-    accounted = any(l.startswith("test-census: OK") for l in lines)
-    # A project's own run may echo unit-test lines; the unit suite's end at
-    # its summary.
-    end = next((i for i, l in enumerate(lines) if census.BLOCK.match(l.rstrip())), len(lines))
-    failed = sorted({m.group(1) for m in map(PROJ_FAILED.match, lines) if m}
-                    | {NEGATIVE + m.group(1) for m in map(NEG_FAILED.match, lines) if m}
-                    | {m.group(1) for m in map(UNIT_FAILED.match, lines[:end]) if m}
-                    | {m.group(1) for m in map(EXAMPLE_FAILED.match, examples) if m})
-    return (accounted, blocks.get("unit test", {}).get("failed", -1),
-            blocks.get("compile-fail", {}).get("failed", -1), failed)
 
 
 def judge_baseline_census(declared, accounted, unit_failed, neg_failed, failed, fixed=(),
@@ -625,7 +889,12 @@ def check_declared(declared, base_exe, cryo, logdir, env, fixed=()):
 
 
 def selftest():
-    """Drive the two judges through every case they must refuse and allow."""
+    """Drive the two judges, and the reading of a baseline run into records,
+    through every case they must refuse and allow."""
+    def records_of(lines, names, rows):
+        return {n: (r["verdict"], len(r["rows"]))
+                for n, r in census_records(lines, names, rows).items()}
+
     cases = [
         ("census: fails on the declared project only",
          judge_baseline_census({"p"}, True, 0, 0, ["p"]), 0),
@@ -683,11 +952,23 @@ def selftest():
          judge_baseline_census({}, True, 0, 0, ["examples/e"]), 1),
         ("census: a declared example the baseline builds",
          judge_baseline_census({}, True, 0, 0, [], {"examples/e"}), 1),
-        ("census: a project's echoed unit summary is not the suite's",
-         [] if census_unit_failed(["  unit test summary\n", "    failed        0\n",
-                                   "test (project) p ... FAILED (exit 1, expected 0)\n",
-                                   "  unit test summary\n", "    failed        3\n"]) == 0
+        ("records: a failed project, a passing compile-fail file, their objects",
+         [] if records_of(["test (project) p ... FAILED (exit 1, expected 0)\n",
+                           "test (negative) E1_x.cryo ... ok\n"],
+                          ["p", "negative/E1_x.cryo"],
+                          ["%s  tests/tests/projects/p/build/a.o" % ("0" * 64),
+                           "%s  tests/tests/projects/q/build/b.o" % ("1" * 64)])
+         == {"p": ("FAILED", 1), "negative/E1_x.cryo": ("ok", 0)} else ["bad"], 0),
+        ("keys: a project's inputs hold the package its cryoconfig reaches by path",
+         [] if any(f.startswith(PROJECTS + "/visibility_internal/shelf/")
+                   for f in reached_outside(PROJECTS + "/visibility_internal_names", set()))
          else ["bad"], 0),
+        ("records: a program the run printed no verdict for has no record",
+         [] if records_of(["test (project) other ... ok\n"], ["p"], []) == {} else ["bad"], 0),
+        ("records: an object outside every program's build belongs to none",
+         [] if owner_of("tests/tests/lang/build/x.o") is None
+         and owner_of("tests/build/deps/A.o") == UNIT_SUITE
+         and owner_of("examples/01-hello/build/m.o") == "examples/01-hello" else ["bad"], 0),
         ("units: a declared object that moved",
          judge_unit_moves({"u": "/U.o"}, {"x/U.o": "1"}, {"x/U.o": "2"}), 0),
         ("units: a declared object that did not move",
@@ -869,37 +1150,18 @@ def main():
         print("verify: %d program(s) declared as starting to pass since %s%s"
               % (len(fixed), args.baseline,
                  "".join("\n      %s -- %s" % (n, r) for n, r in sorted(fixed.items()))))
-        pkey = population_key(exe)
-        cached = os.path.join(home, "pop-" + pkey)
-        if os.path.isfile(os.path.join(cached, "base.tests.sha256")):
-            print("verify: baseline objects cached for this population: %s" % rel(cached))
-            # Cached only after the baseline census was judged, so its verdict
-            # is recorded as the projects it failed on.
-            with io.open(os.path.join(cached, "base.failed"), encoding="utf-8") as fh:
-                recorded = fh.read().split()
-                census = (True, sum("::" in p for p in recorded),
-                          sum(declared_kind(p) == "negative" for p in recorded), recorded)
-        else:
-            print("verify: baseline run (%s) over the working tree's population"
-                  % ", ".join(POPULATION_GATES))
-            bdir = os.path.join(logdir, "baseline")
-            os.makedirs(bdir)
-            bres, bcounts = population(exe, "base", bdir, env, list(POPULATION_GATES))
-            report_gates(bres)
-            census = census_failures(os.path.join(bdir, "census.log"),
-                                     os.path.join(bdir, "examples.log"))
-            # The census and the examples may fail on declared programs; every
-            # other gate must pass outright.
-            # A baseline compiler that links no stdlib archive builds none, so
-            # the archive population alone may be empty.
-            complete = all(r["ok"] for r in bres if r["name"] not in ("census", "examples")) \
-                and bcounts["tests"] and bcounts["examples"] \
-                and all(r["ok"] or declared or fixed for r in bres
-                        if r["name"] in ("census", "examples"))
-            if not complete:
-                print("verify: FAIL -- the baseline run did not complete; its objects "
-                      "are not a baseline (counts %s)" % bcounts)
-                return 1
+        bdir = os.path.join(logdir, "baseline")
+        os.makedirs(bdir)
+        answer = baseline_programs(exe, home, bdir, env)
+        if answer is None:
+            return 1
+        census, lists = answer
+        # A baseline compiler that links no stdlib archive builds none, so
+        # the archive population alone may be empty.
+        if not lists["tests"] or not lists["examples"]:
+            print("verify: FAIL -- the baseline has no tests or no examples objects; "
+                  "an empty list compares clean against anything")
+            return 1
         problems = judge_baseline_census(declared, *census, fixed=fixed,
                                          unit_namespaces={n: unit_namespace(n) for n in fixed
                                                           if declared_kind(n) == "unit"})
@@ -908,14 +1170,7 @@ def main():
             for p in problems:
                 print("verify: FAIL -- %s" % p)
             return 1
-        if not os.path.isfile(os.path.join(cached, "base.tests.sha256")):
-            os.makedirs(cached, exist_ok=True)
-            for base in POPULATIONS:
-                shutil.copyfile(os.path.join(bdir, "base.%s.sha256" % base),
-                                os.path.join(cached, "base.%s.sha256" % base))
-            with io.open(os.path.join(cached, "base.failed"), "w", encoding="utf-8") as fh:
-                fh.write("\n".join(census[3]) + "\n")
-        base_counts = cached
+        base_counts = bdir
 
     print("verify: gates over %s: %s" % (rel(cryo), ", ".join(names)))
     results, counts = population(cryo, "tree", logdir, env, names)
