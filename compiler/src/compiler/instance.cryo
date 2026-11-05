@@ -1378,6 +1378,7 @@ type struct CompilerInstance {
         mut manifest_artifacts: [string] = [];
         mut manifest_stdlib_archive: string = "";
         mut build_fp_hex: string = "";
+        mut build_shape: u128 = 0;
 
         // Per-module incremental cache: a module whose object is emitted or
         // reused records its key, written for the next build on success.
@@ -1430,9 +1431,12 @@ type struct CompilerInstance {
                 };
                 manifest_artifacts.push(ctx.project_config.lib_archive_path(archive_name));
             }
+            mut shape_hasher: ContentHasher = ContentHasher::new();
+            ctx.options.fold_build_shape(&shape_hasher);
+            build_shape = shape_hasher.finish128();
             const manifest: build_manifest::Manifest = compiler::build_manifest::Manifest::new(
-                ctx.project_config, ctx.options.opt_level, ctx.options.debug_info,
-                manifest_stdlib_archive);
+                ctx.project_config, build_shape, ctx.options.opt_level, ctx.options.debug_info,
+                ctx.options.target_triple, manifest_stdlib_archive);
             const build_fp: u128 = manifest.compute_fingerprint(&mod_entries);
             build_fp_hex = compiler::build_manifest::Manifest::hex128(build_fp);
 
@@ -1593,11 +1597,8 @@ type struct CompilerInstance {
         if (do_incremental && ctx.project_config != null
                 && !ctx.module_graph.builds_standard_library) {
             pm_active = true;
-            // A stdlib module's object holds what the archive lacks, so the
-            // archive's key is part of every module's.
             pm_toolchain = compiler::build_manifest::Manifest::toolchain_fingerprint(
-                ctx.project_config, ctx.options.opt_level, ctx.options.debug_info,
-                if (ctx.prebuilt_stdlib != null) { ctx.prebuilt_stdlib.key } else { "" });
+                ctx.options.opt_level, ctx.options.target_triple);
             pm_prior = compiler::build_manifest::ModuleKeyTable::read_module_keys(
                 ctx.project_config.module_keys_path());
         }
@@ -2414,8 +2415,8 @@ type struct CompilerInstance {
         // before the frontend ran. Side files only; no effect on the IR.
         if (do_incremental && ctx.project_config != null) {
             const manifest: build_manifest::Manifest = compiler::build_manifest::Manifest::new(
-                ctx.project_config, ctx.options.opt_level, ctx.options.debug_info,
-                manifest_stdlib_archive);
+                ctx.project_config, build_shape, ctx.options.opt_level, ctx.options.debug_info,
+                ctx.options.target_triple, manifest_stdlib_archive);
             manifest.write_fingerprint(build_fp_hex, ctx.diagnostics.has_warnings());
             manifest.write_manifest(&mod_entries, build_fp_hex, &manifest_artifacts);
             // Per-module cache keys for the NEXT build to consult: every

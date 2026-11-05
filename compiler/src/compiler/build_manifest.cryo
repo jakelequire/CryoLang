@@ -287,24 +287,30 @@ type struct ModuleKeyTable {
 
 /// Captures one build's config + resolved knobs so the whole-build
 /// fingerprint, up-to-date short-circuit, and `build-manifest.json` write
-/// share a single source of truth. `opt_level` / `debug_info` are the
-/// RESOLVED values (after profile + CLI overrides), so a `--dev` vs
-/// `--release` switch produces distinct fingerprints. `stdlib_archive` is ""
-/// for `--no-std` builds. The varying per-build inputs (the source module
-/// list and the artifact paths) are passed to the methods that need them.
+/// share a single source of truth. `build_shape` is the digest of every
+/// resolved option that shapes the build (`BuildOptions.fold_build_shape`);
+/// `opt_level`, `debug_info` and `target_triple` are the resolved values the
+/// manifest records. `stdlib_archive` is "" for `--no-std` builds. The
+/// varying per-build inputs (the source module list and the artifact paths)
+/// are passed to the methods that need them.
 type struct Manifest {
     cfg:            ProjectConfig*;
+    build_shape:    u128;
     opt_level:      u32;
     debug_info:     boolean;
+    target_triple:  string;
     stdlib_archive: string;
 
-    static new(cfg: ProjectConfig*, opt_level: u32, debug_info: boolean,
-               stdlib_archive_text: string) -> Manifest {
+    static new(cfg: ProjectConfig*, build_shape: u128, opt_level: u32, debug_info: boolean,
+               target_triple_text: string, stdlib_archive_text: string) -> Manifest {
+        const target_triple: string = target_triple_text;
         const stdlib_archive: string = stdlib_archive_text;
         return Manifest {
             cfg:            cfg,
+            build_shape:    build_shape,
             opt_level:      opt_level,
             debug_info:     debug_info,
+            target_triple:  target_triple,
             stdlib_archive: stdlib_archive,
         };
     }
@@ -313,17 +319,7 @@ type struct Manifest {
     compute_fingerprint(&this, modules: &[ModuleEntry]) -> u128 {
         mut h: ContentHasher = ContentHasher::new();
         h.fold(Manifest::compiler_fingerprint());
-        // Resolved knobs.
-        h.fold(this.opt_level as u64);
-        const dbg_b:  u8 = if (this.debug_info)    { 1 } else { 0 };
-        const ell_b:  u8 = if (this.cfg.emit_llvm) { 1 } else { 0 };
-        const nstd_b: u8 = if (this.cfg.no_std)    { 1 } else { 0 };
-        const nrt_b:  u8 = if (this.cfg.no_runtime) { 1 } else { 0 };
-        h.fold(dbg_b);
-        h.fold(ell_b);
-        h.fold(nstd_b);
-        h.fold(nrt_b);
-        h.fold(this.cfg.target_triple);
+        h.fold(this.build_shape);
         h.fold(this.cfg.profile);
         // [link] lists affect the final binary but not the .o files.
         for (mut i: i64 = 0; i < this.cfg.link_system.length(); i++) { h.fold(this.cfg.link_system[i]); }
@@ -409,7 +405,7 @@ type struct Manifest {
         root.put("project",              JsonValue::from(this.cfg.project_name));
         root.put("profile",              JsonValue::from(this.cfg.profile));
         root.put("target_type",          JsonValue::from(this.cfg.target_type.label()));
-        root.put("target_triple",        JsonValue::from(this.cfg.target_triple));
+        root.put("target_triple",        JsonValue::from(this.target_triple));
         root.put("opt_level",            JsonValue::uint_value(this.opt_level as u64));
         root.put("debug_info",           JsonValue::bool_value(this.debug_info));
         root.put("emit_llvm",            JsonValue::bool_value(this.cfg.emit_llvm));
@@ -538,31 +534,16 @@ type struct Manifest {
         return g_compiler_fingerprint;
     }
 
-    /// Digest of the toolchain inputs that affect EVERY object file: the
-    /// compiler's own bytes, the key of the stdlib archive the program links
-    /// ("" when it links none) - a stdlib module's object holds only what the
-    /// archive lacks - and the resolved codegen knobs. Deliberately excludes
-    /// the source modules and the `[link]` lists - those are folded per-module
-    /// (sources) or only affect the final link, not an individual `.o`. Every
-    /// per-module key folds this, so a changed compiler or a
-    /// `--dev`/`--release` switch invalidates the whole per-module cache.
-    static toolchain_fingerprint(cfg: ProjectConfig*, opt_level: u32,
-                                   debug_info: boolean, stdlib_key_text: string) -> u128 {
-        const stdlib_key: string = stdlib_key_text;
+    /// Digest of what emitting a module's object reads besides its bitcode:
+    /// the compiler's own bytes (its backend), the optimization level the
+    /// backend runs at and the resolved triple its target machine is made
+    /// for.  Every per-module key folds this with the module's bitcode.
+    static toolchain_fingerprint(opt_level: u32, target_triple_text: string) -> u128 {
+        const target_triple: string = target_triple_text;
         mut h: ContentHasher = ContentHasher::new();
         h.fold(Manifest::compiler_fingerprint());
-        h.fold(stdlib_key);
-        h.fold(opt_level as u64);
-        const dbg_b:  u8 = if (debug_info)    { 1 } else { 0 };
-        const ell_b:  u8 = if (cfg.emit_llvm) { 1 } else { 0 };
-        const nstd_b: u8 = if (cfg.no_std)    { 1 } else { 0 };
-        const nrt_b:  u8 = if (cfg.no_runtime) { 1 } else { 0 };
-        h.fold(dbg_b);
-        h.fold(ell_b);
-        h.fold(nstd_b);
-        h.fold(nrt_b);
-        h.fold(cfg.target_triple);
-        h.fold(cfg.profile);
+        h.fold(opt_level);
+        h.fold(target_triple);
         return h.finish128();
     }
 
