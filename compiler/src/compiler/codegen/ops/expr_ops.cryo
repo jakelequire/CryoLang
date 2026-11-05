@@ -40,7 +40,7 @@ import std::fmt;
 import compiler::codegen::visit::ir_generator::{ IRGeneratorVisitor };
 import compiler::codegen::abi::{ AbiClassifier, SignaturePlan };
 import compiler::codegen::llvm_types::{
-    LBasicBlock, LBuilder, LIntPredicate, LModule, LRealPredicate, LType, LTypeKind,
+    LBasicBlock, LBuilder, LIntPredicate, LModule, LOpcode, LRealPredicate, LType, LTypeKind,
     LValue
 };
 import compiler::codegen::ops::intrinsic_emitter::{ IntrinsicEmitter };
@@ -824,10 +824,9 @@ type struct ExprOps {
                 // preserves identity so callees that mutate the
                 // struct see the caller's memory.  Otherwise
                 // fall back to a fresh temp alloca + store +
-                // addr-of.  LLVMOpcode::Load = 27.
+                // addr-of.
                 mut handled: boolean = false;
-                const opcode: i32 = llvm::LLVMGetInstructionOpcode(arg_val.raw);
-                if (opcode == 27) {
+                if (arg_val.opcode() == LOpcode::Load) {
                     const ptr_operand: mut void* = llvm::LLVMGetOperand(arg_val.raw, 0);
                     if (ptr_operand != null) {
                         arg_val = LValue { raw: ptr_operand };
@@ -858,10 +857,9 @@ type struct ExprOps {
                 // branch above - reuse the Load's source pointer when
                 // possible (identity-preserving, matching the
                 // receiver-side autoref), else spill to a temp slot
-                // and take its address.  LLVMOpcode::Load = 27.
+                // and take its address.
                 mut handled_f: boolean = false;
-                const opcode_f: i32 = llvm::LLVMGetInstructionOpcode(arg_val.raw);
-                if (opcode_f == 27) {
+                if (arg_val.opcode() == LOpcode::Load) {
                     const ptr_operand_f: mut void* = llvm::LLVMGetOperand(arg_val.raw, 0);
                     if (ptr_operand_f != null) {
                         arg_val = LValue { raw: ptr_operand_f };
@@ -893,7 +891,7 @@ type struct ExprOps {
                     const slot: LValue = this.coercion_slot(slot_lty, "recv.slot");
                     this.builder.build_store(arg_val, slot);
                     arg_val = slot;
-                } else if (llvm::LLVMGetInstructionOpcode(arg_val.raw) == 27) {
+                } else if (arg_val.opcode() == LOpcode::Load) {
                     // The integer is a Load of an lvalue, not a
                     // genuine value-as-address.  This is the
                     // integer twin of the float bug above: a
@@ -2618,11 +2616,9 @@ type struct ExprOps {
         // pointer; the function signature wants the pointer back.  If
         // `val` is a load instruction, we can recover the pre-load
         // address (the load's only operand) and return that, leaving
-        // the dead load to be DCE'd by LLVM.  LLVMOpcode::Load = 27
-        // (LLVM-C enum, stable across LLVM 14-20).
+        // the dead load to be DCE'd by LLVM.
         if (want_kind == LTypeKind::Pointer && got_kind == LTypeKind::Struct) {
-            const opcode: i32 = llvm::LLVMGetInstructionOpcode(val.raw);
-            if (opcode == 27) {
+            if (val.opcode() == LOpcode::Load) {
                 const ptr_operand: mut void* = llvm::LLVMGetOperand(val.raw, 0);
                 if (ptr_operand != null) {
                     return LValue { raw: ptr_operand };

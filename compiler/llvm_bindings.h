@@ -99,6 +99,10 @@ LLVMValueRef   LLVMGetOperand(LLVMValueRef Val, unsigned Index);
 int            LLVMGetNumOperands(LLVMValueRef Val);
 LLVMValueRef   LLVMGetFirstInstruction(LLVMBasicBlockRef BB);
 LLVMValueRef   LLVMGetNextInstruction(LLVMValueRef Inst);
+LLVMBasicBlockRef LLVMGetInstructionParent(LLVMValueRef Inst);
+LLVMModuleRef  LLVMGetGlobalParent(LLVMValueRef Global);
+LLVMBool       LLVMGetVolatile(LLVMValueRef MemoryAccessInst);
+LLVMValueRef   LLVMGetAggregateElement(LLVMValueRef C, unsigned Idx);
 void           LLVMInstructionEraseFromParent(LLVMValueRef Inst);
 void           LLVMReplaceAllUsesWith(LLVMValueRef OldVal, LLVMValueRef NewVal);
 LLVMBool       LLVMIsDeclaration(LLVMValueRef Global);
@@ -174,6 +178,7 @@ LLVMTypeRef LLVMGetTypeByName2(LLVMContextRef C, const char *Name);
 void        LLVMStructSetBody(LLVMTypeRef StructTy, LLVMTypeRef *ElementTypes,
                               unsigned ElementCount, LLVMBool Packed);
 unsigned    LLVMCountStructElementTypes(LLVMTypeRef StructTy);
+LLVMBool    LLVMIsPackedStruct(LLVMTypeRef StructTy);
 LLVMTypeRef LLVMStructGetTypeAtIndex(LLVMTypeRef StructTy, unsigned i);
 LLVMBool    LLVMIsOpaqueStruct(LLVMTypeRef StructTy);
 
@@ -486,6 +491,8 @@ LLVMValueRef LLVMBuildMemSet(LLVMBuilderRef B, LLVMValueRef Ptr, LLVMValueRef Va
                              LLVMValueRef Len, unsigned Align);
 LLVMValueRef LLVMBuildMemCpy(LLVMBuilderRef B, LLVMValueRef Dst, unsigned DstAlign,
                              LLVMValueRef Src, unsigned SrcAlign, LLVMValueRef Size);
+LLVMValueRef LLVMBuildMemMove(LLVMBuilderRef B, LLVMValueRef Dst, unsigned DstAlign,
+                              LLVMValueRef Src, unsigned SrcAlign, LLVMValueRef Size);
 
 
 /* ===================================================================

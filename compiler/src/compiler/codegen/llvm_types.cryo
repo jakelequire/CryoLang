@@ -16,6 +16,7 @@ import std::core::hash::{ Hasher };
 import std::core::slice::{ Slice };
 import compiler::resolver::mangled_name::{ MangledName };
 import compiler::const_table::{ FoldedInteger };
+import utils::log::{ Log, LogArea, LogLevel };
 
 
 // LLVM-C enum mirrors
@@ -156,6 +157,106 @@ type enum LCodeModel : i32 {
 type enum LFileType : i32 {
     Assembly = 0;
     Object   = 1;
+}
+
+/// The widest aggregate, in bytes, `LBuilder.build_store` stores as one
+/// value; a wider one is written as bytes.
+const AGGREGATE_STORE_BYTES: u64 = 64;
+
+/// Mirror of `LLVMOpcode` (`llvm-c/Core.h`), with `NotAnInstruction` for
+/// the 0 `LLVMGetInstructionOpcode` answers for a value that is none.
+type enum LOpcode : i32 {
+    NotAnInstruction = 0;
+    Ret            = 1;
+    Br             = 2;
+    Switch         = 3;
+    IndirectBr     = 4;
+    Invoke         = 5;
+    Unreachable    = 7;
+    Add            = 8;
+    FAdd           = 9;
+    Sub            = 10;
+    FSub           = 11;
+    Mul            = 12;
+    FMul           = 13;
+    UDiv           = 14;
+    SDiv           = 15;
+    FDiv           = 16;
+    URem           = 17;
+    SRem           = 18;
+    FRem           = 19;
+    Shl            = 20;
+    LShr           = 21;
+    AShr           = 22;
+    And            = 23;
+    Or             = 24;
+    Xor            = 25;
+    Alloca         = 26;
+    Load           = 27;
+    Store          = 28;
+    GetElementPtr  = 29;
+    Trunc          = 30;
+    ZExt           = 31;
+    SExt           = 32;
+    FPToUI         = 33;
+    FPToSI         = 34;
+    UIToFP         = 35;
+    SIToFP         = 36;
+    FPTrunc        = 37;
+    FPExt          = 38;
+    PtrToInt       = 39;
+    IntToPtr       = 40;
+    BitCast        = 41;
+    ICmp           = 42;
+    FCmp           = 43;
+    PHI            = 44;
+    Call           = 45;
+    Select         = 46;
+    UserOp1        = 47;
+    UserOp2        = 48;
+    VAArg          = 49;
+    ExtractElement = 50;
+    InsertElement  = 51;
+    ShuffleVector  = 52;
+    ExtractValue   = 53;
+    InsertValue    = 54;
+    Fence          = 55;
+    AtomicCmpXchg  = 56;
+    AtomicRMW      = 57;
+    Resume         = 58;
+    LandingPad     = 59;
+    AddrSpaceCast  = 60;
+    CleanupRet     = 61;
+    CatchRet       = 62;
+    CatchPad       = 63;
+    CleanupPad     = 64;
+    CatchSwitch    = 65;
+    FNeg           = 66;
+    CallBr         = 67;
+    Freeze         = 68;
+}
+
+implement enum LOpcode {
+    /// True for an instruction that writes no memory and transfers no
+    /// control: what lies between a load and a later store of its value
+    /// without changing what the load read.  A call, a store, an atomic, a
+    /// fence or a terminator answers false.
+    writes_no_memory(&this) -> boolean {
+        return match (this) {
+            LOpcode::Add | LOpcode::FAdd | LOpcode::Sub | LOpcode::FSub | LOpcode::Mul
+            | LOpcode::FMul | LOpcode::UDiv | LOpcode::SDiv | LOpcode::FDiv | LOpcode::URem
+            | LOpcode::SRem | LOpcode::FRem | LOpcode::Shl | LOpcode::LShr | LOpcode::AShr
+            | LOpcode::And | LOpcode::Or | LOpcode::Xor | LOpcode::FNeg
+            | LOpcode::Alloca | LOpcode::Load | LOpcode::GetElementPtr
+            | LOpcode::Trunc | LOpcode::ZExt | LOpcode::SExt | LOpcode::FPToUI | LOpcode::FPToSI
+            | LOpcode::UIToFP | LOpcode::SIToFP | LOpcode::FPTrunc | LOpcode::FPExt
+            | LOpcode::PtrToInt | LOpcode::IntToPtr | LOpcode::BitCast | LOpcode::AddrSpaceCast
+            | LOpcode::ICmp | LOpcode::FCmp | LOpcode::Select | LOpcode::Freeze
+            | LOpcode::ExtractElement | LOpcode::InsertElement | LOpcode::ShuffleVector
+            | LOpcode::ExtractValue | LOpcode::InsertValue => { true }
+            _ => { false }
+        };
+    }
 }
 
 
@@ -668,6 +769,13 @@ type struct LBuilder {
         return LValue { raw: llvm::LLVMBuildVAArg(this.raw, list.raw, ty.raw, name) };
     }
 
+    /// Store `val` at `ptr`.  An aggregate wider than
+    /// `AGGREGATE_STORE_BYTES` is written as bytes, not as one first-class
+    /// value, whose cost in the backend grows with its width (a store of a
+    /// ten-kilobyte enum spends seconds in instruction selection): a value
+    /// just loaded, whose address still holds it, is copied from there, and
+    /// a constant is written part by part, an all-zero part by memset.  Any
+    /// other aggregate value is stored whole.
     build_store(&this, val: LValue, ptr: LValue) -> LValue {
         if (val.raw == null || ptr.raw == null) { return LValue::null(); }
         // Guard: never store a void-typed value; LLVM's DataLayout::getAlignment
@@ -676,7 +784,78 @@ type struct LBuilder {
         if (val_ty != null && LType::kind_of(val_ty) == LTypeKind::Void) {
             return LValue::null();
         }
+        const ty: LType = LType { raw: val_ty };
+        if (ty.is_aggregate()) {
+            const llvm_module: LModule = this.insert_module();
+            const size: u64 = llvm_module.abi_size_of(ty);
+            if (size > AGGREGATE_STORE_BYTES) {
+                if (val.reads_unchanged_at_end_of(llvm::LLVMGetInsertBlock(this.raw))) {
+                    if (Log::enabled(LogArea::Codegen, LogLevel::Debug)) {
+                        Log::debug(LogArea::Codegen, f"stored a {size}-byte aggregate as bytes: copied from its load");
+                    }
+                    return this.copy_loaded_aggregate(llvm_module, val, ptr, ty);
+                }
+                if (llvm::LLVMIsConstant(val.raw) != 0) {
+                    if (Log::enabled(LogArea::Codegen, LogLevel::Debug)) {
+                        Log::debug(LogArea::Codegen, f"stored a {size}-byte aggregate as bytes: a constant, part by part");
+                    }
+                    return this.store_constant_parts(llvm_module, val, ptr, ty);
+                }
+            }
+        }
         return LValue { raw: llvm::LLVMBuildStore(this.raw, val.raw, ptr.raw) };
+    }
+
+    /// The module of the block the builder is filling.
+    insert_module(&this) -> LModule {
+        const parent_function: mut void* = llvm::LLVMGetBasicBlockParent(llvm::LLVMGetInsertBlock(this.raw));
+        return LModule { raw: llvm::LLVMGetGlobalParent(parent_function) };
+    }
+
+    /// Copy what the load `loaded` read to `ptr`, in place of storing its
+    /// value.  A memmove, since the two may be the same or overlapping
+    /// places (a value assigned over the aggregate holding it).  The load
+    /// stays, for whatever else uses the value; one nothing uses is dropped
+    /// by the backend.
+    copy_loaded_aggregate(&this, llvm_module: LModule, loaded: LValue, ptr: LValue, ty: LType) -> LValue {
+        const source: mut void* = llvm::LLVMGetOperand(loaded.raw, 0);
+        const size: LValue = LType::const_int(LType::i64(), llvm_module.abi_size_of(ty), false);
+        return LValue { raw: llvm::LLVMBuildMemMove(this.raw,
+            ptr.raw, llvm_module.abi_align_of(ty) as u32,
+            source, llvm::LLVMGetAlignment(loaded.raw), size.raw) };
+    }
+
+    /// Store the constant aggregate `val` at `ptr` part by part: an all-zero
+    /// constant by memset, a part no wider than `AGGREGATE_STORE_BYTES`
+    /// whole, a wider struct field by field.  A wider array that is not all
+    /// zero, a packed struct (its fields are not at their own alignment) and
+    /// a constant whose parts LLVM cannot name are stored whole.
+    store_constant_parts(&this, llvm_module: LModule, val: LValue, ptr: LValue, ty: LType) -> LValue {
+        const size: u64 = llvm_module.abi_size_of(ty);
+        if (llvm::LLVMIsNull(val.raw) != 0) {
+            return LValue { raw: llvm::LLVMBuildMemSet(this.raw, ptr.raw,
+                LType::const_int(LType::i8(), 0, false).raw,
+                LType::const_int(LType::i64(), size, false).raw,
+                llvm_module.abi_align_of(ty) as u32) };
+        }
+        if (size <= AGGREGATE_STORE_BYTES || ty.kind() != LTypeKind::Struct
+                || llvm::LLVMIsPackedStruct(ty.raw) != 0) {
+            return LValue { raw: llvm::LLVMBuildStore(this.raw, val.raw, ptr.raw) };
+        }
+        const fields: u32 = llvm::LLVMCountStructElementTypes(ty.raw);
+        for (mut i: u32 = 0; i < fields; i++) {
+            if (llvm::LLVMGetAggregateElement(val.raw, i) == null) {
+                return LValue { raw: llvm::LLVMBuildStore(this.raw, val.raw, ptr.raw) };
+            }
+        }
+        mut last: LValue = LValue::null();
+        for (mut i: u32 = 0; i < fields; i++) {
+            const part: LValue = LValue { raw: llvm::LLVMGetAggregateElement(val.raw, i) };
+            const part_ty: LType = LType { raw: llvm::LLVMStructGetTypeAtIndex(ty.raw, i) };
+            const part_ptr: LValue = this.build_struct_gep(ty, ptr, i, "part");
+            last = this.store_constant_parts(llvm_module, part, part_ptr, part_ty);
+        }
+        return last;
     }
 
     build_gep(&this, ty: LType, ptr: LValue, indices: mut void*, num_indices: u32, name: string) -> LValue {
@@ -895,6 +1074,52 @@ type struct LValue {
         return this.raw != null;
     }
 
+    /// The instruction this value is; `NotAnInstruction` for a constant, an
+    /// argument or a global.
+    opcode(&this) -> LOpcode {
+        return llvm::LLVMGetInstructionOpcode(this.raw) as LOpcode;
+    }
+
+    /// True when this load's address holds, at the end of the block the
+    /// builder is filling, what the load read: the load is in that block and
+    /// nothing after it writes memory the load could have read.  Each
+    /// instruction after it is asked, up to the block's last; a store into
+    /// a stack slot allocated after the load is the one write admitted,
+    /// since that memory did not exist when the load read.
+    reads_unchanged_at_end_of(&this, block: mut void*) -> boolean {
+        if (this.opcode() != LOpcode::Load || llvm::LLVMGetVolatile(this.raw) != 0) { return false; }
+        if (llvm::LLVMGetInstructionParent(this.raw) != block) { return false; }
+        mut later_slots: [mut void*] = [];
+        mut later: mut void* = llvm::LLVMGetNextInstruction(this.raw);
+        while (later != null) {
+            const instruction: LValue = LValue { raw: later };
+            const opcode: LOpcode = instruction.opcode();
+            if (opcode == LOpcode::Alloca) { later_slots.push(later); }
+            if (!opcode.writes_no_memory()) {
+                if (opcode != LOpcode::Store) { return false; }
+                const address: LValue = LValue { raw: llvm::LLVMGetOperand(later, 1) };
+                const slot: mut void* = address.address_base();
+                mut fresh: boolean = false;
+                for (mut i: i64 = 0; i < later_slots.length(); i++) {
+                    if (later_slots[i] == slot) { fresh = true; break; }
+                }
+                if (!fresh || llvm::LLVMGetVolatile(later) != 0) { return false; }
+            }
+            later = llvm::LLVMGetNextInstruction(later);
+        }
+        return true;
+    }
+
+    /// The pointer this address is an element offset from: the operand a
+    /// chain of getelementptr instructions starts at, or the address itself.
+    address_base(&this) -> mut void* {
+        mut base: LValue = LValue { raw: this.raw };
+        while (base.opcode() == LOpcode::GetElementPtr) {
+            base = LValue { raw: llvm::LLVMGetOperand(base.raw, 0) };
+        }
+        return base.raw;
+    }
+
     /// Build an inline-assembly callee value for `asm { ... }` blocks.
     /// The result is passed as the `Fn` operand of `build_call` (it is not
     /// a real `LLVMFunction`).  `dialect` is 0 = ATT, 1 = Intel.
@@ -1104,6 +1329,14 @@ type struct LType {
     /// (`ty.kind() == LTypeKind::Void`) rather than re-casting integers.
     kind(&this) -> LTypeKind {
         return llvm::LLVMGetTypeKind(this.raw) as LTypeKind;
+    }
+
+    /// True for a struct or an array type.
+    is_aggregate(&this) -> boolean {
+        return match (this.kind()) {
+            LTypeKind::Struct | LTypeKind::Array => { true }
+            _ => { false }
+        };
     }
 
     // ----- Primitive type constructors -----
