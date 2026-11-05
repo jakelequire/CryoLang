@@ -46,8 +46,8 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     ArrayAccessExpr, ArrayExpr, BinaryExpr, CallExpr, CastExpr,
-    ExprKind, ExpressionNode, IdentifierExpr, IfExpr, LambdaExpr, MatchExpr,
-    MemberAccessExpr, NewExpr, StructExpr, TernaryExpr,
+    ExprKind, ExpressionNode, IdentifierExpr, LambdaExpr, MatchExpr,
+    MemberAccessExpr, NewExpr, StructExpr,
     TupleExpr, UnaryExpr
 };
 import compiler::ast::node::{ ProgramNode };
@@ -64,6 +64,26 @@ import compiler::types::ownership::{ OwnershipQuery };
 import compiler::types::trait_checker::{ TraitChecker };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
+
+
+/// How the value a branching construct yields is used, which decides how
+/// each branch's yielded value is walked: discarded with the construct, or
+/// moved out of it into the place the construct initializes, returns or
+/// passes (`real` as `walk_expr_move` takes it).  A branch that yields a
+/// binding moves that binding only on its own path, so the join sees it as
+/// the branch's move and nothing else does.
+type struct BranchResult {
+    moved: boolean;
+    real:  boolean;
+
+    static discarded() -> BranchResult {
+        return BranchResult { moved: false, real: false };
+    }
+
+    static moved_out(real: boolean) -> BranchResult {
+        return BranchResult { moved: true, real: real };
+    }
+}
 
 
 type struct MoveChecker {
@@ -723,7 +743,13 @@ type struct MoveChecker {
     /// A null body (e.g. a missing `else`) is the implicit live no-move
     /// branch: it is skipped, contributing nothing to the union, which
     /// leaves a one-sided move correctly *possibly*-moved.
-    merge_branches(mut &this, bodies: [Stmt*]) -> void {
+    ///
+    /// The branches are `bodies` (statement bodies: an `if`'s branches, a
+    /// match's arms) followed by `arms` (the single-expression arms of an
+    /// `if` or `?:` expression); `result` says how each branch's yielded
+    /// value is walked.
+    merge_branches(mut &this, bodies: [Stmt*], arms: [ExpressionNode*],
+                   result: BranchResult) -> void {
         // Inside a conditional: a field-move-out here is NOT an unconditional
         // partial move, so partial_move_allowed rejects it (stays E0453).
         this.branch_depth += 1;
@@ -765,9 +791,11 @@ type struct MoveChecker {
         mut u_keys:  [u64]        = [];
         mut u_spans: [SourceSpan] = [];
         mut u_real:  [boolean]    = [];
-        for (mut i: i64 = 0; i < bodies.length(); i++) {
-            const body: Stmt* = bodies[i];
-            if (body == null) {
+        const branch_count: i64 = bodies.length() + arms.length();
+        for (mut i: i64 = 0; i < branch_count; i++) {
+            const body: Stmt* = if (i < bodies.length()) { bodies[i] } else { null };
+            const arm: ExpressionNode* = if (i < bodies.length()) { null } else { arms[i - bodies.length()] };
+            if (body == null && arm == null) {
                 // Implicit fall-through path (a missing `else`): it moves and
                 // revives nothing, so its end-set IS the pre-branch set.
                 // Contributing it keeps a one-sided move *possibly* moved and
@@ -793,10 +821,17 @@ type struct MoveChecker {
             }
             const branch_cap_start: i64 = this.captured_decl_keys.length();
             this.capture_decls = true;
-            this.walk_stmt(body);
+            if (body != null) {
+                this.walk_branch_body(body, result);
+            } else {
+                this.walk_branch_value(arm, result);
+            }
             this.capture_decls = prev_capture;
             // Only branches that can fall through contribute moves to the join.
-            if (!this.always_diverges(body)) {
+            // An expression arm always counts as falling through: if it
+            // diverges, its moves can only over-report at the join, never hide
+            // one.
+            if (body == null || !this.always_diverges(body)) {
                 for (mut j: i64 = 0; j < this.moved_keys.length(); j++) {
                     const k:    u64     = this.moved_keys[j];
                     // Declared in this branch -> dead at the join, skip.
@@ -835,6 +870,55 @@ type struct MoveChecker {
             this.mark_moved_key(u_keys[i], u_spans[i], u_real[i]);
         }
         this.branch_depth -= 1;
+    }
+
+    /// Walk one statement branch of a branching construct.  When the
+    /// construct's value is moved out, the branch's yielded value - the body
+    /// itself when it is a bare expression, else its block's last statement
+    /// when that is an expression - is walked as that move.
+    walk_branch_body(mut &this, body: Stmt*, result: BranchResult) -> void {
+        if (!result.moved) {
+            this.walk_stmt(body);
+            return;
+        }
+        match (body.kind) {
+            StmtKind::Expr(e) => {
+                if (e.expression != null) { this.walk_expr_move(e.expression, result.real); }
+            }
+            StmtKind::Block(b) => {
+                mut value_index: i64 = -1;
+                for (mut i: i64 = b.statements.length() - 1; i >= 0; i--) {
+                    if (b.statements[i] != null) {
+                        value_index = i;
+                        break;
+                    }
+                }
+                for (mut i: i64 = 0; i < b.statements.length(); i++) {
+                    const stmt: Stmt* = b.statements[i];
+                    if (i != value_index) {
+                        this.walk_stmt(stmt);
+                        continue;
+                    }
+                    match (stmt.kind) {
+                        StmtKind::Expr(e) => {
+                            if (e.expression != null) { this.walk_expr_move(e.expression, result.real); }
+                        }
+                        _ => { this.walk_stmt(stmt); }
+                    }
+                }
+            }
+            _ => { this.walk_stmt(body); }
+        }
+    }
+
+    /// Walk one expression arm of an `if` or `?:` expression: its value is
+    /// the construct's value.
+    walk_branch_value(mut &this, arm: ExpressionNode*, result: BranchResult) -> void {
+        if (result.moved) {
+            this.walk_expr_move(arm, result.real);
+        } else {
+            this.walk_expr_read(arm);
+        }
     }
 
     /// Emit a use-after-move error with a primary label at the use
@@ -985,7 +1069,7 @@ type struct MoveChecker {
                 // move *possibly* (not definitely) moved, which the union
                 // models correctly. See merge_branches.
                 mut if_branches: [Stmt*] = [it.then_stmt, it.else_stmt];
-                this.merge_branches(if_branches);
+                this.merge_branches(if_branches, [], BranchResult::discarded());
             }
             StmtKind::Match(m) => {
                 // Moves inside match arms must be tracked, or a double-move
@@ -1017,7 +1101,7 @@ type struct MoveChecker {
                         arm_bodies.push(arm.body);
                     }
                 }
-                this.merge_branches(arm_bodies);
+                this.merge_branches(arm_bodies, [], BranchResult::discarded());
                 this.move_subject_of_taken_payload(m.subject, pat_snap);
                 this.truncate_pat_bindings(pat_snap);
             }
@@ -1249,6 +1333,25 @@ type struct MoveChecker {
             this.handle_ident(expr, id, true, real);
             return;
         }
+        // A branching expression's value is the value of the branch that ran,
+        // so moving it out moves what that branch yields.
+        match (expr.kind) {
+            ExprKind::If(ie) => {
+                this.walk_conditional(ie.condition, ie.then_expr, ie.else_expr,
+                    BranchResult::moved_out(real));
+                return;
+            }
+            ExprKind::Ternary(t) => {
+                this.walk_conditional(t.condition, t.true_expr, t.false_expr,
+                    BranchResult::moved_out(real));
+                return;
+            }
+            ExprKind::Match(m) => {
+                this.read_match(m, BranchResult::moved_out(real));
+                return;
+            }
+            _ => {}
+        }
         // For other shapes, descend in read mode by default; the
         // child-as-move is only applied at known consume sites below.
         this.walk_expr_read(expr);
@@ -1267,7 +1370,7 @@ type struct MoveChecker {
             ExprKind::MemberAccess(ma) => { this.read_member(ma); }
             // Reduced to one live arm by the monomorphizer; walk it as
             // a block.
-            ExprKind::Match(m) => { this.read_match(m); }
+            ExprKind::Match(m) => { this.read_match(m, BranchResult::discarded()); }
             ExprKind::Cast(cv) => { this.read_cast(cv); }
             ExprKind::ObjectConversion(oc) => { this.walk_expr_read(oc.operand); }
             ExprKind::Unary(u) => { this.read_unary(u); }
@@ -1288,8 +1391,14 @@ type struct MoveChecker {
             ExprKind::Tuple(tl) => { this.read_tuple_lit(tl); }
             ExprKind::Array(al) => { this.read_array_lit(al); }
             ExprKind::Struct(sl) => { this.read_struct_lit(sl); }
-            ExprKind::Ternary(t) => { this.read_ternary(t); }
-            ExprKind::If(ie) => { this.read_if_expr(ie); }
+            ExprKind::Ternary(t) => {
+                this.walk_conditional(t.condition, t.true_expr, t.false_expr,
+                    BranchResult::discarded());
+            }
+            ExprKind::If(ie) => {
+                this.walk_conditional(ie.condition, ie.then_expr, ie.else_expr,
+                    BranchResult::discarded());
+            }
             ExprKind::Lambda(lam) => { this.read_lambda(lam); }
             // Not walked by this pass.
             ExprKind::Sizeof(_) | ExprKind::Alignof(_) | ExprKind::Typeof(_)
@@ -1467,11 +1576,10 @@ type struct MoveChecker {
         return;
     }
 
-    /// An operand that runs on some paths through its expression only - the
-    /// right of `&&` or `||` (`conditional`), an arm of `?:` or of an `if`
-    /// expression - is walked as a branch body is: a field moved out of it
-    /// is not an unconditional partial move, so it stays E0453.  Mirrored
-    /// in drop_insertion.
+    /// The right operand of `&&` or `||` (`conditional`) runs on some paths
+    /// only, so it is walked as a branch body is: a field moved out of it is
+    /// not an unconditional partial move, so it stays E0453.  Mirrored in
+    /// drop_insertion.
     walk_conditional_operand(mut &this, operand: ExpressionNode*, conditional: boolean) -> void {
         if (conditional) { this.branch_depth += 1; }
         this.walk_expr_read(operand);
@@ -1529,27 +1637,21 @@ type struct MoveChecker {
         return;
     }
 
-    read_ternary(mut &this, t: TernaryExpr*) -> void {
-        if (t == null) { return; }
-        if (t.condition != null)  { this.walk_expr_read(t.condition); }
-        if (t.true_expr != null)  { this.walk_conditional_operand(t.true_expr, true); }
-        if (t.false_expr != null) { this.walk_conditional_operand(t.false_expr, true); }
-        return;
-    }
-
-    read_if_expr(mut &this, ie: IfExpr*) -> void {
-        if (ie == null) { return; }
-        if (ie.condition != null) { this.walk_expr_read(ie.condition); }
-        if (ie.then_expr != null) { this.walk_conditional_operand(ie.then_expr, true); }
-        if (ie.else_expr != null) { this.walk_conditional_operand(ie.else_expr, true); }
-        return;
+    /// An `if` or `?:` expression: the condition runs on every path, each arm
+    /// on its own, and the arms join as an `if` statement's branches do.  A
+    /// missing `else` arm is the implicit fall-through.
+    walk_conditional(mut &this, condition: ExpressionNode*, then_arm: ExpressionNode*,
+                     else_arm: ExpressionNode*, result: BranchResult) -> void {
+        if (condition != null) { this.walk_expr_read(condition); }
+        this.merge_branches([], [then_arm, else_arm], result);
     }
 
     /// A `match` in expression position (also the desugaring of `expr?`).
     /// Read the subject once, then merge the arm bodies exactly like the
     /// statement form so a double-move within an arm, or a move in an arm
-    /// reused after the match, is caught.
-    read_match(mut &this, m: MatchExpr*) -> void {
+    /// reused after the match, is caught.  `result` says whether the value
+    /// an arm yields is moved out of the match.
+    read_match(mut &this, m: MatchExpr*, result: BranchResult) -> void {
         if (m == null) { return; }
         if (m.subject != null) {
             this.check_subject_move_out(m.subject);
@@ -1567,7 +1669,7 @@ type struct MoveChecker {
                 arm_bodies.push(arm.body);
             }
         }
-        this.merge_branches(arm_bodies);
+        this.merge_branches(arm_bodies, [], result);
         this.move_subject_of_taken_payload(m.subject, pat_snap);
         this.truncate_pat_bindings(pat_snap);
         return;

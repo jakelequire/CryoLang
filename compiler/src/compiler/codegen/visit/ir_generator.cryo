@@ -236,7 +236,8 @@ type struct IRGeneratorVisitor {
                     ExprKind::Struct(s)  => { return this.visit_struct_literal(e, s); }
                     ExprKind::Literal(l) => { return this.codegen_literal(e, l); }
                     ExprKind::Ternary(t) => {
-                        return this.emit_conditional(e, t.condition, t.true_expr, t.false_expr);
+                        return this.emit_conditional(e, t.condition, t.true_expr, t.false_expr,
+                            &t.then_flag_writes, &t.else_flag_writes);
                     }
                     ExprKind::StaticMatch(s) => { return this.visit_static_match_expr(e, s); }
                     ExprKind::Match(m) => { return this.visit_match_expr(e, m); }
@@ -251,7 +252,8 @@ type struct IRGeneratorVisitor {
                     ExprKind::ScopeResolution(s) => { return this.visit_scope_resolution(e, s); }
                     ExprKind::MemberAccess(m) => { return this.visit_member_access(e, m); }
                     ExprKind::If(i) => {
-                        return this.emit_conditional(e, i.condition, i.then_expr, i.else_expr);
+                        return this.emit_conditional(e, i.condition, i.then_expr, i.else_expr,
+                            &i.then_flag_writes, &i.else_flag_writes);
                     }
                     ExprKind::Call(c) => { return this.calls.emit(this, e, c); }
                 }
@@ -1973,9 +1975,11 @@ type struct IRGeneratorVisitor {
     }
 
     /// `?:` and a value `if`: `condition` picks `then_expr` or `else_expr`,
-    /// and the value is the phi of the arms that reach the merge.
+    /// and the value is the phi of the arms that reach the merge.  An arm's
+    /// drop-flag writes run once its value is computed.
     emit_conditional(mut &this, node: ExpressionNode*, condition: mut ExpressionNode*,
-                     then_expr: mut ExpressionNode*, else_expr: mut ExpressionNode*) -> Emitted {
+                     then_expr: mut ExpressionNode*, else_expr: mut ExpressionNode*,
+                     then_writes: &[Stmt*], else_writes: &[Stmt*]) -> Emitted {
         mut out: Emitted = Emitted::none();
         const cond: LValue = this.dispatch.codegen_rvalue(this,condition);
         const current_fn: LValue = this.get_current_function();
@@ -2014,6 +2018,11 @@ type struct IRGeneratorVisitor {
             then_val = IRGeneratorVisitor::coerce_to_phi_type(
                 this.cg, then_val, ty, node.resolved_type);
         }
+        if (then_live) {
+            for (mut i: i64 = 0; i < then_writes.length(); i++) {
+                this.dispatch_node(Node::Stmt(then_writes[i]));
+            }
+        }
         this.cg.flow.branch_if_not_terminated(merge_bb);
         if (then_live) {
             vals_arr[n as i64] = if (then_val.is_valid()) { then_val.raw }
@@ -2029,6 +2038,11 @@ type struct IRGeneratorVisitor {
         if (else_live && else_val.is_valid()) {
             else_val = IRGeneratorVisitor::coerce_to_phi_type(
                 this.cg, else_val, ty, node.resolved_type);
+        }
+        if (else_live) {
+            for (mut i: i64 = 0; i < else_writes.length(); i++) {
+                this.dispatch_node(Node::Stmt(else_writes[i]));
+            }
         }
         this.cg.flow.branch_if_not_terminated(merge_bb);
         if (else_live) {

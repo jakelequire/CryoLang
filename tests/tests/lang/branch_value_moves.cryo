@@ -1,0 +1,259 @@
+///! A binding a branch yields is moved on that branch's path only.
+///!
+///! `if (c) { a } else { b }`, `c ? a : b` and a match arm yielding `a` move
+///! `a` out exactly when that branch runs.  Each value must then be released
+///! exactly once on every path: by whoever received it when its branch ran,
+///! at its own scope exit when it did not.  Each test runs both paths and
+///! records the releases as a bitmask of ids plus a count, so a value released
+///! twice shows as a count above the number of ids, one never released as a
+///! missing bit, and one released early as a wrong mask at the point it is
+///! read.  The controls prove the counter can tell the cases apart.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::BranchValueMoves;
+
+import std::core::result::{ Result };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_eq };
+
+mut g_mask:  i32 = 0;
+mut g_count: i32 = 0;
+
+function reset() -> void { g_mask = 0; g_count = 0; }
+
+type struct Tracked { id: i32; }
+
+implement trait Drop for struct Tracked {
+    drop(mut &this) -> void {
+        g_mask  = g_mask | (1 << this.id);
+        g_count = g_count + 1;
+    }
+}
+
+function consume(t: Tracked) -> void { }
+
+function id_of(t: Tracked) -> i32 { return t.id; }
+
+/// Both releases' records at once, so one comparison names both.
+function released() -> i32 { return g_mask * 100 + g_count; }
+
+function expected(mask: i32, count: i32) -> i32 { return mask * 100 + count; }
+
+// ---- controls ------------------------------------------------------------
+
+![test]
+function control_one_value_one_release() -> Result<(), TestError> {
+    reset();
+    { const a: Tracked = Tracked { id: 0 }; }
+    return expect_eq(released(), expected(0x01, 1));
+}
+
+![test]
+function control_counter_sees_a_second_release() -> Result<(), TestError> {
+    reset();
+    {
+        mut a: Tracked = Tracked { id: 0 };
+        a.drop();
+        a = Tracked { id: 0 };
+    }
+    return expect_eq(released(), expected(0x01, 2));
+}
+
+// ---- an `if` expression's value initializes a binding ----------------------
+
+function if_initializer(flag: boolean) -> i32 {
+    reset();
+    {
+        const a: Tracked = Tracked { id: 0 };
+        const chosen: Tracked = if (flag) { a } else { Tracked { id: 1 } };
+        if (g_count != 0) { return -1; }
+    }
+    return released();
+}
+
+![test]
+function if_initializer_taken_branch() -> Result<(), TestError> {
+    return expect_eq(if_initializer(true), expected(0x01, 1));
+}
+
+![test]
+function if_initializer_other_branch() -> Result<(), TestError> {
+    return expect_eq(if_initializer(false), expected(0x03, 2));
+}
+
+// ---- both arms yield a binding ----------------------------------------------
+
+function if_both_arms_named(flag: boolean) -> i32 {
+    reset();
+    {
+        const a: Tracked = Tracked { id: 0 };
+        const b: Tracked = Tracked { id: 1 };
+        const chosen: Tracked = if (flag) { a } else { b };
+        if (g_count != 0) { return -1; }
+        if (chosen.id != (if (flag) { 0 } else { 1 })) { return -2; }
+    }
+    return released();
+}
+
+![test]
+function if_both_arms_named_then() -> Result<(), TestError> {
+    return expect_eq(if_both_arms_named(true), expected(0x03, 2));
+}
+
+![test]
+function if_both_arms_named_else() -> Result<(), TestError> {
+    return expect_eq(if_both_arms_named(false), expected(0x03, 2));
+}
+
+// ---- `?:` -------------------------------------------------------------------
+
+function ternary_initializer(flag: boolean) -> i32 {
+    reset();
+    {
+        const a: Tracked = Tracked { id: 0 };
+        const chosen: Tracked = flag ? a : Tracked { id: 1 };
+        if (g_count != 0) { return -1; }
+    }
+    return released();
+}
+
+![test]
+function ternary_taken_branch() -> Result<(), TestError> {
+    return expect_eq(ternary_initializer(true), expected(0x01, 1));
+}
+
+![test]
+function ternary_other_branch() -> Result<(), TestError> {
+    return expect_eq(ternary_initializer(false), expected(0x03, 2));
+}
+
+// ---- a match expression's arm ----------------------------------------------
+
+function match_arm_yields(n: i32) -> i32 {
+    reset();
+    {
+        const a: Tracked = Tracked { id: 0 };
+        const chosen: Tracked = match (n) {
+            1 => { a }
+            _ => { Tracked { id: 1 } }
+        };
+        if (g_count != 0) { return -1; }
+    }
+    return released();
+}
+
+![test]
+function match_arm_yields_taken_arm() -> Result<(), TestError> {
+    return expect_eq(match_arm_yields(1), expected(0x01, 1));
+}
+
+![test]
+function match_arm_yields_other_arm() -> Result<(), TestError> {
+    return expect_eq(match_arm_yields(2), expected(0x03, 2));
+}
+
+// ---- the value passed by value to a call -----------------------------------
+
+function if_argument(flag: boolean) -> i32 {
+    reset();
+    {
+        const a: Tracked = Tracked { id: 0 };
+        consume(if (flag) { a } else { Tracked { id: 1 } });
+        // The taken value was released by `consume`; `a` waits for scope exit
+        // on the other path.
+        if (flag && g_mask != 0x01) { return -1; }
+        if (!flag && g_mask != 0x02) { return -2; }
+    }
+    return released();
+}
+
+![test]
+function if_argument_taken_branch() -> Result<(), TestError> {
+    return expect_eq(if_argument(true), expected(0x01, 1));
+}
+
+![test]
+function if_argument_other_branch() -> Result<(), TestError> {
+    return expect_eq(if_argument(false), expected(0x03, 2));
+}
+
+// ---- the value returned -----------------------------------------------------
+
+function returned(flag: boolean) -> Tracked {
+    const a: Tracked = Tracked { id: 0 };
+    return if (flag) { a } else { Tracked { id: 1 } };
+}
+
+function if_return(flag: boolean) -> i32 {
+    reset();
+    {
+        const r: Tracked = returned(flag);
+        // On the other path `a` was released as `returned` exited.
+        if (flag && g_count != 0) { return -1; }
+        if (!flag && g_mask != 0x01) { return -2; }
+    }
+    return released();
+}
+
+![test]
+function if_return_taken_branch() -> Result<(), TestError> {
+    return expect_eq(if_return(true), expected(0x01, 1));
+}
+
+![test]
+function if_return_other_branch() -> Result<(), TestError> {
+    return expect_eq(if_return(false), expected(0x03, 2));
+}
+
+// ---- nested branches --------------------------------------------------------
+
+function nested(outer: boolean, inner: boolean) -> i32 {
+    reset();
+    {
+        const a: Tracked = Tracked { id: 0 };
+        const b: Tracked = Tracked { id: 1 };
+        const chosen: Tracked = if (outer) { if (inner) { a } else { b } } else { Tracked { id: 2 } };
+        if (g_count != 0) { return -1; }
+    }
+    return released();
+}
+
+![test]
+function nested_first() -> Result<(), TestError> {
+    return expect_eq(nested(true, true), expected(0x03, 2));
+}
+
+![test]
+function nested_second() -> Result<(), TestError> {
+    return expect_eq(nested(true, false), expected(0x03, 2));
+}
+
+![test]
+function nested_outer_else() -> Result<(), TestError> {
+    return expect_eq(nested(false, false), expected(0x07, 3));
+}
+
+// ---- a move inside an arm whose value is not moved --------------------------
+
+function move_inside_arm(flag: boolean) -> i32 {
+    reset();
+    {
+        const a: Tracked = Tracked { id: 0 };
+        const n: i32 = if (flag) { id_of(a) } else { 7 };
+        // `id_of` released `a` on the taken path.
+        if (flag && g_count != 1) { return -1; }
+        if (!flag && g_count != 0) { return -2; }
+        if (n != (if (flag) { 0 } else { 7 })) { return -3; }
+    }
+    return released();
+}
+
+![test]
+function move_inside_arm_taken_branch() -> Result<(), TestError> {
+    return expect_eq(move_inside_arm(true), expected(0x01, 1));
+}
+
+![test]
+function move_inside_arm_other_branch() -> Result<(), TestError> {
+    return expect_eq(move_inside_arm(false), expected(0x01, 1));
+}

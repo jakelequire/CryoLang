@@ -3527,6 +3527,8 @@ Non-`Copy` bindings are tracked by a flow-sensitive analysis ([`passes/move_chec
 - passing a non-`Copy` value to a function or method parameter that is **not** a reference type (`fn f(t: T)` moves; `fn f(t: &T)` borrows), and
 - calling `binding.drop()` or any method whose receiver consumes (`mut this` or `![sink]`).
 
+A branching expression's value is the value of the branch that ran, so where an `if` expression, a `?:` or a `match` expression is itself at a move site, the value each branch yields is moved there: `const c: T = if (f) { a } else { make() };` moves `a` when `f` holds, and only then. A binding moved on some branches only, by yielding it or inside the branch (`if (f) { take(a) } else { 0 }`), is possibly moved after the expression, so a later use is refused (`E0452`) as after an `if` statement that moves it in one branch; at scope exit it is released on exactly the paths that kept it.
+
 References (`&T` / `mut &T`) and raw pointers borrow; passing `&x` keeps `x` usable. Reassigning a binding re-initialises it, so `consume(x); x = make();` is legal and `x` is live again after the assignment. A moved-from binding holds nothing, so that second assignment releases nothing - the callee owns what it took (see [section 15.2](#152-the-drop-trait) for what assignment does release).
 
 ```cryo

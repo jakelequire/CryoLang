@@ -109,6 +109,71 @@ type struct PassLocal {
 }
 
 
+/// The moves of outer bindings each arm of a branching construct made, for
+/// the join after it.  Each arm's moves are a slice of the flat arrays,
+/// from `arm_starts[a]` to `arm_starts[a + 1]`; `keys` holds every binding
+/// any arm moved, once, with the number of arms that moved it.
+type struct ArmMoveLog {
+    arm_keys:   [u64];
+    arm_lines:  [i32];
+    arm_gov:    [boolean];
+    arm_starts: [i64];
+    keys:       [u64];
+    lines:      [i32];
+    counts:     [i64];
+
+    static new() -> ArmMoveLog {
+        return ArmMoveLog {
+            arm_keys: [], arm_lines: [], arm_gov: [], arm_starts: [],
+            keys: [], lines: [], counts: [],
+        };
+    }
+
+    /// Start the next arm's slice.
+    begin_arm(mut &this) -> void {
+        this.arm_starts.push(this.arm_keys.length());
+    }
+
+    /// The arm being logged moved `key` at `line`; `gov` says whether the
+    /// move's flag write is already in place.
+    record(mut &this, key: u64, line: i32, gov: boolean) -> void {
+        this.arm_keys.push(key);
+        this.arm_lines.push(line);
+        this.arm_gov.push(gov);
+        for (mut i: i64 = 0; i < this.keys.length(); i++) {
+            if (this.keys[i] == key) {
+                this.counts[i] += 1;
+                return;
+            }
+        }
+        this.keys.push(key);
+        this.lines.push(line);
+        this.counts.push(1);
+    }
+
+    /// Close the last arm's slice.
+    finish(mut &this) -> void {
+        this.arm_starts.push(this.arm_keys.length());
+    }
+
+    /// The line of the first move of `key` logged, or 0.
+    line_of(&this, key: u64) -> i32 {
+        for (mut i: i64 = 0; i < this.keys.length(); i++) {
+            if (this.keys[i] == key) { return this.lines[i]; }
+        }
+        return 0;
+    }
+
+    /// Whether arm `arm` moved `key` somewhere its flag is not written.
+    moved_unwritten(&this, arm: i64, key: u64) -> boolean {
+        for (mut j: i64 = this.arm_starts[arm]; j < this.arm_starts[arm + 1]; j++) {
+            if (this.arm_keys[j] == key && !this.arm_gov[j]) { return true; }
+        }
+        return false;
+    }
+}
+
+
 type struct DropInserter {
     ctx:      mut CompilationContext*;
     arena:    TypeArena*;
@@ -376,8 +441,21 @@ type struct DropInserter {
     /// True while the expression of a simple statement (an expression, a
     /// declaration, a `return`) is walked, and false inside any compound
     /// statement nested in it: a move recorded while it is set is one the
-    /// statement writes to its binding's flag when it ends.
+    /// statement writes to its binding's flag when it ends.  A branch of a
+    /// branching expression clears it: a move there happens on that branch's
+    /// path only, and the branch writes the flag itself.
     stmt_writes_flags: boolean;
+    /// The flagged bindings a simple statement moves while
+    /// `stmt_writes_flags` is set - on every path through it - and so sets
+    /// the flags of once it ends (`append_move_flag_writes`).  A stack: the
+    /// statement being walked owns the entries from
+    /// `statement_flag_writes_start` on.
+    statement_flag_writes: [u64];
+    statement_flag_writes_start: i64;
+    /// The statement list the statement being walked is written into.  A
+    /// branching expression inside that statement declares the drop flags it
+    /// needs there, ahead of the statement; null outside any statement.
+    flag_declarations: mut [Stmt*]*;
 
     /// Monotonic counter for naming hidden locals synthesized to hold and
     /// drop discarded owning temporaries (see emit_discarded_temp_drop).
@@ -447,6 +525,9 @@ type struct DropInserter {
             assign_seq:      0,
             stmt_move_snap:  0,
             stmt_writes_flags: false,
+            statement_flag_writes: [],
+            statement_flag_writes_start: 0,
+            flag_declarations: null,
             loop_boundary:   [],
             moved_keys:      [],
             moved_lines:     [],
@@ -633,8 +714,12 @@ type struct DropInserter {
         if (key == 0) { return; }
         // Inside a simple statement, a flagged binding's move is written by
         // the statement itself once it ends.
-        this.mark_moved_gov_key(key, span,
-            this.stmt_writes_flags && this.get_drop_flag(key).is_valid());
+        const written_by_statement: boolean =
+            this.stmt_writes_flags && this.get_drop_flag(key).is_valid();
+        if (written_by_statement && !this.is_moved_id(key)) {
+            this.statement_flag_writes.push(key);
+        }
+        this.mark_moved_gov_key(key, span, written_by_statement);
     }
 
     /// `mark_moved`, with whether the move's flag write is in place given.
@@ -1083,9 +1168,18 @@ type struct DropInserter {
     /// statement in the enclosing block).
     walk_stmt_into(mut &this, stmt: Stmt*, out: mut [Stmt*]*) -> boolean {
         const outer_writes: boolean = this.stmt_writes_flags;
+        const outer_flag_writes_start: i64 = this.statement_flag_writes_start;
+        const outer_declarations: mut [Stmt*]* = this.flag_declarations;
         this.stmt_writes_flags = false;
+        this.statement_flag_writes_start = this.statement_flag_writes.length();
+        this.flag_declarations = out;
         const d: boolean = this.walk_stmt_kind(stmt, out);
+        while (this.statement_flag_writes.length() > this.statement_flag_writes_start) {
+            this.statement_flag_writes.pop();
+        }
         this.stmt_writes_flags = outer_writes;
+        this.statement_flag_writes_start = outer_flag_writes_start;
+        this.flag_declarations = outer_declarations;
         return d;
     }
 
@@ -1272,7 +1366,7 @@ type struct DropInserter {
                     this.type_needs_drop(m.subject.resolved_type)) {
                     this.hoist_match_subject(m, out);
                 }
-                const d: boolean = this.walk_match_arms(stmt, m.subject, m.arms, false, out,
+                const d: boolean = this.walk_match_arms(stmt.span, m.subject, m.arms, false, out,
                                                         &m.unwind_cleanup);
                 out.push(stmt);
                 d
@@ -1586,7 +1680,11 @@ type struct DropInserter {
         return consumed;
     }
 
-    walk_match_arms(mut &this, m: Stmt*,
+    ///
+    /// `out` is where a drop flag the join needs is declared, ahead of the
+    /// match (of the statement holding a match expression); with none, a
+    /// binding moved on some arms only is reported E0456 and left undropped.
+    walk_match_arms(mut &this, span: SourceSpan,
                     subject: ExpressionNode*,
                     arms: &[mut MatchArmNode*], is_expr: boolean,
                     out: mut [Stmt*]*, cleanup_out: mut [Stmt*]*) -> boolean {
@@ -1644,18 +1742,7 @@ type struct DropInserter {
             outer_syms.push(this.binding_syms[i].key());
         }
 
-        mut all_keys:    [u64] = [];
-        mut all_lines:   [i32] = [];
-        mut all_counts:  [i64] = [];
-        // Per-arm move log: flat parallel arrays + start-offset table
-        // so we can find which arms moved which keys without an array-
-        // of-arrays (codegen has known issues with `[[T]]`).
-        // arm_move_starts[a] is the index in arm_move_keys where arm `a`'s
-        // moves begin; arm_move_starts[arm_count] is the total length.
-        mut arm_move_keys:   [u64] = [];
-        mut arm_move_lines:  [i32] = [];
-        mut arm_move_gov:    [boolean] = [];
-        mut arm_move_starts: [i64] = [];
+        mut log: ArmMoveLog = ArmMoveLog::new();
         const arm_count: i64 = arms.length();
         mut live_arms:   i64 = 0;
         mut diverge_count: i64 = 0;
@@ -1664,9 +1751,13 @@ type struct DropInserter {
         // unconditional partial move, so classify_field_move_out ignores it
         // (mirrors MoveCheck).  Bump only around the arm walk; the flag/join
         // bookkeeping after the loop synthesizes nodes and never classifies.
+        // A move in an arm happens on that arm's path only, so the join
+        // writes its flag there, not the statement holding a match expression.
         this.branch_depth += 1;
+        const outer_writes: boolean = this.stmt_writes_flags;
+        this.stmt_writes_flags = false;
         for (mut a: i64 = 0; a < arm_count; a++) {
-            arm_move_starts.push(arm_move_keys.length());
+            log.begin_arm();
             const arm: mut MatchArmNode* = arms[a];
             if (arm == null || arm.body == null) { continue; }
             // Register this arm's enum-payload bindings for consumption
@@ -1737,28 +1828,14 @@ type struct DropInserter {
                     if (outer_syms[o] == arm_keys[i]) { in_outer = true; }
                 }
                 if (!in_outer) { continue; }
-                // Record per-arm so the join can splice flag-sets into
-                // the specific arms that performed the move.
-                arm_move_keys.push(arm_keys[i]);
-                arm_move_lines.push(arm_lines[i]);
-                arm_move_gov.push(arm_gov[i]);
-                mut found: boolean = false;
-                for (mut j: i64 = 0; j < all_keys.length(); j++) {
-                    if (all_keys[j] == arm_keys[i]) {
-                        all_counts[j] += 1;
-                        found = true;
-                    }
-                }
-                if (!found) {
-                    all_keys.push(arm_keys[i]);
-                    all_lines.push(arm_lines[i]);
-                    all_counts.push(1);
-                }
+                // Recorded per arm so the join can write flags into the
+                // arms that performed the move.
+                log.record(arm_keys[i], arm_lines[i], arm_gov[i]);
             }
             this.restore_moves(snap);
         }
-        // Closing offset so arm `arm_count - 1`'s slice has an end bound.
-        arm_move_starts.push(arm_move_keys.length());
+        log.finish();
+        this.stmt_writes_flags = outer_writes;
         this.branch_depth -= 1;
 
         // All arms diverge -> match diverges; post-state irrelevant.
@@ -1767,42 +1844,23 @@ type struct DropInserter {
             return true;
         }
 
-        mut def_keys:  [u64] = [];
-        mut def_lines: [i32] = [];
-        mut def_gov:   [boolean] = [];
-        for (mut i: i64 = 0; i < all_keys.length(); i++) {
-            const cond_move: boolean = all_counts[i] < live_arms;
-            mut gov: boolean = this.all_governed(&arm_move_keys, &arm_move_gov, all_keys[i]);
-            if (cond_move && m != null) {
-                // Flag synthesis: a binding moved on some arms but not
-                // all live arms.  Hoist a single flag before the match,
-                // splice `<flag>=true` into every arm that moved it.
-                this.synth_flag_for_match_arms(m, out,
-                    all_lines[i], arms, arm_count,
-                    arm_move_keys, arm_move_gov, arm_move_starts, all_keys[i]);
-                gov = true;
-            } else if (!cond_move && !gov && m != null
-                       && this.get_drop_flag(all_keys[i]).is_valid()) {
-                // Moved on every arm, conditionally on some: the flag those
-                // arms write has to be written by the others too.
-                this.synth_flag_for_match_arms(m, out,
-                    all_lines[i], arms, arm_count,
-                    arm_move_keys, arm_move_gov, arm_move_starts, all_keys[i]);
-                gov = true;
-            } else if (cond_move) {
-                // Expression-position match (out == null): no place to
-                // hoist a flag-decl, so fall back to the historical
-                // warning.  Practically unreachable today because
-                // expression-match in stdlib uses Option/Result with
-                // payload consumption (handled via link_payload), not
-                // outer-scope conditional moves.
-                this.emit_conditional_move_by_id(all_keys[i], all_lines[i]);
+        const writes: [u64] = this.join_arm_moves(&log, snap, live_arms, out, span);
+        for (mut w: i64 = 0; w < writes.length(); w++) {
+            const flag: PassLocal = this.get_drop_flag(writes[w]);
+            const set_span: SourceSpan = this.line_only_span(log.line_of(writes[w]), span);
+            for (mut a: i64 = 0; a < arm_count; a++) {
+                if (!log.moved_unwritten(a, writes[w])) { continue; }
+                const arm: mut MatchArmNode* = arms[a];
+                if (arm == null || arm.body == null) { continue; }
+                // A match expression's arm ends in the value it yields, so its
+                // write goes first.
+                arm.body = if (is_expr) {
+                    this.splice_flag_set_at_front(arm.body, flag, set_span)
+                } else {
+                    this.splice_flag_set_into_branch(arm.body, flag, set_span)
+                };
             }
-            def_keys.push(all_keys[i]);
-            def_lines.push(all_lines[i]);
-            def_gov.push(gov);
         }
-        this.set_moves_tail(snap, def_keys, def_lines, def_gov);
         // A payload binding was consumed by some arm -> the owning subject is
         // moved-from after the match.  Mark it so drop-insertion suppresses
         // its scope-exit glue (preventing a double-free of the payload the
@@ -1817,12 +1875,10 @@ type struct DropInserter {
             // moved/assigned earlier - typically reassigned inside a loop),
             // marking it moved in the static set is not enough: its scope-exit
             // drop is emitted CONDITIONALLY on the flag, so the consuming arms
-            // must set the flag to the moved state. The cond-move flag synthesis
-            // above only fires for NEW conditional moves (and never for match
-            // EXPRESSIONS, where `m` is null), so a definite consume of an
-            // already-flagged subject would otherwise leave the flag stale and
-            // double-free. Set it on each consuming arm. (No-op when the subject
-            // has no flag - the common, unconditional case is unaffected.)
+            // must set the flag to the moved state on every consuming arm, or
+            // the flag stays stale and the subject is released twice. Set it on
+            // each consuming arm. (No-op when the subject has no flag - the
+            // common, unconditional case is unaffected.)
             const subj_flag: PassLocal = this.get_drop_flag(subj_sym.key());
             if (subj_flag.is_valid()) {
                 for (mut c: i64 = 0; c < consumed_arm_idx.length(); c++) {
@@ -2034,49 +2090,95 @@ type struct DropInserter {
         }
     }
 
-    /// Helper: synthesize a drop flag for a binding conditionally
-    /// moved by some - but not all - live arms of a match statement.
-    /// Hoists a single `mut <flag>: boolean = false;` before the match,
-    /// then splices `<flag>=true;` into every arm whose move log
-    /// includes `key`.  Arms that didn't move it (borrow-only arms,
-    /// diverging arms, irrelevant variants) leave the flag at `false`
-    /// so the scope-exit conditional drop fires correctly.
-    synth_flag_for_match_arms(mut &this, m: Stmt*,
-                                out: mut [Stmt*]*,
-                                move_line: i32,
-                                arms: &[mut MatchArmNode*], arm_count: i64,
-                                arm_move_keys: &[u64],
-                                arm_move_gov: &[boolean],
-                                arm_move_starts: &[i64],
-                                key: u64) -> void {
-        mut flag: PassLocal = this.get_drop_flag(key);
-        if (!flag.is_valid()) {
-            flag = this.fresh_drop_flag(key);
-            const decl_span: SourceSpan = this.binding_span_for(key, m.span);
-            out.push(this.make_drop_flag_decl(flag, decl_span));
-            this.register_drop_flag(key, flag);
-        }
-        const set_span: SourceSpan = this.line_only_span(move_line, m.span);
-        // Walk per-arm slice [starts[a], starts[a+1]) and splice the
-        // flag-set when this arm moved `key`.
-        for (mut a: i64 = 0; a < arm_count; a++) {
-            const beg: i64 = arm_move_starts[a];
-            const end: i64 = arm_move_starts[a + 1];
-            // An arm whose every move of `key` is already flag-written (made
-            // on some of the arm's own paths, or by a simple statement)
-            // keeps its writes.
-            mut moved_here: boolean = false;
-            mut unwritten: boolean = false;
-            for (mut j: i64 = beg; j < end; j++) {
-                if (arm_move_keys[j] == key) {
-                    moved_here = true;
-                    if (!arm_move_gov[j]) { unwritten = true; }
+    /// Join the moves the `live_arms` arms of a match or of an `if`/`?:`
+    /// expression made, as `log` holds them, into the moved-set after `snap`.
+    ///
+    /// A binding moved on some live arms only, or moved on all of them while
+    /// already carrying a drop flag some arm does not write, needs its flag
+    /// written by every arm that moved it and did not write it: its flag is
+    /// declared in `out` (ahead of the construct) if it has none, and it is
+    /// returned for the caller to write in those arms (`moved_unwritten`).
+    /// With no `out`, a binding moved on some arms only is reported E0456 and
+    /// left undropped.  Every logged binding stays moved after the join.
+    join_arm_moves(mut &this, log: &ArmMoveLog, snap: i64, live_arms: i64,
+                   out: mut [Stmt*]*, span: SourceSpan) -> [u64] {
+        mut writes:    [u64] = [];
+        mut def_keys:  [u64] = [];
+        mut def_lines: [i32] = [];
+        mut def_gov:   [boolean] = [];
+        for (mut i: i64 = 0; i < log.keys.length(); i++) {
+            const key: u64 = log.keys[i];
+            const cond_move: boolean = log.counts[i] < live_arms;
+            mut gov: boolean = this.all_governed(&log.arm_keys, &log.arm_gov, key);
+            const needs_writes: boolean = cond_move ||
+                (!gov && this.get_drop_flag(key).is_valid());
+            if (needs_writes && out != null) {
+                if (!this.get_drop_flag(key).is_valid()) {
+                    const flag: PassLocal = this.fresh_drop_flag(key);
+                    out.push(this.make_drop_flag_decl(flag, this.binding_span_for(key, span)));
+                    this.register_drop_flag(key, flag);
                 }
+                writes.push(key);
+                gov = true;
+            } else if (cond_move) {
+                this.emit_conditional_move_by_id(key, log.lines[i]);
             }
-            if (!moved_here || !unwritten) { continue; }
-            const arm: mut MatchArmNode* = arms[a];
-            if (arm == null || arm.body == null) { continue; }
-            arm.body = this.splice_flag_set_into_branch(arm.body, flag, set_span);
+            def_keys.push(key);
+            def_lines.push(log.lines[i]);
+            def_gov.push(gov);
+        }
+        this.set_moves_tail(snap, def_keys, def_lines, def_gov);
+        if (writes.length() > 0 && Log::enabled(LogArea::Drop, LogLevel::Debug)) {
+            Log::debug(LogArea::Drop, f"a branch join writes {writes.length()} drop flag(s) in its arms in module {this.ctx.namespace_display()}");
+        }
+        return writes;
+    }
+
+    /// An `if` or `?:` expression: the condition runs on every path and each
+    /// arm on its own, so the arms join as a match's arms do.  When the
+    /// expression's value is `moved` out, the arm that ran yields what is
+    /// moved, so each arm is walked as that move.  The flag writes the join
+    /// asks of an arm go into its `then_writes` / `else_writes`, which codegen
+    /// runs once the arm's value is computed.  A missing `else` is the
+    /// implicit arm that moves nothing.
+    walk_conditional(mut &this, span: SourceSpan, condition: ExpressionNode*,
+                     then_arm: ExpressionNode*, else_arm: ExpressionNode*,
+                     then_writes: mut [Stmt*]*, else_writes: mut [Stmt*]*,
+                     moved: boolean) -> void {
+        if (condition != null) { this.walk_expr_read(condition); }
+        this.branch_depth += 1;
+        const outer_writes: boolean = this.stmt_writes_flags;
+        this.stmt_writes_flags = false;
+        const snap: i64 = this.snapshot_moves();
+        mut log: ArmMoveLog = ArmMoveLog::new();
+        for (mut a: i64 = 0; a < 2; a++) {
+            log.begin_arm();
+            const arm: ExpressionNode* = if (a == 0) { then_arm } else { else_arm };
+            if (arm != null && moved) { this.walk_expr_move(arm); }
+            if (arm != null && !moved) { this.walk_expr_read(arm); }
+            for (mut i: i64 = snap; i < this.moved_keys.length(); i++) {
+                const key: u64 = this.moved_keys[i];
+                if (key == 0 || !this.binding_in_outer_scope(key)) { continue; }
+                log.record(key, this.moved_lines[i], this.moved_gov[i]);
+            }
+            this.restore_moves(snap);
+        }
+        log.finish();
+        this.stmt_writes_flags = outer_writes;
+        this.branch_depth -= 1;
+        if (log.keys.length() > 0 && Log::enabled(LogArea::Drop, LogLevel::Debug)) {
+            Log::debug(LogArea::Drop, f"an arm of a branching expression moves {log.keys.length()} binding(s) in module {this.ctx.namespace_display()}");
+        }
+        const writes: [u64] = this.join_arm_moves(&log, snap, 2, this.flag_declarations, span);
+        for (mut w: i64 = 0; w < writes.length(); w++) {
+            const flag: PassLocal = this.get_drop_flag(writes[w]);
+            const set_span: SourceSpan = this.line_only_span(log.line_of(writes[w]), span);
+            if (log.moved_unwritten(0, writes[w])) {
+                then_writes.push(this.make_drop_flag_set(flag, set_span));
+            }
+            if (log.moved_unwritten(1, writes[w])) {
+                else_writes.push(this.make_drop_flag_set(flag, set_span));
+            }
         }
     }
 
@@ -2693,18 +2795,17 @@ type struct DropInserter {
     /// released the new value; a later `consume(x);` left it saying "not
     /// moved" on the path that had not moved it, and the value was released
     /// twice.
+    ///
+    /// Only a move the statement makes on every path through it is written
+    /// here (`statement_flag_writes`); a branch of a branching expression in
+    /// it writes the flags of its own moves where it makes them.
     append_move_flag_writes(mut &this, snapshot: i64, expr: ExpressionNode*,
                             out: mut [Stmt*]*, span: SourceSpan) -> void {
-        mut written: [u64] = [];
-        for (mut i: i64 = snapshot; i < this.moved_keys.length(); i++) {
-            const k: u64 = this.moved_keys[i];
-            if (k == 0 || !this.moved_gov[i]) { continue; }
-            mut seen: boolean = false;
-            for (mut w: i64 = 0; w < written.length(); w++) {
-                if (written[w] == k) { seen = true; }
-            }
-            if (seen) { continue; }
-            written.push(k);
+        for (mut i: i64 = this.statement_flag_writes_start; i < this.statement_flag_writes.length(); i++) {
+            const k: u64 = this.statement_flag_writes[i];
+            // A binding the statement moved and then assigned holds a value
+            // again; the assignment's own write below says so.
+            if (!this.moved_since(snapshot, k)) { continue; }
             const flag: PassLocal = this.get_drop_flag(k);
             if (flag.is_valid()) { out.push(this.make_drop_flag_write(flag, true, span)); }
         }
@@ -3931,6 +4032,22 @@ type struct DropInserter {
             this.handle_ident(expr, id, true);
             return;
         }
+        // A branching expression's value is the value of the arm that ran,
+        // so moving it out moves what that arm yields.  A match expression's
+        // arms always yield as moves.
+        match (expr.kind) {
+            ExprKind::If(ie) => {
+                this.walk_conditional(expr.span, ie.condition, ie.then_expr, ie.else_expr,
+                    &ie.then_flag_writes, &ie.else_flag_writes, true);
+                return;
+            }
+            ExprKind::Ternary(t) => {
+                this.walk_conditional(expr.span, t.condition, t.true_expr, t.false_expr,
+                    &t.then_flag_writes, &t.else_flag_writes, true);
+                return;
+            }
+            _ => {}
+        }
         this.walk_expr_read(expr);
     }
 
@@ -3954,18 +4071,10 @@ type struct DropInserter {
             // of every live local, and yielded values are
             // move-tracked.
             ExprKind::Match(me) => {
-                // No hoist buffer at expression position - the
-                // enclosing statement-list isn't reachable from
-                // here.  A throwaway out buffer plus a null match
-                // node tells walk_match_arms to skip flag synthesis
-                // and fall back to E0456 for conditional moves (rare
-                // in practice for match expressions: stdlib uses
-                // Option/Result here, whose payload consumption is
-                // tracked via link_payload, not outer-scope move
-                // detection).
-                mut throwaway_out: [Stmt*] = [];
-                this.walk_match_arms(null, me.subject, me.arms, true,
-                    &throwaway_out, &me.unwind_cleanup);
+                // A drop flag the arms' join needs is declared ahead of the
+                // statement holding the match.
+                this.walk_match_arms(expr.span, me.subject, me.arms, true,
+                    this.flag_declarations, &me.unwind_cleanup);
             }
             // Single live arm post-monomorphization: instrument its
             // block.  This is an *expression* arm - its trailing
@@ -4004,8 +4113,14 @@ type struct DropInserter {
             ExprKind::Binary(b) => { this.read_binary(expr, b); }
             ExprKind::ArrayAccess(aa) => { this.read_array_access(aa); }
             ExprKind::Lambda(lam) => { this.read_lambda(lam); }
-            ExprKind::Ternary(t) => { this.read_ternary(t); }
-            ExprKind::If(ie) => { this.read_if_expr(ie); }
+            ExprKind::Ternary(t) => {
+                this.walk_conditional(expr.span, t.condition, t.true_expr, t.false_expr,
+                    &t.then_flag_writes, &t.else_flag_writes, false);
+            }
+            ExprKind::If(ie) => {
+                this.walk_conditional(expr.span, ie.condition, ie.then_expr, ie.else_expr,
+                    &ie.then_flag_writes, &ie.else_flag_writes, false);
+            }
             // Not walked by this pass.
             ExprKind::Sizeof(_) | ExprKind::Alignof(_) | ExprKind::Typeof(_)
             | ExprKind::Delete(_) | ExprKind::Yield(_) | ExprKind::Literal(_)
@@ -4252,25 +4367,10 @@ type struct DropInserter {
         }
     }
 
-    read_ternary(mut &this, t: TernaryExpr*) -> void {
-        if (t == null) { return; }
-        if (t.condition != null)  { this.walk_expr_read(t.condition); }
-        if (t.true_expr != null)  { this.walk_conditional_operand(t.true_expr, true); }
-        if (t.false_expr != null) { this.walk_conditional_operand(t.false_expr, true); }
-    }
-
-    read_if_expr(mut &this, ie: IfExpr*) -> void {
-        if (ie == null) { return; }
-        if (ie.condition != null) { this.walk_expr_read(ie.condition); }
-        if (ie.then_expr != null) { this.walk_conditional_operand(ie.then_expr, true); }
-        if (ie.else_expr != null) { this.walk_conditional_operand(ie.else_expr, true); }
-    }
-
-    /// An operand that runs on some paths through its expression only - the
-    /// right of `&&` or `||` (`conditional`), an arm of `?:` or of an `if`
-    /// expression - is walked as a branch body is: a field moved out of it
-    /// is not recorded as an unconditional partial move.  Mirrors
-    /// move_check, which refuses that move (E0453).
+    /// The right operand of `&&` or `||` (`conditional`) runs on some paths
+    /// only, so it is walked as a branch body is: a field moved out of it is
+    /// not recorded as an unconditional partial move.  Mirrors move_check,
+    /// which refuses that move (E0453).
     walk_conditional_operand(mut &this, operand: ExpressionNode*, conditional: boolean) -> void {
         if (conditional) { this.branch_depth += 1; }
         this.walk_expr_read(operand);
