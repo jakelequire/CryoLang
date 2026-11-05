@@ -1,0 +1,67 @@
+///! The namespace-index cache answers for a file only while the file holds
+///! the content it was read from.  A cache is written for one file, then read
+///! back for that file at its recorded content (answered), at other content
+///! (refused, so discovery lexes the file again), and at another path
+///! (refused).  A cache in another format reads as empty.
+
+namespace main;
+
+import std::fmt;
+import std::fs::{ File, Path };
+import std::fs::temporary::{ TempDirectory };
+import std::collections::string::{ String };
+import compiler::namespace_index_cache::{ IndexedFile, NamespaceIndexCache };
+
+mut g_failed: i32 = 0;
+
+function check(what: string, got: boolean, want: boolean) -> void {
+    if (got != want) {
+        fmt::printf("FAIL %s: got %d, want %d\n", what, got as i32, want as i32);
+        g_failed = g_failed + 1;
+    }
+}
+
+function main() -> int {
+    const scratch: TempDirectory = match (TempDirectory::create()) {
+        Result::Ok(t)  => { t }
+        Result::Err(_) => { fmt::printf("cannot create a temporary directory\n"); return 2; }
+    };
+    const directory: string = String::from_str(scratch.path().as_str()).into_raw();
+    const root: string = "src";
+    const before: string = NamespaceIndexCache::content_digest("namespace Shapes::Circle;\n");
+    const after: string = NamespaceIndexCache::content_digest("namespace Shapes::Square;\n");
+
+    mut writer: NamespaceIndexCache = NamespaceIndexCache::open(directory, root);
+    mut declared: IndexedFile = IndexedFile::none();
+    declared.content = String::from_string(before);
+    declared.namespace_name = String::from_string("Shapes::Circle");
+    writer.keep("shapes/circle.cryo", &declared, true);
+    writer.save();
+
+    const reader: NamespaceIndexCache = NamespaceIndexCache::open(directory, root);
+    mut out: IndexedFile = IndexedFile::none();
+    check("answered at the content it was read from",
+        reader.read_into("shapes/circle.cryo", before, &out), true);
+    check("answers the namespace it read", out.namespace_name.as_str() == String::from_string("Shapes::Circle").as_str(), true);
+    check("refused at other content",
+        reader.read_into("shapes/circle.cryo", after, &out), false);
+    check("refused at another path",
+        reader.read_into("shapes/square.cryo", before, &out), false);
+
+    const other_root: NamespaceIndexCache = NamespaceIndexCache::open(directory, "lib");
+    check("another root's cache is not this one's",
+        other_root.read_into("shapes/circle.cryo", before, &out), false);
+
+    // Rewrite the one cache file under another format line.
+    const written: string = NamespaceIndexCache::open(directory, root).path;
+    match (File::write_text(Path::from(written), "cryo-namespace-index 0\nx\tshapes/circle.cryo\tShapes::Circle\n")) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { fmt::printf("cannot rewrite the cache\n"); return 2; }
+    }
+    const other_format: NamespaceIndexCache = NamespaceIndexCache::open(directory, root);
+    check("a cache in another format reads as empty",
+        other_format.read_into("shapes/circle.cryo", "x", &out), false);
+
+    fmt::printf("namespace index cache checks: %d failed\n", g_failed);
+    return if (g_failed == 0) { 0 } else { 1 };
+}

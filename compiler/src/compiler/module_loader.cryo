@@ -38,6 +38,7 @@ import compiler::compilation_context::{ BuildOptions, SourceOverride };
 import std::collections::hashmap::{ HashMap };
 import std::collections::pair::{ Pair };
 import std::core::mem;
+import compiler::namespace_index_cache::{ IndexedFile, NamespaceIndexCache };
 
 /// The entries of one directory, in the order the directory listed them,
 /// each with the kind the listing reported for it.  `listed` is false for a
@@ -206,6 +207,15 @@ private:
     // Every directory discovery has listed, each listed once.
     listings: DirectoryListings;
 
+    // The index cache of the root `scan_all_project_files` is indexing,
+    // when `index_cache_open`.
+    index_cache: NamespaceIndexCache;
+    index_cache_open: boolean;
+
+    // Where the roots' index caches live (`set_namespace_index_directory`);
+    // empty when this discovery keeps none.
+    index_cache_directory: string;
+
 public:
     /// The language server's open buffers.  A file one of them names is
     /// read from the buffer instead of the disk, so import discovery sees
@@ -257,6 +267,9 @@ public:
             vendor_modules: HashMap::<string, string>::new(),
             module_lines:   [],
             listings:       DirectoryListings::new(),
+            index_cache:    NamespaceIndexCache::closed(),
+            index_cache_open: false,
+            index_cache_directory: "",
             lsp_overrides:    [],
             options:          null,
             vendor_registry:  VendorRegistry::empty(),
@@ -303,6 +316,13 @@ public:
     /// `discover_project`.
     set_lsp_overrides(mut &this, overlays: [SourceOverride]) -> void {
         this.lsp_overrides = overlays;
+    }
+
+    /// Keep each root's namespace-index cache in `directory`
+    /// (`NamespaceIndexCache`).  Called once, before `discover_project`;
+    /// without it discovery lexes every file it indexes.
+    set_namespace_index_directory(mut &this, directory: string) -> void {
+        this.index_cache_directory = directory;
     }
 
     /// The compilation's options, whose hook discovery calls before each
@@ -425,9 +445,30 @@ public:
         return overall_ok;
     }
 
-    /// Recursively walk a directory, lex every .cryo file to extract its
-    /// namespace declaration, and register namespace -> file_path in ns_map.
+    /// Index the root `dir`: walk it, read each .cryo file's namespace
+    /// declaration and `module` lines, and register namespace -> file_path
+    /// in ns_map.  What a file declares is taken from the root's index cache
+    /// when the cache holds the file's present content, and read by lexing
+    /// it otherwise; the cache is rewritten when it held anything else.  An
+    /// open editor buffer is the content the walk must read, so no cache is
+    /// used while any is open, nor when this discovery keeps none.
     scan_all_project_files(mut &this, intern: mut InternTable*, dir: string) -> void {
+        const use_cache: boolean = this.lsp_overrides.length() == 0
+            && this.index_cache_directory.length() > 0;
+        if (use_cache) {
+            this.index_cache = NamespaceIndexCache::open(this.index_cache_directory, dir);
+        }
+        this.index_cache_open = use_cache;
+        this.scan_directory(intern, dir, "");
+        if (use_cache) {
+            this.index_cache.save();
+        }
+        this.index_cache_open = false;
+    }
+
+    /// Walk `dir`, `relative` below the root being indexed, registering
+    /// every .cryo file under it.
+    scan_directory(mut &this, intern: mut InternTable*, dir: string, relative: string) -> void {
         const listing: i64 = this.listings.index_of(Str::new(dir));
         // Indexed afresh each time round: scanning a subdirectory lists it,
         // which can move the listings this one is stored among.
@@ -435,6 +476,8 @@ public:
             const name_s: String = String::from_str(this.listings.listings[listing].entries[e].as_str());
             const name: Str = name_s.as_str();
             const full_path: string = Path::from(dir).join(name).into_raw();
+            const name_text: string = String::from_str(name).into_raw();
+            const child: string = if (relative.length() == 0) { name_text } else { relative + "/" + name_text };
 
             if (this.listings.listings[listing].is_directory(e, Path::from(full_path))) {
                 // `tests/projects/` are independent sub-packages (see
@@ -444,17 +487,19 @@ public:
                 // build's outputs (`stdlib/.bin`), a tool's state - as the
                 // stdlib archive's key treats it.
                 if (name != Str::new("projects") && !name.starts_with(Str::new("."))) {
-                    this.scan_all_project_files(intern, full_path);
+                    this.scan_directory(intern, full_path, child);
                 }
             } else if (name.ends_with(Str::new(".cryo")) && name.length() > 5) {
-                this.scan_file_namespace(intern, full_path);
+                this.scan_file_namespace(intern, full_path, child);
             }
         }
     }
 
-    /// Lex a single .cryo file, extract the namespace declaration,
-    /// and register it in ns_map.
-    scan_file_namespace(mut &this, intern: mut InternTable*, file_path: string) -> void {
+    /// Read what the .cryo file `file_path` (`relative` below the root being
+    /// indexed) declares - its namespace and its `module` lines - and
+    /// register them: from the index cache when it holds the file's present
+    /// content, else by lexing the file.
+    scan_file_namespace(mut &this, intern: mut InternTable*, file_path: string, relative: string) -> void {
         if (this.options != null) { this.options.yield_between_modules(); }
         // An open buffer needs no file on disk: `source_for` hands the lexer
         // the buffer (the file may be new and unsaved).
@@ -462,23 +507,35 @@ public:
             SourceOverride::content_for(&this.lsp_overrides, file_path).is_some();
         if (!is_override && !Path::from(file_path).exists()) { return; }
 
-        mut scan_sink: DiagnosticSink = DiagnosticSink::new();
         const source: string = this.source_for(file_path);
-        mut lexer: Lexer = Lexer::new(file_path, source, &scan_sink);
-        const tokens: [Token] = lexer.lex();
-
-        // Extract just the namespace; scan_tokens gives us everything
-        // but we only need the namespace name.
-        const scan: ModuleScanResult = ModuleLoader::scan_tokens(intern, tokens);
-        if (scan.namespace_name.is_valid()) {
-            this.ns_map.insert(intern.resolve(scan.namespace_name), file_path);
+        const content: string = NamespaceIndexCache::content_digest(source);
+        mut declared: IndexedFile = IndexedFile::none();
+        const cached: boolean = this.index_cache_open
+            && this.index_cache.read_into(relative, content, &declared);
+        if (!cached) {
+            mut scan_sink: DiagnosticSink = DiagnosticSink::new();
+            mut lexer: Lexer = Lexer::new(file_path, source, &scan_sink);
+            const tokens: [Token] = lexer.lex();
+            const scan: ModuleScanResult = ModuleLoader::scan_tokens(intern, tokens);
+            declared.content = String::from_string(content);
+            if (scan.namespace_name.is_valid()) {
+                declared.namespace_name = String::from_string(intern.resolve(scan.namespace_name));
+            }
+            for (mut s: i64 = 0; s < scan.submodule_count; s++) {
+                declared.module_paths.push(String::from_string(intern.resolve(scan.submodule_paths[s])));
+                declared.module_internal.push(scan.submodule_internal[s]);
+            }
         }
-        for (mut s: i64 = 0; s < scan.submodule_count; s++) {
+        if (this.index_cache_open) { this.index_cache.keep(relative, &declared, !cached); }
+        if (declared.namespace_name.length() > 0) {
+            this.ns_map.insert(String::from_str(declared.namespace_name.as_str()).into_raw(), file_path);
+        }
+        for (mut s: i64 = 0; s < declared.module_paths.length(); s++) {
             this.module_lines.push(ModuleLine {
-                written:     scan.submodule_paths[s],
+                written:     intern.intern(String::from_str(declared.module_paths[s].as_str()).into_raw()),
                 from_dir:    file_path.parent_dir(),
                 declarer:    ModuleGraph::module_key(file_path),
-                is_internal: scan.submodule_internal[s],
+                is_internal: declared.module_internal[s],
                 target:      "",
                 resolved:    false,
             });

@@ -1,0 +1,259 @@
+///! Namespace-index cache
+///!
+///! Discovery indexes a root by reading what every .cryo file below it
+///! declares: its namespace and its `module` lines.  Reading a file means
+///! lexing it, for every root, in every run.  This cache keeps what each file
+///! declared, keyed by the file's path below the root and the digest of its
+///! content, so a run lexes only the files whose content it has not seen.
+///! It knows nothing of discovery itself, so it links without the loader.
+
+namespace compiler::namespace_index_cache;
+
+import compiler::build_manifest::{ ContentHasher, Manifest };
+import std::fmt;
+import std::process;
+import std::fs::{ Directory, DirectoryEntries, File, Path, PathBuf };
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::collections::hashmap::{ HashMap };
+import std::core::option::{ Option };
+
+/// What one .cryo file declares that discovery's namespace index records:
+/// the namespace it declares (empty when it declares none) and its `module`
+/// lines as written, with whether each is `internal`.  `content` is the
+/// digest of the text this was read from.
+type struct IndexedFile {
+    content:         String;
+    namespace_name:  String;
+    module_paths:    [String];
+    module_internal: [boolean];
+
+    static none() -> IndexedFile {
+        return IndexedFile {
+            content: String::new(), namespace_name: String::new(),
+            module_paths: [], module_internal: [],
+        };
+    }
+
+    copy(&this) -> IndexedFile {
+        mut file: IndexedFile = IndexedFile::none();
+        file.content = String::from_str(this.content.as_str());
+        file.namespace_name = String::from_str(this.namespace_name.as_str());
+        for (mut s: i64 = 0; s < this.module_paths.length(); s++) {
+            file.module_paths.push(String::from_str(this.module_paths[s].as_str()));
+            file.module_internal.push(this.module_internal[s]);
+        }
+        return file;
+    }
+}
+
+/// The namespace index of one root as the running compiler last read it:
+/// what each .cryo file below the root declared, keyed by its path below
+/// the root and the digest of its content.  It lives in
+/// `<directory>/<digest of the root's path>/<compiler fingerprint>`, the
+/// directory being the run's (`ProjectConfig::namespace_index_dir`), so a
+/// file is trusted only by the compiler that read it, and only while its
+/// content is what was read: anything else is lexed again.  The walk keeps
+/// every file it registers, and the cache is rewritten when it held
+/// anything other than exactly those files with exactly that content.
+type struct NamespaceIndexCache {
+    /// The cache file; empty when there is none to read or write.
+    path:      string;
+    at:        HashMap<String, i64>;
+    files:     [IndexedFile];
+    kept_at:   [String];
+    kept:      [IndexedFile];
+    /// The walk read a file the cache did not hold as it is.
+    read_new:  boolean;
+
+    static closed() -> NamespaceIndexCache {
+        return NamespaceIndexCache {
+            path: "", at: HashMap::<String, i64>::new(), files: [],
+            kept_at: [], kept: [], read_new: false,
+        };
+    }
+
+    /// The cache of `root` in `directory` for the running compiler, as it
+    /// was last written; empty when there is none or it cannot be read.
+    static open(directory: string, root: string) -> NamespaceIndexCache {
+        mut cache: NamespaceIndexCache = NamespaceIndexCache::closed();
+        mut root_digest: ContentHasher = ContentHasher::new();
+        root_digest.fold(root);
+        cache.path = Path::from(directory)
+            .join(Str::new(Manifest::hex128(root_digest.finish128())))
+            .join(Str::new(Manifest::hex128(Manifest::compiler_fingerprint()))).into_raw();
+        const text: String = match (File::read_text(Path::from(cache.path))) {
+            Result::Ok(t)  => { t }
+            Result::Err(_) => { return cache; }
+        };
+        const newline: Str = Str::new("\n");
+        const tab: Str = Str::new("\t");
+        mut first: boolean = true;
+        for (line in text.as_str().split(&newline)) {
+            if (first) {
+                // A cache written in another format is read as empty.
+                if (line != Str::new(NAMESPACE_INDEX_FORMAT)) { return cache; }
+                first = false;
+                continue;
+            }
+            if (line.is_empty()) { continue; }
+            if (line.starts_with(&tab)) {
+                // `\t<0|1>\t<module path>`: a module line of the file above.
+                if (cache.files.length() == 0) { continue; }
+                const rest: Str = match (line.split_once(&tab)) {
+                    Option::Some(p) => { p.second }
+                    Option::None    => { continue; }
+                };
+                match (rest.split_once(&tab)) {
+                    Option::Some(p) => {
+                        const last: i64 = cache.files.length() - 1;
+                        cache.files[last].module_internal.push(p.first == Str::new("1"));
+                        cache.files[last].module_paths.push(String::from_str(p.second));
+                    }
+                    Option::None => { }
+                }
+                continue;
+            }
+            // `<content>\t<path below the root>\t<namespace>`
+            match (line.split_once(&tab)) {
+                Option::Some(head) => {
+                    match (head.second.split_once(&tab)) {
+                        Option::Some(tail) => {
+                            mut file: IndexedFile = IndexedFile::none();
+                            file.content = String::from_str(head.first);
+                            file.namespace_name = String::from_str(tail.second);
+                            cache.at.insert(String::from_str(tail.first), cache.files.length());
+                            cache.files.push(file);
+                        }
+                        Option::None => { }
+                    }
+                }
+                Option::None => { }
+            }
+        }
+        return cache;
+    }
+
+    /// The digest a cached file's content is compared by.
+    static content_digest(source: string) -> string {
+        mut h: ContentHasher = ContentHasher::new();
+        h.fold(source);
+        return Manifest::hex128(h.finish128());
+    }
+
+    /// Fill `out` with what the cache holds for the file at `relative` when
+    /// it was read from content with digest `content`, and say whether it
+    /// does.
+    read_into(&this, relative: string, content: string, out: mut IndexedFile*) -> boolean {
+        if (this.path.length() == 0) { return false; }
+        const key: String = String::from_string(relative);
+        const index: i64 = match (this.at.get(&key)) {
+            Option::Some(i) => { i }
+            Option::None    => { return false; }
+        };
+        if (this.files[index].content.as_str() != Str::new(content)) { return false; }
+        *out = this.files[index].copy();
+        return true;
+    }
+
+    /// Record that this walk registered `file` at `relative`, `read` when it
+    /// was lexed rather than taken from the cache.  A path that would not
+    /// survive the cache's line format is left out, and lexed every time.
+    keep(mut &this, relative: string, file: &IndexedFile, read: boolean) -> void {
+        if (relative.contains("\t") || relative.contains("\n")) { return; }
+        if (read) { this.read_new = true; }
+        this.kept_at.push(String::from_string(relative));
+        this.kept.push(file.copy());
+    }
+
+    /// Rewrite the cache file when it held anything but what this walk kept,
+    /// then remove all but the most recently written caches of the root.  A
+    /// cache that cannot be written is left as it was: it is only ever
+    /// trusted for files whose content it matches.
+    save(mut &this) -> void {
+        if (this.path.length() == 0) { return; }
+        if (!this.read_new && this.kept.length() == this.files.length()) { return; }
+        mut text: String = String::new();
+        text.push(NAMESPACE_INDEX_FORMAT);
+        text.push("\n");
+        for (mut i: i64 = 0; i < this.kept.length(); i++) {
+            const file: IndexedFile* = &this.kept[i];
+            text.push(file.content.as_str());
+            text.push("\t");
+            text.push(this.kept_at[i].as_str());
+            text.push("\t");
+            text.push(file.namespace_name.as_str());
+            text.push("\n");
+            for (mut s: i64 = 0; s < file.module_paths.length(); s++) {
+                text.push(if (file.module_internal[s]) { "\t1\t" } else { "\t0\t" });
+                text.push(file.module_paths[s].as_str());
+                text.push("\n");
+            }
+        }
+        const directory: PathBuf = PathBuf::from(this.path.parent_dir());
+        match (Directory::create_all(directory.as_path())) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { return; }
+        }
+        // Written aside and renamed into place, so a concurrent reader sees
+        // the old cache or the new one, never part of one.
+        const partial: string = fmt::format("%s.partial-%d", this.path, process::id());
+        match (File::write_text(Path::from(partial), text.as_str())) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { return; }
+        }
+        match (Path::from(partial).rename_to(Path::from(this.path))) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => {
+                match (File::remove(Path::from(partial))) { _ => { } }
+                return;
+            }
+        }
+        NamespaceIndexCache::prune(directory.as_path(), NAMESPACE_INDEX_CACHES_KEPT);
+    }
+
+    /// Remove the caches in `directory` beyond the `keep` most recently
+    /// written: each compiler that indexes a root leaves one.
+    static prune(directory: Path, keep: i64) -> void {
+        mut names: [String] = [];
+        mut times: [i64] = [];
+        match (Directory::entries(directory)) {
+            Result::Ok(read) => {
+                mut entries: DirectoryEntries = read;
+                loop {
+                    match (entries.next()) {
+                        Option::Some(entry) => {
+                            match (entry.metadata()) {
+                                Result::Ok(m) => {
+                                    names.push(String::from_str(entry.name()));
+                                    times.push(m.modified_secs());
+                                }
+                                Result::Err(_) => { }
+                            }
+                        }
+                        Option::None => { break; }
+                    }
+                }
+            }
+            Result::Err(_) => { return; }
+        }
+        mut remaining: i64 = names.length();
+        while (remaining > keep) {
+            mut oldest: i64 = -1;
+            for (mut i: i64 = 0; i < names.length(); i++) {
+                if (times[i] < 0) { continue; }
+                if (oldest < 0 || times[i] < times[oldest]) { oldest = i; }
+            }
+            if (oldest < 0) { return; }
+            match (File::remove(directory.join(names[oldest].as_str()).as_path())) { _ => { } }
+            times[oldest] = -1;
+            remaining -= 1;
+        }
+    }
+}
+
+/// The first line of a namespace index cache; a cache that does not begin
+/// with it was written in another format and is read as empty.
+const NAMESPACE_INDEX_FORMAT: string = "cryo-namespace-index 1";
+/// How many compilers' caches of one root are kept.
+const NAMESPACE_INDEX_CACHES_KEPT: i64 = 6;

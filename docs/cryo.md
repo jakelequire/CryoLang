@@ -3030,7 +3030,7 @@ namespace std::collections::array;
 
 The namespace serves as the file's identity within the project. The compiler uses it to resolve imports and to mangle symbol names so that two unrelated functions named `parse` from different modules do not collide at link time.
 
-An import finds a module's file among the `.cryo` files below the project's source root and the standard library's, by the namespace each declares. A directory whose name begins with `.` holds no sources - a build's outputs, such as `stdlib/.bin`, or a tool's state - so a file inside one declares no module an import can name (`E0500`).
+An import finds a module's file among the `.cryo` files below the project's source root and the standard library's, by the namespace each declares. A directory whose name begins with `.` holds no sources - a build's outputs, such as `stdlib/.bin`, or a tool's state - so a file inside one declares no module an import can name (`E0500`). What each file declares is kept in a namespace-index cache, keyed by the compiler, the root, the file's path below it and a digest of its content, so a run lexes only the files whose content it has not read before; a build keeps it in `<output_dir>/namespace-index`, a single-file `cryo check`, which writes no build, in `.bin/namespace-index` beside the file, and the language server keeps none.
 
 ### 13.2 Module Aggregators
 

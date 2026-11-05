@@ -211,6 +211,8 @@ Build
 
 Tests and gates
   make test              cryo test over tests/ (the working loop; ARGS=filter).
+                         Its single-file checks keep namespace-index caches
+                         in tests/tests/negative/.bin (so does test-census).
   make test-list         List the discovered unit tests without running them.
   make test-census       The same run as test, with each suite's count, and
                          the unit tests and projects by name, asserted
@@ -920,7 +922,8 @@ uninstall:
 # Every output the targets above write inside the tree, for every triple:
 # the compiler, the stdlib and runtime tier archives, the LSP build and its
 # installed copy, the test helper archives, the test suite's and the
-# examples' build directories, the gates' state (.verify/ with its cached
+# examples' build directories, the namespace-index caches the compile-fail
+# suite's single-file checks keep in tests/tests/negative/.bin, the gates' state (.verify/ with its cached
 # baseline compilers, .cross-check/, build-logs/) and the release staging
 # (dist/).  Each is rebuilt by the target that wrote it.  The committed pins
 # and the fetched .toolchains/ stay.
@@ -937,7 +940,7 @@ clean:
 	@if exist bin\cryolsp.exe del /q bin\cryolsp.exe
 	@if exist bin\cryolsp del /q bin\cryolsp
 	@del /q tests\helpers\*.o tests\helpers\*.a 2>NUL || rem
-	@for %%d in (tests\build .verify .cross-check build-logs dist) do @if exist %%d rmdir /s /q %%d
+	@for %%d in (tests\build tests\tests\negative\.bin .verify .cross-check build-logs dist) do @if exist %%d rmdir /s /q %%d
 	@for /d %%p in (examples\* tests\tests\projects\*) do @if exist %%p\build rmdir /s /q %%p\build
 	@for %%d in (compiler\build stdlib\.bin runtime\.bin tools\CryoLSP\build bin\cryolsp.exe) do @if exist %%d (echo clean: %%d is still there; a running process holds a file in it & exit /b 1)
 else
@@ -947,6 +950,6 @@ clean:
 	@rm -rf tools/CryoLSP/build
 	@rm -f bin/cryolsp bin/cryolsp.exe
 	@rm -f $(TEST_HELPERS_DIR)/*.o $(TEST_HELPERS_DIR)/*.a
-	@rm -rf tests/build .verify .cross-check build-logs dist
+	@rm -rf tests/build tests/tests/negative/.bin .verify .cross-check build-logs dist
 	@rm -rf examples/*/build tests/tests/projects/*/build
 endif
