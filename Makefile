@@ -662,18 +662,19 @@ incremental-instance-check: cryo
 endif
 
 # The judges behind verify's tests/started-compiling declarations, and
-# verify-pin's checks, driven through every case they must refuse and every
-# case they must allow.
+# verify-pin's checks, and selfhost-check's stage-archive comparison, driven
+# through every case they must refuse and every case they must allow.
 verify-selftest:
 	@$(PYTHON) scripts/verify.py --selftest
 	@$(PYTHON) scripts/verify-pin.py --selftest
 	@$(PYTHON) scripts/roster-check.py --selftest
+	@$(PYTHON) scripts/selfhost-check.py --selftest
 
 # ---- the pre-commit sweep ----------------------------------------------
 # Every gate here is source-derived, so this target builds nothing.  A short
 # gate everybody runs is worth more than a twenty-minute one nobody does.
 check-fast: verify-selftest verify-pin
-	@echo "check-fast: OK (verify's declared-program self-test, roster merge self-test, pin integrity)"
+	@echo "check-fast: OK (verify's declared-program self-test, roster merge self-test, selfhost archive-comparison self-test, pin integrity)"
 
 # ---- language-server compile gate --------------------------------------
 # The LSP links the compiler as a LIBRARY (tools/CryoLSP/cryoconfig ->

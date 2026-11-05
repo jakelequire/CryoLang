@@ -2,7 +2,7 @@
 """
 selfhost-check: build the Cryo compiler through 3 rounds and verify that
 stage-3 and stage-4 produce byte-identical IR, and that the stdlib archives
-stage-2 and stage-3 build hold byte-identical IR.
+stage-2 and stage-3 build hold byte-identical objects.
 
 The chain is rooted at the pinned `bin/cryo` self-hosted binary, not the
 legacy C++ bootstrap. That binary is the canonical entry point for the
@@ -631,20 +631,21 @@ def _drop_llvm_dll_beside(exe: Path):
                 pass
 
 
-def _compare_ir_trees(root_a: Path, root_b: Path):
-    """Compare two per-module IR trees (<root>/*/ir/**/*.ll).  Returns
+def _compare_module_trees(root_a: Path, root_b: Path, below: str, suffix: str):
+    """Compare two per-module output trees: every <root>/*/<below>/**/*<suffix>
+    file, `ir` and `.ll` for IR, `deps` and `.o` for objects.  Returns
     (True, (nmods, bytes)) on match, (False, first_diff_name) on mismatch, or
     (None, reason) when they can't be compared."""
-    # Per-module `.ll` files live in per-namespace SUBDIRECTORIES under `ir/`
-    # (e.g. `ir/std/core/error.ll`), so glob recursively and key by the path
-    # RELATIVE to `ir/` - a plain basename collides across subdirs
+    # Per-module files live in per-namespace SUBDIRECTORIES (e.g.
+    # `ir/std/core/error.ll`), so glob recursively and key by the path
+    # RELATIVE to `<below>/` - a plain basename collides across subdirs
     # (`core/error.ll` vs `io/error.ll` both basename `error.ll`).
     def _key(p: Path) -> str:
-        return p.as_posix().rsplit("/ir/", 1)[-1]
-    a = {_key(p): p for p in root_a.glob("**/ir/**/*.ll")}
-    b = {_key(p): p for p in root_b.glob("**/ir/**/*.ll")}
+        return p.as_posix().rsplit(f"/{below}/", 1)[-1]
+    a = {_key(p): p for p in root_a.glob(f"**/{below}/**/*{suffix}")}
+    b = {_key(p): p for p in root_b.glob(f"**/{below}/**/*{suffix}")}
     if not a or not b:
-        return None, "no per-module IR found (was --emit-llvm honored?)"
+        return None, f"no per-module {suffix} files found under {below}/"
     if set(a) != set(b):
         return None, f"module sets differ ({len(a)} vs {len(b)})"
     total = 0
@@ -654,6 +655,12 @@ def _compare_ir_trees(root_a: Path, root_b: Path):
             return False, name
         total += len(ba)
     return True, (len(a), total)
+
+
+def _compare_ir_trees(root_a: Path, root_b: Path):
+    """Compare two per-module IR trees (<root>/*/ir/**/*.ll), which a compiler
+    stage writes with --emit-llvm."""
+    return _compare_module_trees(root_a, root_b, "ir", ".ll")
 
 
 def archive_dirs(stdlib_root: Path) -> set:
@@ -675,7 +682,7 @@ def record_stage_archive(stage, stdlib_root: Path, seen: set, built: dict):
 def compare_stage_archives(built: dict, stage2: Path, stage3: Path):
     """(True, (nmods, bytes)), (True, None), (False, first differing module) or
     (None, reason): stage-2 and stage-3 must each have built one stdlib
-    archive, and the two must hold byte-identical IR.  Every program links the
+    archive, and the two must hold byte-identical objects.  Every program links the
     stdlib from its archive, so the stdlib's code is checked here, where the
     stage-3 and stage-4 IR no longer holds it.  A stage-3 byte-identical to
     stage-2 - a pin built from the same compiler source, on a host whose link
@@ -688,7 +695,63 @@ def compare_stage_archives(built: dict, stage2: Path, stage3: Path):
     if len(s2) != 1 or len(s3) != 1:
         return None, (f"stage-2 built {len(s2)} stdlib archive(s) and stage-3 "
                       f"{len(s3)}; each builds its own")
-    return _compare_ir_trees(s2[0], s3[0])
+    return _compare_module_trees(s2[0], s3[0], "deps", ".o")
+
+
+def selftest() -> int:
+    """The stage-archive comparison over throwaway archives: two stages'
+    archives agree only when every object agrees - IR that agrees is not
+    enough, since an archive is linked by its objects - and a stage that built
+    none cannot be compared."""
+    import tempfile
+    failures = []
+
+    def check(name: str, got, want) -> None:
+        if got != want:
+            failures.append(f"{name}: got {got!r}, want {want!r}")
+
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch)
+
+        def archive(key: str, objects: dict, ir: dict) -> Path:
+            home = root / key
+            for rel, data in objects.items():
+                p = home / "target" / "release" / "t" / "local" / "deps" / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(data)
+            for rel, data in ir.items():
+                p = home / "target" / "release" / "t" / "local" / "ir" / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(data)
+            return home
+
+        same_ir = {"std/core/error.ll": b"ir", "std/io/error.ll": b"ir2"}
+        a = archive("a", {"std/core/error.o": b"one", "std/io/error.o": b"two"}, same_ir)
+        b = archive("b", {"std/core/error.o": b"one", "std/io/error.o": b"two"}, same_ir)
+        c = archive("c", {"std/core/error.o": b"one", "std/io/error.o": b"TWO"}, same_ir)
+        d = archive("d", {"std/core/error.o": b"one"}, same_ir)
+        stage2, stage3 = root / "stage2", root / "stage3"
+        stage2.write_bytes(b"compiler-2")
+        stage3.write_bytes(b"compiler-3")
+
+        check("equal objects", compare_stage_archives(
+            {"stage-2": [a], "stage-3": [b]}, stage2, stage3)[0], True)
+        check("an object differs under equal IR", compare_stage_archives(
+            {"stage-2": [a], "stage-3": [c]}, stage2, stage3), (False, "std/io/error.o"))
+        check("an object missing", compare_stage_archives(
+            {"stage-2": [a], "stage-3": [d]}, stage2, stage3)[0], None)
+        check("stage-3 built none", compare_stage_archives(
+            {"stage-2": [a], "stage-3": []}, stage2, stage3)[0], None)
+        stage3.write_bytes(b"compiler-2")
+        check("byte-identical stages share one archive", compare_stage_archives(
+            {"stage-2": [a], "stage-3": []}, stage2, stage3), (True, None))
+
+    for f in failures:
+        print(f"selfhost-check selftest: FAIL {f}")
+    if failures:
+        return 1
+    print("selfhost-check selftest: OK (5 cases)")
+    return 0
 
 
 def report_stage_archives(prefix: str, built: dict, stage2: Path, stage3: Path) -> bool:
@@ -700,7 +763,7 @@ def report_stage_archives(prefix: str, built: dict, stage2: Path, stage3: Path) 
     if ok:
         nmods, total = detail
         print(f"  {C.GREEN}{C.BOLD}✓ STDLIB ARCHIVES OK{C.RESET}  {prefix}stage-2 and stage-3 "
-              f"built byte-identical stdlib IR ({nmods} modules, {total:,} bytes)")
+              f"built byte-identical stdlib objects ({nmods} modules, {total:,} bytes)")
         return True
     if ok is None:
         print(f"  {C.RED}✗ cannot compare {prefix}stdlib archives:{C.RESET} {detail}")
@@ -1020,8 +1083,13 @@ def main():
     parser.add_argument("--mirror", metavar="DIR",
                         help="run the Linux arm from a copy of its sources in DIR, "
                              "refused unless the copy's digest is the working tree's")
+    parser.add_argument("--selftest", action="store_true",
+                        help="check the stage-archive comparison against throwaway "
+                             "archives in both directions; builds nothing")
     args = parser.parse_args()
 
+    if args.selftest:
+        return selftest()
     if args.mirror:
         return run_from_mirror(args)
 
