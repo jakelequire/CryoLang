@@ -356,7 +356,9 @@ class Fixture:
             self.load(rel)
 
     def load(self, rel):
-        with open(os.path.join(self.root, rel), "r", encoding="utf-8", newline="") as fh:
+        # "utf-8-sig" drops a leading byte order mark, as an editor does when
+        # it decodes the file: a client's document text holds no mark.
+        with open(os.path.join(self.root, rel), "r", encoding="utf-8-sig", newline="") as fh:
             self.set_text(rel, fh.read())
 
     def set_text(self, rel, text):

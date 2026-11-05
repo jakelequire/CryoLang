@@ -48,6 +48,8 @@ The rest of this document is organised by feature area. Examples are runnable ag
 
 This section describes the building blocks the lexer recognises before any syntactic or semantic meaning is assigned.
 
+A source file is UTF-8. A UTF-8 byte order mark (`EF BB BF`) at the very start of a file marks the encoding and is no part of the text: it is skipped, and columns on line 1 count from the character after it. Anywhere else outside a literal or comment, the same bytes are an unexpected character.
+
 ### 1.1 Identifiers
 
 An identifier begins with a letter (`a`-`z`, `A`-`Z`) or underscore, followed by any sequence of letters, digits, and underscores.
