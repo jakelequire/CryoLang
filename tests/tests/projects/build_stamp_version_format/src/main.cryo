@@ -3,6 +3,7 @@ namespace main;
 import std::fmt;
 import std::ffi::libc;
 import utils::build_stamp::{ BuildStamp, StampSlot, VersionReport };
+import compiler::build_manifest::{ Manifest };
 
 const COMMIT: string = "3f9c2a1b5e0d4c3b2a1908f7e6d5c4b3a2918070";
 
@@ -20,6 +21,14 @@ function check_int(what: string, got: i64, want: i64) -> void {
         fmt::printf("FAIL %s: got %d, want %d\n", what, got, want);
         g_failed = g_failed + 1;
     }
+}
+
+/// A recorded fingerprint as the build renders digests, or "none".
+function hex_of(recorded: Option<u128>) -> string {
+    return match (recorded) {
+        Option::Some(value) => { Manifest::hex128(value) }
+        Option::None        => { "none" }
+    };
 }
 
 function stamp_text(dirty: string) -> string {
@@ -64,6 +73,28 @@ function main(argc: int, argv: string*) -> int {
     check("round trip dirty", again.dirty, "no");
     check("round trip profile", again.profile, "release");
     check("unstamped renders nothing", BuildStamp::empty().render(), "");
+
+    // The digest `cryo stamp` records is read back only for a binary of the
+    // size it was recorded for; a binary that size no longer has its digest
+    // taken again.
+    const digest: string = "0123456789abcdef00112233445566ff";
+    const recorded_text: string = stamp_text("no") + "fingerprint=" + digest + "\nbytes=4096\n";
+    const recorded: BuildStamp = BuildStamp::parse(recorded_text);
+    check("render with fingerprint", recorded.render(), recorded_text);
+    check("recorded for its size", hex_of(recorded.recorded_fingerprint(4096)), digest);
+    check("refused for another size", hex_of(recorded.recorded_fingerprint(4097)), "none");
+    check("refused for an unknown size", hex_of(recorded.recorded_fingerprint(-1)), "none");
+    check("none recorded", hex_of(clean.recorded_fingerprint(4096)), "none");
+    const short: BuildStamp = BuildStamp::parse("fingerprint=0123456789abcdef\nbytes=4096\n");
+    check("refused when malformed", hex_of(short.recorded_fingerprint(4096)), "none");
+    check_int("a full stamp fits the region", if (recorded_text.length() < 496) { 1 } else { 0 }, 1);
+    // Outside a checkout only the fingerprint is recorded, and the version
+    // still reads as unstamped.
+    const outside: BuildStamp = BuildStamp::parse("fingerprint=" + digest + "\nbytes=4096\n");
+    check("outside a checkout renders the fingerprint", outside.render(),
+        "fingerprint=" + digest + "\nbytes=4096\n");
+    check("outside a checkout is unstamped", outside.version("1.0.0", "alpha"), "1.0.0-alpha+unknown");
+    check("outside a checkout keeps its fingerprint", hex_of(outside.recorded_fingerprint(4096)), digest);
 
     // A key a newer stamp writes is skipped; the rest still reads.
     const newer: BuildStamp = BuildStamp::parse(fmt::format("commit=%s\nflavour=x\ndirty=no\n", COMMIT));

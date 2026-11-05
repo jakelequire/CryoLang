@@ -548,10 +548,13 @@ implement enum CommandKind {
                 fmt::printf("tracked files differ from the commit, and the build profile.  The\n");
                 fmt::printf("binary then reports them in `cryo version`.  The build runs this\n");
                 fmt::printf("after linking the compiler; it is not listed in `cryo help`.\n\n");
+                fmt::printf("It also records the binary's fingerprint, the digest a build keys\n");
+                fmt::printf("its caches by, with the binary's size, so a run reads it instead of\n");
+                fmt::printf("hashing itself; a binary whose size changed since is hashed again.\n\n");
                 fmt::printf("Only a reserved region of <binary> changes, so stamping alters no\n");
-                fmt::printf("code.  Outside a git checkout the region is cleared, and the binary\n");
-                fmt::printf("reports `unknown`.  A binary with no region, or more than one, is\n");
-                fmt::printf("refused.\n\n");
+                fmt::printf("code.  Outside a git checkout only the fingerprint is recorded, and\n");
+                fmt::printf("the binary reports `unknown`.  A binary with no region, or more than\n");
+                fmt::printf("one, is refused.\n\n");
                 fmt::printf("Flags:\n");
                 fmt::printf("  --profile=NAME      The profile the binary was built with\n");
                 fmt::printf("  --exclude=PATH,...  Tracked paths, from the top of the checkout,\n");
@@ -869,14 +872,22 @@ type struct Executor {
             exclude = args.get_value("exclude").split_nonempty(",");
         }
         const profile: string = if (args.has_arg("profile")) { args.get_value("profile") } else { "" };
-        const stamp: BuildStamp = BuildStamp::from_checkout(exclude, profile);
+        mut stamp: BuildStamp = BuildStamp::from_checkout(exclude, profile);
+        match (path::Path::from(target).metadata()) {
+            Result::Ok(m) => {
+                stamp.fingerprint = build_manifest::Manifest::hex128(
+                    build_manifest::Manifest::binary_fingerprint(target));
+                stamp.bytes = fmt::format("%lld", m.length());
+            }
+            Result::Err(_) => { }
+        }
         const failure: string = StampSlot::write_into(target, stamp.render());
         if (failure.length() > 0) {
             fmt::eprintf("error: cannot stamp %s: %s\n", target, failure);
             return 1;
         }
         if (!stamp.is_stamped()) {
-            fmt::printf("==> %s: not in a git checkout; stamp cleared\n", target);
+            fmt::printf("==> %s: not in a git checkout; only its fingerprint recorded\n", target);
             return 0;
         }
         fmt::printf("==> %s stamped: %s %s, dirty: %s, profile: %s\n", target,

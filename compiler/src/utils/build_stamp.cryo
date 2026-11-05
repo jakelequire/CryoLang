@@ -122,20 +122,38 @@ implement struct StampSlot {
 }
 
 /// The fields of a stamp.  Each is "" when the binary was not stamped.
+/// `fingerprint` is the binary's digest with its stamp text read as zeros,
+/// and `bytes` its size, both when it was stamped; they are recorded inside
+/// or outside a checkout.
 type struct BuildStamp {
-    commit:   string;
-    date:     string;
-    branch:   string;
-    describe: string;
-    dirty:    string;
-    profile:  string;
+    commit:      string;
+    date:        string;
+    branch:      string;
+    describe:    string;
+    dirty:       string;
+    profile:     string;
+    fingerprint: string;
+    bytes:       string;
 }
 
 implement struct BuildStamp {
     static empty() -> BuildStamp {
         return BuildStamp {
             commit: "", date: "", branch: "", describe: "", dirty: "", profile: "",
+            fingerprint: "", bytes: "",
         };
+    }
+
+    /// The digest recorded for this binary, when it was recorded for one of
+    /// `size` bytes.  A link writes the region as zeros and only `cryo stamp`
+    /// fills it, so a recorded digest was taken over this binary's bytes
+    /// unless the file was edited in place after stamping; an edit that
+    /// changes its size (a strip) is refused here, and its digest must be
+    /// taken again.
+    recorded_fingerprint(&this, size: i64) -> Option<u128> {
+        if (this.fingerprint.length() != 32) { return Option::None; }
+        if (size < 0 || this.bytes != fmt::format("%lld", size)) { return Option::None; }
+        return u128::parse_literal(Str::new(this.fingerprint).as_bytes(), 16);
     }
 
     /// The stamp of the running binary.
@@ -163,18 +181,27 @@ implement struct BuildStamp {
                 "describe" => { stamp.describe = value; }
                 "dirty"    => { stamp.dirty = value; }
                 "profile"  => { stamp.profile = value; }
+                "fingerprint" => { stamp.fingerprint = value; }
+                "bytes"       => { stamp.bytes = value; }
                 _ => {}
             }
         }
         return stamp;
     }
 
-    /// The text `parse` reads back.  "" for an unstamped build, so writing
-    /// it clears a region.
+    /// The text `parse` reads back: the checkout's fields when there is a
+    /// commit, then the fingerprint when there is one.  "" when there is
+    /// neither, so writing it clears a region.
     render(&this) -> string {
-        if (this.commit.length() == 0) { return ""; }
-        return fmt::format("commit=%s\ndate=%s\nbranch=%s\ndescribe=%s\ndirty=%s\nprofile=%s\n",
-            this.commit, this.date, this.branch, this.describe, this.dirty, this.profile);
+        mut text: string = "";
+        if (this.commit.length() > 0) {
+            text = fmt::format("commit=%s\ndate=%s\nbranch=%s\ndescribe=%s\ndirty=%s\nprofile=%s\n",
+                this.commit, this.date, this.branch, this.describe, this.dirty, this.profile);
+        }
+        if (this.fingerprint.length() > 0) {
+            text = text + fmt::format("fingerprint=%s\nbytes=%s\n", this.fingerprint, this.bytes);
+        }
+        return text;
     }
 
     is_stamped(&this) -> boolean {

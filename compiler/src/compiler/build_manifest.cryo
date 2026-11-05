@@ -32,7 +32,8 @@
 namespace compiler::build_manifest;
 
 import compiler::project_config::{ ProjectConfig };
-import utils::build_stamp::{ StampSlot };
+import utils::build_stamp::{ BuildStamp, StampSlot };
+import utils::log::{ Log, LogArea };
 import std::fs::file::{ File };
 import std::fs::file;
 import std::fs::path::{ Path };
@@ -519,23 +520,46 @@ type struct Manifest {
     }
 
     /// Digest of the running compiler's own bytes. Changes whenever the
-    /// compiler changes, invalidating every cached build it produced.  The
-    /// build stamp reads as zeros: `cryo stamp` rewrites it in place and it
-    /// changes nothing the compiler emits, so a new stamp is not a new
-    /// compiler.
+    /// compiler changes, invalidating every cached build it produced.  It is
+    /// the digest `cryo stamp` recorded when the stamp holds one for a binary
+    /// of this one's size, and `binary_fingerprint` of the binary otherwise.
     /// Taken once per process: the binary does not change while it runs.
     static compiler_fingerprint() -> u128 {
         if (g_compiler_fingerprint_taken) { return g_compiler_fingerprint; }
         const exe: string = Manifest::self_exe_path();
-        mut h: ContentHasher = ContentHasher::new();
         if (exe.length() == 0) {
+            mut h: ContentHasher = ContentHasher::new();
             h.fold("<unknown-compiler>");
+            g_compiler_fingerprint = h.finish128();
         } else {
-            Manifest::fold_file_contents(&h, exe, true);
+            mut size: i64 = -1;
+            match (Path::from(exe).metadata()) {
+                Result::Ok(m)  => { size = m.length(); }
+                Result::Err(_) => { }
+            }
+            match (BuildStamp::running().recorded_fingerprint(size)) {
+                Option::Some(recorded) => {
+                    g_compiler_fingerprint = recorded;
+                    Log::debug(LogArea::Driver, "compiler fingerprint read from the build stamp");
+                }
+                Option::None => {
+                    g_compiler_fingerprint = Manifest::binary_fingerprint(exe);
+                    Log::debug(LogArea::Driver, "compiler fingerprint computed from the binary: its stamp records none for its size");
+                }
+            }
         }
-        g_compiler_fingerprint = h.finish128();
         g_compiler_fingerprint_taken = true;
         return g_compiler_fingerprint;
+    }
+
+    /// Digest of the binary at `path`, its build stamp read as zeros:
+    /// `cryo stamp` rewrites the stamp in place and it changes nothing the
+    /// compiler emits, so a new stamp is not a new compiler.  This is what
+    /// `cryo stamp` records and what a run of that binary is identified by.
+    static binary_fingerprint(path: string) -> u128 {
+        mut h: ContentHasher = ContentHasher::new();
+        Manifest::fold_file_contents(&h, path, true);
+        return h.finish128();
     }
 
     /// Digest of what emitting a module's object reads besides its bitcode:
