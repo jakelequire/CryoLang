@@ -1749,6 +1749,8 @@ const p: Point = Point::new(10, 20);
 
 A struct has no constructor; a `static new(...)` factory is the idiom, and simply returns a struct literal.
 
+A static method takes no receiver, so it is never called through a value: `p.origin()`, `this.origin()`, a call through a `Deref` value such as a `Box<Point>`, and a trait's static through a bounded parameter (`t.default()` under `T: Default`) or through `this` in a trait default are refused (`E0358`), with the call through the type (`Point::origin()`, `T::default()`) as the help.
+
 ### 8.5 Struct Literals
 
 A struct literal names each field inside braces. Field order does not need to match declaration order, but every non-defaulted field must be specified.

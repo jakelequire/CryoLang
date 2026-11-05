@@ -3075,7 +3075,7 @@ type struct CallResolver {
             const named: [DeclarationNode*] = this.ctx.decl_index.methods_named(FamilyOwner::Type(cur_owner), member.member);
             for (mut mi: i64 = 0; mi < cur.length(); mi++) {
                 const m: &MethodInfo = &cur[mi];
-                if (!DeclarationIndex::holds_method(&named, m.ast_node)) { continue; }
+                if (!DeclarationIndex::holds_method(&named, m.ast_node) || m.is_static) { continue; }
                 const m_origin: DefId = this.method_origin_trait(m);
                 if (pass == 1 && m_origin.is_valid()) { continue; }
                 if (pass == 2 && !m_origin.is_valid()) { continue; }
@@ -3152,7 +3152,7 @@ type struct CallResolver {
                     for (mut bmi: i64 = 0; bmi < block.methods.length(); bmi++) {
                         const mn_decl: DeclarationNode* = block.methods[bmi];
                         const mn: MethodDecl* = DeclarationNode::method_of(mn_decl);
-                        if (mn == null || mn.func == null) { continue; }
+                        if (mn == null || mn.func == null || mn.is_static) { continue; }
                         const fn_node_decl: DeclarationNode* = mn.func;
                         const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
                         if (!DeclarationIndex::holds_method(&block_named, mn_decl)) { continue; }
@@ -4212,6 +4212,7 @@ type struct CallResolver {
         for (mut tier: i32 = 0; tier <= 3; tier++) {
             if (tier == 3 && this.state.in_implicit_conversion) { break; }
             for (mut i: i64 = 0; i < items.length(); i++) {
+                if (DeclarationNode::method_of(items[i]).is_static) { continue; }
                 const f_decl: DeclarationNode* = DeclarationNode::method_of(items[i]).func;
                 const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
                 mut params: [TypeRef] = [];
@@ -4717,6 +4718,9 @@ type struct CallResolver {
             for (mut mi: i64 = 0; mi < methods_ref.length(); mi++) {
                 const m: MethodInfo* = methods_ref.get_ref(mi).unwrap();
                 if (!DeclarationIndex::holds_method(&named, m.ast_node)) { continue; }
+                // A static function takes no receiver: no call through a
+                // value names one.
+                if (m.is_static) { continue; }
                 if (this.method_origin_trait(m).is_valid() != from_trait) { continue; }
                 if (only_trait.is_valid() && !this.method_provided_by(m.ast_node, only_trait)) { continue; }
                 const mfn_decl: DeclarationNode* = if (m.ast_node != null) { DeclarationNode::method_of(m.ast_node).func } else { null };
@@ -5048,7 +5052,9 @@ type struct CallResolver {
             for (mut mi: i64 = 0; mi < methods.length(); mi++) {
                 const mn_decl: DeclarationNode* = methods[mi];
                 const mn: MethodDecl* = DeclarationNode::method_of(mn_decl);
-                if (mn == null || mn.func == null) { continue; }
+                // A static function takes no receiver: no call through a
+                // value names one.
+                if (mn == null || mn.func == null || mn.is_static) { continue; }
                 const fn_node_decl: DeclarationNode* = mn.func;
                 const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
                 if (!DeclarationIndex::holds_method(named, mn_decl)) { continue; }
@@ -5545,6 +5551,14 @@ type struct CallResolver {
                     }
                 }
             };
+            // A bound's trait gives its subject the trait's static functions
+            // too, and none of them takes a receiver.
+            const bound_trait: DefId = dir.named();
+            if (abs_ret.is_valid() && bound_trait.is_valid() && this.ctx.generic_registry.trait_item_is_static(
+                    bound_trait, this.ctx.generic_registry.trait_item_slot(bound_trait, member.member))) {
+                this.refuse_static_through_value(member_e, member, this.binding.peel_all_indirection(obj_type));
+                return TypeRef::invalid();
+            }
             if (abs_ret.is_valid()) {
                 if (dir.named().is_valid() && !member.resolved_trait.is_valid()) {
                     this.stamp_trait_item(member, dir.named());
@@ -5687,6 +5701,12 @@ type struct CallResolver {
             // where it is written; a `mut &this` one writes the pointee, so
             // through `deref_mutable`.
             const on_target: Selection = this.bind_method_on_receiver(visitor, call, member, member.object.resolved_type);
+            const target: TypeRef = this.binding.peel_all_indirection(member.object.resolved_type);
+            if (on_target.chosen == null && this.ctx.decl_index.family_is_static(
+                    FamilyOwner::Type(this.types.method_owner_ref(target)), member.member)) {
+                this.refuse_static_through_value(member_e, member, target);
+                return TypeRef::invalid();
+            }
             if (this.writes_receiver(on_target.chosen)) {
                 visitor.refuse_read_only_call(visitor.access_within(member.object),
                     member.member_span);
@@ -5749,6 +5769,11 @@ type struct CallResolver {
             return TypeRef::invalid();
         }
 
+        if (this.ctx.decl_index.family_is_static(FamilyOwner::Type(this.types.method_owner_ref(lookup_ref)), member.member)) {
+            this.refuse_static_through_value(member_e, member, lookup_ref);
+            return TypeRef::invalid();
+        }
+
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
             fmt::format("no method named `%s` found on type `%s`", method_name, type_display));
@@ -5782,6 +5807,32 @@ type struct CallResolver {
         }
         this.ctx.emit_diagnostic(diag);
         return TypeRef::invalid();
+    }
+
+    /// E0358 at a call through a value of a function `owner` declares
+    /// static.  A static function takes no receiver, so the value has no
+    /// parameter to land on; the help names the call through the type.
+    /// That form no longer evaluates the value, so the edit may be
+    /// incorrect.
+    refuse_static_through_value(mut &this, member_e: ExpressionNode*, member: MemberAccessExpr*,
+                                owner: TypeRef) -> void {
+        const method_name: string = this.intern.resolve(member.member);
+        const owner_display: string = this.arena.resolve_display_name(owner);
+        // A path writes an owner's type arguments after `::`.
+        const owner_shown: string = this.arena.resolve_display_name_short(owner);
+        const arguments_at: i64 = owner_shown.find("<");
+        const owner_path: string = if (arguments_at < 0) { owner_shown } else {
+            owner_shown.substr(0, arguments_at) + "::" + owner_shown.substr(arguments_at, owner_shown.length() - arguments_at)
+        };
+        const path_form: string = fmt::format("%s::%s", owner_path, method_name);
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
+            fmt::format("no method named `%s` found on type `%s`", method_name, owner_display));
+        diag = diag.at(if (member.member_span.has_location()) { member.member_span } else { member_e.span });
+        diag = diag.with_note(fmt::format("`%s` is a static function of `%s`; it takes no receiver", method_name, owner_display));
+        diag = diag.help(fmt::format("call it through its type: `%s(...)`", path_form));
+        diag = diag.suggest(Suggestion::single(member_e.span, path_form,
+            fmt::format("call `%s` through its type", method_name), Applicability::MaybeIncorrect));
+        this.ctx.emit_diagnostic(diag);
     }
 
     /// E0358: a method gated behind a `where` bound the concrete type args don't satisfy.

@@ -1,0 +1,67 @@
+// E0358: a static function takes no receiver, so a call through a value
+// names no method of the value's type, however the arguments bind.  Refused
+// where the call is written - through a type's own statics, an enum's, a
+// generic type's, a trait's through a bound and through `This`, and through
+// a `Deref` target - not handed to code generation with the value passed as
+// an extra argument.
+![config(testing)]
+![config(negative, E0358)]
+namespace CryoTests::Negative::StaticFunctionCalledThroughValue;
+
+import std::fs::{ file, path };
+import std::io::error::{ IoError };
+import std::collections::string::{ String };
+import std::alloc::box::{ Box };
+
+type struct CfCounter {
+    value: int;
+    static make(start: int) -> CfCounter { return CfCounter { value: start }; }
+    static twice(n: int) -> int { return n * 2; }
+    inside(&this) -> int { return this.twice(4); }
+    //~^ ERROR[E0358] no method named `twice` found on type
+}
+
+type enum CfShade {
+    Light;
+    Dark;
+}
+
+implement enum CfShade {
+    static pick(dark: boolean) -> CfShade { if (dark) { return CfShade::Dark; } return CfShade::Light; }
+}
+
+type struct CfHolder<T> {
+    item: T;
+    static wrap(x: T) -> CfHolder<T> { return CfHolder::<T> { item: x }; }
+}
+
+type trait CfMaker {
+    static produce() -> int;
+    doubled(&this) -> int { return this.produce() * 2; }
+    //~^ ERROR[E0358] no method named `produce` found on type `This`
+}
+
+function cf_through_bound<T>(t: &T) -> int where T: CfMaker {
+    return t.produce();
+    //~^ ERROR[E0358] no method named `produce` found on type `T`
+}
+
+function main() -> int {
+    const p: path::Path = path::Path::from("cf.txt");
+    const opened: Result<file::File, IoError> = file::File::open(path::Path::from("cf.txt"));
+    const text: Result<String, IoError> = opened.unwrap().read_text(p);
+    //~^ ERROR[E0358] no method named `read_text` found on type
+    const c: CfCounter = CfCounter::make(3);
+    const a: int = c.twice(2);
+    //~^ ERROR[E0358] no method named `twice` found on type
+    const b: CfCounter = c.make();
+    //~^ ERROR[E0358] no method named `make` found on type
+    const s: CfShade = CfShade::pick(true).pick(false);
+    //~^ ERROR[E0358] no method named `pick` found on type
+    const h: CfHolder<int> = CfHolder::<int>::wrap(1).wrap(2);
+    //~^ ERROR[E0358] no method named `wrap` found on type
+    const boxed: Box<CfCounter> = Box::new(CfCounter { value: 1 });
+    const n: int = boxed.twice(3);
+    //~^ ERROR[E0358] no method named `twice` found on type
+    return a + n;
+}
