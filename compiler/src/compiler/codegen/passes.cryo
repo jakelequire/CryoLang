@@ -29,6 +29,7 @@ import compiler::passes::pass_id::{ PassResult };
 import compiler::resolver::{ intern_table, symbol_str };
 import std::fmt;
 import utils::log::{ Log, LogArea, LogLevel };
+import utils::time_trace::{ TimeTrace };
 import std::ffi::libc;
 import compiler::codegen::context::{ CodegenContext };
 import compiler::codegen::ops::declaration_emitter::{ DebugInfoState };
@@ -2342,6 +2343,12 @@ type struct EmitJob {
     ok:              boolean;   // result: emission succeeded
     err_msg:         string;    // LLVM error message on failure (worker-set;
                                 // the main thread reports it and disposes it)
+    // When the job's optimization and object emission ran, and on which
+    // worker (0 = the main thread, worker `w` = `w + 1`), for the time trace.
+    optimize_start_ns: i64;
+    emit_start_ns:     i64;
+    end_ns:            i64;
+    thread:            u32;
 }
 
 /// Optimize and emit ONE module's object file from its own standalone LLVM context (the
@@ -2351,7 +2358,11 @@ type struct EmitJob {
 /// IRGeneration).  A top-level function (not a method/lambda), a form usable
 /// as a thread entry point; emission is serial in-process here and
 /// out-of-process for large builds.
-function codegen_emit_job(job: mut EmitJob*) -> void {
+function codegen_emit_job(job: mut EmitJob*, thread: u32) -> void {
+    (*job).thread = thread;
+    (*job).optimize_start_ns = TimeTrace::now();
+    (*job).emit_start_ns = (*job).optimize_start_ns;
+    (*job).end_ns = (*job).optimize_start_ns;
     // Emit this module's live IR directly with its main-thread-built target
     // machine.  Deliberately ALLOCATION-FREE on the Cryo side: it makes the raw
     // LLVM emit call and, on error, stashes the LLVM message pointer in the job
@@ -2370,8 +2381,10 @@ function codegen_emit_job(job: mut EmitJob*) -> void {
     if (!machine.run_optimization_pipeline(LModule { raw: (*job).llvm_module }, (*job).opt_level)) {
         (*job).optimization_failed = true;
         (*job).ok = false;
+        (*job).end_ns = TimeTrace::now();
         return;
     }
+    (*job).emit_start_ns = TimeTrace::now();
     mut err: i8* = null;
     const rc: i32 = llvm::LLVMTargetMachineEmitToFile(
         (*job).tm, (*job).llvm_module, (*job).emit_path,
@@ -2381,6 +2394,7 @@ function codegen_emit_job(job: mut EmitJob*) -> void {
     // main thread reports it and disposes it.
     (*job).err_msg = err as string;
     (*job).ok = rc == 0;
+    (*job).end_ns = TimeTrace::now();
 }
 
 /// The in-process threaded emitter's job queue, moved into each worker by
@@ -2398,6 +2412,8 @@ type struct EmitQueue {
     cursor:    mut Atomic<u64>*;
     published: mut Atomic<u64>*;
     closed:    mut Atomic<u32>*;
+    /// This worker's number, from 0.
+    worker:    u32;
 }
 
 /// Pool worker body.  A plain top-level function: it is handed to
@@ -2417,7 +2433,7 @@ function emit_queue_worker(queue: EmitQueue) -> void {
             }
             thread::sleep_ms(1);
         }
-        codegen_emit_job(&queue.jobs[k]);
+        codegen_emit_job(&queue.jobs[k], queue.worker + 1);
         queue.done[k].store(1, MemoryOrder::Release);
     }
 }

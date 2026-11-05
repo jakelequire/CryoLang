@@ -1,0 +1,226 @@
+///! The build's time trace: the stages, passes and modules a compiler run
+///! spends its time on, written as a trace event file (the JSON form Perfetto
+///! and chrome://tracing open).
+///!
+///! Off until `--time-trace` or `CRYO_TIME_TRACE` switches it on, and a span
+///! costs one clock read while it is off.  Spans are recorded on the main
+///! thread only: a codegen worker measures its own job's bounds into the job,
+///! and the main thread records them once the job is done, so a worker never
+///! allocates.
+///!
+///! `--time-trace=PATH` writes PATH; `--time-trace` alone, or a PATH naming a
+///! directory, writes `cryo-time-trace-<pid>.json` there (the current
+///! directory when no PATH is given).  `CRYO_TIME_TRACE` takes the same PATH
+///! and reaches every compiler a build or the test runner starts, which is why
+///! a directory names each process's file by its id.
+namespace utils::time_trace;
+
+import std::env;
+import std::fmt;
+import std::process;
+import std::ffi::libc;
+import std::alloc::box::{ Box };
+import std::fs::file::{ File };
+import std::fs::path::{ Path };
+import std::time::clock::{ Instant };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::json::value::{ JsonValue, JsonNumber, JsonObject };
+import std::json::serializer;
+
+/// One timed piece of a run.  Its name and detail are byte ranges of the
+/// recorder's text; `category` is a literal.  `thread` 0 is the main thread;
+/// codegen worker `w` is thread `w + 1`.
+type struct TraceSpan {
+    category:      string;
+    name_at:       u64;
+    name_length:   u64;
+    detail_at:     u64;
+    detail_length: u64;
+    start_ns:      i64;
+    duration_ns:   i64;
+    thread:        u32;
+}
+
+/// The spans recorded so far, and the file they are written to.
+///
+/// The spans and their text are held in memory taken from libc directly, not
+/// through the compiler's allocator: while a build runs, that allocator hands
+/// out a per-target arena that is reclaimed at the next target and at the end
+/// of the build, long before the trace is written.
+type struct TraceRecorder {
+    path:           String;
+    origin_ns:      i64;
+    spans:          mut TraceSpan*;
+    span_count:     u64;
+    span_capacity:  u64;
+    text:           mut u8*;
+    text_length:    u64;
+    text_capacity:  u64;
+    /// One past the highest thread number a span named.
+    threads:        u32;
+
+    /// Copy `piece` to the end of the text, answering where it starts.
+    append_text(mut &this, piece: Str) -> u64 {
+        const at: u64 = this.text_length;
+        const length: u64 = piece.length() as u64;
+        if (at + length > this.text_capacity) {
+            mut capacity: u64 = if (this.text_capacity == 0) { 64 * 1024 } else { this.text_capacity * 2 };
+            while (capacity < at + length) { capacity = capacity * 2; }
+            this.text = libc::realloc(this.text, capacity);
+            this.text_capacity = capacity;
+        }
+        if (length > 0) {
+            libc::memcpy((this.text + at) as mut void*, piece.as_ptr() as void*, length);
+        }
+        this.text_length = at + length;
+        return at;
+    }
+
+    push(mut &this, span: TraceSpan) -> void {
+        if (this.span_count == this.span_capacity) {
+            const capacity: u64 = if (this.span_capacity == 0) { 1024 } else { this.span_capacity * 2 };
+            this.spans = libc::realloc(this.spans as mut u8*, capacity * sizeof(TraceSpan)) as mut TraceSpan*;
+            this.span_capacity = capacity;
+        }
+        this.spans[this.span_count] = span;
+        this.span_count = this.span_count + 1;
+        if (span.thread >= this.threads) { this.threads = span.thread + 1; }
+    }
+
+    /// The bytes `at`..`at + length` of the text.
+    text_at(&this, at: u64, length: u64) -> Str {
+        return Str::from_raw(this.text + at, length as i64);
+    }
+}
+
+/// `null` while the trace is off.
+mut g_time_trace: mut TraceRecorder* = null;
+
+type struct TimeTrace {
+    ![inline]
+    static enabled() -> boolean {
+        return g_time_trace != null;
+    }
+
+    /// The clock spans are measured on, in nanoseconds.
+    ![inline]
+    static now() -> i64 {
+        return Instant::now().as_nanos();
+    }
+
+    /// Record a main-thread span from `start_ns` to now.
+    static span(category: string, name: Str, detail: Str, start_ns: i64) -> void {
+        if (g_time_trace == null) { return; }
+        TimeTrace::span_between(category, name, detail, start_ns, Instant::now().as_nanos(), 0);
+    }
+
+    /// Record a span whose bounds were measured on `thread`.
+    static span_between(category: string, name: Str, detail: Str,
+                        start_ns: i64, end_ns: i64, thread: u32) -> void {
+        if (g_time_trace == null) { return; }
+        const name_at: u64 = g_time_trace.append_text(name);
+        const detail_at: u64 = g_time_trace.append_text(detail);
+        g_time_trace.push(TraceSpan {
+            category:      category,
+            name_at:       name_at,
+            name_length:   name.length() as u64,
+            detail_at:     detail_at,
+            detail_length: detail.length() as u64,
+            start_ns:      start_ns,
+            duration_ns:   end_ns - start_ns,
+            thread:        thread,
+        });
+    }
+
+    /// Switch the trace on when `CRYO_TIME_TRACE` or `--time-trace` asks for
+    /// it; the flag wins over the environment.
+    static configure_from_command_line(argc: int, argv: string*) -> void {
+        mut requested: Option<String> = env::var(Str::new("CRYO_TIME_TRACE"));
+        for (mut i: int = 1; i < argc; i++) {
+            const arg: string = argv[i];
+            if (arg == "--time-trace") {
+                requested = Option::Some(String::from("."));
+            } else if (arg.starts_with("--time-trace=")) {
+                requested = Option::Some(String::from_string(arg.strip_prefix("--time-trace=")));
+            }
+        }
+        match (requested) {
+            Option::Some(path) => { TimeTrace::start(path.as_str()); }
+            Option::None       => { }
+        }
+    }
+
+    /// Write the trace, when it is on.  A file that cannot be written is
+    /// reported on stderr; the run's own outcome is unchanged.
+    static finish() -> void {
+        if (g_time_trace == null) { return; }
+        const recorder: mut TraceRecorder* = g_time_trace;
+        g_time_trace = null;
+        mut events: [JsonValue] = [];
+        for (mut t: u32 = 0; t < recorder.threads; t++) {
+            mut thread_name: JsonObject = JsonObject::new();
+            thread_name.put("name", JsonValue::String(
+                if (t == 0) { String::from("main") } else { f"codegen worker {t - 1}" }));
+            mut metadata: JsonObject = JsonObject::new();
+            metadata.put("name", JsonValue::String(String::from("thread_name")));
+            metadata.put("ph", JsonValue::String(String::from("M")));
+            metadata.put("pid", JsonValue::int_value(1));
+            metadata.put("tid", JsonValue::uint_value(t as u64));
+            metadata.put("args", JsonValue::Object(thread_name));
+            events.push(JsonValue::Object(metadata));
+        }
+        for (mut s: u64 = 0; s < recorder.span_count; s++) {
+            const span: TraceSpan* = &recorder.spans[s];
+            mut args: JsonObject = JsonObject::new();
+            if (span.detail_length > 0) {
+                args.put("detail", JsonValue::String(String::from_str(
+                    recorder.text_at(span.detail_at, span.detail_length))));
+            }
+            mut event: JsonObject = JsonObject::new();
+            event.put("name", JsonValue::String(String::from_str(
+                recorder.text_at(span.name_at, span.name_length))));
+            event.put("cat", JsonValue::String(String::from(span.category)));
+            event.put("ph", JsonValue::String(String::from("X")));
+            event.put("ts", JsonValue::Number(JsonNumber::Float(
+                (span.start_ns - recorder.origin_ns) as f64 / 1000.0)));
+            event.put("dur", JsonValue::Number(JsonNumber::Float(span.duration_ns as f64 / 1000.0)));
+            event.put("pid", JsonValue::int_value(1));
+            event.put("tid", JsonValue::uint_value(span.thread as u64));
+            event.put("args", JsonValue::Object(args));
+            events.push(JsonValue::Object(event));
+        }
+        mut document: JsonObject = JsonObject::new();
+        document.put("traceEvents", JsonValue::Array(events));
+        document.put("displayTimeUnit", JsonValue::String(String::from("ms")));
+        const text: String = serializer::stringify(&JsonValue::Object(document));
+        match (File::write_text(Path::from(recorder.path.as_str()), text.as_str())) {
+            Result::Ok(_)  => { }
+            Result::Err(error) => {
+                fmt::eprintln(f"warning: cannot write the time trace '{recorder.path.as_str()}': {error}");
+            }
+        }
+    }
+
+    /// Begin recording, to the file `requested` names (see the module text).
+    private static start(requested: Str) -> void {
+        const file_name: String = f"cryo-time-trace-{process::id()}.json";
+        const path: String =
+            if (Path::from(requested).is_directory()) {
+                String::from_str(Path::from(requested).join(file_name.as_str()).as_path().as_str())
+            } else {
+                String::from_str(requested)
+            };
+        g_time_trace = Box::new(TraceRecorder {
+            path:          path,
+            origin_ns:     Instant::now().as_nanos(),
+            spans:         null,
+            span_count:    0,
+            span_capacity: 0,
+            text:          null,
+            text_length:   0,
+            text_capacity: 0,
+            threads:       1,
+        }).into_raw();
+    }
+}

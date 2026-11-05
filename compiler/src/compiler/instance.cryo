@@ -35,6 +35,7 @@ import compiler::diag::source_span::{ ProgramFileNames };
 import compiler::lex::lexer;
 import utils;
 import utils::log::{ Log, LogArea, LogLevel };
+import utils::time_trace::{ TimeTrace };
 import std::fmt;
 import std::fs::path::{ Path };
 import std::env;
@@ -932,12 +933,14 @@ type struct CompilerInstance {
         // to cryoconfig); we surface a hard error rather than dropping
         // dep roots and reporting confusing "namespace not found"
         // diagnostics later.
+        mut stage_start: i64 = TimeTrace::now();
         const lock_path: string = CompilerInstance::lock_path_for(config.project_root);
         const dep_outcome: ResolveOutcome = DepResolver::resolve(
             &config, ResolveMode::Build, lock_path);
         if (dep_outcome.failed) {
             return CompilationResult::failed(1, 0);
         }
+        TimeTrace::span("stage", Str::new("resolve dependencies"), Str::new(config.project_name), stage_start);
         for (mut dr: i64 = 0; dr < dep_outcome.roots.length(); dr++) {
             effective_roots.push(dep_outcome.roots[dr].path);
             Log::debug(LogArea::Deps, f"dependency scan root {dep_outcome.roots[dr].path} ({dep_outcome.roots[dr].name})");
@@ -978,9 +981,11 @@ type struct CompilerInstance {
         loader.set_lsp_overrides(overlays);
         loader.set_options(&ctx.options);
 
+        stage_start = TimeTrace::now();
         const discovery_ok: boolean = loader.discover_project(
             ctx.intern_table, ctx.module_graph, ctx.diagnostics,
             root_path);
+        TimeTrace::span("stage", Str::new("discover modules"), Str::new(config.project_name), stage_start);
 
         if (!discovery_ok) {
             // Flush deferred diagnostics so the user actually SEES the
@@ -1111,6 +1116,7 @@ type struct CompilerInstance {
         }
 
         Log::debug(LogArea::Loader, f"discovered {ctx.module_graph.module_count()} modules");
+        stage_start = TimeTrace::now();
         ctx.module_graph.resolve_edges();
 
         // Classify each discovered module's origin from its file_path so
@@ -1251,6 +1257,7 @@ type struct CompilerInstance {
             }
             ctx.module_graph.set_visible_modules(imi as i64, imi_visible);
         }
+        TimeTrace::span("stage", Str::new("module graph"), Str::new(config.project_name), stage_start);
 
         // Experimental gate: consuming a C++ vendor library (binding_source
         // "cxx-headers" / language "c++") requires opting in via
@@ -1349,6 +1356,7 @@ type struct CompilerInstance {
             && !ctx.options.output.is_unlinked_artifact()
             && !ctx.options.freestanding() && !ctx.options.native_heap()
             && LinkerConfig::linker_config_for_triple(ctx.options.target_triple).supported;
+        stage_start = TimeTrace::now();
         if (links_prebuilt_stdlib) {
             match (PrebuiltStdlib::ensure(stdlib_root, ctx.options.target_triple,
                     ctx.options.opt_level, ctx.options.debug_info, ctx.options.unwinds())) {
@@ -1364,6 +1372,7 @@ type struct CompilerInstance {
                 }
             }
         }
+        TimeTrace::span("stage", Str::new("open the stdlib archive"), Str::new(config.project_name), stage_start);
 
         // Incremental whole-build fingerprint + short-circuit.
         //
@@ -1401,6 +1410,7 @@ type struct CompilerInstance {
         mut pm_prior:     build_manifest::ModuleKeyTable = compiler::build_manifest::ModuleKeyTable::empty();
         mut pm_reused:    u32        = 0;
         mut pm_emitted:   u32        = 0;
+        stage_start = TimeTrace::now();
         if (do_incremental) {
             for (mut i: u32 = 0; i < n; i++) {
                 const minfo: ModuleInfo* = &ctx.module_graph.modules[order[i]];
@@ -1457,12 +1467,14 @@ type struct CompilerInstance {
                 } else {
                     ""
                 };
+                TimeTrace::span("stage", Str::new("build fingerprint"), Str::new(config.project_name), stage_start);
                 fmt::println(f"{config.project_name} is up to date ({config.profile})");
                 mut utd_result: CompilationResult = CompilationResult::ok(up_to_date_out);
                 utd_result.stdlib_root = ctx.options.stdlib_root;
                 return utd_result;
             }
         }
+        TimeTrace::span("stage", Str::new("build fingerprint"), Str::new(config.project_name), stage_start);
 
         // -- Per-target arena: ACTIVATE ----------------------------------
         // From here through linking, every `[T]`/`HashMap`/`Box`/`String`
@@ -1510,17 +1522,21 @@ type struct CompilerInstance {
 
         // Run each stage across ALL modules before advancing to the next; see
         // the stage-driver block below for why the ordering is load-bearing.
+        stage_start = TimeTrace::now();
         if (!this.run_frontend(ctx, &pipeline, ast_buf)) {
             return this.project_failure_release(ctx, ast_buf);
         }
         ctx.frontend_complete = true;
+        TimeTrace::span("stage", Str::new("parse"), Str::new(config.project_name), stage_start);
+        stage_start = TimeTrace::now();
         if (!this.run_module_resolution(ctx, &pipeline, ast_buf)) {
             return this.project_failure_release(ctx, ast_buf);
         }
+        TimeTrace::span("stage", Str::new("resolve names"), Str::new(config.project_name), stage_start);
+        stage_start = TimeTrace::now();
         if (!this.collect_type_declarations(ctx, &pipeline, ast_buf)) {
             return this.project_failure_release(ctx, ast_buf);
         }
-
         if (!this.register_templates(ctx, &pipeline, ast_buf)) {
             return this.project_failure_release(ctx, ast_buf);
         }
@@ -1530,6 +1546,7 @@ type struct CompilerInstance {
         if (!this.resolve_types(ctx, &pipeline, ast_buf)) {
             return this.project_failure_release(ctx, ast_buf);
         }
+        TimeTrace::span("stage", Str::new("declare and resolve types"), Str::new(config.project_name), stage_start);
 
         tm_frontend_end = Instant::now().as_nanos();
 
@@ -1537,12 +1554,15 @@ type struct CompilerInstance {
         // directives (layout flags) -> body typecheck (mono-after-sema) ->
         // monomorphization.  Each must complete for EVERY module before the
         // next begins (see the stage-driver block for the invariants).
+        stage_start = TimeTrace::now();
         if (!this.process_directives(ctx, &pipeline, ast_buf)) {
             return this.project_failure_release(ctx, ast_buf);
         }
         if (!this.typecheck_bodies(ctx, &pipeline, ast_buf)) {
             return this.project_failure_release(ctx, ast_buf);
         }
+        TimeTrace::span("stage", Str::new("check bodies"), Str::new(config.project_name), stage_start);
+        stage_start = TimeTrace::now();
         if (!this.monomorphize(ctx, &pipeline, ast_buf)) {
             return this.project_failure_release(ctx, ast_buf);
         }
@@ -1592,6 +1612,7 @@ type struct CompilerInstance {
         }
 
         tm_mono_end = Instant::now().as_nanos();
+        TimeTrace::span("stage", Str::new("monomorphize"), Str::new(config.project_name), stage_start);
 
         // Per-module incremental cache.  Every module is analysed and has its
         // IR generated in every build; what a module served from the cache
@@ -1642,6 +1663,7 @@ type struct CompilerInstance {
         }
 
         mut phase6_failed: boolean = false;
+        stage_start = TimeTrace::now();
         for (mut i: u32 = 0; i < n; i++) {
             CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
             ctx.provisions.clear();
@@ -1664,6 +1686,7 @@ type struct CompilerInstance {
         }
 
         tm_sema_end = Instant::now().as_nanos();
+        TimeTrace::span("stage", Str::new("validate, move-check and lower"), Str::new(config.project_name), stage_start);
 
         // Dump ASTs if requested (even on errors, for debugging)
         if (this.config.show_ast) {
@@ -1882,14 +1905,16 @@ type struct CompilerInstance {
                         llvm_module: null, llvm_context: null, tm: null,
                         emit_path: "", emit_type: LFileType::Object, triple: "",
                         opt_level: 0, should_register: false,
-                        optimization_failed: false, ok: false, err_msg: null as string
+                        optimization_failed: false, ok: false, err_msg: null as string,
+                        optimize_start_ns: 0, emit_start_ns: 0, end_ns: 0, thread: 0
                     });
                     cg_done.push(Atomic::<u32>::new(0));
                 }
                 for (mut w: u32 = 0; w < cg_threads; w++) {
                     cg_pool.spawn::<EmitQueue>(EmitQueue {
                         jobs: cg_jobs.as_mutable_ptr(), done: cg_done.as_mutable_ptr(),
-                        cursor: &cg_cursor, published: &cg_published, closed: &cg_closed
+                        cursor: &cg_cursor, published: &cg_published, closed: &cg_closed,
+                        worker: w
                     }, emit_queue_worker);
                 }
             }
@@ -2132,7 +2157,11 @@ type struct CompilerInstance {
                     should_register: tgt.should_register,
                     optimization_failed: false,
                     ok:              false,
-                    err_msg:         null as string
+                    err_msg:         null as string,
+                    optimize_start_ns: 0,
+                    emit_start_ns:   0,
+                    end_ns:          0,
+                    thread:          0
                 };
                 cg_pos.push(i);
                 // Detach the module from ctx (the job owns it now); do NOT
@@ -2241,6 +2270,7 @@ type struct CompilerInstance {
             }
 
             tm_codegen_end = Instant::now().as_nanos();
+            TimeTrace::span("stage", Str::new("generate and emit code"), Str::new(config.project_name), tm_sema_end);
 
             // test-main synthesis: synthesize the test-runner main when in test mode.
             // Walks the directive registry for `![test]` records, builds
@@ -2324,6 +2354,7 @@ type struct CompilerInstance {
                 }
             }
             tm_link_end = Instant::now().as_nanos();
+            TimeTrace::span("stage", Str::new("link"), Str::new(config.project_name), tm_codegen_end);
         }
 
         // A stage required a node's `Res` and no resolver had written one.
@@ -3330,7 +3361,7 @@ type struct CompilerInstance {
     static emit_jobs_serial(jobs: mut [EmitJob]*) -> void {
         const cnt: i64 = (*jobs).length() as i64;
         for (mut j: i64 = 0; j < cnt; j++) {
-            codegen_emit_job(&(*jobs)[j]);
+            codegen_emit_job(&(*jobs)[j], 0);
             CompilerInstance::dispose_emit_job(&(*jobs)[j]);
         }
     }
@@ -3403,6 +3434,13 @@ type struct CompilerInstance {
                                positions: [u32]*, objects: mut [string]*) -> void {
         for (mut b: i64 = 0; b < (*jobs).length() as i64; b++) {
             const job: EmitJob* = &(*jobs)[b];
+            if (TimeTrace::enabled()) {
+                const object_name: Str = Str::new(job.emit_path);
+                TimeTrace::span_between("codegen", Str::new("optimize"), object_name,
+                    job.optimize_start_ns, job.emit_start_ns, job.thread);
+                TimeTrace::span_between("codegen", Str::new("emit object"), object_name,
+                    job.emit_start_ns, job.end_ns, job.thread);
+            }
             const reason: String = LTargetMachine::take_message(job.err_msg as i8*);
             if (job.optimization_failed) {
                 CodegenPasses::report_optimization_failure(ctx, job.emit_path);

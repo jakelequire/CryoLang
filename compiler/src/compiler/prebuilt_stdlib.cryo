@@ -27,6 +27,7 @@ import compiler::build_manifest::{ ContentHasher, Manifest };
 import compiler::codegen::{ llvm };
 import compiler::codegen::llvm_types::{ LModule, LValue };
 import utils::log::{ Log, LogArea };
+import utils::time_trace::{ TimeTrace };
 import std::fmt;
 import std::thread;
 import std::core::hash::{ Hasher };
@@ -107,7 +108,9 @@ type struct PrebuiltStdlib {
         const triple: string = triple_text;
         mut h: ContentHasher = ContentHasher::new();
         h.fold(MANIFEST_FORMAT);
+        const compiler_start: i64 = TimeTrace::now();
         h.fold(Manifest::compiler_fingerprint());
+        TimeTrace::span("stage", Str::new("compiler fingerprint"), Str::new(""), compiler_start);
         h.fold(triple);
         h.fold(opt_level as u64);
         h.fold(debug_info);
@@ -240,10 +243,17 @@ type struct PrebuiltStdlib {
                   debug_info: boolean, unwinds: boolean) -> Result<PrebuiltStdlib, String> {
         const stdlib_root: string = stdlib_root_text;
         const triple: string = triple_text;
+        const key_start: i64 = TimeTrace::now();
         const key: string = PrebuiltStdlib::key_of(stdlib_root, triple, opt_level, debug_info, unwinds);
+        TimeTrace::span("stage", Str::new("stdlib archive key"), Str::new(key), key_start);
         const directory: string = PrebuiltStdlib::directory_for(stdlib_root, triple, key);
+        const open_start: i64 = TimeTrace::now();
         match (PrebuiltStdlib::open(directory, key)) {
-            Option::Some(found) => { found.record_use(); return Result::Ok(found); }
+            Option::Some(found) => {
+                TimeTrace::span("stage", Str::new("read the stdlib archive manifest"), Str::new(key), open_start);
+                found.record_use();
+                return Result::Ok(found);
+            }
             Option::None => { }
         }
         const lock: string = directory + ".lock";
