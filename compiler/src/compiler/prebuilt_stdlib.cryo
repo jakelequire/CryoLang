@@ -10,8 +10,11 @@
 ///! and links the archive.
 ///!
 ///! The archive is exact by its key: the compiler's own bytes, every stdlib
-///! source, the stdlib root as spelled (panic locations embed it), the
-///! target and the code-shaping options.  It lives in a directory named by
+///! source by its path below the root, the target and the code-shaping
+///! options.  Where the stdlib lives is no part of it: the archive names
+///! its files relative to the root, so an archive built from one copy of the
+///! stdlib is linked from another, which is how a release ships them built.
+///! It lives in a directory named by
 ///! the key, so a change to any of them names a directory that does not
 ///! exist yet, and the build makes it by running the stdlib's build with the
 ///! same compiler and options.  An archive whose manifest records another
@@ -38,7 +41,7 @@ import std::process::command::{ Command, Output };
 import std::time::clock::{ SystemTime };
 
 const MANIFEST_NAME:   string = "stdlib.manifest";
-const MANIFEST_FORMAT: string = "cryo-stdlib-manifest 1";
+const MANIFEST_FORMAT: string = "cryo-stdlib-manifest 2";
 const ARCHIVE_NAME:    string = "libcryo.a";
 
 /// Startup code runs lowest priority first; LLVM reserves those below 101.
@@ -54,7 +57,7 @@ const LOCK_EXPIRY_SECONDS: i64 = 600;
 
 /// How many archives a stdlib root keeps per target: one per compiler and
 /// option set in use at once (a selfhost's stages, verify's two compilers
-/// under two stdlib spellings).
+/// under two option sets).
 const ARCHIVES_KEPT: i64 = 6;
 
 /// An archive used this recently is kept whatever newer ones exist: longer
@@ -95,6 +98,9 @@ type struct PrebuiltStdlib {
 
     /// The key of the archive a build with these options links: every input
     /// that decides the archive's bytes.
+    /// The root's own spelling is no input: the archive names every stdlib
+    /// file relative to it (`ProgramFileNames`), so one built from a copy of
+    /// the stdlib anywhere is the archive this one would build.
     static key_of(stdlib_root_text: string, triple_text: string, opt_level: u32,
                   debug_info: boolean, unwinds: boolean) -> string {
         const stdlib_root: string = stdlib_root_text;
@@ -102,7 +108,6 @@ type struct PrebuiltStdlib {
         mut h: ContentHasher = ContentHasher::new();
         h.fold(MANIFEST_FORMAT);
         h.fold(Manifest::compiler_fingerprint());
-        h.fold(stdlib_root);
         h.fold(triple);
         h.fold(opt_level as u64);
         h.fold(debug_info);
@@ -522,12 +527,11 @@ type struct PrebuiltStdlib {
 
     /// Write the manifest of the archive in `directory`, the stdlib's own
     /// build's records in build order.  Answers the failure, or "".
-    static write_manifest(directory_text: string, key_text: string, stdlib_root_text: string,
+    static write_manifest(directory_text: string, key_text: string,
                           triple_text: string, opt_level: u32, debug_info: boolean,
                           unwinds: boolean, modules: &[ArchivedModule]) -> string {
         const directory: string = directory_text;
         const key: string = key_text;
-        const stdlib_root: string = stdlib_root_text;
         const triple: string = triple_text;
         if (modules.length() as u32 > STDLIB_STARTUP_SLOTS) {
             return fmt::format("the stdlib has %d modules and its startup code is ordered in %u places",
@@ -537,8 +541,6 @@ type struct PrebuiltStdlib {
         text.push(Str::new(MANIFEST_FORMAT));
         text.push_byte(10 as u8);
         text.push(Str::new("key " + key));
-        text.push_byte(10 as u8);
-        text.push(Str::new("root " + stdlib_root));
         text.push_byte(10 as u8);
         // What the key folds besides the compiler and the sources, readable.
         text.push(Str::new(fmt::format("options %s O%u %s %s", triple, opt_level,

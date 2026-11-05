@@ -511,10 +511,12 @@ with no diff to check it against.
 - **Every program links the stdlib from `stdlib/.bin/<triple>/prebuilt/<key>/`**
   - the pin building the compiler too; there is no `make stdlib` - an archive
   the compiler builds on first use by running the stdlib's own build with
-  itself; the key is the compiler's bytes, every stdlib source,
-  the stdlib root AS SPELLED, the target and the code-shaping options, so a
-  compiler rebuild or a stdlib edit means one ~8 s archive build on the next
-  program build. Each use rewrites the archive's `last-use`; a build that
+  itself; the key is the compiler's bytes, every stdlib source, the target
+  and the code-shaping options, so a compiler rebuild or a stdlib edit means
+  one ~8 s archive build on the next program build. Where the stdlib lives is
+  NOT in the key: programs name stdlib files `stdlib/<path below the root>`
+  in panics and debug info, so an archive is the same bytes from any copy of
+  the stdlib, and a release ships the default profiles' archives built. Each use rewrites the archive's `last-use`; a build that
   makes a new one removes those beyond the six used most recently, never one
   used within the hour (a concurrent build may be about to link it). The
   archive is built in place under `<key>.lock` and opens only once its

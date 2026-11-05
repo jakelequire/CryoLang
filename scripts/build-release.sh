@@ -29,10 +29,11 @@
 # WINDOWS is NOT static (no official static windows-gnu libLLVM): the zip
 # ships cryo.exe next to LLVM-C.dll (its runtime dep).
 #
-# Neither ships a compiled stdlib.  An installed compiler builds its stdlib
-# archive under `<stdlib>/.bin/<triple>/prebuilt/` on first use, keyed by the
-# stdlib root as installed, so one built here - under the staging path - would
-# never be linked; the smoke's is removed before packaging.
+# Both ship the stdlib archives of the default profiles (release and --dev),
+# built by the shipped compiler under `stdlib/.bin/<triple>/prebuilt/`.  An
+# archive's key is the compiler's bytes, the stdlib's sources and the options,
+# not where the stdlib lives, so an installed compiler links them as they are;
+# any other profile it builds on first use.
 
 set -euo pipefail
 
@@ -144,9 +145,42 @@ smoke_stage() {
             exit 1
         fi
     fi
-    env "${smoke_env[@]}" bash "${ROOT}/scripts/release-smoke.sh" "$stage" "$exe" "${runner[@]}"
-    # The archive the smoke built is keyed by the staging path.
+    # The first smoke builds the stdlib archives of the default profiles with
+    # the staged compiler; they ship.  The second runs from a copy of the tree
+    # in another directory, as an install is, and must link them as shipped:
+    # an archive it rebuilt, or one more, is one every installed compiler
+    # would build again.
     rm -rf "${stage}/stdlib/.bin"
+    env "${smoke_env[@]}" bash "${ROOT}/scripts/release-smoke.sh" "$stage" "$exe" "${runner[@]}"
+    trim_stdlib_archives "$stage"
+    local moved="${stage}.moved" shipped
+    rm -rf "$moved"
+    cp -R "$stage" "$moved"
+    shipped="$(cd "${stage}/stdlib" && find .bin -type f | sort | xargs sha256sum)"
+    env "${smoke_env[@]}" bash "${ROOT}/scripts/release-smoke.sh" "$moved" "$exe" "${runner[@]}"
+    find "${moved}/stdlib/.bin" -name last-use -delete
+    [ "$shipped" = "$(cd "${moved}/stdlib" && find .bin -type f | sort | xargs sha256sum)" ] \
+        || { echo "error: a copy of the staged tree elsewhere did not link the shipped stdlib archives as they are" >&2; exit 1; }
+    rm -rf "$moved"
+}
+
+trim_stdlib_archives() {
+    # $1 = staging dir.  Keeps what a program's link reads from each archive
+    # directory: the archive, its manifest, and the objects of the modules
+    # with startup code, which the link names on its own.  The stdlib build's
+    # other objects, its IR and its incremental records are left behind.
+    local stage="$1" home keep file
+    for home in "${stage}"/stdlib/.bin/*/prebuilt/*/; do
+        [ -f "${home}stdlib.manifest" ] || { echo "error: ${home} holds no stdlib manifest" >&2; exit 1; }
+        keep="$(awk '$1 == "module" && $3 == "1" { print $5 }' "${home}stdlib.manifest")"
+        while IFS= read -r file; do
+            case "${file#"$home"}" in
+                libcryo.a|stdlib.manifest) ;;
+                *) printf '%s\n' "$keep" | grep -qxF "${file#"$home"}" || rm -f "$file" ;;
+            esac
+        done < <(find "$home" -type f)
+        find "$home" -type d -empty -delete
+    done
 }
 
 host_is() {   # $1 = linux|windows

@@ -195,9 +195,8 @@ def wipe_population():
 
 def prebuilt_rows():
     """sha256 rows of every object in the stdlib archives the run built, each
-    named by its target, the stdlib root its manifest was keyed with (the
-    census and the examples spell it differently) and its path in the build,
-    so two compilers' archives line up whatever their keys."""
+    named by its target, the options its manifest records and its path in the
+    build, so two compilers' archives line up whatever their keys."""
     rows = []
     labels = {}
     for pre in prebuilt_dirs():
@@ -209,11 +208,10 @@ def prebuilt_rows():
                 continue
             with io.open(manifest, encoding="utf-8", errors="replace") as fh:
                 head = fh.read(4096).splitlines()
-            root = next((l[5:].strip() for l in head if l.startswith("root ")), "?")
             options = next((l[8:].strip() for l in head if l.startswith("options ")), "?")
-            label = "stdlib-archive/%s/%s" % (triple, re.sub(r"[^\w.-]+", "_", root + " " + options))
+            label = "stdlib-archive/%s/%s" % (triple, re.sub(r"[^\w.-]+", "_", options))
             if label in labels:
-                raise SystemExit("verify: two stdlib archives, %s and %s, record the same root and "
+                raise SystemExit("verify: two stdlib archives, %s and %s, record the same "
                                  "options; their objects cannot be told apart"
                                  % (rel(labels[label]), rel(home)))
             labels[label] = home
@@ -1113,9 +1111,10 @@ def main():
         print("verify: FAIL -- a baseline comparison needs the census and examples runs")
         return 1
 
-    # Objects embed stdlib source paths exactly as the stdlib root was spelled
-    # (panic locations), so the same source compiles to different bytes under
-    # `C:\...\stdlib`, `C:/.../stdlib` and `./../stdlib`.  Each gate therefore
+    # A baseline compiler may embed stdlib source paths exactly as the stdlib
+    # root was spelled (panic locations), so the same source compiles to
+    # different bytes under `C:\...\stdlib`, `C:/.../stdlib` and
+    # `./../stdlib`; the tree's names them below the root.  Each gate therefore
     # sees the stdlib the way its own flow always has: the census with no
     # CRYO_STDLIB (tests/ finds it relative to the project, whichever binary
     # runs, as `make test` does), the examples sweep with the absolute

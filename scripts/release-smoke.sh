@@ -81,29 +81,36 @@ APP
 # smoke would pass on a machine where the shipped stdlib is missing entirely.
 export CRYO_STDLIB="${STAGE}/stdlib"
 
-echo "release-smoke: building a hello-world with ${CRYO}"
-if ! ( cd "$WORK/app" && "${RUNNER[@]}" "$CRYO" build > "$WORK/build.log" 2>&1 ); then
-    echo "--- build output ---" >&2
-    tail -30 "$WORK/build.log" >&2
-    fail "the staged compiler could not build a hello-world"
-fi
+# Once per default profile, so the stdlib archive each links is exercised (and,
+# in a tree that ships none yet, built: build-release.sh ships what this makes).
+for PROFILE in release dev; do
+    FLAGS=()
+    [ "$PROFILE" = dev ] && FLAGS=(--dev)
+    echo "release-smoke: building a hello-world with ${CRYO} (${PROFILE})"
+    rm -rf "$WORK/app/build"
+    if ! ( cd "$WORK/app" && "${RUNNER[@]}" "$CRYO" build "${FLAGS[@]}" > "$WORK/build.log" 2>&1 ); then
+        echo "--- build output ---" >&2
+        tail -30 "$WORK/build.log" >&2
+        fail "the staged compiler could not build a hello-world (${PROFILE})"
+    fi
 
-BIN="$WORK/app/build/release-smoke.exe"
-[ -f "$BIN" ] || BIN="$WORK/app/build/release-smoke"
-[ -f "$BIN" ] || fail "the build reported success but produced no binary"
+    BIN="$WORK/app/build/release-smoke.exe"
+    [ -f "$BIN" ] || BIN="$WORK/app/build/release-smoke"
+    [ -f "$BIN" ] || fail "the build reported success but produced no binary (${PROFILE})"
 
-set +e
-OUT="$("${RUNNER[@]}" "$BIN" 2>&1)"
-CODE=$?
-set -e
+    set +e
+    OUT="$("${RUNNER[@]}" "$BIN" 2>&1)"
+    CODE=$?
+    set -e
 
-case "$OUT" in
-    *"release-smoke ok"*) ;;
-    *) fail "the program ran but printed [$OUT]" ;;
-esac
-# 7 rather than 0: an exit code the runtime has to carry back from `main`, so a
-# core tier that dropped the entry shim cannot pass by exiting 0 for its own
-# reasons.
-[ "$CODE" -eq 7 ] || fail "the program exited ${CODE}, expected 7 (the entry did not carry main's return)"
+    case "$OUT" in
+        *"release-smoke ok"*) ;;
+        *) fail "the program ran but printed [$OUT] (${PROFILE})" ;;
+    esac
+    # 7 rather than 0: an exit code the runtime has to carry back from `main`,
+    # so a core tier that dropped the entry shim cannot pass by exiting 0 for
+    # its own reasons.
+    [ "$CODE" -eq 7 ] || fail "the program exited ${CODE}, expected 7 (the entry did not carry main's return) (${PROFILE})"
+done
 
-echo "release-smoke: OK -- built, ran, printed and exited 7 using only the staged tree"
+echo "release-smoke: OK -- built, ran, printed and exited 7 under both default profiles using only the staged tree"

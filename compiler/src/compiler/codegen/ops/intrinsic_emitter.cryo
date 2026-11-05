@@ -28,7 +28,7 @@ import compiler::codegen::llvm_types::{
 };
 import compiler::codegen::abi::{ AbiClassifier };
 import compiler::intrinsic_kind::{ IntrinsicKind };
-import compiler::diag::source_span::{ SourceSpan };
+import compiler::diag::source_span::{ ProgramFileNames, SourceSpan };
 import std::ffi::libc;
 import compiler::resolver::mangled_name::{ MangledName };
 
@@ -45,13 +45,16 @@ type struct IntrinsicEmitter {
     /// `emit_panic_call` diverges through `llvm.trap` (`ud2`) instead of the
     /// funnel.  Wired from `ctx.options.freestanding()`.
     no_runtime:  boolean;
+    /// The name a `Location`'s file is written under.
+    file_names:  ProgramFileNames;
 
     /// The readable qualified name of the function whose body is emitted,
     /// the `function` of a `Location` made in it.
     function_name: string;
     /// The string constants a `Location` made in this function points at,
     /// made once per function and shared by every place in it: the
-    /// function's name, and the file last asked for with its text.
+    /// function's name, and the file last asked for (as its spans spell it)
+    /// with its written name.
     function_name_global: LValue;
     location_file:        string;
     location_file_global: LValue;
@@ -62,6 +65,7 @@ type struct IntrinsicEmitter {
             builder:      null,
             abi:          null,
             no_runtime:   false,
+            file_names:   ProgramFileNames::new(""),
             function_name:       "",
             function_name_global: LValue::null(),
             location_file:        "",
@@ -88,7 +92,8 @@ type struct IntrinsicEmitter {
         if (file == null || file.length() == 0) { file = "<unknown>"; }
         if (!this.location_file_global.is_valid() || this.location_file != file) {
             this.location_file = file;
-            this.location_file_global = this.builder.build_global_string_ptr(file, "location.file");
+            this.location_file_global =
+                this.builder.build_global_string_ptr(this.file_names.name_of(file), "location.file");
         }
         if (!this.function_name_global.is_valid()) {
             this.function_name_global =
@@ -120,11 +125,12 @@ type struct IntrinsicEmitter {
     }
 
     wire(mut &this, llvm_module: LModule*, builder: LBuilder*,
-         abi: AbiClassifier*, no_runtime: boolean) -> void {
+         abi: AbiClassifier*, no_runtime: boolean, file_names: ProgramFileNames) -> void {
         this.llvm_module = llvm_module;
         this.builder     = builder;
         this.abi         = abi;
         this.no_runtime  = no_runtime;
+        this.file_names  = file_names;
     }
 
 

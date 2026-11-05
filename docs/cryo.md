@@ -982,6 +982,8 @@ type struct Location {
 }
 ```
 
+A file of the standard library is named `stdlib/` followed by its path below the stdlib's root (`stdlib/core/option.cryo`), wherever the stdlib lives, so the stdlib's compiled code is the same in every installation.
+
 Only the compiler makes a `Location`: its fields are private, so a program reads a place through these methods and cannot build one or change one (E0353).
 
 Each call answers the place it is written: the line and column of the call itself, and the function it is written in, named by its qualified path (`App::Main::main`, `App::Main::Probe::own`), never by its linker symbol. Two calls on one line answer two columns. Code the compiler moves into a function of its own is named for the function it is written in: a lambda's or a closure's body names the enclosing function, an `async function`'s body the async function, and every specialization of a generic function or method the generic as written (`App::Main::Holder::at`).
@@ -4659,9 +4661,14 @@ An executable takes the standard library's code from an archive the stdlib
 is compiled into once, in `<stdlib>/.bin/<triple>/prebuilt/<key>/`: its
 `std/` objects hold only the generic instances the archive lacks, and a
 library a `[[bin]]` derives from its own objects holds the same.  The key is
-the compiler, every stdlib source, the stdlib root as spelled, the target and
-the optimization, debug-info and panic settings; when no archive has the
-build's key, the compiler builds one first, with itself.  A build on the
+the compiler, every stdlib source, the target and the optimization,
+debug-info and panic settings; when no archive has the build's key, the
+compiler builds one first, with itself.  Where the stdlib lives is no part
+of the key: a program names a stdlib file `stdlib/` followed by its path
+below the stdlib's root, in a panic's location and in debug info, so an
+archive is the same bytes whichever copy of the stdlib it was built from, and
+a release ships the archives of the default profiles (release and `--dev`)
+built.  A build on the
 native heap (`native_alloc`), and a `[lib]` built on its own, compile the
 stdlib modules they reach.
 
