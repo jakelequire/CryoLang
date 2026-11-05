@@ -64,6 +64,9 @@ import std::json::value::{ JsonObject, JsonValue };
 mut g_compiler_fingerprint: u128 = 0;
 mut g_compiler_fingerprint_taken: boolean = false;
 
+/// The `*.modkeys` field marking a module whose build wrote no object.
+const OBJECTLESS_MARK: string = "none";
+
 const CONTENT_C1: u64 = 0x87c37b91114253d5;
 const CONTENT_C2: u64 = 0x4cf5ad432745937f;
 
@@ -203,14 +206,28 @@ type struct ModuleEntry {
 
 
 /// Prior per-module cache keys, loaded from the `*.modkeys` sidecar. Parallel
-/// `names`/`keys` arrays; `lookup` returns the stored key hex for a namespace
-/// or "" when absent (a never-before-seen module always rebuilds).
+/// `names`/`keys`/`objectless` arrays; `lookup` returns the stored key hex for
+/// a namespace or "" when absent (a never-before-seen module always rebuilds).
+/// `objectless` marks a module whose build wrote no object - a stdlib module
+/// the stdlib archive leaves empty - which is as reusable as one whose object
+/// is on disk.
 type struct ModuleKeyTable {
-    names: [string];
-    keys:  [string];
+    names:      [string];
+    keys:       [string];
+    objectless: [boolean];
 
     static empty() -> ModuleKeyTable {
-        return ModuleKeyTable { names: [], keys: [] };
+        return ModuleKeyTable { names: [], keys: [], objectless: [] };
+    }
+
+    /// Whether the module's recorded build wrote no object.
+    produced_no_object(&this, name: string) -> boolean {
+        for (mut i: i64 = 0; i < this.names.length(); i++) {
+            if (this.names[i].eq(name)) {
+                return this.objectless[i];
+            }
+        }
+        return false;
     }
 
     lookup(&this, name: string) -> string {
@@ -254,12 +271,19 @@ type struct ModuleKeyTable {
             while (i < n && data[i] != 9 && data[i] != 10) { i = i + 1; }
             mut name: string = "";
             mut keyh: string = "";
+            mut objectless: boolean = false;
             if (i < n && data[i] == 9) {
                 name = ModuleKeyTable::modkeys_slice(data, name_start, i - name_start);
                 i = i + 1;                       // skip TAB
                 const key_start: u64 = i;
-                while (i < n && data[i] != 10) { i = i + 1; }
+                while (i < n && data[i] != 9 && data[i] != 10) { i = i + 1; }
                 keyh = ModuleKeyTable::modkeys_slice(data, key_start, i - key_start);
+                if (i < n && data[i] == 9) {
+                    i = i + 1;                   // skip TAB
+                    const mark_start: u64 = i;
+                    while (i < n && data[i] != 10) { i = i + 1; }
+                    objectless = ModuleKeyTable::modkeys_slice(data, mark_start, i - mark_start) == OBJECTLESS_MARK;
+                }
             } else {
                 // No TAB before end-of-line: skip the rest of this line.
                 while (i < n && data[i] != 10) { i = i + 1; }
@@ -268,21 +292,27 @@ type struct ModuleKeyTable {
             if (name.length() > 0 && keyh.length() > 0) {
                 t.names.push(name);
                 t.keys.push(keyh);
+                t.objectless.push(objectless);
             }
         }
         return t;
     }
 
-    /// Write the `*.modkeys` sidecar (`namespace<TAB>keyhex` per line). The caller
-    /// must have created the incremental dir (e.g. via `Manifest::write_fingerprint`,
+    /// Write the `*.modkeys` sidecar (`namespace<TAB>keyhex` per line, then
+    /// `<TAB>none` for a module that wrote no object). The caller must have
+    /// created the incremental dir (e.g. via `Manifest::write_fingerprint`,
     /// which always runs alongside this on the success path).
     static write_module_keys(path: string, names: &[string],
-                               keys: &[string]) -> void {
+                               keys: &[string], objectless: &[boolean]) -> void {
         mut text: String = String::new();
         for (mut i: i64 = 0; i < names.length(); i++) {
             text.push(Str::new(names[i]));
             text.push_byte(9 as u8);     // TAB
             text.push(Str::new(keys[i]));
+            if (objectless[i]) {
+                text.push_byte(9 as u8);
+                text.push(Str::new(OBJECTLESS_MARK));
+            }
             text.push_byte(10 as u8);    // LF
         }
         match (File::write_bytes(Path::from(path), text.as_bytes())) {

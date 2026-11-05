@@ -1404,10 +1404,12 @@ type struct CompilerInstance {
         // Per-module incremental cache.  Computed after Specialization (section below),
         // consumed by the SemanticAnalysis/Codegen skip and the success-path sidecar write.
         //   pm_cached[m]   : module index m may reuse its on-disk .o
+        //   pm_objectless[m]: module m wrote no object (reused or built so)
         //   pm_key_names[m]: namespace of module m (parallel to pm_key_hex)
         //   pm_key_hex[m]  : current cache key of module m
         //   pm_active      : the per-module cache is in effect this build
         mut pm_cached:    [boolean] = [];
+        mut pm_objectless: [boolean] = [];
         mut pm_key_names: [string]  = [];
         mut pm_key_hex:   [string]  = [];
         mut pm_active:    boolean    = false;
@@ -1703,7 +1705,11 @@ type struct CompilerInstance {
             // `pm_closure_ok` clears for any module whose import closure came
             // back short; such a module is never served from cache.
             mut pm_closure_ok: [boolean] = [];
-            for (mut m: u32 = 0; m < n; m++) { pm_cached.push(false); pm_closure_ok.push(true); }
+            for (mut m: u32 = 0; m < n; m++) {
+                pm_cached.push(false);
+                pm_objectless.push(false);
+                pm_closure_ok.push(true);
+            }
 
             // Modules the compiler loads on a module's behalf - the prelude,
             // and the f-string runtime when an f-string appears anywhere - are
@@ -1776,7 +1782,8 @@ type struct CompilerInstance {
                 pm_key_hex.push(compiler::build_manifest::Manifest::hex128(k.finish128()));
             }
 
-            // Cached if the prior key matches AND the .o is still on disk.
+            // Cached if the prior key matches AND the .o is still on disk, or
+            // the prior build of that key wrote none.
             if (pm_active) {
                 for (mut m: u32 = 0; m < n; m++) {
                     if (!pm_closure_ok[m as i64]) { continue; }
@@ -1788,8 +1795,10 @@ type struct CompilerInstance {
                             ModuleInfo::origin_subdir(mi.origin, mi.origin_name)))
                         .join(f"{compiler::build_manifest::Manifest::path_module(ctx.intern_table.shown(mi.path().decl_name()))}.o".as_str())
                         .into_raw();
-                    if (Path::from(objp).exists()) {
+                    const objectless: boolean = pm_prior.produced_no_object(pm_key_names[m as i64]);
+                    if (objectless || Path::from(objp).exists()) {
                         pm_cached[m as i64] = true;
+                        pm_objectless[m as i64] = objectless;
                     }
                 }
                 // A rebuilt module copies `![inline]` bodies from the modules
@@ -1800,7 +1809,10 @@ type struct CompilerInstance {
                 }
                 if (any_rebuilt) {
                     for (mut m: u32 = 0; m < n; m++) {
-                        if (pm_inline[m as i64]) { pm_cached[m as i64] = false; }
+                        if (pm_inline[m as i64]) {
+                            pm_cached[m as i64] = false;
+                            pm_objectless[m as i64] = false;
+                        }
                     }
                 }
             }
@@ -2136,6 +2148,7 @@ type struct CompilerInstance {
                 // regenerating IR + emitting it.  Recorded at this topo
                 // position; registered with everything else below.
                 if (pm_active && pm_cached[order[i] as i64]) {
+                    if (pm_objectless[order[i] as i64]) { continue; }
                     cg_obj[i as i64] = Path::from(ctx.project_config.deps_dir_for(
                             ModuleInfo::origin_subdir(_mi.origin, _mi.origin_name)))
                         .join(f"{compiler::build_manifest::Manifest::path_module(_mn)}.o".as_str())
@@ -2235,9 +2248,10 @@ type struct CompilerInstance {
                 }
 
                 if (!keeps_object) {
-                    // An object an earlier build left would be taken for this
-                    // build's by the module cache.
+                    // An object an earlier build left would be linked as this
+                    // build's; the module cache records that there is none.
                     CodegenPasses::remove_previous_output(CodegenPasses::resolve_emit_target(ctx).emit_path);
+                    if (pm_active) { pm_objectless[order[i] as i64] = true; }
                     mut emptied: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
                     emptied.dispose();
                     ctx.artifacts.ir = IROutput::empty();
@@ -2630,7 +2644,7 @@ type struct CompilerInstance {
             if (pm_key_names.length() > 0) {
                 compiler::build_manifest::ModuleKeyTable::write_module_keys(
                     ctx.project_config.module_keys_path(),
-                    &pm_key_names, &pm_key_hex);
+                    &pm_key_names, &pm_key_hex, &pm_objectless);
             }
         }
 

@@ -317,6 +317,9 @@ LLVMValueRef      LLVMBasicBlockAsValue(LLVMBasicBlockRef BB);
  * it, i.e. the block has no predecessors (dead / unreachable). */
 typedef void *LLVMUseRef;
 LLVMUseRef        LLVMGetFirstUse(LLVMValueRef Val);
+LLVMUseRef        LLVMGetNextUse(LLVMUseRef U);
+LLVMValueRef      LLVMGetUser(LLVMUseRef U);
+LLVMValueRef      LLVMIsAGlobalValue(LLVMValueRef Val);
 
 
 /* ===================================================================

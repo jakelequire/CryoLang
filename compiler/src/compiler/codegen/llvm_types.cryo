@@ -296,7 +296,8 @@ type struct LModule {
             while (f != null) {
                 const next_function: mut void* = llvm::LLVMGetNextFunction(f);
                 const candidate: LValue = LValue { raw: f };
-                if (candidate.is_local() && llvm::LLVMGetFirstUse(f) == null) {
+                if (candidate.is_local() && !candidate.has_live_use()) {
+                    candidate.release_dead_uses();
                     llvm::LLVMDeleteFunction(f);
                     removed = true;
                 }
@@ -306,7 +307,8 @@ type struct LModule {
             while (g != null) {
                 const next_global: mut void* = llvm::LLVMGetNextGlobal(g);
                 const candidate: LValue = LValue { raw: g };
-                if (candidate.is_local() && llvm::LLVMGetFirstUse(g) == null) {
+                if (candidate.is_local() && !candidate.has_live_use()) {
+                    candidate.release_dead_uses();
                     llvm::LLVMDeleteGlobal(g);
                     removed = true;
                 }
@@ -911,6 +913,31 @@ type struct LValue {
     is_local(&this) -> boolean {
         const linkage: i32 = llvm::LLVMGetLinkage(this.raw);
         return linkage == LLinkage::Internal as i32 || linkage == LLinkage::Private as i32;
+    }
+
+    /// Whether anything that will be emitted uses this value: an
+    /// instruction, a function or global, or a constant one of those uses.
+    /// A constant expression a deleted body used stays on its operands' use
+    /// lists, used by nothing, until LLVM drops it; it is not a use.
+    has_live_use(&this) -> boolean {
+        mut use: mut void* = llvm::LLVMGetFirstUse(this.raw);
+        while (use != null) {
+            const user: LValue = LValue { raw: llvm::LLVMGetUser(use) };
+            if (llvm::LLVMIsConstant(user.raw) == 0 || llvm::LLVMIsAGlobalValue(user.raw) != null
+                    || user.has_live_use()) {
+                return true;
+            }
+            use = llvm::LLVMGetNextUse(use);
+        }
+        return false;
+    }
+
+    /// Point the dead constant expressions still using this value at undef,
+    /// so it can be deleted with no use left dangling.
+    release_dead_uses(&this) -> void {
+        if (llvm::LLVMGetFirstUse(this.raw) != null) {
+            llvm::LLVMReplaceAllUsesWith(this.raw, llvm::LLVMGetUndef(llvm::LLVMTypeOf(this.raw)));
+        }
     }
 
     /// Whether this function or global is defined here - has a body or an

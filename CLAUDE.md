@@ -523,8 +523,9 @@ with no diff to check it against.
   used within the hour (a concurrent build may be about to link it). The
   archive is built in place under `<key>.lock` and opens only once its
   manifest, renamed into place last, is there. Its stdlib modules'
-  objects hold only the generic instances the archive lacks (most are
-  empty). verify hashes the archives as a third population (`stdlib`); a
+  objects hold only the generic instances the archive lacks, and one left
+  with nothing writes no object (the module cache records that, `none` in
+  its `.modkeys` line, and reuses it). verify hashes the archives as a third population (`stdlib`); a
   baseline compiler that links none leaves that population empty and its
   stdlib modules' objects count as "replaced by the archive".
 - A scratch project outside the repo cannot find the stdlib — set
