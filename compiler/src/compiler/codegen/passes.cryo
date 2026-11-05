@@ -54,20 +54,6 @@ import compiler::resolver::mangled_name::{ MangledName };
 /// suffix.  Built by `linker_config_for_triple` from the resolved
 /// target triple by `run_linking`.
 ///
-/// `use_stdlib_archive`:
-///   - true  (host build): the stdlib was pre-built by `make stdlib`
-///                         into `<stdlib_root>/.bin/libcryo.a` and we
-///                         append it to the link line.
-///   - false (cross-compile today): the host's `libcryo.a` was built
-///                         for the host ABI and is incompatible with
-///                         the target.  The per-build per-target stdlib
-///                         object files are already in
-///                         `ctx.artifacts.object_files` (cryo
-///                         re-compiles every reachable std module
-///                         when target != host), so no archive is
-///                         needed.  Per-triple `libcryo.a` caching is
-///                         future work.
-///
 /// `supported`:
 ///   - true  for triples we know how to drive end-to-end.
 ///   - false for triples where we still want the historic bailout
@@ -76,19 +62,18 @@ type struct LinkerConfig {
     driver:              string;
     exe_suffix:          string;
     extra_system_libs:   string;
-    use_stdlib_archive:  boolean;
     supported:           boolean;
 
     /// Pick the right toolchain for `triple`.  `triple` is the post-
     /// `resolve_effective_triple` value (empty falls back to host).  Today:
     ///
-    ///   - SysV-amd64 host (linux/macos): `cc -lm -lstdc++`, no suffix,
-    ///     archive yes.  `-lstdc++` drags in LLVM-20's C++ runtime, which
+    ///   - SysV-amd64 host (linux/macos): `cc -lm -lstdc++`, no suffix.
+    ///     `-lstdc++` drags in LLVM-20's C++ runtime, which
     ///     the cryo compiler itself needs (libLLVM-20 is C++); ordinary
     ///     cryo programs don't reference it but the symbol set is a no-op
     ///     so keeping it on the host line costs nothing.
     ///   - x86_64 windows-gnu: the driver `windows_gnu_link_driver` names
-    ///     (clang + lld on a POSIX host), `-lm`, `.exe` suffix, archive no.
+    ///     (clang + lld on a POSIX host), `-lm`, `.exe` suffix.
     ///     mingw-w64 ships its own libc/libm equivalents; no C++ runtime to
     ///     pull in for cross-compiled cryo programs.
     ///   - anything else (aarch64, riscv, windows-msvc, ...): unsupported;
@@ -121,7 +106,6 @@ type struct LinkerConfig {
                 // nothing for programs that use neither.
                 exe_suffix:         ".exe",
                 extra_system_libs:  "-lm -lws2_32 -lntdll",
-                use_stdlib_archive: false,
                 supported:          true,
             };
         }
@@ -130,7 +114,6 @@ type struct LinkerConfig {
             driver:             "",
             exe_suffix:         "",
             extra_system_libs:  "",
-            use_stdlib_archive: false,
             supported:          false,
         };
     }
@@ -153,14 +136,13 @@ type struct LinkerConfig {
     ///     because the compiler binary itself isn't relinked here (the
     ///     committed `cryo.exe` is already linked) and ordinary cryo
     ///     programs don't need it.
-    ///   - the rest (`cc` driver, archive yes, supported) is identical.
+    ///   - the rest (`cc` driver, supported) is identical.
     ![target(unix)]
     static host_linker_config() -> LinkerConfig {
         return LinkerConfig {
             driver:             CodegenPasses::pick_link_driver("cc"),
             exe_suffix:         "",
             extra_system_libs:  "-lm -lstdc++",
-            use_stdlib_archive: true,
             supported:          true,
         };
     }
@@ -188,7 +170,6 @@ type struct LinkerConfig {
             driver:             CodegenPasses::pick_link_driver("cc"),
             exe_suffix:         ".exe",
             extra_system_libs:  "-lm -lws2_32 -lntdll",
-            use_stdlib_archive: true,
             supported:          true,
         };
     }
@@ -429,28 +410,6 @@ type struct CodegenPasses {
         return "";
     }
 
-    /// The stdlib archive to link for `triple`.
-    ///
-    /// Prefers `<root>/.bin/<triple>/libcryo.a`.  One archive per target is
-    /// what stops a native build and a build for another target from
-    /// overwriting each other's `libcryo.a` in place -- they are both ar
-    /// archives with the same name, so the loser is not detected until the
-    /// link reports another architecture's objects.
-    ///
-    /// Unlike `runtime_dir_pick` this falls back to the flat path rather than
-    /// to "" when nothing is present: the result is handed to the linker
-    /// either way, so naming the canonical location is what makes a missing
-    /// archive report itself as the file it should have been.
-    static stdlib_archive_path(stdlib_root_text: string, triple_text: string) -> string {
-        const stdlib_root: string = stdlib_root_text;
-        const triple: string = triple_text;
-        const bin_dir: PathBuf = Path::from(stdlib_root).join(".bin");
-        const per_target: string = bin_dir.join(triple).join("libcryo.a").into_raw();
-        if (Path::from(per_target).exists()) {
-            return per_target;
-        }
-        return bin_dir.join("libcryo.a").into_raw();
-    }
 
     /// Locate the directory holding the runtime tier archives for `triple`, or
     /// "" when none can be found (the caller then links no tiers, exactly as
@@ -1505,8 +1464,7 @@ type struct CodegenPasses {
             // Library / stdlib target: no executable to produce, but
             // bundle the per-module .o files into a single archive that
             // executable projects can pick up via `<root>/<output>/lib<name>.a`.
-            // The stdlib target writes `stdlib/.bin/libcryo.a` (canonical
-            // path the executable-link path below looks for).
+            // The stdlib's own build writes `libcryo.a` and its manifest.
             return CodegenPasses::bundle_archive(ctx);
         }
 
@@ -1515,11 +1473,8 @@ type struct CodegenPasses {
 
         // Resolve the toolchain for the effective triple.  For host
         // builds (empty triple, or triple == host) this picks `cc` plus
-        // the historic `-lm -lstdc++` line and tells us to append
-        // `libcryo.a`.  For x86_64 windows-gnu it picks the mingw-w64
-        // driver and tells us NOT to append `libcryo.a` (the per-build
-        // stdlib .o files are already on the link line; the host
-        // archive would be ABI-incompatible).  For triples we don't
+        // the `-lm -lstdc++` line.  For x86_64 windows-gnu it picks the
+        // mingw-w64 driver.  For triples we don't
         // know how to drive end-to-end (aarch64, riscv, windows-msvc,
         // ...) `supported` is false and we keep the historic
         // object-files-only bailout below.
@@ -1680,8 +1635,9 @@ type struct CodegenPasses {
         // `--release-static`: splice the static libLLVM component set
         // (`-L<libdir> -lLLVMCore ... -lrt -ldl -lm -lz -lzstd -lxml2`) from
         // llvm-config in place of the dynamic `-lLLVM-20` skipped above.
-        // Placed before the stdlib archive + system libs so the single-pass
-        // static link order is objects -> LLVM -> libcryo.a -> libm/libstdc++.
+        // Placed after the objects and the stdlib archive and before the
+        // system libs, so the single-pass static link order is objects ->
+        // libcryo.a -> LLVM -> libm/libstdc++.
         if (ctx.options.static_link) {
             const llvm_static: string = CodegenPasses::static_llvm_link_flags(CodegenPasses::pick_llvm_config());
             if (llvm_static.length() == 0) {
@@ -1690,16 +1646,6 @@ type struct CodegenPasses {
                 return PassResult::failure(1);
             }
             cmd = fmt::format("%s %s", cmd, llvm_static);
-        }
-        // A build that compiles the stdlib modules it reaches itself appends
-        // the archive `make stdlib` built for a host target, which then
-        // supplies nothing those objects lack.  A program linking the prebuilt
-        // archive named it after its objects, above.
-        if (ctx.prebuilt_stdlib == null && link_cfg.use_stdlib_archive && !cfg.no_std
-                && !cfg.no_runtime && ctx.options.stdlib_root.length() > 0) {
-            const stdlib_archive: string = CodegenPasses::stdlib_archive_path(
-                ctx.options.stdlib_root, effective_triple);
-            cmd = fmt::format("%s %s", cmd, CodegenPasses::link_quote(stdlib_archive));
         }
         // A freestanding link has no libc to satisfy the panic/alloc/backtrace
         // lang items, so the tier archives ARE the runtime and must all be on
@@ -1806,10 +1752,9 @@ type struct CodegenPasses {
 
 
     /// Bundle a library/stdlib target's per-module .o files into a single
-    /// archive next to them.  The Stdlib target is hardcoded to `libcryo.a`
-    /// (the path the executable-link path looks for via
-    /// `<root>/../stdlib/.bin/libcryo.a`); Library targets use
-    /// `lib<project_name>.a` per the usual convention.
+    /// archive next to them.  The Stdlib target's is `libcryo.a`, which with
+    /// its manifest is the archive programs link (`PrebuiltStdlib`); Library
+    /// targets use `lib<project_name>.a` per the usual convention.
     /// `ar rcs` is idempotent; re-runs overwrite the archive cleanly.
     static bundle_archive(ctx: mut CompilationContext*) -> PassResult {
         if (ctx.project_config == null) {
