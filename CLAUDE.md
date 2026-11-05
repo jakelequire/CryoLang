@@ -55,8 +55,10 @@ make help                # every target, and every side effect beyond its named 
 
 Every target that runs the compiler under test (`test`, `test-census`,
 `examples`, `lsp-check`, `verify`, ...) rebuilds `compiler/build/cryo` first
-when any `.cryo` under `compiler/src` or `stdlib` is newer than it, so a manual
-`make cryo` before them is not needed. That is a timestamp check: after a
+when any `.cryo` under `compiler/src` or `stdlib` (or the compiler's
+cryoconfig and C headers, the runtime tiers, the pin, `.git/index`) is newer
+than it, so a manual `make cryo` before them is not needed; `make cryo` is the
+same check, and with nothing changed it launches no compiler. That is a timestamp check: after a
 branch switch, see the landmine below. `scripts/README.md` says what each
 script does and who calls it.
 

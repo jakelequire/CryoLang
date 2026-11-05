@@ -8,6 +8,11 @@
 # the build output it names.
 
 ROOT       := $(CURDIR)
+# Every rule here names its recipe.  Make's built-in rules would have it look
+# for a way to remake each of the several hundred source prerequisites,
+# which on a Windows host is most of a no-change `make cryo`.
+MAKEFLAGS  += --no-builtin-rules --no-builtin-variables
+.SUFFIXES:
 PIN        := $(ROOT)/bin/cryo
 STAGE2     := $(ROOT)/compiler/build/cryo
 LIBCRYO_A   = $(ROOT)/stdlib/.bin/$(HOST_TRIPLE)/libcryo.a
@@ -82,12 +87,22 @@ PIN_EXE      := $(ROOT)/bin/cryo.exe
 # prerequisites, so it would be asked while the Makefile is read.  The goals in
 # NO_TRIPLE_GOALS build nothing and read no archive, so when every goal given
 # is one of them the pin is not launched; any other goal asks once, up front.
+#
+# The answer is kept in `compiler/build/host-triple.mk`, remade when the pin
+# is newer than it, so a build that changes nothing does not launch the pin
+# to ask: starting it costs more than the rest of a no-change `make cryo`.
 NO_TRIPLE_GOALS := help clean check-fast verify-selftest verify-pin verify-pin-clean
+HOST_TRIPLE_MK  := $(ROOT)/compiler/build/host-triple.mk
 ifneq ($(filter-out $(NO_TRIPLE_GOALS),$(or $(MAKECMDGOALS),help)),)
+-include $(HOST_TRIPLE_MK)
 ifeq ($(HOST_OS),windows)
-HOST_TRIPLE  := $(shell "$(subst /,\,$(PIN_EXE))" version --triple)
+$(HOST_TRIPLE_MK): $(PIN_EXE)
+	@if not exist "$(subst /,\,$(dir $@))" mkdir "$(subst /,\,$(dir $@))"
+	@for /f %%t in ('"$(subst /,\,$(PIN_EXE))" version --triple') do @echo HOST_TRIPLE := %%t> "$(subst /,\,$@)"
 else
-HOST_TRIPLE  := $(shell "$(PIN)" version --triple)
+$(HOST_TRIPLE_MK): $(PIN)
+	@mkdir -p "$(dir $@)"
+	@printf 'HOST_TRIPLE := %s\n' "$$("$(PIN)" version --triple)" > "$@"
 endif
 endif
 MINGW_GCC    := x86_64-w64-mingw32-gcc
@@ -338,34 +353,52 @@ endif
 # the binary rewritten in place, so no object changes.  The pin outputs are
 # excluded from the dirty check, as cryo-pin.py excludes them from its own:
 # a pin refresh rewrites bin/ between stamping its two halves.
+#
+# `cryo` names the binary, and the binary's rule runs only when a prerequisite
+# is newer than it - any .cryo under compiler/src or stdlib, the compiler's
+# cryoconfig and C headers, the stdlib archive, the runtime tiers, the pin -
+# so a build with nothing changed launches no compiler.  `.git/index` is a
+# prerequisite too: a commit rewrites it, and the stamp then names the new
+# commit.  The binary is touched last: an up-to-date build or an unchanged
+# stamp leaves it as it was, older than what made the rule run.
 CRYO_PROFILE  := release
 STAMP_EXCLUDE := bin/cryo,bin/cryo.pin.txt,bin/cryo.exe,bin/cryo.exe.pin.txt
+# The runtime tiers' newest archive stands for them all (`runtime-tiers`).
+RUNTIME_SOURCES := $(call rwildcard,$(ROOT)/runtime,*.cryo) $(ROOT)/runtime/cryoconfig \
+                   $(ROOT)/runtime/hosted/cryoconfig
+RUNTIME_TIERS_A  = $(ROOT)/runtime/.bin/$(HOST_TRIPLE)/libcryort-panic-unwind-hosted.a
 ifeq ($(HOST_OS),windows)
-cryo: $(LIBCRYO_A) runtime-tiers
+STAGE2_FILE := $(STAGE2_EXE)
+STAGE2_PIN  := $(PIN_EXE)
+else
+STAGE2_FILE := $(STAGE2)
+STAGE2_PIN  := $(PIN)
+endif
+STAGE2_INPUTS := $(CRYO_SOURCES) $(ROOT)/compiler/cryoconfig $(wildcard $(ROOT)/compiler/*.h) \
+                 $(LIBCRYO_A) $(RUNTIME_TIERS_A) $(STAGE2_PIN) $(wildcard $(ROOT)/.git/index)
+
+cryo: $(STAGE2_FILE)
+
+ifeq ($(HOST_OS),windows)
+$(STAGE2_EXE): $(STAGE2_INPUTS)
 	@echo "==> Building self-hosted cryo via bin/cryo.exe"
 	@cd compiler && "$(subst /,\,$(PIN_EXE))" build --profile=$(CRYO_PROFILE)
 	@"$(subst /,\,$(PIN_EXE))" stamp "$(STAGE2_EXE)" --profile=$(CRYO_PROFILE) --exclude=$(STAMP_EXCLUDE)
+	@copy /b "$(subst /,\,$(STAGE2_EXE))" +,, "$(subst /,\,$(STAGE2_EXE))" >NUL
 	@echo "==> Self-hosted cryo built: $(STAGE2_EXE)"
 else
-cryo: $(LIBCRYO_A) runtime-tiers
+$(STAGE2): $(STAGE2_INPUTS)
 	@echo "==> Building self-hosted cryo via bin/cryo"
 	@cd compiler && "$(PIN)" build --profile=$(CRYO_PROFILE)
 	@"$(PIN)" stamp "$(STAGE2)" --profile=$(CRYO_PROFILE) --exclude=$(STAMP_EXCLUDE)
+	@touch "$(STAGE2)"
 	@echo "==> Self-hosted cryo built: $(STAGE2)"
-endif
 
-# File-target rule so downstream targets (test, lsp-check, examples) can depend
-# on the binary itself instead of the phony `cryo` target.  The binary is
-# rebuilt when it is missing or older than any .cryo under compiler/src or
-# stdlib, so those targets never gate a stale compiler.
-$(STAGE2): $(CRYO_SOURCES)
-	@$(MAKE) --no-print-directory cryo
-
-# Windows counterpart: the native build emits `cryo.exe`, so a Windows-host
-# `test`/`test-list` depends on this path instead of $(STAGE2).  Same
-# delegate-to-`cryo` shape; `cryo` is host-branched so it builds correctly.
+# On a POSIX host `cryo.exe` is the cross build `cryo-exe` makes; a target
+# depending on it builds the native compiler first, as it always has.
 $(STAGE2_EXE): $(CRYO_SOURCES)
 	@$(MAKE) --no-print-directory cryo
+endif
 
 # File-target rule for the stdlib static library so `test` rebuilds it
 # when stdlib/.bin has been wiped (e.g. by selfhost-check) but the
@@ -849,14 +882,20 @@ endif
 # both directions.  The per-target split makes that unreachable through this
 # target, but the skip is a live defect in its own right and the tier sources
 # are small enough that forcing the re-emit costs seconds.
+#
+# The tiers are rebuilt when a runtime source or the pin is newer than the
+# tier archive written last, so a build that changes nothing launches no
+# compiler for them.
+runtime-tiers: $(RUNTIME_TIERS_A)
+
 ifeq ($(HOST_OS),windows)
-runtime-tiers:
+$(RUNTIME_TIERS_A): $(RUNTIME_SOURCES) $(PIN_EXE)
 	$(if $(strip $(HOST_TRIPLE)),,$(error runtime-tiers: `cryo version --triple` returned nothing; the pinned compiler is too old))
 	@echo "==> Building runtime tiers for $(HOST_TRIPLE) via bin/cryo.exe"
 	@cd runtime && "$(subst /,\,$(PIN_EXE))" build --no-incremental --build-dir=.bin/$(HOST_TRIPLE)
 	@cd runtime\hosted && "$(subst /,\,$(PIN_EXE))" build --no-incremental --build-dir=../.bin/$(HOST_TRIPLE)
 else
-runtime-tiers: $(PIN)
+$(RUNTIME_TIERS_A): $(RUNTIME_SOURCES) $(PIN)
 	$(if $(strip $(HOST_TRIPLE)),,$(error runtime-tiers: `cryo version --triple` returned nothing; the pinned compiler is too old))
 	@echo "==> Building runtime tiers for $(HOST_TRIPLE) via bin/cryo"
 	@cd runtime && "$(PIN)" build --no-incremental --build-dir=.bin/$(HOST_TRIPLE)
