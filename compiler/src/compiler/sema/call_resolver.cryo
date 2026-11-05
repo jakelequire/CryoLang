@@ -97,6 +97,8 @@ import compiler::resolver::lang_item::{ LangItem };
 import compiler::types::inference::{ InferCtx };
 import compiler::types::ownership::{ OwnershipQuery };
 import compiler::types::resolver::{ ResolutionContext };
+import utils::log::{ Log, LogArea, LogLevel };
+import compiler::module_graph::{ ModuleInfo };
 import compiler::types::substitution::{ TypeSubstitution };
 import compiler::types::trait_checker::{ TraitChecker };
 import compiler::types::type_base::{ Type };
@@ -4112,8 +4114,12 @@ type struct CallResolver {
     /// method at `Drop::drop`'s position.  A type with no implementation
     /// that applies has no destructor to call, and the call is left
     /// unpinned: codegen releases the value with its glue, or not at all
-    /// when it is `Copy`.  A method of the type that is merely named `drop`
-    /// is not its destructor and is never reached.
+    /// when it is `Copy`.  A `Copy` value owns nothing, so its release binds
+    /// no destructor even where its type implements `Drop` (the primitives'
+    /// empty implementations, which exist so `T: Drop` bounds hold): bound,
+    /// each release of an element would be a call into another module the
+    /// optimizer cannot see through.  A method of the type that is merely
+    /// named `drop` is not its destructor and is never reached.
     bind_destructor(mut &this, visitor: mut SemaVisitor*, call: mut CallExpr*, recv: TypeRef) -> Selection {
         const d: DefId = this.ctx.generic_registry.wellknown(LangItem::DropDrop);
         if (!d.is_valid()) { return Selection::none(); }
@@ -4121,6 +4127,13 @@ type struct CallResolver {
         // whether or not the type has a destructor to bind: code generation
         // releases one without by its glue, and knows the call by this.
         call.named_method = d;
+        if (OwnershipQuery::is_copy(this.arena, this.ctx.generic_registry, this.intern, recv)) {
+            if (Log::enabled(LogArea::Drop, LogLevel::Debug) && this.ctx.active_module_index >= 0) {
+                const owner: ModuleInfo* = &this.ctx.module_graph.modules[this.ctx.active_module_index];
+                Log::debug(LogArea::Drop, f"a release of a Copy value binds no destructor in module {this.intern.shown(owner.path().decl_name())}");
+            }
+            return Selection::none();
+        }
         const block: mut ImplBlock* = this.trait_checker().select_impl(
             this.ctx.defs.parent_of(d), recv, 0);
         const chosen: DeclarationNode* = this.ctx.generic_registry.trait_item_method(
