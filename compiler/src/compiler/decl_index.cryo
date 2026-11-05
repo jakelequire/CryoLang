@@ -219,6 +219,35 @@ implement trait Eq for struct ConversionKey {
     }
 }
 
+/// What a method's linker symbol is mangled from, captured where the method
+/// is registered: the owner type's registered name, the trait the method
+/// implements with that trait's arguments, the method's name, receiver,
+/// parameters and return, and a generic method's own type arguments.  A
+/// copy of each list, so the symbol mangled later is the one registration
+/// would have mangled.
+type struct MethodSymbolInputs {
+    position:     u32;
+    owner:        SymbolStr;
+    origin_trait: SymbolStr;
+    trait_args:   [TypeRef];
+    method:       SymbolStr;
+    receiver:     ReceiverKind;
+    params:       [TypeRef];
+    return_type:  TypeRef;
+    is_variadic:  boolean;
+    spec_args:    [TypeRef];
+
+    /// The interned linker symbol.  A generic method's type arguments are
+    /// folded in (`$MG...`): two instances whose signatures do not mention
+    /// the method's parameters would otherwise share a symbol.
+    mangle(&this, intern: mut InternTable*, arena: TypeArena*) -> SymbolStr {
+        const base: MangledName = MangledName::for_method_or_trait_impl(
+            intern, arena, QualifiedName::from_symbol(this.owner), this.origin_trait, &this.trait_args,
+            this.method, this.receiver, &this.params, this.return_type, this.is_variadic);
+        return intern.intern(base.with_method_spec_args(intern, arena, &this.spec_args).as_string());
+    }
+}
+
 
 type struct DeclarationIndex {
     /// The compilation's definitions, for a definition's path.  Borrowed;
@@ -367,6 +396,20 @@ private:
     // Entry position -> the body of a function or method marked
     // `![inline]`, for the modules that call it to emit a copy of.
     inline_bodies: HashMap<u32, InlineBody>;
+
+    // A method's linker symbol is mangled when something first needs it,
+    // not where the method is registered: only code generation reads a
+    // symbol, so an analysis that generates no code mangles none.  Entry
+    // position -> the index of what its symbol is mangled from in
+    // `pending_symbol_inputs`, for the entries not mangled yet.  Mangling
+    // reads the intern table and the type arena the registration was made
+    // with; once `settle_method_symbols` has run, every registration
+    // mangles where it is made.
+    pending_symbols:       HashMap<u32, i64>;
+    pending_symbol_inputs: [MethodSymbolInputs];
+    symbol_intern:         mut InternTable*;
+    symbol_arena:          TypeArena*;
+    symbols_settled:       boolean;
 public:
 
     // --- Module reachability and declaration visibility --------------------
@@ -433,6 +476,11 @@ public:
             overload_index:     HashMap::<FamilySlot, [u32]>::new(),
             extern_symbol_first: HashMap::<u32, Pair<u32, u64>>::new(),
             inline_bodies:      HashMap::<u32, InlineBody>::new(),
+            pending_symbols:       HashMap::<u32, i64>::new(),
+            pending_symbol_inputs: [],
+            symbol_intern:         null,
+            symbol_arena:          null,
+            symbols_settled:       false,
             prelude_modules:    [],
             refused_methods:    HashMap::<FamilySlot, boolean>::new(),
             overload_tag:       g_overload_index_tags,
@@ -557,8 +605,9 @@ public:
             Option::Some(positions) => {
                 for (mut k: i64 = 0; k < (*positions).length(); k++) {
                     const pos: u32 = (*positions)[k];
-                    if (this.overload_func_types[pos as i64].equals(func_type_ref)
-                            && this.overload_func_mangled[pos as i64] == symbol.id) {
+                    if (!this.overload_func_types[pos as i64].equals(func_type_ref)) { continue; }
+                    this.settle_symbol(pos);
+                    if (this.overload_func_mangled[pos as i64] == symbol.id) {
                         return OverloadId::at_position(pos, this.overload_tag);
                     }
                 }
@@ -569,6 +618,69 @@ public:
         const positions: mut [u32]* = this.overload_index.get_or_insert(slot, []);
         (*positions).push(this.slot_of(id) as u32);
         return id;
+    }
+
+    /// `register_signature` for a method whose linker symbol is mangled from
+    /// `inputs`.  A family holding no entry of this signature cannot answer
+    /// an existing entry, so the method is filed with its symbol pending;
+    /// otherwise the symbol is mangled now and compared as any other.
+    register_method_signature(mut &this, owner: FamilyOwner, leaf: SymbolStr, func_type_ref: TypeRef,
+                              owner_return: TypeRef, inputs: MethodSymbolInputs, trait_sym: DefId,
+                              span: SourceSpan, decl: DeclarationNode*,
+                              intern: mut InternTable*, arena: TypeArena*) -> OverloadId {
+        const slot: FamilySlot = this.family_slot(owner, leaf);
+        if (slot.is_none()) { return OverloadId::invalid(); }
+        mut holds_signature: boolean = false;
+        match (this.overload_index.get_ref(&slot)) {
+            Option::Some(positions) => {
+                for (mut k: i64 = 0; k < (*positions).length(); k++) {
+                    if (this.overload_func_types[(*positions)[k] as i64].equals(func_type_ref)) {
+                        holds_signature = true;
+                        break;
+                    }
+                }
+            }
+            Option::None => { }
+        }
+        if (this.symbols_settled || holds_signature) {
+            return this.register_signature(owner, leaf, func_type_ref, owner_return,
+                inputs.mangle(intern, arena), trait_sym, span, decl);
+        }
+        this.func_type_refs.insert(slot, func_type_ref);
+        const id: OverloadId = this.file_entry(slot, func_type_ref, owner_return, SymbolStr::empty(),
+            trait_sym, span, decl);
+        const pos: u32 = this.slot_of(id) as u32;
+        this.symbol_intern = intern;
+        this.symbol_arena = arena;
+        const at: i64 = this.pending_symbol_inputs.length();
+        this.pending_symbols.insert(pos, at);
+        this.pending_symbol_inputs.push(inputs);
+        this.pending_symbol_inputs[at].position = pos;
+        const positions: mut [u32]* = this.overload_index.get_or_insert(slot, []);
+        (*positions).push(pos);
+        return id;
+    }
+
+    /// Mangle the pending symbol of the entry at `pos`, if it has one.
+    settle_symbol(mut &this, pos: u32) -> void {
+        match (this.pending_symbols.remove(&pos)) {
+            Option::Some(at) => {
+                this.overload_func_mangled[pos as i64] =
+                    this.pending_symbol_inputs[at].mangle(this.symbol_intern, this.symbol_arena).id;
+            }
+            Option::None => { }
+        }
+    }
+
+    /// Mangle every pending method symbol, in registration order, and mangle
+    /// every later registration where it is made.  Code generation reads
+    /// symbols, so it runs this before generating any.
+    settle_method_symbols(mut &this) -> void {
+        for (mut i: i64 = 0; i < this.pending_symbol_inputs.length(); i++) {
+            this.settle_symbol(this.pending_symbol_inputs[i].position);
+        }
+        this.pending_symbol_inputs.clear();
+        this.symbols_settled = true;
     }
 
     /// A new entry, recorded as belonging to the family stored under
@@ -650,7 +762,13 @@ public:
     /// invalid id.
     entry_symbol(&this, id: OverloadId) -> DeclName {
         if (!id.is_valid()) { return DeclName::empty(); }
-        return DeclName::of(SymbolStr::from_id(this.overload_func_mangled[this.slot_of(id)]));
+        const pos: i64 = this.slot_of(id);
+        if (this.pending_symbols.contains_key(&(pos as u32))) {
+            panic(fmt::format(
+                "internal compiler error: the linker symbol of signature %lld was read before method symbols were settled",
+                pos), intrinsics::location());
+        }
+        return DeclName::of(SymbolStr::from_id(this.overload_func_mangled[pos]));
     }
 
     /// The return of entry `id` in its owner's parameters: what a reader
@@ -1151,22 +1269,7 @@ public:
             // Compute the mangled LLVM symbol name.  The
             // receiver-kind / non-receiver-params split is shared with
             // codegen (see method_receiver_kind).
-            const type_qname: QualifiedName = QualifiedName::from_symbol(type_sym);
-            const receiver_kind: ReceiverKind = DeclarationIndex::method_receiver_kind(
-                func_decl, method.is_static, intern);
-            const method_param_refs: [TypeRef] = DeclarationIndex::method_non_receiver_params(
-                func_decl, intern);
-            const method_sym: SymbolStr = func.name;
-            const mangled_base: MangledName = MangledName::for_method_or_trait_impl(
-                intern, arena, type_qname, this.defs.path_of(func.origin_trait).spelling(), trait_args,
-                method_sym, receiver_kind, method_param_refs, func.resolved_return_type, func.is_variadic);
-            // Fold in a generic-method spec's type args (`$MG...`) so the DI stores
-            // the same disambiguated symbol the codegen definition + mono pin use;
-            // otherwise a cross-module extern of `name<i64>` vs `name<u64>` (whose
-            // shared signature mangles identically) would collide.  No-op (empty
-            // spec_type_args) for every template / non-spec method.
-            const mangled: MangledName = mangled_base.with_method_spec_args(
-                intern, arena, func.spec_type_args);
+            const span: SourceSpan = if (func_decl.has_name_span()) { func_decl.name_span } else { func_decl.span };
             // A method bound with `![symbol("sym")]` (the C++ binding generator)
             // resolves to the foreign mangled symbol, not the Cryo mangling - so
             // register THAT as the DI symbol, making every consuming module emit
@@ -1174,18 +1277,35 @@ public:
             // the MethodDecl (DirectiveProcessing runs later than this pass).
             // Empty for an ordinary method -> Cryo mangling, byte-unchanged.
             const link_str: string = method_decl.link_directive_symbol();
-            const eff_mangled: SymbolStr = if (!link_str.eq("")) {
-                intern.intern(link_str)
-            } else {
-                intern.intern(mangled.as_string())
-            };
             // The entry is the declaration's identity: stamped on the node
             // so every consumer holding the node - the definition emitter,
             // a call sema or mono binds to it - reads the symbol and
             // signature registration wrote, and mangles nothing.
-            const entry: OverloadId = this.keep_def_entry(func.def, this.register_signature(
-                FamilyOwner::Type(owner), func.name, func_type_ref, ret, eff_mangled, func.origin_trait,
-                if (func_decl.has_name_span()) { func_decl.name_span } else { func_decl.span }, method_decl));
+            mut registered: OverloadId = OverloadId::invalid();
+            if (!link_str.eq("")) {
+                registered = this.register_signature(FamilyOwner::Type(owner), func.name, func_type_ref,
+                    ret, intern.intern(link_str), func.origin_trait, span, method_decl);
+            } else {
+                mut trait_arg_copy: [TypeRef] = [];
+                trait_arg_copy.append(trait_args);
+                mut spec_arg_copy: [TypeRef] = [];
+                spec_arg_copy.append(&func.spec_type_args);
+                const inputs: MethodSymbolInputs = MethodSymbolInputs {
+                    position:     0,
+                    owner:        type_sym,
+                    origin_trait: this.defs.path_of(func.origin_trait).spelling(),
+                    trait_args:   trait_arg_copy,
+                    method:       func.name,
+                    receiver:     DeclarationIndex::method_receiver_kind(func_decl, method.is_static, intern),
+                    params:       DeclarationIndex::method_non_receiver_params(func_decl, intern),
+                    return_type:  func.resolved_return_type,
+                    is_variadic:  func.is_variadic,
+                    spec_args:    spec_arg_copy,
+                };
+                registered = this.register_method_signature(FamilyOwner::Type(owner), func.name,
+                    func_type_ref, ret, inputs, func.origin_trait, span, method_decl, intern, arena);
+            }
+            const entry: OverloadId = this.keep_def_entry(func.def, registered);
             func.set_overload_entry(entry);
             // A copy is the owner's method for the definition it stands for.
             // A specialization of a generic method is that definition AND
