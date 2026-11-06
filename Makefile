@@ -286,8 +286,9 @@ Side effects beyond the named output
                   has no stdlib archive for its key builds one into
                   stdlib/.bin/<triple>/prebuilt/<key>/ and removes those
                   there beyond the six used most recently and idle for an
-                  hour.
-  verify          runs `make check-fast` from inside itself, and keeps a
+                  hour.  A link whose C driver has not answered before
+                  keeps its answers in stdlib/.bin/<triple>/toolchain/.
+  verify         runs `make check-fast` from inside itself, and keeps a
                   clone and baseline compilers under .verify/ until
                   `make clean`; clears stdlib/.bin/*/prebuilt/ before each
                   population run.

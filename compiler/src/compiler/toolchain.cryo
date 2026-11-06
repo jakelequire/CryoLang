@@ -1,0 +1,194 @@
+///! The C toolchain a build links with, found and asked without launching it
+///! whenever that can be avoided: programs are found by searching `PATH`,
+///! and what a driver answered is kept on disk for the next build.
+namespace compiler::toolchain;
+
+import compiler::build_manifest::{ ContentHasher, Manifest };
+import utils::log::{ Log, LogArea };
+import std::env;
+import std::fmt;
+import std::process;
+import std::fs::{ Directory, File, Path, PathBuf };
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::core::option::{ Option };
+
+/// The first line of a driver facts file; a file written in another format
+/// is not read.
+const DRIVER_FACTS_FORMAT: string = "cryo-driver-facts 1";
+
+/// Where a program is, found the way the operating system finds a program
+/// started by name: a name holding a path separator is that path, any other
+/// is looked for in each directory of `PATH`, in order.
+type struct ExecutablePath {
+    /// The path of `program`, or "" when it is not there.  On Windows a
+    /// name with no extension is also looked for with `.exe`, as starting
+    /// it would.
+    static find(program_text: string) -> string {
+        const program: string = program_text;
+        if (program.length() == 0) { return ""; }
+        if (program.contains("/") || program.contains("\\")) {
+            return ExecutablePath::existing(program);
+        }
+        match (env::var(Str::new("PATH"))) {
+            Option::Some(v) => {
+                mut value: String = v;
+                const search: string = value.as_cstr() as string;
+                const length: i64 = search.length() as i64;
+                const separator: i8 = ExecutablePath::list_separator();
+                mut start: i64 = 0;
+                for (mut i: i64 = 0; i <= length; i++) {
+                    if (i < length && search[i] != separator) { continue; }
+                    if (i > start) {
+                        const directory: string = search.substr(start, i - start);
+                        const found: string = ExecutablePath::existing(
+                            Path::from(directory).join(program).into_raw());
+                        if (found.length() > 0) { return found; }
+                    }
+                    start = i + 1;
+                }
+                return "";
+            }
+            Option::None => { return ""; }
+        }
+    }
+
+    /// The path of the program the command line `command` starts - its
+    /// first word, which a driver written with its options
+    /// (`clang-20 --target=...`) is followed by - or "" when it is not there.
+    static of_command(command_text: string) -> string {
+        const command: string = command_text;
+        const space: i64 = command.find(" ");
+        return ExecutablePath::find(if (space < 0) { command } else { command.substr(0, space) });
+    }
+
+    /// `path` when a file is there; on Windows, `path` + `.exe` when only
+    /// that is; else "".
+    static existing(path_text: string) -> string {
+        const path: string = path_text;
+        if (Path::from(path).is_file()) { return path; }
+        const with_suffix: string = path.append(ExecutablePath::implied_suffix());
+        if (with_suffix.length() > path.length() && Path::from(with_suffix).is_file()) {
+            return with_suffix;
+        }
+        return "";
+    }
+
+    /// The byte between two directories of `PATH`: `;`.
+    ![target(windows)]
+    static list_separator() -> i8 { return 59; }
+
+    /// The byte between two directories of `PATH`: `:`.
+    ![target(unix)]
+    static list_separator() -> i8 { return 58; }
+
+    ![target(windows)]
+    static implied_suffix() -> string { return ".exe"; }
+
+    ![target(unix)]
+    static implied_suffix() -> string { return ""; }
+}
+
+/// What a C driver answered about its toolchain, kept on disk beside the
+/// prebuilt stdlib archives so a later build need not launch the driver to
+/// ask again.  A file is trusted only for the same driver text resolving to
+/// the same program, of the same size and modification time: a driver that
+/// is replaced, updated or found elsewhere on `PATH` is asked again.
+type struct DriverFacts {
+    /// Whether the driver's toolchain takes its unwinder from libgcc.
+    unwinds_with_libgcc: boolean;
+
+    /// The directory driver facts are kept in for builds for `triple`
+    /// against the stdlib at `stdlib_root`: beside its prebuilt archives,
+    /// the one place every project's build already shares.  "" with no
+    /// stdlib, and then nothing is kept.
+    static directory_for(stdlib_root: string, triple: string) -> string {
+        if (stdlib_root.length() == 0 || triple.length() == 0) { return ""; }
+        return Path::from(stdlib_root).join(".bin").join(triple).join("toolchain").into_raw();
+    }
+
+    /// The facts `directory` holds for `driver`, or none when it holds none
+    /// for the program `driver` starts as it is now.
+    static read(directory: string, driver: string) -> Option<DriverFacts> {
+        const identity: string = DriverFacts::identity(driver);
+        if (directory.length() == 0 || identity.length() == 0) { return Option::None; }
+        const path: string = DriverFacts::file_for(directory, driver);
+        const text: String = match (File::read_text(Path::from(path))) {
+            Result::Ok(t)  => { t }
+            Result::Err(_) => { return Option::None; }
+        };
+        const newline: Str = Str::new("\n");
+        mut held_identity: Str = Str::new("");
+        mut answer: Option<DriverFacts> = Option::None;
+        mut line_number: i64 = 0;
+        for (line in text.as_str().split(&newline)) {
+            line_number++;
+            if (line_number == 1) {
+                if (line != Str::new(DRIVER_FACTS_FORMAT)) { return Option::None; }
+            } else if (line_number == 2) {
+                held_identity = line;
+            } else if (line == Str::new("unwinds_with_libgcc 1")) {
+                answer = Option::Some(DriverFacts { unwinds_with_libgcc: true });
+            } else if (line == Str::new("unwinds_with_libgcc 0")) {
+                answer = Option::Some(DriverFacts { unwinds_with_libgcc: false });
+            }
+        }
+        if (held_identity != Str::new(identity)) {
+            Log::debug(LogArea::Link, f"driver facts in {path} are for another program than `{driver}` starts now; asking it again");
+            return Option::None;
+        }
+        return answer;
+    }
+
+    /// Keep these facts for `driver` in `directory`.  A file that cannot be
+    /// written is left as it was: it is trusted only for the program it
+    /// names.
+    write(&this, directory: string, driver: string) -> void {
+        const identity: string = DriverFacts::identity(driver);
+        if (directory.length() == 0 || identity.length() == 0) { return; }
+        if (identity.contains("\n")) { return; }
+        const path: string = DriverFacts::file_for(directory, driver);
+        mut text: String = String::new();
+        text.push(DRIVER_FACTS_FORMAT);
+        text.push("\n");
+        text.push(identity);
+        text.push(if (this.unwinds_with_libgcc) { "\nunwinds_with_libgcc 1\n" } else { "\nunwinds_with_libgcc 0\n" });
+        match (Directory::create_all(Path::from(directory))) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { return; }
+        }
+        // Written aside and renamed into place, so a concurrent build reads
+        // the old file or the new one, never part of one.
+        const partial: string = fmt::format("%s.partial-%d", path, process::id());
+        match (File::write_text(Path::from(partial), text.as_str())) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { return; }
+        }
+        match (Path::from(partial).rename_to(Path::from(path))) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { match (File::remove(Path::from(partial))) { _ => { } } }
+        }
+    }
+
+    /// The file `directory` keeps `driver`'s facts in, named by the driver
+    /// text it was started as.
+    static file_for(directory: string, driver: string) -> string {
+        mut digest: ContentHasher = ContentHasher::new();
+        digest.fold(driver);
+        return Path::from(directory).join(Str::new(Manifest::hex128(digest.finish128()))).into_raw();
+    }
+
+    /// The driver text and the program it starts - its path, size and
+    /// modification time - on one line; "" when the program is not found.
+    static identity(driver_text: string) -> string {
+        const driver: string = driver_text;
+        const found: string = ExecutablePath::of_command(driver);
+        if (found.length() == 0) { return ""; }
+        return match (Path::from(found).metadata()) {
+            Result::Ok(m)  => {
+                fmt::format("%s\t%s\t%lld\t%lld", driver, found, m.length(), m.modified_secs())
+            }
+            Result::Err(_) => { "" }
+        };
+    }
+}

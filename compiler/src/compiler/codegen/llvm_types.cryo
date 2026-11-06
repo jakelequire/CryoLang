@@ -16,6 +16,7 @@ import std::core::hash::{ Hasher };
 import std::core::slice::{ Slice };
 import compiler::resolver::mangled_name::{ MangledName };
 import compiler::const_table::{ FoldedInteger };
+import compiler::toolchain::{ ExecutablePath };
 import utils::log::{ Log, LogArea, LogLevel };
 
 
@@ -1698,47 +1699,15 @@ type struct LTargetMachine {
         if (raw == null) { return "x86_64-pc-windows-gnu"; }
         if (!raw.contains("windows-msvc")) { return raw; }
         // Prefer mingw (the only link path the port supports) when present.
-        if (LTargetMachine::exe_on_path("x86_64-w64-mingw32-gcc.exe")) {
+        if (ExecutablePath::find("x86_64-w64-mingw32-gcc").length() > 0) {
             return "x86_64-pc-windows-gnu";
         }
         // Otherwise honour an installed MSVC linker so codegen emits MSVC-ABI
         // objects (the user links them with their own toolchain).
-        if (LTargetMachine::exe_on_path("lld-link.exe") || LTargetMachine::exe_on_path("link.exe")) {
+        if (ExecutablePath::find("lld-link").length() > 0 || ExecutablePath::find("link").length() > 0) {
             return raw;
         }
         return "x86_64-pc-windows-gnu";
-    }
-
-    static exe_on_path(exe_text: string) -> boolean {
-        const exe: string = exe_text;
-        match (env::var(Str::new("PATH"))) {
-            Option::Some(v) => {
-                // Move the owned value into a local so it drops cleanly on every
-                // exit (including the early `return true`); a borrowed cstr view
-                // drives the scan. No leak - unlike a boundary `into_raw`.
-                mut s: String = v;
-                const path: string = s.as_cstr() as string;
-                const len: i64 = path.length() as i64;
-                mut start: i64 = 0;
-                for (mut i: i64 = 0; i <= len; i++) {
-                    if (i == len || path[i] == 59) {            // 59 = ';'
-                        const dlen: i64 = i - start;
-                        if (dlen > 0) {
-                            const dir: string = path.substr(start, dlen);
-                            mut candidate: string = dir;
-                            if (dir[dlen - 1] != 92) {           // 92 = '\'
-                                candidate += "\\";
-                            }
-                            candidate += exe;
-                            if (Path::from(candidate).exists()) { return true; }
-                        }
-                        start = i + 1;
-                    }
-                }
-                return false;
-            }
-            Option::None => { return false; }
-        }
     }
 
     /// Resolve the effective triple for codegen: returns `requested` when it

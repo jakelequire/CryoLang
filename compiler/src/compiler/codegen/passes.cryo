@@ -23,6 +23,7 @@ import compiler::project_config::{ ProjectConfig, TargetType };
 import compiler::module_graph::{ ModuleInfo, ModuleOrigin };
 import compiler::artifacts::{ IROutput, LinkedOutput };
 import compiler::prebuilt_stdlib::{ PrebuiltStdlib };
+import compiler::toolchain::{ DriverFacts, ExecutablePath };
 import compiler::diag::{ diagnostic, ErrorCode, sink, snapshot };
 import compiler::ast::node::{ ProgramNode };
 import compiler::passes::pass_id::{ PassResult };
@@ -47,12 +48,12 @@ import compiler::resolver::mangled_name::{ MangledName };
 
 // Linker configuration per target
 
-/// The answers `LinkerConfig` gets by launching the C toolchain, kept for
-/// the life of the process: which driver a target's default resolves to,
-/// and whether that driver unwinds through libgcc.  Neither can change while
-/// the process runs, and each costs a process launch, which on a small
-/// build is a large share of the wall time.  One target's answers are held;
-/// a link for a target with another default driver probes again.
+/// The answers `LinkerConfig` gets about the C toolchain, kept for the life
+/// of the process: which driver a target's default resolves to (a `PATH`
+/// search), and whether that driver unwinds through libgcc (the driver's
+/// own answer, kept on disk across builds by `DriverFacts`).  Neither can
+/// change while the process runs.  One target's answers are held; a link
+/// for a target with another default driver finds them again.
 ///
 /// Every string held here is a literal: the per-target arena is reset
 /// between targets, so nothing allocated during a build may outlive it here.
@@ -147,9 +148,10 @@ type struct LinkerConfig {
 
     /// The C driver this target links with.  `CRYO_CC` overrides everything,
     /// mirroring `pick_archiver`'s `CRYO_AR`.  With no override the driver is
-    /// found by launching candidates, once per process (`ToolchainProbe`):
+    /// the first candidate found on `PATH` (`ExecutablePath`), searched once
+    /// per process (`ToolchainProbe`); nothing is launched to find it:
     ///
-    ///   1. The target's `default_driver` wins whenever it's launchable.
+    ///   1. The target's `default_driver` wins whenever it's on `PATH`.
     ///      This is the historic choice on every host where it exists - `cc`
     ///      on a POSIX host, `x86_64-w64-mingw32-gcc` on a Linux->windows
     ///      cross - so existing flows and selfhost byte-identity are unchanged
@@ -181,21 +183,34 @@ type struct LinkerConfig {
     /// the driver resolves `libgcc_eh.a` to a path (`-print-file-name` echoes
     /// the bare name back when the file is not in its search dirs).  A
     /// toolchain without it unwinds through LLVM's libunwind instead.  Asked
-    /// once per process (`ToolchainProbe`); the probe's output goes to
-    /// `log_path`, which is removed afterwards.
-    unwinds_with_libgcc(&this, log_path_text: string) -> boolean {
+    /// once per process (`ToolchainProbe`), and of the driver only when
+    /// `facts_directory` holds no answer it gave for the program it starts
+    /// now (`DriverFacts`); the answer it gives is kept there.  The probe's
+    /// output goes to `log_path`, which is removed afterwards.
+    unwinds_with_libgcc(&this, facts_directory: string, log_path_text: string) -> boolean {
         const driver: string = this.link_driver();
         this.hold_probe();
-        if (!g_toolchain_probe.libgcc_probed) {
-            Log::debug(LogArea::Link, f"launching `{driver} -print-file-name=libgcc_eh.a` to find the unwinder");
-            mut out: string = "";
-            const rc: i32 = CodegenPasses::capture_tool(
-                fmt::format("%s -print-file-name=libgcc_eh.a", driver), log_path_text, &out);
-            File::remove(Path::from(log_path_text));
-            const answer: string = out;
-            g_toolchain_probe.unwinds_with_libgcc = rc == 0 && (answer.contains("/") || answer.contains("\\"));
-            g_toolchain_probe.libgcc_probed = true;
+        if (g_toolchain_probe.libgcc_probed) { return g_toolchain_probe.unwinds_with_libgcc; }
+        match (DriverFacts::read(facts_directory, driver)) {
+            Option::Some(facts) => {
+                Log::debug(LogArea::Link, f"`{driver}` unwinds through libgcc: {facts.unwinds_with_libgcc}, as it answered before");
+                g_toolchain_probe.unwinds_with_libgcc = facts.unwinds_with_libgcc;
+            }
+            Option::None => {
+                Log::debug(LogArea::Link, f"launching `{driver} -print-file-name=libgcc_eh.a` to find the unwinder");
+                mut out: string = "";
+                const rc: i32 = CodegenPasses::capture_tool(
+                    fmt::format("%s -print-file-name=libgcc_eh.a", driver), log_path_text, &out);
+                File::remove(Path::from(log_path_text));
+                const answer: string = out;
+                const facts: DriverFacts = DriverFacts {
+                    unwinds_with_libgcc: rc == 0 && (answer.contains("/") || answer.contains("\\")),
+                };
+                if (rc == 0) { facts.write(facts_directory, driver); }
+                g_toolchain_probe.unwinds_with_libgcc = facts.unwinds_with_libgcc;
+            }
         }
+        g_toolchain_probe.libgcc_probed = true;
         return g_toolchain_probe.unwinds_with_libgcc;
     }
 
@@ -211,15 +226,15 @@ type struct LinkerConfig {
         };
     }
 
-    /// The first driver that can be launched for `default_driver`, by the
-    /// order `link_driver` gives.  Every answer is a literal.
+    /// The first driver on `PATH` for `default_driver`, by the order
+    /// `link_driver` gives.  Every answer is a literal.
     static first_launchable_driver(default_driver_text: string) -> string {
         const default_driver: string = default_driver_text;
-        if (CodegenPasses::tool_available(default_driver_text)) { return default_driver; }
+        if (ExecutablePath::of_command(default_driver_text).length() > 0) { return default_driver; }
         if (!default_driver.contains("mingw")) {
-            if (CodegenPasses::tool_available("gcc"))   { return "gcc"; }
-            if (CodegenPasses::tool_available("clang")) { return "clang"; }
-            if (CodegenPasses::tool_available("cc"))    { return "cc"; }
+            if (ExecutablePath::find("gcc").length() > 0)   { return "gcc"; }
+            if (ExecutablePath::find("clang").length() > 0) { return "clang"; }
+            if (ExecutablePath::find("cc").length() > 0)    { return "cc"; }
         }
         return default_driver;
     }
@@ -460,7 +475,8 @@ type struct CodegenPasses {
         // `libgcc_eh`, ships no libunwind to link, and a gcc driver rejects
         // `--unwindlib` outright ("unrecognized command line option").
         if (triple.contains("windows")
-                && !link_cfg.unwinds_with_libgcc(probe_log_text)) {
+                && !link_cfg.unwinds_with_libgcc(
+                    DriverFacts::directory_for(ctx.options.stdlib_root, triple), probe_log_text)) {
             out = fmt::format("%s --unwindlib=none -Wl,-Bstatic -lunwind -Wl,-Bdynamic", out);
         }
         if (ctx.options.static_link) {
@@ -2128,33 +2144,13 @@ type struct CodegenPasses {
         return sbuf.into_raw();
     }
 
-    /// True if `tool` can be launched, probed via `<tool> --version` with both
-    /// streams sent to the null device.  A missing binary makes `spawn` fail
-    /// (Windows) or the child `_exit(127)` (POSIX), so a successful exit means
-    /// it's usable.  The
-    /// probe runs after IR is emitted (link/archive time), so the tool chosen
-    /// never affects the `.ll` the selfhost gate compares.
-    static tool_available(tool_text: string) -> boolean {
-        const tool: string = tool_text;
-        Log::debug(LogArea::Link, f"launching `{tool} --version` to see whether it can be launched");
-        mut probe: Command = Command::new(Str::new(tool));
-        probe.arg(Str::new("--version"));
-        probe.stdout(Stdio::Null);
-        probe.stderr(Stdio::Null);
-        match (probe.status()) {
-            Result::Ok(st) => { return st.success(); }
-            Result::Err(_) => { return false; }
-        }
-    }
-
     /// Pick the static archiver binary.  `CRYO_AR` overrides everything,
     /// mirroring `LinkerConfig::link_driver`'s `CRYO_CC` knob - this is what lets a
     /// Windows-hosted `cryo.exe` under wine point at an `llvm-ar.exe` it can
     /// launch, since the host's ELF `ar` cannot run there.  With no override
-    /// we AUTO-DETECT: the default `ar` wins whenever it's launchable (true on
-    /// every POSIX host and on a mingw box, where binutils ships `ar`), so the
-    /// historic choice and selfhost byte-identity are preserved and the probe
-    /// only falls through to `llvm-ar` when `ar` is genuinely absent.
+    /// the first of `ar`, `llvm-ar`, `llvm-ar-20` found on `PATH` is used
+    /// (`ExecutablePath`; nothing is launched to find it): `ar` is there on
+    /// every POSIX host and on a mingw box, where binutils ships it.
     static pick_archiver() -> string {
         match (env::var(Str::new("CRYO_AR"))) {
             Option::Some(v) => {
@@ -2165,9 +2161,9 @@ type struct CodegenPasses {
             }
             Option::None => {}
         }
-        if (CodegenPasses::tool_available("ar"))         { return "ar"; }
-        if (CodegenPasses::tool_available("llvm-ar"))    { return "llvm-ar"; }
-        if (CodegenPasses::tool_available("llvm-ar-20")) { return "llvm-ar-20"; }
+        if (ExecutablePath::find("ar").length() > 0)         { return "ar"; }
+        if (ExecutablePath::find("llvm-ar").length() > 0)    { return "llvm-ar"; }
+        if (ExecutablePath::find("llvm-ar-20").length() > 0) { return "llvm-ar-20"; }
         return "ar";
     }
 
