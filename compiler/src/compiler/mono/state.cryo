@@ -25,6 +25,7 @@ import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::{ intern_table, symbol_str, res };
 import compiler::decl_index::{ OverloadId };
 import std::collections::hashmap::{ HashMap };
+import std::collections::hashset::{ HashSet };
 import compiler::ast::declaration::{ DeclarationNode, ImplBlock };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
@@ -165,8 +166,9 @@ type struct MonoState {
     // found without visiting every specialization in the program.
     spec_entries_by_type: HashMap<TypeKey, [i64]>;
 
-    // Visited set for request_nested_instantiations cycle detection.
-    nested_visited:   [u64];
+    // The types request_nested_instantiations has visited in the current
+    // traversal; the caller clears it before each top-level one.
+    nested_visited:   HashSet<TypeKey>;
 
     // Error tracking (shared: the orchestrator's spine and the collaborators that
     // emit diagnostics both bump this; process_all returns error_count == 0).
@@ -230,7 +232,7 @@ type struct MonoState {
             pending_cursor:   0,
             spec_entries:     [],
             spec_entries_by_type: HashMap::<TypeKey, [i64]>::new(),
-            nested_visited:   [],
+            nested_visited:   HashSet::<TypeKey>::new(),
             error_count:      0,
             method_instances: [],
             instance_keys:    HashMap::<InstanceKey, [i64]>::new(),
@@ -441,10 +443,7 @@ type struct MonoState {
         if (ty.is_invalid() || ty.key() == 0) { return; }
 
         // Cycle detection: skip types we've already visited in this traversal
-        for (mut v: i64 = 0; v < this.nested_visited.length(); v++) {
-            if (this.nested_visited[v] == ty.key()) { return; }
-        }
-        this.nested_visited.push(ty.key());
+        if (!this.nested_visited.insert(ty.table_key())) { return; }
 
         const t: Type* = this.arena.lookup(ty);
         if (t == null) { return; }
