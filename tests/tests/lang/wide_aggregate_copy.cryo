@@ -1,0 +1,92 @@
+///! Copies of aggregates wider than 64 bytes are written as bytes, from the
+///! address the value was read at, when nothing in between can have changed
+///! that address.  These tests pin both sides of that rule: a write into the
+///! slot the value was read from must not leak into the copy, and a value
+///! read from one slot and copied while another slot is written (an enum's
+///! tag before its payload) arrives whole.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::WideAggregateCopy;
+
+import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_eq, expect_true };
+
+/// Nine i64 fields: 72 bytes, above the width stored as one value.
+type struct Wide {
+    a: i64;
+    b: i64;
+    c: i64;
+    d: i64;
+    e: i64;
+    f: i64;
+    g: i64;
+    h: i64;
+    i: i64;
+}
+
+type struct WideAndCount {
+    first: Wide;
+    second: i64;
+}
+
+function wide_from(start: i64) -> Wide {
+    return Wide {
+        a: start, b: start + 1, c: start + 2, d: start + 3, e: start + 4,
+        f: start + 5, g: start + 6, h: start + 7, i: start + 8,
+    };
+}
+
+/// `first` reads `local` whole; `local.a++` then writes into the same slot
+/// before `first` is stored, so the copy must be of what was read.
+function snapshot_then_bump(value: Wide) -> WideAndCount {
+    mut local: Wide = value;
+    return WideAndCount { first: local, second: local.a++ };
+}
+
+function wrap(value: Wide) -> Option<Wide> {
+    mut local: Wide = value;
+    return Option::Some(local);
+}
+
+function first_field_through_try(value: Option<Wide>) -> Option<i64> {
+    const inner: Wide = value?;
+    return Option::Some(inner.a + inner.i);
+}
+
+![test]
+function copy_reads_before_a_write_into_its_own_slot() -> Result<(), TestError> {
+    const pair: WideAndCount = snapshot_then_bump(wide_from(1));
+    expect_eq(pair.first.a, 1)?;
+    expect_eq(pair.first.i, 9)?;
+    expect_eq(pair.second, 1)?;
+    return Result::Ok(());
+}
+
+![test]
+function payload_survives_the_tag_store() -> Result<(), TestError> {
+    const wrapped: Option<Wide> = wrap(wide_from(10));
+    match (wrapped) {
+        Option::Some(inner) => {
+            expect_eq(inner.a, 10)?;
+            expect_eq(inner.e, 14)?;
+            expect_eq(inner.i, 18)?;
+        }
+        Option::None => { expect_true(false, "wrap returned None")?; }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function payload_survives_try() -> Result<(), TestError> {
+    match (first_field_through_try(Option::Some(wide_from(100)))) {
+        Option::Some(sum) => { expect_eq(sum, 208)?; }
+        Option::None => { expect_true(false, "Some went through `?` as None")?; }
+    }
+    match (first_field_through_try(Option::None)) {
+        Option::Some(_) => { expect_true(false, "None went through `?` as Some")?; }
+        Option::None => { }
+    }
+    return Result::Ok(());
+}

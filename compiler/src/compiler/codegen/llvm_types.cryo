@@ -432,6 +432,41 @@ type struct LModule {
         }
     }
 
+    /// Erase every load of a struct or array that nothing uses, and answer
+    /// how many there were.  `LBuilder.build_store` copies a wide aggregate
+    /// from the address its load read, which leaves the load itself unused;
+    /// kept, it is a whole-value read of the slot that makes the optimizer
+    /// split the slot into one value per field and copy the aggregate field
+    /// by field, in blocks whose size the vectorizer and the scheduler pay
+    /// for superlinearly.  A volatile load stays.
+    erase_unused_aggregate_loads(&this) -> u64 {
+        mut erased: u64 = 0;
+        mut f: mut void* = llvm::LLVMGetFirstFunction(this.raw);
+        while (f != null) {
+            mut block: mut void* = llvm::LLVMGetFirstBasicBlock(f);
+            while (block != null) {
+                mut inst: mut void* = llvm::LLVMGetFirstInstruction(block);
+                while (inst != null) {
+                    const next_inst: mut void* = llvm::LLVMGetNextInstruction(inst);
+                    const instruction: LValue = LValue { raw: inst };
+                    if (instruction.opcode() == LOpcode::Load
+                            && llvm::LLVMGetFirstUse(inst) == null
+                            && llvm::LLVMGetVolatile(inst) == 0) {
+                        const kind: LTypeKind = LType::kind_of(llvm::LLVMTypeOf(inst));
+                        if (kind == LTypeKind::Struct || kind == LTypeKind::Array) {
+                            llvm::LLVMInstructionEraseFromParent(inst);
+                            erased += 1;
+                        }
+                    }
+                    inst = next_inst;
+                }
+                block = llvm::LLVMGetNextBasicBlock(block);
+            }
+            f = llvm::LLVMGetNextFunction(f);
+        }
+        return erased;
+    }
+
     /// Whether this module defines any function or global, and so has an
     /// object worth emitting.
     defines_anything(&this) -> boolean {
@@ -816,8 +851,8 @@ type struct LBuilder {
     /// Copy what the load `loaded` read to `ptr`, in place of storing its
     /// value.  A memmove, since the two may be the same or overlapping
     /// places (a value assigned over the aggregate holding it).  The load
-    /// stays, for whatever else uses the value; one nothing uses is dropped
-    /// by the backend.
+    /// stays, for whatever else uses the value; one nothing uses is erased
+    /// once the module's IR is complete (`LModule.erase_unused_aggregate_loads`).
     copy_loaded_aggregate(&this, llvm_module: LModule, loaded: LValue, ptr: LValue, ty: LType) -> LValue {
         const source: mut void* = llvm::LLVMGetOperand(loaded.raw, 0);
         const size: LValue = LType::const_int(LType::i64(), llvm_module.abi_size_of(ty), false);
@@ -1084,12 +1119,19 @@ type struct LValue {
     /// True when this load's address holds, at the end of the block the
     /// builder is filling, what the load read: the load is in that block and
     /// nothing after it writes memory the load could have read.  Each
-    /// instruction after it is asked, up to the block's last; a store into
-    /// a stack slot allocated after the load is the one write admitted,
-    /// since that memory did not exist when the load read.
+    /// instruction after it is asked, up to the block's last; the one
+    /// write admitted is a store into a stack slot the load cannot have
+    /// read: one allocated after the load, since that memory did not exist
+    /// when the load read, or any other slot when the load read a different
+    /// slot, an argument's memory or a global, none of which is that slot.
     reads_unchanged_at_end_of(&this, block: mut void*) -> boolean {
         if (this.opcode() != LOpcode::Load || llvm::LLVMGetVolatile(this.raw) != 0) { return false; }
         if (llvm::LLVMGetInstructionParent(this.raw) != block) { return false; }
+        const read_address: LValue = LValue { raw: llvm::LLVMGetOperand(this.raw, 0) };
+        const read_base: LValue = LValue { raw: read_address.address_base() };
+        const read_base_is_named: boolean = read_base.opcode() == LOpcode::Alloca
+            || llvm::LLVMIsAArgument(read_base.raw) != null
+            || llvm::LLVMIsAGlobalValue(read_base.raw) != null;
         mut later_slots: [mut void*] = [];
         mut later: mut void* = llvm::LLVMGetNextInstruction(this.raw);
         while (later != null) {
@@ -1099,12 +1141,13 @@ type struct LValue {
             if (!opcode.writes_no_memory()) {
                 if (opcode != LOpcode::Store) { return false; }
                 const address: LValue = LValue { raw: llvm::LLVMGetOperand(later, 1) };
-                const slot: mut void* = address.address_base();
-                mut fresh: boolean = false;
-                for (mut i: i64 = 0; i < later_slots.length(); i++) {
-                    if (later_slots[i] == slot) { fresh = true; break; }
+                const slot: LValue = LValue { raw: address.address_base() };
+                mut unread: boolean = read_base_is_named && slot.raw != read_base.raw
+                    && slot.opcode() == LOpcode::Alloca;
+                for (mut i: i64 = 0; i < later_slots.length() && !unread; i++) {
+                    if (later_slots[i] == slot.raw) { unread = true; }
                 }
-                if (!fresh || llvm::LLVMGetVolatile(later) != 0) { return false; }
+                if (!unread || llvm::LLVMGetVolatile(later) != 0) { return false; }
             }
             later = llvm::LLVMGetNextInstruction(later);
         }
