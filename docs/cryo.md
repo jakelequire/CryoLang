@@ -2778,7 +2778,7 @@ const b: Pair<string> = Pair::<string>::new("x", "y");
 
 it generates two independent types and two specialised function bodies, one for each instantiation. There is no shared dispatch; every call is a direct call to a fully-typed function. The trade-off is binary size: each instantiation produces its own code.
 
-Generic bodies are type-checked once, as templates, **before** monomorphisation: a body is checked against its parameters' bounds, never against the types it is later instantiated with, so an error in a generic body is reported whether or not anything instantiates it. One exception: a path through a type parameter naming a member none of its bounds declares (`T::m()`, `T::m`, `(Tr for T)::m`) is found by that check and reported only once the body is instantiated (section on calls through a bound). Monomorphisation then copies each instantiated body with its type arguments substituted and binds every call in the copy to its concrete callee; the copies are not type-checked again, so a call the template check accepts must be one every copy can bind. A method call on the body's own instantiation of a generic type (`xs.get(i)` with `xs: &Array<T>`) is therefore refused where it is written when its arguments bind to no method of the name, by the rule a call's arguments bind by - a `u64` passed for `get`'s `i64` index is refused (E0214), as is an overload set none of whose members takes the arguments. The driver lives in [`compiler/src/compiler/mono/`](../compiler/src/compiler/mono/) (`monomorphizer.cryo`), run from `instance.cryo` after the function-body type check.
+Generic bodies are type-checked once, as templates, **before** monomorphisation: a body is checked against its parameters' bounds, never against the types it is later instantiated with, so an error in a generic body is reported whether or not anything instantiates it. That includes a path through a type parameter naming a member none of its bounds declares (`T::m()`, `T::m`, `(Tr for T)::m`): it is reported once, where the template is checked, for a body nothing instantiates as for one instantiated many times (section on calls through a bound). Monomorphisation then copies each instantiated body with its type arguments substituted and binds every call in the copy to its concrete callee; the copies are not type-checked again, so a call the template check accepts must be one every copy can bind. A method call on the body's own instantiation of a generic type (`xs.get(i)` with `xs: &Array<T>`) is therefore refused where it is written when its arguments bind to no method of the name, by the rule a call's arguments bind by - a `u64` passed for `get`'s `i64` index is refused (E0214), as is an overload set none of whose members takes the arguments. The driver lives in [`compiler/src/compiler/mono/`](../compiler/src/compiler/mono/) (`monomorphizer.cryo`), run from `instance.cryo` after the function-body type check.
 
 ### 11.7 `static match` — Compile-Time Type Dispatch
 
@@ -4624,8 +4624,11 @@ Set the default in cryoconfig, or pick one per build with `--release` / `--dev`
 default = "release"                 # release | debug
 ```
 
-An explicit `[compiler] optimize` overrides the profile's level; `--opt-level=N`
-overrides everything; `-g` forces debug info on regardless of profile.
+An explicit `[compiler] optimize` overrides the level of the profile the
+cryoconfig selects.  A profile picked on the command line (`--release`, `--dev`,
+`--profile=NAME`) sets the level itself, over `[compiler] optimize`, so `--dev`
+is always a fast debug build; `--opt-level=N` overrides everything; `-g` forces
+debug info on regardless of profile.
 
 The level decides what runs over each module's IR before its object is
 emitted.  At `O1`..`O3` that is LLVM's full optimization pipeline at that
