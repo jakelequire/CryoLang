@@ -19,6 +19,7 @@ import compiler::passes::{
 };
 import compiler::codegen::{ inline_bodies, llvm, llvm_types, passes, test_main_codegen, type_map };
 import compiler::codegen::inline_bodies::{ InlineBodies };
+import compiler::codegen::reachable_instances::{ ReachableInstances };
 import compiler::resolver::{
     intern_table, symbol_str, mangled_name
 };
@@ -1733,6 +1734,26 @@ type struct CompilerInstance {
         if (!phase6_failed && ctx.options.mode.codegen_enabled()) {
             Log::debug(LogArea::Driver, f"generating code for {n} modules");
             ctx.decl_index.settle_method_symbols();
+
+            // An executable's every caller is in this build, so an instance
+            // none of its functions reaches is left out of every module.  A
+            // library's callers are not, nor are those of a single object,
+            // assembly or IR file.
+            const emits_whole_program: boolean = config.target_type == TargetType::Executable
+                && match (ctx.options.output) {
+                    OutputOverride::Default => { true }
+                    OutputOverride::Exe(_)  => { true }
+                    _                       => { false }
+                };
+            if (emits_whole_program) {
+                const reach_start: i64 = TimeTrace::now();
+                mut programs: [ProgramNode*] = [];
+                for (mut r: u32 = 0; r < n; r++) {
+                    programs.push(*((ast_buf as void**) + r) as ProgramNode*);
+                }
+                ReachableInstances::omit_unreached(ctx, &programs);
+                TimeTrace::span("stage", Str::new("reachable instances"), Str::new(config.project_name), reach_start);
+            }
 
             // Concise per-package build summary.  Codegen only runs on a real
             // (non-short-circuited) build and never under LSP, so this is safe

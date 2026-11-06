@@ -36,6 +36,7 @@ import compiler::types::substitution::{ TypeSubstitution };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import std::collections::hashmap::{ HashMap };
+import std::collections::hashset::{ HashSet };
 import std::collections::pair::{ Pair };
 import compiler::intrinsic_kind::{ IntrinsicKind };
 import std::core::hash::{ Hash, Hasher };
@@ -410,6 +411,11 @@ private:
     symbol_intern:         mut InternTable*;
     symbol_arena:          TypeArena*;
     symbols_settled:       boolean;
+
+    // The linker symbols of the instances an executable leaves out: no
+    // function its roots reach names them, so no module defines or
+    // declares them (`compiler::codegen::reachable_instances`).
+    omitted_symbols:       HashSet<u32>;
 public:
 
     // --- Module reachability and declaration visibility --------------------
@@ -481,6 +487,7 @@ public:
             symbol_intern:         null,
             symbol_arena:          null,
             symbols_settled:       false,
+            omitted_symbols:       HashSet::<u32>::new(),
             prelude_modules:    [],
             refused_methods:    HashMap::<FamilySlot, boolean>::new(),
             overload_tag:       g_overload_index_tags,
@@ -747,6 +754,18 @@ public:
     inline_body(&this, id: OverloadId) -> Option<InlineBody> {
         if (!id.is_valid()) { return Option::None; }
         return this.inline_bodies.get(&(this.slot_of(id) as u32));
+    }
+
+    /// Leave the definition linked as `symbol` out of every module: nothing
+    /// the build's roots reach calls it.
+    omit_symbol(mut &this, symbol: SymbolStr) -> void {
+        this.omitted_symbols.insert(symbol.id);
+    }
+
+    /// Whether entry `id`'s definition is left out of every module.
+    omits(&this, id: OverloadId) -> boolean {
+        if (this.omitted_symbols.length() == 0 || !id.is_valid()) { return false; }
+        return this.omitted_symbols.contains(&this.entry_symbol(id).spelling().id);
     }
 
     /// The method entry `id` was registered for; null when it names a

@@ -1,0 +1,118 @@
+/// An executable leaves out every generic instance no function it runs can
+/// reach, and keeps every instance code generation reaches without a call
+/// written for it.  Each check below reaches an instance by one such route:
+///
+///   * a trait-object table over an instance, called only through the table;
+///   * an instance's `Drop`, run only by the release of a value going out of
+///     scope, and by a field's release inside another type's;
+///   * an instance's method named as a value, then called through it;
+///   * an instance reached through an operator, an index and a `?`.
+///
+/// A route the reachability walk did not follow would leave the instance out
+/// and the build would stop on it, naming the instance.
+namespace main;
+
+import std::fmt;
+
+mut g_passed: i32 = 0;
+mut g_total: i32 = 0;
+mut g_released: i32 = 0;
+
+function check(what: string, ok: boolean) -> void {
+    g_total = g_total + 1;
+    if (ok) {
+        g_passed = g_passed + 1;
+        return;
+    }
+    fmt::printf("FAIL %s\n", what);
+}
+
+type trait Measure {
+    measure(&this) -> i64;
+}
+
+type struct Holder<T> {
+    value: T;
+    weight: i64;
+}
+
+implement<T> trait Measure for struct Holder<T> {
+    measure(&this) -> i64 { return this.weight * 2; }
+}
+
+function measure_through_object(m: virtual &Measure) -> i64 {
+    return m.measure();
+}
+
+type struct Guard<T> {
+    value: T;
+
+    static new(value: T) -> Guard<T> { return Guard::<T> { value: value }; }
+}
+
+implement<T> trait Drop for struct Guard<T> {
+    drop(mut &this) -> void { g_released = g_released + 1; }
+}
+
+type struct Outer {
+    inner: Guard<i64>;
+}
+
+type struct Counter<T> {
+    count: i64;
+    marker: T;
+
+    bump(&this, by: i64) -> i64 { return this.count + by; }
+}
+
+type struct Pair<T> {
+    left: T;
+    right: T;
+}
+
+implement<T> trait Add<Pair<T>, Pair<T>> for struct Pair<T> {
+    add(&this, other: &Pair<T>) -> Pair<T> {
+        return Pair::<T> { left: this.left, right: other.right };
+    }
+}
+
+function halve(n: i64) -> Result<i64, string> {
+    if (n % 2 != 0) { return Result::Err("odd"); }
+    return Result::Ok(n / 2);
+}
+
+function quarter(n: i64) -> Result<i64, string> {
+    const h: i64 = halve(n)?;
+    return halve(h);
+}
+
+function main(argc: int, argv: string*) -> int {
+    const h: Holder<u8> = Holder::<u8> { value: 1, weight: 21 };
+    check("a table method called only through the table", measure_through_object(&h) == 42);
+
+    {
+        const g: Guard<string> = Guard::<string>::new("held");
+    }
+    check("an instance's Drop run by a scope exit", g_released == 1);
+    {
+        const o: Outer = Outer { inner: Guard::<i64>::new(7) };
+    }
+    check("an instance's Drop run by a field's release", g_released == 2);
+
+    const c: Counter<u16> = Counter::<u16> { count: 40, marker: 0 };
+    const bump: (&Counter<u16>, i64) -> i64 = Counter::<u16>::bump;
+    check("a method named as a value", bump(&c, 2) == 42);
+
+    const a: Pair<i32> = Pair::<i32> { left: 1, right: 2 };
+    const b: Pair<i32> = Pair::<i32> { left: 3, right: 4 };
+    const s: Pair<i32> = a + b;
+    check("an operator", s.left == 1 && s.right == 4);
+
+    const xs: [i16] = [5, 6, 7];
+    check("an index", xs[2] == 7);
+
+    check("a ?", match (quarter(84)) { Result::Ok(v) => { v == 21 } Result::Err(_) => { false } });
+
+    fmt::printf("reached instances: %d of %d checks passed\n", g_passed, g_total);
+    return if (g_passed == g_total) { 0 } else { 1 };
+}

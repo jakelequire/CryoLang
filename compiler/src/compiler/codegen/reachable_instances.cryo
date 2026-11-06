@@ -1,0 +1,310 @@
+///! The instances an executable calls.
+///!
+///! Monomorphization copies every method of every instantiated type, but an
+///! executable calls only some of them.  An executable's functions are all
+///! known when code generation starts, so the instances none of them can
+///! reach are left out of every module: neither defined nor declared.  A
+///! library is linked by programs this build does not see, so it keeps every
+///! instance, as does a build whose output is a single object, assembly or
+///! IR file.
+///!
+///! Reachability follows exactly what code generation resolves a function
+///! through: an expression's callee pin, a string `+`'s `append`, the call an
+///! operator, an index or a `?` was desugared to, and the statements drop
+///! insertion hangs beside the tree - a block's or a `return`'s releases, an
+///! arm's drop-flag writes, the cleanups an unwinding exit runs.  Its roots are every definition that is not an
+///! instance, every method of an implementation with a trait-object table
+///! (the table points at each), and every method of an implementation of a
+///! trait code generation calls by type rather than through a pin - `Drop`,
+///! whose `drop` the destructor of any value runs, and `Allocate`.
+///!
+///! Identity is the linker symbol, as in code generation: two modules may
+///! each hold a definition of one instance, and a reached symbol keeps every
+///! definition of it.  A reference code generation makes to a symbol left out
+///! is an internal error (`SymbolResolver.resolve_decl`), so a reference this
+///! walk does not follow is reported by name rather than as a link failure.
+
+namespace compiler::codegen::reachable_instances;
+
+import compiler::compilation_context::{ CompilationContext };
+import compiler::decl_index::{ DeclarationIndex, OverloadId };
+import compiler::ast::{ node, declaration, expression, statement };
+import compiler::ast::node::{ ProgramNode };
+import compiler::ast::declaration::{
+    DeclarationNode, DeclKind, FunctionDecl, ImplBlock, MethodDecl
+};
+import compiler::ast::expression::{
+    ArrayAccessExpr, BinaryExpr, CalleePin, CallExpr, ExpressionNode, IdentifierExpr,
+    IfExpr, MatchExpr, NewExpr, ScopeResolutionExpr, TernaryExpr, TryExpr, UnaryExpr
+};
+import compiler::ast::statement::{ BlockStmt, MatchStmt, ReturnStmt, Stmt };
+import compiler::ast::walk::{ Walk };
+import compiler::resolver::lang_item::{ LangItem };
+import compiler::resolver::res::{ DefId };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import std::collections::hashmap::{ HashMap };
+import std::collections::hashset::{ HashSet };
+import utils::log::{ Log, LogArea, LogLevel };
+
+type struct ReachableInstances {
+    di: mut DeclarationIndex*;
+    /// The traits code generation calls the implementations of by the
+    /// type a value has, with no pin naming the method.
+    traits_called_by_type: [DefId];
+    /// Every instance definition, chained per symbol: `last_definition`
+    /// holds a symbol's latest position here, `earlier_definition` each
+    /// position's predecessor under the same symbol (-1 for none).
+    definitions: [DeclarationNode*];
+    earlier_definition: [i64];
+    last_definition: HashMap<u32, i64>;
+    /// Every instance symbol, by id, in the order first defined.
+    instance_symbols: [u32];
+    /// The symbols a root reaches, by id.
+    reached: HashSet<u32>;
+    /// Function declarations whose bodies are still to be walked.
+    pending: [DeclarationNode*];
+
+    /// Leave out of `programs` every instance their roots do not reach,
+    /// recording each left-out symbol in the declaration index.
+    static omit_unreached(ctx: mut CompilationContext*, programs: &[ProgramNode*]) -> void {
+        mut walk: ReachableInstances = ReachableInstances {
+            di: ctx.decl_index,
+            traits_called_by_type: [
+                ctx.defs.parent_of(ctx.generic_registry.wellknown(LangItem::DropDrop)),
+                ctx.generic_registry.wellknown(LangItem::Allocate),
+            ],
+            definitions: [],
+            earlier_definition: [],
+            last_definition: HashMap::<u32, i64>::new(),
+            instance_symbols: [],
+            reached: HashSet::<u32>::new(),
+            pending: [],
+        };
+        for (mut i: i64 = 0; i < programs.length(); i++) {
+            walk.enter_program(programs[i]);
+        }
+        mut walked: i64 = 0;
+        while (walked < walk.pending.length()) {
+            const body: Stmt* = DeclarationNode::fn_of(walk.pending[walked]).body;
+            walked += 1;
+            walk.walk_stmt(body);
+        }
+        mut omitted: i64 = 0;
+        for (mut i: i64 = 0; i < walk.instance_symbols.length(); i++) {
+            const symbol: u32 = walk.instance_symbols[i];
+            if (!walk.reached.contains(&symbol)) {
+                walk.di.omit_symbol(SymbolStr::from_id(symbol));
+                omitted += 1;
+            }
+        }
+        if (Log::enabled(LogArea::Codegen, LogLevel::Debug)) {
+            Log::debug(LogArea::Codegen, f"instances: {walk.instance_symbols.length()} symbols defined, {omitted} unreached and left out; {walked} bodies walked");
+        }
+    }
+
+    /// Record `root`'s definitions: an instance under its symbol, anything
+    /// else as a root.
+    enter_program(mut &this, root: ProgramNode*) -> void {
+        if (root == null) { return; }
+        for (mut i: i64 = 0; i < root.statements.length(); i++) {
+            const stmt: DeclarationNode* = root.statements[i].as_decl();
+            if (stmt == null) { continue; }
+            match (stmt.kind) {
+                DeclKind::Function(_) => { this.enter_function(stmt); }
+                DeclKind::Impl(block) => {
+                    if (block.is_template()) { continue; }
+                    this.enter_methods(&block.methods);
+                    // A table holds a slot for each method of every
+                    // implementation it covers, its traits' supertraits'
+                    // among them.
+                    if (block.object_table_symbol.is_valid()) {
+                        for (mut t: i64 = 0; t < block.object_table_blocks.length(); t++) {
+                            this.reach_methods(&block.object_table_blocks[t].methods);
+                        }
+                    }
+                }
+                DeclKind::Struct(sd) => {
+                    if (sd.generic_params.length() > 0) { continue; }
+                    this.enter_methods(&sd.methods);
+                }
+                DeclKind::Union(ud) => {
+                    if (ud.generic_params.length() > 0) { continue; }
+                    this.enter_methods(&ud.methods);
+                }
+                DeclKind::Variable(vd) => { this.walk_expr(vd.initializer); }
+                DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
+                | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
+                | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::Trait(_)
+                | DeclKind::TypeAlias(_) | DeclKind::Variant(_) | DeclKind::Method(_) => { }
+            }
+        }
+    }
+
+    /// Record the methods of one declaration.
+    enter_methods(mut &this, methods: &[DeclarationNode*]) -> void {
+        for (mut i: i64 = 0; i < methods.length(); i++) {
+            const method: MethodDecl* = DeclarationNode::method_of(methods[i]);
+            if (method == null || method.func == null) { continue; }
+            this.enter_function(method.func);
+        }
+    }
+
+    /// Reach every method of one implementation, wherever it is defined.
+    reach_methods(mut &this, methods: &[DeclarationNode*]) -> void {
+        for (mut i: i64 = 0; i < methods.length(); i++) {
+            const method: MethodDecl* = DeclarationNode::method_of(methods[i]);
+            if (method == null || method.func == null) { continue; }
+            this.reach_entry(DeclarationNode::fn_of(method.func).overload_entry);
+        }
+    }
+
+    /// Record one function: a root unless it is an instance code generation
+    /// calls only through a pin.
+    enter_function(mut &this, function_decl: DeclarationNode*) -> void {
+        const callee: FunctionDecl* = DeclarationNode::fn_of(function_decl);
+        if (callee == null || callee.body == null || callee.generic_params.length() > 0) { return; }
+        if (callee.is_self_returning_default || callee.is_lazy_self_growing) { return; }
+        if (!callee.is_specialization) {
+            this.pending.push(function_decl);
+            return;
+        }
+        const symbol: u32 = this.di.entry_symbol(callee.overload_entry).spelling().id;
+        if (symbol == 0) { return; }
+        match (this.last_definition.get(&symbol)) {
+            Option::Some(last) => { this.earlier_definition.push(last); }
+            Option::None => {
+                this.earlier_definition.push(-1);
+                this.instance_symbols.push(symbol);
+            }
+        }
+        this.last_definition.insert(symbol, this.definitions.length());
+        this.definitions.push(function_decl);
+        if (this.reached.contains(&symbol)) {
+            this.pending.push(function_decl);
+        } else if (this.called_by_type(callee.overload_entry)) {
+            this.reach_symbol(symbol);
+        }
+    }
+
+    called_by_type(&this, entry: OverloadId) -> boolean {
+        const trait_def: DefId = this.di.entry_trait(entry);
+        if (!trait_def.is_valid()) { return false; }
+        for (mut i: i64 = 0; i < this.traits_called_by_type.length(); i++) {
+            if (trait_def.equals(this.traits_called_by_type[i])) { return true; }
+        }
+        return false;
+    }
+
+    /// Reach the entry a pin names.
+    reach_pin(mut &this, pin: CalleePin) -> void {
+        match (pin) {
+            CalleePin::Decl(e)     => { this.reach_entry(e); }
+            CalleePin::Instance(i) => { this.reach_entry(this.di.entry_of_instance(i)); }
+            CalleePin::None        => { }
+        }
+    }
+
+    reach_entry(mut &this, entry: OverloadId) -> void {
+        if (!entry.is_valid()) { return; }
+        const symbol: u32 = this.di.entry_symbol(entry).spelling().id;
+        if (symbol != 0) { this.reach_symbol(symbol); }
+    }
+
+    /// Mark `symbol` reached, queueing the bodies of the instances defined
+    /// under it the first time.
+    reach_symbol(mut &this, symbol: u32) -> void {
+        if (!this.reached.insert(symbol)) { return; }
+        match (this.last_definition.get(&symbol)) {
+            Option::Some(last) => {
+                mut at: i64 = last;
+                while (at >= 0) {
+                    this.pending.push(this.definitions[at]);
+                    at = this.earlier_definition[at];
+                }
+            }
+            Option::None => { }
+        }
+    }
+
+    walk_cleanup(mut &this, cleanup: &[Stmt*]) -> void {
+        for (mut i: i64 = 0; i < cleanup.length(); i++) { this.walk_stmt(cleanup[i]); }
+    }
+}
+
+implement trait Walk for struct ReachableInstances {
+    walk_call(mut &this, e: mut ExpressionNode*, n: mut CallExpr*) -> void {
+        this.reach_pin(n.resolved_callee);
+        CallExpr::walk_children(n, this);
+        this.walk_cleanup(&n.unwind_cleanup);
+    }
+
+    walk_identifier(mut &this, e: mut ExpressionNode*, n: mut IdentifierExpr*) -> void {
+        this.reach_pin(n.resolved_callee);
+        IdentifierExpr::walk_children(n, this);
+    }
+
+    walk_scope_resolution(mut &this, e: mut ExpressionNode*, n: mut ScopeResolutionExpr*) -> void {
+        this.reach_pin(n.resolved_callee);
+        ScopeResolutionExpr::walk_children(n, this);
+    }
+
+    walk_binary(mut &this, e: mut ExpressionNode*, n: BinaryExpr*) -> void {
+        this.reach_entry(n.append_entry);
+        BinaryExpr::walk_children(n, this);
+        this.walk_expr(n.desugared_call);
+        this.walk_cleanup(&n.unwind_cleanup);
+    }
+
+    walk_unary(mut &this, e: mut ExpressionNode*, n: UnaryExpr*) -> void {
+        UnaryExpr::walk_children(n, this);
+        this.walk_expr(n.desugared_call);
+    }
+
+    walk_array_access(mut &this, e: mut ExpressionNode*, n: ArrayAccessExpr*) -> void {
+        ArrayAccessExpr::walk_children(n, this);
+        this.walk_expr(n.desugared_call);
+        this.walk_cleanup(&n.unwind_cleanup);
+    }
+
+    walk_new(mut &this, e: mut ExpressionNode*, n: mut NewExpr*) -> void {
+        NewExpr::walk_children(n, this);
+        this.walk_cleanup(&n.unwind_cleanup);
+    }
+
+    walk_try(mut &this, e: mut ExpressionNode*, n: TryExpr*) -> void {
+        TryExpr::walk_children(n, this);
+        this.walk_expr(n.desugared);
+    }
+
+    walk_match_expr(mut &this, e: mut ExpressionNode*, n: MatchExpr*) -> void {
+        MatchExpr::walk_children(n, this);
+        this.walk_cleanup(&n.unwind_cleanup);
+    }
+
+    walk_match_stmt(mut &this, s: Stmt*, n: MatchStmt*) -> void {
+        MatchStmt::walk_children(n, this);
+        this.walk_cleanup(&n.unwind_cleanup);
+    }
+
+    walk_block(mut &this, s: Stmt*, n: BlockStmt*) -> void {
+        BlockStmt::walk_children(n, this);
+        this.walk_cleanup(&n.synth_drops);
+    }
+
+    walk_return(mut &this, s: Stmt*, n: ReturnStmt*) -> void {
+        ReturnStmt::walk_children(n, this);
+        this.walk_cleanup(&n.synth_drops);
+    }
+
+    walk_if_expr(mut &this, e: mut ExpressionNode*, n: IfExpr*) -> void {
+        IfExpr::walk_children(n, this);
+        this.walk_cleanup(&n.then_flag_writes);
+        this.walk_cleanup(&n.else_flag_writes);
+    }
+
+    walk_ternary(mut &this, e: mut ExpressionNode*, n: TernaryExpr*) -> void {
+        TernaryExpr::walk_children(n, this);
+        this.walk_cleanup(&n.then_flag_writes);
+        this.walk_cleanup(&n.else_flag_writes);
+    }
+}
