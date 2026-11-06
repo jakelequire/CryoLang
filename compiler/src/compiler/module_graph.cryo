@@ -24,6 +24,9 @@ import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::decl_name::{ DeclName };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::diag::source_span::{ SourceSpan };
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::lex::{ Token };
+import std::core::mem;
 import compiler::resolver::res::{ DeclVisibility, DefId, DefTable, DefKind };
 import compiler::resolver::lang_item::{ LangModule };
 
@@ -196,6 +199,21 @@ implement trait Eq for struct ModuleKey {
 }
 
 /// Metadata about a single compilation module (source file).
+/// A module's file as discovery lexed it: its tokens, and the diagnostics
+/// lexing it reported, in the order reported.  Discovery lexes each file to
+/// read its imports; the lexing pass takes what it lexed (`ModuleInfo.
+/// take_lexed`) and reports the diagnostics then, in module order, so each
+/// file is lexed once.  A file discovery could not read has no tokens and
+/// the read failure as its diagnostic.
+type struct LexedSource {
+    tokens:      [Token];
+    diagnostics: [Diagnostic];
+
+    static empty() -> LexedSource {
+        return LexedSource { tokens: [], diagnostics: [] };
+    }
+}
+
 type struct ModuleInfo {
 private:
     /// The module's path, its identity: `path()`.
@@ -283,6 +301,9 @@ public:
     /// recomposing the namespace.  Invalid for a module with no namespace.
     def:               DefId;
 
+    /// The file as discovery lexed it, until the lexing pass takes it.
+    lexed:             LexedSource;
+
     static with_namespace(name: SymbolStr, path: string, ns: SymbolStr) -> ModuleInfo {
         return ModuleInfo {
             name:               name,
@@ -303,7 +324,15 @@ public:
             origin:             ModuleOrigin::Local,
             origin_name:        "",
             def:                DefId::invalid(),
+            lexed:              LexedSource::empty(),
         };
+    }
+
+    /// Take the file as discovery lexed it, leaving nothing behind.
+    take_lexed(mut &this) -> LexedSource {
+        mut taken: LexedSource = LexedSource::empty();
+        mem::swap(&taken, &this.lexed);
+        return taken;
     }
 
     /// This registered module's own path.

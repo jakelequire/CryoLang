@@ -11,7 +11,8 @@ import compiler::diag::{
     sink, diagnostic, source_span, edit_distance, ErrorCode
 };
 import compiler::resolver::{ symbol_str, intern_table };
-import compiler::module_graph::{ ModuleGraph, ModuleInfo };
+import compiler::module_graph::{ LexedSource, ModuleGraph, ModuleInfo };
+import compiler::diag::config::{ DiagConfig };
 import compiler::lex::{ Token, TokenType };
 import compiler::lex::lexer::{ Lexer };
 import compiler::project_config::{ ProjectConfig, VendorPin };
@@ -332,19 +333,18 @@ public:
     }
 
     /// Load the source text for `file_path`: an open buffer's when one
-    /// names it (`SourceOverride::content_for`, which the Lexing pass asks
-    /// too), otherwise the file's.  On-disk reads are leaked as a
+    /// names it (`SourceOverride::content_for`), otherwise the file's; none
+    /// when the file cannot be read.  On-disk reads are leaked as a
     /// NUL-terminated `string` (via `into_raw`) so token lexemes pointing
-    /// into it stay valid; an unreadable file yields "" (the lexer then
-    /// produces only EOF).
-    source_for(&this, file_path: string) -> string {
+    /// into it stay valid for the rest of compilation.
+    source_for(&this, file_path: string) -> Option<string> {
         match (SourceOverride::content_for(&this.lsp_overrides, file_path)) {
-            Option::Some(content) => { return content; }
+            Option::Some(content) => { return Option::Some(content); }
             Option::None          => { }
         }
         match (File::read_text(Path::from(file_path))) {
-            Result::Ok(s)  => { return s.into_raw(); }
-            Result::Err(_) => { return ""; }
+            Result::Ok(s)  => { return Option::Some(s.into_raw()); }
+            Result::Err(_) => { return Option::None; }
         }
     }
 
@@ -507,7 +507,8 @@ public:
             SourceOverride::content_for(&this.lsp_overrides, file_path).is_some();
         if (!is_override && !Path::from(file_path).exists()) { return; }
 
-        const source: string = this.source_for(file_path);
+        // An unreadable file declares nothing: it is lexed as empty.
+        const source: string = this.source_for(file_path).unwrap_or("");
         const content: string = NamespaceIndexCache::content_digest(source);
         mut declared: IndexedFile = IndexedFile::none();
         const cached: boolean = this.index_cache_open
@@ -516,7 +517,7 @@ public:
             mut scan_sink: DiagnosticSink = DiagnosticSink::new();
             mut lexer: Lexer = Lexer::new(file_path, source, &scan_sink);
             const tokens: [Token] = lexer.lex();
-            const scan: ModuleScanResult = ModuleLoader::scan_tokens(intern, tokens);
+            const scan: ModuleScanResult = ModuleLoader::scan_tokens(intern, &tokens);
             declared.content = String::from_string(content);
             if (scan.namespace_name.is_valid()) {
                 declared.namespace_name = String::from_string(intern.resolve(scan.namespace_name));
@@ -830,16 +831,28 @@ public:
             Log::trace(LogArea::Loader, f"discovering {file_path}");
         }
 
-        // Quick-scan the file: lex only, extract namespace and import paths
+        // Lex the file once: its namespace and imports are read from the
+        // tokens here, and the module keeps the tokens and the reports
+        // lexing made for the lexing pass (`LexedSource`), which reports
+        // them in module order.  The sink keeps every report, so the
+        // compilation's own sink applies its config to them then.
         const scan_start: i64 = TimeTrace::now();
         mut scan_sink: DiagnosticSink = DiagnosticSink::new();
-        const source: string = this.source_for(file_path);
-        mut lexer: Lexer = Lexer::new(file_path, source, &scan_sink);
-        const tokens: [Token] = lexer.lex();
+        scan_sink.set_config(DiagConfig::keeping_every_report());
+        const read: Option<string> = this.source_for(file_path);
+        mut lexer: Lexer = Lexer::new(file_path, read.unwrap_or(""), &scan_sink);
+        mut tokens: [Token] = lexer.lex();
 
         // Extract namespace and imports from token stream
-        const scan: ModuleScanResult = ModuleLoader::scan_tokens(intern, tokens);
+        const scan: ModuleScanResult = ModuleLoader::scan_tokens(intern, &tokens);
         TimeTrace::span("loader", Str::new("scan imports"), Str::new(file_path), scan_start);
+        if (read.is_none()) {
+            scan_sink.emit(Diagnostic::error(ErrorCode::E0801_FILE_READ_ERROR,
+                fmt::format("Could not read source file: %s", file_path)));
+            tokens.clear();
+        }
+        mut lexed: LexedSource = LexedSource { tokens: tokens, diagnostics: [] };
+        mem::swap(&lexed.diagnostics, &scan_sink.diagnostics);
 
         // Note if this module uses an f-string so the orchestrator can
         // force-discover the f-string runtime (std::fmt::interp) on demand.
@@ -866,6 +879,7 @@ public:
         mut info: ModuleInfo = ModuleInfo::with_namespace(
             mod_name, file_path, mod_name);
         info.declared_internal = this.declared_internal(intern, norm_path);
+        info.lexed = lexed;
 
         // Publish this module's namespace BEFORE recursing into its imports.
         // Inside a cycle the recursion comes back around and asks for this
@@ -1319,7 +1333,7 @@ public:
     /// Scan a token stream for `namespace` and `import` declarations.
     /// Does NOT build an AST; just extracts the module-level metadata
     /// needed for dependency discovery.
-    static scan_tokens(intern: mut InternTable*, tokens: [Token]) -> ModuleScanResult {
+    static scan_tokens(intern: mut InternTable*, tokens: &[Token]) -> ModuleScanResult {
         mut ns: string = "";
         mut imports: [string] = [];
         mut import_spans: [SourceSpan] = [];

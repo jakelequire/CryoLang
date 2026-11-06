@@ -14,7 +14,6 @@ import compiler::{
 };
 import compiler::diag::{ ErrorCode, sink, snapshot, source_span };
 import compiler::lex::{ Token, TokenType };
-import compiler::lex::lexer::{ Lexer };
 import compiler::ast::{ declaration, ImportStyle, node, Visibility };
 import compiler::types::{ arena, type_ref, TypeKind };
 import compiler::passes::{
@@ -32,9 +31,7 @@ import compiler::codegen::passes::{ CodegenPasses };
 import utils;
 import utils::log::{ Log, LogArea, LogLevel };
 import utils::time_trace::{ TimeTrace };
-import std::fs::file::{ File };
-import std::fs::file;
-import std::fs::path::{ Path };
+import std::core::mem;
 import std::collections::string::{ String };
 import std::collections::str::{ Str };
 import compiler::types::type_base::{ Type };
@@ -47,10 +44,10 @@ import compiler::ast::declaration::{
     TraitDecl, UnionDecl
 };
 import compiler::ast::node::{ Node, ProgramNode };
-import compiler::compilation_context::{ CompilationContext, LangRef, SourceOverride };
+import compiler::compilation_context::{ CompilationContext, LangRef };
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::diag::source_span::{ SourceSpan };
-import compiler::module_graph::{ ModuleGraph };
+import compiler::module_graph::{ LexedSource, ModuleGraph };
 import compiler::module_loader::{ ModuleLoader };
 import compiler::passes::ast_validation::{ ASTValidationPass };
 import compiler::passes::config_gating::{ ConfigGatingPasses };
@@ -374,7 +371,9 @@ type struct PassRegistry {
 
     // Lexing Pass
 
-    /// Reads the source file and tokenizes it.  Populates ctx.artifacts.tokens.
+    /// Takes the module's tokens as discovery lexed them, reports what lexing
+    /// them reported, and cleans them for the parser.  Populates
+    /// ctx.artifacts.tokens.
     static run_lexing_pass(ctx: mut CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
         const source_path: string = ctx.source_file;
@@ -383,36 +382,23 @@ type struct PassRegistry {
             Log::debug(LogArea::Lex, f"lexing {source_path}");
         }
 
-        // A module the language server has open is lexed from its buffer,
-        // the same text module discovery read (`SourceOverride::content_for`
-        // answers both).  Otherwise the source is read from disk and leaked
-        // as a NUL-terminated `string` (via `into_raw`) so token lexemes
-        // pointing into it stay valid for the rest of compilation.
-        mut source: string = "";
-        const overlay: Option<string> =
-            SourceOverride::content_for(&ctx.options.source_overrides, source_path);
-        if (overlay.is_some()) {
-            source = overlay.unwrap_or("");
-        } else {
-            if (!Path::from(source_path).exists()) {
-                ctx.emit_error(ErrorCode::E0800_FILE_NOT_FOUND,
-                    fmt::format("Source file not found: %s", source_path));
-                return PassResult::failure(1);
-            }
-            match (File::read_text(Path::from(source_path))) {
-                Result::Ok(s)  => { source = s.into_raw(); }
-                Result::Err(_) => {
-                    ctx.emit_error(ErrorCode::E0801_FILE_READ_ERROR,
-                        fmt::format("Could not read source file: %s", source_path));
-                    return PassResult::failure(1);
-                }
+        mut lexed: LexedSource = ctx.module_graph.modules[ctx.active_module_index].take_lexed();
+        lexed.diagnostics.reverse();
+        loop {
+            match (lexed.diagnostics.pop()) {
+                Option::Some(report) => { ctx.diagnostics.emit(report); }
+                Option::None => { break; }
             }
         }
-        mut lexer: Lexer      = Lexer::new(source_path, source, ctx.diagnostics);
-        const tokens: [Token] = lexer.lex();
+        mut tokens: [Token] = [];
+        mem::swap(&tokens, &lexed.tokens);
 
+        // A file discovery could not read has no tokens and its read
+        // failure already reported.
         if (tokens.length() == 0) {
-            ctx.emit_error(ErrorCode::E0011_LEXING_EXCEPTION, fmt::format("Lexer produced no tokens for: %s", source_path));
+            if (ctx.diagnostics.errors_since(snap) == 0) {
+                ctx.emit_error(ErrorCode::E0011_LEXING_EXCEPTION, fmt::format("Lexer produced no tokens for: %s", source_path));
+            }
             return PassResult::failure(1);
         }
 
