@@ -47,18 +47,46 @@ import compiler::resolver::mangled_name::{ MangledName };
 
 // Linker configuration per target
 
+/// The answers `LinkerConfig` gets by launching the C toolchain, kept for
+/// the life of the process: which driver a target's default resolves to,
+/// and whether that driver unwinds through libgcc.  Neither can change while
+/// the process runs, and each costs a process launch, which on a small
+/// build is a large share of the wall time.  One target's answers are held;
+/// a link for a target with another default driver probes again.
+///
+/// Every string held here is a literal: the per-target arena is reset
+/// between targets, so nothing allocated during a build may outlive it here.
+/// That is why a `CRYO_CC` driver is read from the environment on every use
+/// rather than held.
+type struct ToolchainProbe {
+    /// The target default the answers are for; "" before the first probe.
+    default_driver:       string;
+    /// The launchable driver found for it; "" until something asks.
+    launchable_driver:    string;
+    libgcc_probed:        boolean;
+    unwinds_with_libgcc:  boolean;
+}
+
+mut g_toolchain_probe: ToolchainProbe = ToolchainProbe {
+    default_driver: "", launchable_driver: "", libgcc_probed: false, unwinds_with_libgcc: false,
+};
+
 /// What the link pass needs to know about the active target's
 /// toolchain: which driver binary to invoke, what to put on the system
 /// library line, and whether the executable filename grows an `.exe`
 /// suffix.  Built by `linker_config_for_triple` from the resolved
-/// target triple by `run_linking`.
+/// target triple.  Building one launches nothing: the suffix, the library
+/// line and `supported` follow from the triple alone, and the driver is
+/// resolved by `link_driver` only when a link needs it.
 ///
 /// `supported`:
 ///   - true  for triples we know how to drive end-to-end.
 ///   - false for triples where we still want the historic bailout
 ///           (object files only; user finishes the link manually).
 type struct LinkerConfig {
-    driver:              string;
+    /// The driver this target links with when `CRYO_CC` names none and it
+    /// can be launched (`link_driver`).  Always a literal.
+    default_driver:      string;
     exe_suffix:          string;
     extra_system_libs:   string;
     supported:           boolean;
@@ -96,7 +124,7 @@ type struct LinkerConfig {
                 && triple.contains("gnu")
                 && triple.contains("x86_64")) {
             return LinkerConfig {
-                driver:             LinkerConfig::windows_gnu_link_driver(),
+                default_driver:     LinkerConfig::windows_gnu_link_driver(),
                 // `-lws2_32` for std::net (Winsock) and `-lntdll` for the
                 // async reactor (its readiness backend polls `\Device\Afd`
                 // through the NT layer); mingw auto-links neither, the way it
@@ -110,11 +138,90 @@ type struct LinkerConfig {
         }
         // Unknown triple - keep the existing object-files-only behaviour.
         return LinkerConfig {
-            driver:             "",
+            default_driver:     "",
             exe_suffix:         "",
             extra_system_libs:  "",
             supported:          false,
         };
+    }
+
+    /// The C driver this target links with.  `CRYO_CC` overrides everything,
+    /// mirroring `pick_archiver`'s `CRYO_AR`.  With no override the driver is
+    /// found by launching candidates, once per process (`ToolchainProbe`):
+    ///
+    ///   1. The target's `default_driver` wins whenever it's launchable.
+    ///      This is the historic choice on every host where it exists - `cc`
+    ///      on a POSIX host, `x86_64-w64-mingw32-gcc` on a Linux->windows
+    ///      cross - so existing flows and selfhost byte-identity are unchanged
+    ///      (on Linux/CI `cc` is present, so the fallback never fires).
+    ///   2. Only when the default is ABSENT do we probe further.  This is the
+    ///      native mingw/MSYS2 case: `host_linker_config` asks for `cc`, but a
+    ///      stock box ships `gcc`/`clang` instead.  `gcc` is tried before
+    ///      `clang` because on a mingw host `gcc` links gnu-ABI objects
+    ///      natively while a bare `clang` may default to the msvc target.
+    ///   3. A cross driver (`*-mingw32-*`) that's missing has no sane host
+    ///      substitute, so we DON'T fall back for it - the original name is
+    ///      kept so the link error names the absent cross toolchain.
+    link_driver(&this) -> string {
+        match (env::var(Str::new("CRYO_CC"))) {
+            Option::Some(v) => {
+                const env_val: string = v.into_raw();
+                if (env_val.length() > 0) { return env_val; }
+            }
+            Option::None => {}
+        }
+        this.hold_probe();
+        if (g_toolchain_probe.launchable_driver.length() == 0) {
+            g_toolchain_probe.launchable_driver = LinkerConfig::first_launchable_driver(this.default_driver);
+        }
+        return g_toolchain_probe.launchable_driver;
+    }
+
+    /// Whether the link driver's toolchain takes its unwinder from libgcc:
+    /// the driver resolves `libgcc_eh.a` to a path (`-print-file-name` echoes
+    /// the bare name back when the file is not in its search dirs).  A
+    /// toolchain without it unwinds through LLVM's libunwind instead.  Asked
+    /// once per process (`ToolchainProbe`); the probe's output goes to
+    /// `log_path`, which is removed afterwards.
+    unwinds_with_libgcc(&this, log_path_text: string) -> boolean {
+        const driver: string = this.link_driver();
+        this.hold_probe();
+        if (!g_toolchain_probe.libgcc_probed) {
+            Log::debug(LogArea::Link, f"launching `{driver} -print-file-name=libgcc_eh.a` to find the unwinder");
+            mut out: string = "";
+            const rc: i32 = CodegenPasses::capture_tool(
+                fmt::format("%s -print-file-name=libgcc_eh.a", driver), log_path_text, &out);
+            File::remove(Path::from(log_path_text));
+            const answer: string = out;
+            g_toolchain_probe.unwinds_with_libgcc = rc == 0 && (answer.contains("/") || answer.contains("\\"));
+            g_toolchain_probe.libgcc_probed = true;
+        }
+        return g_toolchain_probe.unwinds_with_libgcc;
+    }
+
+    /// Make the process's `ToolchainProbe` the one for this target's default
+    /// driver, dropping another target's answers.
+    hold_probe(&this) -> void {
+        if (g_toolchain_probe.default_driver == this.default_driver) { return; }
+        g_toolchain_probe = ToolchainProbe {
+            default_driver:      this.default_driver,
+            launchable_driver:   "",
+            libgcc_probed:       false,
+            unwinds_with_libgcc: false,
+        };
+    }
+
+    /// The first driver that can be launched for `default_driver`, by the
+    /// order `link_driver` gives.  Every answer is a literal.
+    static first_launchable_driver(default_driver_text: string) -> string {
+        const default_driver: string = default_driver_text;
+        if (CodegenPasses::tool_available(default_driver_text)) { return default_driver; }
+        if (!default_driver.contains("mingw")) {
+            if (CodegenPasses::tool_available("gcc"))   { return "gcc"; }
+            if (CodegenPasses::tool_available("clang")) { return "clang"; }
+            if (CodegenPasses::tool_available("cc"))    { return "cc"; }
+        }
+        return default_driver;
     }
 
     /// The host-build `LinkerConfig`: what to run when the user did NOT pass
@@ -139,7 +246,7 @@ type struct LinkerConfig {
     ![target(unix)]
     static host_linker_config() -> LinkerConfig {
         return LinkerConfig {
-            driver:             CodegenPasses::pick_link_driver("cc"),
+            default_driver:     "cc",
             exe_suffix:         "",
             extra_system_libs:  "-lm -lstdc++",
             supported:          true,
@@ -152,21 +259,21 @@ type struct LinkerConfig {
     /// places a base relocation over every thread-local's section-relative
     /// offset, so once the loader moves the image the program faults on its
     /// first thread-local access, and lld does not.  `CRYO_CC` overrides
-    /// either (`pick_link_driver`).
+    /// either (`link_driver`).
     ![target(unix)]
     static windows_gnu_link_driver() -> string {
-        return CodegenPasses::pick_link_driver("clang-20 --target=x86_64-w64-mingw32 -fuse-ld=lld");
+        return "clang-20 --target=x86_64-w64-mingw32 -fuse-ld=lld";
     }
 
     ![target(windows)]
     static windows_gnu_link_driver() -> string {
-        return CodegenPasses::pick_link_driver("x86_64-w64-mingw32-gcc");
+        return "x86_64-w64-mingw32-gcc";
     }
 
     ![target(windows)]
     static host_linker_config() -> LinkerConfig {
         return LinkerConfig {
-            driver:             CodegenPasses::pick_link_driver("cc"),
+            default_driver:     "cc",
             exe_suffix:         ".exe",
             extra_system_libs:  "-lm -lws2_32 -lntdll",
             supported:          true,
@@ -230,21 +337,6 @@ type struct CodegenPasses {
         }
         *out = text;
         return rc;
-    }
-
-    /// Whether the link driver's toolchain takes its unwinder from libgcc:
-    /// the driver resolves `libgcc_eh.a` to a path (`-print-file-name` echoes
-    /// the bare name back when the file is not in its search dirs).  A
-    /// toolchain without it unwinds through LLVM's libunwind instead.  The
-    /// probe's output goes to `log_path`, which is removed afterwards.
-    static unwinds_with_libgcc(driver_text: string, log_path_text: string) -> boolean {
-        const driver: string = driver_text;
-        mut out: string = "";
-        const rc: i32 = CodegenPasses::capture_tool(
-            fmt::format("%s -print-file-name=libgcc_eh.a", driver), log_path_text, &out);
-        File::remove(Path::from(log_path_text));
-        const answer: string = out;
-        return rc == 0 && (answer.contains("/") || answer.contains("\\"));
     }
 
     /// The error for a toolchain command that failed: what ran, where its
@@ -327,7 +419,7 @@ type struct CodegenPasses {
     /// benefit (identical ABI).  An LLVM-libunwind / freestanding combination
     /// that needs an explicit unwinder is a follow-up (a `[link]`-config knob).
     static append_hosted_runtime_libs(ctx: CompilationContext*, cmd_text: string,
-                                      triple_text: string, driver_text: string,
+                                      triple_text: string, link_cfg: LinkerConfig*,
                                       probe_log_text: string) -> string {
         const cmd: string = cmd_text;
         const triple: string = triple_text;
@@ -368,7 +460,7 @@ type struct CodegenPasses {
         // `libgcc_eh`, ships no libunwind to link, and a gcc driver rejects
         // `--unwindlib` outright ("unrecognized command line option").
         if (triple.contains("windows")
-                && !CodegenPasses::unwinds_with_libgcc(driver_text, probe_log_text)) {
+                && !link_cfg.unwinds_with_libgcc(probe_log_text)) {
             out = fmt::format("%s --unwindlib=none -Wl,-Bstatic -lunwind -Wl,-Bdynamic", out);
         }
         if (ctx.options.static_link) {
@@ -1528,8 +1620,9 @@ type struct CodegenPasses {
             return PassResult::failure(1);
         }
 
+        const link_driver: string = link_cfg.link_driver();
         mut cmd: string = fmt::format("%s -o %s @\"%s\"",
-            link_cfg.driver, CodegenPasses::link_quote(exe_path), link_rsp_path);
+            link_driver, CodegenPasses::link_quote(exe_path), link_rsp_path);
         // The prebuilt stdlib archive (`prebuilt_stdlib`) supplies what the
         // program's stdlib modules' objects no longer define.  It comes right
         // after the objects, ahead of the libraries the project names: its
@@ -1656,7 +1749,7 @@ type struct CodegenPasses {
             cmd = CodegenPasses::append_runtime_tier_libs(ctx, cmd, effective_triple);
         } else {
             cmd = CodegenPasses::append_hosted_runtime_libs(ctx, cmd, effective_triple,
-                link_cfg.driver, fmt::format("%s.probe", link_rsp_path));
+                &link_cfg, fmt::format("%s.probe", link_rsp_path));
         }
         // Cryo runtime support is fully inline-lowered: every intrinsic
         // with a kind (ptr_diff, fpclass, atomic_*, dirent_*, ...) is
@@ -1690,7 +1783,7 @@ type struct CodegenPasses {
             // unreplayable - the linker just reports the missing file instead
             // of the original error.
             ctx.emit_diagnostic(CodegenPasses::tool_failure(
-                fmt::format("linker invocation failed (%s exited with %d)", link_cfg.driver, rc),
+                fmt::format("linker invocation failed (%s exited with %d)", link_driver, rc),
                 cmd, link_rsp_path, link_out));
             return PassResult::failure(1);
         }
@@ -1798,7 +1891,7 @@ type struct CodegenPasses {
         // `s` writes the symbol index that `ld` consults to satisfy
         // references.
         //
-        // Archiver selection mirrors `pick_c_preprocessor`'s `CRYO_CC` knob:
+        // Archiver selection mirrors `LinkerConfig::link_driver`'s `CRYO_CC` knob:
         // `CRYO_AR` overrides the default `ar`.  This is what lets a
         // Windows-hosted `cryo.exe` (e.g. run under wine) point at an
         // `llvm-ar.exe` it can actually launch, since the host's ELF `ar`
@@ -2038,11 +2131,12 @@ type struct CodegenPasses {
     /// True if `tool` can be launched, probed via `<tool> --version` with both
     /// streams sent to the null device.  A missing binary makes `spawn` fail
     /// (Windows) or the child `_exit(127)` (POSIX), so a successful exit means
-    /// it's usable.  Mirrors `pick_c_preprocessor`'s `cc_available` probe.  The
+    /// it's usable.  The
     /// probe runs after IR is emitted (link/archive time), so the tool chosen
     /// never affects the `.ll` the selfhost gate compares.
     static tool_available(tool_text: string) -> boolean {
         const tool: string = tool_text;
+        Log::debug(LogArea::Link, f"launching `{tool} --version` to see whether it can be launched");
         mut probe: Command = Command::new(Str::new(tool));
         probe.arg(Str::new("--version"));
         probe.stdout(Stdio::Null);
@@ -2054,7 +2148,7 @@ type struct CodegenPasses {
     }
 
     /// Pick the static archiver binary.  `CRYO_AR` overrides everything,
-    /// mirroring `pick_c_preprocessor`'s `CRYO_CC` knob - this is what lets a
+    /// mirroring `LinkerConfig::link_driver`'s `CRYO_CC` knob - this is what lets a
     /// Windows-hosted `cryo.exe` under wine point at an `llvm-ar.exe` it can
     /// launch, since the host's ELF `ar` cannot run there.  With no override
     /// we AUTO-DETECT: the default `ar` wins whenever it's launchable (true on
@@ -2075,45 +2169,6 @@ type struct CodegenPasses {
         if (CodegenPasses::tool_available("llvm-ar"))    { return "llvm-ar"; }
         if (CodegenPasses::tool_available("llvm-ar-20")) { return "llvm-ar-20"; }
         return "ar";
-    }
-
-    /// Pick the link driver (the `cc`/`gcc`/`clang` binary the link command
-    /// invokes).  `CRYO_CC` overrides everything, mirroring `pick_archiver`'s
-    /// `CRYO_AR` and `pick_c_preprocessor`'s use of the same knob for
-    /// `#include` preprocessing (one C-toolchain driver serves both jobs).
-    ///
-    /// With no override we AUTO-DETECT, the same way `pick_c_preprocessor`
-    /// does, so a NATIVE Windows self-host needs no environment setup:
-    ///
-    ///   1. The per-target `default_driver` wins whenever it's launchable.
-    ///      This is the historic choice on every host where it exists - `cc`
-    ///      on a POSIX host, `x86_64-w64-mingw32-gcc` on a Linux->windows
-    ///      cross - so existing flows and selfhost byte-identity are unchanged
-    ///      (on Linux/CI `cc` is present, so the fallback never fires).
-    ///   2. Only when `default_driver` is ABSENT do we probe.  This is the
-    ///      native mingw/MSYS2 case: `host_linker_config` asks for `cc`, but a
-    ///      stock box ships `gcc`/`clang` instead.  `gcc` is tried before
-    ///      `clang` because on a mingw host `gcc` links gnu-ABI objects
-    ///      natively while a bare `clang` may default to the msvc target.
-    ///   3. A cross driver (`*-mingw32-*`) that's missing has no sane host
-    ///      substitute, so we DON'T fall back for it - the original name is
-    ///      kept so the link error names the absent cross toolchain.
-    static pick_link_driver(default_driver_text: string) -> string {
-        const default_driver: string = default_driver_text;
-        match (env::var(Str::new("CRYO_CC"))) {
-            Option::Some(v) => {
-                const env_val: string = v.into_raw();
-                if (env_val.length() > 0) { return env_val; }
-            }
-            Option::None => {}
-        }
-        if (CodegenPasses::tool_available(default_driver_text)) { return default_driver; }
-        if (!default_driver.contains("mingw")) {
-            if (CodegenPasses::tool_available("gcc"))   { return "gcc"; }
-            if (CodegenPasses::tool_available("clang")) { return "clang"; }
-            if (CodegenPasses::tool_available("cc"))    { return "cc"; }
-        }
-        return default_driver;
     }
 
     /// Resolve the `llvm-config` binary used to derive the static-link lib set
