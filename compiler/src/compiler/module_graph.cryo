@@ -401,6 +401,14 @@ type struct ModuleGraph {
 private:
     // Module name -> index lookup (SymbolStr.id -> module index)
     name_index: HashMap<ModuleKey, u32>;
+    /// Each module's position by its file path as `paths_equal_ignore_case`
+    /// compares paths (`path_key`); the first module registered under it.
+    path_index: HashMap<string, u32>;
+    /// The positions of the modules declaring a namespace, by the
+    /// namespace's last segment, in the graph's order.  A written path names
+    /// only a namespace that ends with the path's own last segment
+    /// (`ns_written_as`), so these are the only candidates for it.
+    leaf_index: HashMap<string, [u32]>;
 
     /// Every module's definition, by the module's path:
     /// each module of this graph as it is added, and each module a C import
@@ -447,6 +455,8 @@ public:
             module_ast_cap:   initial_cap,
             module_sources:   [],
             name_index:       HashMap::<ModuleKey, u32>::new(),
+            path_index:       HashMap::<string, u32>::new(),
+            leaf_index:       HashMap::<string, [u32]>::new(),
             module_defs:      HashMap::<ModuleKey, DefId>::new(),
             def_list:         [],
             def_paths:        [],
@@ -456,9 +466,16 @@ public:
     }
 
     /// Register a module for compilation.
-    add_module(mut &this, info: ModuleInfo) -> void {
+    add_module(mut &this, info: ModuleInfo, intern: InternTable*) -> void {
         const idx: u32 = this.modules.length() as u32;
         this.name_index.insert(ModulePath::of(info.name).table_key(), idx);
+        const path_key: string = ModuleGraph::path_key(info.file_path);
+        if (!this.path_index.contains_key(&path_key)) { this.path_index.insert(path_key, idx); }
+        if (info.namespace_name.is_valid()) {
+            const positions: mut [u32]* = this.leaf_index.get_or_insert(
+                QualifiedName::leaf_of(intern.resolve(info.namespace_name)), []);
+            positions.push(idx);
+        }
         // Read the (Copy) file_path before `info` is moved into `this.modules`.
         this.module_sources.push(info.file_path);
         this.modules.push(info);
@@ -683,9 +700,10 @@ private:
         mut cand_defs: [DefId] = [];
         mut cand_lengths: [i64] = [];
         mut cand_reach: [boolean] = [];
-        for (mut i: i64 = 0; i < this.modules.length(); i++) {
+        const in_reach: [u32] = this.modules_ending_in(spelling, if (continues) { head } else { "" });
+        for (mut at: i64 = 0; at < in_reach.length(); at++) {
+            const i: i64 = in_reach[at] as i64;
             const cand_ns: SymbolStr = this.modules[i].namespace_name;
-            if (!cand_ns.is_valid()) { continue; }
             const cand_path: ModulePath = this.modules[i].path();
             const cand_str: string = intern.resolve(cand_ns);
             const names_head: boolean = continues && ModuleGraph::ns_written_as(cand_str, head);
@@ -742,8 +760,43 @@ private:
         // Only one alignment can be a suffix, so this is a single check rather
         // than a scan.
         const i: i64 = ml - pl;
-        if (!mod_str.substring(i as u32, pl as u32).eq(written)) { return false; }
+        if (!mod_str.ends_with(written)) { return false; }
         return i == 0 || (i >= 2 && mod_str[i - 1] == ':' && mod_str[i - 2] == ':');
+    }
+
+    /// The positions, in the graph's order, of the modules whose namespace
+    /// ends in the same segment as `first` or as `second` ("" asks for
+    /// none): every module either can name (`ns_written_as`), and others.
+    modules_ending_in(&this, first: string, second: string) -> [u32] {
+        mut out: [u32] = [];
+        const first_leaf: string = QualifiedName::leaf_of(first);
+        const second_leaf: string = QualifiedName::leaf_of(second);
+        mut a: [u32]* = null;
+        mut a_length: i64 = 0;
+        match (this.leaf_index.get_ref(&first_leaf)) {
+            Option::Some(positions) => { a = positions; a_length = (*positions).length(); }
+            Option::None => { }
+        }
+        mut b: [u32]* = null;
+        mut b_length: i64 = 0;
+        if (second_leaf.length() > 0 && !second_leaf.eq(first_leaf)) {
+            match (this.leaf_index.get_ref(&second_leaf)) {
+                Option::Some(positions) => { b = positions; b_length = (*positions).length(); }
+                Option::None => { }
+            }
+        }
+        mut i: i64 = 0;
+        mut k: i64 = 0;
+        while (i < a_length || k < b_length) {
+            if (k >= b_length || (i < a_length && (*a)[i] < (*b)[k])) {
+                out.push((*a)[i]);
+                i++;
+            } else {
+                out.push((*b)[k]);
+                k++;
+            }
+        }
+        return out;
     }
 
 public:
@@ -997,13 +1050,25 @@ public:
     /// Find a module's index by its file path (case-insensitive), however
     /// its `.` segments are written.  Returns -1 if not found.
     find_module_by_path(&this, path: string) -> i64 {
-        const spelling: string = ModuleGraph::module_spelling(path);
-        for (mut i: i64 = 0; i < this.modules.length(); i++) {
-            if (ModuleGraph::paths_equal_ignore_case(this.modules[i].file_path, spelling)) {
-                return i;
-            }
+        const key: string = ModuleGraph::path_key(ModuleGraph::module_spelling(path));
+        return match (this.path_index.get(&key)) {
+            Option::Some(at) => { at as i64 }
+            Option::None     => { -1 }
+        };
+    }
+
+    /// `path` as `paths_equal_ignore_case` compares it: ASCII letters
+    /// lower-cased and `\` written `/`, so two paths are equal under that
+    /// comparison exactly when their keys are the same text.
+    static path_key(path: string) -> string {
+        const n: i64 = path.length() as i64;
+        mut out: String = String::with_capacity(n);
+        for (mut i: i64 = 0; i < n; i++) {
+            mut c: u8 = (path[i] as u8).to_ascii_lowercase();
+            if (c == 92) { c = 47; }
+            out.push_byte(c);
         }
-        return -1;
+        return out.into_raw();
     }
 
     /// A module file's path with every `.` segment after the first dropped,
