@@ -54,6 +54,55 @@ type struct TypeLoweringPasses {
             return PassResult::ok();
         }
 
+        // The pass runs once per module, but what it computes and checks over
+        // the arena depends only on the types the arena holds, so a run after
+        // one that found the arena as it is now has nothing to add.
+        if (!ctx.type_arena.is_lowered()) {
+            TypeLoweringPasses::lower_arena(ctx, arena);
+            ctx.type_arena.mark_lowered();
+        }
+
+        // Evaluate module-scope `static_assert(...)` now that every type has a
+        // final layout. The `sizeof`/`alignof` operand types were resolved in
+        // TypeResolution; fold the condition to a constant and fail the build
+        // (E0237) if it is false or not a compile-time constant.
+        //
+        // This is the one position that can consult layouts, so it is the only
+        // one that passes the arena; the rest of what it accepts is what any
+        // compile-time integer position accepts.
+        const sa_root: ProgramNode* = ctx.artifacts.ast.root;
+        if (sa_root != null) {
+            for (mut si: i64 = 0; si < sa_root.static_asserts.length(); si++) {
+                const sa: StaticAssertItem* = sa_root.static_asserts[si];
+                if (sa == null) { continue; }
+                const ev: ConstEval = ConstEval::new(ctx.const_table, ctx.intern_table, arena);
+                const result: Option<FoldedInteger> = ev.fold(sa.cond);
+                if (result.is_none()) {
+                    mut d1: Diagnostic = Diagnostic::error(
+                        ErrorCode::E0237_STATIC_ASSERT_FAILED,
+                        "static_assert condition is not a compile-time constant (a compile-time constant is an integer or boolean literal, a named constant, an enum variant, `sizeof`/`alignof`, or arithmetic over them)");
+                    d1 = d1.at_with_label(sa.span, "in this static_assert");
+                    ctx.emit_diagnostic(d1);
+                } else if (result.unwrap().is_zero()) {
+                    mut msg: string = "static assertion failed";
+                    if (sa.message != "") {
+                        msg = fmt::format("static assertion failed: %s", sa.message);
+                    }
+                    mut d2: Diagnostic = Diagnostic::error(
+                        ErrorCode::E0237_STATIC_ASSERT_FAILED, msg);
+                    d2 = d2.at_with_label(sa.span, "this condition is false");
+                    ctx.emit_diagnostic(d2);
+                }
+            }
+        }
+
+        return PassResult::from_snapshot(ctx.diagnostics, snap);
+    }
+
+    /// Lay out every type in the arena that has no layout yet, then refuse a
+    /// struct that contains itself by value and report a type whose member
+    /// does not resolve.
+    static lower_arena(ctx: mut CompilationContext*, arena: TypeArena*) -> void {
         mut computed: i64 = 0;
 
         // Fixpoint iteration: keep passing over all types until no more
@@ -131,42 +180,6 @@ type struct TypeLoweringPasses {
                 fmt::format("type lowering: a member type of type #%lld did not resolve in the type arena (internal inconsistency)",
                        uty.id as i64)));
         }
-
-        // Evaluate module-scope `static_assert(...)` now that every type has a
-        // final layout. The `sizeof`/`alignof` operand types were resolved in
-        // TypeResolution; fold the condition to a constant and fail the build
-        // (E0237) if it is false or not a compile-time constant.
-        //
-        // This is the one position that can consult layouts, so it is the only
-        // one that passes the arena; the rest of what it accepts is what any
-        // compile-time integer position accepts.
-        const sa_root: ProgramNode* = ctx.artifacts.ast.root;
-        if (sa_root != null) {
-            for (mut si: i64 = 0; si < sa_root.static_asserts.length(); si++) {
-                const sa: StaticAssertItem* = sa_root.static_asserts[si];
-                if (sa == null) { continue; }
-                const ev: ConstEval = ConstEval::new(ctx.const_table, ctx.intern_table, arena);
-                const result: Option<FoldedInteger> = ev.fold(sa.cond);
-                if (result.is_none()) {
-                    mut d1: Diagnostic = Diagnostic::error(
-                        ErrorCode::E0237_STATIC_ASSERT_FAILED,
-                        "static_assert condition is not a compile-time constant (a compile-time constant is an integer or boolean literal, a named constant, an enum variant, `sizeof`/`alignof`, or arithmetic over them)");
-                    d1 = d1.at_with_label(sa.span, "in this static_assert");
-                    ctx.emit_diagnostic(d1);
-                } else if (result.unwrap().is_zero()) {
-                    mut msg: string = "static assertion failed";
-                    if (sa.message != "") {
-                        msg = fmt::format("static assertion failed: %s", sa.message);
-                    }
-                    mut d2: Diagnostic = Diagnostic::error(
-                        ErrorCode::E0237_STATIC_ASSERT_FAILED, msg);
-                    d2 = d2.at_with_label(sa.span, "this condition is false");
-                    ctx.emit_diagnostic(d2);
-                }
-            }
-        }
-
-        return PassResult::from_snapshot(ctx.diagnostics, snap);
     }
 
     /// Resolve `ty` past type aliases and instantiated-type wrappers to the
