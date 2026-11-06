@@ -22,6 +22,7 @@ import compiler::compilation_context::{ CompilationContext, OutputOverride };
 import compiler::project_config::{ ProjectConfig, TargetType };
 import compiler::module_graph::{ ModuleInfo, ModuleOrigin };
 import compiler::artifacts::{ IROutput, LinkedOutput };
+import compiler::build_manifest::{ ContentHasher };
 import compiler::prebuilt_stdlib::{ PrebuiltStdlib };
 import compiler::toolchain::{ DriverFacts, ExecutablePath };
 import compiler::diag::{ diagnostic, ErrorCode, sink, snapshot };
@@ -1003,51 +1004,10 @@ type struct CodegenPasses {
             }
         }
 
+        // The module is verified by its emission job, as it will be emitted
+        // (`EmitJob.verify_and_key`); one with a corrupt function type is not.
         if (has_corrupt) {
             Log::error(LogArea::Codegen, f"skipping verification of module {module_name}: corrupt function types");
-        } else {
-            // Verify the LLVM module.
-            mut verify_err: i8* = null;
-            const verify_result: i32 = llvm::LLVMVerifyModule(cg.llvm_module.raw, 2, &verify_err as mut void*);
-            if (verify_result != 0) {
-                // Print verifier output directly so the user can see which
-                // module / function the verifier choked on. Then emit a
-                // single short diagnostic; the previous code attached the
-                // multi-KB verifier text to a Diagnostic.with_note(), and
-                // that string ended up sharing memory across diagnostics
-                // in a way that segfaulted the deferred flush in stdlib
-                // builds with several verify failures.
-                mut diag: Diagnostic = Diagnostic::error(
-                    ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                    fmt::format("LLVM module verification failed for %s", module_name));
-                if (verify_err != null) {
-                    const max_len: i64 = 2048;
-                    const err_len: i64 = (verify_err as string).length();
-                    mut note_body: string = verify_err as string;
-                    if (err_len > max_len) {
-                        mut tr: String = String::from_str(Str::from_raw(verify_err as u8*, max_len));
-                        note_body = tr.into_raw();
-                    }
-                    diag = diag.with_note("LLVM reports: " + note_body);
-                    if (err_len > max_len) {
-                        diag = diag.with_note("(LLVM error truncated)");
-                    }
-                }
-                ctx.diagnostics.emit(diag);
-                if (verify_err != null) {
-                    llvm::LLVMDisposeMessage(verify_err as mut void*);
-                }
-                ctx.artifacts.unverified_ir = IROutput {
-                    llvm_module: cg.llvm_module.raw,
-                    module_name: module_name,
-                };
-                cg.dispose_builder();
-                tm.dispose();
-                return PassResult::failure(1);
-            }
-            if (verify_err != null) {
-                llvm::LLVMDisposeMessage(verify_err as mut void*);
-            }
         }
 
         if (ctx.options.freestanding()) {
@@ -1068,15 +1028,12 @@ type struct CodegenPasses {
             return PassResult::failure(1);
         }
 
-        if (Log::enabled(LogArea::Codegen, LogLevel::Debug)) {
-            Log::debug(LogArea::Codegen, f"module verified: {module_name}");
-        }
-
         // Store the LLVM module in artifacts.  The module is now owned by
         // artifacts; do NOT dispose it here.
         ctx.artifacts.ir = IROutput {
             llvm_module: cg.llvm_module.raw,
             module_name: module_name,
+            verifiable: !has_corrupt,
         };
 
         cg.dispose_builder();
@@ -1426,9 +1383,44 @@ type struct CodegenPasses {
             fmt::format("LLVM could not emit '%s': %s", path, reason.as_cstr() as string));
     }
 
+    /// E0900: LLVM's verifier refused module `module_name`, with its
+    /// `report` (LLVM's message, disposed here; null for none).  The report
+    /// rides as a note cut to 2 KiB: the whole of it can run to megabytes.
+    static report_verification_failure(ctx: mut CompilationContext*, module_name: string, report: string) -> void {
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+            fmt::format("LLVM module verification failed for %s", module_name));
+        if (report != null) {
+            const max_len: i64 = 2048;
+            const report_length: i64 = report.length();
+            mut note_body: string = report;
+            if (report_length > max_len) {
+                mut truncated: String = String::from_str(Str::from_raw(report as u8*, max_len));
+                note_body = truncated.into_raw();
+            }
+            diag = diag.with_note("LLVM reports: " + note_body);
+            if (report_length > max_len) {
+                diag = diag.with_note("(LLVM error truncated)");
+            }
+        }
+        ctx.diagnostics.emit(diag);
+        if (report != null) {
+            llvm::LLVMDisposeMessage(report as mut void*);
+        }
+    }
+
     static run_object_emission(ctx: mut CompilationContext*) -> PassResult {
         if (!ctx.artifacts.ir.is_valid()) {
             return PassResult::ok();
+        }
+
+        if (ctx.artifacts.ir.verifiable) {
+            const refused: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
+            const report: string = refused.verification_failure();
+            if (report != null) {
+                CodegenPasses::report_verification_failure(ctx, ctx.artifacts.ir.module_name, report);
+                return PassResult::failure(1);
+            }
         }
 
         const target: EmitTarget = CodegenPasses::resolve_emit_target(ctx);
@@ -2299,11 +2291,6 @@ type struct EmitTarget {
     should_register: boolean;   // feed this .o to the linker
 }
 
-/// One unit of IN-PROCESS serial object emission - the fallback path for small
-/// builds and `CRYO_CODEGEN_THREADS=1`; large builds emit out-of-process (see
-/// `run_multiprocess_emit`).  The producer fills the inputs + the module/context
-/// handles (each module in its OWN `LLVMContext`); `codegen_emit_job` emits it
-/// and sets `ok`; `CompilerInstance::emit_jobs_serial` disposes the handles.
 // ---------------------------------------------------------------------------
 // Per-module context auditor (gated by CRYO_CTX_AUDIT; zero cost otherwise).
 // Reports any LLVM type reachable from a module whose owning LLVMContext is not
@@ -2388,56 +2375,161 @@ type struct EmitJob {
     llvm_module:     mut void*;     // LLVMModuleRef (live), owned by this job
     llvm_context:    mut void*;     // its LLVMContextRef, owned by this job
     tm:              mut void*;     // LLVMTargetMachineRef, built on the main thread
+    module_name:     string;
+    /// The module's place in the topological codegen order.
+    position:        u32;
     emit_path:       string;
     emit_type:       LFileType;
     triple:          string;
     opt_level:       u32;
     should_register: boolean;
+    /// False for a module holding a function of no type, which the verifier
+    /// would crash on.
+    verifiable:      boolean;
+    /// The per-module object cache is in effect: the job takes the module's
+    /// key, starting from `key_hasher` (the toolchain already folded in).
+    keyed:           boolean;
+    key_hasher:      ContentHasher;
+    /// The key an earlier build emitted the object at `emit_path` under,
+    /// when that object is still there.
+    reusable:        boolean;
+    prior_key:       u128;
+    /// The module is past its verification and key, so the job optimizes
+    /// and emits it.
+    emitting:        boolean;
+    verify_failed:   boolean;   // result: the verifier refused the module
+    verify_message:  string;    // result: the verifier's report (LLVM-owned)
+    key:             u128;      // result: the module's key, when `keyed`
+    reused:          boolean;   // result: the earlier object is this build's
+    /// Result: the key differs from a reusable object's, so that object must
+    /// be removed before this module's is emitted; the main thread removes
+    /// it and hands the job back with `emitting` set.
+    awaits_emission: boolean;
     optimization_failed: boolean;   // result: LLVM refused the IR pipeline
     ok:              boolean;   // result: emission succeeded
     err_msg:         string;    // LLVM error message on failure (worker-set;
                                 // the main thread reports it and disposes it)
-    // When the job's optimization and object emission ran, and on which
-    // worker (0 = the main thread, worker `w` = `w + 1`), for the time trace.
+    // When the job verified and keyed the module, optimized it and emitted
+    // its object, and on which worker (0 = the main thread, worker `w` =
+    // `w + 1`), for the time trace.
+    verify_start_ns:   i64;
     optimize_start_ns: i64;
     emit_start_ns:     i64;
     end_ns:            i64;
     thread:            u32;
+    /// The main thread has seen this slot's job finish.
+    handled:           boolean;
+
+    /// A job with nothing in it, for a slot of the emission table.
+    static unfilled() -> EmitJob {
+        return EmitJob {
+            llvm_module: null, llvm_context: null, tm: null,
+            module_name: "", position: 0,
+            emit_path: "", emit_type: LFileType::Object, triple: "",
+            opt_level: 0, should_register: false, verifiable: false,
+            keyed: false, key_hasher: ContentHasher::new(), reusable: false, prior_key: 0,
+            emitting: false, verify_failed: false, verify_message: null as string,
+            key: 0, reused: false, awaits_emission: false,
+            optimization_failed: false, ok: false, err_msg: null as string,
+            verify_start_ns: 0, optimize_start_ns: 0, emit_start_ns: 0, end_ns: 0, thread: 0,
+            handled: false
+        };
+    }
+
+    /// Verify the module as it will be emitted, take its key, and decide
+    /// whether an earlier object stands for it: `reused` when its key is
+    /// the reusable object's, `awaits_emission` when there is a reusable
+    /// object under another key, else `emitting`.  Allocation-free on the
+    /// Cryo side, so a worker may run it.
+    verify_and_key(mut &this) -> void {
+        const emitted: LModule = LModule { raw: this.llvm_module };
+        if (this.verifiable) {
+            this.verify_message = emitted.verification_failure();
+            if (this.verify_message != null) {
+                this.verify_failed = true;
+                return;
+            }
+        }
+        if (this.keyed) {
+            emitted.fold_bitcode(&this.key_hasher);
+            this.key = this.key_hasher.finish128();
+            if (this.reusable) {
+                if (this.key == this.prior_key) {
+                    this.reused = true;
+                    this.ok = true;
+                    return;
+                }
+                this.awaits_emission = true;
+                return;
+            }
+        }
+        this.emitting = true;
+    }
+
+    /// Dispose the job's target machine, module and context, and clear
+    /// them so the job reads as released.  Allocation-free on the Cryo
+    /// side, so a worker may run it; its results stay for the main thread.
+    release(mut &this) -> void {
+        if (this.tm != null) {
+            mut machine: LTargetMachine = LTargetMachine { raw: this.tm };
+            machine.dispose();
+            this.tm = null;
+        }
+        if (this.llvm_module != null) {
+            mut released: LModule = LModule { raw: this.llvm_module };
+            released.dispose();
+            this.llvm_module = null;
+        }
+        if (this.llvm_context != null) {
+            mut context: LContext = LContext { raw: this.llvm_context };
+            context.dispose();
+            this.llvm_context = null;
+        }
+    }
 }
 
-/// Optimize and emit ONE module's object file from its own standalone LLVM
-/// context, on the main thread or on a `WorkerPool` worker.  Touches only LLVM
-/// state private to this job - never `ctx`, the arena, or the intern table -
-/// and allocates no Cryo memory, so the main thread keeps the bump arena to
-/// itself while it generates the next module's IR.  The target machine is
-/// created per-job (cheap); `init_native_target` must already have run (it
-/// has, during IRGeneration).  A top-level function, so it can be handed to
-/// the pool as a function pointer: a lambda could not call the generic LLVM
-/// wrappers it uses.
+/// Verify, key, optimize and emit ONE module's object file from its own
+/// standalone LLVM context, on the main thread or on a `WorkerPool` worker.
+/// Touches only LLVM state private to this job - never `ctx`, the arena, or
+/// the intern table - and allocates no Cryo memory, so the main thread keeps
+/// the bump arena to itself while it generates the next module's IR: errors
+/// are left in the job as LLVM's own message pointers, for the main thread
+/// to report and dispose.  The job releases its module, context and target
+/// machine when it is done with them - when the module failed verification,
+/// was reused, or was emitted - and keeps them when it stops for the main
+/// thread to remove an earlier object (`awaits_emission`).  The context is
+/// this job's own, so disposing it touches nothing another worker is
+/// emitting.  A top-level function, so it can be handed to the pool as a
+/// function pointer: a lambda could not call the generic LLVM wrappers it
+/// uses.
 function codegen_emit_job(job: mut EmitJob*, thread: u32) -> void {
     (*job).thread = thread;
-    (*job).optimize_start_ns = TimeTrace::now();
-    (*job).emit_start_ns = (*job).optimize_start_ns;
-    (*job).end_ns = (*job).optimize_start_ns;
-    // Emit this module's live IR directly with its main-thread-built target
-    // machine.  Deliberately ALLOCATION-FREE on the Cryo side: it makes the raw
-    // LLVM emit call and, on error, stashes the LLVM message pointer in the job
-    // and records `ok = false` - reporting and disposal are left to the main
-    // thread.  So
-    // a worker never touches the compiler's single-threaded bump arena, and the
-    // per-module context isolation makes the concurrent LLVM emit itself safe.
-    // The module, context, and target machine are disposed by the caller on the
-    // main thread once this job is done; the context is this job's own, so
-    // disposing it touches nothing another worker is emitting.
     if ((*job).tm == null || (*job).llvm_module == null) {
+        (*job).emitting = true;
         (*job).ok = false;
+        (*job).release();
         return;
+    }
+    if (!(*job).emitting) {
+        (*job).verify_start_ns = TimeTrace::now();
+        (*job).verify_and_key();
+        (*job).optimize_start_ns = TimeTrace::now();
+        (*job).emit_start_ns = (*job).optimize_start_ns;
+        (*job).end_ns = (*job).optimize_start_ns;
+        if ((*job).awaits_emission) { return; }
+        if (!(*job).emitting) {
+            (*job).release();
+            return;
+        }
+    } else {
+        (*job).optimize_start_ns = TimeTrace::now();
     }
     const machine: LTargetMachine = LTargetMachine { raw: (*job).tm };
     if (!machine.run_optimization_pipeline(LModule { raw: (*job).llvm_module }, (*job).opt_level)) {
         (*job).optimization_failed = true;
         (*job).ok = false;
         (*job).end_ns = TimeTrace::now();
+        (*job).release();
         return;
     }
     (*job).emit_start_ns = TimeTrace::now();
@@ -2445,10 +2537,8 @@ function codegen_emit_job(job: mut EmitJob*, thread: u32) -> void {
     const rc: i32 = llvm::LLVMTargetMachineEmitToFile(
         (*job).tm, (*job).llvm_module, (*job).emit_path,
         (*job).emit_type as i32, &err as mut void*);
-    // Hand the LLVM error string to the main thread instead of discarding it
-    // (storing the raw pointer allocates nothing on the Cryo side); the
-    // main thread reports it and disposes it.
     (*job).err_msg = err as string;
     (*job).ok = rc == 0;
     (*job).end_ns = TimeTrace::now();
+    (*job).release();
 }

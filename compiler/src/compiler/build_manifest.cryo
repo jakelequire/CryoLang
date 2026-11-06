@@ -192,23 +192,23 @@ type struct ModuleEntry {
 
 
 /// Prior per-module cache keys, loaded from the `*.modkeys` sidecar. Parallel
-/// `names`/`keys` arrays; `lookup` returns the stored key hex for a namespace
-/// or "" when absent (a never-before-seen module always rebuilds).
+/// `names`/`keys` arrays; `lookup` answers the stored key of a namespace, none
+/// when absent (a never-before-seen module always rebuilds).
 type struct ModuleKeyTable {
     names:      [string];
-    keys:       [string];
+    keys:       [u128];
 
     static empty() -> ModuleKeyTable {
         return ModuleKeyTable { names: [], keys: [] };
     }
 
-    lookup(&this, name: string) -> string {
+    lookup(&this, name: string) -> Option<u128> {
         for (mut i: i64 = 0; i < this.names.length(); i++) {
             if (this.names[i].eq(name)) {
-                return this.keys[i];
+                return Option::Some(this.keys[i]);
             }
         }
-        return "";
+        return Option::None;
     }
 
     /// Copy `len` bytes from `data+start` into a fresh NUL-terminated string.
@@ -219,7 +219,8 @@ type struct ModuleKeyTable {
 
     /// Parse the `*.modkeys` sidecar into a `ModuleKeyTable`. A missing or
     /// unreadable file yields an empty table (every module then rebuilds, which
-    /// is the safe default). Lines without a TAB separator are skipped.
+    /// is the safe default). Lines without a TAB separator, or whose key is not
+    /// a digest `Manifest::hex128` wrote, are skipped.
     ///
     /// Kept a free function (not a `ModuleKeyTable` static): a static method here
     /// resolves through the leaf-name dispatcher, where `read`/`write` collide
@@ -253,9 +254,14 @@ type struct ModuleKeyTable {
             // Anything after the key is not part of the table.
             while (i < n && data[i] != 10) { i = i + 1; }
             if (i < n && data[i] == 10) { i = i + 1; }   // skip newline
-            if (name.length() > 0 && keyh.length() > 0) {
-                t.names.push(name);
-                t.keys.push(keyh);
+            if (name.length() > 0) {
+                match (Manifest::parse_hex128(Str::new(keyh))) {
+                    Option::Some(key) => {
+                        t.names.push(name);
+                        t.keys.push(key);
+                    }
+                    Option::None => { }
+                }
             }
         }
         return t;
@@ -265,12 +271,12 @@ type struct ModuleKeyTable {
     /// caller must have created the incremental dir (e.g. via
     /// `Manifest::write_fingerprint`, which always runs alongside this on the
     /// success path).
-    static write_module_keys(path: string, names: &[string], keys: &[string]) -> void {
+    static write_module_keys(path: string, names: &[string], keys: &[u128]) -> void {
         mut text: String = String::new();
         for (mut i: i64 = 0; i < names.length(); i++) {
             text.push(Str::new(names[i]));
             text.push_byte(9 as u8);     // TAB
-            text.push(Str::new(keys[i]));
+            text.push(Str::new(Manifest::hex128(keys[i])));
             text.push_byte(10 as u8);    // LF
         }
         match (File::write_bytes(Path::from(path), text.as_bytes())) {
@@ -280,6 +286,64 @@ type struct ModuleKeyTable {
             }
         }
         mem::drop(text);
+    }
+}
+
+/// One build's per-module object cache: the keys the last build recorded,
+/// and this build's key for every module whose key was taken, in the order
+/// they were recorded, for the next build.  Inactive, it holds nothing and
+/// every module is emitted.
+type struct ModuleObjectCache {
+    active:    boolean;
+    /// What every key covers besides the module's bitcode.
+    toolchain: u128;
+    prior:     ModuleKeyTable;
+    names:     [string];
+    keys:      [u128];
+    reused:    u32;
+    emitted:   u32;
+
+    static inactive() -> ModuleObjectCache {
+        return ModuleObjectCache {
+            active: false, toolchain: 0, prior: ModuleKeyTable::empty(),
+            names: [], keys: [], reused: 0, emitted: 0,
+        };
+    }
+
+    /// The cache for a build at `opt_level` for `target_triple`, with the
+    /// keys the last build wrote to `keys_path`.
+    static open(opt_level: u32, target_triple: string, keys_path: string) -> ModuleObjectCache {
+        return ModuleObjectCache {
+            active: true,
+            toolchain: Manifest::toolchain_fingerprint(opt_level, target_triple),
+            prior: ModuleKeyTable::read_module_keys(keys_path),
+            names: [], keys: [], reused: 0, emitted: 0,
+        };
+    }
+
+    /// A hasher holding everything a module's key covers except its
+    /// bitcode, which the module's emitter folds in.
+    key_hasher(&this) -> ContentHasher {
+        mut hasher: ContentHasher = ContentHasher::new();
+        hasher.fold(this.toolchain);
+        return hasher;
+    }
+
+    /// Record `name`'s key in this build, and whether its earlier object
+    /// was reused under it.
+    record(mut &this, name: string, key: u128, reused: boolean) -> void {
+        this.names.push(name);
+        this.keys.push(key);
+        if (reused) {
+            this.reused += 1;
+        } else {
+            this.emitted += 1;
+        }
+    }
+
+    /// Write this build's keys to `keys_path` for the next build.
+    write(&this, keys_path: string) -> void {
+        ModuleKeyTable::write_module_keys(keys_path, &this.names, &this.keys);
     }
 }
 
@@ -470,6 +534,21 @@ type struct Manifest {
         const hi: u64 = (d >> 64) as u64;
         const lo: u64 = d as u64;
         return hi.to_hex_padded_str(16) + lo.to_hex_padded_str(16);
+    }
+
+    /// The digest `hex128` wrote as `text`: thirty-two hex digits, the high
+    /// half first.  Anything else is none.
+    static parse_hex128(text: Str) -> Option<u128> {
+        if (text.length() != 32) { return Option::None; }
+        match (text.sub_bytes(0, 16).try_to_hex()) {
+            Result::Ok(high) => {
+                match (text.sub_bytes(16, 32).try_to_hex()) {
+                    Result::Ok(low) => { return Option::Some(((high as u128) << 64) | (low as u128)); }
+                    Result::Err(_) => { return Option::None; }
+                }
+            }
+            Result::Err(_) => { return Option::None; }
+        }
     }
 
     /// Fold a file's full byte content (NULs included) into the running digest

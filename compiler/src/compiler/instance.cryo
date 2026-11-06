@@ -44,7 +44,7 @@ import std::thread;
 import std::time::clock::{ Instant };
 import std::collections::string::{ String };
 import std::collections::str::{ Str };
-import compiler::build_manifest::{ ContentHasher };
+import compiler::build_manifest::{ ContentHasher, ModuleObjectCache };
 import compiler::prebuilt_stdlib::{ PrebuiltStdlib };
 import compiler::codegen::passes::{ LinkerConfig };
 import std::core::mem;
@@ -53,7 +53,7 @@ import compiler::artifacts::{ ASTOutput, IROutput, TokenStream };
 import compiler::ast::declaration::{ DeclarationNode, ImportDecl };
 import compiler::ast::dumper::{ ASTDumper };
 import compiler::ast::node::{ ProgramNode };
-import compiler::codegen::llvm_types::{ LContext, LFileType, LModule, LTargetMachine };
+import compiler::codegen::llvm_types::{ LModule, LTargetMachine };
 import compiler::codegen::passes::{
     codegen_emit_job, CodegenPasses, EmitJob, EmitTarget
 };
@@ -1414,16 +1414,7 @@ type struct CompilerInstance {
 
         // Per-module incremental cache: a module whose object is emitted or
         // reused records its key, written for the next build on success.
-        //   pm_key_names[k]: namespace of the k-th recorded module
-        //   pm_key_hex[k]  : its key
-        //   pm_active      : the per-module cache is in effect this build
-        mut pm_key_names: [string]  = [];
-        mut pm_key_hex:   [string]  = [];
-        mut pm_active:    boolean    = false;
-        mut pm_toolchain: u128       = 0;
-        mut pm_prior:     build_manifest::ModuleKeyTable = compiler::build_manifest::ModuleKeyTable::empty();
-        mut pm_reused:    u32        = 0;
-        mut pm_emitted:   u32        = 0;
+        mut module_cache: build_manifest::ModuleObjectCache = compiler::build_manifest::ModuleObjectCache::inactive();
         stage_start = TimeTrace::now();
         if (do_incremental) {
             for (mut i: u32 = 0; i < n; i++) {
@@ -1641,10 +1632,8 @@ type struct CompilerInstance {
         // give, so it reuses no module's object.
         if (do_incremental && ctx.project_config != null
                 && !ctx.module_graph.builds_standard_library) {
-            pm_active = true;
-            pm_toolchain = compiler::build_manifest::Manifest::toolchain_fingerprint(
-                ctx.options.opt_level, ctx.options.target_triple);
-            pm_prior = compiler::build_manifest::ModuleKeyTable::read_module_keys(
+            module_cache = compiler::build_manifest::ModuleObjectCache::open(
+                ctx.options.opt_level, ctx.options.target_triple,
                 ctx.project_config.module_keys_path());
         }
 
@@ -1899,13 +1888,15 @@ type struct CompilerInstance {
             mut mp_obj: [string] = [];
             mut mp_pos: [u32] = [];
 
-            // In-process emit jobs (used when `!multiproc`), one per module
-            // handed to an emitter, with its topo position in `cg_pos`.  On the
-            // threaded path the table is sized for every module before a worker
-            // starts (see `WorkerPool`); slot `cg_filled` is the next to fill.
+            // In-process emit jobs on the threaded path.  The table is sized
+            // before a worker starts (see `WorkerPool`): two slots a module,
+            // since a module whose reusable object turns out stale is handed
+            // back once (`retire_finished_jobs`).  Slot `cg_filled` is the next
+            // to fill; `cg_final_slot[p]` is the slot holding the module at
+            // topo position `p` last, -1 for none.
             mut cg_jobs: [EmitJob] = [];
-            mut cg_pos:  [u32] = [];
             mut cg_done: [Atomic<u32>] = [];
+            mut cg_final_slot: [i64] = [];
             mut cg_filled: u64 = 0;
             mut cg_live:   u32 = 0;
             mut cg_emit_failed: boolean = false;
@@ -1913,15 +1904,12 @@ type struct CompilerInstance {
             // overflows the ~1 MiB default thread stack.
             mut cg_pool: WorkerPool<EmitJob> = WorkerPool::<EmitJob>::new(64 * 1024 * 1024);
             if (cg_threaded) {
-                for (mut r: u32 = 0; r < n; r++) {
-                    cg_jobs.push(EmitJob {
-                        llvm_module: null, llvm_context: null, tm: null,
-                        emit_path: "", emit_type: LFileType::Object, triple: "",
-                        opt_level: 0, should_register: false,
-                        optimization_failed: false, ok: false, err_msg: null as string,
-                        optimize_start_ns: 0, emit_start_ns: 0, end_ns: 0, thread: 0
-                    });
+                for (mut r: u32 = 0; r < 2 * n; r++) {
+                    cg_jobs.push(EmitJob::unfilled());
                     cg_done.push(Atomic::<u32>::new(0));
+                }
+                for (mut r: u32 = 0; r < n; r++) {
+                    cg_final_slot.push(-1);
                 }
                 cg_pool.start(cg_jobs.as_mutable_ptr(), cg_done.as_mutable_ptr(), cg_threads,
                               codegen_emit_job);
@@ -1997,16 +1985,6 @@ type struct CompilerInstance {
                             fmt::format("generating the IR of module %s failed without reporting why",
                                 CompilerInstance::codegen_module_name(ctx, i)));
                     }
-                    // A module the verifier refused is written all the same,
-                    // so the IR it refused can be read.  It dies with its
-                    // context below.
-                    if (ctx.artifacts.unverified_ir.is_valid()) {
-                        if (ctx.options.emit_llvm) {
-                            CompilerInstance::write_module_ir(
-                                ctx, mod_info, mod_name, ctx.artifacts.unverified_ir.llvm_module);
-                        }
-                        ctx.artifacts.unverified_ir = IROutput::empty();
-                    }
                     compiler::codegen::llvm_types::dispose_codegen_context();
                     pipeline.reset();
                     continue;
@@ -2069,36 +2047,40 @@ type struct CompilerInstance {
                     continue;
                 }
 
-                // The object an earlier build emitted from this very bitcode
-                // is this build's object.
-                if (pm_active) {
-                    mut key_hasher: ContentHasher = ContentHasher::new();
-                    key_hasher.fold(pm_toolchain);
-                    const keyed_module: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
-                    keyed_module.fold_bitcode(&key_hasher);
-                    const key: string = compiler::build_manifest::Manifest::hex128(key_hasher.finish128());
-                    pm_key_names.push(mod_name);
-                    pm_key_hex.push(key);
-                    if (pm_prior.lookup(mod_name) == key && Path::from(tgt.emit_path).exists()) {
-                        cg_obj[i as i64] = tgt.emit_path;
-                        pm_reused += 1;
-                        if (Log::enabled(LogArea::Driver, LogLevel::Debug)) {
-                            Log::debug(LogArea::Driver, f"reused the cached object {tgt.emit_path}");
+                // The job emitting this module.  Verifying it, taking its key
+                // and deciding whether the object an earlier build emitted
+                // from this very bitcode is this build's object are the job's
+                // (`EmitJob.verify_and_key`), so they run on a worker.
+                mut cg_job: EmitJob = EmitJob::unfilled();
+                cg_job.llvm_module = ctx.artifacts.ir.llvm_module;
+                cg_job.llvm_context = compiler::codegen::llvm_types::current_codegen_context();
+                cg_job.module_name = mod_name;
+                cg_job.position = i;
+                cg_job.emit_path = tgt.emit_path;
+                cg_job.emit_type = tgt.emit_type;
+                cg_job.opt_level = ctx.options.opt_level;
+                cg_job.should_register = tgt.should_register;
+                cg_job.verifiable = ctx.artifacts.ir.verifiable;
+                if (module_cache.active) {
+                    cg_job.keyed = true;
+                    cg_job.key_hasher = module_cache.key_hasher();
+                    match (module_cache.prior.lookup(mod_name)) {
+                        Option::Some(prior_key) => {
+                            cg_job.prior_key = prior_key;
+                            cg_job.reusable = Path::from(tgt.emit_path).exists();
                         }
-                        mut reused_module: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
-                        reused_module.dispose();
-                        ctx.artifacts.ir = IROutput::empty();
-                        compiler::codegen::llvm_types::dispose_codegen_context();
-                        pipeline.reset();
-                        continue;
+                        Option::None => { }
                     }
-                    pm_emitted += 1;
                 }
 
                 // An earlier build's object is removed before this one is
                 // emitted: an emit that writes nothing then leaves nothing,
                 // and is refused, instead of leaving the old object to link.
-                CodegenPasses::remove_previous_output(tgt.emit_path);
+                // One the job may reuse is removed only once the job's key
+                // differs from it (`clear_for_emission`).
+                if (!cg_job.reusable) {
+                    CodegenPasses::remove_previous_output(tgt.emit_path);
+                }
 
                 // The stdlib's own build records what each module's object
                 // defines, for the manifest beside its archive.
@@ -2108,23 +2090,30 @@ type struct CompilerInstance {
                 }
 
                 if (multiproc) {
-                    // Serialize the module to bitcode and dispose it immediately
-                    // (one live context at a time - lower peak RSS than the
-                    // in-process batch), then hand its path to a child process.
-                    const bc_path: string = fmt::format("%s.bc", tgt.emit_path);
+                    // Verify and key the module here, then serialize it to
+                    // bitcode and dispose it at once (one live context at a
+                    // time - lower peak RSS than the in-process batch), and
+                    // hand its path to a child process.
+                    cg_job.verify_and_key();
+                    if (cg_job.awaits_emission) {
+                        CompilerInstance::clear_for_emission(&cg_job);
+                    }
+                    CompilerInstance::record_settled_module(ctx, &cg_job, &cg_obj, &module_cache);
                     mut lmbc: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
-                    const wrote: boolean = lmbc.write_bitcode(bc_path);
+                    if (cg_job.emitting) {
+                        const bc_path: string = fmt::format("%s.bc", tgt.emit_path);
+                        if (lmbc.write_bitcode(bc_path)) {
+                            mp_bc.push(bc_path);
+                            mp_obj.push(tgt.emit_path);
+                            mp_pos.push(i);
+                        } else {
+                            CodegenPasses::report_emit_failure(ctx, bc_path, String::new());
+                        }
+                    }
                     lmbc.dispose();
                     ctx.artifacts.ir = IROutput::empty();
                     compiler::codegen::llvm_types::dispose_codegen_context();
                     pipeline.reset();
-                    if (wrote) {
-                        mp_bc.push(bc_path);
-                        mp_obj.push(tgt.emit_path);
-                        mp_pos.push(i);
-                    } else {
-                        CodegenPasses::report_emit_failure(ctx, bc_path, String::new());
-                    }
                     continue;
                 }
 
@@ -2154,71 +2143,54 @@ type struct CompilerInstance {
                         continue;
                     }
                 };
-                const cg_job: EmitJob = EmitJob {
-                    llvm_module:     ctx.artifacts.ir.llvm_module,
-                    llvm_context:    compiler::codegen::llvm_types::current_codegen_context(),
-                    tm:              cg_tm.raw,
-                    emit_path:       tgt.emit_path,
-                    emit_type:       tgt.emit_type,
-                    triple:          cg_tri,
-                    opt_level:       ctx.options.opt_level,
-                    should_register: tgt.should_register,
-                    optimization_failed: false,
-                    ok:              false,
-                    err_msg:         null as string,
-                    optimize_start_ns: 0,
-                    emit_start_ns:   0,
-                    end_ns:          0,
-                    thread:          0
-                };
-                cg_pos.push(i);
+                cg_job.tm = cg_tm.raw;
+                cg_job.triple = cg_tri;
                 // Detach the module from ctx (the job owns it now); do NOT
                 // dispose the context here - the job holds it until it is done.
                 ctx.artifacts.ir = IROutput::empty();
                 pipeline.reset();
 
                 if (!cg_threaded) {
-                    cg_jobs.push(cg_job);
-                    CompilerInstance::emit_jobs_serial(&cg_jobs);
-                    CompilerInstance::record_emitted_jobs(ctx, &cg_jobs, &cg_pos, &cg_obj);
-                    cg_jobs.clear();
-                    cg_pos.clear();
+                    codegen_emit_job(&cg_job, 0);
+                    if (cg_job.awaits_emission) {
+                        CompilerInstance::clear_for_emission(&cg_job);
+                        codegen_emit_job(&cg_job, 0);
+                    }
+                    CompilerInstance::record_emitted_job(ctx, &cg_job, &cg_obj, &module_cache);
                     continue;
                 }
 
                 cg_jobs[cg_filled] = cg_job;
+                cg_final_slot[i as i64] = cg_filled as i64;
                 cg_filled = cg_filled + 1;
                 cg_live = cg_live + 1;
                 cg_pool.publish(cg_filled);
-                // Dispose every job the pool has finished, then wait while the
+                // Retire every job the pool has finished, then wait while the
                 // live modules are at the cap.  A failed job stops the loop at
                 // its next iteration; it is reported below with the rest.
                 loop {
-                    for (mut d: u64 = 0; d < cg_filled; d++) {
-                        if (cg_jobs[d].llvm_context != null
-                                && cg_done[d].load(MemoryOrder::Acquire) != 0) {
-                            if (!cg_jobs[d].ok) { cg_emit_failed = true; }
-                            CompilerInstance::dispose_emit_job(&cg_jobs[d]);
-                            cg_live = cg_live - 1;
-                        }
-                    }
+                    cg_live = cg_live - CompilerInstance::retire_finished_jobs(
+                        &cg_jobs, &cg_done, &cg_filled, &cg_final_slot, &cg_pool, &cg_emit_failed);
                     if (cg_live < cg_live_cap) { break; }
                     thread::sleep_ms(1);
                 }
             }
 
-            // Close the pool: every worker emits what is published and stops.
-            // The jobs still live are disposed here, then every job's object
-            // is recorded (and every failure reported) in topo order.
+            // Wait for every module to be retired - one handed back is
+            // published again - and close the pool; then every module's
+            // object is recorded (and every failure reported) in topo order.
             if (cg_threaded) {
+                while (cg_live > 0) {
+                    cg_live = cg_live - CompilerInstance::retire_finished_jobs(
+                        &cg_jobs, &cg_done, &cg_filled, &cg_final_slot, &cg_pool, &cg_emit_failed);
+                    if (cg_live > 0) { thread::sleep_ms(1); }
+                }
                 cg_pool.close();
-                cg_jobs.truncate(cg_filled as i64);
-                for (mut d: i64 = 0; d < cg_jobs.length(); d++) {
-                    if (cg_jobs[d].llvm_context != null) {
-                        CompilerInstance::dispose_emit_job(&cg_jobs[d]);
+                for (mut p: i64 = 0; p < cg_final_slot.length(); p++) {
+                    if (cg_final_slot[p] >= 0) {
+                        CompilerInstance::record_emitted_job(ctx, &cg_jobs[cg_final_slot[p]], &cg_obj, &module_cache);
                     }
                 }
-                CompilerInstance::record_emitted_jobs(ctx, &cg_jobs, &cg_pos, &cg_obj);
             }
 
             // Fan the multi-process emit out to child processes, then record
@@ -2264,8 +2236,8 @@ type struct CompilerInstance {
             // (do not dispose) before the target-end teardown, or it double-frees.
             compiler::codegen::llvm_types::clear_codegen_context_ptr();
 
-            if (pm_reused > 0 && !ctx.options.mode.skip_user_main()) {
-                fmt::println(f"  reusing {pm_reused} cached object(s), recompiling {pm_emitted}");
+            if (module_cache.reused > 0 && !ctx.options.mode.skip_user_main()) {
+                fmt::println(f"  reusing {module_cache.reused} cached object(s), recompiling {module_cache.emitted}");
             }
 
             // Register every module's object in topo order - link-stable
@@ -2469,9 +2441,8 @@ type struct CompilerInstance {
             // Per-module cache keys for the NEXT build to consult: every
             // module with an object, emitted or reused, under the key of the
             // bitcode that object was emitted from.
-            if (pm_active) {
-                compiler::build_manifest::ModuleKeyTable::write_module_keys(
-                    ctx.project_config.module_keys_path(), &pm_key_names, &pm_key_hex);
+            if (module_cache.active) {
+                module_cache.write(ctx.project_config.module_keys_path());
             }
         }
 
@@ -3362,36 +3333,47 @@ type struct CompilerInstance {
         }
     }
 
-    /// Emit ready modules' objects IN-PROCESS on the main thread (the serial
-    /// path: `CRYO_CODEGEN_MODE=serial` / a 1-thread build), disposing each
-    /// job's module, context and target machine after its emit.
-    static emit_jobs_serial(jobs: mut [EmitJob]*) -> void {
-        const cnt: i64 = (*jobs).length() as i64;
-        for (mut j: i64 = 0; j < cnt; j++) {
-            codegen_emit_job(&(*jobs)[j], 0);
-            CompilerInstance::dispose_emit_job(&(*jobs)[j]);
-        }
+    /// Remove the earlier object a job found stale (`awaits_emission`), so
+    /// an emit that writes nothing leaves nothing, and set the job to emit.
+    /// On the main thread: removing a file allocates.
+    static clear_for_emission(job: mut EmitJob*) -> void {
+        CodegenPasses::remove_previous_output((*job).emit_path);
+        (*job).awaits_emission = false;
+        (*job).emitting = true;
     }
 
-    /// Dispose a finished job's target machine, module, and context, on the
-    /// MAIN thread, and clear them so the job reads as disposed.  Its results
-    /// (`ok`, `err_msg`, `emit_path`) stay for `record_emitted_jobs`.
-    static dispose_emit_job(job: mut EmitJob*) -> void {
-        if ((*job).tm != null) {
-            mut t: LTargetMachine = LTargetMachine { raw: (*job).tm };
-            t.dispose();
-            (*job).tm = null;
+    /// Retire every job in `jobs[0..*filled]` the pool has finished and
+    /// this thread has not yet seen, and answer how many modules that
+    /// retires.  A job stopped on a stale earlier object is handed back: its
+    /// module moves to the next free slot, cleared for emission, and is
+    /// published again, so it stays live.  A retired job that did not
+    /// succeed sets `*failed`.
+    static retire_finished_jobs(jobs: mut [EmitJob]*, done: [Atomic<u32>]*, filled: mut u64*,
+                                final_slot: mut [i64]*, pool: mut WorkerPool<EmitJob>*,
+                                failed: mut boolean*) -> u32 {
+        mut retired: u32 = 0;
+        const seen_up_to: u64 = *filled;
+        for (mut d: u64 = 0; d < seen_up_to; d++) {
+            const job: mut EmitJob* = &(*jobs)[d];
+            if ((*job).handled || (*done)[d].load(MemoryOrder::Acquire) == 0) { continue; }
+            (*job).handled = true;
+            if ((*job).awaits_emission) {
+                mut handed_back: EmitJob = *job;
+                (*job).llvm_module = null;
+                (*job).llvm_context = null;
+                (*job).tm = null;
+                CompilerInstance::clear_for_emission(&handed_back);
+                handed_back.handled = false;
+                (*jobs)[*filled] = handed_back;
+                (*final_slot)[handed_back.position as i64] = *filled as i64;
+                *filled = *filled + 1;
+                (*pool).publish(*filled);
+                continue;
+            }
+            if (!(*job).ok) { *failed = true; }
+            retired += 1;
         }
-        if ((*job).llvm_module != null) {
-            mut m: LModule = LModule { raw: (*job).llvm_module };
-            m.dispose();
-            (*job).llvm_module = null;
-        }
-        if ((*job).llvm_context != null) {
-            mut c: LContext = LContext { raw: (*job).llvm_context };
-            c.dispose();
-            (*job).llvm_context = null;
-        }
+        return retired;
     }
 
     /// The name of the module sitting at `pos` in the topological codegen
@@ -3435,32 +3417,56 @@ type struct CompilerInstance {
         }
     }
 
-    /// Record each emitted job's object at its module's topo position in
-    /// `objects`, and report each job that failed, in job order.
-    static record_emitted_jobs(ctx: mut CompilationContext*, jobs: [EmitJob]*,
-                               positions: [u32]*, objects: mut [string]*) -> void {
-        for (mut b: i64 = 0; b < (*jobs).length() as i64; b++) {
-            const job: EmitJob* = &(*jobs)[b];
-            if (TimeTrace::enabled()) {
-                const object_name: Str = Str::new(job.emit_path);
+    /// Record what a job's `verify_and_key` settled for its module: its key
+    /// in `cache`, the verifier's refusal as an error, or the earlier object
+    /// it reused at the module's topo position in `objects`.
+    static record_settled_module(ctx: mut CompilationContext*, job: EmitJob*,
+                                 objects: mut [string]*, cache: mut ModuleObjectCache*) -> void {
+        if (job.verify_failed) {
+            CodegenPasses::report_verification_failure(ctx, job.module_name, job.verify_message);
+            return;
+        }
+        if (job.keyed) {
+            (*cache).record(job.module_name, job.key, job.reused);
+        }
+        if (job.reused) {
+            (*objects)[job.position as i64] = job.emit_path;
+            if (Log::enabled(LogArea::Driver, LogLevel::Debug)) {
+                Log::debug(LogArea::Driver, f"reused the cached object {job.emit_path}");
+            }
+        }
+    }
+
+    /// Record a finished in-process job: what its verification and key
+    /// settled, then, for a module it emitted, its object at the module's
+    /// topo position in `objects`, or the failure to emit it.
+    static record_emitted_job(ctx: mut CompilationContext*, job: EmitJob*,
+                              objects: mut [string]*, cache: mut ModuleObjectCache*) -> void {
+        if (TimeTrace::enabled()) {
+            const object_name: Str = Str::new(job.emit_path);
+            TimeTrace::span_between("codegen", Str::new("verify and key"), object_name,
+                job.verify_start_ns, job.optimize_start_ns, job.thread);
+            if (job.emitting) {
                 TimeTrace::span_between("codegen", Str::new("optimize"), object_name,
                     job.optimize_start_ns, job.emit_start_ns, job.thread);
                 TimeTrace::span_between("codegen", Str::new("emit object"), object_name,
                     job.emit_start_ns, job.end_ns, job.thread);
             }
-            const reason: String = LTargetMachine::take_message(job.err_msg as i8*);
-            if (job.optimization_failed) {
-                CodegenPasses::report_optimization_failure(ctx, job.emit_path);
-            } else if (!job.ok) {
-                CodegenPasses::report_emit_failure(ctx, job.emit_path, reason);
-            } else if (!Path::from(job.emit_path).exists()) {
-                // The object was removed before the emit, so an emit that
-                // reported success and wrote nothing is seen here.
-                CodegenPasses::report_emit_failure(ctx, job.emit_path,
-                    String::from("LLVM reported success and wrote no file"));
-            } else {
-                (*objects)[(*positions)[b] as i64] = job.emit_path;
-            }
+        }
+        CompilerInstance::record_settled_module(ctx, job, objects, cache);
+        if (!job.emitting) { return; }
+        const reason: String = LTargetMachine::take_message(job.err_msg as i8*);
+        if (job.optimization_failed) {
+            CodegenPasses::report_optimization_failure(ctx, job.emit_path);
+        } else if (!job.ok) {
+            CodegenPasses::report_emit_failure(ctx, job.emit_path, reason);
+        } else if (!Path::from(job.emit_path).exists()) {
+            // The object was removed before the emit, so an emit that
+            // reported success and wrote nothing is seen here.
+            CodegenPasses::report_emit_failure(ctx, job.emit_path,
+                String::from("LLVM reported success and wrote no file"));
+        } else {
+            (*objects)[job.position as i64] = job.emit_path;
         }
     }
 }
