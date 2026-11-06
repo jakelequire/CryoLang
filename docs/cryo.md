@@ -4723,6 +4723,8 @@ system = ["ws2_32"]                  # winsock, windows targets only
 
 A project can build a library and one or more executables from one source tree. `[lib]` declares the library; each `[[bin]]` (array-of-tables) declares an executable. When present these take precedence over the single-target `[project] target_type` / `entry_point`.
 
+`cryo build` of a project with `[[bin]]` targets builds the executables only: its `[lib]` is what a project depending on it compiles (a dependency is compiled from its source, never linked from an archive). A project with a `[lib]` and no `[[bin]]` builds `lib<name>.a`.
+
 ```ini
 [lib]
 name       = "mylib"
