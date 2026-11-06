@@ -1,0 +1,116 @@
+///! A `WorkerPool` closes itself when it is dropped.  Its workers stop only
+///! once the pool is closed, so a panic that unwinds out of the owner's loop
+///! while they wait for more jobs must still close it: the process then ends
+///! with the panic instead of waiting forever to join them.  The panicking
+///! owner runs in a child process under a deadline, so a pool that does not
+///! close fails this test rather than hanging it.  The ordinary path - jobs
+///! published one at a time, then an explicit close - runs here first.
+
+namespace main;
+
+import std::fmt;
+import std::env;
+import std::thread;
+import std::core::intrinsics;
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::process::command::{ Command };
+import std::process::child::{ Child };
+import std::sync::atomic::{ Atomic, MemoryOrder };
+import std::time::duration::{ Duration };
+import utils::worker_pool::{ WorkerPool };
+
+const ROLE_VARIABLE: string = "WORKER_POOL_TEST_ROLE";
+const JOB_COUNT: i64 = 64;
+
+mut g_failed: i32 = 0;
+
+function check(what: string, got: i64, want: i64) -> void {
+    if (got != want) {
+        fmt::printf("FAIL %s: got %lld, want %lld\n", what, got, want);
+        g_failed = g_failed + 1;
+    }
+}
+
+function double_job(job: mut i64*, worker: u32) -> void {
+    *job = *job * 2;
+}
+
+/// The child's role: one job published and run, then a panic while both
+/// workers wait for the next.
+function owner_panics() -> int {
+    mut jobs: [i64] = [];
+    mut done: [Atomic<u32>] = [];
+    for (mut k: i64 = 0; k < 4; k++) {
+        jobs.push(0);
+        done.push(Atomic::<u32>::new(0));
+    }
+    mut pool: WorkerPool<i64> = WorkerPool::<i64>::new(0);
+    pool.start(jobs.as_mutable_ptr(), done.as_mutable_ptr(), 2, double_job);
+    jobs[0] = 21;
+    pool.publish(1);
+    while (done[0].load(MemoryOrder::Acquire) == 0) {
+        thread::sleep_ms(1);
+    }
+    panic("the owner panicked with the pool open", intrinsics::location());
+    return 0;
+}
+
+function main() -> int {
+    if (env::var(Str::new(ROLE_VARIABLE)).is_some()) {
+        return owner_panics();
+    }
+
+    // Published one at a time while the workers run, then closed.
+    mut jobs: [i64] = [];
+    mut done: [Atomic<u32>] = [];
+    for (mut k: i64 = 0; k < JOB_COUNT; k++) {
+        jobs.push(0);
+        done.push(Atomic::<u32>::new(0));
+    }
+    mut pool: WorkerPool<i64> = WorkerPool::<i64>::new(0);
+    pool.start(jobs.as_mutable_ptr(), done.as_mutable_ptr(), 3, double_job);
+    for (mut k: i64 = 0; k < JOB_COUNT; k++) {
+        jobs[k] = k;
+        pool.publish((k + 1) as u64);
+    }
+    pool.close();
+    mut finished: i64 = 0;
+    mut sum: i64 = 0;
+    for (mut k: i64 = 0; k < JOB_COUNT; k++) {
+        if (done[k].load(MemoryOrder::Acquire) != 0) { finished = finished + 1; }
+        sum = sum + jobs[k];
+    }
+    check("jobs finished before close returned", finished, JOB_COUNT);
+    check("sum of the doubled jobs", sum, JOB_COUNT * (JOB_COUNT - 1));
+
+    // A panic with the pool open ends the child, with the panic's exit code.
+    const exe: String = match (env::current_exe()) {
+        Option::Some(path) => { path }
+        Option::None       => { fmt::printf("cannot find this executable\n"); return 2; }
+    };
+    mut command: Command = Command::new(exe.as_str());
+    command.env(Str::new(ROLE_VARIABLE), Str::new("owner"));
+    mut child: Child = match (command.spawn()) {
+        Result::Ok(c)  => { c }
+        Result::Err(_) => { fmt::printf("cannot start the owner process\n"); return 2; }
+    };
+    match (child.wait_timeout(Duration::from_secs(60))) {
+        Result::Ok(Option::Some(status)) => {
+            check("exit code of an owner that panicked", status.exit_code().unwrap_or(-1) as i64, 101);
+        }
+        Result::Ok(Option::None) => {
+            fmt::printf("FAIL the owner did not exit within 60 s of panicking with the pool open\n");
+            g_failed = g_failed + 1;
+            child.kill();
+            child.wait();
+        }
+        Result::Err(_) => {
+            fmt::printf("FAIL cannot wait for the owner process\n");
+            g_failed = g_failed + 1;
+        }
+    }
+
+    fmt::printf("worker pool checks: %d failed\n", g_failed);
+    return g_failed == 0 ? 0 : 1;
+}

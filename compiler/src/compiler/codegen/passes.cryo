@@ -42,8 +42,6 @@ import compiler::types::arena::{ TypeArena };
 import compiler::types::type_base::{ Type };
 import compiler::types::user_defined::{ FieldInfo, StructType };
 import std::core::mem;
-import std::sync::atomic::{ Atomic, MemoryOrder };
-import std::thread;
 import compiler::resolver::mangled_name::{ MangledName };
 
 
@@ -2351,13 +2349,15 @@ type struct EmitJob {
     thread:            u32;
 }
 
-/// Optimize and emit ONE module's object file from its own standalone LLVM context (the
-/// in-process serial path).  Touches only LLVM state private to this job - 
-/// never `ctx`, the arena, or the intern table.  The target machine is created
-/// per-job (cheap); `init_native_target` must already have run (it has, during
-/// IRGeneration).  A top-level function (not a method/lambda), a form usable
-/// as a thread entry point; emission is serial in-process here and
-/// out-of-process for large builds.
+/// Optimize and emit ONE module's object file from its own standalone LLVM
+/// context, on the main thread or on a `WorkerPool` worker.  Touches only LLVM
+/// state private to this job - never `ctx`, the arena, or the intern table -
+/// and allocates no Cryo memory, so the main thread keeps the bump arena to
+/// itself while it generates the next module's IR.  The target machine is
+/// created per-job (cheap); `init_native_target` must already have run (it
+/// has, during IRGeneration).  A top-level function, so it can be handed to
+/// the pool as a function pointer: a lambda could not call the generic LLVM
+/// wrappers it uses.
 function codegen_emit_job(job: mut EmitJob*, thread: u32) -> void {
     (*job).thread = thread;
     (*job).optimize_start_ns = TimeTrace::now();
@@ -2395,45 +2395,4 @@ function codegen_emit_job(job: mut EmitJob*, thread: u32) -> void {
     (*job).err_msg = err as string;
     (*job).ok = rc == 0;
     (*job).end_ns = TimeTrace::now();
-}
-
-/// The in-process threaded emitter's job queue, moved into each worker by
-/// value.  The pointers alias storage the main thread sized for every module
-/// before any worker started, so nothing they point into moves while a worker
-/// runs.  The main thread fills `jobs[k]` and only then raises `published`
-/// past `k` (release); a worker takes the next index off `cursor`, waits until
-/// that index is published, emits it, and stores `done[k]` (release).  The
-/// main thread reads a job's results or disposes it only after seeing `done`
-/// (acquire).  Once the last job is published the main thread sets `closed`,
-/// and a worker holding an index past the last published one stops.
-type struct EmitQueue {
-    jobs:      mut EmitJob*;
-    done:      mut Atomic<u32>*;
-    cursor:    mut Atomic<u64>*;
-    published: mut Atomic<u64>*;
-    closed:    mut Atomic<u32>*;
-    /// This worker's number, from 0.
-    worker:    u32;
-}
-
-/// Pool worker body.  A plain top-level function: it is handed to
-/// `Scope::spawn` as a function pointer, and a lambda handed to the generic
-/// `spawn` could not call the generic LLVM wrappers `codegen_emit_job` uses.
-/// It allocates no Cryo memory (nor does `codegen_emit_job`), so the main
-/// thread keeps the bump arena to itself while it generates the next module's
-/// IR; every module lives in its own LLVM context, so emitting one shares no
-/// LLVM state with the main thread's work on another.
-function emit_queue_worker(queue: EmitQueue) -> void {
-    loop {
-        const k: u64 = (*queue.cursor).fetch_add(1, MemoryOrder::Relaxed);
-        while (k >= (*queue.published).load(MemoryOrder::Acquire)) {
-            if ((*queue.closed).load(MemoryOrder::Acquire) != 0
-                    && k >= (*queue.published).load(MemoryOrder::Acquire)) {
-                return;
-            }
-            thread::sleep_ms(1);
-        }
-        codegen_emit_job(&queue.jobs[k], queue.worker + 1);
-        queue.done[k].store(1, MemoryOrder::Release);
-    }
 }

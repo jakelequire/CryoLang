@@ -1,0 +1,103 @@
+///! A fixed set of worker threads running jobs from a table the owner fills
+///! in order while the workers run.
+
+namespace utils::worker_pool;
+
+import std::sync::atomic::{ Atomic, MemoryOrder };
+import std::thread;
+
+/// Worker threads over a job table of `J`, filled in order by the owner while
+/// the workers run.  The owner fills `jobs[k]` and only then publishes past
+/// `k`; a worker takes the next index off `cursor`, waits until that index is
+/// published, runs the job, and stores `done[k]` (release).  The owner reads a
+/// job's results or releases it only after seeing `done[k]` (acquire).
+///
+/// A worker stops only once the pool is closed, so the pool closes itself
+/// when it is dropped: a panic that unwinds out of the owner's loop still
+/// lets every worker finish what was published and return, and the join in
+/// the drop then completes instead of waiting forever.  The workers point
+/// into the pool and into the job table, so neither may move once `start`
+/// has run, and the pool must be declared after the job table so it is
+/// dropped (and joined) first.
+type struct WorkerPool<J> {
+    private cursor:    Atomic<u64>;
+    private published: Atomic<u64>;
+    private closed:    Atomic<u32>;
+    private workers:   thread::Scope;
+
+    /// A pool with no workers yet, each to run on a `stack_bytes` stack
+    /// (`0` for the OS default).
+    static new(stack_bytes: u64) -> WorkerPool<J> {
+        return WorkerPool::<J> {
+            cursor:    Atomic::<u64>::new(0),
+            published: Atomic::<u64>::new(0),
+            closed:    Atomic::<u32>::new(0),
+            workers:   thread::Scope::new_with_stack(stack_bytes)
+        };
+    }
+
+    /// Start `threads` workers running `run(&jobs[k], worker number from 1)`
+    /// for each published `k`.  `jobs` and `done` are sized for every job
+    /// this pool will ever publish, and `done` starts all zero.
+    start(mut &this, jobs: mut J*, done: mut Atomic<u32>*, threads: u32,
+          run: (mut J*, u32) -> void) -> void {
+        for (mut w: u32 = 0; w < threads; w++) {
+            this.workers.spawn::<WorkerQueue<J>>(WorkerQueue::<J> {
+                jobs: jobs, done: done,
+                cursor: &this.cursor, published: &this.published, closed: &this.closed,
+                worker: w, run: run
+            }, work_through_queue::<J>);
+        }
+    }
+
+    /// Hand the workers every job below `count`.
+    publish(mut &this, count: u64) -> void {
+        this.published.store(count, MemoryOrder::Release);
+    }
+
+    /// Let every worker run what is published and stop, and wait for them.
+    /// A closed pool takes no more jobs; closing again does nothing.
+    close(mut &this) -> void {
+        this.closed.store(1, MemoryOrder::Release);
+        this.workers.join_all();
+    }
+}
+
+implement<J> trait Drop for struct WorkerPool<J> {
+    drop(mut &this) -> void {
+        this.close();
+    }
+}
+
+/// One worker's view of a `WorkerPool`'s queue, moved into the worker by
+/// value.
+private type struct WorkerQueue<J> {
+    jobs:      mut J*;
+    done:      mut Atomic<u32>*;
+    cursor:    mut Atomic<u64>*;
+    published: mut Atomic<u64>*;
+    closed:    mut Atomic<u32>*;
+    /// This worker's number, from 0.
+    worker:    u32;
+    run:       (mut J*, u32) -> void;
+}
+
+/// A worker's body: run published jobs until the pool is closed and no
+/// published index is left for it.  It allocates nothing, so the owner keeps
+/// any thread-local allocator to itself.  A top-level function because
+/// `Scope::spawn` takes the body as a function pointer.
+private function work_through_queue<J>(queue: WorkerQueue<J>) -> void {
+    const run: (mut J*, u32) -> void = queue.run;
+    loop {
+        const k: u64 = (*queue.cursor).fetch_add(1, MemoryOrder::Relaxed);
+        while (k >= (*queue.published).load(MemoryOrder::Acquire)) {
+            if ((*queue.closed).load(MemoryOrder::Acquire) != 0
+                    && k >= (*queue.published).load(MemoryOrder::Acquire)) {
+                return;
+            }
+            thread::sleep_ms(1);
+        }
+        run(&queue.jobs[k], queue.worker + 1);
+        queue.done[k].store(1, MemoryOrder::Release);
+    }
+}

@@ -55,7 +55,7 @@ import compiler::ast::dumper::{ ASTDumper };
 import compiler::ast::node::{ ProgramNode };
 import compiler::codegen::llvm_types::{ LContext, LFileType, LModule, LTargetMachine };
 import compiler::codegen::passes::{
-    codegen_emit_job, CodegenPasses, emit_queue_worker, EmitJob, EmitQueue, EmitTarget
+    codegen_emit_job, CodegenPasses, EmitJob, EmitTarget
 };
 import compiler::codegen::test_main_codegen::{ TestMainCodegen };
 import compiler::compilation_context::{
@@ -77,6 +77,7 @@ import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::module_graph::{ ModulePath };
 import compiler::types::generic_registry;
 import compiler::resolver::lang_item::{ LangModule };
+import utils::worker_pool::{ WorkerPool };
 
 // Default codegen worker count: the online CPU count.  Object emission is
 // parallelized by fanning each module out to a child `cryo __emit-obj` PROCESS
@@ -1895,19 +1896,16 @@ type struct CompilerInstance {
             // In-process emit jobs (used when `!multiproc`), one per module
             // handed to an emitter, with its topo position in `cg_pos`.  On the
             // threaded path the table is sized for every module before a worker
-            // starts (see `EmitQueue`); slot `cg_filled` is the next to fill.
+            // starts (see `WorkerPool`); slot `cg_filled` is the next to fill.
             mut cg_jobs: [EmitJob] = [];
             mut cg_pos:  [u32] = [];
             mut cg_done: [Atomic<u32>] = [];
-            mut cg_cursor:    Atomic<u64> = Atomic::<u64>::new(0);
-            mut cg_published: Atomic<u64> = Atomic::<u64>::new(0);
-            mut cg_closed:    Atomic<u32> = Atomic::<u32>::new(0);
             mut cg_filled: u64 = 0;
             mut cg_live:   u32 = 0;
             mut cg_emit_failed: boolean = false;
             // 64 MiB worker stacks: LLVM's SelectionDAG recurses deep and
             // overflows the ~1 MiB default thread stack.
-            mut cg_pool: thread::Scope = thread::Scope::new_with_stack(64 * 1024 * 1024);
+            mut cg_pool: WorkerPool<EmitJob> = WorkerPool::<EmitJob>::new(64 * 1024 * 1024);
             if (cg_threaded) {
                 for (mut r: u32 = 0; r < n; r++) {
                     cg_jobs.push(EmitJob {
@@ -1919,13 +1917,8 @@ type struct CompilerInstance {
                     });
                     cg_done.push(Atomic::<u32>::new(0));
                 }
-                for (mut w: u32 = 0; w < cg_threads; w++) {
-                    cg_pool.spawn::<EmitQueue>(EmitQueue {
-                        jobs: cg_jobs.as_mutable_ptr(), done: cg_done.as_mutable_ptr(),
-                        cursor: &cg_cursor, published: &cg_published, closed: &cg_closed,
-                        worker: w
-                    }, emit_queue_worker);
-                }
+                cg_pool.start(cg_jobs.as_mutable_ptr(), cg_done.as_mutable_ptr(), cg_threads,
+                              codegen_emit_job);
             }
 
             // Every analysed `![inline]` body, for the modules calling one to
@@ -2190,7 +2183,7 @@ type struct CompilerInstance {
                 cg_jobs[cg_filled] = cg_job;
                 cg_filled = cg_filled + 1;
                 cg_live = cg_live + 1;
-                cg_published.store(cg_filled, MemoryOrder::Release);
+                cg_pool.publish(cg_filled);
                 // Dispose every job the pool has finished, then wait while the
                 // live modules are at the cap.  A failed job stops the loop at
                 // its next iteration; it is reported below with the rest.
@@ -2212,8 +2205,7 @@ type struct CompilerInstance {
             // The jobs still live are disposed here, then every job's object
             // is recorded (and every failure reported) in topo order.
             if (cg_threaded) {
-                cg_closed.store(1, MemoryOrder::Release);
-                cg_pool.join_all();
+                cg_pool.close();
                 cg_jobs.truncate(cg_filled as i64);
                 for (mut d: i64 = 0; d < cg_jobs.length(); d++) {
                     if (cg_jobs[d].llvm_context != null) {
