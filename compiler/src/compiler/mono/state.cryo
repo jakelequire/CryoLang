@@ -160,6 +160,10 @@ type struct MonoState {
     // `spec_index` under each one's instantiation.  Shared so
     // MonoCallSpecializer can read it.
     spec_entries:     [SpecializationEntry];
+    // Each entry's position under its `specialized_type`, in the order the
+    // entries were added (`add_spec_entry`), so the entries for one type are
+    // found without visiting every specialization in the program.
+    spec_entries_by_type: HashMap<TypeKey, [i64]>;
 
     // Visited set for request_nested_instantiations cycle detection.
     nested_visited:   [u64];
@@ -225,6 +229,7 @@ type struct MonoState {
             pending:          [],
             pending_cursor:   0,
             spec_entries:     [],
+            spec_entries_by_type: HashMap::<TypeKey, [i64]>::new(),
             nested_visited:   [],
             error_count:      0,
             method_instances: [],
@@ -233,6 +238,31 @@ type struct MonoState {
             spec_owner_files: [],
             settled_objects:  [],
         };
+    }
+
+    /// Add `entry` to `spec_entries` and answer its position.
+    add_spec_entry(mut &this, entry: SpecializationEntry) -> i64 {
+        const at: i64 = this.spec_entries.length();
+        const positions: mut [i64]* = this.spec_entries_by_type.get_or_insert(entry.specialized_type.table_key(), []);
+        positions.push(at);
+        this.spec_entries.push(entry);
+        return at;
+    }
+
+    /// The positions in `spec_entries` of the entries specializing `ty`, in
+    /// the order they were added.
+    entries_specializing(&this, ty: TypeRef) -> [i64] {
+        mut out: [i64] = [];
+        match (this.spec_entries_by_type.get_ref(&ty.table_key())) {
+            Option::Some(positions) => {
+                for (mut k: i64 = 0; k < (*positions).length(); k++) {
+                    const at: i64 = (*positions)[k];
+                    if (this.spec_entries[at].specialized_type.equals(ty)) { out.push(at); }
+                }
+            }
+            Option::None => { }
+        }
+        return out;
     }
 
     /// The entry of `owner`'s instance of the method definition `def` at

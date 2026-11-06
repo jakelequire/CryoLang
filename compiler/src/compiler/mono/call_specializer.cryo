@@ -738,9 +738,9 @@ type struct MonoCallSpecializer {
     /// holds it.  This is where an instance of `m` is added.
     method_placement(&this, m_decl: DeclarationNode*, recv_type: TypeRef,
                      out_impl: mut (DeclarationNode*)*, out_owner: mut (DeclarationNode*)*) -> boolean {
-        for (mut i: i64 = 0; i < this.state.spec_entries.length(); i++) {
-            const entry: SpecializationEntry* = &this.state.spec_entries[i];
-            if (!entry.specialized_type.equals(recv_type)) { continue; }
+        const specializing: [i64] = this.state.entries_specializing(recv_type);
+        for (mut i: i64 = 0; i < specializing.length(); i++) {
+            const entry: SpecializationEntry* = &this.state.spec_entries[specializing[i]];
             if (MethodDecl::is_method_of(m_decl,entry.ast_node)) { *out_owner = entry.ast_node; return true; }
             for (mut j: i64 = 0; j < entry.impl_nodes.length(); j++) {
                 if (MethodDecl::is_method_of(m_decl,entry.impl_nodes[j])) {
@@ -1091,9 +1091,10 @@ type struct MonoCallSpecializer {
                 // The method is placed on the template AST; route to the
                 // receiver's spec entry instead so the sibling doesn't leak across
                 // every instantiation.
-                for (mut si: i64 = 0; si < this.state.spec_entries.length(); si++) {
-                    const e: SpecializationEntry* = &this.state.spec_entries[si];
-                    if (e.specialized_type.equals(recv_type) && e.ast_node != null) {
+                const specializing: [i64] = this.state.entries_specializing(recv_type);
+                for (mut si: i64 = 0; si < specializing.length(); si++) {
+                    const e: SpecializationEntry* = &this.state.spec_entries[specializing[si]];
+                    if (e.ast_node != null) {
                         target_ast = e.ast_node;
                         break;
                     }
@@ -1187,9 +1188,9 @@ type struct MonoCallSpecializer {
     /// specialization, then the trait impls selected for it - and the block
     /// holding it (`out_impl`); null when none holds one.
     deferred_copy_of(&this, d: DefId, recv_type: TypeRef, out_impl: mut (DeclarationNode*)*) -> DeclarationNode* {
-        for (mut i: i64 = 0; i < this.state.spec_entries.length(); i++) {
-            const entry: SpecializationEntry* = &this.state.spec_entries[i];
-            if (!entry.specialized_type.equals(recv_type)) { continue; }
+        const specializing: [i64] = this.state.entries_specializing(recv_type);
+        for (mut i: i64 = 0; i < specializing.length(); i++) {
+            const entry: SpecializationEntry* = &this.state.spec_entries[specializing[i]];
             for (mut j: i64 = 0; j < entry.impl_nodes.length(); j++) {
                 const block: DeclarationNode* = entry.impl_nodes[j];
                 const m_decl: DeclarationNode* = MonoCallSpecializer::deferred_in(DeclarationNode::impl_of(block), d);
@@ -1282,9 +1283,9 @@ type struct MonoCallSpecializer {
     /// entry, which places it in the trait's module.  The trait's other
     /// methods are never asked of it: a call of one goes through the table.
     object_implementation(mut &this, trait_def: DefId, decl: TraitDecl*, object: TypeRef) -> DeclarationNode* {
-        for (mut i: i64 = 0; i < this.state.spec_entries.length(); i++) {
-            const entry: SpecializationEntry* = &this.state.spec_entries[i];
-            if (!entry.specialized_type.equals(object)) { continue; }
+        const specializing: [i64] = this.state.entries_specializing(object);
+        for (mut i: i64 = 0; i < specializing.length(); i++) {
+            const entry: SpecializationEntry* = &this.state.spec_entries[specializing[i]];
             for (mut j: i64 = 0; j < entry.impl_nodes.length(); j++) {
                 const held: ImplBlock* = DeclarationNode::impl_of(entry.impl_nodes[j]);
                 if (held != null && held.trait_def.equals(trait_def)) { return entry.impl_nodes[j]; }
@@ -1332,7 +1333,7 @@ type struct MonoCallSpecializer {
         mut impls: [DeclarationNode*] = [];
         impls.push(block_decl);
         const object_t: Type* = this.arena.lookup(object);
-        this.state.spec_entries.push(SpecializationEntry {
+        this.state.add_spec_entry(SpecializationEntry {
             specialized_type:  object,
             ast_node:          null,
             impl_nodes:        impls,
@@ -1351,9 +1352,9 @@ type struct MonoCallSpecializer {
     trait_heads_on(&this, trait_def: DefId, recv_type: TypeRef) -> [DeclarationNode*] {
         mut heads: [DeclarationNode*] = [];
         mut specialized: boolean = false;
-        for (mut i: i64 = 0; i < this.state.spec_entries.length(); i++) {
-            const entry: SpecializationEntry* = &this.state.spec_entries[i];
-            if (!entry.specialized_type.equals(recv_type)) { continue; }
+        const specializing: [i64] = this.state.entries_specializing(recv_type);
+        for (mut i: i64 = 0; i < specializing.length(); i++) {
+            const entry: SpecializationEntry* = &this.state.spec_entries[specializing[i]];
             // An entry holding only the blocks placed on the type for it -
             // an object's, a head for every type's - is not the type's own
             // specialization, and its written heads still answer.
@@ -1446,9 +1447,10 @@ type struct MonoCallSpecializer {
     /// other, so two modules emitting it link as one.
     blanket_implementation(mut &this, head_decl: DeclarationNode*, subject: TypeRef) -> DeclarationNode* {
         const head: ImplBlock* = DeclarationNode::impl_of(head_decl);
-        for (mut i: i64 = 0; i < this.state.spec_entries.length(); i++) {
-            const entry: SpecializationEntry* = &this.state.spec_entries[i];
-            if (entry.ast_node != null || !entry.specialized_type.equals(subject)) { continue; }
+        const specializing: [i64] = this.state.entries_specializing(subject);
+        for (mut i: i64 = 0; i < specializing.length(); i++) {
+            const entry: SpecializationEntry* = &this.state.spec_entries[specializing[i]];
+            if (entry.ast_node != null) { continue; }
             for (mut j: i64 = 0; j < entry.impl_nodes.length(); j++) {
                 if (DeclarationNode::impl_of(entry.impl_nodes[j]).template == head) { return entry.impl_nodes[j]; }
             }
@@ -1484,7 +1486,7 @@ type struct MonoCallSpecializer {
         };
         mut impls: [DeclarationNode*] = [];
         impls.push(copy_decl);
-        this.state.spec_entries.push(SpecializationEntry {
+        this.state.add_spec_entry(SpecializationEntry {
             specialized_type:  subject,
             ast_node:          null,
             impl_nodes:        impls,
@@ -2279,16 +2281,15 @@ type struct MonoCallSpecializer {
             // Legacy fallback: an owner minted without generic identity (the
             // substituter can mint an instantiation with fresh arg ids) - match the
             // concrete against a materialized spec entry's instantiated type.
-            for (mut i: i64 = 0; i < this.state.spec_entries.length(); i++) {
-                const e: SpecializationEntry* = &this.state.spec_entries[i];
+            const specializing: [i64] = this.state.entries_specializing(owner_type);
+            for (mut i: i64 = 0; i < specializing.length(); i++) {
+                const e: SpecializationEntry* = &this.state.spec_entries[specializing[i]];
                 if (!e.specialized_type.is_valid() || !e.instantiated_type.is_valid()) { continue; }
-                if (e.specialized_type.equals(owner_type)) {
-                    const cand: TypeRef = this.arena.inst_generic_base(e.instantiated_type);
-                    if (cand.is_valid()) {
-                        owner_src = e.instantiated_type;
-                        owner_base = cand;
-                        break;
-                    }
+                const cand: TypeRef = this.arena.inst_generic_base(e.instantiated_type);
+                if (cand.is_valid()) {
+                    owner_src = e.instantiated_type;
+                    owner_base = cand;
+                    break;
                 }
             }
         }

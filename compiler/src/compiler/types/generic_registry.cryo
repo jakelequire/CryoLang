@@ -310,6 +310,10 @@ type struct GenericRegistry {
     /// `(trait_id, target)` -> indices into `trait_heads`, in
     /// registration order.
     trait_head_index: HashMap<TraitImplKey, [i64]>;
+    /// `target` -> indices into `trait_heads` of every trait's heads for
+    /// it, in registration order: what a method call on a type binds
+    /// against, without visiting the heads for every other type.
+    target_head_index: HashMap<TypeKey, [i64]>;
     /// Every head whose target is a parameter of its own -
     /// `implement<T> trait From<T> for T` - under its trait, in registration
     /// order.  Such a head is for every type, so it is filed under no target
@@ -417,6 +421,7 @@ type struct GenericRegistry {
             mono_set:          HashMap::<TypeKey, boolean>::new(),
             trait_heads:       [],
             trait_head_index:  HashMap::<TraitImplKey, [i64]>::new(),
+            target_head_index: HashMap::<TypeKey, [i64]>::new(),
             blanket_heads:     [],
             overlap_checked:   [],
             coh_pool:  [],
@@ -636,6 +641,8 @@ type struct GenericRegistry {
             if (this.trait_heads[(*slot)[i]].block == block) { return; }
         }
         (*slot).push(this.trait_heads.length());
+        const for_target: mut [i64]* = this.target_head_index.get_or_insert(target.table_key(), []);
+        (*for_target).push(this.trait_heads.length());
         this.trait_heads.push(TraitImplHead { trait_id: trait_id, target: target, block: block });
     }
 
@@ -794,10 +801,10 @@ type struct GenericRegistry {
         mut out: [DeclarationNode*] = [];
         if (!subject.is_valid() || intern == null) { return out; }
         const target: TypeRef = this.impl_target_of(subject);
+        const under: [i64] = this.heads_registered_under(subject, target);
         mut seen: [DefId] = [];
-        for (mut i: i64 = 0; i < this.trait_heads.length(); i++) {
-            const h: const TraitImplHead* = &this.trait_heads[i];
-            if (!h.target.equals(subject) && !h.target.equals(target)) { continue; }
+        for (mut i: i64 = 0; i < under.length(); i++) {
+            const h: const TraitImplHead* = &this.trait_heads[under[i]];
             mut dup: boolean = false;
             for (mut s: i64 = 0; s < seen.length(); s++) {
                 if (seen[s].equals(h.trait_id)) { dup = true; break; }
@@ -840,11 +847,49 @@ type struct GenericRegistry {
         mut out: [DeclarationNode*] = [];
         if (!subject.is_valid() || intern == null) { return out; }
         const target: TypeRef = this.impl_target_of(subject);
-        for (mut i: i64 = 0; i < this.trait_heads.length(); i++) {
-            const h: const TraitImplHead* = &this.trait_heads[i];
-            if (!h.target.equals(target)) { continue; }
+        const under: [i64] = this.heads_registered_under(target, target);
+        for (mut i: i64 = 0; i < under.length(); i++) {
+            const h: const TraitImplHead* = &this.trait_heads[under[i]];
             if (!this.head_matches(DeclarationNode::impl_of(h.block), subject, intern)) { continue; }
             out.push(h.block);
+        }
+        return out;
+    }
+
+    /// The positions in `trait_heads` of every trait's heads registered for
+    /// `first` or for `second` (the same type when only one is asked for), in
+    /// registration order.
+    heads_registered_under(&this, first: TypeRef, second: TypeRef) -> [i64] {
+        mut out: [i64] = [];
+        const first_key: TypeKey = first.table_key();
+        const second_key: TypeKey = second.table_key();
+        mut a: [i64]* = null;
+        mut a_length: i64 = 0;
+        match (this.target_head_index.get_ref(&first_key)) {
+            Option::Some(slot) => { a = slot; a_length = (*slot).length(); }
+            _ => { }
+        }
+        mut b: [i64]* = null;
+        mut b_length: i64 = 0;
+        if (!first_key.equals(&second_key)) {
+            match (this.target_head_index.get_ref(&second_key)) {
+                Option::Some(slot) => { b = slot; b_length = (*slot).length(); }
+                _ => { }
+            }
+        }
+        mut i: i64 = 0;
+        mut k: i64 = 0;
+        while (i < a_length || k < b_length) {
+            mut at: i64 = 0;
+            if (k >= b_length || (i < a_length && (*a)[i] < (*b)[k])) {
+                at = (*a)[i];
+                i++;
+            } else {
+                at = (*b)[k];
+                k++;
+            }
+            const target: TypeRef = this.trait_heads[at].target;
+            if (target.equals(first) || target.equals(second)) { out.push(at); }
         }
         return out;
     }
