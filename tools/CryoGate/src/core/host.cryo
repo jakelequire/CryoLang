@@ -1,0 +1,72 @@
+///! The machine cryogate runs on, and where the repository is on it.
+
+namespace cryogate::core::host;
+
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::env;
+import std::fs::path::{ Path, PathBuf };
+
+public type struct Host {
+    /// The operating system this binary was built for, spelled as a
+    /// `![target(...)]` directive names it.
+    ![target(windows)]
+    public static os() -> Str { return Str::new("windows"); }
+    ![target(linux)]
+    public static os() -> Str { return Str::new("linux"); }
+
+    /// Whether a `![target(<name>)]` gate includes this host.  `unix` names
+    /// every POSIX host.
+    public static builds_target(name: Str) -> boolean {
+        if (name == Host::os()) { return true; }
+        return name == Str::new("unix") && Host::os() != Str::new("windows");
+    }
+
+    /// Whether two environment variable names name one variable: Windows
+    /// compares them without case.
+    ![target(windows)]
+    public static same_variable(a: Str, b: Str) -> boolean { return a.equals_case_insensitive(&b); }
+    ![target(unix)]
+    public static same_variable(a: Str, b: Str) -> boolean { return a == b; }
+
+    /// The file name an executable called `stem` has on this host.
+    ![target(windows)]
+    public static executable_name(stem: Str) -> String { return f"{stem}.exe"; }
+    ![target(unix)]
+    public static executable_name(stem: Str) -> String { return String::from_str(stem); }
+
+    /// The pinned compiler this host runs: `bin/cryo.exe` on Windows,
+    /// `bin/cryo` elsewhere.  Windows does not launch the extensionless
+    /// name, which is the Linux pin.
+    public static pinned_compiler(repository: Path) -> PathBuf {
+        return repository.join(Str::new("bin")).join(Host::executable_name(Str::new("cryo")).as_str());
+    }
+
+    /// The repository this binary was built from: cryogate is built into
+    /// `tools/CryoGate/build/`, so the root is three directories above the
+    /// executable.  Refused unless that directory holds the pinned compiler
+    /// and the stdlib, so a copied binary names its problem instead of
+    /// judging some other tree.
+    public static repository() -> Result<PathBuf, String> {
+        const exe: String = match (env::current_exe()) {
+            Option::Some(path) => { path }
+            Option::None       => { return Result::Err(String::from_str(Str::new("cannot read the path of the running executable"))); }
+        };
+        mut root: PathBuf = PathBuf::from(exe.as_str());
+        mut climbed: i64 = 0;
+        while (climbed < 4) {
+            if (!root.pop()) {
+                return Result::Err(f"{exe} is not inside a repository's tools/CryoGate/build/");
+            }
+            climbed++;
+        }
+        const pin: PathBuf = root.join(Str::new("bin"));
+        const stdlib: PathBuf = root.join(Str::new("stdlib"));
+        if (!pin.as_path().is_directory() || !stdlib.as_path().is_directory()) {
+            return Result::Err(f"{exe} is not inside a repository's tools/CryoGate/build/: {root.as_path().as_str()} holds no bin/ and stdlib/");
+        }
+        return Result::Ok(root);
+    }
+}

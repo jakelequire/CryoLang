@@ -1,0 +1,68 @@
+///! `cryogate heavy [--no-wait] -- <program> [arguments]`: run one heavy
+///! proof under the heavy-run lock.
+///!
+///! The lock is taken (waited for unless `--no-wait`), the program runs with
+///! cryogate's console, and the lock is released when it ends, whatever its
+///! exit.  cryogate exits with the program's code.  The lock names its
+///! holder as `CRYOGATE_OWNER` says, or as the checkout, followed by the
+///! command line.
+
+namespace cryogate::heavy;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::mem;
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::env;
+import std::fmt;
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::child::{ Completion, Job, Outcome };
+import cryogate::core::lock::{ HeavyLock };
+
+public type struct Heavy {
+    public static run(repository: Path, arguments: &Array<String>, first: i64) -> i32 {
+        mut wait: boolean = true;
+        mut index: i64 = first;
+        while (index < arguments.length() && arguments.get_ref(index).unwrap().as_str() != Str::new("--")) {
+            const option: Str = arguments.get_ref(index).unwrap().as_str();
+            if (option == Str::new("--no-wait")) {
+                wait = false;
+            } else {
+                fmt::eprintln(f"cryogate heavy: unknown option `{option}`; usage: cryogate heavy [--no-wait] -- <program> [arguments]");
+                return 2;
+            }
+            index++;
+        }
+        if (index + 1 >= arguments.length()) {
+            fmt::eprintln(String::from_str(Str::new("cryogate heavy: no program after `--`; usage: cryogate heavy [--no-wait] -- <program> [arguments]")));
+            return 2;
+        }
+        mut job: Job = Job::new(arguments.get_ref(index + 1).unwrap().as_str());
+        mut argument: i64 = index + 2;
+        while (argument < arguments.length()) {
+            job.argument(arguments.get_ref(argument).unwrap().as_str());
+            argument++;
+        }
+        const owner: String = match (env::var(Str::new("CRYOGATE_OWNER"))) {
+            Option::Some(name) => { f"{name.as_str()} - {job.command_line().as_str()}" }
+            Option::None       => { f"cryogate in {repository.as_str()} - {job.command_line().as_str()}" }
+        };
+        const path: PathBuf = HeavyLock::default_path(repository);
+        const lock: HeavyLock = match (HeavyLock::acquire(path.as_path(), owner.as_str(), wait)) {
+            Result::Ok(lock)    => { lock }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate heavy: {reason.as_str()}"); return 1; }
+        };
+        const done: Completion = job.run();
+        mem::drop(lock);
+        return match (done.outcome) {
+            Outcome::Exited(code) => { code }
+            _ => {
+                fmt::eprintln(f"cryogate heavy: `{job.command_line().as_str()}`: {done.outcome.describe().as_str()}");
+                1
+            }
+        };
+    }
+}

@@ -1,0 +1,138 @@
+///! The heavy-run lock: one heavy proof (a full suite, verify, selfhost, a
+///! pin build) on the machine at a time, across every checkout.
+///!
+///! The lock is a file, created only if absent, holding who took it and
+///! when.  Its default place is beside the checkout, in the directory that
+///! holds the repository's worktrees, which is where people taking it by
+///! hand put it too; `CRYOGATE_HEAVY_LOCK` names another file.  The holder
+///! deletes it when done.  A lock older than `STALE_SECONDS` is not waited
+///! for and not taken: it is reported, because a run that died holding it
+///! and a run still going look the same from outside.
+
+namespace cryogate::core::lock;
+
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::drop::{ Drop };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::env;
+import std::fmt;
+import std::fs::file::{ File, OpenOptions };
+import std::fs::path::{ Path, PathBuf };
+import std::io::traits::{ Write };
+import std::time::clock::{ SystemTime };
+import std::time::datetime::{ DateTime };
+import std::time::duration::{ Duration };
+
+/// What stands in the way of taking the lock.
+public type enum Holder {
+    /// Nobody: the file is absent.
+    Free;
+    /// Someone, with what the file says about them.
+    Held(String);
+    /// A file older than `STALE_SECONDS`, with what it says.
+    Stale(String);
+}
+
+/// A held heavy-run lock; dropping it deletes the file.
+public type struct HeavyLock {
+    path: PathBuf;
+    held: boolean;
+
+    /// The lock file this checkout uses.
+    public static default_path(repository: Path) -> PathBuf {
+        match (env::var(Str::new("CRYOGATE_HEAVY_LOCK"))) {
+            Option::Some(path) => { return PathBuf::from(path.as_str()); }
+            Option::None       => { }
+        }
+        return match (repository.parent()) {
+            Option::Some(parent) => { parent.join(Str::new("cryo-heavy-run.lock")) }
+            Option::None         => { repository.join(Str::new("cryo-heavy-run.lock")) }
+        };
+    }
+
+    /// Who holds the lock at `path`, judged at `now` (Unix seconds).
+    public static holder(path: Path, now: i64) -> Holder {
+        if (!path.exists()) { return Holder::Free; }
+        const text: String = match (File::read_text(path)) {
+            Result::Ok(text) => { String::from_str(text.trim()) }
+            Result::Err(_)   => { String::from_str(Str::new("(unreadable)")) }
+        };
+        const modified: i64 = match (path.metadata()) {
+            Result::Ok(metadata) => { metadata.modified_secs() }
+            Result::Err(_)       => { now }
+        };
+        if (HeavyLock::is_stale(modified, now)) { return Holder::Stale(text); }
+        return Holder::Held(text);
+    }
+
+    /// Whether a lock written at `modified` is stale at `now`.
+    public static is_stale(modified: i64, now: i64) -> boolean {
+        return now - modified > HeavyLock::STALE_SECONDS;
+    }
+
+    /// Take the lock at `path` for `owner`.  With `wait`, a held lock is
+    /// waited for, polled every `POLL_SECONDS`, and its holder named once;
+    /// without, it is refused.  A stale lock is always refused.
+    public static acquire(path: Path, owner: Str, wait: boolean) -> Result<HeavyLock, String> {
+        mut announced: boolean = false;
+        loop {
+            match (HeavyLock::try_create(path, owner)) {
+                Result::Ok(lock)   => { return Result::Ok(lock); }
+                Result::Err(error) => {
+                    if (path.exists() == false) { return Result::Err(error); }
+                }
+            }
+            match (HeavyLock::holder(path, SystemTime::now().unix_secs())) {
+                Holder::Free => { }
+                Holder::Stale(text) => {
+                    return Result::Err(f"the heavy-run lock {path.as_str()} is older than {HeavyLock::STALE_SECONDS / 3600} hours and is not taken: {text.as_str()}; delete it once nobody holds it");
+                }
+                Holder::Held(text) => {
+                    if (!wait) {
+                        return Result::Err(f"the heavy-run lock {path.as_str()} is held: {text.as_str()}");
+                    }
+                    if (!announced) {
+                        fmt::eprintln(f"cryogate: waiting for the heavy-run lock {path.as_str()}: {text.as_str()}");
+                        announced = true;
+                    }
+                    std::time::clock::sleep(Duration::from_secs(HeavyLock::POLL_SECONDS));
+                }
+            }
+        }
+    }
+
+    /// Create the file only if it is absent, so two runs racing for it
+    /// cannot both win.
+    static try_create(path: Path, owner: Str) -> Result<HeavyLock, String> {
+        mut options: OpenOptions = OpenOptions::new();
+        options.write(true);
+        options.create_new(true);
+        mut file: File = match (options.open(path)) {
+            Result::Ok(file)   => { file }
+            Result::Err(error) => { return Result::Err(f"cannot create the heavy-run lock {path.as_str()}: {error.describe()}"); }
+        };
+        const line: String = f"{owner} - started {DateTime::now()} UTC\n";
+        match (file.write(line.as_str())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => {
+                File::remove(path);
+                return Result::Err(f"cannot write the heavy-run lock {path.as_str()}: {error.describe()}");
+            }
+        }
+        return Result::Ok(HeavyLock { path: PathBuf::from(path.as_str()), held: true });
+    }
+
+    const STALE_SECONDS: i64 = 3 * 3600;
+    const POLL_SECONDS: u64 = 60;
+}
+
+implement trait Drop for HeavyLock {
+    drop(mut &this) -> void {
+        if (this.held) {
+            File::remove(this.path.as_path());
+            this.held = false;
+        }
+    }
+}

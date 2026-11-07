@@ -1,0 +1,298 @@
+///! Running one program as a child process: its arguments, directory and
+///! environment, where its output goes, how long it may take, and what
+///! became of it.
+///!
+///! Both output streams go to one log file, interleaved as written, or to
+///! cryogate's own console.  Output a gate needs to read is read back from
+///! the log: a file never fills and blocks the child the way an undrained
+///! pipe does.
+
+namespace cryogate::core::child;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::env;
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::io::error::{ IoError };
+import std::process::child::{ Child, ExitStatus };
+import std::process::command::{ Command, Stdio };
+import std::time::clock::{ Instant };
+import std::time::duration::{ Duration };
+
+import cryogate::core::host::{ Host };
+
+/// What became of a job.
+public type enum Outcome {
+    /// The program ran and exited with this code.
+    Exited(i32);
+    /// The program was ended by this signal (POSIX).
+    Signalled(i32);
+    /// The program ran past its limit and was killed.
+    TimedOut;
+    /// The program never ran: the reason it could not be started.
+    CouldNotStart(String);
+}
+
+implement enum Outcome {
+    /// Whether the program ran and exited 0.
+    succeeded(&this) -> boolean {
+        return match (&this) {
+            Outcome::Exited(code) => { code == 0 }
+            _                     => { false }
+        };
+    }
+
+    /// The outcome as a report writes it: `exit 0`, `signal 9`,
+    /// `timed out`, `could not start: <reason>`.
+    describe(&this) -> String {
+        return match (&this) {
+            Outcome::Exited(code)          => { f"exit {code}" }
+            Outcome::Signalled(signal)     => { f"signal {signal}" }
+            Outcome::TimedOut              => { String::from_str(Str::new("timed out")) }
+            Outcome::CouldNotStart(reason) => { f"could not start: {reason.as_str()}" }
+        };
+    }
+
+    static from_status(status: &ExitStatus) -> Outcome {
+        match (status.exit_code()) {
+            Option::Some(code) => { return Outcome::Exited(code); }
+            Option::None       => { }
+        }
+        return match (status.terminating_signal()) {
+            Option::Some(signal) => { Outcome::Signalled(signal) }
+            Option::None         => { Outcome::CouldNotStart(String::from_str(Str::new("the system reported neither an exit code nor a signal"))) }
+        };
+    }
+}
+
+/// A finished job.
+public type struct Completion {
+    public outcome: Outcome;
+    /// Wall-clock time from the start to the end.
+    public seconds: f64;
+    /// The log both streams were written to; empty when the job wrote to
+    /// the console.
+    public log: String;
+
+    /// The job's whole output, as the log holds it.  Empty when the job
+    /// wrote to the console or the log cannot be read.
+    public output(&this) -> String {
+        if (this.log.is_empty()) { return String::new(); }
+        return match (File::read_text(Path::from(this.log.as_str()))) {
+            Result::Ok(text) => { text }
+            Result::Err(_)   => { String::new() }
+        };
+    }
+}
+
+/// A job that has been started and not yet finished.
+public type struct Running {
+    child: Child;
+    started: Instant;
+    limit: Option<Duration>;
+    log: String;
+
+    /// The job's completion once it has finished, `None` while it runs.  A
+    /// job past its limit is killed here and completes as `TimedOut`.
+    public poll(mut &this) -> Option<Completion> {
+        match (this.child.try_wait()) {
+            Result::Ok(Option::Some(status)) => { return Option::Some(this.complete(Outcome::from_status(&status))); }
+            Result::Ok(Option::None)         => { }
+            Result::Err(error)               => { return Option::Some(this.complete(Outcome::CouldNotStart(f"waiting for it failed: {error.describe()}"))); }
+        }
+        match (this.limit) {
+            Option::Some(limit) => {
+                if (this.started.elapsed() >= limit) {
+                    this.child.kill();
+                    this.child.wait();
+                    return Option::Some(this.complete(Outcome::TimedOut));
+                }
+            }
+            Option::None => { }
+        }
+        return Option::None;
+    }
+
+    /// Block until the job finishes.
+    public wait(mut &this) -> Completion {
+        loop {
+            match (this.poll()) {
+                Option::Some(done) => { return done; }
+                Option::None       => { std::time::clock::sleep(Duration::from_millis(Running::POLL_MILLISECONDS)); }
+            }
+        }
+    }
+
+    complete(&this, outcome: Outcome) -> Completion {
+        return Completion {
+            outcome: outcome,
+            seconds: this.started.elapsed().as_secs_f64(),
+            log:     this.log.clone(),
+        };
+    }
+
+    /// How often a waiting job is looked at.
+    public const POLL_MILLISECONDS: u64 = 5;
+}
+
+/// One program to run, and how.
+public type struct Job {
+    program: String;
+    arguments: Array<String>;
+    directory: Option<String>;
+    removed: Array<String>;
+    added: Array<Pair<String, String>>;
+    log: String;
+    limit: Option<Duration>;
+
+    /// A job running `program`, writing to the console.  A program named by
+    /// a path is resolved against the current directory now, so a job run
+    /// in another directory still finds it; a bare name is looked up on
+    /// `PATH` when it starts.
+    public static new(program: Str) -> Job {
+        return Job {
+            program:   Job::resolve(program),
+            arguments: Array::<String>::new(),
+            directory: Option::None,
+            removed:   Array::<String>::new(),
+            added:     Array::<Pair<String, String>>::new(),
+            log:       String::new(),
+            limit:     Option::None,
+        };
+    }
+
+    public argument(mut &this, value: Str) -> void { this.arguments.push(String::from_str(value)); }
+
+    /// Run in `path` instead of the current directory.
+    public directory(mut &this, path: Str) -> void { this.directory = Option::Some(String::from_str(path)); }
+
+    /// Leave the inherited variable `name` out of the child's environment.
+    public remove_variable(mut &this, name: Str) -> void { this.removed.push(String::from_str(name)); }
+
+    /// Set `name` to `value` in the child's environment.
+    public set_variable(mut &this, name: Str, value: Str) -> void {
+        this.added.push(Pair::new(String::from_str(name), String::from_str(value)));
+    }
+
+    /// Write both output streams to the file `path`, created or truncated.
+    public log_to(mut &this, path: Str) -> void { this.log = String::from_str(path); }
+
+    /// Kill the job and report it `TimedOut` once it has run this long.
+    public limit(mut &this, limit: Duration) -> void { this.limit = Option::Some(limit); }
+
+    /// The program and its arguments as one line, for a report.
+    public command_line(&this) -> String {
+        mut line: String = this.program.clone();
+        for (argument in this.arguments.iter_ref()) {
+            line.push(' ');
+            line.push(argument.as_str());
+        }
+        return line;
+    }
+
+    /// Start the job.  A job that cannot be started is returned as its
+    /// completion, `CouldNotStart` with the reason.
+    public start(&this) -> Result<Running, Completion> {
+        const started: Instant = Instant::now();
+        if (!this.program_exists()) {
+            return Result::Err(this.never_ran(started, f"{this.program.as_str()} does not exist"));
+        }
+        mut command: Command = Command::new(this.program.as_str());
+        for (argument in this.arguments.iter_ref()) { command.arg(argument.as_str()); }
+        match (&this.directory) {
+            Option::Some(path) => { command.cwd(path.as_str()); }
+            Option::None       => { }
+        }
+        this.build_environment(&command);
+        command.stdin(Stdio::Null);
+        if (!this.log.is_empty()) {
+            match (File::create(Path::from(this.log.as_str()))) {
+                Result::Ok(file) => {
+                    mut owned: File = file;
+                    command.stdout(Stdio::Fd(owned.into_descriptor()));
+                    command.stderr(Stdio::SameAsStdout);
+                }
+                Result::Err(error) => {
+                    return Result::Err(this.never_ran(started, f"cannot create its log {this.log.as_str()}: {error.describe()}"));
+                }
+            }
+        }
+        return match (command.spawn()) {
+            Result::Ok(child) => {
+                Result::Ok(Running { child: child, started: started, limit: this.limit, log: this.log.clone() })
+            }
+            Result::Err(error) => {
+                Result::Err(this.never_ran(started, String::from_str(error.describe())))
+            }
+        };
+    }
+
+    /// Run the job to its end.
+    public run(&this) -> Completion {
+        return match (this.start()) {
+            Result::Ok(mut running) => { running.wait() }
+            Result::Err(done)   => { done }
+        };
+    }
+
+    never_ran(&this, started: Instant, reason: String) -> Completion {
+        return Completion {
+            outcome: Outcome::CouldNotStart(reason),
+            seconds: started.elapsed().as_secs_f64(),
+            log:     this.log.clone(),
+        };
+    }
+
+    /// Whether a program named by a path is there.  A bare name is left to
+    /// the system's own search.  Without this a POSIX host reports a missing
+    /// program as the child's exit 127, which reads as the program's own
+    /// failure.
+    program_exists(&this) -> boolean {
+        const program: Path = Path::from(this.program.as_str());
+        if (!program.is_absolute()) { return true; }
+        if (program.is_file()) { return true; }
+        return Path::from(Host::executable_name(program.as_str()).as_str()).is_file();
+    }
+
+    /// Inherit the environment, less the removed names, plus the added
+    /// ones.  With no removal the child inherits as is.
+    build_environment(&this, command: mut &Command) -> void {
+        if (!this.removed.is_empty()) {
+            command.env_clear();
+            for (variable in env::vars().iter_ref()) {
+                if (!this.is_removed(variable.first.as_str())) {
+                    command.env(variable.first.as_str(), variable.second.as_str());
+                }
+            }
+        }
+        for (variable in this.added.iter_ref()) {
+            command.env(variable.first.as_str(), variable.second.as_str());
+        }
+    }
+
+    is_removed(&this, name: Str) -> boolean {
+        for (removed in this.removed.iter_ref()) {
+            if (Host::same_variable(removed.as_str(), name)) { return true; }
+        }
+        return false;
+    }
+
+    /// A program spelled with a directory separator is a path; it is made
+    /// absolute against the current directory.  A bare name stays a name.
+    static resolve(program: Str) -> String {
+        mut has_separator: boolean = false;
+        for (byte in program.as_bytes().iter()) {
+            if (Path::is_separator(byte)) { has_separator = true; }
+        }
+        if (!has_separator || Path::is_absolute_str(program)) { return String::from_str(program); }
+        return match (env::current_dir()) {
+            Option::Some(here) => { String::from_str(PathBuf::from(here.as_str()).join(program).as_path().as_str()) }
+            Option::None       => { String::from_str(program) }
+        };
+    }
+}

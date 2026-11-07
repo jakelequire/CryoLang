@@ -187,7 +187,7 @@ EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 .DEFAULT_GOAL := help
 .PHONY: help cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check check-fast lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do verify-pin verify-pin-clean incremental-check \
-        install uninstall clean lsp install-lsp release release-linux release-windows
+        install uninstall clean lsp install-lsp cryogate release release-linux release-windows
 
 # The help text is printed by make itself (`$(info)`), not by a shell, so it
 # reads the same under cmd and sh.  A target added to this Makefile is added
@@ -210,6 +210,9 @@ Build
                          bin/cryolsp.
   make install-lsp       Package tools/CryoAnalyzer and install it into VS
                          Code, REPLACING the installed CryoAnalyzer extension.
+  make cryogate          Build the gate runner tools/CryoGate with the pin
+                         (tools/CryoGate/build/); its runs log to
+                         build-logs/cryogate/, newest 20 kept.
 
 Tests and gates
   make test              cryo test over tests/ (the working loop; ARGS=filter).
@@ -475,6 +478,29 @@ lsp: $(PIN)
 	@cd tools/CryoLSP && "$(PIN)" build
 	@cp "$(LSP_BIN)" "$(LSP_PIN)"
 	@echo "==> bin/cryolsp ready"
+endif
+
+# ---- cryogate -----------------------------------------------------------
+# The gate runner (tools/CryoGate), built by the pin against the tree's
+# stdlib and linked against the stdlib only, so a compiler under test that
+# does not build or misbehaves cannot break the program that reports it.
+# Rebuilt when its sources, the stdlib, the runtime tiers or the pin are
+# newer than the binary.
+CRYOGATE_DIR    := $(ROOT)/tools/CryoGate
+CRYOGATE        := $(CRYOGATE_DIR)/build/cryogate$(EXE_SUFFIX)
+CRYOGATE_INPUTS := $(call rwildcard,$(CRYOGATE_DIR)/src,*.cryo) $(CRYOGATE_DIR)/cryoconfig \
+                   $(call rwildcard,$(ROOT)/stdlib,*.cryo) $(RUNTIME_TIERS_A) $(STAGE2_PIN)
+
+cryogate: $(CRYOGATE)
+
+ifeq ($(HOST_OS),windows)
+$(CRYOGATE): $(CRYOGATE_INPUTS)
+	@echo "==> Building cryogate via bin/cryo.exe"
+	@cd tools/CryoGate && "$(subst /,\,$(PIN_EXE))" build
+else
+$(CRYOGATE): $(CRYOGATE_INPUTS)
+	@echo "==> Building cryogate via bin/cryo"
+	@cd tools/CryoGate && "$(PIN)" build
 endif
 
 # ---- CryoAnalyzer VS Code extension -----------------------------------
@@ -941,17 +967,18 @@ clean:
 	@if exist stdlib\.bin rmdir /s /q stdlib\.bin
 	@if exist runtime\.bin rmdir /s /q runtime\.bin
 	@if exist tools\CryoLSP\build rmdir /s /q tools\CryoLSP\build
+	@if exist tools\CryoGate\build rmdir /s /q tools\CryoGate\build
 	@if exist bin\cryolsp.exe del /q bin\cryolsp.exe
 	@if exist bin\cryolsp del /q bin\cryolsp
 	@del /q tests\helpers\*.o tests\helpers\*.a 2>NUL || rem
 	@for %%d in (tests\build tests\tests\negative\.bin .verify .cross-check build-logs dist) do @if exist %%d rmdir /s /q %%d
 	@for /d %%p in (examples\* tests\tests\projects\*) do @if exist %%p\build rmdir /s /q %%p\build
-	@for %%d in (compiler\build stdlib\.bin runtime\.bin tools\CryoLSP\build bin\cryolsp.exe) do @if exist %%d (echo clean: %%d is still there; a running process holds a file in it & exit /b 1)
+	@for %%d in (compiler\build stdlib\.bin runtime\.bin tools\CryoLSP\build tools\CryoGate\build bin\cryolsp.exe) do @if exist %%d (echo clean: %%d is still there; a running process holds a file in it & exit /b 1)
 else
 clean:
 	@echo "==> Cleaning build outputs, test and example builds, and gate state"
 	@rm -rf compiler/build stdlib/.bin runtime/.bin
-	@rm -rf tools/CryoLSP/build
+	@rm -rf tools/CryoLSP/build tools/CryoGate/build
 	@rm -f bin/cryolsp bin/cryolsp.exe
 	@rm -f $(TEST_HELPERS_DIR)/*.o $(TEST_HELPERS_DIR)/*.a
 	@rm -rf tests/build tests/tests/negative/.bin .verify .cross-check build-logs dist

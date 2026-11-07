@@ -1,0 +1,67 @@
+///! Running a project's own `![test]` functions with `cryo test` and reading
+///! back how many ran.
+///!
+///! A run is accepted only when the runner's overall verdict is PASS, its
+///! summary's `passed` count equals the number of `ok` lines, and that
+///! number is not zero: a discovery that found nothing exits 0 and prints
+///! PASS too.
+
+namespace cryogate::core::suite;
+
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::child::{ Completion, Job };
+import cryogate::core::host::{ Host };
+
+public type struct UnitSuite {
+    /// Build and run the tests of the project at `project` with the
+    /// repository's pinned compiler, logging to `log`.  The number of tests
+    /// that ran and passed, or why the run is not accepted.
+    public static run(repository: Path, project: Path, log: Str) -> Result<i64, String> {
+        const pin: PathBuf = Host::pinned_compiler(repository);
+        mut job: Job = Job::new(pin.as_path().as_str());
+        job.argument(Str::new("test"));
+        job.directory(project.as_str());
+        job.log_to(log);
+        const done: Completion = job.run();
+        if (!done.outcome.succeeded()) {
+            return Result::Err(f"`{job.command_line().as_str()}` in {project.as_str()}: {done.outcome.describe().as_str()} (log {log})");
+        }
+        return UnitSuite::judge(done.output().as_str(), log);
+    }
+
+    /// The verdict on one `cryo test` run's output.
+    public static judge(output: Str, log: Str) -> Result<i64, String> {
+        mut ok_lines: i64 = 0;
+        mut summary_passed: Option<i64> = Option::None;
+        mut overall_pass: boolean = false;
+        for (raw in output.split(&Str::new("\n"))) {
+            const line: Str = raw.trim();
+            if (line.starts_with(&Str::new("ok "))) { ok_lines++; }
+            match (line.strip_prefix(&Str::new("passed "))) {
+                Option::Some(rest) => {
+                    match (i64::try_from(rest.trim())) {
+                        Result::Ok(count) => { summary_passed = Option::Some(count); }
+                        Result::Err(_)    => { }
+                    }
+                }
+                Option::None => { }
+            }
+            if (line.starts_with(&Str::new("OVERALL  PASS"))) { overall_pass = true; }
+        }
+        if (!overall_pass) { return Result::Err(f"the runner printed no `OVERALL  PASS` (log {log})"); }
+        const passed: i64 = match (summary_passed) {
+            Option::Some(count) => { count }
+            Option::None        => { return Result::Err(f"the runner printed no `passed` count (log {log})"); }
+        };
+        if (passed != ok_lines) {
+            return Result::Err(f"the summary says {passed} passed but {ok_lines} `ok` lines were printed (log {log})");
+        }
+        if (passed == 0) { return Result::Err(f"no test ran: discovery found nothing (log {log})"); }
+        return Result::Ok(passed);
+    }
+}

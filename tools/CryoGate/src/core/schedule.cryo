@@ -1,0 +1,155 @@
+///! Running several jobs at once within the machine's CPUs and memory.
+///!
+///! A job is admitted while a CPU slot is free and the estimates of the
+///! running jobs plus its own fit the memory budget.  A job larger than the
+///! whole budget runs alone.  Completions are returned in the order the
+///! jobs were added, never the order they finished in, so two runs' reports
+///! compare line by line.
+
+namespace cryogate::core::schedule;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::env;
+import std::thread;
+import std::time::clock;
+import std::time::duration::{ Duration };
+
+import cryogate::core::child::{ Completion, Job, Running };
+
+/// How much of the machine a job is expected to take.
+public type enum Cost {
+    /// A small program: a probe, git, a file copy.
+    Light;
+    /// One compiler process.
+    Compile;
+    /// `cryo test`, which runs its own pool of workers.
+    Suite;
+}
+
+implement enum Cost {
+    /// The memory a job of this cost is assumed to need, until measured
+    /// figures replace the estimate.
+    megabytes(&this) -> i64 {
+        return match (&this) {
+            Cost::Light   => { 512 }
+            Cost::Compile => { 2048 }
+            Cost::Suite   => { 8192 }
+        };
+    }
+}
+
+/// The jobs of one run and the limits they share.
+public type struct Scheduler {
+    jobs: Array<Job>;
+    costs: Array<Cost>;
+    slots: i64;
+    memory: Option<i64>;
+
+    /// A scheduler with `CRYOGATE_JOBS` slots (default: the logical CPU
+    /// count) and a budget of `CRYOGATE_MEMORY_MB` megabytes (default: no
+    /// memory limit).
+    public static new() -> Scheduler {
+        return Scheduler {
+            jobs:   Array::<Job>::new(),
+            costs:  Array::<Cost>::new(),
+            slots:  Scheduler::slots_from_environment(),
+            memory: Scheduler::megabytes_from_environment(),
+        };
+    }
+
+    /// Add a job; its completion is at this index of `run`'s answer.
+    public add(mut &this, job: Job, cost: Cost) -> i64 {
+        this.jobs.push(job);
+        this.costs.push(cost);
+        return this.jobs.length() - 1;
+    }
+
+    /// Run every job and return their completions in the order they were
+    /// added.
+    public run(&this) -> Array<Completion> {
+        mut finished: Array<Option<Completion>> = Array::<Option<Completion>>::new();
+        for (index in 0..this.jobs.length()) { finished.push(Option::None); }
+        mut active: Array<Running> = Array::<Running>::new();
+        mut active_index: Array<i64> = Array::<i64>::new();
+        mut active_megabytes: i64 = 0;
+        mut next: i64 = 0;
+        mut remaining: i64 = this.jobs.length();
+        while (remaining > 0) {
+            while (next < this.jobs.length() && this.admits(active.length(), active_megabytes, next)) {
+                match (this.jobs.get_ref(next).unwrap().start()) {
+                    Result::Ok(running) => {
+                        active.push(running);
+                        active_index.push(next);
+                        active_megabytes += this.costs.get_ref(next).unwrap().megabytes();
+                    }
+                    Result::Err(never_ran) => {
+                        finished.set(next, Option::Some(never_ran));
+                        remaining--;
+                    }
+                }
+                next++;
+            }
+            mut slot: i64 = 0;
+            while (slot < active.length()) {
+                const running: mut &Running = &active[slot];
+                match (running.poll()) {
+                    Option::Some(done) => {
+                        const index: i64 = active_index.swap_remove(slot);
+                        active.swap_remove(slot);
+                        active_megabytes -= this.costs.get_ref(index).unwrap().megabytes();
+                        finished.set(index, Option::Some(done));
+                        remaining--;
+                    }
+                    Option::None => { slot++; }
+                }
+            }
+            if (remaining > 0) { clock::sleep(Duration::from_millis(Running::POLL_MILLISECONDS)); }
+        }
+        mut completions: Array<Completion> = Array::<Completion>::new();
+        while (!finished.is_empty()) {
+            completions.push(finished.remove(0).unwrap());
+        }
+        return completions;
+    }
+
+    /// Whether job `index` may start beside `running` jobs estimated at
+    /// `megabytes`.  The first job always starts, so one larger than the
+    /// whole budget runs alone rather than never.
+    admits(&this, running: i64, megabytes: i64, index: i64) -> boolean {
+        if (running == 0) { return true; }
+        if (running >= this.slots) { return false; }
+        return match (this.memory) {
+            Option::Some(budget) => { megabytes + this.costs.get_ref(index).unwrap().megabytes() <= budget }
+            Option::None         => { true }
+        };
+    }
+
+    static slots_from_environment() -> i64 {
+        match (env::var(Str::new("CRYOGATE_JOBS"))) {
+            Option::Some(text) => {
+                match (i64::try_from(text.as_str())) {
+                    Result::Ok(slots) => { if (slots > 0) { return slots; } }
+                    Result::Err(_)    => { }
+                }
+            }
+            Option::None => { }
+        }
+        return thread::available_parallelism() as i64;
+    }
+
+    static megabytes_from_environment() -> Option<i64> {
+        return match (env::var(Str::new("CRYOGATE_MEMORY_MB"))) {
+            Option::Some(text) => {
+                match (i64::try_from(text.as_str())) {
+                    Result::Ok(megabytes) => { Option::Some(megabytes) }
+                    Result::Err(_)        => { Option::None }
+                }
+            }
+            Option::None => { Option::None }
+        };
+    }
+}

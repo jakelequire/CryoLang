@@ -1,0 +1,58 @@
+///! cryogate - the repository's gate and test runner.
+///!
+///! `cryogate <command> [arguments]`; `cryogate help` lists the commands.
+
+namespace cryogate::main;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::result::{ Result };
+import std::env;
+import std::fmt;
+import std::fs::path::{ PathBuf };
+
+import cryogate::core::host::{ Host };
+import cryogate::core::log::{ RunLogs };
+import cryogate::heavy::{ Heavy };
+import cryogate::probe::{ Probe };
+import cryogate::selftest::{ SelfTest };
+
+function main() -> i32 {
+    const arguments: Array<String> = env::args();
+    if (arguments.length() < 2) {
+        Main::usage();
+        return 2;
+    }
+    const command: Str = arguments.get_ref(1).unwrap().as_str();
+    if (command == Str::new("probe")) { return Probe::run(&arguments, 2); }
+    if (command == Str::new("help")) { Main::usage(); return 0; }
+    const repository: PathBuf = match (Host::repository()) {
+        Result::Ok(root)     => { root }
+        Result::Err(reason)  => { fmt::eprintln(f"cryogate: {reason.as_str()}"); return 1; }
+    };
+    if (command == Str::new("heavy")) { return Heavy::run(repository.as_path(), &arguments, 2); }
+    const logs: RunLogs = match (RunLogs::open(repository.as_path())) {
+        Result::Ok(logs)    => { logs }
+        Result::Err(reason) => { fmt::eprintln(f"cryogate: {reason.as_str()}"); return 1; }
+    };
+    if (command == Str::new("selftest")) { return SelfTest::run(repository.as_path(), &logs); }
+    fmt::eprintln(f"cryogate: unknown command `{command}`");
+    Main::usage();
+    return 2;
+}
+
+type struct Main {
+    static usage() -> void {
+        fmt::eprintln(String::from_str(Str::new(
+            "usage: cryogate <command> [arguments]\n\n"
+            "  selftest            check the child runner, the scheduler and the\n"
+            "                      heavy-run lock, then run cryogate's unit tests\n"
+            "  heavy [--no-wait] -- <program> [arguments]\n"
+            "                      run a heavy proof under the heavy-run lock\n"
+            "  probe <action>...   act as a child for the self-test: `exit N`,\n"
+            "                      `sleep MS`, `print TEXT`, `error TEXT`,\n"
+            "                      `variable NAME`, `directory`\n\n"
+            "Logs go to build-logs/cryogate/<run>/.")));
+    }
+}

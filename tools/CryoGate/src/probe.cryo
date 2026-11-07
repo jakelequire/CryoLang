@@ -1,0 +1,62 @@
+///! `cryogate probe`: the child the self-test runs, doing exactly what its
+///! arguments say, so each part of the child runner is checked against a
+///! program whose behaviour is known.
+
+namespace cryogate::probe;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::env;
+import std::fmt;
+import std::time::clock;
+import std::time::duration::{ Duration };
+
+public type struct Probe {
+    /// Perform the actions in `arguments` from `first` on, in order:
+    /// `exit N` ends with code N; `sleep MS` waits; `print TEXT` writes a
+    /// line to stdout and `error TEXT` one to stderr; `variable NAME` prints
+    /// the variable's value, or `<unset>`; `directory` prints the current
+    /// directory.  Without an `exit` the probe ends with 0.
+    public static run(arguments: &Array<String>, first: i64) -> i32 {
+        mut index: i64 = first;
+        while (index < arguments.length()) {
+            const action: Str = arguments.get_ref(index).unwrap().as_str();
+            if (action == Str::new("directory")) {
+                fmt::println(env::current_dir().unwrap_or(String::new()));
+                index++;
+                continue;
+            }
+            if (index + 1 >= arguments.length()) {
+                fmt::eprintln(f"cryogate probe: `{action}` needs a value");
+                return 2;
+            }
+            const value: Str = arguments.get_ref(index + 1).unwrap().as_str();
+            if (action == Str::new("exit")) {
+                return match (i32::try_from(value)) {
+                    Result::Ok(code) => { code }
+                    Result::Err(_)   => { fmt::eprintln(f"cryogate probe: `{value}` is not an exit code"); 2 }
+                };
+            }
+            if (action == Str::new("sleep")) {
+                match (u64::try_from(value)) {
+                    Result::Ok(milliseconds) => { clock::sleep(Duration::from_millis(milliseconds)); }
+                    Result::Err(_)           => { fmt::eprintln(f"cryogate probe: `{value}` is not a number of milliseconds"); return 2; }
+                }
+            } else if (action == Str::new("print")) {
+                fmt::println(String::from_str(value));
+            } else if (action == Str::new("error")) {
+                fmt::eprintln(String::from_str(value));
+            } else if (action == Str::new("variable")) {
+                fmt::println(env::var(value).unwrap_or(String::from_str(Str::new("<unset>"))));
+            } else {
+                fmt::eprintln(f"cryogate probe: unknown action `{action}`");
+                return 2;
+            }
+            index += 2;
+        }
+        return 0;
+    }
+}

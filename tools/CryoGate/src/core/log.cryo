@@ -1,0 +1,76 @@
+///! Where a run's logs go: `build-logs/cryogate/<stamp>/`, one directory per
+///! run, the newest `KEPT_RUNS` kept.
+
+namespace cryogate::core::log;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fs::directory::{ Directory, DirectoryEntry };
+import std::fs::path::{ Path, PathBuf };
+import std::time::datetime::{ DateTime };
+
+/// One run's log directory.
+public type struct RunLogs {
+    directory: PathBuf;
+
+    /// Create a fresh directory for this run under the repository's
+    /// `build-logs/cryogate/`, and delete all but the newest `KEPT_RUNS`.
+    public static open(repository: Path) -> Result<RunLogs, String> {
+        const parent: PathBuf = repository.join(Str::new("build-logs")).join(Str::new("cryogate"));
+        match (Directory::create_all(parent.as_path())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { return Result::Err(f"cannot create {parent.as_path().as_str()}: {error.describe()}"); }
+        }
+        const now: DateTime = DateTime::now();
+        const stamp: String = f"{now.year}{now.month:02}{now.day:02}-{now.hour:02}{now.minute:02}{now.second:02}";
+        mut attempt: i64 = 1;
+        loop {
+            const name: String = if (attempt == 1) { stamp.clone() } else { f"{stamp.as_str()}-{attempt}" };
+            const directory: PathBuf = parent.join(name.as_str());
+            match (Directory::create(directory.as_path())) {
+                Result::Ok(_) => {
+                    RunLogs::prune(parent.as_path());
+                    return Result::Ok(RunLogs { directory: directory });
+                }
+                Result::Err(error) => {
+                    if (!directory.as_path().exists()) {
+                        return Result::Err(f"cannot create {directory.as_path().as_str()}: {error.describe()}");
+                    }
+                }
+            }
+            attempt++;
+        }
+    }
+
+    public directory(&this) -> Path { return this.directory.as_path(); }
+
+    /// The log file for `name` in this run: `<run>/<name>.log`.
+    public file(&this, name: Str) -> String {
+        return String::from_str(this.directory.join(f"{name}.log".as_str()).as_path().as_str());
+    }
+
+    /// Delete every run directory but the newest `KEPT_RUNS`.  The stamps
+    /// sort by time as text.
+    static prune(parent: Path) -> void {
+        mut names: Array<String> = Array::<String>::new();
+        match (Directory::entries(parent)) {
+            Result::Ok(entries) => {
+                for (entry in entries) {
+                    if (entry.is_directory()) { names.push(String::from_str(entry.name())); }
+                }
+            }
+            Result::Err(_) => { return; }
+        }
+        names.sort();
+        mut index: i64 = 0;
+        while (index + RunLogs::KEPT_RUNS < names.length()) {
+            Directory::remove_all(parent.join(names.get_ref(index).unwrap().as_str()).as_path());
+            index++;
+        }
+    }
+
+    const KEPT_RUNS: i64 = 20;
+}

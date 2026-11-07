@@ -1,0 +1,49 @@
+///! The core's pure decisions: what an outcome is called, when a lock is
+///! stale, which host a target gate includes.
+![config(testing)]
+namespace cryogate::tests::core;
+
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::result::{ Result };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_false };
+
+import cryogate::core::child::{ Outcome };
+import cryogate::core::host::{ Host };
+import cryogate::core::lock::{ HeavyLock };
+
+![test]
+function only_exit_zero_succeeds() -> Result<(), TestError> {
+    expect(Outcome::Exited(0).succeeded(), Str::new("exit 0"))?;
+    expect_false(Outcome::Exited(1).succeeded(), Str::new("exit 1"))?;
+    expect_false(Outcome::Signalled(9).succeeded(), Str::new("a signal"))?;
+    expect_false(Outcome::TimedOut.succeeded(), Str::new("a timeout"))?;
+    return expect_false(Outcome::CouldNotStart(String::new()).succeeded(), Str::new("never started"));
+}
+
+![test]
+function outcomes_are_named_for_the_report() -> Result<(), TestError> {
+    expect(Outcome::Exited(3).describe().as_str() == Str::new("exit 3"), Str::new("exit"))?;
+    expect(Outcome::Signalled(9).describe().as_str() == Str::new("signal 9"), Str::new("signal"))?;
+    expect(Outcome::TimedOut.describe().as_str() == Str::new("timed out"), Str::new("timeout"))?;
+    return expect(Outcome::CouldNotStart(String::from_str(Str::new("gone"))).describe().as_str() == Str::new("could not start: gone"), Str::new("never started"));
+}
+
+![test]
+function a_lock_goes_stale_after_three_hours() -> Result<(), TestError> {
+    expect_false(HeavyLock::is_stale(1000, 1000), Str::new("just written"))?;
+    expect_false(HeavyLock::is_stale(1000, 1000 + 3 * 3600), Str::new("exactly three hours"))?;
+    return expect(HeavyLock::is_stale(1000, 1001 + 3 * 3600), Str::new("past three hours"));
+}
+
+![test]
+function unix_names_every_posix_host() -> Result<(), TestError> {
+    expect(Host::builds_target(Host::os()), Str::new("this host's own name"))?;
+    if (Host::os() == Str::new("windows")) {
+        expect_false(Host::builds_target(Str::new("unix")), Str::new("unix on windows"))?;
+        return expect_false(Host::builds_target(Str::new("linux")), Str::new("linux on windows"));
+    }
+    expect(Host::builds_target(Str::new("unix")), Str::new("unix on a POSIX host"))?;
+    return expect_false(Host::builds_target(Str::new("windows")), Str::new("windows on a POSIX host"));
+}

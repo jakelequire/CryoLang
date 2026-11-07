@@ -1,0 +1,209 @@
+///! `cryogate selftest`: check the instrument before believing any gate it
+///! runs.
+///!
+///! First the child runner and the scheduler, against `cryogate probe`, a
+///! child whose behaviour is known: exit codes, a timeout kill, both
+///! streams in one log, an inherited, a removed and an added variable, the
+///! working directory, a missing program, and the heavy-run lock.  A
+///! process API that drops an argument or loses an exit code fails here,
+///! before any gate's verdict is read.  Then cryogate's own unit tests,
+///! built and run by the pinned compiler.
+
+namespace cryogate::selftest;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::env;
+import std::fmt;
+import std::fs::path::{ Path, PathBuf };
+import std::time::duration::{ Duration };
+
+import cryogate::core::child::{ Completion, Job, Outcome };
+import cryogate::core::host::{ Host };
+import cryogate::core::lock::{ HeavyLock };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::schedule::{ Cost, Scheduler };
+import cryogate::core::suite::{ UnitSuite };
+
+/// One self-test case's result.
+type struct Check {
+    name: String;
+    failure: Option<String>;
+}
+
+public type struct SelfTest {
+    checks: Array<Check>;
+
+    public static run(repository: Path, logs: &RunLogs) -> i32 {
+        mut test: SelfTest = SelfTest { checks: Array::<Check>::new() };
+        test.child_runner(logs);
+        test.heavy_lock(logs);
+        const project: PathBuf = repository.join(Str::new("tools")).join(Str::new("CryoGate"));
+        const unit_log: String = logs.file(Str::new("unit-tests"));
+        const unit: Result<i64, String> = UnitSuite::run(repository, project.as_path(), unit_log.as_str());
+        mut failed: i64 = 0;
+        for (check in test.checks.iter_ref()) {
+            match (&check.failure) {
+                Option::Some(reason) => {
+                    fmt::eprintln(f"cryogate selftest: FAILED  {check.name.as_str()}: {reason.as_str()}");
+                    failed++;
+                }
+                Option::None => { }
+            }
+        }
+        const cases: i64 = test.checks.length();
+        match (unit) {
+            Result::Ok(count) => {
+                if (failed == 0) {
+                    fmt::println(f"cryogate selftest: OK ({cases} child-runner and lock cases, {count} unit tests)");
+                    return 0;
+                }
+                fmt::println(f"cryogate selftest: FAIL ({failed} of {cases} child-runner and lock cases failed; {count} unit tests passed)");
+                return 1;
+            }
+            Result::Err(reason) => {
+                fmt::eprintln(f"cryogate selftest: FAILED  unit tests: {reason.as_str()}");
+                fmt::println(f"cryogate selftest: FAIL ({failed} of {cases} child-runner and lock cases failed; the unit tests failed)");
+                return 1;
+            }
+        }
+    }
+
+    child_runner(mut &this, logs: &RunLogs) -> void {
+        const probe: String = env::current_exe().unwrap_or(String::new());
+        env::set_var(Str::new("CRYOGATE_PROBE_VARIABLE"), Str::new("inherited"));
+        mut scheduler: Scheduler = Scheduler::new();
+
+        // Added first and finishing last: the scheduler reports in the
+        // order of adding, so every check below reads its own job.
+        mut slow: Job = SelfTest::probe_job(probe.as_str(), logs, Str::new("timeout"));
+        slow.argument(Str::new("sleep"));
+        slow.argument(Str::new("5000"));
+        slow.limit(Duration::from_millis(300));
+        const timeout: i64 = scheduler.add(slow, Cost::Light);
+
+        mut zero: Job = SelfTest::probe_job(probe.as_str(), logs, Str::new("exit-0"));
+        const exit_zero: i64 = scheduler.add(zero, Cost::Light);
+
+        mut three: Job = SelfTest::probe_job(probe.as_str(), logs, Str::new("exit-3"));
+        three.argument(Str::new("exit"));
+        three.argument(Str::new("3"));
+        const exit_three: i64 = scheduler.add(three, Cost::Light);
+
+        mut streams: Job = SelfTest::probe_job(probe.as_str(), logs, Str::new("streams"));
+        streams.argument(Str::new("print"));
+        streams.argument(Str::new("to-standard-output"));
+        streams.argument(Str::new("error"));
+        streams.argument(Str::new("to-standard-error"));
+        const both_streams: i64 = scheduler.add(streams, Cost::Light);
+
+        mut kept: Job = SelfTest::probe_job(probe.as_str(), logs, Str::new("variable-inherited"));
+        kept.argument(Str::new("variable"));
+        kept.argument(Str::new("CRYOGATE_PROBE_VARIABLE"));
+        const inherited: i64 = scheduler.add(kept, Cost::Light);
+
+        mut cleared: Job = SelfTest::probe_job(probe.as_str(), logs, Str::new("variable-removed"));
+        cleared.argument(Str::new("variable"));
+        cleared.argument(Str::new("CRYOGATE_PROBE_VARIABLE"));
+        cleared.remove_variable(Str::new("CRYOGATE_PROBE_VARIABLE"));
+        const removed: i64 = scheduler.add(cleared, Cost::Light);
+
+        mut given: Job = SelfTest::probe_job(probe.as_str(), logs, Str::new("variable-added"));
+        given.argument(Str::new("variable"));
+        given.argument(Str::new("CRYOGATE_PROBE_ADDED"));
+        given.set_variable(Str::new("CRYOGATE_PROBE_ADDED"), Str::new("added"));
+        const added: i64 = scheduler.add(given, Cost::Light);
+
+        mut moved: Job = SelfTest::probe_job(probe.as_str(), logs, Str::new("directory"));
+        moved.argument(Str::new("directory"));
+        moved.directory(logs.directory().as_str());
+        const directory: i64 = scheduler.add(moved, Cost::Light);
+
+        const absent_program: PathBuf = logs.directory().join(Str::new("no-such-program"));
+        mut missing: Job = Job::new(absent_program.as_path().as_str());
+        missing.log_to(logs.file(Str::new("probe-missing")).as_str());
+        const could_not_start: i64 = scheduler.add(missing, Cost::Light);
+
+        const done: Array<Completion> = scheduler.run();
+        env::remove_var(Str::new("CRYOGATE_PROBE_VARIABLE"));
+
+        const late: &Completion = &done[timeout];
+        this.expect_outcome(Str::new("a child past its limit is killed and reported timed out"), late, Str::new("timed out"));
+        this.expect(Str::new("the timeout kill happens near the limit"), late.seconds < 10.0, f"took {late.seconds} s");
+        this.expect_outcome(Str::new("exit code 0 is read"), &done[exit_zero], Str::new("exit 0"));
+        this.expect_outcome(Str::new("exit code 3 is read"), &done[exit_three], Str::new("exit 3"));
+        const output: String = done[both_streams].output();
+        this.expect(Str::new("both streams reach the log"),
+                    output.contains(&Str::new("to-standard-output")) && output.contains(&Str::new("to-standard-error")),
+                    f"the log held `{output.trim()}`");
+        this.expect_line(Str::new("an inherited variable reaches the child"), &done[inherited], Str::new("inherited"));
+        this.expect_line(Str::new("a removed variable does not"), &done[removed], Str::new("<unset>"));
+        this.expect_line(Str::new("an added variable does"), &done[added], Str::new("added"));
+        const expected_directory: String = SelfTest::canonical(logs.directory().as_str());
+        const actual_directory: String = SelfTest::canonical(done[directory].output().trim());
+        this.expect(Str::new("the child runs in the directory it is given"),
+                    !expected_directory.is_empty() && expected_directory == actual_directory,
+                    f"expected {expected_directory.as_str()}, the child printed {actual_directory.as_str()}");
+        const never: &Completion = &done[could_not_start];
+        this.expect(Str::new("a missing program could not start, not exit 1 or 127"),
+                    match (&never.outcome) { Outcome::CouldNotStart(_) => { true } _ => { false } },
+                    never.outcome.describe());
+    }
+
+    heavy_lock(mut &this, logs: &RunLogs) -> void {
+        const path: PathBuf = logs.directory().join(Str::new("heavy.lock"));
+        match (HeavyLock::acquire(path.as_path(), Str::new("selftest first"), false)) {
+            Result::Ok(first) => {
+                this.expect(Str::new("the lock file is written with its owner"), path.as_path().is_file(), String::from_str(Str::new("no file after acquiring")));
+                match (HeavyLock::acquire(path.as_path(), Str::new("selftest second"), false)) {
+                    Result::Ok(_) => {
+                        this.expect(Str::new("a held lock is refused without waiting"), false, String::from_str(Str::new("the second acquire succeeded")));
+                    }
+                    Result::Err(reason) => {
+                        this.expect(Str::new("a held lock is refused without waiting, naming its holder"),
+                                    reason.contains(&Str::new("selftest first")), reason);
+                    }
+                }
+                std::core::mem::drop(first);
+                this.expect(Str::new("releasing the lock deletes its file"), !path.as_path().exists(), String::from_str(Str::new("the file is still there")));
+            }
+            Result::Err(reason) => {
+                this.expect(Str::new("a free lock is taken"), false, reason);
+            }
+        }
+    }
+
+    static probe_job(probe: Str, logs: &RunLogs, name: Str) -> Job {
+        mut job: Job = Job::new(probe);
+        job.argument(Str::new("probe"));
+        job.log_to(logs.file(f"probe-{name}".as_str()).as_str());
+        return job;
+    }
+
+    static canonical(path: Str) -> String {
+        return match (Path::from(path).canonicalize()) {
+            Result::Ok(full)  => { String::from_str(full.as_path().as_str()) }
+            Result::Err(_)    => { String::new() }
+        };
+    }
+
+    expect(mut &this, name: Str, passed: boolean, detail: String) -> void {
+        this.checks.push(Check {
+            name:    String::from_str(name),
+            failure: if (passed) { Option::None } else { Option::Some(detail) },
+        });
+    }
+
+    expect_outcome(mut &this, name: Str, done: &Completion, outcome: Str) -> void {
+        const described: String = done.outcome.describe();
+        this.expect(name, described.as_str() == outcome, f"expected {outcome}, got {described.as_str()}");
+    }
+
+    expect_line(mut &this, name: Str, done: &Completion, line: Str) -> void {
+        const output: String = done.output();
+        this.expect(name, output.trim() == line, f"expected `{line}`, the child printed `{output.trim()}`");
+    }
+}
