@@ -1869,10 +1869,11 @@ type struct CallResolver {
             for (mut i: i64 = 0; i < bindings.length(); i++) { bindings[i] = inference.bindings[i]; }
         }
 
-        // E0306 - where-clause bound satisfaction for the bound type args.
-        if (!this.check_call_where_bounds(call_e.span, tmpl_decl, &entry.param_syms, &bindings)) {
-            return TypeRef::invalid();
-        }
+        // E0306 - where-clause bound satisfaction for the bound type args.  A
+        // refused call is typed on all the same: its bindings are known, and
+        // its value's uses are checked against the type they substitute to
+        // rather than refused a second time.
+        this.check_call_where_bounds(call_e.span, tmpl_decl, &entry.param_syms, &bindings);
 
         // KEYSTONE: stash all-bound bindings + substitute into the template return.
         mut all_bound_stash: boolean = bindings.length() == entry.param_types.length();
@@ -7060,10 +7061,10 @@ type struct CallResolver {
                 shown, with_args, span);
             return TypeRef::invalid();
         }
-        // A function's where-clause holds for the instance, as for a call.
-        if (entry.kind == TemplateKind::Function && entry.ast_node != null
-                && !this.check_call_where_bounds(span, entry.ast_node, &entry.param_syms, &bindings)) {
-            return TypeRef::invalid();
+        // A function's where-clause holds for the instance, as for a call, and
+        // a refused instance is typed on as a refused call is.
+        if (entry.kind == TemplateKind::Function && entry.ast_node != null) {
+            this.check_call_where_bounds(span, entry.ast_node, &entry.param_syms, &bindings);
         }
         const ty: TypeRef = this.subst_params(params, &bindings, sig);
         if (ty.is_valid()) { *out_args = bindings; }
@@ -7316,7 +7317,7 @@ type struct CallResolver {
             this.report_excess_type_arguments(shown, bindings.length(), scope.generic_args.length(), scope_e.span);
             return TypeRef::invalid();
         }
-        if (!this.check_call_where_bounds(scope_e.span, DeclarationNode::method_of(node).func, &syms, &bindings)) { return TypeRef::invalid(); }
+        this.check_call_where_bounds(scope_e.span, DeclarationNode::method_of(node).func, &syms, &bindings);
         mut sub_params: [TypeRef] = [];
         mut sub_args: [TypeRef] = [];
         for (mut i: i64 = 0; i < handles.length(); i++) {
@@ -8542,10 +8543,9 @@ type struct CallResolver {
         }
 
         // E0306 - where-clause bound satisfaction for the bound method args, so an
-        // unsatisfied bound is a clean call-site error rather than a downstream miss.
-        if (!this.check_call_where_bounds(call_e.span, tmpl_decl, &entry.param_syms, &binds)) {
-            return TypeRef::invalid();
-        }
+        // unsatisfied bound is a clean call-site error rather than a downstream
+        // miss.  The call is typed on all the same, as a free call is.
+        this.check_call_where_bounds(call_e.span, tmpl_decl, &entry.param_syms, &binds);
 
         // Stash for mono + record the winning template (mono can't re-derive the
         // caller's import scope), then substitute into the return.  Callee stays
