@@ -1,0 +1,81 @@
+// E0455: a future that an `await` polls holds what it was handed past the
+// suspend, and each poll runs on a fresh frame.  A slice names its
+// elements' storage - the frame itself for a fixed-size array, a heap block
+// the local owns for an `Array` - and the type cannot say which, so a slice
+// taken from a local or a by-value parameter may not be handed to an
+// awaited future: not through an inherent method, a trait method, a
+// fixed-size array's `as_slice`, nor a binding that holds one.  A slice the
+// async function was itself handed, or reaches through a reference, names
+// storage its caller keeps and is accepted.
+![config(testing)]
+![config(negative, E0455)]
+namespace CryoTests::Negative::E0455AwaitSliceOfLocal;
+
+import std::collections::array::{ Array };
+import std::core::slice::{ Slice };
+import std::future;
+
+type struct Shelf {
+    buf: Array<u8>;
+}
+
+async function eat(bytes: &Slice<u8>) -> u64 { return bytes.length() as u64; }
+
+async function array_local() -> u64 {
+    mut arr: Array<u8> = Array::<u8>::new();
+    arr.push(1);
+    return await eat(arr.as_slice());   //~ ERROR[E0455] a slice of the local or parameter `arr` is held by a future past an `await`
+}
+
+async function fixed_local() -> u64 {
+    const fixed: [u8; 4] = [1, 2, 3, 4];
+    return await eat(fixed.as_slice());   //~ ERROR[E0455] a slice of the local or parameter `fixed` is held by a future past an `await`
+}
+
+async function field_of_local() -> u64 {
+    const shelf: Shelf = Shelf { buf: Array::<u8>::new() };
+    return await eat(shelf.buf.as_slice());   //~ ERROR[E0455] a slice of the local or parameter `shelf` is held by a future past an `await`
+}
+
+async function by_value_parameter(arr: Array<u8>) -> u64 {
+    return await eat(arr.as_slice());   //~ ERROR[E0455] a slice of the local or parameter `arr` is held by a future past an `await`
+}
+
+async function binding_handed_on() -> u64 {
+    mut arr: Array<u8> = Array::<u8>::new();
+    const view: &Slice<u8> = arr.as_slice();   //~ ERROR[E0455] a slice of the local or parameter `arr` is held by a future past an `await`
+    return await eat(view);
+}
+
+// Compiles: the slice is the caller's.
+async function handed_slice(bytes: &Slice<u8>) -> u64 {
+    return await eat(bytes);
+}
+
+// Compiles: a binding holding the caller's slice.
+async function handed_slice_rebound(bytes: &Slice<u8>) -> u64 {
+    const view: &Slice<u8> = bytes;
+    return await eat(view);
+}
+
+// Compiles: reached through a reference, the shelf is the caller's.
+async function through_reference(shelf: &Shelf) -> u64 {
+    return await eat(shelf.buf.as_slice());
+}
+
+// Compiles: the slice is used and gone before the `await`.
+async function used_before_the_await() -> u64 {
+    mut arr: Array<u8> = Array::<u8>::new();
+    arr.push(1);
+    const n: u64 = arr.as_slice().length() as u64;
+    const more: u64 = await eat_nothing();
+    return n + more;
+}
+
+async function eat_nothing() -> u64 { return 0; }
+
+function main() -> int {
+    mut arr: Array<u8> = Array::<u8>::new();
+    arr.push(7);
+    return future::block_on(handed_slice(arr.as_slice())) as int;
+}

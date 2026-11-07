@@ -43,6 +43,7 @@ import compiler::passes::type_resolution::{ TypeResolutionPasses };
 import compiler::compilation_context::{ CompilationContext };
 import compiler::sema::{ pattern_resolver };
 import std::core::{ option, mem };
+import std::collections::string::{ String };
 import std::fmt;
 import compiler::types::generic::{
     AssocProjectionType, GenericParamType, InstantiatedType
@@ -3206,6 +3207,12 @@ type struct AsyncLower {
                 aw_e.span);
             sm.ok = false; return cur;
         }
+        const slice_root: ExpressionNode* = this.frame_slice_handed_root(sm, aw.operand);
+        if (slice_root != null) {
+            this.report_frame_slice(slice_root, aw_e.span, fmt::format("the future this `await` polls holds a slice of `%s`",
+                this.root_spelling(slice_root)));
+            sm.ok = false; return cur;
+        }
 
         // A future stores every future it awaits as a field, so awaiting one that
         // (transitively) stores THIS one would make the state machine contain
@@ -5412,6 +5419,133 @@ type struct AsyncLower {
         return null;
     }
 
+    /// Whether `ty` is a reference to a slice, read-only or writable.
+    is_slice_reference(&this, ty: TypeRef) -> boolean {
+        const t: Type* = this.arena.lookup(ty);
+        return t != null && t.kind == TypeKind::Reference && this.arena.is_slice(t.as_reference().referent);
+    }
+
+    /// The arguments the future `operand` builds is handed: the receiver of
+    /// a method call and each argument of the call.  Empty for an operand
+    /// that is not a call - a future already built is handed nothing here.
+    handed_to_future(&this, operand: ExpressionNode*) -> [ExpressionNode*] {
+        mut out: [ExpressionNode*] = [];
+        const c: CallExpr* = ExpressionNode::call_of(operand);
+        if (c == null) { return out; }
+        if (c.callee != null && ExpressionNode::member_access_of(c.callee) != null) {
+            out.push(ExpressionNode::member_access_of(c.callee).object);
+        }
+        for (mut i: i64 = 0; i < c.arguments.length(); i++) { out.push(c.arguments[i]); }
+        return out;
+    }
+
+    /// The frame-resident local or parameter a slice reference handed to
+    /// the future `operand` builds was taken from, or null when it hands
+    /// none.  A slice names its elements' storage, which is the frame itself
+    /// for a fixed-size array and a heap block the local owns for an
+    /// `Array`; the type cannot tell the two apart, so every slice taken
+    /// from a frame local is refused, whichever storage it names.
+    frame_slice_handed_root(&this, sm: PollSm*, operand: ExpressionNode*) -> ExpressionNode* {
+        const handed: [ExpressionNode*] = this.handed_to_future(operand);
+        for (mut i: i64 = 0; i < handed.length(); i++) {
+            if (!this.is_slice_reference(handed[i].resolved_type)) { continue; }
+            const root: ExpressionNode* = this.slice_source_root(sm, handed[i]);
+            if (root != null) { return root; }
+        }
+        return null;
+    }
+
+    /// Whether a future some `await` of `sm` builds is handed the binding
+    /// `key` itself as a slice reference.
+    slice_binding_handed_to_future(&this, sm: PollSm*, key: SymbolID) -> boolean {
+        for (mut o: i64 = 0; o < sm.borrow_ops.length(); o++) {
+            const handed: [ExpressionNode*] = this.handed_to_future(sm.borrow_ops[o]);
+            for (mut i: i64 = 0; i < handed.length(); i++) {
+                if (this.is_slice_reference(handed[i].resolved_type) && this.names_binding(handed[i], key)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// The frame-resident local or parameter the slice reference `e` is
+    /// taken from: the receiver or an argument of the call that makes it
+    /// (`arr.as_slice()`, `view_of(&fixed)`), or the place a `&` coerces to
+    /// one.  Null for a slice reached through a pointer or reference, which
+    /// names storage the frame does not own, and for one a binding holds.
+    slice_source_root(&this, sm: PollSm*, e: ExpressionNode*) -> ExpressionNode* {
+        const c: CallExpr* = ExpressionNode::call_of(e);
+        if (c != null) {
+            if (c.callee != null && ExpressionNode::member_access_of(c.callee) != null) {
+                const recv: ExpressionNode* = this.owned_place_root(sm, ExpressionNode::member_access_of(c.callee).object);
+                if (recv != null) { return recv; }
+            }
+            for (mut i: i64 = 0; i < c.arguments.length(); i++) {
+                const a: ExpressionNode* = this.owned_place_root(sm, c.arguments[i]);
+                if (a != null) { return a; }
+            }
+            return null;
+        }
+        return this.owned_place_root(sm, e);
+    }
+
+    /// The frame-resident local or parameter whose value the place `e`
+    /// names, through fields, elements, `&` and casts, the elements an
+    /// `Array` owns among them; null at the first pointer or reference,
+    /// whose pointee the frame does not own.
+    owned_place_root(&this, sm: PollSm*, e: ExpressionNode*) -> ExpressionNode* {
+        if (e == null || this.names_through_indirection(e)) { return null; }
+        if (ExpressionNode::identifier_of(e) != null) {
+            if (this.is_frame_key(sm, this.local_key(e))) { return e; }
+            return null;
+        }
+        const un: UnaryExpr* = ExpressionNode::unary_of(e);
+        if (un != null && un.op.kind == TokenType::Amp) { return this.owned_place_root(sm, un.operand); }
+        const cast: CastExpr* = ExpressionNode::cast_of(e);
+        if (cast != null) { return this.owned_place_root(sm, cast.expression); }
+        const ma: MemberAccessExpr* = ExpressionNode::member_access_of(e);
+        if (ma != null) {
+            if (this.names_through_indirection(ma.object)) { return null; }
+            return this.owned_place_root(sm, ma.object);
+        }
+        const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(e);
+        if (aa != null) {
+            if (this.names_through_indirection(aa.array)) { return null; }
+            return this.owned_place_root(sm, aa.array);
+        }
+        return null;
+    }
+
+    /// Whether `e` is a name or place of pointer or reference type, whose
+    /// pointee is storage some other owner keeps.
+    names_through_indirection(&this, e: ExpressionNode*) -> boolean {
+        if (ExpressionNode::identifier_of(e) == null && ExpressionNode::member_access_of(e) == null
+                && ExpressionNode::array_access_of(e) == null) {
+            return false;
+        }
+        const t: Type* = this.arena.lookup(e.resolved_type);
+        return t != null && (t.kind == TypeKind::Pointer || t.kind == TypeKind::Reference);
+    }
+
+    /// The spelling the frame local or parameter `root`, an identifier,
+    /// was written with.
+    root_spelling(&this, root: ExpressionNode*) -> string {
+        return this.intern.resolve(this.source_name(this.local_key(root), ExpressionNode::identifier_of(root).name));
+    }
+
+    /// E0455 at `at`, labelled `label`: a slice reference taken from the
+    /// frame local `root` is held by a future past the suspend.
+    report_frame_slice(mut &this, root: ExpressionNode*, at: SourceSpan, label: String) -> void {
+        const shown: string = this.root_spelling(root);
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0455_DANGLING_POINTER,
+            fmt::format("async: a slice of the local or parameter `%s` is held by a future past an `await`", shown));
+        d = d.at_with_label(at, label);
+        d = d.with_note("a slice names its elements' storage, which for a fixed-size array is the frame itself; each poll runs on a fresh frame, and the type cannot say where the elements live, so no slice of a local may cross an `await`");
+        d = d.help(fmt::format("move `%s` into the awaited call, or have the caller own the elements and pass the slice in as a parameter", shown));
+        this.ctx.emit_diagnostic(d);
+    }
+
     /// Statement twin of `frame_addr_root_expr`, for the value-block body of a
     /// `match` expression arm.
     frame_addr_root_stmt(&this, sm: PollSm*, s: Stmt*) -> ExpressionNode* {
@@ -5524,6 +5658,23 @@ type struct AsyncLower {
                     d_nodes.push(vd_decl);
                 }
             }
+        }
+
+        // A slice reference handed to an awaited future is held by it past the
+        // suspend whether or not the body mentions it again.  Asked of every
+        // declaration before any is carried: carrying a local rewrites its
+        // mentions in later initializers into reads through the carrier.
+        for (mut d: i64 = 0; d < d_keys.length(); d++) {
+            const slice_decl: VarDecl* = DeclarationNode::var_of(d_nodes[d]);
+            if (!this.is_slice_reference(slice_decl.resolved_type)
+                    || !this.slice_binding_handed_to_future(sm, d_keys[d])) {
+                continue;
+            }
+            const from: ExpressionNode* = this.slice_source_root(sm, slice_decl.initializer);
+            if (from == null) { continue; }
+            this.report_frame_slice(from, d_nodes[d].span, fmt::format("`%s` holds a slice of `%s` and is handed to an awaited future",
+                this.intern.resolve(this.source_name(d_keys[d], slice_decl.name)), this.root_spelling(from)));
+            sm.ok = false; return;
         }
 
         for (mut d: i64 = 0; d < d_keys.length(); d++) {
