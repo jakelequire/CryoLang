@@ -359,7 +359,8 @@ STAGE2_FILE := $(STAGE2)
 STAGE2_PIN  := $(PIN)
 endif
 
-# The gate runner (tools/CryoGate, built below by `make cryogate`).  A heavy
+# The gate runner (tools/CryoGate, built below by `make cryogate`); a recipe
+# runs it as `$(CRYOGATE_COMMAND) <gate> ...`.  A heavy
 # target (verify, test-census, selfhost-check, pin) runs its recipe as
 # `$(CRYOGATE_HEAVY) <command>`: under the machine's heavy-run lock, beside
 # the checkout, waited for while another checkout's heavy run holds it, and
@@ -369,10 +370,11 @@ CRYOGATE        := $(CRYOGATE_DIR)/build/cryogate$(EXE_SUFFIX)
 CRYOGATE_INPUTS := $(call rwildcard,$(CRYOGATE_DIR)/src,*.cryo) $(CRYOGATE_DIR)/cryoconfig \
                    $(call rwildcard,$(ROOT)/stdlib,*.cryo) $(RUNTIME_TIERS_A) $(STAGE2_PIN)
 ifeq ($(HOST_OS),windows)
-CRYOGATE_HEAVY  := "$(subst /,\,$(CRYOGATE))" heavy --
+CRYOGATE_COMMAND := "$(subst /,\,$(CRYOGATE))"
 else
-CRYOGATE_HEAVY  := "$(CRYOGATE)" heavy --
+CRYOGATE_COMMAND := "$(CRYOGATE)"
 endif
+CRYOGATE_HEAVY  := $(CRYOGATE_COMMAND) heavy --
 STAGE2_INPUTS := $(CRYO_SOURCES) $(ROOT)/compiler/cryoconfig $(wildcard $(ROOT)/compiler/*.h) \
                  $(RUNTIME_TIERS_A) $(STAGE2_PIN) $(wildcard $(ROOT)/.git/index)
 
@@ -709,13 +711,8 @@ endif
 
 # An incremental build after an edit that asks an unchanged module for a new
 # generic instance must link (tests/fixtures/incremental-new-instance).
-ifeq ($(HOST_OS),windows)
-incremental-instance-check: cryo
-	@$(PYTHON) scripts/incremental-instance-check.py --cryo "$(STAGE2_EXE)"
-else
-incremental-instance-check: cryo
-	@$(PYTHON) scripts/incremental-instance-check.py --cryo "$(STAGE2)"
-endif
+incremental-instance-check: cryo $(CRYOGATE)
+	@$(CRYOGATE_COMMAND) incr --instance --cryo "$(STAGE2_FILE)"
 
 # The judges behind verify's tests/started-compiling declarations, and
 # verify-pin's checks, and selfhost-check's stage-archive comparison, driven

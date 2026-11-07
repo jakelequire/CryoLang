@@ -1,7 +1,7 @@
 # incremental-new-instance
 
-Two builds of one program, driven by `scripts/incremental-instance-check.py`
-(a `make verify` gate): the project runner builds a program once, and this
+Two builds of one program, driven by `cryogate incr --instance`
+(`make incremental-instance-check`, a `make verify` gate): the project runner builds a program once, and this
 defect needs a cached build followed by an edit.
 
 1. `src/main.cryo` spawns a `thread::Scope` job of type `JobA`; built

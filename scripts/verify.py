@@ -9,8 +9,7 @@ build:
     examples   scripts/examples-gate.py  every examples/ project builds
     lsp        scripts/lsp-gate.py       tools/CryoLSP builds and answers
     cross      scripts/cross-check.py    the other OS's gated half compiles
-    incr       scripts/incremental-instance-check.py
-                                         an edit asking a cached module for a
+    incr       cryogate incr --instance  an edit asking a cached module for a
                                          new generic instance still links
     fast       make check-fast           verify's self-test, pin integrity
 
@@ -102,6 +101,9 @@ STDLIB = os.path.join(ROOT, "stdlib").replace("\\", "/")
 KEEP_RUNS = 20
 PY = sys.executable
 EXE = ".exe" if os.name == "nt" else ""
+# The gate runner `make verify` builds first; the gates it has taken over run
+# as its subcommands.
+CRYOGATE = os.path.join(ROOT, "tools", "CryoGate", "build", "cryogate" + EXE)
 
 # Each gate's own verdict line: the run is judged on it and on the exit code,
 # never on the exit code alone.
@@ -111,7 +113,7 @@ GATES = {
                  r"^examples-gate: "),
     "lsp":      ([PY, "scripts/lsp-gate.py", "--cryo", "{cryo}"], r"^lsp-gate: "),
     "cross":    ([PY, "scripts/cross-check.py", "--cryo", "{cryo}"], r"^cross-check: "),
-    "incr":     ([PY, "scripts/incremental-instance-check.py", "--cryo", "{cryo}"],
+    "incr":     ([CRYOGATE, "incr", "--instance", "--cryo", "{cryo}"],
                  r"^incremental-instance-check: "),
     # `ARGS=` on the command line: `make verify ARGS=...` exports ARGS to
     # child makes, and no check-fast target is meant to receive verify's flags.

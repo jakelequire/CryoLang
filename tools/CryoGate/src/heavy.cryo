@@ -21,29 +21,29 @@ import std::fs::path::{ Path, PathBuf };
 
 import cryogate::core::child::{ Completion, Job, Outcome };
 import cryogate::core::lock::{ HeavyLock };
+import cryogate::core::options::{ Options, Parsed };
 
 public type struct Heavy {
     public static run(repository: Path, arguments: &Array<String>, first: i64) -> i32 {
-        mut wait: boolean = true;
-        mut index: i64 = first;
-        while (index < arguments.length() && arguments.get_ref(index).unwrap().as_str() != Str::new("--")) {
-            const option: Str = arguments.get_ref(index).unwrap().as_str();
-            if (option == Str::new("--no-wait")) {
-                wait = false;
-            } else {
-                fmt::eprintln(f"cryogate heavy: unknown option `{option}`; usage: cryogate heavy [--no-wait] -- <program> [arguments]");
-                return 2;
-            }
-            index++;
-        }
-        if (index + 1 >= arguments.length()) {
-            fmt::eprintln(String::from_str(Str::new("cryogate heavy: no program after `--`; usage: cryogate heavy [--no-wait] -- <program> [arguments]")));
+        mut options: Options = Options::new(Str::new("cryogate heavy [--no-wait] -- <program> [arguments]"));
+        options.flag(Str::new("--no-wait"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate heavy: {reason.as_str()}"); return 2; }
+        };
+        if (!parsed.positionals().is_empty()) {
+            fmt::eprintln(f"cryogate heavy: `{parsed.positionals().get_ref(0).unwrap().as_str()}` before `--`; usage: {options.usage()}");
             return 2;
         }
-        mut job: Job = Job::new(arguments.get_ref(index + 1).unwrap().as_str());
-        mut argument: i64 = index + 2;
-        while (argument < arguments.length()) {
-            job.argument(arguments.get_ref(argument).unwrap().as_str());
+        if (parsed.rest().is_empty()) {
+            fmt::eprintln(f"cryogate heavy: no program after `--`; usage: {options.usage()}");
+            return 2;
+        }
+        const wait: boolean = !parsed.has(Str::new("--no-wait"));
+        mut job: Job = Job::new(parsed.rest().get_ref(0).unwrap().as_str());
+        mut argument: i64 = 1;
+        while (argument < parsed.rest().length()) {
+            job.argument(parsed.rest().get_ref(argument).unwrap().as_str());
             argument++;
         }
         const owner: String = match (env::var(Str::new("CRYOGATE_OWNER"))) {

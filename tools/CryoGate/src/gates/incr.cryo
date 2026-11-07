@@ -1,0 +1,166 @@
+///! `cryogate incr --instance --cryo <compiler>`: an incremental build must
+///! link when an edit asks an unchanged module for a generic instance its
+///! cached object does not hold.
+///!
+///! `tests/fixtures/incremental-new-instance` (see its README) is copied to
+///! `.verify/incremental-instance`, built incrementally and run (exit 3);
+///! then `src/main.cryo` is replaced by `edit/main.cryo` and the project is
+///! built again over the first build's cache and run (exit 4).  The second
+///! build must also REUSE cached objects, or the per-module cache was off
+///! and the build linked for the wrong reason: a gate that passes with the
+///! cache disabled tests nothing.  A failed build's output is printed, since
+///! the linker's report is the evidence.
+
+namespace cryogate::gates::incr;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::child::{ Completion, Job, Outcome };
+import cryogate::core::host::{ Host };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::options::{ Options, Parsed };
+import cryogate::core::tree::{ Tree };
+
+/// One build's outcome and what it printed.
+type struct Build {
+    outcome: Outcome;
+    output: String;
+
+    /// The last `bytes` bytes of the output.
+    tail(&this, bytes: i64) -> Str {
+        const all: Str = this.output.as_str();
+        if (all.length() <= bytes) { return all; }
+        return all.sub_bytes(all.length() - bytes, all.length());
+    }
+}
+
+public type struct IncrementalInstance {
+    scratch: PathBuf;
+    compiler: String;
+    stdlib: String;
+
+    public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
+        mut options: Options = Options::new(Str::new("cryogate incr --instance --cryo <compiler>"));
+        options.flag(Str::new("--instance"));
+        options.valued(Str::new("--cryo"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate incr: {reason.as_str()}"); return 2; }
+        };
+        const compiler: Str = match (parsed.value(Str::new("--cryo"))) {
+            Option::Some(path) => { path }
+            Option::None       => { fmt::eprintln(f"cryogate incr: --cryo is required; usage: {options.usage()}"); return 2; }
+        };
+        if (!parsed.has(Str::new("--instance")) || !parsed.positionals().is_empty() || parsed.separated()) {
+            fmt::eprintln(f"cryogate incr: usage: {options.usage()}");
+            return 2;
+        }
+        const check: IncrementalInstance = IncrementalInstance {
+            scratch:  repository.join(Str::new(".verify")).join(Str::new("incremental-instance")),
+            compiler: String::from_str(compiler),
+            stdlib:   Host::stdlib_directory(repository),
+        };
+        const fixture: PathBuf = repository.join(Str::new("tests")).join(Str::new("fixtures")).join(Str::new("incremental-new-instance"));
+        return check.judge(fixture.as_path(), logs);
+    }
+
+    judge(&this, fixture: Path, logs: &RunLogs) -> i32 {
+        if (this.scratch.as_path().exists()) { Directory::remove_all(this.scratch.as_path()); }
+        mut excluded: Array<String> = Array::<String>::new();
+        excluded.push(String::from_str(Str::new("build")));
+        match (Tree::copy(fixture, this.scratch.as_path(), &excluded)) {
+            Result::Ok(_) => { }
+            Result::Err(reason) => {
+                fmt::println(f"incremental-instance-check: FAIL -- cannot copy the fixture: {reason.as_str()}");
+                return 1;
+            }
+        }
+
+        const first: Build = this.build(logs.file(Str::new("incr-instance-first")).as_str());
+        const first_run: String = this.run_after(&first);
+        if (!first.outcome.succeeded() || first_run.as_str() != Str::new("exit 3")) {
+            fmt::println(String::from_str(first.tail(4000)));
+            fmt::println(f"incremental-instance-check: FAIL -- the first build: build {first.outcome.describe().as_str()}, run {first_run.as_str()} (want 0 and 3)");
+            return 1;
+        }
+
+        const edit: PathBuf = this.scratch.join(Str::new("edit")).join(Str::new("main.cryo"));
+        const main: PathBuf = this.scratch.join(Str::new("src")).join(Str::new("main.cryo"));
+        match (File::copy(edit.as_path(), main.as_path())) {
+            Result::Ok(_) => { }
+            Result::Err(error) => {
+                fmt::println(f"incremental-instance-check: FAIL -- cannot apply the edit: {error.describe()}");
+                return 1;
+            }
+        }
+        const second: Build = this.build(logs.file(Str::new("incr-instance-second")).as_str());
+        const second_run: String = this.run_after(&second);
+        if (!second.outcome.succeeded() || second_run.as_str() != Str::new("exit 4")) {
+            fmt::println(String::from_str(second.tail(6000)));
+            fmt::println(f"incremental-instance-check: FAIL -- the incremental build after the edit: build {second.outcome.describe().as_str()}, run {second_run.as_str()} (want 0 and 4)");
+            return 1;
+        }
+        const reused: i64 = IncrementalInstance::reused(second.output.as_str());
+        if (reused == 0) {
+            fmt::println(String::from_str(second.tail(2000)));
+            fmt::println(String::from_str(Str::new("incremental-instance-check: FAIL -- the second build reused no cached object; the cache was not in effect, so the link proves nothing")));
+            return 1;
+        }
+        fmt::println(f"incremental-instance-check: OK -- first build ran 3; after the edit the incremental build reused {reused} cached object(s), linked and ran 4");
+        return 0;
+    }
+
+    build(&this, log: Str) -> Build {
+        mut job: Job = Job::new(this.compiler.as_str());
+        job.argument(Str::new("build"));
+        job.argument(f"--stdlib={this.stdlib.as_str()}".as_str());
+        job.directory(this.scratch.as_path().as_str());
+        job.default_c_compiler();
+        job.log_to(log);
+        const done: Completion = job.run();
+        return Build { outcome: done.outcome, output: done.output() };
+    }
+
+    /// How the fixture's executable exited after `build`: `exit N`, or
+    /// `exit None` when the build failed or left no executable.
+    run_after(&this, build: &Build) -> String {
+        const executable: String = Host::executable_name(this.scratch.join(Str::new("build")).join(Str::new("incremental_new_instance")).as_path().as_str());
+        if (!build.outcome.succeeded() || !Path::from(executable.as_str()).is_file()) {
+            return String::from_str(Str::new("exit None"));
+        }
+        const job: Job = Job::new(executable.as_str());
+        return job.run().outcome.describe();
+    }
+
+    /// The count in the build's `reusing N cached object(s)` line, 0 when
+    /// there is none.
+    public static reused(output: Str) -> i64 {
+        const marker: Str = Str::new("reusing ");
+        mut rest: Str = output;
+        loop {
+            const at: i64 = match (rest.find(&marker)) {
+                Option::Some(at) => { at }
+                Option::None     => { return 0; }
+            };
+            rest = rest.sub_bytes(at + marker.length(), rest.length());
+            mut digits: i64 = 0;
+            while (digits < rest.length() && rest.byte_at(digits).unwrap().is_digit()) {
+                digits++;
+            }
+            if (digits > 0 && rest.sub_bytes(digits, rest.length()).starts_with(&Str::new(" cached object"))) {
+                return match (i64::try_from(rest.sub_bytes(0, digits))) {
+                    Result::Ok(count) => { count }
+                    Result::Err(_)    => { 0 }
+                };
+            }
+        }
+    }
+}

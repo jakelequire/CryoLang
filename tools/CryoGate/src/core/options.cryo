@@ -1,0 +1,128 @@
+///! A subcommand's options: `--flag`, `--name value` or `--name=value`, then
+///! positional arguments, and everything after a bare `--` kept apart for a
+///! program the subcommand runs.
+///!
+///! Each subcommand declares its flags and valued options; anything else
+///! starting with `-` is refused with the subcommand's usage, so a mistyped
+///! option never reads as a positional argument.
+
+namespace cryogate::core::options;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+
+/// What a subcommand accepts.
+public type struct Options {
+    usage: String;
+    flags: Array<String>;
+    valued: Array<String>;
+
+    /// The options of a subcommand whose usage line is `usage`.
+    public static new(usage: Str) -> Options {
+        return Options { usage: String::from_str(usage), flags: Array::<String>::new(), valued: Array::<String>::new() };
+    }
+
+    /// Accept `name` (spelled with its dashes) as a flag.
+    public flag(mut &this, name: Str) -> void { this.flags.push(String::from_str(name)); }
+
+    /// Accept `name` (spelled with its dashes) with a value.
+    public valued(mut &this, name: Str) -> void { this.valued.push(String::from_str(name)); }
+
+    /// Read `arguments` from index `first`.  The refusal names the
+    /// offending argument and repeats the usage.
+    public parse(&this, arguments: &Array<String>, first: i64) -> Result<Parsed, String> {
+        mut parsed: Parsed = Parsed {
+            flags:       Array::<String>::new(),
+            values:      Array::<Pair<String, String>>::new(),
+            positionals: Array::<String>::new(),
+            rest:        Array::<String>::new(),
+            separated:   false,
+        };
+        mut index: i64 = first;
+        while (index < arguments.length()) {
+            const argument: Str = arguments.get_ref(index).unwrap().as_str();
+            index++;
+            if (argument == Str::new("--")) {
+                parsed.separated = true;
+                while (index < arguments.length()) {
+                    parsed.rest.push(arguments.get_ref(index).unwrap().clone());
+                    index++;
+                }
+                break;
+            }
+            if (!argument.starts_with(&Str::new("-")) || argument == Str::new("-")) {
+                parsed.positionals.push(String::from_str(argument));
+                continue;
+            }
+            if (Options::names(&this.flags, argument)) {
+                parsed.flags.push(String::from_str(argument));
+                continue;
+            }
+            match (argument.split_once(&Str::new("="))) {
+                Option::Some(pair) => {
+                    if (Options::names(&this.valued, pair.first)) {
+                        parsed.values.push(Pair::new(String::from_str(pair.first), String::from_str(pair.second)));
+                        continue;
+                    }
+                }
+                Option::None => {
+                    if (Options::names(&this.valued, argument)) {
+                        if (index >= arguments.length()) {
+                            return Result::Err(f"`{argument}` needs a value; usage: {this.usage.as_str()}");
+                        }
+                        parsed.values.push(Pair::new(String::from_str(argument), arguments.get_ref(index).unwrap().clone()));
+                        index++;
+                        continue;
+                    }
+                }
+            }
+            return Result::Err(f"unknown option `{argument}`; usage: {this.usage.as_str()}");
+        }
+        return Result::Ok(parsed);
+    }
+
+    public usage(&this) -> Str { return this.usage.as_str(); }
+
+    static names(declared: &Array<String>, name: Str) -> boolean {
+        for (candidate in declared.iter_ref()) {
+            if (candidate.as_str() == name) { return true; }
+        }
+        return false;
+    }
+}
+
+/// The options one command line gave.
+public type struct Parsed {
+    flags: Array<String>;
+    values: Array<Pair<String, String>>;
+    positionals: Array<String>;
+    rest: Array<String>;
+    separated: boolean;
+
+    /// Whether the flag `name` was given.
+    public has(&this, name: Str) -> boolean {
+        for (flag in this.flags.iter_ref()) {
+            if (flag.as_str() == name) { return true; }
+        }
+        return false;
+    }
+
+    /// The value of the last `name` given, if any.
+    public value(&this, name: Str) -> Option<Str> {
+        mut found: Option<Str> = Option::None;
+        for (entry in this.values.iter_ref()) {
+            if (entry.first.as_str() == name) { found = Option::Some(entry.second.as_str()); }
+        }
+        return found;
+    }
+
+    public positionals(&this) -> &Array<String> { return &this.positionals; }
+
+    /// Whether a bare `--` was given, and what followed it.
+    public separated(&this) -> boolean { return this.separated; }
+    public rest(&this) -> &Array<String> { return &this.rest; }
+}

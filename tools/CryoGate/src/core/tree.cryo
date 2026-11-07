@@ -1,0 +1,69 @@
+///! Directory trees.
+///!
+///! Every walk leaves out the entries whose name is in the excluded list, at
+///! any depth, and visits names in sorted order, so two runs over one tree do
+///! the same thing in the same order on every host.
+
+namespace cryogate::core::tree;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::result::{ Result };
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+
+public type struct Tree {
+    /// Copy the directory `from` to `to`, which must not exist, leaving out
+    /// the entries named in `excluded`.  A link is copied as what it names.
+    public static copy(from: Path, to: Path, excluded: &Array<String>) -> Result<(), String> {
+        match (Directory::create(to)) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { return Result::Err(f"cannot create {to.as_str()}: {error.describe()}"); }
+        }
+        const names: Array<String> = match (Tree::names(from, excluded)) {
+            Result::Ok(names)   => { names }
+            Result::Err(reason) => { return Result::Err(reason); }
+        };
+        for (name in names.iter_ref()) {
+            const source: PathBuf = from.join(name.as_str());
+            const target: PathBuf = to.join(name.as_str());
+            if (source.as_path().is_directory()) {
+                match (Tree::copy(source.as_path(), target.as_path(), excluded)) {
+                    Result::Ok(_)       => { }
+                    Result::Err(reason) => { return Result::Err(reason); }
+                }
+            } else {
+                match (File::copy(source.as_path(), target.as_path())) {
+                    Result::Ok(_)      => { }
+                    Result::Err(error) => { return Result::Err(f"cannot copy {source.as_path().as_str()} to {target.as_path().as_str()}: {error.describe()}"); }
+                }
+            }
+        }
+        return Result::Ok(());
+    }
+
+    /// The names in `directory`, sorted, less the excluded ones.
+    static names(directory: Path, excluded: &Array<String>) -> Result<Array<String>, String> {
+        mut names: Array<String> = Array::<String>::new();
+        match (Directory::entries(directory)) {
+            Result::Ok(entries) => {
+                for (entry in entries) {
+                    const name: Str = entry.name();
+                    if (!Tree::is_excluded(name, excluded)) { names.push(String::from_str(name)); }
+                }
+            }
+            Result::Err(error) => { return Result::Err(f"cannot list {directory.as_str()}: {error.describe()}"); }
+        }
+        names.sort();
+        return Result::Ok(names);
+    }
+
+    static is_excluded(name: Str, excluded: &Array<String>) -> boolean {
+        for (candidate in excluded.iter_ref()) {
+            if (candidate.as_str() == name) { return true; }
+        }
+        return false;
+    }
+}

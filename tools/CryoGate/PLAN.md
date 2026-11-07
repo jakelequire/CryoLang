@@ -32,8 +32,8 @@ here.
 
 **Built so far:** G1's core (§8): the child runner, the scheduler, the
 heavy-run lock and `cryogate heavy`, the run logs, `cryogate selftest`, and
-`make cryogate`; the heavy Makefile targets run under the lock. No gate is
-switched.
+`make cryogate`; the heavy Makefile targets run under the lock. Ported:
+`incr --instance` (G4).
 
 ---
 
@@ -186,7 +186,7 @@ compiler subcommand, because the compiler already holds the answer), **keep**
 | `scripts/valgrind-check.sh` | 73 | four examples under valgrind (Linux) | **port** → `cryogate examples --under=valgrind` | the same build-and-run loop with a runner prefix; one loop, not two |
 | `scripts/lsp-gate.py` + `tools/CryoLSP/tests/smoke.py` | 189 + 1285 | builds CryoLSP with the compiler under test; drives it over stdio through protocol checks and every fixture's `checks.json` | **port** → `cryogate lsp` (§4g) | the largest port by line count; the JSON-RPC driver is reused by the LSP fuzzing lanes later |
 | `scripts/cross-check.py` | 193 | the other OS's runtime, stdlib, compiler and CryoLSP, objects only, concurrently | **port** → `cryogate cross` | once `cryo build` can stop at objects (ruling 322) it also passes on a Linux host (bug 0035) |
-| `scripts/incremental-instance-check.py` | 90 | an edit asking a cached module for a new instance still links and reuses the cache | **port** → `cryogate incr --instance` | small; part of verify |
+| `scripts/incremental-instance-check.py` | 90 | an edit asking a cached module for a new instance still links and reuses the cache | **ported** → `cryogate incr --instance` (script deleted) | small; part of verify |
 | `scripts/incremental-check.py` | 267 | incremental build == clean build over a three-file edit matrix (Linux; a PE carries a link timestamp) | **replace** with the edit-fuzz gate written as `cryogate incr` on perf's bitcode-keyed module cache (question 3: cryogate writes it) | the fuzz gate compares `.o` hashes, not binaries, which also lifts the Windows refusal; the fixed matrix becomes one of its modes. Today's script also leaks its temp directory |
 | `scripts/vendor-consts-gate.py` | 279 | header-vs-table check, `cryo vendor` under a throwaway `CRYO_HOME`, builds and runs a consumer of every constant | **port** → `cryogate vendor` | needs only child processes, files and a temp directory |
 | `scripts/api-index.py` | 498 | generates `docs/stdlib-api.txt` from a line scanner over the stdlib plus `nm` of the archive demangled by the pin | **fold** → a compiler subcommand that prints the index from the parsed stdlib (§5) | the parser already knows every declaration; a text scanner is why bug 0178 exists |
@@ -599,16 +599,24 @@ does (§9, point 2).
 **Status.** G1's core is built (the child runner, the scheduler with CPU
 slots and a declared-cost memory budget, the heavy-run lock and `cryogate
 heavy`, run logs, `cryogate selftest` over `cryogate probe`, `make
-cryogate`); its tree walk and git helper are built with the first gate that
-calls them, since a helper nothing calls is dead code. Its self-test is red on
-Windows by design until bug 0207 is fixed: the working-directory case dies
-in the stdlib's `Command`. Every gate runs `cryo` in a directory, so G2 and
-after wait for that fix, not for perf.
+cryogate`), with the option parser (`core/options`) and the tree copy
+(`core/tree`); the tree listing and the git helper are built with the first
+gate that calls them, since a helper nothing calls is dead code. Its self-test
+is green on both hosts' stdlib since the `Command` working-directory double
+free was fixed. **Ported:** `incr --instance` (G4's third gate).
 
-**What can start now, beside stdlib work, without clashing:** G2-G12 once
-0207 is fixed. They touch only `tools/CryoGate`, new Makefile lines, and the
-Python files they delete. G5 needs sha256 from the stdlib branch, or waits.
-G6 needs the child-pipe API.
+**The Python gates import each other**, which the unit table above does not
+show: `test-census.py` loads `roster-check.py` for its reading of the
+`![target]` gates, and `verify.py` loads `test-census.py` for its parse and
+its pinned unit names (the baseline census's records). So `roster-check.py`
+cannot be deleted while the census is Python, nor `test-census.py` while
+verify is: G2 and G3 land together, and verify needs the census parse from
+cryogate before G3's deletion (question 13).
+
+**What can start now, beside stdlib work, without clashing:** G2-G12. They
+touch only `tools/CryoGate`, new Makefile lines, a gate's row in `verify.py`'s
+table, and the Python files they delete. G5 needs sha256 from the stdlib
+branch, or waits. G6 needs the child-pipe API.
 
 **What must wait:** G13-G14 (Jake's spellings, proposed in the session that
 builds them).
@@ -898,3 +906,14 @@ unnecessary counts); 10 A (regression export is a must); 11 B (gate ports on
     the old order (lanes before ports). **Recommend A**: the ports need nothing
     from perf or the overflow rule, and every lane later runs through the
     core they build.
+13. **The census and roster scripts are libraries of `verify.py`** (§8,
+    "The Python gates import each other"). A: G2 and G3 land together, and
+    in the same commit `verify.py` reads the census parse and the pinned unit
+    names from `cryogate census --read <log>` (one JSON record), a mode G9's
+    verify keeps as a function call; a few lines of `verify.py` change from an
+    import to a child process. B: G2, G3 and G9 land as one unit, so no
+    Python changes at all, and both scripts live until verify is ported.
+    C: switch `make roster-check` and `make test-census` to cryogate now and
+    keep the two scripts only as `verify.py`'s libraries until G9 (two
+    readings of the OS waiver meanwhile). **Recommend A**: one reading of the
+    waiver from the moment the census moves, and the scripts go at once.

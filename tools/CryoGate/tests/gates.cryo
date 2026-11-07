@@ -1,0 +1,79 @@
+///! The gates' pure decisions, and the option parser every subcommand reads
+///! its command line with.
+![config(testing)]
+namespace cryogate::tests::gates;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_false };
+
+import cryogate::core::options::{ Options, Parsed };
+import cryogate::gates::incr::{ IncrementalInstance };
+
+type struct Fixture {
+    /// `cryogate` followed by the space-separated `words`.
+    static command_line(words: Str) -> Array<String> {
+        mut arguments: Array<String> = Array::<String>::new();
+        arguments.push(String::from_str(Str::new("cryogate")));
+        for (word in words.split(&Str::new(" "))) { arguments.push(String::from_str(word)); }
+        return arguments;
+    }
+
+    static gate_options() -> Options {
+        mut options: Options = Options::new(Str::new("cryogate gate --check --cryo <compiler> [names]"));
+        options.flag(Str::new("--check"));
+        options.valued(Str::new("--cryo"));
+        return options;
+    }
+}
+
+![test]
+function options_read_flags_values_and_positionals() -> Result<(), TestError> {
+    const arguments: Array<String> = Fixture::command_line(Str::new("--check --cryo a/cryo one --cryo=b/cryo two"));
+    const parsed: Parsed = match (Fixture::gate_options().parse(&arguments, 1)) {
+        Result::Ok(parsed) => { parsed }
+        Result::Err(_)     => { return expect(false, Str::new("a valid command line is accepted")); }
+    };
+    expect(parsed.has(Str::new("--check")), Str::new("the flag"))?;
+    expect(parsed.value(Str::new("--cryo")).unwrap() == Str::new("b/cryo"), Str::new("the last value given wins"))?;
+    expect(parsed.positionals().length() == 2, Str::new("two positionals"))?;
+    expect(parsed.positionals().get_ref(1).unwrap().as_str() == Str::new("two"), Str::new("in order"))?;
+    return expect_false(parsed.separated(), Str::new("no `--`"));
+}
+
+![test]
+function options_keep_everything_after_a_separator() -> Result<(), TestError> {
+    const arguments: Array<String> = Fixture::command_line(Str::new("--check -- python --check x"));
+    const parsed: Parsed = Fixture::gate_options().parse(&arguments, 1).unwrap();
+    expect(parsed.separated(), Str::new("`--` seen"))?;
+    expect(parsed.rest().length() == 3, Str::new("three words after it"))?;
+    return expect(parsed.rest().get_ref(1).unwrap().as_str() == Str::new("--check"), Str::new("an option after `--` is the program's"));
+}
+
+![test]
+function options_refuse_what_was_not_declared() -> Result<(), TestError> {
+    const unknown: Array<String> = Fixture::command_line(Str::new("--chekc"));
+    match (Fixture::gate_options().parse(&unknown, 1)) {
+        Result::Ok(_)       => { return expect(false, Str::new("a mistyped flag is refused")); }
+        Result::Err(reason) => { expect(reason.as_str().contains(&Str::new("`--chekc`")), Str::new("the refusal names it"))?; }
+    }
+    const missing: Array<String> = Fixture::command_line(Str::new("--cryo"));
+    match (Fixture::gate_options().parse(&missing, 1)) {
+        Result::Ok(_)       => { return expect(false, Str::new("a valued option with no value is refused")); }
+        Result::Err(reason) => { expect(reason.as_str().contains(&Str::new("needs a value")), Str::new("the refusal says why"))?; }
+    }
+    const flag_with_value: Array<String> = Fixture::command_line(Str::new("--check=yes"));
+    return expect(Fixture::gate_options().parse(&flag_with_value, 1).is_err(), Str::new("a flag given a value is refused"));
+}
+
+![test]
+function the_reuse_count_is_read_off_the_build_line() -> Result<(), TestError> {
+    expect(IncrementalInstance::reused(Str::new("Building x [release]: 3 local\n  reusing 7 cached object(s), recompiling 13\n")) == 7, Str::new("the count"))?;
+    expect(IncrementalInstance::reused(Str::new("reusing the cache\n  reusing 12 cached object(s)")) == 12, Str::new("past a `reusing` that is not the line"))?;
+    expect(IncrementalInstance::reused(Str::new("Compiled -> build/x.exe\n")) == 0, Str::new("no line is zero"))?;
+    return expect(IncrementalInstance::reused(Str::new("  reusing 0 cached object(s), recompiling 3")) == 0, Str::new("an honest zero"));
+}
