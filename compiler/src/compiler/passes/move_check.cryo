@@ -282,6 +282,12 @@ type struct MoveChecker {
     /// releases it twice (`check_destructor_field_move_out`).
     drop_receiver: SymbolID;
 
+    /// The receiver of the function being walked when that function is a
+    /// method marked `![sink]`, invalid otherwise: such a method owns its
+    /// receiver although it is written `&this` or `mut &this`, so reading it
+    /// whole is a transfer (`check_reference_binding_move_out`).
+    consumed_receiver: SymbolID;
+
     fired: i64;
     /// Count of fatal (loop-carried) use-after-move errors.  Non-zero
     /// fails the pass, which (MoveCheck being fatal_on_failure) aborts
@@ -317,12 +323,13 @@ type struct MoveChecker {
             unsafe_depth:        0,
             arg_binding_unknown: false,
             drop_receiver:       SymbolID::invalid(),
+            consumed_receiver:   SymbolID::invalid(),
             fired: 0,
             fatal: 0,
         };
     }
 
-    enter_function(mut &this, func_decl: DeclarationNode*) -> void {
+    enter_function(mut &this, func_decl: DeclarationNode*, receiver_consumed: boolean) -> void {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         this.types       = HashMap::<SymbolKey, TypeRef>::new();
         this.moved_keys  = [];
@@ -346,6 +353,7 @@ type struct MoveChecker {
         this.unsafe_depth       = 0;
         this.arg_binding_unknown = false;
         this.drop_receiver       = SymbolID::invalid();
+        this.consumed_receiver   = SymbolID::invalid();
         const drop_trait: DefId = this.registry.wellknown(LangItem::Drop);
         const is_destructor: boolean = drop_trait.is_valid() && func.origin_trait.equals(drop_trait);
         for (mut i: i64 = 0; i < func.parameters.length(); i++) {
@@ -354,6 +362,7 @@ type struct MoveChecker {
             if (param == null) { continue; }
             this.register_binding(param.sym_id, param.resolved_type, param.name, param_decl.span);
             if (is_destructor && param.is_receiver()) { this.drop_receiver = param.sym_id; }
+            if (receiver_consumed && param.is_receiver()) { this.consumed_receiver = param.sym_id; }
         }
     }
 
@@ -1068,13 +1077,13 @@ type struct MoveChecker {
     walk_top_level(mut &this, stmt: DeclarationNode*) -> void {
         match (stmt.kind) {
             DeclKind::Function(_) => {
-                this.walk_function(stmt);
+                this.walk_function(stmt, false);
             }
             DeclKind::Trait(td) => {
                 for (mut i: i64 = 0; i < td.methods.length(); i++) {
                     const m_decl: DeclarationNode* = td.methods[i];
                     const m: FunctionDecl* = DeclarationNode::fn_of(m_decl);
-                    if (m != null) { this.walk_function(m_decl); }
+                    if (m != null) { this.walk_function(m_decl, false); }
                 }
             }
             DeclKind::Union(ud) => { this.walk_methods(ud.methods); }
@@ -1092,18 +1101,18 @@ type struct MoveChecker {
             const m_decl: DeclarationNode* = methods[i];
             const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null || m.func == null) { continue; }
-            this.walk_function(m.func);
+            this.walk_function(m.func, m.is_sink);
         }
     }
 
-    walk_function(mut &this, func_decl: DeclarationNode*) -> void {
+    walk_function(mut &this, func_decl: DeclarationNode*, receiver_consumed: boolean) -> void {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.body == null) { return; }
         if (func.is_generic()) { return; }
         if (Log::enabled(LogArea::Drop, LogLevel::Trace)) {
             Log::trace(LogArea::Drop, f"move checking function '{this.intern.resolve(func.name)}'");
         }
-        this.enter_function(func_decl);
+        this.enter_function(func_decl, receiver_consumed);
         this.walk_stmt(func.body);
     }
 
@@ -1471,6 +1480,9 @@ type struct MoveChecker {
         // duplicated into an independently-dropped place while whoever owns
         // that storage keeps its own claim on it.
         if (real) { this.check_deref_move_out(expr); }
+        // ...and for a whole value read through a binding that is a
+        // reference to it (`return this;` in a `&this` method).
+        if (real) { this.check_reference_binding_move_out(expr); }
         // Same hazard for an array element read by value: the array keeps
         // ownership of the element, so the duplicated handle is freed twice.
         if (real) { this.check_array_move_out(expr); }
@@ -2279,6 +2291,39 @@ type struct MoveChecker {
         if (!this.type_needs_drop(pointee_ty)) { return; }
         if (this.suppress_emit) { return; }
         this.emit_deref_move_out_error(expr.span);
+    }
+
+    /// Reject a by-value read of a whole value through a binding declared as
+    /// a reference or pointer to it, whose type owns a destructor.
+    ///
+    /// `return this;` in a `&this` or `mut &this` method reads the receiver
+    /// by its implicit dereference: the caller gets a second owner of the
+    /// storage the receiver names, and both are released.  It is the read
+    /// `check_deref_move_out` refuses for a written `*p`, with the same
+    /// `unsafe` escape for a deliberate take.  A method marked `![sink]` owns
+    /// its receiver, so its `return this;` is the transfer it declares.
+    check_reference_binding_move_out(mut &this, expr: ExpressionNode*) -> void {
+        if (this.unsafe_depth > 0 || this.arg_binding_unknown) { return; }
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(expr);
+        if (id == null) { return; }
+        const sym: SymbolID = id.res.local_sym();
+        if (this.consumed_receiver.is_valid() && sym.equals(this.consumed_receiver)) { return; }
+        const declared: TypeRef = this.lookup_type(sym);
+        if (!declared.is_valid() || !this.is_ptr_or_ref(declared)) { return; }
+        const value_ty: TypeRef = expr.resolved_type;
+        if (!value_ty.is_valid() || this.is_ptr_or_ref(value_ty) || this.is_copy(value_ty)) { return; }
+        if (!this.type_needs_drop(value_ty)) { return; }
+        if (this.suppress_emit) { return; }
+        const name: string = this.intern.resolve(id.name);
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
+            fmt::format("cannot move `%s` out through a reference", name).into_raw());
+        diag = diag.at_with_label(expr.span,
+            "this copies the value's owning handle into a second owner; the storage it refers to still drops it too (double free)");
+        diag = diag.help(
+            "clone it, or take it by value (`mut this` for a receiver) when the method is meant to consume it");
+        this.ctx.emit_diagnostic(diag);
+        this.fired += 1;
+        this.fatal += 1;
     }
 
     emit_deref_move_out_error(mut &this, span: SourceSpan) -> void {
