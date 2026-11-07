@@ -1,0 +1,73 @@
+// `{x:#?}` in an f-string formats its value through `Debug` with a pretty
+// formatter - a member per line, indented by depth - where `{x:?}` writes
+// it on one line.  An f-string building a `String` appends the hole with
+// one builder; an f-string passed as `Arguments` records it as a piece the
+// callee writes through its own formatter, and the pretty piece writes
+// through a pretty formatter over that writer.
+//
+// `main` prints how many checks passed and exits 0 only when all did.
+namespace FStringPrettyDebugHole::Main;
+
+import std::fmt;
+import std::core::result::{ Result };
+import std::collections::string::{ String };
+import std::fmt::display::{ Debug, Formatter };
+import std::fmt::error::{ FmtError };
+
+type struct Point {
+    x: i64;
+    y: i64;
+}
+
+implement trait Debug for struct Point {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        return f.debug_struct("Point").field("x", &this.x).field("y", &this.y).finish();
+    }
+}
+
+type enum Shape {
+    Dot;
+    Segment(Point, Point);
+}
+
+implement trait Debug for enum Shape {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        match (&this) {
+            Shape::Dot => { return f.debug_tuple("Dot").finish(); }
+            Shape::Segment(from, to) => {
+                return f.debug_tuple("Segment").field(from).field(to).finish();
+            }
+        }
+    }
+}
+
+function check(passed: i64, ok: boolean, what: string) -> i64 {
+    if (ok) { return passed + 1; }
+    fmt::println(f"FAILED: {what}");
+    return passed;
+}
+
+function main() -> i32 {
+    mut passed: i64 = 0;
+    const p: Point = Point { x: 1, y: 2 };
+
+    const pretty: String = f"at {p:#?}";
+    passed = check(passed, pretty == String::from_string("at Point {\n    x: 1,\n    y: 2,\n}"),
+        "a String f-string's pretty hole");
+    const plain: String = f"at {p:?}";
+    passed = check(passed, plain == String::from_string("at Point { x: 1, y: 2 }"),
+        "a String f-string's plain Debug hole");
+
+    const segment: Shape = Shape::Segment(Point { x: 1, y: 2 }, Point { x: 3, y: 4 });
+    mut out: String = String::new();
+    mut f: Formatter = Formatter::new(&out);
+    const written: Result<(), FmtError> = f.write(f"{segment:#?};{segment:?}");
+    passed = check(passed, written.is_ok(), "writing the Arguments");
+    passed = check(passed, out == String::from_string(
+        "Segment(\n    Point {\n        x: 1,\n        y: 2,\n    },\n    Point {\n        x: 3,\n        y: 4,\n    },\n);Segment(Point { x: 1, y: 2 }, Point { x: 3, y: 4 })"),
+        "written Arguments with a pretty and a plain hole");
+
+    fmt::println(f"f_string_pretty_debug_hole: {passed} of 4 passed");
+    if (passed == 4) { return 0; }
+    return 1;
+}
