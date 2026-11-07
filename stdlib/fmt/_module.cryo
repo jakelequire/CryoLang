@@ -16,7 +16,7 @@
 ///!
 ///! The print family lives directly in this module, so `import std::fmt;`
 ///! brings it in.  Two flavours:
-///!   - `format`  - C-style variadic (`%s`/`%d`) into a fresh string.
+///!   - `format`  - C-style variadic (`%s`/`%d`) into a new owned `String`.
 ///!   - `printf` / `eprintf` - C-style variadic (`%s`/`%d`) to stdout/stderr.
 ///!   - `print` / `println` / `eprint` / `eprintln` - Display-based: take an
 ///!     owned `String` (typically an f-string `f"{x}"`), write it, and drop it.
@@ -38,7 +38,6 @@ namespace std::fmt;
 
 import std::core::intrinsics;
 import std::ffi::libc;
-import std::alloc::allocator;
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 
@@ -68,36 +67,28 @@ export std::fmt::interp::{ Arguments };
 // `String` via `format_to_string` (or an f-string) and the `Display`
 // trait.
 
-/// Format printf-style into a freshly allocated string.  Returns null when
-/// the formatting or the allocation failed.
+/// Format printf-style into a new owned `String`, released when it drops.
+/// Panics when the formatting or the allocation fails, as building any
+/// `String` does.
 ///
 /// Single-pass by construction: `vasprintf` sizes and formats in one go.
 /// A measure-then-format pair would need to read the variadic bucket twice,
 /// and Cryo has no `va_copy` to give the second pass its own cursor - the
-/// first pass leaves the va_list consumed.
-///
-/// The result is relocated out of `vasprintf`'s libc buffer into `GlobalAlloc`
-/// storage (the active per-target arena while the compiler builds itself, plain
-/// libc everywhere else) and the libc temp is released.  Callers overwhelmingly
-/// leak the result, so a long-running host that recompiles per keystroke - the
-/// LSP - reclaims them in bulk at the next arena reset instead of leaking them
-/// to libc for the life of the process.  With the arena inactive `GlobalAlloc`
-/// IS libc `malloc`, so a caller that frees the result still reaches a matching
-/// free.
-public function format(fmt: string, args...) -> string {
+/// first pass leaves the va_list consumed.  The text is copied out of
+/// `vasprintf`'s libc buffer into the `String`'s own storage and the libc
+/// buffer is released, so every byte the result holds belongs to its
+/// allocator.  A zero byte written by `%c` is kept: the length is the count
+/// `vasprintf` reports, not a scan for the terminator.
+public function format(fmt: string, args...) -> String {
     mut buf: mut u8* = null;
     const n: i32 = libc::vasprintf(&buf, fmt, args);
     // `n < 0` leaves `*ret` undefined, so `buf` must not be read or freed.
-    if (n < 0) { return null; }
-    const size: u64 = (n as u64) + 1;
-    const out: mut void* = allocator::alloc(size, 1);
-    if (out == null) {
-        libc::free(buf);
-        return null;
+    if (n < 0) {
+        core::panic("fmt::format: formatting failed", intrinsics::location());
     }
-    libc::memcpy(out, buf, size);
+    const text: String = String::from_str(Str::from_raw(buf, n as i64));
     libc::free(buf);
-    return out as string;
+    return text;
 }
 
 /// Write a printf-style formatted string to stdout.  Returns the number of
