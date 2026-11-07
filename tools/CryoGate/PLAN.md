@@ -634,7 +634,11 @@ baseline run from `cryogate census --read <log>`, one JSON record), `cross`
 `--run` goldens and `--under=valgrind` modes are still the shell scripts),
 with `core/text` (lines, joining, a line scanner) beside the core.
 `check-fast` runs `cryogate selftest` (so it builds cryogate), which carries
-the roster merge's self-test cases.
+the roster merge's self-test cases. The self-test runs the unit-test binary
+`make cryogate` built rather than `cryo test`: the pin building inside a
+verify run makes its own stdlib archive with the same options as the
+compiler under test's, which verify refuses as two archives it cannot tell
+apart.
 
 **What can start now, beside stdlib work, without clashing:** G4-G12. They
 touch only `tools/CryoGate`, new Makefile lines, a gate's row in `verify.py`'s

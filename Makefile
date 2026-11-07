@@ -369,6 +369,7 @@ endif
 # released when the command ends.  cmd cannot run a quoted forward-slash path.
 CRYOGATE_DIR    := $(ROOT)/tools/CryoGate
 CRYOGATE        := $(CRYOGATE_DIR)/build/cryogate$(EXE_SUFFIX)
+CRYOGATE_TESTS  := $(CRYOGATE_DIR)/build/cryogate-test$(EXE_SUFFIX)
 CRYOGATE_INPUTS := $(call rwildcard,$(CRYOGATE_DIR)/src,*.cryo) $(CRYOGATE_DIR)/cryoconfig \
                    $(call rwildcard,$(ROOT)/stdlib,*.cryo) $(RUNTIME_TIERS_A) $(STAGE2_PIN)
 ifeq ($(HOST_OS),windows)
@@ -518,17 +519,27 @@ endif
 # does not build or misbehaves cannot break the program that reports it.
 # Rebuilt when its sources, the stdlib, the runtime tiers or the pin are
 # newer than the binary.  Its variables are set beside the pin's, above,
-# because the heavy targets name it as a prerequisite.
-cryogate: $(CRYOGATE)
+# because the heavy targets name it as a prerequisite.  Its unit tests are
+# built here too, by listing them (`cryo test --list` builds the test binary
+# and prints its tests), and `cryogate selftest` runs that binary: a check-fast
+# run inside verify then builds nothing with the pin, whose stdlib archive
+# would otherwise land among the archives verify hashes.
+cryogate: $(CRYOGATE) $(CRYOGATE_TESTS)
 
 ifeq ($(HOST_OS),windows)
 $(CRYOGATE): $(CRYOGATE_INPUTS)
 	@echo "==> Building cryogate via bin/cryo.exe"
 	@cd tools/CryoGate && "$(subst /,\,$(PIN_EXE))" build
+$(CRYOGATE_TESTS): $(CRYOGATE_INPUTS) $(call rwildcard,$(CRYOGATE_DIR)/tests,*.cryo)
+	@echo "==> Building cryogate's unit tests via bin/cryo.exe"
+	@cd tools/CryoGate && "$(subst /,\,$(PIN_EXE))" test --list
 else
 $(CRYOGATE): $(CRYOGATE_INPUTS)
 	@echo "==> Building cryogate via bin/cryo"
 	@cd tools/CryoGate && "$(PIN)" build
+$(CRYOGATE_TESTS): $(CRYOGATE_INPUTS) $(call rwildcard,$(CRYOGATE_DIR)/tests,*.cryo)
+	@echo "==> Building cryogate's unit tests via bin/cryo"
+	@cd tools/CryoGate && "$(PIN)" test --list
 endif
 
 # ---- CryoAnalyzer VS Code extension -----------------------------------
@@ -719,15 +730,16 @@ incremental-instance-check: cryo $(CRYOGATE)
 # verify-pin's checks, and selfhost-check's stage-archive comparison, and
 # cryogate's own (the roster merge and the census among them), driven through
 # every case they must refuse and every case they must allow.
-verify-selftest: $(CRYOGATE)
+verify-selftest: $(CRYOGATE) $(CRYOGATE_TESTS)
 	@$(PYTHON) scripts/verify.py --selftest
 	@$(PYTHON) scripts/verify-pin.py --selftest
 	@$(PYTHON) scripts/selfhost-check.py --selftest
 	@$(CRYOGATE_COMMAND) selftest
 
 # ---- the pre-commit sweep ----------------------------------------------
-# Every gate here is source-derived; the one thing it builds is cryogate,
-# with the pin.  A short gate everybody runs is worth more than a
+# Every gate here is source-derived; the one thing it builds is cryogate
+# and its unit tests, with the pin, and only when they are stale, so run
+# inside verify it makes no stdlib archive.  A short gate everybody runs is worth more than a
 # twenty-minute one nobody does.
 check-fast: verify-selftest verify-pin
 	@echo "check-fast: OK (verify's declared-program self-test, cryogate's self-test, selfhost archive-comparison self-test, pin integrity)"

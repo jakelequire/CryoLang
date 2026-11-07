@@ -1,10 +1,9 @@
-///! Running a project's own `![test]` functions with `cryo test` and reading
-///! back how many ran.
+///! Running the test binary `cryo test` built for a project's own `![test]`
+///! functions and reading back how many ran.
 ///!
-///! A run is accepted only when the runner's overall verdict is PASS, its
-///! summary's `passed` count equals the number of `ok` lines, and that
-///! number is not zero: a discovery that found nothing exits 0 and prints
-///! PASS too.
+///! A run is accepted only when the summary's verdict is `result PASS`, its
+///! `passed` count equals the number of `ok` lines, and that number is not
+///! zero: a discovery that found nothing exits 0 and prints PASS too.
 
 namespace cryogate::core::suite;
 
@@ -12,19 +11,23 @@ import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::core::option::{ Option };
 import std::core::result::{ Result };
-import std::fs::path::{ Path, PathBuf };
+import std::fs::path::{ Path };
 
 import cryogate::core::child::{ Completion, Job };
-import cryogate::core::host::{ Host };
 
 public type struct UnitSuite {
-    /// Build and run the tests of the project at `project` with the
-    /// repository's pinned compiler, logging to `log`.  The number of tests
-    /// that ran and passed, or why the run is not accepted.
-    public static run(repository: Path, project: Path, log: Str) -> Result<i64, String> {
-        const pin: PathBuf = Host::pinned_compiler(repository);
-        mut job: Job = Job::new(pin.as_path().as_str());
-        job.argument(Str::new("test"));
+    /// Run the test binary `binary` that `cryo test` built for the project
+    /// at `project`, logging to `log`.  Running the binary instead of `cryo
+    /// test` builds nothing, so no stdlib archive is made while a gate is
+    /// reading them; keeping the binary current is the build's job (`make
+    /// cryogate` builds cryogate's, and `make check-fast` depends on it).
+    /// The number of tests that ran and passed, or why the run is not
+    /// accepted.
+    public static run(project: Path, binary: Path, log: Str) -> Result<i64, String> {
+        if (!binary.is_file()) {
+            return Result::Err(f"{binary.as_str()} does not exist; `make cryogate` builds it");
+        }
+        mut job: Job = Job::new(binary.as_str());
         job.directory(project.as_str());
         job.log_to(log);
         const done: Completion = job.run();
@@ -51,9 +54,12 @@ public type struct UnitSuite {
                 }
                 Option::None => { }
             }
-            if (line.starts_with(&Str::new("OVERALL  PASS"))) { overall_pass = true; }
+            match (line.strip_prefix(&Str::new("result "))) {
+                Option::Some(rest) => { if (rest.trim() == Str::new("PASS")) { overall_pass = true; } }
+                Option::None       => { }
+            }
         }
-        if (!overall_pass) { return Result::Err(f"the runner printed no `OVERALL  PASS` (log {log})"); }
+        if (!overall_pass) { return Result::Err(f"the runner printed no `result PASS` (log {log})"); }
         const passed: i64 = match (summary_passed) {
             Option::Some(count) => { count }
             Option::None        => { return Result::Err(f"the runner printed no `passed` count (log {log})"); }
