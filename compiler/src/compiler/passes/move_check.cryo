@@ -2110,6 +2110,58 @@ type struct MoveChecker {
         this.fatal += 1;
     }
 
+    /// Reject a `match` on a field, reached through a pointer or reference,
+    /// whose type owns a destructor.
+    ///
+    /// `match (h.slot)` with `h: &Holder` matches `(*h).slot` by value: the
+    /// subject temporary takes a copy of the field's owning handle and is
+    /// dropped when the match ends, whether or not an arm binds the payload,
+    /// while the storage `h` names still holds the field and drops it again.
+    /// It is the `*p` subject `check_deref_move_out` refuses, one projection
+    /// further, with the same `unsafe` escape for a deliberate take.  The
+    /// match that only looks is `match (&h.slot)`.  A destructor's own
+    /// receiver is `check_destructor_field_move_out`'s.
+    check_subject_field_through_pointer(mut &this, e: ExpressionNode*) -> void {
+        if (this.unsafe_depth > 0 || this.arg_binding_unknown) { return; }
+        const ma: MemberAccessExpr* = ExpressionNode::member_access_of(e);
+        if (ma == null || ma.object == null) { return; }
+        const field_ty: TypeRef = e.resolved_type;
+        if (!field_ty.is_valid() || this.is_copy(field_ty)) { return; }
+        if (!this.type_needs_drop(field_ty)) { return; }
+        if (this.drop_receiver.is_valid() && this.is_receiver_value_place(ma.object)) { return; }
+        if (!this.reaches_through_pointer(ma.object)) { return; }
+        if (this.suppress_emit) { return; }
+        const field: string = this.intern.resolve(ma.member);
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
+            fmt::format("cannot match field `%s` by value through a pointer or reference", field));
+        diag = diag.at_with_label(e.span,
+            "the match takes its own copy of the field and drops it; the storage it is in still drops it too (double free)");
+        diag = diag.help(
+            "match on a borrow of the field instead - write `&` before the subject - so the arms read it without owning it; if this really is a take, swap a replacement in with `core::mem::swap` first");
+        this.ctx.emit_diagnostic(diag);
+        this.fired += 1;
+        this.fatal += 1;
+    }
+
+    /// True when the place `obj` names is reached through a pointer or
+    /// reference: a binding declared as one (a `&T`/`T*` parameter, `this`
+    /// in a `&this` method), a field of such a type in the chain, or a `*p`.
+    reaches_through_pointer(&this, obj: ExpressionNode*) -> boolean {
+        if (obj == null) { return false; }
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(obj);
+        if (id != null) {
+            const declared: TypeRef = this.lookup_type(id.res.local_sym());
+            return declared.is_valid() && this.is_ptr_or_ref(declared);
+        }
+        const inner: MemberAccessExpr* = ExpressionNode::member_access_of(obj);
+        if (inner != null) {
+            if (this.is_ptr_or_ref(obj.resolved_type)) { return true; }
+            return this.reaches_through_pointer(inner.object);
+        }
+        const u: UnaryExpr* = ExpressionNode::unary_of(obj);
+        return u != null && !u.is_postfix && u.op.kind == TokenType::Star;
+    }
+
     /// True when `obj` is the destructor's receiver, or a value-typed field
     /// chain under it with no pointer or reference link: storage field glue
     /// releases when `drop` returns.
@@ -2156,6 +2208,7 @@ type struct MoveChecker {
     check_subject_move_out(mut &this, subject: ExpressionNode*) -> void {
         if (subject == null) { return; }
         this.check_field_move_out(subject);
+        this.check_subject_field_through_pointer(subject);
         this.check_deref_move_out(subject);
         this.check_array_move_out(subject);
         this.check_array_field_move_out(subject);

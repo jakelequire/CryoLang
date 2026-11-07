@@ -1,0 +1,162 @@
+///! A `match` on a field reached through a reference or pointer, written on a
+///! borrow of the field (`match (&h.slot)`), reads the payload without owning
+///! it: the value is released once, by its owner.  Matching such a field by
+///! value is refused (E0453; see the negative test of that name), because the
+///! subject would take a second owning copy and release it at the end of the
+///! match.
+///!
+///! Each test builds its owners in a block and counts destructor runs once
+///! the block has ended, so a payload released by the match as well as by its
+///! owner shows as one drop too many.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::MatchThroughReferenceBorrows;
+
+import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::core::drop::{ Drop };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_eq };
+
+mut g_drops: i64 = 0;
+
+type struct Counted { tag: i64; }
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void { g_drops += 1; }
+}
+
+type struct Holder { slot: Option<Counted>; }
+type struct Nest { inner: Holder; }
+
+type struct Owner {
+    slot: Option<Counted>;
+
+    tag_of_slot(&this) -> i64 {
+        match (&this.slot) {
+            Option::Some(found) => { return found.tag; }
+            Option::None        => { return 0; }
+        }
+    }
+}
+
+function tag_through_reference(h: &Holder) -> i64 {
+    match (&h.slot) {
+        Option::Some(found) => { return found.tag; }
+        Option::None        => { return 0; }
+    }
+}
+
+function tag_through_writable_reference(h: mut &Holder) -> i64 {
+    match (&h.slot) {
+        Option::Some(found) => { return found.tag; }
+        Option::None        => { return 0; }
+    }
+}
+
+function tag_through_pointer(h: Holder*) -> i64 {
+    match (&h.slot) {
+        Option::Some(found) => { return found.tag; }
+        Option::None        => { return 0; }
+    }
+}
+
+function tag_of_nested(n: &Nest) -> i64 {
+    match (&n.inner.slot) {
+        Option::Some(found) => { return found.tag; }
+        Option::None        => { return 0; }
+    }
+}
+
+function is_filled(h: &Holder) -> boolean {
+    match (&h.slot) {
+        Option::Some(_) => { return true; }
+        Option::None    => { return false; }
+    }
+}
+
+![test]
+function a_borrowed_match_through_a_reference_releases_once() -> Result<(), TestError> {
+    g_drops = 0;
+    mut seen: i64 = 0;
+    {
+        const h: Holder = Holder { slot: Option::Some(Counted { tag: 7 }) };
+        for (mut round: i64 = 0; round < 3; round++) { seen += tag_through_reference(&h); }
+    }
+    expect_eq(seen, 21)?;
+    return expect_eq(g_drops, 1);
+}
+
+![test]
+function a_borrowed_match_through_a_writable_reference_releases_once() -> Result<(), TestError> {
+    g_drops = 0;
+    mut seen: i64 = 0;
+    {
+        mut h: Holder = Holder { slot: Option::Some(Counted { tag: 5 }) };
+        seen = tag_through_writable_reference(&h);
+    }
+    expect_eq(seen, 5)?;
+    return expect_eq(g_drops, 1);
+}
+
+![test]
+function a_borrowed_match_through_a_pointer_releases_once() -> Result<(), TestError> {
+    g_drops = 0;
+    mut seen: i64 = 0;
+    {
+        mut h: Holder = Holder { slot: Option::Some(Counted { tag: 4 }) };
+        seen = tag_through_pointer(&h);
+    }
+    expect_eq(seen, 4)?;
+    return expect_eq(g_drops, 1);
+}
+
+![test]
+function a_borrowed_match_on_a_nested_field_releases_once() -> Result<(), TestError> {
+    g_drops = 0;
+    mut seen: i64 = 0;
+    {
+        const n: Nest = Nest { inner: Holder { slot: Option::Some(Counted { tag: 3 }) } };
+        seen = tag_of_nested(&n);
+    }
+    expect_eq(seen, 3)?;
+    return expect_eq(g_drops, 1);
+}
+
+![test]
+function a_borrowed_match_with_a_wildcard_releases_once() -> Result<(), TestError> {
+    g_drops = 0;
+    mut filled: boolean = false;
+    {
+        const h: Holder = Holder { slot: Option::Some(Counted { tag: 2 }) };
+        filled = is_filled(&h);
+    }
+    expect_eq(filled, true)?;
+    return expect_eq(g_drops, 1);
+}
+
+![test]
+function a_borrowed_match_on_a_receiver_field_releases_once() -> Result<(), TestError> {
+    g_drops = 0;
+    mut seen: i64 = 0;
+    {
+        const owner: Owner = Owner { slot: Option::Some(Counted { tag: 9 }) };
+        seen = owner.tag_of_slot();
+    }
+    expect_eq(seen, 9)?;
+    return expect_eq(g_drops, 1);
+}
+
+![test]
+function a_match_on_an_owned_local_still_takes_it() -> Result<(), TestError> {
+    g_drops = 0;
+    mut seen: i64 = 0;
+    {
+        const slot: Option<Counted> = Option::Some(Counted { tag: 6 });
+        match (slot) {
+            Option::Some(found) => { seen = found.tag; }
+            Option::None        => { }
+        }
+    }
+    expect_eq(seen, 6)?;
+    return expect_eq(g_drops, 1);
+}
