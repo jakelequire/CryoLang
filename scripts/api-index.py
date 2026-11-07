@@ -481,7 +481,7 @@ def main():
 
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     # `newline="\n"` suppresses the translation that would write CRLF on
-    # Windows, matching `roster-check.py`.  The reader above keeps universal
+    # Windows, matching the roster golden.  The reader above keeps universal
     # newlines on purpose, so a golden checked out through `core.autocrlf` still
     # compares equal; only what this script PRODUCES has to be pinned, or the
     # artifact differs by host.

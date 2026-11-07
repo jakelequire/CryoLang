@@ -288,8 +288,9 @@ whether branch pushes trigger anything at all.
 Not built: `cryo test` is to print a count for each of its three suites -
 zero included - and `--list` to list all three, not the unit suite alone
 (ruling 272: the runner prints each suite's count and lists every suite,
-retiring the census and roster scripts).  `test-census.py` then reduces to
-nothing, and `roster-check.py` to a diff of `--list` against the golden.
+retiring the census's and the roster's text reading).  `cryogate census` then
+reads the runner's own counts, and `cryogate roster` reduces to a diff of
+`--list` against the golden.
 
 A project's `test.json` gains `stdout_file`, which compares the program's
 whole output against a file (ruling 271: a `stdout_file` field compares a

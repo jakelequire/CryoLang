@@ -92,7 +92,7 @@ PIN_EXE      := $(ROOT)/bin/cryo.exe
 # pin to ask: starting it costs more than the rest of a no-change `make cryo`.
 # One file per host OS: a Windows checkout's `compiler/build` is the one WSL
 # builds in, and each host's pin answers its own triple.
-NO_TRIPLE_GOALS := help clean check-fast verify-selftest verify-pin verify-pin-clean
+NO_TRIPLE_GOALS := help clean verify-pin verify-pin-clean
 HOST_TRIPLE_MK  := $(ROOT)/compiler/build/host-triple-$(HOST_OS).mk
 ifneq ($(filter-out $(NO_TRIPLE_GOALS),$(or $(MAKECMDGOALS),help)),)
 -include $(HOST_TRIPLE_MK)
@@ -646,11 +646,11 @@ test: $(STAGE2_EXE) $(TEST_HELPERS_A) runtime-tiers
 test-list: $(STAGE2_EXE) $(TEST_HELPERS_A)
 	@cd tests && "$(STAGE2_EXE_WIN)" test --list $(ARGS)
 
-roster-check: $(STAGE2_EXE) $(TEST_HELPERS_A)
-	@$(PYTHON) scripts/roster-check.py "$(STAGE2_EXE_WIN)" $(ARGS)
+roster-check: $(STAGE2_EXE) $(TEST_HELPERS_A) $(CRYOGATE)
+	@$(CRYOGATE_COMMAND) roster --cryo "$(STAGE2_FILE)" $(ARGS)
 
 test-census: $(STAGE2_EXE) $(TEST_HELPERS_A) $(CRYOGATE) runtime-tiers
-	@$(CRYOGATE_HEAVY) $(PYTHON) scripts/test-census.py --cryo "$(STAGE2_EXE)" $(ARGS)
+	@$(CRYOGATE_HEAVY) $(CRYOGATE_COMMAND) census --cryo "$(STAGE2_FILE)" -- $(ARGS)
 else
 test: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) runtime-tiers
 	@cd tests && "$(STAGE2)" test $(ARGS)
@@ -660,18 +660,20 @@ test-list: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
 
 # Golden-file gate on the DISCOVERED unit-test roster: a compiler change
 # that silently breaks `![test]` discovery would otherwise stay green
-# ("0 of 0 failed" is a pass).  Re-pin deliberately with ARGS=--update.
-roster-check: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
-	@$(PYTHON) scripts/roster-check.py "$(STAGE2)" $(ARGS)
+# ("0 of 0 failed" is a pass).  Re-pin with ARGS=--merge when adding tests,
+# ARGS=--update when removing them.  `cryogate roster`.
+roster-check: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(CRYOGATE)
+	@$(CRYOGATE_COMMAND) roster --cryo "$(STAGE2_FILE)" $(ARGS)
 
 # `make test` with the counts asserted.  The runner reports a zero the same way
 # it reports success - silently - so an exit code cannot tell a suite that ran
-# everything from one that ran nothing.  This runs the same suite, streams the
-# same output, and then reconciles what ran against the roster golden.  Use it
-# wherever the run is being taken as evidence; `make test` stays for the
-# working loop, where a pattern filter is the point.
+# everything from one that ran nothing.  This runs the same suite (its output
+# in the run's log; the tail printed when it fails), and then reconciles what
+# ran against the roster golden.  Use it wherever the run is being taken as
+# evidence; `make test` stays for the working loop, where a pattern filter is
+# the point.  ARGS are passed to `cryo test`.  `cryogate census`.
 test-census: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(CRYOGATE) runtime-tiers
-	@$(CRYOGATE_HEAVY) $(PYTHON) scripts/test-census.py --cryo "$(STAGE2)" $(ARGS)
+	@$(CRYOGATE_HEAVY) $(CRYOGATE_COMMAND) census --cryo "$(STAGE2_FILE)" -- $(ARGS)
 endif
 
 # End-to-end gate on the constants `cryo vendor` carries out of a C header.
@@ -712,19 +714,21 @@ incremental-instance-check: cryo $(CRYOGATE)
 	@$(CRYOGATE_COMMAND) incr --instance --cryo "$(STAGE2_FILE)"
 
 # The judges behind verify's tests/started-compiling declarations, and
-# verify-pin's checks, and selfhost-check's stage-archive comparison, driven
-# through every case they must refuse and every case they must allow.
-verify-selftest:
+# verify-pin's checks, and selfhost-check's stage-archive comparison, and
+# cryogate's own (the roster merge and the census among them), driven through
+# every case they must refuse and every case they must allow.
+verify-selftest: $(CRYOGATE)
 	@$(PYTHON) scripts/verify.py --selftest
 	@$(PYTHON) scripts/verify-pin.py --selftest
-	@$(PYTHON) scripts/roster-check.py --selftest
 	@$(PYTHON) scripts/selfhost-check.py --selftest
+	@$(CRYOGATE_COMMAND) selftest
 
 # ---- the pre-commit sweep ----------------------------------------------
-# Every gate here is source-derived, so this target builds nothing.  A short
-# gate everybody runs is worth more than a twenty-minute one nobody does.
+# Every gate here is source-derived; the one thing it builds is cryogate,
+# with the pin.  A short gate everybody runs is worth more than a
+# twenty-minute one nobody does.
 check-fast: verify-selftest verify-pin
-	@echo "check-fast: OK (verify's declared-program self-test, roster merge self-test, selfhost archive-comparison self-test, pin integrity)"
+	@echo "check-fast: OK (verify's declared-program self-test, cryogate's self-test, selfhost archive-comparison self-test, pin integrity)"
 
 # ---- language-server compile gate --------------------------------------
 # The LSP links the compiler as a LIBRARY (tools/CryoLSP/cryoconfig ->

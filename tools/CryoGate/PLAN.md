@@ -33,7 +33,8 @@ here.
 **Built so far:** G1's core (§8): the child runner, the scheduler, the
 heavy-run lock and `cryogate heavy`, the run logs, `cryogate selftest`, and
 `make cryogate`; the heavy Makefile targets run under the lock. Ported:
-`incr --instance`, `examples` and `vendor` (G4), `cross` (G7).
+`roster` and `census` (G2, G3), `incr --instance`, `examples` and `vendor`
+(G4), `cross` (G7).
 
 ---
 
@@ -179,8 +180,8 @@ compiler subcommand, because the compiler already holds the answer), **keep**
 | file | lines | what it does | verdict | why |
 |---|---:|---|---|---|
 | `scripts/verify.py` | 1214 | builds the baseline compiler in a clone, runs six gates at once, hashes every object, judges the declared programs; records the baseline per program and reuses a record whose inputs are unchanged; counts objects the prebuilt stdlib archive replaced and hashes the archives | **port** → `cryogate verify` | the orchestrator is the reason cryogate exists; the post-perf script is final, so it is ported as it stands (§7) |
-| `scripts/test-census.py` | 326 | runs `cryo test --format=plain`, reconciles counts and names against the roster golden | **port** → `cryogate census`, then **replace its parsing** with the runner's report (§4d) | rulings 271-272 move the counts into the runner; the reconciliation against the golden stays a gate |
-| `scripts/roster-check.py` | 543 | `--list` + project and negative fingerprints vs `tests/test-roster.txt`; `--merge`, `--update`, `--selftest` | **port** → `cryogate roster` | pure file reading plus one child; once `--list` lists all three suites, the filesystem enumeration moves into the runner and this shrinks to a diff and the merge |
+| `scripts/test-census.py` | 326 | runs `cryo test --format=plain`, reconciles counts and names against the roster golden | **ported** → `cryogate census` (script deleted; `verify.py` reads the parse from `cryogate census --read <log>`), then **replace its parsing** with the runner's report (§4d) | rulings 271-272 move the counts into the runner; the reconciliation against the golden stays a gate |
+| `scripts/roster-check.py` | 543 | `--list` + project and negative fingerprints vs `tests/test-roster.txt`; `--merge`, `--update`, `--selftest` | **ported** → `cryogate roster` (script deleted; its self-test cases are `![test]`s; it also refuses a `test.json` list field the runner would skip, which the script pinned as one assertion per character) | pure file reading plus one child; once `--list` lists all three suites, the filesystem enumeration moves into the runner and this shrinks to a diff and the merge |
 | `scripts/examples-gate.py` | 110 | builds every `examples/*` with a floor (`--min`) | **ported** → `cryogate examples` (script deleted; the floor raised from 14 to the 15 shipped) | small; the absolute forward-slash stdlib spelling is kept, though the objects no longer move with it (stdlib files are named `stdlib/<path>`) |
 | `scripts/check-examples-output.sh` | 96 | builds and runs five examples, diffs stdout with the goldens (POSIX) | **replace**: the examples' `expected.out` become `stdout_file` assertions (ruling 271), run by `cryogate examples --run` | runs on Windows too; the hard-coded list becomes "every example with an `expected.out`", keeping the two-way set check |
 | `scripts/valgrind-check.sh` | 73 | four examples under valgrind (Linux) | **port** → `cryogate examples --under=valgrind` | the same build-and-run loop with a runner prefix; one loop, not two |
@@ -253,6 +254,16 @@ compiler under test by a target like `lsp-check`'s, into
   already uses).
 - **On a Linux host inside WSL**, the same source builds with `bin/cryo`
   (the ELF pin) into the mirror's own `tools/CryoGate/build/`.
+- **In a fresh git worktree** (the `cryogate` branch is worked in one, beside
+  the main checkout), two things the build needs are per-checkout and not in
+  git, so set them up once before `make cryo` or `make cryogate`:
+  1. On Windows, copy the main checkout's `.toolchains/llvm-win/` into the
+     worktree's `.toolchains/` (gitignored, ~190 MB; the Windows LLVM
+     `make cryo` links against). It is never committed.
+  2. Run `make runtime-tiers` once: until `runtime/.bin/<triple>/` holds the
+     tier archives, nothing links (`__cryo_panic` undefined).
+
+  `.claude/settings.json` is per-checkout too (CLAUDE.md, Conventions).
 
 ### 4b. The core
 
@@ -515,6 +526,8 @@ Re-checked at `8828ddc3`: perf added none of these; the table stands.
 | 13 | **take a running child's pipes**: `Child.stdout()` / `stderr()` (or a take) after `spawn` with `Stdio::Piped` | `Child::new` stores them, nothing hands them out: a piped child's output is reachable only through `Command.output()`, after it exits | the census streaming its run (followed from the log file meanwhile), the LSP driver (G6) |
 | 14 | **join a list of strings** with a separator | absent; `core/text` holds cryogate's | every report that names several things |
 | 15 | **a command-line option parser** (flags, valued options in both spellings, positionals, `--`) | absent; `core/options` holds cryogate's | every subcommand; the compiler's own CLI parses by hand too |
+| 16 | **sorted and distinct**: `Array.dedup` after a sort, or an ordered set, and set difference on `HashSet` | absent; `Text::sorted_distinct` and the census's `without` hold cryogate's | the roster and census (every golden comparison), verify's moved lists |
+| 17 | **a cursor over a `Str`**: consume a literal, a word, a whitespace-delimited token, up to a delimiter, skip whitespace | absent (`split_once` and `strip_prefix` cover one step each); `core/text`'s `Scanner` holds cryogate's | every fixed-shape line match a gate makes (the census's runner lines, the roster's directive and function lines) |
 
 **For the lanes, later** (Decision 11 keeps these private to the tool,
 through `extern "C"` declarations in `tools/CryoGate`, not public API):
@@ -602,23 +615,20 @@ does (§9, point 2).
 **Status.** G1's core is built (the child runner, the scheduler with CPU
 slots and a declared-cost memory budget, the heavy-run lock and `cryogate
 heavy`, run logs, `cryogate selftest` over `cryogate probe`, `make
-cryogate`), with the option parser (`core/options`) and the tree copy
-(`core/tree`); the tree listing and the git helper are built with the first
-gate that calls them, since a helper nothing calls is dead code. Its self-test
-is green on both hosts' stdlib since the `Command` working-directory double
-free was fixed. **Ported:** `cross` (G7), `incr --instance`, `vendor` and `examples` (G4's
-build sweep; its `--run` goldens and `--under=valgrind` modes are still the
-shell scripts), with `core/text` (lines, joining) beside the core.
+cryogate`), with the option parser (`core/options`), the tree copy and file
+listing (`core/tree`); the git helper is built with the first gate that calls
+it, since a helper nothing calls is dead code. Its self-test is green on both
+hosts' stdlib since the `Command` working-directory double free was fixed.
+**Ported:** `roster` and `census` together (G2, G3: the census reads the
+roster's `![target]` waiver, and `verify.py` reads the census's parse of a
+baseline run from `cryogate census --read <log>`, one JSON record), `cross`
+(G7), `incr --instance`, `vendor` and `examples` (G4's build sweep; its
+`--run` goldens and `--under=valgrind` modes are still the shell scripts),
+with `core/text` (lines, joining, a line scanner) beside the core.
+`check-fast` runs `cryogate selftest` (so it builds cryogate), which carries
+the roster merge's self-test cases.
 
-**The Python gates import each other**, which the unit table above does not
-show: `test-census.py` loads `roster-check.py` for its reading of the
-`![target]` gates, and `verify.py` loads `test-census.py` for its parse and
-its pinned unit names (the baseline census's records). So `roster-check.py`
-cannot be deleted while the census is Python, nor `test-census.py` while
-verify is: G2 and G3 land together, and verify needs the census parse from
-cryogate before G3's deletion (question 13).
-
-**What can start now, beside stdlib work, without clashing:** G2-G12. They
+**What can start now, beside stdlib work, without clashing:** G4-G12. They
 touch only `tools/CryoGate`, new Makefile lines, a gate's row in `verify.py`'s
 table, and the Python files they delete. G5 needs sha256 from the stdlib
 branch, or waits. G6 needs the child-pipe API.
@@ -844,7 +854,11 @@ by hand until cryogate takes it); 7 A (rebase `cryogate` onto
 9 A (replacing every Python gate is a must for 1.0; a gate cryogate makes
 unnecessary counts); 10 A (regression export is a must); 11 B (gate ports on
 `cryogate`, lanes and the overflow work on a later `test-infra` branch);
-12 A (gate ports, then overflow, then lanes).
+12 A (gate ports, then overflow, then lanes). Question 13 was answered A by
+the session dispatcher on Jake's behalf (roster and census together, verify
+reading the census parse from cryogate); the new spellings (`cryogate incr
+--instance`, `examples`, `vendor`, `cross`, `roster`, `census`, Makefile
+`pin-impl`) are in use and await Jake's approval.
 
 1. **The home** (supersedes test-infra Decisions 8 and 17). A:
    `tools/CryoGate` holds everything: the pin-built orchestrator `cryogate`

@@ -22,6 +22,30 @@ public type struct Text {
         return lines;
     }
 
+    /// `lines` sorted, each distinct line once.
+    public static sorted_distinct(lines: Array<String>) -> Array<String> {
+        mut sorted: Array<String> = lines;
+        sorted.sort();
+        mut distinct: Array<String> = Array::<String>::new();
+        for (line in sorted.iter_ref()) {
+            if (distinct.is_empty() || distinct.get_ref(distinct.length() - 1).unwrap().as_str() != line.as_str()) {
+                distinct.push(line.clone());
+            }
+        }
+        return distinct;
+    }
+
+    /// Whether `text` is one or more ASCII digits.
+    public static is_digits(text: Str) -> boolean {
+        if (text.is_empty()) { return false; }
+        mut index: i64 = 0;
+        while (index < text.length()) {
+            if (!text.byte_at(index).unwrap().is_digit()) { return false; }
+            index++;
+        }
+        return true;
+    }
+
     /// `parts` with `separator` between each two.
     public static joined(parts: &Array<String>, separator: Str) -> String {
         mut out: String = String::new();
@@ -33,4 +57,67 @@ public type struct Text {
         }
         return out;
     }
+}
+
+/// A cursor over one line of a child's output or a source file, reading it
+/// left to right a piece at a time: the fixed-shape line matches a gate
+/// makes, written as prefixes, words and tokens.  Whitespace is ASCII
+/// whitespace (space, tab, line feed, vertical tab, form feed, carriage
+/// return); a word is a run of ASCII letters, digits and `_`; a token is a
+/// run of anything but whitespace.
+public type struct Scanner {
+    text: Str;
+    position: i64;
+
+    public static new(text: Str) -> Scanner { return Scanner { text: text, position: 0 }; }
+
+    /// Skip whitespace; the number of bytes skipped.
+    public skip_whitespace(mut &this) -> i64 {
+        const start: i64 = this.position;
+        while (this.position < this.text.length() && this.text.byte_at(this.position).unwrap().is_whitespace()) { this.position++; }
+        return this.position - start;
+    }
+
+    /// Consume `expected` if the text continues with it.
+    public literal(mut &this, expected: Str) -> boolean {
+        if (!this.rest().starts_with(&expected)) { return false; }
+        this.position = this.position + expected.length();
+        return true;
+    }
+
+    /// Consume a word, if one starts here.
+    public word(mut &this) -> Option<Str> {
+        const start: i64 = this.position;
+        while (this.position < this.text.length() && Scanner::is_word_byte(this.text.byte_at(this.position).unwrap())) { this.position++; }
+        if (this.position == start) { return Option::None; }
+        return Option::Some(this.text.sub_bytes(start, this.position));
+    }
+
+    /// Consume a token, if one starts here.
+    public token(mut &this) -> Option<Str> {
+        const start: i64 = this.position;
+        while (this.position < this.text.length() && !this.text.byte_at(this.position).unwrap().is_whitespace()) { this.position++; }
+        if (this.position == start) { return Option::None; }
+        return Option::Some(this.text.sub_bytes(start, this.position));
+    }
+
+    /// Consume everything up to the next `delimiter`, which is left
+    /// unconsumed; `None`, consuming nothing, when no `delimiter` follows.
+    public until(mut &this, delimiter: Str) -> Option<Str> {
+        match (this.rest().find(&delimiter)) {
+            Option::Some(offset) => {
+                const start: i64 = this.position;
+                this.position = this.position + offset;
+                return Option::Some(this.text.sub_bytes(start, this.position));
+            }
+            Option::None => { return Option::None; }
+        }
+    }
+
+    /// What has not been consumed.
+    public rest(&this) -> Str { return this.text.sub_bytes(this.position, this.text.length()); }
+
+    public at_end(&this) -> boolean { return this.position >= this.text.length(); }
+
+    static is_word_byte(byte: u8) -> boolean { return byte.is_alpha() || byte.is_digit() || byte == '_'; }
 }

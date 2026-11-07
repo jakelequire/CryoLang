@@ -33,8 +33,8 @@ make verify              # build once; census, examples, lsp, cross, incr, check
                          # a program the baseline built, in tests/started-passing
 make roster-check        # every unit test, project and negative file against the roster
                          # golden (tests/test-roster.txt); its OK line prints the current counts
-make check-fast          # verify's and verify-pin's self-tests + pin integrity, builds nothing.
-                         # Run before committing.
+make check-fast          # verify's, verify-pin's and cryogate's self-tests + pin integrity;
+                         # builds only cryogate, with the pin. Run before committing.
 make lsp-check           # compile tools/CryoLSP with the compiler under test
 make cross-check         # runtime/stdlib/compiler/LSP for the OTHER OS, objects only, ~80s;
                          # from WINDOWS only - a Linux host links the windows-gnu
@@ -72,9 +72,9 @@ only things that run are what a person or an agent runs.
 
 So:
 
-- **`make check-fast`** before committing: verify's and verify-pin's
-  self-tests and pin integrity. It builds nothing and takes seconds, so it is
-  no evidence about the compiler; `make verify` is.
+- **`make check-fast`** before committing: verify's, verify-pin's and
+  cryogate's self-tests and pin integrity. It builds only cryogate, with the
+  pin, so it is no evidence about the compiler; `make verify` is.
 - **No commit hook runs.** Nothing refuses a commit; the gates above are
   what a person or an agent runs.
 

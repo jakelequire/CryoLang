@@ -1,0 +1,245 @@
+///! The roster's and the census's decisions: the merge into the golden, the
+///! reading of `![target]` gates, the fingerprints, and the census's parse
+///! of a runner's output and its judgement against the pinned corpus.
+![config(testing)]
+namespace cryogate::tests::roster;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::json::parser;
+import std::json::value::{ JsonValue };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_false };
+
+import cryogate::core::host::{ Host };
+import cryogate::core::text::{ Text };
+import cryogate::gates::census::{ Census, CensusReading, Pinned };
+import cryogate::gates::roster::{ Merge, Roster, TestGates };
+
+type struct Fixture {
+    /// The lines of `text`, one per line break.
+    static lines(text: Str) -> Array<String> { return Text::lines(text); }
+
+    /// The OS that is not this host.
+    static other_os() -> Str {
+        if (Host::os() == Str::new("windows")) { return Str::new("linux"); }
+        return Str::new("windows");
+    }
+
+    /// Whether `list` holds `entry`.
+    static holds(list: &Array<String>, entry: Str) -> boolean { return list.contains(&String::from_str(entry)); }
+
+    /// A golden whose lines take every path through the merge, merged with
+    /// a discovery that changed, kept, added and lost some of them.
+    static merge() -> Merge {
+        const golden: Array<String> = Text::sorted_distinct(Fixture::lines(Str::new(
+            "project shelf: outcome=run fails=0 asserts=19 requires=- ignore=0\n"
+            "negative bad.cryo: E0100 annotations=1\n"
+            "CryoTests::Process::windows_case: test\n"
+            "CryoTests::Gone::vanished: test\n"
+            "CryoTests::Here::stays: test\n")));
+        const entries: Array<String> = Text::sorted_distinct(Fixture::lines(Str::new(
+            "project shelf: outcome=run fails=0 asserts=20 requires=- ignore=0\n"
+            "negative bad.cryo: E0100 annotations=2\n"
+            "CryoTests::Here::stays: test\n"
+            "CryoTests::Here::arrives: test\n")));
+        mut gates: TestGates = TestGates::new();
+        gates.gate(Str::new("windows_case"), Fixture::other_os());
+        return Roster::merge(&entries, &golden, &gates);
+    }
+}
+
+![test]
+function a_changed_line_is_replaced_and_reported_as_replaced() -> Result<(), TestError> {
+    const merge: Merge = Fixture::merge();
+    expect_false(Fixture::holds(&merge.merged, Str::new("project shelf: outcome=run fails=0 asserts=19 requires=- ignore=0")), Str::new("the old project line goes"))?;
+    expect(Fixture::holds(&merge.merged, Str::new("project shelf: outcome=run fails=0 asserts=20 requires=- ignore=0")), Str::new("the new project line comes"))?;
+    expect_false(Fixture::holds(&merge.merged, Str::new("negative bad.cryo: E0100 annotations=1")), Str::new("the old negative line goes"))?;
+    expect(Fixture::holds(&merge.merged, Str::new("negative bad.cryo: E0100 annotations=2")), Str::new("the new negative line comes"))?;
+    expect(merge.replaced.length() == 2, Str::new("two replacements"))?;
+    const first: Pair<String, String>* = merge.replaced.get_ref(0).unwrap();
+    expect(first.first.as_str() == Str::new("negative bad.cryo: E0100 annotations=1"), Str::new("sorted by the pinned line"))?;
+    return expect(first.second.as_str() == Str::new("negative bad.cryo: E0100 annotations=2"), Str::new("paired with what replaced it"));
+}
+
+![test]
+function a_replacement_is_not_counted_as_added() -> Result<(), TestError> {
+    const merge: Merge = Fixture::merge();
+    expect(merge.added.length() == 1, Str::new("one addition"))?;
+    return expect(merge.added.get_ref(0).unwrap().as_str() == Str::new("CryoTests::Here::arrives: test"), Str::new("the new test"));
+}
+
+![test]
+function a_test_gated_to_another_os_is_kept() -> Result<(), TestError> {
+    const merge: Merge = Fixture::merge();
+    expect(Fixture::holds(&merge.merged, Str::new("CryoTests::Process::windows_case: test")), Str::new("kept in the golden"))?;
+    expect(merge.other_platform.length() == 1, Str::new("named once"))?;
+    return expect(merge.other_platform.get_ref(0).unwrap().as_str() == Str::new("CryoTests::Process::windows_case: test"), Str::new("as the other platform's"));
+}
+
+![test]
+function an_ungated_absent_test_is_kept_and_named() -> Result<(), TestError> {
+    const merge: Merge = Fixture::merge();
+    expect(Fixture::holds(&merge.merged, Str::new("CryoTests::Gone::vanished: test")), Str::new("kept in the golden"))?;
+    expect(merge.absent.length() == 1, Str::new("named once"))?;
+    return expect(merge.absent.get_ref(0).unwrap().as_str() == Str::new("CryoTests::Gone::vanished: test"), Str::new("as absent"));
+}
+
+![test]
+function an_unchanged_line_stays_once() -> Result<(), TestError> {
+    const merge: Merge = Fixture::merge();
+    mut count: i64 = 0;
+    for (line in merge.merged.iter_ref()) {
+        if (line.as_str() == Str::new("CryoTests::Here::stays: test")) { count++; }
+    }
+    expect(count == 1, Str::new("once"))?;
+    return expect(merge.merged.length() == 6, Str::new("four discovered, one other platform's, one absent"));
+}
+
+![test]
+function a_target_directive_in_the_run_above_a_test_gates_it() -> Result<(), TestError> {
+    mut gates: TestGates = TestGates::new();
+    gates.add_source(Str::new(
+        "![target(windows)]\n"
+        "![test]\n"
+        "function only_windows() -> Result<(), TestError> {\n"
+        "}\n"
+        "![test]\n"
+        "  ![ target ( \"unix\" ) ]  \n"
+        "public function only_unix() -> Result<(), TestError> {\n"
+        "![target(linux)]\n"
+        "// a comment ends the run\n"
+        "![test]\n"
+        "function ungated() -> Result<(), TestError> {\n"
+        "![target(linux)]\n"
+        "function not_a_test() -> i32 {\n"
+        "![test]\n"
+        "![target(windows)]\n"
+        "function twice() -> Result<(), TestError> {\n"
+        "![test]\n"
+        "![target(linux)]\n"
+        "function twice() -> Result<(), TestError> {\n"));
+    expect(gates.target_of(Str::new("only_windows")).unwrap_or(Str::new("")) == Str::new("windows"), Str::new("a gate directly above"))?;
+    expect(gates.target_of(Str::new("only_unix")).unwrap_or(Str::new("")) == Str::new("unix"), Str::new("spaced and quoted"))?;
+    expect(gates.target_of(Str::new("ungated")).is_none(), Str::new("a comment ends the run"))?;
+    expect(gates.target_of(Str::new("not_a_test")).is_none(), Str::new("only a test is gated"))?;
+    return expect(gates.target_of(Str::new("twice")).is_none(), Str::new("one name gated to two systems excuses neither"));
+}
+
+![test]
+function only_a_unit_entry_gated_to_another_os_is_elsewhere() -> Result<(), TestError> {
+    mut gates: TestGates = TestGates::new();
+    gates.gate(Str::new("away"), Fixture::other_os());
+    gates.gate(Str::new("here"), Host::os());
+    gates.gate(Str::new("shelf"), Fixture::other_os());
+    expect(gates.elsewhere(Str::new("CryoTests::A::away: test")), Str::new("gated to the other OS"))?;
+    expect_false(gates.elsewhere(Str::new("CryoTests::A::here: test")), Str::new("gated to this host"))?;
+    expect_false(gates.elsewhere(Str::new("CryoTests::A::loose: test")), Str::new("not gated"))?;
+    return expect_false(gates.elsewhere(Str::new("project shelf: outcome=run fails=0 asserts=1 requires=- ignore=0")), Str::new("a project is never excused"));
+}
+
+![test]
+function a_negative_files_code_is_read_by_the_suites_rule() -> Result<(), TestError> {
+    expect(Roster::negative_code(Str::new("![config(testing)]\n![config(negative, E0233)]\n")) == Str::new("E0233"), Str::new("after the comma"))?;
+    expect(Roster::negative_code(Str::new("![config(negative,,  W0005 )]")) == Str::new("W0005"), Str::new("commas and spaces skipped"))?;
+    expect(Roster::negative_code(Str::new("![config(negative, E0100]")) == Str::new("E0100"), Str::new("a bracket ends it"))?;
+    expect(Roster::negative_code(Str::new("![config(negative, ABCDEFGHIJKLMNOPQRSTUVWXYZ)]")) == Str::new("ABCDEFGHIJKLMNOPQRSTUVW"), Str::new("at most 23 bytes"))?;
+    return expect(Roster::negative_code(Str::new("![config(testing)]\n")).is_empty(), Str::new("no directive, no code"));
+}
+
+![test]
+function a_project_line_counts_what_the_runner_checks() -> Result<(), TestError> {
+    const specification: JsonValue = parser::parse(Str::new(
+        "{\"outcome\": \"compile_fail\", \"requires\": [\"cxx\", \"display\"], \"ignore\": true,"
+        " \"expect\": {\"exit_code\": 1, \"diagnostic\": \"E0233\", \"output_contains\": [\"a\", \"b\"], \"file_excludes\": [\"c\"]}}")).unwrap();
+    expect(Roster::project_line(Str::new("p"), &specification).as_str() == Str::new("project p: outcome=compile_fail fails=1 asserts=5 requires=cxx,display ignore=1"), Str::new("every term"))?;
+    const bare: JsonValue = parser::parse(Str::new("{}")).unwrap();
+    return expect(Roster::project_line(Str::new("q"), &bare).as_str() == Str::new("project q: outcome=collect fails=0 asserts=0 requires=- ignore=0"), Str::new("the defaults"));
+}
+
+![test]
+function a_string_where_the_runner_reads_a_list_is_refused() -> Result<(), TestError> {
+    const string_field: JsonValue = parser::parse(Str::new("{\"expect\": {\"stderr_contains\": \"the owner panicked\"}}")).unwrap();
+    const problems: Array<String> = Roster::unread_lists(&string_field);
+    expect(problems.length() == 1, Str::new("one problem"))?;
+    expect(problems.get_ref(0).unwrap().as_str().contains(&Str::new("`expect.stderr_contains`")), Str::new("naming the field"))?;
+    const number_element: JsonValue = parser::parse(Str::new("{\"requires\": [\"cxx\", 3]}")).unwrap();
+    expect(Roster::unread_lists(&number_element).length() == 1, Str::new("an element that is not a string"))?;
+    const lists: JsonValue = parser::parse(Str::new("{\"requires\": [\"cxx\"], \"expect\": {\"output_in_order\": [\"a\", \"b\"]}}")).unwrap();
+    return expect(Roster::unread_lists(&lists).is_empty(), Str::new("lists of strings are read"));
+}
+
+![test]
+function the_census_reads_the_summary_blocks_and_the_project_lines() -> Result<(), TestError> {
+    const lines: Array<String> = Fixture::lines(Str::new(
+        "ok    A::one\r\n"
+        "FAIL  A::two\r\n"
+        "skip  A::three\r\n"
+        "test A::four ... ok\r\n"
+        "test (negative) E0001_x.cryo ... ok\r\n"
+        "  unit test summary\r\n"
+        "    passed        2\r\n"
+        "    failed        1\r\n"
+        "    ignored       1\r\n"
+        "    result   FAIL\r\n"
+        "ok    A::late\r\n"
+        "  compile-fail summary\r\n"
+        "    passed      1\r\n"
+        "test (project) collect_one ... ok (12 tests)\r\n"
+        "test (project) plain ... ok\r\n"
+        "test (project) leaky ... The system cannot find the path specified.\r\n"
+        "skipped (requires cxx)\r\n"
+        "test (project) dormant ... ignored\r\n"
+        "test (project) broken ... FAILED (exit 1, expected 0)\r\n"
+        "  unit test summary\r\n"
+        "    passed      99\r\n"
+        "  projects summary\r\n"
+        "    passed        2\r\n"
+        "    failed        1\r\n"));
+    const reading: CensusReading = CensusReading::of(&lines);
+    expect(reading.first_summary == 5, Str::new("the first summary's line"))?;
+    expect(reading.unit_names.length() == 4, Str::new("the unit lines before the unit summary"))?;
+    expect(reading.unit_names.get_ref(3).unwrap().as_str() == Str::new("A::four"), Str::new("the sequential runner's line"))?;
+    expect(reading.unit.printed && reading.unit.passed == 2 && reading.unit.failed == 1 && reading.unit.ignored == 1, Str::new("the unit rows"))?;
+    expect(reading.compile_fail.printed && reading.compile_fail.passed == 1, Str::new("the compile-fail rows"))?;
+    expect(reading.projects.printed && reading.projects.passed == 2 && reading.projects.failed == 1, Str::new("the project rows"))?;
+    expect(reading.reached.length() == 5, Str::new("every project reached"))?;
+    expect(reading.skipped.length() == 1, Str::new("one skip"))?;
+    expect(reading.skipped.get_ref(0).unwrap().first.as_str() == Str::new("leaky"), Str::new("found off the line a probe pushed it onto"))?;
+    expect(reading.skipped.get_ref(0).unwrap().second.as_str() == Str::new("cxx"), Str::new("with its requirement"))?;
+    expect(reading.ignored == 1, Str::new("one ignored"))?;
+    expect(*reading.passed_counts.get_ref(&String::from_str(Str::new("collect_one"))).unwrap() == 12, Str::new("a collect project's count"))?;
+    expect(*reading.passed_counts.get_ref(&String::from_str(Str::new("plain"))).unwrap() == 0, Str::new("a bare ok"))?;
+    return expect_false(reading.passed_counts.contains_key(&String::from_str(Str::new("broken"))), Str::new("a failure is not a pass"));
+}
+
+![test]
+function the_census_refuses_what_did_not_account_for_the_corpus() -> Result<(), TestError> {
+    const pinned: Pinned = Pinned {
+        unit: Text::sorted_distinct(Fixture::lines(Str::new("A::one\nA::two\n"))),
+        negatives: 1,
+        projects: Text::sorted_distinct(Fixture::lines(Str::new("empty_collect\nreached\n"))),
+        elsewhere: Array::<String>::new(),
+        collect: Text::sorted_distinct(Fixture::lines(Str::new("empty_collect\n"))),
+    };
+    const good: CensusReading = CensusReading::of(&Fixture::lines(Str::new(
+        "ok    A::one\nok    A::two\n  unit test summary\n    passed 2\n  compile-fail summary\n    passed 1\n"
+        "test (project) empty_collect ... ok (3 tests)\ntest (project) reached ... ok\n  projects summary\n    passed 2\n")));
+    expect(Census::judge(&pinned, &good).is_empty(), Str::new("a run accounting for everything"))?;
+    const bad: CensusReading = CensusReading::of(&Fixture::lines(Str::new(
+        "ok    A::one\nok    A::extra\n  unit test summary\n    passed 2\n"
+        "test (project) empty_collect ... ok (0 tests)\n  projects summary\n    passed 1\n")));
+    const problems: Array<String> = Census::judge(&pinned, &bad);
+    const report: String = Text::joined(&problems, Str::new("\n"));
+    expect(report.as_str().contains(&Str::new("unit: A::two is pinned but did not run")), Str::new("a pinned test that did not run"))?;
+    expect(report.as_str().contains(&Str::new("unit: A::extra ran but is not pinned")), Str::new("a test that is not pinned"))?;
+    expect(report.as_str().contains(&Str::new("compile-fail: no summary block was printed at all")), Str::new("a suite that printed nothing"))?;
+    expect(report.as_str().contains(&Str::new("projects: accounted for 1 of 2 pinned")), Str::new("the project count"))?;
+    expect(report.as_str().contains(&Str::new("projects: reached is pinned but the runner never reached it")), Str::new("by name"))?;
+    expect(report.as_str().contains(&Str::new("projects: empty_collect passed on its exit code with no tests run")), Str::new("a collect project that ran nothing"))?;
+    return expect(problems.length() == 6, Str::new("and nothing else"));
+}
