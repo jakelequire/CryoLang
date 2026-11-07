@@ -87,11 +87,13 @@ PIN_EXE      := $(ROOT)/bin/cryo.exe
 # NO_TRIPLE_GOALS build nothing and read no archive, so when every goal given
 # is one of them the pin is not launched; any other goal asks once, up front.
 #
-# The answer is kept in `compiler/build/host-triple.mk`, remade when the pin
-# is newer than it, so a build that changes nothing does not launch the pin
-# to ask: starting it costs more than the rest of a no-change `make cryo`.
+# The answer is kept in `compiler/build/host-triple-<os>.mk`, remade when the
+# pin is newer than it, so a build that changes nothing does not launch the
+# pin to ask: starting it costs more than the rest of a no-change `make cryo`.
+# One file per host OS: a Windows checkout's `compiler/build` is the one WSL
+# builds in, and each host's pin answers its own triple.
 NO_TRIPLE_GOALS := help clean check-fast verify-selftest verify-pin verify-pin-clean
-HOST_TRIPLE_MK  := $(ROOT)/compiler/build/host-triple.mk
+HOST_TRIPLE_MK  := $(ROOT)/compiler/build/host-triple-$(HOST_OS).mk
 ifneq ($(filter-out $(NO_TRIPLE_GOALS),$(or $(MAKECMDGOALS),help)),)
 -include $(HOST_TRIPLE_MK)
 ifeq ($(HOST_OS),windows)
