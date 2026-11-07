@@ -2168,6 +2168,14 @@ type struct Sink<W> {
 }
 ```
 
+The same holds for a **call** that needs a bound. A generic body that passes its own parameter to a function or method whose `where` clause bounds it is refused at the call (E0306) unless a bound in scope gives that trait - the body's own clause, a trait it is a supertrait of, the enclosing `implement` block's or the type declaration's - whether or not anything instantiates the body. A structural marker (`Copy`, `Send`, `Sync`) required of a type that names a parameter (`Wrap<T>: Send`) is decided by each instantiation, since such a type has no shape to walk until its parameters are bound.
+
+```cryo
+function largest<T>(a: T, b: T) -> T where T: Ord { if (a > b) { return a; } return b; }
+function pick<T>(a: T, b: T) -> T { return largest(a, b); }                   // error[E0306]: the trait bound `T: Ord` is not satisfied
+function pick_ordered<T>(a: T, b: T) -> T where T: Ord { return largest(a, b); }  // fine
+```
+
 The same holds for **operators** and **fields**. An operator applies to a parameter only when a bound licenses it - the language's own trait for that operator (`Add` for `+`, `Ord` for `<`, `Eq` for `==`; see [section 10.6](#106-operator-overloading)) - and a bound never gives a parameter fields, whatever the type it is later instantiated with declares. Both are refused on the generic body, whether or not anything instantiates it:
 
 ```cryo

@@ -1,0 +1,72 @@
+// E0306: a generic body that passes its own type parameter to a function
+// whose `where` clause bounds it is refused at the call unless a bound in
+// scope of the body gives that trait - its own clause, a trait that has it
+// as a supertrait, or the clause of the implementation the method sits in.
+// Every copy of the body makes the call, so the body is judged as written,
+// not one instantiation at a time.
+![config(testing)]
+![config(negative, E0306)]
+namespace CryoTests::Negative::E0306GenericCallerBoundNotInScope;
+
+import std::core::cmp::{ Eq, Ord };
+
+function largest<T>(a: T, b: T) -> T where T: Ord {
+    if (a > b) { return a; }
+    return b;
+}
+
+function same<T>(a: &T, b: &T) -> boolean where T: Eq {
+    return a.equals(b);
+}
+
+// Refused: `T` has no bound at all.
+function pick<T>(a: T, b: T) -> T {
+    return largest(a, b);   //~ ERROR[E0306] the trait bound `T: Ord` is not satisfied
+}
+
+// Refused: `Eq` does not give `Ord`.
+function pick_equal<T>(a: T, b: T) -> T where T: Eq {
+    return largest(a, b);   //~ ERROR[E0306] the trait bound `T: Ord` is not satisfied
+}
+
+// Refused through an explicit type argument too.
+function pick_named<T>(a: T, b: T) -> T {
+    return largest::<T>(a, b);   //~ ERROR[E0306] the trait bound `T: Ord` is not satisfied
+}
+
+type struct Shelf<T> {
+    item: T;
+
+    // Refused: the method's own `U` is passed on unbounded.
+    match_item<U>(&this, a: &U, b: &U) -> boolean {
+        return same(a, b);   //~ ERROR[E0306] the trait bound `U: Eq` is not satisfied
+    }
+}
+
+// Compiles: the bound is written.
+function pick_ordered<T>(a: T, b: T) -> T where T: Ord {
+    return largest(a, b);
+}
+
+// Compiles: `Ord` has `Eq` as a supertrait.
+function equal_ordered<T>(a: &T, b: &T) -> boolean where T: Ord {
+    return same(a, b);
+}
+
+type struct Pair<T> {
+    left: T;
+    right: T;
+}
+
+// Compiles: the implementation's clause bounds the owner's `T`.
+implement<T> trait Eq for struct Pair<T> where T: Eq {
+    equals(&this, other: &Pair<T>) -> boolean {
+        return same(&this.left, &other.left) && same(&this.right, &other.right);
+    }
+}
+
+function main() -> int {
+    const a: i32 = pick_ordered(1, 2);
+    if (!equal_ordered(&a, &a)) { return 1; }
+    return a - 2;
+}

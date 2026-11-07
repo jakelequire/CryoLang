@@ -4888,7 +4888,9 @@ type struct CallResolver {
     /// that names no parameter by an implementation, and an instantiation
     /// that names one by an implementation whose own clause the bounds in
     /// scope give.  A type that is neither - a projection, a parameter of an
-    /// implementation nothing bound - is left to the copy that binds it.
+    /// implementation nothing bound - is left to the copy that binds it, as
+    /// is a structural marker (`Send`) on a type that names a parameter,
+    /// which has no shape to walk until a copy binds it.
     scope_gives(mut &this, subject: TypeRef, trait_def: DefId, args: &[TypeRef], depth: i32) -> boolean {
         if (depth >= 8) { return true; }
         const t: Type* = this.arena.lookup(subject);
@@ -4923,7 +4925,9 @@ type struct CallResolver {
             if (args.length() == 0) { return this.trait_checker().type_implements_trait(subject, trait_def, 0); }
             return this.trait_checker().implementation_at(trait_def, args, subject) != null;
         }
-        if (t.kind != TypeKind::InstantiatedType) { return true; }
+        if (t.kind != TypeKind::InstantiatedType || this.trait_checker().is_structural_marker(trait_def)) {
+            return true;
+        }
         const heads: [DeclarationNode*] = this.ctx.generic_registry.heads_for(trait_def, subject, this.intern);
         for (mut hi: i64 = 0; hi < heads.length(); hi++) {
             const head: mut ImplBlock* = DeclarationNode::impl_of(heads[hi]);
@@ -8563,6 +8567,10 @@ type struct CallResolver {
     /// symbols the type parameters were declared as).
     /// Emits the bound failure and returns false on the first unsatisfied bound;
     /// true when every bound holds (or the arg is still abstract/skippable).
+    /// A bound the generic body's own scope does not give
+    /// (`unmet_call_bound_in_scope`) is reported and still answers true:
+    /// its bindings are the body's parameters, so the call's type is known
+    /// and typing it on spares the uses of its value a second report.
     /// Shared by the free-function and static-method-template call paths and
     /// a generic function or method taken as a value; `at` is the use's span.
     check_call_where_bounds(mut &this, at: SourceSpan, tmpl_decl: DeclarationNode*,
@@ -8570,9 +8578,87 @@ type struct CallResolver {
         mut concrete: TypeRef = TypeRef::invalid();
         mut shown: SymbolStr = SymbolStr::empty();
         const tref: const TraitRef* = this.unmet_call_bound(tmpl_decl, param_syms, bindings, &concrete, &shown);
-        if (tref == null) { return true; }
-        this.emit_free_call_bound_failure(at, tmpl_decl, tref, concrete, shown);
-        return false;
+        if (tref != null) {
+            this.emit_free_call_bound_failure(at, tmpl_decl, tref, concrete, shown);
+            return false;
+        }
+        mut subject: TypeRef = TypeRef::invalid();
+        mut required: string = "";
+        const scoped: const TraitRef* = this.unmet_call_bound_in_scope(tmpl_decl, param_syms, bindings,
+            &subject, &required);
+        if (scoped != null) { this.emit_call_bound_not_in_scope(at, tmpl_decl, scoped, subject, required); }
+        return true;
+    }
+
+    /// The first where-clause bound of `tmpl_decl` that the bounds in scope
+    /// of the generic body being walked do not give, once its parameters
+    /// `param_syms` are bound to `bindings` and the bound's subject still
+    /// names the body's own parameters: `pick<T>` passing its `T` to
+    /// `largest<T> where T: Ord` holds only in a body that bounds `T: Ord`.
+    /// The subject is written through `out_subject` and the trait, as it is
+    /// required, through `out_trait`.  A body the user did not write where
+    /// it stands is skipped, as is a bound on a concrete subject, which
+    /// `unmet_call_bound` judges.  Null when the scope gives every bound.
+    unmet_call_bound_in_scope(mut &this, tmpl_decl: DeclarationNode*, param_syms: &[SymbolID],
+                              bindings: &[TypeRef], out_subject: mut TypeRef*,
+                              out_trait: mut string*) -> const TraitRef* {
+        if (!this.state.in_symbolic_check || !this.walks_written_body()) { return null; }
+        const tmpl: FunctionDecl* = DeclarationNode::fn_of(tmpl_decl);
+        if (tmpl == null || tmpl.trait_bounds.length() == 0) { return null; }
+        mut subst: TypeSubstitution = TypeSubstitution::empty();
+        for (mut i: i64 = 0; i < param_syms.length() && i < bindings.length(); i++) {
+            if (!bindings[i].is_valid()) { continue; }
+            subst.add(this.arena.create_generic_param(param_syms[i], SymbolStr::empty(), i as u64), bindings[i]);
+        }
+        const checker: TraitChecker = this.trait_checker();
+        for (mut bi: i64 = 0; bi < tmpl.trait_bounds.length(); bi++) {
+            const bound: TraitBound* = &tmpl.trait_bounds[bi];
+            if (bound.has_projection_subject()) { continue; }
+            const subject: TypeRef = if (bound.subject_param().is_valid()) {
+                checker.lookup_subst_for_param(bound.subject_param(), &subst)
+            } else {
+                subst.apply(bound.subject_type, this.arena)
+            };
+            if (!subject.is_valid() || !this.types.contains_generic_param(subject)) { continue; }
+            for (mut ri: i64 = 0; ri < bound.trait_refs.length(); ri++) {
+                const tr: const TraitRef* = &bound.trait_refs[ri];
+                if (tr.path.length() == 0 || tr.refused || !tr.definition().is_valid()) { continue; }
+                mut args: [TypeRef] = [];
+                for (mut ai: i64 = 0; ai < tr.argument_types.length(); ai++) {
+                    args.push(subst.apply(tr.argument_types[ai], this.arena));
+                }
+                if (this.scope_gives(subject, tr.definition(), &args, 0)) { continue; }
+                *out_subject = subject;
+                *out_trait = checker.trait_as_required(tr, &subst);
+                return tr;
+            }
+        }
+        return null;
+    }
+
+    /// E0306 at a generic call whose bound `tref`, required of `subject` as
+    /// `required`, no bound of the generic body being walked gives.  A
+    /// subject that is one of the body's parameters carries the fix adding
+    /// the bound to the body's `where` clause.
+    emit_call_bound_not_in_scope(mut &this, at: SourceSpan, tmpl_decl: DeclarationNode*,
+                                 tref: const TraitRef*, subject: TypeRef, required: string) -> void {
+        const tmpl: FunctionDecl* = DeclarationNode::fn_of(tmpl_decl);
+        const subject_shown: string = this.types.type_display_name(subject);
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
+            fmt::format("the trait bound `%s: %s` is not satisfied", subject_shown, required));
+        d = d.at_with_label(at, fmt::format("`%s` needs `%s: %s`", this.intern.resolve(tmpl.name),
+            subject_shown, required));
+        d = d.also_at(tref.span, fmt::format("required by this bound in `%s`", this.intern.resolve(tmpl.name)));
+        d = d.with_note(fmt::format("no bound of this body gives `%s: %s`, so not every copy of it can make the call",
+            subject_shown, required));
+        const st: Type* = this.arena.lookup(subject);
+        if (st == null || st.kind != TypeKind::GenericParam) {
+            d = d.help(fmt::format("add the bound: `where %s: %s`", subject_shown, required));
+            this.ctx.emit_diagnostic(d);
+            return;
+        }
+        this.ctx.emit_diagnostic(this.binding.with_bound_fix(d, st.as_generic_param(), subject_shown, required,
+            Applicability::MachineApplicable));
     }
 
     /// E0306 for a method call that binds one of the method's type
