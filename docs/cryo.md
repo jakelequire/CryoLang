@@ -3540,7 +3540,7 @@ References (`&T` / `mut &T`) and raw pointers borrow; passing `&x` keeps `x` usa
 ```cryo
 const a: Buffer = make_buffer(1024);
 const b: Buffer = a;   // moves a -> b
-use(a);                // error E0452: use of moved value 'a'
+use(a);                // error E0452: use of moved value `a`
 ```
 
 Two move/ownership hazards that are unambiguous memory errors, called out as their own hard-error classes for clearer diagnostics, are:
