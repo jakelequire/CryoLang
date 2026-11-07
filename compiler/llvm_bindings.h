@@ -73,19 +73,12 @@ const char    *LLVMGetDataLayoutStr(LLVMModuleRef M);
 char          *LLVMPrintModuleToString(LLVMModuleRef M);
 LLVMBool       LLVMPrintModuleToFile(LLVMModuleRef M, const char *Filename, char **ErrorMessage);
 LLVMBool       LLVMVerifyModule(LLVMModuleRef M, int Action, char **OutMessage);
-/* Bitcode serialization for the multi-process object emitter: the main process
- * writes each module's bitcode, child processes parse it back and emit .o. */
-int            LLVMWriteBitcodeToFile(LLVMModuleRef M, const char *Path);
 /* A module's bitcode in memory: the incremental cache keys each module's
  * object on it. */
 LLVMMemoryBufferRef LLVMWriteBitcodeToMemoryBuffer(LLVMModuleRef M);
 const char    *LLVMGetBufferStart(LLVMMemoryBufferRef MemBuf);
 size_t         LLVMGetBufferSize(LLVMMemoryBufferRef MemBuf);
 void           LLVMDisposeMemoryBuffer(LLVMMemoryBufferRef MemBuf);
-LLVMBool       LLVMCreateMemoryBufferWithContentsOfFile(const char *Path, LLVMMemoryBufferRef *OutMemBuf, char **OutMessage);
-/* LLVMParseIRInContext parses textual OR bitcode IR and TAKES OWNERSHIP of
- * MemBuf (do not dispose it afterwards). */
-LLVMBool       LLVMParseIRInContext(LLVMContextRef ContextRef, LLVMMemoryBufferRef MemBuf, LLVMModuleRef *OutM, char **OutMessage);
 void           LLVMDumpModule(LLVMModuleRef M);
 LLVMContextRef LLVMGetModuleContext(LLVMModuleRef M);
 LLVMValueRef   LLVMGetFirstFunction(LLVMModuleRef M);

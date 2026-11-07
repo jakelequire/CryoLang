@@ -80,19 +80,10 @@ import compiler::types::generic_registry;
 import compiler::resolver::lang_item::{ LangModule };
 import utils::worker_pool::{ WorkerPool };
 
-// Default codegen worker count: the online CPU count.  Object emission is
-// parallelized by fanning each module out to a child `cryo __emit-obj` PROCESS
-// (see the codegen loop + `CodegenPasses::run_multiprocess_emit`): a process
-// boundary is required because in-process threading of LLVM codegen corrupts
-// process-global LLVM state (it crashed on both Linux and Windows).  The
-// multi-process path is byte-identical to serial and stable; it engages only
-// above `CODEGEN_MULTIPROC_MIN_MODULES` so small builds skip the spawn +
-// bitcode round-trip overhead.  `CRYO_CODEGEN_THREADS=N` overrides (1 = serial).
+// Default codegen worker count: the online CPU count.  Each module is emitted
+// on a worker thread in its own LLVM context (see the codegen loop).
+// `CRYO_CODEGEN_THREADS=N` overrides (1 = serial).
 function codegen_default_threads() -> u32 { return thread::available_parallelism(); }
-
-// Below this module count the bitcode round-trip + child-process spawn cost
-// outweighs the parallel-emit win, so codegen stays serial + in-process.
-const CODEGEN_MULTIPROC_MIN_MODULES: u32 = 16;
 
 type struct CompilerConfig {
     show_ast:           boolean;
@@ -1833,40 +1824,8 @@ type struct CompilerInstance {
             // `cg_threads` workers.  Default mode is IN-PROCESS THREADED: each
             // module has its own `LLVMContext` + target machine, so a
             // thread-enabled libLLVM emits them concurrently with no shared
-            // mutable state.  Two alternates via
-            // `CRYO_CODEGEN_MODE`:
-            //   * "process" - each object compiled by a child `cryo __emit-obj`
-            //     from bitcode (full process isolation; costs a bitcode
-            //     round-trip). Kept as a fallback / cross-check.
-            //   * "serial" - force single-threaded in-process emit.
-            // `cg_threads == 1` is serial regardless of mode.
-            const cg_mode: string = CompilerInstance::codegen_mode();
-            mut multiproc: boolean = cg_mode == "process"
-                && cg_threads > 1 && n >= CODEGEN_MULTIPROC_MIN_MODULES;
-            mut self_exe:  string = "";
-            if (multiproc) {
-                match (env::current_exe()) {
-                    Option::Some(s) => { self_exe = s.into_raw(); }
-                    Option::None    => { multiproc = false; }
-                }
-            }
-            // The out-of-process emitter builds its target machines in the
-            // workers, so a triple LLVM has no target for is refused here,
-            // once and before any IR is generated, as the in-process path
-            // refuses it at its first module.
-            if (multiproc) {
-                const mp_check_triple: string = CodegenPasses::effective_triple(ctx);
-                match (LTargetMachine::create_target_machine_with_opt(
-                        mp_check_triple, ctx.options.opt_level as i32)) {
-                    Result::Ok(machine) => {
-                        mut checked: LTargetMachine = machine;
-                        checked.dispose();
-                    }
-                    Result::Err(reason) => {
-                        CodegenPasses::report_missing_target(ctx, mp_check_triple, reason);
-                    }
-                }
-            }
+            // mutable state.  `CRYO_CODEGEN_MODE=serial` forces
+            // single-threaded emission; `cg_threads == 1` is serial too.
             // The threaded path hands each module to a pool of `cg_threads`
             // workers as soon as its IR exists, and goes on generating the
             // next module while they emit; `serial` mode (or a 1-thread build)
@@ -1874,7 +1833,7 @@ type struct CompilerInstance {
             // Live modules are capped so the whole target's modules never sit
             // in memory at once: the main thread waits for one to finish
             // before generating past the cap.
-            const cg_threaded: boolean = !multiproc && cg_mode != "serial" && cg_threads > 1;
+            const cg_threaded: boolean = !CompilerInstance::codegen_forced_serial() && cg_threads > 1;
             const cg_live_cap: u32 = cg_threads + 2;
 
             // The per-TARGET codegen context (published before sema/mono) is
@@ -1889,12 +1848,6 @@ type struct CompilerInstance {
             // identical regardless of the order objects finish emitting.
             mut cg_obj: [string] = [];
             for (mut r: u32 = 0; r < n; r++) { cg_obj.push(""); }
-
-            // Multi-process collection: parallel arrays of (bitcode, object)
-            // paths + topo position, one per module emitted out-of-process.
-            mut mp_bc:  [string] = [];
-            mut mp_obj: [string] = [];
-            mut mp_pos: [u32] = [];
 
             // In-process emit jobs on the threaded path.  The table is sized
             // before a worker starts (see `WorkerPool`): two slots a module,
@@ -2097,34 +2050,6 @@ type struct CompilerInstance {
                         LModule { raw: ctx.artifacts.ir.llvm_module }, mod_name, i, tgt.emit_path));
                 }
 
-                if (multiproc) {
-                    // Verify and key the module here, then serialize it to
-                    // bitcode and dispose it at once (one live context at a
-                    // time - lower peak RSS than the in-process batch), and
-                    // hand its path to a child process.
-                    cg_job.verify_and_key();
-                    if (cg_job.awaits_emission) {
-                        CompilerInstance::clear_for_emission(&cg_job);
-                    }
-                    CompilerInstance::record_settled_module(ctx, &cg_job, &cg_obj, &module_cache);
-                    mut lmbc: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
-                    if (cg_job.emitting) {
-                        const bc_path: string = fmt::format("%s.bc", tgt.emit_path);
-                        if (lmbc.write_bitcode(bc_path)) {
-                            mp_bc.push(bc_path);
-                            mp_obj.push(tgt.emit_path);
-                            mp_pos.push(i);
-                        } else {
-                            CodegenPasses::report_emit_failure(ctx, bc_path, String::new());
-                        }
-                    }
-                    lmbc.dispose();
-                    ctx.artifacts.ir = IROutput::empty();
-                    compiler::codegen::llvm_types::dispose_codegen_context();
-                    pipeline.reset();
-                    continue;
-                }
-
                 // In-process emit (ZERO-COPY).  Hand the job the LIVE module in
                 // its own context, plus a target machine built HERE on the main
                 // thread (LLVM target setup is single-threaded, and this keeps
@@ -2197,45 +2122,6 @@ type struct CompilerInstance {
                 for (mut p: i64 = 0; p < cg_final_slot.length(); p++) {
                     if (cg_final_slot[p] >= 0) {
                         CompilerInstance::record_emitted_job(ctx, &cg_jobs[cg_final_slot[p]], &cg_obj, &module_cache);
-                    }
-                }
-            }
-
-            // Fan the multi-process emit out to child processes, then record
-            // each object.  A module whose object is missing is refused with
-            // the note its worker left, or as written by nobody when the
-            // workers all ran; a fan-out that failed is refused once itself.
-            if (multiproc) {
-                mut mf_dir: string = "build";
-                if (ctx.project_config != null) {
-                    mf_dir = ctx.project_config.deps_dir_for("local");
-                }
-                ProjectConfig::mkdir_p(mf_dir);
-                const manifest: string = Path::from(mf_dir).join(".cryo_emit_manifest.txt").into_raw();
-                const mp_triple: string = CodegenPasses::effective_triple(ctx);
-                mut workers_ran: boolean = true;
-                match (CodegenPasses::run_multiprocess_emit(
-                        &mp_bc, &mp_obj, mp_triple, ctx.options.opt_level, cg_threads,
-                        self_exe, manifest)) {
-                    Result::Ok(_) => { }
-                    Result::Err(reason) => {
-                        CodegenPasses::report_emit_workers_failed(ctx, reason);
-                        workers_ran = false;
-                    }
-                }
-                for (mut k: i64 = 0; k < mp_pos.length() as i64; k++) {
-                    match (CodegenPasses::take_failure_note(mp_obj[k])) {
-                        Option::Some(reason) => {
-                            CodegenPasses::report_emit_failure(ctx, mp_obj[k], reason);
-                        }
-                        Option::None => {
-                            if (Path::from(mp_obj[k]).exists()) {
-                                cg_obj[mp_pos[k] as i64] = mp_obj[k];
-                            } else if (workers_ran) {
-                                CodegenPasses::report_emit_failure(ctx, mp_obj[k],
-                                    String::from("its worker exited without writing it"));
-                            }
-                        }
                     }
                 }
             }
@@ -3269,26 +3155,18 @@ type struct CompilerInstance {
         return n;
     }
 
-    /// Codegen parallelism mode from `CRYO_CODEGEN_MODE` (default "thread").
-    ///   "thread" - in-process threaded emit (each module its own context +
-    ///               target machine; the default).
-    ///   "process" - out-of-process emit via child `cryo __emit-obj` from
-    ///               bitcode (full isolation; a bitcode round-trip cost).
-    ///   "serial" - force single-threaded in-process emit.
-    /// An unrecognized value falls back to "thread".
-    static codegen_mode() -> string {
+    /// Whether `CRYO_CODEGEN_MODE=serial` asks for every module to be emitted
+    /// on the main thread.  Any other value, or none, leaves emission
+    /// threaded.
+    static codegen_forced_serial() -> boolean {
         match (env::var(Str::new("CRYO_CODEGEN_MODE"))) {
             Option::Some(v) => {
-                // Borrowed view drives the compare; the owned String drops at
-                // the arm's end. The result is a static literal, never the view.
+                // The owned String drops at the arm's end, after the compare.
                 mut s: String = v;
                 const view: string = s.as_cstr() as string;
-                mut out: string = "thread";
-                if (view == "process") { out = "process"; }
-                else if (view == "serial") { out = "serial"; }
-                return out;
+                return view == "serial";
             }
-            Option::None => { return "thread"; }
+            Option::None => { return false; }
         }
     }
 

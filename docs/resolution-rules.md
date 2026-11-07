@@ -1655,13 +1655,11 @@ yet is recorded with the change that builds it, not here.
      `sizeof`.  (Delegated)
 
 559. **Every code generation failure fails the build with a diagnostic.**
-     What LLVM will not do - write a module's bitcode, emit an object in
-     a worker process, or write the object an emit reported as written -
-     is E0647 with LLVM's reason; a module whose IR generation fails
-     without reporting why is E0900.  An earlier build's object is
-     removed before a module is emitted, so an emit that writes nothing
-     cannot leave it to be linked, and worker processes refuse a triple
-     with no target once, before any IR is generated.  (Jake; the codes
+     What LLVM will not do - emit an object, or write the object an emit
+     reported as written - is E0647 with LLVM's reason; a module whose IR
+     generation fails without reporting why is E0900.  An earlier
+     build's object is removed before a module is emitted, so an emit
+     that writes nothing cannot leave it to be linked.  (Jake; the codes
      Delegated)
 
 560. **An enum whose payload is aligned above 16 is laid out as the front

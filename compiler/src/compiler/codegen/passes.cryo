@@ -13,7 +13,6 @@ import std::fs::file::{ File };
 import std::fs::path::{ Path, PathBuf };
 import std::fs::file;
 import std::process::command::{ Command, Output, Stdio };
-import std::process::child::{ Child };
 
 import compiler::codegen::{ context, llvm, llvm_types, type_map };
 import compiler::types::{ arena, type_base, type_ref, TypeKind, user_defined };
@@ -1106,201 +1105,6 @@ type struct CodegenPasses {
         return ctx.options.target_triple;
     }
 
-
-    // ---- multi-process object emitter: manifest scanning (child side) ------
-    // The manifest is a UTF-8 text file:
-    //   line 0            effective target triple
-    //   line 1            opt level (decimal)
-    //   line 2..          "<bitcode-path>\t<object-path>" per module, topo order
-    // These scanners malloc fresh copies and never free them - a child process
-    // is short-lived and exits, so leaking the parsed strings is fine and keeps
-    // the hot path allocation-simple.
-
-    /// Copy bytes from `*cursor` up to (not including) the next '\n' into a
-    /// fresh NUL-terminated string, then advance `*cursor` past the '\n'.
-    static scan_line(p: u8*, n: i64, cursor: mut i64*) -> string {
-        const start: i64 = *cursor;
-        mut i: i64 = start;
-        while (i < n && p[i] != 10) { i = i + 1; }
-        const len: i64 = i - start;
-        mut s: String = String::from_str(Str::from_raw((p + start) as u8*, len));
-        if (i < n) { i = i + 1; }
-        *cursor = i;
-        return s.into_raw();
-    }
-
-    /// Index of the first byte `b` in `s`, or -1.
-    static index_of_byte(s_text: string, b: u8) -> i64 {
-        const s: string = s_text;
-        const len: i64 = s.length();
-        mut i: i64 = 0;
-        while (i < len) {
-            if ((s[i] as u8) == b) { return i; }
-            i = i + 1;
-        }
-        return -1;
-    }
-
-    /// `s[start .. start+len]` as a fresh NUL-terminated string.
-    static substr(s_text: string, start: i64, len: i64) -> string {
-        const s: string = s_text;
-        mut out: String = String::from_str(Str::from_raw(((s as i8*) + start) as u8*, len));
-        return out.into_raw();
-    }
-
-    /// Child-process entry (`cryo __emit-obj <manifest> <idx> <count>`): read
-    /// the manifest and emit the objects assigned to this worker (module line
-    /// `k` belongs to worker `k % count`, round-robin so large modules spread
-    /// across workers).  An object LLVM will not emit gets LLVM's reason in
-    /// its failure note, which the parent reports; the worker itself fails
-    /// only when it cannot read the manifest or write a note.
-    static run_emit_worker(manifest_path_text: string, worker_idx: u32,
-                           worker_count: u32) -> i32 {
-        const manifest_path: string = manifest_path_text;
-        mut content: String = String::new();
-        match (File::read_text(Path::from(manifest_path))) {
-            Result::Ok(s)  => { content = s; }
-            Result::Err(_) => {
-                fmt::eprintln(f"__emit-obj: cannot read manifest {manifest_path}");
-                return 1;
-            }
-        }
-        const view: Str = content.as_str();
-        const p: u8* = view.as_ptr();
-        const n: i64 = view.length();
-
-        mut cur: i64 = 0;
-        const triple: string = CodegenPasses::scan_line(p, n, &cur);
-        const opt_str: string = CodegenPasses::scan_line(p, n, &cur);
-        const opt: u32 = opt_str.parse_int::<u32>();
-
-        mut mod_idx: u32 = 0;
-        mut failures: i32 = 0;
-        while (cur < n) {
-            const line: string = CodegenPasses::scan_line(p, n, &cur);
-            if (line.length() == 0) { continue; }
-            if (mod_idx % worker_count == worker_idx) {
-                const tab: i64 = CodegenPasses::index_of_byte(line, 9);
-                if (tab >= 0) {
-                    const bc: string = CodegenPasses::substr(line, 0, tab);
-                    const ol: string = CodegenPasses::substr(
-                        line, tab + 1, line.length() - tab - 1);
-                    match (CodegenPasses::emit_object_from_bitcode(bc, ol, triple, opt)) {
-                        Result::Ok(_) => { }
-                        Result::Err(reason) => {
-                            const note: Path = Path::from(CodegenPasses::failure_note_path(ol));
-                            match (File::write_bytes(note,
-                                    Slice::<u8>::from_raw(reason.as_str().as_ptr(), reason.length()))) {
-                                Result::Ok(_)  => { }
-                                Result::Err(_) => {
-                                    fmt::eprintln(f"__emit-obj: failed to emit {ol}: {reason.as_str()}");
-                                    failures = failures + 1;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            mod_idx = mod_idx + 1;
-        }
-        return if (failures > 0) { 1 } else { 0 };
-    }
-
-    /// Parent side of the multi-process object emitter.  Writes the manifest,
-    /// spawns `worker_count` child `cryo __emit-obj` processes over it, and
-    /// waits for all of them.  Each module's object is emitted in a separate
-    /// PROCESS (own address space, own LLVM globals) - so there is no shared
-    /// LLVM state to race, which is what makes this safe where in-process
-    /// threading was not.  Answers why the workers could not be run, or why
-    /// one of them failed; a module a worker could not emit is answered by
-    /// its failure note instead.
-    static run_multiprocess_emit(bc: [string]*, obj: [string]*, triple_text: string,
-                                 opt: u32, worker_count: u32, self_exe_text: string,
-                                 manifest_path_text: string) -> Result<(), String> {
-        const manifest_path: string = manifest_path_text;
-        const self_exe: string = self_exe_text;
-        const triple: string = triple_text;
-        // Manifest: triple, opt, then "<bc>\t<o>" per module in topo order.
-        mut mf: String = String::new();
-        mf.push(triple);            mf.push_byte(10);
-        mf.push(fmt::format("%u", opt)); mf.push_byte(10);
-        const cnt: i64 = (*bc).length() as i64;
-        for (mut k: i64 = 0; k < cnt; k++) {
-            mf.push((*bc)[k]);  mf.push_byte(9);
-            mf.push((*obj)[k]); mf.push_byte(10);
-            // A note an earlier build left would read as this build's failure.
-            CodegenPasses::remove_previous_output(CodegenPasses::failure_note_path((*obj)[k]));
-        }
-        match (File::write_bytes(Path::from(manifest_path),
-                           Slice::<u8>::from_raw(mf.as_str().as_ptr(), mf.length()))) {
-            Result::Ok(_)  => { }
-            Result::Err(_) => {
-                return Result::Err(f"could not write the emit manifest '{manifest_path}'");
-            }
-        }
-
-        // Spawn the workers (all concurrent), then wait for each.
-        mut failure: Result<(), String> = Result::Ok(());
-        mut children: [Child] = [];
-        mut w: u32 = 0;
-        while (w < worker_count) {
-            mut cmd: Command = Command::new(Str::new(self_exe));
-            cmd.arg(Str::new("__emit-obj"));
-            cmd.arg(Str::new(manifest_path));
-            cmd.arg(Str::new(fmt::format("%u", w)));
-            cmd.arg(Str::new(fmt::format("%u", worker_count)));
-            match (cmd.spawn()) {
-                Result::Ok(c)  => { children.push(c); }
-                Result::Err(_) => {
-                    failure = Result::Err(f"could not start the emit worker '{self_exe}'");
-                }
-            }
-            w = w + 1;
-        }
-
-        mut ci: i64 = 0;
-        while (ci < children.length() as i64) {
-            match (children[ci].wait()) {
-                Result::Ok(st) => {
-                    if (!st.success()) {
-                        failure = Result::Err(String::from("an emit worker exited with a failure"));
-                    }
-                }
-                Result::Err(_) => {
-                    failure = Result::Err(String::from("an emit worker could not be waited for"));
-                }
-            }
-            ci = ci + 1;
-        }
-
-        // Reclaim the transient bitcode + manifest - pure inputs to the child
-        // emitters, regenerated every build.  Best-effort (ignore errors).
-        for (mut rk: i64 = 0; rk < cnt; rk++) {
-            CodegenPasses::remove_previous_output((*bc)[rk]);
-        }
-        CodegenPasses::remove_previous_output(manifest_path);
-        return failure;
-    }
-
-    /// Where a worker of the out-of-process emitter leaves LLVM's reason for
-    /// not emitting the object at `object_path`.
-    static failure_note_path(object_path: string) -> string {
-        return fmt::format("%s.error", object_path);
-    }
-
-    /// The reason a worker left for not emitting the object at
-    /// `object_path`, removed as it is read; none when it left no note.
-    static take_failure_note(object_path: string) -> Option<String> {
-        const note: string = CodegenPasses::failure_note_path(object_path);
-        match (File::read_text(Path::from(note))) {
-            Result::Ok(reason) => {
-                CodegenPasses::remove_previous_output(note);
-                return Option::Some(reason);
-            }
-            Result::Err(_) => { return Option::None; }
-        }
-    }
-
     /// Remove the file at `path` if there is one.  A file that cannot be
     /// removed cannot be overwritten either, so the write that follows
     /// fails and says so.
@@ -1311,57 +1115,12 @@ type struct CodegenPasses {
         }
     }
 
-    /// Child-process entry for the multi-process object emitter: parse a
-    /// module's bitcode from `bc_path` (written by the main process) in a FRESH
-    /// per-process LLVM context, optimize it, and emit its object to `o_path`.  Runs in its
-    /// own process, so there is no shared LLVM global state to race - the whole
-    /// point of going multi-process instead of multi-thread.  Answers why
-    /// the object was not emitted, when it was not.
-    static emit_object_from_bitcode(bc_path_text: string, o_path_text: string,
-                                    triple_text: string, opt_level: u32) -> Result<(), String> {
-        LTargetMachine::init_native_target();
-        const eff: string = LTargetMachine::resolve_effective_triple(triple_text);
-        const lctx: LContext = LContext::create();
-        mut m: LModule = LModule::parse_ir_file(bc_path_text, lctx);
-        if (!m.is_valid()) {
-            mut c0: LContext = lctx;
-            c0.dispose();
-            return Result::Err(f"LLVM could not read the bitcode '{bc_path_text}'");
-        }
-        mut emitted: Result<(), String> = Result::Ok(());
-        match (LTargetMachine::create_target_machine_with_opt(eff, opt_level as i32)) {
-            Result::Ok(machine) => {
-                mut tm: LTargetMachine = machine;
-                if (tm.run_optimization_pipeline(m, opt_level)) {
-                    emitted = tm.emit_to_file(m, o_path_text, LFileType::Object);
-                } else {
-                    emitted = Result::Err(f"LLVM's optimization pipeline failed for '{bc_path_text}'");
-                }
-                tm.dispose();
-            }
-            Result::Err(reason) => {
-                emitted = Result::Err(f"LLVM has no target for the triple '{eff}': {reason.as_str()}");
-            }
-        }
-        m.dispose();
-        mut c: LContext = lctx;
-        c.dispose();
-        return emitted;
-    }
-
     /// E0647: LLVM has no target for `triple`, for LLVM's `reason`.
     static report_missing_target(ctx: mut CompilationContext*, triple: string, mut reason: String) -> void {
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0647_LLVM_BACKEND_FAILED,
             fmt::format("LLVM has no target for the triple '%s': %s", triple, reason.as_cstr() as string));
         d = d.help("name a triple this compiler's LLVM supports, with `--target` or cryoconfig's `target_triple`; `cryo version --triple` prints the host's");
         ctx.emit_diagnostic(d);
-    }
-
-    /// E0647: the out-of-process emitter's workers could not be run, or one
-    /// of them failed, for `reason`.
-    static report_emit_workers_failed(ctx: mut CompilationContext*, mut reason: String) -> void {
-        ctx.emit_error(ErrorCode::E0647_LLVM_BACKEND_FAILED,
-            fmt::format("the out-of-process object emitter failed: %s", reason.as_cstr() as string));
     }
 
     /// E0605: LLVM refused to run its optimization pipeline over the module
