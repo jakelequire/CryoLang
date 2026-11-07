@@ -1,0 +1,92 @@
+// `?` on a local an async function owns, and a written call to a consuming
+// method of a generic type, hand the value over exactly as they do in an
+// ordinary function. Both calls name a method of a generic type (`branch`
+// on a `Result`, `unwrap` on an `Option`), which is bound to its copy only
+// when the type is minted, after the async function is lowered; the
+// lowering reads the method sema selected instead, so the value is taken
+// out of the frame rather than copied out of it and released twice, which
+// was refused (E0453).
+//
+// Each case checks the result and counts destructors.  `main` prints how many
+// checks passed and exits 0 only when all did.
+namespace AsyncTryOnOwnedLocal::Main;
+
+import std::fmt;
+import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::core::drop::{ Drop };
+import std::future;
+import std::future::ready::{ PendingThenReady };
+
+mut g_drops: i64 = 0;
+
+type struct Counted { tag: i64; }
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void { g_drops += 1; }
+}
+
+function queue(fail: boolean) -> Result<i64, Counted> {
+    if (fail) { return Result::Err(Counted { tag: 9 }); }
+    return Result::Ok(3);
+}
+
+// `?` before the function's first suspend.
+async function try_before_await(fail: boolean) -> Result<i64, Counted> {
+    const queued: Result<i64, Counted> = queue(fail);
+    const v: i64 = queued?;
+    const a: i64 = await PendingThenReady::<i64>::new(1, 1);
+    return Result::Ok(v + a);
+}
+
+// `?` on a local carried across a suspend, with another one after it.
+async function try_after_await(fail: boolean) -> Result<i64, Counted> {
+    const queued: Result<i64, Counted> = queue(fail);
+    const a: i64 = await PendingThenReady::<i64>::new(1, 1);
+    const v: i64 = queued?;
+    const b: i64 = await PendingThenReady::<i64>::new(1, 2);
+    return Result::Ok(v + a + b);
+}
+
+// A written consuming call on a generic type's value carried across a suspend.
+async function unwrap_after_await() -> i64 {
+    const held: Option<Counted> = Option::Some(Counted { tag: 5 });
+    const a: i64 = await PendingThenReady::<i64>::new(1, 1);
+    const c: Counted = held.unwrap();
+    const b: i64 = await PendingThenReady::<i64>::new(1, 2);
+    return c.tag + a + b;
+}
+
+function value_of(r: Result<i64, Counted>) -> i64 {
+    return match (r) {
+        Result::Ok(v)  => { v }
+        Result::Err(e) => { 0 - e.tag }
+    };
+}
+
+function check(name: string, got: i64, want: i64, want_drops: i64) -> i64 {
+    if (got == want && g_drops == want_drops) { return 1; }
+    fmt::println(f"FAIL {name}: got {got} (want {want}), drops {g_drops} (want {want_drops})");
+    return 0;
+}
+
+function main() -> i32 {
+    mut passed: i64 = 0;
+    g_drops = 0;
+    passed += check("try_before_await_ok",
+        value_of(future::block_on(try_before_await(false))), 4, 0);
+    g_drops = 0;
+    passed += check("try_before_await_err",
+        value_of(future::block_on(try_before_await(true))), -9, 1);
+    g_drops = 0;
+    passed += check("try_after_await_ok",
+        value_of(future::block_on(try_after_await(false))), 6, 0);
+    g_drops = 0;
+    passed += check("try_after_await_err",
+        value_of(future::block_on(try_after_await(true))), -9, 1);
+    g_drops = 0;
+    passed += check("unwrap_after_await",
+        future::block_on(unwrap_after_await()), 8, 1);
+    fmt::println(f"async_try_on_owned_local: {passed} of 5 passed");
+    if (passed != 5) { return 1; }
+    return 0;
+}
