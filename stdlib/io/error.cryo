@@ -5,9 +5,10 @@
 ///! `Other` variant exists for platform-specific errors that don't
 ///! fit the taxonomy.
 ///!
-///! An error from an operation that named a path carries that path, so a
-///! report reads `not found: config.toml` rather than a bare kind. The
-///! path is owned, which makes `IoError` a value that moves.
+///! An error from an operation that named a path carries the operation and
+///! that path, so a report reads `could not open config.toml: not found`
+///! rather than a bare kind. The path is owned, which makes `IoError` a
+///! value that moves.
 ///!
 ///! The errno table is per-OS gated. `from_errno` is fed msvcrt's C-runtime
 ///! errno on Windows (file/process I/O) and glibc errno on Linux; the base
@@ -194,25 +195,74 @@ implement enum IoErrorKind {
     }
 }
 
+/// What a filesystem operation that failed was doing to the path it names.
+public type enum IoOperation {
+    Open;
+    Create;
+    Read;
+    Write;
+    Remove;
+    CreateDirectory;
+    RemoveDirectory;
+    ListDirectory;
+    ReadMetadata;
+    Rename;
+    Copy;
+    Canonicalize;
+}
+
+implement enum IoOperation {
+    /// The operation as the verb phrase of `could not <verb> <path>`:
+    /// `"open"`, `"read the metadata of"`. A static string literal.
+    public verb(&this) -> string {
+        return match (this) {
+            IoOperation::Open            => { "open"                  }
+            IoOperation::Create          => { "create"                }
+            IoOperation::Read            => { "read"                  }
+            IoOperation::Write           => { "write"                 }
+            IoOperation::Remove          => { "remove"                }
+            IoOperation::CreateDirectory => { "create directory"      }
+            IoOperation::RemoveDirectory => { "remove directory"      }
+            IoOperation::ListDirectory   => { "list directory"        }
+            IoOperation::ReadMetadata    => { "read the metadata of"  }
+            IoOperation::Rename          => { "rename"                }
+            IoOperation::Copy            => { "copy"                  }
+            IoOperation::Canonicalize    => { "resolve"               }
+        };
+    }
+}
+
 public type struct IoError {
     public kind: IoErrorKind;
     /// The operating system's own code for the failure - an `errno`, or a
     /// Windows system error code - or 0 if not applicable. Useful for
     /// diagnostics; callers should branch on `kind`.
     public os_code: i32;
+    private failed_operation: Option<IoOperation>;
     private failed_path: Option<PathBuf>;
 
     public static new(kind: IoErrorKind, os_code: i32) -> IoError {
-        return IoError { kind: kind, os_code: os_code, failed_path: Option::None };
+        return IoError {
+            kind: kind,
+            os_code: os_code,
+            failed_operation: Option::None,
+            failed_path: Option::None
+        };
     }
 
     /// What went wrong, as a borrowed `Str`: the kind's description
-    /// (`"not found"`), without the path. This is the convergent accessor
-    /// every stdlib error type exposes (`describe(&this) -> Str`). `Display`
-    /// prints it followed by the path, when there is one. Borrows a static
-    /// string literal, so the view outlives any `IoError`.
+    /// (`"not found"`), without the operation or the path. This is the
+    /// convergent accessor every stdlib error type exposes
+    /// (`describe(&this) -> Str`). `Display` prints it after the operation
+    /// and the path, when there are some. Borrows a static string literal,
+    /// so the view outlives any `IoError`.
     public describe(&this) -> str::Str {
         return str::Str::new(this.kind.description());
+    }
+
+    /// The operation that failed, if the error records one.
+    public operation(&this) -> Option<IoOperation> {
+        return this.failed_operation;
     }
 
     /// The path the failed operation named, if it named one.
@@ -223,11 +273,12 @@ public type struct IoError {
         };
     }
 
-    /// This error, naming `path` as the one the operation failed on. An
-    /// error that already names a path keeps it: the innermost operation
-    /// knows best which path it could not reach.
-    public with_path(mut this, path: Path) -> IoError {
+    /// This error, recording that `operation` failed on `path`. An error
+    /// that already records them keeps its own: the innermost operation
+    /// knows best what it could not do, and to which path.
+    public with_context(mut this, operation: IoOperation, path: Path) -> IoError {
         if (this.failed_path.is_none()) {
+            this.failed_operation = Option::Some(operation);
             this.failed_path = Option::Some(PathBuf::from(path.as_str()));
         }
         return this;

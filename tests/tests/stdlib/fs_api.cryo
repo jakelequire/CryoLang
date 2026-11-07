@@ -20,7 +20,7 @@ import std::encoding::utf16::{ Utf16 };
 import std::fs::{ Directory, File, Path, PathBuf, TempDirectory, TempFile };
 import std::io::buf::{ BufReader };
 import std::io::traits::{ Write };
-import std::fmt::display::{ Display, format_to_string };
+import std::fmt::display::{ Debug, Display, format_debug_to_string, format_to_string };
 import std::core::mem;
 import std::test::error::{ TestError };
 import std::test::assert::{ bail, expect, expect_eq };
@@ -28,6 +28,14 @@ import std::test::assert::{ bail, expect, expect_eq };
 /// What `value` prints as.
 function shown<T>(value: &T) -> String where T: Display {
     match (format_to_string(value)) {
+        Result::Ok(text) => { return text; }
+        Result::Err(_)   => { return String::new(); }
+    }
+}
+
+/// What `value` prints as for debugging.
+function shown_for_debugging<T>(value: &T) -> String where T: Debug {
+    match (format_debug_to_string(value)) {
         Result::Ok(text) => { return text; }
         Result::Err(_)   => { return String::new(); }
     }
@@ -85,7 +93,7 @@ function read_text_refuses_bytes_that_are_not_utf8() -> Result<(), TestError> {
 }
 
 ![test]
-function a_failure_prints_with_its_path() -> Result<(), TestError> {
+function a_failure_prints_its_operation_and_path() -> Result<(), TestError> {
     const scratch: TempDirectory = TempDirectory::create()?;
     const directory: Path = scratch.path();
     const missing: PathBuf = directory.join("absent.txt");
@@ -96,12 +104,74 @@ function a_failure_prints_with_its_path() -> Result<(), TestError> {
                 IoErrorKind::NotFound => { }
                 _ => { return bail("the failure is not NotFound"); }
             }
-            mut expected: String = String::from_str(Str::new("not found: "));
+            mut expected: String = String::from_str(Str::new("could not open "));
             expected.push(missing.as_path().as_str());
+            expected.push(": not found");
             const text: String = shown(&error);
-            expect(text.as_str() == expected.as_str(), "Display prints the description, then the path")?;
+            expect(text.as_str() == expected.as_str(), "Display prints the operation, the path, then the description")?;
+            mut debug_tail: String = String::from_str(Str::new("): could not open "));
+            debug_tail.push(missing.as_path().as_str());
+            const debug_text: String = shown_for_debugging(&error);
+            expect(debug_text.as_str().starts_with(&Str::new("not_found (os ")), "Debug starts with the slug and the code")?;
+            expect(debug_text.as_str().ends_with(&debug_tail.as_str()), "Debug ends with the operation and the path")?;
         }
     }
+    return Result::Ok(());
+}
+
+/// The verb `error` records, or `"none"` when it records no operation.
+function verb_of(error: &IoError) -> string {
+    return match (error.operation()) {
+        Option::Some(operation) => { operation.verb() }
+        Option::None            => { "none" }
+    };
+}
+
+![test]
+function each_failure_records_its_operation() -> Result<(), TestError> {
+    const scratch: TempDirectory = TempDirectory::create()?;
+    const directory: Path = scratch.path();
+    const missing: PathBuf = directory.join("absent");
+    const nested: PathBuf = missing.as_path().join("inner.txt");
+    match (File::read_text(missing.as_path())) {
+        Result::Ok(_)      => { return bail("read a file that does not exist"); }
+        Result::Err(error) => { expect(Str::new(verb_of(&error)) == Str::new("open"), "read_text of a missing file failed to open it")?; }
+    }
+    match (File::create(nested.as_path())) {
+        Result::Ok(_)      => { return bail("created a file in a missing directory"); }
+        Result::Err(error) => { expect(Str::new(verb_of(&error)) == Str::new("create"), "File::create fails to create")?; }
+    }
+    match (File::remove(missing.as_path())) {
+        Result::Ok(_)      => { return bail("removed a file that does not exist"); }
+        Result::Err(error) => { expect(Str::new(verb_of(&error)) == Str::new("remove"), "File::remove fails to remove")?; }
+    }
+    match (Directory::entries(missing.as_path())) {
+        Result::Ok(_)      => { return bail("listed a directory that does not exist"); }
+        Result::Err(error) => { expect(Str::new(verb_of(&error)) == Str::new("list directory"), "entries fails to list")?; }
+    }
+    match (Directory::remove(missing.as_path())) {
+        Result::Ok(_)      => { return bail("removed a directory that does not exist"); }
+        Result::Err(error) => { expect(Str::new(verb_of(&error)) == Str::new("remove directory"), "Directory::remove fails to remove a directory")?; }
+    }
+    match (Directory::create(nested.as_path())) {
+        Result::Ok(_)      => { return bail("created a directory under a missing one"); }
+        Result::Err(error) => { expect(Str::new(verb_of(&error)) == Str::new("create directory"), "Directory::create fails to create a directory")?; }
+    }
+    match (missing.as_path().metadata()) {
+        Result::Ok(_)      => { return bail("read the metadata of a missing entry"); }
+        Result::Err(error) => { expect(Str::new(verb_of(&error)) == Str::new("read the metadata of"), "metadata fails to read it")?; }
+    }
+    match (missing.as_path().rename_to(nested.as_path())) {
+        Result::Ok(_)      => { return bail("renamed an entry that does not exist"); }
+        Result::Err(error) => { expect(Str::new(verb_of(&error)) == Str::new("rename"), "rename_to fails to rename")?; }
+    }
+    match (File::copy(directory, nested.as_path())) {
+        Result::Ok(_)      => { return bail("copied a directory as a file"); }
+        Result::Err(error) => { expect(Str::new(verb_of(&error)) == Str::new("copy"), "copy refuses a directory as the copy it is")?; }
+    }
+    const unmarked: IoError = IoError::new(IoErrorKind::NotFound, 0);
+    expect(Str::new(verb_of(&unmarked)) == Str::new("none"), "an error made bare records no operation")?;
+    expect(shown(&unmarked).as_str() == Str::new("not found"), "an error with no operation prints its description alone")?;
     return Result::Ok(());
 }
 

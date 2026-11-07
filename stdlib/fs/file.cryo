@@ -13,8 +13,8 @@
 ///! other than "read" (`open`) or "create or truncate, then write"
 ///! (`create`): appending, read and write together, or exclusive creation.
 ///!
-///! Every failure from an operation that names a path carries that path,
-///! so it prints as `not found: config.toml`.
+///! Every failure from an operation that names a path carries the operation
+///! and that path, so it prints as `could not open config.toml: not found`.
 ///!
 ///! `File` wraps a C-runtime descriptor (an `i32`). On Windows the file is
 ///! opened with `CreateFileW` and the HANDLE wrapped in a descriptor, so a
@@ -27,7 +27,7 @@ import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::core::slice::{ Slice };
 import std::core::drop::{ Drop };
-import std::io::error::{ IoError, IoErrorKind };
+import std::io::error::{ IoError, IoErrorKind, IoOperation };
 import std::io::fd;
 import std::io::traits::{ Read, Seek, SeekFrom, Write };
 import std::collections::string::{ String };
@@ -141,6 +141,13 @@ public type struct OpenOptions {
         return this.write || this.append;
     }
 
+    /// What opening with these options does to the path: `Create` when it
+    /// may make or empty the file, `Open` otherwise.
+    private operation(&this) -> IoOperation {
+        if (this.create || this.create_new || this.truncate) { return IoOperation::Create; }
+        return IoOperation::Open;
+    }
+
     /// The POSIX `open` flags: glibc/Linux values, from `<fcntl.h>` (the
     /// constants in `ffi::libc`). Close-on-exec, so a concurrent
     /// `fork`+`exec` (e.g. via `process::Command`) does not leak the
@@ -197,7 +204,7 @@ public type struct File {
         const err: i32 = libc::errno();
         mem::drop(c_path);
         if (descriptor < 0) {
-            return Result::Err(IoError::from_errno(err).with_path(path));
+            return Result::Err(IoError::from_errno(err).with_context(options.operation(), path));
         }
         return Result::Ok(File { fd: descriptor });
     }
@@ -226,13 +233,13 @@ public type struct File {
             disposition, syscall::FILE_ATTRIBUTE_NORMAL, null);
         // INVALID_HANDLE_VALUE is `(HANDLE)-1`.
         if ((handle as i64) == -1) {
-            return Result::Err(IoError::last_os_error().with_path(path));
+            return Result::Err(IoError::last_os_error().with_context(options.operation(), path));
         }
         const descriptor: i32 = libc::_open_osfhandle(handle as i64, options.descriptor_flags());
         if (descriptor < 0) {
             const failure: IoError = IoError::from_errno(libc::errno());
             syscall::CloseHandle(handle);
-            return Result::Err(failure.with_path(path));
+            return Result::Err(failure.with_context(options.operation(), path));
         }
         return Result::Ok(File { fd: descriptor });
     }
@@ -250,7 +257,7 @@ public type struct File {
         }
         match (file.read_to_string(&text)) {
             Result::Ok(_)      => { return Result::Ok(text); }
-            Result::Err(error) => { return Result::Err(error.with_path(path)); }
+            Result::Err(error) => { return Result::Err(error.with_context(IoOperation::Read, path)); }
         }
     }
 
@@ -265,7 +272,7 @@ public type struct File {
         }
         match (file.read_to_end(&bytes)) {
             Result::Ok(_)      => { return Result::Ok(bytes); }
-            Result::Err(error) => { return Result::Err(error.with_path(path)); }
+            Result::Err(error) => { return Result::Err(error.with_context(IoOperation::Read, path)); }
         }
     }
 
@@ -280,7 +287,7 @@ public type struct File {
         mut file: File = File::create(path)?;
         match (file.write(bytes)) {
             Result::Ok(_)      => { return Result::Ok(()); }
-            Result::Err(error) => { return Result::Err(error.with_path(path)); }
+            Result::Err(error) => { return Result::Err(error.with_context(IoOperation::Write, path)); }
         }
     }
 
@@ -292,7 +299,7 @@ public type struct File {
         mut file: File = File::open_with(path, &options)?;
         match (file.write(text)) {
             Result::Ok(_)      => { return Result::Ok(()); }
-            Result::Err(error) => { return Result::Err(error.with_path(path)); }
+            Result::Err(error) => { return Result::Err(error.with_context(IoOperation::Write, path)); }
         }
     }
 
@@ -305,10 +312,10 @@ public type struct File {
     public static copy(from: Path, to: Path) -> Result<i64, IoError> {
         const info: Metadata = from.metadata()?;
         if (info.is_directory()) {
-            return Result::Err(IoError::new(IoErrorKind::IsADirectory, 0).with_path(from));
+            return Result::Err(IoError::new(IoErrorKind::IsADirectory, 0).with_context(IoOperation::Copy, from));
         }
         if (!info.is_file()) {
-            return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0).with_path(from));
+            return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0).with_context(IoOperation::Copy, from));
         }
         mut source: File = File::open(from)?;
         mut destination: File = File::create(to)?;
@@ -317,18 +324,18 @@ public type struct File {
         loop {
             const count: i64 = match (source.read(&chunk[0], COPY_CHUNK)) {
                 Result::Ok(count)  => { count }
-                Result::Err(error) => { return Result::Err(error.with_path(from)); }
+                Result::Err(error) => { return Result::Err(error.with_context(IoOperation::Read, from)); }
             };
             if (count == 0) { break; }
             match (destination.write(Slice::<u8>::from_raw(&chunk[0], count))) {
                 Result::Ok(_)      => { }
-                Result::Err(error) => { return Result::Err(error.with_path(to)); }
+                Result::Err(error) => { return Result::Err(error.with_context(IoOperation::Write, to)); }
             }
             total = total + count;
         }
         match (destination.take_permissions_of(info)) {
             Result::Ok(_)      => { return Result::Ok(total); }
-            Result::Err(error) => { return Result::Err(error.with_path(to)); }
+            Result::Err(error) => { return Result::Err(error.with_context(IoOperation::Copy, to)); }
         }
     }
 
@@ -341,7 +348,7 @@ public type struct File {
         const err: i32 = libc::errno();
         mem::drop(c_path);
         if (rc != 0) {
-            return Result::Err(IoError::from_errno(err).with_path(path));
+            return Result::Err(IoError::from_errno(err).with_context(IoOperation::Remove, path));
         }
         return Result::Ok(());
     }
@@ -349,7 +356,7 @@ public type struct File {
     public static remove(path: Path) -> Result<(), IoError> {
         const wide: Array<u16> = Utf16::encode(path.as_str());
         if (syscall::DeleteFileW(wide.as_ptr()) == 0) {
-            return Result::Err(IoError::last_os_error().with_path(path));
+            return Result::Err(IoError::last_os_error().with_context(IoOperation::Remove, path));
         }
         return Result::Ok(());
     }
