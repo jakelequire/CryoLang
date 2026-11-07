@@ -1,0 +1,132 @@
+/// Borrowed Temporaries
+///
+/// A value an expression makes and borrows on the spot - `f(&make())`, a
+/// by-value argument in a `&T` parameter, a borrowing method called on a
+/// call result - has no binding for the drop-insertion pass to release.
+/// Codegen spills it to a slot to take its address, and records the slot
+/// here; the slot is released when the statement that made it ends, after
+/// every call that borrows it has returned.
+///
+/// Statements nest (a block inside an `if`, a match arm inside a loop), so
+/// the records form a stack of scopes, one per statement being emitted.
+/// An exit that leaves a statement early - `return`, `break`, `continue` -
+/// releases the scopes it leaves.
+///
+/// A temporary is made on some paths of its statement only when it sits
+/// in a conditional part (`a && f(&make())`), so each one has a liveness
+/// flag: set where the value is stored, read and cleared where it is
+/// released.  The flag starts false in the function's entry block, and
+/// clearing it after every release keeps a later run of the statement
+/// from releasing a value an earlier run already released.
+///
+/// Leaf component: owns its arrays, holds no back-pointers.
+
+namespace compiler::codegen::state::borrowed_temporaries;
+
+import compiler::codegen::llvm_types::{ LBasicBlock, LValue };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::types::type_ref::{ TypeRef };
+
+/// One spilled temporary: its slot and type, the block it was stored in,
+/// and its liveness flag.
+type struct BorrowedTemporary {
+    slot:  LValue;
+    ty:    TypeRef;
+    span:  SourceSpan;
+    block: LBasicBlock;
+    flag:  LValue;
+}
+
+type struct BorrowedTemporaries {
+    temporaries: [BorrowedTemporary];
+    /// Index into `temporaries` where each open scope begins.
+    scope_starts: [i64];
+    /// The function each open scope belongs to: a lambda's body may be
+    /// emitted in the middle of its enclosing function's statement, and an
+    /// exit from the lambda leaves none of the enclosing function's scopes.
+    scope_functions: [LValue];
+    /// `scope_starts.length()` when each enclosing loop began: `break` and
+    /// `continue` leave the scopes opened since.
+    loop_depths: [i64];
+
+    static new() -> BorrowedTemporaries {
+        return BorrowedTemporaries {
+            temporaries:     [],
+            scope_starts:    [],
+            scope_functions: [],
+            loop_depths:     [],
+        };
+    }
+
+    /// Open a scope for a statement emitted in the function `owner`; the
+    /// returned depth closes it.
+    open(mut &this, owner: LValue) -> i64 {
+        this.scope_starts.push(this.temporaries.length());
+        this.scope_functions.push(owner);
+        return this.scope_starts.length() - 1;
+    }
+
+    /// Whether a temporary stored now, in the function `owner`, has a scope
+    /// to be released by.  An expression evaluated outside any statement of
+    /// that function - a module-level initializer - has none, and a scope
+    /// of an enclosing function's statement is not one of its own.
+    accepts(&this, owner: LValue) -> boolean {
+        const depth: i64 = this.scope_functions.length();
+        return depth > 0 && this.scope_functions[depth - 1].raw == owner.raw;
+    }
+
+    record(mut &this, temporary: BorrowedTemporary) -> void {
+        this.temporaries.push(temporary);
+    }
+
+    /// The first temporary of the scope at `depth`.
+    first_of_scope(&this, depth: i64) -> i64 {
+        if (depth >= this.scope_starts.length()) { return this.temporaries.length(); }
+        return this.scope_starts[depth];
+    }
+
+    /// The shallowest open scope that belongs to the function `owner`: the
+    /// scopes a `return` from it leaves begin there.
+    function_depth(&this, owner: LValue) -> i64 {
+        mut depth: i64 = this.scope_functions.length();
+        while (depth > 0 && this.scope_functions[depth - 1].raw == owner.raw) {
+            depth -= 1;
+        }
+        return depth;
+    }
+
+    /// The first scope opened inside the innermost enclosing loop.
+    loop_depth(&this) -> i64 {
+        if (this.loop_depths.length() == 0) { return this.scope_starts.length(); }
+        return this.loop_depths[this.loop_depths.length() - 1];
+    }
+
+    /// The scope of the statement being emitted.
+    innermost(&this) -> i64 { return this.scope_starts.length() - 1; }
+
+    /// Forget the temporaries from index `first` on, once released.
+    forget_from(mut &this, first: i64) -> void {
+        while (this.temporaries.length() > first) { this.temporaries.pop(); }
+    }
+
+    length(&this) -> i64 { return this.temporaries.length(); }
+
+    at(&this, index: i64) -> BorrowedTemporary { return this.temporaries[index]; }
+
+    /// Close the scope at `depth` and every scope above it, forgetting
+    /// their temporaries.
+    close(mut &this, depth: i64) -> void {
+        if (depth >= this.scope_starts.length()) { return; }
+        this.forget_from(this.scope_starts[depth]);
+        while (this.scope_starts.length() > depth) {
+            this.scope_starts.pop();
+            this.scope_functions.pop();
+        }
+    }
+
+    enter_loop(mut &this) -> void { this.loop_depths.push(this.scope_starts.length()); }
+
+    leave_loop(mut &this) -> void {
+        if (this.loop_depths.length() > 0) { this.loop_depths.pop(); }
+    }
+}

@@ -1,0 +1,238 @@
+///! A value made by an expression and borrowed on the spot - `f(&make())`,
+///! a by-value argument in a `&T` parameter, a `&this` method called on a
+///! call result, an f-string hole - is released at the end of the statement
+///! that made it, after every call that borrows it has returned.
+///!
+///! Each test counts destructor runs: one too few is the temporary leaked,
+///! one too many a double release, and a count read inside the borrowing
+///! call shows whether the temporary was still alive there.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::BorrowedTemporaryReleased;
+
+import std::core::result::{ Result };
+import std::core::drop::{ Drop };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::fmt::display::{ Display, Formatter };
+import std::fmt::error::{ FmtError };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_eq };
+
+mut g_drops: i64 = 0;
+mut g_drops_seen_inside: i64 = -1;
+
+type struct Counted {
+    tag: i64;
+
+    tag_of(&this) -> i64 {
+        g_drops_seen_inside = g_drops;
+        return this.tag;
+    }
+
+    view(&this) -> &Counted { return &this; }
+
+    consume(mut this) -> i64 { return this.tag; }
+}
+
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void { g_drops += 1; }
+}
+
+implement trait Display for struct Counted {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        return f.write_str(Str::new("counted"));
+    }
+}
+
+function make(tag: i64) -> Counted { return Counted { tag: tag }; }
+
+function tag_through(c: &Counted) -> i64 {
+    g_drops_seen_inside = g_drops;
+    return c.tag;
+}
+
+function read_view(c: &Counted) -> i64 {
+    g_drops_seen_inside = g_drops;
+    return c.tag;
+}
+
+function below(c: &Counted, limit: i64) -> boolean { return c.tag < limit; }
+
+function returned_through_a_borrow() -> i64 { return tag_through(&make(8)); }
+
+function fail_with(code: i64) -> Result<i64, i64> { return Result::Err(code); }
+
+function borrow_then_fail() -> Result<i64, i64> {
+    const sum: i64 = tag_through(&make(12)) + fail_with(3)?;
+    return Result::Ok(sum);
+}
+
+![test]
+function an_explicit_borrow_of_a_call_releases_after_the_statement() -> Result<(), TestError> {
+    g_drops = 0;
+    const tag: i64 = tag_through(&make(1));
+    const after: i64 = g_drops;
+    expect_eq(tag, 1)?;
+    expect_eq(g_drops_seen_inside, 0)?;
+    return expect_eq(after, 1);
+}
+
+![test]
+function a_by_value_argument_in_a_reference_parameter_releases_once() -> Result<(), TestError> {
+    g_drops = 0;
+    const tag: i64 = tag_through(make(2));
+    expect_eq(tag, 2)?;
+    expect_eq(g_drops_seen_inside, 0)?;
+    return expect_eq(g_drops, 1);
+}
+
+![test]
+function a_call_result_receiver_of_a_borrowing_method_releases_once() -> Result<(), TestError> {
+    g_drops = 0;
+    const tag: i64 = make(3).tag_of();
+    expect_eq(tag, 3)?;
+    expect_eq(g_drops_seen_inside, 0)?;
+    return expect_eq(g_drops, 1);
+}
+
+![test]
+function an_f_string_hole_releases_its_value() -> Result<(), TestError> {
+    g_drops = 0;
+    {
+        const text: String = f"value = {make(4)}";
+        expect_eq(text.length(), 15)?;
+        expect_eq(g_drops, 1)?;
+    }
+    return expect_eq(g_drops, 1);
+}
+
+![test]
+function a_borrow_on_a_path_not_taken_releases_nothing() -> Result<(), TestError> {
+    g_drops = 0;
+    mut taken: boolean = false;
+    const skip: boolean = false;
+    if (skip && tag_through(&make(5)) > 0) { taken = true; }
+    expect_eq(taken, false)?;
+    expect_eq(g_drops, 0)?;
+    const run: boolean = true;
+    if (run && tag_through(&make(5)) > 0) { taken = true; }
+    expect_eq(taken, true)?;
+    return expect_eq(g_drops, 1);
+}
+
+![test]
+function a_borrow_in_a_loop_body_releases_every_iteration() -> Result<(), TestError> {
+    g_drops = 0;
+    mut sum: i64 = 0;
+    for (mut i: i64 = 0; i < 3; i++) {
+        sum += tag_through(&make(i));
+        expect_eq(g_drops, i + 1)?;
+    }
+    expect_eq(sum, 3)?;
+    return expect_eq(g_drops, 3);
+}
+
+![test]
+function a_borrow_in_a_loop_condition_releases_every_evaluation() -> Result<(), TestError> {
+    g_drops = 0;
+    mut i: i64 = 0;
+    while (below(&make(i), 3)) {
+        expect_eq(g_drops, i + 1)?;
+        i += 1;
+    }
+    expect_eq(i, 3)?;
+    return expect_eq(g_drops, 4);
+}
+
+![test]
+function a_borrow_in_a_return_releases_before_returning() -> Result<(), TestError> {
+    g_drops = 0;
+    const tag: i64 = returned_through_a_borrow();
+    expect_eq(tag, 8)?;
+    expect_eq(g_drops_seen_inside, 0)?;
+    return expect_eq(g_drops, 1);
+}
+
+![test]
+function a_borrowed_match_subject_releases_after_the_match() -> Result<(), TestError> {
+    g_drops = 0;
+    mut seen: i64 = 0;
+    match (make(9).tag_of()) {
+        9 => { seen = g_drops; }
+        _ => { seen = -1; }
+    }
+    expect_eq(seen, 0)?;
+    return expect_eq(g_drops, 1);
+}
+
+![test]
+function a_consumed_call_result_receiver_is_released_by_the_callee_only() -> Result<(), TestError> {
+    g_drops = 0;
+    const tag: i64 = make(10).consume();
+    expect_eq(tag, 10)?;
+    return expect_eq(g_drops, 1);
+}
+
+![test]
+function a_break_out_of_a_borrowing_match_releases_the_temporary() -> Result<(), TestError> {
+    g_drops = 0;
+    mut rounds: i64 = 0;
+    loop {
+        rounds += 1;
+        match (make(11).tag_of()) {
+            11 => { break; }
+            _  => {}
+        }
+    }
+    expect_eq(rounds, 1)?;
+    return expect_eq(g_drops, 1);
+}
+
+![test]
+function an_early_return_by_try_releases_the_temporary() -> Result<(), TestError> {
+    g_drops = 0;
+    const outcome: Result<i64, i64> = borrow_then_fail();
+    expect_eq(outcome.is_err(), true)?;
+    return expect_eq(g_drops, 1);
+}
+
+![test]
+function a_reference_into_a_temporary_stays_valid_to_the_end_of_the_statement() -> Result<(), TestError> {
+    g_drops = 0;
+    const tag: i64 = read_view(make(13).view());
+    expect_eq(tag, 13)?;
+    expect_eq(g_drops_seen_inside, 0)?;
+    return expect_eq(g_drops, 1);
+}
+
+![test]
+function a_borrowed_struct_literal_releases_once() -> Result<(), TestError> {
+    g_drops = 0;
+    const tag: i64 = tag_through(&Counted { tag: 14 });
+    expect_eq(tag, 14)?;
+    return expect_eq(g_drops, 1);
+}
+
+![test]
+function a_borrow_inside_a_closure_body_releases_on_each_call() -> Result<(), TestError> {
+    g_drops = 0;
+    const read = (tag: i64) -> i64 { return tag_through(&make(tag)); };
+    const first: i64 = read(16);
+    expect_eq(g_drops, 1)?;
+    const second: i64 = read(17);
+    expect_eq(first + second, 33)?;
+    return expect_eq(g_drops, 2);
+}
+
+![test]
+function a_borrowed_local_is_released_by_its_scope_only() -> Result<(), TestError> {
+    g_drops = 0;
+    {
+        const held: Counted = make(15);
+        const tag: i64 = tag_through(&held);
+        expect_eq(tag, 15)?;
+        expect_eq(g_drops, 0)?;
+    }
+    return expect_eq(g_drops, 1);
+}

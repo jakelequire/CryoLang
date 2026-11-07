@@ -245,6 +245,7 @@ type struct CallEmitter {
             if (node.arguments[ai].autoref && av.is_valid()
                     && !this.cg.get_arena().is_slice(node.arguments[ai].resolved_type)) {
                 av = this.address_of_value(av);
+                this.cg.record_borrowed_temporary(node.arguments[ai], av);
             }
             call_args.push(Pair::<LValue, TypeRef>::new(av, node.arguments[ai].resolved_type));
         }
@@ -716,22 +717,20 @@ type struct CallEmitter {
                     const recv_slot: LValue = this.entry_spill_slot(recv_ty, "recvtmp");
                     this.cg.builder.build_store(obj, recv_slot);
                     obj = recv_slot;
-                    // A CONSUMED anonymous receiver temp (`make().consume(g())`)
-                    // is moved into the call; if a later argument panics before
-                    // the call runs, this frame must drop it (the callee never
-                    // took it). Record it like a positional owning temp. Gated on
-                    // the same consume check DropInsertion uses, so a receiver it
-                    // treats as borrowed (still owned elsewhere) is not recorded.
-                    if (this.cg.ctx.options.unwinds()
-                        && (ExpressionNode::call_of(ma.object) != null
-                            || ExpressionNode::struct_of(ma.object) != null)
-                        && OwnershipQuery::call_consumes_receiver(this.cg.get_arena(),
-                               this.cg.get_intern(), this.cg.get_decl_index(), node)
-                        && OwnershipQuery::needs_drop(this.cg.get_arena(),
-                               this.cg.ctx.generic_registry, this.cg.get_intern(),
-                               ma.object.resolved_type)) {
-                        this.record_arg_temp_slot(recv_slot, ma.object.resolved_type,
-                                                  ma.object.span);
+                }
+                // A receiver no binding owns (`make().method()`) is either
+                // moved into the call or only borrowed by it.  Moved, the
+                // callee releases it - unless a later argument panics before
+                // the call runs, so it joins the call's unwind temporaries
+                // like a positional owning argument.  Borrowed, it is released
+                // when the statement ends.
+                if (obj.is_valid() && OwnershipQuery::is_owning_temporary(this.cg.get_arena(),
+                        this.cg.ctx.generic_registry, this.cg.get_intern(), ma.object)) {
+                    if (!OwnershipQuery::call_consumes_receiver(this.cg.get_arena(),
+                            this.cg.get_intern(), this.cg.get_decl_index(), node)) {
+                        this.cg.record_borrowed_temporary(ma.object, obj);
+                    } else if (this.cg.ctx.options.unwinds() && !addressable) {
+                        this.record_arg_temp_slot(obj, ma.object.resolved_type, ma.object.span);
                     }
                 }
             }
@@ -757,6 +756,7 @@ type struct CallEmitter {
             if (node.arguments[i].autoref && arg.is_valid()
                     && !this.cg.get_arena().is_slice(node.arguments[i].resolved_type)) {
                 arg = this.address_of_value(arg);
+                this.cg.record_borrowed_temporary(node.arguments[i], arg);
             }
             if (va_ft != null && i < va_ft.param_types.length() && arg.is_valid()) {
                 const pt: Type* = this.cg.arena_type(va_ft.param_types[i]);
@@ -946,18 +946,7 @@ type struct CallEmitter {
         const intern: mut InternTable* = this.cg.get_intern();
         const nm: SymbolStr = intern.intern(fmt::format("__argtemp_%d", this.glue_seq).into_raw());
         this.glue_seq = this.glue_seq + 1;
-        const nm_sym: SymbolID = this.cg.ctx.resolver.alloc_synthetic_binding();
-        this.cg.values.set(nm_sym, slot);
-        const id_node: mut ExpressionNode* = ExpressionNode::identifier_expr(nm, span);
-        ExpressionNode::identifier_of(id_node).set_res(Res::Local(nm_sym));
-        id_node.set_resolved_type(ty);
-        const drop_sym: SymbolStr = intern.intern("drop");
-        mut da: mut ExpressionNode* = ExpressionNode::member_access_expr(
-            id_node, drop_sym, span, span);
-        mut call: mut ExpressionNode* = ExpressionNode::call_expr(da, span);
-        this.cg.bind_destructor_call(call);
-        mut stmt: Stmt* = Stmt::expr_stmt(call, span);
-        this.cg.expr_ops.push_arg_temp_drop(stmt);
+        this.cg.expr_ops.push_arg_temp_drop(this.cg.slot_drop_statement(slot, ty, nm, span));
     }
 
     /// Record a live owning argument temporary so a panic origin nested in a

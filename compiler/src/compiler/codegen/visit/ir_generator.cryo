@@ -53,6 +53,7 @@ import compiler::ast::statement::{
     StaticMatchStmt, Stmt, StmtKind, UnsafeBlockStmt, WhileStmt
 };
 import compiler::codegen::context::{ CodegenContext };
+import compiler::codegen::state::borrowed_temporaries::{ BorrowedTemporary };
 import compiler::codegen::llvm_types::{
     LBasicBlock, LContext, LLinkage, LTargetMachine, LType, LTypeKind, LValue
 };
@@ -261,8 +262,60 @@ type struct IRGeneratorVisitor {
         }
     }
 
-    /// Emit statement `s` by its kind.
+    /// Emit statement `s`, releasing the temporaries it borrows when it ends.
     emit_stmt(mut &this, s: Stmt*) -> Emitted {
+        const block: LBasicBlock = this.cg.builder.get_insert_block();
+        const owner: LValue = if (block.is_valid()) { block.get_parent() } else { LValue::null() };
+        const depth: i64 = this.cg.temporaries.open(owner);
+        const out: Emitted = this.emit_stmt_kind(s);
+        this.release_temporaries_from(this.cg.temporaries.first_of_scope(depth));
+        this.cg.temporaries.close(depth);
+        return out;
+    }
+
+    /// Release the borrowed temporaries recorded from index `first` on,
+    /// newest first, where the builder stands.  One stored in the block the
+    /// release starts in is live here on every path; one stored elsewhere is
+    /// released under its liveness flag.  Each flag is cleared after its
+    /// release.  Nothing is emitted into a block that has already ended.
+    release_temporaries_from(mut &this, first: i64) -> void {
+        const start: LBasicBlock = this.cg.builder.get_insert_block();
+        if (!start.is_valid() || start.has_terminator()) { return; }
+        const owner: LValue = start.get_parent();
+        const name: SymbolStr = this.cg.get_intern().intern("__borrowed_temporary");
+        const flag_type: LType = LType::i1();
+        for (mut i: i64 = this.cg.temporaries.length() - 1; i >= first; i--) {
+            const temporary: BorrowedTemporary = this.cg.temporaries.at(i);
+            const release: Stmt* = this.cg.slot_drop_statement(temporary.slot, temporary.ty,
+                name, temporary.span);
+            if (temporary.block.raw == start.raw) {
+                this.dispatch_node(Node::Stmt(release));
+                this.cg.builder.build_store(LType::const_int(flag_type, 0, false), temporary.flag);
+                continue;
+            }
+            const live_bb: LBasicBlock = LBasicBlock::append(owner, "temporary.release");
+            const done_bb: LBasicBlock = LBasicBlock::append(owner, "temporary.released");
+            const live: LValue = this.cg.builder.build_load(flag_type, temporary.flag, "temporary.live");
+            this.cg.builder.build_cond_br(live, live_bb, done_bb);
+            this.cg.builder.position_at_end(live_bb);
+            this.dispatch_node(Node::Stmt(release));
+            this.cg.builder.build_store(LType::const_int(flag_type, 0, false), temporary.flag);
+            this.cg.flow.branch_if_not_terminated(done_bb);
+            this.cg.builder.position_at_end(done_bb);
+        }
+    }
+
+    /// Release the temporaries a statement's condition borrowed, before the
+    /// statement branches on it: the condition is a whole expression of its
+    /// own, evaluated once per test of a loop.
+    release_condition_temporaries(mut &this) -> void {
+        const first: i64 = this.cg.temporaries.first_of_scope(this.cg.temporaries.innermost());
+        this.release_temporaries_from(first);
+        this.cg.temporaries.forget_from(first);
+    }
+
+    /// Emit statement `s` by its kind.
+    emit_stmt_kind(mut &this, s: Stmt*) -> Emitted {
         match (s.kind) {
             StmtKind::Block(n)       => { return this.visit_block(s, n); }
             StmtKind::UnsafeBlock(n) => { return this.visit_unsafe_block(s, n); }
@@ -416,12 +469,16 @@ type struct IRGeneratorVisitor {
 
     visit_break(mut &this, stmt: Stmt*) -> Emitted {
         mut out: Emitted = Emitted::none();
+        this.release_temporaries_from(
+            this.cg.temporaries.first_of_scope(this.cg.temporaries.loop_depth()));
         this.cg.flow.codegen_break();
         return out;
     }
 
     visit_continue(mut &this, stmt: Stmt*) -> Emitted {
         mut out: Emitted = Emitted::none();
+        this.release_temporaries_from(
+            this.cg.temporaries.first_of_scope(this.cg.temporaries.loop_depth()));
         this.cg.flow.codegen_continue();
         return out;
     }
@@ -683,15 +740,21 @@ type struct IRGeneratorVisitor {
         // Drops attached to the return run *after* the expression value
         // is materialised; the expression may borrow a local that's
         // about to be dropped.  See ReturnStmt.synth_drops and the
-        // return arm in passes/drop_insertion.cryo.
+        // return arm in passes/drop_insertion.cryo.  The temporaries of
+        // every statement the return leaves are released first: they may
+        // borrow those locals, never the other way round.
+        const left: i64 = this.cg.temporaries.first_of_scope(
+            this.cg.temporaries.function_depth(this.get_current_function()));
         if (node.expression != null) {
             const val: LValue = this.dispatch.codegen_rvalue(this,node.expression);
+            this.release_temporaries_from(left);
             for (mut i: i64 = 0; i < node.synth_drops.length(); i++) {
                 const d: Stmt* = node.synth_drops[i];
                 if (d != null) { this.dispatch_node(Node::Stmt(d)); }
             }
             this.cg.expr_ops.codegen_return(val, true, node.expression.resolved_type);
         } else {
+            this.release_temporaries_from(left);
             for (mut i: i64 = 0; i < node.synth_drops.length(); i++) {
                 const d: Stmt* = node.synth_drops[i];
                 if (d != null) { this.dispatch_node(Node::Stmt(d)); }
@@ -704,6 +767,7 @@ type struct IRGeneratorVisitor {
     visit_if(mut &this, stmt: Stmt*, node: IfStmt*) -> Emitted {
         mut out: Emitted = Emitted::none();
         const cond: LValue = this.dispatch.codegen_rvalue(this,node.condition);
+        this.release_condition_temporaries();
         const current_fn: LValue = this.get_current_function();
         const blocks: IfBlocks = this.cg.flow.codegen_if(cond, current_fn,
                                              node.else_stmt != null);
@@ -727,11 +791,14 @@ type struct IRGeneratorVisitor {
         const blocks: LoopBlocks = this.cg.flow.codegen_while_header(current_fn);
         this.cg.builder.position_at_end(blocks.cond_bb);
         const cond: LValue = this.dispatch.codegen_rvalue(this,node.condition);
+        this.release_condition_temporaries();
         this.cg.builder.build_cond_br(cond, blocks.body_bb, blocks.merge_bb);
         this.cg.builder.position_at_end(blocks.body_bb);
+        this.cg.temporaries.enter_loop();
         if (node.body != null) {
             this.dispatch.generate_statement(this,node.body);
         }
+        this.cg.temporaries.leave_loop();
         this.cg.flow.branch_if_not_terminated(blocks.cond_bb);
         this.cg.loops.pop();
         this.cg.builder.position_at_end(blocks.merge_bb);
@@ -750,14 +817,17 @@ type struct IRGeneratorVisitor {
         this.cg.builder.position_at_end(blocks.cond_bb);
         if (node.condition != null) {
             const cond: LValue = this.dispatch.codegen_rvalue(this,node.condition);
+            this.release_condition_temporaries();
             this.cg.builder.build_cond_br(cond, blocks.body_bb, blocks.merge_bb);
         } else {
             this.cg.builder.build_br(blocks.body_bb);
         }
         this.cg.builder.position_at_end(blocks.body_bb);
+        this.cg.temporaries.enter_loop();
         if (node.body != null) {
             this.dispatch.generate_statement(this,node.body);
         }
+        this.cg.temporaries.leave_loop();
         this.cg.flow.branch_if_not_terminated(blocks.update_bb);
         this.cg.builder.position_at_end(blocks.update_bb);
         if (node.update != null) {
@@ -775,9 +845,11 @@ type struct IRGeneratorVisitor {
         const current_fn: LValue = this.get_current_function();
         const blocks: LoopBlocks = this.cg.flow.codegen_loop_header(current_fn);
         this.cg.builder.position_at_end(blocks.body_bb);
+        this.cg.temporaries.enter_loop();
         if (node.body != null) {
             this.dispatch.generate_statement(this,node.body);
         }
+        this.cg.temporaries.leave_loop();
         this.cg.flow.branch_if_not_terminated(blocks.body_bb);
         this.cg.loops.pop();
         this.cg.builder.position_at_end(blocks.merge_bb);
@@ -2133,13 +2205,16 @@ type struct IRGeneratorVisitor {
         const blocks: LoopBlocks = this.cg.flow.codegen_do_while_header(current_fn);
         // Body first (runs at least once).
         this.cg.builder.position_at_end(blocks.body_bb);
+        this.cg.temporaries.enter_loop();
         if (node.body != null) {
             this.dispatch.generate_statement(this,node.body);
         }
+        this.cg.temporaries.leave_loop();
         this.cg.flow.branch_if_not_terminated(blocks.cond_bb);
         // Then the condition: loop back to the body while it holds.
         this.cg.builder.position_at_end(blocks.cond_bb);
         const cond: LValue = this.dispatch.codegen_rvalue(this,node.condition);
+        this.release_condition_temporaries();
         this.cg.builder.build_cond_br(cond, blocks.body_bb, blocks.merge_bb);
         this.cg.loops.pop();
         this.cg.builder.position_at_end(blocks.merge_bb);

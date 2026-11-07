@@ -3423,13 +3423,16 @@ implement trait Drop for Buffer {
 }
 ```
 
-Implementing `Drop` declares "I own resources that must be released." The compiler **automatically synthesises drop calls** for non-`Copy` `const`/`mut` bindings - the analyzer + synthesizer run unconditionally between `MoveCheck` and `TypeLowering`. A value is released at three points:
+Implementing `Drop` declares "I own resources that must be released." The compiler **automatically synthesises drop calls** for non-`Copy` `const`/`mut` bindings - the analyzer + synthesizer run unconditionally between `MoveCheck` and `TypeLowering`. A value is released at four points:
 
 - **Scope exit**, in reverse declaration order, at every exit from the declaring scope (block end, early `return`, `break`, `continue`).
 - **Assignment over a live value**: `x = new_value` releases whatever `x` held. Without this every reassignment of an owning type leaks the previous value, without bound in a loop.
 - **A discarded result**: an expression statement whose value is owning - a call result nobody binds, such as the option `o.replace(v)` hands back - releases it at the end of the statement.
+- **A borrowed temporary**: a call result or struct literal that is only borrowed - `f(&make())`, `make()` passed to a `&T` parameter, `make().len()` with a borrowing receiver, an f-string hole `f"{make()}"` - releases it at the end of the statement that made it, after every call that borrows it has returned. The condition of an `if`, `while`, `do`-`while` or `for` is a statement of its own for this rule: its temporaries are released before the branch, at every test of a loop. A `match` statement keeps its subject's temporaries until the whole `match` ends. A `return`, `break` or `continue` that leaves a statement early releases the temporaries made so far, and one made on a path that was not taken (`ready && f(&make())`) is not released at all.
 
-The last two are released at the statement that performs them, and every statement counts as one wherever it stands: a braceless loop body or `if` branch, and a `for` loop's update clause, release exactly as they would inside braces.
+The last three are released at the statement that performs them, and every statement counts as one wherever it stands: a braceless loop body or `if` branch, and a `for` loop's update clause, release exactly as they would inside braces.
+
+A reference into a borrowed temporary does not outlive its statement: `const s: Str = make_string().as_str();` leaves `s` pointing at released storage. Bind the value first (`const text: String = make_string();`) and borrow the binding.
 
 Auto-drop covers `const x: T = ...` and `mut x: T = ...` declarations, and members of such a local reached by field or constant-index access (`x.f`, `x[0]`). It does **not** yet cover pattern bindings (`match` arms).
 

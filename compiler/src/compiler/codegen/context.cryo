@@ -16,7 +16,12 @@ import compiler::types::{ arena, compound, generic, IntegerKind, type_base, type
 import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name };
 import std::collections::pair;
 import compiler::codegen::abi::{ AbiClassifier };
-import compiler::codegen::llvm_types::{ LBuilder, LModule, LTargetMachine, LType, LValue };
+import compiler::codegen::llvm_types::{ LBasicBlock, LBuilder, LModule, LTargetMachine, LType, LValue };
+import compiler::ast::statement::{ Stmt };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::resolver::res::{ Res };
+import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::types::ownership::{ OwnershipQuery };
 import compiler::codegen::ops::declaration_emitter::{ DebugInfoState, DeclarationEmitter };
 import compiler::codegen::ops::expr_ops::{ ExprOps };
 import compiler::codegen::ops::intrinsic_emitter::{ IntrinsicEmitter };
@@ -26,6 +31,7 @@ import compiler::codegen::state::diag_sink::{ DiagSink };
 import compiler::codegen::state::function_registry::{ FunctionRegistry };
 import compiler::codegen::state::global_registry::{ GlobalRegistry };
 import compiler::codegen::state::loop_stack::{ LoopStack };
+import compiler::codegen::state::borrowed_temporaries::{ BorrowedTemporaries, BorrowedTemporary };
 import compiler::codegen::state::string_cache::{ StringCache };
 import compiler::codegen::state::value_table::{ ValueTable };
 import compiler::codegen::type_map::{ TypeMapper };
@@ -65,6 +71,10 @@ type struct CodegenContext {
     // Push (break_bb, continue_bb) on loop entry; pop on loop exit.
     // `break`/`continue` jump to the top of the stack.
     loops: LoopStack;
+
+    // -- Values made and borrowed on the spot, released when their
+    //    statement ends --
+    temporaries: BorrowedTemporaries;
 
     // -- Control-flow IR primitives (codegen_if/while/for/loop, allocas,
     //    break/continue, terminator guards).  Holds back-pointers to
@@ -129,7 +139,8 @@ type struct CodegenContext {
             str_cache: StringCache::new(),
 
             loops:      LoopStack::new(),
-            flow:       IRFlowEmitter::null(),
+            temporaries: BorrowedTemporaries::new(),
+            flow:      IRFlowEmitter::null(),
             resolver:   SymbolResolver::null(),
             intrinsics: IntrinsicEmitter::null(),
             expr_ops:   ExprOps::null(),
@@ -149,6 +160,51 @@ type struct CodegenContext {
             this.synth_binder = SemaVisitor::synthesized_binder(this.ctx);
         }
         this.synth_binder.bind_destructor_call(call);
+    }
+
+    /// The statement `<name>.drop()` over `slot`, a value of type `ty` that
+    /// no binding names: the slot is bound to a fresh binding, so the
+    /// release lowers like any local's (a user `drop`, field glue, nothing
+    /// for a type with nothing to release).
+    slot_drop_statement(mut &this, slot: LValue, ty: TypeRef, name: SymbolStr,
+                        span: SourceSpan) -> Stmt* {
+        const binding: SymbolID = this.ctx.resolver.alloc_synthetic_binding();
+        this.values.set(binding, slot);
+        const id_node: mut ExpressionNode* = ExpressionNode::identifier_expr(name, span);
+        ExpressionNode::identifier_of(id_node).set_res(Res::Local(binding));
+        id_node.set_resolved_type(ty);
+        const drop_name: SymbolStr = this.get_intern().intern("drop");
+        const callee: mut ExpressionNode* = ExpressionNode::member_access_expr(
+            id_node, drop_name, span, span);
+        const call: mut ExpressionNode* = ExpressionNode::call_expr(callee, span);
+        this.bind_destructor_call(call);
+        return Stmt::expr_stmt(call, span);
+    }
+
+    /// Record `slot`, where the value `e` made was stored to be borrowed,
+    /// for release when the statement being emitted ends.  Only a value no
+    /// binding owns and with something to release is recorded
+    /// (`OwnershipQuery::is_owning_temporary`).  Sets the temporary's
+    /// liveness flag here, where the value is known to exist.
+    record_borrowed_temporary(mut &this, e: ExpressionNode*, slot: LValue) -> void {
+        if (!slot.is_valid() || !OwnershipQuery::is_owning_temporary(this.get_arena(),
+                this.ctx.generic_registry, this.get_intern(), e)) {
+            return;
+        }
+        const block: LBasicBlock = this.builder.get_insert_block();
+        if (!block.is_valid()) { return; }
+        const owner: LValue = block.get_parent();
+        if (!this.temporaries.accepts(owner)) { return; }
+        const flag: LValue = this.flow.temp_slot(LType::i1(), "temporary.live");
+        this.flow.zero_init_in_entry(owner, flag, LType::i1());
+        this.builder.build_store(LType::const_int(LType::i1(), 1, false), flag);
+        this.temporaries.record(BorrowedTemporary {
+            slot:  slot,
+            ty:    e.resolved_type,
+            span:  e.span,
+            block: block,
+            flag:  flag,
+        });
     }
 
     /// Two-phase init step 2: wire up back-pointers on sub-components.
