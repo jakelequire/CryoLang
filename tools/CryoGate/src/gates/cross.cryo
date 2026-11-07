@@ -1,0 +1,296 @@
+///! `cryogate cross --cryo <compiler> [--triple T] [--build-root DIR]
+///! [--min-modules N] [--project P]...`: compile runtime/, stdlib/,
+///! compiler/ and tools/CryoLSP for the other operating system's triple,
+///! objects only from a Windows host, and fail if any of it does not
+///! compile.
+///!
+///! Config gating prunes a `![config(linux)]` module or declaration from a
+///! Windows build before name resolution sees it, and the other way round,
+///! so every gate that runs on one host measures a tree with the other OS's
+///! half cut out.  `cryo build --target=<triple>` selects the other OS's gates
+///! and compiles every module through codegen to objects.  On a Windows host
+///! the Linux triple has no link configuration, so the build stops at
+///! objects; on a Linux host the compiler links a windows-gnu executable and
+///! needs the mingw toolchain and the LLVM-C import library, so the gate is
+///! run from Windows.  Nothing links and nothing runs here.
+///!
+///! `cryo build` is incremental, and a warm build compiles nothing and exits
+///! 0, the shape of a sweep that covered nothing.  So each build directory is
+///! removed first, the build is `--no-incremental`, and the gate passes only
+///! when every project stated the population it built (its `Building ...:
+///! N local, M std module(s)` lines) and the total clears `--min-modules`.
+
+namespace cryogate::gates::cross;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::directory::{ Directory };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::child::{ Completion, Job, Outcome };
+import cryogate::core::host::{ Host };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::options::{ Options, Parsed };
+import cryogate::core::schedule::{ Cost, Scheduler };
+import cryogate::core::text::{ Text };
+
+/// What one project's build said it compiled.
+public type struct Population {
+    /// The number of `Building` lines (one per tier the project builds).
+    public tiers: i64;
+    /// The modules those lines count: local, std and dependency.
+    public modules: i64;
+
+    /// The population a build's output states.
+    public static of(lines: &Array<String>) -> Population {
+        mut population: Population = Population { tiers: 0, modules: 0 };
+        for (line in lines.iter_ref()) {
+            match (Population::counted(line.as_str())) {
+                Option::Some(modules) => {
+                    population.tiers++;
+                    population.modules += modules;
+                }
+                Option::None => { }
+            }
+        }
+        return population;
+    }
+
+    /// The modules a `Building <name> [<profile>]: 164 local, 81 std
+    /// module(s)` line counts; `None` for any other line.
+    public static counted(line: Str) -> Option<i64> {
+        const rest: Str = match (line.strip_prefix(&Str::new("Building"))) {
+            Option::Some(rest) => { rest }
+            Option::None       => { return Option::None; }
+        };
+        if (rest.length() == rest.trim_start().length()) { return Option::None; }
+        const after_profile: Str = match (rest.find(&Str::new("]:"))) {
+            Option::Some(at) => { rest.sub_bytes(at + 2, rest.length()) }
+            Option::None     => { return Option::None; }
+        };
+        const counts: Str = match (after_profile.find(&Str::new(" module"))) {
+            Option::Some(at) => { after_profile.sub_bytes(0, at) }
+            Option::None     => { return Option::None; }
+        };
+        mut modules: i64 = 0;
+        mut previous: Option<i64> = Option::None;
+        for (word in counts.split_nonempty(&Str::new(" "))) {
+            match (previous) {
+                Option::Some(count) => {
+                    if (word.starts_with(&Str::new("local")) || word.starts_with(&Str::new("std")) || word.starts_with(&Str::new("dep"))) {
+                        modules += count;
+                    }
+                }
+                Option::None => { }
+            }
+            previous = match (i64::try_from(word)) {
+                Result::Ok(count) => { Option::Some(count) }
+                Result::Err(_)    => { Option::None }
+            };
+        }
+        return Option::Some(modules);
+    }
+}
+
+public type struct CrossCheck {
+    public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
+        mut options: Options = Options::new(Str::new("cryogate cross --cryo <compiler> [--triple T] [--build-root DIR] [--min-modules N] [--project P]..."));
+        options.valued(Str::new("--cryo"));
+        options.valued(Str::new("--triple"));
+        options.valued(Str::new("--build-root"));
+        options.valued(Str::new("--min-modules"));
+        options.valued(Str::new("--project"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate cross: {reason.as_str()}"); return 2; }
+        };
+        if (!parsed.positionals().is_empty() || parsed.separated()) {
+            fmt::eprintln(f"cryogate cross: usage: {options.usage()}");
+            return 2;
+        }
+        const compiler: String = match (parsed.value(Str::new("--cryo"))) {
+            Option::Some(path) => { Host::absolute(path) }
+            Option::None       => { fmt::eprintln(f"cryogate cross: --cryo is required; usage: {options.usage()}"); return 2; }
+        };
+        const floor: i64 = match (parsed.value(Str::new("--min-modules"))) {
+            Option::Some(text) => {
+                match (i64::try_from(text)) {
+                    Result::Ok(count) => { count }
+                    Result::Err(_)    => { fmt::eprintln(f"cryogate cross: `--min-modules` takes a whole number, not `{text}`"); return 2; }
+                }
+            }
+            Option::None => { CrossCheck::MINIMUM_MODULES }
+        };
+        const triple: String = match (parsed.value(Str::new("--triple"))) {
+            Option::Some(text) => { String::from_str(text) }
+            Option::None       => { String::from_str(CrossCheck::other_triple()) }
+        };
+        const build_root: String = match (parsed.value(Str::new("--build-root"))) {
+            Option::Some(path) => { Host::absolute(path) }
+            Option::None       => { String::from_str(repository.join(Str::new(".cross-check")).as_path().as_str()) }
+        };
+        const chosen: Array<String> = parsed.values_of(Str::new("--project"));
+        const projects: Array<String> = if (chosen.is_empty()) { CrossCheck::projects() } else { chosen.clone() };
+        for (project in projects.iter_ref()) {
+            if (!CrossCheck::projects().contains(project)) {
+                fmt::eprintln(f"cryogate cross: `--project` is one of runtime, stdlib, compiler, tools/CryoLSP, not `{project.as_str()}`");
+                return 2;
+            }
+        }
+
+        if (!Path::from(compiler.as_str()).is_file()) {
+            return CrossCheck::fail(f"compiler binary not found: {compiler.as_str()}");
+        }
+        for (project in projects.iter_ref()) {
+            if (!repository.join(project.as_str()).join(Str::new("cryoconfig")).as_path().is_file()) {
+                return CrossCheck::fail(f"no cryoconfig at {project.as_str()}; nothing to build");
+            }
+        }
+
+        // The projects are independent builds into separate directories, so
+        // they run at once; each is judged in the order above, and the first
+        // to fail is the one reported.
+        mut scheduler: Scheduler = Scheduler::new();
+        scheduler.set_slots(projects.length());
+        const stdlib: String = Host::stdlib_directory(repository);
+        for (project in projects.iter_ref()) {
+            const build_directory: PathBuf = PathBuf::from(build_root.as_str()).join(triple.as_str()).join(project.as_str().replace(&Str::new("/"), &Str::new("_")).as_str());
+            if (build_directory.as_path().exists()) { Directory::remove_all(build_directory.as_path()); }
+            if (build_directory.as_path().exists()) {
+                return CrossCheck::fail(f"could not clear {build_directory.as_path().as_str()}; a warm build compiles nothing and reports success");
+            }
+            // The driver creates the build directory but not its parents.
+            match (Directory::create_all(build_directory.as_path())) {
+                Result::Ok(_)      => { }
+                Result::Err(error) => { return CrossCheck::fail(f"cannot create {build_directory.as_path().as_str()}: {error.describe()}"); }
+            }
+            mut job: Job = Job::new(compiler.as_str());
+            job.argument(Str::new("build"));
+            job.argument(f"--target={triple.as_str()}".as_str());
+            job.argument(f"--build-dir={build_directory.as_path().as_str()}".as_str());
+            job.argument(Str::new("--no-incremental"));
+            job.directory(repository.join(project.as_str()).as_path().as_str());
+            // The compiler under test cannot find the stdlib from runtime/ or
+            // compiler/; pinning the tree's makes the result independent of
+            // which binary runs.
+            job.set_variable(Str::new("CRYO_STDLIB"), stdlib.as_str());
+            job.log_to(logs.file(f"cross-{project.as_str().replace(&Str::new("/"), &Str::new("_")).as_str()}".as_str()).as_str());
+            scheduler.add(job, Cost::Compile);
+        }
+        const results: Array<Completion> = scheduler.run();
+
+        mut total: i64 = 0;
+        mut summary: Array<String> = Array::<String>::new();
+        mut index: i64 = 0;
+        for (done in results.iter_ref()) {
+            const project: Str = projects.get_ref(index).unwrap().as_str();
+            index++;
+            const lines: Array<String> = Text::lines(done.output().as_str());
+            const errors: Array<String> = CrossCheck::error_report(&lines);
+            if (!done.outcome.succeeded()) {
+                fmt::println(f"cross-check: {project} does not compile for {triple.as_str()}");
+                const shown: Array<String> = if (errors.is_empty()) { CrossCheck::last(&lines, 25) } else { errors.clone() };
+                mut count: i64 = 0;
+                for (line in shown.iter_ref()) {
+                    if (count < 40) { fmt::println(f"        | {line.as_str()}"); }
+                    count++;
+                }
+                mut error_lines: i64 = 0;
+                for (line in errors.iter_ref()) { if (line.as_str().starts_with(&Str::new("error"))) { error_lines++; } }
+                const ended: String = match (&done.outcome) {
+                    Outcome::Exited(code) => { f"exited {code}" }
+                    _                     => { done.outcome.describe() }
+                };
+                return CrossCheck::fail(f"{project}: build {ended.as_str()} with {error_lines} error line(s)");
+            }
+            const population: Population = Population::of(&lines);
+            if (population.tiers == 0) {
+                fmt::println(f"cross-check: {project} reported no population.  The first line was:");
+                if (lines.is_empty()) {
+                    fmt::println(String::from_str(Str::new("        | <no output>")));
+                } else {
+                    fmt::println(f"        | {lines.get_ref(0).unwrap().as_str()}");
+                }
+                return CrossCheck::fail(f"{project}: nothing was compiled; a build that skipped the tree has not gated it");
+            }
+            total += population.modules;
+            if (population.tiers > 1) {
+                summary.push(f"{project} {population.modules} module(s) in {population.tiers} tier(s)");
+            } else {
+                summary.push(f"{project} {population.modules} module(s)");
+            }
+        }
+        // The floor is a claim about the whole gate; a `--project` subset is a
+        // way to reproduce one refusal, not a run of the gate.
+        if (chosen.is_empty() && total < floor) {
+            return CrossCheck::fail(f"compiled {total} module(s) in total, expected at least {floor}");
+        }
+        fmt::println(f"cross-check: OK -- {triple.as_str()}: {Text::joined(&summary, Str::new(", ")).as_str()}; 0 errors");
+        return 0;
+    }
+
+    /// Every `error...` line with the `-->` span within the two lines after
+    /// it.
+    public static error_report(lines: &Array<String>) -> Array<String> {
+        mut report: Array<String> = Array::<String>::new();
+        mut index: i64 = 0;
+        while (index < lines.length()) {
+            const line: Str = lines.get_ref(index).unwrap().as_str();
+            if (line.starts_with(&Str::new("error"))) {
+                report.push(String::from_str(line));
+                mut follow: i64 = index + 1;
+                while (follow < lines.length() && follow <= index + 2) {
+                    const next: Str = lines.get_ref(follow).unwrap().as_str();
+                    if (next.trim().starts_with(&Str::new("-->"))) {
+                        report.push(String::from_str(next));
+                        break;
+                    }
+                    follow++;
+                }
+            }
+            index++;
+        }
+        return report;
+    }
+
+    static last(lines: &Array<String>, count: i64) -> Array<String> {
+        mut tail: Array<String> = Array::<String>::new();
+        mut index: i64 = if (lines.length() > count) { lines.length() - count } else { 0 };
+        while (index < lines.length()) {
+            tail.push(lines.get_ref(index).unwrap().clone());
+            index++;
+        }
+        return tail;
+    }
+
+    static fail(reason: String) -> i32 {
+        fmt::println(f"cross-check: FAIL -- {reason.as_str()}");
+        return 1;
+    }
+
+    /// The projects, in the order they are cheapest to fail: the runtime
+    /// tiers, the stdlib, the compiler (the stdlib and its own modules), the
+    /// LSP (the compiler again and its own).  Each is named by its path from
+    /// the repository root.
+    static projects() -> Array<String> {
+        mut projects: Array<String> = Array::<String>::new();
+        projects.push(String::from_str(Str::new("runtime")));
+        projects.push(String::from_str(Str::new("stdlib")));
+        projects.push(String::from_str(Str::new("compiler")));
+        projects.push(String::from_str(Str::new("tools/CryoLSP")));
+        return projects;
+    }
+
+    /// The triple of the operating system this host is not, spelled as
+    /// `cryo version --triple` spells it on that host.
+    ![target(windows)]
+    static other_triple() -> Str { return Str::new("x86_64-pc-linux-gnu"); }
+    ![target(unix)]
+    static other_triple() -> Str { return Str::new("x86_64-pc-windows-gnu"); }
+
+    const MINIMUM_MODULES: i64 = 350;
+}

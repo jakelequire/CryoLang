@@ -771,13 +771,9 @@ endif
 # the checking is the surface being gated, and the pin performs an older one.
 # Objects only: nothing links and nothing runs, so a link-time or runtime
 # defect on the other OS is still `verify-freestanding` / CI's to find.
-ifeq ($(HOST_OS),windows)
-cross-check: $(STAGE2_EXE)
-	@$(PYTHON) scripts/cross-check.py --cryo "$(STAGE2_EXE)" $(ARGS)
-else
-cross-check: $(STAGE2)
-	@$(PYTHON) scripts/cross-check.py --cryo "$(STAGE2)" $(ARGS)
-endif
+# `cryogate cross`; ARGS passes --triple, --project, --min-modules through.
+cross-check: $(STAGE2_FILE) $(CRYOGATE)
+	@$(CRYOGATE_COMMAND) cross --cryo "$(STAGE2_FILE)" $(ARGS)
 
 # ---- stdlib API index --------------------------------------------------
 # Regenerate docs/stdlib-api.txt, the one-file answer to "does this already

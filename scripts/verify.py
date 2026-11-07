@@ -8,7 +8,7 @@ build:
     census     scripts/test-census.py    the three suites, counts reconciled
     examples   cryogate examples         every examples/ project builds
     lsp        scripts/lsp-gate.py       tools/CryoLSP builds and answers
-    cross      scripts/cross-check.py    the other OS's gated half compiles
+    cross      cryogate cross            the other OS's gated half compiles
     incr       cryogate incr --instance  an edit asking a cached module for a
                                          new generic instance still links
     fast       make check-fast           verify's self-test, pin integrity
@@ -112,7 +112,7 @@ GATES = {
     "examples": ([CRYOGATE, "examples", "--cryo", "{cryo}", "--stdlib", "{stdlib}"],
                  r"^examples-gate: "),
     "lsp":      ([PY, "scripts/lsp-gate.py", "--cryo", "{cryo}"], r"^lsp-gate: "),
-    "cross":    ([PY, "scripts/cross-check.py", "--cryo", "{cryo}"], r"^cross-check: "),
+    "cross":    ([CRYOGATE, "cross", "--cryo", "{cryo}"], r"^cross-check: "),
     "incr":     ([CRYOGATE, "incr", "--instance", "--cryo", "{cryo}"],
                  r"^incremental-instance-check: "),
     # `ARGS=` on the command line: `make verify ARGS=...` exports ARGS to

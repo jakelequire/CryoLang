@@ -33,7 +33,7 @@ here.
 **Built so far:** G1's core (§8): the child runner, the scheduler, the
 heavy-run lock and `cryogate heavy`, the run logs, `cryogate selftest`, and
 `make cryogate`; the heavy Makefile targets run under the lock. Ported:
-`incr --instance`, `examples` and `vendor` (G4).
+`incr --instance`, `examples` and `vendor` (G4), `cross` (G7).
 
 ---
 
@@ -185,7 +185,7 @@ compiler subcommand, because the compiler already holds the answer), **keep**
 | `scripts/check-examples-output.sh` | 96 | builds and runs five examples, diffs stdout with the goldens (POSIX) | **replace**: the examples' `expected.out` become `stdout_file` assertions (ruling 271), run by `cryogate examples --run` | runs on Windows too; the hard-coded list becomes "every example with an `expected.out`", keeping the two-way set check |
 | `scripts/valgrind-check.sh` | 73 | four examples under valgrind (Linux) | **port** → `cryogate examples --under=valgrind` | the same build-and-run loop with a runner prefix; one loop, not two |
 | `scripts/lsp-gate.py` + `tools/CryoLSP/tests/smoke.py` | 189 + 1285 | builds CryoLSP with the compiler under test; drives it over stdio through protocol checks and every fixture's `checks.json` | **port** → `cryogate lsp` (§4g) | the largest port by line count; the JSON-RPC driver is reused by the LSP fuzzing lanes later |
-| `scripts/cross-check.py` | 193 | the other OS's runtime, stdlib, compiler and CryoLSP, objects only, concurrently | **port** → `cryogate cross` | once `cryo build` can stop at objects (ruling 322) it also passes on a Linux host (bug 0035) |
+| `scripts/cross-check.py` | 193 | the other OS's runtime, stdlib, compiler and CryoLSP, objects only, concurrently | **ported** → `cryogate cross` (script deleted) | once `cryo build` can stop at objects (ruling 322) it also passes on a Linux host (bug 0035) |
 | `scripts/incremental-instance-check.py` | 90 | an edit asking a cached module for a new instance still links and reuses the cache | **ported** → `cryogate incr --instance` (script deleted) | small; part of verify |
 | `scripts/incremental-check.py` | 267 | incremental build == clean build over a three-file edit matrix (Linux; a PE carries a link timestamp) | **replace** with the edit-fuzz gate written as `cryogate incr` on perf's bitcode-keyed module cache (question 3: cryogate writes it) | the fuzz gate compares `.o` hashes, not binaries, which also lifts the Windows refusal; the fixed matrix becomes one of its modes. Today's script also leaks its temp directory |
 | `scripts/vendor-consts-gate.py` | 279 | header-vs-table check, `cryo vendor` under a throwaway `CRYO_HOME`, builds and runs a consumer of every constant | **ported** → `cryogate vendor` (script deleted) | needs only child processes, files and a temp directory |
@@ -606,7 +606,7 @@ cryogate`), with the option parser (`core/options`) and the tree copy
 (`core/tree`); the tree listing and the git helper are built with the first
 gate that calls them, since a helper nothing calls is dead code. Its self-test
 is green on both hosts' stdlib since the `Command` working-directory double
-free was fixed. **Ported:** `incr --instance`, `vendor` and `examples` (G4's
+free was fixed. **Ported:** `cross` (G7), `incr --instance`, `vendor` and `examples` (G4's
 build sweep; its `--run` goldens and `--under=valgrind` modes are still the
 shell scripts), with `core/text` (lines, joining) beside the core.
 

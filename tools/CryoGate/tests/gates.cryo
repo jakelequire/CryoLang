@@ -12,6 +12,7 @@ import std::test::error::{ TestError };
 import std::test::assert::{ expect, expect_false };
 
 import cryogate::core::options::{ Options, Parsed };
+import cryogate::gates::cross::{ CrossCheck, Population };
 import cryogate::gates::incr::{ IncrementalInstance };
 import cryogate::gates::vendor::{ VendorGate };
 
@@ -90,6 +91,38 @@ function a_header_publishes_object_like_macros_and_static_constants() -> Result<
     expect(names.get_ref(2).unwrap().as_str() == Str::new("VC_TWO_STEP"), Str::new("a macro invoking a macro"))?;
     expect(names.get_ref(3).unwrap().as_str() == Str::new("VC_WIDE_FLAG"), Str::new("the static constant"))?;
     return expect_false(names.contains(&String::from_str(Str::new("VC_MAKE_VERSIO"))), Str::new("a function-like macro is not read as a shorter name"));
+}
+
+![test]
+function a_build_states_its_population_on_its_building_lines() -> Result<(), TestError> {
+    expect(Population::counted(Str::new("Building cryo [release]: 164 local, 81 std module(s)")).unwrap() == 245, Str::new("local and std"))?;
+    expect(Population::counted(Str::new("Building cryolsp [release]: 33 local, 85 std, 169 dep module(s)")).unwrap() == 287, Str::new("with dependencies"))?;
+    expect(Population::counted(Str::new("Building cryort-core [release]: 3 local module(s)")).unwrap() == 3, Str::new("a runtime tier"))?;
+    expect(Population::counted(Str::new("cryo is up to date")).is_none(), Str::new("a warm build states none"))?;
+    expect(Population::counted(Str::new("Buildingcryo [release]: 3 local module(s)")).is_none(), Str::new("the name is separated"))?;
+    mut lines: Array<String> = Array::<String>::new();
+    lines.push(String::from_str(Str::new("Building cryort-core [release]: 3 local module(s)")));
+    lines.push(String::from_str(Str::new("Building cryort-panic [release]: 2 local module(s)")));
+    lines.push(String::from_str(Str::new("Compiled -> build/x")));
+    const population: Population = Population::of(&lines);
+    expect(population.tiers == 2, Str::new("two tiers"))?;
+    return expect(population.modules == 5, Str::new("their modules summed"));
+}
+
+![test]
+function an_error_report_keeps_each_error_with_its_span() -> Result<(), TestError> {
+    mut lines: Array<String> = Array::<String>::new();
+    lines.push(String::from_str(Str::new("error[E0233]: cannot find `x`")));
+    lines.push(String::from_str(Str::new(" --> src/a.cryo:3:5")));
+    lines.push(String::from_str(Str::new("note: unrelated")));
+    lines.push(String::from_str(Str::new("error: linking failed")));
+    lines.push(String::from_str(Str::new("    |")));
+    lines.push(String::from_str(Str::new("    |")));
+    lines.push(String::from_str(Str::new(" --> too far away")));
+    const report: Array<String> = CrossCheck::error_report(&lines);
+    expect(report.length() == 3, Str::new("two errors and one span"))?;
+    expect(report.get_ref(1).unwrap().as_str().contains(&Str::new("src/a.cryo:3:5")), Str::new("the span follows its error"))?;
+    return expect(report.get_ref(2).unwrap().as_str() == Str::new("error: linking failed"), Str::new("a span three lines on is not its"));
 }
 
 ![test]
