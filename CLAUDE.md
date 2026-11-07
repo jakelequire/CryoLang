@@ -47,7 +47,8 @@ make verify-pin          # both pins match their sidecars (sha256 and stamped co
 make verify-freestanding # runtime/ tiers built by the compiler under test
 make examples            # smoke-build every examples/ project (refuses a sweep below
                          # the shipped count, `cryogate examples`' --min)
-make examples-golden     # build AND run them, diff stdout (POSIX only)
+make examples-golden     # build them AND run each with an expected.out, compare its
+                         # output (`cryogate examples --run`, both hosts, heavy)
 make incremental-check   # incremental build == clean build, per module
 make incremental-instance-check  # an edit asking a cached module for a new generic
                          # instance still links (a verify gate: `incr`)

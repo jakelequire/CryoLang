@@ -1,12 +1,18 @@
-///! `cryogate examples --cryo <compiler> [--min N] [--stdlib DIR] [--jobs N]`:
-///! build every `examples/*/` project and fail if any of them does not
-///! compile.
+///! `cryogate examples --cryo <compiler> [--run] [--min N] [--min-goldens N]
+///! [--stdlib DIR] [--jobs N]`: build every `examples/*/` project and fail if
+///! any of them does not compile.  With `--run`, every example holding an
+///! `expected.out` is then run with no input, in its own directory, and its
+///! output stream must equal that file line for line (a `\r` before a line
+///! break and empty lines at the end are not compared, so one golden serves
+///! every host); it must also exit 0 within `RUN_SECONDS`.
 ///!
 ///! The sweep says what it covered, and refuses rather than reporting
 ///! success when it could not have covered enough: the compiler is missing
 ///! (cannot sweep), or fewer projects than `--min` were found (a rename, a
 ///! moved directory or a cryoconfig that stopped parsing finds fewer, not
-///! none, so the floor is the shipped set, not 1).  The summary line states
+///! none, so the floor is the shipped set, not 1), or with `--run` fewer
+///! goldens than `--min-goldens`, or a golden beside no project.  The
+///! summary line states
 ///! the population.  Each project builds in its own directory, `--jobs` at
 ///! once (default: the scheduler's slots), and results print in project
 ///! order at any job count.
@@ -19,8 +25,9 @@ import std::collections::string::{ String };
 import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::fmt;
-import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
 import std::fs::path::{ Path, PathBuf };
+import std::time::duration::{ Duration };
 
 import cryogate::core::child::{ Completion, Job };
 import cryogate::core::host::{ Host };
@@ -28,12 +35,15 @@ import cryogate::core::log::{ RunLogs };
 import cryogate::core::options::{ Options, Parsed };
 import cryogate::core::schedule::{ Cost, Scheduler };
 import cryogate::core::text::{ Text };
+import cryogate::core::tree::{ Tree };
 
 public type struct ExamplesGate {
     public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
-        mut options: Options = Options::new(Str::new("cryogate examples --cryo <compiler> [--min N] [--stdlib DIR] [--jobs N]"));
+        mut options: Options = Options::new(Str::new("cryogate examples --cryo <compiler> [--run] [--min N] [--min-goldens N] [--stdlib DIR] [--jobs N]"));
         options.valued(Str::new("--cryo"));
+        options.flag(Str::new("--run"));
         options.valued(Str::new("--min"));
+        options.valued(Str::new("--min-goldens"));
         options.valued(Str::new("--stdlib"));
         options.valued(Str::new("--jobs"));
         const parsed: Parsed = match (options.parse(arguments, first)) {
@@ -56,6 +66,10 @@ public type struct ExamplesGate {
             Result::Ok(count)   => { count }
             Result::Err(reason) => { fmt::eprintln(f"cryogate examples: {reason.as_str()}"); return 2; }
         };
+        const minimum_goldens: i64 = match (ExamplesGate::count(&parsed, Str::new("--min-goldens"), ExamplesGate::SHIPPED_GOLDENS)) {
+            Result::Ok(count)   => { count }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate examples: {reason.as_str()}"); return 2; }
+        };
         const jobs: i64 = match (ExamplesGate::count(&parsed, Str::new("--jobs"), 0)) {
             Result::Ok(count)   => { count }
             Result::Err(reason) => { fmt::eprintln(f"cryogate examples: {reason.as_str()}"); return 2; }
@@ -66,7 +80,7 @@ public type struct ExamplesGate {
             fmt::println(String::from_str(Str::new("examples-gate: refusing to report success without sweeping anything")));
             return 2;
         }
-        const projects: Array<String> = ExamplesGate::discover(repository.join(Str::new("examples")).as_path());
+        const projects: Array<String> = ExamplesGate::holding(repository.join(Str::new("examples")).as_path(), Str::new("cryoconfig"));
         if (projects.length() < minimum) {
             fmt::println(f"examples-gate: FAIL -- discovered {projects.length()} project(s), expected at least {minimum}");
             fmt::println(String::from_str(Str::new("examples-gate: refusing to report success without sweeping anything")));
@@ -112,25 +126,130 @@ public type struct ExamplesGate {
             fmt::println(f"examples-gate: FAIL -- {failed.length()} of {projects.length()} project(s) did not build: {Text::joined(&failed, Str::new(" ")).as_str()}");
             return 1;
         }
-        fmt::println(f"examples-gate: OK -- {projects.length()} project(s) built");
+        if (!parsed.has(Str::new("--run"))) {
+            fmt::println(f"examples-gate: OK -- {projects.length()} project(s) built");
+            return 0;
+        }
+        return ExamplesGate::run_goldens(repository.join(Str::new("examples")).as_path(), logs, &projects, minimum_goldens, jobs);
+    }
+
+    /// Run every example holding an `expected.out` and compare its output
+    /// stream with that file.  A golden in a directory that is no project
+    /// is refused, since nothing would run it; fewer goldens than `minimum`
+    /// is refused, since a deleted golden otherwise only shrinks the run.
+    static run_goldens(examples: Path, logs: &RunLogs, projects: &Array<String>, minimum: i64, jobs: i64) -> i32 {
+        const goldens: Array<String> = ExamplesGate::holding(examples, Str::new("expected.out"));
+        mut failed: Array<String> = Array::<String>::new();
+        mut runnable: Array<String> = Array::<String>::new();
+        for (name in goldens.iter_ref()) {
+            if (projects.contains(name)) {
+                runnable.push(name.clone());
+                continue;
+            }
+            const golden: String = f"examples/{name.as_str()}/expected.out";
+            fmt::println(f"  FAIL  {golden.as_str()}: beside no project, so nothing runs it");
+            failed.push(golden);
+        }
+        if (goldens.length() < minimum) {
+            fmt::println(f"examples-gate: FAIL -- found {goldens.length()} expected.out file(s), expected at least {minimum}");
+            fmt::println(String::from_str(Str::new("examples-gate: refusing to report success without running enough")));
+            return 2;
+        }
+
+        mut scheduler: Scheduler = Scheduler::new();
+        scheduler.set_slots(jobs);
+        for (name in runnable.iter_ref()) {
+            const directory: PathBuf = examples.join(name.as_str());
+            const program: PathBuf = directory.join(Str::new("build")).as_path().join(Host::executable_name(name.as_str()).as_str());
+            mut job: Job = Job::new(program.as_path().as_str());
+            job.directory(directory.as_path().as_str());
+            job.log_to(logs.file(f"examples-run-{name.as_str()}".as_str()).as_str());
+            job.errors_to(logs.file(f"examples-run-{name.as_str()}-errors".as_str()).as_str());
+            job.limit(Duration::from_secs(ExamplesGate::RUN_SECONDS));
+            scheduler.add(job, Cost::Light);
+        }
+        const results: Array<Completion> = scheduler.run();
+
+        mut index: i64 = 0;
+        for (done in results.iter_ref()) {
+            const name: Str = runnable.get_ref(index).unwrap().as_str();
+            index++;
+            const relative: String = f"examples/{name}/expected.out";
+            if (!done.outcome.succeeded()) {
+                fmt::println(f"  FAIL  {relative.as_str()}: running examples/{name}: {done.outcome.describe().as_str()}");
+                failed.push(relative);
+                continue;
+            }
+            const golden_path: PathBuf = examples.join(name).as_path().join(Str::new("expected.out"));
+            const golden: String = match (File::read_text(golden_path.as_path())) {
+                Result::Ok(text)   => { text }
+                Result::Err(error) => {
+                    fmt::println(f"  FAIL  {relative.as_str()}: cannot read it: {error.describe()}");
+                    failed.push(relative);
+                    continue;
+                }
+            };
+            const expected: Array<String> = Text::lines(golden.as_str());
+            const got: Array<String> = Text::lines(done.output().as_str());
+            match (ExamplesGate::first_difference(&expected, &got)) {
+                Option::None => { fmt::println(f"  ok    {relative.as_str()}"); }
+                Option::Some(line) => {
+                    fmt::println(f"  FAIL  {relative.as_str()}: the output of examples/{name} differs at line {line + 1}");
+                    fmt::println(f"        expected | {ExamplesGate::line_or_end(&expected, line).as_str()}");
+                    fmt::println(f"        got      | {ExamplesGate::line_or_end(&got, line).as_str()}");
+                    failed.push(relative);
+                }
+            }
+        }
+        if (!failed.is_empty()) {
+            fmt::println(f"examples-gate: FAIL -- {failed.length()} of {goldens.length()} expected.out file(s) not matched: {Text::joined(&failed, Str::new(" ")).as_str()}");
+            return 1;
+        }
+        fmt::println(f"examples-gate: OK -- {projects.length()} project(s) built, {runnable.length()} ran and matched their expected.out");
         return 0;
     }
 
-    /// The names of the directories under `examples` holding a cryoconfig,
-    /// sorted.
-    static discover(examples: Path) -> Array<String> {
-        mut found: Array<String> = Array::<String>::new();
-        match (Directory::entries(examples)) {
-            Result::Ok(entries) => {
-                for (entry in entries) {
-                    if (examples.join(entry.name()).join(Str::new("cryoconfig")).as_path().is_file()) {
-                        found.push(String::from_str(entry.name()));
-                    }
-                }
-            }
-            Result::Err(_) => { }
+    /// The first line, counted from 0, at which `got` differs from
+    /// `expected`, or `None` when they agree.  Empty lines at the end of
+    /// either are not compared: a program's last line break, or its
+    /// absence, is not part of what it printed.
+    public static first_difference(expected: &Array<String>, got: &Array<String>) -> Option<i64> {
+        const expected_length: i64 = ExamplesGate::without_trailing_empty(expected);
+        const got_length: i64 = ExamplesGate::without_trailing_empty(got);
+        mut line: i64 = 0;
+        while (line < expected_length && line < got_length) {
+            if (expected.get_ref(line).unwrap().as_str() != got.get_ref(line).unwrap().as_str()) { return Option::Some(line); }
+            line++;
         }
-        found.sort();
+        if (expected_length == got_length) { return Option::None; }
+        return Option::Some(line);
+    }
+
+    /// The number of `lines` left once empty lines at the end are dropped.
+    static without_trailing_empty(lines: &Array<String>) -> i64 {
+        mut length: i64 = lines.length();
+        while (length > 0 && lines.get_ref(length - 1).unwrap().is_empty()) { length--; }
+        return length;
+    }
+
+    /// Line `line` of `lines` for a report, or a marker past their end.
+    static line_or_end(lines: &Array<String>, line: i64) -> String {
+        if (line < ExamplesGate::without_trailing_empty(lines)) { return lines.get_ref(line).unwrap().clone(); }
+        return String::from_str(Str::new("(end of output)"));
+    }
+
+    /// The names of the directories under `examples` holding `file`,
+    /// sorted; none when `examples` cannot be listed, which the floors then
+    /// refuse.
+    static holding(examples: Path, file: Str) -> Array<String> {
+        mut found: Array<String> = Array::<String>::new();
+        const names: Array<String> = match (Tree::names(examples, &Array::<String>::new())) {
+            Result::Ok(names) => { names }
+            Result::Err(_)    => { return found; }
+        };
+        for (name in names.iter_ref()) {
+            if (examples.join(name.as_str()).join(file).as_path().is_file()) { found.push(name.clone()); }
+        }
         return found;
     }
 
@@ -149,6 +268,11 @@ public type struct ExamplesGate {
 
     /// The number of projects `examples/` ships; raise it when one is added.
     const SHIPPED: i64 = 15;
+    /// The number of examples shipping an `expected.out`; raise it when one
+    /// is added.
+    const SHIPPED_GOLDENS: i64 = 5;
     /// The lines of a failed build's output that are printed.
     const TAIL_LINES: i64 = 25;
+    /// How long a golden example may run before it is killed and failed.
+    const RUN_SECONDS: u64 = 60;
 }

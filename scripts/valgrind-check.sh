@@ -33,7 +33,8 @@ if ! command -v valgrind >/dev/null 2>&1; then
     exit 1
 fi
 
-# Deterministic, input-free examples only (same set as check-examples-output.sh):
+# Deterministic, input-free examples only (those with an expected.out but
+# 15-files, which `make examples-golden` runs):
 # no argv/stdin, clock, RNG, or threads, so a run is reproducible under valgrind.
 EXAMPLES=(02-fizzbuzz 07-shapes 10-expr-interpreter 13-closures)
 

@@ -33,8 +33,8 @@ here.
 **Built so far:** G1's core (§8): the child runner, the scheduler, the
 heavy-run lock and `cryogate heavy`, the run logs, `cryogate selftest`, and
 `make cryogate`; the heavy Makefile targets run under the lock. Ported:
-`roster` and `census` (G2, G3), `incr --instance`, `examples` and `vendor`
-(G4), `cross` (G7).
+`roster` and `census` (G2, G3), `incr --instance`, `examples` (with
+`--run`) and `vendor` (G4), `cross` (G7).
 
 ---
 
@@ -183,7 +183,7 @@ compiler subcommand, because the compiler already holds the answer), **keep**
 | `scripts/test-census.py` | 326 | runs `cryo test --format=plain`, reconciles counts and names against the roster golden | **ported** → `cryogate census` (script deleted; `verify.py` reads the parse from `cryogate census --read <log>`), then **replace its parsing** with the runner's report (§4d) | rulings 271-272 move the counts into the runner; the reconciliation against the golden stays a gate |
 | `scripts/roster-check.py` | 543 | `--list` + project and negative fingerprints vs `tests/test-roster.txt`; `--merge`, `--update`, `--selftest` | **ported** → `cryogate roster` (script deleted; its self-test cases are `![test]`s; it also refuses a `test.json` list field the runner would skip, which the script pinned as one assertion per character) | pure file reading plus one child; once `--list` lists all three suites, the filesystem enumeration moves into the runner and this shrinks to a diff and the merge |
 | `scripts/examples-gate.py` | 110 | builds every `examples/*` with a floor (`--min`) | **ported** → `cryogate examples` (script deleted; the floor raised from 14 to the 15 shipped) | small; the absolute forward-slash stdlib spelling is kept, though the objects no longer move with it (stdlib files are named `stdlib/<path>`) |
-| `scripts/check-examples-output.sh` | 96 | builds and runs five examples, diffs stdout with the goldens (POSIX) | **replace**: the examples' `expected.out` become `stdout_file` assertions (ruling 271), run by `cryogate examples --run` | runs on Windows too; the hard-coded list becomes "every example with an `expected.out`", keeping the two-way set check |
+| `scripts/check-examples-output.sh` | 96 | builds and runs five examples, diffs stdout with the goldens (POSIX) | **ported** → `cryogate examples --run` (script deleted), then **replace** its comparison with `stdout_file` assertions (ruling 271) | runs on Windows too; the hard-coded list became "every example with an `expected.out`": a golden beside no project is refused, and a floor (`--min-goldens`, the 5 shipped) refuses a deleted one; an example must also exit 0, which the script never checked |
 | `scripts/valgrind-check.sh` | 73 | four examples under valgrind (Linux) | **port** → `cryogate examples --under=valgrind` | the same build-and-run loop with a runner prefix; one loop, not two |
 | `scripts/lsp-gate.py` + `tools/CryoLSP/tests/smoke.py` | 189 + 1285 | builds CryoLSP with the compiler under test; drives it over stdio through protocol checks and every fixture's `checks.json` | **port** → `cryogate lsp` (§4g) | the largest port by line count; the JSON-RPC driver is reused by the LSP fuzzing lanes later |
 | `scripts/cross-check.py` | 193 | the other OS's runtime, stdlib, compiler and CryoLSP, objects only, concurrently | **ported** → `cryogate cross` (script deleted) | once `cryo build` can stop at objects (ruling 322) it also passes on a Linux host (bug 0035) |
@@ -457,8 +457,8 @@ Jake's (question 4).
    zero included; `--list` lists all three suites; a report file records
    every test, project and negative file with its verdict, and a collect
    project's test count. `test.json` gains `stdout_file`. Retires the census's
-   text parsing, the roster's filesystem enumeration, and
-   `check-examples-output.sh`.
+   text parsing, the roster's filesystem enumeration, and the comparison
+   `cryogate examples --run` makes itself.
 2. **`cryo test` writes `//~` annotations** for a negative file (a flag on the
    negative suite), keeping only annotations its own checker then verifies.
    Retires `annotate-negative-tests.py`.
@@ -529,7 +529,7 @@ Re-checked at `8828ddc3`: perf added none of these; the table stands.
 | 8 | **recursive directory walk** (pruning, sorted, no link following) | none (`entries` only) | verify, selfhost, roster, api-index |
 | 9 | **copy a directory tree** (with excluded names) | none | verify's declared-program copies, incr fixtures, vendor |
 | 10 | **file locking** (an exclusive lock on a file, with try and wait) | raw `fcntl` only | the cross-worktree lock, verify's caches |
-| 11 | **a line diff** for a golden mismatch (first N differing lines with context) | none | examples goldens, selfhost's IR mismatch |
+| 11 | **a line diff** for a golden mismatch (first N differing lines with context) | none; `examples --run` names the first differing line, expected beside got | examples goldens, selfhost's IR mismatch |
 | 12 | small: `Str.lines()` (CR-tolerant), `CondVar.wait_timeout`, `Receiver.recv_timeout`, an ordered map, sub-second file times | absent | conveniences; each has a workaround with existing API |
 | 13 | **take a running child's pipes**: `Child.stdout()` / `stderr()` (or a take) after `spawn` with `Stdio::Piped` | `Child::new` stores them, nothing hands them out: a piped child's output is reachable only through `Command.output()`, after it exits | the census streaming its run (followed from the log file meanwhile), the LSP driver (G6) |
 | 14 | **join a list of strings** with a separator | absent; `core/text` holds cryogate's | every report that names several things |
@@ -616,7 +616,7 @@ does (§9, point 2).
 | G10 | **selfhost** (both arms, WSL mirror, wine arm on Linux), `.cmd` wrapper deleted | G1, G9 | perf2's pair: a syntax error in `compiler/src` reaches the mirror (both FAILED at the same stage), a skipped sync refused by the digest, a nondeterministic plant (stage 3 vs 4 differ) refused by both; exactly two `FIXED POINT OK` |
 | G11 | **freestanding** (Windows arm native, Linux arm via WSL), **release-smoke** | G10's WSL arm | mutations: the panic tier's message changed, an exit code changed, a tier dropped from the link |
 | G12 | **incr** as the edit-fuzz gate (question 3: cryogate writes it), `incremental-check.py` deleted | G1 (perf's content keys have landed) | the perf plan's mutation pair: `external_digest`'s layout term removed - the old gate OK, the new gate refusing the stale object |
-| G13 | **folds**: the runner's report and counts, `stdout_file`, annotation writing; census and roster switch to the report; `annotate-negative-tests.py` and `check-examples-output.sh` deleted | Jake's answers (question 4) | full object proof for the compiler change (`--require-identical`, 0 moved); the census over the report agreeing with the census over the text on the same run |
+| G13 | **folds**: the runner's report and counts, `stdout_file`, annotation writing; census and roster switch to the report; `annotate-negative-tests.py` deleted, `examples --run` compares through `stdout_file` | Jake's answers (question 4) | full object proof for the compiler change (`--require-identical`, 0 moved); the census over the report agreeing with the census over the text on the same run |
 | G14 | **api-index** fold; `api-index.py` deleted | question 4 | the new index contains every line the old one did, plus the one-line `implement` blocks (bug 0178's repro), and nothing else changed |
 | G15 | **No Python**: `$(PYTHON)` removed from the Makefile, CI and release use no Python, `scripts/README.md`, CLAUDE.md, `docs/testing.md` and `make help` rewritten, this file deleted | everything | a fresh clone with no Python on PATH runs `make check-fast`, `make test-census`, `make verify` (control: the same clone at the parent commit fails at the first `$(PYTHON)` recipe) |
 
@@ -630,8 +630,10 @@ hosts' stdlib since the `Command` working-directory double free was fixed.
 **Ported:** `roster` and `census` together (G2, G3: the census reads the
 roster's `![target]` waiver, and `verify.py` reads the census's parse of a
 baseline run from `cryogate census --read <log>`, one JSON record), `cross`
-(G7), `incr --instance`, `vendor` and `examples` (G4's build sweep; its
-`--run` goldens and `--under=valgrind` modes are still the shell scripts),
+(G7), `incr --instance`, `vendor` and `examples` (G4: the build sweep, and
+`--run`, which runs every example holding an `expected.out` and compares
+its output, on both hosts, with the old script's comparison rule; its
+`--under=valgrind` mode is still the shell script),
 with `core/text` (lines, joining, a line scanner) beside the core.
 `check-fast` runs `cryogate selftest` (so it builds cryogate), which carries
 the roster merge's self-test cases. The self-test runs the unit-test binary

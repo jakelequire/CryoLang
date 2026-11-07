@@ -135,7 +135,8 @@ manual dispatch.  As it stands:
 | `check-fast` (the two self-tests) | yes | yes, both hosts |
 | object comparison against a baseline | yes | no: a baseline from before a language feature's removal does not build with the current pin, so it is run locally (ruling 508) |
 | `roster-check` | no (the census reads the same golden) | yes |
-| `examples-golden`, `valgrind-check`, `verify-freestanding` | no (POSIX only) | yes |
+| `examples-golden` | no | yes |
+| `valgrind-check`, `verify-freestanding` | no (POSIX only) | yes |
 | `incremental-check` | no | yes |
 | `vendor-check` | no | yes |
 | `api-index-check` | no | yes |
@@ -295,8 +296,8 @@ reads the runner's own counts, and `cryogate roster` reduces to a diff of
 A project's `test.json` gains `stdout_file`, which compares the program's
 whole output against a file (ruling 271: a `stdout_file` field compares a
 program's output against a file).  The examples' `expected.out` goldens move
-onto it, which retires `scripts/check-examples-output.sh` and makes the
-check run on Windows as well.
+onto it, so the comparison `cryogate examples --run` makes today (on both
+hosts) is the runner's own.
 
 Open: the summary line's exact format, and whether line endings are
 normalised before the comparison.

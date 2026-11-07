@@ -75,8 +75,9 @@ public type struct Completion {
     public outcome: Outcome;
     /// Wall-clock time from the start to the end.
     public seconds: f64;
-    /// The log both streams were written to; empty when the job wrote to
-    /// the console.
+    /// The log the output stream was written to, with the error stream
+    /// unless the job sent that elsewhere; empty when the job wrote to the
+    /// console.
     public log: String;
 
     /// The job's whole output, as the log holds it.  Empty when the job
@@ -148,6 +149,7 @@ public type struct Job {
     removed: Array<String>;
     added: Array<Pair<String, String>>;
     log: String;
+    errors: String;
     limit: Option<Duration>;
 
     /// A job running `program`, writing to the console.  A program named by
@@ -162,6 +164,7 @@ public type struct Job {
             removed:   Array::<String>::new(),
             added:     Array::<Pair<String, String>>::new(),
             log:       String::new(),
+            errors:    String::new(),
             limit:     Option::None,
         };
     }
@@ -198,6 +201,10 @@ public type struct Job {
 
     /// Write both output streams to the file `path`, created or truncated.
     public log_to(mut &this, path: Str) -> void { this.log = String::from_str(path); }
+
+    /// Write the error stream to the file `path` instead, created or
+    /// truncated, so the log holds the output stream alone.
+    public errors_to(mut &this, path: Str) -> void { this.errors = String::from_str(path); }
 
     /// Kill the job and report it `TimedOut` once it has run this long.
     public limit(mut &this, limit: Duration) -> void { this.limit = Option::Some(limit); }
@@ -236,6 +243,17 @@ public type struct Job {
                 }
                 Result::Err(error) => {
                     return Result::Err(this.never_ran(started, f"cannot create its log {this.log.as_str()}: {error.describe()}"));
+                }
+            }
+        }
+        if (!this.errors.is_empty()) {
+            match (File::create(Path::from(this.errors.as_str()))) {
+                Result::Ok(file) => {
+                    mut owned: File = file;
+                    command.stderr(Stdio::Fd(owned.into_descriptor()));
+                }
+                Result::Err(error) => {
+                    return Result::Err(this.never_ran(started, f"cannot create its error log {this.errors.as_str()}: {error.describe()}"));
                 }
             }
         }

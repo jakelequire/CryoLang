@@ -241,9 +241,9 @@ Tests and gates
   make cross-check       runtime, stdlib, compiler and CryoLSP for the other
                          OS's triple, objects only (ARGS=--triple=...).
   make examples          Build every examples/ project.
-  make examples-golden   Build and run four examples, diff their stdout
-                         (POSIX only; refuses on Windows).
-  make valgrind-check    The same four under valgrind (Linux only).
+  make examples-golden   Build every example, run the ones with an
+                         expected.out and compare their output with it.
+  make valgrind-check    Four examples under valgrind (Linux only).
   make incremental-check Incremental build == clean build, per module
                          (refuses on Windows: a PE carries a link timestamp).
   make incremental-instance-check  An edit asking a cached module for a new
@@ -301,7 +301,7 @@ Side effects beyond the named output
                   `make clean`; clears stdlib/.bin/*/prebuilt/ before each
                   population run.
   install         writes symlinks outside the repository (may need sudo).
-  verify, test-census, selfhost-check, pin
+  verify, test-census, selfhost-check, pin, examples-golden
                   hold the heavy-run lock, cryo-heavy-run.lock in the
                   directory holding the MAIN checkout, the one file for every
                   worktree (CRYOGATE_HEAVY_LOCK names another), while their
@@ -363,7 +363,8 @@ endif
 
 # The gate runner (tools/CryoGate, built below by `make cryogate`); a recipe
 # runs it as `$(CRYOGATE_COMMAND) <gate> ...`.  A heavy
-# target (verify, test-census, selfhost-check, pin) runs its recipe as
+# target (verify, test-census, selfhost-check, pin, examples-golden) runs
+# its recipe as
 # `$(CRYOGATE_HEAVY) <command>`: under the machine's heavy-run lock, beside
 # the main checkout, waited for while another checkout's heavy run holds it, and
 # released when the command ends.  cmd cannot run a quoted forward-slash path.
@@ -822,18 +823,12 @@ examples: $(STAGE2_FILE) $(CRYOGATE)
 	@$(CRYOGATE_COMMAND) examples --cryo "$(STAGE2_FILE)"
 
 # ---- examples golden-output check -------------------------------------
-# Build AND run the deterministic, input-free examples and diff their stdout
-# against committed goldens (examples/<name>/expected.out).  Catches runtime
-# regressions that the build-only `examples` target misses.  POSIX-only: the
-# script is bash, so a Windows host refuses rather than reporting success,
-# and builds nothing first.
-ifeq ($(HOST_OS),windows)
-examples-golden:
-	$(error examples-golden: UNAVAILABLE on this host -- it builds AND RUNS the examples and diffs stdout with bash; run it from WSL)
-else
-examples-golden: $(STAGE2)
-	@CRYO="$(STAGE2)" CRYO_STDLIB="$(ROOT)/stdlib" bash scripts/check-examples-output.sh
-endif
+# Build every example, then run each one holding a committed golden
+# (examples/<name>/expected.out) with no input and compare its output with
+# it.  Catches runtime regressions that the build-only `examples` target
+# misses.  Heavy: it runs under the heavy-run lock.
+examples-golden: $(STAGE2_FILE) $(CRYOGATE)
+	@$(CRYOGATE_HEAVY) $(CRYOGATE_COMMAND) examples --run --cryo "$(STAGE2_FILE)"
 
 # ---- runtime memory-safety gate (valgrind) ----------------------------
 # Build AND run the deterministic examples under valgrind, failing on any
@@ -941,7 +936,7 @@ runtime-tiers-win: $(PIN)
 # never produces, and its recipe is sh syntax under a cmd shell.  A gate with no
 # local invocation on half the supported hosts is a gate only CI runs - and CI
 # fires on `main` alone.  It now refuses out loud there instead, the same way
-# examples-golden and valgrind-check do.
+# valgrind-check does.
 ifeq ($(HOST_OS),windows)
 verify-freestanding:
 	$(error verify-freestanding: UNAVAILABLE on this host -- the acceptance script is bash and links ELF objects natively; run it from WSL)
