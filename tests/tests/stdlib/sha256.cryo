@@ -1,0 +1,143 @@
+///! SHA-256 (FIPS 180-4) against the published test vectors, and the
+///! streaming hasher against the one-shot digest.
+///!
+///!   ""                                  e3b0c442...7852b855
+///!   "abc"                               ba7816bf...f20015ad
+///!   the 448-bit two-block message       248d6a61...19db06c1
+///!   one million 'a'                     cdc76e5c...c7112cd0
+///!
+///! A message fed in pieces must hash as the same message held whole,
+///! whatever the pieces' sizes, including pieces that end exactly on, one
+///! short of and one past a block boundary and a padding that needs a
+///! second block.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::Sha256T;
+
+import std::core::result::{ Result };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::collections::array::{ Array };
+import std::encoding::hex;
+import std::encoding::sha256::{ Sha256, Sha256Digest };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect };
+
+const TWO_BLOCK: string = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+
+function digest_of(text: string) -> Sha256Digest {
+    return Sha256::digest(Str::new(text).as_bytes());
+}
+
+function check_hex(digest: &Sha256Digest, want: string) -> Result<(), TestError> {
+    const got: String = digest.to_hex();
+    return expect(got.as_str().equals(&Str::new(want)), Str::new(want));
+}
+
+function million_a() -> Array<u8> {
+    mut bytes: Array<u8> = Array::<u8>::with_capacity(1000000);
+    for (mut i: i64 = 0; i < 1000000; i++) { bytes.push(0x61); }
+    return bytes;
+}
+
+/// `text` fed one piece at a time, piece `k` being `1 + k % step` bytes.
+function streamed(text: Str, step: i64) -> Sha256Digest {
+    mut hasher: Sha256 = Sha256::new();
+    const bytes: &Slice<u8> = text.as_bytes();
+    mut at: i64 = 0;
+    mut k: i64 = 0;
+    while (at < bytes.length()) {
+        mut end: i64 = at + 1 + k % step;
+        if (end > bytes.length()) { end = bytes.length(); }
+        hasher.update(bytes.subslice(at, end));
+        at = end;
+        k++;
+    }
+    return hasher.finish();
+}
+
+![test]
+function sha256_of_the_empty_message() -> Result<(), TestError> {
+    return check_hex(&digest_of(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+}
+
+![test]
+function sha256_of_abc() -> Result<(), TestError> {
+    return check_hex(&digest_of("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+}
+
+![test]
+function sha256_of_the_two_block_message() -> Result<(), TestError> {
+    return check_hex(&digest_of(TWO_BLOCK), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+}
+
+![test]
+function sha256_of_a_million_a() -> Result<(), TestError> {
+    const bytes: Array<u8> = million_a();
+    return check_hex(&Sha256::digest(bytes.as_slice()),
+                     "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+}
+
+![test]
+function a_million_a_streamed_in_thousand_byte_pieces_matches() -> Result<(), TestError> {
+    const bytes: Array<u8> = million_a();
+    mut hasher: Sha256 = Sha256::new();
+    for (mut i: i64 = 0; i < 1000; i++) {
+        hasher.update(bytes.as_slice().subslice(i * 1000, i * 1000 + 1000));
+    }
+    return check_hex(&hasher.finish(), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+}
+
+![test]
+function streaming_matches_one_shot_for_every_piece_size() -> Result<(), TestError> {
+    // Three copies, 168 bytes: long enough that pieces complete blocks
+    // inside `update`, not only in the padding.
+    const message: String = f"{TWO_BLOCK}{TWO_BLOCK}{TWO_BLOCK}";
+    const text: Str = message.as_str();
+    const whole: Sha256Digest = Sha256::digest(text.as_bytes());
+    for (mut step: i64 = 1; step <= 70; step++) {
+        if (!streamed(text, step).equals(&whole)) {
+            return expect(false, Str::new("a streamed digest differs from the one-shot digest"));
+        }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function streaming_matches_one_shot_around_block_boundaries() -> Result<(), TestError> {
+    // 55 bytes pad within one block, 56 need a second; 63/64/65 straddle
+    // the first block's end.
+    const lengths: [i64; 7] = [0, 1, 55, 56, 63, 64, 65];
+    const bytes: &Slice<u8> = Str::new(TWO_BLOCK).as_bytes();
+    for (mut i: i64 = 0; i < 7; i++) {
+        mut source: Array<u8> = Array::<u8>::new();
+        for (mut b: i64 = 0; b < lengths[i]; b++) { source.push(bytes.get(b % bytes.length()).unwrap()); }
+        const whole: Sha256Digest = Sha256::digest(source.as_slice());
+        mut hasher: Sha256 = Sha256::new();
+        for (mut b: i64 = 0; b < lengths[i]; b++) { hasher.update(source.as_slice().subslice(b, b + 1)); }
+        if (!hasher.finish().equals(&whole)) {
+            return expect(false, Str::new("a byte-at-a-time digest differs at a block boundary"));
+        }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function a_digest_displays_as_its_hex_and_compares_by_value() -> Result<(), TestError> {
+    const d: Sha256Digest = digest_of("abc");
+    const shown: String = f"{d}";
+    if (!shown.as_str().equals(&Str::new("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"))) {
+        return expect(false, Str::new("Display differs from to_hex"));
+    }
+    if (d.as_bytes().length() != 32 || d.as_bytes().get(0).unwrap() != 0xBA) {
+        return expect(false, Str::new("as_bytes is not the digest's 32 bytes"));
+    }
+    return expect(d.equals(&digest_of("abc")) && !d.equals(&digest_of("abd")), Str::new("digest equality"));
+}
+
+![test]
+function hex_encodes_two_lowercase_digits_per_byte() -> Result<(), TestError> {
+    const bytes: [u8; 4] = [0x00, 0x0F, 0xA0, 0xFF];
+    const text: String = hex::encode(bytes.as_slice());
+    return expect(text.as_str().equals(&Str::new("000fa0ff")), Str::new("000fa0ff"));
+}
