@@ -226,7 +226,7 @@ function clamp_inverted_range_panics() -> Result<(), TestError> {
 }
 
 // ============================================================================
-// Float Eq / Ord (bitwise equality + a total order over every float)
+// Float Eq (the IEEE `==`) and total_compare (a total order over every float)
 //
 // NaNs are built from explicit bit patterns via `mem::transmute` rather
 // than `0.0 / 0.0`: on x86 the latter yields a *negative* (sign-bit-set)
@@ -260,58 +260,57 @@ function eq_f64_distinct_unequal() -> Result<(), TestError> {
 }
 
 ![test]
-function eq_f64_signed_zeros_distinct() -> Result<(), TestError> {
-    // Bitwise Eq distinguishes +0.0 and -0.0 (they differ only in the
-    // sign bit). IEEE `==` would call them equal; `equals` must not.
+function eq_f64_signed_zeros_equal() -> Result<(), TestError> {
+    // +0.0 and -0.0 differ only in the sign bit, and the IEEE `==` calls
+    // them equal; so does `equals`.
     const pos: f64 = 0.0;
     const neg: f64 = mem::transmute::<u64, f64>(0x8000000000000000);   // -0.0
-    match (expect(!pos.equals(&neg),
-        Str::new("+0.0 and -0.0 should be bitwise-unequal"))) {
-        Result::Ok(_) => { }
-        Result::Err(e) => { return Result::Err(e); }
-    }
-    return Result::Ok(());
+    expect(pos.equals(&neg), Str::new("+0.0 and -0.0 should be equal"))?;
+    const pos_single: f32 = 0.0;
+    const neg_single: f32 = mem::transmute::<u32, f32>(0x80000000);
+    return expect(pos_single.equals(&neg_single), Str::new("f32 +0.0 and -0.0 should be equal"));
 }
 
 ![test]
-function eq_f64_nan_reflexive_same_bits() -> Result<(), TestError> {
-    // Bitwise Eq is reflexive even for NaN, as long as the bit pattern
-    // matches - the property IEEE `==` famously breaks.
+function eq_f64_nan_equals_nothing() -> Result<(), TestError> {
+    // A NaN is unequal to everything, its own bit pattern included.
     const nan: f64 = mem::transmute::<u64, f64>(0x7FF8000000000000);
     const nan2: f64 = mem::transmute::<u64, f64>(0x7FF8000000000000);
-    match (expect(nan.equals(&nan2),
-        Str::new("identical NaN bit patterns should compare equal"))) {
-        Result::Ok(_) => { }
-        Result::Err(e) => { return Result::Err(e); }
-    }
-    return Result::Ok(());
+    const one: f64 = 1.0;
+    expect(!nan.equals(&nan), Str::new("a NaN should not equal itself"))?;
+    expect(!nan.equals(&nan2), Str::new("identical NaN bit patterns should not compare equal"))?;
+    expect(!nan.equals(&one), Str::new("a NaN should not equal 1.0"))?;
+    const nan_single: f32 = mem::transmute::<u32, f32>(0x7FC00000);
+    return expect(!nan_single.equals(&nan_single), Str::new("an f32 NaN should not equal itself"));
 }
 
 ![test]
-function ord_f64_less_greater_equal() -> Result<(), TestError> {
+function total_compare_f64_less_greater_equal() -> Result<(), TestError> {
     const a: f64 = 1.0;
     const b: f64 = 2.0;
-    const less: boolean = match (a.compare(&b)) { Ordering::Less => { true } _ => { false } };
-    const greater: boolean = match (b.compare(&a)) { Ordering::Greater => { true } _ => { false } };
-    const equal: boolean = match (a.compare(&a)) { Ordering::Equal => { true } _ => { false } };
-    match (expect(less, Str::new("1.0.compare(&2.0) should be Less"))) {
-        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
-    }
-    match (expect(greater, Str::new("2.0.compare(&1.0) should be Greater"))) {
-        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
-    }
-    match (expect(equal, Str::new("1.0.compare(&1.0) should be Equal"))) {
-        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
-    }
-    return Result::Ok(());
+    const less: boolean = match (a.total_compare(&b)) { Ordering::Less => { true } _ => { false } };
+    const greater: boolean = match (b.total_compare(&a)) { Ordering::Greater => { true } _ => { false } };
+    const equal: boolean = match (a.total_compare(&a)) { Ordering::Equal => { true } _ => { false } };
+    expect(less, Str::new("1.0.total_compare(&2.0) should be Less"))?;
+    expect(greater, Str::new("2.0.total_compare(&1.0) should be Greater"))?;
+    return expect(equal, Str::new("1.0.total_compare(&1.0) should be Equal"));
 }
 
 ![test]
-function ord_f64_negatives_ordered() -> Result<(), TestError> {
+function total_compare_f64_nan_equal_to_its_own_bits() -> Result<(), TestError> {
+    // The total order places every value, so a NaN is Equal to itself
+    // there even though `equals` says otherwise.
+    const nan: f64 = mem::transmute::<u64, f64>(0x7FF8000000000000);
+    const equal: boolean = match (nan.total_compare(&nan)) { Ordering::Equal => { true } _ => { false } };
+    return expect(equal, Str::new("a NaN should be Equal to itself under total_compare"));
+}
+
+![test]
+function total_compare_f64_negatives_ordered() -> Result<(), TestError> {
     // Total order must handle the sign-bit flip: more-negative < less-negative.
     const a: f64 = 0.0 - 2.0;
     const b: f64 = 0.0 - 1.0;
-    const less: boolean = match (a.compare(&b)) { Ordering::Less => { true } _ => { false } };
+    const less: boolean = match (a.total_compare(&b)) { Ordering::Less => { true } _ => { false } };
     match (expect(less, Str::new("-2.0 should compare Less than -1.0"))) {
         Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
     }
@@ -319,11 +318,11 @@ function ord_f64_negatives_ordered() -> Result<(), TestError> {
 }
 
 ![test]
-function ord_f64_signed_zeros_ordered() -> Result<(), TestError> {
+function total_compare_f64_signed_zeros_ordered() -> Result<(), TestError> {
     // -0.0 sorts strictly below +0.0 under the total order.
     const pos: f64 = 0.0;
     const neg: f64 = mem::transmute::<u64, f64>(0x8000000000000000);   // -0.0
-    const less: boolean = match (neg.compare(&pos)) { Ordering::Less => { true } _ => { false } };
+    const less: boolean = match (neg.total_compare(&pos)) { Ordering::Less => { true } _ => { false } };
     match (expect(less, Str::new("-0.0 should compare Less than +0.0"))) {
         Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
     }
@@ -331,13 +330,13 @@ function ord_f64_signed_zeros_ordered() -> Result<(), TestError> {
 }
 
 ![test]
-function ord_f64_positive_nan_sorts_last() -> Result<(), TestError> {
+function total_compare_f64_positive_nan_sorts_last() -> Result<(), TestError> {
     // +NaN is greater than every finite value and +inf.
     const nan: f64 = mem::transmute::<u64, f64>(0x7FF8000000000000);
     const inf: f64 = mem::transmute::<u64, f64>(0x7FF0000000000000);
     const huge: f64 = 1.0;
-    const gt_huge: boolean = match (nan.compare(&huge)) { Ordering::Greater => { true } _ => { false } };
-    const gt_inf: boolean = match (nan.compare(&inf)) { Ordering::Greater => { true } _ => { false } };
+    const gt_huge: boolean = match (nan.total_compare(&huge)) { Ordering::Greater => { true } _ => { false } };
+    const gt_inf: boolean = match (nan.total_compare(&inf)) { Ordering::Greater => { true } _ => { false } };
     match (expect(gt_huge, Str::new("+NaN should compare Greater than a finite value"))) {
         Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
     }
@@ -348,13 +347,13 @@ function ord_f64_positive_nan_sorts_last() -> Result<(), TestError> {
 }
 
 ![test]
-function ord_f64_negative_nan_sorts_first() -> Result<(), TestError> {
+function total_compare_f64_negative_nan_sorts_first() -> Result<(), TestError> {
     // -NaN is less than every finite value and -inf.
     const nan: f64 = mem::transmute::<u64, f64>(0xFFF8000000000000);
     const ninf: f64 = mem::transmute::<u64, f64>(0xFFF0000000000000);
     const small: f64 = 0.0 - 1.0;
-    const lt_small: boolean = match (nan.compare(&small)) { Ordering::Less => { true } _ => { false } };
-    const lt_ninf: boolean = match (nan.compare(&ninf)) { Ordering::Less => { true } _ => { false } };
+    const lt_small: boolean = match (nan.total_compare(&small)) { Ordering::Less => { true } _ => { false } };
+    const lt_ninf: boolean = match (nan.total_compare(&ninf)) { Ordering::Less => { true } _ => { false } };
     match (expect(lt_small, Str::new("-NaN should compare Less than a finite value"))) {
         Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
     }
@@ -365,25 +364,11 @@ function ord_f64_negative_nan_sorts_first() -> Result<(), TestError> {
 }
 
 ![test]
-function min_max_f64_use_ord() -> Result<(), TestError> {
-    // min/max are `where T: Ord`, so floats work through the new impl.
-    const lo: f64 = min(1.0, 2.0);
-    const hi: f64 = max(1.0, 2.0);
-    match (expect(lo == 1.0, Str::new("min(1.0, 2.0) should be 1.0"))) {
-        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
-    }
-    match (expect(hi == 2.0, Str::new("max(1.0, 2.0) should be 2.0"))) {
-        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
-    }
-    return Result::Ok(());
-}
-
-![test]
-function eq_ord_f32_basic() -> Result<(), TestError> {
+function eq_total_compare_f32_basic() -> Result<(), TestError> {
     const a: f32 = 1.5;
     const b: f32 = 1.5;
     const c: f32 = 2.5;
-    const less: boolean = match (a.compare(&c)) { Ordering::Less => { true } _ => { false } };
+    const less: boolean = match (a.total_compare(&c)) { Ordering::Less => { true } _ => { false } };
     match (expect(a.equals(&b), Str::new("f32 1.5 should equal 1.5"))) {
         Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
     }
