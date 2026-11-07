@@ -17,7 +17,7 @@ import std::json::value;
 import std::ffi::libc;
 
 import compiler::compilation_context::{ CompilationContext };
-import compiler::ast::{ LiteralKind, TypeAnnotation };
+import compiler::ast::{ LiteralKind, TypeAnnotation, Visibility };
 import compiler::ast::declaration::{
     DeclarationNode, DeclKind, EnumVariant, FieldDecl, FunctionDecl,
     ImportDecl, MethodDecl, VarDecl
@@ -192,11 +192,9 @@ type struct Shown {
             DeclKind::Method(m) => {
                 if (m.func != null) {
                     if (this.doc.length() == 0) { this.doc = m.func.documentation; }
-                    const owner: DefId = this.ctx.defs.parent_of(d);
-                    const in_owner: string = if (owner.is_valid()) { "// in " + this.path(owner) + "\n" } else { "" };
-                    const written: Option<String> = this.written_head(decl, m.func, Shown::body_of(m.func));
+                    const written: Option<String> = this.method_head(d, decl, m);
                     this.text = if (written.is_some()) {
-                        in_owner + written.unwrap().into_raw()
+                        written.unwrap().into_raw()
                     } else {
                         m.visibility.label() + " " + this.signature(d, m.func, m.is_static)
                     };
@@ -204,7 +202,11 @@ type struct Shown {
             }
             DeclKind::Function(f) => {
                 const written: Option<String> = this.written_head(decl, decl, f.body);
-                this.text = if (written.is_some()) { written.unwrap().into_raw() } else { reach + this.signature(d, decl, false) };
+                // A head written with no return type returns `void`, and says so.
+                const returns: string = if (f.return_type_annotation == null) {
+                    " -> " + this.type_text(f.resolved_return_type)
+                } else { "" };
+                this.text = if (written.is_some()) { written.unwrap().into_raw() + returns } else { reach + this.signature(d, decl, false) };
             }
             DeclKind::Intrinsic(f) => {
                 const written: Option<String> = this.written_head(decl, decl, f.body);
@@ -269,6 +271,96 @@ type struct Shown {
             return this.written_text(at, body.span.start_line, body.span.start_col, false);
         }
         return this.written_text(at, at.end_line, at.end_col, false);
+    }
+
+    /// A method's hover head: the modifiers written before its name but
+    /// `static`, then its owner and itself (`method_prefix`), its head as
+    /// written from its name, and its return type when none is written.
+    /// None when the text the analysis read cannot be had.
+    method_head(&this, d: DefId, decl: DeclarationNode*, m: MethodDecl*) -> Option<String> {
+        const f_decl: DeclarationNode* = m.func;
+        const name: SourceSpan = f_decl.name_span;
+        if (this.docs == null || name.file == null || !name.has_location()) { return Option::None; }
+        const body: Stmt* = Shown::body_of(f_decl);
+        const at: SourceSpan = Shown::written_extent(decl, f_decl);
+        mut end_line: u32 = at.end_line;
+        mut end_col: u32 = at.end_col;
+        if (body != null && body.span.start_line != 0) {
+            end_line = body.span.start_line;
+            end_col = body.span.start_col;
+        }
+        const written: Option<String> = this.written_text(name, end_line, end_col, false);
+        if (written.is_none()) { return Option::None; }
+        // The modifiers written before the name, but `static`, which the
+        // `::` between the owner and the name says.
+        mut modifiers: String = String::with_capacity(16);
+        mut visibility_written: boolean = false;
+        const before: Option<String> = this.docs.analysed_text_between(str::Str::from(name.file),
+            at.start_line, at.start_col, name.start_line, name.start_col);
+        if (before.is_some()) {
+            mut raw: String = before.unwrap();
+            mut words: String = Shown::without_comments(raw.as_str());
+            mem::drop(raw);
+            const space: str::Str = str::Str::from(" ");
+            for (word in words.as_str().split(&space)) {
+                const w: str::Str = word.trim();
+                if (w.length() == 0 || w.equals(&str::Str::from("static"))) { continue; }
+                if (w.equals(&str::Str::from("public")) || w.equals(&str::Str::from("internal"))
+                        || w.equals(&str::Str::from("private"))) {
+                    visibility_written = true;
+                }
+                modifiers.push(w);
+                modifiers.push(" ");
+            }
+            mem::drop(words);
+        }
+        // A method a `private:` or `internal:` section holds reaches no
+        // further than the section says, though its own head writes nothing.
+        mut out: String = String::with_capacity(64);
+        if (!visibility_written && m.visibility != Visibility::Public) {
+            out.push(m.visibility.label());
+            out.push(" ");
+        }
+        out.push(modifiers.as_str());
+        mem::drop(modifiers);
+        out.push(this.method_prefix(d, f_decl, m.is_static));
+        out.push(written.unwrap().as_str());
+        const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
+        if (f != null && f.return_type_annotation == null) {
+            out.push(" -> ");
+            out.push(this.type_text(f.resolved_return_type));
+        }
+        return Option::Some(out);
+    }
+
+    /// A member's head as written, `reach` in front when it is not public
+    /// and the head writes no visibility of its own: a `private:` or
+    /// `internal:` section gave it.
+    static with_reach(head: String, reach: Visibility) -> String {
+        if (reach == Visibility::Public) { return head; }
+        const text: str::Str = head.as_str();
+        if (text.starts_with(&str::Str::from("public ")) || text.starts_with(&str::Str::from("internal "))
+                || text.starts_with(&str::Str::from("private "))) {
+            return head;
+        }
+        mut out: String = String::from_string(reach.label());
+        out.push(" ");
+        out.push(text);
+        return out;
+    }
+
+    /// What a method's name follows in its hover: `trait ` for a method a
+    /// trait's implementation declares, then its owner's name and `.` for
+    /// one called on a value (`Person.age_of`) or `::` for a static
+    /// (`Person::new`).
+    method_prefix(&this, d: DefId, f_decl: DeclarationNode*, is_static: boolean) -> string {
+        const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
+        mut out: string = if (f != null && f.origin_trait.is_valid()) { "trait " } else { "" };
+        const owner: DefId = this.ctx.defs.parent_of(d);
+        if (owner.is_valid()) {
+            out = out + this.path(owner) + if (is_static) { "::" } else { "." };
+        }
+        return out;
     }
 
     /// A type's or a trait's head as its source writes it, up to the `{`
@@ -390,7 +482,7 @@ type struct Shown {
                     } else { null };
                     if (declared != null) {
                         const written: Option<String> = this.written_head(declared, m.func, Shown::body_of(m.func));
-                        if (written.is_some()) { line = written.unwrap().into_raw(); }
+                        if (written.is_some()) { line = Shown::with_reach(written.unwrap(), m.visibility).into_raw(); }
                     }
                 }
                 Member::Constant(c) => {
@@ -469,13 +561,13 @@ type struct Shown {
     signature(&this, d: DefId, f_decl: DeclarationNode*, is_static: boolean) -> string {
         const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
         const is_method: boolean = this.ctx.defs.kind_of(d) == DefKind::Method;
-        const head: string = if (is_method) {
-            if (is_static) { "static " } else { "" }
-        } else { "function " };
+        const named: string = if (is_method) {
+            this.method_prefix(d, f_decl, is_static) + this.ctx.intern_table.shown(this.ctx.defs.leaf_of(d))
+        } else { "function " + this.path(d) };
         // An instance method's first parameter is its receiver, written
         // `this`, `&this` or `mut &this`, and shown as written.
         const receiver: boolean = is_method && !is_static;
-        return head + this.path(d) + "(" + this.params(&f.parameters, receiver, f.is_variadic) + ") -> "
+        return named + "(" + this.params(&f.parameters, receiver, f.is_variadic) + ") -> "
             + this.names.type_text_written(f.resolved_return_type, f.return_type_annotation);
     }
 
@@ -529,7 +621,7 @@ type struct Shown {
         if (h == null) { return; }
         const fd: FieldDecl* = DeclarationNode::field_of(h);
         this.show_directives(&h.attached_directives);
-        this.text = fd.visibility.label() + " field " + this.path(owner) + "::" + this.ctx.intern_table.resolve(fd.name)
+        this.text = fd.visibility.label() + " field " + this.path(owner) + "." + this.ctx.intern_table.resolve(fd.name)
             + ": " + this.names.type_text_written(fd.resolved_type, fd.type_annotation);
         this.doc = h.documentation;
     }
