@@ -40,12 +40,58 @@ import std::random::error::{ RandomError };
 
 public type struct Formatter {
     private writer: virtual mut &FmtWrite;
+    /// `debug_struct` and `debug_tuple` write one member per line.
+    private pretty: boolean;
+    /// How many `debug_struct` / `debug_tuple` builders are open, which is
+    /// how far a pretty member line is indented.
+    private depth: i64;
 
     /// Construct over any `FmtWrite` sink, which the formatter borrows
     /// as a trait object: every `fmt` is compiled once and writes to
     /// whatever sink it is given through the sink's table.
     public static new(writer: virtual mut &FmtWrite) -> Formatter {
-        return Formatter { writer: writer };
+        return Formatter { writer: writer, pretty: false, depth: 0 };
+    }
+
+    /// A formatter whose `debug_struct` and `debug_tuple` write one member
+    /// per line, indented four spaces a level:
+    ///
+    ///     Point {
+    ///         x: 1,
+    ///         y: 2,
+    ///     }
+    public static pretty(writer: virtual mut &FmtWrite) -> Formatter {
+        return Formatter { writer: writer, pretty: true, depth: 0 };
+    }
+
+    /// Whether this formatter writes `Debug` output one member per line.
+    public is_pretty(&this) -> boolean { return this.pretty; }
+
+    /// Begin the `Debug` text of a value with named fields:
+    /// `f.debug_struct("Point").field("x", &this.x).field("y", &this.y).finish()`
+    /// writes `Point { x: 1, y: 2 }`, and a value with no fields its name alone.
+    public debug_struct(mut &this, name: string) -> DebugStruct {
+        mut result: Result<(), FmtError> = this.write_str(Str::new(name));
+        this.depth += 1;
+        return DebugStruct { formatter: &this, result: result, has_fields: false };
+    }
+
+    /// Begin the `Debug` text of a value with unnamed members - a tuple
+    /// struct or an enum variant's payload:
+    /// `f.debug_tuple("Some").field(&value).finish()` writes `Some(1)`, and a
+    /// value with no members its name alone.
+    public debug_tuple(mut &this, name: string) -> DebugTuple {
+        mut result: Result<(), FmtError> = this.write_str(Str::new(name));
+        this.depth += 1;
+        return DebugTuple { formatter: &this, result: result, has_fields: false };
+    }
+
+    /// The four-space indent of a pretty member line at the current depth.
+    private write_indent(mut &this) -> Result<(), FmtError> {
+        for (mut level: i64 = 0; level < this.depth; level++) {
+            this.write_str(Str::new("    "))?;
+        }
+        return Result::Ok(());
     }
 
     /// Write a `Str`. The usual path for fixed text and for
@@ -70,6 +116,103 @@ public type struct Formatter {
     /// same sink, or to flush mid-stream.
     public get_writer(&this) -> virtual mut &FmtWrite {
         return this.writer;
+    }
+}
+
+/// The builder `Formatter::debug_struct` begins.  Each `field` writes one
+/// named member; `finish` closes the braces and gives the first error any
+/// step met, after which the later steps write nothing.
+public type struct DebugStruct {
+    private formatter: mut &Formatter;
+    private result: Result<(), FmtError>;
+    private has_fields: boolean;
+
+    /// Write the field `name` with `value`'s `Debug` text.
+    public field<T>(mut this, name: string, value: &T) -> DebugStruct
+    where T: Debug {
+        if (this.result.is_ok()) {
+            this.result = this.write_field(name, value);
+        }
+        this.has_fields = true;
+        return this;
+    }
+
+    /// Close the value: ` }`, or on a pretty formatter `}` on a line of its
+    /// own.  A value with no fields was written as its name alone.
+    public finish(mut this) -> Result<(), FmtError> {
+        this.formatter.depth -= 1;
+        if (this.result.is_ok() && this.has_fields) { this.result = this.write_close(); }
+        return this.result;
+    }
+
+    private write_close(mut &this) -> Result<(), FmtError> {
+        if (this.formatter.pretty) {
+            this.formatter.write_indent()?;
+            return this.formatter.write_str(Str::new("}"));
+        }
+        return this.formatter.write_str(Str::new(" }"));
+    }
+
+    private write_field<T>(mut &this, name: string, value: &T) -> Result<(), FmtError>
+    where T: Debug {
+        if (this.formatter.pretty) {
+            if (!this.has_fields) { this.formatter.write_str(Str::new(" {\n"))?; }
+            this.formatter.write_indent()?;
+        } else {
+            const separator: string = if (this.has_fields) { ", " } else { " { " };
+            this.formatter.write_str(Str::new(separator))?;
+        }
+        this.formatter.write_str(Str::new(name))?;
+        this.formatter.write_str(Str::new(": "))?;
+        value.fmt(this.formatter)?;
+        if (this.formatter.pretty) { return this.formatter.write_str(Str::new(",\n")); }
+        return Result::Ok(());
+    }
+}
+
+/// The builder `Formatter::debug_tuple` begins.  Each `field` writes one
+/// unnamed member; `finish` closes the parentheses and gives the first
+/// error any step met, after which the later steps write nothing.
+public type struct DebugTuple {
+    private formatter: mut &Formatter;
+    private result: Result<(), FmtError>;
+    private has_fields: boolean;
+
+    /// Write the next member, `value`'s `Debug` text.
+    public field<T>(mut this, value: &T) -> DebugTuple
+    where T: Debug {
+        if (this.result.is_ok()) {
+            this.result = this.write_field(value);
+        }
+        this.has_fields = true;
+        return this;
+    }
+
+    /// Close the value: `)`, on a line of its own on a pretty formatter.
+    /// A value with no members was written as its name alone.
+    public finish(mut this) -> Result<(), FmtError> {
+        this.formatter.depth -= 1;
+        if (this.result.is_ok() && this.has_fields) { this.result = this.write_close(); }
+        return this.result;
+    }
+
+    private write_close(mut &this) -> Result<(), FmtError> {
+        if (this.formatter.pretty) { this.formatter.write_indent()?; }
+        return this.formatter.write_str(Str::new(")"));
+    }
+
+    private write_field<T>(mut &this, value: &T) -> Result<(), FmtError>
+    where T: Debug {
+        if (this.formatter.pretty) {
+            if (!this.has_fields) { this.formatter.write_str(Str::new("(\n"))?; }
+            this.formatter.write_indent()?;
+        } else {
+            const separator: string = if (this.has_fields) { ", " } else { "(" };
+            this.formatter.write_str(Str::new(separator))?;
+        }
+        value.fmt(this.formatter)?;
+        if (this.formatter.pretty) { return this.formatter.write_str(Str::new(",\n")); }
+        return Result::Ok(());
     }
 }
 
