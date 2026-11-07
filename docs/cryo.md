@@ -700,7 +700,7 @@ const p: u8* = some_string as u8*; // pointer reinterpretation
 
 A cast to a struct, tuple or array **value** is a cast from a value of that same type, and nothing else: `p as Point` with `p` a pointer, or one aggregate cast to another, is refused (`E0208`); `*p` reads the value a pointer points at.
 
-A struct, tuple or array value is not cast **to** a pointer or a scalar either (`E0208`): `v as void*` is refused, and the value's address is written `&v` (and converted as `&v as void*`). Inside a method taking `&this`, `this` is that address already, so `this as void*` is allowed.
+A struct, tuple or array value is not cast **to** a pointer or a scalar either (`E0208`), an instance of a generic struct such as a `String` included: `v as void*` is refused, and the value's address is written `&v` (and converted as `&v as void*`). Inside a method taking `&this`, `this` is that address already, so `this as void*` is allowed.
 
 ### 2.10 Optional Types (`T?`)
 
