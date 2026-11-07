@@ -1,0 +1,80 @@
+// A local an async function carries across an `await` and then hands to a
+// method that consumes its receiver (`mut this`) is given away, exactly as
+// when it is passed to a by-value parameter: the state takes the value out
+// of its carrier field for the call, so the frame keeps no second claim, and
+// each value is released once whether the method returns it or releases it
+// itself.  Read as a borrowed receiver, the call moved the value out of the
+// frame while the frame still held it, which was refused (E0453).
+//
+// Each case checks the result and counts destructors.  `main` prints how many
+// checks passed and exits 0 only when all did.
+namespace AsyncConsumingReceiverAcrossAwait::Main;
+
+import std::fmt;
+import std::core::option::{ Option };
+import std::core::drop::{ Drop };
+import std::future;
+import std::future::ready::{ PendingThenReady };
+
+mut g_drops: i64 = 0;
+
+type struct Counted { tag: i64; }
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void { g_drops += 1; }
+}
+
+type struct Pair {
+    kept:  Counted;
+    other: Counted;
+
+    into_kept(mut this) -> Counted {
+        return this.kept;
+    }
+
+    into_found(mut this) -> Option<Counted> {
+        return Option::Some(this.kept);
+    }
+}
+
+// Carried across the first suspend, consumed in the next state, and what the
+// call returned is carried across the second.
+async function consume_between_awaits() -> i64 {
+    const pair: Pair = Pair { kept: Counted { tag: 7 }, other: Counted { tag: 8 } };
+    const a: i64 = await PendingThenReady::<i64>::new(1, 1);
+    const kept: Counted = pair.into_kept();
+    const b: i64 = await PendingThenReady::<i64>::new(1, 2);
+    return kept.tag + a + b;
+}
+
+// Consumed in a `match` subject's call, the shape a transport outcome is read
+// in.
+async function consume_in_match_subject() -> i64 {
+    const pair: Pair = Pair { kept: Counted { tag: 4 }, other: Counted { tag: 5 } };
+    const a: i64 = await PendingThenReady::<i64>::new(1, 1);
+    mut tag: i64 = 0;
+    match (pair.into_found()) {
+        Option::Some(found) => { tag = found.tag; }
+        Option::None        => { }
+    }
+    const b: i64 = await PendingThenReady::<i64>::new(1, 2);
+    return tag + a + b;
+}
+
+function check(name: string, got: i64, want: i64, want_drops: i64) -> i64 {
+    if (got == want && g_drops == want_drops) { return 1; }
+    fmt::println(f"FAIL {name}: got {got} (want {want}), drops {g_drops} (want {want_drops})");
+    return 0;
+}
+
+function main() -> i32 {
+    mut passed: i64 = 0;
+    g_drops = 0;
+    passed += check("consumed_between_awaits",
+        future::block_on(consume_between_awaits()), 10, 2);
+    g_drops = 0;
+    passed += check("consumed_in_match_subject",
+        future::block_on(consume_in_match_subject()), 7, 2);
+    fmt::println(f"async_consuming_receiver_across_await: {passed} of 2 passed");
+    if (passed != 2) { return 1; }
+    return 0;
+}

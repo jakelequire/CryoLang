@@ -2013,8 +2013,9 @@ type struct AsyncLower {
     }
 
     /// `by_value` says whether a bare mention in THIS position hands the value
-    /// over (a by-value call argument, an initializer, a returned expression, a
-    /// `match` subject) or merely reaches into it (a receiver, a field access,
+    /// over (a by-value call argument, a consumed receiver, an initializer, a
+    /// returned expression, a `match` subject) or merely reaches into it (a
+    /// borrowed receiver, a field access,
     /// an address-of, an operand). The positions mirror `mark_last_use_expr`,
     /// which answers the same question for the eligibility walk — the two must
     /// agree, or a mention counted as a give-away there is aliased here.
@@ -2098,14 +2099,20 @@ type struct AsyncLower {
         }
         if (ExpressionNode::call_of(e) != null) {
             const c: mut CallExpr* = ExpressionNode::call_of(e);
-            // A receiver is reached into; an argument is handed over only when
+            // A receiver is reached into unless the method consumes it
+            // (`mut this` / `![sink]`); an argument is handed over only when
             // the parameter it binds to takes ownership. `arg_binding` is the
             // authority, and an UNCLASSIFIED slot must read as a borrow here:
             // emptying the field for a parameter that only borrows strands
             // every later `unwrap_ptr` on a `None`, whereas leaving an owning
             // argument aliased surfaces as `E0453` at compile time. That is the
             // opposite default from the move passes, and deliberately so.
-            c.callee = this.subst_name_expr(c.callee, key, field, struct_ref, ty, span, false);
+            if (this.call_consumes_receiver(c)) {
+                const recv: mut MemberAccessExpr* = ExpressionNode::member_access_of(c.callee);
+                recv.object = this.subst_name_expr(recv.object, key, field, struct_ref, ty, span, true);
+            } else {
+                c.callee = this.subst_name_expr(c.callee, key, field, struct_ref, ty, span, false);
+            }
             for (mut i: i64 = 0; i < c.arguments.length(); i++) {
                 const owns: boolean = (c.arguments[i] != null &&
                                        c.arguments[i].arg_binding == ArgBinding::ByValue);
@@ -4442,6 +4449,17 @@ type struct AsyncLower {
                                           this.intern, ty);
     }
 
+    /// True when `c` calls a method that takes its receiver by value (`this`,
+    /// `mut this`, or `![sink]`), so the receiver is handed over rather than
+    /// reached into.  The method the call was pinned to answers, as it does
+    /// for the move passes; an unpinned call borrows.
+    call_consumes_receiver(&this, c: CallExpr*) -> boolean {
+        if (c.callee == null || ExpressionNode::member_access_of(c.callee) == null) { return false; }
+        const m_decl: DeclarationNode* = this.ctx.decl_index.entry_method(c.resolved_callee.decl_entry());
+        if (DeclarationNode::method_of(m_decl) == null) { return false; }
+        return OwnershipQuery::method_consumes_receiver(this.arena, this.intern, m_decl);
+    }
+
     /// True when some awaited operand was built from `name`, so the future it
     /// produced may hold a view into the storage `name` owns.
     borrowed_by_awaited_future(&this, sm: PollSm*, key: SymbolID) -> boolean {
@@ -4613,7 +4631,8 @@ type struct AsyncLower {
         }
         if (ExpressionNode::call_of(e) != null) {
             const c: CallExpr* = ExpressionNode::call_of(e);
-            // A receiver is reached into; an argument is handed over only when
+            // A receiver is reached into unless the method consumes it
+            // (`call_consumes_receiver`); an argument is handed over only when
             // the parameter it binds to takes ownership, which `arg_binding`
             // records. Reading the position instead classified an argument
             // standing in a `&T` slot as a give-away, so a state whose last
@@ -4628,7 +4647,12 @@ type struct AsyncLower {
             // borrow publishes a value the state may have given away, which
             // MoveCheck catches as E0453; erring the other way strands the
             // field, which nothing catches until a `None` is unwrapped.
-            this.mark_last_use_expr(c.callee, key, false, out);
+            if (this.call_consumes_receiver(c)) {
+                this.mark_last_use_expr(ExpressionNode::member_access_of(c.callee).object,
+                                        key, true, out);
+            } else {
+                this.mark_last_use_expr(c.callee, key, false, out);
+            }
             for (mut i: i64 = 0; i < c.arguments.length(); i++) {
                 const owns: boolean = (c.arguments[i] != null &&
                                        c.arguments[i].arg_binding == ArgBinding::ByValue);
