@@ -651,9 +651,6 @@ roster-check: $(STAGE2_EXE) $(TEST_HELPERS_A)
 
 test-census: $(STAGE2_EXE) $(TEST_HELPERS_A) $(CRYOGATE) runtime-tiers
 	@$(CRYOGATE_HEAVY) $(PYTHON) scripts/test-census.py --cryo "$(STAGE2_EXE)" $(ARGS)
-
-vendor-check: $(STAGE2_EXE) runtime-tiers
-	@$(PYTHON) scripts/vendor-consts-gate.py "$(STAGE2_EXE_WIN)" $(ARGS)
 else
 test: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) runtime-tiers
 	@cd tests && "$(STAGE2)" test $(ARGS)
@@ -675,6 +672,7 @@ roster-check: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
 # working loop, where a pattern filter is the point.
 test-census: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(CRYOGATE) runtime-tiers
 	@$(CRYOGATE_HEAVY) $(PYTHON) scripts/test-census.py --cryo "$(STAGE2)" $(ARGS)
+endif
 
 # End-to-end gate on the constants `cryo vendor` carries out of a C header.
 # The importer binds a constant and the serializer writes it, and when those
@@ -686,10 +684,9 @@ test-census: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(CRYOGATE) runti
 # Needs the compiler and a working link (it builds and RUNS a consumer), but no
 # external library and no display, so unlike the raylib acceptance project this
 # runs everywhere.  Hermetic: the fixture registers under a throwaway
-# $CRYO_HOME and leaves nothing on the machine.
-vendor-check: $(STAGE2) runtime-tiers
-	@$(PYTHON) scripts/vendor-consts-gate.py "$(STAGE2)" $(ARGS)
-endif
+# $CRYO_HOME and leaves nothing on the machine.  `cryogate vendor`.
+vendor-check: $(STAGE2_FILE) $(CRYOGATE) runtime-tiers
+	@$(CRYOGATE_COMMAND) vendor --cryo "$(STAGE2_FILE)"
 
 # ---- one verification run ----------------------------------------------
 # Build once, then run census, examples, lsp-check, cross-check,

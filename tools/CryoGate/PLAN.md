@@ -33,7 +33,7 @@ here.
 **Built so far:** G1's core (§8): the child runner, the scheduler, the
 heavy-run lock and `cryogate heavy`, the run logs, `cryogate selftest`, and
 `make cryogate`; the heavy Makefile targets run under the lock. Ported:
-`incr --instance` and `examples` (G4).
+`incr --instance`, `examples` and `vendor` (G4).
 
 ---
 
@@ -188,7 +188,7 @@ compiler subcommand, because the compiler already holds the answer), **keep**
 | `scripts/cross-check.py` | 193 | the other OS's runtime, stdlib, compiler and CryoLSP, objects only, concurrently | **port** → `cryogate cross` | once `cryo build` can stop at objects (ruling 322) it also passes on a Linux host (bug 0035) |
 | `scripts/incremental-instance-check.py` | 90 | an edit asking a cached module for a new instance still links and reuses the cache | **ported** → `cryogate incr --instance` (script deleted) | small; part of verify |
 | `scripts/incremental-check.py` | 267 | incremental build == clean build over a three-file edit matrix (Linux; a PE carries a link timestamp) | **replace** with the edit-fuzz gate written as `cryogate incr` on perf's bitcode-keyed module cache (question 3: cryogate writes it) | the fuzz gate compares `.o` hashes, not binaries, which also lifts the Windows refusal; the fixed matrix becomes one of its modes. Today's script also leaks its temp directory |
-| `scripts/vendor-consts-gate.py` | 279 | header-vs-table check, `cryo vendor` under a throwaway `CRYO_HOME`, builds and runs a consumer of every constant | **port** → `cryogate vendor` | needs only child processes, files and a temp directory |
+| `scripts/vendor-consts-gate.py` | 279 | header-vs-table check, `cryo vendor` under a throwaway `CRYO_HOME`, builds and runs a consumer of every constant | **ported** → `cryogate vendor` (script deleted) | needs only child processes, files and a temp directory |
 | `scripts/api-index.py` | 498 | generates `docs/stdlib-api.txt` from a line scanner over the stdlib plus `nm` of the archive demangled by the pin | **fold** → a compiler subcommand that prints the index from the parsed stdlib (§5) | the parser already knows every declaration; a text scanner is why bug 0178 exists |
 | `scripts/annotate-negative-tests.py` | 171 | writes `//~` lines from a real `cryo check` run, keeps only annotations that verify | **fold** → `cryo test` writing annotations (§5) | the code that checks an annotation is the one that should write it: one answering path |
 | `scripts/cryo-pin.py` | 233 | copies, strips and writes the `.pin.txt` sidecar | **port** → `cryogate pin` | sha256, git, strip; runs where `make pin` runs (Linux / WSL) |
@@ -512,6 +512,9 @@ Re-checked at `8828ddc3`: perf added none of these; the table stands.
 | 10 | **file locking** (an exclusive lock on a file, with try and wait) | raw `fcntl` only | the cross-worktree lock, verify's caches |
 | 11 | **a line diff** for a golden mismatch (first N differing lines with context) | none | examples goldens, selfhost's IR mismatch |
 | 12 | small: `Str.lines()` (CR-tolerant), `CondVar.wait_timeout`, `Receiver.recv_timeout`, an ordered map, sub-second file times | absent | conveniences; each has a workaround with existing API |
+| 13 | **take a running child's pipes**: `Child.stdout()` / `stderr()` (or a take) after `spawn` with `Stdio::Piped` | `Child::new` stores them, nothing hands them out: a piped child's output is reachable only through `Command.output()`, after it exits | the census streaming its run (followed from the log file meanwhile), the LSP driver (G6) |
+| 14 | **join a list of strings** with a separator | absent; `core/text` holds cryogate's | every report that names several things |
+| 15 | **a command-line option parser** (flags, valued options in both spellings, positionals, `--`) | absent; `core/options` holds cryogate's | every subcommand; the compiler's own CLI parses by hand too |
 
 **For the lanes, later** (Decision 11 keeps these private to the tool,
 through `extern "C"` declarations in `tools/CryoGate`, not public API):
@@ -603,9 +606,9 @@ cryogate`), with the option parser (`core/options`) and the tree copy
 (`core/tree`); the tree listing and the git helper are built with the first
 gate that calls them, since a helper nothing calls is dead code. Its self-test
 is green on both hosts' stdlib since the `Command` working-directory double
-free was fixed. **Ported:** `incr --instance` and `examples` (G4's build
-sweep; its `--run` goldens and `--under=valgrind` modes are still the shell
-scripts).
+free was fixed. **Ported:** `incr --instance`, `vendor` and `examples` (G4's
+build sweep; its `--run` goldens and `--under=valgrind` modes are still the
+shell scripts), with `core/text` (lines, joining) beside the core.
 
 **The Python gates import each other**, which the unit table above does not
 show: `test-census.py` loads `roster-check.py` for its reading of the

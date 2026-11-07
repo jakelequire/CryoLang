@@ -1,0 +1,397 @@
+///! `cryogate vendor --cryo <compiler>`: every constant shape a C header
+///! publishes survives `cryo vendor`.
+///!
+///! The vendor path has two halves that must agree on an AST shape: the
+///! importer binds a constant and the serializer writes it as source.  When
+///! they disagree the translation report still says the constant bound, the
+///! generator exits 0, and the constant is simply absent from the generated
+///! file; the use site fails with `cannot find value` a build later, pointing
+///! at nothing.  So the gate registers the fixture library
+///! (`tests/helpers/vendor_consts`) under a throwaway `CRYO_HOME`, then builds
+///! and runs a consumer that reads every constant:
+///!
+///! - a constant the serializer drops fails to compile, the real symptom;
+///! - a constant that survives with the wrong value fails the comparison;
+///! - `[skip] const` anywhere in the translation report fails the gate even
+///!   when the build succeeds.
+///!
+///! Values are pinned, types are not: the consumer casts each integer to
+///! `i64` before printing, so the importer choosing `i32` where `u32` would
+///! also do is not this gate's question.  The constants consumed must be
+///! exactly the ones the header publishes: a shape added to the header and
+///! not here is a shape nothing checks.  Declarations that reach the
+///! generated file by other paths (an enum, functions, read-only pointer
+///! levels) are checked as text, so a generator that wrote nothing cannot
+///! satisfy the gate by dropping the constants and the code that reads them.
+///! The temporary `CRYO_HOME` is removed afterwards; the developer's own
+///! registry is never read or written.
+
+namespace cryogate::gates::vendor;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::fs::temporary::{ TempDirectory };
+
+import cryogate::core::child::{ Completion, Job };
+import cryogate::core::host::{ Host };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::options::{ Options, Parsed };
+import cryogate::core::text::{ Text };
+
+public type struct VendorGate {
+    compiler: String;
+    stdlib: String;
+
+    public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
+        mut options: Options = Options::new(Str::new("cryogate vendor --cryo <compiler>"));
+        options.valued(Str::new("--cryo"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate vendor: {reason.as_str()}"); return 2; }
+        };
+        const compiler: String = match (parsed.value(Str::new("--cryo"))) {
+            Option::Some(path) => { Host::absolute(path) }
+            Option::None       => { fmt::eprintln(f"cryogate vendor: --cryo is required; usage: {options.usage()}"); return 2; }
+        };
+        if (!parsed.positionals().is_empty() || parsed.separated()) {
+            fmt::eprintln(f"cryogate vendor: usage: {options.usage()}");
+            return 2;
+        }
+        const gate: VendorGate = VendorGate { compiler: compiler, stdlib: Host::stdlib_directory(repository) };
+        const fixture: PathBuf = repository.join(Str::new("tests")).join(Str::new("helpers")).join(Str::new("vendor_consts"));
+        return match (gate.judge(fixture.as_path(), logs)) {
+            Result::Ok(count) => {
+                fmt::println(f"vendor-consts gate: OK - {count} constants survived generation");
+                0
+            }
+            Result::Err(failure) => {
+                fmt::eprintln(f"vendor-consts gate: FAIL - {failure.as_str()}");
+                1
+            }
+        };
+    }
+
+    /// The number of constants that survived, or the failure: its first
+    /// line the reason, the rest the evidence.
+    judge(&this, fixture: Path, logs: &RunLogs) -> Result<i64, String> {
+        if (!Path::from(this.compiler.as_str()).exists()) {
+            return Result::Err(f"compiler not found at {this.compiler.as_str()} (run `make cryo` first)");
+        }
+        if (!fixture.is_directory()) { return Result::Err(f"fixture missing at {fixture.as_str()}"); }
+        const header: PathBuf = fixture.join(Str::new("include")).join(Str::new("vendor_consts.h"));
+        const published: Array<String> = match (File::read_text(header.as_path())) {
+            Result::Ok(text) => { VendorGate::published(text.as_str()) }
+            Result::Err(_)   => { return Result::Err(String::from_str(Str::new("fixture header missing; the gate would consume a list of names with nothing behind it"))); }
+        };
+        const expected: Array<Pair<String, String>> = VendorGate::expected();
+        const unconsumed: Array<String> = VendorGate::names_not_in(&published, &expected);
+        if (!unconsumed.is_empty()) {
+            return Result::Err(f"the fixture header publishes constant(s) this gate never consumes: {Text::joined(&unconsumed, Str::new(", ")).as_str()}\nA shape in the header that no assertion reads is a shape nothing\nchecks - the fixture looks like coverage while the gate reports\nonly the names it already knew.  Add it to the gate's integer table (or\nthe float/string pair) with the value the header says it has.");
+        }
+        mut phantom: Array<String> = Array::<String>::new();
+        for (entry in expected.iter_ref()) {
+            if (!published.contains(&entry.first)) { phantom.push(entry.first.clone()); }
+        }
+        phantom.sort();
+        if (!phantom.is_empty()) {
+            return Result::Err(f"this gate consumes constant(s) the header does not publish: {Text::joined(&phantom, Str::new(", ")).as_str()}");
+        }
+
+        const home: TempDirectory = match (TempDirectory::create()) {
+            Result::Ok(home)   => { home }
+            Result::Err(error) => { return Result::Err(f"cannot create a temporary CRYO_HOME: {error.describe()}"); }
+        };
+        mut vendor: Job = this.job(home.path());
+        vendor.argument(Str::new("vendor"));
+        vendor.argument(fixture.as_str());
+        vendor.log_to(logs.file(Str::new("vendor-register")).as_str());
+        const registered: Completion = vendor.run();
+        const report: String = registered.output();
+        if (!registered.outcome.succeeded()) {
+            return Result::Err(f"`cryo vendor` failed on the fixture ({registered.outcome.describe().as_str()})\n{report.as_str().trim_end()}");
+        }
+        mut dropped: Array<String> = Array::<String>::new();
+        mut generated: Option<String> = Option::None;
+        for (line in report.as_str().split(&Str::new("\n"))) {
+            if (line.contains(&Str::new("[skip]")) && line.contains(&Str::new("const"))) { dropped.push(String::from_str(line.trim_end())); }
+            if (generated.is_none()) {
+                match (line.trim_start().strip_prefix(&Str::new("bindings:"))) {
+                    Option::Some(rest) => { if (!rest.trim().is_empty()) { generated = Option::Some(String::from_str(rest.trim())); } }
+                    Option::None       => { }
+                }
+            }
+        }
+        if (!dropped.is_empty()) {
+            return Result::Err(f"the serializer reported dropping bound constants\n{Text::joined(&dropped, Str::new("\n")).as_str()}");
+        }
+        const bindings: String = match (generated) {
+            Option::Some(path) => { path }
+            Option::None       => { return Result::Err(f"could not find the generated bindings path in the output\n{report.as_str().trim_end()}"); }
+        };
+        const body: String = match (File::read_text(Path::from(bindings.as_str()))) {
+            Result::Ok(text) => { text }
+            Result::Err(_)   => { return Result::Err(f"generated bindings file does not exist: {bindings.as_str()}\n{report.as_str().trim_end()}"); }
+        };
+        mut missing: Array<String> = Array::<String>::new();
+        for (text in VendorGate::generated_must_contain().iter_ref()) {
+            if (!body.as_str().contains(&text.as_str())) { missing.push(f"  {text.as_str()}"); }
+        }
+        if (!missing.is_empty()) {
+            return Result::Err(f"the generated binding is missing non-const declarations\n{Text::joined(&missing, Str::new("\n")).as_str()}\n{body.as_str().trim_end()}");
+        }
+
+        const project: PathBuf = home.path().join(Str::new("consumer"));
+        match (VendorGate::write_consumer(project.as_path(), &expected)) {
+            Result::Ok(_)       => { }
+            Result::Err(reason) => { return Result::Err(reason); }
+        }
+        // `cryo build` writes its output relative to the current directory,
+        // so the consumer is built from inside its project.
+        mut consumer: Job = this.job(home.path());
+        consumer.argument(Str::new("run"));
+        consumer.directory(project.as_path().as_str());
+        consumer.log_to(logs.file(Str::new("vendor-consumer")).as_str());
+        const ran: Completion = consumer.run();
+        const printed: String = ran.output();
+        if (!ran.outcome.succeeded()) {
+            return Result::Err(f"the consumer failed to build or run (a `cannot find value` here means the constant was dropped from the generated binding)\n{printed.as_str().trim_end()}\n--- generated binding ---\n{body.as_str().trim_end()}");
+        }
+
+        mut bad: Array<String> = Array::<String>::new();
+        mut names: Array<String> = Array::<String>::new();
+        for (entry in expected.iter_ref()) { names.push(entry.first.clone()); }
+        names.sort();
+        for (name in names.iter_ref()) {
+            mut want: Str = Str::new("");
+            for (entry in expected.iter_ref()) {
+                if (entry.first.as_str() == name.as_str()) { want = entry.second.as_str(); }
+            }
+            match (VendorGate::printed_value(printed.as_str(), name.as_str())) {
+                Option::Some(value) => {
+                    if (value != want) { bad.push(f"  {name.as_str():<14} expected {want}, got {value}"); }
+                }
+                Option::None => { bad.push(f"  {name.as_str():<14} MISSING from the consumer's output"); }
+            }
+        }
+        if (!bad.is_empty()) {
+            return Result::Err(f"constant values do not match the header\n{Text::joined(&bad, Str::new("\n")).as_str()}\n{printed.as_str().trim_end()}");
+        }
+        return Result::Ok(expected.length());
+    }
+
+    /// A compiler job with the gate's hermetic environment.
+    job(&this, home: Path) -> Job {
+        mut job: Job = Job::new(this.compiler.as_str());
+        job.set_variable(Str::new("CRYO_HOME"), home.as_str());
+        job.set_variable(Str::new("CRYO_STDLIB"), this.stdlib.as_str());
+        job.default_c_compiler();
+        return job;
+    }
+
+    /// Every constant the gate consumes and the value the header gives it,
+    /// as the consumer prints it.  The values are worked out by hand from
+    /// the header so that a wrong fold is caught rather than mirrored.
+    static expected() -> Array<Pair<String, String>> {
+        mut table: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+        VendorGate::entry(&table, Str::new("VC_PLAIN_INT"), Str::new("4097"));         // a single literal
+        VendorGate::entry(&table, Str::new("VC_TWO_STEP"), Str::new("259"));           // VC_MAKE_VERSION(1, 3): (1 << 8) | 3
+        VendorGate::entry(&table, Str::new("VC_ARITH"), Str::new("4100"));             // VC_PLAIN_INT + 3
+        VendorGate::entry(&table, Str::new("VC_NEGATIVE"), Str::new("-4098"));         // two's complement, cast back
+        VendorGate::entry(&table, Str::new("VC_HEX_U"), Str::new("8196"));             // 0x00002004u
+        VendorGate::entry(&table, Str::new("VC_CHAR"), Str::new("81"));                // 'Q'
+        VendorGate::entry(&table, Str::new("VC_WIDE_FLAG"), Str::new("4294967296"));   // static const unsigned long long
+        VendorGate::entry(&table, Str::new(VendorGate::FLOAT_CONSTANT), Str::new("3.500"));
+        VendorGate::entry(&table, Str::new(VendorGate::STRING_CONSTANT), Str::new("vendor-consts"));
+        return table;
+    }
+
+    static entry(table: mut &Array<Pair<String, String>>, name: Str, value: Str) -> void {
+        table.push(Pair::new(String::from_str(name), String::from_str(value)));
+    }
+
+    /// The text the generated binding must hold for declarations that reach
+    /// it by paths other than the constant writer.
+    static generated_must_contain() -> Array<String> {
+        mut texts: Array<String> = Array::<String>::new();
+        texts.push(String::from_str(Str::new("type enum VcKind")));
+        texts.push(String::from_str(Str::new("VC_KIND_SOME = 7;")));
+        texts.push(String::from_str(Str::new("function vc_touch(")));
+        texts.push(String::from_str(Str::new("function vc_name() -> const i8*;")));
+        texts.push(String::from_str(Str::new("lines: const (const i8*)*")));
+        texts.push(String::from_str(Str::new("slots: const (mut i8*)*")));
+        return texts;
+    }
+
+    /// The consumer: a project reading every constant through the
+    /// generated binding and printing `NAME=value`, integers as `i64`.
+    static write_consumer(project: Path, expected: &Array<Pair<String, String>>) -> Result<(), String> {
+        const source: PathBuf = project.join(Str::new("src"));
+        match (Directory::create_all(source.as_path())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { return Result::Err(f"cannot create {source.as_path().as_str()}: {error.describe()}"); }
+        }
+        mut text: String = String::from_str(Str::new(
+            "///! Generated by `cryogate vendor`.  Reads every constant\n"
+            "///! the fixture header publishes; a constant the serializer dropped\n"
+            "///! fails to resolve here, which is the symptom the gate watches for.\n"
+            "namespace VendorConstsGate::Main;\n\n"
+            "import std::fmt;\n"
+            "import vendor::VendorConsts;\n\n"
+            "function main() -> i32 {\n"));
+        for (entry in expected.iter_ref()) {
+            const name: Str = entry.first.as_str();
+            text.push(Str::new("    fmt::printf(\""));
+            text.push(name);
+            if (name == Str::new(VendorGate::FLOAT_CONSTANT)) {
+                text.push(Str::new("=%.3f\\n\", VendorConsts::"));
+                text.push(name);
+                text.push(Str::new(" as f64);\n"));
+            } else if (name == Str::new(VendorGate::STRING_CONSTANT)) {
+                text.push(Str::new("=%s\\n\", VendorConsts::"));
+                text.push(name);
+                text.push(Str::new(");\n"));
+            } else {
+                text.push(Str::new("=%lld\\n\", VendorConsts::"));
+                text.push(name);
+                text.push(Str::new(" as i64);\n"));
+            }
+        }
+        text.push(Str::new("    return 0;\n}\n"));
+        match (File::write_text(project.join(Str::new("cryoconfig")).as_path(), Str::new(VendorGate::CONSUMER_CONFIG))) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { return Result::Err(f"cannot write the consumer's cryoconfig: {error.describe()}"); }
+        }
+        match (File::write_text(source.join(Str::new("main.cryo")).as_path(), text.as_str())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { return Result::Err(f"cannot write the consumer's source: {error.describe()}"); }
+        }
+        return Result::Ok(());
+    }
+
+    /// The value printed for `name` (`name=value`, both trimmed), the last
+    /// one when there are several.
+    static printed_value(output: Str, name: Str) -> Option<Str> {
+        mut found: Option<Str> = Option::None;
+        for (line in output.split(&Str::new("\n"))) {
+            match (line.split_once(&Str::new("="))) {
+                Option::Some(pair) => { if (pair.first.trim() == name) { found = Option::Some(pair.second.trim()); } }
+                Option::None       => { }
+            }
+        }
+        return found;
+    }
+
+    /// Every constant name the header publishes, sorted: each object-like
+    /// `#define NAME` (a function-like macro, `NAME(`, is not a constant)
+    /// and each `static const ... NAME =`, whose declaration may span lines.
+    public static published(header: Str) -> Array<String> {
+        mut names: Array<String> = Array::<String>::new();
+        mut offset: i64 = 0;
+        for (line in header.split(&Str::new("\n"))) {
+            const start: i64 = offset;
+            offset += line.length() + 1;
+            match (line.strip_prefix(&Str::new("#define"))) {
+                Option::Some(rest) => {
+                    const after: Str = rest.trim_start();
+                    if (after.length() < rest.length()) {
+                        const name: Str = VendorGate::leading_identifier(after);
+                        if (!name.is_empty()) {
+                            const next: Option<u8> = after.byte_at(name.length());
+                            const continues: boolean = match (next) {
+                                Option::Some(byte) => { VendorGate::is_word_byte(byte) || byte == VendorGate::OPEN_PARENTHESIS }
+                                Option::None       => { false }
+                            };
+                            if (!continues) { VendorGate::add(&names, name); }
+                        }
+                    }
+                }
+                Option::None => { }
+            }
+            match (line.strip_prefix(&Str::new("static"))) {
+                Option::Some(rest) => {
+                    const after: Str = rest.trim_start();
+                    if (after.length() < rest.length() && after.starts_with(&Str::new("const"))) {
+                        const tail: Str = header.sub_bytes(start + (line.length() - after.length()) + 5, header.length());
+                        const boundary: boolean = match (tail.byte_at(0)) {
+                            Option::Some(byte) => { !VendorGate::is_word_byte(byte) }
+                            Option::None       => { true }
+                        };
+                        if (boundary) {
+                            const name: Str = VendorGate::name_before_assignment(tail);
+                            if (!name.is_empty()) { VendorGate::add(&names, name); }
+                        }
+                    }
+                }
+                Option::None => { }
+            }
+        }
+        names.sort();
+        return names;
+    }
+
+    /// The identifier just before the first `=` of `text`, when no `;`
+    /// comes first: the declared name of `static const <type> NAME = ...`.
+    static name_before_assignment(text: Str) -> Str {
+        const assignment: i64 = match (text.find(&Str::new("="))) {
+            Option::Some(at) => { at }
+            Option::None     => { return Str::new(""); }
+        };
+        match (text.find(&Str::new(";"))) {
+            Option::Some(at) => { if (at < assignment) { return Str::new(""); } }
+            Option::None     => { }
+        }
+        const before: Str = text.sub_bytes(0, assignment).trim_end();
+        mut begin: i64 = before.length();
+        while (begin > 0 && VendorGate::is_word_byte(before.byte_at(begin - 1).unwrap())) { begin--; }
+        while (begin < before.length() && before.byte_at(begin).unwrap().is_digit()) { begin++; }
+        return before.sub_bytes(begin, before.length());
+    }
+
+    /// The identifier `text` starts with, empty when it starts with none.
+    static leading_identifier(text: Str) -> Str {
+        match (text.byte_at(0)) {
+            Option::Some(byte) => { if (!VendorGate::is_word_byte(byte) || byte.is_digit()) { return Str::new(""); } }
+            Option::None       => { return Str::new(""); }
+        }
+        mut end: i64 = 1;
+        while (end < text.length() && VendorGate::is_word_byte(text.byte_at(end).unwrap())) { end++; }
+        return text.sub_bytes(0, end);
+    }
+
+    /// A byte of a C identifier: a letter, a digit or `_`.
+    static is_word_byte(byte: u8) -> boolean {
+        return byte.is_alpha() || byte.is_digit() || byte == VendorGate::UNDERSCORE;
+    }
+
+    static add(names: mut &Array<String>, name: Str) -> void {
+        const owned: String = String::from_str(name);
+        if (!names.contains(&owned)) { names.push(owned); }
+    }
+
+    /// The published names no entry of `expected` consumes.
+    static names_not_in(published: &Array<String>, expected: &Array<Pair<String, String>>) -> Array<String> {
+        mut missing: Array<String> = Array::<String>::new();
+        for (name in published.iter_ref()) {
+            mut consumed: boolean = false;
+            for (entry in expected.iter_ref()) {
+                if (entry.first.as_str() == name.as_str()) { consumed = true; }
+            }
+            if (!consumed) { missing.push(name.clone()); }
+        }
+        return missing;
+    }
+
+    const UNDERSCORE: u8 = 95;
+    const OPEN_PARENTHESIS: u8 = 40;
+    const FLOAT_CONSTANT: string = "VC_FLOAT";
+    const STRING_CONSTANT: string = "VC_STRING";
+    const CONSUMER_CONFIG: string = "[project]\nproject_name = \"vendor_consts_gate\"\noutput_dir   = \"build\"\ntarget_type  = \"executable\"\nsource_dir   = \"src\"\nentry_point  = \"src/main.cryo\"\n\n[compiler]\n\n[dependencies]\n";
+}
