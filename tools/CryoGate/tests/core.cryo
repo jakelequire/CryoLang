@@ -1,11 +1,15 @@
-///! The core's pure decisions: what an outcome is called, when a lock is
-///! stale, which host a target gate includes.
+///! The core's decisions: what an outcome is called, when a lock is stale
+///! and where it lives, which host a target gate includes.
 ![config(testing)]
 namespace cryogate::tests::core;
 
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::core::result::{ Result };
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ PathBuf };
+import std::fs::temporary::{ TempDirectory };
 import std::test::error::{ TestError };
 import std::test::assert::{ expect, expect_false };
 
@@ -35,6 +39,57 @@ function a_lock_goes_stale_after_three_hours() -> Result<(), TestError> {
     expect_false(HeavyLock::is_stale(1000, 1000), Str::new("just written"))?;
     expect_false(HeavyLock::is_stale(1000, 1000 + 3 * 3600), Str::new("exactly three hours"))?;
     return expect(HeavyLock::is_stale(1000, 1001 + 3 * 3600), Str::new("past three hours"));
+}
+
+/// A main checkout `apps/main` and a linked worktree made somewhere else,
+/// `apps/elsewhere/linked`, laid out as git lays them out: the worktree's
+/// `.git` file names its directory under the store, whose `commondir` leads
+/// back to the store.
+![test]
+function every_worktree_takes_the_lock_beside_the_main_checkout() -> Result<(), TestError> {
+    const scratch: TempDirectory = match (TempDirectory::create()) {
+        Result::Ok(directory) => { directory }
+        Result::Err(error)    => { return Result::Err(TestError::other(error.describe())); }
+    };
+    const apps: PathBuf = match (scratch.path().canonicalize()) {
+        Result::Ok(path)   => { path }
+        Result::Err(error) => { return Result::Err(TestError::other(error.describe())); }
+    };
+    const main: PathBuf = apps.join(Str::new("main"));
+    const linked: PathBuf = apps.join(Str::new("elsewhere")).as_path().join(Str::new("linked"));
+    const store_entry: PathBuf = main.join(Str::new(".git/worktrees/linked"));
+    expect(Directory::create_all(store_entry.as_path()).is_ok(), Str::new("store entry made"))?;
+    expect(Directory::create_all(linked.as_path()).is_ok(), Str::new("worktree made"))?;
+    expect(File::write_text(store_entry.join(Str::new("commondir")).as_path(), Str::new("../..\n")).is_ok(), Str::new("commondir written"))?;
+    const marker: String = f"gitdir: {store_entry.as_path().as_str()}\n";
+    expect(File::write_text(linked.join(Str::new(".git")).as_path(), marker.as_str()).is_ok(), Str::new("worktree marker written"))?;
+
+    const expected: PathBuf = apps.join(Str::new("cryo-heavy-run.lock"));
+    const from_main: PathBuf = match (Host::main_checkout(main.as_path())) {
+        Result::Ok(path)    => { path }
+        Result::Err(reason) => { return Result::Err(TestError::other(reason.as_str())); }
+    };
+    const from_linked: PathBuf = match (Host::main_checkout(linked.as_path())) {
+        Result::Ok(path)    => { path }
+        Result::Err(reason) => { return Result::Err(TestError::other(reason.as_str())); }
+    };
+    expect(from_main.as_path().as_str() == main.as_path().as_str(), Str::new("the main checkout is its own"))?;
+    expect(from_linked.as_path().as_str() == main.as_path().as_str(), Str::new("the worktree leads to the main checkout"))?;
+    const lock: PathBuf = match (HeavyLock::beside(from_linked.as_path())) {
+        Result::Ok(path)    => { path }
+        Result::Err(reason) => { return Result::Err(TestError::other(reason.as_str())); }
+    };
+    return expect(lock.as_path().as_str() == expected.as_path().as_str(), Str::new("the lock is beside the main checkout"));
+}
+
+![test]
+function a_worktree_marker_without_gitdir_is_refused() -> Result<(), TestError> {
+    const scratch: TempDirectory = match (TempDirectory::create()) {
+        Result::Ok(directory) => { directory }
+        Result::Err(error)    => { return Result::Err(TestError::other(error.describe())); }
+    };
+    expect(File::write_text(scratch.path().join(Str::new(".git")).as_path(), Str::new("not a marker\n")).is_ok(), Str::new("marker written"))?;
+    return expect(Host::main_checkout(scratch.path()).is_err(), Str::new("a .git file with no gitdir line"));
 }
 
 ![test]

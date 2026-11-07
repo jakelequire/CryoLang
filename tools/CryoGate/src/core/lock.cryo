@@ -2,9 +2,10 @@
 ///! pin build) on the machine at a time, across every checkout.
 ///!
 ///! The lock is a file, created only if absent, holding who took it and
-///! when.  Its default place is beside the checkout, in the directory that
-///! holds the repository's worktrees, which is where people taking it by
-///! hand put it too; `CRYOGATE_HEAVY_LOCK` names another file.  The holder
+///! when.  Its default place is beside the MAIN checkout, in the directory
+///! holding it, so every worktree of the repository takes one file wherever
+///! the worktree was made, and it is the file people taking the lock by hand
+///! use too; `CRYOGATE_HEAVY_LOCK` names another file.  The holder
 ///! deletes it when done.  A lock older than `STALE_SECONDS` is not waited
 ///! for and not taken: it is reported, because a run that died holding it
 ///! and a run still going look the same from outside.
@@ -25,6 +26,8 @@ import std::time::clock::{ SystemTime };
 import std::time::datetime::{ DateTime };
 import std::time::duration::{ Duration };
 
+import cryogate::core::host::{ Host };
+
 /// What stands in the way of taking the lock.
 public type enum Holder {
     /// Nobody: the file is absent.
@@ -41,14 +44,23 @@ public type struct HeavyLock {
     held: boolean;
 
     /// The lock file this checkout uses.
-    public static default_path(repository: Path) -> PathBuf {
+    public static default_path(repository: Path) -> Result<PathBuf, String> {
         match (env::var(Str::new("CRYOGATE_HEAVY_LOCK"))) {
-            Option::Some(path) => { return PathBuf::from(path.as_str()); }
+            Option::Some(path) => { return Result::Ok(PathBuf::from(path.as_str())); }
             Option::None       => { }
         }
-        return match (repository.parent()) {
-            Option::Some(parent) => { parent.join(Str::new("cryo-heavy-run.lock")) }
-            Option::None         => { repository.join(Str::new("cryo-heavy-run.lock")) }
+        return match (Host::main_checkout(repository)) {
+            Result::Ok(main)    => { HeavyLock::beside(main.as_path()) }
+            Result::Err(reason) => { Result::Err(reason) }
+        };
+    }
+
+    /// The lock of every worktree whose main checkout is `main`: in the
+    /// directory holding that checkout.
+    public static beside(main: Path) -> Result<PathBuf, String> {
+        return match (main.parent()) {
+            Option::Some(parent) => { Result::Ok(parent.join(Str::new("cryo-heavy-run.lock"))) }
+            Option::None         => { Result::Err(f"the main checkout {main.as_str()} is a root directory: there is no directory beside it for the heavy-run lock") }
         };
     }
 

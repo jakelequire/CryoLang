@@ -303,8 +303,10 @@ Side effects beyond the named output
   install         writes symlinks outside the repository (may need sudo).
   verify, test-census, selfhost-check, pin
                   hold the heavy-run lock, cryo-heavy-run.lock in the
-                  directory holding the checkout (CRYOGATE_HEAVY_LOCK names
-                  another), for the run: one waits, polling each minute,
+                  directory holding the MAIN checkout, the one file for every
+                  worktree (CRYOGATE_HEAVY_LOCK names another), while their
+                  recipe runs (their prerequisites build before it is
+                  taken): one waits, polling each minute,
                   while another checkout's heavy run holds it, and refuses a
                   lock older than three hours.  An interrupted run leaves
                   the file behind; delete it once nobody holds it.
@@ -363,7 +365,7 @@ endif
 # runs it as `$(CRYOGATE_COMMAND) <gate> ...`.  A heavy
 # target (verify, test-census, selfhost-check, pin) runs its recipe as
 # `$(CRYOGATE_HEAVY) <command>`: under the machine's heavy-run lock, beside
-# the checkout, waited for while another checkout's heavy run holds it, and
+# the main checkout, waited for while another checkout's heavy run holds it, and
 # released when the command ends.  cmd cannot run a quoted forward-slash path.
 CRYOGATE_DIR    := $(ROOT)/tools/CryoGate
 CRYOGATE        := $(CRYOGATE_DIR)/build/cryogate$(EXE_SUFFIX)

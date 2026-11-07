@@ -7,6 +7,7 @@ import std::collections::string::{ String };
 import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::env;
+import std::fs::file::{ File };
 import std::fs::path::{ Path, PathBuf };
 
 public type struct Host {
@@ -92,5 +93,51 @@ public type struct Host {
             return Result::Err(f"{exe} is not inside a repository's tools/CryoGate/build/: {root.as_path().as_str()} holds no bin/ and stdlib/");
         }
         return Result::Ok(root);
+    }
+
+    /// The main checkout of `repository`, spelled absolute with forward
+    /// slashes: the repository itself, or for a linked worktree the checkout
+    /// holding the object store its `.git` file leads to (`gitdir:`, then
+    /// that directory's `commondir`).  Every worktree of one repository
+    /// answers the same, wherever it was made.
+    public static main_checkout(repository: Path) -> Result<PathBuf, String> {
+        const marker: PathBuf = repository.join(Str::new(".git"));
+        if (!marker.as_path().is_file()) { return Host::resolved(repository); }
+        const text: String = match (File::read_text(marker.as_path())) {
+            Result::Ok(text)   => { text }
+            Result::Err(error) => { return Result::Err(f"cannot read {marker.as_path().as_str()}: {error.describe()}"); }
+        };
+        const linked: Str = match (text.as_str().trim().strip_prefix(&Str::new("gitdir:"))) {
+            Option::Some(rest) => { rest.trim() }
+            Option::None       => { return Result::Err(f"{marker.as_path().as_str()} holds no `gitdir:` line"); }
+        };
+        const git_directory: PathBuf = repository.join(linked);
+        if (!git_directory.as_path().is_directory()) {
+            return Result::Err(f"{marker.as_path().as_str()} names {linked}, which is not a directory on this host");
+        }
+        const common_file: PathBuf = git_directory.as_path().join(Str::new("commondir"));
+        if (!common_file.as_path().is_file()) {
+            return Result::Err(f"{git_directory.as_path().as_str()} holds no commondir: {repository.as_str()} is not a linked worktree");
+        }
+        const common_text: String = match (File::read_text(common_file.as_path())) {
+            Result::Ok(text)   => { text }
+            Result::Err(error) => { return Result::Err(f"cannot read {common_file.as_path().as_str()}: {error.describe()}"); }
+        };
+        const common: PathBuf = match (git_directory.as_path().join(common_text.as_str().trim()).as_path().canonicalize()) {
+            Result::Ok(path)   => { path }
+            Result::Err(error) => { return Result::Err(f"cannot resolve the object store {git_directory.as_path().as_str()} names: {error.describe()}"); }
+        };
+        return match (common.as_path().parent()) {
+            Option::Some(main) => { Host::resolved(main) }
+            Option::None       => { Result::Err(f"the object store {common.as_path().as_str()} has no parent directory") }
+        };
+    }
+
+    /// `path` made absolute, spelled with forward slashes.
+    static resolved(path: Path) -> Result<PathBuf, String> {
+        return match (path.canonicalize()) {
+            Result::Ok(absolute) => { Result::Ok(absolute) }
+            Result::Err(error)   => { Result::Err(f"cannot resolve {path.as_str()}: {error.describe()}") }
+        };
     }
 }

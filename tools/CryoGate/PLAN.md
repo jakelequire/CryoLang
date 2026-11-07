@@ -317,8 +317,11 @@ memory. So:
   cryogate takes it). A heavy run (verify, census, selfhost, pin builds,
   examples-golden, freestanding, profiling) takes one lock file for the
   machine. **Built** (`core/lock`): the file is the one the hand rule uses,
-  `cryo-heavy-run.lock` in the directory that holds the checkouts (beside the
-  repository; `CRYOGATE_HEAVY_LOCK` names another), created only if absent,
+  `cryo-heavy-run.lock` in the directory holding the MAIN checkout (found
+  through a linked worktree's `.git` file and its store's `commondir`, so every
+  worktree takes the one file wherever it was made; a worktree whose `gitdir:`
+  names another OS's path, as WSL reading a Windows worktree sees it, is
+  refused; `CRYOGATE_HEAVY_LOCK` names another file), created only if absent,
   holding its owner (`CRYOGATE_OWNER`, or the checkout) and the command line
   and start time. A held lock is waited for, polled every minute and named
   once, unless `--no-wait` (then refused); a lock older than three hours is
@@ -328,7 +331,12 @@ memory. So:
   `pin` run their recipes as `$(CRYOGATE_HEAVY) <command>`; the Windows
   `pin`'s re-entry into WSL calls `pin-impl`, which takes no lock, since the
   Windows side holds it. Ctrl-C leaves the file behind until the stdlib has an
-  interrupt hook (§6 row 7); the staleness rule bounds the damage. This is
+  interrupt hook (§6 row 7); the staleness rule bounds the damage. Not yet
+  covered: a heavy target's prerequisites (the stage-2 compiler, the test
+  helpers) build before its recipe takes the lock; an unfiltered `make test`,
+  `examples-golden` and `verify-freestanding` take none; and a gate whose
+  children outlive it (no process-tree kill, §6 row 2) releases the lock while
+  they run. This is
   what lets several workers share the PC without one's timings being
   another's noise.
 - Verdicts never depend on the schedule: a gate run alone and run under verify
@@ -858,7 +866,8 @@ unnecessary counts); 10 A (regression export is a must); 11 B (gate ports on
 the session dispatcher on Jake's behalf (roster and census together, verify
 reading the census parse from cryogate); the new spellings (`cryogate incr
 --instance`, `examples`, `vendor`, `cross`, `roster`, `census`, Makefile
-`pin-impl`) are in use and await Jake's approval.
+`pin-impl`, with their `--cryo` and other flags) are approved. The heavy-run
+lock is one file for every checkout, beside the main checkout.
 
 1. **The home** (supersedes test-infra Decisions 8 and 17). A:
    `tools/CryoGate` holds everything: the pin-built orchestrator `cryogate`
