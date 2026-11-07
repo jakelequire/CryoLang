@@ -16,7 +16,7 @@ import compiler::ast::declaration::{
     DeclarationNode, DeclKind, EnumDecl, FieldDecl, FunctionDecl, ImplBlock, MethodDecl,
     StructDecl, UnionDecl, VarDecl
 };
-import compiler::module_graph::{ ModulePath };
+import compiler::module_graph::{ IndexedModule, ModulePath };
 import compiler::resolver::res::{ DefId };
 import compiler::resolver::symbol::{ Symbol, SymbolKind };
 import compiler::resolver::symbol_id::{ SymbolID };
@@ -192,18 +192,32 @@ type struct Members {
     }
 
     /// The modules nested one level under `m`, or, for an invalid `m`, the
-    /// modules nested under none, that code in module `from` may name.
-    /// Each is named by its last segment, the text a path continues with;
-    /// a module hidden from `from` hides every path through it.
+    /// modules nested under none, that code in module `from` may name: the
+    /// analysis's modules and the ones discovery found on disk that nothing
+    /// imports (`ModuleGraph::indexed`).  Each is named by its last segment,
+    /// the text a path continues with; a module hidden from `from` hides
+    /// every path through it.
     static submodules_of(ctx: CompilationContext*, m: ModulePath, from: ModulePath) -> [string] {
+        mut paths: [ModulePath] = [];
+        mut path_hidden: [boolean] = [];
+        const n: u32 = ctx.module_graph.module_count();
+        for (mut i: u32 = 0; i < n; i++) {
+            const p: ModulePath = ctx.module_graph.get_module(i as i64).path();
+            paths.push(p);
+            path_hidden.push(ctx.hidden_from(ctx.module_def_of(p), from));
+        }
+        for (mut i: i64 = 0; i < ctx.module_graph.indexed.length(); i++) {
+            const indexed: &IndexedModule = &ctx.module_graph.indexed[i];
+            paths.push(indexed.path());
+            path_hidden.push(!ctx.module_graph.indexed_reaches(indexed, from));
+        }
         mut out: [string] = [];
         mut hidden: [string] = [];
         const parent: string = if (m.is_valid()) { ctx.intern_table.shown(m.decl_name()) } else { "" };
         const skip: i64 = if (m.is_valid()) { parent.length() as i64 + 2 } else { 0 };
         const separator: str::Str = str::Str::from("::");
-        const n: u32 = ctx.module_graph.module_count();
-        for (mut i: u32 = 0; i < n; i++) {
-            const p: ModulePath = ctx.module_graph.get_module(i as i64).path();
+        for (mut i: i64 = 0; i < paths.length(); i++) {
+            const p: ModulePath = paths[i];
             if (m.is_valid() && (p.equals(m) || !p.is_within(m, ctx.intern_table))) { continue; }
             const full: str::Str = str::Str::from(ctx.intern_table.shown(p.decl_name()));
             if (skip >= full.length()) { continue; }
@@ -214,7 +228,7 @@ type struct Members {
             };
             if (head.length() == 0) { continue; }
             const seg: string = String::from_str(head).into_raw();
-            if (head.length() == rest.length() && ctx.hidden_from(ctx.module_def_of(p), from)) {
+            if (head.length() == rest.length() && path_hidden[i]) {
                 hidden.push(seg);
                 continue;
             }

@@ -65,7 +65,7 @@ import compiler::compilation_context::{
 };
 import compiler::compile_mode::{ CompileMode };
 import compiler::diag::{ ErrorCode };
-import compiler::module_graph::{ ModuleInfo, ModuleOrigin };
+import compiler::module_graph::{ ModuleInfo, ModuleOrigin, ModulePackage, PackageRoots };
 import compiler::module_loader::{ ModuleLoader };
 import compiler::passes::pass_id::{ PassID, PassResult, Provision, ProvisionSet };
 import compiler::passes::pass_registry::{ PassRegistry };
@@ -1127,55 +1127,36 @@ type struct CompilerInstance {
             } else {
                 if (config.no_std) { "" } else { stdlib_root }
             });
-        const vendor_root: string =
-            if (ctx.project_config != null) {
-                ctx.project_config.vendor_dir()
+        // Vendored bindings are the loader's copies in `<profile_dir>/vendor/
+        // <Name>/<Name>.cryo`, checked first as the most specific root; their
+        // output routes to `vendor/<Name>/{deps,ir}`.
+        mut roots: PackageRoots = PackageRoots {
+            vendor_root: if (ctx.project_config != null) { ctx.project_config.vendor_dir() } else { "" },
+            stdlib_root: if (config.no_std) { "" } else { stdlib_root },
+            dep_roots:   [],
+            dep_names:   [],
+        };
+        for (mut drc: i64 = 0; drc < dep_outcome.roots.length(); drc++) {
+            const dr_path: string = dep_outcome.roots[drc].path;
+            roots.dep_roots.push(if (config.project_root.length() == 0 || config.project_root.eq(".")) {
+                dr_path
             } else {
-                ""
-            };
+                Path::from(config.project_root).join(dr_path).into_raw()
+            });
+            roots.dep_names.push(dep_outcome.roots[drc].name);
+        }
         for (mut mci: u32 = 0; mci < ctx.module_graph.module_count(); mci++) {
             const mci_info: mut ModuleInfo* = &ctx.module_graph.modules[mci];
-            const fpath: string = mci_info.file_path;
-            const file: Path = Path::from(fpath);
-            // Vendored bindings the loader copied into `<profile_dir>/vendor/
-            // <Name>/<Name>.cryo`.  Checked first (most specific path); the
-            // library name is the immediate parent directory, carried in
-            // origin_name so output routes to `vendor/<Name>/{deps,ir}`.
-            if (vendor_root.length() > 0 && file.starts_with(Path::from(vendor_root))) {
-                mci_info.origin = ModuleOrigin::Vendor;
-                mci_info.origin_name = fpath.parent_dir().basename();
-                // Warnings pointing into a generated binding are not the
-                // consuming author's to act on; the sink drops them from here on.
-                ctx.diagnostics.mark_vendor_file(fpath);
-                continue;
-            }
-            if (!config.no_std && stdlib_root.length() > 0
-                    && file.starts_with(Path::from(stdlib_root))) {
-                mci_info.origin = ModuleOrigin::Stdlib;
-                mci_info.origin_name = "";
-                continue;
-            }
-            mut matched_dep: boolean = false;
-            for (mut drc: i64 = 0; drc < dep_outcome.roots.length(); drc++) {
-                const dr_path: string = dep_outcome.roots[drc].path;
-                const dr_base: string =
-                    if (config.project_root.length() == 0
-                        || config.project_root.eq(".")) {
-                        dr_path
-                    } else {
-                        Path::from(config.project_root).join(dr_path).into_raw()
-                    };
-                if (file.starts_with(Path::from(dr_base))) {
-                    mci_info.origin = ModuleOrigin::Dep;
-                    mci_info.origin_name = dep_outcome.roots[drc].name;
-                    matched_dep = true;
-                    break;
-                }
-            }
-            if (!matched_dep) {
-                mci_info.origin = ModuleOrigin::Local;
-                mci_info.origin_name = "";
-            }
+            const package: ModulePackage = roots.package_of(mci_info.file_path);
+            mci_info.origin = package.origin;
+            mci_info.origin_name = package.origin_name;
+            // Warnings pointing into a generated binding are not the
+            // consuming author's to act on; the sink drops them from here on.
+            if (package.origin == ModuleOrigin::Vendor) { ctx.diagnostics.mark_vendor_file(mci_info.file_path); }
+        }
+        // Only the language server asks which modules exist unloaded.
+        if (ctx.options.mode == CompileMode::Lsp) {
+            ctx.module_graph.indexed = loader.indexed_modules(ctx.intern_table, &roots);
         }
 
         // Give each module the list of modules it can see through its imports,

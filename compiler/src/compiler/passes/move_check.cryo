@@ -54,6 +54,7 @@ import compiler::ast::node::{ ProgramNode };
 import compiler::ast::pattern::{ EnumPattern, MatchArmNode, Pattern, PatternKind };
 import compiler::ast::statement::{ Stmt, StmtKind };
 import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::suggestion::{ Suggestion };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
@@ -206,9 +207,11 @@ type struct MoveChecker {
     /// at every scope exit.  Everything else stays a hard E0453.  Mirrors
     /// drop_insertion's `pm_binding`/`pm_field`; the two passes MUST classify
     /// the identical set (a divergence is a double-free or a leak).  Reset in
-    /// `enter_function`.
+    /// `enter_function`.  `pm_site[i]` is where the field was moved out,
+    /// which a second move's report points back to.
     pm_binding: [u64];
     pm_field:   [u32];
+    pm_site:    [SourceSpan];
 
     /// Depth of enclosing `unsafe` blocks.
     ///
@@ -298,6 +301,7 @@ type struct MoveChecker {
             pat_binding_keys:   [],
             pm_binding:         [],
             pm_field:           [],
+            pm_site:            [],
             branch_depth:       0,
             loop_repeat:        false,
             unsafe_depth:        0,
@@ -326,6 +330,7 @@ type struct MoveChecker {
         this.pat_binding_keys   = [];
         this.pm_binding         = [];
         this.pm_field           = [];
+        this.pm_site            = [];
         this.branch_depth       = 0;
         this.loop_repeat        = false;
         this.unsafe_depth       = 0;
@@ -966,15 +971,51 @@ type struct MoveChecker {
     /// so a non-zero `fatal` aborts the pipeline before codegen and the
     /// unsound binary is never emitted.
     emit_use_after_move(mut &this, code: ErrorCode, headline_text: string,
-                        use_span: SourceSpan, move_span: SourceSpan) -> void {
+                        use_span: SourceSpan, move_span: SourceSpan, value_type: TypeRef) -> void {
         mut diag: Diagnostic = Diagnostic::error(code, headline_text);
         diag = diag.at_with_label(use_span, "value used here after move");
         if (move_span.has_location()) {
             diag = diag.also_at(move_span, "value moved here");
         }
+        diag = this.with_clone_hint(diag, value_type, move_span);
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
+    }
+
+    /// `diag`, a refused use of a value of type `ty` that was first moved
+    /// at `moved_at`, with the way to keep the value: a type implementing
+    /// `Clone` is offered `.clone()` where the value is first moved, which
+    /// moves a copy and leaves the original; a struct or enum that does not
+    /// is told to implement it.  Unchanged when the program declares no
+    /// `Clone` or the first move has no place.
+    with_clone_hint(&this, diag: Diagnostic, ty: TypeRef, moved_at: SourceSpan) -> Diagnostic {
+        const clone_trait: DefId = this.ctx.generic_registry.wellknown(LangItem::Clone);
+        if (!clone_trait.is_valid() || !ty.is_valid() || !moved_at.has_location()) { return diag; }
+        const shown: string = this.arena.resolve_display_name_short(ty);
+        mut checker: TraitChecker = TraitChecker::new(
+            this.arena, this.registry, this.intern, this.ctx.diagnostics);
+        if (checker.type_implements_trait(ty, clone_trait, 0)) {
+            return diag.suggest(Suggestion::machine_applicable(moved_at.end_point(), ".clone()",
+                fmt::format("`%s` implements `Clone`: move a copy where the value is first moved", shown)));
+        }
+        if (this.aggregate_type_of(ty) == null && !this.is_enum(ty)) { return diag; }
+        return diag.help(fmt::format(
+            "`%s` does not implement `Clone`; implement it to move a copy and keep the original: `implement trait Clone for %s { ... }`",
+            shown, shown));
+    }
+
+    /// Whether `ty`, its instantiations seen through, is an enum.
+    is_enum(&this, ty: TypeRef) -> boolean {
+        mut t: Type* = this.arena.lookup(ty);
+        mut guard: i32 = 0;
+        while (t != null && t.kind == TypeKind::InstantiatedType && guard < 16) {
+            const inst: InstantiatedType* = t.as_instantiated();
+            if (!inst.has_resolved_type()) { return false; }
+            t = this.arena.lookup(inst.resolved_type);
+            guard = guard + 1;
+        }
+        return t != null && t.kind == TypeKind::Enum;
     }
 
     /// A value declared outside a loop, moved inside it via a storage-
@@ -1828,13 +1869,15 @@ type struct MoveChecker {
 
     // ---- partial-move tracking (the "allow + track" half) ----------------
 
-    pm_has(&this, binding_id: u64, field_id: u32) -> boolean {
+    /// The position in the partial-move set of field `field_id` of the
+    /// binding `binding_id`, or -1 when it was not moved out.
+    pm_position(&this, binding_id: u64, field_id: u32) -> i64 {
         for (mut i: i64 = 0; i < this.pm_binding.length(); i++) {
             if (this.pm_binding[i] == binding_id && this.pm_field[i] == field_id) {
-                return true;
+                return i;
             }
         }
-        return false;
+        return -1;
     }
 
     pm_has_binding(&this, binding_id: u64) -> boolean {
@@ -1912,7 +1955,8 @@ type struct MoveChecker {
         return true;
     }
 
-    emit_double_field_move(mut &this, e: ExpressionNode*, ma: MemberAccessExpr*) -> void {
+    emit_double_field_move(mut &this, e: ExpressionNode*, ma: MemberAccessExpr*,
+                           moved_at: SourceSpan) -> void {
         const field: string = this.intern.resolve(ma.member);
         const headline: string = fmt::format(
             "field '%s' moved out of a value more than once", field);
@@ -1920,8 +1964,10 @@ type struct MoveChecker {
             ErrorCode::E0452_USE_AFTER_MOVE, headline);
         diag = diag.at_with_label(e.span,
             "this field was already moved out of the value (double free)");
+        diag = diag.also_at(moved_at, "first moved out here");
         diag = diag.help(
             "a value can be moved out of a given field only once");
+        diag = this.with_clone_hint(diag, e.resolved_type, moved_at);
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
@@ -2022,13 +2068,15 @@ type struct MoveChecker {
         if (this.type_needs_drop(field_ty) && this.partial_move_allowed(ma)) {
             const owner_id: u64 = ExpressionNode::identifier_of(ma.object).res.local_sym().key();
             const field_id: u32 = ma.member.id;
-            if (this.pm_has(owner_id, field_id)) {
+            const moved: i64 = this.pm_position(owner_id, field_id);
+            if (moved >= 0) {
                 // Moving the SAME field out twice is a double free.
-                if (!this.suppress_emit) { this.emit_double_field_move(expr, ma); }
+                if (!this.suppress_emit) { this.emit_double_field_move(expr, ma, this.pm_site[moved]); }
                 return;
             }
             this.pm_binding.push(owner_id);
             this.pm_field.push(field_id);
+            this.pm_site.push(expr.span);
             return;
         }
         this.emit_move_out_error(expr, ma);
@@ -2326,7 +2374,7 @@ type struct MoveChecker {
             const headline: string = fmt::format("use of moved value '%s'",
                 this.intern.resolve(name));
             this.emit_use_after_move(ErrorCode::E0452_USE_AFTER_MOVE,
-                headline, e.span, move_span);
+                headline, e.span, move_span, ty);
             return;
         }
         if (in_move_context) {

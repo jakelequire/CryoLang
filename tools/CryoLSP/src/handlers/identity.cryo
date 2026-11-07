@@ -287,6 +287,8 @@ type struct Locator {
                     }
                     ExprKind::Struct(sl) => { return this.struct_literal(e, sl); }
                     ExprKind::Cast(c) => { return this.annotation(c.target_annotation); }
+                    // A type written in the call's type arguments: `f::<String>()`.
+                    ExprKind::Call(c) => { return this.annotation_in(&c.generic_args); }
                     // Nothing here names a definition the editor can answer.
                     ExprKind::Sizeof(_) | ExprKind::Alignof(_) | ExprKind::Typeof(_)
                     | ExprKind::Delete(_) | ExprKind::Yield(_) | ExprKind::Try(_)
@@ -294,8 +296,9 @@ type struct Locator {
                     | ExprKind::Tuple(_) | ExprKind::Array(_) | ExprKind::Literal(_)
                     | ExprKind::Ternary(_) | ExprKind::If(_) | ExprKind::StaticMatch(_)
                     | ExprKind::Match(_) | ExprKind::Unary(_) | ExprKind::Binary(_)
-                    | ExprKind::ArrayAccess(_) | ExprKind::Lambda(_) | ExprKind::Await(_)
-                    | ExprKind::Call(_) => { return Answer::nothing(); }
+                    | ExprKind::ArrayAccess(_) | ExprKind::Lambda(_) | ExprKind::Await(_) => {
+                        return Answer::nothing();
+                    }
                 }
             }
             Node::Pattern(p) => { return this.pattern(p); }
@@ -354,7 +357,13 @@ type struct Locator {
         if (this.holds(s.scope_span)) {
             return Answer::of(this.res_target(&s.scope_res), s.scope_span, TypeRef::invalid());
         }
-        if (!this.holds(s.member_span)) { return Answer::nothing(); }
+        if (!this.holds(s.member_span)) {
+            // A type written in the path's type arguments: `String` in
+            // `Array::<String>::new`, or in `f::<String>`.
+            const scope_arg: Answer = this.annotation_in(&s.scope_generic_args);
+            if (!scope_arg.target.is_nothing()) { return scope_arg; }
+            return this.annotation_in(&s.generic_args);
+        }
         return Answer::of(this.path_member(s, this.call_of(e)), s.member_span, ty);
     }
 
@@ -660,11 +669,7 @@ type struct Locator {
         }
         const a: Answer = this.annotation(ib.trait_annotation);
         if (!a.target.is_nothing()) { return a; }
-        for (mut i: i64 = 0; i < ib.target_args.length(); i++) {
-            const t: Answer = this.annotation(ib.target_args[i]);
-            if (!t.target.is_nothing()) { return t; }
-        }
-        return Answer::nothing();
+        return this.annotation_in(&ib.target_args);
     }
 
     /// The module an import's path names, from its last segment, or the
@@ -701,6 +706,15 @@ type struct Locator {
         if (!m.is_valid()) { return Answer::nothing(); }
         const d: DefId = this.ctx.module_graph.module_def(m);
         return Answer::of(Locator::def_target(d), md.path_segment_spans[last], TypeRef::invalid());
+    }
+
+    /// The written type name at the position inside one of `anns`.
+    annotation_in(&this, anns: &[mut TypeAnnotation*]) -> Answer {
+        for (mut i: i64 = 0; i < anns.length(); i++) {
+            const t: Answer = this.annotation(anns[i]);
+            if (!t.target.is_nothing()) { return t; }
+        }
+        return Answer::nothing();
     }
 
     /// The written type name at the position inside `ann`.

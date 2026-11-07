@@ -282,8 +282,8 @@ type struct Docs {
             }
             Option::None => { }
         }
-        match (File::read_text(path::Path::from(fpath))) {
-            Result::Ok(t) => {
+        match (this.analysed_text(fpath)) {
+            Option::Some(t) => {
                 mut owned: String = t;
                 mut idx: line_index::LineIndex = line_index::LineIndex::build(owned.as_str());
                 const r: lsp::Range = lsp::Range::new(
@@ -293,13 +293,61 @@ type struct Docs {
                 mem::drop(owned);
                 return r;
             }
-            Result::Err(_) => {
+            Option::None => {
                 // No text to measure: the compiler's columns are the best
                 // statement of where the span is.
                 return lsp::Range::new(
                     lsp::Position::new(span.start_line - 1, Docs::col0(span.start_col)),
                     lsp::Position::new(end_line - 1, Docs::col0(end_col)));
             }
+        }
+    }
+
+    /// The text the current analysis read for file `path`: an open
+    /// document's analysed text (its buffer when the analysis read the
+    /// buffer as it is), or else the file on disk.  None when the file
+    /// cannot be read.
+    analysed_text(&this, path: str::Str) -> Option<String> {
+        match (this.by_path(path)) {
+            Option::Some(doc) => {
+                if (doc.has_snap) { return Option::Some(String::from_str(doc.snap_text.as_str())); }
+                return Option::Some(String::from_str(doc.text.as_str()));
+            }
+            Option::None => { }
+        }
+        match (File::read_text(path::Path::from(path))) {
+            Result::Ok(t) => { return Option::Some(t); }
+            Result::Err(_) => { return Option::None; }
+        }
+    }
+
+    /// The text the current analysis read in file `path` from compiler
+    /// position (`start_line`, `start_col`) up to, not including,
+    /// (`end_line`, `end_col`).  None when the file cannot be read or the
+    /// positions are not in it in that order.
+    analysed_text_between(&this, path: str::Str, start_line: u32, start_col: u32,
+                          end_line: u32, end_col: u32) -> Option<String> {
+        if (start_line == 0 || end_line == 0) { return Option::None; }
+        match (this.analysed_text(path)) {
+            Option::Some(t) => {
+                mut owned: String = t;
+                mut idx: line_index::LineIndex = line_index::LineIndex::build(owned.as_str());
+                const lines: i64 = idx.line_count();
+                mut out: Option<String> = Option::None;
+                if ((start_line as i64) <= lines && (end_line as i64) <= lines) {
+                    const from: i64 = idx.line_start(start_line - 1)
+                        + Columns::compiler_to_byte(Columns::line_of(owned.as_str(), &idx, start_line - 1), start_col);
+                    const to: i64 = idx.line_start(end_line - 1)
+                        + Columns::compiler_to_byte(Columns::line_of(owned.as_str(), &idx, end_line - 1), end_col);
+                    if (from <= to && to <= owned.length()) {
+                        out = Option::Some(String::from_str(owned.as_str().sub_bytes(from, to)));
+                    }
+                }
+                mem::drop(idx);
+                mem::drop(owned);
+                return out;
+            }
+            Option::None => { return Option::None; }
         }
     }
 

@@ -279,11 +279,10 @@ several diagnostics share one cause and one fix - every change a method makes
 through its `&this` receiver - the compiler prints them as one report with an
 `-->` arrow per place, stacked under the header. Each place is still a
 diagnostic of the report's code at its own line, carrying the report's
-headline, and each needs its own `//~`. The report is named by a note,
-`report diag-<ten hex digits>`, hashed from its code, headline, file name and
-first place: the same source names it the same on every host, so a project's
-`output_contains` may pin it, and the language server's related information
-for each place carries the same name.
+headline, and each needs its own `//~`. The language server names the report
+in each place's related information, `diag-<ten hex digits>`, hashed from its
+code, headline, file name and first place, so the places of one report read
+as one; the compiler's output prints no name.
 
 ---
 

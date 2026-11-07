@@ -408,6 +408,66 @@ public:
 
 }
 
+/// The package a module's file is in: its origin and, for a dependency or a
+/// vendored library, its name.
+type struct ModulePackage {
+    origin:      ModuleOrigin;
+    origin_name: string;
+
+    /// Whether this is the same package as `other`.
+    same_as(&this, other: &ModulePackage) -> boolean {
+        return this.origin == other.origin && this.origin_name.eq(other.origin_name);
+    }
+}
+
+/// The roots a module's file is classified by: under the vendored
+/// libraries' build folder, a vendored library; under the standard
+/// library's root, the standard library's; under a dependency's root, that
+/// dependency's; otherwise the program's own.
+type struct PackageRoots {
+    /// `<profile_dir>/vendor`; empty when the build has no project.
+    vendor_root: string;
+    /// Empty when the build uses no standard library.
+    stdlib_root: string;
+    dep_roots:   [string];
+    dep_names:   [string];
+
+    /// The package file `file_path` is in.
+    package_of(&this, file_path: string) -> ModulePackage {
+        const file: Path = Path::from(file_path);
+        if (this.vendor_root.length() > 0 && file.starts_with(Path::from(this.vendor_root))) {
+            // The library name is the bindings file's directory.
+            return ModulePackage { origin: ModuleOrigin::Vendor, origin_name: file_path.parent_dir().basename() };
+        }
+        if (this.stdlib_root.length() > 0 && file.starts_with(Path::from(this.stdlib_root))) {
+            return ModulePackage { origin: ModuleOrigin::Stdlib, origin_name: "" };
+        }
+        for (mut i: i64 = 0; i < this.dep_roots.length(); i++) {
+            if (file.starts_with(Path::from(this.dep_roots[i]))) {
+                return ModulePackage { origin: ModuleOrigin::Dep, origin_name: this.dep_names[i] };
+            }
+        }
+        return ModulePackage { origin: ModuleOrigin::Local, origin_name: "" };
+    }
+}
+
+/// A module discovery found on disk, whether or not the build loads it: the
+/// namespace a file under one of the roots declares, its package, and
+/// whether a `module` line makes it internal to that package.  Discovery
+/// loads only what is imported, so these are the modules an import may name
+/// that the graph need not hold.
+type struct IndexedModule {
+    name:              SymbolStr;
+    file_path:         string;
+    package:           ModulePackage;
+    declared_internal: boolean;
+
+    /// The module's path, as the graph would register it.
+    path(&this) -> ModulePath {
+        return ModulePath::of(this.name);
+    }
+}
+
 /// Tracks modules and their dependency relationships for multi-module and
 /// stdlib batch compilation.
 type struct ModuleGraph {
@@ -466,6 +526,11 @@ public:
     /// the output they route to.
     builds_standard_library: boolean;
 
+    /// Every module discovery indexed under the roots it scanned, loaded or
+    /// not (`IndexedModule`), for a language server's analysis; empty for
+    /// any other, which nothing asks.
+    indexed: [IndexedModule];
+
     static new(defs: mut DefTable*) -> ModuleGraph {
         // Pre-allocate raw buffers for up to 128 modules to avoid
         // per-module reallocation (which causes heap corruption from
@@ -491,6 +556,7 @@ public:
             def_paths:        [],
             uses_fstring:     false,
             builds_standard_library: false,
+            indexed:          [],
         };
     }
 
@@ -583,14 +649,18 @@ public:
     }
 
     /// The path an import writes, `std` in `import std::`, when the graph
-    /// holds a module at it or anywhere under it, whether or not the path
-    /// names a module itself; none otherwise.  What it answers is a path to
-    /// list the modules within (`ModulePath::is_within`), not a module.
+    /// holds or has indexed a module at it or anywhere under it, whether or
+    /// not the path names a module itself; none otherwise.  What it answers
+    /// is a path to list the modules within (`ModulePath::is_within`), not a
+    /// module.
     module_path_over(&this, written: SymbolStr, intern: InternTable*) -> ModulePath {
         if (!written.is_valid() || intern == null) { return ModulePath::none(); }
         const m: ModulePath = ModulePath::of(written);
         for (mut i: i64 = 0; i < this.modules.length(); i++) {
             if (ModulePath::of(this.modules[i].name).is_within(m, intern)) { return m; }
+        }
+        for (mut i: i64 = 0; i < this.indexed.length(); i++) {
+            if (ModulePath::of(this.indexed[i].name).is_within(m, intern)) { return m; }
         }
         return ModulePath::none();
     }
@@ -946,6 +1016,17 @@ public:
         const ma: const ModuleInfo* = &this.modules[ia];
         const mb: const ModuleInfo* = &this.modules[ib];
         return ma.origin == mb.origin && ma.origin_name.eq(mb.origin_name);
+    }
+
+    /// Whether the indexed module `m` may be named from module `from`: it
+    /// is not internal, or `from` is in its package.
+    indexed_reaches(&this, m: &IndexedModule, from: ModulePath) -> boolean {
+        if (!m.declared_internal) { return true; }
+        const index: i64 = this.find_module_index(from);
+        if (index < 0) { return false; }
+        const own: ModulePackage = ModulePackage {
+            origin: this.modules[index].origin, origin_name: this.modules[index].origin_name };
+        return own.same_as(&m.package);
     }
 
     /// Whether the module at path `m` is the standard library's: one a

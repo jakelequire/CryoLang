@@ -42,6 +42,8 @@ checks.json:
          "at": "...", "declaration": true, "expect": ["src/b.cryo@marker", ...]},
         {"name": "...", "method": "documentSymbol", "file": "src/b.cryo",
          "includes": ["Item", "Item/get"], "excludes": ["..."]},
+         a document symbol check also fails on any symbol whose
+         selectionRange is not inside its range,
         {"name": "...", "method": "workspaceSymbol", "query": "...",
          "includes": ["..."], "excludes": ["..."]},
         {"name": "...", "method": "semanticTokens", "file": "src/main.cryo",
@@ -340,6 +342,22 @@ def symbol_names(symbols, prefix=""):
     return out
 
 
+def selection_outside(symbols, prefix=""):
+    """Every document symbol whose selectionRange is not inside its range,
+    as `Parent/child`: the protocol requires it, and an editor refuses the
+    whole answer otherwise."""
+    def at(p):
+        return (p["line"], p["character"])
+    out = []
+    for s in symbols:
+        full = prefix + s.get("name", "")
+        r, sel = s.get("range"), s.get("selectionRange")
+        if r and sel and (at(sel["start"]) < at(r["start"]) or at(sel["end"]) > at(r["end"])):
+            out.append(full)
+        out.extend(selection_outside(s.get("children", []), full + "/"))
+    return out
+
+
 # ---- fixtures --------------------------------------------------------------
 
 class Fixture:
@@ -541,8 +559,10 @@ def run_check(srv, fx, chk, c):
         names = symbol_names(resp.get("result") or [])
         missing = [s for s in chk.get("includes", []) if s not in names]
         present = [s for s in chk.get("excludes", []) if s in names]
-        c.ok(not missing and not present, name,
-             "symbols %r; missing %r, unwanted %r" % (names[:40], missing, present))
+        outside = selection_outside(resp.get("result") or []) if method == "documentSymbol" else []
+        c.ok(not missing and not present and not outside, name,
+             "symbols %r; missing %r, unwanted %r, selection outside its range %r"
+             % (names[:40], missing, present, outside))
         return
 
     if method in ("prepareRename", "rename"):

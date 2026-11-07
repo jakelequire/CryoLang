@@ -3190,7 +3190,7 @@ type struct SemaVisitor {
     refuse_read_only_write(mut &this, access: PlaceAccess, span: SourceSpan) -> void {
         if (access.is_writable()) { return; }
         this.ctx.emit_diagnostic(this.read_only_report(ErrorCode::E0250_WRITE_THROUGH_READ_ONLY,
-            access, span, "assign to", "written here"));
+            access, span, "assign to", "written through", "written to"));
     }
 
     /// E0250 where a `mut &this` method is called on a place `access` says
@@ -3198,7 +3198,8 @@ type struct SemaVisitor {
     refuse_read_only_call(mut &this, access: PlaceAccess, span: SourceSpan) -> void {
         if (access.is_writable()) { return; }
         this.ctx.emit_diagnostic(this.read_only_report(ErrorCode::E0250_WRITE_THROUGH_READ_ONLY,
-            access, span, "call a `mut &this` method on", "mutating call here"));
+            access, span, "call a `mut &this` method on",
+            "`mut &this` method called through", "`mut &this` method called on"));
     }
 
     /// E0251 where a writable borrow or pointer is taken of a place while
@@ -3206,27 +3207,38 @@ type struct SemaVisitor {
     refuse_read_only_borrow(mut &this, access: PlaceAccess, span: SourceSpan) -> void {
         if (access.is_writable()) { return; }
         this.ctx.emit_diagnostic(this.read_only_report(ErrorCode::E0251_READ_ONLY_FOR_WRITABLE,
-            access, span, "take a writable borrow of", "borrowed for writing here"));
+            access, span, "take a writable borrow of",
+            "borrowed for writing through", "borrowed for writing from"));
     }
 
-    /// The report of a write (`what`, labelled `label`) to a place that
-    /// `access` makes read-only, naming the expression that decides it.
+    /// The report of a write (`what`) to a place that `access` makes
+    /// read-only, naming the expression that decides it.  The place's label
+    /// says what made it read-only: `done_through` and the read-only borrow
+    /// or pointer it is reached through, or `done_to` and the `const`
+    /// binding holding it.
     read_only_report(&this, code: ErrorCode, access: PlaceAccess, span: SourceSpan,
-                     what: string, label: string) -> Diagnostic {
+                     what: string, done_through: string, done_to: string) -> Diagnostic {
         const holder: ExpressionNode* = access.decided_by();
         const id: IdentifierExpr* = ExpressionNode::identifier_of(holder);
         mut through: string = "";
+        mut read_only: string = "";
         if (this.names_receiver(id)) {
             through = "the `&this` receiver";
+            read_only = "the read-only `&this`";
         } else {
             // A dereference names the pointer it reads through.
             const un: UnaryExpr* = ExpressionNode::unary_of(holder);
             const shown: TypeRef = if (un != null && un.operand != null) { un.operand.resolved_type } else { holder.resolved_type };
             through = fmt::format("`%s`", this.arena.resolve_display_name_short(shown));
+            read_only = fmt::format("the read-only %s", through);
         }
         const message: string = match (access) {
             PlaceAccess::ConstBinding(_) => { fmt::format("cannot %s a place held by a `const` binding", what) }
             _ => { fmt::format("cannot %s a place reached through %s, which is read-only", what, through) }
+        };
+        const label: string = match (access) {
+            PlaceAccess::ConstBinding(_) => { fmt::format("%s a `const` binding", done_to) }
+            _ => { fmt::format("%s %s", done_through, read_only) }
         };
         mut diag: Diagnostic = Diagnostic::error(code, message);
         diag = diag.at_with_label(span, label);

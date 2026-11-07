@@ -1,14 +1,19 @@
-///! Names as the cursor's scope writes them.
+///! Names as the editor writes them.
 ///!
 ///! A path written before the cursor (`A::B::`) is resolved through the
 ///! doors in the cursor's scope (`place_of_path`).  The other way round, a
-///! definition or a type the editor shows is written in the shortest form
-///! that names the same identity from the cursor: a definition's own name
-///! when the scope binds that name to it, else its owner's shortest form and
-///! the name, else its path in full.  Every candidate is resolved through the
-///! doors and compared by identity before it is used; nothing is cut from a
-///! name's text.  A type argument equal to the default its template declares
-///! is left out.  `Names::full` writes every path in full, as declared.
+///! definition or a type the editor shows is written in one of three styles
+///! (`NameStyle`).  As the cursor's scope writes it, the text an inlay hint
+///! or a completion puts in the buffer: the shortest form that names the
+///! same identity from the cursor - a definition's own name when the scope
+///! binds that name to it, else its owner's shortest form and the name, else
+///! its path in full; every candidate is resolved through the doors and
+///! compared by identity before it is used, and nothing is cut from a name's
+///! text.  By its own name, the text a hover shows: a definition's declared
+///! name, under its owner's when it is a member (`Str::as_ptr`), whatever the
+///! cursor's scope binds.  In full, the expanded hover's: every path as
+///! declared.  A type argument equal to the default its template declares is
+///! left out in each style.
 namespace lsp::handlers::names;
 
 import std::collections::str;
@@ -41,24 +46,42 @@ type enum Place {
 }
 
 
+/// How a definition the editor shows is written.
+type enum NameStyle {
+    /// The shortest form that names it from the cursor's scope.
+    AsScopeWrites;
+    /// Its declared name, under its owner's own name when it is a member.
+    OwnName;
+    /// Its path in full, as declared.
+    Full;
+}
+
 type struct Names {
     ctx:    CompilationContext*;
-    /// The module the cursor is in; none for `full`.
+    /// The module the cursor is in; none for `full` and `own`.
     module: ModulePath;
-    /// The scope at the cursor; invalid for `full`.
+    /// The scope at the cursor; invalid for `full` and `own`.
     scope:  ScopeID;
-    /// Every path in full, as declared.
-    full:   boolean;
+    style:  NameStyle;
 
     /// Names written in full: the expanded hover's text.
     static full(ctx: CompilationContext*) -> Names {
-        return Names { ctx: ctx, module: ModulePath::none(), scope: ScopeID::invalid(), full: true };
+        return Names { ctx: ctx, module: ModulePath::none(), scope: ScopeID::invalid(), style: NameStyle::Full };
+    }
+
+    /// Names written by their own name, the hover's text, at `line`:`col`
+    /// in the module at index `module_idx`: a name the scope there binds to
+    /// another definition is written as the scope writes it instead.
+    static own(ctx: CompilationContext*, module_idx: i64, line: u32, col: u32) -> Names {
+        mut n: Names = Names::in_module(ctx, module_idx, line, col);
+        n.style = NameStyle::OwnName;
+        return n;
     }
 
     /// Names as module `within` writes them at `line`:`col`, compiler
     /// coordinates.  A position with no scope writes them in full.
     static at(ctx: CompilationContext*, within: ModulePath, line: u32, col: u32) -> Names {
-        mut n: Names = Names { ctx: ctx, module: within, scope: ScopeID::invalid(), full: false };
+        mut n: Names = Names { ctx: ctx, module: within, scope: ScopeID::invalid(), style: NameStyle::AsScopeWrites };
         if (ctx != null && within.is_valid() && line != 0) {
             n.scope = ctx.resolver.scope_at(within, line, col);
         }
@@ -71,8 +94,23 @@ type struct Names {
         return Names::at(ctx, ctx.module_graph.get_module(module_idx).path(), line, col);
     }
 
+    /// Whether names are written shorter than in full: by their own name,
+    /// or as a scope at the cursor writes them.
     relative(&this) -> boolean {
-        return !this.full && this.ctx != null && this.scope.is_valid();
+        if (this.ctx == null) { return false; }
+        return match (this.style) {
+            NameStyle::Full          => { false }
+            NameStyle::OwnName       => { true }
+            NameStyle::AsScopeWrites => { this.scope.is_valid() }
+        };
+    }
+
+    /// Whether names are written by their own name.
+    by_own_name(&this) -> boolean {
+        return match (this.style) {
+            NameStyle::OwnName => { true }
+            _                  => { false }
+        };
     }
 
     // -- A path written before the cursor --
@@ -148,6 +186,20 @@ type struct Names {
     def_path(&this, d: DefId) -> string {
         const whole: string = this.ctx.intern_table.shown(this.ctx.defs.path_of(d));
         if (!this.relative() || !d.is_valid()) { return whole; }
+        // A module's own name is its path.  A definition's own name is not
+        // what it names where the cursor's scope binds the name to another.
+        if (this.by_own_name()) {
+            if (this.ctx.defs.kind_of(d) == DefKind::Module) { return whole; }
+            const own: string = this.ctx.intern_table.shown(this.ctx.defs.leaf_of(d));
+            const parent: DefId = this.ctx.defs.parent_of(d);
+            if (!parent.is_valid() || this.ctx.defs.kind_of(parent) == DefKind::Module) {
+                if (!this.binds_other(own, d)) { return own; }
+                const as_written: Names = Names { ctx: this.ctx, module: this.module, scope: this.scope,
+                                                  style: NameStyle::AsScopeWrites };
+                return as_written.def_path(d);
+            }
+            return this.def_path(parent) + "::" + own;
+        }
         if (this.ctx.defs.kind_of(d) == DefKind::Module) {
             const m: string = this.module_text(this.ctx.module_graph.module_of_def(d));
             return if (m.length() > 0) { m } else { whole };
@@ -190,6 +242,19 @@ type struct Names {
             if (family[k].equals(mine)) { return true; }
         }
         return false;
+    }
+
+    /// Whether the cursor's scope binds the bare name `leaf`, in the type
+    /// namespace, to a definition other than `d`.
+    binds_other(&this, leaf: string, d: DefId) -> boolean {
+        if (!this.scope.is_valid()) { return false; }
+        const t: SymbolID = this.ctx.resolver.type_binding(this.intern(str::Str::from(leaf)), this.scope);
+        if (!t.is_valid()) { return false; }
+        mut s: Symbol = this.ctx.resolver.get_symbol(t);
+        if (s.kind == SymbolKind::Import) {
+            s = this.ctx.resolver.get_symbol(this.ctx.resolver.declaration_of(t));
+        }
+        return s.def.is_valid() && !s.def.equals(d);
     }
 
     /// The shortest spelling of module `m`'s path, its last segments, that

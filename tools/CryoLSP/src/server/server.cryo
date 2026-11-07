@@ -20,6 +20,8 @@ import std::core::option;
 import std::core::result;
 import std::core::intrinsics;
 import std::core::mem;
+import std::core::panic_unwind;
+import std::fmt;
 import std::collections::str;
 import std::collections::string::{ String };
 import std::io::stdio;
@@ -73,6 +75,8 @@ type struct Server {
     cancelled:  boolean;
     /// Inside the compiler's hook (`between_modules`).
     in_yield:   boolean;
+    /// How many panic guards (`guarded`) the work running now is inside.
+    guards:     i32;
 
     static new() -> Server {
         return Server {
@@ -86,6 +90,7 @@ type struct Server {
             serving:    value::JsonValue::Null,
             cancelled:  false,
             in_yield:   false,
+            guards:     0,
         };
     }
 
@@ -109,7 +114,7 @@ type struct Server {
                     match (maybe) {
                         Option::Some(body) => {
                             mut owned: String = body;
-                            this.handle(owned.as_str());
+                            this.guarded(Work::Message(owned.as_str()));
                             mem::drop(owned);
                         }
                         // End of input: the main loop reads it again and stops.
@@ -122,6 +127,65 @@ type struct Server {
         if (building != null) { ast_arena::cryo_ast_arena_set_current(building); }
         ast_arena::cryo_alloc_arena_set_active(true);
         this.in_yield = false;
+    }
+
+    /// Do `work`, and survive a panic in answering a request: the panic
+    /// unwinds to here, the request is answered with an error, and a line on
+    /// stderr - the editor's log of the server - names the request, what it
+    /// asked and where it panicked.  A panic inside an analysis is logged
+    /// the same way and ends the process (exit 101): the compiler's state
+    /// across analyses is not known to be whole after one stops partway, and
+    /// an analysis after it may answer nothing, so the editor starts the
+    /// server afresh rather than keep one that has quietly stopped answering.
+    guarded(mut &this, work: Work) -> void {
+        mut job: GuardedWork = GuardedWork { server: &this as mut Server*, work: work };
+        const run: (mut u8*) -> void = Server::run_guarded;
+        this.guards = this.guards + 1;
+        const caught: boolean = intrinsics::try_catch(run as void*, &job as mut void*);
+        this.guards = this.guards - 1;
+        if (!caught) { return; }
+        const info: panic_unwind::PanicInfo = panic_unwind::taken_panic_info();
+        // A guard inside the hook answers a request while an analysis is
+        // suspended, and catches only that request's panic; the outermost
+        // guard holds the analysis, and a panic reaching it stopped one.
+        const interrupted: boolean = this.guards == 0 && this.projects.analysing;
+        const then: string = if (interrupted) {
+            "; it stopped an analysis, so the server exits to be started afresh"
+        } else { "" };
+        match (work) {
+            Work::Flush => {
+                fmt::eprintln(f"cryolsp: an analysis panicked at {info.file}:{info.line}: {info.msg}{then}");
+            }
+            Work::Message(body) => {
+                mut msg: jsonrpc::IncomingMessage = jsonrpc::JsonRpcCodec::parse_incoming(body);
+                match (&msg) {
+                    jsonrpc::IncomingMessage::Request(req) => {
+                        fmt::eprintln(f"cryolsp: request {req.method.as_str()} panicked at {info.file}:{info.line}: {info.msg}; params {serializer::stringify(&req.params).as_str()}{then}");
+                        this.reply_error(&req.id, jsonrpc::INTERNAL_ERROR,
+                            str::Str::from("the server panicked answering this request; see its log"));
+                    }
+                    jsonrpc::IncomingMessage::Notification(n) => {
+                        fmt::eprintln(f"cryolsp: notification {n.method.as_str()} panicked at {info.file}:{info.line}: {info.msg}{then}");
+                    }
+                    _ => { }
+                }
+                mem::drop(msg);
+            }
+        }
+        if (interrupted) { sys::exit(101 as i32); }
+    }
+
+    /// The body `guarded` runs under its catch: `data` is its `GuardedWork`.
+    static run_guarded(data: mut u8*) -> void {
+        const job: GuardedWork* = data as GuardedWork*;
+        const server: mut Server* = job.server;
+        match (job.work) {
+            Work::Message(body) => { server.handle(body); }
+            Work::Flush => {
+                text_sync::flush(&server.docs, &server.projects, &server.writer,
+                                 &server.diag_cache, &server.outbound);
+            }
+        }
     }
 
     /// Whether two request ids are the same id.
@@ -151,9 +215,7 @@ type struct Server {
             // on the read below (no busy-loop).
             if (this.projects.has_owed()) {
                 if (!Server::poll_stdin_readable(DEBOUNCE_MS)) {
-                    text_sync::flush(&this.docs, &this.projects,
-                                     &this.writer, &this.diag_cache,
-                                     &this.outbound);
+                    this.guarded(Work::Flush);
                     continue;
                 }
                 // Input is ready - fall through and read it, deferring the
@@ -165,7 +227,7 @@ type struct Server {
                     match (maybe) {
                         Option::Some(body) => {
                             mut owned: String = body;
-                            this.handle(owned.as_str());
+                            this.guarded(Work::Message(owned.as_str()));
                             mem::drop(owned);
                         }
                         Option::None => {
@@ -544,6 +606,19 @@ type struct Server {
 
 implement trait Drop for struct Server {
     drop(mut &this) -> void { }
+}
+
+/// What the server does under a panic guard (`Server::guarded`): handle one
+/// message, or run the analyses owed and publish what they found.
+type enum Work {
+    Message(str::Str);
+    Flush;
+}
+
+/// The server and its work, handed through the guard's one pointer.
+type struct GuardedWork {
+    server: mut Server*;
+    work:   Work;
 }
 
 /// The compiler's hook between two modules of an analysis.
