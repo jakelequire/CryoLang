@@ -802,20 +802,13 @@ api-index-check:
 # Compile every examples/*/ project with the freshly-built stage-2 compiler
 # so a stdlib/compiler change that breaks a shipped "getting started" example
 # fails CI instead of reaching users.  Build-only (no run); the per-example
-# build/ dirs are gitignored.  The script pins CRYO_STDLIB to the in-tree
-# stdlib so resolution is independent of which compiler binary builds the
-# examples.
-# Driven by a script rather than a shell loop because the loop was POSIX-only
-# and the Windows branch printed "run it from WSL" and exited 0.  A gate that
-# exits 0 having done nothing is counted as evidence, so this one refuses to
-# report success unless it can say what it swept.
-ifeq ($(HOST_OS),windows)
-examples: $(STAGE2_EXE)
-	@$(PYTHON) scripts/examples-gate.py --cryo "$(STAGE2_EXE)"
-else
-examples: $(STAGE2)
-	@$(PYTHON) scripts/examples-gate.py --cryo "$(STAGE2)"
-endif
+# build/ dirs are gitignored.  `cryogate examples` pins CRYO_STDLIB to the
+# in-tree stdlib so resolution is independent of which compiler binary builds
+# the examples.  A gate that exits 0 having done nothing is counted as
+# evidence, so this one refuses to report success unless it swept at least
+# the shipped set (its floor; raise it when an example is added).
+examples: $(STAGE2_FILE) $(CRYOGATE)
+	@$(CRYOGATE_COMMAND) examples --cryo "$(STAGE2_FILE)"
 
 # ---- examples golden-output check -------------------------------------
 # Build AND run the deterministic, input-free examples and diff their stdout

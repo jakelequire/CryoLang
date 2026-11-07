@@ -33,7 +33,7 @@ here.
 **Built so far:** G1's core (§8): the child runner, the scheduler, the
 heavy-run lock and `cryogate heavy`, the run logs, `cryogate selftest`, and
 `make cryogate`; the heavy Makefile targets run under the lock. Ported:
-`incr --instance` (G4).
+`incr --instance` and `examples` (G4).
 
 ---
 
@@ -181,7 +181,7 @@ compiler subcommand, because the compiler already holds the answer), **keep**
 | `scripts/verify.py` | 1214 | builds the baseline compiler in a clone, runs six gates at once, hashes every object, judges the declared programs; records the baseline per program and reuses a record whose inputs are unchanged; counts objects the prebuilt stdlib archive replaced and hashes the archives | **port** → `cryogate verify` | the orchestrator is the reason cryogate exists; the post-perf script is final, so it is ported as it stands (§7) |
 | `scripts/test-census.py` | 326 | runs `cryo test --format=plain`, reconciles counts and names against the roster golden | **port** → `cryogate census`, then **replace its parsing** with the runner's report (§4d) | rulings 271-272 move the counts into the runner; the reconciliation against the golden stays a gate |
 | `scripts/roster-check.py` | 543 | `--list` + project and negative fingerprints vs `tests/test-roster.txt`; `--merge`, `--update`, `--selftest` | **port** → `cryogate roster` | pure file reading plus one child; once `--list` lists all three suites, the filesystem enumeration moves into the runner and this shrinks to a diff and the merge |
-| `scripts/examples-gate.py` | 110 | builds every `examples/*` with a floor (`--min`) | **port** → `cryogate examples` | small; the absolute forward-slash stdlib spelling must be kept (objects embed it) |
+| `scripts/examples-gate.py` | 110 | builds every `examples/*` with a floor (`--min`) | **ported** → `cryogate examples` (script deleted; the floor raised from 14 to the 15 shipped) | small; the absolute forward-slash stdlib spelling is kept, though the objects no longer move with it (stdlib files are named `stdlib/<path>`) |
 | `scripts/check-examples-output.sh` | 96 | builds and runs five examples, diffs stdout with the goldens (POSIX) | **replace**: the examples' `expected.out` become `stdout_file` assertions (ruling 271), run by `cryogate examples --run` | runs on Windows too; the hard-coded list becomes "every example with an `expected.out`", keeping the two-way set check |
 | `scripts/valgrind-check.sh` | 73 | four examples under valgrind (Linux) | **port** → `cryogate examples --under=valgrind` | the same build-and-run loop with a runner prefix; one loop, not two |
 | `scripts/lsp-gate.py` + `tools/CryoLSP/tests/smoke.py` | 189 + 1285 | builds CryoLSP with the compiler under test; drives it over stdio through protocol checks and every fixture's `checks.json` | **port** → `cryogate lsp` (§4g) | the largest port by line count; the JSON-RPC driver is reused by the LSP fuzzing lanes later |
@@ -603,7 +603,9 @@ cryogate`), with the option parser (`core/options`) and the tree copy
 (`core/tree`); the tree listing and the git helper are built with the first
 gate that calls them, since a helper nothing calls is dead code. Its self-test
 is green on both hosts' stdlib since the `Command` working-directory double
-free was fixed. **Ported:** `incr --instance` (G4's third gate).
+free was fixed. **Ported:** `incr --instance` and `examples` (G4's build
+sweep; its `--run` goldens and `--under=valgrind` modes are still the shell
+scripts).
 
 **The Python gates import each other**, which the unit table above does not
 show: `test-census.py` loads `roster-check.py` for its reading of the

@@ -45,7 +45,7 @@ make verify-pin          # both pins match their sidecars (sha256 and stamped co
                          # each other
 make verify-freestanding # runtime/ tiers built by the compiler under test
 make examples            # smoke-build every examples/ project (refuses a sweep below
-                         # scripts/examples-gate.py's --min)
+                         # the shipped count, `cryogate examples`' --min)
 make examples-golden     # build AND run them, diff stdout (POSIX only)
 make incremental-check   # incremental build == clean build, per module
 make incremental-instance-check  # an edit asking a cached module for a new generic

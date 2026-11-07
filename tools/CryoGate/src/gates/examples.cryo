@@ -1,0 +1,171 @@
+///! `cryogate examples --cryo <compiler> [--min N] [--stdlib DIR] [--jobs N]`:
+///! build every `examples/*/` project and fail if any of them does not
+///! compile.
+///!
+///! The sweep says what it covered, and refuses rather than reporting
+///! success when it could not have covered enough: the compiler is missing
+///! (cannot sweep), or fewer projects than `--min` were found (a rename, a
+///! moved directory or a cryoconfig that stopped parsing finds fewer, not
+///! none, so the floor is the shipped set, not 1).  The summary line states
+///! the population.  Each project builds in its own directory, `--jobs` at
+///! once (default: the scheduler's slots), and results print in project
+///! order at any job count.
+
+namespace cryogate::gates::examples;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::directory::{ Directory };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::child::{ Completion, Job };
+import cryogate::core::host::{ Host };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::options::{ Options, Parsed };
+import cryogate::core::schedule::{ Cost, Scheduler };
+
+public type struct ExamplesGate {
+    public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
+        mut options: Options = Options::new(Str::new("cryogate examples --cryo <compiler> [--min N] [--stdlib DIR] [--jobs N]"));
+        options.valued(Str::new("--cryo"));
+        options.valued(Str::new("--min"));
+        options.valued(Str::new("--stdlib"));
+        options.valued(Str::new("--jobs"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate examples: {reason.as_str()}"); return 2; }
+        };
+        if (!parsed.positionals().is_empty() || parsed.separated()) {
+            fmt::eprintln(f"cryogate examples: usage: {options.usage()}");
+            return 2;
+        }
+        const compiler: String = match (parsed.value(Str::new("--cryo"))) {
+            Option::Some(path) => { Host::absolute(path) }
+            Option::None       => { fmt::eprintln(f"cryogate examples: --cryo is required; usage: {options.usage()}"); return 2; }
+        };
+        const stdlib: String = match (parsed.value(Str::new("--stdlib"))) {
+            Option::Some(directory) => { Host::stdlib_spelling(directory) }
+            Option::None            => { Host::stdlib_directory(repository) }
+        };
+        const minimum: i64 = match (ExamplesGate::count(&parsed, Str::new("--min"), ExamplesGate::SHIPPED)) {
+            Result::Ok(count)   => { count }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate examples: {reason.as_str()}"); return 2; }
+        };
+        const jobs: i64 = match (ExamplesGate::count(&parsed, Str::new("--jobs"), 0)) {
+            Result::Ok(count)   => { count }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate examples: {reason.as_str()}"); return 2; }
+        };
+
+        if (!Path::from(compiler.as_str()).is_file()) {
+            fmt::println(f"examples-gate: FAIL -- compiler binary not found: {compiler.as_str()}");
+            fmt::println(String::from_str(Str::new("examples-gate: refusing to report success without sweeping anything")));
+            return 2;
+        }
+        const projects: Array<String> = ExamplesGate::discover(repository.join(Str::new("examples")).as_path());
+        if (projects.length() < minimum) {
+            fmt::println(f"examples-gate: FAIL -- discovered {projects.length()} project(s), expected at least {minimum}");
+            fmt::println(String::from_str(Str::new("examples-gate: refusing to report success without sweeping anything")));
+            return 2;
+        }
+
+        mut scheduler: Scheduler = Scheduler::new();
+        scheduler.set_slots(jobs);
+        for (name in projects.iter_ref()) {
+            mut job: Job = Job::new(compiler.as_str());
+            job.argument(Str::new("build"));
+            job.argument(Str::new("."));
+            job.directory(repository.join(Str::new("examples")).join(name.as_str()).as_path().as_str());
+            job.set_variable(Str::new("CRYO_STDLIB"), stdlib.as_str());
+            job.log_to(logs.file(f"examples-{name.as_str()}".as_str()).as_str());
+            scheduler.add(job, Cost::Compile);
+        }
+        const results: Array<Completion> = scheduler.run();
+
+        mut failed: Array<String> = Array::<String>::new();
+        mut index: i64 = 0;
+        for (done in results.iter_ref()) {
+            const relative: String = f"examples/{projects.get_ref(index).unwrap().as_str()}";
+            index++;
+            if (done.outcome.succeeded()) {
+                fmt::println(f"  ok    {relative.as_str()}");
+                continue;
+            }
+            fmt::println(f"  FAIL  {relative.as_str()}");
+            const output: String = done.output();
+            const lines: Array<String> = ExamplesGate::lines(output.as_str());
+            const skipped: i64 = if (lines.length() > ExamplesGate::TAIL_LINES) { lines.length() - ExamplesGate::TAIL_LINES } else { 0 };
+            mut position: i64 = 0;
+            for (line in lines.iter_ref()) {
+                if (position >= skipped) { fmt::println(f"        | {line.as_str()}"); }
+                position++;
+            }
+            // A build that never started wrote nothing; say why instead.
+            if (output.is_empty()) { fmt::println(f"        | {done.outcome.describe().as_str()}"); }
+            failed.push(relative);
+        }
+        if (!failed.is_empty()) {
+            mut names: String = String::new();
+            for (name in failed.iter_ref()) {
+                if (!names.is_empty()) { names.push(' '); }
+                names.push(name.as_str());
+            }
+            fmt::println(f"examples-gate: FAIL -- {failed.length()} of {projects.length()} project(s) did not build: {names.as_str()}");
+            return 1;
+        }
+        fmt::println(f"examples-gate: OK -- {projects.length()} project(s) built");
+        return 0;
+    }
+
+    /// The names of the directories under `examples` holding a cryoconfig,
+    /// sorted.
+    static discover(examples: Path) -> Array<String> {
+        mut found: Array<String> = Array::<String>::new();
+        match (Directory::entries(examples)) {
+            Result::Ok(entries) => {
+                for (entry in entries) {
+                    if (examples.join(entry.name()).join(Str::new("cryoconfig")).as_path().is_file()) {
+                        found.push(String::from_str(entry.name()));
+                    }
+                }
+            }
+            Result::Err(_) => { }
+        }
+        found.sort();
+        return found;
+    }
+
+    /// The text's lines, a `\r` before each line break dropped.
+    static lines(text: Str) -> Array<String> {
+        mut lines: Array<String> = Array::<String>::new();
+        for (line in text.split(&Str::new("\n"))) {
+            match (line.strip_suffix(&Str::new("\r"))) {
+                Option::Some(bare) => { lines.push(String::from_str(bare)); }
+                Option::None       => { lines.push(String::from_str(line)); }
+            }
+        }
+        if (!lines.is_empty() && lines.get_ref(lines.length() - 1).unwrap().is_empty()) { lines.pop(); }
+        return lines;
+    }
+
+    /// The whole number given for `name`, or `fallback` when none was.
+    static count(parsed: &Parsed, name: Str, fallback: i64) -> Result<i64, String> {
+        return match (parsed.value(name)) {
+            Option::Some(text) => {
+                match (i64::try_from(text)) {
+                    Result::Ok(count) => { Result::Ok(count) }
+                    Result::Err(_)    => { Result::Err(f"`{name}` takes a whole number, not `{text}`") }
+                }
+            }
+            Option::None => { Result::Ok(fallback) }
+        };
+    }
+
+    /// The number of projects `examples/` ships; raise it when one is added.
+    const SHIPPED: i64 = 15;
+    /// The lines of a failed build's output that are printed.
+    const TAIL_LINES: i64 = 25;
+}

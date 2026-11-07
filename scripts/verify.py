@@ -6,7 +6,7 @@ archives) once, then this runs, AT THE SAME TIME, the gates that read that
 build:
 
     census     scripts/test-census.py    the three suites, counts reconciled
-    examples   scripts/examples-gate.py  every examples/ project builds
+    examples   cryogate examples         every examples/ project builds
     lsp        scripts/lsp-gate.py       tools/CryoLSP builds and answers
     cross      scripts/cross-check.py    the other OS's gated half compiles
     incr       cryogate incr --instance  an edit asking a cached module for a
@@ -109,7 +109,7 @@ CRYOGATE = os.path.join(ROOT, "tools", "CryoGate", "build", "cryogate" + EXE)
 # never on the exit code alone.
 GATES = {
     "census":   ([PY, "scripts/test-census.py", "--cryo", "{cryo}"], r"^test-census: "),
-    "examples": ([PY, "scripts/examples-gate.py", "--cryo", "{cryo}", "--stdlib", "{stdlib}"],
+    "examples": ([CRYOGATE, "examples", "--cryo", "{cryo}", "--stdlib", "{stdlib}"],
                  r"^examples-gate: "),
     "lsp":      ([PY, "scripts/lsp-gate.py", "--cryo", "{cryo}"], r"^lsp-gate: "),
     "cross":    ([PY, "scripts/cross-check.py", "--cryo", "{cryo}"], r"^cross-check: "),
@@ -413,7 +413,8 @@ EXAMPLE_ARCHIVES = "archives/examples"
 BOOKKEEPING = {"tests/test-roster.txt", "tests/started-compiling", "tests/started-passing"}
 # The procedure that takes the hashes decides them too (how the stdlib is
 # spelled to each run, which flags a build gets).
-PROCEDURE = ["scripts/verify.py", "scripts/test-census.py", "scripts/examples-gate.py"]
+PROCEDURE = ["scripts/verify.py", "scripts/test-census.py", "tools/CryoGate/src/gates/examples.cryo",
+             "tools/CryoGate/src/core/host.cryo"]
 NEG_LINE = re.compile(r"^test \(negative\) (\S+) \.\.\.")
 PROJ_REACHED = re.compile(r"^test \(project\) (\S+) \.\.\.")
 EXAMPLE_OK = re.compile(r"^\s*ok\s+(examples/\S+)")
