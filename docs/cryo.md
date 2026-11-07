@@ -220,8 +220,10 @@ const s: String = f"x = {x}, opt = {opt:?}";   // "x = 42, opt = Some(7)"
 ```
 
 - `{expr}` formats `expr` through the `Display` trait; `{expr:?}` formats it
-  through `Debug`. Any type implementing the relevant trait works, including
-  `Option`, `Result`, and `Array<T>`.
+  through `Debug`, and `{expr:#?}` through `Debug` in its pretty form - a
+  member per line, indented by depth, as `Formatter::pretty` writes it. Any
+  type implementing the relevant trait works, including `Option`, `Result`,
+  and `Array<T>`.
 - The embedded expression is a full expression: `f"{a + b}"`, `f"{p.x}"`,
   `f"{m.get(k)}"`. Because a hole holds source rather than literal text,
   quoting nests inside it - a string or char literal written in a hole is its
