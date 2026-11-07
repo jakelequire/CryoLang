@@ -186,7 +186,7 @@ EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
 .PHONY: help cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check check-fast lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
-        pin-linux-impl pin-windows-impl _pin-windows-do verify-pin verify-pin-clean incremental-check \
+        pin-impl pin-linux-impl pin-windows-impl _pin-windows-do verify-pin verify-pin-clean incremental-check \
         install uninstall clean lsp install-lsp cryogate release release-linux release-windows
 
 # The help text is printed by make itself (`$(info)`), not by a shell, so it
@@ -212,7 +212,9 @@ Build
                          Code, REPLACING the installed CryoAnalyzer extension.
   make cryogate          Build the gate runner tools/CryoGate with the pin
                          (tools/CryoGate/build/); its runs log to
-                         build-logs/cryogate/, newest 20 kept.
+                         build-logs/cryogate/, newest 20 kept.  verify,
+                         test-census, selfhost-check and pin run under its
+                         heavy-run lock (see below).
 
 Tests and gates
   make test              cryo test over tests/ (the working loop; ARGS=filter).
@@ -275,7 +277,8 @@ Pins and release
                          example builds, .verify/, .cross-check/,
                          build-logs/ and dist/.
 
-Internal, called by pin: pin-linux-impl, pin-windows-impl, _pin-windows-do.
+Internal, called by pin: pin-impl (the refresh, without the lock),
+pin-linux-impl, pin-windows-impl, _pin-windows-do.
 
 Side effects beyond the named output
   lsp             overwrites bin/cryolsp; fails while an editor holds it open.
@@ -298,6 +301,13 @@ Side effects beyond the named output
                   `make clean`; clears stdlib/.bin/*/prebuilt/ before each
                   population run.
   install         writes symlinks outside the repository (may need sudo).
+  verify, test-census, selfhost-check, pin
+                  hold the heavy-run lock, cryo-heavy-run.lock in the
+                  directory holding the checkout (CRYOGATE_HEAVY_LOCK names
+                  another), for the run: one waits, polling each minute,
+                  while another checkout's heavy run holds it, and refuses a
+                  lock older than three hours.  An interrupted run leaves
+                  the file behind; delete it once nobody holds it.
 endef
 
 help:
@@ -347,6 +357,21 @@ STAGE2_PIN  := $(PIN_EXE)
 else
 STAGE2_FILE := $(STAGE2)
 STAGE2_PIN  := $(PIN)
+endif
+
+# The gate runner (tools/CryoGate, built below by `make cryogate`).  A heavy
+# target (verify, test-census, selfhost-check, pin) runs its recipe as
+# `$(CRYOGATE_HEAVY) <command>`: under the machine's heavy-run lock, beside
+# the checkout, waited for while another checkout's heavy run holds it, and
+# released when the command ends.  cmd cannot run a quoted forward-slash path.
+CRYOGATE_DIR    := $(ROOT)/tools/CryoGate
+CRYOGATE        := $(CRYOGATE_DIR)/build/cryogate$(EXE_SUFFIX)
+CRYOGATE_INPUTS := $(call rwildcard,$(CRYOGATE_DIR)/src,*.cryo) $(CRYOGATE_DIR)/cryoconfig \
+                   $(call rwildcard,$(ROOT)/stdlib,*.cryo) $(RUNTIME_TIERS_A) $(STAGE2_PIN)
+ifeq ($(HOST_OS),windows)
+CRYOGATE_HEAVY  := "$(subst /,\,$(CRYOGATE))" heavy --
+else
+CRYOGATE_HEAVY  := "$(CRYOGATE)" heavy --
 endif
 STAGE2_INPUTS := $(CRYO_SOURCES) $(ROOT)/compiler/cryoconfig $(wildcard $(ROOT)/compiler/*.h) \
                  $(RUNTIME_TIERS_A) $(STAGE2_PIN) $(wildcard $(ROOT)/.git/index)
@@ -418,15 +443,18 @@ ifeq ($(HOST_OS),windows)
 # unchanged whether you invoked `make` from cmd / PowerShell (recipe shell
 # is cmd) or from MSYS2 / Git Bash (recipe shell is bash).  The wrapper
 # checks for wsl.exe, resolves the WSL path, and re-enters this Makefile
-# inside WSL.
-pin:
-	scripts\pin-windows.cmd
+# inside WSL at `pin-impl`, which takes no lock: this host's run holds it.
+pin: $(CRYOGATE)
+	@$(CRYOGATE_HEAVY) cmd /c scripts\pin-windows.cmd
 else
 # Linux/macOS host: native build for bin/cryo, cross-build for bin/cryo.exe.
 # The Windows half is skipped (not failed) when the mingw toolchain or
 # the fetched .toolchains artifacts are absent, so a Linux-only checkout
 # can still refresh the Linux pin without dragging in the Windows bits.
-pin: pin-linux-impl pin-windows-impl
+pin: $(CRYOGATE)
+	@$(CRYOGATE_HEAVY) $(MAKE) --no-print-directory pin-impl
+
+pin-impl: pin-linux-impl pin-windows-impl
 
 pin-linux-impl: cryo
 	@$(PYTHON) scripts/cryo-pin.py --source "$(STAGE2)" --pin "$(PIN)" --stamp-profile=$(CRYO_PROFILE)
@@ -485,12 +513,8 @@ endif
 # stdlib and linked against the stdlib only, so a compiler under test that
 # does not build or misbehaves cannot break the program that reports it.
 # Rebuilt when its sources, the stdlib, the runtime tiers or the pin are
-# newer than the binary.
-CRYOGATE_DIR    := $(ROOT)/tools/CryoGate
-CRYOGATE        := $(CRYOGATE_DIR)/build/cryogate$(EXE_SUFFIX)
-CRYOGATE_INPUTS := $(call rwildcard,$(CRYOGATE_DIR)/src,*.cryo) $(CRYOGATE_DIR)/cryoconfig \
-                   $(call rwildcard,$(ROOT)/stdlib,*.cryo) $(RUNTIME_TIERS_A) $(STAGE2_PIN)
-
+# newer than the binary.  Its variables are set beside the pin's, above,
+# because the heavy targets name it as a prerequisite.
 cryogate: $(CRYOGATE)
 
 ifeq ($(HOST_OS),windows)
@@ -552,11 +576,11 @@ ifeq ($(HOST_OS),windows)
 # `make` from cmd / PowerShell or from MSYS2 / Git Bash.
 # `runtime-tiers` first: the check's stage-2 and stage-3 rounds are hosted links
 # that need libcryort-panic-abort-hosted.a to resolve `__cryo_panic`.
-selfhost-check: runtime-tiers
-	scripts\selfhost-check-windows.cmd $(ARGS)
+selfhost-check: $(CRYOGATE) runtime-tiers
+	$(CRYOGATE_HEAVY) cmd /c scripts\selfhost-check-windows.cmd $(ARGS)
 else
-selfhost-check: $(PIN) runtime-tiers
-	@$(PYTHON) scripts/selfhost-check.py $(ARGS)
+selfhost-check: $(PIN) $(CRYOGATE) runtime-tiers
+	@$(CRYOGATE_HEAVY) $(PYTHON) scripts/selfhost-check.py $(ARGS)
 endif
 
 # ---- pin self-verification --------------------------------------------
@@ -623,8 +647,8 @@ test-list: $(STAGE2_EXE) $(TEST_HELPERS_A)
 roster-check: $(STAGE2_EXE) $(TEST_HELPERS_A)
 	@$(PYTHON) scripts/roster-check.py "$(STAGE2_EXE_WIN)" $(ARGS)
 
-test-census: $(STAGE2_EXE) $(TEST_HELPERS_A) runtime-tiers
-	@$(PYTHON) scripts/test-census.py --cryo "$(STAGE2_EXE)" $(ARGS)
+test-census: $(STAGE2_EXE) $(TEST_HELPERS_A) $(CRYOGATE) runtime-tiers
+	@$(CRYOGATE_HEAVY) $(PYTHON) scripts/test-census.py --cryo "$(STAGE2_EXE)" $(ARGS)
 
 vendor-check: $(STAGE2_EXE) runtime-tiers
 	@$(PYTHON) scripts/vendor-consts-gate.py "$(STAGE2_EXE_WIN)" $(ARGS)
@@ -647,8 +671,8 @@ roster-check: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
 # same output, and then reconciles what ran against the roster golden.  Use it
 # wherever the run is being taken as evidence; `make test` stays for the
 # working loop, where a pattern filter is the point.
-test-census: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) runtime-tiers
-	@$(PYTHON) scripts/test-census.py --cryo "$(STAGE2)" $(ARGS)
+test-census: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(CRYOGATE) runtime-tiers
+	@$(CRYOGATE_HEAVY) $(PYTHON) scripts/test-census.py --cryo "$(STAGE2)" $(ARGS)
 
 # End-to-end gate on the constants `cryo vendor` carries out of a C header.
 # The importer binds a constant and the serializer writes it, and when those
@@ -676,11 +700,11 @@ endif
 # the gates run concurrently, and a phony prerequisite rebuilt by one of them
 # (the runtime tiers) would be rewritten while another is linking against it.
 ifeq ($(HOST_OS),windows)
-verify: cryo $(TEST_HELPERS_A)
-	@$(PYTHON) scripts/verify.py --cryo "$(STAGE2_EXE)" $(ARGS)
+verify: cryo $(TEST_HELPERS_A) $(CRYOGATE)
+	@$(CRYOGATE_HEAVY) $(PYTHON) scripts/verify.py --cryo "$(STAGE2_EXE)" $(ARGS)
 else
-verify: cryo $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
-	@$(PYTHON) scripts/verify.py --cryo "$(STAGE2)" $(ARGS)
+verify: cryo $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(CRYOGATE)
+	@$(CRYOGATE_HEAVY) $(PYTHON) scripts/verify.py --cryo "$(STAGE2)" $(ARGS)
 endif
 
 # An incremental build after an edit that asks an unchanged module for a new

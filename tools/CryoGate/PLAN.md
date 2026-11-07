@@ -32,7 +32,8 @@ here.
 
 **Built so far:** G1's core (§8): the child runner, the scheduler, the
 heavy-run lock and `cryogate heavy`, the run logs, `cryogate selftest`, and
-`make cryogate`. No gate is switched.
+`make cryogate`; the heavy Makefile targets run under the lock. No gate is
+switched.
 
 ---
 
@@ -312,7 +313,10 @@ memory. So:
   once, unless `--no-wait` (then refused); a lock older than three hours is
   reported and not taken. `cryogate heavy [--no-wait] -- <program> ...` runs
   any heavy proof under it, the Python gates included, until each gate takes
-  it itself. Ctrl-C leaves the file behind until the stdlib has an
+  it itself. **Built:** `make verify`, `test-census`, `selfhost-check` and
+  `pin` run their recipes as `$(CRYOGATE_HEAVY) <command>`; the Windows
+  `pin`'s re-entry into WSL calls `pin-impl`, which takes no lock, since the
+  Windows side holds it. Ctrl-C leaves the file behind until the stdlib has an
   interrupt hook (§6 row 7); the staleness rule bounds the damage. This is
   what lets several workers share the PC without one's timings being
   another's noise.
