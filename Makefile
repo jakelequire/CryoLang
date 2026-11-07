@@ -243,7 +243,7 @@ Tests and gates
   make examples          Build every examples/ project.
   make examples-golden   Build every example, run the ones with an
                          expected.out and compare their output with it.
-  make valgrind-check    Four examples under valgrind (Linux only).
+  make valgrind-check    The same runs under valgrind (Linux only).
   make incremental-check Incremental build == clean build, per module
                          (refuses on Windows: a PE carries a link timestamp).
   make incremental-instance-check  An edit asking a cached module for a new
@@ -301,7 +301,7 @@ Side effects beyond the named output
                   `make clean`; clears stdlib/.bin/*/prebuilt/ before each
                   population run.
   install         writes symlinks outside the repository (may need sudo).
-  verify, test-census, selfhost-check, pin, examples-golden
+  verify, test-census, selfhost-check, pin, examples-golden, valgrind-check
                   hold the heavy-run lock, cryo-heavy-run.lock in the
                   directory holding the MAIN checkout, the one file for every
                   worktree (CRYOGATE_HEAVY_LOCK names another), while their
@@ -363,8 +363,8 @@ endif
 
 # The gate runner (tools/CryoGate, built below by `make cryogate`); a recipe
 # runs it as `$(CRYOGATE_COMMAND) <gate> ...`.  A heavy
-# target (verify, test-census, selfhost-check, pin, examples-golden) runs
-# its recipe as
+# target (verify, test-census, selfhost-check, pin, examples-golden,
+# valgrind-check) runs its recipe as
 # `$(CRYOGATE_HEAVY) <command>`: under the machine's heavy-run lock, beside
 # the main checkout, waited for while another checkout's heavy run holds it, and
 # released when the command ends.  cmd cannot run a quoted forward-slash path.
@@ -831,18 +831,19 @@ examples-golden: $(STAGE2_FILE) $(CRYOGATE)
 	@$(CRYOGATE_HEAVY) $(CRYOGATE_COMMAND) examples --run --cryo "$(STAGE2_FILE)"
 
 # ---- runtime memory-safety gate (valgrind) ----------------------------
-# Build AND run the deterministic examples under valgrind, failing on any
-# invalid free/read/write or definite leak.  The static move-checker rejects
+# Build every example, then run each one holding an expected.out under
+# valgrind, failing on any invalid free/read/write or definite leak, or on
+# output that differs from its golden.  The static move-checker rejects
 # use-after-move at compile time; this exercises the generated drop/free paths
 # at runtime, so a miscompile that double-freed or leaked an owned value is
-# caught here.  POSIX/Linux-only and requires valgrind on PATH; a Windows host
-# refuses and builds nothing first.
+# caught here.  Linux-only and requires valgrind on PATH; a Windows host
+# refuses and builds nothing first.  Heavy: it runs under the heavy-run lock.
 ifeq ($(HOST_OS),windows)
 valgrind-check:
 	$(error valgrind-check: UNAVAILABLE on this host -- valgrind is POSIX/Linux only; run it from WSL)
 else
-valgrind-check: $(STAGE2)
-	@CRYO="$(STAGE2)" CRYO_STDLIB="$(ROOT)/stdlib" bash scripts/valgrind-check.sh
+valgrind-check: $(STAGE2_FILE) $(CRYOGATE)
+	@$(CRYOGATE_HEAVY) $(CRYOGATE_COMMAND) examples --run --under=valgrind --cryo "$(STAGE2_FILE)"
 endif
 
 # ---- runtime tier archives --------------------------------------------

@@ -34,7 +34,8 @@ here.
 heavy-run lock and `cryogate heavy`, the run logs, `cryogate selftest`, and
 `make cryogate`; the heavy Makefile targets run under the lock. Ported:
 `roster` and `census` (G2, G3), `incr --instance`, `examples` (with
-`--run`) and `vendor` (G4), `cross` (G7).
+`--run` and `--under=valgrind`) and `vendor` (G4), `cross` (G7): G4 is
+complete.
 
 ---
 
@@ -184,7 +185,7 @@ compiler subcommand, because the compiler already holds the answer), **keep**
 | `scripts/roster-check.py` | 543 | `--list` + project and negative fingerprints vs `tests/test-roster.txt`; `--merge`, `--update`, `--selftest` | **ported** → `cryogate roster` (script deleted; its self-test cases are `![test]`s; it also refuses a `test.json` list field the runner would skip, which the script pinned as one assertion per character) | pure file reading plus one child; once `--list` lists all three suites, the filesystem enumeration moves into the runner and this shrinks to a diff and the merge |
 | `scripts/examples-gate.py` | 110 | builds every `examples/*` with a floor (`--min`) | **ported** → `cryogate examples` (script deleted; the floor raised from 14 to the 15 shipped) | small; the absolute forward-slash stdlib spelling is kept, though the objects no longer move with it (stdlib files are named `stdlib/<path>`) |
 | `scripts/check-examples-output.sh` | 96 | builds and runs five examples, diffs stdout with the goldens (POSIX) | **ported** → `cryogate examples --run` (script deleted), then **replace** its comparison with `stdout_file` assertions (ruling 271) | runs on Windows too; the hard-coded list became "every example with an `expected.out`": a golden beside no project is refused, and a floor (`--min-goldens`, the 5 shipped) refuses a deleted one; an example must also exit 0, which the script never checked |
-| `scripts/valgrind-check.sh` | 73 | four examples under valgrind (Linux) | **port** → `cryogate examples --under=valgrind` | the same build-and-run loop with a runner prefix; one loop, not two |
+| `scripts/valgrind-check.sh` | 73 | four examples under valgrind (Linux) | **ported** → `cryogate examples --run --under=valgrind` (script deleted) | the same build-and-run loop with a runner prefix; one loop, not two. It runs every golden (15-files too, which the script's list left out, and which leaks the temporaries a borrowing call is made on: the gate is red on Linux until that is fixed) and also compares their output |
 | `scripts/lsp-gate.py` + `tools/CryoLSP/tests/smoke.py` | 189 + 1285 | builds CryoLSP with the compiler under test; drives it over stdio through protocol checks and every fixture's `checks.json` | **port** → `cryogate lsp` (§4g) | the largest port by line count; the JSON-RPC driver is reused by the LSP fuzzing lanes later |
 | `scripts/cross-check.py` | 193 | the other OS's runtime, stdlib, compiler and CryoLSP, objects only, concurrently | **ported** → `cryogate cross` (script deleted) | once `cryo build` can stop at objects (ruling 322) it also passes on a Linux host (bug 0035) |
 | `scripts/incremental-instance-check.py` | 90 | an edit asking a cached module for a new instance still links and reuses the cache | **ported** → `cryogate incr --instance` (script deleted) | small; part of verify |
@@ -632,8 +633,8 @@ roster's `![target]` waiver, and `verify.py` reads the census's parse of a
 baseline run from `cryogate census --read <log>`, one JSON record), `cross`
 (G7), `incr --instance`, `vendor` and `examples` (G4: the build sweep, and
 `--run`, which runs every example holding an `expected.out` and compares
-its output, on both hosts, with the old script's comparison rule; its
-`--under=valgrind` mode is still the shell script),
+its output, on both hosts, with the old script's comparison rule, and
+`--under=valgrind`, which makes those runs under valgrind on Linux),
 with `core/text` (lines, joining, a line scanner) beside the core.
 `check-fast` runs `cryogate selftest` (so it builds cryogate), which carries
 the roster merge's self-test cases. The self-test runs the unit-test binary

@@ -1,21 +1,23 @@
-///! `cryogate examples --cryo <compiler> [--run] [--min N] [--min-goldens N]
-///! [--stdlib DIR] [--jobs N]`: build every `examples/*/` project and fail if
-///! any of them does not compile.  With `--run`, every example holding an
-///! `expected.out` is then run with no input, in its own directory, and its
-///! output stream must equal that file line for line (a `\r` before a line
-///! break and empty lines at the end are not compared, so one golden serves
-///! every host); it must also exit 0 within `RUN_SECONDS`.
+///! `cryogate examples --cryo <compiler> [--run] [--under=valgrind] [--min N]
+///! [--min-goldens N] [--stdlib DIR] [--jobs N]`: build every `examples/*/`
+///! project and fail if any of them does not compile.  With `--run`, every
+///! example holding an `expected.out` is then run with no input, in its own
+///! directory, and its output stream must equal that file line for line (a
+///! `\r` before a line break and empty lines at the end are not compared, so
+///! one golden serves every host); it must also exit 0 within
+///! `RUN_SECONDS`.  `--under=valgrind` (Linux) makes those runs under
+///! valgrind, which fails one on an invalid free, read or write or a
+///! definite leak; memory still reachable at exit is not an error.
 ///!
 ///! The sweep says what it covered, and refuses rather than reporting
 ///! success when it could not have covered enough: the compiler is missing
 ///! (cannot sweep), or fewer projects than `--min` were found (a rename, a
 ///! moved directory or a cryoconfig that stopped parsing finds fewer, not
 ///! none, so the floor is the shipped set, not 1), or with `--run` fewer
-///! goldens than `--min-goldens`, or a golden beside no project.  The
-///! summary line states
-///! the population.  Each project builds in its own directory, `--jobs` at
-///! once (default: the scheduler's slots), and results print in project
-///! order at any job count.
+///! goldens than `--min-goldens`, or a golden beside no project, or valgrind
+///! does not run.  The summary line states the population.  Each project
+///! builds in its own directory, `--jobs` at once (default: the scheduler's
+///! slots), and results print in project order at any job count.
 
 namespace cryogate::gates::examples;
 
@@ -39,9 +41,10 @@ import cryogate::core::tree::{ Tree };
 
 public type struct ExamplesGate {
     public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
-        mut options: Options = Options::new(Str::new("cryogate examples --cryo <compiler> [--run] [--min N] [--min-goldens N] [--stdlib DIR] [--jobs N]"));
+        mut options: Options = Options::new(Str::new("cryogate examples --cryo <compiler> [--run] [--under=valgrind] [--min N] [--min-goldens N] [--stdlib DIR] [--jobs N]"));
         options.valued(Str::new("--cryo"));
         options.flag(Str::new("--run"));
+        options.valued(Str::new("--under"));
         options.valued(Str::new("--min"));
         options.valued(Str::new("--min-goldens"));
         options.valued(Str::new("--stdlib"));
@@ -74,6 +77,30 @@ public type struct ExamplesGate {
             Result::Ok(count)   => { count }
             Result::Err(reason) => { fmt::eprintln(f"cryogate examples: {reason.as_str()}"); return 2; }
         };
+        const under_valgrind: boolean = match (parsed.value(Str::new("--under"))) {
+            Option::Some(runner) => {
+                if (runner != Str::new("valgrind")) {
+                    fmt::eprintln(f"cryogate examples: `--under` takes `valgrind`, not `{runner}`");
+                    return 2;
+                }
+                true
+            }
+            Option::None => { false }
+        };
+        if (under_valgrind && !parsed.has(Str::new("--run"))) {
+            fmt::eprintln(f"cryogate examples: `--under=valgrind` changes how `--run` runs the examples; give both");
+            return 2;
+        }
+        if (under_valgrind) {
+            match (ExamplesGate::valgrind_runs(logs)) {
+                Result::Ok(_)       => { }
+                Result::Err(reason) => {
+                    fmt::println(f"examples-gate: FAIL -- {reason.as_str()}");
+                    fmt::println(String::from_str(Str::new("examples-gate: refusing to report success without running anything under it")));
+                    return 2;
+                }
+            }
+        }
 
         if (!Path::from(compiler.as_str()).is_file()) {
             fmt::println(f"examples-gate: FAIL -- compiler binary not found: {compiler.as_str()}");
@@ -130,14 +157,30 @@ public type struct ExamplesGate {
             fmt::println(f"examples-gate: OK -- {projects.length()} project(s) built");
             return 0;
         }
-        return ExamplesGate::run_goldens(repository.join(Str::new("examples")).as_path(), logs, &projects, minimum_goldens, jobs);
+        return ExamplesGate::run_goldens(repository.join(Str::new("examples")).as_path(), logs, &projects, minimum_goldens, jobs, under_valgrind);
+    }
+
+    /// Whether `valgrind` starts and exits 0 when asked its version: a
+    /// missing one would otherwise read as every example failing.
+    ![target(windows)]
+    static valgrind_runs(logs: &RunLogs) -> Result<(), String> {
+        return Result::Err(String::from_str(Str::new("valgrind runs on Linux only")));
+    }
+    ![target(unix)]
+    static valgrind_runs(logs: &RunLogs) -> Result<(), String> {
+        mut probe: Job = Job::new(Str::new("valgrind"));
+        probe.argument(Str::new("--version"));
+        probe.log_to(logs.file(Str::new("valgrind-version")).as_str());
+        const done: Completion = probe.run();
+        if (done.outcome.succeeded()) { return Result::Ok(()); }
+        return Result::Err(f"`valgrind --version`: {done.outcome.describe().as_str()}; is valgrind on PATH?");
     }
 
     /// Run every example holding an `expected.out` and compare its output
     /// stream with that file.  A golden in a directory that is no project
     /// is refused, since nothing would run it; fewer goldens than `minimum`
     /// is refused, since a deleted golden otherwise only shrinks the run.
-    static run_goldens(examples: Path, logs: &RunLogs, projects: &Array<String>, minimum: i64, jobs: i64) -> i32 {
+    static run_goldens(examples: Path, logs: &RunLogs, projects: &Array<String>, minimum: i64, jobs: i64, under_valgrind: boolean) -> i32 {
         const goldens: Array<String> = ExamplesGate::holding(examples, Str::new("expected.out"));
         mut failed: Array<String> = Array::<String>::new();
         mut runnable: Array<String> = Array::<String>::new();
@@ -161,7 +204,14 @@ public type struct ExamplesGate {
         for (name in runnable.iter_ref()) {
             const directory: PathBuf = examples.join(name.as_str());
             const program: PathBuf = directory.join(Str::new("build")).as_path().join(Host::executable_name(name.as_str()).as_str());
-            mut job: Job = Job::new(program.as_path().as_str());
+            mut job: Job = if (under_valgrind) { Job::new(Str::new("valgrind")) } else { Job::new(program.as_path().as_str()) };
+            if (under_valgrind) {
+                job.argument(Str::new("--error-exitcode=1"));
+                job.argument(Str::new("--leak-check=full"));
+                job.argument(Str::new("--errors-for-leak-kinds=definite"));
+                job.argument(Str::new("-q"));
+                job.argument(program.as_path().as_str());
+            }
             job.directory(directory.as_path().as_str());
             job.log_to(logs.file(f"examples-run-{name.as_str()}".as_str()).as_str());
             job.errors_to(logs.file(f"examples-run-{name.as_str()}-errors".as_str()).as_str());
@@ -177,6 +227,10 @@ public type struct ExamplesGate {
             const relative: String = f"examples/{name}/expected.out";
             if (!done.outcome.succeeded()) {
                 fmt::println(f"  FAIL  {relative.as_str()}: running examples/{name}: {done.outcome.describe().as_str()}");
+                if (under_valgrind) {
+                    const errors: String = logs.file(f"examples-run-{name}-errors".as_str());
+                    ExamplesGate::print_valgrind_findings(Path::from(errors.as_str()));
+                }
                 failed.push(relative);
                 continue;
             }
@@ -205,8 +259,29 @@ public type struct ExamplesGate {
             fmt::println(f"examples-gate: FAIL -- {failed.length()} of {goldens.length()} expected.out file(s) not matched: {Text::joined(&failed, Str::new(" ")).as_str()}");
             return 1;
         }
-        fmt::println(f"examples-gate: OK -- {projects.length()} project(s) built, {runnable.length()} ran and matched their expected.out");
+        const how: Str = if (under_valgrind) { Str::new(" under valgrind") } else { Str::new("") };
+        fmt::println(f"examples-gate: OK -- {projects.length()} project(s) built, {runnable.length()} ran{how} and matched their expected.out");
         return 0;
+    }
+
+    /// The lines of a valgrind report at `path` that say what it found: the
+    /// error summary, the definite leaks and each invalid access, at most
+    /// `TAIL_LINES` of them, then where the whole report is.
+    static print_valgrind_findings(path: Path) -> void {
+        const report: String = match (File::read_text(path)) {
+            Result::Ok(text) => { text }
+            Result::Err(_)   => { String::new() }
+        };
+        mut printed: i64 = 0;
+        for (line in Text::lines(report.as_str()).iter_ref()) {
+            if (printed >= ExamplesGate::TAIL_LINES) { break; }
+            const text: Str = line.as_str();
+            if (text.contains(&Str::new("ERROR SUMMARY")) || text.contains(&Str::new("definitely lost")) || text.contains(&Str::new("Invalid free")) || text.contains(&Str::new("Invalid read")) || text.contains(&Str::new("Invalid write"))) {
+                fmt::println(f"        | {text}");
+                printed++;
+            }
+        }
+        fmt::println(f"        valgrind's report: {path.as_str()}");
     }
 
     /// The first line, counted from 0, at which `got` differs from
