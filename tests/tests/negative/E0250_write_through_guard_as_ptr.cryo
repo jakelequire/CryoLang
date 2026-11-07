@@ -1,0 +1,50 @@
+// E0250: a lock guard's `as_ptr()` is a read-only `T*`, so the guarded value
+// is not written through it - not by a store, a compound assignment or a
+// `mut &this` method.  Writes go through `as_mutable_ptr()`, from a guard
+// held writably; the controls compile: those writes, and reads through
+// `as_ptr()` of all three guards.
+![config(testing)]
+![config(negative, E0250)]
+namespace CryoTests::Negative::WriteThroughGuardAsPtr;
+
+import std::sync::mutex::{ Mutex, MutexGuard };
+import std::sync::rwlock::{ RwLock, RwLockReadGuard, RwLockWriteGuard };
+import std::alloc::allocator::{ GlobalAlloc };
+import std::collections::array::{ Array };
+
+function store_through_mutex_guard(m: mut &Mutex<i32>) -> void {
+    const g: MutexGuard<i32, GlobalAlloc> = m.lock();
+    *g.as_ptr() = 1;
+    //~^ ERROR[E0250] cannot assign to a place reached through `i32*`, which is read-only
+}
+
+function method_through_mutex_guard(m: mut &Mutex<Array<i32>>) -> void {
+    const g: MutexGuard<Array<i32>, GlobalAlloc> = m.lock();
+    g.as_ptr().push(1);
+    //~^ ERROR[E0250] cannot call a `mut &this` method on a place reached through
+}
+
+function store_through_write_guard(l: mut &RwLock<i32>) -> void {
+    const g: RwLockWriteGuard<i32, GlobalAlloc> = l.write();
+    *g.as_ptr() = 2;
+    //~^ ERROR[E0250] cannot assign to a place reached through `i32*`, which is read-only
+}
+
+function writes_control(m: mut &Mutex<i32>, l: mut &RwLock<i32>) -> i32 {
+    mut g: MutexGuard<i32, GlobalAlloc> = m.lock();
+    *g.as_mutable_ptr() = 3;
+    const p: mut i32* = g.as_mutable_ptr();
+    *p = *p + 1;
+    mut w: RwLockWriteGuard<i32, GlobalAlloc> = l.write();
+    *w.as_mutable_ptr() = 5;
+    return *g.as_ptr() + *w.as_ptr();
+}
+
+function reads_control(l: mut &RwLock<i32>) -> i32 {
+    const r: RwLockReadGuard<i32, GlobalAlloc> = l.read();
+    return *r.as_ptr();
+}
+
+function main() -> int {
+    return 0;
+}
