@@ -8,6 +8,8 @@
 namespace compiler::diag::suggestion;
 
 import compiler::diag::source_span::{ SourceSpan };
+import std::collections::string::{ String };
+import std::fmt::display::{ Display };
 
 
 /// How confident the compiler is that a Suggestion will produce
@@ -70,7 +72,8 @@ type struct SuggestionPart {
 /// to work without churn; `parts` carries the same data for multi-part
 /// fixes and is what new code should populate via `multipart()`.
 type struct Suggestion {
-    message:       string;
+    /// What the fix does, owned by the suggestion.
+    message:       String;
     span:          SourceSpan;
     replacement:   string;
     parts:         [SuggestionPart];
@@ -79,13 +82,13 @@ type struct Suggestion {
     /// Single-edit suggestion, applicability unspecified.  Kept for
     /// backwards compatibility with the many existing emission sites
     /// that built one of these before `Applicability` existed.
-    static replace(span: SourceSpan, replacement: string, message: string) -> Suggestion {
+    static replace<T>(span: SourceSpan, replacement: string, message: T) -> Suggestion where T: Display {
         return Suggestion::single(span, replacement, message,
                                   Applicability::Unspecified);
     }
 
     /// Single-edit removal (replace span with empty text).
-    static remove(span: SourceSpan, message: string) -> Suggestion {
+    static remove<T>(span: SourceSpan, message: T) -> Suggestion where T: Display {
         return Suggestion::single(span, "", message,
                                   Applicability::Unspecified);
     }
@@ -93,19 +96,19 @@ type struct Suggestion {
     /// Single-edit suggestion that the IDE may auto-apply.  Use only
     /// when the compiler is sure: the fix lands valid, compilable code
     /// verbatim, with no required user input.
-    static machine_applicable(span: SourceSpan, replacement: string,
-                               message: string) -> Suggestion {
+    static machine_applicable<T>(span: SourceSpan, replacement: string,
+                                  message: T) -> Suggestion where T: Display {
         return Suggestion::single(span, replacement, message,
                                   Applicability::MachineApplicable);
     }
 
     /// Single-edit constructor with an explicit applicability level.
-    static single(span: SourceSpan, replacement: string, message: string,
-                  applicability: Applicability) -> Suggestion {
+    static single<T>(span: SourceSpan, replacement: string, message: T,
+                     applicability: Applicability) -> Suggestion where T: Display {
         mut parts: [SuggestionPart] = [];
         parts.push(SuggestionPart::new(span, replacement));
         return Suggestion {
-            message:       message,
+            message:       String::from(message),
             span:          span,
             replacement:   replacement,
             parts:         parts,
@@ -115,11 +118,11 @@ type struct Suggestion {
 
     /// A fix made of several edits, which only compile applied together.
     /// `parts` holds at least one edit; the first is the surface pair.
-    static multipart(parts: [SuggestionPart], message: string,
-                     applicability: Applicability) -> Suggestion {
+    static multipart<T>(parts: [SuggestionPart], message: T,
+                        applicability: Applicability) -> Suggestion where T: Display {
         const first: SuggestionPart = parts[0];
         return Suggestion {
-            message:       message,
+            message:       String::from(message),
             span:          first.span,
             replacement:   first.replacement,
             parts:         parts,
@@ -139,9 +142,9 @@ type struct Suggestion {
 
 }
 
-/// A deep copy; `parts` (the only owning field, SuggestionPart is Copy) is
-/// rebuilt into an independent buffer so the clone can be stored in a second
-/// owner without a double-free.
+/// A deep copy; the message and `parts` (SuggestionPart is Copy) are the
+/// owning fields, rebuilt into independent buffers so the clone can be
+/// stored in a second owner without a double-free.
 implement trait Clone for struct Suggestion {
     clone(&this) -> Suggestion {
         mut parts_c: [SuggestionPart] = [];
@@ -149,7 +152,7 @@ implement trait Clone for struct Suggestion {
             parts_c.push(this.parts[i]);
         }
         return Suggestion {
-            message:       this.message,
+            message:       this.message.clone(),
             span:          this.span,
             replacement:   this.replacement,
             parts:         parts_c,

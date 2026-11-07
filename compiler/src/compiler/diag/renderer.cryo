@@ -307,10 +307,9 @@ type struct DiagRenderer {
     /// `base_color` is the ANSI sequence to restore after each bolded
     /// span (so the surrounding label keeps its color); pass `""` to
     /// fall back to the default text style.
-    print_message(&this, out: void*, message: string, base_color: string) -> void {
-        const msg: string = message;
-        if (msg == null) { return; }
-        const len: i64 = msg.length() as i64;
+    print_message(&this, out: void*, message: Str, base_color: string) -> void {
+        const msg: &Slice<u8> = message.as_bytes();
+        const len: i64 = msg.length();
         if (len == 0) { return; }
 
         const bold:  string = this.color_bold();
@@ -321,7 +320,7 @@ type struct DiagRenderer {
         mut i: i64 = 0;
         mut in_code: boolean = false;
         while (i < len) {
-            const ch: char = msg[i];
+            const ch: i8 = msg[i] as i8;
             if (ch == 96) {  // '`'
                 if (!in_code) {
                     if (colors_on) {
@@ -476,7 +475,7 @@ type struct DiagRenderer {
         // 3. Cross-file secondary labels (rendered as separate snippets
         //    since they can't share a margin with the primary).
         for (mut i: i64 = 0; i < diag.labels.length(); i++) {
-            const label: SpanLabel = diag.labels[i];
+            const label: &SpanLabel = &diag.labels[i];
             if (label.is_primary) { continue; }
             if (!label.span.has_location()) { continue; }
             if (label.span.file == diag.span.file && diag.span.has_location()) {
@@ -541,7 +540,7 @@ type struct DiagRenderer {
     has_same_file_secondary(&this, diag: &Diagnostic) -> boolean {
         if (!diag.span.has_location()) { return false; }
         for (mut i: i64 = 0; i < diag.labels.length(); i++) {
-            const lbl: SpanLabel = diag.labels[i];
+            const lbl: &SpanLabel = &diag.labels[i];
             if (lbl.is_primary) { continue; }
             if (!lbl.span.has_location()) { continue; }
             if (lbl.span.file == diag.span.file) { return true; }
@@ -572,13 +571,13 @@ type struct DiagRenderer {
         DiagSink::emit_raw(out, ": ");
         DiagSink::emit_raw(out, bold);
         DiagSink::emit_raw(out, white);
-        this.print_message(out, diag.message, white);
+        this.print_message(out, diag.message.as_str(), white);
         DiagSink::emit_raw(out, reset);
         DiagSink::emit_raw(out, "\n");
     }
 
     /// Render a source snippet with caret underline for the primary span.
-    render_snippet(mut &this, span: SourceSpan, severity: Severity, message: string) -> void {
+    render_snippet(mut &this, span: SourceSpan, severity: Severity, message: Str) -> void {
         const blue: string  = this.color_blue();
         const reset: string = this.color_reset();
         const bold: string  = this.color_bold();
@@ -703,22 +702,13 @@ type struct DiagRenderer {
     collect_same_file_labels(&this, diag: &Diagnostic) -> [SpanLabel] {
         mut out: [SpanLabel] = [];
         for (mut i: i64 = 0; i < diag.labels.length(); i++) {
-            const lbl: SpanLabel = diag.labels[i];
+            const lbl: &SpanLabel = &diag.labels[i];
             if (!lbl.span.has_location()) { continue; }
             if (lbl.span.file != diag.span.file) { continue; }
-            out.push(lbl);
-        }
-        // Insertion sort by start_line (small N, stable).
-        for (mut i: i64 = 1; i < out.length(); i++) {
-            for (mut j: i64 = i; j > 0; j--) {
-                if (out[j].span.start_line < out[j - 1].span.start_line) {
-                    const tmp: SpanLabel = out[j];
-                    out[j] = out[j - 1];
-                    out[j - 1] = tmp;
-                } else {
-                    break;
-                }
-            }
+            // Insertion by start_line (small N, stable: a tie goes after).
+            mut at: i64 = out.length();
+            while (at > 0 && lbl.span.start_line < out[at - 1].span.start_line) { at -= 1; }
+            out.insert(at, lbl.clone());
         }
         return out;
     }
@@ -737,7 +727,7 @@ type struct DiagRenderer {
         const labels: [SpanLabel] = this.collect_same_file_labels(diag);
         if (labels.length() == 0) {
             // Nothing to combine; fall back to single-span rendering.
-            this.render_snippet(primary_span, diag.severity, diag.message);
+            this.render_snippet(primary_span, diag.severity, diag.message.as_str());
             return;
         }
 
@@ -784,7 +774,7 @@ type struct DiagRenderer {
         mut have_group:  boolean = false;
 
         for (mut i: i64 = 0; i < labels.length(); i++) {
-            const lbl: SpanLabel = labels[i];
+            const lbl: &SpanLabel = &labels[i];
             const ln: u32 = lbl.span.start_line;
             const want_start: u32 = if (ln > ctx) { ln - ctx } else { 1 };
             const want_end:   u32 = ln + ctx;
@@ -879,44 +869,33 @@ type struct DiagRenderer {
     render_labels_for_line(mut &this, all_labels: &Slice<SpanLabel>, file_text: string,
                             line_num: u32, severity: Severity,
                             line_width: u32) -> void {
+        // The labels on this line, by start_col ascending so we can pick
+        // out "rightmost" by index.  Stable: ties keep insertion order.
         mut on_line: [SpanLabel] = [];
         for (mut k: i64 = 0; k < all_labels.length(); k++) {
-            const lbl: SpanLabel* = all_labels.get_ref(k).unwrap();
-            if (lbl.span.start_line == line_num) {
-                on_line.push(*lbl);
-            }
+            const lbl: &SpanLabel = &all_labels[k];
+            if (lbl.span.start_line != line_num) { continue; }
+            mut at: i64 = on_line.length();
+            while (at > 0 && lbl.span.start_col < on_line[at - 1].span.start_col) { at -= 1; }
+            on_line.insert(at, lbl.clone());
         }
         if (on_line.length() == 0) { return; }
         if (on_line.length() == 1) {
-            this.render_label_underline(on_line[0], severity, line_width);
+            this.render_label_underline(&on_line[0], severity, line_width);
             return;
-        }
-
-        // Insertion sort by start_col ascending so we can pick out
-        // "rightmost" by index.  Stable: ties keep insertion order.
-        for (mut i: i64 = 1; i < on_line.length(); i++) {
-            for (mut j: i64 = i; j > 0; j--) {
-                if (on_line[j].span.start_col < on_line[j - 1].span.start_col) {
-                    const tmp: SpanLabel = on_line[j];
-                    on_line[j] = on_line[j - 1];
-                    on_line[j - 1] = tmp;
-                } else {
-                    break;
-                }
-            }
         }
 
         // 2-label case gets the stacked rendering; 3+ falls back to
         // one-row-per-label so we don't have to solve the multi-level
         // connector layout problem here.
         if (on_line.length() == 2) {
-            this.render_stacked_two_labels(on_line[0], on_line[1],
+            this.render_stacked_two_labels(&on_line[0], &on_line[1],
                 file_text, line_num, severity, line_width);
             return;
         }
 
         for (mut k: i64 = 0; k < on_line.length(); k++) {
-            this.render_label_underline(on_line[k], severity, line_width);
+            this.render_label_underline(&on_line[k], severity, line_width);
         }
     }
 
@@ -930,7 +909,7 @@ type struct DiagRenderer {
     /// `left` and `right` are pre-sorted by ascending start_col.  Both
     /// labels' colors come from severity/primary-ness; primary wins
     /// when caret ranges overlap.
-    render_stacked_two_labels(mut &this, left: SpanLabel, right: SpanLabel,
+    render_stacked_two_labels(mut &this, left: &SpanLabel, right: &SpanLabel,
                                file_text: string, line_num: u32,
                                severity: Severity, line_width: u32) -> void {
         const cyan:  string = this.color_cyan();
@@ -974,12 +953,12 @@ type struct DiagRenderer {
         }
 
         // Append the rightmost label's caption inline.
-        if (right.message != "") {
+        if (!right.message.is_empty()) {
             const right_color: string = if (right.is_primary) { sev_color } else { cyan };
             DiagSink::emit_raw(out, " ");
             DiagSink::emit_raw(out, bold);
             DiagSink::emit_raw(out, right_color);
-            this.print_message(out, right.message, right_color);
+            this.print_message(out, right.message.as_str(), right_color);
             DiagSink::emit_raw(out, reset);
         }
         DiagSink::emit_raw(out, "\n");
@@ -997,14 +976,14 @@ type struct DiagRenderer {
         DiagSink::emit_raw(out, "\n");
 
         // Caption row for the left label.
-        if (left.message != "") {
+        if (!left.message.is_empty()) {
             this.emit_gutter_blank(out, line_width, " ");
             for (mut cell: u32 = 1; cell < left_vs; cell++) {
                 DiagSink::emit_raw(out, " ");
             }
             DiagSink::emit_raw(out, bold);
             DiagSink::emit_raw(out, left_color);
-            this.print_message(out, left.message, left_color);
+            this.print_message(out, left.message.as_str(), left_color);
             DiagSink::emit_raw(out, reset);
             DiagSink::emit_raw(out, "\n");
         }
@@ -1014,7 +993,7 @@ type struct DiagRenderer {
     /// snippet. Primaries get `^^^^` in the diagnostic's severity
     /// color; secondaries get `----` in cyan, matching the
     /// "value moved here" caption style.
-    render_label_underline(&this, label: SpanLabel, severity: Severity,
+    render_label_underline(&this, label: &SpanLabel, severity: Severity,
                            line_width: u32) -> void {
         const reset: string = this.color_reset();
         const bold: string  = this.color_bold();
@@ -1052,16 +1031,16 @@ type struct DiagRenderer {
             DiagSink::emit_raw(out, caret_char);
         }
 
-        if (label.message != "") {
+        if (!label.message.is_empty()) {
             DiagSink::emit_raw(out, " ");
-            this.print_message(out, label.message, caption_color);
+            this.print_message(out, label.message.as_str(), caption_color);
         }
         DiagSink::emit_raw(out, reset);
         DiagSink::emit_raw(out, "\n");
     }
 
     /// Render the caret underline below a source line.
-    render_underline(&this, span: SourceSpan, severity: Severity, message: string,
+    render_underline(&this, span: SourceSpan, severity: Severity, message: Str,
                      line_width: u32) -> void {
         const reset: string     = this.color_reset();
         const bold: string      = this.color_bold();
@@ -1101,7 +1080,7 @@ type struct DiagRenderer {
         }
 
         // Inline label
-        if (message != "") {
+        if (!message.is_empty()) {
             DiagSink::emit_raw(out, " ");
             this.print_message(out, message, sev_color);
         }
@@ -1111,7 +1090,7 @@ type struct DiagRenderer {
     }
 
     /// Render a secondary span:  :: file:line:col  with cyan underline.
-    render_secondary_span(mut &this, label: SpanLabel) -> void {
+    render_secondary_span(mut &this, label: &SpanLabel) -> void {
         const blue: string  = this.color_blue();
         const cyan: string  = this.color_cyan();
         const bold: string  = this.color_bold();
@@ -1165,9 +1144,9 @@ type struct DiagRenderer {
         for (mut t: u32 = 1; t < ul_len; t++) {
             DiagSink::emit_raw(out, "~");
         }
-        if (label.message != "") {
+        if (!label.message.is_empty()) {
             DiagSink::emit_raw(out, " ");
-            this.print_message(out, label.message, cyan);
+            this.print_message(out, label.message.as_str(), cyan);
         }
         DiagSink::emit_raw(out, reset);
         DiagSink::emit_raw(out, "\n");
@@ -1190,12 +1169,12 @@ type struct DiagRenderer {
         DiagSink::emit_raw(out, child.severity.label());
         DiagSink::emit_raw(out, reset);
         DiagSink::emit_raw(out, ": ");
-        this.print_message(out, child.message, "");
+        this.print_message(out, child.message.as_str(), "");
         DiagSink::emit_raw(out, "\n");
 
         if (child.span.has_location()) {
             this.load_source(child.span.file);
-            this.render_snippet(child.span, child.severity, child.message);
+            this.render_snippet(child.span, child.severity, child.message.as_str());
         }
     }
 
@@ -1239,7 +1218,7 @@ type struct DiagRenderer {
         DiagSink::emit_raw(out, applicability_tag);
         DiagSink::emit_raw(out, reset);
         DiagSink::emit_raw(out, ": ");
-        this.print_message(out, sug.message, "");
+        this.print_message(out, sug.message.as_str(), "");
         DiagSink::emit_raw(out, "\n");
 
         // The edits a fix makes to one source line are drawn as that line
