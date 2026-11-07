@@ -1,35 +1,22 @@
-/// A bound on a type parameter is written in a `where` clause. The inline form
-/// `<T: Bound>` is not syntax: a `:` in generic-parameter position is rejected
-/// by the parser, which is what this project pins.
+/// A bound written on a type parameter (`<T: Tagged>`) means exactly what
+/// `where T: Tagged` means, on every declaration that takes a `where` clause:
+/// a function, a method, a struct, an enum, and both parameter lists of an
+/// `implement` block.  A parameter may carry both, and they merge:
+/// `<T: Tagged> where T: Copy` gives `T` both traits.
 ///
-/// The rejection is ONE diagnostic that names `where`, not a parse cascade. The
-/// bound list is consumed at the point the `:` is seen, so the parameter list
-/// does not then fall over on the tokens after it and report the same single
-/// mistake again from further away. Only the error code is asserted here; the
-/// count is not something the projects runner can express.
-///
-/// WHY A COMPILE-FAIL PROJECT AND NOT A UNIT TEST
-///
-/// The rejection happens in `parse_generic_params`, so the file cannot parse -
-/// there is no way to assert it from inside a test function in the same
-/// package. A project whose declared outcome is `compile_fail` is the only
-/// shape that can hold a file the compiler must refuse.
-///
-/// WHAT WOULD SILENTLY UNDO THIS
-///
-/// Re-adding a constraint branch to `parse_generic_params` makes this file
-/// parse again. Nothing else in the tree writes the form, so no other corpus
-/// would notice; without this project the production could come back and every
-/// gate would stay green.
-///
-/// The `where` spelling of the same bound is exercised across the stdlib and is
-/// enforced at call sites by E0306. The two are not interchangeable spellings:
-/// `where` is the only one the language has, and it accepts a qualified trait
-/// path (`where W: io::Write`), which this form never did.
+/// Every case below calls through the inline bound, so it compiles only if
+/// the bound reaches the body, and checks the value it computes.  `main`
+/// prints how many checks passed and exits 0 only when all did.
 namespace InlineGenericBound::Main;
+
+import std::fmt;
 
 type trait Tagged {
     tag(&this) -> i32;
+}
+
+type trait Describe {
+    describe(&this) -> i32;
 }
 
 type struct Widget {
@@ -40,12 +27,75 @@ implement trait Tagged for Widget {
     tag(&this) -> i32 { return this.v; }
 }
 
-/// The rejected form. `where T: Tagged` is how this is written.
+/// A function's parameter.
 function tag_of<T: Tagged>(x: &T) -> i32 {
     return x.tag();
 }
 
+/// More than one trait, joined with `+`, beside an unbounded parameter.
+function larger<T: Ord + Copy, U>(a: T, b: T, _unused: U) -> T {
+    if (a > b) { return a; }
+    return b;
+}
+
+/// An inline bound and a `where` clause on the same parameter merge.
+type struct Pair<T: Tagged> where T: Copy {
+    a: T;
+    b: T;
+
+    sum(&this) -> i32 { return this.a.tag() + this.b.tag(); }
+    first(&this) -> T { return this.a; }
+
+    /// A method's own parameter.
+    static tag_twice<U: Tagged>(u: &U) -> i32 { return u.tag() * 2; }
+}
+
+/// An enum's parameter, reached in its methods.
+type enum Slot<T: Tagged> {
+    Empty;
+    Full(T);
+}
+
+implement enum Slot<T: Tagged> {
+    tag_or_zero(&this) -> i32 {
+        return match (this) {
+            Slot::Empty   => { 0 }
+            Slot::Full(v) => { v.tag() }
+        };
+    }
+}
+
+type struct Holder<T> {
+    inner: T;
+}
+
+/// A trait implementation's leading parameter list.
+implement<T: Tagged> trait Describe for struct Holder<T> {
+    describe(&this) -> i32 { return this.inner.tag() + 100; }
+}
+
+function check(name: string, got: i32, want: i32) -> i32 {
+    if (got == want) { return 1; }
+    fmt::println(f"FAIL {name}: got {got} (want {want})");
+    return 0;
+}
+
 function main() -> i32 {
-    mut w: Widget = Widget { v: 7 };
-    return tag_of::<Widget>(&w) - 7;
+    mut passed: i32 = 0;
+    const w: Widget = Widget { v: 7 };
+    passed += check("function", tag_of::<Widget>(&w), 7);
+    passed += check("two_traits", larger::<i32, boolean>(3, 9, true), 9);
+    const p: Pair<Widget> = Pair::<Widget> { a: Widget { v: 2 }, b: Widget { v: 5 } };
+    passed += check("struct", p.sum(), 7);
+    passed += check("merged_with_where", p.first().v, 2);
+    passed += check("method", Pair::<Widget>::tag_twice::<Widget>(&w), 14);
+    const full: Slot<Widget> = Slot::<Widget>::Full(Widget { v: 4 });
+    passed += check("enum", full.tag_or_zero(), 4);
+    const empty: Slot<Widget> = Slot::<Widget>::Empty;
+    passed += check("enum_empty", empty.tag_or_zero(), 0);
+    const h: Holder<Widget> = Holder::<Widget> { inner: Widget { v: 1 } };
+    passed += check("implement", h.describe(), 101);
+    fmt::println(f"inline_generic_bound: {passed} of 8 passed");
+    if (passed != 8) { return 1; }
+    return 0;
 }

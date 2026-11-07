@@ -285,11 +285,13 @@ MethodImpl         ::= Directive* Visibility? "static"? "async"?
                      | Visibility? MemberConstant  (* an inherent block's constant *)
 
 Generics           ::= "<" GenericParam ("," GenericParam)* ">"
-GenericParam       ::= Ident ("=" Type)?
-                       (* the optional "=" Type is a default type argument,
-                          e.g. `<A = GlobalAlloc>`.  A parameter carries no
-                          bound here: a bound is written in a WhereClause, so
-                          `<T: Bound>` is a syntax error. *)
+GenericParam       ::= Ident (":" TraitBound ("+" TraitBound)*)? ("=" Type)?
+                       (* `<T: Ord + Hash>` is the WhereClause entry
+                          `T: Ord + Hash`, and merges with the declaration's
+                          own WhereClause; it is accepted wherever a
+                          WhereClause is (not on a trait or a type alias).
+                          The optional "=" Type is a default type argument,
+                          e.g. `<A = GlobalAlloc>`. *)
 GenericArgs        ::= "<" Type ("," Type)* ">"
 TurbofishArgs      ::= "::" GenericArgs
                        (* generic arguments in EXPRESSION position: `<`

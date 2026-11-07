@@ -4636,8 +4636,9 @@ dropped or deferred says so; a deferred one is listed in
 - **D7.** Imports do not glob.  A plain `import M;` binds the module and no
   names from it.  The globs that remain are the written `M::*`, the prelude
   and the formatted-string runtime the compiler imports for a program.
-- **D8.** There is no inline `<T: Bound>` form; bounds are written in
-  `where`.
+- **D8.** A bound written on a parameter, `<T: Bound>`, is the `where`
+  entry `T: Bound` of the same declaration and merges with its `where`
+  clause; it is accepted wherever `where` is.
 - **D9.** Type declarations take `where` between the head and the body,
   and an instantiation whose argument does not satisfy a bound is E0306 at
   the annotation that wrote it.

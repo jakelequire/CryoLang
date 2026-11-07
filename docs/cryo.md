@@ -2108,7 +2108,14 @@ Multiple bounds on the same parameter are joined with `+`. Multiple constrained 
 where T: Hash + Eq, V: Clone
 ```
 
-A `where` clause is the only way to constrain a parameter; there is no inline `<T: Bound>` form. It is written on functions and methods, on `implement` blocks, and on type declarations — a struct, union or enum — after the parameter list and before the body:
+A bound on a parameter may also be written where the parameter is declared: `<T: Ord + Copy>` means exactly `where T: Ord + Copy`. The two forms merge, so `type struct Pair<T: Clone> where T: Default` gives `T` both traits, and each is checked and assumed as the other is. The inline form is accepted wherever a `where` clause is, and nowhere else: a trait or a type alias takes neither, and a bound on one of their parameters is refused (E0101).
+
+```cryo
+function largest<T: Ord>(items: &[T]) -> &T { ... }
+implement<T: Display> trait Describe for struct Holder<T> { ... }
+```
+
+A `where` clause is written on functions and methods, on `implement` blocks, and on type declarations — a struct, union or enum — after the parameter list and before the body:
 
 ```cryo
 type struct Holder<T> where T: Tagged {
