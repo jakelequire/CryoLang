@@ -98,6 +98,16 @@ type struct LoopWalk {
     continues_start:    i64;
 }
 
+/// Where a field is read by value into a second owner: an initializer,
+/// return, argument, assignment or literal field (`Value`), or a `match`
+/// subject's temporary (`MatchSubject`).  The double free is the same; the
+/// refusal says which, because the borrow that fixes each is spelled
+/// differently.
+type enum FieldReadSite {
+    Value;
+    MatchSubject;
+}
+
 /// A binding declared outside a loop that was moved on a path leaving the
 /// loop's body through a `break` or a `continue`.
 type struct LoopExitMove {
@@ -1363,7 +1373,11 @@ type struct MoveChecker {
     walk_var_decl(mut &this, d: DeclarationNode*) -> void {
         const vd: VarDecl* = DeclarationNode::var_of(d);
         if (vd == null) { return; }
-        if (vd.initializer != null) {
+        // A capture alias names the closure's own field under the captured
+        // binding's identity; it owns nothing, so its initializer is a read.
+        if (vd.initializer != null && vd.is_capture_alias) {
+            this.walk_expr_read(vd.initializer);
+        } else if (vd.initializer != null) {
             this.walk_expr_move(vd.initializer, true);
         }
         if (!vd.is_global) {
@@ -1452,7 +1466,7 @@ type struct MoveChecker {
         // A storage-duplicating move of a non-Copy field out of an owned
         // value is a double free (no partial-move tracking). Reject it.
         if (real) { this.check_polled_move(expr); }
-        if (real) { this.check_field_move_out(expr); }
+        if (real) { this.check_field_move_out(expr, FieldReadSite::Value); }
         // Same hazard for a value read out THROUGH a pointer: the pointee is
         // duplicated into an independently-dropped place while whoever owns
         // that storage keeps its own claim on it.
@@ -1672,7 +1686,7 @@ type struct MoveChecker {
             // RHS double-frees, so check for it explicitly.  So does a
             // move-out through a pointer, and for the same reason: the walk
             // below passes `real=false`, which skips both checks.
-            if (b.right != null) { this.check_field_move_out(b.right); }
+            if (b.right != null) { this.check_field_move_out(b.right, FieldReadSite::Value); }
             if (b.right != null) { this.check_deref_move_out(b.right); }
             if (b.right != null) { this.check_array_field_move_out(b.right); }
             const left_id: IdentifierExpr* = ExpressionNode::identifier_of(b.left);
@@ -2031,12 +2045,12 @@ type struct MoveChecker {
     /// this is a hard error (E0453) rather than the silent heap
     /// corruption it produced before.  The escape hatch is
     /// `core::mem::swap` (leave the field a valid value to be dropped in
-    /// place) or a `Copy` field type.  Moving a field out THROUGH a
-    /// pointer/reference (heap or borrowed storage) is the caller's to
-    /// manage and is deliberately allowed - see `is_owned_value_place` -
-    /// except out of a destructor's own receiver
-    /// (`check_destructor_field_move_out`).
-    check_field_move_out(mut &this, expr: ExpressionNode*) -> void {
+    /// place) or a `Copy` field type.  A field read THROUGH a pointer or
+    /// reference is not tracked here - its storage is not this scope's to
+    /// glue-drop - and is refused by `check_field_read_through_pointer`
+    /// instead, or by `check_destructor_field_move_out` out of a
+    /// destructor's own receiver.
+    check_field_move_out(mut &this, expr: ExpressionNode*, site: FieldReadSite) -> void {
         if (expr == null || ExpressionNode::member_access_of(expr) == null) { return; }
         const ma: MemberAccessExpr* = ExpressionNode::member_access_of(expr);
         if (ma.object == null) { return; }
@@ -2047,6 +2061,7 @@ type struct MoveChecker {
         // The source must be an owned, glue-dropped value place.
         if (!this.is_owned_value_place(ma.object)) {
             this.check_destructor_field_move_out(expr, ma, field_ty);
+            this.check_field_read_through_pointer(expr, ma, field_ty, site);
             return;
         }
         // Partial-move model ("allow + track" half): a non-Copy *droppable*
@@ -2110,37 +2125,52 @@ type struct MoveChecker {
         this.fatal += 1;
     }
 
-    /// Reject a `match` on a field, reached through a pointer or reference,
-    /// whose type owns a destructor.
+    /// Reject a by-value read of a field, reached through a pointer or
+    /// reference, whose type owns a destructor.
     ///
-    /// `match (h.slot)` with `h: &Holder` matches `(*h).slot` by value: the
-    /// subject temporary takes a copy of the field's owning handle and is
-    /// dropped when the match ends, whether or not an arm binds the payload,
-    /// while the storage `h` names still holds the field and drops it again.
-    /// It is the `*p` subject `check_deref_move_out` refuses, one projection
-    /// further, with the same `unsafe` escape for a deliberate take.  The
-    /// match that only looks is `match (&h.slot)`.  A destructor's own
-    /// receiver is `check_destructor_field_move_out`'s.
-    check_subject_field_through_pointer(mut &this, e: ExpressionNode*) -> void {
+    /// `const x: T = h.slot;`, `return this.slot;`, `take(h.slot)` and
+    /// `match (h.slot)` with `h: &Holder` each copy the field's owning handle
+    /// into a second owner - the binding, the caller, the callee, the match's
+    /// temporary - while the storage `h` names still holds the field and
+    /// drops it again.  It is the `*p` read `check_deref_move_out` refuses,
+    /// one projection further, with the same `unsafe` escape for a
+    /// deliberate take.  An owning array field is
+    /// `check_array_field_move_out`'s, and a destructor's own receiver
+    /// `check_destructor_field_move_out`'s.
+    check_field_read_through_pointer(mut &this, e: ExpressionNode*, ma: MemberAccessExpr*,
+                                     field_ty: TypeRef, site: FieldReadSite) -> void {
         if (this.unsafe_depth > 0 || this.arg_binding_unknown) { return; }
-        const ma: MemberAccessExpr* = ExpressionNode::member_access_of(e);
-        if (ma == null || ma.object == null) { return; }
-        const field_ty: TypeRef = e.resolved_type;
-        if (!field_ty.is_valid() || this.is_copy(field_ty)) { return; }
-        if (!this.type_needs_drop(field_ty)) { return; }
+        if (!this.type_needs_drop(field_ty) || this.is_owning_array(field_ty)) { return; }
         if (this.drop_receiver.is_valid() && this.is_receiver_value_place(ma.object)) { return; }
         if (!this.reaches_through_pointer(ma.object)) { return; }
         if (this.suppress_emit) { return; }
         const field: string = this.intern.resolve(ma.member);
-        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
-            fmt::format("cannot match field `%s` by value through a pointer or reference", field));
-        diag = diag.at_with_label(e.span,
-            "the match takes its own copy of the field and drops it; the storage it is in still drops it too (double free)");
-        diag = diag.help(
-            "match on a borrow of the field instead - write `&` before the subject - so the arms read it without owning it; if this really is a take, swap a replacement in with `core::mem::swap` first");
+        const diag: Diagnostic = match (site) {
+            FieldReadSite::MatchSubject => {
+                Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
+                    fmt::format("cannot match field `%s` by value through a pointer or reference", field))
+                    .at_with_label(e.span,
+                        "the match takes its own copy of the field and drops it; the storage it is in still drops it too (double free)")
+                    .help("match on a borrow of the field instead - write `&` before the subject - so the arms read it without owning it; if this really is a take, swap a replacement in with `core::mem::swap` first")
+            }
+            FieldReadSite::Value => {
+                Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
+                    fmt::format("cannot move field `%s` out through a pointer or reference", field))
+                    .at_with_label(e.span,
+                        "this copies the field's owning handle into a second owner; the storage it is in still drops it too (double free)")
+                    .help("borrow the field (`&p.field`) or clone it; if this really is a take, swap a replacement in with `core::mem::swap`, or take it by value from an owned receiver (`mut this`)")
+            }
+        };
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
+    }
+
+    /// True for an owning array type: `[T]` (`Array<T>`) or `[T; N]`.
+    is_owning_array(&this, ty: TypeRef) -> boolean {
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null) { return false; }
+        return t.kind == TypeKind::Array || this.arena.default_array_element_of(t).is_valid();
     }
 
     /// True when the place `obj` names is reached through a pointer or
@@ -2207,8 +2237,7 @@ type struct MoveChecker {
     /// does not consume `x` for every later use.
     check_subject_move_out(mut &this, subject: ExpressionNode*) -> void {
         if (subject == null) { return; }
-        this.check_field_move_out(subject);
-        this.check_subject_field_through_pointer(subject);
+        this.check_field_move_out(subject, FieldReadSite::MatchSubject);
         this.check_deref_move_out(subject);
         this.check_array_move_out(subject);
         this.check_array_field_move_out(subject);
@@ -2345,11 +2374,7 @@ type struct MoveChecker {
         const ma: MemberAccessExpr* = ExpressionNode::member_access_of(expr);
         if (ma.object == null) { return; }
         const field_ty: TypeRef = expr.resolved_type;
-        if (!field_ty.is_valid()) { return; }
-        const t: Type* = this.arena.lookup(field_ty);
-        if (t == null) { return; }
-        // `[T]` is `Array<T>`; `[T; N]` holds its elements inline.
-        if (t.kind != TypeKind::Array && !this.arena.default_array_element_of(t).is_valid()) { return; }
+        if (!field_ty.is_valid() || !this.is_owning_array(field_ty)) { return; }
         // Only an owning (droppable) array buffer double-frees on copy.
         if (!this.type_needs_drop(field_ty)) { return; }
         // The owned-value-place form is already handled by

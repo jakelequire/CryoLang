@@ -798,8 +798,15 @@ implement trait Future for struct ChildWait {
         mut out: Result<ExitStatus, IoError> =
             Result::Err(IoError::new(IoErrorKind::Interrupted, 0));
         if (j.produced) {
-            if (j.ok) { out = Result::Ok(j.status); }
-            else      { out = Result::Err(j.err); }
+            if (j.ok) {
+                out = Result::Ok(j.status);
+            } else {
+                // Swap rather than read: the block still holds `err` until it is
+                // released, and an owning error must have one owner.
+                mut err: IoError = IoError::new(IoErrorKind::Other, 0);
+                mem::swap::<IoError>(&err, &j.err);
+                out = Result::Err(err);
+            }
         }
         this.let_go();
         return Poll::Ready(out);
@@ -1070,7 +1077,9 @@ implement trait Future for struct PipeDrain {
                 mem::swap::<Array<u8>>(&b, &jc.buf);
                 out = Result::Ok(b);
             } else {
-                out = Result::Err(jc.err);
+                mut err: IoError = IoError::new(IoErrorKind::Other, 0);
+                mem::swap::<IoError>(&err, &jc.err);
+                out = Result::Err(err);
             }
         }
         this.let_go();

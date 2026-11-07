@@ -1,0 +1,122 @@
+///! A field whose type owns a destructor, reached through a reference or a
+///! pointer, cannot be read by value (E0453; see the negative test
+///! E0453_field_read_by_value_through_reference): the storage still holds it
+///! and releases it again.  The ways that ARE sound each release every value
+///! exactly once: a `mem::swap` that leaves a replacement behind, a method
+///! that consumes its receiver (`mut this`) and hands one field out, an
+///! `unsafe` take whose storage is overwritten without being released, and a
+///! closure reading what it captured.
+///!
+///! Each test builds its owners in a block and counts destructor runs once
+///! the block has ended, so a value released twice shows as one drop too
+///! many and a leak as one too few.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::FieldTakeThroughReference;
+
+import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::core::drop::{ Drop };
+import std::core::mem;
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_eq };
+
+mut g_drops: i64 = 0;
+
+type struct Counted { tag: i64; }
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void { g_drops += 1; }
+}
+
+type struct Holder { slot: Option<Counted>; }
+
+type struct Pair {
+    kept:  Counted;
+    other: Counted;
+
+    into_kept(mut this) -> Counted {
+        return this.kept;
+    }
+}
+
+function swap_out(h: mut &Holder) -> Option<Counted> {
+    mut taken: Option<Counted> = Option::None;
+    mem::swap::<Option<Counted>>(&taken, &h.slot);
+    return taken;
+}
+
+function tag_of(slot: &Option<Counted>) -> i64 {
+    match (slot) {
+        Option::Some(found) => { return found.tag; }
+        Option::None        => { return 0; }
+    }
+}
+
+![test]
+function a_swapped_out_field_releases_once() -> Result<(), TestError> {
+    g_drops = 0;
+    mut tag: i64 = 0;
+    {
+        mut h: Holder = Holder { slot: Option::Some(Counted { tag: 4 }) };
+        const taken: Option<Counted> = swap_out(&h);
+        tag = tag_of(&taken);
+    }
+    match (expect_eq(tag, 4)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(g_drops, 1);
+}
+
+![test]
+function a_consuming_accessor_releases_each_field_once() -> Result<(), TestError> {
+    g_drops = 0;
+    mut tag: i64 = 0;
+    {
+        const pair: Pair = Pair { kept: Counted { tag: 7 }, other: Counted { tag: 8 } };
+        const kept: Counted = pair.into_kept();
+        tag = kept.tag;
+    }
+    match (expect_eq(tag, 7)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(g_drops, 2);
+}
+
+![test]
+function an_unsafe_take_with_its_storage_overwritten_releases_once() -> Result<(), TestError> {
+    g_drops = 0;
+    mut tag: i64 = 0;
+    {
+        mut h: Holder = Holder { slot: Option::Some(Counted { tag: 5 }) };
+        const p: mut Holder* = &h;
+        unsafe {
+            const taken: Option<Counted> = p.slot;
+            // A store through a pointer does not release what it overwrites.
+            p.slot = Option::None;
+            tag = tag_of(&taken);
+        }
+    }
+    match (expect_eq(tag, 5)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(g_drops, 1);
+}
+
+![test]
+function a_closure_reading_its_capture_releases_it_once() -> Result<(), TestError> {
+    g_drops = 0;
+    mut total: i64 = 0;
+    {
+        const slot: Option<Counted> = Option::Some(Counted { tag: 3 });
+        const f = () -> i64 { return tag_of(&slot); };
+        total = f() + f();
+    }
+    match (expect_eq(total, 6)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(g_drops, 1);
+}

@@ -182,16 +182,18 @@ private function thread_body<C, T>(arg: mut u8*) -> void {
     const p: Payload<C, T>* = arg as Payload<C, T>*;
     const body:   (C) -> T  = (*p).body;
     const shared: mut Shared<T>* = (*p).shared;
-    // Move the context out of the payload, then release the payload box;
-    // `ctx` now solely owns whatever heap state it carried.
-    const c: C = (*p).ctx;
-    mut alloc: GlobalAlloc = GlobalAlloc::new();
-    alloc.deallocate(NonNull::new(arg), Layout::of::<Payload<C, T>>());
-
-    // Run the user body and publish the result. Writing through a raw
-    // `T*` avoids drop-synthesis on the (uninitialized) destination.
+    // Writing the result through a raw `T*` avoids drop-synthesis on the
+    // (uninitialized) destination.
     const rptr: mut T* = &(*shared).result;
-    *rptr = body(c);
+    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    // A take: the context is read out of the payload, and the payload box is
+    // released raw right after, without dropping what it held, so `c` is
+    // the context's only owner from here on.
+    unsafe {
+        const c: C = (*p).ctx;
+        alloc.deallocate(NonNull::new(arg), Layout::of::<Payload<C, T>>());
+        *rptr = body(c);
+    }
 
     // Handshake: announce completion. If the handle already detached, no
     // one will ever read the result, so we own teardown here.
@@ -601,10 +603,14 @@ private type struct ScopePayload<C> {
 private function scope_body<C>(arg: mut u8*) -> void {
     const p: ScopePayload<C>* = arg as ScopePayload<C>*;
     const body: (C) -> void = (*p).body;
-    const c: C = (*p).ctx;
-    mut alloc: GlobalAlloc = GlobalAlloc::new();
-    alloc.deallocate(NonNull::new(arg), Layout::of::<ScopePayload<C>>());
-    body(c);
+    // A take, as in `thread_body`: the payload box is released raw right
+    // after, so `c` is the context's only owner.
+    unsafe {
+        const c: C = (*p).ctx;
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        alloc.deallocate(NonNull::new(arg), Layout::of::<ScopePayload<C>>());
+        body(c);
+    }
 }
 
 ![target(unix)]

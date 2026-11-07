@@ -1,0 +1,110 @@
+// E0453: a field whose type owns a destructor, read by value through a
+// reference or pointer, hands the field's owning handle to a second owner -
+// a binding, a caller, a callee, a literal - while the storage the field is
+// in still holds it and releases it again.  Refused for an initializer, an
+// assignment, a `return` from a `&this` method, an argument, a struct literal
+// field, through `&`, `mut &`, a pointer and a nested field alike.
+// The controls compile: a borrow of the field, a field with no destructor,
+// a field moved out of an owned local, a consuming `mut this` accessor, a
+// `mem::swap` take, an `unsafe` take, and a closure reading its captures.
+![config(testing)]
+![config(negative, E0453)]
+namespace CryoTests::Negative::FieldReadByValueThroughReference;
+
+import std::core::option::{ Option };
+import std::core::mem;
+import std::collections::string::{ String };
+
+type struct Holder { slot: Option<String>; count: i64; }
+type struct Nest { inner: Holder; }
+type struct Other { slot: Option<String>; }
+
+type struct Owner {
+    slot: Option<String>;
+
+    slot_by_value(&this) -> Option<String> {
+        return this.slot;
+        //~^ ERROR[E0453] cannot move field `slot` out through a pointer or reference
+    }
+
+    into_slot(mut this) -> Option<String> {
+        return this.slot;
+    }
+}
+
+function take(slot: Option<String>) -> i64 { return 0; }
+
+function into_local(h: &Holder) -> i64 {
+    const _copy: Option<String> = h.slot;
+    //~^ ERROR[E0453] cannot move field `slot` out through a pointer or reference
+    return 0;
+}
+
+function into_assignment(h: mut &Holder) -> i64 {
+    mut copy: Option<String> = Option::None;
+    copy = h.slot;
+    //~^ ERROR[E0453] cannot move field `slot` out through a pointer or reference
+    return 0;
+}
+
+function into_argument(h: &Holder) -> i64 {
+    return take(h.slot);
+    //~^ ERROR[E0453] cannot move field `slot` out through a pointer or reference
+}
+
+function into_literal(h: &Holder) -> Other {
+    return Other { slot: h.slot };
+    //~^ ERROR[E0453] cannot move field `slot` out through a pointer or reference
+}
+
+function through_pointer(h: Holder*) -> Option<String> {
+    return h.slot;
+    //~^ ERROR[E0453] cannot move field `slot` out through a pointer or reference
+}
+
+function nested_through_reference(n: &Nest) -> Option<String> {
+    return n.inner.slot;
+    //~^ ERROR[E0453] cannot move field `slot` out through a pointer or reference
+}
+
+function borrowed_control(h: &Holder) -> boolean {
+    const slot: &Option<String> = &h.slot;
+    return slot.is_some();
+}
+
+function no_destructor_control(h: &Holder) -> i64 {
+    const n: i64 = h.count;
+    return n;
+}
+
+function owned_local_control() -> i64 {
+    const h: Holder = Holder { slot: Option::None, count: 0 };
+    return take(h.slot);
+}
+
+function consuming_accessor_control() -> i64 {
+    const o: Owner = Owner { slot: Option::None };
+    return take(o.into_slot());
+}
+
+function swap_take_control(h: mut &Holder) -> i64 {
+    mut taken: Option<String> = Option::None;
+    mem::swap::<Option<String>>(&taken, &h.slot);
+    return take(taken);
+}
+
+function unsafe_take_control(h: mut Holder*) -> i64 {
+    unsafe {
+        const taken: Option<String> = h.slot;
+        h.slot = Option::None;
+        return take(taken);
+    }
+}
+
+function capture_control() -> i64 {
+    const text: String = String::from_string("captured");
+    const f = () -> i64 { return text.length(); };
+    return f();
+}
+
+function main() -> i32 { return 0; }
