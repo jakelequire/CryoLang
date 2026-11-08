@@ -37,6 +37,7 @@ import compiler::ast::{
     declaration, expression, LiteralKind, MemberPin, NamedAnnotation, node, statement, TraitBound, TraitRef, TypeAnnotation,
     Visibility
 };
+import compiler::ast::node_locator::{ annotation_span };
 import compiler::diag::{ diagnostic, ErrorCode, renderer, source_span, suggestion };
 import compiler::diag::renderer::{ DiagRenderer };
 import compiler::compilation_context::{ CompilationContext };
@@ -189,11 +190,15 @@ type struct CallInference {
     conflict_to:       TypeRef;
     misfit:            i64;
     unjudged:          boolean;
+    /// Whether the binding the conflicting argument disagrees with is one
+    /// the call's own type arguments write, rather than one an earlier
+    /// argument bound.
+    conflict_written:  boolean;
 
     static new() -> CallInference {
         return CallInference {
             bindings: [], conflict_argument: -1, conflict_from: TypeRef::invalid(),
-            conflict_to: TypeRef::invalid(), misfit: -1, unjudged: false,
+            conflict_to: TypeRef::invalid(), misfit: -1, unjudged: false, conflict_written: false,
         };
     }
 
@@ -1252,7 +1257,9 @@ type struct CallResolver {
         if (ident != null) {
             this.lambda.try_specialize_for_closure_args(call, ident, this.closure_call_entry(call, ident));
 
-            const inferred_generic_ret: TypeRef = this.check_generic_free_call(call_e, call, ident);
+            mut type_arguments_refused: boolean = false;
+            const inferred_generic_ret: TypeRef = this.check_generic_free_call(call_e, call, ident, &type_arguments_refused);
+            if (type_arguments_refused) { return TypeRef::invalid(); }
 
             if (call.resolved_callee.is_some()) {
                 // The pin is ground truth: on a re-resolution of an
@@ -1295,7 +1302,7 @@ type struct CallResolver {
                 this.check_generic_free_call_args(visitor, call, ident);
                 return inferred_generic_ret;
             }
-            if (call.generic_args.length() > 0) {
+            if (TypeAnnotation::names_every_argument(&call.generic_args)) {
                 const spec_tmpl: const TemplateEntry* = this.spelling_template(ident.res);
                 if (spec_tmpl != null && spec_tmpl.kind == TemplateKind::Function) {
                     // A function template's instance: its placeholder with
@@ -1362,7 +1369,7 @@ type struct CallResolver {
             // its receiver has, so this is where the method it chose is gated.
             this.member.enforce_method_visibility(selected.chosen,
                 if (callee_member.member_span.has_location()) { callee_member.member_span } else { callee.span });
-            if (this.method_call_type_arguments_excess(callee_member, selected.chosen)) {
+            if (this.method_call_type_argument_count_refused(callee_member, selected.chosen)) {
                 return TypeRef::invalid();
             }
             this.check_method_call_arg_types(visitor, call_e, call, callee_member, selected.chosen);
@@ -1909,7 +1916,11 @@ type struct CallResolver {
     /// Invalid when not a generic free call, a binding stays abstract, or a
     /// diagnostic fired.  `resolved_callee` is left unpinned (mono specializes).
 
-    check_generic_free_call(mut &this, call_e: ExpressionNode*, call: mut CallExpr*, ident: IdentifierExpr*) -> TypeRef {
+    /// `refused` is set when the call is refused for its type arguments
+    /// themselves - their count, or one nothing binds - and so has no type
+    /// to be checked by.
+    check_generic_free_call(mut &this, call_e: ExpressionNode*, call: mut CallExpr*, ident: IdentifierExpr*,
+                            refused: mut &boolean) -> TypeRef {
         const entry: const TemplateEntry* = this.find_fn_template_for_call(ident, call.arguments.length());
         if (entry == null) { return TypeRef::invalid(); }
         const tmpl_decl: DeclarationNode* = entry.ast_node;
@@ -1923,21 +1934,35 @@ type struct CallResolver {
         mut bindings: [TypeRef] = [];
         for (mut i: i64 = 0; i < entry.param_types.length(); i++) { bindings.push(TypeRef::invalid()); }
 
+        // The turbofish binds what it writes; with none written, or for each
+        // `_`, the arguments bind the rest.
+        if (this.type_argument_count_refused(&call.generic_args, &tmpl.generic_params,
+                this.intern.resolve(tmpl.name), call_e.span)) {
+            *refused = true;
+            return TypeRef::invalid();
+        }
         if (call.generic_args.length() > 0) {
-            mut rc: ResolutionContext = ResolutionContext::new("");
-            this.symbolic.symbolic_bind_params(&rc);
-            mut n: i64 = call.generic_args.length();
-            if (n > bindings.length()) { n = bindings.length(); }
-            for (mut i: i64 = 0; i < n; i++) {
-                const tr: TypeRef = this.ctx.type_resolver.resolve(call.generic_args[i], &rc);
-                if (tr.is_valid()) { bindings[i] = tr; }
+            // A written argument the name layer refused was reported where
+            // it is written, and the call has no instance to be typed by.
+            for (mut i: i64 = 0; i < call.generic_args.length(); i++) {
+                if (!TypeAnnotation::is_inferred(call.generic_args[i]) && TypeAnnotation::refused(call.generic_args[i])) {
+                    *refused = true;
+                    return TypeRef::invalid();
+                }
             }
-        } else {
+            const written: [TypeRef] = this.resolve_turbofish(&call.generic_args);
+            for (mut i: i64 = 0; i < written.length() && i < bindings.length(); i++) { bindings[i] = written[i]; }
+        }
+        if (!TypeAnnotation::names_every_argument(&call.generic_args)) {
             if (tmpl.parameters.length() != call.arguments.length()) { return TypeRef::invalid(); }
-            const inference: CallInference = this.infer_call_bindings(call, entry, tmpl_decl);
-            if (inference.conflict_argument < 0 && !inference.all_bound() && tmpl.is_implicit
-                    && call.arguments.length() == 0 && !this.state.expected_type.is_valid()) {
-                this.emit_free_cannot_infer(call_e, call, tmpl.name);
+            const inference: CallInference = this.infer_call_bindings(call, entry, tmpl_decl, &bindings);
+            if (inference.conflict_argument < 0 && !inference.all_bound() && call.arguments.length() == 0) {
+                if (tmpl.is_implicit && !this.state.expected_type.is_valid()) {
+                    this.emit_free_cannot_infer(call_e, call, tmpl.name);
+                } else {
+                    this.report_unbound_type_parameter(call_e, &call.generic_args, tmpl, &inference.bindings);
+                    *refused = true;
+                }
                 return TypeRef::invalid();
             }
             if (this.failed_inference_reported(call_e, call, entry, &inference) || !inference.all_bound()) {
@@ -2343,17 +2368,18 @@ type struct CallResolver {
     }
 
     /// The type arguments the arguments of `call` bind, one per parameter of
-    /// the generic function `tmpl_decl`; empty when the arguments conflict
+    /// the generic function `tmpl_decl`, with the ones `written` already
+    /// bound (`infer_call_bindings`); empty when the arguments conflict
     /// or leave one unbound.  Reports nothing: for the readers that ask
     /// whether a function fits a call, and for the paths whose call is
     /// reported where its arguments are checked.
     infer_free_call_bindings(mut &this, call: CallExpr*, entry: const TemplateEntry*,
-                             tmpl_decl: DeclarationNode*) -> [TypeRef] {
+                             tmpl_decl: DeclarationNode*, written: &[TypeRef]) -> [TypeRef] {
         const tmpl: FunctionDecl* = DeclarationNode::fn_of(tmpl_decl);
         mut empty: [TypeRef] = [];
         if (entry.param_types.length() == 0) { return empty; }
         if (tmpl.parameters.length() != call.arguments.length()) { return empty; }
-        const inference: CallInference = this.infer_call_bindings(call, entry, tmpl_decl);
+        const inference: CallInference = this.infer_call_bindings(call, entry, tmpl_decl, written);
         if (inference.conflict_argument >= 0 || !inference.all_bound()) { return empty; }
         return inference.bindings;
     }
@@ -2370,13 +2396,18 @@ type struct CallResolver {
     /// concrete expected type through the return; a polymorphic literal
     /// adopts the type its parameter was given, or binds it; the where-bound
     /// projection again for what the literals bound.  The arity is the
-    /// caller's to have checked.
+    /// caller's to have checked.  `written` holds what the call's own type
+    /// arguments bind, one per parameter and invalid for each `_`, or is
+    /// empty when it writes none; the arguments must agree with it.
     infer_call_bindings(mut &this, call: CallExpr*, entry: const TemplateEntry*,
-                        tmpl_decl: DeclarationNode*) -> CallInference {
+                        tmpl_decl: DeclarationNode*, written: &[TypeRef]) -> CallInference {
         const tmpl: FunctionDecl* = DeclarationNode::fn_of(tmpl_decl);
         mut pids: [TypeRef] = [];
         for (mut i: i64 = 0; i < entry.param_types.length(); i++) { pids.push(entry.param_types[i]); }
         mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
+        for (mut i: i64 = 0; i < written.length(); i++) {
+            if (written[i].is_valid()) { ictx.bind_slot(i, written[i]); }
+        }
         mut inference: CallInference = CallInference::new();
 
         for (mut i: i64 = 0; i < call.arguments.length(); i++) {
@@ -2401,6 +2432,8 @@ type struct CallResolver {
                 inference.conflict_argument = i;
                 inference.conflict_from = ictx.conflict_from;
                 inference.conflict_to = ictx.conflict_to;
+                const slot: i64 = ictx.binding_index(param.resolved_type);
+                inference.conflict_written = slot >= 0 && slot < written.length() && written[slot].is_valid();
                 return inference;
             }
             if (!fits && !ictx.conflict_from.is_valid()) {
@@ -2439,6 +2472,7 @@ type struct CallResolver {
                     inference.conflict_argument = i;
                     inference.conflict_from = bnd;
                     inference.conflict_to = this.literal_slot(lit_actual, arg);
+                    inference.conflict_written = f_idx < written.length() && written[f_idx].is_valid();
                     return inference;
                 }
                 continue;
@@ -2483,17 +2517,13 @@ type struct CallResolver {
                            entry: const TemplateEntry*, tmpl_decl: DeclarationNode*) -> [TypeRef] {
         mut targs: &[mut TypeAnnotation*] = &call.generic_args;
         if (targs.length() == 0 && scope != null && scope.generic_args.length() > 0) { targs = &scope.generic_args; }
-        if (targs.length() == 0) { return this.infer_free_call_bindings(call, entry, tmpl_decl); }
-        mut binds: [TypeRef] = [];
-        if (targs.length() != entry.param_types.length()) { return binds; }
-        mut rc: ResolutionContext = ResolutionContext::new("");
-        this.symbolic.symbolic_bind_params(&rc);
-        for (mut i: i64 = 0; i < targs.length(); i++) {
-            const tr: TypeRef = this.ctx.type_resolver.resolve(targs[i], &rc);
-            if (!tr.is_valid()) { return []; }
-            binds.push(tr);
-        }
-        return binds;
+        const none: [TypeRef] = [];
+        if (targs.length() == 0) { return this.infer_free_call_bindings(call, entry, tmpl_decl, &none); }
+        if (targs.length() != entry.param_types.length()) { return []; }
+        const written: [TypeRef] = this.resolve_turbofish(targs);
+        if (written.length() != targs.length()) { return []; }
+        if (TypeAnnotation::names_every_argument(targs)) { return written; }
+        return this.infer_free_call_bindings(call, entry, tmpl_decl, &written);
     }
 
     emit_free_call_bound_failure(mut &this, at: SourceSpan, tmpl_decl: DeclarationNode*,
@@ -2540,7 +2570,7 @@ type struct CallResolver {
         const tmpl: FunctionDecl* = DeclarationNode::fn_of(entry.ast_node);
         if (inference.conflict_argument >= 0) {
             this.emit_free_infer_conflict(call_e, call, tmpl.name, call.arguments[inference.conflict_argument],
-                inference.conflict_from, inference.conflict_to);
+                inference.conflict_from, inference.conflict_to, inference.conflict_written);
             return true;
         }
         if (inference.all_bound() || call.arguments.length() == 0) { return false; }
@@ -2578,8 +2608,41 @@ type struct CallResolver {
         this.ctx.emit_diagnostic(d);
     }
 
+    /// E0307 at a call with no arguments whose type parameter nothing binds:
+    /// not its type arguments, which leave it to inference with `_` or by
+    /// writing none, and not the type its result is expected to have.  The
+    /// first such parameter is reported, at its `_` where one is written.
+    report_unbound_type_parameter(mut &this, call_e: ExpressionNode*, written: &[mut TypeAnnotation*],
+                                  tmpl: FunctionDecl*, bindings: &[TypeRef]) -> void {
+        mut open: i64 = -1;
+        for (mut i: i64 = 0; i < bindings.length() && i < tmpl.generic_params.length(); i++) {
+            if (!bindings[i].is_valid()) { open = i; break; }
+        }
+        if (open < 0) { return; }
+        const fn_str: string = this.intern.resolve(tmpl.name);
+        mut names: string = "";
+        for (mut i: i64 = 0; i < tmpl.generic_params.length(); i++) {
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(tmpl.generic_params[i]);
+            if (i > 0) { names = names + ", "; }
+            names = names + if (gp != null) { this.intern.resolve(gp.name) } else { "_" };
+        }
+        const open_param: GenericParamDecl* = DeclarationNode::generic_param_of(tmpl.generic_params[open]);
+        const open_name: string = if (open_param != null) { this.intern.resolve(open_param.name) } else { "?" };
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
+            fmt::format("cannot infer the type argument `%s` for `%s`", open_name, fn_str));
+        if (open < written.length()) {
+            d = d.at_with_label(annotation_span(written[open]), "nothing in the call says which type this is");
+            d = d.help("the call has no arguments to infer it from; write the type in place of `_`");
+        } else {
+            d = d.at_with_label(call_e.span, "nothing in the call says which type it is");
+            d = d.help(fmt::format("the call has no arguments to infer it from; write the type arguments, `%s::<%s>()`",
+                fn_str, names));
+        }
+        this.ctx.emit_diagnostic(d);
+    }
+
     emit_free_infer_conflict(mut &this, call_e: ExpressionNode*, call: CallExpr*, fn_name: SymbolStr,
-                             arg: ExpressionNode*, bound: TypeRef, got: TypeRef) -> void {
+                             arg: ExpressionNode*, bound: TypeRef, got: TypeRef, written: boolean) -> void {
         const fn_str:    string = this.intern.resolve(fn_name);
         const bound_str: string = this.types.type_display_name(bound);
         const got_str:   string = this.types.type_display_name(got);
@@ -2588,7 +2651,13 @@ type struct CallResolver {
             fmt::format("conflicting types for the type parameter of `%s`", fn_str));
         const anchor: SourceSpan = if (arg != null && arg.span.has_location()) { arg.span } else { call_e.span };
         d = d.at_with_label(anchor,
-            fmt::format("expected `%s` (inferred from an earlier argument), found `%s`", bound_str, got_str));
+            fmt::format("expected `%s` (%s), found `%s`", bound_str,
+                if (written) { "written in the call's type arguments" } else { "inferred from an earlier argument" },
+                got_str));
+        if (written) {
+            d = d.help(fmt::format("change the written type argument to `%s`, or write `_` there to infer it from the arguments",
+                got_str));
+        }
         d = d.with_note(fmt::format("a single type parameter cannot be both `%s` and `%s`", bound_str, got_str));
         this.ctx.emit_diagnostic(d);
     }
@@ -4707,7 +4776,9 @@ type struct CallResolver {
             if (targs.length() != func.generic_params.length()) { return sema_copy_type_refs(params); }
             const explicit: [TypeRef] = this.resolve_turbofish(targs);
             if (explicit.length() != targs.length()) { return sema_copy_type_refs(params); }
-            for (mut i: i64 = 0; i < explicit.length(); i++) { ictx.bind_slot(i, explicit[i]); }
+            for (mut i: i64 = 0; i < explicit.length(); i++) {
+                if (explicit[i].is_valid()) { ictx.bind_slot(i, explicit[i]); }
+            }
         }
         for (mut i: i64 = 0; i < decl.length() && i < call.arguments.length(); i++) {
             const arg: ExpressionNode* = call.arguments[i];
@@ -5285,15 +5356,17 @@ type struct CallResolver {
             if (targs.length() == 0 && callee_node != null && ExpressionNode::member_access_of(callee_node) != null) {
                 targs = &ExpressionNode::member_access_of(call.callee).generic_args;
             }
-            // More type arguments than the method has parameters are the
-            // call's error, not the candidate's: it binds by its arguments
-            // alone, as a method with none does, and once selected is
-            // refused for the excess (`method_call_type_arguments_excess`).
-            if (targs.length() > 0 && targs.length() <= n_own) {
-                if (targs.length() != n_own) { return false; }
+            // A list that does not write one argument for each parameter is
+            // the call's error, not the candidate's: it binds by its
+            // arguments alone, as a method with none does, and once selected
+            // is refused for the count (`method_call_type_argument_count_refused`).
+            // A `_` binds nothing here; the arguments bind it.
+            if (targs.length() == n_own) {
                 const explicit: [TypeRef] = this.resolve_turbofish(targs);
                 if (explicit.length() != targs.length()) { return false; }
-                for (mut i: i64 = 0; i < explicit.length(); i++) { ictx.bind_slot(i, explicit[i]); }
+                for (mut i: i64 = 0; i < explicit.length(); i++) {
+                    if (explicit[i].is_valid()) { ictx.bind_slot(i, explicit[i]); }
+                }
             }
         }
         for (mut pi: i64 = 0; pi < fixed; pi++) {
@@ -5600,7 +5673,7 @@ type struct CallResolver {
             // its methods and solved with them, so `this[i]`'s `I::Output*`
             // reduces to the element here; left unbound, the projection would
             // type the call as anything.
-            if (mret.is_valid() && member.generic_args.length() > 0) {
+            if (mret.is_valid() && TypeAnnotation::names_every_argument(&member.generic_args)) {
                 mret = this.binding.resolve_method_return_with_explicit_args(obj_type, member, selected.chosen, mret);
             } else if (mret.is_valid() && call.resolved_type_args.length() > 0) {
                 mret = this.binding.resolve_generic_method_return(obj_type, member, call, selected.chosen, mret);
@@ -5649,7 +5722,7 @@ type struct CallResolver {
             // registered nowhere, so there is no entry to read it from.
             mut dir: BoundDirection = BoundDirection::none();
             const on_instantiation: boolean = this.types.peel_to_instantiation(obj_type) != null;
-            const abs_ret: TypeRef = if (member.generic_args.length() > 0 && on_instantiation) {
+            const abs_ret: TypeRef = if (TypeAnnotation::names_every_argument(&member.generic_args) && on_instantiation) {
                 this.binding.resolve_method_return_with_explicit_args(obj_type, member, selected.chosen,
                     TypeRef::invalid())
             } else {
@@ -5762,7 +5835,7 @@ type struct CallResolver {
             DeclarationNode::fn_of(named.func).resolved_return_type
         } else { TypeRef::invalid() } };
         if (ret.is_valid() && !proj_blocked) {
-            const refined: TypeRef = if (member.generic_args.length() > 0) {
+            const refined: TypeRef = if (TypeAnnotation::names_every_argument(&member.generic_args)) {
                 this.binding.resolve_method_return_with_explicit_args(obj_type, member, named_decl, ret)
             } else {
                 this.types.subst_owner_params_from_receiver(obj_type, ret)
@@ -7130,7 +7203,7 @@ type struct CallResolver {
         if (params.length() != entry.param_types.length()) { return TypeRef::invalid(); }
         mut bindings: [TypeRef] = [];
         for (mut i: i64 = 0; i < params.length(); i++) { bindings.push(TypeRef::invalid()); }
-        if (written.length() > 0) {
+        if (TypeAnnotation::names_every_argument(written)) {
             // The written arguments, defaults filled, as the template's
             // instantiation they name.
             const named: TypeRef = this.resolve_generic_scope_type(entry.base_type, written, span);
@@ -7138,6 +7211,14 @@ type struct CallResolver {
             const resolved: [TypeRef] = this.types.view_type_args_copy(named);
             for (mut i: i64 = 0; i < bindings.length() && i < resolved.length(); i++) { bindings[i] = resolved[i]; }
         } else {
+            // What the turbofish writes is bound; the expected function type
+            // binds the rest - every argument with none written, or each `_`.
+            if (written.length() > 0) {
+                if (written.length() != params.length()) { return TypeRef::invalid(); }
+                const seeds: [TypeRef] = this.resolve_turbofish(written);
+                if (seeds.length() != written.length()) { return TypeRef::invalid(); }
+                for (mut i: i64 = 0; i < seeds.length(); i++) { bindings[i] = seeds[i]; }
+            }
             const expected: TypeRef = this.state.expected_type;
             mut et: Type* = null;
             if (expected.is_valid()) { et = this.arena.lookup(expected); }
@@ -7146,6 +7227,9 @@ type struct CallResolver {
                 mut pids: [TypeRef] = [];
                 for (mut i: i64 = 0; i < params.length(); i++) { pids.push(params[i]); }
                 mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
+                for (mut i: i64 = 0; i < bindings.length(); i++) {
+                    if (bindings[i].is_valid()) { ictx.bind_slot(i, bindings[i]); }
+                }
                 ictx.unify(sig, expected);
                 for (mut i: i64 = 0; i < bindings.length(); i++) { bindings[i] = ictx.bindings[i]; }
             }
@@ -7178,18 +7262,19 @@ type struct CallResolver {
         this.ctx.emit_diagnostic(d);
     }
 
-    /// E0307 when a method call writes more type arguments than the method
-    /// `chosen` has type parameters of its own (`s.area::<i32>()` on a
-    /// method that has none), as a call through an object and a method
-    /// taken as a value are refused; true when it is reported.
-    method_call_type_arguments_excess(mut &this, member: MemberAccessExpr*, chosen: DeclarationNode*) -> boolean {
+    /// E0307 when a method call writes type arguments and not one for each
+    /// type parameter the method `chosen` has of its own: more
+    /// (`s.area::<i32>()` on a method that has none), as a call through an
+    /// object and a method taken as a value are refused, or fewer
+    /// (`c.map::<i64>(f)` for `map<U, F>`); true when it is reported.
+    method_call_type_argument_count_refused(mut &this, member: MemberAccessExpr*, chosen: DeclarationNode*) -> boolean {
         if (member.generic_args.length() == 0 || chosen == null) { return false; }
         mut func: FunctionDecl* = DeclarationNode::fn_of(chosen);
         if (func == null) {
             const method: MethodDecl* = DeclarationNode::method_of(chosen);
             if (method != null) { func = DeclarationNode::fn_of(method.func); }
         }
-        if (func == null || member.generic_args.length() <= func.generic_params.length()) { return false; }
+        if (func == null) { return false; }
         mut receiver_type: TypeRef = member.object.resolved_type;
         while (this.types.peel_indirection(receiver_type).is_valid()) {
             receiver_type = this.types.peel_indirection(receiver_type);
@@ -7197,9 +7282,55 @@ type struct CallResolver {
         const receiver: Type* = this.arena.lookup(receiver_type);
         const owner: string = if (receiver != null) { this.arena.format_display(receiver) } else { "?" };
         const at: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.object.span };
-        this.report_excess_type_arguments(fmt::format("%s::%s", owner, this.intern.resolve(member.member)).into_raw(),
-            func.generic_params.length(), member.generic_args.length(), at);
+        return this.type_argument_count_refused(&member.generic_args, &func.generic_params,
+            fmt::format("%s::%s", owner, this.intern.resolve(member.member)).into_raw(), at);
+    }
+
+    /// E0307 when a call or path writes type arguments for `params`, the
+    /// callee's type parameters, and does not write one for each: more than
+    /// there are parameters, or fewer than there are parameters with no
+    /// default.  A call writes every argument or none, `_` standing for one
+    /// it leaves to inference, so the fix for too few is to add a `_` for
+    /// each missing one.  True when it is reported; nothing written is
+    /// never refused.
+    type_argument_count_refused(mut &this, written: &[mut TypeAnnotation*], params: &[DeclarationNode*],
+                                shown: string, span: SourceSpan) -> boolean {
+        if (written.length() == 0) { return false; }
+        mut required: i64 = 0;
+        for (mut i: i64 = 0; i < params.length(); i++) {
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(params[i]);
+            if (gp != null && !gp.has_default_annotation()) { required = i + 1; }
+        }
+        if (written.length() > params.length()) {
+            this.report_excess_type_arguments(shown, params.length(), written.length(), span);
+            return true;
+        }
+        if (written.length() >= required) { return false; }
+        this.report_missing_type_arguments(shown, required, written, span);
         return true;
+    }
+
+    /// E0307 for fewer type arguments written on `shown` than its `required`
+    /// type parameters, with the edit that writes `_` for each one missing.
+    report_missing_type_arguments(mut &this, shown: string, required: i64, written: &[mut TypeAnnotation*],
+                                  span: SourceSpan) -> void {
+        const missing: i64 = required - written.length();
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
+            fmt::format("`%s` has %lld type parameter%s, and %lld type argument%s %s written", shown,
+                required, if (required == 1) { "" } else { "s" },
+                written.length(), if (written.length() == 1) { "" } else { "s" },
+                if (written.length() == 1) { "is" } else { "are" }));
+        d = d.at_with_label(span, "too few type arguments");
+        d = d.help("a call writes all of its type arguments or none of them; `_` leaves one to be inferred");
+        mut placeholders: string = "";
+        for (mut i: i64 = 0; i < missing; i++) { placeholders = placeholders + ", _"; }
+        const last: SourceSpan = annotation_span(written[written.length() - 1]);
+        if (last.has_location()) {
+            d = d.suggest(Suggestion::machine_applicable(last.end_point(), placeholders,
+                if (missing == 1) { "add `, _` to let the remaining type argument be inferred" }
+                else { "add `, _` for each remaining type argument to let them be inferred" }));
+        }
+        this.ctx.emit_diagnostic(d);
     }
 
     /// E0307 for more type arguments written on `shown` than its
@@ -7357,16 +7488,16 @@ type struct CallResolver {
         const shown: string = fmt::format("%s::%s",
             this.intern.resolve(scope.scope_name), this.intern.resolve(scope.member_name)).into_raw();
         const with_args: string = fmt::format("%s::<...>", shown).into_raw();
-        if (scope.generic_args.length() > 0) {
-            mut rc: ResolutionContext = ResolutionContext::new("");
-            this.symbolic.symbolic_bind_params(&rc);
-            for (mut i: i64 = 0; i < scope.generic_args.length() && i < bindings.length(); i++) {
-                const tr: TypeRef = this.ctx.type_resolver.resolve(scope.generic_args[i], &rc);
-                if (!tr.is_valid()) { return TypeRef::invalid(); }
-                bindings[i] = tr;
-            }
+        if (this.type_argument_count_refused(&scope.generic_args,
+                &DeclarationNode::fn_of(DeclarationNode::method_of(node).func).generic_params, shown, scope_e.span)) {
+            return TypeRef::invalid();
         }
-        if (scope.generic_args.length() == 0 || owner_unbound) {
+        if (scope.generic_args.length() > 0) {
+            const written: [TypeRef] = this.resolve_turbofish(&scope.generic_args);
+            if (written.length() != scope.generic_args.length()) { return TypeRef::invalid(); }
+            for (mut i: i64 = 0; i < written.length() && i < bindings.length(); i++) { bindings[i] = written[i]; }
+        }
+        if (!TypeAnnotation::names_every_argument(&scope.generic_args) || owner_unbound) {
             const expected: TypeRef = this.state.expected_type;
             mut et: Type* = null;
             if (expected.is_valid()) { et = this.arena.lookup(expected); }
@@ -7406,10 +7537,6 @@ type struct CallResolver {
             if (bindings[i].is_valid()) { continue; }
             this.report_uninferable_value(this.intern.resolve(DeclarationNode::generic_param_of(DeclarationNode::fn_of(DeclarationNode::method_of(node).func).generic_params[i]).name),
                 shown, with_args, scope_e.span);
-            return TypeRef::invalid();
-        }
-        if (scope.generic_args.length() > bindings.length()) {
-            this.report_excess_type_arguments(shown, bindings.length(), scope.generic_args.length(), scope_e.span);
             return TypeRef::invalid();
         }
         this.check_call_where_bounds(scope_e.span, DeclarationNode::method_of(node).func, &syms, &bindings);
@@ -8382,8 +8509,8 @@ type struct CallResolver {
         // resolves the return, and leaves the callee UNPINNED for mono to specialize
         // (specialize_static_method_on_generic_owner).  Handled before the
         // owner-only stash / DI-return branches below, which bail on generic methods.
-        const gsm_ret: TypeRef = this.try_resolve_generic_static_method(scope, call_e, call);
-        if (gsm_ret.is_valid()) { return gsm_ret; }
+        const gsm_ret: TypeRef = this.try_resolve_generic_static_method(scope, call_e, call, claimed);
+        if (gsm_ret.is_valid() || *claimed) { return gsm_ret; }
         // A GENERIC static method on a NON-generic owner (`Bo::drive<F, R>`) is
         // registered as its OWN function template keyed `Owner::method`
         // (register_static_method_templates), so it resolves like a free function:
@@ -8621,13 +8748,22 @@ type struct CallResolver {
         const tmpl: FunctionDecl* = DeclarationNode::fn_of(tmpl_decl);
         if (tmpl == null || !tmpl.resolved_return_type.is_valid()) { return TypeRef::invalid(); }
 
-        // The method's own type args: explicit turbofish (on the member or,
-        // as a fallback, the scope), else argument inference + where-bound
-        // projection (the free-function inference, which runs PASS D).
+        // The method's own type args: the turbofish (on the member or, as a
+        // fallback, the scope) binds what it writes, and argument inference
+        // + where-bound projection (the free-function inference, which runs
+        // PASS D) binds the rest - all of them, or each `_`.
         mut binds: [TypeRef] = [];
-        if (call.generic_args.length() == 0 && scope.generic_args.length() == 0) {
+        mut targs: &[mut TypeAnnotation*] = &call.generic_args;
+        if (targs.length() == 0) { targs = &scope.generic_args; }
+        if (this.type_argument_count_refused(targs, &tmpl.generic_params,
+                fmt::format("%s::%s", this.intern.resolve(scope.scope_name), this.intern.resolve(scope.member_name)).into_raw(),
+                call_e.span)) {
+            return TypeRef::invalid();
+        }
+        if (!TypeAnnotation::names_every_argument(targs)) {
             if (tmpl.parameters.length() != call.arguments.length()) { return TypeRef::invalid(); }
-            const inference: CallInference = this.infer_call_bindings(call, entry, tmpl_decl);
+            const written: [TypeRef] = this.resolve_turbofish(targs);
+            const inference: CallInference = this.infer_call_bindings(call, entry, tmpl_decl, &written);
             if (this.failed_inference_reported(call_e, call, entry, &inference)) { return TypeRef::invalid(); }
             for (mut i: i64 = 0; i < inference.bindings.length(); i++) { binds.push(inference.bindings[i]); }
         } else {
@@ -8915,7 +9051,7 @@ type struct CallResolver {
     /// to the non-generic static paths) unless `scope` is a registered generic owner
     /// and the method the path records has type parameters that fully infer.
     try_resolve_generic_static_method(mut &this, scope: ScopeResolutionExpr*,
-                                      call_e: ExpressionNode*, call: mut CallExpr*) -> TypeRef {
+                                      call_e: ExpressionNode*, call: mut CallExpr*, claimed: mut boolean*) -> TypeRef {
         if (call == null || scope == null) { return TypeRef::invalid(); }
         mut tmpl: const TemplateEntry* =
             this.resolve_scope_owner_template(scope);
@@ -8938,6 +9074,14 @@ type struct CallResolver {
         // Infer the method's OWN `<T>` (turbofish -> argument types).  Inside a
         // generic body either argument list may name the body's parameters;
         // each copy of the body concretizes the stash.
+        mut written_method_args: &[mut TypeAnnotation*] = &call.generic_args;
+        if (written_method_args.length() == 0) { written_method_args = &scope.generic_args; }
+        if (this.type_argument_count_refused(written_method_args, &func.generic_params,
+                fmt::format("%s::%s", this.intern.resolve(scope.scope_name), this.intern.resolve(scope.member_name)).into_raw(),
+                call_e.span)) {
+            *claimed = true;
+            return TypeRef::invalid();
+        }
         mut method_binds: [TypeRef] = this.infer_generic_method_bindings(call, scope, func_decl);
         if (method_binds.length() != func.generic_params.length()) { return TypeRef::invalid(); }
         for (mut i: i64 = 0; i < method_binds.length(); i++) {
@@ -9012,19 +9156,20 @@ type struct CallResolver {
         return true;
     }
 
-    /// Infer a generic METHOD's own type args from an explicit turbofish
-    /// (`make<i32>(..)`) or, failing that, from the argument types - the method
-    /// analogue of `infer_free_call_bindings`.  Returns a length-`generic_params`
-    /// all-valid array, or `[]` when inference is incomplete.
     /// A call's explicit type arguments, resolved as the caller wrote them,
-    /// with the enclosing body's generic parameters in scope; `[]` when any
-    /// fails to resolve.
+    /// with the enclosing body's generic parameters in scope, one per
+    /// argument: invalid for a `_`, which the call infers; `[]` when a
+    /// written one fails to resolve.
     resolve_turbofish(mut &this, targs: &[mut TypeAnnotation*]) -> [TypeRef] {
         mut empty: [TypeRef] = [];
         mut rc: ResolutionContext = ResolutionContext::new("");
         this.symbolic.symbolic_bind_params(&rc);
         mut binds: [TypeRef] = [];
         for (mut i: i64 = 0; i < targs.length(); i++) {
+            if (TypeAnnotation::is_inferred(targs[i])) {
+                binds.push(TypeRef::invalid());
+                continue;
+            }
             const tr: TypeRef = this.ctx.type_resolver.resolve(targs[i], &rc);
             if (!tr.is_valid()) { return empty; }
             binds.push(tr);
@@ -9032,6 +9177,12 @@ type struct CallResolver {
         return binds;
     }
 
+    /// Infer a generic METHOD's own type args - the method analogue of
+    /// `infer_free_call_bindings`: the turbofish (`make::<i32>(..)`) binds
+    /// what it writes, and a `_` in it is inferred from the argument types
+    /// as an unwritten list's arguments are.  Returns a length-`generic_params`
+    /// all-valid array, or `[]` when inference is incomplete or the list
+    /// does not write one argument for each parameter.
     infer_generic_method_bindings(mut &this, call: CallExpr*, scope: ScopeResolutionExpr*,
                                   func_decl: DeclarationNode*) -> [TypeRef] {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
@@ -9049,13 +9200,19 @@ type struct CallResolver {
         // Explicit turbofish on the member (`Wrap::make<i32>(..)`).
         mut targs: &[mut TypeAnnotation*] = &call.generic_args;
         if (targs.length() == 0 && scope.generic_args.length() > 0) { targs = &scope.generic_args; }
+        mut written: [TypeRef] = [];
         if (targs.length() > 0) {
             if (targs.length() != n) { return empty; }
-            return this.resolve_turbofish(targs);
+            written = this.resolve_turbofish(targs);
+            if (written.length() != n) { return empty; }
+            if (TypeAnnotation::names_every_argument(targs)) { return written; }
         }
         // Inference from concrete argument types.
         if (func.parameters.length() != call.arguments.length()) { return empty; }
         mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
+        for (mut i: i64 = 0; i < written.length(); i++) {
+            if (written[i].is_valid()) { ictx.bind_slot(i, written[i]); }
+        }
         for (mut i: i64 = 0; i < call.arguments.length(); i++) {
             const param_decl: DeclarationNode* = func.parameters[i];
             const param: VarDecl* = DeclarationNode::var_of(param_decl);
@@ -9223,7 +9380,8 @@ type struct CallResolver {
     /// solely to detect the case, then emits E0307 (an unannotated literal is no
     /// longer accepted as the sole source for a generic owner's type argument).
     infer_static_owner_bindings_from_args(mut &this, tmpl: const TemplateEntry*, func_decl: DeclarationNode*,
-                                          call: CallExpr*, allow_literal_default: boolean) -> [TypeRef] {
+                                          call: CallExpr*, allow_literal_default: boolean,
+                                          seeds: &[TypeRef]) -> [TypeRef] {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return []; }
         if (tmpl.param_types.length() == 0) { return []; }
@@ -9231,6 +9389,9 @@ type struct CallResolver {
         mut pids: [TypeRef] = [];
         for (mut i: i64 = 0; i < tmpl.param_types.length(); i++) { pids.push(tmpl.param_types[i]); }
         mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
+        for (mut i: i64 = 0; i < seeds.length(); i++) {
+            if (seeds[i].is_valid()) { ictx.bind_slot(i, seeds[i]); }
+        }
         // Pass 1: bind from concrete (non-literal, non-null) argument types.
         for (mut i: i64 = 0; i < func.parameters.length(); i++) {
             const p_decl: DeclarationNode* = func.parameters[i];
@@ -9288,7 +9449,7 @@ type struct CallResolver {
     /// narrow base-equality expected-type source can't.  Returns a length-`want`
     /// all-bound binding set (declaration order) or `[]`.
     infer_static_owner_bindings_from_expected(mut &this, tmpl: const TemplateEntry*,
-                                              func_decl: DeclarationNode*) -> [TypeRef] {
+                                              func_decl: DeclarationNode*, seeds: &[TypeRef]) -> [TypeRef] {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return []; }
         if (tmpl.param_types.length() == 0) { return []; }
@@ -9300,6 +9461,9 @@ type struct CallResolver {
         mut pids: [TypeRef] = [];
         for (mut i: i64 = 0; i < tmpl.param_types.length(); i++) { pids.push(tmpl.param_types[i]); }
         mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
+        for (mut i: i64 = 0; i < seeds.length(); i++) {
+            if (seeds[i].is_valid()) { ictx.bind_slot(i, seeds[i]); }
+        }
         // formal = abstract (carries owner params), actual = the expected type.
         if (!ictx.unify(abstract_ret, this.state.expected_type)) { return []; }
         mut bindings: [TypeRef] = [];
@@ -9379,7 +9543,11 @@ type struct CallResolver {
         // (LLVM-illegal `getelementptr(void,..)`) or a polymorphic-literal arg
         // tripping the literal-default diagnostic (a spurious E0307 on an
         // explicitly-typed `Atomic<u64>::new(0)`).
-        if (scope.scope_generic_args.length() > 0) {
+        // A turbofish with a `_` binds what it writes, and every source below
+        // must keep those (`seeds`, invalid at each `_`); the inference sources
+        // start from them.
+        mut seeds: [TypeRef] = [];
+        if (TypeAnnotation::names_every_argument(&scope.scope_generic_args)) {
             mut rc: ResolutionContext = ResolutionContext::new("");
             this.symbolic.symbolic_bind_params(&rc);
             mut sb: [TypeRef] = [];
@@ -9395,11 +9563,14 @@ type struct CallResolver {
                 sb = this.ctx.type_resolver.expand_default_type_args(tmpl, sb, &rc);
             }
             if (ok && sb.length() == want) { return sb; }
+        } else if (scope.scope_generic_args.length() > 0) {
+            seeds = this.resolve_turbofish(&scope.scope_generic_args);
+            if (seeds.length() != scope.scope_generic_args.length()) { return []; }
         }
 
         // 1. Inferred from CONCRETE argument types (no literal-default guess yet).
         // Returns a length-`want` all-bound set or `[]`.
-        const ib: [TypeRef] = this.infer_static_owner_bindings_from_args(tmpl, func_decl, call, false);
+        const ib: [TypeRef] = this.infer_static_owner_bindings_from_args(tmpl, func_decl, call, false, &seeds);
         if (ib.length() == want) { return ib; }
 
         // 1b. Unify the method's ABSTRACT return type against the expected type to
@@ -9409,7 +9580,7 @@ type struct CallResolver {
         // - its owner param `T` is in no parameter, only in the annotation
         // `Result<Array<u64,GlobalAlloc>, E>`, so structural unification of the
         // declared return against the expected type is the only source.
-        const eb_unify: [TypeRef] = this.infer_static_owner_bindings_from_expected(tmpl, func_decl);
+        const eb_unify: [TypeRef] = this.infer_static_owner_bindings_from_expected(tmpl, func_decl, &seeds);
         if (eb_unify.length() == want) { return eb_unify; }
 
         // 2. Expected-type derived (e.g. `const s: &Slice<i32> = Slice::from_raw(..)`).
@@ -9425,7 +9596,8 @@ type struct CallResolver {
             if (this.types.view_generic_base(exp_ref_s).equals(tmpl.base_type)
                     && this.types.view_type_arg_count(exp_ref_s) == want
                     && this.symbolic.symbolic_type_concretizable(exp_ref_s)) {
-                return this.types.view_type_args_copy(exp_ref_s);
+                const expected_args: [TypeRef] = this.types.view_type_args_copy(exp_ref_s);
+                if (CallResolver::keeps_written(&expected_args, &seeds)) { return expected_args; }
             }
         }
 
@@ -9454,7 +9626,7 @@ type struct CallResolver {
                 for (mut i: i64 = 0; i < filled.length(); i++) {
                     if (!this.symbolic.symbolic_type_concretizable(filled[i])) { all_ok = false; break; }
                 }
-                if (all_ok) { return filled; }
+                if (all_ok && CallResolver::keeps_written(&filled, &seeds)) { return filled; }
             }
         }
 
@@ -9469,7 +9641,7 @@ type struct CallResolver {
         // not cascade; the emitted error aborts the build.  Single-fire: `stash_*`
         // sets `resolved_type_args` from these bindings, so its idempotency guard
         // short-circuits every later `compute` for this call before it re-emits.
-        const lb: [TypeRef] = this.infer_static_owner_bindings_from_args(tmpl, func_decl, call, true);
+        const lb: [TypeRef] = this.infer_static_owner_bindings_from_args(tmpl, func_decl, call, true, &seeds);
         if (lb.length() == want) {
             // EXEMPTION: a range literal (`0..5` / `1..=4`) is lowered by the parser
             // into `Range::new` / `RangeInclusive::new` (see expr_parser.cryo), and its
@@ -9483,6 +9655,16 @@ type struct CallResolver {
             return lb;
         }
         return [];
+    }
+
+    /// Whether `bindings` keep every type argument a turbofish wrote:
+    /// `written` holds one per argument, invalid at each `_`, or is empty.
+    static keeps_written(bindings: &[TypeRef], written: &[TypeRef]) -> boolean {
+        for (mut i: i64 = 0; i < written.length(); i++) {
+            if (!written[i].is_valid()) { continue; }
+            if (i >= bindings.length() || !bindings[i].equals(written[i])) { return false; }
+        }
+        return true;
     }
 
     /// Whether two definitions print alike when each is shown by its leaf,
@@ -9577,12 +9759,21 @@ type struct CallResolver {
         }
         // Type arguments written on the variant (`Result::Ok::<i32, i32>(4)`)
         // name the instantiation, as they do on a payload-less variant.
-        if (scope.generic_args.length() > 0) {
+        if (TypeAnnotation::names_every_argument(&scope.generic_args)) {
             const written: TypeRef = this.demanded_scope_type(type_ref, &scope.generic_args, scope_e.span);
             scope_e.set_resolved_type(written);
             return written;
         }
-        const promoted: TypeRef = this.promote_to_expected_instantiation(type_ref);
+        // With a `_` among them, the expected type answers only an instance
+        // keeping the arguments written; the call's arguments bind otherwise.
+        mut promoted: TypeRef = this.promote_to_expected_instantiation(type_ref);
+        if (scope.generic_args.length() > 0 && !promoted.equals(type_ref)) {
+            const promoted_args: [TypeRef] = this.types.view_type_args_copy(promoted);
+            const written_args: [TypeRef] = this.resolve_turbofish(&scope.generic_args);
+            if (!CallResolver::keeps_written(&promoted_args, &written_args)) {
+                promoted = type_ref;
+            }
+        }
         // `promote` only specialises when an expected type supplies the args.
         // With none - an inline `Option::Some(<expr>)` standing as a `match`
         // subject, or initializing an unannotated local - it returns the
@@ -9700,8 +9891,16 @@ type struct CallResolver {
         const variant: EnumVariantInfo* = &et.variants[ordinal];
         if (variant.payload_types.length() != call.arguments.length()) { return TypeRef::invalid(); }
 
+        // A turbofish with a `_` on the variant or on its enum binds what it
+        // writes; the arguments bind each `_`.
         mut bindings: [TypeRef] = [];
         for (mut p: i64 = 0; p < tmpl.param_count; p++) { bindings.push(TypeRef::invalid()); }
+        mut targs: &[mut TypeAnnotation*] = &scope.generic_args;
+        if (targs.length() == 0) { targs = &scope.scope_generic_args; }
+        if (targs.length() == tmpl.param_count) {
+            const written: [TypeRef] = this.resolve_turbofish(targs);
+            for (mut p: i64 = 0; p < written.length(); p++) { bindings[p] = written[p]; }
+        }
 
         for (mut i: i64 = 0; i < variant.payload_types.length(); i++) {
             const pt: Type* = this.arena.lookup(variant.payload_types[i]);
@@ -9724,7 +9923,10 @@ type struct CallResolver {
             // binds as its specialization will after monomorphization.
             if (!this.types.arg_type_names_one_type(arg_ty)) { continue; }
             for (mut p: i64 = 0; p < tmpl.param_count; p++) {
-                if (gpt.declared_by(tmpl.param_syms[p])) { bindings[p] = arg_ty; break; }
+                if (gpt.declared_by(tmpl.param_syms[p])) {
+                    if (!bindings[p].is_valid()) { bindings[p] = arg_ty; }
+                    break;
+                }
             }
         }
 
@@ -9848,12 +10050,21 @@ type struct CallResolver {
                 CalleePin::Instance(i) => { spec_inst = i; }
                 _                      => { }
             }
-            if (!spec_inst.is_valid()) {
-                if (scope != null && scope.generic_args.length() > 0) {
-                    spec_inst = this.resolve_generic_scope_type(tmpl.base_type, &scope.generic_args, call.callee.span);
-                } else if (call.generic_args.length() > 0) {
-                    spec_inst = this.resolve_generic_scope_type(tmpl.base_type, &call.generic_args, call_e.span);
-                }
+            // The turbofish written on the scope or on the call; one writing
+            // every argument names the instance, and one with a `_` binds
+            // what it writes, the arguments the rest.
+            mut targs: &[mut TypeAnnotation*] = &call.generic_args;
+            if (scope != null && scope.generic_args.length() > 0) { targs = &scope.generic_args; }
+            const tfn_decl: DeclarationNode* = tmpl.ast_node;
+            const tfn: FunctionDecl* = DeclarationNode::fn_of(tfn_decl);
+            if (tfn != null && this.type_argument_count_refused(targs, &tfn.generic_params,
+                    this.intern.resolve(tfn.name), call_e.span)) {
+                *claimed = true;
+                return TypeRef::invalid();
+            }
+            if (!spec_inst.is_valid() && TypeAnnotation::names_every_argument(targs)) {
+                spec_inst = this.resolve_generic_scope_type(tmpl.base_type, targs,
+                    if (scope != null && scope.generic_args.length() > 0) { call.callee.span } else { call_e.span });
             }
             if (spec_inst.is_valid()) {
                 const spec_ret: TypeRef = this.instance_return_type(spec_inst);
@@ -9862,9 +10073,7 @@ type struct CallResolver {
                     return spec_ret;
                 }
             }
-            const no_turbofish: boolean =
-                (scope == null || scope.generic_args.length() == 0) && call.generic_args.length() == 0;
-            if (no_turbofish) {
+            if (!TypeAnnotation::names_every_argument(targs)) {
                 // The stamp names the family's generic function; a
                 // non-generic signature of it may accept the arguments too.
                 mut arg_types: [TypeRef] = [];
@@ -9873,13 +10082,12 @@ type struct CallResolver {
                     if (arg == null || !arg.resolved_type.is_valid()) { break; }
                     arg_types.push(arg.resolved_type);
                 }
-                if (arg_types.length() == call.arguments.length()) {
+                if (targs.length() == 0 && arg_types.length() == call.arguments.length()) {
                     this.report_free_generic_tie(call_e, call, callee, scope, &arg_types);
                 }
-                const tfn_decl: DeclarationNode* = tmpl.ast_node;
-                const tfn: FunctionDecl* = DeclarationNode::fn_of(tfn_decl);
                 if (tfn != null && tmpl.param_types.length() > 0 && tfn.parameters.length() == call.arguments.length()) {
-                    const inference: CallInference = this.infer_call_bindings(call, tmpl, tfn_decl);
+                    const written: [TypeRef] = this.resolve_turbofish(targs);
+                    const inference: CallInference = this.infer_call_bindings(call, tmpl, tfn_decl, &written);
                     if (this.failed_inference_reported(call_e, call, tmpl, &inference)) {
                         *claimed = true;
                         return TypeRef::invalid();
@@ -10121,15 +10329,20 @@ type struct CallResolver {
     }
 
     /// The instance of the generic struct `tmpl` a literal written without
-    /// arguments builds, from its fields: each field's declared type, over
-    /// the template's parameters, unified with the type of the value given
-    /// for it.  Demanded, since the literal may flow where nothing else
-    /// names the instance (a generic function's argument).  Invalid unless
-    /// every parameter is bound to a concrete type.
-    instance_from_fields(mut &this, tmpl: const TemplateEntry*, fields: &[TypeRef], values: &[TypeRef]) -> TypeRef {
+    /// arguments, or with a `_` among them, builds from its fields: the
+    /// arguments `written` (invalid at each `_`, or empty) bound first, then
+    /// each field's declared type, over the template's parameters, unified
+    /// with the type of the value given for it.  Demanded, since the literal
+    /// may flow where nothing else names the instance (a generic function's
+    /// argument).  Invalid unless every parameter is bound to a concrete type.
+    instance_from_fields(mut &this, tmpl: const TemplateEntry*, fields: &[TypeRef], values: &[TypeRef],
+                         written: &[TypeRef]) -> TypeRef {
         mut pids: [TypeRef] = [];
         for (mut i: i64 = 0; i < tmpl.param_types.length(); i++) { pids.push(tmpl.param_types[i]); }
         mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
+        for (mut i: i64 = 0; i < written.length(); i++) {
+            if (written[i].is_valid()) { ictx.bind_slot(i, written[i]); }
+        }
         for (mut i: i64 = 0; i < fields.length() && i < values.length(); i++) { ictx.unify(fields[i], values[i]); }
         const owner_bounds: [TraitBound]* = tmpl.declared_where_bounds();
         if (owner_bounds != null) {

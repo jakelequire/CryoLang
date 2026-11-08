@@ -308,13 +308,19 @@ GenericParam       ::= Ident (":" BoundEntry ("+" BoundEntry)*)? ("=" Type)?
                           The optional "=" Type is a default type argument,
                           e.g. `<A = GlobalAlloc>`. *)
 GenericArgs        ::= "<" Type ("," Type)* ">"
-TurbofishArgs      ::= "::" GenericArgs
+TurbofishArgs      ::= "::" "<" TypeArg ("," TypeArg)* ">"
                        (* generic arguments in EXPRESSION position: `<`
                           opens them only immediately after `::`, and is
                           the comparison operator anywhere else in an
                           expression.  `Vec::<i32>::new()`, `f::<T>(x)`,
                           `o.m::<T>()`, `Pair::<A, B> { .. }`, `f::<T>` as a
                           value.  Type position uses GenericArgs directly. *)
+TypeArg            ::= Type | "_"
+                       (* `_` leaves that argument to inference; a list
+                          writes one TypeArg for each type parameter (one
+                          with a default may be left off the end).  `_`
+                          anywhere else, inside a TypeArg included, is
+                          parsed and refused. *)
 
 
 (*  Expressions ================================================ *)

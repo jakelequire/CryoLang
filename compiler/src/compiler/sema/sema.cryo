@@ -4796,7 +4796,7 @@ type struct SemaVisitor {
         // the same fact without the round trip through a string - and a mangled
         // spec name minted from an already-mangled spelling names nothing at
         // all, which is what made this lookup miss three times in four.
-        if (!struct_ref.is_valid() && lit.generic_args.length() > 0) {
+        if (!struct_ref.is_valid() && TypeAnnotation::names_every_argument(&lit.generic_args)) {
             struct_ref = this.resolve_struct_literal_type(e, lit);
         }
         // A literal with no arguments has no pair to resolve, so neither branch
@@ -4832,15 +4832,20 @@ type struct SemaVisitor {
         // names (`const b: Boxy<i32> = Boxy { v: 3 };`), else the one its
         // field values bind (`second(Pair { a: 1, b: 5 })`).  Its fields are
         // that instance's; the template still answers the literal's shape.
+        // Written with a `_` among its arguments, it is the instance that
+        // keeps the ones written, the rest bound the same way.
         mut field_owner: TypeRef = lit_type;
         mut infer_from: const TemplateEntry* = null;
-        if (!this.state.in_symbolic_check && lit.generic_args.length() == 0
+        const written: [TypeRef] = this.calls.resolve_turbofish(&lit.generic_args);
+        if (!this.state.in_symbolic_check && !TypeAnnotation::names_every_argument(&lit.generic_args)
                 && !e.resolved_type.is_valid() && lit_type.equals(struct_ref) && struct_ref.is_valid()) {
             const lt: const TemplateEntry* = this.ctx.generic_registry.template_of_type(struct_ref);
             if (lt != null && lt.param_types.length() > 0
                     && (lt.kind == TemplateKind::Struct)) {
                 const promoted: TypeRef = this.calls.promote_to_expected_instantiation(struct_ref);
-                if (!promoted.equals(struct_ref) && !this.types.contains_generic_param(promoted)) {
+                const promoted_args: [TypeRef] = this.types.view_type_args_copy(promoted);
+                if (!promoted.equals(struct_ref) && !this.types.contains_generic_param(promoted)
+                        && CallResolver::keeps_written(&promoted_args, &written)) {
                     lit_type = promoted;
                     field_owner = promoted;
                 } else {
@@ -4913,7 +4918,7 @@ type struct SemaVisitor {
         }
         this.state.expected_type = saved_expected;
         if (infer_from != null) {
-            const bound: TypeRef = this.calls.instance_from_fields(infer_from, &infer_fields, &infer_values);
+            const bound: TypeRef = this.calls.instance_from_fields(infer_from, &infer_fields, &infer_values, &written);
             if (bound.is_valid()) { lit_type = bound; }
         }
 

@@ -1141,15 +1141,15 @@ type struct MethodBinding {
         return this.ctx.generic_registry.find_trait_defining_method(method_name);
     }
 
-    /// When `member.generic_args` carry explicit method-level args
-    /// (`obj.method<U>(...)`), re-resolve the method's template return
+    /// When `member.generic_args` write every method-level arg, none of them
+    /// `_` (`obj.method<U>(...)`), re-resolve the method's template return
     /// annotation with the receiver's + the explicit args bound.  Hands back
     /// `fallback` (the bare-lookup return) on any miss.
     resolve_method_return_with_explicit_args(mut &this, recv_type: TypeRef,
                                              member: MemberAccessExpr*, chosen_decl: DeclarationNode*,
                                              fallback: TypeRef) -> TypeRef {
         const chosen: MethodDecl* = DeclarationNode::method_of(chosen_decl);
-        if (member.generic_args.length() == 0)   { return fallback; }
+        if (!TypeAnnotation::names_every_argument(&member.generic_args)) { return fallback; }
 
         // An explicit arg naming the enclosing body's own parameters
         // (`raw.cast::<F>()` inside `f<F>`) types the return abstractly
@@ -1847,8 +1847,10 @@ type struct MethodBinding {
     }
 
     /// Solve every method-level generic param of `orig_func` for this call:
-    /// explicit turbofish, else formal/actual unification (with return-type
-    /// recovery + polymorphic-literal adoption, mirroring the free-fn path).
+    /// the turbofish binds what it writes, and the rest - all of them with
+    /// none written, or each `_` - come from formal/actual unification (with
+    /// return-type recovery + polymorphic-literal adoption, mirroring the
+    /// free-fn path).
     /// Returns the bindings in declaration order, or `[]`
     /// when any stays unbound/abstract (caller defers to mono).
     solve_method_bindings(mut &this, orig_func_decl: DeclarationNode*,
@@ -1876,12 +1878,14 @@ type struct MethodBinding {
             method_bindings.push(TypeRef::invalid());
         }
 
-        if (generic_args.length() == n_method_params && generic_args.length() > 0) {
-            // Explicit turbofish is authoritative.  CRITICAL: resolve in the
-            // CALLER's scope, NOT through `owner_ctx` (which would shadow an
-            // enclosing param sharing the receiver's param name).  Inside a
-            // generic body, resolve in the enclosing symbolic-param context so an
-            // enclosing `T` stays abstract for the substituter to concretize.
+        // The turbofish binds what it writes.  CRITICAL: resolve in the
+        // CALLER's scope, NOT through `owner_ctx` (which would shadow an
+        // enclosing param sharing the receiver's param name).  Inside a
+        // generic body, resolve in the enclosing symbolic-param context so an
+        // enclosing `T` stays abstract for the substituter to concretize.  A
+        // `_` binds nothing: the arguments bind it below, with the written
+        // ones already in place.
+        if (generic_args.length() == n_method_params) {
             mut tf_ctx_buf: ResolutionContext = ResolutionContext::new("");
             mut use_symbolic: boolean = false;
             if (this.state.in_symbolic_check) {
@@ -1889,6 +1893,7 @@ type struct MethodBinding {
                 use_symbolic = true;
             }
             for (mut i: i64 = 0; i < n_method_params; i++) {
+                if (TypeAnnotation::is_inferred(generic_args[i])) { continue; }
                 const tf_ctx: ResolutionContext* =
                     if (use_symbolic) { &tf_ctx_buf } else { owner_ctx };
                 const tr: TypeRef = this.ctx.type_resolver.resolve(generic_args[i], tf_ctx);
@@ -1898,7 +1903,8 @@ type struct MethodBinding {
                 }
                 method_bindings[i] = tr;
             }
-        } else {
+        }
+        if (!TypeAnnotation::names_every_argument(generic_args)) {
             // Infer from arguments: bind each method param to a fresh GenericParam
             // for the unifier, resolve each formal in a context with owner args
             // concrete + method params as those fresh refs, then unify vs actuals.
@@ -1924,6 +1930,9 @@ type struct MethodBinding {
             if (explicit_params.length() != n_args) { return []; }
 
             mut ictx: InferCtx = InferCtx::for_template(this.arena, method_param_ids);
+            for (mut i: i64 = 0; i < n_method_params; i++) {
+                if (method_bindings[i].is_valid()) { ictx.bind_slot(i, method_bindings[i]); }
+            }
             // Resolve each parameter's formal type once (in the fresh-param
             // context), so all three inference passes share it.
             mut formals: [TypeRef] = [];

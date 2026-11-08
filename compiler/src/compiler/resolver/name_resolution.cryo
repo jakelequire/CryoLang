@@ -1906,6 +1906,29 @@ type struct NameResolver {
         }
     }
 
+    /// Stamp the type arguments a call, a path, a method or a struct literal
+    /// writes.  These are the positions the arguments are inferred at when
+    /// none is written, so a whole argument may be `_`, inferred there too;
+    /// a `_` inside an argument (`Array<_>`) names part of a type and is
+    /// refused as anywhere else.
+    stamp_type_argument_list(mut &this, args: &[mut TypeAnnotation*]) -> void {
+        for (mut i: i64 = 0; i < args.length(); i++) {
+            if (TypeAnnotation::is_inferred(args[i])) { continue; }
+            this.stamp_annotation(args[i]);
+        }
+    }
+
+    /// E0307 at `_` written where nothing infers it: in a declared type, an
+    /// impl head, a bound, or inside a type argument.  Only a whole type
+    /// argument of a call or path is inferred.
+    refuse_misplaced_placeholder(&this, span: SourceSpan) -> void {
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
+            "the type placeholder `_` is not allowed here");
+        d = d.at_with_label(span, "not inferred in this position");
+        d = d.help("`_` stands for a whole type argument of a call or a path, `f::<i32, _>(x)`; write the type here");
+        this.ctx.emit_diagnostic(d);
+    }
+
     /// Stamp an annotation written where a value's type goes, and refuse it
     /// when it names a trait: a trait is no type, so `p: Shape` declares
     /// nothing a value could have.
@@ -1933,6 +1956,7 @@ type struct NameResolver {
         if (ann == null) { return; }
         match (*ann) {
             TypeAnnotation::Named(n)       => { this.stamp_named_annotation(n); }
+            TypeAnnotation::Inferred(placeholder) => { this.refuse_misplaced_placeholder(placeholder.span); }
             TypeAnnotation::Pointer(p)     => {
                 this.stamp_annotation_tree(p.inner);
                 this.refuse_trait_type(p.inner, p.span, "", "*", "a pointer to a trait");
@@ -3837,7 +3861,7 @@ implement trait Walk for struct NameResolver {
             // chooses the message only - the answer is a refusal either way.
             if (this.resolver.lookup(node.name, this.resolver.current_scope).is_valid()) {
                 this.refuse_type_as_value(e, node);
-                this.stamp_annotation_list(&node.generic_args);
+                this.stamp_type_argument_list(&node.generic_args);
                 return;
             }
             // No rib binds the name, the prelude included, and nothing
@@ -3847,13 +3871,13 @@ implement trait Walk for struct NameResolver {
             // function when a call names it, a value otherwise - and stamped
             // `Err` so no later stage reports it again or guesses at it.
             this.refuse_unbound_name(e, node);
-            this.stamp_annotation_list(&node.generic_args);
+            this.stamp_type_argument_list(&node.generic_args);
             return;
         }
         this.resolver.record_resolution(e.span, sym_id);
         if (this.refuse_ambiguous_import(sym_id, node.name, e.span)) {
             node.set_res(Res::Err);
-            this.stamp_annotation_list(&node.generic_args);
+            this.stamp_type_argument_list(&node.generic_args);
             return;
         }
         // Stamped from the lookup already performed, never a second one: the
@@ -3865,7 +3889,7 @@ implement trait Walk for struct NameResolver {
             ResSlot::Answered(r) => { node.set_res(r); }
             _                    => { }
         }
-        this.stamp_annotation_list(&node.generic_args);
+        this.stamp_type_argument_list(&node.generic_args);
     }
 
     walk_scope_resolution(mut &this, e: mut ExpressionNode*, node: mut ScopeResolutionExpr*) -> void {
@@ -3873,8 +3897,8 @@ implement trait Walk for struct NameResolver {
         // the item is claimed; its scope segment is not the writing module's
         // to look up.  The types written beside it are, as on any path.
         if (node.scope_res.is_lang()) {
-            this.stamp_annotation_list(&node.scope_generic_args);
-            this.stamp_annotation_list(&node.generic_args);
+            this.stamp_type_argument_list(&node.scope_generic_args);
+            this.stamp_type_argument_list(&node.generic_args);
             this.stamp_annotation_tree(node.impl_trait);
             return;
         }
@@ -3898,8 +3922,8 @@ implement trait Walk for struct NameResolver {
         // the member's (`Layout::of<Entry<K, V>>`) are written types in their
         // own right; what they name is settled here, where the writing scope
         // is still the current one.
-        this.stamp_annotation_list(&node.scope_generic_args);
-        this.stamp_annotation_list(&node.generic_args);
+        this.stamp_type_argument_list(&node.scope_generic_args);
+        this.stamp_type_argument_list(&node.generic_args);
         // The trait of an impl-qualified path, `(Beta for P)::make`, is a
         // written type name like the arguments beside it.
         this.stamp_annotation_tree(node.impl_trait);
@@ -3920,7 +3944,7 @@ implement trait Walk for struct NameResolver {
         this.walk_expr(node.callee);
         this.callee_ident = outer_callee;
 
-        this.stamp_annotation_list(&node.generic_args);
+        this.stamp_type_argument_list(&node.generic_args);
 
         // Visit arguments
         for (mut i: i64 = 0; i < node.arguments.length(); i++) {
@@ -3932,7 +3956,7 @@ implement trait Walk for struct NameResolver {
         // The member itself is resolved by the type check, which knows the
         // object's type.
         MemberAccessExpr::walk_children(node, this);
-        this.stamp_annotation_list(&node.generic_args);
+        this.stamp_type_argument_list(&node.generic_args);
     }
 
     walk_static_match_expr(mut &this, e: mut ExpressionNode*, node: mut StaticMatchExpr*) -> void {
@@ -4065,7 +4089,7 @@ implement trait Walk for struct NameResolver {
                 }
             }
         }
-        this.stamp_annotation_list(&node.generic_args);
+        this.stamp_type_argument_list(&node.generic_args);
 
         // Visit field initializer expressions
         for (mut i: i64 = 0; i < node.field_inits.length(); i++) {

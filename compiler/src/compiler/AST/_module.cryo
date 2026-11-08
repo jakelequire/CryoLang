@@ -204,6 +204,10 @@ type enum TypeAnnotation {
     /// A trait object type: `virtual &Trait`, `virtual mut &Trait` or
     /// `virtual Trait*`.  See ObjectAnnotation.
     Object(mut ObjectAnnotation*);
+    /// `_` as a type argument a call or path writes: the argument at that
+    /// position is inferred, as an unwritten list's arguments are.  See
+    /// InferredAnnotation.
+    Inferred(InferredAnnotation*);
 }
 
 
@@ -292,6 +296,10 @@ implement enum TypeAnnotation {
             }
             TypeAnnotation::Projection(pj) => { pj.refused || TypeAnnotation::refused(pj.base) }
             TypeAnnotation::Object(o)      => { o.refused || TypeAnnotation::refused(o.trait_annotation) }
+            // Only a call's or a path's own type argument may be `_`, and
+            // those lists are not judged here; one anywhere else is refused
+            // where it is written.
+            TypeAnnotation::Inferred(_)    => { true }
             _ => { false }
         };
     }
@@ -351,6 +359,7 @@ implement enum TypeAnnotation {
                 out + ">"
             }
             TypeAnnotation::Object(o)     => { o.form.spell(TypeAnnotation::spell(o.trait_annotation, intern)) }
+            TypeAnnotation::Inferred(_)   => { "_" }
             _ => { ".." }
         };
     }
@@ -461,6 +470,9 @@ implement enum TypeAnnotation {
                 const tt: ThisTypeAnnotation* = new ThisTypeAnnotation { span: t.span };
                 new TypeAnnotation::ThisType(tt)
             }
+            TypeAnnotation::Inferred(placeholder) => {
+                new TypeAnnotation::Inferred(new InferredAnnotation { span: placeholder.span })
+            }
             TypeAnnotation::ImplTrait(imp) => {
                 mut new_bounds: [mut TypeAnnotation*] = [];
                 for (mut i: i64 = 0; i < imp.bounds.length(); i++) {
@@ -528,6 +540,35 @@ implement enum TypeAnnotation {
             res:          ResSlot::Answered(res),
         });
     }
+
+    /// Whether `ann` is the placeholder `_`, a type argument left to
+    /// inference.
+    static is_inferred(ann: TypeAnnotation*) -> boolean {
+        if (ann == null) { return false; }
+        return match (*ann) {
+            TypeAnnotation::Inferred(_) => { true }
+            _                           => { false }
+        };
+    }
+
+    /// Whether a written list of type arguments names every argument, none
+    /// of them `_`: the list is then the instance, and nothing is inferred.
+    /// An empty list names none.
+    static names_every_argument(args: &[mut TypeAnnotation*]) -> boolean {
+        if (args.length() == 0) { return false; }
+        for (mut i: i64 = 0; i < args.length(); i++) {
+            if (TypeAnnotation::is_inferred(args[i])) { return false; }
+        }
+        return true;
+    }
+}
+
+
+/// `_` written as a type argument.  It names no type: the call or path that
+/// writes it infers the argument at its position, and anywhere else it is
+/// refused.
+type struct InferredAnnotation {
+    span: SourceSpan;
 }
 
 
