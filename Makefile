@@ -206,10 +206,12 @@ Build
                          (skipped without the mingw toolchain).
   make cryo-exe          Cross-build compiler/build/cryo.exe from Linux, and
                          stamp it.
-  make lsp               Build tools/CryoLSP with the pin and install it as
-                         bin/cryolsp.
-  make install-lsp       Package tools/CryoAnalyzer and install it into VS
-                         Code, REPLACING the installed CryoAnalyzer extension.
+  make lsp               Build tools/CryoLSP from the current tree with the pin
+                         and install it as bin/cryolsp.
+  make install-lsp       lsp, the server's behavioural checks on the installed
+                         binary, then package tools/CryoAnalyzer and install
+                         it into VS Code, REPLACING the installed extension.
+                         No gates; reload the VS Code window afterwards.
 
 Tests and gates
   make test              cryo test over tests/ (the working loop; ARGS=filter).
@@ -275,7 +277,8 @@ Pins and release
 Internal, called by pin: pin-linux-impl, pin-windows-impl, _pin-windows-do.
 
 Side effects beyond the named output
-  lsp             overwrites bin/cryolsp; fails while an editor holds it open.
+  lsp             replaces bin/cryolsp and tools/CryoLSP/build/cryolsp (Windows:
+                  moves held copies into tools/CryoLSP/build/retired/).
   install-lsp     uninstalls the VS Code extension it replaces.
   pin             rewrites both pins; copies LLVM-C.dll and libclang.dll to bin/.
   selfhost-check  Linux host: deletes stdlib/.bin and compiler/build.  Windows
@@ -456,31 +459,60 @@ endif
 # so the stage-2 compiler *binary* is not an input here.  Depending on it
 # would drag `make cryo` (a full self-host) in front of every LSP build for
 # no benefit.
-# Run `make cryo` / `make pin` first if you want compiler changes reflected
-# in the pin used to build; the LSP's own copy of the compiler library is
-# always rebuilt from current source by the project build.
+# What the server knows of the language is the compiler SOURCE it links, which
+# the project build always compiles from the tree; the pin only does the
+# compiling.
+#
+# The build's whole-build fingerprint is dropped first.  It covers every
+# module source and the stdlib archive key, but not the C header the
+# compiler's codegen module includes, so a header edit would otherwise leave
+# the old server reported as up to date.  Without the fingerprint the build
+# analyses again; the per-module cache still skips the backend of every
+# module whose bitcode did not change.
 ifeq ($(HOST_OS),windows)
 # Windows host: recipes run under cmd, which has no `cp`.  `$(PIN)` (bin/cryo,
 # no extension) launches via PATHEXT -> bin/cryo.exe.  The built binary is
 # `cryolsp.exe`; copy it to the pin with the `copy` builtin (backslash paths,
 # stdout silenced).
+#
+# A running server holds its binary open, and Windows refuses to overwrite it
+# but allows renaming it, so both installed copies are moved into
+# build\retired\ first; the running servers keep the old code until the
+# editor restarts them.  A retired copy still held stays until a later run
+# can delete it.  A failed build leaves no server installed, so the editor
+# reports a missing server rather than starting a stale one.
+LSP_RETIRED := tools\CryoLSP\build\retired
 lsp:
 	@echo "==> Building CryoLSP via bin/cryo.exe"
+	-@if exist $(LSP_RETIRED) del /Q $(LSP_RETIRED)\*
+	@if not exist $(LSP_RETIRED) mkdir $(LSP_RETIRED)
+	@if exist tools\CryoLSP\build\cryolsp.exe move /Y tools\CryoLSP\build\cryolsp.exe $(LSP_RETIRED)\build-%RANDOM%.exe
+	@if exist bin\cryolsp.exe move /Y bin\cryolsp.exe $(LSP_RETIRED)\bin-%RANDOM%.exe
+	-@if exist tools\CryoLSP\build\target del /S /Q tools\CryoLSP\build\target\cryolsp.fp
 	cd tools/CryoLSP && "$(PIN)" build
 	copy /Y "$(subst /,\,$(LSP_BIN))" "$(subst /,\,$(LSP_PIN))" >NUL
 	@echo "==> bin/cryolsp.exe ready"
 else
+# `mv` over the installed copy replaces its directory entry, so a running
+# server keeps the file it has open and the next start gets the new one.
 lsp: $(PIN)
 	@echo "==> Building CryoLSP via bin/cryo"
+	@if [ -d tools/CryoLSP/build/target ]; then find tools/CryoLSP/build/target -name cryolsp.fp -delete; fi
 	@cd tools/CryoLSP && "$(PIN)" build
-	@cp "$(LSP_BIN)" "$(LSP_PIN)"
+	@cp "$(LSP_BIN)" "$(LSP_PIN).new"
+	@mv -f "$(LSP_PIN).new" "$(LSP_PIN)"
 	@echo "==> bin/cryolsp ready"
 endif
 
 # ---- CryoAnalyzer VS Code extension -----------------------------------
-# Packages tools/CryoAnalyzer/ into a .vsix and installs it into VS Code,
-# evicting any previously installed copy and any stale .vsix artifacts so
-# the install always reflects the current source.
+# Builds and installs the server from the current tree (`lsp`), runs its
+# behavioural checks on the installed binary, then packages
+# tools/CryoAnalyzer/ into a .vsix and installs it into VS Code, evicting any
+# previously installed copy and any stale .vsix artifacts so the install
+# always reflects the current source.  The extension finds the server itself
+# (tools/CryoLSP/build/ in this workspace, bin/ through PATH elsewhere), and
+# `lsp` writes both, so neither can be left behind.
+install-lsp: lsp
 ifeq ($(HOST_OS),windows)
 # Windows host: the POSIX recipe below (`command -v`, `{ ... }`, `[ -d ]`,
 # `rm`, `./node_modules/.bin/...`) is unparseable by cmd, so the whole job
@@ -488,9 +520,11 @@ ifeq ($(HOST_OS),windows)
 # `where`/`if exist`/`del` and the `.cmd` shims (`code.cmd`, `npm.cmd`,
 # `vsce.cmd`) that npm installs on Windows.
 install-lsp:
+	@$(PYTHON) tools/CryoLSP/tests/smoke.py "$(LSP_PIN)"
 	scripts\install-lsp-windows.cmd
 else
 install-lsp:
+	@$(PYTHON) tools/CryoLSP/tests/smoke.py "$(LSP_PIN)"
 	@command -v code >/dev/null 2>&1 || { echo "ERROR: 'code' CLI not found on PATH"; exit 1; }
 	@echo "==> Ensuring CryoAnalyzer node_modules are present"
 	@cd "$(EXT_DIR)" && [ -d node_modules ] || npm install

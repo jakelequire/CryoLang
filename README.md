@@ -460,7 +460,8 @@ The committed `bin/cryo` is the only thing needed to rebuild the compiler from s
 make cryo              # rebuild the self-hosted compiler from sources
 make selfhost-check    # 3-round / 6-stage byte-identity gate
 make test              # run the repo-level test suite
-make lsp               # build the Cryo-language LSP (bin/cryolsp)
+make lsp               # build the Cryo-language LSP from this tree (bin/cryolsp)
+make install-lsp       # make lsp, check the server, install the VS Code extension
 make pin               # refresh bin/cryo and bin/cryo.exe (host-aware)
 make clean             # remove compiler, stdlib, runtime tier and LSP build outputs
 make help              # every target, and what each one changes besides its output
