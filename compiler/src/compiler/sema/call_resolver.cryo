@@ -8960,6 +8960,14 @@ type struct CallResolver {
         for (mut i: i64 = 0; i < syms.length(); i++) {
             owned.add(this.arena.create_generic_param(syms[i], SymbolStr::empty(), i as u64), call.resolved_type_args[i]);
         }
+        // A trait's method names its implementing type `This`
+        // (`F: (Acc, This::Item) -> Acc` on `Iterator::fold`): the receiver,
+        // through which the bound's projections reduce.  Left open, the bound
+        // could not be judged and a callable of the wrong signature would be
+        // called as the right one.
+        if (recv.is_valid() && !this.types.contains_generic_param(recv)) {
+            owned.add(this.arena.this_placeholder(this.intern.intern("This")), recv);
+        }
         if (!this.check_callable_bounds(at, m.func, &owned)) { return false; }
         if (f.inherited_params == 0 || block == null) { return true; }
         mut subst: TypeSubstitution = TypeSubstitution::empty();
@@ -9224,6 +9232,16 @@ type struct CallResolver {
             if (!actual.is_valid()) { continue; }
             ictx.unify(param.resolved_type, actual);
         }
+        // What a where-bound or a callable bound reads off a bound subject
+        // is what the bound requires, before a literal's default could pick
+        // another (`Acc` of `F: (Acc, T) -> Acc` with a literal initial value);
+        // PASS D below runs again for what the literals bind.
+        mut method_syms: [SymbolID] = [];
+        for (mut i: i64 = 0; i < n; i++) { method_syms.push(DeclarationNode::generic_param_of(func.generic_params[i]).sym_id); }
+        this.ctx.type_resolver.project_where_bound_params_into(
+            &func.trait_bounds, &method_syms, &ictx, this.ctx.source_file,
+            this.state.in_symbolic_check);
+        this.ctx.type_resolver.unify_callable_bounds(&func.trait_bounds, &method_syms, &ictx, null);
         // Polymorphic literals second (fill only still-unbound params).
         for (mut i: i64 = 0; i < call.arguments.length(); i++) {
             const param_decl: DeclarationNode* = func.parameters[i];
@@ -9240,12 +9258,10 @@ type struct CallResolver {
         // PASS D - a method param that appears only in a where-bound (`R` in
         // `make<F, R>(fut: F) -> R where F: Future<R>`) projects off its now-bound
         // subject; `ictx.bindings[i]` is index-aligned with `func.generic_params[i]`.
-        mut method_syms_d: [SymbolID] = [];
-        for (mut i: i64 = 0; i < n; i++) { method_syms_d.push(DeclarationNode::generic_param_of(func.generic_params[i]).sym_id); }
         this.ctx.type_resolver.project_where_bound_params_into(
-            &func.trait_bounds, &method_syms_d, &ictx, this.ctx.source_file,
+            &func.trait_bounds, &method_syms, &ictx, this.ctx.source_file,
             this.state.in_symbolic_check);
-        this.ctx.type_resolver.unify_callable_bounds(&func.trait_bounds, &method_syms_d, &ictx, null);
+        this.ctx.type_resolver.unify_callable_bounds(&func.trait_bounds, &method_syms, &ictx, null);
         mut bindings: [TypeRef] = [];
         for (mut i: i64 = 0; i < ictx.bindings.length(); i++) { bindings.push(ictx.bindings[i]); }
         for (mut i: i64 = 0; i < bindings.length(); i++) {

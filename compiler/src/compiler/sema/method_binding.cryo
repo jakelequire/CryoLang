@@ -1957,6 +1957,22 @@ type struct MethodBinding {
                 if (!arg.resolved_type.is_valid()) { return []; }
                 ictx.unify(formals[i], this.slice_reference_for_argument(formals[i], arg.resolved_type));
             }
+            // A param a where-bound or a callable bound reads off a bound
+            // subject (`R` of `F: Future<R>`, `Acc` of `F: (Acc, T) -> Acc`)
+            // is what the bound requires: it is bound before the expected
+            // type or a literal's default could pick another (PASS D, which
+            // runs again below for what those bind).
+            mut method_param_syms: [SymbolID] = [];
+            for (mut i: i64 = 0; i < n_method_params; i++) {
+                const gp: GenericParamDecl* = DeclarationNode::generic_param_of(orig_func.generic_params[i]);
+                if (gp == null) { return []; }
+                method_param_syms.push(gp.sym_id);
+            }
+            this.ctx.type_resolver.project_where_bound_params_into(
+                &orig_func.trait_bounds, &method_param_syms, &ictx, this.ctx.source_file,
+                this.state.in_symbolic_check);
+            this.ctx.type_resolver.unify_callable_bounds(
+                &orig_func.trait_bounds, &method_param_syms, &ictx, &infer_ctx);
             // PASS B - recover still-unbound method params from a CONCRETE
             // expected type via the return annotation. Not gated on `is_implicit`:
             // any generic method whose param appears in the return (`next_range<T>
@@ -1996,18 +2012,11 @@ type struct MethodBinding {
             // turbofish or expected-type hint required. Shares the free-function
             // projection; `ictx.bindings[i]` is index-aligned with
             // `orig_func.generic_params[i]` (both built from the same order).
-            mut method_param_syms_d: [SymbolID] = [];
-            for (mut i: i64 = 0; i < n_method_params; i++) {
-                const gp_decl: DeclarationNode* = orig_func.generic_params[i];
-                const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
-                if (gp == null) { return []; }
-                method_param_syms_d.push(gp.sym_id);
-            }
             this.ctx.type_resolver.project_where_bound_params_into(
-                &orig_func.trait_bounds, &method_param_syms_d, &ictx, this.ctx.source_file,
+                &orig_func.trait_bounds, &method_param_syms, &ictx, this.ctx.source_file,
                 this.state.in_symbolic_check);
             this.ctx.type_resolver.unify_callable_bounds(
-                &orig_func.trait_bounds, &method_param_syms_d, &ictx, &infer_ctx);
+                &orig_func.trait_bounds, &method_param_syms, &ictx, &infer_ctx);
             for (mut i: i64 = 0; i < n_method_params; i++) {
                 const b: TypeRef = ictx.bindings[i];
                 if (!b.is_valid()) { return []; }

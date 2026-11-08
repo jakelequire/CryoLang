@@ -662,10 +662,15 @@ A capturing lambda written inside a generic function cannot yet capture a
 value whose type is one of that function's parameters: the closure type would
 itself need the parameter.
 
+The standard library's combinators take their callback through a callable
+bound, so each takes a capturing closure, a non-capturing lambda or a named
+function: `Option`'s `map`, `and_then`, `or_else`, `unwrap_or_else` and
+`ok_or_else`, `Result`'s `map`, `map_err`, `and_then`, `or_else` and
+`unwrap_or_else`, and `Iterator`'s `fold`, `for_each`, `any`, `all` and `find`.
 A combinator that infers a *new* type parameter from the callback's return
-type - for example `Option::map<U>` - does so automatically: `U` is bound from
-the callback's signature, so the type argument may be omitted. This works the
-same whether the callback is a lambda or a named function:
+type - for example `Option::map<U, F>` - does so automatically: `U` is bound
+from the callback's signature, and `F` is the callback's own type, so the type
+arguments may be omitted:
 
 ```cryo
 const some: Option<int> = Option::Some(5);
@@ -673,10 +678,14 @@ const out:  Option<int> = some.map((n: int) -> int { return n * 10; });  // U = 
 
 function tentimes(n: int) -> int { return n * 10; }
 const out2: Option<int> = some.map(tentimes);                            // U = int, inferred
+
+const factor: int = 3;
+const out3: Option<int> = some.map((n: int) -> int { return n * factor; }); // a capturing closure
 ```
 
-The explicit form is still accepted (`some.map::<int>(...)`) and is required only
-when the type parameter appears *nowhere* the call can infer it from.
+The explicit form writes every type argument, `_` for the callback's type
+(`some.map::<int, _>(...)`), and is required only when a type parameter appears
+*nowhere* the call can infer it from.
 
 ### 2.6 Tuple Types
 
