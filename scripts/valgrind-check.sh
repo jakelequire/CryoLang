@@ -18,13 +18,22 @@
 #   CRYO         compiler to use (default: bin/cryo). The Makefile passes the
 #                freshly built stage-2 compiler.
 #   CRYO_STDLIB  stdlib root (default: this repo's stdlib).
+#   ROOT         the checkout (default: this script's parent directory). The
+#                Makefile passes it, since it hands bash the script's text
+#                with carriage returns stripped (`bash -c`): a working copy
+#                checked out with CRLF endings runs the same.
+#
+# The program run is the one this host builds, `build/<name>`: a checkout
+# shared with Windows also holds a `build/<name>.exe` from a Windows build,
+# which valgrind cannot start. A program valgrind cannot start fails as
+# that, not as a memory error.
 #
 # Exit: 0 if every listed example builds, runs, and is valgrind-clean; 1
 # otherwise.
 
 set -uo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="${ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 CRYO="${CRYO:-$ROOT/bin/cryo}"
 export CRYO_STDLIB="${CRYO_STDLIB:-$ROOT/stdlib}"
 
@@ -47,21 +56,26 @@ for n in "${EXAMPLES[@]}"; do
         continue
     fi
 
-    bin="$dir/build/$n.exe"
-    [ -x "$bin" ] || bin="$dir/build/$n"
+    bin="$dir/build/$n"
     if [ ! -x "$bin" ]; then
-        echo "FAIL $n: built binary not found under $dir/build/"
+        echo "FAIL $n: built binary not found: $bin"
         fail=1
         continue
     fi
 
-    if valgrind --error-exitcode=1 --leak-check=full \
-                --errors-for-leak-kinds=definite -q "$bin" >/dev/null 2>"$dir/build/valgrind.log"; then
+    valgrind --error-exitcode=1 --leak-check=full \
+             --errors-for-leak-kinds=definite -q "$bin" >/dev/null 2>"$dir/build/valgrind.log"
+    status=$?
+    if [ "$status" -eq 0 ]; then
         echo "ok   $n"
-    else
+    elif [ "$status" -eq 1 ]; then
         echo "FAIL $n: valgrind reported errors"
         grep -E 'ERROR SUMMARY|definitely lost|Invalid (free|read|write)|blocks are definitely' \
             "$dir/build/valgrind.log" | head -20
+        fail=1
+    else
+        echo "FAIL $n: valgrind could not run $bin (exit $status)"
+        head -5 "$dir/build/valgrind.log"
         fail=1
     fi
 done

@@ -796,7 +796,7 @@ valgrind-check:
 	$(error valgrind-check: UNAVAILABLE on this host -- valgrind is POSIX/Linux only; run it from WSL)
 else
 valgrind-check: $(STAGE2)
-	@CRYO="$(STAGE2)" CRYO_STDLIB="$(ROOT)/stdlib" bash scripts/valgrind-check.sh
+	@CRYO="$(STAGE2)" CRYO_STDLIB="$(ROOT)/stdlib" ROOT="$(ROOT)" bash -c "$$(cat scripts/valgrind-check.sh | tr -d '\r')" valgrind-check
 endif
 
 # ---- runtime tier archives --------------------------------------------
