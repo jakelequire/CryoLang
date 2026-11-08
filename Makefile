@@ -462,13 +462,6 @@ endif
 # What the server knows of the language is the compiler SOURCE it links, which
 # the project build always compiles from the tree; the pin only does the
 # compiling.
-#
-# The build's whole-build fingerprint is dropped first.  It covers every
-# module source and the stdlib archive key, but not the C header the
-# compiler's codegen module includes, so a header edit would otherwise leave
-# the old server reported as up to date.  Without the fingerprint the build
-# analyses again; the per-module cache still skips the backend of every
-# module whose bitcode did not change.
 ifeq ($(HOST_OS),windows)
 # Windows host: recipes run under cmd, which has no `cp`.  `$(PIN)` (bin/cryo,
 # no extension) launches via PATHEXT -> bin/cryo.exe.  The built binary is
@@ -488,7 +481,6 @@ lsp:
 	@if not exist $(LSP_RETIRED) mkdir $(LSP_RETIRED)
 	@if exist tools\CryoLSP\build\cryolsp.exe move /Y tools\CryoLSP\build\cryolsp.exe $(LSP_RETIRED)\build-%RANDOM%.exe
 	@if exist bin\cryolsp.exe move /Y bin\cryolsp.exe $(LSP_RETIRED)\bin-%RANDOM%.exe
-	-@if exist tools\CryoLSP\build\target del /S /Q tools\CryoLSP\build\target\cryolsp.fp
 	cd tools/CryoLSP && "$(PIN)" build
 	copy /Y "$(subst /,\,$(LSP_BIN))" "$(subst /,\,$(LSP_PIN))" >NUL
 	@echo "==> bin/cryolsp.exe ready"
@@ -497,7 +489,6 @@ else
 # server keeps the file it has open and the next start gets the new one.
 lsp: $(PIN)
 	@echo "==> Building CryoLSP via bin/cryo"
-	@if [ -d tools/CryoLSP/build/target ]; then find tools/CryoLSP/build/target -name cryolsp.fp -delete; fi
 	@cd tools/CryoLSP && "$(PIN)" build
 	@cp "$(LSP_BIN)" "$(LSP_PIN).new"
 	@mv -f "$(LSP_PIN).new" "$(LSP_PIN)"
