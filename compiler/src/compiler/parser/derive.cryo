@@ -22,6 +22,8 @@ import compiler::lex::lexer::{ Lexer };
 import compiler::diag::{ ErrorCode };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span::{ SourceSpan };
+import compiler::diag::suggestion::{ Applicability, Suggestion, SuggestionPart };
+import std::collections::string::{ String };
 import compiler::ast::{ ArrayAnnotation, NamedAnnotation, TraitBound, TraitRef, TypeAnnotation };
 import compiler::ast::declaration::{
     DeclarationNode, DeclKind, EnumVariant, FieldDecl, FunctionDecl, GenericParamDecl,
@@ -59,6 +61,10 @@ type struct DerivedTrait {
     /// The spelling as written (`Eq`, `cmp::Eq`): what the generated head
     /// and bounds name the trait by.
     text:       string;
+    /// The text deleting this entry from its clause leaves well formed: the
+    /// entry with the separator before it, or after it for the first, or
+    /// the whole clause for the only one.
+    removal:    SourceSpan;
 }
 
 /// A type's `with [...]` clause; `written` is false when the type has none.
@@ -66,9 +72,14 @@ type struct DeriveClause {
     written: boolean;
     span:    SourceSpan;
     entries: [DerivedTrait];
+    /// The clause as written, `with [Eq, Hash]`.
+    text:    string;
+    /// The clause with the space before it: what deleting it removes.
+    removal: SourceSpan;
 
     static none() -> DeriveClause {
-        return DeriveClause { written: false, span: SourceSpan::none(), entries: [] };
+        return DeriveClause { written: false, span: SourceSpan::none(), entries: [], text: "",
+                              removal: SourceSpan::none() };
     }
 }
 
@@ -243,22 +254,39 @@ implement struct Parser {
     /// after it, its bounds pushed onto `where_bounds`.  A clause written
     /// after the `where` is refused, and still read, so the implementations
     /// it asks for do not go missing as well.
-    parse_derive_and_where(mut &this, where_bounds: mut &[TraitBound]) -> DeriveClause {
+    parse_derive_and_where(mut &this, header_from: i64, where_bounds: mut &[TraitBound]) -> DeriveClause {
         mut clause: DeriveClause = DeriveClause::none();
         if (this.check(TokenType::KwWith)) { clause = this.parse_derive_clause(); }
+        mut where_from: i64 = -1;
+        mut where_span: SourceSpan = SourceSpan::none();
         if (this.check(TokenType::KwWhere)) {
+            where_from = this.pos;
+            where_span = this.current_span();
             const bounds: [TraitBound] = this.parse_trait_bounds();
             for (mut i: i64 = 0; i < bounds.length(); i++) { where_bounds.push(bounds[i].clone()); }
         }
         if (this.check(TokenType::KwWith)) {
             const with_span: SourceSpan = this.current_span();
+            const where_to: i64 = this.pos;
+            const late: DeriveClause = this.parse_derive_clause();
             mut d: Diagnostic = Diagnostic::error(ErrorCode::E0101_UNEXPECTED_TOKEN,
                 "a `with` clause goes before the `where` clause");
             d = d.at(with_span);
             d = d.help("a type header is written name and parameters, then `with [...]`, then `where`");
+            if (!clause.written && where_from >= 0) {
+                // Move the clause in front of `where`: the rewritten header
+                // is the message, the two edits the fix.
+                const where_text: string = this.tokens_text(where_from, where_to);
+                const header: string = this.tokens_text(header_from, where_from) + " " + late.text + " " + where_text;
+                mut parts: [SuggestionPart] = [];
+                parts.push(SuggestionPart::new(SourceSpan::new(where_span.file, where_span.start_line,
+                    where_span.start_col, where_span.start_line, where_span.start_col), late.text + " "));
+                parts.push(SuggestionPart::new(late.removal, ""));
+                d = d.suggest(Suggestion::multipart(parts, f"move the `with` clause before `where`: `{header}`",
+                    Applicability::MachineApplicable));
+            }
             this.ctx.emit_diagnostic(d);
             this.error_count += 1;
-            const late: DeriveClause = this.parse_derive_clause();
             if (!clause.written) {
                 clause = late;
             } else {
@@ -270,6 +298,8 @@ implement struct Parser {
 
     /// `with [A, B]`, `with` current.
     parse_derive_clause(mut &this) -> DeriveClause {
+        const before: SourceSpan = this.end_of_last_consumed();
+        const clause_from: i64 = this.pos;
         const with_tok: Token = this.advance();
         mut entries: [DerivedTrait] = [];
         this.consume(TokenType::LSquare, "`[`");
@@ -282,11 +312,29 @@ implement struct Parser {
                 annotation: annotation,
                 span:       this.span_from(entry_tok),
                 text:       this.tokens_text(from, this.last_consumed_index() + 1),
+                removal:    SourceSpan::none(),
             });
             if (!this.match_tok(TokenType::Comma)) { break; }
         }
         this.consume(TokenType::RSquare, "`]`");
-        return DeriveClause { written: true, span: this.span_from(with_tok), entries: entries };
+        const span: SourceSpan = this.span_from(with_tok);
+        const removal: SourceSpan = SourceSpan::new(span.file, before.start_line, before.start_col,
+            span.end_line, span.end_col);
+        for (mut i: i64 = 0; i < entries.length(); i++) {
+            const at: SourceSpan = entries[i].span;
+            if (entries.length() == 1) {
+                entries[i].removal = removal;
+            } else if (i == 0) {
+                const next: SourceSpan = entries[1].span;
+                entries[i].removal = SourceSpan::new(at.file, at.start_line, at.start_col, next.start_line, next.start_col);
+            } else {
+                const previous: SourceSpan = entries[i - 1].span;
+                entries[i].removal = SourceSpan::new(at.file, previous.end_line, previous.end_col, at.end_line, at.end_col);
+            }
+        }
+        return DeriveClause { written: true, span: span, entries: entries,
+                              text: this.tokens_text(clause_from, this.last_consumed_index() + 1),
+                              removal: removal };
     }
 
     /// Generate the implementations `clause` asks of the type `decl`, just
@@ -295,12 +343,14 @@ implement struct Parser {
         if (!clause.written || decl == null) { return; }
         if (clause.entries.length() == 0) {
             this.refuse_derive(clause.span, "a `with` clause lists no traits",
-                "list the traits to implement, `with [Eq, Clone]`, or remove the clause");
+                "list the traits to implement, `with [Eq, Clone]`, or remove the clause",
+                clause.removal, String::from("remove the empty `with` clause"), Applicability::MachineApplicable);
             return;
         }
         if (this.scope_depth > 0) {
             this.refuse_derive(clause.span, "a type declared in a function body cannot derive traits",
-                "the implementations a `with` clause generates are module items; declare the type at module level");
+                "the implementations a `with` clause generates are module items; declare the type at module level",
+                SourceSpan::none(), String::new(), Applicability::Unspecified);
             return;
         }
         mut shape: DerivedShape = DerivedShape {
@@ -327,7 +377,9 @@ implement struct Parser {
             }
             _ => {
                 this.refuse_derive(clause.span, "a union cannot derive traits",
-                    "a union does not record which of its fields it holds, so no implementation can be generated from them; write it by hand");
+                    "a union does not record which of its fields it holds, so no implementation can be generated from them; write it by hand",
+                    clause.removal, String::from("remove the `with` clause, and implement the traits the union needs by hand"),
+                    Applicability::MaybeIncorrect);
                 return;
             }
         }
@@ -348,7 +400,9 @@ implement struct Parser {
             match (item) {
                 Option::None => {
                     this.refuse_derive(entry.span, f"`{entry.text}` cannot be derived",
-                        "a `with` clause generates implementations of `Eq`, `Ord`, `Hash`, `Clone`, `Debug` and `Default`, written by those names; implement any other trait by hand");
+                        "a `with` clause generates implementations of `Eq`, `Ord`, `Hash`, `Clone`, `Debug` and `Default`, written by those names; implement any other trait by hand",
+                        entry.removal, f"remove `{entry.text}` from the `with` clause, and implement it by hand",
+                        Applicability::MaybeIncorrect);
                 }
                 Option::Some(trait_item) => {
                     mut listed: boolean = false;
@@ -357,11 +411,14 @@ implement struct Parser {
                     }
                     if (listed) {
                         this.refuse_derive(entry.span, f"`{entry.text}` is listed twice in the `with` clause",
-                            "list each trait once");
+                            "list each trait once",
+                            entry.removal, f"remove the second `{entry.text}`", Applicability::MachineApplicable);
                     } else if (shape.is_enum && trait_item == LangItem::Default) {
                         derived.push(trait_item);
                         this.refuse_derive(entry.span, "an enum cannot derive `Default`",
-                            "which variant is the default is the type's own choice; implement `Default` by hand");
+                            "which variant is the default is the type's own choice; implement `Default` by hand",
+                            entry.removal, f"remove `{entry.text}` from the `with` clause, and implement `Default` by hand returning the default variant",
+                            Applicability::MaybeIncorrect);
                     } else {
                         derived.push(trait_item);
                         this.generate_implementation(decl, &shape, &entry, trait_item, i);
@@ -371,10 +428,16 @@ implement struct Parser {
         }
     }
 
-    refuse_derive<T>(mut &this, span: SourceSpan, message: T, help: string) -> void where T: Display {
+    /// E0318 at `span`, with `help`, and - when `removal` is located - the
+    /// edit deleting it, described by `fix`.
+    refuse_derive<T>(mut &this, span: SourceSpan, message: T, help: string,
+                     removal: SourceSpan, fix: String, applicability: Applicability) -> void where T: Display {
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0318_CANNOT_DERIVE, message);
         d = d.at(span);
         d = d.help(help);
+        if (removal.has_location()) {
+            d = d.suggest(Suggestion::single(removal, "", fix, applicability));
+        }
         this.ctx.emit_diagnostic(d);
         this.error_count += 1;
     }
@@ -434,6 +497,7 @@ implement struct Parser {
         }
         block.derived_trait = Option::Some(item);
         block.derived_for = decl;
+        block.derived_removal = entry.removal;
         generated.span = entry.span;
 
         mut names: DerivedNames = DerivedNames { ctx: this.ctx };

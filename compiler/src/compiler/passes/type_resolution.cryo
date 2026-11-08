@@ -59,7 +59,7 @@ import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::edit_distance::{ find_best_candidate };
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::diag::source_span::{ SourceSpan };
-import compiler::diag::suggestion::{ Suggestion };
+import compiler::diag::suggestion::{ Applicability, Suggestion };
 import compiler::ast::node_locator::{ annotation_span };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::lang_item::{ LangItem };
@@ -1922,11 +1922,26 @@ type struct TypeResolutionPasses {
                     TypeResolutionPasses::extract_trait_leaf(node.trait_annotation);
                 const tname: string = ctx.intern_table.resolve(c_leaf);
                 const gname: string = ctx.intern_table.resolve(canonical_target);
-                ctx.emit_error_at(
-                    ErrorCode::E0308_CONFLICTING_TRAIT_IMPL,
+                mut cd: Diagnostic = Diagnostic::error(ErrorCode::E0308_CONFLICTING_TRAIT_IMPL,
                     fmt::format("conflicting implementations of trait `%s` for type `%s`: a trait may be implemented at most once per type, including across modules",
-                           tname, gname),
-                    decl.span);
+                           tname, gname));
+                cd = cd.at(decl.span);
+                // One of the two a `with [...]` entry generated: the entry
+                // is the other implementation, and deleting it keeps the
+                // written one.
+                const prior_block: ImplBlock* = DeclarationNode::impl_of(prior);
+                const derived: ImplBlock* = if (node.derived_removal.has_location()) {
+                    node
+                } else {
+                    if (prior_block != null && prior_block.derived_removal.has_location()) { prior_block } else { null }
+                };
+                if (derived != null) {
+                    cd = cd.also_at(annotation_span(derived.trait_annotation), "derived here");
+                    cd = cd.suggest(Suggestion::single(derived.derived_removal, "",
+                        f"remove `{tname}` from the `with` clause, keeping the implementation written by hand",
+                        Applicability::MaybeIncorrect));
+                }
+                ctx.emit_diagnostic(cd);
             } else {
                 // Not a second copy of one head, so ask whether an earlier
                 // head under the same (trait, target) key OVERLAPS it: some

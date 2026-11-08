@@ -3780,6 +3780,11 @@ type struct SemaVisitor {
                     item.derived_spelling(), written, item.derived_spelling()));
             d = d.at(span);
             d = d.help(fmt::format("implement `%s` by hand, or derive the standard trait under its own name", written));
+            if (node.derived_removal.has_location()) {
+                d = d.suggest(Suggestion::single(node.derived_removal, "",
+                    f"remove `{item.derived_spelling()}` from the `with` clause, and implement `{written}` by hand",
+                    Applicability::MaybeIncorrect));
+            }
             this.ctx.emit_diagnostic(d);
             return false;
         }
@@ -3794,7 +3799,7 @@ type struct SemaVisitor {
                     if (field == null) { continue; }
                     const field_name: string = this.intern.resolve(field.name);
                     if (!this.derived_part_holds(field.resolved_type, standard, item, &f"field `{field_name}`",
-                            owner_name, annotation_span(field.type_annotation))) {
+                            owner_name, annotation_span(field.type_annotation), node.derived_removal)) {
                         holds = false;
                     }
                 }
@@ -3811,7 +3816,7 @@ type struct SemaVisitor {
                     const payloads: &[TypeRef] = &info.variants[v].payload_types;
                     for (mut p: i64 = 0; p < payloads.length() && p < variant.associated_types.length(); p++) {
                         if (!this.derived_part_holds(payloads[p], standard, item, &f"the payload of `{variant_name}`",
-                                owner_name, annotation_span(variant.associated_types[p]))) {
+                                owner_name, annotation_span(variant.associated_types[p]), node.derived_removal)) {
                             holds = false;
                         }
                     }
@@ -3829,7 +3834,7 @@ type struct SemaVisitor {
     /// template does, and that implementation's own clause is checked
     /// against those bounds where the generated body uses the part.
     derived_part_holds(mut &this, part: TypeRef, trait_def: DefId, item: LangItem, part_shown: &String,
-                       owner_name: string, span: SourceSpan) -> boolean {
+                       owner_name: string, span: SourceSpan, removal: SourceSpan) -> boolean {
         const t: Type* = this.arena.lookup(part);
         if (t == null || t.kind == TypeKind::GenericParam) { return true; }
         const holds: boolean = if (this.arena.contains_generic_param(part)) {
@@ -3843,8 +3848,19 @@ type struct SemaVisitor {
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0318_CANNOT_DERIVE,
             f"`{owner_name}` cannot derive `{trait_name}`: {part_shown.as_str()} has type `{shown_part}`, which does not implement `{trait_name}`");
         d = d.at(span);
-        d = d.help(fmt::format("implement `%s` for `%s`, or implement `%s` for `%s` by hand",
-            trait_name, shown_part, trait_name, owner_name));
+        if (item == LangItem::Ord && t.kind == TypeKind::Float) {
+            // A float's `==` is IEEE equality, which no total order agrees
+            // with; its explicit total order is `total_compare`.
+            d = d.help(f"`{shown_part}` has no `Ord`: compare {part_shown.as_str()} with `{shown_part}::total_compare` in an `Ord` for `{owner_name}` written by hand, or remove `Ord` from the `with` clause");
+        } else if (t.kind == TypeKind::Struct || t.kind == TypeKind::Enum || t.kind == TypeKind::InstantiatedType) {
+            d = d.help(f"give `{shown_part}` `{trait_name}` - `with [{trait_name}]` on its declaration, or an implementation by hand - or remove `{trait_name}` from `{owner_name}`'s `with` clause");
+        } else {
+            d = d.help(f"implement `{trait_name}` for `{owner_name}` by hand, or remove it from the `with` clause");
+        }
+        if (removal.has_location()) {
+            d = d.suggest(Suggestion::single(removal, "",
+                f"remove `{trait_name}` from `{owner_name}`'s `with` clause", Applicability::MaybeIncorrect));
+        }
         this.ctx.emit_diagnostic(d);
         return false;
     }
