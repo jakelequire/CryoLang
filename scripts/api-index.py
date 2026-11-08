@@ -96,6 +96,9 @@ TYPE_RE = re.compile(
 TRAIT_RE = re.compile(
     r"^\s*(?:(public|private|internal)\s+)?type\s+trait\s+([A-Za-z_]\w*)\s*(<[^{;]*>)?"
 )
+# A type's `with [Eq, Ord]` clause: each entry is an implementation the
+# compiler generates, listed as a written one is.
+WITH_RE = re.compile(r"^\s*with\s*\[([^\]]*)\]")
 # `private:` inside a body: the members after it take that visibility until
 # the next label.
 LABEL_RE = re.compile(r"^\s*(public|private|internal)\s*:\s*$")
@@ -237,6 +240,11 @@ def scan_file(path):
         if m:
             vis, kind, name, generics = m.group(1), m.group(2), m.group(3), m.group(4) or ""
             entries.append(("type", f"{kind} {name}{clean_sig(generics)}", tag(vis)))
+            derived = WITH_RE.match(code[m.end():])
+            if derived:
+                for trait in derived.group(1).split(","):
+                    if trait.strip():
+                        entries.append(("impl", f"{name}{clean_sig(generics)}: implements {clean_sig(trait)}", ""))
             if "{" in code:
                 type_stack.append([name, depth, None])
                 opened_type = True
