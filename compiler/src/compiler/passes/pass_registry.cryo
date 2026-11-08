@@ -44,7 +44,7 @@ import compiler::ast::declaration::{
     TraitDecl, UnionDecl
 };
 import compiler::ast::node::{ Node, ProgramNode };
-import compiler::compilation_context::{ CompilationContext, LangRef };
+import compiler::compilation_context::{ CompilationContext, LangRef, LangSite };
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::module_graph::{ LexedSource, ModuleGraph };
@@ -819,36 +819,51 @@ type struct PassRegistry {
                 continue;
             }
             const spelling: SymbolStr = ctx.defs.leaf_of(id).spelling();
-            match (r.node) {
-                // A lang ref on a pattern is the desugarings' `Item::variant`.
-                Node::Pattern(p) => {
-                    p.enum_payload().enum_name = spelling;
-                    p.enum_payload().res.settle(Res::Def(id));
+            match (r.site) {
+                LangSite::Annotation(annotation) => {
+                    annotation.name = spelling;
+                    annotation.res.settle(Res::Def(id));
                 }
-                Node::Expr(e) => {
-                    if (ExpressionNode::scope_resolution_of(e) != null) {
-                        ExpressionNode::scope_resolution_of(e).scope_name = spelling;
-                        ExpressionNode::scope_resolution_of(e).scope_res.settle(
-                            Res::TypeRelative(ResBase::Def(id), 1));
-                    } else if (ExpressionNode::member_access_of(e) != null) {
-                        // The trait and its method's position, as an operator's
-                        // desugar is stamped: a call a bound answers in a
-                        // generic body is selected by the position.
-                        mut access: mut MemberAccessExpr* = ExpressionNode::member_access_of(e);
-                        access.set_resolved_trait_item(id,
-                            ctx.generic_registry.trait_item_slot(id, access.member));
-                    } else if (ExpressionNode::identifier_of(e) != null) {
-                        // A function generated code calls: an f-string's
-                        // builders.
-                        ExpressionNode::identifier_of(e).name = spelling;
-                        ExpressionNode::identifier_of(e).res.settle(Res::Def(id));
-                    }
+                LangSite::Bound(trait_ref) => {
+                    trait_ref.path.push(spelling);
+                    trait_ref.resolved = id;
                 }
-                _ => { }
+                LangSite::Node(node) => { PassRegistry::settle_lang_node(ctx, node, id, spelling); }
             }
         }
         while (ctx.lang_refs.length() > kept) {
             ctx.lang_refs.pop();
+        }
+    }
+
+    /// Answer one expression or pattern a desugaring wrote naming the
+    /// item `id`, spelled `spelling` by its declaration.
+    static settle_lang_node(ctx: mut CompilationContext*, node: Node, id: DefId, spelling: SymbolStr) -> void {
+        match (node) {
+            // A lang ref on a pattern is the desugarings' `Item::variant`.
+            Node::Pattern(p) => {
+                p.enum_payload().enum_name = spelling;
+                p.enum_payload().res.settle(Res::Def(id));
+            }
+            Node::Expr(e) => {
+                if (ExpressionNode::scope_resolution_of(e) != null) {
+                    ExpressionNode::scope_resolution_of(e).scope_name = spelling;
+                    ExpressionNode::scope_resolution_of(e).scope_res.settle(
+                        Res::TypeRelative(ResBase::Def(id), 1));
+                } else if (ExpressionNode::member_access_of(e) != null) {
+                    // The trait and its method's position, as an operator's
+                    // desugar is stamped: a call a bound answers in a
+                    // generic body is selected by the position.
+                    mut access: mut MemberAccessExpr* = ExpressionNode::member_access_of(e);
+                    access.set_resolved_trait_item(id,
+                        ctx.generic_registry.trait_item_slot(id, access.member));                } else if (ExpressionNode::identifier_of(e) != null) {
+                    // A function generated code calls: an f-string's
+                    // builders.
+                    ExpressionNode::identifier_of(e).name = spelling;
+                    ExpressionNode::identifier_of(e).res.settle(Res::Def(id));
+                }
+            }
+            _ => { }
         }
     }
 

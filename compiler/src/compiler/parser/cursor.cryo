@@ -10,6 +10,7 @@ import compiler::lex::{ Token, TokenType };
 import compiler::lex::lexer::{ Lexer };
 import compiler::diag::{ diagnostic, ErrorCode, source_span, suggestion };
 import compiler::ast::node::{ StaticAssertItem };
+import compiler::ast::declaration::{ DeclarationNode };
 import compiler::compilation_context::{ CompilationContext };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import std::collections::string::{ String };
@@ -119,6 +120,10 @@ type struct Parser {
     /// parse and attached to the ProgramNode before it is returned. Kept off
     /// the statement stream so they need no item kind or walker handling.
     static_assert_items: [StaticAssertItem*];
+
+    /// The implementations a type's `with [...]` clause generated, waiting
+    /// to be listed among the module's items beside the type.
+    derived_implementations: [DeclarationNode*];
 }
 
 implement struct Parser {
@@ -148,6 +153,7 @@ implement struct Parser {
             current_type_name:      "",
             fstr_span:              SourceSpan::none(),
             static_assert_items:    [],
+            derived_implementations: [],
         };
     }
 
@@ -418,6 +424,27 @@ implement struct Parser {
             prev_end = tok.column + tok.source_length;
         }
         return text;
+    }
+
+    /// The written text of `span`, a construct already parsed: its tokens
+    /// as `tokens_text` writes them.  Empty for a span no consumed token
+    /// starts.
+    written_text_of(&this, span: SourceSpan) -> string {
+        mut from: i64 = -1;
+        for (mut i: i64 = 0; i < this.pos && i < this.tokens.length(); i++) {
+            const tok: Token = this.tokens[i];
+            if (tok.line as u32 == span.start_line && tok.column as u32 == span.start_col) { from = i; break; }
+        }
+        if (from < 0) { return ""; }
+        mut to: i64 = from;
+        while (to < this.pos && to < this.tokens.length()) {
+            const tok: Token = this.tokens[to];
+            const line: u32 = tok.line as u32;
+            const column: u32 = tok.column as u32;
+            if (line > span.end_line || (line == span.end_line && column >= span.end_col)) { break; }
+            to++;
+        }
+        return this.tokens_text(from, to);
     }
 
     static is_comment(kind: TokenType) -> boolean {

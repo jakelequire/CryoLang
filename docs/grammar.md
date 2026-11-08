@@ -178,6 +178,7 @@ Visibility         ::= "public" | "internal" | "private"
    to refuse it where it is written (E0117).                          *)
 
 AggregateDecl      ::= "type"? "struct" Ident Generics?
+                       DeriveClause?
                        ("where" WhereClause)?        (* bounds on the declaration's own
                                                         parameters; checked per instantiation *)
                        "{" Member* "}"
@@ -216,6 +217,7 @@ Method             ::= "async"? MemberName Generics?
                        (Block | ";")
 
 EnumDecl           ::= "type"? "enum" Ident Generics? (":" Type)?
+                       DeriveClause?
                        ("where" WhereClause)?
                        "{" (EnumVariant ("," | ";"))* "}"
                        (* the optional ":" Type is the explicit discriminant
@@ -223,6 +225,12 @@ EnumDecl           ::= "type"? "enum" Ident Generics? (":" Type)?
 EnumVariant        ::= Ident
                      | Ident "=" NumLit
                      | Ident "(" Type ("," Type)* ")"
+
+(* The traits the compiler implements for the type, field by field:
+   `Eq`, `Ord`, `Hash`, `Clone`, `Debug` and `Default` (not `Default`
+   on an enum).  Read on a union only to refuse it (E0318); written
+   after the WhereClause it is refused as out of order (E0101).        *)
+DeriveClause       ::= "with" "[" Ident ("::" Ident)* ("," Ident ("::" Ident)*)* ","? "]"
 
 UnionDecl          ::= "type" "union" Ident Generics?
                        ("where" WhereClause)?

@@ -1,0 +1,691 @@
+///! Derive
+///!
+///! A struct's or enum's `with [Eq, Hash]` clause, and the implementations
+///! it generates.  Each listed trait becomes one `implement` block, written
+///! as Cryo source, parsed by a parser of its own and listed among the
+///! module's items beside the type, so every later stage handles it as it
+///! handles a written one.
+///!
+///! Which implementation is generated is chosen by the trait's spelling as
+///! written in the clause; the head names the trait by that spelling in the
+///! type's scope, and the type check confirms the two agree.  Everything
+///! else the generated code names - `Ordering`, `Formatter`, the traits'
+///! methods - it names by identity: those spellings are placeholders the
+///! parser turns into language-item references, so a module that declares
+///! its own `Ordering`, or a field type with a method of its own named
+///! `equals`, changes nothing.
+
+namespace compiler::parser::derive;
+
+import compiler::lex::{ Token, TokenType };
+import compiler::lex::lexer::{ Lexer };
+import compiler::diag::{ ErrorCode };
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::ast::{ ArrayAnnotation, NamedAnnotation, TraitBound, TraitRef, TypeAnnotation };
+import compiler::ast::declaration::{
+    DeclarationNode, DeclKind, EnumVariant, FieldDecl, FunctionDecl, GenericParamDecl,
+    ImplBlock, MethodDecl
+};
+import compiler::ast::expression::{ ExpressionNode, MemberAccessExpr, ScopeResolutionExpr };
+import compiler::ast::node::{ Node };
+import compiler::ast::node_locator::{ annotation_span };
+import compiler::ast::walk::{ Walk };
+import compiler::compilation_context::{ CompilationContext };
+import compiler::parser::cursor::{ Parser };
+import compiler::resolver::lang_item::{ LangItem };
+import compiler::resolver::qualified_name::{ QualifiedName };
+import compiler::resolver::res::{ ResSlot };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import std::fmt;
+import std::fmt::display::{ Display };
+
+/// What a placeholder spelling starts with.  The rest is the item's own
+/// spelling (`Ordering`, `equals`), which the reference keeps once settled.
+private const PLACEHOLDER_PREFIX: string = "__derived_";
+
+/// The column generated text starts at, on the line of the clause entry it
+/// was generated for, and the room each entry's text has before the next
+/// one's.  Generated code is one line, so its tokens sit past the end of any
+/// written line and no two share a position with each other or with
+/// written code - a position is what the name layer records a reference by.
+private const GENERATED_COLUMN: u32 = 0x8000;
+private const GENERATED_COLUMN_STRIDE: u32 = 0x1000;
+
+/// One trait a `with [...]` clause lists, as written.
+type struct DerivedTrait {
+    annotation: mut TypeAnnotation*;
+    span:       SourceSpan;
+    /// The spelling as written (`Eq`, `cmp::Eq`): what the generated head
+    /// and bounds name the trait by.
+    text:       string;
+}
+
+/// A type's `with [...]` clause; `written` is false when the type has none.
+type struct DeriveClause {
+    written: boolean;
+    span:    SourceSpan;
+    entries: [DerivedTrait];
+
+    static none() -> DeriveClause {
+        return DeriveClause { written: false, span: SourceSpan::none(), entries: [] };
+    }
+}
+
+/// Turns the placeholders in one generated implementation into references
+/// to the language items they stand for.
+type struct DerivedNames {
+    ctx: mut CompilationContext*;
+
+    /// The item a placeholder spelling's rest stands for, or none.
+    static item_spelled(rest: string) -> Option<LangItem> {
+        return match (rest) {
+            "Ordering"  => { Option::Some(LangItem::Ordering) }
+            "Formatter" => { Option::Some(LangItem::Formatter) }
+            "FmtError"  => { Option::Some(LangItem::FormatError) }
+            "Result"    => { Option::Some(LangItem::Result) }
+            "Default"   => { Option::Some(LangItem::Default) }
+            "Array"     => { Option::Some(LangItem::Array) }
+            "Hasher"    => { Option::Some(LangItem::Hasher) }
+            "equals"    => { Option::Some(LangItem::Eq) }
+            "compare"   => { Option::Some(LangItem::Ord) }
+            "hash"      => { Option::Some(LangItem::Hash) }
+            "clone"     => { Option::Some(LangItem::Clone) }
+            _           => { Option::None }
+        };
+    }
+
+    /// The rest of `spelling` after the placeholder prefix, or empty when it
+    /// is no placeholder.
+    static placeholder_rest(spelling: string) -> string {
+        const prefix_length: i64 = PLACEHOLDER_PREFIX.length() as i64;
+        if (spelling.length() as i64 <= prefix_length) { return ""; }
+        if (spelling.substr(0, prefix_length) != PLACEHOLDER_PREFIX) { return ""; }
+        return spelling.substr(prefix_length, spelling.length() as i64 - prefix_length);
+    }
+
+    /// Each type in the tree `annotation` spelled by a placeholder.
+    name_types(mut &this, annotation: TypeAnnotation*) -> void {
+        if (annotation == null) { return; }
+        match (*annotation) {
+            TypeAnnotation::Named(n) => {
+                const rest: string = DerivedNames::placeholder_rest(this.ctx.resolve_str(n.name));
+                match (DerivedNames::item_spelled(rest)) {
+                    Option::Some(item) => { this.ctx.note_lang_annotation(n, item); }
+                    Option::None       => { }
+                }
+            }
+            TypeAnnotation::Generic(g) => {
+                this.name_types(g.base);
+                for (mut i: i64 = 0; i < g.args.length(); i++) { this.name_types(g.args[i]); }
+            }
+            TypeAnnotation::Reference(r) => { this.name_types(r.inner); }
+            TypeAnnotation::Pointer(p)   => { this.name_types(p.inner); }
+            _ => { }
+        }
+    }
+}
+
+implement trait Walk for DerivedNames {
+    walk_annotation(mut &this, annotation: TypeAnnotation*) -> void {
+        this.name_types(annotation);
+    }
+
+    walk_scope_resolution(mut &this, e: mut ExpressionNode*, n: mut ScopeResolutionExpr*) -> void {
+        const rest: string = DerivedNames::placeholder_rest(this.ctx.resolve_str(n.scope_name));
+        match (DerivedNames::item_spelled(rest)) {
+            Option::Some(item) => {
+                n.scope_res = ResSlot::Lang(item);
+                this.ctx.note_lang_ref(Node::Expr(e), item);
+            }
+            Option::None => { }
+        }
+        ScopeResolutionExpr::walk_children(n, this);
+    }
+
+    walk_member_access(mut &this, e: mut ExpressionNode*, n: mut MemberAccessExpr*) -> void {
+        const rest: string = DerivedNames::placeholder_rest(this.ctx.resolve_str(n.member));
+        match (DerivedNames::item_spelled(rest)) {
+            Option::Some(item) => {
+                n.member = this.ctx.intern(rest);
+                this.ctx.note_lang_ref(Node::Expr(e), item);
+            }
+            Option::None => { }
+        }
+        MemberAccessExpr::walk_children(n, this);
+    }
+}
+
+/// The parts of a struct or enum generated text is written from.
+type struct DerivedShape {
+    type_name:   string;
+    parameters:  [string];
+    /// A struct's fields; empty on an enum.
+    fields:      [FieldDecl*];
+    /// An enum's variants; empty on a struct.
+    variants:    [EnumVariant*];
+    is_enum:     boolean;
+
+    /// `<T, U>`, or nothing for a type without parameters.
+    parameter_list(&this) -> string {
+        if (this.parameters.length() == 0) { return ""; }
+        mut text: string = "<";
+        for (mut i: i64 = 0; i < this.parameters.length(); i++) {
+            if (i > 0) { text = text + ", "; }
+            text = text + this.parameters[i];
+        }
+        return text + ">";
+    }
+
+    /// The type as its own implementations name it, `Pair<T, U>`.
+    self_type(&this) -> string {
+        return this.type_name + this.parameter_list();
+    }
+
+    /// The type as a struct literal spells it, `Pair::<T, U>`.
+    literal_type(&this) -> string {
+        if (this.parameters.length() == 0) { return this.type_name; }
+        return this.type_name + "::" + this.parameter_list();
+    }
+
+    /// A name for a method's own type parameter that none of the type's
+    /// parameters already has.
+    fresh_parameter(&this, base: string) -> string {
+        mut candidate: string = base;
+        mut suffix: i64 = 0;
+        while (this.names_parameter(candidate)) {
+            suffix++;
+            candidate = base + fmt::format("%lld", suffix).into_raw();
+        }
+        return candidate;
+    }
+
+    names_parameter(&this, name: string) -> boolean {
+        for (mut i: i64 = 0; i < this.parameters.length(); i++) {
+            if (this.parameters[i] == name) { return true; }
+        }
+        return false;
+    }
+
+    /// `Name::Variant(a0, a1)` binding each payload as `<prefix><index>`,
+    /// `Name::Variant(_, _)` with an empty prefix, `Name::Variant` without
+    /// a payload.
+    variant_pattern(&this, variant: EnumVariant*, prefix: string, ctx: CompilationContext*) -> string {
+        mut text: string = this.type_name + "::" + ctx.resolve_str(variant.name);
+        const count: i64 = variant.associated_types.length();
+        if (count == 0) { return text; }
+        text = text + "(";
+        for (mut i: i64 = 0; i < count; i++) {
+            if (i > 0) { text = text + ", "; }
+            if (prefix == "") {
+                text = text + "_";
+            } else {
+                text = text + prefix + fmt::format("%lld", i).into_raw();
+            }
+        }
+        return text + ")";
+    }
+
+    /// `match (<subject>) { V(_) => { 0 } W => { 1 } }`: the variant's
+    /// position among the enum's variants.
+    ordinal_of(&this, subject: string, ctx: CompilationContext*) -> string {
+        mut text: string = "match (" + subject + ") { ";
+        for (mut v: i64 = 0; v < this.variants.length(); v++) {
+            text = text + this.variant_pattern(this.variants[v], "", ctx)
+                + " => { " + fmt::format("%lld", v).into_raw() + " } ";
+        }
+        return text + "}";
+    }
+}
+
+implement struct Parser {
+    /// The `with [...]` clause of a type header and the `where` clause
+    /// after it, its bounds pushed onto `where_bounds`.  A clause written
+    /// after the `where` is refused, and still read, so the implementations
+    /// it asks for do not go missing as well.
+    parse_derive_and_where(mut &this, where_bounds: mut &[TraitBound]) -> DeriveClause {
+        mut clause: DeriveClause = DeriveClause::none();
+        if (this.check(TokenType::KwWith)) { clause = this.parse_derive_clause(); }
+        if (this.check(TokenType::KwWhere)) {
+            const bounds: [TraitBound] = this.parse_trait_bounds();
+            for (mut i: i64 = 0; i < bounds.length(); i++) { where_bounds.push(bounds[i].clone()); }
+        }
+        if (this.check(TokenType::KwWith)) {
+            const with_span: SourceSpan = this.current_span();
+            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0101_UNEXPECTED_TOKEN,
+                "a `with` clause goes before the `where` clause");
+            d = d.at(with_span);
+            d = d.help("a type header is written name and parameters, then `with [...]`, then `where`");
+            this.ctx.emit_diagnostic(d);
+            this.error_count += 1;
+            const late: DeriveClause = this.parse_derive_clause();
+            if (!clause.written) {
+                clause = late;
+            } else {
+                for (mut i: i64 = 0; i < late.entries.length(); i++) { clause.entries.push(late.entries[i]); }
+            }
+        }
+        return clause;
+    }
+
+    /// `with [A, B]`, `with` current.
+    parse_derive_clause(mut &this) -> DeriveClause {
+        const with_tok: Token = this.advance();
+        mut entries: [DerivedTrait] = [];
+        this.consume(TokenType::LSquare, "`[`");
+        while (!this.check(TokenType::RSquare) && !this.is_at_end() && !this.panic_mode) {
+            const entry_tok: Token = this.current();
+            const from: i64 = this.pos;
+            const annotation: mut TypeAnnotation* = this.parse_type_annotation();
+            if (annotation == null) { break; }
+            entries.push(DerivedTrait {
+                annotation: annotation,
+                span:       this.span_from(entry_tok),
+                text:       this.tokens_text(from, this.last_consumed_index() + 1),
+            });
+            if (!this.match_tok(TokenType::Comma)) { break; }
+        }
+        this.consume(TokenType::RSquare, "`]`");
+        return DeriveClause { written: true, span: this.span_from(with_tok), entries: entries };
+    }
+
+    /// Generate the implementations `clause` asks of the type `decl`, just
+    /// parsed, for the program to list beside it; or refuse the clause.
+    derive_implementations(mut &this, decl: DeclarationNode*, clause: &DeriveClause) -> void {
+        if (!clause.written || decl == null) { return; }
+        if (clause.entries.length() == 0) {
+            this.refuse_derive(clause.span, "a `with` clause lists no traits",
+                "list the traits to implement, `with [Eq, Clone]`, or remove the clause");
+            return;
+        }
+        if (this.scope_depth > 0) {
+            this.refuse_derive(clause.span, "a type declared in a function body cannot derive traits",
+                "the implementations a `with` clause generates are module items; declare the type at module level");
+            return;
+        }
+        mut shape: DerivedShape = DerivedShape {
+            type_name: "", parameters: [], fields: [], variants: [], is_enum: false,
+        };
+        mut parameters: [DeclarationNode*] = [];
+        match (&decl.kind) {
+            DeclKind::Struct(s) => {
+                shape.type_name = this.ctx.resolve_str(s.name);
+                for (mut i: i64 = 0; i < s.generic_params.length(); i++) { parameters.push(s.generic_params[i]); }
+                for (mut i: i64 = 0; i < s.fields.length(); i++) {
+                    const field: FieldDecl* = DeclarationNode::field_of(s.fields[i]);
+                    if (field != null) { shape.fields.push(field); }
+                }
+            }
+            DeclKind::Enum(e) => {
+                shape.type_name = this.ctx.resolve_str(e.name);
+                shape.is_enum = true;
+                for (mut i: i64 = 0; i < e.generic_params.length(); i++) { parameters.push(e.generic_params[i]); }
+                for (mut i: i64 = 0; i < e.variants.length(); i++) {
+                    const variant: EnumVariant* = DeclarationNode::variant_of(e.variants[i]);
+                    if (variant != null) { shape.variants.push(variant); }
+                }
+            }
+            _ => {
+                this.refuse_derive(clause.span, "a union cannot derive traits",
+                    "a union does not record which of its fields it holds, so no implementation can be generated from them; write it by hand");
+                return;
+            }
+        }
+        for (mut i: i64 = 0; i < parameters.length(); i++) {
+            shape.parameters.push(this.ctx.resolve_str(DeclarationNode::generic_param_of(parameters[i]).name));
+        }
+
+        mut derived: [LangItem] = [];
+        for (mut i: i64 = 0; i < clause.entries.length(); i++) {
+            const entry: DerivedTrait = clause.entries[i];
+            mut item: Option<LangItem> = Option::None;
+            match (*entry.annotation) {
+                TypeAnnotation::Named(n) => {
+                    item = LangItem::derivable_spelled(QualifiedName::leaf_of(this.ctx.resolve_str(n.name)));
+                }
+                _ => { }
+            }
+            match (item) {
+                Option::None => {
+                    this.refuse_derive(entry.span, f"`{entry.text}` cannot be derived",
+                        "a `with` clause generates implementations of `Eq`, `Ord`, `Hash`, `Clone`, `Debug` and `Default`, written by those names; implement any other trait by hand");
+                }
+                Option::Some(trait_item) => {
+                    mut listed: boolean = false;
+                    for (mut k: i64 = 0; k < derived.length(); k++) {
+                        if (derived[k] == trait_item) { listed = true; }
+                    }
+                    if (listed) {
+                        this.refuse_derive(entry.span, f"`{entry.text}` is listed twice in the `with` clause",
+                            "list each trait once");
+                    } else if (shape.is_enum && trait_item == LangItem::Default) {
+                        derived.push(trait_item);
+                        this.refuse_derive(entry.span, "an enum cannot derive `Default`",
+                            "which variant is the default is the type's own choice; implement `Default` by hand");
+                    } else {
+                        derived.push(trait_item);
+                        this.generate_implementation(decl, &shape, &entry, trait_item, i);
+                    }
+                }
+            }
+        }
+    }
+
+    refuse_derive<T>(mut &this, span: SourceSpan, message: T, help: string) -> void where T: Display {
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0318_CANNOT_DERIVE, message);
+        d = d.at(span);
+        d = d.help(help);
+        this.ctx.emit_diagnostic(d);
+        this.error_count += 1;
+    }
+
+    /// Write, parse and record the implementation of `item` for `shape`,
+    /// asked for by `entry`, the `index`-th entry of its clause.
+    generate_implementation(mut &this, decl: DeclarationNode*, shape: &DerivedShape, entry: &DerivedTrait,
+                            item: LangItem, index: i64) -> void {
+        mut head: string = "implement" + shape.parameter_list() + " trait " + entry.text
+            + " for " + shape.self_type();
+        if (shape.parameters.length() > 0) {
+            head = head + " where ";
+            for (mut i: i64 = 0; i < shape.parameters.length(); i++) {
+                if (i > 0) { head = head + ", "; }
+                head = head + shape.parameters[i] + ": " + entry.text;
+            }
+        }
+        const method: string = match (item) {
+            LangItem::Eq      => { this.derived_equals(shape) }
+            LangItem::Ord     => { this.derived_compare(shape) }
+            LangItem::Hash    => { this.derived_hash(shape) }
+            LangItem::Clone   => { this.derived_clone(shape) }
+            LangItem::Debug   => { this.derived_debug(shape) }
+            _                 => { this.derived_default(shape) }
+        };
+        const text: string = head + " { " + method + " }";
+
+        mut lexer: Lexer = Lexer::new(this.source_file, text, this.ctx.diagnostics);
+        lexer.seed_location(entry.span.start_line as int,
+            (GENERATED_COLUMN + GENERATED_COLUMN_STRIDE * (index as u32)) as int);
+        mut generator: Parser = Parser::new(lexer.lex(), this.source_file, this.ctx);
+        const generated: mut DeclarationNode* = generator.parse_implementation_block();
+        if (generated == null) { return; }
+        const block: mut ImplBlock* = DeclarationNode::impl_of(generated);
+        if (block == null) { return; }
+
+        // The head and the bounds name the trait as the entry writes it, so
+        // a reference to them is a reference to the entry.
+        Parser::respan_annotation(block.trait_annotation, entry.span);
+        // The target is the type itself, not written at the entry; a report
+        // about the head falls back to the block's span, the entry.
+        block.target_type_span = SourceSpan::none();
+        for (mut b: i64 = 0; b < block.where_bounds.length(); b++) {
+            for (mut r: i64 = 0; r < block.where_bounds[b].trait_refs.length(); r++) {
+                block.where_bounds[b].trait_refs[r].span = entry.span;
+            }
+        }
+        // The type's own bounds hold of each implementation.
+        match (&decl.kind) {
+            DeclKind::Struct(s) => {
+                for (mut b: i64 = 0; b < s.where_bounds.length(); b++) { block.where_bounds.push(s.where_bounds[b].clone()); }
+            }
+            DeclKind::Enum(e) => {
+                for (mut b: i64 = 0; b < e.where_bounds.length(); b++) { block.where_bounds.push(e.where_bounds[b].clone()); }
+            }
+            _ => { }
+        }
+        block.derived_trait = Option::Some(item);
+        block.derived_for = decl;
+        generated.span = entry.span;
+
+        mut names: DerivedNames = DerivedNames { ctx: this.ctx };
+        names.walk_decl(generated);
+        if (item == LangItem::Hash) {
+            // `where H: Hasher` on the method names the trait by identity.
+            const hash_method: MethodDecl* = DeclarationNode::method_of(block.methods[0]);
+            const hash_function: mut FunctionDecl* = DeclarationNode::fn_of(hash_method.func);
+            const hasher_ref: mut TraitRef* = &hash_function.trait_bounds[0].trait_refs[0];
+            hasher_ref.path = [];
+            this.ctx.note_lang_bound(hasher_ref, LangItem::Hasher);
+        }
+        this.derived_implementations.push(generated);
+    }
+
+    /// Place every name in the tree `annotation` at `span`.
+    static respan_annotation(annotation: TypeAnnotation*, span: SourceSpan) -> void {
+        if (annotation == null) { return; }
+        match (*annotation) {
+            TypeAnnotation::Named(n)   => { n.span = span; }
+            TypeAnnotation::Generic(g) => { Parser::respan_annotation(g.base, span); }
+            _                          => { }
+        }
+    }
+
+    /// `this.f.equals(&other.f) && ...`, or the enum's variant-by-variant
+    /// comparison.
+    derived_equals(&this, shape: &DerivedShape) -> string {
+        mut body: string = "";
+        if (!shape.is_enum) {
+            if (shape.fields.length() == 0) {
+                body = "true";
+            } else {
+                for (mut i: i64 = 0; i < shape.fields.length(); i++) {
+                    const name: string = this.ctx.resolve_str(shape.fields[i].name);
+                    if (i > 0) { body = body + " && "; }
+                    body = body + "this." + name + ".__derived_equals(&other." + name + ")";
+                }
+            }
+        } else if (shape.variants.length() == 0) {
+            body = "true";
+        } else {
+            body = "match (&this) { ";
+            for (mut v: i64 = 0; v < shape.variants.length(); v++) {
+                const variant: EnumVariant* = shape.variants[v];
+                mut same: string = "true";
+                for (mut p: i64 = 0; p < variant.associated_types.length(); p++) {
+                    const position: string = fmt::format("%lld", p).into_raw();
+                    const test: string = "a" + position + ".__derived_equals(b" + position + ")";
+                    same = if (p == 0) { test } else { same + " && " + test };
+                }
+                body = body + shape.variant_pattern(variant, "a", this.ctx) + " => { match (other) { "
+                    + shape.variant_pattern(variant, "b", this.ctx) + " => { " + same + " } "
+                    + Parser::otherwise(shape, "false") + "} } ";
+            }
+            body = body + "}";
+        }
+        return "equals(&this, other: &" + shape.self_type() + ") -> boolean { return " + body + "; }";
+    }
+
+    /// `_ => { <value> }` where an enum has another variant to match, and
+    /// nothing where the variants already matched are all there are.
+    static otherwise(shape: &DerivedShape, value: string) -> string {
+        if (shape.variants.length() < 2) { return ""; }
+        return "_ => { " + value + " } ";
+    }
+
+    /// The fields compared in declaration order, the first that differs
+    /// deciding; an enum's variants in declaration order, then the payloads
+    /// of two of the same variant.
+    derived_compare(&this, shape: &DerivedShape) -> string {
+        const ordering: string = "__derived_Ordering";
+        mut body: string = "";
+        if (!shape.is_enum) {
+            if (shape.fields.length() == 0) {
+                body = "return " + ordering + "::Equal; ";
+            } else {
+                mut lefts: [string] = [];
+                mut rights: [string] = [];
+                for (mut i: i64 = 0; i < shape.fields.length(); i++) {
+                    const name: string = this.ctx.resolve_str(shape.fields[i].name);
+                    lefts.push("this." + name);
+                    rights.push("&other." + name);
+                }
+                body = Parser::compare_in_order(&lefts, &rights, ordering, "return ", "; ");
+            }
+        } else if (shape.variants.length() == 0) {
+            body = "return " + ordering + "::Equal; ";
+        } else {
+            body = "const left: i64 = " + shape.ordinal_of("&this", this.ctx) + "; "
+                + "const right: i64 = " + shape.ordinal_of("other", this.ctx) + "; "
+                + "if (left < right) { return " + ordering + "::Less; } "
+                + "if (left > right) { return " + ordering + "::Greater; } "
+                + "return match (&this) { ";
+            for (mut v: i64 = 0; v < shape.variants.length(); v++) {
+                const variant: EnumVariant* = shape.variants[v];
+                const count: i64 = variant.associated_types.length();
+                if (count == 0) {
+                    body = body + shape.variant_pattern(variant, "", this.ctx) + " => { " + ordering + "::Equal } ";
+                    continue;
+                }
+                mut lefts: [string] = [];
+                mut rights: [string] = [];
+                for (mut p: i64 = 0; p < count; p++) {
+                    const position: string = fmt::format("%lld", p).into_raw();
+                    lefts.push("a" + position);
+                    rights.push("b" + position);
+                }
+                body = body + shape.variant_pattern(variant, "a", this.ctx) + " => { match (other) { "
+                    + shape.variant_pattern(variant, "b", this.ctx) + " => { "
+                    + Parser::compare_in_order(&lefts, &rights, ordering, "", " ") + "} "
+                    + Parser::otherwise(shape, ordering + "::Equal") + "} } ";
+            }
+            body = body + "}; ";
+        }
+        return "compare(&this, other: &" + shape.self_type() + ") -> " + ordering + " { " + body + "}";
+    }
+
+    /// Compare `lefts[i]` with `rights[i]` in order, returning the first
+    /// that is not equal; the last comparison is the value, written between
+    /// `lead` and `tail`.
+    static compare_in_order(lefts: &[string], rights: &[string], ordering: string,
+                            lead: string, tail: string) -> string {
+        mut text: string = "";
+        const last: i64 = lefts.length() - 1;
+        for (mut i: i64 = 0; i < last; i++) {
+            const local: string = "by_" + fmt::format("%lld", i).into_raw();
+            text = text + "const " + local + ": " + ordering + " = " + lefts[i]
+                + ".__derived_compare(" + rights[i] + "); "
+                + "if (" + local + ".is_lt() || " + local + ".is_gt()) { return " + local + "; } ";
+        }
+        return text + lead + lefts[last] + ".__derived_compare(" + rights[last] + ")" + tail;
+    }
+
+    /// Each field hashed in declaration order; an enum's variant position
+    /// first, then its payloads.
+    derived_hash(&this, shape: &DerivedShape) -> string {
+        const parameter: string = shape.fresh_parameter("H");
+        mut body: string = "";
+        if (!shape.is_enum) {
+            for (mut i: i64 = 0; i < shape.fields.length(); i++) {
+                body = body + "this." + this.ctx.resolve_str(shape.fields[i].name) + ".__derived_hash(hasher); ";
+            }
+        } else if (shape.variants.length() > 0) {
+            body = "const ordinal: i64 = " + shape.ordinal_of("&this", this.ctx) + "; ordinal.__derived_hash(hasher); ";
+            mut payloads: string = "";
+            mut any_payload: boolean = false;
+            for (mut v: i64 = 0; v < shape.variants.length(); v++) {
+                const variant: EnumVariant* = shape.variants[v];
+                mut hashes: string = "";
+                for (mut p: i64 = 0; p < variant.associated_types.length(); p++) {
+                    hashes = hashes + "a" + fmt::format("%lld", p).into_raw() + ".__derived_hash(hasher); ";
+                    any_payload = true;
+                }
+                payloads = payloads + shape.variant_pattern(variant, "a", this.ctx) + " => { " + hashes + "} ";
+            }
+            if (any_payload) { body = body + "match (&this) { " + payloads + "} "; }
+        }
+        return "hash<" + parameter + ">(&this, hasher: mut &" + parameter + ") -> void where "
+            + parameter + ": __derived_Hasher { " + body + "}";
+    }
+
+    /// A copy built field by field, or variant by variant, from each part's
+    /// own copy.
+    derived_clone(&this, shape: &DerivedShape) -> string {
+        mut value: string = "";
+        if (!shape.is_enum) {
+            value = shape.literal_type() + " { ";
+            for (mut i: i64 = 0; i < shape.fields.length(); i++) {
+                const name: string = this.ctx.resolve_str(shape.fields[i].name);
+                if (i > 0) { value = value + ", "; }
+                value = value + name + ": this." + name + ".__derived_clone()";
+            }
+            value = value + " }";
+        } else {
+            value = "match (&this) { ";
+            for (mut v: i64 = 0; v < shape.variants.length(); v++) {
+                const variant: EnumVariant* = shape.variants[v];
+                const count: i64 = variant.associated_types.length();
+                mut built: string = shape.type_name + "::" + this.ctx.resolve_str(variant.name);
+                if (count > 0) {
+                    built = built + "(";
+                    for (mut p: i64 = 0; p < count; p++) {
+                        if (p > 0) { built = built + ", "; }
+                        built = built + "a" + fmt::format("%lld", p).into_raw() + ".__derived_clone()";
+                    }
+                    built = built + ")";
+                }
+                value = value + shape.variant_pattern(variant, "a", this.ctx) + " => { " + built + " } ";
+            }
+            value = value + "}";
+        }
+        return "clone(&this) -> " + shape.self_type() + " { return " + value + "; }";
+    }
+
+    /// `Name { field: .., .. }` through the formatter's struct builder, or a
+    /// variant through its tuple builder.
+    derived_debug(&this, shape: &DerivedShape) -> string {
+        mut value: string = "";
+        if (!shape.is_enum) {
+            value = "f.debug_struct(\"" + shape.type_name + "\")";
+            for (mut i: i64 = 0; i < shape.fields.length(); i++) {
+                const name: string = this.ctx.resolve_str(shape.fields[i].name);
+                value = value + ".field(\"" + name + "\", &this." + name + ")";
+            }
+            value = value + ".finish()";
+        } else if (shape.variants.length() == 0) {
+            value = "f.write_str(\"\")";
+        } else {
+            value = "match (&this) { ";
+            for (mut v: i64 = 0; v < shape.variants.length(); v++) {
+                const variant: EnumVariant* = shape.variants[v];
+                mut written: string = "f.debug_tuple(\"" + this.ctx.resolve_str(variant.name) + "\")";
+                for (mut p: i64 = 0; p < variant.associated_types.length(); p++) {
+                    written = written + ".field(a" + fmt::format("%lld", p).into_raw() + ")";
+                }
+                value = value + shape.variant_pattern(variant, "a", this.ctx) + " => { " + written + ".finish() } ";
+            }
+            value = value + "}";
+        }
+        return "fmt(&this, f: mut &__derived_Formatter) -> __derived_Result<(), __derived_FmtError> { return "
+            + value + "; }";
+    }
+
+    /// Every field without a written default given its type's `Default`;
+    /// the literal fills the others from their defaults.
+    derived_default(&this, shape: &DerivedShape) -> string {
+        mut value: string = shape.literal_type() + " { ";
+        mut written: i64 = 0;
+        for (mut i: i64 = 0; i < shape.fields.length(); i++) {
+            const field: FieldDecl* = shape.fields[i];
+            if (field.has_default_value()) { continue; }
+            if (written > 0) { value = value + ", "; }
+            value = value + this.ctx.resolve_str(field.name) + ": (__derived_Default for "
+                + this.defaulted_type_text(field.type_annotation) + ")::default()";
+            written++;
+        }
+        return "static default() -> " + shape.self_type() + " { return " + value + " }; }";
+    }
+
+    /// A field's type as an impl-qualified path's target spells it: as
+    /// written, with `[T]` as the language's array type.
+    defaulted_type_text(&this, annotation: TypeAnnotation*) -> string {
+        if (annotation == null) { return ""; }
+        match (*annotation) {
+            TypeAnnotation::Array(a) => {
+                if (a.size == ArrayAnnotation::heap_dynamic_size()) {
+                    return "__derived_Array<" + this.written_text_of(annotation_span(a.element)) + ">";
+                }
+            }
+            _ => { }
+        }
+        return this.written_text_of(annotation_span(annotation));
+    }
+}

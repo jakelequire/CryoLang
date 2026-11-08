@@ -98,8 +98,8 @@ match (r) { R::D(static) => { .. } }     // E0100: expected a binding name
 | `while`      | `enum`          | `intrinsic` | `public`    | `alignof`         | `this`         | `tuple`                 |
 | `for`        | `trait`         | `where`     | `internal`  | `typeof`          | `This`         | `optional`              |
 |              |                 |             | `private`   |                   |                |                         |
-| `loop`       | `type`          | `extern`    | `protected` | `in`              |                | `with`                  |
-| `do`         | `namespace`     |             | `virtual`   | `as`              |                |                         |
+| `loop`       | `type`          | `extern`    | `protected` | `in`              |                |                         |
+| `do`         | `namespace`     | `with`      | `virtual`   | `as`              |                |                         |
 | `break`      | `module`        |             | `override`  | `await`           |                |                         |
 | `continue`   | `import`        |             | `inline`    |                   |                |                         |
 | `return`     | `export`        |             | `unsafe`    |                   |                |                         |
@@ -110,6 +110,8 @@ match (r) { R::D(static) => { .. } }     // E0100: expected a binding name
 `class`, `protected`, `virtual` (outside a trait object's type), `override` and `default` open
 no form of the language: they are reserved, so a declaration or member written with one is
 refused where it is written (`E0117`) rather than misread.
+
+`with` lists the traits a struct or enum derives (see [section 10.8](#108-derived-implementations-with-)).
 
 `move` marks a closure that captures its environment by move (see [section 15.3](#153-move-checking)).
 
@@ -2648,6 +2650,51 @@ const n: i32 = total([&sq, &r]);                 // 10
 
 The table's layout and the object's calling convention are in `docs/abi.md`; the symbols of a table and of an object type in `docs/cryo-mangling-spec.md`.
 
+### 10.8 Derived Implementations: `with [...]`
+
+A struct or enum header may list standard traits after `with`, in square brackets; the compiler writes one implementation of each, field by field:
+
+```cryo
+type struct Point with [Eq, Ord, Hash, Clone, Debug, Default] {
+    x: i64;
+    y: i64 = 7;
+}
+
+type enum Shape with [Eq, Clone, Debug] {
+    Dot;
+    Segment(Point, Point);
+}
+```
+
+The clause comes after the name and its parameters (and an enum's `: base`) and before `where`. A long header is written one clause per line, with its `{` on a line of its own:
+
+```cryo
+type struct Pair<T: Display>
+    with [Eq, Clone, Debug]
+    where T: Hash
+{
+    left: T;
+    right: T;
+}
+```
+
+Six traits can be derived. Each generated method works through the type's parts in declaration order:
+
+| Trait     | The generated method                                                                                                                   |
+| --------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `Eq`      | Every field equal. Two enum values are equal when they are the same variant with equal payloads.                                      |
+| `Ord`     | The first field that compares unequal decides; all equal is `Equal`. A variant declared earlier is less than one declared later, and two of the same variant compare their payloads in order. `Ord` requires `Eq` (`E0312` without it). |
+| `Hash`    | Each field hashed in turn. An enum hashes its variant's position, then the payloads.                                                  |
+| `Clone`   | A new value built from each field's `clone()`; an enum rebuilds the variant from its payloads' clones.                                |
+| `Debug`   | `Point { x: 1, y: 2 }` through the formatter's `debug_struct`, a variant as `Segment(.., ..)` through `debug_tuple` and a variant without a payload as its name; `{x:#?}` writes the same members one per line. |
+| `Default` | A field with a written default takes it, every other field its type's `Default`. An enum cannot derive `Default`: which variant is the default is the type's own choice. |
+
+A generic type gets one implementation of each trait, which requires the trait of every type parameter and keeps the type's own bounds: `Pair<T>` above derives `Eq` as `implement<T> trait Eq for Pair<T> where T: Eq, T: Display, T: Hash`. There is no per-field control; a type that needs one field skipped or compared differently implements the trait by hand. `Copy` is never listed: whether a type is `Copy` is decided from its fields ([section 15.1](#151-the-copy-trait)). Since `f32` and `f64` have `Eq` and `Hash` but no `Ord`, a type with a float field derives `Eq` and `Hash` and is refused `Ord` at that field.
+
+The entry chooses what is generated by its spelling, `Eq` or `cmp::Eq`, which must name the standard library's trait where the type is declared: a module's own trait spelled `Eq` is refused, and so is a trait imported under another name (`import std::core::hash::{ Hash as H };` then `with [H]`). Everything the generated code calls - the traits' methods, `Ordering`, `Formatter` - is the standard library's own, whatever the module declares under those names.
+
+Each refusal is `E0318`, at the entry or the field it is about: an empty list, a trait listed twice, a trait that cannot be derived, a union, `Default` on an enum, a type declared in a function body (the implementations are module items), and a field or payload whose type lacks the trait ("`Wrapper` cannot derive `Hash`: field `inner` has type `Opaque`, which does not implement `Hash`"). `with` written after `where` is refused as out of order (`E0101`), and a trait both derived and implemented by hand is a conflicting implementation (`E0308`).
+
 ---
 
 ## 11. Generics
@@ -3683,7 +3730,6 @@ type struct Gauge {
 | `![section("name")]`                                      | function / method                  | Place the emitted symbol in object-file section `name`.                                                                                                                                                                                                                                                                                                                                                                         |
 | `![naked]`                                                | function                           | Emit no prologue/epilogue (sets LLVM's `naked` attribute); the body must be a single `asm { … }` block that provides its own `ret`/`jmp`/exit. For a freestanding `_start` and other raw entry points. A non-`asm` body is an error (`E0151`).                                                                                                                                                                                  |
 | `![allow(name)]` / `![warn(name)]` / `![deny(name)]`      | any decl                           | Intended to adjust a named lint's level. *Parsed and validated; lint-level adjustment is not yet implemented.* Each takes at most one `reason = "..."`, a non-empty string; a lint name is not checked, so an unknown one is accepted.                                                                                                                                                                                       |
-| `![derive(Trait, ...)]`                                   | struct / enum                      | Intended to auto-derive one or more traits. *Parsed and validated; no trait is actually synthesized.* See [section 21](#21-reserved-syntax).                                                                                                                                                                                                                                                                                    |
 | `![sink]`                                                 | method                             | Marks a method as consuming its receiver, even when the receiver is syntactically `&this` or `mut &this`. Useful for methods that semantically take ownership but want the borrow-style call ergonomics.                                                                                                                                                                                                                        |
 | `![implicit]`                                             | generic function / method          | Lets a call omit its generic type arguments: the compiler recovers them by unifying the declared return type against the call's *expected* type (the type of the `const x: T = ...` it initialises). Every type parameter must appear in the return type. A call with no expected type reports `E0307`; write the arguments explicitly (`f::<T>(...)`) there. Used by `VaArgs::next` so `const n: i64 = va.next()` reads cleanly. |
 | `![config(<atom>)]` / `![target(<atom>)]` / `![<atom>]`   | any decl                           | Platform / build-flavor gate. `<atom>` is `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`. The bare-atom form (`![windows]`) is sugar for `![config(windows)]`. The decl is stripped from the AST when the gate doesn't match.                                                                                                                                                                                            |
@@ -4506,7 +4552,6 @@ The lexer and grammar reserve the following forms because the language plans to 
 | `![noreturn]`                                 | Reserved. Will declare a function that never returns normally.                                                                                                                                                                                                                                   |
 | `![constructor]` / `![destructor]`            | Reserved. Will register functions that run before `main` / after `main` returns.                                                                                                                                                                                                                 |
 | `![repr(<int_type>)]` on enums                | Reserved. Use `type enum Foo : u8 { ... }` syntax for now; future versions may accept `![repr(u8)]` as an equivalent spelling.                                                                                                                                                                   |
-| `![derive(Trait, ...)]`                       | Reserved. The directive's argument list is parsed and validated (an unknown trait name is rejected), but nothing consumes it: no implementation is synthesized for any listed trait. `Copy` in particular is decided structurally, not declared - see [section 15](#15-ownership-copy-and-drop). |
 
 When any of these moves out of "reserved" and into "implemented," it will be added to the relevant section of this document and removed from this table.
 

@@ -20,7 +20,8 @@ import compiler::compilation_context::{ CompilationContext };
 import compiler::resolver::{ symbol_str, qualified_name };
 import compiler::resolver::res::{ DefId, ResSlot };
 import compiler::resolver::symbol_id::{ SymbolID };
-import compiler::parser::{ cursor, expr_parser };
+import compiler::parser::{ cursor, derive, expr_parser };
+import compiler::parser::derive::{ DeriveClause };
 import utils::log::{ Log, LogArea, LogLevel };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::generic_registry;
@@ -273,6 +274,10 @@ implement struct Parser {
                 program.add_statement(node);
                 Parser::hoist_extern_globals(program, decl);
                 Parser::hoist_type_constants(program, decl);
+                for (mut d: i64 = 0; d < this.derived_implementations.length(); d++) {
+                    program.add_statement(Node::Decl(this.derived_implementations[d]));
+                }
+                while (this.derived_implementations.length() > 0) { this.derived_implementations.pop(); }
             } else if (pending.length() > 0) {
                 for (mut i: i64 = 0; i < pending.length(); i++) {
                     program.add_statement(Node::Directive(pending[i]));
@@ -1124,14 +1129,9 @@ implement struct Parser {
                 ": " + base_text, "a base list", "hold the shared part in a field, its methods in a trait");
         }
 
-        // Optional `where T: Bound` clause on the declaration's own
-        // parameters, after the list that declares them.
-        if (this.check(TokenType::KwWhere)) {
-            const bounds: [TraitBound] = this.parse_trait_bounds();
-            for (mut wi: i64 = 0; wi < bounds.length(); wi++) {
-                node.where_bounds.push(bounds[wi].clone());
-            }
-        }
+        // `with [...]`, then a `where` clause on the declaration's own
+        // parameters.
+        const derive_clause: DeriveClause = this.parse_derive_and_where(&node.where_bounds);
 
         this.consume(TokenType::LBrace, "`{`");
         this.parse_type_body(node, null);
@@ -1139,6 +1139,7 @@ implement struct Parser {
 
         this.current_type_name = "";
         decl.span = this.span_from(start);
+        this.derive_implementations(decl, &derive_clause);
         return decl;
     }
 
@@ -1167,14 +1168,9 @@ implement struct Parser {
             }
         }
 
-        // Optional `where T: Bound` clause on the declaration's own
-        // parameters, after the list that declares them.
-        if (this.check(TokenType::KwWhere)) {
-            const bounds: [TraitBound] = this.parse_trait_bounds();
-            for (mut wi: i64 = 0; wi < bounds.length(); wi++) {
-                node.where_bounds.push(bounds[wi].clone());
-            }
-        }
+        // `with [...]` (refused on a union, below), then a `where` clause
+        // on the declaration's own parameters.
+        const derive_clause: DeriveClause = this.parse_derive_and_where(&node.where_bounds);
 
         this.consume(TokenType::LBrace, "`{`");
         this.parse_type_body(null, node);
@@ -1182,6 +1178,7 @@ implement struct Parser {
 
         this.current_type_name = "";
         decl.span = this.span_from(start);
+        this.derive_implementations(decl, &derive_clause);
         return decl;
     }
 
@@ -1639,14 +1636,9 @@ implement struct Parser {
             }
         }
 
-        // Optional `where T: Bound` clause on the declaration's own
-        // parameters, after the list that declares them.
-        if (this.check(TokenType::KwWhere)) {
-            const bounds: [TraitBound] = this.parse_trait_bounds();
-            for (mut wi: i64 = 0; wi < bounds.length(); wi++) {
-                en.where_bounds.push(bounds[wi].clone());
-            }
-        }
+        // `with [...]`, then a `where` clause on the declaration's own
+        // parameters.
+        const derive_clause: DeriveClause = this.parse_derive_and_where(&en.where_bounds);
 
         this.consume(TokenType::LBrace, "`{`");
 
@@ -1672,6 +1664,7 @@ implement struct Parser {
 
         this.consume(TokenType::RBrace, "`}`");
         node.span = this.span_from(start);
+        this.derive_implementations(node, &derive_clause);
         return node;
     }
 

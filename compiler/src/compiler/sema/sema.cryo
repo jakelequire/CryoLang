@@ -48,6 +48,7 @@ import compiler::sema::{
 };
 import std::core::{ option, mem };
 import std::collections::hashmap::{ HashMap };
+import std::collections::string::{ String };
 import std::collections::pair::{ Pair };
 import std::core::iter::{ Iterator };
 import std::fmt;
@@ -57,7 +58,7 @@ import compiler::passes::type_resolution::{ TypeResolutionPasses, TypeResolution
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
     AssocTypeDeclNode, DeclarationNode, DeclKind, DestructureBinding, DestructureDecl,
-    FunctionDecl, GenericParamDecl, ImplBlock, MethodDecl,
+    EnumVariant, FieldDecl, FunctionDecl, GenericParamDecl, ImplBlock, MethodDecl,
     StructDecl, TraitDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
@@ -669,6 +670,7 @@ type struct SemaVisitor {
     }
 
     visit_impl(mut &this, decl: DeclarationNode*, node: mut ImplBlock*) -> void {
+        if (!this.check_derivation(node)) { return; }
         this.check_supertraits_implemented(decl, node);
         if (node.is_template()) {
             const impl_target: TypeRef = this.ctx.decl_index.impl_owner(node, "sema/visit:ImplBlock");
@@ -3756,6 +3758,95 @@ type struct SemaVisitor {
                 fmt::format("`%s` does not implement `%s`, which `%s` requires, so `%s` cannot implement `%s`",
                     shown_owner, shown_base, shown_trait, shown_owner, shown_trait), span);
         }
+    }
+
+    /// Whether the implementation a `with [...]` clause generated may be
+    /// checked and kept: its head names the standard trait the clause's
+    /// spelling chose, and every field - every variant's payload - has that
+    /// trait.  A refusal names the field and skips the generated body, whose
+    /// own errors would only restate it at the field's use.
+    check_derivation(mut &this, node: ImplBlock*) -> boolean {
+        const item: LangItem = match (node.derived_trait) {
+            Option::Some(i) => { i }
+            Option::None    => { return true; }
+        };
+        const span: SourceSpan = annotation_span(node.trait_annotation);
+        const standard: DefId = this.ctx.generic_registry.wellknown(item);
+        if (!node.trait_def.is_valid()) { return false; }
+        if (!standard.is_valid() || !node.trait_def.equals(standard)) {
+            const written: string = this.intern.resolve(this.ctx.defs.path_of(node.trait_def).spelling());
+            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0318_CANNOT_DERIVE,
+                fmt::format("`%s` names `%s`, not the standard `%s`, so it cannot be derived",
+                    item.derived_spelling(), written, item.derived_spelling()));
+            d = d.at(span);
+            d = d.help(fmt::format("implement `%s` by hand, or derive the standard trait under its own name", written));
+            this.ctx.emit_diagnostic(d);
+            return false;
+        }
+        const owner: DeclarationNode* = node.derived_for;
+        if (owner == null) { return true; }
+        mut holds: boolean = true;
+        match (&owner.kind) {
+            DeclKind::Struct(s) => {
+                const owner_name: string = this.intern.resolve(s.name);
+                for (mut i: i64 = 0; i < s.fields.length(); i++) {
+                    const field: FieldDecl* = DeclarationNode::field_of(s.fields[i]);
+                    if (field == null) { continue; }
+                    const field_name: string = this.intern.resolve(field.name);
+                    if (!this.derived_part_holds(field.resolved_type, standard, item, &f"field `{field_name}`",
+                            owner_name, annotation_span(field.type_annotation))) {
+                        holds = false;
+                    }
+                }
+            }
+            DeclKind::Enum(e) => {
+                const owner_name: string = this.intern.resolve(e.name);
+                const enum_type: Type* = this.arena.lookup(this.ctx.decl_index.type_of_def(e.def));
+                if (enum_type == null || enum_type.kind != TypeKind::Enum) { return holds; }
+                const info: EnumType* = enum_type.as_enum();
+                for (mut v: i64 = 0; v < e.variants.length() && v < info.variants.length(); v++) {
+                    const variant: EnumVariant* = DeclarationNode::variant_of(e.variants[v]);
+                    if (variant == null) { continue; }
+                    const variant_name: string = this.intern.resolve(variant.name);
+                    const payloads: &[TypeRef] = &info.variants[v].payload_types;
+                    for (mut p: i64 = 0; p < payloads.length() && p < variant.associated_types.length(); p++) {
+                        if (!this.derived_part_holds(payloads[p], standard, item, &f"the payload of `{variant_name}`",
+                                owner_name, annotation_span(variant.associated_types[p]))) {
+                            holds = false;
+                        }
+                    }
+                }
+            }
+            _ => { }
+        }
+        return holds;
+    }
+
+    /// Whether the part of a derived type whose type is `part` has the
+    /// trait `trait_def`; refused at `span` when it has not.  A parameter
+    /// of the type has it by the bound the implementation places on each;
+    /// an instantiation naming one has it where some implementation for its
+    /// template does, and that implementation's own clause is checked
+    /// against those bounds where the generated body uses the part.
+    derived_part_holds(mut &this, part: TypeRef, trait_def: DefId, item: LangItem, part_shown: &String,
+                       owner_name: string, span: SourceSpan) -> boolean {
+        const t: Type* = this.arena.lookup(part);
+        if (t == null || t.kind == TypeKind::GenericParam) { return true; }
+        const holds: boolean = if (this.arena.contains_generic_param(part)) {
+            this.ctx.generic_registry.heads_for(trait_def, part, this.intern).length() > 0
+        } else {
+            this.trait_checker().type_implements_trait(part, trait_def, 0)
+        };
+        if (holds) { return true; }
+        const shown_part: string = this.arena.format_display(t);
+        const trait_name: string = item.derived_spelling();
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0318_CANNOT_DERIVE,
+            f"`{owner_name}` cannot derive `{trait_name}`: {part_shown.as_str()} has type `{shown_part}`, which does not implement `{trait_name}`");
+        d = d.at(span);
+        d = d.help(fmt::format("implement `%s` for `%s`, or implement `%s` for `%s` by hand",
+            trait_name, shown_part, trait_name, owner_name));
+        this.ctx.emit_diagnostic(d);
+        return false;
     }
 
     resolve_cast(mut &this, e: ExpressionNode*, cast: mut CastExpr*) -> TypeRef {

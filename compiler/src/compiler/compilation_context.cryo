@@ -14,9 +14,9 @@ import compiler::types::{ type_ref, arena, resolver, generic_registry };
 import compiler::mono::monomorphizer::{ Monomorphizer };
 import compiler::mono::state::{ SettledObjectConversion };
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, resolver };
-import compiler::resolver::res::{ DeclVisibility, DefId, DefTable, DefKind, FamilyOwner, ResBase };
+import compiler::resolver::res::{ DeclVisibility, DefId, DefTable, DefKind, FamilyOwner, ResBase, ResSlot };
 import compiler::ast::node::{ Node };
-import compiler::ast::{ NamedAnnotation, Visibility };
+import compiler::ast::{ NamedAnnotation, TraitRef, Visibility };
 import compiler::ast::declaration::{ DeclarationNode, FunctionDecl, ImplBlock, MethodDecl, ObjectTableInstance };
 import compiler::ast::expression::{ ExpressionNode };
 import compiler::ast::pattern::{ DirectiveArgKind, DirectiveNode };
@@ -165,11 +165,21 @@ type struct InjectedOrigin {
     module: ModulePath;
 }
 
-/// A node a desugaring wrote naming a language item (its slot holds
-/// `ResSlot::Lang`) before the item was claimed.
+/// Where compiler-written code names a language item before the item is
+/// claimed.
+type enum LangSite {
+    /// An expression or a pattern whose slot holds `ResSlot::Lang`.
+    Node(Node);
+    /// A type, its slot holding `ResSlot::Lang`.
+    Annotation(mut NamedAnnotation*);
+    /// A bound's trait.  Its path stays empty until settled, so no scope is
+    /// asked for a spelling.
+    Bound(mut TraitRef*);
+}
+
+/// A language item compiler-written code names, waiting for its claim.
 type struct LangRef {
-    /// An expression or a pattern.
-    node: Node;
+    site: LangSite;
     item: LangItem;
 }
 
@@ -553,7 +563,20 @@ public:
     }
 
     note_lang_ref(mut &this, node: Node, item: LangItem) -> void {
-        this.lang_refs.push(LangRef { node: node, item: item });
+        this.lang_refs.push(LangRef { site: LangSite::Node(node), item: item });
+    }
+
+    /// A type compiler-written code spells as the item `item`: its slot is
+    /// claimed for the item at once, and answered once the item is claimed.
+    note_lang_annotation(mut &this, annotation: mut NamedAnnotation*, item: LangItem) -> void {
+        annotation.res = ResSlot::Lang(item);
+        this.lang_refs.push(LangRef { site: LangSite::Annotation(annotation), item: item });
+    }
+
+    /// A bound compiler-written code places on the item `item`, a trait.  The
+    /// reference must stay where it is until settled.
+    note_lang_bound(mut &this, trait_ref: mut TraitRef*, item: LangItem) -> void {
+        this.lang_refs.push(LangRef { site: LangSite::Bound(trait_ref), item: item });
     }
 
     /// Claim `def` as the language item its declaration `decl` names with

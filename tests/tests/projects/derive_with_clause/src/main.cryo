@@ -1,0 +1,172 @@
+// What a `with [...]` clause generates, checked by running it: equality,
+// ordering in declaration order, hashing consistent with equality (float
+// zeros and NaNs included), clones that own their own storage, Debug text
+// in the plain and the pretty form, and `Default` from field defaults and
+// the field types' own.  Generic types derive under inline and where
+// bounds; `identity` declares its own `Ordering` and `Formatter`.
+//
+// `main` prints how many checks passed and exits 0 only when all did.
+namespace DeriveWithClause::Main;
+
+import std::fmt;
+import std::core::cmp::{ Eq, Ord, Ordering };
+import std::core::hash::{ Hash, Hasher, DefaultHasher };
+import std::core::clone::{ Clone };
+import std::core::default::{ Default };
+import std::fmt::display::{ Debug, Display };
+import std::collections::string::{ String };
+import DeriveWithClause::Identity;
+
+type struct Point with [Eq, Ord, Hash, Clone, Debug, Default] {
+    x: i64;
+    y: i64 = 7;
+}
+
+type enum Shape with [Eq, Ord, Hash, Clone, Debug] {
+    Dot;
+    Circle(i64);
+    Segment(Point, Point);
+}
+
+type struct Named with [Eq, Clone, Debug] {
+    name: String;
+    scores: [i64];
+}
+
+type struct Ranked<T: Display>
+    with [Eq, Ord, Clone, Debug]
+    where T: Hash
+{
+    first: T;
+    second: T;
+}
+
+type enum Maybe<T> with [Eq, Hash, Clone, Debug] {
+    Nothing;
+    Just(T);
+}
+
+type struct Measured with [Eq, Hash, Debug] {
+    value: f64;
+}
+
+type struct Settings<T> with [Default, Debug] {
+    items: [T];
+    inner: T;
+}
+
+type struct Empty with [Eq, Ord, Hash, Clone, Debug, Default] {
+}
+
+function hash_of<T>(value: &T) -> u64 where T: Hash {
+    mut hasher: DefaultHasher = DefaultHasher::new();
+    value.hash(&hasher);
+    return hasher.finish();
+}
+
+/// A generic type's `Default` reached through a bound.
+function fresh<T: Default>() -> T {
+    return T::default();
+}
+
+function check(passed: i64, ok: boolean, what: string) -> i64 {
+    if (ok) { return passed + 1; }
+    fmt::println(f"FAILED: {what}");
+    return passed;
+}
+
+function main() -> i32 {
+    mut passed: i64 = 0;
+
+    // A struct: each field in declaration order.
+    const a: Point = Point { x: 1, y: 2 };
+    const same: Point = Point { x: 1, y: 2 };
+    const later: Point = Point { x: 1, y: 3 };
+    const right: Point = Point { x: 2, y: 0 };
+    passed = check(passed, a.equals(&same), "equal fields are equal");
+    passed = check(passed, !a.equals(&later), "one unequal field is unequal");
+    passed = check(passed, a.compare(&later).is_lt(), "the second field decides when the first ties");
+    passed = check(passed, right.compare(&later).is_gt(), "the first field decides");
+    passed = check(passed, !a.compare(&same).is_lt() && !a.compare(&same).is_gt(), "equal fields compare equal");
+    passed = check(passed, a < later && right > a, "the derived Ord backs the operators");
+    passed = check(passed, hash_of(&a) == hash_of(&same), "equal values hash alike");
+    passed = check(passed, hash_of(&a) != hash_of(&later), "the hash reads every field");
+    passed = check(passed, a.clone().equals(&a), "a clone is equal");
+    const d: Point = (Default for Point)::default();
+    passed = check(passed, d.x == 0 && d.y == 7, "Default takes a written default and the type's own");
+    passed = check(passed, f"{a:?}" == String::from_string("Point { x: 1, y: 2 }"), "Debug of a struct");
+    passed = check(passed, f"{a:#?}" == String::from_string("Point {\n    x: 1,\n    y: 2,\n}"), "pretty Debug of a struct");
+
+    // An enum: variants in declaration order, then payloads.
+    const dot: Shape = Shape::Dot;
+    const small: Shape = Shape::Circle(1);
+    const big: Shape = Shape::Circle(2);
+    const segment: Shape = Shape::Segment(a, later);
+    passed = check(passed, dot.equals(&Shape::Dot) && small.equals(&Shape::Circle(1)), "same variant, equal payloads");
+    passed = check(passed, !small.equals(&big) && !small.equals(&dot), "a payload or a variant differs");
+    passed = check(passed, dot.compare(&small).is_lt() && small.compare(&segment).is_lt(), "an earlier variant is less");
+    passed = check(passed, segment.compare(&small).is_gt(), "a later variant is greater");
+    passed = check(passed, small.compare(&big).is_lt(), "the same variant compares its payload");
+    passed = check(passed, hash_of(&small) == hash_of(&Shape::Circle(1)) && hash_of(&small) != hash_of(&big),
+        "an enum hashes its payload");
+    passed = check(passed, hash_of(&dot) != hash_of(&small), "an enum hashes its variant");
+    passed = check(passed, segment.clone().equals(&segment), "a cloned variant is equal");
+    passed = check(passed, f"{dot:?} {big:?}" == String::from_string("Dot Circle(2)"), "Debug of variants");
+    passed = check(passed, f"{segment:?}" == String::from_string("Segment(Point { x: 1, y: 2 }, Point { x: 1, y: 3 })"),
+        "Debug of a variant's payloads");
+    passed = check(passed, f"{big:#?}" == String::from_string("Circle(\n    2,\n)"), "pretty Debug of a variant");
+
+    // A clone owns its own storage.
+    const original: Named = Named { name: String::from_string("first"), scores: [1, 2] };
+    mut copy: Named = original.clone();
+    passed = check(passed, copy.equals(&original), "a clone of owning fields is equal");
+    copy.name.push_char('!');
+    copy.scores.push(3);
+    passed = check(passed, original.name == String::from_string("first") && original.scores.length() == 2,
+        "changing the clone leaves the original");
+    passed = check(passed, !copy.equals(&original), "the changed clone is unequal");
+    passed = check(passed, f"{original:?}" == String::from_string("Named { name: \"first\", scores: [1, 2] }"),
+        "Debug of owning fields");
+
+    // Generic types, with inline and where bounds.
+    const low: Ranked<i64> = Ranked::<i64> { first: 1, second: 9 };
+    const high: Ranked<i64> = Ranked::<i64> { first: 2, second: 0 };
+    passed = check(passed, low.compare(&high).is_lt() && low.equals(&low.clone()), "a generic struct derives");
+    passed = check(passed, f"{high:?}" == String::from_string("Ranked { first: 2, second: 0 }"), "Debug of a generic struct");
+    const just: Maybe<i64> = Maybe::Just(4);
+    const nothing: Maybe<i64> = Maybe::Nothing;
+    passed = check(passed, just.equals(&just.clone()) && !just.equals(&nothing), "a generic enum derives");
+    passed = check(passed, hash_of(&just) == hash_of(&Maybe::<i64>::Just(4)), "a generic enum hashes");
+    passed = check(passed, f"{just:?} {nothing:?}" == String::from_string("Just(4) Nothing"), "Debug of a generic enum");
+
+    // A float compares and hashes by its IEEE equality.
+    const zero: Measured = Measured { value: 0.0 };
+    const negative_zero: Measured = Measured { value: -0.0 };
+    const nan: Measured = Measured { value: 0.0 / 0.0 };
+    passed = check(passed, zero.equals(&negative_zero), "the two zeros are equal");
+    passed = check(passed, hash_of(&zero) == hash_of(&negative_zero), "the two zeros hash alike");
+    passed = check(passed, !nan.equals(&nan), "a NaN equals nothing, itself included");
+    passed = check(passed, hash_of(&nan) == hash_of(&Measured { value: 0.0 / 0.0 }), "every NaN hashes alike");
+
+    // Default for a dynamic array and a type parameter.
+    const settings: Settings<i64> = fresh::<Settings<i64>>();
+    passed = check(passed, settings.items.length() == 0 && settings.inner == 0, "a generic Default");
+
+    // A type with no fields.
+    const empty: Empty = (Default for Empty)::default();
+    passed = check(passed, empty.equals(&empty.clone()) && !empty.compare(&Empty {}).is_lt()
+        && f"{empty:?}" == String::from_string("Empty"), "a struct with no fields");
+
+    // Identity: the module's own `Ordering`, `Formatter` and `Code::equals`
+    // change nothing.
+    const first: Identity::Tagged = Identity::tagged(3, 1);
+    const second: Identity::Tagged = Identity::tagged(3, 2);
+    passed = check(passed, first.compare(&second).is_lt() && first.equals(&Identity::tagged(3, 1)),
+        "derived methods name the standard items");
+    passed = check(passed, f"{first:?}" == String::from_string("Tagged { code: Code { value: 3 }, rank: 1 }"),
+        "Debug beside a module's own Formatter");
+
+    fmt::println(f"derive_with_clause: {passed} of 40 passed");
+    if (passed == 40) { return 0; }
+    return 1;
+}
