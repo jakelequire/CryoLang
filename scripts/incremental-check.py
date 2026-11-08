@@ -14,8 +14,9 @@ For a target project it runs an edit matrix. Each scenario:
   4. asserts the two final binaries are byte-identical,
   5. reverts the edit.
 
-It also checks the cold-cache path (first incremental build == clean) and the
-no-change outer short-circuit.
+It also checks the cold-cache path (first incremental build == clean), the
+no-change outer short-circuit, and that an edit to a C header the project's
+`extern "C"` block includes is not short-circuited.
 
 Usage:
   scripts/incremental-check.py [--cryo PATH] [--project DIR] [--bin NAME]
@@ -156,6 +157,42 @@ def main():
             failures.append(scenario)
 
     print(f"== incremental-check: {project} (cryo={cryo}) ==")
+
+    # An input no module source names: a header an `extern "C"` block
+    # includes.  The whole-build fingerprint folds the files the last build's
+    # C imports read, so an edit to one must rebuild; a build after the edit
+    # that reports "is up to date" kept a binary made from the old header.
+    # It asks nothing of the binary's bytes, so it runs before the link
+    # control and on a host that cannot link reproducibly.  Its own control
+    # first: an unchanged rebuild must short-circuit, or "not up to date"
+    # after the edit would prove nothing (a build that reported warnings
+    # records no fingerprint and never short-circuits).
+    print("\n[scenario] header edit (an input no module source names)")
+    header_path = os.path.join(project, "llvm_bindings.h")
+    if not os.path.exists(header_path):
+        print(f"incremental-check: FAIL -- header edit target no longer exists: {header_path}")
+        print("  Point the scenario at a header an `extern \"C\"` block of the project includes.")
+        return 1
+    clean_tree(project)
+    run_build(driver, project)
+    rc, out = run_build(driver, project)
+    if rc != 0 or "is up to date" not in out:
+        print("  header-edit: FAIL (control) -- an unchanged rebuild did not report"
+              " \"is up to date\", so the edit below could not be told apart")
+        failures.append("header-edit")
+    else:
+        header = Edit("header-comment", header_path, "append")
+        header.apply()
+        try:
+            rc, out = run_build(driver, project)
+        finally:
+            header.revert()
+        if rc == 0 and "is up to date" in out:
+            print("  header-edit: FAIL -- the build after the header edit reported"
+                  " \"is up to date\"")
+            failures.append("header-edit")
+        else:
+            print("  header-edit: rebuilt ✓")
 
     # CONTROL, before any scenario: is a link on this host byte-reproducible
     # AT ALL?  Every assertion below compares two binaries, so a toolchain

@@ -384,8 +384,9 @@ type struct Manifest {
         };
     }
 
-    /// Combined fingerprint over every build input.
-    compute_fingerprint(&this, modules: &[ModuleEntry]) -> u128 {
+    /// Combined fingerprint over every build input: the module sources, and
+    /// `headers`, the files the build's C imports read.
+    compute_fingerprint(&this, modules: &[ModuleEntry], headers: &[string]) -> u128 {
         mut h: ContentHasher = ContentHasher::new();
         h.fold(Manifest::compiler_fingerprint());
         h.fold(this.build_shape);
@@ -407,7 +408,25 @@ type struct Manifest {
             h.fold(modules[i].origin_subdir);
             Manifest::fold_file(&h, modules[i].source_path);
         }
+        // A header no module source names: its path and its content, so an
+        // edit to it, or to a file it includes, is a changed input.
+        for (mut i: i64 = 0; i < headers.length(); i++) {
+            h.fold(headers[i]);
+            Manifest::fold_file(&h, headers[i]);
+        }
         return h.finish128();
+    }
+
+    /// The files the C imports of the build that wrote the fingerprint
+    /// sidecar read: its lines after the fingerprint.  Which headers a build
+    /// reads is known only once its imports run, so the up-to-date check
+    /// asks the last build's, and a source edit that names another header
+    /// changes a module source anyway.  Empty when there is no sidecar.
+    recorded_headers(&this) -> [string] {
+        mut headers: [string] = [];
+        const lines: [string] = Manifest::read_file_trimmed(this.cfg.fingerprint_path()).split_nonempty("\n");
+        for (mut i: i64 = 1; i < lines.length(); i++) { headers.push(lines[i]); }
+        return headers;
     }
 
     /// True when the saved fingerprint matches `fp_hex` AND every artifact
@@ -415,9 +434,8 @@ type struct Manifest {
     /// a build.
     is_up_to_date(&this, fp_hex_text: string, artifacts: &[string]) -> boolean {
         const fp_hex: string = fp_hex_text;
-        const saved: string = Manifest::read_file_trimmed(this.cfg.fingerprint_path());
-        if (saved.length() == 0) { return false; }
-        if (!saved.eq(fp_hex)) { return false; }
+        const lines: [string] = Manifest::read_file_trimmed(this.cfg.fingerprint_path()).split_nonempty("\n");
+        if (lines.length() == 0 || !lines[0].eq(fp_hex)) { return false; }
         for (mut i: i64 = 0; i < artifacts.length(); i++) {
             if (!Path::from(artifacts[i]).exists()) { return false; }
         }
@@ -425,11 +443,14 @@ type struct Manifest {
     }
 
     /// Write the fingerprint sidecar (`incremental/inputs.fp`) the next
-    /// build's short-circuit compares, creating the incremental dir first.
+    /// build's short-circuit compares, creating the incremental dir first:
+    /// the fingerprint, then one line per file in `headers`, the files this
+    /// build's C imports read, which the next build folds into the
+    /// fingerprint it compares (`recorded_headers`).
     /// A build that reported warnings records none: skipping the next build
     /// would skip reporting them, so the next build analyses the program
     /// again, and reuses every object whose bitcode is unchanged.
-    write_fingerprint(&this, fp_hex_text: string, reported_warnings: boolean) -> void {
+    write_fingerprint(&this, fp_hex_text: string, headers: &[string], reported_warnings: boolean) -> void {
         const fp_hex: string = fp_hex_text;
         ProjectConfig::mkdir_p(this.cfg.incremental_dir());
         const path: string = this.cfg.fingerprint_path();
@@ -447,6 +468,10 @@ type struct Manifest {
         mut text: String = String::new();
         text.push(Str::new(fp_hex));
         text.push_byte(10 as u8);        // LF
+        for (mut i: i64 = 0; i < headers.length(); i++) {
+            text.push(Str::new(headers[i]));
+            text.push_byte(10 as u8);
+        }
         match (File::write_bytes(Path::from(path), text.as_bytes())) {
             Result::Ok(_)  => {}
             Result::Err(_) => {

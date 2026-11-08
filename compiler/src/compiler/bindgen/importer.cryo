@@ -335,12 +335,11 @@ type struct Importer {
     /// the C path is byte-for-byte unchanged.  Set by `collect_from_tu` from the
     /// language signal; the C path leaves it false.
     is_cpp:         boolean;
-    /// Vendor-path only: resolved paths of every non-system file this TU pulled
-    /// in (entry header + transitive `#include`s), collected via
-    /// `clang_getInclusions` after the decl walk.  `collect_from_tu` threads
-    /// these out so the generator can write an include-graph `.deps` sidecar for
-    /// cache provenance.  Stays empty on the inline `#include` path (which never
-    /// calls `clang_getInclusions`).
+    /// Resolved paths of every non-system file this TU pulled in (entry header
+    /// + transitive `#include`s), collected via `clang_getInclusions` before
+    /// the decl walk.  `collect_from_tu` records them on the compilation
+    /// context, where the build fingerprint and the vendor generator's
+    /// include-graph `.deps` sidecar read them.
     inputs:         [string];
     /// The same set as `inputs`, held as libclang CXFile handles.  This is what
     /// the macro filter tests: a CXFile is unique per file within a TU, so
@@ -2350,7 +2349,7 @@ type struct Importer {
         mut no_extra: [u8*] = [];
         return Importer::collect_from_tu(resolved_path as u8*, null, 0,
                                          &no_extra, resolved_path_text, extern_node,
-                                         functions_only, ctx, null, null, "c", "");
+                                         functions_only, ctx, null, "c", "");
     }
 
     /// Parse an angle-bracket system header (`#include <stdio.h>`) by feeding
@@ -2376,12 +2375,12 @@ type struct Importer {
         mut no_extra: [u8*] = [];
         return Importer::collect_from_tu("cryo_syshdr.c" as u8*, &uf, 1,
                                          &no_extra, header_text, extern_node,
-                                         functions_only, ctx, null, null, "c", "");
+                                         functions_only, ctx, null, "c", "");
     }
 
     /// `clang_getInclusions` trampoline: records each non-system file the TU
-    /// pulled in (entry header + transitive `#include`s) into `imp.inputs`, for
-    /// the include-graph `.deps` sidecar.  System headers are dropped - they are
+    /// pulled in (entry header + transitive `#include`s) into `imp.inputs`, the
+    /// files the build depends on.  System headers are dropped - they are
     /// already covered by the libclang-version fold in the provenance key, and
     /// hashing glibc/CRT headers on every cache check would be wasteful.  Matches
     /// the C `CXInclusionVisitor` signature `(CXFile, CXSourceLocation*, unsigned,
@@ -2412,15 +2411,15 @@ type struct Importer {
     /// `out_report` (when non-null) accumulates this TU's skipped/approximated
     /// constructs for the caller's consolidated report (the `cryo vendor`
     /// path); when null, the report goes to the bindgen log's summary
-    /// (the inline `#include` path).  `out_inputs` (when non-null) is appended
-    /// with every non-system file the TU included (via `clang_getInclusions`),
-    /// for the generator's include-graph `.deps` sidecar; null on the inline
-    /// path skips the inclusion walk entirely.
+    /// (the inline `#include` path).  Every non-system file the TU read - a
+    /// real entry file and each file `clang_getInclusions` reports - is
+    /// recorded on `ctx` (`note_imported_header`): the build fingerprint and
+    /// the vendor generator's include-graph `.deps` sidecar both read it.
     static collect_from_tu(source_filename: u8*, unsaved: CXUnsavedFile*, num_unsaved: u32,
                            extra_args: &[u8*], label: string, extern_node: mut ExternBlock*,
                            functions_only: boolean,
                            ctx: mut CompilationContext*, out_report: mut ImportReport*,
-                           out_inputs: mut [string]*, lang_text: string, cpp_std_text: string) -> i32 {
+                           lang_text: string, cpp_std_text: string) -> i32 {
         const cpp_std: string = cpp_std_text;
         const lang: string = lang_text;
         const index: void* = clang::clang_createIndex(0, 0);
@@ -2508,12 +2507,12 @@ type struct Importer {
         if (out_report != null) { imp.report.merge_into(out_report); }
         else                    { imp.report.summary(label); }
 
-        // Thread the inclusion set (entry header + transitive `#include`s) out
-        // to the vendor generator's include-graph provenance sidecar.
-        if (out_inputs != null) {
-            for (mut ii: i64 = 0; ii < imp.inputs.length(); ii++) {
-                out_inputs.push(imp.inputs[ii]);
-            }
+        // The entry file is recorded by name, as libclang may or may not
+        // report a TU's main file among its inclusions; an in-memory one is
+        // not a file the build reads.
+        if (unsaved == null) { ctx.note_imported_header(label); }
+        for (mut ii: i64 = 0; ii < imp.inputs.length(); ii++) {
+            ctx.note_imported_header(imp.inputs[ii]);
         }
 
         clang::clang_disposeTranslationUnit(tu);

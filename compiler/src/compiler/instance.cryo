@@ -1422,7 +1422,8 @@ type struct CompilerInstance {
             const manifest: build_manifest::Manifest = compiler::build_manifest::Manifest::new(
                 ctx.project_config, build_shape, ctx.options.opt_level, ctx.options.debug_info,
                 ctx.options.target_triple, manifest_stdlib_archive, manifest_stdlib_archive_key);
-            const build_fp: u128 = manifest.compute_fingerprint(&mod_entries);
+            const recorded_headers: [string] = manifest.recorded_headers();
+            const build_fp: u128 = manifest.compute_fingerprint(&mod_entries, &recorded_headers);
             build_fp_hex = compiler::build_manifest::Manifest::hex128(build_fp);
 
             if (manifest.is_up_to_date(build_fp_hex, &manifest_artifacts)) {
@@ -2256,14 +2257,17 @@ type struct CompilerInstance {
 
         // Build succeeded: record the fingerprint sidecar (consulted by the
         // next build's short-circuit) and the human/tooling-facing manifest.
-        // Gated on `do_incremental`; the fingerprint locals were computed
-        // before the frontend ran. Side files only; no effect on the IR.
+        // Gated on `do_incremental`. Side files only; no effect on the IR.
+        // The fingerprint recorded is over the headers THIS build's C imports
+        // read, which only the frontend could know.
         if (do_incremental && ctx.project_config != null) {
             const manifest: build_manifest::Manifest = compiler::build_manifest::Manifest::new(
                 ctx.project_config, build_shape, ctx.options.opt_level, ctx.options.debug_info,
                 ctx.options.target_triple, manifest_stdlib_archive, manifest_stdlib_archive_key);
-            manifest.write_fingerprint(build_fp_hex, ctx.diagnostics.has_warnings());
-            manifest.write_manifest(&mod_entries, build_fp_hex, &manifest_artifacts);
+            const built_fp_hex: string = compiler::build_manifest::Manifest::hex128(
+                manifest.compute_fingerprint(&mod_entries, &ctx.imported_headers));
+            manifest.write_fingerprint(built_fp_hex, &ctx.imported_headers, ctx.diagnostics.has_warnings());
+            manifest.write_manifest(&mod_entries, built_fp_hex, &manifest_artifacts);
             // Per-module cache keys for the NEXT build to consult: every
             // module with an object, emitted or reused, under the key of the
             // bitcode that object was emitted from.

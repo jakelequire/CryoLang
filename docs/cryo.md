@@ -4767,10 +4767,12 @@ built.  A build on the
 native heap (`native_alloc`), and a `[lib]` built on its own, compile the
 stdlib modules they reach.
 
-`cryo build` is incremental: if no input changed (sources, the resolved knobs,
-the compiler binary, or the linked stdlib) and the artifact still exists, the
-build is skipped (`<name> is up to date`). Pass `--no-incremental` to force a
-full rebuild and refresh the manifest.
+`cryo build` is incremental: if no input changed (sources, the C headers an
+`extern "C"` block's `#include` read - the named header and every non-system
+file it includes - the resolved knobs, the compiler binary, or the linked
+stdlib) and the artifact still exists, the build is skipped (`<name> is up to
+date`). Pass `--no-incremental` to force a full rebuild and refresh the
+manifest.
 
 ### 23.3 `[link]`
 
