@@ -1670,6 +1670,11 @@ must still be supplied, and omitting one is `E0355`. A default is a standalone
 expression - it cannot reference the other fields - and is evaluated afresh at
 each construction that omits the field.
 
+A generic struct's literal follows the same rule whichever way its arguments
+are given - written (`Settings::<i64> { .. }`), a generic body's own parameter
+(`Settings::<T> { .. }`), or taken from the expected type or the field values
+(`Settings { .. }`) - and a default is typed through those arguments.
+
 ```cryo
 type struct Config {
     debug:   boolean = false;
@@ -1680,6 +1685,14 @@ type struct Config {
 const c: Config = Config {};              // -> { false, false, 3 }
 const d: Config = Config { retries: 5 };  // -> { false, false, 5 } (supplied value wins)
 // Omitting a field that has NO default is still `E0355`.
+
+type struct Settings<T> {
+    limit: i64       = 10;
+    inner: T;
+    extra: Option<T> = Option::None;
+}
+
+const s: Settings<i64> = Settings::<i64> { inner: 1 };  // -> { 10, 1, None }
 ```
 
 ### 8.3 Methods

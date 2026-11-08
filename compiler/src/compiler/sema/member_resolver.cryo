@@ -67,17 +67,21 @@ import compiler::types::user_defined::{
 /// template, off its declaration: one answer whichever the door read, so a
 /// template's private field is as private as a concrete type's.  `owner`
 /// is the type declaring it, for the diagnostic.  `index` is -1 for an
-/// array's `length`, which has a type and no slot and is public.
+/// array's `length`, which has a type and no slot and is public.  `name` is
+/// the declared name and `default_value` the declaration's `= expr`, or
+/// null: a literal omitting the field evaluates its own copy of it.
 type struct FieldAnswer {
-    ty:          TypeRef;
-    visibility:  Visibility;
-    declared_in: ModulePath;
-    owner:       Type*;
-    index:       i64;
+    ty:            TypeRef;
+    visibility:    Visibility;
+    declared_in:   ModulePath;
+    owner:         Type*;
+    index:         i64;
+    name:          SymbolStr;
+    default_value: ExpressionNode*;
 
     static none() -> FieldAnswer {
         return FieldAnswer { ty: TypeRef::invalid(), visibility: Visibility::Public, declared_in: ModulePath::none(),
-                             owner: null, index: -1 };
+                             owner: null, index: -1, name: SymbolStr::empty(), default_value: null };
     }
 
     found(&this) -> boolean { return this.ty.is_valid(); }
@@ -525,6 +529,7 @@ type struct MemberResolver {
             return FieldAnswer {
                 ty:          this.types.subst_owner_params_from_receiver(recv, this.arena.get_i64()),
                 visibility:  Visibility::Public, declared_in: ModulePath::none(), owner: null, index: -1,
+                name:        leaf, default_value: null,
             };
         }
         return FieldAnswer::none();
@@ -540,6 +545,8 @@ type struct MemberResolver {
             declared_in: this.arena.declared_in(owner),
             owner:       owner,
             index:       index,
+            name:        entry.decl_name().spelling(),
+            default_value: entry.default_value,
         };
     }
 
@@ -562,54 +569,66 @@ type struct MemberResolver {
         for (mut k: i64 = 0; k < fields.length(); k++) {
             const f: FieldDecl* = DeclarationNode::field_of(fields[k]);
             if (f == null || !f.name.equals(leaf) || !f.resolved_type.is_valid()) { continue; }
-            return FieldAnswer {
-                ty:          this.types.subst_owner_params_from_receiver(recv, f.resolved_type),
-                visibility:  f.visibility,
-                declared_in: tmpl.declared_in,
-                owner:       this.arena.lookup(tmpl_ref),
-                index:       k,
-            };
+            return this.template_field_answer(tmpl, tmpl_ref, recv, f, k);
         }
         return FieldAnswer::none();
     }
 
-    /// The names of the fields of the struct `recv` names, in declaration
-    /// order, read where `field_of` reads them: a struct's or a resolved
-    /// instantiation's off its arena type, an instantiation not minted yet
-    /// and a generic owner off the template's declaration, whose order is
-    /// every specialization's.  False when `recv` names no struct (a type
-    /// parameter, a projection, an enum): it has no field list to read.
-    field_names(&this, recv: TypeRef, out: mut &[SymbolStr]) -> boolean {
+    /// The answer for the declared field `f`, at `index` in the template
+    /// `tmpl`, seen through the receiver.  A field whose type did not
+    /// resolve answers no type.
+    template_field_answer(&this, tmpl: const TemplateEntry*, tmpl_ref: TypeRef, recv: TypeRef,
+                          f: FieldDecl*, index: i64) -> FieldAnswer {
+        return FieldAnswer {
+            ty:            if (f.resolved_type.is_valid()) { this.types.subst_owner_params_from_receiver(recv, f.resolved_type) }
+                           else { TypeRef::invalid() },
+            visibility:    f.visibility,
+            declared_in:   tmpl.declared_in,
+            owner:         this.arena.lookup(tmpl_ref),
+            index:         index,
+            name:          f.name,
+            default_value: f.default_value,
+        };
+    }
+
+    /// Every field of the struct `recv` names, in declaration order, each
+    /// answered as `field_of` answers it and read where `field_of` reads
+    /// it: a struct's or a resolved instantiation's off its arena type, an
+    /// instantiation not minted yet and a generic owner off the template's
+    /// declaration, whose order is every specialization's.  False when
+    /// `recv` names no struct (a type parameter, a projection, an enum, a
+    /// generic union): it has no field list to read.
+    fields(&this, recv: TypeRef, out: mut &[FieldAnswer]) -> boolean {
         mut owner: TypeRef = recv;
         mut t: Type* = this.arena.lookup(owner);
         if (t == null) { return false; }
         if (t.kind == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = t.as_instantiated();
-            if (!inst.has_resolved_type()) { return this.template_field_names(inst.generic_base, out); }
+            if (!inst.has_resolved_type()) { return this.template_fields(inst.generic_base, recv, out); }
             owner = inst.resolved_type;
             t = this.arena.lookup(owner);
             if (t == null) { return false; }
         }
         if (t.kind != TypeKind::Struct) { return false; }
         const reg: GenericRegistry* = this.ctx.get_generic_registry();
-        if (reg != null && reg.is_template(owner)) { return this.template_field_names(owner, out); }
+        if (reg != null && reg.is_template(owner)) { return this.template_fields(owner, recv, out); }
         const st: StructType* = t.as_struct();
-        for (mut k: i64 = 0; k < st.fields.length(); k++) { out.push(st.fields[k].decl_name().spelling()); }
+        for (mut k: i64 = 0; k < st.fields.length(); k++) { out.push(this.field_answer(recv, &st.fields[k], t, k)); }
         return true;
     }
 
-    /// The declared field names of the generic struct template `tmpl_ref`.
-    template_field_names(&this, tmpl_ref: TypeRef, out: mut &[SymbolStr]) -> boolean {
+    /// Every declared field of the generic struct template `tmpl_ref`, seen
+    /// through the receiver.
+    template_fields(&this, tmpl_ref: TypeRef, recv: TypeRef, out: mut &[FieldAnswer]) -> boolean {
         const reg: GenericRegistry* = this.ctx.get_generic_registry();
         if (reg == null) { return false; }
         const tmpl: const TemplateEntry* = reg.template_of_type(tmpl_ref);
-        if (tmpl == null || tmpl.ast_node == null) { return false; }
-        if (tmpl.kind == TemplateKind::Struct) {
-            const sn: StructDecl* = DeclarationNode::struct_of(tmpl.ast_node);
-            for (mut k: i64 = 0; k < sn.fields.length(); k++) { out.push(DeclarationNode::field_of(sn.fields[k]).name); }
-            return true;
+        if (tmpl == null || tmpl.ast_node == null || tmpl.kind != TemplateKind::Struct) { return false; }
+        const sn: StructDecl* = DeclarationNode::struct_of(tmpl.ast_node);
+        for (mut k: i64 = 0; k < sn.fields.length(); k++) {
+            out.push(this.template_field_answer(tmpl, tmpl_ref, recv, DeclarationNode::field_of(sn.fields[k]), k));
         }
-        return false;
+        return true;
     }
 
     /// The type the field `fa` of `object`, of type `obj_type`, is read as:

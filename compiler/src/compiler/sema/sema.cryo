@@ -118,7 +118,7 @@ import compiler::types::trait_checker::{ TraitChecker };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{
-    EnumType, EnumVariantInfo, FieldInfo, MethodInfo, StructType, TraitType, TypeAliasType
+    EnumType, EnumVariantInfo, MethodInfo, TraitType, TypeAliasType
 };
 import std::core::mem::{ swap };
 import std::core::option::{ Option };
@@ -1538,8 +1538,8 @@ type struct SemaVisitor {
             }
         }
         if (!node.has_resolved_type()) { this.register_destructure_locals_void(node); return; }
-        mut names: [SymbolStr] = [];
-        if (!this.member.field_names(node.resolved_type, &names)) {
+        mut fields: [FieldAnswer] = [];
+        if (!this.member.fields(node.resolved_type, &fields)) {
             // A generic body's type with no field list of its own (a type
             // parameter, a projection) is checked in each specialization.
             if (!this.symbolic.symbolic_defer_type(node.resolved_type)) {
@@ -1550,7 +1550,7 @@ type struct SemaVisitor {
             this.register_destructure_locals_void(node);
             return;
         }
-        const positions: [i64] = this.check_destructure_shape(d, node, &names,
+        const positions: [i64] = this.check_destructure_shape(d, node, &fields,
             this.arena.resolve_display_name(node.resolved_type));
         for (mut i: i64 = 0; i < node.bindings.length(); i++) {
             mut b: DestructureBinding = node.bindings[i];
@@ -1573,11 +1573,11 @@ type struct SemaVisitor {
         }
     }
 
-    /// Report a destructure whose bindings do not match the fields `names`
+    /// Report a destructure whose bindings do not match the fields `fields`
     /// of the type it destructures (`ty_name` in the messages): a field bound
     /// twice, a field the type does not have, a field left out.  Each
-    /// binding's field position in `names`, or -1 for one reported here.
-    check_destructure_shape(mut &this, d: DeclarationNode*, node: DestructureDecl*, names: &[SymbolStr],
+    /// binding's field position in `fields`, or -1 for one reported here.
+    check_destructure_shape(mut &this, d: DeclarationNode*, node: DestructureDecl*, fields: &[FieldAnswer],
                             ty_name: string) -> [i64] {
         mut positions: [i64] = [];
         for (mut i: i64 = 0; i < node.bindings.length(); i++) {
@@ -1601,8 +1601,8 @@ type struct SemaVisitor {
                 continue;
             }
             mut pos: i64 = -1;
-            for (mut k: i64 = 0; k < names.length(); k++) {
-                if (names[k].id == b.source_field.id) { pos = k; break; }
+            for (mut k: i64 = 0; k < fields.length(); k++) {
+                if (fields[k].name.id == b.source_field.id) { pos = k; break; }
             }
             if (pos < 0) {
                 const field_name: string = this.intern.resolve(b.source_field);
@@ -1610,29 +1610,29 @@ type struct SemaVisitor {
                     fmt::format("no field `%s` on type `%s`", field_name, ty_name));
                 diag = diag.at_with_label(b.span, "unknown field");
                 mut cands: [string] = [];
-                for (mut k: i64 = 0; k < names.length(); k++) { cands.push(this.intern.resolve(names[k])); }
+                for (mut k: i64 = 0; k < fields.length(); k++) { cands.push(this.intern.resolve(fields[k].name)); }
                 diag = diag.did_you_mean(field_name, cands, "field", b.span);
                 this.ctx.emit_diagnostic(diag);
             }
             positions.push(pos);
         }
 
-        if (node.bindings.length() < names.length()) {
+        if (node.bindings.length() < fields.length()) {
             mut missing: string = "";
             mut count: i64 = 0;
-            for (mut k: i64 = 0; k < names.length(); k++) {
+            for (mut k: i64 = 0; k < fields.length(); k++) {
                 mut bound: boolean = false;
                 for (mut bi: i64 = 0; bi < node.bindings.length(); bi++) {
-                    if (node.bindings[bi].source_field.id == names[k].id) { bound = true; break; }
+                    if (node.bindings[bi].source_field.id == fields[k].name.id) { bound = true; break; }
                 }
                 if (!bound) {
-                    if (count > 0) { missing = fmt::format("%s, %s", missing, this.intern.resolve(names[k])).into_raw(); }
-                    else { missing = this.intern.resolve(names[k]); }
+                    if (count > 0) { missing = fmt::format("%s, %s", missing, this.intern.resolve(fields[k].name)).into_raw(); }
+                    else { missing = this.intern.resolve(fields[k].name); }
                     count++;
                 }
             }
             mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0362_DESTRUCTURE_INCOMPLETE,
-                fmt::format("destructure of `%s` must bind all %lld field(s); missing: %s", ty_name, names.length(), missing));
+                fmt::format("destructure of `%s` must bind all %lld field(s); missing: %s", ty_name, fields.length(), missing));
             diag = diag.at_with_label(d.span, fmt::format("missing %lld field%s", count, if (count == 1) { "" } else { "s" }));
             this.ctx.emit_diagnostic(diag);
         }
@@ -4931,72 +4931,110 @@ type struct SemaVisitor {
             return lit_type;
         }
 
-        if (struct_t != null && struct_t.kind == TypeKind::Struct) {
-            const st: StructType* = struct_t.as_struct();
-            const fields_ptr: &[FieldInfo] = &st.fields;
-            const is_complete: boolean = st.is_complete;
-            if (is_complete && fields_ptr.length() > 0) {
-                mut missing_names: [SymbolStr] = [];
-                for (mut k: i64 = 0; k < fields_ptr.length(); k++) {
-                    const decl_name: SymbolStr = fields_ptr[k].decl_name().spelling();
-                    mut covered: boolean = false;
-                    for (mut fi: i64 = 0; fi < lit.field_inits.length(); fi++) {
-                        // Pinned above to the type's own field `k`.
-                        const own_k: boolean = match (lit.field_inits[fi].pin) {
-                            MemberPin::Field(ix) => { ix == k }
-                            _                       => { false }
-                        };
-                        if (own_k) { covered = true; break; }
-                    }
-                    if (covered) { continue; }
-                    // A literal sets every field, the ones it leaves to their
-                    // defaults included, so one the writer may not reach
-                    // refuses the literal whether it is named or not.
-                    const omitted: FieldAnswer = this.member.field_answer(struct_ref, &fields_ptr[k], struct_t, k);
-                    this.member.enforce_field_visibility(&omitted, decl_name, e.span);
-                    // An omitted field carrying a `= default` is filled in: clone the
-                    // default, resolve + type-check it, and append it as a synthetic
-                    // field-init so codegen materializes it.  Only an omitted field
-                    // WITHOUT a default is a missing-field error (E0355).
-                    if (fields_ptr[k].has_default()) {
-                        this.fill_field_default(e, lit, &fields_ptr[k], k, decl_name);
-                    } else {
-                        missing_names.push(decl_name);
-                    }
+        // Every field the literal leaves out is filled from its default or
+        // refused, read off the field list of the type the literal builds:
+        // a struct's, and an instantiation's not minted yet - inside a
+        // generic body or out of one - off its template's declaration, seen
+        // through the literal's arguments.
+        mut fields: [FieldAnswer] = [];
+        if (struct_t != null && this.member.fields(lit_type, &fields)) {
+            mut missing: [FieldAnswer] = [];
+            for (mut k: i64 = 0; k < fields.length(); k++) {
+                mut covered: boolean = false;
+                for (mut fi: i64 = 0; fi < lit.field_inits.length(); fi++) {
+                    // Pinned above to the type's own field `k`.
+                    const own_k: boolean = match (lit.field_inits[fi].pin) {
+                        MemberPin::Field(ix) => { ix == k }
+                        _                       => { false }
+                    };
+                    if (own_k) { covered = true; break; }
                 }
-                if (missing_names.length() > 0) {
-                    mut names_str: string = "";
-                    const cap: i64 = if (missing_names.length() < 4) { missing_names.length() } else { 4 };
-                    for (mut i: i64 = 0; i < cap; i++) {
-                        const nm: string = this.intern.resolve(missing_names[i]);
-                        if (i == 0) { names_str = fmt::format("`%s`", nm).into_raw(); } else { names_str = fmt::format("%s, `%s`", names_str, nm).into_raw(); }
-                    }
-                    if (missing_names.length() > cap) { names_str = fmt::format("%s, and %lld more", names_str, missing_names.length() - cap).into_raw(); }
-                    const ty_name: string = this.arena.format_display(struct_t);
-                    mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0355_MISSING_FIELD_INIT,
-                        fmt::format("missing field%s %s in initializer of `%s`",
-                            if (missing_names.length() == 1) { "" } else { "s" }, names_str, ty_name));
-                    diag = diag.at_with_label(e.span,
-                        if (missing_names.length() == 1) { fmt::format("missing field %s", names_str) } else { fmt::format("missing fields %s", names_str) });
-                    this.ctx.emit_diagnostic(diag);
+                if (covered) { continue; }
+                // A literal sets every field, the ones it leaves to their
+                // defaults included, so one the writer may not reach
+                // refuses the literal whether it is named or not.
+                this.member.enforce_field_visibility(&fields[k], fields[k].name, e.span);
+                // An omitted field carrying a `= default` is filled in: clone the
+                // default, resolve + type-check it, and append it as a synthetic
+                // field-init so codegen materializes it.  Only an omitted field
+                // WITHOUT a default is a missing-field error (E0355).
+                if (fields[k].default_value != null) {
+                    this.fill_field_default(e, lit, &fields[k]);
+                } else {
+                    missing.push(fields[k]);
                 }
+            }
+            if (missing.length() > 0) {
+                this.report_missing_fields(e, lit, &missing, this.arena.resolve_display_name(lit_type));
             }
         }
         return lit_type;
     }
 
+    /// E0355 on the literal `e`, which leaves out `missing`, fields with no
+    /// default of the type shown as `ty_name`.  The fix writes each one into
+    /// the literal with a placeholder value of its type, after the last
+    /// written field, or before the closing brace of a literal that writes
+    /// none.
+    report_missing_fields(mut &this, e: ExpressionNode*, lit: StructExpr*, missing: &[FieldAnswer],
+                          ty_name: string) -> void {
+        mut names_str: string = "";
+        const cap: i64 = if (missing.length() < 4) { missing.length() } else { 4 };
+        for (mut i: i64 = 0; i < cap; i++) {
+            const nm: string = this.intern.resolve(missing[i].name);
+            if (i == 0) { names_str = fmt::format("`%s`", nm).into_raw(); } else { names_str = fmt::format("%s, `%s`", names_str, nm).into_raw(); }
+        }
+        if (missing.length() > cap) { names_str = fmt::format("%s, and %lld more", names_str, missing.length() - cap).into_raw(); }
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0355_MISSING_FIELD_INIT,
+            fmt::format("missing field%s %s in initializer of `%s`",
+                if (missing.length() == 1) { "" } else { "s" }, names_str, ty_name));
+        diag = diag.at_with_label(e.span,
+            if (missing.length() == 1) { fmt::format("missing field %s", names_str) } else { fmt::format("missing fields %s", names_str) });
+        // The last field the source wrote; one filled from a default is
+        // spanned as the whole literal.
+        mut last_written: ExpressionNode* = null;
+        for (mut fi: i64 = 0; fi < lit.field_inits.length(); fi++) {
+            const value: ExpressionNode* = lit.field_inits[fi].value;
+            if (value != null && value.span.has_location() && !lit.field_inits[fi].span.same_as(&e.span)) {
+                last_written = value;
+            }
+        }
+        mut written: string = "";
+        for (mut i: i64 = 0; i < missing.length(); i++) {
+            const entry: string = fmt::format("%s: %s", this.intern.resolve(missing[i].name),
+                this.default_return_expr_for(missing[i].ty)).into_raw();
+            if (i == 0) { written = entry; } else { written = fmt::format("%s, %s", written, entry).into_raw(); }
+        }
+        if (e.span.has_location()) {
+            mut anchor: SourceSpan = SourceSpan::new(e.span.file, e.span.end_line, e.span.end_col - 1,
+                                                    e.span.end_line, e.span.end_col - 1);
+            mut insert: string = fmt::format(" %s ", written).into_raw();
+            if (last_written != null) {
+                anchor = last_written.span.end_point();
+                insert = fmt::format(", %s", written).into_raw();
+            }
+            diag = diag.suggest(Suggestion::single(anchor, insert,
+                if (missing.length() == 1) { "add the missing field" } else { "add the missing fields" },
+                Applicability::HasPlaceholders));
+        }
+        diag = diag.help("a field declared with a default (`name: Type = value;`) may be left out of a literal");
+        this.ctx.emit_diagnostic(diag);
+    }
+
     /// Materialize a struct field's `= default` at a construction site that omits
     /// it: clone the default (each construction evaluates its own copy), resolve
-    /// and type-check it against the field type (E0200 on mismatch), then append
-    /// it to the literal as a synthetic field-init so codegen fills the field.
-    /// The default is a standalone expression - it never sees the other fields.
-    fill_field_default(mut &this, e: ExpressionNode*, lit: mut StructExpr*, field: const FieldInfo*,
-                       index: i64, name: SymbolStr) -> void {
+    /// and type-check it against the field's type as the literal sees it (E0200
+    /// on mismatch), then append it to the literal as a synthetic field-init,
+    /// spanned as the whole literal, so codegen fills the field.  The default is
+    /// a standalone expression - it never sees the other fields.
+    fill_field_default(mut &this, e: ExpressionNode*, lit: mut StructExpr*, field: &FieldAnswer) -> void {
         if (field.default_value == null) { return; }
         mut cloner: ASTCloner = ASTCloner::new();
         const cloned: mut ExpressionNode* = cloner.clone_expr(field.default_value);
         if (cloned == null) { return; }
-        const field_type: TypeRef = field.field_type;
+        const field_type: TypeRef = field.ty;
+        const name: SymbolStr = field.name;
+        const index: i64 = field.index;
         const saved: TypeRef = this.state.expected_type;
         if (field_type.is_valid()) { this.state.expected_type = field_type; }
         else { this.state.expected_type = TypeRef::invalid(); }
