@@ -34,7 +34,7 @@ import compiler::types::compound::{
 };
 import compiler::types::generic::{ AssocProjectionType, InstantiatedType };
 import compiler::types::type_base::{ Type };
-import compiler::types::user_defined::{ TypeAliasType };
+import compiler::types::user_defined::{ MethodInfo, TypeAliasType };
 import std::fmt;
 import compiler::ast::declaration::{
     DeclarationNode, FieldDecl, FunctionDecl, GenericParamDecl, ImplBlock, MethodDecl,
@@ -1280,6 +1280,80 @@ type struct TypeResolver {
     /// caller discards the whole binding set, and the call reaches codegen
     /// unspecialized (E0636). Outside the symbolic walk an abstract subject has no
     /// findable impl, so it still derives nothing.
+    /// Bind, through each callable bound of `trait_bounds` (`F: (T) -> U`),
+    /// the parameters its signature names, from the call signature of the
+    /// type its subject is bound to: a function type's own, or a closure's.
+    /// `res_ctx` resolves the signature as the caller resolved its formals,
+    /// so it names the parameters `ictx` solves for; null takes the
+    /// signature as the declaration resolved it, in the parameters a free
+    /// function's template is keyed by.  `param_syms[i]` aligns with
+    /// `ictx.bindings[i]`.  An existing binding is kept, and one the
+    /// signatures contradict is left for the bound check to report.
+    unify_callable_bounds(&this, trait_bounds: &[TraitBound], param_syms: &[SymbolID],
+                          ictx: mut InferCtx*, res_ctx: ResolutionContext*) -> void {
+        for (mut bi: i64 = 0; bi < trait_bounds.length(); bi++) {
+            const bound: const TraitBound* = &trait_bounds[bi];
+            if (bound.signature == null || bound.has_projection_subject()) { continue; }
+            const s: i64 = this.param_slot(param_syms, bound.subject_param());
+            if (s < 0 || s >= ictx.bindings.length()) { continue; }
+            const subject: TypeRef = ictx.bindings[s];
+            if (!subject.is_valid()) { continue; }
+            const actual: TypeRef = this.call_signature_of(subject);
+            if (!actual.is_valid()) { continue; }
+            const written: TypeRef = if (res_ctx != null) {
+                this.resolve(bound.signature, res_ctx)
+            } else { bound.signature_type };
+            if (!written.is_valid()) { continue; }
+            // The parameters already solved are put in first, so a projection
+            // on one (`(I::Item) -> O` with `I` bound) is the type it reduces
+            // to and the rest of the signature can bind.
+            mut known: TypeSubstitution = TypeSubstitution::empty();
+            for (mut i: i64 = 0; i < ictx.bindings.length(); i++) {
+                if (ictx.bindings[i].is_valid()) { known.add(ictx.params[i], ictx.bindings[i]); }
+            }
+            const formal: TypeRef = this.reduce_projections(known.apply(written, this.arena), false);
+            if (!formal.is_valid()) { continue; }
+            ictx.unify(formal, actual);
+        }
+    }
+
+    /// The signature the callable bound `bound` requires of its subject
+    /// under `subst`, when the subject is not called with it - a function
+    /// type or closure called with another signature, or a type that is not
+    /// called at all - with the subject so substituted written to
+    /// `*out_subject`.  Invalid when the subject meets it, when the bound
+    /// writes no signature, and when the subject or the signature still
+    /// names a parameter, which the copy that binds it decides.
+    unmet_callable_bound(&this, bound: const TraitBound*, subst: &TypeSubstitution,
+                         out_subject: mut TypeRef*) -> TypeRef {
+        if (!bound.signature_type.is_valid() || !bound.subject_param().is_valid()) { return TypeRef::invalid(); }
+        const required: TypeRef = this.reduce_projections(subst.apply(bound.signature_type, this.arena), false);
+        const subject: TypeRef = subst.apply(
+            this.arena.create_generic_param(bound.subject_param(), SymbolStr::empty(), 0), this.arena);
+        if (!required.is_valid() || !subject.is_valid()) { return TypeRef::invalid(); }
+        if (this.arena.contains_generic_param(required) || this.arena.contains_generic_param(subject)) {
+            return TypeRef::invalid();
+        }
+        if (this.call_signature_of(subject).equals(required)) { return TypeRef::invalid(); }
+        *out_subject = subject;
+        return required;
+    }
+
+    /// The signature a value of type `ty` is called with when `ty` is
+    /// concrete: a function type's own, or a closure's - the parameters of
+    /// its `__call__` after the receiver, and its return.  Invalid for any
+    /// other type.
+    call_signature_of(&this, ty: TypeRef) -> TypeRef {
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null) { return TypeRef::invalid(); }
+        if (t.kind == TypeKind::Function) { return ty; }
+        if (t.kind != TypeKind::Struct) { return TypeRef::invalid(); }
+        const call_method: const MethodInfo* = this.decl_index.type_method(
+            ty, this.arena.intern_table.intern("__call__"), this.arena);
+        if (call_method == null) { return TypeRef::invalid(); }
+        return call_method.function_type;
+    }
+
     project_where_bound_params_into(&this, trait_bounds: &[TraitBound],
                                     param_syms: &[SymbolID], ictx: mut InferCtx*,
                                     source_file: string, symbolic: boolean) -> void {
@@ -1552,6 +1626,9 @@ type struct TypeResolver {
         for (mut b: i64 = 0; b < bounds.length(); b++) {
             const bound: mut TraitBound* = &bounds[b];
             if (bound.has_projection_subject()) { continue; }
+            if (bound.signature != null && !bound.signature_type.is_valid()) {
+                bound.signature_type = this.resolve(bound.signature, res_ctx);
+            }
             if (bound.subject_param().is_valid()) {
                 for (mut r: i64 = 0; r < bound.trait_refs.length(); r++) {
                     const tr: mut TraitRef* = &bound.trait_refs[r];

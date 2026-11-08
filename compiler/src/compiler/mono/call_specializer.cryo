@@ -73,7 +73,7 @@ import compiler::types::resolver::{ ResolutionContext, TypeResolver };
 import compiler::types::substitution::{ TypeSubstitution };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
-import compiler::types::user_defined::{ FieldInfo, StructType };
+import compiler::types::user_defined::{ FieldInfo, MethodInfo, StructType };
 
 
 /// A walked call with no pin, and the function whose body holds it.
@@ -403,6 +403,7 @@ type struct MonoCallSpecializer {
                 if (callee_path != null && callee_path.refused) { return; }
                 this.specialize_free_call(expr, call, res_ctx, subst);
                 this.specialize_method_call(call, subst);
+                this.bind_closure_call(call);
                 this.bind_call_arguments(call);
                 if (!call.resolved_callee.is_some()) {
                     this.unpinned_calls.push(UnpinnedCall { call: expr, func: this.current_fn });
@@ -1791,6 +1792,27 @@ type struct MonoCallSpecializer {
         if (impl_node == null) { return true; }
         this.pin_spec_entry(call, this.method_instance_entry(m_decl, impl_node, null, owner, &infer.bindings, null));
         return true;
+    }
+
+    /// A call through a value whose type is, in this copy, a closure - a
+    /// parameter, local or field of a type parameter whose callable bound
+    /// let the template call it - calls the closure's `__call__`: the callee
+    /// becomes that method of the value, and the call is pinned to it.  A
+    /// value of function type is called through, as written.
+    bind_closure_call(mut &this, call: mut CallExpr*) -> void {
+        if (call.resolved_callee.is_some() || !this.callee_is_value(call.callee)) { return; }
+        const value: mut ExpressionNode* = call.callee;
+        const value_t: Type* = this.arena.lookup(value.resolved_type);
+        if (value_t == null || value_t.kind != TypeKind::Struct) { return; }
+        const call_method: const MethodInfo* = this.decl_index.type_method(
+            value.resolved_type, this.intern_table.intern("__call__"), this.arena);
+        if (call_method == null || call_method.ast_node == null) { return; }
+        const call_signature: Type* = this.arena.lookup(call_method.function_type);
+        call.callee = ExpressionNode::member_access_expr(value, call_method.name, value.span, value.span);
+        if (call_signature != null && call_signature.kind == TypeKind::Function) {
+            call.callee.set_resolved_type(call_signature.as_function().return_type);
+        }
+        this.pin_plain(call, call_method.ast_node);
     }
 
     /// Pin `call` to `m` when `m` is bound as it is written: one with type

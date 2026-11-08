@@ -671,7 +671,9 @@ today (`E0458`; ruling 293: refused until it is supported properly).  A
 function-typed value is a bare function pointer, with nowhere to keep the
 captures, so supporting it means a function value that carries an
 environment: a pointer to the code beside a pointer to the captures, with
-an owner that releases them.
+an owner that releases them.  A type that keeps a closure today holds it
+through a type parameter with a callable bound (`F: (T) -> U`), which
+needs neither.
 
 Open: whether every function-typed value becomes the two-pointer form or
 only a separate closure-value type does; who owns an escaping closure's

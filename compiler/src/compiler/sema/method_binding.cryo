@@ -585,6 +585,34 @@ type struct MethodBinding {
         return out;
     }
 
+    /// The signature a callable bound in scope of the body being walked
+    /// gives `param` (`F: (T) -> U`), as written in the declaration's own
+    /// parameters; invalid when no bound in scope gives it one.
+    param_signature(&this, param: GenericParamType*) -> TypeRef {
+        const func: FunctionDecl* = DeclarationNode::fn_of(this.state.symbolic_current_func);
+        if (func != null) {
+            const own: TypeRef = MethodBinding::bound_signature(&func.trait_bounds, param);
+            if (own.is_valid()) { return own; }
+        }
+        if (this.state.symbolic_impl_node != null) {
+            const from_impl: TypeRef = MethodBinding::bound_signature(&this.state.symbolic_impl_node.where_bounds, param);
+            if (from_impl.is_valid()) { return from_impl; }
+        }
+        const owner_bounds: [TraitBound]* = this.owner_declared_bounds();
+        if (owner_bounds != null) { return MethodBinding::bound_signature(owner_bounds, param); }
+        return TypeRef::invalid();
+    }
+
+    /// The signature one of `bounds` on `param` itself writes; invalid when
+    /// none does.
+    static bound_signature(bounds: &[TraitBound], param: GenericParamType*) -> TypeRef {
+        for (mut i: i64 = 0; i < bounds.length(); i++) {
+            if (!MethodBinding::bound_names_param(&bounds[i], param)) { continue; }
+            if (bounds[i].signature_type.is_valid()) { return bounds[i].signature_type; }
+        }
+        return TypeRef::invalid();
+    }
+
     static push_bound_traits(bounds: &[TraitBound], param: GenericParamType*, out: mut &[DefId]) -> void {
         for (mut i: i64 = 0; i < bounds.length(); i++) {
             if (!MethodBinding::bound_names_param(&bounds[i], param)) { continue; }
@@ -1969,6 +1997,8 @@ type struct MethodBinding {
             this.ctx.type_resolver.project_where_bound_params_into(
                 &orig_func.trait_bounds, &method_param_syms_d, &ictx, this.ctx.source_file,
                 this.state.in_symbolic_check);
+            this.ctx.type_resolver.unify_callable_bounds(
+                &orig_func.trait_bounds, &method_param_syms_d, &ictx, &infer_ctx);
             for (mut i: i64 = 0; i < n_method_params; i++) {
                 const b: TypeRef = ictx.bindings[i];
                 if (!b.is_valid()) { return []; }

@@ -158,11 +158,18 @@ Param              ::= Ident ":" Type
                           first; one with none is refused (E0118). *)
 VariadicParam      ::= Ident ":" Type "..."
 
-WhereClause        ::= Ident ":" TraitBound ("+" TraitBound)*
-                       ("," Ident ":" TraitBound ("+" TraitBound)*)*
+WhereClause        ::= Ident ":" BoundEntry ("+" BoundEntry)*
+                       ("," Ident ":" BoundEntry ("+" BoundEntry)*)*
                        (* TraitBound is a possibly-qualified trait name with
                           optional generic arguments - same shape as
                           super-trait references on a `type trait` decl. *)
+BoundEntry         ::= TraitBound
+                     | "(" (Type ("," Type)*)? ")" "->" Type
+                       (* a callable bound, `F: (T) -> U`: values of the
+                          subject are called with these parameters and
+                          return this type.  At most one per bound
+                          (E0101), and the return type is required
+                          (E0101). *)
 Visibility         ::= "public" | "internal" | "private"
 
 
@@ -293,7 +300,7 @@ MethodImpl         ::= Directive* Visibility? "static"? "async"?
                      | Visibility? MemberConstant  (* an inherent block's constant *)
 
 Generics           ::= "<" GenericParam ("," GenericParam)* ">"
-GenericParam       ::= Ident (":" TraitBound ("+" TraitBound)*)? ("=" Type)?
+GenericParam       ::= Ident (":" BoundEntry ("+" BoundEntry)*)? ("=" Type)?
                        (* `<T: Ord + Hash>` is the WhereClause entry
                           `T: Ord + Hash`, and merges with the declaration's
                           own WhereClause; it is accepted wherever a

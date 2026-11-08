@@ -806,16 +806,44 @@ type struct Monomorphizer {
         }
         mut concrete: TypeRef = TypeRef::invalid();
         const tref: const TraitRef* = this.trait_checker.unsatisfied_trait_ref(bounds, subst, true, &concrete);
-        if (tref == null) { return true; }
-        const trait_str: string = this.trait_checker.trait_as_required(tref, subst);
-        const concrete_t: Type* = this.arena.lookup(concrete);
-        const concrete_str: string = if (concrete_t != null) { this.arena.format_display(concrete_t) } else { "?" };
         mut args_str: string = "";
         for (mut ai: i64 = 0; ai < type_arg_displays.length(); ai++) {
             if (ai > 0) { args_str = args_str + ", "; }
             args_str = args_str + type_arg_displays[ai];
         }
         const tmpl_str: string = entry.display_name(this.intern_table);
+        if (tref == null) {
+            for (mut bi: i64 = 0; bi < bounds.length(); bi++) {
+                mut subject: TypeRef = TypeRef::invalid();
+                const required: TypeRef = this.type_resolver.unmet_callable_bound(&bounds[bi], subst, &subject);
+                if (!required.is_valid()) { continue; }
+                const required_str: string = this.arena.format_display(this.arena.lookup(required));
+                const actual: TypeRef = this.type_resolver.call_signature_of(subject);
+                mut callable_diag: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
+                    fmt::format("the callable bound `%s: %s` is not satisfied by `%s<%s>`",
+                        this.arena.format_display(this.arena.lookup(this.arena.create_generic_param(
+                            bounds[bi].subject_param(), SymbolStr::empty(), 0))),
+                        required_str, tmpl_str, args_str));
+                callable_diag = callable_diag.at_with_label(bounds[bi].span,
+                    fmt::format("required by this bound on `%s`", tmpl_str));
+                callable_diag = callable_diag.with_note(if (actual.is_valid()) {
+                    fmt::format("the argument is called as `%s`, and the bound requires `%s`",
+                        this.arena.format_display(this.arena.lookup(actual)), required_str).into_raw()
+                } else {
+                    fmt::format("the argument `%s` is not called, and the bound requires `%s`",
+                        this.arena.format_display(this.arena.lookup(subject)), required_str).into_raw()
+                });
+                callable_diag = callable_diag.help(fmt::format(
+                    "give it a function or closure that takes and returns exactly these types: `%s`", required_str));
+                this.diagnostics.emit(callable_diag);
+                return false;
+            }
+            return true;
+        }
+        const trait_str: string = this.trait_checker.trait_as_required(tref, subst);
+        const concrete_t: Type* = this.arena.lookup(concrete);
+        const concrete_str: string = if (concrete_t != null) { this.arena.format_display(concrete_t) } else { "?" };
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
             fmt::format("the trait bound `%s: %s` is not satisfied by `%s<%s>`",

@@ -80,7 +80,7 @@ import compiler::sema::helpers::{
 };
 import compiler::sema::lambda_synth::{ LambdaSynth };
 import compiler::sema::literal_resolver::{ LiteralResolver };
-import compiler::sema::member_resolver::{ MemberResolver };
+import compiler::sema::member_resolver::{ FieldAnswer, MemberResolver };
 import compiler::sema::method_binding::{ BoundDirection, MethodBinding };
 import compiler::sema::scope_manager::{ ScopeManager };
 import compiler::sema::state::{ SemaState };
@@ -355,6 +355,9 @@ type struct CallResolver {
                     if (local.is_valid()) {
                         const local_t: Type* = this.arena.lookup(local);
                         if (local_t != null && local_t.kind == TypeKind::Function) { return local; }
+                        if (local_t != null && local_t.kind == TypeKind::GenericParam) {
+                            return this.binding.param_signature(local_t.as_generic_param());
+                        }
                     }
                     return TypeRef::invalid();
                 }
@@ -1236,7 +1239,7 @@ type struct CallResolver {
         }
         this.state.expected_type = saved_expected;
 
-        this.classify_args_from_params(call, param_types);
+        this.classify_args_from_params(call, &param_types);
 
         // Type-check a `printf`/`eprintf` call's `%` directives against its
         // variadic arguments now that each argument carries a resolved type.
@@ -1330,8 +1333,8 @@ type struct CallResolver {
         const callee_member: mut MemberAccessExpr* = ExpressionNode::member_access_of(callee_node);
         if (callee_member != null) {
             const arg_snap: DiagnosticSnapshot = this.ctx.diagnostics.snapshot();
-            this.lambda.reject_closure_struct_args_in_non_free_call(call,
-                "passing a capturing closure as a method-call argument");
+            this.lambda.refuse_closures_into_function_parameters(call, &param_types,
+                fmt::format("`%s`", this.intern.resolve(callee_member.member)).into_raw());
             const receiver_type: TypeRef = visitor.resolve_receiver(callee_member.object);
             const receiver_t: Type* = this.arena.object_behind_receiver(receiver_type);
             if (receiver_t != null) {
@@ -1388,13 +1391,27 @@ type struct CallResolver {
             return mret;
         }
         if (ExpressionNode::scope_resolution_of(callee_node) != null) {
-            this.lambda.reject_closure_struct_args_in_non_free_call(call,
-                "passing a capturing closure to a scope-resolution call");
             // A call whose owner declares the member is checked against its
             // candidates even when none was selected, which is what reports
             // the arguments that selected none.
             mut claimed: boolean = false;
             const scope_ret: TypeRef = this.resolve_scope_call(visitor, ExpressionNode::scope_resolution_of(callee), call_e, call, &claimed);
+            // A variant's payload holds its argument, as a field does; any
+            // other path calls a function with it.
+            const called: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(callee_node);
+            match (called.resolved_member) {
+                MemberPin::Variant(_) => {
+                    for (mut i: i64 = 0; i < call.arguments.length() && i < param_types.length(); i++) {
+                        if (call.arguments[i] == null) { continue; }
+                        this.lambda.refuse_stored_closure(call.arguments[i].resolved_type, param_types[i],
+                            call.arguments[i].span, "a variant's payload", SourceSpan::none());
+                    }
+                }
+                _ => {
+                    this.lambda.refuse_closures_into_function_parameters(call, &param_types,
+                        fmt::format("`%s`", this.intern.resolve(called.member_name)).into_raw());
+                }
+            }
             if (scope_ret.is_valid() || claimed) {
                 this.check_scope_call_arg_types(visitor, ExpressionNode::scope_resolution_of(callee), call_e, call);
             }
@@ -1428,6 +1445,66 @@ type struct CallResolver {
         this.ctx.emit_diagnostic(d);
     }
 
+    /// E0213 for a call through a value of the type parameter `param`
+    /// (`found`) that no callable bound in scope gives a signature, with the
+    /// fix writing one from the call: its arguments' types, and the type the
+    /// call's context expects back (`void` when none does).
+    refuse_call_of_unbounded_parameter(mut &this, call: CallExpr*, param: GenericParamType*, found: TypeRef) -> void {
+        const shown: string = this.types.type_display_name(found);
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0213_NON_CALLABLE,
+            fmt::format("expected function, found `%s`", shown));
+        d = d.at_with_label(call.callee.span, "call expression requires function");
+        d = d.with_note(fmt::format(
+            "a value of a type parameter is called only through a callable bound on it, `%s: (Args) -> Ret`", shown));
+        mut signature: string = "(";
+        for (mut i: i64 = 0; i < call.arguments.length(); i++) {
+            if (i > 0) { signature = signature + ", "; }
+            const arg: ExpressionNode* = call.arguments[i];
+            signature = signature + if (arg != null && arg.resolved_type.is_valid()) {
+                this.types.type_display_name(arg.resolved_type)
+            } else { "void" };
+        }
+        signature = signature + ") -> " + if (this.state.expected_type.is_valid()) {
+            this.types.type_display_name(this.state.expected_type)
+        } else { "void" };
+        this.ctx.emit_diagnostic(this.binding.with_bound_fix(d, param, shown, signature,
+            Applicability::MaybeIncorrect));
+    }
+
+    /// The signature a value of type `ty` is called with: a function type's
+    /// own, a closure's call, or the one a callable bound in scope gives a
+    /// type parameter (`F: (T) -> U`); invalid for a value that cannot be
+    /// called.
+    callable_signature(mut &this, ty: TypeRef) -> TypeRef {
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null) { return TypeRef::invalid(); }
+        if (t.kind == TypeKind::Function) { return ty; }
+        if (t.kind == TypeKind::GenericParam) { return this.binding.param_signature(t.as_generic_param()); }
+        return this.lambda.closure_call_type(ty);
+    }
+
+    /// `obj.f(args)` where `f` is a field whose value is called - of a
+    /// function type, or of a type parameter a callable bound gives a
+    /// signature: tag the member with the field's type, pin the field, and
+    /// return the signature's return type; invalid when `obj_type` has no
+    /// such field.  Calling the field reads it, so it is gated as a read
+    /// is: a private field is refused outside the module that may reach it.
+    resolve_field_call(mut &this, obj_type: TypeRef, member_e: mut ExpressionNode*,
+                       member: mut MemberAccessExpr*) -> TypeRef {
+        const fa: FieldAnswer = this.member.field_of(obj_type, member.member);
+        if (!fa.found() || fa.index < 0) { return TypeRef::invalid(); }
+        const ft: Type* = this.arena.lookup(fa.ty);
+        if (ft == null || (ft.kind != TypeKind::Function && ft.kind != TypeKind::GenericParam)) {
+            return TypeRef::invalid();
+        }
+        const signature: TypeRef = this.callable_signature(fa.ty);
+        if (!signature.is_valid()) { return TypeRef::invalid(); }
+        member_e.set_resolved_type(fa.ty);
+        const acc_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member_e.span };
+        this.member.pin_field(member, &fa, acc_span);
+        return this.arena.lookup(signature).as_function().return_type;
+    }
+
     /// Whether a call's callee is a name, a path or a member - the callees
     /// a declaration is selected for - rather than a value an expression
     /// computes.
@@ -1439,8 +1516,8 @@ type struct CallResolver {
 
     /// Record how each argument binds to the parameter it lands on
     /// (`CallExpr::bind_arguments`).
-    classify_args_from_params(mut &this, call: CallExpr*, param_types: [TypeRef]) -> void {
-        call.bind_arguments(this.arena, &param_types);
+    classify_args_from_params(mut &this, call: CallExpr*, param_types: &[TypeRef]) -> void {
+        call.bind_arguments(this.arena, param_types);
     }
 
     // -- printf/eprintf format-string checking (W0013) --
@@ -2262,6 +2339,7 @@ type struct CallResolver {
         this.ctx.type_resolver.project_where_bound_params_into(
             &tmpl.trait_bounds, &entry.param_syms, ictx, this.ctx.source_file,
             this.state.in_symbolic_check);
+        this.ctx.type_resolver.unify_callable_bounds(&tmpl.trait_bounds, &entry.param_syms, ictx, null);
     }
 
     /// The type arguments the arguments of `call` bind, one per parameter of
@@ -3409,7 +3487,7 @@ type struct CallResolver {
         if (entries.length() > 1) {
             const sel_t: Type* = this.arena.lookup(overloads[oi]);
             if (sel_t != null && sel_t.kind == TypeKind::Function) {
-                this.classify_args_from_params(call, sema_copy_type_refs(&sel_t.as_function().param_types));
+                this.classify_args_from_params(call, &sel_t.as_function().param_types);
             }
         }
         return this.overload_return_type(overloads[oi]);
@@ -3687,11 +3765,28 @@ type struct CallResolver {
                         const fp_local: TypeRef = this.scopes.type_of(sym);
                         if (fp_local.is_valid()) {
                             const fp_t: Type* = this.arena.lookup(fp_local);
+                            const signature: TypeRef = if (fp_t != null && fp_t.kind == TypeKind::GenericParam) {
+                                this.callable_signature(fp_local)
+                            } else { TypeRef::invalid() };
                             if (fp_t != null && fp_t.kind == TypeKind::Function) {
                                 call.callee.set_resolved_type(fp_local);
                                 this.check_call_against_signature(visitor, call_e, call,
                                     fmt::format("`%s`", this.intern.resolve(ident.name)).into_raw(), fp_t.as_function());
                                 return fp_t.as_function().return_type;
+                            }
+                            // A type parameter a callable bound gives a
+                            // signature is called through it; the copy for
+                            // each argument calls the value it is bound to.
+                            if (signature.is_valid()) {
+                                call.callee.set_resolved_type(fp_local);
+                                const bound_signature: FunctionType* = this.arena.lookup(signature).as_function();
+                                this.check_call_against_signature(visitor, call_e, call,
+                                    fmt::format("`%s`", this.intern.resolve(ident.name)).into_raw(), bound_signature);
+                                return bound_signature.return_type;
+                            }
+                            if (fp_t != null && fp_t.kind == TypeKind::GenericParam) {
+                                this.refuse_call_of_unbounded_parameter(call, fp_t.as_generic_param(), fp_local);
+                                return TypeRef::invalid();
                             }
                             // A local is a value, and one of no function type is
                             // not called: E0213 at the callee, as for a computed one.
@@ -5513,7 +5608,7 @@ type struct CallResolver {
             if (mret.is_valid()) { member_e.set_resolved_type(mret); return mret; }
             // No method of the name: a call through a function-typed field,
             // pinned here so every copy of the body carries the field.
-            return this.member.try_field_function_call(obj_type, member_e, member);
+            return this.resolve_field_call(obj_type, member_e, member);
         }
         if (this.symbolic.symbolic_type_unresolved(obj_type)) {
             this.binding.stash_abstract_receiver_method(obj_type, member, call);
@@ -5696,7 +5791,7 @@ type struct CallResolver {
             return final_ret;
         }
 
-        const field_ret: TypeRef = this.member.try_field_function_call(lookup_ref, member_e, member);
+        const field_ret: TypeRef = this.resolve_field_call(lookup_ref, member_e, member);
         if (field_ret.is_valid()) {
             return field_ret;
         }
@@ -8594,6 +8689,12 @@ type struct CallResolver {
             this.emit_free_call_bound_failure(at, tmpl_decl, tref, concrete, shown);
             return false;
         }
+        mut params: [TypeRef] = [];
+        for (mut i: i64 = 0; i < param_syms.length(); i++) {
+            params.push(this.arena.create_generic_param(param_syms[i], SymbolStr::empty(), i as u64));
+        }
+        const subst: TypeSubstitution = TypeSubstitution::from_params(&params, bindings);
+        if (!this.check_callable_bounds(at, tmpl_decl, &subst)) { return false; }
         mut subject: TypeRef = TypeRef::invalid();
         mut required: string = "";
         const scoped: const TraitRef* = this.unmet_call_bound_in_scope(tmpl_decl, param_syms, bindings,
@@ -8699,15 +8800,33 @@ type struct CallResolver {
             syms.push(gp.sym_id);
         }
         if (!this.check_call_where_bounds(at, m.func, &syms, &call.resolved_type_args)) { return false; }
-        if (f.inherited_params == 0) { return true; }
         const block: ImplBlock* = DeclarationNode::impl_of(this.binding.method_site(chosen, null, recv));
-        if (block == null) { return true; }
         const checker: TraitChecker = this.trait_checker();
-        mut subst: TypeSubstitution = TypeSubstitution::empty();
         mut recv_args: [TypeRef] = [];
         for (mut i: i64 = 0; i < this.arena.inst_type_arg_count(recv); i++) {
             recv_args.push(this.arena.inst_type_arg_at(recv, i));
         }
+        // A callable bound on the method may name its owner's parameters
+        // (`F: (T) -> U` on a method of `Cell<T>`): they are the receiver's
+        // arguments, in the block's head or the type's own declaration.
+        mut owned: TypeSubstitution = TypeSubstitution::empty();
+        if (block != null) {
+            checker.add_head_param_bindings(block, &recv_args, &owned);
+        } else {
+            const owner: const TemplateEntry* = this.ctx.generic_registry.template_of_type(
+                this.arena.inst_generic_base(recv));
+            if (owner != null) {
+                for (mut i: i64 = 0; i < owner.param_syms.length() && i < recv_args.length(); i++) {
+                    owned.add(this.arena.create_generic_param(owner.param_syms[i], SymbolStr::empty(), i as u64), recv_args[i]);
+                }
+            }
+        }
+        for (mut i: i64 = 0; i < syms.length(); i++) {
+            owned.add(this.arena.create_generic_param(syms[i], SymbolStr::empty(), i as u64), call.resolved_type_args[i]);
+        }
+        if (!this.check_callable_bounds(at, m.func, &owned)) { return false; }
+        if (f.inherited_params == 0 || block == null) { return true; }
+        mut subst: TypeSubstitution = TypeSubstitution::empty();
         checker.add_head_param_bindings(block, &recv_args, &subst);
         for (mut i: i64 = f.written_params(); i < syms.length(); i++) {
             subst.add(this.arena.create_generic_param(syms[i], SymbolStr::empty(), i as u64), call.resolved_type_args[i]);
@@ -8725,6 +8844,44 @@ type struct CallResolver {
             if (unmet == null) { continue; }
             this.emit_free_call_bound_failure(at, m.func, unmet, concrete,
                 this.intern.intern(checker.trait_as_required(unmet, &subst)));
+            return false;
+        }
+        return true;
+    }
+
+    /// E0306 at `at` for the first callable bound of the function
+    /// `tmpl_decl` (`F: (T) -> U`) whose subject, under `subst`, is not
+    /// called with the signature the bound writes, under `subst`: a function
+    /// type or closure called with another, or a type that is not called at
+    /// all.  A subject or signature that still names a parameter is left to
+    /// the copy that binds it.  False when one is refused.
+    check_callable_bounds(mut &this, at: SourceSpan, tmpl_decl: DeclarationNode*,
+                          subst: &TypeSubstitution) -> boolean {
+        const tmpl: FunctionDecl* = DeclarationNode::fn_of(tmpl_decl);
+        if (tmpl == null) { return true; }
+        for (mut bi: i64 = 0; bi < tmpl.trait_bounds.length(); bi++) {
+            const bound: const TraitBound* = &tmpl.trait_bounds[bi];
+            mut subject: TypeRef = TypeRef::invalid();
+            const required: TypeRef = this.ctx.type_resolver.unmet_callable_bound(bound, subst, &subject);
+            if (!required.is_valid()) { continue; }
+            const actual: TypeRef = this.ctx.type_resolver.call_signature_of(subject);
+            const subject_param: TypeRef = this.arena.create_generic_param(bound.subject_param(), SymbolStr::empty(), 0);
+            const subject_name: string = this.types.type_display_name(subject_param);
+            const required_shown: string = this.types.type_display_name(required);
+            mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
+                fmt::format("the callable bound `%s: %s` is not satisfied", subject_name, required_shown));
+            diag = diag.at_with_label(at, if (actual.is_valid()) {
+                fmt::format("the argument for `%s` is called as `%s`", subject_name,
+                    this.types.type_display_name(actual)).into_raw()
+            } else {
+                fmt::format("the argument for `%s` is a `%s`, which is not called", subject_name,
+                    this.types.type_display_name(subject)).into_raw()
+            });
+            diag = diag.also_at_in(bound.span, tmpl_decl.name_span, fmt::format(
+                "required by this bound in `%s`", this.intern.resolve(tmpl.name)));
+            diag = diag.help(fmt::format(
+                "pass a function or closure that takes and returns exactly these types: `%s`", required_shown));
+            this.ctx.emit_diagnostic(diag);
             return false;
         }
         return true;
@@ -8931,6 +9088,7 @@ type struct CallResolver {
         this.ctx.type_resolver.project_where_bound_params_into(
             &func.trait_bounds, &method_syms_d, &ictx, this.ctx.source_file,
             this.state.in_symbolic_check);
+        this.ctx.type_resolver.unify_callable_bounds(&func.trait_bounds, &method_syms_d, &ictx, null);
         mut bindings: [TypeRef] = [];
         for (mut i: i64 = 0; i < ictx.bindings.length(); i++) { bindings.push(ictx.bindings[i]); }
         for (mut i: i64 = 0; i < bindings.length(); i++) {
@@ -9085,6 +9243,10 @@ type struct CallResolver {
             const actual: TypeRef = arg.resolved_type;
             if (!actual.is_valid()) { continue; }
             ictx.unify(p.resolved_type, actual);
+        }
+        const owner_bounds: [TraitBound]* = tmpl.declared_where_bounds();
+        if (owner_bounds != null) {
+            this.ctx.type_resolver.unify_callable_bounds(owner_bounds, &tmpl.param_syms, &ictx, null);
         }
         // Pass 2 (GATED literal-default - last resort only): a still-unbound owner
         // param adopts a polymorphic literal's default type (`0` -> i32).  This runs
@@ -9969,6 +10131,10 @@ type struct CallResolver {
         for (mut i: i64 = 0; i < tmpl.param_types.length(); i++) { pids.push(tmpl.param_types[i]); }
         mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
         for (mut i: i64 = 0; i < fields.length() && i < values.length(); i++) { ictx.unify(fields[i], values[i]); }
+        const owner_bounds: [TraitBound]* = tmpl.declared_where_bounds();
+        if (owner_bounds != null) {
+            this.ctx.type_resolver.unify_callable_bounds(owner_bounds, &tmpl.param_syms, &ictx, null);
+        }
         mut args: [TypeRef] = [];
         for (mut i: i64 = 0; i < ictx.bindings.length(); i++) {
             const b: TypeRef = ictx.bindings[i];

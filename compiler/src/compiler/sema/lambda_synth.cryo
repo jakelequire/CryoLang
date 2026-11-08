@@ -48,6 +48,7 @@ import compiler::ast::statement::{ BlockStmt, Stmt, StmtKind };
 import compiler::sema::sema::{ SemaVisitor };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span::{ SourceSpan };
+import compiler::diag::suggestion::{ Suggestion };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::mangled_name::{ MangledName };
 import compiler::resolver::qualified_name::{ QualifiedName };
@@ -524,12 +525,9 @@ type struct LambdaSynth {
     /// what a function-typed parameter it is passed to must be; invalid when
     /// `ty` is no closure type.
     closure_call_type(mut &this, ty: TypeRef) -> TypeRef {
-        if (!ty.is_valid()) { return TypeRef::invalid(); }
         const t: Type* = this.arena.lookup(ty);
         if (t == null || t.kind != TypeKind::Struct) { return TypeRef::invalid(); }
-        const call_m: const MethodInfo* = this.ctx.decl_index.type_method(ty, this.intern.intern("__call__"), this.arena);
-        if (call_m == null) { return TypeRef::invalid(); }
-        return call_m.function_type;
+        return this.ctx.type_resolver.call_signature_of(ty);
     }
 
     /// True if any of `call`'s arguments is a capturing closure (an anonymous
@@ -588,15 +586,15 @@ type struct LambdaSynth {
         }
         const callee_def: DefId = callee_res.def_id();
         if (!callee_def.is_valid()) {
-            // A local fn-pointer cannot receive a closure struct: there is no
-            // declaration to specialize, and the indirect call would treat
-            // the struct as a function pointer.  Refused, as a generic or
-            // method callee is below.
+            // A local of function type holds a function pointer, and the
+            // pointer's parameters take function pointers: there is no
+            // declaration to copy for the closure.
             match (callee_res) {
-                Res::Local(_) => {
-                    if (this.call_has_closure_struct_arg(call)) {
-                        this.reject_closure_struct_args_in_non_free_call(
-                            call, "passing a capturing closure to a fn-pointer local's parameter");
+                Res::Local(sym) => {
+                    const local_t: Type* = this.arena.lookup(this.scopes.type_of(sym));
+                    if (local_t != null && local_t.kind == TypeKind::Function) {
+                        this.refuse_closures_into_function_parameters(call, &local_t.as_function().param_types,
+                            fmt::format("the function value `%s`", this.intern.resolve(ident.name)).into_raw());
                     }
                 }
                 _ => {}
@@ -604,23 +602,21 @@ type struct LambdaSynth {
             return;
         }
 
-        // Guard: a capturing closure (closure-struct value) passed to a
-        // *generic* free function's fn-typed parameter is not yet supported.
-        // The closure-arg specialization below cannot compose with
-        // monomorphization of the generic receiver, and letting it fall
-        // through silently miscompiles - the generic body calls the parameter
-        // as a plain fn-pointer while the argument is a closure-struct value,
-        // which segfaults at the indirect call.  Reject cleanly here, BEFORE
-        // the `generic_args`/`resolved_callee` early returns below, so an
-        // explicit `f<T>(closure)` call is caught as well as an inferred one.
+        // A generic function's parameter of function type is a function
+        // pointer in every copy of the function, so a closure is refused
+        // there, before the early returns below; one passed to a type
+        // parameter is that parameter's argument, and the copy for it calls
+        // it directly.
         const stamped_fn_decl: DeclarationNode* = this.top_level_function_of(callee_def);
         const stamped_fn: FunctionDecl* = DeclarationNode::fn_of(stamped_fn_decl);
-        if (this.call_has_closure_struct_arg(call)) {
-            if (stamped_fn != null && stamped_fn.is_generic()) {
-                this.reject_closure_struct_args_in_non_free_call(
-                    call, "passing a capturing closure to a generic free function's parameter");
-                return;
+        if (stamped_fn != null && stamped_fn.is_generic() && this.call_has_closure_struct_arg(call)) {
+            mut generic_params: [TypeRef] = [];
+            for (mut i: i64 = 0; i < stamped_fn.parameters.length(); i++) {
+                generic_params.push(DeclarationNode::var_of(stamped_fn.parameters[i]).resolved_type);
             }
+            this.refuse_closures_into_function_parameters(call, &generic_params,
+                fmt::format("`%s`", this.intern.resolve(ident.name)).into_raw());
+            return;
         }
 
         if (call.resolved_callee.is_some()) { return; }
@@ -656,7 +652,12 @@ type struct LambdaSynth {
         }
         if (sub_indices.length() == 0) { return; }
 
-        if (orig_func == null) { return; }
+        // Declared in another module: there is no body here to copy.
+        if (orig_func == null) {
+            this.refuse_closures_into_function_parameters(call, &ft.param_types,
+                fmt::format("`%s` (declared in another module)", this.intern.resolve(ident.name)).into_raw());
+            return;
+        }
         // Keyed by the selected DEFINITION: two callees sharing a leaf, or
         // overloads sharing a path, must not share a specialization.
         const def_slot: DefKey = this.ctx.defs.table_key(orig_func.def);
@@ -755,45 +756,62 @@ type struct LambdaSynth {
 
     /// E0458 when a capturing closure of type `value_ty` is held by a slot
     /// of function type `slot_ty` - `what`, a variable, a field, an array
-    /// element, an assigned place or a returned value.  A variant's payload
-    /// is a scope-resolution call's argument, refused as such.  A function-typed
-    /// slot holds a function pointer, which has no room for the closure's
-    /// captures: only a non-generic free function's parameter is
-    /// specialised to the closure's own type.
+    /// element, a variant's payload, an assigned place or a returned value.
+    /// A function-typed slot holds a function pointer, which has no room for
+    /// the closure's captures; a slot of the closure's own type, or of a type
+    /// parameter, holds it.  `annotation` is a variable's written `: Type`,
+    /// from the end of its name, which the fix removes; no location for any
+    /// other slot.
     refuse_stored_closure(mut &this, value_ty: TypeRef, slot_ty: TypeRef, span: SourceSpan,
-                          what: string) -> void {
+                          what: string, annotation: SourceSpan) -> void {
         if (!this.is_closure_struct_type(value_ty)) { return; }
         const st: Type* = this.arena.lookup(slot_ty);
         if (st == null || st.kind != TypeKind::Function) { return; }
+        const shown: string = this.arena.format_display(st);
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0458_CLOSURE_ARG_NON_FREE,
-            fmt::format("a capturing closure cannot be held by %s of function type `%s`", what,
-                this.arena.format_display(st)));
+            fmt::format("a capturing closure cannot be held by %s of function type `%s`", what, shown));
         diag = diag.at_with_label(span, "this closure captures from its environment");
         diag = diag.with_note(
-            "a function-typed value is a function pointer, with no room for a closure's captures; a capturing closure is passed only to a non-generic free function's `(Args) -> Ret` parameter");
-        diag = diag.help(
-            "pass the closure straight to such a function, or leave the variable's type to inference: `const f = (...) -> T { ... };`");
+            "a function-typed value is a function pointer, with no room for a closure's captures; a binding of the closure's own type holds it, and so does a value of a type parameter");
+        diag = diag.help(fmt::format(
+            "leave a variable's type to inference (`const f = (...) -> T { ... };`), or give the slot a type parameter with a callable bound: `where F: %s`",
+            shown));
+        if (annotation.has_location()) {
+            diag = diag.suggest(Suggestion::machine_applicable(annotation, "",
+                "let the variable take the closure's own type"));
+        }
         this.ctx.emit_diagnostic(diag);
     }
 
-    /// Emit E0458 for each closure-struct argument to a method / scope call (v1.0
-    /// routes closures through free-function `(Args) -> Ret` params only).
-    reject_closure_struct_args_in_non_free_call(mut &this, call: CallExpr*,
-                                                context_msg: string) -> void {
+    /// E0458 for each capturing closure among `call`'s arguments that lands
+    /// on a parameter of function type in `param_types`, the parameters of
+    /// what `call` calls (`callee` names it).  A function-typed parameter
+    /// holds a function pointer, which has no room for the closure's
+    /// captures; a closure that lands on a type parameter is passed as the
+    /// value it is, and a callable bound on that parameter is what lets the
+    /// callee call it.  An argument past the known parameters is refused the
+    /// same way: nothing says it reaches anything but a function pointer.
+    refuse_closures_into_function_parameters(mut &this, call: CallExpr*, param_types: &[TypeRef],
+                                             callee: string) -> void {
         if (call == null) { return; }
         for (mut i: i64 = 0; i < call.arguments.length(); i++) {
             const arg: ExpressionNode* = call.arguments[i];
             if (arg == null) { continue; }
             if (!this.is_closure_struct_type(arg.resolved_type)) { continue; }
+            const slot: Type* = if (i < param_types.length()) { this.arena.lookup(param_types[i]) } else { null };
+            if (slot != null && slot.kind != TypeKind::Function) { continue; }
+            const shown: string = if (slot != null) { this.arena.format_display(slot) } else { "(...) -> ..." };
             mut diag: Diagnostic = Diagnostic::error(
                 ErrorCode::E0458_CLOSURE_ARG_NON_FREE,
-                fmt::format("%s is not yet supported", context_msg));
-            diag = diag.at_with_label(arg.span, "this is a capturing closure (anonymous struct value)");
+                fmt::format("a capturing closure cannot be passed to a parameter of function type `%s` of %s",
+                    shown, callee));
+            diag = diag.at_with_label(arg.span, "this closure captures from its environment");
             diag = diag.with_note(
-                "v1.0 routes capturing closures through NON-GENERIC free-function `(Args) -> Ret` parameters only; generic free-function, method-call, and scope-resolution-call closure parameters are deferred");
-            diag = diag.with_note(
-                "workaround: pull the call out into a free function, or pre-extract the closure into a fn-pointer if the capture set is empty");
+                "a function-typed parameter takes a function pointer, which has no room for a closure's captures; only a non-generic free function of this module is copied for each closure passed to it");
+            diag = diag.help(fmt::format(
+                "declare the parameter's type as a type parameter with a callable bound, which takes a closure: `<F>(f: F) where F: %s`",
+                shown));
             this.ctx.emit_diagnostic(diag);
         }
     }

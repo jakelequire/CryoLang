@@ -1,0 +1,128 @@
+namespace CallableBounds;
+
+import std::core::drop::{ Drop };
+import std::core::iter::{ Iterator };
+import CallableBounds::Other::{ apply_elsewhere };
+
+mut drops: i32 = 0;
+
+type struct Counted { v: i32; }
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void { drops = drops + 1; }
+}
+
+function apply<F>(f: F, x: i32) -> i32 where F: (i32) -> i32 { return f(x); }
+
+/// Inline bound form, and a callable passed on to another bounded parameter.
+function apply_plus_one<G: (i32) -> i32>(g: G, x: i32) -> i32 { return apply(g, x) + 1; }
+
+/// Called twice through the same value.
+function twice<F>(f: F, x: i32) -> i32 where F: (i32) -> i32 { return f(f(x)); }
+
+/// A callable that takes a reference and returns nothing.
+function visit<F>(values: &[i32], f: F) -> void where F: (&i32) -> void {
+    for (mut i: i64 = 0; i < values.length(); i++) { f(&values[i]); }
+}
+
+function double(x: i32) -> i32 { return x * 2; }
+
+type struct Cell<T> {
+    value: T;
+
+    /// The result type `U` is bound through the callable bound alone.
+    map<U, F>(&this, f: F) -> U where F: (T) -> U { return f(this.value); }
+
+    static apply_one<F>(f: F) -> i32 where F: (i32) -> i32 { return f(1); }
+}
+
+type trait Measured {
+    measure(&this) -> i32;
+    measure_with<F>(&this, f: F) -> i32 where F: (i32) -> i32 { return f(this.measure()); }
+}
+
+type struct Length { n: i32; }
+implement trait Measured for struct Length {
+    measure(&this) -> i32 { return this.n; }
+}
+
+/// An adapter that stores its callable through a type parameter.
+type struct Mapped<I, F, O> where I: Iterator, F: (I::Item) -> O {
+    inner: I;
+    f: F;
+}
+
+implement<I, F, O> trait Iterator<O> for struct Mapped<I, F, O> where I: Iterator, F: (I::Item) -> O {
+    next(mut &this) -> Option<O> {
+        return match (this.inner.next()) {
+            Option::Some(value) => { Option::Some(this.f(value)) }
+            Option::None        => { Option::None }
+        };
+    }
+}
+
+type struct Upto { at: i32; end: i32; }
+implement trait Iterator<i32> for struct Upto {
+    next(mut &this) -> Option<i32> {
+        if (this.at >= this.end) { return Option::None; }
+        this.at = this.at + 1;
+        return Option::Some(this.at - 1);
+    }
+}
+
+function main() -> i32 {
+    const bias: i32 = 10;
+
+    // Free functions: a capturing closure, a named function, a non-capturing lambda.
+    if (apply((x: i32) -> i32 { return x + bias; }, 1) != 11) { return 1; }
+    if (apply(double, 4) != 8) { return 2; }
+    if (apply((x: i32) -> i32 { return x * 3; }, 2) != 6) { return 3; }
+    if (apply_plus_one((x: i32) -> i32 { return x + bias; }, 1) != 12) { return 4; }
+    if (twice((x: i32) -> i32 { return x + bias; }, 1) != 21) { return 5; }
+    if (apply_elsewhere((x: i32) -> i32 { return x - bias; }, 15) != 5) { return 6; }
+
+    const values: [i32] = [1, 2, 3];
+    const total_cell: mut Counted* = new Counted { v: 0 };
+    visit(&values, (v: &i32) -> void { total_cell.v = total_cell.v + *v + bias; });
+    if (total_cell.v != 36) { return 7; }
+    delete total_cell;
+    drops = 0;
+
+    // Methods: the result type comes from the closure.
+    const c: Cell<i32> = Cell::<i32> { value: 5 };
+    const wide: i64 = c.map((x: i32) -> i64 { return (x + bias) as i64; });
+    if (wide != 15) { return 8; }
+    if (Cell::<i32>::apply_one((x: i32) -> i32 { return x + bias; }) != 11) { return 9; }
+    const len: Length = Length { n: 3 };
+    if (len.measure_with((x: i32) -> i32 { return x * bias; }) != 30) { return 10; }
+
+    // A stored adapter.
+    mut mapped = Mapped { inner: Upto { at: 0, end: 3 }, f: (x: i32) -> i64 { return (x * bias) as i64; } };
+    mut sum: i64 = 0;
+    loop {
+        match (mapped.next()) {
+            Option::Some(v) => { sum = sum + v; }
+            Option::None    => { break; }
+        }
+    }
+    if (sum != 30) { return 11; }
+
+    // A closure that owns a value releases it once: passed by value and
+    // called, or stored in an adapter and called through the field.
+    {
+        const k: Counted = Counted { v: 2 };
+        if (apply(move (x: i32) -> i32 { return x + k.v; }, 1) != 3) { return 12; }
+    }
+    if (drops != 1) { return 13; }
+    drops = 0;
+    {
+        const k: Counted = Counted { v: 4 };
+        mut owning = Mapped { inner: Upto { at: 0, end: 2 }, f: move (x: i32) -> i32 { return x + k.v; } };
+        match (owning.next()) {
+            Option::Some(v) => { if (v != 4) { return 14; } }
+            Option::None    => { return 15; }
+        }
+        if (drops != 0) { return 16; }
+    }
+    if (drops != 1) { return 17; }
+    return 0;
+}

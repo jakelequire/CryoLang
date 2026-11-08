@@ -565,22 +565,88 @@ const b: i32 = x(3);       // error[E0213]: expected function, found `i32`
 const c: i32 = h.n(4);     // error[E0213]: expected function, found `i32` (`n` is a field)
 ```
 
+#### Callable bounds
+
+A type parameter may be bounded by a function type, a **callable bound**:
+`F: (T) -> U`, inline or in a `where` clause. A value of `F` is called with
+those parameters and returns that type, and `F` may be given any type called
+that way: a capturing closure, a non-capturing lambda, or a named function.
+Each closure type is its own argument, so the copy of the callee made for it
+calls the closure directly; every function pointer of the signature shares one
+copy, which calls through the pointer.
+
+```cryo
+function apply<F>(f: F, x: i32) -> i32 where F: (i32) -> i32 { return f(x); }
+
+const bias: i32 = 10;
+apply((x: i32) -> i32 { return x + bias; }, 1);   // 11 - capturing closure
+apply(tentimes, 4);                               // 40 - named function
+```
+
+The bound works in every callee shape - a free function in any module, a
+method, a static method, a trait's default method - and the signature may name
+the other parameters in scope, the owner's included. A parameter that appears
+only in the signature is bound from the argument's own signature, so the type
+argument is never written:
+
+```cryo
+type struct Cell<T> {
+    value: T;
+    map<U, F>(&this, f: F) -> U where F: (T) -> U { return f(this.value); }
+}
+
+const c: Cell<i32> = Cell::<i32> { value: 5 };
+const wide: i64 = c.map((x: i32) -> i64 { return (x + bias) as i64; });   // U = i64
+```
+
+A type that keeps a callable holds it through a callable-bounded parameter, and
+a field of that type is called as a function-typed field is:
+
+```cryo
+type struct Mapped<I, F, O> where I: Iterator, F: (I::Item) -> O {
+    inner: I;
+    f: F;
+}
+// ... in its `next`:  Option::Some(this.f(value))
+```
+
+The argument must be called with exactly the bound's signature; one called
+another way, or not called at all, is refused at the call (**E0306**, "the
+callable bound `F: (i32) -> i32` is not satisfied"), and a type's callable
+bound where the type is instantiated. A value of a type parameter is called
+only through a callable bound on it: without one the call is **E0213**, and the
+fix writes the bound from the call. A bound carries one signature, written
+with its return type (**E0101** otherwise); it may stand beside traits
+(`F: (i32) -> i32 + Copy`). A closure passed to a callable-bounded parameter is
+passed by value, as any argument is: a closure that owns a capture moves into
+the callee, which releases it once.
+
 #### Where a capturing closure may be passed
 
-The specialisation above happens per call site, and in 1.0 it is wired for
-one call shape: a **non-generic free function**. Passing a *capturing* closure
-anywhere else is rejected at compile time with **E0458** rather than silently
-falling back to an indirect call:
+A capturing closure is a value of its own type, so it goes wherever a value of
+a type parameter goes: to a callable-bounded parameter, to a plain `T`
+parameter, into a field or variant of a type parameter. A **function-typed**
+parameter or slot is different: it holds a function pointer, which has no room
+for the closure's captures. One function-typed parameter takes a capturing
+closure - a non-generic free function's, when the function is declared in the
+same module: that function is copied for each closure type passed to it, with
+the parameter retyped to the closure. Everything else is refused at compile
+time with **E0458** rather than compiled to a call through a pointer that is
+not one:
 
-| Callee                                    | Capturing closure           | Non-capturing lambda / named fn |
-| ----------------------------------------- | --------------------------- | ------------------------------- |
-| Non-generic free function - `apply(c, x)` | **yes**                     | yes                             |
-| Generic free function - `apply::<T>(c, x)`  | E0458                       | yes                             |
-| Method - `obj.run(c)`                     | E0458                       | yes                             |
-| Scope-resolution call - `Type::run(c)`    | E0458                       | yes                             |
-| `extern "C"` callback parameter           | never (no environment slot) | yes                             |
+| Where the capturing closure goes                         | Capturing closure           | Non-capturing lambda / named fn |
+| -------------------------------------------------------- | --------------------------- | ------------------------------- |
+| Callable-bounded or plain type parameter, any callee     | **yes**                     | yes                             |
+| `(Args) -> Ret` parameter, non-generic free function of this module | **yes**          | yes                             |
+| `(Args) -> Ret` parameter, any other callee (another module, generic, method, static, function value) | E0458 | yes |
+| `extern "C"` callback parameter                          | never (no environment slot) | yes                             |
 
-A capturing closure is not a function pointer, so a slot of function type cannot hold one either. A variable, field or array element typed `(Args) -> Ret`, a place of that type assigned to, and a function returning one are each refused where the capturing closure meets them (**E0458**). A variable with no annotation takes the closure's own type and holds it:
+The refusal's help shows the callable-bounded form of the parameter. A slot of
+function type cannot hold a capturing closure either: a variable, field, array
+element or variant payload typed `(Args) -> Ret`, a place of that type assigned
+to, and a function returning one are each refused where the capturing closure
+meets them (**E0458**). A variable with no annotation takes the closure's own
+type and holds it, which the variable's fix applies:
 
 ```cryo
 const bias: i32 = 40;
@@ -590,25 +656,11 @@ const g: (i32) -> i32 = (x: i32) -> i32 { return x + bias; }; // error[E0458]: a
 
 The distinction is *capture*, not syntax. A lambda that captures nothing is an
 ordinary function pointer and binds anywhere a function pointer does, including
-every row above; a lambda that captures becomes an anonymous struct value, and
-only the first row knows how to specialise a receiver for it. This is why
-`opt.map((n: int) -> int { return n * 10; })` is fine while the same call with
-a lambda that closes over a local is E0458 - the callee is a method.
+every row above; a lambda that captures becomes an anonymous struct value.
 
-Two ways around it:
-
-```cryo
-// 1. Pull the call into a free function that takes the closure.
-function run_with(f: (i32) -> i32, v: i32) -> i32 { return f(v); }
-run_with((x: i32) -> i32 { return x + bias; }, 32);
-
-// 2. Close over nothing - pass the value as an argument instead.
-opt.map((n: int) -> int { return n * 10; });
-```
-
-These are deferred capabilities, not bugs: the grammar and the closure
-representation already accommodate them, only the receiver-specialisation
-paths for generic, method, and scope-resolution callees are unimplemented.
+A capturing lambda written inside a generic function cannot yet capture a
+value whose type is one of that function's parameters: the closure type would
+itself need the parameter.
 
 A combinator that infers a *new* type parameter from the callback's return
 type - for example `Option::map<U>` - does so automatically: `U` is bound from
