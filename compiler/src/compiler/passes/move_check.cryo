@@ -54,7 +54,7 @@ import compiler::ast::node::{ ProgramNode };
 import compiler::ast::pattern::{ EnumPattern, MatchArmNode, Pattern, PatternKind };
 import compiler::ast::statement::{ Stmt, StmtKind };
 import compiler::diag::diagnostic::{ Diagnostic };
-import compiler::diag::suggestion::{ Suggestion };
+import compiler::diag::suggestion::{ Applicability, Suggestion };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
@@ -288,6 +288,41 @@ type struct MoveChecker {
     /// whole is a transfer (`check_reference_binding_move_out`).
     consumed_receiver: SymbolID;
 
+    /// The bindings of the function being walked that name a closure's
+    /// captures inside its `__call__`.  The closure keeps - or borrows - each
+    /// for every call, so none may be moved out (`emit_capture_move_out`).
+    capture_alias_keys: [u64];
+
+    /// One entry per binding a closure made in this function borrows, as
+    /// parallel arrays: the closure's type, the binding, its spelling, where
+    /// the borrowing closure is written, and the statement that made it.  A
+    /// closure written without `move` borrows each captured value that is
+    /// not `Copy`, and a closure holding a borrowing closure borrows what
+    /// that one does, under its own type too.  The binding may not be moved
+    /// while the closure can still run (`live_borrow_of`).
+    borrow_closures:   [TypeRef];
+    borrow_keys:       [u64];
+    borrow_names:      [SymbolStr];
+    borrow_sites:      [SourceSpan];
+    borrow_statements: [i64];
+
+    /// The borrowing closure types held by a binding in scope, innermost
+    /// last.  A block drops the ones its declarations added when it ends.
+    holder_closures: [TypeRef];
+
+    /// The serial numbers of the statements being walked, outermost first.
+    /// A closure made as a temporary of a statement can run until that
+    /// statement ends - a condition's temporaries, until the condition does
+    /// (`walk_condition`).
+    open_statements:  [i64];
+    statement_serial: i64;
+
+    /// Where each `move` closure in this function moved a capture - the
+    /// capture's use, which the move is recorded at - and the closure it
+    /// moved into, so a later use of the value is told where it went.
+    closure_move_sites:    [SourceSpan];
+    closure_move_closures: [SourceSpan];
+
     fired: i64;
     /// Count of fatal (loop-carried) use-after-move errors.  Non-zero
     /// fails the pass, which (MoveCheck being fatal_on_failure) aborts
@@ -324,6 +359,17 @@ type struct MoveChecker {
             arg_binding_unknown: false,
             drop_receiver:       SymbolID::invalid(),
             consumed_receiver:   SymbolID::invalid(),
+            capture_alias_keys:    [],
+            borrow_closures:       [],
+            borrow_keys:           [],
+            borrow_names:          [],
+            borrow_sites:          [],
+            borrow_statements:     [],
+            holder_closures:       [],
+            open_statements:       [],
+            statement_serial:      0,
+            closure_move_sites:    [],
+            closure_move_closures: [],
             fired: 0,
             fatal: 0,
         };
@@ -354,6 +400,16 @@ type struct MoveChecker {
         this.arg_binding_unknown = false;
         this.drop_receiver       = SymbolID::invalid();
         this.consumed_receiver   = SymbolID::invalid();
+        this.capture_alias_keys    = [];
+        this.borrow_closures       = [];
+        this.borrow_keys           = [];
+        this.borrow_names          = [];
+        this.borrow_sites          = [];
+        this.borrow_statements     = [];
+        this.holder_closures       = [];
+        this.open_statements       = [];
+        this.closure_move_sites    = [];
+        this.closure_move_closures = [];
         const drop_trait: DefId = this.registry.wellknown(LangItem::Drop);
         const is_destructor: boolean = drop_trait.is_valid() && func.origin_trait.equals(drop_trait);
         for (mut i: i64 = 0; i < func.parameters.length(); i++) {
@@ -371,6 +427,9 @@ type struct MoveChecker {
                      span: SourceSpan) -> void {
         if (!this.require_identity(sym, name, span)) { return; }
         this.types.insert(sym.table_key(), ty);
+        // A binding holding a borrowing closure keeps it able to run while
+        // the binding is in scope.
+        this.arena.frame_borrowing_closures(ty, &this.holder_closures);
         // During a loop body's discovery walk, record bindings declared
         // inside the body so they're excluded from the carried set: a
         // body-local is a fresh binding each iteration, not a value
@@ -1116,8 +1175,36 @@ type struct MoveChecker {
         this.walk_stmt(func.body);
     }
 
+    /// Walk `stmt` as an open statement (`open_statements`); a block drops
+    /// the borrowing closures its declarations held when it ends.
     walk_stmt(mut &this, stmt: Stmt*) -> void {
         if (stmt == null) { return; }
+        this.statement_serial += 1;
+        this.open_statements.push(this.statement_serial);
+        const holders_at: i64 = this.holder_closures.length();
+        this.walk_stmt_kind(stmt);
+        match (stmt.kind) {
+            StmtKind::Block(_) | StmtKind::UnsafeBlock(_) => {
+                while (this.holder_closures.length() > holders_at) { this.holder_closures.pop(); }
+            }
+            _ => {}
+        }
+        this.open_statements.pop();
+    }
+
+    /// A statement's condition, whose temporaries are released before the
+    /// branch it decides is taken: a closure made as one of them can no
+    /// longer run after it.
+    walk_condition(mut &this, condition: ExpressionNode*) -> void {
+        if (condition == null) { return; }
+        const borrows_at: i64 = this.borrow_keys.length();
+        this.walk_expr_read(condition);
+        for (mut i: i64 = borrows_at; i < this.borrow_statements.length(); i++) {
+            this.borrow_statements[i] = -1;
+        }
+    }
+
+    walk_stmt_kind(mut &this, stmt: Stmt*) -> void {
         match (stmt.kind) {
             StmtKind::Block(b) => {
                 for (mut i: i64 = 0; i < b.statements.length(); i++) {
@@ -1152,7 +1239,7 @@ type struct MoveChecker {
                 }
             }
             StmtKind::If(it) => {
-                if (it.condition != null) { this.walk_expr_read(it.condition); }
+                this.walk_condition(it.condition);
                 // Walk both branches from the same pre-branch state and merge
                 // their moves at the join. A binding moved in a non-diverging
                 // branch stays moved afterwards (possibly-moved -> Moved,
@@ -1209,18 +1296,18 @@ type struct MoveChecker {
             // its moves stay in effect after the loop; the loop body walk
             // re-walks it, and a `for`'s update, at the back edge.
             StmtKind::While(w) => {
-                if (w.condition != null) { this.walk_expr_read(w.condition); }
+                this.walk_condition(w.condition);
                 this.walk_loop_body(w.body, null, w.condition);
             }
             StmtKind::For(f) => {
-                if (f.condition != null) { this.walk_expr_read(f.condition); }
+                this.walk_condition(f.condition);
                 this.walk_loop_body(f.body, f.update, f.condition);
             }
             StmtKind::DoWhile(d) => {
                 // The condition is tested after the body, so it runs at
                 // least once and is part of every iteration's back edge.
                 this.walk_loop_body(d.body, null, d.condition);
-                if (d.condition != null) { this.walk_expr_read(d.condition); }
+                this.walk_condition(d.condition);
             }
             StmtKind::Loop(lp) => {
                 this.walk_loop_body(lp.body, null, null);
@@ -1375,7 +1462,7 @@ type struct MoveChecker {
         const prev: boolean = this.loop_repeat;
         this.loop_repeat = true;
         this.walk_stmt(update);
-        if (condition != null) { this.walk_expr_read(condition); }
+        this.walk_condition(condition);
         this.loop_repeat = prev;
     }
 
@@ -1386,6 +1473,7 @@ type struct MoveChecker {
         // binding's identity; it owns nothing, so its initializer is a read.
         if (vd.initializer != null && vd.is_capture_alias) {
             this.walk_expr_read(vd.initializer);
+            this.capture_alias_keys.push(vd.sym_id.key());
         } else if (vd.initializer != null) {
             this.walk_expr_move(vd.initializer, true);
         }
@@ -1562,7 +1650,7 @@ type struct MoveChecker {
                 this.walk_conditional(ie.condition, ie.then_expr, ie.else_expr,
                     BranchResult::discarded());
             }
-            ExprKind::Lambda(lam) => { this.read_lambda(lam); }
+            ExprKind::Lambda(lam) => { this.read_lambda(expr, lam); }
             // Not walked by this pass.
             ExprKind::Sizeof(_) | ExprKind::Alignof(_) | ExprKind::Typeof(_)
             | ExprKind::Delete(_) | ExprKind::Yield(_) | ExprKind::Literal(_)
@@ -1571,40 +1659,157 @@ type struct MoveChecker {
     
     }
 
-    /// A move-flagged lambda consumes each non-Copy captured outer binding
-    /// at its construction site - the surrounding scope can no longer name
-    /// those bindings, and a loop-carried construction double-frees the
-    /// captured value.  Walk each capture as a real move so subsequent uses
-    /// surface as E0452 and loop-carried captures fail the pass.
+    /// The construction of the closure `e`: a `move` closure consumes each
+    /// non-Copy captured binding there - the surrounding scope can no longer
+    /// name it, and a loop-carried construction double-frees it - and any
+    /// other closure borrows it, which reads it and records the borrow
+    /// (`borrow_closures`).  A capture of a value holding a borrowing closure
+    /// carries that closure's borrows into this one.
     ///
-    /// Sema flips `is_move` on any lambda that captures a non-Copy outer
-    /// binding (whether the source wrote `move` or not); a Copy-only
-    /// lambda has `is_move == false` and the loop body is a no-op.
     /// Bodies aren't walked here: sema synthesises a closure struct +
     /// `__call__` method for capturing lambdas and injects them into the
     /// program, so MoveCheck visits the body when it walks the
     /// synthesised method.  Non-capturing lambdas have no outer-state
     /// effect at the construction site.
-    read_lambda(mut &this, lam: LambdaExpr*) -> void {
+    read_lambda(mut &this, e: ExpressionNode*, lam: LambdaExpr*) -> void {
         if (lam == null) { return; }
-        if (!lam.is_move) { return; }
+        const closure: TypeRef = e.resolved_type;
+        const statement: i64 = if (this.open_statements.length() > 0) {
+            this.open_statements[this.open_statements.length() - 1]
+        } else { -1 };
         for (mut i: i64 = 0; i < lam.captured_names.length(); i++) {
             const cap_name: SymbolStr = lam.captured_names[i];
             const cap_ty:   TypeRef   = lam.captured_types[i];
             if (!cap_ty.is_valid()) { continue; }
+            if (!lam.borrows_capture(i)) {
+                mut held: [TypeRef] = [];
+                this.arena.frame_borrowing_closures(cap_ty, &held);
+                for (mut h: i64 = 0; h < held.length(); h++) {
+                    const known: i64 = this.borrow_keys.length();
+                    for (mut b: i64 = 0; b < known; b++) {
+                        if (!this.borrow_closures[b].equals(held[h])) { continue; }
+                        this.note_borrow(closure, this.borrow_keys[b], this.borrow_names[b],
+                            this.borrow_sites[b], statement);
+                    }
+                }
+            }
             if (this.is_copy(cap_ty)) { continue; }
             // Synthesize an identifier at the capture's recorded span so
             // handle_ident's existing use-after-move and loop-carried logic
-            // applies uniformly with any other move site.  It carries the
-            // binding the capture names: minted from the spelling alone it
-            // names nothing, and the capture's move silently goes unrecorded.
+            // applies uniformly with any other use.  It carries the binding
+            // the capture names: minted from the spelling alone it names
+            // nothing, and the capture's move silently goes unrecorded.
             const id: mut ExpressionNode* = ExpressionNode::identifier_expr(cap_name,
                 lam.captured_spans[i]);
             const id_p: mut IdentifierExpr* = ExpressionNode::identifier_of(id);
             id_p.set_res(Res::Local(lam.captured_syms[i]));
             id.set_resolved_type(cap_ty);
+            if (lam.borrows_capture(i)) {
+                this.handle_ident(id, id_p, false, false);
+                this.note_borrow(closure, lam.captured_syms[i].key(), cap_name, e.span, statement);
+                continue;
+            }
+            if (!lam.is_move) { continue; }
             this.handle_ident(id, id_p, true, true);
+            this.closure_move_sites.push(lam.captured_spans[i]);
+            this.closure_move_closures.push(e.span);
         }
+    }
+
+    note_borrow(mut &this, closure: TypeRef, key: u64, name: SymbolStr, site: SourceSpan,
+                statement: i64) -> void {
+        this.borrow_closures.push(closure);
+        this.borrow_keys.push(key);
+        this.borrow_names.push(name);
+        this.borrow_sites.push(site);
+        this.borrow_statements.push(statement);
+    }
+
+    /// The entry of a borrow of `key` whose closure can still run, or -1: one
+    /// made in a statement still being walked, or one whose closure a
+    /// binding in scope holds.
+    live_borrow_of(&this, key: u64) -> i64 {
+        for (mut i: i64 = 0; i < this.borrow_keys.length(); i++) {
+            if (this.borrow_keys[i] != key) { continue; }
+            for (mut s: i64 = 0; s < this.open_statements.length(); s++) {
+                if (this.open_statements[s] == this.borrow_statements[i]) { return i; }
+            }
+            for (mut h: i64 = 0; h < this.holder_closures.length(); h++) {
+                if (this.holder_closures[h].equals(this.borrow_closures[i])) { return i; }
+            }
+        }
+        return -1;
+    }
+
+    is_capture_alias(&this, key: u64) -> boolean {
+        for (mut i: i64 = 0; i < this.capture_alias_keys.length(); i++) {
+            if (this.capture_alias_keys[i] == key) { return true; }
+        }
+        return false;
+    }
+
+    /// The closure a `move` closure's capture moved into, when `moved_at` is
+    /// where one was recorded; no location otherwise.
+    closure_moved_into(&this, moved_at: SourceSpan) -> SourceSpan {
+        for (mut i: i64 = 0; i < this.closure_move_sites.length(); i++) {
+            if (this.closure_move_sites[i].same_as(&moved_at)) { return this.closure_move_closures[i]; }
+        }
+        return SourceSpan::none();
+    }
+
+    /// E0453: a closure's body moving one of its captures out.  The closure
+    /// keeps what it captures for every call and releases it once, with
+    /// itself; a capture it borrows is its owner's to release.  Either way
+    /// the value is released again after the move.
+    emit_capture_move_out(mut &this, name: SymbolStr, span: SourceSpan, ty: TypeRef) -> void {
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
+            fmt::format("cannot move captured `%s` out of a closure", this.intern.resolve(name)).into_raw());
+        diag = diag.at_with_label(span,
+            "moving the capture out here leaves the closure's owner of it to release it again (double free)");
+        diag = diag.with_note(
+            "a closure keeps what it captures for every call: a `move` closure releases it when the closure is released, and any other closure borrows it from its owner");
+        diag = this.with_clone_hint(diag, ty, span);
+        this.ctx.emit_diagnostic(diag);
+        this.fired += 1;
+        this.fatal += 1;
+    }
+
+    /// E0457: the binding `name` moved at `span` while the closure of borrow
+    /// entry `entry` can still run.
+    emit_borrowed_move(mut &this, name: SymbolStr, span: SourceSpan, entry: i64) -> void {
+        const shown: string = this.intern.resolve(name);
+        const site: SourceSpan = this.borrow_sites[entry];
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0457_NON_COPY_CAPTURE,
+            fmt::format("cannot move `%s` while a closure borrows it", shown).into_raw());
+        diag = diag.at_with_label(span, fmt::format("`%s` is moved here", shown).into_raw());
+        diag = diag.also_at(site, fmt::format("this closure borrows `%s` and can still run", shown).into_raw());
+        diag = diag.with_note(
+            "a closure written without `move` borrows each captured value that is not `Copy`, so the value has to stay where it is while the closure can run");
+        diag = diag.suggest(Suggestion::single(site.start_point(), "move ",
+            fmt::format("make the closure own `%s`: a `move` closure takes what it captures where it is made", shown),
+            Applicability::MaybeIncorrect));
+        this.ctx.emit_diagnostic(diag);
+        this.fired += 1;
+        this.fatal += 1;
+    }
+
+    /// E0452 for a value a `move` closure took (`closure`, where it is
+    /// written), used again at `use_span`.
+    emit_use_after_closure_move(mut &this, name: SymbolStr, use_span: SourceSpan, closure: SourceSpan) -> void {
+        const shown: string = this.intern.resolve(name);
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0452_USE_AFTER_MOVE,
+            fmt::format("use of moved value `%s`", shown).into_raw());
+        diag = diag.at_with_label(use_span, "value used here after move");
+        diag = diag.also_at(closure, fmt::format("`%s` was moved into this `move` closure", shown).into_raw());
+        diag = diag.help(fmt::format(
+            "a `move` closure owns what it captures; to keep `%s`, capture a clone made before the closure, or leave out `move` so the closure borrows it",
+            shown).into_raw());
+        diag = diag.suggest(Suggestion::single(
+            SourceSpan::new(closure.file, closure.start_line, closure.start_col, closure.start_line, closure.start_col + 5),
+            "", fmt::format("leave out `move`: the closure then borrows `%s`", shown), Applicability::MaybeIncorrect));
+        this.ctx.emit_diagnostic(diag);
+        this.fired += 1;
+        this.fatal += 1;
     }
 
     read_call(mut &this, e: ExpressionNode*, c: CallExpr*) -> void {
@@ -2449,6 +2654,13 @@ type struct MoveChecker {
         }
         if (_is_copy) { return; }
 
+        // A closure's capture stays the closure's, or its owner's, for every
+        // call.
+        if (in_move_context && this.is_capture_alias(sym.key())) {
+            if (!this.suppress_emit) { this.emit_capture_move_out(name, e.span, ty); }
+            return;
+        }
+
         // A move in a loop's condition or update is made again at every back
         // edge.  Refused even when the body gave the value a new one: the
         // value the last test moved is still the one the scope releases.
@@ -2489,6 +2701,11 @@ type struct MoveChecker {
                 return;
             }
             const move_span: SourceSpan = this.moved_at_span(sym);
+            const into_closure: SourceSpan = this.closure_moved_into(move_span);
+            if (into_closure.has_location()) {
+                this.emit_use_after_closure_move(name, e.span, into_closure);
+                return;
+            }
             const headline: string = fmt::format("use of moved value `%s`",
                 this.intern.resolve(name)).into_raw();
             this.emit_use_after_move(ErrorCode::E0452_USE_AFTER_MOVE,
@@ -2496,6 +2713,8 @@ type struct MoveChecker {
             return;
         }
         if (in_move_context) {
+            const borrowed: i64 = this.live_borrow_of(sym.key());
+            if (borrowed >= 0 && !this.suppress_emit) { this.emit_borrowed_move(name, e.span, borrowed); }
             this.mark_moved(sym, e.span, real);
         }
     }

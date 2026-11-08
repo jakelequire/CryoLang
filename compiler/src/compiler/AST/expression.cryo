@@ -284,6 +284,7 @@ type struct ExpressionNode {
             captured_syms:   [],
             captured_types:  [],
             captured_spans:  [],
+            captured_by_reference: [],
             is_move:         false,
         }), span);
     }
@@ -1509,10 +1510,14 @@ type struct LambdaExpr {
     captured_syms:   [SymbolID];
     captured_types:  [TypeRef];
     captured_spans:  [SourceSpan];
-    // `move (...) -> T { ... }` opts the closure into capture-by-move
-    // semantics: non-Copy captures are permitted (and become move sites
-    // on the outer binding), and the synthesized closure struct gets a
-    // Drop method that drops each non-Copy field.
+    // Parallel to the arrays above: whether the closure holds a reference to
+    // the captured binding rather than a value of its own.  A closure written
+    // without `move` borrows each capture that is not `Copy`; every other
+    // capture is held by value.
+    captured_by_reference: [boolean];
+    // `move (...) -> T { ... }`: the closure takes ownership of what it
+    // captures - each non-Copy capture is moved in where the closure is made,
+    // and the closure struct's `Drop` releases it.
     is_move:         boolean;
 
     static walk_children<V>(n: LambdaExpr*, v: mut &V) -> void where V: Walk {
@@ -1542,7 +1547,8 @@ type struct LambdaExpr {
     /// Record a free-variable use of an outer-scope binding.  Idempotent:
     /// a binding already in `captured_syms` is not re-added (the body may
     /// reference the same outer local multiple times).
-    add_capture(mut &this, name: SymbolStr, sym: SymbolID, ty: TypeRef, span: SourceSpan) -> void {
+    add_capture(mut &this, name: SymbolStr, sym: SymbolID, ty: TypeRef, span: SourceSpan,
+                by_reference: boolean) -> void {
         for (mut i: i64 = 0; i < this.captured_syms.length(); i++) {
             if (this.captured_syms[i].equals(sym)) { return; }
         }
@@ -1550,10 +1556,25 @@ type struct LambdaExpr {
         this.captured_syms.push(sym);
         this.captured_types.push(ty);
         this.captured_spans.push(span);
+        this.captured_by_reference.push(by_reference);
     }
 
     is_capturing(&this) -> boolean {
         return this.captured_names.length() > 0;
+    }
+
+    /// Whether the closure holds capture `i` by reference - it borrows the
+    /// binding, which stays its owner's.
+    borrows_capture(&this, i: i64) -> boolean {
+        return i < this.captured_by_reference.length() && this.captured_by_reference[i];
+    }
+
+    /// Whether the closure borrows any of its captures.
+    borrows_any(&this) -> boolean {
+        for (mut i: i64 = 0; i < this.captured_by_reference.length(); i++) {
+            if (this.captured_by_reference[i]) { return true; }
+        }
+        return false;
     }
 }
 

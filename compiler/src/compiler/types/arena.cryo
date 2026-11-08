@@ -1232,6 +1232,76 @@ public:
         return false;
     }
 
+    /// Append to `out` each closure type within `ty` that borrows from the
+    /// frame it was made in (`StructType.borrows_frame`): `ty` itself, or one
+    /// reached through a type argument, a pointee, an element or a member of
+    /// a tuple.  A struct's fields are not walked - a closure holding a
+    /// borrowing value is marked borrowing itself where it is made, and any
+    /// other struct reaches a closure only through its type arguments.
+    frame_borrowing_closures(&this, ty: TypeRef, out: mut &[TypeRef]) -> void {
+        if (!ty.is_valid()) { return; }
+        const t: Type* = this.lookup(ty);
+        if (t == null) { return; }
+        if (t.kind == TypeKind::Struct) {
+            const st: StructType* = t.as_struct();
+            if (st.borrows_frame) {
+                for (mut i: i64 = 0; i < out.length(); i++) {
+                    if (out[i].equals(ty)) { return; }
+                }
+                out.push(ty);
+                return;
+            }
+            for (mut i: i64 = 0; i < st.type_args.length(); i++) {
+                this.frame_borrowing_closures(st.type_args[i], out);
+            }
+            return;
+        }
+        if (t.kind == TypeKind::Enum) {
+            const en: EnumType* = t.as_enum();
+            for (mut i: i64 = 0; i < en.type_args.length(); i++) {
+                this.frame_borrowing_closures(en.type_args[i], out);
+            }
+            return;
+        }
+        if (t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t.as_instantiated();
+            for (mut i: i64 = 0; i < inst.type_args.length(); i++) {
+                this.frame_borrowing_closures(inst.type_args[i], out);
+            }
+            return;
+        }
+        if (t.kind == TypeKind::Pointer) {
+            this.frame_borrowing_closures(t.as_pointer().pointee, out);
+            return;
+        }
+        if (t.kind == TypeKind::Reference) {
+            this.frame_borrowing_closures(t.as_reference().referent, out);
+            return;
+        }
+        if (t.kind == TypeKind::Array) {
+            this.frame_borrowing_closures(t.as_array().element, out);
+            return;
+        }
+        if (t.kind == TypeKind::Optional) {
+            this.frame_borrowing_closures(t.as_optional().wrapped, out);
+            return;
+        }
+        if (t.kind == TypeKind::Tuple) {
+            const tup: TupleType* = t.as_tuple();
+            for (mut i: i64 = 0; i < tup.elements.length(); i++) {
+                this.frame_borrowing_closures(tup.elements[i], out);
+            }
+        }
+    }
+
+    /// Whether a value of `ty` holds a closure that borrows from the frame it
+    /// was made in (`frame_borrowing_closures`).
+    holds_frame_borrow(&this, ty: TypeRef) -> boolean {
+        mut found: [TypeRef] = [];
+        this.frame_borrowing_closures(ty, &found);
+        return found.length() > 0;
+    }
+
     /// The trait object a method call's receiver of type `t` calls
     /// through: `t` itself when it is one, else the object it reaches
     /// through references and pointers (`&virtual &Shape`, `virtual &Shape*`,

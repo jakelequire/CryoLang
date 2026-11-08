@@ -71,6 +71,7 @@ import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::sema::pattern_resolver::{ PatternResolver };
+import compiler::sema::lambda_synth::{ LambdaSynth };
 import compiler::sema::literal_resolver::{ LiteralResolver };
 import compiler::sema::member_resolver::{ FieldAnswer, MemberResolver };
 import compiler::types::arena::{ TypeArena };
@@ -5728,6 +5729,21 @@ type struct AsyncLower {
                 this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
                     "async: a reference cannot be held live across an `await` (owned values only); a suspended future may outlive the referent",
                     vd_decl.span);
+                sm.ok = false; return;
+            }
+            // A closure written without `move` holds references to what it
+            // borrows: the same refusal, with the fix that makes it own them.
+            mut borrowing: [TypeRef] = [];
+            this.arena.frame_borrowing_closures(lty, &borrowing);
+            if (borrowing.length() > 0) {
+                mut d: Diagnostic = Diagnostic::error(ErrorCode::E0455_DANGLING_POINTER,
+                    "async: a closure that borrows local values cannot be held live across an `await`; a suspended future may outlive what it borrows");
+                d = d.at_with_label(vd_decl.span, "this binding holds a closure that borrows");
+                match (LambdaSynth::own_captures_fix(this.ctx, borrowing[0])) {
+                    Option::Some(fix) => { d = d.suggest(fix); }
+                    Option::None => {}
+                }
+                this.ctx.emit_diagnostic(d);
                 sm.ok = false; return;
             }
             if (!this.zeroable_kind(lk)) {

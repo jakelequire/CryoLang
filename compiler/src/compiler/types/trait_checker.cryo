@@ -380,6 +380,10 @@ type struct TraitChecker {
     /// object is refused with (E0314).  For any other type, that the type
     /// does not implement the trait.
     bound_failure_note(&this, ty: TypeRef, trait_def: DefId, trait_shown: string, ty_shown: string) -> string {
+        if (this.borrowing_closure_not_thread_safe(ty, trait_def)) {
+            return fmt::format("`%s` holds a closure that borrows values of the function that made it, so it is not `%s`: another thread may outlive what it borrows",
+                ty_shown, trait_shown).into_raw();
+        }
         const t: Type* = this.arena.lookup(ty);
         if (t != null && t.kind == TypeKind::Object && this.generic_registry != null
                 && this.object_reaches_trait(t.as_object(), trait_def)) {
@@ -395,6 +399,17 @@ type struct TraitChecker {
         return fmt::format("the trait `%s` is not implemented for `%s`", trait_shown, ty_shown).into_raw();
     }
 
+    /// Whether `trait_def` is `Send` or `Sync` and `ty` fails it by holding a
+    /// closure that borrows from the frame it was made in.
+    borrowing_closure_not_thread_safe(&this, ty: TypeRef, trait_def: DefId) -> boolean {
+        if (this.generic_registry == null) { return false; }
+        if (!trait_def.equals(this.generic_registry.wellknown(LangItem::Send))
+                && !trait_def.equals(this.generic_registry.wellknown(LangItem::Sync))) {
+            return false;
+        }
+        return this.arena.holds_frame_borrow(ty);
+    }
+
     /// The help an unmet bound of `trait_def` on `ty` carries.  No
     /// implementation can be written for an object, so an object is told to
     /// give way to a type that implements the trait: one whose trait reaches
@@ -405,6 +420,9 @@ type struct TraitChecker {
     /// other type gets `written_help`, the site's own advice.
     bound_failure_help(&this, ty: TypeRef, trait_def: DefId, trait_shown: string, ty_shown: string,
                        written_help: string) -> string {
+        if (this.borrowing_closure_not_thread_safe(ty, trait_def)) {
+            return "write `move` before the closure, so it owns what it captures";
+        }
         const t: Type* = this.arena.lookup(ty);
         if (t == null || t.kind != TypeKind::Object) {
             const decl: TraitDecl* = if (this.generic_registry != null) {

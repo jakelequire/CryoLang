@@ -113,7 +113,7 @@ refused where it is written (`E0117`) rather than misread.
 
 `with` lists the traits a struct or enum derives (see [section 10.8](#108-derived-implementations-with-)).
 
-`move` marks a closure that captures its environment by move (see [section 15.3](#153-move-checking)).
+`move` marks a closure that takes ownership of what it captures; a closure written without it borrows each captured value that is not `Copy` (see [section 2.5](#25-function-types) and [section 15.3](#153-move-checking)).
 
 `async` marks a function, method, or trait method whose body is compiled into a state machine and whose call returns a future; `await` suspends the enclosing `async` body until a future completes (see [section 18](#18-asynchronous-programming)).
 
@@ -484,28 +484,68 @@ apply((n: int) -> int { return n * 2; }, 21);     // 42 (inline)
 ```
 
 A lambda that references a binding from the enclosing scope **captures** it,
-becoming a closure. Copy types (i32, u64, bool, char, references, and any
-aggregate whose components are all Copy and which has no `Drop` impl - Copy
-is decided structurally, never declared) are captured by value-copy; non-Copy types are
-captured by move - the outer binding is consumed at the lambda's
-construction site (subsequent use is E0452) and the closure-struct's
-synthesized Drop releases the captured value at scope exit. The `move`
-keyword stays valid as an explicit prefix (`move (params) -> T { body }`)
-but is no longer required for non-Copy captures: any non-Copy capture
-implicitly flips the lambda to move semantics. The compiler synthesises an
-anonymous struct holding the captured fields plus a `__call__` method whose
-body is the lambda body; the closure value is the struct instance and the
-call site dispatches directly through `__call__`. Stack-allocated; no heap
-allocation. A closure with a non-Copy capture implements `Drop` - an empty
-`drop`, after which the captures are released as any aggregate's fields are
-- so a written `f.drop()` releases what it captured exactly once, and so does
-leaving its scope; a closure whose captures are all Copy is itself Copy.
+becoming a closure. How the closure holds what it captures is decided by
+`move`:
+
+- A value of a `Copy` type (i32, u64, bool, char, references, and any
+  aggregate whose components are all Copy and which has no `Drop` impl - Copy
+  is decided structurally, never declared) is **copied** into the closure
+  where the closure is made, whichever form it is written in.
+- A closure written without `move` **borrows** each captured value that is not
+  `Copy`: it holds a reference to the variable, which stays usable after the
+  closure is made and is still released by its own scope. Each call reads the
+  variable as it is at that call.
+- A `move` closure, `move (params) -> T { body }`, **takes ownership** of each
+  captured value that is not `Copy`: the variable is moved into the closure
+  where the closure is made - using it afterwards is E0452 - and the closure
+  releases the value when the closure itself is released.
 
 ```cryo
 const bias: i32 = 10;
-const add_bias = (x: i32) -> i32 { return x + bias; };  // captures `bias`
+const add_bias = (x: i32) -> i32 { return x + bias; };  // copies `bias`
 add_bias(32);                                            // 42
+
+const name: String = String::from("cryo");
+const size = () -> i64 { return name.length() as i64; };        // borrows `name`
+size();                                                          // 4
+name.length();                                                   // `name` is still usable
+
+const owned = move () -> i64 { return name.length() as i64; };  // takes `name`
+name.length();          // error[E0452]: use of moved value `name`
 ```
+
+A borrowing closure must not outlive what it borrows, so the places where it
+could are refused, each with the fix that writes `move`:
+
+| Refused                                                                                                  | Diagnostic |
+| -------------------------------------------------------------------------------------------------------- | ---------- |
+| Moving a borrowed variable while the closure can still run: until the end of the statement that makes the closure (for one made in an `if`'s or a loop's condition, the end of the condition), and while any binding in scope holds it | E0457 |
+| Returning the closure, or a value holding it, from the function or closure that made it                  | E0457      |
+| Giving it where `Send` or `Sync` is required: a borrowing closure is neither                             | E0306      |
+| Holding it across an `await`                                                                             | E0455      |
+
+```cryo
+const name: String = String::from("cryo");
+const size = () -> i64 { return name.length() as i64; };
+consume(name);   // error[E0457]: cannot move `name` while a closure borrows it
+size();
+```
+
+A closure's body may not move a captured value out (**E0453**): the closure
+keeps what it captures for every call - a `move` closure until it is
+released, any other closure borrowed from the value's owner - so a value
+moved out would be released again. Clone it instead (`consume(name.clone())`).
+A closure's captures cannot be assigned to.
+
+The compiler synthesises an anonymous struct holding the captures - a
+reference for each borrowed one, the value for each other - plus a
+`__call__` method whose body is the lambda body; the closure value is the
+struct instance and the call site dispatches directly through `__call__`.
+Stack-allocated; no heap allocation. A closure that owns a captured value
+that is not `Copy` implements `Drop` - an empty `drop`, after which the
+captures are released as any aggregate's fields are - so a written `f.drop()`
+releases what it captured exactly once, and so does leaving its scope; a
+closure that owns no such value, a borrowing closure included, is itself Copy.
 
 A closure can also be passed to a `(Args) -> Ret`-typed parameter; the
 compiler specialises the receiver function per concrete closure type so
@@ -3703,9 +3743,11 @@ Two move/ownership hazards that are unambiguous memory errors, called out as the
 - **An owning array read by value through a pointer or reference** (`E0453`) - `const xs: [T] = p.items;` or `xs = p.items;`, with `p` a pointer or reference, copies the array's handle while the struct `p` names still owns the same buffer, so the buffer is released twice.  `[T]` and `[T; N]` alike; borrow the field (`&p.items`) or clone it.  A take that is sound - the old value is meant to leave - swaps it out with `mem::swap`.
 - **A field matched by value through a pointer or reference** (`E0453`) - `match (p.slot)`, with `p` a pointer or reference (including `this` in a `&this` or `mut &this` method) and the field's type owning a destructor, gives the match's subject its own copy of the field's owning handle, released when the match ends whether or not an arm binds the payload, while the storage `p` names still holds the field.  Match on a borrow instead - `match (&p.slot)` - and the arms read the payload without owning it.  A take swaps a replacement in with `mem::swap` first.
 - **A field read by value through a pointer or reference** (`E0453`) - the same holds wherever such a field is read into a second owner: `const x: T = p.slot;`, `x = p.slot;`, `return this.slot;` from a `&this` or `mut &this` method, `take(p.slot)` for a by-value parameter, and `Other { slot: p.slot }`.  Each copies the field's owning handle while the storage `p` names still releases it.  Borrow the field (`&p.slot`), swap it out with `mem::swap`, or read it from a receiver the method owns: `outcome(mut this) -> T { return this.slot; }` consumes the value it is called on, so the field has one owner.  Inside an `unsafe` block the read is allowed, for a take whose storage is overwritten or freed without being released.  A closure reading what it captured is not such a read: its captures are fields of the closure itself.
+- **A capture moved out of a closure's body** (`E0453`) - the closure keeps what it captures for every call, and releases it once with itself (a `move` closure) or leaves it to the value's owner (any other closure), so a captured value given away by the body would be released again.  Clone it (`take(name.clone())`); `unsafe` does not change this.
+- **A borrowed variable moved while a closure borrows it** (`E0457`) - a closure written without `move` holds a reference to each captured value that is not `Copy`, so the variable may not be moved until the end of the statement that made the closure, nor while a binding in scope holds the closure; nor may the closure, or a value holding it, be returned from the function that made it.  Write `move` before the closure to give it the value instead.
 - **A whole value read by value through a reference** (`E0453`) - `return this;` in a `&this` or `mut &this` method, with the type owning a destructor, reads the receiver by its implicit dereference and hands the caller a second owner of the storage the receiver names, so it is released twice.  Clone it, or take the receiver by value (`mut this`) when the method is meant to consume what it is called on; a method marked `![sink]` owns its receiver already, and its `return this;` is that transfer.  Inside an `unsafe` block the read is allowed, as for a field.
 
-Cryo has **no borrow checker**. References and raw pointers are unchecked: aliasing, validity, and lifetimes are the programmer's responsibility (see [section 2](#2-type-system) and [section 14](#14-pointers-and-memory)). Move tracking enforces the moved-set above and nothing more: it does not prove that a reference or pointer outlives what it points to.
+Cryo has **no borrow checker**. References and raw pointers are unchecked: aliasing, validity, and lifetimes are the programmer's responsibility (see [section 2](#2-type-system) and [section 14](#14-pointers-and-memory)). Move tracking enforces the moved-set above and nothing more: it does not prove that a reference or pointer outlives what it points to.  The one borrow it does follow is a closure's borrow of what it captures, which no written reference stands for: E0457 above.
 
 ---
 
@@ -4323,6 +4365,7 @@ The rules below exist to keep futures free of self-references, which is what mak
 | Rule                                                                                                                                                                       | Diagnostic |
 | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
 | A reference may not be held live across an `await`. Owned values are unrestricted.                                                                                         | `E0455`    |
+| A closure that borrows what it captures (one written without `move` that captures a value that is not `Copy`) may not be held live across an `await`; a `move` closure may. | `E0455`    |
 | The address of a local or parameter of the current frame may not be handed to a future that outlives the current step.                                                     | `E0455`    |
 | No slice of a local or by-value parameter may be handed to an awaited future, directly or through a binding: a slice names its elements' storage, which for a fixed-size array is the frame, and the type cannot say where the elements live - so `arr.as_slice()` of an `Array` local is refused as well. A slice the function was handed, or reaches through a reference, is the caller's. | `E0455`    |
 | An `async` method must be awaited on a receiver that names storage - a local, parameter, field, or dereference. A temporary or call result must be bound to a local first. | `E0455`    |

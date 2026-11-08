@@ -675,10 +675,14 @@ an owner that releases them.  A type that keeps a closure today holds it
 through a type parameter with a callable bound (`F: (T) -> U`), which
 needs neither.
 
+A closure that leaves the function that made it already has to own what it
+captures: one written without `move` borrows, and returning it is refused
+(`E0457`), so an escaping closure is a `move` closure and releases its
+captures with itself.
+
 Open: whether every function-typed value becomes the two-pointer form or
-only a separate closure-value type does; who owns an escaping closure's
-captures and when they are released; and whether a non-capturing function
-keeps its single-pointer form across the C boundary.
+only a separate closure-value type does; and whether a non-capturing
+function keeps its single-pointer form across the C boundary.
 
 ## Moving a value out from behind a reference
 

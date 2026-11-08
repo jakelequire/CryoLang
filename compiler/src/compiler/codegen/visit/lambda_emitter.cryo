@@ -18,7 +18,8 @@ import compiler::codegen::{ context, llvm, llvm_types, util };
 import compiler::codegen::state::visitor_state::{ Emitted, VisitorState };
 import compiler::compilation_context::{ CompilationContext };
 import compiler::diag::{ ErrorCode };
-import compiler::types::{ type_ref, resolver };
+import compiler::types::{ type_ref, resolver, RefMutability };
+import compiler::lex::{ Token, TokenType };
 import compiler::ast::{ declaration, expression, MemberPin, node, statement };
 import compiler::resolver::{ symbol_str, intern_table };
 import compiler::types::arena::{ TypeArena };
@@ -292,9 +293,16 @@ type struct LambdaEmitter {
         for (mut i: i64 = 0; i < node.captured_names.length(); i++) {
             const cap_name: SymbolStr = node.captured_names[i];
             const cap_ty:   TypeRef   = node.captured_types[i];
-            const ident: mut ExpressionNode* = ExpressionNode::identifier_expr(cap_name, e.span);
+            mut ident: mut ExpressionNode* = ExpressionNode::identifier_expr(cap_name, e.span);
             ExpressionNode::identifier_of(ident).set_res(Res::Local(node.captured_syms[i]));
             ident.set_resolved_type(cap_ty);
+            // A borrowed capture's field holds the binding's address.
+            if (node.borrows_capture(i)) {
+                const amp: Token = Token::new(TokenType::Amp, "&",
+                    e.span.start_line as int, e.span.start_col as int);
+                ident = ExpressionNode::synthetic_unary(amp, ident, e.span);
+                ident.set_resolved_type(this.cg.ctx.type_arena.get_reference_to(cap_ty, RefMutability::Immutable));
+            }
             // The closure struct's fields ARE the captures, in this order
             // (`LambdaSynth::synthesize_closure_struct`), so the field this
             // initializer names is the i-th; a literal minted after the last

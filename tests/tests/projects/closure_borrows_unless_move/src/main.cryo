@@ -1,0 +1,131 @@
+namespace ClosureBorrowsUnlessMove;
+
+import std::core::drop::{ Drop };
+
+mut drops: i32 = 0;
+
+type struct Counted {
+    v: i32;
+}
+
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void { drops = drops + 1; }
+}
+
+type struct Holder<F> where F: () -> i32 {
+    f: F;
+
+    run(&this) -> i32 { return this.f(); }
+}
+
+function consume(c: Counted) -> i32 { return c.v; }
+
+function call_twice<F>(f: F) -> i32 where F: () -> i32 { return f() + f(); }
+
+function hold<F>(f: F) -> Holder<F> where F: () -> i32 { return Holder::<F> { f: f }; }
+
+function main() -> i32 {
+    // A closure without `move` borrows: the variable stays usable, and its
+    // own scope releases it once.
+    drops = 0;
+    {
+        const c: Counted = Counted { v: 4 };
+        const f = () -> i32 { return c.v; };
+        if (f() != 4) { return 1; }
+        if (c.v != 4) { return 2; }
+        if (f() != 4) { return 3; }
+    }
+    if (drops != 1) { return 4; }
+
+    // Each call reads the borrowed variable as it is then; a `Copy`
+    // capture was copied where the closure was made.
+    drops = 0;
+    {
+        mut n: i32 = 1;
+        mut c: Counted = Counted { v: 1 };
+        const f = () -> i32 { return n * 100 + c.v; };
+        n = 2;
+        c.v = 2;
+        if (f() != 102) { return 5; }
+    }
+    if (drops != 1) { return 6; }
+
+    // A borrowing closure is `Copy`: passed by value twice, nothing is
+    // released by the callee.
+    drops = 0;
+    {
+        const c: Counted = Counted { v: 3 };
+        const f = () -> i32 { return c.v; };
+        if (call_twice(f) != 6) { return 7; }
+        if (call_twice(f) != 6) { return 8; }
+        if (drops != 0) { return 9; }
+    }
+    if (drops != 1) { return 10; }
+
+    // Held in a value whose scope ends: the variable may be moved after it.
+    drops = 0;
+    {
+        const c: Counted = Counted { v: 7 };
+        {
+            const h = hold(() -> i32 { return c.v; });
+            if (h.run() != 7) { return 11; }
+        }
+        if (consume(c) != 7) { return 12; }
+        if (drops != 1) { return 13; }
+    }
+    if (drops != 1) { return 14; }
+
+    // A temporary closure ends with its statement.
+    drops = 0;
+    {
+        const c: Counted = Counted { v: 8 };
+        const twice: i32 = call_twice(() -> i32 { return c.v; });
+        if (twice + consume(c) != 24) { return 15; }
+    }
+    if (drops != 1) { return 16; }
+
+    // Nested closures without `move` borrow the same variable.
+    drops = 0;
+    {
+        const c: Counted = Counted { v: 5 };
+        const outer = () -> i32 {
+            const inner = () -> i32 { return c.v + 1; };
+            return inner() + c.v;
+        };
+        if (outer() != 11) { return 17; }
+        if (c.v != 5) { return 18; }
+    }
+    if (drops != 1) { return 19; }
+
+    // A `move` closure owns: the closure releases the value once.
+    drops = 0;
+    {
+        const c: Counted = Counted { v: 6 };
+        const f = move () -> i32 { return c.v; };
+        if (f() != 6) { return 20; }
+        if (drops != 0) { return 21; }
+    }
+    if (drops != 1) { return 22; }
+
+    // ... and given away, the callee releases it once.
+    drops = 0;
+    {
+        const c: Counted = Counted { v: 2 };
+        const f = move () -> i32 { return c.v; };
+        if (call_twice(f) != 4) { return 23; }
+        if (drops != 1) { return 24; }
+    }
+    if (drops != 1) { return 25; }
+
+    // A `move` closure holding a borrowing closure borrows through it.
+    drops = 0;
+    {
+        const c: Counted = Counted { v: 9 };
+        const peek = () -> i32 { return c.v; };
+        const wrapped = move () -> i32 { return call_twice(peek) + 1; };
+        if (wrapped() != 19) { return 26; }
+        if (c.v != 9) { return 27; }
+    }
+    if (drops != 1) { return 28; }
+    return 0;
+}

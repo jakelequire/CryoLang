@@ -1,0 +1,54 @@
+// E0453: a closure's body may not move a captured value out.  The closure
+// keeps what it captures for every call: a `move` closure releases it once,
+// with itself, and any other closure borrows it from its owner, which
+// releases it.  Either way a value the body gives away is released again.
+//
+// Regression test for uses that name no binding of the function they live in.
+// The closure synthesis moves the lambda's body into `__call__` and declares a
+// shadow there for each capture, read from the closure struct.  The shadow was
+// given an identity of its own while the moved uses still named the OUTER
+// binding, so inside `__call__` they named nothing the move checker tracks;
+// this program was accepted and the value released three times.  The shadow
+// now IS the captured binding inside `__call__`, so each move of it is seen.
+![config(testing)]
+![config(negative, E0453)]
+namespace CryoTests::Negative::ClosureBodyMovesCaptureOut;
+
+type struct Res {
+    tag: i32;
+}
+
+implement trait Drop for struct Res {
+    drop(mut &this) -> void { }
+}
+
+function consume(r: Res) -> i32 { return r.tag; }
+
+function call<F>(f: F) -> i32 where F: () -> i32 { return f(); }
+
+function owned_capture() -> i32 {
+    const p: Res = Res { tag: 3 };
+    const f = move () -> i32 {
+        consume(p);
+        //~^ ERROR[E0453] cannot move captured `p` out of a closure
+        return consume(p);
+        //~^ ERROR[E0453] cannot move captured `p` out of a closure
+    };
+    return f();
+}
+
+function borrowed_capture() -> i32 {
+    const q: Res = Res { tag: 4 };
+    return call(() -> i32 { return consume(q); });
+    //~^ ERROR[E0453] cannot move captured `q` out of a closure
+}
+
+// Reading a capture is not a move.
+function read_capture() -> i32 {
+    const r: Res = Res { tag: 5 };
+    return call(() -> i32 { return r.tag; });
+}
+
+function main() -> int {
+    return owned_capture() + borrowed_capture() + read_capture();
+}

@@ -1,0 +1,80 @@
+// E0457: a closure written without `move` borrows each captured value that
+// is not `Copy`, so the variable may not be moved while the closure can still
+// run: while a binding in scope holds the closure - or a value holding it -
+// and until the end of the statement that made it.  Once it can no longer
+// run, the move is accepted (the controls at the end).
+![config(testing)]
+![config(negative, E0457)]
+namespace CryoTests::Negative::MovedWhileClosureBorrows;
+
+type struct Res {
+    tag: i32;
+}
+
+implement trait Drop for struct Res {
+    drop(mut &this) -> void { }
+}
+
+type struct Holder<F> where F: () -> i32 {
+    f: F;
+
+    run(&this) -> i32 { return this.f(); }
+}
+
+function consume(r: Res) -> i32 { return r.tag; }
+
+function call<F>(f: F) -> i32 where F: () -> i32 { return f(); }
+
+function hold<F>(f: F) -> Holder<F> where F: () -> i32 { return Holder::<F> { f: f }; }
+
+function held_by_a_binding() -> i32 {
+    const p: Res = Res { tag: 1 };
+    const f = () -> i32 { return p.tag; };
+    const n: i32 = consume(p);   //~ ERROR[E0457] cannot move `p` while a closure borrows it
+    return n + f();
+}
+
+function held_inside_a_value() -> i32 {
+    const p: Res = Res { tag: 2 };
+    const h = hold(() -> i32 { return p.tag; });
+    const n: i32 = consume(p);   //~ ERROR[E0457] cannot move `p` while a closure borrows it
+    return n + h.run();
+}
+
+function in_the_same_statement() -> i32 {
+    const p: Res = Res { tag: 3 };
+    return call(() -> i32 { return p.tag; }) + consume(p);   //~ ERROR[E0457] cannot move `p` while a closure borrows it
+}
+
+function into_a_move_closure() -> i32 {
+    const p: Res = Res { tag: 4 };
+    const f = () -> i32 { return p.tag; };
+    const g = move () -> i32 { return p.tag; };   //~ ERROR[E0457] cannot move `p` while a closure borrows it
+    return f() + g();
+}
+
+function after_its_statement() -> i32 {
+    const p: Res = Res { tag: 5 };
+    const n: i32 = call(() -> i32 { return p.tag; });
+    return n + consume(p);
+}
+
+function after_its_block() -> i32 {
+    const p: Res = Res { tag: 6 };
+    {
+        const f = () -> i32 { return p.tag; };
+        if (f() != 6) { return 0; }
+    }
+    return consume(p);
+}
+
+function after_its_condition() -> i32 {
+    const p: Res = Res { tag: 7 };
+    if (call(() -> i32 { return p.tag; }) == 7) { return consume(p); }
+    return 0;
+}
+
+function main() -> int {
+    return held_by_a_binding() + held_inside_a_value() + in_the_same_statement()
+        + into_a_move_closure() + after_its_statement() + after_its_block() + after_its_condition();
+}

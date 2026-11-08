@@ -18,8 +18,10 @@
 namespace compiler::sema::lambda_synth;
 
 import compiler::types::{
-    type_ref, type_base, arena, compound, user_defined, ownership, resolver, generic_registry, TypeKind
+    type_ref, type_base, arena, compound, user_defined, ownership, resolver, generic_registry, RefMutability,
+    TypeKind
 };
+import compiler::lex::{ Token, TokenType };
 import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name };
 import compiler::ast::{
     cloner, declaration, expression, MemberPin, NamedAnnotation, node, statement,
@@ -48,7 +50,7 @@ import compiler::ast::statement::{ BlockStmt, Stmt, StmtKind };
 import compiler::sema::sema::{ SemaVisitor };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span::{ SourceSpan };
-import compiler::diag::suggestion::{ Suggestion };
+import compiler::diag::suggestion::{ Applicability, Suggestion };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::mangled_name::{ MangledName };
 import compiler::resolver::qualified_name::{ QualifiedName };
@@ -234,18 +236,16 @@ type struct LambdaSynth {
         this.state.current_lambda      = saved_current_lam;
 
         // Nested-capture propagation: an inner lambda's captures not in the outer
-        // lambda's own locals must be captured by the outer lambda too.
+        // lambda's own locals must be captured by the outer lambda too, each
+        // as the outer lambda captures (`capture_by_reference`).
         if (node.is_capturing() && saved_current_lam != null && saved_lambda_depth > 0) {
-            const prop_registry: GenericRegistry* = this.ctx.get_generic_registry();
             for (mut ci: i64 = 0; ci < node.captured_names.length(); ci++) {
                 const cap_name: SymbolStr = node.captured_names[ci];
                 if (!this.scopes.type_of(node.captured_syms[ci]).is_valid()) {
                     const cap_ty: TypeRef = node.captured_types[ci];
                     saved_current_lam.add_capture(cap_name, node.captured_syms[ci],
-                                                  cap_ty, node.captured_spans[ci]);
-                    if (!OwnershipQuery::is_copy(this.arena, prop_registry, this.intern, cap_ty)) {
-                        saved_current_lam.is_move = true;
-                    }
+                                                  cap_ty, node.captured_spans[ci],
+                                                  this.capture_by_reference(saved_current_lam, cap_ty));
                 }
             }
         }
@@ -256,21 +256,25 @@ type struct LambdaSynth {
         return this.arena.get_function(ret_ty, param_types, false);
     }
 
-    /// Record a captured outer binding `outer_ty` for the surrounding lambda
-    /// (non-Copy captures flip `is_move`), shadow it as a per-lambda local, and
-    /// return its type so the referencing identifier resolves.
+    /// Record a captured outer binding `outer_ty` for the surrounding lambda,
+    /// shadow it as a per-lambda local, and return its type so the
+    /// referencing identifier resolves.
     record_lambda_capture(mut &this, e: ExpressionNode*, ident: IdentifierExpr*, outer_ty: TypeRef) -> TypeRef {
-        const is_copy: boolean = OwnershipQuery::is_copy(this.arena,
-            this.ctx.get_generic_registry(), this.intern, outer_ty);
-        if (!is_copy && this.state.current_lambda != null) {
-            this.state.current_lambda.is_move = true;
-        }
         this.scopes.declare(ident.res.local_sym(), outer_ty, false);
         if (this.state.current_lambda != null) {
             this.state.current_lambda.add_capture(ident.name, ident.res.local_sym(),
-                                                  outer_ty, e.span);
+                                                  outer_ty, e.span,
+                                                  this.capture_by_reference(this.state.current_lambda, outer_ty));
         }
         return outer_ty;
+    }
+
+    /// Whether `lambda` holds a capture of type `ty` by reference.  A `Copy`
+    /// value is copied into any closure; any other value is moved into a
+    /// `move` closure and borrowed by every other closure.
+    capture_by_reference(mut &this, lambda: LambdaExpr*, ty: TypeRef) -> boolean {
+        if (lambda.is_move) { return false; }
+        return !OwnershipQuery::is_copy(this.arena, this.ctx.get_generic_registry(), this.intern, ty);
     }
 
     /// Register the definition of a new closure struct, `<ns>::__Closure_<N>`,
@@ -316,10 +320,23 @@ type struct LambdaSynth {
         const struct_header: mut DeclarationNode* = DeclarationNode::of(DeclKind::Struct(struct_decl), span);
         struct_header.generated = true;
 
+        // A borrowed capture's field is a reference to the binding; any other
+        // capture's field holds the value.
+        mut field_types: [TypeRef] = [];
+        mut borrows_frame: boolean = false;
+        for (mut i: i64 = 0; i < lambda.captured_names.length(); i++) {
+            if (lambda.borrows_capture(i)) {
+                field_types.push(arena_ptr.get_reference_to(lambda.captured_types[i], RefMutability::Immutable));
+                borrows_frame = true;
+            } else {
+                field_types.push(lambda.captured_types[i]);
+                if (arena_ptr.holds_frame_borrow(lambda.captured_types[i])) { borrows_frame = true; }
+            }
+        }
         for (mut i: i64 = 0; i < lambda.captured_names.length(); i++) {
             mut field: mut FieldDecl* = FieldDecl::new(lambda.captured_names[i]);
             field.visibility = Visibility::Public;
-            field.resolved_type = lambda.captured_types[i];
+            field.resolved_type = field_types[i];
             struct_decl.fields.push(DeclarationNode::of(DeclKind::Field(field), span));
         }
 
@@ -332,9 +349,10 @@ type struct LambdaSynth {
             mut infos: [FieldInfo] = [];
             for (mut i: i64 = 0; i < lambda.captured_names.length(); i++) {
                 infos.push(FieldInfo::new(
-                    lambda.captured_names[i], lambda.captured_types[i], Visibility::Public, false));
+                    lambda.captured_names[i], field_types[i], Visibility::Public, false));
             }
             st.set_fields(infos);
+            st.borrows_frame = borrows_frame;
         }
 
         // 3. `__call__` FunctionDecl: the closure struct by reference, then
@@ -351,7 +369,8 @@ type struct LambdaSynth {
             call_fn.add_parameter(lambda.parameters[i]);
         }
 
-        // 4. __call__ body: `{ const cap_i = this.cap_i; <lambda body> }`.
+        // 4. __call__ body: `{ const cap_i = this.cap_i; <lambda body> }`, and
+        // `const cap_i = *this.cap_i;` for a borrowed capture.
         const body_block: Stmt* = Stmt::block(span);
         const body: mut BlockStmt* = body_block.as_block();
         const this_ident_sym: SymbolStr = intern_ptr.intern("this");
@@ -363,13 +382,19 @@ type struct LambdaSynth {
             const this_ident: mut ExpressionNode* = ExpressionNode::identifier_expr(this_ident_sym, span);
             this_ident.set_resolved_type(struct_ref);
             ExpressionNode::identifier_of(this_ident).set_res(Res::Local(call_recv.sym_id));
-            const access: mut ExpressionNode* = ExpressionNode::member_access_expr(
+            mut access: mut ExpressionNode* = ExpressionNode::member_access_expr(
                 this_ident, cap_name, span, span);
-            access.set_resolved_type(cap_ty);
+            access.set_resolved_type(field_types[i]);
             // Capture `i` is field `i` of the struct laid out above; nothing
             // after this walks a node that already carries its type, so the
             // position is recorded here, where it is known.
             ExpressionNode::member_access_of(access).set_resolved_member(MemberPin::Field(i));
+            if (lambda.borrows_capture(i)) {
+                const star: Token = Token::new(TokenType::Star, "*",
+                    span.start_line as int, span.start_col as int);
+                access = ExpressionNode::synthetic_unary(star, access, span);
+                access.set_resolved_type(cap_ty);
+            }
             // The shadow is the captured binding inside `__call__`: the body
             // moved in below still names that binding in every use it holds, so
             // the shadow takes its identity.  With a fresh one, a move of the
@@ -386,8 +411,9 @@ type struct LambdaSynth {
             shadow.set_mutable(false);
             shadow.set_resolved_type(cap_ty);
             shadow.set_initializer(access);
-            if (lambda.is_move
-                    && !OwnershipQuery::is_copy(arena_ptr, cap_registry, intern_ptr, cap_ty)) {
+            // A value that is not `Copy` stays the closure's, or its owner's
+            // when borrowed: the shadow names it and owns nothing.
+            if (!OwnershipQuery::is_copy(arena_ptr, cap_registry, intern_ptr, cap_ty)) {
                 shadow.set_capture_alias(true);
             }
             body.add_statement(Stmt::decl_stmt(shadow_decl, span));
@@ -458,18 +484,19 @@ type struct LambdaSynth {
         return struct_ref;
     }
 
-    /// `implement trait Drop for struct <closure>`, for a closure that
-    /// captures a value that is not `Copy`; null when every capture is
-    /// `Copy`, so the closure is `Copy` too.  The destructor's body is
-    /// empty: the captures are the struct's fields, and they are released
-    /// after its `drop` runs, as any aggregate's are.  Being the closure's
-    /// destructor, it is what a written `f.drop()` and the scope-exit
-    /// release both reach.
+    /// `implement trait Drop for struct <closure>`, for a closure that owns
+    /// a captured value that is not `Copy`; null when it owns none - every
+    /// capture is `Copy` or borrowed - so the closure is `Copy` too.  The
+    /// destructor's body is empty: the captures are the struct's fields, and
+    /// they are released after its `drop` runs, as any aggregate's are.
+    /// Being the closure's destructor, it is what a written `f.drop()` and
+    /// the scope-exit release both reach.
     closure_drop_impl(mut &this, lambda: LambdaExpr*, struct_decl: StructDecl*,
                       struct_ref: TypeRef, span: SourceSpan) -> mut DeclarationNode* {
         const registry_ptr: mut GenericRegistry* = this.ctx.get_generic_registry();
         mut has_noncopy_capture: boolean = false;
         for (mut di: i64 = 0; di < lambda.captured_names.length(); di++) {
+            if (lambda.borrows_capture(di)) { continue; }
             if (!OwnershipQuery::is_copy(this.arena, registry_ptr, this.intern, lambda.captured_types[di])) {
                 has_noncopy_capture = true;
                 break;
@@ -752,6 +779,46 @@ type struct LambdaSynth {
     mint_closure_spec_name(mut &this, orig: SymbolStr, closure_tys: [TypeRef]) -> SymbolStr {
         return MangledName::specialized_identifier(
             this.intern, this.arena, QualifiedName::from_symbol(orig), &closure_tys);
+    }
+
+    /// Where the closure of type `closure_ty` is written: the lambda its
+    /// struct was made for.
+    static closure_site(ctx: CompilationContext*, closure_ty: TypeRef) -> SourceSpan {
+        return ctx.defs.span_of(ctx.decl_index.registered_def(closure_ty));
+    }
+
+    /// The suggestion to write `move` before the closure of type
+    /// `closure_ty`, so it owns what it captures; none when the closure has
+    /// no place to write it.
+    static own_captures_fix(ctx: CompilationContext*, closure_ty: TypeRef) -> Option<Suggestion> {
+        const site: SourceSpan = LambdaSynth::closure_site(ctx, closure_ty);
+        if (!site.has_location()) { return Option::None; }
+        return Option::Some(Suggestion::single(site.start_point(), "move ",
+            "make the closure own what it captures: a `move` closure takes each captured value where it is made",
+            Applicability::MaybeIncorrect));
+    }
+
+    /// E0457 when the value of type `value_ty` returned at `span` holds a
+    /// closure that borrows from this frame: what it borrows is released
+    /// when the function returns, and the closure would read it afterwards.
+    refuse_returned_borrow(mut &this, value_ty: TypeRef, span: SourceSpan) -> void {
+        mut held: [TypeRef] = [];
+        this.arena.frame_borrowing_closures(value_ty, &held);
+        if (held.length() == 0) { return; }
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0457_NON_COPY_CAPTURE,
+            "cannot return a closure that borrows values of this function");
+        diag = diag.at_with_label(span, "this value holds a closure that borrows local values");
+        const site: SourceSpan = LambdaSynth::closure_site(this.ctx, held[0]);
+        if (site.has_location()) {
+            diag = diag.also_at(site, "this closure borrows what it captures");
+        }
+        diag = diag.with_note(
+            "a closure written without `move` borrows each captured value that is not `Copy`, and those values are released when the function returns");
+        match (LambdaSynth::own_captures_fix(this.ctx, held[0])) {
+            Option::Some(fix) => { diag = diag.suggest(fix); }
+            Option::None => {}
+        }
+        this.ctx.emit_diagnostic(diag);
     }
 
     /// E0458 when a capturing closure of type `value_ty` is held by a slot

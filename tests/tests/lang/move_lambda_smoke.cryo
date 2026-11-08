@@ -1,11 +1,10 @@
-///! Capture-by-move tests for closures.
+///! Capture tests for closures.
 ///!
-///! Cryo captures Copy types by value-copy and non-Copy types by move
-///! (the outer binding is consumed at the lambda construction site, the
-///! closure-struct takes ownership of the value, and the synthesized
-///! Drop releases it at scope exit).  The `move` keyword stays valid
-///! as an explicit signal but is no longer required: sema flips
-///! `is_move` on any lambda that captures a non-Copy outer binding.
+///! A closure copies each captured `Copy` value.  A `move` closure takes
+///! each other captured value (the outer binding is consumed where the
+///! closure is made, the closure struct owns the value, and its
+///! synthesized Drop releases it with the closure); a closure without
+///! `move` borrows it, and the outer binding's own scope releases it.
 ![config(testing)]
 namespace CryoTests::Tests::Lang::MoveLambda;
 
@@ -27,9 +26,9 @@ implement trait Drop for struct Probe {
 }
 
 ![test]
-function implicit_move_accepts_noncopy_capture() -> Result<(), TestError> {
-    // No `move` keyword - sema upgrades the lambda to move semantics
-    // automatically because `p` is non-Copy (Probe has a Drop impl).
+function plain_closure_borrows_noncopy_capture() -> Result<(), TestError> {
+    // No `move` keyword: the closure borrows `p` (non-Copy - Probe has a
+    // Drop impl), which stays `main`'s to release.
     const p: Probe = Probe { payload: 7 };
     const f = () -> i32 { return p.payload; };
     match (expect_eq(f(), 7)) {
@@ -40,10 +39,8 @@ function implicit_move_accepts_noncopy_capture() -> Result<(), TestError> {
 }
 
 ![test]
-function explicit_move_keyword_still_works() -> Result<(), TestError> {
-    // `move` is still a valid prefix - useful for documentation and for
-    // thread::spawn where the consumption should be visible at the
-    // construction site.  Behavior is identical to the implicit form.
+function move_closure_owns_noncopy_capture() -> Result<(), TestError> {
+    // `move`: the closure takes `p` where it is made.
     const p: Probe = Probe { payload: 11 };
     const f = move () -> i32 { return p.payload; };
     match (expect_eq(f(), 11)) {
@@ -58,7 +55,7 @@ function captured_field_drops_exactly_once_at_scope_exit() -> Result<(), TestErr
     drop_counter = 0;
     {
         const p: Probe = Probe { payload: 1 };
-        const f = () -> i32 { return p.payload; };
+        const f = move () -> i32 { return p.payload; };
         const _v: i32 = f();
         // `f` (and therefore the captured `p`) goes out of scope at the end
         // of this block.  The Probe::drop above bumps drop_counter exactly
@@ -81,7 +78,7 @@ function call_does_not_consume_capture() -> Result<(), TestError> {
     drop_counter = 0;
     {
         const p: Probe = Probe { payload: 4 };
-        const f = () -> i32 { return p.payload; };
+        const f = move () -> i32 { return p.payload; };
         const a: i32 = f();
         const b: i32 = f();
         const c: i32 = f();
@@ -106,7 +103,7 @@ function multi_field_capture_all_drop_once() -> Result<(), TestError> {
     {
         const p1: Probe = Probe { payload: 10 };
         const p2: Probe = Probe { payload: 20 };
-        const sum_two = () -> i32 { return p1.payload + p2.payload; };
+        const sum_two = move () -> i32 { return p1.payload + p2.payload; };
         match (expect_eq(sum_two(), 30)) {
             Result::Ok(_)  => { }
             Result::Err(e) => { return Result::Err(e); }
@@ -121,15 +118,15 @@ function multi_field_capture_all_drop_once() -> Result<(), TestError> {
 
 ![test]
 function mixed_copy_and_noncopy_capture() -> Result<(), TestError> {
-    // Copy bindings (i32) capture by value-copy; non-Copy (Probe)
-    // capture by move.  Both kinds in one closure: closure-struct gets a
-    // synthesized Drop that drops only the non-Copy field.  Copy field
-    // contributes nothing to drop_counter.
+    // Copy bindings (i32) capture by value-copy; non-Copy (Probe) is
+    // moved into a `move` closure.  Both kinds in one closure: the closure
+    // struct gets a synthesized Drop that drops only the non-Copy field.
+    // The Copy field contributes nothing to drop_counter.
     drop_counter = 0;
     {
         const k: i32  = 3;
         const p: Probe = Probe { payload: 4 };
-        const compute = () -> i32 { return k * p.payload; };
+        const compute = move () -> i32 { return k * p.payload; };
         match (expect_eq(compute(), 12)) {
             Result::Ok(_)  => { }
             Result::Err(e) => { return Result::Err(e); }
@@ -493,7 +490,7 @@ function closure_invoked_repeatedly_in_loop() -> Result<(), TestError> {
     mut total: i32 = 0;
     {
         const factor: Probe = Probe { payload: 3 };
-        const mul = (x: i32) -> i32 { return x * factor.payload; };
+        const mul = move (x: i32) -> i32 { return x * factor.payload; };
         mut i: i32 = 0;
         while (i < 100) {
             total = total + mul(1);
@@ -524,7 +521,7 @@ function box_capture_drops_heap_allocation() -> Result<(), TestError> {
     mut got: i32 = 0;
     {
         mut b: Box<i32> = Box::new(123);
-        const read_box = () -> i32 { return *b.as_ptr(); };
+        const read_box = move () -> i32 { return *b.as_ptr(); };
         got = read_box();
     }
     match (expect_eq(got, 123)) {
