@@ -261,8 +261,8 @@ function shell_set_environment(setting: string) -> string {
     return fmt::format("export \"%s\" && ", setting).into_raw();
 }
 
-/// One batch of shell commands for a suite's worker pool, moved into each
-/// worker by value.  The pointers alias arrays the suite owns and keeps alive
+/// One batch of shell commands for a suite's worker pool, copied into each
+/// worker.  The pointers alias arrays the suite owns and keeps alive
 /// until its scope has joined every worker.  A worker takes the next index off
 /// `cursor`, runs that command, stores its exit status, and only then
 /// publishes `done` for it (release); the suite reads a result only after
@@ -274,16 +274,15 @@ type struct ShellJobs {
     n:      u64;
     status: mut i32*;
     done:   mut Atomic<u32>*;
-}
 
-// Pool worker body.  A free function because it is handed to
-// `Scope::spawn` as a plain function pointer.
-function shell_jobs_worker(ctx: ShellJobs) -> void {
-    loop {
-        const k: u64 = (*ctx.cursor).fetch_add(1, MemoryOrder::Relaxed);
-        if (k >= ctx.n) { break; }
-        ctx.status[k] = Command::shell(ctx.cmds[k]);
-        ctx.done[k].store(1, MemoryOrder::Release);
+    /// A pool worker's body: run commands off the cursor until none is left.
+    run(&this) -> void {
+        loop {
+            const k: u64 = (*this.cursor).fetch_add(1, MemoryOrder::Relaxed);
+            if (k >= this.n) { break; }
+            this.status[k] = Command::shell(this.cmds[k]);
+            this.done[k].store(1, MemoryOrder::Release);
+        }
     }
 }
 
@@ -2081,10 +2080,11 @@ type struct Executor {
             mut scope: thread::Scope = thread::Scope::new();
             mut w: u32 = 0;
             while (w < jobs && (w as u64) < n_jobs) {
-                scope.spawn::<ShellJobs>(ShellJobs {
+                const batch: ShellJobs = ShellJobs {
                     cursor: &cursor, cmds: cmds.as_ptr(), n: n_jobs,
                     status: status.as_mutable_ptr(), done: done.as_mutable_ptr()
-                }, shell_jobs_worker);
+                };
+                scope.spawn(move () -> void { batch.run(); });
                 w = w + 1;
             }
 
@@ -2558,10 +2558,11 @@ type struct Executor {
             mut scope: thread::Scope = thread::Scope::new();
             mut w: u32 = 0;
             while (w < jobs && (w as u64) < n_jobs) {
-                scope.spawn::<ShellJobs>(ShellJobs {
+                const batch: ShellJobs = ShellJobs {
                     cursor: &cursor, cmds: cmds.as_ptr(), n: n_jobs,
                     status: status.as_mutable_ptr(), done: done.as_mutable_ptr()
-                }, shell_jobs_worker);
+                };
+                scope.spawn(move () -> void { batch.run(); });
                 w = w + 1;
             }
 

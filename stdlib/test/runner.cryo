@@ -1171,43 +1171,43 @@ private type struct WorkerCtx {
     private timeout_secs: u32;
     private capture:      boolean;
     private sender:       mpsc::Sender<WorkerResult>;
-}
 
-/// Pool worker body. Pulls test indices off the shared cursor until the
-/// runnable list is exhausted, running each in its own child process. For
-/// each test it ships a `Started` event the instant it picks the test up and
-/// a `Finished` event carrying the outcome once the child exits, so the main
-/// thread can both stream results live and name the tests still in flight
-/// during a stall. `ctx` (including its `Sender`) is dropped on return,
-/// releasing this worker's sender so the channel can disconnect once every
-/// worker has finished.
-private function test_worker(ctx: WorkerCtx) -> void {
-    loop {
-        const k: u64 = (*ctx.counter).fetch_add(1, MemoryOrder::Relaxed);
-        if (k >= ctx.n_runnable) { break; }
-        const idx: u64 = ctx.runnable[k];
+    /// Pool worker body. Pulls test indices off the shared cursor until the
+    /// runnable list is exhausted, running each in its own child process.
+    /// For each test it ships a `Started` event the instant it picks the test
+    /// up and a `Finished` event carrying the outcome once the child exits,
+    /// so the main thread can both stream results live and name the tests
+    /// still in flight during a stall. The thread's body owns the context, so
+    /// its `Sender` is released when the thread finishes, and the channel
+    /// disconnects once every worker has.
+    private run(&this) -> void {
+        loop {
+            const k: u64 = (*this.counter).fetch_add(1, MemoryOrder::Relaxed);
+            if (k >= this.n_runnable) { break; }
+            const idx: u64 = this.runnable[k];
 
-        // Announce the test as in-flight before the (potentially hanging)
-        // child runs, so a stall report can point at it.
-        const start_ev: WorkerResult = WorkerResult {
-            idx: idx, kind: WorkerEventKind::Started,
-            outcome: TestOutcome::Pass, captured: String::new()
-        };
-        match (ctx.sender.send(start_ev)) {
-            Result::Ok(_)  => { }
-            Result::Err(_) => { }
-        }
+            // Announce the test as in-flight before the (potentially
+            // hanging) child runs, so a stall report can point at it.
+            const start_ev: WorkerResult = WorkerResult {
+                idx: idx, kind: WorkerEventKind::Started,
+                outcome: TestOutcome::Pass, captured: String::new()
+            };
+            match (this.sender.send(start_ev)) {
+                Result::Ok(_)  => { }
+                Result::Err(_) => { }
+            }
 
-        const d: TestDescriptor = ctx.descriptors[idx];
-        mut tr: TestRun = run_one(d, idx, ctx.timeout_secs, ctx.capture);
-        const fin_ev: WorkerResult = WorkerResult {
-            idx: idx, kind: WorkerEventKind::Finished,
-            outcome: tr.outcome, captured: tr.take_captured()
-        };
-        mem::drop(tr);
-        match (ctx.sender.send(fin_ev)) {
-            Result::Ok(_)  => { }
-            Result::Err(_) => { }
+            const d: TestDescriptor = this.descriptors[idx];
+            mut tr: TestRun = run_one(d, idx, this.timeout_secs, this.capture);
+            const fin_ev: WorkerResult = WorkerResult {
+                idx: idx, kind: WorkerEventKind::Finished,
+                outcome: tr.outcome, captured: tr.take_captured()
+            };
+            mem::drop(tr);
+            match (this.sender.send(fin_ev)) {
+                Result::Ok(_)  => { }
+                Result::Err(_) => { }
+            }
         }
     }
 }
@@ -1253,11 +1253,9 @@ private function print_in_flight(descriptors: TestDescriptor*, count: u64,
 // methods, so the threaded state travels with the object instead of being
 // passed by reference through a pile of free functions.
 //
-// Target-gated primitives (`run_one`, `arm_watchdog`) and the
-// pool worker body (`test_worker`) stay free functions: the first because
-// `![target(...)]` variants can't be methods, the second because the worker
-// is handed to `thread::spawn` as a plain function pointer. The live drain
-// loop itself is a `TestRunner` method (`run_parallel`), so the tally and
+// Target-gated primitives (`run_one`, `arm_watchdog`) stay free functions,
+// because `![target(...)]` variants can't be methods. The live drain loop
+// itself is a `TestRunner` method (`run_parallel`), so the tally and
 // reporter travel with the object.
 
 private type struct TestRunner {
@@ -1542,7 +1540,7 @@ private type struct TestRunner {
                     capture:      this.opts.capture,
                     sender:       rx.sender(),
                 };
-                scope.spawn::<WorkerCtx>(ctx, test_worker);
+                scope.spawn(move () -> void { ctx.run(); });
                 w = w + 1;
             }
 

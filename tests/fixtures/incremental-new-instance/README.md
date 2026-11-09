@@ -4,11 +4,12 @@ Two builds of one program, driven by `scripts/incremental-instance-check.py`
 (a `make verify` gate): the project runner builds a program once, and this
 defect needs a cached build followed by an edit.
 
-1. `src/main.cryo` spawns a `thread::Scope` job of type `JobA`; built
-   incrementally, it runs and exits 3.
-2. `edit/main.cryo` replaces it and also spawns a `JobB`, which asks
-   `std::thread` for a new instance, `Scope::spawn<JobB>`.  Built again
-   incrementally over the first build's cache, it must link and exit 4.
+1. `src/main.cryo` spawns a `thread::Scope` job, a closure running a
+   `JobA`; built incrementally, it runs and exits 3.
+2. `edit/main.cryo` replaces it and also spawns a second closure, running a
+   `JobB`, which asks `std::thread` for a new instance, `Scope::spawn<F>`
+   for that closure's type.  Built again incrementally over the first
+   build's cache, it must link and exit 4.
 
 Each build also converts instantiations of `src/meters.cryo`'s `Gauge<T>`,
 which implements `Meter` generically, to trait objects; the edit converts a
@@ -17,10 +18,11 @@ tables of those instantiations are emitted with them, in `meters.cryo`'s
 and `std::collections::string`'s objects, which the edit does not touch;
 reused from the first build, they would hold no such table.
 
-`spawn<C>` is a generic method written inside `type struct Scope { .. }`, so
+`spawn<F>` is a generic method written inside `type struct Scope { .. }`, so
 its instances are emitted in `std::thread`'s object, not in the module that
 calls it.  If the cache reused that module's object from the first build -
-which has no `spawn<JobB>` - the link would fail on the undefined symbol.
+which has no instance for the second closure - the link would fail on the
+undefined symbol.
 
 `src/steady.cryo` is the one module the edit neither touches nor asks for
 anything new: its object is the one the second build must reuse, which is

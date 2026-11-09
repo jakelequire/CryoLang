@@ -13,7 +13,7 @@
 #   [private]         not reachable from another module
 #   [internal]        reachable only from the standard library
 #
-# 158 namespaces, 4968 declarations.
+# 158 namespaces, 4967 declarations.
 
 ==============================================================================
 std::alloc::allocator
@@ -2971,7 +2971,6 @@ std::future::blocking
   JOB_CANCELLED: u8
   JOB_DONE: u8
   JOB_PENDING: u8
-  blocking_worker(pool: mut BlockingPool*) -> ()   [private]
   BlockingJob.arm(mut &this, w: Waker) -> u8
   BlockingJob.finish(mut &this, status: u8) -> void   [private]
   BlockingJob.release(mut &this) -> void
@@ -2979,6 +2978,7 @@ std::future::blocking
   BlockingJob::init(job: mut BlockingJob*, run_fn: (mut u8*) -> void, drop_fn: (mut u8*) -> void) -> void
   BlockingPool.submit(mut &this, job: mut BlockingJob*) -> boolean
   BlockingPool.take(mut &this) -> mut BlockingJob*   [private]
+  BlockingPool.work(mut &this) -> ()   [private]
   BlockingPool::current() -> mut BlockingPool*
   BlockingPool::free(p: mut BlockingPool*) -> void
   BlockingPool::set_current(p: mut BlockingPool*) -> void   [internal]
@@ -3048,10 +3048,10 @@ std::future::executor
   task_wake(data: mut u8*) -> void   [private]
   waker_arc_clone(data: mut u8*) -> mut u8*   [private]
   waker_arc_drop(data: mut u8*) -> void   [private]
-  worker_body(inner: mut ExecInner*) -> void   [private]
   ExecInner.drain_cancelled(mut &this) -> void   [private]
   ExecInner.enqueue(mut &this, task: mut Task*) -> void   [private]
   ExecInner.take(mut &this) -> mut Task*   [private]
+  ExecInner.work(mut &this) -> void   [private]
   Executor.block_on<F, O>(mut &this, root: F) -> O where F: Future<O>
   Executor.spawn<F, O>(mut &this, fut: F) -> JoinHandle<O> where F: Future<O>
   Executor.spawn_detached<F, O>(mut &this, fut: F) -> void where F: Future<O>
@@ -3095,7 +3095,6 @@ std::future::reactor
   afd_op_free(op: mut AfdOp*) -> void   [private]
   afd_ovl(op: mut AfdOp*) -> mut u8*   [private]
   epoll_event_pack(slot: u8*, events: u32, fd: u32) -> void   [private]
-  reactor_body(rt: mut Reactor*) -> void   [private]
   rt_arm(rt: Reactor*, reg: mut Registration*) -> boolean   [private]
   rt_backend_close(rt: mut Reactor*) -> void   [private]
   rt_backend_open(rt: mut Reactor*) -> boolean   [private]
@@ -3112,6 +3111,7 @@ std::future::reactor
   Reactor.register_timer(mut &this, deadline: i64, w: Waker) -> u64   [internal]
   Reactor.remove(mut &this, table: mut ReactorTable*, reg: mut Registration*) -> void   [private]
   Reactor.run_once(mut &this) -> void   [private]
+  Reactor.run_until_shutdown(mut &this) -> void   [private]
   Reactor::current() -> mut Reactor*   [internal]
   Reactor::free(rt: mut Reactor*) -> void   [internal]
   Reactor::require() -> mut Reactor*   [internal]
@@ -5314,7 +5314,6 @@ std::test::runner
   run_child(d: TestDescriptor, idx: u64, command: mut &Command, timeout_secs: u32, capture: boolean) -> TestRun   [private]
   run_child_single(idx: u64, descriptors: TestDescriptor*, count: u64, timeout_secs: u32) -> i32   [private]
   run_one(d: TestDescriptor, idx: u64, timeout_secs: u32, capture: boolean) -> TestRun   [private]
-  test_worker(ctx: WorkerCtx) -> void   [private]
   Counters::new() -> Counters   [private]
   ReporterState::new() -> ReporterState   [private]
   RunOptions::default() -> RunOptions   [private]
@@ -5334,6 +5333,7 @@ std::test::runner
   TestRunner.run_sequential(mut &this) -> void   [private]
   TestRunner.should_show(&this, failed: boolean) -> boolean   [private]
   TestRunner::new(opts: RunOptions, descriptors: TestDescriptor*, count: u64) -> TestRunner   [private]
+  WorkerCtx.run(&this) -> void   [private]
 
 ==============================================================================
 std::test::table
@@ -5349,9 +5349,8 @@ std::thread
   enum SpawnError
   struct Builder
   struct JoinHandle<T>
-  struct Payload<C, T>   [private]
+  struct Payload<F, T>   [private]
   struct Scope
-  struct ScopePayload<C>   [private]
   struct Shared<T>   [private]
   struct Thread
   struct ThreadId
@@ -5371,29 +5370,29 @@ std::thread
   os_thread_self() -> u64   [private]
   os_yield() -> void   [private]
   reap_detached<T>(tid: u64, shared: mut Shared<T>*) -> void   [private]
-  scope_body<C>(arg: mut u8*) -> void   [private]
-  scope_trampoline<C>(arg: mut u8*) -> u32   [private]
-  scope_trampoline<C>(arg: mut u8*) -> u8*   [private]
+  scope_body<F>(arg: mut u8*) -> void where F: () -> void   [private]
+  scope_trampoline<F>(arg: mut u8*) -> u32 where F: () -> void   [private]
+  scope_trampoline<F>(arg: mut u8*) -> u8* where F: () -> void   [private]
   sleep(nanos: u64) -> void
   sleep_ms(millis: u64) -> void
-  spawn<C, T>(ctx: C, body: (C) -> T) -> JoinHandle<T> where C: Send, T: Send
-  spawn_with_attr<C, T>(ctx: C, body: (C) -> T, stack_bytes: u64) -> Result<JoinHandle<T>, SpawnError> where C: Send, T: Send
-  thread_body<C, T>(arg: mut u8*) -> void   [private]
-  thread_trampoline<C, T>(arg: mut u8*) -> u32   [private]
-  thread_trampoline<C, T>(arg: mut u8*) -> u8*   [private]
-  try_spawn<C, T>(ctx: C, body: (C) -> T) -> Result<JoinHandle<T>, SpawnError> where C: Send, T: Send
+  spawn<F, T>(body: F) -> JoinHandle<T> where F: () -> T + Send, T: Send
+  spawn_with_attr<F, T>(body: F, stack_bytes: u64) -> Result<JoinHandle<T>, SpawnError> where F: () -> T + Send, T: Send
+  thread_body<F, T>(arg: mut u8*) -> void where F: () -> T   [private]
+  thread_trampoline<F, T>(arg: mut u8*) -> u32 where F: () -> T   [private]
+  thread_trampoline<F, T>(arg: mut u8*) -> u8* where F: () -> T   [private]
+  try_spawn<F, T>(body: F) -> Result<JoinHandle<T>, SpawnError> where F: () -> T + Send, T: Send
   yield_now() -> void
   Builder.name(mut this, n: Str) -> Builder
-  Builder.spawn<C, T>(this, ctx: C, body: (C) -> T) -> JoinHandle<T> where C: Send, T: Send
+  Builder.spawn<F, T>(this, body: F) -> JoinHandle<T> where F: () -> T + Send, T: Send
   Builder.stack_size(mut this, bytes: u64) -> Builder
-  Builder.try_spawn<C, T>(this, ctx: C, body: (C) -> T) -> Result<JoinHandle<T>, SpawnError> where C: Send, T: Send
+  Builder.try_spawn<F, T>(this, body: F) -> Result<JoinHandle<T>, SpawnError> where F: () -> T + Send, T: Send
   Builder::new() -> Builder
   JoinHandle.detach(mut this) -> void
   JoinHandle.id(&this) -> ThreadId
   JoinHandle.is_finished(&this) -> boolean
   JoinHandle.join(mut this) -> T
   Scope.join_all(mut &this) -> void
-  Scope.spawn<C>(mut &this, ctx: C, body: (C) -> void) -> void where C: Send
+  Scope.spawn<F>(mut &this, body: F) -> void where F: () -> void + Send
   Scope::new() -> Scope
   Scope::new_with_stack(stack_bytes: u64) -> Scope
   SpawnError::from_errno(rc: i32) -> SpawnError

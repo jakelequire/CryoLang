@@ -1,12 +1,11 @@
 ///! Native threads: spawn/join, message-passing channels, and scoped
 ///! fork-join parallelism.
 ///!
-///! Cryo threads use a move-context model: data is moved INTO a thread
-///! through an explicit context argument and the body's result is moved
-///! back OUT through `JoinHandle::join`. The bodies here are plain
-///! functions (or non-capturing lambdas), so there are no hidden captures
-///! to reason about - what crosses the thread boundary is exactly the
-///! context you pass.
+///! A thread's body is a `move` closure: what it captures is moved INTO
+///! the thread where the closure is made, and the body's result is moved
+///! back OUT through `JoinHandle::join`. A closure written without `move`
+///! borrows from the function that spawns it, which may return while the
+///! thread still runs, so `thread::spawn` refuses it.
 ///!
 ///! Run with:  cryo run
 
@@ -25,37 +24,38 @@ function double_it(x: i32) -> i32 {
     return x * 2;
 }
 
-/// A worker that takes ownership of a `String`, mutates it, and hands it
-/// back. Demonstrates moving owned heap data across the thread boundary
-/// in both directions with no copy and no leak.
-function decorate(mut s: String) -> String {
-    s.push(" [done on worker]");
-    return s;
+/// A worker that builds a new `String` from one it was given. The thread
+/// owns the original (moved in by its `move` closure, released when the
+/// thread ends) and hands the new one back through `join`.
+function decorate(s: &String) -> String {
+    mut out: String = s.clone();
+    out.push(" [done on worker]");
+    return out;
 }
 
-/// A producer: send five numbers down a channel, then drop the sender so
-/// the receiver observes disconnection.
-function produce(tx: mpsc::Sender<i32>) -> i32 {
-    mut snd: mpsc::Sender<i32> = tx;
+/// A producer: send five numbers down a channel. The thread's closure owns
+/// the sender, so it is released when the thread ends, and the receiver
+/// then observes disconnection.
+function produce(tx: &mpsc::Sender<i32>) -> i32 {
     mut i: i32 = 1;
     while (i <= 5) {
-        snd.send(i * i);   // 1, 4, 9, 16, 25
+        tx.send(i * i);   // 1, 4, 9, 16, 25
         i = i + 1;
     }
-    snd.close();
     return 0;
 }
 
 function main() -> int {
     // 1. spawn + join: move a value in, get the result back.
-    const h: thread::JoinHandle<i32> = thread::spawn::<i32, i32>(21, double_it);
+    const n: i32 = 21;
+    const h: thread::JoinHandle<i32> = thread::spawn(move () -> i32 { return double_it(n); });
     fmt::printf("spawn/join:   double(21) = %d\n", h.join());
 
-    // 2. Move owned data (a String) into a thread and back out.
+    // 2. Move owned data (a String) into a thread, and a new one back out.
     mut greeting: String = String::new();
     greeting.push("hello from main");
     const sh: thread::JoinHandle<String> =
-        thread::spawn::<String, String>(greeting, decorate);
+        thread::spawn(move () -> String { return decorate(&greeting); });
     mut result: String = sh.join();
     fmt::printf("move String:  %.*s\n",
         result.length() as i32, result.as_str().as_ptr());
@@ -64,7 +64,7 @@ function main() -> int {
     //    it until every sender has dropped (disconnection).
     mut rx: mpsc::Receiver<i32> = mpsc::channel::<i32>();
     const tx: mpsc::Sender<i32> = rx.sender();
-    const ph: thread::JoinHandle<i32> = thread::spawn::<mpsc::Sender<i32>, i32>(tx, produce);
+    const ph: thread::JoinHandle<i32> = thread::spawn(move () -> i32 { return produce(&tx); });
     mut sum: i32 = 0;
     mut draining: boolean = true;
     while (draining) {
@@ -78,16 +78,14 @@ function main() -> int {
 
     // 4. Scoped fork-join: four threads each bump a shared atomic counter
     //    that lives on main's stack. The scope joins them all before it is
-    //    torn down, so borrowing the stack counter by pointer is safe.
-    mut counter: Atomic<u8> = Atomic::<u8>::new(0u8);
+    //    torn down, so pointing at the stack counter is safe.
+    mut counter: Atomic<u8> = Atomic::<u8>::new(0);
     const cptr: mut Atomic<u8>* = &counter;
     {
         mut s: thread::Scope = thread::Scope::new();
         mut w: i32 = 0;
         while (w < 4) {
-            s.spawn::<mut Atomic<u8>*>(cptr, (p: mut Atomic<u8>*) -> void {
-                (*p).fetch_add(1u8, MemoryOrder::SeqCst);
-            });
+            s.spawn(move () -> void { (*cptr).fetch_add(1, MemoryOrder::SeqCst); });
             w = w + 1;
         }
         s.join_all();

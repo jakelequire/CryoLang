@@ -3804,10 +3804,21 @@ caught by it:
 #### `Send` is advisory at the edges
 
 Bounds are genuinely enforced: `Send`/`Sync` are checked at every explicit
-`where T: Send` / `where T: Sync`, and the thread entry points carry them -
-`thread::spawn`, `try_spawn`, and `spawn_with_attr` require `C: Send, T: Send`,
-`Scope::spawn` requires `C: Send`. Moving an `Rc<T>` or a lock guard into
-another thread is a compile error.
+`where T: Send` / `where T: Sync`, and the thread entry points carry them. A
+thread's body is a callable taking no arguments - a `move` closure, a
+non-capturing lambda or a named function - and `thread::spawn`, `try_spawn`,
+`spawn_with_attr` and `Builder`'s `spawn` / `try_spawn` take it as
+`F: () -> T + Send` with `T: Send`; `Scope::spawn` takes `F: () -> void + Send`.
+A closure is `Send` when everything it owns is, so moving an `Rc<T>` or a lock
+guard into another thread is a compile error, and so is a closure written
+without `move`, which borrows from the spawning function; the error's fix
+writes `move`:
+
+```cryo
+const n: i32 = 21;
+const h: thread::JoinHandle<i32> = thread::spawn(move () -> i32 { return n * 2; });
+const r: i32 = h.join();   // 42
+```
 
 What the rule does **not** do is make `Send` a safety guarantee:
 

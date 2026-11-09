@@ -342,7 +342,8 @@ public type struct BlockingPool {
         // moment the lock is released.
         const live: i64 = state.threads.length();
         if (state.idle == 0 && live < this.max as i64) {
-            match (thread::try_spawn::<mut BlockingPool*, ()>(&this, blocking_worker)) {
+            const pool: mut BlockingPool* = &this;
+            match (thread::try_spawn(move () -> () { return pool.work(); })) {
                 Result::Ok(worker) => { state.threads.push(worker); }
                 Result::Err(_)     => {
                     // No thread exists and none can be created, so a queued
@@ -385,17 +386,15 @@ public type struct BlockingPool {
         mem::drop(held);
         return job;
     }
-}
 
-
-/// A pool thread: run queued jobs until shutdown. A thread's body, so a free
-/// function.
-private function blocking_worker(pool: mut BlockingPool*) -> () {
-    loop {
-        const job: mut BlockingJob* = pool.take();
-        if (job == null) { return (); }
-        const rf: (mut u8*) -> void = job.run_fn;
-        rf(job as mut u8*);
-        job.finish(JOB_DONE);
+    /// A pool thread's body: run queued jobs until shutdown.
+    private work(mut &this) -> () {
+        loop {
+            const job: mut BlockingJob* = this.take();
+            if (job == null) { return (); }
+            const rf: (mut u8*) -> void = job.run_fn;
+            rf(job as mut u8*);
+            job.finish(JOB_DONE);
+        }
     }
 }

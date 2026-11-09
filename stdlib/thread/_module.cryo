@@ -1,37 +1,33 @@
 ///! std::thread: native OS threads.
 ///!
-///! Spawn a thread with `thread::spawn(ctx, body)`: `ctx` is moved into
-///! the new thread and handed to `body`, a `(C) -> T` function (a named
-///! function or a non-capturing lambda). The returned `JoinHandle<T>`
-///! hands back the body's `T` result via `join()`:
+///! Spawn a thread with `thread::spawn(body)`: `body` is a callable taking
+///! no arguments - a `move` closure, a non-capturing lambda or a named
+///! function - and it is moved into the new thread. The returned
+///! `JoinHandle<T>` hands back the body's `T` result via `join()`:
 ///!
 ///!   ```cryo
-///!   const h = thread::spawn<i32, i32>(21, (n: i32) -> i32 { return n * 2; });
+///!   const n: i32 = 21;
+///!   const h = thread::spawn(move () -> i32 { return n * 2; });
 ///!   const r: i32 = h.join();   // 42
 ///!   ```
 ///!
-///! Owned data (String, Box, Vec, ...) can be moved across the thread
-///! boundary in either direction - into the thread through `ctx`, and
-///! back out through the returned `T`. The move-checker tracks the
-///! transfer, so there is no aliasing and no double-free.
+///! Owned data (String, Box, Array, ...) can be moved across the thread
+///! boundary in either direction - into the thread as a capture of a
+///! `move` closure, and back out through the returned `T`. The
+///! move-checker tracks the transfer, so there is no aliasing and no
+///! double-free.
 ///!
-///! ## Why an explicit context instead of a capturing closure
-///!
-///! `body` is a function-typed `(C) -> T` parameter, which holds a function
-///! pointer with no room for a closure's captures, so the state the thread
-///! needs travels through `ctx`.  A closure handed to another thread would
-///! have to be a `move` closure: one written without `move` borrows from
-///! the spawning function and is not `Send`.
+///! The body must be `Send`, and so must its result. A closure written
+///! without `move` borrows from the spawning function, which may return
+///! while the thread still runs, so it is refused; the fix writes `move`.
 ///!
 ///! ## Implementation
 ///!
-///! Each spawn heap-allocates a `Payload<C,T>` (the body fn-pointer plus
-///! the moved-in `ctx`) and a `Shared<T>` control block (an atomic state
-///! byte plus storage for the result). `pthread_create` runs a
-///! monomorphized `thread_trampoline<C,T>` - a real named generic
-///! function, made addressable by the function-reference fix (GAP 1) -
-///! which moves `ctx` out, runs `body`, stores the result, frees the
-///! payload, and hands the control block off to `join`/`detach` via a
+///! Each spawn heap-allocates a `Payload<F,T>` (the body) and a
+///! `Shared<T>` control block (an atomic state byte plus storage for the
+///! result). The OS thread runs a monomorphized `thread_trampoline<F,T>`,
+///! which moves the body out, frees the payload, runs the body, stores the
+///! result, and hands the control block off to `join`/`detach` via a
 ///! lock-free two-actor handshake on the state byte, freeing the payload on
 ///! every path (spawn-failure included) so the control block never leaks.
 ///!
@@ -163,36 +159,35 @@ private type struct Shared<T> {
     private result: T;
 }
 
-/// Heap input to the spawned thread: the body to run plus the moved-in
-/// context and a pointer to the shared control block. Consumed (and
-/// freed) by the trampoline as soon as the thread starts.
-private type struct Payload<C, T> {
-    private body:   (C) -> T;
-    private ctx:    C;
+/// Heap input to the spawned thread: the body to run and a pointer to the
+/// shared control block. Consumed (and freed) by the trampoline as soon as
+/// the thread starts.
+private type struct Payload<F, T> {
+    private body:   F;
     private shared: mut Shared<T>*;
 }
 
 
-/// The thread body: moves `ctx` out, runs `body`, publishes the result, and
+/// The thread body: moves the body out, runs it, publishes the result, and
 /// performs the completion half of the join/detach handshake. Platform-
 /// agnostic; the gated `thread_trampoline` wrappers below adapt the C entry
 /// ABI (pthread returns `void*`, Win32's LPTHREAD_START_ROUTINE returns
 /// `DWORD`/`u32`) around this shared logic.
-private function thread_body<C, T>(arg: mut u8*) -> void {
-    const p: Payload<C, T>* = arg as Payload<C, T>*;
-    const body:   (C) -> T  = (*p).body;
+private function thread_body<F, T>(arg: mut u8*) -> void where F: () -> T {
+    const p: Payload<F, T>* = arg as Payload<F, T>*;
     const shared: mut Shared<T>* = (*p).shared;
     // Writing the result through a raw `T*` avoids drop-synthesis on the
     // (uninitialized) destination.
     const rptr: mut T* = &(*shared).result;
     mut alloc: GlobalAlloc = GlobalAlloc::new();
-    // A take: the context is read out of the payload, and the payload box is
-    // released raw right after, without dropping what it held, so `c` is
-    // the context's only owner from here on.
+    // A take: the body is read out of the payload, and the payload box is
+    // released raw right after, without dropping what it held, so `body` is
+    // the only owner of what it captured from here on; it is released when
+    // this block ends.
     unsafe {
-        const c: C = (*p).ctx;
-        alloc.deallocate(NonNull::new(arg), Layout::of::<Payload<C, T>>());
-        *rptr = body(c);
+        const body: F = (*p).body;
+        alloc.deallocate(NonNull::new(arg), Layout::of::<Payload<F, T>>());
+        *rptr = body();
     }
 
     // Handshake: announce completion. If the handle already detached, no
@@ -205,11 +200,17 @@ private function thread_body<C, T>(arg: mut u8*) -> void {
 }
 
 /// The C entry point handed to the OS thread creator. One monomorphization
-/// per `(C,T)`, addressable thanks to the generic function-reference fix.
+/// per `(F,T)`.
 ![target(unix)]
-private function thread_trampoline<C, T>(arg: mut u8*) -> u8* { thread_body::<C, T>(arg); return null; }
+private function thread_trampoline<F, T>(arg: mut u8*) -> u8* where F: () -> T {
+    thread_body::<F, T>(arg);
+    return null;
+}
 ![target(windows)]
-private function thread_trampoline<C, T>(arg: mut u8*) -> u32 { thread_body::<C, T>(arg); return 0; }
+private function thread_trampoline<F, T>(arg: mut u8*) -> u32 where F: () -> T {
+    thread_body::<F, T>(arg);
+    return 0;
+}
 
 /// Create an OS thread running `entry(arg)`, where `entry` is a trampoline
 /// of the platform's entry ABI, and return its joinable id (a pthread id,
@@ -274,8 +275,8 @@ private function reap_detached<T>(tid: u64, shared: mut Shared<T>*) -> void {
 
 
 /// Handle to a spawned thread. Carries the OS thread id and the shared
-/// control block. `T` is the body's return type; the context type `C` is
-/// erased (its storage was consumed on the thread).
+/// control block. `T` is the body's return type; the body's own type is
+/// erased (it was consumed on the thread).
 public type struct JoinHandle<T> {
     private tid:    u64;
     private shared: mut Shared<T>*;
@@ -336,23 +337,22 @@ implement<T> trait Drop for struct JoinHandle<T> {
 // spawn
 // ---------------------------------------------------------------------------
 
-/// Spawn a thread that runs `body(ctx)` and returns a handle to its
-/// `T` result. `ctx` is moved into the new thread. `body` must be a
-/// function pointer or non-capturing lambda. Panics on allocation or
-/// `pthread_create` failure; use `try_spawn` for a fallible spawn.
+/// Spawn a thread that runs `body()` and returns a handle to its `T`
+/// result. `body` is moved into the new thread: a `move` closure, a
+/// non-capturing lambda or a named function. Panics on allocation or
+/// thread-creation failure; use `try_spawn` for a fallible spawn.
 ///
-/// Thread-safety: `spawn` requires `C: Send` (the moved context) and
-/// `T: Send` (the result handed back through `JoinHandle::join`). Both
-/// are computed structurally - primitives, raw pointers, references, and
-/// the standard containers built on them (`Box`, `Arc`, `Array`,
-/// `String`, `mpsc::Sender`, ...) are `Send`, so the scoped-thread
-/// idiom of moving a raw pointer (e.g. `Atomic<u8>*`) into the body still
-/// compiles. The bound statically rejects the genuinely-unsafe types on
-/// the thread-safety deny-list (`Rc<T>` and the lock guards), closing the
-/// "move a non-thread-safe value into a thread" hole.
-public function spawn<C, T>(ctx: C, body: (C) -> T) -> JoinHandle<T>
-where C: Send, T: Send {
-    match (spawn_with_attr::<C, T>(ctx, body, 0)) {
+/// Thread-safety: `spawn` requires `F: Send` (the body and everything it
+/// owns) and `T: Send` (the result handed back through
+/// `JoinHandle::join`). Both are computed structurally - primitives, raw
+/// pointers, references, and the standard containers built on them
+/// (`Box`, `Arc`, `Array`, `String`, `mpsc::Sender`, ...) are `Send`. The
+/// bound rejects a closure written without `move`, which borrows from the
+/// spawning function, and the types on the thread-safety deny-list
+/// (`Rc<T>` and the lock guards).
+public function spawn<F, T>(body: F) -> JoinHandle<T>
+where F: () -> T + Send, T: Send {
+    match (spawn_with_attr::<F, T>(body, 0)) {
         Result::Ok(h)  => { return h; }
         Result::Err(_) => {
             core::panic("thread::spawn: failed to create thread", intrinsics::location());
@@ -363,9 +363,8 @@ where C: Send, T: Send {
 /// Fallible spawn with an optional stack size (`0` == OS default). The
 /// per-OS thread creator (`os_create_thread`) applies it - via a
 /// `pthread_attr_t` on POSIX, or `CreateThread`'s `dwStackSize` on Windows.
-public function spawn_with_attr<C, T>(ctx: C, body: (C) -> T,
-                               stack_bytes: u64) -> Result<JoinHandle<T>, SpawnError>
-where C: Send, T: Send {
+public function spawn_with_attr<F, T>(body: F, stack_bytes: u64) -> Result<JoinHandle<T>, SpawnError>
+where F: () -> T + Send, T: Send {
     mut alloc: GlobalAlloc = GlobalAlloc::new();
 
     mut shared: mut Shared<T>* = null;
@@ -375,26 +374,25 @@ where C: Send, T: Send {
     }
     (*shared).state = Atomic::<u8>::new(STATE_LIVE);
 
-    mut p: mut Payload<C, T>* = null;
-    match (alloc.allocate(Layout::of::<Payload<C, T>>())) {
-        Result::Ok(raw) => { p = raw.cast::<Payload<C, T>>().as_ptr(); }
+    mut p: mut Payload<F, T>* = null;
+    match (alloc.allocate(Layout::of::<Payload<F, T>>())) {
+        Result::Ok(raw) => { p = raw.cast::<Payload<F, T>>().as_ptr(); }
         Result::Err(_)  => {
             alloc.deallocate(NonNull::new(shared as mut u8*), Layout::of::<Shared<T>>());
             return Result::Err(SpawnError::OutOfMemory);
         }
     }
     (*p).body   = body;
-    (*p).ctx    = ctx;
     (*p).shared = shared;
 
-    match (os_create_thread(thread_trampoline::<C, T> as void*, p as u8*, stack_bytes)) {
+    match (os_create_thread(thread_trampoline::<F, T> as void*, p as u8*, stack_bytes)) {
         Result::Ok(tid) => { return Result::Ok(JoinHandle::<T> { tid: tid, shared: shared }); }
         Result::Err(e)  => {
             // The thread never started, so we still own both boxes. The
-            // payload's `ctx` was moved in; release it in place so owned
-            // state inside it is not leaked, then free both boxes.
-            ptr::drop_in_place::<C>(&(*p).ctx);
-            alloc.deallocate(NonNull::new(p as mut u8*), Layout::of::<Payload<C, T>>());
+            // body was moved in; release it in place so what it owns is not
+            // leaked, then free both boxes.
+            ptr::drop_in_place::<F>(&(*p).body);
+            alloc.deallocate(NonNull::new(p as mut u8*), Layout::of::<Payload<F, T>>());
             alloc.deallocate(NonNull::new(shared as mut u8*), Layout::of::<Shared<T>>());
             return Result::Err(e);
         }
@@ -429,14 +427,14 @@ implement enum SpawnError {
 /// returned handle's `join()`.
 ///
 ///   ```cryo
-///   match (thread::try_spawn<i32, i32>(arg, body)) {
+///   match (thread::try_spawn(move () -> i32 { return work(arg); })) {
 ///       Result::Ok(h)  => { use(h.join()); }
 ///       Result::Err(e) => { /* back off / report */ }
 ///   }
 ///   ```
-public function try_spawn<C, T>(ctx: C, body: (C) -> T) -> Result<JoinHandle<T>, SpawnError>
-where C: Send, T: Send {
-    return spawn_with_attr::<C, T>(ctx, body, 0);
+public function try_spawn<F, T>(body: F) -> Result<JoinHandle<T>, SpawnError>
+where F: () -> T + Send, T: Send {
+    return spawn_with_attr::<F, T>(body, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -455,16 +453,17 @@ public const MAX_THREAD_NAME: u64 = 15;
 /// name is set with `pthread_setname_np` once the thread is running.
 ///
 ///   ```cryo
+///   const n: i32 = 21;
 ///   const h = thread::Builder::new()
 ///       .stack_size(1u64 << 20)            // 1 MiB stack
 ///       .name(Str::new("worker"))
-///       .spawn<i32, i32>(21, (n: i32) -> i32 { return n * 2; });
+///       .spawn(move () -> i32 { return n * 2; });
 ///   const r: i32 = h.join();               // 42
 ///   ```
 ///
 /// POD: a `Builder` owns no resources (the name lives in a fixed inline
 /// buffer), so it is copied by value and needs no `drop`. The same
-/// `C: Send` / `T: Send` thread-safety bounds as `spawn` apply.
+/// `F: Send` / `T: Send` thread-safety bounds as `spawn` apply.
 public type struct Builder {
     private stack_bytes: u64;       // 0 -> OS default stack size
     private name_buf:    [u8; 16];    // NUL-terminated C string for pthread_setname_np
@@ -505,9 +504,9 @@ public type struct Builder {
 
     /// Spawn with the configured attributes, panicking on failure. Use
     /// `try_spawn` for a fallible spawn.
-    public spawn<C, T>(this, ctx: C, body: (C) -> T) -> JoinHandle<T>
-    where C: Send, T: Send {
-        match (this.try_spawn::<C, T>(ctx, body)) {
+    public spawn<F, T>(this, body: F) -> JoinHandle<T>
+    where F: () -> T + Send, T: Send {
+        match (this.try_spawn::<F, T>(body)) {
             Result::Ok(h)  => { return h; }
             Result::Err(_) => {
                 core::panic("thread::Builder::spawn: failed to create thread", intrinsics::location());
@@ -518,13 +517,13 @@ public type struct Builder {
     /// Spawn with the configured attributes, returning `Err(SpawnError)`
     /// if the OS rejects the configuration (e.g. an out-of-range stack
     /// size) or cannot create the thread.
-    public try_spawn<C, T>(this, ctx: C, body: (C) -> T) -> Result<JoinHandle<T>, SpawnError>
-    where C: Send, T: Send {
+    public try_spawn<F, T>(this, body: F) -> Result<JoinHandle<T>, SpawnError>
+    where F: () -> T + Send, T: Send {
         // The stack size is applied inside `os_create_thread` (a
         // `pthread_attr_t` on POSIX, `dwStackSize` on Windows), so the
         // builder just forwards the configured size.
         mut result: Result<JoinHandle<T>, SpawnError> =
-            spawn_with_attr::<C, T>(ctx, body, this.stack_bytes);
+            spawn_with_attr::<F, T>(body, this.stack_bytes);
 
         match (result) {
             Result::Ok(h) => {
@@ -590,45 +589,42 @@ public function sleep_ms(millis: u64) -> void {
 // Scoped threads: fork-join parallelism with auto-join at scope end.
 // ---------------------------------------------------------------------------
 
-/// Heap input to a scoped thread: a void-returning body plus its moved-in
-/// context. Freed by the scope trampoline once the body has been invoked.
-private type struct ScopePayload<C> {
-    private body: (C) -> void;
-    private ctx:  C;
-}
-
-/// Scoped-thread body: moves the context out, frees the payload, runs the
-/// body. Scoped bodies return no value, so there is no result/handshake
+/// Scoped-thread body: moves the body out of its box, frees the box, runs
+/// the body. Scoped bodies return no value, so there is no result/handshake
 /// machinery. The gated `scope_trampoline` wrappers adapt the C entry ABI.
-private function scope_body<C>(arg: mut u8*) -> void {
-    const p: ScopePayload<C>* = arg as ScopePayload<C>*;
-    const body: (C) -> void = (*p).body;
-    // A take, as in `thread_body`: the payload box is released raw right
-    // after, so `c` is the context's only owner.
+private function scope_body<F>(arg: mut u8*) -> void where F: () -> void {
+    // A take, as in `thread_body`: the box is released raw right after, so
+    // `body` is the only owner of what it captured.
     unsafe {
-        const c: C = (*p).ctx;
+        const body: F = *(arg as F*);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        alloc.deallocate(NonNull::new(arg), Layout::of::<ScopePayload<C>>());
-        body(c);
+        alloc.deallocate(NonNull::new(arg), Layout::of::<F>());
+        body();
     }
 }
 
 ![target(unix)]
-private function scope_trampoline<C>(arg: mut u8*) -> u8* { scope_body::<C>(arg); return null; }
+private function scope_trampoline<F>(arg: mut u8*) -> u8* where F: () -> void {
+    scope_body::<F>(arg);
+    return null;
+}
 ![target(windows)]
-private function scope_trampoline<C>(arg: mut u8*) -> u32 { scope_body::<C>(arg); return 0; }
+private function scope_trampoline<F>(arg: mut u8*) -> u32 where F: () -> void {
+    scope_body::<F>(arg);
+    return 0;
+}
 
 /// A thread scope. Every thread spawned through it is guaranteed to be
 /// joined before the scope is torn down (explicitly via `join_all()` or
 /// automatically when the `Scope` drops), so scoped bodies may safely
-/// borrow data that outlives the scope - pass a pointer to it through the
-/// body's context:
+/// point at data that outlives the scope:
 ///
 ///   ```cryo
-///   mut counter: i64 = 0i64;
+///   const counter: Atomic<i64> = Atomic::<i64>::new(0);
+///   const at: Atomic<i64>* = &counter;
 ///   mut s: thread::Scope = thread::Scope::new();
-///   s.spawn<i64*>(&counter, (p: i64*) -> void { *p = *p + 1i64; });
-///   s.spawn<i64*>(&counter, (p: i64*) -> void { *p = *p + 10i64; });
+///   s.spawn(move () -> void { (*at).fetch_add(1, MemoryOrder::SeqCst); });
+///   s.spawn(move () -> void { (*at).fetch_add(10, MemoryOrder::SeqCst); });
 ///   s.join_all();   // both threads finished; `counter` safe to read
 ///   ```
 ///
@@ -651,23 +647,21 @@ public type struct Scope {
         return Scope { tids: [], stack_bytes: stack_bytes };
     }
 
-    /// Spawn a scoped thread running `body(ctx)`. `ctx` is moved in (often
-    /// a pointer into scope-outliving state). The thread is recorded and
-    /// joined by `join_all()` / the scope's drop. Panics on allocation or
-    /// thread-creation failure. `C: Send` - a raw pointer into the scope's
-    /// state qualifies (raw pointers are `Send`); a deny-listed type
-    /// (`Rc`, a lock guard) does not.
-    public spawn<C>(mut &this, ctx: C, body: (C) -> void) -> void
-    where C: Send {
+    /// Spawn a scoped thread running `body()`; `body` is moved into it. The
+    /// thread is recorded and joined by `join_all()` / the scope's drop.
+    /// Panics on allocation or thread-creation failure. `F: Send` - a raw
+    /// pointer into the scope's state qualifies (raw pointers are `Send`);
+    /// a deny-listed type (`Rc`, a lock guard) does not.
+    public spawn<F>(mut &this, body: F) -> void
+    where F: () -> void + Send {
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        mut p: mut ScopePayload<C>* = null;
-        match (alloc.allocate(Layout::of::<ScopePayload<C>>())) {
-            Result::Ok(raw) => { p = raw.cast::<ScopePayload<C>>().as_ptr(); }
+        mut p: mut F* = null;
+        match (alloc.allocate(Layout::of::<F>())) {
+            Result::Ok(raw) => { p = raw.cast::<F>().as_ptr(); }
             Result::Err(_)  => { core::panic("Scope::spawn: alloc failed", intrinsics::location()); }
         }
-        (*p).body = body;
-        (*p).ctx  = ctx;
-        match (os_create_thread(scope_trampoline::<C> as void*, p as u8*, this.stack_bytes)) {
+        *p = body;
+        match (os_create_thread(scope_trampoline::<F> as void*, p as u8*, this.stack_bytes)) {
             Result::Ok(tid) => { this.tids.push(tid); }
             Result::Err(_)  => { core::panic("Scope::spawn: thread creation failed", intrinsics::location()); }
         }

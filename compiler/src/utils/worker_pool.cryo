@@ -37,16 +37,18 @@ type struct WorkerPool<J> {
     }
 
     /// Start `threads` workers running `run(&jobs[k], worker number from 1)`
-    /// for each published `k`.  `jobs` and `done` are sized for every job
-    /// this pool will ever publish, and `done` starts all zero.
-    start(mut &this, jobs: mut J*, done: mut Atomic<u32>*, threads: u32,
-          run: (mut J*, u32) -> void) -> void {
+    /// for each published `k`; each worker runs its own copy of `run`.
+    /// `jobs` and `done` are sized for every job this pool will ever publish,
+    /// and `done` starts all zero.
+    start<R>(mut &this, jobs: mut J*, done: mut Atomic<u32>*, threads: u32, run: R) -> void
+    where R: (mut J*, u32) -> void + Copy + Send {
         for (mut w: u32 = 0; w < threads; w++) {
-            this.workers.spawn::<WorkerQueue<J>>(WorkerQueue::<J> {
+            const queue: WorkerQueue<J, R> = WorkerQueue::<J, R> {
                 jobs: jobs, done: done,
                 cursor: &this.cursor, published: &this.published, closed: &this.closed,
                 worker: w, run: run
-            }, work_through_queue::<J>);
+            };
+            this.workers.spawn(move () -> void { queue.work(); });
         }
     }
 
@@ -71,7 +73,7 @@ implement<J> trait Drop for struct WorkerPool<J> {
 
 /// One worker's view of a `WorkerPool`'s queue, moved into the worker by
 /// value.
-private type struct WorkerQueue<J> {
+private type struct WorkerQueue<J, R> {
     jobs:      mut J*;
     done:      mut Atomic<u32>*;
     cursor:    mut Atomic<u64>*;
@@ -79,25 +81,23 @@ private type struct WorkerQueue<J> {
     closed:    mut Atomic<u32>*;
     /// This worker's number, from 0.
     worker:    u32;
-    run:       (mut J*, u32) -> void;
-}
+    run:       R;
 
-/// A worker's body: run published jobs until the pool is closed and no
-/// published index is left for it.  It allocates nothing, so the owner keeps
-/// any thread-local allocator to itself.  A top-level function because
-/// `Scope::spawn` takes the body as a function pointer.
-private function work_through_queue<J>(queue: WorkerQueue<J>) -> void {
-    const run: (mut J*, u32) -> void = queue.run;
-    loop {
-        const k: u64 = (*queue.cursor).fetch_add(1, MemoryOrder::Relaxed);
-        while (k >= (*queue.published).load(MemoryOrder::Acquire)) {
-            if ((*queue.closed).load(MemoryOrder::Acquire) != 0
-                    && k >= (*queue.published).load(MemoryOrder::Acquire)) {
-                return;
+    /// A worker's body: run published jobs until the pool is closed and no
+    /// published index is left for it.  It allocates nothing, so the owner
+    /// keeps any thread-local allocator to itself.
+    work(&this) -> void where R: (mut J*, u32) -> void {
+        loop {
+            const k: u64 = (*this.cursor).fetch_add(1, MemoryOrder::Relaxed);
+            while (k >= (*this.published).load(MemoryOrder::Acquire)) {
+                if ((*this.closed).load(MemoryOrder::Acquire) != 0
+                        && k >= (*this.published).load(MemoryOrder::Acquire)) {
+                    return;
+                }
+                thread::sleep_ms(1);
             }
-            thread::sleep_ms(1);
+            this.run(&this.jobs[k], this.worker + 1);
+            this.done[k].store(1, MemoryOrder::Release);
         }
-        run(&queue.jobs[k], queue.worker + 1);
-        queue.done[k].store(1, MemoryOrder::Release);
     }
 }

@@ -1,0 +1,116 @@
+/// Every thread entry point takes its body as a callable with no arguments: a
+/// `move` closure, a non-capturing lambda or a named function. A `move`
+/// closure's owned captures move into the thread and are released exactly
+/// once - when the thread's body finishes, or, when the thread cannot be
+/// created, by the failed spawn. The exit code names the first check that
+/// failed; 0 means all held.
+namespace ThreadSpawnTakesClosures;
+
+import std::core::drop::{ Drop };
+import std::core::result::{ Result };
+import std::collections::string::{ String };
+import std::sync::atomic::{ Atomic, MemoryOrder };
+import std::sync::mpsc;
+import std::thread;
+import std::ffi::libc;
+
+/// Counts its releases through `tally`.
+type struct Counted {
+    tally: mut Atomic<u32>*;
+    value: i64;
+}
+
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void {
+        (*this.tally).fetch_add(1, MemoryOrder::AcqRel);
+    }
+}
+
+function forty_two() -> i64 { return 42; }
+
+function main() -> int {
+    // A `move` closure owning a value with a destructor: the thread reads it,
+    // and it is released once, on the thread.
+    mut tally: Atomic<u32> = Atomic::<u32>::new(0);
+    const c: Counted = Counted { tally: &tally, value: 20 };
+    const h: thread::JoinHandle<i64> = thread::spawn(move () -> i64 { return c.value + 1; });
+    if (h.join() != 21) { return 1; }
+    if (tally.load(MemoryOrder::Acquire) != 1) { return 2; }
+
+    // An owned String in, a new String out.
+    const s: String = String::from("abc");
+    const hs: thread::JoinHandle<String> = thread::spawn(move () -> String {
+        mut out: String = s.clone();
+        out.push("def");
+        return out;
+    });
+    const joined: String = hs.join();
+    if (joined.length() != 6) { return 3; }
+
+    // A named function and a non-capturing lambda.
+    if (thread::spawn(forty_two).join() != 42) { return 4; }
+    if (thread::spawn(() -> i64 { return 7; }).join() != 7) { return 5; }
+
+    // try_spawn and the Builder's two forms.
+    const k: i64 = 5;
+    match (thread::try_spawn(move () -> i64 { return k * 2; })) {
+        Result::Ok(th) => { if (th.join() != 10) { return 6; } }
+        Result::Err(_) => { return 7; }
+    }
+    const named: thread::JoinHandle<i64> = thread::Builder::new()
+        .stack_size(1 << 20)
+        .spawn(move () -> i64 { return k * 3; });
+    if (named.join() != 15) { return 8; }
+    match (thread::Builder::new().try_spawn(move () -> i64 { return k * 4; })) {
+        Result::Ok(th) => { if (th.join() != 20) { return 9; } }
+        Result::Err(_) => { return 10; }
+    }
+
+    // A body whose thread is never created - no OS can reserve a 4 EiB
+    // stack - is released by the failed spawn, exactly once.
+    mut refused_tally: Atomic<u32> = Atomic::<u32>::new(0);
+    const r: Counted = Counted { tally: &refused_tally, value: 1 };
+    match (thread::spawn_with_attr(move () -> i64 { return r.value; }, 1 << 62)) {
+        Result::Ok(th) => { th.join(); return 11; }
+        Result::Err(_) => { }
+    }
+    if (refused_tally.load(MemoryOrder::Acquire) != 1) { return 12; }
+
+    // A sender moved into the thread is released when the thread ends, so
+    // the receiver sees the channel disconnect after the values.
+    mut rx: mpsc::Receiver<i64> = mpsc::channel::<i64>();
+    const tx: mpsc::Sender<i64> = rx.sender();
+    const producer: thread::JoinHandle<i64> = thread::spawn(move () -> i64 {
+        tx.send(1);
+        tx.send(2);
+        return 0;
+    });
+    mut sum: i64 = 0;
+    mut draining: boolean = true;
+    while (draining) {
+        match (rx.recv()) {
+            Result::Ok(v)  => { sum = sum + v; }
+            Result::Err(_) => { draining = false; }
+        }
+    }
+    producer.join();
+    if (sum != 3) { return 13; }
+
+    // Scoped threads take `move` closures too; each owned capture is released
+    // once, on its thread, and the scope joins them before it is torn down.
+    mut scoped_tally: Atomic<u32> = Atomic::<u32>::new(0);
+    mut hits: Atomic<i64> = Atomic::<i64>::new(0);
+    const hits_at: mut Atomic<i64>* = &hits;
+    {
+        mut scope: thread::Scope = thread::Scope::new();
+        for (mut i: i64 = 0; i < 4; i = i + 1) {
+            const item: Counted = Counted { tally: &scoped_tally, value: i };
+            scope.spawn(move () -> void { (*hits_at).fetch_add(item.value + 1, MemoryOrder::AcqRel); });
+        }
+    }
+    if (hits.load(MemoryOrder::Acquire) != 10) { return 14; }
+    if (scoped_tally.load(MemoryOrder::Acquire) != 4) { return 15; }
+
+    libc::printf("thread closures ok\n");
+    return 0;
+}

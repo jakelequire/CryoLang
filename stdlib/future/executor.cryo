@@ -345,6 +345,28 @@ private type struct ExecInner {
         return t;
     }
 
+    /// A pool worker's body: pull ready tasks and drive them until shutdown.
+    private work(mut &this) -> void {
+        // Publish this pool's reactor and blocking pool for the thread's
+        // lifetime: every future this worker polls reaches them through
+        // `Reactor::current()` / `BlockingPool::current()`, so an I/O future
+        // can park — and a future whose work has no readiness form can
+        // offload it — without either driver being threaded through
+        // `Context`, whose shape is fixed.
+        Reactor::set_current(this.reactor);
+        BlockingPool::set_current(this.blocking);
+        loop {
+            const task: mut Task* = this.take();
+            if (task == null) { return; }
+            // `drive` returns true when it re-enqueued the task (the
+            // scheduling reference moved back to the queue), false when it
+            // finished or parked — then release the scheduling reference this
+            // worker held.
+            const rescheduled: boolean = task.drive();
+            if (!rescheduled) { task_decref(task); }
+        }
+    }
+
     /// Reclaim every still-queued task (called from `Executor::drop` after the
     /// workers have joined). Releasing each task's scheduling reference — the
     /// last reference for a never-driven task — runs `Task::drop`, which
@@ -531,28 +553,6 @@ private function dispose_shared_thunk<O>(shared_raw: mut u8*, drop_result: u8) -
     alloc.deallocate(NonNull::new(shared_raw), Layout::of::<TaskShared<O>>());
 }
 
-
-/// A pool worker: pull ready tasks and drive them until shutdown. The pthread
-/// entry (a `(ExecInner*) -> void` fn-ptr handed to `thread::Scope::spawn`), so
-/// a free function.
-private function worker_body(inner: mut ExecInner*) -> void {
-    // Publish this pool's reactor and blocking pool for the thread's lifetime:
-    // every future this worker polls reaches them through `Reactor::current()` /
-    // `BlockingPool::current()`, so an I/O future can park — and a future whose
-    // work has no readiness form can offload it — without either driver being
-    // threaded through `Context`, whose shape is fixed.
-    Reactor::set_current(inner.reactor);
-    BlockingPool::set_current(inner.blocking);
-    loop {
-        const task: mut Task* = inner.take();
-        if (task == null) { return; }
-        // `drive` returns true when it re-enqueued the task (the scheduling
-        // reference moved back to the queue), false when it finished or parked —
-        // then release the scheduling reference this worker held.
-        const rescheduled: boolean = task.drive();
-        if (!rescheduled) { task_decref(task); }
-    }
-}
 
 /// Box `fut` + its shared control block, wrap them in a `Task` with the
 /// monomorphized vtable, and enqueue it. Generic-function references
@@ -742,7 +742,7 @@ public type struct Executor {
         inner.blocking = BlockingPool::with_max(blocking);
         mut workers: Scope = Scope::new();
         for (mut i: u32 = 0; i < count; i = i + 1) {
-            workers.spawn::<mut ExecInner*>(inner, worker_body);
+            workers.spawn(move () -> void { inner.work(); });
         }
         return Executor { inner: inner, workers: workers };
     }
