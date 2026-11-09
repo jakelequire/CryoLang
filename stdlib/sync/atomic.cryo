@@ -24,9 +24,12 @@
 ///! matters; `Acquire` / `Release` pair to form the standard happens-before
 ///! edge.  A load cannot use `Release`.
 ///!
-///! Atomic cells are intentionally **not** `Copy`: mutation through a shared
-///! pointer must be controlled, and bitwise-copying an atomic would silently
-///! break that invariant.  Wrap in `Arc<Atomic<T>>` to share across threads.
+///! Every operation takes `&this`: an atomic is updated in place through a
+///! shared reference, so threads and closures that borrow one cell all
+///! update that cell - scoped threads can count into an atomic local of
+///! their caller.  Atomic cells are intentionally **not** `Copy`: a bitwise
+///! copy would be a second cell, and an update to it would be lost.  Wrap in
+///! `Arc<Atomic<T>>` to share one with threads that outlive its owner.
 
 namespace std::sync::atomic;
 
@@ -127,7 +130,7 @@ public type struct Atomic<T> {
         };
     }
 
-    public store(mut &this, val: T, order: MemoryOrder) -> void {
+    public store(&this,val: T, order: MemoryOrder) -> void {
         static match (T) {
             u8      => { intrinsics::atomic_store_u8(&this.value, val, MemoryOrder::to_u32(order)); }
             u32     => { intrinsics::atomic_store_u32(&this.value, val, MemoryOrder::to_u32(order)); }
@@ -147,7 +150,7 @@ public type struct Atomic<T> {
     /// included only so `Atomic<boolean>` instantiates (whole-struct
     /// monomorphization specializes every method), and `fetch_and`/`fetch_or`/
     /// `fetch_xor` are the meaningful boolean RMW ops.
-    public fetch_add(mut &this, val: T, order: MemoryOrder) -> T {
+    public fetch_add(&this,val: T, order: MemoryOrder) -> T {
         return static match (T) {
             u8  => { intrinsics::atomic_add_u8(&this.value, val, MemoryOrder::to_u32(order)) }
             u32 => { intrinsics::atomic_add_u32(&this.value, val, MemoryOrder::to_u32(order)) }
@@ -163,7 +166,7 @@ public type struct Atomic<T> {
 
     /// Atomically subtract `val` from the cell and return the previous value.
     /// See `fetch_add` for the `Atomic<boolean>` caveat.
-    public fetch_sub(mut &this, val: T, order: MemoryOrder) -> T {
+    public fetch_sub(&this,val: T, order: MemoryOrder) -> T {
         return static match (T) {
             u8  => { intrinsics::atomic_sub_u8(&this.value, val, MemoryOrder::to_u32(order)) }
             u32 => { intrinsics::atomic_sub_u32(&this.value, val, MemoryOrder::to_u32(order)) }
@@ -178,7 +181,7 @@ public type struct Atomic<T> {
     }
 
     /// AND the cell with `val`.  Returns the previous value.
-    public fetch_and(mut &this, val: T, order: MemoryOrder) -> T {
+    public fetch_and(&this,val: T, order: MemoryOrder) -> T {
         return static match (T) {
             u8  => { intrinsics::atomic_and_u8(&this.value, val, MemoryOrder::to_u32(order)) }
             u32 => { intrinsics::atomic_and_u32(&this.value, val, MemoryOrder::to_u32(order)) }
@@ -193,7 +196,7 @@ public type struct Atomic<T> {
     }
 
     /// OR the cell with `val`.  Returns the previous value.
-    public fetch_or(mut &this, val: T, order: MemoryOrder) -> T {
+    public fetch_or(&this,val: T, order: MemoryOrder) -> T {
         return static match (T) {
             u8  => { intrinsics::atomic_or_u8(&this.value, val, MemoryOrder::to_u32(order)) }
             u32 => { intrinsics::atomic_or_u32(&this.value, val, MemoryOrder::to_u32(order)) }
@@ -208,7 +211,7 @@ public type struct Atomic<T> {
     }
 
     /// XOR the cell with `val`.  Returns the previous value.
-    public fetch_xor(mut &this, val: T, order: MemoryOrder) -> T {
+    public fetch_xor(&this,val: T, order: MemoryOrder) -> T {
         return static match (T) {
             u8  => { intrinsics::atomic_xor_u8(&this.value, val, MemoryOrder::to_u32(order)) }
             u32 => { intrinsics::atomic_xor_u32(&this.value, val, MemoryOrder::to_u32(order)) }
@@ -224,7 +227,7 @@ public type struct Atomic<T> {
 
     /// Atomically replace the cell's value with `val` and return the
     /// previous value.
-    public swap(mut &this, val: T, order: MemoryOrder) -> T {
+    public swap(&this,val: T, order: MemoryOrder) -> T {
         return static match (T) {
             u8  => { intrinsics::atomic_swap_u8(&this.value, val, MemoryOrder::to_u32(order)) }
             u32 => { intrinsics::atomic_swap_u32(&this.value, val, MemoryOrder::to_u32(order)) }
@@ -241,7 +244,7 @@ public type struct Atomic<T> {
     /// Atomic compare-and-swap.  Returns `Ok(prev)` with `prev == current`
     /// when the swap happens; `Err(actual)` with the observed value when the
     /// comparison fails.
-    public compare_exchange(mut &this, current: T, next: T, succ: MemoryOrder, fail: MemoryOrder) -> Result<T, T> {
+    public compare_exchange(&this,current: T, next: T, succ: MemoryOrder, fail: MemoryOrder) -> Result<T, T> {
         static match (T) {
             u8 => {
                 mut ok: boolean = false;
@@ -297,8 +300,8 @@ public type struct Atomic<T> {
     }
 }
 
-/// Empty `Drop` makes `Atomic<T>` non-`Copy`; mutation through a shared
-/// pointer must remain explicit, never silent.
+/// Empty `Drop` makes `Atomic<T>` non-`Copy`, so a closure borrows the cell
+/// it captures instead of updating a copy.
 implement<T> trait Drop for struct Atomic<T> {
     drop(mut &this) -> void { }
 }

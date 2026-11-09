@@ -1,0 +1,84 @@
+/// An atomic is updated in place through a shared reference: a `const`
+/// local, a `&Atomic` parameter, a struct's `&this` method, a closure that
+/// borrows the cell, and scoped threads that borrow it all update the ONE
+/// cell. The exit code names the first check that failed; 0 means all held.
+namespace AtomicUpdatesThroughSharedReference;
+
+import std::sync::atomic::{ Atomic, MemoryOrder };
+import std::core::result::{ Result };
+import std::thread;
+import std::ffi::libc;
+
+function add_one(cell: &Atomic<u32>) -> u32 {
+    return cell.fetch_add(1, MemoryOrder::AcqRel);
+}
+
+/// Counts its hits through `&this`.
+type struct HitCounter {
+    hits: Atomic<u64>;
+
+    static new() -> HitCounter { return HitCounter { hits: Atomic::<u64>::new(0) }; }
+
+    hit(&this) -> void { this.hits.fetch_add(1, MemoryOrder::Relaxed); }
+}
+
+const STARTS: Atomic<i32> = Atomic::<i32>::new(0);
+
+function main() -> int {
+    // A `const` local and a `&Atomic` parameter: one cell.
+    const cell: Atomic<u32> = Atomic::<u32>::new(5);
+    cell.store(6, MemoryOrder::Release);
+    if (add_one(&cell) != 6) { return 1; }
+    if (cell.load(MemoryOrder::Acquire) != 7) { return 2; }
+    if (cell.swap(9, MemoryOrder::AcqRel) != 7) { return 3; }
+    match (cell.compare_exchange(9, 10, MemoryOrder::AcqRel, MemoryOrder::Acquire)) {
+        Result::Ok(previous) => { if (previous != 9) { return 4; } }
+        Result::Err(_)       => { return 5; }
+    }
+    match (cell.compare_exchange(9, 11, MemoryOrder::AcqRel, MemoryOrder::Acquire)) {
+        Result::Ok(_)      => { return 6; }
+        Result::Err(found) => { if (found != 10) { return 7; } }
+    }
+    cell.fetch_sub(3, MemoryOrder::AcqRel);
+    cell.fetch_or(8, MemoryOrder::AcqRel);
+    cell.fetch_and(14, MemoryOrder::AcqRel);
+    cell.fetch_xor(1, MemoryOrder::AcqRel);
+    if (cell.load(MemoryOrder::Acquire) != 15) { return 8; }
+
+    // A closure written without `move` borrows the cell: each call updates
+    // the caller's atomic, not a copy.
+    const flags: Atomic<boolean> = Atomic::<boolean>::new(false);
+    const total: Atomic<i64> = Atomic::<i64>::new(0);
+    const add = (n: i64) -> void {
+        total.fetch_add(n, MemoryOrder::AcqRel);
+        flags.store(true, MemoryOrder::Release);
+    };
+    add(4);
+    add(38);
+    if (total.load(MemoryOrder::Acquire) != 42) { return 9; }
+    if (!flags.load(MemoryOrder::Acquire)) { return 10; }
+
+    // Scoped threads borrow the caller's atomic and all count into it.
+    const counted: Atomic<u64> = Atomic::<u64>::new(0);
+    const counter: HitCounter = HitCounter::new();
+    thread::scope((scope: mut &thread::Scope) -> void {
+        for (mut t: i64 = 0; t < 4; t = t + 1) {
+            scope.spawn(() -> void {
+                for (mut i: i64 = 0; i < 1000; i = i + 1) {
+                    counted.fetch_add(1, MemoryOrder::Relaxed);
+                    counter.hit();
+                }
+            });
+        }
+    });
+    if (counted.load(MemoryOrder::Acquire) != 4000) { return 11; }
+    if (counter.hits.load(MemoryOrder::Acquire) != 4000) { return 12; }
+
+    // A global atomic declared `const` is one cell too.
+    STARTS.fetch_add(2, MemoryOrder::AcqRel);
+    STARTS.fetch_add(3, MemoryOrder::AcqRel);
+    if (STARTS.load(MemoryOrder::Acquire) != 5) { return 13; }
+
+    libc::printf("atomic shared updates ok\n");
+    return 0;
+}
