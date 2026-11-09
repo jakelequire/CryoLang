@@ -63,7 +63,8 @@ import std::alloc::layout::{ Layout };
 import std::alloc::allocator::{ GlobalAlloc };
 import std::sync::atomic::{ Atomic, MemoryOrder };
 import std::sync::mutex::{ Mutex, MutexGuard };
-import std::thread::{ Scope };
+import std::thread;
+import std::thread::{ JoinHandle as ThreadJoinHandle };
 import std::ffi::libc::{ EpollOp };
 import std::sys::syscall;
 import std::core::mem;
@@ -203,7 +204,7 @@ private:
     kick_h:   i64;                 // eventfd (Linux) / unused (Windows)
     aux_h:    i64;                 // unused (Linux) / AFD helper handle (Windows)
     shutdown: Atomic<u8>;          // 1 once teardown has been signaled
-    io_thread: Scope;              // the reactor thread, once started
+    io_thread: Option<ThreadJoinHandle<()>>;   // the reactor thread, once started
 
 internal:
     /// Create a reactor, open its OS backend, and start its I/O thread.
@@ -222,11 +223,11 @@ internal:
         rt.kick_h   = -1;
         rt.aux_h    = -1;
         rt.shutdown = Atomic::<u8>::new(0);
-        rt.io_thread = Scope::new();
+        rt.io_thread = Option::None;
         if (!rt_backend_open(rt)) {
             panic("Reactor::start: I/O readiness backend unavailable", intrinsics::location());
         }
-        rt.io_thread.spawn(move () -> void { rt.run_until_shutdown(); });
+        rt.io_thread = Option::Some(thread::spawn(move () -> () { rt.run_until_shutdown(); return (); }));
         return rt;
     }
 
@@ -246,7 +247,10 @@ internal:
         if (rt == null) { return; }
         rt.shutdown.store(1, MemoryOrder::Release);
         rt_kick(rt);
-        rt.io_thread.join_all();
+        match (rt.io_thread.take()) {
+            Option::Some(io) => { io.join(); }
+            Option::None     => {}
+        }
         // Releasing a still-armed waker here is what reclaims a task that parked
         // on I/O and was never woken; that release runs the task's destructor,
         // which drops its future, which cancels — re-entering the table under

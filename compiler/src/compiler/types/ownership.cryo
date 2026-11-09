@@ -219,8 +219,9 @@ type struct OwnershipQuery {
     // Send / Sync: structural thread-safety markers.
     //
     // Mirrors the `is_copy` shape but with thread-safety rules:
-    //   - Primitives, references, function pointers, raw pointers:
-    //     Send + Sync.  Raw pointers being Send+Sync is the
+    //   - Primitives, function pointers, raw pointers: Send + Sync.
+    //   - A reference `&T`: Send/Sync when `T` is Sync, since it shares `T`
+    //     with whoever holds it.  Raw pointers being Send+Sync is the
     //     permissive stance Cryo adopts elsewhere (no borrow
     //     checker, refs unchecked): a struct that hides a `T*` field
     //     and reasons about it correctly (Box, Arc, Array, HashMap,
@@ -235,9 +236,12 @@ type struct OwnershipQuery {
     //     comes first; otherwise delegate to the resolved type.
     //   - Generic params and unresolved positions: conservative false.
     //
-    // Send and Sync currently share the same structural rule.  They are
-    // exposed as separate predicates so future divergence (e.g. a
-    // `&T: Send if T: Sync` distinction) can land without an API change.
+    // Send and Sync share the same structural rule; they are separate
+    // predicates so a type that is one and not the other can be told apart
+    // without an API change.  A value holding a closure that borrows from
+    // its frame passes this walk on its parts; `TraitChecker::
+    // type_implements_trait` refuses it, since another thread may outlive
+    // that frame.
 
     /// True when a value of `ty` may safely transfer between threads.
     static is_send(arena: mut TypeArena*, registry: GenericRegistry*,
@@ -274,16 +278,20 @@ type struct OwnershipQuery {
             return true;
         }
 
-        // References, function pointers, and raw pointers: all Send +
-        // Sync.  Cryo lacks borrow-checked lifetimes, so references are
-        // unchecked address handles like raw pointers; treating them
-        // identically keeps the rule simple.  Stdlib container types
-        // (Box, Arc, Array, HashMap, String, ...) all hide a raw pointer
-        // and depend on this rule to inherit Send/Sync from their
-        // generic args.  Genuinely-unsafe types go on the deny-list.
-        if (k == TypeKind::Pointer   || k == TypeKind::Reference ||
-            k == TypeKind::Function) {
+        // Function pointers and raw pointers: Send + Sync.  Stdlib
+        // container types (Box, Arc, Array, HashMap, String, ...) all hide a
+        // raw pointer and depend on this rule to inherit Send/Sync from
+        // their generic args.  Genuinely-unsafe types go on the deny-list.
+        if (k == TypeKind::Pointer || k == TypeKind::Function) {
             return true;
+        }
+        // A reference shares its referent with whoever holds it, so `&T`
+        // may cross to another thread exactly when `T` may be shared
+        // between threads: `&T` is `Send` when `T` is `Sync`.  Send and
+        // Sync share one rule, so this asks the referent's.
+        if (k == TypeKind::Reference) {
+            return OwnershipQuery::is_thread_safe_at_depth(arena, registry, intern,
+                                                            t.as_reference().referent, depth + 1);
         }
 
         // Compound aggregates: thread-safe if every component is.
@@ -310,9 +318,6 @@ type struct OwnershipQuery {
             if (OwnershipQuery::is_thread_safety_denied(arena, registry, intern, ty)) {
                 return false;
             }
-            // A closure that borrows from the frame it was made in reads
-            // that frame, which another thread may outlive.
-            if (st.borrows_frame) { return false; }
             return OwnershipQuery::all_fields_thread_safe(arena, registry, intern,
                                                            st.fields, depth + 1);
         }
@@ -476,6 +481,10 @@ type struct OwnershipQuery {
     ///     pthread mutex/rwlock primitives require unlock from the
     ///     same thread that acquired the lock, so a guard cannot
     ///     cross threads.
+    ///   - the thread scope (`thread_scope`) : it records the threads
+    ///     spawned through it without a lock, so only the thread running
+    ///     the scope's body may spawn through it, and its handle may not
+    ///     reach a scoped thread.
     ///
     /// Keyed on the target's definition (an `InstantiatedType` peeled to
     /// its template) against the definitions those declarations claimed,
@@ -492,6 +501,7 @@ type struct OwnershipQuery {
         if (!def.is_valid()) { return false; }
         const denied: [LangItem] = [
             LangItem::Rc, LangItem::MutexGuard, LangItem::RwLockReadGuard, LangItem::RwLockWriteGuard,
+            LangItem::ThreadScope,
         ];
         for (mut i: i64 = 0; i < denied.length(); i++) {
             const id: DefId = registry.wellknown(denied[i]);

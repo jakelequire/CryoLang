@@ -158,6 +158,10 @@ type struct TypeArena {
     // build with no slice item.  See `set_slice_template`.
     slice_template:        TypeRef;
 
+    // The thread scope item's type, invalid until the item is claimed and in
+    // a build with no thread scope.  See `holds_thread_scope`.
+    thread_scope:          TypeRef;
+
 private:
     /// The allocator of this arena's handles, and its only one: every
     /// handle is made by `alloc_type`, so the handle at position `i` names
@@ -214,6 +218,7 @@ public:
             dynamic_array_base:  TypeRef::invalid(),
             dynamic_array_alloc: TypeRef::invalid(),
             slice_template:      TypeRef::invalid(),
+            thread_scope:        TypeRef::invalid(),
         };
 
         arena.init_primitives();
@@ -1292,6 +1297,64 @@ public:
                 this.frame_borrowing_closures(tup.elements[i], out);
             }
         }
+    }
+
+    /// Record the thread scope item's type, whose handle `holds_thread_scope`
+    /// finds.
+    set_thread_scope(mut &this, scope: TypeRef) -> void {
+        this.thread_scope = scope;
+    }
+
+    /// Whether a value of `ty` holds the thread scope - the scope itself, or
+    /// a reference or pointer to it - in itself or in a type argument, array
+    /// element, optional, or tuple element.  A closure that captures the
+    /// handle is not looked into: it borrows from its frame, and
+    /// `frame_borrowing_closures` finds it.
+    holds_thread_scope(&this, ty: TypeRef) -> boolean {
+        if (!ty.is_valid() || !this.thread_scope.is_valid()) { return false; }
+        if (ty.equals(this.thread_scope)) { return true; }
+        const t: Type* = this.lookup(ty);
+        if (t == null) { return false; }
+        if (t.kind == TypeKind::Struct) {
+            const st: StructType* = t.as_struct();
+            for (mut i: i64 = 0; i < st.type_args.length(); i++) {
+                if (this.holds_thread_scope(st.type_args[i])) { return true; }
+            }
+            return false;
+        }
+        if (t.kind == TypeKind::Enum) {
+            const en: EnumType* = t.as_enum();
+            for (mut i: i64 = 0; i < en.type_args.length(); i++) {
+                if (this.holds_thread_scope(en.type_args[i])) { return true; }
+            }
+            return false;
+        }
+        if (t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t.as_instantiated();
+            for (mut i: i64 = 0; i < inst.type_args.length(); i++) {
+                if (this.holds_thread_scope(inst.type_args[i])) { return true; }
+            }
+            return false;
+        }
+        if (t.kind == TypeKind::Pointer)   { return this.holds_thread_scope(t.as_pointer().pointee); }
+        if (t.kind == TypeKind::Reference) { return this.holds_thread_scope(t.as_reference().referent); }
+        if (t.kind == TypeKind::Array)     { return this.holds_thread_scope(t.as_array().element); }
+        if (t.kind == TypeKind::Optional)  { return this.holds_thread_scope(t.as_optional().wrapped); }
+        if (t.kind == TypeKind::Tuple) {
+            const tup: TupleType* = t.as_tuple();
+            for (mut i: i64 = 0; i < tup.elements.length(); i++) {
+                if (this.holds_thread_scope(tup.elements[i])) { return true; }
+            }
+        }
+        return false;
+    }
+
+    /// Whether `ty` is the thread scope's handle as its body is given it: a
+    /// reference to the scope, `&Scope` or `mut &Scope`.
+    is_thread_scope_handle(&this, ty: TypeRef) -> boolean {
+        const t: Type* = this.lookup(ty);
+        return t != null && t.kind == TypeKind::Reference && this.thread_scope.is_valid()
+            && t.as_reference().referent.equals(this.thread_scope);
     }
 
     /// Whether a value of `ty` holds a closure that borrows from the frame it

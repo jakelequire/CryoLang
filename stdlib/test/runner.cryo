@@ -1520,15 +1520,15 @@ private type struct TestRunner {
             return;
         }
 
-        // Shared work cursor on the stack; workers borrow it by pointer and we
-        // join them all before this frame returns (scoped-thread idiom).
+        // Shared work cursor on the stack; workers borrow it by pointer and
+        // are all joined after the drain, before this frame returns.
         mut counter: Atomic<u64> = Atomic::<u64>::new(0);
         const cptr: mut Atomic<u64>* = &counter;
 
         mut rx: mpsc::Receiver<WorkerResult> = mpsc::channel::<WorkerResult>();
 
         {
-            mut scope: thread::Scope = thread::Scope::new();
+            mut workers: [thread::JoinHandle<()>] = [];
             mut w: u32 = 0;
             while (w < jobs) {
                 const ctx: WorkerCtx = WorkerCtx {
@@ -1540,7 +1540,7 @@ private type struct TestRunner {
                     capture:      this.opts.capture,
                     sender:       rx.sender(),
                 };
-                scope.spawn(move () -> void { ctx.run(); });
+                workers.push(thread::spawn(move () -> () { ctx.run(); return (); }));
                 w = w + 1;
             }
 
@@ -1608,7 +1608,12 @@ private type struct TestRunner {
                 }
             }
 
-            scope.join_all();
+            loop {
+                match (workers.pop()) {
+                    Option::Some(worker) => { worker.join(); }
+                    Option::None         => { break; }
+                }
+            }
         }
 
         mem::drop(in_flight);

@@ -39,6 +39,28 @@
 ///! `try_spawn` is the fallible variant (returns `Result` instead of
 ///! panicking on OS thread-creation failure).
 ///!
+///! ## Scoped threads
+///!
+///! `thread::scope(body)` runs `body` with a scope handle, `s`, and joins
+///! every thread spawned through `s.spawn(...)` before it returns. A scoped
+///! thread may therefore borrow the variables of the function that called
+///! `scope`: a closure written without `move` is accepted by `s.spawn` when
+///! everything it borrows is `Sync`.
+///!
+///!   ```cryo
+///!   const words: [String] = [String::from("a"), String::from("bc")];
+///!   const total: Mutex<i64> = Mutex::<i64>::new(0);
+///!   thread::scope((s: mut &thread::Scope) -> void {
+///!       s.spawn(() -> void { mut g = total.lock(); *g.as_mutable_ptr() += words[0].length() as i64; });
+///!       s.spawn(() -> void { mut g = total.lock(); *g.as_mutable_ptr() += words[1].length() as i64; });
+///!   });
+///!   // both threads are joined here; `total` holds 3
+///!   ```
+///!
+///! The handle never leaves the scope's body: it may only be a `&Scope` /
+///! `mut &Scope` local or parameter, or be used by a closure written without
+///! `move`, and it is not `Send`, so a scoped thread cannot spawn through it.
+///!
 ///! Sub-modules:
 ///!   - `local` : `ThreadLocal<T>`, per-thread storage.
 
@@ -614,44 +636,29 @@ private function scope_trampoline<F>(arg: mut u8*) -> u32 where F: () -> void {
     return 0;
 }
 
-/// A thread scope. Every thread spawned through it is guaranteed to be
-/// joined before the scope is torn down (explicitly via `join_all()` or
-/// automatically when the `Scope` drops), so scoped bodies may safely
-/// point at data that outlives the scope:
-///
-///   ```cryo
-///   const counter: Atomic<i64> = Atomic::<i64>::new(0);
-///   const at: Atomic<i64>* = &counter;
-///   mut s: thread::Scope = thread::Scope::new();
-///   s.spawn(move () -> void { (*at).fetch_add(1, MemoryOrder::SeqCst); });
-///   s.spawn(move () -> void { (*at).fetch_add(10, MemoryOrder::SeqCst); });
-///   s.join_all();   // both threads finished; `counter` safe to read
-///   ```
-///
-/// (Cryo has no borrow checker, so the join-before-teardown discipline -
-/// not the type system - is what keeps borrowed data alive; do not let a
-/// scope outlive what its threads point at.)
+/// Run `body` with a thread scope and join every thread it spawned through
+/// the scope before returning `body`'s result. The threads may borrow the
+/// variables of the caller, which outlive them. A panic unwinding out of
+/// `body` still joins them, when the scope is released.
+public function scope<F, R>(body: F) -> R where F: (mut &Scope) -> R {
+    mut s: Scope = Scope { tids: [] };
+    const result: R = body(&s);
+    s.join_all();
+    return result;
+}
+
+/// A thread scope, the handle `thread::scope` gives its body. Every thread
+/// spawned through it is joined before `scope` returns, so a scoped thread
+/// may borrow what outlives the scope's body.
+![language("thread_scope")]
 public type struct Scope {
-    private tids:        [u64];
-    private stack_bytes: u64;   // per-thread stack; 0 -> OS default
-
-    /// Create an empty scope whose threads use the OS default stack size.
-    public static new() -> Scope {
-        return Scope { tids: [], stack_bytes: 0 };
-    }
-
-    /// Create a scope whose threads each get a `stack_bytes`-byte stack. Use
-    /// this for bodies that recurse deeply (e.g. driving LLVM codegen), where
-    /// the ~1 MiB default worker stack would overflow. `0` means OS default.
-    public static new_with_stack(stack_bytes: u64) -> Scope {
-        return Scope { tids: [], stack_bytes: stack_bytes };
-    }
+    private tids: [u64];
 
     /// Spawn a scoped thread running `body()`; `body` is moved into it. The
-    /// thread is recorded and joined by `join_all()` / the scope's drop.
-    /// Panics on allocation or thread-creation failure. `F: Send` - a raw
-    /// pointer into the scope's state qualifies (raw pointers are `Send`);
-    /// a deny-listed type (`Rc`, a lock guard) does not.
+    /// thread is recorded and joined before `thread::scope` returns. Panics
+    /// on allocation or thread-creation failure. `F: Send` holds for a
+    /// closure written without `move` when everything it borrows is `Sync`;
+    /// a deny-listed type (`Rc`, a lock guard, the scope itself) is not.
     public spawn<F>(mut &this, body: F) -> void
     where F: () -> void + Send {
         mut alloc: GlobalAlloc = GlobalAlloc::new();
@@ -661,7 +668,7 @@ public type struct Scope {
             Result::Err(_)  => { core::panic("Scope::spawn: alloc failed", intrinsics::location()); }
         }
         *p = body;
-        match (os_create_thread(scope_trampoline::<F> as void*, p as u8*, this.stack_bytes)) {
+        match (os_create_thread(scope_trampoline::<F> as void*, p as u8*, 0)) {
             Result::Ok(tid) => { this.tids.push(tid); }
             Result::Err(_)  => { core::panic("Scope::spawn: thread creation failed", intrinsics::location()); }
         }

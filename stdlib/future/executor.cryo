@@ -65,7 +65,7 @@ import std::sync::atomic::{ Atomic, MemoryOrder };
 import std::sync::mutex::{ Mutex, MutexGuard };
 import std::sync::condvar::{ CondVar };
 import std::thread;
-import std::thread::{ Scope };
+import std::thread::{ JoinHandle as ThreadJoinHandle };
 import std::core::mem;
 import std::collections::array;
 import std::future::poll::{ Poll };
@@ -700,7 +700,7 @@ implement<O> trait Drop for struct JoinHandle<O> {
 ![language("executor")]
 public type struct Executor {
     private inner:   mut ExecInner*;
-    private workers: Scope;   // the pool's worker threads
+    private workers: [ThreadJoinHandle<()>];   // the pool's worker threads
 
     /// Create an executor whose pool is sized to the hardware parallelism.
     public static new() -> Executor {
@@ -740,9 +740,9 @@ public type struct Executor {
         // something actually offloads work — so this costs an allocation.
         inner.reactor  = Reactor::start();
         inner.blocking = BlockingPool::with_max(blocking);
-        mut workers: Scope = Scope::new();
+        mut workers: [ThreadJoinHandle<()>] = [];
         for (mut i: u32 = 0; i < count; i = i + 1) {
-            workers.spawn(move () -> void { inner.work(); });
+            workers.push(thread::spawn(move () -> () { inner.work(); return (); }));
         }
         return Executor { inner: inner, workers: workers };
     }
@@ -813,7 +813,12 @@ implement trait Drop for struct Executor {
         // Join every worker (each exits `take()` once it observes shutdown).
         // Must follow the shutdown+broadcast above, or the join would block
         // forever on threads still parked in `take()`.
-        this.workers.join_all();
+        loop {
+            match (this.workers.pop()) {
+                Option::Some(worker) => { worker.join(); }
+                Option::None         => { break; }
+            }
+        }
         BlockingPool::stop(inner.blocking);
         Reactor::stop(inner.reactor);
         // No workers and no reactor thread remain. The reactor block stays

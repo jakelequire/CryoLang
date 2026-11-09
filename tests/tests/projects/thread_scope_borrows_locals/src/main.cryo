@@ -1,0 +1,112 @@
+namespace ThreadScopeBorrowsLocals;
+
+import std::thread;
+import std::sync::mutex::{ Mutex };
+import std::core::drop::{ Drop };
+import std::collections::string::{ String };
+
+mut drops: i32 = 0;
+
+type struct Counted {
+    v: i64;
+}
+
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void { drops = drops + 1; }
+}
+
+function sum_halves(values: &[i64]) -> i64 {
+    const total: Mutex<i64> = Mutex::<i64>::new(0);
+    thread::scope((s: mut &thread::Scope) -> void {
+        s.spawn(() -> void {
+            mut part: i64 = 0;
+            for (mut i: i64 = 0; i < values.length() / 2; i++) { part = part + values[i]; }
+            mut g = total.lock();
+            *g.as_mutable_ptr() += part;
+        });
+        s.spawn(() -> void {
+            mut part: i64 = 0;
+            for (mut i: i64 = values.length() / 2; i < values.length(); i++) { part = part + values[i]; }
+            mut g = total.lock();
+            *g.as_mutable_ptr() += part;
+        });
+    });
+    mut g = total.lock();
+    return *g.as_ptr();
+}
+
+function main() -> i32 {
+    // Scoped threads read a String and an Array declared outside the scope,
+    // borrowed by closures written without `move`, and update shared state
+    // through a Mutex; every thread is joined when `scope` returns.
+    const word: String = String::from("scoped");
+    const numbers: [i64] = [1, 2, 3, 4, 5, 6, 7, 8];
+    const seen: Mutex<i64> = Mutex::<i64>::new(0);
+    thread::scope((s: mut &thread::Scope) -> void {
+        for (mut t: i64 = 0; t < 4; t++) {
+            s.spawn(() -> void {
+                mut g = seen.lock();
+                *g.as_mutable_ptr() += word.length() as i64 + numbers[t];
+            });
+        }
+    });
+    {
+        mut g = seen.lock();
+        if (*g.as_ptr() != 4 * 6 + 1 + 2 + 3 + 4) { return 1; }
+    }
+    if (word.length() != 6) { return 2; }
+
+    // The scope hands its body's result back once every thread is joined.
+    const start: [i64] = [];
+    const results: Mutex<[i64]> = Mutex::<[i64]>::new(start);
+    const count: i64 = thread::scope((s: mut &thread::Scope) -> i64 {
+        for (mut t: i64 = 0; t < 3; t++) {
+            s.spawn(() -> void {
+                mut g = results.lock();
+                g.as_mutable_ptr().push(numbers[t] * 10);
+            });
+        }
+        return 3;
+    });
+    {
+        mut g = results.lock();
+        const all: [i64]* = g.as_ptr();
+        if (count != 3 || (*all).length() != 3) { return 3; }
+        mut sum: i64 = 0;
+        for (mut i: i64 = 0; i < (*all).length(); i++) { sum = sum + (*all)[i]; }
+        if (sum != 60) { return 4; }
+    }
+
+    // A scope in a function that borrows its parameter.
+    if (sum_halves(&numbers) != 36) { return 5; }
+
+    // A borrowed value with a destructor is released once, by its own scope,
+    // after the threads that read it are joined.
+    drops = 0;
+    {
+        const c: Counted = Counted { v: 7 };
+        const read: Mutex<i64> = Mutex::<i64>::new(0);
+        thread::scope((s: mut &thread::Scope) -> void {
+            s.spawn(() -> void {
+                mut g = read.lock();
+                *g.as_mutable_ptr() = c.v;
+            });
+        });
+        if (drops != 0) { return 6; }
+        mut g = read.lock();
+        if (*g.as_ptr() != 7) { return 7; }
+    }
+    if (drops != 1) { return 8; }
+
+    // `move` closures still work in a scope: each owned capture is released
+    // once, on its thread.
+    drops = 0;
+    thread::scope((s: mut &thread::Scope) -> void {
+        for (mut t: i64 = 0; t < 3; t++) {
+            const owned: Counted = Counted { v: t };
+            s.spawn(move () -> void { const _v: i64 = owned.v; });
+        }
+    });
+    if (drops != 3) { return 9; }
+    return 0;
+}

@@ -115,16 +115,13 @@ type struct TraitChecker {
         // `Send` and `Sync` follow the same "structural marker" pattern
         // as `Copy`: the compiler decides via a type walk, not via
         // `implement trait Send for T { ... }` lookups.  See
-        // OwnershipQuery::is_send / is_sync for the rules.
-        const send_name: DefId = this.generic_registry.wellknown(LangItem::Send);
-        if (send_name.is_valid() && trait_name.equals(send_name)) {
-            return OwnershipQuery::is_send(this.arena, this.generic_registry,
-                                            this.intern_table, ty);
-        }
-        const sync_name: DefId = this.generic_registry.wellknown(LangItem::Sync);
-        if (sync_name.is_valid() && trait_name.equals(sync_name)) {
-            return OwnershipQuery::is_sync(this.arena, this.generic_registry,
-                                            this.intern_table, ty);
+        // OwnershipQuery::is_send / is_sync for the rules.  A value holding
+        // a closure that borrows from the frame it was made in is neither,
+        // whatever its parts are: another thread may outlive that frame.
+        // Only a bound that admits such a closure (`TraitBound.
+        // admits_frame_borrow`) asks the structural question alone.
+        if (this.is_thread_safety_trait(trait_name)) {
+            return this.thread_safe_structurally(ty) && !this.arena.holds_frame_borrow(ty);
         }
 
         // Pointers are non-owning aliases; dropping one is a trivial no-op.
@@ -319,6 +316,10 @@ type struct TraitChecker {
             const tr: const TraitRef* = &bound.trait_refs[ri];
             // A bound refused where it is written is reported there.
             if (tr.path.length() == 0 || tr.refused) { continue; }
+            if (bound.admits_frame_borrow && this.is_thread_safety_trait(tr.definition())) {
+                if (!this.thread_safe_structurally(subject)) { return tr; }
+                continue;
+            }
             if (object || tr.argument_types.length() == 0) {
                 if (!this.type_implements_trait(subject, tr.definition(), depth)) { return tr; }
                 continue;
@@ -399,15 +400,27 @@ type struct TraitChecker {
         return fmt::format("the trait `%s` is not implemented for `%s`", trait_shown, ty_shown).into_raw();
     }
 
-    /// Whether `trait_def` is `Send` or `Sync` and `ty` fails it by holding a
-    /// closure that borrows from the frame it was made in.
-    borrowing_closure_not_thread_safe(&this, ty: TypeRef, trait_def: DefId) -> boolean {
+    /// Whether `trait_def` is `Send` or `Sync`.
+    is_thread_safety_trait(&this, trait_def: DefId) -> boolean {
         if (this.generic_registry == null) { return false; }
-        if (!trait_def.equals(this.generic_registry.wellknown(LangItem::Send))
-                && !trait_def.equals(this.generic_registry.wellknown(LangItem::Sync))) {
-            return false;
-        }
-        return this.arena.holds_frame_borrow(ty);
+        const send: DefId = this.generic_registry.wellknown(LangItem::Send);
+        const sync: DefId = this.generic_registry.wellknown(LangItem::Sync);
+        return (send.is_valid() && trait_def.equals(send)) || (sync.is_valid() && trait_def.equals(sync));
+    }
+
+    /// Whether `ty` is built only of parts that may cross or be shared
+    /// between threads, frame borrows aside; `Send` and `Sync` share the
+    /// rule (`OwnershipQuery::is_send`).
+    thread_safe_structurally(&this, ty: TypeRef) -> boolean {
+        return OwnershipQuery::is_send(this.arena, this.generic_registry, this.intern_table, ty);
+    }
+
+    /// Whether `trait_def` is `Send` or `Sync` and `ty` fails it only by
+    /// holding a closure that borrows from the frame it was made in: every
+    /// part is thread-safe, so owning the captures would satisfy it.
+    borrowing_closure_not_thread_safe(&this, ty: TypeRef, trait_def: DefId) -> boolean {
+        if (!this.is_thread_safety_trait(trait_def)) { return false; }
+        return this.arena.holds_frame_borrow(ty) && this.thread_safe_structurally(ty);
     }
 
     /// The help an unmet bound of `trait_def` on `ty` carries.  No

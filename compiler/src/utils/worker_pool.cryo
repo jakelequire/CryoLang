@@ -23,7 +23,9 @@ type struct WorkerPool<J> {
     private cursor:    Atomic<u64>;
     private published: Atomic<u64>;
     private closed:    Atomic<u32>;
-    private workers:   thread::Scope;
+    /// Each worker's stack size; `0` for the OS default.
+    private stack_bytes: u64;
+    private workers:   [thread::JoinHandle<()>];
 
     /// A pool with no workers yet, each to run on a `stack_bytes` stack
     /// (`0` for the OS default).
@@ -32,7 +34,8 @@ type struct WorkerPool<J> {
             cursor:    Atomic::<u64>::new(0),
             published: Atomic::<u64>::new(0),
             closed:    Atomic::<u32>::new(0),
-            workers:   thread::Scope::new_with_stack(stack_bytes)
+            stack_bytes: stack_bytes,
+            workers:   []
         };
     }
 
@@ -48,7 +51,8 @@ type struct WorkerPool<J> {
                 cursor: &this.cursor, published: &this.published, closed: &this.closed,
                 worker: w, run: run
             };
-            this.workers.spawn(move () -> void { queue.work(); });
+            this.workers.push(thread::Builder::new().stack_size(this.stack_bytes)
+                .spawn(move () -> () { queue.work(); return (); }));
         }
     }
 
@@ -61,7 +65,12 @@ type struct WorkerPool<J> {
     /// A closed pool takes no more jobs; closing again does nothing.
     close(mut &this) -> void {
         this.closed.store(1, MemoryOrder::Release);
-        this.workers.join_all();
+        loop {
+            match (this.workers.pop()) {
+                Option::Some(worker) => { worker.join(); }
+                Option::None         => { break; }
+            }
+        }
     }
 }
 

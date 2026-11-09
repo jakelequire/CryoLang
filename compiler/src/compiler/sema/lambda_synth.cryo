@@ -59,6 +59,7 @@ import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::mangled_name::{ MangledName };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::decl_name::{ DeclName };
 import compiler::resolver::res::{ Res, ResSlot, DefId, DefKey, DefKind, FamilyOwner };
 import compiler::decl_index::{ DeclarationIndex, OverloadId };
 import compiler::module_graph::{ ModulePath };
@@ -358,6 +359,15 @@ type struct LambdaSynth {
                 field_types.push(lambda.captured_types[i]);
                 if (arena_ptr.holds_frame_borrow(lambda.captured_types[i])) { borrows_frame = true; }
             }
+            // The thread scope's handle is copied into the closure, which
+            // then borrows from the scope's body like any borrowing closure;
+            // a `move` closure would own it beyond the body.
+            if (arena_ptr.holds_thread_scope(lambda.captured_types[i])) {
+                if (lambda.is_move) {
+                    this.refuse_moved_scope_handle(lambda, i, span);
+                }
+                borrows_frame = true;
+            }
         }
         // Each field's initializer where the closure is made: the binding
         // itself, or its address for a borrowed capture.
@@ -423,6 +433,10 @@ type struct LambdaSynth {
             }
             st.set_fields(infos);
             st.borrows_frame = borrows_frame;
+            // A message names the closure by where it is written: its
+            // struct's name is minted, and no program spells it.
+            st.set_display_name(DeclName::of(intern_ptr.intern(fmt::format("closure (%s:%u:%u)",
+                ctx_ptr.program_file_names.name_of(span.file), span.start_line, span.start_col).into_raw())));
         }
 
         // 3. `__call__` FunctionDecl: the closure struct by reference, then
@@ -906,6 +920,47 @@ type struct LambdaSynth {
             Option::Some(fix) => { diag = diag.suggest(fix); }
             Option::None => {}
         }
+        this.ctx.emit_diagnostic(diag);
+    }
+
+    /// E0455 when a value of `value_ty` holding the thread scope's handle is
+    /// held by `what` - a returned value, a field, a global, an array element,
+    /// or a variable or argument of any type but the handle's own (`&Scope` /
+    /// `mut &Scope`), which `admits_handle` allows.  The scope joins its
+    /// threads when its body returns, so the handle must not outlive the
+    /// body.  A value holding a closure that uses the handle is the borrowing
+    /// closure's to refuse (`refuse_returned_borrow` and the rest).
+    refuse_held_scope_handle(mut &this, value_ty: TypeRef, span: SourceSpan, what: string,
+                             admits_handle: boolean) -> void {
+        if (!this.arena.holds_thread_scope(value_ty)) { return; }
+        // The scope itself is a local only where `thread::scope` makes it:
+        // its field is private and it has no public constructor.
+        if (admits_handle && (this.arena.is_thread_scope_handle(value_ty)
+                || value_ty.equals(this.arena.thread_scope))) { return; }
+        if (this.arena.holds_frame_borrow(value_ty)) { return; }
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0455_DANGLING_POINTER,
+            fmt::format("the thread scope's handle cannot be held by %s", what));
+        diag = diag.at_with_label(span, fmt::format("this value of type `%s` holds the handle",
+            this.arena.resolve_display_name(value_ty)));
+        diag = diag.with_note(
+            "`thread::scope` joins its threads when its body returns, so the handle may only be a `&Scope` or `mut &Scope` local or parameter of the body, or be used by a closure written without `move`");
+        this.ctx.emit_diagnostic(diag);
+    }
+
+    /// E0455 when `lambda`, a `move` closure written at `closure`, captures
+    /// the thread scope's handle in its capture `i`: it would own the handle
+    /// beyond the scope's body.
+    refuse_moved_scope_handle(mut &this, lambda: LambdaExpr*, i: i64, closure: SourceSpan) -> void {
+        const shown: string = this.intern.resolve(lambda.captured_names[i]);
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0455_DANGLING_POINTER,
+            fmt::format("a `move` closure cannot capture the thread scope's handle `%s`", shown));
+        diag = diag.at_with_label(lambda.captured_spans[i], "the handle is captured here");
+        diag = diag.also_at(closure, "this `move` closure would own it");
+        diag = diag.with_note(
+            "`thread::scope` joins its threads when its body returns, so only a closure that borrows from the body may use the handle");
+        diag = diag.suggest(Suggestion::single(
+            SourceSpan::new(closure.file, closure.start_line, closure.start_col, closure.start_line, closure.start_col + 5),
+            "", "leave out `move`: the closure then borrows from the scope's body", Applicability::MaybeIncorrect));
         this.ctx.emit_diagnostic(diag);
     }
 

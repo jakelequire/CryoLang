@@ -528,7 +528,7 @@ could are refused, each with the fix that writes `move`:
 | -------------------------------------------------------------------------------------------------------- | ---------- |
 | Moving a borrowed variable while the closure can still run: until the end of the statement that makes the closure (for one made in an `if`'s or a loop's condition, the end of the condition), and while any binding in scope holds it | E0457 |
 | Returning the closure, or a value holding it, from the function or closure that made it                  | E0457      |
-| Giving it where `Send` or `Sync` is required: a borrowing closure is neither                             | E0306      |
+| Giving it where `Send` or `Sync` is required: a borrowing closure is neither, except to a scoped thread's `spawn` ([section 15.4](#scoped-threads)) | E0306 |
 | Holding it across an `await`                                                                             | E0455      |
 
 ```cryo
@@ -3785,11 +3785,12 @@ type becomes `Send`, and writing one has no effect. The declarations in
 name them.
 
 The rule is structural, and identical for both traits today (they are separate
-predicates so a future `&T: Send if T: Sync` distinction can land without an
-API change):
+predicates so a type that is one and not the other can be told apart without
+an API change):
 
-- Primitives, references, function pointers, and **raw pointers** are `Send`
-  and `Sync`.
+- Primitives, function pointers, and **raw pointers** are `Send` and `Sync`.
+- A reference `&T` (or `mut &T`) shares `T` with whoever holds it, so it is
+  `Send` and `Sync` exactly when `T` is `Sync`.
 - Arrays, optionals, and tuples are `Send`/`Sync` if every component is.
 - Structs and enums are `Send`/`Sync` if every field - or every
   variant payload - is, **and** the type is not on the deny-list below.
@@ -3807,6 +3808,43 @@ caught by it:
 | `std::sync::mutex::MutexGuard`        | POSIX mutexes must be released by the acquiring thread |
 | `std::sync::rwlock::RwLockReadGuard`  | as above                                               |
 | `std::sync::rwlock::RwLockWriteGuard` | as above                                               |
+| `std::thread::Scope`                  | records its threads without a lock; see [scoped threads](#scoped-threads) |
+
+A value holding a closure that borrows from the frame it was made in (one
+written without `move` that captures a value that is not `Copy`) is neither
+`Send` nor `Sync`, whatever it borrows: another thread may outlive that frame.
+The one exception is the scope's own `spawn`, below.
+
+#### Scoped threads
+
+`thread::scope(body)` calls `body` with a scope handle and joins every thread
+spawned through the handle before it returns `body`'s result. Because those
+threads cannot outlive the call, `Scope::spawn` accepts a closure written
+without `move`: its `F: () -> void + Send` bound is met by a borrowing
+closure whose parts are `Send` - each borrowed value `Sync`. Scoped threads may
+therefore read the caller's locals, and update shared state through a
+`Mutex`:
+
+```cryo
+const words: [String] = [String::from("a"), String::from("bc")];
+const total: Mutex<i64> = Mutex::<i64>::new(0);
+thread::scope((s: mut &thread::Scope) -> void {
+    s.spawn(() -> void { mut g = total.lock(); *g.as_mutable_ptr() += words[0].length() as i64; });
+    s.spawn(() -> void { mut g = total.lock(); *g.as_mutable_ptr() += words[1].length() as i64; });
+});
+// both threads are joined; `total` holds 3
+```
+
+The guarantee holds only while the handle stays inside the scope's body. The
+handle is `&Scope` or `mut &Scope`; `Scope` is on the deny-list, so `&Scope`
+is not `Send`, and a closure that uses the handle cannot be given to
+`Scope::spawn` or `thread::spawn` - a scoped thread cannot spawn through it.
+Every other place a borrowing closure is refused (section 2.5) applies to a
+closure that uses the handle, and the handle itself may only be a local or a
+parameter of type `&Scope` / `mut &Scope`: a field, variant payload, tuple,
+global or other value holding it is refused, as is returning it and capturing
+it in a `move` closure (**E0455**). `Scope` has no public constructor; the
+handle comes only from `thread::scope`.
 
 #### `Send` is advisory at the edges
 
@@ -3817,9 +3855,9 @@ non-capturing lambda or a named function - and `thread::spawn`, `try_spawn`,
 `spawn_with_attr` and `Builder`'s `spawn` / `try_spawn` take it as
 `F: () -> T + Send` with `T: Send`; `Scope::spawn` takes `F: () -> void + Send`.
 A closure is `Send` when everything it owns is, so moving an `Rc<T>` or a lock
-guard into another thread is a compile error, and so is a closure written
-without `move`, which borrows from the spawning function; the error's fix
-writes `move`:
+guard into another thread is a compile error, and so is giving `thread::spawn`
+a closure written without `move`, which borrows from the spawning function;
+the error's fix writes `move`:
 
 ```cryo
 const n: i32 = 21;

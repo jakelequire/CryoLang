@@ -17,7 +17,7 @@ import compiler::resolver::{ symbol_str, intern_table, qualified_name, resolver 
 import compiler::resolver::res::{ DeclVisibility, DefId, DefTable, DefKind, FamilyOwner, ResBase, ResSlot };
 import compiler::ast::node::{ Node };
 import compiler::ast::{ NamedAnnotation, TraitRef, Visibility };
-import compiler::ast::declaration::{ DeclarationNode, FunctionDecl, ImplBlock, MethodDecl, ObjectTableInstance };
+import compiler::ast::declaration::{ DeclarationNode, FunctionDecl, ImplBlock, MethodDecl, ObjectTableInstance, StructDecl };
 import compiler::ast::expression::{ ExpressionNode };
 import compiler::ast::pattern::{ DirectiveArgKind, DirectiveNode };
 import compiler::types::generic_registry::{ TemplateEntry };
@@ -622,6 +622,20 @@ public:
             this.lang_claims.push(LangClaim { item: item, span: d.span });
             if (item == LangItem::Slice) {
                 this.type_arena.set_slice_template(this.decl_index.type_of_def(def));
+            }
+            // The scope joins every thread spawned through it before its
+            // body returns, so what those threads borrow outlives them.
+            if (item == LangItem::ThreadScope) {
+                this.type_arena.set_thread_scope(this.decl_index.type_of_def(def));
+                const scope: mut StructDecl* = DeclarationNode::struct_of(decl);
+                for (mut m: i64 = 0; scope != null && m < scope.methods.length(); m++) {
+                    const method: MethodDecl* = DeclarationNode::method_of(scope.methods[m]);
+                    const func: mut FunctionDecl* = if (method != null) { DeclarationNode::fn_of(method.func) } else { null };
+                    if (func == null) { continue; }
+                    for (mut b: i64 = 0; b < func.trait_bounds.length(); b++) {
+                        func.trait_bounds[b].admits_frame_borrow = true;
+                    }
+                }
             }
             return;
         }

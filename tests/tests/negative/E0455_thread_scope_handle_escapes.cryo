@@ -1,0 +1,69 @@
+// E0455: the thread scope's handle may only be a `&Scope` / `mut &Scope`
+// local or parameter of the scope's body, or be used by a closure written
+// without `move`.  Returning it, or holding it in a field, an optional, a
+// tuple, an array or a lock, would let it outlive the body, after which
+// `thread::scope` has joined its threads and released the scope.  A local
+// handle and a parameter handle are the controls.
+![config(testing)]
+![config(negative, E0455)]
+namespace CryoTests::Negative::ThreadScopeHandleEscapes;
+
+import std::thread;
+import std::sync::mutex::{ Mutex };
+
+type struct Holder {
+    scope: mut &thread::Scope;
+}
+
+function spawn_one(s: mut &thread::Scope) -> void {
+    s.spawn(() -> void { });
+}
+
+function returned() -> void {
+    thread::scope((s: mut &thread::Scope) -> mut &thread::Scope { return s; });
+    //~^ ERROR[E0455] the thread scope's handle cannot be held by a returned value
+}
+
+function in_a_field() -> void {
+    thread::scope((s: mut &thread::Scope) -> void {
+        const h: Holder = Holder { scope: s };
+        //~^ ERROR[E0455] the thread scope's handle cannot be held by a field
+    });
+}
+
+function in_an_optional() -> void {
+    thread::scope((s: mut &thread::Scope) -> void {
+        const o: Option<mut &thread::Scope> = Option::Some(s);
+        //~^ ERROR[E0455] the thread scope's handle cannot be held by a variable
+    });
+}
+
+function in_a_tuple() -> void {
+    thread::scope((s: mut &thread::Scope) -> void {
+        const t: (i32, mut &thread::Scope) = (1, s);
+        //~^ ERROR[E0455] the thread scope's handle cannot be held by a variable
+    });
+}
+
+function in_an_array() -> void {
+    thread::scope((s: mut &thread::Scope) -> void {
+        const a = [s];
+        //~^ ERROR[E0455] the thread scope's handle cannot be held by a variable
+    });
+}
+
+function in_an_outer_lock() -> void {
+    const slot: Mutex<Option<mut &thread::Scope>> = Mutex::<Option<mut &thread::Scope>>::new(Option::<mut &thread::Scope>::None);
+    //~^ ERROR[E0455] the thread scope's handle cannot be held by a variable
+}
+
+function controls() -> void {
+    thread::scope((s: mut &thread::Scope) -> void {
+        const again: mut &thread::Scope = s;
+        spawn_one(again);
+        const later = () -> void { spawn_one(s); };
+        later();
+    });
+}
+
+function main() -> int { return 0; }
