@@ -646,8 +646,9 @@ type struct MoveChecker {
         if (pspan.has_location()) {
             diag = diag.also_at(pspan, "polled here, fixing its address");
         }
-        diag = diag.help(
-            "a future may hold a pointer into its own storage once it has run, so it must stay put; hand it over before the first poll (`block_on(f)`, `spawn(f)`, `Futures::join(a, b)`) rather than after");
+        diag = diag.help_with_example(
+            "a future may hold a pointer into its own storage once it has run, so it must stay put; hand it over before the first poll rather than after",
+            "const f = work();\nconst result = block_on(f);   // or spawn(f), Futures::join(a, b)");
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
@@ -1077,10 +1078,11 @@ type struct MoveChecker {
             return diag.suggest(Suggestion::machine_applicable(moved_at.end_point(), ".clone()",
                 fmt::format("`%s` implements `Clone`: move a copy where the value is first moved", shown)));
         }
-        if (this.aggregate_type_of(ty) == null && !this.is_enum(ty)) { return diag; }
-        return diag.help(fmt::format(
-            "`%s` does not implement `Clone`; implement it to move a copy and keep the original: `implement trait Clone for %s { ... }`",
-            shown, shown));
+        const is_enum: boolean = this.is_enum(ty);
+        if (this.aggregate_type_of(ty) == null && !is_enum) { return diag; }
+        return diag.help_with_example(fmt::format(
+            "`%s` does not implement `Clone`; derive it on its declaration, or implement it, to move a copy and keep the original",
+            shown), fmt::format("type %s %s with [Clone] { ... }", if (is_enum) { "enum" } else { "struct" }, shown).into_raw());
     }
 
     /// Whether `ty`, its instantiations seen through, is an enum.
@@ -1117,8 +1119,9 @@ type struct MoveChecker {
             ErrorCode::E0452_USE_AFTER_MOVE, headline);
         diag = diag.at_with_label(use_span,
             "moved here, then re-read on the next iteration (double free)");
-        diag = diag.help(
-            "declare the value inside the loop, reassign it after the move, or move out of a per-iteration binding");
+        diag = diag.help_with_example(
+            "declare the value inside the loop, reassign it after the move, or move out of a per-iteration binding",
+            "while (...) {\n    const item = <a new value each iteration>;\n    consume(item);\n}");
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
@@ -2365,14 +2368,18 @@ type struct MoveChecker {
                     fmt::format("cannot match field `%s` by value through a pointer or reference", field))
                     .at_with_label(e.span,
                         "the match takes its own copy of the field and drops it; the storage it is in still drops it too (double free)")
-                    .help("match on a borrow of the field instead - write `&` before the subject - so the arms read it without owning it; if this really is a take, swap a replacement in with `core::mem::swap` first")
+                    .help("match on a borrow of the field instead, so the arms read it without owning it; if this really is a take, swap a replacement in with `core::mem::swap` first")
+                    .suggest(Suggestion::single(e.span.start_point(), "&", "match on a borrow of the field",
+                        Applicability::MaybeIncorrect))
             }
             FieldReadSite::Value => {
                 Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
                     fmt::format("cannot move field `%s` out through a pointer or reference", field))
                     .at_with_label(e.span,
                         "this copies the field's owning handle into a second owner; the storage it is in still drops it too (double free)")
-                    .help("borrow the field (`&p.field`) or clone it; if this really is a take, swap a replacement in with `core::mem::swap`, or take it by value from an owned receiver (`mut this`)")
+                    .help("borrow the field or clone it; if this really is a take, swap a replacement in with `core::mem::swap`, or take it by value from an owned receiver (`mut this`)")
+                    .suggest(Suggestion::single(e.span.start_point(), "&", "borrow the field",
+                        Applicability::MaybeIncorrect))
             }
         };
         this.ctx.emit_diagnostic(diag);
@@ -2497,7 +2504,7 @@ type struct MoveChecker {
         if (!pointee_ty.is_valid() || this.is_copy(pointee_ty)) { return; }
         if (!this.type_needs_drop(pointee_ty)) { return; }
         if (this.suppress_emit) { return; }
-        this.emit_deref_move_out_error(expr.span);
+        this.emit_deref_move_out_error(expr);
     }
 
     /// Reject a by-value read of a whole value through a binding declared as
@@ -2528,19 +2535,19 @@ type struct MoveChecker {
             "this copies the value's owning handle into a second owner; the storage it refers to still drops it too (double free)");
         diag = diag.help(
             "clone it, or take it by value (`mut this` for a receiver) when the method is meant to consume it");
-        this.ctx.emit_diagnostic(diag);
+        this.ctx.emit_diagnostic(this.with_clone_hint(diag, value_ty, expr.span));
         this.fired += 1;
         this.fatal += 1;
     }
 
-    emit_deref_move_out_error(mut &this, span: SourceSpan) -> void {
+    emit_deref_move_out_error(mut &this, expr: ExpressionNode*) -> void {
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
             "cannot move a value that owns a destructor out of a pointer");
-        diag = diag.at_with_label(span,
+        diag = diag.at_with_label(expr.span,
             "reading the pointee by value copies its owning handle; the storage this points at is still dropped by its owner (double free)");
         diag = diag.help(
             "borrow it instead (`p.field`, `p.method()`), or clone it; if this really is a take - the storage is yours to empty, or you overwrite it straight after - say so with an `unsafe` block around the sequence that makes it sound");
-        this.ctx.emit_diagnostic(diag);
+        this.ctx.emit_diagnostic(this.with_clone_hint(diag, expr.resolved_type, expr.span));
         this.fired += 1;
         this.fatal += 1;
     }
@@ -2564,8 +2571,9 @@ type struct MoveChecker {
         }
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE, headline);
         diag = diag.at_with_label(e.span, label);
-        diag = diag.help(
-            "swap the field out with `core::mem::swap`, leaving a valid value to be dropped in place; or use a `Copy` field type");
+        diag = diag.help_with_example(
+            "swap the field out with `core::mem::swap`, leaving a valid value to be dropped in place; or use a `Copy` field type",
+            fmt::format("mut taken = <a value to leave behind>;\ncore::mem::swap(&taken, &owner.%s);", field).into_raw());
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
@@ -2593,18 +2601,20 @@ type struct MoveChecker {
         // not a raw-pointer deref the caller is responsible for.
         const arr_ty: TypeRef = aa.array.resolved_type;
         if (!arr_ty.is_valid() || this.is_ptr_or_ref(arr_ty)) { return; }
-        this.emit_array_move_out_error(expr.span);
+        this.emit_array_move_out_error(expr);
     }
 
-    emit_array_move_out_error(mut &this, span: SourceSpan) -> void {
+    emit_array_move_out_error(mut &this, expr: ExpressionNode*) -> void {
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0453_DOUBLE_FREE,
             "cannot move an element out of an array that owns a destructor");
-        diag = diag.at_with_label(span,
+        diag = diag.at_with_label(expr.span,
             "copying this element out leaves the array to drop it again at scope exit (double free)");
         diag = diag.help(
-            "borrow the element instead (`const x: &T = &arr[i];`); or clone it when an owned copy is required");
-        this.ctx.emit_diagnostic(diag);
+            "borrow the element instead, and type what holds it `&T`; or clone it when an owned copy is required");
+        diag = diag.suggest(Suggestion::single(expr.span.start_point(), "&", "borrow the element",
+            Applicability::MaybeIncorrect));
+        this.ctx.emit_diagnostic(this.with_clone_hint(diag, expr.resolved_type, expr.span));
         this.fired += 1;
         this.fatal += 1;
     }
@@ -2633,8 +2643,10 @@ type struct MoveChecker {
         diag = diag.at_with_label(expr.span,
             "copying this array field out aliases the buffer the source still owns (double free)");
         diag = diag.help(
-            "borrow it (`const x: &[T] = &place.field;`) or clone it when an owned copy is required");
-        this.ctx.emit_diagnostic(diag);
+            "borrow it, and type what holds it `&[T]`; or clone it when an owned copy is required");
+        diag = diag.suggest(Suggestion::single(expr.span.start_point(), "&", "borrow the array",
+            Applicability::MaybeIncorrect));
+        this.ctx.emit_diagnostic(this.with_clone_hint(diag, field_ty, expr.span));
         this.fired += 1;
         this.fatal += 1;
     }

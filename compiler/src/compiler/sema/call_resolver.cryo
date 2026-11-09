@@ -771,7 +771,7 @@ type struct CallResolver {
             diag = diag.help(fmt::format("use `std::core::ptr::drop_in_place(%s)`",
                 this.pointer_to_receiver_text(member.object)));
         } else {
-            diag = diag.help(this.param_bound_help(member.member, param));
+            diag = this.with_member_bound_fix(diag, member.member, param);
         }
         this.ctx.emit_diagnostic(diag);
     }
@@ -793,11 +793,14 @@ type struct CallResolver {
         return diag;
     }
 
-    /// The help on `param_member_miss`: the bound that would give `param`
-    /// the member.
-    param_bound_help(&this, member_name: SymbolStr, param: GenericParamType*) -> string {
-        return fmt::format("add a `where %s: Trait` bound naming a trait that declares `%s`",
-            this.arena.format_generic_param(param), this.intern.resolve(member_name)).into_raw();
+    /// `d`, a `param_member_miss`, with the bound that would give `param` the
+    /// member: one naming a trait that declares it, `Trait` standing in for
+    /// that trait.
+    with_member_bound_fix(&this, d: Diagnostic, member_name: SymbolStr, param: GenericParamType*) -> Diagnostic {
+        const shown: string = this.arena.format_generic_param(param);
+        const helped: Diagnostic = d.help(fmt::format("bound `%s` by a trait that declares `%s`",
+            shown, this.intern.resolve(member_name)));
+        return this.binding.with_bound_fix(helped, param, shown, "Trait", Applicability::HasPlaceholders);
     }
 
     /// The pointer to a destructor call's receiver, as the writer would spell
@@ -2542,12 +2545,7 @@ type struct CallResolver {
             fmt::format("implement `%s` for `%s`, or pass an argument of a type that already does",
                 trait_str, conc_str).into_raw()));
         if (this.trait_checker().borrowing_closure_not_thread_safe(concrete, tref.definition())) {
-            mut borrowing: [TypeRef] = [];
-            this.arena.frame_borrowing_closures(concrete, &borrowing);
-            match (LambdaSynth::own_captures_fix(this.ctx.decl_index, borrowing[0])) {
-                Option::Some(fix) => { d = d.suggest(fix); }
-                Option::None => {}
-            }
+            d = LambdaSynth::with_own_captures_fix(d, this.ctx.decl_index, this.arena, concrete);
         }
         this.ctx.emit_diagnostic(d);
     }
@@ -2559,8 +2557,28 @@ type struct CallResolver {
             fmt::format("cannot infer the type argument for `%s`", fn_str));
         d = d.at(call_e.span);
         d = d.with_note("`![implicit]` recovers the type argument from the expected type, but this call is not in a typed context (e.g. a `const x: T = ...` initializer)");
-        d = d.help(fmt::format("write the type argument explicitly, e.g. `%s<T>(...)`", fn_str));
+        d = d.help(fmt::format("write the type argument explicitly, `%s::<T>(...)`", fn_str));
+        d = d.suggest(CallResolver::type_arguments_fix(call.callee.span, "T"));
         this.ctx.emit_diagnostic(d);
+    }
+
+    /// The fix writing a call's type arguments after its callee, `f::<A, B>`;
+    /// `names` stands in for the types until the author picks them.
+    static type_arguments_fix(callee: SourceSpan, names: string) -> Suggestion {
+        return Suggestion::single(callee.end_point(), fmt::format("::<%s>", names).into_raw(),
+            "write the type arguments", Applicability::HasPlaceholders);
+    }
+
+    /// The type parameters of `tmpl` as a type argument list would write
+    /// them, `T, U`.
+    type_parameter_list(&this, tmpl: FunctionDecl*) -> string {
+        mut names: string = "";
+        for (mut i: i64 = 0; i < tmpl.generic_params.length(); i++) {
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(tmpl.generic_params[i]);
+            if (i > 0) { names = names + ", "; }
+            names = names + if (gp != null) { this.intern.resolve(gp.name) } else { "_" };
+        }
+        return names;
     }
 
     /// Report why inferring `call`'s type arguments to the generic function
@@ -2612,7 +2630,9 @@ type struct CallResolver {
             ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
             fmt::format("cannot infer the type argument for `%s` from its arguments", fn_str));
         d = d.at(call_e.span);
-        d = d.help(fmt::format("write the type argument explicitly, e.g. `%s::<T>(...)`", fn_str));
+        d = d.help(fmt::format("write the type arguments explicitly, `%s::<%s>(...)`", fn_str,
+            this.type_parameter_list(tmpl)));
+        d = d.suggest(CallResolver::type_arguments_fix(call.callee.span, this.type_parameter_list(tmpl)));
         this.ctx.emit_diagnostic(d);
     }
 
@@ -2628,12 +2648,7 @@ type struct CallResolver {
         }
         if (open < 0) { return; }
         const fn_str: string = this.intern.resolve(tmpl.name);
-        mut names: string = "";
-        for (mut i: i64 = 0; i < tmpl.generic_params.length(); i++) {
-            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(tmpl.generic_params[i]);
-            if (i > 0) { names = names + ", "; }
-            names = names + if (gp != null) { this.intern.resolve(gp.name) } else { "_" };
-        }
+        const names: string = this.type_parameter_list(tmpl);
         const open_param: GenericParamDecl* = DeclarationNode::generic_param_of(tmpl.generic_params[open]);
         const open_name: string = if (open_param != null) { this.intern.resolve(open_param.name) } else { "?" };
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
@@ -2641,10 +2656,16 @@ type struct CallResolver {
         if (open < written.length()) {
             d = d.at_with_label(annotation_span(written[open]), "nothing in the call says which type this is");
             d = d.help("the call has no arguments to infer it from; write the type in place of `_`");
+            d = d.suggest(Suggestion::single(annotation_span(written[open]), open_name,
+                fmt::format("write the type `%s` stands for", open_name), Applicability::HasPlaceholders));
         } else {
             d = d.at_with_label(call_e.span, "nothing in the call says which type it is");
             d = d.help(fmt::format("the call has no arguments to infer it from; write the type arguments, `%s::<%s>()`",
                 fn_str, names));
+            const call: CallExpr* = ExpressionNode::call_of(call_e);
+            if (call != null && call.callee != null) {
+                d = d.suggest(CallResolver::type_arguments_fix(call.callee.span, names));
+            }
         }
         this.ctx.emit_diagnostic(d);
     }
@@ -5018,8 +5039,8 @@ type struct CallResolver {
             this.intern.resolve(member.member), trait_shown, subject_shown, bound_shown));
         diag = diag.with_note(fmt::format("no bound of this body gives `%s: %s`, so not every copy of it has the method",
             subject_shown, bound_shown));
-        diag = diag.help(fmt::format("add `where %s: %s` to the function", subject_shown, bound_shown));
-        this.ctx.emit_diagnostic(diag);
+        this.ctx.emit_diagnostic(this.binding.with_bound_fix(diag, this.arena.generic_param_or_null(subject),
+            subject_shown, bound_shown, Applicability::MachineApplicable));
     }
 
     /// The first bound of `block`'s where-clause that the bounds in scope of
@@ -6087,7 +6108,8 @@ type struct CallResolver {
         d = d.with_note(fmt::format("method `%s` requires `%s: %s`", method_str, param_str, trait_str));
         const ct: Type* = this.arena.lookup(concrete);
         if (ct != null && ct.kind == TypeKind::GenericParam) {
-            d = d.help(fmt::format("add `%s: %s` to the bounds in scope here", conc_str, trait_str));
+            d = this.binding.with_bound_fix(d, ct.as_generic_param(), conc_str, trait_str,
+                Applicability::MachineApplicable);
         } else if (tref.definition().equals(this.ctx.generic_registry.wellknown(LangItem::Copy))) {
             d = d.help(fmt::format(
                 "`%s` owns resources, so it isn't `Copy`, and `%s` is only available when `%s` is",
@@ -6409,7 +6431,7 @@ type struct CallResolver {
         } else if (!ret.is_valid() && param != null) {
             mut miss: Diagnostic = this.param_member_miss(scope.member_name, scope.member_span, param,
                 this.binding.param_is_bounded(param));
-            miss = miss.help(this.param_bound_help(scope.member_name, param));
+            miss = this.with_member_bound_fix(miss, scope.member_name, param);
             this.refuse_param_path(scope, miss);
         }
         if (!dir.named().is_valid()) { return TypeRef::invalid(); }
@@ -6801,8 +6823,8 @@ type struct CallResolver {
                 fmt::format("`%s` does not implement `%s`", param_display, trait_leaf));
             d = d.at_with_label(scope.scope_span,
                 fmt::format("no bound in scope gives `%s` the trait `%s`", param_display, trait_leaf));
-            d = d.help(fmt::format("add a `where %s: %s` bound", param_display, trait_leaf));
-            this.ctx.emit_diagnostic(d);
+            this.ctx.emit_diagnostic(this.binding.with_bound_fix(d, param, param_display, trait_leaf,
+                Applicability::MachineApplicable));
             return;
         }
         call.template_method = item;
@@ -7267,6 +7289,8 @@ type struct CallResolver {
         d = d.at_with_label(span, "generic, and nothing here says which instance this names");
         d = d.help(fmt::format(
             "write the type arguments, `%s`, or give the binding a function type", with_args));
+        d = d.suggest(Suggestion::single(span, with_args, "write the type arguments",
+            Applicability::HasPlaceholders));
         this.ctx.emit_diagnostic(d);
     }
 
@@ -8909,13 +8933,7 @@ type struct CallResolver {
             fmt::format("required by this bound in `%s`", this.intern.resolve(tmpl.name)));
         d = d.with_note(fmt::format("no bound of this body gives `%s: %s`, so not every copy of it can make the call",
             subject_shown, required));
-        const st: Type* = this.arena.lookup(subject);
-        if (st == null || st.kind != TypeKind::GenericParam) {
-            d = d.help(fmt::format("add the bound: `where %s: %s`", subject_shown, required));
-            this.ctx.emit_diagnostic(d);
-            return;
-        }
-        this.ctx.emit_diagnostic(this.binding.with_bound_fix(d, st.as_generic_param(), subject_shown, required,
+        this.ctx.emit_diagnostic(this.binding.with_bound_fix(d, this.arena.generic_param_or_null(subject), subject_shown, required,
             Applicability::MachineApplicable));
     }
 
@@ -9726,8 +9744,12 @@ type struct CallResolver {
                 owner_str, method_str));
         d = d.at(call_e.span);
         d = d.with_note("the owner type argument would default to `i32` from an unsuffixed literal; a bare literal is no longer accepted as the only source for a generic owner's type argument");
-        d = d.help(fmt::format("write the owner type argument explicitly, e.g. `%s<i64>::%s(...)`, or give the call an expected type (`const x: %s<i64> = ...`)",
+        d = d.help(fmt::format("write the owner type argument explicitly, e.g. `%s::<i64>::%s(...)`, or give the call an expected type (`const x: %s<i64> = ...`)",
             owner_str, method_str, owner_str));
+        if (scope.scope_span.has_location()) {
+            d = d.suggest(Suggestion::single(scope.scope_span.end_point(), "::<i64>",
+                "write the owner's type argument; `i64` is one choice", Applicability::MaybeIncorrect));
+        }
         this.ctx.emit_diagnostic(d);
     }
 
@@ -9884,6 +9906,9 @@ type struct CallResolver {
         d = d.at_with_label(scope_e.span, "generic, and nothing here says which instance this constructs");
         d = d.help(fmt::format(
             "write the type arguments, `%s::<...>::%s%s`, or give the value an expected type", enum_str, member_str, args_tail));
+        if (scope.scope_span.has_location()) {
+            d = d.suggest(CallResolver::type_arguments_fix(scope.scope_span, "..."));
+        }
         this.ctx.emit_diagnostic(d);
     }
 

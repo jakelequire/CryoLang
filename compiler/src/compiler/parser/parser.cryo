@@ -788,14 +788,22 @@ implement struct Parser {
 
     /// Refuse a form the language does not have where it is written (E0117):
     /// "`form` is not part of Cryo", the span labelled with what the form is,
-    /// and a help line saying what to write instead.  The caller consumes the
-    /// form and parses on, so what follows it is still checked.
-    refuse_removed_form(mut &this, span: SourceSpan, form: string, label: string, help: string) -> void {
+    /// and a help line saying what to write instead.  Where that is one edit,
+    /// `replacement` is the text written in the form's place (`exact` when
+    /// it means what the form did); empty when the fix is no single edit,
+    /// and `example` then shows the shape Cryo writes it in.  The caller
+    /// consumes the form and parses on, so what follows it is still checked.
+    refuse_removed_form(mut &this, span: SourceSpan, form: string, label: string, help: string,
+                        replacement: string, exact: boolean, example: string) -> void {
         this.error_count += 1;
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0117_REMOVED_FORM,
             fmt::format("`%s` is not part of Cryo", form));
         diag = diag.at_with_label(span, label);
-        diag = diag.help(help);
+        diag = if (example != "") { diag.help_with_example(help, example) } else { diag.help(help) };
+        if (replacement != "") {
+            diag = diag.suggest(Suggestion::single(span, replacement, fmt::format("write `%s`", replacement),
+                if (exact) { Applicability::MachineApplicable } else { Applicability::MaybeIncorrect }));
+        }
         this.ctx.emit_diagnostic(diag);
     }
 
@@ -811,7 +819,8 @@ implement struct Parser {
         this.refuse_removed_form(span,
             if (is_block) { "protected:" } else { "protected" },
             "a visibility no declaration has",
-            if (is_block) { "write `private:` or `public:`" } else { "write `private` or `public`" });
+            if (is_block) { "write `private:` or `public:`" } else { "write `private` or `public`" },
+            if (is_block) { "private:" } else { "private" }, false, "");
     }
 
     /// At a `virtual` or `override` member modifier: refuse it and consume
@@ -820,7 +829,8 @@ implement struct Parser {
         if (!this.at_removed_modifier(TokenType::KwVirtual) && !this.at_removed_modifier(TokenType::KwOverride)) { return; }
         const tok: Token = this.advance();
         this.refuse_removed_form(this.span_from_token(tok), tok.lexeme, "a method modifier",
-            "declare the method in a trait and implement it");
+            "declare the method in a trait and implement it", "", false,
+            "type trait Shape {\n    area(&this) -> f64;\n}\nimplement trait Shape for struct Circle {\n    area(&this) -> f64 { ... }\n}");
     }
 
     /// Whether the cursor is at keyword `kw` used as a modifier, not as the
@@ -1098,7 +1108,7 @@ implement struct Parser {
         const kw: Token = this.advance();    // consume 'struct' (or 'class')
         if (kw.kind == TokenType::KwClass) {
             this.refuse_removed_form(SourceSpan::covering(this.span_from_token(start), this.span_from_token(kw)),
-                "type class", "a class", "declare a struct and implement a trait");
+                "type class", "a class", "declare a struct and implement a trait", "type struct", false, "");
         }
 
         const name_tok: Token = this.consume(TokenType::Identifier, "struct name");
@@ -1126,7 +1136,8 @@ implement struct Parser {
             const base_text: string = this.current().lexeme;
             this.parse_type_annotation();
             this.refuse_removed_form(this.span_from(colon),
-                ": " + base_text, "a base list", "hold the shared part in a field, its methods in a trait");
+                ": " + base_text, "a base list", "hold the shared part in a field, its methods in a trait", "", false,
+                "type struct Derived {\n    base: " + base_text + ";\n    ...\n}");
         }
 
         // `with [...]`, then a `where` clause on the declaration's own
@@ -1380,7 +1391,8 @@ implement struct Parser {
         const func_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(func), this.span_from_token(start));
         this.parse_function_param_list_into(func_decl);
         this.refuse_removed_form(this.span_from(start), start.lexeme + "(..)", "a constructor",
-            "write a `static new` factory");
+            "write a `static new` factory", "", false,
+            "static new(...) -> " + start.lexeme + " {\n    return " + start.lexeme + " { ... };\n}");
         if (this.check(TokenType::Colon)) {
             const colon: Token = this.advance();
             const base_tok: Token = this.consume(TokenType::Identifier, "base name");
@@ -1391,7 +1403,8 @@ implement struct Parser {
             }
             this.consume(TokenType::RParen, "`)`");
             this.refuse_removed_form(this.span_from(colon), ": " + base_tok.lexeme + "(..)",
-                "a base-constructor initializer", "build the shared field in the factory");
+                "a base-constructor initializer", "build the shared field in the factory", "", false,
+                "return Derived { base: " + base_tok.lexeme + "::new(...), ... };");
         }
         if (this.match_tok(TokenType::Arrow)) { this.parse_type_annotation(); }
         if (this.check(TokenType::LBrace)) { this.parse_block_statement(); }
@@ -1405,7 +1418,8 @@ implement struct Parser {
         this.consume(TokenType::LParen, "`(`");
         this.consume(TokenType::RParen, "`)`");
         this.refuse_removed_form(this.span_from(start), "~" + name_tok.lexeme + "()", "a destructor",
-            "implement `Drop`");
+            "implement `Drop`", "", false,
+            "implement trait Drop for struct " + name_tok.lexeme + " {\n    drop(mut &this) -> void { ... }\n}");
         if (this.match_tok(TokenType::Equal)) {
             if (this.check(TokenType::KwDefault)) { this.advance(); }
             this.consume(TokenType::Semicolon, "`;`");
@@ -2102,7 +2116,7 @@ implement struct Parser {
             this.advance();
             this.refuse_removed_form(span, "public module",
                 "a module is public unless it is declared `internal module`",
-                "write `module` without `public`");
+                "write `module` without `public`", "module", true, "");
         }
         this.consume(TokenType::KwModule, "`module`");
         mut modules: [mut DeclarationNode*] = [];
@@ -2302,9 +2316,10 @@ implement struct Parser {
             const tag: Token = this.advance();
             if (trait_ann == null) {
                 this.refuse_removed_form(SourceSpan::covering(this.span_from_token(start), this.span_from_token(tag)),
-                    "implement class", "a class", "write `implement struct`");
+                    "implement class", "a class", "write `implement struct`", "implement struct", true, "");
             } else {
-                this.refuse_removed_form(this.span_from_token(tag), "for class", "a class", "write `for struct`");
+                this.refuse_removed_form(this.span_from_token(tag), "for class", "a class", "write `for struct`",
+                    "struct", true, "");
             }
         } else if (this.check(TokenType::KwEnum) || this.check(TokenType::KwStruct)
             || this.check(TokenType::KwUnion)) {

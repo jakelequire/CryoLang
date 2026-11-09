@@ -2463,9 +2463,10 @@ type struct SemaVisitor {
             bound = fmt::format("%s<%s>", trait_path, shown).into_raw();
             applicability = Applicability::MaybeIncorrect;
         } else if (arity != 0) {
-            bound = "";
+            bound = fmt::format("%s<...>", trait_path).into_raw();
+            applicability = Applicability::HasPlaceholders;
         }
-        if (!receives || bound == "") {
+        if (!receives) {
             diag = diag.help(fmt::format("add the bound: `where %s: %s`", shown, trait_path));
             this.ctx.emit_diagnostic(diag);
             return true;
@@ -3395,6 +3396,8 @@ type struct SemaVisitor {
                         this.arena.resolve_display_name_short(operand_type)));
                 diag = diag.at_with_label(e.span, "a slice read out of its reference");
                 diag = diag.help("use the reference itself: its methods, `[i]` and `length()` reach the elements");
+                diag = diag.suggest(Suggestion::single(e.span.up_to(unary.operand.span), "",
+                    "use the reference itself", Applicability::MaybeIncorrect));
                 this.ctx.emit_diagnostic(diag);
                 return TypeRef::invalid();
             }
@@ -3623,7 +3626,8 @@ type struct SemaVisitor {
                     shown_from, shown_to, shown_value, shown_trait));
             d = d.at(expr.span);
             if (!this.arena.is_this_placeholder(value_t.as_generic_param())) {
-                d = d.help(fmt::format("bound it where it is declared: `where %s: %s`", shown_value, shown_trait));
+                d = this.binding.with_bound_fix(d, value_t.as_generic_param(), shown_value, shown_trait,
+                    Applicability::MachineApplicable);
             }
             this.ctx.emit_diagnostic(d);
             return TraitConversionOutcome::Refused;
@@ -3930,8 +3934,10 @@ type struct SemaVisitor {
                 "invalid cast between an aggregate type (struct/tuple/array) and a scalar or pointer: there is no valid representation for this conversion");
             d = d.at(e.span);
             if (this.cast_shape_kind(to_ty) == TypeKind::Pointer && this.cast_shape_kind(from_ty).is_aggregate_value()) {
-                d = d.help(fmt::format("a `%s` value is not an address; to point at its storage, cast its address: `&value as %s`",
-                    this.arena.resolve_display_name_short(from_ty), this.types.type_display_name(to_ty)));
+                d = d.help(fmt::format("a `%s` value is not an address; to point at its storage, cast its address",
+                    this.arena.resolve_display_name_short(from_ty)));
+                d = d.suggest(Suggestion::single(cast.expression.span.start_point(), "&",
+                    "cast the value's address", Applicability::MaybeIncorrect));
             }
             this.ctx.emit_diagnostic(d);
         } else if (from_ty.is_valid() && to_ty.is_valid()
@@ -4702,8 +4708,9 @@ type struct SemaVisitor {
                         fmt::format("the `?` operator cannot convert the error `%s` into `%s`", from_shown, to_shown));
                     if (by_bound) {
                         diag = diag.at_with_label(e.span, fmt::format("no `where` bound gives `%s: From<%s>`", to_shown, from_shown));
-                        diag = diag.help(fmt::format("add `where %s: From<%s>` to the function, or convert the error with `map_err` before the `?`",
-                            to_shown, from_shown));
+                        diag = diag.help("a bound giving the conversion lets `?` make it; the error can also be converted with `map_err` before the `?`");
+                        diag = this.binding.with_bound_fix(diag, this.arena.generic_param_or_null(to_error), to_shown,
+                            fmt::format("From<%s>", from_shown).into_raw(), Applicability::MachineApplicable);
                     } else {
                         diag = diag.at_with_label(e.span, fmt::format("`%s` does not implement `From<%s>`", to_shown, from_shown));
                         diag = diag.help(fmt::format("implement `From<%s>` for `%s`, or convert the error with `map_err` before the `?`",
