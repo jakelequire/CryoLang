@@ -307,7 +307,7 @@ type struct LambdaSynth {
     /// Synthesise the closure-struct + `__call__` (+ `Drop` for non-Copy captures)
     /// for a capturing lambda written at `span`; returns the closure struct's
     /// TypeRef.
-    synthesize_closure_struct(mut &this, lambda: LambdaExpr*, span: SourceSpan) -> TypeRef {
+    synthesize_closure_struct(mut &this, lambda: mut LambdaExpr*, span: SourceSpan) -> TypeRef {
         const ctx_ptr: mut CompilationContext* = this.ctx;
         const intern_ptr: mut InternTable* = this.intern;
         const arena_ptr: mut TypeArena* = this.arena;
@@ -333,6 +333,23 @@ type struct LambdaSynth {
                 if (arena_ptr.holds_frame_borrow(lambda.captured_types[i])) { borrows_frame = true; }
             }
         }
+        // Each field's initializer where the closure is made: the binding
+        // itself, or its address for a borrowed capture.
+        mut capture_values: [mut ExpressionNode*] = [];
+        for (mut i: i64 = 0; i < lambda.captured_names.length(); i++) {
+            mut value: mut ExpressionNode* = ExpressionNode::identifier_expr(
+                lambda.captured_names[i], lambda.captured_spans[i]);
+            ExpressionNode::identifier_of(value).set_res(Res::Local(lambda.captured_syms[i]));
+            value.set_resolved_type(lambda.captured_types[i]);
+            if (lambda.borrows_capture(i)) {
+                const amp: Token = Token::new(TokenType::Amp, "&",
+                    lambda.captured_spans[i].start_line as int, lambda.captured_spans[i].start_col as int);
+                value = ExpressionNode::synthetic_unary(amp, value, lambda.captured_spans[i]);
+                value.set_resolved_type(field_types[i]);
+            }
+            capture_values.push(value);
+        }
+        lambda.capture_values = capture_values;
         for (mut i: i64 = 0; i < lambda.captured_names.length(); i++) {
             mut field: mut FieldDecl* = FieldDecl::new(lambda.captured_names[i]);
             field.visibility = Visibility::Public;

@@ -1846,6 +1846,15 @@ type struct AsyncLower {
             }
             return false;
         }
+        // A closure reads what it captures where it is made; its body is a
+        // function of its own.
+        const read_lambda: LambdaExpr* = ExpressionNode::lambda_of(e);
+        if (read_lambda != null) {
+            for (mut i: i64 = 0; i < read_lambda.capture_values.length(); i++) {
+                if (this.name_read_in_expr(read_lambda.capture_values[i], key)) { return true; }
+            }
+            return false;
+        }
         return false;
     }
 
@@ -2211,6 +2220,16 @@ type struct AsyncLower {
                 me.arms[i].guard = this.subst_name_expr(me.arms[i].guard, key, field,
                                                        struct_ref, ty, span, false);
                 this.subst_nested_stmt(me.arms[i].body, key, field, struct_ref, ty, span);
+            }
+            return e;
+        }
+        // A capture initializes a field of the closure, as a struct literal's
+        // field initializer does; a borrowed one is `&name`.
+        mut subst_lambda: mut LambdaExpr* = ExpressionNode::lambda_of(e);
+        if (subst_lambda != null) {
+            for (mut i: i64 = 0; i < subst_lambda.capture_values.length(); i++) {
+                subst_lambda.capture_values[i] = this.subst_name_expr(subst_lambda.capture_values[i],
+                    key, field, struct_ref, ty, span, true);
             }
             return e;
         }
@@ -4713,6 +4732,14 @@ type struct AsyncLower {
             }
             return;
         }
+        // Positions `subst_name_expr` substitutes a closure's captures in.
+        const use_lambda: LambdaExpr* = ExpressionNode::lambda_of(e);
+        if (use_lambda != null) {
+            for (mut i: i64 = 0; i < use_lambda.capture_values.length(); i++) {
+                this.mark_last_use_expr(use_lambda.capture_values[i], key, true, out);
+            }
+            return;
+        }
         // Anything else: a mention can only be a read of the value in place.
         if (this.name_read_in_expr(e, key)) { *out = 1; }
     }
@@ -6890,6 +6917,9 @@ type struct AsyncLower {
             const f: SymbolStr = map.fresh_of(lam.captured_syms[i]);
             if (f.is_valid()) { lam.captured_names[i] = f; }
         }
+        for (mut i: i64 = 0; i < lam.capture_values.length(); i++) {
+            this.rn_expr(map, lam.capture_values[i]);
+        }
         this.rn_stmt(map, lam.body);
     }
 
@@ -7204,12 +7234,15 @@ type struct AsyncLower {
     /// that builds the closure is recorded against them.  Its own body is not
     /// walked: it became `__call__`, a function of its own, whose capture
     /// shadows carry the identities the body's uses already name.
-    rb_lambda(mut &this, ctx: RebindCtx*, lam: mut LambdaExpr*) -> void {
+    rb_lambda(mut &this, ctx: mut RebindCtx*, lam: mut LambdaExpr*) -> void {
         if (lam == null) { return; }
         for (mut i: i64 = 0; i < lam.captured_syms.length(); i++) {
             mut found: boolean = false;
             const s: SymbolID = this.rb_lookup(ctx, lam.captured_syms[i], &found);
             if (found && s.is_valid()) { lam.captured_syms[i] = s; }
+        }
+        for (mut i: i64 = 0; i < lam.capture_values.length(); i++) {
+            this.rb_expr(ctx, lam.capture_values[i]);
         }
     }
 

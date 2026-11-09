@@ -285,6 +285,7 @@ type struct ExpressionNode {
             captured_types:  [],
             captured_spans:  [],
             captured_by_reference: [],
+            capture_values:  [],
             is_move:         false,
         }), span);
     }
@@ -1515,12 +1516,25 @@ type struct LambdaExpr {
     // without `move` borrows each capture that is not `Copy`; every other
     // capture is held by value.
     captured_by_reference: [boolean];
+    // Parallel to the arrays above, once the closure struct exists: the
+    // expression each field of the closure is initialized from where the
+    // closure is made - the captured binding, or `&binding` for a borrowed
+    // capture.  These are the closure's operands in the enclosing body, so
+    // every pass that rewrites or tracks a use there (the async lowering
+    // moving a local into its future, the move and drop passes) sees them
+    // and codegen emits what those passes left; a field initializer built
+    // later from the capture's name would name a binding a rewrite has
+    // since removed.
+    capture_values:  [mut ExpressionNode*];
     // `move (...) -> T { ... }`: the closure takes ownership of what it
     // captures - each non-Copy capture is moved in where the closure is made,
     // and the closure struct's `Drop` releases it.
     is_move:         boolean;
 
     static walk_children<V>(n: LambdaExpr*, v: mut &V) -> void where V: Walk {
+        for (mut i: i64 = 0; i < n.capture_values.length(); i++) {
+            v.walk_expr(n.capture_values[i]);
+        }
         for (mut i: i64 = 0; i < n.parameters.length(); i++) {
             v.walk_decl(n.parameters[i] as DeclarationNode*);
         }

@@ -1,0 +1,97 @@
+namespace ClosureOwnedCaptureAcrossAwait;
+
+import std::core::drop::{ Drop };
+import std::collections::string::{ String };
+import std::future::{ PendingThenReady, block_on };
+
+mut drops: i32 = 0;
+
+type struct Counted {
+    v: i64;
+}
+
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void { drops = drops + 1; }
+}
+
+function step(n: i64) -> PendingThenReady<i64> { return PendingThenReady::<i64>::new(2, n); }
+
+// The closure owns the string; the call after the suspend reads it.
+async function string_across(k: i64) -> i64 {
+    const s: String = String::from("abc");
+    const f = move () -> i64 { return s.length() as i64 + k; };
+    const extra: i64 = await step(1);
+    return f() + extra;
+}
+
+// The owned value is released once, by the closure, when the future ends.
+async function counted_across() -> i64 {
+    const c: Counted = Counted { v: 5 };
+    const f = move () -> i64 { return c.v; };
+    const extra: i64 = await step(10);
+    const before_end: i64 = drops as i64;
+    return f() + extra + before_end * 1000;
+}
+
+// Called before, between and after two suspends.
+async function across_two() -> i64 {
+    const c: Counted = Counted { v: 3 };
+    const f = move () -> i64 { return c.v; };
+    mut total: i64 = f();
+    total = total + await step(100);
+    total = total + f();
+    total = total + await step(1000);
+    return total + f();
+}
+
+// A value carried across one suspend is moved into a closure made after it,
+// which is called after a second.
+async function made_after_suspend() -> i64 {
+    const s: String = String::from("abcd");
+    const first: i64 = await step(1);
+    const f = move () -> i64 { return s.length() as i64; };
+    const second: i64 = await step(2);
+    return f() * 100 + first * 10 + second;
+}
+
+// A closure that borrows, made and called between two suspends; the
+// variable is still the frame's afterwards.
+async function borrowed_then_suspend() -> i64 {
+    const c: Counted = Counted { v: 7 };
+    const s: String = String::from("xy");
+    const before: i64 = await step(1);
+    const read = () -> i64 { return c.v + s.length() as i64; };
+    const first: i64 = read();
+    const after: i64 = await step(2);
+    return first * 100 + c.v * 10 + s.length() as i64 + before + after;
+}
+
+// Never called: still released once.
+async function never_called() -> i64 {
+    const c: Counted = Counted { v: 9 };
+    const _f = move () -> i64 { return c.v; };
+    return await step(4);
+}
+
+function main() -> i32 {
+    if (block_on(string_across(10)) != 14) { return 1; }
+
+    drops = 0;
+    if (block_on(counted_across()) != 15) { return 2; }
+    if (drops != 1) { return 3; }
+
+    drops = 0;
+    if (block_on(across_two()) != 1109) { return 4; }
+    if (drops != 1) { return 5; }
+
+    if (block_on(made_after_suspend()) != 412) { return 6; }
+
+    drops = 0;
+    if (block_on(borrowed_then_suspend()) != 975) { return 7; }
+    if (drops != 1) { return 8; }
+
+    drops = 0;
+    if (block_on(never_called()) != 4) { return 9; }
+    if (drops != 1) { return 10; }
+    return 0;
+}

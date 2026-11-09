@@ -18,8 +18,7 @@ import compiler::codegen::{ context, llvm, llvm_types, util };
 import compiler::codegen::state::visitor_state::{ Emitted, VisitorState };
 import compiler::compilation_context::{ CompilationContext };
 import compiler::diag::{ ErrorCode };
-import compiler::types::{ type_ref, resolver, RefMutability };
-import compiler::lex::{ Token, TokenType };
+import compiler::types::{ type_ref, resolver };
 import compiler::ast::{ declaration, expression, MemberPin, node, statement };
 import compiler::resolver::{ symbol_str, intern_table };
 import compiler::types::arena::{ TypeArena };
@@ -35,7 +34,6 @@ import compiler::codegen::context::{ CodegenContext };
 import compiler::codegen::llvm_types::{ LBasicBlock, LType, LTypeKind, LValue };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
-import compiler::resolver::res::{ Res };
 import compiler::types::resolver::{ ResolutionContext };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::resolver::mangled_name::{ MangledName };
@@ -263,9 +261,8 @@ type struct LambdaEmitter {
     /// type Sema stamped as the lambda's resolved type, with each field
     /// initialised from the corresponding captured local in scope.  Built
     /// as a transient struct literal so the normal struct-literal
-    /// codegen path handles the alloca + GEP-store sequence; we just
-    /// supply identifier-node initialisers, each stamped with its capture's
-    /// binding, whose lookups land on the outer function's allocas.
+    /// codegen path handles the alloca + GEP-store sequence, from the
+    /// lambda's `capture_values` as the passes before codegen left them.
     ///
     /// No anonymous function is emitted from this site: the lambda's body
     /// lives on the synthesised `<closure_struct>::__call__` method,
@@ -290,26 +287,14 @@ type struct LambdaEmitter {
         lit_e.set_resolved_type(closure_ty);
         mut lit: mut StructExpr* = ExpressionNode::struct_of(lit_e);
 
-        for (mut i: i64 = 0; i < node.captured_names.length(); i++) {
-            const cap_name: SymbolStr = node.captured_names[i];
-            const cap_ty:   TypeRef   = node.captured_types[i];
-            mut ident: mut ExpressionNode* = ExpressionNode::identifier_expr(cap_name, e.span);
-            ExpressionNode::identifier_of(ident).set_res(Res::Local(node.captured_syms[i]));
-            ident.set_resolved_type(cap_ty);
-            // A borrowed capture's field holds the binding's address.
-            if (node.borrows_capture(i)) {
-                const amp: Token = Token::new(TokenType::Amp, "&",
-                    e.span.start_line as int, e.span.start_col as int);
-                ident = ExpressionNode::synthetic_unary(amp, ident, e.span);
-                ident.set_resolved_type(this.cg.ctx.type_arena.get_reference_to(cap_ty, RefMutability::Immutable));
-            }
+        for (mut i: i64 = 0; i < node.capture_values.length(); i++) {
             // The closure struct's fields ARE the captures, in this order
             // (`LambdaSynth::synthesize_closure_struct`), so the field this
             // initializer names is the i-th; a literal minted after the last
             // sema walk carries its own answer.
             const init: FieldInit = FieldInit {
-                field_name: cap_name,
-                value:      ident,
+                field_name: node.captured_names[i],
+                value:      node.capture_values[i],
                 span:        e.span,
                 pin:         MemberPin::Field(i),
                 pin_carried: false,
