@@ -1,0 +1,82 @@
+/// A generic `async function` may hold a tuple or a function value across an
+/// `await`: each is carried in the future's frame, spelled in the body's own
+/// type parameters, and read after the suspend in every instantiation. Each
+/// tuple is built from locals: one built from the function's parameters is
+/// refused (E0452 at the function's name), which is a separate defect. The
+/// exit code names the first check that failed; 0 means all held.
+namespace GenericAsyncCarriesTupleAndFunction;
+
+import std::core::drop::{ Drop };
+import std::collections::string::{ String };
+import std::future::{ PendingThenReady, block_on };
+import std::ffi::libc;
+
+mut drops: i32 = 0;
+
+type struct Counted {
+    v: i64;
+}
+
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void { drops = drops + 1; }
+}
+
+function step(n: i64) -> PendingThenReady<i64> { return PendingThenReady::<i64>::new(2, n); }
+
+function twice_i64(x: i64) -> i64 { return x * 2; }
+function twice_i32(x: i32) -> i32 { return x * 2; }
+
+// A tuple of the parameter's type, built before the suspend and read after.
+async function pair_across<T>(a: T, b: T) -> (T, T) {
+    const first: T = a;
+    const second: T = b;
+    const pair: (T, T) = (second, first);
+    await step(1);
+    return pair;
+}
+
+// A function value over the parameter's type, called after the suspend.
+async function apply_across<T>(f: (T) -> T, x: T) -> T {
+    const g: (T) -> T = f;
+    await step(3);
+    return g(x);
+}
+
+// A tuple holding an owned value of the parameter's type and a count: the
+// owned element is released once, when the future ends.
+async function owned_tuple_across<T>(t: T) -> i64 {
+    const owned: T = t;
+    const held: (T, i64) = (owned, 40);
+    const extra: i64 = await step(2);
+    return held.1 + extra;
+}
+
+// A tuple holding a function value, carried across two suspends.
+async function tuple_of_function<T>(f: (T) -> T, x: T) -> T {
+    const value: T = x;
+    const both: ((T) -> T, T) = (f, value);
+    await step(1);
+    await step(2);
+    const g: (T) -> T = both.0;
+    return g(both.1);
+}
+
+function main() -> int {
+    const p: (i64, i64) = block_on(pair_across::<i64>(1, 2));
+    if (p.0 != 2 || p.1 != 1) { return 1; }
+    const q: (String, String) = block_on(pair_across::<String>(String::from("a"), String::from("bc")));
+    if (q.0.length() != 2 || q.1.length() != 1) { return 2; }
+
+    if (block_on(apply_across::<i64>(twice_i64, 21)) != 42) { return 3; }
+    if (block_on(apply_across::<i32>(twice_i32, 8)) != 16) { return 4; }
+
+    if (block_on(owned_tuple_across::<Counted>(Counted { v: 1 })) != 42) { return 5; }
+    if (drops != 1) { return 6; }
+    if (block_on(owned_tuple_across::<i32>(5)) != 42) { return 7; }
+
+    if (block_on(tuple_of_function::<i64>(twice_i64, 5)) != 10) { return 8; }
+    if (block_on(tuple_of_function::<i32>(twice_i32, 6)) != 12) { return 9; }
+
+    libc::printf("generic async carries ok\n");
+    return 0;
+}
