@@ -1162,6 +1162,20 @@ type struct IRGeneratorVisitor {
     visit_var(mut &this, decl: DeclarationNode*, node: VarDecl*) -> Emitted {
         mut out: Emitted = Emitted::none();
         if (node.is_global) { return out; }
+        // A capture's shadow inside a closure's `__call__` names the captured
+        // place itself - the closure's field, or what a borrowed field points
+        // at - not a copy of it: `&x` in the body, and a closure nested in
+        // the body borrowing `x`, must reach the binding the closure
+        // captured, which a copy in this frame is not.
+        if (node.is_capture_alias) {
+            const place: Emitted = this.dispatch.generate_expression(this, node.initializer);
+            if (!place.is_lvalue || !place.value.is_valid()) {
+                this.cg.ctx.ice_at("a closure capture's shadow was initialized from something that is not a place", decl.span);
+                return out;
+            }
+            this.cg.values.set(node.sym_id, place.value);
+            return out;
+        }
         mut init_val: LValue = LValue::null();
         const has_init: boolean = node.initializer != null;
         if (has_init) {

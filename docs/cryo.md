@@ -500,6 +500,13 @@ becoming a closure. How the closure holds what it captures is decided by
   where the closure is made - using it afterwards is E0452 - and the closure
   releases the value when the closure itself is released.
 
+Inside the closure's body, a captured value that is not `Copy` **is** the
+captured place: the variable a closure without `move` borrows, or the value a
+`move` closure owns - never a copy of it in the body's own frame. So `&name`
+in the body is the address of that place, and a closure written inside the
+body that borrows `name` borrows the same place, however deeply the closures
+nest. A `Copy` capture is the closure's own copy.
+
 ```cryo
 const bias: i32 = 10;
 const add_bias = (x: i32) -> i32 { return x + bias; };  // copies `bias`

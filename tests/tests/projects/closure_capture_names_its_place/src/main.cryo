@@ -1,0 +1,118 @@
+namespace ClosureCaptureNamesItsPlace;
+
+import std::core::drop::{ Drop };
+
+mut drops: i32 = 0;
+
+type struct Counted {
+    v: i32;
+}
+
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void { drops = drops + 1; }
+}
+
+function address_of(c: &Counted) -> u64 { return (c as const Counted*) as u64; }
+
+function call<F>(f: F) -> u64 where F: () -> u64 { return f(); }
+
+function nested_in_generic<T>(t: T) -> boolean {
+    const at: u64 = (&t as const T*) as u64;
+    const outer = () -> boolean {
+        const inner = () -> u64 { return (&t as const T*) as u64; };
+        return inner() == at;
+    };
+    return outer();
+}
+
+function main() -> i32 {
+    // A borrowed capture is the variable itself inside the closure's body.
+    drops = 0;
+    {
+        const c: Counted = Counted { v: 1 };
+        const f = () -> u64 { return address_of(&c); };
+        if (f() != address_of(&c)) { return 1; }
+    }
+    if (drops != 1) { return 2; }
+
+    // A closure nested in a closure borrows the variable the outer one
+    // borrows, not a copy in the outer closure's frame.
+    drops = 0;
+    {
+        const c: Counted = Counted { v: 2 };
+        const outer = () -> u64 {
+            const inner = () -> u64 { return address_of(&c); };
+            return inner();
+        };
+        if (outer() != address_of(&c)) { return 3; }
+        if (call(outer) != address_of(&c)) { return 4; }
+    }
+    if (drops != 1) { return 5; }
+
+    // Three deep, each level reaching the same variable.
+    drops = 0;
+    {
+        const c: Counted = Counted { v: 3 };
+        const outer = () -> u64 {
+            const middle = () -> u64 {
+                const inner = () -> u64 { return address_of(&c); };
+                return inner();
+            };
+            return middle();
+        };
+        if (outer() != address_of(&c)) { return 6; }
+    }
+    if (drops != 1) { return 7; }
+
+    // A nested closure reads the variable as it is when it is called.
+    drops = 0;
+    {
+        mut c: Counted = Counted { v: 4 };
+        const outer = () -> i32 {
+            const inner = () -> i32 { return c.v; };
+            return inner();
+        };
+        c.v = 40;
+        if (outer() != 40) { return 8; }
+        c.v = 41;
+        if (outer() != 41) { return 9; }
+    }
+    if (drops != 1) { return 10; }
+
+    // Inside a `move` closure, a nested closure borrows the value the outer
+    // closure owns - the same place the outer body names - and the value is
+    // released once, with the outer closure.
+    drops = 0;
+    {
+        const d: Counted = Counted { v: 5 };
+        const owner = move () -> i32 {
+            const here: u64 = address_of(&d);
+            const inner = () -> u64 { return address_of(&d); };
+            if (inner() != here) { return 0; }
+            const read = () -> i32 { return d.v; };
+            return read();
+        };
+        if (owner() != 5) { return 11; }
+        if (owner() != 5) { return 12; }
+        if (drops != 0) { return 13; }
+    }
+    if (drops != 1) { return 14; }
+
+    // A `Copy` capture is still copied where each closure is made.
+    {
+        mut n: i32 = 6;
+        const outer = () -> i32 {
+            const inner = () -> i32 { return n; };
+            return inner();
+        };
+        n = 60;
+        if (outer() != 6) { return 15; }
+    }
+
+    // The same in a generic body, for two types that are not `Copy`.
+    if (!nested_in_generic::<[i32]>([7, 70])) { return 16; }
+    drops = 0;
+    if (!nested_in_generic::<Counted>(Counted { v: 8 })) { return 17; }
+    if (drops != 1) { return 18; }
+    return 0;
+}
