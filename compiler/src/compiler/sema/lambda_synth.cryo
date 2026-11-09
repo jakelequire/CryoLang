@@ -889,28 +889,21 @@ type struct LambdaSynth {
         return decl_index.defs.span_of(decl_index.registered_def(closure_ty));
     }
 
-    /// The suggestion to write `move` before the closure of type
-    /// `closure_ty`, so it owns what it captures; none when the closure has
-    /// no place to write it.
-    static own_captures_fix(decl_index: DeclarationIndex*, closure_ty: TypeRef) -> Option<Suggestion> {
-        const site: SourceSpan = LambdaSynth::closure_site(decl_index, closure_ty);
-        if (!site.has_location()) { return Option::None; }
-        return Option::Some(Suggestion::single(site.start_point(), "move ",
-            "make the closure own what it captures: a `move` closure takes each captured value where it is made",
-            Applicability::MaybeIncorrect));
+    /// The advice to make a borrowing closure own what it captures.  No edit
+    /// is offered: a `move` closure moves every capture that is not `Copy`,
+    /// so a later use of one in the function becomes a use after move.
+    static own_captures_help() -> string {
+        return "make the closure own what it captures: a `move` closure takes each captured value where it is made, so the function cannot use those values after it";
     }
 
-    /// `d` with the fix writing `move` before the first closure `held_ty`
-    /// holds that borrows from its frame; `d` unchanged when it holds none.
-    static with_own_captures_fix(d: Diagnostic, decl_index: DeclarationIndex*, arena: TypeArena*,
-                                 held_ty: TypeRef) -> Diagnostic {
+    /// `d` with the advice to make the first closure `held_ty` holds that
+    /// borrows from its frame own its captures; `d` unchanged when it holds
+    /// none.
+    static with_own_captures_help(d: Diagnostic, arena: TypeArena*, held_ty: TypeRef) -> Diagnostic {
         mut borrowing: [TypeRef] = [];
         arena.frame_borrowing_closures(held_ty, &borrowing);
         if (borrowing.length() == 0) { return d; }
-        return match (LambdaSynth::own_captures_fix(decl_index, borrowing[0])) {
-            Option::Some(fix) => { d.suggest(fix) }
-            Option::None      => { d }
-        };
+        return d.help(LambdaSynth::own_captures_help());
     }
 
     /// E0457 when the value of type `value_ty` returned at `span` holds a
@@ -929,10 +922,7 @@ type struct LambdaSynth {
         }
         diag = diag.with_note(
             "a closure written without `move` borrows each captured value that is not `Copy`, and those values are released when the function returns");
-        match (LambdaSynth::own_captures_fix(this.ctx.decl_index, held[0])) {
-            Option::Some(fix) => { diag = diag.suggest(fix); }
-            Option::None => {}
-        }
+        diag = diag.help(LambdaSynth::own_captures_help());
         this.ctx.emit_diagnostic(diag);
     }
 
@@ -971,9 +961,7 @@ type struct LambdaSynth {
         diag = diag.also_at(closure, "this `move` closure would own it");
         diag = diag.with_note(
             "`thread::scope` joins its threads when its body returns, so only a closure that borrows from the body may use the handle");
-        diag = diag.suggest(Suggestion::single(
-            SourceSpan::new(closure.file, closure.start_line, closure.start_col, closure.start_line, closure.start_col + 5),
-            "", "leave out `move`: the closure then borrows from the scope's body", Applicability::MaybeIncorrect));
+        diag = diag.help("leave out `move`, so the closure borrows from the scope's body");
         this.ctx.emit_diagnostic(diag);
     }
 

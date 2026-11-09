@@ -774,10 +774,8 @@ implement struct Parser {
 
         // Function body or semicolon (forward declaration)
         if (this.check(TokenType::LBrace)) {
-            const this_before: i64 = this.this_written;
             const body: Stmt* = this.parse_block_statement();
             func.set_body(body);
-            func.body_names_this = this.this_written > this_before;
         } else {
             this.consume(TokenType::Semicolon, "`;` or `{`");
         }
@@ -789,10 +787,13 @@ implement struct Parser {
     /// Refuse a form the language does not have where it is written (E0117):
     /// "`form` is not part of Cryo", the span labelled with what the form is,
     /// and a help line saying what to write instead.  Where that is one edit,
-    /// `replacement` is the text written in the form's place (`exact` when
-    /// it means what the form did); empty when the fix is no single edit,
-    /// and `example` then shows the shape Cryo writes it in.  The caller
-    /// consumes the form and parses on, so what follows it is still checked.
+    /// `replacement` is the text written in the form's place, offered as a
+    /// fix when `exact` - it means what the form did; a replacement that
+    /// only may (`protected` to `private`, whose outside users may lose
+    /// access) is left to the help line.  Empty when the fix is no single
+    /// edit, and `example` then shows the shape Cryo writes it in.  The
+    /// caller consumes the form and parses on, so what follows it is still
+    /// checked.
     refuse_removed_form(mut &this, span: SourceSpan, form: string, label: string, help: string,
                         replacement: string, exact: boolean, example: string) -> void {
         this.error_count += 1;
@@ -800,9 +801,8 @@ implement struct Parser {
             fmt::format("`%s` is not part of Cryo", form));
         diag = diag.at_with_label(span, label);
         diag = if (example != "") { diag.help_with_example(help, example) } else { diag.help(help) };
-        if (replacement != "") {
-            diag = diag.suggest(Suggestion::single(span, replacement, fmt::format("write `%s`", replacement),
-                if (exact) { Applicability::MachineApplicable } else { Applicability::MaybeIncorrect }));
+        if (replacement != "" && exact) {
+            diag = diag.suggest(Suggestion::machine_applicable(span, replacement, fmt::format("write `%s`", replacement)));
         }
         this.ctx.emit_diagnostic(diag);
     }
@@ -847,9 +847,7 @@ implement struct Parser {
     /// rules don't drift across the three sites.
     parse_function_param_list_into(mut &this, func_decl: DeclarationNode*) -> void {
         const func: mut FunctionDecl* = DeclarationNode::fn_of(func_decl);
-        const open: SourceSpan = this.span_from_token(this.consume(TokenType::LParen, "`(`"));
-        func.receiver_anchor = SourceSpan::new(open.file, open.start_line, open.end_col,
-                                               open.start_line, open.end_col);
+        this.consume(TokenType::LParen, "`(`");
         if (!this.check(TokenType::RParen)) {
             const params: [DeclarationNode*] = this.parse_parameter_list();
             for (mut i: i64 = 0; i < params.length(); i++) {
@@ -964,25 +962,9 @@ implement struct Parser {
         diag = diag.at_with_label(at, "no receiver written");
         diag = diag.help(
             "write `&this` first among its parameters to read the receiver, `mut &this` to change it, or `this` to take it by value; a method with no receiver is `static`");
-        // A body that never names `this` most likely meant a static method;
-        // one that does needs a receiver, and which one is the author's call
-        // until the body's writes are known.
-        const anchor: SourceSpan = func.receiver_anchor;
-        const separator: string = if (func.parameters.length() > 0) { ", " } else { "" };
-        if (!func.body_names_this && func_decl.name_span.has_location()) {
-            const before_name: SourceSpan = SourceSpan::new(at.file, at.start_line, at.start_col,
-                                                            at.start_line, at.start_col);
-            diag = diag.suggest(Suggestion::single(before_name, "static ",
-                fmt::format("make `%s` static", name), Applicability::MaybeIncorrect));
-        }
-        if (anchor.has_location()) {
-            diag = diag.suggest(Suggestion::single(anchor, fmt::format("&this%s", separator).into_raw(),
-                "read the receiver: `&this`", Applicability::MaybeIncorrect));
-            if (func.body_names_this) {
-                diag = diag.suggest(Suggestion::single(anchor, fmt::format("mut &this%s", separator).into_raw(),
-                    "change the receiver: `mut &this`", Applicability::MaybeIncorrect));
-            }
-        }
+        // No edit is offered: which receiver the method needs - or whether
+        // it is static, which changes how its callers call it - is the
+        // author's choice, not one the declaration settles.
         this.ctx.emit_diagnostic(diag);
         const span: SourceSpan = SourceSpan::new(at.file, at.start_line, at.start_col,
                                                  at.start_line, at.start_col);
@@ -1585,10 +1567,8 @@ implement struct Parser {
 
         // Body or semicolon
         if (this.check(TokenType::LBrace)) {
-            const this_before: i64 = this.this_written;
             const body: Stmt* = this.parse_block_statement();
             func.set_body(body);
-            func.body_names_this = this.this_written > this_before;
         } else {
             this.consume(TokenType::Semicolon, "`;` or `{`");
         }
@@ -2278,7 +2258,7 @@ implement struct Parser {
                 diag = diag.at(sugg_span);
                 diag = diag.with_note("trait impls are written `implement trait <TraitName> for <TypeName> { ... }`; the `trait` keyword distinguishes a trait impl from an inherent impl");
                 diag = diag.with_note("inherent impls (no `for` clause) use `implement <TypeName> { ... }`, optionally with a `struct`/`enum`/`union` kind tag on the target");
-                diag = diag.suggest(Suggestion::replace(sugg_span,
+                diag = diag.suggest(Suggestion::machine_applicable(sugg_span,
                     fmt::format("trait %s", head).into_raw(),
                     "insert `trait` before the trait name"));
                 this.ctx.diagnostics.emit(diag);
@@ -2300,7 +2280,7 @@ implement struct Parser {
                 diag = diag.with_note(fmt::format("the `struct`/`enum`/`union` kind tag is only allowed on the *target* type after `for`; on the trait side, use `trait` (you wrote `implement %s %s for ...`)",
                     tag_tok.lexeme, name_tok.lexeme));
                 diag = diag.with_note("the canonical form is `implement trait <TraitName> for [<KindTag>] <TypeName> { ... }`");
-                diag = diag.suggest(Suggestion::replace(tag_span, "trait",
+                diag = diag.suggest(Suggestion::machine_applicable(tag_span, "trait",
                     fmt::format("replace `%s` with `trait`", tag_tok.lexeme)));
                 this.ctx.diagnostics.emit(diag);
                 this.error_count += 1;
@@ -2991,8 +2971,7 @@ implement struct Parser {
                     mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0101_UNEXPECTED_TOKEN,
                         "a callable bound is written as a function type, with its return type");
                     diag = diag.at_with_label(span, "this names no return type");
-                    diag = diag.suggest(Suggestion::single(span.end_point(), " -> void",
-                        "a callable that returns nothing returns `void`", Applicability::MaybeIncorrect));
+                    diag = diag.help("write its return type after it, `-> void` when the callable returns nothing");
                     this.ctx.diagnostics.emit(diag);
                     this.error_count += 1;
                 } else if (signature != null) {

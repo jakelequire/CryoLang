@@ -2448,8 +2448,8 @@ type struct SemaVisitor {
                 "`%s` is bounded by %s; none of them is `%s` or has it as a supertrait", shown, listed, trait_path));
         }
         // An operator's trait takes the right operand's type, when there is
-        // one, then the result's.  The result is taken to be the parameter
-        // itself, which is a guess, so a bound with arguments may be wrong.
+        // one, then the result's.  What the result is meant to be the use
+        // does not settle, so it is a placeholder for the author.
         const trait_decl: TraitDecl* = this.ctx.generic_registry.lang_trait_decl(map.lang);
         const arity: i64 = if (trait_decl == null) { -1 } else { trait_decl.generic_params.length() };
         const right_t: Type* = this.arena.lookup(right);
@@ -2457,11 +2457,8 @@ type struct SemaVisitor {
         mut bound: string = trait_path;
         mut applicability: Applicability = Applicability::MachineApplicable;
         if (arity == 2 && right_text != "") {
-            bound = fmt::format("%s<%s, %s>", trait_path, right_text, shown).into_raw();
-            applicability = Applicability::MaybeIncorrect;
-        } else if (arity == 1 && !right.is_valid()) {
-            bound = fmt::format("%s<%s>", trait_path, shown).into_raw();
-            applicability = Applicability::MaybeIncorrect;
+            bound = fmt::format("%s<%s, ...>", trait_path, right_text).into_raw();
+            applicability = Applicability::HasPlaceholders;
         } else if (arity != 0) {
             bound = fmt::format("%s<...>", trait_path).into_raw();
             applicability = Applicability::HasPlaceholders;
@@ -3396,8 +3393,6 @@ type struct SemaVisitor {
                         this.arena.resolve_display_name_short(operand_type)));
                 diag = diag.at_with_label(e.span, "a slice read out of its reference");
                 diag = diag.help("use the reference itself: its methods, `[i]` and `length()` reach the elements");
-                diag = diag.suggest(Suggestion::single(e.span.up_to(unary.operand.span), "",
-                    "use the reference itself", Applicability::MaybeIncorrect));
                 this.ctx.emit_diagnostic(diag);
                 return TypeRef::invalid();
             }
@@ -3797,11 +3792,6 @@ type struct SemaVisitor {
                     item.derived_spelling(), written, item.derived_spelling()));
             d = d.at(span);
             d = d.help(fmt::format("implement `%s` by hand, or derive the standard trait under its own name", written));
-            if (node.derived_removal.has_location()) {
-                d = d.suggest(Suggestion::single(node.derived_removal, "",
-                    f"remove `{item.derived_spelling()}` from the `with` clause, and implement `{written}` by hand",
-                    Applicability::MaybeIncorrect));
-            }
             this.ctx.emit_diagnostic(d);
             return false;
         }
@@ -3874,10 +3864,6 @@ type struct SemaVisitor {
         } else {
             d = d.help(f"implement `{trait_name}` for `{owner_name}` by hand, or remove it from the `with` clause");
         }
-        if (removal.has_location()) {
-            d = d.suggest(Suggestion::single(removal, "",
-                f"remove `{trait_name}` from `{owner_name}`'s `with` clause", Applicability::MaybeIncorrect));
-        }
         this.ctx.emit_diagnostic(d);
         return false;
     }
@@ -3936,8 +3922,12 @@ type struct SemaVisitor {
             if (this.cast_shape_kind(to_ty) == TypeKind::Pointer && this.cast_shape_kind(from_ty).is_aggregate_value()) {
                 d = d.help(fmt::format("a `%s` value is not an address; to point at its storage, cast its address",
                     this.arena.resolve_display_name_short(from_ty)));
-                d = d.suggest(Suggestion::single(cast.expression.span.start_point(), "&",
-                    "cast the value's address", Applicability::MaybeIncorrect));
+                // Only a place has an address to take.
+                if (ExpressionNode::identifier_of(cast.expression) != null
+                        || ExpressionNode::member_access_of(cast.expression) != null) {
+                    d = d.suggest(Suggestion::machine_applicable(cast.expression.span.start_point(), "&",
+                        "cast the value's address"));
+                }
             }
             this.ctx.emit_diagnostic(d);
         } else if (from_ty.is_valid() && to_ty.is_valid()
@@ -4636,11 +4626,13 @@ type struct SemaVisitor {
             mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0234_INVALID_TRY_OPERAND,
                 fmt::format("the `?` operator requires a value whose type implements `Try`, but the operand has type `%s`", disp));
             diag = diag.at_with_label(e.span, fmt::format("`%s` does not implement `Try`", disp));
-            // The `?` is the expression's last character.
-            if (e.span.has_location() && e.span.end_col > 0) {
+            // The `?` is the expression's last character.  Deleting it is the
+            // fix only where the operand already has the type expected there.
+            if (e.span.has_location() && e.span.end_col > 0
+                    && this.state.expected_type.is_valid() && this.state.expected_type.equals(operand_type)) {
                 const mark: SourceSpan = SourceSpan::new(e.span.file, e.span.end_line, e.span.end_col - 1,
                                                          e.span.end_line, e.span.end_col);
-                diag = diag.suggest(Suggestion::single(mark, "", "remove the `?`", Applicability::MaybeIncorrect));
+                diag = diag.suggest(Suggestion::machine_applicable(mark, "", "remove the `?`"));
             }
             this.ctx.emit_diagnostic(diag);
             return TypeRef::invalid();

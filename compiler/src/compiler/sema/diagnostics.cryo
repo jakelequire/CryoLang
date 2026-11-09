@@ -228,27 +228,14 @@ type struct Diagnostics {
         const found_kind: TypeKind = this.kind_or_void(found);
         // A value of another number type converts with `as`, as every
         // conversion is written.  It may change the value - a narrower width
-        // truncates, a change of sign reinterprets - so the fix is offered,
-        // not applied.  An operator expression is parenthesized first, since
-        // `as` binds tighter than any operator.
+        // truncates, a change of sign reinterprets - so whether the
+        // conversion is what the author means is not settled here: it is
+        // advice, not an edit.
         const want_numeric:  boolean = want_kind == TypeKind::Int || want_kind == TypeKind::Float;
         const found_numeric: boolean = found_kind == TypeKind::Int || found_kind == TypeKind::Float;
         if (lit == null && want_numeric && found_numeric && value_expr.span.has_location()) {
-            const at: SourceSpan = value_expr.span;
-            const operand: boolean = ExpressionNode::identifier_of(value_expr) != null
-                || ExpressionNode::call_of(value_expr) != null
-                || ExpressionNode::member_access_of(value_expr) != null
-                || ExpressionNode::array_access_of(value_expr) != null;
-            const message: string = fmt::format("convert it with `as %s`", expected_name).into_raw();
-            if (operand) {
-                return diag.suggest(Suggestion::single(at.end_point(), fmt::format(" as %s", expected_name).into_raw(),
-                    message, Applicability::MaybeIncorrect));
-            }
-            mut parts: [SuggestionPart] = [];
-            parts.push(SuggestionPart::new(SourceSpan::new(at.file, at.start_line, at.start_col,
-                                                           at.start_line, at.start_col), "("));
-            parts.push(SuggestionPart::new(at.end_point(), fmt::format(") as %s", expected_name).into_raw()));
-            return diag.suggest(Suggestion::multipart(parts, message, Applicability::MaybeIncorrect));
+            return diag.help(fmt::format("convert it with `as %s`, if a value that may change in the conversion is what is meant",
+                expected_name).into_raw());
         }
         if (lit == null) { return diag; }
 
@@ -504,18 +491,16 @@ type struct Diagnostics {
     /// Attach a note for each shadowed candidate `find_shadowed_type_candidates`
     /// answered with, and the way to reach it: when the file already imports
     /// the candidate's module, a help naming the qualified spelling, which is
-    /// not applied for the user; otherwise a quickfix importing the module
-    /// (MachineApplicable for a single candidate, else MaybeIncorrect).
+    /// not applied for the user; otherwise, for a single candidate, a
+    /// quickfix importing the module.  Among several candidates which one
+    /// is meant is the author's choice, so each is named and none imported.
     attach_shadow_import_suggestions(&this, diag: Diagnostic, simple_name_str: string,
                                      candidates: [ShadowCandidate]) -> Diagnostic {
         if (candidates.length() == 0) { return diag; }
         mut out: Diagnostic = diag;
-        const insert_span: SourceSpan = this.find_import_insertion_span();
-        const apply: Applicability = if (candidates.length() == 1) {
-            Applicability::MachineApplicable
-        } else {
-            Applicability::MaybeIncorrect
-        };
+        const insert_span: SourceSpan = if (candidates.length() == 1) {
+            this.find_import_insertion_span()
+        } else { SourceSpan::none() };
         mut any_to_import: boolean = false;
         for (mut i: i64 = 0; i < candidates.length(); i++) {
             const cand_str: string = candidates[i].path;
@@ -532,7 +517,7 @@ type struct Diagnostics {
             if (insert_span.has_location()) {
                 const insertion: string = fmt::format("\nimport %s;", import_path).into_raw();
                 const msg: string = fmt::format("import `%s`", import_path).into_raw();
-                out = out.suggest(Suggestion::single(insert_span, insertion, msg, apply));
+                out = out.suggest(Suggestion::machine_applicable(insert_span, insertion, msg));
             }
         }
         if (any_to_import) {

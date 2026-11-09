@@ -54,7 +54,7 @@ import compiler::ast::node::{ ProgramNode };
 import compiler::ast::pattern::{ EnumPattern, MatchArmNode, Pattern, PatternKind };
 import compiler::ast::statement::{ Stmt, StmtKind };
 import compiler::diag::diagnostic::{ Diagnostic };
-import compiler::diag::suggestion::{ Applicability, Suggestion };
+import compiler::diag::suggestion::{ Applicability, Suggestion, SuggestionPart };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
@@ -1056,7 +1056,7 @@ type struct MoveChecker {
         if (move_span.has_location()) {
             diag = diag.also_at(move_span, "value moved here");
         }
-        diag = this.with_clone_hint(diag, value_type, move_span);
+        diag = this.with_clone_hint(diag, value_type, move_span, null);
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
@@ -1067,16 +1067,26 @@ type struct MoveChecker {
     /// `Clone` is offered `.clone()` where the value is first moved, which
     /// moves a copy and leaves the original; a struct or enum that does not
     /// is told to implement it.  Unchanged when the program declares no
-    /// `Clone` or the first move has no place.
-    with_clone_hint(&this, diag: Diagnostic, ty: TypeRef, moved_at: SourceSpan) -> Diagnostic {
+    /// `Clone` or the first move has no place.  `moved` is the expression
+    /// moved, or null when the move is of a named variable: one that binds
+    /// looser than a postfix call (`*r`) is bracketed before `.clone()`, or
+    /// the fix would clone the wrong thing.
+    with_clone_hint(&this, diag: Diagnostic, ty: TypeRef, moved_at: SourceSpan,
+                    moved: ExpressionNode*) -> Diagnostic {
         const clone_trait: DefId = this.ctx.generic_registry.wellknown(LangItem::Clone);
         if (!clone_trait.is_valid() || !ty.is_valid() || !moved_at.has_location()) { return diag; }
         const shown: string = this.arena.resolve_display_name_short(ty);
         mut checker: TraitChecker = TraitChecker::new(
             this.arena, this.registry, this.intern, this.ctx.diagnostics);
         if (checker.type_implements_trait(ty, clone_trait, 0)) {
-            return diag.suggest(Suggestion::machine_applicable(moved_at.end_point(), ".clone()",
-                fmt::format("`%s` implements `Clone`: move a copy where the value is first moved", shown)));
+            const message: string = fmt::format("`%s` implements `Clone`: move a copy where the value is first moved", shown).into_raw();
+            if (moved == null || moved.takes_postfix_directly()) {
+                return diag.suggest(Suggestion::machine_applicable(moved_at.end_point(), ".clone()", message));
+            }
+            mut parts: [SuggestionPart] = [];
+            parts.push(SuggestionPart::new(moved_at.start_point(), "("));
+            parts.push(SuggestionPart::new(moved_at.end_point(), ").clone()"));
+            return diag.suggest(Suggestion::multipart(parts, message, Applicability::MachineApplicable));
         }
         const is_enum: boolean = this.is_enum(ty);
         if (this.aggregate_type_of(ty) == null && !is_enum) { return diag; }
@@ -1773,7 +1783,7 @@ type struct MoveChecker {
             "moving the capture out here leaves the closure's owner of it to release it again (double free)");
         diag = diag.with_note(
             "a closure keeps what it captures for every call: a `move` closure releases it when the closure is released, and any other closure borrows it from its owner");
-        diag = this.with_clone_hint(diag, ty, span);
+        diag = this.with_clone_hint(diag, ty, span, null);
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
@@ -1790,9 +1800,8 @@ type struct MoveChecker {
         diag = diag.also_at(site, fmt::format("this closure borrows `%s` and can still run", shown).into_raw());
         diag = diag.with_note(
             "a closure written without `move` borrows each captured value that is not `Copy`, so the value has to stay where it is while the closure can run");
-        diag = diag.suggest(Suggestion::single(site.start_point(), "move ",
-            fmt::format("make the closure own `%s`: a `move` closure takes what it captures where it is made", shown),
-            Applicability::MaybeIncorrect));
+        diag = diag.help(fmt::format(
+            "to keep the move, make the closure own `%s`: a `move` closure takes what it captures where it is made", shown).into_raw());
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
@@ -1809,9 +1818,6 @@ type struct MoveChecker {
         diag = diag.help(fmt::format(
             "a `move` closure owns what it captures; to keep `%s`, capture a clone made before the closure, or leave out `move` so the closure borrows it",
             shown).into_raw());
-        diag = diag.suggest(Suggestion::single(
-            SourceSpan::new(closure.file, closure.start_line, closure.start_col, closure.start_line, closure.start_col + 5),
-            "", fmt::format("leave out `move`: the closure then borrows `%s`", shown), Applicability::MaybeIncorrect));
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
@@ -2198,7 +2204,7 @@ type struct MoveChecker {
         diag = diag.also_at(moved_at, "first moved out here");
         diag = diag.help(
             "a value can be moved out of a given field only once");
-        diag = this.with_clone_hint(diag, e.resolved_type, moved_at);
+        diag = this.with_clone_hint(diag, e.resolved_type, moved_at, null);
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
@@ -2369,8 +2375,6 @@ type struct MoveChecker {
                     .at_with_label(e.span,
                         "the match takes its own copy of the field and drops it; the storage it is in still drops it too (double free)")
                     .help("match on a borrow of the field instead, so the arms read it without owning it; if this really is a take, swap a replacement in with `core::mem::swap` first")
-                    .suggest(Suggestion::single(e.span.start_point(), "&", "match on a borrow of the field",
-                        Applicability::MaybeIncorrect))
             }
             FieldReadSite::Value => {
                 Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
@@ -2378,8 +2382,6 @@ type struct MoveChecker {
                     .at_with_label(e.span,
                         "this copies the field's owning handle into a second owner; the storage it is in still drops it too (double free)")
                     .help("borrow the field or clone it; if this really is a take, swap a replacement in with `core::mem::swap`, or take it by value from an owned receiver (`mut this`)")
-                    .suggest(Suggestion::single(e.span.start_point(), "&", "borrow the field",
-                        Applicability::MaybeIncorrect))
             }
         };
         this.ctx.emit_diagnostic(diag);
@@ -2535,7 +2537,7 @@ type struct MoveChecker {
             "this copies the value's owning handle into a second owner; the storage it refers to still drops it too (double free)");
         diag = diag.help(
             "clone it, or take it by value (`mut this` for a receiver) when the method is meant to consume it");
-        this.ctx.emit_diagnostic(this.with_clone_hint(diag, value_ty, expr.span));
+        this.ctx.emit_diagnostic(this.with_clone_hint(diag, value_ty, expr.span, expr));
         this.fired += 1;
         this.fatal += 1;
     }
@@ -2547,7 +2549,7 @@ type struct MoveChecker {
             "reading the pointee by value copies its owning handle; the storage this points at is still dropped by its owner (double free)");
         diag = diag.help(
             "borrow it instead (`p.field`, `p.method()`), or clone it; if this really is a take - the storage is yours to empty, or you overwrite it straight after - say so with an `unsafe` block around the sequence that makes it sound");
-        this.ctx.emit_diagnostic(this.with_clone_hint(diag, expr.resolved_type, expr.span));
+        this.ctx.emit_diagnostic(this.with_clone_hint(diag, expr.resolved_type, expr.span, expr));
         this.fired += 1;
         this.fatal += 1;
     }
@@ -2612,9 +2614,7 @@ type struct MoveChecker {
             "copying this element out leaves the array to drop it again at scope exit (double free)");
         diag = diag.help(
             "borrow the element instead, and type what holds it `&T`; or clone it when an owned copy is required");
-        diag = diag.suggest(Suggestion::single(expr.span.start_point(), "&", "borrow the element",
-            Applicability::MaybeIncorrect));
-        this.ctx.emit_diagnostic(this.with_clone_hint(diag, expr.resolved_type, expr.span));
+        this.ctx.emit_diagnostic(this.with_clone_hint(diag, expr.resolved_type, expr.span, expr));
         this.fired += 1;
         this.fatal += 1;
     }
@@ -2644,9 +2644,7 @@ type struct MoveChecker {
             "copying this array field out aliases the buffer the source still owns (double free)");
         diag = diag.help(
             "borrow it, and type what holds it `&[T]`; or clone it when an owned copy is required");
-        diag = diag.suggest(Suggestion::single(expr.span.start_point(), "&", "borrow the array",
-            Applicability::MaybeIncorrect));
-        this.ctx.emit_diagnostic(this.with_clone_hint(diag, field_ty, expr.span));
+        this.ctx.emit_diagnostic(this.with_clone_hint(diag, field_ty, expr.span, expr));
         this.fired += 1;
         this.fatal += 1;
     }

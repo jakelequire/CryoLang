@@ -1476,19 +1476,31 @@ type struct CallResolver {
         d = d.at_with_label(call.callee.span, "call expression requires function");
         d = d.with_note(fmt::format(
             "a value of a type parameter is called only through a callable bound on it, `%s: (Args) -> Ret`", shown));
+        // The bound's signature is what the call shows: each argument's
+        // type, and the type the call is expected to have.  A part the call
+        // does not settle - an argument typed only by its literal's default,
+        // or a return nothing expects - is a placeholder for the author.
         mut signature: string = "(";
+        mut settled: boolean = true;
         for (mut i: i64 = 0; i < call.arguments.length(); i++) {
             if (i > 0) { signature = signature + ", "; }
             const arg: ExpressionNode* = call.arguments[i];
-            signature = signature + if (arg != null && arg.resolved_type.is_valid()) {
-                this.types.type_display_name(arg.resolved_type)
-            } else { "void" };
+            if (arg != null && arg.resolved_type.is_valid() && !this.binding.method_arg_is_polymorphic_literal(arg)) {
+                signature = signature + this.types.type_display_name(arg.resolved_type);
+            } else {
+                signature = signature + "...";
+                settled = false;
+            }
         }
-        signature = signature + ") -> " + if (this.state.expected_type.is_valid()) {
-            this.types.type_display_name(this.state.expected_type)
-        } else { "void" };
+        signature = signature + ") -> ";
+        if (this.state.expected_type.is_valid()) {
+            signature = signature + this.types.type_display_name(this.state.expected_type);
+        } else {
+            signature = signature + "...";
+            settled = false;
+        }
         this.ctx.emit_diagnostic(this.binding.with_bound_fix(d, param, shown, signature,
-            Applicability::MaybeIncorrect));
+            if (settled) { Applicability::MachineApplicable } else { Applicability::HasPlaceholders }));
     }
 
     /// The signature a value of type `ty` is called with: a function type's
@@ -2554,9 +2566,6 @@ type struct CallResolver {
         d = d.help(this.trait_checker().bound_failure_help(concrete, tref.definition(), trait_str, conc_str,
             fmt::format("implement `%s` for `%s`, or pass an argument of a type that already does",
                 trait_str, conc_str).into_raw()));
-        if (this.trait_checker().borrowing_closure_not_thread_safe(concrete, tref.definition())) {
-            d = LambdaSynth::with_own_captures_fix(d, this.ctx.decl_index, this.arena, concrete);
-        }
         this.ctx.emit_diagnostic(d);
     }
 
@@ -6036,9 +6045,9 @@ type struct CallResolver {
 
     /// E0358 at a call through a value of a function `owner` declares
     /// static.  A static function takes no receiver, so the value has no
-    /// parameter to land on; the help names the call through the type.
-    /// That form no longer evaluates the value, so the edit may be
-    /// incorrect.
+    /// parameter to land on; the help names the call through the type.  No
+    /// edit is offered: that form no longer evaluates the value, and the
+    /// owner's name may mean something else where the call is written.
     refuse_static_through_value(mut &this, member_e: ExpressionNode*, member: MemberAccessExpr*,
                                 owner: TypeRef) -> void {
         const method_name: string = this.intern.resolve(member.member);
@@ -6055,8 +6064,6 @@ type struct CallResolver {
         diag = diag.at(if (member.member_span.has_location()) { member.member_span } else { member_e.span });
         diag = diag.with_note(fmt::format("`%s` is a static function of `%s`; it takes no receiver", method_name, owner_display));
         diag = diag.help(fmt::format("call it through its type: `%s(...)`", path_form));
-        diag = diag.suggest(Suggestion::single(member_e.span, path_form,
-            fmt::format("call `%s` through its type", method_name), Applicability::MaybeIncorrect));
         this.ctx.emit_diagnostic(diag);
     }
 
