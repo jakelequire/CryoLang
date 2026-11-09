@@ -1973,8 +1973,7 @@ type struct MethodBinding {
             this.ctx.type_resolver.project_where_bound_params_into(
                 &orig_func.trait_bounds, &method_param_syms, &ictx, this.ctx.source_file,
                 this.state.in_symbolic_check);
-            this.ctx.type_resolver.unify_callable_bounds(
-                &orig_func.trait_bounds, &method_param_syms, &ictx, &infer_ctx);
+            this.unify_callable_bounds(&orig_func.trait_bounds, &method_param_syms, &ictx, &infer_ctx);
             // PASS B - recover still-unbound method params from a CONCRETE
             // expected type via the return annotation. Not gated on `is_implicit`:
             // any generic method whose param appears in the return (`next_range<T>
@@ -2017,8 +2016,7 @@ type struct MethodBinding {
             this.ctx.type_resolver.project_where_bound_params_into(
                 &orig_func.trait_bounds, &method_param_syms, &ictx, this.ctx.source_file,
                 this.state.in_symbolic_check);
-            this.ctx.type_resolver.unify_callable_bounds(
-                &orig_func.trait_bounds, &method_param_syms, &ictx, &infer_ctx);
+            this.unify_callable_bounds(&orig_func.trait_bounds, &method_param_syms, &ictx, &infer_ctx);
             for (mut i: i64 = 0; i < n_method_params; i++) {
                 const b: TypeRef = ictx.bindings[i];
                 if (!b.is_valid()) { return []; }
@@ -2029,6 +2027,26 @@ type struct MethodBinding {
             }
         }
         return method_bindings;
+    }
+
+    /// Bind the method parameters `ictx` solves for through the callable
+    /// bounds of `trait_bounds` (`TypeResolver::callable_bound_signatures`),
+    /// each written signature resolved in `res_ctx`.  A projection in it is
+    /// reduced as the method's formals are (`reduce_assoc_projections`): in a
+    /// generic body the receiver's item can be a projection on the body's own
+    /// parameter (`I::Item` under `I: Iterator<i32>`), which only that
+    /// parameter's bound answers - left unreduced, it unifies with nothing
+    /// and the parameters after it in the signature stay unbound.
+    unify_callable_bounds(mut &this, trait_bounds: &[TraitBound], param_syms: &[SymbolID],
+                          ictx: mut InferCtx*, res_ctx: ResolutionContext*) -> void {
+        mut formals: [TypeRef] = [];
+        mut actuals: [TypeRef] = [];
+        this.ctx.type_resolver.callable_bound_signatures(trait_bounds, param_syms, ictx, res_ctx, &formals, &actuals);
+        for (mut i: i64 = 0; i < formals.length(); i++) {
+            const formal: TypeRef = this.reduce_assoc_projections(formals[i]);
+            if (!formal.is_valid()) { continue; }
+            ictx.unify(formal, actuals[i]);
+        }
     }
 
     /// Stash the method's concrete method-level bindings on the call so mono's

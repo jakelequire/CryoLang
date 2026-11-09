@@ -1,0 +1,78 @@
+// `map` and `filter` hold their callback, whatever it is: a capturing
+// closure, an owning `move` closure (released once, with the adapter), a
+// named function, chained, and inside a generic body.
+namespace IteratorAdaptersTakeCapturingClosures::Main;
+
+import std::core::option::{ Option };
+import std::core::iter::{ Iterator };
+import std::core::drop::{ Drop };
+
+type struct Up {
+    cur: i32;
+    end: i32;
+}
+
+implement trait Iterator<i32> for struct Up {
+    next(mut &this) -> Option<i32> {
+        if (this.cur >= this.end) { return Option::None; }
+        const v: i32 = this.cur;
+        this.cur = this.cur + 1;
+        return Option::Some(v);
+    }
+}
+
+mut released: i32 = 0;
+
+type struct Counted {
+    step: i64;
+}
+
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void { released = released + 1; }
+}
+
+function sum_i64<I>(mut it: I) -> i64 where I: Iterator<i64> {
+    mut sum: i64 = 0;
+    loop {
+        match (it.next()) {
+            Option::Some(v) => { sum = sum + v; }
+            Option::None => { break; }
+        }
+    }
+    return sum;
+}
+
+function is_even(x: &i32) -> boolean { return (*x % 2) == 0; }
+
+function scaled_above<I>(it: I, floor: i32, scale: i64) -> i64 where I: Iterator<i32> {
+    return sum_i64(it.filter((x: &i32) -> boolean { return *x > floor; })
+                     .map((x: i32) -> i64 { return (x as i64) * scale; }));
+}
+
+function main() -> i32 {
+    const bias: i64 = 100;
+    const four: Up = Up { cur: 0, end: 4 };
+    if (sum_i64(four.map((x: i32) -> i64 { return (x as i64) + bias; })) != 406) { return 1; }
+
+    const limit: i32 = 3;
+    const ten: Up = Up { cur: 0, end: 10 };
+    if (ten.filter((x: &i32) -> boolean { return *x < limit; }).count() != 3) { return 2; }
+
+    const twice: i64 = 2;
+    const chained: i64 = sum_i64(Up { cur: 0, end: 10 }
+        .filter(is_even)
+        .map((x: i32) -> i64 { return (x as i64) * twice; })
+        .filter((x: &i64) -> boolean { return *x != 8; }));
+    if (chained != 32) { return 3; }
+
+    if (scaled_above(Up { cur: 0, end: 6 }, 2, 10) != 120) { return 4; }
+
+    {
+        const c: Counted = Counted { step: 7 };
+        const three: Up = Up { cur: 0, end: 3 };
+        const owning: i64 = sum_i64(three.map(move (x: i32) -> i64 { return (x as i64) * c.step; }));
+        if (owning != 21) { return 5; }
+    }
+    if (released != 1) { return 6; }
+    return 0;
+}

@@ -89,16 +89,17 @@ public type trait Iterator {
         return SkipIter::new(this, n);
     }
 
-    /// Transform each element with `f`, yielding the results. `f` must be a
-    /// non-capturing function (a plain `fn` or a non-capturing lambda).
-    map<B>(this, f: (This::Item) -> B) -> MapIter<This, B> {
+    /// Transform each element with `f`, yielding the results. `f` is any
+    /// callable - a function, or a closure, capturing or not - and the
+    /// adapter holds it.
+    map<B, F>(this, f: F) -> MapIter<This, F, B> where F: (This::Item) -> B {
         return MapIter::new(this, f);
     }
 
-    /// Yield only the elements for which `pred` returns `true`. `pred` must be
-    /// a non-capturing function.  It BORROWS each element: the element it
+    /// Yield only the elements for which `pred` returns `true`. `pred` is any
+    /// callable, held by the adapter.  It BORROWS each element: the element it
     /// keeps is the one yielded, so it cannot also be handed to `pred`.
-    filter(this, pred: (&This::Item) -> boolean) -> FilterIter<This> {
+    filter<P>(this, pred: P) -> FilterIter<This, P> where P: (&This::Item) -> boolean {
         return FilterIter::new(this, pred);
     }
 
@@ -258,8 +259,9 @@ where I: Iterator<A> {
 }
 
 /// Adapter applying `f` to each element of `inner`.  The input element type is
-/// the inner iterator's associated item `I::Item`; `O` is the mapped result
-/// (Output) type, the only element-type struct parameter needed.
+/// the inner iterator's associated item `I::Item`; `Mapper` is the callback's
+/// own type (a function type or a closure); `O` is the mapped result (Output)
+/// type, which the callback's signature binds.
 ///
 /// No parameter of an adapter shares a name with a generic of the trait's
 /// defaults (`map<B>`, `fold<Acc, F>`, `any<P>`, ...).  When a default is
@@ -268,17 +270,17 @@ where I: Iterator<A> {
 /// inherited default - its own generics included - to the receiver's
 /// arguments, leaving the default's generic of that name unbindable.  So the
 /// result-type parameter is `O`, not `B`.
-public type struct MapIter<I, O> where I: Iterator {
+public type struct MapIter<I, Mapper, O> where I: Iterator, Mapper: (I::Item) -> O {
     private inner: I;
-    private f:     (I::Item) -> O;
+    private f:     Mapper;
 
-    public static new(inner: I, f: (I::Item) -> O) -> MapIter<I, O> {
-        return MapIter::<I, O> { inner: inner, f: f };
+    public static new(inner: I, f: Mapper) -> MapIter<I, Mapper, O> {
+        return MapIter::<I, Mapper, O> { inner: inner, f: f };
     }
 }
 
-implement<I, O> trait Iterator<O> for struct MapIter<I, O>
-where I: Iterator {
+implement<I, Mapper, O> trait Iterator<O> for struct MapIter<I, Mapper, O>
+where I: Iterator, Mapper: (I::Item) -> O {
     next(mut &this) -> Option<O> {
         return match (this.inner.next()) {
             Option::Some(value) => { Option::Some(this.f(value)) }
@@ -288,25 +290,22 @@ where I: Iterator {
 }
 
 /// Adapter yielding only the elements of `inner` for which `pred` holds.
-public type struct FilterIter<I> where I: Iterator {
+public type struct FilterIter<I, Predicate> where I: Iterator, Predicate: (&I::Item) -> boolean {
     private inner: I;
-    private pred:  (&I::Item) -> boolean;
+    private pred:  Predicate;
 
-    public static new(inner: I, pred: (&I::Item) -> boolean) -> FilterIter<I> {
-        return FilterIter::<I> { inner: inner, pred: pred };
+    public static new(inner: I, pred: Predicate) -> FilterIter<I, Predicate> {
+        return FilterIter::<I, Predicate> { inner: inner, pred: pred };
     }
 }
 
-implement<I> trait Iterator<I::Item> for struct FilterIter<I>
-where I: Iterator {
+implement<I, Predicate> trait Iterator<I::Item> for struct FilterIter<I, Predicate>
+where I: Iterator, Predicate: (&I::Item) -> boolean {
     next(mut &this) -> Option<I::Item> {
-        // Called through a local: a call through the field itself leaves its
-        // argument unclassified, which the move checker reads as a transfer.
-        const pred: (&I::Item) -> boolean = this.pred;
         loop {
             match (this.inner.next()) {
                 Option::Some(value) => {
-                    if (pred(value)) {
+                    if (this.pred(value)) {
                         return Option::Some(value);
                     }
                 }

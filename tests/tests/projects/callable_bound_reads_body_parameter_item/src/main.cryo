@@ -1,0 +1,91 @@
+// A method whose callable bound reads its owner's item (`F: (I::Item) -> B`),
+// called inside a generic body where the owner's `I` is the body's own
+// parameter, bound only by `Iterator<i32>`: the bound's `I::Item` is `i32`,
+// so `B` is what the callback returns.  The result feeds the same method
+// again, whose item is then the first call's `B` - so a `B` left unbound by
+// the first call would be read as the second call's own.
+namespace CallableBoundReadsBodyParameterItem::Main;
+
+import std::core::option::{ Option };
+import std::core::iter::{ Iterator };
+
+type struct Up {
+    cur: i32;
+    end: i32;
+}
+
+implement trait Iterator<i32> for struct Up {
+    next(mut &this) -> Option<i32> {
+        if (this.cur >= this.end) { return Option::None; }
+        const v: i32 = this.cur;
+        this.cur = this.cur + 1;
+        return Option::Some(v);
+    }
+}
+
+type struct Mapped<I, M, O> where I: Iterator, M: (I::Item) -> O {
+    inner: I;
+    f:     M;
+}
+
+implement<I, M, O> trait Iterator<O> for struct Mapped<I, M, O>
+where I: Iterator, M: (I::Item) -> O {
+    next(mut &this) -> Option<O> {
+        return match (this.inner.next()) {
+            Option::Some(value) => { Option::Some(this.f(value)) }
+            Option::None        => { Option::None }
+        };
+    }
+}
+
+type struct Wrap<I> where I: Iterator {
+    it: I;
+
+    map_with<B, F>(this, f: F) -> Mapped<I, F, B> where F: (I::Item) -> B {
+        return Mapped::<I, F, B> { inner: this.it, f: f };
+    }
+}
+
+function widen(x: i32) -> i64 { return (x as i64) * 1000; }
+function halve(x: i64) -> i32 { return (x / 2) as i32; }
+
+function sum_i64<I>(mut it: I) -> i64 where I: Iterator<i64> {
+    mut sum: i64 = 0;
+    loop {
+        match (it.next()) {
+            Option::Some(v) => { sum = sum + v; }
+            Option::None => { break; }
+        }
+    }
+    return sum;
+}
+
+function sum_i32<I>(mut it: I) -> i32 where I: Iterator<i32> {
+    mut sum: i32 = 0;
+    loop {
+        match (it.next()) {
+            Option::Some(v) => { sum = sum + v; }
+            Option::None => { break; }
+        }
+    }
+    return sum;
+}
+
+function widened<I>(it: I) -> i64 where I: Iterator<i32> {
+    return sum_i64(Wrap::<I> { it: it }.map_with(widen));
+}
+
+function widened_then_halved<I>(it: I) -> i32 where I: Iterator<i32> {
+    const once: Mapped<I, (i32) -> i64, i64> = Wrap::<I> { it: it }.map_with(widen);
+    const again: Wrap<Mapped<I, (i32) -> i64, i64>> = Wrap::<Mapped<I, (i32) -> i64, i64>> { it: once };
+    return sum_i32(again.map_with(halve));
+}
+
+function main() -> i32 {
+    const w: Wrap<Up> = Wrap::<Up> { it: Up { cur: 0, end: 4 } };
+    const m: Mapped<Up, (i32) -> i64, i64> = w.map_with(widen);
+    if (sum_i64(m) != 6000) { return 3; }
+    if (widened(Up { cur: 0, end: 4 }) != 6000) { return 1; }
+    if (widened_then_halved(Up { cur: 0, end: 4 }) != 3000) { return 2; }
+    return 0;
+}

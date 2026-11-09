@@ -730,7 +730,9 @@ The standard library's combinators take their callback through a callable
 bound, so each takes a capturing closure, a non-capturing lambda or a named
 function: `Option`'s `map`, `and_then`, `or_else`, `unwrap_or_else` and
 `ok_or_else`, `Result`'s `map`, `map_err`, `and_then`, `or_else` and
-`unwrap_or_else`, and `Iterator`'s `fold`, `for_each`, `any`, `all` and `find`.
+`unwrap_or_else`, and `Iterator`'s `fold`, `for_each`, `any`, `all` and `find`,
+and its adapters `map` and `filter`, which hold the callback until they are
+iterated.
 A combinator that infers a *new* type parameter from the callback's return
 type - for example `Option::map<U, F>` - does so automatically: `U` is bound
 from the callback's signature, and `F` is the callback's own type, so the type
@@ -2418,7 +2420,7 @@ this implementation bound". Projections also work off a generic parameter - a
 generic adapter names its source's element as `I::Item`:
 
 ```cryo
-type struct MapIter<I, O> where I: Iterator { inner: I; f: (I::Item) -> O; }
+type struct MapIter<I, Mapper, O> where I: Iterator, Mapper: (I::Item) -> O { inner: I; f: Mapper; }
 ```
 
 A projection is answered by the parameter's bounds, so `I::Item` needs a bound on `I` whose trait declares `Item`. Without one, or when no bound's trait declares the name, the projection is refused where it is written (E0203, "associated type `Item` not found for `I`"). A bound on a trait that *inherits* `Iterator` answers too: the projection resolves through the bound trait's supertraits.
@@ -2537,7 +2539,7 @@ implement trait Seq<NotCopy> for struct Holder { ... }   // E0306: Item not Copy
   body form (`type Out = ...;`).
 
 Because Cryo monomorphises, a projection is fully resolved at compile time:
-`MapIter<Range<i32>, i64>::Item` reduces to `i64` with no runtime cost.
+`MapIter<Range<i32>, (i32) -> i64, i64>::Item` reduces to `i64` with no runtime cost.
 
 ### 10.6 Operator Overloading
 
@@ -2790,7 +2792,7 @@ const n: i32 = total([&sq, &r]);                 // 10
 **An object satisfies its own trait.** An object satisfies a bound of its own trait and of each of its supertraits, in every form: `Keeper<virtual mut &Counter>` is accepted where `type struct Keeper<C> where C: Counter`, and so is `ident(o)` with `o: virtual &Counter` where `function ident<B>(b: B) -> i32 where B: Base` and `Base` is a supertrait of `Counter`. No implementation is written for it; the compiler makes one, in which each method is called through the object's table, so a bounded call in the generic body reaches the implementation of the value behind the object, a default the table holds included, and one instance of `Keeper<virtual mut &Counter>` serves every type implementing `Counter`. An associated type of the trait, `S::Item` with `S` the object `virtual &Source<i64>`, is the object's own argument, `i64`.
 
 - Every method of the bound's trait and its supertraits that has no default must be callable through an object: a trait with such a method that has type parameters of its own, or names `This` outside its receiver, is satisfied by no object (`E0306`, "the trait bound `virtual &Grow: Grow` is not satisfied").  The note names the first such method and why a table cannot hold it, in the words a call of it through the object is refused with (`E0314`): "the method `grow` of `Grow` has no default, and cannot be called through `virtual &Grow`: it has type parameters of its own, and a table holds one copy of each method".  No implementation can be written for an object, so the help does not ask for one: "use a type that implements `Grow` in place of `virtual &Grow`, or an object of a trait whose methods a table can hold".  An object whose trait neither is nor inherits the bound's trait never satisfies it, and its help says so: "use a type that implements `Size` in place of `virtual &Grow`; an object implements only its own trait and that trait's supertraits".
-- A default the table cannot hold - `map<B>` and `filter` of `Iterator<i32>`, or `take`, which returns `This` - does not stand in the way: a bounded call of it is compiled once per object type, in the trait's module, with `This` the object, and each call on the receiver inside it goes through the table. So `it.map(f)` in `function sum<I>(it: I) where I: Iterator<i32>` runs with `I` the object `virtual mut &Iterator<i32>`, calling `next` of the value behind it.
+- A default the table cannot hold - `map` and `filter` of `Iterator<i32>`, or `take`, which returns `This` - does not stand in the way: a bounded call of it is compiled once per object type, in the trait's module, with `This` the object, and each call on the receiver inside it goes through the table. So `it.map(f)` in `function sum<I>(it: I) where I: Iterator<i32>` runs with `I` the object `virtual mut &Iterator<i32>`, calling `next` of the value behind it.
 - The value behind an object a generic struct holds is borrowed, not owned, and nothing checks that it outlives the struct.
 
 **Overrides of such a default.** The instance compiled for an object is the trait's default and nothing else: a type that writes its own `map` in its implementation of `Iterator` has it called directly and under a bound, but not through an object, which reaches the default. A default the table holds is not affected: its slot holds the type's own override where the implementation writes one.

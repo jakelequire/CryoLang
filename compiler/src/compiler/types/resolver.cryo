@@ -1296,6 +1296,29 @@ type struct TypeResolver {
     /// signatures contradict is left for the bound check to report.
     unify_callable_bounds(&this, trait_bounds: &[TraitBound], param_syms: &[SymbolID],
                           ictx: mut InferCtx*, res_ctx: ResolutionContext*) -> void {
+        mut formals: [TypeRef] = [];
+        mut actuals: [TypeRef] = [];
+        this.callable_bound_signatures(trait_bounds, param_syms, ictx, res_ctx, &formals, &actuals);
+        for (mut i: i64 = 0; i < formals.length(); i++) {
+            const formal: TypeRef = this.reduce_projections(formals[i], false);
+            if (!formal.is_valid()) { continue; }
+            ictx.unify(formal, actuals[i]);
+        }
+    }
+
+    /// The pairs `unify_callable_bounds` unifies, before any projection in
+    /// them is reduced: for each callable bound of `trait_bounds` whose
+    /// subject `ictx` has bound, the signature the bound writes with the
+    /// parameters already solved put in (`formals`), and the call signature
+    /// of the subject's binding (`actuals`), index-aligned.  The parameters
+    /// solved are put in first, so a projection on one (`(I::Item) -> O`
+    /// with `I` bound) reduces to the type it names and the rest of the
+    /// signature can bind.  Reducing is the caller's: inside a generic body
+    /// a projection on the body's own parameter reduces through that
+    /// parameter's bound, which only the body's walk knows.
+    callable_bound_signatures(&this, trait_bounds: &[TraitBound], param_syms: &[SymbolID],
+                              ictx: InferCtx*, res_ctx: ResolutionContext*,
+                              formals: mut [TypeRef]*, actuals: mut [TypeRef]*) -> void {
         for (mut bi: i64 = 0; bi < trait_bounds.length(); bi++) {
             const bound: const TraitBound* = &trait_bounds[bi];
             if (bound.signature == null || bound.has_projection_subject()) { continue; }
@@ -1309,16 +1332,12 @@ type struct TypeResolver {
                 this.resolve(bound.signature, res_ctx)
             } else { bound.signature_type };
             if (!written.is_valid()) { continue; }
-            // The parameters already solved are put in first, so a projection
-            // on one (`(I::Item) -> O` with `I` bound) is the type it reduces
-            // to and the rest of the signature can bind.
             mut known: TypeSubstitution = TypeSubstitution::empty();
             for (mut i: i64 = 0; i < ictx.bindings.length(); i++) {
                 if (ictx.bindings[i].is_valid()) { known.add(ictx.params[i], ictx.bindings[i]); }
             }
-            const formal: TypeRef = this.reduce_projections(known.apply(written, this.arena), false);
-            if (!formal.is_valid()) { continue; }
-            ictx.unify(formal, actual);
+            formals.push(known.apply(written, this.arena));
+            actuals.push(actual);
         }
     }
 
