@@ -9702,7 +9702,7 @@ type struct CallResolver {
             // unannotated `for (i in 0..N)`.  Keep the silent i32 default for the range
             // family; only USER generic owners (`Atomic::new(0)`) get E0307.
             if (!this.owner_is_range_family(tmpl)) {
-                this.emit_static_owner_literal_default(scope, call_e, call);
+                this.emit_static_owner_literal_default(scope, call_e, tmpl);
             }
             return lb;
         }
@@ -9743,22 +9743,31 @@ type struct CallResolver {
     /// turbofish, no concrete argument, and no expected type).  Pre-mono-after-sema
     /// this was a silent i32 guess (the `Atomic<u64>::new(0)` trap); it is now an
     /// error.  Emitted at most once per call (see `compute_static_owner_bindings`
-    /// step 3).  `scope.scope_name` is the owner, `scope.member_name` the method.
+    /// step 3).  `scope.scope_name` is the owner, `scope.member_name` the method,
+    /// `tmpl` the owner's template.  The fix writes the owner's arguments as its
+    /// own parameter names, for the author to replace: nothing at the call says
+    /// which type is meant.
     emit_static_owner_literal_default(mut &this, scope: ScopeResolutionExpr*,
-                                      call_e: ExpressionNode*, call: CallExpr*) -> void {
+                                      call_e: ExpressionNode*, tmpl: const TemplateEntry*) -> void {
         const owner_str:  string = this.intern.resolve(scope.scope_name);
         const method_str: string = this.intern.resolve(scope.member_name);
+        mut parameters: string = "";
+        for (mut i: i64 = 0; i < tmpl.param_names.length(); i++) {
+            if (i > 0) { parameters = parameters + ", "; }
+            parameters = parameters + this.intern.resolve(tmpl.param_names[i]);
+        }
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
             fmt::format("cannot infer the owner type argument for `%s::%s` from a polymorphic literal",
                 owner_str, method_str));
         d = d.at(call_e.span);
         d = d.with_note("the owner type argument would default to `i32` from an unsuffixed literal; a bare literal is no longer accepted as the only source for a generic owner's type argument");
-        d = d.help(fmt::format("write the owner type argument explicitly, e.g. `%s::<i64>::%s(...)`, or give the call an expected type (`const x: %s<i64> = ...`)",
-            owner_str, method_str, owner_str));
+        d = d.help(fmt::format("write the owner's type arguments, `%s::<%s>::%s(...)` with each parameter replaced by the type meant, or give the call an expected type",
+            owner_str, parameters, method_str));
         if (scope.scope_span.has_location()) {
-            d = d.suggest(Suggestion::single(scope.scope_span.end_point(), "::<i64>",
-                "write the owner's type argument; `i64` is one choice", Applicability::MaybeIncorrect));
+            d = d.suggest(Suggestion::single(scope.scope_span.end_point(), fmt::format("::<%s>", parameters).into_raw(),
+                "write the owner's type arguments, replacing each parameter with the type meant",
+                Applicability::HasPlaceholders));
         }
         this.ctx.emit_diagnostic(d);
     }
