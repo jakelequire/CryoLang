@@ -1,0 +1,98 @@
+namespace ClosureInGenericBody;
+
+import std::core::drop::{ Drop };
+import std::collections::string::{ String };
+import std::alloc::allocator::{ GlobalAlloc };
+
+mut drops: i32 = 0;
+
+type trait Valued {
+    value(&this) -> i64;
+}
+
+type struct Counted {
+    v: i64;
+}
+
+implement trait Valued for struct Counted {
+    value(&this) -> i64 { return this.v; }
+}
+
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void { drops = drops + 1; }
+}
+
+implement trait Valued for struct String<GlobalAlloc> {
+    value(&this) -> i64 { return this.length() as i64; }
+}
+
+function call_with<F>(f: F, x: i64) -> i64 where F: (i64) -> i64 { return f(x); }
+
+function call_twice<F>(f: F) -> i64 where F: () -> i64 { return f() + f(); }
+
+// A `Copy` value of the body's type parameter, captured and read.
+function plus_one_keeping<T>(t: T, x: i64) -> i64 where T: Copy {
+    return call_with(move (y: i64) -> i64 { const keep: T = t; const _again: T = keep; return y + 1; }, x);
+}
+
+// An owned value of the type parameter: the closure owns it and releases it
+// once, in the callee it was moved to.
+function owned_value<T>(t: T) -> i64 where T: Valued {
+    return call_with(move (y: i64) -> i64 { return t.value() + y; }, 100);
+}
+
+// A borrowed value of the type parameter: the variable is still the body's.
+function borrowed_value<T>(t: T) -> i64 where T: Valued {
+    const twice: i64 = call_twice(() -> i64 { return t.value(); });
+    return twice + t.value();
+}
+
+// Called where it is made, through a local.
+function called_locally<T>(t: T) -> T where T: Copy {
+    const f = move () -> T { return t; };
+    return f();
+}
+
+// The closure's own parameter and return are the type parameter.
+function identity_through_closure<T>(t: T) -> T where T: Copy {
+    const f = (x: T) -> T { return x; };
+    return f(t);
+}
+
+// A closure in a method of a generic owner, over the owner's parameter.
+type struct Wrap<T> where T: Valued {
+    inner: T;
+
+    doubled(&this) -> i64 {
+        const r: &T = &this.inner;
+        const g = () -> i64 { return r.value() * 2; };
+        return g();
+    }
+}
+
+function main() -> i32 {
+    if (plus_one_keeping(5, 1) != 2) { return 1; }
+    if (plus_one_keeping(5 as i64, 41) != 42) { return 2; }
+
+    drops = 0;
+    if (owned_value(Counted { v: 7 }) != 107) { return 3; }
+    if (drops != 1) { return 4; }
+    if (owned_value(String::from("abcd")) != 104) { return 5; }
+
+    drops = 0;
+    if (borrowed_value(Counted { v: 3 }) != 9) { return 6; }
+    if (drops != 1) { return 7; }
+
+    if (called_locally(9) != 9) { return 8; }
+    if (called_locally(true) != true) { return 9; }
+    if (identity_through_closure(12 as i64) != 12) { return 10; }
+
+    drops = 0;
+    {
+        const w: Wrap<Counted> = Wrap::<Counted> { inner: Counted { v: 21 } };
+        if (w.doubled() != 42) { return 11; }
+        if (drops != 0) { return 12; }
+    }
+    if (drops != 1) { return 13; }
+    return 0;
+}

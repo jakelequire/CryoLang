@@ -1807,7 +1807,23 @@ type struct MonoCallSpecializer {
         if (call.resolved_callee.is_some() || !this.callee_is_value(call.callee)) { return; }
         const value: mut ExpressionNode* = call.callee;
         const value_t: Type* = this.arena.lookup(value.resolved_type);
-        if (value_t == null || value_t.kind != TypeKind::Struct) { return; }
+        if (value_t == null) { return; }
+        // A closure made in a generic body is an instance of the template the
+        // closure is: its `__call__` is the template's, bound to the
+        // instance's copy of it as any method of a generic struct is.
+        if (value_t.kind == TypeKind::InstantiatedType) {
+            const template_call: const MethodInfo* = this.decl_index.type_method(
+                value_t.as_instantiated().generic_base, this.intern_table.intern("__call__"), this.arena);
+            if (template_call == null || template_call.ast_node == null) { return; }
+            const template_method: MethodDecl* = DeclarationNode::method_of(template_call.ast_node as DeclarationNode*);
+            if (template_method == null || template_method.func == null) { return; }
+            call.callee = ExpressionNode::member_access_expr(value, template_call.name, value.span, value.span);
+            call.template_method = DeclarationNode::fn_of(template_method.func).def;
+            call.template_recv = value.resolved_type;
+            this.specialize_method_call(call, null);
+            return;
+        }
+        if (value_t.kind != TypeKind::Struct) { return; }
         const call_method: const MethodInfo* = this.decl_index.type_method(
             value.resolved_type, this.intern_table.intern("__call__"), this.arena);
         if (call_method == null || call_method.ast_node == null) { return; }

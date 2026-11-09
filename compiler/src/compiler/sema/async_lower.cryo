@@ -32,10 +32,9 @@ import compiler::resolver::res::{ DefId, Res, ResBase, ResSlot, DefKind, FamilyO
 import compiler::resolver::resolver::{ Resolver };
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::ast::{
-    ArgBinding, ArrayAnnotation, cloner, declaration, expression, GenericAnnotation,
-    LiteralKind, MemberPin, NamedAnnotation, node, pattern, PatternBinding,
-    PointerAnnotation, ProjectionAnnotation, ReferenceAnnotation, statement,
-    TypeAnnotation, Visibility
+    ArgBinding, cloner, declaration, expression, GenericAnnotation,
+    LiteralKind, MemberPin, node, pattern, PatternBinding,
+    PointerAnnotation, statement, TypeAnnotation, Visibility
 };
 import compiler::lex::{ Token, TokenType };
 import compiler::diag::{ diagnostic, ErrorCode, source_span };
@@ -46,7 +45,7 @@ import std::core::{ option, mem };
 import std::collections::string::{ String };
 import std::fmt;
 import compiler::types::generic::{
-    AssocProjectionType, GenericParamType, InstantiatedType
+    AssocProjectionType, InstantiatedType
 };
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
@@ -73,9 +72,9 @@ import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::sema::pattern_resolver::{ PatternResolver };
 import compiler::sema::lambda_synth::{ LambdaSynth };
 import compiler::sema::literal_resolver::{ LiteralResolver };
+import compiler::sema::type_spelling::{ TypeSpelling };
 import compiler::sema::member_resolver::{ FieldAnswer, MemberResolver };
 import compiler::types::arena::{ TypeArena };
-import compiler::types::compound::{ ArrayType, PointerType, ReferenceType };
 import compiler::types::generic_registry::{ TemplateEntry, TemplateKind };
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::types::ownership::{ OwnershipQuery };
@@ -405,6 +404,8 @@ type struct AsyncLower {
     /// lowering builds bodies after name resolution ran, so nothing else can
     /// say that two locals it declares are two locals.
     resolver: mut Resolver*;
+    // The annotations a generic future's declarations are spelled with.
+    spelling: TypeSpelling;
     // Borrowed sema peer: re-derives a `match`-arm pattern binding's payload
     // type (`resolve_variant_payload_types`) and answers `match_is_exhaustive`,
     // neither of which is cached on the AST. Used only by the `match`-arm await
@@ -521,6 +522,7 @@ type struct AsyncLower {
 
     static null() -> AsyncLower {
         return AsyncLower { arena: null, intern: null, ctx: null, resolver: null,
+                            spelling: TypeSpelling::new(null, null),
                             patterns: null, literals: null, members: null,
                             own_accesses: [], counter: 0,
                             frame_locals: [], frame_local_src: [], temp_keys: [],
@@ -613,6 +615,7 @@ type struct AsyncLower {
         this.arena    = arena;
         this.intern   = intern;
         this.ctx      = ctx;
+        this.spelling = TypeSpelling::new(arena, ctx);
         this.patterns = patterns;
         this.literals = literals;
         this.members  = members;
@@ -704,93 +707,13 @@ type struct AsyncLower {
         return this.intern.intern(fmt::format("%s$Future_%llu", base, idx).into_raw());
     }
 
-    /// Build a `Named` type annotation whose resolution short-circuits to `ty`
-    /// (via `pre_resolved`), so a synthesized annotation resolves without a name
-    /// lookup.
-    make_type_ann(&this, ty: TypeRef, span: SourceSpan) -> mut TypeAnnotation* {
-        mut n: NamedAnnotation* = new NamedAnnotation {
-            name: this.arena.display_label(ty), span: span, pre_resolved: ty,
-            res: ResSlot::Pending,
-        };
-        return new TypeAnnotation::Named(n);
-    }
-
-    /// A `Named` annotation spelling the GENERIC PARAMETER `gp`, stamped as
-    /// the name layer stamps a written one and resolved by lookup rather than
-    /// short-circuited.
-    ///
-    /// The counterpart to `make_type_ann`, and mandatory for anything a generic
-    /// future mentions: monomorphization specializes a template by rewriting the
-    /// generic parameters that appear in its ANNOTATIONS, and `pre_resolved`
-    /// bypasses annotation resolution entirely — a pre-resolved `T` would reach
-    /// codegen still being `T`.  The stamp carries the parameter's symbol,
-    /// because every substitution table is keyed by it and a spelling matches
-    /// nothing; a synthesized node is stamped by nothing but its synthesizer.
-    /// A DECLARATION spelled by the lowering goes through `named_ann_def` for
-    /// the same reason.
-    named_ann(&this, gp: GenericParamDecl*, span: SourceSpan) -> mut TypeAnnotation* {
-        mut n: mut NamedAnnotation* = new NamedAnnotation {
-            name: gp.name, span: span, pre_resolved: TypeRef::invalid(),
-            res: ResSlot::Pending,
-        };
-        n.res.answer(Res::GenericParam(gp.sym_id));
-        return new TypeAnnotation::Named(n);
-    }
-
-    /// The parameter among `params` whose declaration bound `sym`, or null.
-    ///
-    /// The lowering rebuilds a frame field's type from the ARENA, whose
-    /// parameter types carry the symbol their declaration bound; the
-    /// declaration being lowered owns the parameters (the owner's, then the
-    /// function's own) a type its body computed can mention.
-    param_bound_by(&this, params: &[DeclarationNode*], t: GenericParamType*) -> GenericParamDecl* {
-        for (mut i: i64 = 0; i < params.length(); i++) {
-            const gp_decl: DeclarationNode* = params[i];
-            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
-            if (gp != null && t.declared_by(gp.sym_id)) { return gp; }
-        }
-        return null;
-    }
-
-    /// `named_ann`, carrying the definition it refers to.
-    ///
-    /// Nothing name-resolves a synthesized annotation: the stamping walk visits
-    /// what the parser produced, and a minted node was never written. So a
-    /// consumer that asks what this refers to finds no answer unless the
-    /// synthesizer records one, and the synthesizer is the only place the
-    /// referent is known.
-    named_ann_def(&this, name: SymbolStr, def: DefId,
-                  span: SourceSpan) -> mut TypeAnnotation* {
-        mut n: mut NamedAnnotation* = new NamedAnnotation {
-            name: name, span: span, pre_resolved: TypeRef::invalid(),
-            res: ResSlot::Pending,
-        };
-        if (def.is_valid()) { n.res.answer(Res::Def(def)); }
-        return new TypeAnnotation::Named(n);
-    }
-
-    /// `<T, U, …>` — the function's own generic parameters spelled by name, the
-    /// form the monomorphizer's substituter rewrites. A fresh array of fresh
-    /// nodes per call: substitution edits annotations IN PLACE, so two uses may
-    /// not share one node.
-    generic_param_anns(&this, params: &[DeclarationNode*], span: SourceSpan) -> [mut TypeAnnotation*] {
-        mut args: [mut TypeAnnotation*] = [];
-        for (mut i: i64 = 0; i < params.length(); i++) {
-            const gp_decl: DeclarationNode* = params[i];
-            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
-            if (gp == null) { continue; }
-            args.push(this.named_ann(gp, span));
-        }
-        return args;
-    }
-
     /// An annotation for the generated future type: `Fut` when the function is
     /// not generic (pre-resolved, no lookup), `Fut<T, …>` when it is.
     future_type_ann(mut &this, d: AsyncDecl*, span: SourceSpan) -> mut TypeAnnotation* {
-        if (!d.generic) { return this.make_type_ann(d.struct_ref, span); }
+        if (!d.generic) { return this.spelling.pre_resolved(d.struct_ref, span); }
         mut gen: GenericAnnotation* = new GenericAnnotation {
-            base: this.named_ann_def(d.q_name, DeclarationNode::struct_of(d.struct_decl).def, span),
-            args: this.generic_param_anns(d.fut_params, span),
+            base: this.spelling.definition(d.q_name, DeclarationNode::struct_of(d.struct_decl).def, span),
+            args: this.spelling.generic_parameters(d.fut_params, span),
             span: span,
             refused: false,
         };
@@ -836,96 +759,7 @@ type struct AsyncLower {
     /// An annotation for the `Future`'s `Output` — the declared return type, or
     /// unit for `-> void`.
     output_type_ann(mut &this, d: AsyncDecl*, span: SourceSpan) -> mut TypeAnnotation* {
-        return this.type_ann_for(d.output_ref, &d.fut_params, span);
-    }
-
-    /// Spell `ty` as an annotation monomorphization can substitute.
-    ///
-    /// A subtree with no generic parameter anywhere in it is pre-resolved — the
-    /// substituter has nothing to do there, and pre-resolving skips a name lookup
-    /// that a synthesized name might not survive. A subtree that DOES mention one
-    /// is rebuilt structurally down to the parameter, which is spelled by name so
-    /// the substituter can see and rewrite it.
-    ///
-    /// Null when the type mentions a parameter through a shape with no annotation
-    /// spelling, or a parameter that is none of `params` (the future's own);
-    /// the caller reports that rather than emitting a field whose type would
-    /// silently stay generic.
-    type_ann_for(mut &this, ty: TypeRef, params: &[DeclarationNode*],
-                 span: SourceSpan) -> mut TypeAnnotation* {
-        if (!ty.is_valid()) { return null; }
-        if (!this.arena.contains_generic_param(ty)) { return this.make_type_ann(ty, span); }
-
-        const t: Type* = this.arena.lookup(ty);
-        if (t == null) { return null; }
-        if (t.kind == TypeKind::GenericParam) {
-            const gp: GenericParamDecl* = this.param_bound_by(params, t.as_generic_param());
-            if (gp == null) { return null; }
-            return this.named_ann(gp, span);
-        }
-        if (t.kind == TypeKind::Pointer) {
-            const p: PointerType* = t.as_pointer();
-            mut inner: mut TypeAnnotation* = this.type_ann_for(p.pointee, params, span);
-            if (inner == null) { return null; }
-            return new TypeAnnotation::Pointer(new PointerAnnotation {
-                inner: inner, is_const: false, span: span,
-            });
-        }
-        if (t.kind == TypeKind::Reference) {
-            const r: ReferenceType* = t.as_reference();
-            mut inner: mut TypeAnnotation* = this.type_ann_for(r.referent, params, span);
-            if (inner == null) { return null; }
-            return new TypeAnnotation::Reference(new ReferenceAnnotation {
-                inner: inner, is_mutable: r.is_mutable(), span: span,
-            });
-        }
-        if (t.kind == TypeKind::Array) {
-            const a: ArrayType* = t.as_array();
-            mut elem: mut TypeAnnotation* = this.type_ann_for(a.element, params, span);
-            if (elem == null) { return null; }
-            return new TypeAnnotation::Array(new ArrayAnnotation {
-                element: elem, size: a.size, size_expr: null, span: span,
-            });
-        }
-        // An associated-type projection (`S::ReadFut`, or the nested
-        // `(S::ReadFut)::Output` an `await` on one produces) is spelled as a
-        // Projection annotation so the substituter rewrites its BASE when the
-        // enclosing template specializes; mono then reduces the projection.
-        // Without this the frame field for such an `await` cannot be spelled at
-        // all and the whole lowering is refused.
-        if (t.kind == TypeKind::AssocProjection) {
-            const proj: AssocProjectionType* = t.as_assoc_projection();
-            mut base: mut TypeAnnotation* = this.type_ann_for(proj.base, params, span);
-            if (base == null) { return null; }
-            const owner_decl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(
-                this.ctx.decl_index.def_of(proj.owning_trait, this.ctx.type_arena));
-            return new TypeAnnotation::Projection(new ProjectionAnnotation {
-                base:         base,
-                member:       proj.member,
-                rooted_at:    SymbolID::invalid(),
-                owner_trait:  if (owner_decl != null) { owner_decl.def } else { DefId::invalid() },
-                resolved:     TypeRef::invalid(),
-                span:         span,
-                refused:      false,
-            });
-        }
-        if (t.kind == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = t.as_instantiated();
-            const base_q: SymbolStr = this.arena.get_qualified_name(inst.generic_base).spelling();
-            if (!base_q.is_valid()) { return null; }
-            mut args: [mut TypeAnnotation*] = [];
-            for (mut i: i64 = 0; i < inst.type_args.length(); i++) {
-                mut arg: mut TypeAnnotation* = this.type_ann_for(inst.type_args[i], params, span);
-                if (arg == null) { return null; }
-                args.push(arg);
-            }
-            return new TypeAnnotation::Generic(new GenericAnnotation {
-                base: this.named_ann_def(base_q,
-                    this.ctx.decl_index.def_of(inst.generic_base, this.ctx.type_arena), span),
-                args: args, span: span, refused: false,
-            });
-        }
-        return null;
+        return this.spelling.of(d.output_ref, &d.fut_params, span);
     }
 
     /// An annotation for `Poll<X>` over an already-built `X`.
@@ -936,7 +770,7 @@ type struct AsyncLower {
     poll_type_ann(mut &this, arg: mut TypeAnnotation*, span: SourceSpan) -> mut TypeAnnotation* {
         const poll_q: SymbolStr = this.poll_identity();
         mut gen: GenericAnnotation* = new GenericAnnotation {
-            base: this.named_ann_def(poll_q,
+            base: this.spelling.definition(poll_q,
                 this.ctx.generic_registry.wellknown(LangItem::Poll), span),
             args: [arg],
             span: span,
@@ -7606,7 +7440,7 @@ type struct AsyncLower {
         const wrapper_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(wrapper), span);
         wrapper.def = main_def;
         wrapper.set_resolved_return_type(i32_ty);
-        wrapper.set_return_type_annotation(this.make_type_ann(i32_ty, span));
+        wrapper.set_return_type_annotation(this.spelling.pre_resolved(i32_ty, span));
 
         // The forwarded arguments are read off the WRAPPER's own parameters, so
         // each is an ordinary identifier the synthesized body binds.
@@ -7641,7 +7475,7 @@ type struct AsyncLower {
         mut ex_decl: mut VarDecl* = VarDecl::new(ex_sym);
         ex_decl.set_sym_id(this.resolver.alloc_synthetic_binding());
         ex_decl.set_mutable(true);
-        ex_decl.set_type_annotation(this.make_type_ann(exec_ty, span));
+        ex_decl.set_type_annotation(this.spelling.pre_resolved(exec_ty, span));
         ex_decl.set_initializer(ex_new);
         body.as_block().add_statement(Stmt::decl_stmt(
             DeclarationNode::of(DeclKind::Variable(ex_decl), span), span));
@@ -7673,7 +7507,7 @@ type struct AsyncLower {
             mut out_decl: mut VarDecl* = VarDecl::new(out_sym);
             out_decl.set_sym_id(this.resolver.alloc_synthetic_binding());
             out_decl.set_mutable(false);
-            out_decl.set_type_annotation(this.make_type_ann(i32_ty, span));
+            out_decl.set_type_annotation(this.spelling.pre_resolved(i32_ty, span));
             out_decl.set_initializer(drive);
             body.as_block().add_statement(Stmt::decl_stmt(
                 DeclarationNode::of(DeclKind::Variable(out_decl), span), span));
@@ -7945,7 +7779,7 @@ type struct AsyncLower {
             // Concrete, but the specialized clone drops every `resolved_type`, so
             // the signature only survives if it is also spelled as an annotation.
             cx_param.set_type_annotation(new TypeAnnotation::Pointer(new PointerAnnotation {
-                inner: this.make_type_ann(ctx_ref, span), is_const: false, span: span,
+                inner: this.spelling.pre_resolved(ctx_ref, span), is_const: false, span: span,
             }));
         }
         poll_fn.add_parameter(cx_param_decl);
@@ -7983,7 +7817,7 @@ type struct AsyncLower {
         // records it.
         impl_node.res.answer(Res::Def(struct_decl.def));
         mut gen: GenericAnnotation* = new GenericAnnotation {
-            base: this.named_ann_def(future_leaf, future_id, span),
+            base: this.spelling.definition(future_leaf, future_id, span),
             args: [this.output_type_ann(&d, span)],
             span: span,
             refused: false,
@@ -7998,7 +7832,7 @@ type struct AsyncLower {
             }
             // `target_args` is what makes `This` inside the impl resolve to the
             // full `Fut<T>` rather than the bare template base.
-            impl_node.target_args = this.generic_param_anns(d.fut_params, span);
+            impl_node.target_args = this.spelling.generic_parameters(d.fut_params, span);
             // Hang the block off the template so the same demand that specializes
             // `Fut<i64>` specializes its `Future` impl. Without it the
             // specialization exists but has no `poll`.
@@ -8125,7 +7959,7 @@ type struct AsyncLower {
     /// A generic future additionally needs the field spelled as an ANNOTATION:
     /// specialization clones the decl, and the clone keeps annotations but drops
     /// every `resolved_type`. False (with a diagnostic) when the type mentions a
-    /// generic parameter through a shape `type_ann_for` cannot spell — emitting
+    /// generic parameter through a shape `TypeSpelling::of` cannot spell — emitting
     /// the field anyway would leave the specialization's field still generic,
     /// which surfaces far from here as an unresolved member type.
     add_future_field(mut &this, struct_decl: mut StructDecl*, name: SymbolStr,
@@ -8134,7 +7968,7 @@ type struct AsyncLower {
         f.visibility = Visibility::Public;
         f.resolved_type = ty;
         if (d.generic) {
-            mut ann: mut TypeAnnotation* = this.type_ann_for(ty, &d.fut_params, span);
+            mut ann: mut TypeAnnotation* = this.spelling.of(ty, &d.fut_params, span);
             if (ann == null) {
                 this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
                     fmt::format("async: a generic `async function` cannot carry a value of type `%s` across a suspend; give it a concrete type",
@@ -8427,7 +8261,7 @@ type struct AsyncLower {
         // bare template — without them the function's return type and the value
         // it returns stop matching.
         if (generic) {
-            ctor_lit.set_generic_args(this.generic_param_anns(this.pending[pi].fut_params, span));
+            ctor_lit.set_generic_args(this.spelling.generic_parameters(this.pending[pi].fut_params, span));
         }
         ctor_e.set_resolved_type(self_ty);
         mut ret: Stmt* = Stmt::return_stmt(ctor_e, span);

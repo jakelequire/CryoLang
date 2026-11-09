@@ -1,0 +1,207 @@
+/// TypeSpelling
+///
+/// Type annotations for declarations a sema pass synthesizes - the future of an
+/// `async function`, the closure struct of a lambda.  A synthesized generic
+/// template is specialized as a written one is: the monomorphizer clones it and
+/// re-resolves the clone from its ANNOTATIONS, rewriting the generic parameters
+/// that appear in them; every `resolved_type` the clone carried is dropped.  So
+/// whatever a synthesized template mentions has to be spelled, and spelled in
+/// the form the substituter rewrites.
+namespace compiler::sema::type_spelling;
+
+import compiler::types::{ type_ref, type_base, arena, compound, generic_registry, TypeKind };
+import compiler::resolver::{ symbol_str };
+import compiler::resolver::res::{ DefId, Res, ResSlot };
+import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::ast::{
+    ArrayAnnotation, declaration, FunctionAnnotation, GenericAnnotation, NamedAnnotation,
+    PointerAnnotation, ProjectionAnnotation, ReferenceAnnotation, TupleAnnotation, TypeAnnotation
+};
+import compiler::ast::declaration::{ DeclarationNode, GenericParamDecl, TraitDecl };
+import compiler::compilation_context::{ CompilationContext };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::compound::{ ArrayType, FunctionType, PointerType, ReferenceType, TupleType };
+import compiler::types::generic::{ AssocProjectionType, GenericParamType, InstantiatedType };
+import compiler::types::type_base::{ Type };
+import compiler::types::type_ref::{ TypeRef };
+
+type struct TypeSpelling {
+    arena: mut TypeArena*;
+    ctx:   mut CompilationContext*;
+
+    static new(arena: mut TypeArena*, ctx: mut CompilationContext*) -> TypeSpelling {
+        return TypeSpelling { arena: arena, ctx: ctx };
+    }
+
+    /// A `Named` annotation whose resolution short-circuits to `ty` (via
+    /// `pre_resolved`), so it resolves without a name lookup.  Nothing in it
+    /// is substituted: only for a type that mentions no generic parameter.
+    pre_resolved(&this, ty: TypeRef, span: SourceSpan) -> mut TypeAnnotation* {
+        mut n: NamedAnnotation* = new NamedAnnotation {
+            name: this.arena.display_label(ty), span: span, pre_resolved: ty,
+            res: ResSlot::Pending,
+        };
+        return new TypeAnnotation::Named(n);
+    }
+
+    /// A `Named` annotation spelling the generic parameter `gp`, stamped as
+    /// the name layer stamps a written one and resolved by lookup rather than
+    /// short-circuited: a pre-resolved `T` would reach codegen still being
+    /// `T`.  The stamp carries the parameter's symbol, because every
+    /// substitution table is keyed by it and a spelling matches nothing.
+    generic_parameter(&this, gp: GenericParamDecl*, span: SourceSpan) -> mut TypeAnnotation* {
+        mut n: mut NamedAnnotation* = new NamedAnnotation {
+            name: gp.name, span: span, pre_resolved: TypeRef::invalid(),
+            res: ResSlot::Pending,
+        };
+        n.res.answer(Res::GenericParam(gp.sym_id));
+        return new TypeAnnotation::Named(n);
+    }
+
+    /// A `Named` annotation carrying the definition it refers to.  Nothing
+    /// name-resolves a synthesized annotation, so the synthesizer, the only
+    /// place the referent is known, records it.
+    definition(&this, name: SymbolStr, def: DefId, span: SourceSpan) -> mut TypeAnnotation* {
+        mut n: mut NamedAnnotation* = new NamedAnnotation {
+            name: name, span: span, pre_resolved: TypeRef::invalid(),
+            res: ResSlot::Pending,
+        };
+        if (def.is_valid()) { n.res.answer(Res::Def(def)); }
+        return new TypeAnnotation::Named(n);
+    }
+
+    /// The parameter among `params` whose declaration bound `t`, or null.
+    parameter_bound_by(&this, params: &[DeclarationNode*], t: GenericParamType*) -> GenericParamDecl* {
+        for (mut i: i64 = 0; i < params.length(); i++) {
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(params[i]);
+            if (gp != null && t.declared_by(gp.sym_id)) { return gp; }
+        }
+        return null;
+    }
+
+    /// `<T, U, …>`: `params` spelled by name.  A fresh array of fresh nodes
+    /// per call - substitution edits annotations IN PLACE, so two uses may not
+    /// share one node.
+    generic_parameters(&this, params: &[DeclarationNode*], span: SourceSpan) -> [mut TypeAnnotation*] {
+        mut args: [mut TypeAnnotation*] = [];
+        for (mut i: i64 = 0; i < params.length(); i++) {
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(params[i]);
+            if (gp == null) { continue; }
+            args.push(this.generic_parameter(gp, span));
+        }
+        return args;
+    }
+
+    /// `ty` spelled as an annotation monomorphization can substitute.
+    ///
+    /// A subtree with no generic parameter anywhere in it is pre-resolved -
+    /// the substituter has nothing to do there, and pre-resolving skips a name
+    /// lookup a synthesized name might not survive.  A subtree that DOES
+    /// mention one is rebuilt structurally down to the parameter, which is
+    /// spelled by name so the substituter can see and rewrite it.
+    ///
+    /// Null when the type mentions a parameter through a shape with no
+    /// annotation spelling, or a parameter that is none of `params`; the
+    /// caller reports that rather than emitting a declaration whose type would
+    /// silently stay generic.
+    of(&this, ty: TypeRef, params: &[DeclarationNode*], span: SourceSpan) -> mut TypeAnnotation* {
+        if (!ty.is_valid()) { return null; }
+        if (!this.arena.contains_generic_param(ty)) { return this.pre_resolved(ty, span); }
+
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null) { return null; }
+        if (t.kind == TypeKind::GenericParam) {
+            const gp: GenericParamDecl* = this.parameter_bound_by(params, t.as_generic_param());
+            if (gp == null) { return null; }
+            return this.generic_parameter(gp, span);
+        }
+        if (t.kind == TypeKind::Pointer) {
+            const p: PointerType* = t.as_pointer();
+            mut inner: mut TypeAnnotation* = this.of(p.pointee, params, span);
+            if (inner == null) { return null; }
+            return new TypeAnnotation::Pointer(new PointerAnnotation {
+                inner: inner, is_const: false, span: span,
+            });
+        }
+        if (t.kind == TypeKind::Reference) {
+            const r: ReferenceType* = t.as_reference();
+            mut inner: mut TypeAnnotation* = this.of(r.referent, params, span);
+            if (inner == null) { return null; }
+            return new TypeAnnotation::Reference(new ReferenceAnnotation {
+                inner: inner, is_mutable: r.is_mutable(), span: span,
+            });
+        }
+        if (t.kind == TypeKind::Array) {
+            const a: ArrayType* = t.as_array();
+            mut elem: mut TypeAnnotation* = this.of(a.element, params, span);
+            if (elem == null) { return null; }
+            return new TypeAnnotation::Array(new ArrayAnnotation {
+                element: elem, size: a.size, size_expr: null, span: span,
+            });
+        }
+        if (t.kind == TypeKind::Tuple) {
+            const tuple: TupleType* = t.as_tuple();
+            mut elements: [mut TypeAnnotation*] = [];
+            for (mut i: i64 = 0; i < tuple.elements.length(); i++) {
+                mut element: mut TypeAnnotation* = this.of(tuple.elements[i], params, span);
+                if (element == null) { return null; }
+                elements.push(element);
+            }
+            return new TypeAnnotation::Tuple(new TupleAnnotation { elements: elements, span: span });
+        }
+        if (t.kind == TypeKind::Function) {
+            const signature: FunctionType* = t.as_function();
+            if (signature.is_variadic) { return null; }
+            mut parameters: [mut TypeAnnotation*] = [];
+            for (mut i: i64 = 0; i < signature.param_types.length(); i++) {
+                mut parameter: mut TypeAnnotation* = this.of(signature.param_types[i], params, span);
+                if (parameter == null) { return null; }
+                parameters.push(parameter);
+            }
+            mut returned: mut TypeAnnotation* = this.of(signature.return_type, params, span);
+            if (returned == null) { return null; }
+            return new TypeAnnotation::Function(new FunctionAnnotation {
+                parameters: parameters, return_type: returned, span: span,
+            });
+        }
+        // An associated-type projection (`S::ReadFut`, or the nested
+        // `(S::ReadFut)::Output` an `await` on one produces) is spelled as a
+        // Projection annotation so the substituter rewrites its BASE when the
+        // enclosing template specializes; mono then reduces the projection.
+        if (t.kind == TypeKind::AssocProjection) {
+            const proj: AssocProjectionType* = t.as_assoc_projection();
+            mut base: mut TypeAnnotation* = this.of(proj.base, params, span);
+            if (base == null) { return null; }
+            const owner_decl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(
+                this.ctx.decl_index.def_of(proj.owning_trait, this.ctx.type_arena));
+            return new TypeAnnotation::Projection(new ProjectionAnnotation {
+                base:         base,
+                member:       proj.member,
+                rooted_at:    SymbolID::invalid(),
+                owner_trait:  if (owner_decl != null) { owner_decl.def } else { DefId::invalid() },
+                resolved:     TypeRef::invalid(),
+                span:         span,
+                refused:      false,
+            });
+        }
+        if (t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t.as_instantiated();
+            const base_q: SymbolStr = this.arena.get_qualified_name(inst.generic_base).spelling();
+            if (!base_q.is_valid()) { return null; }
+            mut args: [mut TypeAnnotation*] = [];
+            for (mut i: i64 = 0; i < inst.type_args.length(); i++) {
+                mut arg: mut TypeAnnotation* = this.of(inst.type_args[i], params, span);
+                if (arg == null) { return null; }
+                args.push(arg);
+            }
+            return new TypeAnnotation::Generic(new GenericAnnotation {
+                base: this.definition(base_q,
+                    this.ctx.decl_index.def_of(inst.generic_base, this.ctx.type_arena), span),
+                args: args, span: span, refused: false,
+            });
+        }
+        return null;
+    }
+}

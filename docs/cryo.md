@@ -698,9 +698,26 @@ The distinction is *capture*, not syntax. A lambda that captures nothing is an
 ordinary function pointer and binds anywhere a function pointer does, including
 every row above; a lambda that captures becomes an anonymous struct value.
 
-A capturing lambda written inside a generic function cannot yet capture a
-value whose type is one of that function's parameters: the closure type would
-itself need the parameter.
+A lambda written inside a generic body - a generic function, or a method of a
+generic type - is generic over that body's type parameters, so its captures,
+its parameters, its return type and its body may all mention them. Each copy
+of the body has its own closure type, with the copy's arguments:
+
+```cryo
+function apply<F>(f: F, x: i64) -> i64 where F: (i64) -> i64 { return f(x); }
+
+function plus_value<T>(t: T) -> i64 where T: Valued {
+    return apply(move (y: i64) -> i64 { return t.value() + y; }, 100);
+}
+
+function first<T>(t: T) -> T where T: Copy {
+    const f = (x: T) -> T { return x; };
+    return f(t);
+}
+```
+
+What a copy may do with a captured `T` - copy it, move it - is decided in that
+copy, by the type `T` is there.
 
 The standard library's combinators take their callback through a callable
 bound, so each takes a capturing closure, a non-capturing lambda or a named

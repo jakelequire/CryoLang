@@ -37,9 +37,13 @@ import std::core::iter::{ Iterator };
 import std::fmt;
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
-    DeclarationNode, DeclKind, FieldDecl, FunctionDecl, ImplBlock, MethodDecl, ReceiverForm,
-    StructDecl, VarDecl
+    DeclarationNode, DeclKind, FieldDecl, FunctionDecl, GenericParamDecl, ImplBlock, MethodDecl,
+    ReceiverForm, StructDecl, VarDecl
 };
+import compiler::passes::type_resolution::{ TypeResolutionPasses };
+import compiler::sema::type_spelling::{ TypeSpelling };
+import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::types::generic_registry::{ TemplateEntry, TemplateKind };
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::ast::expression::{
     CalleePin,
@@ -315,6 +319,28 @@ type struct LambdaSynth {
         const closure_def: DefId = this.mint_closure_def(span);
         const qual_name: SymbolStr = ctx_ptr.defs.path_of(closure_def).spelling();
 
+        // A lambda written in a generic body may mention that body's type
+        // parameters - in what it captures, its signature or its body - so
+        // its closure is a template over them (the owner's, then the
+        // function's own), specialized with each copy of the body as a
+        // written generic struct is.  The parameter nodes are the body's
+        // own, so the closure's `T` and the body's `T` are one arena type.
+        mut params: [DeclarationNode*] = [];
+        if (this.state.in_symbolic_check) {
+            for (mut i: i64 = 0; i < this.state.symbolic_owner_param_nodes.length(); i++) {
+                params.push(this.state.symbolic_owner_param_nodes[i]);
+            }
+            for (mut i: i64 = 0; i < this.state.symbolic_method_param_nodes.length(); i++) {
+                params.push(this.state.symbolic_method_param_nodes[i]);
+            }
+        }
+        const generic: boolean = params.length() > 0;
+        const spelling: TypeSpelling = TypeSpelling::new(arena_ptr, ctx_ptr);
+        // What a template builds from its own parameters is abstract: nothing
+        // demands those instantiations.
+        const saved_no_demand: boolean = arena_ptr.symbolic_no_demand_active;
+        if (generic) { arena_ptr.set_symbolic_no_demand(true); }
+
         // 1. The struct declaration and its fields.
         const struct_decl: mut StructDecl* = StructDecl::new(qual_name);
         const struct_header: mut DeclarationNode* = DeclarationNode::of(DeclKind::Struct(struct_decl), span);
@@ -354,12 +380,39 @@ type struct LambdaSynth {
             mut field: mut FieldDecl* = FieldDecl::new(lambda.captured_names[i]);
             field.visibility = Visibility::Public;
             field.resolved_type = field_types[i];
+            if (generic) {
+                field.type_annotation = spelling.of(field_types[i], &params, span);
+                if (field.type_annotation == null) {
+                    ctx_ptr.ice_at(fmt::format("a closure in a generic body captures a value of type `%s`, which has no annotation spelling",
+                        arena_ptr.resolve_display_name(field_types[i])).into_raw(), span);
+                }
+            }
             struct_decl.fields.push(DeclarationNode::of(DeclKind::Field(field), span));
         }
 
         // 2. Arena StructType + fields.
         const struct_ref: TypeRef = arena_ptr.create_struct(
             qual_name, ctx_ptr.declaring_module(closure_def));
+        // The type a value of the closure has: the template at its own
+        // parameters when generic, the struct itself otherwise.
+        mut self_ty: TypeRef = struct_ref;
+        if (generic) {
+            for (mut i: i64 = 0; i < params.length(); i++) { struct_decl.generic_params.push(params[i]); }
+            const param_refs: [TypeRef] = TypeResolutionPasses::create_generic_param_types(params, arena_ptr);
+            mut param_names: [SymbolStr] = [];
+            mut param_syms: [SymbolID] = [];
+            mut param_types: [TypeRef] = [];
+            for (mut i: i64 = 0; i < params.length(); i++) {
+                const gp: GenericParamDecl* = DeclarationNode::generic_param_of(params[i]);
+                param_names.push(gp.name);
+                param_syms.push(gp.sym_id);
+                param_types.push(param_refs[i]);
+            }
+            ctx_ptr.get_generic_registry().register_template(TemplateEntry::new(
+                ctx_ptr.defs.leaf_of(closure_def).spelling(), qual_name, closure_def, ctx_ptr.current_module(),
+                param_names, param_syms, param_types, struct_header, TemplateKind::Struct, struct_ref));
+            self_ty = ctx_ptr.get_generic_registry().instantiate(struct_ref, &param_refs);
+        }
         const struct_t: Type* = arena_ptr.lookup(struct_ref);
         if (struct_t != null && struct_t.kind == TypeKind::Struct) {
             const st: mut StructType* = struct_t.as_struct();
@@ -379,7 +432,10 @@ type struct LambdaSynth {
         const call_fn_decl: DeclarationNode* = DeclarationNode::of(DeclKind::Function(call_fn), span);
         call_fn.written_in = FunctionDecl::written_in_of(this.state.current_func);
         call_fn.set_resolved_return_type(lambda.return_type);
-        const call_recv_decl: DeclarationNode* = this.closure_receiver(struct_ref, span);
+        if (generic) {
+            call_fn.set_return_type_annotation(spelling.of(lambda.return_type, &params, span));
+        }
+        const call_recv_decl: DeclarationNode* = this.closure_receiver(self_ty, span);
         const call_recv: VarDecl* = DeclarationNode::var_of(call_recv_decl);
         call_fn.add_parameter(call_recv_decl);
         for (mut i: i64 = 0; i < lambda.parameters.length(); i++) {
@@ -397,7 +453,7 @@ type struct LambdaSynth {
             const cap_ty:   TypeRef   = lambda.captured_types[i];
 
             const this_ident: mut ExpressionNode* = ExpressionNode::identifier_expr(this_ident_sym, span);
-            this_ident.set_resolved_type(struct_ref);
+            this_ident.set_resolved_type(self_ty);
             ExpressionNode::identifier_of(this_ident).set_res(Res::Local(call_recv.sym_id));
             mut access: mut ExpressionNode* = ExpressionNode::member_access_expr(
                 this_ident, cap_name, span, span);
@@ -427,6 +483,7 @@ type struct LambdaSynth {
             });
             shadow.set_mutable(false);
             shadow.set_resolved_type(cap_ty);
+            if (generic) { shadow.set_type_annotation(spelling.of(cap_ty, &params, span)); }
             shadow.set_initializer(access);
             // A value that is not `Copy` stays the closure's, or its owner's
             // when borrowed: the shadow names it and owns nothing.
@@ -487,7 +544,18 @@ type struct LambdaSynth {
         mut method_arr: [DeclarationNode*] = [method_decl];
         ctx_ptr.decl_index.register_methods(
             struct_ref, method_arr, intern_ptr, arena_ptr, "closure/struct methods");
+        // A call of the closure in the generic body it was made in asks the
+        // template's own instantiation for `__call__`.
+        if (generic) { ctx_ptr.decl_index.register_template_methods(closure_def, &method_arr, arena_ptr); }
         const drop_impl: mut DeclarationNode* = this.closure_drop_impl(lambda, struct_decl, struct_ref, span);
+        // A template's `Drop` is specialized with it, by the demand that
+        // specializes the closure.
+        if (generic && drop_impl != null) {
+            const drop_block: mut ImplBlock* = DeclarationNode::impl_of(drop_impl);
+            for (mut i: i64 = 0; i < params.length(); i++) { drop_block.generic_params.push(params[i]); }
+            drop_block.target_args = spelling.generic_parameters(&params, span);
+            ctx_ptr.get_generic_registry().register_impl_block(drop_block.target_def(), drop_impl);
+        }
 
         // 8. Inject into ProgramNode so subsequent passes walk it.
         if (ctx_ptr.artifacts.ast.root != null) {
@@ -498,7 +566,8 @@ type struct LambdaSynth {
             }
         }
 
-        return struct_ref;
+        if (generic) { arena_ptr.set_symbolic_no_demand(saved_no_demand); }
+        return self_ty;
     }
 
     /// `implement trait Drop for struct <closure>`, for a closure that owns
@@ -570,7 +639,9 @@ type struct LambdaSynth {
     /// `ty` is no closure type.
     closure_call_type(mut &this, ty: TypeRef) -> TypeRef {
         const t: Type* = this.arena.lookup(ty);
-        if (t == null || t.kind != TypeKind::Struct) { return TypeRef::invalid(); }
+        if (t == null || (t.kind != TypeKind::Struct && t.kind != TypeKind::InstantiatedType)) {
+            return TypeRef::invalid();
+        }
         return this.ctx.type_resolver.call_signature_of(ty);
     }
 
