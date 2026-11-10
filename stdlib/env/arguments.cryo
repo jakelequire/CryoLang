@@ -1,0 +1,457 @@
+///! Command-line arguments read against a declaration of what a program
+///! takes: flags, options with values, and positional arguments.
+///!
+///!     import std::collections::array::{ Array };
+///!     import std::collections::str::{ Str };
+///!     import std::collections::string::{ String };
+///!     import std::env;
+///!     import std::env::arguments::{ ArgumentParser, ParsedArguments };
+///!     import std::fmt;
+///!
+///!     function main() -> i32 {
+///!         mut parser: ArgumentParser = ArgumentParser::new(Str::new("grep"));
+///!         parser.flag(Str::new("count"), Option::Some('c'), Str::new("print only a count"))
+///!             .option(Str::new("context"), Option::None, Str::new("lines"), Str::new("lines around a match"))
+///!             .positional(Str::new("pattern"), Str::new("what to look for"))
+///!             .optional_positional(Str::new("file"), Str::new("where to look"));
+///!         const all: Array<String> = env::args();
+///!         match (parser.parse(all.as_slice().subslice(1, all.length()))) {
+///!             Result::Ok(parsed) => {
+///!                 const pattern: Str = parsed.value(Str::new("pattern")).unwrap();
+///!                 const counting: boolean = parsed.flag(Str::new("count"));
+///!                 fmt::println(f"looking for {pattern}, counting: {counting}");
+///!                 return 0;
+///!             }
+///!             Result::Err(error) => {
+///!                 fmt::eprintln(f"{error}");
+///!                 fmt::eprint(parser.help_text());
+///!                 return 2;
+///!             }
+///!         }
+///!     }
+///!
+///! An option's value is written `--context=3`, `--context 3`, `-C3` or
+///! `-C 3`; short flags group, `-cv`. `--` ends the options: every
+///! argument after it is positional, even one starting with `-`. A single
+///! `-` is positional too. A short letter is ASCII.
+
+namespace std::env::arguments;
+
+import std::core::intrinsics;
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::fmt::display::{ Debug, Display, Formatter };
+import std::fmt::error::{ FmtError };
+
+/// What a declared argument is.
+private type enum ArgumentShape with [Eq] {
+    Flag;
+    Option;
+    Positional;
+    OptionalPositional;
+}
+
+/// One declared argument: its name (an option's long name, without the
+/// dashes), the short letter a flag or an option may also be written
+/// with, the name an option's value is shown under, and its help.
+private type struct ArgumentSpecification {
+    private shape: ArgumentShape;
+    private name: String;
+    private short: Option<char>;
+    private value_name: String;
+    private help: String;
+}
+
+/// What `parse` found for one declaration.
+private type struct ParsedArgument {
+    private name: String;
+    private occurrences: i64;
+    private values: Array<String>;
+
+    private add_value(mut &this, value: Str) -> void {
+        this.occurrences += 1;
+        this.values.push(String::from_str(value));
+    }
+}
+
+/// The arguments a command line gave, read by the names they were
+/// declared under. Asking for a name the parser did not declare panics.
+public type struct ParsedArguments {
+    private arguments: Array<ParsedArgument>;
+
+    /// True when the flag or option `name` was given.
+    ![caller_location]
+    public flag(&this, name: Str) -> boolean {
+        return this.occurrences(name) > 0;
+    }
+
+    /// How many times the flag or option `name` was given: `-vvv` is 3.
+    ![caller_location]
+    public occurrences(&this, name: Str) -> i64 {
+        return this.find(name).occurrences;
+    }
+
+    /// The value of the option or positional argument `name`: the last one
+    /// given when the option was given more than once.
+    ![caller_location]
+    public value(&this, name: Str) -> Option<Str> {
+        const found: &ParsedArgument = this.find(name);
+        if (found.values.length() == 0) {
+            return Option::None;
+        }
+        return Option::Some(found.values[found.values.length() - 1].as_str());
+    }
+
+    /// Every value of the option `name`, in the order they were given.
+    ![caller_location]
+    public values(&this, name: Str) -> &Slice<String> {
+        return &this.find(name).values;
+    }
+
+    ![caller_location]
+    private find(&this, name: Str) -> &ParsedArgument {
+        for (mut i: i64 = 0; i < this.arguments.length(); i++) {
+            if (this.arguments[i].name.as_str().equals(&name)) {
+                return &this.arguments[i];
+            }
+        }
+        core::panic("ParsedArguments: no argument by that name was declared", intrinsics::location());
+    }
+}
+
+/// Why a command line did not fit the declarations.
+public type enum ArgumentErrorKind with [Eq, Clone, Debug] {
+    /// An option or short letter nothing declares.
+    UnknownOption;
+    /// An option that takes a value came last, with none after it.
+    MissingValue;
+    /// A flag written with a value, `--verbose=yes`.
+    UnexpectedValue;
+    /// A required positional argument was not given.
+    MissingPositional;
+    /// More positional arguments than are declared.
+    UnexpectedPositional;
+}
+
+/// The argument a command line went wrong at, and how.
+public type struct ArgumentError with [Eq, Clone, Debug] {
+    public kind: ArgumentErrorKind;
+    /// The argument as written; for a missing positional argument, its
+    /// name as the help shows it, `<file>`.
+    public argument: String;
+
+    public static new(kind: ArgumentErrorKind, argument: Str) -> ArgumentError {
+        return ArgumentError { kind: kind, argument: String::from_str(argument) };
+    }
+}
+
+/// `unknown option '--colour'`, `option '--jobs' needs a value`, `flag
+/// '--verbose=yes' takes no value`, `missing argument <file>`, `unexpected
+/// argument 'extra'`.
+implement trait Display for struct ArgumentError {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        const argument: Str = this.argument.as_str();
+        match (this.kind) {
+            ArgumentErrorKind::UnknownOption => { return f.write(f"unknown option '{argument}'"); }
+            ArgumentErrorKind::MissingValue => { return f.write(f"option '{argument}' needs a value"); }
+            ArgumentErrorKind::UnexpectedValue => { return f.write(f"flag '{argument}' takes no value"); }
+            ArgumentErrorKind::MissingPositional => { return f.write(f"missing argument {argument}"); }
+            ArgumentErrorKind::UnexpectedPositional => { return f.write(f"unexpected argument '{argument}'"); }
+        }
+    }
+}
+
+/// A declaration of the arguments a program takes, which `parse` reads a
+/// command line against and `help_text` describes. Each declaring method
+/// returns the parser, so declarations chain.
+public type struct ArgumentParser {
+    private program: String;
+    private specifications: Array<ArgumentSpecification>;
+
+    public static new(program: Str) -> ArgumentParser {
+        return ArgumentParser { program: String::from_str(program), specifications: Array::new() };
+    }
+
+    /// A flag, `--long` or `-s`: present or not, and counted when repeated.
+    public flag(mut &this, long: Str, short: Option<char>, help: Str) -> mut &ArgumentParser {
+        return this.declare(ArgumentShape::Flag, long, short, Str::new(""), help);
+    }
+
+    /// An option that takes a value, `--long=value`, `--long value`,
+    /// `-svalue` or `-s value`; `value_name` names the value in the help.
+    /// Given more than once, it keeps every value, in order.
+    public option(mut &this, long: Str, short: Option<char>, value_name: Str, help: Str) -> mut &ArgumentParser {
+        return this.declare(ArgumentShape::Option, long, short, value_name, help);
+    }
+
+    /// A positional argument that must be given. Positional arguments are
+    /// read in the order they are declared.
+    public positional(mut &this, name: Str, help: Str) -> mut &ArgumentParser {
+        return this.declare(ArgumentShape::Positional, name, Option::None, Str::new(""), help);
+    }
+
+    /// A positional argument that may be left out. It is read after every
+    /// required one, whatever order they are declared in.
+    public optional_positional(mut &this, name: Str, help: Str) -> mut &ArgumentParser {
+        return this.declare(ArgumentShape::OptionalPositional, name, Option::None, Str::new(""), help);
+    }
+
+    /// Read `arguments` - the command line after the program's own name -
+    /// against the declarations. The first argument that does not fit them
+    /// is the error.
+    public parse(&this, arguments: &Slice<String>) -> Result<ParsedArguments, ArgumentError> {
+        mut parsed: ParsedArguments = ParsedArguments { arguments: Array::new() };
+        for (mut i: i64 = 0; i < this.specifications.length(); i++) {
+            const specification: &ArgumentSpecification = &this.specifications[i];
+            parsed.arguments.push(ParsedArgument {
+                name: String::from_str(specification.name.as_str()),
+                occurrences: 0,
+                values: Array::new(),
+            });
+        }
+        mut positionals: Array<String> = Array::new();
+        mut options_ended: boolean = false;
+        mut index: i64 = 0;
+        while (index < arguments.length()) {
+            const argument: Str = arguments[index].as_str();
+            index += 1;
+            if (options_ended || argument.length() < 2 || !argument.starts_with(&Str::new("-"))) {
+                positionals.push(String::from_str(argument));
+                continue;
+            }
+            if (argument.equals(&Str::new("--"))) {
+                options_ended = true;
+                continue;
+            }
+            if (argument.starts_with(&Str::new("--"))) {
+                const written: Str = argument.sub_bytes(2, argument.length());
+                mut long: Str = written;
+                mut attached: Option<Str> = Option::None;
+                match (written.find_byte(0x3D)) {
+                    Option::Some(at) => {
+                        long = written.sub_bytes(0, at);
+                        attached = Option::Some(written.sub_bytes(at + 1, written.length()));
+                    }
+                    Option::None => { }
+                }
+                const found: Option<i64> = this.find_long(long);
+                if (found.is_none()) {
+                    return Result::Err(ArgumentError::new(ArgumentErrorKind::UnknownOption, argument));
+                }
+                const which: i64 = found.unwrap();
+                if (this.specifications[which].shape == ArgumentShape::Flag) {
+                    if (attached.is_some()) {
+                        return Result::Err(ArgumentError::new(ArgumentErrorKind::UnexpectedValue, argument));
+                    }
+                    parsed.arguments[which].occurrences += 1;
+                    continue;
+                }
+                match (attached) {
+                    Option::Some(value) => { parsed.arguments[which].add_value(value); }
+                    Option::None => {
+                        if (index >= arguments.length()) {
+                            return Result::Err(ArgumentError::new(ArgumentErrorKind::MissingValue, argument));
+                        }
+                        parsed.arguments[which].add_value(arguments[index].as_str());
+                        index += 1;
+                    }
+                }
+                continue;
+            }
+            // A group of short letters: flags, the last of which may be an
+            // option whose value is the rest of the group or the next
+            // argument.
+            mut position: i64 = 1;
+            while (position < argument.length()) {
+                const found: Option<i64> = this.find_short(argument.byte_at(position).unwrap());
+                if (found.is_none()) {
+                    return Result::Err(ArgumentError::new(ArgumentErrorKind::UnknownOption,
+                        argument.sub_bytes(position, argument.length())));
+                }
+                position += 1;
+                const which: i64 = found.unwrap();
+                if (this.specifications[which].shape == ArgumentShape::Flag) {
+                    parsed.arguments[which].occurrences += 1;
+                    continue;
+                }
+                if (position < argument.length()) {
+                    parsed.arguments[which].add_value(argument.sub_bytes(position, argument.length()));
+                } else {
+                    if (index >= arguments.length()) {
+                        return Result::Err(ArgumentError::new(ArgumentErrorKind::MissingValue, argument));
+                    }
+                    parsed.arguments[which].add_value(arguments[index].as_str());
+                    index += 1;
+                }
+                break;
+            }
+        }
+        // The positional arguments, in the order they came, go to the
+        // required declarations and then to the optional ones.
+        mut next: i64 = 0;
+        for (mut i: i64 = 0; i < this.specifications.length(); i++) {
+            if (this.specifications[i].shape != ArgumentShape::Positional) {
+                continue;
+            }
+            if (next >= positionals.length()) {
+                return Result::Err(ArgumentError::new(ArgumentErrorKind::MissingPositional, this.label(i).as_str()));
+            }
+            parsed.arguments[i].add_value(positionals[next].as_str());
+            next += 1;
+        }
+        for (mut i: i64 = 0; i < this.specifications.length(); i++) {
+            if (this.specifications[i].shape != ArgumentShape::OptionalPositional || next >= positionals.length()) {
+                continue;
+            }
+            parsed.arguments[i].add_value(positionals[next].as_str());
+            next += 1;
+        }
+        if (next < positionals.length()) {
+            return Result::Err(ArgumentError::new(ArgumentErrorKind::UnexpectedPositional, positionals[next].as_str()));
+        }
+        return Result::Ok(parsed);
+    }
+
+    /// A description of the arguments: a usage line, then each positional
+    /// argument and each flag and option with its help, in the order they
+    /// were declared.
+    public help_text(&this) -> String {
+        mut text: String = String::new();
+        text.push(Str::new("usage: "));
+        text.push(this.program.as_str());
+        mut has_options: boolean = false;
+        for (mut i: i64 = 0; i < this.specifications.length(); i++) {
+            const shape: ArgumentShape = this.specifications[i].shape;
+            if (shape == ArgumentShape::Flag || shape == ArgumentShape::Option) {
+                has_options = true;
+            }
+        }
+        if (has_options) {
+            text.push(Str::new(" [options]"));
+        }
+        for (mut i: i64 = 0; i < this.specifications.length(); i++) {
+            const specification: &ArgumentSpecification = &this.specifications[i];
+            if (specification.shape == ArgumentShape::Positional || specification.shape == ArgumentShape::OptionalPositional) {
+                text.push(Str::new(" "));
+                text.push(this.label(i).as_str());
+            }
+        }
+        text.push(Str::new("\n"));
+        mut width: i64 = 0;
+        for (mut i: i64 = 0; i < this.specifications.length(); i++) {
+            const length: i64 = this.label(i).length();
+            if (length > width) {
+                width = length;
+            }
+        }
+        mut heading_written: boolean = false;
+        for (mut i: i64 = 0; i < this.specifications.length(); i++) {
+            const shape: ArgumentShape = this.specifications[i].shape;
+            if (shape == ArgumentShape::Positional || shape == ArgumentShape::OptionalPositional) {
+                if (!heading_written) {
+                    text.push(Str::new("\narguments:\n"));
+                    heading_written = true;
+                }
+                this.write_help_line(&text, i, width);
+            }
+        }
+        if (has_options) {
+            text.push(Str::new("\noptions:\n"));
+            for (mut i: i64 = 0; i < this.specifications.length(); i++) {
+                const shape: ArgumentShape = this.specifications[i].shape;
+                if (shape == ArgumentShape::Flag || shape == ArgumentShape::Option) {
+                    this.write_help_line(&text, i, width);
+                }
+            }
+        }
+        return text;
+    }
+
+    private declare(mut &this, shape: ArgumentShape, name: Str, short: Option<char>, value_name: Str, help: Str) -> mut &ArgumentParser {
+        this.specifications.push(ArgumentSpecification {
+            shape: shape,
+            name: String::from_str(name),
+            short: short,
+            value_name: String::from_str(value_name),
+            help: String::from_str(help),
+        });
+        return &this;
+    }
+
+    private find_long(&this, long: Str) -> Option<i64> {
+        for (mut i: i64 = 0; i < this.specifications.length(); i++) {
+            const specification: &ArgumentSpecification = &this.specifications[i];
+            const is_option: boolean = specification.shape == ArgumentShape::Flag || specification.shape == ArgumentShape::Option;
+            if (is_option && specification.name.as_str().equals(&long)) {
+                return Option::Some(i);
+            }
+        }
+        return Option::None;
+    }
+
+    /// The declaration whose short letter is the byte `letter`. Short
+    /// letters are ASCII, so a byte that is not one matches none.
+    private find_short(&this, letter: u8) -> Option<i64> {
+        for (mut i: i64 = 0; i < this.specifications.length(); i++) {
+            match (this.specifications[i].short) {
+                Option::Some(short) => {
+                    if (short.is_ascii() && short as u8 == letter) {
+                        return Option::Some(i);
+                    }
+                }
+                Option::None => { }
+            }
+        }
+        return Option::None;
+    }
+
+    /// How a declaration is shown: `<file>`, `[<file>]`, `-v, --verbose`
+    /// or `-j, --jobs <count>`.
+    private label(&this, index: i64) -> String {
+        const specification: &ArgumentSpecification = &this.specifications[index];
+        mut label: String = String::new();
+        if (specification.shape == ArgumentShape::Positional) {
+            label.push(Str::new("<"));
+            label.push(specification.name.as_str());
+            label.push(Str::new(">"));
+            return label;
+        }
+        if (specification.shape == ArgumentShape::OptionalPositional) {
+            label.push(Str::new("[<"));
+            label.push(specification.name.as_str());
+            label.push(Str::new(">]"));
+            return label;
+        }
+        match (specification.short) {
+            Option::Some(short) => {
+                label.push(Str::new("-"));
+                label.push_char(short);
+                label.push(Str::new(", "));
+            }
+            Option::None => { label.push(Str::new("    ")); }
+        }
+        label.push(Str::new("--"));
+        label.push(specification.name.as_str());
+        if (specification.shape == ArgumentShape::Option) {
+            label.push(Str::new(" <"));
+            label.push(specification.value_name.as_str());
+            label.push(Str::new(">"));
+        }
+        return label;
+    }
+
+    private write_help_line(&this, text: mut &String, index: i64, width: i64) -> void {
+        const label: String = this.label(index);
+        text.push(Str::new("  "));
+        text.push(label.as_str());
+        for (mut pad: i64 = label.length(); pad < width + 2; pad++) {
+            text.push(Str::new(" "));
+        }
+        text.push(this.specifications[index].help.as_str());
+        text.push(Str::new("\n"));
+    }
+}
