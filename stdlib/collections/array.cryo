@@ -32,6 +32,7 @@ import std::alloc::layout::{ Layout };
 import std::alloc::allocator::{
     AllocError, AllocErrorKind, Allocator, GlobalAlloc, next_capacity
 };
+import std::collections::raw_buffer::{ RawBuffer };
 import std::ffi::libc;
 
 /// First-allocation capacity. Small enough that near-empty arrays
@@ -381,37 +382,95 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
         this.length = 0;
     }
 
-    /// Sort the array in place, ascending, by `T::compare`.
-    ///
-    /// Hybrid in-place quicksort: median-of-three pivot above a cutoff,
-    /// insertion sort below.  O(n log n) average; O(n^2) adversarial
-    /// worst case (pure quicksort, no introsort fallback in v1.0).
-    /// **Not stable** - equal elements may be reordered.  No allocation.
-    ///
-    /// The bound is `T: Ord`; primitives, `String`, and any user type
-    /// that implements `Ord` are accepted.  Owning `T`s are moved
-    /// in place via `mem::swap` so the array's drop obligation stays
-    /// intact (every initialised slot still gets dropped exactly once).
+    /// Sort the array in place, ascending by `T`'s `Ord`. The sort is
+    /// stable: equal elements keep the order they had. It takes
+    /// O(n log n) comparisons on every input and allocates a buffer as
+    /// long as the array; `sort_unstable` allocates nothing.
     public sort(mut &this) -> void where T: Ord {
-        if (this.length < 2) { return; }
-        sort_range::<T>(this.ptr, 0, this.length);
+        this.sort_by(natural_order::<T>);
     }
 
-    /// Sort in place using a user-supplied "less-than" predicate.
-    /// Returns no value; mutates the array.  Same complexity and
-    /// stability as `sort()`.  The predicate must impose a strict
-    /// weak ordering (irreflexive, transitive, with the implied
-    /// equivalence being transitive) or the result is unspecified.
-    ///
-    /// `less` is a function pointer; non-capturing lambdas convert
-    /// implicitly.  Capturing closures passed in method position are
-    /// rejected (E0458) in v1.0 - capture by indirection if you need
-    /// state (`mut state: State*; (a, b) -> boolean { ... state.x ... }`)
-    /// or pull the sort into a free function and use the free-function
-    /// closure-arg path.
-    public sort_by(mut &this, less: (&T, &T) -> boolean) -> void {
+    /// Sort the array in place by `compare`, which says how its first
+    /// argument orders against its second. Stable, as `sort` is. When
+    /// `compare` is not a total order the elements end up in some order,
+    /// each exactly once.
+    public sort_by<F>(mut &this, compare: F) -> void where F: (&T, &T) -> Ordering {
+        merge_sort::<T, F>(this.ptr, this.length, compare);
+    }
+
+    /// Sort the array in place, ascending by `T`'s `Ord`, without
+    /// allocating. Equal elements may change places. It takes
+    /// O(n log n) comparisons on every input: a quicksort that turns to a
+    /// heapsort for any range it has split too often.
+    public sort_unstable(mut &this) -> void where T: Ord {
+        this.sort_unstable_by(natural_order::<T>);
+    }
+
+    /// Sort the array in place by `compare`, as `sort_unstable` does.
+    public sort_unstable_by<F>(mut &this, compare: F) -> void where F: (&T, &T) -> Ordering {
+        introsort::<T, F>(this.ptr, this.length, compare);
+    }
+
+    /// Find `value` in an array sorted ascending: `Ok` with the index of
+    /// an element equal to it, or `Err` with the index it would be
+    /// inserted at to keep the order. On an unsorted array the answer is
+    /// some index, not necessarily a meaningful one.
+    public binary_search(&this, value: &T) -> Result<i64, i64> where T: Ord {
+        return this.binary_search_by((element: &T) -> Ordering { return element.compare(value); });
+    }
+
+    /// Search an array sorted in the order `compare` describes. `compare`
+    /// says how an element orders against the one sought: `Less` for an
+    /// element before it, `Greater` for one after it. Answers as
+    /// `binary_search` does.
+    public binary_search_by<F>(&this, compare: F) -> Result<i64, i64> where F: (&T) -> Ordering {
+        mut low: i64 = 0;
+        mut high: i64 = this.length;
+        while (low < high) {
+            const middle: i64 = low + (high - low) / 2;
+            match (compare(&this.ptr[middle])) {
+                Ordering::Less => { low = middle + 1; }
+                Ordering::Greater => { high = middle; }
+                Ordering::Equal => { return Result::Ok(middle); }
+            }
+        }
+        return Result::Err(low);
+    }
+
+    /// Keep only the elements `keep` answers true for, in their order,
+    /// releasing the others.
+    public retain<F>(mut &this, keep: F) -> void where F: (&T) -> boolean {
+        mut kept: i64 = 0;
+        for (mut index: i64 = 0; index < this.length; index++) {
+            if (keep(&this.ptr[index])) {
+                if (kept != index) {
+                    mem::copy::<T>(mem::offset(this.ptr, kept), mem::offset(this.ptr, index), 1);
+                }
+                kept += 1;
+            } else {
+                ptr::drop_in_place::<T>(&this.ptr[index]);
+            }
+        }
+        this.length = kept;
+    }
+
+    /// Release every element equal to the one before it, so each run of
+    /// equal neighbours keeps only its first element. On a sorted array
+    /// that leaves each value once.
+    public dedup(mut &this) -> void where T: Eq {
         if (this.length < 2) { return; }
-        sort_range_by::<T>(this.ptr, 0, this.length, less);
+        mut kept: i64 = 1;
+        for (mut index: i64 = 1; index < this.length; index++) {
+            if (this.ptr[index].equals(&this.ptr[kept - 1])) {
+                ptr::drop_in_place::<T>(&this.ptr[index]);
+            } else {
+                if (kept != index) {
+                    mem::copy::<T>(mem::offset(this.ptr, kept), mem::offset(this.ptr, index), 1);
+                }
+                kept += 1;
+            }
+        }
+        this.length = kept;
     }
 
     /// Append every element of `source` to the end of this array.
@@ -653,150 +712,183 @@ public function from_iter<I, T>(it: I) -> Array<T> where I: Iterator<T> {
     return out;
 }
 
-// Sort helpers ----------------------------------------------------------------
+// Sorting ---------------------------------------------------------------------
 //
-// Free functions rather than methods so they're reachable from both
-// `sort()` and `sort_by()` without re-stating the where bound at every
-// call site, and so recursive quicksort doesn't have to thread `mut &this`
-// through the recursion.  Operate on a raw `T*` + `[lo, hi)` half-open
-// range; the caller (`sort` / `sort_by`) is responsible for validating
-// the range against the array's length before the first call.
+// Both sorts work on `length` elements from `items` and take the comparison
+// by value, calling it only in their own body: a capturing closure handed on
+// to a second function would be moved there.
 
-/// Length cutoff for switching from quicksort to insertion sort. 16 is
-/// the canonical value; small enough that insertion sort's O(n^2) is
-/// faster than quicksort's per-element overhead, large enough to avoid
-/// recursing all the way down.
+/// `T`'s own order, the comparison `sort` and `sort_unstable` hand on.
+private function natural_order<T>(a: &T, b: &T) -> Ordering where T: Ord {
+    return a.compare(b);
+}
+
+/// Below this many elements a range is put in order by insertion, which is
+/// faster there than splitting it further.
 private const SORT_INSERTION_CUTOFF: i64 = 16;
 
-private function sort_range<T>(ptr: mut T*, lo: i64, hi: i64) -> void where T: Ord {
-    if (hi - lo < SORT_INSERTION_CUTOFF) {
-        sort_insertion::<T>(ptr, lo, hi);
-        return;
+/// A stable bottom-up merge sort. Runs of `SORT_INSERTION_CUTOFF` elements
+/// are put in order by insertion, then neighbouring runs are merged at
+/// doubling widths. A merge moves its left run into a buffer and moves
+/// elements back one at a time, taking the left run's element on a tie,
+/// which is what keeps equal elements in order. Every move is a bitwise
+/// one, so each element is owned exactly once throughout.
+private function merge_sort<T, F>(items: mut T*, length: i64, compare: F) -> void where F: (&T, &T) -> Ordering {
+    if (length < 2) { return; }
+    for (mut start: i64 = 0; start < length; start += SORT_INSERTION_CUTOFF) {
+        mut end: i64 = start + SORT_INSERTION_CUTOFF;
+        if (end > length) { end = length; }
+        for (mut index: i64 = start + 1; index < end; index++) {
+            mut at: i64 = index;
+            while (at > start && compare(&items[at - 1], &items[at]).is_gt()) {
+                mem::swap::<T>(mem::offset(items, at - 1), mem::offset(items, at));
+                at -= 1;
+            }
+        }
     }
-    const pivot_idx: i64 = sort_partition::<T>(ptr, lo, hi);
-    sort_range::<T>(ptr, lo, pivot_idx);
-    sort_range::<T>(ptr, pivot_idx + 1, hi);
-}
-
-private function sort_insertion<T>(ptr: mut T*, lo: i64, hi: i64) -> void where T: Ord {
-    mut i: i64 = lo + 1;
-    while (i < hi) {
-        mut j: i64 = i;
-        // Walk j backwards while ptr[j-1] > ptr[j].  Stop at lo.
-        while (j > lo) {
-            const ord: Ordering = ptr[j - 1].compare(&ptr[j]);
-            match (ord) {
-                Ordering::Greater => {
-                    mem::swap::<T>(mem::offset(ptr, j - 1), mem::offset(ptr, j));
-                    j = j - 1;
+    if (length <= SORT_INSERTION_CUTOFF) { return; }
+    mut buffer: RawBuffer<T> = RawBuffer::new();
+    match (buffer.reserve_exact(0, length)) {
+        Result::Ok(_) => { }
+        Result::Err(_) => { core::panic("Array::sort: allocation failed", intrinsics::location()); }
+    }
+    const spare: mut T* = buffer.ptr();
+    for (mut width: i64 = SORT_INSERTION_CUTOFF; width < length; width *= 2) {
+        for (mut low: i64 = 0; low + width < length; low += 2 * width) {
+            const middle: i64 = low + width;
+            mut high: i64 = middle + width;
+            if (high > length) { high = length; }
+            // Two runs already in order need no merge.
+            if (!compare(&items[middle - 1], &items[middle]).is_gt()) { continue; }
+            const left_length: i64 = middle - low;
+            for (mut index: i64 = 0; index < left_length; index++) {
+                mem::copy::<T>(mem::offset(spare, index), mem::offset(items, low + index), 1);
+            }
+            // While the left run is not used up, `out` stays below `right`:
+            // the gap between them is the count of left elements still in
+            // the buffer.
+            mut left: i64 = 0;
+            mut right: i64 = middle;
+            mut out: i64 = low;
+            while (left < left_length && right < high) {
+                if (compare(&items[right], &spare[left]).is_lt()) {
+                    mem::copy::<T>(mem::offset(items, out), mem::offset(items, right), 1);
+                    right += 1;
+                } else {
+                    mem::copy::<T>(mem::offset(items, out), mem::offset(spare, left), 1);
+                    left += 1;
                 }
-                Ordering::Less    => { break; }
-                Ordering::Equal   => { break; }
+                out += 1;
+            }
+            // What is left of the right run is already in place.
+            while (left < left_length) {
+                mem::copy::<T>(mem::offset(items, out), mem::offset(spare, left), 1);
+                left += 1;
+                out += 1;
             }
         }
-        i = i + 1;
     }
 }
 
-/// Median-of-three pivot: pick the median of `ptr[lo]`, `ptr[mid]`,
-/// `ptr[hi-1]` as the pivot, move it to `ptr[hi-1]`, then partition
-/// `[lo, hi-1)` around its value.  Returns the final pivot index.
-private function sort_partition<T>(ptr: mut T*, lo: i64, hi: i64) -> i64 where T: Ord {
-    const mid: i64 = lo + (hi - lo) / 2;
-    sort_order_pair::<T>(ptr, lo,     mid);
-    sort_order_pair::<T>(ptr, lo,     hi - 1);
-    sort_order_pair::<T>(ptr, mid,    hi - 1);
-    // After the three pair-orderings, ptr[lo] <= ptr[mid] <= ptr[hi-1].
-    // Stash the median (ptr[mid]) at hi-1 as the pivot.
-    mem::swap::<T>(mem::offset(ptr, mid), mem::offset(ptr, hi - 1));
-    // Lomuto partition over [lo, hi-1) with pivot at ptr[hi-1].
-    mut store: i64 = lo;
-    mut k:     i64 = lo;
-    while (k < hi - 1) {
-        const ord: Ordering = ptr[k].compare(&ptr[hi - 1]);
-        match (ord) {
-            Ordering::Less    => {
-                mem::swap::<T>(mem::offset(ptr, store), mem::offset(ptr, k));
-                store = store + 1;
+/// An in-place quicksort that cannot go quadratic. A range is split around
+/// the median of its first, middle and last elements; a range of
+/// `SORT_INSERTION_CUTOFF` or fewer is put in order by insertion, and a
+/// range that has been split twice log2(length) times without getting that
+/// small is heapsorted instead. The smaller side of every split is sorted
+/// first and the larger one waits in `pending`, so at most log2(length)
+/// ranges wait at once: 63 for any `i64` length, three slots each.
+private function introsort<T, F>(items: mut T*, length: i64, compare: F) -> void where F: (&T, &T) -> Ordering {
+    if (length < 2) { return; }
+    mut depth_limit: i64 = 0;
+    for (mut remaining: i64 = length; remaining > 1; remaining /= 2) {
+        depth_limit += 2;
+    }
+    mut pending: [i64; 192] = [0; 192];
+    mut waiting: i64 = 0;
+    mut low: i64 = 0;
+    mut high: i64 = length;
+    mut depth: i64 = depth_limit;
+    loop {
+        if (high - low <= SORT_INSERTION_CUTOFF) {
+            for (mut index: i64 = low + 1; index < high; index++) {
+                mut at: i64 = index;
+                while (at > low && compare(&items[at - 1], &items[at]).is_gt()) {
+                    mem::swap::<T>(mem::offset(items, at - 1), mem::offset(items, at));
+                    at -= 1;
+                }
             }
-            Ordering::Equal   => { }
-            Ordering::Greater => { }
-        }
-        k = k + 1;
-    }
-    mem::swap::<T>(mem::offset(ptr, store), mem::offset(ptr, hi - 1));
-    return store;
-}
-
-private function sort_order_pair<T>(ptr: mut T*, i: i64, j: i64) -> void where T: Ord {
-    const ord: Ordering = ptr[i].compare(&ptr[j]);
-    match (ord) {
-        Ordering::Greater => {
-            mem::swap::<T>(mem::offset(ptr, i), mem::offset(ptr, j));
-        }
-        Ordering::Less  => { }
-        Ordering::Equal => { }
-    }
-}
-
-// `sort_by` helpers - identical shape to the Ord versions but route
-// comparisons through a caller-supplied `less` predicate.  Duplicated
-// rather than parameterised because Cryo's free-function generics can
-// take a fn-typed parameter directly, and the duplication keeps the
-// hot inner loops monomorphic and obvious.
-
-private function sort_range_by<T>(ptr: mut T*, lo: i64, hi: i64,
-                          less: (&T, &T) -> boolean) -> void {
-    if (hi - lo < SORT_INSERTION_CUTOFF) {
-        sort_insertion_by::<T>(ptr, lo, hi, less);
-        return;
-    }
-    const pivot_idx: i64 = sort_partition_by::<T>(ptr, lo, hi, less);
-    sort_range_by::<T>(ptr, lo, pivot_idx,    less);
-    sort_range_by::<T>(ptr, pivot_idx + 1, hi, less);
-}
-
-private function sort_insertion_by<T>(ptr: mut T*, lo: i64, hi: i64,
-                              less: (&T, &T) -> boolean) -> void {
-    mut i: i64 = lo + 1;
-    while (i < hi) {
-        mut j: i64 = i;
-        while (j > lo) {
-            if (less(&ptr[j], &ptr[j - 1])) {
-                mem::swap::<T>(mem::offset(ptr, j - 1), mem::offset(ptr, j));
-                j = j - 1;
+        } else if (depth == 0) {
+            // A max-heap over [low, high): first built by sifting down
+            // every parent, last to first, then emptied by swapping its
+            // root to the end of the shrinking heap and sifting the new
+            // root down.
+            const size: i64 = high - low;
+            mut heap_end: i64 = size;
+            mut next_parent: i64 = size / 2;
+            loop {
+                mut root: i64 = 0;
+                if (next_parent > 0) {
+                    next_parent -= 1;
+                    root = next_parent;
+                } else {
+                    heap_end -= 1;
+                    if (heap_end <= 0) { break; }
+                    mem::swap::<T>(mem::offset(items, low), mem::offset(items, low + heap_end));
+                }
+                loop {
+                    mut child: i64 = 2 * root + 1;
+                    if (child >= heap_end) { break; }
+                    if (child + 1 < heap_end && compare(&items[low + child], &items[low + child + 1]).is_lt()) {
+                        child += 1;
+                    }
+                    if (!compare(&items[low + root], &items[low + child]).is_lt()) { break; }
+                    mem::swap::<T>(mem::offset(items, low + root), mem::offset(items, low + child));
+                    root = child;
+                }
+            }
+        } else {
+            depth -= 1;
+            // Order the first, middle and last elements, then park the
+            // median at `high - 1` as the pivot and partition the rest
+            // around it.
+            const middle: i64 = low + (high - low) / 2;
+            if (compare(&items[middle], &items[low]).is_lt()) {
+                mem::swap::<T>(mem::offset(items, middle), mem::offset(items, low));
+            }
+            if (compare(&items[high - 1], &items[low]).is_lt()) {
+                mem::swap::<T>(mem::offset(items, high - 1), mem::offset(items, low));
+            }
+            if (compare(&items[high - 1], &items[middle]).is_lt()) {
+                mem::swap::<T>(mem::offset(items, high - 1), mem::offset(items, middle));
+            }
+            mem::swap::<T>(mem::offset(items, middle), mem::offset(items, high - 1));
+            mut store: i64 = low;
+            for (mut index: i64 = low; index < high - 1; index++) {
+                if (compare(&items[index], &items[high - 1]).is_lt()) {
+                    mem::swap::<T>(mem::offset(items, store), mem::offset(items, index));
+                    store += 1;
+                }
+            }
+            mem::swap::<T>(mem::offset(items, store), mem::offset(items, high - 1));
+            if (store - low < high - store - 1) {
+                pending[waiting] = store + 1;
+                pending[waiting + 1] = high;
+                pending[waiting + 2] = depth;
+                high = store;
             } else {
-                break;
+                pending[waiting] = low;
+                pending[waiting + 1] = store;
+                pending[waiting + 2] = depth;
+                low = store + 1;
             }
+            waiting += 3;
+            continue;
         }
-        i = i + 1;
-    }
-}
-
-private function sort_partition_by<T>(ptr: mut T*, lo: i64, hi: i64,
-                              less: (&T, &T) -> boolean) -> i64 {
-    const mid: i64 = lo + (hi - lo) / 2;
-    sort_order_pair_by::<T>(ptr, lo,  mid,     less);
-    sort_order_pair_by::<T>(ptr, lo,  hi - 1,  less);
-    sort_order_pair_by::<T>(ptr, mid, hi - 1,  less);
-    mem::swap::<T>(mem::offset(ptr, mid), mem::offset(ptr, hi - 1));
-    mut store: i64 = lo;
-    mut k:     i64 = lo;
-    while (k < hi - 1) {
-        if (less(&ptr[k], &ptr[hi - 1])) {
-            mem::swap::<T>(mem::offset(ptr, store), mem::offset(ptr, k));
-            store = store + 1;
-        }
-        k = k + 1;
-    }
-    mem::swap::<T>(mem::offset(ptr, store), mem::offset(ptr, hi - 1));
-    return store;
-}
-
-private function sort_order_pair_by<T>(ptr: mut T*, i: i64, j: i64,
-                               less: (&T, &T) -> boolean) -> void {
-    if (less(&ptr[j], &ptr[i])) {
-        mem::swap::<T>(mem::offset(ptr, i), mem::offset(ptr, j));
+        if (waiting == 0) { break; }
+        waiting -= 3;
+        low = pending[waiting];
+        high = pending[waiting + 1];
+        depth = pending[waiting + 2];
     }
 }
 

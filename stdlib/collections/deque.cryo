@@ -1,0 +1,205 @@
+///! Deque: a double-ended queue, growable at both ends.
+///!
+///!     import std::collections::deque::{ Deque };
+///!
+///!     mut queue: Deque<i64> = Deque::new();
+///!     queue.push_back(2);
+///!     queue.push_front(1);
+///!     queue.push_back(3);
+///!     const first: Option<i64> = queue.pop_front();   // Some(1)
+///!     const middle: i64 = queue[0];                    // 2
+///!
+///! The elements live in one ring buffer: they start at `head` and run
+///! `length` slots on, wrapping from the buffer's end to its start. Pushing
+///! and popping at either end is O(1), amortised over the doublings that
+///! grow the buffer; indexing is O(1). `as_slices` hands out the elements
+///! as the two runs they occupy.
+
+namespace std::collections::deque;
+
+import std::core::intrinsics;
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::core::mem;
+import std::core::ptr;
+import std::core::drop::{ Drop };
+import std::core::ops::{ Index, IndexMutable };
+import std::alloc::allocator::{ Allocator, GlobalAlloc };
+import std::collections::pair::{ Pair };
+import std::collections::raw_buffer::{ RawBuffer };
+
+/// The capacity the first push allocates.
+private const INITIAL_CAPACITY: i64 = 4;
+
+public type struct Deque<T, A = GlobalAlloc> where A: Allocator {
+    private buffer: RawBuffer<T, A>;
+    /// The slot the front element is in.
+    private head: i64;
+    private length: i64;
+
+    /// An empty deque backed by `GlobalAlloc`. It allocates nothing until
+    /// the first push.
+    public static new() -> Deque<T, GlobalAlloc> {
+        return Deque::<T, GlobalAlloc> { buffer: RawBuffer::new(), head: 0, length: 0 };
+    }
+
+    /// An empty deque that allocates through `alloc`.
+    public static new_in(alloc: A) -> Deque<T, A> {
+        return Deque::<T, A> { buffer: RawBuffer::new_in(alloc), head: 0, length: 0 };
+    }
+
+    /// An empty deque with room for `capacity` elements before it grows.
+    /// Panics on allocation failure.
+    public static with_capacity(capacity: i64) -> Deque<T, GlobalAlloc> {
+        mut deque: Deque<T, GlobalAlloc> = Deque::new();
+        match (deque.buffer.reserve_exact(0, capacity)) {
+            Result::Ok(_) => { }
+            Result::Err(_) => { core::panic("Deque::with_capacity: allocation failed", intrinsics::location()); }
+        }
+        return deque;
+    }
+
+    public length(&this) -> i64 {
+        return this.length;
+    }
+
+    public is_empty(&this) -> boolean {
+        return this.length == 0;
+    }
+
+    /// How many elements fit before the deque grows.
+    public capacity(&this) -> i64 {
+        return this.buffer.capacity();
+    }
+
+    /// Add `value` after the back element. Panics on allocation failure.
+    public push_back(mut &this, value: T) -> void {
+        this.grow_if_full();
+        const slot: mut T* = mem::offset(this.buffer.ptr(), this.slot_of(this.length));
+        *slot = value;
+        this.length += 1;
+    }
+
+    /// Add `value` before the front element. Panics on allocation failure.
+    public push_front(mut &this, value: T) -> void {
+        this.grow_if_full();
+        this.head = this.slot_of(this.buffer.capacity() - 1);
+        const slot: mut T* = mem::offset(this.buffer.ptr(), this.head);
+        *slot = value;
+        this.length += 1;
+    }
+
+    /// Remove and return the front element, or `None` when empty.
+    public pop_front(mut &this) -> Option<T> {
+        if (this.length == 0) { return Option::None; }
+        const slot: T* = mem::offset(this.buffer.ptr(), this.head);
+        mut value: T;
+        unsafe { value = *slot; }
+        this.head = this.slot_of(1);
+        this.length -= 1;
+        return Option::Some(value);
+    }
+
+    /// Remove and return the back element, or `None` when empty.
+    public pop_back(mut &this) -> Option<T> {
+        if (this.length == 0) { return Option::None; }
+        this.length -= 1;
+        const slot: T* = mem::offset(this.buffer.ptr(), this.slot_of(this.length));
+        mut value: T;
+        unsafe { value = *slot; }
+        return Option::Some(value);
+    }
+
+    /// The front element, or `None` when empty.
+    public front(&this) -> Option<T*> {
+        return this.get_ref(0);
+    }
+
+    /// The back element, or `None` when empty.
+    public back(&this) -> Option<T*> {
+        return this.get_ref(this.length - 1);
+    }
+
+    /// The element `index` places from the front, or `None` past the end.
+    public get_ref(&this, index: i64) -> Option<T*> {
+        if (index < 0 || index >= this.length) { return Option::None; }
+        return Option::Some(mem::offset(this.buffer.ptr(), this.slot_of(index)));
+    }
+
+    /// The elements front to back, as the run from the front element to
+    /// the buffer's end and the run that wrapped round to its start. The
+    /// second is empty when nothing wrapped.
+    public as_slices(&this) -> Pair<&Slice<T>, &Slice<T>> {
+        const capacity: i64 = this.buffer.capacity();
+        mut first_length: i64 = this.length;
+        if (this.head + this.length > capacity) {
+            first_length = capacity - this.head;
+        }
+        const first: &Slice<T> = Slice::from_raw(mem::offset(this.buffer.ptr(), this.head), first_length);
+        const second: &Slice<T> = Slice::from_raw(this.buffer.ptr(), this.length - first_length);
+        return Pair::new(first, second);
+    }
+
+    /// Release every element, keeping the buffer.
+    public clear(mut &this) -> void {
+        for (mut index: i64 = 0; index < this.length; index++) {
+            ptr::drop_in_place::<T>(mem::offset(this.buffer.ptr(), this.slot_of(index)));
+        }
+        this.head = 0;
+        this.length = 0;
+    }
+
+    /// The buffer slot of the element `index` places from the front.
+    private slot_of(&this, index: i64) -> i64 {
+        const capacity: i64 = this.buffer.capacity();
+        const slot: i64 = this.head + index;
+        if (slot >= capacity) { return slot - capacity; }
+        return slot;
+    }
+
+    /// Double the buffer when it is full. The buffer keeps its slots in
+    /// place as it grows, so a run that had wrapped to the start is moved
+    /// to just past the old end, where it continues the run from `head`.
+    private grow_if_full(mut &this) -> void {
+        const old_capacity: i64 = this.buffer.capacity();
+        if (this.length < old_capacity) { return; }
+        mut additional: i64 = old_capacity;
+        if (additional < INITIAL_CAPACITY) { additional = INITIAL_CAPACITY; }
+        match (this.buffer.reserve_exact(old_capacity, additional)) {
+            Result::Ok(_) => { }
+            Result::Err(_) => { core::panic("Deque: allocation failed", intrinsics::location()); }
+        }
+        const wrapped: i64 = this.head + this.length - old_capacity;
+        for (mut index: i64 = 0; index < wrapped; index++) {
+            mem::copy::<T>(mem::offset(this.buffer.ptr(), old_capacity + index), mem::offset(this.buffer.ptr(), index), 1);
+        }
+    }
+}
+
+implement<T, A> trait Drop for struct Deque<T, A> where A: Allocator {
+    drop(mut &this) -> void {
+        this.clear();
+    }
+}
+
+implement<T, A> trait Index<i64> for struct Deque<T, A> where A: Allocator {
+    type Output = T;
+    ![caller_location]
+    index(&this, index: i64) -> const T* {
+        if (index < 0 || index >= this.length) {
+            core::panic("Deque: index out of range", intrinsics::location());
+        }
+        return mem::offset(this.buffer.ptr(), this.slot_of(index));
+    }
+}
+
+implement<T, A> trait IndexMutable<i64> for struct Deque<T, A> where A: Allocator {
+    ![caller_location]
+    index_mutable(mut &this, index: i64) -> mut T* {
+        if (index < 0 || index >= this.length) {
+            core::panic("Deque: index out of range", intrinsics::location());
+        }
+        return mem::offset(this.buffer.ptr(), this.slot_of(index));
+    }
+}

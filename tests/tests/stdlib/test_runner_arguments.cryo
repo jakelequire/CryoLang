@@ -1,0 +1,95 @@
+///! The test runner's own command line. Every flag and option `cryo test`
+///! forwards is accepted in each of its spellings, and anything else stops
+///! the run with exit code 2, the error and the usage on stderr, before a
+///! test runs. Each test runs this test binary again with `--list`, so no
+///! test runs twice.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::TestRunnerArguments;
+
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::env;
+import std::process::command::{ Command, Output, Stdio };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_eq };
+
+/// This test binary run again with `arguments`, split at spaces.
+function run_runner(arguments: string) -> Result<Output, TestError> {
+    const program: String = match (env::current_exe()) {
+        Option::Some(path) => { path }
+        Option::None => { return Result::Err(TestError::failed(Str::new("the test binary's own path is unknown"))); }
+    };
+    mut command: Command = Command::new(program.as_str());
+    for (word in Str::new(arguments).split_whitespace()) {
+        command.arg(word);
+    }
+    command.stdout(Stdio::Piped).stderr(Stdio::Piped);
+    return Result::Ok(command.output()?);
+}
+
+function exit_code(output: &Output) -> i32 {
+    return output.status().exit_code().unwrap_or(-1);
+}
+
+function text_of(bytes: &Slice<u8>) -> Str {
+    return Str::from_utf8(bytes).unwrap();
+}
+
+![test]
+function every_forwarded_option_is_accepted() -> Result<(), TestError> {
+    const output: Output = run_runner("--list --ignored --quiet --nocapture --show-output --format=plain --color=never --timeout=5 --jobs=1 --exact CryoTests::Tests::Stdlib::TestRunnerArguments::every_forwarded_option_is_accepted")?;
+    expect_eq(exit_code(&output), 0)?;
+    const listed: Str = text_of(output.stdout());
+    expect(listed.contains(&Str::new("every_forwarded_option_is_accepted")), Str::new("the test is listed"))?;
+    // `--exact` and the pattern reached the filter: a sibling is not listed.
+    expect(!listed.contains(&Str::new("short_and_alternate_spellings_are_accepted")), Str::new("a sibling is not listed"))?;
+    return Result::Ok(());
+}
+
+![test]
+function short_and_alternate_spellings_are_accepted() -> Result<(), TestError> {
+    const output: Output = run_runner("-q -j 2 -j3 --jobs 4 --no-capture --timeout 5 --list TestRunnerArguments::short_and")?;
+    expect_eq(exit_code(&output), 0)?;
+    expect(text_of(output.stdout()).contains(&Str::new("short_and_alternate_spellings_are_accepted")), Str::new("the test is listed"))?;
+    return Result::Ok(());
+}
+
+![test]
+function an_unknown_option_stops_the_run() -> Result<(), TestError> {
+    const output: Output = run_runner("--list --colour=never")?;
+    expect_eq(exit_code(&output), 2)?;
+    const errors: Str = text_of(output.stderr());
+    expect(errors.contains(&Str::new("error: unknown option '--colour=never'")), Str::new("the option is named"))?;
+    expect(errors.contains(&Str::new("usage: cryo test [options] [<pattern>]")), Str::new("the usage follows"))?;
+    // Nothing was listed: the run stopped at the command line.
+    expect_eq(output.stdout().length(), 0)?;
+    return Result::Ok(());
+}
+
+![test]
+function an_unknown_short_letter_stops_the_run() -> Result<(), TestError> {
+    const output: Output = run_runner("--list -qx")?;
+    expect_eq(exit_code(&output), 2)?;
+    expect(text_of(output.stderr()).contains(&Str::new("error: unknown option 'x'")), Str::new("the letter is named"))?;
+    return Result::Ok(());
+}
+
+![test]
+function a_second_pattern_stops_the_run() -> Result<(), TestError> {
+    const output: Output = run_runner("--list first second")?;
+    expect_eq(exit_code(&output), 2)?;
+    expect(text_of(output.stderr()).contains(&Str::new("error: unexpected argument 'second'")), Str::new("the extra pattern is named"))?;
+    return Result::Ok(());
+}
+
+![test]
+function a_flag_given_a_value_stops_the_run() -> Result<(), TestError> {
+    const output: Output = run_runner("--list --quiet=yes")?;
+    expect_eq(exit_code(&output), 2)?;
+    expect(text_of(output.stderr()).contains(&Str::new("error: flag '--quiet=yes' takes no value")), Str::new("the flag is named"))?;
+    return Result::Ok(());
+}

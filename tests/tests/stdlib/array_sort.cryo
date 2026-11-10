@@ -1,0 +1,243 @@
+///! Array sorting and searching: `sort` keeps equal elements in order,
+///! both sorts order large and adversarial inputs, `sort_unstable` stays
+///! within O(n log n) comparisons where a plain quicksort goes quadratic,
+///! owning elements survive both sorts, `binary_search` answers found and
+///! insertion points, and `retain` and `dedup` release what they remove.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::ArraySort;
+
+import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::core::cmp::{ Ord, Ordering };
+import std::core::drop::{ Drop };
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_eq };
+
+/// A sort key with the position the element started at.
+type struct Tagged {
+    key: i64;
+    position: i64;
+}
+
+/// How many times `counted_compare` has been called.
+mut comparisons: i64 = 0;
+
+function counted_compare(a: &i64, b: &i64) -> Ordering {
+    comparisons += 1;
+    return a.compare(b);
+}
+
+/// `count` numbers from a fixed linear congruential sequence, below `limit`.
+function scrambled(count: i64, limit: i64) -> Array<i64> {
+    mut numbers: Array<i64> = Array::new();
+    mut state: i64 = 12345;
+    for (mut index: i64 = 0; index < count; index++) {
+        state = (state * 1103515245 + 12345) % 2147483648;
+        numbers.push(state % limit);
+    }
+    return numbers;
+}
+
+function is_ascending(numbers: &Array<i64>) -> boolean {
+    for (mut index: i64 = 1; index < numbers.length(); index++) {
+        if (numbers[index - 1] > numbers[index]) { return false; }
+    }
+    return true;
+}
+
+function total(numbers: &Array<i64>) -> i64 {
+    mut sum: i64 = 0;
+    for (mut index: i64 = 0; index < numbers.length(); index++) {
+        sum += numbers[index];
+    }
+    return sum;
+}
+
+![test]
+function sort_keeps_equal_elements_in_order() -> Result<(), TestError> {
+    mut items: Array<Tagged> = Array::new();
+    const keys: Array<i64> = scrambled(500, 7);
+    for (mut index: i64 = 0; index < keys.length(); index++) {
+        items.push(Tagged { key: keys[index], position: index });
+    }
+    items.sort_by((a: &Tagged, b: &Tagged) -> Ordering { return a.key.compare(&b.key); });
+    for (mut index: i64 = 1; index < items.length(); index++) {
+        const before: &Tagged = &items[index - 1];
+        const after: &Tagged = &items[index];
+        expect(before.key <= after.key, Str::new("keys ascend"))?;
+        if (before.key == after.key) {
+            expect(before.position < after.position, Str::new("equal keys keep their order"))?;
+        }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function both_sorts_order_a_large_scrambled_array() -> Result<(), TestError> {
+    mut stable: Array<i64> = scrambled(5000, 1000000);
+    mut unstable: Array<i64> = scrambled(5000, 1000000);
+    const before: i64 = total(&stable);
+    stable.sort();
+    unstable.sort_unstable();
+    expect(is_ascending(&stable), Str::new("sort ascends"))?;
+    expect(is_ascending(&unstable), Str::new("sort_unstable ascends"))?;
+    expect_eq(total(&stable), before)?;
+    expect_eq(total(&unstable), before)?;
+    for (mut index: i64 = 0; index < stable.length(); index++) {
+        expect_eq(stable[index], unstable[index])?;
+    }
+    return Result::Ok(());
+}
+
+![test]
+function both_sorts_order_ascending_descending_and_equal_inputs() -> Result<(), TestError> {
+    for (mut shape: i64 = 0; shape < 3; shape++) {
+        mut stable: Array<i64> = Array::new();
+        mut unstable: Array<i64> = Array::new();
+        for (mut index: i64 = 0; index < 1000; index++) {
+            mut value: i64 = index;
+            if (shape == 1) { value = 1000 - index; }
+            if (shape == 2) { value = 5; }
+            stable.push(value);
+            unstable.push(value);
+        }
+        stable.sort();
+        unstable.sort_unstable();
+        expect(is_ascending(&stable), Str::new("sort ascends"))?;
+        expect(is_ascending(&unstable), Str::new("sort_unstable ascends"))?;
+    }
+    return Result::Ok(());
+}
+
+![test]
+function sort_unstable_stays_n_log_n_on_equal_elements() -> Result<(), TestError> {
+    // Every element equal sends every partition's elements to one side, so
+    // a quicksort without the heapsort turn makes about n * n / 2
+    // comparisons: eight million here. The bound is a tenth of that.
+    mut items: Array<i64> = Array::new();
+    for (mut index: i64 = 0; index < 4096; index++) {
+        items.push(7);
+    }
+    comparisons = 0;
+    items.sort_unstable_by(counted_compare);
+    expect(comparisons < 800000, Str::new("comparisons stay O(n log n)"))?;
+    return Result::Ok(());
+}
+
+![test]
+function sort_by_takes_a_descending_comparison() -> Result<(), TestError> {
+    mut items: Array<i64> = scrambled(300, 50);
+    items.sort_by((a: &i64, b: &i64) -> Ordering { return b.compare(a); });
+    for (mut index: i64 = 1; index < items.length(); index++) {
+        expect(items[index - 1] >= items[index], Str::new("descends"))?;
+    }
+    mut unstable: Array<i64> = scrambled(300, 50);
+    unstable.sort_unstable_by((a: &i64, b: &i64) -> Ordering { return b.compare(a); });
+    for (mut index: i64 = 0; index < items.length(); index++) {
+        expect_eq(unstable[index], items[index])?;
+    }
+    return Result::Ok(());
+}
+
+![test]
+function both_sorts_move_owning_elements() -> Result<(), TestError> {
+    mut stable: Array<String> = Array::new();
+    mut unstable: Array<String> = Array::new();
+    const numbers: Array<i64> = scrambled(200, 100);
+    for (mut index: i64 = 0; index < numbers.length(); index++) {
+        stable.push(f"item {numbers[index]}");
+        unstable.push(f"item {numbers[index]}");
+    }
+    stable.sort();
+    unstable.sort_unstable();
+    for (mut index: i64 = 1; index < stable.length(); index++) {
+        expect(stable[index - 1].as_str().compare(&stable[index].as_str()).is_le(), Str::new("sort ascends"))?;
+        expect(stable[index].as_str().equals(&unstable[index].as_str()), Str::new("the sorts agree"))?;
+    }
+    return Result::Ok(());
+}
+
+/// A search's answer as one number: a found index as itself, an insertion
+/// point `p` as `-1 - p`.
+function answer(found: Result<i64, i64>) -> i64 {
+    match (found) {
+        Result::Ok(index) => { return index; }
+        Result::Err(insertion) => { return -1 - insertion; }
+    }
+}
+
+![test]
+function binary_search_finds_values_and_insertion_points() -> Result<(), TestError> {
+    mut items: Array<i64> = Array::new();
+    // Values far past 16 bits, so a comparison of their low bits alone
+    // would answer wrongly.
+    for (mut index: i64 = 0; index < 50; index++) {
+        items.push(index * 2 * 100003);
+    }
+    for (mut index: i64 = 0; index < 50; index++) {
+        const even: i64 = index * 2 * 100003;
+        const odd: i64 = even + 100003;
+        expect_eq(answer(items.binary_search(&even)), index)?;
+        expect_eq(answer(items.binary_search(&odd)), -1 - (index + 1))?;
+    }
+    const below: i64 = -1;
+    expect_eq(answer(items.binary_search(&below)), -1)?;
+    const empty: Array<i64> = Array::new();
+    const three: i64 = 3;
+    expect_eq(answer(empty.binary_search(&three)), -1)?;
+    const forty: i64 = 40 * 100003;
+    expect_eq(answer(items.binary_search_by((element: &i64) -> Ordering { return element.compare(&forty); })), 20)?;
+    return Result::Ok(());
+}
+
+/// How many `Counted` values have been released.
+mut released: i64 = 0;
+
+type struct Counted {
+    value: i64;
+}
+
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void { released += 1; }
+}
+
+![test]
+function retain_keeps_matches_in_order_and_releases_the_rest() -> Result<(), TestError> {
+    mut items: Array<Counted> = Array::new();
+    for (mut index: i64 = 0; index < 10; index++) {
+        items.push(Counted { value: index });
+    }
+    released = 0;
+    items.retain((item: &Counted) -> boolean { return item.value % 3 == 0; });
+    expect_eq(released, 6)?;
+    expect_eq(items.length(), 4)?;
+    for (mut index: i64 = 0; index < items.length(); index++) {
+        expect_eq(items[index].value, index * 3)?;
+    }
+    return Result::Ok(());
+}
+
+![test]
+function dedup_keeps_the_first_of_each_run() -> Result<(), TestError> {
+    mut items: Array<i64> = Array::new();
+    const values: Array<i64> = scrambled(400, 20);
+    for (mut index: i64 = 0; index < values.length(); index++) {
+        items.push(values[index]);
+    }
+    items.sort();
+    items.dedup();
+    expect_eq(items.length(), 20)?;
+    for (mut index: i64 = 0; index < items.length(); index++) {
+        expect_eq(items[index], index)?;
+    }
+    mut runs: Array<i64> = Array::new();
+    runs.push(1); runs.push(1); runs.push(2); runs.push(1); runs.push(1);
+    runs.dedup();
+    expect_eq(runs.length(), 3)?;
+    expect_eq(runs[2], 1)?;
+    return Result::Ok(());
+}

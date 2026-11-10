@@ -34,10 +34,12 @@ import std::core::result::{ Result };
 import std::core::drop::{ Drop };
 import std::alloc::layout::{ Layout };
 import std::alloc::allocator::{ AllocError, AllocErrorKind, GlobalAlloc };
+import std::core::option::{ Option };
 import std::ffi::libc::{
-    pthread_cond_broadcast, pthread_cond_destroy, pthread_cond_init, pthread_cond_signal,
-    pthread_cond_wait
+    ClockId, ETIMEDOUT, clock_gettime, pthread_cond_broadcast, pthread_cond_destroy, pthread_cond_init,
+    pthread_cond_signal, pthread_cond_timedwait, pthread_cond_wait, timespec
 };
+import std::time::duration::{ Duration };
 import std::sys::syscall;
 import std::sync::mutex::{ Mutex, MutexGuard };
 
@@ -64,6 +66,47 @@ private function cond_wait_raw(cond: mut u8*, mtx: mut u8*) -> i32 {
     if (syscall::SleepConditionVariableSRW(cond, mtx, syscall::INFINITE, 0) != 0) { return 0; }
     return 1;
 }
+
+/// Wait on `cond` for no longer than `duration`: `Some(true)` when the
+/// time ran out, `Some(false)` when woken, `None` when the wait failed. A
+/// duration too long for the clock to state waits as long as it can.
+![target(unix)]
+private function cond_wait_timeout_raw(cond: mut u8*, mtx: mut u8*, duration: &Duration) -> Option<boolean> {
+    mut deadline: timespec = timespec { tv_sec: 0, tv_nsec: 0 };
+    clock_gettime(ClockId::CLOCK_REALTIME, &deadline);
+    mut seconds: i64 = LONGEST_WAIT_SECONDS;
+    match (i64::try_from(duration.as_secs())) {
+        Result::Ok(whole) => { if (whole < seconds) { seconds = whole; } }
+        Result::Err(_) => { }
+    }
+    deadline.tv_sec += seconds;
+    deadline.tv_nsec += duration.subsec_nanos();
+    if (deadline.tv_nsec >= 1000000000) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000;
+    }
+    const status: i32 = pthread_cond_timedwait(cond, mtx, &deadline);
+    if (status == 0) { return Option::Some(false); }
+    if (status == ETIMEDOUT) { return Option::Some(true); }
+    return Option::None;
+}
+![target(windows)]
+private function cond_wait_timeout_raw(cond: mut u8*, mtx: mut u8*, duration: &Duration) -> Option<boolean> {
+    // INFINITE would never time out, so the longest finite wait is one less.
+    mut milliseconds: u32 = syscall::INFINITE - 1;
+    match (u32::try_from(duration.as_millis_ceil())) {
+        Result::Ok(whole) => { if (whole < milliseconds) { milliseconds = whole; } }
+        Result::Err(_) => { }
+    }
+    if (syscall::SleepConditionVariableSRW(cond, mtx, milliseconds, 0) != 0) { return Option::Some(false); }
+    if (syscall::GetLastError() == syscall::ERROR_TIMEOUT) { return Option::Some(true); }
+    return Option::None;
+}
+
+/// The longest wait `cond_wait_timeout_raw` states as a deadline: about
+/// 34,000 years, far inside what `tv_sec` holds from any present time.
+![target(unix)]
+private const LONGEST_WAIT_SECONDS: i64 = 1099511627776;
 
 ![target(unix)]
 private function cond_signal_raw(buf: mut u8*) -> void { pthread_cond_signal(buf); }
@@ -134,6 +177,21 @@ public type struct CondVar {
         const rc: i32 = cond_wait_raw(cond_buf, mutex_buf);
         if (rc != 0) {
             core::panic("CondVar::wait: cond_wait_raw failed", intrinsics::location());
+        }
+    }
+
+    /// Wait as `wait` does, but for no longer than `duration`. Answers
+    /// true when the wait ended because `duration` passed, false when the
+    /// thread was woken. A wake can be spurious, as for `wait`, so check
+    /// the condition waited for either way.
+    public wait_timeout<T, A>(&this, mutex: &Mutex<T, A>, guard: mut &MutexGuard<T, A>, duration: Duration) -> boolean {
+        const cond_buf:  mut u8* = &this.inner.pthread_buf[0];
+        const mutex_buf: mut u8* = mutex.raw_pthread_buf();
+        match (cond_wait_timeout_raw(cond_buf, mutex_buf, &duration)) {
+            Option::Some(timed_out) => { return timed_out; }
+            Option::None => {
+                core::panic("CondVar::wait_timeout: the wait failed", intrinsics::location());
+            }
         }
     }
 

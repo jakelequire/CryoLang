@@ -207,9 +207,16 @@ cryo test [PATTERN] [FLAGS]
 | `--timeout=N` | Per-test wall-clock limit in seconds (default 60; `0` disables) |
 | `--format=plain\|pretty\|compact` | Output layout |
 | `--color=auto\|always\|never` | ANSI color control |
+| `--jobs=N` | How many tests run at once (`0`, the default, is one per processor) |
+| `--nocapture` | Let each test write straight to the terminal instead of capturing its output |
+| `--show-output` | Replay the captured output of passing tests too, not only failing ones |
 
 Environment overrides (useful in CI): `CRYO_TEST_TIMEOUT`, `CRYO_TEST_FORMAT`,
-`CRYO_TEST_COLOR`.
+`CRYO_TEST_COLOR`, `CRYO_TEST_JOBS`, `CRYO_TEST_NOCAPTURE`.
+
+A built test binary takes the same flags, and `-j N` for `--jobs`. A flag it
+does not know is an error: it prints the flag and its usage to stderr and exits
+with code 2 before running anything.
 
 ---
 
