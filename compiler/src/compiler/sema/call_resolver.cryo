@@ -6770,6 +6770,48 @@ type struct CallResolver {
         return DeclarationNode::fn_of(decl.methods[slot]).def;
     }
 
+    /// The function type of `T::m` taken as a value in a generic body, where
+    /// the bound on `T` directed the path to its trait's declared method `m`
+    /// (`scope.template_method`): the method's signature with its receiver
+    /// first, `This` being `T` and the bound's trait arguments put in, so
+    /// `T::compare` under `where T: Ord` is a `(&T, &T) -> Ordering`.  That
+    /// is the type every copy's `Pt::compare` has once `T` is `Pt`, so a
+    /// generic callee taking the value binds its parameters from it where
+    /// the body is written.  Invalid for a method generic in its own
+    /// parameters, whose value is one instance chosen by its use, and for a
+    /// generic trait no bound on `T` names - a supertrait's method - whose
+    /// arguments nothing here writes.
+    param_path_value_type(mut &this, scope: ScopeResolutionExpr*) -> TypeRef {
+        if (!scope.template_method.is_valid() || !scope.resolved_trait.is_valid()) { return TypeRef::invalid(); }
+        const param_ty: TypeRef = this.symbolic.symbolic_scope_param_type(scope);
+        const func: FunctionDecl* = DeclarationNode::fn_of(this.ctx.decl_index.method_func_of(scope.template_method));
+        if (!param_ty.is_valid() || func == null || func.generic_params.length() > 0) { return TypeRef::invalid(); }
+        const tdecl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(scope.resolved_trait);
+        if (tdecl == null) { return TypeRef::invalid(); }
+        const refs: [const TraitRef*] = this.binding.bounds_naming(param_ty, scope.resolved_trait);
+        const trait_has_arguments: boolean = tdecl.generic_params.length() > 0 || tdecl.assoc_types.length() > 0;
+        if (trait_has_arguments && refs.length() == 0) { return TypeRef::invalid(); }
+        // The parameters, then the return, each with the bound's trait
+        // arguments and then `T` put in.
+        mut params: [TypeRef] = [];
+        mut ret: TypeRef = TypeRef::invalid();
+        for (mut i: i64 = 0; i <= func.parameters.length(); i++) {
+            mut part: TypeRef = func.resolved_return_type;
+            if (i < func.parameters.length()) {
+                const p: VarDecl* = DeclarationNode::var_of(func.parameters[i]);
+                if (p == null) { return TypeRef::invalid(); }
+                part = p.resolved_type;
+            }
+            if (!part.is_valid()) { return TypeRef::invalid(); }
+            if (refs.length() > 0) {
+                part = this.binding.subst_bound_trait_args(part, refs[0].path[refs[0].path.length() - 1], refs[0]);
+            }
+            part = this.binding.subst_this_in_trait_return(part, param_ty);
+            if (i < func.parameters.length()) { params.push(part); } else { ret = part; }
+        }
+        return this.arena.get_function(ret, &params, func.is_variadic);
+    }
+
     /// A call written through a TRAIT's path, `Beta::go(&p, ...)`: the
     /// implementation is the receiver's - the first argument's type, behind
     /// any reference or pointer - and the method is the one that trait
