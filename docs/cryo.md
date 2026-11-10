@@ -2919,7 +2919,7 @@ A struct can have multiple type parameters, and a parameter can have a default. 
 
 ```cryo
 type struct Array<T, A = GlobalAlloc> { /* ... */ }
-type struct HashMap<K, V, A = GlobalAlloc> { /* ... */ }
+type struct HashMap<K, V, A = GlobalAlloc, H = SipHasher> { /* ... */ }
 ```
 
 Calling `Array::<int>::new()` uses `GlobalAlloc`; calling `Array::<int, Arena>::new_in(my_arena)` parameterises the container over a custom allocator.
