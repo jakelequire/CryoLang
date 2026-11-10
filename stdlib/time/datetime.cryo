@@ -1,36 +1,53 @@
-///! std::time::datetime: `DateTime`, a UTC civil calendar.
+///! std::time::datetime: `DateTime`, a civil calendar reading at a fixed
+///! offset from UTC, and RFC 3339 text both ways.
 ///!
-///! `DateTime` is a broken-out UTC calendar reading - year / month / day /
-///! hour / minute / second - derived from a Unix timestamp (whole seconds
-///! since 1970-01-01 00:00:00 UTC) or a `SystemTime`. It is a pure value:
-///! POD, copy-by-value, no `Drop`.
+///! A `DateTime` is a broken-out calendar reading - year / month / day /
+///! hour / minute / second / nanosecond - together with the `UtcOffset` it
+///! was read at. It is a pure value: POD, copy-by-value, no `Drop`. One
+///! made from a Unix timestamp or a `SystemTime` is read at UTC; `to_offset`
+///! reads the same instant at another offset.
 ///!
 ///! The timestamp <-> civil-date conversion uses Howard Hinnant's public
-///! `civil_from_days` algorithm, which is exact and branch-light across the
-///! whole proleptic Gregorian calendar - leap years, century rules, and
-///! pre-epoch (negative) timestamps all fall out of the arithmetic with no
-///! per-month tables. The day index and the second-of-day are split with a
-///! FLOOR division so a negative timestamp lands on the correct civil day
-///! (truncating toward zero would put, e.g., -1 second on 1970-01-01 instead
-///! of 1969-12-31).
+///! `civil_from_days` / `days_from_civil` algorithms, which are exact and
+///! branch-light across the whole proleptic Gregorian calendar - leap years,
+///! century rules, and pre-epoch (negative) timestamps all fall out of the
+///! arithmetic with no per-month tables. The day index and the second-of-day
+///! are split with a FLOOR division so a negative timestamp lands on the
+///! correct civil day (truncating toward zero would put, e.g., -1 second on
+///! 1970-01-01 instead of 1969-12-31).
 ///!
-///! `Display` renders ISO-8601 in UTC: `YYYY-MM-DDThh:mm:ssZ`. Only whole
-///! seconds are shown; sub-second precision, if any, stays in the source
-///! `SystemTime`.
+///! `Display` and `format_rfc3339` write RFC 3339: `YYYY-MM-DDThh:mm:ss`,
+///! then a fraction of a second only when there is one (trailing zeros
+///! dropped), then `Z` at UTC or `+hh:mm` / `-hh:mm`. A year before the
+///! Common Era takes a leading `-`. `parse_rfc3339` reads the same form,
+///! with a lowercase `t` or `z` accepted, and refuses a leap second
+///! (`:60`): a `DateTime` counts every minute as sixty seconds.
+///!
+///! ```cryo
+///! import std::collections::str::{ Str };
+///! import std::time::datetime::{ DateTime, UtcOffset };
+///!
+///! const moment: DateTime = DateTime::parse_rfc3339(Str::new("1996-12-19T16:39:57-08:00")).unwrap();
+///! const utc: DateTime = moment.to_offset(UtcOffset::utc());   // 1996-12-20T00:39:57Z
+///! ```
 
 namespace std::time::datetime;
 
+import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::core::primitives;
+import std::core::slice::{ Slice };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
-import std::fmt::display::{ Display, format_to_string, Formatter };
+import std::fmt::display::{ Debug, Display, format_to_string, Formatter };
 import std::fmt::error::{ FmtError };
 import std::time::clock::{ SystemTime };
+import std::time::duration::{ Duration };
 
 private const SECS_PER_DAY:  i64 = 86400;
 private const SECS_PER_HOUR: i64 = 3600;
 private const SECS_PER_MIN:  i64 = 60;
+private const NANOS_PER_SECOND: i128 = 1000000000;
 
 // The civil algorithm counts days from 0000-03-01 (a "shifted" epoch that
 // puts the leap day at the end of the year). 719468 is the number of days
@@ -40,17 +57,125 @@ private const DAYS_SHIFT:   i64 = 719468;
 private const DAYS_PER_ERA: i64 = 146097;   // days in 400 years
 private const YEARS_PER_ERA: i64 = 400;
 
-/// A UTC civil calendar reading. All fields are UTC and already normalized:
-/// `month` in 1..=12, `day` in 1..=31, `hour` in 0..=23, `minute`/`second`
-/// in 0..=59. `year` is the proleptic Gregorian year and may be negative for
+/// A day of the week.
+public type enum Weekday with [Eq, Debug] {
+    Monday;
+    Tuesday;
+    Wednesday;
+    Thursday;
+    Friday;
+    Saturday;
+    Sunday;
+}
+
+implement trait Display for enum Weekday {
+    /// The day's English name: `Monday`.
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        match (&this) {
+            Weekday::Monday => { return f.write_str(Str::new("Monday")); }
+            Weekday::Tuesday => { return f.write_str(Str::new("Tuesday")); }
+            Weekday::Wednesday => { return f.write_str(Str::new("Wednesday")); }
+            Weekday::Thursday => { return f.write_str(Str::new("Thursday")); }
+            Weekday::Friday => { return f.write_str(Str::new("Friday")); }
+            Weekday::Saturday => { return f.write_str(Str::new("Saturday")); }
+            Weekday::Sunday => { return f.write_str(Str::new("Sunday")); }
+        }
+    }
+}
+
+/// A fixed offset from UTC: a whole number of minutes east (positive) or
+/// west (negative), less than a day either way - what RFC 3339 can write.
+public type struct UtcOffset with [Eq, Debug] {
+    private seconds: i32;
+
+    /// UTC itself, offset zero.
+    public static utc() -> UtcOffset {
+        return UtcOffset { seconds: 0 };
+    }
+
+    /// The offset `seconds` east of UTC, or `None` unless it is a whole
+    /// number of minutes strictly between -24 and +24 hours.
+    public static from_seconds(seconds: i32) -> Option<UtcOffset> {
+        if (seconds <= -86400 || seconds >= 86400 || seconds % 60 != 0) {
+            return Option::None;
+        }
+        return Option::Some(UtcOffset { seconds: seconds });
+    }
+
+    /// Seconds east of UTC; negative west of it.
+    public seconds(&this) -> i32 {
+        return this.seconds;
+    }
+
+    public is_utc(&this) -> boolean {
+        return this.seconds == 0;
+    }
+}
+
+/// What `DateTime::parse_rfc3339` found wrong.
+public type enum DateTimeErrorKind with [Eq, Debug] {
+    /// A byte the RFC 3339 grammar does not allow there, or the text ended
+    /// early.
+    InvalidSyntax;
+    /// A well-formed field whose value no date or time has: month 13,
+    /// February 30, hour 24, a leap second, an offset of 24 hours.
+    OutOfRange;
+}
+
+/// A parse failure: its kind and the byte offset in the text where it was
+/// found - the offending byte, or the start of the out-of-range field.
+public type struct DateTimeError with [Eq, Debug] {
+    public position: i64;
+    public kind: DateTimeErrorKind;
+
+    public static new(kind: DateTimeErrorKind, position: i64) -> DateTimeError {
+        return DateTimeError { position: position, kind: kind };
+    }
+
+    /// What went wrong, without the position; `Display` adds it.
+    public describe(&this) -> Str {
+        match (this.kind) {
+            DateTimeErrorKind::InvalidSyntax => { return Str::new("not RFC 3339 date-time syntax"); }
+            DateTimeErrorKind::OutOfRange => { return Str::new("date or time field out of range"); }
+        }
+    }
+}
+
+implement trait Display for struct DateTimeError {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        return f.write(f"{this.describe()} at byte {this.position}");
+    }
+}
+
+/// A civil calendar reading at `offset` from UTC. All fields are
+/// normalized: `month` in 1..=12, `day` in 1..=31 (and within the month),
+/// `hour` in 0..=23, `minute`/`second` in 0..=59, `nanosecond` below one
+/// second. `year` is the proleptic Gregorian year and may be negative for
 /// timestamps far before the Common Era. POD.
 public type struct DateTime {
-    public year:   i64;
-    public month:  u32;
-    public day:    u32;
-    public hour:   u32;
-    public minute: u32;
-    public second: u32;
+    public year:       i64;
+    public month:      u32;
+    public day:        u32;
+    public hour:       u32;
+    public minute:     u32;
+    public second:     u32;
+    public nanosecond: u32;
+    public offset:     UtcOffset;
+
+    /// The reading with these parts, or `None` when one is out of range.
+    public static from_parts(year: i64, month: u32, day: u32, hour: u32, minute: u32, second: u32,
+                             nanosecond: u32, offset: UtcOffset) -> Option<DateTime> {
+        if (month < 1 || month > 12 || day < 1 || day > days_in_month(year, month)) {
+            return Option::None;
+        }
+        if (hour > 23 || minute > 59 || second > 59 || nanosecond >= 1000000000) {
+            return Option::None;
+        }
+        return Option::Some(DateTime {
+            year: year, month: month, day: day, hour: hour, minute: minute, second: second,
+            nanosecond: nanosecond, offset: offset
+        });
+    }
 
     /// Break a whole-second Unix timestamp into its UTC calendar parts.
     public static from_unix_secs(secs: i64) -> DateTime {
@@ -76,20 +201,224 @@ public type struct DateTime {
         return DateTime::from_system_time(&t);
     }
 
-    /// Render as ISO-8601 UTC (`YYYY-MM-DDThh:mm:ssZ`) - the same text as the
-    /// `Display` impl, available directly without an f-string.
+    /// Read RFC 3339 `date-time` text: `1985-04-12T23:20:50.52Z`,
+    /// `1996-12-19T16:39:57-08:00`. Fraction digits past the ninth are
+    /// read and dropped. The error names the first byte that is wrong, or
+    /// the start of a field whose value is out of range.
+    public static parse_rfc3339(text: Str) -> Result<DateTime, DateTimeError> {
+        const bytes: &Slice<u8> = text.as_bytes();
+        const year: u32 = DateTime::read_digits(bytes, 0, 4)?;
+        DateTime::read_separator(bytes, 4, '-' as u8, '-' as u8)?;
+        const month: u32 = DateTime::read_digits(bytes, 5, 2)?;
+        DateTime::read_separator(bytes, 7, '-' as u8, '-' as u8)?;
+        const day: u32 = DateTime::read_digits(bytes, 8, 2)?;
+        DateTime::read_separator(bytes, 10, 'T' as u8, 't' as u8)?;
+        const hour: u32 = DateTime::read_digits(bytes, 11, 2)?;
+        DateTime::read_separator(bytes, 13, ':' as u8, ':' as u8)?;
+        const minute: u32 = DateTime::read_digits(bytes, 14, 2)?;
+        DateTime::read_separator(bytes, 16, ':' as u8, ':' as u8)?;
+        const second: u32 = DateTime::read_digits(bytes, 17, 2)?;
+
+        mut position: i64 = 19;
+        mut nanosecond: u32 = 0;
+        if (position < bytes.length() && bytes[position] == '.' as u8) {
+            position = position + 1;
+            const first_digit: i64 = position;
+            mut scale: u32 = 100000000;
+            while (position < bytes.length() && bytes[position].is_digit()) {
+                nanosecond = nanosecond + ((bytes[position] - '0' as u8) as u32) * scale;
+                scale = scale / 10;
+                position = position + 1;
+            }
+            if (position == first_digit) {
+                return Result::Err(DateTimeError::new(DateTimeErrorKind::InvalidSyntax, position));
+            }
+        }
+
+        mut offset_seconds: i32 = 0;
+        if (position >= bytes.length()) {
+            return Result::Err(DateTimeError::new(DateTimeErrorKind::InvalidSyntax, position));
+        }
+        const sign: u8 = bytes[position];
+        if (sign == 'Z' as u8 || sign == 'z' as u8) {
+            position = position + 1;
+        } else if (sign == '+' as u8 || sign == '-' as u8) {
+            const offset_hours: u32 = DateTime::read_digits(bytes, position + 1, 2)?;
+            DateTime::read_separator(bytes, position + 3, ':' as u8, ':' as u8)?;
+            const offset_minutes: u32 = DateTime::read_digits(bytes, position + 4, 2)?;
+            if (offset_hours > 23) {
+                return Result::Err(DateTimeError::new(DateTimeErrorKind::OutOfRange, position + 1));
+            }
+            if (offset_minutes > 59) {
+                return Result::Err(DateTimeError::new(DateTimeErrorKind::OutOfRange, position + 4));
+            }
+            offset_seconds = (offset_hours * 3600 + offset_minutes * 60) as i32;
+            if (sign == '-' as u8) { offset_seconds = 0 - offset_seconds; }
+            position = position + 6;
+        } else {
+            return Result::Err(DateTimeError::new(DateTimeErrorKind::InvalidSyntax, position));
+        }
+        if (position != bytes.length()) {
+            return Result::Err(DateTimeError::new(DateTimeErrorKind::InvalidSyntax, position));
+        }
+
+        if (month < 1 || month > 12) {
+            return Result::Err(DateTimeError::new(DateTimeErrorKind::OutOfRange, 5));
+        }
+        if (day < 1 || day > days_in_month(year as i64, month)) {
+            return Result::Err(DateTimeError::new(DateTimeErrorKind::OutOfRange, 8));
+        }
+        if (hour > 23) { return Result::Err(DateTimeError::new(DateTimeErrorKind::OutOfRange, 11)); }
+        if (minute > 59) { return Result::Err(DateTimeError::new(DateTimeErrorKind::OutOfRange, 14)); }
+        if (second > 59) { return Result::Err(DateTimeError::new(DateTimeErrorKind::OutOfRange, 17)); }
+        return Result::Ok(DateTime {
+            year: year as i64, month: month, day: day, hour: hour, minute: minute, second: second,
+            nanosecond: nanosecond, offset: UtcOffset { seconds: offset_seconds }
+        });
+    }
+
+    /// The `count` decimal digits at `position`, or the error naming the
+    /// first byte that is not one.
+    private static read_digits(bytes: &Slice<u8>, position: i64, count: i64) -> Result<u32, DateTimeError> {
+        mut value: u32 = 0;
+        for (mut i: i64 = position; i < position + count; i++) {
+            if (i >= bytes.length() || !bytes[i].is_digit()) {
+                return Result::Err(DateTimeError::new(DateTimeErrorKind::InvalidSyntax, i));
+            }
+            value = value * 10 + ((bytes[i] - '0' as u8) as u32);
+        }
+        return Result::Ok(value);
+    }
+
+    /// The byte at `position` is `expected` or `alternative`, or the error
+    /// naming it.
+    private static read_separator(bytes: &Slice<u8>, position: i64, expected: u8, alternative: u8) -> Result<(), DateTimeError> {
+        if (position >= bytes.length() || (bytes[position] != expected && bytes[position] != alternative)) {
+            return Result::Err(DateTimeError::new(DateTimeErrorKind::InvalidSyntax, position));
+        }
+        return Result::Ok(());
+    }
+
+    /// This reading as RFC 3339 text - the same text as `Display`.
+    public format_rfc3339(&this) -> String {
+        return f"{this}";
+    }
+
+    /// Render as RFC 3339, the same text as `format_rfc3339`.
     public to_string(&this) -> String {
         match (format_to_string::<DateTime>(this)) {
             Result::Ok(s)  => { return s; }
             Result::Err(_) => { return String::new(); }
         }
     }
+
+    /// Whole seconds since 1970-01-01T00:00:00Z at this instant; the
+    /// nanoseconds are left out.
+    public unix_seconds(&this) -> i64 {
+        const local: i64 = days_from_civil(this.year, this.month, this.day) * SECS_PER_DAY
+            + (this.hour as i64) * SECS_PER_HOUR + (this.minute as i64) * SECS_PER_MIN + (this.second as i64);
+        return local - (this.offset.seconds as i64);
+    }
+
+    /// The day of the week of this reading's date.
+    public weekday(&this) -> Weekday {
+        // 1970-01-01, day 0, was a Thursday.
+        match (days_from_civil(this.year, this.month, this.day).modulo_floor(7)) {
+            0 => { return Weekday::Thursday; }
+            1 => { return Weekday::Friday; }
+            2 => { return Weekday::Saturday; }
+            3 => { return Weekday::Sunday; }
+            4 => { return Weekday::Monday; }
+            5 => { return Weekday::Tuesday; }
+            _ => { return Weekday::Wednesday; }
+        }
+    }
+
+    /// The same instant read at `offset`.
+    public to_offset(&this, offset: UtcOffset) -> DateTime {
+        mut shifted: DateTime = DateTime::from_unix_secs(this.unix_seconds() + (offset.seconds as i64));
+        shifted.nanosecond = this.nanosecond;
+        shifted.offset = offset;
+        return shifted;
+    }
+
+    /// The instant `duration` later, at this reading's offset, or `None`
+    /// past the range of an `i64` Unix timestamp.
+    public add(&this, duration: Duration) -> Option<DateTime> {
+        return this.at_total(this.total_nanoseconds() + DateTime::duration_nanoseconds(duration));
+    }
+
+    /// The instant `duration` earlier, at this reading's offset, or `None`
+    /// past the range of an `i64` Unix timestamp.
+    public subtract(&this, duration: Duration) -> Option<DateTime> {
+        return this.at_total(this.total_nanoseconds() - DateTime::duration_nanoseconds(duration));
+    }
+
+    /// The time from `earlier` to this instant, or `None` when `earlier`
+    /// is the later one. The offsets do not matter: both are instants.
+    public duration_since(&this, earlier: &DateTime) -> Option<Duration> {
+        const difference: i128 = this.total_nanoseconds() - earlier.total_nanoseconds();
+        if (difference < 0) { return Option::None; }
+        return Option::Some(Duration::new((difference / NANOS_PER_SECOND) as u64,
+                                          (difference % NANOS_PER_SECOND) as u32));
+    }
+
+    /// Nanoseconds since the Unix epoch at this instant.
+    private total_nanoseconds(&this) -> i128 {
+        return (this.unix_seconds() as i128) * NANOS_PER_SECOND + (this.nanosecond as i128);
+    }
+
+    private static duration_nanoseconds(duration: Duration) -> i128 {
+        return (duration.as_secs() as i128) * NANOS_PER_SECOND + (duration.subsec_nanos() as i128);
+    }
+
+    /// The reading at this offset for `total` nanoseconds since the epoch,
+    /// or `None` when its seconds leave the `i64` range.
+    private at_total(&this, total: i128) -> Option<DateTime> {
+        mut seconds: i128 = total / NANOS_PER_SECOND;
+        mut nanoseconds: i128 = total % NANOS_PER_SECOND;
+        if (nanoseconds < 0) {
+            seconds = seconds - 1;
+            nanoseconds = nanoseconds + NANOS_PER_SECOND;
+        }
+        const local: i128 = seconds + (this.offset.seconds as i128);
+        if (local < (i64::MIN as i128) || local > (i64::MAX as i128)) { return Option::None; }
+        mut moved: DateTime = DateTime::from_unix_secs(local as i64);
+        moved.nanosecond = nanoseconds as u32;
+        moved.offset = this.offset;
+        return Option::Some(moved);
+    }
+}
+
+/// The number of days in `month` (1..=12) of `year`.
+private function days_in_month(year: i64, month: u32) -> u32 {
+    if (month == 2) {
+        const leap: boolean = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        return if (leap) { 29 } else { 28 };
+    }
+    if (month == 4 || month == 6 || month == 9 || month == 11) { return 30; }
+    return 31;
+}
+
+/// The day index counted from the Unix epoch for a civil date: Howard
+/// Hinnant's `days_from_civil`, the inverse of `civil_from_days`.
+private function days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    // The algorithm's year starts in March, so January and February
+    // belong to the year before.
+    const y: i64 = if (month <= 2) { year - 1 } else { year };
+    const era: i64 = y.divide_floor(YEARS_PER_ERA);
+    const yoe: i64 = y - era * YEARS_PER_ERA;                                   // [0, 399]
+    const shifted_month: i64 = if (month > 2) { (month as i64) - 3 } else { (month as i64) + 9 };   // [0, 11]
+    const doy: i64 = (153 * shifted_month + 2) / 5 + (day as i64) - 1;           // [0, 365]
+    const doe: i64 = yoe * 365 + yoe / 4 - yoe / 100 + doy;                     // [0, 146096]
+    return era * DAYS_PER_ERA + doe - DAYS_SHIFT;
 }
 
 /// (year, month, day) for a day index counted from the Unix epoch, packed
-/// into a `DateTime` alongside the already-computed time-of-day. This is
-/// Howard Hinnant's `civil_from_days`, verbatim in structure; every division
-/// here is exact integer arithmetic with the ranges annotated inline.
+/// into a UTC `DateTime` alongside the already-computed time-of-day. This
+/// is Howard Hinnant's `civil_from_days`, verbatim in structure; every
+/// division here is exact integer arithmetic with the ranges annotated
+/// inline.
 private function civil_from_days(days: i64, hour: u32,
                                  minute: u32, second: u32) -> DateTime {
     const z: i64 = days + DAYS_SHIFT;
@@ -114,24 +443,38 @@ private function civil_from_days(days: i64, hour: u32,
     if (month <= 2) { year = y + 1; }
 
     return DateTime {
-        year:   year,
-        month:  month as u32,
-        day:    day as u32,
-        hour:   hour,
-        minute: minute,
-        second: second
+        year:       year,
+        month:      month as u32,
+        day:        day as u32,
+        hour:       hour,
+        minute:     minute,
+        second:     second,
+        nanosecond: 0,
+        offset:     UtcOffset::utc()
     };
 }
 
-// Display: ISO-8601 UTC.
+// Display: RFC 3339.
 
 implement trait Display for struct DateTime {
     /// The year zero-padded to 4 digits, with a leading `-` for years
-    /// before the Common Era (ISO-8601 expanded form), and every other
-    /// field to 2.
+    /// before the Common Era, every other field to 2, a fraction only when
+    /// there is one, and the offset.
     fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         if (this.year < 0) { f.write_str(Str::new("-"))?; }
         const year: u64 = if (this.year < 0) { (0 - this.year) as u64 } else { this.year as u64 };
-        return f.write(f"{year:04}-{this.month:02}-{this.day:02}T{this.hour:02}:{this.minute:02}:{this.second:02}Z");
+        f.write(f"{year:04}-{this.month:02}-{this.day:02}T{this.hour:02}:{this.minute:02}:{this.second:02}")?;
+        if (this.nanosecond != 0) {
+            const digits: String = f"{this.nanosecond:09}";
+            mut length: i64 = 9;
+            while (digits.as_str().byte_at(length - 1) == Option::Some('0' as u8)) { length = length - 1; }
+            f.write_str(Str::new("."))?;
+            f.write_str(digits.as_str().sub_bytes(0, length))?;
+        }
+        if (this.offset.is_utc()) { return f.write_str(Str::new("Z")); }
+        const east: boolean = this.offset.seconds > 0;
+        const magnitude: i32 = if (east) { this.offset.seconds } else { 0 - this.offset.seconds };
+        if (east) { f.write_str(Str::new("+"))?; } else { f.write_str(Str::new("-"))?; }
+        return f.write(f"{magnitude / 3600:02}:{magnitude % 3600 / 60:02}");
     }
 }
