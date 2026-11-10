@@ -921,11 +921,7 @@ declaration* it introduces an implement block - the two never overlap.)
 - **Return type** - the concrete type is inferred from the body's first
   `return` expression. That expression must currently be a *struct literal*
   (e.g. `return SliceIter::<T> { ... }`), which is how every standard-library
-  iterator is written. The type is read from what the literal writes, before
-  any body is checked, so a generic struct's literal writes its type
-  arguments there; one written without them is refused at the literal
-  (`E0307`, "cannot infer the type arguments of `Gen` for the opaque return
-  type").
+  iterator is written.
 - **Variable binding** - `mut it: implement Iterator<i32> = expr;`. The type
   is taken from the initialiser, which is then checked to actually implement
   the named trait; a mismatch is `E0200`:
