@@ -1655,8 +1655,9 @@ type struct MonoCallSpecializer {
     /// names the specialization being made, or a type parameter's
     /// (`T::default()`), which names the type bound to it.  The call is
     /// bound on that owner, by the method it recorded where it is written,
-    /// once the owner is minted.  A method with type parameters of its own,
-    /// or a call carrying the owner's arguments, is specialized as written.
+    /// once the owner is minted; one with type parameters of its own, at the
+    /// arguments the call carries for them.  A call carrying the owner's
+    /// arguments is specialized as written.
     /// A bound-directed path taken as a VALUE in a copy (`const f = T::make;`
     /// with `T` bound to `P`): the function is the method the path recorded
     /// where it is written, on the owner the copy's substitution wrote, by
@@ -1711,10 +1712,17 @@ type struct MonoCallSpecializer {
     /// names the template's parameters until `subst` puts the copy's in.
     bind_on_substituted_owner(mut &this, call: mut CallExpr*, scope: mut ScopeResolutionExpr*, subst: TypeSubstitution*) -> void {
         if (!scope.spec_owner.is_valid() || !call.template_method.is_valid()
-                || call.template_recv.is_valid() || call.resolved_type_args.length() > 0) { return; }
+                || call.template_recv.is_valid()) { return; }
         const f_decl: DeclarationNode* = this.decl_index.method_func_of(call.template_method);
         const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
-        if (f == null || f.generic_params.length() > 0) { return; }
+        if (f == null) { return; }
+        // A method with type parameters of its own is bound here only through
+        // a type parameter's path (`C::from_iterator(source)`), where the
+        // drain binds its parameters from the copy's argument types.  Any
+        // other path to one, or carrying arguments, carries its owner's,
+        // and is specialized as written.
+        if (call.resolved_type_args.length() > 0) { return; }
+        if (f.generic_params.length() > 0 && !scope.scope_res.relative_param_sym().is_valid()) { return; }
         if (!scope.scope_res.relative_param_sym().is_valid() && subst != null
                 && this.arena.contains_generic_param(scope.spec_owner)) {
             const concrete: TypeRef = this.concretize_stashed_arg(scope.spec_owner, subst);
@@ -1802,18 +1810,21 @@ type struct MonoCallSpecializer {
     }
 
     /// Bind `call` to the instance of `m_decl`, a method of `owner`'s
-    /// implementation whose only type parameters are the ones its
-    /// implementation lends it (`FunctionDecl.inherited_params`), at the
-    /// arguments the call passes: each lent parameter is bound by unifying
-    /// the method's parameters with the types the directing bound gives the
+    /// implementation with type parameters - the ones its implementation
+    /// lends it (`FunctionDecl.inherited_params`) or its own, which a call
+    /// through a type parameter's path carries no arguments for - at the
+    /// arguments the call passes: each parameter is bound by unifying the
+    /// method's parameters with the types the directing bound gives the
     /// call (`bound_params`), else the arguments' own.  Answers whether
     /// `m_decl` is such a method; one whose parameters stay unbound is left
-    /// unpinned, as an unbound call is.
+    /// unpinned, as an unbound call is.  A call that writes arguments for
+    /// the method's own parameters is bound by them, as written.
     instantiate_lent_method(mut &this, call: mut CallExpr*, m_decl: DeclarationNode*, owner: TypeRef) -> boolean {
         const m: MethodDecl* = DeclarationNode::method_of(m_decl);
         if (m == null || m.func == null) { return false; }
         const f: FunctionDecl* = DeclarationNode::fn_of(m.func);
-        if (f.inherited_params == 0 || f.written_params() > 0) { return false; }
+        if (f.generic_params.length() == 0) { return false; }
+        if (f.written_params() > 0 && call.resolved_type_args.length() > 0) { return false; }
         mut formals: [TypeRef] = [];
         for (mut i: i64 = 0; i < f.parameters.length(); i++) {
             const p: VarDecl* = DeclarationNode::var_of(f.parameters[i]);
@@ -1821,7 +1832,13 @@ type struct MonoCallSpecializer {
         }
         mut actuals: [TypeRef] = [];
         if (call.bound_params.length() == formals.length()) {
-            for (mut i: i64 = 0; i < call.bound_params.length(); i++) { actuals.push(call.bound_params[i]); }
+            // A position the bound leaves to the method's own type parameter
+            // is the argument's type.
+            for (mut i: i64 = 0; i < call.bound_params.length(); i++) {
+                const open: boolean = this.arena.contains_generic_param(call.bound_params[i])
+                    && i < call.arguments.length() && call.arguments[i] != null;
+                actuals.push(if (open) { call.arguments[i].resolved_type } else { call.bound_params[i] });
+            }
         } else {
             for (mut i: i64 = 0; i < call.arguments.length(); i++) {
                 if (call.arguments[i] != null) { actuals.push(call.arguments[i].resolved_type); }
@@ -2023,9 +2040,16 @@ type struct MonoCallSpecializer {
             const own_params: FunctionDecl* = if (call.template_method.is_valid()) {
                 DeclarationNode::fn_of(this.decl_index.method_func_of(call.template_method))
             } else { null };
+            // A path naming a trait's item names the method of the owner's
+            // implementation at the item's position, which `path_method_on`
+            // answers; its own type parameters, if any, are bound by the
+            // arguments.
+            const trait_path: boolean = ExpressionNode::scope_resolution_of(call.callee) != null
+                && call.template_method.is_valid()
+                && this.generic_registry.trait_item_position(call.template_method) >= 0;
             if (call.named_method.is_valid()) {
                 this.pin_plain(call, this.named_method_on(call.named_method, owner));
-            } else if (own_params != null && own_params.generic_params.length() > 0) {
+            } else if (own_params != null && own_params.generic_params.length() > 0 && !trait_path) {
                 mut gm_impl: DeclarationNode* = null;
                 mut gm_owner: DeclarationNode* = null;
                 const gm_decl: DeclarationNode* = this.receiver_method_of(call.template_method, owner, &gm_impl, &gm_owner);

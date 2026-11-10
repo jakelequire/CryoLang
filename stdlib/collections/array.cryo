@@ -26,7 +26,7 @@ import std::core::clone::{ Clone };
 import std::core::cmp::{ Eq, Ord, Ordering };
 import std::core::hash::{ Hash, Hasher };
 import std::core::default::{ Default };
-import std::core::iter::{ Iterator };
+import std::core::iter::{ FromIterator, Iterator };
 import std::core::ops::{ Index, IndexMutable };
 import std::alloc::layout::{ Layout };
 import std::alloc::allocator::{
@@ -387,7 +387,7 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// O(n log n) comparisons on every input and allocates a buffer as
     /// long as the array; `sort_unstable` allocates nothing.
     public sort(mut &this) -> void where T: Ord {
-        this.sort_by((a: &T, b: &T) -> Ordering { return a.compare(b); });
+        this.sort_by(T::compare);
     }
 
     /// Sort the array in place by `compare`, which says how its first
@@ -409,7 +409,7 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// O(n log n) comparisons on every input: a quicksort that turns to a
     /// heapsort for any range it has split too often.
     public sort_unstable(mut &this) -> void where T: Ord {
-        this.sort_unstable_by((a: &T, b: &T) -> Ordering { return a.compare(b); });
+        this.sort_unstable_by(T::compare);
     }
 
     /// Sort the array in place by `compare`, as `sort_unstable` does.
@@ -693,29 +693,16 @@ where A: Allocator {
     }
 }
 
-/// Collect every element an iterator yields into a fresh `Array<T>`, in order.
-/// `it` is consumed.  `T` is recovered from the iterator's `Iterator<T>` impl,
-/// and the result element type is fixed by the expected type at the call site:
-///
-///   mut v: Array<i32> = from_iter(r.map(square));
-///
-/// A free function rather than an `Iterator::collect` trait default on purpose:
-/// a non-self-returning default would be cloned into EVERY `Iterator` impl,
-/// including the by-reference `RefIter<T>` over `Array<T>`, whose clone would
-/// instantiate `Array<T>` -> `RefIter<T>` over it -> `Array<T*>` -> `Array<T**>`
-/// -> ... a genuinely-new pointer level each round, diverging monomorphization
-/// until OOM.  As a free function, only concrete call sites instantiate it, so
-/// there is no divergence.
-public function from_iter<I, T>(it: I) -> Array<T> where I: Iterator<T> {
-    mut iter: I = it;
-    mut out: Array<T> = Array::<T>::new();
-    loop {
-        match (iter.next()) {
-            Option::Some(value) => { out.push(value); }
-            Option::None => { break; }
+/// An array of every element an iterator yields, in order: what `collect`
+/// builds for `Array<T>`.
+implement<T> trait FromIterator<T> for struct Array<T, GlobalAlloc> {
+    static from_iterator<I>(source: I) -> Array<T> where I: Iterator<T> {
+        mut out: Array<T> = Array::<T>::new();
+        for (value in source) {
+            out.push(value);
         }
+        return out;
     }
-    return out;
 }
 
 // Sorting ---------------------------------------------------------------------

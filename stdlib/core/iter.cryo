@@ -4,12 +4,12 @@
 ///! is derived from it. Implementations drive the sequence; consumers
 ///! call `next` in a loop or use one of the defaults below.
 ///!
-///! Lazy adapters live in this module: `map`, `filter`, `take`, `chain`,
-///! `enumerate`, and `zip` each return a wrapper iterator (`MapIter`,
-///! `FilterIter`, `TakeIter`, `ChainIter`, `EnumerateIter`, `ZipIter`) that
-///! is itself an `Iterator`, so they compose. Eager consumers (`for_each`,
-///! `fold`, `any`, `all`, `find`, `count`) and `for (x in iter)` drive the
-///! chain. The adapters resolve directly on any concrete `Iterator` receiver,
+///! Lazy adapters live in this module: `map`, `filter`, `take`, `skip`,
+///! `chain`, `enumerate`, `zip`, `rev`, `peekable` and `flat_map` each return
+///! a wrapper iterator (`MapIter`, `FilterIter`, ..., `FlatMapIter`) that is
+///! itself an `Iterator`, so they compose. Eager consumers (`for_each`,
+///! `fold`, `any`, `all`, `find`, `count`, `collect`, `sum`) and
+///! `for (x in iter)` drive the chain. The adapters resolve directly on any concrete `Iterator` receiver,
 ///! including a user struct that `implement`s `Iterator`
 ///! (`mut c: Counter = ...; c.take(3).map(f)`), not just stdlib iterators.
 ///! (Re-adapting an opaque-typed iterator *local* works when the
@@ -125,6 +125,37 @@ public type trait Iterator {
     /// tuple literal, so `Pair` is the element type.)
     zip<J>(this, other: J) -> ZipIter<This, J> {
         return ZipIter::new(this, other);
+    }
+
+    /// Build a collection of every element, in order: the collection is the
+    /// type wanted where the call stands,
+    /// `const evens: Array<i64> = numbers.filter(is_even).collect();`.
+    collect<C>(this) -> C where C: FromIterator<This::Item> {
+        return C::from_iterator(this);
+    }
+
+    /// The sum of every element; an iterator with none sums to zero.
+    sum<S>(this) -> S where S: Sum, This: Iterator<S> {
+        return S::sum(this);
+    }
+
+    /// Yield the elements back to front.  Only an iterator that also yields
+    /// from its back end reverses: `RevIter`'s implementation asks for
+    /// `DoubleEndedIterator`.
+    rev(this) -> RevIter<This> {
+        return RevIter::new(this);
+    }
+
+    /// Yield the same elements, with `peek` reading the next one without
+    /// taking it.
+    peekable(this) -> PeekableIter<This> {
+        return PeekableIter::new(this);
+    }
+
+    /// Map each element to an iterator with `f`, and yield the elements of
+    /// each of those in turn.
+    flat_map<B, F>(this, f: F) -> FlatMapIter<This, F, B> where F: (This::Item) -> B {
+        return FlatMapIter::new(this, f);
     }
 
 
@@ -393,6 +424,131 @@ where I: Iterator<A>, J: Iterator<O> {
                 }
             }
             Option::None => { return Option::None; }
+        }
+    }
+}
+
+/// A collection built from the elements of an iterator: what `collect`
+/// builds.
+public type trait FromIterator<T> {
+    static from_iterator<I>(source: I) -> This where I: Iterator<T>;
+}
+
+/// A number that is the sum of an iterator's elements: what `sum` returns.
+public type trait Sum {
+    static sum<I>(source: I) -> This where I: Iterator<This>;
+}
+
+implement trait Sum for i8    { static sum<I>(source: I) -> i8    where I: Iterator<i8>    { mut total: i8 = 0;    for (value in source) { total = total + value; } return total; } }
+implement trait Sum for i16   { static sum<I>(source: I) -> i16   where I: Iterator<i16>   { mut total: i16 = 0;   for (value in source) { total = total + value; } return total; } }
+implement trait Sum for i32   { static sum<I>(source: I) -> i32   where I: Iterator<i32>   { mut total: i32 = 0;   for (value in source) { total = total + value; } return total; } }
+implement trait Sum for i64   { static sum<I>(source: I) -> i64   where I: Iterator<i64>   { mut total: i64 = 0;   for (value in source) { total = total + value; } return total; } }
+implement trait Sum for i128  { static sum<I>(source: I) -> i128  where I: Iterator<i128>  { mut total: i128 = 0;  for (value in source) { total = total + value; } return total; } }
+implement trait Sum for isize { static sum<I>(source: I) -> isize where I: Iterator<isize> { mut total: isize = 0; for (value in source) { total = total + value; } return total; } }
+implement trait Sum for u8    { static sum<I>(source: I) -> u8    where I: Iterator<u8>    { mut total: u8 = 0;    for (value in source) { total = total + value; } return total; } }
+implement trait Sum for u16   { static sum<I>(source: I) -> u16   where I: Iterator<u16>   { mut total: u16 = 0;   for (value in source) { total = total + value; } return total; } }
+implement trait Sum for u32   { static sum<I>(source: I) -> u32   where I: Iterator<u32>   { mut total: u32 = 0;   for (value in source) { total = total + value; } return total; } }
+implement trait Sum for u64   { static sum<I>(source: I) -> u64   where I: Iterator<u64>   { mut total: u64 = 0;   for (value in source) { total = total + value; } return total; } }
+implement trait Sum for u128  { static sum<I>(source: I) -> u128  where I: Iterator<u128>  { mut total: u128 = 0;  for (value in source) { total = total + value; } return total; } }
+implement trait Sum for usize { static sum<I>(source: I) -> usize where I: Iterator<usize> { mut total: usize = 0; for (value in source) { total = total + value; } return total; } }
+implement trait Sum for f32   { static sum<I>(source: I) -> f32   where I: Iterator<f32>   { mut total: f32 = 0.0; for (value in source) { total = total + value; } return total; } }
+implement trait Sum for f64   { static sum<I>(source: I) -> f64   where I: Iterator<f64>   { mut total: f64 = 0.0; for (value in source) { total = total + value; } return total; } }
+
+/// An iterator that also yields from its back end.  `next` and `next_back`
+/// draw from one sequence, so between them each element is yielded once.
+public type trait DoubleEndedIterator : Iterator {
+    next_back(mut &this) -> Option<This::Item>;
+}
+
+/// Adapter yielding `inner`'s elements back to front.  Its own back end is
+/// `inner`'s front, so a reversed iterator reverses back.
+public type struct RevIter<I> {
+    private inner: I;
+
+    public static new(inner: I) -> RevIter<I> {
+        return RevIter::<I> { inner: inner };
+    }
+}
+
+implement<I> trait Iterator<I::Item> for struct RevIter<I>
+where I: DoubleEndedIterator {
+    next(mut &this) -> Option<I::Item> {
+        return this.inner.next_back();
+    }
+}
+
+implement<I> trait DoubleEndedIterator for struct RevIter<I>
+where I: DoubleEndedIterator {
+    next_back(mut &this) -> Option<I::Item> {
+        return this.inner.next();
+    }
+}
+
+/// Adapter that reads its next element without taking it.  The element
+/// `peek` reads is held until `next` yields it.
+public type struct PeekableIter<I> where I: Iterator {
+    private inner: I;
+    private peeked: Option<I::Item>;
+    /// Whether `peeked` holds what `inner` yielded last, `None` included.
+    private has_peeked: boolean;
+
+    public static new(inner: I) -> PeekableIter<I> {
+        return PeekableIter::<I> { inner: inner, peeked: Option::None, has_peeked: false };
+    }
+
+    /// The next element, borrowed, or `None` when there is none.  The element
+    /// is still the one `next` yields.
+    public peek(mut &this) -> Option<const I::Item*> {
+        if (!this.has_peeked) {
+            this.peeked = this.inner.next();
+            this.has_peeked = true;
+        }
+        return this.peeked.as_ref();
+    }
+}
+
+implement<I> trait Iterator<I::Item> for struct PeekableIter<I>
+where I: Iterator {
+    next(mut &this) -> Option<I::Item> {
+        if (this.has_peeked) {
+            this.has_peeked = false;
+            return this.peeked.take();
+        }
+        return this.inner.next();
+    }
+}
+
+/// Adapter mapping each element of `inner` to an iterator with `f` and
+/// yielding that iterator's elements, then the next one's.  `U` is the
+/// iterator `f` returns; the element type `O` it yields lives in the
+/// implementation's bounds.
+public type struct FlatMapIter<I, Mapper, U> where I: Iterator, Mapper: (I::Item) -> U {
+    private inner: I;
+    private f:     Mapper;
+    private current: Option<U>;
+
+    public static new(inner: I, f: Mapper) -> FlatMapIter<I, Mapper, U> {
+        return FlatMapIter::<I, Mapper, U> { inner: inner, f: f, current: Option::None };
+    }
+}
+
+implement<I, Mapper, U, O> trait Iterator<O> for struct FlatMapIter<I, Mapper, U>
+where I: Iterator, Mapper: (I::Item) -> U, U: Iterator<O> {
+    next(mut &this) -> Option<O> {
+        loop {
+            match (this.current.as_mutable_ref()) {
+                Option::Some(current) => {
+                    match (current.next()) {
+                        Option::Some(value) => { return Option::Some(value); }
+                        Option::None => { }
+                    }
+                }
+                Option::None => { }
+            }
+            match (this.inner.next()) {
+                Option::Some(element) => { this.current = Option::Some(this.f(element)); }
+                Option::None => { return Option::None; }
+            }
         }
     }
 }
