@@ -9,9 +9,10 @@
 ///!   - A `Stack` struct backed by `Array<i64>`, with `push` / `pop`
 ///!     methods.
 ///!   - A `CalcError` enum for the three failure modes (empty stack,
-///!     div-by-zero, parse failure) - propagated via `Result`.
-///!   - Tokenizing input with `Str::sub_bytes` rather than allocating
-///!     a heap split.
+///!     div-by-zero, unknown token) - propagated via `Result` and `?`.
+///!   - Tokenizing input with `Str::split_whitespace`, which yields views
+///!     into the expression rather than allocating, and reading numbers
+///!     with `i64::try_from`.
 ///!
 ///! Run with:  cryo run
 
@@ -31,7 +32,6 @@ type enum CalcError {
     EmptyStack;
     DivisionByZero;
     UnknownToken;
-    BadNumber;
 }
 
 function describe_error(e: CalcError) -> string {
@@ -39,7 +39,6 @@ function describe_error(e: CalcError) -> string {
         CalcError::EmptyStack     => { return "empty stack"; }
         CalcError::DivisionByZero => { return "division by zero"; }
         CalcError::UnknownToken   => { return "unknown token"; }
-        CalcError::BadNumber      => { return "bad number"; }
     }
 }
 
@@ -71,54 +70,8 @@ type struct Stack {
 }
 
 // ============================================================================
-// Tokenization & parsing
+// Evaluation
 // ============================================================================
-
-function is_digit(b: u8) -> boolean {
-    return b >= 0x30 && b <= 0x39;
-}
-
-function is_space(b: u8) -> boolean {
-    return b == 0x20 || b == 0x09;
-}
-
-/// Try to parse `token` as a signed integer. Accepts an optional
-/// leading `-`. Returns `Err(BadNumber)` on any non-digit char.
-function parse_number(token: Str) -> Result<i64, CalcError> {
-    const len: i64 = token.length();
-    if (len == 0) { return Result::Err(CalcError::BadNumber); }
-
-    mut negative: boolean = false;
-    mut i: i64 = 0;
-    match (token.byte_at(0)) {
-        Option::Some(first) => {
-            if (first == 0x2D) {   // '-'
-                negative = true;
-                i = 1;
-            }
-        }
-        Option::None => { return Result::Err(CalcError::BadNumber); }
-    }
-
-    if (i >= len) { return Result::Err(CalcError::BadNumber); }
-
-    mut value: i64 = 0;
-    while (i < len) {
-        match (token.byte_at(i)) {
-            Option::Some(byte) => {
-                if (!is_digit(byte)) {
-                    return Result::Err(CalcError::BadNumber);
-                }
-                value = value * 10 + (byte - 0x30) as i64;
-            }
-            Option::None => { return Result::Err(CalcError::BadNumber); }
-        }
-        i = i + 1;
-    }
-
-    if (negative) { value = -value; }
-    return Result::Ok(value);
-}
 
 /// Apply a single token to the stack. The token may be a number
 /// (pushed) or one of the four operators (consumed from the stack).
@@ -150,7 +103,8 @@ function apply_token(stack: mut &Stack, token: Str) -> Result<(), CalcError> {
         }
     }
 
-    match (parse_number(token)) {
+    // Anything else must be a whole integer, with an optional sign.
+    match (i64::try_from(token)) {
         Result::Ok(n) => { stack.push(n); return Result::Ok(()); }
         Result::Err(_) => { return Result::Err(CalcError::UnknownToken); }
     }
@@ -161,38 +115,8 @@ function apply_token(stack: mut &Stack, token: Str) -> Result<(), CalcError> {
 /// expression was malformed (extra operands).
 function evaluate(expr: Str) -> Result<i64, CalcError> {
     mut stack: Stack = Stack::new();
-    const len: i64 = expr.length();
-    mut i: i64 = 0;
-
-    while (i < len) {
-        // Skip whitespace.
-        match (expr.byte_at(i)) {
-            Option::Some(b) => {
-                if (is_space(b)) { i = i + 1; continue; }
-            }
-            Option::None => { break; }
-        }
-
-        // Walk a non-whitespace run.
-        const start: i64 = i;
-        loop {
-            if (i >= len) { break; }
-            match (expr.byte_at(i)) {
-                Option::Some(b) => {
-                    if (is_space(b)) { break; }
-                    i = i + 1;
-                }
-                Option::None => { break; }
-            }
-        }
-
-        const token: Str = expr.sub_bytes(start, i);
-        match (apply_token(&stack, token)) {
-            Result::Ok(_)  => { }
-            Result::Err(e) => {
-                return Result::Err(e);
-            }
-        }
+    for (token in expr.split_whitespace()) {
+        apply_token(&stack, token)?;
     }
 
     if (stack.length() != 1) {

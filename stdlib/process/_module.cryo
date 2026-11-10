@@ -5,18 +5,22 @@
 ///! uses `CreateProcessA` and is supported with known gaps (see "Windows
 ///! limitations" below).
 ///!
-///! Between fork and exec the child runs a small amount of code:
+///! Between fork and exec the child runs a small amount of code: no
 ///! allocator calls, only async-signal-safe libc. It then either execs
-///! the target or `_exit(127)` on failure. The parent sees 127 as
-///! "exec failed" regardless of why.
+///! the target or reports the step that failed, with its `errno`, over a
+///! close-on-exec pipe, so `spawn` returns the failure as its error.
 ///!
 ///! In scope:
-///! - `Command` with program / args / env overrides / cwd
+///! - `Command` with program / args / env overrides and removals / cwd /
+///!   a process tree of the child's own (`group_descendants`)
 ///! - `Stdio::Inherit / Null / Piped / Fd(i32) / SameAsStdout`
-///! - `Child::wait` / `join` / `try_wait` / `wait_timeout` / `kill` / `send_signal`
+///! - `Child::wait` / `join` / `try_wait` / `wait_timeout` / `kill` /
+///!   `send_signal` / `kill_tree`
 ///! - `Command::output` / `status` / `spawn`
 ///! - Captured `ChildStdin` / `ChildStdout` / `ChildStderr` that
 ///!   implement `Write` / `Read`
+///! - `ExitStatus::peak_memory_bytes`, and the machine's memory in
+///!   `memory::SystemMemory`
 ///!
 ///! Async: `Child::join` awaits the child's exit without stalling an
 ///! executor worker - a pidfd on the reactor where the kernel has one, a
@@ -29,7 +33,7 @@
 ///!   are not sockets, so they cannot be armed on that platform's reactor;
 ///!   the pool is their route when they land.
 ///! - Detached / double-fork daemonization
-///! - Process groups / session leader control / Windows job objects
+///! - Session leader control, and limits on a job object
 ///!
 ///! Windows (`CreateProcessA`) - supported; the gaps below remain:
 ///! - `Stdio::Inherit / Null / Piped / Fd` all wired; `env_clear` /
@@ -46,6 +50,7 @@ module {
     process::signal;
     process::child;
     process::command;
+    process::memory;
 }
 
 /// The current process's OS process id (pid).  On POSIX this is

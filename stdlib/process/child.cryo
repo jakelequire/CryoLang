@@ -4,7 +4,9 @@
 ///! the caller asked for. `wait` blocks until the child exits;
 ///! `join` is its async spelling; `try_wait` polls; `wait_timeout`
 ///! waits at most a given time; `kill` sends
-///! SIGKILL; `send_signal` sends any other. `ChildStdin` /
+///! SIGKILL; `send_signal` sends any other; `kill_tree` ends the child
+///! with everything it started, when it was spawned after
+///! `Command.group_descendants`. `ChildStdin` /
 ///! `ChildStdout` / `ChildStderr` implement `Write` / `Read` over a fd.
 ///!
 ///! Ownership: call `wait` (or `kill` then `wait`) before a `Child`
@@ -76,13 +78,14 @@ import std::future::blocking::{ BlockingJob, BlockingPool, JOB_PENDING };
 ![target(unix)]
 private function os_proc_wait(pid: i32, handle: u64) -> Result<ExitStatus, IoError> {
     mut status: i32 = 0;
+    mut usage: libc::rusage;
     loop {
-        const rc: i32 = libc::waitpid(pid, &status, 0);
+        const rc: i32 = libc::wait4(pid, &status, 0, &usage);
         if (rc >= 0) {
             // A stop/continue notification isn't a termination; keep blocking
             // until the child actually exits or is killed.
             if (wstatus_is_alive(status)) { continue; }
-            return Result::Ok(decode_wstatus(status));
+            return Result::Ok(decode_wstatus(status, &usage));
         }
         const err: IoError = IoError::last_os_error();
         match (err.kind) {
@@ -97,11 +100,25 @@ private function os_proc_wait(pid: i32, handle: u64) -> Result<ExitStatus, IoErr
     if (syscall::WaitForSingleObject(h, 0xFFFFFFFF) == 0xFFFFFFFF) {   // INFINITE; WAIT_FAILED
         return Result::Err(IoError::last_os_error());
     }
+    return os_proc_exit_status(h);
+}
+
+/// The status of the exited process `h`: its exit code, and the largest
+/// working set it reached, which the system keeps for as long as a HANDLE
+/// to the process is open.
+![target(windows)]
+private function os_proc_exit_status(h: u8*) -> Result<ExitStatus, IoError> {
     mut code: u32 = 0;
     if (syscall::GetExitCodeProcess(h, &code) == 0) {
         return Result::Err(IoError::last_os_error());
     }
-    return Result::Ok(ExitStatus { code: code as i32, signal: 0, signaled: false });
+    mut counters: syscall::PROCESS_MEMORY_COUNTERS;
+    counters.cb = 72;
+    mut peak: u64 = 0;
+    if (syscall::K32GetProcessMemoryInfo(h, &counters, 72) != 0) {
+        peak = counters.PeakWorkingSetSize;
+    }
+    return Result::Ok(ExitStatus { code: code as i32, signal: 0, signaled: false, peak_memory: peak });
 }
 
 /// True when a waitpid `wstatus` reports a state change that is NOT a real
@@ -119,11 +136,12 @@ private function wstatus_is_alive(wstatus: i32) -> boolean {
 ![target(unix)]
 private function os_proc_try_wait(pid: i32, handle: u64) -> Result<Option<ExitStatus>, IoError> {
     mut status: i32 = 0;
+    mut usage: libc::rusage;
     loop {
-        const rc: i32 = libc::waitpid(pid, &status, libc::WNOHANG);
+        const rc: i32 = libc::wait4(pid, &status, libc::WNOHANG, &usage);
         if (rc > 0) {
             if (wstatus_is_alive(status)) { return Result::Ok(Option::None); }
-            return Result::Ok(Option::Some(decode_wstatus(status)));
+            return Result::Ok(Option::Some(decode_wstatus(status, &usage)));
         }
         if (rc == 0) { return Result::Ok(Option::None); }
         const err: IoError = IoError::last_os_error();
@@ -143,11 +161,7 @@ private function os_proc_try_wait(pid: i32, handle: u64) -> Result<Option<ExitSt
     if (waited == 0xFFFFFFFF) {   // WAIT_FAILED
         return Result::Err(IoError::last_os_error());
     }
-    mut code: u32 = 0;
-    if (syscall::GetExitCodeProcess(h, &code) == 0) {
-        return Result::Err(IoError::last_os_error());
-    }
-    return Result::Ok(Option::Some(ExitStatus { code: code as i32, signal: 0, signaled: false }));
+    return Result::Ok(Option::Some(os_proc_exit_status(h)?));
 }
 
 // POSIX has no timed waitpid, so the wait polls `WNOHANG`, pausing between
@@ -181,11 +195,7 @@ private function os_proc_wait_timeout(pid: i32, handle: u64, timeout: Duration) 
     if (waited == 0xFFFFFFFF) {   // WAIT_FAILED
         return Result::Err(IoError::last_os_error());
     }
-    mut code: u32 = 0;
-    if (syscall::GetExitCodeProcess(h, &code) == 0) {
-        return Result::Err(IoError::last_os_error());
-    }
-    return Result::Ok(Option::Some(ExitStatus { code: code as i32, signal: 0, signaled: false }));
+    return Result::Ok(Option::Some(os_proc_exit_status(h)?));
 }
 
 ![target(unix)]
@@ -207,6 +217,31 @@ private function os_proc_signal(pid: i32, handle: u64, sig: i32) -> Result<(), I
         return Result::Err(IoError::last_os_error());
     }
     return Result::Ok(());
+}
+
+![target(unix)]
+private function os_proc_kill_tree(tree: u64) -> Result<(), IoError> {
+    // A negative pid names the process group.
+    if (libc::kill(-(tree as i32), Signal::kill().as_i32()) < 0) {
+        return Result::Err(IoError::last_os_error());
+    }
+    return Result::Ok(());
+}
+![target(windows)]
+private function os_proc_kill_tree(tree: u64) -> Result<(), IoError> {
+    if (syscall::TerminateJobObject(tree as u8*, 1) == 0) {
+        return Result::Err(IoError::last_os_error());
+    }
+    return Result::Ok(());
+}
+
+// A tree's job object is a HANDLE the `Child` owns; closing it leaves the
+// processes in the job running. A process group needs no release.
+![target(unix)]
+private function os_proc_release_tree(tree: u64) -> void { }
+![target(windows)]
+private function os_proc_release_tree(tree: u64) -> void {
+    if (tree != 0) { syscall::CloseHandle(tree as u8*); }
 }
 
 // Best-effort cleanup at `Child` drop.  POSIX: a non-blocking reap so an
@@ -303,6 +338,17 @@ public type struct ExitStatus {
     private code: i32;
     private signal: i32;
     private signaled: boolean;
+    // In bytes; 0 when the system reported none.
+    private peak_memory: u64;
+
+    /// The most physical memory the child held at once, in bytes: its
+    /// peak resident set on POSIX, its peak working set on Windows. It
+    /// covers the child alone, not the processes it started. `None` when
+    /// the system did not report it.
+    public peak_memory_bytes(&this) -> Option<u64> {
+        if (this.peak_memory == 0) { return Option::None; }
+        return Option::Some(this.peak_memory);
+    }
 
     /// Convenience: did the child exit with status 0?
     public success(&this) -> boolean {
@@ -325,30 +371,39 @@ public type struct ExitStatus {
 
 /// Decode a POSIX `wstatus` word. The low 7 bits are the terminating
 /// signal (or 0 for normal exit); bits 8..15 are the exit code when
-/// bits 0..6 are zero.
+/// bits 0..6 are zero. `usage` is what `wait4` reported with it.
 ![target(unix)]
-private function decode_wstatus(wstatus: i32) -> ExitStatus {
+private function decode_wstatus(wstatus: i32, usage: &libc::rusage) -> ExitStatus {
+    const peak: u64 = usage.ru_maxrss as u64 * MAXRSS_UNIT;
     const termsig: i32 = wstatus & 0x7F;
     if (termsig == 0) {
         // Normal exit.
         return ExitStatus {
             code: (wstatus >> 8) & 0xFF,
             signal: 0,
-            signaled: false
+            signaled: false,
+            peak_memory: peak
         };
     }
     if (termsig == 0x7F) {
         // Stopped (WIFSTOPPED). Treated as
         // "still running"; callers who want ptrace semantics
         // need more than Child can offer.
-        return ExitStatus { code: 0, signal: 0, signaled: false };
+        return ExitStatus { code: 0, signal: 0, signaled: false, peak_memory: 0 };
     }
     return ExitStatus {
         code: 0,
         signal: termsig,
-        signaled: true
+        signaled: true,
+        peak_memory: peak
     };
 }
+
+// The unit `ru_maxrss` counts in: kibibytes on Linux, bytes on macOS.
+![target(linux)]
+private const MAXRSS_UNIT: u64 = 1024;
+![target(macos)]
+private const MAXRSS_UNIT: u64 = 1;
 
 // ChildStdin / Stdout / Stderr: fd wrappers with Write / Read
 
@@ -431,6 +486,10 @@ private:
     // OS process HANDLE on Windows (for wait/kill/close); 0 on POSIX, where
     // `pid` is the joinable identity.
     handle: u64;
+    // The child's process tree when `Command.group_descendants` asked for
+    // one: the process group's id on POSIX, the job object's HANDLE on
+    // Windows; 0 otherwise.
+    tree: u64;
     waited: boolean;
 public:
     stdin: Option<ChildStdin>;
@@ -439,15 +498,18 @@ public:
 
     /// Low-level constructor used by `Command::spawn`. Application
     /// code should not call this directly. `handle` is 0 on POSIX and the
-    /// Win32 process HANDLE on Windows.
+    /// Win32 process HANDLE on Windows; `tree` is the process group id on
+    /// POSIX or the job HANDLE on Windows, and 0 for a child with no tree.
     static new(pid: i32,
                handle: u64,
+               tree: u64,
                stdin: Option<ChildStdin>,
                stdout: Option<ChildStdout>,
                stderr: Option<ChildStderr>) -> Child {
         return Child {
             pid: pid,
             handle: handle,
+            tree: tree,
             stdin: stdin,
             stdout: stdout,
             stderr: stderr,
@@ -540,8 +602,29 @@ public:
 
     /// Send `sig` to the child. Windows delivers only `Signal::kill()`,
     /// as a termination; any other signal there is `Unsupported`.
+    ///
+    /// A child that `wait`, `try_wait`, `wait_timeout` or `join` has
+    /// already seen exit is refused with `InvalidInput`: once reaped, its
+    /// process id is free for the system to give to an unrelated process.
     send_signal(&this, sig: Signal) -> Result<(), IoError> {
+        if (this.waited) {
+            return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
+        }
         return os_proc_signal(this.pid, this.handle, sig.as_i32());
+    }
+
+    /// End the child and every process in its tree at once: SIGKILL to
+    /// the process group on POSIX, the job terminated on Windows. Does
+    /// not wait; call `wait` afterwards to reap the child.
+    ///
+    /// The tree exists only for a child spawned after
+    /// `Command.group_descendants`; for any other, and for a child already
+    /// waited for, this is `InvalidInput`.
+    kill_tree(&this) -> Result<(), IoError> {
+        if (this.tree == 0 || this.waited) {
+            return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
+        }
+        return os_proc_kill_tree(this.tree);
     }
 
     /// Close the child's stdin now, if it is still held, so the child sees
@@ -772,7 +855,7 @@ implement trait Future for struct ChildWait {
             BlockingJob::init(&j.job, child_wait_job_run, child_wait_job_free);
             j.pid      = this.pid;
             j.handle   = owned;
-            j.status   = ExitStatus { code: 0, signal: 0, signaled: false };
+            j.status   = ExitStatus { code: 0, signal: 0, signaled: false, peak_memory: 0 };
             j.err      = IoError::new(IoErrorKind::Other, 0);
             j.produced = false;
             j.ok       = false;
@@ -1149,5 +1232,7 @@ implement trait Drop for struct Child {
         // so a second drop is a no-op.
         os_proc_reap(this.pid, this.handle, this.waited);
         this.handle = 0;
+        os_proc_release_tree(this.tree);
+        this.tree = 0;
     }
 }

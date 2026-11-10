@@ -16,14 +16,18 @@ import std::core::drop;
 import std::core::mem;
 import std::collections::array::{ Array };
 import std::collections::str::{ Str };
-import std::io::error::{ IoError, IoErrorKind };
+import std::io::error::{ IoError, IoErrorKind, IoOperation };
 import std::io::traits;
+import std::collections::string::{ String };
+import std::env;
 import std::process::command::{ Command, Output, Stdio };
 import std::process::child::{ Child, ChildStdout, ExitStatus };
 import std::process::signal::{ Signal };
+import std::process::memory::{ SystemMemory };
 import std::fs::path::{ Path };
 import std::fs::file::{ File };
 import std::time::duration::{ Duration };
+import std::time::clock::{ Instant };
 import std::test::error::{ TestError };
 import std::test::assert::{ bail, expect, expect_eq, expect_false };
 
@@ -51,11 +55,9 @@ function array_eq_str(arr: &Array<u8>, s: Str) -> boolean {
 // Platform abstraction.
 //
 // The Unix coreutils (/bin/true, /bin/false, /bin/echo) don't exist on
-// Windows, and a missing image is reported differently: POSIX forks and the
-// child `_exit(127)`s when execvp fails, whereas Windows fails up-front inside
-// CreateProcess so spawn returns Err.  These `![target(...)]` helpers pick the
-// right program per OS and account for cmd.exe's CRLF line endings, keeping
-// the test bodies below platform-neutral.
+// Windows.  These `![target(...)]` helpers pick the right program per OS and
+// account for cmd.exe's CRLF line endings, keeping the test bodies below
+// platform-neutral.
 // ---------------------------------------------------------------------------
 
 // A command that exits 0.
@@ -100,26 +102,15 @@ function echo_foobar_expect() -> Str { return Str::new("foo bar\n"); }
 ![target(windows)]
 function echo_foobar_expect() -> Str { return Str::new("foo bar\r\n"); }
 
-// Validate the outcome of running a nonexistent program.  POSIX: the forked
-// child `_exit(127)`s when execvp fails, so `status()` yields Ok(127).
-// Windows: CreateProcess fails for a missing image, so spawn/status returns
-// Err - that Err *is* the "command not found" signal, carrying the system's
-// own code (ERROR_FILE_NOT_FOUND).
-![target(unix)]
-function expect_missing(r: Result<ExitStatus, IoError>) -> Result<(), TestError> {
-    match (r) {
-        Result::Ok(st) => { return expect_eq(st.exit_code().unwrap_or(-1), 127); }
-        Result::Err(_) => { return bail(Str::new("spawn of missing program errored")); }
+// The failed spawn's error records `operation` on `path`.
+function expect_context(error: &IoError, operation: IoOperation, path: Str) -> Result<(), TestError> {
+    match (error.operation()) {
+        Option::Some(recorded) => { expect(recorded == operation, Str::new("the error records the operation that failed"))?; }
+        Option::None           => { return bail(Str::new("the error records no operation")); }
     }
-}
-![target(windows)]
-function expect_missing(r: Result<ExitStatus, IoError>) -> Result<(), TestError> {
-    match (r) {
-        Result::Ok(_)  => { return bail(Str::new("missing program unexpectedly spawned")); }
-        Result::Err(e) => {
-            expect(e.kind == IoErrorKind::NotFound, Str::new("missing program should be NotFound"))?;
-            return expect_eq(e.os_code, 2);
-        }
+    match (error.path()) {
+        Option::Some(recorded) => { return expect(recorded.as_str() == path, Str::new("the error names the path")); }
+        Option::None           => { return bail(Str::new("the error names no path")); }
     }
 }
 
@@ -206,15 +197,204 @@ function false_command_fails() -> Result<(), TestError> {
     return expect_eq(code, 1);
 }
 
+/// A program that does not exist is the spawn's own error, on every
+/// platform, and it names the program.
 ![test]
-function missing_program_exits_127() -> Result<(), TestError> {
-    // POSIX: execvp fails in the forked child, which _exit(127)s - the
-    // conventional "command not found" status.  Windows: CreateProcess
-    // fails up-front, so status() returns Err.  `expect_missing` encodes
-    // both per target.
-    mut cmd: Command = Command::new(Str::new("/no/such/cryo_program_xyzzy"));
-    const r: Result<ExitStatus, IoError> = cmd.status();
-    return expect_missing(r);
+function a_missing_program_is_a_spawn_error_naming_it() -> Result<(), TestError> {
+    const program: Str = Str::new("/no/such/cryo_program_xyzzy");
+    mut cmd: Command = Command::new(program);
+    match (cmd.status()) {
+        Result::Ok(_)  => { return bail(Str::new("a missing program must not start")); }
+        Result::Err(e) => {
+            expect(e.kind == IoErrorKind::NotFound, Str::new("a missing program is NotFound"))?;
+            expect_eq(e.os_code, 2)?;
+            return expect_context(&e, IoOperation::Spawn, program);
+        }
+    }
+}
+
+/// A working directory that does not exist is named by the spawn's error,
+/// not the program, which was never reached.
+![test]
+function a_missing_working_directory_is_a_spawn_error_naming_it() -> Result<(), TestError> {
+    const directory: Str = Str::new("cryo_no_such_directory_xyzzy");
+    mut cmd: Command = cmd_true();
+    cmd.current_directory(directory);
+    match (cmd.status()) {
+        Result::Ok(_)  => { return bail(Str::new("the child cannot start in a missing directory")); }
+        Result::Err(e) => { return expect_context(&e, IoOperation::Open, directory); }
+    }
+}
+
+/// A file that is no program is `NotExecutable`.
+![target(windows)]
+![test]
+function a_file_that_is_no_program_is_not_executable() -> Result<(), TestError> {
+    // A bare name is searched for, not taken from the current directory.
+    const name: Str = Str::new("./cryo_not_a_program.tmp");
+    match (File::write_text(Path::from(name), Str::new("plain text"))) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return bail(Str::new("could not write the text file")); }
+    }
+    mut cmd: Command = Command::new(name);
+    const outcome: Result<ExitStatus, IoError> = cmd.status();
+    mem::drop(File::remove(Path::from(name)));
+    match (outcome) {
+        Result::Ok(_)  => { return bail(Str::new("a text file must not start")); }
+        Result::Err(e) => {
+            expect_eq(e.os_code, 193)?;
+            expect(e.kind == IoErrorKind::NotExecutable, Str::new("a text file is NotExecutable"))?;
+            return expect_context(&e, IoOperation::Spawn, name);
+        }
+    }
+}
+
+/// `env_remove` keeps an inherited variable from the child, and the later
+/// of `env` and `env_remove` for one key is the one that holds.
+![test]
+function env_remove_keeps_an_inherited_variable_from_the_child() -> Result<(), TestError> {
+    const name: Str = Str::new("CRYO_REMOVED_VARIABLE");
+    env::set_var(name, Str::new("inherited"));
+
+    mut removed: Command = cmd_print_variable(name);
+    removed.env_remove(name);
+    const removed_output: Output = removed.output().unwrap();
+
+    mut set_then_removed: Command = cmd_print_variable(name);
+    set_then_removed.env(name, Str::new("set")).env_remove(name);
+    const set_then_removed_output: Output = set_then_removed.output().unwrap();
+
+    mut removed_then_set: Command = cmd_print_variable(name);
+    removed_then_set.env_remove(name).env(name, Str::new("set"));
+    const removed_then_set_output: Output = removed_then_set.output().unwrap();
+
+    mut inherited: Command = cmd_print_variable(name);
+    const inherited_output: Output = inherited.output().unwrap();
+    env::remove_var(name);
+
+    expect(removed_output.stdout().equals(unset_variable_output(name).as_bytes()), Str::new("a removed variable does not reach the child"))?;
+    expect(set_then_removed_output.stdout().equals(unset_variable_output(name).as_bytes()), Str::new("env_remove after env removes"))?;
+    expect(removed_then_set_output.stdout().equals(set_variable_output(Str::new("set")).as_bytes()), Str::new("env after env_remove sets"))?;
+    return expect(inherited_output.stdout().equals(set_variable_output(Str::new("inherited")).as_bytes()), Str::new("an untouched variable is inherited"));
+}
+
+/// Windows variable names ignore case, so removing `cryo_...` removes the
+/// inherited `CRYO_...`.
+![target(windows)]
+![test]
+function env_remove_ignores_case_on_windows() -> Result<(), TestError> {
+    const name: Str = Str::new("CRYO_REMOVED_ANY_CASE");
+    env::set_var(name, Str::new("inherited"));
+    mut cmd: Command = cmd_print_variable(name);
+    cmd.env_remove(Str::new("cryo_removed_any_case"));
+    const output: Output = cmd.output().unwrap();
+    env::remove_var(name);
+    return expect(output.stdout().equals(unset_variable_output(name).as_bytes()), Str::new("the removal matches the name in any case"));
+}
+
+/// A child that has been waited for is never signalled: its process id may
+/// already belong to another process.
+![test]
+function a_reaped_child_is_not_signalled() -> Result<(), TestError> {
+    mut cmd: Command = cmd_true();
+    mut child: Child = cmd.spawn().unwrap();
+    mem::drop(child.wait());
+    match (child.kill()) {
+        Result::Ok(_)  => { return bail(Str::new("kill after wait must be refused")); }
+        Result::Err(e) => { return expect(e.kind == IoErrorKind::InvalidInput, Str::new("refused with InvalidInput")); }
+    }
+}
+
+/// `Signal::from_i32` answers only for a number it names.
+![test]
+function signal_from_a_number_is_checked() -> Result<(), TestError> {
+    expect(Signal::from_i32(9).unwrap().as_i32() == 9, Str::new("9 is kill"))?;
+    expect(Signal::from_i32(0).is_none(), Str::new("0 names no signal"))?;
+    return expect(Signal::from_i32(16).is_none(), Str::new("16 names none of the signals"));
+}
+
+/// `kill_tree` ends the grandchild too: the pipe the whole tree holds
+/// reaches end of file at once, not when the grandchild's five seconds
+/// are up.
+![test]
+function kill_tree_ends_the_childs_descendants() -> Result<(), TestError> {
+    mut cmd: Command = cmd_grandchild_holds_stdout();
+    cmd.stdout(Stdio::Piped).group_descendants();
+    mut child: Child = cmd.spawn().unwrap();
+    mut stdout: ChildStdout = child.stdout.take().unwrap();
+    mut seen: Array<u8> = Array::new();
+    mut chunk: [u8; 64];
+    while (!Str::from_raw(seen.as_ptr(), seen.length()).contains(&grandchild_marker())) {
+        const count: i64 = stdout.read(&chunk[0], 64).unwrap();
+        if (count == 0) { break; }
+        for (mut i: i64 = 0; i < count; i++) { seen.push(chunk[i]); }
+    }
+    const killed: Instant = Instant::now();
+    const outcome: Result<(), IoError> = child.kill_tree();
+    mem::drop(child.wait());
+    mut rest: Array<u8> = Array::new();
+    mem::drop(stdout.read_to_end(&rest));
+    const waited_for_end: Duration = killed.elapsed();
+    expect(outcome.is_ok(), Str::new("kill_tree succeeds on a grouped child"))?;
+    return expect(waited_for_end.as_millis() < 3000, Str::new("every holder of the pipe is gone at once"));
+}
+
+/// A child spawned without `group_descendants` has no tree to end.
+![test]
+function kill_tree_needs_a_grouped_child() -> Result<(), TestError> {
+    mut cmd: Command = cmd_sleep();
+    mut child: Child = cmd.spawn().unwrap();
+    const outcome: Result<(), IoError> = child.kill_tree();
+    mem::drop(child.kill());
+    mem::drop(child.wait());
+    match (outcome) {
+        Result::Ok(_)  => { return bail(Str::new("an ungrouped child has no tree")); }
+        Result::Err(e) => { return expect(e.kind == IoErrorKind::InvalidInput, Str::new("refused with InvalidInput")); }
+    }
+}
+
+/// Every wait reports how much memory the child held at its peak; any
+/// program holds well over 100 KB once loaded.
+![test]
+function a_childs_peak_memory_is_reported() -> Result<(), TestError> {
+    mut waited: Command = cmd_true();
+    const waited_status: ExitStatus = waited.status().unwrap();
+    mut polled: Command = cmd_true();
+    mut child: Child = polled.spawn().unwrap();
+    const polled_status: ExitStatus = child.wait_timeout(Duration::from_secs(30)).unwrap().unwrap();
+    expect(waited_status.peak_memory_bytes().unwrap_or(0) > 100000, Str::new("wait reports the peak"))?;
+    return expect(polled_status.peak_memory_bytes().unwrap_or(0) > 100000, Str::new("wait_timeout reports the peak"));
+}
+
+/// The machine reports some memory, and no more available than installed.
+![test]
+function system_memory_reports_total_and_available() -> Result<(), TestError> {
+    const memory: SystemMemory = SystemMemory::query().unwrap();
+    expect(memory.total_bytes() > 0, Str::new("some memory is installed"))?;
+    expect(memory.available_bytes() > 0, Str::new("some memory is available"))?;
+    return expect(memory.available_bytes() <= memory.total_bytes(), Str::new("no more is available than installed"));
+}
+
+/// A piped stdout is taken out of the running child and read while the
+/// child keeps running.
+![test]
+function a_running_childs_output_is_read_before_it_exits() -> Result<(), TestError> {
+    mut cmd: Command = cmd_print_then_wait();
+    cmd.stdout(Stdio::Piped);
+    mut child: Child = cmd.spawn().unwrap();
+    mut stdout: ChildStdout = child.stdout.take().unwrap();
+    mut seen: Array<u8> = Array::new();
+    mut chunk: [u8; 64];
+    while (!Str::from_raw(seen.as_ptr(), seen.length()).contains(&Str::new("ready"))) {
+        const count: i64 = stdout.read(&chunk[0], 64).unwrap();
+        if (count == 0) { break; }
+        for (mut i: i64 = 0; i < count; i++) { seen.push(chunk[i]); }
+    }
+    const running: boolean = child.try_wait().unwrap().is_none();
+    mem::drop(child.kill());
+    mem::drop(child.wait());
+    expect(Str::from_raw(seen.as_ptr(), seen.length()).contains(&Str::new("ready")), Str::new("the first line arrives"))?;
+    return expect(running, Str::new("the child is still running when its first line is read"));
 }
 
 ![test]
@@ -344,24 +524,80 @@ function output_with_large_stderr_does_not_deadlock() -> Result<(), TestError> {
     return expect(got_stderr, Str::new("stderr must capture ~100 KiB"));
 }
 
-// A command that prints the value of $CRYO_TEST_VAR with no extra output.
-// unix: printf avoids a trailing newline; windows: cmd's echo adds CRLF.
+// A command that prints the value of the variable `name` with no extra
+// output. unix: printf avoids a trailing newline; windows: cmd's echo adds
+// CRLF, and echoes `%name%` itself when the variable is unset.
 ![target(unix)]
-function cmd_print_var() -> Command {
+function cmd_print_variable(name: Str) -> Command {
+    mut script: String = String::from_str(Str::new("printf %s \"$"));
+    script.push(name);
+    script.push(Str::new("\""));
     mut c: Command = Command::new(Str::new("/bin/sh"));
-    c.arg(Str::new("-c")); c.arg(Str::new("printf %s \"$CRYO_TEST_VAR\""));
+    c.arg(Str::new("-c")).arg(script.as_str());
     return c;
 }
 ![target(windows)]
-function cmd_print_var() -> Command {
+function cmd_print_variable(name: Str) -> Command {
+    mut script: String = String::from_str(Str::new("echo %"));
+    script.push(name);
+    script.push(Str::new("%"));
     mut c: Command = Command::new(Str::new("cmd"));
-    c.arg(Str::new("/c")); c.arg(Str::new("echo %CRYO_TEST_VAR%"));
+    c.arg(Str::new("/c")).arg(script.as_str());
     return c;
 }
 ![target(unix)]
-function print_var_expect() -> Str { return Str::new("cryo_env_works"); }
+function set_variable_output(value: Str) -> String { return String::from_str(value); }
 ![target(windows)]
-function print_var_expect() -> Str { return Str::new("cryo_env_works\r\n"); }
+function set_variable_output(value: Str) -> String {
+    mut text: String = String::from_str(value);
+    text.push(Str::new("\r\n"));
+    return text;
+}
+![target(unix)]
+function unset_variable_output(name: Str) -> String { return String::new(); }
+![target(windows)]
+function unset_variable_output(name: Str) -> String {
+    mut text: String = String::from_str(Str::new("%"));
+    text.push(name);
+    text.push(Str::new("%\r\n"));
+    return text;
+}
+
+// A child that prints `ready`, then keeps running for about five seconds.
+![target(unix)]
+function cmd_print_then_wait() -> Command {
+    mut c: Command = Command::new(Str::new("/bin/sh"));
+    c.arg(Str::new("-c")).arg(Str::new("echo ready; sleep 5"));
+    return c;
+}
+![target(windows)]
+function cmd_print_then_wait() -> Command {
+    mut c: Command = Command::new(Str::new("cmd"));
+    c.arg(Str::new("/c")).arg(Str::new("echo ready& ping -n 6 127.0.0.1 >NUL"));
+    return c;
+}
+
+// A child whose own child - the grandchild - writes `grandchild_marker()` to
+// the shared stdout and then holds it for about five seconds. The marker
+// comes from the grandchild, so once it is read the grandchild exists. The
+// shell waits for it rather than replacing itself, since a command follows.
+![target(unix)]
+function cmd_grandchild_holds_stdout() -> Command {
+    mut c: Command = Command::new(Str::new("/bin/sh"));
+    c.arg(Str::new("-c")).arg(Str::new("/bin/sh -c 'echo ready; exec sleep 5'; echo done"));
+    return c;
+}
+![target(windows)]
+function cmd_grandchild_holds_stdout() -> Command {
+    mut c: Command = Command::new(Str::new("cmd"));
+    c.arg(Str::new("/c")).arg(Str::new("ping -n 6 127.0.0.1& echo done"));
+    return c;
+}
+// ping's first line names the address in every display language.
+![target(unix)]
+function grandchild_marker() -> Str { return Str::new("ready"); }
+![target(windows)]
+function grandchild_marker() -> Str { return Str::new("127.0.0.1"); }
 
 // env() overrides reach the child. On Windows this exercises the
 // CreateProcessA environment-block builder (the parent process does not have
@@ -369,7 +605,7 @@ function print_var_expect() -> Str { return Str::new("cryo_env_works\r\n"); }
 // unix it exercises the existing per-var apply_env path.
 ![test]
 function env_override_passed_to_child() -> Result<(), TestError> {
-    mut cmd: Command = cmd_print_var();
+    mut cmd: Command = cmd_print_variable(Str::new("CRYO_TEST_VAR"));
     cmd.env(Str::new("CRYO_TEST_VAR"), Str::new("cryo_env_works"));
     mut success: boolean = false;
     mut content_ok: boolean = false;
@@ -377,7 +613,7 @@ function env_override_passed_to_child() -> Result<(), TestError> {
         Result::Ok(out) => {
             mut o: Output = out;
             success = o.status().success();
-            content_ok = o.stdout().equals(print_var_expect().as_bytes());
+            content_ok = o.stdout().equals(set_variable_output(Str::new("cryo_env_works")).as_bytes());
         }
         Result::Err(_) => { return bail(Str::new("output() of env command failed")); }
     }

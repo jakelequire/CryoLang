@@ -13,9 +13,11 @@
 ///! // read from child.stdout, wait, etc.
 ///! ```
 ///!
-///! Under the hood: fork(), adjust fds and env in the child, execvp.
-///! If execvp fails the child `_exit(127)`s so the parent sees a
-///! status of 127, the standard "exec not found" code.
+///! Under the hood: fork(), adjust fds and env in the child, execvp on
+///! POSIX; one CreateProcess call on Windows. A program that cannot be
+///! started is `spawn`'s error, naming the program (`could not start
+///! tool: not found`), or the working directory when that was what
+///! could not be entered - never a child that exits 127.
 
 namespace std::process::command;
 
@@ -25,7 +27,8 @@ import std::core::result::{ Result };
 import std::core::slice::{ Slice };
 import std::core::drop::{ Drop };
 import std::core::mem;
-import std::io::error::{ IoError, IoErrorKind };
+import std::io::error::{ IoError, IoErrorKind, IoOperation };
+import std::fs::path::{ Path };
 import std::io::fd;
 import std::io::fd::{ BorrowedFileDescriptor };
 import std::io::traits::{ Read };
@@ -62,9 +65,11 @@ public type enum Stdio {
     SameAsStdout;
 }
 
+/// One change to the child's environment: `value` set, or `None` for a
+/// variable removed. A command holds at most one entry per key.
 private type struct EnvEntry {
     private key: String;
-    private value: String;
+    private value: Option<String>;
 }
 
 public type struct Command {
@@ -72,6 +77,7 @@ public type struct Command {
     private args: Array<String>;
     private envs: Array<EnvEntry>;
     private clear_env_flag: boolean;
+    private group_descendants_flag: boolean;
     private current_directory: Option<String>;
     private stdin_cfg: Stdio;
     private stdout_cfg: Stdio;
@@ -86,6 +92,7 @@ public type struct Command {
             args: Array::new(),
             envs: Array::new(),
             clear_env_flag: false,
+            group_descendants_flag: false,
             current_directory: Option::None,
             stdin_cfg: Stdio::Inherit,
             stdout_cfg: Stdio::Inherit,
@@ -116,19 +123,42 @@ public type struct Command {
         return &this;
     }
 
-    /// Set the environment variable `key` to `value` in the child.
+    /// Set the environment variable `key` to `value` in the child. Replaces
+    /// an earlier `env` or `env_remove` of the same key.
     public env(mut &this, key: Str, value: Str) -> mut &Command {
+        this.envs.retain((entry: &EnvEntry) -> boolean { return entry.key.as_str() != key; });
         this.envs.push(EnvEntry {
             key: String::from_str(key),
-            value: String::from_str(value)
+            value: Option::Some(String::from_str(value))
         });
         return &this;
     }
 
-    /// Don't inherit the parent's environment. Only the entries added
+    /// Start the child without the variable `key`, even though the parent
+    /// has it. Replaces an earlier `env` of the same key.
+    public env_remove(mut &this, key: Str) -> mut &Command {
+        this.envs.retain((entry: &EnvEntry) -> boolean { return entry.key.as_str() != key; });
+        this.envs.push(EnvEntry { key: String::from_str(key), value: Option::None });
+        return &this;
+    }
+
+    /// Don't inherit the parent's environment. Only the variables set
     /// with `env()` reach the child.
     public env_clear(mut &this) -> mut &Command {
         this.clear_env_flag = true;
+        return &this;
+    }
+
+    /// Start the child as the root of a process tree of its own - a new
+    /// process group on POSIX, a job object on Windows - that every
+    /// process it starts joins, so `Child.kill_tree` ends them all.
+    ///
+    /// A descendant that leaves the tree on purpose (POSIX `setsid` or
+    /// `setpgid`, a Windows job breakaway) is beyond its reach. On POSIX
+    /// the new group is no longer the terminal's foreground group, so the
+    /// terminal's Ctrl-C reaches the parent and not the child.
+    public group_descendants(mut &this) -> mut &Command {
+        this.group_descendants_flag = true;
         return &this;
     }
 
@@ -500,23 +530,31 @@ private function build_argv(program: &String,
 /// strings alive across the fork; `envp` aliases each one's `as_ptr()`
 /// and is NUL-terminated so the child can hand it straight to `execvpe`
 /// on the `clear_env` path.  The inherit path reads `storage` directly
-/// via `putenv` (which stores the pointer without copying).
+/// via `putenv` (which stores the pointer without copying), and unsets
+/// each NUL-terminated key in `removed`.
 ![target(unix)]
 private function build_envp(envs: &Array<EnvEntry>,
                             storage: mut &Array<String>,
-                            envp: mut &Array<u8*>) -> Result<(), IoError> {
+                            envp: mut &Array<u8*>,
+                            removed: mut &Array<String>) -> Result<(), IoError> {
     mut i: i64 = 0;
     while (i < envs.length()) {
         match (envs.get_ref(i)) {
             Option::Some(entry) => {
-                // "KEY=VALUE\0" - one heap string, the terminator kept in
-                // the buffer for `as_ptr()` (C reads up to the first NUL).
-                mut joined: String = String::new();
-                joined.push(entry.key.as_str());
-                joined.push_byte('=' as u8);
-                joined.push(entry.value.as_str());
-                joined.push_byte(0 as u8);
-                storage.push(joined);
+                match (&entry.value) {
+                    Option::Some(value) => {
+                        // "KEY=VALUE\0" - one heap string, the terminator kept
+                        // in the buffer for `as_ptr()` (C reads up to the
+                        // first NUL).
+                        mut joined: String = String::new();
+                        joined.push(entry.key.as_str());
+                        joined.push_byte('=' as u8);
+                        joined.push(value.as_str());
+                        joined.push_byte(0 as u8);
+                        storage.push(joined);
+                    }
+                    Option::None => { removed.push(String::with_null(entry.key.as_str())); }
+                }
             }
             Option::None => { break; }
         }
@@ -597,7 +635,8 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
     // `envp_storage` strings directly via `putenv` below.
     mut envp_storage: Array<String> = Array::new();
     mut envp: Array<u8*> = Array::new();
-    match (build_envp(&cmd.envs, &envp_storage, &envp)) {
+    mut removed_keys: Array<String> = Array::new();
+    match (build_envp(&cmd.envs, &envp_storage, &envp, &removed_keys)) {
         Result::Ok(_) => { }
         Result::Err(err) => {
             close_pipe(&stdin_pipe);
@@ -607,6 +646,19 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
         }
     }
 
+    // 3c. The failure pipe: close-on-exec, so a successful exec closes the
+    // child's write end and the parent reads end of file; a child that fails
+    // before or at exec writes its step and `errno` there instead.
+    mut failure_ends: [i32; 2];
+    if (libc::pipe2(&failure_ends[0], libc::O_CLOEXEC) < 0) {
+        const err: IoError = IoError::last_os_error();
+        close_pipe(&stdin_pipe);
+        close_pipe(&stdout_pipe);
+        close_pipe(&stderr_pipe);
+        return Result::Err(err);
+    }
+    const failure_pipe: PipePair = PipePair { read_end: failure_ends[0], write_end: failure_ends[1] };
+
     // 4. fork.
     const pid: i32 = libc::fork();
     if (pid < 0) {
@@ -614,6 +666,7 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
         close_pipe(&stdin_pipe);
         close_pipe(&stdout_pipe);
         close_pipe(&stderr_pipe);
+        close_pipe(&failure_pipe);
         return Result::Err(err);
     }
 
@@ -624,14 +677,20 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
         // environment was assembled in the parent (`build_envp`) precisely
         // so the child performs no allocation and never calls
         // setenv/clearenv (which are NOT async-signal-safe).
-        if (!child_remap(cmd.stdin_cfg, &stdin_pipe, 0, true)) { libc::_exit(127); }
-        if (!child_remap(cmd.stdout_cfg, &stdout_pipe, 1, false)) { libc::_exit(127); }
-        if (!child_remap(cmd.stderr_cfg, &stderr_pipe, 2, false)) { libc::_exit(127); }
+        fd::close_fd(failure_pipe.read_end);
+        // The child leads a new group, so a signal to the group reaches
+        // everything it starts.
+        if (cmd.group_descendants_flag && libc::setpgid(0, 0) < 0) {
+            report_spawn_failure(failure_pipe.write_end, SPAWN_STEP_SETUP);
+        }
+        if (!child_remap(cmd.stdin_cfg, &stdin_pipe, 0, true)) { report_spawn_failure(failure_pipe.write_end, SPAWN_STEP_SETUP); }
+        if (!child_remap(cmd.stdout_cfg, &stdout_pipe, 1, false)) { report_spawn_failure(failure_pipe.write_end, SPAWN_STEP_SETUP); }
+        if (!child_remap(cmd.stderr_cfg, &stderr_pipe, 2, false)) { report_spawn_failure(failure_pipe.write_end, SPAWN_STEP_SETUP); }
 
         // cwd change.
         match (cwd_cstr) {
             Option::Some(path) => {
-                if (libc::chdir(path.as_ptr()) < 0) { libc::_exit(127); }
+                if (libc::chdir(path.as_ptr()) < 0) { report_spawn_failure(failure_pipe.write_end, SPAWN_STEP_DIRECTORY); }
             }
             Option::None => { }
         }
@@ -647,10 +706,17 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
         //    internal alloc is the only residual on the inherit path and
         //    is unavoidable without enumerating the inherited environment
         //    (which the stdlib does not yet expose).
+        //    A removed variable is `unsetenv`ed first; like `putenv` it
+        //    edits the environ array in place.
         //  - inherit, no overrides: plain `execvp`.
         if (cmd.clear_env_flag) {
             libc::execvpe(argv[0], argv.as_ptr(), envp.as_ptr());
         } else {
+            mut ri: i64 = 0;
+            while (ri < removed_keys.length()) {
+                libc::unsetenv(removed_keys.get_ref(ri).unwrap().as_ptr());
+                ri = ri + 1;
+            }
             mut ei: i64 = 0;
             while (ei < envp_storage.length()) {
                 libc::putenv(envp_storage.get_ref(ei).unwrap().as_ptr());
@@ -659,10 +725,33 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
             libc::execvp(argv[0], argv.as_ptr());
         }
         // If we got here, exec failed.
-        libc::_exit(127);
+        report_spawn_failure(failure_pipe.write_end, SPAWN_STEP_EXEC);
     }
 
     // -------- parent --------
+    // The child's write end closes here; the read below then sees end of
+    // file once the child has exec'd (close-on-exec) or written a failure.
+    fd::close_fd(failure_pipe.write_end);
+    mut failure: [i32; 2];
+    mut failure_read: i64 = 0;
+    loop {
+        failure_read = libc::read(failure_pipe.read_end, &failure[0] as mut u8*, 8);
+        if (failure_read >= 0) { break; }
+        if (libc::errno() != libc::EINTR) { break; }
+    }
+    fd::close_fd(failure_pipe.read_end);
+    if (failure_read == 8) {
+        // The child exited at once; reap it so no zombie is left behind.
+        mut reaped_status: i32 = 0;
+        while (libc::waitpid(pid, &reaped_status, 0) < 0 && libc::errno() == libc::EINTR) { }
+        close_pipe(&stdin_pipe);
+        close_pipe(&stdout_pipe);
+        close_pipe(&stderr_pipe);
+        match (cmd.stdin_cfg) { Stdio::Fd(raw) => { fd::close_fd(raw); } _ => { } }
+        match (cmd.stdout_cfg) { Stdio::Fd(raw) => { fd::close_fd(raw); } _ => { } }
+        match (cmd.stderr_cfg) { Stdio::Fd(raw) => { fd::close_fd(raw); } _ => { } }
+        return Result::Err(spawn_error(cmd, IoError::from_errno(failure[1]), failure[0] == SPAWN_STEP_DIRECTORY));
+    }
     // Close the ends of each pipe that belong to the child.
     // For `Stdio::Fd`, ownership of the fd transferred to the spawn: the
     // child duped it into place (`child_remap`) before exec, so the parent
@@ -724,7 +813,40 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
     // The argument strings + pointer array fall out of scope at function
     // exit; the synthesized drops release them.  The child has its own COW
     // copies, which are either replaced by exec or abandoned on _exit.
-    return Result::Ok(Child::new(pid, 0, stdin_handle, stdout_handle, stderr_handle));
+    // A grouped child leads the group numbered by its own pid; it joined
+    // it before exec, which the failure pipe's end of file follows.
+    mut tree: u64 = 0;
+    if (cmd.group_descendants_flag) { tree = pid as u64; }
+    return Result::Ok(Child::new(pid, 0, tree, stdin_handle, stdout_handle, stderr_handle));
+}
+
+// The step a forked child failed at, written to the failure pipe before
+// its `errno`.
+private const SPAWN_STEP_SETUP:     i32 = 0;
+private const SPAWN_STEP_DIRECTORY: i32 = 1;
+private const SPAWN_STEP_EXEC:      i32 = 2;
+
+/// In the forked child: write `step` and `errno` to the failure pipe and
+/// exit. Only `write` and `_exit`, so it is async-signal-safe.
+![target(unix)]
+private function report_spawn_failure(failure_fd: i32, step: i32) -> void {
+    mut report: [i32; 2] = [step, libc::errno()];
+    libc::write(failure_fd, &report[0] as u8*, 8);
+    libc::_exit(127);
+}
+
+/// A spawn failure as the caller reads it: the working directory when
+/// entering it failed, otherwise the program.
+private function spawn_error(cmd: &Command, error: IoError, in_directory: boolean) -> IoError {
+    match (&cmd.current_directory) {
+        Option::Some(directory) => {
+            if (in_directory) {
+                return error.with_context(IoOperation::Open, Path::from(directory.as_str()));
+            }
+        }
+        Option::None => { }
+    }
+    return error.with_context(IoOperation::Spawn, Path::from(cmd.program.as_str()));
 }
 
 ![target(unix)]
@@ -762,6 +884,7 @@ private function clone_command(cmd: &Command) -> Command {
         args: Array::new(),
         envs: Array::new(),
         clear_env_flag: cmd.clear_env_flag,
+        group_descendants_flag: cmd.group_descendants_flag,
         current_directory: Option::None,
         stdin_cfg: cmd.stdin_cfg,
         stdout_cfg: cmd.stdout_cfg,
@@ -779,10 +902,12 @@ private function clone_command(cmd: &Command) -> Command {
     while (j < cmd.envs.length()) {
         match (cmd.envs.get_ref(j)) {
             Option::Some(entry) => {
-                out.envs.push(EnvEntry {
-                    key: String::from_str(entry.key.as_str()),
-                    value: String::from_str(entry.value.as_str())
-                });
+                mut value: Option<String> = Option::None;
+                match (&entry.value) {
+                    Option::Some(text) => { value = Option::Some(String::from_str(text.as_str())); }
+                    Option::None       => { }
+                }
+                out.envs.push(EnvEntry { key: String::from_str(entry.key.as_str()), value: value });
             }
             Option::None => { break; }
         }
@@ -1014,16 +1139,19 @@ private function build_cmdline(cmd: &Command) -> String {
     return cl;
 }
 
-// True if the `KEY=VALUE\0` entry at `entry` has key exactly `key` (i.e. the
-// bytes match and the entry's key ends right at the `=`).  Used to drop an
-// inherited variable that the caller overrides.
+// True if the `KEY=VALUE\0` entry at `entry` has key `key` (the entry's key
+// ends right at the `=`).  Windows variable names ignore ASCII case, so
+// `Path` names the inherited `PATH`.  Used to drop an inherited variable the
+// caller sets or removes.
 ![target(windows)]
 private function win_env_key_matches(entry: u8*, key: &String) -> boolean {
+    // Byte by byte, stopping at the first difference: the entry may be
+    // shorter than `key`, and its NUL then differs before the block ends.
     const klen: i64 = key.length();
     const kp: u8* = key.as_ptr();
     mut i: i64 = 0;
     while (i < klen) {
-        if (entry[i] != kp[i]) { return false; }
+        if (entry[i].to_ascii_lowercase() != kp[i].to_ascii_lowercase()) { return false; }
         i = i + 1;
     }
     return entry[klen] == 61;  // '='
@@ -1072,15 +1200,21 @@ private function build_env_block(cmd: &Command) -> String {
         }
     }
 
-    // Append the caller's overrides as KEY=VALUE\0.
+    // Append the caller's overrides as KEY=VALUE\0; a removed variable was
+    // dropped above and is not appended.
     mut e2: i64 = 0;
     while (e2 < cmd.envs.length()) {
         match (cmd.envs.get_ref(e2)) {
             Option::Some(en) => {
-                blk.push(en.key.as_str());
-                blk.push_byte(61);           // '='
-                blk.push(en.value.as_str());
-                blk.push_byte(0);
+                match (&en.value) {
+                    Option::Some(value) => {
+                        blk.push(en.key.as_str());
+                        blk.push_byte(61);           // '='
+                        blk.push(value.as_str());
+                        blk.push_byte(0);
+                    }
+                    Option::None => { }
+                }
             }
             Option::None => { }
         }
@@ -1218,8 +1352,12 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
         env_ptr = env_block.as_ptr();
     }
 
+    // A grouped child starts suspended, so it is in its job before it can
+    // start anything of its own.
+    mut creation_flags: u32 = 0;
+    if (cmd.group_descendants_flag) { creation_flags = syscall::CREATE_SUSPENDED; }
     const ok: i32 = syscall::CreateProcessA(null, cmdline.as_ptr(), null, null,
-                                            1, 0, env_ptr, cwd_ptr, &si, &pi);
+                                            1, creation_flags, env_ptr, cwd_ptr, &si, &pi);
     // Read before the closes below can overwrite it; used only on failure.
     const create_error: IoError = IoError::last_os_error();
 
@@ -1239,7 +1377,29 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
         if (sin.parent_fd  >= 0) { fd::close_fd(sin.parent_fd); }
         if (sout.parent_fd >= 0) { fd::close_fd(sout.parent_fd); }
         if (serr.parent_fd >= 0) { fd::close_fd(serr.parent_fd); }
-        return Result::Err(create_error);
+        // CreateProcess reports a working directory it cannot enter as
+        // ERROR_DIRECTORY.
+        const in_directory: boolean = create_error.os_code == syscall::ERROR_DIRECTORY as i32;
+        return Result::Err(spawn_error(cmd, create_error, in_directory));
+    }
+
+    mut job: u8* = null;
+    if (cmd.group_descendants_flag) {
+        job = syscall::CreateJobObjectA(null, null);
+        if (job == null || syscall::AssignProcessToJobObject(job, pi.hProcess) == 0) {
+            // The child has run nothing yet: end it rather than hand back a
+            // child its caller asked to be able to end with its tree.
+            const job_error: IoError = IoError::last_os_error();
+            syscall::TerminateProcess(pi.hProcess, 1);
+            if (job != null) { syscall::CloseHandle(job); }
+            syscall::CloseHandle(pi.hThread);
+            syscall::CloseHandle(pi.hProcess);
+            if (sin.parent_fd  >= 0) { fd::close_fd(sin.parent_fd); }
+            if (sout.parent_fd >= 0) { fd::close_fd(sout.parent_fd); }
+            if (serr.parent_fd >= 0) { fd::close_fd(serr.parent_fd); }
+            return Result::Err(spawn_error(cmd, job_error, false));
+        }
+        syscall::ResumeThread(pi.hThread);
     }
     syscall::CloseHandle(pi.hThread);
 
@@ -1250,7 +1410,7 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
     if (sout.parent_fd >= 0) { stdout_handle = Option::Some(ChildStdout::from_fd(sout.parent_fd)); }
     if (serr.parent_fd >= 0) { stderr_handle = Option::Some(ChildStderr::from_fd(serr.parent_fd)); }
 
-    return Result::Ok(Child::new(pi.dwProcessId as i32, pi.hProcess as u64,
+    return Result::Ok(Child::new(pi.dwProcessId as i32, pi.hProcess as u64, job as u64,
                                  stdin_handle, stdout_handle, stderr_handle));
 }
 

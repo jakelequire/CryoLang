@@ -1,0 +1,59 @@
+///! The chunked transfer coding, for sending a body whose length is not
+///! known when sending starts: each piece goes out as its size in
+///! hexadecimal, CRLF, the bytes and CRLF, and an empty chunk ends the
+///! body. Reading one is part of `conn`'s framing.
+///!
+///! ```cryo
+///! import std::collections::array::{ Array };
+///! import std::collections::str::{ Str };
+///! import std::net::http::chunked::{ ChunkedEncoder };
+///!
+///! mut out: Array<u8> = Array::new();
+///! mut encoder: ChunkedEncoder = ChunkedEncoder::new();
+///! encoder.encode(Str::new("hello").as_bytes(), &out)?;   // "5\r\nhello\r\n"
+///! encoder.finish(&out)?;                                 // "0\r\n\r\n"
+///! ```
+///!
+///! The message carrying the body sends `Transfer-Encoding: chunked` and
+///! no `Content-Length`.
+
+namespace std::net::http::chunked;
+
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::io::error::{ IoError, IoErrorKind };
+import std::collections::array::{ Array };
+
+/// Writes a body as chunks, then the empty chunk that ends it.
+public type struct ChunkedEncoder {
+    private finished: boolean;
+
+    public static new() -> ChunkedEncoder {
+        return ChunkedEncoder { finished: false };
+    }
+
+    /// Append `data` to `out` as one chunk. Empty data appends nothing,
+    /// since an empty chunk would end the body. After `finish` it is
+    /// `InvalidInput`.
+    public encode(mut &this, data: &Slice<u8>, out: mut Array<u8>*) -> Result<(), IoError> {
+        if (this.finished) {
+            return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
+        }
+        if (data.is_empty()) { return Result::Ok(()); }
+        out.write(f"{data.length():x}\r\n")?;
+        out.try_append(data)?;
+        out.try_append(Slice::from_raw("\r\n", 2))?;
+        return Result::Ok(());
+    }
+
+    /// Append the empty chunk that ends the body, with an empty trailer
+    /// section. A second `finish` is `InvalidInput`.
+    public finish(mut &this, out: mut Array<u8>*) -> Result<(), IoError> {
+        if (this.finished) {
+            return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
+        }
+        out.try_append(Slice::from_raw("0\r\n\r\n", 5))?;
+        this.finished = true;
+        return Result::Ok(());
+    }
+}

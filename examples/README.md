@@ -17,7 +17,7 @@ builds and executes it.
 | 09 | [09-json-config](09-json-config/)      | `std::json` parsing, nested object/array walking, fallback defaults.          |
 | 10 | [10-expr-interpreter](10-expr-interpreter/) | Lexer + recursive-descent parser + evaluator over arithmetic.            |
 | 11 | [11-http-server](11-http-server/)      | `std::net::http` Router, four routes, drop discipline in handlers.            |
-| 12 | [12-guessing-game](12-guessing-game/)  | Stdin reads (`stdio::stdin().line()`), seeded RNG via `libc::time` + `rand`.  |
+| 12 | [12-guessing-game](12-guessing-game/)  | Stdin reads (`stdio::stdin().line()`), `random::rng::Rng::from_os()` + `next_range`. |
 | 13 | [13-closures](13-closures/)            | Capturing closures over `Copy` values, passed through `(Args) -> Ret` slots. |
 | 14 | [14-threads](14-threads/)              | Native threads: `thread::spawn`/`join` (move data in & out), `sync::mpsc` channels, scoped fork-join over a borrowed atomic. |
 | 15 | [15-files](15-files/)                  | `File::read_text` and friends, `BufReader.lines()`, directories, `TempDirectory`, errors naming their path. |
