@@ -1,12 +1,12 @@
-///! mpsc - single-threaded coverage of the multi-producer / single-consumer
-///! channel.
+///! mpsc - the multi-producer / single-consumer channel.
 ///!
-///! Cross-thread hand-off depends on std::thread (covered there).  On one
-///! thread we can still pin down the queue contract: FIFO delivery, the
+///! On one thread we pin down the queue contract: FIFO delivery, the
 ///! non-blocking `try_recv` Empty/Disconnected distinction, and that a
 ///! drained channel with no senders left reports Disconnected.  `recv()`
-///! blocks while senders remain, so every `recv` here is issued only after a
-///! value has been enqueued.
+///! blocks while senders remain, so every single-threaded `recv` here is
+///! issued only after a value has been enqueued.  A bounded channel's full
+///! queue is shown with a second thread: its `send` waits for the receiver
+///! to take a value, and returns the value once the receiver is gone.
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::SyncMpsc;
@@ -16,7 +16,11 @@ import std::core::option;
 import std::core::drop;
 import std::core::mem;
 import std::collections::str::{ Str };
-import std::sync::mpsc::{ Receiver, RecvError, Sender, TryRecvError };
+import std::collections::pair::{ Pair };
+import std::sync::mpsc;
+import std::sync::mpsc::{ Channel, Receiver, RecvError, Sender, TryRecvError };
+import std::sync::atomic::{ Atomic, MemoryOrder };
+import std::thread;
 import std::test::error::{ TestError };
 import std::test::assert::{ bail, expect_eq };
 
@@ -38,8 +42,7 @@ function recv_eq(rx: &Receiver<i32>, want: i32) -> Result<(), TestError> {
 
 ![test]
 function mpsc_delivers_in_fifo_order() -> Result<(), TestError> {
-    mut rx: Receiver<i32> = mpsc::channel::<i32>();
-    mut tx: Sender<i32> = rx.sender();
+    const { first: tx, second: rx }: Pair<Sender<i32>, Receiver<i32>> = Channel::unbounded::<i32>();
 
     send_ok(&tx, 10)?;
     send_ok(&tx, 20)?;
@@ -54,8 +57,7 @@ function mpsc_delivers_in_fifo_order() -> Result<(), TestError> {
 
 ![test]
 function mpsc_try_recv_empty_then_disconnected() -> Result<(), TestError> {
-    mut rx: Receiver<i32> = mpsc::channel::<i32>();
-    mut tx: Sender<i32> = rx.sender();
+    const { first: tx, second: rx }: Pair<Sender<i32>, Receiver<i32>> = Channel::unbounded::<i32>();
 
     // No value queued, but a sender is alive -> Empty.
     match (rx.try_recv()) {
@@ -86,8 +88,7 @@ function mpsc_try_recv_empty_then_disconnected() -> Result<(), TestError> {
 
 ![test]
 function mpsc_recv_after_senders_dropped_is_disconnected() -> Result<(), TestError> {
-    mut rx: Receiver<i32> = mpsc::channel::<i32>();
-    mut tx: Sender<i32> = rx.sender();
+    const { first: tx, second: rx }: Pair<Sender<i32>, Receiver<i32>> = Channel::unbounded::<i32>();
 
     // Queue one value, drop the sender, then drain. The buffered value comes
     // out first; the next recv sees no value and no senders -> Disconnected.
@@ -109,9 +110,8 @@ function mpsc_recv_after_senders_dropped_is_disconnected() -> Result<(), TestErr
 
 ![test]
 function mpsc_multiple_producers_via_clone() -> Result<(), TestError> {
-    mut rx: Receiver<i32> = mpsc::channel::<i32>();
-    mut tx1: Sender<i32> = rx.sender();
-    mut tx2: Sender<i32> = tx1.clone();
+    const { first: tx1, second: rx }: Pair<Sender<i32>, Receiver<i32>> = Channel::unbounded::<i32>();
+    const tx2: Sender<i32> = tx1.clone();
 
     send_ok(&tx1, 1)?;
     send_ok(&tx2, 2)?;
@@ -131,5 +131,66 @@ function mpsc_multiple_producers_via_clone() -> Result<(), TestError> {
         }
     }
 
+    return Result::Ok(());
+}
+
+![test]
+function mpsc_bounded_holds_up_to_its_capacity() -> Result<(), TestError> {
+    const { first: tx, second: rx }: Pair<Sender<i32>, Receiver<i32>> = Channel::bounded::<i32>(2);
+    send_ok(&tx, 1)?;
+    send_ok(&tx, 2)?;
+    recv_eq(&rx, 1)?;
+    send_ok(&tx, 3)?;
+    recv_eq(&rx, 2)?;
+    recv_eq(&rx, 3)?;
+    return Result::Ok(());
+}
+
+![test]
+function mpsc_bounded_send_waits_for_room() -> Result<(), TestError> {
+    const { first: tx, second: rx }: Pair<Sender<i32>, Receiver<i32>> = Channel::bounded::<i32>(1);
+    send_ok(&tx, 1)?;
+    // The queue is full, so the worker's send waits until the first value
+    // is taken; `through` turns on only once that send has returned.
+    const through: Atomic<u32> = Atomic::<u32>::new(0);
+    const through_pointer: Atomic<u32>* = &through;
+    const worker = thread::spawn(move () -> i32 {
+        mut sent: i32 = 0;
+        if (tx.send(2).is_ok()) { sent = sent + 1; }
+        through_pointer.store(1, MemoryOrder::SeqCst);
+        if (tx.send(3).is_ok()) { sent = sent + 1; }
+        return sent;
+    });
+    thread::sleep_ms(50);
+    expect_eq(through.load(MemoryOrder::SeqCst), 0)?;
+    recv_eq(&rx, 1)?;
+    recv_eq(&rx, 2)?;
+    recv_eq(&rx, 3)?;
+    expect_eq(worker.join(), 2)?;
+    return Result::Ok(());
+}
+
+![test]
+function mpsc_bounded_send_returns_the_value_when_the_receiver_goes() -> Result<(), TestError> {
+    const { first: tx, second: rx }: Pair<Sender<i32>, Receiver<i32>> = Channel::bounded::<i32>(1);
+    send_ok(&tx, 1)?;
+    // The worker waits for room; dropping the receiver wakes it with the
+    // value handed back.
+    const worker = thread::spawn(move () -> i32 {
+        match (tx.send(5)) {
+            Result::Ok(_)  => { return -1; }
+            Result::Err(e) => { return e.value; }
+        }
+    });
+    thread::sleep_ms(30);
+    mem::drop(rx);
+    expect_eq(worker.join(), 5)?;
+    return Result::Ok(());
+}
+
+![test]
+![should_panic]
+function mpsc_bounded_refuses_no_capacity() -> Result<(), TestError> {
+    Channel::bounded::<i32>(0);
     return Result::Ok(());
 }

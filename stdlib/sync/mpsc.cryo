@@ -1,14 +1,14 @@
 ///! std::sync::mpsc: multi-producer, single-consumer channels.
 ///!
-///! `channel<T>()` returns the owning `Receiver<T>`; mint producers with
-///! `rx.sender()` (each `Sender<T>` is independently owned and movable
-///! into its own thread, and is cloneable for further multi-producer
-///! fan-out). Values of any type `T` - including owned data like
-///! `String` - are moved through the unbounded FIFO queue.
+///! `Channel::unbounded::<T>()` and `Channel::bounded::<T>(capacity)` open a
+///! channel and return both of its ends together, its `Sender<T>` first.
+///! Each `Sender<T>` is independently owned and movable into its own thread,
+///! and is cloned for more producers. Values of any type `T` - including
+///! owned data like `String` - are moved through the FIFO queue.
 ///!
 ///!   ```cryo
-///!   mut rx: mpsc::Receiver<i32> = mpsc::channel<i32>();
-///!   const tx: mpsc::Sender<i32> = rx.sender();
+///!   const { first: tx, second: rx }: Pair<mpsc::Sender<i32>, mpsc::Receiver<i32>> =
+///!       mpsc::Channel::unbounded::<i32>();
 ///!   // move `tx` into a worker thread; keep `rx` here
 ///!   const h = thread::spawn(move () -> i32 {
 ///!       tx.send(42);
@@ -18,19 +18,29 @@
 ///!   h.join();
 ///!   ```
 ///!
+///! ## Capacity
+///!
+///! An unbounded channel queues every value sent. A bounded one holds at
+///! most `capacity` values: `send` on a full channel blocks until the
+///! receiver takes one, or returns the value in `Err(SendError)` if the
+///! receiver is dropped meanwhile.
+///!
 ///! ## Disconnection
 ///!
 ///! When every `Sender` has been dropped, a blocked `recv()` returns
 ///! `Err(RecvError::Disconnected)` and `try_recv()` returns
-///! `Err(TryRecvError::Disconnected)`. When the `Receiver` is dropped,
-///! `send()` returns `Err(SendError)` (handing the value back) instead of
-///! queueing into a channel no one will drain.
+///! `Err(TryRecvError::Disconnected)`. A disconnected channel stays
+///! disconnected: a sender is made only with the channel or by cloning a
+///! live one. When the `Receiver` is dropped, `send()` returns
+///! `Err(SendError)` (handing the value back) instead of queueing into a
+///! channel no one will drain.
 ///!
 ///! ## Implementation
 ///!
 ///! A heap `ChannelInner<T>` holds a `Mutex` over the channel's state - a
-///! raw singly-linked node queue plus a live-sender count and a
-///! total-handle refcount - and a `CondVar` the receiver waits on. The inner is reclaimed when the last handle
+///! raw singly-linked node queue with its length, plus a live-sender count
+///! and a total-handle refcount - a `CondVar` the receiver waits on, and one
+///! a sender waits on for room. The inner is reclaimed when the last handle
 ///! (sender or receiver) drops. Values move out of dequeued nodes through
 ///! raw pointers, so the move-checker treats each as a clean transfer
 ///! (no aliasing, no double-free).
@@ -44,6 +54,7 @@ import std::core::option;
 import std::core::drop::{ Drop };
 import std::alloc::layout::{ Layout };
 import std::alloc::allocator::{ GlobalAlloc };
+import std::collections::pair::{ Pair };
 import std::core::mem;
 import std::sync::mutex::{ Mutex, MutexGuard };
 import std::sync::condvar::{ CondVar };
@@ -60,11 +71,13 @@ private type struct ChanNode<T> {
 
 /// The queue and the handle counts, reached only through the channel's lock.
 private type struct ChannelState<T> {
-    private head:    mut ChanNode<T>*;   // dequeue end (null when empty)
-    private tail:    mut ChanNode<T>*;   // enqueue end
-    private senders: i64;            // live Sender handles
-    private refs:    i64;            // live Sender + Receiver handles
-    private rx_open: boolean;        // receiver still alive
+    private head:     mut ChanNode<T>*;   // dequeue end (null when empty)
+    private tail:     mut ChanNode<T>*;   // enqueue end
+    private length:   i64;            // values queued
+    private capacity: i64;            // most values queued at once; `i64::MAX` when unbounded
+    private senders:  i64;            // live Sender handles
+    private refs:     i64;            // live Sender + Receiver handles
+    private rx_open:  boolean;        // receiver still alive
 
     /// Unlink and return the oldest queued node, or null when the queue is
     /// empty.
@@ -73,6 +86,7 @@ private type struct ChannelState<T> {
         if (node == null) { return null; }
         this.head = (*node).next;
         if (this.head == null) { this.tail = null; }
+        this.length = this.length - 1;
         return node;
     }
 }
@@ -81,22 +95,25 @@ private type struct ChannelState<T> {
 private type struct ChannelInner<T> {
     private state: Mutex<ChannelState<T>>;
     private ready: CondVar;   // the receiver waits here for a value or the last sender
+    private room:  CondVar;   // a sender waits here for a full queue to shrink or the receiver to go
 }
 
 
-/// Allocate + initialize a fresh `ChannelInner<T>` owned solely by the
-/// receiver `channel` returns (no senders yet; one live handle).
-private function new_inner<T>() -> mut ChannelInner<T>* {
+/// Allocate + initialize a fresh `ChannelInner<T>` holding at most
+/// `capacity` values, with its two handles: one `Sender` and the `Receiver`.
+private function new_inner<T>(capacity: i64) -> mut ChannelInner<T>* {
     mut alloc: GlobalAlloc = GlobalAlloc::new();
     mut inner: mut ChannelInner<T>* = null;
     match (alloc.allocate(Layout::of::<ChannelInner<T>>())) {
         Result::Ok(raw) => { inner = raw.cast::<ChannelInner<T>>().as_ptr(); }
-        Result::Err(_)  => { core::panic("mpsc::channel: allocation failed", intrinsics::location()); }
+        Result::Err(_)  => { core::panic("mpsc::Channel: allocation failed", intrinsics::location()); }
     }
     inner.state = Mutex::new(ChannelState::<T> {
-        head: null, tail: null, senders: 0, refs: 1, rx_open: true   // one handle: the Receiver
+        head: null, tail: null, length: 0, capacity: capacity,
+        senders: 1, refs: 2, rx_open: true
     });
     inner.ready = CondVar::new();
+    inner.room = CondVar::new();
     return inner;
 }
 
@@ -140,12 +157,16 @@ public type enum ReceiveTimeoutError {
 public type struct Sender<T> {
     private inner: mut ChannelInner<T>*;
 
-    /// Enqueue `value`. Returns `Err(SendError{value})` if the receiver
-    /// has already been dropped (the value is handed back unconsumed).
+    /// Enqueue `value`, first waiting for room when a bounded channel is
+    /// full. Returns `Err(SendError{value})` if the receiver has been
+    /// dropped (the value is handed back unconsumed).
     public send(&this, value: T) -> Result<(), SendError<T>> {
         const inner: ChannelInner<T>* = this.inner;
         mut held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
         const state: mut ChannelState<T>* = held.as_mutable_ptr();
+        while (state.rx_open && state.length >= state.capacity) {
+            inner.room.wait(&inner.state, &held);
+        }
         if (!state.rx_open) {
             return Result::Err(SendError::<T> { value: value });
         }
@@ -169,6 +190,7 @@ public type struct Sender<T> {
             (*state.tail).next = node;
             state.tail = node;
         }
+        state.length = state.length + 1;
         // Wake one blocked receiver (there is at most one).
         inner.ready.notify_one();
         mem::drop(held);
@@ -220,25 +242,9 @@ implement<T> trait Drop for struct Sender<T> {
 }
 
 
-/// The receiving half of a channel, and the channel's owner. Not
-/// cloneable (single consumer); mint producers with `sender()`.
+/// The receiving half of a channel. Not cloneable (single consumer).
 public type struct Receiver<T> {
     private inner: mut ChannelInner<T>*;
-
-    /// Create a new `Sender<T>` feeding this channel. Call once per
-    /// producer (each returned sender is independently owned and may be
-    /// moved into its own thread); clone an existing sender as an
-    /// alternative. The channel stays open for `recv` as long as any
-    /// sender is alive.
-    public sender(&this) -> Sender<T> {
-        const inner: mut ChannelInner<T>* = this.inner;
-        mut held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
-        const state: mut ChannelState<T>* = held.as_mutable_ptr();
-        state.senders = state.senders + 1;
-        state.refs    = state.refs + 1;
-        mem::drop(held);
-        return Sender::<T> { inner: inner };
-    }
 
     /// Block until a value is available and return it, or return
     /// `Err(Disconnected)` once every sender has dropped and the queue is
@@ -251,6 +257,8 @@ public type struct Receiver<T> {
             inner.ready.wait(&inner.state, &held);
         }
         const node: mut ChanNode<T>* = state.pop();
+        // A value taken is room made: wake a sender waiting on a full queue.
+        if (node != null) { inner.room.notify_one(); }
         mem::drop(held);
         if (node == null) {
             // No value and no senders left.
@@ -282,6 +290,7 @@ public type struct Receiver<T> {
             inner.ready.wait_timeout(&inner.state, &held, remaining);
         }
         const node: mut ChanNode<T>* = state.pop();
+        if (node != null) { inner.room.notify_one(); }
         mem::drop(held);
         if (node == null) {
             return Result::Err(ReceiveTimeoutError::Disconnected);
@@ -307,6 +316,7 @@ public type struct Receiver<T> {
             if (state.senders == 0) { return Result::Err(TryRecvError::Disconnected); }
             return Result::Err(TryRecvError::Empty);
         }
+        inner.room.notify_one();
         mem::drop(held);
         // Same balance as `recv`: the node is released without running the
         // slot's destructor, so the value is owned exactly once.
@@ -336,6 +346,9 @@ implement<T> trait Drop for struct Receiver<T> {
             a.deallocate(NonNull::new(node as mut u8*), Layout::of::<ChanNode<T>>());
             node = state.pop();
         }
+        // A sender waiting for room would wait for ever: wake every one, to
+        // find the receiver gone.
+        inner.room.notify_all();
         state.refs = state.refs - 1;
         const last: boolean = state.refs == 0;
         mem::drop(held);
@@ -345,22 +358,37 @@ implement<T> trait Drop for struct Receiver<T> {
 }
 
 
-/// Create an unbounded channel and return its `Receiver<T>` - the
-/// channel's owning end. Mint one or more producers with `rx.sender()`
-/// (each is independently owned and movable into its own thread):
+/// Opens channels. A channel's two ends come out together, its `Sender<T>`
+/// first; more senders are clones of that one:
 ///
 ///   ```cryo
-///   mut rx: mpsc::Receiver<i32> = mpsc::channel<i32>();
-///   const tx: mpsc::Sender<i32> = rx.sender();
+///   const { first: tx, second: rx }: Pair<mpsc::Sender<i32>, mpsc::Receiver<i32>> =
+///       mpsc::Channel::unbounded::<i32>();
 ///   thread::spawn(move () -> i32 { tx.send(1); return 0; });
 ///   match (rx.recv()) { Result::Ok(v) => {} Result::Err(_) => {} }
 ///   ```
 ///
-/// Returning a single owned value (rather than a sender/receiver pair)
-/// sidesteps the current restriction on moving owning fields out of an
-/// aggregate (E0453); it also makes the receiver the unambiguous owner of
-/// the channel's lifetime. Panics only on allocation / pthread-init
-/// failure.
-public function channel<T>() -> Receiver<T> {
-    return Receiver::<T> { inner: new_inner::<T>() };
+/// Panics only on allocation / lock-initialization failure.
+public type struct Channel {
+    /// A channel that queues every value sent.
+    public static unbounded<T>() -> Pair<Sender<T>, Receiver<T>> {
+        return Channel::open::<T>(i64::MAX);
+    }
+
+    /// A channel holding at most `capacity` values: `send` on a full one
+    /// waits for the receiver to take a value. Panics when `capacity` is
+    /// less than 1.
+    public static bounded<T>(capacity: i64) -> Pair<Sender<T>, Receiver<T>> {
+        if (capacity < 1) {
+            core::panic("mpsc::Channel::bounded: the capacity must be at least 1", intrinsics::location());
+        }
+        return Channel::open::<T>(capacity);
+    }
+
+    private static open<T>(capacity: i64) -> Pair<Sender<T>, Receiver<T>> {
+        const inner: mut ChannelInner<T>* = new_inner::<T>(capacity);
+        return Pair::<Sender<T>, Receiver<T>> {
+            first: Sender::<T> { inner: inner }, second: Receiver::<T> { inner: inner }
+        };
+    }
 }
