@@ -2472,37 +2472,6 @@ type struct SemaVisitor {
         return true;
     }
 
-    /// Warn when two DIFFERENT concrete numeric types meet in one operation.
-    ///
-    /// Only the widening direction can occur here - the common-type rule picks
-    /// the wider operand, so the narrower one converts up to it - and narrowing
-    /// is already rejected where it can appear, at the assignment and argument
-    /// boundaries.  Widening is accepted for now, so this is a warning and not
-    /// an error, but the language reference states that every conversion is
-    /// written with `as`, so the message says the acceptance is temporary
-    /// rather than letting the code quietly contradict the reference.
-    ///
-    /// Suppressible by code through `DiagConfig` like any other warning, which
-    /// matters while the tree still carries mixed-width integer arithmetic.
-    warn_implicit_numeric_conversion(mut &this, e: ExpressionNode*,
-                                     lhs: TypeRef, rhs: TypeRef) -> void {
-        if (!lhs.is_valid() || !rhs.is_valid()) { return; }
-        if (lhs.equals(rhs)) { return; }
-        const lt: Type* = this.arena.lookup(lhs);
-        const rt2: Type* = this.arena.lookup(rhs);
-        if (lt == null || rt2 == null) { return; }
-        const l_num: boolean = lt.kind == TypeKind::Int || lt.kind == TypeKind::Float;
-        const r_num: boolean = rt2.kind == TypeKind::Int || rt2.kind == TypeKind::Float;
-        if (!l_num || !r_num) { return; }
-        mut diag: Diagnostic = Diagnostic::warning(
-            ErrorCode::W0005_IMPLICIT_CONVERSION,
-            fmt::format("implicit conversion between `%s` and `%s`; the narrower operand widens to the wider one. Write it with `as` - this is accepted for now and will become an error before v1.0.0",
-                this.types.type_display_name(lhs),
-                this.types.type_display_name(rhs)));
-        diag = diag.at(e.span);
-        this.ctx.emit_diagnostic(diag);
-    }
-
     resolve_binary(mut &this, e: ExpressionNode*, bin: mut BinaryExpr*) -> TypeRef {
         // Idempotent: if a previous resolution already rewrote this operator
         // into a trait-method call, return its type without re-running
@@ -2584,6 +2553,15 @@ type struct SemaVisitor {
                 // into `a` (codegen). Phase 2 bounded params overload on the
                 // success path; concrete user types on the failure path.
                 const map: OperatorTraitMap = OperatorTraitMap::for_binary(base_op);
+                if (cres.success && !this.checker.can_assign(cres.result_type, lhs)) {
+                    // `a += b` stores `a + b` back into `a`, so the sum's
+                    // type, widened from `b`'s, must fit `a`.
+                    this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH,
+                        fmt::format("`%s` computes `%s`, which the `%s` it is stored into cannot hold for every value; convert the right side with `as`",
+                            bin.op.kind.to_string(), this.types.type_display_name(cres.result_type),
+                            this.types.type_display_name(lhs)).into_raw(), e.span);
+                    return lhs;
+                }
                 if (cres.success) {
                     if (map.valid && bin.desugared_call == null) {
                         const de: mut ExpressionNode* = this.operator_overload_expr(
@@ -2730,14 +2708,7 @@ type struct SemaVisitor {
             }
             const result: TypeCheckResult = this.checker.check_binary_op(bin.op.kind, lhs, rhs);
             const map: OperatorTraitMap = OperatorTraitMap::for_binary(bin.op.kind);
-            // A shift's amount widening to the shifted value's type changes no
-            // value - its type never reaches the result - so only the shifted
-            // value widening, to a wider amount, is a conversion to report.
-            const amount_widens_only: boolean =
-                (bin.op.kind == TokenType::LessLess || bin.op.kind == TokenType::GreaterGreater)
-                && result.result_type.equals(lhs);
             if (result.success) {
-                if (!amount_widens_only) { this.warn_implicit_numeric_conversion(e, lhs, rhs); }
                 // Phase 2: a bounded-param operand (`T: Add`) still overloads,
                 // even though `check_binary_op` passed the generic param through.
                 // Concrete primitives fall straight through (no user impl).
@@ -2779,6 +2750,9 @@ type struct SemaVisitor {
                 }
             }
             this.ctx.emit_error_at(ErrorCode::E0229_INVALID_BINARY_OP, result.error_message, e.span);
+            // A refused operation computes no value, so what holds it
+            // reports nothing more; a comparison is still a `boolean`.
+            if (!bin.op.kind.yields_boolean()) { return TypeRef::invalid(); }
         }
         // A refused comparison, or one over an operand already reported, is
         // still a `boolean`, so the condition holding it reports nothing more.

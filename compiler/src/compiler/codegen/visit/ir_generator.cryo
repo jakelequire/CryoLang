@@ -1177,12 +1177,14 @@ type struct IRGeneratorVisitor {
             return out;
         }
         mut init_val: LValue = LValue::null();
+        mut init_type: TypeRef = TypeRef::invalid();
         const has_init: boolean = node.initializer != null;
         if (has_init) {
             init_val = this.dispatch.codegen_rvalue(this,node.initializer);
+            init_type = node.initializer.resolved_type;
         }
         this.cg.expr_ops.codegen_local_var(node.name, node.sym_id, node.resolved_type,
-                          init_val, has_init, decl.span, node.is_drop_flag);
+                          init_val, init_type, has_init, decl.span, node.is_drop_flag);
         return out;
     }
 
@@ -1248,7 +1250,7 @@ type struct IRGeneratorVisitor {
             }
 
             this.cg.expr_ops.codegen_local_var(b.local_name, b.sym_id, b.resolved_type,
-                              field_val, true, b.span, false);
+                              field_val, b.resolved_type, true, b.span, false);
         }
         return out;
     }
@@ -1296,7 +1298,12 @@ type struct IRGeneratorVisitor {
                 if (sint.is_unsigned()) { sign_extend = false; }
                 if (sint.bit_width() == 128) { is_128 = true; }
             }
-            if (is_128) {
+            if (sty != null && sty.kind == TypeKind::Float) {
+                // An integer literal sema typed as the float holding it exactly.
+                const whole: u128 = Lexer::integer_literal_value(node.value, node.suffix)
+                    .expect("an integer literal past u128::MAX reached codegen; sema refuses it");
+                out.value = LType::const_real(ty, whole as f64);
+            } else if (is_128) {
                 // A 128-bit literal can hold more than 64 bits, so the u64
                 // `const_int` path would truncate. Build the constant from the
                 // literal's decimal digits instead.
@@ -1392,7 +1399,7 @@ type struct IRGeneratorVisitor {
     /// Materialize a struct literal `{ field: value, ... }` into a stack alloca
     /// and store each field.  Gives the alloca's address as a place; rvalue
     /// users load through it.
-    codegen_struct_literal(mut &this, struct_type: TypeRef, field_names: [SymbolStr], field_pins: [MemberPin], field_values: [LValue], site_span: SourceSpan) -> Emitted {
+    codegen_struct_literal(mut &this, struct_type: TypeRef, field_names: [SymbolStr], field_pins: [MemberPin], field_values: [LValue], value_types: [TypeRef], site_span: SourceSpan) -> Emitted {
         mut out: Emitted = Emitted::none();
         const ty: LType = this.cg.type_mapper.map_type(struct_type);
         if (!ty.is_valid()) {
@@ -1487,48 +1494,11 @@ type struct IRGeneratorVisitor {
             const gep: LValue = this.cg.builder.build_struct_gep(ty, alloca, slot, "field");
             mut val: LValue = field_values[i];
             if (val.is_valid()) {
-                // Widen/narrow integer literals to the field's declared
-                // width before storing.  `HashMap { len: 0, cap: 0, ... }`
-                // arrives with each `0` as `i32 0` (codegen_literal defaults
-                // integer literals to i32 when sema doesn't propagate the
-                // expected type) but `len`/`cap`/`deleted` are u64 fields
-                // a direct `store i32` writes only the low 4 bytes,
-                // leaving the high 4 uninitialised.  Mirrors the same fix
-                // in stmt_codegen.cryo:codegen_local_var so subsequent
-                // i64 reads through the field don't see stack garbage in
-                // the upper bits.  LLVMIntegerTypeKind = 8.
+                // The value at the field's type: a narrower number widens
+                // to it, or a full slot would hold stale upper bytes.
                 const field_llvm_ty: mut void* = llvm::LLVMStructGetTypeAtIndex(ty.raw, slot);
-                const val_ty_raw: mut void* = llvm::LLVMTypeOf(val.raw);
-                if (field_llvm_ty != null && val_ty_raw != null
-                        && LType::kind_of(field_llvm_ty) == LTypeKind::Integer
-                        && LType::kind_of(val_ty_raw) == LTypeKind::Integer) {
-                    const want_bits: u32 = llvm::LLVMGetIntTypeWidth(field_llvm_ty);
-                    const got_bits:  u32 = llvm::LLVMGetIntTypeWidth(val_ty_raw);
-                    const field_lty: LType = LType { raw: field_llvm_ty };
-                    if (want_bits > got_bits) {
-                        // Widen with the field's signedness; using zext
-                        // for a signed i64 field stored a negative i32
-                        // literal (`-1`) as `0x00000000FFFFFFFF`, which
-                        // is `4294967295` not `-1`.  This is what made
-                        // `new ArrayAnnotation { size: -1, ... }` lose
-                        // its sign and turn dynamic arrays into giant
-                        // fixed ones (the size sentinel was treated as
-                        // a positive i64).  Mirrors the local-var fix.
-                        mut signed_target: boolean = false;
-                        const field_t: Type* = this.cg.arena_type(
-                            pin_field.field_type);
-                        if (field_t != null && field_t.kind == TypeKind::Int) {
-                            const ft_int: IntegerKind = field_t.int_kind();
-                            signed_target = ft_int.is_signed();
-                        }
-                        if (signed_target) {
-                            val = this.cg.builder.build_sext(val, field_lty, "field.widen");
-                        } else {
-                            val = this.cg.builder.build_zext(val, field_lty, "field.widen");
-                        }
-                    } else if (want_bits < got_bits) {
-                        val = this.cg.builder.build_trunc(val, field_lty, "field.trunc");
-                    }
+                if (field_llvm_ty != null) {
+                    val = this.cg.expr_ops.convert_number(val, value_types[i], LType { raw: field_llvm_ty });
                 }
             }
             this.cg.builder.build_store(val, gep);
@@ -1776,13 +1746,15 @@ type struct IRGeneratorVisitor {
         mut field_names: [SymbolStr] = [];
         mut field_pins: [MemberPin] = [];
         mut field_values: [LValue] = [];
+        mut value_types: [TypeRef] = [];
         for (mut i: i64 = 0; i < node.field_inits.length(); i++) {
             const init: FieldInit = node.field_inits[i];
             field_names.push(init.field_name);
             field_pins.push(init.pin);
             field_values.push(this.dispatch.codegen_rvalue(this,init.value));
+            value_types.push(init.value.resolved_type);
         }
-        return this.codegen_struct_literal(type_ref, field_names, field_pins, field_values, e.span);
+        return this.codegen_struct_literal(type_ref, field_names, field_pins, field_values, value_types, e.span);
     }
 
     /// Array literal: delegate to ArrayLitEmitter, which handles all three
@@ -2102,7 +2074,7 @@ type struct IRGeneratorVisitor {
         const then_live: boolean = then_end.is_valid() && !then_end.has_terminator();
         if (then_live && then_val.is_valid()) {
             then_val = IRGeneratorVisitor::coerce_to_phi_type(
-                this.cg, then_val, ty, node.resolved_type);
+                this.cg, then_val, ty, then_expr.resolved_type);
         }
         if (then_live) {
             for (mut i: i64 = 0; i < then_writes.length(); i++) {
@@ -2123,7 +2095,7 @@ type struct IRGeneratorVisitor {
         const else_live: boolean = else_end.is_valid() && !else_end.has_terminator();
         if (else_live && else_val.is_valid()) {
             else_val = IRGeneratorVisitor::coerce_to_phi_type(
-                this.cg, else_val, ty, node.resolved_type);
+                this.cg, else_val, ty, else_expr.resolved_type);
         }
         if (else_live) {
             for (mut i: i64 = 0; i < else_writes.length(); i++) {
@@ -2244,37 +2216,16 @@ type struct IRGeneratorVisitor {
     /// value when no cheap conversion applies.  LLVM kind codes: 0=void, 8=int,
     /// 10=struct, 12=pointer.
     ///
-    /// `result_ty` is the Cryo type of the whole match/if expression - every
-    /// arm must produce a value compatible with it, so its signedness drives
-    /// the sext-vs-zext choice when an arm value is narrower than the phi type.
-    static coerce_to_phi_type(cg: CodegenContext*, val: LValue,
-                                 expected: LType, result_ty: TypeRef) -> LValue {
+    /// `value_ty` is the Cryo type of the value the arm produced, whose own
+    /// signedness decides a widening (`ExprOps::convert_number`).
+    static coerce_to_phi_type(cg: mut CodegenContext*, val: LValue,
+                                 expected: LType, value_ty: TypeRef) -> LValue {
         if (!val.is_valid() || !expected.is_valid()) { return val; }
 
-        // Dispatch on kind + width rather than on type identity: a narrower
-        // arm value needs a real sext/zext/trunc, and identity only tells us
-        // the pair differs, not which direction to convert.
         const got_ty: mut void* = llvm::LLVMTypeOf(val.raw);
         const want_ty: mut void* = expected.raw;
         const gk: LTypeKind = LType::kind_of(got_ty);
         const wk: LTypeKind = LType::kind_of(want_ty);
-
-        // int <-> int: widen or narrow.
-        if (gk == LTypeKind::Integer && wk == LTypeKind::Integer) {
-            const gw: u32 = llvm::LLVMGetIntTypeWidth(got_ty);
-            const ww: u32 = llvm::LLVMGetIntTypeWidth(want_ty);
-            if (gw == ww) { return val; }
-            if (gw < ww) {
-                // Widen with the result type's signedness: a signed match arm
-                // feeding a wider signed phi must sext, or `-1` becomes a huge
-                // positive value.
-                if (cg.int_type_is_signed(result_ty)) {
-                    return cg.builder.build_sext(val, expected, "mexpr.widen");
-                }
-                return cg.builder.build_zext(val, expected, "mexpr.widen");
-            }
-            return cg.builder.build_trunc(val, expected, "mexpr.trunc");
-        }
 
         // int -> ptr / ptr -> int: match the `coerce_return_value` conventions.
         if (gk == LTypeKind::Integer && wk == LTypeKind::Pointer) {
@@ -2284,10 +2235,10 @@ type struct IRGeneratorVisitor {
             return LValue { raw: llvm::LLVMBuildPtrToInt(cg.builder.raw, val.raw, want_ty, "mexpr.p2i") };
         }
 
-        // Same-kind struct/ptr/etc with different SHAPE is not safely
-        // convertible at this level; return as-is and let LLVM verification
-        // surface the mismatch.
-        return val;
+        // A number to the phi's number type; any other pair of the same kind
+        // with a different SHAPE is not convertible at this level and is
+        // returned as it is, for LLVM verification to surface.
+        return cg.expr_ops.convert_number(val, value_ty, expected);
     }
 }
 

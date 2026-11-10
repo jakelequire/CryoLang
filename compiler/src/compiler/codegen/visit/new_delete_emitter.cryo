@@ -238,37 +238,11 @@ type struct NewDeleteEmitter {
                     const gep: LValue = this.cg.field_gep(t, mapped, obj_ptr, sf_fidx, "field");
                     mut val: LValue = this.dispatch.codegen_rvalue(visitor,finit.value);
                     if (val.is_valid() && gep.is_valid()) {
-                        // Widen/narrow integer literal to field's declared
-                        // width before storing.  `new ArrayAnnotation { size: -1, ... }`
-                        // arrives with `-1` as `i32 -1` but `size` is `i64`
-                        // a direct `store i32` writes 4 bytes leaving the
-                        // upper 4 bytes of the i64 slot uninitialised, and a
-                        // `size < 0` check then sees a huge positive number.
-                        // Mirrors codegen_struct_literal and codegen_local_var.
+                        // The value at the field's type, as a struct
+                        // literal's field takes it.
                         const field_llvm_ty: mut void* = llvm::LLVMStructGetTypeAtIndex(mapped.raw, sf_fidx as u32);
-                        const val_ty_raw: mut void* = llvm::LLVMTypeOf(val.raw);
-                        if (field_llvm_ty != null && val_ty_raw != null
-                                && LType::kind_of(field_llvm_ty) == LTypeKind::Integer
-                                && LType::kind_of(val_ty_raw) == LTypeKind::Integer) {
-                            const want_bits: u32 = llvm::LLVMGetIntTypeWidth(field_llvm_ty);
-                            const got_bits:  u32 = llvm::LLVMGetIntTypeWidth(val_ty_raw);
-                            const field_lty: LType = LType { raw: field_llvm_ty };
-                            if (want_bits > got_bits) {
-                                mut signed_target: boolean = false;
-                                const field_t: Type* = this.cg.arena_type(
-                                    st.fields[sf_fidx].field_type);
-                                if (field_t != null && field_t.kind == TypeKind::Int) {
-                                    const ft_int: IntegerKind = field_t.int_kind();
-                                    signed_target = ft_int.is_signed();
-                                }
-                                if (signed_target) {
-                                    val = this.cg.builder.build_sext(val, field_lty, "field.widen");
-                                } else {
-                                    val = this.cg.builder.build_zext(val, field_lty, "field.widen");
-                                }
-                            } else if (want_bits < got_bits) {
-                                val = this.cg.builder.build_trunc(val, field_lty, "field.trunc");
-                            }
+                        if (field_llvm_ty != null) {
+                            val = this.cg.expr_ops.convert_number(val, finit.value.resolved_type, LType { raw: field_llvm_ty });
                         }
                         this.cg.builder.build_store(val, gep);
                     }

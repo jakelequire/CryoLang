@@ -1209,6 +1209,14 @@ type struct CallResolver {
                     // type kind, so the argument's own type still selects the
                     // specialization.
                     push_expected = true;
+                } else if ((ExpressionNode::if_of(arg_node) != null
+                            || ExpressionNode::ternary_of(arg_node) != null)
+                        && is_adoptable_numeric_type(this.arena, slot)) {
+                    // A two-branch expression's value is one of its arms', so
+                    // the parameter's type reaches each arm as it reaches a
+                    // literal argument: `take_u64(if (c) { 1 } else { 0 })`
+                    // computes a `u64`.
+                    push_expected = true;
                 } else if (this.sema_arg_is_null_literal(arg)
                         && this.types.is_function_type(slot)) {
                     // `null` is typed `void*` and reaches a data-pointer slot
@@ -3085,22 +3093,16 @@ type struct CallResolver {
                     ErrorCode::E0214_ARGUMENT_MISMATCH, arg.span, param_ty, arg_ty,
                     fmt::format("argument %lld doesn't match the parameter's declared type", i + 1).into_raw(),
                     SourceSpan::none(), arg);
-            } else if (this.checker.is_lossy_numeric_narrowing(arg_ty, param_ty)
+            } else if (compat == TypeCompatibility::ExplicitCast
+                       && this.checker.is_numeric_pair(arg_ty, param_ty)
                        && !this.literals.int_literal_fits_target(arg, param_ty)) {
+                // A numeric argument converts implicitly only where the
+                // parameter's type holds every value of the argument's; a
+                // literal that fits takes the parameter's type instead.
                 this.diag.emit_type_mismatch_with_value(
                     ErrorCode::E0214_ARGUMENT_MISMATCH, arg.span, param_ty, arg_ty,
-                    fmt::format("argument %lld narrows the value and would silently truncate; add an explicit `as` cast", i + 1).into_raw(),
-                    SourceSpan::none(), arg);
-            } else if (this.checker.is_same_width_sign_reinterpret(arg_ty, param_ty)
-                       && (
-                           ((is_numeric_literal_expr(arg) || is_negative_numeric_literal_expr(arg))
-                            && !this.literals.int_literal_fits_target(arg, param_ty))
-                           || (!is_numeric_literal_expr(arg) && !is_negative_numeric_literal_expr(arg)
-                               && this.checker.is_subword_sign_reinterpret(arg_ty, param_ty))
-                       )) {
-                this.diag.emit_type_mismatch_with_value(
-                    ErrorCode::E0214_ARGUMENT_MISMATCH, arg.span, param_ty, arg_ty,
-                    fmt::format("argument %lld reinterprets the sign of a same-width integer and would silently change its value; add an explicit `as` cast", i + 1).into_raw(),
+                    fmt::format("argument %lld would change value for some `%s`, which `%s` cannot hold", i + 1,
+                        this.types.type_display_name(arg_ty), this.types.type_display_name(param_ty)).into_raw(),
                     SourceSpan::none(), arg);
             }
         }

@@ -5,7 +5,7 @@
 
 Cryo is a statically-typed, compiled systems language. It targets native machine code through LLVM 20, has a self-hosted compiler, and ships a standard library written entirely in itself. Three principles shape the language:
 
-1. **Explicitness.** Cryo has no implicit conversions and no hidden control flow. The programmer writes out every cast and every loop condition. Type inference is deliberately local - a binding may adopt its initialiser's type, but there is no flow- or program-level inference - so the cost of every operation stays visible in the source and the code is easy to reason about.
+1. **Explicitness.** Cryo converts a value implicitly only where no value can change - a number widening to a type that holds every value of its own - and has no hidden control flow. The programmer writes out every other cast and every loop condition. Type inference is deliberately local - a binding may adopt its initialiser's type, but there is no flow- or program-level inference - so the cost of every operation stays visible in the source and the code is easy to reason about.
 
 2. **One toolchain.** Build, run, test, fetch, init, and check are subcommands of a single `cryo` binary. The package manager, the test runner, and the dependency resolver ship with the compiler.
 
@@ -169,7 +169,7 @@ const c: i8 = 0 - 128;     // -128: held
 
 A literal an integer is compared with, or combined with by an operator, takes the integer's type the same way, so `x != 127` and `x != -128` with `x: i8` are both comparisons of two `i8`s. A negated literal takes the type of a signed operand only: beside an unsigned one, `-1` keeps its default type rather than becoming a huge unsigned value.
 
-A shift's amount does not type the value shifted: a literal shifted by an amount not made only of literals takes the integer type expected of the result, where one is - an initializer's, an assignment's, an argument's or a return's - so `const p: u64 = 1 << (u64::BITS - 1);` shifts at 64 bits, not at the `u32` amount's 32.  An amount narrower than the shifted value widens to its type silently: the amount's type never changes the result, so it draws no `W0005`. A shifted value narrower than its amount still widens with `W0005`, since that conversion does change the result's type.  Where no integer type is expected, the literal takes the amount's type.
+A shift's amount does not type the value shifted: a literal shifted by an amount not made only of literals takes the integer type expected of the result, where one is - an initializer's, an assignment's, an argument's or a return's - so `const p: u64 = 1 << (u64::BITS - 1);` shifts at 64 bits, not at the `u32` amount's 32.  A shift's result is always the shifted value's type, and the amount's type never changes it: `b << n` with `b: u8` and `n: u64` is a `u8`.  Where no integer type is expected, a shifted literal takes the amount's type.
 
 An integer literal stored where a `char` is takes `char`, and must be at most `0x10FFFF`, the largest Unicode scalar value: `const c: char = 0x110000;` is refused (`E0010`).
 
@@ -330,7 +330,7 @@ The other direction stays: `boolean as` an integer type is `1` for `true` and `0
 
 ## 2. Type System
 
-Every value in Cryo has a known type at compile time. A binding's type is either written explicitly or inferred from its initialiser (local inference only - see [section 3](#3-variables-and-constants)). There are no implicit conversions between numeric types; when you need a conversion, you write it with `as`.
+Every value in Cryo has a known type at compile time. A binding's type is either written explicitly or inferred from its initialiser (local inference only - see [section 3](#3-variables-and-constants)). A number converts implicitly only to a type that holds every value of its own ([section 2.9](#29-casting-with-as)); any other conversion is written with `as`.
 
 ### 2.1 Primitive Types
 
@@ -825,7 +825,18 @@ A path through an alias names what the same path through its target names, type 
 
 ### 2.9 Casting with `as`
 
-Cryo never inserts an implicit numeric or pointer conversion. To convert between types, use the `as` keyword. The compiler does not insert range checks for narrowing casts; this is a deliberate choice that keeps the conversion's cost visible.
+Cryo never inserts a conversion that can change a value, and never an implicit pointer conversion. A number converts implicitly - at an initializer, an assignment, a compound assignment, an argument, a return, a struct literal's field and a two-branch expression's arm - only to a type that holds every value of its own:
+
+- an integer to a wider integer of the same signedness, or an unsigned integer to a wider signed one (`u32` to `i64`);
+- `usize` and `isize`, which are as wide as a pointer - 32 or 64 bits by target - only where the conversion keeps every value on every target: into `usize` from an unsigned type of at most 32 bits, into `isize` from a signed type of at most 32 bits or an unsigned one of at most 16; out of `usize` into an unsigned type of at least 64 bits or a signed one wider than 64, out of `isize` into a signed type of at least 64. A `u64` is not a `usize`, nor an `isize` an `i64`;
+- an integer to a float that holds it exactly: an integer of at most 16 bits to `f32`, of at most 32 bits to `f64`;
+- `f32` to `f64`.
+
+The conversion keeps the value: an unsigned integer widens as unsigned and a signed one as signed, whatever the target's sign, so a `u32` holding 4294967295 is 4294967295 in an `i64`. Any other conversion - a narrowing, a change of sign at one width, an integer a float would round - is refused: `E0214` at an argument, `E0200` at an initializer, an assignment, a compound assignment and every other typed place. The diagnostic says to convert with `as` as help, and never writes the `as` in: whether a value that may change is what is meant is the writer's decision. An integer literal, or an expression made only of literals, is not converted but typed: it takes the type wanted where it stands when that type holds its value - a float when the float holds it exactly, so `x + 2` with `x: f32` adds the `f32` 2.0.
+
+Two numeric operands of different types compute in the one that holds every value of the other, by the same rule: `a + b` with `a: i32` and `b: i8` is an `i32`. Where neither does - `i32` and `u32`, `i64` and `f64` - the operation is refused (`E0229`) and one side is converted with `as`. Two integers compare by their true values whatever their types, so any pair of integers compares: `-1 < n` holds for every unsigned `n`. `a += b` stores `a + b` back into `a`, so it is refused where that sum's type is not one `a` holds (`E0200`). Type-argument inference never widens: a type parameter is bound to the argument's own type. A shift's result is the shifted value's type ([section 1.4](#14-literals)).
+
+To convert in any other way, use the `as` keyword. The compiler does not insert range checks for narrowing casts; this is a deliberate choice that keeps the conversion's cost visible.
 
 ```cryo
 const a: i64 = 42;

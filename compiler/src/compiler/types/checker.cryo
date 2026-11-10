@@ -170,8 +170,18 @@ type struct TypeChecker {
             return this.check_float_compatibility(from_type, to_type);
         }
 
+        // An integer converts implicitly only to a float whose significand
+        // holds every value of it exactly: 16 bits into `f32`'s 24, 32 bits
+        // into `f64`'s 53.  A wider one would round, so it needs `as`.
         if (from_type.kind == TypeKind::Int && to_type.kind == TypeKind::Float) {
-            return TypeCompatibility::ImplicitConvert;
+            const exact_bits: u64 = match (to_type.float_kind()) {
+                FloatKind::F32 => { 16 }
+                FloatKind::F64 => { 32 }
+            };
+            if (from_type.int_kind().widest_bit_width() <= exact_bits) {
+                return TypeCompatibility::ImplicitConvert;
+            }
+            return TypeCompatibility::ExplicitCast;
         }
 
         if (from_type.kind == TypeKind::Float && to_type.kind == TypeKind::Int) {
@@ -508,12 +518,19 @@ type struct TypeChecker {
     // Numeric compatibility helpers
 
     check_int_compatibility(&this, _from: Type*, to: Type*) -> TypeCompatibility {
-        mut from_int: IntegerKind = _from.int_kind();
-        mut to_int: IntegerKind   = to.int_kind();
-
-        return TypeChecker::width_lattice(
-            from_int.bit_width(), from_int.is_signed(),
-            to_int.bit_width(),   to_int.is_signed());
+        const from_int: IntegerKind = _from.int_kind();
+        const to_int: IntegerKind   = to.int_kind();
+        if (from_int == to_int) { return TypeCompatibility::Identical; }
+        // Judged at the widest the source can be and the narrowest the
+        // target can be, so a conversion implicit here loses nothing on any
+        // target: `u32` into `usize` widens, `u64` into `usize` does not.
+        // Two distinct types of one width on this target are still a
+        // conversion, never one type.
+        const compat: TypeCompatibility = TypeChecker::width_lattice(
+            from_int.widest_bit_width(), from_int.is_signed(),
+            to_int.narrowest_bit_width(), to_int.is_signed());
+        if (compat == TypeCompatibility::Identical) { return TypeCompatibility::ImplicitConvert; }
+        return compat;
     }
 
     /// The integral conversion lattice, in terms of width and signedness
@@ -564,21 +581,21 @@ type struct TypeChecker {
         return TypeCompatibility::Identical;
     }
 
-    /// True when `from` -> `to` is a *lossy* numeric conversion: integer
-    /// width-narrowing (e.g. i64 -> u8), float narrowing (f64 -> f32), or
-    /// float -> int (drops the fraction and may overflow).  Codegen lowers
-    /// each of these to a silent `trunc` / `fptrunc` / `fptosi`, so an
-    /// implicit one at a call site silently corrupts the value
-    /// (`take_u8(300_i64)` -> 44).  Same-width signedness reinterpretation
-    /// (i32 <-> u32) and any widening preserve the representation and are
-    /// deliberately NOT flagged, so the FFI-heavy `i32` -> `u64` argument
-    /// pattern stays legal.  Char/enum are left to their existing rules.
+    /// True when both types are integers or floats.
+    is_numeric_pair(&this, from: TypeRef, to: TypeRef) -> boolean {
+        const f: Type* = this.arena.lookup(from);
+        const t: Type* = this.arena.lookup(to);
+        if (f == null || t == null) { return false; }
+        return (f.kind == TypeKind::Int || f.kind == TypeKind::Float)
+            && (t.kind == TypeKind::Int || t.kind == TypeKind::Float);
+    }
+
     /// True when `from` is `const T*` and `to` is a non-const pointer with the
     /// same pointee: passing/assigning would silently drop const. `check_compat`
     /// already returns `ExplicitCast` for this (so assignment and return are
     /// rejected and an explicit `as` cast is still allowed), but call arguments
     /// only reject `Incompatible`, so the call resolver consults this predicate
-    /// directly - mirroring `is_lossy_numeric_narrowing`.
+    /// directly.
     is_const_drop(&this, from: TypeRef, to: TypeRef) -> boolean {
         const f: Type* = this.arena.lookup(from);
         const t: Type* = this.arena.lookup(to);
@@ -631,61 +648,6 @@ type struct TypeChecker {
             || t.kind == TypeKind::String
             || t.kind == TypeKind::VaList;
     }
-
-    is_lossy_numeric_narrowing(&this, from: TypeRef, to: TypeRef) -> boolean {
-        const f: Type* = this.arena.lookup(from);
-        const t: Type* = this.arena.lookup(to);
-        if (f == null || t == null) { return false; }
-        if (f.kind == TypeKind::Int && t.kind == TypeKind::Int) {
-            const fi: IntegerKind = f.int_kind();
-            const ti: IntegerKind = t.int_kind();
-            return fi.bit_width() > ti.bit_width();
-        }
-        if (f.kind == TypeKind::Float && t.kind == TypeKind::Float) {
-            const ff: FloatKind = f.float_kind();
-            const tf: FloatKind = t.float_kind();
-            return ff.bit_width() > tf.bit_width();
-        }
-        if (f.kind == TypeKind::Float && t.kind == TypeKind::Int) {
-            return true;
-        }
-        return false;
-    }
-
-    /// True when `from` -> `to` is a same-width integer signedness
-    /// reinterpretation (i32 <-> u32, i64 <-> u64, ...).  The bits are
-    /// preserved but the VALUE flips for any input with the top bit set
-    /// (`take_u32(-1_i32)` arrives as 4294967295), so an implicit one at a
-    /// call site is a silent footgun - assignment already rejects it via
-    /// `can_assign`.  Widening across signedness (i32 -> u64) is deliberately
-    /// NOT flagged here: it preserves small values and is the legal,
-    /// FFI-heavy argument idiom (see `is_lossy_numeric_narrowing`).
-    is_same_width_sign_reinterpret(&this, from: TypeRef, to: TypeRef) -> boolean {
-        const f: Type* = this.arena.lookup(from);
-        const t: Type* = this.arena.lookup(to);
-        if (f == null || t == null) { return false; }
-        if (f.kind != TypeKind::Int || t.kind != TypeKind::Int) { return false; }
-        const fi: IntegerKind = f.int_kind();
-        const ti: IntegerKind = t.int_kind();
-        return fi.bit_width() == ti.bit_width() &&
-               fi.is_signed() != ti.is_signed();
-    }
-
-    /// A same-width signedness reinterpretation narrower than 64 bits
-    /// (`i32`<->`u32`, `i16`<->`u16`, `i8`<->`u8`).  These are the cases
-    /// where flipping the sign of a *runtime* value is a likely accidental
-    /// value change worth flagging.  The 64-bit `i64`<->`u64` case is left
-    /// out deliberately: passing runtime lengths/offsets across that boundary
-    /// is pervasive and benign, so the call-arg gate stays lenient for it
-    /// (literals that don't fit are still caught separately).
-    is_subword_sign_reinterpret(&this, from: TypeRef, to: TypeRef) -> boolean {
-        if (!this.is_same_width_sign_reinterpret(from, to)) { return false; }
-        const f: Type* = this.arena.lookup(from);
-        if (f == null) { return false; }
-        const fi: IntegerKind = f.int_kind();
-        return fi.bit_width() < 64;
-    }
-
 
     // Operation type checking
 
@@ -740,7 +702,7 @@ type struct TypeChecker {
         // Arithmetic: + - * / %
         if (op == TokenType::Plus || op == TokenType::Minus || op == TokenType::Star || op == TokenType::Slash || op == TokenType::Percent) {
             if (lhs_type.is_numeric() && rhs_type.is_numeric()) {
-                return TypeCheckResult::ok(this.get_common_numeric_type(lhs, rhs));
+                return this.numeric_operation(op, lhs, rhs, this.get_common_numeric_type(lhs, rhs));
             }
             // `char` is a 1-byte integer; allow `c - '0'` and friends
             // (digit-parsing code, char arithmetic in lexers).
@@ -795,8 +757,15 @@ type struct TypeChecker {
 
         // Comparison: == != < > <= >=
         if (op == TokenType::EqualEqual || op == TokenType::ExclaimEqual || op == TokenType::LAngle || op == TokenType::RAngle || op == TokenType::LessEqual || op == TokenType::GreaterEqual) {
-            if (lhs_type.is_numeric() && rhs_type.is_numeric()) {
+            // Two integers compare by their true values whatever their
+            // signs - `-1` below every unsigned value - so no value changes
+            // and any pair compares.  An integer and a float compare in a
+            // common type, which must hold both exactly.
+            if (lhs_type.kind == TypeKind::Int && rhs_type.kind == TypeKind::Int) {
                 return TypeCheckResult::ok(this.arena.get_bool());
+            }
+            if (lhs_type.is_numeric() && rhs_type.is_numeric()) {
+                return this.numeric_operation(op, lhs, rhs, this.arena.get_bool());
             }
             if (lhs_type.kind == TypeKind::Bool && rhs_type.kind == TypeKind::Bool) {
                 return TypeCheckResult::ok(this.arena.get_bool());
@@ -886,8 +855,17 @@ type struct TypeChecker {
                                       || lhs_type.kind == TypeKind::Char;
             const rhs_intlike: boolean = rhs_type.kind == TypeKind::Int
                                       || rhs_type.kind == TypeKind::Char;
+            const is_shift: boolean = op == TokenType::LessLess || op == TokenType::GreaterGreater;
+            if (is_shift && lhs_intlike && rhs_intlike) {
+                // A shift's amount is no operand of the value: the result
+                // is always the shifted value's type.
+                return TypeCheckResult::ok(lhs);
+            }
+            if (lhs_type.kind == TypeKind::Int && rhs_type.kind == TypeKind::Int) {
+                return this.numeric_operation(op, lhs, rhs, this.get_common_numeric_type(lhs, rhs));
+            }
             if (lhs_intlike && rhs_intlike) {
-                return TypeCheckResult::ok(this.get_common_numeric_type(lhs, rhs));
+                return TypeCheckResult::ok(lhs);
             }
             return TypeCheckResult::fail(fmt::format("Bitwise `%s` requires integer operands", op.to_string()).into_raw());
         }
@@ -1053,55 +1031,33 @@ type struct TypeChecker {
 
     // Numeric promotion
 
-    /// Get the common type for a numeric binary operation.
-    /// Promotes to the wider/higher-precision type.
+    /// The type a numeric binary operation on `a` and `b` is computed in:
+    /// the one of the two that holds every value of the other, which then
+    /// widens to it.  Invalid when neither does (`i32` and `u32`, `i64` and
+    /// `f64`): any type both converted to would change some value, so the
+    /// operation needs an `as` on one side.
     get_common_numeric_type(&this, a: TypeRef, b: TypeRef) -> TypeRef {
         if (a.equals(b)) {
             return a;
         }
-
-        mut a_type: Type* = this.arena.lookup(a);
-        mut b_type: Type* = this.arena.lookup(b);
-
-        if (a_type == null || b_type == null) {
-            return TypeRef::invalid();
-        }
-
-        // Float beats int
-        if (a_type.kind == TypeKind::Float && b_type.kind == TypeKind::Int) {
+        if (this.check_compatibility(b, a).is_assignable()) {
             return a;
         }
-        if (a_type.kind == TypeKind::Int && b_type.kind == TypeKind::Float) {
+        if (this.check_compatibility(a, b).is_assignable()) {
             return b;
         }
+        return TypeRef::invalid();
+    }
 
-        // Both float -> wider wins
-        if (a_type.kind == TypeKind::Float && b_type.kind == TypeKind::Float) {
-            mut a_float: FloatKind = a_type.float_kind();
-            mut b_float: FloatKind = b_type.float_kind();
-            if (a_float.bit_width() >= b_float.bit_width()) {
-                return a;
-            }
-            return b;
+    /// `check_binary_op`'s answer for numeric operands: the common type, or
+    /// the refusal naming both when they have none.
+    numeric_operation(&this, op: TokenType, lhs: TypeRef, rhs: TypeRef, result: TypeRef) -> TypeCheckResult {
+        if (this.get_common_numeric_type(lhs, rhs).is_valid()) {
+            return TypeCheckResult::ok(result);
         }
-
-        // Both int -> wider wins; same width -> prefer unsigned (as C does)
-        if (a_type.kind == TypeKind::Int && b_type.kind == TypeKind::Int) {
-            mut a_int: IntegerKind = a_type.int_kind();
-            mut b_int: IntegerKind = b_type.int_kind();
-            if (a_int.bit_width() > b_int.bit_width()) {
-                return a;
-            }
-            if (b_int.bit_width() > a_int.bit_width()) {
-                return b;
-            }
-            // Same width: prefer unsigned (u32 op i32 -> u32)
-            if (!a_int.is_signed()) {
-                return a;
-            }
-            return b;
-        }
-
-        return a;  // Fallback
+        return TypeCheckResult::fail(fmt::format(
+            "`%s` on `%s` and `%s`: neither type holds every value of the other, so one side must be converted with `as`",
+            op.to_string(), this.arena.format_display(this.arena.lookup(lhs)),
+            this.arena.format_display(this.arena.lookup(rhs))).into_raw());
     }
 }

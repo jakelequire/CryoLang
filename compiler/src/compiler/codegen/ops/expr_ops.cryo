@@ -507,7 +507,7 @@ type struct ExprOps {
     /// bug, so we point the user at the declaration that tripped the
     /// check).
     codegen_local_var(mut &this, name: SymbolStr, sym: SymbolID,
-                      ty: TypeRef, init_val: LValue,
+                      ty: TypeRef, init_val: LValue, init_type: TypeRef,
                       has_init: boolean,
                       site_span: SourceSpan,
                       persistent_name: boolean) -> void {
@@ -568,7 +568,7 @@ type struct ExprOps {
         }
 
         if (has_init && init_val.is_valid()) {
-            this.builder.build_store(this.init_store_value(init_val, llvm_ty, ty), alloca);
+            this.builder.build_store(this.convert_number(init_val, init_type, llvm_ty), alloca);
         }
 
         // Drop-flag locals register persistently: the conditional drop that
@@ -582,42 +582,43 @@ type struct ExprOps {
     }
 
 
-    /// An initializer's value at the width of the slot it is stored into,
-    /// whose LLVM type is `llvm_ty` and Cryo type `ty`.  `mut i: i64 = 0`
-    /// arrives with the value as `i32 0` (codegen_literal defaults integer
-    /// literals to i32 when sema doesn't propagate the expected type) and
-    /// the slot is 8 bytes; a direct `store i32` writes only the low 4
-    /// bytes, leaving the high 4 uninitialised.  zext/sext to the slot's
-    /// type so the full slot is written; same idea for the trunc direction
-    /// (an i64 expression initialising an i32 slot).
-    init_store_value(mut &this, init_val: LValue, llvm_ty: LType, ty: TypeRef) -> LValue {
-        const init_ty_raw: mut void* = llvm::LLVMTypeOf(init_val.raw);
-        if (init_ty_raw == null
-                || LType::kind_of(init_ty_raw) != LTypeKind::Integer
-                || LType::kind_of(llvm_ty.raw) != LTypeKind::Integer) {
-            return init_val;
-        }
-        const want_bits: u32 = llvm::LLVMGetIntTypeWidth(llvm_ty.raw);
-        const got_bits:  u32 = llvm::LLVMGetIntTypeWidth(init_ty_raw);
-        if (want_bits > got_bits) {
-            // Widen with the slot's signedness; `mut x: i64 = -1` would
-            // otherwise zext the i32 -1 into 0xFFFFFFFF (a huge positive
-            // i64) instead of -1.
-            mut signed_target: boolean = false;
-            const ty_t: Type* = this.arena_type(ty);
-            if (ty_t != null && ty_t.kind == TypeKind::Int) {
-                const ti: IntegerKind = ty_t.int_kind();
-                signed_target = ti.is_signed();
+    /// `val`, a number whose Cryo type is `from`, as the LLVM number type
+    /// `to` of the place it is stored into, passed as or returned as.  Sema
+    /// lets a conversion through implicitly only where it keeps every
+    /// value, so the source's own type decides it: an integer widens by its
+    /// own signedness (a `u32` 0xFFFFFFFF is 4294967295 in an `i64`, a
+    /// `i32` -1 is -1) and becomes a float by it, and a float widens to the
+    /// wider float.  A narrower integer target holds a literal or constant
+    /// sema found to fit, which is truncated.  Anything but a pair of
+    /// numbers is returned as it is.
+    convert_number(mut &this, val: LValue, from: TypeRef, to: LType) -> LValue {
+        if (!val.is_valid() || !to.is_valid()) { return val; }
+        const got: mut void* = llvm::LLVMTypeOf(val.raw);
+        if (got == null) { return val; }
+        const got_kind: LTypeKind = LType::kind_of(got);
+        const want_kind: LTypeKind = LType::kind_of(to.raw);
+        const signed_source: boolean = this.int_type_is_signed(from);
+        if (got_kind == LTypeKind::Integer && want_kind == LTypeKind::Integer) {
+            const got_bits: u32 = llvm::LLVMGetIntTypeWidth(got);
+            const want_bits: u32 = llvm::LLVMGetIntTypeWidth(to.raw);
+            if (got_bits < want_bits) {
+                if (signed_source) { return this.builder.build_sext(val, to, "num.widen"); }
+                return this.builder.build_zext(val, to, "num.widen");
             }
-            if (signed_target) {
-                return this.builder.build_sext(init_val, llvm_ty, "init.widen");
-            }
-            return this.builder.build_zext(init_val, llvm_ty, "init.widen");
+            if (got_bits > want_bits) { return this.builder.build_trunc(val, to, "num.trunc"); }
+            return val;
         }
-        if (want_bits < got_bits) {
-            return this.builder.build_trunc(init_val, llvm_ty, "init.trunc");
+        if (got_kind == LTypeKind::Integer && (want_kind == LTypeKind::Float || want_kind == LTypeKind::Double)) {
+            if (signed_source) { return this.builder.build_si_to_fp(val, to, "num.float"); }
+            return this.builder.build_ui_to_fp(val, to, "num.float");
         }
-        return init_val;
+        if (got_kind == LTypeKind::Float && want_kind == LTypeKind::Double) {
+            return this.builder.build_fp_ext(val, to, "num.widen");
+        }
+        if (got_kind == LTypeKind::Double && want_kind == LTypeKind::Float) {
+            return this.builder.build_fp_trunc(val, to, "num.trunc");
+        }
+        return val;
     }
 
     // Function call (with argument width / pointer coercion)
@@ -924,6 +925,11 @@ type struct ExprOps {
                 } else {
                     arg_val = LValue { raw: llvm::LLVMBuildIntToPtr(this.builder.raw, arg_val.raw, expected_ty, "arg.i2p") };
                 }
+            } else if ((ek == LTypeKind::Float || ek == LTypeKind::Double)
+                       && (ak == LTypeKind::Integer || ak == LTypeKind::Float || ak == LTypeKind::Double)) {
+                // A number into a float parameter: an integer exact in it,
+                // or the narrower float.
+                arg_val = this.convert_number(arg_val, arg_ty_ref, LType { raw: expected_ty });
             } else if (ek == LTypeKind::Integer && ak == LTypeKind::Pointer) {
                 arg_val = LValue { raw: llvm::LLVMBuildPtrToInt(this.builder.raw, arg_val.raw, expected_ty, "arg.p2i") };
             } else if ((ek == LTypeKind::Integer
@@ -983,35 +989,7 @@ type struct ExprOps {
             const exp_lty: LType = LType { raw: expected_ty };
             arg_val = this.builder.build_load(exp_lty, slot_p, "arg.reshaped");
         } else if (ek == LTypeKind::Integer && ak == LTypeKind::Integer) {
-            // Both integers: coerce widths if needed.  Picking
-            // sext vs zext from the *source* Cryo type's
-            // signedness is load-bearing: an i32 holding `-1`
-            // (0xFFFFFFFF) widened to i64 must become
-            // 0xFFFFFFFFFFFFFFFF (sext), not 0x00000000FFFFFFFF
-            // (zext).  Defaulting to zext silently corrupted any
-            // negative signed-narrow arg passed to a wider
-            // parameter.
-            const ew: u32 = llvm::LLVMGetIntTypeWidth(expected_ty);
-            const aw: u32 = llvm::LLVMGetIntTypeWidth(actual_ty);
-            if (aw < ew) {
-                const target: LType = LType { raw: expected_ty };
-                mut src_signed: boolean = false;
-                if (arg_ty_ref.is_valid()) {
-                    const at_t: Type* = this.arena_type(arg_ty_ref);
-                    if (at_t != null && at_t.kind == TypeKind::Int) {
-                        const it: IntegerKind = at_t.int_kind();
-                        src_signed = it.is_signed();
-                    }
-                }
-                if (src_signed) {
-                    arg_val = this.builder.build_sext(arg_val, target, "arg.widen");
-                } else {
-                    arg_val = this.builder.build_zext(arg_val, target, "arg.widen");
-                }
-            } else if (aw > ew) {
-                const target: LType = LType { raw: expected_ty };
-                arg_val = this.builder.build_trunc(arg_val, target, "arg.trunc");
-            }
+            arg_val = this.convert_number(arg_val, arg_ty_ref, LType { raw: expected_ty });
         }
         return arg_val;
     }
@@ -2625,23 +2603,6 @@ type struct ExprOps {
                 }
             }
         }
-        if (want_kind == LTypeKind::Integer && got_kind == LTypeKind::Integer) {
-            const want_bits: u32 = llvm::LLVMGetIntTypeWidth(want_ty_raw);
-            const got_bits:  u32 = llvm::LLVMGetIntTypeWidth(got_ty_raw);
-            if (want_bits > got_bits) {
-                // Widen with the *returned value's* signedness, not zext
-                // unconditionally: `return some_i32` from an `-> i64`
-                // fn must sign-extend a signed i32 so `-1` stays `-1`.
-                if (this.int_type_is_signed(src_ty)) {
-                    return this.builder.build_sext(val, want_lty, "ret.sext");
-                }
-                return this.builder.build_zext(val, want_lty, "ret.zext");
-            }
-            if (want_bits < got_bits) {
-                return this.builder.build_trunc(val, want_lty, "ret.trunc");
-            }
-        }
-
-        return val;
+        return this.convert_number(val, src_ty, want_lty);
     }
 }
