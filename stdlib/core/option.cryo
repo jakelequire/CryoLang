@@ -8,7 +8,10 @@ namespace std::core::option;
 import std::core::intrinsics;
 import std::core::clone::{ Clone };
 import std::core::cmp::{ Eq };
+import std::core::default::{ Default };
+import std::core::mem;
 import std::core::result::{ Result };
+import std::collections::pair::{ Pair };
 import std::core::ops::{ ControlFlow, FromResidual, Try };
 import std::fmt::display::{ Debug };
 
@@ -209,6 +212,135 @@ implement enum Option<T> {
             Option::Some(inner) => { return inner.equals(value); }
             Option::None => { return false; }
         }
+    }
+
+    /// True when the option is `Some` and the predicate holds for the value.
+    /// The value is lent to the predicate; the option keeps it.
+    public is_some_and<P>(&this, predicate: P) -> boolean where P: (&T) -> boolean {
+        match (&this) {
+            Option::Some(value) => { return predicate(&value); }
+            Option::None => { return false; }
+        }
+    }
+
+    /// True when the option is `None`, or `Some` with a value the predicate
+    /// holds for.
+    public is_none_or<P>(&this, predicate: P) -> boolean where P: (&T) -> boolean {
+        match (&this) {
+            Option::Some(value) => { return predicate(&value); }
+            Option::None => { return true; }
+        }
+    }
+
+    /// The option itself when it is `Some` and the predicate holds for the
+    /// value; `None` otherwise, releasing a refused value.
+    ![sink]
+    public filter<P>(&this, predicate: P) -> Option<T> where P: (&T) -> boolean {
+        match (&this) {
+            Option::Some(value) => {
+                if (predicate(&value)) {
+                    return Option::Some(value);
+                }
+                mem::drop(value);
+                return Option::None;
+            }
+            Option::None => { return Option::None; }
+        }
+    }
+
+    /// The function applied to the value, or `default_value` for `None`.
+    ![sink]
+    public map_or<U, F>(&this, default_value: U, f: F) -> U where F: (T) -> U {
+        match (&this) {
+            Option::Some(value) => { return f(value); }
+            Option::None => { return default_value; }
+        }
+    }
+
+    /// The function applied to the value, or `default_function`'s result for
+    /// `None`; the default is computed only when it is needed.
+    ![sink]
+    public map_or_else<U, D, F>(&this, default_function: D, f: F) -> U where D: () -> U, F: (T) -> U {
+        match (&this) {
+            Option::Some(value) => { return f(value); }
+            Option::None => { return default_function(); }
+        }
+    }
+
+    /// `other` when this option is `Some`, `None` otherwise. This option's
+    /// value is released either way.
+    ![sink]
+    public and<U>(&this, other: Option<U>) -> Option<U> {
+        match (&this) {
+            Option::Some(value) => {
+                mem::drop(value);
+                return other;
+            }
+            Option::None => { return Option::None; }
+        }
+    }
+
+    /// This option when it is `Some`, `other` otherwise.
+    ![sink]
+    public or(&this, other: Option<T>) -> Option<T> {
+        match (&this) {
+            Option::Some(value) => { return Option::Some(value); }
+            Option::None => { return other; }
+        }
+    }
+
+    /// The one of the two options that is `Some`, when exactly one is;
+    /// `None` when both or neither are, releasing both values.
+    ![sink]
+    public xor(&this, other: Option<T>) -> Option<T> {
+        match (&this) {
+            Option::Some(value) => {
+                if (other.is_none()) {
+                    return Option::Some(value);
+                }
+                mem::drop(value);
+                return Option::None;
+            }
+            Option::None => { return other; }
+        }
+    }
+
+    /// Both values as a `Pair` when both options are `Some`; `None`
+    /// otherwise, releasing whichever value there was.
+    ![sink]
+    public zip<U>(&this, other: Option<U>) -> Option<Pair<T, U>> {
+        match (&this) {
+            Option::Some(value) => {
+                match (other) {
+                    Option::Some(other_value) => { return Option::Some(Pair::new(value, other_value)); }
+                    Option::None => {
+                        mem::drop(value);
+                        return Option::None;
+                    }
+                }
+            }
+            Option::None => { return Option::None; }
+        }
+    }
+
+    /// The value, or `T::default()` for `None`.
+    ![sink]
+    public unwrap_or_default(&this) -> T where T: Default {
+        match (&this) {
+            Option::Some(value) => { return value; }
+            Option::None => { return T::default(); }
+        }
+    }
+
+    /// Lend the value to `f` when there is one, then give the option back
+    /// unchanged.
+    ![sink]
+    public inspect<F>(&this, f: F) -> Option<T> where F: (&T) -> void {
+        match (&this) {
+            Option::Some(value) => { f(&value); }
+            Option::None => { }
+        }
+        return this;
     }
 }
 

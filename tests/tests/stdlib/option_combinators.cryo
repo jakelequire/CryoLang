@@ -1,0 +1,186 @@
+///! Option combinators: predicates, filter, map_or, and/or/xor, zip,
+///! unwrap_or_default, inspect - and that every value one of them discards
+///! is released exactly once.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::OptionCombinators;
+
+import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::core::drop::{ Drop };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_eq };
+
+mut released: i64 = 0;
+mut inspected: i64 = 0;
+
+type struct Counted {
+    tag: i64;
+}
+
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void {
+        released += this.tag;
+    }
+}
+
+function counted(tag: i64) -> Option<Counted> {
+    return Option::Some(Counted { tag: tag });
+}
+
+![test]
+function is_some_and_and_is_none_or_test_the_value() -> Result<(), TestError> {
+    const three: Option<i32> = Option::Some(3);
+    const none: Option<i32> = Option::None;
+    expect(three.is_some_and((x: &i32) -> boolean { return *x == 3; }), Str::new("Some(3) is 3"))?;
+    expect(!three.is_some_and((x: &i32) -> boolean { return *x == 4; }), Str::new("Some(3) is not 4"))?;
+    expect(!none.is_some_and((x: &i32) -> boolean { return true; }), Str::new("None is never some-and"))?;
+    expect(none.is_none_or((x: &i32) -> boolean { return false; }), Str::new("None is always none-or"))?;
+    expect(three.is_none_or((x: &i32) -> boolean { return *x > 2; }), Str::new("Some(3) > 2"))?;
+    return expect(!three.is_none_or((x: &i32) -> boolean { return *x > 3; }), Str::new("Some(3) is not > 3"));
+}
+
+![test]
+function filter_keeps_a_value_the_predicate_accepts() -> Result<(), TestError> {
+    const kept: Option<i32> = Option::Some(8).filter((x: &i32) -> boolean { return *x % 2 == 0; });
+    expect_eq(kept.unwrap_or(0), 8)?;
+    const refused: Option<i32> = Option::Some(7).filter((x: &i32) -> boolean { return *x % 2 == 0; });
+    expect(refused.is_none(), Str::new("an odd value is filtered out"))?;
+    const none: Option<i32> = Option::None;
+    return expect(none.filter((x: &i32) -> boolean { return true; }).is_none(), Str::new("None stays None"));
+}
+
+![test]
+function filter_releases_a_refused_value_once() -> Result<(), TestError> {
+    released = 0;
+    {
+        const refused: Option<Counted> = counted(1).filter((c: &Counted) -> boolean { return false; });
+        expect_eq(released, 1)?;
+        expect(refused.is_none(), Str::new("refused"))?;
+        const kept: Option<Counted> = counted(10).filter((c: &Counted) -> boolean { return true; });
+        expect_eq(released, 1)?;
+        expect(kept.is_some(), Str::new("kept"))?;
+    }
+    return expect_eq(released, 11);
+}
+
+![test]
+function map_or_and_map_or_else_pick_the_branch() -> Result<(), TestError> {
+    const some: Option<i32> = Option::Some(4);
+    expect_eq(some.map_or(0, (x: i32) -> i32 { return x * 10; }), 40)?;
+    const none: Option<i32> = Option::None;
+    expect_eq(none.map_or(-1, (x: i32) -> i32 { return x * 10; }), -1)?;
+    const again: Option<i32> = Option::Some(5);
+    expect_eq(again.map_or_else(() -> i32 { return -1; }, (x: i32) -> i32 { return x + 1; }), 6)?;
+    const empty: Option<i32> = Option::None;
+    return expect_eq(empty.map_or_else(() -> i32 { return -1; }, (x: i32) -> i32 { return x + 1; }), -1);
+}
+
+![test]
+function map_or_releases_the_unused_default() -> Result<(), TestError> {
+    released = 0;
+    const some: Option<i32> = Option::Some(2);
+    const mapped: Counted = some.map_or(Counted { tag: 100 }, (x: i32) -> Counted { return Counted { tag: 0 }; });
+    expect_eq(mapped.tag, 0)?;
+    return expect_eq(released, 100);
+}
+
+![test]
+function and_or_xor_pick_the_right_option() -> Result<(), TestError> {
+    const one: Option<i32> = Option::Some(1);
+    const two: Option<i32> = Option::Some(2);
+    const none: Option<i32> = Option::None;
+    expect_eq(one.and(two).unwrap_or(0), 2)?;
+    expect(none.and(two).is_none(), Str::new("None and Some is None"))?;
+    expect_eq(one.or(two).unwrap_or(0), 1)?;
+    expect_eq(none.or(two).unwrap_or(0), 2)?;
+    expect(none.or(none).is_none(), Str::new("None or None is None"))?;
+    expect(one.xor(two).is_none(), Str::new("Some xor Some is None"))?;
+    expect_eq(one.xor(none).unwrap_or(0), 1)?;
+    expect_eq(none.xor(two).unwrap_or(0), 2)?;
+    return expect(none.xor(none).is_none(), Str::new("None xor None is None"));
+}
+
+![test]
+function and_releases_this_value_and_keeps_the_other() -> Result<(), TestError> {
+    released = 0;
+    {
+        const result: Option<Counted> = counted(1).and(counted(10));
+        expect_eq(released, 1)?;
+        const kept: Counted = result.unwrap();
+        expect_eq(kept.tag, 10)?;
+    }
+    expect_eq(released, 11)?;
+    released = 0;
+    const none: Option<Counted> = Option::None;
+    const nothing: Option<Counted> = none.and(counted(10));
+    expect(nothing.is_none(), Str::new("None and Some is None"))?;
+    return expect_eq(released, 10);
+}
+
+![test]
+function or_releases_the_option_it_does_not_return() -> Result<(), TestError> {
+    released = 0;
+    {
+        const first: Option<Counted> = counted(1).or(counted(10));
+        expect_eq(released, 10)?;
+        expect(first.is_some(), Str::new("Some or Some is the first"))?;
+    }
+    expect_eq(released, 11)?;
+    released = 0;
+    {
+        const none: Option<Counted> = Option::None;
+        const second: Option<Counted> = none.or(counted(10));
+        expect_eq(released, 0)?;
+        expect(second.is_some(), Str::new("None or Some is the second"))?;
+    }
+    return expect_eq(released, 10);
+}
+
+![test]
+function xor_of_two_values_releases_both() -> Result<(), TestError> {
+    released = 0;
+    const neither: Option<Counted> = counted(1).xor(counted(10));
+    expect(neither.is_none(), Str::new("Some xor Some is None"))?;
+    return expect_eq(released, 11);
+}
+
+![test]
+function zip_pairs_two_values_or_releases_the_one() -> Result<(), TestError> {
+    const one: Option<i32> = Option::Some(1);
+    const word: Option<Str> = Option::Some(Str::new("one"));
+    const pair: Pair<i32, Str> = one.zip(word).unwrap();
+    expect_eq(pair.first, 1)?;
+    expect(pair.second.equals(&Str::new("one")), Str::new("second member"))?;
+    released = 0;
+    const missing: Option<i32> = Option::None;
+    const unpaired: Option<Pair<Counted, i32>> = counted(5).zip(missing);
+    expect(unpaired.is_none(), Str::new("Some zip None is None"))?;
+    return expect_eq(released, 5);
+}
+
+![test]
+function unwrap_or_default_gives_the_default_for_none() -> Result<(), TestError> {
+    const none: Option<i64> = Option::None;
+    expect_eq(none.unwrap_or_default(), 0)?;
+    const some: Option<i64> = Option::Some(9);
+    expect_eq(some.unwrap_or_default(), 9)?;
+    const no_text: Option<String> = Option::None;
+    return expect_eq(no_text.unwrap_or_default().length(), 0);
+}
+
+![test]
+function inspect_lends_the_value_and_returns_the_option() -> Result<(), TestError> {
+    inspected = 0;
+    const some: Option<i64> = Option::Some(6);
+    const same: Option<i64> = some.inspect((x: &i64) -> void { inspected += *x; });
+    expect_eq(inspected, 6)?;
+    expect_eq(same.unwrap_or(0), 6)?;
+    const none: Option<i64> = Option::None;
+    const still_none: Option<i64> = none.inspect((x: &i64) -> void { inspected += 100; });
+    expect(still_none.is_none(), Str::new("None stays None"))?;
+    return expect_eq(inspected, 6);
+}
