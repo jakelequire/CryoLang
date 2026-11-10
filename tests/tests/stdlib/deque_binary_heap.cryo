@@ -1,0 +1,156 @@
+///! Deque and BinaryHeap. A deque pushed and popped at both ends keeps its
+///! order across growth that happens while its elements wrap round the
+///! buffer, indexes front to back, splits into two slices and releases what
+///! it still holds. A heap hands out its greatest element first, builds
+///! from an array, and sorts into an ascending array.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::DequeBinaryHeap;
+
+import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::core::drop::{ Drop };
+import std::collections::array::{ Array };
+import std::collections::deque::{ Deque };
+import std::collections::binary_heap::{ BinaryHeap };
+import std::collections::pair::{ Pair };
+import std::core::slice::{ Slice };
+import std::collections::str::{ Str };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_eq };
+
+![test]
+function deque_keeps_order_through_wrapping_growth() -> Result<(), TestError> {
+    mut queue: Deque<i64> = Deque::new();
+    // Wrap the elements round the buffer before every growth: take from
+    // the front while adding at the back, then add at the front.
+    mut next: i64 = 0;
+    mut expected_front: i64 = 0;
+    for (mut round: i64 = 0; round < 200; round++) {
+        queue.push_back(next);
+        next += 1;
+        queue.push_back(next);
+        next += 1;
+        expect_eq(queue.pop_front().unwrap(), expected_front)?;
+        expected_front += 1;
+    }
+    expect_eq(queue.length(), 200)?;
+    for (mut index: i64 = 0; index < queue.length(); index++) {
+        expect_eq(queue[index], expected_front + index)?;
+    }
+    queue.push_front(-1);
+    queue.push_front(-2);
+    expect_eq(*queue.front().unwrap(), -2)?;
+    expect_eq(*queue.back().unwrap(), next - 1)?;
+    expect_eq(queue.pop_back().unwrap(), next - 1)?;
+    expect_eq(queue.pop_front().unwrap(), -2)?;
+    expect_eq(queue.pop_front().unwrap(), -1)?;
+    expect_eq(queue.pop_front().unwrap(), expected_front)?;
+    return Result::Ok(());
+}
+
+![test]
+function deque_pushed_only_at_the_front_reads_back_to_front() -> Result<(), TestError> {
+    mut queue: Deque<i64> = Deque::new();
+    for (mut value: i64 = 0; value < 100; value++) {
+        queue.push_front(value);
+    }
+    for (mut index: i64 = 0; index < 100; index++) {
+        expect_eq(queue[index], 99 - index)?;
+    }
+    queue[0] = 1000;
+    expect_eq(queue.pop_front().unwrap(), 1000)?;
+    expect(queue.get_ref(99).is_none(), Str::new("past the end"))?;
+    return Result::Ok(());
+}
+
+![test]
+function deque_empty_answers_none() -> Result<(), TestError> {
+    mut queue: Deque<i64> = Deque::new();
+    expect(queue.is_empty(), Str::new("new deque is empty"))?;
+    expect(queue.pop_front().is_none(), Str::new("pop_front on empty"))?;
+    expect(queue.pop_back().is_none(), Str::new("pop_back on empty"))?;
+    expect(queue.front().is_none(), Str::new("front on empty"))?;
+    return Result::Ok(());
+}
+
+![test]
+function deque_as_slices_covers_both_runs() -> Result<(), TestError> {
+    mut queue: Deque<i64> = Deque::with_capacity(8);
+    for (mut value: i64 = 0; value < 8; value++) {
+        queue.push_back(value);
+    }
+    queue.pop_front();
+    queue.pop_front();
+    queue.push_back(8);
+    queue.push_back(9);
+    const halves: Pair<&Slice<i64>, &Slice<i64>> = queue.as_slices();
+    expect_eq(halves.first.length() + halves.second.length(), 8)?;
+    expect_eq(halves.first.length(), 6)?;
+    expect_eq(halves.first[0], 2)?;
+    expect_eq(halves.second[0], 8)?;
+    expect_eq(halves.second[1], 9)?;
+    return Result::Ok(());
+}
+
+/// How many `Counted` values have been released.
+mut released: i64 = 0;
+
+type struct Counted {
+    value: i64;
+}
+
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void { released += 1; }
+}
+
+![test]
+function deque_releases_what_it_holds() -> Result<(), TestError> {
+    released = 0;
+    {
+        mut queue: Deque<Counted> = Deque::new();
+        for (mut value: i64 = 0; value < 10; value++) {
+            queue.push_back(Counted { value: value });
+            queue.push_front(Counted { value: value });
+        }
+        const taken: Counted = queue.pop_front().unwrap();
+        expect_eq(taken.value, 9)?;
+    }
+    expect_eq(released, 20)?;
+    return Result::Ok(());
+}
+
+![test]
+function heap_hands_out_the_greatest_first() -> Result<(), TestError> {
+    mut heap: BinaryHeap<i64> = BinaryHeap::new();
+    mut state: i64 = 77;
+    for (mut index: i64 = 0; index < 300; index++) {
+        state = (state * 1103515245 + 12345) % 2147483648;
+        heap.push(state % 100000);
+    }
+    expect_eq(heap.length(), 300)?;
+    mut previous: i64 = *heap.peek().unwrap();
+    for (mut index: i64 = 0; index < 300; index++) {
+        const value: i64 = heap.pop().unwrap();
+        expect(value <= previous, Str::new("each pop is no greater than the last"))?;
+        previous = value;
+    }
+    expect(heap.pop().is_none(), Str::new("empty after every pop"))?;
+    return Result::Ok(());
+}
+
+![test]
+function heap_from_array_sorts_into_ascending_order() -> Result<(), TestError> {
+    mut values: Array<i64> = Array::new();
+    for (mut index: i64 = 0; index < 64; index++) {
+        values.push((index * 37) % 64);
+    }
+    const heap: BinaryHeap<i64> = BinaryHeap::from_array(values);
+    expect_eq(*heap.peek().unwrap(), 63)?;
+    const sorted: Array<i64> = heap.into_sorted();
+    expect_eq(sorted.length(), 64)?;
+    for (mut index: i64 = 0; index < 64; index++) {
+        expect_eq(sorted[index], index)?;
+    }
+    return Result::Ok(());
+}
