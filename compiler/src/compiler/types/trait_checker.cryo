@@ -156,6 +156,16 @@ type struct TraitChecker {
             }
         }
 
+        // A fixed array has `Eq`, `Ord` and `Hash` when its element does:
+        // no implementation can name the array's length, so the compiler
+        // answers for it, and a call of the trait's method is made on the
+        // slice over the elements (`SemaVisitor::slice_view`), whose
+        // implementation of each holds exactly when the element's does.
+        const array_t: Type* = this.arena.lookup(ty);
+        if (array_t != null && array_t.kind == TypeKind::Array && this.answered_through_slice(trait_name)) {
+            return this.type_implements_trait(array_t.as_array().element, trait_name, depth + 1);
+        }
+
         const object_t: Type* = this.arena.lookup(ty);
         if (object_t != null && object_t.kind == TypeKind::Object) {
             return this.object_implements_trait(object_t.as_object(), trait_name);
@@ -172,6 +182,30 @@ type struct TraitChecker {
         // A method merely named `drop` does not satisfy `Drop`: a type
         // implements it with `implement trait Drop`, as any other trait.
         return impl_block != null;
+    }
+
+    /// Whether a fixed array has `trait_def` through the slice over its
+    /// elements: `Eq`, `Ord` and `Hash`, whose methods read the receiver
+    /// through `&this` and take another value of the type only as `&This`,
+    /// both of which the slice stands in for.
+    answered_through_slice(&this, trait_def: DefId) -> boolean {
+        const traits: [DefId] = this.traits_answered_through_slice();
+        for (mut i: i64 = 0; i < traits.length(); i++) {
+            if (traits[i].equals(trait_def)) { return true; }
+        }
+        return false;
+    }
+
+    /// The traits `answered_through_slice` accepts, those this program's
+    /// module graph declares.
+    traits_answered_through_slice(&this) -> [DefId] {
+        mut traits: [DefId] = [];
+        const items: [LangItem] = [LangItem::Eq, LangItem::Ord, LangItem::Hash];
+        for (mut i: i64 = 0; i < items.length(); i++) {
+            const trait_def: DefId = this.generic_registry.wellknown(items[i]);
+            if (trait_def.is_valid()) { traits.push(trait_def); }
+        }
+        return traits;
     }
 
     /// Whether `trait_def` is one of the structural markers - `Copy`,

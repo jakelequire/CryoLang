@@ -3528,6 +3528,31 @@ type struct SemaVisitor {
         return TraitConversionOutcome::Converted(call);
     }
 
+    /// The read-only slice over the elements of `array`, an expression
+    /// typed as a fixed array or a reference to one - a value is borrowed
+    /// first - built by `fixed_array_slice` and typed, so a call of an
+    /// `Eq`, `Ord` or `Hash` method on the array (`TraitChecker::
+    /// answered_through_slice`) is the call on the slice.  The one place
+    /// that rewrite is made: where the call is written, and in a generic
+    /// body's copy whose type argument is the array.  Null when `array`
+    /// is no fixed array or a reference to one.
+    slice_view(mut &this, array: mut ExpressionNode*) -> mut ExpressionNode* {
+        const written: Type* = this.arena.lookup(array.resolved_type);
+        if (written == null) { return null; }
+        mut reference: mut ExpressionNode* = array;
+        mut array_t: Type* = written;
+        if (written.kind == TypeKind::Reference) {
+            array_t = this.arena.lookup(written.as_reference().referent);
+        } else {
+            const amp: Token = Token::new(TokenType::Amp, "&", array.span.start_line as int, array.span.start_col as int);
+            reference = ExpressionNode::synthetic_unary(amp, array, array.span);
+        }
+        if (array_t == null || array_t.kind != TypeKind::Array) { return null; }
+        const slice: mut ExpressionNode* = this.fixed_array_slice(reference, array_t.as_array(), false, array.span);
+        this.resolve_expr(slice);
+        return slice;
+    }
+
     /// The slice over the elements of the fixed array `reference` refers
     /// to: `Slice::from_raw(reference as T*, N)`, or
     /// `Slice::from_raw_mutable(reference as mut T*, N)` when `writable`.  No

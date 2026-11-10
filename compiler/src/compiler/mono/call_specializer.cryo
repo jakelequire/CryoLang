@@ -54,6 +54,7 @@ import compiler::mono::ast_resolver::{ MonoAstResolver };
 import compiler::mono::state::{ MonoState, SettledObjectConversion, SpecializationEntry };
 import compiler::mono::trait_specializer::{ MonoTraitSpecializer };
 import compiler::sema::call_resolver::{ CallResolver };
+import compiler::sema::sema::{ SemaVisitor };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::res::{ FamilyOwner, Res, ResBase, ResSlot };
 import compiler::decl_index::{ OverloadId };
@@ -93,6 +94,8 @@ type struct MonoCallSpecializer {
     state:            mut MonoState*;
     trait_spec:       mut MonoTraitSpecializer*;
     ast_resolver:     mut MonoAstResolver*;
+    /// Types the nodes a copy's rewrite builds (`view_array_as_slice`).
+    binder:           mut SemaVisitor*;
     current_source_file: SymbolStr;
     /// Calls bound by identity to a method of a receiver or owner whose
     /// instantiation was not minted when the call was walked: a copy's body
@@ -125,6 +128,7 @@ type struct MonoCallSpecializer {
             state:            null,
             trait_spec:       null,
             ast_resolver:     null,
+            binder:           null,
             current_source_file: SymbolStr::empty(),
             queued_binds:     [],
             queued_path_values: [],
@@ -137,7 +141,7 @@ type struct MonoCallSpecializer {
                     intern_table: mut InternTable*, diagnostics: mut DiagnosticSink*,
                     type_resolver: TypeResolver*, decl_index: mut DeclarationIndex*,
                     state: mut MonoState*, trait_spec: mut MonoTraitSpecializer*,
-                    ast_resolver: mut MonoAstResolver*) -> void {
+                    ast_resolver: mut MonoAstResolver*, binder: mut SemaVisitor*) -> void {
         this.arena            = arena;
         this.generic_registry = generic_registry;
         this.intern_table     = intern_table;
@@ -147,6 +151,7 @@ type struct MonoCallSpecializer {
         this.state            = state;
         this.trait_spec       = trait_spec;
         this.ast_resolver     = ast_resolver;
+        this.binder           = binder;
     }
 
     set_current_source_file(mut &this, file: SymbolStr) -> void {
@@ -390,6 +395,7 @@ type struct MonoCallSpecializer {
         if (expr == null) { return; }
         match (expr.kind) {
             ExprKind::Call(call) => {
+                this.view_array_as_slice(call, subst);
                 for (mut i: i64 = 0; i < call.arguments.length(); i++) {
                     this.walk_expr(call.arguments[i], res_ctx, subst);
                 }
@@ -547,6 +553,46 @@ type struct MonoCallSpecializer {
     }
 
 
+    /// A call a bound answered whose receiver is, in this copy, a fixed
+    /// array - `a.equals(b)` in a body over `T: Eq` copied with
+    /// `T = [u8; 4]` - is made on the slice over the array's elements, as
+    /// the call is where it is written on an array (`SemaVisitor::
+    /// slice_view`, `TraitChecker::answered_through_slice`): the receiver
+    /// and each argument the trait's method takes as `&This` become that
+    /// slice, and the call is then bound to the slice's implementation as
+    /// any receiver's is.  Done before the call's operands are walked, so
+    /// the slice's construction is walked and bound with them; a second
+    /// walk of the call finds a slice receiver and leaves it.
+    view_array_as_slice(mut &this, call: mut CallExpr*, subst: TypeSubstitution*) -> void {
+        if (call.callee == null || !call.template_recv.is_valid() || this.binder == null) { return; }
+        const ma: mut MemberAccessExpr* = ExpressionNode::member_access_of(call.callee);
+        if (ma == null || !ma.resolved_trait.is_valid() || ma.resolved_trait_slot < 0) { return; }
+        mut recv: TypeRef = call.template_recv;
+        if (subst != null) { recv = subst.apply(recv, this.arena); }
+        const owner_t: Type* = this.arena.lookup(this.receiver_owner(recv));
+        if (owner_t == null || owner_t.kind != TypeKind::Array) { return; }
+        const view: mut ExpressionNode* = this.binder.slice_view(ma.object);
+        if (view == null) { return; }
+        ma.object = view;
+        const method: DeclarationNode* = this.generic_registry.get_trait_decl(ma.resolved_trait).methods[ma.resolved_trait_slot];
+        const func: FunctionDecl* = DeclarationNode::fn_of(method);
+        for (mut i: i64 = 1; i < func.parameters.length() && i - 1 < call.arguments.length(); i++) {
+            if (!this.refers_to_this(DeclarationNode::var_of(func.parameters[i]).resolved_type)) { continue; }
+            const argument_view: mut ExpressionNode* = this.binder.slice_view(call.arguments[i - 1]);
+            if (argument_view != null) { call.arguments[i - 1] = argument_view; }
+        }
+        call.template_recv = view.resolved_type;
+    }
+
+    /// Whether `ty`, a trait method's parameter type, is `&This`.
+    refers_to_this(&this, ty: TypeRef) -> boolean {
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null || t.kind != TypeKind::Reference) { return false; }
+        const referent: Type* = this.arena.lookup(t.as_reference().referent);
+        return referent != null && referent.kind == TypeKind::GenericParam
+            && this.arena.is_this_placeholder(referent.as_generic_param());
+    }
+
     /// Whether an operand a bound gave an operator's trait is, in this copy,
     /// a type the primitive operator applies to: anything but a user type,
     /// once no type parameter is left in it.  A user type overloads through
@@ -564,7 +610,9 @@ type struct MonoCallSpecializer {
         const t: Type* = this.arena.lookup(ty);
         if (t == null) { return false; }
         if (keep_on_reference && t.kind == TypeKind::Reference) { return false; }
-        return t.kind != TypeKind::Struct
+        // A fixed array has its traits through the slice over its elements
+        // (`view_array_as_slice`), which no primitive operator stands for.
+        return t.kind != TypeKind::Struct && t.kind != TypeKind::Array
             && t.kind != TypeKind::Enum && t.kind != TypeKind::InstantiatedType;
     }
 
