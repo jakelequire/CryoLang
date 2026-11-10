@@ -2201,6 +2201,8 @@ type trait Read {
 }
 ```
 
+A trait declares each method name once: its methods are found by name alone, so a second method of a name the trait already declares is refused at its name (`E0205`: "the method `area` is declared twice in this trait"), whatever its parameters.
+
 A trait may inherit from a base trait; implementations of the derived trait must also implement the base:
 
 ```cryo
