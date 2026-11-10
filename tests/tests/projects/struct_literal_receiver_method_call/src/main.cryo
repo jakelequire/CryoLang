@@ -1,0 +1,95 @@
+namespace StructLiteralReceiverMethodCall;
+
+import std::core::option::{ Option };
+import std::core::iter::{ Iterator };
+
+// A literal of a generic struct written with its type arguments is a value
+// of that instantiation.  A method called straight on it, where no declared
+// type in the program names the instantiation, calls that instantiation's
+// method: a plain one, one generic in its own parameters, and one whose
+// callable bound reads the owner's item, in `main` and in a generic body.
+
+type struct Holder<T> {
+    v: T;
+
+    plain(&this) -> i64 { return 3; }
+
+    apply<B, F>(this, f: F) -> B where F: (T) -> B {
+        return f(this.v);
+    }
+}
+
+type struct Up {
+    cur: i32;
+    end: i32;
+}
+
+implement trait Iterator<i32> for struct Up {
+    next(mut &this) -> Option<i32> {
+        if (this.cur >= this.end) { return Option::None; }
+        const v: i32 = this.cur;
+        this.cur = this.cur + 1;
+        return Option::Some(v);
+    }
+}
+
+type struct Mapped<I, M, O> where I: Iterator, M: (I::Item) -> O {
+    inner: I;
+    f:     M;
+}
+
+implement<I, M, O> trait Iterator<O> for struct Mapped<I, M, O>
+where I: Iterator, M: (I::Item) -> O {
+    next(mut &this) -> Option<O> {
+        return match (this.inner.next()) {
+            Option::Some(value) => { Option::Some(this.f(value)) }
+            Option::None        => { Option::None }
+        };
+    }
+}
+
+type struct Wrap<I> where I: Iterator {
+    it: I;
+
+    map_with<B, F>(this, f: F) -> Mapped<I, F, B> where F: (I::Item) -> B {
+        return Mapped::<I, F, B> { inner: this.it, f: f };
+    }
+}
+
+function widen(x: i32) -> i64 { return (x as i64) * 1000; }
+function halve(x: i64) -> i32 { return (x / 2) as i32; }
+
+function sum_i64<I>(mut it: I) -> i64 where I: Iterator<i64> {
+    mut sum: i64 = 0;
+    loop {
+        match (it.next()) {
+            Option::Some(v) => { sum = sum + v; }
+            Option::None => { break; }
+        }
+    }
+    return sum;
+}
+
+function sum_i32<I>(mut it: I) -> i32 where I: Iterator<i32> {
+    mut sum: i32 = 0;
+    loop {
+        match (it.next()) {
+            Option::Some(v) => { sum = sum + v; }
+            Option::None => { break; }
+        }
+    }
+    return sum;
+}
+
+function widened_then_halved<I>(it: I) -> i32 where I: Iterator<i32> {
+    const once: Mapped<I, (i32) -> i64, i64> = Wrap::<I> { it: it }.map_with(widen);
+    return sum_i32(Wrap::<Mapped<I, (i32) -> i64, i64>> { it: once }.map_with(halve));
+}
+
+function main() -> i32 {
+    if (Holder::<i32> { v: 5 }.plain() != 3) { return 1; }
+    if (Holder::<i32> { v: 5 }.apply(widen) != 5000) { return 2; }
+    if (sum_i64(Wrap::<Up> { it: Up { cur: 0, end: 4 } }.map_with(widen)) != 6000) { return 3; }
+    if (widened_then_halved(Up { cur: 0, end: 4 }) != 3000) { return 4; }
+    return 0;
+}
