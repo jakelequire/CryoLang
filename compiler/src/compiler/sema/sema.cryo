@@ -773,7 +773,9 @@ type struct SemaVisitor {
             }
             const method_this: TypeRef = if (method.is_static) { TypeRef::invalid() } else { owner_type };
             const saved_owner: TypeRef = this.state.current_owner_type;
+            const saved_enclosing: TypeRef = this.state.enclosing_type;
             this.state.current_owner_type = owner_type;
+            this.state.enclosing_type = owner_type;
             // An `async` method's node already carries its FUTURE type, so
             // callers typed before it resolve correctly; its own body is still
             // checked against the declared Output.
@@ -787,6 +789,7 @@ type struct SemaVisitor {
             // exactly as `visit(FunctionDecl*)` does for a free function.
             if (DeclarationNode::fn_of(method.func).is_async) { this.async_lower.lower(method.func); }
             this.state.current_owner_type = saved_owner;
+            this.state.enclosing_type = saved_enclosing;
         }
     }
 
@@ -867,15 +870,18 @@ type struct SemaVisitor {
         }
         this.state.symbolic_method_param_nodes = method_nodes;
 
+        const saved_enclosing: TypeRef = this.state.enclosing_type;
+        this.state.enclosing_type = this.symbolic.symbolic_owner_instance(owner_type);
         mut eff_this: TypeRef = this_type;
         if (this_type.is_valid() && owner_type.is_valid() && this_type.equals(owner_type)) {
-            eff_this = this.symbolic.symbolic_owner_instance(owner_type);
+            eff_this = this.state.enclosing_type;
             const written: TypeRef = this.written_receiver_type(func_decl);
             if (written.is_valid()) { eff_this = written; }
         }
         this.enter_function(func_decl, eff_this);
         this.visit_block(func.body);
 
+        this.state.enclosing_type = saved_enclosing;
         if (ar != null) { ar.set_symbolic_no_demand(saved_no_demand); }
         swap(&this.state.symbolic_method_param_nodes, &saved_method_nodes);
         this.state.in_symbolic_check  = saved_symbolic;
@@ -1336,7 +1342,7 @@ type struct SemaVisitor {
         if (!var_node.has_resolved_type() && var_node.type_annotation != null) {
             this.prime_typeof_annotation(var_node.type_annotation);
             mut res_ctx: ResolutionContext = this.body_res_ctx();
-            this.symbolic.symbolic_bind_params(&res_ctx);
+            this.symbolic.bind_body_scope(&res_ctx);
             const vtype: TypeRef = this.ctx.type_resolver.resolve(var_node.type_annotation, &res_ctx);
             if (vtype.is_valid()) { var_node.resolved_type = vtype; }
             else { this.refuse_unresolved_body_annotation(var_node.type_annotation); }
@@ -1526,7 +1532,7 @@ type struct SemaVisitor {
     visit_destructure(mut &this, d: DeclarationNode*, node: mut DestructureDecl*) -> void {
         if (!node.has_resolved_type() && node.type_annotation != null) {
             mut res_ctx: ResolutionContext = this.body_res_ctx();
-            this.symbolic.symbolic_bind_params(&res_ctx);
+            this.symbolic.bind_body_scope(&res_ctx);
             const ttype: TypeRef = this.ctx.type_resolver.resolve(node.type_annotation, &res_ctx);
             if (ttype.is_valid()) { node.resolved_type = ttype; }
         }
@@ -3414,7 +3420,7 @@ type struct SemaVisitor {
         if (ann == null) { return TypeRef::invalid(); }
         this.prime_typeof_annotation(ann);
         mut res_ctx: ResolutionContext = this.body_res_ctx();
-        this.symbolic.symbolic_bind_params(&res_ctx);
+        this.symbolic.bind_body_scope(&res_ctx);
         const ty: TypeRef = this.ctx.type_resolver.resolve(ann, &res_ctx);
         if (!ty.is_valid()) { this.refuse_unresolved_body_annotation(ann); }
         return ty;
@@ -3903,7 +3909,7 @@ type struct SemaVisitor {
             // generic (e.g. stdlib `RandomSource::next_range<T>`), turning
             // `<scalar> as T` into an aggregate cast -> spurious E0208.  Mirrors
             // the identical bind at the var-decl / other cast/annotation sites.
-            this.symbolic.symbolic_bind_params(&res_ctx);
+            this.symbolic.bind_body_scope(&res_ctx);
             const target: TypeRef = this.ctx.type_resolver.resolve(cast.target_annotation, &res_ctx);
             if (target.is_valid()) { cast.set_resolved_target(target); }
             else { this.refuse_unresolved_body_annotation(cast.target_annotation); }
@@ -4282,7 +4288,7 @@ type struct SemaVisitor {
     /// During the symbolic generic-body check, narrow a `static match (T)` arm to
     /// the concrete type `pattern` for the duration of one walk of its body.
     /// When the scrutinee is a bare generic param (`T`), a type naming `T` is
-    /// the pattern's type inside the arm (`symbolic_bind_params` reads the
+    /// the pattern's type inside the arm (`bind_body_scope` reads the
     /// narrowing), and every in-scope local typed exactly `T` is rebound to it,
     /// so member/method resolution - and hover - sees the real type instead of
     /// an abstract param.  The rebinding is logged on the scope undo log; the
@@ -4300,7 +4306,7 @@ type struct SemaVisitor {
         mut rc: ResolutionContext = ResolutionContext::new("");
         // The scrutinee annotation is written at the `static match`, inside a
         // body, and resolves there.
-        this.symbolic.symbolic_bind_params(&rc);
+        this.symbolic.bind_body_scope(&rc);
         const scrut_ref: TypeRef = this.ctx.type_resolver.resolve(scrutinee, &rc);
         if (!scrut_ref.is_valid()) { return save; }
         const st: Type* = this.arena.lookup(scrut_ref);
@@ -4837,24 +4843,29 @@ type struct SemaVisitor {
         mut lit_type: TypeRef = struct_ref;
         lit_type = this.ctx.type_resolver.canonicalize_default_generic_type(struct_ref);
 
-        // A generic struct's literal written without arguments, outside a
-        // generic body, is one instance of it: the one the expected type
-        // names (`const b: Boxy<i32> = Boxy { v: 3 };`), else the one its
-        // field values bind (`second(Pair { a: 1, b: 5 })`).  Its fields are
-        // that instance's; the template still answers the literal's shape.
-        // Written with a `_` among its arguments, it is the instance that
-        // keeps the ones written, the rest bound the same way.
+        // A generic struct's literal written without arguments is one instance
+        // of it: the one the expected type names (`const b: Boxy<i32> = Boxy
+        // { v: 3 };`), else the one its field values bind (`second(Pair { a:
+        // 1, b: 5 })`).  Its fields are that instance's; the template still
+        // answers the literal's shape.  Written with a `_` among its
+        // arguments, it is the instance that keeps the ones written, the rest
+        // bound the same way.  Inside a generic body the instance may be over
+        // the body's parameters (`return Holder { f: f };` in a function
+        // returning `Holder<F>`), exactly as `Holder::<F> { f: f }` would
+        // write it: specialization rewrites that instance in each copy, and a
+        // literal left at the bare template has no layout in any of them.
         mut field_owner: TypeRef = lit_type;
         mut infer_from: const TemplateEntry* = null;
         const written: [TypeRef] = this.calls.resolve_turbofish(&lit.generic_args);
-        if (!this.state.in_symbolic_check && !TypeAnnotation::names_every_argument(&lit.generic_args)
+        if (!TypeAnnotation::names_every_argument(&lit.generic_args)
                 && !e.resolved_type.is_valid() && lit_type.equals(struct_ref) && struct_ref.is_valid()) {
             const lt: const TemplateEntry* = this.ctx.generic_registry.template_of_type(struct_ref);
             if (lt != null && lt.param_types.length() > 0
                     && (lt.kind == TemplateKind::Struct)) {
                 const promoted: TypeRef = this.calls.promote_to_expected_instantiation(struct_ref);
                 const promoted_args: [TypeRef] = this.types.view_type_args_copy(promoted);
-                if (!promoted.equals(struct_ref) && !this.types.contains_generic_param(promoted)
+                if (!promoted.equals(struct_ref)
+                        && (this.state.in_symbolic_check || !this.types.contains_generic_param(promoted))
                         && CallResolver::keeps_written(&promoted_args, &written)) {
                     lit_type = promoted;
                     field_owner = promoted;

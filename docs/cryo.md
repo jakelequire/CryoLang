@@ -921,7 +921,11 @@ declaration* it introduces an implement block - the two never overlap.)
 - **Return type** - the concrete type is inferred from the body's first
   `return` expression. That expression must currently be a *struct literal*
   (e.g. `return SliceIter::<T> { ... }`), which is how every standard-library
-  iterator is written.
+  iterator is written. The type is read from what the literal writes, before
+  any body is checked, so a generic struct's literal writes its type
+  arguments there; one written without them is refused at the literal
+  (`E0307`, "cannot infer the type arguments of `Gen` for the opaque return
+  type").
 - **Variable binding** - `mut it: implement Iterator<i32> = expr;`. The type
   is taken from the initialiser, which is then checked to actually implement
   the named trait; a mismatch is `E0200`:
@@ -1970,6 +1974,8 @@ const strs: Pair<string> = Pair::<string>::new("hello", "world");
 ```
 
 `Pair<int>` and `Pair<string>` are independent types. See [section 11.6](#116-monomorphisation).
+
+A generic struct's literal written without type arguments is one instance of it: the one its expected type names, or else the one its field values bind. Inside a generic body that instance may be over the body's own parameters, so `return Pair { first: a, second: b };` in `new` above is a `Pair<T>`, and `Holder { f: f }` returned from `function hold<F>(f: F) -> Holder<F>` is a `Holder<F>`. The owner's own literal follows the same rule: in a method of `type struct Two<A, B>` declared `-> Two<B, A>`, `return Two { a: this.b, b: this.a };` builds a `Two<B, A>`, not the `Two<A, B>` the method belongs to.
 
 ### 8.7 Unions
 
