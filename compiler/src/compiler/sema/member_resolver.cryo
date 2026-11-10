@@ -761,6 +761,13 @@ type struct MemberResolver {
 
         const result: TypeCheckResult = this.checker.check_index_access(array_type, index_type);
         if (result.success) { return result.result_type; }
+        // A base that implements `IndexView` at the index's type is viewed:
+        // `a[r]` is `a.view(r)`, a value of the implementation's `View`.
+        const view: mut ExpressionNode* = this.try_index_view(visitor, e, access, array_type, index_type);
+        if (view != null) {
+            access.desugared_call = view;
+            return view.resolved_type;
+        }
         // A type parameter a bound gives `Index` is indexed through that
         // bound where it is written: the desugar's call is answered by the
         // bound and records it, and every copy of the body carries that
@@ -852,6 +859,37 @@ type struct MemberResolver {
             return null;
         }
         return this.build_index_desugar(visitor, e, access);
+    }
+
+    /// The view desugar `a.view(i)` for `access`, where `ty`, the base's
+    /// type behind any references, implements `std::core::ops::IndexView`
+    /// at `index_ty`; null where it does not, which leaves `[]` to `Index`.
+    /// Once an implementation answers, the desugar is the access's whatever
+    /// its call reports: the view was what `[]` asked for.  Asked of
+    /// concrete types only - a base or index in the walked body's
+    /// parameters is indexed by `Index` alone.
+    try_index_view(mut &this, visitor: mut SemaVisitor*, e: ExpressionNode*, access: ArrayAccessExpr*,
+                   ty: TypeRef, index_ty: TypeRef) -> mut ExpressionNode* {
+        const view_id: DefId = this.ctx.generic_registry.wellknown(LangItem::IndexView);
+        if (!view_id.is_valid() || !index_ty.is_valid()) { return null; }
+        mut base_ty: TypeRef = ty;
+        mut t: Type* = this.arena.lookup(base_ty);
+        while (t != null && t.kind == TypeKind::Reference) {
+            base_ty = t.as_reference().referent;
+            t = this.arena.lookup(base_ty);
+        }
+        if (t == null) { return null; }
+        if (this.types.contains_generic_param(base_ty) || this.types.contains_generic_param(index_ty)) {
+            return null;
+        }
+        const index_args: [TypeRef] = [index_ty];
+        if (this.trait_checker().implementation_at(view_id, &index_args, base_ty) == null) { return null; }
+        const member: mut ExpressionNode* = this.lang_method_callee(access.array, LangItem::IndexViewView, e.span);
+        if (member == null) { return null; }
+        mut call: mut ExpressionNode* = ExpressionNode::call_expr(member, e.span);
+        ExpressionNode::call_of(call).add_argument(access.index);
+        visitor.resolve_expr(call);
+        return call;
     }
 
     /// The index desugar for a base that is a type parameter of the body

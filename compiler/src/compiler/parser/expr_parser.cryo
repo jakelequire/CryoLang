@@ -316,7 +316,26 @@ implement struct Parser {
     /// Pratt-style precedence-climbing binary expression parser.
     /// binary = cast ( binop binary )*
     parse_binary_expression(mut &this, min_prec: int) -> mut ExpressionNode* {
-        mut left: mut ExpressionNode* = this.parse_cast();
+        mut left: mut ExpressionNode* = null;
+        const range_precedence: int = this.current().kind.binary_precedence();
+        if (this.check(TokenType::DotDot) && min_prec <= range_precedence) {
+            // `..b` and `..`: a range open at its start, and one open at
+            // both ends.
+            const op: Token = this.advance();
+            if (this.at_range_end()) {
+                left = this.range_literal(LangItem::RangeFull, this.span_from_token(op), []);
+            } else {
+                const end: mut ExpressionNode* = this.parse_binary_expression(range_precedence + 1);
+                if (end == null) {
+                    this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION, "expected expression after `..`");
+                    return null;
+                }
+                left = this.range_literal(LangItem::RangeTo,
+                    Parser::merge_spans(this.span_from_token(op), end.span), [end]);
+            }
+        } else {
+            left = this.parse_cast();
+        }
         if (left == null || this.panic_mode) { return left; }
 
         // A left-associative operator chain (`a + b + c + ...`) is parsed
@@ -343,6 +362,11 @@ implement struct Parser {
             }
 
             const op: Token = this.advance();
+            if (op.kind == TokenType::DotDot && this.at_range_end()) {
+                left = this.range_literal(LangItem::RangeFrom,
+                    Parser::merge_spans(left.span, this.span_from_token(op)), [left]);
+                continue;
+            }
             const right: mut ExpressionNode* = this.parse_binary_expression(prec + 1);
             if (right == null) {
                 // `a < b >` with nothing an expression can start with after
@@ -391,31 +415,43 @@ implement struct Parser {
                 left = call;
             } else if (op.kind == TokenType::DotDot ||
                        op.kind == TokenType::DotDotEq) {
-                // `a..b`  => `Range::new(a, b)`
-                // `a..=b` => `RangeInclusive::new(a, b)`.  The range types
-                // are stdlib (`std::core::ops`); sema/codegen never see a
-                // dedicated range operator, just a static constructor call.
-                // The scope names the language's type by its definition, so a
-                // module declaring its own `Range` keeps its range literals.
                 const range_item: LangItem =
                     if (op.kind == TokenType::DotDotEq) { LangItem::RangeInclusive } else { LangItem::Range };
-                const ctor_scope: SymbolStr = this.ctx.intern(range_item.name());
-                const new_name: SymbolStr = this.ctx.intern("new");
-                const sr: mut ExpressionNode* = ExpressionNode::scope_resolution_expr(
-                    ctor_scope, new_name, span);
-                ExpressionNode::scope_resolution_of(sr).scope_res = ResSlot::Lang(range_item);
-                this.ctx.note_lang_ref(Node::Expr(sr), range_item);
-                mut call: mut ExpressionNode* =
-                    ExpressionNode::call_expr(sr, span);
-                ExpressionNode::call_of(call).add_argument(left);
-                ExpressionNode::call_of(call).add_argument(right);
-                left = call;
+                left = this.range_literal(range_item, span, [left, right]);
             } else {
                 left = ExpressionNode::binary_expr(op, left, right, span);
             }
         }
 
         return left;
+    }
+
+    /// A range literal, `item::new(operands...)`: `a..b` is `Range::new(a,
+    /// b)`, `a..=b` `RangeInclusive::new(a, b)`, `a..` `RangeFrom::new(a)`,
+    /// `..b` `RangeTo::new(b)` and `..` `RangeFull::new()`.  Sema and
+    /// codegen never see a range operator, only a static constructor call.
+    /// The scope names the language's type by its definition, so a module
+    /// declaring its own `Range` keeps its range literals.
+    range_literal(mut &this, item: LangItem, span: SourceSpan,
+                  operands: [mut ExpressionNode*]) -> mut ExpressionNode* {
+        const sr: mut ExpressionNode* = ExpressionNode::scope_resolution_expr(
+            this.ctx.intern(item.name()), this.ctx.intern("new"), span);
+        ExpressionNode::scope_resolution_of(sr).scope_res = ResSlot::Lang(item);
+        this.ctx.note_lang_ref(Node::Expr(sr), item);
+        mut call: mut ExpressionNode* = ExpressionNode::call_expr(sr, span);
+        for (mut i: i64 = 0; i < operands.length(); i++) {
+            ExpressionNode::call_of(call).add_argument(operands[i]);
+        }
+        return call;
+    }
+
+    /// Whether the token after a `..` closes the range there: what follows
+    /// it is no operand, so the range is open at that end.
+    at_range_end(&this) -> boolean {
+        const kind: TokenType = this.current().kind;
+        return kind == TokenType::RSquare || kind == TokenType::RParen
+            || kind == TokenType::Comma || kind == TokenType::Semicolon
+            || kind == TokenType::RBrace;
     }
 
     /// Parse cast expression: unary ( 'as' type )*

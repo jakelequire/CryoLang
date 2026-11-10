@@ -3008,7 +3008,11 @@ type struct SemaVisitor {
         const aa: mut ArrayAccessExpr* = ExpressionNode::array_access_of(place);
         if (aa != null) {
             if (aa.desugared_call != null) {
+                const viewed: boolean = this.view_desugar_member(aa.desugared_call) != null;
                 aa.desugared_call = this.writable_trait_read(aa.desugared_call);
+                // A view made writable is a value of another type (`mut
+                // &Slice<T>` where it read `&Slice<T>`).
+                if (viewed) { place.resolved_type = aa.desugared_call.resolved_type; }
             } else if (aa.array != null && this.indirection_access(aa.array).is_none()) {
                 aa.array = this.route_write(aa.array);
             }
@@ -3029,20 +3033,25 @@ type struct SemaVisitor {
         return place;
     }
 
-    /// The read `star`, `*(r.index(i))` or `*(r.deref())`, rebuilt as the
-    /// write `*(r.index_mutable(i))` or `*(r.deref_mutable())` and
-    /// resolved.  `star` itself where it is no such read, where `r` is not
+    /// The read `star`, `*(r.index(i))`, `*(r.deref())` or the view
+    /// `r.view(i)`, rebuilt as the write `*(r.index_mutable(i))`,
+    /// `*(r.deref_mutable())` or `r.view_mutable(i)` and resolved.  `star` itself where it is no such read, where `r` is not
     /// writable (the write's own check reports it), or where no declaration
     /// claims the writable trait.  An `r` that does not implement the
     /// writable trait is refused (E0229): its `[]` or `*` only reads.
     writable_trait_read(mut &this, star: mut ExpressionNode*) -> mut ExpressionNode* {
-        const member: MemberAccessExpr* = this.trait_desugar_member(star);
+        mut member: MemberAccessExpr* = this.trait_desugar_member(star);
+        const viewed: MemberAccessExpr* = this.view_desugar_member(star);
+        if (member == null) { member = viewed; }
         if (member == null) { return star; }
         const registry: GenericRegistry* = this.ctx.generic_registry;
         mut writer_trait: LangItem = LangItem::IndexMutable;
         mut writer: LangItem = LangItem::IndexMutableIndexMutable;
         mut written_through: string = "[]";
-        if (member.resolved_trait.equals(registry.wellknown(LangItem::Deref))) {
+        if (viewed != null) {
+            writer_trait = LangItem::IndexViewMutable;
+            writer = LangItem::IndexViewMutableViewMutable;
+        } else if (member.resolved_trait.equals(registry.wellknown(LangItem::Deref))) {
             writer_trait = LangItem::DerefMutable;
             writer = LangItem::DerefMutableDerefMutable;
             written_through = "*";
@@ -3073,15 +3082,40 @@ type struct SemaVisitor {
         }
         const callee: mut ExpressionNode* = this.member.lang_method_callee(member.object, writer, star.span);
         if (callee == null) { return star; }
-        const read: CallExpr* = ExpressionNode::call_of(ExpressionNode::unary_of(star).operand);
+        mut read: CallExpr* = ExpressionNode::call_of(star);
+        if (viewed == null) { read = ExpressionNode::call_of(ExpressionNode::unary_of(star).operand); }
         mut write: mut ExpressionNode* = ExpressionNode::call_expr(callee, star.span);
         for (mut i: i64 = 0; i < read.arguments.length(); i++) {
             ExpressionNode::call_of(write).add_argument(read.arguments[i]);
         }
-        const written: mut ExpressionNode* =
-            ExpressionNode::synthetic_unary(ExpressionNode::unary_of(star).op, write, star.span);
+        mut written: mut ExpressionNode* = write;
+        if (viewed == null) {
+            written = ExpressionNode::synthetic_unary(ExpressionNode::unary_of(star).op, write, star.span);
+        }
         if (!this.resolve_expr(written).is_valid()) { return star; }
         return written;
+    }
+
+    /// `a` of `place` where it is a view `a[r]` still read through
+    /// `a.view(r)`; null for any other expression.
+    view_receiver(&this, place: ExpressionNode*) -> ExpressionNode* {
+        const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(place);
+        if (aa == null || aa.desugared_call == null) { return null; }
+        const member: MemberAccessExpr* = this.view_desugar_member(aa.desugared_call);
+        if (member == null) { return null; }
+        return member.object;
+    }
+
+    /// The callee `r.view` of `call` where it is the desugar `r.view(i)` of
+    /// a `[]` that views; null for anything else.
+    view_desugar_member(&this, call: ExpressionNode*) -> MemberAccessExpr* {
+        const c: CallExpr* = ExpressionNode::call_of(call);
+        if (c == null) { return null; }
+        const member: MemberAccessExpr* = ExpressionNode::member_access_of(c.callee);
+        if (member == null || member.object == null) { return null; }
+        const view_id: DefId = this.ctx.generic_registry.wellknown(LangItem::IndexView);
+        if (!view_id.is_valid() || !member.resolved_trait.equals(view_id)) { return null; }
+        return member;
     }
 
     /// E0250 where a place inside `holder`, a value reached through no
@@ -3183,6 +3217,11 @@ type struct SemaVisitor {
     /// access the last indirection of `through`'s type gives, or the first
     /// one's when `outermost_only`.
     access_through_indirections(&this, through: ExpressionNode*, outermost_only: boolean) -> Option<PlaceAccess> {
+        // A view `a[r]` is written as `a.view_mutable(r)`, so a place
+        // reached through it is exactly as writable as `a`, whatever its
+        // read view's type says.
+        const viewed: ExpressionNode* = this.view_receiver(through);
+        if (viewed != null) { return Option::Some(this.access_within(viewed)); }
         mut last: Option<PlaceAccess> = Option::None;
         mut walk: Type* = this.arena.lookup(through.resolved_type);
         while (walk != null) {
