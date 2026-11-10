@@ -26,6 +26,7 @@ import std::process::signal::{ Signal };
 import std::fs::path::{ Path };
 import std::fs::file::{ File };
 import std::time::duration::{ Duration };
+import std::time::clock::{ Instant };
 import std::test::error::{ TestError };
 import std::test::assert::{ bail, expect, expect_eq, expect_false };
 
@@ -311,6 +312,46 @@ function signal_from_a_number_is_checked() -> Result<(), TestError> {
     return expect(Signal::from_i32(16).is_none(), Str::new("16 names none of the signals"));
 }
 
+/// `kill_tree` ends the grandchild too: the pipe the whole tree holds
+/// reaches end of file at once, not when the grandchild's five seconds
+/// are up.
+![test]
+function kill_tree_ends_the_childs_descendants() -> Result<(), TestError> {
+    mut cmd: Command = cmd_grandchild_holds_stdout();
+    cmd.stdout(Stdio::Piped).group_descendants();
+    mut child: Child = cmd.spawn().unwrap();
+    mut stdout: ChildStdout = child.stdout.take().unwrap();
+    mut seen: Array<u8> = Array::new();
+    mut chunk: [u8; 64];
+    while (!Str::from_raw(seen.as_ptr(), seen.length()).contains(&grandchild_marker())) {
+        const count: i64 = stdout.read(&chunk[0], 64).unwrap();
+        if (count == 0) { break; }
+        for (mut i: i64 = 0; i < count; i++) { seen.push(chunk[i]); }
+    }
+    const killed: Instant = Instant::now();
+    const outcome: Result<(), IoError> = child.kill_tree();
+    mem::drop(child.wait());
+    mut rest: Array<u8> = Array::new();
+    mem::drop(stdout.read_to_end(&rest));
+    const waited_for_end: Duration = killed.elapsed();
+    expect(outcome.is_ok(), Str::new("kill_tree succeeds on a grouped child"))?;
+    return expect(waited_for_end.as_millis() < 3000, Str::new("every holder of the pipe is gone at once"));
+}
+
+/// A child spawned without `group_descendants` has no tree to end.
+![test]
+function kill_tree_needs_a_grouped_child() -> Result<(), TestError> {
+    mut cmd: Command = cmd_sleep();
+    mut child: Child = cmd.spawn().unwrap();
+    const outcome: Result<(), IoError> = child.kill_tree();
+    mem::drop(child.kill());
+    mem::drop(child.wait());
+    match (outcome) {
+        Result::Ok(_)  => { return bail(Str::new("an ungrouped child has no tree")); }
+        Result::Err(e) => { return expect(e.kind == IoErrorKind::InvalidInput, Str::new("refused with InvalidInput")); }
+    }
+}
+
 /// A piped stdout is taken out of the running child and read while the
 /// child keeps running.
 ![test]
@@ -512,6 +553,28 @@ function cmd_print_then_wait() -> Command {
     c.arg(Str::new("/c")).arg(Str::new("echo ready& ping -n 6 127.0.0.1 >NUL"));
     return c;
 }
+
+// A child whose own child - the grandchild - writes `grandchild_marker()` to
+// the shared stdout and then holds it for about five seconds. The marker
+// comes from the grandchild, so once it is read the grandchild exists. The
+// shell waits for it rather than replacing itself, since a command follows.
+![target(unix)]
+function cmd_grandchild_holds_stdout() -> Command {
+    mut c: Command = Command::new(Str::new("/bin/sh"));
+    c.arg(Str::new("-c")).arg(Str::new("/bin/sh -c 'echo ready; exec sleep 5'; echo done"));
+    return c;
+}
+![target(windows)]
+function cmd_grandchild_holds_stdout() -> Command {
+    mut c: Command = Command::new(Str::new("cmd"));
+    c.arg(Str::new("/c")).arg(Str::new("ping -n 6 127.0.0.1& echo done"));
+    return c;
+}
+// ping's first line names the address in every display language.
+![target(unix)]
+function grandchild_marker() -> Str { return Str::new("ready"); }
+![target(windows)]
+function grandchild_marker() -> Str { return Str::new("127.0.0.1"); }
 
 // env() overrides reach the child. On Windows this exercises the
 // CreateProcessA environment-block builder (the parent process does not have

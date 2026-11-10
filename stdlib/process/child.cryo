@@ -4,7 +4,9 @@
 ///! the caller asked for. `wait` blocks until the child exits;
 ///! `join` is its async spelling; `try_wait` polls; `wait_timeout`
 ///! waits at most a given time; `kill` sends
-///! SIGKILL; `send_signal` sends any other. `ChildStdin` /
+///! SIGKILL; `send_signal` sends any other; `kill_tree` ends the child
+///! with everything it started, when it was spawned after
+///! `Command.group_descendants`. `ChildStdin` /
 ///! `ChildStdout` / `ChildStderr` implement `Write` / `Read` over a fd.
 ///!
 ///! Ownership: call `wait` (or `kill` then `wait`) before a `Child`
@@ -207,6 +209,31 @@ private function os_proc_signal(pid: i32, handle: u64, sig: i32) -> Result<(), I
         return Result::Err(IoError::last_os_error());
     }
     return Result::Ok(());
+}
+
+![target(unix)]
+private function os_proc_kill_tree(tree: u64) -> Result<(), IoError> {
+    // A negative pid names the process group.
+    if (libc::kill(-(tree as i32), Signal::kill().as_i32()) < 0) {
+        return Result::Err(IoError::last_os_error());
+    }
+    return Result::Ok(());
+}
+![target(windows)]
+private function os_proc_kill_tree(tree: u64) -> Result<(), IoError> {
+    if (syscall::TerminateJobObject(tree as u8*, 1) == 0) {
+        return Result::Err(IoError::last_os_error());
+    }
+    return Result::Ok(());
+}
+
+// A tree's job object is a HANDLE the `Child` owns; closing it leaves the
+// processes in the job running. A process group needs no release.
+![target(unix)]
+private function os_proc_release_tree(tree: u64) -> void { }
+![target(windows)]
+private function os_proc_release_tree(tree: u64) -> void {
+    if (tree != 0) { syscall::CloseHandle(tree as u8*); }
 }
 
 // Best-effort cleanup at `Child` drop.  POSIX: a non-blocking reap so an
@@ -431,6 +458,10 @@ private:
     // OS process HANDLE on Windows (for wait/kill/close); 0 on POSIX, where
     // `pid` is the joinable identity.
     handle: u64;
+    // The child's process tree when `Command.group_descendants` asked for
+    // one: the process group's id on POSIX, the job object's HANDLE on
+    // Windows; 0 otherwise.
+    tree: u64;
     waited: boolean;
 public:
     stdin: Option<ChildStdin>;
@@ -439,15 +470,18 @@ public:
 
     /// Low-level constructor used by `Command::spawn`. Application
     /// code should not call this directly. `handle` is 0 on POSIX and the
-    /// Win32 process HANDLE on Windows.
+    /// Win32 process HANDLE on Windows; `tree` is the process group id on
+    /// POSIX or the job HANDLE on Windows, and 0 for a child with no tree.
     static new(pid: i32,
                handle: u64,
+               tree: u64,
                stdin: Option<ChildStdin>,
                stdout: Option<ChildStdout>,
                stderr: Option<ChildStderr>) -> Child {
         return Child {
             pid: pid,
             handle: handle,
+            tree: tree,
             stdin: stdin,
             stdout: stdout,
             stderr: stderr,
@@ -549,6 +583,20 @@ public:
             return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
         }
         return os_proc_signal(this.pid, this.handle, sig.as_i32());
+    }
+
+    /// End the child and every process in its tree at once: SIGKILL to
+    /// the process group on POSIX, the job terminated on Windows. Does
+    /// not wait; call `wait` afterwards to reap the child.
+    ///
+    /// The tree exists only for a child spawned after
+    /// `Command.group_descendants`; for any other, and for a child already
+    /// waited for, this is `InvalidInput`.
+    kill_tree(&this) -> Result<(), IoError> {
+        if (this.tree == 0 || this.waited) {
+            return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
+        }
+        return os_proc_kill_tree(this.tree);
     }
 
     /// Close the child's stdin now, if it is still held, so the child sees
@@ -1156,5 +1204,7 @@ implement trait Drop for struct Child {
         // so a second drop is a no-op.
         os_proc_reap(this.pid, this.handle, this.waited);
         this.handle = 0;
+        os_proc_release_tree(this.tree);
+        this.tree = 0;
     }
 }

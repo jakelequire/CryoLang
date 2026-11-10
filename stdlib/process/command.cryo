@@ -77,6 +77,7 @@ public type struct Command {
     private args: Array<String>;
     private envs: Array<EnvEntry>;
     private clear_env_flag: boolean;
+    private group_descendants_flag: boolean;
     private current_directory: Option<String>;
     private stdin_cfg: Stdio;
     private stdout_cfg: Stdio;
@@ -91,6 +92,7 @@ public type struct Command {
             args: Array::new(),
             envs: Array::new(),
             clear_env_flag: false,
+            group_descendants_flag: false,
             current_directory: Option::None,
             stdin_cfg: Stdio::Inherit,
             stdout_cfg: Stdio::Inherit,
@@ -144,6 +146,19 @@ public type struct Command {
     /// with `env()` reach the child.
     public env_clear(mut &this) -> mut &Command {
         this.clear_env_flag = true;
+        return &this;
+    }
+
+    /// Start the child as the root of a process tree of its own - a new
+    /// process group on POSIX, a job object on Windows - that every
+    /// process it starts joins, so `Child.kill_tree` ends them all.
+    ///
+    /// A descendant that leaves the tree on purpose (POSIX `setsid` or
+    /// `setpgid`, a Windows job breakaway) is beyond its reach. On POSIX
+    /// the new group is no longer the terminal's foreground group, so the
+    /// terminal's Ctrl-C reaches the parent and not the child.
+    public group_descendants(mut &this) -> mut &Command {
+        this.group_descendants_flag = true;
         return &this;
     }
 
@@ -663,9 +678,14 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
         // so the child performs no allocation and never calls
         // setenv/clearenv (which are NOT async-signal-safe).
         fd::close_fd(failure_pipe.read_end);
-        if (!child_remap(cmd.stdin_cfg, &stdin_pipe, 0, true)) { report_spawn_failure(failure_pipe.write_end, SPAWN_STEP_STDIO); }
-        if (!child_remap(cmd.stdout_cfg, &stdout_pipe, 1, false)) { report_spawn_failure(failure_pipe.write_end, SPAWN_STEP_STDIO); }
-        if (!child_remap(cmd.stderr_cfg, &stderr_pipe, 2, false)) { report_spawn_failure(failure_pipe.write_end, SPAWN_STEP_STDIO); }
+        // The child leads a new group, so a signal to the group reaches
+        // everything it starts.
+        if (cmd.group_descendants_flag && libc::setpgid(0, 0) < 0) {
+            report_spawn_failure(failure_pipe.write_end, SPAWN_STEP_SETUP);
+        }
+        if (!child_remap(cmd.stdin_cfg, &stdin_pipe, 0, true)) { report_spawn_failure(failure_pipe.write_end, SPAWN_STEP_SETUP); }
+        if (!child_remap(cmd.stdout_cfg, &stdout_pipe, 1, false)) { report_spawn_failure(failure_pipe.write_end, SPAWN_STEP_SETUP); }
+        if (!child_remap(cmd.stderr_cfg, &stderr_pipe, 2, false)) { report_spawn_failure(failure_pipe.write_end, SPAWN_STEP_SETUP); }
 
         // cwd change.
         match (cwd_cstr) {
@@ -793,12 +813,16 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
     // The argument strings + pointer array fall out of scope at function
     // exit; the synthesized drops release them.  The child has its own COW
     // copies, which are either replaced by exec or abandoned on _exit.
-    return Result::Ok(Child::new(pid, 0, stdin_handle, stdout_handle, stderr_handle));
+    // A grouped child leads the group numbered by its own pid; it joined
+    // it before exec, which the failure pipe's end of file follows.
+    mut tree: u64 = 0;
+    if (cmd.group_descendants_flag) { tree = pid as u64; }
+    return Result::Ok(Child::new(pid, 0, tree, stdin_handle, stdout_handle, stderr_handle));
 }
 
 // The step a forked child failed at, written to the failure pipe before
 // its `errno`.
-private const SPAWN_STEP_STDIO:     i32 = 0;
+private const SPAWN_STEP_SETUP:     i32 = 0;
 private const SPAWN_STEP_DIRECTORY: i32 = 1;
 private const SPAWN_STEP_EXEC:      i32 = 2;
 
@@ -860,6 +884,7 @@ private function clone_command(cmd: &Command) -> Command {
         args: Array::new(),
         envs: Array::new(),
         clear_env_flag: cmd.clear_env_flag,
+        group_descendants_flag: cmd.group_descendants_flag,
         current_directory: Option::None,
         stdin_cfg: cmd.stdin_cfg,
         stdout_cfg: cmd.stdout_cfg,
@@ -1327,8 +1352,12 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
         env_ptr = env_block.as_ptr();
     }
 
+    // A grouped child starts suspended, so it is in its job before it can
+    // start anything of its own.
+    mut creation_flags: u32 = 0;
+    if (cmd.group_descendants_flag) { creation_flags = syscall::CREATE_SUSPENDED; }
     const ok: i32 = syscall::CreateProcessA(null, cmdline.as_ptr(), null, null,
-                                            1, 0, env_ptr, cwd_ptr, &si, &pi);
+                                            1, creation_flags, env_ptr, cwd_ptr, &si, &pi);
     // Read before the closes below can overwrite it; used only on failure.
     const create_error: IoError = IoError::last_os_error();
 
@@ -1353,6 +1382,25 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
         const in_directory: boolean = create_error.os_code == syscall::ERROR_DIRECTORY as i32;
         return Result::Err(spawn_error(cmd, create_error, in_directory));
     }
+
+    mut job: u8* = null;
+    if (cmd.group_descendants_flag) {
+        job = syscall::CreateJobObjectA(null, null);
+        if (job == null || syscall::AssignProcessToJobObject(job, pi.hProcess) == 0) {
+            // The child has run nothing yet: end it rather than hand back a
+            // child its caller asked to be able to end with its tree.
+            const job_error: IoError = IoError::last_os_error();
+            syscall::TerminateProcess(pi.hProcess, 1);
+            if (job != null) { syscall::CloseHandle(job); }
+            syscall::CloseHandle(pi.hThread);
+            syscall::CloseHandle(pi.hProcess);
+            if (sin.parent_fd  >= 0) { fd::close_fd(sin.parent_fd); }
+            if (sout.parent_fd >= 0) { fd::close_fd(sout.parent_fd); }
+            if (serr.parent_fd >= 0) { fd::close_fd(serr.parent_fd); }
+            return Result::Err(spawn_error(cmd, job_error, false));
+        }
+        syscall::ResumeThread(pi.hThread);
+    }
     syscall::CloseHandle(pi.hThread);
 
     mut stdin_handle:  Option<ChildStdin>  = Option::None;
@@ -1362,7 +1410,7 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
     if (sout.parent_fd >= 0) { stdout_handle = Option::Some(ChildStdout::from_fd(sout.parent_fd)); }
     if (serr.parent_fd >= 0) { stderr_handle = Option::Some(ChildStderr::from_fd(serr.parent_fd)); }
 
-    return Result::Ok(Child::new(pi.dwProcessId as i32, pi.hProcess as u64,
+    return Result::Ok(Child::new(pi.dwProcessId as i32, pi.hProcess as u64, job as u64,
                                  stdin_handle, stdout_handle, stderr_handle));
 }
 
