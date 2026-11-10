@@ -5237,6 +5237,27 @@ type struct SemaVisitor {
         mut owner_method: boolean = false;
         const owner_value: TypeRef = this.calls.generic_owner_method_value(e, scope, found, &owner_method);
         if (owner_method) { return owner_value; }
+        // A method a primitive or an enum has from an `implement` block -
+        // `i64::compare` from `Ord for i64` - is not in a body the index
+        // walks for `scope_method`; it is in the type's method family, where
+        // a path call finds it, and its entry's signature is the value's
+        // type, receiver first.  An enum's variant of the name is the
+        // variant, never a method.
+        if (found.is_valid() && recv_m == null) {
+            const found_type: Type* = this.arena.lookup(found);
+            const names_variant: boolean = found_type != null && found_type.kind == TypeKind::Enum
+                && found_type.as_enum().variant_index(scope.member_name) >= 0;
+            if (!names_variant) {
+                const family: [OverloadId] = this.ctx.decl_index.lookup_family_entries(
+                    FamilyOwner::Type(found), scope.member_name);
+                if (family.length() > 0) {
+                    const entry_ft: TypeRef = this.ctx.decl_index.entry_signature(family[0]);
+                    if (entry_ft.is_valid() && !this.types.contains_generic_param(entry_ft)) {
+                        return this.calls.pin_scope_value_static_method(e, scope, found, entry_ft);
+                    }
+                }
+            }
+        }
         if (found.is_valid() && this.scope_member_binds_type(found, scope)) {
             this.validate_enum_scope_member(e, found, scope);
             // Type arguments written on the path (`Option::<i32>::None`,
@@ -5319,7 +5340,9 @@ type struct SemaVisitor {
             fmt::format("cannot find value `%s` in this scope", path_str));
         miss = miss.at_with_label(e.span, "not found in this scope");
         this.ctx.emit_diagnostic(miss);
-        return found;
+        // The path names no value: it has no type, not its qualifier's,
+        // which a caller would check as the value and report again.
+        return TypeRef::invalid();
     }
 
     /// The type of the constant the path `T::NAME` names, when `T` is a type
