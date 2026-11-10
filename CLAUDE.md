@@ -520,7 +520,12 @@ with no diff to check it against.
   makes a new one removes those beyond the six used most recently, never one
   used within the hour (a concurrent build may be about to link it). The
   archive is built in place under `<key>.lock` and opens only once its
-  manifest, renamed into place last, is there. Its stdlib modules'
+  manifest, renamed into place last, is there. The archive's build is the
+  only build that analyses the stdlib's own bodies, so a warning in the
+  stdlib is printed by the build that MAKES the archive and by no other -
+  and is not in that build's own warning count. A clean-build warning check
+  that is meant to cover the stdlib removes `stdlib/.bin/<triple>/prebuilt`
+  first, and reads the output for `warning[`. Its stdlib modules'
   objects hold only the generic instances the archive lacks, and one left
   with nothing writes no object. verify hashes the archives as a third population (`stdlib`); a
   baseline compiler that links none leaves that population empty and its
