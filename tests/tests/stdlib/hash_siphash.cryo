@@ -1,0 +1,105 @@
+///! SipHash: the reference vectors for SipHash-2-4 (key 00..0f, message
+///! 00..n-1), the byte, word and bulk paths agreeing at every split, the
+///! key changing the hash, and a map keyed by it working through growth.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::HashSipHash;
+
+import std::core::hash::{ Hasher, SipHasher };
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::collections::array::{ Array };
+import std::collections::hashmap::{ HashMap };
+import std::collections::str::{ Str };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_eq };
+
+const KEY0: u64 = 0x0706050403020100;
+const KEY1: u64 = 0x0f0e0d0c0b0a0908;
+
+/// SipHash-2-4 of the bytes 0, 1, .., length - 1, one byte at a time.
+function reference_message_bytewise(length: u8) -> u64 {
+    mut hasher: SipHasher = SipHasher::with_keys_2_4(KEY0, KEY1);
+    for (mut i: u8 = 0; i < length; i++) {
+        hasher.write_u8(i);
+    }
+    return hasher.finish();
+}
+
+/// The same message, split after `split` bytes, each part through
+/// `write_bytes`.
+function reference_message_bulk(length: u8, split: i64) -> u64 {
+    mut bytes: Array<u8> = Array::new();
+    for (mut i: u8 = 0; i < length; i++) {
+        bytes.push(i);
+    }
+    mut hasher: SipHasher = SipHasher::with_keys_2_4(KEY0, KEY1);
+    hasher.write_bytes(bytes.as_slice().subslice(0, split));
+    hasher.write_bytes(bytes.as_slice().subslice(split, bytes.length()));
+    return hasher.finish();
+}
+
+![test]
+function siphash_2_4_matches_the_reference_vectors() -> Result<(), TestError> {
+    expect_eq(reference_message_bytewise(0), 0x726fdb47dd0e0e31)?;
+    expect_eq(reference_message_bytewise(1), 0x74f839c593dc67fd)?;
+    return expect_eq(reference_message_bytewise(15), 0xa129ca6149be45e5);
+}
+
+![test]
+function bulk_writes_agree_with_bytewise_at_every_split() -> Result<(), TestError> {
+    for (mut length: u8 = 0; length < 40; length++) {
+        const want: u64 = reference_message_bytewise(length);
+        const limit: i64 = length;
+        for (mut split: i64 = 0; split <= limit; split++) {
+            expect_eq(reference_message_bulk(length, split), want)?;
+        }
+    }
+    return expect_eq(reference_message_bulk(15, 3), 0xa129ca6149be45e5);
+}
+
+![test]
+function a_word_written_whole_or_bytewise_hashes_the_same() -> Result<(), TestError> {
+    mut whole: SipHasher = SipHasher::with_keys_1_3(KEY0, KEY1);
+    whole.write_uint(0x0807060504030201, 8);
+    whole.write_uint(0x0a09, 2);
+    mut bytewise: SipHasher = SipHasher::with_keys_1_3(KEY0, KEY1);
+    for (mut i: u8 = 1; i <= 10; i++) {
+        bytewise.write_u8(i);
+    }
+    expect_eq(whole.finish(), bytewise.finish())?;
+    mut shifted: SipHasher = SipHasher::with_keys_1_3(KEY0, KEY1);
+    shifted.write_u8(1);
+    shifted.write_uint(0x0908070605040302, 8);
+    shifted.write_u8(10);
+    return expect_eq(shifted.finish(), bytewise.finish());
+}
+
+![test]
+function the_key_and_the_round_counts_change_the_hash() -> Result<(), TestError> {
+    mut one: SipHasher = SipHasher::with_keys_1_3(KEY0, KEY1);
+    mut other_key: SipHasher = SipHasher::with_keys_1_3(KEY0, KEY1 + 1);
+    mut standard: SipHasher = SipHasher::with_keys_2_4(KEY0, KEY1);
+    one.write_bytes(Str::new("same input").as_bytes());
+    other_key.write_bytes(Str::new("same input").as_bytes());
+    standard.write_bytes(Str::new("same input").as_bytes());
+    expect(one.finish() != other_key.finish(), Str::new("another key, another hash"))?;
+    expect(one.finish() != standard.finish(), Str::new("1-3 is not 2-4"))?;
+    mut again: SipHasher = SipHasher::with_keys_1_3(KEY0, KEY1);
+    again.write_bytes(Str::new("same input").as_bytes());
+    return expect_eq(again.finish(), one.finish());
+}
+
+![test]
+function a_keyed_map_finds_every_entry_through_growth() -> Result<(), TestError> {
+    mut map: HashMap<i64, i64> = HashMap::new();
+    for (mut i: i64 = 0; i < 2000; i++) {
+        map.insert(i * 7919, i);
+    }
+    expect_eq(map.length(), 2000)?;
+    for (mut i: i64 = 0; i < 2000; i++) {
+        expect_eq(map.get(&(i * 7919)).unwrap(), i)?;
+    }
+    const absent: i64 = 1;
+    return expect(map.get(&absent).is_none(), Str::new("absent key"));
+}

@@ -2,12 +2,11 @@
 ///!
 ///! Separate chaining over a bucket array: each bucket holds a linked
 ///! list of entries. Keys must implement `Hash + Eq`. The hasher is
-///! FNV-1a (`core::hash::DefaultHasher`) seeded per map from a
-///! per-process random value, so bucket placement varies between runs
-///! and adversarial keys cannot be pre-computed to flood one bucket.
-///! FNV-1a is not collision-resistant, so this is hardening, not a
-///! cryptographic guarantee; supply a custom hasher where that matters.
-///! `with_seed` fixes the seed for tests needing reproducible layout.
+///! SipHash-1-3 (`core::hash::SipHasher`) with a 128-bit key of its own
+///! for each map, drawn from a per-process secret, so which keys collide
+///! cannot be worked out without the key and adversarial keys cannot be
+///! chosen to flood one bucket. `with_seed` fixes the key, derived from
+///! the seed, for tests needing reproducible layout.
 ///!
 ///! Chaining was chosen over open addressing because it sidesteps the
 ///! problem of storing uninitialised key/value slots. The cost is one
@@ -20,7 +19,7 @@ import std::core::intrinsics;
 import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::core::cmp::{ Eq };
-import std::core::hash::{ DefaultHasher, Hash };
+import std::core::hash::{ Hash, SipHasher };
 import std::core::drop::{ Drop };
 import std::core::clone::{ Clone };
 import std::core::default::{ Default };
@@ -34,27 +33,26 @@ import std::ffi::libc;
 
 private const INITIAL_BUCKETS: u64 = 8;
 
-// Per-process HashMap seed generator (RandomState-style).
+// Per-process HashMap key generator.
 //
-// A fresh `HashMap` adopts a random seed so an attacker who controls the keys
-// cannot pre-compute a flood of entries that all land in one bucket (a
-// hash-flooding DoS): the bucket a key maps to now varies unpredictably between
-// processes. FNV-1a is not collision-resistant regardless, so this is hardening
-// rather than a cryptographic guarantee; for adversarial workloads supply a
-// custom `Hasher`.
+// Each `HashMap` hashes with SipHash under a key of its own, so an attacker who
+// controls the keys cannot pick a flood of entries that all land in one bucket
+// (a hash-flooding DoS): without the key, which inputs collide is not known.
 //
-// The seed is drawn from the kernel CSPRNG ONCE per process, then advanced with
-// a SplitMix64 step for each map - distinct, well-mixed seeds without a
-// `getrandom` syscall per `HashMap::new()` (the compiler alone builds thousands
-// of maps). `DefaultHasher::new()` and `fnv1a_*` are deliberately left on the
-// fixed FNV offset basis: the build fingerprint / manifest input hash fold
-// through them and MUST stay reproducible across processes.
+// Two words are drawn from the kernel CSPRNG ONCE per process: a SplitMix64
+// state advanced for each key word, and a word mixed into every map's second
+// key word, so the keys rest on 128 secret bits without a `getrandom` syscall
+// per `HashMap::new()` (the compiler alone builds thousands of maps).
+// `DefaultHasher::new()` and `digest` are deliberately left on the fixed FNV
+// offset basis: the build fingerprint / manifest input hash fold through them
+// and MUST stay reproducible across processes.
 //
 // The read-modify-write of the global state is not synchronized: a race between
-// threads can at worst hand two maps the same seed or draw the OS seed twice
-// (last write wins) - both benign, costing only a little per-map seed diversity.
+// threads can at worst hand two maps the same key word or draw the OS words
+// twice (last write wins) - both benign, costing only a little key diversity.
 private mut g_seed_initialized: boolean = false;
 private mut g_seed_state:       u64     = 0;
+private mut g_seed_high:        u64     = 0;
 
 // SplitMix64 constants: an odd increment (fractional golden ratio) plus the two
 // finalizer multipliers.
@@ -68,6 +66,7 @@ private function next_map_seed() -> u64 {
     if (!g_seed_initialized) {
         mut rng: SecureRng = SecureRng::new();
         g_seed_state = rng.next_64();
+        g_seed_high = rng.next_64();
         g_seed_initialized = true;
     }
     g_seed_state = g_seed_state + SEED_GAMMA;
@@ -92,11 +91,11 @@ public type struct HashMap<K, V, A = GlobalAlloc> where A: Allocator {
     private bucket_count: u64;
     private length: i64;
     private alloc: A;
-    /// Per-map hash seed (initial `DefaultHasher` state). Drawn from the
-    /// process seed generator (`next_map_seed`) so bucket placement is
-    /// unpredictable between runs; fixed via `with_seed*` for tests that
-    /// need reproducible iteration/layout.
-    private seed: u64;
+    /// The map's 128-bit SipHash key. Drawn from the process key generator
+    /// (`next_map_seed`) so bucket placement is unpredictable; fixed via
+    /// `with_seed*` for tests that need reproducible iteration/layout.
+    private key0: u64;
+    private key1: u64;
 
     public static new() -> HashMap<K, V, GlobalAlloc> {
         return HashMap::<K, V, GlobalAlloc> {
@@ -104,7 +103,8 @@ public type struct HashMap<K, V, A = GlobalAlloc> where A: Allocator {
             bucket_count: 0,
             length: 0,
             alloc: GlobalAlloc::new(),
-            seed: next_map_seed()
+            key0: next_map_seed(),
+            key1: next_map_seed() ^ g_seed_high
         };
     }
 
@@ -114,21 +114,23 @@ public type struct HashMap<K, V, A = GlobalAlloc> where A: Allocator {
             bucket_count: 0,
             length: 0,
             alloc: alloc,
-            seed: next_map_seed()
+            key0: next_map_seed(),
+            key1: next_map_seed() ^ g_seed_high
         };
     }
 
-    /// Construct an empty map with an explicit, fixed hash seed instead of a
-    /// random one. Intended for tests and any caller that needs reproducible
+    /// Construct an empty map whose key is fixed by `seed` instead of
+    /// random. Intended for tests and any caller that needs reproducible
     /// bucket placement / iteration order; production code should prefer
-    /// `new` so the seed stays unpredictable.
+    /// `new` so the key stays unpredictable.
     public static with_seed(seed: u64) -> HashMap<K, V, GlobalAlloc> {
         return HashMap::<K, V, GlobalAlloc> {
             buckets: null,
             bucket_count: 0,
             length: 0,
             alloc: GlobalAlloc::new(),
-            seed: seed
+            key0: seed,
+            key1: seed ^ SEED_GAMMA
         };
     }
 
@@ -139,8 +141,16 @@ public type struct HashMap<K, V, A = GlobalAlloc> where A: Allocator {
             bucket_count: 0,
             length: 0,
             alloc: alloc,
-            seed: seed
+            key0: seed,
+            key1: seed ^ SEED_GAMMA
         };
+    }
+
+    /// `key`'s hash under this map's SipHash key.
+    private hash_of(&this, key: &K) -> u64 where K: Hash {
+        mut hasher: SipHasher = SipHasher::with_keys_1_3(this.key0, this.key1);
+        key.hash(&hasher);
+        return hasher.finish();
     }
 
     /// Preallocate for at least `capacity` entries at the default load
@@ -301,7 +311,7 @@ public type struct HashMap<K, V, A = GlobalAlloc> where A: Allocator {
         if (this.bucket_count == 0) {
             return Option::None;
         }
-        const h: u64 = hash_key(key, this.seed);
+        const h: u64 = this.hash_of(key);
         const index: u64 = h & (this.bucket_count - 1);
         mut node: Entry<K, V>* = this.buckets[index];
         loop {
@@ -328,7 +338,7 @@ public type struct HashMap<K, V, A = GlobalAlloc> where A: Allocator {
         if (this.bucket_count == 0) {
             return Option::None;
         }
-        const h: u64 = hash_key(key, this.seed);
+        const h: u64 = this.hash_of(key);
         const index: u64 = h & (this.bucket_count - 1);
         mut node: Entry<K, V>* = this.buckets[index];
         loop {
@@ -348,7 +358,7 @@ public type struct HashMap<K, V, A = GlobalAlloc> where A: Allocator {
         if (this.bucket_count == 0) {
             return Option::None;
         }
-        const h: u64 = hash_key(key, this.seed);
+        const h: u64 = this.hash_of(key);
         const index: u64 = h & (this.bucket_count - 1);
         mut node: mut Entry<K, V>* = this.buckets[index];
         loop {
@@ -382,7 +392,7 @@ public type struct HashMap<K, V, A = GlobalAlloc> where A: Allocator {
             this.resize_buckets(this.bucket_count * 2)?;
         }
 
-        const h: u64 = hash_key(&key, this.seed);
+        const h: u64 = this.hash_of(&key);
         const index: u64 = h & (this.bucket_count - 1);
         mut node: mut Entry<K, V>* = this.buckets[index];
         loop {
@@ -440,7 +450,7 @@ public type struct HashMap<K, V, A = GlobalAlloc> where A: Allocator {
         } else if (this.length as u64 >= this.bucket_count) {
             this.resize_buckets(this.bucket_count * 2)?;
         }
-        const h: u64 = hash_key(&key, this.seed);
+        const h: u64 = this.hash_of(&key);
         const index: u64 = h & (this.bucket_count - 1);
         mut node: mut Entry<K, V>* = this.buckets[index];
         loop {
@@ -481,7 +491,7 @@ public type struct HashMap<K, V, A = GlobalAlloc> where A: Allocator {
         if (this.bucket_count == 0) {
             return Option::None;
         }
-        const h: u64 = hash_key(key, this.seed);
+        const h: u64 = this.hash_of(key);
         const index: u64 = h & (this.bucket_count - 1);
 
         // `cursor` always points to the pointer-slot that links to the
@@ -799,16 +809,6 @@ implement<K, V> trait Iterator<mut V*> for struct ValuesMutableIter<K, V> {
     }
 }
 
-// Hashing helper
-
-private function hash_key<K>(key: &K, seed: u64) -> u64
-where K: Hash {
-    // Start the fold from the map's seed rather than the fixed FNV offset
-    // basis, so a map's bucket placement depends on its (random) seed.
-    mut hasher: DefaultHasher = DefaultHasher::from_state(seed);
-    key.hash(&hasher);
-    return hasher.finish();
-}
 
 // HashMap takes a `&K` and runs the `Hash` trait itself, so it does not use
 // `hash_int`; a string's hash is `core::hash::digest`.

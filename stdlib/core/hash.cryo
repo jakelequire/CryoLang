@@ -214,6 +214,152 @@ implement trait Hasher for struct Fnv128Hasher {
     }
 }
 
+/// SipHash, a keyed hash: without the 128-bit key, which inputs collide
+/// cannot be worked out, so a map keyed this way keeps its buckets even when
+/// its keys come from someone hostile (request headers, JSON object keys).
+/// `with_keys_1_3` is SipHash-1-3, the form `HashMap` uses: one compression
+/// round per eight bytes and three to finish. `with_keys_2_4` is SipHash-2-4,
+/// the form the algorithm's authors give as the standard one, at about half
+/// the speed. Bytes are read in eight-byte little-endian words, and the
+/// total length is folded into the last.
+public type struct SipHasher {
+    private v0: u64;
+    private v1: u64;
+    private v2: u64;
+    private v3: u64;
+    /// The bytes since the last full word, low byte first.
+    private pending: u64;
+    private pending_length: u64;
+    private length: u64;
+    private compression_rounds: u64;
+    private finalization_rounds: u64;
+
+    public static with_keys_1_3(key0: u64, key1: u64) -> SipHasher {
+        return SipHasher::keyed(key0, key1, 1, 3);
+    }
+
+    public static with_keys_2_4(key0: u64, key1: u64) -> SipHasher {
+        return SipHasher::keyed(key0, key1, 2, 4);
+    }
+
+    private static keyed(key0: u64, key1: u64, compression_rounds: u64, finalization_rounds: u64) -> SipHasher {
+        return SipHasher {
+            v0: key0 ^ 0x736f6d6570736575,
+            v1: key1 ^ 0x646f72616e646f6d,
+            v2: key0 ^ 0x6c7967656e657261,
+            v3: key1 ^ 0x7465646279746573,
+            pending: 0,
+            pending_length: 0,
+            length: 0,
+            compression_rounds: compression_rounds,
+            finalization_rounds: finalization_rounds,
+        };
+    }
+
+    /// One SipRound over the four state words.
+    private round(mut &this) -> void {
+        this.v0 = this.v0 + this.v1;
+        this.v1 = this.v1.rotate_left(13);
+        this.v1 = this.v1 ^ this.v0;
+        this.v0 = this.v0.rotate_left(32);
+        this.v2 = this.v2 + this.v3;
+        this.v3 = this.v3.rotate_left(16);
+        this.v3 = this.v3 ^ this.v2;
+        this.v0 = this.v0 + this.v3;
+        this.v3 = this.v3.rotate_left(21);
+        this.v3 = this.v3 ^ this.v0;
+        this.v2 = this.v2 + this.v1;
+        this.v1 = this.v1.rotate_left(17);
+        this.v1 = this.v1 ^ this.v2;
+        this.v2 = this.v2.rotate_left(32);
+    }
+
+    /// Mix one eight-byte word into the state: the message word and the
+    /// final length word go through the same step.
+    private absorb(mut &this, word: u64) -> void {
+        this.v3 = this.v3 ^ word;
+        for (mut i: u64 = 0; i < this.compression_rounds; i++) {
+            this.round();
+        }
+        this.v0 = this.v0 ^ word;
+    }
+}
+
+implement trait Hasher for struct SipHasher {
+    write_u8(mut &this, value: u8) -> void {
+        const byte: u64 = value;
+        this.pending = this.pending | (byte << (8 * this.pending_length));
+        this.pending_length = this.pending_length + 1;
+        this.length = this.length + 1;
+        if (this.pending_length == 8) {
+            this.absorb(this.pending);
+            this.pending = 0;
+            this.pending_length = 0;
+        }
+    }
+
+    /// A whole word arriving on a word boundary is absorbed at once; any
+    /// other width goes a byte at a time.
+    write_uint(mut &this, value: u128, byte_count: u32) -> void {
+        if (byte_count == 8 && this.pending_length == 0) {
+            this.length = this.length + 8;
+            this.absorb(value as u64);
+            return;
+        }
+        mut rest: u128 = value;
+        for (mut i: u32 = 0; i < byte_count; i++) {
+            this.write_u8((rest & 0xFF) as u8);
+            rest = rest >> 8;
+        }
+    }
+
+    /// Bytes up to a word boundary go one at a time, then whole eight-byte
+    /// words, then the rest one at a time.
+    write_bytes(mut &this, bytes: &Slice<u8>) -> void {
+        const data: u8* = bytes.as_ptr();
+        const count: i64 = bytes.length();
+        mut at: i64 = 0;
+        while (at < count && this.pending_length != 0) {
+            this.write_u8(data[at]);
+            at++;
+        }
+        while (count - at >= 8) {
+            mut word: u64 = 0;
+            for (mut k: i64 = 7; k >= 0; k--) {
+                const byte: u64 = data[at + k];
+                word = (word << 8) | byte;
+            }
+            this.length = this.length + 8;
+            this.absorb(word);
+            at += 8;
+        }
+        while (at < count) {
+            this.write_u8(data[at]);
+            at++;
+        }
+    }
+
+    finish(&this) -> u64 {
+        mut state: SipHasher = SipHasher {
+            v0: this.v0,
+            v1: this.v1,
+            v2: this.v2,
+            v3: this.v3,
+            pending: this.pending,
+            pending_length: this.pending_length,
+            length: this.length,
+            compression_rounds: this.compression_rounds,
+            finalization_rounds: this.finalization_rounds,
+        };
+        state.absorb(((this.length & 0xFF) << 56) | this.pending);
+        state.v2 = state.v2 ^ 0xFF;
+        for (mut i: u64 = 0; i < state.finalization_rounds; i++) {
+            state.round();
+        }
+        return state.v0 ^ state.v1 ^ state.v2 ^ state.v3;
+    }
+}
+
 // One-shot digest
 //
 // The canonical single-value digest: fold a value's bytes through a fresh
