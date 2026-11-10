@@ -8,6 +8,8 @@ namespace std::core::result;
 import std::core::intrinsics;
 import std::core::clone::{ Clone };
 import std::core::cmp::{ Eq };
+import std::core::default::{ Default };
+import std::core::mem;
 import std::core::option::{ Option };
 import std::core::convert::{ From };
 import std::core::ops::{ ControlFlow, FromResidual, Try };
@@ -103,7 +105,10 @@ implement enum Result<T, E> {
     public unwrap_or(&this, default_value: T) -> T {
         match (&this) {
             Result::Ok(value) => { return value; }
-            Result::Err(_) => { return default_value; }
+            Result::Err(error) => {
+                mem::drop(error);
+                return default_value;
+            }
         }
     }
 
@@ -148,20 +153,26 @@ implement enum Result<T, E> {
         }
     }
 
-    /// Project the success side to an `Option`, discarding the error.
+    /// Project the success side to an `Option`, releasing the error.
     ![sink]
     public ok(&this) -> Option<T> {
         match (&this) {
             Result::Ok(value) => { return Option::Some(value); }
-            Result::Err(_) => { return Option::None; }
+            Result::Err(error) => {
+                mem::drop(error);
+                return Option::None;
+            }
         }
     }
 
-    /// Project the error side to an `Option`, discarding the success.
+    /// Project the error side to an `Option`, releasing the value.
     ![sink]
     public err(&this) -> Option<E> {
         match (&this) {
-            Result::Ok(_) => { return Option::None; }
+            Result::Ok(value) => {
+                mem::drop(value);
+                return Option::None;
+            }
             Result::Err(err) => { return Option::Some(err); }
         }
     }
@@ -182,6 +193,117 @@ implement enum Result<T, E> {
             Result::Ok(_) => { return false; }
             Result::Err(inner) => { return inner.equals(error); }
         }
+    }
+
+    /// True when the result is `Ok` and the predicate holds for the value.
+    /// The value is lent to the predicate; the result keeps it.
+    public is_ok_and<P>(&this, predicate: P) -> boolean where P: (&T) -> boolean {
+        match (&this) {
+            Result::Ok(value) => { return predicate(&value); }
+            Result::Err(_) => { return false; }
+        }
+    }
+
+    /// True when the result is `Err` and the predicate holds for the error.
+    public is_err_and<P>(&this, predicate: P) -> boolean where P: (&E) -> boolean {
+        match (&this) {
+            Result::Ok(_) => { return false; }
+            Result::Err(error) => { return predicate(&error); }
+        }
+    }
+
+    /// The function applied to the value, or `default_value` for `Err`,
+    /// releasing the error.
+    ![sink]
+    public map_or<U, O>(&this, default_value: U, op: O) -> U where O: (T) -> U {
+        match (&this) {
+            Result::Ok(value) => { return op(value); }
+            Result::Err(error) => {
+                mem::drop(error);
+                return default_value;
+            }
+        }
+    }
+
+    /// The function applied to the value, or `default_op` applied to the
+    /// error.
+    ![sink]
+    public map_or_else<U, D, O>(&this, default_op: D, op: O) -> U where D: (E) -> U, O: (T) -> U {
+        match (&this) {
+            Result::Ok(value) => { return op(value); }
+            Result::Err(error) => { return default_op(error); }
+        }
+    }
+
+    /// `other` when this result is `Ok`, releasing the value; this result's
+    /// error otherwise, releasing `other`.
+    ![sink]
+    public and<U>(&this, other: Result<U, E>) -> Result<U, E> {
+        match (&this) {
+            Result::Ok(value) => {
+                mem::drop(value);
+                return other;
+            }
+            Result::Err(error) => { return Result::Err(error); }
+        }
+    }
+
+    /// This result when it is `Ok`, releasing `other`; `other` otherwise,
+    /// releasing this result's error.
+    ![sink]
+    public or<F>(&this, other: Result<T, F>) -> Result<T, F> {
+        match (&this) {
+            Result::Ok(value) => { return Result::Ok(value); }
+            Result::Err(error) => {
+                mem::drop(error);
+                return other;
+            }
+        }
+    }
+
+    /// The value, or `T::default()` for `Err`, releasing the error.
+    ![sink]
+    public unwrap_or_default(&this) -> T where T: Default {
+        match (&this) {
+            Result::Ok(value) => { return value; }
+            Result::Err(error) => {
+                mem::drop(error);
+                return T::default();
+            }
+        }
+    }
+
+    /// Like `unwrap_err`, with a caller-supplied message for the `Ok` case.
+    ![sink]
+    public expect_err(&this, message: string) -> E {
+        match (&this) {
+            Result::Ok(_) => {
+                core::panic(message, intrinsics::location());
+            }
+            Result::Err(error) => { return error; }
+        }
+    }
+
+    /// Lend the value to `f` when the result is `Ok`, then give the result
+    /// back unchanged.
+    ![sink]
+    public inspect<F>(&this, f: F) -> Result<T, E> where F: (&T) -> void {
+        match (&this) {
+            Result::Ok(value) => { f(&value); }
+            Result::Err(_) => { }
+        }
+        return this;
+    }
+
+    /// Lend the error to `f` when the result is `Err`, then give the result
+    /// back unchanged.
+    ![sink]
+    public inspect_err<F>(&this, f: F) -> Result<T, E> where F: (&E) -> void {
+        match (&this) {
+            Result::Ok(_) => { }
+            Result::Err(error) => { f(&error); }
+        }
+        return this;
     }
 }
 

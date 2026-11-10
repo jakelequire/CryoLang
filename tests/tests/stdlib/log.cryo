@@ -1,0 +1,197 @@
+///! Logging: the default and per-area levels, the specification text, a
+///! program's own sink, the caller's location on a record, and a refused
+///! record's message never being formatted.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::Log;
+
+import std::core::intrinsics::{ Location };
+import std::core::intrinsics;
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::env;
+import std::fmt::display::{ Display, Formatter };
+import std::fmt::error::{ FmtError };
+import std::fmt::write::{ FmtWrite };
+import std::log::logger::{ Logger, Logging, LogSpecificationError };
+import std::log::record::{ LogLevel, LogRecord };
+import std::log::sink::{ LogSink };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_eq };
+
+mut recorded: Array<String> = Array::new();
+mut recorded_line: u32 = 0;
+mut formatted: i64 = 0;
+
+/// Keeps `level area: message` for each record, and the line it was
+/// logged at.
+type struct RecordingSink { }
+
+implement trait LogSink for struct RecordingSink {
+    write(&this, record: &LogRecord) -> void {
+        const area: Str = record.area;
+        mut line: String = String::new();
+        line.write(f"{record.level} {area}: ");
+        line.write(record.message);
+        recorded.push(line);
+        recorded_line = record.location.line();
+    }
+}
+
+const SINK: RecordingSink = RecordingSink { };
+
+/// Counts how often it is formatted.
+type struct Counted { }
+
+implement trait Display for struct Counted {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        formatted += 1;
+        return f.write_str(Str::new("counted"));
+    }
+}
+
+function record_into_sink() -> void {
+    Logging::set_sink(&SINK);
+}
+
+function expect_recorded(index: i64, want: string) -> Result<(), TestError> {
+    expect(index < recorded.length(), Str::new("too few records"))?;
+    return expect(recorded[index].as_str().equals(&Str::new(want)), recorded[index].as_str());
+}
+
+![test]
+function the_default_lets_warnings_and_errors_through() -> Result<(), TestError> {
+    record_into_sink();
+    const log: Logger = Logger::new(Str::new("app"));
+    log.error(f"disk {1} failed");
+    log.warning(f"slow");
+    log.information(f"started");
+    log.debug(f"detail");
+    log.trace(f"step");
+    expect_eq(recorded.length(), 2)?;
+    expect_recorded(0, "error app: disk 1 failed")?;
+    return expect_recorded(1, "warning app: slow");
+}
+
+![test]
+function set_level_moves_the_default() -> Result<(), TestError> {
+    record_into_sink();
+    Logging::set_level(LogLevel::Debug);
+    const log: Logger = Logger::new(Str::new("app"));
+    log.debug(f"detail");
+    log.trace(f"step");
+    expect_eq(recorded.length(), 1)?;
+    expect_recorded(0, "debug app: detail")?;
+    Logging::set_level(LogLevel::Error);
+    log.warning(f"slow");
+    return expect_eq(recorded.length(), 1);
+}
+
+![test]
+function an_area_level_covers_the_areas_below_it() -> Result<(), TestError> {
+    record_into_sink();
+    Logging::set_area_level(Str::new("http"), LogLevel::Trace);
+    Logger::new(Str::new("http")).trace(f"a");
+    Logger::new(Str::new("http::server")).trace(f"b");
+    Logger::new(Str::new("https")).trace(f"c");
+    Logger::new(Str::new("database")).information(f"d");
+    expect_eq(recorded.length(), 2)?;
+    expect_recorded(0, "trace http: a")?;
+    return expect_recorded(1, "trace http::server: b");
+}
+
+![test]
+function the_longest_area_setting_wins() -> Result<(), TestError> {
+    record_into_sink();
+    Logging::set_area_level(Str::new("http"), LogLevel::Trace);
+    Logging::set_area_level(Str::new("http::server"), LogLevel::Error);
+    Logger::new(Str::new("http::client")).debug(f"a");
+    Logger::new(Str::new("http::server")).warning(f"b");
+    Logger::new(Str::new("http::server::tls")).debug(f"c");
+    expect_eq(recorded.length(), 1)?;
+    expect_recorded(0, "debug http::client: a")?;
+    Logging::set_area_level(Str::new("http::server"), LogLevel::Debug);
+    Logger::new(Str::new("http::server")).debug(f"d");
+    expect_eq(recorded.length(), 2)?;
+    return expect_recorded(1, "debug http::server: d");
+}
+
+![test]
+function configure_reads_levels_and_areas() -> Result<(), TestError> {
+    record_into_sink();
+    expect(Logging::configure(Str::new(" Information , http = debug ,")).is_ok(), Str::new("a valid specification"))?;
+    const app: Logger = Logger::new(Str::new("app"));
+    const http: Logger = Logger::new(Str::new("http"));
+    expect(app.is_enabled(LogLevel::Information), Str::new("information by default"))?;
+    expect(!app.is_enabled(LogLevel::Debug), Str::new("no debug by default"))?;
+    expect(http.is_enabled(LogLevel::Debug), Str::new("debug for http"))?;
+    return expect(!http.is_enabled(LogLevel::Trace), Str::new("no trace for http"));
+}
+
+![test]
+function configure_applies_nothing_when_an_entry_is_unreadable() -> Result<(), TestError> {
+    record_into_sink();
+    const refused: Result<(), LogSpecificationError> = Logging::configure(Str::new("trace,http=loud"));
+    match (refused) {
+        Result::Ok(_) => { return expect(false, Str::new("an unknown level is refused")); }
+        Result::Err(error) => {
+            expect(error.entry.as_str().equals(&Str::new("http=loud")), error.entry.as_str())?;
+            const shown: String = f"{error}";
+            expect(shown.as_str().equals(&Str::new("unrecognized logging entry 'http=loud'")), shown.as_str())?;
+        }
+    }
+    expect(Logging::configure(Str::new("=debug")).is_err(), Str::new("an entry with no area"))?;
+    expect(Logging::configure(Str::new("verbose")).is_err(), Str::new("an unknown level alone"))?;
+    return expect(!Logger::new(Str::new("app")).is_enabled(LogLevel::Trace), Str::new("the trace before the bad entry is not applied"));
+}
+
+![test]
+function configure_from_environment_reads_the_variable() -> Result<(), TestError> {
+    record_into_sink();
+    env::remove_var(Str::new("CRYO_LOG_TEST_SPECIFICATION"));
+    expect(Logging::configure_from_environment(Str::new("CRYO_LOG_TEST_SPECIFICATION")).is_ok(), Str::new("unset is no change"))?;
+    expect(!Logger::new(Str::new("app")).is_enabled(LogLevel::Debug), Str::new("still the default"))?;
+    env::set_var(Str::new("CRYO_LOG_TEST_SPECIFICATION"), Str::new("debug"));
+    expect(Logging::configure_from_environment(Str::new("CRYO_LOG_TEST_SPECIFICATION")).is_ok(), Str::new("set"))?;
+    return expect(Logger::new(Str::new("app")).is_enabled(LogLevel::Debug), Str::new("debug from the environment"));
+}
+
+![test]
+function a_refused_record_is_never_formatted() -> Result<(), TestError> {
+    record_into_sink();
+    formatted = 0;
+    const log: Logger = Logger::new(Str::new("app"));
+    const value: Counted = Counted { };
+    log.debug(f"{value}");
+    expect_eq(formatted, 0)?;
+    log.error(f"{value}");
+    expect_eq(formatted, 1)?;
+    return expect_recorded(0, "error app: counted");
+}
+
+![test]
+function a_record_carries_the_line_of_the_logging_call() -> Result<(), TestError> {
+    record_into_sink();
+    const log: Logger = Logger::new(Str::new("app"));
+    const here: Location = intrinsics::location();
+    log.warning(f"here");
+    expect_eq(recorded_line, here.line() + 1)?;
+    const there: Location = intrinsics::location();
+    log.log(LogLevel::Error, f"there");
+    return expect_eq(recorded_line, there.line() + 1);
+}
+
+![test]
+function levels_parse_name_and_order() -> Result<(), TestError> {
+    expect(LogLevel::parse(Str::new("WARNING")).unwrap().equals(&LogLevel::Warning), Str::new("case is ignored"))?;
+    expect(LogLevel::parse(Str::new("info")).is_none(), Str::new("names are written out"))?;
+    expect(LogLevel::Trace.name().equals(&Str::new("trace")), Str::new("trace's name"))?;
+    expect(LogLevel::Warning.allows(&LogLevel::Error), Str::new("a warning setting passes errors"))?;
+    expect(LogLevel::Warning.allows(&LogLevel::Warning), Str::new("and warnings"))?;
+    expect(!LogLevel::Warning.allows(&LogLevel::Information), Str::new("but not information"))?;
+    const shown: String = f"{LogLevel::Information}";
+    return expect(shown.as_str().equals(&Str::new("information")), shown.as_str());
+}

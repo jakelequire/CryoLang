@@ -1,0 +1,128 @@
+///! Result combinators: predicates, map_or, and/or, unwrap_or_default,
+///! expect_err, inspect - and that every value or error one of them
+///! discards is released exactly once.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::ResultCombinators;
+
+import std::core::result::{ Result };
+import std::core::drop::{ Drop };
+import std::collections::str::{ Str };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_eq };
+
+mut released: i64 = 0;
+mut inspected: i32 = 0;
+
+type struct Counted {
+    tag: i64;
+}
+
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void {
+        released += this.tag;
+    }
+}
+
+function ok(value: i32) -> Result<i32, i32> {
+    return Result::Ok(value);
+}
+
+function err(error: i32) -> Result<i32, i32> {
+    return Result::Err(error);
+}
+
+![test]
+function is_ok_and_and_is_err_and_test_the_payload() -> Result<(), TestError> {
+    expect(ok(3).is_ok_and((x: &i32) -> boolean { return *x == 3; }), Str::new("Ok(3) is 3"))?;
+    expect(!ok(3).is_ok_and((x: &i32) -> boolean { return *x == 4; }), Str::new("Ok(3) is not 4"))?;
+    expect(!err(3).is_ok_and((x: &i32) -> boolean { return true; }), Str::new("Err is never ok-and"))?;
+    expect(err(7).is_err_and((e: &i32) -> boolean { return *e == 7; }), Str::new("Err(7) is 7"))?;
+    return expect(!ok(7).is_err_and((e: &i32) -> boolean { return true; }), Str::new("Ok is never err-and"));
+}
+
+![test]
+function map_or_and_map_or_else_pick_the_branch() -> Result<(), TestError> {
+    expect_eq(ok(4).map_or(0, (x: i32) -> i32 { return x * 10; }), 40)?;
+    expect_eq(err(4).map_or(-1, (x: i32) -> i32 { return x * 10; }), -1)?;
+    expect_eq(ok(5).map_or_else((e: i32) -> i32 { return -e; }, (x: i32) -> i32 { return x + 1; }), 6)?;
+    return expect_eq(err(5).map_or_else((e: i32) -> i32 { return -e; }, (x: i32) -> i32 { return x + 1; }), -5);
+}
+
+![test]
+function map_or_releases_the_error_it_discards() -> Result<(), TestError> {
+    released = 0;
+    const failed: Result<i32, Counted> = Result::Err(Counted { tag: 3 });
+    expect_eq(failed.map_or(-1, (x: i32) -> i32 { return x; }), -1)?;
+    return expect_eq(released, 3);
+}
+
+![test]
+function and_or_pick_the_right_result() -> Result<(), TestError> {
+    expect_eq(ok(1).and(ok(2)).unwrap_or(0), 2)?;
+    expect_eq(err(1).and(ok(2)).unwrap_err(), 1)?;
+    expect_eq(ok(1).and(err(2)).unwrap_err(), 2)?;
+    expect_eq(ok(1).or(ok(2)).unwrap_or(0), 1)?;
+    expect_eq(err(1).or(ok(2)).unwrap_or(0), 2)?;
+    return expect_eq(err(1).or(err(2)).unwrap_err(), 2);
+}
+
+![test]
+function and_releases_the_value_and_or_the_error() -> Result<(), TestError> {
+    released = 0;
+    const first: Result<Counted, i32> = Result::Ok(Counted { tag: 1 });
+    const second: Result<i32, i32> = first.and(ok(5));
+    expect_eq(released, 1)?;
+    expect_eq(second.unwrap_or(0), 5)?;
+    released = 0;
+    const failed: Result<i32, Counted> = Result::Err(Counted { tag: 10 });
+    const recovered: Result<i32, i32> = failed.or(ok(6));
+    expect_eq(released, 10)?;
+    return expect_eq(recovered.unwrap_or(0), 6);
+}
+
+![test]
+function unwrap_or_default_releases_the_error() -> Result<(), TestError> {
+    expect_eq(err(1).unwrap_or_default(), 0)?;
+    expect_eq(ok(9).unwrap_or_default(), 9)?;
+    released = 0;
+    const failed: Result<i64, Counted> = Result::Err(Counted { tag: 4 });
+    expect_eq(failed.unwrap_or_default(), 0)?;
+    return expect_eq(released, 4);
+}
+
+![test]
+function ok_err_and_unwrap_or_release_the_side_they_discard() -> Result<(), TestError> {
+    released = 0;
+    const failed: Result<i32, Counted> = Result::Err(Counted { tag: 1 });
+    expect(failed.ok().is_none(), Str::new("Err(..).ok() is None"))?;
+    expect_eq(released, 1)?;
+    const succeeded: Result<Counted, i32> = Result::Ok(Counted { tag: 10 });
+    expect(succeeded.err().is_none(), Str::new("Ok(..).err() is None"))?;
+    expect_eq(released, 11)?;
+    const fallback: Result<i32, Counted> = Result::Err(Counted { tag: 100 });
+    expect_eq(fallback.unwrap_or(5), 5)?;
+    return expect_eq(released, 111);
+}
+
+![test]
+function expect_err_returns_the_error() -> Result<(), TestError> {
+    return expect_eq(err(12).expect_err("an error was expected"), 12);
+}
+
+![test]
+function inspect_and_inspect_err_lend_their_side() -> Result<(), TestError> {
+    inspected = 0;
+    const same: Result<i32, i32> = ok(6).inspect((x: &i32) -> void { inspected += *x; });
+    expect_eq(inspected, 6)?;
+    expect_eq(same.unwrap_or(0), 6)?;
+    const unchanged: Result<i32, i32> = err(2).inspect((x: &i32) -> void { inspected += 100; });
+    expect_eq(inspected, 6)?;
+    expect_eq(unchanged.unwrap_err(), 2)?;
+    const failed: Result<i32, i32> = err(3).inspect_err((e: &i32) -> void { inspected += *e; });
+    expect_eq(inspected, 9)?;
+    expect_eq(failed.unwrap_err(), 3)?;
+    const fine: Result<i32, i32> = ok(1).inspect_err((e: &i32) -> void { inspected += 100; });
+    expect_eq(fine.unwrap_or(0), 1)?;
+    return expect_eq(inspected, 9);
+}

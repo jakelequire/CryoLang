@@ -58,7 +58,9 @@ import std::collections::pair::{ Pair };
 import std::env;
 import std::io::error;
 import std::io::traits::{ Read };
-import std::io::stdio::{ is_tty, Stderr, stderr };
+import std::io::stdio::{ Stderr, stderr };
+import std::io::terminal::{ Color, StandardStream, Style, Styled, Terminal };
+import std::fmt;
 import std::fmt::display;
 import std::ffi::libc;
 import std::sys::syscall::{ SYSTEM_INFO_PARTIAL };
@@ -79,15 +81,6 @@ import std::test::error::{ TestError };
 
 private const RULE_HEAVY: string = "================================================================================";
 private const RULE_THIN:  string = "--------------------------------------------------------------------------------";
-
-// ANSI SGR escape sequences. Only emitted when `color_active(opts)` is true;
-// otherwise the bare `[PASS]` / `[FAIL]` / `[skip]` chips ship without codes.
-private const ANSI_GREEN:  string = "\x1B[32m";
-private const ANSI_RED:    string = "\x1B[31m";
-private const ANSI_YELLOW: string = "\x1B[33m";
-private const ANSI_DIM:    string = "\x1B[2m";
-private const ANSI_BOLD:   string = "\x1B[1m";
-private const ANSI_RESET:  string = "\x1B[0m";
 
 // Live parallel feed tuning. `STALL_REPORT_SECS`: how long the feed may go
 // without a single test completing before it prints the in-flight "still
@@ -142,10 +135,12 @@ private type struct RunOptions {
     private format_explicit: boolean;
     private color:         ColorMode;
     private color_explicit: boolean;
-    /// Resolved once at the start of `run_all`: did `color` plus the
-    /// TTY check land on "emit escapes". Reporters consult this flag
-    /// rather than re-evaluating the policy on each test.
-    private color_active:  boolean;
+    /// The styles a passing, failing and skipped verdict print in. Chosen
+    /// once at the start of `run_all` from `color` and the terminal check;
+    /// plain, writing no escape sequences, when colour is off.
+    private pass_style:    Style;
+    private fail_style:    Style;
+    private skip_style:    Style;
     /// Per-test wall-clock limit in seconds. The child arms `alarm()`
     /// with this value before running; 0 disables the watchdog.
     private timeout_secs:  u32;
@@ -189,7 +184,9 @@ private type struct RunOptions {
             format_explicit: false,
             color:           ColorMode::Auto,
             color_explicit:  false,
-            color_active:    false,
+            pass_style:      Style::new(),
+            fail_style:      Style::new(),
+            skip_style:      Style::new(),
             timeout_secs:    60,
             timeout_explicit: false,
             jobs:            0,
@@ -520,52 +517,23 @@ private function cstr_to_str(raw: u8*) -> Str {
     return Str::from_raw(raw, libc::strlen(raw));
 }
 
-// Color resolution + ANSI emission
+// Verdict colours
 
-/// Resolve `opts.color` into a concrete on/off decision for this run.
-/// `Auto` -> on if stdout is a TTY (already gated by NO_COLOR at
-/// parse time). Caller stores the result on `opts.color_active`.
-private function resolve_color_active(opts: &RunOptions) -> boolean {
-    match (opts.color) {
-        ColorMode::Always => { return true;  }
-        ColorMode::Never  => { return false; }
-        ColorMode::Auto   => { return is_tty(1); }
+/// Choose the verdict styles for this run from `opts.color`: `Auto` colours
+/// when stdout is a terminal that takes colour (`NO_COLOR` set in the
+/// environment already turned `color` to `Never` at parse time). Passing is
+/// green, failing red, skipped yellow; with colour off all three stay plain.
+private function choose_styles(opts: mut &RunOptions) -> void {
+    const colored: boolean = match (opts.color) {
+        ColorMode::Always => { true }
+        ColorMode::Never  => { false }
+        ColorMode::Auto   => { Terminal::supports_color(StandardStream::Output) }
+    };
+    if (colored) {
+        opts.pass_style = Style::new().foreground(Color::Green);
+        opts.fail_style = Style::new().foreground(Color::Red);
+        opts.skip_style = Style::new().foreground(Color::Yellow);
     }
-}
-
-/// Print an ANSI escape if color is active for this run. No-op
-/// otherwise; the callers stay branch-free.
-private function emit_ansi(active: boolean, code: string) -> void {
-    if (active) {
-        libc::printf("%s", code);
-    }
-}
-
-// Verdict chips (rendered colored on TTY, plain otherwise).
-//
-//   chip_pass  -> "[PASS]"  green
-//   chip_fail  -> "[FAIL]"  red
-//   chip_skip  -> "[skip]"  yellow
-//
-// These print the chip text only; the caller writes whatever spacing /
-// trailing detail (panic reason, exit code) it wants.
-
-private function chip_pass(active: boolean) -> void {
-    emit_ansi(active, ANSI_GREEN);
-    libc::printf("[PASS]");
-    emit_ansi(active, ANSI_RESET);
-}
-
-private function chip_fail(active: boolean) -> void {
-    emit_ansi(active, ANSI_RED);
-    libc::printf("[FAIL]");
-    emit_ansi(active, ANSI_RESET);
-}
-
-private function chip_skip(active: boolean) -> void {
-    emit_ansi(active, ANSI_YELLOW);
-    libc::printf("[skip]");
-    emit_ansi(active, ANSI_RESET);
 }
 
 // Filter matching
@@ -974,14 +942,14 @@ private function pretty_end_test(opts: &RunOptions, outcome: TestOutcome,
                           was_should_panic: boolean) -> void {
     match (outcome) {
         TestOutcome::Pass => {
-            chip_pass(opts.color_active);
+            fmt::print(f"{opts.pass_style.paint(Str::new("[PASS]"))}");
             if (was_should_panic) {
                 libc::printf("  (panicked as expected)");
             }
             libc::printf("\n");
         }
         TestOutcome::Fail(code, signal, signaled) => {
-            chip_fail(opts.color_active);
+            fmt::print(f"{opts.fail_style.paint(Str::new("[FAIL]"))}");
             if (signaled) {
                 libc::printf("  (panicked, signal %d)\n", signal);
             } else {
@@ -989,19 +957,19 @@ private function pretty_end_test(opts: &RunOptions, outcome: TestOutcome,
             }
         }
         TestOutcome::Skipped => {
-            chip_skip(opts.color_active);
+            fmt::print(f"{opts.skip_style.paint(Str::new("[skip]"))}");
             libc::printf("\n");
         }
         TestOutcome::DidNotPanic => {
-            chip_fail(opts.color_active);
+            fmt::print(f"{opts.fail_style.paint(Str::new("[FAIL]"))}");
             libc::printf("  (test did not panic as expected)\n");
         }
         TestOutcome::Timeout(secs) => {
-            chip_fail(opts.color_active);
+            fmt::print(f"{opts.fail_style.paint(Str::new("[FAIL]"))}");
             libc::printf("  (timed out after %u s)\n", secs);
         }
         TestOutcome::RunnerError(code) => {
-            chip_fail(opts.color_active);
+            fmt::print(f"{opts.fail_style.paint(Str::new("[FAIL]"))}");
             libc::printf("  (runner error: os error %d)\n", code);
         }
     }
@@ -1361,12 +1329,9 @@ private type struct TestRunner {
     /// the live path deliberately does without.
     private report_live_finish(&this, name: Str, outcome: TestOutcome,
                        was_should_panic: boolean) -> void {
-        const active: boolean = this.opts.color_active;
         match (outcome) {
             TestOutcome::Pass => {
-                emit_ansi(active, ANSI_GREEN);
-                libc::printf("ok  ");
-                emit_ansi(active, ANSI_RESET);
+                fmt::print(f"{this.opts.pass_style.paint(Str::new("ok  "))}");
                 libc::printf("  %.*s", name.length() as i32, name.as_ptr());
                 if (was_should_panic) {
                     libc::printf("  (panicked as expected)");
@@ -1374,9 +1339,7 @@ private type struct TestRunner {
                 libc::printf("\n");
             }
             TestOutcome::Fail(code, signal, signaled) => {
-                emit_ansi(active, ANSI_RED);
-                libc::printf("FAIL");
-                emit_ansi(active, ANSI_RESET);
+                fmt::print(f"{this.opts.fail_style.paint(Str::new("FAIL"))}");
                 libc::printf("  %.*s", name.length() as i32, name.as_ptr());
                 if (signaled) {
                     libc::printf("  (panicked, signal %d)\n", signal);
@@ -1385,29 +1348,21 @@ private type struct TestRunner {
                 }
             }
             TestOutcome::Skipped => {
-                emit_ansi(active, ANSI_YELLOW);
-                libc::printf("skip");
-                emit_ansi(active, ANSI_RESET);
+                fmt::print(f"{this.opts.skip_style.paint(Str::new("skip"))}");
                 libc::printf("  %.*s\n", name.length() as i32, name.as_ptr());
             }
             TestOutcome::DidNotPanic => {
-                emit_ansi(active, ANSI_RED);
-                libc::printf("FAIL");
-                emit_ansi(active, ANSI_RESET);
+                fmt::print(f"{this.opts.fail_style.paint(Str::new("FAIL"))}");
                 libc::printf("  %.*s  (test did not panic as expected)\n",
                     name.length() as i32, name.as_ptr());
             }
             TestOutcome::Timeout(secs) => {
-                emit_ansi(active, ANSI_RED);
-                libc::printf("FAIL");
-                emit_ansi(active, ANSI_RESET);
+                fmt::print(f"{this.opts.fail_style.paint(Str::new("FAIL"))}");
                 libc::printf("  %.*s  (timed out after %u s)\n",
                     name.length() as i32, name.as_ptr(), secs);
             }
             TestOutcome::RunnerError(code) => {
-                emit_ansi(active, ANSI_RED);
-                libc::printf("FAIL");
-                emit_ansi(active, ANSI_RESET);
+                fmt::print(f"{this.opts.fail_style.paint(Str::new("FAIL"))}");
                 libc::printf("  %.*s  (runner error: os error %d)\n",
                     name.length() as i32, name.as_ptr(), code);
             }
@@ -1636,7 +1591,11 @@ private type struct TestRunner {
 
     /// Print the framed trailing summary block.
     private print_summary(&this) -> void {
-        const verdict: string = if (this.counts.failed == 0) { "PASS" } else { "FAIL" };
+        const verdict: Styled<Str> = if (this.counts.failed == 0) {
+            this.opts.pass_style.paint(Str::new("PASS"))
+        } else {
+            this.opts.fail_style.paint(Str::new("FAIL"))
+        };
         libc::printf("\n%s\n", RULE_HEAVY);
         libc::printf("  unit test summary\n");
         libc::printf("%s\n", RULE_THIN);
@@ -1645,13 +1604,7 @@ private type struct TestRunner {
         libc::printf("    %-9s%6llu\n", "ignored",  this.counts.ignored);
         libc::printf("    %-9s%6llu\n", "filtered", this.counts.filtered);
         libc::printf("%s\n", RULE_THIN);
-        if (this.opts.color_active && this.counts.failed == 0) {
-            libc::printf("    result   %s%s%s\n", ANSI_GREEN, verdict, ANSI_RESET);
-        } else if (this.opts.color_active && this.counts.failed > 0) {
-            libc::printf("    result   %s%s%s\n", ANSI_RED, verdict, ANSI_RESET);
-        } else {
-            libc::printf("    result   %s\n", verdict);
-        }
+        fmt::println(f"    result   {verdict}");
         libc::printf("%s\n", RULE_HEAVY);
     }
 
@@ -1722,7 +1675,7 @@ internal function run_all(argc: i32, argv: u8**,
                  descriptors: TestDescriptor*, count: u64) -> i32 {
     mut opts: RunOptions = parse_options(argc, argv);
     // Pin color decision now so reporters don't re-evaluate per test.
-    opts.color_active = resolve_color_active(&opts);
+    choose_styles(&opts);
 
     // Re-exec child path: run only the selected test and exit 0/1, with no
     // header or driver loop.  The parent process classifies the exit code.

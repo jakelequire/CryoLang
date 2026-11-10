@@ -1,0 +1,74 @@
+///! Where log records go: the `LogSink` trait, and `StandardErrorSink`, the
+///! sink logging writes to until a program sets its own.
+
+namespace std::log::sink;
+
+import std::core::result::{ Result };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::fmt;
+import std::fmt::write::{ FmtWrite };
+import std::io::terminal::{ Color, StandardStream, Style, Styled, Terminal };
+import std::log::record::{ LogLevel, LogRecord };
+import std::time::datetime::{ DateTime };
+
+/// A destination for log records. `Logging` calls `write` for every record
+/// that passes the level settings, one call at a time: no two writes to a
+/// sink overlap, so a sink needs no lock of its own for its output to come
+/// out whole.
+public type trait LogSink {
+    write(&this, record: &LogRecord) -> void;
+}
+
+/// Writes each record to standard error as one line, its time in RFC 3339
+/// (UTC, to the second), its level, its area and its message:
+///
+///     2026-11-09T14:03:07Z warning http: no route for /favicon.ico
+///
+/// The level is coloured when standard error takes colour
+/// (`Terminal::supports_color`), which is decided once, by `new`.
+public type struct StandardErrorSink {
+    private error_style: Style;
+    private warning_style: Style;
+    private information_style: Style;
+    private debug_style: Style;
+    private trace_style: Style;
+
+    public static new() -> StandardErrorSink {
+        if (!Terminal::supports_color(StandardStream::Error)) {
+            return StandardErrorSink {
+                error_style: Style::new(),
+                warning_style: Style::new(),
+                information_style: Style::new(),
+                debug_style: Style::new(),
+                trace_style: Style::new(),
+            };
+        }
+        return StandardErrorSink {
+            error_style: Style::new().foreground(Color::Red).bold(),
+            warning_style: Style::new().foreground(Color::Yellow),
+            information_style: Style::new().foreground(Color::Green),
+            debug_style: Style::new().foreground(Color::Blue),
+            trace_style: Style::new().dim(),
+        };
+    }
+}
+
+implement trait LogSink for struct StandardErrorSink {
+    write(&this, record: &LogRecord) -> void {
+        const style: &Style = match (&record.level) {
+            LogLevel::Error => { &this.error_style }
+            LogLevel::Warning => { &this.warning_style }
+            LogLevel::Information => { &this.information_style }
+            LogLevel::Debug => { &this.debug_style }
+            LogLevel::Trace => { &this.trace_style }
+        };
+        const time: DateTime = DateTime::from_system_time(&record.time);
+        const level: Styled<LogLevel> = style.paint(record.level.clone());
+        const area: Str = record.area;
+        mut line: String = String::new();
+        line.write(f"{time} {level} {area}: ");
+        line.write(record.message);
+        fmt::eprintln(line);
+    }
+}

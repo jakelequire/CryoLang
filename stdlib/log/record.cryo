@@ -1,0 +1,85 @@
+///! A log record and its level: what a `Logger` hands a `LogSink`.
+
+namespace std::log::record;
+
+import std::core::intrinsics::{ Location };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::collections::str::{ Str };
+import std::fmt::display::{ Debug, Display, Formatter };
+import std::fmt::error::{ FmtError };
+import std::fmt::interp::{ Arguments };
+import std::time::clock::{ SystemTime };
+
+/// How much a record matters, from `Error`, the most, to `Trace`, the
+/// least. A level setting lets through records at that level and every
+/// level above it: `Warning` passes errors and warnings.
+public type enum LogLevel with [Eq, Clone, Debug] {
+    Error;
+    Warning;
+    Information;
+    Debug;
+    Trace;
+}
+
+implement enum LogLevel {
+    /// The level a name spells, ignoring ASCII case: `error`, `warning`,
+    /// `information`, `debug` or `trace`; `None` for any other text.
+    public static parse(name: Str) -> Option<LogLevel> {
+        if (name.equals_case_insensitive(&Str::new("error"))) { return Option::Some(LogLevel::Error); }
+        if (name.equals_case_insensitive(&Str::new("warning"))) { return Option::Some(LogLevel::Warning); }
+        if (name.equals_case_insensitive(&Str::new("information"))) { return Option::Some(LogLevel::Information); }
+        if (name.equals_case_insensitive(&Str::new("debug"))) { return Option::Some(LogLevel::Debug); }
+        if (name.equals_case_insensitive(&Str::new("trace"))) { return Option::Some(LogLevel::Trace); }
+        return Option::None;
+    }
+
+    /// The level's name, in lower case, as `parse` reads it.
+    public name(&this) -> Str {
+        match (&this) {
+            LogLevel::Error => { return Str::new("error"); }
+            LogLevel::Warning => { return Str::new("warning"); }
+            LogLevel::Information => { return Str::new("information"); }
+            LogLevel::Debug => { return Str::new("debug"); }
+            LogLevel::Trace => { return Str::new("trace"); }
+        }
+    }
+
+    /// True when a setting of `this` lets a record at `level` through.
+    public allows(&this, level: &LogLevel) -> boolean {
+        return level.verbosity() <= this.verbosity();
+    }
+
+    /// 0 for `Error` up to 4 for `Trace`: the order the levels are written
+    /// in, which is the order `allows` and the logging module's atomic
+    /// threshold compare them by.
+    internal verbosity(&this) -> u8 {
+        match (&this) {
+            LogLevel::Error => { return 0; }
+            LogLevel::Warning => { return 1; }
+            LogLevel::Information => { return 2; }
+            LogLevel::Debug => { return 3; }
+            LogLevel::Trace => { return 4; }
+        }
+    }
+}
+
+/// Writes the level's name, `warning`.
+implement trait Display for enum LogLevel {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        return f.write_str(this.name());
+    }
+}
+
+/// One thing logged. The message is formatted only when a sink writes it,
+/// and only during the `LogSink.write` call the record is passed to: it
+/// borrows the values the logging call was given.
+public type struct LogRecord {
+    public level: LogLevel;
+    /// The area of the `Logger` that logged it.
+    public area: Str;
+    public message: Arguments;
+    /// Where the logging call is written.
+    public location: Location;
+    public time: SystemTime;
+}
