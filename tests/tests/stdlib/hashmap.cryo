@@ -7,6 +7,9 @@ import std::core::result::{ Result };
 import std::core::option::{ Option };
 import std::core::iter::{ Iterator };
 import std::collections::hashmap::{ HashMap };
+import std::collections::hashset::{ HashSet };
+import std::core::hash::{ FnvHasher, SipHasher };
+import std::alloc::allocator::{ GlobalAlloc };
 import std::collections::str::{ Str };
 import std::collections::pair::{ Pair };
 import std::test::error::{ TestError };
@@ -482,18 +485,18 @@ function with_capacity_huge_hint_panics_not_hangs() -> Result<(), TestError> {
 }
 
 // ============================================================================
-// Per-map hash seeding
+// Per-map hashers
 //
-// `HashMap::new()` draws a random per-process seed so bucket placement is
-// unpredictable (hash-flood hardening). `with_seed` pins that seed so a test
-// can rely on reproducible placement. These tests pin both: a seeded map is
-// functionally correct, and two maps with the same seed + insertion order
-// agree on iteration order (which also proves the seed drives placement).
+// `HashMap::new()` hashes under a SipHash key drawn per map (hash-flood
+// hardening). `with_hasher` fixes the hasher so a test can rely on
+// reproducible placement. These tests pin both: a map with a given hasher is
+// functionally correct, and two maps with the same hasher + insertion order
+// agree on iteration order.
 // ============================================================================
 
 ![test]
-function with_seed_map_is_functional() -> Result<(), TestError> {
-    mut map: HashMap<u32, i32> = HashMap::with_seed(0xDEADBEEF);
+function with_hasher_map_is_functional() -> Result<(), TestError> {
+    mut map: HashMap<u32, i32> = HashMap::<u32, i32>::with_hasher(SipHasher::with_keys_1_3(0xDEADBEEF, 0));
     mut i: u32 = 0;
     while (i < 16) {
         map.insert(i, (i as i32) * 3);
@@ -516,9 +519,9 @@ function with_seed_map_is_functional() -> Result<(), TestError> {
 }
 
 ![test]
-function same_seed_same_iteration_order() -> Result<(), TestError> {
-    mut a: HashMap<u32, i32> = HashMap::with_seed(0x1234567);
-    mut b: HashMap<u32, i32> = HashMap::with_seed(0x1234567);
+function same_hasher_same_iteration_order() -> Result<(), TestError> {
+    mut a: HashMap<u32, i32> = HashMap::<u32, i32>::with_hasher(SipHasher::with_keys_1_3(0x1234567, 0));
+    mut b: HashMap<u32, i32> = HashMap::<u32, i32>::with_hasher(SipHasher::with_keys_1_3(0x1234567, 0));
     mut i: u32 = 0;
     while (i < 24) {
         a.insert(i, i as i32);
@@ -589,4 +592,70 @@ function values_mutable_changes_every_value() -> Result<(), TestError> {
         expect_eq(map.get(&k).unwrap(), (k as i32) * 10)?;
     }
     return Result::Ok(());
+}
+
+![test]
+function fnv_hashed_map_and_set_work() -> Result<(), TestError> {
+    mut map: HashMap<u32, i32, GlobalAlloc, FnvHasher> = HashMap::<u32, i32, GlobalAlloc, FnvHasher>::new();
+    mut set: HashSet<u32, GlobalAlloc, FnvHasher> = HashSet::<u32, GlobalAlloc, FnvHasher>::new();
+    for (mut k: u32 = 0; k < 40; k++) {
+        map.insert(k, (k as i32) * 2);
+        set.insert(k * 3);
+    }
+    for (mut k: u32 = 0; k < 40; k++) {
+        expect_eq(map.get(&k).unwrap(), (k as i32) * 2)?;
+        expect_true(set.contains(&(k * 3)), Str::new("FNV-hashed set holds every inserted value"))?;
+    }
+    const absent: u32 = 1;
+    expect_false(set.contains(&absent), Str::new("FNV-hashed set holds nothing else"))?;
+    return expect_eq(map.length(), 40 as i64);
+}
+
+![test]
+function default_maps_hash_under_their_own_keys() -> Result<(), TestError> {
+    // Two default maps fed the same keys in the same order lay them out
+    // alike only if they hash under the same key; with 64 keys over 64
+    // buckets, two independent SipHash keys agree on every bucket with
+    // negligible probability.
+    mut a: HashMap<u32, i32> = HashMap::new();
+    mut b: HashMap<u32, i32> = HashMap::new();
+    for (mut k: u32 = 0; k < 64; k++) {
+        a.insert(k, 0);
+        b.insert(k, 0);
+    }
+    mut ita: implement Iterator<Pair<u32, i32>> = a.iter();
+    mut itb: implement Iterator<Pair<u32, i32>> = b.iter();
+    mut same: boolean = true;
+    loop {
+        match (ita.next()) {
+            Option::Some(pa) => {
+                if (pa.first != itb.next().unwrap().first) { same = false; }
+            }
+            Option::None => { break; }
+        }
+    }
+    return expect_false(same, Str::new("two default maps iterate in different orders"));
+}
+
+![test]
+function fnv_maps_lay_out_alike() -> Result<(), TestError> {
+    // An `FnvHasher` map is unseeded, so two of them lay out alike.
+    mut a: HashMap<u32, i32, GlobalAlloc, FnvHasher> = HashMap::<u32, i32, GlobalAlloc, FnvHasher>::new();
+    mut b: HashMap<u32, i32, GlobalAlloc, FnvHasher> = HashMap::<u32, i32, GlobalAlloc, FnvHasher>::new();
+    for (mut k: u32 = 0; k < 64; k++) {
+        a.insert(k, 0);
+        b.insert(k, 0);
+    }
+    mut ita: implement Iterator<Pair<u32, i32>> = a.iter();
+    mut itb: implement Iterator<Pair<u32, i32>> = b.iter();
+    mut same: boolean = true;
+    loop {
+        match (ita.next()) {
+            Option::Some(pa) => {
+                if (pa.first != itb.next().unwrap().first) { same = false; }
+            }
+            Option::None => { break; }
+        }
+    }
+    return expect_true(same, Str::new("two FNV maps iterate in the same order"));
 }

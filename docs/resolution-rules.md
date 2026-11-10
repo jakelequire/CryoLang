@@ -1270,10 +1270,10 @@ yet is recorded with the change that builds it, not here.
      expression before E0111 could be reported.  (Jake; the stack size
      delegated)
 
-650. **The type arena hashes through `DefaultHasher`.**  A canonical type
+650. **The type arena hashes through `FnvHasher`.**  A canonical type
      key's bucket is chosen by folding the kind, the two scalar
      discriminators, each operand and the operand count into a
-     `DefaultHasher`; the arena's own FNV-1a mix is gone.  The hash only
+     `FnvHasher`; the arena's own FNV-1a mix is gone.  The hash only
      selects a bucket - entry comparison decides identity.  (Jake)
 
 651. **A byte of a `string` has no address.**  `s[i]` and `*s` on a

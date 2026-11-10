@@ -1,0 +1,173 @@
+///! One-off rewrite: every `HashMap<..>` / `HashSet<..>` spelling in the files
+///! named on the command line is given the hasher `FnvHasher` explicitly
+///! (`HashMap<K, V>` -> `HashMap<K, V, GlobalAlloc, FnvHasher>`, a written
+///! allocator kept), and a file it rewrites imports `FnvHasher` and
+///! `GlobalAlloc` when it does not already.  Line comments and string
+///! literals are left alone.
+
+namespace FnvMapsCodemod;
+
+import std::env;
+import std::fs::file::{ File };
+import std::fs::path::{ Path };
+import std::fmt;
+import std::io::error::{ IoError };
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::collections::array::{ Array };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+
+type struct Source {
+    bytes: u8*;
+    length: i64;
+
+    at(&this, index: i64) -> u8 {
+        if (index < 0 || index >= this.length) { return 0; }
+        return this.bytes[index];
+    }
+
+    is_word_byte(&this, index: i64) -> boolean {
+        const c: u8 = this.at(index);
+        return (c >= 'a' as u8 && c <= 'z' as u8) || (c >= 'A' as u8 && c <= 'Z' as u8)
+            || (c >= '0' as u8 && c <= '9' as u8) || c == '_' as u8;
+    }
+
+    /// Whether `word` starts at `index` as a whole word.
+    word_at(&this, index: i64, word: string) -> boolean {
+        const text: Str = Str::new(word);
+        if (this.is_word_byte(index - 1)) { return false; }
+        for (mut k: i64 = 0; k < text.length(); k++) {
+            if (this.at(index + k) != text.byte_at(k).unwrap()) { return false; }
+        }
+        return !this.is_word_byte(index + text.length());
+    }
+
+    /// The index of the `>` closing the argument list opened at `open`, and
+    /// the number of arguments in it, or -1 when it does not close.
+    closing(&this, open: i64, arguments: mut &i64) -> i64 {
+        mut angle: i64 = 0;
+        mut paren: i64 = 0;
+        *arguments = 1;
+        for (mut i: i64 = open; i < this.length; i++) {
+            const c: u8 = this.at(i);
+            if (c == '<' as u8) { angle += 1; }
+            if (c == '(' as u8 || c == '[' as u8) { paren += 1; }
+            if (c == ')' as u8 || c == ']' as u8) { paren -= 1; }
+            if (c == ',' as u8 && angle == 1 && paren == 0) { *arguments += 1; }
+            if (c == '>' as u8 && this.at(i - 1) != '-' as u8) {
+                angle -= 1;
+                if (angle == 0) { return i; }
+            }
+            if (c == '\n' as u8 && angle > 0 && paren == 0 && this.at(i - 1) == ';' as u8) { return -1; }
+        }
+        return -1;
+    }
+
+    /// Whether some line holding `import` names `word`.
+    imports(&this, word: string) -> boolean {
+        mut line_start: i64 = 0;
+        for (mut i: i64 = 0; i <= this.length; i++) {
+            if (i == this.length || this.at(i) == '\n' as u8) {
+                if (this.word_at(line_start, "import")) {
+                    for (mut j: i64 = line_start; j < i; j++) {
+                        if (this.word_at(j, word)) { return true; }
+                    }
+                }
+                line_start = i + 1;
+            }
+        }
+        return false;
+    }
+}
+
+function rewrite(path_text: String) -> i64 {
+    const path: Path = Path::from(path_text.as_str());
+    const read: Result<String, IoError> = File::read_text(path);
+    if (read.is_err()) { return -1; }
+    const text: String = read.unwrap();
+    const source: Source = Source { bytes: text.as_ptr(), length: text.length() };
+    mut out: String = String::new();
+    mut changed: i64 = 0;
+    mut last_import_end: i64 = -1;
+    mut i: i64 = 0;
+    while (i < source.length) {
+        const c: u8 = source.at(i);
+        if (c == '/' as u8 && source.at(i + 1) == '/' as u8) {
+            while (i < source.length && source.at(i) != '\n' as u8) { out.push_byte(source.at(i)); i++; }
+            continue;
+        }
+        if (c == '"' as u8) {
+            out.push_byte(c);
+            i++;
+            while (i < source.length && source.at(i) != '"' as u8) {
+                if (source.at(i) == '\\' as u8) { out.push_byte(source.at(i)); i++; }
+                out.push_byte(source.at(i));
+                i++;
+            }
+            if (i < source.length) { out.push_byte(source.at(i)); i++; }
+            continue;
+        }
+        if (source.word_at(i, "import") && (i == 0 || source.at(i - 1) == '\n' as u8)) {
+            mut end: i64 = i;
+            while (end < source.length && source.at(end) != '\n' as u8) { end++; }
+            last_import_end = out.length() + (end - i);
+        }
+        const is_map: boolean = source.word_at(i, "HashMap");
+        const is_set: boolean = source.word_at(i, "HashSet");
+        if (is_map || is_set) {
+            const word_length: i64 = 7;
+            mut open: i64 = i + word_length;
+            if (source.at(open) == ':' as u8 && source.at(open + 1) == ':' as u8 && source.at(open + 2) == '<' as u8) {
+                open = open + 2;
+            }
+            if (source.at(open) == '<' as u8) {
+                mut arguments: i64 = 0;
+                const close: i64 = source.closing(open, &arguments);
+                const full: i64 = if (is_map) { 4 } else { 3 };
+                if (close > 0 && arguments < full) {
+                    for (mut k: i64 = i; k < close; k++) { out.push_byte(source.at(k)); }
+                    if (arguments == full - 2) { out.push(", GlobalAlloc"); }
+                    out.push(", FnvHasher");
+                    i = close;
+                    changed += 1;
+                    continue;
+                }
+            }
+        }
+        out.push_byte(c);
+        i++;
+    }
+    if (changed == 0) { return 0; }
+    mut added: String = String::new();
+    if (!source.imports("FnvHasher")) { added.push("\nimport std::core::hash::{ FnvHasher };"); }
+    if (!source.imports("GlobalAlloc")) { added.push("\nimport std::alloc::allocator::{ GlobalAlloc };"); }
+    mut result: String = String::new();
+    const body: Str = out.as_str();
+    if (last_import_end < 0) {
+        fmt::println(f"{path_text}: rewritten but has no import line");
+        return -1;
+    }
+    for (mut k: i64 = 0; k < last_import_end; k++) { result.push_byte(body.byte_at(k).unwrap()); }
+    result.push(added);
+    for (mut k: i64 = last_import_end; k < body.length(); k++) { result.push_byte(body.byte_at(k).unwrap()); }
+    const written: Result<(), IoError> = File::write_text(path, result.as_str());
+    if (written.is_err()) { return -1; }
+    return changed;
+}
+
+function main() -> i32 {
+    const arguments: Array<String> = env::args();
+    mut total: i64 = 0;
+    for (mut a: i64 = 1; a < arguments.length(); a++) {
+        const name: String = (*arguments.get_ref(a).unwrap()).clone();
+        const changed: i64 = rewrite(name.clone());
+        if (changed < 0) {
+            fmt::println(f"failed: {name}");
+            return 1;
+        }
+        total += changed;
+    }
+    fmt::println(f"rewritten spellings: {total}");
+    return 0;
+}

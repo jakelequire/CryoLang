@@ -24,7 +24,7 @@ import compiler::resolver::{ symbol_str, intern_table, qualified_name };
 import utils::log::{ Log, LogArea, LogLevel };
 import std::core::option::{ Option };
 import std::collections::hashmap::{ HashMap };
-import std::core::hash::{ DefaultHasher, Hasher };
+import std::core::hash::{ FnvHasher, Hasher };
 import std::fmt;
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::qualified_name::{ QualifiedName };
@@ -46,6 +46,7 @@ import compiler::types::user_defined::{
     TraitType, TypeAliasType
 };
 import compiler::module_graph::{ ModulePath };
+import std::alloc::allocator::{ GlobalAlloc };
 
 
 /// One entry in the canonical structural interner (a hash-cons table).
@@ -141,10 +142,10 @@ type struct TypeArena {
     //     `create_generic_param`.  Re-including them here would regress it.
     intern_entries: [InternEntry];
     intern_ops:     [TypeRef];          // flat operand pool, sliced by InternEntry
-    intern_cache:   HashMap<u64, i64>;  // structural hash (probed) -> intern_entries index
+    intern_cache:   HashMap<u64, i64, GlobalAlloc, FnvHasher>;  // structural hash (probed) -> intern_entries index
 
     // -- Generic parameter cache (key: the declaration's SymbolID -> TypeRef) --
-    generic_param_cache:   HashMap<SymbolKey, TypeRef>;
+    generic_param_cache:   HashMap<SymbolKey, TypeRef, GlobalAlloc, FnvHasher>;
     // The one `This` placeholder (`this_placeholder`).
     this_param:            TypeRef;
 
@@ -212,8 +213,8 @@ public:
 
             intern_entries:      [],
             intern_ops:          [],
-            intern_cache:        HashMap::<u64, i64>::new(),
-            generic_param_cache: HashMap::<SymbolKey, TypeRef>::new(),
+            intern_cache:        HashMap::<u64, i64, GlobalAlloc, FnvHasher>::new(),
+            generic_param_cache: HashMap::<SymbolKey, TypeRef, GlobalAlloc, FnvHasher>::new(),
             this_param:          TypeRef::invalid(),
             dynamic_array_base:  TypeRef::invalid(),
             dynamic_array_alloc: TypeRef::invalid(),
@@ -320,7 +321,7 @@ public:
     /// correctness.  The operand COUNT is mixed in so that `(a)` and `(a, a)`
     /// cannot land on the same key by accident.
     structural_hash(&this, kind: TypeKind, aux0: u64, aux1: u64, ops: &[TypeRef]) -> u64 {
-        mut hasher: DefaultHasher = DefaultHasher::new();
+        mut hasher: FnvHasher = FnvHasher::new();
         hasher.fold(kind as u64);
         hasher.fold(aux0);
         hasher.fold(aux1);

@@ -29,6 +29,8 @@ import compiler::decl_index::{ OverloadId };
 import compiler::resolver::symbol_id::{ SymbolID, SymbolKey };
 import std::collections::hashset::{ HashSet };
 import std::collections::hashmap::{ HashMap };
+import std::core::hash::{ FnvHasher };
+import std::alloc::allocator::{ GlobalAlloc };
 
 /// A function's copy specialized for the capturing closures one call
 /// passes: each argument position a closure is passed at, and the closure's
@@ -76,7 +78,7 @@ type struct SemaState {
     // and never again by its spelling.  A scope's undo log records each
     // binding's previous state, so leaving the scope restores what a
     // narrowing inside it changed and drops what the scope declared.
-    bindings:        HashMap<SymbolKey, LocalBinding>;
+    bindings:        HashMap<SymbolKey, LocalBinding, GlobalAlloc, FnvHasher>;
     binding_undo:    [SymbolKey];
     binding_prev:    [LocalBinding];
 
@@ -116,7 +118,7 @@ type struct SemaState {
     // matched payload; returning a pointer/reference to `p` dangles once the
     // function returns.  This set lets the return-escape check reject that
     // (E0455) instead of miscompiling into a use-after-free.
-    payload_bindings: HashSet<SymbolKey>;
+    payload_bindings: HashSet<SymbolKey, GlobalAlloc, FnvHasher>;
     // The arm bindings whose subject is reached through a by-reference
     // parameter (`match (&this)`, `match (ptr_param)`).  Such a binding names
     // the CALLER's storage rather than a copy in this frame, so `&binding`
@@ -125,12 +127,12 @@ type struct SemaState {
     // (`payload_ptr(&this) -> T*`) is.  Kept as a separate set rather than by
     // suppressing the entry above, because the payload-escape check has its
     // own reason to know a binding is a payload.
-    alias_bindings:   HashSet<SymbolKey>;
+    alias_bindings:   HashSet<SymbolKey, GlobalAlloc, FnvHasher>;
     // The current function's parameters (and its receiver).  Autoref'd /
     // caller-backed, so `&param` re-borrows caller storage rather than
     // escaping a stack slot - the return-escape check flags only
     // `&<body-local>`.
-    param_bindings:   HashSet<SymbolKey>;
+    param_bindings:   HashSet<SymbolKey, GlobalAlloc, FnvHasher>;
     // True while inside a method whose receiver is `&this` / `mut &this`.  A
     // by-value `this` receiver lives in THIS frame, so it is not caller-backed.
     this_is_by_ref: boolean;
@@ -149,7 +151,7 @@ type struct SemaState {
     // free variable, and records a capture.
     // `current_lambda`: the lambda whose body we're walking - the capture sink.
     in_lambda_depth:     i32;
-    outer_bindings:      HashMap<SymbolKey, TypeRef>;
+    outer_bindings:      HashMap<SymbolKey, TypeRef, GlobalAlloc, FnvHasher>;
     current_lambda:      mut LambdaExpr*;
 
     // Per-module monotonic counter for synthesised closure-struct names.
@@ -160,7 +162,7 @@ type struct SemaState {
     // the same closures is pinned to one copy.  Keyed by the function's
     // definition; a key's copies are told apart by `ClosureSpec::binds`.
     closure_specs:     [ClosureSpec];
-    closure_spec_keys: HashMap<DefKey, [i64]>;
+    closure_spec_keys: HashMap<DefKey, [i64], GlobalAlloc, FnvHasher>;
 
     // Re-entrancy guard for implicit-conversion synthesis: set while re-resolving
     // a synthesized `converter(arg)` call so its own args don't re-trigger a
@@ -214,7 +216,7 @@ type struct SemaState {
 
     static new() -> SemaState {
         return SemaState {
-            bindings:       HashMap::<SymbolKey, LocalBinding>::new(),
+            bindings:       HashMap::<SymbolKey, LocalBinding, GlobalAlloc, FnvHasher>::new(),
             binding_undo:   [],
             binding_prev:   [],
             return_type:      TypeRef::invalid(),
@@ -228,18 +230,18 @@ type struct SemaState {
             expected_type: TypeRef::invalid(),
             untyped_binding: SymbolStr::empty(),
             untyped_init:    null,
-            payload_bindings: HashSet::<SymbolKey>::new(),
-            alias_bindings:   HashSet::<SymbolKey>::new(),
-            param_bindings:   HashSet::<SymbolKey>::new(),
+            payload_bindings: HashSet::<SymbolKey, GlobalAlloc, FnvHasher>::new(),
+            alias_bindings:   HashSet::<SymbolKey, GlobalAlloc, FnvHasher>::new(),
+            param_bindings:   HashSet::<SymbolKey, GlobalAlloc, FnvHasher>::new(),
             this_is_by_ref:  false,
             receiver_sym:    SymbolID::invalid(),
             current_func: null,
             in_lambda_depth:    0,
-            outer_bindings:      HashMap::<SymbolKey, TypeRef>::new(),
+            outer_bindings:      HashMap::<SymbolKey, TypeRef, GlobalAlloc, FnvHasher>::new(),
             current_lambda:      null,
             closure_counter:  0,
             closure_specs:     [],
-            closure_spec_keys: HashMap::<DefKey, [i64]>::new(),
+            closure_spec_keys: HashMap::<DefKey, [i64], GlobalAlloc, FnvHasher>::new(),
             in_implicit_conversion: false,
             try_counter: 0,
             unbound_variants: [],

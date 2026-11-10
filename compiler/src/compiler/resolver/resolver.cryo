@@ -30,6 +30,8 @@ import std::collections::pair::{ Pair };
 import std::core::mem;
 import std::core::intrinsics;
 import compiler::ast::{ TypeAnnotation };
+import std::core::hash::{ FnvHasher };
+import std::alloc::allocator::{ GlobalAlloc };
 
 /// A trait a `where` clause bounds a type parameter by, with the arguments
 /// the clause writes on it: the trait's own parameters, then its associated
@@ -108,7 +110,7 @@ public:
             span:               span,
             child_scope_ids:    [],
             symbols:            [],
-            symbol_index:       HashMap::<u32, i64>::new(),
+            symbol_index:       HashMap::<u32, i64, GlobalAlloc, FnvHasher>::new(),
             overloads:          [],
             overload_in_type_ns: [],
             meetings:           [],
@@ -139,7 +141,7 @@ private:
     symbols:         [ScopeEntry];
 
     // Fast lookup index: SymbolStr.id -> index in symbols[]
-    symbol_index:    HashMap<u32, i64>;
+    symbol_index:    HashMap<u32, i64, GlobalAlloc, FnvHasher>;
 
     // Overloaded names: flat array of (name_key, SymbolID) pairs, and
     // beside each whether that binding is in the type namespace.
@@ -361,7 +363,7 @@ type struct Resolver {
     resolution_map:     ResolutionMap;
     /// `referenced_declarations`' set, and the map's record count and the
     /// symbol count it was built at (-1: never built).
-    referenced:         HashMap<u64, boolean>;
+    referenced:         HashMap<u64, boolean, GlobalAlloc, FnvHasher>;
     referenced_records: u64;
     referenced_symbols: i64;
 
@@ -375,8 +377,8 @@ type struct Resolver {
     // entry, and beside each entry the next one of its name (-1 for none),
     // in export order.  A name's entries are read without a walk over every
     // module's exports.
-    export_first:         HashMap<u32, i64>;
-    export_last:          HashMap<u32, i64>;
+    export_first:         HashMap<u32, i64, GlobalAlloc, FnvHasher>;
+    export_last:          HashMap<u32, i64, GlobalAlloc, FnvHasher>;
     export_next:          [i64];
 
 
@@ -414,7 +416,7 @@ type struct Resolver {
     /// entering a module fourteen times produce fourteen scopes, only the
     /// third of them populated, and a save/restore mechanism necessary to
     /// paper over it.
-    module_scopes: HashMap<ModuleKey, u64>;
+    module_scopes: HashMap<ModuleKey, u64, GlobalAlloc, FnvHasher>;
     /// The traits a `where` clause bounds each type parameter by.  `S::Item`
     /// is `Item` of whichever of these traits declares it; a trait the
     /// parameter is not bounded by does not answer it, however it is spelled.
@@ -424,12 +426,12 @@ type struct Resolver {
     /// import of a leaf binds every declaration the module offers under it,
     /// one binding each, so a type and a same-leaf function arrive as two
     /// bindings and each one's target is what a namespace chooses between.
-    import_targets: HashMap<SymbolKey, SymbolID>;
+    import_targets: HashMap<SymbolKey, SymbolID, GlobalAlloc, FnvHasher>;
 
     /// The import bindings an explicit entry - `import M::{ name }` - made,
     /// by binding.  A glob's bindings are not among them: a second explicit
     /// import of a name is refused against an explicit one only.
-    explicit_imports: HashMap<SymbolKey, boolean>;
+    explicit_imports: HashMap<SymbolKey, boolean, GlobalAlloc, FnvHasher>;
 
     /// Create a new Resolver with a global scope.
     /// Every pointer must outlive the Resolver (owned by CompilationContext).
@@ -451,18 +453,18 @@ type struct Resolver {
             global_scope:         global_id,
             current_scope:        global_id,
             resolution_map:       ResolutionMap::new(),
-            referenced:           HashMap::<u64, boolean>::new(),
+            referenced:           HashMap::<u64, boolean, GlobalAlloc, FnvHasher>::new(),
             referenced_records:   0,
             referenced_symbols:   -1,
             exports:              [],
-            export_first:         HashMap::<u32, i64>::new(),
-            export_last:          HashMap::<u32, i64>::new(),
+            export_first:         HashMap::<u32, i64, GlobalAlloc, FnvHasher>::new(),
+            export_last:          HashMap::<u32, i64, GlobalAlloc, FnvHasher>::new(),
             export_next:          [],
             current_module:       ModulePath::none(),
             prelude_modules:      [],
-            module_scopes:        HashMap::<ModuleKey, u64>::new(),            param_bounds:         [],
-            import_targets:       HashMap::<SymbolKey, SymbolID>::new(),
-            explicit_imports:     HashMap::<SymbolKey, boolean>::new(),
+            module_scopes:        HashMap::<ModuleKey, u64, GlobalAlloc, FnvHasher>::new(),            param_bounds:         [],
+            import_targets:       HashMap::<SymbolKey, SymbolID, GlobalAlloc, FnvHasher>::new(),
+            explicit_imports:     HashMap::<SymbolKey, boolean, GlobalAlloc, FnvHasher>::new(),
         };
     }
 
@@ -1113,13 +1115,13 @@ type struct Resolver {
     /// for itself, so a declaration is never a use of itself.  The set is
     /// the whole program's: it is built once and rebuilt only after the map
     /// records again or a symbol is added.
-    referenced_declarations(mut &this) -> HashMap<u64, boolean>* {
+    referenced_declarations(mut &this) -> HashMap<u64, boolean, GlobalAlloc, FnvHasher>* {
         const n: u64 = this.symbols.length() as u64;
         if (this.referenced_symbols == n as i64
                 && this.referenced_records == this.resolution_map.records) {
             return &this.referenced;
         }
-        mut fresh: HashMap<u64, boolean> = HashMap::<u64, boolean>::new();
+        mut fresh: HashMap<u64, boolean, GlobalAlloc, FnvHasher> = HashMap::<u64, boolean, GlobalAlloc, FnvHasher>::new();
         mut it: implement Iterator<Pair<u64, SymbolID>> = this.resolution_map.singles.iter();
         loop {
             match (it.next()) {

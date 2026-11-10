@@ -44,6 +44,8 @@ import std::core::cmp::{ Eq };
 import compiler::types::type_ref::{ TypeKey };
 import compiler::types::user_defined::{ EnumType, MethodInfo, StructType };
 import std::core::intrinsics;
+import std::core::hash::{ FnvHasher };
+import std::alloc::allocator::{ GlobalAlloc };
 
 
 /// One global's registration slot, read by value: the key the slot is
@@ -255,11 +257,11 @@ type struct DeclarationIndex {
     /// set by `CompilationContext`, which owns it.
     defs: mut DefTable*;
     // Family slot (`family_slot`) -> the last signature registered in it
-    private func_type_refs: HashMap<FamilySlot, TypeRef>;
+    private func_type_refs: HashMap<FamilySlot, TypeRef, GlobalAlloc, FnvHasher>;
 
     // Reverse: a type -> the definition it was registered as, made by the
     // registration; a type's name is read off the definition.
-    type_reverse:   HashMap<TypeKey, DefId>;
+    type_reverse:   HashMap<TypeKey, DefId, GlobalAlloc, FnvHasher>;
 
     // The definition's slot in `defs` -> the type it was registered as;
     // invalid for a slot no type registration reached.
@@ -279,12 +281,12 @@ type struct DeclarationIndex {
     // (owner type << 32 | a method definition's slot in `defs`) -> the
     // entry of the owner's copy of that method: an instance's clone of its
     // template's method, a type's copy of a trait's default.
-    copy_entries:   HashMap<CopyKey, OverloadId>;
+    copy_entries:   HashMap<CopyKey, OverloadId, GlobalAlloc, FnvHasher>;
 
     // A generic function's instance - the arena instantiation of its
     // template's placeholder with the type arguments - -> the entry its copy
     // registered.
-    instance_entries: HashMap<TypeKey, OverloadId>;
+    instance_entries: HashMap<TypeKey, OverloadId, GlobalAlloc, FnvHasher>;
 
     // A global definition's slot in `defs` -> its registration slot in the
     // `module_global_*` arrays; -1 for a slot no global registration reached.
@@ -329,7 +331,7 @@ type struct DeclarationIndex {
     // that definition (e.g. `string` -> `Str` via `Str::new`) instead of
     // emitting E0214/E0200.  Keyed on the resolved canonical arena ids,
     // exactly the ids the use site sees.
-    implicit_converters: HashMap<ConversionKey, DefId>;
+    implicit_converters: HashMap<ConversionKey, DefId, GlobalAlloc, FnvHasher>;
 
     // Function registry: one entry per (family, signature, alias, symbol),
     // in parallel arrays; an entry's position is its `OverloadId`.  The
@@ -386,17 +388,17 @@ type struct DeclarationIndex {
     // in lockstep with each array push.
 
     // Family slot (`family_slot`) -> positions in the `overload_func_*` arrays.
-    private overload_index:      HashMap<FamilySlot, [u32]>;
+    private overload_index:      HashMap<FamilySlot, [u32], GlobalAlloc, FnvHasher>;
 
     // C symbol -> (key, function type id) of the FIRST `extern "C"` block
     // declaration carrying it, for W0011: a later extern block declaring the
     // same symbol with another signature is reported against this one.
 private:
-    extern_symbol_first: HashMap<u32, Pair<u32, u64>>;
+    extern_symbol_first: HashMap<u32, Pair<u32, u64>, GlobalAlloc, FnvHasher>;
 
     // Entry position -> the body of a function or method marked
     // `![inline]`, for the modules that call it to emit a copy of.
-    inline_bodies: HashMap<u32, InlineBody>;
+    inline_bodies: HashMap<u32, InlineBody, GlobalAlloc, FnvHasher>;
 
     // A method's linker symbol is mangled when something first needs it,
     // not where the method is registered: only code generation reads a
@@ -406,7 +408,7 @@ private:
     // reads the intern table and the type arena the registration was made
     // with; once `settle_method_symbols` has run, every registration
     // mangles where it is made.
-    pending_symbols:       HashMap<u32, i64>;
+    pending_symbols:       HashMap<u32, i64, GlobalAlloc, FnvHasher>;
     pending_symbol_inputs: [MethodSymbolInputs];
     symbol_intern:         mut InternTable*;
     symbol_arena:          TypeArena*;
@@ -415,7 +417,7 @@ private:
     // The linker symbols of the instances an executable leaves out: no
     // function its roots reach names them, so no module defines or
     // declares them (`compiler::codegen::reachable_instances`).
-    omitted_symbols:       HashSet<u32>;
+    omitted_symbols:       HashSet<u32, GlobalAlloc, FnvHasher>;
 public:
 
     // --- Module reachability and declaration visibility --------------------
@@ -443,7 +445,7 @@ public:
     /// declaration that exists is a second report of the first, stated as
     /// something false.  A free function's refusal is recorded on its
     /// definition (`DefTable::signature_refused`).
-    private refused_methods:     HashMap<FamilySlot, boolean>;
+    private refused_methods:     HashMap<FamilySlot, boolean, GlobalAlloc, FnvHasher>;
 
 private:
     /// This index's tag, distinct from every other index the process made;
@@ -455,14 +457,14 @@ public:
         g_overload_index_tags = g_overload_index_tags + 1;
         return DeclarationIndex {
             defs: defs,
-            func_type_refs:      HashMap::<FamilySlot, TypeRef>::new(),
-            type_reverse:        HashMap::<TypeKey, DefId>::new(),
+            func_type_refs:      HashMap::<FamilySlot, TypeRef, GlobalAlloc, FnvHasher>::new(),
+            type_reverse:        HashMap::<TypeKey, DefId, GlobalAlloc, FnvHasher>::new(),
             def_types:           [],
             def_entries:         [],
             declarations:        [],
-            copy_entries:        HashMap::<CopyKey, OverloadId>::new(),
-            instance_entries:    HashMap::<TypeKey, OverloadId>::new(),
-            implicit_converters: HashMap::<ConversionKey, DefId>::new(),
+            copy_entries:        HashMap::<CopyKey, OverloadId, GlobalAlloc, FnvHasher>::new(),
+            instance_entries:    HashMap::<TypeKey, OverloadId, GlobalAlloc, FnvHasher>::new(),
+            implicit_converters: HashMap::<ConversionKey, DefId, GlobalAlloc, FnvHasher>::new(),
             def_globals:              [],
             module_global_leaves:     [],
             module_global_threadlocal: [],
@@ -479,17 +481,17 @@ public:
             overload_func_owner_return: [],
             overload_func_family: [],
             overload_func_intrinsic: [],
-            overload_index:     HashMap::<FamilySlot, [u32]>::new(),
-            extern_symbol_first: HashMap::<u32, Pair<u32, u64>>::new(),
-            inline_bodies:      HashMap::<u32, InlineBody>::new(),
-            pending_symbols:       HashMap::<u32, i64>::new(),
+            overload_index:     HashMap::<FamilySlot, [u32], GlobalAlloc, FnvHasher>::new(),
+            extern_symbol_first: HashMap::<u32, Pair<u32, u64>, GlobalAlloc, FnvHasher>::new(),
+            inline_bodies:      HashMap::<u32, InlineBody, GlobalAlloc, FnvHasher>::new(),
+            pending_symbols:       HashMap::<u32, i64, GlobalAlloc, FnvHasher>::new(),
             pending_symbol_inputs: [],
             symbol_intern:         null,
             symbol_arena:          null,
             symbols_settled:       false,
-            omitted_symbols:       HashSet::<u32>::new(),
+            omitted_symbols:       HashSet::<u32, GlobalAlloc, FnvHasher>::new(),
             prelude_modules:    [],
-            refused_methods:    HashMap::<FamilySlot, boolean>::new(),
+            refused_methods:    HashMap::<FamilySlot, boolean, GlobalAlloc, FnvHasher>::new(),
             overload_tag:       g_overload_index_tags,
         };
     }
