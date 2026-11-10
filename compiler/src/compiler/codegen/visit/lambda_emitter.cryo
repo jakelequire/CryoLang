@@ -31,7 +31,7 @@ import compiler::ast::statement::{ Stmt, StmtKind };
 import compiler::codegen::visit::ir_generator::{ IRGeneratorVisitor };
 import compiler::codegen::abi::{ SignaturePlan };
 import compiler::codegen::context::{ CodegenContext };
-import compiler::codegen::llvm_types::{ LBasicBlock, LType, LTypeKind, LValue };
+import compiler::codegen::llvm_types::{ LBasicBlock, LLinkage, LType, LTypeKind, LValue };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::resolver::{ ResolutionContext };
@@ -97,9 +97,8 @@ type struct LambdaEmitter {
         const ctx_ptr: CompilationContext* = this.cg.ctx;
         const intern:  mut InternTable*        = this.cg.get_intern();
 
-        // Per-module counter; the namespace prefix keeps cross-module
-        // lambda symbols unique at link time (lambdas have external
-        // linkage), so each visitor instance can start fresh at 0.
+        // Per-module counter: the name only has to be unique within this
+        // module, because the function is internal (below).
         const lam_idx: u64 = this.state.lambda_counter;
         this.state.lambda_counter += 1;
         const lam_leaf: string = fmt::format("__lambda_%lld", lam_idx as i64).into_raw();
@@ -170,10 +169,16 @@ type struct LambdaEmitter {
             out.is_lvalue = false;
             return out;
         }
+        // Internal: only the enclosing function refers to the lambda, and the
+        // counter name says nothing about which lambda it is.  Linked
+        // externally, two different lambdas - one in the stdlib archive, one
+        // in a generic instance a program emits into the same module - share a
+        // name, and the program's definition is stripped as one the archive
+        // already provides, so its function value calls the archive's lambda.
+        fn_val.set_linkage(LLinkage::Internal);
         const sret_pointee: LType = if (plan.sret_slot) { plan.return_plan.pointee_ty } else { LType::null() };
         this.cg.abi.apply_signature_attributes(fn_val, sret_pointee, &plan.param_plans);
 
-        // Register so that cross-module references can find it.
         const lam_sym: SymbolStr = intern.intern(lam_name);
         this.cg.functions.register(lam_sym, fn_val);
 
