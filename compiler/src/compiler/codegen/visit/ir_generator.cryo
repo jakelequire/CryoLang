@@ -74,6 +74,7 @@ import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::compound::{ ArrayType };
 import compiler::types::generic::{ InstantiatedType };
+import compiler::types::ownership::{ OwnershipQuery };
 import compiler::types::resolver::{ ResolutionContext };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
@@ -1557,6 +1558,48 @@ type struct IRGeneratorVisitor {
 
 
     visit_member_access(mut &this, e: ExpressionNode*, node: MemberAccessExpr*) -> Emitted {
+        // A `Copy` field read through fields of a value no binding owns -
+        // `make().tag`, `make_outer().inner.tag` - copies the field out and
+        // leaves the value whole, so the value is released when the
+        // statement ends, as a borrowed one is.  A field that is not `Copy`
+        // moves out of it, and the value is not released here.
+        mut chain: [ExpressionNode*] = [e];
+        mut root: mut ExpressionNode* = node.object;
+        while (ExpressionNode::member_access_of(root) != null) {
+            chain.push(root);
+            root = ExpressionNode::member_access_of(root).object;
+        }
+        if (OwnershipQuery::is_owning_temporary(this.cg.get_arena(), this.cg.ctx.generic_registry,
+                    this.cg.get_intern(), root)
+                && OwnershipQuery::is_copy(this.cg.get_arena(), this.cg.ctx.generic_registry,
+                    this.cg.get_intern(), e.resolved_type)) {
+            const root_e: Emitted = this.dispatch.generate_expression(this, root);
+            // A value returned in registers is stored to a slot; one the
+            // call wrote through a hidden result pointer is that pointer.
+            mut place: LValue = root_e.value;
+            if (!root_e.is_lvalue && place.is_valid()
+                    && LType::kind_of(llvm::LLVMTypeOf(place.raw)) != LTypeKind::Pointer) {
+                const slot: LValue = this.cg.flow.temp_slot(LType { raw: llvm::LLVMTypeOf(place.raw) }, "fieldbase");
+                this.cg.builder.build_store(place, slot);
+                place = slot;
+            }
+            this.cg.record_borrowed_temporary(root, place);
+            mut is_place: boolean = true;
+            for (mut i: i64 = chain.length() - 1; i >= 0; i--) {
+                const step_access: MemberAccessExpr* = ExpressionNode::member_access_of(chain[i]);
+                const step: Emitted = this.places.codegen_member_access(place, step_access.object.resolved_type,
+                    is_place, step_access.member, step_access.resolved_member, step_access.pin_carried,
+                    chain[i].span);
+                place = step.value;
+                is_place = step.is_lvalue;
+            }
+            mut out: Emitted = Emitted::none();
+            out.value = if (is_place && place.is_valid()) {
+                this.cg.builder.build_load(this.cg.type_mapper.map_type(e.resolved_type), place, "fieldval")
+            } else { place };
+            out.is_lvalue = false;
+            return out;
+        }
         // The receiver as it was emitted, place or value: `f().field` gives
         // a value, so the autoderef inside member-access codegen knows not
         // to over-load the call's pointer rvalue.

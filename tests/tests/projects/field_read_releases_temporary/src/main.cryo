@@ -1,0 +1,66 @@
+namespace FieldReadReleasesTemporary;
+
+import std::core::drop::{ Drop };
+
+// A field read straight off a value no binding owns - a call's result, a
+// struct literal - copies the field out, and the value is released when the
+// statement ends, exactly once.
+
+mut g_released: i64 = 0;
+
+type struct Counted {
+    tag: i64;
+    weight: i32;
+}
+
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void { g_released = g_released + 1; }
+}
+
+type struct Outer {
+    inner: Counted;
+    id: i64;
+}
+
+type struct Wide {
+    a: i64;
+    b: i64;
+    c: i64;
+    d: i64;
+    e: i64;
+    f: i64;
+}
+
+implement trait Drop for struct Wide {
+    drop(mut &this) -> void { g_released = g_released + 100; }
+}
+
+function make(t: i64) -> Counted { return Counted { tag: t, weight: 2 }; }
+function make_wide(t: i64) -> Wide { return Wide { a: t, b: t, c: t, d: t, e: t, f: t + 5 }; }
+function make_outer(t: i64) -> Outer { return Outer { inner: make(t), id: t + 1 }; }
+
+function main() -> i32 {
+    const tag: i64 = make(10).tag;
+    if (tag != 10) { return 1; }
+    if (g_released != 1) { return 2; }
+    if (make(3).weight + make(4).weight != 4) { return 3; }
+    if (g_released != 3) { return 4; }
+    const id: i64 = make_outer(7).id;
+    if (id != 8 || g_released != 4) { return 5; }
+    const deep: i64 = make_outer(20).inner.tag;
+    if (deep != 20 || g_released != 5) { return 6; }
+    // A value returned through a hidden result pointer.
+    const last: i64 = make_wide(1).f;
+    if (last != 6 || g_released != 105) { return 7; }
+    // A struct literal's field.
+    const literal: i64 = Counted { tag: 30, weight: 1 }.tag;
+    if (literal != 30 || g_released != 106) { return 8; }
+    // A field that is not `Copy` moves out: the binding owns it and
+    // releases it once, and the value it came from is not released here.
+    {
+        const moved: Counted = make_outer(40).inner;
+        if (moved.tag != 40 || g_released != 106) { return 9; }
+    }
+    if (g_released != 107) { return 10; }
+    return 0;
+}
