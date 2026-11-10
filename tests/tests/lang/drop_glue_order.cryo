@@ -193,7 +193,34 @@ function unwinds_through_owning_locals() -> i64 {
 ![test]
 function unwinding_releases_each_live_value_once() -> Result<(), TestError> {
     reset();
-    const outcome: Result<i64, PanicInfo> = catch_unwind::<i64>(unwinds_through_owning_locals);
+    const outcome: Result<i64, PanicInfo> = catch_unwind(unwinds_through_owning_locals);
     expect_true(outcome.is_err(), Str::new("the panic must reach catch_unwind"))?;
     return expect_eq(g_log, 1234);
+}
+
+// A closure given to `catch_unwind` owns what it captured with `move`, and
+// is released once when `catch_unwind` returns, on either path.
+![test]
+function catch_unwind_runs_a_capturing_closure() -> Result<(), TestError> {
+    reset();
+    const kept: Probe = Probe { tag: 5 };
+    const outcome: Result<i64, PanicInfo> = catch_unwind(move () -> i64 { return kept.tag * 2; });
+    expect_true(outcome.is_ok(), Str::new("a body that returns is Ok"))?;
+    expect_eq(outcome.unwrap_or(0), 10)?;
+    return expect_eq(g_log, 5);
+}
+
+![test]
+function catch_unwind_releases_a_panicking_closure_once() -> Result<(), TestError> {
+    reset();
+    const kept: Probe = Probe { tag: 7 };
+    const limit: i64 = 3;
+    const outcome: Result<i64, PanicInfo> = catch_unwind(move () -> i64 {
+        if (kept.tag > limit) {
+            intrinsics::panic("the closure panics", intrinsics::location());
+        }
+        return kept.tag;
+    });
+    expect_true(outcome.is_err(), Str::new("the closure's panic must reach catch_unwind"))?;
+    return expect_eq(g_log, 7);
 }
