@@ -401,6 +401,83 @@ public type struct Str {
         return CharIndices { bytes: this.bytes, length: this.length, pos: 0 };
     }
 
+    /// Iterator over the lines of this string: the pieces between `\n`
+    /// bytes, each without its `\n` or a `\r` just before it. A final line
+    /// break ends the last line rather than starting an empty one, so
+    /// `"a\r\nb\n"` yields `"a"` and `"b"`, and an empty string yields no
+    /// line. Each line borrows from this string.
+    public lines(&this) -> implement Iterator<Str> {
+        return Lines { bytes: this.bytes, length: this.length, position: 0 };
+    }
+
+    /// Iterator over the pieces of this string between runs of ASCII
+    /// whitespace (space, tab, LF, VT, FF, CR). Leading, trailing and
+    /// repeated whitespace yields no empty piece, so `"  a \t b "` yields
+    /// `"a"` and `"b"`. Each piece borrows from this string.
+    public split_whitespace(&this) -> implement Iterator<Str> {
+        return WhitespaceSplit { bytes: this.bytes, length: this.length, position: 0 };
+    }
+
+    /// This string written `count` times over, as a new `String`. Zero or
+    /// less gives the empty string. Panics when the length overflows `i64`.
+    public repeat(&this, count: i64) -> String {
+        if (count <= 0) { return String::new(); }
+        const total: i64 = match (this.length.checked_multiply(count)) {
+            Option::Some(n) => { n }
+            Option::None => {
+                core::panic("Str::repeat: length overflows i64", intrinsics::location())
+            }
+        };
+        mut out: String = String::with_capacity(total);
+        for (mut i: i64 = 0; i < count; i++) {
+            out.push(*this);
+        }
+        return out;
+    }
+
+    /// Every piece `parts` yields, in order, with this string between each
+    /// two: `Str::new(", ").join(names.iter())` gives `"a, b, c"`. No
+    /// piece gives the empty string.
+    public join<I>(&this, parts: I) -> String
+    where I: Iterator<Str> {
+        mut pieces: I = parts;
+        mut out: String = String::new();
+        mut first: boolean = true;
+        loop {
+            match (pieces.next()) {
+                Option::Some(piece) => {
+                    if (!first) { out.push(*this); }
+                    out.push(piece);
+                    first = false;
+                }
+                Option::None => { break; }
+            }
+        }
+        return out;
+    }
+
+    /// The number of Unicode scalars in this string: what `chars` yields,
+    /// so each byte that is not well-formed UTF-8 counts as one.
+    public char_count(&this) -> i64 {
+        mut count: i64 = 0;
+        mut position: i64 = 0;
+        while (position < this.length) {
+            position = position + decode_scalar(this.bytes, this.length, position).second;
+            count = count + 1;
+        }
+        return count;
+    }
+
+    /// Whether byte offset `index` falls between two scalars, where
+    /// `sub_bytes` can cut without splitting one: the start, the end, and
+    /// any byte that is not a UTF-8 continuation byte. An offset outside
+    /// `[0, length]` is no boundary.
+    public is_char_boundary(&this, index: i64) -> boolean {
+        if (index == 0 || index == this.length) { return true; }
+        if (index < 0 || index > this.length) { return false; }
+        return (this.bytes[index] & 0xC0) != 0x80;
+    }
+
     /// The value these bytes write as hexadecimal digits, every byte one.
     public try_to_hex(&this) -> Result<u64, ConversionError> {
         return this.digits_value(16);
@@ -475,6 +552,47 @@ implement trait Iterator<Str> for struct SplitIter {
             }
         }
         return Option::None;
+    }
+}
+
+/// Lazy iterator over the lines of a `Str`; see `Str::lines`.
+internal type struct Lines {
+    private bytes:    u8*;
+    private length:   i64;
+    private position: i64;
+}
+
+implement trait Iterator<Str> for struct Lines {
+    next(mut &this) -> Option<Str> {
+        if (this.position >= this.length) { return Option::None; }
+        const start: i64 = this.position;
+        mut end: i64 = start;
+        while (end < this.length && this.bytes[end] != '\n' as u8) { end = end + 1; }
+        this.position = end + 1;
+        if (end < this.length && end > start && this.bytes[end - 1] == '\r' as u8) { end = end - 1; }
+        return Option::Some(Str { bytes: this.bytes + start, length: end - start });
+    }
+}
+
+/// Lazy iterator over the whitespace-separated pieces of a `Str`; see
+/// `Str::split_whitespace`.
+internal type struct WhitespaceSplit {
+    private bytes:    u8*;
+    private length:   i64;
+    private position: i64;
+}
+
+implement trait Iterator<Str> for struct WhitespaceSplit {
+    next(mut &this) -> Option<Str> {
+        while (this.position < this.length && this.bytes[this.position].is_whitespace()) {
+            this.position = this.position + 1;
+        }
+        if (this.position >= this.length) { return Option::None; }
+        const start: i64 = this.position;
+        while (this.position < this.length && !this.bytes[this.position].is_whitespace()) {
+            this.position = this.position + 1;
+        }
+        return Option::Some(Str { bytes: this.bytes + start, length: this.position - start });
     }
 }
 
