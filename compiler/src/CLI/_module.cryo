@@ -149,21 +149,23 @@ public:
     /// stderr (matching the CLI's plain `Error:` style) and returns false, so
     /// the caller exits non-zero.  Two checks:
     ///   1. every flag must be in the known union (`is_known_flag`) - catches
-    ///      typos like `--relese` that would otherwise be silently ignored;
+    ///      typos like `--relese` that would otherwise be silently ignored -
+    ///      unless the command hands undeclared options on
+    ///      (`forwards_undeclared`), where the program they reach judges them;
     ///   2. `--output=`/`--target=` must carry a non-empty value - an empty
     ///      value would otherwise be silently accepted (dropping `-o`, etc.).
     /// `-D` defines live in a separate list and are intentionally not checked.
-    validate(&this) -> boolean {
+    validate(&this, forwards_undeclared: boolean) -> boolean {
         for (mut i: i64 = 0; i < this.flags.length(); i++) {
             const key: string = this.flags[i].first;
-            if (!ArgumentParser::is_known_flag(key)) {
+            if (!forwards_undeclared && !ArgumentParser::is_known_flag(key)) {
                 fmt::eprintf("Error: unknown flag '--%s'. Run 'cryo help flags' for the list.\n", key);
                 return false;
             }
         }
         for (mut i: i64 = 0; i < this.args.length(); i++) {
             const key: string = this.args[i].first;
-            if (!ArgumentParser::is_known_flag(key)) {
+            if (!forwards_undeclared && !ArgumentParser::is_known_flag(key)) {
                 fmt::eprintf("Error: unknown flag '--%s'. Run 'cryo help flags' for the list.\n", key);
                 return false;
             }
@@ -177,6 +179,25 @@ public:
             }
         }
         return true;
+    }
+
+    /// Every flag and `--key=value` argument the compiler declares no flag
+    /// for, written back as given (`--key`, `-k`, `--key=value`), each after
+    /// a space: what `cryo test` hands the test binary unread.
+    undeclared_options(&this) -> string {
+        mut out: string = "";
+        for (mut i: i64 = 0; i < this.flags.length(); i++) {
+            const key: string = this.flags[i].first;
+            if (ArgumentParser::is_known_flag(key)) { continue; }
+            const dashes: string = if (key.length() == 1) { "-" } else { "--" };
+            out = fmt::format("%s %s%s", out, dashes, key).into_raw();
+        }
+        for (mut i: i64 = 0; i < this.args.length(); i++) {
+            const key: string = this.args[i].first;
+            if (ArgumentParser::is_known_flag(key)) { continue; }
+            out = fmt::format("%s --%s=%s", out, key, this.args[i].second.default_value).into_raw();
+        }
+        return out;
     }
 }
 
@@ -400,14 +421,16 @@ public:
                 }
             }
             const args: ParsedArgs = ArgumentParser::parse(argc, argv, 2);
-            if (!args.validate()) { return 1; }
+            // `cryo test` hands the options it does not declare to the test
+            // binary, whose runner declares its own.
+            if (!args.validate(resolved == commands::CommandKind::Test)) { return 1; }
             return this.dispatch(first_arg, args);
         }
 
         // Not a known command; treat as a file for direct compilation
         if (path::Path::from(first_arg).exists()) {
             const args: ParsedArgs = ArgumentParser::parse(argc, argv, 2);
-            if (!args.validate()) { return 1; }
+            if (!args.validate(false)) { return 1; }
             return cli::commands::Executor::compile_file(first_arg, args);
         }
 

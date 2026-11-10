@@ -218,6 +218,11 @@ A built test binary takes the same flags, and `-j N` for `--jobs`. A flag it
 does not know is an error: it prints the flag and its usage to stderr and exits
 with code 2 before running anything.
 
+`cryo test` hands every option the compiler declares no flag for to the test
+binary as written - `cryo test --no-capture` reaches the runner's
+`--no-capture` - so the runner, not the compiler, judges it. Every other
+command refuses an option the compiler does not declare.
+
 ---
 
 ## 5. Project layout
