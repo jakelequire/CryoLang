@@ -1,0 +1,109 @@
+///! Percent-encoding (RFC 3986): a byte a URI cannot carry as itself is
+///! written `%` and two hexadecimal digits.
+///!
+///! Encoding leaves the unreserved characters (`A`-`Z`, `a`-`z`, `0`-`9`,
+///! `-`, `.`, `_`, `~`) as they are and escapes every other byte, with
+///! uppercase digits. A path keeps its `/` separators too. Decoding turns
+///! every escape back into its byte; `+` stays `+`, since it means a space
+///! only in HTML form data.
+///!
+///! ```cryo
+///! import std::collections::str::{ Str };
+///! import std::collections::string::{ String };
+///! import std::encoding::percent::{ PercentEncoding };
+///!
+///! const query: String = PercentEncoding::encode_component(Str::new("a b&c"));   // "a%20b%26c"
+///! ```
+
+namespace std::encoding::percent;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::encoding::error::{ DecodeError, DecodeErrorKind };
+
+/// The escape character, `%`.
+private const ESCAPE: u8 = 0x25;
+/// The path separator, `/`.
+private const SEPARATOR: u8 = 0x2F;
+
+/// The percent-encoding codec. Stateless; its operations are statics.
+public type struct PercentEncoding {
+    /// `text` with every byte but the unreserved characters escaped: safe
+    /// as one path segment, query key or query value.
+    public static encode_component(text: Str) -> String {
+        return PercentEncoding::encode_keeping(text, false);
+    }
+
+    /// `text` with every byte but the unreserved characters and `/`
+    /// escaped: safe as a whole URI path.
+    public static encode_path(text: Str) -> String {
+        return PercentEncoding::encode_keeping(text, true);
+    }
+
+    /// `text` with every `%XX` escape replaced by its byte. Refuses an
+    /// escape without two hexadecimal digits (`InvalidEscape`, at its `%`)
+    /// and a result that is not UTF-8 (`InvalidUtf8`, at the input byte
+    /// that starts the bad sequence).
+    public static decode(text: Str) -> Result<String, DecodeError> {
+        const bytes: &Slice<u8> = text.as_bytes();
+        const length: i64 = bytes.length();
+        mut out: Array<u8> = Array::<u8>::with_capacity(length);
+        mut i: i64 = 0;
+        while (i < length) {
+            if (bytes[i] != ESCAPE) {
+                out.push(bytes[i]);
+                i = i + 1;
+                continue;
+            }
+            if (i + 3 > length) {
+                return Result::Err(DecodeError::new(DecodeErrorKind::InvalidEscape, i));
+            }
+            match (u64::parse_radix(bytes.subslice(i + 1, i + 3), 16)) {
+                Option::Some(value) => { out.push(value as u8); }
+                Option::None => {
+                    return Result::Err(DecodeError::new(DecodeErrorKind::InvalidEscape, i));
+                }
+            }
+            i = i + 3;
+        }
+        match (String::from_utf8(out)) {
+            Result::Ok(decoded) => { return Result::Ok(decoded); }
+            Result::Err(error) => {
+                // Walk the input to the byte that produced decoded byte
+                // `valid_up_to`: an escape makes one byte of three.
+                mut input: i64 = 0;
+                mut produced: i64 = 0;
+                while (produced < error.valid_up_to) {
+                    if (bytes[input] == ESCAPE) { input = input + 3; } else { input = input + 1; }
+                    produced = produced + 1;
+                }
+                return Result::Err(DecodeError::new(DecodeErrorKind::InvalidUtf8, input));
+            }
+        }
+    }
+
+    /// `text` with every byte escaped except the unreserved characters,
+    /// and `/` when `keep_separator` is set.
+    private static encode_keeping(text: Str, keep_separator: boolean) -> String {
+        const bytes: &Slice<u8> = text.as_bytes();
+        mut out: String = String::with_capacity(bytes.length());
+        mut digits: [u8; 2];
+        for (byte in bytes.iter()) {
+            const unreserved: boolean = byte.is_alpha() || byte.is_digit()
+                || byte == '-' as u8 || byte == '.' as u8 || byte == '_' as u8 || byte == '~' as u8;
+            if (unreserved || (keep_separator && byte == SEPARATOR)) {
+                out.push_byte(byte);
+            } else {
+                (byte as u64).to_hex_padded_upper_buf(&digits[0], 2);
+                out.push_byte(ESCAPE);
+                out.push_byte(digits[0]);
+                out.push_byte(digits[1]);
+            }
+        }
+        return out;
+    }
+}

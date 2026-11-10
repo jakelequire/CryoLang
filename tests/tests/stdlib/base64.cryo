@@ -1,8 +1,7 @@
-///! Base64 (RFC 4648) encode / decode known-answer vectors.
+///! Base64 (RFC 4648) encode / decode known-answer vectors, in all four
+///! variants, and the decoder's refusals with the byte each one names.
 ///!
-///! `encode(data, len) -> String` (standard alphabet, with padding) and
-///! `decode(src: Str) -> Option<Array<u8>>` (rejects bad length / bad
-///! characters / misplaced padding). The RFC 4648 section 10 test vectors:
+///! The RFC 4648 section 10 test vectors:
 ///!
 ///!   ""       -> ""
 ///!   "f"      -> "Zg=="
@@ -16,56 +15,49 @@
 namespace CryoTests::Tests::Stdlib::Base64T;
 
 import std::core::result::{ Result };
-import std::core::option::{ Option };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::collections::array::{ Array };
-import std::encoding::base64;
+import std::encoding::base64::{ Base64 };
+import std::encoding::error::{ DecodeError, DecodeErrorKind };
+import std::fmt::display;
 import std::test::error::{ TestError };
-import std::test::assert::{ bail, expect };
+import std::test::assert::{ bail, expect, expect_eq };
 
-/// Encode `input` and assert the resulting String equals `want`.
+/// Encode the bytes of `input` with `variant` and assert the text is `want`.
+function check_encode_with(variant: Base64, input: Str, want: string) -> Result<(), TestError> {
+    const got: String = variant.encode(input.as_bytes());
+    return expect(got.as_str().equals(&Str::new(want)), Str::new(want));
+}
+
 function check_encode(input: Str, want: string) -> Result<(), TestError> {
-    mut got: String = base64::encode(input.as_ptr(), input.length());
-    const ok: boolean = got.as_str().equals(&Str::new(want));
-    return expect(ok, Str::new(want));
+    return check_encode_with(Base64::standard(), input, want);
 }
 
-/// Decode `input`, assert it succeeds and the decoded bytes equal the
-/// bytes of the ASCII string `want`.
+/// Decode `input` with `variant` and assert the bytes are those of `want`.
+function check_decode_with(variant: Base64, input: string, want: string) -> Result<(), TestError> {
+    match (variant.decode(Str::new(input))) {
+        Result::Ok(bytes) => {
+            return expect(bytes.as_slice().equals(Str::new(want).as_bytes()), Str::new(input));
+        }
+        Result::Err(_) => { return bail(Str::new(input)); }
+    }
+}
+
 function check_decode(input: string, want: string) -> Result<(), TestError> {
-    const want_view: Str = Str::new(want);
-    match (base64::decode(Str::new(input))) {
-        Option::Some(bytes) => {
-            mut decoded: Array<u8> = bytes;
-            mut ok: boolean = decoded.length() == want_view.length();
-            mut i: i64 = 0;
-            while (ok && i < want_view.length()) {
-                match (want_view.byte_at(i)) {
-                    Option::Some(b) => {
-                        match (decoded.get(i)) {
-                            Option::Some(d) => { if (d != b) { ok = false; } }
-                            Option::None    => { ok = false; }
-                        }
-                    }
-                    Option::None    => { ok = false; }
-                }
-                i++;
-            }
-            return expect(ok, Str::new(input));
-        }
-        Option::None => { return bail(Str::new(input)); }
+    return check_decode_with(Base64::standard(), input, want);
+}
+
+/// Assert that `variant` refuses `input` with `kind` at byte `position`.
+function check_reject_with(variant: Base64, input: string, kind: DecodeErrorKind, position: i64) -> Result<(), TestError> {
+    match (variant.decode(Str::new(input))) {
+        Result::Ok(_) => { return bail(Str::new(input)); }
+        Result::Err(error) => { return expect_eq(error, DecodeError::new(kind, position)); }
     }
 }
 
-/// Assert that `decode(input)` rejects the input (returns None).
-function check_reject(input: string) -> Result<(), TestError> {
-    match (base64::decode(Str::new(input))) {
-        Option::Some(_) => {
-            return bail(Str::new(input));
-        }
-        Option::None => { return Result::Ok(()); }
-    }
+function check_reject(input: string, kind: DecodeErrorKind, position: i64) -> Result<(), TestError> {
+    return check_reject_with(Base64::standard(), input, kind, position);
 }
 
 // --- encode: RFC 4648 vectors -----------------------------------------
@@ -109,11 +101,70 @@ function encode_foobar() -> Result<(), TestError> {
 // bytes {0xFB, 0xFF, 0xBF} -> "+/+/"
 ![test]
 function encode_plus_slash_alphabet() -> Result<(), TestError> {
-    mut data: [u8; 3];
-    data[0] = 0xFB; data[1] = 0xFF; data[2] = 0xBF;
-    mut got: String = base64::encode(&data[0], 3);
-    const ok: boolean = got.as_str().equals(&Str::new("+/+/"));
-    return expect(ok, Str::new("{0xFB,0xFF,0xBF} should encode to '+/+/'"));
+    const data: [u8; 3] = [0xFB, 0xFF, 0xBF];
+    const got: String = Base64::standard().encode(data.as_slice());
+    return expect(got.as_str().equals(&Str::new("+/+/")), Str::new("{0xFB,0xFF,0xBF} should encode to '+/+/'"));
+}
+
+// --- the other three variants -----------------------------------------
+
+// The same bytes take '-' and '_' in the URL-safe alphabet.
+![test]
+function encode_url_safe_alphabet() -> Result<(), TestError> {
+    const data: [u8; 3] = [0xFB, 0xFF, 0xBF];
+    const got: String = Base64::url_safe().encode(data.as_slice());
+    return expect(got.as_str().equals(&Str::new("-_-_")), Str::new("{0xFB,0xFF,0xBF} should encode to '-_-_'"));
+}
+
+![test]
+function encode_unpadded_drops_padding() -> Result<(), TestError> {
+    check_encode_with(Base64::standard_unpadded(), Str::new("f"), "Zg")?;
+    check_encode_with(Base64::standard_unpadded(), Str::new("fo"), "Zm8")?;
+    check_encode_with(Base64::standard_unpadded(), Str::new("foo"), "Zm9v")?;
+    check_encode_with(Base64::url_safe_unpadded(), Str::new("hi?"), "aGk_")?;
+    return check_encode_with(Base64::url_safe(), Str::new("f"), "Zg==");
+}
+
+![test]
+function encoded_length_matches_encode() -> Result<(), TestError> {
+    expect_eq(Base64::standard().encoded_length(4), 8)?;
+    expect_eq(Base64::standard_unpadded().encoded_length(4), 6)?;
+    expect_eq(Base64::standard_unpadded().encoded_length(5), 7)?;
+    return expect_eq(Base64::url_safe_unpadded().encoded_length(6), 8);
+}
+
+![test]
+function encode_into_appends() -> Result<(), TestError> {
+    mut text: String = String::from_str(Str::new("key="));
+    Base64::standard().encode_into(Str::new("fo").as_bytes(), &text);
+    return expect(text.as_str().equals(&Str::new("key=Zm8=")), Str::new("encode_into appends after what is there"));
+}
+
+![test]
+function decode_unpadded_and_url_safe() -> Result<(), TestError> {
+    check_decode_with(Base64::standard_unpadded(), "Zg", "f")?;
+    check_decode_with(Base64::standard_unpadded(), "Zm8", "fo")?;
+    check_decode_with(Base64::url_safe_unpadded(), "aGk_", "hi?")?;
+    return check_decode_with(Base64::url_safe(), "aGk_", "hi?");
+}
+
+![test]
+function decode_refuses_the_other_alphabet() -> Result<(), TestError> {
+    check_reject_with(Base64::url_safe(), "+/+/", DecodeErrorKind::InvalidCharacter, 0)?;
+    return check_reject("-_-_", DecodeErrorKind::InvalidCharacter, 0);
+}
+
+![test]
+function decode_unpadded_refuses_padding_and_bad_length() -> Result<(), TestError> {
+    check_reject_with(Base64::standard_unpadded(), "Zg==", DecodeErrorKind::InvalidPadding, 2)?;
+    return check_reject_with(Base64::standard_unpadded(), "Zm9vY", DecodeErrorKind::InvalidLength, 5);
+}
+
+![test]
+function decode_error_displays_kind_and_position() -> Result<(), TestError> {
+    const error: DecodeError = DecodeError::new(DecodeErrorKind::InvalidPadding, 2);
+    const text: String = display::format_to_string(&error).unwrap();
+    return expect(text.as_str().equals(&Str::new("invalid padding at byte 2")), text.as_str());
 }
 
 // --- decode: round-trip of the RFC 4648 vectors -----------------------
@@ -158,25 +209,25 @@ function decode_foobar() -> Result<(), TestError> {
 // Length not a multiple of 4.
 ![test]
 function decode_rejects_bad_length() -> Result<(), TestError> {
-    return check_reject("Zg=");
+    return check_reject("Zg=", DecodeErrorKind::InvalidLength, 3);
 }
 
 // '!' is outside the base64 alphabet.
 ![test]
 function decode_rejects_invalid_char() -> Result<(), TestError> {
-    return check_reject("Zm9!");
+    return check_reject("Zm9!", DecodeErrorKind::InvalidCharacter, 3);
 }
 
 // Padding in the middle of a group (a non-pad symbol follows a pad).
 ![test]
 function decode_rejects_pad_in_middle() -> Result<(), TestError> {
-    return check_reject("Z=g=");
+    return check_reject("Z=g=", DecodeErrorKind::InvalidPadding, 1);
 }
 
 // Whitespace is explicitly not tolerated by this decoder.
 ![test]
 function decode_rejects_whitespace() -> Result<(), TestError> {
-    return check_reject("Zm 9");
+    return check_reject("Zm 9", DecodeErrorKind::InvalidCharacter, 2);
 }
 
 // --- decode: cross-group padding (RFC 4648 - pad only in the final group) ---
@@ -187,23 +238,23 @@ function decode_rejects_whitespace() -> Result<(), TestError> {
 // the LAST group.
 ![test]
 function decode_rejects_pad_before_final_group() -> Result<(), TestError> {
-    return check_reject("AB==CDEF");
+    return check_reject("AB==CDEF", DecodeErrorKind::InvalidPadding, 2);
 }
 
 // Three pad chars in the final group (only 1 or 2 are valid).
 ![test]
 function decode_rejects_three_pads() -> Result<(), TestError> {
-    return check_reject("A===");
+    return check_reject("A===", DecodeErrorKind::InvalidPadding, 1);
 }
 
 // A whole group of padding.
 ![test]
 function decode_rejects_all_pad_group() -> Result<(), TestError> {
-    return check_reject("====");
+    return check_reject("====", DecodeErrorKind::InvalidPadding, 0);
 }
 
 // A full data group followed by a pure-padding group.
 ![test]
 function decode_rejects_data_then_pad_group() -> Result<(), TestError> {
-    return check_reject("AAAA====");
+    return check_reject("AAAA====", DecodeErrorKind::InvalidPadding, 4);
 }

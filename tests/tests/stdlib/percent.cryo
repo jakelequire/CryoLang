@@ -1,0 +1,77 @@
+///! Percent-encoding (RFC 3986): what each encoder escapes and keeps, the
+///! decoder's round trip, and its refusals with the byte each one names.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::PercentT;
+
+import std::core::result::{ Result };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::encoding::error::{ DecodeError, DecodeErrorKind };
+import std::encoding::percent::{ PercentEncoding };
+import std::test::error::{ TestError };
+import std::test::assert::{ bail, expect, expect_eq };
+
+function check_text(got: String, want: string) -> Result<(), TestError> {
+    return expect(got.as_str().equals(&Str::new(want)), got.as_str());
+}
+
+function check_decode(input: string, want: string) -> Result<(), TestError> {
+    match (PercentEncoding::decode(Str::new(input))) {
+        Result::Ok(text) => { return check_text(text, want); }
+        Result::Err(_) => { return bail(Str::new(input)); }
+    }
+}
+
+function check_reject(input: string, kind: DecodeErrorKind, position: i64) -> Result<(), TestError> {
+    match (PercentEncoding::decode(Str::new(input))) {
+        Result::Ok(_) => { return bail(Str::new(input)); }
+        Result::Err(error) => { return expect_eq(error, DecodeError::new(kind, position)); }
+    }
+}
+
+![test]
+function component_keeps_unreserved_only() -> Result<(), TestError> {
+    check_text(PercentEncoding::encode_component(Str::new("AZaz09-._~")), "AZaz09-._~")?;
+    check_text(PercentEncoding::encode_component(Str::new("a b&c=d/e?")), "a%20b%26c%3Dd%2Fe%3F")?;
+    return check_text(PercentEncoding::encode_component(Str::new("100%+")), "100%25%2B");
+}
+
+![test]
+function component_escapes_every_utf8_byte() -> Result<(), TestError> {
+    return check_text(PercentEncoding::encode_component(Str::new("na\u{ef}ve")), "na%C3%AFve");
+}
+
+![test]
+function path_keeps_separators() -> Result<(), TestError> {
+    return check_text(PercentEncoding::encode_path(Str::new("/home/my files/r\u{e9}sum\u{e9}.txt")), "/home/my%20files/r%C3%A9sum%C3%A9.txt");
+}
+
+![test]
+function decode_round_trips() -> Result<(), TestError> {
+    check_decode("a%20b%26c%3Dd%2Fe%3F", "a b&c=d/e?")?;
+    check_decode("na%C3%AFve", "na\u{ef}ve")?;
+    check_decode("lower%2fcase%c3%a9", "lower/case\u{e9}")?;
+    check_decode("", "")?;
+    return check_decode("plus+stays", "plus+stays");
+}
+
+![test]
+function decode_refuses_short_escape() -> Result<(), TestError> {
+    check_reject("ab%2", DecodeErrorKind::InvalidEscape, 2)?;
+    return check_reject("100%", DecodeErrorKind::InvalidEscape, 3);
+}
+
+![test]
+function decode_refuses_non_hex_escape() -> Result<(), TestError> {
+    check_reject("a%G1", DecodeErrorKind::InvalidEscape, 1)?;
+    return check_reject("a%+1b", DecodeErrorKind::InvalidEscape, 1);
+}
+
+// The third escape, at input byte 6, makes a lone continuation byte, so
+// the error names input byte 6, not decoded byte 2.
+![test]
+function decode_refuses_bytes_that_are_not_utf8() -> Result<(), TestError> {
+    check_reject("%41%42%80", DecodeErrorKind::InvalidUtf8, 6)?;
+    return check_reject("ab%FFc", DecodeErrorKind::InvalidUtf8, 2);
+}
