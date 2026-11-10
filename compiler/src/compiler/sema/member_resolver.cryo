@@ -28,7 +28,7 @@ import std::fmt;
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry, TemplateKind };
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::ast::declaration::{
-    DeclarationNode, FieldDecl, FunctionDecl, ImplBlock, MethodDecl, StructDecl, UnionDecl
+    DeclarationNode, FieldDecl, FunctionDecl, ImplBlock, MethodDecl, StructDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
     ArrayAccessExpr, CallExpr, ExpressionNode, MemberAccessExpr
@@ -230,7 +230,7 @@ type struct MemberResolver {
             const method_ret: TypeRef =
                 this.method_return_through_door(walk_ty, member);
             if (method_ret.is_valid()) {
-                this.report_method_read(member, type_name, acc_span);
+                this.report_method_read(member, type_name, walk_ty, acc_span);
                 return TypeRef::invalid();
             }
 
@@ -244,7 +244,7 @@ type struct MemberResolver {
             const coerced: TypeRef = this.try_deref_coercion(visitor, member_e, member);
             if (coerced.is_valid()) {
                 if (!member.resolved_member.is_some()) {
-                    this.report_method_read(member, type_name, acc_span);
+                    this.report_method_read(member, type_name, TypeRef::invalid(), acc_span);
                     return TypeRef::invalid();
                 }
                 return coerced;
@@ -298,16 +298,48 @@ type struct MemberResolver {
 
     /// `obj.m` read as a value where `m` names a method of the receiver's
     /// type and no field: a method is reached only by calling it, so the
-    /// read names nothing a value can be taken from.
+    /// read names nothing a value can be taken from.  The call `m()` is the
+    /// fix only when it is certain to type: `owner` (null when the method
+    /// was reached through a `Deref` pointee) declares exactly one `m`, read
+    /// through `&this`, with no other parameter and no type parameter of
+    /// its own.  Any other method gets the advice alone, its arguments or
+    /// receiver being the author's to supply.
     report_method_read(mut &this, member: MemberAccessExpr*, type_name: string,
-                       span: SourceSpan) -> void {
+                       owner: TypeRef, span: SourceSpan) -> void {
         const name: string = this.intern.resolve(member.member);
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0204_UNDEFINED_FIELD,
             fmt::format("no field `%s` on type `%s`", name, type_name));
         d = d.at_with_label(span, "a method, not a field");
-        d = d.help(fmt::format("`%s` is a method; call it with its arguments", name));
+        if (this.called_without_arguments(owner, member.member)) {
+            d = d.suggest(Suggestion::machine_applicable(span, fmt::format("%s()", name).into_raw(),
+                fmt::format("`%s` is a method that takes no arguments; call it", name)));
+        } else {
+            d = d.help(fmt::format("`%s` is a method; call it with its arguments", name));
+        }
         this.ctx.emit_diagnostic(d);
+    }
+
+    /// Whether `owner` declares exactly one method `leaf`, an instance
+    /// method read through `&this` with no other parameter and no type
+    /// parameter of its own: `recv.leaf()` then types on any readable
+    /// receiver of `owner`.
+    called_without_arguments(&this, owner: TypeRef, leaf: SymbolStr) -> boolean {
+        if (!owner.is_valid()) { return false; }
+        const method_owner: TypeRef = this.types.method_owner_ref(owner);
+        if (!method_owner.is_valid()) { return false; }
+        const entries: [OverloadId] = this.ctx.decl_index.lookup_family_entries(
+            FamilyOwner::Type(method_owner), leaf);
+        if (entries.length() != 1) { return false; }
+        const method: MethodDecl* = DeclarationNode::method_of(this.ctx.decl_index.entry_method(entries[0]));
+        if (method == null || method.is_static || method.func == null) { return false; }
+        const func: FunctionDecl* = DeclarationNode::fn_of(method.func);
+        if (func.generic_params.length() != 0 || func.parameters.length() != 1) { return false; }
+        const receiver: VarDecl* = DeclarationNode::var_of(func.parameters[0]);
+        if (receiver == null || !receiver.is_receiver()) { return false; }
+        const receiver_t: Type* = this.arena.lookup(receiver.resolved_type);
+        return receiver_t != null && receiver_t.kind == TypeKind::Reference
+            && !receiver_t.as_reference().is_mutable();
     }
 
     /// A field read whose receiver is a type parameter of the body being

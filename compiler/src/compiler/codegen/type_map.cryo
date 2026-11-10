@@ -26,7 +26,7 @@ import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{
-    ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
+    ArrayType, FunctionType, OptionalType, ReferenceType, TupleType
 };
 import compiler::types::generic::{ InstantiatedType };
 import compiler::types::type_base::{ Type };
@@ -358,7 +358,14 @@ type struct TypeMapper {
             // `__va_list_tag[1]` to a pointer; Win64 va_list is `char*`), and
             // this matches what a variadic function's `args` bucket already is.
             TypeKind::VaList           => { LType::pointer_to(LType::i8()) }
-            TypeKind::Pointer          => { this.map_pointer(t.as_pointer()) }
+            // An LLVM pointer type does not depend on its pointee, so the
+            // pointee is not mapped: mapping it would recurse through every
+            // type reachable by pointer while the struct holding the pointer
+            // is still opaque, and measuring a struct that holds the
+            // unfinished one by value (`tail_padding_for`) makes LLVM cache
+            // an empty layout for it that outlives its body.  A copy sized
+            // from that layout moves no bytes.
+            TypeKind::Pointer          => { LType::pointer_to(LType::i8()) }
             TypeKind::Reference        => { this.map_reference(t.as_reference()) }
             TypeKind::Array            => { this.map_array(t.as_array()) }
             TypeKind::Function         => { this.map_function(t.as_function()) }
@@ -408,36 +415,13 @@ type struct TypeMapper {
 
     // Compound type mappers
 
-    /// Pointer -> LLVMPointerType(pointee, 0)
-    map_pointer(mut &this, t: PointerType*) -> LType {
-        const pointee: LType = this.map_type(t.pointee);
-        if (!pointee.is_valid()) {
-            return LType::pointer_to(LType::i8());  // fallback to i8* for void*
-        }
-        // Void is not a valid LLVM pointee; LLVMBuildAlloca(VoidType) crashes
-        // because void is unsized. Use i8 as the canonical void-pointer element.
-        const vt: LType = LType::void_type();
-        if (pointee.raw == vt.raw) {
-            return LType::pointer_to(LType::i8());
-        }
-        return LType::pointer_to(pointee);
-    }
-
-    /// Reference -> pointer at IR level; a wide reference -> the slice
-    /// it is.
+    /// Reference -> `ptr`, for the reason a pointer is (`map_type_impl`); a
+    /// wide reference -> the slice it is.
     map_reference(mut &this, t: ReferenceType*) -> LType {
-        const referent: LType = this.map_type(t.referent);
         if (t.wide) {
-            return referent;
+            return this.map_type(t.referent);
         }
-        if (!referent.is_valid()) {
-            return LType::pointer_to(LType::i8());
-        }
-        const vt: LType = LType::void_type();
-        if (referent.raw == vt.raw) {
-            return LType::pointer_to(LType::i8());
-        }
-        return LType::pointer_to(referent);
+        return LType::pointer_to(LType::i8());
     }
 
     /// A trait object -> { ptr, ptr }: the address of the value, then the
