@@ -31,6 +31,7 @@ import compiler::deps::dep_resolver::{ DepResolver, ResolveMode, ResolveOutcome 
 import compiler::deps::lockfile::{ LockedVendor, Lockfile };
 import compiler::vendor::auto_vendor::{ AutoVendor };
 import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::fix_applier::{ FixApplier };
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::diag::source_span::{ ProgramFileNames };
 import compiler::lex::lexer;
@@ -193,6 +194,9 @@ type struct CompilerConfig {
     /// already built is linked as it is: its key holds no diagnostic option,
     /// because a warning changes no byte of it.
     warnings_as_errors:  boolean;
+    /// `--apply-fixes`: make every machine-applicable suggestion the build
+    /// reports in the project's own files, then build again.
+    apply_fixes:         boolean;
 
     static default() -> CompilerConfig {
         return CompilerConfig {
@@ -216,6 +220,7 @@ type struct CompilerConfig {
             codegen_threads_override: -1,
             plant_unanswered_name: "",
             warnings_as_errors:  false,
+            apply_fixes:         false,
         };
     }
 }
@@ -230,6 +235,9 @@ type struct CompilationResult {
     /// so `cryo test` can export it as `$CRYO_STDLIB` for the test
     /// runtime's compile-fail helpers. Empty for `--no-std` builds.
     stdlib_root:   string;
+    /// How many machine-applicable suggestions `--apply-fixes` made in the
+    /// build's files; 0 without the flag.
+    fixes_applied: i64;
 
     static ok(output_path_text: string) -> CompilationResult {
         const output_path: string = output_path_text;
@@ -239,6 +247,7 @@ type struct CompilationResult {
             warning_count: 0,
             output_path:   output_path,
             stdlib_root:   "",
+            fixes_applied: 0,
         };
     }
 
@@ -249,6 +258,7 @@ type struct CompilationResult {
             warning_count: warnings,
             output_path:   "",
             stdlib_root:   "",
+            fixes_applied: 0,
         };
     }
 }
@@ -688,8 +698,22 @@ type struct CompilerInstance {
 
     /// Compile a single target view of a project.  Shared between the
     /// legacy single-target path and each iteration of
-    /// `compile_project_multi`.
+    /// `compile_project_multi`.  Under `--apply-fixes` a build that made
+    /// fixes builds again, once, without making any: what it reports is the
+    /// fixed source's, and a fix that does not compile fails the build.
     compile_project_with_config(&this, config: ProjectConfig) -> CompilationResult {
+        if (!this.config.apply_fixes) { return this.build_project(config, false); }
+        const first: CompilationResult = this.build_project(config.clone(), true);
+        if (first.fixes_applied == 0) { return first; }
+        fmt::println(f"applied {first.fixes_applied} fix(es); building again");
+        mut again: CompilationResult = this.build_project(config, false);
+        again.fixes_applied = first.fixes_applied;
+        return again;
+    }
+
+    /// Compile one target view, making the machine-applicable suggestions
+    /// its diagnostics carry in the project's files when `apply_fixes`.
+    build_project(&this, config: ProjectConfig, apply_fixes: boolean) -> CompilationResult {
         const root_path: string = config.discovery_root_path();
 
         Log::debug(LogArea::Driver, f"project {config.project_name} (target {config.target_type.label()}, root {root_path}, no_std {config.no_std}, no_runtime {config.no_runtime})");
@@ -739,6 +763,9 @@ type struct CompilerInstance {
         // them.  The LSP keeps its context alive and never comes through here.
         result.output_path = CompilerInstance::dup_survivor(result.output_path);
         result.stdlib_root = CompilerInstance::dup_survivor(result.stdlib_root);
+        if (apply_fixes && build.ctx != null) {
+            result.fixes_applied = FixApplier::apply(build.ctx.diagnostics, build.ctx.options.stdlib_root);
+        }
         if (build.ctx != null) {
             mem::drop(Box::<CompilationContext>::from_raw(build.ctx));
         }

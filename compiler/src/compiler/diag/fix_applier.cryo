@@ -1,0 +1,167 @@
+/// FixApplier
+///
+/// Makes the machine-applicable suggestions a build reported in the files
+/// they edit (`cryo build --apply-fixes`).  A suggestion is applied whole or
+/// not at all: one whose edits overlap an edit already taken, or that edits
+/// a file the build does not own (the stdlib, a generated vendor binding),
+/// is left for the next build to report again.
+
+namespace compiler::diag::fix_applier;
+
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::sink::{ DiagnosticSink };
+import compiler::diag::suggestion::{ Suggestion, SuggestionPart, Applicability };
+import compiler::lex::lexer::{ Lexer };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::cmp::{ Ordering };
+import std::fs::file::{ File };
+import std::fs::path::{ Path };
+
+
+/// One edit of a file's text, in byte offsets: `[start, end)` replaced.
+type struct ByteEdit {
+    start:       i64;
+    end:         i64;
+    replacement: string;
+
+    /// Whether this edit and `other` touch the same bytes, or insert at the
+    /// same point: either order of the two would give a different text.
+    overlaps(&this, other: &ByteEdit) -> boolean {
+        if (this.start == other.start) { return true; }
+        return this.start < other.end && other.start < this.end;
+    }
+}
+
+
+/// The suggestions of one build, grouped by the file they edit.
+type struct FixApplier {
+    /// The files edited, in the order first met.
+    files:       [string];
+    /// Every machine-applicable suggestion whose edits are all in one file.
+    suggestions: [Suggestion];
+    /// What the build does not own: a file under it is never edited.
+    stdlib_root: string;
+
+    static new(stdlib_root: string) -> FixApplier {
+        return FixApplier { files: [], suggestions: [], stdlib_root: stdlib_root };
+    }
+
+    /// Apply every machine-applicable suggestion `sink` holds that edits a
+    /// file this build owns, and answer how many were made.
+    static apply(sink: DiagnosticSink*, stdlib_root: string) -> i64 {
+        mut applier: FixApplier = FixApplier::new(stdlib_root);
+        for (mut i: i64 = 0; i < sink.diagnostics.length(); i++) {
+            applier.collect(sink, &sink.diagnostics[i]);
+        }
+        mut applied: i64 = 0;
+        for (mut f: i64 = 0; f < applier.files.length(); f++) {
+            applied = applied + applier.apply_to(applier.files[f]);
+        }
+        return applied;
+    }
+
+    /// Record `diagnostic`'s machine-applicable suggestions, and its
+    /// children's.
+    collect(mut &this, sink: DiagnosticSink*, diagnostic: &Diagnostic) -> void {
+        for (mut i: i64 = 0; i < diagnostic.suggestions.length(); i++) {
+            const suggestion: &Suggestion = &diagnostic.suggestions[i];
+            const machine_applicable: boolean = match (suggestion.applicability) {
+                Applicability::MachineApplicable => { true }
+                Applicability::HasPlaceholders   => { false }
+            };
+            if (!machine_applicable) { continue; }
+            const file: string = suggestion.parts[0].span.file;
+            mut one_file: boolean = true;
+            for (mut p: i64 = 1; p < suggestion.parts.length(); p++) {
+                one_file = one_file && suggestion.parts[p].span.file == file;
+            }
+            if (!one_file || !this.owns(sink, file)) { continue; }
+            this.suggestions.push(suggestion.clone());
+            mut known: boolean = false;
+            for (mut f: i64 = 0; !known && f < this.files.length(); f++) {
+                known = this.files[f] == file;
+            }
+            if (!known) { this.files.push(file); }
+        }
+        for (mut c: i64 = 0; c < diagnostic.children.length(); c++) {
+            this.collect(sink, &diagnostic.children[c]);
+        }
+    }
+
+    /// Whether the build owns `file`: not a generated vendor binding, not
+    /// a stdlib source, and a file that exists.
+    owns(&this, sink: DiagnosticSink*, file: string) -> boolean {
+        if (file.length() == 0 || sink.is_vendor_file(file)) { return false; }
+        if (this.stdlib_root.length() > 0 && Path::from(file).starts_with(Path::from(this.stdlib_root))) {
+            return false;
+        }
+        return Path::from(file).exists();
+    }
+
+    /// Apply the suggestions that edit `file`, each whole or not at all, and
+    /// answer how many were applied.
+    apply_to(&this, file: string) -> i64 {
+        const text: String = match (File::read_text(Path::from(file))) {
+            Result::Ok(read) => { read }
+            Result::Err(_)   => { return 0; }
+        };
+        const source: Str = text.as_str();
+        // The byte each line starts at; the first line starts after a byte
+        // order mark, as the lexer's columns do.
+        mut line_starts: [i64] = [];
+        line_starts.push(Lexer::text_start(source));
+        for (mut b: i64 = 0; b < source.length(); b++) {
+            match (source.byte_at(b)) {
+                Option::Some(byte) => { if (byte == 10) { line_starts.push(b + 1); } }
+                Option::None       => { }
+            }
+        }
+        mut taken: [ByteEdit] = [];
+        mut applied: i64 = 0;
+        for (mut s: i64 = 0; s < this.suggestions.length(); s++) {
+            const suggestion: &Suggestion = &this.suggestions[s];
+            if (suggestion.parts[0].span.file != file) { continue; }
+            mut edits: [ByteEdit] = [];
+            mut fits: boolean = true;
+            for (mut p: i64 = 0; fits && p < suggestion.parts.length(); p++) {
+                const part: &SuggestionPart = &suggestion.parts[p];
+                const start: i64 = FixApplier::offset_of(&line_starts, part.span.start_line, part.span.start_col);
+                const end: i64 = FixApplier::offset_of(&line_starts, part.span.end_line, part.span.end_col);
+                const edit: ByteEdit = ByteEdit { start: start, end: end, replacement: part.replacement };
+                fits = start >= 0 && end >= start && end <= source.length();
+                for (mut t: i64 = 0; fits && t < taken.length(); t++) {
+                    fits = !edit.overlaps(&taken[t]);
+                }
+                for (mut e: i64 = 0; fits && e < edits.length(); e++) {
+                    fits = !edit.overlaps(&edits[e]);
+                }
+                edits.push(edit);
+            }
+            if (!fits) { continue; }
+            for (mut e: i64 = 0; e < edits.length(); e++) { taken.push(edits[e]); }
+            applied = applied + 1;
+        }
+        if (applied == 0) { return 0; }
+        taken.sort_by((a: &ByteEdit, b: &ByteEdit) -> Ordering { return a.start.compare(&b.start); });
+        mut fixed: String = String::new();
+        mut copied_to: i64 = 0;
+        for (mut t: i64 = 0; t < taken.length(); t++) {
+            fixed.push(source.sub_bytes(copied_to, taken[t].start));
+            fixed.push(Str::new(taken[t].replacement));
+            copied_to = taken[t].end;
+        }
+        fixed.push(source.sub_bytes(copied_to, source.length()));
+        match (File::write_text(Path::from(file), fixed.as_str())) {
+            Result::Ok(_)  => { return applied; }
+            Result::Err(_) => { return 0; }
+        }
+    }
+
+    /// The byte offset of 1-based `line` and `column` (columns count bytes),
+    /// or -1 when the line is not in the file.
+    static offset_of(line_starts: &[i64], line: u32, column: u32) -> i64 {
+        if (line == 0 || column == 0 || (line as i64) > line_starts.length()) { return -1; }
+        return line_starts[(line - 1) as i64] + (column - 1) as i64;
+    }
+}

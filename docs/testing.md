@@ -371,6 +371,22 @@ for any package: `[link]`, `[dependencies]`, target type), and `test.json` is
   { "outcome": "run", "expect": { "exit_code": 0, "stdout_contains": "ready" } }
   ```
 
+A project whose report carries a machine-applicable suggestion proves the
+fix with `applied`: besides its own outcome, a copy of the project (outside
+the tree, without its `build/`) is run with `cryo run --apply-fixes`, which
+must make at least one fix, build the fixed source and exit with
+`applied.exit_code` (default 0). The project passes only if both hold, so a
+fix the compiler calls machine-applicable is shown to compile once made,
+with no second copy of the program written by hand:
+
+```json
+{
+  "outcome": "compile_fail",
+  "expect": { "diagnostic": "E0101" },
+  "applied": { "exit_code": 0 }
+}
+```
+
 A project can also drive the compiler itself, for a test of what `cryo`
 writes rather than what the program does. `environment` sets variables for
 that one command (`"NAME=value"` entries), `arguments` adds to its command

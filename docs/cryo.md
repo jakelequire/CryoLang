@@ -5129,6 +5129,7 @@ Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` o
 | `--no-incremental`    | Force a full build: skip the up-to-date short-circuit and the manifest/fingerprint write.                                               |
 | `--locked`            | Verify the `cryoconfig.lock` vendor pins instead of re-resolving them; error if the lock is missing or out of date.                     |
 | `-Werror`             | Report every warning as an error and fail the build on it; a stdlib archive the build has to make is built with it too.                 |
+| `--apply-fixes`       | Make every machine-applicable suggestion the build reports in the project's own files (never the stdlib's or a vendor binding's), then build again once; a suggestion overlapping one already made is left for the next build. |
 | `-o`, `--output PATH` | Redirect output for single-file builds; the output kind is inferred from the extension (`.o`, `.s`, `.ll`, or an executable).           |
 
 Test-only flags: `--ignored`, `--list`, `--exact`, `-q` / `--quiet`.

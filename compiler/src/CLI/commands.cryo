@@ -3,6 +3,7 @@ namespace cli::commands;
 import std::fmt;
 import std::env;
 import std::fs::file::{ File };
+import std::fs::directory::{ Directory };
 import std::io::stdio;
 import compiler::{ compilation_context, instance, project_config };
 import compiler::codegen::{ llvm_types };
@@ -154,6 +155,12 @@ type struct ProjSpec {
     file: string;
     file_contains: [string];
     file_excludes: [string];
+    /// test.json `applied`: the project's machine-applicable fixes are
+    /// proven too.  A copy of the project is run with `cryo run
+    /// --apply-fixes`, which must make at least one fix, build the fixed
+    /// source and exit with `applied.exit_code` (default 0).
+    applied: boolean;
+    applied_exit_code: i64;
 
     static empty() -> ProjSpec {
         return ProjSpec {
@@ -161,8 +168,24 @@ type struct ProjSpec {
             output_contains: [], output_excludes: [], output_in_order: [], requires: [],
             environment: [], arguments: [], stderr_contains: [], stderr_excludes: [],
             stdout_line_prefixes: [], stderr_line_prefixes: [],
-            file: "", file_contains: [], file_excludes: []
+            file: "", file_contains: [], file_excludes: [],
+            applied: false, applied_exit_code: 0
         };
+    }
+
+    /// What the copy with its fixes applied is held to: it runs, with
+    /// `--apply-fixes`, in this project's environment, reports the fixes it
+    /// made, and exits with `applied_exit_code`.
+    applied_run(&this) -> ProjSpec {
+        mut run: ProjSpec = ProjSpec::empty();
+        run.outcome = 2;
+        run.exit_code = this.applied_exit_code;
+        for (mut i: i64 = 0; i < this.environment.length(); i++) {
+            run.environment.push(this.environment[i]);
+        }
+        run.arguments.push("--apply-fixes");
+        run.output_contains.push("building again");
+        return run;
     }
 }
 
@@ -790,6 +813,9 @@ type struct Executor {
     ///                       the release profile when none is given
     ///   -Werror             report every warning as an error and fail the
     ///                       build on it, the stdlib archive's build included
+    ///   --apply-fixes       make every machine-applicable suggestion the
+    ///                       build reports in the project's files, then build
+    ///                       again
     /// `--release` wins over `--dev` wins over `--profile=` when several are
     /// passed. Leaving all unset keeps the cryoconfig `[profile] default`.
     static apply_profile_flags(config: mut instance::CompilerConfig*, args: &cli::ParsedArgs) -> void {
@@ -810,6 +836,9 @@ type struct Executor {
         }
         if (args.has_flag("Werror")) {
             config.warnings_as_errors = true;
+        }
+        if (args.has_flag("apply-fixes")) {
+            config.apply_fixes = true;
         }
         // Distribution-only: link a self-contained binary (no libLLVM-20.so
         // runtime dep).  Consumed at link time in run_linking; a static
@@ -1060,6 +1089,8 @@ type struct Executor {
         fmt::printf("                      updating them; fail the build on binding drift\n");
         fmt::printf("  -Werror             Report every warning as an error and fail the build,\n");
         fmt::printf("                      the stdlib archive's build included when it is made\n");
+        fmt::printf("  --apply-fixes       Make every machine-applicable suggestion in the project's\n");
+        fmt::printf("                      own files, then build again\n");
         fmt::printf("  -o, --output PATH   Redirect output (single-file builds; kind inferred\n");
         fmt::printf("                      from the extension: .o .s .ll or an executable)\n\n");
         fmt::printf("Test-only flags: --ignored, --list, --exact, -q/--quiet.\n");
@@ -2333,6 +2364,21 @@ type struct Executor {
         Executor::read_strings(&root, "requires", &spec.requires);
         Executor::read_strings(&root, "environment", &spec.environment);
         Executor::read_strings(&root, "arguments", &spec.arguments);
+        match (root.get(str::Str::new("applied"))) {
+            Option::Some(ap) => {
+                spec.applied = true;
+                match (ap.get(str::Str::new("exit_code"))) {
+                    Option::Some(xp) => {
+                        match (xp.as::<i64>()) {
+                            Option::Some(n) => { spec.applied_exit_code = n; }
+                            Option::None    => { }
+                        }
+                    }
+                    Option::None => { }
+                }
+            }
+            Option::None => { }
+        }
         match (root.get(str::Str::new("expect"))) {
             Option::Some(ep) => {
                 match (ep.get(str::Str::new("exit_code"))) {
@@ -2496,6 +2542,9 @@ type struct Executor {
         mut verdict_of: [i32]      = [];
         mut reason_of:  [string]   = [];
         mut job_of:     [i64]      = [];
+        //   applied_job_of[i]: the job running the copy of project i with its
+        //                      fixes applied, or -1 when it has no `applied`
+        mut applied_job_of: [i64]  = [];
         mut specs:      [ProjSpec] = [];
         mut cmds:       [string]   = [];
         mut entry: void* = libc::readdir(dp);
@@ -2550,8 +2599,31 @@ type struct Executor {
                 const out_path: string = Executor::job_tmp_path(tmp, cmds.length() as u64);
                 job_of.push(cmds.length() as i64);
                 cmds.push(Executor::project_command(self_exe, stdlib_abs, proj_dir, &spec, out_path));
+                // The fixes are made in a copy, never in the tree's own
+                // sources; the copy's build output is left behind so its
+                // first build analyses the source as written.  A copy that
+                // cannot be made fails the project (-2).
+                mut applied_job: i64 = -1;
+                if (spec.applied) {
+                    const copy_dir: string = fmt::format("%s.applied.%llu", tmp, cmds.length() as u64).into_raw();
+                    if (path::Path::from(copy_dir).exists()) { Directory::remove_all(path::Path::from(copy_dir)); }
+                    applied_job = -2;
+                    match (Directory::copy_all(path::Path::from(proj_dir), path::Path::from(copy_dir))) {
+                        Result::Ok(_) => {
+                            const copied_build: path::PathBuf = path::Path::from(copy_dir).join(str::Str::new("build"));
+                            if (copied_build.as_path().exists()) { Directory::remove_all(copied_build.as_path()); }
+                            const applied_spec: ProjSpec = spec.applied_run();
+                            applied_job = cmds.length() as i64;
+                            cmds.push(Executor::project_command(self_exe, stdlib_abs, copy_dir,
+                                &applied_spec, Executor::job_tmp_path(tmp, applied_job as u64)));
+                        }
+                        Result::Err(_) => { }
+                    }
+                }
+                applied_job_of.push(applied_job);
             } else {
                 job_of.push(-1);
+                applied_job_of.push(-1);
             }
             specs.push(spec);
         }
@@ -2623,22 +2695,47 @@ type struct Executor {
                 Executor::wait_job(done.as_ptr(), k);
                 const out_path: string = Executor::job_tmp_path(tmp, k);
                 const proj_dir: string = path::Path::from(projects_dir).join(name).into_raw();
-                const res: ProjOutcome = Executor::project_outcome(&specs[i], status[k as i64], out_path, proj_dir);
+                mut res: ProjOutcome = Executor::project_outcome(&specs[i], status[k as i64], out_path, proj_dir);
                 Executor::remove_project_file(proj_dir, &specs[i]);
+                // The run of the copy with its fixes applied is judged on its
+                // own, and fails the project when the project itself passed.
+                mut shown_path: string = out_path;
+                mut applied_out: string = "";
+                const applied_job: i64 = applied_job_of[i];
+                if (applied_job == -2 && res.passed) {
+                    res = ProjOutcome { passed: false, detail: "the project could not be copied to apply its fixes" };
+                }
+                if (applied_job >= 0) {
+                    Executor::wait_job(done.as_ptr(), applied_job as u64);
+                    applied_out = Executor::job_tmp_path(tmp, applied_job as u64);
+                    const copy_dir: string = fmt::format("%s.applied.%llu", tmp, applied_job as u64).into_raw();
+                    const applied_spec: ProjSpec = specs[i].applied_run();
+                    const applied: ProjOutcome = Executor::project_outcome(&applied_spec, status[applied_job], applied_out, copy_dir);
+                    if (res.passed && !applied.passed) {
+                        res = ProjOutcome { passed: false,
+                            detail: fmt::format("with its fixes applied: %s", applied.detail).into_raw() };
+                        shown_path = applied_out;
+                    }
+                    Directory::remove_all(path::Path::from(copy_dir));
+                }
                 Executor::proj_report(is_pretty, is_compact, color_on, res.passed, res.detail);
                 if (!res.passed) {
                     failures += 1;
                     // Surface the captured subprocess output on failure so the
                     // reason is visible (kept quiet on success).
                     if (!is_compact) {
-                        const out: string = Executor::read_file_or_empty(out_path);
+                        const out: string = Executor::read_file_or_empty(shown_path);
                         if (out.length() > 0) { fmt::printf("%s\n", out); }
-                        const err: string = Executor::read_file_or_empty(Executor::stderr_path(out_path));
+                        const err: string = Executor::read_file_or_empty(Executor::stderr_path(shown_path));
                         if (err.length() > 0) { fmt::printf("%s\n", err); }
                     }
                 }
                 File::remove(path::Path::from(out_path));
                 File::remove(path::Path::from(Executor::stderr_path(out_path)));
+                if (applied_out.length() > 0) {
+                    File::remove(path::Path::from(applied_out));
+                    File::remove(path::Path::from(Executor::stderr_path(applied_out)));
+                }
                 ran += 1;
             }
             return NegSuiteResult { ran: ran, failures: failures };
