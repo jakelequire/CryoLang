@@ -46,6 +46,7 @@ import compiler::ast::expression::{
     MemberAccessExpr, ObjectConversionExpr, ScopeResolutionExpr
 };
 import compiler::ast::node::{ ProgramNode };
+import compiler::lex::{ Token, TokenType };
 import compiler::ast::pattern::{ MatchArmNode, StaticMatchArmNode };
 import compiler::ast::statement::{ Stmt, StmtKind };
 import compiler::diag::diagnostic::{ Diagnostic };
@@ -1851,12 +1852,23 @@ type struct MonoCallSpecializer {
     /// parameter, local or field of a type parameter whose callable bound
     /// let the template call it - calls the closure's `__call__`: the callee
     /// becomes that method of the value, and the call is pinned to it.  A
-    /// value of function type is called through, as written.
+    /// value of function type is called through, as written.  A reference to
+    /// either is called through what it refers to: the callee becomes `*r`.
     bind_closure_call(mut &this, call: mut CallExpr*) -> void {
         if (call.resolved_callee.is_some() || !this.callee_is_value(call.callee)) { return; }
-        const value: mut ExpressionNode* = call.callee;
-        const value_t: Type* = this.arena.lookup(value.resolved_type);
+        mut value: mut ExpressionNode* = call.callee;
+        mut value_t: Type* = this.arena.lookup(value.resolved_type);
         if (value_t == null) { return; }
+        if (value_t.kind == TypeKind::Reference) {
+            const referent: TypeRef = value_t.as_reference().referent;
+            const star: Token = Token::new(TokenType::Star, "*",
+                value.span.start_line as int, value.span.start_col as int);
+            value = ExpressionNode::synthetic_unary(star, value, value.span);
+            value.set_resolved_type(referent);
+            call.callee = value;
+            value_t = this.arena.lookup(referent);
+            if (value_t == null) { return; }
+        }
         // A closure made in a generic body is an instance of the template the
         // closure is: its `__call__` is the template's, bound to the
         // instance's copy of it as any method of a generic struct is.

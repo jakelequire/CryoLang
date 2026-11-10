@@ -261,6 +261,25 @@ type struct LambdaSynth {
         return this.arena.get_function(ret_ty, param_types, false);
     }
 
+    /// The type of the local `ident` names, as the scope being resolved sees
+    /// it: its own binding's, or - inside a lambda - the enclosing binding's
+    /// it captures, recorded as a capture.  Invalid when no local of the name
+    /// is in reach, or its binding failed to type.  A name in a callee's
+    /// place asks this as a name read as a value does, so a lambda calling a
+    /// callable it captures captures it.
+    local_type(mut &this, e: ExpressionNode*, ident: IdentifierExpr*) -> TypeRef {
+        const sym: SymbolID = ident.res.local_sym();
+        const local: TypeRef = this.scopes.type_of(sym);
+        if (local.is_valid() || this.scopes.binds(sym)) { return local; }
+        if (this.state.in_lambda_depth > 0 && this.state.current_lambda != null) {
+            match (this.scopes.outer_type_of(sym)) {
+                Option::Some(outer_ty) => { return this.record_lambda_capture(e, ident, outer_ty); }
+                Option::None => { }
+            }
+        }
+        return TypeRef::invalid();
+    }
+
     /// Record a captured outer binding `outer_ty` for the surrounding lambda,
     /// shadow it as a per-lambda local, and return its type so the
     /// referencing identifier resolves.
@@ -678,7 +697,7 @@ type struct LambdaSynth {
         if (call == null || call.callee == null) { return; }
         const ident: IdentifierExpr* = ExpressionNode::identifier_of(call.callee);
         if (ident == null) { return; }
-        const local_ty: TypeRef = this.scopes.type_of(ident.res.local_sym());
+        const local_ty: TypeRef = this.local_type(call.callee, ident);
         if (!this.is_closure_struct_type(local_ty)) { return; }
         call.callee.set_resolved_type(local_ty);
         const call_sym: SymbolStr = this.intern.intern("__call__");

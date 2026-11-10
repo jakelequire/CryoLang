@@ -675,7 +675,10 @@ fix writes the bound from the call. A bound carries one signature, written
 with its return type (**E0101** otherwise); it may stand beside traits
 (`F: (i32) -> i32 + Copy`). A closure passed to a callable-bounded parameter is
 passed by value, as any argument is: a closure that owns a capture moves into
-the callee, which releases it once.
+the callee, which releases it once. A reference to such a value, `&F`, is
+called as the value is (`compare(x, y)` with `compare: &F`), reading it rather
+than consuming it. A lambda calls a callable it captures - a closure local, or a
+parameter of a callable-bounded type - as the enclosing body would.
 
 #### Where a capturing closure may be passed
 
