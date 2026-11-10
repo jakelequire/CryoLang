@@ -1,0 +1,70 @@
+///! Terminal styling: the escape sequence each style writes around a
+///! painted value, a plain style writing the value alone, and colour
+///! support refused for a stream that is not a terminal.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::IoTerminal;
+
+import std::core::result::{ Result };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::env;
+import std::io::terminal::{ Color, StandardStream, Style, Styled, Terminal };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect };
+
+function check_text(text: String, want: string) -> Result<(), TestError> {
+    return expect(text.as_str().equals(&Str::new(want)), text.as_str());
+}
+
+![test]
+function plain_style_writes_the_value_alone() -> Result<(), TestError> {
+    const plain: Style = Style::new();
+    expect(plain.is_plain(), Str::new("a new style sets nothing"))?;
+    const painted: Styled<i32> = plain.paint(42);
+    return check_text(f"[{painted}]", "[42]");
+}
+
+![test]
+function foreground_and_bold_write_one_sequence_and_a_reset() -> Result<(), TestError> {
+    const style: Style = Style::new().foreground(Color::Red).bold();
+    expect(!style.is_plain(), Str::new("a coloured style is not plain"))?;
+    const painted: Styled<Str> = style.paint(Str::new("error"));
+    return check_text(f"{painted}", "\x1B[0;1;31merror\x1B[0m");
+}
+
+![test]
+function every_attribute_and_both_colours_in_order() -> Result<(), TestError> {
+    const style: Style = Style::new().underline().italic().dim().bold()
+        .background(Color::BrightBlue).foreground(Color::BrightWhite);
+    const painted: Styled<i32> = style.paint(7);
+    return check_text(f"{painted}", "\x1B[0;1;2;3;4;97;104m7\x1B[0m");
+}
+
+![test]
+function each_colour_has_its_code() -> Result<(), TestError> {
+    expect(Color::Black.foreground_code() == 30, Str::new("black"))?;
+    expect(Color::White.foreground_code() == 37, Str::new("white"))?;
+    expect(Color::BrightBlack.foreground_code() == 90, Str::new("bright black"))?;
+    expect(Color::Green.background_code() == 42, Str::new("green background"))?;
+    return expect(Color::BrightCyan.background_code() == 106, Str::new("bright cyan background"));
+}
+
+![test]
+function styles_compare_by_what_they_set() -> Result<(), TestError> {
+    const one: Style = Style::new().foreground(Color::Green);
+    const same: Style = Style::new().foreground(Color::Green);
+    const other: Style = Style::new().foreground(Color::Green).bold();
+    expect(one.equals(&same), Str::new("the same settings are equal"))?;
+    return expect(!one.equals(&other), Str::new("bold makes a different style"));
+}
+
+// Each test runs in its own process, so the variable set here reaches no
+// other test. `NO_COLOR` refuses colour whether or not the stream is a
+// terminal.
+![test]
+function no_color_refuses_colour_on_both_streams() -> Result<(), TestError> {
+    env::set_var(Str::new("NO_COLOR"), Str::new("1"));
+    expect(!Terminal::supports_color(StandardStream::Output), Str::new("stdout under NO_COLOR"))?;
+    return expect(!Terminal::supports_color(StandardStream::Error), Str::new("stderr under NO_COLOR"));
+}

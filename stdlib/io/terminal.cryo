@@ -1,0 +1,256 @@
+///! Terminal styling: colours and text attributes written as ANSI escape
+///! sequences, and whether a standard stream should get them.
+///!
+///! A `Style` names a foreground and background `Color` and the attributes
+///! bold, dim, italic and underline; `paint` wraps a `Display` value so that
+///! printing it writes the style, the value and a reset. A style with
+///! nothing set writes the value alone, so a program picks its styles once,
+///! from `Terminal::supports_color`, and prints the same way either way:
+///!
+///!     import std::fmt;
+///!     import std::collections::str::{ Str };
+///!     import std::io::terminal::{ Color, StandardStream, Style, Styled, Terminal };
+///!
+///!     mut error: Style = Style::new();
+///!     if (Terminal::supports_color(StandardStream::Error)) {
+///!         error = Style::new().foreground(Color::Red).bold();
+///!     }
+///!     const label: Styled<Str> = error.paint(Str::new("error"));
+///!     fmt::eprintln(f"{label}: file not found");
+
+namespace std::io::terminal;
+
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::env;
+import std::fmt::display::{ Debug, Display, Formatter };
+import std::fmt::error::{ FmtError };
+import std::io::stdio;
+import std::sys::syscall;
+
+/// The sixteen colours every ANSI terminal has: eight, and a bright form of
+/// each. The terminal's theme decides the exact shade.
+public type enum Color with [Eq, Clone, Debug] {
+    Black;
+    Red;
+    Green;
+    Yellow;
+    Blue;
+    Magenta;
+    Cyan;
+    White;
+    BrightBlack;
+    BrightRed;
+    BrightGreen;
+    BrightYellow;
+    BrightBlue;
+    BrightMagenta;
+    BrightCyan;
+    BrightWhite;
+}
+
+implement enum Color {
+    /// The SGR parameter that sets this colour as the foreground; the
+    /// background's is 10 more.
+    public foreground_code(&this) -> u8 {
+        match (&this) {
+            Color::Black => { return 30; }
+            Color::Red => { return 31; }
+            Color::Green => { return 32; }
+            Color::Yellow => { return 33; }
+            Color::Blue => { return 34; }
+            Color::Magenta => { return 35; }
+            Color::Cyan => { return 36; }
+            Color::White => { return 37; }
+            Color::BrightBlack => { return 90; }
+            Color::BrightRed => { return 91; }
+            Color::BrightGreen => { return 92; }
+            Color::BrightYellow => { return 93; }
+            Color::BrightBlue => { return 94; }
+            Color::BrightMagenta => { return 95; }
+            Color::BrightCyan => { return 96; }
+            Color::BrightWhite => { return 97; }
+        }
+    }
+
+    /// The SGR parameter that sets this colour as the background.
+    public background_code(&this) -> u8 {
+        return this.foreground_code() + 10;
+    }
+}
+
+/// The two standard streams text is styled for.
+public type enum StandardStream with [Eq, Clone, Debug] {
+    Output;
+    Error;
+}
+
+/// A foreground and background colour and a set of attributes, built up
+/// from `Style::new()`, which sets nothing.
+public type struct Style with [Eq, Clone, Debug] {
+    private foreground_color: Option<Color>;
+    private background_color: Option<Color>;
+    private is_bold: boolean;
+    private is_dim: boolean;
+    private is_italic: boolean;
+    private is_underlined: boolean;
+
+    /// A style that sets nothing: painting with it writes the value alone.
+    public static new() -> Style {
+        return Style {
+            foreground_color: Option::None,
+            background_color: Option::None,
+            is_bold: false,
+            is_dim: false,
+            is_italic: false,
+            is_underlined: false,
+        };
+    }
+
+    public foreground(mut this, color: Color) -> Style {
+        this.foreground_color = Option::Some(color);
+        return this;
+    }
+
+    public background(mut this, color: Color) -> Style {
+        this.background_color = Option::Some(color);
+        return this;
+    }
+
+    public bold(mut this) -> Style {
+        this.is_bold = true;
+        return this;
+    }
+
+    public dim(mut this) -> Style {
+        this.is_dim = true;
+        return this;
+    }
+
+    public italic(mut this) -> Style {
+        this.is_italic = true;
+        return this;
+    }
+
+    public underline(mut this) -> Style {
+        this.is_underlined = true;
+        return this;
+    }
+
+    /// True when the style sets nothing, so it writes no escape sequences.
+    public is_plain(&this) -> boolean {
+        return this.foreground_color.is_none() && this.background_color.is_none()
+            && !this.is_bold && !this.is_dim && !this.is_italic && !this.is_underlined;
+    }
+
+    /// `value`, to be printed in this style: its `Display` writes the
+    /// escape sequence that turns the style on, the value, and the one that
+    /// resets every style.
+    public paint<D>(&this, value: D) -> Styled<D> where D: Display {
+        return Styled::<D> { style: this.clone(), value: value };
+    }
+
+    /// Write the escape sequence that turns this style on; nothing for a
+    /// plain style. The sequence resets first (`ESC[0;...m`), so the text
+    /// gets exactly this style whatever was on before it.
+    public write_start(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        if (this.is_plain()) {
+            return Result::Ok(());
+        }
+        f.write_str(Str::new("\x1B[0"))?;
+        if (this.is_bold) { f.write_str(Str::new(";1"))?; }
+        if (this.is_dim) { f.write_str(Str::new(";2"))?; }
+        if (this.is_italic) { f.write_str(Str::new(";3"))?; }
+        if (this.is_underlined) { f.write_str(Str::new(";4"))?; }
+        match (&this.foreground_color) {
+            Option::Some(color) => { f.write(f";{color.foreground_code()}")?; }
+            Option::None => { }
+        }
+        match (&this.background_color) {
+            Option::Some(color) => { f.write(f";{color.background_code()}")?; }
+            Option::None => { }
+        }
+        return f.write_str(Str::new("m"));
+    }
+
+    /// Write the escape sequence that resets every style; nothing for a
+    /// plain style, which turned none on.
+    public write_end(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        if (this.is_plain()) {
+            return Result::Ok(());
+        }
+        return f.write_str(Str::new("\x1B[0m"));
+    }
+}
+
+/// A value with the style it is printed in; made by `Style.paint`.
+public type struct Styled<D> where D: Display {
+    public style: Style;
+    public value: D;
+}
+
+implement<D> trait Display for struct Styled<D> where D: Display {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        this.style.write_start(f)?;
+        this.value.fmt(f)?;
+        return this.style.write_end(f);
+    }
+}
+
+/// What the standard streams are attached to.
+public type struct Terminal {
+    /// Whether text written to `stream` should be styled: the stream is a
+    /// terminal, `NO_COLOR` is unset or empty, and `TERM` is not `dumb`.
+    /// On Windows this also turns on the console's escape-sequence
+    /// processing, and answers false where the console refuses it.
+    public static supports_color(stream: StandardStream) -> boolean {
+        const descriptor: i32 = match (stream) {
+            StandardStream::Output => { stdio::STDOUT_FD }
+            StandardStream::Error => { stdio::STDERR_FD }
+        };
+        if (!stdio::is_tty(descriptor)) {
+            return false;
+        }
+        match (env::var(Str::new("NO_COLOR"))) {
+            Option::Some(value) => {
+                if (value.length() > 0) {
+                    return false;
+                }
+            }
+            Option::None => { }
+        }
+        match (env::var(Str::new("TERM"))) {
+            Option::Some(term) => {
+                if (term.as_str().equals(&Str::new("dumb"))) {
+                    return false;
+                }
+            }
+            Option::None => { }
+        }
+        return Terminal::enable_escape_sequences(stream);
+    }
+
+    ![target(unix)]
+    private static enable_escape_sequences(_stream: StandardStream) -> boolean {
+        return true;
+    }
+
+    ![target(windows)]
+    private static enable_escape_sequences(stream: StandardStream) -> boolean {
+        const handle_id: u32 = match (stream) {
+            StandardStream::Output => { syscall::STD_OUTPUT_HANDLE }
+            StandardStream::Error => { syscall::STD_ERROR_HANDLE }
+        };
+        const handle: u8* = syscall::GetStdHandle(handle_id);
+        mut mode: u32 = 0;
+        if (syscall::GetConsoleMode(handle, &mode) == 0) {
+            return false;
+        }
+        if ((mode & syscall::ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0) {
+            return true;
+        }
+        return syscall::SetConsoleMode(handle, mode | syscall::ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
+    }
+}
