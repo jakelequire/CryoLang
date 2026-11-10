@@ -1357,9 +1357,11 @@ type struct CallResolver {
             }
             // A fixed array, or a reference to one, has the two slice
             // methods, which the compiler answers.
+            mut array_ref: TypeRef = receiver_type;
             mut array_t: Type* = this.arena.lookup(receiver_type);
             if (array_t != null && array_t.kind == TypeKind::Reference) {
-                array_t = this.arena.lookup(array_t.as_reference().referent);
+                array_ref = array_t.as_reference().referent;
+                array_t = this.arena.lookup(array_ref);
             }
             if (array_t != null && array_t.kind == TypeKind::Array) {
                 const registry: GenericRegistry* = this.ctx.generic_registry;
@@ -1367,6 +1369,11 @@ type struct CallResolver {
                 if (writable || registry.names_lang_method(callee_member.member, LangItem::AsSliceAsSlice)) {
                     return this.resolve_fixed_array_slice_call(visitor, call_e, call, callee_member,
                         array_t.as_array(), writable);
+                }
+                // A method of a trait the array has through the slice over
+                // its elements is called on that slice.
+                if (this.array_trait_method(visitor, array_ref, callee_member.member)) {
+                    callee_member.object = visitor.slice_view(callee_member.object);
                 }
             }
             if (callee_member.trait_required && !this.receiver_has_required_trait(visitor, callee_member)) {
@@ -5533,6 +5540,21 @@ type struct CallResolver {
             || ty.kind == TypeKind::Bool || ty.kind == TypeKind::Char
             || ty.kind == TypeKind::Unit || ty.kind == TypeKind::Void
             || ty.kind == TypeKind::Never;
+    }
+
+    /// Whether `leaf` names a method of a trait the fixed array `array_t`
+    /// has through the slice over its elements
+    /// (`TraitChecker::answered_through_slice`).
+    array_trait_method(&this, visitor: mut SemaVisitor*, array: TypeRef, leaf: SymbolStr) -> boolean {
+        const registry: GenericRegistry* = this.ctx.generic_registry;
+        const checker: TraitChecker = visitor.trait_checker();
+        const traits: [DefId] = checker.traits_answered_through_slice();
+        for (mut i: i64 = 0; i < traits.length(); i++) {
+            if (registry.trait_item_slot(traits[i], leaf) >= 0) {
+                return checker.type_implements_trait(array, traits[i], 0);
+            }
+        }
+        return false;
     }
 
     /// `values.as_slice()` or `values.as_mutable_slice()` on a fixed array,
