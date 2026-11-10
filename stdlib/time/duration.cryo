@@ -98,17 +98,31 @@ public type struct Duration with [Eq, Ord, Debug] {
         };
     }
 
-    /// Construct from a floating-point number of seconds. Negative
-    /// inputs clamp to zero.
+    /// Construct from a floating-point number of seconds. Panics on a
+    /// value no duration has - NaN, a negative number, infinity, or more
+    /// seconds than `u64` holds; `try_from_secs_f64` answers `None` instead.
     public static from_secs_f64(secs: f64) -> Duration {
-        if (secs <= 0.0) {
-            return Duration { secs: 0, nanos: 0 };
+        match (Duration::try_from_secs_f64(secs)) {
+            Option::Some(duration) => { return duration; }
+            Option::None => {
+                core::panic("Duration::from_secs_f64: NaN, negative, infinite or too large", intrinsics::location());
+            }
+        }
+    }
+
+    /// Construct from a floating-point number of seconds, or `None` for
+    /// NaN, a negative number, infinity, or more seconds than `u64` holds.
+    /// Negative zero is zero.
+    public static try_from_secs_f64(secs: f64) -> Option<Duration> {
+        // NaN fails every comparison, so it fails this one too.
+        if (!(secs >= 0.0) || secs >= 18446744073709551616.0) {
+            return Option::None;
         }
         const whole: u64 = secs as u64;
         const frac:  f64 = secs - (whole as f64);
         mut nanos: u64 = (frac * 1000000000.0) as u64;
         if (nanos >= Duration::NANOS_PER_SEC) { nanos = Duration::NANOS_PER_SEC - 1; }
-        return Duration { secs: whole, nanos: nanos as u32 };
+        return Option::Some(Duration { secs: whole, nanos: nanos as u32 });
     }
 
     /// Whole seconds (the sub-second part is dropped).
@@ -127,9 +141,10 @@ public type struct Duration with [Eq, Ord, Debug] {
         return ((this.nanos as u64) / Duration::NANOS_PER_MICRO) as u32;
     }
 
-    /// Total whole milliseconds.
+    /// Total whole milliseconds. Panics when they overflow `u64`.
     public as_millis(&this) -> u64 {
-        return this.secs * Duration::MILLIS_PER_SEC + (this.nanos as u64) / Duration::NANOS_PER_MILLI;
+        return Duration::total_units(this.secs, Duration::MILLIS_PER_SEC, (this.nanos as u64) / Duration::NANOS_PER_MILLI,
+            "Duration::as_millis: overflows u64");
     }
 
     /// Total milliseconds, a partial millisecond rounded UP, so a wait of
@@ -141,14 +156,32 @@ public type struct Duration with [Eq, Ord, Debug] {
         return this.secs.saturating_multiply(Duration::MILLIS_PER_SEC).saturating_add(partial);
     }
 
-    /// Total whole microseconds.
+    /// Total whole microseconds. Panics when they overflow `u64`.
     public as_micros(&this) -> u64 {
-        return this.secs * Duration::MICROS_PER_SEC + (this.nanos as u64) / Duration::NANOS_PER_MICRO;
+        return Duration::total_units(this.secs, Duration::MICROS_PER_SEC, (this.nanos as u64) / Duration::NANOS_PER_MICRO,
+            "Duration::as_micros: overflows u64");
     }
 
-    /// Total nanoseconds. Wraps for spans beyond ~584 years.
+    /// Total nanoseconds. Panics when they overflow `u64`, past about 584
+    /// years.
     public as_nanos(&this) -> u64 {
-        return this.secs * Duration::NANOS_PER_SEC + (this.nanos as u64);
+        return Duration::total_units(this.secs, Duration::NANOS_PER_SEC, this.nanos as u64,
+            "Duration::as_nanos: overflows u64");
+    }
+
+    /// `secs * per_second + rest`, panicking with `message` on overflow:
+    /// the one total the `as_*` conversions share.
+    private static total_units(secs: u64, per_second: u64, rest: u64, message: string) -> u64 {
+        match (secs.checked_multiply(per_second)) {
+            Option::Some(whole) => {
+                match (whole.checked_add(rest)) {
+                    Option::Some(total) => { return total; }
+                    Option::None => { }
+                }
+            }
+            Option::None => { }
+        }
+        core::panic(message, intrinsics::location());
     }
 
     /// The whole span as floating-point seconds.
@@ -208,12 +241,35 @@ public type struct Duration with [Eq, Ord, Debug] {
         };
     }
 
-    /// `this * factor`.
+    /// `this * factor`. Panics when the seconds overflow `u64`;
+    /// `checked_multiply` answers `None` instead.
     public scale(&this, factor: u64) -> Duration {
-        const total_nanos: u64 = (this.nanos as u64) * factor;
-        const extra_secs:  u64 = total_nanos / Duration::NANOS_PER_SEC;
-        const rem_nanos:   u32 = (total_nanos % Duration::NANOS_PER_SEC) as u32;
-        return Duration { secs: this.secs * factor + extra_secs, nanos: rem_nanos };
+        match (this.checked_multiply(factor)) {
+            Option::Some(product) => { return product; }
+            Option::None => {
+                core::panic("Duration::scale: overflows the seconds", intrinsics::location());
+            }
+        }
+    }
+
+    /// `this * factor`, or `None` when the seconds would overflow `u64`.
+    public checked_multiply(&this, factor: u64) -> Option<Duration> {
+        // The nanoseconds stay below 1e9, so their product with any `u64`
+        // fits in `u128`, as does every carry into the seconds.
+        const total_nanos: u128 = (this.nanos as u128) * (factor as u128);
+        const extra_secs:  u128 = total_nanos / (Duration::NANOS_PER_SEC as u128);
+        const secs: u128 = (this.secs as u128) * (factor as u128) + extra_secs;
+        if (secs > (u64::MAX as u128)) { return Option::None; }
+        return Option::Some(Duration {
+            secs: secs as u64,
+            nanos: (total_nanos % (Duration::NANOS_PER_SEC as u128)) as u32
+        });
+    }
+
+    /// `this / divisor`, or `None` when `divisor` is zero.
+    public checked_divide(&this, divisor: u64) -> Option<Duration> {
+        if (divisor == 0) { return Option::None; }
+        return Option::Some(this.divide(divisor));
     }
 
     /// `this * factor` for a floating-point factor.
@@ -228,8 +284,10 @@ public type struct Duration with [Eq, Ord, Debug] {
         }
         const secs:        u64 = this.secs / divisor;
         const rem_secs:    u64 = this.secs % divisor;
-        const total_nanos: u64 = rem_secs * Duration::NANOS_PER_SEC + (this.nanos as u64);
-        return Duration { secs: secs, nanos: (total_nanos / divisor) as u32 };
+        // `rem_secs` is below `divisor`, so in `u64` its nanoseconds wrap
+        // for a divisor past about 1.8e10; in `u128` they cannot.
+        const total_nanos: u128 = (rem_secs as u128) * (Duration::NANOS_PER_SEC as u128) + (this.nanos as u128);
+        return Duration { secs: secs, nanos: (total_nanos / (divisor as u128)) as u32 };
     }
 
     /// Render the most natural unit as an owned `String` (`1.5s`,

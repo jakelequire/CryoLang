@@ -23,6 +23,7 @@ import std::io::bytes::{ ByteWriter };
 import std::io::fd;
 import std::ffi::libc;
 import std::sys::syscall;
+import std::time::duration::{ Duration };
 
 // ---- one-time Winsock init -------------------------------------------------
 // WSAStartup is reference-counted and idempotent, so calling it once per
@@ -292,19 +293,21 @@ public function os_sock_error(fd: i32) -> i32 {
 ![target(unix)]
 // Host order is little-endian on every supported target.
 ![target(unix)]
-public function os_set_timeout(fd: i32, is_recv: boolean, secs: i64, usecs: i64) -> i32 {
+public function os_set_timeout(fd: i32, is_recv: boolean, timeout: Duration) -> i32 {
     mut timeval: Array<u8> = Array::<u8>::with_capacity(16);
     mut fields: ByteWriter = ByteWriter::new(&timeval);
-    fields.write_i64_little_endian(secs);
-    fields.write_i64_little_endian(usecs);
+    fields.write_u64_little_endian(timeout.as_secs());
+    fields.write_u64_little_endian(timeout.subsec_micros() as u64);
     const opt: i32 = if (is_recv) { libc::SO_RCVTIMEO } else { libc::SO_SNDTIMEO };
     return libc::setsockopt(fd, libc::SocketLevel::SOL_SOCKET, opt, timeval.as_ptr(), 16);
 }
 ![target(windows)]
-public function os_set_timeout(fd: i32, is_recv: boolean, secs: i64, usecs: i64) -> i32 {
+public function os_set_timeout(fd: i32, is_recv: boolean, timeout: Duration) -> i32 {
     mut milliseconds: Array<u8> = Array::<u8>::with_capacity(4);
     mut field: ByteWriter = ByteWriter::new(&milliseconds);
-    field.write_u32_little_endian((secs * 1000 + usecs / 1000) as u32);
+    // Rounded up, so a short non-zero timeout is not 0 (which waits
+    // forever), and held to the DWORD's range.
+    field.write_u32_little_endian(timeout.as_millis_ceil().clamp(0, u32::MAX as u64) as u32);
     const opt: i32 = if (is_recv) { 4102 } else { 4101 };   // 0x1006 / 0x1005
     return syscall::setsockopt(fd as u64, 65535, opt, milliseconds.as_ptr(), 4);
 }
@@ -381,8 +384,8 @@ public function sock_write(fd: i32, buf: u8*, len: i64) -> Result<i64, IoError> 
 
 // Apply a receive/send timeout, returning a Result (the raw helper returns an
 // rc).  Shared by tcp/udp `set_*_timeout`.
-public function set_timeout(fd: i32, is_recv: boolean, secs: i64, usecs: i64) -> Result<(), IoError> {
-    if (os_set_timeout(fd, is_recv, secs, usecs) < 0) {
+public function set_timeout(fd: i32, is_recv: boolean, timeout: Duration) -> Result<(), IoError> {
+    if (os_set_timeout(fd, is_recv, timeout) < 0) {
         return Result::Err(last_io_error());
     }
     return Result::Ok(());

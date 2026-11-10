@@ -399,6 +399,48 @@ public type struct String<A = GlobalAlloc> {
         }
     }
 
+    /// Insert the scalar `c`, UTF-8-encoded, at byte offset `index`,
+    /// moving the bytes after it along. Panics when `index` is not a char
+    /// boundary (`Str::is_char_boundary`), and on allocation failure.
+    public insert(mut &this, index: i64, c: char) -> void {
+        if (!this.as_str().is_char_boundary(index)) {
+            core::panic("String::insert: index is not a char boundary", intrinsics::location());
+        }
+        const old_length: i64 = this.length;
+        this.push(c);
+        const width: i64 = this.length - old_length;
+        mut encoded: [u8; 4];
+        libc::memcpy(&encoded[0], this.buffer.ptr() + old_length, width as u64);
+        libc::memmove(this.buffer.ptr() + index + width, this.buffer.ptr() + index, (old_length - index) as u64);
+        libc::memcpy(this.buffer.ptr() + index, &encoded[0], width as u64);
+    }
+
+    /// Remove the scalar that starts at byte offset `index` and return it,
+    /// moving the bytes after it back. Panics when `index` is the end of
+    /// the string or not a char boundary.
+    public remove(mut &this, index: i64) -> char {
+        if (index >= this.length || !this.as_str().is_char_boundary(index)) {
+            core::panic("String::remove: index is the end or not a char boundary", intrinsics::location());
+        }
+        const text: Str = this.as_str();
+        mut width: i64 = 1;
+        while (!text.is_char_boundary(index + width)) { width = width + 1; }
+        const scalar: u32 = text.sub_bytes(index, index + width).chars().next().unwrap();
+        libc::memmove(this.buffer.ptr() + index, this.buffer.ptr() + index + width, (this.length - index - width) as u64);
+        this.length = this.length - width;
+        return scalar as char;
+    }
+
+    /// Remove the last scalar and return it; `None` when the string is
+    /// empty.
+    public pop(mut &this) -> Option<char> {
+        if (this.length == 0) { return Option::None; }
+        const text: Str = this.as_str();
+        mut start: i64 = this.length - 1;
+        while (!text.is_char_boundary(start)) { start = start - 1; }
+        return Option::Some(this.remove(start));
+    }
+
     /// Room for at least `additional` more bytes; zero or less is a no-op.
     public reserve(mut &this, additional: i64) -> Result<(), AllocError> {
         return this.buffer.reserve(this.length, additional, INITIAL_CAPACITY);

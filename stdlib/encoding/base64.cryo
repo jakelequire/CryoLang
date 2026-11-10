@@ -1,108 +1,154 @@
-///! Base64 (RFC 4648) - standard alphabet, with padding.
+///! Base64 (RFC 4648): bytes as text drawn from a 64-character alphabet,
+///! four characters for every three bytes.
 ///!
-///! `encode` is what the WebSocket handshake needs (random key and the
-///! SHA-1 accept value); `decode` rounds it out for general use.
+///! A `Base64` value names one of the four variants RFC 4648 defines: the
+///! standard alphabet (`+` and `/`) or the URL- and filename-safe one (`-`
+///! and `_`), each with or without the `=` padding that rounds the text up
+///! to a multiple of four characters.
+///!
+///! ```cryo
+///! import std::collections::str::{ Str };
+///! import std::collections::string::{ String };
+///! import std::encoding::base64::{ Base64 };
+///!
+///! const text: String = Base64::url_safe_unpadded().encode(Str::new("hi?").as_bytes());   // "aGk_"
+///! ```
 
 namespace std::encoding::base64;
 
-import std::core::option::{ Option };
-import std::core::slice::{ Slice };
 import std::collections::array::{ Array };
-import std::collections::string::{ String };
 import std::collections::str::{ Str };
-import std::core::mem;
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::encoding::error::{ DecodeError, DecodeErrorKind };
 
-private const PAD: u8 = 0x3D;   // '='
+/// The padding character, `=`.
+private const PAD: u8 = 0x3D;
 
-/// Encode `len` bytes at `data` to a padded base64 `String`.
-public function encode(data: u8*, len: i64) -> String {
-    // The alphabet is a LOCAL const: a module-level `const Str = Str::new(..)`
-    // reads back empty at runtime (fragile static init), which would make
-    // the lookup index an empty table.
-    const table: &Slice<u8> = Str::new("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/").as_bytes();
-    mut out: String = String::with_capacity((len + 2) / 3 * 4);
+/// One base64 variant: an alphabet, and whether encoded text is padded.
+/// Cheap to copy; make one with `standard`, `standard_unpadded`,
+/// `url_safe` or `url_safe_unpadded`.
+public type struct Base64 {
+    /// The 64 characters, in the order of the values they stand for.
+    private alphabet: Str;
+    /// Whether `encode` pads to a multiple of four and `decode` requires it.
+    private padded: boolean;
 
-    mut i: i64 = 0;
-    while (i + 3 <= len) {
-        const n: u32 = ((data[i] as u32) << 16)
-                     | ((data[i + 1] as u32) << 8)
-                     |  (data[i + 2] as u32);
-        out.push_byte(table[(n >> 18) & 0x3F]);
-        out.push_byte(table[(n >> 12) & 0x3F]);
-        out.push_byte(table[(n >> 6)  & 0x3F]);
-        out.push_byte(table[(n)       & 0x3F]);
-        i = i + 3;
+    /// The standard alphabet (`+`, `/`), padded with `=`.
+    public static standard() -> Base64 {
+        return Base64 { alphabet: Str::new("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"), padded: true };
     }
 
-    const rest: i64 = len - i;
-    if (rest == 1) {
-        const n: u32 = (data[i] as u32) << 16;
-        out.push_byte(table[(n >> 18) & 0x3F]);
-        out.push_byte(table[(n >> 12) & 0x3F]);
-        out.push_byte(PAD);
-        out.push_byte(PAD);
+    /// The standard alphabet, with no padding.
+    public static standard_unpadded() -> Base64 {
+        return Base64 { alphabet: Str::new("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"), padded: false };
     }
-    if (rest == 2) {
-        const n: u32 = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8);
-        out.push_byte(table[(n >> 18) & 0x3F]);
-        out.push_byte(table[(n >> 12) & 0x3F]);
-        out.push_byte(table[(n >> 6)  & 0x3F]);
-        out.push_byte(PAD);
+
+    /// The URL- and filename-safe alphabet (`-`, `_`), padded with `=`.
+    public static url_safe() -> Base64 {
+        return Base64 { alphabet: Str::new("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"), padded: true };
     }
-    return out;
-}
 
-/// Decode a base64 `Str`. Returns `None` on any invalid character or a
-/// malformed length. Whitespace is not tolerated.
-public function decode(source: Str) -> Option<Array<u8>> {
-    const len: i64 = source.length();
-    if (len % 4 != 0) { return Option::None; }
-    mut out: Array<u8> = Array::<u8>::new();
-    if (len == 0) { return Option::Some(out); }
+    /// The URL- and filename-safe alphabet, with no padding: the form a
+    /// URL or a token carries, since `=` itself needs escaping there.
+    public static url_safe_unpadded() -> Base64 {
+        return Base64 { alphabet: Str::new("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"), padded: false };
+    }
 
-    const bytes: &Slice<u8> = source.as_bytes();
-    mut i: i64 = 0;
-    while (i < len) {
-        mut acc: u32 = 0;
-        mut pads: u32 = 0;
-        mut j: i64 = 0;
-        while (j < 4) {
-            const ch: u8 = bytes[i + j];
-            acc = acc << 6;
-            if (ch == PAD) {
-                pads = pads + 1;
-            } else {
-                match (decode_sym(ch)) {
-                    Option::Some(v) => {
-                        if (pads != 0) { mem::drop(out); return Option::None; } // pad mid-group
-                        acc = acc | (v as u32);
+    /// The length of the text `encode` makes from `byte_count` bytes.
+    public encoded_length(&this, byte_count: i64) -> i64 {
+        if (this.padded) { return (byte_count + 2) / 3 * 4; }
+        const rest: i64 = byte_count % 3;
+        if (rest == 0) { return byte_count / 3 * 4; }
+        return byte_count / 3 * 4 + rest + 1;
+    }
+
+    /// `bytes` as base64 text in this variant.
+    public encode(&this, bytes: &Slice<u8>) -> String {
+        mut text: String = String::with_capacity(this.encoded_length(bytes.length()));
+        this.encode_into(bytes, &text);
+        return text;
+    }
+
+    /// Append `bytes` as base64 text in this variant to `out`.
+    public encode_into(&this, bytes: &Slice<u8>, out: mut &String) -> void {
+        const table: &Slice<u8> = this.alphabet.as_bytes();
+        const length: i64 = bytes.length();
+        mut i: i64 = 0;
+        while (i + 3 <= length) {
+            const group: u32 = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8) | (bytes[i + 2] as u32);
+            out.push_byte(table[(group >> 18) & 0x3F]);
+            out.push_byte(table[(group >> 12) & 0x3F]);
+            out.push_byte(table[(group >> 6) & 0x3F]);
+            out.push_byte(table[group & 0x3F]);
+            i = i + 3;
+        }
+        const rest: i64 = length - i;
+        if (rest == 0) { return; }
+        mut group: u32 = (bytes[i] as u32) << 16;
+        if (rest == 2) { group = group | ((bytes[i + 1] as u32) << 8); }
+        out.push_byte(table[(group >> 18) & 0x3F]);
+        out.push_byte(table[(group >> 12) & 0x3F]);
+        if (rest == 2) { out.push_byte(table[(group >> 6) & 0x3F]); }
+        if (this.padded) {
+            out.push_byte(PAD);
+            if (rest == 1) { out.push_byte(PAD); }
+        }
+    }
+
+    /// The bytes `text` encodes in this variant. A padded variant requires
+    /// the padding; an unpadded one refuses it. Whitespace is not skipped,
+    /// and the error names the first byte that is wrong.
+    public decode(&this, text: Str) -> Result<Array<u8>, DecodeError> {
+        const bytes: &Slice<u8> = text.as_bytes();
+        const length: i64 = bytes.length();
+        mut data_length: i64 = length;
+        if (this.padded) {
+            if (length % 4 != 0) {
+                return Result::Err(DecodeError::new(DecodeErrorKind::InvalidLength, length));
+            }
+            while (data_length > 0 && data_length > length - 2 && bytes[data_length - 1] == PAD) {
+                data_length = data_length - 1;
+            }
+        }
+        if (data_length % 4 == 1) {
+            return Result::Err(DecodeError::new(DecodeErrorKind::InvalidLength, data_length));
+        }
+        mut out: Array<u8> = Array::<u8>::with_capacity(data_length / 4 * 3 + 2);
+        mut accumulator: u32 = 0;
+        mut bits: u32 = 0;
+        for (mut i: i64 = 0; i < data_length; i++) {
+            const byte: u8 = bytes[i];
+            match (this.value_of(byte)) {
+                Option::Some(value) => {
+                    accumulator = (accumulator << 6) | (value as u32);
+                    bits = bits + 6;
+                    if (bits >= 8) {
+                        bits = bits - 8;
+                        out.push(((accumulator >> bits) & 0xFF) as u8);
                     }
-                    Option::None => { mem::drop(out); return Option::None; }
+                }
+                Option::None => {
+                    if (byte == PAD) {
+                        return Result::Err(DecodeError::new(DecodeErrorKind::InvalidPadding, i));
+                    }
+                    return Result::Err(DecodeError::new(DecodeErrorKind::InvalidCharacter, i));
                 }
             }
-            j++;
         }
-        // Padding is only valid in the FINAL group, and at most two `=`.
-        // Without this, `AB==CDEF` (pad before a later group) or `A===`
-        // (3+ pads) would decode instead of being rejected per RFC 4648.
-        if (pads != 0) {
-            if (i + 4 < len) { mem::drop(out); return Option::None; }   // pad before final group
-            if (pads > 2)    { mem::drop(out); return Option::None; }   // at most 2 pad chars
-        }
-        out.push(((acc >> 16) & 0xFF) as u8);
-        if (pads < 2) { out.push(((acc >> 8) & 0xFF) as u8); }
-        if (pads < 1) { out.push((acc & 0xFF) as u8); }
-        i = i + 4;
+        return Result::Ok(out);
     }
-    return Option::Some(out);
-}
 
-/// Map a base64 character back to its 6-bit value, or `None`.
-private function decode_sym(ch: u8) -> Option<u8> {
-    if (ch >= 0x41 && ch <= 0x5A) { return Option::Some(ch - 0x41); }        // A-Z -> 0..25
-    if (ch >= 0x61 && ch <= 0x7A) { return Option::Some(ch - 0x61 + 26); }   // a-z -> 26..51
-    if (ch >= 0x30 && ch <= 0x39) { return Option::Some(ch - 0x30 + 52); }   // 0-9 -> 52..61
-    if (ch == 0x2B) { return Option::Some(62); }                            // '+'
-    if (ch == 0x2F) { return Option::Some(63); }                            // '/'
-    return Option::None;
+    /// The 6-bit value `byte` stands for in this variant's alphabet.
+    private value_of(&this, byte: u8) -> Option<u8> {
+        if (byte >= 0x41 && byte <= 0x5A) { return Option::Some(byte - 0x41); }
+        if (byte >= 0x61 && byte <= 0x7A) { return Option::Some(byte - 0x61 + 26); }
+        if (byte >= 0x30 && byte <= 0x39) { return Option::Some(byte - 0x30 + 52); }
+        const table: &Slice<u8> = this.alphabet.as_bytes();
+        if (byte == table[62]) { return Option::Some(62); }
+        if (byte == table[63]) { return Option::Some(63); }
+        return Option::None;
+    }
 }

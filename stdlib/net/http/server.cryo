@@ -24,10 +24,10 @@
 ///! before the first `accept`; use it to log the listening address or
 ///! signal a readiness probe.
 ///!
-///! `.with_read_timeout(secs)` caps how long one request may take to arrive,
-///! which is what keeps a peer dribbling a request out a byte at a time from
-///! pinning the connection — and, since connections are served one at a time,
-///! the accept loop behind it. `secs == 0` disables the cap.
+///! `.with_read_timeout(timeout)` caps how long one request may take to
+///! arrive, which is what keeps a peer dribbling a request out a byte at a
+///! time from pinning the connection — and, since connections are served one
+///! at a time, the accept loop behind it. `Duration::zero()` disables the cap.
 ///!
 ///! A read that hits the cap is abandoned, and abandoning an in-flight read
 ///! closes the connection: the transport is left holding a closed placeholder
@@ -75,7 +75,7 @@ public const MAX_REQUESTS_PER_CONNECTION: u64 = 100;
 
 /// Default per-connection read cap.  Long enough for slow consumer networks
 /// but short enough that a single slow-loris peer can't pin the accept loop.
-public const DEFAULT_READ_TIMEOUT_SECS: i64 = 30;
+public const DEFAULT_READ_TIMEOUT_SECS: u64 = 30;
 
 /// A configured HTTP server ready to bind and run.
 ///
@@ -102,9 +102,9 @@ public type struct HttpServer {
     /// Owned by the caller; the Router must outlive this server.
     private router:   Router*;
     private on_ready: Option<() -> void>;
-    /// Deadline applied to each request read (whole seconds).  Zero
-    /// disables; defaults to `DEFAULT_READ_TIMEOUT_SECS`.
-    private read_timeout_secs: i64;
+    /// Deadline applied to each request read.  Zero disables; defaults to
+    /// `DEFAULT_READ_TIMEOUT_SECS` seconds.
+    private read_timeout: Duration;
 
     /// Build a server with a raw handler function. The handler receives
     /// every request and must produce a `Response`; all routing logic
@@ -115,7 +115,7 @@ public type struct HttpServer {
             handler:           Option::Some(handler),
             router:            null,
             on_ready:          Option::None,
-            read_timeout_secs: DEFAULT_READ_TIMEOUT_SECS
+            read_timeout:      Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS)
         };
     }
 
@@ -127,7 +127,7 @@ public type struct HttpServer {
             handler:           Option::None,
             router:            router,
             on_ready:          Option::None,
-            read_timeout_secs: DEFAULT_READ_TIMEOUT_SECS
+            read_timeout:      Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS)
         };
     }
 
@@ -142,13 +142,13 @@ public type struct HttpServer {
         return &this;
     }
 
-    /// Override the per-connection read timeout.  `secs == 0` disables;
-    /// the default is `DEFAULT_READ_TIMEOUT_SECS`.
+    /// Override the per-connection read timeout.  `Duration::zero()`
+    /// disables it; the default is `DEFAULT_READ_TIMEOUT_SECS` seconds.
     ///
     /// Reaching the cap closes the connection outright rather than answering
     /// with a 408 -- see the module doc for why a timed-out read cannot reply.
-    public with_read_timeout(mut &this, secs: i64) -> mut &HttpServer {
-        this.read_timeout_secs = secs;
+    public with_read_timeout(mut &this, timeout: Duration) -> mut &HttpServer {
+        this.read_timeout = timeout;
         return &this;
     }
 
@@ -237,7 +237,7 @@ public type struct HttpServer {
             // The read is capped so one peer dribbling a request out a byte at
             // a time cannot pin this connection (and, since connections are
             // served one at a time, the accept loop behind it) forever.
-            // `read_timeout_secs == 0` disables the cap.
+            // A zero `read_timeout` disables the cap.
             //
             // Hitting the cap ABANDONS the read, and abandoning an in-flight
             // read closes the connection: the transport is left holding a
@@ -247,11 +247,9 @@ public type struct HttpServer {
             // returns rather than trying to write a 408.
             mut got: Result<Request, IoError> =
                 Result::Err(IoError::new(IoErrorKind::TimedOut, 0));
-            if (this.read_timeout_secs > 0) {
+            if (!this.read_timeout.is_zero()) {
                 const capped: Result<Result<Request, IoError>, Elapsed> =
-                    await Futures::timeout(
-                        Duration::from_secs(this.read_timeout_secs as u64),
-                        c.read_request());
+                    await Futures::timeout(this.read_timeout, c.read_request());
                 match (capped) {
                     Result::Ok(inner) => { got = inner; }
                     Result::Err(_)    => { return; }

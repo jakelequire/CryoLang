@@ -1,0 +1,144 @@
+///! DateTime and RFC 3339: the RFC's own examples both ways, the refusals
+///! with the byte each one names, offsets, weekdays, and arithmetic with
+///! `Duration`.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::DateTimeT;
+
+import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::time::datetime::{ DateTime, DateTimeError, DateTimeErrorKind, UtcOffset, Weekday };
+import std::time::duration::{ Duration };
+import std::fmt::display;
+import std::test::error::{ TestError };
+import std::test::assert::{ bail, expect, expect_eq, expect_true };
+
+function parse(text: string) -> DateTime {
+    return DateTime::parse_rfc3339(Str::new(text)).unwrap();
+}
+
+function check_text(moment: DateTime, want: string) -> Result<(), TestError> {
+    const text: String = moment.format_rfc3339();
+    return expect(text.as_str().equals(&Str::new(want)), text.as_str());
+}
+
+function check_round_trip(text: string) -> Result<(), TestError> {
+    return check_text(parse(text), text);
+}
+
+function check_reject(text: string, kind: DateTimeErrorKind, position: i64) -> Result<(), TestError> {
+    match (DateTime::parse_rfc3339(Str::new(text))) {
+        Result::Ok(_) => { return bail(Str::new(text)); }
+        Result::Err(error) => { return expect_eq(error, DateTimeError::new(kind, position)); }
+    }
+}
+
+![test]
+function rfc3339_examples_read_their_fields() -> Result<(), TestError> {
+    const utc: DateTime = parse("1985-04-12T23:20:50.52Z");
+    expect_eq(utc.year, 1985)?;
+    expect_eq(utc.month, 4)?;
+    expect_eq(utc.day, 12)?;
+    expect_eq(utc.hour, 23)?;
+    expect_eq(utc.minute, 20)?;
+    expect_eq(utc.second, 50)?;
+    expect_eq(utc.nanosecond, 520000000)?;
+    expect_true(utc.offset.is_utc(), Str::new("Z is UTC"))?;
+    expect_eq(parse("1996-12-19T16:39:57-08:00").offset.seconds(), -28800)?;
+    return expect_eq(parse("1937-01-01T12:00:27.87+00:20").offset.seconds(), 1200);
+}
+
+![test]
+function rfc3339_examples_round_trip() -> Result<(), TestError> {
+    check_round_trip("1985-04-12T23:20:50.52Z")?;
+    check_round_trip("1996-12-19T16:39:57-08:00")?;
+    check_round_trip("1937-01-01T12:00:27.87+00:20")?;
+    check_round_trip("2000-02-29T00:00:00.000000001Z")?;
+    return check_text(parse("1985-04-12t23:20:50.500z"), "1985-04-12T23:20:50.5Z");
+}
+
+![test]
+function fraction_digits_past_nanoseconds_are_dropped() -> Result<(), TestError> {
+    return expect_eq(parse("2020-01-01T00:00:00.1234567891Z").nanosecond, 123456789);
+}
+
+![test]
+function parse_refuses_bad_syntax_at_the_byte() -> Result<(), TestError> {
+    check_reject("19x5-04-12T23:20:50Z", DateTimeErrorKind::InvalidSyntax, 2)?;
+    check_reject("1985-04-12 23:20:50Z", DateTimeErrorKind::InvalidSyntax, 10)?;
+    check_reject("1985-04-12T23:20:50", DateTimeErrorKind::InvalidSyntax, 19)?;
+    check_reject("1985-04-12T23:20:50.Z", DateTimeErrorKind::InvalidSyntax, 20)?;
+    check_reject("1985-04-12T23:20:50Zjunk", DateTimeErrorKind::InvalidSyntax, 20)?;
+    check_reject("1985-04-12T23:20:50+0800", DateTimeErrorKind::InvalidSyntax, 22)?;
+    return check_reject("1985-04", DateTimeErrorKind::InvalidSyntax, 7);
+}
+
+// A leap second is refused: a DateTime counts sixty seconds a minute.
+![test]
+function parse_refuses_out_of_range_fields_at_their_start() -> Result<(), TestError> {
+    check_reject("1990-12-31T23:59:60Z", DateTimeErrorKind::OutOfRange, 17)?;
+    check_reject("1985-13-12T23:20:50Z", DateTimeErrorKind::OutOfRange, 5)?;
+    check_reject("1985-02-29T00:00:00Z", DateTimeErrorKind::OutOfRange, 8)?;
+    check_reject("1985-04-12T24:00:00Z", DateTimeErrorKind::OutOfRange, 11)?;
+    check_reject("1985-04-12T23:20:50+24:00", DateTimeErrorKind::OutOfRange, 20)?;
+    check_reject("1985-04-12T23:20:50-08:60", DateTimeErrorKind::OutOfRange, 23)?;
+    return check_round_trip("2000-02-29T00:00:00Z");
+}
+
+![test]
+function date_time_error_displays_kind_and_position() -> Result<(), TestError> {
+    const error: DateTimeError = DateTimeError::new(DateTimeErrorKind::OutOfRange, 17);
+    const text: String = display::format_to_string(&error).unwrap();
+    return expect(text.as_str().equals(&Str::new("date or time field out of range at byte 17")), text.as_str());
+}
+
+![test]
+function offsets_name_one_instant() -> Result<(), TestError> {
+    const pacific: DateTime = parse("1996-12-19T16:39:57-08:00");
+    expect_eq(pacific.unix_seconds(), 851042397)?;
+    check_text(pacific.to_offset(UtcOffset::utc()), "1996-12-20T00:39:57Z")?;
+    check_text(parse("1996-12-20T00:39:57Z").to_offset(UtcOffset::from_seconds(19800).unwrap()), "1996-12-20T06:09:57+05:30")?;
+    return expect_eq(pacific.duration_since(&parse("1996-12-20T00:39:57Z")), Option::Some(Duration::zero()));
+}
+
+![test]
+function utc_offset_takes_whole_minutes_within_a_day() -> Result<(), TestError> {
+    expect_true(UtcOffset::from_seconds(-28800).is_some(), Str::new("-08:00"))?;
+    expect_true(UtcOffset::from_seconds(90).is_none(), Str::new("not whole minutes"))?;
+    expect_true(UtcOffset::from_seconds(86400).is_none(), Str::new("a whole day"))?;
+    return expect_true(UtcOffset::from_seconds(-86400).is_none(), Str::new("a whole day west"));
+}
+
+![test]
+function from_parts_checks_every_field() -> Result<(), TestError> {
+    const utc: UtcOffset = UtcOffset::utc();
+    expect_true(DateTime::from_parts(2024, 2, 29, 12, 0, 0, 0, utc).is_some(), Str::new("leap day"))?;
+    expect_true(DateTime::from_parts(2023, 2, 29, 12, 0, 0, 0, utc).is_none(), Str::new("no leap day"))?;
+    expect_true(DateTime::from_parts(1900, 2, 29, 12, 0, 0, 0, utc).is_none(), Str::new("century"))?;
+    expect_true(DateTime::from_parts(2023, 4, 31, 12, 0, 0, 0, utc).is_none(), Str::new("April 31"))?;
+    expect_true(DateTime::from_parts(2023, 4, 30, 24, 0, 0, 0, utc).is_none(), Str::new("hour 24"))?;
+    return expect_true(DateTime::from_parts(2023, 4, 30, 0, 0, 0, 1000000000, utc).is_none(), Str::new("a whole second of nanoseconds"));
+}
+
+![test]
+function weekday_of_known_dates() -> Result<(), TestError> {
+    expect_eq(parse("1970-01-01T00:00:00Z").weekday(), Weekday::Thursday)?;
+    expect_eq(parse("1969-12-31T23:59:59Z").weekday(), Weekday::Wednesday)?;
+    expect_eq(parse("2000-02-29T00:00:00Z").weekday(), Weekday::Tuesday)?;
+    expect_eq(parse("2024-01-01T00:00:00Z").weekday(), Weekday::Monday)?;
+    // The local date decides: 23:00 on a Sunday in UTC-05:00 is Monday in UTC.
+    return expect_eq(parse("2024-01-07T23:00:00-05:00").weekday(), Weekday::Sunday);
+}
+
+![test]
+function arithmetic_with_durations() -> Result<(), TestError> {
+    const before: DateTime = parse("2023-12-31T23:59:59.5Z");
+    const after: DateTime = before.add(Duration::from_millis(500)).unwrap();
+    check_text(after, "2024-01-01T00:00:00Z")?;
+    check_text(after.subtract(Duration::from_secs(86400)).unwrap(), "2023-12-31T00:00:00Z")?;
+    check_text(parse("2024-03-01T00:30:00+01:00").subtract(Duration::from_secs(3600)).unwrap(), "2024-02-29T23:30:00+01:00")?;
+    expect_eq(after.duration_since(&before), Option::Some(Duration::from_millis(500)))?;
+    return expect_true(before.duration_since(&after).is_none(), Str::new("earlier minus later"));
+}
