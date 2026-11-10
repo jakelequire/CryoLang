@@ -2746,12 +2746,23 @@ element - where `a`'s type implements `IndexView<Idx>` at `r`'s type: it is
 That is one question, asked before `Index`'s: a container and index type
 with no `IndexView` implementation are indexed through `Index` as above.
 Where the view is written - an element of it assigned (`xs[1..3][0] = v`),
-or the view made the receiver of a `mut &this` method - it is
-`a.view_mutable(r)`, the `ViewMutable` of `IndexViewMutable<Idx>` (whose
-supertrait is `IndexView<Idx>`), and a place reached through it is exactly
-as writable as `a` (E0250 on a `const` binding).  A type that implements
-only `IndexView` is read-only through the view (E0229).  A view is not
-checked for lifetime: like any reference, it must not outlive `a`.
+the view made the receiver of a `mut &this` method, or the view passed for
+a parameter that writes (`mut &Slice<T>`) - it is `a.view_mutable(r)`, the
+`ViewMutable` of `IndexViewMutable<Idx>` (whose supertrait is
+`IndexView<Idx>`), and a place reached through it is exactly as writable as
+`a` (E0250 on a `const` binding; E0251 for the argument, naming the `const`
+binding or the read-only reference `a` is reached through).  A type that
+implements only `IndexView` is read-only through the view (E0229).  A view
+is not checked for lifetime: like any reference, it must not outlive `a`.
+
+No implementation can name a fixed array's length, so a `[T; N]`, or a
+reference to one, is viewed through the slice over its elements that its
+reference converts to: `fixed[r]` is `fixed.as_slice().view(r)`, written
+`fixed.as_mutable_slice().view_mutable(r)`.  In a generic body a container
+written in the body's parameters (`&Array<T>`, `&[T; N]`, `&Slice<T>`) is
+viewed when an implementation applies to it as written, and each copy of
+the body calls that implementation for its own `T`.  A base that is itself
+a type parameter is indexed through `Index` alone.
 
 The standard library slices by a range.  On an `Array<T>`, a `[T]` or a
 `Slice<T>`, `xs[r]` is a `&Slice<T>` of the elements `r` names, and written a

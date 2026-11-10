@@ -865,9 +865,11 @@ type struct MemberResolver {
     /// type behind any references, implements `std::core::ops::IndexView`
     /// at `index_ty`; null where it does not, which leaves `[]` to `Index`.
     /// Once an implementation answers, the desugar is the access's whatever
-    /// its call reports: the view was what `[]` asked for.  Asked of
-    /// concrete types only - a base or index in the walked body's
-    /// parameters is indexed by `Index` alone.
+    /// its call reports: the view was what `[]` asked for.  A base that
+    /// carries the walked body's parameters (`&Array<T>`) is viewed when an
+    /// implementation's where-clause holds for it as written, and the
+    /// body's copies specialize the call.  A base that IS a parameter, or
+    /// an index in the body's parameters, is indexed by `Index` alone.
     try_index_view(mut &this, visitor: mut SemaVisitor*, e: ExpressionNode*, access: ArrayAccessExpr*,
                    ty: TypeRef, index_ty: TypeRef) -> mut ExpressionNode* {
         const view_id: DefId = this.ctx.generic_registry.wellknown(LangItem::IndexView);
@@ -878,13 +880,21 @@ type struct MemberResolver {
             base_ty = t.as_reference().referent;
             t = this.arena.lookup(base_ty);
         }
-        if (t == null) { return null; }
-        if (this.types.contains_generic_param(base_ty) || this.types.contains_generic_param(index_ty)) {
+        if (t == null || t.kind == TypeKind::GenericParam || this.types.contains_generic_param(index_ty)) {
             return null;
+        }
+        // No implementation can name a fixed array's length, so a `[T; N]`
+        // is viewed through the slice over its elements that the compiler
+        // builds for it, as its reference converts to one.
+        mut receiver: mut ExpressionNode* = access.array;
+        if (t.kind == TypeKind::Array) {
+            receiver = visitor.slice_view(access.array);
+            if (receiver == null || !receiver.resolved_type.is_valid()) { return null; }
+            base_ty = this.arena.lookup(receiver.resolved_type).as_reference().referent;
         }
         const index_args: [TypeRef] = [index_ty];
         if (this.trait_checker().implementation_at(view_id, &index_args, base_ty) == null) { return null; }
-        const member: mut ExpressionNode* = this.lang_method_callee(access.array, LangItem::IndexViewView, e.span);
+        const member: mut ExpressionNode* = this.lang_method_callee(receiver, LangItem::IndexViewView, e.span);
         if (member == null) { return null; }
         mut call: mut ExpressionNode* = ExpressionNode::call_expr(member, e.span);
         ExpressionNode::call_of(call).add_argument(access.index);
