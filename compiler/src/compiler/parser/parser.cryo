@@ -505,41 +505,37 @@ implement struct Parser {
             return Node::Decl(vd);
         }
 
+        // `struct Name` / `trait Name` written without `type`.  Those keywords
+        // open nothing else, so the declaration meant is parsed and the
+        // missing `type` reported once it is known whether the rest parsed.
+        // A bare `class` is the removed form, which the struct parser refuses.
+        if (Parser::names_a_type_kind(tok.kind) && tok.kind != TokenType::KwClass
+                && this.peek_at(1).kind == TokenType::Identifier) {
+            const errors_before: int = this.error_count;
+            const declaration: Node = this.parse_type_declaration(tok, visibility, doc_text);
+            const rest_parsed: boolean = this.error_count == errors_before;
+            const keyword_span: SourceSpan = this.span_from_token(tok);
+            this.error_count += 1;
+            mut diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0100_EXPECTED_TOKEN,
+                fmt::format("expected `type` before `%s`", tok.lexeme));
+            diag = diag.at(keyword_span);
+            const written: string = fmt::format("type %s", tok.lexeme).into_raw();
+            if (rest_parsed) {
+                diag = diag.suggest(Suggestion::machine_applicable(keyword_span.start_point(), "type ",
+                    fmt::format("write `%s`", written)));
+            } else {
+                diag = diag.help(fmt::format("a type is declared with `%s Name`", written));
+            }
+            this.ctx.emit_diagnostic(diag);
+            return declaration;
+        }
+
         // Type declarations: type struct/enum/trait/alias
         if (tok.kind == TokenType::KwType) {
             const next: Token = this.peek_at(1);
-
-            if (next.kind == TokenType::KwStruct || next.kind == TokenType::KwClass) {
-                const sd: mut DeclarationNode* = this.parse_struct_declaration();
-                if (sd != null) {
-                    DeclarationNode::struct_of(sd).visibility = visibility;
-                    if (doc != "") { sd.set_documentation(doc_text); }
-                }
-                return Node::Decl(sd);
-            }
-            if (next.kind == TokenType::KwUnion) {
-                const ud: mut DeclarationNode* = this.parse_union_declaration();
-                if (ud != null) {
-                    DeclarationNode::union_of(ud).visibility = visibility;
-                    if (doc != "") { ud.set_documentation(doc_text); }
-                }
-                return Node::Decl(ud);
-            }
-            if (next.kind == TokenType::KwEnum) {
-                const ed: mut DeclarationNode* = this.parse_enum_declaration();
-                if (ed != null) {
-                    DeclarationNode::enum_of(ed).visibility = visibility;
-                    if (doc != "") { ed.set_documentation(doc_text); }
-                }
-                return Node::Decl(ed);
-            }
-            if (next.kind == TokenType::KwTrait) {
-                const td: mut DeclarationNode* = this.parse_trait_declaration();
-                if (td != null) {
-                    if (DeclarationNode::trait_of(td) != null) { DeclarationNode::trait_of(td).visibility = visibility; }
-                    if (doc != "") { td.set_documentation(doc_text); }
-                }
-                return Node::Decl(td);
+            if (Parser::names_a_type_kind(next.kind)) {
+                return this.parse_type_declaration(next, visibility, doc_text);
             }
 
             // Type alias: type Alias = Target;
@@ -577,6 +573,54 @@ implement struct Parser {
 
         // Fall through to statement
         return Node::Stmt(this.parse_statement());
+    }
+
+    /// Whether a token of `kind` is the keyword after `type` that says which
+    /// kind of type is declared.
+    static names_a_type_kind(kind: TokenType) -> boolean {
+        return match (kind) {
+            TokenType::KwStruct => { true }
+            TokenType::KwClass  => { true }
+            TokenType::KwUnion  => { true }
+            TokenType::KwEnum   => { true }
+            TokenType::KwTrait  => { true }
+            _                   => { false }
+        };
+    }
+
+    /// Parse a struct, union, enum or trait declaration whose kind keyword is
+    /// `kind`; the cursor is at its `type`, or at `kind` when `type` is missing.
+    parse_type_declaration(mut &this, kind: Token, visibility: Visibility, doc_text: string) -> Node {
+        if (kind.kind == TokenType::KwStruct || kind.kind == TokenType::KwClass) {
+            const sd: mut DeclarationNode* = this.parse_struct_declaration();
+            if (sd != null) {
+                DeclarationNode::struct_of(sd).visibility = visibility;
+                if (doc_text != "") { sd.set_documentation(doc_text); }
+            }
+            return Node::Decl(sd);
+        }
+        if (kind.kind == TokenType::KwUnion) {
+            const ud: mut DeclarationNode* = this.parse_union_declaration();
+            if (ud != null) {
+                DeclarationNode::union_of(ud).visibility = visibility;
+                if (doc_text != "") { ud.set_documentation(doc_text); }
+            }
+            return Node::Decl(ud);
+        }
+        if (kind.kind == TokenType::KwEnum) {
+            const ed: mut DeclarationNode* = this.parse_enum_declaration();
+            if (ed != null) {
+                DeclarationNode::enum_of(ed).visibility = visibility;
+                if (doc_text != "") { ed.set_documentation(doc_text); }
+            }
+            return Node::Decl(ed);
+        }
+        const td: mut DeclarationNode* = this.parse_trait_declaration();
+        if (td != null) {
+            if (DeclarationNode::trait_of(td) != null) { DeclarationNode::trait_of(td).visibility = visibility; }
+            if (doc_text != "") { td.set_documentation(doc_text); }
+        }
+        return Node::Decl(td);
     }
 
 
@@ -1086,8 +1130,9 @@ implement struct Parser {
     /// Parse a struct declaration: type struct Name<T> { fields, methods }.
     /// `type class` is refused at its keywords and parsed as a struct.
     parse_struct_declaration(mut &this) -> mut DeclarationNode* {
-        const start: Token = this.advance(); // consume 'type'
-        const kw: Token = this.advance();    // consume 'struct' (or 'class')
+        const start: Token = this.current();
+        this.match_tok(TokenType::KwType); // absent when reported missing
+        const kw: Token = this.advance();  // consume 'struct' (or 'class')
         if (kw.kind == TokenType::KwClass) {
             this.refuse_removed_form(SourceSpan::covering(this.span_from_token(start), this.span_from_token(kw)),
                 "type class", "a class", "declare a struct and implement a trait", "type struct", false, "");
@@ -1140,7 +1185,8 @@ implement struct Parser {
     /// Shares the struct member-grammar; an untagged C-style union where all
     /// fields overlap at offset 0 (see UnionDecl).
     parse_union_declaration(mut &this) -> mut DeclarationNode* {
-        const start: Token = this.advance(); // consume 'type'
+        const start: Token = this.current();
+        this.match_tok(TokenType::KwType); // absent when reported missing
         this.advance(); // consume 'union'
 
         const name_tok: Token = this.consume(TokenType::Identifier, "union name");
@@ -1601,7 +1647,8 @@ implement struct Parser {
 
     /// Parse an enum declaration: type enum Name<T> { variants }
     parse_enum_declaration(mut &this) -> mut DeclarationNode* {
-        const start: Token = this.advance(); // consume 'type'
+        const start: Token = this.current();
+        this.match_tok(TokenType::KwType); // absent when reported missing
         this.advance(); // consume 'enum'
 
         const name_tok: Token = this.consume(TokenType::Identifier, "enum name");
@@ -1712,7 +1759,8 @@ implement struct Parser {
 
     /// Parse a trait declaration: type trait Name<T> [: Base] { methods }
     parse_trait_declaration(mut &this) -> mut DeclarationNode* {
-        const start: Token = this.advance(); // consume 'type'
+        const start: Token = this.current();
+        this.match_tok(TokenType::KwType); // absent when reported missing
         this.advance(); // consume 'trait'
 
         const name_tok: Token = this.consume(TokenType::Identifier, "trait name");
