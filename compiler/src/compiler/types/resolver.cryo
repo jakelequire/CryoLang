@@ -1704,7 +1704,9 @@ type struct TypeResolver {
     /// Currently the return expression must be a struct literal
     /// (`return SomeIter<T> { ... }`), which covers every collection iterator
     /// entry point; other shapes leave the return unresolved (a clear
-    /// downstream error rather than a silent miscompile).
+    /// downstream error rather than a silent miscompile).  A generic struct's
+    /// literal without type arguments is left unresolved too: sema decides it
+    /// from the checked value (`SemaVisitor.visit_return`).
     infer_impl_trait_return(&this, func_decl: DeclarationNode*,
                             res_ctx: ResolutionContext*) -> void {
         const func: mut FunctionDecl* = DeclarationNode::fn_of(func_decl);
@@ -1724,6 +1726,19 @@ type struct TypeResolver {
         if (ret_expr == null) { return; }
         const concrete: TypeRef = this.type_of_impl_return_expr(ret_expr, res_ctx);
         if (!concrete.is_valid()) { return; }
+        // A generic struct's literal written without type arguments names no
+        // instance until its field values are typed, so a free function that
+        // is not generic leaves the type for its body's check to decide from
+        // the value it returns.  A method's or a generic function's body is
+        // not checked at a concrete type before its callers are.
+        if (ExpressionNode::struct_of(ret_expr).generic_args.length() == 0
+                && func.generic_params.length() == 0 && !res_ctx.this_type.is_valid()) {
+            const template: const TemplateEntry* = this.generic_registry.template_of_type(concrete);
+            if (template != null && template.kind == TemplateKind::Struct && template.param_types.length() > 0) {
+                imp.decided_by_body = true;
+                return;
+            }
+        }
         imp.resolved = concrete;
         func.resolved_return_type = concrete;
     }

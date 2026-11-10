@@ -365,15 +365,46 @@ type struct SemaVisitor {
         this.state.current_func = null;
         this.type_unwritten_globals(node);
         this.state.unbound_variants.clear();
+        const checked_first: [i64] = this.check_undecided_opaque_returns(node);
         for (mut i: i64 = 0; i < node.statements.length(); i++) {
             const stmt: Node = node.statements[i];
             if (stmt.is_null()) { continue; }
+            if (checked_first.contains(&i)) { continue; }
             // An item is outside every function until its own visit enters
             // one; a global's initializer must not read the last body's.
             this.state.current_func = null;
             this.dispatch_top_level(stmt);
         }
         this.calls.refuse_unbound_variants();
+    }
+
+    /// Check, before any other item of the module, the body of every free
+    /// function whose opaque return (`-> implement Trait`) its signature left
+    /// undecided: the first value it returns decides the type
+    /// (`visit_return`), and a caller checked earlier would find the
+    /// function with no return type.  Returns the statement positions of the
+    /// functions checked, which the module's walk then passes over.
+    check_undecided_opaque_returns(mut &this, node: ProgramNode*) -> [i64] {
+        mut checked: [i64] = [];
+        for (mut i: i64 = 0; i < node.statements.length(); i++) {
+            const stmt: Node = node.statements[i];
+            const decl: DeclarationNode* = stmt.as_decl();
+            const func: FunctionDecl* = DeclarationNode::fn_of(decl);
+            if (func == null || func.body == null || func.return_type_annotation == null
+                    || func.generic_params.length() > 0) {
+                continue;
+            }
+            match (*func.return_type_annotation) {
+                TypeAnnotation::ImplTrait(opaque) => {
+                    if (!opaque.decided_by_body || opaque.resolved.is_valid()) { continue; }
+                }
+                _ => { continue; }
+            }
+            this.state.current_func = null;
+            this.dispatch_top_level(stmt);
+            checked.push(i);
+        }
+        return checked;
     }
 
     /// Give every `async function` in the module its future type before any body
@@ -1038,12 +1069,35 @@ type struct SemaVisitor {
     visit_return(mut &this, stmt: Stmt*, node: mut ReturnStmt*) -> void {
         if (node.expression != null) {
             const saved_expected: TypeRef = this.state.expected_type;
-            const declared: TypeRef = this.symbolic.symbolic_narrowed(this.state.return_type);
+            mut declared: TypeRef = this.symbolic.symbolic_narrowed(this.state.return_type);
             if (declared.is_valid()) {
                 this.state.expected_type = declared;
             }
             const expr_type: TypeRef = this.resolve_expr(node.expression);
             this.state.expected_type = saved_expected;
+            // An opaque return a free function's signature left undecided - a
+            // generic struct's literal written without type arguments - is
+            // the type of the first value its body returns, typed from the
+            // literal's field values.  The function is registered with it
+            // here, which `check_undecided_opaque_returns` makes happen before
+            // any caller in the module is checked; a later `return` is held
+            // to it.
+            const current_fn: mut FunctionDecl* = DeclarationNode::fn_of(this.state.current_func);
+            if (!declared.is_valid() && expr_type.is_valid() && current_fn != null
+                    && current_fn.return_type_annotation != null) {
+                match (*current_fn.return_type_annotation) {
+                    TypeAnnotation::ImplTrait(opaque) => {
+                        if (opaque.decided_by_body && !opaque.resolved.is_valid()) {
+                            opaque.resolved = expr_type;
+                            current_fn.resolved_return_type = expr_type;
+                            this.state.return_type = expr_type;
+                            declared = expr_type;
+                            TypeResolutionPasses::register_decl_in_index(this.state.current_func, this.ctx, true);
+                        }
+                    }
+                    _ => { }
+                }
+            }
             this.lambda.refuse_returned_borrow(expr_type, node.expression.span);
             this.lambda.refuse_held_scope_handle(expr_type, node.expression.span, "a returned value", false);
             if (expr_type.is_valid() && declared.is_valid()
