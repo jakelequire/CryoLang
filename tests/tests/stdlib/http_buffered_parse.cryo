@@ -183,26 +183,34 @@ function tiny_chunks_still_frame_correctly() -> Result<(), TestError> {
     return expect_eq(fills, Str::new(TWO_REQUESTS).length() as i64);
 }
 
-/// A chunked request whose one chunk is itself a request line. Read as a
-/// bodiless request, it would leave that chunk to be parsed as a second,
-/// smuggled request; it must be refused instead.
+/// A chunked request whose one chunk (0x17 = 23 bytes) is itself a request
+/// line. Read as a bodiless request, it would leave that chunk to be parsed
+/// as a second, smuggled request; decoded, it is the first request's body
+/// and nothing follows it.
 const CHUNKED_REQUEST: string =
-    "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n12\r\nGET /admin HTTP/1.1\r\n\r\n0\r\n\r\n";
+    "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n17\r\nGET /admin HTTP/1.1\r\n\r\n\r\n0\r\n\r\n";
 
-/// 0 when the chunked request is refused as `Unsupported`.
+/// 0 when the chunk is the body and the next read finds the end of the
+/// connection rather than a request.
 async function hbp_chunked_request() -> i64 {
     mut c: BufStream<MemTransport> =
         BufStream::<MemTransport>::of(MemTransport::of(CHUNKED_REQUEST, 0));
     match (await c.read_request()) {
-        Result::Ok(_)  => { return 1; }
+        Result::Ok(first) => {
+            if (!hbp_bytes_eq(&first.body, "GET /admin HTTP/1.1\r\n\r\n")) { return 1; }
+        }
+        Result::Err(_) => { return 2; }
+    }
+    match (await c.read_request()) {
+        Result::Ok(_)  => { return 3; }
         Result::Err(e) => {
-            if (e.kind == IoErrorKind::Unsupported) { return 0; }
-            return 2;
+            if (e.kind == IoErrorKind::UnexpectedEof) { return 0; }
+            return 4;
         }
     }
 }
 
 ![test]
-function transfer_encoding_request_is_refused() -> Result<(), TestError> {
+function a_chunk_holding_a_request_line_stays_the_body() -> Result<(), TestError> {
     return expect_eq(future::block_on(hbp_chunked_request()), 0 as i64);
 }

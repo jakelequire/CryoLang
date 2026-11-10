@@ -1,0 +1,248 @@
+///! HTTP/1.1 framing: chunked bodies both ways, repeated header fields, and
+///! the refusals that keep a peer and this parser agreeing on where a
+///! message ends.
+///!
+///! Every message is read off one `BufStream` over an in-memory transport,
+///! so a test can follow a refused or decoded message with the bytes after
+///! it and see that the next message starts exactly where it should.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::HttpFraming;
+
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::collections::array::{ Array };
+import std::future;
+import std::io::error::{ IoError, IoErrorKind };
+import std::io::traits::{ AsyncTransport, Transfer };
+import std::io::buf::{ BufStream };
+import std::net::http::headers::{ Headers };
+import std::net::http::request::{ Request };
+import std::net::http::response::{ Response };
+import std::net::http::chunked::{ ChunkedEncoder };
+import std::net::http::conn;
+import std::test::error::{ TestError };
+import std::test::assert::{ bail, expect, expect_eq };
+
+/// In-memory async transport handing over at most `chunk` bytes per read
+/// (everything when 0). Writes are not used.
+type struct MemTransport {
+    inbox: Array<u8>;
+    position: i64;
+    chunk: i64;
+
+    static of(bytes: &Slice<u8>, chunk: i64) -> MemTransport {
+        mut inbox: Array<u8> = Array::new();
+        for (byte in bytes.iter()) { inbox.push(byte); }
+        return MemTransport { inbox: inbox, position: 0, chunk: chunk };
+    }
+}
+
+implement trait AsyncTransport for struct MemTransport {
+    async read_into(mut &this, buf: Array<u8>) -> Transfer {
+        mut out: Array<u8> = buf;
+        mut take: i64 = this.inbox.length() - this.position;
+        if (this.chunk > 0 && take > this.chunk) { take = this.chunk; }
+        if (take > out.length()) { take = out.length(); }
+        for (mut i: i64 = 0; i < take; i++) {
+            out.set(i, this.inbox.get(this.position + i).unwrap());
+        }
+        this.position = this.position + take;
+        out.truncate(take);
+        return Transfer { buf: out, result: Result::Ok(take) };
+    }
+
+    async write_from(mut &this, buf: Array<u8>) -> Transfer {
+        const length: i64 = buf.length();
+        return Transfer { buf: buf, result: Result::Ok(length) };
+    }
+}
+
+function connection(text: string, chunk: i64) -> BufStream<MemTransport> {
+    return BufStream::<MemTransport>::of(MemTransport::of(Str::new(text).as_bytes(), chunk));
+}
+
+function text_of(bytes: &Array<u8>) -> Str {
+    return Str::from_raw(bytes.as_ptr(), bytes.length());
+}
+
+/// The body of the first request, then the path of the one after it.
+async function body_then_next_path(text: string, chunk: i64) -> Result<String, IoError> {
+    mut c: BufStream<MemTransport> = connection(text, chunk);
+    mut first: Request = (await c.read_request())?;
+    mut second: Request = (await c.read_request())?;
+    mut out: String = String::from_str(text_of(&first.body));
+    out.push(Str::new(" then "));
+    out.push(second.path.as_str());
+    return Result::Ok(out);
+}
+
+/// True when reading one request from `text` is refused with `kind`.
+async function refused_as(text: string, kind: IoErrorKind) -> boolean {
+    mut c: BufStream<MemTransport> = connection(text, 0);
+    match (await c.read_request()) {
+        Result::Ok(_)  => { return false; }
+        Result::Err(e) => { return e.kind == kind; }
+    }
+}
+
+const CHUNKED_REQUESTS: string =
+    "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6;name=value\r\n world\r\n0\r\nTrailer-Field: x\r\n\r\nGET /b HTTP/1.1\r\n\r\n";
+
+/// The chunks are joined, an extension is ignored, the trailer is read and
+/// dropped, and the next request starts after it.
+![test]
+function a_chunked_request_body_is_decoded() -> Result<(), TestError> {
+    const got: String = future::block_on(body_then_next_path(CHUNKED_REQUESTS, 0)).unwrap();
+    return expect_eq(got.as_str(), Str::new("hello world then /b"));
+}
+
+/// The same bytes one per read: no chunk-size line or chunk arrives whole.
+![test]
+function a_chunked_body_split_one_byte_per_read_is_decoded() -> Result<(), TestError> {
+    const got: String = future::block_on(body_then_next_path(CHUNKED_REQUESTS, 1)).unwrap();
+    return expect_eq(got.as_str(), Str::new("hello world then /b"));
+}
+
+/// Both framings at once: the peer and a proxy could each pick a different
+/// one, so the request is refused rather than guessed at.
+![test]
+function chunked_with_a_content_length_is_refused() -> Result<(), TestError> {
+    return expect(future::block_on(refused_as(
+        "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n0\r\n\r\n",
+        IoErrorKind::InvalidData)), Str::new("refused as InvalidData"));
+}
+
+/// A transfer coding other than chunked is one the server does not
+/// implement.
+![test]
+function another_transfer_coding_is_unsupported() -> Result<(), TestError> {
+    return expect(future::block_on(refused_as(
+        "POST /a HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n",
+        IoErrorKind::Unsupported)), Str::new("refused as Unsupported"));
+}
+
+/// A chunk size past 64 bits is refused, not wrapped.
+![test]
+function an_overflowing_chunk_size_is_refused() -> Result<(), TestError> {
+    return expect(future::block_on(refused_as(
+        "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n10000000000000001\r\nx\r\n0\r\n\r\n",
+        IoErrorKind::InvalidData)), Str::new("refused as InvalidData"));
+}
+
+/// A chunk larger than the body cap is refused from its size line, before
+/// any of it is read.
+![test]
+function a_chunk_past_the_body_cap_is_refused() -> Result<(), TestError> {
+    return expect(future::block_on(refused_as(
+        "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2000000\r\nx",
+        IoErrorKind::InvalidData)), Str::new("refused as InvalidData"));
+}
+
+/// A chunk followed by anything but its CRLF is refused.
+![test]
+function a_chunk_without_its_line_end_is_refused() -> Result<(), TestError> {
+    return expect(future::block_on(refused_as(
+        "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX\r\n0\r\n\r\n",
+        IoErrorKind::InvalidData)), Str::new("refused as InvalidData"));
+}
+
+/// A size line that is not hexadecimal is refused.
+![test]
+function a_chunk_size_that_is_not_hex_is_refused() -> Result<(), TestError> {
+    return expect(future::block_on(refused_as(
+        "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n",
+        IoErrorKind::InvalidData)), Str::new("refused as InvalidData"));
+}
+
+/// Two different lengths are refused; repeats of one length fold to it.
+![test]
+function content_length_repeats_fold_and_conflicts_are_refused() -> Result<(), TestError> {
+    expect(future::block_on(refused_as(
+        "POST /a HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\nabcd",
+        IoErrorKind::InvalidData)), Str::new("two lengths are refused"))?;
+    const got: String = future::block_on(body_then_next_path(
+        "POST /a HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabcGET /b HTTP/1.1\r\n\r\n", 0)).unwrap();
+    return expect_eq(got.as_str(), Str::new("abc then /b"));
+}
+
+/// The body of the one response in `text`.
+async function response_body(text: string) -> Result<String, IoError> {
+    mut c: BufStream<MemTransport> = connection(text, 0);
+    mut response: Response = (await c.read_response())?;
+    return Result::Ok(String::from_str(text_of(&response.body)));
+}
+
+/// A chunked response is decoded the same way.
+![test]
+function a_chunked_response_body_is_decoded() -> Result<(), TestError> {
+    const got: String = future::block_on(response_body(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n")).unwrap();
+    return expect_eq(got.as_str(), Str::new("abc"));
+}
+
+/// A response with neither framing ends when the server closes.
+![test]
+function a_response_without_framing_is_read_to_the_end() -> Result<(), TestError> {
+    const got: String = future::block_on(response_body(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nall of it")).unwrap();
+    return expect_eq(got.as_str(), Str::new("all of it"));
+}
+
+/// Encoded chunks decode back to the bytes written, in order.
+![test]
+function an_encoded_chunked_body_decodes_back() -> Result<(), TestError> {
+    mut wire: Array<u8> = Array::new();
+    for (byte in Str::new("POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n").as_bytes().iter()) { wire.push(byte); }
+    mut encoder: ChunkedEncoder = ChunkedEncoder::new();
+    encoder.encode(Str::new("hello").as_bytes(), &wire).unwrap();
+    encoder.encode(Str::new("").as_bytes(), &wire).unwrap();
+    encoder.encode(Str::new(" world, at more than sixteen bytes").as_bytes(), &wire).unwrap();
+    encoder.finish(&wire).unwrap();
+    for (byte in Str::new("GET /b HTTP/1.1\r\n\r\n").as_bytes().iter()) { wire.push(byte); }
+    mut c: BufStream<MemTransport> = BufStream::<MemTransport>::of(MemTransport::of(wire.as_slice(), 0));
+    const first: Request = future::block_on(c.read_request()).unwrap();
+    const second: Request = future::block_on(c.read_request()).unwrap();
+    expect_eq(text_of(&first.body), Str::new("hello world, at more than sixteen bytes"))?;
+    return expect_eq(second.path.as_str(), Str::new("/b"));
+}
+
+/// Nothing is encoded after the last chunk.
+![test]
+function an_encoder_refuses_a_chunk_after_finishing() -> Result<(), TestError> {
+    mut wire: Array<u8> = Array::new();
+    mut encoder: ChunkedEncoder = ChunkedEncoder::new();
+    encoder.finish(&wire).unwrap();
+    match (encoder.encode(Str::new("late").as_bytes(), &wire)) {
+        Result::Ok(_)  => { return bail(Str::new("a chunk after the last one must be refused")); }
+        Result::Err(e) => { return expect(e.kind == IoErrorKind::InvalidInput, Str::new("refused as InvalidInput")); }
+    }
+}
+
+/// Repeated fields are kept in order; `insert` replaces every one.
+![test]
+function headers_keep_repeated_fields_in_order() -> Result<(), TestError> {
+    mut headers: Headers = Headers::new();
+    headers.append(Str::new("Set-Cookie"), Str::new("a=1"));
+    headers.append(Str::new("Content-Type"), Str::new("text/plain"));
+    headers.append(Str::new("set-cookie"), Str::new("b=2"));
+    expect_eq(headers.length(), 3)?;
+    expect_eq(headers.get(Str::new("SET-COOKIE")).unwrap(), Str::new("a=1"))?;
+    mut cookies: String = String::new();
+    for (cookie in headers.get_all(Str::new("Set-Cookie"))) {
+        cookies.push(cookie);
+        cookies.push(Str::new(";"));
+    }
+    expect_eq(cookies.as_str(), Str::new("a=1;b=2;"))?;
+    mut wire: Array<u8> = Array::new();
+    headers.encode_into(&wire).unwrap();
+    expect_eq(text_of(&wire), Str::new("set-cookie: a=1\r\ncontent-type: text/plain\r\nset-cookie: b=2\r\n"))?;
+    headers.insert(Str::new("Set-Cookie"), Str::new("c=3"));
+    expect_eq(headers.length(), 2)?;
+    expect_eq(headers.get(Str::new("set-cookie")).unwrap(), Str::new("c=3"))?;
+    expect(headers.remove(Str::new("set-cookie")), Str::new("remove reports a removed field"))?;
+    return expect(!headers.remove(Str::new("set-cookie")), Str::new("remove reports nothing left"));
+}

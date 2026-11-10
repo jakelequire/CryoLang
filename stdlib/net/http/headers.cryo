@@ -1,173 +1,173 @@
-///! HTTP headers: case-insensitive name/value map.
+///! HTTP headers: an ordered list of name/value fields.
 ///!
-///! Names are canonicalized to lowercase on insert so case-insensitive
-///! lookup is just `HashMap::get` with a lowercase key. Values are
-///! stored verbatim; folding, whitespace collapsing, and multi-value
-///! comma-splitting are caller concerns.
+///! A name may appear more than once (`Set-Cookie` does, routinely), so the
+///! fields are kept in the order they arrived or were added, repeats and
+///! all. Names are compared without regard to ASCII case and stored in
+///! lowercase; values are stored verbatim.
+///!
+///! ```cryo
+///! import std::collections::str::{ Str };
+///! import std::net::http::headers::{ Headers };
+///!
+///! mut headers: Headers = Headers::new();
+///! headers.append(Str::new("Set-Cookie"), Str::new("a=1"));
+///! headers.append(Str::new("Set-Cookie"), Str::new("b=2"));
+///! for (cookie in headers.get_all(Str::new("set-cookie"))) { /* a=1, then b=2 */ }
+///! ```
 
 namespace std::net::http::headers;
 
-import std::core::intrinsics;
 import std::core::drop::{ Drop };
 import std::core::option::{ Option };
 import std::core::result::{ Result };
-import std::core::hash;
-import std::core::cmp;
 import std::core::slice::{ Slice };
 import std::io::error::{ IoError, IoErrorKind };
-import std::io::traits;
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
-import std::collections::hashmap::{ HashMap };
 import std::collections::pair::{ Pair };
 import std::core::iter::{ Iterator };
 import std::collections::array::{ Array };
-import std::core::convert;
 import std::core::primitives;
-import std::core::mem;
+
+/// One header field: its lowercase name and its value.
+private type struct HeaderField {
+    private name: String;
+    private value: String;
+}
 
 public type struct Headers {
-    private inner: HashMap<String, String>;
+    private fields: Array<HeaderField>;
 
     public static new() -> Headers {
-        return Headers { inner: HashMap::new() };
+        return Headers { fields: Array::new() };
     }
 
+    /// The number of fields, a repeated name counted once per value.
     ![inline]
     public length(&this) -> i64 {
-        return this.inner.length();
+        return this.fields.length();
     }
 
     public is_empty(&this) -> boolean {
-        return this.inner.is_empty();
+        return this.fields.is_empty();
     }
 
-    /// Iterate over every stored header by shared borrow, yielding the
-    /// lowercase name and the value as stored. The pointers borrow the
-    /// headers' own storage and are invalidated by any `insert` or
-    /// `remove`. The order is unspecified.
+    /// Every field by shared borrow, in order, yielding the lowercase name
+    /// and the value as stored. The pointers borrow the headers' own
+    /// storage and are invalidated by any `append`, `insert` or `remove`.
     public entries(&this) -> implement Iterator<Pair<String*, String*>> {
-        return HeaderEntries {
-            map: &this.inner,
-            bucket_index: 0,
-            current: null
-        };
+        return HeaderEntries { fields: &this.fields, index: 0 };
     }
 
-    /// Insert or replace. Name is normalized to lowercase; CR/LF bytes are
-    /// stripped from both name and value before storing. Ownership of both
-    /// values transfers to the headers map.
+    /// Add `name: value` after the fields already present, keeping any
+    /// earlier values of the same name. The name is stored in lowercase;
+    /// CR and LF bytes are stripped from both before storing.
     ///
     /// The strip is a header-injection defense: `encode_into` re-emits every
-    /// entry verbatim as `name: value\r\n`, so an embedded CRLF in a
+    /// field verbatim as `name: value\r\n`, so an embedded CRLF in a
     /// caller-supplied value (e.g. a `Content-Type`) or an HTTP/2-decoded
     /// header folded into an HTTP/1 response would split the message
     /// (request smuggling / response splitting). Request-line parsing is
     /// already CRLF-safe (the line is CRLF-delimited), so this is a no-op
     /// there.
-    public insert(mut &this, name: Str, value: Str) -> void {
-        mut clean_name: String = strip_crlf(name);
-        mut key: String = clean_name.as_str().to_ascii_lowercase();
-        mem::drop(clean_name);
-        mut val: String = strip_crlf(value);
-        this.inner.insert(key, val);
+    public append(mut &this, name: Str, value: Str) -> void {
+        const clean_name: String = strip_crlf(name);
+        this.fields.push(HeaderField {
+            name: clean_name.as_str().to_ascii_lowercase(),
+            value: strip_crlf(value)
+        });
     }
 
-    /// Case-insensitive lookup. Returns a deep-cloned owned copy of the
-    /// stored value (header values are small, so copy-on-read is cheap),
-    /// so the caller owns it independently of the map and must drop it.
-    public get(&this, name: Str) -> Option<String> {
-        mut key: String = name.to_ascii_lowercase();
-        // Borrow the stored value, then clone its bytes into a fresh
-        // String. A bitwise `HashMap::get` here would alias the map's
-        // heap buffer and double-free.
-        match (this.inner.get_ref(&key)) {
-            Option::Some(stored) => {
-                return Option::Some(String::from_str((*stored).as_str()));
+    /// Set `name` to `value` alone: every earlier value of the name is
+    /// removed, then the field is appended.
+    public insert(mut &this, name: Str, value: Str) -> void {
+        this.remove(name);
+        this.append(name, value);
+    }
+
+    /// The first value of `name`, compared without regard to case. The
+    /// view borrows the headers' storage and is invalidated by any
+    /// `append`, `insert` or `remove`.
+    public get(&this, name: Str) -> Option<Str> {
+        for (field in this.fields.iter_ref()) {
+            if (field.name.as_str().equals_case_insensitive(&name)) {
+                return Option::Some(field.value.as_str());
             }
-            Option::None => { return Option::None; }
         }
+        return Option::None;
+    }
+
+    /// Every value of `name`, in order, compared without regard to case.
+    /// The views borrow the headers' storage, as `get`'s does.
+    public get_all(&this, name: Str) -> implement Iterator<Str> {
+        return HeaderValues { fields: &this.fields, name: name, index: 0 };
     }
 
     public contains(&this, name: Str) -> boolean {
-        mut key: String = name.to_ascii_lowercase();
-        return this.inner.contains_key(&key);
+        return this.get(name).is_some();
     }
 
+    /// Remove every value of `name`. True when there was one.
     public remove(mut &this, name: Str) -> boolean {
-        mut key: String = name.to_ascii_lowercase();
-        // `HashMap::remove` releases the stored key; our local probe key and
-        // the popped value are released at scope exit.
-        match (this.inner.remove(&key)) {
-            Option::Some(mut value) => { return true; }
+        const before: i64 = this.fields.length();
+        this.fields.retain((field: &HeaderField) -> boolean {
+            return !field.name.as_str().equals_case_insensitive(&name);
+        });
+        return this.fields.length() != before;
+    }
+
+    /// Parse a single `Name: Value` header line (no CRLF) and append it.
+    /// Used by the request and response parsers. Returns `false` on
+    /// malformed input; the caller turns that into a 400.
+    public parse_line(mut &this, line: Str) -> boolean {
+        match (line.split_once(&Str::new(":"))) {
+            Option::Some(parts) => {
+                this.append(parts.first, parts.second.trim_start());
+                return true;
+            }
             Option::None => { return false; }
         }
     }
 
-    /// Parse a single `Name: Value` header line (no CRLF). Used by
-    /// the request parser. Returns `false` on malformed input; the
-    /// caller turns that into a 400.
-    public parse_line(mut &this, line: Str) -> boolean {
-        mut colon: i64 = line.length();
-        mut i: i64 = 0;
-        while (i < line.length()) {
-            match (line.byte_at(i)) {
-                Option::Some(byte) => {
-                    if (byte == 0x3A) { colon = i; break; }
-                }
-                Option::None => { return false; }
-            }
-            i++;
-        }
-        if (colon == line.length()) { return false; }
-        const name_part: Str = line.sub_bytes(0, colon);
-        // Skip any leading whitespace in the value.
-        mut start: i64 = colon + 1;
-        while (start < line.length()) {
-            match (line.byte_at(start)) {
-                Option::Some(byte) => {
-                    if (byte != 0x20 && byte != 0x09) { break; }
-                }
-                Option::None => { return false; }
-            }
-            start = start + 1;
-        }
-        const value_part: Str = line.sub_bytes(start, line.length());
-        this.insert(name_part, value_part);
-        return true;
-    }
-
-    /// Content-Length as a number. `Ok(None)` means the header is
-    /// absent, which for this parser means "no body". A present but
-    /// non-numeric value is `InvalidData` rather than a silent `None`:
-    /// a peer that sends `Content-Length: abc` has framed the message
-    /// wrongly, and guessing at zero would leave its body bytes in the
-    /// buffer to be read as the next message.
+    /// Content-Length as a number. `Ok(None)` means the header is absent.
+    /// A value that is not a number is `InvalidData` rather than a silent
+    /// `None`: a peer that sends `Content-Length: abc` has framed the
+    /// message wrongly, and guessing at zero would leave its body bytes in
+    /// the buffer to be read as the next message. Repeats of one value
+    /// fold to it; two different values are `InvalidData`, since either
+    /// reading would leave the peer and this parser disagreeing about
+    /// where the message ends.
     ///
     /// The caller applies its own ceiling; the two directions cap the
     /// body independently.
     public content_length(&this) -> Result<Option<i64>, IoError> {
-        match (this.get(Str::new("content-length"))) {
-            Option::Some(mut value) => {
-                match (u64::try_from(value.as_str())) {
-                    Result::Ok(len) => {
-                        if (len > i64::MAX as u64) {
-                            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
-                        }
-                        return Result::Ok(Option::Some(len as i64));
+        mut found: Option<i64> = Option::None;
+        for (value in this.get_all(Str::new("content-length"))) {
+            mut length: i64 = 0;
+            match (u64::try_from(value)) {
+                Result::Ok(parsed) => {
+                    if (parsed > i64::MAX as u64) {
+                        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
                     }
-                    Result::Err(_)  => {
+                    length = parsed as i64;
+                }
+                Result::Err(_) => { return Result::Err(IoError::new(IoErrorKind::InvalidData, 0)); }
+            }
+            match (found) {
+                Option::Some(earlier) => {
+                    if (earlier != length) {
                         return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
                     }
                 }
+                Option::None => { found = Option::Some(length); }
             }
-            Option::None => { return Result::Ok(Option::None); }
         }
+        return Result::Ok(found);
     }
 
-    /// Append every stored header to `out` as HTTP/1.1 field lines,
-    /// `name: value\r\n` per entry. The caller appends the trailing
-    /// blank-line CRLF that separates headers from the message body.
+    /// Append every field to `out` as HTTP/1.1 field lines, `name: value\r\n`
+    /// each, in order. The caller appends the trailing blank-line CRLF that
+    /// separates headers from the message body.
     ///
     /// Synchronous, and that is the point: a message is built into the
     /// connection's outgoing buffer with no suspension point anywhere
@@ -175,66 +175,68 @@ public type struct Headers {
     public encode_into(&this, out: mut Array<u8>*) -> Result<(), IoError> {
         const colon_sp: &Slice<u8> = Slice::from_raw(": ", 2);
         const crlf: &Slice<u8> = Slice::from_raw("\r\n", 2);
-        for (entry in this.entries()) {
-            out.try_append(entry.first.as_bytes())?;
+        for (field in this.fields.iter_ref()) {
+            out.try_append(field.name.as_bytes())?;
             out.try_append(colon_sp)?;
-            out.try_append(entry.second.as_bytes())?;
+            out.try_append(field.value.as_bytes())?;
             out.try_append(crlf)?;
         }
         return Result::Ok(());
     }
-
 }
 
 /// Copy `s` into a fresh String with CR (0x0D) and LF (0x0A) bytes removed.
-/// See `Headers::insert` for why header names/values must never carry an
+/// See `Headers::append` for why header names/values must never carry an
 /// embedded line terminator.
 private function strip_crlf(s: Str) -> String {
     mut out: String = String::with_capacity(s.length());
-    mut i: i64 = 0;
-    while (i < s.length()) {
-        match (s.byte_at(i)) {
-            Option::Some(b) => {
-                if (b != 0x0D && b != 0x0A) { out.push_byte(b); }
-            }
-            Option::None => { }
-        }
-        i = i + 1;
+    for (byte in s.as_bytes().iter()) {
+        if (byte != 0x0D && byte != 0x0A) { out.push_byte(byte); }
     }
     return out;
 }
 
-/// The cursor behind `Headers::entries`: the map's buckets in order, each
-/// bucket's chain from its head.
+/// The cursor behind `Headers::entries`.
 private type struct HeaderEntries {
-    private map: const HashMap<String, String>*;
-    private bucket_index: u64;
-    private current: hashmap::Entry<String, String>*;
+    private fields: const Array<HeaderField>*;
+    private index: i64;
 }
 
 implement trait Iterator<Pair<String*, String*>> for struct HeaderEntries {
     next(mut &this) -> Option<Pair<String*, String*>> {
-        loop {
-            if (this.current != null) {
-                const entry: hashmap::Entry<String, String>* = this.current;
-                this.current = entry.next;
-                return Option::Some(Pair::<String*, String*> {
-                    first: &entry.key,
-                    second: &entry.value
-                });
+        match (this.fields.get_ref(this.index)) {
+            Option::Some(field) => {
+                this.index = this.index + 1;
+                return Option::Some(Pair::<String*, String*> { first: &field.name, second: &field.value });
             }
-            if (this.bucket_index >= this.map.bucket_count()) {
-                return Option::None;
-            }
-            this.current = this.map.get_bucket(this.bucket_index);
-            this.bucket_index = this.bucket_index + 1;
+            Option::None => { return Option::None; }
         }
     }
 }
 
-/// Drop every stored header.  `HashMap::drop` requires `K: Drop,
-/// V: Drop` and calls `K::drop()` / `V::drop()` on every entry, so
-/// each stored `String` key and value is reclaimed automatically.
+/// The cursor behind `Headers::get_all`. `name` borrows the caller's text.
+private type struct HeaderValues {
+    private fields: const Array<HeaderField>*;
+    private name: Str;
+    private index: i64;
+}
+
+implement trait Iterator<Str> for struct HeaderValues {
+    next(mut &this) -> Option<Str> {
+        loop {
+            match (this.fields.get_ref(this.index)) {
+                Option::Some(field) => {
+                    this.index = this.index + 1;
+                    if (field.name.as_str().equals_case_insensitive(&this.name)) {
+                        return Option::Some(field.value.as_str());
+                    }
+                }
+                Option::None => { return Option::None; }
+            }
+        }
+    }
+}
+
 implement trait Drop for struct Headers {
     drop(mut &this) -> void { }
 }

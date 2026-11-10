@@ -30,76 +30,94 @@
 ///! byte is copied out by `read_line` / `read_exact` before the next
 ///! suspension, which is what makes them safe against a fill that grows
 ///! and moves the connection's buffer.
+///!
+///! ## Bodies
+///!
+///! A body is framed by `Content-Length`, or by the chunked transfer
+///! coding: size-prefixed chunks ending with an empty one and an optional
+///! trailer section, which is read and dropped. A message that names both
+///! is refused (`InvalidData`), since a peer and a proxy could each read
+///! it by a different one; a transfer coding other than chunked is
+///! `Unsupported`. A request with neither has no body; a response with
+///! neither runs to the end of the connection, except one that never has
+///! a body (1xx, 204, 304). Either way the body is capped at the
+///! direction's `MAX_BODY`, checked before the bytes are read.
 
 namespace std::net::http::conn;
 
 import std::core::option::{ Option };
 import std::core::result::{ Result };
+import std::core::mem;
 import std::core::slice;
 import std::io::error::{ IoError, IoErrorKind };
 import std::io::traits::{ AsyncTransport };
 import std::io::buf::{ BufStream };
 import std::collections::array::{ Array };
 import std::collections::str;
+import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::net::http::headers;
+import std::net::http::headers::{ Headers };
 import std::net::http::request::{ Request };
 import std::net::http::response::{ Response };
 import std::future::poll;
 import std::future::waker;
 import std::future::traits;
 
+/// How a message's body is delimited, decided from its headers before any
+/// of the body is read.
+private type enum BodyFraming {
+    /// No body at all.
+    Empty;
+    /// Exactly this many bytes.
+    Length(i64);
+    /// Chunked transfer coding.
+    Chunked;
+    /// Everything up to the end of the connection.
+    ToEnd;
+}
+
+implement enum BodyFraming {
+    /// The framing `headers` declare. `unframed` is what a message that
+    /// declares none has: `Empty` for a request, `ToEnd` for most
+    /// responses.
+    private static of(headers: &Headers, unframed: BodyFraming) -> Result<BodyFraming, IoError> {
+        match (headers.get(Str::new("transfer-encoding"))) {
+            Option::Some(coding) => {
+                if (headers.contains(Str::new("content-length"))) {
+                    return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                }
+                if (!coding.trim().equals_case_insensitive(&Str::new("chunked"))) {
+                    return Result::Err(IoError::new(IoErrorKind::Unsupported, 0));
+                }
+                return Result::Ok(BodyFraming::Chunked);
+            }
+            Option::None => { }
+        }
+        match (headers.content_length()?) {
+            Option::Some(length) => { return Result::Ok(BodyFraming::Length(length)); }
+            Option::None         => { return Result::Ok(unframed); }
+        }
+    }
+}
+
 /// Reading a whole HTTP/1.1 message off a buffered connection.
 ///
 /// Written once for `BufStream<S>` over any async transport, so a plaintext
 /// socket and a TLS session are served by the same framing code.
 implement struct BufStream<S> {
-    /// Read one complete request: request line, headers, and the body
-    /// sized by `Content-Length`. A peer that closes mid-message is
-    /// `UnexpectedEof`; one that sends a malformed line is `InvalidData`;
-    /// a request whose body is framed by `Transfer-Encoding` is
+    /// Read one complete request: request line, headers, and the body as
+    /// the module note describes. A peer that closes mid-message is
+    /// `UnexpectedEof`; one that sends a malformed line or framing is
+    /// `InvalidData`; a transfer coding other than chunked is
     /// `Unsupported`.
     public async read_request(mut &this) -> Result<Request, IoError>
     where S: AsyncTransport {
         mut line: String = (await this.read_line(request::MAX_HEADER_LINE))?;
         mut req: Request = Request::from_request_line(line.as_str())?;
-
-        mut header_count: u64 = 0;
-        loop {
-            mut header_line: String = (await this.read_line(request::MAX_HEADER_LINE))?;
-            if (header_line.is_empty()) { break; }
-            if (!req.headers.parse_line(header_line.as_str())) {
-                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
-            }
-            header_count = header_count + 1;
-            if (header_count > request::MAX_HEADER_COUNT) {
-                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
-            }
-        }
-
-        // A body framed by `Transfer-Encoding` has no length this parser
-        // reads. Taking the request as bodiless would leave the body on the
-        // connection, to be parsed as the next request.
-        if (req.headers.contains(str::Str::new("transfer-encoding"))) {
-            return Result::Err(IoError::new(IoErrorKind::Unsupported, 0));
-        }
-
-        // Body, sized by Content-Length. No Content-Length means no body.
-        const declared: Option<i64> = req.headers.content_length()?;
-        mut length: i64 = 0;
-        match (declared) {
-            Option::Some(n) => { length = n; }
-            Option::None    => { return Result::Ok(req); }
-        }
-        // Reject up front; never size a buffer to an untrusted peer's
-        // declared length.
-        if (length > request::MAX_BODY) {
-            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
-        }
-        if (length > 0) {
-            mut body: Array<u8> = (await this.read_exact(length))?;
-            req.body = body;
-        }
+        req.headers = (await this.read_header_section(request::MAX_HEADER_COUNT))?;
+        const framing: BodyFraming = BodyFraming::of(&req.headers, BodyFraming::Empty)?;
+        req.body = (await this.read_body(framing, request::MAX_BODY))?;
         return Result::Ok(req);
     }
 
@@ -108,33 +126,93 @@ implement struct BufStream<S> {
     where S: AsyncTransport {
         mut line: String = (await this.read_line(request::MAX_HEADER_LINE))?;
         mut resp: Response = Response::from_status_line(line.as_str())?;
+        resp.headers = (await this.read_header_section(response::MAX_HEADER_COUNT))?;
+        const code: u16 = resp.status.as_u16();
+        mut unframed: BodyFraming = BodyFraming::ToEnd;
+        if (resp.status.is_informational() || code == 204 || code == 304) {
+            unframed = BodyFraming::Empty;
+        }
+        const framing: BodyFraming = BodyFraming::of(&resp.headers, unframed)?;
+        resp.body = (await this.read_body(framing, response::MAX_BODY))?;
+        return Result::Ok(resp);
+    }
 
-        mut header_count: u64 = 0;
+    /// Read header lines up to the blank line that ends them, refusing more
+    /// than `most` of them. The fields are returned rather than written
+    /// through a pointer, since a future may not hold the address of its
+    /// caller's local across a suspension.
+    private async read_header_section(mut &this, most: u64) -> Result<Headers, IoError>
+    where S: AsyncTransport {
+        mut headers: Headers = Headers::new();
+        mut count: u64 = 0;
         loop {
             mut header_line: String = (await this.read_line(request::MAX_HEADER_LINE))?;
-            if (header_line.is_empty()) { break; }
-            if (!resp.headers.parse_line(header_line.as_str())) {
+            if (header_line.is_empty()) { return Result::Ok(headers); }
+            if (!headers.parse_line(header_line.as_str())) {
                 return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
             }
-            header_count = header_count + 1;
-            if (header_count > response::MAX_HEADER_COUNT) {
+            count = count + 1;
+            if (count > most) {
                 return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
             }
         }
+    }
 
-        const declared: Option<i64> = resp.headers.content_length()?;
-        mut length: i64 = 0;
-        match (declared) {
-            Option::Some(n) => { length = n; }
-            Option::None    => { return Result::Ok(resp); }
+    /// Read a body framed as `framing`, refusing one past `limit` bytes.
+    private async read_body(mut &this, framing: BodyFraming, limit: i64) -> Result<Array<u8>, IoError>
+    where S: AsyncTransport {
+        match (framing) {
+            BodyFraming::Empty => { return Result::Ok(Array::new()); }
+            BodyFraming::Length(length) => {
+                // Never size a buffer to an untrusted peer's declared length.
+                if (length > limit) {
+                    return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                }
+                if (length == 0) { return Result::Ok(Array::new()); }
+                return await this.read_exact(length);
+            }
+            BodyFraming::Chunked => {
+                mut body: Array<u8> = Array::new();
+                loop {
+                    mut size_line: String = (await this.read_line(request::MAX_HEADER_LINE))?;
+                    // A chunk extension after `;` is allowed and ignored.
+                    mut digits: Str = size_line.as_str();
+                    match (digits.split_once(&Str::new(";"))) {
+                        Option::Some(parts) => { digits = parts.first; }
+                        Option::None        => { }
+                    }
+                    mut size: u64 = 0;
+                    match (digits.trim().try_to_hex()) {
+                        Result::Ok(value) => { size = value; }
+                        Result::Err(_)    => { return Result::Err(IoError::new(IoErrorKind::InvalidData, 0)); }
+                    }
+                    if (size == 0) { break; }
+                    if (size > (limit - body.length()) as u64) {
+                        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                    }
+                    mut chunk: Array<u8> = (await this.read_exact(size as i64))?;
+                    body.try_append(chunk.as_slice())?;
+                    // The chunk's own CRLF, and nothing before it.
+                    mut chunk_end: String = (await this.read_line(2))?;
+                    if (!chunk_end.is_empty()) {
+                        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                    }
+                }
+                // The trailer section, read and dropped.
+                mem::drop((await this.read_header_section(request::MAX_HEADER_COUNT))?);
+                return Result::Ok(body);
+            }
+            BodyFraming::ToEnd => {
+                mut body: Array<u8> = Array::new();
+                loop {
+                    mut piece: Array<u8> = (await this.read_some(limit - body.length() + 1))?;
+                    if (piece.is_empty()) { return Result::Ok(body); }
+                    body.try_append(piece.as_slice())?;
+                    if (body.length() > limit) {
+                        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                    }
+                }
+            }
         }
-        if (length > response::MAX_BODY) {
-            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
-        }
-        if (length > 0) {
-            mut body: Array<u8> = (await this.read_exact(length))?;
-            resp.body = body;
-        }
-        return Result::Ok(resp);
     }
 }
