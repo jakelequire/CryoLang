@@ -1423,7 +1423,7 @@ From **lowest** to **highest**:
 
 `as` sits between multiplication and unary, so `x * y as i64` casts `y`, not the product. Use parentheses if you mean `(x * y) as i64`.
 
-The range operators `..` / `..=` bind looser than every arithmetic and comparison operator, so `a + 1 .. b * 2` is `(a + 1) .. (b * 2)`. They desugar at parse time to `Range::new` / `RangeInclusive::new` (see [section 6.3](#63-for-loops)).
+The range operators `..` / `..=` bind looser than every arithmetic and comparison operator, so `a + 1 .. b * 2` is `(a + 1) .. (b * 2)`. They desugar at parse time to `Range::new` / `RangeInclusive::new` (see [section 6.3](#63-for-loops)). A range may leave an end open where the next token cannot start its operand - `]`, `)`, `,`, `;` or `}`: `a..` is `RangeFrom::new(a)`, `..b` is `RangeTo::new(b)` and a bare `..` is `RangeFull::new()`, the forms a slice takes ([section 10.6](#106-operator-overloading)). `RangeFrom` is an endless iterator over a `Step` type: `for (n in 5..)` counts up until the loop breaks.
 
 ---
 
@@ -2623,6 +2623,8 @@ live in
 | `<=>`                  | `Ord` (`: Eq`)                        | `a <=> b` -> `a.compare(&b)`                                 |
 | `a[i]` read            | `Index<Idx>` (`type Output`)          | `a[i]` -> `*(a.index(i))`                                    |
 | `a[i]` written         | `IndexMutable<Idx>` (`: Index<Idx>`)  | `a[i]` -> `*(a.index_mutable(i))`                            |
+| `a[r]` read, a view    | `IndexView<Idx>` (`type View`)        | `a[r]` -> `a.view(r)`                                        |
+| `a[r]` written, a view | `IndexViewMutable<Idx>` (`type ViewMutable`) | `a[r]` -> `a.view_mutable(r)`                          |
 | `*a` (deref) read      | `Deref` (`type Target`)               | `*a` -> `*(a.deref())`                                       |
 | `*a` (deref) written   | `DerefMutable` (`: Deref`)            | `*a` -> `*(a.deref_mutable())`                               |
 
@@ -2736,6 +2738,38 @@ mut g: Grid = ...;
 const first: i32 = g[0];  // *(g.index(0))
 g[0] = 42;                // *(g.index_mutable(0)) = 42
 g[0] += 1;                // index_mutable called once
+```
+
+**Views.** `a[r]` is a *view* - a value standing for part of `a`, not one
+element - where `a`'s type implements `IndexView<Idx>` at `r`'s type: it is
+`a.view(r)`, a value of the implementation's `View`, returned by value.
+That is one question, asked before `Index`'s: a container and index type
+with no `IndexView` implementation are indexed through `Index` as above.
+Where the view is written - an element of it assigned (`xs[1..3][0] = v`),
+or the view made the receiver of a `mut &this` method - it is
+`a.view_mutable(r)`, the `ViewMutable` of `IndexViewMutable<Idx>` (whose
+supertrait is `IndexView<Idx>`), and a place reached through it is exactly
+as writable as `a` (E0250 on a `const` binding).  A type that implements
+only `IndexView` is read-only through the view (E0229).  A view is not
+checked for lifetime: like any reference, it must not outlive `a`.
+
+The standard library slices by a range.  On an `Array<T>`, a `[T]` or a
+`Slice<T>`, `xs[r]` is a `&Slice<T>` of the elements `r` names, and written a
+`mut &Slice<T>`; on a `Str` or a `String`, `s[r]` is the `Str` of the bytes
+`r` names.  `r` is any of the five range forms over any integer type:
+`a..b` (`Range`), `a..=b` (`RangeInclusive`), `a..` (`RangeFrom`), `..b`
+(`RangeTo`) and `..` (`RangeFull`), a missing start being `0` and a missing
+end the length.  A range reaching outside `[0, length]`, or starting after
+its end, panics, and on a string so does an end inside a UTF-8 character
+(neither end may split one: `Str.is_char_boundary`); the report names the
+`[]` that asked (`![caller_location]`).
+
+```cryo
+mut xs: [i64] = [1, 2, 3, 4, 5];
+const middle: &Slice<i64> = xs[1..4];   // 2, 3, 4
+xs[3..][0] = 40;                        // xs.view_mutable(RangeFrom::new(3))[0]
+const text: Str = Str::new("héllo");
+const tail: Str = text[3..];            // "llo"; text[0..2] panics
 ```
 
 **Dereference and auto-deref.** `*b` is read through `Deref`, whose
@@ -4677,7 +4711,7 @@ The prelude is auto-imported into every Cryo source file. Currently:
 | `core::drop`, `core::marker`, `core::cmp`, `core::clone` | `Drop`, the marker traits (`Copy`, `Send`, `Sync`), `Eq` / `Ord` / `Ordering`, `Clone` |
 | `collections::array` | `Array<T>`, the type `[T]` names                                                                                       |
 | `core::slice`        | `Slice<T>`, backing the for-in lowering over fixed-size arrays (`for (x in arr)` where `arr: [T; N]`)                 |
-| `core::ops`          | `Range` / `RangeInclusive`, backing range literals (`a..b` desugars to `Range::new`)                                  |
+| `core::ops`          | `Range` / `RangeInclusive` / `RangeFrom` / `RangeTo` / `RangeFull`, backing range literals (`a..b` desugars to `Range::new`) |
 | `core::iter`         | `Iterator`, the trait the for-in sugar drives the scrutinee through                                                   |
 | `alloc::box`         | `Box<T>`                                                                                                              |
 | `alloc::rc`          | `Rc<T>`                                                                                                               |

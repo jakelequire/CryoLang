@@ -335,7 +335,11 @@ Coalesce           ::= Pipe ("??" Coalesce)?            (* null-coalescing, righ
 Pipe               ::= Conditional (("|>" | "<|") Conditional)*   (* pipeline, left-assoc *)
 
 Conditional        ::= BinaryExpr ("?" Expr ":" Conditional)?
-BinaryExpr         ::= UnaryExpr (BinOp UnaryExpr)*
+BinaryExpr         ::= ".." (BinaryExpr)?    (* ..b and a bare .. : RangeTo, RangeFull *)
+                     | UnaryExpr (BinOp UnaryExpr | "..")*
+                                        (* a postfix ".." is a..: RangeFrom; it
+                                           and a bare ".." take no operand where
+                                           the next token is "]" ")" "," ";" "}" *)
 BinOp              ::= "||" | "&&" | "|" | "^" | "&"
                      | "==" | "!=" | "<" | ">" | "<=" | ">=" | "<=>"
                      | "<<" | ">>" | "+" | "-" | "*" | "/" | "%"

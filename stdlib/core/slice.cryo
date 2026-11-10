@@ -14,7 +14,8 @@ namespace std::core::slice;
 import std::core::intrinsics;
 import std::core::cmp::{ Eq, Ord, Ordering };
 import std::core::hash::{ Hash, Hasher };
-import std::core::ops::{ Index, IndexMutable };
+import std::core::ops::{ Index, IndexMutable, IndexView, IndexViewMutable,
+                         Range, RangeInclusive, RangeFrom, RangeTo, RangeFull };
 import std::core::iter::{ DoubleEndedIterator, Iterator };
 import std::core::option::{ Option };
 import std::core::mem;
@@ -139,6 +140,25 @@ public type struct Slice<T> {
         }
         return element;
     }
+
+    /// The positions `[start, end)` `range` names among the elements, for
+    /// a view.  Panics where either is outside `[0, length]` or the range
+    /// starts after its end, at the `xs[r]` that asked: this and every
+    /// `view` report their caller's location.
+    ![caller_location]
+    internal range_bounds<R>(&this, range: &R) -> (i64, i64) where R: SliceRange {
+        const positions: (i64, i64) = range.positions_in(this.length);
+        if (positions[0] < 0) {
+            core::panic("range start is out of bounds", intrinsics::location());
+        }
+        if (positions[1] < 0) {
+            core::panic("range end is out of bounds", intrinsics::location());
+        }
+        if (positions[0] > positions[1]) {
+            core::panic("range starts after its end", intrinsics::location());
+        }
+        return positions;
+    }
 }
 
 /// An index `[]` takes on a `Slice<T>` or an `Array<T>`: each integer type,
@@ -247,6 +267,122 @@ implement<T, I> trait IndexMutable<I> for struct Slice<T> where I: SliceIndex<T>
     ![inline]
     ![caller_location]
     index_mutable(mut &this, i: I) -> mut I::Output* { return this.element_at(i); }
+}
+
+/// A position a range names among the elements of a `Slice<T>`, an
+/// `Array<T>` or a string: each integer type.  Implemented here alone.
+internal type trait SlicePosition {
+    /// This position among `length` elements, from `0` to `length`
+    /// inclusive, or -1 when it is outside them; a negative position is
+    /// outside every slice.
+    position_in(&this, length: i64) -> i64;
+}
+
+implement trait SlicePosition for i8 {
+    ![inline]
+    position_in(&this, length: i64) -> i64 { if (this as u64 > length as u64) { return -1; } return this as i64; }
+}
+implement trait SlicePosition for i16 {
+    ![inline]
+    position_in(&this, length: i64) -> i64 { if (this as u64 > length as u64) { return -1; } return this as i64; }
+}
+implement trait SlicePosition for i32 {
+    ![inline]
+    position_in(&this, length: i64) -> i64 { if (this as u64 > length as u64) { return -1; } return this as i64; }
+}
+implement trait SlicePosition for i64 {
+    ![inline]
+    position_in(&this, length: i64) -> i64 { if (this as u64 > length as u64) { return -1; } return this; }
+}
+implement trait SlicePosition for isize {
+    ![inline]
+    position_in(&this, length: i64) -> i64 { if (this as u64 > length as u64) { return -1; } return this as i64; }
+}
+implement trait SlicePosition for u8 {
+    ![inline]
+    position_in(&this, length: i64) -> i64 { if (this as u64 > length as u64) { return -1; } return this as i64; }
+}
+implement trait SlicePosition for u16 {
+    ![inline]
+    position_in(&this, length: i64) -> i64 { if (this as u64 > length as u64) { return -1; } return this as i64; }
+}
+implement trait SlicePosition for u32 {
+    ![inline]
+    position_in(&this, length: i64) -> i64 { if (this as u64 > length as u64) { return -1; } return this as i64; }
+}
+implement trait SlicePosition for u64 {
+    ![inline]
+    position_in(&this, length: i64) -> i64 { if (this > length as u64) { return -1; } return this as i64; }
+}
+implement trait SlicePosition for usize {
+    ![inline]
+    position_in(&this, length: i64) -> i64 { if (this as u64 > length as u64) { return -1; } return this as i64; }
+}
+
+/// A range `[]` takes on a `Slice<T>`, an `Array<T>` or a string, viewing
+/// part of it: `a..b`, `a..=b`, `a..`, `..b` and `..`, over each integer
+/// type.  Implemented here alone.
+internal type trait SliceRange {
+    /// The positions `[start, end)` this range names among `length`
+    /// elements, each -1 where it is outside them.
+    positions_in(&this, length: i64) -> (i64, i64);
+}
+
+implement<I> trait SliceRange for struct Range<I> where I: SlicePosition {
+    positions_in(&this, length: i64) -> (i64, i64) {
+        return (this.start.position_in(length), this.end.position_in(length));
+    }
+}
+
+/// The end names the last element, so it is a position only short of
+/// `length`.
+implement<I> trait SliceRange for struct RangeInclusive<I> where I: SlicePosition {
+    positions_in(&this, length: i64) -> (i64, i64) {
+        const last: i64 = this.end.position_in(length);
+        const end: i64 = if (last < 0 || last == length) { -1 } else { last + 1 };
+        return (this.start.position_in(length), end);
+    }
+}
+
+implement<I> trait SliceRange for struct RangeFrom<I> where I: SlicePosition {
+    positions_in(&this, length: i64) -> (i64, i64) {
+        return (this.start.position_in(length), length);
+    }
+}
+
+implement<I> trait SliceRange for struct RangeTo<I> where I: SlicePosition {
+    positions_in(&this, length: i64) -> (i64, i64) {
+        return (0, this.end.position_in(length));
+    }
+}
+
+implement trait SliceRange for struct RangeFull {
+    positions_in(&this, length: i64) -> (i64, i64) {
+        return (0, length);
+    }
+}
+
+// `xs[r]` with a range `r` is the part of the slice `r` names: read, it is
+// `xs.view(r)`, a `&Slice<T>`, and written, `xs.view_mutable(r)`, a
+// `mut &Slice<T>`.  A range reaching outside `[0, length]`, or starting
+// after its end, panics.
+implement<T, R> trait IndexView<R> for struct Slice<T> where R: SliceRange {
+    type View = &Slice<T>;
+    ![inline]
+    ![caller_location]
+    view(&this, range: R) -> &Slice<T> {
+        const bounds: (i64, i64) = this.range_bounds(&range);
+        return Slice::from_raw(mem::const_offset(this.ptr, bounds[0]), bounds[1] - bounds[0]);
+    }
+}
+implement<T, R> trait IndexViewMutable<R> for struct Slice<T> where R: SliceRange {
+    type ViewMutable = mut &Slice<T>;
+    ![inline]
+    ![caller_location]
+    view_mutable(mut &this, range: R) -> mut &Slice<T> {
+        const bounds: (i64, i64) = this.range_bounds(&range);
+        return Slice::from_raw_mutable(mem::offset(this.ptr, bounds[0]), bounds[1] - bounds[0]);
+    }
 }
 
 // Two slices are equal when they have the same length and equal elements
