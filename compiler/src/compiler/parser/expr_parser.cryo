@@ -488,6 +488,9 @@ implement struct Parser {
                 return null;
             }
             const op: Token = this.advance();
+            if (op.kind == TokenType::Amp && this.check(TokenType::KwMut)) {
+                this.refuse_mut_after_borrow();
+            }
             this.unary_depth += 1;
             const operand: mut ExpressionNode* = this.parse_unary();
             this.unary_depth -= 1;
@@ -502,6 +505,26 @@ implement struct Parser {
         }
 
         return this.parse_primary_with_postfix();
+    }
+
+    /// `&mut x`, at the `mut`: a borrow is written `&x`, and is writable
+    /// where a writable one is wanted, so `mut` there is never Cryo.  Deleting
+    /// it, up to the operand, leaves the one spelling of the borrow; the
+    /// `mut` is consumed so the operand parses as the borrow's.
+    refuse_mut_after_borrow(mut &this) -> void {
+        const mut_token: Token = this.advance();
+        const operand_start: Token = this.current();
+        const mut_span: SourceSpan = this.span_from_token(mut_token);
+        const removal: SourceSpan = SourceSpan::new(this.source_file,
+            mut_token.line as u32, mut_token.column as u32,
+            operand_start.line as u32, operand_start.column as u32);
+        this.error_count += 1;
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0101_UNEXPECTED_TOKEN,
+            "a borrow is not written `&mut`");
+        diag = diag.at_with_label(mut_span, "remove this `mut`");
+        diag = diag.with_note("`&x` is a writable borrow wherever a writable one is wanted - a `mut &T` parameter, binding or field - and `x` is writable");
+        diag = diag.suggest(Suggestion::machine_applicable(removal, "", "write the borrow as `&`"));
+        this.ctx.emit_diagnostic(diag);
     }
 
 

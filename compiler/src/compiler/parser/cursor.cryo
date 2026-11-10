@@ -17,9 +17,7 @@ import std::collections::string::{ String };
 import std::collections::str::{ Str };
 import std::fmt;
 import std::fmt::display::{ Display };
-import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span::{ SourceSpan };
-import compiler::diag::suggestion::{ Suggestion };
 
 
 /// The recursive-descent parser over one file's tokens.
@@ -247,80 +245,19 @@ implement struct Parser {
 
     /// Expect and consume a token of the given kind.
     /// Reports an error and enters panic mode if the token doesn't match.
+    ///
+    /// The error offers no inserted token: where the parser stopped is not
+    /// always where the token is missing.  A value-yielding `{ x }` nested
+    /// below an arm stops at its `}` wanting a `;`, and after a refused arm
+    /// the next `_ => {` stops at `{` wanting `=>`; inserting either breaks
+    /// the program further.
     consume(mut &this, kind: TokenType, message: string) -> Token {
         if (this.check(kind)) {
             return this.advance();
         }
 
-        this.error_expected_with_insert(kind, message);
+        this.error_expected(message);
         return this.current();
-    }
-
-    /// Map a TokenType whose source representation is a fixed literal
-    /// (delimiters, common punctuators, the assignment / arrow / fat-arrow
-    /// operators) to that literal.  Returns the empty string for kinds
-    /// whose source form is variable (identifiers, literals, keywords
-    /// that may be spelled differently across configurations), in which
-    /// case the caller skips the auto-insert quickfix.  Keep this list
-    /// conservative - every entry here drives a machine-applicable edit,
-    /// so a wrong mapping would auto-apply broken code.
-    static literal_for_token(kind: TokenType) -> string {
-        return match (kind) {
-            TokenType::Semicolon   => { ";"  }
-            TokenType::Comma       => { ","  }
-            TokenType::Colon       => { ":"  }
-            TokenType::ColonColon  => { "::" }
-            TokenType::LParen      => { "("  }
-            TokenType::RParen      => { ")"  }
-            TokenType::LBrace      => { "{"  }
-            TokenType::RBrace      => { "}"  }
-            TokenType::LSquare     => { "["  }
-            TokenType::RSquare     => { "]"  }
-            TokenType::LAngle      => { "<"  }
-            TokenType::RAngle      => { ">"  }
-            TokenType::Arrow       => { "->" }
-            TokenType::FatArrow    => { "=>" }
-            TokenType::Equal       => { "="  }
-            _                      => { ""   }
-        };
-    }
-
-    /// Like `error_expected`, but when the expected token has a fixed
-    /// source form (see `literal_for_token`), attach a machine-applicable
-    /// suggestion that inserts the literal at the end of the previous
-    /// real token.  This turns "expected ';'" into a one-click fix for
-    /// the missing-semicolon / missing-comma / missing-paren cases that
-    /// dominate parser-error UX.
-    error_expected_with_insert(mut &this, kind: TokenType, expected: string) -> void {
-        const tok: Token = this.current();
-        const message: string = fmt::format("expected %s, found `%s`", expected, tok.lexeme).into_raw();
-        const literal: string = Parser::literal_for_token(kind);
-        if (literal == "") {
-            // No safe auto-insertion; fall back to the plain error.
-            this.report_error(ErrorCode::E0100_EXPECTED_TOKEN, message);
-            return;
-        }
-
-        // Anchor: the END of the most recently consumed real token.  For
-        // the missing-`;` case this places the caret just after the
-        // expression - exactly where the user expects it.  When there's
-        // no prior token (start of input), fall through to the unadorned
-        // error so we don't synthesise a span at column 0.
-        const insert_span: SourceSpan = this.end_of_last_consumed();
-        if (!insert_span.has_location()) {
-            this.report_error(ErrorCode::E0100_EXPECTED_TOKEN, message);
-            return;
-        }
-
-        this.panic_mode = true;
-        this.error_count += 1;
-        mut diag: Diagnostic = Diagnostic::error(
-            ErrorCode::E0100_EXPECTED_TOKEN, message);
-        diag = diag.at(this.current_span());
-        diag = diag.suggest(Suggestion::machine_applicable(
-            insert_span, literal,
-            fmt::format("insert `%s` here", literal)));
-        this.ctx.emit_diagnostic(diag);
     }
 
     /// Check if we've reached the end of the token stream.
