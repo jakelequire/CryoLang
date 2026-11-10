@@ -23,6 +23,7 @@ import std::env;
 import std::process::command::{ Command, Output, Stdio };
 import std::process::child::{ Child, ChildStdout, ExitStatus };
 import std::process::signal::{ Signal };
+import std::process::memory::{ SystemMemory };
 import std::fs::path::{ Path };
 import std::fs::file::{ File };
 import std::time::duration::{ Duration };
@@ -350,6 +351,28 @@ function kill_tree_needs_a_grouped_child() -> Result<(), TestError> {
         Result::Ok(_)  => { return bail(Str::new("an ungrouped child has no tree")); }
         Result::Err(e) => { return expect(e.kind == IoErrorKind::InvalidInput, Str::new("refused with InvalidInput")); }
     }
+}
+
+/// Every wait reports how much memory the child held at its peak; any
+/// program holds well over 100 KB once loaded.
+![test]
+function a_childs_peak_memory_is_reported() -> Result<(), TestError> {
+    mut waited: Command = cmd_true();
+    const waited_status: ExitStatus = waited.status().unwrap();
+    mut polled: Command = cmd_true();
+    mut child: Child = polled.spawn().unwrap();
+    const polled_status: ExitStatus = child.wait_timeout(Duration::from_secs(30)).unwrap().unwrap();
+    expect(waited_status.peak_memory_bytes().unwrap_or(0) > 100000, Str::new("wait reports the peak"))?;
+    return expect(polled_status.peak_memory_bytes().unwrap_or(0) > 100000, Str::new("wait_timeout reports the peak"));
+}
+
+/// The machine reports some memory, and no more available than installed.
+![test]
+function system_memory_reports_total_and_available() -> Result<(), TestError> {
+    const memory: SystemMemory = SystemMemory::query().unwrap();
+    expect(memory.total_bytes() > 0, Str::new("some memory is installed"))?;
+    expect(memory.available_bytes() > 0, Str::new("some memory is available"))?;
+    return expect(memory.available_bytes() <= memory.total_bytes(), Str::new("no more is available than installed"));
 }
 
 /// A piped stdout is taken out of the running child and read while the

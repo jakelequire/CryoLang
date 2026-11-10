@@ -78,13 +78,14 @@ import std::future::blocking::{ BlockingJob, BlockingPool, JOB_PENDING };
 ![target(unix)]
 private function os_proc_wait(pid: i32, handle: u64) -> Result<ExitStatus, IoError> {
     mut status: i32 = 0;
+    mut usage: libc::rusage;
     loop {
-        const rc: i32 = libc::waitpid(pid, &status, 0);
+        const rc: i32 = libc::wait4(pid, &status, 0, &usage);
         if (rc >= 0) {
             // A stop/continue notification isn't a termination; keep blocking
             // until the child actually exits or is killed.
             if (wstatus_is_alive(status)) { continue; }
-            return Result::Ok(decode_wstatus(status));
+            return Result::Ok(decode_wstatus(status, &usage));
         }
         const err: IoError = IoError::last_os_error();
         match (err.kind) {
@@ -99,11 +100,25 @@ private function os_proc_wait(pid: i32, handle: u64) -> Result<ExitStatus, IoErr
     if (syscall::WaitForSingleObject(h, 0xFFFFFFFF) == 0xFFFFFFFF) {   // INFINITE; WAIT_FAILED
         return Result::Err(IoError::last_os_error());
     }
+    return os_proc_exit_status(h);
+}
+
+/// The status of the exited process `h`: its exit code, and the largest
+/// working set it reached, which the system keeps for as long as a HANDLE
+/// to the process is open.
+![target(windows)]
+private function os_proc_exit_status(h: u8*) -> Result<ExitStatus, IoError> {
     mut code: u32 = 0;
     if (syscall::GetExitCodeProcess(h, &code) == 0) {
         return Result::Err(IoError::last_os_error());
     }
-    return Result::Ok(ExitStatus { code: code as i32, signal: 0, signaled: false });
+    mut counters: syscall::PROCESS_MEMORY_COUNTERS;
+    counters.cb = 72;
+    mut peak: u64 = 0;
+    if (syscall::K32GetProcessMemoryInfo(h, &counters, 72) != 0) {
+        peak = counters.PeakWorkingSetSize;
+    }
+    return Result::Ok(ExitStatus { code: code as i32, signal: 0, signaled: false, peak_memory: peak });
 }
 
 /// True when a waitpid `wstatus` reports a state change that is NOT a real
@@ -121,11 +136,12 @@ private function wstatus_is_alive(wstatus: i32) -> boolean {
 ![target(unix)]
 private function os_proc_try_wait(pid: i32, handle: u64) -> Result<Option<ExitStatus>, IoError> {
     mut status: i32 = 0;
+    mut usage: libc::rusage;
     loop {
-        const rc: i32 = libc::waitpid(pid, &status, libc::WNOHANG);
+        const rc: i32 = libc::wait4(pid, &status, libc::WNOHANG, &usage);
         if (rc > 0) {
             if (wstatus_is_alive(status)) { return Result::Ok(Option::None); }
-            return Result::Ok(Option::Some(decode_wstatus(status)));
+            return Result::Ok(Option::Some(decode_wstatus(status, &usage)));
         }
         if (rc == 0) { return Result::Ok(Option::None); }
         const err: IoError = IoError::last_os_error();
@@ -145,11 +161,7 @@ private function os_proc_try_wait(pid: i32, handle: u64) -> Result<Option<ExitSt
     if (waited == 0xFFFFFFFF) {   // WAIT_FAILED
         return Result::Err(IoError::last_os_error());
     }
-    mut code: u32 = 0;
-    if (syscall::GetExitCodeProcess(h, &code) == 0) {
-        return Result::Err(IoError::last_os_error());
-    }
-    return Result::Ok(Option::Some(ExitStatus { code: code as i32, signal: 0, signaled: false }));
+    return Result::Ok(Option::Some(os_proc_exit_status(h)?));
 }
 
 // POSIX has no timed waitpid, so the wait polls `WNOHANG`, pausing between
@@ -183,11 +195,7 @@ private function os_proc_wait_timeout(pid: i32, handle: u64, timeout: Duration) 
     if (waited == 0xFFFFFFFF) {   // WAIT_FAILED
         return Result::Err(IoError::last_os_error());
     }
-    mut code: u32 = 0;
-    if (syscall::GetExitCodeProcess(h, &code) == 0) {
-        return Result::Err(IoError::last_os_error());
-    }
-    return Result::Ok(Option::Some(ExitStatus { code: code as i32, signal: 0, signaled: false }));
+    return Result::Ok(Option::Some(os_proc_exit_status(h)?));
 }
 
 ![target(unix)]
@@ -330,6 +338,17 @@ public type struct ExitStatus {
     private code: i32;
     private signal: i32;
     private signaled: boolean;
+    // In bytes; 0 when the system reported none.
+    private peak_memory: u64;
+
+    /// The most physical memory the child held at once, in bytes: its
+    /// peak resident set on POSIX, its peak working set on Windows. It
+    /// covers the child alone, not the processes it started. `None` when
+    /// the system did not report it.
+    public peak_memory_bytes(&this) -> Option<u64> {
+        if (this.peak_memory == 0) { return Option::None; }
+        return Option::Some(this.peak_memory);
+    }
 
     /// Convenience: did the child exit with status 0?
     public success(&this) -> boolean {
@@ -352,30 +371,39 @@ public type struct ExitStatus {
 
 /// Decode a POSIX `wstatus` word. The low 7 bits are the terminating
 /// signal (or 0 for normal exit); bits 8..15 are the exit code when
-/// bits 0..6 are zero.
+/// bits 0..6 are zero. `usage` is what `wait4` reported with it.
 ![target(unix)]
-private function decode_wstatus(wstatus: i32) -> ExitStatus {
+private function decode_wstatus(wstatus: i32, usage: &libc::rusage) -> ExitStatus {
+    const peak: u64 = usage.ru_maxrss as u64 * MAXRSS_UNIT;
     const termsig: i32 = wstatus & 0x7F;
     if (termsig == 0) {
         // Normal exit.
         return ExitStatus {
             code: (wstatus >> 8) & 0xFF,
             signal: 0,
-            signaled: false
+            signaled: false,
+            peak_memory: peak
         };
     }
     if (termsig == 0x7F) {
         // Stopped (WIFSTOPPED). Treated as
         // "still running"; callers who want ptrace semantics
         // need more than Child can offer.
-        return ExitStatus { code: 0, signal: 0, signaled: false };
+        return ExitStatus { code: 0, signal: 0, signaled: false, peak_memory: 0 };
     }
     return ExitStatus {
         code: 0,
         signal: termsig,
-        signaled: true
+        signaled: true,
+        peak_memory: peak
     };
 }
+
+// The unit `ru_maxrss` counts in: kibibytes on Linux, bytes on macOS.
+![target(linux)]
+private const MAXRSS_UNIT: u64 = 1024;
+![target(macos)]
+private const MAXRSS_UNIT: u64 = 1;
 
 // ChildStdin / Stdout / Stderr: fd wrappers with Write / Read
 
@@ -827,7 +855,7 @@ implement trait Future for struct ChildWait {
             BlockingJob::init(&j.job, child_wait_job_run, child_wait_job_free);
             j.pid      = this.pid;
             j.handle   = owned;
-            j.status   = ExitStatus { code: 0, signal: 0, signaled: false };
+            j.status   = ExitStatus { code: 0, signal: 0, signaled: false, peak_memory: 0 };
             j.err      = IoError::new(IoErrorKind::Other, 0);
             j.produced = false;
             j.ok       = false;

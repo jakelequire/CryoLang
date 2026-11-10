@@ -1,0 +1,85 @@
+///! The machine's physical memory: how much it has, and how much is still
+///! available to a program that starts now.
+///!
+///! ```cryo
+///! import std::process::memory::{ SystemMemory };
+///!
+///! const memory: SystemMemory = SystemMemory::query().unwrap();
+///! const spare_megabytes: u64 = memory.available_bytes() / 1048576;
+///! ```
+
+namespace std::process::memory;
+
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::io::error::{ IoError, IoErrorKind };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::fs::file::{ File };
+import std::fs::path::{ Path };
+import std::sys::syscall;
+
+/// The machine's physical memory, read once by `query`.
+public type struct SystemMemory {
+    private total: u64;
+    private available: u64;
+
+    /// Read the machine's memory now: `MemTotal` and `MemAvailable` from
+    /// `/proc/meminfo` on Linux, `GlobalMemoryStatusEx` on Windows.
+    ![target(linux)]
+    public static query() -> Result<SystemMemory, IoError> {
+        const text: String = File::read_text(Path::from(Str::new("/proc/meminfo")))?;
+        mut total: Option<u64> = Option::None;
+        mut available: Option<u64> = Option::None;
+        for (line in text.as_str().lines()) {
+            match (line.strip_prefix(&Str::new("MemTotal:"))) {
+                Option::Some(rest) => { total = kibibytes(rest); }
+                Option::None       => { }
+            }
+            match (line.strip_prefix(&Str::new("MemAvailable:"))) {
+                Option::Some(rest) => { available = kibibytes(rest); }
+                Option::None       => { }
+            }
+        }
+        if (total.is_none() || available.is_none()) {
+            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+        }
+        return Result::Ok(SystemMemory { total: total.unwrap(), available: available.unwrap() });
+    }
+
+    ![target(windows)]
+    public static query() -> Result<SystemMemory, IoError> {
+        mut status: syscall::MEMORYSTATUSEX = syscall::MEMORYSTATUSEX {
+            dwLength: 64, dwMemoryLoad: 0, ullTotalPhys: 0, ullAvailPhys: 0,
+            ullTotalPageFile: 0, ullAvailPageFile: 0, ullTotalVirtual: 0,
+            ullAvailVirtual: 0, ullAvailExtendedVirtual: 0
+        };
+        if (syscall::GlobalMemoryStatusEx(&status) == 0) {
+            return Result::Err(IoError::last_os_error());
+        }
+        return Result::Ok(SystemMemory { total: status.ullTotalPhys, available: status.ullAvailPhys });
+    }
+
+    /// The physical memory installed, in bytes.
+    public total_bytes(&this) -> u64 {
+        return this.total;
+    }
+
+    /// The physical memory a program could still be given without the
+    /// system paging anything out, in bytes.
+    public available_bytes(&this) -> u64 {
+        return this.available;
+    }
+}
+
+/// A `/proc/meminfo` value, `   16303512 kB`, in bytes.
+![target(linux)]
+private function kibibytes(field: Str) -> Option<u64> {
+    for (word in field.split_whitespace()) {
+        return match (u64::try_from(word)) {
+            Result::Ok(count) => { Option::Some(count * 1024) }
+            Result::Err(_)    => { Option::None }
+        };
+    }
+    return Option::None;
+}
