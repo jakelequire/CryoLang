@@ -47,7 +47,8 @@ import std::net::http::method::{ Method };
 import std::net::http::status::{ StatusCode };
 import std::net::http::request::{ Request };
 import std::net::http::response::{ Response };
-import std::net::http2::client::{ Http2Client };
+import std::net::addr::url::{ Url };
+import std::net::http::client::{ Client };
 import std::net::http2::server::{ Http2Server };
 import std::net::http2::connection::{ Http2Connection };
 import std::test::error::{ TestError };
@@ -143,12 +144,17 @@ async function h2_serve_one(server: Http2Server, handler: (Request) -> Response)
     }
 }
 
-/// One h2c GET through the public one-shot client. Returns the response body
-/// length on a verified `200`.
+/// A client that speaks HTTP/2 without negotiation, as h2c needs.
+function h2_client() -> Client {
+    return Client::new().expect("TLS context").with_http2();
+}
+
+/// One h2c GET through the public client. Returns the response body length on
+/// a verified `200`.
 async function h2_get(port: u16, path: Str) -> i64 {
-    const c: Http2Client = Http2Client::new();
-    mut resp: Response = match (await c.get(SocketAddr::localhost_v4(port),
-                                            Str::new("localhost"), path)) {
+    const c: Client = h2_client();
+    const text: String = f"http://127.0.0.1:{port}{path}";
+    mut resp: Response = match (await c.get(Url::parse(text.as_str()).unwrap())) {
         Result::Ok(r)  => { r }
         Result::Err(_) => { return -10; }
     };
@@ -163,15 +169,15 @@ async function h2_get(port: u16, path: Str) -> i64 {
 /// POST `n` generated octets and verify the same octets come back. Returns the
 /// echoed length.
 async function h2_post_echo(port: u16, n: i64) -> i64 {
-    const c: Http2Client = Http2Client::new();
+    const c: Client = h2_client();
     mut body: Array<u8> = Array::<u8>::new();
     mut i: i64 = 0;
     while (i < n) { body.push(h2_pattern_byte(i)); i = i + 1; }
 
     // `body` is handed to the request before anything suspends, so the bytes
     // belong to the client connection from here on.
-    mut resp: Response = match (await c.post(SocketAddr::localhost_v4(port),
-                                             Str::new("localhost"), Str::new("/echo"),
+    const text: String = f"http://127.0.0.1:{port}/echo";
+    mut resp: Response = match (await c.post(Url::parse(text.as_str()).unwrap(),
                                              Str::new("application/octet-stream"), body)) {
         Result::Ok(r)  => { r }
         Result::Err(_) => { return -20; }

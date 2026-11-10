@@ -18,6 +18,9 @@ namespace std::net::tls::context;
 
 import std::core::option;
 import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::core::convert;
+import std::core::primitives;
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::io::error::{ IoError, IoErrorKind };
@@ -34,6 +37,11 @@ public type struct TlsConnector {
 
     /// New client context with the system trust store loaded and peer
     /// verification on by default.
+    ///
+    /// The system store is OpenSSL's default verify paths - the OS CA bundle
+    /// on Unix - and, on Windows, the Windows ROOT certificate store as well:
+    /// OpenSSL's default paths there name its own build directory, which an
+    /// ordinary Windows machine does not have.
     public static new() -> Result<TlsConnector, IoError> {
         ignore_sigpipe();
         const method: void* = openssl::TLS_client_method();
@@ -41,12 +49,56 @@ public type struct TlsConnector {
         if (ctx == null) {
             return Result::Err(IoError::new(IoErrorKind::Other, 0));
         }
-        // Load the OS CA bundle so verification can actually succeed.
-        if (openssl::SSL_CTX_set_default_verify_paths(ctx) != 1) {
+        if (openssl::SSL_CTX_set_default_verify_paths(ctx) != 1 || !os_load_system_store(ctx)) {
             openssl::SSL_CTX_free(ctx);
             return Result::Err(IoError::new(IoErrorKind::Other, 0));
         }
         return Result::Ok(TlsConnector { ctx: ctx, verify: true });
+    }
+
+    /// Trust the certificates in `pem` - one or more PEM `CERTIFICATE`
+    /// blocks - as roots, alongside the system store: a private CA, or a
+    /// self-signed server's own certificate. `InvalidData` when `pem` holds
+    /// no certificate, or one OpenSSL refuses; the certificates before it
+    /// stay trusted.
+    ///
+    /// ```cryo
+    /// import std::fs::{ File };
+    /// import std::fs::path::{ Path };
+    /// import std::collections::array::{ Array };
+    /// import std::net::tls::context::{ TlsConnector };
+    ///
+    /// mut connector: TlsConnector = TlsConnector::new().unwrap();
+    /// const pem: Array<u8> = File::read_bytes(Path::new("ca.pem")).unwrap();
+    /// connector.add_root_certificate(pem.as_slice()).unwrap();
+    /// ```
+    public add_root_certificate(mut &this, pem: &Slice<u8>) -> Result<(), IoError> {
+        const length: i32 = match (i32::try_from(pem.length())) {
+            Result::Ok(n)  => { n }
+            Result::Err(_) => { return Result::Err(IoError::new(IoErrorKind::InvalidData, 0)); }
+        };
+        const bio: void* = openssl::BIO_new_mem_buf(pem.as_ptr(), length);
+        if (bio == null) {
+            return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0));
+        }
+        const store: void* = openssl::SSL_CTX_get_cert_store(this.ctx);
+        mut added: i64 = 0;
+        mut refused: boolean = false;
+        loop {
+            const certificate: void* = openssl::PEM_read_bio_X509(bio, null, null, null);
+            if (certificate == null) { break; }
+            refused = openssl::X509_STORE_add_cert(store, certificate) != 1;
+            openssl::X509_free(certificate);
+            if (refused) { break; }
+            added = added + 1;
+        }
+        openssl::BIO_free(bio);
+        // Reading past the last block leaves a "no start line" error queued.
+        openssl::ERR_clear_error();
+        if (refused || added == 0) {
+            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+        }
+        return Result::Ok(());
     }
 
     /// Disable certificate + hostname verification. Named to be ugly on
@@ -203,6 +255,19 @@ implement trait Drop for struct TlsAcceptor {
             this.ctx = null;
         }
     }
+}
+
+/// Add the Windows ROOT certificate store to `ctx`'s trust sources, through
+/// OpenSSL's `winstore` store loader. False when OpenSSL cannot open it.
+![target(windows)]
+private function os_load_system_store(ctx: void*) -> boolean {
+    return openssl::SSL_CTX_load_verify_store(ctx, "org.openssl.winstore://") == 1;
+}
+
+/// The default verify paths are the system store on Unix: nothing to add.
+![target(unix)]
+private function os_load_system_store(_ctx: void*) -> boolean {
+    return true;
 }
 
 /// Ignore `SIGPIPE` process-wide. OpenSSL writes through a plain socket

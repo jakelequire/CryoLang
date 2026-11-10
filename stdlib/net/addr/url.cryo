@@ -21,7 +21,10 @@ namespace std::net::addr::url;
 import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::core::convert;
+import std::core::primitives;
+import std::collections::array::{ Array };
 import std::collections::str::{ Str };
+import std::collections::string::{ String };
 import std::collections::pair::{ Pair };
 import std::fmt::display::{ Display, Formatter };
 import std::fmt::error::{ FmtError };
@@ -31,7 +34,11 @@ private const SLASH:    u8 = 0x2F;  // '/'
 private const QUESTION: u8 = 0x3F;  // '?'
 private const HASH:     u8 = 0x23;  // '#'
 private const AT:       u8 = 0x40;  // '@'
+private const LBRACKET: u8 = 0x5B;  // '['
 private const RBRACKET: u8 = 0x5D;  // ']'
+private const PLUS:     u8 = 0x2B;  // '+'
+private const MINUS:    u8 = 0x2D;  // '-'
+private const DOT:      u8 = 0x2E;  // '.'
 
 /// Why a URL failed to parse.
 public type enum UrlError {
@@ -180,6 +187,141 @@ public type struct Url {
         });
     }
 
+    /// `host[:port]`, the form a request's `Host` header carries: an IPv6
+    /// host in brackets, the port only when it is not the scheme's default.
+    public authority(&this) -> String {
+        mut out: String = String::new();
+        const bracketed: boolean = this.host.find_byte(COLON).is_some();
+        if (bracketed) { out.push_byte(LBRACKET); }
+        out.push(this.host);
+        if (bracketed) { out.push_byte(RBRACKET); }
+        if (this.port != default_port(this.scheme)) {
+            out.push_byte(COLON);
+            out.push(this.port);
+        }
+        return out;
+    }
+
+    /// The path and, when there is one, `?query`: the target an HTTP request
+    /// line names. The fragment is never part of it.
+    public path_and_query(&this) -> String {
+        mut out: String = String::from_str(this.path);
+        match (this.query) {
+            Option::Some(query) => {
+                out.push_byte(QUESTION);
+                out.push(query);
+            }
+            Option::None => { }
+        }
+        return out;
+    }
+
+    /// Resolve `reference` against this URL, as a link or a `Location`
+    /// header is resolved against the page it came from, and return the
+    /// absolute URL it names.
+    ///
+    /// A reference with its own scheme is returned as written; `//host/p`
+    /// keeps this URL's scheme; `/p` keeps the scheme and authority; `?q`
+    /// keeps the path too; `#f` replaces only the fragment; anything else is
+    /// relative to the directory of this URL's path. `.` and `..` segments
+    /// of a path built that way are removed, and `..` never climbs above
+    /// the root.
+    ///
+    /// ```cryo
+    /// import std::collections::str::{ Str };
+    /// import std::collections::string::{ String };
+    /// import std::net::addr::url::{ Url };
+    ///
+    /// const base: Url = Url::parse(Str::new("http://example.com/a/b?x=1")).unwrap();
+    /// const next: String = base.join(Str::new("../c"));    // http://example.com/c
+    /// ```
+    public join(&this, reference: Str) -> String {
+        if (Url::has_scheme(reference)) { return String::from_str(reference); }
+        mut out: String = String::from_str(this.scheme);
+        out.push_byte(COLON);
+        if (reference.starts_with(&Str::new("//"))) {
+            out.push(reference);
+            return out;
+        }
+        out.push(Str::new("//"));
+        out.push(this.authority().as_str());
+        if (reference.is_empty() || reference.starts_with(&Str::new("#"))) {
+            out.push(this.path_and_query().as_str());
+            out.push(reference);
+            return out;
+        }
+        if (reference.starts_with(&Str::new("?"))) {
+            out.push(this.path);
+            out.push(reference);
+            return out;
+        }
+        // The reference's own path ends where its query or fragment begins.
+        const path_end: i64 = Url::path_length(reference);
+        const reference_path: Str = reference.sub_bytes(0, path_end);
+        mut merged: String = String::new();
+        if (!reference_path.starts_with(&Str::new("/"))) {
+            const directory_end: i64 = match (this.path.rfind_byte(SLASH)) {
+                Option::Some(i) => { i + 1 }
+                Option::None    => { 0 }
+            };
+            merged.push(this.path.sub_bytes(0, directory_end));
+        }
+        merged.push(reference_path);
+        Url::push_without_dot_segments(&out, merged.as_str());
+        out.push(reference.sub_bytes(path_end, reference.length()));
+        return out;
+    }
+
+    /// Whether `text` begins with `scheme:`: a letter, then letters, digits,
+    /// `+`, `-` or `.`, then a colon.
+    private static has_scheme(text: Str) -> boolean {
+        mut i: i64 = 0;
+        while (i < text.length()) {
+            const b: u8 = text.byte_at(i).unwrap();
+            if (b == COLON) { return i > 0; }
+            const letter: boolean = b.is_alpha();
+            if (!letter && (i == 0 || !(b.is_digit() || b == PLUS || b == MINUS || b == DOT))) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// Length of `reference`'s path: up to its first `?` or `#`.
+    private static path_length(reference: Str) -> i64 {
+        mut i: i64 = 0;
+        while (i < reference.length()) {
+            const b: u8 = reference.byte_at(i).unwrap();
+            if (b == QUESTION || b == HASH) { return i; }
+            i = i + 1;
+        }
+        return reference.length();
+    }
+
+    /// Append the absolute `path` to `out` with its `.` and `..` segments
+    /// removed. A path ending in one of them keeps a trailing slash.
+    private static push_without_dot_segments(out: mut String*, path: Str) -> void {
+        mut kept: Array<Str> = Array::new();
+        mut trailing_slash: boolean = false;
+        for (segment in path.sub_bytes(1, path.length()).split(&Str::new("/"))) {
+            trailing_slash = false;
+            if (segment.equals(&Str::new("."))) {
+                trailing_slash = true;
+            } else if (segment.equals(&Str::new(".."))) {
+                kept.pop();
+                trailing_slash = true;
+            } else {
+                kept.push(segment);
+            }
+        }
+        for (segment in kept.iter()) {
+            out.push_byte(SLASH);
+            out.push(segment);
+        }
+        if (trailing_slash || kept.is_empty()) { out.push_byte(SLASH); }
+    }
+
     /// Parse a non-empty decimal port into a `u16`.
     private static parse_port(digits: Str) -> Result<u16, UrlError> {
         if (digits.is_empty()) { return Result::Err(UrlError::InvalidPort); }
@@ -198,14 +340,7 @@ implement trait Display for struct Url {
     fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
         f.write_str(this.scheme)?;
         f.write_str(Str::new("://"))?;
-        const bracketed: boolean = this.host.find_byte(COLON).is_some();
-        if (bracketed) { f.write_str(Str::new("["))?; }
-        f.write_str(this.host)?;
-        if (bracketed) { f.write_str(Str::new("]"))?; }
-        if (this.port != default_port(this.scheme)) {
-            f.write_str(Str::new(":"))?;
-            (Display for u16)::fmt(&this.port, f)?;
-        }
+        f.write_str(this.authority().as_str())?;
         f.write_str(this.path)?;
         match (this.query) {
             Option::Some(query) => {

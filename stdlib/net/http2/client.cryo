@@ -8,23 +8,15 @@
 ///! Issue requests with `request`; reuse the connection for several sequential
 ///! requests.
 ///!
-///! `Http2Client` is a convenience for one-shot h2c requests over plain
-///! TCP: dial, handshake, one request/response, close.
+///! For one request by URL, `net::http::client::Client` built `with_http2()`
+///! dials, connects through here and closes.
 
 namespace std::net::http2::client;
 
-import std::core::option;
 import std::core::result::{ Result };
 import std::io::error::{ IoError };
 import std::io::traits::{ AsyncTransport };
 import std::io::buf::{ BufStream };
-import std::collections::array::{ Array };
-import std::collections::str::{ Str };
-import std::net::addr::socket_addr::{ SocketAddr };
-import std::net::socket::tcp::{ TcpConnect, TcpStream };
-import std::net::http::method::{ Method };
-import std::net::http::request::{ Request };
-import std::net::http::response::{ Response };
 import std::net::http2::connection::{ Http2Connection };
 import std::future::poll;
 import std::future::waker;
@@ -38,42 +30,4 @@ where S: AsyncTransport {
     mut c: Http2Connection<S> = Http2Connection::<S>::new_client(conn);
     (await c.handshake_client())?;
     return Result::Ok(c);
-}
-
-/// One-shot h2c (cleartext) requests over plain TCP.
-public type struct Http2Client {
-    public static new() -> Http2Client {
-        return Http2Client { };
-    }
-
-    /// `GET` over h2c. `authority` is the `:authority` pseudo-header
-    /// (host[:port]); `path` is the request target.
-    public async get(&this, addr: SocketAddr, authority: Str, path: Str) -> Result<Response, IoError> {
-        mut req: Request = Request::new(Method::Get, path);
-        return await one_shot(addr, authority, req);
-    }
-
-    /// `POST` over h2c with a body and Content-Type.
-    public async post(&this, addr: SocketAddr, authority: Str, path: Str,
-               content_type: Str, body: Array<u8>) -> Result<Response, IoError> {
-        mut req: Request = Request::new(Method::Post, path);
-        req.headers.insert(Str::new("content-type"), content_type);
-        req.set_body(body);
-        return await one_shot(addr, authority, req);
-    }
-}
-
-/// Dial `addr`, upgrade to h2c, run one request/response, close.
-///
-/// The connection is built synchronously from the accepted socket and then
-/// awaited on as this future's own local, so the socket never has to be reached
-/// through an address belonging to another frame. Dropping it at the end of the
-/// function is what closes the connection — every exit path releases it.
-private async function one_shot(addr: SocketAddr, authority: Str, req: Request) -> Result<Response, IoError> {
-    mut request_local: Request = req;
-    mut sock: TcpStream = (await TcpConnect::start(addr))?;
-    mut conn: Http2Connection<TcpStream> =
-        Http2Connection::<TcpStream>::new_client(BufStream::<TcpStream>::of(sock));
-    (await conn.handshake_client())?;
-    return await conn.request(request_local, Str::new("http"), authority);
 }
