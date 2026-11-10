@@ -25,8 +25,10 @@ import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::collections::array::{ Array };
 import std::env;
-import std::ffi::libc;
+import std::env::arguments::{ ArgumentParser, ParsedArguments };
 import std::fmt;
+import std::time::clock;
+import std::time::duration::{ Duration };
 
 // ============================================================================
 // Grid
@@ -191,15 +193,14 @@ function seed_pulsar(grid: mut &Grid, row: i32, col: i32) -> void {
     }
 }
 
-function apply_seed(grid: mut &Grid, pattern: string) -> void {
-    const view: Str = Str::new(pattern);
-    if (view.equals(&Str::new("glider"))) {
+function apply_seed(grid: mut &Grid, pattern: Str) -> void {
+    if (pattern.equals(&Str::new("glider"))) {
         seed_glider(grid, 1, 1);
-    } else if (view.equals(&Str::new("blinker"))) {
+    } else if (pattern.equals(&Str::new("blinker"))) {
         seed_blinker(grid, grid.height as i32 / 2, grid.width as i32 / 2 - 1);
-    } else if (view.equals(&Str::new("toad"))) {
+    } else if (pattern.equals(&Str::new("toad"))) {
         seed_toad(grid, grid.height as i32 / 2, grid.width as i32 / 2 - 2);
-    } else if (view.equals(&Str::new("pulsar"))) {
+    } else if (pattern.equals(&Str::new("pulsar"))) {
         seed_pulsar(grid, 0, 0);
     } else {
         // Default - sprinkle a couple of patterns so something
@@ -211,32 +212,6 @@ function apply_seed(grid: mut &Grid, pattern: string) -> void {
 }
 
 // ============================================================================
-// Argument parsing
-// ============================================================================
-
-function parse_args(args: &Array<String>, pattern_buf: mut &Array<u8>, gens: mut &u32) -> void {
-    if (args.length() >= 2) {
-        match (args.get_ref(1)) {
-            Option::Some(v) => {
-                pattern_buf.append(v.as_bytes());
-            }
-            Option::None => { }
-        }
-    }
-    if (args.length() >= 3) {
-        match (args.get_ref(2)) {
-            Option::Some(v) => {
-                match (u32::try_from(v.as_str())) {
-                    Result::Ok(n) => { *gens = n; }
-                    Result::Err(_) => { }
-                }
-            }
-            Option::None => { }
-        }
-    }
-}
-
-// ============================================================================
 // Entry point
 // ============================================================================
 
@@ -244,18 +219,37 @@ function main() -> int {
     const WIDTH: u32  = 30;
     const HEIGHT: u32 = 12;
 
-    mut args: Array<String> = env::args();
-    mut pattern_buf: Array<u8> = Array::new();
+    mut parser: ArgumentParser = ArgumentParser::new(Str::new("game-of-life"));
+    parser.optional_positional(Str::new("pattern"), Str::new("glider, blinker, toad or pulsar"))
+        .optional_positional(Str::new("generations"), Str::new("how many generations to run (24)"));
+    const all: Array<String> = env::args();
+    const parsed: ParsedArguments = match (parser.parse(all.as_slice().subslice(1, all.length()))) {
+        Result::Ok(arguments) => { arguments }
+        Result::Err(error) => {
+            fmt::eprintln(f"{error}");
+            fmt::eprint(parser.help_text());
+            return 2;
+        }
+    };
+    // No pattern, or one not listed above, seeds the default mix.
+    const pattern: Str = parsed.value(Str::new("pattern")).unwrap_or(Str::new(""));
     mut gens: u32 = 24;
-    parse_args(&args, &pattern_buf, &gens);
-
-    // Resolve the pattern name (may be empty -> default).
-    pattern_buf.push(0);  // NUL-terminate so we can pass it as `string`.
-    const pattern_name: string = pattern_buf.as_ptr() as string;
+    match (parsed.value(Str::new("generations"))) {
+        Option::Some(text) => {
+            match (u32::try_from(text)) {
+                Result::Ok(n) => { gens = n; }
+                Result::Err(_) => {
+                    fmt::eprintln(f"not a number of generations: {text}");
+                    return 2;
+                }
+            }
+        }
+        Option::None => { }
+    }
 
     mut current: Grid = Grid::new(WIDTH, HEIGHT);
     mut next:    Grid = Grid::new(WIDTH, HEIGHT);
-    apply_seed(&current, pattern_name);
+    apply_seed(&current, pattern);
 
     mut g: u32 = 0;
     while (g <= gens) {
@@ -268,7 +262,7 @@ function main() -> int {
         mem::swap(&current.cells, &next.cells);
         g = g + 1;
         // Brief pause so the animation is visible. 60ms ~= 16 fps.
-        libc::usleep(60000);
+        clock::sleep(Duration::from_millis(60));
     }
 
     return 0;
