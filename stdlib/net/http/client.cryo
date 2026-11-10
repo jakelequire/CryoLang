@@ -1,104 +1,291 @@
-///! HTTP client: simple one-shot requests over plain TCP.
+///! HTTP client: one request per connection, by URL, over plain TCP or TLS.
 ///!
-///! Opens a fresh connection, sends the request, reads one response,
-///! closes. Keep-alive, connection pooling, retries, and redirect
-///! following are caller concerns on top.
+///! `Client` takes the URL apart itself: the scheme picks plain TCP (`http`)
+///! or TLS with certificate and hostname verification (`https`), the host is
+///! resolved through `net::dns` and every address it resolves to - IPv6
+///! included - is tried in turn until one connects, and the request carries a
+///! `Host` header naming the port whenever it is not the scheme's default.
 ///!
-///! The client takes a `SocketAddr` and a path directly. To start from
-///! a URL, `net::addr::url::Url::parse` splits it into scheme, host,
-///! port and path; the host still has to be resolved to an address
-///! (`net::dns`) before it reaches this client.
+///! Each request opens a fresh connection and closes it after the response.
+///! A client built `with_http2()` offers HTTP/2 by ALPN on `https` and uses it
+///! when the server accepts; on plain `http` it speaks HTTP/2 from the first
+///! byte, which only a server known to accept HTTP/2 without negotiation
+///! answers.
+///!
+///! Redirects (301, 302, 303, 307, 308) are followed up to a limit, ten by
+///! default. A 303 - or a 301 or 302 answering a `POST` - is followed with a
+///! `GET` and no body; 307 and 308 repeat the request as it was. A redirect
+///! to another scheme, host or port does not carry the `Authorization` or
+///! `Cookie` headers with it.
+///!
+///! A program using `Client` links OpenSSL: add `ssl` and `crypto` to the
+///! project's `cryoconfig` `link_libs`.
+///!
+///! ```cryo
+///! import std::collections::str::{ Str };
+///! import std::net::addr::url::{ Url };
+///! import std::net::http::client::{ Client };
+///! import std::net::http::response::{ Response };
+///! import std::time::duration::{ Duration };
+///!
+///! async function fetch() -> i64 {
+///!     const client: Client = Client::new().unwrap().with_timeout(Duration::from_secs(10));
+///!     const url: Url = Url::parse(Str::new("https://example.com/")).unwrap();
+///!     const response: Response = (await client.get(url)).unwrap();
+///!     return response.body.length();
+///! }
+///! ```
 
 namespace std::net::http::client;
 
-import std::core::intrinsics;
-import std::core::option;
+import std::core::clone::{ Clone };
+import std::core::option::{ Option };
 import std::core::result::{ Result };
-import std::core::slice;
-import std::io::error::{ IoError };
-import std::io::traits;
+import std::io::error::{ IoError, IoErrorKind };
+import std::io::traits::{ AsyncTransport };
 import std::io::buf::{ BufStream };
 import std::collections::array::{ Array };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
-import std::core::primitives;
+import std::net::addr::url::{ Url };
+import std::net::addr::ip::{ IpAddr };
 import std::net::addr::socket_addr::{ SocketAddr };
+import std::net::dns::{ Resolve, ResolvedAddrs };
 import std::net::socket::tcp::{ TcpConnect, TcpStream };
+import std::net::tls::context::{ TlsConnector };
+import std::net::tls::stream::{ TlsStream, AlpnProtocol };
+import std::net::tls::future::{ TlsHandshake };
 import std::net::http::method::{ Method };
 import std::net::http::request::{ Request };
 import std::net::http::response::{ Response };
-import std::net::http::headers;
 import std::net::http::conn;
+import std::net::http2::connection::{ Http2Connection };
+import std::net::http2::client::{ connect };
 import std::future::poll;
 import std::future::waker;
-import std::future::traits;
+import std::future::traits::{ Future };
+import std::future::combinator::{ Futures };
+import std::time::clock::{ Instant };
+import std::time::duration::{ Duration };
+
+/// How many redirects a new `Client` follows before it returns the last
+/// redirect response as it is.
+public const DEFAULT_REDIRECT_LIMIT: i64 = 10;
 
 public type struct Client {
-    public static new() -> Client {
-        return Client { };
+    private connector: TlsConnector;
+    private http2: boolean;
+    private timeout: Option<Duration>;
+    private redirect_limit: i64;
+
+    /// A client that verifies certificates against the system trust store,
+    /// speaks HTTP/1.1, has no timeout and follows up to
+    /// `DEFAULT_REDIRECT_LIMIT` redirects. Fails only when the TLS context
+    /// cannot be created.
+    public static new() -> Result<Client, IoError> {
+        const connector: TlsConnector = TlsConnector::new()?;
+        return Result::Ok(Client {
+            connector: connector,
+            http2: false,
+            timeout: Option::None,
+            redirect_limit: DEFAULT_REDIRECT_LIMIT
+        });
     }
 
-    /// `GET addr/path`. Sets Host to `addr`'s address:port.
-    public async get(&this, addr: SocketAddr, path: Str) -> Result<Response, IoError> {
-        mut req: Request = Request::new(Method::Get, path);
-        const host: String = f"{addr}";
-        req.headers.insert(Str::new("Host"), host.as_str());
-        return await send(addr, req);
+    /// Use HTTP/2: offered by ALPN on `https`, spoken without negotiation on
+    /// `http`. Fluent.
+    public with_http2(this) -> Client {
+        return Client {
+            connector: this.connector.with_alpn_h2(),
+            http2: true,
+            timeout: this.timeout,
+            redirect_limit: this.redirect_limit
+        };
     }
 
-    /// `POST addr/path` with body bytes. Sets Host and passes the
-    /// supplied Content-Type through unchanged; if the caller didn't
-    /// set one, the server may fall back to octet-stream.
-    public async post(&this,
-               addr: SocketAddr,
-               path: Str,
-               content_type: Str,
-               body: Array<u8>) -> Result<Response, IoError> {
-        mut req: Request = Request::new(Method::Post, path);
-        const host: String = f"{addr}";
-        req.headers.insert(Str::new("Host"), host.as_str());
-        req.headers.insert(
-            Str::new("Content-Type"),
-            content_type
-        );
-        req.set_body(body);
-        return await send(addr, req);
+    /// Fail a request with `IoErrorKind::TimedOut` when it has not completed
+    /// within `timeout`: resolving, connecting, the TLS handshake, sending,
+    /// reading the whole response and following its redirects all count
+    /// against the one limit. Fluent.
+    public with_timeout(mut this, timeout: Duration) -> Client {
+        this.timeout = Option::Some(timeout);
+        return this;
+    }
+
+    /// Follow at most `limit` redirects; 0 returns every redirect response
+    /// to the caller. Fluent.
+    public with_redirect_limit(mut this, limit: i64) -> Client {
+        this.redirect_limit = limit;
+        return this;
+    }
+
+    /// Skip certificate and hostname verification. For self-signed or
+    /// out-of-band-pinned servers only - never for the open web. Fluent.
+    public danger_accept_invalid_certs(this) -> Client {
+        return Client {
+            connector: this.connector.danger_accept_invalid_certs(),
+            http2: this.http2,
+            timeout: this.timeout,
+            redirect_limit: this.redirect_limit
+        };
+    }
+
+    /// `GET url`.
+    public async get(&this, url: Url) -> Result<Response, IoError> {
+        return await this.send(url, Request::new(Method::Get, url.path));
+    }
+
+    /// `POST url` with `body`, labelled with `content_type`.
+    public async post(&this, url: Url, content_type: Str, body: Array<u8>) -> Result<Response, IoError> {
+        mut request: Request = Request::new(Method::Post, url.path);
+        request.headers.insert(Str::new("Content-Type"), content_type);
+        request.set_body(body);
+        return await this.send(url, request);
+    }
+
+    /// Send `request` to `url` and read the response, following redirects.
+    /// The request's target is replaced by `url`'s path and query, and its
+    /// `Host` header by `url`'s authority. A scheme other than `http` or
+    /// `https` is `Unsupported`; a redirect to a `Location` that is not a
+    /// URL is `InvalidData`.
+    public async send(&this, url: Url, request: Request) -> Result<Response, IoError> {
+        const started: Instant = Instant::now();
+        mut current: Request = request;
+        mut location: String = f"{url}";
+        mut redirects: i64 = 0;
+        loop {
+            const target: Url = match (Url::parse(location.as_str())) {
+                Result::Ok(parsed) => { parsed }
+                Result::Err(_)     => { return Result::Err(IoError::new(IoErrorKind::InvalidData, 0)); }
+            };
+            current.path = target.path_and_query();
+            const response: Response = (await this.exchange(target, current.clone(), started))?;
+            const status: u16 = response.status.as_u16();
+            const redirect: boolean = status == 301 || status == 302 || status == 303
+                || status == 307 || status == 308;
+            if (!redirect || redirects >= this.redirect_limit) { return Result::Ok(response); }
+            const next: String = match (response.headers.get(Str::new("Location"))) {
+                Option::Some(reference) => { target.join(reference) }
+                Option::None            => { return Result::Ok(response); }
+            };
+            if (status == 303 || ((status == 301 || status == 302) && current.method == Method::Post)) {
+                if (current.method != Method::Head) { current.method = Method::Get; }
+                current.body = Array::new();
+                current.headers.remove(Str::new("Content-Length"));
+                current.headers.remove(Str::new("Content-Type"));
+                current.headers.remove(Str::new("Transfer-Encoding"));
+            }
+            match (Url::parse(next.as_str())) {
+                Result::Ok(next_target) => {
+                    const same_origin: boolean = next_target.scheme.equals_case_insensitive(&target.scheme)
+                        && next_target.host.equals_case_insensitive(&target.host)
+                        && next_target.port == target.port;
+                    if (!same_origin) {
+                        current.headers.remove(Str::new("Authorization"));
+                        current.headers.remove(Str::new("Cookie"));
+                    }
+                }
+                Result::Err(_) => { return Result::Err(IoError::new(IoErrorKind::InvalidData, 0)); }
+            }
+            location = next;
+            redirects = redirects + 1;
+        }
+    }
+
+    /// When a request that started at `started` must have finished, if this
+    /// client has a timeout.
+    private deadline(&this, started: Instant) -> Option<Instant> {
+        match (this.timeout) {
+            Option::Some(limit) => { return Option::Some(started.saturating_add(&limit)); }
+            Option::None        => { return Option::None; }
+        }
+    }
+
+    /// One request and its response on a fresh connection to `url`, every
+    /// step of it bounded by the deadline of a request that started at
+    /// `started`.
+    private async exchange(&this, url: Url, request: Request, started: Instant)
+        -> Result<Response, IoError> {
+        mut outgoing: Request = request;
+        const authority: String = url.authority();
+        outgoing.headers.insert(Str::new("Host"), authority.as_str());
+        const secure: boolean = url.scheme.equals_case_insensitive(&Str::new("https"));
+        if (!secure && !url.scheme.equals_case_insensitive(&Str::new("http"))) {
+            return Result::Err(IoError::new(IoErrorKind::Unsupported, 0));
+        }
+        const tcp: TcpStream = (await within(this.deadline(started), dial(url.host, url.port)))?;
+        if (!secure) {
+            if (this.http2) {
+                return await within(this.deadline(started),
+                    exchange_http2(tcp, outgoing, Str::new("http"), authority.as_str()));
+            }
+            return await within(this.deadline(started), exchange_http1(tcp, outgoing));
+        }
+        const handshake: TlsHandshake = this.connector.start_connect(tcp, url.host)?;
+        const tls: TlsStream = (await within(this.deadline(started), handshake))?;
+        match (tls.negotiated_alpn()) {
+            AlpnProtocol::H2 => {
+                return await within(this.deadline(started),
+                    exchange_http2(tls, outgoing, Str::new("https"), authority.as_str()));
+            }
+            AlpnProtocol::Http11 => { return await within(this.deadline(started), exchange_http1(tls, outgoing)); }
+            AlpnProtocol::None   => { return await within(this.deadline(started), exchange_http1(tls, outgoing)); }
+        }
     }
 }
 
-/// Open a connection, send the request, read one response, close.
-/// Emits `Connection: close` (RFC 7230 section 6.1) so the server knows this
-/// is a one-shot exchange and can free its half of the socket as soon
-/// as the response is written.  Without this header, servers that
-/// default to HTTP/1.1 keep-alive will sit holding the connection open
-/// until their idle timeout fires.
+/// `operation`'s own result, or `TimedOut` once `deadline` passes first. The
+/// operation is dropped - cancelled - when it times out.
+private async function within<F, T>(deadline: Option<Instant>, operation: F) -> Result<T, IoError>
+where F: Future<Result<T, IoError>> {
+    match (deadline) {
+        Option::Some(at) => {
+            match (await Futures::timeout_at::<F, Result<T, IoError>>(at, operation)) {
+                Result::Ok(outcome) => { return outcome; }
+                Result::Err(_)      => { return Result::Err(IoError::new(IoErrorKind::TimedOut, 0)); }
+            }
+        }
+        Option::None => { return await operation; }
+    }
+}
+
+/// Connect to `host` on `port`, trying each address it resolves to in the
+/// resolver's order; the last address's error when none connects.
+private async function dial(host: Str, port: u16) -> Result<TcpStream, IoError> {
+    const resolved: ResolvedAddrs = (await Resolve::start(host))?;
+    mut index: i64 = 0;
+    loop {
+        const ip: IpAddr = match (resolved.get(index)) {
+            Option::Some(address) => { address }
+            Option::None          => { return Result::Err(IoError::new(IoErrorKind::NotFound, 0)); }
+        };
+        const attempt: Result<TcpStream, IoError> = await TcpConnect::start(SocketAddr::new(ip, port));
+        if (attempt.is_ok() || index + 1 >= resolved.length()) { return attempt; }
+        index = index + 1;
+    }
+}
+
+/// One HTTP/1.1 exchange on `transport`, marked `Connection: close`.
 ///
-/// The whole request is encoded into the connection's outgoing buffer
-/// first and flushed once, so sending costs one suspension however many
-/// headers it carries. The response then comes back through the SAME
-/// buffer that the flush drained, which is what lets the header block
-/// and a Content-Length body be read without losing bytes that arrived
-/// in the same fill.
-public async function send(addr: SocketAddr, req: Request) -> Result<Response, IoError> {
-    mut request_local: Request = req;
-    request_local.headers.insert(
-        Str::new("Connection"),
-        Str::new("close")
-    );
-
-    mut sock: TcpStream = (await TcpConnect::start(addr))?;
-    mut c: BufStream<TcpStream> = BufStream::<TcpStream>::of(sock);
-
-    request_local.encode_into(c.pending())?;
-    (await c.flush())?;
-    // Half-close so a server that reads to EOF sees the request end.
-    // Not required for a Content-Length-framed request, and a failure
-    // here is not one the caller can act on: the bytes are already sent.
-    match (c.transport().shutdown_write()) {
-        Result::Ok(_) => { }
-        Result::Err(_) => { }
-    }
-
-    return await c.read_response();
+/// The whole request is encoded into the connection's outgoing buffer and
+/// flushed once, and the response comes back through the SAME buffer, which
+/// is what lets the header block and the body be read without losing bytes
+/// that arrived in the same read.
+private async function exchange_http1<S>(transport: S, request: Request) -> Result<Response, IoError>
+where S: AsyncTransport {
+    mut outgoing: Request = request;
+    outgoing.headers.insert(Str::new("Connection"), Str::new("close"));
+    mut buffered: BufStream<S> = BufStream::<S>::of(transport);
+    outgoing.encode_into(buffered.pending())?;
+    (await buffered.flush())?;
+    return await buffered.read_response();
 }
 
+/// One HTTP/2 exchange on `transport`: the connection preface, then the
+/// request as a stream with `:scheme` and `:authority` from the arguments.
+private async function exchange_http2<S>(transport: S, request: Request, scheme: Str, authority: Str)
+    -> Result<Response, IoError>
+where S: AsyncTransport {
+    mut connection: Http2Connection<S> = (await connect(BufStream::<S>::of(transport)))?;
+    return await connection.request(request, scheme, authority);
+}
