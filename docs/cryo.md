@@ -666,6 +666,10 @@ type struct Mapped<I, F, O> where I: Iterator, F: (I::Item) -> O {
 // ... in its `next`:  Option::Some(this.f(value))
 ```
 
+Outside the type's generic body the field holds the closure itself, and is
+called through the field the same way, `h.f(x)`, when the type has no method
+of that name; a method `f` is what `h.f(x)` calls.
+
 The argument must be called with exactly the bound's signature; one called
 another way, or not called at all, is refused at the call (**E0306**, "the
 callable bound `F: (i32) -> i32` is not satisfied"), and a type's callable

@@ -1388,6 +1388,19 @@ type struct CallResolver {
                 return TypeRef::invalid();
             }
             const selected: Selection = this.resolve_method_overload(visitor, call, callee_member);
+            // No method of the name, and a field of it holding a closure: the
+            // field's value is called, `h.f(x)` being `h.f.__call__(x)`, as a
+            // closure local is called (`LambdaSynth.maybe_rewrite_closure_call`).
+            if (selected.chosen == null) {
+                const held: FieldAnswer = this.member.field_of(
+                    this.binding.peel_all_indirection(receiver_type), callee_member.member);
+                if (held.found() && held.index >= 0 && this.lambda.is_closure_struct_type(held.ty)) {
+                    const field_value: mut ExpressionNode* = call.callee;
+                    call.callee = ExpressionNode::member_access_expr(field_value, this.intern.intern("__call__"),
+                        field_value.span, field_value.span);
+                    return this.resolve_call(visitor, call_e, call);
+                }
+            }
             // Every `recv.method(...)` call is selected here, whatever shape
             // its receiver has, so this is where the method it chose is gated.
             this.member.enforce_method_visibility(selected.chosen,
