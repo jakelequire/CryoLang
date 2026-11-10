@@ -668,7 +668,11 @@ type struct Mapped<I, F, O> where I: Iterator, F: (I::Item) -> O {
 
 Outside the type's generic body the field holds the closure itself, and is
 called through the field the same way, `h.f(x)`, when the type has no method
-of that name; a method `f` is what `h.f(x)` calls.
+of that name; a method `f` is what `h.f(x)` calls.  Parentheses around the
+access make it the field's value, so `(h.f)(x)` calls what the field holds -
+a closure, a function, or a value of a callable-bound parameter - whatever
+method shares its name.  A parenthesized member that names no field is
+refused (**E0204** for a method, **E0213** for a field that cannot be called).
 
 The argument must be called with exactly the bound's signature; one called
 another way, or not called at all, is refused at the call (**E0306**, "the

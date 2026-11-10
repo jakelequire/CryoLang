@@ -1063,7 +1063,8 @@ type struct CallResolver {
         }
         if (param_types.length() == 0) {
             const callee_node: ExpressionNode* = call.callee;
-            if (ExpressionNode::member_access_of(callee_node) != null) {
+            if (ExpressionNode::member_access_of(callee_node) != null
+                    && !ExpressionNode::member_access_of(callee_node).parenthesized) {
                 param_types = this.lookup_method_param_types(
                     visitor, call, ExpressionNode::member_access_of(call.callee), call.arguments.length());
             }
@@ -1385,6 +1386,31 @@ type struct CallResolver {
                 }
             }
             if (callee_member.trait_required && !this.receiver_has_required_trait(visitor, callee_member)) {
+                return TypeRef::invalid();
+            }
+            // `(h.f)(x)`: the parentheses make the callee the field's value,
+            // so the call is of that value whatever method shares its name -
+            // a closure through its `__call__`, a function or a callable-bound
+            // parameter through its signature.  A member that is no such
+            // field is a value that cannot be called.
+            if (callee_member.parenthesized) {
+                const field_owner: TypeRef = this.binding.peel_all_indirection(receiver_type);
+                const held_value: FieldAnswer = this.member.field_of(field_owner, callee_member.member);
+                if (held_value.found() && held_value.index >= 0 && this.lambda.is_closure_struct_type(held_value.ty)) {
+                    const closure_value: mut ExpressionNode* = call.callee;
+                    call.callee = ExpressionNode::member_access_expr(closure_value, this.intern.intern("__call__"),
+                        closure_value.span, closure_value.span);
+                    return this.resolve_call(visitor, call_e, call);
+                }
+                const field_return: TypeRef = this.resolve_field_call(field_owner, call.callee, callee_member);
+                if (field_return.is_valid()) {
+                    const field_signature: FunctionType* =
+                        this.arena.lookup(this.callable_signature(call.callee.resolved_type)).as_function();
+                    this.check_call_against_signature(visitor, call_e, call, "the called field", field_signature);
+                    return field_return;
+                }
+                const value_type: TypeRef = visitor.resolve_expr(call.callee);
+                if (value_type.is_valid()) { this.refuse_call_of_non_function(call.callee.span, value_type); }
                 return TypeRef::invalid();
             }
             const selected: Selection = this.resolve_method_overload(visitor, call, callee_member);
