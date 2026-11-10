@@ -3,9 +3,12 @@
 ///! The typical flow:
 ///!
 ///! ```cryo
+///! import std::collections::str::{ Str };
+///! import std::process::child::{ Child };
+///! import std::process::command::{ Command, Stdio };
+///!
 ///! mut cmd: Command = Command::new(Str::new("ls"));
-///! cmd.arg(Str::new("-la"));
-///! cmd.stdout(Stdio::Piped);
+///! cmd.arg(Str::new("-la")).current_directory(Str::new("/tmp")).stdout(Stdio::Piped);
 ///! mut child: Child = cmd.spawn().unwrap();
 ///! // read from child.stdout, wait, etc.
 ///! ```
@@ -26,6 +29,7 @@ import std::io::error::{ IoError, IoErrorKind };
 import std::io::fd;
 import std::io::fd::{ BorrowedFileDescriptor };
 import std::io::traits::{ Read };
+import std::core::iter::{ Iterator };
 import std::collections::array::{ Array };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
@@ -68,7 +72,7 @@ public type struct Command {
     private args: Array<String>;
     private envs: Array<EnvEntry>;
     private clear_env_flag: boolean;
-    private cwd: Option<String>;
+    private current_directory: Option<String>;
     private stdin_cfg: Stdio;
     private stdout_cfg: Stdio;
     private stderr_cfg: Stdio;
@@ -82,41 +86,80 @@ public type struct Command {
             args: Array::new(),
             envs: Array::new(),
             clear_env_flag: false,
-            cwd: Option::None,
+            current_directory: Option::None,
             stdin_cfg: Stdio::Inherit,
             stdout_cfg: Stdio::Inherit,
             stderr_cfg: Stdio::Inherit
         };
     }
 
-    public arg(mut &this, value: Str) -> void {
+    // Every setter returns the command, so a configuration chains:
+    // `command.arg(Str::new("-c")).arg(script).stdout(Stdio::Piped);`
+
+    /// Add one argument after those already added.
+    public arg(mut &this, value: Str) -> mut &Command {
         this.args.push(String::from_str(value));
+        return &this;
     }
 
-    public env(mut &this, key: Str, value: Str) -> void {
+    /// Add every argument `values` yields, in order, after those already
+    /// added.
+    public args<I>(mut &this, values: I) -> mut &Command
+    where I: Iterator<Str> {
+        mut remaining: I = values;
+        loop {
+            match (remaining.next()) {
+                Option::Some(value) => { this.args.push(String::from_str(value)); }
+                Option::None => { break; }
+            }
+        }
+        return &this;
+    }
+
+    /// Set the environment variable `key` to `value` in the child.
+    public env(mut &this, key: Str, value: Str) -> mut &Command {
         this.envs.push(EnvEntry {
             key: String::from_str(key),
             value: String::from_str(value)
         });
+        return &this;
     }
 
     /// Don't inherit the parent's environment. Only the entries added
     /// with `env()` reach the child.
-    public env_clear(mut &this) -> void {
+    public env_clear(mut &this) -> mut &Command {
         this.clear_env_flag = true;
+        return &this;
     }
 
-    public cwd(mut &this, path: Str) -> void {
+    /// The directory the child starts in; without one it starts in the
+    /// parent's current directory. A second call replaces the first.
+    public current_directory(mut &this, path: Str) -> mut &Command {
         // A write through `mut &this` does not release what it replaces, so
         // the new directory is swapped in and the old one leaves in
         // `replaced`, released at the end of this body.
         mut replaced: Option<String> = Option::Some(String::from_str(path));
-        mem::swap::<Option<String>>(&replaced, &this.cwd);
+        mem::swap::<Option<String>>(&replaced, &this.current_directory);
+        return &this;
     }
 
-    public stdin(mut &this, setting: Stdio) -> void { this.stdin_cfg = setting; }
-    public stdout(mut &this, setting: Stdio) -> void { this.stdout_cfg = setting; }
-    public stderr(mut &this, setting: Stdio) -> void { this.stderr_cfg = setting; }
+    /// How the child's standard input is wired up.
+    public stdin(mut &this, setting: Stdio) -> mut &Command {
+        this.stdin_cfg = setting;
+        return &this;
+    }
+
+    /// How the child's standard output is wired up.
+    public stdout(mut &this, setting: Stdio) -> mut &Command {
+        this.stdout_cfg = setting;
+        return &this;
+    }
+
+    /// How the child's standard error is wired up.
+    public stderr(mut &this, setting: Stdio) -> mut &Command {
+        this.stderr_cfg = setting;
+        return &this;
+    }
 
     // Spawning
 
@@ -269,10 +312,9 @@ public type struct Command {
     /// semantics (pipes, redirects, glob expansion). For a plain program
     /// invocation, build the argv with `new`/`arg` and call `status` instead.
     ![target(unix)]
-    public static shell(command: string) -> i32 {
+    public static shell(command: Str) -> i32 {
         mut c: Command = Command::new(Str::new("/bin/sh"));
-        c.arg(Str::new("-c"));
-        c.arg(Str::new(command));
+        c.arg(Str::new("-c")).arg(command);
         return decode_shell_status(c.status());
     }
 
@@ -283,8 +325,9 @@ public type struct Command {
     // argv joining).  `system` returns the child's exit code directly (0 on
     // success), or -1 if the command interpreter could not be started.
     ![target(windows)]
-    public static shell(command: string) -> i32 {
-        return libc::system(command);
+    public static shell(command: Str) -> i32 {
+        const text: String = String::with_null(command);
+        return libc::system(text.as_ptr());
     }
 
 }
@@ -541,7 +584,7 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
 
     // 3. Prepare an optional NUL-terminated cwd path.
     mut cwd_cstr: Option<String> = Option::None;
-    match (&cmd.cwd) {
+    match (&cmd.current_directory) {
         Option::Some(path) => {
             cwd_cstr = Option::Some(String::with_null(path.as_str()));
         }
@@ -719,7 +762,7 @@ private function clone_command(cmd: &Command) -> Command {
         args: Array::new(),
         envs: Array::new(),
         clear_env_flag: cmd.clear_env_flag,
-        cwd: Option::None,
+        current_directory: Option::None,
         stdin_cfg: cmd.stdin_cfg,
         stdout_cfg: cmd.stdout_cfg,
         stderr_cfg: cmd.stderr_cfg
@@ -745,9 +788,9 @@ private function clone_command(cmd: &Command) -> Command {
         }
         j = j + 1;
     }
-    match (&cmd.cwd) {
+    match (&cmd.current_directory) {
         Option::Some(path) => {
-            out.cwd = Option::Some(String::from_str(path.as_str()));
+            out.current_directory = Option::Some(String::from_str(path.as_str()));
         }
         Option::None => { }
     }
@@ -1144,7 +1187,7 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
 
     mut cwd_cstr: String = String::new();
     mut cwd_ptr:  u8* = null;
-    match (&cmd.cwd) {
+    match (&cmd.current_directory) {
         Option::Some(path) => {
             cwd_cstr = String::with_null(path.as_str());
             cwd_ptr  = cwd_cstr.as_ptr();
