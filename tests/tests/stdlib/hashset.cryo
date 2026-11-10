@@ -24,6 +24,8 @@ import std::core::option::{ Option };
 import std::core::iter::{ Iterator };
 import std::collections::str::{ Str };
 import std::collections::hashset::{ HashSet };
+import std::core::hash::{ Hasher };
+import std::alloc::allocator::{ GlobalAlloc };
 import std::test::error::{ TestError };
 import std::test::assert::{ expect_eq, expect_false, expect_none, expect_true };
 
@@ -280,4 +282,36 @@ function iter_count_default_returns_length() -> Result<(), TestError> {
     mut it: implement Iterator<u32> = s.iter();
     const got: i64 =it.count();
     return expect_eq(got, 3);
+}
+
+/// A hasher with no `Default`: where it starts is only ever given, so a
+/// clone can have it only from the set it copies.
+type struct SeededHasher {
+    state: u64;
+}
+
+implement trait Hasher for struct SeededHasher {
+    write_u8(mut &this, value: u8) -> void {
+        this.state = (this.state ^ (value as u64)) * 1099511628211;
+    }
+    finish(&this) -> u64 {
+        return this.state;
+    }
+}
+
+![test]
+function clone_hashes_with_the_original_hasher() -> Result<(), TestError> {
+    mut s: HashSet<u32, GlobalAlloc, SeededHasher> =
+        HashSet::<u32, GlobalAlloc, SeededHasher>::with_hasher(SeededHasher { state: 77 });
+    s.insert(1);
+    s.insert(2);
+    const copy: HashSet<u32, GlobalAlloc, SeededHasher> = s.clone();
+    match (expect_eq(copy.hasher().state, 77)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    const member: u32 = 2;
+    match (expect_eq(copy.contains(&member), true)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(copy.length(), 2);
 }
