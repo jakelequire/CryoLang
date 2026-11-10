@@ -9,8 +9,9 @@
 ///!     a failure names the file it could not read.
 ///!   - `HashMap<String, i64>` - index into a parallel `WordCount`
 ///!     array so we keep one owned `String` per unique word.
-///!   - Manual selection-sort over the result array to pick the top
-///!     `K` entries (the stdlib does not yet have a `sort` helper).
+///!   - `Array.sort_by` with a closure to rank the words by count; the
+///!     sort is stable, so equal counts keep the order the words first
+///!     appeared in.
 ///!   - Careful ownership: every `String` lives in exactly one place
 ///!     (`words[i].text`), and the HashMap key is a borrowing alias -
 ///!     a fresh `String` made from the same bytes - so the dropping
@@ -26,6 +27,7 @@ import std::collections::string::{ String };
 import std::collections::array::{ Array };
 import std::collections::hashmap::{ HashMap };
 import std::fs::{ File };
+import std::core::cmp::{ Ordering };
 import std::fmt;
 
 // ============================================================================
@@ -41,17 +43,10 @@ type struct WordCount {
 // Byte classification - ASCII fast path
 // ============================================================================
 
+/// What this example counts as part of a word: ASCII letters, digits and
+/// the apostrophe of a contraction.
 function is_word_byte(b: u8) -> boolean {
-    if (b >= 0x41 && b <= 0x5A) { return true; }   // A-Z
-    if (b >= 0x61 && b <= 0x7A) { return true; }   // a-z
-    if (b >= 0x30 && b <= 0x39) { return true; }   // 0-9
-    if (b == 0x27) { return true; }                // '
-    return false;
-}
-
-function to_lower(b: u8) -> u8 {
-    if (b >= 0x41 && b <= 0x5A) { return b + 32; }
-    return b;
+    return b.is_alpha() || b.is_digit() || b == 0x27;
 }
 
 // ============================================================================
@@ -68,7 +63,7 @@ function take_word(bytes: &Array<u8>, start: i64, out: mut &String) -> i64 {
         match (bytes.get(i)) {
             Option::Some(byte) => {
                 if (!is_word_byte(byte)) { break; }
-                out.push_byte(to_lower(byte));
+                out.push_byte(byte.to_ascii_lowercase());
                 i = i + 1;
             }
             Option::None => { break; }
@@ -135,40 +130,6 @@ function tally(bytes: &Array<u8>, words: mut &Array<WordCount>) -> i64 {
 }
 
 // ============================================================================
-// Top-N - selection sort over `count` (descending). Stops once
-// we've placed the top `k` entries.
-// ============================================================================
-
-function rank_top(words: mut &Array<WordCount>, k: i64) -> void {
-    const n: i64 = words.length();
-    const limit: i64 = if (k < n) { k } else { n };
-    const slot: mut WordCount* = words.as_mutable_ptr();
-
-    mut i: i64 = 0;
-    while (i < limit) {
-        mut max_idx: i64 = i;
-        mut j: i64 = i + 1;
-        while (j < n) {
-            if (slot[j].count > slot[max_idx].count) {
-                max_idx = j;
-            }
-            j = j + 1;
-        }
-        if (max_idx != i) {
-            // Swap fields field-by-field - strings are pointers
-            // we move around without dropping.
-            const tmp_text: String = slot[i].text;
-            const tmp_count: i64   = slot[i].count;
-            slot[i].text  = slot[max_idx].text;
-            slot[i].count = slot[max_idx].count;
-            slot[max_idx].text  = tmp_text;
-            slot[max_idx].count = tmp_count;
-        }
-        i = i + 1;
-    }
-}
-
-// ============================================================================
 // Output
 // ============================================================================
 
@@ -210,7 +171,8 @@ function main() -> int {
             mut words: Array<WordCount> = Array::new();
             const total: i64 = tally(&buffer, &words);
 
-            rank_top(&words, 10);
+            // Most frequent first.
+            words.sort_by((a: &WordCount, b: &WordCount) -> Ordering { return b.count.compare(&a.count); });
             print_report(&words, 10, total);
 
             return 0;
