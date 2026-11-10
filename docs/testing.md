@@ -387,6 +387,9 @@ with no second copy of the program written by hand:
 }
 ```
 
+The roster golden records the `applied` exit code on the project's line
+(`applied=0`), so dropping the field from a `test.json` is a roster change.
+
 A project can also drive the compiler itself, for a test of what `cryo`
 writes rather than what the program does. `environment` sets variables for
 that one command (`"NAME=value"` entries), `arguments` adds to its command

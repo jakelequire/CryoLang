@@ -264,31 +264,42 @@ def project_entries():
         except ValueError as e:
             errors.append("project %s has a malformed test.json (%s)" % (name, e))
             continue
-        outcome = spec.get("outcome", "collect")
-        expect = spec.get("expect", {}) or {}
-        # `compile_fail` is the build fixture plus the failing polarity, and
-        # `diagnostic` is `fails` plus an error[<code>] marker; count what the
-        # runner will actually check, not what the file happens to spell.
-        fails = bool(expect.get("fails", False)) or outcome == "compile_fail"             or "diagnostic" in expect
-        asserts = 0
-        if "exit_code" in expect:
-            asserts += 1
-        if "stdout_contains" in expect:
-            asserts += 1
-        if "diagnostic" in expect:
-            asserts += 1
-        if "file" in expect:
-            asserts += 1
-        for key in ("output_contains", "output_excludes", "stderr_contains",
-                    "stderr_excludes", "stdout_line_prefixes",
-                    "stderr_line_prefixes", "file_contains", "file_excludes"):
-            asserts += len(expect.get(key, []) or [])
-        reqs = ",".join(spec.get("requires", []) or []) or "-"
-        entries.append(
-            "project %s: outcome=%s fails=%d asserts=%d requires=%s ignore=%d"
+        entries.append(project_line(name, spec))
+    return entries, errors
+
+
+def project_line(name, spec):
+    """The pinned line for project `name` whose test.json parsed to `spec`."""
+    outcome = spec.get("outcome", "collect")
+    expect = spec.get("expect", {}) or {}
+    # `compile_fail` is the build fixture plus the failing polarity, and
+    # `diagnostic` is `fails` plus an error[<code>] marker; count what the
+    # runner will actually check, not what the file happens to spell.
+    fails = bool(expect.get("fails", False)) or outcome == "compile_fail"             or "diagnostic" in expect
+    asserts = 0
+    if "exit_code" in expect:
+        asserts += 1
+    if "stdout_contains" in expect:
+        asserts += 1
+    if "diagnostic" in expect:
+        asserts += 1
+    if "file" in expect:
+        asserts += 1
+    for key in ("output_contains", "output_excludes", "stderr_contains",
+                "stderr_excludes", "stdout_line_prefixes",
+                "stderr_line_prefixes", "file_contains", "file_excludes"):
+        asserts += len(expect.get(key, []) or [])
+    reqs = ",".join(spec.get("requires", []) or []) or "-"
+    line = ("project %s: outcome=%s fails=%d asserts=%d requires=%s ignore=%d"
             % (name, outcome, int(fails), asserts, reqs,
                int(bool(spec.get("ignore", False)))))
-    return entries, errors
+    # `applied` is a second run of the project with its machine-applicable
+    # fixes made; a test.json that drops it stops proving them, so the exit
+    # code that run must give is part of the line.
+    applied = spec.get("applied")
+    if isinstance(applied, dict):
+        line += " applied=%s" % applied.get("exit_code", 0)
+    return line
 
 
 def _negative_code(content):
@@ -415,6 +426,17 @@ def selftest():
         ("a test gated to another OS is kept", windows_only in merged and other_platform == [windows_only]),
         ("an ungated absent test is kept and named", deleted in merged and absent == [deleted]),
         ("an unchanged line stays once", merged.count(kept) == 1),
+    ]
+    fixed = {"outcome": "compile_fail", "expect": {"diagnostic": "E0101"},
+             "applied": {"exit_code": 0}}
+    unproven = {"outcome": "compile_fail", "expect": {"diagnostic": "E0101"}}
+    cases += [
+        ("a project's `applied` run is on its line",
+         project_line("fix", fixed).endswith(" applied=0")),
+        ("dropping `applied` changes the project's line",
+         project_line("fix", fixed) != project_line("fix", unproven)),
+        ("`applied` with no exit code pins the runner's default 0",
+         project_line("fix", {"applied": {}}).endswith(" applied=0")),
     ]
     bad = [name for name, ok in cases if not ok]
     for name in bad:
