@@ -1,0 +1,262 @@
+///! BTreeMap and BTreeSet. A map driven by a long run of random inserts and
+///! removes agrees with a plain table of which keys are present, walks its
+///! keys in ascending order from either end, hands out and takes away its
+///! smallest and greatest entries, releases every key and value it owns
+///! exactly once, and copies deeply. A set answers membership and walks in
+///! order.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::BTreeMapSet;
+
+import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::core::drop::{ Drop };
+import std::core::clone::{ Clone };
+import std::core::iter::{ Iterator, DoubleEndedIterator };
+import std::collections::array::{ Array };
+import std::collections::btree_map::{ BTreeMap };
+import std::collections::btree_set::{ BTreeSet };
+import std::collections::pair::{ Pair };
+import std::collections::string::{ String };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_eq };
+
+/// The keys the random tests draw from.
+const KEY_SPACE: i64 = 700;
+
+/// The next value of a linear congruential sequence.
+function next_random(state: i64) -> i64 {
+    return (state * 1103515245 + 12345) % 2147483648;
+}
+
+![test]
+function map_agrees_with_a_table_through_random_inserts_and_removes() -> Result<(), TestError> {
+    mut map: BTreeMap<i64, i64> = BTreeMap::new();
+    // `table[k]` is the value stored for `k`, or -1 when `k` is absent.
+    mut table: Array<i64> = Array::new();
+    for (mut key: i64 = 0; key < KEY_SPACE; key++) { table.push(-1); }
+    mut present: i64 = 0;
+    mut state: i64 = 5;
+    for (mut step: i64 = 0; step < 20000; step++) {
+        state = next_random(state);
+        const key: i64 = (state / 7) % KEY_SPACE;
+        // Insert more often than remove early on, then the other way round,
+        // so the tree both grows deep and shrinks back through merges.
+        mut insert_weight: i64 = 3;
+        if (step > 12000) { insert_weight = 1; }
+        if (state % 4 < insert_weight) {
+            const previous: Option<i64> = map.insert(key, step);
+            if (table[key] < 0) {
+                expect_eq(previous.is_none(), true)?;
+                present += 1;
+            } else {
+                expect_eq(previous.unwrap(), table[key])?;
+            }
+            table[key] = step;
+        } else {
+            const removed: Option<i64> = map.remove(&key);
+            if (table[key] < 0) {
+                expect_eq(removed.is_none(), true)?;
+            } else {
+                expect_eq(removed.unwrap(), table[key])?;
+                present -= 1;
+            }
+            table[key] = -1;
+        }
+        expect_eq(map.length(), present)?;
+    }
+    for (mut key: i64 = 0; key < KEY_SPACE; key++) {
+        expect_eq(map.contains_key(&key), table[key] >= 0)?;
+        if (table[key] >= 0) { expect_eq(map.get(&key).unwrap(), table[key])?; }
+    }
+    // Ascending from the front, descending from the back.
+    mut expected: i64 = 0;
+    for (entry in map.entries()) {
+        while (table[expected] < 0) { expected += 1; }
+        expect_eq(*entry.first, expected)?;
+        expect_eq(*entry.second, table[expected])?;
+        expected += 1;
+    }
+    mut descending: i64 = KEY_SPACE - 1;
+    for (key in map.keys().rev()) {
+        while (table[descending] < 0) { descending -= 1; }
+        expect_eq(key, descending)?;
+        descending -= 1;
+    }
+    // Empty it from both ends.
+    mut low: i64 = 0;
+    mut high: i64 = KEY_SPACE - 1;
+    while (!map.is_empty()) {
+        const smallest: Pair<i64, i64> = map.pop_first().unwrap();
+        while (table[low] < 0) { low += 1; }
+        expect_eq(smallest.first, low)?;
+        low += 1;
+        if (!map.is_empty()) {
+            const greatest: Pair<i64, i64> = map.pop_last().unwrap();
+            while (table[high] < 0) { high -= 1; }
+            expect_eq(greatest.first, high)?;
+            high -= 1;
+        }
+    }
+    expect_eq(map.first().is_none(), true)?;
+    expect_eq(map.pop_last().is_none(), true)?;
+    return Result::Ok(());
+}
+
+![test]
+function map_iterates_from_both_ends_until_they_meet() -> Result<(), TestError> {
+    mut map: BTreeMap<i64, i64> = BTreeMap::new();
+    for (mut key: i64 = 199; key >= 0; key--) { map.insert(key, key * 10); }
+    mut walk: implement Iterator<Pair<i64, i64>> + DoubleEndedIterator = map.iter();
+    mut front: i64 = 0;
+    mut back: i64 = 199;
+    mut taken: i64 = 0;
+    loop {
+        match (walk.next()) {
+            Option::Some(entry) => {
+                expect_eq(entry.first, front)?;
+                expect_eq(entry.second, front * 10)?;
+                front += 1;
+                taken += 1;
+            }
+            Option::None => { break; }
+        }
+        match (walk.next_back()) {
+            Option::Some(entry) => {
+                expect_eq(entry.first, back)?;
+                back -= 1;
+                taken += 1;
+            }
+            Option::None => { break; }
+        }
+    }
+    expect_eq(taken, 200)?;
+    expect_eq(front, back + 1)?;
+    return Result::Ok(());
+}
+
+![test]
+function map_first_last_and_get_or_insert() -> Result<(), TestError> {
+    mut map: BTreeMap<i64, i64> = BTreeMap::new();
+    const absent: i64 = 3;
+    expect_eq(map.first().is_none(), true)?;
+    expect_eq(map.get_ref(&absent).is_none(), true)?;
+    for (mut key: i64 = 0; key < 50; key++) { map.insert(key * 2, 0); }
+    expect_eq(*map.first().unwrap().first, 0)?;
+    expect_eq(*map.last().unwrap().first, 98)?;
+    for (mut round: i64 = 0; round < 3; round++) {
+        for (mut key: i64 = 0; key < 100; key++) {
+            const count: mut i64* = map.get_or_insert(key, 0);
+            *count += 1;
+        }
+    }
+    expect_eq(map.length(), 100)?;
+    const seven: i64 = 7;
+    const eight: i64 = 8;
+    const fifty: i64 = 50;
+    expect_eq(map.get(&seven).unwrap(), 3)?;
+    *map.get_mutable(&seven).unwrap() = 40;
+    expect_eq(map.get(&seven).unwrap(), 40)?;
+    for (value in map.values_mutable()) { *value += 1; }
+    expect_eq(map.get(&seven).unwrap(), 41)?;
+    expect_eq(map.get(&eight).unwrap(), 4)?;
+    mut total: i64 = 0;
+    for (value in map.values()) { total += value; }
+    expect_eq(total, 41 + 99 * 4)?;
+    const removed: Pair<i64, i64> = map.remove_entry(&fifty).unwrap();
+    expect_eq(removed.first, 50)?;
+    expect_eq(map.remove_entry(&fifty).is_none(), true)?;
+    return Result::Ok(());
+}
+
+/// How many `Counted` values have been released.
+mut released: i64 = 0;
+
+type struct Counted {
+    value: i64;
+}
+
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void { released += 1; }
+}
+
+![test]
+function map_releases_each_value_once() -> Result<(), TestError> {
+    released = 0;
+    {
+        mut map: BTreeMap<i64, Counted> = BTreeMap::new();
+        for (mut key: i64 = 0; key < 300; key++) {
+            map.insert(key, Counted { value: key });
+        }
+        // Replacing hands the old value back; dropping it releases it.
+        const replaced: Option<Counted> = map.insert(5, Counted { value: -5 });
+        expect_eq(replaced.unwrap().value, 5)?;
+        expect_eq(released, 1)?;
+        for (mut key: i64 = 0; key < 300; key += 3) {
+            const taken: Option<Counted> = map.remove(&key);
+            expect_eq(taken.is_some(), true)?;
+        }
+        expect_eq(released, 101)?;
+        expect_eq(map.length(), 200)?;
+    }
+    expect_eq(released, 301)?;
+    return Result::Ok(());
+}
+
+![test]
+function map_with_owning_keys_finds_and_copies_them() -> Result<(), TestError> {
+    mut map: BTreeMap<String, i64> = BTreeMap::new();
+    const words: [string; 6] = ["pear", "apple", "fig", "banana", "cherry", "date"];
+    for (mut index: i64 = 0; index < 6; index++) {
+        map.insert(String::from(words[index]), index);
+    }
+    map.insert(String::from("fig"), 60);
+    expect_eq(map.length(), 6)?;
+    const copy: BTreeMap<String, i64> = map.clone();
+    map.clear();
+    expect_eq(map.is_empty(), true)?;
+    const in_order: [string; 6] = ["apple", "banana", "cherry", "date", "fig", "pear"];
+    mut index: i64 = 0;
+    for (key in copy.keys_ref()) {
+        const wanted: String = String::from(in_order[index]);
+        expect_eq((*key).equals(&wanted), true)?;
+        index += 1;
+    }
+    const fig: String = String::from("fig");
+    expect_eq(copy.get(&fig).unwrap(), 60)?;
+    return Result::Ok(());
+}
+
+![test]
+function set_answers_membership_in_order() -> Result<(), TestError> {
+    mut set: BTreeSet<i64> = BTreeSet::new();
+    mut state: i64 = 11;
+    for (mut step: i64 = 0; step < 1000; step++) {
+        state = next_random(state);
+        set.insert(state % 64);
+    }
+    expect_eq(set.insert(*set.first().unwrap()), false)?;
+    mut previous: i64 = -1;
+    for (value in set.iter()) {
+        expect_eq(value > previous, true)?;
+        expect_eq(set.contains(&value), true)?;
+        previous = value;
+    }
+    const greatest: i64 = set.pop_last().unwrap();
+    expect_eq(set.contains(&greatest), false)?;
+    // The key is copied out first: a removal moves entries between nodes,
+    // so a pointer into the set does not stay put while it runs.
+    const smallest: i64 = *set.first().unwrap();
+    expect_eq(set.remove(&smallest), true)?;
+    expect_eq(set.contains(&smallest), false)?;
+    mut source: Array<i64> = Array::new();
+    source.push(5);
+    source.push(3);
+    source.push(5);
+    source.push(1);
+    const collected: BTreeSet<i64> = source.iter().collect();
+    expect_eq(collected.length(), 3)?;
+    expect_eq(*collected.first().unwrap(), 1)?;
+    expect_eq(*collected.iter_ref().rev().next().unwrap(), 5)?;
+    return Result::Ok(());
+}

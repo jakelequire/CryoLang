@@ -3082,7 +3082,13 @@ type struct SemaVisitor {
         if (aa != null) {
             if (aa.desugared_call != null) {
                 const viewed: boolean = this.view_desugar_member(aa.desugared_call) != null;
-                aa.desugared_call = this.writable_trait_read(aa.desugared_call);
+                mut array: ArrayType* = null;
+                if (viewed) { array = this.viewed_fixed_array(aa); }
+                if (array != null) {
+                    aa.desugared_call = this.writable_fixed_array_view(aa, array);
+                } else {
+                    aa.desugared_call = this.writable_trait_read(aa.desugared_call);
+                }
                 // A view made writable is a value of another type (`mut
                 // &Slice<T>` where it read `&Slice<T>`).
                 if (viewed) { place.resolved_type = aa.desugared_call.resolved_type; }
@@ -3176,7 +3182,44 @@ type struct SemaVisitor {
         if (aa == null || aa.desugared_call == null) { return null; }
         const member: MemberAccessExpr* = this.view_desugar_member(aa.desugared_call);
         if (member == null) { return null; }
+        // A fixed array is viewed through a slice built over it; the
+        // elements are the array's own.
+        if (this.viewed_fixed_array(aa) != null) { return aa.array; }
         return member.object;
+    }
+
+    /// The fixed array `aa` views, where its base is a `[T; N]` or a
+    /// reference to one: `try_index_view` reads it through the slice over
+    /// its elements.  Null for any other base.
+    viewed_fixed_array(&this, aa: ArrayAccessExpr*) -> ArrayType* {
+        if (aa.array == null) { return null; }
+        mut t: Type* = this.arena.lookup(aa.array.resolved_type);
+        if (t != null && t.kind == TypeKind::Reference) { t = this.arena.lookup(t.as_reference().referent); }
+        if (t == null || t.kind != TypeKind::Array) { return null; }
+        return t.as_array();
+    }
+
+    /// The view `a[r]` of the fixed array `a`, rebuilt as the write
+    /// `view_mutable(r)` on the writable slice over `a`'s elements.  The
+    /// read itself where `a` is not writable - the write's own check
+    /// reports it - or where no declaration claims the writable view.
+    writable_fixed_array_view(mut &this, aa: ArrayAccessExpr*, array: ArrayType*) -> mut ExpressionNode* {
+        const read: mut ExpressionNode* = aa.desugared_call;
+        if (!this.access_within(aa.array).is_writable()) { return read; }
+        const span: SourceSpan = read.span;
+        mut reference: mut ExpressionNode* = aa.array;
+        const written: Type* = this.arena.lookup(aa.array.resolved_type);
+        if (written == null || written.kind != TypeKind::Reference) {
+            const amp: Token = Token::new(TokenType::Amp, "&", span.start_line as int, span.start_col as int);
+            reference = ExpressionNode::synthetic_unary(amp, aa.array, span);
+        }
+        const slice: mut ExpressionNode* = this.fixed_array_slice(reference, array, true, span);
+        const callee: mut ExpressionNode* = this.member.lang_method_callee(slice, LangItem::IndexViewMutableViewMutable, span);
+        if (callee == null) { return read; }
+        mut write: mut ExpressionNode* = ExpressionNode::call_expr(callee, span);
+        ExpressionNode::call_of(write).add_argument(ExpressionNode::call_of(read).arguments[0]);
+        if (!this.resolve_expr(write).is_valid()) { return read; }
+        return write;
     }
 
     /// The callee `r.view` of `call` where it is the desugar `r.view(i)` of

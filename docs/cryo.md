@@ -1423,7 +1423,7 @@ From **lowest** to **highest**:
 
 `as` sits between multiplication and unary, so `x * y as i64` casts `y`, not the product. Use parentheses if you mean `(x * y) as i64`.
 
-The range operators `..` / `..=` bind looser than every arithmetic and comparison operator, so `a + 1 .. b * 2` is `(a + 1) .. (b * 2)`. They desugar at parse time to `Range::new` / `RangeInclusive::new` (see [section 6.3](#63-for-loops)).
+The range operators `..` / `..=` bind looser than every arithmetic and comparison operator, so `a + 1 .. b * 2` is `(a + 1) .. (b * 2)`. They desugar at parse time to `Range::new` / `RangeInclusive::new` (see [section 6.3](#63-for-loops)). A range may leave an end open where the next token cannot start its operand - `]`, `)`, `,`, `;` or `}`: `a..` is `RangeFrom::new(a)`, `..b` is `RangeTo::new(b)` and a bare `..` is `RangeFull::new()`, the forms a slice takes ([section 10.6](#106-operator-overloading)). `RangeFrom` is an endless iterator over a `Step` type: `for (n in 5..)` counts up until the loop breaks.
 
 ---
 
@@ -2623,6 +2623,8 @@ live in
 | `<=>`                  | `Ord` (`: Eq`)                        | `a <=> b` -> `a.compare(&b)`                                 |
 | `a[i]` read            | `Index<Idx>` (`type Output`)          | `a[i]` -> `*(a.index(i))`                                    |
 | `a[i]` written         | `IndexMutable<Idx>` (`: Index<Idx>`)  | `a[i]` -> `*(a.index_mutable(i))`                            |
+| `a[r]` read, a view    | `IndexView<Idx>` (`type View`)        | `a[r]` -> `a.view(r)`                                        |
+| `a[r]` written, a view | `IndexViewMutable<Idx>` (`type ViewMutable`) | `a[r]` -> `a.view_mutable(r)`                          |
 | `*a` (deref) read      | `Deref` (`type Target`)               | `*a` -> `*(a.deref())`                                       |
 | `*a` (deref) written   | `DerefMutable` (`: Deref`)            | `*a` -> `*(a.deref_mutable())`                               |
 
@@ -2736,6 +2738,49 @@ mut g: Grid = ...;
 const first: i32 = g[0];  // *(g.index(0))
 g[0] = 42;                // *(g.index_mutable(0)) = 42
 g[0] += 1;                // index_mutable called once
+```
+
+**Views.** `a[r]` is a *view* - a value standing for part of `a`, not one
+element - where `a`'s type implements `IndexView<Idx>` at `r`'s type: it is
+`a.view(r)`, a value of the implementation's `View`, returned by value.
+That is one question, asked before `Index`'s: a container and index type
+with no `IndexView` implementation are indexed through `Index` as above.
+Where the view is written - an element of it assigned (`xs[1..3][0] = v`),
+the view made the receiver of a `mut &this` method, or the view passed for
+a parameter that writes (`mut &Slice<T>`) - it is `a.view_mutable(r)`, the
+`ViewMutable` of `IndexViewMutable<Idx>` (whose supertrait is
+`IndexView<Idx>`), and a place reached through it is exactly as writable as
+`a` (E0250 on a `const` binding; E0251 for the argument, naming the `const`
+binding or the read-only reference `a` is reached through).  A type that
+implements only `IndexView` is read-only through the view (E0229).  A view
+is not checked for lifetime: like any reference, it must not outlive `a`.
+
+No implementation can name a fixed array's length, so a `[T; N]`, or a
+reference to one, is viewed through the slice over its elements that its
+reference converts to: `fixed[r]` is `fixed.as_slice().view(r)`, written
+`fixed.as_mutable_slice().view_mutable(r)`.  In a generic body a container
+written in the body's parameters (`&Array<T>`, `&[T; N]`, `&Slice<T>`) is
+viewed when an implementation applies to it as written, and each copy of
+the body calls that implementation for its own `T`.  A base that is itself
+a type parameter is indexed through `Index` alone.
+
+The standard library slices by a range.  On an `Array<T>`, a `[T]` or a
+`Slice<T>`, `xs[r]` is a `&Slice<T>` of the elements `r` names, and written a
+`mut &Slice<T>`; on a `Str` or a `String`, `s[r]` is the `Str` of the bytes
+`r` names.  `r` is any of the five range forms over any integer type:
+`a..b` (`Range`), `a..=b` (`RangeInclusive`), `a..` (`RangeFrom`), `..b`
+(`RangeTo`) and `..` (`RangeFull`), a missing start being `0` and a missing
+end the length.  A range reaching outside `[0, length]`, or starting after
+its end, panics, and on a string so does an end inside a UTF-8 character
+(neither end may split one: `Str.is_char_boundary`); the report names the
+`[]` that asked (`![caller_location]`).
+
+```cryo
+mut xs: [i64] = [1, 2, 3, 4, 5];
+const middle: &Slice<i64> = xs[1..4];   // 2, 3, 4
+xs[3..][0] = 40;                        // xs.view_mutable(RangeFrom::new(3))[0]
+const text: Str = Str::new("héllo");
+const tail: Str = text[3..];            // "llo"; text[0..2] panics
 ```
 
 **Dereference and auto-deref.** `*b` is read through `Deref`, whose
@@ -4677,7 +4722,7 @@ The prelude is auto-imported into every Cryo source file. Currently:
 | `core::drop`, `core::marker`, `core::cmp`, `core::clone` | `Drop`, the marker traits (`Copy`, `Send`, `Sync`), `Eq` / `Ord` / `Ordering`, `Clone` |
 | `collections::array` | `Array<T>`, the type `[T]` names                                                                                       |
 | `core::slice`        | `Slice<T>`, backing the for-in lowering over fixed-size arrays (`for (x in arr)` where `arr: [T; N]`)                 |
-| `core::ops`          | `Range` / `RangeInclusive`, backing range literals (`a..b` desugars to `Range::new`)                                  |
+| `core::ops`          | `Range` / `RangeInclusive` / `RangeFrom` / `RangeTo` / `RangeFull`, backing range literals (`a..b` desugars to `Range::new`) |
 | `core::iter`         | `Iterator`, the trait the for-in sugar drives the scrutinee through                                                   |
 | `alloc::box`         | `Box<T>`                                                                                                              |
 | `alloc::rc`          | `Rc<T>`                                                                                                               |
@@ -4689,7 +4734,7 @@ The prelude is deliberately small. Anything else is an explicit `import` - notab
 | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **`core`**        | The language foundations. `Option<T>` and `Result<T, E>` with their combinators - beyond `map` / `and_then` / `or_else`, `filter`, `map_or`, `map_or_else`, `and`, `or`, `xor` and `zip` (a `Pair` of both values), `unwrap_or_default`, `is_some_and` / `is_none_or` (`is_ok_and` / `is_err_and`), `inspect` (`inspect_err`) and `expect_err`; a combinator that discards a value or an error releases it. `Slice<T>`, `NonNull<T>`, `Range<T>`, `RangeInclusive<T>`, `Ordering`. Traits: `Copy`, `Drop`, `Clone`, `Default`, `Eq`, `Ord`, `Hash`, `Iterator<Item>` (beyond the lazy adapters, `collect` builds any `FromIterator<T>` - an `Array`, a `HashMap` from `Pair`s, a `HashSet`, a `String` from `char`s - as the type wanted where it stands, `sum` adds into any `Sum` number, `rev` reverses a `DoubleEndedIterator` such as a range or a slice's iterator, `peekable` reads ahead with `peek`, and `flat_map` yields each element's iterator in turn), `From`/`Into`/`TryFrom`/`TryInto`, `Step`; generic `cmp::min` / `cmp::max` (`where T: Ord`). Memory utilities (`copy`, `zero`, `swap`, `transmute`). Hashing (`Hasher`; `FnvHasher`, FNV-1a, fixed and reproducible across runs, for digests and for maps whose keys are trusted; `SipHasher`, keyed SipHash - `with_keys_1_3` and `with_keys_2_4` - for a hash whose input an adversary chooses; a default `SipHasher` is SipHash-1-3 under a key drawn per hasher from a per-process random seed).                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | **`alloc`**       | `Layout`, `Allocator` trait, `GlobalAlloc`, `Box<T>`, `Arena` (bump allocator with reset), `Pool` (fixed-slot slab), `Rc<T>` (single-threaded reference counting), `Arc<T>` (atomic reference counting for cross-thread sharing).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| **`collections`** | `Array<T, A>` (growable contiguous), `Str` (borrowed length-typed UTF-8 view; `split`, `split_nonempty`, `split_whitespace` and `lines` iterate borrowed pieces, the separator `join`s an iterator of pieces - `Str::new(", ").join(words.split_whitespace())` - and `repeat`, `char_count` and `is_char_boundary` round it out), `String<A>` (owned UTF-8; `insert`, `remove` and `pop` work a scalar at a time at char boundaries), `HashMap<K, V, A, H>` (separate-chaining; keys hashed by `H`, by default a `SipHasher` keyed per map, so which keys share a bucket cannot be worked out by whoever chooses them; `HashMap<K, V, GlobalAlloc, FnvHasher>` names the faster unkeyed hasher, and `with_hasher` builds a map around a given hasher), `HashSet<T, A, H>` (the same hasher parameter), `Pair<A, B>` (owned two-element tuple). All allocator-generic with `GlobalAlloc` default.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| **`collections`** | `Array<T, A>` (growable contiguous), `Str` (borrowed length-typed UTF-8 view; `split`, `split_nonempty`, `split_whitespace` and `lines` iterate borrowed pieces, the separator `join`s an iterator of pieces - `Str::new(", ").join(words.split_whitespace())` - and `repeat`, `char_count` and `is_char_boundary` round it out), `String<A>` (owned UTF-8; `insert`, `remove` and `pop` work a scalar at a time at char boundaries), `HashMap<K, V, A, H>` (separate-chaining; keys hashed by `H`, by default a `SipHasher` keyed per map, so which keys share a bucket cannot be worked out by whoever chooses them; `HashMap<K, V, GlobalAlloc, FnvHasher>` names the faster unkeyed hasher, and `with_hasher` builds a map around a given hasher), `HashSet<T, A, H>` (the same hasher parameter), `BTreeMap<K, V, A>` and `BTreeSet<T, A>` (a B-tree kept in `Ord` order: O(log n) lookup, insert and remove, `first`/`last` and `pop_first`/`pop_last`, and iterators that run in ascending order from either end), `Deque<T, A>` and `BinaryHeap<T, A>`, `Pair<A, B>` (owned two-element tuple). All allocator-generic with `GlobalAlloc` default.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | **`io`**          | `Read` / `Write` traits with rich defaults (`read_byte`, `read_until`, `read_to_end`, `read_to_string`, `write_all`, `write_str`, `write_line`). `Stdin`, `Stdout`, `Stderr` handles with `is_tty()`/`as_fd()`. `io::terminal` styles text: `Style::new().foreground(Color::Red).bold().paint(value)` prints `value` between the escape sequence for the style and a reset (a `Style` that sets nothing writes the value alone), and `Terminal::supports_color(StandardStream::Error)` says whether a stream takes colour - it is a terminal, `NO_COLOR` is unset or empty and `TERM` is not `dumb`; on Windows it also turns on the console's escape-sequence processing. `BufWriter<W>` / `LineWriter<W>` / `BufReader<R>` (each over a `mut` pointer to its source or sink; `BufReader.lines()` yields owned, UTF-8-checked lines without their endings). POSIX flag constants and an `IoError` / `IoErrorKind` mapping `errno` and Windows error codes; an `IoError` carries the operation that failed (`IoOperation`) and the path it named, and prints as `could not open config.toml: not found`. `IoErrorKind`, `IoOperation` and the standard library's other fieldless kind and error enums implement `Eq` and `Clone`, so `error.kind == IoErrorKind::NotFound` holds wrapped too, as an `Option<IoErrorKind>` or in a `Result`. `read_to_string` refuses bytes that are not UTF-8.                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | **`fmt`**         | `Display` and `Debug` traits, `Formatter` borrowing its sink as a `virtual mut &FmtWrite`, `FmtWrite`, `fmt::Arguments` (an f-string written where it goes: `sink.write(f"...")`), `print` / `println` / `eprint` / `eprintln`, `format_to_string`, `format_debug_to_string`; a `Debug` text built member by member - `f.debug_struct("Point").field("x", &this.x).field("y", &this.y).finish()` writes `Point { x: 1, y: 2 }`, `f.debug_tuple("Some").field(&value).finish()` writes `Some(1)`, and a formatter made by `Formatter::pretty` writes one member per line, indented four spaces a level; `format` / `printf` / `eprintf` for C-style `%s`/`%d` text, `format` into an owned `String`. Heap-free float writers into a caller's buffer (`f64.to_buf`, `to_buf_with`, `to_buf_roundtrip`) and `parse_f64`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | **`encoding`**    | Byte-to-text codecs. `Base64` names an RFC 4648 variant - `standard`, `standard_unpadded`, `url_safe`, `url_safe_unpadded` - with `encode(&Slice<u8>) -> String`, `encode_into(bytes, mut &String)` and `decode(Str) -> Result<Array<u8>, DecodeError>`. `PercentEncoding` (RFC 3986): `encode_component` escapes every byte but the unreserved characters, `encode_path` keeps `/` as well, and `decode` turns `%XX` back into bytes and refuses a result that is not UTF-8. A `DecodeError` names its `DecodeErrorKind` and the input byte it was found at, and prints as `invalid padding at byte 2`. `hex::encode`, `sha1`, `Sha256`, and the `Utf16` codec the wide-character Windows calls take. |

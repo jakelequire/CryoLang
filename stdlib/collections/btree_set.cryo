@@ -1,0 +1,189 @@
+///! BTreeSet<T, A>: a set kept in order, built on `BTreeMap<T, ()>`.
+///!
+///!     import std::collections::btree_set::{ BTreeSet };
+///!
+///!     mut seen: BTreeSet<i64> = BTreeSet::new();
+///!     seen.insert(3);
+///!     seen.insert(1);
+///!     seen.insert(3);                       // false: already present
+///!     const smallest: Option<i64*> = seen.first();   // 1
+///!
+///! Values are ordered by `Ord`; finding, inserting and removing are
+///! O(log n), and iteration runs in ascending order from either end. See
+///! `BTreeMap` for the structure.
+
+namespace std::collections::btree_set;
+
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::core::cmp::{ Ord };
+import std::core::clone::{ Clone };
+import std::core::default::{ Default };
+import std::core::iter::{ DoubleEndedIterator, FromIterator, Iterator };
+import std::alloc::allocator::{ AllocError, Allocator, GlobalAlloc };
+import std::collections::btree_map::{ BTreeMap, KeysIter, KeysRefIter };
+import std::collections::pair::{ Pair };
+
+public type struct BTreeSet<T, A = GlobalAlloc> where A: Allocator {
+    private map: BTreeMap<T, (), A>;
+
+    /// An empty set backed by `GlobalAlloc`. Allocates nothing until the
+    /// first insert.
+    public static new() -> BTreeSet<T, GlobalAlloc> {
+        return BTreeSet::<T, GlobalAlloc> { map: BTreeMap::new() };
+    }
+
+    /// An empty set that allocates through `alloc`.
+    public static new_in(alloc: A) -> BTreeSet<T, A> {
+        return BTreeSet::<T, A> { map: BTreeMap::new_in(alloc) };
+    }
+
+    public length(&this) -> i64 {
+        return this.map.length();
+    }
+
+    public is_empty(&this) -> boolean {
+        return this.map.is_empty();
+    }
+
+    public contains(&this, value: &T) -> boolean where T: Ord {
+        return this.map.contains_key(value);
+    }
+
+    /// Add `value`. Returns `true` if it was not already present; a value
+    /// already present is kept and `value` is released. Panics on
+    /// allocation failure.
+    public insert(mut &this, value: T) -> boolean where T: Ord {
+        return this.map.insert(value, ()).is_none();
+    }
+
+    /// `insert` that returns `Err(AllocError)` instead of panicking when a
+    /// node cannot be allocated.
+    public try_insert(mut &this, value: T) -> Result<boolean, AllocError> where T: Ord {
+        const previous: Option<()> = this.map.try_insert(value, ())?;
+        return Result::Ok(previous.is_none());
+    }
+
+    /// Remove `value`. Returns `true` if it was present.
+    public remove(mut &this, value: &T) -> boolean where T: Ord {
+        return this.map.remove(value).is_some();
+    }
+
+    /// The smallest value, or `None` when empty.
+    public first(&this) -> Option<T*> {
+        match (this.map.first()) {
+            Option::Some(entry) => { return Option::Some(entry.first); }
+            Option::None => { return Option::None; }
+        }
+    }
+
+    /// The greatest value, or `None` when empty.
+    public last(&this) -> Option<T*> {
+        match (this.map.last()) {
+            Option::Some(entry) => { return Option::Some(entry.first); }
+            Option::None => { return Option::None; }
+        }
+    }
+
+    /// Remove and return the smallest value, or `None` when empty.
+    public pop_first(mut &this) -> Option<T> where T: Ord {
+        match (this.map.pop_first()) {
+            Option::Some(entry) => {
+                const { first: value, second: _ }: Pair<T, ()> = entry;
+                return Option::Some(value);
+            }
+            Option::None => { return Option::None; }
+        }
+    }
+
+    /// Remove and return the greatest value, or `None` when empty.
+    public pop_last(mut &this) -> Option<T> where T: Ord {
+        match (this.map.pop_last()) {
+            Option::Some(entry) => {
+                const { first: value, second: _ }: Pair<T, ()> = entry;
+                return Option::Some(value);
+            }
+            Option::None => { return Option::None; }
+        }
+    }
+
+    /// Release every value.
+    public clear(mut &this) -> void {
+        this.map.clear();
+    }
+
+    /// Every value by value, in ascending order. Gated on `T: Copy`: the
+    /// values are bit copies of the stored ones. `iter_ref` walks any set.
+    public iter(&this) -> implement Iterator<T> + DoubleEndedIterator where T: Copy {
+        return BTreeSetIter::<T> { keys: KeysIter::<T, ()>::over::<A>(&this.map) };
+    }
+
+    /// Every value by borrow, in ascending order.
+    public iter_ref(&this) -> implement Iterator<T*> + DoubleEndedIterator {
+        return BTreeSetRefIter::<T> { keys: KeysRefIter::<T, ()>::over::<A>(&this.map) };
+    }
+}
+
+// Produced only as the opaque iterators `iter` and `iter_ref` return.
+
+private type struct BTreeSetIter<T> {
+    private keys: KeysIter<T, ()>;
+}
+
+implement<T> trait Iterator<T> for struct BTreeSetIter<T> where T: Copy {
+    next(mut &this) -> Option<T> {
+        return this.keys.next();
+    }
+}
+
+implement<T> trait DoubleEndedIterator for struct BTreeSetIter<T> where T: Copy {
+    next_back(mut &this) -> Option<T> {
+        return this.keys.next_back();
+    }
+}
+
+private type struct BTreeSetRefIter<T> {
+    private keys: KeysRefIter<T, ()>;
+}
+
+implement<T> trait Iterator<T*> for struct BTreeSetRefIter<T> {
+    next(mut &this) -> Option<T*> {
+        return this.keys.next();
+    }
+}
+
+implement<T> trait DoubleEndedIterator for struct BTreeSetRefIter<T> {
+    next_back(mut &this) -> Option<T*> {
+        return this.keys.next_back();
+    }
+}
+
+/// Deep copy: a fresh set owning clones of every value.
+implement<T> trait Clone for struct BTreeSet<T, GlobalAlloc> where T: Ord + Clone {
+    clone(&this) -> BTreeSet<T, GlobalAlloc> {
+        mut out: BTreeSet<T, GlobalAlloc> = BTreeSet::<T, GlobalAlloc>::new();
+        for (value in this.iter_ref()) {
+            out.insert((*value).clone());
+        }
+        return out;
+    }
+}
+
+/// A fresh empty set, allocating nothing until the first insert.
+implement<T> trait Default for struct BTreeSet<T, GlobalAlloc> {
+    static default() -> BTreeSet<T, GlobalAlloc> {
+        return BTreeSet::<T, GlobalAlloc>::new();
+    }
+}
+
+/// A set of every value an iterator yields: what `collect` builds for
+/// `BTreeSet`.
+implement<T> trait FromIterator<T> for struct BTreeSet<T, GlobalAlloc> where T: Ord {
+    static from_iterator<I>(source: I) -> BTreeSet<T, GlobalAlloc> where I: Iterator<T> {
+        mut out: BTreeSet<T, GlobalAlloc> = BTreeSet::<T, GlobalAlloc>::new();
+        for (value in source) {
+            out.insert(value);
+        }
+        return out;
+    }
+}
