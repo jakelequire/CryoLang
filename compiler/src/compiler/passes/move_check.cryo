@@ -2283,6 +2283,24 @@ type struct MoveChecker {
         // bitwise-independent of the source and safe to duplicate.
         const field_ty: TypeRef = expr.resolved_type;
         if (!field_ty.is_valid() || this.is_copy(field_ty)) { return; }
+        // A value no binding owns gives the field up and is released without
+        // it when the statement ends - unless a destructor sees the value
+        // whole, as it does a local's.
+        if (OwnershipQuery::temporary_field_root(this.arena, this.registry, this.intern, expr) != null
+                && !OwnershipQuery::moves_out_of_temporary(this.arena, this.registry, this.intern, expr)) {
+            if (this.suppress_emit) { return; }
+            const field: string = this.intern.resolve(ma.member);
+            mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
+                fmt::format("cannot move field `%s` out of a value that owns a destructor", field).into_raw());
+            diag = diag.at_with_label(expr.span,
+                "the destructor is run over the whole value when the statement ends, this field with it");
+            diag = diag.help(
+                "borrow the field, or clone it; a value whose type implements `Drop` is never taken apart");
+            this.ctx.emit_diagnostic(this.with_clone_hint(diag, field_ty, expr.span, expr));
+            this.fired += 1;
+            this.fatal += 1;
+            return;
+        }
         // The source must be an owned, glue-dropped value place.
         if (!this.is_owned_value_place(ma.object)) {
             this.check_destructor_field_move_out(expr, ma, field_ty);

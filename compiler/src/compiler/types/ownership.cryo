@@ -749,13 +749,63 @@ type struct OwnershipQuery {
     /// handed to, or, when it is only borrowed, at the end of its statement.
     /// A name, a field or an element read names storage something else
     /// already owns, so releasing it here would be a second release.
+    ///
+    /// A field moved out of such a value (`make().name`) is one too, when
+    /// the value can be released without it: the field is then the moved
+    /// value's own, and the rest of the value is released field by field
+    /// (`moves_out_of_temporary`).
     static is_owning_temporary(arena: TypeArena*, registry: GenericRegistry*,
                                intern: mut InternTable*, e: ExpressionNode*) -> boolean {
         if (e == null) { return false; }
+        if (ExpressionNode::member_access_of(e) != null) {
+            return OwnershipQuery::moves_out_of_temporary(arena, registry, intern, e)
+                && OwnershipQuery::needs_drop(arena, registry, intern, e.resolved_type);
+        }
         if (ExpressionNode::call_of(e) == null && ExpressionNode::struct_of(e) == null) {
             return false;
         }
         return OwnershipQuery::needs_drop(arena, registry, intern, e.resolved_type);
+    }
+
+    /// The value no binding owns that the field read `e` reads out of
+    /// through value fields alone - `make()` in `make().inner.name` - or
+    /// null: for a read that is no field's, or that passes through a pointer
+    /// or a reference, whose storage something else owns.
+    static temporary_field_root(arena: TypeArena*, registry: GenericRegistry*,
+                                intern: mut InternTable*, e: ExpressionNode*) -> ExpressionNode* {
+        if (e == null || ExpressionNode::member_access_of(e) == null) { return null; }
+        mut object: ExpressionNode* = ExpressionNode::member_access_of(e).object;
+        while (ExpressionNode::member_access_of(object) != null) {
+            const link: Type* = arena.lookup(object.resolved_type);
+            if (link == null || link.kind == TypeKind::Pointer || link.kind == TypeKind::Reference) {
+                return null;
+            }
+            object = ExpressionNode::member_access_of(object).object;
+        }
+        if (!OwnershipQuery::is_owning_temporary(arena, registry, intern, object)) { return null; }
+        return object;
+    }
+
+    /// Whether the field `e` reads, when it is not `Copy`, moves out of a
+    /// value no binding owns that can be released without it: every value
+    /// it is read out of, from that value down to the field's owner, is a
+    /// struct, a union or a tuple with no destructor of its own.  A
+    /// destructor sees its whole value, so a value with one cannot give up
+    /// a field (E0453 in the move check), and a read of it only borrows.
+    static moves_out_of_temporary(arena: TypeArena*, registry: GenericRegistry*,
+                                  intern: mut InternTable*, e: ExpressionNode*) -> boolean {
+        const root: ExpressionNode* = OwnershipQuery::temporary_field_root(arena, registry, intern, e);
+        if (root == null) { return false; }
+        if (OwnershipQuery::is_copy(arena, registry, intern, e.resolved_type)) { return false; }
+        mut object: ExpressionNode* = ExpressionNode::member_access_of(e).object;
+        while (true) {
+            if (OwnershipQuery::type_implements_drop(arena, registry, intern, object.resolved_type)) {
+                return false;
+            }
+            if (ExpressionNode::member_access_of(object) == null) { return true; }
+            object = ExpressionNode::member_access_of(object).object;
+        }
+        return true;
     }
 
     /// Strip a qualified name down to its bare leaf: the segment after

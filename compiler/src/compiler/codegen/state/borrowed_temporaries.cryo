@@ -28,13 +28,19 @@ import compiler::diag::source_span::{ SourceSpan };
 import compiler::types::type_ref::{ TypeRef };
 
 /// One spilled temporary: its slot and type, the block it was stored in,
-/// and its liveness flag.
+/// and its liveness flag.  A field moved out of it (`make().inner.name`)
+/// is its new owner's, so the temporary is released without it: the
+/// field's path, one position per field from the value down, is
+/// `moved_count` entries of `BorrowedTemporaries.moved_fields` from
+/// `moved_from`; none for a value released whole.
 type struct BorrowedTemporary {
     slot:  LValue;
     ty:    TypeRef;
     span:  SourceSpan;
     block: LBasicBlock;
     flag:  LValue;
+    moved_from:  i64;
+    moved_count: i64;
 }
 
 type struct BorrowedTemporaries {
@@ -48,6 +54,9 @@ type struct BorrowedTemporaries {
     /// `scope_starts.length()` when each enclosing loop began: `break` and
     /// `continue` leave the scopes opened since.
     loop_depths: [i64];
+    /// The paths of the fields moved out of the recorded temporaries, in
+    /// the temporaries' order (`BorrowedTemporary.moved_from`).
+    moved_fields: [i64];
 
     static new() -> BorrowedTemporaries {
         return BorrowedTemporaries {
@@ -55,6 +64,7 @@ type struct BorrowedTemporaries {
             scope_starts:    [],
             scope_functions: [],
             loop_depths:     [],
+            moved_fields:    [],
         };
     }
 
@@ -75,8 +85,20 @@ type struct BorrowedTemporaries {
         return depth > 0 && this.scope_functions[depth - 1].raw == owner.raw;
     }
 
-    record(mut &this, temporary: BorrowedTemporary) -> void {
-        this.temporaries.push(temporary);
+    /// Record `temporary`, from which the field at the path `moved` was
+    /// moved out (empty for a value released whole).
+    record(mut &this, temporary: BorrowedTemporary, moved: &[i64]) -> void {
+        mut recorded: BorrowedTemporary = temporary;
+        recorded.moved_from = this.moved_fields.length();
+        recorded.moved_count = moved.length();
+        for (mut i: i64 = 0; i < moved.length(); i++) { this.moved_fields.push(moved[i]); }
+        this.temporaries.push(recorded);
+    }
+
+    /// The position, at `depth` of the path, of the field moved out of
+    /// `temporary`.
+    moved_field(&this, temporary: BorrowedTemporary, depth: i64) -> i64 {
+        return this.moved_fields[temporary.moved_from + depth];
     }
 
     /// The first temporary of the scope at `depth`.
@@ -106,7 +128,10 @@ type struct BorrowedTemporaries {
 
     /// Forget the temporaries from index `first` on, once released.
     forget_from(mut &this, first: i64) -> void {
+        if (first >= this.temporaries.length()) { return; }
+        const kept_paths: i64 = this.temporaries[first].moved_from;
         while (this.temporaries.length() > first) { this.temporaries.pop(); }
+        while (this.moved_fields.length() > kept_paths) { this.moved_fields.pop(); }
     }
 
     length(&this) -> i64 { return this.temporaries.length(); }

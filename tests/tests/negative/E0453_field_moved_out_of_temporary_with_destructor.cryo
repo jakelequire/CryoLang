@@ -1,0 +1,48 @@
+// E0453: a field that is not `Copy` cannot be moved out of a value no
+// binding owns when that value, or a value it is read through, has a
+// destructor.
+//
+// A value no binding owns gives a field up and is released without it when
+// the statement ends, but a destructor runs over its whole value, so a value
+// whose type implements `Drop` is never taken apart - the rule a local of
+// such a type is held to.  Borrowing the field (the control) is allowed: the
+// value is released whole when the statement ends.
+![config(testing)]
+![config(negative, E0453)]
+namespace CryoTests::Negative::FieldMovedOutOfTemporaryWithDestructor;
+
+type struct Res { id: i64; }
+
+implement trait Drop for struct Res {
+    drop(mut &this) -> void { }
+}
+
+type struct Guarded { inner: Res; }
+
+implement trait Drop for struct Guarded {
+    drop(mut &this) -> void { }
+}
+
+type struct Outer { guarded: Guarded; id: i64; }
+
+function guarded() -> Guarded { return Guarded { inner: Res { id: 1 } }; }
+function outer() -> Outer { return Outer { guarded: guarded(), id: 2 }; }
+function take(r: Res) -> i64 { return r.id; }
+function look(r: &Res) -> i64 { return r.id; }
+
+function moved_into_a_binding() -> i64 {
+    const r: Res = guarded().inner;
+    //~^ ERROR[E0453] cannot move field `inner` out of a value that owns a destructor
+    return r.id;
+}
+
+function moved_into_a_call_through_a_field() -> i64 {
+    return take(outer().guarded.inner);
+    //~^ ERROR[E0453] cannot move field `inner` out of a value that owns a destructor
+}
+
+function borrowed() -> i64 {
+    return look(&guarded().inner) + outer().guarded.inner.id;
+}
+
+function main() -> int { return 0; }

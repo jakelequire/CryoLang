@@ -287,10 +287,8 @@ type struct IRGeneratorVisitor {
         const flag_type: LType = LType::i1();
         for (mut i: i64 = this.cg.temporaries.length() - 1; i >= first; i--) {
             const temporary: BorrowedTemporary = this.cg.temporaries.at(i);
-            const release: Stmt* = this.cg.slot_drop_statement(temporary.slot, temporary.ty,
-                name, temporary.span);
             if (temporary.block.raw == start.raw) {
-                this.dispatch_node(Node::Stmt(release));
+                this.release_temporary(temporary, temporary.slot, temporary.ty, 0, name);
                 this.cg.builder.build_store(LType::const_int(flag_type, 0, false), temporary.flag);
                 continue;
             }
@@ -299,10 +297,59 @@ type struct IRGeneratorVisitor {
             const live: LValue = this.cg.builder.build_load(flag_type, temporary.flag, "temporary.live");
             this.cg.builder.build_cond_br(live, live_bb, done_bb);
             this.cg.builder.position_at_end(live_bb);
-            this.dispatch_node(Node::Stmt(release));
+            this.release_temporary(temporary, temporary.slot, temporary.ty, 0, name);
             this.cg.builder.build_store(LType::const_int(flag_type, 0, false), temporary.flag);
             this.cg.flow.branch_if_not_terminated(done_bb);
             this.cg.builder.position_at_end(done_bb);
+        }
+    }
+
+    /// Release the value of type `ty` in `slot`, which is `temporary` or
+    /// the field `depth` positions down the path of the field moved out of
+    /// it.  A value off the path, or a temporary nothing moved out of, is
+    /// released whole; one on it releases every field but the next one on
+    /// the path, which is released the same way; the moved field itself is
+    /// its new owner's and is left alone.  A union's fields are never
+    /// released, so nothing under one is.
+    release_temporary(mut &this, temporary: BorrowedTemporary, slot: LValue, ty: TypeRef,
+                      depth: i64, name: SymbolStr) -> void {
+        if (depth == temporary.moved_count) {
+            if (depth == 0) {
+                this.dispatch_node(Node::Stmt(this.cg.slot_drop_statement(slot, ty, name, temporary.span)));
+            }
+            return;
+        }
+        mut value_type: TypeRef = ty;
+        mut t: Type* = this.cg.arena_type(value_type);
+        while (t != null && t.kind == TypeKind::InstantiatedType && t.as_instantiated().has_resolved_type()) {
+            value_type = t.as_instantiated().resolved_type;
+            t = this.cg.arena_type(value_type);
+        }
+        if (t == null) { return; }
+        mut field_types: [TypeRef] = [];
+        if (t.kind == TypeKind::Tuple) {
+            for (mut i: i64 = 0; i < t.as_tuple().elements.length(); i++) {
+                field_types.push(t.as_tuple().elements[i]);
+            }
+        } else if (t.kind == TypeKind::Struct && !t.as_struct().is_union) {
+            for (mut i: i64 = 0; i < t.as_struct().fields.length(); i++) {
+                field_types.push(t.as_struct().fields[i].field_type);
+            }
+        }
+        const moved_position: i64 = this.cg.temporaries.moved_field(temporary, depth);
+        for (mut i: i64 = 0; i < field_types.length(); i++) {
+            if (!OwnershipQuery::needs_drop(this.cg.get_arena(), this.cg.ctx.generic_registry,
+                    this.cg.get_intern(), field_types[i])) {
+                continue;
+            }
+            const field: Emitted = this.places.codegen_member_access(slot, value_type, true, name,
+                MemberPin::Field(i), false, temporary.span);
+            if (i == moved_position) {
+                this.release_temporary(temporary, field.value, field_types[i], depth + 1, name);
+                continue;
+            }
+            this.dispatch_node(Node::Stmt(this.cg.slot_drop_statement(field.value, field_types[i],
+                name, temporary.span)));
         }
     }
 
@@ -1558,21 +1605,31 @@ type struct IRGeneratorVisitor {
 
 
     visit_member_access(mut &this, e: ExpressionNode*, node: MemberAccessExpr*) -> Emitted {
-        // A `Copy` field read through fields of a value no binding owns -
-        // `make().tag`, `make_outer().inner.tag` - copies the field out and
-        // leaves the value whole, so the value is released when the
-        // statement ends, as a borrowed one is.  A field that is not `Copy`
-        // moves out of it, and the value is not released here.
+        // A field read through fields of a value no binding owns - a call's
+        // result, a struct literal - leaves the value to be released when
+        // the statement ends, as a borrowed one is.  A `Copy` field
+        // (`make().tag`) is copied out of it.  A field that is not `Copy`
+        // and that the value can give up (`make().inner.name`,
+        // `OwnershipQuery::moves_out_of_temporary`) moves out: the value is
+        // released without it, and the field is a value no binding owns in
+        // turn.  One read out of a value with a destructor only borrows the
+        // field - the move check refuses taking it - so the value is
+        // released whole and the read is the field's place.
         mut chain: [ExpressionNode*] = [e];
         mut root: mut ExpressionNode* = node.object;
         while (ExpressionNode::member_access_of(root) != null) {
             chain.push(root);
             root = ExpressionNode::member_access_of(root).object;
         }
-        if (OwnershipQuery::is_owning_temporary(this.cg.get_arena(), this.cg.ctx.generic_registry,
-                    this.cg.get_intern(), root)
+        const copied: boolean = OwnershipQuery::is_owning_temporary(this.cg.get_arena(),
+                    this.cg.ctx.generic_registry, this.cg.get_intern(), root)
                 && OwnershipQuery::is_copy(this.cg.get_arena(), this.cg.ctx.generic_registry,
-                    this.cg.get_intern(), e.resolved_type)) {
+                    this.cg.get_intern(), e.resolved_type);
+        const moved_out: boolean = !copied && OwnershipQuery::moves_out_of_temporary(this.cg.get_arena(),
+            this.cg.ctx.generic_registry, this.cg.get_intern(), e);
+        const borrowed: boolean = !copied && !moved_out && OwnershipQuery::temporary_field_root(
+            this.cg.get_arena(), this.cg.ctx.generic_registry, this.cg.get_intern(), e) != null;
+        if (copied || moved_out || borrowed) {
             const root_e: Emitted = this.dispatch.generate_expression(this, root);
             // A value returned in registers is stored to a slot; one the
             // call wrote through a hidden result pointer is that pointer.
@@ -1583,7 +1640,18 @@ type struct IRGeneratorVisitor {
                 this.cg.builder.build_store(place, slot);
                 place = slot;
             }
-            this.cg.record_borrowed_temporary(root, place);
+            // The moved field's path: each access's field position, from
+            // the value down.
+            mut moved: [i64] = [];
+            if (moved_out) {
+                for (mut i: i64 = chain.length() - 1; i >= 0; i--) {
+                    match (ExpressionNode::member_access_of(chain[i]).resolved_member) {
+                        MemberPin::Field(position) => { moved.push(position); }
+                        _                          => { }
+                    }
+                }
+            }
+            this.cg.record_temporary(root, place, &moved);
             mut is_place: boolean = true;
             for (mut i: i64 = chain.length() - 1; i >= 0; i--) {
                 const step_access: MemberAccessExpr* = ExpressionNode::member_access_of(chain[i]);
@@ -1594,6 +1662,11 @@ type struct IRGeneratorVisitor {
                 is_place = step.is_lvalue;
             }
             mut out: Emitted = Emitted::none();
+            if (borrowed) {
+                out.value = place;
+                out.is_lvalue = is_place;
+                return out;
+            }
             out.value = if (is_place && place.is_valid()) {
                 this.cg.builder.build_load(this.cg.type_mapper.map_type(e.resolved_type), place, "fieldval")
             } else { place };
