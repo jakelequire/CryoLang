@@ -1,0 +1,306 @@
+///! `Logger`, a named area a program logs through, and `Logging`, the
+///! process-wide settings every logger reads: the level for each area and
+///! the sink records go to.
+
+namespace std::log::logger;
+
+import std::core::intrinsics;
+import std::core::marker::{ Sync };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::env;
+import std::fmt::display::{ Debug, Display, Formatter };
+import std::fmt::error::{ FmtError };
+import std::fmt::interp::{ Arguments };
+import std::log::record::{ LogLevel, LogRecord };
+import std::log::sink::{ LogSink, StandardErrorSink };
+import std::sync::atomic::{ Atomic, MemoryOrder };
+import std::sync::mutex::{ Mutex, MutexGuard };
+import std::alloc::allocator::{ GlobalAlloc };
+import std::time::clock::{ SystemTime };
+
+/// A named area of a program, `Logger::new("http")`, that logs records at a
+/// level: `log.warning(f"no route for {path}")`. An f-string message is
+/// formatted only when a sink writes it, so a record the settings refuse
+/// costs one atomic load. A logger is a name and nothing else: copy it, or
+/// keep one in a global.
+public type struct Logger {
+    private area: Str;
+
+    public static new(area: Str) -> Logger {
+        return Logger { area: area };
+    }
+
+    public area(&this) -> Str {
+        return this.area;
+    }
+
+    /// True when the settings let a record at `level` from this logger's
+    /// area through.
+    public is_enabled(&this, level: LogLevel) -> boolean {
+        return Logging::allows(this.area, &level);
+    }
+
+    /// Hand a record to the sink when the settings let it through. The
+    /// record's location is where this call is written.
+    ![caller_location]
+    public log(&this, level: LogLevel, message: Arguments) -> void {
+        if (!Logging::allows(this.area, &level)) {
+            return;
+        }
+        const record: LogRecord = LogRecord {
+            level: level,
+            area: this.area,
+            message: message,
+            location: intrinsics::location(),
+            time: SystemTime::now(),
+        };
+        Logging::write(&record);
+    }
+
+    ![caller_location]
+    public error(&this, message: Arguments) -> void {
+        this.log(LogLevel::Error, message);
+    }
+
+    ![caller_location]
+    public warning(&this, message: Arguments) -> void {
+        this.log(LogLevel::Warning, message);
+    }
+
+    ![caller_location]
+    public information(&this, message: Arguments) -> void {
+        this.log(LogLevel::Information, message);
+    }
+
+    ![caller_location]
+    public debug(&this, message: Arguments) -> void {
+        this.log(LogLevel::Debug, message);
+    }
+
+    ![caller_location]
+    public trace(&this, message: Arguments) -> void {
+        this.log(LogLevel::Trace, message);
+    }
+}
+
+/// A logging specification entry `Logging::configure` could not read.
+public type struct LogSpecificationError with [Eq, Clone, Debug] {
+    /// The entry, as written between commas.
+    public entry: String;
+}
+
+/// `unrecognized logging entry 'http=loud'`.
+implement trait Display for struct LogSpecificationError {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        const entry: Str = this.entry.as_str();
+        return f.write(f"unrecognized logging entry '{entry}'");
+    }
+}
+
+/// The settings behind the lock: the level for records from an area no
+/// entry names, the levels set per area, and the sink set by the program.
+internal type struct LoggingSettings {
+    internal level: LogLevel;
+    internal area_levels: Array<Pair<String, LogLevel>>;
+    internal sink: Option<virtual &LogSink>;
+    internal standard_error: Option<StandardErrorSink>;
+
+    internal static new() -> LoggingSettings {
+        return LoggingSettings {
+            level: LogLevel::Warning,
+            area_levels: Array::new(),
+            sink: Option::None,
+            standard_error: Option::None,
+        };
+    }
+
+    /// The level that applies to `area`: the entry naming the longest
+    /// area that is `area` itself or an area it is below (`http` for
+    /// `http::server`, but not for `https`), or the default level when no
+    /// entry does.
+    internal level_for(&this, area: Str) -> LogLevel {
+        mut best: LogLevel = this.level.clone();
+        mut best_length: i64 = -1;
+        for (mut i: i64 = 0; i < this.area_levels.length(); i++) {
+            const entry: &Pair<String, LogLevel> = &this.area_levels[i];
+            const name: Str = entry.first.as_str();
+            if (name.length() <= best_length || !area.starts_with(&name)) {
+                continue;
+            }
+            const rest: Str = area.sub_bytes(name.length(), area.length());
+            if (rest.length() == 0 || rest.starts_with(&Str::new("::"))) {
+                best = entry.second.clone();
+                best_length = name.length();
+            }
+        }
+        return best;
+    }
+
+    /// The most verbose level any setting lets through, which is the
+    /// threshold a record must be within before the lock is taken at all.
+    internal most_verbose(&this) -> u8 {
+        mut most: u8 = this.level.verbosity();
+        for (mut i: i64 = 0; i < this.area_levels.length(); i++) {
+            const verbosity: u8 = this.area_levels[i].second.verbosity();
+            if (verbosity > most) {
+                most = verbosity;
+            }
+        }
+        return most;
+    }
+}
+
+private const g_settings: Mutex<LoggingSettings> = Mutex::new(LoggingSettings::new());
+private mut g_threshold: Atomic<u8> = Atomic::new(1);
+private mut g_has_area_levels: Atomic<boolean> = Atomic::new(false);
+
+/// The process-wide logging settings. Records at `Warning` and above go to
+/// standard error until a program says otherwise.
+public type struct Logging {
+    /// Let records at `level` and above through, from every area no area
+    /// setting names.
+    public static set_level(level: LogLevel) -> void {
+        mut settings: MutexGuard<LoggingSettings, GlobalAlloc> = g_settings.lock();
+        settings.as_mutable_ptr().level = level;
+        Logging::publish(&settings);
+    }
+
+    /// Let records at `level` and above through from `area` and every area
+    /// below it, replacing an earlier setting for the same area.
+    public static set_area_level(area: Str, level: LogLevel) -> void {
+        mut settings: MutexGuard<LoggingSettings, GlobalAlloc> = g_settings.lock();
+        Logging::store_area_level(&settings, area, level);
+        Logging::publish(&settings);
+    }
+
+    /// Apply a specification of comma-separated entries, each a level name
+    /// (the default level) or `area=level`: `"information,http=debug"`.
+    /// Spaces around an entry and its parts are ignored, and so is an empty
+    /// entry. Nothing is applied when an entry cannot be read; the error
+    /// names the first such entry.
+    public static configure(specification: Str) -> Result<(), LogSpecificationError> {
+        mut default_level: Option<LogLevel> = Option::None;
+        mut area_levels: Array<Pair<Str, LogLevel>> = Array::new();
+        for (piece in specification.split(&Str::new(","))) {
+            const entry: Str = piece.trim();
+            if (entry.length() == 0) {
+                continue;
+            }
+            match (entry.split_once(&Str::new("="))) {
+                Option::Some(parts) => {
+                    const area: Str = parts.first.trim();
+                    match (LogLevel::parse(parts.second.trim())) {
+                        Option::Some(level) => {
+                            if (area.length() == 0) {
+                                return Result::Err(LogSpecificationError { entry: String::from_str(entry) });
+                            }
+                            area_levels.push(Pair::new(area, level));
+                        }
+                        Option::None => {
+                            return Result::Err(LogSpecificationError { entry: String::from_str(entry) });
+                        }
+                    }
+                }
+                Option::None => {
+                    match (LogLevel::parse(entry)) {
+                        Option::Some(level) => { default_level = Option::Some(level); }
+                        Option::None => {
+                            return Result::Err(LogSpecificationError { entry: String::from_str(entry) });
+                        }
+                    }
+                }
+            }
+        }
+        mut settings: MutexGuard<LoggingSettings, GlobalAlloc> = g_settings.lock();
+        match (default_level) {
+            Option::Some(level) => { settings.as_mutable_ptr().level = level; }
+            Option::None => { }
+        }
+        for (mut i: i64 = 0; i < area_levels.length(); i++) {
+            const setting: &Pair<Str, LogLevel> = &area_levels[i];
+            Logging::store_area_level(&settings, setting.first, setting.second.clone());
+        }
+        Logging::publish(&settings);
+        return Result::Ok(());
+    }
+
+    /// `configure` with the value of the environment variable `variable`;
+    /// nothing changes when it is unset.
+    public static configure_from_environment(variable: Str) -> Result<(), LogSpecificationError> {
+        match (env::var(variable)) {
+            Option::Some(specification) => { return Logging::configure(specification.as_str()); }
+            Option::None => { return Result::Ok(()); }
+        }
+    }
+
+    /// Send every record from now on to `sink`, in place of standard error.
+    /// The sink is borrowed, not kept: it must live until the program stops
+    /// logging, as a global or a value `main` holds does. Any thread may log,
+    /// so the sink's type must be `Sync`.
+    public static set_sink<S>(sink: &S) -> void where S: LogSink, S: Sync {
+        mut settings: MutexGuard<LoggingSettings, GlobalAlloc> = g_settings.lock();
+        settings.as_mutable_ptr().sink = Option::Some(sink);
+    }
+
+    /// Send records to standard error again, as before any `set_sink`.
+    public static reset_sink() -> void {
+        mut settings: MutexGuard<LoggingSettings, GlobalAlloc> = g_settings.lock();
+        settings.as_mutable_ptr().sink = Option::None;
+    }
+
+    /// True when the settings let a record at `level` from `area` through:
+    /// one atomic load refuses anything beyond every setting, and the lock
+    /// is taken only when areas have levels of their own.
+    internal static allows(area: Str, level: &LogLevel) -> boolean {
+        if (level.verbosity() > g_threshold.load(MemoryOrder::Acquire)) {
+            return false;
+        }
+        if (!g_has_area_levels.load(MemoryOrder::Acquire)) {
+            return true;
+        }
+        const settings: MutexGuard<LoggingSettings, GlobalAlloc> = g_settings.lock();
+        return settings.as_ptr().level_for(area).allows(level);
+    }
+
+    /// Hand `record` to the sink, under the lock, so records from different
+    /// threads reach it one at a time.
+    internal static write(record: &LogRecord) -> void {
+        mut settings: MutexGuard<LoggingSettings, GlobalAlloc> = g_settings.lock();
+        const held: mut LoggingSettings* = settings.as_mutable_ptr();
+        match (held.sink) {
+            Option::Some(sink) => {
+                sink.write(record);
+                return;
+            }
+            Option::None => { }
+        }
+        if (held.standard_error.is_none()) {
+            held.standard_error = Option::Some(StandardErrorSink::new());
+        }
+        held.standard_error.unwrap_ptr().write(record);
+    }
+
+    private static store_area_level(settings: mut &MutexGuard<LoggingSettings, GlobalAlloc>, area: Str, level: LogLevel) -> void {
+        const held: mut LoggingSettings* = settings.as_mutable_ptr();
+        for (mut i: i64 = 0; i < held.area_levels.length(); i++) {
+            if (held.area_levels[i].first.as_str().equals(&area)) {
+                held.area_levels[i].second = level;
+                return;
+            }
+        }
+        held.area_levels.push(Pair::new(String::from_str(area), level));
+    }
+
+    /// Store the threshold and whether any area has a level of its own, for
+    /// `allows` to read without the lock.
+    private static publish(settings: &MutexGuard<LoggingSettings, GlobalAlloc>) -> void {
+        const held: LoggingSettings* = settings.as_ptr();
+        g_threshold.store(held.most_verbose(), MemoryOrder::Release);
+        g_has_area_levels.store(held.area_levels.length() > 0, MemoryOrder::Release);
+    }
+}
