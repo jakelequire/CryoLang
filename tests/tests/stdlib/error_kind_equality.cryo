@@ -1,0 +1,54 @@
+///! The standard library's fieldless kind and error enums implement `Eq` and
+///! `Clone`. A bare `==` on a fieldless enum needs neither, but an `Option`
+///! or `Result` of one compares only through its contents' `Eq`, and `clone`
+///! is the trait's: an error is tested by its kind, wrapped or not, without
+///! a `match` written for one case.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::ErrorKindEquality;
+
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::core::clone::{ Clone };
+import std::collections::str::{ Str };
+import std::io::error::{ IoError, IoErrorKind, IoOperation };
+import std::fs::{ File };
+import std::fs::path::{ Path };
+import std::net::addr::url::{ Url, UrlError };
+import std::sync::mpsc::{ TryRecvError };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_true };
+
+![test]
+function io_error_kind_compares_and_clones() -> Result<(), TestError> {
+    const kind: IoErrorKind = IoErrorKind::NotFound;
+    expect_true(kind == IoErrorKind::NotFound, "equal kinds")?;
+    expect_true(kind != IoErrorKind::PermissionDenied, "different kinds")?;
+    expect_true(kind.clone() == kind, "a clone is equal")?;
+    return expect_true(IoOperation::Open != IoOperation::Read, "different operations");
+}
+
+![test]
+function an_option_of_a_kind_compares_by_its_contents() -> Result<(), TestError> {
+    const found: Option<IoErrorKind> = Option::Some(IoErrorKind::NotFound);
+    expect_true(found == Option::<IoErrorKind>::Some(IoErrorKind::NotFound), "same kind")?;
+    expect_true(found != Option::<IoErrorKind>::Some(IoErrorKind::TimedOut), "other kind")?;
+    return expect_true(found != Option::<IoErrorKind>::None, "Some is not None");
+}
+
+![test]
+function a_failed_open_is_tested_by_its_kind() -> Result<(), TestError> {
+    match (File::open(Path::new("this file does not exist.txt"))) {
+        Result::Ok(_)      => { return expect_true(false, "opened a file that does not exist"); }
+        Result::Err(error) => { return expect_true(error.kind == IoErrorKind::NotFound, "NotFound"); }
+    }
+}
+
+![test]
+function parse_and_channel_errors_compare() -> Result<(), TestError> {
+    match (Url::parse(Str::new("no scheme here"))) {
+        Result::Ok(_)      => { return expect_true(false, "parsed a URL with no scheme"); }
+        Result::Err(error) => { expect_true(error == UrlError::MissingScheme, "MissingScheme")?; }
+    }
+    return expect_true(TryRecvError::Empty != TryRecvError::Disconnected, "channel errors differ");
+}
