@@ -378,33 +378,93 @@ type struct SemaVisitor {
         this.calls.refuse_unbound_variants();
     }
 
-    /// Check, before any other item of the module, the body of every free
+    /// Check, before any other item of the module, the body of every
     /// function whose opaque return (`-> implement Trait`) its signature left
     /// undecided: the first value it returns decides the type
     /// (`visit_return`), and a caller checked earlier would find the
-    /// function with no return type.  Returns the statement positions of the
-    /// functions checked, which the module's walk then passes over.
+    /// function with no return type.  Such a method of a type that is not
+    /// generic, or of an inherent implementation for one, is checked the
+    /// same way.
+    /// Returns
+    /// the statement positions of the free functions checked, which the
+    /// module's walk then passes over; it passes over such methods by their
+    /// mark (`visit_methods`).
     check_undecided_opaque_returns(mut &this, node: ProgramNode*) -> [i64] {
         mut checked: [i64] = [];
         for (mut i: i64 = 0; i < node.statements.length(); i++) {
             const stmt: Node = node.statements[i];
             const decl: DeclarationNode* = stmt.as_decl();
-            const func: FunctionDecl* = DeclarationNode::fn_of(decl);
-            if (func == null || func.body == null || func.return_type_annotation == null
-                    || func.generic_params.length() > 0) {
-                continue;
+            const st: StructDecl* = DeclarationNode::struct_of(decl);
+            if (st != null && !st.is_generic()) {
+                this.check_undecided_opaque_methods(st.methods,
+                    this.ctx.decl_index.type_of_decl(st.def, "sema/undecided opaque methods"));
             }
-            match (*func.return_type_annotation) {
-                TypeAnnotation::ImplTrait(opaque) => {
-                    if (!opaque.decided_by_body || opaque.resolved.is_valid()) { continue; }
-                }
-                _ => { continue; }
+            const un: UnionDecl* = DeclarationNode::union_of(decl);
+            if (un != null && !un.is_generic()) {
+                this.check_undecided_opaque_methods(un.methods,
+                    this.ctx.decl_index.type_of_decl(un.def, "sema/undecided opaque methods"));
+            }
+            const block: ImplBlock* = DeclarationNode::impl_of(decl);
+            if (block != null && !block.is_trait_impl() && !block.is_template() && !block.is_generic()) {
+                this.check_undecided_opaque_methods(block.methods,
+                    this.ctx.decl_index.impl_owner(block, "sema/undecided opaque methods"));
+            }
+            const func: FunctionDecl* = DeclarationNode::fn_of(decl);
+            if (func == null || func.body == null || !SemaVisitor::opaque_return_decided_by_body(func)) {
+                continue;
             }
             this.state.current_func = null;
             this.dispatch_top_level(stmt);
             checked.push(i);
         }
         return checked;
+    }
+
+    /// Check each of `methods`, of `owner`, whose opaque return its
+    /// signature left undecided, and register it again under `owner` with
+    /// the type its body decided: a method's callers read its registration.
+    /// A trait's method declares no opaque return, so no implementation's
+    /// method has one to decide.
+    check_undecided_opaque_methods(mut &this, methods: &[DeclarationNode*], owner: TypeRef) -> void {
+        const owner_type: Type* = this.arena.lookup(owner);
+        if (owner_type == null || owner_type.kind == TypeKind::InstantiatedType) { return; }
+        for (mut i: i64 = 0; i < methods.length(); i++) {
+            const method: MethodDecl* = DeclarationNode::method_of(methods[i]);
+            if (method == null || method.func == null) { continue; }
+            const func: FunctionDecl* = DeclarationNode::fn_of(method.func);
+            if (func.body == null || func.is_generic() || !SemaVisitor::opaque_return_decided_by_body(func)) {
+                continue;
+            }
+            this.state.current_func = null;
+            this.visit_method(methods[i], owner);
+            match (*func.return_type_annotation) {
+                TypeAnnotation::ImplTrait(opaque) => { opaque.body_checked_first = true; }
+                _ => { }
+            }
+            const decided: [DeclarationNode*] = [methods[i]];
+            this.ctx.decl_index.register_methods(owner, &decided, this.ctx.intern_table, this.arena,
+                "sema/undecided opaque methods");
+        }
+    }
+
+    /// Whether `func`'s signature left its opaque return (`-> implement
+    /// Trait`) for its body to decide.
+    static opaque_return_decided_by_body(func: FunctionDecl*) -> boolean {
+        if (func.return_type_annotation == null) { return false; }
+        return match (*func.return_type_annotation) {
+            TypeAnnotation::ImplTrait(opaque) => { opaque.decided_by_body }
+            _ => { false }
+        };
+    }
+
+    /// Whether `func`'s body was checked before the rest of its module, to
+    /// decide its opaque return.
+    static opaque_return_checked_first(func: FunctionDecl*) -> boolean {
+        if (func.return_type_annotation == null) { return false; }
+        return match (*func.return_type_annotation) {
+            TypeAnnotation::ImplTrait(opaque) => { opaque.body_checked_first }
+            _ => { false }
+        };
     }
 
     /// Give every `async function` in the module its future type before any body
@@ -765,63 +825,73 @@ type struct SemaVisitor {
         this.state.symbolic_impl_node = saved_impl;
     }
 
-    /// Type-check all method bodies in a type or impl block.
+    /// Type-check all method bodies in a type or impl block, but for those
+    /// `check_undecided_opaque_methods` checked first.
     visit_methods(mut &this, methods: &[DeclarationNode*], owner_type: TypeRef) -> void {
         for (mut i: i64 = 0; i < methods.length(); i++) {
-            const method_decl: DeclarationNode* = methods[i];
-            const method: MethodDecl* = DeclarationNode::method_of(method_decl);
-            if (method == null || method.func == null || DeclarationNode::fn_of(method.func).body == null) { continue; }
-            if (DeclarationNode::fn_of(method.func).is_generic()) {
-                const sym_this: TypeRef = if (method.is_static) { TypeRef::invalid() } else { owner_type };
-                // Same shape as the free-function case: the walk types the body,
-                // and an `async` one's state machine is then built from what it
-                // left there.  `begin_body_check` lends the declared Output back
-                // for the walk and is a no-op for anything not a pending `async`
-                // method.
-                const displaced: TypeRef = this.async_lower.begin_body_check(method.func);
-                this.symbolic_check_body(method.func, sym_this, owner_type);
-                this.async_lower.end_body_check(method.func, displaced);
-                if (DeclarationNode::fn_of(method.func).is_async) {
-                    this.async_lower.lower(method.func);
-                }
+            const method: MethodDecl* = DeclarationNode::method_of(methods[i]);
+            if (method != null && method.func != null
+                    && SemaVisitor::opaque_return_checked_first(DeclarationNode::fn_of(method.func))) {
                 continue;
             }
-            // A self-returning trait default (`take -> TakeIter<This>`) and a
-            // method whose return grows its owner (`as_ref -> Option<T*>`)
-            // are instantiated lazily, per call site, so the body is typed the
-            // way a generic body is: symbolically, demanding no instantiation.
-            // An eager walk would demand the adapter over this owner, whose
-            // own impl carries the same default, without end.  The walk still
-            // has to happen: what it leaves on the body - the callee stashes
-            // above all - is what the lazy specialization's clone carries.  A
-            // specialization's copy of such a method is that clone's source
-            // and is never emitted; its body is not substituted, so after
-            // monomorphization it is not walked, like a generic template.
-            if (DeclarationNode::fn_of(method.func).is_self_returning_default || DeclarationNode::fn_of(method.func).is_lazy_self_growing) {
-                const lazy_this: TypeRef = if (method.is_static) { TypeRef::invalid() } else { owner_type };
-                this.symbolic_check_body(method.func, lazy_this, owner_type);
-                continue;
-            }
-            const method_this: TypeRef = if (method.is_static) { TypeRef::invalid() } else { owner_type };
-            const saved_owner: TypeRef = this.state.current_owner_type;
-            const saved_enclosing: TypeRef = this.state.enclosing_type;
-            this.state.current_owner_type = owner_type;
-            this.state.enclosing_type = owner_type;
-            // An `async` method's node already carries its FUTURE type, so
-            // callers typed before it resolve correctly; its own body is still
-            // checked against the declared Output.
-            const displaced: TypeRef = this.async_lower.begin_body_check(method.func);
-            this.enter_function(method.func, method_this);
-            this.visit_block(DeclarationNode::fn_of(method.func).body);
-            this.state.body_count += 1;
-            this.check_function_returns(method.func);
-            this.async_lower.end_body_check(method.func, displaced);
-            // Lower AFTER the body is typed against the declared Output type,
-            // exactly as `visit(FunctionDecl*)` does for a free function.
-            if (DeclarationNode::fn_of(method.func).is_async) { this.async_lower.lower(method.func); }
-            this.state.current_owner_type = saved_owner;
-            this.state.enclosing_type = saved_enclosing;
+            this.visit_method(methods[i], owner_type);
         }
+    }
+
+    /// Type-check the body of `method_decl`, a method of `owner_type`.
+    visit_method(mut &this, method_decl: DeclarationNode*, owner_type: TypeRef) -> void {
+        const method: MethodDecl* = DeclarationNode::method_of(method_decl);
+        if (method == null || method.func == null || DeclarationNode::fn_of(method.func).body == null) { return; }
+        if (DeclarationNode::fn_of(method.func).is_generic()) {
+            const sym_this: TypeRef = if (method.is_static) { TypeRef::invalid() } else { owner_type };
+            // Same shape as the free-function case: the walk types the body,
+            // and an `async` one's state machine is then built from what it
+            // left there.  `begin_body_check` lends the declared Output back
+            // for the walk and is a no-op for anything not a pending `async`
+            // method.
+            const displaced: TypeRef = this.async_lower.begin_body_check(method.func);
+            this.symbolic_check_body(method.func, sym_this, owner_type);
+            this.async_lower.end_body_check(method.func, displaced);
+            if (DeclarationNode::fn_of(method.func).is_async) {
+                this.async_lower.lower(method.func);
+            }
+            return;
+        }
+        // A self-returning trait default (`take -> TakeIter<This>`) and a
+        // method whose return grows its owner (`as_ref -> Option<T*>`)
+        // are instantiated lazily, per call site, so the body is typed the
+        // way a generic body is: symbolically, demanding no instantiation.
+        // An eager walk would demand the adapter over this owner, whose
+        // own impl carries the same default, without end.  The walk still
+        // has to happen: what it leaves on the body - the callee stashes
+        // above all - is what the lazy specialization's clone carries.  A
+        // specialization's copy of such a method is that clone's source
+        // and is never emitted; its body is not substituted, so after
+        // monomorphization it is not walked, like a generic template.
+        if (DeclarationNode::fn_of(method.func).is_self_returning_default || DeclarationNode::fn_of(method.func).is_lazy_self_growing) {
+            const lazy_this: TypeRef = if (method.is_static) { TypeRef::invalid() } else { owner_type };
+            this.symbolic_check_body(method.func, lazy_this, owner_type);
+            return;
+        }
+        const method_this: TypeRef = if (method.is_static) { TypeRef::invalid() } else { owner_type };
+        const saved_owner: TypeRef = this.state.current_owner_type;
+        const saved_enclosing: TypeRef = this.state.enclosing_type;
+        this.state.current_owner_type = owner_type;
+        this.state.enclosing_type = owner_type;
+        // An `async` method's node already carries its FUTURE type, so
+        // callers typed before it resolve correctly; its own body is still
+        // checked against the declared Output.
+        const displaced: TypeRef = this.async_lower.begin_body_check(method.func);
+        this.enter_function(method.func, method_this);
+        this.visit_block(DeclarationNode::fn_of(method.func).body);
+        this.state.body_count += 1;
+        this.check_function_returns(method.func);
+        this.async_lower.end_body_check(method.func, displaced);
+        // Lower AFTER the body is typed against the declared Output type,
+        // exactly as `visit(FunctionDecl*)` does for a free function.
+        if (DeclarationNode::fn_of(method.func).is_async) { this.async_lower.lower(method.func); }
+        this.state.current_owner_type = saved_owner;
+        this.state.enclosing_type = saved_enclosing;
     }
 
     /// Enforce a trait's declaration-site associated-type bounds against this
@@ -1075,13 +1145,14 @@ type struct SemaVisitor {
             }
             const expr_type: TypeRef = this.resolve_expr(node.expression);
             this.state.expected_type = saved_expected;
-            // An opaque return a free function's signature left undecided - a
+            // An opaque return a function's signature left undecided - a
             // generic struct's literal written without type arguments - is
             // the type of the first value its body returns, typed from the
-            // literal's field values.  The function is registered with it
-            // here, which `check_undecided_opaque_returns` makes happen before
-            // any caller in the module is checked; a later `return` is held
-            // to it.
+            // literal's field values.  A free function is registered with it
+            // here, a method by `check_undecided_opaque_methods` once its body
+            // is checked; `check_undecided_opaque_returns` makes either happen
+            // before any caller in the module is checked.  A later `return` is
+            // held to it.
             const current_fn: mut FunctionDecl* = DeclarationNode::fn_of(this.state.current_func);
             if (!declared.is_valid() && expr_type.is_valid() && current_fn != null
                     && current_fn.return_type_annotation != null) {
@@ -1092,7 +1163,9 @@ type struct SemaVisitor {
                             current_fn.resolved_return_type = expr_type;
                             this.state.return_type = expr_type;
                             declared = expr_type;
-                            TypeResolutionPasses::register_decl_in_index(this.state.current_func, this.ctx, true);
+                            if (!this.state.current_owner_type.is_valid()) {
+                                TypeResolutionPasses::register_decl_in_index(this.state.current_func, this.ctx, true);
+                            }
                         }
                     }
                     _ => { }

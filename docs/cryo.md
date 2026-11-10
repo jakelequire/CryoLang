@@ -925,12 +925,18 @@ declaration* it introduces an implement block - the two never overlap.)
 - **Return type** - the concrete type is inferred from the body's first
   `return` expression. That expression must currently be a *struct literal*
   (e.g. `return SliceIter::<T> { ... }`), which is how every standard-library
-  iterator is written.  In a function that is not generic and not a method,
-  a generic struct's literal may leave its type arguments out (`return Gen {
-  f: move () -> i64 { ... } };`): the type is then the instance the literal's
-  field values give it, decided when the function's body is checked, which
-  happens before any other body of its module.  This is the only way to
-  return a value holding a closure, whose type has no spelling.
+  iterator is written.  A generic struct's literal may leave its type
+  arguments out (`return Gen { f: move () -> i64 { ... } };`) in a free
+  function, generic or not, and in a method of a type that is not generic,
+  written in the type or in an `implement struct` block for it: the type is
+  then the instance the literal's field values give it, decided when the
+  function's body is checked, which happens before any other body of its
+  module.  A generic function's is decided in its own parameters
+  (`Holder<T>` for `return Holder { value: value };` with `value: T`), and
+  each specialization returns its arguments' instance.  This is the only
+  way to return a value holding a closure, whose type has no spelling.  A
+  method of a generic type, or of an instance of one, or a method with type
+  parameters of its own, still writes the literal's type arguments.
 - **Variable binding** - `mut it: implement Iterator<i32> = expr;`. The type
   is taken from the initialiser, which is then checked to actually implement
   the named trait; a mismatch is `E0200`:

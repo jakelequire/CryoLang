@@ -1727,14 +1727,28 @@ type struct TypeResolver {
         const concrete: TypeRef = this.type_of_impl_return_expr(ret_expr, res_ctx);
         if (!concrete.is_valid()) { return; }
         // A generic struct's literal written without type arguments names no
-        // instance until its field values are typed, so a free function that
-        // is not generic leaves the type for its body's check to decide from
-        // the value it returns.  A method's or a generic function's body is
-        // not checked at a concrete type before its callers are.
-        if (ExpressionNode::struct_of(ret_expr).generic_args.length() == 0
-                && func.generic_params.length() == 0 && !res_ctx.this_type.is_valid()) {
+        // instance until its field values are typed, so the type is the one
+        // the body's check gives the value returned.  A copy of a checked
+        // body - a generic function's specialization - carries its literal
+        // typed, substituted to the copy's arguments; any other body is
+        // checked later, and its signature leaves the type for that check
+        // to decide (`SemaVisitor.visit_return`), a generic function's in
+        // its own parameters.  A method's of a generic type, of an instance
+        // of one, or of a trait is not checked at a type its callers can
+        // substitute.
+        const owner: Type* = this.arena.lookup(res_ctx.this_type);
+        const concrete_owner: boolean = !res_ctx.this_type.is_valid()
+            || (owner != null && owner.kind != TypeKind::InstantiatedType
+                && !this.arena.contains_generic_param(res_ctx.this_type));
+        if (ExpressionNode::struct_of(ret_expr).generic_args.length() == 0 && concrete_owner) {
             const template: const TemplateEntry* = this.generic_registry.template_of_type(concrete);
             if (template != null && template.kind == TemplateKind::Struct && template.param_types.length() > 0) {
+                const typed: TypeRef = ret_expr.resolved_type;
+                if (typed.is_valid() && !this.arena.contains_generic_param(typed)) {
+                    imp.resolved = typed;
+                    func.resolved_return_type = typed;
+                    return;
+                }
                 imp.decided_by_body = true;
                 return;
             }
