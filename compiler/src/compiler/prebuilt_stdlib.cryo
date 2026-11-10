@@ -240,9 +240,11 @@ type struct PrebuiltStdlib {
     /// built by running the stdlib's own build with this compiler when it
     /// does not.  Builds racing to make one wait on a lock beside it; the
     /// one holding it builds the archive in place, and the archive opens only
-    /// once its manifest, published last, is there.
+    /// once its manifest, published last, is there.  `warnings_as_errors`
+    /// reaches only an archive this call builds: it is not in the key.
     static ensure(stdlib_root_text: string, triple_text: string, opt_level: u32,
-                  debug_info: boolean, unwinds: boolean) -> Result<PrebuiltStdlib, String> {
+                  debug_info: boolean, unwinds: boolean,
+                  warnings_as_errors: boolean) -> Result<PrebuiltStdlib, String> {
         const stdlib_root: string = stdlib_root_text;
         const triple: string = triple_text;
         const key_start: i64 = TimeTrace::now();
@@ -314,7 +316,7 @@ type struct PrebuiltStdlib {
             Option::None => { }
         }
         const failure: String = PrebuiltStdlib::build(stdlib_root, triple, opt_level, debug_info,
-                                                      unwinds, directory);
+                                                      unwinds, warnings_as_errors, directory);
         PrebuiltStdlib::release(lock);
         if (failure.length() > 0) {
             return Result::Err(failure);
@@ -372,7 +374,7 @@ type struct PrebuiltStdlib {
     /// writes the manifest last, so nothing opens the archive before it is
     /// whole.  Answers the failure, or an empty string.
     static build(stdlib_root: string, triple: string, opt_level: u32, debug_info: boolean,
-                 unwinds: boolean, directory: string) -> String {
+                 unwinds: boolean, warnings_as_errors: boolean, directory: string) -> String {
         // An archive directory that does not open was left by a build that
         // died, or by a prune that failed partway: nothing links from it.
         if (Path::from(directory).exists()) {
@@ -396,6 +398,7 @@ type struct PrebuiltStdlib {
         command.arg(Str::new(if (unwinds) { "--panic=unwind" } else { "--panic=abort" }));
         command.arg(Str::new(fmt::format("--target=%s", triple).into_raw()));
         if (debug_info) { command.arg(Str::new("-g")); }
+        if (warnings_as_errors) { command.arg(Str::new("-Werror")); }
         Log::debug(LogArea::Driver, f"building the stdlib archive in {directory}");
         match (command.output()) {
             Result::Ok(result) => {

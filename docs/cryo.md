@@ -5126,6 +5126,7 @@ Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` o
 | `--profile=NAME`      | Build with a named profile (cache under `build/target/NAME/`).                                                                          |
 | `--no-incremental`    | Force a full build: skip the up-to-date short-circuit and the manifest/fingerprint write.                                               |
 | `--locked`            | Verify the `cryoconfig.lock` vendor pins instead of re-resolving them; error if the lock is missing or out of date.                     |
+| `-Werror`             | Report every warning as an error and fail the build on it; a stdlib archive the build has to make is built with it too.                 |
 | `-o`, `--output PATH` | Redirect output for single-file builds; the output kind is inferred from the extension (`.o`, `.s`, `.ll`, or an executable).           |
 
 Test-only flags: `--ignored`, `--list`, `--exact`, `-q` / `--quiet`.

@@ -185,7 +185,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check check-fast lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
+.PHONY: help cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check check-fast lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding warnings-check runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do verify-pin verify-pin-clean incremental-check \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -235,6 +235,9 @@ Tests and gates
                          (into its own directory; installs nothing), and
                          the binary passes its behavioural checks
                          (tools/CryoLSP/tests/smoke.py).
+  make warnings-check    compiler/ and the stdlib build with -Werror under
+                         the compiler under test; DELETES the host's prebuilt
+                         stdlib archives first (into build-logs/).
   make cross-check       runtime, stdlib, compiler and CryoLSP for the other
                          OS's triple, objects only (ARGS=--triple=...).
   make examples          Build every examples/ project.
@@ -737,6 +740,24 @@ lsp-check: $(STAGE2_EXE)
 else
 lsp-check: $(STAGE2)
 	@$(PYTHON) scripts/lsp-gate.py --cryo "$(STAGE2)" $(ARGS)
+endif
+
+# The compiler's own source and the whole stdlib build with no warning.  A
+# stdlib warning is reported only by the build that MAKES the archive, so the
+# host's prebuilt archives are removed first and the compiler under test
+# builds its own with `-Werror`, then builds compiler/ with `-Werror` into
+# build-logs/warnings-check - from inside compiler/, whose cryoconfig names
+# the LLVM libraries relative to it.
+ifeq ($(HOST_OS),windows)
+warnings-check: $(STAGE2_EXE)
+	@if exist "stdlib\.bin\$(HOST_TRIPLE)\prebuilt" rmdir /s /q "stdlib\.bin\$(HOST_TRIPLE)\prebuilt"
+	@cd compiler && "$(STAGE2_EXE)" build --build-dir=$(ROOT)/build-logs/warnings-check --no-incremental -Werror
+	@echo warnings-check: OK -- compiler and stdlib built with -Werror
+else
+warnings-check: $(STAGE2)
+	@rm -rf "stdlib/.bin/$(HOST_TRIPLE)/prebuilt"
+	@cd compiler && "$(STAGE2)" build --build-dir=$(ROOT)/build-logs/warnings-check --no-incremental -Werror
+	@echo "warnings-check: OK -- compiler and stdlib built with -Werror"
 endif
 
 # ---- the other OS's config-gated half ----------------------------------

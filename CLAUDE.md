@@ -36,6 +36,8 @@ make roster-check        # every unit test, project and negative file against th
 make check-fast          # verify's and verify-pin's self-tests + pin integrity, builds nothing.
                          # Run before committing.
 make lsp-check           # compile tools/CryoLSP with the compiler under test
+make warnings-check      # compiler/ + stdlib archive built with -Werror by the compiler
+                         # under test; DELETES the host's prebuilt stdlib archives first
 make cross-check         # runtime/stdlib/compiler/LSP for the OTHER OS, objects only, ~80s;
                          # from WINDOWS only - a Linux host links the windows-gnu
                          # build and fails without mingw + the LLVM-C import lib
@@ -523,9 +525,12 @@ with no diff to check it against.
   manifest, renamed into place last, is there. The archive's build is the
   only build that analyses the stdlib's own bodies, so a warning in the
   stdlib is printed by the build that MAKES the archive and by no other -
-  and is not in that build's own warning count. A clean-build warning check
-  that is meant to cover the stdlib removes `stdlib/.bin/<triple>/prebuilt`
-  first, and reads the output for `warning[`. Its stdlib modules'
+  and is not in that build's own warning count. `make warnings-check` is
+  the clean-build warning gate: it removes `stdlib/.bin/<triple>/prebuilt`
+  and builds compiler/ with `-Werror`, which the archive's build inherits
+  (an archive already built is linked as it is - `-Werror` is not in its
+  key - so a check that does not remove them proves nothing about the
+  stdlib). Its stdlib modules'
   objects hold only the generic instances the archive lacks, and one left
   with nothing writes no object. verify hashes the archives as a third population (`stdlib`); a
   baseline compiler that links none leaves that population empty and its
