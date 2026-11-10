@@ -1,0 +1,891 @@
+///! BTreeMap<K, V, A>: a map kept in key order, built as a B-tree.
+///!
+///!     import std::collections::btree_map::{ BTreeMap };
+///!
+///!     mut ages: BTreeMap<i64, i64> = BTreeMap::new();
+///!     ages.insert(30, 1);
+///!     ages.insert(10, 2);
+///!     ages.insert(20, 3);
+///!     for (entry in ages.entries()) {
+///!         // 10, then 20, then 30
+///!     }
+///!     const smallest: Option<Pair<i64*, i64*>> = ages.first();
+///!
+///! Keys are ordered by `Ord`. Each node holds up to eleven entries side by
+///! side, so a lookup compares against a run of neighbouring keys before it
+///! follows a pointer: a tree of `n` entries is about `log6(n)` nodes deep,
+///! and finding, inserting and removing are O(log n). Every node other than
+///! the root holds at least five entries.
+///!
+///! Iteration runs in ascending key order and from either end: every
+///! iterator here is a `DoubleEndedIterator`, so `.rev()` walks the keys in
+///! descending order. Like `HashMap`'s, an iterator borrows the map's
+///! storage and is invalidated by any insert or remove.
+
+namespace std::collections::btree_map;
+
+import std::core::intrinsics;
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::core::cmp::{ Ord, Ordering };
+import std::core::clone::{ Clone };
+import std::core::default::{ Default };
+import std::core::drop::{ Drop };
+import std::core::iter::{ DoubleEndedIterator, FromIterator, Iterator };
+import std::core::mem;
+import std::core::ptr;
+import std::core::ptr::{ NonNull };
+import std::alloc::layout::{ Layout };
+import std::alloc::allocator::{ AllocError, Allocator, GlobalAlloc };
+import std::collections::pair::{ Pair };
+
+/// Every node other than the root holds at least `MINIMUM_DEGREE - 1`
+/// entries, and every internal one at least `MINIMUM_DEGREE` children.
+private const MINIMUM_DEGREE: i64 = 6;
+/// The most entries a node holds.
+private const NODE_CAPACITY: i64 = 2 * MINIMUM_DEGREE - 1;
+/// The deepest path an iterator records. A tree of depth `d` holds at least
+/// `2 * MINIMUM_DEGREE^(d - 1) - 1` entries, so 32 levels would need more
+/// entries than an `i64` length can count.
+private const MAXIMUM_DEPTH: i64 = 32;
+
+/// One node: `length` entries in key order, and, when it is not a leaf,
+/// `length + 1` children, the subtree at `children[i]` holding the keys
+/// between `keys[i - 1]` and `keys[i]`. Slots past `length` are never
+/// written, so a node is filled and emptied through its pointer only.
+private type struct BTreeNode<K, V> {
+    private length: i64;
+    private leaf: boolean;
+    private keys: [K; NODE_CAPACITY];
+    private values: [V; NODE_CAPACITY];
+    private children: [mut BTreeNode<K, V>*; NODE_CAPACITY + 1];
+
+    /// Where `key` is in this node: the index of the first key not less
+    /// than it, and whether that key is equal to it.
+    private search(&this, key: &K) -> Pair<i64, boolean> where K: Ord {
+        for (mut index: i64 = 0; index < this.length; index++) {
+            const order: Ordering = key.compare(&this.keys[index]);
+            if (order.is_lt()) { return Pair::new(index, false); }
+            if (!order.is_gt()) { return Pair::new(index, true); }
+        }
+        return Pair::new(this.length, false);
+    }
+
+    // The moves below address the slot after `index` as an offset from
+    // `index`'s slot: it may be one past the array, which an index into the
+    // array refuses even when nothing is moved.
+
+    /// Put an entry at `index`, moving the entries from there on one place
+    /// right. The node must have room.
+    private insert_entry(mut &this, index: i64, key: K, value: V) -> void {
+        const moved: u64 = (this.length - index) as u64;
+        mem::copy_overlapping::<K>(mem::offset::<K>(&this.keys[index], 1), &this.keys[index], moved);
+        mem::copy_overlapping::<V>(mem::offset::<V>(&this.values[index], 1), &this.values[index], moved);
+        this.keys[index] = key;
+        this.values[index] = value;
+        this.length += 1;
+    }
+
+    /// Take the entry at `index` out, moving the entries after it one place
+    /// left. Children are left where they are.
+    private remove_entry(mut &this, index: i64) -> Pair<K, V> {
+        mut key: K;
+        mut value: V;
+        // Sound because the slot is overwritten by the move below or falls
+        // past the new length, so the taken values have no other owner.
+        unsafe {
+            key = this.keys[index];
+            value = this.values[index];
+        }
+        const moved: u64 = (this.length - index - 1) as u64;
+        mem::copy_overlapping::<K>(&this.keys[index], mem::offset::<K>(&this.keys[index], 1), moved);
+        mem::copy_overlapping::<V>(&this.values[index], mem::offset::<V>(&this.values[index], 1), moved);
+        this.length -= 1;
+        return Pair::new(key, value);
+    }
+
+    /// Put `key` and `value` in the slot at `index` and hand back what it
+    /// held.
+    private replace_entry(mut &this, index: i64, key: K, value: V) -> Pair<K, V> {
+        mut old_key: K;
+        mut old_value: V;
+        // Sound because the slot is overwritten on the next lines.
+        unsafe {
+            old_key = this.keys[index];
+            old_value = this.values[index];
+        }
+        this.keys[index] = key;
+        this.values[index] = value;
+        return Pair::new(old_key, old_value);
+    }
+
+    /// Put `child` at `index`, moving the children from there on one place
+    /// right. Called before the entry that goes with it is inserted, while
+    /// the node still has `length + 1` children.
+    private insert_child(mut &this, index: i64, child: mut BTreeNode<K, V>*) -> void {
+        const moved: u64 = (this.length + 1 - index) as u64;
+        mem::copy_overlapping::<mut BTreeNode<K, V>*>(mem::offset::<mut BTreeNode<K, V>*>(&this.children[index], 1), &this.children[index], moved);
+        this.children[index] = child;
+    }
+
+    /// Take the child at `index` out, moving the children after it one
+    /// place left. Called before the entry that goes with it is removed.
+    private remove_child(mut &this, index: i64) -> mut BTreeNode<K, V>* {
+        const child: mut BTreeNode<K, V>* = this.children[index];
+        const moved: u64 = (this.length - index) as u64;
+        mem::copy_overlapping::<mut BTreeNode<K, V>*>(&this.children[index], mem::offset::<mut BTreeNode<K, V>*>(&this.children[index], 1), moved);
+        return child;
+    }
+
+    /// Append `key` and `value`, then every entry and child of `other`.
+    /// `other` is left holding nothing it owns.
+    private append(mut &this, key: K, value: V, other: mut BTreeNode<K, V>*) -> void {
+        this.keys[this.length] = key;
+        this.values[this.length] = value;
+        this.length += 1;
+        mem::copy::<K>(&this.keys[this.length], &other.keys[0], other.length as u64);
+        mem::copy::<V>(&this.values[this.length], &other.values[0], other.length as u64);
+        if (!this.leaf) {
+            mem::copy::<mut BTreeNode<K, V>*>(&this.children[this.length], &other.children[0], (other.length + 1) as u64);
+        }
+        this.length += other.length;
+        other.length = 0;
+    }
+}
+
+/// Which entry a removal descends towards.
+private type enum RemovalTarget<K> {
+    /// The entry whose key equals this one.
+    Key(K*);
+    /// The entry with the smallest key.
+    First;
+    /// The entry with the greatest key.
+    Last;
+}
+
+/// Where a key is, or where it would be inserted: an entry of `node` when
+/// `found`, otherwise the slot at `index` of the leaf `node`.
+private type struct KeyPosition<K, V> {
+    private node: mut BTreeNode<K, V>*;
+    private index: i64;
+    private found: boolean;
+}
+
+public type struct BTreeMap<K, V, A = GlobalAlloc> where A: Allocator {
+    /// Null while the map is empty.
+    private root: mut BTreeNode<K, V>*;
+    private length: i64;
+    private alloc: A;
+
+    /// An empty map backed by `GlobalAlloc`. Allocates nothing until the
+    /// first insert.
+    public static new() -> BTreeMap<K, V, GlobalAlloc> {
+        return BTreeMap::<K, V, GlobalAlloc> { root: null, length: 0, alloc: GlobalAlloc::new() };
+    }
+
+    /// An empty map that allocates through `alloc`.
+    public static new_in(alloc: A) -> BTreeMap<K, V, A> {
+        return BTreeMap::<K, V, A> { root: null, length: 0, alloc: alloc };
+    }
+
+    public length(&this) -> i64 {
+        return this.length;
+    }
+
+    public is_empty(&this) -> boolean {
+        return this.length == 0;
+    }
+
+    public contains_key(&this, key: &K) -> boolean where K: Ord {
+        return this.get_ref(key).is_some();
+    }
+
+    /// A copy of the value for `key`, or `None` when the key is absent.
+    public get(&this, key: &K) -> Option<V> where K: Ord, V: Copy {
+        match (this.get_ref(key)) {
+            Option::Some(value) => { return Option::Some(*value); }
+            Option::None => { return Option::None; }
+        }
+    }
+
+    /// A read-only borrow of the value for `key`, or `None` when the key is
+    /// absent. Valid until the next insert or remove.
+    public get_ref(&this, key: &K) -> Option<V*> where K: Ord {
+        mut node: mut BTreeNode<K, V>* = this.root;
+        while (node != null) {
+            const position: Pair<i64, boolean> = node.search(key);
+            if (position.second) { return Option::Some(&node.values[position.first]); }
+            if (node.leaf) { return Option::None; }
+            node = node.children[position.first];
+        }
+        return Option::None;
+    }
+
+    /// A writable borrow of the value for `key`, or `None` when the key is
+    /// absent. Valid until the next insert or remove.
+    public get_mutable(mut &this, key: &K) -> Option<mut V*> where K: Ord {
+        mut node: mut BTreeNode<K, V>* = this.root;
+        while (node != null) {
+            const position: Pair<i64, boolean> = node.search(key);
+            if (position.second) { return Option::Some(&node.values[position.first]); }
+            if (node.leaf) { return Option::None; }
+            node = node.children[position.first];
+        }
+        return Option::None;
+    }
+
+    /// Insert `key -> value`. Returns the previous value if the key was
+    /// present, otherwise `None`; a present key keeps the key it was
+    /// inserted with. Panics on allocation failure; use `try_insert` to
+    /// recover from it.
+    public insert(mut &this, key: K, value: V) -> Option<V> where K: Ord {
+        match (this.try_insert(key, value)) {
+            Result::Ok(previous) => { return previous; }
+            Result::Err(_) => { core::panic("BTreeMap::insert: allocation failed", intrinsics::location()); }
+        }
+    }
+
+    /// `insert` that returns `Err(AllocError)` instead of panicking when a
+    /// node cannot be allocated. The map is unchanged by a failed insert.
+    public try_insert(mut &this, key: K, value: V) -> Result<Option<V>, AllocError> where K: Ord {
+        const position: KeyPosition<K, V> = this.find_or_make_room(&key)?;
+        if (position.found) {
+            mut previous: V;
+            // Sound because the slot is overwritten on the next line.
+            unsafe { previous = position.node.values[position.index]; }
+            position.node.values[position.index] = value;
+            return Result::Ok(Option::Some(previous));
+        }
+        position.node.insert_entry(position.index, key, value);
+        this.length += 1;
+        return Result::Ok(Option::None);
+    }
+
+    /// Borrow the value for `key`, inserting `default` first if the key is
+    /// absent: one descent, unlike `get_ref` then `insert`. When the key is
+    /// present, `key` and `default` are released. Panics on allocation
+    /// failure.
+    public get_or_insert(mut &this, key: K, default: V) -> mut V* where K: Ord {
+        match (this.try_get_or_insert(key, default)) {
+            Result::Ok(value) => { return value; }
+            Result::Err(_) => { core::panic("BTreeMap::get_or_insert: allocation failed", intrinsics::location()); }
+        }
+    }
+
+    /// `get_or_insert` that returns `Err(AllocError)` instead of panicking
+    /// when a node cannot be allocated.
+    public try_get_or_insert(mut &this, key: K, default: V) -> Result<mut V*, AllocError> where K: Ord {
+        const position: KeyPosition<K, V> = this.find_or_make_room(&key)?;
+        if (!position.found) {
+            position.node.insert_entry(position.index, key, default);
+            this.length += 1;
+        }
+        return Result::Ok(&position.node.values[position.index]);
+    }
+
+    /// Remove the entry for `key`. Returns its value, or `None` when the key
+    /// was absent; the stored key is released.
+    public remove(mut &this, key: &K) -> Option<V> where K: Ord {
+        match (this.remove_from(this.root, RemovalTarget::Key(key))) {
+            Option::Some(entry) => {
+                const { first: _, second: value }: Pair<K, V> = entry;
+                return Option::Some(value);
+            }
+            Option::None => { return Option::None; }
+        }
+    }
+
+    /// Remove the entry for `key` and hand back both its key and its value,
+    /// or `None` when the key was absent.
+    public remove_entry(mut &this, key: &K) -> Option<Pair<K, V>> where K: Ord {
+        return this.remove_from(this.root, RemovalTarget::Key(key));
+    }
+
+    /// The entry with the smallest key, or `None` when empty.
+    public first(&this) -> Option<Pair<K*, V*>> {
+        if (this.root == null) { return Option::None; }
+        mut node: mut BTreeNode<K, V>* = this.root;
+        while (!node.leaf) { node = node.children[0]; }
+        return Option::Some(Pair::<K*, V*> { first: &node.keys[0], second: &node.values[0] });
+    }
+
+    /// The entry with the greatest key, or `None` when empty.
+    public last(&this) -> Option<Pair<K*, V*>> {
+        if (this.root == null) { return Option::None; }
+        mut node: mut BTreeNode<K, V>* = this.root;
+        while (!node.leaf) { node = node.children[node.length]; }
+        const index: i64 = node.length - 1;
+        return Option::Some(Pair::<K*, V*> { first: &node.keys[index], second: &node.values[index] });
+    }
+
+    /// Remove and return the entry with the smallest key, or `None` when
+    /// empty.
+    public pop_first(mut &this) -> Option<Pair<K, V>> where K: Ord {
+        return this.remove_from(this.root, RemovalTarget::First);
+    }
+
+    /// Remove and return the entry with the greatest key, or `None` when
+    /// empty.
+    public pop_last(mut &this) -> Option<Pair<K, V>> where K: Ord {
+        return this.remove_from(this.root, RemovalTarget::Last);
+    }
+
+    /// Release every entry and every node.
+    public clear(mut &this) -> void {
+        if (this.root != null) {
+            this.release_subtree(this.root);
+            this.root = null;
+        }
+        this.length = 0;
+    }
+
+    /// Every entry by value, in ascending key order. Gated on `K: Copy` and
+    /// `V: Copy`: the pairs are bit copies of the stored entries, which for
+    /// an owning key or value would be released twice. `entries` walks any
+    /// map by borrow.
+    public iter(&this) -> implement Iterator<Pair<K, V>> + DoubleEndedIterator where K: Copy, V: Copy {
+        return BTreeMapIter::<K, V> { cursor: BTreeCursor::new(this.root, this.length) };
+    }
+
+    /// Every key by value, in ascending order. Gated on `K: Copy`, as
+    /// `iter` is.
+    public keys(&this) -> implement Iterator<K> + DoubleEndedIterator where K: Copy {
+        return KeysIter::<K, V> { cursor: BTreeCursor::new(this.root, this.length) };
+    }
+
+    /// Every value by value, in ascending key order. Gated on `V: Copy`, as
+    /// `iter` is.
+    public values(&this) -> implement Iterator<V> + DoubleEndedIterator where V: Copy {
+        return ValuesIter::<K, V> { cursor: BTreeCursor::new(this.root, this.length) };
+    }
+
+    /// Every entry as a borrowed key and value, in ascending key order:
+    /// sound for any `K` and `V`, owning or not.
+    public entries(&this) -> implement Iterator<Pair<K*, V*>> + DoubleEndedIterator {
+        return EntriesIter::<K, V> { cursor: BTreeCursor::new(this.root, this.length) };
+    }
+
+    /// Every key by borrow, in ascending order.
+    public keys_ref(&this) -> implement Iterator<K*> + DoubleEndedIterator {
+        return KeysRefIter::<K, V> { cursor: BTreeCursor::new(this.root, this.length) };
+    }
+
+    /// Every value by borrow, in ascending key order.
+    public values_ref(&this) -> implement Iterator<V*> + DoubleEndedIterator {
+        return ValuesRefIter::<K, V> { cursor: BTreeCursor::new(this.root, this.length) };
+    }
+
+    /// Every value by writable borrow, in ascending key order: the way to
+    /// change owning values in place.
+    public values_mutable(mut &this) -> implement Iterator<mut V*> + DoubleEndedIterator {
+        return ValuesMutableIter::<K, V> { cursor: BTreeCursor::new(this.root, this.length) };
+    }
+
+    /// Descend to `key`, splitting every full node on the way so that the
+    /// leaf an insert ends in has room. Answers where the key is, or the
+    /// leaf slot it belongs in. A failed allocation leaves a valid tree:
+    /// every split made before it is complete.
+    private find_or_make_room(mut &this, key: &K) -> Result<KeyPosition<K, V>, AllocError> where K: Ord {
+        if (this.root == null) {
+            this.root = this.allocate_node(true)?;
+        } else if (this.root.length == NODE_CAPACITY) {
+            const new_root: mut BTreeNode<K, V>* = this.allocate_node(false)?;
+            match (this.allocate_node(this.root.leaf)) {
+                Result::Ok(sibling) => {
+                    new_root.children[0] = this.root;
+                    this.root = new_root;
+                    this.split_child(new_root, 0, sibling);
+                }
+                Result::Err(error) => {
+                    this.free_node(new_root);
+                    return Result::Err(error);
+                }
+            }
+        }
+        mut node: mut BTreeNode<K, V>* = this.root;
+        loop {
+            const position: Pair<i64, boolean> = node.search(key);
+            mut index: i64 = position.first;
+            if (position.second || node.leaf) {
+                return Result::Ok(KeyPosition::<K, V> { node: node, index: index, found: position.second });
+            }
+            if (node.children[index].length == NODE_CAPACITY) {
+                const sibling: mut BTreeNode<K, V>* = this.allocate_node(node.children[index].leaf)?;
+                this.split_child(node, index, sibling);
+                const order: Ordering = key.compare(&node.keys[index]);
+                if (!order.is_lt() && !order.is_gt()) {
+                    return Result::Ok(KeyPosition::<K, V> { node: node, index: index, found: true });
+                }
+                if (order.is_gt()) { index += 1; }
+            }
+            node = node.children[index];
+        }
+    }
+
+    /// Split the full child at `index` of `parent` around its middle entry,
+    /// which moves up into `parent`; the upper half moves to `sibling`, an
+    /// empty node of the same kind. `parent` must have room.
+    private split_child(mut &this, parent: mut BTreeNode<K, V>*, index: i64, sibling: mut BTreeNode<K, V>*) -> void {
+        const full: mut BTreeNode<K, V>* = parent.children[index];
+        const kept: i64 = MINIMUM_DEGREE - 1;
+        mem::copy::<K>(&sibling.keys[0], &full.keys[MINIMUM_DEGREE], kept as u64);
+        mem::copy::<V>(&sibling.values[0], &full.values[MINIMUM_DEGREE], kept as u64);
+        if (!full.leaf) {
+            mem::copy::<mut BTreeNode<K, V>*>(&sibling.children[0], &full.children[MINIMUM_DEGREE], MINIMUM_DEGREE as u64);
+        }
+        sibling.length = kept;
+        full.length = MINIMUM_DEGREE;
+        const middle: Pair<K, V> = full.remove_entry(kept);
+        const { first: key, second: value }: Pair<K, V> = middle;
+        parent.insert_child(index + 1, sibling);
+        parent.insert_entry(index, key, value);
+    }
+
+    /// Remove the entry `target` names from the subtree at `start`. Every
+    /// node the descent enters below the root is first given at least
+    /// `MINIMUM_DEGREE` entries, by borrowing from a sibling or merging with
+    /// one, so taking an entry out of a leaf never leaves it short.
+    private remove_from(mut &this, start: mut BTreeNode<K, V>*, target: RemovalTarget<K>) -> Option<Pair<K, V>> where K: Ord {
+        if (start == null) { return Option::None; }
+        mut node: mut BTreeNode<K, V>* = start;
+        loop {
+            mut index: i64 = 0;
+            mut found: boolean = false;
+            match (target) {
+                RemovalTarget::Key(key) => {
+                    const position: Pair<i64, boolean> = node.search(key);
+                    index = position.first;
+                    found = position.second;
+                }
+                RemovalTarget::First => {
+                    found = node.leaf;
+                }
+                RemovalTarget::Last => {
+                    found = node.leaf;
+                    index = node.length;
+                    if (found) { index -= 1; }
+                }
+            }
+            if (found && node.leaf) {
+                const entry: Pair<K, V> = node.remove_entry(index);
+                this.length -= 1;
+                if (this.root.length == 0) {
+                    this.free_node(this.root);
+                    this.root = null;
+                }
+                return Option::Some(entry);
+            }
+            if (found) {
+                // An internal node's entry is replaced by its neighbour in key
+                // order, taken from a child that can spare one; when neither
+                // can, the two children merge around it and the descent goes
+                // on into the merged node.
+                const left: mut BTreeNode<K, V>* = node.children[index];
+                const right: mut BTreeNode<K, V>* = node.children[index + 1];
+                if (left.length >= MINIMUM_DEGREE || right.length >= MINIMUM_DEGREE) {
+                    mut neighbour: Option<Pair<K, V>> = Option::None;
+                    if (left.length >= MINIMUM_DEGREE) {
+                        neighbour = this.remove_from(left, RemovalTarget::Last);
+                    } else {
+                        neighbour = this.remove_from(right, RemovalTarget::First);
+                    }
+                    const { first: key, second: value }: Pair<K, V> = neighbour.unwrap();
+                    return Option::Some(node.replace_entry(index, key, value));
+                }
+                this.merge_children(node, index);
+                node = this.descend_after_merge(node, index);
+                continue;
+            }
+            if (node.leaf) { return Option::None; }
+            const child: mut BTreeNode<K, V>* = node.children[index];
+            if (child.length >= MINIMUM_DEGREE) {
+                node = child;
+                continue;
+            }
+            if (index > 0 && node.children[index - 1].length >= MINIMUM_DEGREE) {
+                this.borrow_from_left(node, index);
+                node = child;
+                continue;
+            }
+            if (index < node.length && node.children[index + 1].length >= MINIMUM_DEGREE) {
+                this.borrow_from_right(node, index);
+                node = child;
+                continue;
+            }
+            if (index == node.length) { index -= 1; }
+            this.merge_children(node, index);
+            node = this.descend_after_merge(node, index);
+        }
+    }
+
+    /// The node to go on into once `node`'s children at `index` and
+    /// `index + 1` have merged. A root left with no entries gives way to
+    /// the merged child.
+    private descend_after_merge(mut &this, node: mut BTreeNode<K, V>*, index: i64) -> mut BTreeNode<K, V>* {
+        const merged: mut BTreeNode<K, V>* = node.children[index];
+        if (node == this.root && node.length == 0) {
+            this.root = merged;
+            this.free_node(node);
+        }
+        return merged;
+    }
+
+    /// Move the last entry of the child left of `index` up into `parent`,
+    /// and `parent`'s entry between the two down to the front of the child
+    /// at `index`, with the left child's last subtree.
+    private borrow_from_left(mut &this, parent: mut BTreeNode<K, V>*, index: i64) -> void {
+        const child: mut BTreeNode<K, V>* = parent.children[index];
+        const left: mut BTreeNode<K, V>* = parent.children[index - 1];
+        mut moved_child: mut BTreeNode<K, V>* = null;
+        if (!left.leaf) { moved_child = left.children[left.length]; }
+        const { first: left_key, second: left_value }: Pair<K, V> = left.remove_entry(left.length - 1);
+        const { first: key, second: value }: Pair<K, V> = parent.replace_entry(index - 1, left_key, left_value);
+        if (!child.leaf) { child.insert_child(0, moved_child); }
+        child.insert_entry(0, key, value);
+    }
+
+    /// Move the first entry of the child right of `index` up into `parent`,
+    /// and `parent`'s entry between the two down to the end of the child at
+    /// `index`, with the right child's first subtree.
+    private borrow_from_right(mut &this, parent: mut BTreeNode<K, V>*, index: i64) -> void {
+        const child: mut BTreeNode<K, V>* = parent.children[index];
+        const right: mut BTreeNode<K, V>* = parent.children[index + 1];
+        mut moved_child: mut BTreeNode<K, V>* = null;
+        if (!right.leaf) { moved_child = right.remove_child(0); }
+        const { first: right_key, second: right_value }: Pair<K, V> = right.remove_entry(0);
+        const { first: key, second: value }: Pair<K, V> = parent.replace_entry(index, right_key, right_value);
+        if (!child.leaf) { child.insert_child(child.length + 1, moved_child); }
+        child.insert_entry(child.length, key, value);
+    }
+
+    /// Merge the children of `parent` at `index` and `index + 1`, around the
+    /// entry between them, into the first; the second is freed.
+    private merge_children(mut &this, parent: mut BTreeNode<K, V>*, index: i64) -> void {
+        const left: mut BTreeNode<K, V>* = parent.children[index];
+        const right: mut BTreeNode<K, V>* = parent.remove_child(index + 1);
+        const { first: key, second: value }: Pair<K, V> = parent.remove_entry(index);
+        left.append(key, value, right);
+        this.free_node(right);
+    }
+
+    private allocate_node(mut &this, leaf: boolean) -> Result<mut BTreeNode<K, V>*, AllocError> {
+        const raw: NonNull<u8> = this.alloc.allocate(Layout::of::<BTreeNode<K, V>>())?;
+        const node: mut BTreeNode<K, V>* = raw.cast::<BTreeNode<K, V>>().as_ptr();
+        node.length = 0;
+        node.leaf = leaf;
+        return Result::Ok(node);
+    }
+
+    /// Free a node's storage without releasing its entries.
+    private free_node(mut &this, node: mut BTreeNode<K, V>*) -> void {
+        this.alloc.deallocate(NonNull::new(node).cast::<u8>(), Layout::of::<BTreeNode<K, V>>());
+    }
+
+    /// Release every entry below and in `node`, and free the nodes.
+    private release_subtree(mut &this, node: mut BTreeNode<K, V>*) -> void {
+        if (!node.leaf) {
+            for (mut index: i64 = 0; index <= node.length; index++) {
+                this.release_subtree(node.children[index]);
+            }
+        }
+        for (mut index: i64 = 0; index < node.length; index++) {
+            ptr::drop_in_place::<K>(&node.keys[index]);
+            ptr::drop_in_place::<V>(&node.values[index]);
+        }
+        this.free_node(node);
+    }
+}
+
+/// An in-order walk over a map's entries from both ends. Each end keeps the
+/// path from the root to its next entry: a frame `(node, index)` at the
+/// front means the next entry is `node`'s entry `index`, or, past the last
+/// one, the next frame up; at the back it means entry `index - 1`. The two
+/// ends stop when `remaining` entries have been handed out between them.
+internal type struct BTreeCursor<K, V> {
+    private front_nodes: [mut BTreeNode<K, V>*; MAXIMUM_DEPTH];
+    private front_indexes: [i64; MAXIMUM_DEPTH];
+    private front_depth: i64;
+    private back_nodes: [mut BTreeNode<K, V>*; MAXIMUM_DEPTH];
+    private back_indexes: [i64; MAXIMUM_DEPTH];
+    private back_depth: i64;
+    private remaining: i64;
+
+    private static new(root: mut BTreeNode<K, V>*, length: i64) -> BTreeCursor<K, V> {
+        mut cursor: BTreeCursor<K, V> = BTreeCursor::<K, V> {
+            front_nodes: [null; MAXIMUM_DEPTH],
+            front_indexes: [0; MAXIMUM_DEPTH],
+            front_depth: 0,
+            back_nodes: [null; MAXIMUM_DEPTH],
+            back_indexes: [0; MAXIMUM_DEPTH],
+            back_depth: 0,
+            remaining: length
+        };
+        if (root != null) {
+            cursor.push_leftmost(root);
+            cursor.push_rightmost(root);
+        }
+        return cursor;
+    }
+
+    /// The next entry from the front, as the node holding it and its index.
+    private next_front(mut &this) -> Option<Pair<mut BTreeNode<K, V>*, i64>> {
+        if (this.remaining == 0) { return Option::None; }
+        loop {
+            const top: i64 = this.front_depth - 1;
+            const node: mut BTreeNode<K, V>* = this.front_nodes[top];
+            const index: i64 = this.front_indexes[top];
+            if (index < node.length) {
+                this.front_indexes[top] = index + 1;
+                if (!node.leaf) { this.push_leftmost(node.children[index + 1]); }
+                this.remaining -= 1;
+                return Option::Some(Pair::new(node, index));
+            }
+            this.front_depth -= 1;
+        }
+    }
+
+    /// The next entry from the back, as the node holding it and its index.
+    private next_back(mut &this) -> Option<Pair<mut BTreeNode<K, V>*, i64>> {
+        if (this.remaining == 0) { return Option::None; }
+        loop {
+            const top: i64 = this.back_depth - 1;
+            const node: mut BTreeNode<K, V>* = this.back_nodes[top];
+            const index: i64 = this.back_indexes[top];
+            if (index > 0) {
+                this.back_indexes[top] = index - 1;
+                if (!node.leaf) { this.push_rightmost(node.children[index - 1]); }
+                this.remaining -= 1;
+                return Option::Some(Pair::new(node, index - 1));
+            }
+            this.back_depth -= 1;
+        }
+    }
+
+    /// Record the path from `node` down its first children to a leaf.
+    private push_leftmost(mut &this, start: mut BTreeNode<K, V>*) -> void {
+        mut node: mut BTreeNode<K, V>* = start;
+        loop {
+            this.front_nodes[this.front_depth] = node;
+            this.front_indexes[this.front_depth] = 0;
+            this.front_depth += 1;
+            if (node.leaf) { return; }
+            node = node.children[0];
+        }
+    }
+
+    /// Record the path from `node` down its last children to a leaf.
+    private push_rightmost(mut &this, start: mut BTreeNode<K, V>*) -> void {
+        mut node: mut BTreeNode<K, V>* = start;
+        loop {
+            this.back_nodes[this.back_depth] = node;
+            this.back_indexes[this.back_depth] = node.length;
+            this.back_depth += 1;
+            if (node.leaf) { return; }
+            node = node.children[node.length];
+        }
+    }
+}
+
+// The iterators below are produced only as the opaque iterators the map's
+// methods return. Each projects the cursor's entries to what it yields.
+// `KeysIter` and `KeysRefIter` are `internal` because `BTreeSet` wraps them.
+
+private type struct BTreeMapIter<K, V> {
+    private cursor: BTreeCursor<K, V>;
+}
+
+implement<K, V> trait Iterator<Pair<K, V>> for struct BTreeMapIter<K, V> where K: Copy, V: Copy {
+    next(mut &this) -> Option<Pair<K, V>> {
+        match (this.cursor.next_front()) {
+            Option::Some(at) => { return Option::Some(Pair::new(at.first.keys[at.second], at.first.values[at.second])); }
+            Option::None => { return Option::None; }
+        }
+    }
+}
+
+implement<K, V> trait DoubleEndedIterator for struct BTreeMapIter<K, V> where K: Copy, V: Copy {
+    next_back(mut &this) -> Option<Pair<K, V>> {
+        match (this.cursor.next_back()) {
+            Option::Some(at) => { return Option::Some(Pair::new(at.first.keys[at.second], at.first.values[at.second])); }
+            Option::None => { return Option::None; }
+        }
+    }
+}
+
+internal type struct KeysIter<K, V> {
+    private cursor: BTreeCursor<K, V>;
+
+    internal static over<A>(map: &BTreeMap<K, V, A>) -> KeysIter<K, V> where A: Allocator {
+        return KeysIter::<K, V> { cursor: BTreeCursor::new(map.root, map.length) };
+    }
+}
+
+implement<K, V> trait Iterator<K> for struct KeysIter<K, V> where K: Copy {
+    next(mut &this) -> Option<K> {
+        match (this.cursor.next_front()) {
+            Option::Some(at) => { return Option::Some(at.first.keys[at.second]); }
+            Option::None => { return Option::None; }
+        }
+    }
+}
+
+implement<K, V> trait DoubleEndedIterator for struct KeysIter<K, V> where K: Copy {
+    next_back(mut &this) -> Option<K> {
+        match (this.cursor.next_back()) {
+            Option::Some(at) => { return Option::Some(at.first.keys[at.second]); }
+            Option::None => { return Option::None; }
+        }
+    }
+}
+
+private type struct ValuesIter<K, V> {
+    private cursor: BTreeCursor<K, V>;
+}
+
+implement<K, V> trait Iterator<V> for struct ValuesIter<K, V> where V: Copy {
+    next(mut &this) -> Option<V> {
+        match (this.cursor.next_front()) {
+            Option::Some(at) => { return Option::Some(at.first.values[at.second]); }
+            Option::None => { return Option::None; }
+        }
+    }
+}
+
+implement<K, V> trait DoubleEndedIterator for struct ValuesIter<K, V> where V: Copy {
+    next_back(mut &this) -> Option<V> {
+        match (this.cursor.next_back()) {
+            Option::Some(at) => { return Option::Some(at.first.values[at.second]); }
+            Option::None => { return Option::None; }
+        }
+    }
+}
+
+private type struct EntriesIter<K, V> {
+    private cursor: BTreeCursor<K, V>;
+}
+
+implement<K, V> trait Iterator<Pair<K*, V*>> for struct EntriesIter<K, V> {
+    next(mut &this) -> Option<Pair<K*, V*>> {
+        match (this.cursor.next_front()) {
+            Option::Some(at) => { return Option::Some(Pair::<K*, V*> { first: &at.first.keys[at.second], second: &at.first.values[at.second] }); }
+            Option::None => { return Option::None; }
+        }
+    }
+}
+
+implement<K, V> trait DoubleEndedIterator for struct EntriesIter<K, V> {
+    next_back(mut &this) -> Option<Pair<K*, V*>> {
+        match (this.cursor.next_back()) {
+            Option::Some(at) => { return Option::Some(Pair::<K*, V*> { first: &at.first.keys[at.second], second: &at.first.values[at.second] }); }
+            Option::None => { return Option::None; }
+        }
+    }
+}
+
+internal type struct KeysRefIter<K, V> {
+    private cursor: BTreeCursor<K, V>;
+
+    internal static over<A>(map: &BTreeMap<K, V, A>) -> KeysRefIter<K, V> where A: Allocator {
+        return KeysRefIter::<K, V> { cursor: BTreeCursor::new(map.root, map.length) };
+    }
+}
+
+implement<K, V> trait Iterator<K*> for struct KeysRefIter<K, V> {
+    next(mut &this) -> Option<K*> {
+        match (this.cursor.next_front()) {
+            Option::Some(at) => { return Option::Some(&at.first.keys[at.second]); }
+            Option::None => { return Option::None; }
+        }
+    }
+}
+
+implement<K, V> trait DoubleEndedIterator for struct KeysRefIter<K, V> {
+    next_back(mut &this) -> Option<K*> {
+        match (this.cursor.next_back()) {
+            Option::Some(at) => { return Option::Some(&at.first.keys[at.second]); }
+            Option::None => { return Option::None; }
+        }
+    }
+}
+
+private type struct ValuesRefIter<K, V> {
+    private cursor: BTreeCursor<K, V>;
+}
+
+implement<K, V> trait Iterator<V*> for struct ValuesRefIter<K, V> {
+    next(mut &this) -> Option<V*> {
+        match (this.cursor.next_front()) {
+            Option::Some(at) => { return Option::Some(&at.first.values[at.second]); }
+            Option::None => { return Option::None; }
+        }
+    }
+}
+
+implement<K, V> trait DoubleEndedIterator for struct ValuesRefIter<K, V> {
+    next_back(mut &this) -> Option<V*> {
+        match (this.cursor.next_back()) {
+            Option::Some(at) => { return Option::Some(&at.first.values[at.second]); }
+            Option::None => { return Option::None; }
+        }
+    }
+}
+
+private type struct ValuesMutableIter<K, V> {
+    private cursor: BTreeCursor<K, V>;
+}
+
+implement<K, V> trait Iterator<mut V*> for struct ValuesMutableIter<K, V> {
+    next(mut &this) -> Option<mut V*> {
+        match (this.cursor.next_front()) {
+            Option::Some(at) => { return Option::Some(&at.first.values[at.second]); }
+            Option::None => { return Option::None; }
+        }
+    }
+}
+
+implement<K, V> trait DoubleEndedIterator for struct ValuesMutableIter<K, V> {
+    next_back(mut &this) -> Option<mut V*> {
+        match (this.cursor.next_back()) {
+            Option::Some(at) => { return Option::Some(&at.first.values[at.second]); }
+            Option::None => { return Option::None; }
+        }
+    }
+}
+
+/// Release every entry and every node.
+implement<K, V, A> trait Drop for struct BTreeMap<K, V, A> where A: Allocator {
+    drop(mut &this) -> void {
+        this.clear();
+    }
+}
+
+/// Deep copy: a fresh map owning clones of every key and value.
+implement<K, V> trait Clone for struct BTreeMap<K, V, GlobalAlloc> where K: Ord + Clone, V: Clone {
+    clone(&this) -> BTreeMap<K, V, GlobalAlloc> {
+        mut out: BTreeMap<K, V, GlobalAlloc> = BTreeMap::<K, V, GlobalAlloc>::new();
+        for (entry in this.entries()) {
+            out.insert((*entry.first).clone(), (*entry.second).clone());
+        }
+        return out;
+    }
+}
+
+/// A fresh empty map, allocating nothing until the first insert.
+implement<K, V> trait Default for struct BTreeMap<K, V, GlobalAlloc> {
+    static default() -> BTreeMap<K, V, GlobalAlloc> {
+        return BTreeMap::<K, V, GlobalAlloc>::new();
+    }
+}
+
+/// A map of every key-value pair an iterator yields: what `collect` builds
+/// for `BTreeMap`. A later pair's value replaces an earlier one's for the
+/// same key.
+implement<K, V> trait FromIterator<Pair<K, V>> for struct BTreeMap<K, V, GlobalAlloc> where K: Ord {
+    static from_iterator<I>(source: I) -> BTreeMap<K, V, GlobalAlloc> where I: Iterator<Pair<K, V>> {
+        mut out: BTreeMap<K, V, GlobalAlloc> = BTreeMap::<K, V, GlobalAlloc>::new();
+        for (pair in source) {
+            out.insert(pair.first, pair.second);
+        }
+        return out;
+    }
+}
