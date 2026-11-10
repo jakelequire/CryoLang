@@ -159,7 +159,7 @@ Integer literals support four bases. Underscores are visual separators that the 
 
 **Type suffixes:** `u8` `u16` `u32` `u64` `u128` `i8` `i16` `i32` `i64` `i128` `usize` `isize` `f32` `f64`
 
-A literal stored where an integer of a written type is - a constant's or a variable's initializer, an assignment's value, a call's argument - takes that type, and must hold its value there.  So must an expression made only of literals: its value is what the arithmetic gives, and a type that does not hold it is refused (`E0010`) rather than wrapped.  A value is held up to the type's unsigned maximum (a bit pattern) and, for a signed type, down to its minimum.
+A literal stored where an integer of a written type is - a constant's or a variable's initializer, an assignment's value, a call's argument - takes that type, and must hold its value there.  So must an expression made only of literals: its value is what the arithmetic gives, and a type that does not hold it is refused (`E0010`) rather than wrapped.  A value is held up to the type's unsigned maximum (a bit pattern) and, for a signed type, down to its minimum. `usize` and `isize` are 32 bits on a 32-bit target, so they hold a literal only where it is the same value on every target: a `usize` up to `u32`'s maximum, an `isize` in `i32`'s range, with no bit pattern past it. A wider value is written in a 64-bit type and converted with `as`.
 
 ```cryo
 const a: u8 = 100 + 100;   // 200: held

@@ -128,13 +128,12 @@ type struct LiteralResolver {
             const st: Type* = this.arena.lookup(suffixed);
             if (st != null && st.kind == TypeKind::Int) {
                 const sit: IntegerKind = st.int_kind();
-                const smax: u64 = sema_int_unsigned_bound(sit.bit_width());
+                const smax: u64 = sema_int_unsigned_bound(sit.narrowest_bit_width());
                 if (smax != 0 && int_literal_exceeds(lit, smax)) {
-                    this.ctx.emit_error_at(
-                        ErrorCode::E0010_NUMBER_TOO_LARGE,
-                        fmt::format("integer literal `%s` is out of range for type `%s`",
-                            lit.value, sit.to_string()),
-                        e.span);
+                    this.refuse_literal_out_of_range(e, lit, sit);
+                } else if (sit.is_pointer_sized() && sit.is_signed()
+                        && int_literal_exceeds(lit, (smax >> 1) + 1)) {
+                    this.refuse_literal_out_of_range(e, lit, sit);
                 }
             }
             this.warn_if_suffix_redundant(e, lit, suffixed);
@@ -149,13 +148,15 @@ type struct LiteralResolver {
                 // admitting two's-complement bit-pattern initializers up to the
                 // width.  128-bit bounds exceed u64, so they are left unchecked
                 // (sema_int_unsigned_bound returns 0 there).
-                const max_mag: u64 = sema_int_unsigned_bound(it.bit_width());
+                // A pointer-sized type is bounded at its narrowest width, and
+                // holds no bit pattern past its signed range: either would be
+                // a different value on a 32-bit target than on a 64-bit one.
+                const max_mag: u64 = sema_int_unsigned_bound(it.narrowest_bit_width());
                 if (max_mag != 0 && int_literal_exceeds(lit, max_mag)) {
-                    this.ctx.emit_error_at(
-                        ErrorCode::E0010_NUMBER_TOO_LARGE,
-                        fmt::format("integer literal `%s` is out of range for type `%s`",
-                            lit.value, it.to_string()),
-                        e.span);
+                    this.refuse_literal_out_of_range(e, lit, it);
+                } else if (it.is_pointer_sized() && it.is_signed()
+                        && int_literal_exceeds(lit, (max_mag >> 1) + 1)) {
+                    this.refuse_literal_out_of_range(e, lit, it);
                 } else if (max_mag != 0 && it.is_signed()) {
                     // The literal fits the width's bit pattern but, for a signed
                     // type, exceeds the representable signed range: a bare
@@ -216,6 +217,19 @@ type struct LiteralResolver {
         // No integer expected-type hint: pick the narrowest default width that
         // holds the literal's magnitude (i32 -> i64 -> u64).
         return sema_default_int_type(this.arena, lit);
+    }
+
+    /// E0010 for integer literal `lit`, which `it` does not hold.  A
+    /// pointer-sized type is named with the width it is held to.
+    refuse_literal_out_of_range(&this, e: ExpressionNode*, lit: LiteralExpr*, it: IntegerKind) -> void {
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0010_NUMBER_TOO_LARGE,
+            fmt::format("integer literal `%s` is out of range for type `%s`", lit.value, it.to_string()));
+        diag = diag.at(e.span);
+        if (it.is_pointer_sized()) {
+            diag = diag.with_note(fmt::format("`%s` is 32 bits on a 32-bit target, so its literals are the values `%s` holds",
+                it.to_string(), if (it.is_signed()) { "i32" } else { "u32" }));
+        }
+        this.ctx.emit_diagnostic(diag);
     }
 
     /// Type a float literal: a type suffix settles it, else adopt a float
@@ -312,8 +326,11 @@ type struct LiteralResolver {
         const t: Type* = this.arena.lookup(target);
         if (t == null || t.kind != TypeKind::Int) { return false; }
         const it: IntegerKind = t.int_kind();
-        const max_mag: u64 = sema_int_unsigned_bound(it.bit_width());
+        const max_mag: u64 = sema_int_unsigned_bound(it.narrowest_bit_width());
         if (max_mag == 0) { return false; }
+        if (it.is_pointer_sized() && it.is_signed()) {
+            return !int_literal_exceeds(lit, (max_mag >> 1) + 1);
+        }
         return !int_literal_exceeds(lit, max_mag);
     }
 
@@ -343,13 +360,13 @@ type struct LiteralResolver {
         const t: Type* = this.arena.lookup(target);
         if (t == null || t.kind != TypeKind::Int) { return false; }
         const it: IntegerKind = t.int_kind();
-        const max_mag: u64 = sema_int_unsigned_bound(it.bit_width());
+        const max_mag: u64 = sema_int_unsigned_bound(it.narrowest_bit_width());
         if (max_mag == 0) { return false; }
         const folded: Option<i128> = try_fold_const_integer(expr);
         if (folded.is_none()) { return false; }
         const v: i128 = folded.unwrap();
         const held: boolean = if (v >= 0) {
-            v <= max_mag as i128
+            if (it.is_pointer_sized() && it.is_signed()) { v <= (max_mag / 2) as i128 } else { v <= max_mag as i128 }
         } else {
             it.is_signed() && v >= -((max_mag / 2) as i128) - 1
         };
@@ -367,7 +384,7 @@ type struct LiteralResolver {
         const folded: Option<i128> = try_fold_const_integer(expr);
         if (folded.is_none()) { return false; }
         const v: i128 = folded.unwrap();
-        const max_mag: u64 = sema_int_unsigned_bound(it.bit_width());
+        const max_mag: u64 = sema_int_unsigned_bound(it.narrowest_bit_width());
         if (max_mag == 0) { return false; }
         if (it.is_signed()) {
             const hi: i128 = (max_mag / 2) as i128;

@@ -2389,6 +2389,15 @@ type struct SemaVisitor {
         return true;
     }
 
+    /// E0229 for a binary operation the checker refused, with its help line
+    /// when it gave one.
+    refuse_binary_operation(mut &this, refused: TypeCheckResult, span: SourceSpan) -> void {
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0229_INVALID_BINARY_OP, refused.error_message);
+        diag = diag.at(span);
+        if (refused.help.length() > 0) { diag = diag.help(refused.help); }
+        this.ctx.emit_diagnostic(diag);
+    }
+
     /// An operator applied in a generic body to an operand that is still one
     /// of the body's type parameters is licensed by that parameter's bounds
     /// alone: one of them must give it the operator's language trait, or a
@@ -2556,10 +2565,14 @@ type struct SemaVisitor {
                 if (cres.success && !this.checker.can_assign(cres.result_type, lhs)) {
                     // `a += b` stores `a + b` back into `a`, so the sum's
                     // type, widened from `b`'s, must fit `a`.
-                    this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH,
-                        fmt::format("`%s` computes `%s`, which the `%s` it is stored into cannot hold for every value; convert the right side with `as`",
-                            bin.op.kind.to_string(), this.types.type_display_name(cres.result_type),
-                            this.types.type_display_name(lhs)).into_raw(), e.span);
+                    const stored: string = this.types.type_display_name(lhs);
+                    mut narrowing: Diagnostic = Diagnostic::error(ErrorCode::E0200_TYPE_MISMATCH,
+                        fmt::format("`%s` computes `%s`, which the `%s` it is stored into cannot hold for every value",
+                            bin.op.kind.to_string(), this.types.type_display_name(cres.result_type), stored));
+                    narrowing = narrowing.at(e.span);
+                    narrowing = narrowing.help(fmt::format("convert the right side with `as %s`, if a value that may change in the conversion is what is meant",
+                        stored).into_raw());
+                    this.ctx.emit_diagnostic(narrowing);
                     return lhs;
                 }
                 if (cres.success) {
@@ -2578,8 +2591,7 @@ type struct SemaVisitor {
                     }
                     if (!overloaded
                         && !this.emit_operator_missing_impl(lhs, map, base_op, e.span)) {
-                        this.ctx.emit_error_at(ErrorCode::E0229_INVALID_BINARY_OP,
-                            cres.error_message, e.span);
+                        this.refuse_binary_operation(cres, e.span);
                     }
                 }
             }
@@ -2749,7 +2761,7 @@ type struct SemaVisitor {
                     return TypeRef::invalid();
                 }
             }
-            this.ctx.emit_error_at(ErrorCode::E0229_INVALID_BINARY_OP, result.error_message, e.span);
+            this.refuse_binary_operation(result, e.span);
             // A refused operation computes no value, so what holds it
             // reports nothing more; a comparison is still a `boolean`.
             if (!bin.op.kind.yields_boolean()) { return TypeRef::invalid(); }
