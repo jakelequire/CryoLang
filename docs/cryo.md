@@ -242,7 +242,7 @@ const s: String = f"x = {x}, opt = {opt:?}";   // "x = 42, opt = Some(7)"
 - A hole may carry a **format spec** after a colon:
 
   ```
-  {expr:[[fill]align][#][0][width][.precision][type]}
+  {expr:[[fill]align][+][#][0][width][.precision][type]}
   ```
 
   - `align` is `<` (left), `>` (right), or `^` (centre); the default is
@@ -260,6 +260,13 @@ const s: String = f"x = {x}, opt = {opt:?}";   // "x = 42, opt = Some(7)"
   - `type` selects an integer radix: `x`/`X` (hex), `o` (octal), `b`
     (binary); `#` adds the `0x`/`0o`/`0b` prefix. A radix formats the
     value's own-width two's-complement bits, so `{(-5i32):x}` → `fffffffb`.
+  - `type` `e` writes a number in scientific form, with `.precision` digits
+    after the mantissa's point and six without one: `{1234.5:.2e}` →
+    `1.23e+3`, `{0.00012:.1e}` → `1.2e-4`. An integer is written as the
+    `f64` nearest it.
+  - `+` writes the sign of a decimal number that is not negative too
+    (`{42:+}` → `+42`, `{0.5:+.1}` → `+0.5`), kept leftmost by a `0` flag
+    as `-` is. A radix has no sign to write, and NaN none either.
   - The spec separator is the first top-level `:`. A hole that mixes a
     ternary with a spec must parenthesise the ternary
     (`f"{(c ? a : b):>4}"`); a bare `a ? b : c` (spaces around `:`) is not

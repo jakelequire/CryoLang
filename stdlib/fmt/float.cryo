@@ -113,35 +113,14 @@ implement f64 {
     /// or less writes no fractional digits. `buffer` must hold at least
     /// `F64_MAX_DIGITS` bytes plus `decimals`.
     public to_buf_with(&this, buffer: mut u8*, decimals: i64) -> i64 {
-        const value: f64 = this;
-        const places: i64 = if (decimals > 0) { decimals } else { 0 };
-        if (value.is_nan()) {
-            return write_literal(buffer, "NaN", 3);
-        }
-        if (value.is_infinite()) {
-            if (value < 0.0) {
-                return write_literal(buffer, "-inf", 4);
-            }
-            return write_literal(buffer, "inf", 3);
-        }
+        return write_float(buffer, this, decimals, false);
+    }
 
-        mut cursor: i64 = 0;
-        mut absolute: f64 = value;
-        if (value < 0.0 || value.is_negative_zero()) {
-            buffer[cursor] = 0x2D; // '-'
-            cursor = cursor + 1;
-            absolute = intrinsics::fabs64(value);
-        }
-
-        if (absolute == 0.0) {
-            buffer[cursor] = 0x30; // '0'
-            return cursor + 1;
-        }
-
-        if (absolute >= LARGE_THRESHOLD || absolute < SMALL_THRESHOLD) {
-            return cursor + write_scientific(buffer + cursor, absolute, places);
-        }
-        return cursor + write_fixed(buffer + cursor, absolute, places);
+    /// Write `this` in scientific form whatever its magnitude, `decimals`
+    /// digits after the mantissa's point: `1234.5` at 2 is `1.23e+3`, and
+    /// zero is `0.00e+0`.  `buffer` holds what `to_buf_with` needs.
+    internal to_scientific_buf(&this, buffer: mut u8*, decimals: i64) -> i64 {
+        return write_float(buffer, this, decimals, true);
     }
 
     /// Write `this` as the SHORTEST decimal string that re-parses (via
@@ -174,6 +153,43 @@ implement f64 {
 }
 
 // Private helpers
+
+/// `value` with `decimals` fractional digits: in scientific form when
+/// `scientific`, and otherwise when its magnitude is past the thresholds.
+private function write_float(buffer: mut u8*, value: f64, decimals: i64, scientific: boolean) -> i64 {
+    const places: i64 = if (decimals > 0) { decimals } else { 0 };
+    if (value.is_nan()) {
+        return write_literal(buffer, "NaN", 3);
+    }
+    if (value.is_infinite()) {
+        if (value < 0.0) {
+            return write_literal(buffer, "-inf", 4);
+        }
+        return write_literal(buffer, "inf", 3);
+    }
+
+    mut cursor: i64 = 0;
+    mut absolute: f64 = value;
+    if (value < 0.0 || value.is_negative_zero()) {
+        buffer[cursor] = 0x2D; // '-'
+        cursor = cursor + 1;
+        absolute = intrinsics::fabs64(value);
+    }
+
+    if (absolute == 0.0) {
+        if (scientific) {
+            cursor = cursor + write_fixed(buffer + cursor, 0.0, places);
+            return cursor + write_literal(buffer + cursor, "e+0", 3);
+        }
+        buffer[cursor] = 0x30; // '0'
+        return cursor + 1;
+    }
+
+    if (scientific || absolute >= LARGE_THRESHOLD || absolute < SMALL_THRESHOLD) {
+        return cursor + write_scientific(buffer + cursor, absolute, places);
+    }
+    return cursor + write_fixed(buffer + cursor, absolute, places);
+}
 
 private function write_literal(buffer: mut u8*, literal: u8*, length: i64) -> i64 {
     libc::memcpy(buffer, literal as void*, length as u64);

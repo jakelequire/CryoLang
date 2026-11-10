@@ -3,10 +3,14 @@
 ///! An f-string hole may carry a spec after a colon: `f"{value:spec}"`.
 ///! The grammar:
 ///!
-///!   spec := [[fill]align][#][0][width][.precision][type]
-///!   align := '<' | '>' | '^'          (left, right, centre)
-///!   type  := 'x' | 'X' | 'o' | 'b'    (lower/upper hex, octal, binary)
+///!   spec := [[fill]align][+][#][0][width][.precision][type]
+///!   align := '<' | '>' | '^'                (left, right, centre)
+///!   type  := 'x' | 'X' | 'o' | 'b' | 'e'    (lower/upper hex, octal,
+///!                                            binary, scientific)
 ///!
+///! `+` writes a decimal number's sign when it is not negative too;
+///! `e` writes a number in scientific form, `.precision` digits after the
+///! mantissa's point (six without one).
 ///! `#` prefixes a radix with `0x`/`0o`/`0b`; a leading `0` zero-pads
 ///! (sign/prefix stay leftmost). `width` is a minimum field width in
 ///! Unicode scalars; `.precision` truncates a Display value to that many
@@ -29,7 +33,7 @@ import std::collections::string::{ String };
 import std::collections::pair::{ Pair };
 import std::fmt::display::{ Display, format_to_string, Formatter };
 import std::fmt::error::{ FmtError };
-import std::fmt::float::{ F64_MAX_DIGITS };
+import std::fmt::float::{ DEFAULT_DECIMALS, F64_MAX_DIGITS };
 import std::core::mem;
 
 /// No radix: format the value in its natural (decimal / Display) form.
@@ -57,18 +61,20 @@ private const FILL_ZERO:  u32 = 0x30;
 internal type struct FmtSpec {
     private fill:          u32;      // scalar fill char
     private align:         u8;       // ALIGN_*
+    private plus_sign:     boolean;  // '+' - sign a non-negative decimal
     private alternate:     boolean;  // '#' - radix prefix
     private zero_pad:      boolean;  // '0' - sign-aware zero fill
     private width:         i64;      // minimum field width, in scalars
     private has_precision: boolean;
     private precision:     i64;
     private radix:         u8;       // RADIX_*
+    private scientific:    boolean;  // 'e'
 
     private static empty() -> FmtSpec {
         return FmtSpec {
-            fill: FILL_SPACE, align: ALIGN_DEFAULT, alternate: false,
+            fill: FILL_SPACE, align: ALIGN_DEFAULT, plus_sign: false, alternate: false,
             zero_pad: false, width: 0, has_precision: false, precision: 0,
-            radix: RADIX_NONE,
+            radix: RADIX_NONE, scientific: false,
         };
     }
 }
@@ -102,6 +108,12 @@ internal function fmt_parse_spec(spec: Str) -> FmtSpec {
     } else if (n >= 1 && is_align_byte(bytes[0])) {
         s.align = align_of_byte(bytes[0]);
         i = 1;
+    }
+
+    // '+'
+    if (i < n && bytes[i] == 0x2B) {
+        s.plus_sign = true;
+        i = i + 1;
     }
 
     // '#'
@@ -140,6 +152,7 @@ internal function fmt_parse_spec(spec: Str) -> FmtSpec {
         else if (t == 0x58) { s.radix = RADIX_HEX_UPPER; }   // 'X'
         else if (t == 0x6F) { s.radix = RADIX_OCT; }         // 'o'
         else if (t == 0x62) { s.radix = RADIX_BIN; }         // 'b'
+        else if (t == 0x65) { s.scientific = true; }         // 'e'
     }
 
     return s;
@@ -179,11 +192,15 @@ private function radix_digits(val: u64, spec: &FmtSpec, out: mut u8*) -> i64 {
 /// Body for an unsigned integer, written into `out` (`NUMBER_BODY_BYTES`):
 /// optional radix prefix + digits, the prefix its `head_len`.
 internal function fmt_uint_body(val: u64, spec: &FmtSpec, out: mut u8*) -> BodyText {
+    if (spec.scientific) { return fmt_float_body(val as f64, spec, out); }
     mut head: i64 = 0;
     if (spec.radix != RADIX_NONE) {
         const prefix: Str = radix_prefix(spec);
         for (mut i: i64 = 0; i < prefix.length(); i++) { out[i] = prefix.as_ptr()[i]; }
         head = prefix.length();
+    } else if (spec.plus_sign) {
+        out[0] = 0x2B;   // '+'
+        head = 1;
     }
     return BodyText::number(out, head + radix_digits(val, spec, out + head), head);
 }
@@ -193,11 +210,12 @@ internal function fmt_uint_body(val: u64, spec: &FmtSpec, out: mut u8*) -> BodyT
 /// pattern `masked` (already narrowed to the value's own width by the
 /// caller) with no sign: `-1i8` in hex is `ff`.
 internal function fmt_sint_body(val: i64, masked: u64, spec: &FmtSpec, out: mut u8*) -> BodyText {
+    if (spec.scientific) { return fmt_float_body(val as f64, spec, out); }
     if (spec.radix != RADIX_NONE) {
         return fmt_uint_body(masked, spec, out);
     }
     if (val >= 0) {
-        return BodyText::number(out, (val as u64).to_decimal_buf(out), 0);
+        return fmt_uint_body(val as u64, spec, out);
     }
     out[0] = 0x2D;   // '-'
     // Negate in u64 space so i64::MIN (whose magnitude overflows i64)
@@ -208,11 +226,15 @@ internal function fmt_sint_body(val: i64, masked: u64, spec: &FmtSpec, out: mut 
 
 /// Body for a float, written into `out` (`NUMBER_BODY_BYTES`). With a
 /// precision, uses fixed fractional digits; without, the form `Display`
-/// writes. A precision too long for `out` is written into an allocation
-/// sized to it and kept as the body's `String`. The sign is part of the
-/// text, so `head_len` marks a leading `-` for zero-fill.
+/// writes; `e` writes the scientific form, six digits after the
+/// mantissa's point unless a precision says otherwise. A precision too long
+/// for `out` is written into an allocation sized to it and kept as the
+/// body's `String`. The sign is part of the text - a `+` before a value
+/// that is not negative under `+`, none before NaN - so `head_len` marks it
+/// for zero-fill.
 internal function fmt_float_body(val: f64, spec: &FmtSpec, out: mut u8*) -> BodyText {
-    const needed: i64 = if (spec.has_precision) { F64_MAX_DIGITS + spec.precision } else { F64_MAX_DIGITS };
+    const places: i64 = if (spec.has_precision) { spec.precision } else { DEFAULT_DECIMALS };
+    const needed: i64 = F64_MAX_DIGITS + 1 + places;
     mut digits: mut u8* = out;
     if (needed > NUMBER_BODY_BYTES) {
         digits = allocator::alloc(needed as u64, 1) as mut u8*;
@@ -220,12 +242,16 @@ internal function fmt_float_body(val: f64, spec: &FmtSpec, out: mut u8*) -> Body
             core::panic("fmt: allocation failed formatting a float", intrinsics::location());
         }
     }
-    const written: i64 = if (spec.has_precision) {
-        val.to_buf_with(digits, spec.precision)
+    const signed: boolean = spec.plus_sign && !val.is_nan() && !(val < 0.0 || val.is_negative_zero());
+    if (signed) { digits[0] = 0x2B; }   // '+'
+    const sign_length: i64 = if (signed) { 1 } else { 0 };
+    const body: mut u8* = digits + sign_length;
+    const written: i64 = sign_length + if (spec.scientific) {
+        val.to_scientific_buf(body, places)
     } else {
-        val.to_buf(digits)
+        val.to_buf_with(body, places)
     };
-    const head: i64 = if (written > 0 && digits[0] == 0x2D) { 1 } else { 0 };
+    const head: i64 = if (written > 0 && (digits[0] == 0x2D || digits[0] == 0x2B)) { 1 } else { 0 };
     if (digits == out) {
         return BodyText::number(out, written, head);
     }
