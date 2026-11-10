@@ -1,0 +1,130 @@
+///! Command-line parsing: long and short flags and options in every
+///! spelling, grouped short letters, repeated options, required and
+///! optional positional arguments, `--`, each error with the argument it
+///! names, and the help text.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::EnvArguments;
+
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::env::arguments::{ ArgumentError, ArgumentErrorKind, ArgumentParser, ParsedArguments };
+import std::test::error::{ TestError };
+import std::test::assert::{ bail, expect, expect_eq };
+
+/// The words of `text`, split at spaces, as a command line.
+function words(text: string) -> Array<String> {
+    mut line: Array<String> = Array::new();
+    for (word in Str::new(text).split_whitespace()) {
+        line.push(String::from_str(word));
+    }
+    return line;
+}
+
+function search_parser() -> ArgumentParser {
+    mut parser: ArgumentParser = ArgumentParser::new(Str::new("search"));
+    parser.flag(Str::new("count"), Option::Some('c'), Str::new("print only a count"))
+        .flag(Str::new("verbose"), Option::Some('v'), Str::new("say more"))
+        .option(Str::new("context"), Option::Some('C'), Str::new("lines"), Str::new("lines around a match"))
+        .option(Str::new("exclude"), Option::None, Str::new("glob"), Str::new("skip matching files"))
+        .positional(Str::new("pattern"), Str::new("what to look for"))
+        .optional_positional(Str::new("file"), Str::new("where to look"));
+    return parser;
+}
+
+function parse(text: string) -> ParsedArguments {
+    const parser: ArgumentParser = search_parser();
+    const line: Array<String> = words(text);
+    return parser.parse(line.as_slice()).unwrap();
+}
+
+function check_value(parsed: &ParsedArguments, name: string, want: string) -> Result<(), TestError> {
+    match (parsed.value(Str::new(name))) {
+        Option::Some(value) => { return expect(value.equals(&Str::new(want)), value); }
+        Option::None => { return bail(Str::new(name)); }
+    }
+}
+
+function check_error(text: string, kind: ArgumentErrorKind, argument: string, shown: string) -> Result<(), TestError> {
+    const parser: ArgumentParser = search_parser();
+    const line: Array<String> = words(text);
+    match (parser.parse(line.as_slice())) {
+        Result::Ok(_) => { return bail(Str::new(text)); }
+        Result::Err(error) => {
+            expect(error.kind.equals(&kind), Str::new(text))?;
+            expect(error.argument.as_str().equals(&Str::new(argument)), error.argument.as_str())?;
+            const message: String = f"{error}";
+            return expect(message.as_str().equals(&Str::new(shown)), message.as_str());
+        }
+    }
+}
+
+![test]
+function flags_long_short_and_grouped() -> Result<(), TestError> {
+    const plain: ParsedArguments = parse("needle");
+    expect(!plain.flag(Str::new("count")), Str::new("no count"))?;
+    const long: ParsedArguments = parse("--count needle");
+    expect(long.flag(Str::new("count")), Str::new("--count"))?;
+    const grouped: ParsedArguments = parse("-cvv needle");
+    expect(grouped.flag(Str::new("count")), Str::new("-c in a group"))?;
+    return expect_eq(grouped.occurrences(Str::new("verbose")), 2);
+}
+
+![test]
+function an_option_value_in_every_spelling() -> Result<(), TestError> {
+    check_value(&parse("--context=3 needle"), "context", "3")?;
+    check_value(&parse("--context 4 needle"), "context", "4")?;
+    check_value(&parse("-C5 needle"), "context", "5")?;
+    check_value(&parse("-C 6 needle"), "context", "6")?;
+    check_value(&parse("-vC7 needle"), "context", "7")?;
+    return check_value(&parse("--context= needle"), "context", "");
+}
+
+![test]
+function a_repeated_option_keeps_every_value() -> Result<(), TestError> {
+    const parsed: ParsedArguments = parse("--exclude a --exclude=b needle");
+    expect_eq(parsed.values(Str::new("exclude")).length(), 2)?;
+    expect(parsed.values(Str::new("exclude"))[0].as_str().equals(&Str::new("a")), Str::new("first"))?;
+    check_value(&parsed, "exclude", "b")?;
+    return expect_eq(parse("needle").values(Str::new("exclude")).length(), 0);
+}
+
+![test]
+function positionals_fill_required_then_optional() -> Result<(), TestError> {
+    const one: ParsedArguments = parse("needle");
+    check_value(&one, "pattern", "needle")?;
+    expect(one.value(Str::new("file")).is_none(), Str::new("no file given"))?;
+    const two: ParsedArguments = parse("needle -c haystack");
+    check_value(&two, "pattern", "needle")?;
+    check_value(&two, "file", "haystack")?;
+    return expect(two.flag(Str::new("count")), Str::new("a flag between positionals"));
+}
+
+![test]
+function double_dash_ends_the_options() -> Result<(), TestError> {
+    const parsed: ParsedArguments = parse("-- -c -");
+    check_value(&parsed, "pattern", "-c")?;
+    check_value(&parsed, "file", "-")?;
+    return expect(!parsed.flag(Str::new("count")), Str::new("-c after -- is positional"));
+}
+
+![test]
+function each_error_names_its_argument() -> Result<(), TestError> {
+    check_error("--colour needle", ArgumentErrorKind::UnknownOption, "--colour", "unknown option '--colour'")?;
+    check_error("-cx needle", ArgumentErrorKind::UnknownOption, "x", "unknown option 'x'")?;
+    check_error("needle --context", ArgumentErrorKind::MissingValue, "--context", "option '--context' needs a value")?;
+    check_error("needle -C", ArgumentErrorKind::MissingValue, "-C", "option '-C' needs a value")?;
+    check_error("--count=yes needle", ArgumentErrorKind::UnexpectedValue, "--count=yes", "flag '--count=yes' takes no value")?;
+    check_error("-c", ArgumentErrorKind::MissingPositional, "<pattern>", "missing argument <pattern>")?;
+    return check_error("a b c", ArgumentErrorKind::UnexpectedPositional, "c", "unexpected argument 'c'");
+}
+
+![test]
+function help_text_lists_every_declaration() -> Result<(), TestError> {
+    const help: String = search_parser().help_text();
+    const want: string = "usage: search [options] <pattern> [<file>]\n\narguments:\n  <pattern>              what to look for\n  [<file>]               where to look\n\noptions:\n  -c, --count            print only a count\n  -v, --verbose          say more\n  -C, --context <lines>  lines around a match\n      --exclude <glob>   skip matching files\n";
+    return expect(help.as_str().equals(&Str::new(want)), help.as_str());
+}
