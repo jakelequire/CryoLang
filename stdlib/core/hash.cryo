@@ -215,10 +215,10 @@ implement trait Hasher for struct Fnv128Hasher {
 }
 
 /// SipHash, a keyed hash: without the 128-bit key, which inputs collide
-/// cannot be worked out, so a map keyed this way keeps its buckets even when
-/// its keys come from someone hostile (request headers, JSON object keys).
-/// `with_keys_1_3` is SipHash-1-3, the form `HashMap` uses: one compression
-/// round per eight bytes and three to finish. `with_keys_2_4` is SipHash-2-4,
+/// cannot be worked out, so a table keyed this way keeps its buckets even
+/// when its keys come from someone hostile (request headers, JSON object
+/// keys). `with_keys_1_3` is SipHash-1-3: one compression round per eight
+/// bytes and three to finish. `with_keys_2_4` is SipHash-2-4,
 /// the form the algorithm's authors give as the standard one, at about half
 /// the speed. Bytes are read in eight-byte little-endian words, and the
 /// total length is folded into the last.
@@ -298,18 +298,26 @@ implement trait Hasher for struct SipHasher {
         }
     }
 
-    /// A whole word arriving on a word boundary is absorbed at once; any
-    /// other width goes a byte at a time.
+    /// Up to eight bytes at a time join the pending bytes in one step; a word
+    /// they complete is absorbed, and what is left over starts the next.
     write_uint(mut &this, value: u128, byte_count: u32) -> void {
-        if (byte_count == 8 && this.pending_length == 0) {
-            this.length = this.length + 8;
-            this.absorb(value as u64);
-            return;
-        }
         mut rest: u128 = value;
-        for (mut i: u32 = 0; i < byte_count; i++) {
-            this.write_u8((rest & 0xFF) as u8);
-            rest = rest >> 8;
+        mut remaining: u64 = byte_count;
+        while (remaining > 0) {
+            const room: u64 = 8 - this.pending_length;
+            const taken: u64 = if (remaining < room) { remaining } else { room };
+            const mask: u64 = if (taken == 8) { 0xFFFFFFFFFFFFFFFF } else { (1 << (8 * taken)) - 1 };
+            const part: u64 = (rest as u64) & mask;
+            this.pending = this.pending | (part << (8 * this.pending_length));
+            this.pending_length = this.pending_length + taken;
+            this.length = this.length + taken;
+            rest = rest >> (8 * taken);
+            remaining = remaining - taken;
+            if (this.pending_length == 8) {
+                this.absorb(this.pending);
+                this.pending = 0;
+                this.pending_length = 0;
+            }
         }
     }
 
