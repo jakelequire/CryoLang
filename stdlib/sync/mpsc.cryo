@@ -47,6 +47,8 @@ import std::alloc::allocator::{ GlobalAlloc };
 import std::core::mem;
 import std::sync::mutex::{ Mutex, MutexGuard };
 import std::sync::condvar::{ CondVar };
+import std::time::clock::{ Instant };
+import std::time::duration::{ Duration };
 
 
 /// A queued value plus a raw link to the next node. Allocated per `send`,
@@ -125,6 +127,14 @@ public type enum TryRecvError {
     Disconnected;   // all senders dropped and the queue is empty
 }
 
+
+/// Why `Receiver::receive_timeout` returned no value.
+public type enum ReceiveTimeoutError {
+    /// The time ran out with no value sent and a sender still alive.
+    Timeout;
+    /// Every sender has dropped and the queue is empty.
+    Disconnected;
+}
 
 /// The sending half of a channel. Cloneable for multiple producers.
 public type struct Sender<T> {
@@ -248,6 +258,35 @@ public type struct Receiver<T> {
         }
         // Move the value out of the node, then free the node without running
         // the slot's destructor, so the value is owned exactly once.
+        const slot: T* = &(*node).value;
+        mut value: T;
+        unsafe { value = *slot; }
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        alloc.deallocate(NonNull::new(node as mut u8*), Layout::of::<ChanNode<T>>());
+        return Result::Ok(value);
+    }
+
+    /// Wait no longer than `duration` for a value and return it.
+    /// `Err(Timeout)` when the time runs out first, `Err(Disconnected)`
+    /// once every sender has dropped and the queue is drained.
+    public receive_timeout(&this, duration: Duration) -> Result<T, ReceiveTimeoutError> {
+        const deadline: Instant = Instant::now().saturating_add(&duration);
+        const inner: ChannelInner<T>* = this.inner;
+        mut held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
+        const state: mut ChannelState<T>* = held.as_mutable_ptr();
+        while (state.head == null && state.senders > 0) {
+            const remaining: Duration = deadline.saturating_duration_since(&Instant::now());
+            if (remaining.is_zero()) {
+                return Result::Err(ReceiveTimeoutError::Timeout);
+            }
+            inner.ready.wait_timeout(&inner.state, &held, remaining);
+        }
+        const node: mut ChanNode<T>* = state.pop();
+        mem::drop(held);
+        if (node == null) {
+            return Result::Err(ReceiveTimeoutError::Disconnected);
+        }
+        // Moved out and released as in `recv`.
         const slot: T* = &(*node).value;
         mut value: T;
         unsafe { value = *slot; }

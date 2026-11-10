@@ -1,0 +1,91 @@
+///! Waits bounded by a `Duration`: `CondVar.wait_timeout` reports that the
+///! time ran out after waiting it, and `Receiver.receive_timeout` times out
+///! with a sender still alive, returns a queued value at once, takes a
+///! value sent while it waits, and reports a channel whose senders are gone.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::SyncTimedWaits;
+
+import std::core::result::{ Result };
+import std::collections::str::{ Str };
+import std::alloc::allocator::{ GlobalAlloc };
+import std::sync::condvar::{ CondVar };
+import std::sync::mutex::{ Mutex, MutexGuard };
+import std::sync::mpsc;
+import std::sync::mpsc::{ Receiver, ReceiveTimeoutError, Sender };
+import std::thread;
+import std::time::clock::{ Instant };
+import std::time::duration::{ Duration };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_eq };
+
+![test]
+function condvar_wait_timeout_reports_the_time_running_out() -> Result<(), TestError> {
+    const lock: Mutex<i64> = Mutex::new(0);
+    const signal: CondVar = CondVar::new();
+    mut guard: MutexGuard<i64, GlobalAlloc> = lock.lock();
+    const start: Instant = Instant::now();
+    const timed_out: boolean = signal.wait_timeout(&lock, &guard, Duration::from_millis(60));
+    expect(timed_out, Str::new("the wait timed out"))?;
+    expect(start.elapsed().as_millis() >= 50, Str::new("the wait lasted the duration"))?;
+    return Result::Ok(());
+}
+
+![test]
+function receive_timeout_times_out_with_a_sender_alive() -> Result<(), TestError> {
+    const receiver: Receiver<i64> = mpsc::channel::<i64>();
+    const sender: Sender<i64> = receiver.sender();
+    const start: Instant = Instant::now();
+    match (receiver.receive_timeout(Duration::from_millis(60))) {
+        Result::Ok(_) => { return Result::Err(TestError::failed(Str::new("no value was sent"))); }
+        Result::Err(ReceiveTimeoutError::Disconnected) => { return Result::Err(TestError::failed(Str::new("a sender is alive"))); }
+        Result::Err(ReceiveTimeoutError::Timeout) => { }
+    }
+    expect(start.elapsed().as_millis() >= 50, Str::new("the wait lasted the duration"))?;
+    sender.send(1);
+    return Result::Ok(());
+}
+
+![test]
+function receive_timeout_returns_a_queued_value_at_once() -> Result<(), TestError> {
+    const receiver: Receiver<i64> = mpsc::channel::<i64>();
+    const sender: Sender<i64> = receiver.sender();
+    sender.send(7);
+    match (receiver.receive_timeout(Duration::from_secs(10))) {
+        Result::Ok(value) => { expect_eq(value, 7)?; }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::new("the queued value"))); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function receive_timeout_takes_a_value_sent_while_it_waits() -> Result<(), TestError> {
+    const receiver: Receiver<i64> = mpsc::channel::<i64>();
+    const sender: Sender<i64> = receiver.sender();
+    const worker = thread::spawn(move () -> i64 {
+        thread::sleep_ms(30);
+        sender.send(9);
+        return 0;
+    });
+    const start: Instant = Instant::now();
+    match (receiver.receive_timeout(Duration::from_secs(20))) {
+        Result::Ok(value) => { expect_eq(value, 9)?; }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::new("the value sent while waiting"))); }
+    }
+    expect(start.elapsed().as_secs() < 10, Str::new("woken by the send, not the timeout"))?;
+    worker.join();
+    return Result::Ok(());
+}
+
+![test]
+function receive_timeout_reports_a_channel_without_senders() -> Result<(), TestError> {
+    const receiver: Receiver<i64> = mpsc::channel::<i64>();
+    const start: Instant = Instant::now();
+    match (receiver.receive_timeout(Duration::from_secs(20))) {
+        Result::Err(ReceiveTimeoutError::Disconnected) => { }
+        Result::Err(ReceiveTimeoutError::Timeout) => { return Result::Err(TestError::failed(Str::new("no sender exists"))); }
+        Result::Ok(_) => { return Result::Err(TestError::failed(Str::new("no value was sent"))); }
+    }
+    expect(start.elapsed().as_secs() < 10, Str::new("answered at once"))?;
+    return Result::Ok(());
+}
