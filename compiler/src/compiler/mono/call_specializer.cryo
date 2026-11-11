@@ -1845,22 +1845,6 @@ type struct MonoCallSpecializer {
             }
         }
         if (actuals.length() != formals.length()) { return true; }
-        mut named: [TypeRef] = [];
-        for (mut i: i64 = 0; i < formals.length(); i++) { this.arena.generic_params_in(formals[i], &named); }
-        mut params: [TypeRef] = [];
-        for (mut g: i64 = 0; g < f.generic_params.length(); g++) {
-            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(f.generic_params[g]);
-            mut found: TypeRef = TypeRef::invalid();
-            for (mut k: i64 = 0; k < named.length(); k++) {
-                if (gp != null && this.arena.lookup(named[k]).as_generic_param().param_sym.equals(gp.sym_id)) { found = named[k]; }
-            }
-            if (!found.is_valid()) { return true; }
-            params.push(found);
-        }
-        mut infer: InferCtx = InferCtx::for_template(this.arena, params);
-        for (mut i: i64 = 0; i < formals.length(); i++) {
-            if (!actuals[i].is_valid() || !infer.unify(formals[i], actuals[i])) { return true; }
-        }
         mut impl_node: DeclarationNode* = null;
         const heads: [DeclarationNode*] = this.trait_heads_on(f.origin_trait, owner);
         for (mut h: i64 = 0; h < heads.length(); h++) {
@@ -1870,7 +1854,52 @@ type struct MonoCallSpecializer {
             }
         }
         if (impl_node == null) { return true; }
+        mut named: [TypeRef] = [];
+        for (mut i: i64 = 0; i < formals.length(); i++) { this.arena.generic_params_in(formals[i], &named); }
+        // A parameter no argument names - one the trait's arguments name and
+        // the method only returns (`T` in `implement<T> trait Ends<T> for
+        // Everything`) - is bound by the trait arguments the bound the call
+        // went through gives it (`R: Ends<i64>`), against the arguments the
+        // implementation's head writes.
+        const block: ImplBlock* = DeclarationNode::impl_of(impl_node);
+        if (!this.names_every_parameter(f, &named) && call.bound_trait_args.length() == block.trait_arg_types.length()) {
+            for (mut i: i64 = 0; i < block.trait_arg_types.length(); i++) {
+                formals.push(block.trait_arg_types[i]);
+                actuals.push(call.bound_trait_args[i]);
+                this.arena.generic_params_in(block.trait_arg_types[i], &named);
+            }
+        }
+        mut params: [TypeRef] = [];
+        for (mut g: i64 = 0; g < f.generic_params.length(); g++) {
+            const found: TypeRef = this.parameter_named(f.generic_params[g], &named);
+            if (!found.is_valid()) { return true; }
+            params.push(found);
+        }
+        mut infer: InferCtx = InferCtx::for_template(this.arena, params);
+        for (mut i: i64 = 0; i < formals.length(); i++) {
+            if (!actuals[i].is_valid() || !infer.unify(formals[i], actuals[i])) { return true; }
+        }
         this.pin_spec_entry(call, this.method_instance_entry(m_decl, impl_node, null, owner, &infer.bindings, null));
+        return true;
+    }
+
+    /// The type parameter among `named` that `param_decl` declares; invalid
+    /// when none is.
+    parameter_named(&this, param_decl: DeclarationNode*, named: &[TypeRef]) -> TypeRef {
+        const gp: GenericParamDecl* = DeclarationNode::generic_param_of(param_decl);
+        if (gp == null) { return TypeRef::invalid(); }
+        mut found: TypeRef = TypeRef::invalid();
+        for (mut k: i64 = 0; k < named.length(); k++) {
+            if (this.arena.lookup(named[k]).as_generic_param().param_sym.equals(gp.sym_id)) { found = named[k]; }
+        }
+        return found;
+    }
+
+    /// Whether `named` holds every type parameter of `f`.
+    names_every_parameter(&this, f: FunctionDecl*, named: &[TypeRef]) -> boolean {
+        for (mut g: i64 = 0; g < f.generic_params.length(); g++) {
+            if (!this.parameter_named(f.generic_params[g], named).is_valid()) { return false; }
+        }
         return true;
     }
 

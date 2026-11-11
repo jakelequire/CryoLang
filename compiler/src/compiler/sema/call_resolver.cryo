@@ -204,10 +204,15 @@ type struct CallInference {
 
     /// Whether every parameter was bound.
     all_bound(&this) -> boolean {
+        return this.first_unbound() < 0;
+    }
+
+    /// The position of the first parameter left unbound; -1 when none is.
+    first_unbound(&this) -> i64 {
         for (mut i: i64 = 0; i < this.bindings.length(); i++) {
-            if (!this.bindings[i].is_valid()) { return false; }
+            if (!this.bindings[i].is_valid()) { return i; }
         }
-        return true;
+        return -1;
     }
 }
 
@@ -2039,7 +2044,8 @@ type struct CallResolver {
                 if (tmpl.is_implicit && !this.state.expected_type.is_valid()) {
                     this.emit_free_cannot_infer(call_e, call, tmpl.name);
                 } else {
-                    this.report_unbound_type_parameter(call_e, &call.generic_args, tmpl, &inference.bindings);
+                    this.report_unbound_type_parameter(call_e.span, call.callee, 0, &call.generic_args, tmpl,
+                        inference.first_unbound());
                     *refused = true;
                 }
                 return TypeRef::invalid();
@@ -2712,35 +2718,37 @@ type struct CallResolver {
         this.ctx.emit_diagnostic(d);
     }
 
-    /// E0307 at a call with no arguments whose type parameter nothing binds:
-    /// not its type arguments, which leave it to inference with `_` or by
-    /// writing none, and not the type its result is expected to have.  The
-    /// first such parameter is reported, at its `_` where one is written.
-    report_unbound_type_parameter(mut &this, call_e: ExpressionNode*, written: &[mut TypeAnnotation*],
-                                  tmpl: FunctionDecl*, bindings: &[TypeRef]) -> void {
-        mut open: i64 = -1;
-        for (mut i: i64 = 0; i < bindings.length() && i < tmpl.generic_params.length(); i++) {
-            if (!bindings[i].is_valid()) { open = i; break; }
-        }
-        if (open < 0) { return; }
+    /// E0307 at a call, at `at`, whose type parameter nothing binds: not its
+    /// type arguments, which leave it to inference with `_` or by writing
+    /// none, not its `argument_count` arguments, and not the type its result
+    /// is expected to have.  The parameter at `open` is reported, at its `_`
+    /// where one is written; otherwise the fix writes the type arguments
+    /// after `callee`.
+    report_unbound_type_parameter(mut &this, at: SourceSpan, callee: ExpressionNode*, argument_count: i64,
+                                  written: &[mut TypeAnnotation*], tmpl: FunctionDecl*, open: i64) -> void {
+        if (open < 0 || open >= tmpl.generic_params.length()) { return; }
         const fn_str: string = this.intern.resolve(tmpl.name);
         const names: string = this.type_parameter_list(tmpl);
         const open_param: GenericParamDecl* = DeclarationNode::generic_param_of(tmpl.generic_params[open]);
         const open_name: string = if (open_param != null) { this.intern.resolve(open_param.name) } else { "?" };
+        const reason: string = if (argument_count == 0) {
+            "the call has no arguments to infer it from"
+        } else {
+            "none of the call's arguments names it"
+        };
+        const argument_list: string = if (argument_count == 0) { "()" } else { "(...)" };
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
             fmt::format("cannot infer the type argument `%s` for `%s`", open_name, fn_str));
         if (open < written.length()) {
             d = d.at_with_label(annotation_span(written[open]), "nothing in the call says which type this is");
-            d = d.help("the call has no arguments to infer it from; write the type in place of `_`");
+            d = d.help(fmt::format("%s; write the type in place of `_`", reason));
             d = d.suggest(Suggestion::single(annotation_span(written[open]), open_name,
                 fmt::format("write the type `%s` stands for", open_name), Applicability::HasPlaceholders));
         } else {
-            d = d.at_with_label(call_e.span, "nothing in the call says which type it is");
-            d = d.help(fmt::format("the call has no arguments to infer it from; write the type arguments, `%s::<%s>()`",
-                fn_str, names));
-            const call: CallExpr* = ExpressionNode::call_of(call_e);
-            if (call != null && call.callee != null) {
-                d = d.suggest(CallResolver::type_arguments_fix(call.callee.span, names));
+            d = d.at_with_label(at, "nothing in the call says which type it is");
+            d = d.help(fmt::format("%s; write the type arguments, `%s::<%s>%s`", reason, fn_str, names, argument_list));
+            if (callee != null && written.length() == 0) {
+                d = d.suggest(CallResolver::type_arguments_fix(callee.span, names));
             }
         }
         this.ctx.emit_diagnostic(d);
@@ -5837,8 +5845,10 @@ type struct CallResolver {
             // stash, and sema's stash is the sole producer of method-spec
             // demand, so mono mints no specialization and the call is left
             // bound to nothing.
+            // A parameter left unbound here is the copy's to bind.
             if (call.resolved_type_args.length() == 0) {
-                this.binding.stash_method_call_bindings(obj_type, member, call, selected.chosen);
+                mut unbound_at: i64 = -1;
+                this.binding.stash_method_call_bindings(obj_type, member, call, selected.chosen, &unbound_at);
             }
             // The stash solves the method's own type args but yields no RETURN
             // type, so every use of the result reads `void`. A bounded-param or
@@ -5907,7 +5917,14 @@ type struct CallResolver {
             }
             return TypeRef::invalid();
         }
-        this.binding.stash_method_call_bindings(obj_type, member, call, selected.chosen);
+        mut unbound_at: i64 = -1;
+        const unbound_method: DeclarationNode* = this.binding.stash_method_call_bindings(obj_type, member, call,
+            selected.chosen, &unbound_at);
+        if (unbound_method != null) {
+            this.report_unbound_type_parameter(member.member_span, member_e, call.arguments.length(),
+                &member.generic_args, DeclarationNode::fn_of(unbound_method), unbound_at);
+            return TypeRef::invalid();
+        }
         if (!this.check_method_call_bounds(member.member_span, selected.chosen, call,
                 visitor.receiver_subject(obj_type))) {
             return TypeRef::invalid();
@@ -6038,7 +6055,14 @@ type struct CallResolver {
                     member.member_span);
                 member.object = visitor.route_write(member.object);
             }
-            this.binding.stash_method_call_bindings(member.object.resolved_type, member, call, null);
+            mut unbound_at: i64 = -1;
+            const unbound_method: DeclarationNode* = this.binding.stash_method_call_bindings(
+                member.object.resolved_type, member, call, null, &unbound_at);
+            if (unbound_method != null) {
+                this.report_unbound_type_parameter(member.member_span, member_e, call.arguments.length(),
+                    &member.generic_args, DeclarationNode::fn_of(unbound_method), unbound_at);
+                return TypeRef::invalid();
+            }
             member_e.set_resolved_type(coerced);
             return coerced;
         }
@@ -8626,7 +8650,7 @@ type struct CallResolver {
         ctx.set_this_type(owner);
         mut targs: &[mut TypeAnnotation*] = &call.generic_args;
         if (targs.length() == 0 && scope != null) { targs = &scope.generic_args; }
-        const binds: [TypeRef] = this.binding.solve_method_bindings_at(m.func, &ctx, targs, call, 1);
+        const binds: [TypeRef] = this.binding.solve_method_bindings_at(m.func, &ctx, targs, call, 1, null);
         if (binds.length() != DeclarationNode::fn_of(m.func).generic_params.length()) { return ctx; }
         for (mut i: i64 = 0; i < binds.length(); i++) {
             const gp_decl: DeclarationNode* = DeclarationNode::fn_of(m.func).generic_params[i];

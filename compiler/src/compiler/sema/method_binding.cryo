@@ -1859,16 +1859,19 @@ type struct MethodBinding {
                           owner_ctx: ResolutionContext*, member: MemberAccessExpr*,
                           call: CallExpr*) -> [TypeRef] {
         if (member == null) { return []; }
-        return this.solve_method_bindings_at(orig_func_decl, owner_ctx, &member.generic_args, call, 0);
+        return this.solve_method_bindings_at(orig_func_decl, owner_ctx, &member.generic_args, call, 0, null);
     }
 
     /// `solve_method_bindings` for a call whose method arguments start at
     /// `first_arg` - 0 for `recv.m(args)`, 1 for a path call
     /// `Owner::m(recv, args)`, whose receiver is its first argument - with
-    /// the turbofish `generic_args` the call wrote for the method.
+    /// the turbofish `generic_args` the call wrote for the method.  When
+    /// `unbound_at` is not null and every pass ran and left a parameter
+    /// unbound - nothing the call writes, passes or is expected to be fixes
+    /// it - the first such parameter's position is stored there.
     solve_method_bindings_at(mut &this, orig_func_decl: DeclarationNode*,
                              owner_ctx: ResolutionContext*, generic_args: &[mut TypeAnnotation*],
-                             call: CallExpr*, first_arg: i64) -> [TypeRef] {
+                             call: CallExpr*, first_arg: i64, unbound_at: mut i64*) -> [TypeRef] {
         const orig_func: FunctionDecl* = DeclarationNode::fn_of(orig_func_decl);
         if (orig_func == null || call == null) { return []; }
         if (call.arguments.length() < first_arg) { return []; }
@@ -2019,7 +2022,10 @@ type struct MethodBinding {
             this.unify_callable_bounds(&orig_func.trait_bounds, &method_param_syms, &ictx, &infer_ctx);
             for (mut i: i64 = 0; i < n_method_params; i++) {
                 const b: TypeRef = ictx.bindings[i];
-                if (!b.is_valid()) { return []; }
+                if (!b.is_valid()) {
+                    if (unbound_at != null) { *unbound_at = i; }
+                    return [];
+                }
                 if (this.types.contains_generic_param(b) && !this.state.in_symbolic_check) {
                     return [];
                 }
@@ -2052,17 +2058,27 @@ type struct MethodBinding {
     /// Stash the method's concrete method-level bindings on the call so mono's
     /// `try_infer_method_call` reads them instead of re-inferring.  Called for
     /// every method call; no-op for non-generic methods / abstract bindings.
-    stash_method_call_bindings(mut &this, recv_type: TypeRef,
-                               member: MemberAccessExpr*, call: mut CallExpr*, chosen_decl: DeclarationNode*) -> void {
-        if (call == null || member == null) { return; }
+    /// Answers the generic method whose parameter at `*unbound_at` nothing
+    /// in the call binds, and null when every one is bound or the call
+    /// could not be judged.
+    stash_method_call_bindings(mut &this, recv_type: TypeRef, member: MemberAccessExpr*,
+                               call: mut CallExpr*, chosen_decl: DeclarationNode*,
+                               unbound_at: mut i64*) -> DeclarationNode* {
+        if (call == null || member == null) { return null; }
         mut orig_func: DeclarationNode* = null;
         mut owner_ctx: ResolutionContext =
             this.find_generic_method_for_call(recv_type, member, chosen_decl, &orig_func);
-        if (orig_func == null) { return; }
+        if (orig_func == null) { return null; }
         const n_method_params: i64 = DeclarationNode::fn_of(orig_func).generic_params.length();
-        mut bindings: [TypeRef] = this.solve_method_bindings(orig_func, &owner_ctx, member, call);
-        if (bindings.length() != n_method_params) { return; }
+        mut unbound: i64 = -1;
+        mut bindings: [TypeRef] = this.solve_method_bindings_at(orig_func, &owner_ctx, &member.generic_args,
+            call, 0, &unbound);
+        if (bindings.length() != n_method_params) {
+            *unbound_at = unbound;
+            return if (unbound >= 0) { orig_func } else { null };
+        }
         call.set_resolved_type_args(bindings);
+        return null;
     }
 
     /// GATED: mono-after-sema (R1).  Resolve the CONCRETE return type of a call to

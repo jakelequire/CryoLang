@@ -1,0 +1,87 @@
+///! An implementation whose parameter only the trait's arguments and a
+///! method's return name (`implement<T> trait Ends<T> for Everything`) is
+///! called through a bound, which says what the parameter is: `R: Ends<i64>`
+///! makes `low` return an `Option<&i64>`. The full range `..` is such an
+///! implementation of `RangeBounds<T>`, so `map.range(..)` walks every
+///! entry. A project rather than a unit file: a compiler that leaves the
+///! parameter unbound stops at code generation, and a unit file it refuses
+///! would stop its whole unit build.
+
+![config(testing)]
+namespace CryoTests::Tests::TraitArgumentParameterBoundByCall;
+
+import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::core::iter::{ Iterator, DoubleEndedIterator };
+import std::core::ops::{ Bound, RangeBounds, RangeFull };
+import std::collections::btree_map::{ BTreeMap };
+import std::collections::btree_set::{ BTreeSet };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::test::error::{ TestError };
+import std::test::assert::{ bail, expect_eq };
+
+type trait Ends<T> {
+    low(&this) -> Option<&T>;
+}
+
+type struct Everything { }
+
+implement<T> trait Ends<T> for struct Everything {
+    low(&this) -> Option<&T> { return Option::None; }
+}
+
+type struct Below { limit: i64; }
+
+implement trait Ends<i64> for struct Below {
+    low(&this) -> Option<&i64> { return Option::Some(&this.limit); }
+}
+
+function lowest<R>(ends: R) -> i64 where R: Ends<i64> {
+    return match (ends.low()) {
+        Option::Some(value) => { *value }
+        Option::None        => { -1 }
+    };
+}
+
+function has_text_low<R>(ends: R) -> boolean where R: Ends<String> {
+    return ends.low().is_some();
+}
+
+![test]
+function a_bound_binds_the_parameter_only_the_return_names() -> Result<(), TestError> {
+    expect_eq(lowest(Everything { }), -1)?;
+    expect_eq(lowest(Below { limit: 7 }), 7)?;
+    return expect_eq(has_text_low(Everything { }), false);
+}
+
+![test]
+function a_direct_call_binds_it_from_its_type_arguments_or_expected_type() -> Result<(), TestError> {
+    const everything: Everything = Everything { };
+    expect_eq(everything.low::<i64>().is_none(), true)?;
+    const expected: Option<&u8> = everything.low();
+    expect_eq(expected.is_none(), true)?;
+    return match (RangeFull::new().start_bound::<i64>()) {
+        Bound::Unbounded => { Result::Ok(()) }
+        _ => { bail(Str::new("the full range starts unbounded")) }
+    };
+}
+
+![test]
+function the_full_range_walks_every_entry() -> Result<(), TestError> {
+    mut map: BTreeMap<i64, i64> = BTreeMap::new();
+    for (mut key: i64 = 0; key < 300; key++) { map.insert(key, key * 10); }
+    mut expected: i64 = 0;
+    for (entry in map.range(..)) {
+        expect_eq(*entry.first, expected)?;
+        expect_eq(*entry.second, expected * 10)?;
+        expected += 1;
+    }
+    expect_eq(expected, 300)?;
+    expect_eq(*map.range(..).next_back().unwrap().first, 299)?;
+    mut set: BTreeSet<i64> = BTreeSet::new();
+    for (mut value: i64 = 0; value < 50; value++) { set.insert(value * 2); }
+    expect_eq(*set.range(..).rev().next().unwrap(), 98)?;
+    const empty: BTreeMap<i64, i64> = BTreeMap::new();
+    return expect_eq(empty.range(..).next().is_none(), true);
+}
