@@ -1,0 +1,258 @@
+///! std::process::signal_handling: receiving the interrupt and terminate
+///! signals, so a program can shut down cleanly instead of being ended.
+///!
+///! `Signals::listen()` starts receiving them. While any `Signals` is
+///! alive they no longer end the process: `wait`, `wait_timeout` and
+///! `try_wait` hand each one over instead. Once the last `Signals` is
+///! dropped they end the process again, as they did before.
+///!
+///! ```cryo
+///! const signals: Signals = Signals::listen().unwrap();
+///! const received: Signal = signals.wait();   // Ctrl-C, or a SIGTERM
+///! ```
+///!
+///! What arrives:
+///!   - POSIX: SIGINT as `Signal::interrupt()`, SIGTERM as
+///!     `Signal::terminate()`.
+///!   - Windows: Ctrl-C and Ctrl-Break, both as `Signal::interrupt()`.
+///!     Closing the console, logging off and shutting down are not
+///!     received: Windows ends the process after them whatever a handler
+///!     answers.
+///!
+///! Every `Signals` in the process shares one record of what arrived, so
+///! each signal is handed to one waiter, whichever asks first. Signals
+///! that arrive before anyone asks are each kept; when both kinds are
+///! waiting, an interrupt is handed over before a terminate.
+
+namespace std::process::signal_handling;
+
+import std::core::intrinsics;
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::core::drop::{ Drop };
+import std::io::error::{ IoError };
+import std::process::signal::{ Signal };
+import std::time::duration::{ Duration };
+import std::time::clock::{ Instant };
+import std::ffi::libc;
+import std::sys::syscall;
+import std::thread;
+
+// The handler runs where nothing may block or allocate - inside an
+// asynchronous signal on POSIX, on a thread the console starts on Windows -
+// so it only counts what arrived and wakes the waiters; everything else
+// happens in the waiter.
+//
+// Signals received and not yet handed over: interrupts in the low 32 bits,
+// terminates in the high 32, so one compare-exchange takes either.
+private mut g_pending: u64 = 0;
+// Live `Signals`. With none, the handler gives the signal its default
+// action, so dropping the last one gives the process its old behaviour back.
+private mut g_listeners: u32 = 0;
+// The wake channel and the Windows handler registration, made once:
+// 0 = not made, 1 = being made, 2 = made.
+private mut g_setup: u32 = 0;
+// POSIX: the pipe the handler writes a byte to; waiters poll its read end.
+private mut g_wake_read: i32 = -1;
+private mut g_wake_write: i32 = -1;
+// Windows: the semaphore the handler releases; waiters wait on it.
+private mut g_wake_semaphore: u8* = null;
+
+private const PENDING_INTERRUPT: u64 = 1;
+private const PENDING_TERMINATE: u64 = 0x100000000;
+private const ORDER_SEQUENTIALLY_CONSISTENT: u32 = 7;
+
+![target(unix)]
+private function signals_handler(signal_number: i32) -> void {
+    // `write` may set errno, and the code this signal interrupted may be
+    // about to read it.
+    const saved_errno: i32 = libc::errno();
+    if (intrinsics::atomic_load_u32(&g_listeners, ORDER_SEQUENTIALLY_CONSISTENT) == 0) {
+        // `signal` and `raise` are async-signal-safe; the raised signal is
+        // held until this handler returns, then takes the default action.
+        libc::signal(signal_number, libc::SIG_DFL as void*);
+        libc::raise(signal_number);
+        libc::set_errno(saved_errno);
+        return;
+    }
+    mut kind: u64 = PENDING_INTERRUPT;
+    if (signal_number == libc::SIGTERM) { kind = PENDING_TERMINATE; }
+    intrinsics::atomic_add_u64(&g_pending, kind, ORDER_SEQUENTIALLY_CONSISTENT);
+    const byte: u8 = 1;
+    libc::write(g_wake_write, &byte, 1);
+    libc::set_errno(saved_errno);
+}
+
+![target(windows)]
+private function signals_handler(control_type: u32) -> i32 {
+    if (control_type != syscall::CTRL_C_EVENT && control_type != syscall::CTRL_BREAK_EVENT) {
+        return 0;
+    }
+    // 0 passes the event on, to the default handler that ends the process.
+    if (intrinsics::atomic_load_u32(&g_listeners, ORDER_SEQUENTIALLY_CONSISTENT) == 0) {
+        return 0;
+    }
+    intrinsics::atomic_add_u64(&g_pending, PENDING_INTERRUPT, ORDER_SEQUENTIALLY_CONSISTENT);
+    syscall::ReleaseSemaphore(g_wake_semaphore, 1, null);
+    return 1;
+}
+
+![target(unix)]
+private function signals_set_up() -> Result<(), IoError> {
+    mut ends: [i32; 2] = [-1, -1];
+    if (libc::pipe2(&ends[0], libc::O_CLOEXEC | libc::O_NONBLOCK) < 0) {
+        return Result::Err(IoError::last_os_error());
+    }
+    g_wake_read = ends[0];
+    g_wake_write = ends[1];
+    return Result::Ok(());
+}
+
+![target(windows)]
+private function signals_set_up() -> Result<(), IoError> {
+    const semaphore: u8* = syscall::CreateSemaphoreA(null, 0, 0x7FFFFFFF, null);
+    if (semaphore == null) { return Result::Err(IoError::last_os_error()); }
+    g_wake_semaphore = semaphore;
+    if (syscall::SetConsoleCtrlHandler(signals_handler as void*, 1) == 0) {
+        const error: IoError = IoError::last_os_error();
+        syscall::CloseHandle(semaphore);
+        g_wake_semaphore = null;
+        return Result::Err(error);
+    }
+    return Result::Ok(());
+}
+
+// The handler a signal's default action left behind is put back on every
+// listen; the console handler, registered once, stays.
+![target(unix)]
+private function signals_install() -> Result<(), IoError> {
+    if (libc::signal(libc::SIGINT, signals_handler as void*) as i64 == libc::SIG_ERR
+        || libc::signal(libc::SIGTERM, signals_handler as void*) as i64 == libc::SIG_ERR) {
+        return Result::Err(IoError::last_os_error());
+    }
+    return Result::Ok(());
+}
+
+![target(windows)]
+private function signals_install() -> Result<(), IoError> {
+    return Result::Ok(());
+}
+
+// Block until the handler wakes this thread or `milliseconds` pass; a
+// negative count waits without a limit. A wake meant for another waiter
+// is harmless: the caller looks at what is pending again.
+![target(unix)]
+private function signals_sleep(milliseconds: i64) -> void {
+    mut timeout: i32 = -1;
+    if (milliseconds >= 0) {
+        timeout = 0x7FFFFFFF;
+        if (milliseconds < 0x7FFFFFFF) { timeout = milliseconds as i32; }
+    }
+    mut readable: libc::pollfd = libc::pollfd { fd: g_wake_read, events: libc::POLLIN, revents: 0 };
+    libc::poll(&readable, 1, timeout);
+    mut drained: [u8; 64];
+    while (libc::read(g_wake_read, &drained[0], 64) > 0) { }
+}
+
+![target(windows)]
+private function signals_sleep(milliseconds: i64) -> void {
+    // INFINITE is 0xFFFFFFFF, so a finite wait stops one short of it.
+    mut timeout: u32 = 0xFFFFFFFF;
+    if (milliseconds >= 0) {
+        timeout = 0xFFFFFFFE;
+        if (milliseconds < 0xFFFFFFFE) { timeout = milliseconds as u32; }
+    }
+    syscall::WaitForSingleObject(g_wake_semaphore, timeout);
+}
+
+/// Receives the interrupt and terminate signals for as long as it lives;
+/// see the module documentation.
+public type struct Signals {
+    /// Start receiving the interrupt and terminate signals. From now until
+    /// the last `Signals` is dropped they no longer end the process. An
+    /// error is the operating system's refusal to set up the handler or
+    /// the channel it wakes waiters through.
+    public static listen() -> Result<Signals, IoError> {
+        while (intrinsics::atomic_load_u32(&g_setup, ORDER_SEQUENTIALLY_CONSISTENT) != 2) {
+            mut won: boolean = false;
+            intrinsics::atomic_cmpxchg_u32(&g_setup, 0, 1, ORDER_SEQUENTIALLY_CONSISTENT,
+                                           ORDER_SEQUENTIALLY_CONSISTENT, &won);
+            if (!won) {
+                // Another thread is making them; it takes one OS call or two.
+                thread::yield_now();
+                continue;
+            }
+            match (signals_set_up()) {
+                Result::Ok(_) => {
+                    intrinsics::atomic_store_u32(&g_setup, 2, ORDER_SEQUENTIALLY_CONSISTENT);
+                }
+                Result::Err(error) => {
+                    intrinsics::atomic_store_u32(&g_setup, 0, ORDER_SEQUENTIALLY_CONSISTENT);
+                    return Result::Err(error);
+                }
+            }
+        }
+        // Counted before the handler is installed, so the handler never
+        // sees no listener once it is in place for this one.
+        intrinsics::atomic_add_u32(&g_listeners, 1, ORDER_SEQUENTIALLY_CONSISTENT);
+        match (signals_install()) {
+            Result::Ok(_) => { return Result::Ok(Signals { }); }
+            Result::Err(error) => {
+                intrinsics::atomic_sub_u32(&g_listeners, 1, ORDER_SEQUENTIALLY_CONSISTENT);
+                return Result::Err(error);
+            }
+        }
+    }
+
+    /// The next signal not yet handed over, or `None` at once when there
+    /// is none.
+    public try_wait(&this) -> Option<Signal> {
+        mut pending: u64 = intrinsics::atomic_load_u64(&g_pending, ORDER_SEQUENTIALLY_CONSISTENT);
+        while (pending != 0) {
+            mut taken: u64 = PENDING_TERMINATE;
+            if ((pending & 0xFFFFFFFF) != 0) { taken = PENDING_INTERRUPT; }
+            mut won: boolean = false;
+            const seen: u64 = intrinsics::atomic_cmpxchg_u64(&g_pending, pending, pending - taken,
+                                                             ORDER_SEQUENTIALLY_CONSISTENT,
+                                                             ORDER_SEQUENTIALLY_CONSISTENT, &won);
+            if (won) {
+                if (taken == PENDING_INTERRUPT) { return Option::Some(Signal::interrupt()); }
+                return Option::Some(Signal::terminate());
+            }
+            pending = seen;
+        }
+        return Option::None;
+    }
+
+    /// Block until a signal arrives, and hand it over. One that arrived
+    /// before the call is handed over at once.
+    public wait(&this) -> Signal {
+        loop {
+            match (this.try_wait()) {
+                Option::Some(received) => { return received; }
+                Option::None => { }
+            }
+            signals_sleep(-1);
+        }
+    }
+
+    /// As `wait`, giving up with `None` once `duration` has passed.
+    public wait_timeout(&this, duration: Duration) -> Option<Signal> {
+        const deadline: Instant = Instant::now().saturating_add(&duration);
+        loop {
+            match (this.try_wait()) {
+                Option::Some(received) => { return Option::Some(received); }
+                Option::None => { }
+            }
+            const remaining: Duration = deadline.saturating_duration_since(&Instant::now());
+            if (remaining.is_zero()) { return Option::None; }
+            signals_sleep(remaining.as_millis_ceil() as i64);
+        }
+    }
+}
+
+implement trait Drop for struct Signals {
+    drop(mut &this) -> void {
+        intrinsics::atomic_sub_u32(&g_listeners, 1, ORDER_SEQUENTIALLY_CONSISTENT);
+    }
+}
