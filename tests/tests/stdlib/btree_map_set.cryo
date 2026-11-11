@@ -13,6 +13,7 @@ import std::core::option::{ Option };
 import std::core::drop::{ Drop };
 import std::core::clone::{ Clone };
 import std::core::iter::{ Iterator, DoubleEndedIterator };
+import std::core::ops::{ RangeBounds };
 import std::collections::array::{ Array };
 import std::collections::btree_map::{ BTreeMap };
 import std::collections::btree_set::{ BTreeSet };
@@ -132,6 +133,92 @@ function map_iterates_from_both_ends_until_they_meet() -> Result<(), TestError> 
     }
     expect_eq(taken, 200)?;
     expect_eq(front, back + 1)?;
+    return Result::Ok(());
+}
+
+/// Walk `map.range(bounds)` and expect exactly the map's keys from `lowest`
+/// to `highest`, both included: from the front only, or alternately from
+/// the front and the back until the two ends meet.
+function expect_range<R>(map: &BTreeMap<i64, i64>, bounds: R, lowest: i64, highest: i64,
+                         from_both_ends: boolean) -> Result<(), TestError> where R: RangeBounds<i64> {
+    mut front: i64 = lowest;
+    mut back: i64 = highest;
+    mut walk: implement Iterator<Pair<i64*, i64*>> + DoubleEndedIterator = map.range(bounds);
+    loop {
+        match (walk.next()) {
+            Option::Some(entry) => {
+                while (!map.contains_key(&front)) { front += 1; }
+                expect_eq(*entry.first, front)?;
+                expect_eq(*entry.second, front * 10)?;
+                front += 1;
+            }
+            Option::None => { break; }
+        }
+        if (from_both_ends) {
+            match (walk.next_back()) {
+                Option::Some(entry) => {
+                    while (!map.contains_key(&back)) { back -= 1; }
+                    expect_eq(*entry.first, back)?;
+                    back -= 1;
+                }
+                Option::None => { break; }
+            }
+        }
+    }
+    // Every key between the two ends was handed out by one of them.
+    while (front <= back && !map.contains_key(&front)) { front += 1; }
+    expect_eq(front > back, true)?;
+    expect_eq(walk.next().is_none(), true)?;
+    expect_eq(walk.next_back().is_none(), true)?;
+    return Result::Ok(());
+}
+
+![test]
+function map_range_hands_out_the_keys_inside_each_form_of_range() -> Result<(), TestError> {
+    // The even keys 0 to 398: deep enough that a range's ends descend
+    // through internal nodes, with gaps for a bound to fall into.
+    mut map: BTreeMap<i64, i64> = BTreeMap::new();
+    for (mut key: i64 = 398; key >= 0; key -= 2) { map.insert(key, key * 10); }
+    for (mut low: i64 = -3; low < 403; low += 3) {
+        // Steps of 3 land each end both on keys and between them.
+        for (mut high: i64 = -3; high < 403; high += 3) {
+            const both_ends: boolean = (low + high) % 2 == 0;
+            expect_range(&map, low..high, low, high - 1, both_ends)?;
+            expect_range(&map, low..=high, low, high, !both_ends)?;
+            expect_range(&map, ..high, -1, high - 1, both_ends)?;
+        }
+        expect_range(&map, low.., low, 399, true)?;
+        expect_range(&map, low.., low, 399, false)?;
+    }
+    // A `for` walks a range as it walks the whole map.
+    const ten: i64 = 10;
+    const twenty: i64 = 20;
+    mut count: i64 = 0;
+    for (entry in map.range(ten..twenty)) {
+        expect_eq(*entry.first >= 10 && *entry.first < 20, true)?;
+        count += 1;
+    }
+    expect_eq(count, 5)?;
+    const empty: BTreeMap<i64, i64> = BTreeMap::new();
+    const zero: i64 = 0;
+    expect_eq(empty.range(zero..).next().is_none(), true)?;
+    return Result::Ok(());
+}
+
+![test]
+function set_range_hands_out_the_values_inside_it() -> Result<(), TestError> {
+    mut set: BTreeSet<i64> = BTreeSet::new();
+    for (mut value: i64 = 0; value < 100; value++) { set.insert(value * 3); }
+    const low: i64 = 10;
+    const high: i64 = 40;
+    mut expected: i64 = 12;
+    for (value in set.range(low..=high)) {
+        expect_eq(*value, expected)?;
+        expected += 3;
+    }
+    expect_eq(expected, 42)?;
+    expect_eq(*set.range(..low).rev().next().unwrap(), 9)?;
+    expect_eq(set.range(high..low).next().is_none(), true)?;
     return Result::Ok(());
 }
 

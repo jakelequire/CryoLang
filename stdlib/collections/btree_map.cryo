@@ -33,6 +33,7 @@ import std::core::default::{ Default };
 import std::core::drop::{ Drop };
 import std::core::iter::{ DoubleEndedIterator, FromIterator, Iterator };
 import std::core::mem;
+import std::core::ops::{ Bound, RangeBounds };
 import std::core::ptr;
 import std::core::ptr::{ NonNull };
 import std::alloc::layout::{ Layout };
@@ -344,41 +345,53 @@ public type struct BTreeMap<K, V, A = GlobalAlloc> where A: Allocator {
     /// an owning key or value would be released twice. `entries` walks any
     /// map by borrow.
     public iter(&this) -> implement Iterator<Pair<K, V>> + DoubleEndedIterator where K: Copy, V: Copy {
-        return BTreeMapIter::<K, V> { cursor: BTreeCursor::new(this.root, this.length) };
+        return BTreeMapIter::<K, V> { cursor: BTreeCursor::new(this.root) };
     }
 
     /// Every key by value, in ascending order. Gated on `K: Copy`, as
     /// `iter` is.
     public keys(&this) -> implement Iterator<K> + DoubleEndedIterator where K: Copy {
-        return KeysIter::<K, V> { cursor: BTreeCursor::new(this.root, this.length) };
+        return KeysIter::<K, V> { cursor: BTreeCursor::new(this.root) };
     }
 
     /// Every value by value, in ascending key order. Gated on `V: Copy`, as
     /// `iter` is.
     public values(&this) -> implement Iterator<V> + DoubleEndedIterator where V: Copy {
-        return ValuesIter::<K, V> { cursor: BTreeCursor::new(this.root, this.length) };
+        return ValuesIter::<K, V> { cursor: BTreeCursor::new(this.root) };
     }
 
     /// Every entry as a borrowed key and value, in ascending key order:
     /// sound for any `K` and `V`, owning or not.
     public entries(&this) -> implement Iterator<Pair<K*, V*>> + DoubleEndedIterator {
-        return EntriesIter::<K, V> { cursor: BTreeCursor::new(this.root, this.length) };
+        return EntriesIter::<K, V> { cursor: BTreeCursor::new(this.root) };
+    }
+
+    /// The entries whose keys are in `bounds`, as borrowed keys and values,
+    /// in ascending key order and from either end: `map.range(low..high)`,
+    /// `map.range(low..=high)`, `map.range(low..)`, `map.range(..high)`,
+    /// with bounds of the key type. Finding where the range starts and ends
+    /// is O(log n).
+    public range<R>(&this, bounds: R) -> implement Iterator<Pair<K*, V*>> + DoubleEndedIterator
+            where K: Ord, R: RangeBounds<K> {
+        return EntriesIter::<K, V> {
+            cursor: BTreeCursor::between(this.root, bounds.start_bound(), bounds.end_bound())
+        };
     }
 
     /// Every key by borrow, in ascending order.
     public keys_ref(&this) -> implement Iterator<K*> + DoubleEndedIterator {
-        return KeysRefIter::<K, V> { cursor: BTreeCursor::new(this.root, this.length) };
+        return KeysRefIter::<K, V> { cursor: BTreeCursor::new(this.root) };
     }
 
     /// Every value by borrow, in ascending key order.
     public values_ref(&this) -> implement Iterator<V*> + DoubleEndedIterator {
-        return ValuesRefIter::<K, V> { cursor: BTreeCursor::new(this.root, this.length) };
+        return ValuesRefIter::<K, V> { cursor: BTreeCursor::new(this.root) };
     }
 
     /// Every value by writable borrow, in ascending key order: the way to
     /// change owning values in place.
     public values_mutable(mut &this) -> implement Iterator<mut V*> + DoubleEndedIterator {
-        return ValuesMutableIter::<K, V> { cursor: BTreeCursor::new(this.root, this.length) };
+        return ValuesMutableIter::<K, V> { cursor: BTreeCursor::new(this.root) };
     }
 
     /// Descend to `key`, splitting every full node on the way so that the
@@ -596,11 +609,16 @@ public type struct BTreeMap<K, V, A = GlobalAlloc> where A: Allocator {
     }
 }
 
-/// An in-order walk over a map's entries from both ends. Each end keeps the
-/// path from the root to its next entry: a frame `(node, index)` at the
-/// front means the next entry is `node`'s entry `index`, or, past the last
-/// one, the next frame up; at the back it means entry `index - 1`. The two
-/// ends stop when `remaining` entries have been handed out between them.
+/// An in-order walk over a run of a map's entries from both ends. Each end
+/// keeps the path from the root to its next entry: a frame `(node, index)`
+/// at the front means the next entry is `node`'s entry `index`, or, past the
+/// last one, the next frame up; at the back it means entry `index - 1`.
+///
+/// The run is `first` to `last`, the keys' slots inside their nodes. The
+/// ends meet by identity rather than by count: an end that reaches the entry
+/// the other end handed out last, or that hands out the far end of the run,
+/// finishes the walk for both. A slot names one entry while the map is not
+/// changed, which an iterator's borrow of the map already requires.
 internal type struct BTreeCursor<K, V> {
     private front_nodes: [mut BTreeNode<K, V>*; MAXIMUM_DEPTH];
     private front_indexes: [i64; MAXIMUM_DEPTH];
@@ -608,36 +626,136 @@ internal type struct BTreeCursor<K, V> {
     private back_nodes: [mut BTreeNode<K, V>*; MAXIMUM_DEPTH];
     private back_indexes: [i64; MAXIMUM_DEPTH];
     private back_depth: i64;
-    private remaining: i64;
+    private first: K*;
+    private last: K*;
+    private front_handed: K*;
+    private back_handed: K*;
+    private finished: boolean;
 
-    private static new(root: mut BTreeNode<K, V>*, length: i64) -> BTreeCursor<K, V> {
-        mut cursor: BTreeCursor<K, V> = BTreeCursor::<K, V> {
+    private static empty() -> BTreeCursor<K, V> {
+        return BTreeCursor::<K, V> {
             front_nodes: [null; MAXIMUM_DEPTH],
             front_indexes: [0; MAXIMUM_DEPTH],
             front_depth: 0,
             back_nodes: [null; MAXIMUM_DEPTH],
             back_indexes: [0; MAXIMUM_DEPTH],
             back_depth: 0,
-            remaining: length
+            first: null,
+            last: null,
+            front_handed: null,
+            back_handed: null,
+            finished: true
         };
+    }
+
+    /// Every entry of the tree under `root`.
+    private static new(root: mut BTreeNode<K, V>*) -> BTreeCursor<K, V> {
+        mut cursor: BTreeCursor<K, V> = BTreeCursor::empty();
         if (root != null) {
             cursor.push_leftmost(root);
             cursor.push_rightmost(root);
+            cursor.mark_run();
         }
         return cursor;
     }
 
+    /// The entries of the tree under `root` whose keys are after `start`
+    /// and before `end`. Each end descends once, so the run is found in
+    /// O(log n); a run whose start is after its end is empty.
+    private static between(root: mut BTreeNode<K, V>*, start: Bound<&K>, end: Bound<&K>) -> BTreeCursor<K, V>
+            where K: Ord {
+        mut cursor: BTreeCursor<K, V> = BTreeCursor::empty();
+        if (root == null) { return cursor; }
+        mut node: mut BTreeNode<K, V>* = root;
+        loop {
+            const index: i64 = BTreeCursor::<K, V>::entries_before(node, &start, true);
+            cursor.front_nodes[cursor.front_depth] = node;
+            cursor.front_indexes[cursor.front_depth] = index;
+            cursor.front_depth += 1;
+            if (node.leaf) { break; }
+            node = node.children[index];
+        }
+        node = root;
+        loop {
+            const index: i64 = BTreeCursor::<K, V>::entries_before(node, &end, false);
+            cursor.back_nodes[cursor.back_depth] = node;
+            cursor.back_indexes[cursor.back_depth] = index;
+            cursor.back_depth += 1;
+            if (node.leaf) { break; }
+            node = node.children[index];
+        }
+        cursor.mark_run();
+        if (!cursor.finished && (*cursor.first).compare(&*cursor.last).is_gt()) { cursor.finished = true; }
+        return cursor;
+    }
+
+    /// How many of `node`'s keys come before the range's start (`is_start`)
+    /// or are inside the range's end: the index each end descends at.
+    private static entries_before(node: mut BTreeNode<K, V>*, bound: &Bound<&K>, is_start: boolean) -> i64
+            where K: Ord {
+        mut index: i64 = 0;
+        while (index < node.length) {
+            // An unbounded start has no key before it; an unbounded end has
+            // every key inside it.
+            mut inside: boolean = !is_start;
+            match (*bound) {
+                Bound::Included(key) => {
+                    if (is_start) {
+                        inside = node.keys[index].compare(key).is_lt();
+                    } else {
+                        inside = !node.keys[index].compare(key).is_gt();
+                    }
+                }
+                Bound::Excluded(key) => {
+                    if (is_start) {
+                        inside = !node.keys[index].compare(key).is_gt();
+                    } else {
+                        inside = node.keys[index].compare(key).is_lt();
+                    }
+                }
+                Bound::Unbounded => { }
+            }
+            if (!inside) { return index; }
+            index += 1;
+        }
+        return index;
+    }
+
+    /// Record the run's two ends from the positions the stacks hold: the
+    /// entry each end hands out first. No entry at either end is an empty run.
+    private mark_run(mut &this) -> void {
+        this.first = null;
+        for (mut depth: i64 = this.front_depth - 1; depth >= 0 && this.first == null; depth--) {
+            const node: mut BTreeNode<K, V>* = this.front_nodes[depth];
+            const index: i64 = this.front_indexes[depth];
+            if (index < node.length) { this.first = &node.keys[index]; }
+        }
+        this.last = null;
+        for (mut depth: i64 = this.back_depth - 1; depth >= 0 && this.last == null; depth--) {
+            const node: mut BTreeNode<K, V>* = this.back_nodes[depth];
+            const index: i64 = this.back_indexes[depth];
+            if (index > 0) { this.last = &node.keys[index - 1]; }
+        }
+        this.finished = this.first == null || this.last == null;
+    }
+
     /// The next entry from the front, as the node holding it and its index.
     private next_front(mut &this) -> Option<Pair<mut BTreeNode<K, V>*, i64>> {
-        if (this.remaining == 0) { return Option::None; }
+        if (this.finished) { return Option::None; }
         loop {
             const top: i64 = this.front_depth - 1;
             const node: mut BTreeNode<K, V>* = this.front_nodes[top];
             const index: i64 = this.front_indexes[top];
             if (index < node.length) {
+                const key: K* = &node.keys[index];
+                if (key == this.back_handed) {
+                    this.finished = true;
+                    return Option::None;
+                }
                 this.front_indexes[top] = index + 1;
                 if (!node.leaf) { this.push_leftmost(node.children[index + 1]); }
-                this.remaining -= 1;
+                this.front_handed = key;
+                if (key == this.last) { this.finished = true; }
                 return Option::Some(Pair::new(node, index));
             }
             this.front_depth -= 1;
@@ -646,15 +764,21 @@ internal type struct BTreeCursor<K, V> {
 
     /// The next entry from the back, as the node holding it and its index.
     private next_back(mut &this) -> Option<Pair<mut BTreeNode<K, V>*, i64>> {
-        if (this.remaining == 0) { return Option::None; }
+        if (this.finished) { return Option::None; }
         loop {
             const top: i64 = this.back_depth - 1;
             const node: mut BTreeNode<K, V>* = this.back_nodes[top];
             const index: i64 = this.back_indexes[top];
             if (index > 0) {
+                const key: K* = &node.keys[index - 1];
+                if (key == this.front_handed) {
+                    this.finished = true;
+                    return Option::None;
+                }
                 this.back_indexes[top] = index - 1;
                 if (!node.leaf) { this.push_rightmost(node.children[index - 1]); }
-                this.remaining -= 1;
+                this.back_handed = key;
+                if (key == this.first) { this.finished = true; }
                 return Option::Some(Pair::new(node, index - 1));
             }
             this.back_depth -= 1;
@@ -716,7 +840,7 @@ internal type struct KeysIter<K, V> {
     private cursor: BTreeCursor<K, V>;
 
     internal static over<A>(map: &BTreeMap<K, V, A>) -> KeysIter<K, V> where A: Allocator {
-        return KeysIter::<K, V> { cursor: BTreeCursor::new(map.root, map.length) };
+        return KeysIter::<K, V> { cursor: BTreeCursor::new(map.root) };
     }
 }
 
@@ -786,7 +910,13 @@ internal type struct KeysRefIter<K, V> {
     private cursor: BTreeCursor<K, V>;
 
     internal static over<A>(map: &BTreeMap<K, V, A>) -> KeysRefIter<K, V> where A: Allocator {
-        return KeysRefIter::<K, V> { cursor: BTreeCursor::new(map.root, map.length) };
+        return KeysRefIter::<K, V> { cursor: BTreeCursor::new(map.root) };
+    }
+
+    /// The keys of `map` between `start` and `end`.
+    internal static between<A>(map: &BTreeMap<K, V, A>, start: Bound<&K>, end: Bound<&K>) -> KeysRefIter<K, V>
+            where K: Ord, A: Allocator {
+        return KeysRefIter::<K, V> { cursor: BTreeCursor::between(map.root, start, end) };
     }
 }
 
