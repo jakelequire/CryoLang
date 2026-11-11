@@ -9300,7 +9300,7 @@ type struct CallResolver {
             *claimed = true;
             return TypeRef::invalid();
         }
-        mut method_binds: [TypeRef] = this.infer_generic_method_bindings(call, scope, func_decl);
+        mut method_binds: [TypeRef] = this.infer_generic_method_bindings(call, scope, func_decl, tmpl);
         if (method_binds.length() != func.generic_params.length()) { return TypeRef::invalid(); }
         for (mut i: i64 = 0; i < method_binds.length(); i++) {
             if (!method_binds[i].is_valid()) { return TypeRef::invalid(); }
@@ -9405,9 +9405,14 @@ type struct CallResolver {
     /// what it writes, and a `_` in it is inferred from the argument types
     /// as an unwritten list's arguments are.  Returns a length-`generic_params`
     /// all-valid array, or `[]` when inference is incomplete or the list
-    /// does not write one argument for each parameter.
+    /// does not write one argument for each parameter.  The owner `tmpl`'s
+    /// parameters are unknowns of the same inference, solved and dropped: an
+    /// argument names them beside the method's (`&Holder<K, V, W>` in
+    /// `Viewer<K, V>::over<W>`), and held fixed they would not unify with
+    /// what a generic body passes for them (`&Holder<T, i64, A>`), leaving
+    /// the method's own unbound.
     infer_generic_method_bindings(mut &this, call: CallExpr*, scope: ScopeResolutionExpr*,
-                                  func_decl: DeclarationNode*) -> [TypeRef] {
+                                  func_decl: DeclarationNode*, tmpl: const TemplateEntry*) -> [TypeRef] {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         mut empty: [TypeRef] = [];
         const n: i64 = func.generic_params.length();
@@ -9420,6 +9425,7 @@ type struct CallResolver {
             const pref: TypeRef = this.arena.create_generic_param(gp.sym_id, gp.name, i as u64);
             pids.push(pref);
         }
+        for (mut i: i64 = 0; i < tmpl.param_types.length(); i++) { pids.push(tmpl.param_types[i]); }
         // Explicit turbofish on the member (`Wrap::make<i32>(..)`).
         mut targs: &[mut TypeAnnotation*] = &call.generic_args;
         if (targs.length() == 0 && scope.generic_args.length() > 0) { targs = &scope.generic_args; }
@@ -9478,9 +9484,9 @@ type struct CallResolver {
             this.state.in_symbolic_check);
         this.ctx.type_resolver.unify_callable_bounds(&func.trait_bounds, &method_syms, &ictx, null);
         mut bindings: [TypeRef] = [];
-        for (mut i: i64 = 0; i < ictx.bindings.length(); i++) { bindings.push(ictx.bindings[i]); }
-        for (mut i: i64 = 0; i < bindings.length(); i++) {
-            if (!bindings[i].is_valid()) { return empty; }
+        for (mut i: i64 = 0; i < n; i++) {
+            if (!ictx.bindings[i].is_valid()) { return empty; }
+            bindings.push(ictx.bindings[i]);
         }
         return bindings;
     }
