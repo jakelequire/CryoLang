@@ -22,45 +22,44 @@
 ///!              non-zero on success (and fills the full buffer in one
 ///!              call), zero on failure.
 ///!
-///! The OS divergence is hidden behind the private `fill_secure_bytes`
-///! helper; the public `try_fill` / `RandomSource::next_64` /
-///! `RandomSource::fill` bodies are platform-agnostic.
+///! The OS divergence is confined to `fill_secure_bytes`, one call to the
+///! OS; the `try_fill` / `RandomSource::next_64` / `RandomSource::fill`
+///! bodies are platform-agnostic.
 
 namespace std::random::secure;
 
 import std::core::intrinsics;
 import std::core::result::{ Result };
 import std::core::slice::{ Slice };
-import std::core::mem;
 import std::random::source::{ RandomSource };
 import std::random::error::{ RandomError };
 import std::io::bytes::{ ByteReader };
 import std::ffi::libc::{ getrandom };
 import std::sys::syscall;
 
-/// Fill `[buf, buf + len)` with cryptographically secure bytes from the
-/// OS.  Returns the number of bytes written on success (`>= 1` and
-/// `<= len`; partial fills are normal on UNIX), or `0` / a negative
-/// value on error.  Callers loop on partial fills.
+/// Write cryptographically secure bytes from the OS to the front of
+/// `buffer`, in one call to the OS. Returns the number written on success
+/// (`>= 1` and `<= buffer.length()`; a partial fill is normal on UNIX), or
+/// `0` / a negative value on error. `SecureRng.try_fill` and `fill` repeat
+/// it until the whole buffer is written.
 ///
 /// The two OS-gated bodies are picked by the ConfigGating pass before
 /// name resolution, so name lookup only ever sees one definition.
 ![target(linux)]
-public function fill_secure_bytes(buf: mut u8*, len: u64) -> i64 {
-    return getrandom(buf, len, 0);
+public function fill_secure_bytes(buffer: mut &Slice<u8>) -> i64 {
+    return getrandom(buffer.as_mutable_ptr(), buffer.length() as u64, 0);
 }
 
 ![target(windows)]
-public function fill_secure_bytes(buf: mut u8*, len: u64) -> i64 {
+public function fill_secure_bytes(buffer: mut &Slice<u8>) -> i64 {
     // RtlGenRandom takes a u32 length and a single i32 result
     // (non-zero on success).  Clamp the per-call length to u32::MAX so
     // a > 4 GiB request becomes multiple calls; the caller's loop
     // handles partial fills.
-    mut req: u32 = u32::MAX;
-    if (len < (req as u64)) { req = len as u32; }
-    const ok: i32 = syscall::SystemFunction036(buf, req);
+    mut request: u32 = u32::MAX;
+    if (buffer.length() < (request as i64)) { request = buffer.length() as u32; }    const ok: i32 = syscall::SystemFunction036(buffer.as_mutable_ptr(), request);
     if (ok == 0) { return -1; }
-    return req as i64;
+    return request as i64;
 }
 
 /// Cryptographically secure source backed by the kernel CSPRNG. Slower
@@ -75,17 +74,15 @@ public type struct SecureRng {
     /// the kernel source cannot satisfy the request. The careful
     /// counterpart to the `RandomSource::fill` default (which panics on
     /// failure). On `Ok` the whole view is written.
-    public try_fill(&this, dst: mut &Slice<u8>) ->Result<(), RandomError> {
-        const len: u64 = dst.length() as u64;
-        const buf: mut u8* = dst.as_mutable_ptr();
-        mut done: u64 = 0;
-        while (done < len) {
-            const n: i64 = fill_secure_bytes(
-                mem::offset(buf, done as i64), len - done);
-            if (n <= 0) {
+    public try_fill(&this, dst: mut &Slice<u8>) -> Result<(), RandomError> {
+        const length: i64 = dst.length();
+        mut done: i64 = 0;
+        while (done < length) {
+            const written: i64 = fill_secure_bytes(dst.subslice_mutable(done, length));
+            if (written <= 0) {
                 return Result::Err(RandomError::EntropyUnavailable);
             }
-            done = done + (n as u64);
+            done = done + written;
         }
         return Result::Ok(());
     }
@@ -93,33 +90,18 @@ public type struct SecureRng {
 
 implement trait RandomSource for struct SecureRng {
     next_64(mut &this) -> u64 {
-        mut b: [u8; 8];
-        mut done: u64 = 0;
-        while (done < 8) {
-            const n: i64 = fill_secure_bytes(
-                mem::offset(&b[0], done as i64), 8 - done);
-            if (n <= 0) {
-                core::panic("SecureRng::next_64: kernel entropy unavailable", intrinsics::location());
-            }
-            done = done + (n as u64);
-        }
-        mut word: ByteReader = ByteReader::new(Slice::from_raw(&b[0], 8));
+        mut bytes: [u8; 8];
+        this.fill(&bytes);
+        mut word: ByteReader = ByteReader::new(bytes.as_slice());
         return word.read_u64_little_endian().unwrap();
     }
 
-    /// Override the byte-fill default to pull straight from the kernel in
-    /// one pass rather than synthesizing bytes from `next_64`.
-    fill(mut &this, dst: mut &Slice<u8>) ->void {
-        const len: u64 = dst.length() as u64;
-        const buf: mut u8* = dst.as_mutable_ptr();
-        mut done: u64 = 0;
-        while (done < len) {
-            const n: i64 = fill_secure_bytes(
-                mem::offset(buf, done as i64), len - done);
-            if (n <= 0) {
-                core::panic("SecureRng::fill: kernel entropy unavailable", intrinsics::location());
-            }
-            done = done + (n as u64);
+    /// Override the byte-fill default to pull straight from the kernel
+    /// rather than synthesizing bytes from `next_64`. Panics when the
+    /// kernel cannot supply them; `try_fill` reports it instead.
+    fill(mut &this, dst: mut &Slice<u8>) -> void {
+        if (this.try_fill(dst).is_err()) {
+            core::panic("SecureRng::fill: kernel entropy unavailable", intrinsics::location());
         }
     }
 }
