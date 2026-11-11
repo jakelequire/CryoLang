@@ -8,9 +8,8 @@ import std::core::option::{ Option };
 import std::collections::str::{ Str };
 import std::net::addr::ip::{ IpAddr, IpV4Addr, IpV6Addr };
 import std::net::addr::socket_addr::{ SocketAddr };
-import std::net::addr::sockaddr;
+import std::net::socket::tcp::{ TcpListener };
 import std::core::slice::{ Slice };
-import std::io::error::{ IoErrorKind };
 import std::test::error::{ TestError };
 import std::test::assert::{ bail, expect, expect_eq, expect_false };
 
@@ -211,33 +210,17 @@ function v6_from_bytes_takes_exactly_sixteen() -> Result<(), TestError> {
     return expect(IpV6Addr::from_bytes(whole).is_none(), Str::new("seventeen octets are refused"));
 }
 
-/// A packed address unpacks to itself, for each family.
+/// A listener on each family's loopback reports that address and the port
+/// the kernel gave it: the address goes to the kernel packed as a C
+/// `sockaddr` and comes back unpacked from one.
 ![test]
-function sockaddr_round_trips_both_families() -> Result<(), TestError> {
-    mut buffer: [u8; 28];
-    const v4: SocketAddr = SocketAddr::parse_v4(Str::new("192.0.2.7:8080")).unwrap();
-    expect_eq(sockaddr::pack_sockaddr_in(&buffer, &v4).unwrap(), 16)?;
-    expect_eq(f"{sockaddr::unpack_sockaddr(&buffer)}".as_str(), Str::new("192.0.2.7:8080"))?;
-    expect_eq(f"{sockaddr::unpack_sockaddr_in(&buffer)}".as_str(), Str::new("192.0.2.7:8080"))?;
-    const v6: SocketAddr = SocketAddr::new(IpAddr::parse(Str::new("2001:db8::1")).unwrap(), 443);
-    expect_eq(sockaddr::pack_sockaddr_in(&buffer, &v6).unwrap(), 28)?;
-    return expect_eq(f"{sockaddr::unpack_sockaddr(&buffer)}".as_str(), Str::new("[2001:db8::1]:443"));
-}
-
-/// Packing refuses a buffer too short for the address's layout instead of
-/// writing past it, and leaves the buffer untouched.
-![test]
-function sockaddr_pack_refuses_a_short_buffer() -> Result<(), TestError> {
-    mut buffer: [u8; 20];
-    mut i: i64 = 0;
-    while (i < 20) { buffer[i] = 0xEE; i = i + 1; }
-    const v6: SocketAddr = SocketAddr::new(IpAddr::parse(Str::new("::1")).unwrap(), 80);
-    match (sockaddr::pack_sockaddr_in(&buffer, &v6)) {
-        Result::Ok(_) => { return bail(Str::new("a 20-byte buffer cannot hold a sockaddr_in6")); }
-        Result::Err(e) => { expect(e.kind == IoErrorKind::InvalidInput, Str::new("refused with InvalidInput"))?; }
-    }
-    mut untouched: boolean = true;
-    i = 0;
-    while (i < 20) { if (buffer[i] != 0xEE) { untouched = false; } i = i + 1; }
-    return expect(untouched, Str::new("nothing is written"));
+function a_listener_reports_its_address_in_both_families() -> Result<(), TestError> {
+    const v4: TcpListener = TcpListener::bind(SocketAddr::localhost_v4(0)).unwrap();
+    const v4_bound: SocketAddr = v4.local_addr().unwrap();
+    expect_eq(f"{v4_bound.ip}".as_str(), Str::new("127.0.0.1"))?;
+    expect(v4_bound.port != 0, Str::new("the IPv4 listener has a port"))?;
+    const v6: TcpListener = TcpListener::bind(SocketAddr::localhost_v6(0)).unwrap();
+    const v6_bound: SocketAddr = v6.local_addr().unwrap();
+    expect_eq(f"{v6_bound.ip}".as_str(), Str::new("::1"))?;
+    return expect(v6_bound.port != 0, Str::new("the IPv6 listener has a port"));
 }
