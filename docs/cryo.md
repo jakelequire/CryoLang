@@ -1269,7 +1269,7 @@ This is a defined deterministic result, not undefined behavior, but it is *silen
 | `<` `>` `<=` `>=` | Ordering comparisons                                                                  |
 | `<=>`             | Three-way comparison (spaceship); yields an `Ordering` (`Less` / `Equal` / `Greater`) |
 
-Comparison operators return `boolean`. On numeric types and pointers they emit native instructions; on user-defined types that implement `Eq`/`Ord` they are **overloaded** - `a == b` becomes `a.equals(&b)` and `a < b` becomes `a.compare(&b).is_lt()` (see operator overloading, [section 10.6](#106-operator-overloading)).
+Comparison operators return `boolean`. On numeric types and pointers they emit native instructions; on user-defined types that implement `Eq`/`Ord` they are **overloaded** - `a == b` becomes `a.equals(&b)` and `a < b` becomes `a.compare(&b).is_lt()` (see operator overloading, [section 10.6](#106-operator-overloading)). The two sides of `==` and `!=` are one type, so the right operand is typed with the left operand's type as its expected type, as an initializer is with its declared type: with `opt: Option<i64>`, `opt == Option::Some(4)` builds an `Option<i64>` and `r == Result::Ok(1)` infers `r`'s error type. A pointer or a reference on the left sets no expectation.
 
 **Unrelated types are not compared.** Two values of different enum types, or two pointers neither of which converts to the other, are refused (E0200) by every comparison operator. An enum compares its discriminant, so `A::Z == B::W` would otherwise answer by variant position; two pointers to unrelated structs never hold the same address. A pointer still compares with `null`, with a `void*`, and with a pointer it converts to (`T*` with `const T*`):
 
