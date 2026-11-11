@@ -2271,8 +2271,8 @@ type struct MonoCallSpecializer {
         // `(Beta for Wrap<i32>)::make()`).  A generic one (`Wrap<A>::make<T>`,
         // `Wrap<A>::keep<T>(&w, t)`), wherever it is written, needs its OWN
         // `<T>` specialized on the owner's specialization - the stash is the
-        // METHOD's `<T>`; owner args come from the scope turbofish or
-        // template defaults.
+        // METHOD's `<T>`; the owner is the receiver sema selected the method
+        // on.
         const func_decl: DeclarationNode* = this.decl_index.method_func_of(call.template_method);
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return false; }
@@ -2308,12 +2308,13 @@ type struct MonoCallSpecializer {
         }
 
         // --- Generic method on a generic owner (`Wrap<A>::make<T>`) ---
-        return this.specialize_generic_path_method(call, scope, entry, subst);
+        return this.specialize_generic_path_method(call, entry, subst);
     }
 
     /// Specialize a call through a path to a GENERIC method of a GENERIC
     /// owner (`Wrap<A>::make<T>(item)`, `Wrap<A>::keep<T>(&w, t)`).  The owner
-    /// spec is materialized (via the scope turbofish / template defaults) and
+    /// spec is materialized (the receiver sema selected the method on, put in
+    /// this copy's terms) and
     /// the owner's method for the recorded definition is instantiated at
     /// sema's stash of the method's OWN `<T>` - exactly as a member call
     /// (`w.keep::<T>(t)`) is, with the owner's specialization as the
@@ -2321,29 +2322,34 @@ type struct MonoCallSpecializer {
     /// the owner spec entry does not exist yet: the owner is enqueued and the
     /// call is left UNPINNED so the walk/drain fixpoint (specialization.cryo)
     /// re-visits it once the entry materializes.
-    specialize_generic_path_method(mut &this, call: mut CallExpr*, scope: ScopeResolutionExpr*,
+    specialize_generic_path_method(mut &this, call: mut CallExpr*,
                                    entry: const TemplateEntry*, subst: TypeSubstitution*) -> boolean {
         const registry: mut GenericRegistry* = this.generic_registry;
         if (registry == null) { return false; }
 
-        // Owner binds: scope turbofish, else template defaults.
-        mut owner_binds: [TypeRef] = this.compute_owner_default_binds(scope, entry, subst);
-        if (owner_binds.length() != entry.param_types.length()) { return false; }
+        // The owner: sema's receiver, in this copy's terms.
+        if (!call.template_recv.is_valid()) { return false; }
+        const owner: TypeRef = this.concretize_stashed_arg(call.template_recv, subst);
+        if (!owner.is_valid() || this.arena.contains_generic_param(owner)) { return false; }
+        mut owner_args: [TypeRef] = [];
+        for (mut i: i64 = 0; i < this.arena.inst_type_arg_count(owner); i++) {
+            owner_args.push(this.arena.inst_type_arg_at(owner, i));
+        }
+        if (owner_args.length() != entry.param_types.length()) { return false; }
 
         // Materialize the owner instantiation.
-        const inst_ref: TypeRef = registry.instantiate(
-            entry.base_type, owner_binds);
+        const inst_ref: TypeRef = registry.instantiate(entry.base_type, owner_args);
         if (!inst_ref.is_valid()) { return false; }
 
         // Find the owner spec entry.  On the first walk it does not exist yet:
-        // enqueue it and leave the call unpinned for the next fixpoint iteration.
+        // enqueue it and leave the call unpinned, queued to be bound once the
+        // drain mints the owner.  Sema's receiver may already be this very
+        // instance, so whether the receiver changed cannot tell a first walk.
         mut spec_entry: SpecializationEntry* = this.find_owner_spec_entry(inst_ref);
         if (spec_entry == null) {
             this.state.enqueue_from_type_ref(inst_ref);
-            if (!call.template_recv.equals(inst_ref)) {
-                call.template_recv = inst_ref;
-                this.queue_bind(call);
-            }
+            call.template_recv = inst_ref;
+            this.queue_bind(call);
             return true;
         }
         const recv_type: TypeRef = spec_entry.specialized_type;
@@ -2355,31 +2361,6 @@ type struct MonoCallSpecializer {
         return true;
     }
 
-    /// Owner type args for a generic-owner static call in mono: explicit scope
-    /// turbofish (`Wrap<u8>::make`) if present, else all-default (`Wrap` ->
-    /// `Wrap<i32>`).  Mirrors sema's `compute_generic_static_owner_binds`.
-    compute_owner_default_binds(mut &this, scope: ScopeResolutionExpr*,
-                                entry: const TemplateEntry*, subst: TypeSubstitution*) -> [TypeRef] {
-        const want: i64 = entry.param_types.length();
-        if (want == 0) { return []; }
-        if (this.type_resolver == null) { return []; }
-        mut rc: ResolutionContext = ResolutionContext::new("");
-        mut binds: [TypeRef] = [];
-        for (mut i: i64 = 0; i < scope.scope_generic_args.length(); i++) {
-            mut tr: TypeRef = this.type_resolver.resolve(scope.scope_generic_args[i], &rc);
-            if (subst != null) { tr = subst.apply(tr, this.arena); }
-            if (!tr.is_valid()) { return []; }
-            binds.push(tr);
-        }
-        if (binds.length() < want) {
-            binds = this.type_resolver.expand_default_type_args(entry, binds, &rc);
-        }
-        if (binds.length() != want) { return []; }
-        for (mut i: i64 = 0; i < binds.length(); i++) {
-            if (!binds[i].is_valid() || this.arena.contains_generic_param(binds[i])) { return []; }
-        }
-        return binds;
-    }
 
     /// Find the materialized owner spec entry for an owner instantiation
     /// (display-equal on `instantiated_type`, matching the instance-method path).

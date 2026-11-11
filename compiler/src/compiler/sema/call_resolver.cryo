@@ -9267,17 +9267,22 @@ type struct CallResolver {
             if (!method_binds[i].is_valid()) { return TypeRef::invalid(); }
         }
 
-        // Owner args: explicit scope turbofish, else all-defaults.
-        mut owner_binds: [TypeRef] = this.compute_generic_static_owner_binds(scope, tmpl);
+        // The owner's arguments are answered as for a static method with none
+        // of its own: the path's turbofish, else what the call's arguments and
+        // expected type infer, else the template's defaults. The method's own
+        // parameters take no part in that inference.
+        mut owner_binds: [TypeRef] = this.compute_static_owner_bindings(scope, call_e, call, tmpl, func_decl);
         if (owner_binds.length() != tmpl.param_types.length()) { return TypeRef::invalid(); }
 
-        // Stash the METHOD binds for mono (mono derives owner binds itself from the
-        // scope turbofish / defaults, exactly as here).
+        // Mono reads the METHOD's arguments from the stash and the owner from
+        // the receiver the method was selected on; inside a generic body
+        // either may name the body's parameters, which each copy substitutes.
         if (call.resolved_type_args.length() == 0) {
             mut stash: [TypeRef] = [];
             for (mut i: i64 = 0; i < method_binds.length(); i++) { stash.push(method_binds[i]); }
             call.set_resolved_type_args(stash);
         }
+        call.template_recv = this.arena.create_instantiation(tmpl.base_type, owner_binds);
 
         // Resolve the return type: substitute owner params AND the method's `<T>`.
         mut subst: TypeSubstitution = TypeSubstitution::empty();
@@ -9441,32 +9446,6 @@ type struct CallResolver {
         return bindings;
     }
 
-    /// Owner type args for a generic-owner static call: explicit scope turbofish
-    /// (`Wrap<u8>::make`) if present, else all-default (`Wrap` -> `Wrap<i32>`).
-    /// Owner args are NOT inferred from the arguments here - those determine the
-    /// METHOD's `<T>`, not the owner's params.  Inside a generic body they may
-    /// name the body's parameters.
-    compute_generic_static_owner_binds(mut &this, scope: ScopeResolutionExpr*,
-                                       tmpl: const TemplateEntry*) -> [TypeRef] {
-        const want: i64 = tmpl.param_types.length();
-        if (want == 0) { return []; }
-        mut rc: ResolutionContext = ResolutionContext::new("");
-        this.symbolic.bind_body_scope(&rc);
-        mut sb: [TypeRef] = [];
-        for (mut i: i64 = 0; i < scope.scope_generic_args.length(); i++) {
-            const tr: TypeRef = this.ctx.type_resolver.resolve(scope.scope_generic_args[i], &rc);
-            if (!tr.is_valid()) { return []; }
-            sb.push(tr);
-        }
-        if (sb.length() < want) {
-            sb = this.ctx.type_resolver.expand_default_type_args(tmpl, sb, &rc);
-        }
-        if (sb.length() != want) { return []; }
-        for (mut i: i64 = 0; i < sb.length(); i++) {
-            if (!sb[i].is_valid()) { return []; }
-        }
-        return sb;
-    }
 
     /// Stash a call's owner type args for mono, for a call through a path
     /// whose owner is a generic type.  The method is the one recorded where
@@ -10691,8 +10670,8 @@ type struct CallResolver {
     /// (`(&FilterIter<I>::Item) -> boolean`) is not checked here (passed as invalid,
     /// which `check_args_against_params` skips): its projections are reduced
     /// only in the copies.  A method with type parameters of its own has the
-    /// METHOD's arguments stashed, and the owner's from the path or the
-    /// template's defaults.  A call with no complete stash is not checked here.
+    /// METHOD's arguments stashed, and the owner's on the receiver it was
+    /// selected on.  A call with no complete stash is not checked here.
     check_template_static_args(mut &this, visitor: mut SemaVisitor*, scope: ScopeResolutionExpr*,
                                call: mut CallExpr*) -> void {
         const tmpl: const TemplateEntry* = this.resolve_scope_owner_template(scope);
@@ -10713,7 +10692,8 @@ type struct CallResolver {
         if (func.generic_params.length() == 0) {
             for (mut i: i64 = 0; i < call.resolved_type_args.length(); i++) { owner_args.push(call.resolved_type_args[i]); }
         } else {
-            owner_args = this.compute_generic_static_owner_binds(scope, tmpl);
+            if (!call.template_recv.is_valid()) { return; }
+            owner_args = this.types.view_type_args_copy(call.template_recv);
             method_args = &call.resolved_type_args;
         }
         if (owner_args.length() != tmpl.param_types.length()) { return; }
