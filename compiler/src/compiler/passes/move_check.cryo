@@ -1942,6 +1942,7 @@ type struct MoveChecker {
             // and move the RHS into it (same real=false rationale as above).
             if (b.left  != null) { this.walk_expr_read(b.left); }
             if (b.right != null) { this.walk_expr_move(b.right, false); }
+            this.reinitialise_moved_field(b.left);
             return;
         }
         if (b.left != null)  { this.walk_expr_read(b.left); }
@@ -2117,6 +2118,26 @@ type struct MoveChecker {
             }
         }
         return -1;
+    }
+
+    /// An assignment to a field moved out of its owner (`h.r = make();`,
+    /// `this.r = this.r.with_flag();`) gives the owner that field back, so
+    /// the owner is whole again and its later uses are not partial-move
+    /// uses. Only an unconditional assignment does: one in a branch or a
+    /// loop leaves the field moved on the paths that skip it, so the entry
+    /// stays. Mirrored in drop_insertion, whose scope-exit drop then
+    /// releases the field again.
+    reinitialise_moved_field(mut &this, place: ExpressionNode*) -> void {
+        if (this.branch_depth != 0 || place == null) { return; }
+        const ma: MemberAccessExpr* = ExpressionNode::member_access_of(place);
+        if (ma == null) { return; }
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(ma.object);
+        if (id == null) { return; }
+        const moved: i64 = this.pm_position(id.res.local_sym().key(), ma.member.id);
+        if (moved < 0) { return; }
+        this.pm_binding.remove(moved);
+        this.pm_field.remove(moved);
+        this.pm_site.remove(moved);
     }
 
     pm_has_binding(&this, binding_id: u64) -> boolean {

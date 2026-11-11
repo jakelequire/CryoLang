@@ -1,0 +1,73 @@
+///! A field moved out of its owner and then assigned again gives the owner the
+///! field back: the owner can be used whole afterwards, and each value is
+///! released exactly once - the one moved out by whoever took it, the new one
+///! with its owner. Releases are recorded as a sum of distinct values, so a
+///! missing or doubled release names the value.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::ReassignedMovedFieldMakesOwnerWhole;
+
+import std::core::result::{ Result };
+import std::core::mem;
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_eq };
+
+mut g_released: i64 = 0;
+
+type struct Resource {
+    value: i64;
+
+    with_flag(this) -> Resource {
+        const next: i64 = this.value + 1;
+        mem::drop(this);
+        return Resource { value: next };
+    }
+}
+
+implement trait Drop for struct Resource {
+    drop(mut &this) -> void { g_released = g_released + this.value; }
+}
+
+type struct Holder {
+    resource: Resource;
+    count: i64;
+
+    bump(mut this) -> Holder {
+        this.resource = this.resource.with_flag();
+        return this;
+    }
+}
+
+function total_of(holder: Holder) -> i64 {
+    return holder.resource.value + holder.count;
+}
+
+![test]
+function a_receiver_field_replaced_from_itself_returns_whole() -> Result<(), TestError> {
+    g_released = 0;
+    mut seen: i64 = 0;
+    {
+        const holder: Holder = Holder { resource: Resource { value: 10 }, count: 1 };
+        const bumped: Holder = holder.bump();
+        seen = bumped.resource.value;
+    }
+    const want_seen: i64 = 11;
+    if (seen != want_seen) { return expect_eq(seen, want_seen); }
+    // `with_flag` releases 10 and makes 11; the holder releases 11 once.
+    const want_released: i64 = 21;
+    return expect_eq(g_released, want_released);
+}
+
+![test]
+function a_local_field_moved_out_and_assigned_again_moves_whole() -> Result<(), TestError> {
+    g_released = 0;
+    mut holder: Holder = Holder { resource: Resource { value: 3 }, count: 2 };
+    const taken: Resource = holder.resource;
+    holder.resource = Resource { value: 40 };
+    const total: i64 = total_of(holder) + taken.value;
+    mem::drop(taken);
+    const want_total: i64 = 45;
+    if (total != want_total) { return expect_eq(total, want_total); }
+    const want_released: i64 = 43;
+    return expect_eq(g_released, want_released);
+}

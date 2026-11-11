@@ -2544,6 +2544,27 @@ type struct DropInserter {
         return false;
     }
 
+    /// An unconditional assignment to a field moved out of its owner gives
+    /// the owner the field back: the owner's scope-exit drop releases it
+    /// again. The same rule as MoveCheck's, which must agree on which fields
+    /// the owner still holds; the value the assignment displaced was moved
+    /// out, and `record_assign_drop` has already declined to release it.
+    reinitialise_moved_field(mut &this, place: ExpressionNode*) -> void {
+        if (this.branch_depth != 0 || place == null) { return; }
+        const ma: MemberAccessExpr* = ExpressionNode::member_access_of(place);
+        if (ma == null) { return; }
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(ma.object);
+        if (id == null) { return; }
+        const owner_id: u64 = id.res.local_sym().key();
+        for (mut i: i64 = 0; i < this.pm_binding.length(); i++) {
+            if (this.pm_binding[i] == owner_id && this.pm_field[i] == ma.member.id) {
+                this.pm_binding.remove(i);
+                this.pm_field.remove(i);
+                return;
+            }
+        }
+    }
+
     /// True when `ty` is a pointer or reference (a borrow, not an owned place).
     is_ptr_or_ref(&this, ty: TypeRef) -> boolean {
         if (!ty.is_valid() || this.arena == null) { return false; }
@@ -4378,6 +4399,8 @@ type struct DropInserter {
                 const left_id: IdentifierExpr* = ExpressionNode::identifier_of(b.left);
                 if (left_id != null) {
                     this.unmark_moved(left_id.res.local_sym());
+                } else {
+                    this.reinitialise_moved_field(b.left);
                 }
             } else {
                 this.walk_conditional_operand(b.right,
