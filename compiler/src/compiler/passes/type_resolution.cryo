@@ -2302,11 +2302,14 @@ type struct TypeResolutionPasses {
     /// `FromResidual<Result<(), E>> for Result<T, F> where F: From<E>`, where
     /// `F` converts from several errors - so a method whose parameters name
     /// it is generic over it and each call binds it from its arguments.  A
-    /// method that names it only in its return cannot be bound by a call, and
-    /// keeps the binding the where-clause derives for the block
-    /// (`A` in `Iterator<A> for TakeN<I> where I: Iterator<A>`).  The
-    /// parameter keeps its one declaration, which every name in the block was
-    /// resolved to; it is appended after the method's own, once.
+    /// method that names it only in its return keeps the binding the
+    /// where-clause derives for the block, when one does (`A` in
+    /// `Iterator<A> for TakeN<I> where I: Iterator<A>`); when none does
+    /// (`implement<T> trait RangeBounds<T> for RangeFull`), the method is
+    /// generic over it too, and a call binds it from the trait arguments the
+    /// bound it goes through gives its result.  The parameter keeps its one
+    /// declaration, which every name in the block was resolved to; it is
+    /// appended after the method's own, once.
     static lend_trait_argument_params(node: ImplBlock*) -> void {
         const trait_generic: GenericAnnotation* = GenericRegistry::trait_generic_of(node.trait_annotation);
         if (trait_generic == null) { return; }
@@ -2316,6 +2319,14 @@ type struct TypeResolutionPasses {
             if (param == null || !param.sym_id.is_valid() || param.sym_id.equals(node.target_param())) { continue; }
             if (TypeResolutionPasses::annotations_name(&node.target_args, param.sym_id)) { continue; }
             if (!TypeResolutionPasses::annotations_name(&trait_generic.args, param.sym_id)) { continue; }
+            mut derived: boolean = false;
+            for (mut b: i64 = 0; b < node.where_bounds.length(); b++) {
+                for (mut r: i64 = 0; r < node.where_bounds[b].trait_refs.length(); r++) {
+                    if (TypeResolutionPasses::annotations_name(&node.where_bounds[b].trait_refs[r].type_args, param.sym_id)) {
+                        derived = true;
+                    }
+                }
+            }
             for (mut mi: i64 = 0; mi < node.methods.length(); mi++) {
                 const method: MethodDecl* = DeclarationNode::method_of(node.methods[mi]);
                 if (method == null || method.func == null) { continue; }
@@ -2326,6 +2337,7 @@ type struct TypeResolutionPasses {
                     const p: VarDecl* = DeclarationNode::var_of(f.parameters[k]);
                     if (p != null && !p.is_receiver()) { taken.push(p.type_annotation); }
                 }
+                if (!derived && f.return_type_annotation != null) { taken.push(f.return_type_annotation); }
                 if (!TypeResolutionPasses::annotations_name(&taken, param.sym_id)) { continue; }
                 mut lent: boolean = false;
                 for (mut g: i64 = 0; g < f.generic_params.length(); g++) {

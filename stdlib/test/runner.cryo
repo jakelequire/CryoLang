@@ -180,6 +180,10 @@ private type struct RunOptions {
     /// CreateProcess-re-execs the test binary once per test (Windows has no
     /// `fork`, so each test runs in a fresh process selected by index).
     private child_idx: i64;
+    /// `--test-runner-role=<name>`: run only the `![child_role]` function
+    /// of this fully-qualified name, the way `ChildRole::command` starts it.
+    /// Empty when the binary is not running as a child role.
+    private child_role: String;
 
     private static default() -> RunOptions {
         return RunOptions {
@@ -202,12 +206,15 @@ private type struct RunOptions {
             capture:         true,
             show_output:     false,
             child_idx:       -1,
+            child_role:      String::new(),
         };
     }
 
     /// What a test binary's command line may hold: every flag and option
-    /// `cryo test` forwards, and the runner's own `--test-runner-child`,
-    /// which it re-runs itself with. Anything else is refused.
+    /// `cryo test` forwards, the runner's own `--test-runner-child`, which
+    /// it re-runs itself with, and `--test-runner-role`, which
+    /// `ChildRole::command` starts a child role with. Anything else is
+    /// refused.
     private static argument_parser() -> ArgumentParser {
         mut parser: ArgumentParser = ArgumentParser::new(Str::new("cryo test"));
         parser.optional_positional(Str::new("pattern"), Str::new("run only the tests whose name contains this"))
@@ -222,7 +229,8 @@ private type struct RunOptions {
             .option(Str::new("color"), Option::None, Str::new("auto|always|never"), Str::new("whether results are coloured"))
             .option(Str::new("timeout"), Option::None, Str::new("seconds"), Str::new("the time each test may take, 0 for no limit (default 60)"))
             .option(Str::new("jobs"), Option::Some('j'), Str::new("count"), Str::new("how many tests run at once, 0 for one per processor"))
-            .option(Str::new("test-runner-child"), Option::None, Str::new("index"), Str::new("run only the test at this index, in this process"));
+            .option(Str::new("test-runner-child"), Option::None, Str::new("index"), Str::new("run only the test at this index, in this process"))
+            .option(Str::new("test-runner-role"), Option::None, Str::new("name"), Str::new("run only the child role of this name, in this process"));
         return parser;
     }
 
@@ -265,6 +273,10 @@ private type struct RunOptions {
                     Result::Err(_)    => { -1 }
                 };
             }
+            Option::None => { }
+        }
+        match (arguments.value(Str::new("test-runner-role"))) {
+            Option::Some(value) => { options.child_role = String::from_str(value); }
             Option::None => { }
         }
         apply_env_defaults(&options);
@@ -1644,12 +1656,15 @@ implement trait Drop for struct TestRunner {
 ///
 /// `descriptors` is a static array baked into the executable by the
 /// compiler's `TestMainCodegen` pass. `count` is the number of entries.
-/// Both must be valid for the duration of the call. This free function
-/// keeps the exact signature the compiler synthesizes a call to; it
-/// constructs a `TestRunner` and delegates.
+/// `roles` is the same kind of table for the `![child_role]` functions,
+/// which run only when `--test-runner-role` names one. All must be valid
+/// for the duration of the call. This free function keeps the exact
+/// signature the compiler synthesizes a call to; it constructs a
+/// `TestRunner` and delegates.
 ![language("run_all_tests")]
 internal function run_all(argc: i32, argv: u8**,
-                 descriptors: TestDescriptor*, count: u64) -> i32 {
+                 descriptors: TestDescriptor*, count: u64,
+                 roles: TestDescriptor*, role_count: u64) -> i32 {
     env::set_args(argc, argv);
     const command_line: Array<String> = env::args();
     const parser: ArgumentParser = RunOptions::argument_parser();
@@ -1674,6 +1689,21 @@ internal function run_all(argc: i32, argv: u8**,
     if (opts.child_idx >= 0) {
         return run_child_single(opts.child_idx as u64, descriptors, count,
                                 opts.timeout_secs);
+    }
+
+    // Child role: run the one `![child_role]` function named, exactly as a
+    // test child runs its test.
+    if (opts.child_role.length() > 0) {
+        const wanted: Str = opts.child_role.as_str();
+        mut index: u64 = 0;
+        while (index < role_count) {
+            if (roles[index].name.equals(&wanted)) {
+                return run_child_single(index, roles, role_count, opts.timeout_secs);
+            }
+            index = index + 1;
+        }
+        fmt::eprintln(f"error: no child role is named `{wanted}`");
+        return 2;
     }
 
     mut runner: TestRunner = TestRunner::new(opts, descriptors, count);

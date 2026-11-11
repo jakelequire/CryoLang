@@ -2547,7 +2547,14 @@ on such a parameter is checked by each call that binds it, not when the
 type is asked whether it implements the trait: `c[true]` is refused at the
 index with `E0306`.  A parameter
 no method takes in its parameters is the one the where-clause derives, as `A`
-is above.
+is above.  When no where-clause derives it either and a method only returns
+it, as in `implement<T> trait RangeBounds<T> for struct RangeFull`, that
+method is generic over it too: a call through a bound takes it from the
+bound's arguments (`bounds.start_bound()` under `R: RangeBounds<i64>`
+returns a `Bound<&i64>`), and a call on the type itself takes it from its
+type arguments (`RangeFull::new().start_bound::<i64>()`) or from the type its
+result is expected to have, and is refused without either (`E0307`), as any
+call to a method whose type parameter nothing in the call fixes is.
 
 The type the call returns is read with the parameter bound.  With
 `implement<T, I> trait Index<I> for struct Cells<T> where I: Position<T>`
@@ -4045,7 +4052,7 @@ type struct Gauge {
 
 A method declared in a trait body takes `![language]` and no other directive (`E0151`), and a directive written above an associated type is refused (`E0151`).
 
-The test-mode directives (`![config(testing)]`, `![test]`, `![ignore]`, `![should_panic]`) are documented in the next subsection.
+The test-mode directives (`![config(testing)]`, `![test]`, `![ignore]`, `![should_panic]`, `![child_role]`) are documented in the next subsection.
 
 Other names that appear with `![...]` syntax are accepted by the parser and recorded so user tooling can observe them, but the compiler emits a warning for any non-builtin name and applies no semantics. A list of reserved-but-unimplemented directive names is in [section 21](#21-reserved-syntax).
 
@@ -4059,6 +4066,7 @@ The test framework introduces a small set of directives recognised by the compil
 | `![test]`            | Marks a function as a discoverable test.                           |
 | `![ignore]`          | Skips the test unless `cryo test --ignored` is passed.             |
 | `![should_panic]`    | Asserts the test panics; passing the test means observing a panic. |
+| `![child_role]`      | Not a test: a function a test starts as a child process by name, through `std::test::child_role::ChildRole::command`. The runner neither runs nor lists it. |
 
 ### 16.3 Memory Layout
 
@@ -4722,7 +4730,7 @@ The prelude is auto-imported into every Cryo source file. Currently:
 | `core::drop`, `core::marker`, `core::cmp`, `core::clone` | `Drop`, the marker traits (`Copy`, `Send`, `Sync`), `Eq` / `Ord` / `Ordering`, `Clone` |
 | `collections::array` | `Array<T>`, the type `[T]` names                                                                                       |
 | `core::slice`        | `Slice<T>`, backing the for-in lowering over fixed-size arrays (`for (x in arr)` where `arr: [T; N]`)                 |
-| `core::ops`          | `Range` / `RangeInclusive` / `RangeFrom` / `RangeTo` / `RangeFull`, backing range literals (`a..b` desugars to `Range::new`); `RangeBounds<T>`, implemented by the four forms with a `T` (not `RangeFull`), answers each end as a `Bound<&T>` (`Included`, `Excluded`, `Unbounded`) |
+| `core::ops`          | `Range` / `RangeInclusive` / `RangeFrom` / `RangeTo` / `RangeFull`, backing range literals (`a..b` desugars to `Range::new`); `RangeBounds<T>`, implemented by all five forms (`RangeFull` for every `T`), answers each end as a `Bound<&T>` (`Included`, `Excluded`, `Unbounded`) |
 | `core::iter`         | `Iterator`, the trait the for-in sugar drives the scrutinee through                                                   |
 | `alloc::box`         | `Box<T>`                                                                                                              |
 | `alloc::rc`          | `Rc<T>`                                                                                                               |
