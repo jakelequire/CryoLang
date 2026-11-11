@@ -73,8 +73,8 @@ Each assertion returns a `Result<(), TestError>`; propagate failures with the
 - `![ignore]` - the test is skipped unless `cryo test --ignored` is passed.
 - `![should_panic]` - the test passes **only** if its body panics or returns
   `Err`; a clean `Ok` exit is reported as a failure.
-- `![child_role]` - not a test: a function a test starts as a child process
-  by name (see "Child roles" below).
+- `![test_child]` - not a test: a function a test starts as a child process
+  by name (see "Test children" below).
 
 ```cryo
 ![test]
@@ -85,32 +85,33 @@ function rejects_out_of_range() -> Result<(), TestError> {
 }
 ```
 
-### Child roles
+### Test children
 
 Some tests need a real child process: one in its own process group that
 receives an interrupt, or one whose exit status or output is the thing under
-test. Mark a function in the test file `![child_role]` instead of `![test]`.
+test. Mark a function in the test file `![test_child]` instead of `![test]`.
 It has a test's shape, `() -> Result<(), TestError>`, but the runner never
 runs it as a test and `--list` does not show it. A test starts it by its
-fully-qualified name with `ChildRole::command` (`std::test::child_role`),
-which returns a `Command` that runs this test binary as that role; the test
-configures it and spawns it like any other command.
+fully-qualified name with `TestChild::command` (`std::test::test_child`),
+which returns a `Command` that runs this test binary as that test child
+(`--test-runner-role=<name>`); the test configures it and spawns it like any
+other command.
 
 The child runs that one function and exits 0 when it returns `Ok`, 1 when it
 returns `Err` (the error's message on stderr), and through the panic's own
 exit when it panics. The per-test timeout applies to the child as well. A
-name no child role has makes the child print an error and exit 2.
+name no test child has makes the child print an error and exit 2.
 
 ```cryo
-![child_role]
+![test_child]
 function prints_ready() -> Result<(), TestError> {
     fmt::print("ready");
     return Result::Ok(());
 }
 
 ![test]
-function a_role_runs_by_name_and_exits_zero() -> Result<(), TestError> {
-    const command: Command = ChildRole::command(Str::new("CryoTests::Tests::ChildRoles::prints_ready"))?;
+function a_test_child_runs_by_name_and_exits_zero() -> Result<(), TestError> {
+    const command: Command = TestChild::command(Str::new("CryoTests::Tests::TestChildren::prints_ready"))?;
     const output: Output = command.output()?;
     return expect_eq(output.status().exit_code(), Option::Some(0));
 }

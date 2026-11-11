@@ -2,12 +2,12 @@
 ///
 /// Runs once at the end of Phase 7 (per-module codegen) when the compile
 /// mode is `Test`. Walks `ctx.directive_registry` for `![test]` and
-/// `![child_role]` records, builds a fresh LLVM module containing:
+/// `![test_child]` records, builds a fresh LLVM module containing:
 ///
 ///   * a private global string for each one's fully-qualified name,
 ///   * an extern declaration for each one's mangled symbol,
 ///   * a static `[N + R x %TestDescriptor]` global initialised with one
-///     entry per test followed by one per child role (matching the layout
+///     entry per test followed by one per test child (matching the layout
 ///     of `stdlib/test/descriptor.cryo`'s `TestDescriptor` struct), and
 ///   * a `define i32 @main(i32 argc, ptr argv)` that calls
 ///     `std::env::set_args(argc, argv)` and then
@@ -88,19 +88,19 @@ type struct TestMainCodegen {
             return PassResult::ok();
         }
 
-        // Tests first, child roles after them: the runner reads the roles
-        // from `&descriptors[test_count]`.
+        // Tests first, test children after them: the runner reads the
+        // children from `&descriptors[test_count]`.
         mut tests: [TestEntry] = TestMainCodegen::collect_tests(ctx, "test");
         const test_count: u64 = tests.length() as u64;
-        const roles: [TestEntry] = TestMainCodegen::collect_tests(ctx, "child_role");
-        const role_count: u64 = roles.length() as u64;
-        mut role_index: i64 = 0;
-        while (role_index < roles.length()) {
-            tests.push(roles[role_index]);
-            role_index += 1;
+        const children: [TestEntry] = TestMainCodegen::collect_tests(ctx, "test_child");
+        const child_count: u64 = children.length() as u64;
+        mut child_index: i64 = 0;
+        while (child_index < children.length()) {
+            tests.push(children[child_index]);
+            child_index += 1;
         }
         const entry_count: u64 = tests.length() as u64;
-        Log::debug(LogArea::Codegen, f"{test_count} tests and {role_count} child roles discovered");
+        Log::debug(LogArea::Codegen, f"{test_count} tests and {child_count} test children discovered");
 
         // Create the synthesized module.  Match target/data-layout to the
         // rest of the build so the linker can splice the .o in cleanly.
@@ -168,7 +168,7 @@ type struct TestMainCodegen {
 
         // Synthesize `int main(int argc, char** argv)`.
         const built_ok: boolean = TestMainCodegen::build_test_main(
-            ctx, test_mod, arr_global, arr_ty, test_count, role_count);
+            ctx, test_mod, arr_global, arr_ty, test_count, child_count);
         if (!built_ok) {
             tm.dispose();
             test_mod.dispose();
@@ -194,7 +194,7 @@ type struct TestMainCodegen {
     // Test collection from the directive registry
 
     /// Walk `ctx.directive_registry` for records of `kind` (`test` or
-    /// `child_role`) and build a `TestEntry` for each.  Sibling directives
+    /// `test_child`) and build a `TestEntry` for each.  Sibling directives
     /// (`![ignore]`, `![should_panic]`) on the same `FunctionDecl` are
     /// folded into the entry's flags via `decl.attached_directives`.
     static collect_tests(ctx: CompilationContext*, kind: string) -> [TestEntry] {
@@ -347,7 +347,7 @@ type struct TestMainCodegen {
                               arr_global: LValue,
                               arr_ty: LType,
                               test_count: u64,
-                              role_count: u64) -> boolean {
+                              child_count: u64) -> boolean {
         const intern: InternTable* = ctx.intern_table;
         const di:     DeclarationIndex* = ctx.decl_index;
 
@@ -371,7 +371,7 @@ type struct TestMainCodegen {
         // Build the function signatures.
         //   set_args : (i32 argc, ptr argv) -> void
         //   run_all  : (i32 argc, ptr argv, ptr descriptors, i64 count,
-        //               ptr roles, i64 role_count) -> i32
+        //               ptr test_children, i64 test_child_count) -> i32
         const ptr_ty:  LType = LType::pointer_to(LType::i8());
         const i32_ty:  LType = LType::i32();
         const i64_ty:  LType = LType::i64();
@@ -419,26 +419,26 @@ type struct TestMainCodegen {
             libc::free(args_buf);
         }
 
-        // The tests start at `&descriptors[0]`, the child roles at
+        // The tests start at `&descriptors[0]`, the test children at
         // `&descriptors[test_count]`; an empty table hands out the global.
         mut first_ptr: LValue = arr_global;
-        mut roles_ptr: LValue = arr_global;
-        if (test_count + role_count > 0) {
+        mut children_ptr: LValue = arr_global;
+        if (test_count + child_count > 0) {
             first_ptr = TestMainCodegen::make_element_address(builder, arr_ty, arr_global, 0, "test.first");
-            roles_ptr = TestMainCodegen::make_element_address(builder, arr_ty, arr_global, test_count, "test.roles");
+            children_ptr = TestMainCodegen::make_element_address(builder, arr_ty, arr_global, test_count, "test.children");
         }
 
-        // call run_all(argc, argv, first_ptr, count, roles_ptr, role_count)
+        // call run_all(argc, argv, first_ptr, count, children_ptr, child_count)
         const count_const: LValue = LType::const_int(i64_ty, test_count, false);
-        const role_count_const: LValue = LType::const_int(i64_ty, role_count, false);
+        const child_count_const: LValue = LType::const_int(i64_ty, child_count, false);
         const args_buf: mut void* = libc::malloc(6 * 8);
         const args_slots: mut (mut void*)* = args_buf as mut (mut void*)*;
         args_slots[0] = argc.raw;
         args_slots[1] = argv.raw;
         args_slots[2] = first_ptr.raw;
         args_slots[3] = count_const.raw;
-        args_slots[4] = roles_ptr.raw;
-        args_slots[5] = role_count_const.raw;
+        args_slots[4] = children_ptr.raw;
+        args_slots[5] = child_count_const.raw;
         const rc: LValue = builder.build_call(
             run_all_ty, run_all_fn, args_buf, 6, "test.rc");
         libc::free(args_buf);
