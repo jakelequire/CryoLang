@@ -3001,6 +3001,8 @@ A default resolves **in the module where the type is declared**, not at the use 
 
 A use inside the type's own body is a use like any other, so a spelling means one thing wherever it is written: in `String<A>`'s methods a bare `String` - in a signature, or as a struct literal `String { .. }` - is `String<GlobalAlloc>`, not the `String<A>` the method belongs to, and the literal's fields are `String<GlobalAlloc>`'s fields. A literal of the owner itself names its arguments: `String::<A> { .. }`.
 
+The owner of a static call written without type arguments is not such a use: its arguments are inferred at the call, and the defaults fill only the parameters nothing there decides. With `type struct Defaulted<T = i64>` and `small: i8`, `Defaulted::plain(small)` is `Defaulted<i8>` (from the argument), `const d: Defaulted<u8> = Defaulted::zero();` is `Defaulted<u8>` (from the expected type), and `Defaulted::plain(7)` and `Defaulted::zero()` with nothing expected are `Defaulted<i64>`: the default, not the literal's own type. `String::new()` is `String<GlobalAlloc>` the same way.
+
 A default fills a parameter that a *use* leaves out. An **`implement` head is not a use**: it names every parameter of the template it is written for, either as parameters of its own or as a concrete instantiation, and a head that leaves one out is an error (E0302), whether every parameter has a default or only the trailing ones do. `implement trait Display for String` would read as an impl for every `String<A>` while binding only `String<GlobalAlloc>`, so the writer says which is meant:
 
 ```cryo
