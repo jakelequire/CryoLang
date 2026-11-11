@@ -3001,6 +3001,8 @@ A default resolves **in the module where the type is declared**, not at the use 
 
 A use inside the type's own body is a use like any other, so a spelling means one thing wherever it is written: in `String<A>`'s methods a bare `String` - in a signature, or as a struct literal `String { .. }` - is `String<GlobalAlloc>`, not the `String<A>` the method belongs to, and the literal's fields are `String<GlobalAlloc>`'s fields. A literal of the owner itself names its arguments: `String::<A> { .. }`.
 
+The owner of a static call written without type arguments is not such a use: its arguments are inferred at the call, and the defaults fill only the parameters nothing there decides. With `type struct Defaulted<T = i64>` and `small: i8`, `Defaulted::plain(small)` is `Defaulted<i8>` (from the argument), `const d: Defaulted<u8> = Defaulted::zero();` is `Defaulted<u8>` (from the expected type), and `Defaulted::plain(7)` and `Defaulted::zero()` with nothing expected are `Defaulted<i64>`: the default, not the literal's own type. `String::new()` is `String<GlobalAlloc>` the same way.
+
 A default fills a parameter that a *use* leaves out. An **`implement` head is not a use**: it names every parameter of the template it is written for, either as parameters of its own or as a concrete instantiation, and a head that leaves one out is an error (E0302), whether every parameter has a default or only the trailing ones do. `implement trait Display for String` would read as an impl for every `String<A>` while binding only `String<GlobalAlloc>`, so the writer says which is meant:
 
 ```cryo
@@ -4052,7 +4054,7 @@ type struct Gauge {
 
 A method declared in a trait body takes `![language]` and no other directive (`E0151`), and a directive written above an associated type is refused (`E0151`).
 
-The test-mode directives (`![config(testing)]`, `![test]`, `![ignore]`, `![should_panic]`, `![child_role]`) are documented in the next subsection.
+The test-mode directives (`![config(testing)]`, `![test]`, `![ignore]`, `![should_panic]`, `![test_child]`) are documented in the next subsection.
 
 Other names that appear with `![...]` syntax are accepted by the parser and recorded so user tooling can observe them, but the compiler emits a warning for any non-builtin name and applies no semantics. A list of reserved-but-unimplemented directive names is in [section 21](#21-reserved-syntax).
 
@@ -4066,7 +4068,7 @@ The test framework introduces a small set of directives recognised by the compil
 | `![test]`            | Marks a function as a discoverable test.                           |
 | `![ignore]`          | Skips the test unless `cryo test --ignored` is passed.             |
 | `![should_panic]`    | Asserts the test panics; passing the test means observing a panic. |
-| `![child_role]`      | Not a test: a function a test starts as a child process by name, through `std::test::child_role::ChildRole::command`. The runner neither runs nor lists it. |
+| `![test_child]`      | Not a test: a function a test starts as a child process by name, through `std::test::test_child::TestChild::command`. The runner neither runs nor lists it. |
 
 ### 16.3 Memory Layout
 
