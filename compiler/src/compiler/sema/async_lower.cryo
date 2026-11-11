@@ -2405,15 +2405,66 @@ type struct AsyncLower {
     /// True when a value of `ty` has no room to store an address, so carrying
     /// one across a suspend cannot keep a frame address alive.
     ///
-    /// Deliberately only the scalars. An aggregate, a pointer, a reference or
-    /// anything still generic could hold one somewhere, and a type that failed
-    /// to resolve has to be assumed to as well.
-    type_cannot_hold_address(&this, ty: TypeRef) -> boolean {
-        if (!ty.is_valid()) { return false; }
+    /// A scalar has none, and an aggregate has none when none of its parts
+    /// has: a struct's or union's fields, an enum's payloads, a tuple's or an
+    /// array's elements, an instance's components with its arguments put in.
+    /// A pointer, a reference, a function value, a trait object, anything
+    /// still generic and a type that failed to resolve could hold one, and
+    /// answer false.
+    type_cannot_hold_address(mut &this, ty: TypeRef) -> boolean {
+        return this.type_cannot_hold_address_at_depth(ty, 0);
+    }
+
+    type_cannot_hold_address_at_depth(mut &this, ty: TypeRef, depth: i32) -> boolean {
+        if (depth >= 32 || !ty.is_valid()) { return false; }
         const t: Type* = this.arena.lookup(ty);
         if (t == null) { return false; }
-        return t.kind == TypeKind::Int || t.kind == TypeKind::Bool
-            || t.kind == TypeKind::Float || t.kind == TypeKind::Char;
+        const k: TypeKind = t.kind;
+        if (k == TypeKind::Int || k == TypeKind::Bool || k == TypeKind::Float
+                || k == TypeKind::Char || k == TypeKind::Unit || k == TypeKind::Void) {
+            return true;
+        }
+        if (k == TypeKind::Array) {
+            return this.type_cannot_hold_address_at_depth(t.as_array().element, depth + 1);
+        }
+        if (k == TypeKind::Optional) {
+            return this.type_cannot_hold_address_at_depth(t.as_optional().wrapped, depth + 1);
+        }
+        if (k == TypeKind::Tuple) {
+            return this.no_part_can_hold_address(&t.as_tuple().elements, depth + 1);
+        }
+        if (k == TypeKind::Struct) {
+            const fields: &[FieldInfo] = &t.as_struct().fields;
+            for (mut i: i64 = 0; i < fields.length(); i++) {
+                if (!this.type_cannot_hold_address_at_depth(fields[i].field_type, depth + 1)) { return false; }
+            }
+            return true;
+        }
+        if (k == TypeKind::Enum) {
+            const et: EnumType* = t.as_enum();
+            for (mut i: i64 = 0; i < et.variants.length(); i++) {
+                if (!this.no_part_can_hold_address(&et.variants[i].payload_types, depth + 1)) { return false; }
+            }
+            return true;
+        }
+        if (k == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t.as_instantiated();
+            if (inst.has_resolved_type()) {
+                return this.type_cannot_hold_address_at_depth(inst.resolved_type, depth + 1);
+            }
+            match (OwnershipQuery::instance_components(this.arena, this.ctx.generic_registry, inst)) {
+                Option::Some(components) => { return this.no_part_can_hold_address(&components, depth + 1); }
+                Option::None => { return false; }
+            }
+        }
+        return false;
+    }
+
+    no_part_can_hold_address(mut &this, parts: &[TypeRef], depth: i32) -> boolean {
+        for (mut i: i64 = 0; i < parts.length(); i++) {
+            if (!this.type_cannot_hold_address_at_depth(parts[i], depth)) { return false; }
+        }
+        return true;
     }
 
     zeroable_kind(&this, k: TypeKind) -> boolean {
@@ -4357,14 +4408,18 @@ type struct AsyncLower {
                                           this.intern, ty);
     }
 
-    /// True when `ty` is an instantiation whose concrete shape specialization
-    /// has not produced yet: its fields are empty at lowering time, so reading
-    /// them would report every generic aggregate as owning nothing.
+    /// True when what `ty` owns cannot be read at lowering time: an
+    /// instantiation whose concrete shape specialization has not produced
+    /// yet, and whose template's components cannot be recovered either. One
+    /// whose components can is read through them (`OwnershipQuery`), so
+    /// `Option<i64>` is copyable here as it is once specialized.
     ownership_unreadable(&this, ty: TypeRef) -> boolean {
         const t: Type* = this.arena.lookup(ty);
         if (t == null) { return true; }
         if (t.kind != TypeKind::InstantiatedType) { return false; }
-        return !t.as_instantiated().has_resolved_type();
+        const inst: InstantiatedType* = t.as_instantiated();
+        if (inst.has_resolved_type()) { return false; }
+        return OwnershipQuery::instance_components(this.arena, this.ctx.generic_registry, inst).is_none();
     }
 
     last_use_consumes(&this, blk_stmt: Stmt*, key: SymbolID, lty: TypeRef) -> boolean {
@@ -5504,9 +5559,10 @@ type struct AsyncLower {
     /// default, but it is an over-approximation whenever the value being
     /// carried could not hold an address in the first place: passing `&local`
     /// to a predicate and keeping its `boolean` answer across a suspend carries
-    /// nothing. A NUMBER, a `boolean` or a `char` has no room for a pointer, so
-    /// for those the address provably died with the call that consumed it.
-    /// Every other type stays conservative.
+    /// nothing, and neither does an `Option<Instant>` computed from `&limit`.
+    /// A value with no room for a pointer anywhere in it
+    /// (`type_cannot_hold_address`) provably lost the address with the call
+    /// that consumed it. Every other type stays conservative.
     reject_frame_addr_carry(mut &this, sm: mut PollSm*, vd_decl: DeclarationNode*, key: SymbolID) -> boolean {
         const vd: VarDecl* = DeclarationNode::var_of(vd_decl);
         if (this.type_cannot_hold_address(vd.resolved_type)) { return false; }
@@ -5952,8 +6008,9 @@ type struct AsyncLower {
     /// its scope's end must run; -1 otherwise. A temporary the lowering made
     /// up stands for part of a statement rather than a declared local.
     ///
-    /// An instantiation whose layout specialization has not produced yet
-    /// cannot say whether it owns anything, and is treated as owning: carrying
+    /// An instantiation whose components cannot be read yet
+    /// (`ownership_unreadable`) cannot say whether it owns anything, and is
+    /// treated as owning: carrying
     /// a value that has no destructor costs a field, while leaving one that has
     /// in the frame releases it before the suspend. One that still names a
     /// type parameter is the exception, since such a body cannot carry a value

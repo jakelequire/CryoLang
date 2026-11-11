@@ -65,7 +65,7 @@ import compiler::types::user_defined::{
 
 type struct OwnershipQuery {
     /// Top-level Copy predicate. See module doc for the full rule.
-    static is_copy(arena: TypeArena*, registry: GenericRegistry*,
+    static is_copy(arena: mut TypeArena*, registry: GenericRegistry*,
                    intern: mut InternTable*, ty: TypeRef) -> boolean {
         return OwnershipQuery::is_copy_at_depth(arena, registry, intern, ty, 0);
     }
@@ -77,7 +77,7 @@ type struct OwnershipQuery {
     /// Treats unresolved or out-of-budget types as non-Copy
     /// (conservative: false negatives only enable extra drop calls,
     /// never UAF).
-    static is_copy_at_depth(arena: TypeArena*, registry: GenericRegistry*,
+    static is_copy_at_depth(arena: mut TypeArena*, registry: GenericRegistry*,
                              intern: mut InternTable*, ty: TypeRef,
                              depth: i32) -> boolean {
         if (depth >= 32) { return false; }
@@ -167,7 +167,13 @@ type struct OwnershipQuery {
                 return OwnershipQuery::is_copy_at_depth(arena, registry, intern,
                                                          inst.resolved_type, depth + 1);
             }
-            return false;
+            if (OwnershipQuery::instance_of_union(registry, inst)) { return true; }
+            match (OwnershipQuery::instance_components(arena, registry, inst)) {
+                Option::Some(components) => {
+                    return OwnershipQuery::all_copy(arena, registry, intern, &components, depth + 1);
+                }
+                Option::None => { return false; }
+            }
         }
 
         // Generic params, traits, function templates, error placeholders
@@ -177,7 +183,7 @@ type struct OwnershipQuery {
     }
 
     /// True when every TypeRef in `tys` is Copy. Empty list trivially yes.
-    static all_copy(arena: TypeArena*, registry: GenericRegistry*,
+    static all_copy(arena: mut TypeArena*, registry: GenericRegistry*,
                     intern: mut InternTable*, tys: &[TypeRef],
                     depth: i32) -> boolean {
         for (mut i: i64 = 0; i < tys.length(); i++) {
@@ -190,7 +196,7 @@ type struct OwnershipQuery {
     }
 
     /// True when every FieldInfo in `fields` has a Copy field type.
-    static all_fields_copy(arena: TypeArena*, registry: GenericRegistry*,
+    static all_fields_copy(arena: mut TypeArena*, registry: GenericRegistry*,
                             intern: mut InternTable*, fields: &[FieldInfo],
                             depth: i32) -> boolean {
         for (mut i: i64 = 0; i < fields.length(); i++) {
@@ -204,7 +210,7 @@ type struct OwnershipQuery {
 
     /// True when every variant payload type list is all-Copy. C-style
     /// enums (no payloads) trivially qualify.
-    static all_variants_copy(arena: TypeArena*, registry: GenericRegistry*,
+    static all_variants_copy(arena: mut TypeArena*, registry: GenericRegistry*,
                               intern: mut InternTable*, variants: &[EnumVariantInfo],
                               depth: i32) -> boolean {
         for (mut i: i64 = 0; i < variants.length(); i++) {
@@ -378,61 +384,75 @@ type struct OwnershipQuery {
                                       intern: InternTable*, inst: InstantiatedType*,
                                       depth: i32) -> boolean {
         if (depth >= 32) { return false; }
-        if (registry == null) { return false; }
+        match (OwnershipQuery::instance_components(arena, registry, inst)) {
+            Option::Some(components) => {
+                return OwnershipQuery::all_thread_safe(arena, registry, intern, &components, depth);
+            }
+            Option::None => { return false; }
+        }
+    }
+
+    /// The component types of an instantiation whose concrete shape has not
+    /// been produced yet: the template's struct or union fields, or its enum
+    /// variants' payloads, with the instantiation's type arguments
+    /// substituted in. A query that reads them answers for the instance
+    /// before specialization exists, and so gives the same answer then as
+    /// after. None when the template or a component cannot be recovered.
+    ///
+    /// Struct and union fields come from the AST, whose `resolved_type`
+    /// carries the abstract field types after type resolution; enum payloads
+    /// are not on the AST as resolved types and come from the template's
+    /// arena enum type.
+    static instance_components(arena: mut TypeArena*, registry: GenericRegistry*,
+                               inst: InstantiatedType*) -> Option<[TypeRef]> {
+        if (registry == null) { return Option::None; }
         const tmpl: const TemplateEntry* =
             registry.template_of_type(inst.generic_base);
-        if (tmpl == null) { return false; }
-        if (tmpl.param_types.length() != inst.type_args.length()) { return false; }
+        if (tmpl == null) { return Option::None; }
+        if (tmpl.param_types.length() != inst.type_args.length()) { return Option::None; }
         mut subst: TypeSubstitution =
             TypeSubstitution::from_params(&tmpl.param_types, &inst.type_args);
-
+        mut components: [TypeRef] = [];
         if (tmpl.kind == TemplateKind::Struct && tmpl.ast_node != null) {
             const sn: StructDecl* = DeclarationNode::struct_of(tmpl.ast_node);
             for (mut i: i64 = 0; i < sn.fields.length(); i++) {
-                const f_decl: DeclarationNode* = sn.fields[i];
-                const f: FieldDecl* = DeclarationNode::field_of(f_decl);
-                if (f == null || !f.resolved_type.is_valid()) { return false; }
-                const ft: TypeRef = subst.apply(f.resolved_type, arena);
-                if (!OwnershipQuery::is_thread_safe_at_depth(arena, registry, intern,
-                                                              ft, depth + 1)) {
-                    return false;
-                }
+                const f: FieldDecl* = DeclarationNode::field_of(sn.fields[i]);
+                if (f == null || !f.resolved_type.is_valid()) { return Option::None; }
+                components.push(subst.apply(f.resolved_type, arena));
             }
-            return true;
+            return Option::Some(components);
         }
         if (tmpl.kind == TemplateKind::Union && tmpl.ast_node != null) {
             const un: UnionDecl* = DeclarationNode::union_of(tmpl.ast_node);
             for (mut i: i64 = 0; i < un.fields.length(); i++) {
-                const f_decl: DeclarationNode* = un.fields[i];
-                const f: FieldDecl* = DeclarationNode::field_of(f_decl);
-                if (f == null || !f.resolved_type.is_valid()) { return false; }
-                const ft: TypeRef = subst.apply(f.resolved_type, arena);
-                if (!OwnershipQuery::is_thread_safe_at_depth(arena, registry, intern,
-                                                              ft, depth + 1)) {
-                    return false;
-                }
+                const f: FieldDecl* = DeclarationNode::field_of(un.fields[i]);
+                if (f == null || !f.resolved_type.is_valid()) { return Option::None; }
+                components.push(subst.apply(f.resolved_type, arena));
             }
-            return true;
+            return Option::Some(components);
         }
         if (tmpl.kind == TemplateKind::Enum) {
-            // Variant payloads aren't on the AST as resolved TypeRefs (only as
-            // annotations); read them off the template's arena enum type.
             const base_t: Type* = arena.lookup(inst.generic_base);
-            if (base_t == null || base_t.kind != TypeKind::Enum) { return false; }
+            if (base_t == null || base_t.kind != TypeKind::Enum) { return Option::None; }
             const et: EnumType* = base_t.as_enum();
             for (mut vi: i64 = 0; vi < et.variants.length(); vi++) {
                 const payloads: &[TypeRef] = &et.variants[vi].payload_types;
                 for (mut pi: i64 = 0; pi < payloads.length(); pi++) {
-                    const pt: TypeRef = subst.apply(payloads[pi], arena);
-                    if (!OwnershipQuery::is_thread_safe_at_depth(arena, registry,
-                                                                  intern, pt, depth + 1)) {
-                        return false;
-                    }
+                    components.push(subst.apply(payloads[pi], arena));
                 }
             }
-            return true;
+            return Option::Some(components);
         }
-        return false;
+        return Option::None;
+    }
+
+    /// True when `inst` instantiates a union template. A union is an untagged
+    /// overlay that never drops its members, so its fields decide neither
+    /// whether it is `Copy` nor whether it needs a drop.
+    static instance_of_union(registry: GenericRegistry*, inst: InstantiatedType*) -> boolean {
+        if (registry == null) { return false; }
+        const tmpl: const TemplateEntry* = registry.template_of_type(inst.generic_base);
+        return tmpl != null && tmpl.kind == TemplateKind::Union;
     }
 
     /// True when every element type in `tys` is Send/Sync.
@@ -527,12 +547,12 @@ type struct OwnershipQuery {
     // recursion stops: Cryo's convention is that a hand-written `drop`
     // releases everything the value owns, so drop-glue codegen must call that
     // drop and NOT also recurse into the fields (which would double-free).
-    static needs_drop(arena: TypeArena*, registry: GenericRegistry*,
+    static needs_drop(arena: mut TypeArena*, registry: GenericRegistry*,
                       intern: mut InternTable*, ty: TypeRef) -> boolean {
         return OwnershipQuery::needs_drop_at_depth(arena, registry, intern, ty, 0);
     }
 
-    static needs_drop_at_depth(arena: TypeArena*, registry: GenericRegistry*,
+    static needs_drop_at_depth(arena: mut TypeArena*, registry: GenericRegistry*,
                                intern: mut InternTable*, ty: TypeRef,
                                depth: i32) -> boolean {
         if (depth >= 32) { return false; }
@@ -601,7 +621,13 @@ type struct OwnershipQuery {
                 return OwnershipQuery::needs_drop_at_depth(arena, registry, intern,
                                                            inst.resolved_type, depth + 1);
             }
-            return false;
+            if (OwnershipQuery::instance_of_union(registry, inst)) { return false; }
+            match (OwnershipQuery::instance_components(arena, registry, inst)) {
+                Option::Some(components) => {
+                    return OwnershipQuery::any_needs_drop(arena, registry, intern, &components, depth + 1);
+                }
+                Option::None => { return false; }
+            }
         }
         // Generic params, traits, templates, error placeholders: not a
         // concrete droppable value position.
@@ -609,7 +635,7 @@ type struct OwnershipQuery {
     }
 
     /// True when any element type in `tys` needs drop.
-    static any_needs_drop(arena: TypeArena*, registry: GenericRegistry*,
+    static any_needs_drop(arena: mut TypeArena*, registry: GenericRegistry*,
                           intern: mut InternTable*, tys: &[TypeRef],
                           depth: i32) -> boolean {
         for (mut i: i64 = 0; i < tys.length(); i++) {
@@ -622,7 +648,7 @@ type struct OwnershipQuery {
     }
 
     /// True when any field's type needs drop.
-    static any_field_needs_drop(arena: TypeArena*, registry: GenericRegistry*,
+    static any_field_needs_drop(arena: mut TypeArena*, registry: GenericRegistry*,
                                 intern: mut InternTable*, fields: &[FieldInfo],
                                 depth: i32) -> boolean {
         for (mut i: i64 = 0; i < fields.length(); i++) {
@@ -635,7 +661,7 @@ type struct OwnershipQuery {
     }
 
     /// True when any variant payload type needs drop.
-    static any_variant_needs_drop(arena: TypeArena*, registry: GenericRegistry*,
+    static any_variant_needs_drop(arena: mut TypeArena*, registry: GenericRegistry*,
                                   intern: mut InternTable*, variants: &[EnumVariantInfo],
                                   depth: i32) -> boolean {
         for (mut i: i64 = 0; i < variants.length(); i++) {
@@ -754,7 +780,7 @@ type struct OwnershipQuery {
     /// the value can be released without it: the field is then the moved
     /// value's own, and the rest of the value is released field by field
     /// (`moves_out_of_temporary`).
-    static is_owning_temporary(arena: TypeArena*, registry: GenericRegistry*,
+    static is_owning_temporary(arena: mut TypeArena*, registry: GenericRegistry*,
                                intern: mut InternTable*, e: ExpressionNode*) -> boolean {
         if (e == null) { return false; }
         if (ExpressionNode::member_access_of(e) != null) {
@@ -771,7 +797,7 @@ type struct OwnershipQuery {
     /// through value fields alone - `make()` in `make().inner.name` - or
     /// null: for a read that is no field's, or that passes through a pointer
     /// or a reference, whose storage something else owns.
-    static temporary_field_root(arena: TypeArena*, registry: GenericRegistry*,
+    static temporary_field_root(arena: mut TypeArena*, registry: GenericRegistry*,
                                 intern: mut InternTable*, e: ExpressionNode*) -> ExpressionNode* {
         if (e == null || ExpressionNode::member_access_of(e) == null) { return null; }
         mut object: ExpressionNode* = ExpressionNode::member_access_of(e).object;
@@ -792,7 +818,7 @@ type struct OwnershipQuery {
     /// struct, a union or a tuple with no destructor of its own.  A
     /// destructor sees its whole value, so a value with one cannot give up
     /// a field (E0453 in the move check), and a read of it only borrows.
-    static moves_out_of_temporary(arena: TypeArena*, registry: GenericRegistry*,
+    static moves_out_of_temporary(arena: mut TypeArena*, registry: GenericRegistry*,
                                   intern: mut InternTable*, e: ExpressionNode*) -> boolean {
         const root: ExpressionNode* = OwnershipQuery::temporary_field_root(arena, registry, intern, e);
         if (root == null) { return false; }

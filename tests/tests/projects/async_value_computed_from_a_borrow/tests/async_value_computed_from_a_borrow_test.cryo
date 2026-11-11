@@ -1,0 +1,47 @@
+///! A value computed from `&local` and carried across an `await` holds that
+///! address only if its type has room for one. `Option<Instant>` returned by
+///! a call that took `&limit` has none, so it is carried; the refusal of a
+///! value that can hold the address (E0455) is the negative test
+///! E0455_async_option_of_struct_holding_local_address.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::AsyncValueComputedFromABorrow;
+
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::future;
+import std::future::ready::{ PendingThenReady };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_eq };
+
+type struct Span {
+    start: i64;
+    length: i64;
+
+    ending_after(&this, extra: &i64) -> Span {
+        return Span { start: this.start, length: this.length + *extra };
+    }
+}
+
+type struct Plan {
+    extra: Option<i64>;
+
+    async end(&this, base: Span) -> i64 {
+        const planned: Option<Span> = match (this.extra) {
+            Option::Some(limit) => { Option::Some(base.ending_after(&limit)) }
+            Option::None => { Option::None }
+        };
+        const pause: i64 = await PendingThenReady::<i64>::new(1, 0);
+        match (planned) {
+            Option::Some(span) => { return span.start + span.length + pause; }
+            Option::None => { return -1; }
+        }
+    }
+}
+
+![test]
+function an_option_of_a_plain_struct_built_from_a_borrow_crosses_an_await() -> Result<(), TestError> {
+    const plan: Plan = Plan { extra: Option::Some(5) };
+    const want: i64 = 17;
+    return expect_eq(future::block_on(plan.end(Span { start: 10, length: 2 })), want);
+}

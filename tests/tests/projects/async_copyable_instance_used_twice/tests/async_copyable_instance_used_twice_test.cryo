@@ -1,0 +1,62 @@
+// A copyable instance of a generic type (`Option<i64>`) used by value more
+// than once across `await`s in an async function.
+//
+// Whether a carried value is COPIED or GIVEN AWAY by a by-value use is decided
+// while the body is lowered, before the instance's concrete shape exists. A
+// carried value that is given away is taken out of its slot, so a second use
+// unwraps an empty slot and panics; the instance has to be read as copyable
+// from its template's components then, as it is once specialized.
+![config(testing)]
+namespace CryoTests::Tests::Lang::AsyncCopyableInstanceUsedTwice;
+
+import std::test;
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::future;
+import std::future::ready::{ PendingThenReady };
+import std::test::assert::{ expect_eq };
+import std::test::error::{ TestError };
+
+async function step(value: Option<i64>) -> i64 {
+    const pause: i64 = await PendingThenReady::<i64>::new(1, 0);
+    return value.unwrap_or(10) + pause;
+}
+
+async function local_used_twice() -> i64 {
+    const value: Option<i64> = Option::None;
+    const first: i64 = await step(value);
+    const second: i64 = await step(value);
+    return first + second;
+}
+
+async function parameter_used_twice(value: Option<i64>) -> i64 {
+    const first: i64 = await step(value);
+    const second: i64 = await step(value);
+    return first + second;
+}
+
+async function result_used_twice(value: Result<i64, i32>) -> i64 {
+    const pause: i64 = await PendingThenReady::<i64>::new(1, 0);
+    const first: i64 = match (value) { Result::Ok(n) => { n } Result::Err(_) => { -1 } };
+    const again: i64 = await PendingThenReady::<i64>::new(1, 0);
+    const second: i64 = match (value) { Result::Ok(n) => { n } Result::Err(_) => { -1 } };
+    return first + second + pause + again;
+}
+
+![test]
+function a_carried_option_local_is_copied_by_each_use() -> Result<(), TestError> {
+    const want: i64 = 20;
+    return expect_eq(future::block_on(local_used_twice()), want);
+}
+
+![test]
+function a_carried_option_parameter_is_copied_by_each_use() -> Result<(), TestError> {
+    const want: i64 = 14;
+    return expect_eq(future::block_on(parameter_used_twice(Option::Some(7))), want);
+}
+
+![test]
+function a_carried_result_is_copied_by_each_use() -> Result<(), TestError> {
+    const want: i64 = 6;
+    return expect_eq(future::block_on(result_used_twice(Result::Ok(3))), want);
+}
