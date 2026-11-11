@@ -4,13 +4,14 @@
 ///! very fast. Seed it reproducibly with `from_seed` (same seed, same
 ///! stream - ideal for tests and simulations) or unpredictably with
 ///! `from_os`. It is POD: copying an `Rng` forks the stream rather than
-///! sharing it. NOT suitable for cryptography; use `SecureRng` for that.
+///! sharing it. `Rng::for_current_thread()` is each thread's own
+///! OS-seeded generator. NOT suitable for cryptography; use `SecureRng`
+///! for that.
 
 namespace std::random::rng;
 
 import std::random::source::{ RandomSource };
-import std::random::secure;
-import std::core::slice::{ Slice };
+import std::random::secure::{ SecureRng };
 import std::io::bytes::{ ByteReader };
 import std::ffi::libc::{ ClockId, clock_gettime, timespec };
 import std::sys::syscall::{ LARGE_INTEGER };
@@ -36,17 +37,14 @@ public type struct Rng {
         return non_zero_state(a, b, c, d);
     }
 
-    /// Seed from the OS CSPRNG. Falls back to a monotonic-clock + pid mix
-    /// if the kernel source is briefly unavailable, so it never hard-fails.
-    /// (The fallback is fine for non-crypto use; for cryptography use
-    /// `SecureRng`.)  Routes through `secure::fill_secure_bytes` so the OS
-    /// source is portable - `getrandom` on UNIX, `RtlGenRandom` on Windows
-    /// - instead of binding the Linux-only `getrandom` symbol directly.
+    /// Seed from the OS CSPRNG (`SecureRng`). Falls back to a
+    /// monotonic-clock + pid mix if the kernel source is unavailable, so it
+    /// never hard-fails. (The fallback is fine for non-crypto use; for
+    /// cryptography use `SecureRng`.)
     public static from_os() -> Rng {
-        mut buf: [u8; 32];
-        const got: i64 = secure::fill_secure_bytes(&buf[0], 32);
-        if (got == 32) {
-            mut words: ByteReader = ByteReader::new(Slice::from_raw(&buf[0], 32));
+        mut bytes: [u8; 32];
+        if (SecureRng::new().try_fill(&bytes).is_ok()) {
+            mut words: ByteReader = ByteReader::new(bytes.as_slice());
             const a: u64 = words.read_u64_little_endian().unwrap();
             const b: u64 = words.read_u64_little_endian().unwrap();
             const c: u64 = words.read_u64_little_endian().unwrap();
@@ -55,7 +53,24 @@ public type struct Rng {
         }
         return Rng::from_seed(fallback_seed());
     }
+
+    /// The calling thread's own generator, seeded from the OS (as
+    /// `from_os`) the first time the thread asks for it. Every thread has a
+    /// separate stream, so no lock is taken and no two threads draw the
+    /// same values. The free functions of `std::random` draw from it.
+    public static for_current_thread() -> mut &Rng {
+        if (thread_generator.s0 == 0 && thread_generator.s1 == 0
+            && thread_generator.s2 == 0 && thread_generator.s3 == 0) {
+            thread_generator = Rng::from_os();
+        }
+        return &thread_generator;
+    }
 }
+
+/// The state behind `Rng::for_current_thread`. All-zero marks it unseeded:
+/// no seeded generator is ever all-zero (`non_zero_state` refuses it).
+![thread_local]
+private mut thread_generator: Rng = Rng { s0: 0, s1: 0, s2: 0, s3: 0 };
 
 /// Last-resort seed for `from_os` when the OS CSPRNG is briefly unavailable.
 /// Mixes a high-resolution monotonic counter with the process id. The libc
