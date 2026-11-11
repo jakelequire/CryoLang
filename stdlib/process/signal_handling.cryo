@@ -14,10 +14,18 @@
 ///! What arrives:
 ///!   - POSIX: SIGINT as `Signal::interrupt()`, SIGTERM as
 ///!     `Signal::terminate()`.
-///!   - Windows: Ctrl-C and Ctrl-Break, both as `Signal::interrupt()`.
-///!     Closing the console, logging off and shutting down are not
-///!     received: Windows ends the process after them whatever a handler
-///!     answers.
+///!   - Windows: Ctrl-C and Ctrl-Break, both as `Signal::interrupt()`;
+///!     closing the console, logging off and shutting down as
+///!     `Signal::terminate()`.
+///!
+///! A terminate on Windows cannot be refused: the process ends once the
+///! program exits or Windows' time limit runs out, whichever comes first.
+///! The limit is a system setting, by default 5 seconds (20 for a service
+///! at shutdown), so cleanup after it must be quick. Until then the
+///! program runs as normal and `wait` hands the terminate over. Logoff and
+///! shutdown reach only services, and only a program that has not loaded
+///! the Windows user interface libraries (user32 or gdi32): Windows ends
+///! any other program at logoff and shutdown without a signal.
 ///!
 ///! Every `Signals` in the process shares one record of what arrived, so
 ///! each signal is handed to one waiter, whichever asks first. Signals
@@ -61,6 +69,10 @@ private mut g_wake_semaphore: u8* = null;
 private const PENDING_INTERRUPT: u64 = 1;
 private const PENDING_TERMINATE: u64 = 0x100000000;
 private const ORDER_SEQUENTIALLY_CONSISTENT: u32 = 7;
+// Windows: how long the handler holds the process open after a close,
+// logoff or shutdown - the longest limit Windows grants by default (a
+// service at shutdown), so the hold never cuts cleanup short.
+private const TERMINATE_HOLD_MILLISECONDS: u32 = 20000;
 
 ![target(unix)]
 private function signals_handler(signal_number: i32) -> void {
@@ -85,15 +97,26 @@ private function signals_handler(signal_number: i32) -> void {
 
 ![target(windows)]
 private function signals_handler(control_type: u32) -> i32 {
-    if (control_type != syscall::CTRL_C_EVENT && control_type != syscall::CTRL_BREAK_EVENT) {
-        return 0;
-    }
     // 0 passes the event on, to the default handler that ends the process.
     if (intrinsics::atomic_load_u32(&g_listeners, ORDER_SEQUENTIALLY_CONSISTENT) == 0) {
         return 0;
     }
-    intrinsics::atomic_add_u64(&g_pending, PENDING_INTERRUPT, ORDER_SEQUENTIALLY_CONSISTENT);
+    if (control_type == syscall::CTRL_C_EVENT || control_type == syscall::CTRL_BREAK_EVENT) {
+        intrinsics::atomic_add_u64(&g_pending, PENDING_INTERRUPT, ORDER_SEQUENTIALLY_CONSISTENT);
+        syscall::ReleaseSemaphore(g_wake_semaphore, 1, null);
+        return 1;
+    }
+    if (control_type != syscall::CTRL_CLOSE_EVENT && control_type != syscall::CTRL_LOGOFF_EVENT
+        && control_type != syscall::CTRL_SHUTDOWN_EVENT) {
+        return 0;
+    }
+    intrinsics::atomic_add_u64(&g_pending, PENDING_TERMINATE, ORDER_SEQUENTIALLY_CONSISTENT);
     syscall::ReleaseSemaphore(g_wake_semaphore, 1, null);
+    // Windows ends the process as soon as this handler returns, whatever it
+    // answers, so holding here is what gives the waiter time to clean up.
+    // The program's own exit ends the hold sooner; Windows' limit usually
+    // ends it before the hold runs out.
+    syscall::Sleep(TERMINATE_HOLD_MILLISECONDS);
     return 1;
 }
 
