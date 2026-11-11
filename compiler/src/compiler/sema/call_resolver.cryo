@@ -168,10 +168,13 @@ type struct ArgCandidates {
     count:      i64;
     variadic:   boolean;
     params:     [TypeRef];
+    /// The function of each candidate with the call's arity, in the order
+    /// `params` holds their parameters.
+    declarations: [DeclarationNode*];
 
     static new(argc: i64) -> ArgCandidates {
         return ArgCandidates { argc: argc, name_seen: 0, uniq_arity: -1, count: 0,
-                               variadic: false, params: [] };
+                               variadic: false, params: [], declarations: [] };
     }
 }
 
@@ -416,8 +419,12 @@ type struct CallResolver {
 
     /// Arity-matching method overloads' non-receiver param types for `member`, as
     /// an expected-type hint (a position-wise merge where all overloads agree).
+    /// `*chosen` is the method when exactly one has the call's arity, null
+    /// otherwise.
     lookup_method_param_types(mut &this, visitor: mut SemaVisitor*, call: CallExpr*,
-                              member: MemberAccessExpr*, arg_count: i64) -> [TypeRef] {
+                              member: MemberAccessExpr*, arg_count: i64,
+                              chosen: mut (DeclarationNode*)*) -> [TypeRef] {
+        *chosen = null;
         const obj_type: TypeRef = visitor.resolve_receiver(member.object);
         if (!obj_type.is_valid()) { return []; }
         mut base_ref: TypeRef = obj_type;
@@ -449,6 +456,7 @@ type struct CallResolver {
                         // default width while the parameter states another.
                         mut cands: ArgCandidates = ArgCandidates::new(arg_count);
                         if (!this.collect_on_template(visitor, call, member, base_ref, &cands)) { return []; }
+                        if (cands.count == 1) { *chosen = cands.declarations[0]; }
                         return this.agreed_candidate_params(&cands);
                     }
                 }
@@ -488,6 +496,7 @@ type struct CallResolver {
 
         if (found.length() == 0) { return []; }
         if (found.length() == 1) {
+            *chosen = found[0].ast_node as DeclarationNode*;
             mut single: [TypeRef] = [];
             for (mut i: i64 = 0; i < found[0].param_types.length(); i++) {
                 single.push(found[0].param_types[i]);
@@ -1066,12 +1075,15 @@ type struct CallResolver {
                 param_types = sema_copy_type_refs(&this.arena.lookup(computed_fn).as_function().param_types);
             }
         }
+        // The one method a member call can select, when its arity leaves one.
+        mut chosen_method: DeclarationNode* = null;
         if (param_types.length() == 0) {
             const callee_node: ExpressionNode* = call.callee;
             if (ExpressionNode::member_access_of(callee_node) != null
                     && !ExpressionNode::member_access_of(callee_node).parenthesized) {
                 param_types = this.lookup_method_param_types(
-                    visitor, call, ExpressionNode::member_access_of(call.callee), call.arguments.length());
+                    visitor, call, ExpressionNode::member_access_of(call.callee), call.arguments.length(),
+                    &chosen_method);
             }
         }
         if (param_types.length() == 0) {
@@ -1133,8 +1145,10 @@ type struct CallResolver {
             // still holds: a literal in an `[T]` slot is an `Array`, which
             // only the slot says.
             mut open_dynamic_slot: boolean = false;
+            mut open_slot: TypeRef = TypeRef::invalid();
             if (slot.is_valid() && this.symbolic.names_param_out_of_scope(slot)) {
                 open_dynamic_slot = this.arena.default_array_element(slot).is_valid();
+                open_slot = slot;
                 slot = TypeRef::invalid();
                 push_expected = false;
             }
@@ -1261,7 +1275,29 @@ type struct CallResolver {
             } else {
                 this.state.expected_type = TypeRef::invalid();
             }
+            // An open slot that is one of the method's own type parameters,
+            // bound by a trait written with arguments: a static call written
+            // as the argument with its owner's type arguments left out takes
+            // them from that trait's implementation (`map.range(10..20)` on
+            // an `i64`-keyed map is a `Range<i64>`).  Arguments nested in it
+            // see the bound only through their own slots.
+            const saved_bound_argument: ExpressionNode* = this.state.bound_argument;
+            const saved_bound_trait: DefId = this.state.bound_trait;
+            mut saved_bound_args: [TypeRef] = [];
+            mut bound_here: boolean = false;
+            if (open_slot.is_valid() && chosen_method != null) {
+                saved_bound_args = sema_copy_type_refs(&this.state.bound_trait_args);
+                if (this.argument_bound(visitor, ExpressionNode::member_access_of(call.callee), chosen_method, open_slot)) {
+                    this.state.bound_argument = arg;
+                    bound_here = true;
+                }
+            }
             visitor.resolve_expr(arg);
+            if (bound_here) {
+                this.state.bound_argument = saved_bound_argument;
+                this.state.bound_trait = saved_bound_trait;
+                this.state.bound_trait_args = saved_bound_args;
+            }
             if (open_dynamic_slot) { this.adopt_dynamic_array_kind(arg); }
         }
         this.state.expected_type = saved_expected;
@@ -3576,17 +3612,18 @@ type struct CallResolver {
         return true;
     }
 
-    /// Record in `found` a candidate the selection tried, with its
+    /// Record in `found` a candidate method the selection tried, with its
     /// parameters seen through `view` (null: as declared) when it has the
     /// call's arity.
-    record_candidate(mut &this, fn_node_decl: DeclarationNode*, params: &[TypeRef],
+    record_candidate(mut &this, method_decl: DeclarationNode*, params: &[TypeRef],
                      view: TypeSubstitution*, found: mut ArgCandidates*) -> void {
-        const fn_node: FunctionDecl* = DeclarationNode::fn_of(fn_node_decl);
+        const fn_node: FunctionDecl* = DeclarationNode::fn_of(DeclarationNode::method_of(method_decl).func);
         if (fn_node.is_variadic) { found.variadic = true; return; }
         found.name_seen += 1;
         found.uniq_arity = this.diag.note_arity(found.uniq_arity, params.length());
         if (params.length() != found.argc) { return; }
         found.count += 1;
+        found.declarations.push(method_decl);
         for (mut ci: i64 = 0; ci < params.length(); ci++) {
             found.params.push(if (view != null) { this.seen_through(view, params[ci]) } else { params[ci] });
         }
@@ -5386,7 +5423,7 @@ type struct CallResolver {
                 // Collecting for the argument check binds nothing: each
                 // candidate is recorded once.
                 if (sel.collect != null) {
-                    this.record_candidate(fn_node_decl, &params, view, sel.collect);
+                    this.record_candidate(mn_decl, &params, view, sel.collect);
                     continue;
                 }
                 if (!this.method_args_bind(call, arg_types, params.as_slice(), fn_node.is_variadic, tier, fn_node_decl,
@@ -9149,22 +9186,7 @@ type struct CallResolver {
         for (mut i: i64 = 0; i < this.arena.inst_type_arg_count(recv); i++) {
             recv_args.push(this.arena.inst_type_arg_at(recv, i));
         }
-        // A bound on the method may name its owner's parameters
-        // (`F: (T) -> U` on a method of `Cell<T>`, `R: RangeBounds<K>` on a
-        // method of `BTreeMap<K, V>`): they are the receiver's arguments, in
-        // the block's head or the type's own declaration.
-        mut owned: TypeSubstitution = TypeSubstitution::empty();
-        if (block != null) {
-            checker.add_head_param_bindings(block, &recv_args, &owned);
-        } else {
-            const owner: const TemplateEntry* = this.ctx.generic_registry.template_of_type(
-                this.arena.inst_generic_base(recv));
-            if (owner != null) {
-                for (mut i: i64 = 0; i < owner.param_syms.length() && i < recv_args.length(); i++) {
-                    owned.add(this.arena.create_generic_param(owner.param_syms[i], SymbolStr::empty(), i as u64), recv_args[i]);
-                }
-            }
-        }
+        mut owned: TypeSubstitution = this.receiver_owner_substitution(block, recv, &recv_args);
         if (!this.check_call_where_bounds(at, m.func, &syms, &call.resolved_type_args, &owned)) { return false; }
         for (mut i: i64 = 0; i < syms.length(); i++) {
             owned.add(this.arena.create_generic_param(syms[i], SymbolStr::empty(), i as u64), call.resolved_type_args[i]);
@@ -9200,6 +9222,112 @@ type struct CallResolver {
             return false;
         }
         return true;
+    }
+
+    /// What the owner parameters a method's bounds may name stand for on
+    /// `recv` (`K` in `R: RangeBounds<K>` on a method of `BTreeMap<K, V>`):
+    /// `block`'s head parameters when the method is written in an implement
+    /// block, the type's own declared parameters otherwise, each bound to
+    /// the receiver's argument at its position.
+    receiver_owner_substitution(&this, block: ImplBlock*, recv: TypeRef, recv_args: &[TypeRef]) -> TypeSubstitution {
+        mut owned: TypeSubstitution = TypeSubstitution::empty();
+        if (block != null) {
+            this.trait_checker().add_head_param_bindings(block, recv_args, &owned);
+            return owned;
+        }
+        const owner: const TemplateEntry* = this.ctx.generic_registry.template_of_type(
+            this.arena.inst_generic_base(recv));
+        if (owner != null) {
+            for (mut i: i64 = 0; i < owner.param_syms.length() && i < recv_args.length(); i++) {
+                owned.add(this.arena.create_generic_param(owner.param_syms[i], SymbolStr::empty(), i as u64), recv_args[i]);
+            }
+        }
+        return owned;
+    }
+
+    /// The trait `chosen`, the one method a member call can select, requires
+    /// by a where-bound of its own type parameter `parameter` (the declared
+    /// type of the argument's slot), with the trait's arguments under the
+    /// receiver's: `RangeBounds<i64>` for `range<R>(&this, bounds: R) where
+    /// R: RangeBounds<K>` called on a `BTreeMap<i64, V>`.  Written to
+    /// `state.bound_trait` / `state.bound_trait_args`; false, writing
+    /// nothing, unless the slot is one of the method's type parameters and
+    /// that parameter's first trait written with arguments has every one of
+    /// them concrete on this receiver.
+    argument_bound(mut &this, visitor: mut SemaVisitor*, member: MemberAccessExpr*, chosen: DeclarationNode*,
+                   parameter: TypeRef) -> boolean {
+        const own: GenericParamType* = this.arena.generic_param_or_null(parameter);
+        if (own == null || chosen == null) { return false; }
+        const recv: TypeRef = visitor.receiver_subject(visitor.resolve_receiver(member.object));
+        const m: MethodDecl* = DeclarationNode::method_of(chosen);
+        if (m == null || m.func == null) { return false; }
+        const f: FunctionDecl* = DeclarationNode::fn_of(m.func);
+        mut recv_args: [TypeRef] = [];
+        for (mut i: i64 = 0; i < this.arena.inst_type_arg_count(recv); i++) {
+            recv_args.push(this.arena.inst_type_arg_at(recv, i));
+        }
+        const block: ImplBlock* = DeclarationNode::impl_of(this.binding.method_site(chosen, null, recv));
+        const owned: TypeSubstitution = this.receiver_owner_substitution(block, recv, &recv_args);
+        for (mut bi: i64 = 0; bi < f.trait_bounds.length(); bi++) {
+            const bound: const TraitBound* = &f.trait_bounds[bi];
+            if (!bound.subject_param().equals(own.param_sym)) { continue; }
+            for (mut ri: i64 = 0; ri < bound.trait_refs.length(); ri++) {
+                const tr: const TraitRef* = &bound.trait_refs[ri];
+                if (tr.refused || tr.argument_types.length() == 0) { continue; }
+                mut args: [TypeRef] = [];
+                for (mut ai: i64 = 0; ai < tr.argument_types.length(); ai++) {
+                    const arg: TypeRef = owned.apply(tr.argument_types[ai], this.arena);
+                    if (!arg.is_valid() || this.arena.contains_generic_param(arg)) { return false; }
+                    args.push(arg);
+                }
+                this.state.bound_trait = tr.definition();
+                this.state.bound_trait_args = args;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// A generic owner's arguments, read off the one implementation of
+    /// `state.bound_trait` for the owner whose trait arguments unify with
+    /// `state.bound_trait_args` (`implement<T> RangeBounds<T> for Range<T>`
+    /// asked for `RangeBounds<i64>` gives `[i64]`).  `[]` when no
+    /// implementation's head writes a parameter at every position, when
+    /// none or more than one answers, or when the answer drops a type
+    /// argument a turbofish wrote (`seeds`).
+    owner_bindings_from_bound(mut &this, tmpl: const TemplateEntry*, seeds: &[TypeRef]) -> [TypeRef] {
+        const checker: TraitChecker = this.trait_checker();
+        const heads: [DeclarationNode*] = this.ctx.generic_registry.heads_under(this.state.bound_trait, tmpl.base_type);
+        mut answer: [TypeRef] = [];
+        for (mut h: i64 = 0; h < heads.length(); h++) {
+            const block: ImplBlock* = DeclarationNode::impl_of(heads[h]);
+            if (block == null || block.target_args.length() != tmpl.param_types.length()
+                    || block.trait_arg_types.length() != this.state.bound_trait_args.length()) {
+                continue;
+            }
+            mut params: [TypeRef] = [];
+            for (mut i: i64 = 0; i < block.target_args.length(); i++) {
+                params.push(checker.head_param_type(block, i));
+            }
+            mut ictx: InferCtx = InferCtx::for_template(this.arena, params);
+            mut unified: boolean = true;
+            for (mut i: i64 = 0; i < block.trait_arg_types.length(); i++) {
+                if (!ictx.unify(block.trait_arg_types[i], this.state.bound_trait_args[i])) { unified = false; break; }
+            }
+            if (!unified) { continue; }
+            mut found: [TypeRef] = [];
+            for (mut i: i64 = 0; i < ictx.bindings.length(); i++) {
+                if (!ictx.bindings[i].is_valid() || !this.symbolic.symbolic_type_concretizable(ictx.bindings[i])) {
+                    unified = false;
+                    break;
+                }
+                found.push(ictx.bindings[i]);
+            }
+            if (!unified || !CallResolver::keeps_written(&found, seeds)) { continue; }
+            if (answer.length() > 0) { return []; }
+            answer = found;
+        }
+        return answer;
     }
 
     /// E0306 at `at` for the first callable bound of the function
@@ -9810,6 +9938,18 @@ type struct CallResolver {
                 const expected_args: [TypeRef] = this.types.view_type_args_copy(exp_ref_s);
                 if (CallResolver::keeps_written(&expected_args, &seeds)) { return expected_args; }
             }
+        }
+
+        // 2a. The call is the argument for a callee's type parameter bound by
+        // a trait written with arguments (`R: RangeBounds<i64>` given
+        // `10..20`): the owner's implementation of that trait at those
+        // arguments decides the owner's.  After the arguments and the
+        // expected type, so a concretely typed argument keeps its own type
+        // and meets the bound check; before the defaults and the literal
+        // guess, which know nothing of the bound.
+        if (this.state.bound_argument != null && this.state.bound_argument == call_e) {
+            const from_bound: [TypeRef] = this.owner_bindings_from_bound(tmpl, &seeds);
+            if (from_bound.length() == want) { return from_bound; }
         }
 
         // 2b. Trailing DEFAULTED owner params the args and the return leave
