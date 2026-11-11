@@ -279,10 +279,33 @@ type struct TraitChecker {
             } else {
                 this.generic_registry.binds_trait_arguments(block, trait_def, args, this.intern_table)
             };
-            if (!binds) { continue; }
+            if (!binds || !this.head_writes_trait_arguments(block, args, value)) { continue; }
             if (this.impl_applies_at(block, trait_def, args, value, depth)) { return heads[i]; }
         }
         return null;
+    }
+
+    /// Whether `block`'s head, its parameters bound by `value`'s own
+    /// arguments, writes its trait at `args`: `implement<T> trait Accepts<T>
+    /// for Wrap<T>` gives `Wrap<i32>` `Accepts<i32>` and never
+    /// `Accepts<i64>`, though each of the head's two `T`s alone binds to
+    /// anything. A position the target leaves to a parameter it does not
+    /// carry, or an argument that still names a parameter, refutes nothing.
+    head_writes_trait_arguments(&this, block: mut ImplBlock*, args: &[TypeRef], value: TypeRef) -> boolean {
+        if (block.target_param().is_valid()) { return true; }
+        const count: i64 = this.arena.inst_type_arg_count(value);
+        if (count == 0 || block.target_args.length() != count) { return true; }
+        mut value_args: [TypeRef] = [];
+        for (mut i: i64 = 0; i < count; i++) { value_args.push(this.arena.inst_type_arg_at(value, i)); }
+        mut head: TypeSubstitution = TypeSubstitution::empty();
+        this.add_head_param_bindings(block, &value_args, &head);
+        for (mut i: i64 = 0; i < args.length() && i < block.trait_arg_types.length(); i++) {
+            if (!args[i].is_valid() || this.arena.contains_generic_param(args[i])) { continue; }
+            const written: TypeRef = head.apply(block.trait_arg_types[i], this.arena);
+            if (!written.is_valid() || this.arena.contains_generic_param(written)) { continue; }
+            if (!this.generic_registry.type_unifies(written, args[i], this.intern_table)) { return false; }
+        }
+        return true;
     }
 
     /// The trait `tr` names, as a diagnostic shows it: with the arguments a

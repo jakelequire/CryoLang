@@ -2054,7 +2054,8 @@ type struct CallResolver {
         // refused call is typed on all the same: its bindings are known, and
         // its value's uses are checked against the type they substitute to
         // rather than refused a second time.
-        this.check_call_where_bounds(call_e.span, tmpl_decl, &entry.param_syms, &bindings);
+        const no_owner: TypeSubstitution = TypeSubstitution::empty();
+        this.check_call_where_bounds(call_e.span, tmpl_decl, &entry.param_syms, &bindings, &no_owner);
 
         // KEYSTONE: stash all-bound bindings + substitute into the template return.
         mut all_bound_stash: boolean = bindings.length() == entry.param_types.length();
@@ -2674,7 +2675,9 @@ type struct CallResolver {
         }
         if (inference.all_bound() || call.arguments.length() == 0) { return false; }
         if (inference.misfit < 0 && inference.unjudged) {
-            return !this.check_call_where_bounds(call_e.span, entry.ast_node, &entry.param_syms, &inference.bindings);
+            const no_owner: TypeSubstitution = TypeSubstitution::empty();
+            return !this.check_call_where_bounds(call_e.span, entry.ast_node, &entry.param_syms, &inference.bindings,
+                &no_owner);
         }
         this.emit_unbound_from_arguments(call_e, call, tmpl, inference.misfit);
         return true;
@@ -3705,7 +3708,10 @@ type struct CallResolver {
             const binds: [TypeRef] = this.template_call_bindings(call, null, t, f_decl);
             mut unmet_arg: TypeRef = TypeRef::invalid();
             mut unmet_trait: SymbolStr = SymbolStr::empty();
-            if (this.unmet_call_bound(f_decl, &t.param_syms, &binds, &unmet_arg, &unmet_trait) != null) { continue; }
+            const no_owner: TypeSubstitution = TypeSubstitution::empty();
+            if (this.unmet_call_bound(f_decl, &t.param_syms, &binds, &no_owner, &unmet_arg, &unmet_trait) != null) {
+                continue;
+            }
             generics.push(entries[i]);
         }
         if (!plain.is_valid() || generics.length() == 0) { return false; }
@@ -7418,7 +7424,8 @@ type struct CallResolver {
         // A function's where-clause holds for the instance, as for a call, and
         // a refused instance is typed on as a refused call is.
         if (entry.kind == TemplateKind::Function && entry.ast_node != null) {
-            this.check_call_where_bounds(span, entry.ast_node, &entry.param_syms, &bindings);
+            const no_owner: TypeSubstitution = TypeSubstitution::empty();
+            this.check_call_where_bounds(span, entry.ast_node, &entry.param_syms, &bindings, &no_owner);
         }
         const ty: TypeRef = this.subst_params(params, &bindings, sig);
         if (ty.is_valid()) { *out_args = bindings; }
@@ -7716,7 +7723,9 @@ type struct CallResolver {
                 shown, with_args, scope_e.span);
             return TypeRef::invalid();
         }
-        this.check_call_where_bounds(scope_e.span, DeclarationNode::method_of(node).func, &syms, &bindings);
+        const owner_bindings: TypeSubstitution = TypeSubstitution::from_params(&owner_handles, &owner_args);
+        this.check_call_where_bounds(scope_e.span, DeclarationNode::method_of(node).func, &syms, &bindings,
+            &owner_bindings);
         mut sub_params: [TypeRef] = [];
         mut sub_args: [TypeRef] = [];
         for (mut i: i64 = 0; i < handles.length(); i++) {
@@ -8965,7 +8974,8 @@ type struct CallResolver {
         // E0306 - where-clause bound satisfaction for the bound method args, so an
         // unsatisfied bound is a clean call-site error rather than a downstream
         // miss.  The call is typed on all the same, as a free call is.
-        this.check_call_where_bounds(call_e.span, tmpl_decl, &entry.param_syms, &binds);
+        const no_owner: TypeSubstitution = TypeSubstitution::empty();
+        this.check_call_where_bounds(call_e.span, tmpl_decl, &entry.param_syms, &binds, &no_owner);
 
         // Stash for mono + record the winning template (mono can't re-derive the
         // caller's import scope), then substitute into the return.  Callee stays
@@ -8993,25 +9003,28 @@ type struct CallResolver {
     /// and typing it on spares the uses of its value a second report.
     /// Shared by the free-function and static-method-template call paths and
     /// a generic function or method taken as a value; `at` is the use's span.
+    /// `outer` binds the parameters of the type a method belongs to, which
+    /// its bounds' arguments may name; empty for a free function.
     check_call_where_bounds(mut &this, at: SourceSpan, tmpl_decl: DeclarationNode*,
-                            param_syms: &[SymbolID], bindings: &[TypeRef]) -> boolean {
+                            param_syms: &[SymbolID], bindings: &[TypeRef],
+                            outer: &TypeSubstitution) -> boolean {
         mut concrete: TypeRef = TypeRef::invalid();
         mut shown: SymbolStr = SymbolStr::empty();
-        const tref: const TraitRef* = this.unmet_call_bound(tmpl_decl, param_syms, bindings, &concrete, &shown);
+        const tref: const TraitRef* = this.unmet_call_bound(tmpl_decl, param_syms, bindings, outer,
+            &concrete, &shown);
         if (tref != null) {
             this.emit_free_call_bound_failure(at, tmpl_decl, tref, concrete, shown);
             return false;
         }
-        mut params: [TypeRef] = [];
-        for (mut i: i64 = 0; i < param_syms.length(); i++) {
-            params.push(this.arena.create_generic_param(param_syms[i], SymbolStr::empty(), i as u64));
+        mut subst: TypeSubstitution = TypeSubstitution::from_params(&outer.params, &outer.replacements);
+        for (mut i: i64 = 0; i < param_syms.length() && i < bindings.length(); i++) {
+            subst.add(this.arena.create_generic_param(param_syms[i], SymbolStr::empty(), i as u64), bindings[i]);
         }
-        const subst: TypeSubstitution = TypeSubstitution::from_params(&params, bindings);
         if (!this.check_callable_bounds(at, tmpl_decl, &subst)) { return false; }
         mut subject: TypeRef = TypeRef::invalid();
         mut required: string = "";
         const scoped: const TraitRef* = this.unmet_call_bound_in_scope(tmpl_decl, param_syms, bindings,
-            &subject, &required);
+            outer, &subject, &required);
         if (scoped != null) { this.emit_call_bound_not_in_scope(at, tmpl_decl, scoped, subject, required); }
         return true;
     }
@@ -9026,12 +9039,12 @@ type struct CallResolver {
     /// it stands is skipped, as is a bound on a concrete subject, which
     /// `unmet_call_bound` judges.  Null when the scope gives every bound.
     unmet_call_bound_in_scope(mut &this, tmpl_decl: DeclarationNode*, param_syms: &[SymbolID],
-                              bindings: &[TypeRef], out_subject: mut TypeRef*,
+                              bindings: &[TypeRef], outer: &TypeSubstitution, out_subject: mut TypeRef*,
                               out_trait: mut string*) -> const TraitRef* {
         if (!this.state.in_symbolic_check || !this.walks_written_body()) { return null; }
         const tmpl: FunctionDecl* = DeclarationNode::fn_of(tmpl_decl);
         if (tmpl == null || tmpl.trait_bounds.length() == 0) { return null; }
-        mut subst: TypeSubstitution = TypeSubstitution::empty();
+        mut subst: TypeSubstitution = TypeSubstitution::from_params(&outer.params, &outer.replacements);
         for (mut i: i64 = 0; i < param_syms.length() && i < bindings.length(); i++) {
             if (!bindings[i].is_valid()) { continue; }
             subst.add(this.arena.create_generic_param(param_syms[i], SymbolStr::empty(), i as u64), bindings[i]);
@@ -9106,16 +9119,16 @@ type struct CallResolver {
             if (gp == null) { return true; }
             syms.push(gp.sym_id);
         }
-        if (!this.check_call_where_bounds(at, m.func, &syms, &call.resolved_type_args)) { return false; }
         const block: ImplBlock* = DeclarationNode::impl_of(this.binding.method_site(chosen, null, recv));
         const checker: TraitChecker = this.trait_checker();
         mut recv_args: [TypeRef] = [];
         for (mut i: i64 = 0; i < this.arena.inst_type_arg_count(recv); i++) {
             recv_args.push(this.arena.inst_type_arg_at(recv, i));
         }
-        // A callable bound on the method may name its owner's parameters
-        // (`F: (T) -> U` on a method of `Cell<T>`): they are the receiver's
-        // arguments, in the block's head or the type's own declaration.
+        // A bound on the method may name its owner's parameters
+        // (`F: (T) -> U` on a method of `Cell<T>`, `R: RangeBounds<K>` on a
+        // method of `BTreeMap<K, V>`): they are the receiver's arguments, in
+        // the block's head or the type's own declaration.
         mut owned: TypeSubstitution = TypeSubstitution::empty();
         if (block != null) {
             checker.add_head_param_bindings(block, &recv_args, &owned);
@@ -9128,6 +9141,7 @@ type struct CallResolver {
                 }
             }
         }
+        if (!this.check_call_where_bounds(at, m.func, &syms, &call.resolved_type_args, &owned)) { return false; }
         for (mut i: i64 = 0; i < syms.length(); i++) {
             owned.add(this.arena.create_generic_param(syms[i], SymbolStr::empty(), i as u64), call.resolved_type_args[i]);
         }
@@ -9208,11 +9222,12 @@ type struct CallResolver {
     /// when every bound holds (or the arg is still abstract/skippable).
     /// Reports nothing.
     unmet_call_bound(mut &this, tmpl_decl: DeclarationNode*, param_syms: &[SymbolID],
-                     bindings: &[TypeRef], out_concrete: mut TypeRef*, out_trait: mut SymbolStr*) -> const TraitRef* {
+                     bindings: &[TypeRef], outer: &TypeSubstitution, out_concrete: mut TypeRef*,
+                     out_trait: mut SymbolStr*) -> const TraitRef* {
         const tmpl: FunctionDecl* = DeclarationNode::fn_of(tmpl_decl);
         for (mut bi: i64 = 0; bi < tmpl.trait_bounds.length(); bi++) {
             const unmet: const TraitRef* = this.ctx.type_resolver.unmet_written_bound(&tmpl.trait_bounds[bi],
-                param_syms, bindings, out_concrete, out_trait);
+                param_syms, bindings, outer, out_concrete, out_trait);
             if (unmet != null) { return unmet; }
         }
         return null;
