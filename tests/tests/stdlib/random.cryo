@@ -16,6 +16,9 @@ import std::random::distribution::{
     Bernoulli, Exponential, Normal, UniformF64, UniformU64, WeightedIndex
 };
 import std::random::error::{ RandomError };
+import std::random;
+import std::collections::array::{ Array };
+import std::thread;
 import std::test::error::{ TestError };
 import std::test::assert::{ expect_eq, expect_true };
 
@@ -359,4 +362,267 @@ function weighted_index_rejects_bad_weights() -> Result<(), TestError> {
             return Result::Ok(());
         }
     }
+}
+
+// A source that draws all ones, then zeros: the largest draw a generator
+// can make, followed by the smallest.
+type struct LargestThenSmallest {
+    drawn: i32;
+}
+
+implement trait RandomSource for struct LargestThenSmallest {
+    next_64(mut &this) -> u64 {
+        this.drawn = this.drawn + 1;
+        if (this.drawn == 1) { return u64::MAX; }
+        return 0;
+    }
+}
+
+![test]
+function largest_draw_of_a_float_is_below_one() -> Result<(), TestError> {
+    mut wide: LargestThenSmallest = LargestThenSmallest { drawn: 0 };
+    expect_true(wide.next::<f64>() < 1.0, Str::new("next::<f64>() of all ones is below 1.0"))?;
+    mut narrow: LargestThenSmallest = LargestThenSmallest { drawn: 0 };
+    expect_true(narrow.next::<f32>() < (1.0 as f32), Str::new("next::<f32>() of all ones is below 1.0"))?;
+    return Result::Ok(());
+}
+
+![test]
+function float_range_draws_again_when_rounding_reaches_high() -> Result<(), TestError> {
+    // 1 + (1 - 2^-53) is halfway between the last f64 below 2 and 2, and
+    // rounds to 2; the range takes the next draw, 0, and gives 1.
+    mut wide: LargestThenSmallest = LargestThenSmallest { drawn: 0 };
+    expect_eq(wide.next_range(1.0, 2.0), 1.0)?;
+    mut narrow: LargestThenSmallest = LargestThenSmallest { drawn: 0 };
+    expect_eq(narrow.next_range(1.0 as f32, 2.0 as f32), 1.0 as f32)?;
+    return Result::Ok(());
+}
+
+// The free functions draw from the calling thread's generator, which is
+// seeded from the OS, so their tests assert bounds and distributions
+// loose enough that a correct generator fails them with negligible
+// probability; the seeded `Rng` is what repeats exactly.
+
+![test]
+function free_range_rolls_every_face_evenly() -> Result<(), TestError> {
+    mut faces: [i32; 6];
+    mut i: i32 = 0;
+    while (i < 6) { faces[i] = 0; i = i + 1; }
+    mut in_bounds: boolean = true;
+    i = 0;
+    while (i < 12000) {
+        const roll: i32 = random::range(1, 7);
+        if (roll < 1 || roll >= 7) { in_bounds = false; } else { faces[roll - 1] = faces[roll - 1] + 1; }
+        i = i + 1;
+    }
+    expect_true(in_bounds, Str::new("range(1, 7) stays in [1, 7)"))?;
+    // 2000 expected per face, standard deviation about 41.
+    mut even: boolean = true;
+    i = 0;
+    while (i < 6) { if (faces[i] < 1700 || faces[i] > 2300) { even = false; } i = i + 1; }
+    expect_true(even, Str::new("every face of range(1, 7) comes up about equally"))?;
+    return Result::Ok(());
+}
+
+![test]
+function free_range_takes_every_integer_width() -> Result<(), TestError> {
+    mut ok: boolean = true;
+    mut i: i32 = 0;
+    while (i < 2000) {
+        const small: u8 = random::range(250 as u8, 255 as u8);
+        if (small < 250 || small >= 255) { ok = false; }
+        const negative: i64 = random::range(-10 as i64, -5 as i64);
+        if (negative < -10 || negative >= -5) { ok = false; }
+        const wide: u128 = random::range(0 as u128, 3 as u128);
+        if (wide >= 3) { ok = false; }
+        const whole: i8 = random::range(i8::MIN, i8::MAX);
+        if (whole == i8::MAX) { ok = false; }
+        i = i + 1;
+    }
+    expect_true(ok, Str::new("range stays in bounds for u8, i64, u128 and i8"))?;
+    return Result::Ok(());
+}
+
+![test]
+function free_range_of_floats_stays_below_high() -> Result<(), TestError> {
+    mut ok: boolean = true;
+    mut sum: f64 = 0.0;
+    mut i: i32 = 0;
+    while (i < 10000) {
+        const x: f64 = random::range(-2.5, 2.5);
+        if (x < -2.5 || x >= 2.5) { ok = false; }
+        sum = sum + x;
+        const y: f32 = random::range(1.0 as f32, 1.5 as f32);
+        if (y < (1.0 as f32) || y >= (1.5 as f32)) { ok = false; }
+        i = i + 1;
+    }
+    expect_true(ok, Str::new("float ranges stay in [low, high)"))?;
+    // Mean 0, standard deviation of the mean about 0.014.
+    const mean: f64 = sum / 10000.0;
+    expect_true(mean > -0.1 && mean < 0.1, Str::new("range(-2.5, 2.5) centres on 0"))?;
+    return Result::Ok(());
+}
+
+![test]
+function free_float_and_boolean_are_even() -> Result<(), TestError> {
+    mut ok: boolean = true;
+    mut sum: f64 = 0.0;
+    mut heads: i32 = 0;
+    mut i: i32 = 0;
+    while (i < 10000) {
+        const x: f64 = random::float();
+        if (x < 0.0 || x >= 1.0) { ok = false; }
+        sum = sum + x;
+        if (random::boolean()) { heads = heads + 1; }
+        i = i + 1;
+    }
+    expect_true(ok, Str::new("float() stays in [0, 1)"))?;
+    const mean: f64 = sum / 10000.0;
+    expect_true(mean > 0.47 && mean < 0.53, Str::new("float() averages one half"))?;
+    // 5000 expected, standard deviation 50.
+    expect_true(heads > 4700 && heads < 5300, Str::new("boolean() is true about half the time"))?;
+    return Result::Ok(());
+}
+
+![test]
+function free_value_reaches_every_byte() -> Result<(), TestError> {
+    mut seen: [boolean; 256];
+    mut i: i32 = 0;
+    while (i < 256) { seen[i] = false; i = i + 1; }
+    i = 0;
+    while (i < 8000) {
+        const byte: u8 = random::value::<u8>();
+        seen[byte as i32] = true;
+        i = i + 1;
+    }
+    mut all: boolean = true;
+    i = 0;
+    while (i < 256) { if (!seen[i]) { all = false; } i = i + 1; }
+    expect_true(all, Str::new("value::<u8>() reaches all 256 values"))?;
+
+    mut ok: boolean = true;
+    i = 0;
+    while (i < 1000) {
+        const unit: f32 = random::value::<f32>();
+        if (unit < (0.0 as f32) || unit >= (1.0 as f32)) { ok = false; }
+        const scalar: u32 = random::value::<char>() as u32;
+        if (scalar > 0x10FFFF || (scalar >= 0xD800 && scalar < 0xE000)) { ok = false; }
+        i = i + 1;
+    }
+    expect_true(ok, Str::new("value::<f32>() is in [0, 1) and value::<char>() is a scalar value"))?;
+    return Result::Ok(());
+}
+
+![test]
+function free_shuffle_reaches_every_order() -> Result<(), TestError> {
+    // An order of four elements is named by where 0, 1 and 2 land
+    // (`16 * p0 + 4 * p1 + p2`); 2400 shuffles expect each of the 24
+    // orders 100 times, standard deviation about 10.
+    mut orders: [i32; 64];
+    mut i: i32 = 0;
+    while (i < 64) { orders[i] = 0; i = i + 1; }
+    mut permutation: boolean = true;
+    mut round: i32 = 0;
+    while (round < 2400) {
+        mut items: [i32; 4];
+        i = 0;
+        while (i < 4) { items[i] = i; i = i + 1; }
+        random::shuffle(&items);
+        mut position: [i32; 4];
+        mut count: [i32; 4];
+        i = 0;
+        while (i < 4) { count[i] = 0; i = i + 1; }
+        i = 0;
+        while (i < 4) {
+            const v: i32 = items[i];
+            if (v < 0 || v >= 4) { permutation = false; } else { position[v] = i; count[v] = count[v] + 1; }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < 4) { if (count[i] != 1) { permutation = false; } i = i + 1; }
+        if (permutation) {
+            const order: i32 = 16 * position[0] + 4 * position[1] + position[2];
+            orders[order] = orders[order] + 1;
+        }
+        round = round + 1;
+    }
+    expect_true(permutation, Str::new("shuffle yields a permutation"))?;
+    mut distinct: i32 = 0;
+    mut even: boolean = true;
+    i = 0;
+    while (i < 64) {
+        if (orders[i] > 0) {
+            distinct = distinct + 1;
+            if (orders[i] < 60 || orders[i] > 140) { even = false; }
+        }
+        i = i + 1;
+    }
+    expect_eq(distinct, 24)?;
+    expect_true(even, Str::new("every order of shuffle comes up about equally"))?;
+    return Result::Ok(());
+}
+
+![test]
+function free_choose_reaches_every_element() -> Result<(), TestError> {
+    mut items: Array<i32> = Array::new();
+    items.push(10); items.push(20); items.push(30); items.push(40); items.push(50);
+    mut counts: [i32; 5];
+    mut i: i32 = 0;
+    while (i < 5) { counts[i] = 0; i = i + 1; }
+    mut member: boolean = true;
+    i = 0;
+    while (i < 5000) {
+        match (random::choose(&items)) {
+            Option::Some(chosen) => {
+                const v: i32 = *chosen;
+                if (v % 10 != 0 || v < 10 || v > 50) { member = false; } else { counts[v / 10 - 1] = counts[v / 10 - 1] + 1; }
+            }
+            Option::None => { member = false; }
+        }
+        i = i + 1;
+    }
+    expect_true(member, Str::new("choose returns an element of the array"))?;
+    // 1000 expected per element, standard deviation about 28.
+    mut even: boolean = true;
+    i = 0;
+    while (i < 5) { if (counts[i] < 850 || counts[i] > 1150) { even = false; } i = i + 1; }
+    expect_true(even, Str::new("every element is chosen about equally"))?;
+
+    const empty: Array<i32> = Array::new();
+    expect_true(random::choose(&empty).is_none(), Str::new("choose of nothing is None"))?;
+    return Result::Ok(());
+}
+
+![test]
+function seeded_rng_repeats_the_free_functions_draws() -> Result<(), TestError> {
+    mut a: Rng = Rng::from_seed(42);
+    mut b: Rng = Rng::from_seed(42);
+    mut same: boolean = true;
+    mut i: i32 = 0;
+    while (i < 100) {
+        if (a.next_range(1, 7) != b.next_range(1, 7)) { same = false; }
+        if (a.next_range(-1.0, 1.0) != b.next_range(-1.0, 1.0)) { same = false; }
+        if (a.next::<boolean>() != b.next::<boolean>()) { same = false; }
+        i = i + 1;
+    }
+    mut first: [i32; 8];
+    mut second: [i32; 8];
+    i = 0;
+    while (i < 8) { first[i] = i; second[i] = i; i = i + 1; }
+    a.shuffle(&first);
+    b.shuffle(&second);
+    i = 0;
+    while (i < 8) { if (first[i] != second[i]) { same = false; } i = i + 1; }
+    expect_true(same, Str::new("two generators from one seed draw the same values"))?;
+    return Result::Ok(());
+}
+
+![test]
+function each_thread_has_its_own_generator() -> Result<(), TestError> {
+    const here: u64 = random::value::<u64>();
+    const there: u64 = thread::spawn(() -> u64 { return random::value::<u64>(); }).join();
+    expect_true(here != there, Str::new("two threads draw different values"))?;
+    const next: u64 = random::value::<u64>();
+    expect_true(next != here, Str::new("the thread's generator advances"))?;
+    return Result::Ok(());
 }

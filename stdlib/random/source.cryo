@@ -28,8 +28,8 @@ public type trait RandomSource {
     ///   - integers - the required number of bits, taken from the top (best-mixed)
     ///     end for the sub-64-bit widths; `u128`/`i128` concatenate two draws.
     ///   - `boolean` - the top (highest-quality) bit.
-    ///   - `f64`/`f32` - a uniform value in `[0.0, 1.0)`; `f64` uses the top 53
-    ///     bits so every representable value in the interval is equally likely.
+    ///   - `f64`/`f32` - a uniform value in `[0.0, 1.0)` on a grid of the type's
+    ///     significand width (53 and 24 bits), each grid point equally likely.
     ///   - `char` - a uniform Unicode scalar value (the surrogate range is skipped).
     /// Select the type with a turbofish (`rng.next<u32>()`) or from context.
     next<T>(mut &this) -> T {
@@ -54,8 +54,10 @@ public type trait RandomSource {
                 (bits as f64) / 9007199254740992.0         // / 2^53
             }
             f32 => {
-                const bits: u64 = this.next_64() >> 11;
-                ((bits as f64) / 9007199254740992.0) as f32
+                // 24 bits, the f32 significand: narrowing a 53-bit f64 draw
+                // would round its top values up to 1.0.
+                const bits: u64 = this.next_64() >> 40;
+                (bits as f32) / 16777216.0                 // / 2^24
             }
             char => {
                 // Uniform Unicode scalar: draw over `[0, 0x110000)` minus the
@@ -86,11 +88,13 @@ public type trait RandomSource {
         }
     }
 
-    /// A uniform integer of type `T` in `[lo, hi)`. Requires `lo < hi`.
-    /// `static match (T)` covers every integer width: a span of a
-    /// 64-bit-and-narrower type is drawn unbiased through `next_below`,
-    /// and through the 128-bit sampler `next_below_wide` when it is wider
-    /// than `i64::MAX`; `u128`/`i128` always use the 128-bit sampler.
+    /// A uniform value of type `T` in `[lo, hi)`, panicking unless `lo < hi`.
+    /// Every integer width is drawn unbiased: a span of a
+    /// 64-bit-and-narrower type through `next_below`, and through the
+    /// 128-bit sampler `next_below_wide` when it is wider than `i64::MAX`;
+    /// `u128`/`i128` always use the 128-bit sampler. `f64`/`f32` scale a
+    /// `next` draw onto the span, which must be finite, and never return
+    /// `hi`.
     next_range<T>(mut &this, lo: T, hi: T) -> T {
         return static match (T) {
             u8 | u16 | u32 | u64 | usize | i8 | i16 | i32 | i64 | isize => {
@@ -119,6 +123,35 @@ public type trait RandomSource {
                     core::panic("RandomSource::next_range: lo must be < hi", intrinsics::location());
                 }
                 lo + (this.next_below_wide((hi - lo) as u128) as i128)
+            }
+            f64 => {
+                const low: f64 = lo;
+                const span: f64 = hi - lo;
+                if (!(lo < hi) || !span.is_finite()) {
+                    core::panic("RandomSource::next_range: lo must be < hi and the span finite", intrinsics::location());
+                }
+                // `unit` is `next`'s `f64` draw, in `[0, 1)`. Rounding can carry
+                // `low + span * unit` up to `hi` itself; such a draw is taken
+                // again rather than moved, so no value gains weight.
+                mut value: f64 = hi;
+                while (value >= hi) {
+                    const unit: f64 = ((this.next_64() >> 11) as f64) / 9007199254740992.0;
+                    value = low + span * unit;
+                }
+                value
+            }
+            f32 => {
+                const low: f32 = lo;
+                const span: f32 = hi - lo;
+                if (!(lo < hi) || !span.is_finite()) {
+                    core::panic("RandomSource::next_range: lo must be < hi and the span finite", intrinsics::location());
+                }
+                mut value: f32 = hi;
+                while (value >= hi) {
+                    const unit: f32 = ((this.next_64() >> 40) as f32) / 16777216.0;
+                    value = low + span * unit;
+                }
+                value
             }
         };
     }
