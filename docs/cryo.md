@@ -4045,7 +4045,7 @@ type struct Gauge {
 
 A method declared in a trait body takes `![language]` and no other directive (`E0151`), and a directive written above an associated type is refused (`E0151`).
 
-The test-mode directives (`![config(testing)]`, `![test]`, `![ignore]`, `![should_panic]`) are documented in the next subsection.
+The test-mode directives (`![config(testing)]`, `![test]`, `![ignore]`, `![should_panic]`, `![child_role]`) are documented in the next subsection.
 
 Other names that appear with `![...]` syntax are accepted by the parser and recorded so user tooling can observe them, but the compiler emits a warning for any non-builtin name and applies no semantics. A list of reserved-but-unimplemented directive names is in [section 21](#21-reserved-syntax).
 
@@ -4059,6 +4059,7 @@ The test framework introduces a small set of directives recognised by the compil
 | `![test]`            | Marks a function as a discoverable test.                           |
 | `![ignore]`          | Skips the test unless `cryo test --ignored` is passed.             |
 | `![should_panic]`    | Asserts the test panics; passing the test means observing a panic. |
+| `![child_role]`      | Not a test: a function a test starts as a child process by name, through `std::test::child_role::ChildRole::command`. The runner neither runs nor lists it. |
 
 ### 16.3 Memory Layout
 

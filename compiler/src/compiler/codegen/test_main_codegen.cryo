@@ -1,18 +1,18 @@
 /// Test-main synthesis pass.
 ///
 /// Runs once at the end of Phase 7 (per-module codegen) when the compile
-/// mode is `Test`. Walks `ctx.directive_registry` for `![test]` records,
-/// builds a fresh LLVM module containing:
+/// mode is `Test`. Walks `ctx.directive_registry` for `![test]` and
+/// `![child_role]` records, builds a fresh LLVM module containing:
 ///
-///   * a private global string for each test's fully-qualified name,
-///   * an extern declaration for each test's mangled symbol,
-///   * a static `[N x %TestDescriptor]` global initialised with one
-///     entry per test (matching the layout of
-///     `stdlib/test/descriptor.cryo`'s `TestDescriptor` struct), and
+///   * a private global string for each one's fully-qualified name,
+///   * an extern declaration for each one's mangled symbol,
+///   * a static `[N + R x %TestDescriptor]` global initialised with one
+///     entry per test followed by one per child role (matching the layout
+///     of `stdlib/test/descriptor.cryo`'s `TestDescriptor` struct), and
 ///   * a `define i32 @main(i32 argc, ptr argv)` that calls
 ///     `std::env::set_args(argc, argv)` and then
-///     `std::test::runner::run_all(argc, argv, &descriptors[0], N)`,
-///     returning whatever the runner returned.
+///     `std::test::runner::run_all(argc, argv, &descriptors[0], N,
+///     &descriptors[N], R)`, returning whatever the runner returned.
 ///
 /// The synthesized module is emitted to
 /// `<output_dir>/target/<profile>/local/deps/__cryo_test_main.o` and pushed
@@ -88,9 +88,19 @@ type struct TestMainCodegen {
             return PassResult::ok();
         }
 
-        mut tests: [TestEntry] = TestMainCodegen::collect_tests(ctx);
+        // Tests first, child roles after them: the runner reads the roles
+        // from `&descriptors[test_count]`.
+        mut tests: [TestEntry] = TestMainCodegen::collect_tests(ctx, "test");
         const test_count: u64 = tests.length() as u64;
-        Log::debug(LogArea::Codegen, f"{test_count} tests discovered");
+        const roles: [TestEntry] = TestMainCodegen::collect_tests(ctx, "child_role");
+        const role_count: u64 = roles.length() as u64;
+        mut role_index: i64 = 0;
+        while (role_index < roles.length()) {
+            tests.push(roles[role_index]);
+            role_index += 1;
+        }
+        const entry_count: u64 = tests.length() as u64;
+        Log::debug(LogArea::Codegen, f"{test_count} tests and {role_count} child roles discovered");
 
         // Create the synthesized module.  Match target/data-layout to the
         // rest of the build so the linker can splice the .o in cleanly.
@@ -123,12 +133,12 @@ type struct TestMainCodegen {
         // holding the name string, plus an extern declaration of the test
         // function's mangled symbol so the linker resolves it later.
         mut entries_buf: mut void* = null;
-        if (test_count > 0) {
-            entries_buf = libc::malloc(test_count * 8);
+        if (entry_count > 0) {
+            entries_buf = libc::malloc(entry_count * 8);
         }
         mut entries: mut (mut void*)* = entries_buf as mut (mut void*)*;
         mut i: u64 = 0;
-        while (i < test_count) {
+        while (i < entry_count) {
             const t: TestEntry = tests[i];
             const name_global: LValue = TestMainCodegen::add_private_name_global(test_mod, i, t);
             const fn_decl:     LValue = TestMainCodegen::add_extern_test_function(test_mod, MangledName::new(t.mangled_name));
@@ -139,11 +149,11 @@ type struct TestMainCodegen {
             i += 1;
         }
 
-        // Build [N x %TestDescriptor] global, initialised with the entries.
-        const arr_ty:     LType = LType::array_of(desc_ty, test_count as u32);
+        // Build [N + R x %TestDescriptor] global, initialised with the entries.
+        const arr_ty:     LType = LType::array_of(desc_ty, entry_count as u32);
         mut arr_init:     LValue = LValue::null();
-        if (test_count > 0) {
-            arr_init = LType::const_array(desc_ty, entries_buf, test_count as u32);
+        if (entry_count > 0) {
+            arr_init = LType::const_array(desc_ty, entries_buf, entry_count as u32);
         } else {
             // Zero-length array: still emit a global, but the initializer
             // is the canonical empty array constant via `LLVMConstArray` with
@@ -158,7 +168,7 @@ type struct TestMainCodegen {
 
         // Synthesize `int main(int argc, char** argv)`.
         const built_ok: boolean = TestMainCodegen::build_test_main(
-            ctx, test_mod, arr_global, arr_ty, desc_ty, test_count);
+            ctx, test_mod, arr_global, arr_ty, test_count, role_count);
         if (!built_ok) {
             tm.dispose();
             test_mod.dispose();
@@ -183,11 +193,11 @@ type struct TestMainCodegen {
 
     // Test collection from the directive registry
 
-    /// Walk `ctx.directive_registry` for records with `kind == "test"` and
-    /// build a `TestEntry` for each.  Sibling directives (`![ignore]`,
-    /// `![should_panic]`) on the same `FunctionDecl` are folded into
-    /// the entry's flags via `decl.attached_directives`.
-    static collect_tests(ctx: CompilationContext*) -> [TestEntry] {
+    /// Walk `ctx.directive_registry` for records of `kind` (`test` or
+    /// `child_role`) and build a `TestEntry` for each.  Sibling directives
+    /// (`![ignore]`, `![should_panic]`) on the same `FunctionDecl` are
+    /// folded into the entry's flags via `decl.attached_directives`.
+    static collect_tests(ctx: CompilationContext*, kind: string) -> [TestEntry] {
         mut out: [TestEntry] = [];
         if (ctx.directive_registry == null) { return out; }
         const reg: DirectiveRegistry* = ctx.directive_registry;
@@ -198,7 +208,7 @@ type struct TestMainCodegen {
         while (i < reg.records.length()) {
             const rec: DirectiveRecord = reg.records[i];
             i += 1;
-            if (!rec.kind.as_string().eq("test")) { continue; }
+            if (!rec.kind.as_string().eq(kind)) { continue; }
             if (rec.decl == null) { continue; }
             if (DeclarationNode::fn_of(rec.decl) == null) { continue; }
             const fn_decl_decl: DeclarationNode* = rec.decl;
@@ -326,8 +336,8 @@ type struct TestMainCodegen {
 
     /// Synthesize `int main(int argc, char** argv)` in `test_mod`.  The body
     /// publishes argv to `std::env::set_args`, then tail-calls
-    /// `std::test::runner::run_all(argc, argv, &descriptors[0], N)` and
-    /// returns its result.
+    /// `std::test::runner::run_all(argc, argv, &descriptors[0], N,
+    /// &descriptors[N], R)` and returns its result.
     ///
     /// Returns `false` if either runner symbol couldn't be resolved through
     /// the DI; in that case the synthesized module is unusable and the
@@ -336,8 +346,8 @@ type struct TestMainCodegen {
                               test_mod: LModule,
                               arr_global: LValue,
                               arr_ty: LType,
-                              desc_ty: LType,
-                              test_count: u64) -> boolean {
+                              test_count: u64,
+                              role_count: u64) -> boolean {
         const intern: InternTable* = ctx.intern_table;
         const di:     DeclarationIndex* = ctx.decl_index;
 
@@ -360,15 +370,16 @@ type struct TestMainCodegen {
 
         // Build the function signatures.
         //   set_args : (i32 argc, ptr argv) -> void
-        //   run_all  : (i32 argc, ptr argv, ptr descriptors, i64 count) -> i32
+        //   run_all  : (i32 argc, ptr argv, ptr descriptors, i64 count,
+        //               ptr roles, i64 role_count) -> i32
         const ptr_ty:  LType = LType::pointer_to(LType::i8());
         const i32_ty:  LType = LType::i32();
         const i64_ty:  LType = LType::i64();
         const void_ty: LType = LType::void_type();
 
-        const set_args_ty: LType = TestMainCodegen::make_function_type_2(void_ty, i32_ty, ptr_ty);
-        const set_env_ty:  LType = TestMainCodegen::make_function_type_1(void_ty, ptr_ty);
-        const run_all_ty:  LType = TestMainCodegen::make_function_type_4(i32_ty, i32_ty, ptr_ty, ptr_ty, i64_ty);
+        const set_args_ty: LType = TestMainCodegen::make_function_type(void_ty, [i32_ty, ptr_ty]);
+        const set_env_ty:  LType = TestMainCodegen::make_function_type(void_ty, [ptr_ty]);
+        const run_all_ty:  LType = TestMainCodegen::make_function_type(i32_ty, [i32_ty, ptr_ty, ptr_ty, i64_ty, ptr_ty, i64_ty]);
 
         // Declare the runner-side externs.
         const set_args_fn: LValue = test_mod.add_function(MangledName::new(set_args_name), set_args_ty);
@@ -378,7 +389,7 @@ type struct TestMainCodegen {
         // Declare main(i32, ptr, ptr) -> i32.  The third `char** envp`
         // param mirrors the user-program main-widening so `env::vars()`
         // works under `cryo test`; the C runtime always passes it.
-        const main_ty: LType = TestMainCodegen::make_function_type_3(i32_ty, i32_ty, ptr_ty, ptr_ty);
+        const main_ty: LType = TestMainCodegen::make_function_type(i32_ty, [i32_ty, ptr_ty, ptr_ty]);
         const main_fn: LValue = test_mod.add_function(MangledName::new("main"), main_ty);
         const entry:   LBasicBlock = LBasicBlock::append(main_fn, "entry");
         mut builder: LBuilder = LBuilder::create();
@@ -408,29 +419,28 @@ type struct TestMainCodegen {
             libc::free(args_buf);
         }
 
-        // ptr_to_first = getelementptr [N x %Desc], @descriptors, i64 0, i64 0
-        // -> equivalent to bitcasting the array global to ptr-to-element-0.
+        // The tests start at `&descriptors[0]`, the child roles at
+        // `&descriptors[test_count]`; an empty table hands out the global.
         mut first_ptr: LValue = arr_global;
-        if (test_count > 0) {
-            const idx_buf: mut void* = libc::malloc(2 * 8);
-            const idx_slots: mut (mut void*)* = idx_buf as mut (mut void*)*;
-            const zero_64: LValue = LType::const_int(i64_ty, 0, false);
-            idx_slots[0] = zero_64.raw;
-            idx_slots[1] = zero_64.raw;
-            first_ptr = builder.build_gep(arr_ty, arr_global, idx_buf, 2, "test.first");
-            libc::free(idx_buf);
+        mut roles_ptr: LValue = arr_global;
+        if (test_count + role_count > 0) {
+            first_ptr = TestMainCodegen::make_element_address(builder, arr_ty, arr_global, 0, "test.first");
+            roles_ptr = TestMainCodegen::make_element_address(builder, arr_ty, arr_global, test_count, "test.roles");
         }
 
-        // call run_all(argc, argv, first_ptr, count)
+        // call run_all(argc, argv, first_ptr, count, roles_ptr, role_count)
         const count_const: LValue = LType::const_int(i64_ty, test_count, false);
-        const args_buf: mut void* = libc::malloc(4 * 8);
+        const role_count_const: LValue = LType::const_int(i64_ty, role_count, false);
+        const args_buf: mut void* = libc::malloc(6 * 8);
         const args_slots: mut (mut void*)* = args_buf as mut (mut void*)*;
         args_slots[0] = argc.raw;
         args_slots[1] = argv.raw;
         args_slots[2] = first_ptr.raw;
         args_slots[3] = count_const.raw;
+        args_slots[4] = roles_ptr.raw;
+        args_slots[5] = role_count_const.raw;
         const rc: LValue = builder.build_call(
-            run_all_ty, run_all_fn, args_buf, 4, "test.rc");
+            run_all_ty, run_all_fn, args_buf, 6, "test.rc");
         libc::free(args_buf);
 
         builder.build_ret(rc);
@@ -438,51 +448,31 @@ type struct TestMainCodegen {
         return true;
     }
 
-    /// Helper: build a `(p1) -> ret` LLVM function type.
-    static make_function_type_1(ret: LType, p1: LType) -> LType {
-        const buf: mut void* = libc::malloc(8);
+    /// The LLVM function type `(parameters...) -> ret`, not variadic.
+    static make_function_type(ret: LType, parameters: [LType]) -> LType {
+        const buf: mut void* = libc::malloc(parameters.length() as u64 * 8);
         const slots: mut (mut void*)* = buf as mut (mut void*)*;
-        slots[0] = p1.raw;
-        const ty: LType = LType::function_type(ret, buf, 1, false);
+        mut index: i64 = 0;
+        while (index < parameters.length()) {
+            slots[index] = parameters[index].raw;
+            index += 1;
+        }
+        const ty: LType = LType::function_type(ret, buf, parameters.length() as u32, false);
         libc::free(buf);
         return ty;
     }
 
-    /// Helper: build a `(p1, p2) -> ret` LLVM function type.
-    static make_function_type_2(ret: LType, p1: LType, p2: LType) -> LType {
-        const buf: mut void* = libc::malloc(2 * 8);
-        const slots: mut (mut void*)* = buf as mut (mut void*)*;
-        slots[0] = p1.raw;
-        slots[1] = p2.raw;
-        const ty: LType = LType::function_type(ret, buf, 2, false);
-        libc::free(buf);
-        return ty;
-    }
-
-    /// Helper: build a `(p1, p2, p3) -> ret` LLVM function type.
-    static make_function_type_3(ret: LType, p1: LType, p2: LType, p3: LType) -> LType {
-        const buf: mut void* = libc::malloc(3 * 8);
-        const slots: mut (mut void*)* = buf as mut (mut void*)*;
-        slots[0] = p1.raw;
-        slots[1] = p2.raw;
-        slots[2] = p3.raw;
-        const ty: LType = LType::function_type(ret, buf, 3, false);
-        libc::free(buf);
-        return ty;
-    }
-
-    /// Helper: build a `(p1, p2, p3, p4) -> ret` LLVM function type.
-    static make_function_type_4(ret: LType, p1: LType, p2: LType,
-                                   p3: LType, p4: LType) -> LType {
-        const buf: mut void* = libc::malloc(4 * 8);
-        const slots: mut (mut void*)* = buf as mut (mut void*)*;
-        slots[0] = p1.raw;
-        slots[1] = p2.raw;
-        slots[2] = p3.raw;
-        slots[3] = p4.raw;
-        const ty: LType = LType::function_type(ret, buf, 4, false);
-        libc::free(buf);
-        return ty;
+    /// The address of `array[index]`: `getelementptr <array_type>, array,
+    /// i64 0, i64 index`.
+    static make_element_address(builder: LBuilder, array_type: LType, array: LValue,
+                                index: u64, name: string) -> LValue {
+        const index_buffer: mut void* = libc::malloc(2 * 8);
+        const index_slots: mut (mut void*)* = index_buffer as mut (mut void*)*;
+        index_slots[0] = LType::const_int(LType::i64(), 0, false).raw;
+        index_slots[1] = LType::const_int(LType::i64(), index, false).raw;
+        const address: LValue = builder.build_gep(array_type, array, index_buffer, 2, name);
+        libc::free(index_buffer);
+        return address;
     }
 
 
