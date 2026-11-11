@@ -3,7 +3,9 @@
 ///! that address.  These tests pin both sides of that rule: a write into the
 ///! slot the value was read from must not leak into the copy, and a value
 ///! read from one slot and copied while another slot is written (an enum's
-///! tag before its payload) arrives whole.
+///! tag before its payload), or while a call that cannot reach the slot
+///! runs (a release before a return), arrives whole; a call handed the
+///! slot's address must not leak into the copy either.
 
 ![config(testing)]
 namespace CryoTests::Tests::Lang::WideAggregateCopy;
@@ -88,5 +90,60 @@ function payload_survives_try() -> Result<(), TestError> {
         Option::Some(_) => { expect_true(false, "None went through `?` as Some")?; }
         Option::None => { }
     }
+    return Result::Ok(());
+}
+
+/// How many `Guard` values have been released.
+mut guards_released: i64 = 0;
+
+type struct Guard {
+    id: i64;
+}
+
+implement trait Drop for struct Guard {
+    drop(mut &this) -> void { guards_released += 1; }
+}
+
+/// `guard` is released between the enum's read from its temporary and the
+/// store that returns it: a call that cannot reach the temporary, so the
+/// copy is still made from it.
+function wrap_releasing(value: Wide, guard: Guard) -> Option<Wide> {
+    mut local: Wide = value;
+    return Option::Some(local);
+}
+
+/// Writes through the address it is handed.
+function bump_first(target: mut &Wide) -> i64 {
+    target.a = 500;
+    return target.a;
+}
+
+/// `first` reads `local` whole, then a call handed `local`'s address writes
+/// it before `first` is stored, so the copy must be of what was read.
+function snapshot_then_call(value: Wide) -> WideAndCount {
+    mut local: Wide = value;
+    return WideAndCount { first: local, second: bump_first(&local) };
+}
+
+![test]
+function payload_survives_a_release_before_the_return() -> Result<(), TestError> {
+    guards_released = 0;
+    match (wrap_releasing(wide_from(30), Guard { id: 1 })) {
+        Option::Some(inner) => {
+            expect_eq(inner.a, 30)?;
+            expect_eq(inner.i, 38)?;
+        }
+        Option::None => { expect_true(false, "wrap_releasing returned None")?; }
+    }
+    expect_eq(guards_released, 1)?;
+    return Result::Ok(());
+}
+
+![test]
+function copy_reads_before_a_call_writes_its_slot() -> Result<(), TestError> {
+    const pair: WideAndCount = snapshot_then_call(wide_from(7));
+    expect_eq(pair.first.a, 7)?;
+    expect_eq(pair.first.i, 15)?;
+    expect_eq(pair.second, 500)?;
     return Result::Ok(());
 }

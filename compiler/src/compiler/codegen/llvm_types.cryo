@@ -1099,6 +1099,10 @@ type struct LValue {
     /// read: one allocated after the load, since that memory did not exist
     /// when the load read, or any other slot when the load read a different
     /// slot, an argument's memory or a global, none of which is that slot.
+    /// A call is admitted when the load read a stack slot whose address
+    /// never escapes (`address_escapes`): no function is handed a way to
+    /// reach it.  A memory intrinsic is not admitted, as it may be the copy
+    /// that writes the slot.
     reads_unchanged_at_end_of(&this, block: mut void*) -> boolean {
         if (this.opcode() != LOpcode::Load || llvm::LLVMGetVolatile(this.raw) != 0) { return false; }
         if (llvm::LLVMGetInstructionParent(this.raw) != block) { return false; }
@@ -1107,12 +1111,17 @@ type struct LValue {
         const read_base_is_named: boolean = read_base.opcode() == LOpcode::Alloca
             || llvm::LLVMIsAArgument(read_base.raw) != null
             || llvm::LLVMIsAGlobalValue(read_base.raw) != null;
+        const read_slot_is_private: boolean = read_base.opcode() == LOpcode::Alloca && !read_base.address_escapes();
         mut later_slots: [mut void*] = [];
         mut later: mut void* = llvm::LLVMGetNextInstruction(this.raw);
         while (later != null) {
             const instruction: LValue = LValue { raw: later };
             const opcode: LOpcode = instruction.opcode();
             if (opcode == LOpcode::Alloca) { later_slots.push(later); }
+            if (opcode == LOpcode::Call && read_slot_is_private && !instruction.calls_memory_intrinsic()) {
+                later = llvm::LLVMGetNextInstruction(later);
+                continue;
+            }
             if (!opcode.writes_no_memory()) {
                 if (opcode != LOpcode::Store) { return false; }
                 const address: LValue = LValue { raw: llvm::LLVMGetOperand(later, 1) };
@@ -1127,6 +1136,43 @@ type struct LValue {
             later = llvm::LLVMGetNextInstruction(later);
         }
         return true;
+    }
+
+    /// True when this address, a stack slot or an offset into one, may be
+    /// reached other than through its own uses: it is stored as a value,
+    /// handed to a call that is not a memory intrinsic, or used by anything
+    /// but a load, a store into it, an element offset or a memory
+    /// intrinsic.  An address that does not escape is written only by the
+    /// instructions that use it.
+    address_escapes(&this) -> boolean {
+        mut use: mut void* = llvm::LLVMGetFirstUse(this.raw);
+        while (use != null) {
+            const user: LValue = LValue { raw: llvm::LLVMGetUser(use) };
+            const opcode: LOpcode = user.opcode();
+            if (opcode == LOpcode::GetElementPtr) {
+                if (user.address_escapes()) { return true; }
+            } else if (opcode == LOpcode::Store) {
+                if (llvm::LLVMGetOperand(user.raw, 0) == this.raw) { return true; }
+            } else if (opcode == LOpcode::Call) {
+                if (!user.calls_memory_intrinsic()) { return true; }
+            } else if (opcode != LOpcode::Load) {
+                return true;
+            }
+            use = llvm::LLVMGetNextUse(use);
+        }
+        return false;
+    }
+
+    /// True when this call's callee is one of LLVM's memory intrinsics
+    /// (`llvm.memcpy`, `llvm.memmove`, `llvm.memset`), which read and write
+    /// only the memory their arguments name.
+    calls_memory_intrinsic(&this) -> boolean {
+        const operands: i32 = llvm::LLVMGetNumOperands(this.raw);
+        if (operands < 1) { return false; }
+        const callee: mut void* = llvm::LLVMGetOperand(this.raw, (operands - 1) as u32);
+        if (callee == null || llvm::LLVMIsAGlobalValue(callee) == null) { return false; }
+        const name: string = llvm::LLVMGetValueName(callee) as string;
+        return name.starts_with("llvm.memcpy") || name.starts_with("llvm.memmove") || name.starts_with("llvm.memset");
     }
 
     /// The pointer this address is an element offset from: the operand a
