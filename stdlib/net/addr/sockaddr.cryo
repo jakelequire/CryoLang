@@ -17,7 +17,7 @@ namespace std::net::addr::sockaddr;
 import std::core::option;
 import std::core::result::{ Result };
 import std::core::slice::{ Slice };
-import std::io::error::{ IoError };
+import std::io::error::{ IoError, IoErrorKind };
 import std::io::bytes::{ ByteReader, ByteWriter };
 import std::net::addr::ip::{ IpAddr, IpV4Addr, IpV6Addr };
 import std::net::addr::socket_addr::{ SocketAddr };
@@ -36,13 +36,21 @@ private function af_inet6() -> u16 { return 10; }
 private function af_inet6() -> u16 { return 23; }
 
 /// Pack a `SocketAddr` into a `sockaddr_in` (16 bytes, IPv4) or
-/// `sockaddr_in6` (28 bytes, IPv6) buffer. Returns the number of bytes
-/// written. The caller must supply a buffer of at least 28 bytes so the
-/// v6 path fits.
-public function pack_sockaddr_in(out: mut u8*, addr: &SocketAddr) -> Result<u32, IoError> {
+/// `sockaddr_in6` (28 bytes, IPv6) at the front of `out`. Returns the
+/// number of bytes written, or `InvalidInput` when `out` is shorter than
+/// the address's layout; 28 bytes hold either.
+public function pack_sockaddr_in(out: mut &Slice<u8>, addr: &SocketAddr) -> Result<u32, IoError> {
+    mut needed: i64 = 16;
+    match (addr.ip) {
+        IpAddr::V4(_) => { }
+        IpAddr::V6(_) => { needed = 28; }
+    }
+    if (out.length() < needed) {
+        return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
+    }
     match (addr.ip) {
         IpAddr::V4(v4) => {
-            mut w: ByteWriter = ByteWriter::over(Slice::<u8>::from_raw_mutable(out, 16));
+            mut w: ByteWriter = ByteWriter::over(out.subslice_mutable(0, 16));
             // sin_family = AF_INET, host byte order (low byte first on
             // our little-endian targets)
             w.write_u16_little_endian(2);
@@ -57,7 +65,7 @@ public function pack_sockaddr_in(out: mut u8*, addr: &SocketAddr) -> Result<u32,
             return Result::Ok(16);
         }
         IpAddr::V6(v6) => {
-            mut w: ByteWriter = ByteWriter::over(Slice::<u8>::from_raw_mutable(out, 28));
+            mut w: ByteWriter = ByteWriter::over(out.subslice_mutable(0, 28));
             // sin6_family = AF_INET6, host byte order
             w.write_u16_little_endian(af_inet6());
             // sin6_port, network byte order
@@ -79,27 +87,32 @@ public function pack_sockaddr_in(out: mut u8*, addr: &SocketAddr) -> Result<u32,
 /// `sin_port` (offset 2, big-endian) and `sin_addr` (offset 4, network
 /// order). The family at offset 0 is assumed `AF_INET`; the socket
 /// layer only ever creates v4 sockets, so a v6 reply can't appear here.
-public function unpack_sockaddr_in(buf: u8*) -> SocketAddr {
-    // The family and port of either family's layout, so the read cannot run short.
-    mut fields: ByteReader = ByteReader::new(Slice::from_raw(buf, 4));
+/// Panics on a buffer shorter than the 8 bytes it reads.
+public function unpack_sockaddr_in(buffer: &Slice<u8>) -> SocketAddr {
+    mut fields: ByteReader = ByteReader::new(buffer.subslice(0, 8));
     fields.set_position(2);
     const port: u16 = fields.read_u16_big_endian().unwrap();
-    const v4: IpV4Addr = IpV4Addr::new(buf[4], buf[5], buf[6], buf[7]);
+    const a: u8 = fields.read_u8().unwrap();
+    const b: u8 = fields.read_u8().unwrap();
+    const c: u8 = fields.read_u8().unwrap();
+    const d: u8 = fields.read_u8().unwrap();
+    const v4: IpV4Addr = IpV4Addr::new(a, b, c, d);
     return SocketAddr::new(IpAddr::V4(v4), port);
 }
 
 /// Unpack either a v4 `sockaddr_in` or a v6 `sockaddr_in6` from a
 /// kernel-filled buffer, dispatching on the family at offset 0. Used by
 /// `getsockname`-style readback where the socket may be either family.
-/// The buffer must be at least 28 bytes for the v6 case.
-public function unpack_sockaddr(buf: u8*) -> SocketAddr {
+/// Panics on a buffer shorter than the family's layout (28 bytes for v6).
+public function unpack_sockaddr(buffer: &Slice<u8>) -> SocketAddr {
     // The family is in host order (little-endian on every supported
     // target), the port in network order.
-    mut fields: ByteReader = ByteReader::new(Slice::from_raw(buf, 4));
+    mut fields: ByteReader = ByteReader::new(buffer.subslice(0, 4));
     const fam: u16 = fields.read_u16_little_endian().unwrap();
     if (fam == af_inet6()) {
         const port: u16 = fields.read_u16_big_endian().unwrap();
-        return SocketAddr::new(IpAddr::V6(IpV6Addr::from_buf(&buf[8])), port);
+        const v6: IpV6Addr = IpV6Addr::from_bytes(buffer.subslice(8, 24)).unwrap();
+        return SocketAddr::new(IpAddr::V6(v6), port);
     }
-    return unpack_sockaddr_in(buf);
+    return unpack_sockaddr_in(buffer);
 }
