@@ -3,7 +3,8 @@
 ///! The public API is the extension method `f64.to_buf(buffer)` /
 ///! `f64.to_buf_with(buffer, decimals)` / `f64.to_buf_roundtrip(buffer)`,
 ///! plus `f64.is_negative_zero()` and the `f32` delegating wrappers. Each
-///! writes ASCII into a caller-supplied `u8*` and returns the byte count.
+///! writes ASCII at the front of a caller's `mut &Slice<u8>` and returns
+///! the byte count, or `None` for a slice shorter than it needs.
 ///!
 ///! Contract (see fmt/float.cryo):
 ///!   * NaN -> "NaN", +Inf -> "inf", -Inf -> "-inf".
@@ -24,13 +25,15 @@
 namespace CryoTests::Tests::Stdlib::FmtFloatT;
 
 import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::core::slice::{ Slice };
 import std::core::primitives;
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::math;
 import std::fmt::float;
 import std::test::error::{ TestError };
-import std::test::assert::{ expect, expect_false };
+import std::test::assert::{ expect, expect_eq, expect_false };
 
 // IEEE-754 `0.0 - 0.0` is *positive* zero, so a genuine -0.0 must be
 // built with copysign (set the sign bit on a zero magnitude).
@@ -44,7 +47,7 @@ function negative_zero() -> f64 {
 /// Format `v` with the default 6 fractional digits and assert it equals `want`.
 function fmt_default(v: f64, want: string) -> Result<(), TestError> {
     mut buf: [u8; 64];
-    const n: i64 = v.to_buf(&buf[0]);
+    const n: i64 = v.to_buf(&buf).unwrap();
     const got: Str = Str::from_raw(&buf[0], n);
     return expect(got.equals(&Str::new(want)), Str::new(want));
 }
@@ -52,7 +55,7 @@ function fmt_default(v: f64, want: string) -> Result<(), TestError> {
 /// Format `v` with `decimals` fractional digits and assert it equals `want`.
 function fmt_with(v: f64, decimals: i64, want: string) -> Result<(), TestError> {
     mut buf: [u8; 64];
-    const n: i64 = v.to_buf_with(&buf[0], decimals);
+    const n: i64 = v.to_buf_with(&buf, decimals).unwrap();
     const got: Str = Str::from_raw(&buf[0], n);
     return expect(got.equals(&Str::new(want)), Str::new(want));
 }
@@ -60,7 +63,7 @@ function fmt_with(v: f64, decimals: i64, want: string) -> Result<(), TestError> 
 /// Format `v` via the shortest round-trip writer and assert it equals `want`.
 function fmt_roundtrip(v: f64, want: string) -> Result<(), TestError> {
     mut buf: [u8; 64];
-    const n: i64 = v.to_buf_roundtrip(&buf[0]);
+    const n: i64 = v.to_buf_roundtrip(&buf).unwrap();
     const got: Str = Str::from_raw(&buf[0], n);
     return expect(got.equals(&Str::new(want)), Str::new(want));
 }
@@ -134,7 +137,7 @@ function with_four_decimals_pads() -> Result<(), TestError> {
 /// assert it is `head`, then `zeros` zeros, then `tail`.
 function fmt_long(v: f64, decimals: i64, head: string, zeros: i64, tail: string) -> Result<(), TestError> {
     mut buf: [u8; 160];
-    const n: i64 = v.to_buf_with(&buf[0], decimals);
+    const n: i64 = v.to_buf_with(&buf, decimals).unwrap();
     mut want: String = String::from_str(Str::new(head));
     want.push_repeated('0', zeros);
     want.push(Str::new(tail));
@@ -152,6 +155,33 @@ function fixed_places_past_a_u64_scale_keep_the_value() -> Result<(), TestError>
 ![test]
 function scientific_mantissa_places_past_a_u64_scale() -> Result<(), TestError> {
     return fmt_long(1.5e20, 40, "1.5", 39, "e+20");
+}
+
+/// Every writer refuses a buffer shorter than it needs with `None` and
+/// leaves it as it was: `F64_MAX_DIGITS` bytes, one more per decimal past
+/// 13. A buffer exactly that long is written.
+![test]
+function a_short_buffer_is_refused_and_left_untouched() -> Result<(), TestError> {
+    mut buf: [u8; 40];
+    mut i: i64 = 0;
+    while (i < 40) { buf[i] = 0xEE; i = i + 1; }
+    const value: f64 = 1.5;
+    const narrow: f32 = 1.5;
+    const whole: mut &Slice<u8> = buf.as_mutable_slice();
+    expect(value.to_buf(whole.subslice_mutable(0, 31)).is_none(), Str::new("to_buf refuses 31 bytes"))?;
+    expect(value.to_buf_with(whole.subslice_mutable(0, 32), 14).is_none(),
+           Str::new("to_buf_with refuses 32 bytes for 14 decimals"))?;
+    expect(value.to_buf_roundtrip(whole.subslice_mutable(0, 31)).is_none(),
+           Str::new("to_buf_roundtrip refuses 31 bytes"))?;
+    expect(narrow.to_buf(whole.subslice_mutable(0, 31)).is_none(), Str::new("f32 to_buf refuses 31 bytes"))?;
+    mut untouched: boolean = true;
+    i = 0;
+    while (i < 40) { if (buf[i] != 0xEE) { untouched = false; } i = i + 1; }
+    expect(untouched, Str::new("a refusal writes nothing"))?;
+    const written: Option<i64> = value.to_buf(whole.subslice_mutable(0, 32));
+    expect_eq(written.unwrap(), 8)?;
+    const longer: Option<i64> = value.to_buf_with(whole.subslice_mutable(0, 33), 14);
+    return expect_eq(longer.unwrap(), 16);
 }
 
 // --- scientific notation (|v| >= 1e16 or 0 < |v| < 1e-4) --------------
