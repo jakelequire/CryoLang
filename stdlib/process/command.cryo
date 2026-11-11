@@ -156,7 +156,10 @@ public type struct Command {
     /// A descendant that leaves the tree on purpose (POSIX `setsid` or
     /// `setpgid`, a Windows job breakaway) is beyond its reach. On POSIX
     /// the new group is no longer the terminal's foreground group, so the
-    /// terminal's Ctrl-C reaches the parent and not the child.
+    /// terminal's Ctrl-C reaches the parent and not the child. On Windows
+    /// the child also roots a new console process group: Ctrl-C is off in
+    /// it, and Ctrl-Break, the interrupt a parent can send to that group
+    /// alone, reaches the child and its tree.
     public group_descendants(mut &this) -> mut &Command {
         this.group_descendants_flag = true;
         return &this;
@@ -1353,9 +1356,13 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
     }
 
     // A grouped child starts suspended, so it is in its job before it can
-    // start anything of its own.
+    // start anything of its own, and as the root of a console process
+    // group of its own, so a console control event can be sent to its tree
+    // alone.
     mut creation_flags: u32 = 0;
-    if (cmd.group_descendants_flag) { creation_flags = syscall::CREATE_SUSPENDED; }
+    if (cmd.group_descendants_flag) {
+        creation_flags = syscall::CREATE_SUSPENDED | syscall::CREATE_NEW_PROCESS_GROUP;
+    }
     const ok: i32 = syscall::CreateProcessA(null, cmdline.as_ptr(), null, null,
                                             1, creation_flags, env_ptr, cwd_ptr, &si, &pi);
     // Read before the closes below can overwrite it; used only on failure.

@@ -1,0 +1,69 @@
+///! `Signals`: receiving the interrupt and terminate signals in-process.
+///! Each test is its own process, so a signal raised here reaches no other
+///! test. Delivery from another process is tested through a child.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::ProcessSignals;
+
+import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::collections::str::{ Str };
+import std::process::signal::{ Signal };
+import std::process::signal_handling::{ Signals };
+import std::time::duration::{ Duration };
+import std::time::clock::{ Instant };
+import std::ffi::libc;
+import std::thread;
+import std::thread::{ JoinHandle };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_eq };
+
+/// With nothing arrived, `try_wait` answers at once and `wait_timeout`
+/// waits its whole duration.
+![test]
+function nothing_arrived_is_none() -> Result<(), TestError> {
+    const signals: Signals = Signals::listen().unwrap();
+    expect(signals.try_wait().is_none(), Str::new("try_wait has nothing to hand over"))?;
+    const started: Instant = Instant::now();
+    const waited: Option<Signal> = signals.wait_timeout(Duration::from_millis(200));
+    const elapsed: u64 = started.elapsed().as_millis();
+    expect(waited.is_none(), Str::new("wait_timeout gives up with None"))?;
+    return expect(elapsed >= 190, Str::new("wait_timeout waits its whole duration"));
+}
+
+/// Each signal raised is handed over once, of its own kind, interrupts
+/// first, and none is invented.
+![target(unix)]
+![test]
+function raised_signals_are_handed_over_once_each() -> Result<(), TestError> {
+    const signals: Signals = Signals::listen().unwrap();
+    libc::raise(libc::SIGTERM);
+    libc::raise(libc::SIGINT);
+    libc::raise(libc::SIGINT);
+    const interrupt: i32 = Signal::interrupt().as_i32();
+    const terminate: i32 = Signal::terminate().as_i32();
+    expect_eq(signals.wait().as_i32(), interrupt)?;
+    expect_eq(signals.wait_timeout(Duration::from_millis(1000)).unwrap().as_i32(), interrupt)?;
+    expect_eq(signals.try_wait().unwrap().as_i32(), terminate)?;
+    return expect(signals.try_wait().is_none(), Str::new("three signals raised, three handed over"));
+}
+
+/// A signal handled on another thread wakes a thread blocked in `wait`.
+/// `raise` delivers it to the raising thread, so the waiting thread's own
+/// wait is never cut short by the signal itself: only the handler's wake
+/// can end it.
+![target(unix)]
+![test]
+function a_signal_on_another_thread_wakes_a_blocked_wait() -> Result<(), TestError> {
+    const signals: Signals = Signals::listen().unwrap();
+    mut raiser: JoinHandle<i32> = thread::spawn(() -> i32 {
+        thread::sleep_ms(200);
+        return libc::raise(libc::SIGTERM);
+    });
+    const started: Instant = Instant::now();
+    const received: Option<Signal> = signals.wait_timeout(Duration::from_millis(5000));
+    const elapsed: u64 = started.elapsed().as_millis();
+    expect_eq(raiser.join(), 0)?;
+    expect_eq(received.unwrap().as_i32(), Signal::terminate().as_i32())?;
+    return expect(elapsed < 4000, Str::new("the wait ends when the signal arrives"));
+}

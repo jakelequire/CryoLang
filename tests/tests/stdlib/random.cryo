@@ -11,7 +11,6 @@ import std::core::slice::{ Slice };
 import std::collections::str::{ Str };
 import std::random::rng::{ Rng };
 import std::random::source::{ RandomSource };
-import std::random::secure;
 import std::random::secure::{ SecureRng };
 import std::random::distribution::{
     Bernoulli, Exponential, Normal, UniformF64, UniformU64, WeightedIndex
@@ -49,6 +48,21 @@ function from_seed_is_deterministic() -> Result<(), TestError> {
     expect_true(c.next_64() != d.next_64(),
                 Str::new("distinct seeds produce distinct streams"))?;
     return Result::Ok(());
+}
+
+/// A seeded stream is part of the library's contract: a program that saved
+/// a seed replays the same values on every later version. These are the
+/// first outputs of xoshiro256** seeded through SplitMix64 from 42,
+/// computed outside the library; a change to either algorithm, to the seed
+/// expansion, or to the output scrambler moves them.
+![test]
+function seed_42_stream_is_fixed() -> Result<(), TestError> {
+    mut rng: Rng = Rng::from_seed(42);
+    expect_eq(rng.next_64(), 0x15780B2E0C2EC716)?;
+    expect_eq(rng.next_64(), 0x6104D9866D113A7E)?;
+    expect_eq(rng.next_64(), 0xAE17533239E499A1)?;
+    expect_eq(rng.next_64(), 0xECB8AD4703B360A1)?;
+    return expect_eq(rng.next_64(), 0xFDE6DC7FE2EC5E64);
 }
 
 ![test]
@@ -366,19 +380,25 @@ function weighted_index_rejects_bad_weights() -> Result<(), TestError> {
 }
 
 ![test]
-function fill_secure_bytes_writes_only_its_slice() -> Result<(), TestError> {
+function secure_try_fill_writes_only_its_slice() -> Result<(), TestError> {
     mut bytes: [u8; 48];
     mut i: i64 = 0;
     while (i < 48) { bytes[i] = 0; i = i + 1; }
     mut whole: mut &Slice<u8> = bytes.as_mutable_slice();
-    const written: i64 = secure::fill_secure_bytes(whole.subslice_mutable(8, 40));
-    expect_true(written >= 1 && written <= 32, Str::new("fill_secure_bytes writes 1 to 32 bytes"))?;
+    const source: SecureRng = SecureRng::new();
+    expect_true(source.try_fill(whole.subslice_mutable(8, 40)).is_ok(),
+                Str::new("try_fill over a view succeeds"))?;
     mut outside_zero: boolean = true;
     i = 0;
     while (i < 8) { if (bytes[i] != 0) { outside_zero = false; } i = i + 1; }
-    i = 8 + written;
+    i = 40;
     while (i < 48) { if (bytes[i] != 0) { outside_zero = false; } i = i + 1; }
-    expect_true(outside_zero, Str::new("no byte outside the slice is written"))?;
+    expect_true(outside_zero, Str::new("no byte outside the view is written"))?;
+    // 32 secure bytes all zero is a 2^-256 event.
+    mut inside_written: boolean = false;
+    i = 8;
+    while (i < 40) { if (bytes[i] != 0) { inside_written = true; } i = i + 1; }
+    expect_true(inside_written, Str::new("the view is written"))?;
     return Result::Ok(());
 }
 

@@ -199,17 +199,25 @@ private function os_proc_wait_timeout(pid: i32, handle: u64, timeout: Duration) 
 }
 
 ![target(unix)]
-private function os_proc_signal(pid: i32, handle: u64, sig: i32) -> Result<(), IoError> {
+private function os_proc_signal(pid: i32, handle: u64, tree: u64, sig: i32) -> Result<(), IoError> {
     if (libc::kill(pid, sig) < 0) {
         return Result::Err(IoError::last_os_error());
     }
     return Result::Ok(());
 }
 ![target(windows)]
-private function os_proc_signal(pid: i32, handle: u64, sig: i32) -> Result<(), IoError> {
-    // No POSIX signals on Windows. Terminating the process is the one
-    // signal that can be delivered; any other is refused, never turned
-    // into a termination the caller did not ask for.
+private function os_proc_signal(pid: i32, handle: u64, tree: u64, sig: i32) -> Result<(), IoError> {
+    // No POSIX signals on Windows. Termination is delivered as itself, and
+    // the interrupt as Ctrl-Break to a child rooting a console process group
+    // of its own - the one event that reaches that child's group alone. Any
+    // other signal is refused, never turned into something the caller did
+    // not ask for.
+    if (sig == Signal::interrupt().as_i32() && tree != 0) {
+        if (syscall::GenerateConsoleCtrlEvent(syscall::CTRL_BREAK_EVENT, pid as u32) == 0) {
+            return Result::Err(IoError::last_os_error());
+        }
+        return Result::Ok(());
+    }
     if (sig != Signal::kill().as_i32()) {
         return Result::Err(IoError::new(IoErrorKind::Unsupported, 0));
     }
@@ -600,8 +608,11 @@ public:
         return this.send_signal(Signal::kill());
     }
 
-    /// Send `sig` to the child. Windows delivers only `Signal::kill()`,
-    /// as a termination; any other signal there is `Unsupported`.
+    /// Send `sig` to the child. Windows delivers `Signal::kill()`, as a
+    /// termination, and `Signal::interrupt()`, as Ctrl-Break to a child
+    /// spawned after `Command.group_descendants` (which reaches the child's
+    /// console process group, so its tree too); any other signal, and the
+    /// interrupt to an ungrouped child, is `Unsupported` there.
     ///
     /// A child that `wait`, `try_wait`, `wait_timeout` or `join` has
     /// already seen exit is refused with `InvalidInput`: once reaped, its
@@ -610,7 +621,7 @@ public:
         if (this.waited) {
             return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
         }
-        return os_proc_signal(this.pid, this.handle, sig.as_i32());
+        return os_proc_signal(this.pid, this.handle, this.tree, sig.as_i32());
     }
 
     /// End the child and every process in its tree at once: SIGKILL to

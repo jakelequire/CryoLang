@@ -28,6 +28,7 @@ import std::fs::path::{ Path };
 import std::fs::file::{ File };
 import std::time::duration::{ Duration };
 import std::time::clock::{ Instant };
+import std::random;
 import std::test::error::{ TestError };
 import std::test::assert::{ bail, expect, expect_eq, expect_false };
 
@@ -350,6 +351,57 @@ function kill_tree_needs_a_grouped_child() -> Result<(), TestError> {
     match (outcome) {
         Result::Ok(_)  => { return bail(Str::new("an ungrouped child has no tree")); }
         Result::Err(e) => { return expect(e.kind == IoErrorKind::InvalidInput, Str::new("refused with InvalidInput")); }
+    }
+}
+
+/// The interrupt reaches a grouped child and ends it - SIGINT on POSIX,
+/// Ctrl-Break to the child's own console process group on Windows - long
+/// before its five seconds are up, and this process carries on. The child
+/// is given time to start first: an event that lands while it is still
+/// loading ends it with a startup failure, which says nothing about where
+/// the event was aimed.
+![test]
+function interrupt_ends_a_grouped_child() -> Result<(), TestError> {
+    mut cmd: Command = cmd_sleep();
+    cmd.group_descendants();
+    mut child: Child = cmd.spawn().unwrap();
+    const running: boolean = child.wait_timeout(Duration::from_millis(500)).unwrap().is_none();
+    const outcome: Result<(), IoError> = child.send_signal(Signal::interrupt());
+    const status: Option<ExitStatus> = child.wait_timeout(Duration::from_millis(3000)).unwrap();
+    if (status.is_none()) {
+        mem::drop(child.kill_tree());
+        mem::drop(child.wait());
+    }
+    expect(running, Str::new("the child is running before the interrupt"))?;
+    expect(outcome.is_ok(), Str::new("the interrupt is delivered to a grouped child"))?;
+    expect(status.is_some(), Str::new("the child ends at the interrupt"))?;
+    return expect(ended_by_interrupt(status.unwrap()), Str::new("the child is ended by the interrupt itself"));
+}
+
+![target(unix)]
+function ended_by_interrupt(status: ExitStatus) -> boolean {
+    return status.terminating_signal().unwrap_or(0) == Signal::interrupt().as_i32();
+}
+// The default console control handler ends a process with
+// STATUS_CONTROL_C_EXIT, for Ctrl-Break as for Ctrl-C.
+![target(windows)]
+function ended_by_interrupt(status: ExitStatus) -> boolean {
+    return status.exit_code().unwrap_or(0) == 0xC000013A as i32;
+}
+
+/// Windows can aim Ctrl-Break only at a process group, so an ungrouped child
+/// cannot be interrupted alone.
+![target(windows)]
+![test]
+function interrupt_needs_a_grouped_child_on_windows() -> Result<(), TestError> {
+    mut cmd: Command = cmd_sleep();
+    mut child: Child = cmd.spawn().unwrap();
+    const outcome: Result<(), IoError> = child.send_signal(Signal::interrupt());
+    mem::drop(child.kill());
+    mem::drop(child.wait());
+    match (outcome) {
+        Result::Ok(_)  => { return bail(Str::new("an ungrouped child cannot be interrupted alone")); }
+        Result::Err(e) => { return expect(e.kind == IoErrorKind::Unsupported, Str::new("refused with Unsupported")); }
     }
 }
 
@@ -756,11 +808,17 @@ function cmd_sleep() -> Command {
     c.arg(Str::new("5"));
     return c;
 }
+// `waitfor` keeps the default console control handling, so Ctrl-Break ends
+// it; `ping` would print its statistics and carry on. Two `waitfor`s on one
+// name at once refuse each other, so every call waits on a fresh name.
 ![target(windows)]
 function cmd_sleep() -> Command {
-    mut c: Command = Command::new(Str::new("ping"));
-    c.arg(Str::new("-n")); c.arg(Str::new("6")); c.arg(Str::new("127.0.0.1"));
+    mut name: String = String::from_str(Str::new("CryoTestsNeverSignalled"));
+    name.push(random::value::<u64>());
+    mut c: Command = Command::new(Str::new("waitfor"));
+    c.arg(Str::new("/t")); c.arg(Str::new("5")); c.arg(name.as_str());
     c.stdout(Stdio::Null);
+    c.stderr(Stdio::Null);
     return c;
 }
 
