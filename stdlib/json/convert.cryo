@@ -8,8 +8,10 @@
 ///! ```
 ///!
 ///! The standard types implement both: `boolean`, every integer width,
-///! `f32`, `f64`, `String`, and `Array<T>` (a JSON array). `Str` and
-///! `Option<T>` (`None` as `null`) are written only. Reading checks the
+///! `f32`, `f64`, `String`, `Array<T>` (a JSON array), and
+///! `HashMap<String, V>` and `BTreeMap<String, V>` (a JSON object, one
+///! member per key). `Str` and `Option<T>` (`None` as `null`) are written
+///! only. Reading checks the
 ///! shape and the range: `300` read as a `u8` is a `JsonDecodeError` naming
 ///! where in the document it was and what was expected there, not a
 ///! wrapped value.
@@ -26,6 +28,10 @@ import std::collections::array::{ Array };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::alloc::allocator::{ GlobalAlloc };
+import std::core::default::{ Default };
+import std::core::hash::{ Hasher };
+import std::collections::hashmap::{ HashMap };
+import std::collections::btree_map::{ BTreeMap };
 import std::json::value::{ JsonNumber, JsonObject, JsonValue };
 
 /// A value that can be written as JSON.
@@ -322,6 +328,70 @@ implement<T> trait FromJson for struct Array<T, GlobalAlloc> where T: FromJson {
                 return Result::Ok(items);
             }
             _ => { return Result::Err(JsonDecodeError::unexpected(Str::new("an array"), value)); }
+        }
+    }
+}
+
+/// A JSON object, one member per entry, in the map's iteration order.
+implement<V, H> trait ToJson for struct HashMap<String<GlobalAlloc>, V, GlobalAlloc, H> where V: ToJson {
+    to_json(&this) -> JsonValue {
+        mut object: JsonObject = JsonObject::with_capacity(this.length());
+        for (entry in this.entries()) {
+            object.insert(String::from_str(entry.first.as_str()), entry.second.to_json());
+        }
+        return JsonValue::Object(object);
+    }
+}
+
+/// A JSON object, each member's value read as `V`; one that cannot be is
+/// named by its key in the error. A key written twice keeps its last value.
+implement<V, H> trait FromJson for struct HashMap<String<GlobalAlloc>, V, GlobalAlloc, H> where V: FromJson, H: Hasher + Copy + Default {
+    static from_json(value: &JsonValue) -> Result<HashMap<String<GlobalAlloc>, V, GlobalAlloc, H>, JsonDecodeError> {
+        match (value) {
+            JsonValue::Object(members) => {
+                mut map: HashMap<String<GlobalAlloc>, V, GlobalAlloc, H> = HashMap::new();
+                for (mut index: i64 = 0; index < members.length(); index++) {
+                    const key: Str = members.key_at(index).unwrap();
+                    match (V::from_json(members.value_at(index).unwrap())) {
+                        Result::Ok(item) => { map.insert(String::from_str(key), item); }
+                        Result::Err(error) => { return Result::Err(error.at_field(key)); }
+                    }
+                }
+                return Result::Ok(map);
+            }
+            _ => { return Result::Err(JsonDecodeError::unexpected(Str::new("an object"), value)); }
+        }
+    }
+}
+
+/// A JSON object, one member per entry, in key order.
+implement<V> trait ToJson for struct BTreeMap<String<GlobalAlloc>, V, GlobalAlloc> where V: ToJson {
+    to_json(&this) -> JsonValue {
+        mut object: JsonObject = JsonObject::with_capacity(this.length());
+        for (entry in this.entries()) {
+            object.insert(String::from_str(entry.first.as_str()), entry.second.to_json());
+        }
+        return JsonValue::Object(object);
+    }
+}
+
+/// A JSON object, each member's value read as `V`; one that cannot be is
+/// named by its key in the error. A key written twice keeps its last value.
+implement<V> trait FromJson for struct BTreeMap<String<GlobalAlloc>, V, GlobalAlloc> where V: FromJson {
+    static from_json(value: &JsonValue) -> Result<BTreeMap<String<GlobalAlloc>, V, GlobalAlloc>, JsonDecodeError> {
+        match (value) {
+            JsonValue::Object(members) => {
+                mut map: BTreeMap<String<GlobalAlloc>, V> = BTreeMap::new();
+                for (mut index: i64 = 0; index < members.length(); index++) {
+                    const key: Str = members.key_at(index).unwrap();
+                    match (V::from_json(members.value_at(index).unwrap())) {
+                        Result::Ok(item) => { map.insert(String::from_str(key), item); }
+                        Result::Err(error) => { return Result::Err(error.at_field(key)); }
+                    }
+                }
+                return Result::Ok(map);
+            }
+            _ => { return Result::Err(JsonDecodeError::unexpected(Str::new("an object"), value)); }
         }
     }
 }
