@@ -16,8 +16,9 @@
 ///! Supported `T`: `u8`, `u32`, `u64`, `i32`, `i64`, `boolean`.  Instantiating
 ///! `Atomic<T>` with any other type is a compile error (E0645): the absence
 ///! of a matching `static match` arm IS the type constraint (no trait bound
-///! needed).  `fetch_add`/`fetch_sub` on `Atomic<boolean>` compile; they
-///! do arithmetic on the 0/1 `u8` backing (see `fetch_add`).
+///! needed).  `fetch_add` and `fetch_sub` are an integer cell's alone
+///! (`where T: Integer`): on `Atomic<boolean>` they are refused, since
+///! arithmetic on the 0/1 backing byte would store a byte that is neither.
 ///!
 ///! Every operation takes an `MemoryOrder` describing the memory-model
 ///! constraints around it.  When in doubt, `SeqCst` is the always-safe
@@ -163,39 +164,32 @@ public type struct Atomic<T> {
         }
     }
 
-    /// Atomically add `val` to the cell and return the previous value.
-    ///
-    /// On `Atomic<boolean>` this operates on the 0/1 `u8` backing; it is
-    /// included only so `Atomic<boolean>` instantiates (whole-struct
-    /// monomorphization specializes every method), and `fetch_and`/`fetch_or`/
-    /// `fetch_xor` are the meaningful boolean RMW ops.
-    public fetch_add(&this,val: T, order: MemoryOrder) -> T {
+    /// Atomically add `val` to the cell and return the previous value.  An
+    /// integer cell's alone: `Atomic<boolean>` has no `fetch_add`.
+    public fetch_add(&this,val: T, order: MemoryOrder) -> T where T: Integer {
         return static match (T) {
             u8  => { intrinsics::atomic_add_u8(&this.value, val, MemoryOrder::to_u32(order)) }
             u32 => { intrinsics::atomic_add_u32(&this.value, val, MemoryOrder::to_u32(order)) }
             u64 => { intrinsics::atomic_add_u64(&this.value, val, MemoryOrder::to_u32(order)) }
             i32 => { intrinsics::atomic_add_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as i32 }
             i64 => { intrinsics::atomic_add_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as i64 }
-            boolean => {
-                const b: u8 = if (val) { 1 } else { 0 };
-                intrinsics::atomic_add_u8(&this.value as u8*, b, MemoryOrder::to_u32(order)) != 0
-            }
+            // No cell holds another integer: `load` and `store` refuse it.
+            _   => { unreachable() }
         };
     }
 
-    /// Atomically subtract `val` from the cell and return the previous value.
-    /// See `fetch_add` for the `Atomic<boolean>` caveat.
-    public fetch_sub(&this,val: T, order: MemoryOrder) -> T {
+    /// Atomically subtract `val` from the cell and return the previous
+    /// value.  An integer cell's alone: `Atomic<boolean>` has no
+    /// `fetch_sub`.
+    public fetch_sub(&this,val: T, order: MemoryOrder) -> T where T: Integer {
         return static match (T) {
             u8  => { intrinsics::atomic_sub_u8(&this.value, val, MemoryOrder::to_u32(order)) }
             u32 => { intrinsics::atomic_sub_u32(&this.value, val, MemoryOrder::to_u32(order)) }
             u64 => { intrinsics::atomic_sub_u64(&this.value, val, MemoryOrder::to_u32(order)) }
             i32 => { intrinsics::atomic_sub_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as i32 }
             i64 => { intrinsics::atomic_sub_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as i64 }
-            boolean => {
-                const b: u8 = if (val) { 1 } else { 0 };
-                intrinsics::atomic_sub_u8(&this.value as u8*, b, MemoryOrder::to_u32(order)) != 0
-            }
+            // No cell holds another integer: `load` and `store` refuse it.
+            _   => { unreachable() }
         };
     }
 

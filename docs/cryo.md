@@ -3216,7 +3216,7 @@ A `_` arm takes every allowed type no arm names. With no primitive-trait bound, 
 
 They have no methods. The compiler decides each from the type, as it decides `Copy`, so no implementation of one is written, and an `implement` of one is refused (E0312) - for another type, which a `static match` over the trait's types would have no arm for, and for a built-in type, which has it already. A trait may name one as a supertrait (`type trait Halve : UnsignedInteger { ... }`); it can then be implemented only for a type the primitive trait admits.
 
-A bound of one says, in the signature, which types a generic accepts - a call with any other is refused where it is written (E0306 for a function, E0358 for a method) - and closes the set a `static match` over the parameter must cover ([section 11.7](#117-static-match--compile-time-type-dispatch)).
+A bound of one says, in the signature, which types a generic accepts - a call with any other is refused where it is written (E0306 for a function, E0358 for a method) - and closes the set a `static match` over the parameter must cover ([section 11.7](#117-static-match--compile-time-type-dispatch)). The standard library writes them where its generics switch on the built-in types: `Hasher::fold` takes a `Primitive`, `RandomSource::next_range` a `Numeric`, and `Atomic<T>`'s `fetch_add` and `fetch_sub` need `T: Integer`, so on an `Atomic<boolean>` they are refused (E0358) rather than adding to its 0/1 byte.
 
 ---
 
