@@ -7,8 +7,13 @@ namespace CryoTests::Tests::Stdlib::LocaleT;
 
 import std::core::result::{ Result };
 import std::collections::str::{ Str };
+import std::collections::string::{ String };
 import std::ffi::libc::{ LocaleCategory };
 import std::ffi::libc;
+import std::fmt::float;
+import std::json::value::{ JsonNumber, JsonValue };
+import std::json::parser;
+import std::json::serializer;
 import std::test::error::{ TestError };
 import std::test::assert::{ expect };
 
@@ -33,4 +38,58 @@ function the_numeric_category_sets_the_decimal_point() -> Result<(), TestError> 
     const comma: boolean = decimal_point_byte() == 0x2C;
     libc::setlocale(LocaleCategory::LC_NUMERIC, "C" as u8*);
     return expect(comma, Str::new("German's decimal point is ','"));
+}
+
+// Under a numeric locale whose decimal point is ',', numbers are still read
+// and written with '.'.
+
+/// `value` as `to_buf_roundtrip` writes it.
+function roundtrip_text(value: f64) -> String {
+    mut buffer: [u8; 32];
+    const written: i64 = value.to_buf_roundtrip(&buffer).unwrap();
+    mut text: String = String::new();
+    text.push(Str::from_raw(&buffer[0], written));
+    return text;
+}
+
+/// The number `text` parses to as JSON, or NaN.
+function json_number(text: Str) -> f64 {
+    match (parser::parse(text)) {
+        Result::Ok(parsed) => {
+            mut owned: JsonValue = parsed;
+            return owned.as::<f64>().unwrap_or(f64::NAN);
+        }
+        Result::Err(_) => { return f64::NAN; }
+    }
+}
+
+![target(windows)]
+![test]
+function numbers_are_read_with_a_dot_under_a_comma_locale() -> Result<(), TestError> {
+    expect(libc::setlocale(LocaleCategory::LC_NUMERIC, "German" as u8*) != null, Str::new("German is installed"))?;
+    expect(decimal_point_byte() == 0x2C, Str::new("German's decimal point is ','"))?;
+    const json_fraction: f64 = json_number(Str::new("3.25"));
+    const json_exponent: f64 = json_number(Str::new("-2.5e1"));
+    const dot: f64 = float::parse_f64("0.125").unwrap_or(f64::NAN);
+    // A C-locale read stops at the ','.
+    const comma: f64 = float::parse_f64("2,5").unwrap_or(f64::NAN);
+    libc::setlocale(LocaleCategory::LC_NUMERIC, "C" as u8*);
+    expect(json_fraction == 3.25, Str::new("JSON 3.25"))?;
+    expect(json_exponent == -25.0, Str::new("JSON -2.5e1"))?;
+    expect(dot == 0.125, Str::new("parse_f64 0.125"))?;
+    return expect(comma == 2.0, Str::new("parse_f64 stops at ','"));
+}
+
+![target(windows)]
+![test]
+function numbers_are_written_with_a_dot_under_a_comma_locale() -> Result<(), TestError> {
+    expect(libc::setlocale(LocaleCategory::LC_NUMERIC, "German" as u8*) != null, Str::new("German is installed"))?;
+    expect(decimal_point_byte() == 0x2C, Str::new("German's decimal point is ','"))?;
+    mut tenth: String = roundtrip_text(0.1);
+    mut long: String = roundtrip_text(1.2345678901234567);
+    mut json: String = serializer::stringify(&JsonValue::Number(JsonNumber::Float(-0.5)));
+    libc::setlocale(LocaleCategory::LC_NUMERIC, "C" as u8*);
+    expect(tenth.as_str() == Str::new("0.1"), Str::new("0.1"))?;
+    expect(long.as_str() == Str::new("1.2345678901234567"), Str::new("17 digits"))?;
+    return expect(json.as_str() == Str::new("-0.5"), Str::new("JSON -0.5"));
 }

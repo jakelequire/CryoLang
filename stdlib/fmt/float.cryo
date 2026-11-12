@@ -32,19 +32,52 @@ import std::core::primitives;
 import std::core::slice::{ Slice };
 import std::ffi::libc;
 
-/// Parse a leading `f64` from `s` using C `strtod` semantics: skip
-/// leading whitespace, read the longest valid float prefix (decimal or
-/// scientific; no hex floats). Returns `None` when `s` has no numeric
-/// prefix.  The single funnel every float-from-text caller routes
-/// through, replacing scattered `sscanf("%lf")`.  Caller-supplied
-/// strings must already be cleaned of digit separators (`_`), which
-/// `strtod` - like `sscanf` - would stop at.
+/// Parse a leading `f64` from `s` using C `strtod` semantics in the C
+/// locale: skip leading whitespace, read the longest valid float prefix
+/// (decimal or scientific; no hex floats), whose decimal point is `.`
+/// whatever numeric locale the program has set. Returns `None` when `s`
+/// has no numeric prefix, or when a copy the locale needs cannot be
+/// allocated.  The single funnel every float-from-text caller routes
+/// through.  Caller-supplied strings must already be cleaned of digit
+/// separators (`_`), which `strtod` would stop at.
 public function parse_f64(s: string) -> Option<f64> {
     if (s == null) { return Option::None; }
+    const text: u8* = s as u8*;
+    // `strtod` reads the numeric locale's decimal point. Under any locale
+    // but one whose point is `.`, it reads a copy of the text that ends
+    // where that point first appears (a C-locale read stops there) and
+    // holds the locale's point in place of the first `.`.
+    const point: u8* = libc::localeconv().decimal_point;
+    const point_length: u64 = libc::strlen(point);
+    const point_is_dot: boolean = point_length == 0 || (point_length == 1 && point[0] == 0x2E);
+    mut source: mut u8* = null;
+    if (!point_is_dot) {
+        mut length: u64 = libc::strlen(text);
+        const locale_point_at: u8* = libc::strstr(text, point);
+        if (locale_point_at != null) { length = length - libc::strlen(locale_point_at); }
+        source = libc::malloc(length + point_length + 1);
+        if (source == null) { return Option::None; }
+        mut written: u64 = 0;
+        mut replaced: boolean = false;
+        for (mut index: u64 = 0; index < length; index++) {
+            if (!replaced && text[index] == 0x2E) {
+                libc::memcpy(source + written, point as void*, point_length);
+                written = written + point_length;
+                replaced = true;
+            } else {
+                source[written] = text[index];
+                written = written + 1;
+            }
+        }
+        source[written] = 0;
+    }
+    const read: u8* = if (point_is_dot) { text } else { source };
     mut end: u8* = null;
-    const v: f64 = libc::strtod(s as u8*, &end);
+    const v: f64 = libc::strtod(read, &end);
     // `strtod` leaves `endptr == s` when it converts nothing.
-    if (end == (s as u8*)) { return Option::None; }
+    const converted: boolean = end != read;
+    if (!point_is_dot) { libc::free(source); }
+    if (!converted) { return Option::None; }
     return Option::Some(v);
 }
 
@@ -150,6 +183,7 @@ implement f64 {
     /// A `buffer` shorter than `F64_MAX_DIGITS` is refused with `None`.
     /// Non-finite inputs (NaN/Inf) have no round-trippable form; callers
     /// handle them first, but as a guard we fall back to the debug spelling.
+    /// The decimal point is `.` whatever numeric locale the program has set.
     public to_buf_roundtrip(&this, buffer: mut &Slice<u8>) -> Option<i64> {
         const value: f64 = this;
         if (!value.is_finite()) {
@@ -157,13 +191,30 @@ implement f64 {
         }
         if (buffer.length() < F64_MAX_DIGITS) { return Option::None; }
         const out: mut u8* = buffer.as_mutable_ptr();
-        mut n: i32 = libc::snprintf(out, 32, "%.15g" as u8*, value);
-        if (n > 0 && libc::strtod(out, null) == value) { return Option::Some(n as i64); }
-        n = libc::snprintf(out, 32, "%.16g" as u8*, value);
-        if (n > 0 && libc::strtod(out, null) == value) { return Option::Some(n as i64); }
-        n = libc::snprintf(out, 32, "%.17g" as u8*, value);
-        if (n < 0) { return Option::Some(0); }
-        return Option::Some(n as i64);
+        // `snprintf` writes the numeric locale's decimal point; each form
+        // has it replaced by `.` before it is checked and returned. The
+        // longest form, 24 bytes, leaves room for a point of several bytes.
+        const point: u8* = libc::localeconv().decimal_point;
+        const point_length: u64 = libc::strlen(point);
+        const point_is_dot: boolean = point_length == 0 || (point_length == 1 && point[0] == 0x2E);
+        for (mut digits: i32 = 15; digits <= 17; digits++) {
+            mut n: i32 = libc::snprintf(out, 32, "%.*g" as u8*, digits, value);
+            if (n < 0) { return Option::Some(0); }
+            if (!point_is_dot) {
+                const locale_point_at: u8* = libc::strstr(out, point);
+                if (locale_point_at != null) {
+                    const index: u64 = (n as u64) - libc::strlen(locale_point_at);
+                    out[index] = 0x2E; // '.'
+                    const rest: u64 = index + point_length;
+                    libc::memmove(out + index + 1, (out + rest) as void*, (n as u64) - rest + 1);
+                    n = n - ((point_length - 1) as i32);
+                }
+            }
+            if (digits == 17 || parse_f64(out as string).unwrap_or(f64::NAN) == value) {
+                return Option::Some(n as i64);
+            }
+        }
+        return Option::Some(0);
     }
 }
 
