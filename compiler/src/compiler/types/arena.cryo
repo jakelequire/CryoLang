@@ -1412,27 +1412,35 @@ public:
     /// `implement` blocks (the receiver is back-filled later), so it is
     /// asked of the definition.
     ///
+    /// The owner's own instantiation written as an argument of ANOTHER
+    /// generic type (`Result<Option<T>, E>` on owner `Option`) is matched
+    /// too (`inside_other`): the other type's methods mint instantiations of
+    /// the owner over their own parameters (`Result<Y, E>::ok -> Option<Y>`),
+    /// so with `Y = Option<T>` they mint `Option<Option<T>>`, whose copy of
+    /// the method asks for `Result<Option<Option<T>>, E>`, and so on - the
+    /// same tower, one type removed.
+    ///
     /// NOT matched (these are finite, so they stay eager):
     ///   - `Option<T>`   bare param arg  -> same level, no growth
     ///   - `Option<i32*>` concrete arg   -> no param, materialized once
     ///   - `&Option<T>` (`&this`)        -> peels to the bare-param owner
-    ///   - `Foo<T>` for a different base than the owner
-    is_self_growing_instantiation(&this, ty: TypeRef, owner: TypeRef) -> boolean {
+    ///   - `Foo<T>` for a different base than the owner, naming no owner
+    is_self_growing_instantiation(&this, ty: TypeRef, owner: TypeRef, inside_other: boolean) -> boolean {
         if (!ty.is_valid() || !owner.is_valid()) { return false; }
         const t: Type* = this.lookup(ty);
         if (t == null) { return false; }
         // Peel transparent wrappers so `&Option<T*>` / `[Option<T*>]` match.
         if (t.kind == TypeKind::Pointer) {
-            return this.is_self_growing_instantiation(t.as_pointer().pointee, owner);
+            return this.is_self_growing_instantiation(t.as_pointer().pointee, owner, inside_other);
         }
         if (t.kind == TypeKind::Reference) {
-            return this.is_self_growing_instantiation(t.as_reference().referent, owner);
+            return this.is_self_growing_instantiation(t.as_reference().referent, owner, inside_other);
         }
         if (t.kind == TypeKind::Array) {
-            return this.is_self_growing_instantiation(t.as_array().element, owner);
+            return this.is_self_growing_instantiation(t.as_array().element, owner, inside_other);
         }
         if (t.kind == TypeKind::Optional) {
-            return this.is_self_growing_instantiation(t.as_optional().wrapped, owner);
+            return this.is_self_growing_instantiation(t.as_optional().wrapped, owner, inside_other);
         }
         if (t.kind != TypeKind::InstantiatedType) { return false; }
         const inst: InstantiatedType* = t.as_instantiated();
@@ -1440,14 +1448,18 @@ public:
             // Different base: the owner base may be nested deeper
             // (e.g. `Pair<i32, Option<T*>>` on owner `Option`).
             for (mut i: i64 = 0; i < inst.type_args.length(); i++) {
-                if (this.is_self_growing_instantiation(inst.type_args[i], owner)) {
+                if (this.is_self_growing_instantiation(inst.type_args[i], owner, true)) {
                     return true;
                 }
             }
             return false;
         }
-        // Same base as the owner: a STRICT superterm has at least one arg that
-        // contains a generic param but is not the bare param itself.
+        // Same base as the owner, inside another type: any parameter in its
+        // arguments grows through that type's methods.
+        if (inside_other) { return this.contains_generic_param(ty); }
+        // Same base as the owner at the top: a STRICT superterm has at least
+        // one arg that contains a generic param but is not the bare param
+        // itself.
         for (mut i: i64 = 0; i < inst.type_args.length(); i++) {
             const arg: TypeRef = inst.type_args[i];
             const at: Type* = this.lookup(arg);

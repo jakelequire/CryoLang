@@ -1250,7 +1250,7 @@ type struct MonoCallSpecializer {
     /// by its identity.  Null when the receiver has neither.
     receiver_method_of(&this, d: DefId, recv_type: TypeRef, out_impl: mut (DeclarationNode*)*,
                        out_owner_ast: mut (DeclarationNode*)*) -> DeclarationNode* {
-        const deferred_decl: DeclarationNode* = this.deferred_copy_of(d, recv_type, out_impl);
+        const deferred_decl: DeclarationNode* = this.deferred_copy_of(d, recv_type, out_impl, out_owner_ast);
         const deferred: MethodDecl* = DeclarationNode::method_of(deferred_decl);
         if (deferred != null) { return deferred_decl; }
         const m_decl: DeclarationNode* = this.decl_index.entry_method(this.decl_index.method_entry_on(recv_type, d));
@@ -1259,36 +1259,48 @@ type struct MonoCallSpecializer {
         return m_decl;
     }
 
-    /// The deferred copy of the definition `d` among the impl blocks the
-    /// receiver's methods are read from - those placed under its
-    /// specialization, then the trait impls selected for it - and the block
-    /// holding it (`out_impl`); null when none holds one.
-    deferred_copy_of(&this, d: DefId, recv_type: TypeRef, out_impl: mut (DeclarationNode*)*) -> DeclarationNode* {
+    /// The deferred copy of the definition `d` among the methods the
+    /// receiver's are read from - the impl blocks placed under its
+    /// specialization and the specialization's own declaration, then the
+    /// trait impls selected for it - and what holds it: the block
+    /// (`out_impl`) or the type declaration (`out_owner_ast`); null when
+    /// none holds one.
+    deferred_copy_of(&this, d: DefId, recv_type: TypeRef, out_impl: mut (DeclarationNode*)*,
+                     out_owner_ast: mut (DeclarationNode*)*) -> DeclarationNode* {
         const specializing: [i64] = this.state.entries_specializing(recv_type);
         for (mut i: i64 = 0; i < specializing.length(); i++) {
             const entry: SpecializationEntry* = &this.state.spec_entries[specializing[i]];
             for (mut j: i64 = 0; j < entry.impl_nodes.length(); j++) {
-                const block: DeclarationNode* = entry.impl_nodes[j];
-                const m_decl: DeclarationNode* = MonoCallSpecializer::deferred_in(DeclarationNode::impl_of(block), d);
-                const m: MethodDecl* = DeclarationNode::method_of(m_decl);
-                if (m != null) { *out_impl = block; return m_decl; }
+                const block: ImplBlock* = DeclarationNode::impl_of(entry.impl_nodes[j]);
+                if (block == null) { continue; }
+                const m_decl: DeclarationNode* = MonoCallSpecializer::deferred_in(block.methods, d);
+                if (m_decl != null) { *out_impl = entry.impl_nodes[j]; return m_decl; }
             }
+            mut declared: DeclarationNode* = null;
+            const owner_struct: StructDecl* = DeclarationNode::struct_of(entry.ast_node);
+            const owner_union: UnionDecl* = DeclarationNode::union_of(entry.ast_node);
+            if (owner_struct != null) {
+                declared = MonoCallSpecializer::deferred_in(owner_struct.methods, d);
+            } else if (owner_union != null) {
+                declared = MonoCallSpecializer::deferred_in(owner_union.methods, d);
+            }
+            if (declared != null) { *out_owner_ast = entry.ast_node; return declared; }
         }
         if (this.generic_registry == null) { return null; }
         const traits: [DeclarationNode*] = this.generic_registry.trait_impls_of(recv_type, this.intern_table);
         for (mut i: i64 = 0; i < traits.length(); i++) {
-            const m_decl: DeclarationNode* = MonoCallSpecializer::deferred_in(DeclarationNode::impl_of(traits[i]), d);
-            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
-            if (m != null) { *out_impl = traits[i]; return m_decl; }
+            const block: ImplBlock* = DeclarationNode::impl_of(traits[i]);
+            if (block == null) { continue; }
+            const m_decl: DeclarationNode* = MonoCallSpecializer::deferred_in(block.methods, d);
+            if (m_decl != null) { *out_impl = traits[i]; return m_decl; }
         }
         return null;
     }
 
-    /// The method of `block` that is a deferred copy of the definition `d`.
-    static deferred_in(block: ImplBlock*, d: DefId) -> DeclarationNode* {
-        if (block == null) { return null; }
-        for (mut k: i64 = 0; k < block.methods.length(); k++) {
-            const m_decl: DeclarationNode* = block.methods[k];
+    /// The method among `methods` that is a deferred copy of the definition `d`.
+    static deferred_in(methods: &[DeclarationNode*], d: DefId) -> DeclarationNode* {
+        for (mut k: i64 = 0; k < methods.length(); k++) {
+            const m_decl: DeclarationNode* = methods[k];
             const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null || m.func == null || !DeclarationNode::fn_of(m.func).copy_of.equals(d)) { continue; }
             if (DeclarationNode::fn_of(m.func).is_self_returning_default || DeclarationNode::fn_of(m.func).is_lazy_self_growing) { return m_decl; }
@@ -1627,18 +1639,34 @@ type struct MonoCallSpecializer {
             return;
         }
         const block: ImplBlock* = DeclarationNode::impl_of(impl_node);
-        if (block == null) { return; }
+        const owner_struct: StructDecl* = DeclarationNode::struct_of(owner_ast);
+        const owner_union: UnionDecl* = DeclarationNode::union_of(owner_ast);
         mut made: DeclarationNode* = null;
-        for (mut k: i64 = 0; k < block.methods.length() && made == null; k++) {
-            const c_decl: DeclarationNode* = block.methods[k];
+        if (block != null) {
+            made = MonoCallSpecializer::deferred_instance_in(block.methods, m);
+        } else if (owner_struct != null) {
+            made = MonoCallSpecializer::deferred_instance_in(owner_struct.methods, m);
+        } else if (owner_union != null) {
+            made = MonoCallSpecializer::deferred_instance_in(owner_union.methods, m);
+        } else {
+            return;
+        }
+        this.instantiate_deferred(call, m_decl, impl_node, owner_ast, recv_type, made);
+    }
+
+    /// The instance an earlier call made of the deferred method `m` among
+    /// `methods`, where its instances join it; null when none was made.
+    static deferred_instance_in(methods: &[DeclarationNode*], m: MethodDecl*) -> DeclarationNode* {
+        for (mut k: i64 = 0; k < methods.length(); k++) {
+            const c_decl: DeclarationNode* = methods[k];
             const c: MethodDecl* = DeclarationNode::method_of(c_decl);
             if (c != null && c != m && c.func != null && DeclarationNode::fn_of(c.func).copy_of.equals(DeclarationNode::fn_of(m.func).copy_of)
                     && !DeclarationNode::fn_of(c.func).is_self_returning_default && !DeclarationNode::fn_of(c.func).is_lazy_self_growing
                     && DeclarationNode::fn_of(c.func).generic_params.length() == 0) {
-                made = c_decl;
+                return c_decl;
             }
         }
-        this.instantiate_deferred(call, m_decl, impl_node, recv_type, made);
+        return null;
     }
 
     /// The type a receiver's methods are read from: `recv` behind any
@@ -2124,7 +2152,26 @@ type struct MonoCallSpecializer {
             } else if (ExpressionNode::scope_resolution_of(call.callee) != null) {
                 this.place_blanket_implementations(call, owner);
                 const path_m: DeclarationNode* = this.path_method_on(call, owner);
-                if (!this.instantiate_lent_method(call, path_m, owner)) { this.pin_plain(call, path_m); }
+                // A deferred method has no instance until a call asks for one,
+                // and the owner's entries do not hold it: the definition the
+                // path names (a trait's item, through the implementation's
+                // method at its position) is looked for among the owner's
+                // deferred copies, and a call to one is bound as a receiver's
+                // call to it is.
+                const path_method: MethodDecl* = DeclarationNode::method_of(path_m);
+                const path_def: DefId = if (path_method != null && path_method.func != null) {
+                    DeclarationNode::fn_of(path_method.func).copy_of
+                } else { call.template_method };
+                mut lazy_impl: DeclarationNode* = null;
+                mut lazy_owner: DeclarationNode* = null;
+                const lazy_m: DeclarationNode* = if (path_def.is_valid()) {
+                    this.deferred_copy_of(path_def, owner, &lazy_impl, &lazy_owner)
+                } else { null };
+                if (lazy_m != null) {
+                    this.bind_receiver_method(call, lazy_m, lazy_impl, lazy_owner, owner, null);
+                } else if (!this.instantiate_lent_method(call, path_m, owner)) {
+                    this.pin_plain(call, path_m);
+                }
             } else if (call.template_method.is_valid()) {
                 mut id_impl: DeclarationNode* = null;
                 mut id_owner: DeclarationNode* = null;
@@ -2133,7 +2180,12 @@ type struct MonoCallSpecializer {
             } else {
                 mut item_impl: DeclarationNode* = null;
                 const item_decl: DeclarationNode* = this.trait_item_on(call, ExpressionNode::member_access_of(call.callee), owner, &item_impl);
-                if (!this.instantiate_lent_method(call, item_decl, owner)) { this.pin_plain(call, item_decl); }
+                const item: MethodDecl* = DeclarationNode::method_of(item_decl);
+                if (item != null && item.func != null && DeclarationNode::fn_of(item.func).is_lazy_self_growing) {
+                    this.bind_receiver_method(call, item_decl, item_impl, null, owner, null);
+                } else if (!this.instantiate_lent_method(call, item_decl, owner)) {
+                    this.pin_plain(call, item_decl);
+                }
             }
         }
         this.queued_binds = still;
@@ -2267,7 +2319,7 @@ type struct MonoCallSpecializer {
     /// instance minted now, registered, and walked for the calls its body
     /// makes.  The pin is the instance's registered entry.
     instantiate_deferred(mut &this, call: mut CallExpr*, orig_decl: DeclarationNode*, impl_node: DeclarationNode*,
-                         recv_type: TypeRef, made_decl: DeclarationNode*) -> boolean {
+                         owner_ast: DeclarationNode*, recv_type: TypeRef, made_decl: DeclarationNode*) -> boolean {
         const made: MethodDecl* = DeclarationNode::method_of(made_decl);
         if (made != null) {
             this.pin_spec_entry(call, DeclarationNode::fn_of(made.func).overload_entry);
@@ -2281,8 +2333,20 @@ type struct MonoCallSpecializer {
             orig_decl, &empty_params, &empty_args, recv_type, block, &copy_subst);
         const spec_method: MethodDecl* = DeclarationNode::method_of(spec_method_decl);
         if (spec_method == null || spec_method.func == null) { return false; }
-        block.methods.push(spec_method_decl);
-        this.register_spec_method_in_di(spec_method_decl, recv_type, impl_node);
+        // The instance joins what holds the deferred method: its impl block,
+        // or the declaration of the type that declares it.
+        if (block != null) {
+            block.methods.push(spec_method_decl);
+            this.register_spec_method_in_di(spec_method_decl, recv_type, impl_node);
+        } else if (DeclarationNode::struct_of(owner_ast) != null) {
+            (DeclarationNode::struct_of(owner_ast)).methods.push(spec_method_decl);
+            this.register_spec_method_in_di_inherent(spec_method_decl, recv_type, owner_ast);
+        } else if (DeclarationNode::union_of(owner_ast) != null) {
+            (DeclarationNode::union_of(owner_ast)).methods.push(spec_method_decl);
+            this.register_spec_method_in_di_inherent(spec_method_decl, recv_type, owner_ast);
+        } else {
+            return false;
+        }
         this.pin_spec_entry(call, DeclarationNode::fn_of(spec_method.func).overload_entry);
         if (DeclarationNode::fn_of(spec_method.func).body != null) {
             mut rw_ctx: ResolutionContext = ResolutionContext::new("");
@@ -2663,10 +2727,18 @@ type struct MonoCallSpecializer {
         // The substituter takes ownership of its parameter lists, so it is
         // handed INDEPENDENT copies rather than the buffers this frame still
         // owns (a by-value pass would shallow-copy them and both would free
-        // them -> the double-free heap-corruption wall).
+        // them -> the double-free heap-corruption wall).  It is told every
+        // parameter the substitution binds, in the substitution's order -
+        // the method's own, then the owner's and those the impl's head names
+        // - since a path through one (`T::decode(value)` in an impl over
+        // `Option<T>`) names the type the copy binds it to, and a parameter
+        // it is not told of is left naming nothing.
         mut ps_owned: [SymbolID] = [];
-        for (mut i: i64 = 0; i < param_syms.length(); i++) {
-            ps_owned.push(param_syms[i]);
+        for (mut i: i64 = 0; i < subst_ptr.params.length(); i++) {
+            const bound_param: Type* = this.arena.lookup(subst_ptr.params[i]);
+            ps_owned.push(if (bound_param != null && bound_param.kind == TypeKind::GenericParam) {
+                bound_param.as_generic_param().param_sym
+            } else { SymbolID::invalid() });
         }
         const empty_sym: SymbolStr = SymbolStr::empty();
         // No template and no spec id: this rewrites a method's parameters

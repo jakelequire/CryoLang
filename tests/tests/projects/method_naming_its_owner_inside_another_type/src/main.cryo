@@ -1,0 +1,65 @@
+namespace method_naming_its_owner_inside_another_type;
+
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+
+type struct DecodeError { code: i32; }
+
+type trait Decode {
+    static decode(value: i64) -> Result<This, DecodeError>;
+}
+
+implement trait Decode for i64 {
+    static decode(value: i64) -> Result<i64, DecodeError> { return Result::Ok(value); }
+}
+
+// `Option<X>: Decode` asks for `Result<Option<X>, DecodeError>`, whose
+// methods mint `Option<Option<X>>`, which is `Decode` too: built on demand,
+// not for every `Option` there is.
+implement<T> trait Decode for enum Option<T> where T: Decode {
+    static decode(value: i64) -> Result<Option<T>, DecodeError> {
+        if (value == 0) { return Result::Ok(Option::None); }
+        return match (T::decode(value)) {
+            Result::Ok(inner) => { Result::Ok(Option::Some(inner)) }
+            Result::Err(error) => { Result::Err(error) }
+        };
+    }
+}
+
+type struct Cell<T> {
+    value: T;
+
+    static make(value: T) -> Result<Cell<T>, DecodeError> {
+        return Result::Ok(Cell::<T> { value: value });
+    }
+
+    wrapped(&this) -> Option<Cell<T>> where T: Copy {
+        return Option::Some(Cell::<T> { value: this.value });
+    }
+}
+
+function decode_through_bound<T>(value: i64) -> Result<T, DecodeError> where T: Decode {
+    return T::decode(value);
+}
+
+function main() -> i32 {
+    match (Option::<i64>::decode(5)) {
+        Result::Ok(read) => { if (read.unwrap() != 5) { return 1; } }
+        Result::Err(_) => { return 2; }
+    }
+    match (decode_through_bound::<Option<Option<i64>>>(0)) {
+        Result::Ok(read) => { if (read.is_some()) { return 3; } }
+        Result::Err(_) => { return 4; }
+    }
+    match (decode_through_bound::<Option<Option<i64>>>(7)) {
+        Result::Ok(read) => { if (read.unwrap().unwrap() != 7) { return 5; } }
+        Result::Err(_) => { return 6; }
+    }
+    match (Cell::<i64>::make(9)) {
+        Result::Ok(cell) => {
+            if (cell.wrapped().unwrap().value != 9) { return 7; }
+        }
+        Result::Err(_) => { return 8; }
+    }
+    return 0;
+}

@@ -1884,11 +1884,13 @@ type struct TypeResolver {
                 this.resolve_func_signature(method.func, res_ctx);
             }
 
-            // Anti-tower: flag a non-generic INSTANCE method whose resolved
-            // return type (or a non-receiver param) is a strict structural
-            // superterm of the owner - e.g. `Option<T>::as_ref -> Option<T*>`.
-            // Eagerly materializing such a method recurses forever (each level
-            // grows the type args: `Option<T*>`, `Option<T**>`, ...).  Reuse the
+            // Anti-tower: flag a non-generic method, static or instance, whose
+            // resolved return type (or a non-receiver param) is a strict
+            // structural superterm of the owner - e.g. `Option<T>::as_ref ->
+            // Option<T*>` - or names the owner inside another generic type
+            // (`static decode() -> Result<Option<T>, E>`).  Eagerly
+            // materializing such a method recurses forever (each level grows
+            // the type args: `Option<T*>`, `Option<T**>`, ...).  Reuse the
             // `is_self_returning_default` path, whose operational meaning is
             // "skip every eager-materialization site, instantiate lazily at the
             // call site" (MonoCallSpecializer::instantiate_deferred
@@ -1896,8 +1898,8 @@ type struct TypeResolver {
             // type's instantiation there).  Only the self-growing method is
             // deferred - drop glue and all other methods stay eager, so the
             // post-mono DropInsertion contract is unaffected.  Restricted to
-            // 0-own-generic instance methods because that is the only shape the
-            // lazy call path materializes.
+            // methods with no type parameters of their own: the lazy call
+            // paths instantiate a copy at the owner's arguments only.
             //
             // Compared by the owner's DEFINITION, not a `TypeRef`: for an
             // `implement enum`/`implement` block the owner `TypeRef` handed in
@@ -1905,13 +1907,12 @@ type struct TypeResolver {
             // so a TypeRef-identity check would silently never fire.
             if (owner_def.is_valid()
                     && !DeclarationNode::fn_of(method.func).is_generic()
-                    && !method.is_static
                     && !DeclarationNode::fn_of(method.func).is_self_returning_default
                     && !DeclarationNode::fn_of(method.func).is_lazy_self_growing) {
                 const owner_base: TypeRef = this.decl_index.type_of_def(owner_def);
                 mut grows: boolean = DeclarationNode::fn_of(method.func).resolved_return_type.is_valid()
                     && this.arena.is_self_growing_instantiation(
-                           DeclarationNode::fn_of(method.func).resolved_return_type, owner_base);
+                           DeclarationNode::fn_of(method.func).resolved_return_type, owner_base, false);
                 if (!grows) {
                     for (mut gp: i64 = 0; gp < DeclarationNode::fn_of(method.func).parameters.length(); gp++) {
                         const gparam_decl: DeclarationNode* = DeclarationNode::fn_of(method.func).parameters[gp];
@@ -1921,7 +1922,7 @@ type struct TypeResolver {
                         // never a superterm.
                         if (gparam.is_receiver()) { continue; }
                         if (this.arena.is_self_growing_instantiation(
-                                gparam.resolved_type, owner_base)) {
+                                gparam.resolved_type, owner_base, false)) {
                             grows = true;
                             break;
                         }
