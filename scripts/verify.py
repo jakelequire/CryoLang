@@ -700,13 +700,19 @@ EXAMPLE_FAILED = re.compile(r"^\s*FAIL\s+(examples/\S+)")
 # fails it), an example as `examples/<name>` (the baseline does not build it),
 # or a unit-test file as its path under tests/tests (its object moves, so it
 # is left out of the comparison and must have moved, and the baseline may
-# fail the tests it holds).
+# fail the tests it holds).  A unit-test file written `archive:<path>` fails
+# on the baseline through the stdlib archive the baseline compiler built from
+# this tree's stdlib: the baseline may fail the tests it holds, its own object
+# is compared as any other, and an archive object must have moved.
 NEGATIVE = "negative/"
 EXAMPLE = "examples/"
+ARCHIVE = "archive:"
 UNIT_DIR = "tests/tests"
 
 
 def declared_kind(name):
+    if name.startswith(ARCHIVE):
+        return "archive"
     if name.startswith(NEGATIVE):
         return "negative"
     if name.startswith(EXAMPLE):
@@ -716,10 +722,16 @@ def declared_kind(name):
     return "project"
 
 
+def program_of(name):
+    """The program a declaration line names, without the form it is written
+    in: `archive:stdlib/x.cryo` names `stdlib/x.cryo`."""
+    return name[len(ARCHIVE):] if name.startswith(ARCHIVE) else name
+
+
 def unit_namespace(name):
     """The namespace a unit-test file declares, `A::B::C`; None when the file
     or its namespace line is missing."""
-    path = os.path.join(ROOT, UNIT_DIR, name)
+    path = os.path.join(ROOT, UNIT_DIR, program_of(name))
     if not os.path.isfile(path):
         return None
     with io.open(path, encoding="utf-8", errors="replace") as fh:
@@ -753,10 +765,12 @@ def declarations_between(tree_text, base_text):
     """The declarations `tree_text` carries that `base_text` does not.  A
     line naming a program the base also names, with its reason rewritten,
     declares it again: a later change can make a program start passing a
-    second time, and the line records the latest cause."""
+    second time, and the line records the latest cause.  The form a line is
+    written in is not part of what it declares: a line rewritten into
+    another form (`archive:`) with its reason kept declares nothing again."""
     tree = parse_declared(tree_text)
-    base = parse_declared(base_text)
-    return {k: v for k, v in tree.items() if base.get(k) != v}
+    base = {program_of(k): v for k, v in parse_declared(base_text).items()}
+    return {k: v for k, v in tree.items() if base.get(program_of(k)) != v}
 
 
 def declared_since(sha, rel=DECLARED):
@@ -808,7 +822,7 @@ def judge_baseline_census(declared, accounted, unit_failed, neg_failed, failed, 
     for p in sorted(set(failed) - set(unit_names) - set(declared) - set(fixed)):
         problems.append("the baseline fails %s, which neither %s nor %s declares"
                         % (p, DECLARED, FIXED))
-    judged = set(declared) | {p for p in fixed if declared_kind(p) != "unit"}
+    judged = set(declared) | {p for p in fixed if declared_kind(p) not in ("unit", "archive")}
     for p in sorted(judged - set(failed)):
         problems.append("%s is declared as changed by this change, but the baseline census "
                         "passes it; a program this change makes compile or corrects fails "
@@ -867,7 +881,7 @@ def check_declared(declared, base_exe, cryo, logdir, env, fixed=()):
                 problems.append("%s: declared in %s but %s is not an example project"
                                 % (name, rel, name))
             continue
-        if is_fixed and kind == "unit":
+        if is_fixed and kind in ("unit", "archive"):
             if unit_object_suffix(name) is None:
                 problems.append("%s: declared in %s but %s/%s is not a unit-test file "
                                 "with a namespace" % (name, rel, UNIT_DIR, name))
@@ -944,6 +958,20 @@ def selftest():
                                {"lang/u.cryo": "A::U"}), 1),
         ("census: a unit failure with nothing declared",
          judge_baseline_census({}, True, 1, 0, ["A::U::t"]), 1),
+        ("census: a unit failure in a file declared through the archive",
+         judge_baseline_census({}, True, 1, 0, ["A::U::t"], {"archive:lang/u.cryo"},
+                               {"archive:lang/u.cryo": "A::U"}), 0),
+        ("census: a unit failure beside a file declared through the archive",
+         judge_baseline_census({}, True, 1, 0, ["A::V::t"], {"archive:lang/u.cryo"},
+                               {"archive:lang/u.cryo": "A::U"}), 1),
+        ("archive: a file declared through the archive, an archive object moved",
+         judge_archive_moves(["archive:lang/u.cryo"], 3), 0),
+        ("archive: a file declared through the archive, no archive object moved",
+         judge_archive_moves(["archive:lang/u.cryo"], 0), 1),
+        ("declarations: a line rewritten into the archive form, reason kept",
+         [] if declarations_between("archive:p a\n", "p a\n") == {} else ["bad"], 0),
+        ("declarations: a new line in the archive form applies",
+         [] if declarations_between("archive:p a\n", "") == {"archive:p": "a"} else ["bad"], 0),
         ("census: a declared example the baseline does not build",
          judge_baseline_census({}, True, 0, 0, ["examples/e"], {"examples/e"}), 0),
         ("census: an undeclared example the baseline does not build",
@@ -1019,6 +1047,16 @@ def judge_unit_moves(suffixes, a, b):
         for p in kb:
             del b[p]
     return problems
+
+
+def judge_archive_moves(names, archive_changed):
+    """Problems with the unit-test files `names` declared as failing on the
+    baseline through the stdlib archive: the archive is their cause, so some
+    archive object (`archive_changed`, moved or in one run only) must differ."""
+    if not names or archive_changed > 0:
+        return []
+    return ["%s is declared as failing the baseline through the stdlib archive, but no "
+            "archive object moved" % n for n in names]
 
 
 def split_replaced(only_baseline, replaced_by_archive):
@@ -1163,7 +1201,7 @@ def main():
             return 1
         problems = judge_baseline_census(declared, *census, fixed=fixed,
                                          unit_namespaces={n: unit_namespace(n) for n in fixed
-                                                          if declared_kind(n) == "unit"})
+                                                          if declared_kind(n) in ("unit", "archive")})
         problems += check_declared(declared, exe, cryo, logdir, env, fixed)
         if problems:
             for p in problems:
@@ -1192,13 +1230,19 @@ def main():
         diff = 0
         units = {n: unit_object_suffix(n) for n in fixed if declared_kind(n) == "unit"}
         unit_problems = []
+        archive_changed = 0
         for base in POPULATIONS:
-            diff += compare(base, os.path.join(base_counts, "base.%s.sha256" % base),
-                            os.path.join(logdir, "tree.%s.sha256" % base), args.list_limit,
-                            excluded=set(declared) | set(fixed),
-                            units=units if base == "tests" else None,
-                            problems=unit_problems,
-                            replaced_by_archive=counts["stdlib"] > 0)
+            changed = compare(base, os.path.join(base_counts, "base.%s.sha256" % base),
+                              os.path.join(logdir, "tree.%s.sha256" % base), args.list_limit,
+                              excluded=set(declared) | set(fixed),
+                              units=units if base == "tests" else None,
+                              problems=unit_problems,
+                              replaced_by_archive=counts["stdlib"] > 0)
+            diff += changed
+            if base == "stdlib":
+                archive_changed = changed
+        unit_problems += judge_archive_moves(
+            sorted(n for n in fixed if declared_kind(n) == "archive"), archive_changed)
         for p in unit_problems:
             print("verify: FAIL -- %s" % p)
             ok = False
