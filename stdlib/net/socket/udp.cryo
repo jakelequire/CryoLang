@@ -53,6 +53,36 @@ import std::future::waker::{ Context };
 import std::future::traits::{ Future };
 import std::future::reactor::{ INTEREST_READ, INTEREST_WRITE, Reactor };
 
+/// An IPv4 datagram socket. `bind` or `unbound` opens one in non-blocking
+/// mode; datagrams move through the `UdpSendTo`/`UdpRecvFrom` futures, or
+/// `UdpSend`/`UdpRecv` once `connect` has pinned a peer. Owns its socket and
+/// closes it on `drop`.
+///
+/// ```cryo
+/// import std::collections::array::{ Array };
+/// import std::future::executor::{ Executor };
+/// import std::net::addr::socket_addr::{ SocketAddr };
+/// import std::net::socket::udp::{ UdpIo, UdpReceived, UdpRecvFrom, UdpSendTo, UdpSocket };
+///
+/// async function round_trip(receiver: UdpSocket, sender: UdpSocket, to: SocketAddr) -> i64 {
+///     mut payload: Array<u8> = Array::<u8>::new();
+///     payload.push(0x68); payload.push(0x69);                  // "hi"
+///     mut sent: UdpIo = await UdpSendTo::start(sender, payload, to);
+///     mut _sender: UdpSocket = sent.take_socket();
+///
+///     mut buffer: Array<u8> = Array::<u8>::new();
+///     buffer.resize(64, 0);                                    // room to receive into
+///     mut got: UdpReceived = await UdpRecvFrom::start(receiver, buffer);
+///     mut _receiver: UdpSocket = got.take_socket();
+///     return got.take_buf().length();                          // 2
+/// }
+///
+/// const receiver: UdpSocket = UdpSocket::bind(SocketAddr::localhost_v4(0)).unwrap();
+/// const to: SocketAddr = receiver.local_addr().unwrap();
+/// const sender: UdpSocket = UdpSocket::unbound().unwrap();
+/// mut executor: Executor = Executor::new();
+/// const received: i64 = executor.block_on(round_trip(receiver, sender, to));
+/// ```
 public type struct UdpSocket {
     private fd: i32;
 
@@ -216,12 +246,17 @@ public type struct UdpReceived {
     private buf:    Array<u8>;
     private result: Result<(i64, SocketAddr), IoError>;
 
+    /// Take the socket back, so the next operation can be started on it.
+    /// Calling it twice yields a closed socket the second time.
     public take_socket(mut &this) -> UdpSocket {
         mut out: UdpSocket = UdpSocket::from_fd(-1);
         mem::swap::<UdpSocket>(&out, &this.socket);
         return out;
     }
 
+    /// Take the buffer back, holding exactly the bytes of the datagram that
+    /// arrived (none if the receive failed). Calling it twice yields an
+    /// empty buffer the second time.
     public take_buf(mut &this) -> Array<u8> {
         mut out: Array<u8> = Array::<u8>::new();
         mem::swap::<Array<u8>>(&out, &this.buf);

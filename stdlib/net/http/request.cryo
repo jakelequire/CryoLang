@@ -25,8 +25,19 @@ import std::core::primitives;
 import std::net::http::method::{ Method };
 import std::net::http::headers::{ Headers };
 
+/// `"HTTP/1.1"`, the version `Request::new` and `Response::new` store. It is
+/// the only version written on the wire: the encoders emit it literally
+/// whatever a message's `version` field holds.
 public const HTTP_VERSION: Str = Str::new("HTTP/1.1");
+/// The longest line, in bytes, the HTTP/1.1 reader buffers while looking
+/// for its end: 8192. It caps the request line, the status line, each
+/// header and trailer line and each chunk-size line, in both directions;
+/// a peer that sends a longer one is refused with `InvalidData`.
 public const MAX_HEADER_LINE: i64 = 8192;
+/// The largest request body, in bytes, the HTTP/1.1 reader accepts:
+/// 16777216 (16 MiB). A declared `Content-Length` above it is refused with
+/// `InvalidData` before any of the body is read; a chunked body is refused
+/// as soon as its chunks would pass it.
 public const MAX_BODY: i64 = 16777216;  // 16 MiB; hard cap against runaway Content-Length
 /// Cap on the number of header lines. Each line is already bounded by
 /// MAX_HEADER_LINE, but without a count cap the parse loop grows the Headers
@@ -34,6 +45,27 @@ public const MAX_BODY: i64 = 16777216;  // 16 MiB; hard cap against runaway Cont
 /// memory-exhaustion DoS). 100 mirrors common server defaults.
 public const MAX_HEADER_COUNT: u64 = 100;
 
+/// An HTTP/1.1 request: method, target path, version text, headers, body,
+/// and the path parameters a `Router` captured. A server receives one from
+/// `BufStream::read_request`; a client builds one with `new` and the
+/// `with_*` builders and writes it with `encode_into`.
+///
+/// ```cryo
+/// import std::collections::array::{ Array };
+/// import std::collections::str::{ Str };
+/// import std::net::http::method::{ Method };
+/// import std::net::http::request::{ Request };
+///
+/// mut body: Array<u8> = Array::new();
+/// body.append(Str::new("hello").as_bytes());
+/// const request: Request = Request::new(Method::Post, Str::new("/items"))
+///     .with_header(Str::new("Content-Type"), Str::new("text/plain"))
+///     .with_body(body);
+/// mut wire: Array<u8> = Array::new();
+/// request.encode_into(&wire).expect("encode");
+/// // POST /items HTTP/1.1, content-type: text/plain, content-length: 5,
+/// // a blank line, then hello
+/// ```
 public type struct Request with [Clone] {
     public method:  Method;
     public path:    String;

@@ -79,6 +79,12 @@ private function tcp_socket_for(addr: &SocketAddr) -> i32 {
 
 // TcpStream: connected socket
 
+/// A connected TCP socket. Comes from `TcpConnect` (client) or `TcpAccept`
+/// (server), both of which leave it in non-blocking mode; bytes move through
+/// the `TcpRead`/`TcpWrite` futures, or through `BufStream<TcpStream>` via
+/// its `AsyncTransport` implementation. Owns its socket and closes it on
+/// `drop`. A stream made with `from_fd(-1)` is a closed placeholder that
+/// `drop` leaves alone.
 public type struct TcpStream {
     private fd: i32;
 
@@ -133,6 +139,43 @@ implement trait Drop for struct TcpStream {
 
 // TcpListener: bound + listening socket
 
+/// A TCP socket bound to a local address and listening for connections.
+/// `bind` makes one; `TcpAccept` takes the next connection from it, which
+/// needs the listener in non-blocking mode first. Owns its socket and closes
+/// it on `drop`.
+///
+/// ```cryo
+/// import std::core::result::{ Result };
+/// import std::future::combinator::{ Futures };
+/// import std::future::executor::{ Executor };
+/// import std::io::error::{ IoError };
+/// import std::net::addr::socket_addr::{ SocketAddr };
+/// import std::net::socket::tcp::{ TcpAccept, TcpAccepted, TcpConnect, TcpListener, TcpStream };
+///
+/// async function accept_one(listener: TcpListener) -> boolean {
+///     mut accepted: TcpAccepted = await TcpAccept::start(listener);
+///     mut _listener: TcpListener = accepted.take_listener();
+///     return accepted.take_result().is_ok();
+/// }
+///
+/// async function connect_to(port: u16) -> boolean {
+///     const connected: Result<TcpStream, IoError> =
+///         await TcpConnect::start(SocketAddr::localhost_v4(port));
+///     return connected.is_ok();
+/// }
+///
+/// async function both(listener: TcpListener, port: u16) -> (boolean, boolean) {
+///     return await Futures::join(accept_one(listener), connect_to(port));
+/// }
+///
+/// // Port 0: the system picks a free port, read back with `local_addr`.
+/// mut listener: TcpListener = TcpListener::bind(SocketAddr::localhost_v4(0)).unwrap();
+/// listener.set_nonblocking(true).unwrap();
+/// const port: u16 = listener.local_addr().unwrap().port;
+/// mut executor: Executor = Executor::new();
+/// const outcome: (boolean, boolean) = executor.block_on(both(listener, port));
+/// // outcome is (true, true)
+/// ```
 public type struct TcpListener {
     private fd: i32;
 
