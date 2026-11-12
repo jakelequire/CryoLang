@@ -69,6 +69,14 @@ endif
 # scripts/fetch-windows-llvm.sh.  The link is dynamic (LLVM-C.dll), mirroring
 # how bin/cryo expects a system libLLVM-20.so.
 WIN_TRIPLE   := x86_64-pc-windows-gnu
+
+# The triple of the operating system this host is not, for the gates that
+# build the other OS's config-gated half (`warnings-check`).
+ifeq ($(HOST_OS),windows)
+OTHER_OS_TRIPLE := x86_64-pc-linux-gnu
+else
+OTHER_OS_TRIPLE := x86_64-pc-windows-gnu
+endif
 STAGE2_EXE   := $(ROOT)/compiler/build/cryo.exe
 PIN_EXE      := $(ROOT)/bin/cryo.exe
 
@@ -237,7 +245,9 @@ Tests and gates
                          (tools/CryoLSP/tests/smoke.py).
   make warnings-check    compiler/ and the stdlib build with -Werror under
                          the compiler under test, the stdlib under both panic
-                         strategies; DELETES the host's prebuilt stdlib
+                         strategies and for both operating systems (the
+                         other one by --target, objects only into
+                         build-logs/); DELETES the host's prebuilt stdlib
                          archives first (into build-logs/).
   make cross-check       runtime, stdlib, compiler and CryoLSP for the other
                          OS's triple, objects only (ARGS=--triple=...).
@@ -756,19 +766,27 @@ endif
 # the LLVM libraries relative to it.  The compiler unwinds, so that archive is
 # the `--panic=unwind` one; config gating removes a different set of
 # declarations under `--panic=abort`, which is what a program builds with by
-# default, so the stdlib is built once more on its own under it.
+# default, so the stdlib is built once more on its own under it.  Config
+# gating also removes the other operating system's half before analysis, so
+# the stdlib is built for that OS's triple under both strategies too - objects
+# only, as `cross-check` builds it - or a warning in `![target(unix)]` code is
+# never seen on a Windows host, nor one in `![target(windows)]` code on Linux.
 ifeq ($(HOST_OS),windows)
 warnings-check: $(STAGE2_EXE)
 	@if exist "stdlib\.bin\$(HOST_TRIPLE)\prebuilt" rmdir /s /q "stdlib\.bin\$(HOST_TRIPLE)\prebuilt"
 	@cd compiler && "$(STAGE2_EXE)" build --build-dir=$(ROOT)/build-logs/warnings-check --no-incremental -Werror
 	@"$(STAGE2_EXE)" build stdlib --build-dir=$(ROOT)/build-logs/warnings-check/stdlib-panic-abort --no-incremental --panic=abort -Werror
-	@echo warnings-check: OK -- compiler and stdlib built with -Werror, the stdlib under both panic strategies
+	@"$(STAGE2_EXE)" build stdlib --target=$(OTHER_OS_TRIPLE) --build-dir=$(ROOT)/build-logs/warnings-check/other-os-panic-unwind --no-incremental --panic=unwind -Werror
+	@"$(STAGE2_EXE)" build stdlib --target=$(OTHER_OS_TRIPLE) --build-dir=$(ROOT)/build-logs/warnings-check/other-os-panic-abort --no-incremental --panic=abort -Werror
+	@echo warnings-check: OK -- compiler and stdlib built with -Werror, the stdlib under both panic strategies for both operating systems
 else
 warnings-check: $(STAGE2)
 	@rm -rf "stdlib/.bin/$(HOST_TRIPLE)/prebuilt"
 	@cd compiler && "$(STAGE2)" build --build-dir=$(ROOT)/build-logs/warnings-check --no-incremental -Werror
 	@"$(STAGE2)" build stdlib --build-dir=$(ROOT)/build-logs/warnings-check/stdlib-panic-abort --no-incremental --panic=abort -Werror
-	@echo "warnings-check: OK -- compiler and stdlib built with -Werror, the stdlib under both panic strategies"
+	@"$(STAGE2)" build stdlib --target=$(OTHER_OS_TRIPLE) --build-dir=$(ROOT)/build-logs/warnings-check/other-os-panic-unwind --no-incremental --panic=unwind -Werror
+	@"$(STAGE2)" build stdlib --target=$(OTHER_OS_TRIPLE) --build-dir=$(ROOT)/build-logs/warnings-check/other-os-panic-abort --no-incremental --panic=abort -Werror
+	@echo "warnings-check: OK -- compiler and stdlib built with -Werror, the stdlib under both panic strategies for both operating systems"
 endif
 
 # ---- the other OS's config-gated half ----------------------------------
