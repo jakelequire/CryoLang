@@ -1,0 +1,118 @@
+///! The common error trait, and one owning carrier any error converts into.
+///!
+///! Every standard library error implements `Error`: it prints a message
+///! for a person (`Display`), a fuller form for a developer (`Debug`), and
+///! may name the error it was caused by (`source`). `ErrorReport` keeps the
+///! text of an error and of each of its sources, so errors of different
+///! types can be returned as one:
+///!
+///! ```cryo
+///! match (File::read_text(path)) {
+///!     Result::Ok(text) => { ... }
+///!     Result::Err(error) => { return Result::Err(ErrorReport::from_error(&error)); }
+///! }
+///! ```
+
+namespace std::core::error;
+
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::core::iter::{ Iterator };
+import std::core::mem;
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::fmt::error::{ FmtError };
+import std::fmt::display::{ Display, Debug, Formatter };
+
+/// An error: a message for a person through `Display`, a fuller form
+/// through `Debug`, and the error it was caused by, if it keeps one.
+public type trait Error : Display, Debug {
+    /// The error this one was caused by, if it keeps one. None by default.
+    source(&this) -> Option<virtual &Error> {
+        return Option::None;
+    }
+}
+
+/// An error kept as text: its own message and the message of each error in
+/// its chain of sources, outermost first. Any `Error` makes one
+/// (`from_error`). It prints its message and its causes joined by `: `,
+/// and through `Debug` each cause on a line of its own.
+public type struct ErrorReport {
+    private message: String;
+    private causes: Array<String>;
+
+    /// The report of `error`: its `Display` text and that of each source.
+    public static from_error<E>(error: &E) -> ErrorReport where E: Error {
+        const outermost: virtual &Error = error;
+        mut texts: Array<String> = Array::new();
+        mut next: Option<virtual &Error> = Option::Some(outermost);
+        loop {
+            match (next) {
+                Option::Some(current) => {
+                    mut text: String = String::new();
+                    mut formatter: Formatter = Formatter::new(&text);
+                    match (current.fmt(&formatter)) {
+                        Result::Ok(_) => { }
+                        Result::Err(_) => { text.push(Str::new("(the error could not be formatted)")); }
+                    }
+                    texts.push(text);
+                    next = current.source();
+                }
+                Option::None => { break; }
+            }
+        }
+        const message: String = texts.remove(0);
+        return ErrorReport { message: message, causes: texts };
+    }
+
+    /// The error's own message.
+    public message(&this) -> Str {
+        return this.message.as_str();
+    }
+
+    /// The message of each error in the chain of sources, outermost first.
+    public causes(&this) -> implement Iterator<Str> {
+        return ErrorCauses { causes: this.causes.as_ptr(), index: 0, length: this.causes.length() };
+    }
+}
+
+/// A report's causes, each as a view of its message.
+private type struct ErrorCauses {
+    private causes: String*;
+    private index: i64;
+    private length: i64;
+}
+
+implement trait Iterator<Str> for struct ErrorCauses {
+    next(mut &this) -> Option<Str> {
+        if (this.index >= this.length) {
+            return Option::None;
+        }
+        const cause: String* = mem::const_offset(this.causes, this.index);
+        this.index = this.index + 1;
+        return Option::Some(cause.as_str());
+    }
+}
+
+implement trait Display for struct ErrorReport {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        f.write_str(this.message.as_str())?;
+        for (mut i: i64 = 0; i < this.causes.length(); i++) {
+            f.write_str(Str::new(": "))?;
+            f.write_str(this.causes[i].as_str())?;
+        }
+        return Result::Ok(());
+    }
+}
+
+implement trait Debug for struct ErrorReport {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        f.write_str(this.message.as_str())?;
+        for (mut i: i64 = 0; i < this.causes.length(); i++) {
+            f.write_str(Str::new("\ncaused by: "))?;
+            f.write_str(this.causes[i].as_str())?;
+        }
+        return Result::Ok(());
+    }
+}

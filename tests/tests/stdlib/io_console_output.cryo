@@ -4,7 +4,7 @@
 ///! tested here directly. A console itself cannot be attached to an
 ///! automated run, so what is tested of the stream is the other side: a
 ///! pipe is not taken for a console, and gets the UTF-8 bytes as they were
-///! written, whichever way they were written.
+///! written, whichever way they were written, each line feed as one byte.
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::IoConsoleOutput;
@@ -24,8 +24,8 @@ import std::test::error::{ TestError };
 import std::test::assert::{ expect, expect_eq };
 import std::test::test_child::{ TestChild };
 
-// No line feed: on Windows the C runtime writes one to a pipe as CR LF.
 const TEXT: string = "a\u{2014}\u{e9}\u{1f600}";
+const LINES: string = "a\nb\n";
 
 /// Whether `units` holds exactly `expected`.
 function units_are(units: &Array<u16>, expected: &Slice<u16>) -> boolean {
@@ -102,4 +102,27 @@ function a_pipe_gets_the_bytes_as_written() -> Result<(), TestError> {
     expected.push(Str::new(TEXT));
     expect(Str::from(output.stdout()).equals(&expected.as_str()), Str::new("stdout holds the UTF-8 bytes written, three times"))?;
     return expect(Str::from(output.stderr()).equals(&Str::new(TEXT)), Str::new("stderr holds the UTF-8 bytes written"));
+}
+
+/// Writes `LINES` to stdout through `Stdout`, `print` and `printf`, and to
+/// stderr through `eprint` and `eprintln`.
+![test_child]
+function writes_line_feeds() -> Result<(), TestError> {
+    mut out: Stdout = stdout();
+    out.write(Str::new(LINES).as_bytes())?;
+    fmt::print(String::from_str(Str::new(LINES)));
+    fmt::printf("%s", LINES);
+    fmt::eprint(String::from_str(Str::new(LINES)));
+    fmt::eprintln(String::from_str(Str::new("c")));
+    return Result::Ok(());
+}
+
+![test]
+function a_pipe_gets_each_line_feed_as_one_byte() -> Result<(), TestError> {
+    const command: Command = TestChild::command(Str::new("CryoTests::Tests::Stdlib::IoConsoleOutput::writes_line_feeds"))?;
+    const output: Output = command.output()?;
+    expect_eq(output.status().exit_code(), Option::Some(0))?;
+    expect_eq(output.stdout().length(), 12)?;
+    expect(Str::from(output.stdout()).equals(&Str::new("a\nb\na\nb\na\nb\n")), Str::new("stdout holds each line feed as written, with no carriage return"))?;
+    return expect(Str::from(output.stderr()).equals(&Str::new("a\nb\nc\n")), Str::new("stderr holds each line feed as written, with no carriage return"));
 }

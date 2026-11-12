@@ -1,0 +1,103 @@
+///! Standard input on a Windows console is read as UTF-16 and given as
+///! UTF-8, a CR LF as one LF and a Ctrl-Z as the end of input. A console
+///! cannot be attached to an automated run, so what is tested here is the
+///! other side: a pipe is not taken for a console, and its UTF-8 bytes and
+///! line feeds are read as they were written.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::IoConsoleInput;
+
+import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::io::stdio::{ stdin, Stdin, stdout, Stdout };
+import std::io::traits::{ Read, Write };
+import std::process::child::{ Child, ChildStdin, ChildStdout, ExitStatus };
+import std::process::command::{ Command, Stdio };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_eq };
+import std::test::test_child::{ TestChild };
+
+const TEXT: string = "a\u{e9}\u{4e2d}\nb\n";
+
+/// Copies all of standard input to standard output.
+![test_child]
+function echoes_its_input() -> Result<(), TestError> {
+    mut input: Stdin = stdin();
+    mut text: String = String::new();
+    input.read_to_string(&text)?;
+    mut out: Stdout = stdout();
+    out.write(text.as_bytes())?;
+    return Result::Ok(());
+}
+
+![test]
+function a_pipe_is_read_as_written() -> Result<(), TestError> {
+    mut command: Command = TestChild::command(Str::new("CryoTests::Tests::Stdlib::IoConsoleInput::echoes_its_input"))?;
+    command.stdin(Stdio::Piped).stdout(Stdio::Piped);
+    mut child: Child = command.spawn()?;
+    match (child.stdin.take()) {
+        Option::Some(writer) => {
+            mut input: ChildStdin = writer;
+            input.write(Str::new(TEXT).as_bytes())?;
+        }
+        Option::None => { return expect(false, Str::new("the child's stdin is piped")); }
+    }
+    mut echoed: Array<u8> = Array::new();
+    match (child.stdout.take()) {
+        Option::Some(reader) => {
+            mut output: ChildStdout = reader;
+            output.read_to_end(&echoed)?;
+        }
+        Option::None => { return expect(false, Str::new("the child's stdout is piped")); }
+    }
+    const status: ExitStatus = child.wait()?;
+    expect_eq(status.exit_code(), Option::Some(0))?;
+    return expect(Str::from(echoed.as_slice()).equals(&Str::new(TEXT)), Str::new("the child read the UTF-8 bytes and line feeds as written"));
+}
+
+/// Copies all of standard input to standard output as bytes.
+![test_child]
+function copies_its_input_bytes() -> Result<(), TestError> {
+    mut input: Stdin = stdin();
+    mut bytes: Array<u8> = Array::new();
+    input.read_to_end(&bytes)?;
+    mut out: Stdout = stdout();
+    out.write(bytes.as_slice())?;
+    return Result::Ok(());
+}
+
+/// Every byte value, then a CR LF, a Ctrl-Z and more bytes after it: a
+/// stdin read in text mode would drop the CRs and stop at the Ctrl-Z.
+![test]
+function a_pipe_is_read_byte_for_byte() -> Result<(), TestError> {
+    mut sent: Array<u8> = Array::new();
+    for (mut value: i64 = 0; value < 256; value++) {
+        sent.push(value as u8);
+    }
+    sent.append(Str::new("\r\n\u{1a}after\r\n").as_bytes());
+    mut command: Command = TestChild::command(Str::new("CryoTests::Tests::Stdlib::IoConsoleInput::copies_its_input_bytes"))?;
+    command.stdin(Stdio::Piped).stdout(Stdio::Piped);
+    mut child: Child = command.spawn()?;
+    match (child.stdin.take()) {
+        Option::Some(writer) => {
+            mut input: ChildStdin = writer;
+            input.write(sent.as_slice())?;
+        }
+        Option::None => { return expect(false, Str::new("the child's stdin is piped")); }
+    }
+    mut echoed: Array<u8> = Array::new();
+    match (child.stdout.take()) {
+        Option::Some(reader) => {
+            mut output: ChildStdout = reader;
+            output.read_to_end(&echoed)?;
+        }
+        Option::None => { return expect(false, Str::new("the child's stdout is piped")); }
+    }
+    const status: ExitStatus = child.wait()?;
+    expect_eq(status.exit_code(), Option::Some(0))?;
+    expect_eq(echoed.length(), sent.length())?;
+    return expect(echoed == sent, Str::new("the child read every byte as sent"));
+}
