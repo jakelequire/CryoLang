@@ -6867,9 +6867,9 @@ type struct CallResolver {
         // trait that delivers nothing leaves the path to the bare reading.
         if (scope.resolved_trait.is_valid()) {
             const directed: [OverloadId] = this.trait_delivered_entries(FamilyOwner::Type(owner), scope.resolved_trait, member_sym);
-            if (directed.length() > 0 && this.pin_trait_delivered_call(call, scope, &directed)) { return; }
+            if (directed.length() > 0 && this.pin_trait_delivered_call(call, scope, &directed, owner)) { return; }
         }
-        if (this.try_pin_static_method_overload(call_e, call, scope, FamilyOwner::Type(owner), member_sym)) { return; }
+        if (this.try_pin_static_method_overload(call_e, call, scope, owner, member_sym)) { return; }
         // Single-entry static method: pin the entry, consistent with
         // instance methods (`bind_method_on_receiver`) and the multi-entry
         // static path above.  A family the arguments cannot select one entry
@@ -6878,7 +6878,7 @@ type struct CallResolver {
         if (this.ctx.decl_index != null) {
             const entries: [OverloadId] = this.ctx.decl_index.lookup_family_entries(FamilyOwner::Type(owner), member_sym);
             if (entries.length() == 1) {
-                this.pin_static_entry(call, scope, entries[0]);
+                this.pin_static_entry(call, scope, entries[0], owner);
             }
         }
     }
@@ -7017,7 +7017,7 @@ type struct CallResolver {
             this.report_impl_qualified_miss(scope, owner_sym, owner_ty, trait_sym, member_sym);
             return true;
         }
-        this.pin_trait_delivered_call(call, scope, &entries);
+        this.pin_trait_delivered_call(call, scope, &entries, owner_ty);
         return true;
     }
 
@@ -8009,7 +8009,7 @@ type struct CallResolver {
     /// argument checks, and the one mismatch those accept - a shared
     /// reference where the parameter is exclusive - is reported here.
     pin_trait_delivered_call(mut &this, call: mut CallExpr*, scope: ScopeResolutionExpr*,
-                             entries: &[OverloadId]) -> boolean {
+                             entries: &[OverloadId], owner: TypeRef) -> boolean {
         mut arg_types: [TypeRef] = [];
         for (mut ai: i64 = 0; ai < call.arguments.length(); ai++) {
             const arg: ExpressionNode* = call.arguments[ai];
@@ -8021,7 +8021,7 @@ type struct CallResolver {
         if (fits.length() == 0) { this.report_shared_for_exclusive(call, scope, entries, &arg_types); }
         if (fits.length() != 1) { return false; }
         this.type_from_delivered_entry(call.callee, fits[0]);
-        this.pin_static_entry(call, scope, fits[0]);
+        this.pin_static_entry(call, scope, fits[0], owner);
         return true;
     }
 
@@ -8250,7 +8250,7 @@ type struct CallResolver {
         if (!trait_sym.is_valid()) { return; }
         const entries: [OverloadId] = this.trait_delivered_entries(FamilyOwner::Type(owner), trait_sym, member_sym);
         if (entries.length() > 0) {
-            this.pin_trait_delivered_call(call, scope, &entries);
+            this.pin_trait_delivered_call(call, scope, &entries, owner);
             return;
         }
         this.report_impl_qualified_miss(scope, owner_sym, owner, trait_sym, member_sym);
@@ -8567,7 +8567,8 @@ type struct CallResolver {
     /// `f(&T)` selects the exact one whatever order they registered in.
     /// Several fits in one pass go to `choose_entry`.
     try_pin_static_method_overload(mut &this, call_e: ExpressionNode*, call: mut CallExpr*, scope: ScopeResolutionExpr*,
-                                   owner: FamilyOwner, leaf: SymbolStr) -> boolean {
+                                   owner_type: TypeRef, leaf: SymbolStr) -> boolean {
+        const owner: FamilyOwner = FamilyOwner::Type(owner_type);
         const di: DeclarationIndex* = this.ctx.decl_index;
         const entries: [OverloadId] = di.lookup_family_entries(owner, leaf);
         if (entries.length() < 2) { return false; }
@@ -8585,7 +8586,7 @@ type struct CallResolver {
         }
         const chosen: OverloadId = this.choose_entry(&fits, call.callee, scope, call_e, call, owner);
         if (!chosen.is_valid()) { return false; }
-        this.pin_static_entry(call, scope, chosen);
+        this.pin_static_entry(call, scope, chosen, owner_type);
         return true;
     }
 
@@ -8747,11 +8748,23 @@ type struct CallResolver {
     /// is not a definition the call can run: the call records its definition
     /// (`template_method`) and its own type parameters, bound here - stashed
     /// for monomorphization, which mints the specialization and pins it as it
-    /// does for `recv.m(args)` - and the path is typed through them.  Any
-    /// other entry is pinned.
-    pin_static_entry(mut &this, call: mut CallExpr*, scope: ScopeResolutionExpr*, e: OverloadId) -> void {
+    /// does for `recv.m(args)` - and the path is typed through them.  A
+    /// static method with a parameter its implementation lends it (`E` in
+    /// `implement<E> trait Convert<E> for Report`) is no definition either:
+    /// only the arguments bind `E`, so the call records the method and
+    /// `owner`, the type it is called on, and monomorphization binds it as
+    /// it does the same method called through a bound.  Any other entry is
+    /// pinned.
+    pin_static_entry(mut &this, call: mut CallExpr*, scope: ScopeResolutionExpr*, e: OverloadId, owner: TypeRef) -> void {
         const m_decl: DeclarationNode* = this.ctx.decl_index.entry_method(e);
         const m: MethodDecl* = DeclarationNode::method_of(m_decl);
+        if (m != null && m.func != null && m.is_static && DeclarationNode::fn_of(m.func).inherited_params > 0) {
+            if (!call.template_method.is_valid()) {
+                call.template_method = if (DeclarationNode::fn_of(m.func).def.is_valid()) { DeclarationNode::fn_of(m.func).def } else { DeclarationNode::fn_of(m.func).copy_of };
+            }
+            call.template_recv = owner;
+            return;
+        }
         if (m == null || m.func == null || DeclarationNode::fn_of(m.func).generic_params.length() == 0 || m.is_static) {
             call.set_resolved_callee(CalleePin::Decl(e));
             return;
