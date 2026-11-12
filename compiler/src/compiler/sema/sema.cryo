@@ -4525,18 +4525,15 @@ type struct SemaVisitor {
         return result_type;
     }
 
-    /// E0645 at a `static match (T)` in a generic body that has no `_` arm
-    /// and misses a type `T`'s bounds allow, when a primitive trait bounds
+    /// A `static match (T)` in a generic body, when a primitive trait bounds
     /// `T` - written on it, or a supertrait of a trait written on it.  Those
-    /// bounds close the set of types a copy can bind `T` to, so every one
-    /// needs an arm, and the one missing is reported here rather than in
-    /// whichever copy first asks for it.
+    /// bounds close the set of types a copy can bind `T` to, so an arm naming
+    /// a type outside it can never be chosen (W0009, one per such type), and
+    /// with no `_` arm every type inside it needs an arm: the one missing is
+    /// E0645 here rather than in whichever copy first asks for it.
     check_static_match_covers_bounds(mut &this, scrutinee: TypeAnnotation*,
                                      arms: &[mut StaticMatchArmNode*], span: SourceSpan) -> void {
         if (!this.state.in_symbolic_check || scrutinee == null || this.arena == null) { return; }
-        for (mut i: i64 = 0; i < arms.length(); i++) {
-            if (arms[i] != null && arms[i].type_patterns.length() == 0) { return; }
-        }
         mut rc: ResolutionContext = ResolutionContext::new("");
         this.symbolic.bind_body_scope(&rc);
         const scrut_t: Type* = this.arena.lookup(this.ctx.type_resolver.resolve(scrutinee, &rc));
@@ -4551,14 +4548,32 @@ type struct SemaVisitor {
             }
         }
         if (bounding.length() == 0) { return; }
+        const allowed: [TypeRef] = checker.primitive_types_admitted(&bounding);
+        const param_shown: string = TypeAnnotation::spell(scrutinee, this.intern);
         mut named: [TypeRef] = [];
+        mut has_wildcard: boolean = false;
         for (mut i: i64 = 0; i < arms.length(); i++) {
             if (arms[i] == null) { continue; }
+            if (arms[i].type_patterns.length() == 0) { has_wildcard = true; }
             for (mut p: i64 = 0; p < arms[i].type_patterns.length(); p++) {
-                named.push(this.ctx.type_resolver.resolve(arms[i].type_patterns[p], &rc));
+                const pattern: TypeAnnotation* = arms[i].type_patterns[p];
+                const arm_type: TypeRef = this.ctx.type_resolver.resolve(pattern, &rc);
+                named.push(arm_type);
+                if (!arm_type.is_valid() || TraitChecker::lists_type(&allowed, arm_type)) { continue; }
+                const arm_shown: string = this.arena.format_display(this.arena.lookup(arm_type));
+                mut w: Diagnostic = Diagnostic::warning(ErrorCode::W0009_DEAD_CODE,
+                    fmt::format("unreachable `static match` arm: the bounds of `%s` exclude `%s`, so this arm can never be chosen",
+                        param_shown, arm_shown));
+                w = w.at_with_label(annotation_span(pattern), fmt::format("`%s` never meets the bounds of `%s`", arm_shown, param_shown));
+                w = w.help(if (arms[i].type_patterns.length() == 1) {
+                    "remove this arm"
+                } else {
+                    fmt::format("remove `%s` from this arm", arm_shown).into_raw()
+                });
+                this.ctx.emit_diagnostic(w);
             }
         }
-        const allowed: [TypeRef] = checker.primitive_types_admitted(&bounding);
+        if (has_wildcard) { return; }
         mut missing: string = "";
         mut count: i64 = 0;
         for (mut a: i64 = 0; a < allowed.length(); a++) {
@@ -4568,7 +4583,6 @@ type struct SemaVisitor {
             count += 1;
         }
         if (count == 0) { return; }
-        const param_shown: string = TypeAnnotation::spell(scrutinee, this.intern);
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0645_NO_STATIC_MATCH_ARM,
             fmt::format("this `static match` has no arm for %s, which the bounds of `%s` allow", missing, param_shown));
         d = d.at(span);

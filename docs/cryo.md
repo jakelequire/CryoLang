@@ -3199,7 +3199,7 @@ function code<T>() -> i32 where T: UnsignedInteger {
 }
 ```
 
-A `_` arm takes every allowed type no arm names. With no primitive-trait bound, the arm list stays the accepted-type list, checked per instantiation as above; when such a match's arms name exactly one primitive trait's types and an instantiation has another type, the E0645 for it names that trait as the bound that would refuse the type where it is given.
+A `_` arm takes every allowed type no arm names. An arm naming a type outside the set - `boolean` under `T: Integer` - can never be chosen, since no copy binds `T` to it, and is warned about (W0009), one warning per such type, with or without a `_` arm. With no primitive-trait bound, the arm list stays the accepted-type list, checked per instantiation as above; when such a match's arms name exactly one primitive trait's types and an instantiation has another type, the E0645 for it names that trait as the bound that would refuse the type where it is given.
 
 **When to reach for it.** Prefer a trait bound when the operation is genuinely the same across types and the set is open. Reach for `static match` when the set of accepted types is closed and each one needs *different* code — width-specific integer handling, or a conversion whose implementation differs per source type. The standard library uses it for `Hash::fold`, `String::push`/`try_push`, `Str::from`, `Atomic<T>`, and `io::Write::write`.
 
