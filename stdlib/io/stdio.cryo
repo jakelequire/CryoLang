@@ -8,8 +8,9 @@
 ///! boilerplate per handle.
 ///!
 ///! No buffering at this layer. `stdout()` and `stderr()` translate
-///! to raw `write(2)` calls. Callers who want buffering compose it
-///! explicitly:
+///! to raw `write(2)` calls; on a Windows console, to the console's
+///! UTF-16 write, so UTF-8 text shows as written (see `ConsoleOutput`).
+///! Callers who want buffering compose it explicitly:
 ///!
 ///! ```cryo
 ///! mut out: Stdout = stdout();
@@ -66,8 +67,10 @@ import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::core::drop::{ Drop };
 import std::core::slice::{ Slice };
+import std::collections::array::{ Array };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
+import std::encoding::utf16::{ Utf16 };
 import std::io::error::{ IoError };
 import std::io::fd;
 import std::io::traits::{ Read, Write };
@@ -99,9 +102,7 @@ private mut g_stdout_lock: [u8; 40];
 private mut g_stderr_lock: [u8; 40];
 
 // Per-OS lock/unlock helpers - the lock primitives differ between
-// platforms and ConfigGating only handles file-scope declarations
-// (not struct method bodies), so the divergence sits in free
-// functions and the public `lock()` methods just delegate.
+// platforms, and the public `lock()` methods delegate to these.
 
 ![target(unix)]
 private function stream_lock(slot: mut u8*) -> void {
@@ -147,6 +148,96 @@ public const NEWLINE: Str = Str::new("\n");
 /// Windows terminal as redirected.
 public function is_tty(fd: i32) -> boolean {
     return libc::isatty(fd) != 0;
+}
+
+// The bytes of a character that a console write cut short, held for the
+// stream's next write: stdout's in the first four, stderr's in the last
+// four. A cut-short UTF-8 character is at most three bytes.
+![target(windows)]
+private mut g_console_pending: [u8; 8];
+![target(windows)]
+private mut g_console_pending_length: [i64; 2];
+// One SRWLOCK (8 bytes, all-zero = SRWLOCK_INIT) per stream, held across a
+// console write so that two threads neither share a held character nor
+// interleave inside one write. Separate from the `lock()` guards' locks,
+// which a guard holds while it writes.
+![target(windows)]
+private mut g_console_locks: [u8; 16];
+
+/// How bytes reach standard output and standard error. A Windows console
+/// shows the bytes written to it in its code page, which mangles UTF-8,
+/// but takes text as UTF-16 through its own write call; so on a console
+/// the bytes are read as UTF-8 and written as UTF-16, and any text shows
+/// as written without changing the code page of a console other processes
+/// share. A pipe, a file or any other device, and every stream on POSIX,
+/// gets the bytes exactly as given.
+internal type struct ConsoleOutput {
+    /// True when `descriptor` writes to a Windows console.
+    ![target(unix)]
+    internal static attached(_descriptor: i32) -> boolean {
+        return false;
+    }
+
+    /// True when `descriptor` writes to a Windows console.
+    ![target(windows)]
+    internal static attached(descriptor: i32) -> boolean {
+        return ConsoleOutput::console_of(descriptor) != null;
+    }
+
+    /// Write `bytes` to `descriptor`, which is `STDOUT_FD` or `STDERR_FD`,
+    /// and answer how many were taken.
+    ![target(unix)]
+    internal static write(descriptor: i32, bytes: &Slice<u8>) -> Result<i64, IoError> {
+        return fd::write_fd(descriptor, bytes);
+    }
+
+    /// Write `bytes` to `descriptor`, which is `STDOUT_FD` or `STDERR_FD`,
+    /// and answer how many were taken. On a console every byte is taken: a
+    /// character cut short at the end is held, and written ahead of the
+    /// stream's next write, so text written a byte at a time still shows.
+    ![target(windows)]
+    internal static write(descriptor: i32, bytes: &Slice<u8>) -> Result<i64, IoError> {
+        const console: u8* = ConsoleOutput::console_of(descriptor);
+        if (console == null) {
+            return fd::write_fd(descriptor, bytes);
+        }
+        const stream: i64 = descriptor - STDOUT_FD;
+        syscall::AcquireSRWLockExclusive(&g_console_locks[stream * 8]);
+        const held: i64 = g_console_pending_length[stream];
+        mut text: Array<u8> = Array::with_capacity(held + bytes.length());
+        text.append(Slice::<u8>::from_raw(&g_console_pending[stream * 4], held));
+        text.append(bytes);
+        mut units: Array<u16> = Array::with_capacity(text.length());
+        const encoded: i64 = Utf16::encode_into(text.as_slice(), &units);
+        g_console_pending_length[stream] = text.length() - encoded;
+        for (mut i: i64 = encoded; i < text.length(); i++) {
+            g_console_pending[stream * 4 + i - encoded] = text[i];
+        }
+        mut done: i64 = 0;
+        while (done < units.length()) {
+            mut written: u32 = 0;
+            if (syscall::WriteConsoleW(console, &units[done], (units.length() - done) as u32, &written, null) == 0) {
+                const error: IoError = IoError::last_os_error();
+                syscall::ReleaseSRWLockExclusive(&g_console_locks[stream * 8]);
+                return Result::Err(error);
+            }
+            done = done + written;
+        }
+        syscall::ReleaseSRWLockExclusive(&g_console_locks[stream * 8]);
+        return Result::Ok(bytes.length());
+    }
+
+    /// The console `descriptor` writes to, or null when it writes to
+    /// anything else.
+    ![target(windows)]
+    private static console_of(descriptor: i32) -> u8* {
+        const handle: u8* = libc::_get_osfhandle(descriptor) as u8*;
+        mut mode: u32 = 0;
+        if (syscall::GetConsoleMode(handle, &mode) == 0) {
+            return null;
+        }
+        return handle;
+    }
 }
 
 /// Handle to process standard input. Construction is free; all
@@ -267,7 +358,7 @@ public function stdout() -> Stdout {
 
 implement trait Write for struct Stdout {
     write_some(mut &this, bytes: &Slice<u8>) -> Result<i64, IoError> {
-        return fd::write_fd(STDOUT_FD, bytes);
+        return ConsoleOutput::write(STDOUT_FD, bytes);
     }
 
     flush(mut &this) -> Result<(), IoError> {
@@ -305,7 +396,7 @@ public function stderr() -> Stderr {
 
 implement trait Write for struct Stderr {
     write_some(mut &this, bytes: &Slice<u8>) -> Result<i64, IoError> {
-        return fd::write_fd(STDERR_FD, bytes);
+        return ConsoleOutput::write(STDERR_FD, bytes);
     }
 
     flush(mut &this) -> Result<(), IoError> {
@@ -345,7 +436,7 @@ public type struct StdoutLock { }
 
 implement trait Write for struct StdoutLock {
     write_some(mut &this, bytes: &Slice<u8>) -> Result<i64, IoError> {
-        return fd::write_fd(STDOUT_FD, bytes);
+        return ConsoleOutput::write(STDOUT_FD, bytes);
     }
 
     flush(mut &this) -> Result<(), IoError> {
@@ -365,7 +456,7 @@ public type struct StderrLock { }
 
 implement trait Write for struct StderrLock {
     write_some(mut &this, bytes: &Slice<u8>) -> Result<i64, IoError> {
-        return fd::write_fd(STDERR_FD, bytes);
+        return ConsoleOutput::write(STDERR_FD, bytes);
     }
 
     flush(mut &this) -> Result<(), IoError> {
