@@ -1,11 +1,12 @@
 ///! Pool: O(1) allocator for uniformly-sized slots.
 ///!
 ///! A Pool is configured at construction with a single slot layout and
-///! refuses any allocation request that doesn't match. Freed slots are
-///! threaded onto an intrusive free list, making both allocation and
-///! deallocation O(1). When the free list is empty, the pool allocates
-///! a new block from `GlobalAlloc` and carves `slots_per_block` fresh
-///! slots out of it.
+///! refuses a request whose size differs from the slot's or whose
+///! alignment is stricter. Freed slots are threaded onto an intrusive free
+///! list, making both allocation and deallocation O(1). When the free list
+///! is empty, the pool takes a new block from the C library
+///! (`libc::aligned_alloc`, with its header from `libc::malloc`) and carves
+///! `slots_per_block` fresh slots out of it.
 ///!
 ///! Use a Pool when you have many values of the same type with
 ///! churn-heavy lifetimes (game entities, AST nodes under frequent
@@ -138,9 +139,9 @@ implement trait Drop for struct Pool {
 }
 
 implement trait Allocator for struct Pool {
-    /// Accepts exactly the pool's configured layout. Any mismatched
-    /// request returns `Err(InvalidLayout)`; callers who need a
-    /// different layout picked the wrong allocator.
+    /// Accepts a layout of the slot's exact size and an alignment no
+    /// stricter than the slot's. Any other request returns
+    /// `Err(InvalidLayout)`.
     allocate(mut &this, block: Layout) -> Result<NonNull<u8>, AllocError> {
         if (block.size() != this.slot.size()
                 || block.alignment() > this.slot.alignment()) {

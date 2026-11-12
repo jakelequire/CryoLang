@@ -1,8 +1,9 @@
 ///! TCP sockets.
 ///!
 ///! `TcpListener` binds an address and accepts connections;
-///! `TcpStream` is a connected socket. Both own a POSIX file descriptor and
-///! must have `drop` called before going out of scope.
+///! `TcpStream` is a connected socket. Both own their socket - a file
+///! descriptor on POSIX, a Winsock `SOCKET` held as an `i32` on Windows - and
+///! close it when they go out of scope.
 ///!
 ///! **Every operation that can wait is a future.** `bind` is the one entry point
 ///! that stays a plain call, because binding does not wait; connecting,
@@ -127,8 +128,8 @@ public type struct TcpStream {
 }
 
 implement trait Drop for struct TcpStream {
-    /// Close both halves. Ownership obligation: every TcpStream must
-    /// have `drop` called before going out of scope.
+    /// Close both halves, unless the stream is a closed placeholder
+    /// (a negative descriptor). Runs when the stream goes out of scope.
     drop(mut &this) -> void {
         if (this.fd >= 0) {
             sys::os_close_sock(this.fd);
@@ -248,8 +249,9 @@ public type struct TcpListener {
 }
 
 implement trait Drop for struct TcpListener {
-    /// Close the listening socket. Ownership obligation: every
-    /// TcpListener must have `drop` called before going out of scope.
+    /// Close the listening socket, unless the listener is a closed
+    /// placeholder (a negative descriptor). Runs when the listener goes out
+    /// of scope.
     drop(mut &this) -> void {
         if (this.fd >= 0) {
             sys::os_close_sock(this.fd);
@@ -534,7 +536,7 @@ implement trait Drop for struct TcpAccept {
 /// future is dropped before it completes.
 public type struct TcpConnect {
     private fd:      i32;         // < 0 once handed over, or if it could not be opened
-    private addr:    [u8; 28];      // packed sockaddr, replayed to poll the connect
+    private addr:    [u8; 28];      // packed sockaddr, replayed on POSIX to poll the connect
     private addrlen: u32;
     private err:     Option<IoError>;  // why `fd` is < 0 before the first poll
     private rt: mut Reactor*;
@@ -560,7 +562,9 @@ public type struct TcpConnect {
         }
         c.fd = sock;
         // Start the handshake here so the first poll already has something to
-        // wait on; its outcome is read back by `poll` re-issuing the connect.
+        // wait on; `poll` reads its outcome back through `os_connect_status`
+        // (re-issuing the connect on POSIX, reading `SO_ERROR` and
+        // `SO_CONNECT_TIME` on Windows).
         sys::os_connect(sock, &c.addr[0], c.addrlen);
         return c;
     }

@@ -85,8 +85,8 @@ implement enum JsonNumber {
 }
 
 /// JSON object. Insertion-ordered keys + parallel value array; a
-/// HashMap from `String` to slot index gives O(1) lookup. Owning;
-/// callers must `drop` before discarding.
+/// HashMap from `String` to slot index gives O(1) lookup. Owns its keys
+/// and values, and releases them when it goes out of scope.
 ///
 /// The string keys are owned. The `index` HashMap stores `String`
 /// keys (cloned from the parallel `keys` array) so lookup is by
@@ -315,22 +315,20 @@ implement enum JsonValue {
 }
 
 /// Typed scalar extraction from a `JsonValue`, dispatched on the
-/// requested type `T`.  `json.as<i64>()` yields `Some` when the value is
-/// a number representable as `i64`, else `None`; likewise `as<boolean>`,
-/// `as<u64>`, `as<f64>`, and `as<Str>` (a borrow into the value's owned
-/// string, valid for the JsonValue's lifetime).
+/// requested type `T`.  `json.as::<i64>()` yields `Some` when the value is
+/// a number representable as `i64`, else `None`; likewise `as::<boolean>`,
+/// `as::<u64>`, `as::<f64>`, and `as::<Str>` (a borrow into the value's
+/// owned string, valid for the JsonValue's lifetime).
 ///
-/// This is the single generic replacement for the former `as_bool` /
-/// `as_i64` / `as_u64` / `as_f64` / `as_str` family.  It routes through
-/// the open `TryFrom<&JsonValue>` abstraction, so any `T` a caller
-/// teaches `TryFrom<&JsonValue>` (see below) is readable via `as<T>` too,
-/// with no change here.  A conversion error - wrong variant, or a number
-/// out of range for `T` - becomes `None`; use `T::try_from(&json)`
-/// directly when the reason matters.
+/// It routes through the open `TryFrom<&JsonValue>` abstraction, so any
+/// `T` a caller teaches `TryFrom<&JsonValue>` (see below) is readable via
+/// `as::<T>()` too, with no change here.  A conversion error - wrong
+/// variant, or a number out of range for `T` - becomes `None`; use
+/// `T::try_from(&json)` directly when the reason matters.
 public type trait JsonExtract {
     /// The value read as a `T`, or `None` when `T::try_from` refuses it:
     /// the wrong variant, or a number that `T` cannot hold exactly
-    /// (`as<f64>` takes any number, rounding an integer beyond 2^53).
+    /// (`as::<f64>()` takes any number, rounding an integer beyond 2^53).
     ///
     /// ```cryo
     /// import std::core::option::{ Option };
@@ -427,14 +425,6 @@ implement trait TryFrom<&JsonValue> for Str {
         };
     }
 }
-
-// Note: a generic `get_or<T>(parent, key, fallback)` free function
-// would belong here, routing through `T::try_from(...)`. Today the
-// Cryo monomorphizer doesn't reliably emit generic free functions
-// from a stdlib module when the only call sites are in a downstream
-// project; until that lands, callers define a one-liner local helper
-// alongside their own code (see `examples/09-json-config/src/main.cryo`
-// for the pattern).
 
 /// The keys, values and index are released by their fields after this
 /// body. `Array<T>::drop` and `HashMap<K, V>::drop` release their
