@@ -10,6 +10,8 @@
 ///! No buffering at this layer. `stdout()` and `stderr()` translate
 ///! to raw `write(2)` calls; on a Windows console, to the console's
 ///! UTF-16 write, so UTF-8 text shows as written (see `ConsoleOutput`).
+///! `stdin()` reads a Windows console through its UTF-16 read, so typed
+///! text arrives as UTF-8 (see `ConsoleInput`).
 ///! Callers who want buffering compose it explicitly:
 ///!
 ///! ```cryo
@@ -244,7 +246,7 @@ internal type struct ConsoleOutput {
         libc::_setmode(STDERR_FD, libc::O_BINARY);
     }
 
-    /// The console `descriptor` writes to, or null when it writes to
+    /// The console `descriptor` reads or writes, or null when it is
     /// anything else.
     ![target(windows)]
     private static console_of(descriptor: i32) -> u8* {
@@ -254,6 +256,127 @@ internal type struct ConsoleOutput {
             return null;
         }
         return handle;
+    }
+}
+
+![target(windows)]
+private const CARRIAGE_RETURN: u8 = 0x0D;
+// The byte a console gives for Ctrl-Z, the end of typed input.
+![target(windows)]
+private const CONTROL_Z: u8 = 0x1A;
+
+// How many UTF-16 units one console read asks for. Their text is at most
+// three UTF-8 bytes a unit, a held high surrogate's pair included.
+![target(windows)]
+private const CONSOLE_READ_UNITS: i64 = 1024;
+// The text of a console read that a caller's buffer did not take, handed
+// out from `g_console_input_start` up to `g_console_input_end` by the next
+// reads.
+![target(windows)]
+private mut g_console_input: [u8; 3075];
+![target(windows)]
+private mut g_console_input_start: i64 = 0;
+![target(windows)]
+private mut g_console_input_end: i64 = 0;
+// A high surrogate a full read ended on, waiting for its pair; 0 for none.
+![target(windows)]
+private mut g_console_input_surrogate: u16 = 0;
+// One SRWLOCK (all-zero = SRWLOCK_INIT) held across a console read.
+![target(windows)]
+private mut g_console_input_lock: [u8; 8];
+
+/// How bytes are read from standard input. A Windows console hands the
+/// text typed into it to a byte read in its code page, which mangles
+/// anything outside it, but gives it as UTF-16 through its own read call;
+/// so on a console the text is read as UTF-16 and given as UTF-8, a CR LF
+/// as one LF, and a Ctrl-Z ends the input there: what precedes it on its
+/// line is given, and a read that starts with it answers 0 bytes, the end
+/// of input, as the C runtime's text-mode byte read does. A pipe, a file
+/// or any other device is read through that byte read, and stdin on POSIX
+/// as it is.
+internal type struct ConsoleInput {
+    /// Read up to `length` bytes of standard input into `buffer` and answer
+    /// how many were read; 0 is the end of input.
+    ![target(unix)]
+    internal static read(buffer: mut u8*, length: i64) -> Result<i64, IoError> {
+        return fd::read_fd(STDIN_FD, buffer, length);
+    }
+
+    /// Read up to `length` bytes of standard input into `buffer` and answer
+    /// how many were read; 0 is the end of input. On a console a line's
+    /// text that `buffer` does not take is kept for the next read.
+    ![target(windows)]
+    internal static read(buffer: mut u8*, length: i64) -> Result<i64, IoError> {
+        const console: u8* = ConsoleOutput::console_of(STDIN_FD);
+        if (console == null) {
+            return fd::read_fd(STDIN_FD, buffer, length);
+        }
+        syscall::AcquireSRWLockExclusive(&g_console_input_lock[0]);
+        while (g_console_input_start == g_console_input_end) {
+            match (ConsoleInput::fill(console)) {
+                Result::Ok(more) => {
+                    if (!more) {
+                        syscall::ReleaseSRWLockExclusive(&g_console_input_lock[0]);
+                        return Result::Ok(0);
+                    }
+                }
+                Result::Err(error) => {
+                    syscall::ReleaseSRWLockExclusive(&g_console_input_lock[0]);
+                    return Result::Err(error);
+                }
+            }
+        }
+        mut count: i64 = g_console_input_end - g_console_input_start;
+        if (count > length) { count = length; }
+        for (mut i: i64 = 0; i < count; i++) {
+            buffer[i] = g_console_input[g_console_input_start + i];
+        }
+        g_console_input_start = g_console_input_start + count;
+        syscall::ReleaseSRWLockExclusive(&g_console_input_lock[0]);
+        return Result::Ok(count);
+    }
+
+    /// Read the console once into the empty pending text, and answer false
+    /// when the read ended the input: it gave nothing, or began with a
+    /// Ctrl-Z.
+    ![target(windows)]
+    private static fill(console: u8*) -> Result<boolean, IoError> {
+        mut units: [u16; 1025];
+        mut held: i64 = 0;
+        if (g_console_input_surrogate != 0) {
+            units[0] = g_console_input_surrogate;
+            g_console_input_surrogate = 0;
+            held = 1;
+        }
+        mut read: u32 = 0;
+        if (syscall::ReadConsoleW(console, &units[held], CONSOLE_READ_UNITS as u32, &read, null) == 0) {
+            return Result::Err(IoError::last_os_error());
+        }
+        if (read == 0) {
+            return Result::Ok(false);
+        }
+        mut count: i64 = held + read;
+        const last: u16 = units[count - 1];
+        if (count - held == CONSOLE_READ_UNITS && last >= 0xD800 && last <= 0xDBFF) {
+            g_console_input_surrogate = last;
+            count = count - 1;
+        }
+        const text: String = Utf16::decode_lossy(Slice::<u16>::from_raw(&units[0], count));
+        const bytes: &Slice<u8> = text.as_bytes();
+        g_console_input_start = 0;
+        g_console_input_end = 0;
+        for (mut i: i64 = 0; i < bytes.length(); i++) {
+            const byte: u8 = bytes[i];
+            if (byte == CONTROL_Z) {
+                return Result::Ok(g_console_input_end > 0);
+            }
+            if (byte == CARRIAGE_RETURN && i + 1 < bytes.length() && bytes[i + 1] == LINE_FEED) {
+                continue;
+            }
+            g_console_input[g_console_input_end] = byte;
+            g_console_input_end = g_console_input_end + 1;
+        }
+        return Result::Ok(true);
     }
 }
 
@@ -344,7 +467,7 @@ public function stdin() -> Stdin {
 
 implement trait Read for struct Stdin {
     read(mut &this, buffer: mut u8*, length: i64) -> Result<i64, IoError> {
-        return fd::read_fd(STDIN_FD, buffer, length);
+        return ConsoleInput::read(buffer, length);
     }
 }
 
@@ -436,7 +559,7 @@ public type struct StdinLock { }
 
 implement trait Read for struct StdinLock {
     read(mut &this, buffer: mut u8*, length: i64) -> Result<i64, IoError> {
-        return fd::read_fd(STDIN_FD, buffer, length);
+        return ConsoleInput::read(buffer, length);
     }
 }
 
