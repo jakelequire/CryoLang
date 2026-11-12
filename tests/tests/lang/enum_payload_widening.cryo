@@ -1,0 +1,101 @@
+///! A narrower number passed to an enum variant's constructor is stored at the
+///! payload field's type by its VALUE: an `f32` widens to an `f64` payload as
+///! a float, and an integer widens by its own signedness, so an unsigned value
+///! that does not fit the narrower signed width stays positive in a wider
+///! signed payload. Each shape a variant is built through is covered: a plain
+///! enum, a generic enum at a concrete argument, `Option`, a payload of several
+///! fields, and a variant built on the heap with `new`.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::EnumPayloadWidening;
+
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_eq };
+import std::collections::str::{ Str };
+
+type enum Number {
+    Float(f64);
+    Whole(i64);
+    Both(f64, i64);
+}
+
+type enum Holder<T> {
+    Held(T);
+}
+
+function float_of(number: Number) -> f64 {
+    match (number) {
+        Number::Float(value) => { return value; }
+        _ => { return 0.0; }
+    }
+}
+
+function whole_of(number: Number) -> i64 {
+    match (number) {
+        Number::Whole(value) => { return value; }
+        _ => { return 0; }
+    }
+}
+
+![test]
+function an_f32_widens_into_an_f64_payload() -> Result<(), TestError> {
+    const small: f32 = 1.5;
+    return expect(float_of(Number::Float(small)) == 1.5, Str::new("Number::Float(1.5 as f32) reads 1.5"));
+}
+
+![test]
+function an_f32_widens_into_a_generic_payload() -> Result<(), TestError> {
+    const small: f32 = -2.25;
+    const held: Holder<f64> = Holder::Held(small);
+    match (held) {
+        Holder::Held(value) => { return expect(value == -2.25, Str::new("Holder<f64>::Held(-2.25 as f32) reads -2.25")); }
+    }
+}
+
+![test]
+function an_f32_widens_into_an_option_payload() -> Result<(), TestError> {
+    const small: f32 = 0.5;
+    const maybe: Option<f64> = Option::Some(small);
+    match (maybe) {
+        Option::Some(value) => { return expect(value == 0.5, Str::new("Option<f64>::Some(0.5 as f32) reads 0.5")); }
+        Option::None => { return expect(false, Str::new("Some was built")); }
+    }
+}
+
+![test]
+function an_unsigned_value_widens_without_its_sign() -> Result<(), TestError> {
+    const large: u32 = 4000000000;
+    return expect_eq(whole_of(Number::Whole(large)), 4000000000);
+}
+
+![test]
+function a_signed_value_widens_with_its_sign() -> Result<(), TestError> {
+    const negative: i32 = -7;
+    const small: i8 = -100;
+    expect_eq(whole_of(Number::Whole(negative)), -7)?;
+    return expect_eq(whole_of(Number::Whole(small)), -100);
+}
+
+![test]
+function every_field_of_a_payload_widens() -> Result<(), TestError> {
+    const small: f32 = 3.75;
+    const large: u16 = 65535;
+    match (Number::Both(small, large)) {
+        Number::Both(value, count) => {
+            expect(value == 3.75, Str::new("Both's f64 field reads 3.75"))?;
+            return expect_eq(count, 65535);
+        }
+        _ => { return expect(false, Str::new("Both was built")); }
+    }
+}
+
+![test]
+function a_heap_variant_widens() -> Result<(), TestError> {
+    const small: f32 = 6.5;
+    const boxed: Number* = new Number::Float(small);
+    const value: f64 = float_of(*boxed);
+    delete boxed;
+    return expect(value == 6.5, Str::new("new Number::Float(6.5 as f32) reads 6.5"));
+}
