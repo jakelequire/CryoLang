@@ -43,6 +43,11 @@ make cross-check         # runtime/stdlib/compiler/LSP for the OTHER OS, objects
                          # build and fails without mingw + the LLVM-C import lib
 make vendor-check        # every constant shape survives `cryo vendor`
 make api-index-check     # docs/stdlib-api.txt is not stale
+make doc-coverage-check  # the stdlib's undocumented public declarations are EXACTLY
+                         # docs/doc-coverage.txt: a new undocumented one fails, and so
+                         # does a listed one now documented (`make doc-coverage-update`);
+                         # tools/CryoDocCoverage, built by the compiler under test, runs
+                         # its own self-test first
 make verify-pin          # both pins match their sidecars (sha256 and stamped commit) AND
                          # each other
 make verify-freestanding # runtime/ tiers built by the compiler under test
@@ -120,6 +125,13 @@ not done. The remaining limits are here so nobody rediscovers them:
   real run and refuses to keep one that does not verify.
 - **A diagnostic emitted with no `-->` span cannot be pinned to anything.**
   E0236 is one; its negative test can assert the code alone.
+- **`doc-coverage-check` does not count a trait's own methods.** The parser
+  keeps no documentation for them, so every one would read undocumented.
+  Nor does it count the functions of an `extern` block (libc, the OS
+  calls): they bind a foreign interface whose documentation is the
+  platform's, so an undocumented binding passes. It counts by name, so a declaration written once per target reads documented
+  only when every copy is. It reads only that a doc comment is there, not
+  what it says.
 - **`selfhost-check` proves stability, not correctness.** Stage 3 builds
   stage 4, so a miscompile that reproduces itself is invisible to it.
 - **`make lsp-check` builds with the stage-2 compiler**, which is what makes

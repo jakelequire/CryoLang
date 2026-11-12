@@ -1,0 +1,497 @@
+///! cryo-doc-coverage: the public declarations of a source tree that carry
+///! no documentation, held to a golden list so that none is added
+///! undocumented.
+///!
+///!   cryo-doc-coverage check <root> <golden>
+///!   cryo-doc-coverage update <root> <golden>
+///!   cryo-doc-coverage self-test <fixture root> <fixture golden>
+///!
+///! Every `.cryo` file under <root> is lexed and parsed with the compiler
+///! library; nothing is resolved. Counted: public free functions, types
+///! (struct, union, enum, trait, alias), the methods and statics of a type
+///! and of an inherent `implement` block, and globals and type constants.
+///! Not counted: anything private or internal, anything in an
+///! `internal module`, the members of a type that is not public, the
+///! methods of a trait implementation (their documentation is the trait's),
+///! fields and variants, a trait's own methods, for which the parser keeps
+///! no documentation, and the functions of an `extern` block, which bind a
+///! foreign interface documented where it is defined.
+///!
+///! `check` fails on a counted declaration missing from the golden
+///! (document it) and on a golden name no longer found undocumented (it was
+///! documented, renamed or removed: run `update`). The golden is exactly
+///! the undocumented set, so it changes only when someone writes to it.
+///! `self-test` proves `check` both passes and refuses, over a fixture
+///! whose golden is written by hand.
+
+namespace doc_coverage::main;
+
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::env;
+import std::fmt::{ println, eprintln };
+import std::fs::{ Directory, DirectoryEntries, File, Path, PathBuf };
+import std::thread;
+
+import compiler::compilation_context::{ BuildOptions, CompilationContext };
+import compiler::compile_mode::{ CompileMode };
+import compiler::lex::{ Token, TokenType };
+import compiler::lex::lexer::{ Lexer };
+import compiler::parser::cursor::{ Parser };
+import compiler::ast::{ Visibility };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::ast::node::{ Node, ProgramNode };
+import compiler::ast::declaration::{ DeclarationNode, MethodDecl, FunctionDecl, StructDecl, UnionDecl,
+                                     EnumDecl, TraitDecl, TypeAliasDecl, ImplBlock, VarDecl,
+                                     ModuleDecl };
+
+// The parser recurses once per level of nesting; a thread of its own gives
+// it the stack the compiler's own parsing pass gives it.
+const PARSER_STACK_BYTES: u64 = 64 << 20;
+// The parser writes a derived implementation at a column no source line
+// reaches; such a declaration is not written in the file.
+const GENERATED_COLUMN: u32 = 0x8000;
+
+/// A public declaration with no documentation.
+type struct Undocumented {
+    /// The qualified name the golden records: `std::fmt::float::f64.to_buf`.
+    name: String;
+    /// Where it is declared, `path:line`, for the report.
+    location: String;
+}
+
+/// The undocumented public declarations of one source tree.
+type struct CoverageScan {
+    context: mut CompilationContext*;
+    programs: Array<mut ProgramNode*>;
+    /// Each program's file, by the same index.
+    paths: Array<String>;
+    /// The file being walked; the parser leaves a declaration's own empty.
+    current_path: String;
+    /// Every `internal module`'s path, `::`-wrapped: `::http2::hpack::`.
+    internal_modules: Array<String>;
+    /// Every type that is not public, as `namespace::Name`.
+    hidden_types: Array<String>;
+    found: Array<Undocumented>;
+
+    /// Parse every `.cryo` file under `root` and find what is undocumented.
+    /// An error names the file that could not be read or parsed.
+    static over(root: Str, context: mut CompilationContext*) -> Result<CoverageScan, String> {
+        mut scan: CoverageScan = CoverageScan {
+            context: context,
+            programs: Array::new(),
+            paths: Array::new(),
+            current_path: String::new(),
+            internal_modules: Array::new(),
+            hidden_types: Array::new(),
+            found: Array::new(),
+        };
+        scan.parse_directory(Path::from(root))?;
+        for (mut i: i64 = 0; i < scan.programs.length(); i++) {
+            scan.note_hidden(scan.programs[i]);
+        }
+        for (mut i: i64 = 0; i < scan.programs.length(); i++) {
+            scan.current_path = scan.paths[i].clone();
+            scan.walk(scan.programs[i]);
+        }
+        scan.found.sort_by_key((entry: &Undocumented) -> String { return entry.name.clone(); });
+        return Result::Ok(scan);
+    }
+
+    /// The undocumented names, sorted, each once: a declaration gated to
+    /// each target is written twice.
+    names(&this) -> Array<String> {
+        mut names: Array<String> = Array::new();
+        for (mut i: i64 = 0; i < this.found.length(); i++) {
+            if (names.length() == 0 || !(names[names.length() - 1] == this.found[i].name)) {
+                names.push(this.found[i].name.clone());
+            }
+        }
+        return names;
+    }
+
+    /// Where `name` is declared, for a report.
+    location_of(&this, name: &String) -> Str {
+        for (mut i: i64 = 0; i < this.found.length(); i++) {
+            if (this.found[i].name == *name) { return this.found[i].location.as_str(); }
+        }
+        return Str::new("?");
+    }
+
+    parse_directory(mut &this, directory: Path) -> Result<(), String> {
+        mut entries: DirectoryEntries = match (Directory::entries(directory)) {
+            Result::Ok(entries) => { entries }
+            Result::Err(error) => { return Result::Err(f"{directory.as_str()}: {error}"); }
+        };
+        loop {
+            match (entries.next()) {
+                Option::Some(entry) => {
+                    if (entry.is_directory()) {
+                        this.parse_directory(entry.path())?;
+                    } else if (entry.name().ends_with(&Str::new(".cryo"))) {
+                        this.parse_file(entry.path())?;
+                    }
+                }
+                Option::None => { break; }
+            }
+        }
+        return Result::Ok(());
+    }
+
+    parse_file(mut &this, path: Path) -> Result<(), String> {
+        const text: String = match (File::read_text(path)) {
+            Result::Ok(text) => { text }
+            Result::Err(error) => { return Result::Err(f"{path.as_str()}: {error}"); }
+        };
+        // The tokens point into both strings for as long as the tree lives.
+        const path_text: string = String::from_str(path.as_str()).into_raw();
+        mut lexer: Lexer = Lexer::new(path_text, text.into_raw(), this.context.diagnostics);
+        const tokens: [Token] = lexer.lex();
+        mut kept: [Token] = [];
+        for (mut i: i64 = 0; i < tokens.length(); i++) {
+            if (tokens[i].kind != TokenType::Unknown && tokens[i].kind != TokenType::Comment) {
+                kept.push(tokens[i]);
+            }
+        }
+        mut parser: Parser = Parser::new(kept, path_text, this.context);
+        const parser_at: mut Parser* = &parser;
+        const parsing: thread::JoinHandle<mut ProgramNode*> = thread::Builder::new()
+            .stack_size(PARSER_STACK_BYTES)
+            .spawn(move () -> mut ProgramNode* { return parser_at.parse(); });
+        const root: mut ProgramNode* = parsing.join();
+        if (root == null || this.context.diagnostics.has_errors()) {
+            return Result::Err(f"{path.as_str()}: does not parse");
+        }
+        this.programs.push(root);
+        this.paths.push(String::from_str(path.as_str()));
+        return Result::Ok(());
+    }
+
+    /// Record the internal modules and the types that are not public, which
+    /// hide what they hold wherever it is written.
+    note_hidden(mut &this, program: ProgramNode*) -> void {
+        for (mut i: i64 = 0; i < program.statements.length(); i++) {
+            const declaration: DeclarationNode* = program.statements[i].as_decl();
+            if (declaration == null) { continue; }
+            const module_declaration: ModuleDecl* = DeclarationNode::module_of(declaration);
+            if (module_declaration != null && !module_declaration.is_namespace
+                && module_declaration.visibility == Visibility::Internal) {
+                this.internal_modules.push(f"::{module_declaration.path}::");
+            }
+            const name: Option<String> = this.type_name(declaration);
+            if (name.is_some() && !this.type_is_public(declaration)) {
+                this.hidden_types.push(f"{program.namespace_name}::{name.unwrap()}");
+            }
+        }
+    }
+
+    walk(mut &this, program: ProgramNode*) -> void {
+        const wrapped: String = f"::{program.namespace_name}::";
+        for (mut i: i64 = 0; i < this.internal_modules.length(); i++) {
+            if (wrapped.as_str().contains(&this.internal_modules[i].as_str())) { return; }
+        }
+        for (mut i: i64 = 0; i < program.statements.length(); i++) {
+            const declaration: DeclarationNode* = program.statements[i].as_decl();
+            if (declaration == null || declaration.span.start_col >= GENERATED_COLUMN) { continue; }
+            this.walk_declaration(program.namespace_name, declaration);
+        }
+    }
+
+    walk_declaration(mut &this, namespace_name: string, declaration: DeclarationNode*) -> void {
+        const free_function: FunctionDecl* = DeclarationNode::fn_of(declaration);
+        if (free_function != null) {
+            if (free_function.visibility == Visibility::Public) {
+                this.record(declaration, null, f"{namespace_name}::{this.spelled(free_function.name)}");
+            }
+            return;
+        }
+        const type_name: Option<String> = this.type_name(declaration);
+        if (type_name.is_some()) {
+            if (!this.type_is_public(declaration)) { return; }
+            const owner: String = f"{namespace_name}::{type_name.unwrap()}";
+            this.record(declaration, null, owner.clone());
+            // A trait's own methods are not counted; see the module notes.
+            const structure: StructDecl* = DeclarationNode::struct_of(declaration);
+            if (structure != null) { this.walk_methods(&owner, &structure.methods); }
+            const union_type: UnionDecl* = DeclarationNode::union_of(declaration);
+            if (union_type != null) { this.walk_methods(&owner, &union_type.methods); }
+            return;
+        }
+        const block: ImplBlock* = DeclarationNode::impl_of(declaration);
+        if (block != null) {
+            if (block.is_trait_impl()) { return; }
+            const owner: String = f"{namespace_name}::{this.spelled(block.target_type)}";
+            if (this.hidden_types.contains(&owner)) { return; }
+            this.walk_methods(&owner, &block.methods);
+            return;
+        }
+        const variable: VarDecl* = DeclarationNode::var_of(declaration);
+        if (variable != null) {
+            if (variable.visibility != Visibility::Public) { return; }
+            if (variable.owner == null) {
+                this.record(declaration, null, f"{namespace_name}::{this.spelled(variable.name)}");
+                return;
+            }
+            const owner_name: Option<String> = this.owner_name(variable.owner);
+            if (owner_name.is_none()) { return; }
+            const owner: String = f"{namespace_name}::{owner_name.unwrap()}";
+            if (this.hidden_types.contains(&owner)) { return; }
+            this.record(declaration, null, f"{owner}::{this.spelled(variable.name)}");
+        }
+    }
+
+    /// The public methods and statics of `owner`, `Owner.method` and
+    /// `Owner::static`.
+    walk_methods(mut &this, owner: &String, methods: &[DeclarationNode*]) -> void {
+        for (mut i: i64 = 0; i < methods.length(); i++) {
+            const item: DeclarationNode* = methods[i];
+            const method: MethodDecl* = DeclarationNode::method_of(item);
+            if (method == null || method.visibility != Visibility::Public || method.func == null) { continue; }
+            const method_function: FunctionDecl* = DeclarationNode::fn_of(method.func);
+            if (method_function == null) { continue; }
+            const separator: string = if (method.is_static) { "::" } else { "." };
+            this.record(item, method.func, f"{owner.as_str()}{separator}{this.spelled(method_function.name)}");
+        }
+    }
+
+    /// Record `name` unless `declaration` or `inner` (a method's function,
+    /// which the parser may hold its documentation on) is documented.
+    record(mut &this, declaration: DeclarationNode*, inner: DeclarationNode*, name: String) -> void {
+        if (declaration.documentation != null && declaration.documentation.length() > 0) { return; }
+        if (inner != null && inner.documentation != null && inner.documentation.length() > 0) { return; }
+        const location: String = f"{this.current_path.as_str()}:{declaration.span.start_line}";
+        this.found.push(Undocumented { name: name, location: location });
+    }
+
+    /// The name of a struct, union, enum, trait or alias; `None` for any
+    /// other declaration.
+    type_name(&this, declaration: DeclarationNode*) -> Option<String> {
+        const structure: StructDecl* = DeclarationNode::struct_of(declaration);
+        if (structure != null) { return Option::Some(String::from_string(this.spelled(structure.name))); }
+        const union_type: UnionDecl* = DeclarationNode::union_of(declaration);
+        if (union_type != null) { return Option::Some(String::from_string(this.spelled(union_type.name))); }
+        const enumeration: EnumDecl* = DeclarationNode::enum_of(declaration);
+        if (enumeration != null) { return Option::Some(String::from_string(this.spelled(enumeration.name))); }
+        const trait_type: TraitDecl* = DeclarationNode::trait_of(declaration);
+        if (trait_type != null) { return Option::Some(String::from_string(this.spelled(trait_type.name))); }
+        const alias: TypeAliasDecl* = DeclarationNode::alias_of(declaration);
+        if (alias != null) { return Option::Some(String::from_string(this.spelled(alias.alias_name))); }
+        return Option::None;
+    }
+
+    type_is_public(&this, declaration: DeclarationNode*) -> boolean {
+        const structure: StructDecl* = DeclarationNode::struct_of(declaration);
+        if (structure != null) { return structure.visibility == Visibility::Public; }
+        const union_type: UnionDecl* = DeclarationNode::union_of(declaration);
+        if (union_type != null) { return union_type.visibility == Visibility::Public; }
+        const enumeration: EnumDecl* = DeclarationNode::enum_of(declaration);
+        if (enumeration != null) { return enumeration.visibility == Visibility::Public; }
+        const trait_type: TraitDecl* = DeclarationNode::trait_of(declaration);
+        if (trait_type != null) { return trait_type.visibility == Visibility::Public; }
+        const alias: TypeAliasDecl* = DeclarationNode::alias_of(declaration);
+        if (alias != null) { return alias.visibility == Visibility::Public; }
+        return false;
+    }
+
+    /// The type a type constant belongs to: a struct, a union or an
+    /// inherent `implement` block's target.
+    owner_name(&this, owner: DeclarationNode*) -> Option<String> {
+        const block: ImplBlock* = DeclarationNode::impl_of(owner);
+        if (block != null) { return Option::Some(String::from_string(this.spelled(block.target_type))); }
+        return this.type_name(owner);
+    }
+
+    spelled(&this, name: SymbolStr) -> string {
+        return this.context.intern_table.resolve(name);
+    }
+}
+
+/// How a scan's undocumented names differ from a golden's.
+type struct GoldenDifference {
+    /// Undocumented and not in the golden: each must be documented.
+    added: Array<String>;
+    /// In the golden and no longer undocumented: the golden must drop them.
+    gone: Array<String>;
+
+    static between(found: &Array<String>, golden: &Array<String>) -> GoldenDifference {
+        mut difference: GoldenDifference = GoldenDifference { added: Array::new(), gone: Array::new() };
+        for (mut i: i64 = 0; i < found.length(); i++) {
+            if (!golden.contains(&found[i])) { difference.added.push(found[i].clone()); }
+        }
+        for (mut i: i64 = 0; i < golden.length(); i++) {
+            if (!found.contains(&golden[i])) { difference.gone.push(golden[i].clone()); }
+        }
+        return difference;
+    }
+
+    is_empty(&this) -> boolean {
+        return this.added.length() == 0 && this.gone.length() == 0;
+    }
+}
+
+/// The golden file: one undocumented name a line, after `#` comment lines.
+type struct Golden {
+    static read(path: Str) -> Result<Array<String>, String> {
+        const text: String = match (File::read_text(Path::from(path))) {
+            Result::Ok(text) => { text }
+            Result::Err(error) => { return Result::Err(f"{path}: {error}"); }
+        };
+        mut names: Array<String> = Array::new();
+        mut lines = text.as_str().lines();
+        loop {
+            match (lines.next()) {
+                Option::Some(line) => {
+                    const name: Str = line.trim();
+                    if (!name.is_empty() && !name.starts_with(&Str::new("#"))) {
+                        names.push(String::from_str(name));
+                    }
+                }
+                Option::None => { break; }
+            }
+        }
+        return Result::Ok(names);
+    }
+
+    static write(path: Str, names: &Array<String>) -> Result<(), String> {
+        mut text: String = String::new();
+        text.push("# The public standard library declarations with no documentation,\n");
+        text.push("# one qualified name a line. `make doc-coverage-check` fails on an\n");
+        text.push("# undocumented declaration not listed here, and on a listed one that\n");
+        text.push("# is documented or gone; `make doc-coverage-update` rewrites this file.\n");
+        for (mut i: i64 = 0; i < names.length(); i++) {
+            text.push(names[i].as_str());
+            text.push("\n");
+        }
+        match (File::write_text(Path::from(path), text.as_str())) {
+            Result::Ok(_) => { return Result::Ok(()); }
+            Result::Err(error) => { return Result::Err(f"{path}: {error}"); }
+        }
+    }
+}
+
+/// The three commands.
+type struct DocCoverage {
+    /// Compare `root`'s undocumented declarations with the golden at
+    /// `golden_path`, report the difference, and answer the exit code.
+    static check(root: Str, golden_path: Str) -> i32 {
+        mut context: CompilationContext = CompilationContext::new(
+            BuildOptions::defaults(CompileMode::SingleFile), "<doc-coverage>", null);
+        const scan: CoverageScan = match (CoverageScan::over(root, &context)) {
+            Result::Ok(scan) => { scan }
+            Result::Err(message) => { eprintln(f"doc-coverage: {message}"); return 2; }
+        };
+        const golden: Array<String> = match (Golden::read(golden_path)) {
+            Result::Ok(names) => { names }
+            Result::Err(message) => { eprintln(f"doc-coverage: {message}"); return 2; }
+        };
+        const found: Array<String> = scan.names();
+        const difference: GoldenDifference = GoldenDifference::between(&found, &golden);
+        for (mut i: i64 = 0; i < difference.added.length(); i++) {
+            println(f"  undocumented, not in the golden: {scan.location_of(&difference.added[i])} {difference.added[i]}");
+        }
+        for (mut i: i64 = 0; i < difference.gone.length(); i++) {
+            println(f"  in the golden, documented or gone: {difference.gone[i]}");
+        }
+        if (!difference.is_empty()) {
+            println(f"doc-coverage: FAIL - {difference.added.length()} to document, {difference.gone.length()} to drop from {golden_path} (make doc-coverage-update)");
+            return 1;
+        }
+        println(f"doc-coverage: OK - {found.length()} public declarations undocumented, every one in {golden_path}");
+        return 0;
+    }
+
+    /// Rewrite the golden at `golden_path` to `root`'s undocumented set.
+    static update(root: Str, golden_path: Str) -> i32 {
+        mut context: CompilationContext = CompilationContext::new(
+            BuildOptions::defaults(CompileMode::SingleFile), "<doc-coverage>", null);
+        const scan: CoverageScan = match (CoverageScan::over(root, &context)) {
+            Result::Ok(scan) => { scan }
+            Result::Err(message) => { eprintln(f"doc-coverage: {message}"); return 2; }
+        };
+        const found: Array<String> = scan.names();
+        match (Golden::write(golden_path, &found)) {
+            Result::Ok(_) => { }
+            Result::Err(message) => { eprintln(f"doc-coverage: {message}"); return 2; }
+        }
+        println(f"doc-coverage: wrote {golden_path} ({found.length()} undocumented)");
+        return 0;
+    }
+
+    /// Prove the comparison over a fixture: its hand-written golden passes,
+    /// and a golden missing one name, or holding one too many, is refused.
+    static self_test(root: Str, golden_path: Str) -> i32 {
+        mut context: CompilationContext = CompilationContext::new(
+            BuildOptions::defaults(CompileMode::SingleFile), "<doc-coverage>", null);
+        const scan: CoverageScan = match (CoverageScan::over(root, &context)) {
+            Result::Ok(scan) => { scan }
+            Result::Err(message) => { eprintln(f"doc-coverage: {message}"); return 2; }
+        };
+        const golden: Array<String> = match (Golden::read(golden_path)) {
+            Result::Ok(names) => { names }
+            Result::Err(message) => { eprintln(f"doc-coverage: {message}"); return 2; }
+        };
+        const found: Array<String> = scan.names();
+        mut failures: i32 = 0;
+
+        const exact: GoldenDifference = GoldenDifference::between(&found, &golden);
+        for (mut i: i64 = 0; i < exact.added.length(); i++) {
+            println(f"  counted, not in the fixture golden: {exact.added[i]}");
+        }
+        for (mut i: i64 = 0; i < exact.gone.length(); i++) {
+            println(f"  in the fixture golden, not counted: {exact.gone[i]}");
+        }
+        failures = failures + DocCoverage::expect(exact.is_empty(), "the fixture's own golden passes");
+
+        mut short: Array<String> = Array::new();
+        for (mut i: i64 = 1; i < golden.length(); i++) { short.push(golden[i].clone()); }
+        const missing: GoldenDifference = GoldenDifference::between(&found, &short);
+        failures = failures + DocCoverage::expect(
+            golden.length() > 0 && missing.added.length() == 1 && missing.gone.length() == 0
+                && missing.added[0] == golden[0],
+            "a golden missing one undocumented name is refused, naming it");
+
+        mut long: Array<String> = Array::new();
+        for (mut i: i64 = 0; i < golden.length(); i++) { long.push(golden[i].clone()); }
+        long.push(String::from_string("fixture::never_declared"));
+        const extra: GoldenDifference = GoldenDifference::between(&found, &long);
+        failures = failures + DocCoverage::expect(
+            extra.added.length() == 0 && extra.gone.length() == 1,
+            "a golden naming a declaration that is not undocumented is refused");
+
+        if (failures > 0) {
+            println(f"doc-coverage self-test: FAIL - {failures} of 3 cases");
+            return 1;
+        }
+        println(f"doc-coverage self-test: OK - 3 cases over {found.length()} undocumented fixture declarations");
+        return 0;
+    }
+
+    /// Report one case; 1 when it failed.
+    static expect(held: boolean, case_name: string) -> i32 {
+        if (held) {
+            println(f"  ok    {case_name}");
+            return 0;
+        }
+        println(f"  FAIL  {case_name}");
+        return 1;
+    }
+}
+
+function main() -> i32 {
+    const arguments: Array<String> = env::args();
+    if (arguments.length() != 4) {
+        eprintln(String::from_string("usage: cryo-doc-coverage check|update|self-test <root> <golden>"));
+        return 2;
+    }
+    const command: Str = arguments[1].as_str();
+    const root: Str = arguments[2].as_str();
+    const golden_path: Str = arguments[3].as_str();
+    if (command == Str::new("check")) { return DocCoverage::check(root, golden_path); }
+    if (command == Str::new("update")) { return DocCoverage::update(root, golden_path); }
+    if (command == Str::new("self-test")) { return DocCoverage::self_test(root, golden_path); }
+    eprintln(f"cryo-doc-coverage: unknown command {command}");
+    return 2;
+}

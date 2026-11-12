@@ -185,7 +185,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check check-fast lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding warnings-check runtime-tiers runtime-tiers-win pin \
+.PHONY: help cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check check-fast lsp-check cross-check vendor-check api-index api-index-check doc-coverage-check doc-coverage-update examples examples-golden valgrind-check verify-freestanding warnings-check runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do verify-pin verify-pin-clean incremental-check \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -259,6 +259,11 @@ Tests and gates
                          same time as the Windows chain natively.
   make api-index         Regenerate docs/stdlib-api.txt.
   make api-index-check   Fail if docs/stdlib-api.txt is stale.
+  make doc-coverage-check  The stdlib's undocumented public declarations are
+                         exactly docs/doc-coverage.txt (tools/CryoDocCoverage,
+                         built with the compiler under test into build-logs/,
+                         after its own self-test).
+  make doc-coverage-update Rewrite docs/doc-coverage.txt to the current set.
 
 Pins and release
   make pin               Refresh bin/cryo and bin/cryo.exe and their sidecars
@@ -796,6 +801,27 @@ api-index:
 
 api-index-check:
 	@$(PYTHON) scripts/api-index.py --check
+
+# ---- documentation coverage -------------------------------------------
+# docs/doc-coverage.txt is the standard library's public declarations with
+# no documentation, exactly: `doc-coverage-check` fails on an undocumented
+# one it does not list (document it) and on a listed one that is documented
+# or gone (`make doc-coverage-update`).  tools/CryoDocCoverage parses with
+# the compiler library, so it is built with the compiler under test, into
+# build-logs/doc-coverage; it first proves over its own fixture that the
+# comparison passes a matching golden and refuses one a name short or a
+# name over, then checks the stdlib.
+ifeq ($(HOST_OS),windows)
+DOC_COVERAGE := $(ROOT)/build-logs/doc-coverage/cryo-doc-coverage.exe
+doc-coverage-check doc-coverage-update: $(STAGE2_EXE)
+	@cd tools/CryoDocCoverage && "$(STAGE2_EXE)" build --stdlib=$(ROOT)/stdlib --build-dir=$(ROOT)/build-logs/doc-coverage
+else
+DOC_COVERAGE := $(ROOT)/build-logs/doc-coverage/cryo-doc-coverage
+doc-coverage-check doc-coverage-update: $(STAGE2)
+	@cd tools/CryoDocCoverage && "$(STAGE2)" build --stdlib=$(ROOT)/stdlib --build-dir=$(ROOT)/build-logs/doc-coverage
+endif
+	@"$(DOC_COVERAGE)" self-test tools/CryoDocCoverage/tests/fixture tools/CryoDocCoverage/tests/fixture-golden.txt
+	@"$(DOC_COVERAGE)" $(if $(filter doc-coverage-update,$@),update,check) stdlib docs/doc-coverage.txt
 
 # ---- examples smoke build ---------------------------------------------
 # Compile every examples/*/ project with the freshly-built stage-2 compiler
