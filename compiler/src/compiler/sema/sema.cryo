@@ -5815,15 +5815,15 @@ type struct SemaVisitor {
                 // enclosing assignment fail on a difference that does not
                 // exist at runtime.
                 //
-                // Restricted to pointer-shaped on purpose: an element that
-                // needs a VALUE change to reach the expected type (an integer
-                // widening) must not adopt it, because the element emitter
-                // stores what the element evaluated to - adopting there would
-                // store a narrow value into a wide slot.
+                // A number that widens to the expected element is stored
+                // widened, as at every other typed place: the element emitter
+                // converts each element to the literal's element type.  Any
+                // other conversion is refused above, and two pointer types
+                // that differ in no instruction need none.
                 if (elem_expected.is_valid() && !t.equals(elem_expected)
                         && this.checker.can_assign(t, elem_expected)
-                        && this.checker.is_pointer_shaped(t)
-                        && this.checker.is_pointer_shaped(elem_expected)) {
+                        && ((this.checker.is_pointer_shaped(t) && this.checker.is_pointer_shaped(elem_expected))
+                            || this.checker.is_numeric_pair(t, elem_expected))) {
                     elem_type = elem_expected;
                 }
             }
@@ -5892,9 +5892,9 @@ type struct SemaVisitor {
     /// Because elements adopt their expected type directly, a correctly typed
     /// tuple needs no coercion downstream at all - which is what lets
     /// `check_compatibility` refuse to coerce tuples element-wise (see the note
-    /// there; doing so miscompiles).  A genuinely mixed-width tuple - a
-    /// non-literal `i32` element in an `i64` slot - is a hard E0200 here; the
-    /// cast has to be written explicitly.
+    /// there; doing so miscompiles).  A non-literal element that widens to its
+    /// slot (`i32` into `i64`) gives the tuple the slot's type, and the
+    /// emitter converts it; one that would change is refused (E0200).
     resolve_tuple_literal(mut &this, tup: TupleExpr*) -> TypeRef {
         mut exp_tup: TupleType* = null;
         if (this.state.expected_type.is_valid()) {
@@ -5920,8 +5920,18 @@ type struct SemaVisitor {
                 // No usable tuple hint: clear rather than leak the enclosing one.
                 this.state.expected_type = TypeRef::invalid();
             }
-            elem_types.push(this.resolve_expr(tup.elements[i]));
+            const element_type: TypeRef = this.resolve_expr(tup.elements[i]);
             this.state.expected_type = saved_expected;
+            // A number that widens to its position's expected type is stored
+            // widened, as at every other typed place; the tuple emitter
+            // converts each element to its slot's type.
+            if (exp_tup != null && element_type.is_valid() && !element_type.equals(exp_tup.elements[i])
+                    && this.checker.is_numeric_pair(element_type, exp_tup.elements[i])
+                    && this.checker.can_assign(element_type, exp_tup.elements[i])) {
+                elem_types.push(exp_tup.elements[i]);
+            } else {
+                elem_types.push(element_type);
+            }
         }
         // `()` is the unit value, of the unit type, as the annotation `()` is.
         if (elem_types.length() == 0) { return this.arena.get_unit(); }

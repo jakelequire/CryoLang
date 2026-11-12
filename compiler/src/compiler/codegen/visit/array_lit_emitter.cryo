@@ -114,9 +114,13 @@ type struct ArrayLitEmitter {
             return out;
         }
         const alloca: LValue = this.cg.flow.create_entry_alloca(current_fn, "arrlit", ty);
+        const slot_ty: LType = LType { raw: llvm::LLVMGetElementType(ty.raw) };
 
         for (mut i: i64 = 0; i < node.elements.length(); i++) {
-            const elem: LValue = this.dispatch.codegen_rvalue(visitor, node.elements[i]);
+            // Each element at the literal's element type: a narrower number
+            // widens to it.
+            const elem: LValue = this.cg.expr_ops.convert_number(
+                this.dispatch.codegen_rvalue(visitor, node.elements[i]), node.elements[i].resolved_type, slot_ty);
             const idx: LValue = LType::const_int(LType::i64(), i as u64, false);
             const buf: mut void* = libc::malloc(16);
             const buf_arr: mut (mut void*)* = buf as mut (mut void*)*;
@@ -203,7 +207,8 @@ type struct ArrayLitEmitter {
             }
 
             for (mut i: i64 = 0; i < count; i++) {
-                const elem: LValue = this.dispatch.codegen_rvalue(visitor, node.elements[i]);
+                const elem: LValue = this.cg.expr_ops.convert_number(
+                    this.dispatch.codegen_rvalue(visitor, node.elements[i]), node.elements[i].resolved_type, elem_ty);
                 if (!elem.is_valid()) { continue; }
                 const idx: LValue = LType::const_int(LType::i64(), i as u64, false);
                 const buf: mut void* = libc::malloc(8);
@@ -293,24 +298,11 @@ type struct ArrayLitEmitter {
             return out;
         }
 
-        // Compute the fill value.  Coerce the RHS integer width to match
-        // the element type; common case: `[0; N]` for `[i8]` where 0 is
-        // an i32 literal and slots want i8.
-        mut fill_val: LValue = this.dispatch.codegen_rvalue(visitor, node.elements[0]);
-        if (fill_val.is_valid()) {
-            const fill_llvm_ty: mut void* = llvm::LLVMTypeOf(fill_val.raw);
-            if (fill_llvm_ty != null &&
-                LType::kind_of(fill_llvm_ty) == LTypeKind::Integer &&
-                LType::kind_of(elem_ty.raw) == LTypeKind::Integer) {
-                const fw: u32 = llvm::LLVMGetIntTypeWidth(fill_llvm_ty);
-                const ew: u32 = llvm::LLVMGetIntTypeWidth(elem_ty.raw);
-                if (fw < ew) {
-                    fill_val = this.cg.builder.build_zext(fill_val, elem_ty, "fill.widen");
-                } else if (fw > ew) {
-                    fill_val = this.cg.builder.build_trunc(fill_val, elem_ty, "fill.trunc");
-                }
-            }
-        }
+        // The fill value at the element type: a narrower number widens to
+        // it by its own signedness, and a literal sema found to fit a
+        // narrower slot (`[0; N]` for `[i8]`) is truncated to it.
+        const fill_val: LValue = this.cg.expr_ops.convert_number(
+            this.dispatch.codegen_rvalue(visitor, node.elements[0]), node.elements[0].resolved_type, elem_ty);
 
         if (fixed != null) {
             // Fixed `[value; N]` where N is a compile-time constant.

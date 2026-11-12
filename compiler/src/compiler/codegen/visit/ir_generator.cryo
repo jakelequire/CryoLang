@@ -1560,7 +1560,8 @@ type struct IRGeneratorVisitor {
 
     /// Materialize a tuple literal `(a, b, c)` into a stack alloca and store
     /// each element.  Same lvalue convention as `codegen_struct_literal`.
-    codegen_tuple_literal(mut &this, tuple_type: TypeRef, element_values: [LValue], site_span: SourceSpan) -> Emitted {
+    codegen_tuple_literal(mut &this, tuple_type: TypeRef, element_values: [LValue], element_types: [TypeRef],
+                          site_span: SourceSpan) -> Emitted {
         mut out: Emitted = Emitted::none();
         const ty: LType = this.cg.type_mapper.map_type(tuple_type);
         if (!ty.is_valid()) {
@@ -1592,8 +1593,14 @@ type struct IRGeneratorVisitor {
 
         for (mut i: i64 = 0; i < element_values.length(); i++) {
             const gep: LValue = this.cg.builder.build_struct_gep(ty, alloca, i as u32, "elem");
-            const val: LValue = element_values[i];
+            mut val: LValue = element_values[i];
             if (val.is_valid()) {
+                // The value at the slot's type: a narrower number widens to
+                // it, as a struct literal's field does.
+                const slot_llvm_ty: mut void* = llvm::LLVMStructGetTypeAtIndex(ty.raw, i as u32);
+                if (slot_llvm_ty != null) {
+                    val = this.cg.expr_ops.convert_number(val, element_types[i], LType { raw: slot_llvm_ty });
+                }
                 this.cg.builder.build_store(val, gep);
             }
         }
@@ -1848,10 +1855,12 @@ type struct IRGeneratorVisitor {
     visit_tuple_literal(mut &this, e: ExpressionNode*, node: TupleExpr*) -> Emitted {
         const type_ref: TypeRef = e.resolved_type;
         mut element_values: [LValue] = [];
+        mut element_types: [TypeRef] = [];
         for (mut i: i64 = 0; i < node.elements.length(); i++) {
             element_values.push(this.dispatch.codegen_rvalue(this,node.elements[i]));
+            element_types.push(node.elements[i].resolved_type);
         }
-        return this.codegen_tuple_literal(type_ref, element_values, e.span);
+        return this.codegen_tuple_literal(type_ref, element_values, element_types, e.span);
     }
 
     visit_struct_literal(mut &this, e: ExpressionNode*, node: StructExpr*) -> Emitted {
