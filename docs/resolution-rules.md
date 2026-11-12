@@ -133,6 +133,16 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-11-12
+
+703. **A hash map's bucket layer is internal.**  `Entry`, the node of a
+     bucket's chain, and `HashMap::get_bucket`, which hands one out, are
+     internal: a caller outside the standard library walks a map through
+     `entries`, `keys_ref`, `values_ref` and `values_mutable`, which
+     borrow in place for any key and value type.  `bucket_count` stays
+     public.  Supersedes the part of 636 that kept `Entry` public for
+     callers walking a map in place.  (Jake)
+
 ### 2026-11-09
 
 700. **A number widens implicitly only where every value of its type fits
