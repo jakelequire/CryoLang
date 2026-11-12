@@ -127,9 +127,10 @@ not done. The remaining limits are here so nobody rediscovers them:
 - **A diagnostic emitted with no `-->` span cannot be pinned to anything.**
   E0236 is one; its negative test can assert the code alone.
 - **`doc-coverage-check` does not count the functions of an `extern`
-  block** (libc, the OS calls): they bind a foreign interface whose documentation is the
-  platform's, so an undocumented binding passes. It counts by name, so a declaration written once per target reads documented
-  only when every copy is. It reads only that a doc comment is there, not
+  block** (libc, the OS calls): they bind a foreign interface whose
+  documentation is the platform's, so an undocumented binding passes. It
+  counts by name, so a declaration written once per target reads
+  documented only when every copy is. It reads only that a doc comment is there, not
   what it says.
 - **`selfhost-check` proves stability, not correctness.** Stage 3 builds
   stage 4, so a miscompile that reproduces itself is invisible to it.

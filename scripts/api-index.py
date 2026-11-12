@@ -216,7 +216,10 @@ def scan_file(path):
                 continue
 
         in_body = bool(type_stack) and type_stack[-1][0] is not None
-        member_depth = depth == 0 or (in_body and depth == type_stack[-1][1] + 1)
+        # An extern block's functions are declared directly inside it, so a
+        # signature split over lines there is joined as a top-level one is.
+        member_depth = (depth == 0 or (in_body and depth == type_stack[-1][1] + 1)
+                        or (extern_block is not None and depth == extern_block[1] + 1))
         if in_body and member_depth:
             m = LABEL_RE.match(code)
             if m:
