@@ -125,10 +125,8 @@ not done. The remaining limits are here so nobody rediscovers them:
   real run and refuses to keep one that does not verify.
 - **A diagnostic emitted with no `-->` span cannot be pinned to anything.**
   E0236 is one; its negative test can assert the code alone.
-- **`doc-coverage-check` does not count a trait's own methods.** The parser
-  keeps no documentation for them, so every one would read undocumented.
-  Nor does it count the functions of an `extern` block (libc, the OS
-  calls): they bind a foreign interface whose documentation is the
+- **`doc-coverage-check` does not count the functions of an `extern`
+  block** (libc, the OS calls): they bind a foreign interface whose documentation is the
   platform's, so an undocumented binding passes. It counts by name, so a declaration written once per target reads documented
   only when every copy is. It reads only that a doc comment is there, not
   what it says.
