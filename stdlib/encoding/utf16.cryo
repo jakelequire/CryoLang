@@ -4,7 +4,8 @@
 ///! form every `*W` path and name parameter expects; `Utf16::encode_into`
 ///! appends the units of UTF-8 bytes that arrive in pieces, leaving a
 ///! character cut short for the next piece; `Utf16::decode` turns units an
-///! OS call wrote back into a `String`. Both are plain Cryo, with no
+///! OS call wrote back into a `String`, refusing a lone surrogate, which
+///! `Utf16::decode_lossy` reads as U+FFFD instead. Both are plain Cryo, with no
 ///! OS dependency, so they build and behave the same on every target.
 
 namespace std::encoding::utf16;
@@ -21,6 +22,7 @@ private const SURROGATE_HIGH_FIRST: u32 = 0xD800;
 private const SURROGATE_LOW_FIRST:  u32 = 0xDC00;
 private const SURROGATE_LAST:       u32 = 0xDFFF;
 private const SUPPLEMENTARY_FIRST:  u32 = 0x10000;
+private const REPLACEMENT:          u32 = 0xFFFD;
 
 /// The UTF-16 codec. Stateless; its operations are statics.
 public type struct Utf16 {
@@ -80,6 +82,22 @@ public type struct Utf16 {
     /// and its `error_length` is `None` when the input ends on a high
     /// surrogate whose pair could still follow.
     public static decode(units: &Slice<u16>) -> Result<String, Utf8Error> {
+        return Utf16::decode_replacing(units, false);
+    }
+
+    /// The text in `units`, as `decode` reads it, except that a surrogate
+    /// that is not half of a pair becomes U+FFFD instead of refusing the
+    /// whole. For text that must be read even when it is not well-formed,
+    /// such as a Windows argument or environment variable.
+    public static decode_lossy(units: &Slice<u16>) -> String {
+        match (Utf16::decode_replacing(units, true)) {
+            Result::Ok(text) => { return text; }
+            Result::Err(_) => { return String::new(); }
+        }
+    }
+
+    /// `decode`, or with `replace`, `decode_lossy`, which never fails.
+    private static decode_replacing(units: &Slice<u16>, replace: boolean) -> Result<String, Utf8Error> {
         mut text: String = String::with_capacity(units.length());
         const count: i64 = units.length();
         mut index: i64 = 0;
@@ -90,14 +108,19 @@ public type struct Utf16 {
                 index = index + 1;
                 continue;
             }
-            if (unit >= SURROGATE_LOW_FIRST) {
-                return Result::Err(Utf8Error { valid_up_to: index, error_length: Option::Some(1) });
+            mut low: u32 = 0;
+            if (unit < SURROGATE_LOW_FIRST && index + 1 < count) {
+                low = units[index + 1] as u32;
             }
-            if (index + 1 == count) {
-                return Result::Err(Utf8Error { valid_up_to: index, error_length: Option::None });
-            }
-            const low: u32 = units[index + 1] as u32;
             if (low < SURROGATE_LOW_FIRST || low > SURROGATE_LAST) {
+                if (replace) {
+                    text.push_char(REPLACEMENT as char);
+                    index = index + 1;
+                    continue;
+                }
+                if (unit < SURROGATE_LOW_FIRST && index + 1 == count) {
+                    return Result::Err(Utf8Error { valid_up_to: index, error_length: Option::None });
+                }
                 return Result::Err(Utf8Error { valid_up_to: index, error_length: Option::Some(1) });
             }
             const scalar: u32 = SUPPLEMENTARY_FIRST
