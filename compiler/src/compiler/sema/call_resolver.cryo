@@ -1491,6 +1491,12 @@ type struct CallResolver {
                         field_value.span, field_value.span);
                     return this.resolve_call(visitor, call_e, call);
                 }
+                // No method of the receiver's own and no written
+                // implementation: a head for every type may give one.
+                mut through_every_type: boolean = false;
+                const every_type_ret: TypeRef = this.resolve_every_type_method_call(visitor, call_e, call,
+                    callee_member, receiver_type, &through_every_type);
+                if (through_every_type) { return every_type_ret; }
             }
             // Every `recv.method(...)` call is selected here, whatever shape
             // its receiver has, so this is where the method it chose is gated.
@@ -7014,6 +7020,9 @@ type struct CallResolver {
         }
         const entries: [OverloadId] = this.trait_delivered_entries(FamilyOwner::Type(owner_ty), trait_sym, member_sym);
         if (entries.length() == 0) {
+            // No implementation written for the receiver delivers it: the
+            // trait's head for every type may.
+            if (this.record_blanket_static_call(call, scope, owner_ty, trait_sym).is_valid()) { return true; }
             this.report_impl_qualified_miss(scope, owner_sym, owner_ty, trait_sym, member_sym);
             return true;
         }
@@ -8850,7 +8859,7 @@ type struct CallResolver {
                 if (call.arguments[i] != null) { arg_types.push(call.arguments[i].resolved_type); }
             }
             if (!this.static_member_takes(owner_ref, scope, call, &arg_types, true)) {
-                const blanket_ret: TypeRef = this.record_blanket_static_call(call, scope, owner_ty);
+                const blanket_ret: TypeRef = this.record_blanket_static_call(call, scope, owner_ty, DefId::invalid());
                 if (blanket_ret.is_valid()) { return blanket_ret; }
             }
             mut resolved: TypeRef = this.type_static_call(call_e, call, scope, owner_ref, owner_sym);
@@ -8883,26 +8892,31 @@ type struct CallResolver {
             call.callee.set_resolved_type(tmpl_ret);
             return tmpl_ret;
         }
-        const blanket_ret: TypeRef = this.record_blanket_static_call(call, scope, owner_ty);
+        const blanket_ret: TypeRef = this.record_blanket_static_call(call, scope, owner_ty, DefId::invalid());
         if (blanket_ret.is_valid()) { *claimed = true; }
         return blanket_ret;
     }
 
     /// A static call through a type's path to a method the type has
     /// through a head for every type (`i32::from(5)` with `implement<T>
-    /// trait From<T> for T`), with no method of its own of the name or none
-    /// the arguments select: the head whose trait declares the member and
+    /// trait From<T> for T`, `i64::twice(&x)` with `implement<T> trait
+    /// Twice for T`), with no method of its own of the name or none the
+    /// arguments select: the head whose trait declares the member and
     /// whose method, with the head's parameter bound to the owner, takes the
-    /// arguments' types.  The call records the trait's method, the owner and
+    /// arguments' types - its receiver first, when it has one.  A call
+    /// through a trait's path (`Twice::twice(&x)`) asks only that trait's
+    /// heads, `only_trait`; invalid asks every trait's.  The call records the trait's method, the owner and
     /// the types the method takes, as a path a bound directs does, and
     /// monomorphization places the head's copy on the owner and binds the
     /// call to it.  Typed by the method's return with the parameter bound;
     /// invalid when no such head takes the arguments, or the owner is still
     /// a parameter, whose methods only a bound gives.
-    record_blanket_static_call(mut &this, call: mut CallExpr*, scope: mut ScopeResolutionExpr*, owner: TypeRef) -> TypeRef {
+    record_blanket_static_call(mut &this, call: mut CallExpr*, scope: mut ScopeResolutionExpr*, owner: TypeRef,
+                               only_trait: DefId) -> TypeRef {
         if (call == null || !owner.is_valid() || this.types.contains_generic_param(owner)) { return TypeRef::invalid(); }
         for (mut h: i64 = 0; h < this.ctx.generic_registry.blanket_heads.length(); h++) {
             const trait_def: DefId = this.ctx.generic_registry.blanket_heads[h].trait_id;
+            if (only_trait.is_valid() && !trait_def.equals(only_trait)) { continue; }
             const head: mut ImplBlock* = DeclarationNode::impl_of(this.ctx.generic_registry.blanket_heads[h].block);
             const item: DefId = this.trait_item_def(trait_def, scope);
             if (head == null || !item.is_valid()) { continue; }
@@ -8912,16 +8926,26 @@ type struct CallResolver {
             const f: FunctionDecl* = DeclarationNode::fn_of(m.func);
             if (!head.target_parameter_binding(this.arena, owner).is_valid()) { continue; }
             const subject: TypeSubstitution = head.parameter_substitution(this.arena, owner);
+            // A method with a receiver takes it as the path call's first
+            // argument (`i64::twice(&x)`), the parameters after it.
+            mut receiver_taken: TypeRef = TypeRef::invalid();
             mut taken: [TypeRef] = [];
             for (mut i: i64 = 0; i < f.parameters.length(); i++) {
                 const p: VarDecl* = DeclarationNode::var_of(f.parameters[i]);
-                if (p != null && !p.is_receiver()) { taken.push(subject.apply(p.resolved_type, this.arena)); }
+                if (p == null) { continue; }
+                if (p.is_receiver()) {
+                    receiver_taken = subject.apply(p.resolved_type, this.arena);
+                } else {
+                    taken.push(subject.apply(p.resolved_type, this.arena));
+                }
             }
-            if (taken.length() != call.arguments.length()) { continue; }
+            const first: i64 = if (receiver_taken.is_valid()) { 1 } else { 0 };
+            if (taken.length() + first != call.arguments.length()) { continue; }
             mut takes: boolean = true;
-            for (mut i: i64 = 0; i < taken.length(); i++) {
+            for (mut i: i64 = 0; i < call.arguments.length(); i++) {
                 const arg: ExpressionNode* = call.arguments[i];
-                if (arg == null || !arg.resolved_type.is_valid() || !this.checker.can_assign(arg.resolved_type, taken[i])) {
+                const wanted: TypeRef = if (i < first) { receiver_taken } else { taken[i - first] };
+                if (arg == null || !arg.resolved_type.is_valid() || !this.checker.can_assign(arg.resolved_type, wanted)) {
                     takes = false;
                 }
             }
@@ -8960,6 +8984,35 @@ type struct CallResolver {
             DefId::invalid(), &owner);
         if (head_decl == null) { return TypeRef::invalid(); }
         *claimed = true;
+        return this.stamp_head_method_call(visitor, call_e, call, member, head_decl, owner);
+    }
+
+    /// A method call whose method no method of the receiver's own and no
+    /// implementation written for its value gives, and a head for every
+    /// type does (`TraitChecker::every_type_method_head`): `claimed` is
+    /// set and the call stamped as `resolve_reference_method_call` stamps
+    /// one, on the value the receiver refers to or is.
+    resolve_every_type_method_call(mut &this, visitor: mut SemaVisitor*, call_e: ExpressionNode*,
+                                   call: mut CallExpr*, member: mut MemberAccessExpr*, receiver: TypeRef,
+                                   claimed: mut boolean*) -> TypeRef {
+        if (member.resolved_trait.is_valid() || !receiver.is_valid()) { return TypeRef::invalid(); }
+        const value: TypeRef = this.binding.peel_all_indirection(receiver);
+        const head_decl: DeclarationNode* = this.trait_checker().every_type_method_head(value, member.member,
+            DefId::invalid());
+        if (head_decl == null) { return TypeRef::invalid(); }
+        *claimed = true;
+        return this.stamp_head_method_call(visitor, call_e, call, member, head_decl, value);
+    }
+
+    /// Stamp the method call `call` with the method `head_decl`, a head for
+    /// every type or every reference, gives `owner`: the head's trait and
+    /// the method's position, and `owner` as the receiver it answered on,
+    /// as a call a bound answered records its subject; monomorphization
+    /// places the head's copy on `owner` and binds the call to it.  The
+    /// arguments are checked, and the call typed, against the head's method
+    /// with the head's parameter bound by `owner`.
+    stamp_head_method_call(mut &this, visitor: mut SemaVisitor*, call_e: ExpressionNode*, call: mut CallExpr*,
+                           member: mut MemberAccessExpr*, head_decl: DeclarationNode*, owner: TypeRef) -> TypeRef {
         const head: mut ImplBlock* = DeclarationNode::impl_of(head_decl);
         const trait_def: DefId = head.trait_def;
         const slot: i64 = this.trait_slot_of(trait_def, member.member);

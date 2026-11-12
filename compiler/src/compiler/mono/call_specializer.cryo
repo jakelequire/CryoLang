@@ -952,7 +952,7 @@ type struct MonoCallSpecializer {
                 && call.template_recv.is_valid()) {
             recv_type = call.template_recv;
         }
-        if (path_method == null && this.bind_reference_method(call, ma, subst)) { return; }
+        if (path_method == null && this.bind_head_method(call, ma, subst)) { return; }
         if (!recv_type.is_valid()) { return; }
         if (subst != null) { recv_type = subst.apply(recv_type, this.arena); }
         recv_type = this.receiver_owner(recv_type);
@@ -1532,10 +1532,13 @@ type struct MonoCallSpecializer {
     /// it.  The step starts at the type the call recorded
     /// (`template_recv`): the type its bound answered on, as this copy
     /// substitutes it, or the reference an implementation for references
-    /// answered on where the call is written.  False when no
-    /// implementation for references answers, and the referent's method is
-    /// the call's.
-    bind_reference_method(mut &this, call: mut CallExpr*, ma: MemberAccessExpr*, subst: TypeSubstitution*) -> boolean {
+    /// answered on where the call is written.  With none, a value that is
+    /// no reference is asked for the head for every type that gives it the
+    /// method when no implementation written for it does
+    /// (`TraitChecker::every_type_method_head`), and that head's copy is
+    /// placed on it and bound the same way.  False when neither answers,
+    /// and the receiver's own implementation is the call's.
+    bind_head_method(mut &this, call: mut CallExpr*, ma: MemberAccessExpr*, subst: TypeSubstitution*) -> boolean {
         if (ma == null || !ma.resolved_trait.is_valid() || ma.resolved_trait_slot < 0
                 || !call.template_recv.is_valid() || call.template_method.is_valid()) {
             return false;
@@ -1543,8 +1546,13 @@ type struct MonoCallSpecializer {
         mut stepped: TypeRef = call.template_recv;
         if (subst != null) { stepped = subst.apply(stepped, this.arena); }
         mut owner: TypeRef = TypeRef::invalid();
-        const head_decl: DeclarationNode* = this.trait_spec.trait_checker.reference_method_head(stepped, ma.member,
+        mut head_decl: DeclarationNode* = this.trait_spec.trait_checker.reference_method_head(stepped, ma.member,
             ma.resolved_trait, &owner);
+        const stepped_t: Type* = this.arena.lookup(stepped);
+        if (head_decl == null && stepped_t != null && stepped_t.kind != TypeKind::Reference) {
+            head_decl = this.trait_spec.trait_checker.every_type_method_head(stepped, ma.member, ma.resolved_trait);
+            owner = stepped;
+        }
         if (head_decl == null) { return false; }
         this.blanket_implementation(head_decl, owner);
         mut item_impl: DeclarationNode* = null;
