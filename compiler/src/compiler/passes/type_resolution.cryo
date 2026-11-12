@@ -1967,33 +1967,19 @@ type struct TypeResolutionPasses {
                 // declaration rather than at a use - the use is innocent, and
                 // a pick by declaration order or by bound would make the
                 // program's meaning depend on which impl was written first.
-                // Where-bounds do not separate two heads; nothing here can
-                // prove two bounds disjoint.
-                const over: DeclarationNode* =
-                    ctx.generic_registry.overlapping_head(
-                        node.trait_def,
-                        ctx.decl_index.impl_owner(node, "type_resolution/overlap"), node);
+                // A where-bound keeps two heads apart only where they meet
+                // at one named type that fails it (`overlap_excused`);
+                // nothing here can prove two bounds on a parameter disjoint.
+                const unified: [DeclarationNode*] = ctx.generic_registry.overlapping_heads(
+                    node.trait_def, ctx.decl_index.impl_owner(node, "type_resolution/overlap"), node);
+                mut over: DeclarationNode* = null;
+                for (mut oi: i64 = 0; oi < unified.length() && over == null; oi++) {
+                    if (!TypeResolutionPasses::overlap_excused(node, DeclarationNode::impl_of(unified[oi]), ctx)) {
+                        over = unified[oi];
+                    }
+                }
                 if (over != null) {
-                    const this_head: string = node.spell_head(ctx.intern_table);
-                    const that_head: string = DeclarationNode::impl_of(over).spell_head(ctx.intern_table);
-                    const trait_spelt: string =
-                        TypeAnnotation::spell(node.trait_annotation, ctx.intern_table);
-                    // Two heads spelled alike differ only in their
-                    // where-clauses, and that is the sentence.
-                    const msg: string = if (this_head == that_head) {
-                        fmt::format("conflicting implementations of trait `%s`: two `%s` heads differ only in their where-clauses, which do not separate them - a type satisfying both bounds would select both",
-                            trait_spelt, this_head).into_raw()
-                    } else {
-                        fmt::format("conflicting implementations of trait `%s`: `%s` overlaps `%s`, so a type both heads accept would select both",
-                            trait_spelt, this_head, that_head).into_raw()
-                    };
-                    mut od: Diagnostic = Diagnostic::error(
-                        ErrorCode::E0308_CONFLICTING_TRAIT_IMPL, msg);
-                    od = od.at_with_label(decl.span, "this implementation");
-                    od = od.also_at(over.span, "overlaps this one");
-                    od = od.with_note(
-                        "two implementations of one trait must not both accept any type; a where-clause narrows which types a head is FOR but does not separate two heads, so make the targets disjoint or keep one implementation");
-                    ctx.emit_diagnostic(od);
+                    TypeResolutionPasses::report_overlap(decl, node, over, ctx);
                 }
             }
             ctx.generic_registry.mark_overlap_checked(node.trait_def, decl);
@@ -2009,6 +1995,95 @@ type struct TypeResolutionPasses {
             ctx.decl_index.impl_owner(node, "type_resolution/register impl methods"),
             node.methods, &head, &node.trait_arg_types, ctx.intern_table, arena,
             "type_resolution/register impl methods");
+    }
+
+    /// E0308 at `decl`, the head `node`, for overlapping `over`, a head of
+    /// the same trait checked before it.
+    static report_overlap(decl: DeclarationNode*, node: ImplBlock*, over: DeclarationNode*,
+                          ctx: mut CompilationContext*) -> void {
+        const this_head: string = node.spell_head(ctx.intern_table);
+        const that_head: string = DeclarationNode::impl_of(over).spell_head(ctx.intern_table);
+        const trait_spelt: string = TypeAnnotation::spell(node.trait_annotation, ctx.intern_table);
+        // Two heads spelled alike differ only in their where-clauses, and
+        // that is the sentence.
+        const msg: string = if (this_head == that_head) {
+            fmt::format("conflicting implementations of trait `%s`: two `%s` heads differ only in their where-clauses, which do not separate them - a type satisfying both bounds would select both",
+                trait_spelt, this_head).into_raw()
+        } else {
+            fmt::format("conflicting implementations of trait `%s`: `%s` overlaps `%s`, so a type both heads accept would select both",
+                trait_spelt, this_head, that_head).into_raw()
+        };
+        mut od: Diagnostic = Diagnostic::error(ErrorCode::E0308_CONFLICTING_TRAIT_IMPL, msg);
+        od = od.at_with_label(decl.span, "this implementation");
+        od = od.also_at(over.span, "overlaps this one");
+        od = od.with_note(
+            "two implementations of one trait must not both accept any type; a where-clause keeps two heads apart only where they meet at one named type that does not meet it, so make the targets disjoint or keep one implementation");
+        ctx.emit_diagnostic(od);
+    }
+
+    /// Whether two heads of one trait that unify, `block` and `other`, are
+    /// kept apart by a `where` bound.  When the unification binds every
+    /// parameter of both heads to a named type, the two would both be
+    /// selected for one type at one set of trait arguments only, and a head
+    /// whose bounds that type fails does not accept it: `From<E> for
+    /// ErrorReport where E: Error` beside `From<T> for T` meet only at
+    /// `From<ErrorReport> for ErrorReport`, which needs `ErrorReport:
+    /// Error`.  A parameter left free stands for any type, and bounds on it
+    /// are never told apart, so such a pair overlaps.  Every module's
+    /// implementations are registered before any head's overlap is checked,
+    /// so one written in a later module counts here too.
+    static overlap_excused(block: mut ImplBlock*, other: mut ImplBlock*, ctx: mut CompilationContext*) -> boolean {
+        mut bindings: [HeadBinding] = [];
+        if (!GenericRegistry::heads_unify(other, block, &bindings)) { return false; }
+        if (!TypeResolutionPasses::head_params_named(block, &bindings)
+                || !TypeResolutionPasses::head_params_named(other, &bindings)) {
+            return false;
+        }
+        mut rc: ResolutionContext = ResolutionContext::new("");
+        const subject_term: TypeAnnotation* = GenericRegistry::head_term(block.target_annotation(), &bindings);
+        if (!TypeResolutionPasses::names_a_type(subject_term)) { return false; }
+        const subject: TypeRef = ctx.type_resolver.resolve(subject_term, &rc);
+        if (!subject.is_valid()) { return false; }
+        mut trait_args: [TypeRef] = [];
+        const generic: GenericAnnotation* = GenericRegistry::trait_generic_of(block.trait_annotation);
+        if (generic != null) {
+            for (mut i: i64 = 0; i < generic.args.length(); i++) {
+                const term: TypeAnnotation* = GenericRegistry::head_term(generic.args[i], &bindings);
+                if (!TypeResolutionPasses::names_a_type(term)) { return false; }
+                const arg: TypeRef = ctx.type_resolver.resolve(term, &rc);
+                if (!arg.is_valid()) { return false; }
+                trait_args.push(arg);
+            }
+        }
+        const checker: TraitChecker = TraitChecker::new(ctx.type_arena, ctx.generic_registry,
+                                                        ctx.intern_table, ctx.diagnostics);
+        return !checker.impl_applies_at(block, block.trait_def, &trait_args, subject, 0)
+            || !checker.impl_applies_at(other, other.trait_def, &trait_args, subject, 0);
+    }
+
+    /// Whether every parameter of `head` is bound, through `bindings`, to a
+    /// named type.
+    static head_params_named(head: ImplBlock*, bindings: &[HeadBinding]) -> boolean {
+        for (mut i: i64 = 0; i < head.generic_params.length(); i++) {
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(head.generic_params[i]);
+            if (gp == null) { return false; }
+            const bound: i64 = GenericRegistry::head_binding_of(gp.sym_id, bindings);
+            if (bound < 0) { return false; }
+            if (!TypeResolutionPasses::names_a_type(GenericRegistry::head_term(bindings[bound].term, bindings))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Whether a head's written argument, as the unification left it, is a
+    /// type named by itself - no parameter, no arguments of its own.
+    static names_a_type(term: TypeAnnotation*) -> boolean {
+        if (term == null || GenericRegistry::head_param_of(term).is_valid()) { return false; }
+        return match (*term) {
+            TypeAnnotation::Named(_) => { true }
+            _                        => { false }
+        };
     }
 
 

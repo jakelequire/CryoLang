@@ -695,24 +695,24 @@ type struct GenericRegistry {
         return true;
     }
 
-    /// The head of `trait_id` checked before `block` that overlaps it, when
+    /// The heads of `trait_id` checked before `block` that overlap it, when
     /// one of the two is for every type (a target that is a parameter of
-    /// its own), or null.  Heads with the same target are
-    /// `overlapping_head`'s; a head for every type meets every head of the
-    /// trait, whatever its target, and is compared with each once, by
-    /// whichever of the two is checked second, so the order the modules are
-    /// checked in decides only which of the two the report is at.
-    overlapping_blanket(&this, trait_id: DefId, block: ImplBlock*) -> DeclarationNode* {
-        if (block == null || block.spec_owner.is_valid()) { return null; }
+    /// its own), added to `out` in the order they were checked.  Heads with
+    /// the same target are `overlapping_heads`'s; a head for every type
+    /// meets every head of the trait, whatever its target, and is compared
+    /// with each once, by whichever of the two is checked second, so the
+    /// order the modules are checked in decides only which of the two the
+    /// report is at.
+    overlapping_blankets(&this, trait_id: DefId, block: ImplBlock*, out: mut &[DeclarationNode*]) -> void {
+        if (block == null || block.spec_owner.is_valid()) { return; }
         const blanket: boolean = block.target_param().is_valid();
         for (mut i: i64 = 0; i < this.overlap_checked.length(); i++) {
             if (!this.overlap_checked[i].trait_id.equals(trait_id)) { continue; }
             const other: ImplBlock* = DeclarationNode::impl_of(this.overlap_checked[i].block);
             if (other == null || other == block) { continue; }
             if (!blanket && !other.target_param().is_valid()) { continue; }
-            if (GenericRegistry::heads_overlap(other, block)) { return this.overlap_checked[i].block; }
+            if (GenericRegistry::heads_overlap(other, block)) { out.push(this.overlap_checked[i].block); }
         }
-        return null;
     }
 
     /// Record that `block`'s overlap check has run.
@@ -1082,58 +1082,65 @@ type struct GenericRegistry {
 
     // -- Overlap between two written heads --
 
-    /// The head registered before `block` that OVERLAPS it, or null: one
-    /// under `(trait_id, target)`, else one of the trait's heads for every
-    /// type (`overlapping_blanket`).  Only written heads are compared: a clone
-    /// the monomorphizer placed (`spec_owner` valid) is one written head's
-    /// instantiation, and two clones under one specialization are the two
-    /// template heads' overlap seen again.  The first such head is the
-    /// answer, so a third overlapping head is reported against the first
-    /// and not once per pair.
-    overlapping_head(&this, trait_id: DefId, target: TypeRef,
-                     block: ImplBlock*) -> DeclarationNode* {
-        if (block == null || block.spec_owner.is_valid()) { return null; }
+    /// The heads registered before `block` whose heads unify with it, in
+    /// order: those under `(trait_id, target)`, then the trait's heads for
+    /// every type (`overlapping_blankets`).  Only written heads are
+    /// compared: a clone the monomorphizer placed (`spec_owner` valid) is
+    /// one written head's instantiation, and two clones under one
+    /// specialization are the two template heads' overlap seen again.  The
+    /// caller reports the first a bound does not keep apart, so a third
+    /// overlapping head is reported against the first and not once per
+    /// pair.
+    overlapping_heads(&this, trait_id: DefId, target: TypeRef, block: ImplBlock*) -> [DeclarationNode*] {
+        mut out: [DeclarationNode*] = [];
+        if (block == null || block.spec_owner.is_valid()) { return out; }
         const heads: [DeclarationNode*] = this.heads_under(trait_id, target);
         for (mut i: i64 = 0; i < heads.length(); i++) {
             const other: ImplBlock* = DeclarationNode::impl_of(heads[i]);
             if (other == block) { break; }
             if (other.spec_owner.is_valid()) { continue; }
-            if (GenericRegistry::heads_overlap(other, block)) { return heads[i]; }
+            if (GenericRegistry::heads_overlap(other, block)) { out.push(heads[i]); }
         }
-        return this.overlapping_blanket(trait_id, block);
+        this.overlapping_blankets(trait_id, block, &out);
+        return out;
     }
 
-    /// Whether two written heads under one `(trait, target)` key overlap:
-    /// some subject would select both.  The rule: the heads unify, each
-    /// impl's own parameters standing as variables that may bind to any
-    /// written argument of the other head, and the where-bounds not
-    /// consulted - a bound narrows which subjects a head accepts, but nothing
-    /// here can prove two bounds disjoint, so two heads told apart only by
-    /// their bounds overlap.  The trait's written arguments and the target's
-    /// unify under ONE substitution, so `From<i8> for u64` and `From<u8> for
-    /// u64` do not overlap while `Show for Wrap<T>` and `Show for Wrap<i32>`
-    /// do, and `Show for Pair<T, T>` and `Show for Pair<i32, u8>` do not.
+    /// Whether two written heads under one `(trait, target)` key unify:
+    /// some subject would select both, unless a bound keeps them apart
+    /// (`TypeResolutionPasses::overlap_excused`).  The rule: each impl's
+    /// own parameters stand as variables that may bind to any written
+    /// argument of the other head.  The trait's written arguments and the
+    /// target's unify under ONE substitution, so `From<i8> for u64` and
+    /// `From<u8> for u64` do not overlap while `Show for Wrap<T>` and
+    /// `Show for Wrap<i32>` do, and `Show for Pair<T, T>` and `Show for
+    /// Pair<i32, u8>` do not.
     static heads_overlap(a: ImplBlock*, b: ImplBlock*) -> boolean {
-        if (a == null || b == null || a == b) { return false; }
         mut bindings: [HeadBinding] = [];
+        return GenericRegistry::heads_unify(a, b, &bindings);
+    }
+
+    /// `heads_overlap`, leaving in `bindings` what each head's parameters
+    /// stand for where the two heads meet.
+    static heads_unify(a: ImplBlock*, b: ImplBlock*, bindings: mut &[HeadBinding]) -> boolean {
+        if (a == null || b == null || a == b) { return false; }
         const ga: GenericAnnotation* = GenericRegistry::trait_generic_of(a.trait_annotation);
         const gb: GenericAnnotation* = GenericRegistry::trait_generic_of(b.trait_annotation);
         const na: i64 = if (ga == null) { 0 } else { ga.args.length() };
         const nb: i64 = if (gb == null) { 0 } else { gb.args.length() };
         if (na != nb) { return false; }
         for (mut i: i64 = 0; i < na; i++) {
-            if (!GenericRegistry::head_unify(ga.args[i], gb.args[i], &bindings)) { return false; }
+            if (!GenericRegistry::head_unify(ga.args[i], gb.args[i], bindings)) { return false; }
         }
         // A head for every type is compared with the other's whole target,
         // under the bindings its trait arguments made: `From<T> for T` and
         // `From<i8> for i16` bind `T` to `i8`, which is not `i16`, while
         // `From<Mine> for Mine` overlaps it.
         if (a.target_param().is_valid() || b.target_param().is_valid()) {
-            return GenericRegistry::head_unify(a.target_annotation(), b.target_annotation(), &bindings);
+            return GenericRegistry::head_unify(a.target_annotation(), b.target_annotation(), bindings);
         }
         if (a.target_args.length() != b.target_args.length()) { return false; }
         for (mut i: i64 = 0; i < a.target_args.length(); i++) {
-            if (!GenericRegistry::head_unify(a.target_args[i], b.target_args[i], &bindings)) {
+            if (!GenericRegistry::head_unify(a.target_args[i], b.target_args[i], bindings)) {
                 return false;
             }
         }
@@ -1167,6 +1174,21 @@ type struct GenericRegistry {
             }
             _ => { SymbolID::invalid() }
         };
+    }
+
+    /// What the written argument `ann` stands for under `bindings`: a
+    /// parameter the unification bound is followed to its term, as often as
+    /// the terms are themselves bound parameters; anything else is itself.
+    static head_term(ann: TypeAnnotation*, bindings: &[HeadBinding]) -> TypeAnnotation* {
+        mut term: TypeAnnotation* = ann;
+        while (true) {
+            const param: SymbolID = GenericRegistry::head_param_of(term);
+            if (!param.is_valid()) { return term; }
+            const bound: i64 = GenericRegistry::head_binding_of(param, bindings);
+            if (bound < 0) { return term; }
+            term = bindings[bound].term;
+        }
+        return term;
     }
 
     /// The binding of `param`, or -1 when it is unbound.
