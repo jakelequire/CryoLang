@@ -31,6 +31,16 @@ import std::ffi::libc;
 
 private const INITIAL_CAPACITY: i64 = 8;
 
+/// Owned, growable UTF-8 text. `as_str` borrows it as a `Str`, the
+/// read-only view most text functions take; an f-string builds one.
+///
+/// ```cryo
+/// import std::collections::string::{ String };
+///
+/// mut greeting: String = String::from("hello");
+/// greeting.push(", world");
+/// const shouted: String = greeting.to_ascii_uppercase();   // "HELLO, WORLD"
+/// ```
 public type struct String<A = GlobalAlloc> {
     private buffer: RawBuffer<u8, A>;
     private length: i64;
@@ -44,6 +54,8 @@ public type struct String<A = GlobalAlloc> {
         };
     }
 
+    /// An empty string that allocates through `alloc`. No storage until
+    /// the first push.
     public static new_in(alloc: A) -> String<A> {
         return String::<A> {
             buffer: RawBuffer::new_in(alloc),
@@ -62,6 +74,9 @@ public type struct String<A = GlobalAlloc> {
         }
     }
 
+    /// An empty string with room for `capacity` bytes, allocated through
+    /// `alloc`, or the `AllocError` when the storage cannot be had. A
+    /// `capacity` of zero or less allocates nothing.
     public static try_with_capacity_in(capacity: i64, alloc: A) -> Result<String<A>, AllocError> {
         mut string: String<A> = String::<A> {
             buffer: RawBuffer::new_in(alloc),
@@ -215,20 +230,24 @@ public type struct String<A = GlobalAlloc> {
         return this.push_one_byte(byte);
     }
 
+    /// Remove all the text, keeping the storage for reuse.
     public clear(mut &this) -> void {
         this.length = 0;
     }
 
+    /// The length of the text in bytes, not characters.
     ![inline]
     public length(&this) -> i64 {
         return this.length;
     }
 
+    /// How many bytes fit before the string must grow its storage.
     ![inline]
     public capacity(&this) -> i64 {
         return this.buffer.capacity();
     }
 
+    /// True when the string holds no text.
     public is_empty(&this) -> boolean {
         return this.length == 0;
     }
@@ -238,10 +257,15 @@ public type struct String<A = GlobalAlloc> {
         return Str::from_raw(this.buffer.ptr(), this.length);
     }
 
+    /// The text's UTF-8 bytes, borrowed. Invalidated by the next mutating
+    /// call.
     public as_bytes(&this) -> &Slice<u8> {
         return Slice::from_raw(this.buffer.ptr(), this.length);
     }
 
+    /// A pointer to the first byte of the text, not NUL-terminated (see
+    /// `as_cstr` for that); null while the string has no storage.
+    /// Invalidated by the next mutating call.
     public as_ptr(&this) -> u8* {
         return this.buffer.ptr();
     }
@@ -289,18 +313,22 @@ public type struct String<A = GlobalAlloc> {
     // `SplitIter` values borrow this String's buffer and are valid only
     // while it lives and is not mutated.
 
+    /// True when the text begins with `prefix`.
     public starts_with(&this, prefix: &Str) -> boolean {
         return this.as_str().starts_with(prefix);
     }
 
+    /// True when the text ends with `suffix`.
     public ends_with(&this, suffix: &Str) -> boolean {
         return this.as_str().ends_with(suffix);
     }
 
+    /// The byte offset of the first occurrence of `needle`, or `None`.
     public find(&this, needle: &Str) -> Option<i64> {
         return this.as_str().find(needle);
     }
 
+    /// True when `needle` occurs in the text.
     public contains(&this, needle: &Str) -> boolean {
         return this.as_str().contains(needle);
     }
@@ -322,6 +350,8 @@ public type struct String<A = GlobalAlloc> {
         return this.as_str().trim_end();
     }
 
+    /// A fresh `String` with every ASCII lowercase byte folded to
+    /// uppercase; other bytes are copied unchanged.
     public to_ascii_uppercase(&this) -> String {
         return this.as_str().to_ascii_uppercase();
     }
@@ -453,6 +483,7 @@ public type struct String<A = GlobalAlloc> {
         return this.buffer.reserve_exact(this.length, additional);
     }
 
+    /// Give back the storage beyond the text's length.
     public shrink_to_fit(mut &this) -> void {
         this.buffer.shrink_to(this.length);
     }

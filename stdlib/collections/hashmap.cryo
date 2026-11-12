@@ -74,6 +74,9 @@ private function next_map_seed() -> u64 {
 
 // Entry: one node in a bucket's chain
 
+/// One key and its value as a `HashMap` stores them: a node of the bucket
+/// chain `get_bucket` returns, linked to the next node of the same bucket
+/// through `next` (null at the chain's end). `hash` is the key's hash.
 public type struct Entry<K, V> {
     public hash: u64;
     public key: K;
@@ -81,6 +84,18 @@ public type struct Entry<K, V> {
     public next: mut Entry<K, V>*;
 }
 
+/// A map from keys to values, found by the key's hash. Keys need `Hash`
+/// and `Eq`. `H` is the hasher: `SipHasher` by default, which resists
+/// keys chosen to collide; `FnvHasher` is faster for trusted keys.
+/// Iteration order is unspecified; `BTreeMap` keeps keys sorted.
+///
+/// ```cryo
+/// import std::collections::hashmap::{ HashMap };
+///
+/// mut ages: HashMap<Str, i32> = HashMap::new();
+/// ages.insert(Str::new("ada"), 36);
+/// if (ages.contains_key(&Str::new("ada"))) { println("found"); }
+/// ```
 public type struct HashMap<K, V, A = GlobalAlloc, H = SipHasher> where A: Allocator {
     private buckets: mut (mut Entry<K, V>*)*;
     private bucket_count: u64;
@@ -90,11 +105,14 @@ public type struct HashMap<K, V, A = GlobalAlloc, H = SipHasher> where A: Alloca
     /// finished, so one map hashes every key the same way.
     private hasher: H;
 
+    /// An empty map backed by `GlobalAlloc`, hashing with `H`'s default.
     public static new() -> HashMap<K, V, GlobalAlloc, H>
     where H: Default {
         return HashMap::<K, V, GlobalAlloc, H>::with_hasher(H::default());
     }
 
+    /// An empty map that allocates through `alloc`, hashing with `H`'s
+    /// default.
     public static new_in(alloc: A) -> HashMap<K, V, A, H>
     where H: Default {
         return HashMap::<K, V, A, H>::with_hasher_in(H::default(), alloc);
@@ -142,11 +160,13 @@ public type struct HashMap<K, V, A = GlobalAlloc, H = SipHasher> where A: Alloca
         return map;
     }
 
+    /// The number of keys in the map.
     ![inline]
     public length(&this) -> i64 {
         return this.length;
     }
 
+    /// True when the map holds no keys.
     public is_empty(&this) -> boolean {
         return this.length == 0;
     }
@@ -266,6 +286,7 @@ public type struct HashMap<K, V, A = GlobalAlloc, H = SipHasher> where A: Alloca
         };
     }
 
+    /// True when the map holds `key`.
     public contains_key(&this, key: &K) -> boolean
     where K: Hash + Eq, H: Hasher + Copy {
         // Borrow rather than copy out, so this stays sound for owning V
@@ -356,6 +377,9 @@ public type struct HashMap<K, V, A = GlobalAlloc, H = SipHasher> where A: Alloca
         }
     }
 
+    /// `insert` that returns `Err(AllocError)` instead of panicking when
+    /// the map cannot grow. `Ok` holds the value `key` had before, or
+    /// `None`.
     public try_insert(mut &this, key: K, value: V) -> Result<Option<V>, AllocError>
     where K: Hash + Eq, H: Hasher + Copy {
         if (this.bucket_count == 0) {
