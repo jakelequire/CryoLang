@@ -1474,6 +1474,10 @@ type struct CallResolver {
                 if (value_type.is_valid()) { this.refuse_call_of_non_function(call.callee.span, value_type); }
                 return TypeRef::invalid();
             }
+            mut through_reference: boolean = false;
+            const reference_ret: TypeRef = this.resolve_reference_method_call(visitor, call_e, call,
+                callee_member, receiver_type, &through_reference);
+            if (through_reference) { return reference_ret; }
             const selected: Selection = this.resolve_method_overload(visitor, call, callee_member);
             // No method of the name, and a field of it holding a closure: the
             // field's value is called, `h.f(x)` being `h.f.__call__(x)`, as a
@@ -5972,12 +5976,14 @@ type struct CallResolver {
                     this.stamp_trait_item(member, dir.named());
                     call.bound_trait_args = dir.bound_args();
                 }
-                // The receiver the bound answered on, in the body's own
-                // parameters: each copy of the body substitutes it, which is
-                // what monomorphization selects the implementation for.  A
-                // copy's receiver expression carries no type of its own.
+                // The type the bound answered on - the receiver behind its
+                // references, in the body's own parameters: each copy of the
+                // body substitutes it, which is what monomorphization
+                // selects the implementation for, even when the type it
+                // becomes is itself a reference.  A copy's receiver
+                // expression carries no type of its own.
                 if (member.resolved_trait.is_valid() && member.resolved_trait_slot >= 0) {
-                    call.template_recv = obj_type;
+                    call.template_recv = visitor.receiver_subject(obj_type);
                 }
                 const typed_ret: TypeRef = this.bound_return_at_call_args(member, call, abs_ret);
                 member_e.set_resolved_type(typed_ret);
@@ -8891,15 +8897,8 @@ type struct CallResolver {
             const m: MethodDecl* = DeclarationNode::method_of(this.ctx.generic_registry.trait_item_method(head, slot));
             if (m == null || m.func == null) { continue; }
             const f: FunctionDecl* = DeclarationNode::fn_of(m.func);
-            mut params: [TypeRef] = [];
-            mut types: [TypeRef] = [];
-            for (mut gi: i64 = 0; gi < head.generic_params.length(); gi++) {
-                const gp: GenericParamDecl* = DeclarationNode::generic_param_of(head.generic_params[gi]);
-                if (gp == null || !gp.sym_id.equals(head.target_param())) { continue; }
-                params.push(this.arena.create_generic_param(gp.sym_id, gp.name, gi as u64));
-                types.push(owner);
-            }
-            const subject: TypeSubstitution = TypeSubstitution::from_params(&params, &types);
+            if (!head.target_parameter_binding(this.arena, owner).is_valid()) { continue; }
+            const subject: TypeSubstitution = head.parameter_substitution(this.arena, owner);
             mut taken: [TypeRef] = [];
             for (mut i: i64 = 0; i < f.parameters.length(); i++) {
                 const p: VarDecl* = DeclarationNode::var_of(f.parameters[i]);
@@ -8923,6 +8922,53 @@ type struct CallResolver {
             return ret;
         }
         return TypeRef::invalid();
+    }
+
+    /// A method call whose method an implementation for references gives
+    /// its receiver (`TraitChecker::reference_method_head`): `claimed` is
+    /// set, the call is stamped with the head's trait and the method's
+    /// position and records the reference it answered on, as a call a
+    /// bound answered records its subject, and monomorphization places the
+    /// head's copy on that reference and binds the call to it.  The
+    /// arguments are checked, and the call typed, against the head's
+    /// method with the head's parameter bound to what the reference refers
+    /// to.  A call a bound answered in a generic body keeps that answer.
+    resolve_reference_method_call(mut &this, visitor: mut SemaVisitor*, call_e: ExpressionNode*,
+                                  call: mut CallExpr*, member: mut MemberAccessExpr*, receiver: TypeRef,
+                                  claimed: mut boolean*) -> TypeRef {
+        if (member.resolved_trait.is_valid() || !receiver.is_valid()) { return TypeRef::invalid(); }
+        const receiver_t: Type* = this.arena.lookup(receiver);
+        if (receiver_t == null) { return TypeRef::invalid(); }
+        const stepped: TypeRef = if (receiver_t.kind == TypeKind::Reference) {
+            receiver_t.as_reference().referent
+        } else { receiver };
+        mut owner: TypeRef = TypeRef::invalid();
+        const head_decl: DeclarationNode* = this.trait_checker().reference_method_head(stepped, member.member,
+            DefId::invalid(), &owner);
+        if (head_decl == null) { return TypeRef::invalid(); }
+        *claimed = true;
+        const head: mut ImplBlock* = DeclarationNode::impl_of(head_decl);
+        const trait_def: DefId = head.trait_def;
+        const slot: i64 = this.trait_slot_of(trait_def, member.member);
+        const m: MethodDecl* = DeclarationNode::method_of(this.ctx.generic_registry.trait_item_method(head, slot));
+        if (m == null || m.func == null) { return TypeRef::invalid(); }
+        const f: FunctionDecl* = DeclarationNode::fn_of(m.func);
+        const subject: TypeSubstitution = head.parameter_substitution(this.arena, owner);
+        mut taken: [TypeRef] = [];
+        for (mut i: i64 = 0; i < f.parameters.length(); i++) {
+            const p: VarDecl* = DeclarationNode::var_of(f.parameters[i]);
+            if (p != null && !p.is_receiver()) { taken.push(subject.apply(p.resolved_type, this.arena)); }
+        }
+        const ret: TypeRef = subject.apply(f.resolved_return_type, this.arena);
+        const signature: FunctionType* = this.arena.lookup(this.arena.get_function(ret, &taken, false)).as_function();
+        if (this.check_call_against_signature(visitor, call_e, call,
+                fmt::format("`%s`", this.intern.resolve(member.member)).into_raw(), signature)) {
+            return TypeRef::invalid();
+        }
+        this.stamp_trait_item(member, trait_def);
+        call.template_recv = owner;
+        call.callee.set_resolved_type(ret);
+        return ret;
     }
 
     /// True when the scope segment names a declared TYPE, distinguishing a

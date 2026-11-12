@@ -219,13 +219,16 @@ type struct SymbolicChecker {
     /// The block's parameter list is not the owner's: a where-clause can add
     /// a parameter the owner has no slot for, and an instance built from that
     /// list carries one argument too many - unmakeable once a specialization
-    /// substitutes it.
+    /// substitutes it.  A block whose target is a parameter of its own
+    /// (`for T`, `for &T`) is written for that parameter, which is its
+    /// own instance.
     symbolic_owner_instance(mut &this, owner_type: TypeRef) -> TypeRef {
         if (!owner_type.is_valid()) { return owner_type; }
         if (this.state.symbolic_owner_param_nodes.length() == 0) { return owner_type; }
         const t: Type* = this.arena.lookup(owner_type);
         if (t == null || t.kind == TypeKind::InstantiatedType) { return owner_type; }
         const impl_node: ImplBlock* = this.state.symbolic_impl_node;
+        if (impl_node != null && impl_node.target_param().is_valid()) { return owner_type; }
         if (impl_node != null && impl_node.target_args.length() > 0
 ) {
             mut rc: ResolutionContext = ResolutionContext::new("");
@@ -283,13 +286,17 @@ type struct SymbolicChecker {
 
     /// True (only in a generic-owner symbolic walk) when `ty` is the abstract
     /// owner type itself - so an access rooted at `this` with abstract field/
-    /// method types should be deferred rather than reported.
+    /// method types should be deferred rather than reported.  An owner that
+    /// is a type parameter - the target of a block written for every type -
+    /// has no template to read methods off: its methods are its bounds'.
     symbolic_is_generic_owner_receiver(&this, ty: TypeRef) -> boolean {
         if (!this.state.in_symbolic_check || !this.state.symbolic_owner_is_generic) { return false; }
         if (!ty.is_valid() || !this.state.current_owner_type.is_valid()) { return false; }
         const recv_base:  TypeRef = this.symbolic_recv_base(ty);
         const owner_base: TypeRef = this.types.unwrap_to_base_ref(this.state.current_owner_type);
         if (!recv_base.is_valid() || !owner_base.is_valid()) { return false; }
+        const owner_t: Type* = this.arena.lookup(owner_base);
+        if (owner_t != null && owner_t.kind == TypeKind::GenericParam) { return false; }
         return recv_base.equals(owner_base);
     }
 

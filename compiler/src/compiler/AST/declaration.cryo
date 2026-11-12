@@ -15,11 +15,14 @@ namespace compiler::ast::declaration;
 import compiler::diag;
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::ast::{
-    expression, GenericAnnotation, ImportStyle, NamedAnnotation, node, pattern, statement, TraitBound,
+    expression, GenericAnnotation, ImportStyle, NamedAnnotation, node, pattern, ReferenceAnnotation, statement, TraitBound,
     TraitRef, TypeAnnotation, Visibility
 };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::arena::{ TypeArena };
+import compiler::types::{ RefMutability, TypeKind };
+import compiler::types::type_base::{ Type };
+import compiler::types::substitution::{ TypeSubstitution };
 import std::fmt;
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::res::{ DefId, Res, ResBase, ResSlot };
@@ -1745,6 +1748,11 @@ type struct ImplBlock {
     /// the LSP to detect cursor on the target name and render the
     /// type's hover / jump to its declaration.
     target_type_span: SourceSpan;
+    /// Whether the head implements the trait for references to its target,
+    /// `for &T`, rather than for the target itself.
+    target_reference: boolean;
+    /// Whether those references are the mutable ones, `for mut &T`.
+    target_reference_mutable: boolean;
 
     /// Concrete trait-element bindings captured at impl-specialization time
     /// (parallel arrays: name -> resolved concrete TypeRef).  Populated by the
@@ -1812,6 +1820,8 @@ type struct ImplBlock {
             trait_annotation:          null,
             where_bounds:              [],
             target_type_span:          SourceSpan::none(),
+            target_reference:          false,
+            target_reference_mutable:  false,
             derived_param_names:       [],
             derived_param_syms:        [],
             derived_param_types:       [],
@@ -1901,11 +1911,17 @@ type struct ImplBlock {
             name: this.target_type, span: SourceSpan::none(),
             pre_resolved: TypeRef::invalid(), res: this.res,
         });
-        if (this.target_args.length() == 0) { return base; }
-        mut args: [mut TypeAnnotation*] = [];
-        for (mut i: i64 = 0; i < this.target_args.length(); i++) { args.push(this.target_args[i]); }
-        return new TypeAnnotation::Generic(new GenericAnnotation {
-            base: base, args: args, span: SourceSpan::none(), refused: false,
+        mut target: mut TypeAnnotation* = base;
+        if (this.target_args.length() > 0) {
+            mut args: [mut TypeAnnotation*] = [];
+            for (mut i: i64 = 0; i < this.target_args.length(); i++) { args.push(this.target_args[i]); }
+            target = new TypeAnnotation::Generic(new GenericAnnotation {
+                base: base, args: args, span: SourceSpan::none(), refused: false,
+            });
+        }
+        if (!this.target_reference) { return target; }
+        return new TypeAnnotation::Reference(new ReferenceAnnotation {
+            inner: target, is_mutable: this.target_reference_mutable, span: SourceSpan::none(),
         });
     }
 
@@ -1922,6 +1938,55 @@ type struct ImplBlock {
             }
             _ => { SymbolID::invalid() }
         };
+    }
+
+    /// What the head's own parameter stands for when the head is asked
+    /// about `subject`, for a head whose target is that parameter
+    /// (`target_param`): `subject` itself for `for T`; for `for &T` and
+    /// `for mut &T` the type `subject` refers to, when it is a reference of
+    /// the head's mutability.  Invalid when it is not: the head does not
+    /// apply to it.
+    target_parameter_binding(&this, arena: TypeArena*, subject: TypeRef) -> TypeRef {
+        if (!this.target_reference) { return subject; }
+        const t: Type* = arena.lookup(subject);
+        if (t == null || t.kind != TypeKind::Reference) { return TypeRef::invalid(); }
+        const mutable: boolean = t.as_reference().mutability == RefMutability::Mutable;
+        if (mutable != this.target_reference_mutable) { return TypeRef::invalid(); }
+        return t.as_reference().referent;
+    }
+
+    /// The substitution that binds the parameter a head for every type is
+    /// written for (`target_param`) to what it stands for when the head is
+    /// asked about `subject` (`target_parameter_binding`).
+    parameter_substitution(&this, arena: mut TypeArena*, subject: TypeRef) -> TypeSubstitution {
+        mut params: [TypeRef] = [];
+        mut types: [TypeRef] = [];
+        const target: SymbolID = this.target_param();
+        const bound_to: TypeRef = this.target_parameter_binding(arena, subject);
+        for (mut i: i64 = 0; i < this.generic_params.length(); i++) {
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(this.generic_params[i]);
+            if (gp == null || !gp.sym_id.equals(target)) { continue; }
+            params.push(arena.create_generic_param(gp.sym_id, gp.name, i as u64));
+            types.push(bound_to);
+        }
+        return TypeSubstitution::from_params(&params, &types);
+    }
+
+    /// The type a head whose target is a parameter of its own is written
+    /// for, as its methods' `This`: the parameter for `for T`, a reference
+    /// to it for `for &T` and `for mut &T`.  Invalid for any other head.
+    parameter_target_type(&this, arena: mut TypeArena*) -> TypeRef {
+        const target: SymbolID = this.target_param();
+        if (!target.is_valid()) { return TypeRef::invalid(); }
+        for (mut i: i64 = 0; i < this.generic_params.length(); i++) {
+            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(this.generic_params[i]);
+            if (gp == null || !gp.sym_id.equals(target)) { continue; }
+            const param: TypeRef = arena.create_generic_param(gp.sym_id, gp.name, i as u64);
+            if (!this.target_reference) { return param; }
+            return arena.get_reference_to(param,
+                if (this.target_reference_mutable) { RefMutability::Mutable } else { RefMutability::Immutable });
+        }
+        return TypeRef::invalid();
     }
 
     /// The definition the head's target names, off its stamp; invalid for a
@@ -2003,6 +2068,7 @@ type struct ImplBlock {
         mut out: string = if (this.trait_annotation != null) {
             TypeAnnotation::spell(this.trait_annotation, intern) + " for "
         } else { "" };
+        if (this.target_reference) { out = out + if (this.target_reference_mutable) { "mut &" } else { "&" }; }
         out = out + intern.resolve(this.target_type);
         if (this.target_args.length() > 0) {
             out = out + "<";

@@ -176,7 +176,11 @@ type struct TraitChecker {
         // type-arg substitution below read the instantiation identity through the
         // `inst_*` views, and a concrete carries that identity itself.
         const subject: TypeRef = ty;
-        if (!this.arena.carries_impl_key(subject, this.intern_table)) { return false; }
+        // A reference has the traits an implementation for references
+        // gives it (`for &T`), and no other.
+        const subject_t: Type* = this.arena.lookup(subject);
+        const is_reference: boolean = subject_t != null && subject_t.kind == TypeKind::Reference;
+        if (!is_reference && !this.arena.carries_impl_key(subject, this.intern_table)) { return false; }
         // The candidates by identity, the first whose bounds hold.
         const impl_block: ImplBlock* = this.select_impl(trait_name, subject, depth);
         // A method merely named `drop` does not satisfy `Drop`: a type
@@ -555,12 +559,51 @@ type struct TraitChecker {
         return this.impl_applies_at(head, head.trait_def, &no_trait_args, subject, depth);
     }
 
+    /// The implementation for references that gives a method call its
+    /// method, by the step a call takes before it looks through a
+    /// reference.  The call's receiver is `&X`, written so or borrowed for
+    /// the call, and `stepped` is `X`: `X`'s own methods come first - when
+    /// `X` is itself a reference, those an implementation for references
+    /// (`implement<T> trait Describe for &T`) gives it - and only then is
+    /// the reference stripped and its referent asked, step by step.  The
+    /// answer is the first such head, on the first step that has one, whose
+    /// trait declares a method `leaf` (`trait_def`'s alone when it is
+    /// valid) and which applies to the reference at that step; `out_owner`
+    /// receives that reference.  Null when no step has one, and the call is
+    /// the referent's.  A reference still written in a type parameter has
+    /// no step here: each copy of its body takes it.
+    reference_method_head(&this, stepped: TypeRef, leaf: SymbolStr, trait_def: DefId,
+                          out_owner: mut TypeRef*) -> DeclarationNode* {
+        mut x: TypeRef = stepped;
+        mut t: Type* = this.arena.lookup(x);
+        while (t != null && t.kind == TypeKind::Reference && !this.arena.contains_generic_param(x)) {
+            for (mut h: i64 = 0; h < this.generic_registry.blanket_heads.length(); h++) {
+                const head_trait: DefId = this.generic_registry.blanket_heads[h].trait_id;
+                const head_decl: DeclarationNode* = this.generic_registry.blanket_heads[h].block;
+                const head: mut ImplBlock* = DeclarationNode::impl_of(head_decl);
+                if (head == null || !head.target_reference) { continue; }
+                if (trait_def.is_valid() && !head_trait.equals(trait_def)) { continue; }
+                if (this.generic_registry.trait_item_slot(head_trait, leaf) < 0) { continue; }
+                if (!this.impl_applies(head, x, 0)) { continue; }
+                *out_owner = x;
+                return head_decl;
+            }
+            x = t.as_reference().referent;
+            t = this.arena.lookup(x);
+        }
+        return null;
+    }
+
     /// `impl_applies` for a head of `trait_def` asked at the trait arguments
     /// `trait_args`, which also bind the head's parameters written in them.
     impl_applies_at(&this, head: mut ImplBlock*, trait_def: DefId, trait_args: &[TypeRef], subject: TypeRef,
                     depth: i32) -> boolean {
         if (head == null) { return false; }
         if (head.spec_owner.is_valid()) { return true; }
+        // A head for every reference applies to references alone.
+        if (head.target_param().is_valid() && !head.target_parameter_binding(this.arena, subject).is_valid()) {
+            return false;
+        }
         return this.impl_bounds_hold(head, trait_def, trait_args, subject, depth);
     }
 
@@ -579,15 +622,12 @@ type struct TraitChecker {
         if (impl_block == null) { return false; }
         if (impl_block.where_bounds.length() == 0) { return true; }
         mut bindings: TypeSubstitution = TypeSubstitution::empty();
-        // A head for every type: its parameter is the subject itself.
+        // A head for every type: its parameter is the subject itself, or
+        // what the subject refers to for a head for every reference.
         const target: SymbolID = impl_block.target_param();
         if (target.is_valid()) {
-            for (mut gi: i64 = 0; gi < impl_block.generic_params.length(); gi++) {
-                const gp: GenericParamDecl* = DeclarationNode::generic_param_of(impl_block.generic_params[gi]);
-                if (gp != null && gp.sym_id.equals(target)) {
-                    bindings.add(this.arena.create_generic_param(gp.sym_id, gp.name, gi as u64), subject);
-                }
-            }
+            if (!impl_block.target_parameter_binding(this.arena, subject).is_valid()) { return false; }
+            bindings = impl_block.parameter_substitution(this.arena, subject);
         }
         // The impl's TARGET arguments - the names the type itself is
         // parameterized by (`I` in `for TakeIter<I>`) - bound to the

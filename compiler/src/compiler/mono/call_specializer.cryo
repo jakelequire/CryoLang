@@ -927,6 +927,7 @@ type struct MonoCallSpecializer {
                 && call.template_recv.is_valid()) {
             recv_type = call.template_recv;
         }
+        if (path_method == null && this.bind_reference_method(call, ma, subst)) { return; }
         if (!recv_type.is_valid()) { return; }
         if (subst != null) { recv_type = subst.apply(recv_type, this.arena); }
         recv_type = this.receiver_owner(recv_type);
@@ -1465,7 +1466,7 @@ type struct MonoCallSpecializer {
             const head: mut ImplBlock* = DeclarationNode::impl_of(blanket[h]);
             const m: MethodDecl* = DeclarationNode::method_of(this.generic_registry.trait_item_method(head, slot));
             if (m == null || m.func == null) { continue; }
-            mut subject: TypeSubstitution = MonoCallSpecializer::blanket_subject(head, owner, this.arena);
+            mut subject: TypeSubstitution = head.parameter_substitution(this.arena, owner);
             const f: FunctionDecl* = DeclarationNode::fn_of(m.func);
             mut k: i64 = 0;
             mut takes: boolean = true;
@@ -1486,19 +1487,34 @@ type struct MonoCallSpecializer {
         }
     }
 
-    /// The substitution of a head for every type, `head`, that binds its
-    /// parameter - the one its target is - to `subject`.
-    static blanket_subject(head: ImplBlock*, subject: TypeRef, arena: mut TypeArena*) -> TypeSubstitution {
-        mut params: [TypeRef] = [];
-        mut types: [TypeRef] = [];
-        const target: SymbolID = head.target_param();
-        for (mut gi: i64 = 0; gi < head.generic_params.length(); gi++) {
-            const gp: GenericParamDecl* = DeclarationNode::generic_param_of(head.generic_params[gi]);
-            if (gp == null || !gp.sym_id.equals(target)) { continue; }
-            params.push(arena.create_generic_param(gp.sym_id, gp.name, gi as u64));
-            types.push(subject);
+    /// Bind a call a trait's method answers - stamped by a bound in a
+    /// generic body, or where it is written by an implementation for
+    /// references - to the method an implementation for references gives
+    /// its receiver, when one does (`TraitChecker::reference_method_head`):
+    /// the head's copy is placed on that reference and the call bound to
+    /// it.  The step starts at the type the call recorded
+    /// (`template_recv`): the type its bound answered on, as this copy
+    /// substitutes it, or the reference an implementation for references
+    /// answered on where the call is written.  False when no
+    /// implementation for references answers, and the referent's method is
+    /// the call's.
+    bind_reference_method(mut &this, call: mut CallExpr*, ma: MemberAccessExpr*, subst: TypeSubstitution*) -> boolean {
+        if (ma == null || !ma.resolved_trait.is_valid() || ma.resolved_trait_slot < 0
+                || !call.template_recv.is_valid() || call.template_method.is_valid()) {
+            return false;
         }
-        return TypeSubstitution::from_params(&params, &types);
+        mut stepped: TypeRef = call.template_recv;
+        if (subst != null) { stepped = subst.apply(stepped, this.arena); }
+        mut owner: TypeRef = TypeRef::invalid();
+        const head_decl: DeclarationNode* = this.trait_spec.trait_checker.reference_method_head(stepped, ma.member,
+            ma.resolved_trait, &owner);
+        if (head_decl == null) { return false; }
+        this.blanket_implementation(head_decl, owner);
+        mut item_impl: DeclarationNode* = null;
+        const item_decl: DeclarationNode* = this.trait_item_on(call, ma, owner, &item_impl);
+        if (item_decl == null) { return false; }
+        this.bind_receiver_method(call, item_decl, item_impl, null, owner, subst);
+        return true;
     }
 
     /// The implementation `head_decl`, a head for every type
@@ -1519,14 +1535,14 @@ type struct MonoCallSpecializer {
                 if (DeclarationNode::impl_of(entry.impl_nodes[j]).template == head) { return entry.impl_nodes[j]; }
             }
         }
-        mut binding: TypeSubstitution = MonoCallSpecializer::blanket_subject(head, subject, this.arena);
+        mut binding: TypeSubstitution = head.parameter_substitution(this.arena, subject);
         mut syms: [SymbolID] = [];
         syms.push(head.target_param());
         // Heap-allocated: the substituter holds the pointer and attaches
         // types that outlive this call.
         const subst_ptr: mut TypeSubstitution* =
             allocator::alloc(sizeof(TypeSubstitution), 16) as mut TypeSubstitution*;
-        *subst_ptr = MonoCallSpecializer::blanket_subject(head, subject, this.arena);
+        *subst_ptr = head.parameter_substitution(this.arena, subject);
         mut cloner: ASTCloner = ASTCloner::for_monomorphization();
         const copy_decl: DeclarationNode* = cloner.clone_decl(head_decl);
         const block: mut ImplBlock* = DeclarationNode::impl_of(copy_decl);
@@ -1538,6 +1554,16 @@ type struct MonoCallSpecializer {
         block.template = head;
         block.spec_owner = subject;
         this.ast_resolver.resolve_specialized_impl(block, &binding, subject);
+        // A reference is declared nowhere: the copy's methods are owned by a
+        // definition of their own under the trait, its leaf the reference's
+        // encoding, as an object's implementation's are.
+        if (!this.decl_index.registered_def(subject).is_valid()) {
+            mut mangle: MangleContext = MangleContext::new(this.intern_table, this.arena);
+            const owner_def: DefId = this.decl_index.defs.register_generated(head.trait_def,
+                this.intern_table.intern(mangle.encode_type_ref(subject, "blanket_implementation")),
+                DefKind::Instance, SourceSpan::none());
+            this.decl_index.register_type(owner_def, subject, Visibility::Public);
+        }
         this.decl_index.register_methods_through(subject, block.methods, null, &block.trait_arg_types,
             this.intern_table, this.arena, "mono/blanket implementation");
         const subject_t: Type* = this.arena.lookup(subject);

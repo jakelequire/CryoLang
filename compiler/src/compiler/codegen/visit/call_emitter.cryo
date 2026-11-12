@@ -180,6 +180,31 @@ type struct CallEmitter {
         return this.cg.type_mapper.map_type(this.cg.ctx.decl_index.type_of_def(def));
     }
 
+    /// The reference a method call's method belongs to, when an
+    /// implementation for references gave it (`for &T`): the type the
+    /// method's receiver points at, itself a reference.  Invalid for any
+    /// other method, whose receiver is loaded down to the value.
+    reference_method_owner(&this, node: CallExpr*) -> TypeRef {
+        if (!node.resolved_callee.decl_entry().is_valid()) { return TypeRef::invalid(); }
+        const m: MethodDecl* = DeclarationNode::method_of(
+            this.cg.ctx.decl_index.entry_method(node.resolved_callee.decl_entry()));
+        if (m == null || m.func == null) { return TypeRef::invalid(); }
+        const f: FunctionDecl* = DeclarationNode::fn_of(m.func);
+        if (f.parameters.length() == 0) { return TypeRef::invalid(); }
+        const receiver: VarDecl* = DeclarationNode::var_of(f.parameters[0]);
+        if (receiver == null || !receiver.is_ref_receiver()) { return TypeRef::invalid(); }
+        const receiver_t: Type* = this.cg.arena_type(receiver.resolved_type);
+        if (receiver_t == null) { return TypeRef::invalid(); }
+        const owner: TypeRef = match (receiver_t.kind) {
+            TypeKind::Pointer   => { receiver_t.as_pointer().pointee }
+            TypeKind::Reference => { receiver_t.as_reference().referent }
+            _                   => { TypeRef::invalid() }
+        };
+        const owner_t: Type* = this.cg.arena_type(owner);
+        if (owner_t == null || owner_t.kind != TypeKind::Reference) { return TypeRef::invalid(); }
+        return owner;
+    }
+
     /// Stack slot for a value spilled so its address can be taken.
     entry_spill_slot(&this, ty: LType, name: string) -> LValue {
         return this.cg.flow.temp_slot(ty, name);
@@ -673,11 +698,16 @@ type struct CallEmitter {
             // out of the local slot.  A layer behind it (`r: &(Runner*)`)
             // holds the next pointer, loaded in turn until the value the
             // method is declared on: methods belong to that value, never
-            // to a pointer.  For value receivers (`runner: Runner`), take
-            // the lvalue address as `this`.
+            // to a pointer - except a method an implementation for
+            // references gives a reference, which belongs to that
+            // reference, the type its receiver points at.  For value
+            // receivers (`runner: Runner`), and a receiver that is that
+            // reference itself, take the lvalue address as `this`.
             const recv_t: Type* = this.cg.arena_type(ma.object.resolved_type);
+            const method_owner: TypeRef = this.reference_method_owner(node);
+            const is_method_owner: boolean = method_owner.is_valid() && ma.object.resolved_type.equals(method_owner);
             mut obj: LValue = LValue::null();
-            if (recv_t != null && (recv_t.kind == TypeKind::Pointer
+            if (recv_t != null && !is_method_owner && (recv_t.kind == TypeKind::Pointer
                                 || recv_t.kind == TypeKind::Reference)) {
                 // A wide reference is the slice itself: a receiver that is
                 // one is given a slot, and a slot holding one behind another
@@ -690,6 +720,7 @@ type struct CallEmitter {
                     } else {
                         layer.as_reference().referent
                     };
+                    if (method_owner.is_valid() && inner.equals(method_owner)) { break; }
                     layer = this.cg.arena_type(inner);
                     if (layer == null || (layer.kind != TypeKind::Pointer && layer.kind != TypeKind::Reference)) {
                         break;

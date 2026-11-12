@@ -2340,6 +2340,21 @@ implement struct Parser {
             }
         }
 
+        // A trait implementation for references to a type: `for &T`, or
+        // `for mut &T` for the mutable ones.  The reference is recorded on
+        // the block and the name after it is read as any other target.
+        mut target_reference: boolean = false;
+        mut target_reference_mutable: boolean = false;
+        if (trait_ann != null && this.check(TokenType::KwMut) && this.peek_at(1).kind == TokenType::Amp) {
+            this.advance();
+            this.advance();
+            target_reference = true;
+            target_reference_mutable = true;
+        } else if (trait_ann != null && this.check(TokenType::Amp)) {
+            this.advance();
+            target_reference = true;
+        }
+
         // Optional type keyword (enum, struct, union); `class` is refused
         // and the head read on as `struct`'s.
         if (this.check(TokenType::KwClass)) {
@@ -2391,6 +2406,27 @@ implement struct Parser {
         const node: mut ImplBlock* = ImplBlock::new(type_name);
         const decl: mut DeclarationNode* = DeclarationNode::of(DeclKind::Impl(node), this.span_from_token(start));
         node.target_type_span = this.span_from_token(type_tok);
+        // References are implemented for through a parameter of the head's
+        // own, so that the head covers every type of the referent's kind;
+        // a reference to one named type is not a target.
+        if (target_reference) {
+            mut names_own_parameter: boolean = false;
+            for (mut pi: i64 = 0; pi < leading_gen_params.length(); pi++) {
+                const gp: GenericParamDecl* = DeclarationNode::generic_param_of(leading_gen_params[pi]);
+                if (gp != null && gp.name.equals(type_name)) { names_own_parameter = true; }
+            }
+            if (!names_own_parameter || this.check(TokenType::LAngle)) {
+                mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0104_EXPECTED_TYPE,
+                    fmt::format("a trait implementation for references names a type parameter of its own after `&`, found `%s`",
+                        type_text));
+                diag = diag.at_with_label(this.span_from_token(type_tok), "not a type parameter of this implementation");
+                diag = diag.help("an implementation for references is written for every reference, `for &T` with `T` a type parameter of the implementation, bounded where its methods need it");
+                this.ctx.diagnostics.emit(diag);
+                this.error_count += 1;
+            }
+        }
+        node.target_reference = target_reference;
+        node.target_reference_mutable = target_reference_mutable;
         this.current_type_name = type_text;
 
         // Attach the trait annotation and the leading generic params (if any)
