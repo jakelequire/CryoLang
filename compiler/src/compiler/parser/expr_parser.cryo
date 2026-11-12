@@ -367,6 +367,7 @@ implement struct Parser {
                     Parser::merge_spans(left.span, this.span_from_token(op)), [left]);
                 continue;
             }
+            const group_open: i64 = this.pos;
             const right: mut ExpressionNode* = this.parse_binary_expression(prec + 1);
             if (right == null) {
                 // `a < b >` with nothing an expression can start with after
@@ -419,11 +420,86 @@ implement struct Parser {
                     if (op.kind == TokenType::DotDotEq) { LangItem::RangeInclusive } else { LangItem::Range };
                 left = this.range_literal(range_item, span, [left, right]);
             } else {
-                left = ExpressionNode::binary_expr(op, left, right, span);
+                const comparison: mut ExpressionNode* = ExpressionNode::binary_expr(op, left, right, span);
+                if (op.kind == TokenType::RAngle) {
+                    ExpressionNode::binary_of(comparison).call_reading =
+                        this.call_reading_of(left, op, right, group_open, span);
+                }
+                left = comparison;
             }
         }
 
         return left;
+    }
+
+    /// The call `L::<R>(args)` that `L < R > (args)` spells with its `::`
+    /// left out, for BinaryExpr.call_reading; null when the tokens do not
+    /// have that shape.  `left` is the `L < R` comparison and `right` the
+    /// operand parsed after the `>`, from the token at `group_open`.  The
+    /// shape: `L` a name, path or member written without type arguments,
+    /// `R` a bare name, and the operand after `>` exactly one parenthesized
+    /// group - so `L::<R>` followed by the same group is a call taking it as
+    /// its argument list.  An operand that runs on past the group's `)`
+    /// (`(x).len()`, `(x) + 1`, a lambda) has no such reading.
+    call_reading_of(mut &this, left: ExpressionNode*, close_angle: Token, right: mut ExpressionNode*,
+                    group_open: i64, span: SourceSpan) -> mut ExpressionNode* {
+        const angle: BinaryExpr* = ExpressionNode::binary_of(left);
+        if (angle == null || angle.op.kind != TokenType::LAngle) { return null; }
+        if (angle.left == null || angle.right == null || right == null) { return null; }
+        const callee: mut ExpressionNode* = angle.left;
+        const identifier: IdentifierExpr* = ExpressionNode::identifier_of(callee);
+        const scope: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(callee);
+        const member: MemberAccessExpr* = ExpressionNode::member_access_of(callee);
+        const callee_bare: boolean =
+            (identifier != null && identifier.generic_args.length() == 0)
+            || (scope != null && scope.generic_args.length() == 0 && scope.impl_trait == null)
+            || (member != null && member.generic_args.length() == 0 && !member.parenthesized);
+        const type_name: IdentifierExpr* = ExpressionNode::identifier_of(angle.right);
+        if (!callee_bare || type_name == null || type_name.generic_args.length() > 0) { return null; }
+        if (group_open >= this.tokens.length() || this.tokens[group_open].kind != TokenType::LParen) {
+            return null;
+        }
+        // The operand must end on the `)` that closes the group.
+        mut depth: i64 = 0;
+        mut close: i64 = group_open;
+        while (close < this.tokens.length()) {
+            const k: TokenType = this.tokens[close].kind;
+            if (k == TokenType::LParen) { depth += 1; }
+            if (k == TokenType::RParen) {
+                depth -= 1;
+                if (depth == 0) { break; }
+            }
+            close += 1;
+        }
+        if (close != this.last_consumed_index()) { return null; }
+        // `R` is the one token before the `>`; read it again as the type
+        // the call's argument list holds.
+        mut type_index: i64 = this.consumed_index_of(close_angle) - 1;
+        while (type_index >= 0 && Parser::is_comment(this.tokens[type_index].kind)) { type_index -= 1; }
+        if (type_index < 0) { return null; }
+        const resume: i64 = this.pos;
+        const errors_before: int = this.error_count;
+        this.pos = type_index;
+        const type_argument: mut TypeAnnotation* = this.parse_type_annotation();
+        const read_whole: boolean = this.last_consumed_index() == type_index;
+        this.pos = resume;
+        if (type_argument == null || !read_whole || this.error_count != errors_before) { return null; }
+        mut call: mut ExpressionNode* = ExpressionNode::call_expr(callee, span);
+        ExpressionNode::call_of(call).set_generic_args([type_argument]);
+        ExpressionNode::call_of(call).turbofish_left_out = this.span_from_token(angle.op);
+        // `()` and `(a, b)` are the group itself; anything else in it,
+        // `((a, b))` included, is the one argument.
+        const group: TupleExpr* = ExpressionNode::tuple_of(right);
+        const open: SourceSpan = this.span_from_token(this.tokens[group_open]);
+        if (group != null && right.span.start_line == open.start_line
+                && right.span.start_col == open.start_col) {
+            for (mut i: i64 = 0; i < group.elements.length(); i++) {
+                ExpressionNode::call_of(call).add_argument(group.elements[i]);
+            }
+        } else {
+            ExpressionNode::call_of(call).add_argument(right);
+        }
+        return call;
     }
 
     /// A range literal, `item::new(operands...)`: `a..b` is `Range::new(a,

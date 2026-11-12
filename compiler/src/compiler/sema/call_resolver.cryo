@@ -1363,6 +1363,10 @@ type struct CallResolver {
             if (TypeAnnotation::names_every_argument(&call.generic_args)) {
                 const spec_tmpl: const TemplateEntry* = this.spelling_template(ident.res);
                 if (spec_tmpl != null && spec_tmpl.kind == TemplateKind::Function) {
+                    // An instance takes the arguments its template's
+                    // parameters number; a call supplying some other count
+                    // names no instance worth typing.
+                    if (this.check_call_arity(visitor, call_e, call, ident)) { return TypeRef::invalid(); }
                     // A function template's instance: its placeholder with
                     // the written arguments.
                     const inst: TypeRef = this.resolve_generic_scope_type(
@@ -2814,24 +2818,29 @@ type struct CallResolver {
 
     // -- Free-call arity + argument type checking --
 
-    check_call_arity(mut &this, visitor: mut SemaVisitor*, call_e: ExpressionNode*, call: mut CallExpr*, ident: IdentifierExpr*) -> void {
-        if (call.generic_args.length() > 0) { return; }
+    /// Check a free call's arguments against the family its callee names;
+    /// true when their count is refused.  With type arguments written, only
+    /// the count: the parameter types are the instance's, which the written
+    /// arguments choose.
+    check_call_arity(mut &this, visitor: mut SemaVisitor*, call_e: ExpressionNode*, call: mut CallExpr*, ident: IdentifierExpr*) -> boolean {
         // Arity is checked against the family the callee names and nothing
         // else: a leaf-keyed list holds every module's `write`, and an arity
         // reported against one of those is a diagnostic about a function the
         // call never named.
         const callee: DefId = this.callee_def(ident);
-        if (!callee.is_valid()) { return; }
+        if (!callee.is_valid()) { return false; }
         const overloads: [TypeRef] = this.family_signatures_of(callee);
-        if (overloads.length() == 0) { return; }
+        if (overloads.length() == 0) { return false; }
         if (overloads.length() > 1) {
-            this.check_overloaded_free_call_arity(call_e, call, ident, overloads);
-            return;
+            return this.check_overloaded_free_call_arity(call_e, call, ident, overloads);
         }
         const ft_raw: Type* = this.arena.lookup(overloads[0]);
-        if (ft_raw == null || ft_raw.kind != TypeKind::Function) { return; }
-        this.check_call_against_signature(visitor, call_e, call,
-            fmt::format("function `%s`", this.intern.resolve(ident.name)).into_raw(), ft_raw.as_function());
+        if (ft_raw == null || ft_raw.kind != TypeKind::Function) { return false; }
+        const callee_text: string = fmt::format("function `%s`", this.intern.resolve(ident.name)).into_raw();
+        if (call.generic_args.length() > 0) {
+            return this.argument_count_refused(call_e, call, callee_text, ft_raw.as_function());
+        }
+        return this.check_call_against_signature(visitor, call_e, call, callee_text, ft_raw.as_function());
     }
 
     /// The arguments of a call whose callee has the one signature `ft`,
@@ -2839,12 +2848,21 @@ type struct CallResolver {
     /// A function called by its name and a function value - a local, a
     /// global, a computed callee - are checked here alike, since a value's
     /// signature binds its arguments as surely as a declaration's.
-    /// `callee_text` names the callee in a count diagnostic.
+    /// `callee_text` names the callee in a count diagnostic.  True when the
+    /// count is refused.
     check_call_against_signature(mut &this, visitor: mut SemaVisitor*, call_e: ExpressionNode*, call: mut CallExpr*,
-                                 callee_text: string, ft: FunctionType*) -> void {
-        // A variadic callee's declared parameters are parameters: each must
-        // be supplied and each is checked against its declared type.  Only
-        // the tail past them is unconstrained.
+                                 callee_text: string, ft: FunctionType*) -> boolean {
+        if (this.argument_count_refused(call_e, call, callee_text, ft)) { return true; }
+        this.check_args_against_params(visitor, &call.arguments, ft.param_types.as_slice());
+        return false;
+    }
+
+    /// Refuse a call `call_e` whose argument count `ft` does not take (E0216
+    /// too few, E0215 too many); true when refused.  A variadic callee's
+    /// declared parameters are parameters, each one required; only the tail
+    /// past them is unconstrained.
+    argument_count_refused(mut &this, call_e: ExpressionNode*, call: CallExpr*, callee_text: string,
+                           ft: FunctionType*) -> boolean {
         const expected: i64 = ft.param_types.length();
         const got: i64 = call.arguments.length();
         if (got < expected) {
@@ -2855,7 +2873,7 @@ type struct CallResolver {
             diag = diag.at_with_label(call_e.span,
                 fmt::format("missing %lld argument%s", expected - got, if (expected - got == 1) { "" } else { "s" }));
             this.ctx.diagnostics.emit(this.diag.with_missing_arguments_fix(diag, call_e, &ft.param_types, got));
-            return;
+            return true;
         }
         if (got > expected && !ft.is_variadic) {
             mut diag: Diagnostic = Diagnostic::error(
@@ -2864,9 +2882,9 @@ type struct CallResolver {
             diag = diag.at_with_label(call_e.span,
                 fmt::format("unexpected argument%s", if (got - expected == 1) { "" } else { "s" }));
             this.ctx.diagnostics.emit(this.diag.with_extra_arguments_fix(diag, call_e, &call.arguments, expected));
-            return;
+            return true;
         }
-        this.check_args_against_params(visitor, &call.arguments, ft.param_types.as_slice());
+        return false;
     }
 
     /// The signatures of the function family the definition `def` names, in
@@ -2879,24 +2897,25 @@ type struct CallResolver {
     }
 
     check_overloaded_free_call_arity(mut &this, call_e: ExpressionNode*, call: CallExpr*, ident: IdentifierExpr*,
-                                     overloads: [TypeRef]) -> void {
+                                     overloads: [TypeRef]) -> boolean {
         const got: i64 = call.arguments.length();
         mut uniq_arity:  i64 = -1;
         mut any_variadic: boolean = false;
         mut matches:      boolean = false;
         for (mut i: i64 = 0; i < overloads.length(); i++) {
             const t: Type* = this.arena.lookup(overloads[i]);
-            if (t == null || t.kind != TypeKind::Function) { return; }
+            if (t == null || t.kind != TypeKind::Function) { return false; }
             const ft: FunctionType* = t.as_function();
             if (ft.is_variadic) { any_variadic = true; continue; }
             const ar: i64 = ft.param_types.length();
             uniq_arity = this.diag.note_arity(uniq_arity, ar);
             if (ar == got) { matches = true; }
         }
-        if (any_variadic || matches) { return; }
+        if (any_variadic || matches) { return false; }
         const expected_for_msg: i64 = if (uniq_arity >= 0) { uniq_arity } else { -1 };
         const no_params: [TypeRef] = [];
         this.diag.emit_method_arity_error(call_e, ident.name, "function", expected_for_msg, got, false, &no_params);
+        return true;
     }
 
     /// Non-emitting category check: do the call's args fit `params`?  Non-concrete
@@ -10807,7 +10826,7 @@ type struct CallResolver {
             if (scope.resolved_trait.is_valid() && !this.symbolic.symbolic_scope_is_generic_param(scope)) { return; }
             const owner_ty: TypeRef = this.scope_owner_type(call.callee, scope);
             if (this.scope_is_generic_template(owner_ty, scope, call)) {
-                this.check_template_static_args(visitor, scope, call);
+                this.check_template_static_args(visitor, scope, call_e, call);
                 return;
             }
             const scope_str:  string = this.intern.resolve(lookup_sym);
@@ -10858,7 +10877,7 @@ type struct CallResolver {
     /// METHOD's arguments stashed, and the owner's on the receiver it was
     /// selected on.  A call with no complete stash is not checked here.
     check_template_static_args(mut &this, visitor: mut SemaVisitor*, scope: ScopeResolutionExpr*,
-                               call: mut CallExpr*) -> void {
+                               call_e: ExpressionNode*, call: mut CallExpr*) -> void {
         const tmpl: const TemplateEntry* = this.resolve_scope_owner_template(scope);
         // A generic static method of a non-generic owner is a function
         // template of its own, and its arguments are a generic free call's.
@@ -10869,7 +10888,12 @@ type struct CallResolver {
         }
         const func_decl: DeclarationNode* = this.ctx.decl_index.method_func_of(call.template_method);
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
-        if (func == null) { return; }
+        // No method was recorded when none of the name takes the call's
+        // argument count: that count is refused against the owner's.
+        if (func == null) {
+            this.check_static_scope_method_args(visitor, scope, call_e, call);
+            return;
+        }
         if (tmpl.param_types.length() == 0) { return; }
         const no_args: [TypeRef] = [];
         mut owner_args: [TypeRef] = [];
@@ -11008,14 +11032,40 @@ type struct CallResolver {
         if (!type_ref.is_valid()) { return; }
         mut t: Type* = this.arena.lookup(type_ref);
         mut owner_ref: TypeRef = type_ref;
+        mut minted: boolean = true;
         if (t != null && t.kind == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = t.as_instantiated();
-            if (!inst.has_resolved_type()) { return; }
-            owner_ref = inst.resolved_type;
-            t = this.arena.lookup(inst.resolved_type);
+            minted = inst.has_resolved_type();
+            owner_ref = if (minted) { inst.resolved_type } else { inst.generic_base };
+            t = this.arena.lookup(owner_ref);
         }
+        const owner_template: const TemplateEntry* = this.ctx.generic_registry.template_of_type(owner_ref);
+        if (owner_template != null && owner_template.base_type.equals(owner_ref)) { minted = false; }
         if (t == null) { return; }
         const named: [DeclarationNode*] = this.ctx.decl_index.methods_named(FamilyOwner::Type(owner_ref), scope.member_name);
+        const argc: i64 = call.arguments.length();
+        // An owner not minted - a generic template, or an instance of one
+        // not yet made - has no method set of its own.  Its declarations
+        // number their parameters as the minted instance's methods will, so
+        // they settle the count; the types wait for the instance.
+        if (!minted) {
+            mut static_seen: i64 = 0;
+            mut arity: i64 = -1;
+            for (mut i: i64 = 0; i < named.length(); i++) {
+                const method: MethodDecl* = DeclarationNode::method_of(named[i]);
+                if (method == null || !method.is_static) { continue; }
+                const func: FunctionDecl* = DeclarationNode::fn_of(method.func);
+                if (func == null) { continue; }
+                if (func.is_variadic || func.parameters.length() == argc) { return; }
+                static_seen += 1;
+                arity = this.diag.note_arity(arity, func.parameters.length());
+            }
+            if (static_seen > 0) {
+                const no_params: [TypeRef] = [];
+                this.diag.emit_method_arity_error(call_e, scope.member_name, "static method", arity, argc, false, &no_params);
+            }
+            return;
+        }
         const no_methods: [MethodInfo] = [];
         mut methods: &[MethodInfo] = &no_methods;
         match (t.kind) {
@@ -11023,7 +11073,6 @@ type struct CallResolver {
             TypeKind::Enum   => { methods = &t.as_enum().methods; }
             _ => { return; }
         }
-        const argc: i64 = call.arguments.length();
         mut found:     boolean = false;
         mut ambiguous: boolean = false;
         mut variadic_ok: boolean = false;

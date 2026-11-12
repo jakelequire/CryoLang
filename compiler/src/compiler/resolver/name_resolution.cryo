@@ -39,7 +39,7 @@ import compiler::ast::declaration::{
     TraitDecl, TypeAliasDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
-    AlignofExpr,
+    AlignofExpr, BinaryExpr,
     CallExpr, CastExpr, ExpressionNode, IdentifierExpr,
     LambdaExpr, MemberAccessExpr, NewExpr,
     ScopeResolutionExpr, SizeofExpr, StaticMatchExpr, StructExpr,
@@ -1133,6 +1133,24 @@ type struct NameResolver {
             name));
         this.ctx.emit_diagnostic(d);
         node.set_res(Res::Err);
+    }
+
+    /// Whether the `R` of `L < R > (..)` names a type - a declared one, a
+    /// primitive or a type parameter - and no value in this scope.
+    names_type_and_no_value(&this, node: BinaryExpr*) -> boolean {
+        const angle: BinaryExpr* = ExpressionNode::binary_of(node.left);
+        if (angle == null) { return false; }
+        const type_name: IdentifierExpr* = ExpressionNode::identifier_of(angle.right);
+        if (type_name == null) { return false; }
+        if (this.resolver.lookup_value(type_name.name, this.resolver.current_scope).is_valid()) {
+            return false;
+        }
+        return match (this.type_spelling_res(type_name.name, angle.right.span)) {
+            ResSlot::Answered(Res::Def(d))          => { this.resolver.defs.kind_of(d) == DefKind::Type }
+            ResSlot::Answered(Res::PrimTy(_))       => { true }
+            ResSlot::Answered(Res::GenericParam(_)) => { true }
+            _                                       => { false }
+        };
     }
 
     /// The type declarations under the leaf `name` across every module, as
@@ -3965,6 +3983,33 @@ implement trait Walk for struct NameResolver {
         for (mut i: i64 = 0; i < node.arguments.length(); i++) {
             this.walk_expr(node.arguments[i]);
         }
+    }
+
+    /// `f<T>(x)` parses as the comparisons `(f < T) > (x)`, since `<` after a
+    /// name compares; when `T` names a type and no value, no comparison can
+    /// be meant, and the expression becomes the call its `call_reading`
+    /// spells, `f::<T>(x)`, its `<` kept for the type check to refuse the
+    /// spelling at.  Asked here because this walk is where `T` is looked up
+    /// in the scope it was written in.
+    walk_binary(mut &this, e: mut ExpressionNode*, node: BinaryExpr*) -> void {
+        if (node.call_reading != null && this.names_type_and_no_value(node)) {
+            mut call: mut CallExpr* = ExpressionNode::call_of(node.call_reading);
+            // The type arguments go where `::<` would have put them: on the
+            // call of a bare name, on the path or member otherwise.
+            const scope: mut ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(call.callee);
+            const member: mut MemberAccessExpr* = ExpressionNode::member_access_of(call.callee);
+            if (scope != null || member != null) {
+                mut type_arguments: [mut TypeAnnotation*] = [];
+                for (mut i: i64 = 0; i < call.generic_args.length(); i++) { type_arguments.push(call.generic_args[i]); }
+                call.generic_args = [];
+                if (scope != null) { scope.set_generic_args(type_arguments); }
+                else { member.generic_args = type_arguments; }
+            }
+            e.kind = node.call_reading.kind;
+            this.walk_expr(e);
+            return;
+        }
+        BinaryExpr::walk_children(node, this);
     }
 
     walk_member_access(mut &this, e: mut ExpressionNode*, node: mut MemberAccessExpr*) -> void {
