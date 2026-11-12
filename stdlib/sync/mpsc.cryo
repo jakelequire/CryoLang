@@ -55,7 +55,11 @@ import std::core::drop::{ Drop };
 import std::alloc::layout::{ Layout };
 import std::alloc::allocator::{ GlobalAlloc };
 import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::core::error::{ Error };
 import std::core::mem;
+import std::fmt::display::{ Debug, Display, Formatter };
+import std::fmt::error::{ FmtError };
 import std::sync::mutex::{ Mutex, MutexGuard };
 import std::sync::condvar::{ CondVar };
 import std::time::clock::{ Instant };
@@ -133,25 +137,73 @@ public type struct SendError<T> {
     public value: T;
 }
 
+/// `the receiver has been dropped`; the value it carries is not printed.
+implement<T> trait Display for struct SendError<T> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        return f.write_str(Str::new("the receiver has been dropped"));
+    }
+}
+
+/// `SendError`; the value it carries is not printed.
+implement<T> trait Debug for struct SendError<T> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        return f.write_str(Str::new("SendError"));
+    }
+}
+
+implement<T> trait Error for struct SendError<T> { }
+
 /// Error returned by a blocking `Receiver::recv`.
-public type enum RecvError with [Eq, Clone] {
+public type enum RecvError with [Eq, Clone, Debug] {
     Disconnected;   // all senders dropped and the queue is empty
 }
 
+/// `every sender has been dropped`.
+implement trait Display for enum RecvError {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        return f.write_str(Str::new("every sender has been dropped"));
+    }
+}
+
+implement trait Error for enum RecvError { }
+
 /// Error returned by the non-blocking `Receiver::try_recv`.
-public type enum TryRecvError with [Eq, Clone] {
+public type enum TryRecvError with [Eq, Clone, Debug] {
     Empty;          // no value ready, but senders remain
     Disconnected;   // all senders dropped and the queue is empty
 }
 
+/// `no value is ready` or `every sender has been dropped`.
+implement trait Display for enum TryRecvError {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        match (&this) {
+            TryRecvError::Empty        => { return f.write_str(Str::new("no value is ready")); }
+            TryRecvError::Disconnected => { return f.write_str(Str::new("every sender has been dropped")); }
+        }
+    }
+}
+
+implement trait Error for enum TryRecvError { }
 
 /// Why `Receiver::receive_timeout` returned no value.
-public type enum ReceiveTimeoutError with [Eq, Clone] {
+public type enum ReceiveTimeoutError with [Eq, Clone, Debug] {
     /// The time ran out with no value sent and a sender still alive.
     Timeout;
     /// Every sender has dropped and the queue is empty.
     Disconnected;
 }
+
+/// `the time ran out` or `every sender has been dropped`.
+implement trait Display for enum ReceiveTimeoutError {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        match (&this) {
+            ReceiveTimeoutError::Timeout      => { return f.write_str(Str::new("the time ran out")); }
+            ReceiveTimeoutError::Disconnected => { return f.write_str(Str::new("every sender has been dropped")); }
+        }
+    }
+}
+
+implement trait Error for enum ReceiveTimeoutError { }
 
 /// The sending half of a channel. Cloneable for multiple producers.
 public type struct Sender<T> {

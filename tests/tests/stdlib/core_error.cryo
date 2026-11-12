@@ -1,0 +1,140 @@
+///! `Error` and `ErrorReport`: an error names its source, a report keeps the
+///! text of an error and of each source, and `?` carries any standard
+///! error into a report.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::CoreError;
+
+import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::core::error::{ Error, ErrorReport };
+import std::core::iter::{ Iterator };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::fmt::error::{ FmtError };
+import std::fmt::display::{ Display, Debug, Formatter, format_to_string, format_debug_to_string };
+import std::fs::path::{ Path };
+import std::alloc::allocator::{ AllocError, AllocErrorKind };
+import std::alloc::layout::{ Layout };
+import std::core::convert::{ ConversionError };
+import std::encoding::error::{ DecodeError, DecodeErrorKind };
+import std::env::arguments::{ ArgumentError, ArgumentErrorKind };
+import std::future::executor::{ JoinError };
+import std::io::error::{ IoError, IoErrorKind, IoOperation };
+import std::net::addr::url::{ UrlError };
+import std::random::error::{ RandomError };
+import std::sync::mpsc::{ SendError, RecvError, TryRecvError, ReceiveTimeoutError };
+import std::thread::{ SpawnError };
+import std::time::datetime::{ DateTime };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_eq };
+
+/// An error of a program's own, caused by an `IoError`.
+type struct LoadError {
+    cause: IoError;
+}
+
+implement trait Display for struct LoadError {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        return f.write_str(Str::new("could not load the settings"));
+    }
+}
+
+implement trait Debug for struct LoadError {
+    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+        return f.write_str(Str::new("LoadError"));
+    }
+}
+
+implement trait Error for struct LoadError {
+    source(&this) -> Option<virtual &Error> {
+        const cause: virtual &Error = &this.cause;
+        return Option::Some(cause);
+    }
+}
+
+/// The `IoError` a missing settings file gives.
+function missing_settings() -> IoError {
+    return IoError::new(IoErrorKind::NotFound, 2).with_context(IoOperation::Open, Path::new("settings.toml"));
+}
+
+/// The `Display` text of `error`.
+function text_of<E>(error: &E) -> String where E: Display {
+    match (format_to_string(error)) {
+        Result::Ok(text) => { return text; }
+        Result::Err(_) => { return String::new(); }
+    }
+}
+
+![test]
+function a_report_keeps_the_message_and_each_cause() -> Result<(), TestError> {
+    const error: LoadError = LoadError { cause: missing_settings() };
+    const report: ErrorReport = ErrorReport::from_error(&error);
+    expect(report.message().equals(&Str::new("could not load the settings")), Str::new("the report's message is the error's Display text"))?;
+    const cause_text: String = text_of(&missing_settings());
+    mut causes = report.causes();
+    match (causes.next()) {
+        Option::Some(cause) => {
+            expect(cause.equals(&cause_text.as_str()), Str::new("the first cause is the source's Display text"))?;
+        }
+        Option::None => { return expect(false, Str::new("the report has a cause")); }
+    }
+    return expect(causes.next().is_none(), Str::new("the IoError has no source of its own"));
+}
+
+![test]
+function a_report_prints_its_message_and_causes() -> Result<(), TestError> {
+    const error: LoadError = LoadError { cause: missing_settings() };
+    const report: ErrorReport = ErrorReport::from_error(&error);
+    mut expected: String = String::from_str(Str::new("could not load the settings: "));
+    expected.push(text_of(&missing_settings()).as_str());
+    expect(text_of(&report).as_str().equals(&expected.as_str()), Str::new("Display joins the message and causes with \": \""))?;
+    mut debug_expected: String = String::from_str(Str::new("could not load the settings\ncaused by: "));
+    debug_expected.push(text_of(&missing_settings()).as_str());
+    match (format_debug_to_string(&report)) {
+        Result::Ok(debug) => {
+            return expect(debug.as_str().equals(&debug_expected.as_str()), Str::new("Debug puts each cause on a line of its own"));
+        }
+        Result::Err(_) => { return expect(false, Str::new("Debug formats")); }
+    }
+}
+
+![test]
+function an_error_without_a_source_has_no_causes() -> Result<(), TestError> {
+    const report: ErrorReport = ErrorReport::from_error(&missing_settings());
+    expect(report.message().equals(&text_of(&missing_settings()).as_str()), Str::new("the message is the error's own"))?;
+    return expect(report.causes().next().is_none(), Str::new("no causes"));
+}
+
+/// Whether `error`'s report holds its `Display` text and no causes.
+function reports_itself<E>(error: &E) -> boolean where E: Error {
+    const report: ErrorReport = ErrorReport::from_error(error);
+    return report.message().equals(&text_of(error).as_str()) && report.causes().next().is_none();
+}
+
+![test]
+function every_standard_error_makes_a_report() -> Result<(), TestError> {
+    expect(reports_itself(&UrlError::MissingScheme), Str::new("UrlError"))?;
+    expect(reports_itself(&DecodeError::new(DecodeErrorKind::InvalidPadding, 3)), Str::new("DecodeError"))?;
+    expect(reports_itself(&ArgumentError::new(ArgumentErrorKind::UnknownOption, Str::new("--colour"))), Str::new("ArgumentError"))?;
+    expect(reports_itself(&SpawnError::ResourceLimit), Str::new("SpawnError"))?;
+    expect(reports_itself(&RecvError::Disconnected), Str::new("RecvError"))?;
+    expect(reports_itself(&TryRecvError::Empty), Str::new("TryRecvError"))?;
+    expect(reports_itself(&ReceiveTimeoutError::Timeout), Str::new("ReceiveTimeoutError"))?;
+    expect(reports_itself(&SendError::<i32> { value: 7 }), Str::new("SendError"))?;
+    expect(reports_itself(&JoinError::Cancelled), Str::new("JoinError"))?;
+    expect(reports_itself(&FmtError::Io(missing_settings())), Str::new("FmtError"))?;
+    expect(reports_itself(&RandomError::EmptyRange), Str::new("RandomError"))?;
+    expect(reports_itself(&AllocError::new(AllocErrorKind::OutOfMemory, Layout::new(8, 8))), Str::new("AllocError"))?;
+    expect(reports_itself(&ConversionError::new("out of range")), Str::new("ConversionError"))?;
+    expect(reports_itself(&DateTime::parse_rfc3339(Str::new("not a date")).unwrap_err()), Str::new("DateTimeError"))?;
+    expect(reports_itself(&missing_settings()), Str::new("IoError"))?;
+    return expect(reports_itself(&TestError::failed(Str::new("no"))), Str::new("TestError"));
+}
+
+![test]
+function the_receive_errors_say_what_happened() -> Result<(), TestError> {
+    expect(text_of(&TryRecvError::Empty).as_str().equals(&Str::new("no value is ready")), Str::new("TryRecvError::Empty"))?;
+    expect(text_of(&ReceiveTimeoutError::Timeout).as_str().equals(&Str::new("the time ran out")), Str::new("ReceiveTimeoutError::Timeout"))?;
+    return expect(text_of(&SpawnError::OutOfMemory).as_str().equals(&Str::new("could not start a thread: out of memory")), Str::new("SpawnError::OutOfMemory"));
+}
