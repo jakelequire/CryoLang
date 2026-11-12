@@ -4,10 +4,13 @@
 ///! `set_var`, `remove_var` and `vars` read and write environment
 ///! variables. Ending the process with a status code is `sys::exit`.
 ///!
-///! Argv comes from the C runtime: the generated `main(argc, argv)`
-///! calls `set_args` before user code runs, so `args()` returns the
-///! real argument vector. `current_dir`/`set_current_dir` wrap
-///! `getcwd`/`chdir`. `env::arguments` reads a command line against a
+///! On POSIX, argv comes from the C runtime: the generated
+///! `main(argc, argv)` calls `set_args` before user code runs, so `args()`
+///! returns the real argument vector. `current_dir`/`set_current_dir` wrap
+///! `getcwd`/`chdir`. On Windows every one of these goes through the
+///! wide-character (`W`) calls - the command line, the environment block,
+///! the working directory and the executable's path - converting UTF-16 to
+///! and from UTF-8, so non-ASCII arguments, variables and paths round-trip. `env::arguments` reads a command line against a
 ///! declaration of the flags, options and positional arguments a program
 ///! takes (`ArgumentParser`).
 
@@ -61,6 +64,7 @@ internal function set_env(envp: u8**) -> void {
 /// Program arguments as UTF-8 strings. The first element is the
 /// program name. Returns an empty array if the runtime hasn't
 /// published argv yet. Panics on allocation failure.
+![target(unix)]
 public function args() -> Array<String> {
     mut out: Array<String> = Array::new();
     if (argv_global == null) { return out; }
@@ -74,13 +78,57 @@ public function args() -> Array<String> {
     return out;
 }
 
+/// Program arguments as UTF-8 strings, from the wide command line split
+/// by `CommandLineToArgvW`, so non-ASCII arguments arrive intact; a
+/// lone surrogate in one reads as U+FFFD. The first element is the program
+/// name. Returns an empty array if the command line cannot be split.
+/// Panics on allocation failure.
+![target(windows)]
+public function args() -> Array<String> {
+    mut out: Array<String> = Array::new();
+    mut count: i32 = 0;
+    const vector: u16** = syscall::CommandLineToArgvW(syscall::GetCommandLineW(), &count);
+    if (vector == null) { return out; }
+    for (mut i: i32 = 0; i < count; i++) {
+        const units: u16* = vector[i as u64];
+        out.push(Utf16::decode_lossy(Slice::<u16>::from_raw(units, libc::wcslen(units) as i64)));
+    }
+    syscall::LocalFree(vector as u8*);
+    return out;
+}
+
 /// Read the environment variable `name`. Returns `None` if unset.
 /// The returned `String` owns a copy of the value.
+![target(unix)]
 public function var(name: Str) -> Option<String> {
     mut c_name: String = String::with_null(name);
     const raw: u8* = libc::getenv(c_name.as_ptr());
     if (raw == null) { return Option::None; }
     return Option::Some(String::from_str(Str::from(raw as string)));
+}
+
+/// Read the environment variable `name` through the wide-character call,
+/// so any name and value round-trip; a lone surrogate in the value reads
+/// as U+FFFD. Returns `None` if unset; a variable set to the empty string
+/// is `Some` of it. The returned `String` owns a copy of the value.
+![target(windows)]
+public function var(name: Str) -> Option<String> {
+    const wide_name: Array<u16> = Utf16::encode(name);
+    mut units: Array<u16> = Array::new();
+    units.resize(256, 0);
+    loop {
+        syscall::SetLastError(syscall::ERROR_SUCCESS);
+        const count: u32 = syscall::GetEnvironmentVariableW(wide_name.as_ptr(), &units[0], units.length() as u32);
+        if (count == 0 && syscall::GetLastError() == syscall::ERROR_ENVVAR_NOT_FOUND) {
+            return Option::None;
+        }
+        // A buffer too short is answered with the size it needs, the NUL
+        // included; one long enough, with the length written.
+        if (count < units.length()) {
+            return Option::Some(Utf16::decode_lossy(units.as_slice().subslice(0, count)));
+        }
+        units.resize(count, 0);
+    }
 }
 
 /// The process environment as `(key, value)` pairs, in the order the C
@@ -103,6 +151,7 @@ public function var(name: Str) -> Option<String> {
 /// A malformed entry with no `=` keeps the whole entry as the key with an
 /// empty value; POSIX guarantees `KEY=VALUE`, so this is only a defensive
 /// fallback.
+![target(unix)]
 public function vars() -> Array<Pair<String, String>> {
     mut out: Array<Pair<String, String>> = Array::new();
     if (envp_global == null) { return out; }
@@ -128,12 +177,47 @@ public function vars() -> Array<Pair<String, String>> {
     return out;
 }
 
+/// The process environment as `(key, value)` pairs, read from the wide
+/// environment block, so it includes what `set_var` and `remove_var`
+/// changed; a lone surrogate reads as U+FFFD. The block's entries that
+/// begin with `=` are the shell's record of each drive's working
+/// directory (`=C:=C:\work`), not variables, and are left out. Each pair
+/// owns copies of its key and value. Panics on allocation failure.
+![target(windows)]
+public function vars() -> Array<Pair<String, String>> {
+    mut out: Array<Pair<String, String>> = Array::new();
+    const block: u16* = syscall::GetEnvironmentStringsW();
+    if (block == null) { return out; }
+    const separator: Str = Str::new("=");
+    mut start: u64 = 0;
+    loop {
+        const length: u64 = libc::wcslen(&block[start]);
+        if (length == 0) { break; }
+        const entry: String = Utf16::decode_lossy(Slice::<u16>::from_raw(&block[start], length as i64));
+        start = start + length + 1;
+        const text: Str = entry.as_str();
+        if (text.starts_with(&separator)) { continue; }
+        match (text.find(&separator)) {
+            Option::Some(at) => {
+                out.push(Pair::<String, String>::new(String::from_str(text.sub_bytes(0, at)),
+                                                     String::from_str(text.sub_bytes(at + 1, text.length()))));
+            }
+            Option::None => {
+                out.push(Pair::<String, String>::new(String::from_str(text), String::new()));
+            }
+        }
+    }
+    syscall::FreeEnvironmentStringsW(block);
+    return out;
+}
+
 /// Set `name = value`, overwriting any existing binding. Returns
 /// `true` if the underlying call succeeded.
 ///
-/// Backed by `setenv(3)` on POSIX and `_putenv_s` on Windows
-/// (msvcrt).  `_putenv_s` always overwrites, matching POSIX
-/// `setenv(name, value, 1)`.
+/// Backed by `setenv(3)` on POSIX and `SetEnvironmentVariableW` on
+/// Windows, which always overwrites, matching POSIX
+/// `setenv(name, value, 1)`; an empty value sets the variable to the
+/// empty string on both.
 ![target(unix)]
 public function set_var(name: Str, value: Str) -> boolean {
     mut n: String = String::with_null(name);
@@ -144,15 +228,13 @@ public function set_var(name: Str, value: Str) -> boolean {
 
 ![target(windows)]
 public function set_var(name: Str, value: Str) -> boolean {
-    mut n: String = String::with_null(name);
-    mut v: String = String::with_null(value);
-    const rc: i32 = libc::_putenv_s(n.as_ptr(), v.as_ptr());
-    return rc == 0;
+    const wide_name: Array<u16> = Utf16::encode(name);
+    const wide_value: Array<u16> = Utf16::encode(value);
+    return syscall::SetEnvironmentVariableW(wide_name.as_ptr(), wide_value.as_ptr()) != 0;
 }
 
 /// Remove the binding for `name`.  Returns `true` if the underlying
-/// call succeeded.  On Windows the documented way to delete a binding
-/// is `_putenv_s(name, "")`.
+/// call succeeded, and for a name that had no binding.
 ![target(unix)]
 public function remove_var(name: Str) -> boolean {
     mut n: String = String::with_null(name);
@@ -162,12 +244,9 @@ public function remove_var(name: Str) -> boolean {
 
 ![target(windows)]
 public function remove_var(name: Str) -> boolean {
-    mut n: String = String::with_null(name);
-    // One-byte NUL buffer: the empty C string `_putenv_s` treats as
-    // "delete this binding".
-    mut empty: [u8; 1] = [0];
-    const rc: i32 = libc::_putenv_s(n.as_ptr(), &empty[0]);
-    return rc == 0;
+    const wide_name: Array<u16> = Utf16::encode(name);
+    if (syscall::SetEnvironmentVariableW(wide_name.as_ptr(), null) != 0) { return true; }
+    return syscall::GetLastError() == syscall::ERROR_ENVVAR_NOT_FOUND;
 }
 
 /// The directory for temporary files: `TMPDIR` if it is set and not
@@ -208,11 +287,32 @@ public function temp_directory() -> PathBuf {
 /// The process's current working directory as an owned `String`.
 /// Returns `None` if the path could not be read (e.g. it exceeds the
 /// 4096-byte buffer, or a parent component was removed/unreadable).
+![target(unix)]
 public function current_dir() -> Option<String> {
     mut buf: [u8; 4096];
     const rc: u8* = libc::getcwd(&buf[0], 4096);
     if (rc == null) { return Option::None; }
     return Option::Some(String::from_str(Str::from(rc as string)));
+}
+
+/// The process's current working directory as an owned `String`, read
+/// through the wide-character call, as Windows writes it (`\`
+/// separators). Returns `None` if it could not be read, or holds a lone
+/// surrogate no `String` can.
+![target(windows)]
+public function current_dir() -> Option<String> {
+    mut units: Array<u16> = Array::new();
+    units.resize(260, 0);
+    loop {
+        const count: u32 = syscall::GetCurrentDirectoryW(units.length() as u32, &units[0]);
+        if (count == 0) { return Option::None; }
+        // A buffer too short is answered with the size it needs, the NUL
+        // included; one long enough, with the length written.
+        if (count < units.length()) {
+            return Utf16::decode(units.as_slice().subslice(0, count)).ok();
+        }
+        units.resize(count, 0);
+    }
 }
 
 /// The running executable's absolute path as an owned `String`, or
@@ -232,22 +332,40 @@ public function current_exe() -> Option<String> {
     return Option::Some(String::from_str(Str::from(&buf[0] as string)));
 }
 
-/// See the Unix variant above.
+/// The running executable's absolute path as an owned `String`, asked of
+/// kernel32 through the wide-character call; `None` if it could not be
+/// read, or holds a lone surrogate no `String` can.
 ![target(windows)]
 public function current_exe() -> Option<String> {
-    mut buf: [u8; 4096];
-    // Returns the length written, or `nSize` on truncation - which is why
-    // the full-buffer case is rejected rather than accepted as a valid path.
-    const n: u32 = libc::GetModuleFileNameA(null, &buf[0], 4096);
-    if (n == 0 || n >= 4096) { return Option::None; }
-    buf[n as u64] = 0;
-    return Option::Some(String::from_str(Str::from(&buf[0] as string)));
+    mut units: Array<u16> = Array::new();
+    units.resize(260, 0);
+    loop {
+        // Answers the length written, or the buffer's whole size when the
+        // path was cut short to fit - so a full buffer is grown and asked
+        // again rather than taken as the path.
+        const count: u32 = libc::GetModuleFileNameW(null, &units[0], units.length() as u32);
+        if (count == 0) { return Option::None; }
+        if (count < units.length()) {
+            return Utf16::decode(units.as_slice().subslice(0, count)).ok();
+        }
+        units.resize(units.length() * 2, 0);
+    }
 }
 
 /// Change the process's current working directory to `path`. Returns
 /// `true` on success. This affects the whole process, not just the
 /// calling thread.
+![target(unix)]
 public function set_current_dir(path: Str) -> boolean {
     mut p: String = String::with_null(path);
     return libc::chdir(p.as_ptr()) == 0;
+}
+
+/// Change the process's current working directory to `path`, named
+/// through the wide-character call. Returns `true` on success. This
+/// affects the whole process, not just the calling thread.
+![target(windows)]
+public function set_current_dir(path: Str) -> boolean {
+    const wide: Array<u16> = Utf16::encode(path);
+    return syscall::SetCurrentDirectoryW(wide.as_ptr()) != 0;
 }

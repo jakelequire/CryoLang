@@ -1,8 +1,11 @@
 ///! UTF-16: the text encoding the Windows wide-character (`*W`) calls take.
 ///!
 ///! `Utf16::encode` turns UTF-8 text into NUL-terminated UTF-16 units, the
-///! form every `*W` path and name parameter expects; `Utf16::decode` turns
-///! units an OS call wrote back into a `String`. Both are plain Cryo, with no
+///! form every `*W` path and name parameter expects; `Utf16::encode_into`
+///! appends the units of UTF-8 bytes that arrive in pieces, leaving a
+///! character cut short for the next piece; `Utf16::decode` turns units an
+///! OS call wrote back into a `String`, refusing a lone surrogate, which
+///! `Utf16::decode_lossy` reads as U+FFFD instead. Both are plain Cryo, with no
 ///! OS dependency, so they build and behave the same on every target.
 
 namespace std::encoding::utf16;
@@ -19,6 +22,7 @@ private const SURROGATE_HIGH_FIRST: u32 = 0xD800;
 private const SURROGATE_LOW_FIRST:  u32 = 0xDC00;
 private const SURROGATE_LAST:       u32 = 0xDFFF;
 private const SUPPLEMENTARY_FIRST:  u32 = 0x10000;
+private const REPLACEMENT:          u32 = 0xFFFD;
 
 /// The UTF-16 codec. Stateless; its operations are statics.
 public type struct Utf16 {
@@ -27,17 +31,49 @@ public type struct Utf16 {
     /// U+FFFD, as `Str::chars` reads it.
     public static encode(text: Str) -> Array<u16> {
         mut units: Array<u16> = Array::<u16>::with_capacity(text.length() + 1);
-        for (scalar in text.chars()) {
-            if (scalar < SUPPLEMENTARY_FIRST) {
-                units.push(scalar as u16);
-            } else {
-                const offset: u32 = scalar - SUPPLEMENTARY_FIRST;
-                units.push((SURROGATE_HIGH_FIRST + (offset >> 10)) as u16);
-                units.push((SURROGATE_LOW_FIRST + (offset & 0x3FF)) as u16);
-            }
-        }
+        Utf16::push_text(text, &units);
         units.push(0);
         return units;
+    }
+
+    /// Append the UTF-16 units of the UTF-8 `bytes` to `out`, with no NUL,
+    /// and answer how many bytes were encoded: all of them except a
+    /// multi-byte sequence cut short at the end, which a later call
+    /// completes when those bytes are passed again ahead of the rest. Text
+    /// arriving in pieces, as a stream writes it, encodes this way without
+    /// splitting a character. A malformed byte encodes as U+FFFD, as in
+    /// `encode`.
+    public static encode_into(bytes: &Slice<u8>, out: mut &Array<u16>) -> i64 {
+        mut complete: i64 = bytes.length();
+        mut checked: i64 = 0;
+        loop {
+            match (Str::from_utf8(bytes.subslice(checked, complete))) {
+                Result::Ok(_) => { break; }
+                Result::Err(error) => {
+                    if (error.error_length.is_none()) {
+                        complete = checked + error.valid_up_to;
+                        break;
+                    }
+                    checked = checked + error.valid_up_to + 1;
+                }
+            }
+        }
+        Utf16::push_text(Str::from_raw(bytes.as_ptr(), complete), out);
+        return complete;
+    }
+
+    /// Append each scalar of `text` to `out` as one unit, or as a surrogate
+    /// pair above U+FFFF.
+    private static push_text(text: Str, out: mut &Array<u16>) -> void {
+        for (scalar in text.chars()) {
+            if (scalar < SUPPLEMENTARY_FIRST) {
+                out.push(scalar as u16);
+            } else {
+                const offset: u32 = scalar - SUPPLEMENTARY_FIRST;
+                out.push((SURROGATE_HIGH_FIRST + (offset >> 10)) as u16);
+                out.push((SURROGATE_LOW_FIRST + (offset & 0x3FF)) as u16);
+            }
+        }
     }
 
     /// The text in `units`, which end at the slice's end (a NUL unit, if
@@ -46,6 +82,22 @@ public type struct Utf16 {
     /// and its `error_length` is `None` when the input ends on a high
     /// surrogate whose pair could still follow.
     public static decode(units: &Slice<u16>) -> Result<String, Utf8Error> {
+        return Utf16::decode_replacing(units, false);
+    }
+
+    /// The text in `units`, as `decode` reads it, except that a surrogate
+    /// that is not half of a pair becomes U+FFFD instead of refusing the
+    /// whole. For text that must be read even when it is not well-formed,
+    /// such as a Windows argument or environment variable.
+    public static decode_lossy(units: &Slice<u16>) -> String {
+        match (Utf16::decode_replacing(units, true)) {
+            Result::Ok(text) => { return text; }
+            Result::Err(_) => { return String::new(); }
+        }
+    }
+
+    /// `decode`, or with `replace`, `decode_lossy`, which never fails.
+    private static decode_replacing(units: &Slice<u16>, replace: boolean) -> Result<String, Utf8Error> {
         mut text: String = String::with_capacity(units.length());
         const count: i64 = units.length();
         mut index: i64 = 0;
@@ -56,14 +108,19 @@ public type struct Utf16 {
                 index = index + 1;
                 continue;
             }
-            if (unit >= SURROGATE_LOW_FIRST) {
-                return Result::Err(Utf8Error { valid_up_to: index, error_length: Option::Some(1) });
+            mut low: u32 = 0;
+            if (unit < SURROGATE_LOW_FIRST && index + 1 < count) {
+                low = units[index + 1] as u32;
             }
-            if (index + 1 == count) {
-                return Result::Err(Utf8Error { valid_up_to: index, error_length: Option::None });
-            }
-            const low: u32 = units[index + 1] as u32;
             if (low < SURROGATE_LOW_FIRST || low > SURROGATE_LAST) {
+                if (replace) {
+                    text.push_char(REPLACEMENT as char);
+                    index = index + 1;
+                    continue;
+                }
+                if (unit < SURROGATE_LOW_FIRST && index + 1 == count) {
+                    return Result::Err(Utf8Error { valid_up_to: index, error_length: Option::None });
+                }
                 return Result::Err(Utf8Error { valid_up_to: index, error_length: Option::Some(1) });
             }
             const scalar: u32 = SUPPLEMENTARY_FIRST

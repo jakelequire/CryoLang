@@ -38,8 +38,10 @@ namespace std::fmt;
 
 import std::core::intrinsics;
 import std::ffi::libc;
+import std::core::slice::{ Slice };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
+import std::io::stdio::{ ConsoleOutput, STDOUT_FD, STDERR_FD };
 
 module {
     fmt::error;
@@ -97,7 +99,36 @@ public function format(fmt: string, args...) -> String {
 /// prefer an f-string through `println` (Display-based) below.
 ![language("printf")]
 public function printf(fmt: string, args...) -> i32 {
+    if (ConsoleOutput::attached(STDOUT_FD)) {
+        mut buffer: mut u8* = null;
+        const length: i32 = libc::vasprintf(&buffer, fmt, args);
+        // `length < 0` leaves `buffer` undefined, so it must not be read or freed.
+        if (length >= 0) {
+            write_if_console(STDOUT_FD, Slice::<u8>::from_raw(buffer, length));
+            libc::free(buffer);
+        }
+        return length;
+    }
     return libc::vprintf(fmt, args);
+}
+
+// The print family writes through the C streams, so that its output stays
+// in order with `printf`; except to a Windows console, which `ConsoleOutput`
+// writes as UTF-16 so that UTF-8 text shows as written.
+
+/// Write `bytes` to `descriptor` if it is a Windows console, answering
+/// whether it was one. What the C streams hold is flushed first, so the
+/// console write does not overtake it.
+private function write_if_console(descriptor: i32, bytes: &Slice<u8>) -> boolean {
+    if (!ConsoleOutput::attached(descriptor)) {
+        return false;
+    }
+    libc::fflush(null);
+    match (ConsoleOutput::write(descriptor, bytes)) {
+        Result::Ok(_) => { }
+        Result::Err(_) => { }
+    }
+    return true;
 }
 
 /// Write an already-formatted `String` (typically an f-string `f"{x}"`) to
@@ -109,6 +140,9 @@ public function printf(fmt: string, args...) -> i32 {
 /// `%s` stops at a zero byte even with a precision, so each run before an
 /// embedded zero is written by `%.*s` and the zero itself by `%c`.
 public function print(text: String) -> void {
+    if (write_if_console(STDOUT_FD, text.as_bytes())) {
+        return;
+    }
     mut rest: Str = text.as_str();
     loop {
         match (rest.find_byte(0)) {
@@ -127,7 +161,9 @@ public function print(text: String) -> void {
 /// Like `print`, followed by a newline.
 public function println(text: String) -> void {
     print(text);
-    libc::putchar(0x0A);
+    if (!write_if_console(STDOUT_FD, Str::new("\n").as_bytes())) {
+        libc::putchar(0x0A);
+    }
 }
 
 // Lazily-opened stderr stream for the `eprint` family.  libc's `stderr`
@@ -148,6 +184,16 @@ private function fmt_stderr_stream() -> void* {
 /// `printf` (see above).  Returns the number of bytes `vfprintf` reported.
 ![language("eprintf")]
 public function eprintf(fmt: string, args...) -> i32 {
+    if (ConsoleOutput::attached(STDERR_FD)) {
+        mut buffer: mut u8* = null;
+        const length: i32 = libc::vasprintf(&buffer, fmt, args);
+        // `length < 0` leaves `buffer` undefined, so it must not be read or freed.
+        if (length >= 0) {
+            write_if_console(STDERR_FD, Slice::<u8>::from_raw(buffer, length));
+            libc::free(buffer);
+        }
+        return length;
+    }
     const stream: void* = fmt_stderr_stream();
     const n: i32 = libc::vfprintf(stream, fmt, args);
     libc::fflush(stream);
@@ -157,6 +203,9 @@ public function eprintf(fmt: string, args...) -> i32 {
 /// Write an already-formatted `String` (typically an f-string) to stderr,
 /// then drop it.  Display-based counterpart to `eprintf`.
 public function eprint(text: String) -> void {
+    if (write_if_console(STDERR_FD, text.as_bytes())) {
+        return;
+    }
     const stream: void* = fmt_stderr_stream();
     libc::fwrite(text.as_ptr(), 1, text.length() as u64, stream);
     libc::fflush(stream);
@@ -164,6 +213,10 @@ public function eprint(text: String) -> void {
 
 /// Like `eprint`, followed by a newline.
 public function eprintln(text: String) -> void {
+    if (write_if_console(STDERR_FD, text.as_bytes())) {
+        write_if_console(STDERR_FD, Str::new("\n").as_bytes());
+        return;
+    }
     const stream: void* = fmt_stderr_stream();
     libc::fwrite(text.as_ptr(), 1, text.length() as u64, stream);
     libc::fputc(0x0A, stream);

@@ -1,0 +1,105 @@
+///! Standard output on a Windows console is written as UTF-16, converted
+///! from the UTF-8 bytes a program writes, a character cut short at the end
+///! of one write held for the next. The conversion is `Utf16::encode_into`,
+///! tested here directly. A console itself cannot be attached to an
+///! automated run, so what is tested of the stream is the other side: a
+///! pipe is not taken for a console, and gets the UTF-8 bytes as they were
+///! written, whichever way they were written.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::IoConsoleOutput;
+
+import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::core::slice::{ Slice };
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::encoding::utf16::{ Utf16 };
+import std::fmt;
+import std::io::stdio::{ stdout, Stdout };
+import std::io::traits::{ Write };
+import std::process::command::{ Command, Output };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_eq };
+import std::test::test_child::{ TestChild };
+
+// No line feed: on Windows the C runtime writes one to a pipe as CR LF.
+const TEXT: string = "a\u{2014}\u{e9}\u{1f600}";
+
+/// Whether `units` holds exactly `expected`.
+function units_are(units: &Array<u16>, expected: &Slice<u16>) -> boolean {
+    if (units.length() != expected.length()) { return false; }
+    for (mut i: i64 = 0; i < units.length(); i++) {
+        if (units[i] != expected[i]) { return false; }
+    }
+    return true;
+}
+
+![test]
+function whole_text_encodes_with_no_terminator() -> Result<(), TestError> {
+    const text: Str = Str::new("\u{e9}\u{1f600}");
+    mut units: Array<u16> = Array::new();
+    expect_eq(Utf16::encode_into(text.as_bytes(), &units), 6)?;
+    const expected: [u16; 3] = [0xE9, 0xD83D, 0xDE00];
+    return expect(units_are(&units, Slice::<u16>::from_raw(&expected[0], 3)), Str::new("a scalar and a surrogate pair, and no NUL"));
+}
+
+![test]
+function a_character_cut_short_waits_for_the_next_piece() -> Result<(), TestError> {
+    // "a" then the em dash U+2014, E2 80 94, cut after its first byte.
+    const bytes: Str = Str::new("a\u{2014}");
+    mut units: Array<u16> = Array::new();
+    expect_eq(Utf16::encode_into(bytes.as_bytes().subslice(0, 2), &units), 1)?;
+    const first: [u16; 1] = [0x61];
+    expect(units_are(&units, Slice::<u16>::from_raw(&first[0], 1)), Str::new("only the whole character is encoded"))?;
+    expect_eq(Utf16::encode_into(bytes.as_bytes().subslice(1, 4), &units), 3)?;
+    const both: [u16; 2] = [0x61, 0x2014];
+    return expect(units_are(&units, Slice::<u16>::from_raw(&both[0], 2)), Str::new("the held bytes complete the character"));
+}
+
+![test]
+function a_malformed_byte_is_a_replacement_character() -> Result<(), TestError> {
+    const bytes: [u8; 3] = [0x61, 0xFF, 0x62];
+    mut units: Array<u16> = Array::new();
+    expect_eq(Utf16::encode_into(Slice::<u8>::from_raw(&bytes[0], 3), &units), 3)?;
+    const expected: [u16; 3] = [0x61, 0xFFFD, 0x62];
+    return expect(units_are(&units, Slice::<u16>::from_raw(&expected[0], 3)), Str::new("U+FFFD stands for the malformed byte"));
+}
+
+![test]
+function a_malformed_byte_before_a_cut_short_character() -> Result<(), TestError> {
+    const bytes: [u8; 3] = [0xFF, 0xE2, 0x80];
+    mut units: Array<u16> = Array::new();
+    expect_eq(Utf16::encode_into(Slice::<u8>::from_raw(&bytes[0], 3), &units), 1)?;
+    const expected: [u16; 1] = [0xFFFD];
+    return expect(units_are(&units, Slice::<u16>::from_raw(&expected[0], 1)), Str::new("the malformed byte is encoded and the cut-short character held"));
+}
+
+/// Writes `TEXT` to stdout a byte at a time, then through `print` and
+/// `printf`, and once to stderr through `eprint`.
+![test_child]
+function writes_text_in_pieces() -> Result<(), TestError> {
+    const bytes: &Slice<u8> = Str::new(TEXT).as_bytes();
+    mut out: Stdout = stdout();
+    for (mut i: i64 = 0; i < bytes.length(); i++) {
+        out.write(bytes.subslice(i, i + 1))?;
+    }
+    fmt::print(String::from_str(Str::new(TEXT)));
+    fmt::printf("%s", TEXT);
+    fmt::eprint(String::from_str(Str::new(TEXT)));
+    return Result::Ok(());
+}
+
+![test]
+function a_pipe_gets_the_bytes_as_written() -> Result<(), TestError> {
+    const command: Command = TestChild::command(Str::new("CryoTests::Tests::Stdlib::IoConsoleOutput::writes_text_in_pieces"))?;
+    const output: Output = command.output()?;
+    expect_eq(output.status().exit_code(), Option::Some(0))?;
+    mut expected: String = String::new();
+    expected.push(Str::new(TEXT));
+    expected.push(Str::new(TEXT));
+    expected.push(Str::new(TEXT));
+    expect(Str::from(output.stdout()).equals(&expected.as_str()), Str::new("stdout holds the UTF-8 bytes written, three times"))?;
+    return expect(Str::from(output.stderr()).equals(&Str::new(TEXT)), Str::new("stderr holds the UTF-8 bytes written"));
+}

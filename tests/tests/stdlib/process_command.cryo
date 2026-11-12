@@ -24,8 +24,11 @@ import std::process::command::{ Command, Output, Stdio };
 import std::process::child::{ Child, ChildStdout, ExitStatus };
 import std::process::signal::{ Signal };
 import std::process::memory::{ SystemMemory };
-import std::fs::path::{ Path };
+import std::fs::path::{ Path, PathBuf };
 import std::fs::file::{ File };
+import std::fs::directory::{ Directory };
+import std::fmt;
+import std::test::test_child::{ TestChild };
 import std::time::duration::{ Duration };
 import std::time::clock::{ Instant };
 import std::random;
@@ -312,6 +315,13 @@ function signal_from_a_number_is_checked() -> Result<(), TestError> {
     expect(Signal::from_i32(9).unwrap().as_i32() == 9, Str::new("9 is kill"))?;
     expect(Signal::from_i32(0).is_none(), Str::new("0 names no signal"))?;
     return expect(Signal::from_i32(16).is_none(), Str::new("16 names none of the signals"));
+}
+
+/// Two signals are equal when they are the same signal, however made.
+![test]
+function signals_compare_by_number() -> Result<(), TestError> {
+    expect(Signal::from_i32(2).unwrap() == Signal::interrupt(), Str::new("2 is the interrupt"))?;
+    return expect(Signal::interrupt() != Signal::kill(), Str::new("the interrupt is not kill"));
 }
 
 /// `kill_tree` ends the grandchild too: the pipe the whole tree holds
@@ -939,4 +949,49 @@ function same_as_stdout_is_refused_for_stdout() -> Result<(), TestError> {
             return expect(e.kind == IoErrorKind::InvalidInput, Str::new("refused with InvalidInput"));
         }
     }
+}
+
+const WIDE_ARGUMENT: string = "arg \u{e9}\u{2014}\u{1f600} \"quoted\"";
+const WIDE_NAME: string = "CRYO_TEST_WIDE_\u{e9}";
+const WIDE_VALUE: string = "value \u{4e2d}";
+const WIDE_DIRECTORY: string = "cryo-spawn-d\u{e9}\u{4e2d}";
+
+/// Prints the one argument after its role's own, the variable `WIDE_NAME`
+/// and its working directory, a line each.
+![test_child]
+function reports_argument_variable_and_directory() -> Result<(), TestError> {
+    const arguments: Array<String> = env::args();
+    fmt::println(f"argument: {arguments[arguments.length() - 1]}");
+    match (env::var(Str::new(WIDE_NAME))) {
+        Option::Some(value) => { fmt::println(f"variable: {value}"); }
+        Option::None => { fmt::println(f"variable: (unset)"); }
+    }
+    match (env::current_dir()) {
+        Option::Some(directory) => { fmt::println(f"directory: {directory}"); }
+        Option::None => { fmt::println(f"directory: (unreadable)"); }
+    }
+    return Result::Ok(());
+}
+
+// The command line, an environment override and the working directory
+// reach a child intact when they are not ASCII (on Windows: CreateProcessW
+// with a UTF-16 command line, environment block and directory).
+![test]
+function a_child_gets_non_ascii_argument_variable_and_directory() -> Result<(), TestError> {
+    const directory: PathBuf = env::temp_directory().join(Str::new(WIDE_DIRECTORY));
+    match (Directory::remove_all(directory.as_path())) { Result::Ok(_) => { } Result::Err(_) => { } }
+    Directory::create(directory.as_path())?;
+    mut command: Command = TestChild::command(Str::new("CryoTests::Tests::Stdlib::ProcessCommand::reports_argument_variable_and_directory"))?;
+    command.arg(Str::new(WIDE_ARGUMENT))
+           .env(Str::new(WIDE_NAME), Str::new(WIDE_VALUE))
+           .current_directory(directory.as_path().as_str());
+    const output: Output = command.output()?;
+    match (Directory::remove(directory.as_path())) { Result::Ok(_) => { } Result::Err(_) => { } }
+    expect_eq(output.status().exit_code(), Option::Some(0))?;
+    const text: Str = Str::from(output.stdout());
+    const argument_line: String = f"argument: {WIDE_ARGUMENT}";
+    const variable_line: String = f"variable: {WIDE_VALUE}";
+    expect(text.contains(&argument_line.as_str()), Str::new("the argument arrives intact"))?;
+    expect(text.contains(&variable_line.as_str()), Str::new("the variable arrives, name and value intact"))?;
+    return expect(text.contains(&Str::new(WIDE_DIRECTORY)), Str::new("the child starts in the directory named"));
 }
