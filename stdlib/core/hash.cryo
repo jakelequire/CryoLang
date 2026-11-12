@@ -17,6 +17,8 @@ import std::core::option::{ Option };
 import std::core::slice::{ Slice };
 import std::core::mem;
 
+/// A running hash state that values feed their bytes into, one `write_*`
+/// call at a time; `finish` reads the digest of everything fed so far.
 ![language("hasher")]
 public type trait Hasher {
     /// Feed a single byte into the hash state.
@@ -113,8 +115,13 @@ public type trait Hasher {
     finish(&this) -> u64;
 }
 
+/// A type whose values can be hashed, so they can key a `HashMap` or sit
+/// in a `HashSet`. Values that are equal under `Eq` must feed the same
+/// bytes. A type takes it with `with [Hash]` on its declaration, or by
+/// implementing `hash` by hand.
 ![language("hash")]
 public type trait Hash {
+    /// Feed this value's bytes into `hasher`.
     hash<H>(&this, hasher: mut &H) -> void
     where H: Hasher;
 }
@@ -124,6 +131,7 @@ public type trait Hash {
 public type struct FnvHasher {
     private state: u64;
 
+    /// A hasher at the offset basis, the start of every FNV-1a digest.
     public static new() -> FnvHasher {
         return FnvHasher { state: FNV_OFFSET_BASIS };
     }
@@ -143,7 +151,9 @@ public type struct FnvHasher {
 
 }
 
+/// The 64-bit FNV prime each byte's state is multiplied by.
 public const FNV_PRIME:        u64 = 1099511628211;
+/// The 64-bit FNV offset basis: the state before any byte.
 public const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
 
 /// A default `FnvHasher` starts from the offset basis, as `new` does.
@@ -164,7 +174,9 @@ implement trait Hasher for struct FnvHasher {
     }
 }
 
+/// The 128-bit FNV prime each byte's state is multiplied by.
 public const FNV128_PRIME:        u128 = 309485009821345068724781371;
+/// The 128-bit FNV offset basis: the state before any byte.
 public const FNV128_OFFSET_BASIS: u128 = 144066263297769815596495629667062367629;
 
 /// 128-bit FNV-1a. Same construction as `FnvHasher`, twice the width.
@@ -179,6 +191,7 @@ public const FNV128_OFFSET_BASIS: u128 = 144066263297769815596495629667062367629
 public type struct Fnv128Hasher {
     private state: u128;
 
+    /// A hasher at the 128-bit offset basis.
     public static new() -> Fnv128Hasher {
         return Fnv128Hasher { state: FNV128_OFFSET_BASIS };
     }
@@ -204,6 +217,7 @@ public type struct Fnv128Hasher {
         return (this.state >> 64) as u64;
     }
 
+    /// The low 64 bits of the 128-bit state.
     public low64(&this) -> u64 {
         return this.state as u64;
     }
@@ -243,10 +257,15 @@ public type struct SipHasher {
     private compression_rounds: u64;
     private finalization_rounds: u64;
 
+    /// A SipHash-1-3 hasher keyed by the two halves of a 128-bit key.
+    /// Keep the key secret, and draw it at random, for the hash to resist
+    /// chosen collisions.
     public static with_keys_1_3(key0: u64, key1: u64) -> SipHasher {
         return SipHasher::keyed(key0, key1, 1, 3);
     }
 
+    /// A SipHash-2-4 hasher keyed by the two halves of a 128-bit key: the
+    /// standard form, about half the speed of `with_keys_1_3`.
     public static with_keys_2_4(key0: u64, key1: u64) -> SipHasher {
         return SipHasher::keyed(key0, key1, 2, 4);
     }
@@ -387,6 +406,15 @@ implement trait Hasher for struct SipHasher {
 // prime inline, and there's no per-type entry point to keep in sync. For a
 // running digest over several mixed values, drive a `FnvHasher` directly
 // with `fold` / `finish`.
+/// The 64-bit FNV-1a digest of `value`'s `Hash` bytes: the same for the
+/// same value on every run and every machine. Not keyed, so not for
+/// tables whose keys an adversary picks.
+///
+/// ```cryo
+/// import std::core::hash;
+///
+/// const id: u64 = hash::digest(&Str::new("main.cryo"));
+/// ```
 public function digest<T>(value: &T) -> u64
 where T: Hash {
     mut h: FnvHasher = FnvHasher::new();
