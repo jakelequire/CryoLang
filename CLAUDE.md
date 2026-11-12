@@ -37,7 +37,8 @@ make check-fast          # verify's and verify-pin's self-tests + pin integrity,
                          # Run before committing.
 make lsp-check           # compile tools/CryoLSP with the compiler under test
 make warnings-check      # compiler/ + stdlib archive built with -Werror by the compiler
-                         # under test; DELETES the host's prebuilt stdlib archives first
+                         # under test, the stdlib for both OSes and both panic strategies;
+                         # DELETES the host's prebuilt stdlib archives first
 make cross-check         # runtime/stdlib/compiler/LSP for the OTHER OS, objects only, ~80s;
                          # from WINDOWS only - a Linux host links the windows-gnu
                          # build and fails without mingw + the LLVM-C import lib
@@ -126,9 +127,10 @@ not done. The remaining limits are here so nobody rediscovers them:
 - **A diagnostic emitted with no `-->` span cannot be pinned to anything.**
   E0236 is one; its negative test can assert the code alone.
 - **`doc-coverage-check` does not count the functions of an `extern`
-  block** (libc, the OS calls): they bind a foreign interface whose documentation is the
-  platform's, so an undocumented binding passes. It counts by name, so a declaration written once per target reads documented
-  only when every copy is. It reads only that a doc comment is there, not
+  block** (libc, the OS calls): they bind a foreign interface whose
+  documentation is the platform's, so an undocumented binding passes. It
+  counts by name, so a declaration written once per target reads
+  documented only when every copy is. It reads only that a doc comment is there, not
   what it says.
 - **`selfhost-check` proves stability, not correctness.** Stage 3 builds
   stage 4, so a miscompile that reproduces itself is invisible to it.
@@ -543,8 +545,11 @@ with no diff to check it against.
   key - so a check that does not remove them proves nothing about the
   stdlib), then builds the stdlib on its own with `--panic=abort
   -Werror`, since the compiler's archive unwinds and config gating keeps
-  a different set of declarations under each strategy. Only the host's
-  OS is analysed: a warning in another OS's gated half is not seen. Its stdlib modules'
+  a different set of declarations under each strategy, and then for the
+  other OS's triple under both (`--target`, objects only), since gating
+  removes that OS's half from every host build. A warning is only what
+  the lints report: an unused function is W0002 only when it is
+  `private`, so a planted control must be. Its stdlib modules'
   objects hold only the generic instances the archive lacks, and one left
   with nothing writes no object. verify hashes the archives as a third population (`stdlib`); a
   baseline compiler that links none leaves that population empty and its
