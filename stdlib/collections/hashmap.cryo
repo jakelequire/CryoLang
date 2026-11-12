@@ -31,6 +31,7 @@ import std::alloc::allocator::{ AllocError, AllocErrorKind, Allocator, GlobalAll
 import std::collections::pair::{ Pair };
 import std::random::secure::{ SecureRng };
 import std::ffi::libc;
+import std::math;
 
 private const INITIAL_BUCKETS: u64 = 8;
 
@@ -149,7 +150,9 @@ public type struct HashMap<K, V, A = GlobalAlloc, H = SipHasher> where A: Alloca
     where H: Default {
         mut map: HashMap<K, V, GlobalAlloc, H> = HashMap::<K, V, GlobalAlloc, H>::new();
         if (capacity > 0) {
-            const count: u64 = next_pow2(capacity as u64);
+            // A hint of at most `i64::MAX` rounds to at most 2^63 buckets,
+            // whose allocation then fails loudly.
+            const count: u64 = math::next_power_of_two(capacity as u64);
             match (map.resize_buckets(count)) {
                 Result::Ok(_) => { }
                 Result::Err(_) => {
@@ -833,22 +836,6 @@ public function hash_int(value: u64) -> u64 {
     x = x * 0xc4ceb9fe1a85ec53;
     x = x ^ (x >> 33);
     return x;
-}
-
-/// Round `n` up to the next power of two. Assumes `n > 0`.
-private function next_pow2(n: u64) -> u64 {
-    // 2^63 is the largest power of two representable in u64. For any larger
-    // `n`, doubling `p` past 2^63 wraps to 0 and `0 < n` stays true forever
-    // (an unbounded-CPU hang reachable from `HashMap::with_capacity` with an
-    // untrusted size hint). Saturate instead; the caller's resize then fails
-    // the allocation loudly rather than spinning.
-    const MAX_POW2: u64 = (u64::MAX >> 1) + 1;
-    if (n >= MAX_POW2) { return MAX_POW2; }
-    mut p: u64 = 1;
-    while (p < n) {
-        p = p * 2;
-    }
-    return p;
 }
 
 // Entry allocation

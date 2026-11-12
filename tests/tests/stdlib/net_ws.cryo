@@ -36,7 +36,7 @@ import std::io::traits;
 import std::io::buf::{ BufStream };
 import std::net::addr::socket_addr::{ SocketAddr };
 import std::net::socket::tcp::{ TcpAccept, TcpAccepted, TcpConnect, TcpListener, TcpStream };
-import std::net::ws::frame::{ OpCode };
+import std::net::ws::frame::{ Frame, OpCode };
 import std::net::ws::conn::{ accept, connect, Message, WebSocket };
 import std::net::ws::handshake::{ compute_accept, generate_key };
 import std::test::error::{ TestError };
@@ -383,4 +383,144 @@ function ping_is_answered_inline_without_losing_the_message() -> Result<(), Test
     mut ex: Executor = Executor::new();
     const r: i64 = ex.block_on(ws_ping_pair(l, port));
     return expect_eq(r, 1 as i64);
+}
+
+// ============================================================================
+// The closing handshake and text validation
+// ============================================================================
+
+/// The frame each case sends, pipelined behind the upgrade request:
+///   0 - Close 1000 with the reason "bye", which the server echoes;
+///   1 - text that is not UTF-8 (0xC3 0x28), answered with 1007;
+///   2 - a Close of one byte, answered with 1002;
+///   3 - Close 1005, a code no peer may send, answered with 1002.
+/// Returns the status code of the Close the server sends back, or a
+/// negative step code.
+async function ws_raw_client(port: u16, case: i64) -> i64 {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -10; }
+    };
+    mut c: BufStream<TcpStream> = BufStream::<TcpStream>::of(sock);
+    mut req: String = String::with_capacity(200);
+    req.push(Str::new("GET /chat HTTP/1.1\r\n"));
+    req.push(Str::new("Host: 127.0.0.1\r\n"));
+    req.push(Str::new("Upgrade: websocket\r\n"));
+    req.push(Str::new("Connection: Upgrade\r\n"));
+    req.push(Str::new("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"));
+    req.push(Str::new("Sec-WebSocket-Version: 13\r\n\r\n"));
+    match (c.pending().try_append(req.as_str().as_bytes())) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -11; }
+    }
+    mut queued: boolean = false;
+    {
+        mut body: Array<u8> = Array::<u8>::new();
+        if (case == 0) {
+            body.push(0x03); body.push(0xE8);
+            body.append(Str::new("bye").as_bytes());
+            queued = c.queue_frame(true, OpCode::Close, body.as_slice(), true).is_ok();
+        } else if (case == 1) {
+            body.push(0xC3); body.push(0x28);
+            queued = c.queue_frame(true, OpCode::Text, body.as_slice(), true).is_ok();
+        } else if (case == 2) {
+            body.push(0x03);
+            queued = c.queue_frame(true, OpCode::Close, body.as_slice(), true).is_ok();
+        } else {
+            body.push(0x03); body.push(0xED);
+            queued = c.queue_frame(true, OpCode::Close, body.as_slice(), true).is_ok();
+        }
+    }
+    if (!queued) { return -12; }
+    match (await c.flush()) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -13; }
+    }
+    loop {
+        mut line: String = match (await c.read_line(4096)) {
+            Result::Ok(v)  => { v }
+            Result::Err(_) => { return -14; }
+        };
+        if (line.is_empty()) { break; }
+    }
+    mut answer: Frame = match (await c.read_frame()) {
+        Result::Ok(f)  => { f }
+        Result::Err(_) => { return -15; }
+    };
+    const is_close: boolean = match (answer.opcode) {
+        OpCode::Close => { true }
+        _             => { false }
+    };
+    if (!is_close) { return -16; }
+    const status: &slice::Slice<u8> = answer.payload.as_slice();
+    if (status.length() != 2) { return -17; }
+    return (((status[0] as i64) << 8) | (status[1] as i64));
+}
+
+/// Accept, upgrade and read one message. Returns 1 when `recv` answered as
+/// the case requires - `Message::Close` for case 0, an error otherwise -
+/// and a negative step code when it did not.
+async function ws_raw_server(listener: TcpListener, case: i64) -> i64 {
+    mut sock: TcpStream = match (await ws_accept_one(listener)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -100; }
+    };
+    mut ws: WebSocket<TcpStream> = match (await accept(sock)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -101; }
+    };
+    match (await ws.recv()) {
+        Result::Ok(msg) => {
+            const closed: boolean = match (msg) {
+                Message::Close     => { true }
+                Message::Text(s)   => { mut _owned: String = s; false }
+                Message::Binary(b) => { mut _bytes: Array<u8> = b; false }
+            };
+            if (closed && case == 0) { return 1; }
+            return -102;
+        }
+        Result::Err(_) => {
+            if (case == 0) { return -103; }
+            return 1;
+        }
+    }
+}
+
+async function ws_raw_pair(listener: TcpListener, port: u16, case: i64) -> (i64, i64) {
+    return await Futures::join(ws_raw_server(listener, case), ws_raw_client(port, case));
+}
+
+/// The server's result and the status its Close carried, for one case.
+function ws_raw_case(case: i64) -> (i64, i64) {
+    mut l: TcpListener = match (ws_bind()) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return (-1000, -1000); }
+    };
+    const port: u16 = ws_port(&l);
+    mut ex: Executor = Executor::new();
+    return ex.block_on(ws_raw_pair(l, port, case));
+}
+
+![test]
+function close_is_answered_with_its_own_status() -> Result<(), TestError> {
+    const r: (i64, i64) = ws_raw_case(0);
+    expect_eq(r.0, 1 as i64)?;
+    return expect_eq(r.1, 1000 as i64);
+}
+
+![test]
+function text_that_is_not_utf8_fails_the_connection_with_1007() -> Result<(), TestError> {
+    const r: (i64, i64) = ws_raw_case(1);
+    expect_eq(r.0, 1 as i64)?;
+    return expect_eq(r.1, 1007 as i64);
+}
+
+![test]
+function malformed_close_is_answered_with_1002() -> Result<(), TestError> {
+    const short: (i64, i64) = ws_raw_case(2);
+    expect_eq(short.0, 1 as i64)?;
+    expect_eq(short.1, 1002 as i64)?;
+    const reserved: (i64, i64) = ws_raw_case(3);
+    expect_eq(reserved.0, 1 as i64)?;
+    return expect_eq(reserved.1, 1002 as i64);
 }

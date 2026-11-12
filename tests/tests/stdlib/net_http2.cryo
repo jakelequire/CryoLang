@@ -51,8 +51,12 @@ import std::net::addr::url::{ Url };
 import std::net::http::client::{ Client };
 import std::net::http2::server::{ Http2Server };
 import std::net::http2::connection::{ Http2Connection };
+import std::net::http2::frame::{ Frame };
+import std::net::http2::settings::{ Settings };
+import std::io::bytes::{ ByteReader };
+import std::core::mem;
 import std::test::error::{ TestError };
-import std::test::assert::{ bail, expect_eq };
+import std::test::assert::{ bail, expect, expect_eq };
 import std::future::combinator::{ Futures };
 import std::future::executor::{ Executor };
 
@@ -284,7 +288,59 @@ async function h2_handshake_then_close(port: u16) -> i64 {
     }
 }
 
+/// A client that sends the preface and a SETTINGS frame with
+/// `SETTINGS_ENABLE_PUSH = 2`, which the protocol forbids, then reads two
+/// frames: the server's own SETTINGS and its answer. Returns the error code
+/// of a GOAWAY answer, or a negative step code; an acknowledgement in its
+/// place, which means the value was taken, is -66.
+async function h2_bad_settings_client(port: u16) -> i64 {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -60; }
+    };
+    mut c: BufStream<TcpStream> = BufStream::<TcpStream>::of(sock);
+    match (c.pending().try_append(Str::new("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").as_bytes())) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -61; }
+    }
+    mut queued: boolean = false;
+    {
+        mut payload: Array<u8> = Array::<u8>::new();
+        settings::push_entry(&payload, settings::SETTINGS_ENABLE_PUSH, 2);
+        queued = c.queue_h2_frame(frame::FRAME_SETTINGS, 0, 0, payload.as_slice()).is_ok();
+    }
+    if (!queued) { return -62; }
+    match (await c.flush()) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -63; }
+    }
+    mut first: Frame = match (await c.read_h2_frame(16384)) {
+        Result::Ok(f)  => { f }
+        Result::Err(_) => { return -64; }
+    };
+    const first_is_settings: boolean = first.ftype == frame::FRAME_SETTINGS && !first.has_flag(frame::FLAG_ACK);
+    mem::drop(first);
+    if (!first_is_settings) { return -65; }
+    mut answer: Frame = match (await c.read_h2_frame(16384)) {
+        Result::Ok(f)  => { f }
+        Result::Err(_) => { return -67; }
+    };
+    if (answer.ftype != frame::FRAME_GOAWAY) { return -66; }
+    mut fields: ByteReader = ByteReader::new(answer.payload.as_slice());
+    const last_stream: u32 = fields.read_u32_big_endian().unwrap_or(999);
+    const code: u32 = fields.read_u32_big_endian().unwrap_or(999);
+    if (last_stream != 0) { return -68; }
+    return code as i64;
+}
+
 // ---- joins ------------------------------------------------------------------
+
+/// The server's result and the client's, unchanged, so the test can tell
+/// which side went wrong.
+async function h2_join_bad_settings(port: u16, server: Http2Server) -> (i64, i64) {
+    return await Futures::join(h2_serve_one(server, h2_handler),
+                               h2_bad_settings_client(port));
+}
 
 async function h2_join_get(port: u16, server: Http2Server) -> i64 {
     const pair: (i64, i64) = await Futures::join(h2_serve_one(server, h2_handler),
@@ -435,4 +491,67 @@ function h2c_loopback_client_close_ends_the_server_loop() -> Result<(), TestErro
     // connection was actually released.
     if (r != 1) { return expect_eq(r, 1 as i64); }
     return expect_eq(g_served, 0 as i64);
+}
+
+/// The server ends a connection whose SETTINGS the protocol forbids with
+/// a GOAWAY naming the error, and reports the failure itself.
+![test]
+function h2c_loopback_forbidden_setting_is_answered_with_goaway() -> Result<(), TestError> {
+    g_served = 0; g_body_seen = 0; g_headers_seen = 0;
+    mut server: Http2Server = match (h2_bind()) {
+        Result::Ok(s)  => { s }
+        Result::Err(_) => { return bail(Str::new("h2 bind 127.0.0.1:0 failed")); }
+    };
+    const port: u16 = match (server.local_addr()) {
+        Result::Ok(a)  => { a.port }
+        Result::Err(_) => { return bail(Str::new("local_addr failed")); }
+    };
+    mut ex: Executor = Executor::new();
+    const pair: (i64, i64) = ex.block_on(h2_join_bad_settings(port, server));
+    expect_eq(pair.1, frame::PROTOCOL_ERROR as i64)?;
+    expect_eq(pair.0, -1 as i64)?;
+    return expect_eq(g_served, 0 as i64);
+}
+
+/// The code a refused setting carries, or `u32::MAX` when it was taken.
+function refusal_code(outcome: Result<(), u32>) -> u32 {
+    return match (outcome) {
+        Result::Ok(_)     => { u32::MAX }
+        Result::Err(code) => { code }
+    };
+}
+
+![test]
+function settings_take_each_bound_and_refuse_past_it() -> Result<(), TestError> {
+    mut s: Settings = Settings::defaults();
+    expect_eq(refusal_code(s.apply_one(settings::SETTINGS_ENABLE_PUSH, 0)), u32::MAX)?;
+    expect_eq(refusal_code(s.apply_one(settings::SETTINGS_ENABLE_PUSH, 1)), u32::MAX)?;
+    expect_eq(refusal_code(s.apply_one(settings::SETTINGS_ENABLE_PUSH, 2)), frame::PROTOCOL_ERROR)?;
+    expect_eq(s.enable_push, 1)?;
+    expect_eq(refusal_code(s.apply_one(settings::SETTINGS_INITIAL_WINDOW_SIZE, 2147483647)), u32::MAX)?;
+    expect_eq(refusal_code(s.apply_one(settings::SETTINGS_INITIAL_WINDOW_SIZE, 2147483648)),
+        frame::FLOW_CONTROL_ERROR)?;
+    expect_eq(s.initial_window_size, 2147483647)?;
+    expect_eq(refusal_code(s.apply_one(settings::SETTINGS_MAX_FRAME_SIZE, 16384)), u32::MAX)?;
+    expect_eq(refusal_code(s.apply_one(settings::SETTINGS_MAX_FRAME_SIZE, 16777215)), u32::MAX)?;
+    expect_eq(refusal_code(s.apply_one(settings::SETTINGS_MAX_FRAME_SIZE, 16383)), frame::PROTOCOL_ERROR)?;
+    expect_eq(refusal_code(s.apply_one(settings::SETTINGS_MAX_FRAME_SIZE, 16777216)), frame::PROTOCOL_ERROR)?;
+    expect_eq(refusal_code(s.apply_one(settings::SETTINGS_MAX_FRAME_SIZE, 0)), frame::PROTOCOL_ERROR)?;
+    expect_eq(s.max_frame_size, 16777215)?;
+    // An identifier the protocol does not define is ignored, whatever its value.
+    return expect_eq(refusal_code(s.apply_one(0x99, u32::MAX)), u32::MAX);
+}
+
+![test]
+function settings_payload_stops_at_the_first_refusal() -> Result<(), TestError> {
+    mut s: Settings = Settings::defaults();
+    mut payload: Array<u8> = Array::<u8>::new();
+    settings::push_entry(&payload, settings::SETTINGS_HEADER_TABLE_SIZE, 100);
+    settings::push_entry(&payload, settings::SETTINGS_ENABLE_PUSH, 5);
+    settings::push_entry(&payload, settings::SETTINGS_MAX_FRAME_SIZE, 20000);
+    expect_eq(refusal_code(s.apply_payload(payload.as_slice())), frame::PROTOCOL_ERROR)?;
+    expect_eq(s.header_table_size, 100)?;
+    expect_eq(s.max_frame_size, 16384)?;
+    payload.push(0);
+    return expect_eq(refusal_code(s.apply_payload(payload.as_slice())), frame::FRAME_SIZE_ERROR);
 }
