@@ -162,6 +162,10 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     /// New client-side connection taking ownership of `conn`, coding its
     /// header blocks with `codec`.
     public static new_client_with_codec(conn: BufStream<S>, codec: C) -> Http2Connection<S, C> {
+        // A server never accepts pushed streams, so its SETTINGS_ENABLE_PUSH
+        // starts at 0 and a SETTINGS frame that sets it is refused.
+        mut server_settings: Settings = Settings::defaults();
+        server_settings.enable_push = 0;
         return Http2Connection::<S, C> {
             conn:                  conn,
             codec:                 codec,
@@ -169,7 +173,7 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
             next_stream_id:        1,
             goaway_received:       false,
             last_peer_stream_id:   0,
-            remote_settings:       Settings::defaults(),
+            remote_settings:       server_settings,
             conn_send_window:      DEFAULT_CONNECTION_WINDOW,
             stream_send_window:    65535
         };
@@ -305,9 +309,21 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
                 }
                 return Result::Ok(true);
             }
+            const previous_window: i64 = this.remote_settings.initial_window_size as i64;
             match (this.remote_settings.apply_payload(fr.payload.as_slice())) {
                 Result::Ok(_)     => { }
                 Result::Err(code) => { return Result::Err(this.fail_connection(code)); }
+            }
+            if (this.is_client && this.remote_settings.enable_push != 0) {
+                return Result::Err(this.fail_connection(frame::PROTOCOL_ERROR));
+            }
+            // A new initial window moves the open stream's window by the
+            // difference, which may leave it negative; past 2^31 - 1 it is
+            // a connection error.
+            this.stream_send_window = this.stream_send_window
+                + (this.remote_settings.initial_window_size as i64) - previous_window;
+            if (this.stream_send_window > settings::MAX_WINDOW_SIZE as i64) {
+                return Result::Err(this.fail_connection(frame::FLOW_CONTROL_ERROR));
             }
             // Our encoder must not exceed the peer's decoder table size.
             this.codec.limit_encoder_table(this.remote_settings.header_table_size as i64);
