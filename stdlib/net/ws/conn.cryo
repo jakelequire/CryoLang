@@ -56,6 +56,29 @@ private const MAX_MESSAGE: i64 = 67108864;          // 64 MiB
 /// connection in unbounded auto-Pong work and never yield a message.
 private const MAX_CONTROL_PER_RECV: u64 = 256;
 
+// Close status codes (RFC 6455 section 7.4.1), for `close` and for what
+// `recv` answers a Close frame with.
+/// Status 1000: the connection did what it was for.
+public const CLOSE_NORMAL:              u16 = 1000;
+/// Status 1001: the endpoint is going away, as a server shutting down.
+public const CLOSE_GOING_AWAY:          u16 = 1001;
+/// Status 1002: the peer broke the protocol.
+public const CLOSE_PROTOCOL_ERROR:      u16 = 1002;
+/// Status 1003: a message of a type the endpoint cannot take.
+public const CLOSE_UNSUPPORTED_DATA:    u16 = 1003;
+/// Status 1007: a message's data does not fit its type, as text that is
+/// not UTF-8.
+public const CLOSE_INVALID_PAYLOAD:     u16 = 1007;
+/// Status 1008: a message broke the endpoint's policy.
+public const CLOSE_POLICY_VIOLATION:    u16 = 1008;
+/// Status 1009: a message too big to process.
+public const CLOSE_MESSAGE_TOO_BIG:     u16 = 1009;
+/// Status 1010: the server did not agree to an extension the client
+/// requires.
+public const CLOSE_MANDATORY_EXTENSION: u16 = 1010;
+/// Status 1011: the server met a condition it could not handle.
+public const CLOSE_INTERNAL_ERROR:      u16 = 1011;
+
 /// A complete application message. Owns its payload.
 public type enum Message {
     Text(String);
@@ -232,7 +255,12 @@ public type struct WebSocket<S> {
 
     /// Receive the next application message, reassembling fragments and
     /// transparently answering Pings with Pongs and skipping Pongs. A Close
-    /// frame surfaces as `Message::Close`.
+    /// frame surfaces as `Message::Close`, after being answered with a Close
+    /// echoing its status code unless this side already sent one. A Close
+    /// whose status code or reason breaks the protocol is answered with
+    /// `CLOSE_PROTOCOL_ERROR` or `CLOSE_INVALID_PAYLOAD` instead and
+    /// reported as `InvalidData`, as is a text message that is not UTF-8,
+    /// which is answered with `CLOSE_INVALID_PAYLOAD`.
     public async recv(mut &this) -> Result<Message, IoError>
     where S: AsyncTransport {
         mut acc: Array<u8> = Array::<u8>::new();
@@ -249,6 +277,11 @@ public type struct WebSocket<S> {
             mut pong: boolean = false;
             mut done: boolean = false;
             mut closing: boolean = false;
+            // The status code a Close frame is answered with: the peer's own
+            // when it sent a valid one with a valid reason.
+            mut close_answer: u16 = CLOSE_NORMAL;
+            // The Close frame broke the protocol, which fails the connection.
+            mut close_broken: boolean = false;
             if (!bad) {
                 match (fr.opcode) {
                     OpCode::Ping => {
@@ -267,6 +300,30 @@ public type struct WebSocket<S> {
                     }
                     OpCode::Close => {
                         closing = true;
+                        const body: &Slice<u8> = fr.payload.as_slice();
+                        if (body.length() == 1) {
+                            // A status code is two bytes or absent.
+                            close_answer = CLOSE_PROTOCOL_ERROR;
+                            close_broken = true;
+                        } else if (body.length() >= 2) {
+                            const code: u16 = ((body[0] as u16) << 8) | (body[1] as u16);
+                            // The codes a peer may send: the protocol's own
+                            // (1004 is reserved, and 1005, 1006 and 1015
+                            // only stand for a missing code locally), and
+                            // the registered and private ranges.
+                            const receivable: boolean = (code >= 1000 && code <= 1003)
+                                || (code >= 1007 && code <= 1014)
+                                || (code >= 3000 && code <= 4999);
+                            if (!receivable) {
+                                close_answer = CLOSE_PROTOCOL_ERROR;
+                                close_broken = true;
+                            } else if (Str::from_utf8(body.subslice(2, body.length())).is_err()) {
+                                close_answer = CLOSE_INVALID_PAYLOAD;
+                                close_broken = true;
+                            } else {
+                                close_answer = code;
+                            }
+                        }
                     }
                     OpCode::Text => {
                         binary = false;
@@ -293,7 +350,19 @@ public type struct WebSocket<S> {
                 return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
             }
             if (closing) {
+                // A Close that does not answer ours is answered, so the peer
+                // need not wait out a timeout; one that breaks the protocol
+                // is answered with the error and fails the connection.
+                if (!this.closed) {
+                    match (await this.close(close_answer, Str::new(""))) {
+                        Result::Ok(_)  => { }
+                        Result::Err(_) => { }
+                    }
+                }
                 this.closed = true;
+                if (close_broken) {
+                    return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                }
                 return Result::Ok(Message::Close);
             }
             if (acc.length() > MAX_MESSAGE) {
@@ -303,7 +372,18 @@ public type struct WebSocket<S> {
                 return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
             }
             if (done) {
-                return Result::Ok(build_message(acc, binary));
+                if (binary) { return Result::Ok(Message::Binary(acc)); }
+                match (String::from_utf8(acc)) {
+                    Result::Ok(text) => { return Result::Ok(Message::Text(text)); }
+                    Result::Err(_)   => {
+                        // Text that is not UTF-8 fails the connection.
+                        match (await this.close(CLOSE_INVALID_PAYLOAD, Str::new(""))) {
+                            Result::Ok(_)  => { }
+                            Result::Err(_) => { }
+                        }
+                        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                    }
+                }
             }
             if (pong) {
                 (await this.conn.flush())?;
@@ -334,17 +414,6 @@ public async function accept(sock: TcpStream) -> Result<WebSocket<TcpStream>, Io
         WebSocket::<TcpStream>::of(BufStream::<TcpStream>::of(sock), false);
     (await ws.server_handshake())?;
     return Result::Ok(ws);
-}
-
-/// Reassemble accumulated payload bytes into a `Message`. Consumes `data`.
-private function build_message(data: Array<u8>, binary: boolean) -> Message {
-    mut bytes: Array<u8> = data;
-    if (binary) {
-        return Message::Binary(bytes);
-    }
-    const text: String = String::from_str(Str::from_raw(bytes.as_ptr(), bytes.length()));
-    mem::drop(bytes);
-    return Message::Text(text);
 }
 
 /// Status code from a response's first line (`HTTP/1.1 <code> ...`).
