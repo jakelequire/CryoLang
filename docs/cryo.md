@@ -1068,6 +1068,10 @@ const n: int    = identity::<int>(42);
 const s: string = identity::<string>("hello");
 ```
 
+The `::` is required: in an expression `<` after a name compares, so `identity<int>(42)` parses as `(identity < int) > (42)`. Where the name between the angle brackets is a type and no value, a name, path or member followed by `<Type>(arguments)` is read as the call it was meant to be and refused at its `<` (`E0111`, "type arguments in an expression are written with `::<`"), with nothing reported against the comparisons; the fix inserting the `::` is offered when that call is otherwise accepted. Values on both sides, `a < b > (c)`, stay comparisons.
+
+A call with type arguments written takes the arguments its instance's parameters number, and is refused for any other count (`E0216` too few, `E0215` too many). A static call through a generic owner written bare - `String::new()`, `HashMap::new()`, its arguments defaulted or left to inference - is counted against the owner's methods of that name before its instance exists.
+
 A call writes **all** of its type arguments or **none** of them. A type argument it leaves to inference is written `_`, which is inferred exactly as an unwritten list's arguments are, with the written ones beside it already bound:
 
 ```cryo

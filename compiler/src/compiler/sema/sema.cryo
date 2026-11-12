@@ -1967,8 +1967,33 @@ type struct SemaVisitor {
             ExprKind::ArrayAccess(a) => { this.member.resolve_array_access(this, expr, a) }
             ExprKind::Lambda(l) => { this.lambda.resolve_lambda(this, expr, l) }
             ExprKind::Await(a) => { this.resolve_await(expr, a) }
-            ExprKind::Call(c) => { this.calls.resolve_call(this, expr, c) }
+            ExprKind::Call(c) => { this.resolve_written_call(expr, c) }
         };
+    }
+
+    /// Type a call.  One written `f<T>(x)`, which name resolution read as
+    /// `f::<T>(x)`, is typed as that call - so the comparison it parsed as
+    /// reports nothing - and its spelling is refused at the `<` (E0111); the
+    /// fix inserting the `::` is offered only when the call is accepted, the
+    /// one case where writing it is certain to give a call that compiles.
+    resolve_written_call(mut &this, expr: mut ExpressionNode*, call: mut CallExpr*) -> TypeRef {
+        if (!call.turbofish_left_out.has_location()) { return this.calls.resolve_call(this, expr, call); }
+        const angle: SourceSpan = call.turbofish_left_out;
+        call.turbofish_left_out = SourceSpan::none();
+        const errors_before: u32 = this.ctx.diagnostics.error_count;
+        const typed: TypeRef = this.calls.resolve_call(this, expr, call);
+        const accepted: boolean = typed.is_valid() && this.ctx.diagnostics.error_count == errors_before;
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0111_INVALID_SYNTAX,
+            "type arguments in an expression are written with `::<`");
+        d = d.at_with_label(angle, "`<` after a name compares, so this reads as `<` and `>`, not type arguments");
+        if (accepted) {
+            d = d.suggest(Suggestion::single(angle, "::<", "write `::` before the type arguments",
+                Applicability::MachineApplicable));
+        } else {
+            d = d.help("write `::` before the type arguments: `name::<Type>(arguments)`");
+        }
+        this.ctx.emit_diagnostic(d);
+        return typed;
     }
 
     /// Type an `await e`: `e` must be a `Future`, and the await evaluates to
