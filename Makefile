@@ -236,8 +236,9 @@ Tests and gates
                          the binary passes its behavioural checks
                          (tools/CryoLSP/tests/smoke.py).
   make warnings-check    compiler/ and the stdlib build with -Werror under
-                         the compiler under test; DELETES the host's prebuilt
-                         stdlib archives first (into build-logs/).
+                         the compiler under test, the stdlib under both panic
+                         strategies; DELETES the host's prebuilt stdlib
+                         archives first (into build-logs/).
   make cross-check       runtime, stdlib, compiler and CryoLSP for the other
                          OS's triple, objects only (ARGS=--triple=...).
   make examples          Build every examples/ project.
@@ -752,17 +753,22 @@ endif
 # host's prebuilt archives are removed first and the compiler under test
 # builds its own with `-Werror`, then builds compiler/ with `-Werror` into
 # build-logs/warnings-check - from inside compiler/, whose cryoconfig names
-# the LLVM libraries relative to it.
+# the LLVM libraries relative to it.  The compiler unwinds, so that archive is
+# the `--panic=unwind` one; config gating removes a different set of
+# declarations under `--panic=abort`, which is what a program builds with by
+# default, so the stdlib is built once more on its own under it.
 ifeq ($(HOST_OS),windows)
 warnings-check: $(STAGE2_EXE)
 	@if exist "stdlib\.bin\$(HOST_TRIPLE)\prebuilt" rmdir /s /q "stdlib\.bin\$(HOST_TRIPLE)\prebuilt"
 	@cd compiler && "$(STAGE2_EXE)" build --build-dir=$(ROOT)/build-logs/warnings-check --no-incremental -Werror
-	@echo warnings-check: OK -- compiler and stdlib built with -Werror
+	@"$(STAGE2_EXE)" build stdlib --build-dir=$(ROOT)/build-logs/warnings-check/stdlib-panic-abort --no-incremental --panic=abort -Werror
+	@echo warnings-check: OK -- compiler and stdlib built with -Werror, the stdlib under both panic strategies
 else
 warnings-check: $(STAGE2)
 	@rm -rf "stdlib/.bin/$(HOST_TRIPLE)/prebuilt"
 	@cd compiler && "$(STAGE2)" build --build-dir=$(ROOT)/build-logs/warnings-check --no-incremental -Werror
-	@echo "warnings-check: OK -- compiler and stdlib built with -Werror"
+	@"$(STAGE2)" build stdlib --build-dir=$(ROOT)/build-logs/warnings-check/stdlib-panic-abort --no-incremental --panic=abort -Werror
+	@echo "warnings-check: OK -- compiler and stdlib built with -Werror, the stdlib under both panic strategies"
 endif
 
 # ---- the other OS's config-gated half ----------------------------------

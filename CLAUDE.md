@@ -535,14 +535,18 @@ with no diff to check it against.
   used within the hour (a concurrent build may be about to link it). The
   archive is built in place under `<key>.lock` and opens only once its
   manifest, renamed into place last, is there. The archive's build is the
-  only build that analyses the stdlib's own bodies, so a warning in the
-  stdlib is printed by the build that MAKES the archive and by no other -
-  and is not in that build's own warning count. `make warnings-check` is
-  the clean-build warning gate: it removes `stdlib/.bin/<triple>/prebuilt`
+  only build that analyses the stdlib's own bodies, and a program's build
+  does not show its warnings: a stdlib warning is printed by the stdlib's
+  own build (`cryo build stdlib`) and by nothing else, and fails a
+  `-Werror` build that makes an archive. `make warnings-check` is the
+  clean-build warning gate: it removes `stdlib/.bin/<triple>/prebuilt`
   and builds compiler/ with `-Werror`, which the archive's build inherits
   (an archive already built is linked as it is - `-Werror` is not in its
   key - so a check that does not remove them proves nothing about the
-  stdlib). Its stdlib modules'
+  stdlib), then builds the stdlib on its own with `--panic=abort
+  -Werror`, since the compiler's archive unwinds and config gating keeps
+  a different set of declarations under each strategy. Only the host's
+  OS is analysed: a warning in another OS's gated half is not seen. Its stdlib modules'
   objects hold only the generic instances the archive lacks, and one left
   with nothing writes no object. verify hashes the archives as a third population (`stdlib`); a
   baseline compiler that links none leaves that population empty and its
