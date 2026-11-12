@@ -9457,6 +9457,26 @@ type struct CallResolver {
             });
             diag = diag.also_at_in(bound.span, tmpl_decl.name_span, fmt::format(
                 "required by this bound in `%s`", this.intern.resolve(tmpl.name)));
+            // A signature of the right arity that differs at a parameter
+            // takes the wrong type there: name the first one, beside the type
+            // the bound passes it (an iterator's item, for `map`).
+            const required_type: Type* = this.arena.lookup(required);
+            const actual_type: Type* = this.arena.lookup(actual);
+            if (required_type != null && actual_type != null
+                    && required_type.kind == TypeKind::Function && actual_type.kind == TypeKind::Function) {
+                const required_fn: FunctionType* = required_type.as_function();
+                const actual_fn: FunctionType* = actual_type.as_function();
+                mut differs: i64 = -1;
+                for (mut pi: i64 = 0; differs < 0 && pi < required_fn.param_types.length()
+                        && required_fn.param_types.length() == actual_fn.param_types.length(); pi++) {
+                    if (!required_fn.param_types[pi].equals(actual_fn.param_types[pi])) { differs = pi; }
+                }
+                if (differs >= 0) {
+                    diag = diag.with_note(fmt::format("parameter %lld of the argument takes `%s`, and `%s` passes it `%s`",
+                        differs + 1, this.types.type_display_name(actual_fn.param_types[differs]),
+                        this.intern.resolve(tmpl.name), this.types.type_display_name(required_fn.param_types[differs])));
+                }
+            }
             diag = diag.help(fmt::format(
                 "pass a function or closure that takes and returns exactly these types: `%s`", required_shown));
             this.ctx.emit_diagnostic(diag);
