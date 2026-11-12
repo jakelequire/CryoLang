@@ -4832,18 +4832,22 @@ type struct SemaVisitor {
     }
 
     /// Whether `to` implements the language's `From<from>`: an implementation
-    /// of it for `to` whose trait argument is `from` and whose bounds hold.
+    /// of it for `to` whose trait argument is `from`, or a parameter of its
+    /// own the head binds to `from` (`From<E> for ErrorReport where E:
+    /// Error`), and whose bounds hold there.  A head for every type gives
+    /// a type only the `From` of itself, which converts nothing.
     implements_from(&this, from: TypeRef, to: TypeRef) -> boolean {
         const from_trait: DefId = this.ctx.generic_registry.wellknown(LangItem::From);
         if (!from_trait.is_valid() || !this.ctx.generic_registry.wellknown(LangItem::FromFrom).is_valid()) {
             return false;
         }
+        const args: [TypeRef] = [from];
         const heads: [DeclarationNode*] = this.ctx.generic_registry.heads_for(from_trait, to, this.intern);
         for (mut i: i64 = 0; i < heads.length(); i++) {
             const head: mut ImplBlock* = DeclarationNode::impl_of(heads[i]);
-            if (head == null || head.trait_arg_types.length() != 1) { continue; }
-            if (!this.checker.is_same_type(from, head.trait_arg_types[0])) { continue; }
-            if (this.trait_checker().impl_applies(head, to, 0)) { return true; }
+            if (head == null || head.target_param().is_valid()) { continue; }
+            if (!this.ctx.generic_registry.binds_trait_arguments(head, from_trait, &args, this.intern)) { continue; }
+            if (this.trait_checker().impl_applies_at(head, from_trait, &args, to, 0)) { return true; }
         }
         return false;
     }
