@@ -1391,6 +1391,22 @@ type struct CallResolver {
                 _ => { false }
             };
             if (!callee_is_local) {
+                // Type arguments written on a function that has no type
+                // parameters name nothing; a generic callee had its count
+                // checked as a template above.
+                if (call.generic_args.length() > 0) {
+                    match (ident.res) {
+                        ResSlot::Answered(r) => {
+                            const stamped_function: FunctionDecl* = DeclarationNode::fn_of(
+                                this.ctx.decl_index.entry_decl(this.ctx.decl_index.entry_of_def(r.def_id())));
+                            if (stamped_function != null && this.type_argument_count_refused(&call.generic_args,
+                                    &stamped_function.generic_params, this.intern.resolve(ident.name), call_e.span)) {
+                                return TypeRef::invalid();
+                            }
+                        }
+                        _ => { }
+                    }
+                }
                 this.check_call_arity(visitor, call_e, call, ident);
                 const ovl_ret: TypeRef = this.try_pin_overload_mangled_callee(call_e, call, ident);
                 if (ovl_ret.is_valid() && !this.types.contains_generic_param(ovl_ret)) {
@@ -7606,6 +7622,9 @@ type struct CallResolver {
                 parameters, if (parameters == 1) { "" } else { "s" },
                 written, if (written == 1) { "" } else { "s" }, if (written == 1) { "is" } else { "are" }));
         d = d.at_with_label(span, "too many type arguments");
+        if (parameters == 0) {
+            d = d.help(fmt::format("`%s` is not generic: remove the type arguments", shown));
+        }
         this.ctx.emit_diagnostic(d);
     }
 
@@ -10496,6 +10515,19 @@ type struct CallResolver {
                 subst_ret = this.subst_return_from_call_args(call, tmpl, &call.generic_args, ret);
             }
             if (subst_ret.is_valid()) { return subst_ret; }
+        }
+        if (!is_fn_template && call != null) {
+            // Type arguments written on a function that has no type
+            // parameters name nothing.
+            mut written_args: &[mut TypeAnnotation*] = &call.generic_args;
+            if (scope != null && scope.generic_args.length() > 0) { written_args = &scope.generic_args; }
+            const callee_function: FunctionDecl* = DeclarationNode::fn_of(
+                this.ctx.decl_index.entry_decl(this.ctx.decl_index.entry_of_def(callee)));
+            if (callee_function != null && this.type_argument_count_refused(written_args,
+                    &callee_function.generic_params, this.intern.resolve(callee_function.name), call_e.span)) {
+                *claimed = true;
+                return TypeRef::invalid();
+            }
         }
         if (!is_fn_template) {
             // A call already pinned to one of the member's signatures - by
