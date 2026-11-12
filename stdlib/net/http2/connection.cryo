@@ -141,9 +141,12 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     private is_client:             boolean;
     private next_stream_id:        u32;
     private goaway_received:       boolean;
-    // Peer parameters that bound what we send.
-    private remote_max_frame:      i64;
-    private remote_initial_window: i64;
+    // The highest stream the peer opened that this side began to read: the
+    // last-stream identifier a GOAWAY names.
+    private last_peer_stream_id:   u32;
+    // The peer's parameters, which bound what we send. Each SETTINGS frame
+    // changes only the values it carries.
+    private remote_settings:       Settings;
     // Send-side flow-control windows for the single active stream.
     private conn_send_window:      i64;
     private stream_send_window:    i64;
@@ -165,8 +168,8 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
             is_client:             true,
             next_stream_id:        1,
             goaway_received:       false,
-            remote_max_frame:      16384,
-            remote_initial_window: 65535,
+            last_peer_stream_id:   0,
+            remote_settings:       Settings::defaults(),
             conn_send_window:      DEFAULT_CONNECTION_WINDOW,
             stream_send_window:    65535
         };
@@ -188,8 +191,8 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
             is_client:             false,
             next_stream_id:        2,
             goaway_received:       false,
-            remote_max_frame:      16384,
-            remote_initial_window: 65535,
+            last_peer_stream_id:   0,
+            remote_settings:       Settings::defaults(),
             conn_send_window:      DEFAULT_CONNECTION_WINDOW,
             stream_send_window:    65535
         };
@@ -252,7 +255,10 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
             // the flush below rather than being carried across it.
             const outcome: Result<boolean, IoError> = this.process_control(&fr);
             mem::drop(fr);
-            outcome?;
+            match (outcome) {
+                Result::Ok(_)  => { }
+                Result::Err(e) => { return Result::Err(await this.flush_failure(e)); }
+            }
             (await this.conn.flush())?;
             if (is_settings) { return Result::Ok(()); }
         }
@@ -283,15 +289,28 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     /// ACK, PING ACK) are QUEUED, and the caller flushes once it has released
     /// the frame — so the borrowed `fr` never has to survive a suspension, and
     /// this stays callable from every read loop without one.
+    ///
+    /// A frame that breaks the protocol is a connection error: a GOAWAY
+    /// carrying its code is queued and an `InvalidData` error returned,
+    /// which the caller passes through `flush_failure` so the GOAWAY is
+    /// sent before the connection ends.
     private process_control(mut &this, fr: &Frame) -> Result<boolean, IoError> {
         if (fr.ftype == frame::FRAME_SETTINGS) {
-            if (fr.has_flag(frame::FLAG_ACK)) { return Result::Ok(true); }
-            mut s: Settings = Settings::defaults();
-            s.apply_payload(fr.payload.as_slice());
-            this.remote_max_frame = s.max_frame_size as i64;
-            this.remote_initial_window = s.initial_window_size as i64;
+            // SETTINGS describes the connection, never one stream.
+            if (fr.stream_id != 0) { return Result::Err(this.fail_connection(frame::PROTOCOL_ERROR)); }
+            if (fr.has_flag(frame::FLAG_ACK)) {
+                // An acknowledgement carries no settings.
+                if (!fr.payload.is_empty()) {
+                    return Result::Err(this.fail_connection(frame::FRAME_SIZE_ERROR));
+                }
+                return Result::Ok(true);
+            }
+            match (this.remote_settings.apply_payload(fr.payload.as_slice())) {
+                Result::Ok(_)     => { }
+                Result::Err(code) => { return Result::Err(this.fail_connection(code)); }
+            }
             // Our encoder must not exceed the peer's decoder table size.
-            this.codec.limit_encoder_table(s.header_table_size as i64);
+            this.codec.limit_encoder_table(this.remote_settings.header_table_size as i64);
             // Acknowledge.
             this.conn.queue_h2_frame(frame::FRAME_SETTINGS, frame::FLAG_ACK, 0,
                                      Slice::from_raw(null as u8*, 0))?;
@@ -310,19 +329,19 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
             // RFC 7540 section 6.9.1: a 0 increment is a PROTOCOL_ERROR, and a flow-
             // control window must never exceed 2^31-1 (FLOW_CONTROL_ERROR).
             // The 0 check also rejects a short/truncated payload, read as 0.
-            const WINDOW_MAX: i64 = 2147483647;   // 2^31 - 1
+            const window_max: i64 = settings::MAX_WINDOW_SIZE as i64;
             if (inc == 0) {
-                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                return Result::Err(this.fail_connection(frame::PROTOCOL_ERROR));
             }
             if (fr.stream_id == 0) {
                 this.conn_send_window = this.conn_send_window + inc;
-                if (this.conn_send_window > WINDOW_MAX) {
-                    return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                if (this.conn_send_window > window_max) {
+                    return Result::Err(this.fail_connection(frame::FLOW_CONTROL_ERROR));
                 }
             } else {
                 this.stream_send_window = this.stream_send_window + inc;
-                if (this.stream_send_window > WINDOW_MAX) {
-                    return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                if (this.stream_send_window > window_max) {
+                    return Result::Err(this.fail_connection(frame::FLOW_CONTROL_ERROR));
                 }
             }
             return Result::Ok(true);
@@ -337,6 +356,40 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
         return Result::Ok(false);
     }
 
+    /// Queue the GOAWAY that ends the connection with `error_code`, and
+    /// the error the read loop returns. Synchronous; `flush_failure` sends
+    /// it. A GOAWAY that cannot be queued is not sent: the connection ends
+    /// either way.
+    private fail_connection(mut &this, error_code: u32) -> IoError {
+        match (this.queue_goaway(this.last_peer_stream_id, error_code)) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { }
+        }
+        return IoError::new(IoErrorKind::InvalidData, 0);
+    }
+
+    /// Send what a failed `process_control` queued, best-effort, and hand
+    /// `error` back for the caller to return: the transport may already be
+    /// gone, and its own error would hide the protocol's.
+    private async flush_failure(mut &this, error: IoError) -> IoError
+    where S: AsyncTransport {
+        match (await this.conn.flush()) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { }
+        }
+        return error;
+    }
+
+    /// Queue a GOAWAY naming `last_stream_id` (its reserved top bit
+    /// cleared) and `error_code`. Synchronous; the caller flushes.
+    private queue_goaway(mut &this, last_stream_id: u32, error_code: u32) -> Result<(), IoError> {
+        mut payload: Array<u8> = Array::<u8>::with_capacity(8);
+        mut fields: ByteWriter = ByteWriter::new(&payload);
+        fields.write_u32_big_endian(last_stream_id & 0x7fffffff);
+        fields.write_u32_big_endian(error_code);
+        return this.conn.queue_h2_frame(frame::FRAME_GOAWAY, 0, 0, payload.as_slice());
+    }
+
     // ---- sending ----------------------------------------------------------
 
     /// Queue a header block on `stream_id`, splitting into HEADERS +
@@ -349,7 +402,7 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     private queue_header_block(mut &this, stream_id: u32, block: &Slice<u8>,
                        end_stream: boolean) -> Result<(), IoError> {
         const total: i64 = block.length();
-        const max: i64 = this.remote_max_frame;
+        const max: i64 = this.remote_settings.max_frame_size as i64;
         if (total <= max) {
             mut flags: u8 = frame::FLAG_END_HEADERS;
             if (end_stream) { flags = flags | frame::FLAG_END_STREAM; }
@@ -404,7 +457,7 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
         mut pos: i64 = 0;
         while (pos < total) {
             (await this.ensure_send_window())?;
-            mut avail: i64 = this.remote_max_frame;
+            mut avail: i64 = this.remote_settings.max_frame_size as i64;
             const remaining: i64 = total - pos;
             if (remaining < avail) { avail = remaining; }
             if (this.stream_send_window < avail) { avail = this.stream_send_window; }
@@ -435,7 +488,10 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
             mut fr: Frame = (await this.conn.read_h2_frame(LOCAL_MAX_FRAME_SIZE as i64))?;
             const outcome: Result<boolean, IoError> = this.process_control(&fr);
             mem::drop(fr);
-            outcome?;
+            match (outcome) {
+                Result::Ok(_)  => { }
+                Result::Err(e) => { return Result::Err(await this.flush_failure(e)); }
+            }
             (await this.conn.flush())?;
         }
         return Result::Ok(());
@@ -466,7 +522,7 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
         mut request_local: Request = req;
         const sid: u32 = this.next_stream_id;
         this.next_stream_id = this.next_stream_id + 2;
-        this.stream_send_window = this.remote_initial_window;
+        this.stream_send_window = this.remote_settings.initial_window_size as i64;
 
         mut block: Array<u8> = Array::<u8>::new();
         this.encode_request_headers(&block, &request_local, scheme, authority);
@@ -513,7 +569,10 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
             mut handled: boolean = false;
             match (control) {
                 Result::Ok(h)  => { handled = h; }
-                Result::Err(e) => { mem::drop(fr); return Result::Err(e); }
+                Result::Err(e) => {
+                    mem::drop(fr);
+                    return Result::Err(await this.flush_failure(e));
+                }
             }
             if (handled) {
                 mem::drop(fr);
@@ -618,7 +677,10 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
             mut handled: boolean = false;
             match (control) {
                 Result::Ok(h)  => { handled = h; }
-                Result::Err(e) => { mem::drop(fr); return Result::Err(e); }
+                Result::Err(e) => {
+                    mem::drop(fr);
+                    return Result::Err(await this.flush_failure(e));
+                }
             }
             if (handled) {
                 const closing: boolean = this.goaway_received && !have_stream;
@@ -629,7 +691,11 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
             }
 
             if (fr.ftype == frame::FRAME_HEADERS) {
-                if (!have_stream) { sid = fr.stream_id; have_stream = true; }
+                if (!have_stream) {
+                    sid = fr.stream_id;
+                    have_stream = true;
+                    this.last_peer_stream_id = sid;
+                }
                 if (fr.stream_id == sid) {
                     block.append(header_fragment(&fr));
                     if (fr.has_flag(frame::FLAG_END_HEADERS)) { headers_done = true; }
@@ -670,7 +736,7 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     public async send_response(mut &this, sid: u32, resp: Response) -> Result<(), IoError>
     where S: AsyncTransport {
         mut response: Response = resp;
-        this.stream_send_window = this.remote_initial_window;
+        this.stream_send_window = this.remote_settings.initial_window_size as i64;
 
         mut block: Array<u8> = Array::<u8>::new();
         this.encode_response_headers(&block, &response);
@@ -694,14 +760,7 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     /// stop. Best-effort; transport teardown is the caller's.
     public async send_goaway(mut &this, last_stream_id: u32, error_code: u32) -> Result<(), IoError>
     where S: AsyncTransport {
-        {
-            // A 31-bit last stream id (reserved top bit clear), then the code.
-            mut payload: Array<u8> = Array::<u8>::with_capacity(8);
-            mut fields: ByteWriter = ByteWriter::new(&payload);
-            fields.write_u32_big_endian(last_stream_id & 0x7fffffff);
-            fields.write_u32_big_endian(error_code);
-            this.conn.queue_h2_frame(frame::FRAME_GOAWAY, 0, 0, payload.as_slice())?;
-        }
+        this.queue_goaway(last_stream_id, error_code)?;
         return await this.conn.flush();
     }
 

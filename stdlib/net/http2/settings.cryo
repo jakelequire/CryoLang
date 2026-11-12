@@ -8,7 +8,9 @@
 namespace std::net::http2::settings;
 
 import std::core::option::{ Option };
+import std::core::result::{ Result };
 import std::core::slice::{ Slice };
+import std::net::http2::frame;
 import std::collections::array::{ Array };
 import std::io::bytes::{ ByteReader, ByteWriter };
 
@@ -30,6 +32,15 @@ public const SETTINGS_MAX_FRAME_SIZE:         u16 = 0x5;
 /// Identifier 0x6: the largest header list, in bytes, the sender is
 /// prepared to accept. Unlimited by default.
 public const SETTINGS_MAX_HEADER_LIST_SIZE:   u16 = 0x6;
+
+/// The largest flow-control window, and so the largest
+/// `SETTINGS_INITIAL_WINDOW_SIZE`: 2^31 - 1.
+public const MAX_WINDOW_SIZE:    u32 = 2147483647;
+/// The smallest `SETTINGS_MAX_FRAME_SIZE`, 2^14, which is also its
+/// default.
+public const MIN_MAX_FRAME_SIZE: u32 = 16384;
+/// The largest `SETTINGS_MAX_FRAME_SIZE`, 2^24 - 1.
+public const MAX_MAX_FRAME_SIZE: u32 = 16777215;
 
 /// The six SETTINGS parameters of one side of an HTTP/2 connection, one
 /// field per identifier. Start from `defaults` and fold a received SETTINGS
@@ -55,39 +66,53 @@ public type struct Settings {
         };
     }
 
-    /// Apply a single parsed (identifier, value). Unknown identifiers
-    /// are ignored.
-    public apply_one(mut &this, id: u16, value: u32) -> void {
-        if (id == SETTINGS_HEADER_TABLE_SIZE)      { this.header_table_size = value; }
-        else if (id == SETTINGS_ENABLE_PUSH)            { this.enable_push = value; }
-        else if (id == SETTINGS_MAX_CONCURRENT_STREAMS) { this.max_concurrent_streams = value; }
-        else if (id == SETTINGS_INITIAL_WINDOW_SIZE)    { this.initial_window_size = value; }
-        else if (id == SETTINGS_MAX_FRAME_SIZE) {
-            // RFC 7540 section 6.5.2: SETTINGS_MAX_FRAME_SIZE must be within
-            // [2^14, 2^24-1] = [16384, 16777215]. A peer sending an
-            // out-of-range value (e.g. 0) would otherwise be stored verbatim
-            // and make send_body / send_header_block compute a zero per-frame
-            // budget and loop forever -- a one-frame remote DoS. Reject the
-            // bad value, keeping the last valid setting (the 16384 default).
-            if (value >= 16384 && value <= 16777215) {
-                this.max_frame_size = value;
+    /// Apply a single parsed (identifier, value). Unknown identifiers are
+    /// ignored. A value the protocol forbids is refused with the error code
+    /// the connection must end with, and stores nothing: `PROTOCOL_ERROR`
+    /// for `SETTINGS_ENABLE_PUSH` other than 0 or 1 and for
+    /// `SETTINGS_MAX_FRAME_SIZE` outside 16384 to 16777215, and
+    /// `FLOW_CONTROL_ERROR` for `SETTINGS_INITIAL_WINDOW_SIZE` above
+    /// 2^31 - 1.
+    public apply_one(mut &this, id: u16, value: u32) -> Result<(), u32> {
+        if (id == SETTINGS_HEADER_TABLE_SIZE) {
+            this.header_table_size = value;
+        } else if (id == SETTINGS_ENABLE_PUSH) {
+            if (value > 1) { return Result::Err(frame::PROTOCOL_ERROR); }
+            this.enable_push = value;
+        } else if (id == SETTINGS_MAX_CONCURRENT_STREAMS) {
+            this.max_concurrent_streams = value;
+        } else if (id == SETTINGS_INITIAL_WINDOW_SIZE) {
+            // A window past 2^31 - 1 cannot be tracked by the flow-control
+            // arithmetic the protocol defines.
+            if (value > MAX_WINDOW_SIZE) { return Result::Err(frame::FLOW_CONTROL_ERROR); }
+            this.initial_window_size = value;
+        } else if (id == SETTINGS_MAX_FRAME_SIZE) {
+            // Stored, a 0 would give the senders a zero per-frame budget
+            // and loop them forever.
+            if (value < MIN_MAX_FRAME_SIZE || value > MAX_MAX_FRAME_SIZE) {
+                return Result::Err(frame::PROTOCOL_ERROR);
             }
+            this.max_frame_size = value;
+        } else if (id == SETTINGS_MAX_HEADER_LIST_SIZE) {
+            this.max_header_list_size = value;
         }
-        else if (id == SETTINGS_MAX_HEADER_LIST_SIZE)   { this.max_header_list_size = value; }
+        return Result::Ok(());
     }
 
-    /// Parse a SETTINGS frame payload, applying every entry. Returns
-    /// false if the payload length is not a multiple of 6.
-    public apply_payload(mut &this, payload: &Slice<u8>) -> boolean {
-        if (payload.length() % 6 != 0) { return false; }
+    /// Parse a SETTINGS frame payload, applying its entries in order.
+    /// Refused with `FRAME_SIZE_ERROR` when the length is not a multiple
+    /// of 6, and with `apply_one`'s code at the first value it refuses;
+    /// the entries before that one stay applied.
+    public apply_payload(mut &this, payload: &Slice<u8>) -> Result<(), u32> {
+        if (payload.length() % 6 != 0) { return Result::Err(frame::FRAME_SIZE_ERROR); }
         mut entries: ByteReader = ByteReader::new(payload);
         while (entries.remaining() > 0) {
             // A whole number of entries remains, so neither read runs short.
             const id: u16 = entries.read_u16_big_endian().unwrap();
             const value: u32 = entries.read_u32_big_endian().unwrap();
-            this.apply_one(id, value);
+            this.apply_one(id, value)?;
         }
-        return true;
+        return Result::Ok(());
     }
 }
 
