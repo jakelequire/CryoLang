@@ -2122,28 +2122,39 @@ type struct TypeResolver {
     /// unless `ty` is a registered template BASE with >0 params, every one
     /// defaulted.
     canonicalize_default_generic_type(&this, ty: TypeRef) -> TypeRef {
-        if (!ty.is_valid() || this.generic_registry == null) { return ty; }
+        const filled: [TypeRef] = this.default_type_arguments(ty);
+        if (filled.length() == 0) { return ty; }
+        return this.arena.create_instantiation(ty, &filled);
+    }
+
+    /// The arguments every parameter of the template base `ty` defaults to,
+    /// one per parameter, or empty unless `ty` is a registered struct or enum
+    /// template with >0 parameters, every one defaulted.  Mints nothing: an
+    /// instantiation made and never used reaches codegen unresolved.
+    default_type_arguments(&this, ty: TypeRef) -> [TypeRef] {
+        mut none: [TypeRef] = [];
+        if (!ty.is_valid() || this.generic_registry == null) { return none; }
         const t: Type* = this.arena.lookup(ty);
-        if (t == null) { return ty; }
+        if (t == null) { return none; }
         if (t.kind != TypeKind::Struct
-                && t.kind != TypeKind::Enum) { return ty; }
+                && t.kind != TypeKind::Enum) { return none; }
         const entry: const TemplateEntry* =
             this.generic_registry.template_of_type(ty);
-        if (entry == null || entry.param_count <= 0) { return ty; }
+        if (entry == null || entry.param_count <= 0) { return none; }
         const params: &Slice<DeclarationNode*> = entry.get_generic_params();
-        if (params.length() < entry.param_count) { return ty; }
+        if (params.length() < entry.param_count) { return none; }
         for (mut i: i64 = 0; i < entry.param_count; i++) {
             const gp_decl: DeclarationNode* = params[i];
             const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
-            if (gp == null || !gp.has_default_annotation()) { return ty; }
+            if (gp == null || !gp.has_default_annotation()) { return none; }
         }
         // The defaults carry their own stamps; this context holds nothing but
         // the bindings `expand_default_type_args` adds.
         mut ctx: ResolutionContext = ResolutionContext::new("");
         mut empty: [TypeRef] = [];
         const filled: [TypeRef] = this.expand_default_type_args(entry, empty, &ctx);
-        if (filled.length() != entry.param_count) { return ty; }
-        return this.arena.create_instantiation(ty, &filled);
+        if (filled.length() != entry.param_count) { return none; }
+        return filled;
     }
 
     /// Give the arena what `[T]` is made of - `Array`'s template and the
