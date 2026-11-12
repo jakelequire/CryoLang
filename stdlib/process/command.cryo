@@ -37,7 +37,8 @@ import std::collections::array::{ Array };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::ffi::libc;
-import std::sys::syscall::{ SECURITY_ATTRIBUTES, STARTUPINFOA, PROCESS_INFORMATION };
+import std::sys::syscall::{ SECURITY_ATTRIBUTES, STARTUPINFOW, PROCESS_INFORMATION };
+import std::encoding::utf16::{ Utf16 };
 import std::alloc::layout;
 import std::process::child::{
     Child, ChildStderr, ChildStdin, ChildStdout, ExitStatus, PipeDrain
@@ -1051,7 +1052,7 @@ private function collect_output(c: mut &Child) -> Result<Output, IoError> {
 // ===========================================================================
 // Windows (CreateProcess) implementation.
 //
-// Windows has no fork+exec: a process is created in one CreateProcessA call
+// Windows has no fork+exec: a process is created in one CreateProcessW call
 // that takes a single mutable command-line STRING (not an argv array) plus a
 // STARTUPINFO carrying inheritable std handles.  Pipe ends created with
 // CreatePipe are bridged into CRT file descriptors via `_open_osfhandle`, so
@@ -1061,8 +1062,10 @@ private function collect_output(c: mut &Child) -> Result<Output, IoError> {
 // Stdio: Inherit, Piped, Null (an inheritable `NUL` handle), and Fd (the
 // caller's CRT fd is recovered to a Win32 HANDLE via `_get_osfhandle` and
 // duplicated inheritable for the child) are all wired.  `clear_env` /
-// per-var env overrides and `cwd` are applied (explicit ANSI env block +
-// `lpCurrentDirectory`).  `collect_output` interleaves the stdout/stderr
+// per-var env overrides and `cwd` are applied (an explicit UTF-16 env block +
+// `lpCurrentDirectory`); the command line, the block and the directory are
+// all UTF-16, so non-ASCII arguments, variables and paths reach the child
+// intact.  `collect_output` interleaves the stdout/stderr
 // drains via `PeekNamedPipe` so neither full pipe buffer can deadlock the
 // other (matching the POSIX `poll` path).
 // ===========================================================================
@@ -1124,10 +1127,10 @@ private function win_append_quoted(out: mut &String, arg: &String) -> void {
     out.push_byte(34);   // closing quote
 }
 
-// Build the NUL-terminated command line "program arg1 arg2 ..." for
-// CreateProcessA (which may modify the buffer in place).
+// Build the NUL-terminated UTF-16 command line "program arg1 arg2 ..." for
+// CreateProcessW (which may modify the buffer in place).
 ![target(windows)]
-private function build_cmdline(cmd: &Command) -> String {
+private function build_cmdline(cmd: &Command) -> Array<u16> {
     mut cl: String = String::new();
     win_append_quoted(&cl, &cmd.program);
     mut i: i64 = 0;
@@ -1138,93 +1141,92 @@ private function build_cmdline(cmd: &Command) -> String {
         }
         i = i + 1;
     }
-    cl.push_byte(0);   // NUL terminator (kept in the buffer)
-    return cl;
+    return Utf16::encode(cl.as_str());
 }
 
-// True if the `KEY=VALUE\0` entry at `entry` has key `key` (the entry's key
-// ends right at the `=`).  Windows variable names ignore ASCII case, so
-// `Path` names the inherited `PATH`.  Used to drop an inherited variable the
-// caller sets or removes.
+// True if the `KEY=VALUE\0` entry at `entry` has key `key`, UTF-16 units
+// without a NUL (the entry's key ends right at the `=`).  Windows variable
+// names ignore ASCII case, so `Path` names the inherited `PATH`.  Used to
+// drop an inherited variable the caller sets or removes.
 ![target(windows)]
-private function win_env_key_matches(entry: u8*, key: &String) -> boolean {
-    // Byte by byte, stopping at the first difference: the entry may be
+private function win_env_key_matches(entry: u16*, key: &Slice<u16>) -> boolean {
+    // Unit by unit, stopping at the first difference: the entry may be
     // shorter than `key`, and its NUL then differs before the block ends.
-    const klen: i64 = key.length();
-    const kp: u8* = key.as_ptr();
-    mut i: i64 = 0;
-    while (i < klen) {
-        if (entry[i].to_ascii_lowercase() != kp[i].to_ascii_lowercase()) { return false; }
-        i = i + 1;
+    const length: i64 = key.length();
+    for (mut i: i64 = 0; i < length; i++) {
+        mut a: u16 = entry[i];
+        mut b: u16 = key[i];
+        if (a >= 0x41 && a <= 0x5A) { a = a + 0x20; }   // 'A'-'Z' to 'a'-'z'
+        if (b >= 0x41 && b <= 0x5A) { b = b + 0x20; }
+        if (a != b) { return false; }
     }
-    return entry[klen] == 61;  // '='
+    return entry[length] == 61;  // '='
 }
 
-// Build the ANSI environment block for CreateProcessA: a sequence of
-// `KEY=VALUE\0` entries terminated by an extra `\0`.  Returns an empty
-// String (caller passes null -> inherit verbatim) only when there is
-// nothing to change.  When `clear_env_flag` is set the inherited block is
-// skipped; otherwise inherited entries are copied except those the caller
-// overrides (so overrides win), then the overrides are appended.  We use the
-// ANSI block (no CREATE_UNICODE_ENVIRONMENT), matching CreateProcessA's
-// `lpCommandLine`/`lpCurrentDirectory` ANSI strings.
+// Build the UTF-16 environment block for CreateProcessW
+// (CREATE_UNICODE_ENVIRONMENT): a sequence of `KEY=VALUE\0` entries
+// terminated by an extra `\0`.  When `clear_env_flag` is set the inherited
+// block is skipped; otherwise inherited entries are copied unit for unit
+// except those the caller overrides (so overrides win), then the overrides
+// are appended.
 ![target(windows)]
-private function build_env_block(cmd: &Command) -> String {
-    mut blk: String = String::new();
+private function build_env_block(cmd: &Command) -> Array<u16> {
+    mut blk: Array<u16> = Array::new();
+    // Each override's key, encoded once, without its NUL.
+    mut keys: Array<Array<u16>> = Array::new();
+    for (mut e: i64 = 0; e < cmd.envs.length(); e++) {
+        match (cmd.envs.get_ref(e)) {
+            Option::Some(en) => {
+                mut key: Array<u16> = Utf16::encode(en.key.as_str());
+                key.truncate(key.length() - 1);
+                keys.push(key);
+            }
+            Option::None => { }
+        }
+    }
 
     if (!cmd.clear_env_flag) {
-        const base: u8* = syscall::GetEnvironmentStrings();
+        const base: u16* = syscall::GetEnvironmentStringsW();
         if (base != null) {
             mut i: u64 = 0;
             while (base[i] != 0) {        // until the block's double-NUL
                 const start: u64 = i;
                 mut overridden: boolean = false;
-                mut e: i64 = 0;
-                while (e < cmd.envs.length()) {
-                    match (cmd.envs.get_ref(e)) {
-                        Option::Some(en) => {
-                            if (win_env_key_matches(&base[start], &en.key)) {
-                                overridden = true;
-                            }
-                        }
-                        Option::None => { }
-                    }
-                    e = e + 1;
+                for (mut e: i64 = 0; e < keys.length(); e++) {
+                    if (win_env_key_matches(&base[start], keys[e].as_slice())) { overridden = true; }
                 }
                 // Copy (or skip) the whole `KEY=VALUE\0` entry.
                 while (base[i] != 0) {
-                    if (!overridden) { blk.push_byte(base[i]); }
+                    if (!overridden) { blk.push(base[i]); }
                     i = i + 1;
                 }
-                if (!overridden) { blk.push_byte(0); }
+                if (!overridden) { blk.push(0); }
                 i = i + 1;              // step past the entry's NUL
             }
-            syscall::FreeEnvironmentStringsA(base);
+            syscall::FreeEnvironmentStringsW(base);
         }
     }
 
     // Append the caller's overrides as KEY=VALUE\0; a removed variable was
     // dropped above and is not appended.
-    mut e2: i64 = 0;
-    while (e2 < cmd.envs.length()) {
-        match (cmd.envs.get_ref(e2)) {
+    for (mut e: i64 = 0; e < cmd.envs.length(); e++) {
+        match (cmd.envs.get_ref(e)) {
             Option::Some(en) => {
                 match (&en.value) {
                     Option::Some(value) => {
-                        blk.push(en.key.as_str());
-                        blk.push_byte(61);           // '='
-                        blk.push(value.as_str());
-                        blk.push_byte(0);
+                        const wide_value: Array<u16> = Utf16::encode(value.as_str());
+                        blk.append(keys[e].as_slice());
+                        blk.push(61);                // '='
+                        blk.append(wide_value.as_slice());   // with its NUL
                     }
                     Option::None => { }
                 }
             }
             Option::None => { }
         }
-        e2 = e2 + 1;
     }
 
-    blk.push_byte(0);  // block terminator (block ends in `\0\0`)
+    blk.push(0);  // block terminator (block ends in `\0\0`)
     return blk;
 }
 
@@ -1320,19 +1322,19 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
         _ => { win_setup_stdio(cmd.stderr_cfg, syscall::STD_ERROR_HANDLE, false)? }
     };
 
-    mut cmdline: String = build_cmdline(cmd);
+    mut cmdline: Array<u16> = build_cmdline(cmd);
 
-    mut cwd_cstr: String = String::new();
-    mut cwd_ptr:  u8* = null;
+    mut cwd_wide: Array<u16> = Array::new();
+    mut cwd_ptr:  u16* = null;
     match (&cmd.current_directory) {
         Option::Some(path) => {
-            cwd_cstr = String::with_null(path.as_str());
-            cwd_ptr  = cwd_cstr.as_ptr();
+            cwd_wide = Utf16::encode(path.as_str());
+            cwd_ptr  = cwd_wide.as_ptr();
         }
         Option::None => { }
     }
 
-    mut si: syscall::STARTUPINFOA = syscall::STARTUPINFOA {
+    mut si: syscall::STARTUPINFOW = syscall::STARTUPINFOW {
         cb: 104, lpReserved: null, lpDesktop: null, lpTitle: null,
         dwX: 0, dwY: 0, dwXSize: 0, dwYSize: 0,
         dwXCountChars: 0, dwYCountChars: 0, dwFillAttribute: 0,
@@ -1344,12 +1346,12 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
         hProcess: null, hThread: null, dwProcessId: 0, dwThreadId: 0
     };
 
-    // Apply env overrides / env_clear via an explicit ANSI environment block.
-    // When there's nothing to change, pass null so the child inherits the
-    // parent's environment verbatim. `env_block` must outlive CreateProcessA
-    // (which copies it); it drops at function exit.
-    mut env_block: String = String::new();
-    mut env_ptr: u8* = null;
+    // Apply env overrides / env_clear via an explicit UTF-16 environment
+    // block. When there's nothing to change, pass null so the child inherits
+    // the parent's environment verbatim. `env_block` must outlive
+    // CreateProcessW (which copies it); it drops at function exit.
+    mut env_block: Array<u16> = Array::new();
+    mut env_ptr: u16* = null;
     if (cmd.clear_env_flag || cmd.envs.length() > 0) {
         env_block = build_env_block(cmd);
         env_ptr = env_block.as_ptr();
@@ -1359,11 +1361,11 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
     // start anything of its own, and as the root of a console process
     // group of its own, so a console control event can be sent to its tree
     // alone.
-    mut creation_flags: u32 = 0;
+    mut creation_flags: u32 = syscall::CREATE_UNICODE_ENVIRONMENT;
     if (cmd.group_descendants_flag) {
-        creation_flags = syscall::CREATE_SUSPENDED | syscall::CREATE_NEW_PROCESS_GROUP;
+        creation_flags = creation_flags | syscall::CREATE_SUSPENDED | syscall::CREATE_NEW_PROCESS_GROUP;
     }
-    const ok: i32 = syscall::CreateProcessA(null, cmdline.as_ptr(), null, null,
+    const ok: i32 = syscall::CreateProcessW(null, &cmdline[0], null, null,
                                             1, creation_flags, env_ptr, cwd_ptr, &si, &pi);
     // Read before the closes below can overwrite it; used only on failure.
     const create_error: IoError = IoError::last_os_error();
