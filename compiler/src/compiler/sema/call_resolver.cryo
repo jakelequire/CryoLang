@@ -9944,9 +9944,24 @@ type struct CallResolver {
             }
         }
         mut bindings: [TypeRef] = [];
-        for (mut i: i64 = 0; i < ictx.bindings.length(); i++) { bindings.push(ictx.bindings[i]); }
+        for (mut i: i64 = 0; i < ictx.bindings.length(); i++) {
+            // With the guess allowed, the parameters after the bound prefix
+            // that nothing binds take their declared defaults, as they do
+            // when nothing is guessed: `Box<T, A = GlobalAlloc>::new(41)`
+            // guesses `T` and is `Box<i32, GlobalAlloc>`, and is refused for
+            // the guess, not left over `T`.
+            if (allow_literal_default && !ictx.bindings[i].is_valid()) {
+                mut rc: ResolutionContext = ResolutionContext::new("");
+                this.symbolic.bind_body_scope(&rc);
+                bindings = this.ctx.type_resolver.expand_default_type_args(tmpl, bindings, &rc);
+                break;
+            }
+            bindings.push(ictx.bindings[i]);
+        }
+        if (bindings.length() != ictx.bindings.length()) { return []; }
         for (mut i: i64 = 0; i < bindings.length(); i++) {
             if (!this.symbolic.symbolic_type_concretizable(bindings[i])) { return []; }
+            if (ictx.bindings[i].is_valid() && !bindings[i].equals(ictx.bindings[i])) { return []; }
         }
         return bindings;
     }
@@ -10222,8 +10237,17 @@ type struct CallResolver {
                                       call_e: ExpressionNode*, tmpl: const TemplateEntry*) -> void {
         const owner_str:  string = this.intern.resolve(scope.scope_name);
         const method_str: string = this.intern.resolve(scope.member_name);
+        // The parameters with no default: a written list may stop before the
+        // defaulted ones, which then take their defaults.
+        const generic_params: &Slice<DeclarationNode*> = tmpl.get_generic_params();
         mut parameters: string = "";
         for (mut i: i64 = 0; i < tmpl.param_names.length(); i++) {
+            const gp: GenericParamDecl* = if (i < generic_params.length()) {
+                DeclarationNode::generic_param_of(generic_params[i])
+            } else {
+                null
+            };
+            if (gp != null && gp.has_default_annotation()) { break; }
             if (i > 0) { parameters = parameters + ", "; }
             parameters = parameters + this.intern.resolve(tmpl.param_names[i]);
         }
@@ -10235,7 +10259,7 @@ type struct CallResolver {
         d = d.with_note("the owner type argument would default to `i32` from an unsuffixed literal; a bare literal is no longer accepted as the only source for a generic owner's type argument");
         d = d.help(fmt::format("write the owner's type arguments, `%s::<%s>::%s(...)` with each parameter replaced by the type meant, or give the call an expected type",
             owner_str, parameters, method_str));
-        if (scope.scope_span.has_location()) {
+        if (scope.scope_span.has_location() && parameters != "") {
             d = d.suggest(Suggestion::single(scope.scope_span.end_point(), fmt::format("::<%s>", parameters).into_raw(),
                 "write the owner's type arguments, replacing each parameter with the type meant",
                 Applicability::HasPlaceholders));
