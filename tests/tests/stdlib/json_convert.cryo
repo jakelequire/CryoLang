@@ -1,0 +1,129 @@
+///! Typed JSON: each standard type written with `ToJson`, serialized,
+///! parsed and read back with `FromJson` is the value it was; a value of
+///! the wrong shape or out of range is refused with where and why.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::JsonConvert;
+
+import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::json::value::{ JsonValue };
+import std::json::parser;
+import std::json::serializer;
+import std::json::convert::{ FromJson, JsonDecodeError, ToJson };
+import std::test::error::{ TestError };
+import std::test::assert::{ bail, expect, expect_eq };
+
+/// `value` written, serialized, parsed and read back as a `T`.
+function round_trip<T>(value: &T) -> Result<T, TestError> where T: ToJson + FromJson {
+    const text: String = serializer::stringify(&value.to_json());
+    return read_as::<T>(text.as_str());
+}
+
+/// `text` parsed and read as a `T`; a decoding error fails the test.
+function read_as<T>(text: Str) -> Result<T, TestError> where T: FromJson {
+    const parsed: JsonValue = match (parser::parse(text)) {
+        Result::Ok(value) => { value }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::from("the text must parse"))); }
+    };
+    return match (T::from_json(&parsed)) {
+        Result::Ok(read) => { Result::Ok(read) }
+        Result::Err(error) => {
+            const message: String = f"{error}";
+            Result::Err(TestError::failed(message.as_str()))
+        }
+    };
+}
+
+/// The error reading `text` as a `T`, printed.
+function refusal<T>(text: Str) -> Result<String, TestError> where T: FromJson {
+    const parsed: JsonValue = match (parser::parse(text)) {
+        Result::Ok(value) => { value }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::from("the text must parse"))); }
+    };
+    return match (T::from_json(&parsed)) {
+        Result::Ok(_) => { Result::Err(TestError::failed(Str::from("the value must be refused"))) }
+        Result::Err(error) => { Result::Ok(f"{error}") }
+    };
+}
+
+![test]
+function integers_round_trip_at_their_limits() -> Result<(), TestError> {
+    expect_eq(round_trip(&i8::MIN)?, i8::MIN)?;
+    expect_eq(round_trip(&i8::MAX)?, i8::MAX)?;
+    expect_eq(round_trip(&i16::MIN)?, i16::MIN)?;
+    expect_eq(round_trip(&i32::MAX)?, i32::MAX)?;
+    expect_eq(round_trip(&i64::MIN)?, i64::MIN)?;
+    expect_eq(round_trip(&i64::MAX)?, i64::MAX)?;
+    expect_eq(round_trip(&u8::MAX)?, u8::MAX)?;
+    expect_eq(round_trip(&u16::MAX)?, u16::MAX)?;
+    expect_eq(round_trip(&u32::MAX)?, u32::MAX)?;
+    return expect_eq(round_trip(&u64::MAX)?, u64::MAX);
+}
+
+![test]
+function an_integer_out_of_range_is_refused() -> Result<(), TestError> {
+    expect_eq(refusal::<u8>(Str::from("256"))?, String::from_str(Str::from("expected a u8, found a number out of its range")))?;
+    expect_eq(refusal::<i8>(Str::from("-129"))?, String::from_str(Str::from("expected an i8, found a number out of its range")))?;
+    expect_eq(refusal::<u32>(Str::from("-1"))?, String::from_str(Str::from("expected a u32, found a number out of its range")))?;
+    return expect_eq(refusal::<i32>(Str::from("1.5"))?, String::from_str(Str::from("expected an i32, found a number out of its range")));
+}
+
+![test]
+function floats_booleans_and_strings_round_trip() -> Result<(), TestError> {
+    const tenth: f64 = 0.1;
+    expect_eq(round_trip(&tenth)?, tenth)?;
+    const large: f64 = -2.5e10;
+    expect_eq(round_trip(&large)?, large)?;
+    const small: f32 = 1.5;
+    expect_eq(read_as::<f32>(Str::from("1.5"))?, small)?;
+    const yes: boolean = true;
+    expect_eq(round_trip(&yes)?, yes)?;
+    const no: boolean = false;
+    expect_eq(round_trip(&no)?, no)?;
+    const text: String = String::from_str(Str::from("a \"quoted\" line\nand \u{e9}\u{4e2d}"));
+    return expect_eq(round_trip(&text)?, text);
+}
+
+![test]
+function a_str_is_written_as_a_string() -> Result<(), TestError> {
+    const written: String = serializer::stringify(&Str::from("view").to_json());
+    return expect_eq(written, String::from_str(Str::from("\"view\"")));
+}
+
+![test]
+function an_option_is_written_as_null_or_its_value() -> Result<(), TestError> {
+    const absent: Option<i32> = Option::None;
+    expect_eq(serializer::stringify(&absent.to_json()), String::from_str(Str::from("null")))?;
+    const present: Option<i32> = Option::Some(5);
+    return expect_eq(serializer::stringify(&present.to_json()), String::from_str(Str::from("5")));
+}
+
+![test]
+function nested_arrays_round_trip() -> Result<(), TestError> {
+    mut rows: Array<Array<i64>> = Array::new();
+    mut first: Array<i64> = Array::new();
+    first.push(1);
+    first.push(-2);
+    rows.push(first);
+    rows.push(Array::new());
+    expect_eq(serializer::stringify(&rows.to_json()), String::from_str(Str::from("[[1,-2],[]]")))?;
+    const back: Array<Array<i64>> = round_trip(&rows)?;
+    return expect(back == rows, Str::from("the rows read back as written"));
+}
+
+![test]
+function a_refusal_names_where_it_was_met() -> Result<(), TestError> {
+    expect_eq(refusal::<Array<Array<i32>>>(Str::from("[[1], [1, \"x\"]]"))?,
+              String::from_str(Str::from("at [1][1]: expected an i32, found a string")))?;
+    expect_eq(refusal::<Array<boolean>>(Str::from("{}"))?,
+              String::from_str(Str::from("expected an array, found an object")))?;
+    expect_eq(refusal::<String>(Str::from("[null]"))?,
+              String::from_str(Str::from("expected a string, found an array")))?;
+    const missing: JsonDecodeError = JsonDecodeError::missing_field(Str::from("port")).at_field(Str::from("server"));
+    expect_eq(missing.path(), Str::from(".server.port"))?;
+    return expect_eq(f"{missing}", String::from_str(Str::from("at .server.port: expected a value, found nothing")));
+}

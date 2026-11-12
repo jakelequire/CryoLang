@@ -1,0 +1,323 @@
+///! Typed JSON: a value of a Cryo type written as a `JsonValue`
+///! (`ToJson`), and read back from one (`FromJson`).
+///!
+///! ```cryo
+///! const ports: Array<u16> = ...;
+///! const text: String = serializer::stringify(&ports.to_json());
+///! const back: Array<u16> = Array::<u16>::from_json(&parser::parse(text.as_str())?)?;
+///! ```
+///!
+///! The standard types implement both: `boolean`, every integer width,
+///! `f64`, `String`, and `Array<T>` (a JSON array). `Str` and `Option<T>`
+///! (`None` as `null`) are written only, and `f32` is read only. Reading checks the
+///! shape and the range: `300` read as a `u8` is a `JsonDecodeError` naming
+///! where in the document it was and what was expected there, not a
+///! wrapped value.
+///!
+///! `TryFrom<&JsonValue>` and `JsonValue.as<T>()` stay the way to borrow a
+///! scalar out of a value in place; `FromJson` builds an owned value of any
+///! shape and says where reading it failed.
+
+namespace std::json::convert;
+
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::alloc::allocator::{ GlobalAlloc };
+import std::json::value::{ JsonNumber, JsonObject, JsonValue };
+
+/// A value that can be written as JSON.
+public type trait ToJson {
+    /// This value as a JSON value the caller owns.
+    to_json(&this) -> JsonValue;
+}
+
+/// A value that can be read from JSON.
+public type trait FromJson {
+    /// Read a value of this type from `value`, or say where in it and why
+    /// it could not be read.
+    static from_json(value: &JsonValue) -> Result<This, JsonDecodeError>;
+}
+
+/// Why a JSON value could not be read as a type: where in the document
+/// (`path`, from the value read: `.servers[2].port`, empty for the value
+/// itself), what was expected there and what was found. It prints as
+/// `at .servers[2].port: expected a u16, found a string`.
+public type struct JsonDecodeError {
+    private path: String;
+    private expected: Str;
+    private found: Str;
+
+    /// `value` was found where `expected` (`"a u16"`, `"an object"`) was
+    /// wanted.
+    public static unexpected(expected: Str, value: &JsonValue) -> JsonDecodeError {
+        const found: string = match (value) {
+            JsonValue::Null      => { "null" }
+            JsonValue::Bool(_)   => { "a boolean" }
+            JsonValue::Number(_) => { "a number" }
+            JsonValue::String(_) => { "a string" }
+            JsonValue::Array(_)  => { "an array" }
+            JsonValue::Object(_) => { "an object" }
+        };
+        return JsonDecodeError { path: String::new(), expected: expected, found: Str::new(found) };
+    }
+
+    /// A number was found where `expected` was wanted, but it is out of
+    /// that type's range or is not a whole number.
+    public static out_of_range(expected: Str) -> JsonDecodeError {
+        return JsonDecodeError { path: String::new(), expected: expected,
+                                 found: Str::new("a number out of its range") };
+    }
+
+    /// An object has no member `name`, which the type being read needs.
+    public static missing_field(name: Str) -> JsonDecodeError {
+        return JsonDecodeError { path: f".{name}", expected: Str::new("a value"),
+                                 found: Str::new("nothing") };
+    }
+
+    /// This error, met reading the member `name` of an object.
+    public at_field(this, name: Str) -> JsonDecodeError {
+        return JsonDecodeError { path: f".{name}{this.path}", expected: this.expected, found: this.found };
+    }
+
+    /// This error, met reading the element `index` of an array.
+    public at_index(this, index: i64) -> JsonDecodeError {
+        return JsonDecodeError { path: f"[{index}]{this.path}", expected: this.expected, found: this.found };
+    }
+
+    /// Where the value that could not be read is: `.servers[2].port`, or
+    /// empty for the value read itself.
+    public path(&this) -> Str {
+        return this.path.as_str();
+    }
+
+    /// What was wanted there: `a u16`, `an object`.
+    public expected(&this) -> Str {
+        return this.expected;
+    }
+
+    /// What was there: `a string`, `a number out of its range`, `nothing`.
+    public found(&this) -> Str {
+        return this.found;
+    }
+}
+
+// A number read as an integer type: `value` must be a whole number from
+// `minimum` to `maximum`. Signed widths read through `i64`, unsigned
+// widths through `u64`.
+private function signed_from_json(value: &JsonValue, minimum: i64, maximum: i64, expected: string) -> Result<i64, JsonDecodeError> {
+    match (value) {
+        JsonValue::Number(number) => {
+            match (number.as_i64()) {
+                Option::Some(whole) => {
+                    if (whole >= minimum && whole <= maximum) { return Result::Ok(whole); }
+                }
+                Option::None => { }
+            }
+            return Result::Err(JsonDecodeError::out_of_range(Str::new(expected)));
+        }
+        _ => { return Result::Err(JsonDecodeError::unexpected(Str::new(expected), value)); }
+    }
+}
+
+private function unsigned_from_json(value: &JsonValue, maximum: u64, expected: string) -> Result<u64, JsonDecodeError> {
+    match (value) {
+        JsonValue::Number(number) => {
+            match (number.as_u64()) {
+                Option::Some(whole) => {
+                    if (whole <= maximum) { return Result::Ok(whole); }
+                }
+                Option::None => { }
+            }
+            return Result::Err(JsonDecodeError::out_of_range(Str::new(expected)));
+        }
+        _ => { return Result::Err(JsonDecodeError::unexpected(Str::new(expected), value)); }
+    }
+}
+
+// An unsigned value is written as `Int` when it fits, as the parser reads
+// it, so a value written and parsed again is the same `JsonNumber`.
+private function unsigned_to_json(value: u64) -> JsonValue {
+    if (value <= i64::MAX as u64) { return JsonValue::int_value(value as i64); }
+    return JsonValue::uint_value(value);
+}
+
+implement trait ToJson for boolean {
+    to_json(&this) -> JsonValue { return JsonValue::Bool(this); }
+}
+
+implement trait FromJson for boolean {
+    static from_json(value: &JsonValue) -> Result<boolean, JsonDecodeError> {
+        return match (value) {
+            JsonValue::Bool(b) => { Result::Ok(b) }
+            _                  => { Result::Err(JsonDecodeError::unexpected(Str::new("a boolean"), value)) }
+        };
+    }
+}
+
+implement trait ToJson for i8 {
+    to_json(&this) -> JsonValue { return JsonValue::int_value(this); }
+}
+
+implement trait FromJson for i8 {
+    static from_json(value: &JsonValue) -> Result<i8, JsonDecodeError> {
+        return Result::Ok(signed_from_json(value, i8::MIN, i8::MAX, "an i8")? as i8);
+    }
+}
+
+implement trait ToJson for i16 {
+    to_json(&this) -> JsonValue { return JsonValue::int_value(this); }
+}
+
+implement trait FromJson for i16 {
+    static from_json(value: &JsonValue) -> Result<i16, JsonDecodeError> {
+        return Result::Ok(signed_from_json(value, i16::MIN, i16::MAX, "an i16")? as i16);
+    }
+}
+
+implement trait ToJson for i32 {
+    to_json(&this) -> JsonValue { return JsonValue::int_value(this); }
+}
+
+implement trait FromJson for i32 {
+    static from_json(value: &JsonValue) -> Result<i32, JsonDecodeError> {
+        return Result::Ok(signed_from_json(value, i32::MIN, i32::MAX, "an i32")? as i32);
+    }
+}
+
+implement trait ToJson for i64 {
+    to_json(&this) -> JsonValue { return JsonValue::int_value(this); }
+}
+
+implement trait FromJson for i64 {
+    static from_json(value: &JsonValue) -> Result<i64, JsonDecodeError> {
+        return signed_from_json(value, i64::MIN, i64::MAX, "an i64");
+    }
+}
+
+implement trait ToJson for u8 {
+    to_json(&this) -> JsonValue { return unsigned_to_json(this); }
+}
+
+implement trait FromJson for u8 {
+    static from_json(value: &JsonValue) -> Result<u8, JsonDecodeError> {
+        return Result::Ok(unsigned_from_json(value, u8::MAX, "a u8")? as u8);
+    }
+}
+
+implement trait ToJson for u16 {
+    to_json(&this) -> JsonValue { return unsigned_to_json(this); }
+}
+
+implement trait FromJson for u16 {
+    static from_json(value: &JsonValue) -> Result<u16, JsonDecodeError> {
+        return Result::Ok(unsigned_from_json(value, u16::MAX, "a u16")? as u16);
+    }
+}
+
+implement trait ToJson for u32 {
+    to_json(&this) -> JsonValue { return unsigned_to_json(this); }
+}
+
+implement trait FromJson for u32 {
+    static from_json(value: &JsonValue) -> Result<u32, JsonDecodeError> {
+        return Result::Ok(unsigned_from_json(value, u32::MAX, "a u32")? as u32);
+    }
+}
+
+implement trait ToJson for u64 {
+    to_json(&this) -> JsonValue { return unsigned_to_json(this); }
+}
+
+implement trait FromJson for u64 {
+    static from_json(value: &JsonValue) -> Result<u64, JsonDecodeError> {
+        return unsigned_from_json(value, u64::MAX, "a u64");
+    }
+}
+
+/// A NaN or an infinity has no JSON number; the serializer writes it as
+/// `null`, which reads back as an error, not as the number.
+implement trait ToJson for f64 {
+    to_json(&this) -> JsonValue { return JsonValue::Number(JsonNumber::Float(this)); }
+}
+
+implement trait FromJson for f64 {
+    static from_json(value: &JsonValue) -> Result<f64, JsonDecodeError> {
+        return match (value) {
+            JsonValue::Number(number) => { Result::Ok(number.as_f64()) }
+            _                         => { Result::Err(JsonDecodeError::unexpected(Str::new("an f64"), value)) }
+        };
+    }
+}
+
+/// The nearest `f32` to the number written.
+implement trait FromJson for f32 {
+    static from_json(value: &JsonValue) -> Result<f32, JsonDecodeError> {
+        return match (value) {
+            JsonValue::Number(number) => { Result::Ok(number.as_f64() as f32) }
+            _                         => { Result::Err(JsonDecodeError::unexpected(Str::new("an f32"), value)) }
+        };
+    }
+}
+
+implement<A> trait ToJson for struct String<A> {
+    to_json(&this) -> JsonValue { return JsonValue::from(this.as_str()); }
+}
+
+implement trait FromJson for struct String<GlobalAlloc> {
+    static from_json(value: &JsonValue) -> Result<String, JsonDecodeError> {
+        return match (value) {
+            JsonValue::String(text) => { Result::Ok(String::from_str(text.as_str())) }
+            _                       => { Result::Err(JsonDecodeError::unexpected(Str::new("a string"), value)) }
+        };
+    }
+}
+
+/// Written only: a `Str` borrows its text, so reading one is
+/// `JsonValue.as<Str>()`, a view into the value read.
+implement trait ToJson for Str {
+    to_json(&this) -> JsonValue { return JsonValue::from(this); }
+}
+
+/// `None` is written as `null`.
+implement<T> trait ToJson for enum Option<T> where T: ToJson {
+    to_json(&this) -> JsonValue {
+        return match (this) {
+            Option::Some(inner) => { inner.to_json() }
+            Option::None        => { JsonValue::Null }
+        };
+    }
+}
+
+implement<T, A> trait ToJson for struct Array<T, A> where T: ToJson {
+    to_json(&this) -> JsonValue {
+        mut items: Array<JsonValue> = Array::with_capacity(this.length());
+        for (item in this.iter_ref()) {
+            items.push(item.to_json());
+        }
+        return JsonValue::Array(items);
+    }
+}
+
+/// A JSON array, each element read as `T`; an element that cannot be is
+/// named by its index in the error.
+implement<T> trait FromJson for struct Array<T, GlobalAlloc> where T: FromJson {
+    static from_json(value: &JsonValue) -> Result<Array<T, GlobalAlloc>, JsonDecodeError> {
+        match (value) {
+            JsonValue::Array(elements) => {
+                mut items: Array<T> = Array::with_capacity(elements.length());
+                for (mut index: i64 = 0; index < elements.length(); index++) {
+                    match (T::from_json(&elements[index])) {
+                        Result::Ok(item) => { items.push(item); }
+                        Result::Err(error) => { return Result::Err(error.at_index(index)); }
+                    }
+                }
+                return Result::Ok(items);
+            }
+            _ => { return Result::Err(JsonDecodeError::unexpected(Str::new("an array"), value)); }
+        }
+    }
+}
+

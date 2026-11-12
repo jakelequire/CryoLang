@@ -8,13 +8,11 @@
 ///! anything else answers `null`.
 namespace lsp::handlers::hover;
 
-import std::fmt;
 import std::core::option;
 import std::core::mem;
 import std::collections::str;
 import std::collections::string::{ String };
 import std::json::value;
-import std::ffi::libc;
 
 import compiler::compilation_context::{ CompilationContext };
 import compiler::ast::{ LiteralKind, TypeAnnotation, Visibility };
@@ -72,13 +70,14 @@ type struct Shown {
     ctx:   CompilationContext*;
     /// The texts the analysis read, a declaration's source is shown from.
     docs:  const docs::Docs*;
-    text:  string;
+    text:  String;
     /// Comment lines above the directives, each ending in a newline: a
     /// type's size and alignment.
-    preface: string;
+    preface: String;
     /// `![...]` lines, one per directive, each ending in a newline.
-    directives: string;
-    doc:   string;
+    directives: String;
+    /// The declaration's doc comment as written, its markers included.
+    doc:   String;
     /// How paths and types are written: by their own name, or in full.
     names: Names;
     /// The editor's longer hover: a type's methods and constants are listed
@@ -86,8 +85,8 @@ type struct Shown {
     expanded: boolean;
 
     static new(docs: const docs::Docs*, names: Names) -> Shown {
-        return Shown { ctx: names.ctx, docs: docs, text: "", preface: "", directives: "", doc: "",
-                       names: names, expanded: false };
+        return Shown { ctx: names.ctx, docs: docs, text: String::new(), preface: String::new(),
+                       directives: String::new(), doc: String::new(), names: names, expanded: false };
     }
 
     /// The hover at the request's position; `expanded`, a type's members
@@ -133,16 +132,17 @@ type struct Shown {
         match (&a.target) {
             Target::Def(d) => {
                 if (a.receiver) {
-                    this.text = "this: " + this.type_text(a.ty);
+                    this.text = f"this: {this.type_text(a.ty)}";
                     return;
                 }
                 this.def(d);
             }
             Target::Local(s)      => { this.local(s, a.ty); }
             Target::TypeParam(s)  => {
-                this.text = "type parameter " + this.ctx.intern_table.resolve(this.ctx.resolver.get_symbol(s).name);
+                const name: string = this.ctx.intern_table.resolve(this.ctx.resolver.get_symbol(s).name);
+                this.text = f"type parameter {name}";
             }
-            Target::Prim(p)       => { this.text = this.ctx.intern_table.resolve(p); }
+            Target::Prim(p)       => { this.text = String::from_string(this.ctx.intern_table.resolve(p)); }
             Target::Field(o, i)   => { this.field(o, i); }
             Target::Variant(o, i) => { this.variant(o, i); }
             Target::Nothing       => { }
@@ -163,21 +163,21 @@ type struct Shown {
 
     def(mut &this, d: DefId) -> void {
         if (this.ctx.defs.kind_of(d) == DefKind::Module) {
-            this.text = "module " + this.path(d);
+            this.text = f"module {this.path(d)}";
             return;
         }
         const decl: DeclarationNode* = this.ctx.decl_index.declaration_of(d);
         if (decl == null) {
-            this.text = this.path(d);
+            this.text = String::from_string(this.path(d));
             return;
         }
-        this.doc = decl.documentation;
+        this.doc = String::from_string(decl.documentation);
         this.show_directives(&decl.attached_directives);
         // The expanded hover writes paths in full: a type shown as its source
         // writes it is placed in its module above its head.
         if (this.expanded && this.ctx.defs.kind_of(d) == DefKind::Type) {
             const home: DefId = this.ctx.defs.parent_of(d);
-            if (home.is_valid()) { this.preface = "// in " + this.path(home) + "\n"; }
+            if (home.is_valid()) { this.preface = f"// in {this.path(home)}\n"; }
         }
         // How far the definition reaches, as its registration recorded it:
         // what is written, or the default where nothing is.  A method's is
@@ -191,56 +191,58 @@ type struct Shown {
         match (decl.kind) {
             DeclKind::Method(m) => {
                 if (m.func != null) {
-                    if (this.doc.length() == 0) { this.doc = m.func.documentation; }
+                    if (this.doc.length() == 0) { this.doc = String::from_string(m.func.documentation); }
                     const written: Option<String> = this.method_head(d, decl, m);
                     this.text = if (written.is_some()) {
-                        written.unwrap().into_raw()
+                        written.unwrap()
                     } else {
-                        m.visibility.label() + " " + this.signature(d, m.func, m.is_static)
+                        f"{m.visibility.label()} {this.signature(d, m.func, m.is_static)}"
                     };
                 }
             }
             DeclKind::Function(f) => {
                 const written: Option<String> = this.written_head(decl, decl, f.body);
+                if (written.is_none()) {
+                    this.text = f"{reach}{this.signature(d, decl, false)}";
+                    return;
+                }
+                this.text = written.unwrap();
                 // A head written with no return type returns `void`, and says so.
-                const returns: string = if (f.return_type_annotation == null) {
-                    " -> " + this.type_text(f.resolved_return_type)
-                } else { "" };
-                this.text = if (written.is_some()) { written.unwrap().into_raw() + returns } else { reach + this.signature(d, decl, false) };
+                if (f.return_type_annotation == null) {
+                    this.text.push(" -> ");
+                    this.text.push(this.type_text(f.resolved_return_type));
+                }
             }
             DeclKind::Intrinsic(f) => {
                 const written: Option<String> = this.written_head(decl, decl, f.body);
                 this.text = if (written.is_some()) {
-                    written.unwrap().into_raw()
+                    written.unwrap()
                 } else {
-                    reach + "intrinsic function " + this.path(d) + "("
-                        + this.params(&f.parameters, false, f.is_variadic) + ") -> "
-                        + this.type_text(f.resolved_return_type)
+                    f"{reach}intrinsic function {this.path(d)}({this.params(&f.parameters, false, f.is_variadic)}) -> {this.type_text(f.resolved_return_type)}"
                 };
             }
-            DeclKind::TypeAlias(_) => { this.text = this.written_or(decl, reach + "type " + this.path(d)); }
-            DeclKind::Trait(_)     => { this.text = this.written_or(decl, reach + "type trait " + this.path(d)); }
+            DeclKind::TypeAlias(_) => { this.text = this.written_or(decl, f"{reach}type {this.path(d)}"); }
+            DeclKind::Trait(_)     => { this.text = this.written_or(decl, f"{reach}type trait {this.path(d)}"); }
             DeclKind::Enum(_)      => {
-                this.preface = this.preface + this.layout_line(d, decl);
-                this.text = this.type_block(d, decl, reach + "type enum " + this.path(d));
+                this.preface.push(this.layout_line(d, decl));
+                this.text = this.type_block(d, decl, f"{reach}type enum {this.path(d)}");
             }
             DeclKind::Union(_)     => {
-                this.preface = this.preface + this.layout_line(d, decl);
-                this.text = this.type_block(d, decl, reach + "type union " + this.path(d));
+                this.preface.push(this.layout_line(d, decl));
+                this.text = this.type_block(d, decl, f"{reach}type union {this.path(d)}");
             }
             DeclKind::Struct(_)    => {
-                this.preface = this.preface + this.layout_line(d, decl);
-                this.text = this.type_block(d, decl, reach + "type struct " + this.path(d));
+                this.preface.push(this.layout_line(d, decl));
+                this.text = this.type_block(d, decl, f"{reach}type struct {this.path(d)}");
             }
             DeclKind::Variable(v)  => {
                 const kw: string = if (v.is_mutable) { "mut " } else { "const " };
-                this.text = reach + kw + this.path(d) + ": "
-                    + this.names.type_text_written(v.resolved_type, v.type_annotation);
+                this.text = f"{reach}{kw}{this.path(d)}: {this.names.type_text_written(v.resolved_type, v.type_annotation)}";
             }
             DeclKind::Import(_) | DeclKind::Module(_) | DeclKind::Impl(_)
             | DeclKind::Variant(_) | DeclKind::Extern(_) | DeclKind::Destructure(_)
             | DeclKind::Field(_) | DeclKind::GenericParam(_) => {
-                this.text = this.path(d);
+                this.text = String::from_string(this.path(d));
             }
         }
     }
@@ -353,12 +355,14 @@ type struct Shown {
     /// trait's implementation declares, then its owner's name and `.` for
     /// one called on a value (`Person.age_of`) or `::` for a static
     /// (`Person::new`).
-    method_prefix(&this, d: DefId, f_decl: DeclarationNode*, is_static: boolean) -> string {
+    method_prefix(&this, d: DefId, f_decl: DeclarationNode*, is_static: boolean) -> String {
         const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
-        mut out: string = if (f != null && f.origin_trait.is_valid()) { "trait " } else { "" };
+        mut out: String = String::new();
+        if (f != null && f.origin_trait.is_valid()) { out.push("trait "); }
         const owner: DefId = this.ctx.defs.parent_of(d);
         if (owner.is_valid()) {
-            out = out + this.path(owner) + if (is_static) { "::" } else { "." };
+            out.push(this.path(owner));
+            out.push(if (is_static) { "::" } else { "." });
         }
         return out;
     }
@@ -366,11 +370,11 @@ type struct Shown {
     /// A type's or a trait's head as its source writes it, up to the `{`
     /// opening its body; an alias whole.  `otherwise` when the text the
     /// analysis read cannot be had.
-    written_or(&this, decl: DeclarationNode*, otherwise: string) -> string {
+    written_or(&this, decl: DeclarationNode*, otherwise: String) -> String {
         const at: SourceSpan = Shown::written_extent(decl, decl);
         const written: Option<String> = this.written_text(at, at.end_line, at.end_col, true);
         if (written.is_none()) { return otherwise; }
-        return written.unwrap().into_raw();
+        return written.unwrap();
     }
 
     /// The source text from `at`'s start up to (`end_line`, `end_col`),
@@ -464,14 +468,13 @@ type struct Shown {
     /// A struct's, a union's or an enum's hover: its head as written (`head` when the source
     /// cannot be had), and its fields or variants as written, one a line;
     /// the expanded hover adds its methods and constants.
-    type_block(&this, d: DefId, decl: DeclarationNode*, head: string) -> string {
-        mut out: String = String::with_capacity(128);
-        out.push(this.written_or(decl, head));
+    type_block(&this, d: DefId, decl: DeclarationNode*, head: String) -> String {
+        mut out: String = this.written_or(decl, head);
         out.push(" {");
         const all: [Member] = Members::of_type(this.ctx, d);
         mut listed: i64 = 0;
         for (mut i: i64 = 0; i < all.length(); i++) {
-            mut line: string = "";
+            mut line: String = String::new();
             match (&all[i]) {
                 Member::Field(o, k)   => { line = this.member_text(Members::field_decl(this.ctx, o, k)); }
                 Member::Variant(o, k) => { line = this.member_text(Members::variant_decl(this.ctx, o, k)); }
@@ -482,54 +485,57 @@ type struct Shown {
                     } else { null };
                     if (declared != null) {
                         const written: Option<String> = this.written_head(declared, m.func, Shown::body_of(m.func));
-                        if (written.is_some()) { line = Shown::with_reach(written.unwrap(), m.visibility).into_raw(); }
+                        if (written.is_some()) { line = Shown::with_reach(written.unwrap(), m.visibility); }
                     }
                 }
                 Member::Constant(c) => {
                     if (this.expanded) {
                         mut shown: Shown = Shown::new(this.docs, this.names);
                         shown.def(c);
-                        line = shown.text;
+                        line.push(shown.text.as_str());
                     }
                 }
             }
             if (line.length() == 0) { continue; }
             const newline: str::Str = str::Str::from("\n");
-            for (piece in str::Str::from(line).split(&newline)) {
+            for (piece in line.as_str().split(&newline)) {
                 out.push("\n    ");
                 out.push(piece);
             }
             listed = listed + 1;
         }
         out.push(if (listed > 0) { "\n}" } else { "}" });
-        return out.into_raw();
+        return out;
     }
 
     /// A field's or a variant's source text, `;` closing it; its name and
     /// type when the source cannot be had.
-    member_text(&this, member: DeclarationNode*) -> string {
-        if (member == null) { return ""; }
+    member_text(&this, member: DeclarationNode*) -> String {
+        if (member == null) { return String::new(); }
         const at: SourceSpan = Shown::written_extent(member, member);
         const written: Option<String> = this.written_text(at, at.end_line, at.end_col, false);
-        if (written.is_some()) { return written.unwrap().into_raw() + ";"; }
+        if (written.is_some()) {
+            mut text: String = written.unwrap();
+            text.push(";");
+            return text;
+        }
         const fd: FieldDecl* = DeclarationNode::field_of(member);
         if (fd != null) {
-            return this.ctx.intern_table.resolve(fd.name) + ": "
-                + this.names.type_text_written(fd.resolved_type, fd.type_annotation) + ";";
+            return f"{this.ctx.intern_table.resolve(fd.name)}: {this.names.type_text_written(fd.resolved_type, fd.type_annotation)};";
         }
         const v: EnumVariant* = DeclarationNode::variant_of(member);
-        if (v != null) { return this.ctx.intern_table.resolve(v.name) + ";"; }
-        return "";
+        if (v != null) { return f"{this.ctx.intern_table.resolve(v.name)};"; }
+        return String::new();
     }
 
     /// `// size = N, align = M` and a newline, for a type the analysis laid
     /// out: one with no type parameters of its own.  Empty for a template,
     /// which has no layout until it is instantiated.
-    layout_line(&this, d: DefId, decl: DeclarationNode*) -> string {
-        if (Shown::has_type_parameters(decl)) { return ""; }
+    layout_line(&this, d: DefId, decl: DeclarationNode*) -> String {
+        if (Shown::has_type_parameters(decl)) { return String::new(); }
         const ty: Type* = this.ctx.type_arena.lookup(this.ctx.decl_index.type_of_def(d));
-        if (ty == null || ty.size_bytes() == 0) { return ""; }
-        return fmt::format("// size = %llu, align = %llu\n", ty.size_bytes(), ty.alignment()).into_raw();
+        if (ty == null || ty.size_bytes() == 0) { return String::new(); }
+        return f"// size = {ty.size_bytes()}, align = {ty.alignment()}\n";
     }
 
     /// Whether a type declaration declares type parameters.
@@ -552,47 +558,50 @@ type struct Shown {
                 _          => { false }
             };
             if (hidden) { continue; }
-            this.directives = this.directives + "![" + written[i].to_text() + "]\n";
+            this.directives.push(f"![{written[i].to_text()}]\n");
         }
     }
 
     /// `function a::b(x: i32) -> i64`, or for a method `[static]
     /// Owner::m(...)`.
-    signature(&this, d: DefId, f_decl: DeclarationNode*, is_static: boolean) -> string {
+    signature(&this, d: DefId, f_decl: DeclarationNode*, is_static: boolean) -> String {
         const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
         const is_method: boolean = this.ctx.defs.kind_of(d) == DefKind::Method;
-        const named: string = if (is_method) {
-            this.method_prefix(d, f_decl, is_static) + this.ctx.intern_table.shown(this.ctx.defs.leaf_of(d))
-        } else { "function " + this.path(d) };
         // An instance method's first parameter is its receiver, written
         // `this`, `&this` or `mut &this`, and shown as written.
         const receiver: boolean = is_method && !is_static;
-        return named + "(" + this.params(&f.parameters, receiver, f.is_variadic) + ") -> "
-            + this.names.type_text_written(f.resolved_return_type, f.return_type_annotation);
+        const parameters: String = this.params(&f.parameters, receiver, f.is_variadic);
+        const returns: string = this.names.type_text_written(f.resolved_return_type, f.return_type_annotation);
+        if (is_method) {
+            const name: string = this.ctx.intern_table.shown(this.ctx.defs.leaf_of(d));
+            return f"{this.method_prefix(d, f_decl, is_static)}{name}({parameters}) -> {returns}";
+        }
+        return f"function {this.path(d)}({parameters}) -> {returns}";
     }
 
     /// The parameters as written.  A `variadic` function's last parameter
     /// written with no type is its named rest (`args...`); with none, the
     /// rest is a bare `...`.
-    params(&this, ps: &[DeclarationNode*], receiver: boolean, variadic: boolean) -> string {
-        mut out: string = "";
+    params(&this, ps: &[DeclarationNode*], receiver: boolean, variadic: boolean) -> String {
+        mut out: String = String::new();
         mut named_rest: boolean = false;
         for (mut i: i64 = 0; i < ps.length(); i++) {
-            if (i > 0) { out = out + ", "; }
+            if (i > 0) { out.push(", "); }
             const p: VarDecl* = DeclarationNode::var_of(ps[i]);
             // The receiver's name is its spelling (`&this`, `this`); a
             // `mut` written before it is the parameter's mutability.
-            if (i == 0 && receiver && p.is_mutable) { out = out + "mut "; }
-            out = out + this.ctx.intern_table.resolve(p.name);
+            if (i == 0 && receiver && p.is_mutable) { out.push("mut "); }
+            out.push(this.ctx.intern_table.resolve(p.name));
             if (variadic && i == ps.length() - 1 && p.type_annotation == null) {
-                out = out + "...";
+                out.push("...");
                 named_rest = true;
             } else if (i > 0 || !receiver) {
-                out = out + ": " + this.names.type_text_written(p.resolved_type, p.type_annotation);
+                out.push(": ");
+                out.push(this.names.type_text_written(p.resolved_type, p.type_annotation));
             }
         }
         if (variadic && !named_rest) {
-            out = if (ps.length() > 0) { out + ", ..." } else { "..." };
+            out.push(if (ps.length() > 0) { ", ..." } else { "..." });
         }
         return out;
     }
@@ -608,12 +617,12 @@ type struct Shown {
         }
         // A binding declared with an annotation shows its type as written.
         const at: DeclarationNode* = Declared::binding_decl(this.ctx, s);
-        if (at != null && DeclarationNode::var_of(at) != null) {
-            this.text = kw + name + ": "
-                + this.names.type_text_written(ty, (DeclarationNode::var_of(at)).type_annotation);
+        const declared: VarDecl* = if (at != null) { DeclarationNode::var_of(at) } else { null };
+        if (declared != null) {
+            this.text = f"{kw}{name}: {this.names.type_text_written(ty, declared.type_annotation)}";
             return;
         }
-        this.text = kw + name + ": " + this.type_text(ty);
+        this.text = f"{kw}{name}: {this.type_text(ty)}";
     }
 
     field(mut &this, owner: DefId, index: i64) -> void {
@@ -621,17 +630,17 @@ type struct Shown {
         if (h == null) { return; }
         const fd: FieldDecl* = DeclarationNode::field_of(h);
         this.show_directives(&h.attached_directives);
-        this.text = fd.visibility.label() + " field " + this.path(owner) + "." + this.ctx.intern_table.resolve(fd.name)
-            + ": " + this.names.type_text_written(fd.resolved_type, fd.type_annotation);
-        this.doc = h.documentation;
+        const name: string = this.ctx.intern_table.resolve(fd.name);
+        this.text = f"{fd.visibility.label()} field {this.path(owner)}.{name}: {this.names.type_text_written(fd.resolved_type, fd.type_annotation)}";
+        this.doc = String::from_string(h.documentation);
     }
 
     variant(mut &this, owner: DefId, ordinal: i64) -> void {
         const v: DeclarationNode* = Members::variant_decl(this.ctx, owner, ordinal);
         if (v == null) { return; }
-        this.text = this.path(owner) + "::"
-            + this.ctx.intern_table.resolve(DeclarationNode::variant_of(v).name);
-        this.doc = v.documentation;
+        const name: string = this.ctx.intern_table.resolve(DeclarationNode::variant_of(v).name);
+        this.text = f"{this.path(owner)}::{name}";
+        this.doc = String::from_string(v.documentation);
     }
 
     /// A segment of an import's path before its last - `std` or `core` in
@@ -669,12 +678,11 @@ type struct Shown {
         if (!m.is_valid()) { return Answer::nothing(); }
         const from: ModulePath = this.ctx.module_graph.get_module(asked.module_idx).path();
         const subs: [string] = Members::submodules_of(this.ctx, m, from);
-        mut out: String = String::from_str(str::Str::from(shown_path));
+        this.text = String::from_string(shown_path);
         for (mut i: i64 = 0; i < subs.length(); i++) {
-            out.push("\n    module ");
-            out.push(subs[i]);
+            this.text.push("\n    module ");
+            this.text.push(subs[i]);
         }
-        this.text = out.into_raw();
         return Answer::of(Target::Nothing, imp.path_segment_spans[segment], TypeRef::invalid());
     }
 
@@ -711,7 +719,7 @@ type struct Shown {
             out.push(")[");
             out.push(literal.byte_length);
             out.push("]");
-            this.text = out.into_raw();
+            this.text = out;
             return Answer::of(Target::Nothing, e.span, e.resolved_type);
         }
         // The holes, in the order written: the lowering appends each piece
@@ -752,7 +760,7 @@ type struct Shown {
         out.push(line.sub_bytes(from, end));
         out.push(" -> ");
         out.push(this.type_text(e.resolved_type));
-        this.text = out.into_raw();
+        this.text = out;
         return Answer::of(Target::Nothing, e.span, e.resolved_type);
     }
 
@@ -760,14 +768,14 @@ type struct Shown {
     reply(&this, docs: &docs::Docs, a: &Answer) -> value::JsonValue {
         mut body: String = String::with_capacity(64);
         body.push("```cryo\n");
-        body.push(this.preface);
-        body.push(this.directives);
-        body.push(this.text);
+        body.push(this.preface.as_str());
+        body.push(this.directives.as_str());
+        body.push(this.text.as_str());
         body.push("\n```");
-        const doc: string = Shown::clean_doc(this.doc);
+        const doc: String = Shown::clean_doc(this.doc.as_str());
         if (doc.length() > 0) {
             body.push("\n\n");
-            body.push(doc);
+            body.push(doc.as_str());
         }
         const hover: lsp::Hover = lsp::Hover {
             contents: lsp::MarkupContent::markdown(body),
@@ -782,49 +790,48 @@ type struct Shown {
     /// A doc comment as markdown: each line's `///`, `///!`, `/**`, `*`
     /// or `*/` marker and one following space removed, trailing blanks
     /// trimmed.
-    static clean_doc(raw: string) -> string {
-        if (raw == null) { return ""; }
-        const len: i64 = libc::strlen(raw) as i64;
-        if (len == 0) { return ""; }
-        const buf: mut i8* = libc::malloc((len + 1) as u64) as mut i8*;
-        mut out: i64 = 0;
-        mut i:   i64 = 0;
-        while (i < len) {
-            while (i < len && (raw[i] == ' ' as i8 || raw[i] == '\t' as i8)) { i = i + 1; }
-            if (i + 3 < len && raw[i] == '/' as i8 && raw[i + 1] == '/' as i8
-                    && raw[i + 2] == '/' as i8 && raw[i + 3] == '!' as i8) {
-                i = i + 4;
-            } else if (i + 2 < len && raw[i] == '/' as i8 && raw[i + 1] == '/' as i8
-                    && raw[i + 2] == '/' as i8) {
-                i = i + 3;
-            } else if (i + 2 < len && raw[i] == '/' as i8 && raw[i + 1] == '*' as i8
-                    && raw[i + 2] == '*' as i8) {
-                i = i + 3;
-            } else if (i + 1 < len && raw[i] == '*' as i8 && raw[i + 1] == '/' as i8) {
-                i = i + 2;
-            } else if (i < len && raw[i] == '*' as i8 && (i + 1 >= len || raw[i + 1] != '*' as i8)) {
-                i = i + 1;
+    static clean_doc(raw: str::Str) -> String {
+        mut out: String = String::with_capacity(raw.length());
+        const newline: str::Str = str::Str::from("\n");
+        mut first: boolean = true;
+        for (written in raw.split(&newline)) {
+            if (!first) { out.push("\n"); }
+            first = false;
+            mut line: str::Str = written;
+            while (line.length() > 0 && (line.byte_at(0).unwrap_or(0) == ' ' as u8 || line.byte_at(0).unwrap_or(0) == '\t' as u8)) {
+                line = line.sub_bytes(1, line.length());
             }
-            if (i < len && raw[i] == ' ' as i8) { i = i + 1; }
-            while (i < len && raw[i] != '\n' as i8) {
-                if (i + 1 < len && raw[i] == '*' as i8 && raw[i + 1] == '/' as i8) {
-                    i = i + 2;
-                    break;
+            const markers: [string] = ["///!", "///", "/**", "*/"];
+            mut marked: boolean = false;
+            for (mut k: i64 = 0; k < markers.length() && !marked; k++) {
+                match (line.strip_prefix(&str::Str::from(markers[k]))) {
+                    Option::Some(rest) => { line = rest; marked = true; }
+                    Option::None       => { }
                 }
-                buf[out] = raw[i] as i8;
-                out = out + 1;
-                i = i + 1;
             }
-            while (out > 0 && (buf[out - 1] == ' ' as i8 || buf[out - 1] == '\t' as i8)) { out = out - 1; }
-            if (i < len) {
-                buf[out] = '\n' as i8;
-                out = out + 1;
-                i = i + 1;
+            // A lone `*` continues a block comment; `**` is text.
+            if (!marked && line.byte_at(0).unwrap_or(0) == '*' as u8 && line.byte_at(1).unwrap_or(0) != '*' as u8) {
+                line = line.sub_bytes(1, line.length());
             }
+            match (line.strip_prefix(&str::Str::from(" "))) {
+                Option::Some(rest) => { line = rest; }
+                Option::None       => { }
+            }
+            // A `*/` closes the comment: nothing after it on its line is text.
+            match (line.find(&str::Str::from("*/"))) {
+                Option::Some(end) => { line = line.sub_bytes(0, end); }
+                Option::None      => { }
+            }
+            while (line.length() > 0 && (line.byte_at(line.length() - 1).unwrap_or(0) == ' ' as u8
+                    || line.byte_at(line.length() - 1).unwrap_or(0) == '\t' as u8)) {
+                line = line.sub_bytes(0, line.length() - 1);
+            }
+            out.push(line);
         }
-        while (out > 0 && buf[out - 1] == '\n' as i8) { out = out - 1; }
-        buf[out] = 0 as i8;
-        return buf as string;
+        while (out.length() > 0 && out.as_str().byte_at(out.length() - 1).unwrap_or(0) == '\n' as u8) {
+            out.truncate(out.length() - 1);
+        }
+        return out;
     }
 }
 
