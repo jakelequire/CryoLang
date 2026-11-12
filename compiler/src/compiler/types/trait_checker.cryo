@@ -112,6 +112,12 @@ type struct TraitChecker {
                                             this.intern_table, ty);
         }
 
+        // A primitive trait is had by the built-in types its rule names and
+        // by nothing else: no implementation of one can be written.
+        if (this.is_primitive_trait(trait_name)) {
+            return this.primitive_trait_admits(trait_name, ty);
+        }
+
         // `Send` and `Sync` follow the same "structural marker" pattern
         // as `Copy`: the compiler decides via a type walk, not via
         // `implement trait Send for T { ... }` lookups.  See
@@ -213,13 +219,115 @@ type struct TraitChecker {
     }
 
     /// Whether `trait_def` is one of the structural markers - `Copy`,
-    /// `Send`, `Sync` - that a type has by its shape, decided by walking it
-    /// rather than by an implementation.  A type that still names a type
-    /// parameter has no shape to walk until a copy binds the parameter.
+    /// `Send`, `Sync` and the primitive traits - that a type has by its
+    /// shape, decided by walking it rather than by an implementation.  A
+    /// type that still names a type parameter has no shape to walk until a
+    /// copy binds the parameter.
     is_structural_marker(&this, trait_def: DefId) -> boolean {
         return trait_def.equals(this.generic_registry.wellknown(LangItem::Copy))
             || trait_def.equals(this.generic_registry.wellknown(LangItem::Send))
-            || trait_def.equals(this.generic_registry.wellknown(LangItem::Sync));
+            || trait_def.equals(this.generic_registry.wellknown(LangItem::Sync))
+            || this.is_primitive_trait(trait_def);
+    }
+
+    /// The primitive traits this program's module graph declares: the
+    /// traits the built-in value types alone have, each by a rule on the
+    /// type (`primitive_trait_admits`), with no implementation written.
+    primitive_traits(&this) -> [DefId] {
+        mut traits: [DefId] = [];
+        if (this.generic_registry == null) { return traits; }
+        const items: [LangItem] = [LangItem::Primitive, LangItem::Numeric, LangItem::Integer,
+                                   LangItem::SignedInteger, LangItem::UnsignedInteger, LangItem::Float];
+        for (mut i: i64 = 0; i < items.length(); i++) {
+            const trait_def: DefId = this.generic_registry.wellknown(items[i]);
+            if (trait_def.is_valid()) { traits.push(trait_def); }
+        }
+        return traits;
+    }
+
+    /// Whether `trait_def` is a primitive trait.
+    is_primitive_trait(&this, trait_def: DefId) -> boolean {
+        if (!trait_def.is_valid()) { return false; }
+        const traits: [DefId] = this.primitive_traits();
+        for (mut i: i64 = 0; i < traits.length(); i++) {
+            if (traits[i].equals(trait_def)) { return true; }
+        }
+        return false;
+    }
+
+    /// Whether `ty` has the primitive trait `trait_def`: `Primitive` is
+    /// every integer, float, `boolean`, `char` and `string`; `Numeric` the
+    /// integers and floats; `Integer` the integers, `SignedInteger` and
+    /// `UnsignedInteger` each sign's; `Float` the floats.  False for any
+    /// other trait.
+    primitive_trait_admits(&this, trait_def: DefId, ty: TypeRef) -> boolean {
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null || this.generic_registry == null) { return false; }
+        const integer: boolean = t.kind == TypeKind::Int;
+        const float: boolean = t.kind == TypeKind::Float;
+        if (trait_def.equals(this.generic_registry.wellknown(LangItem::Primitive))) {
+            return integer || float || t.kind == TypeKind::Bool || t.kind == TypeKind::Char
+                || t.kind == TypeKind::String;
+        }
+        if (trait_def.equals(this.generic_registry.wellknown(LangItem::Numeric))) { return integer || float; }
+        if (trait_def.equals(this.generic_registry.wellknown(LangItem::Integer))) { return integer; }
+        if (trait_def.equals(this.generic_registry.wellknown(LangItem::SignedInteger))) {
+            return integer && t.int_kind().is_signed();
+        }
+        if (trait_def.equals(this.generic_registry.wellknown(LangItem::UnsignedInteger))) {
+            return integer && !t.int_kind().is_signed();
+        }
+        if (trait_def.equals(this.generic_registry.wellknown(LangItem::Float))) { return float; }
+        return false;
+    }
+
+    /// The built-in value types that have every primitive trait among
+    /// `traits`, in `TypeArena::primitive_types`' order; a trait in
+    /// `traits` that is no primitive trait restricts nothing.
+    primitive_types_admitted(&this, traits: &[DefId]) -> [TypeRef] {
+        mut admitted: [TypeRef] = [];
+        const candidates: [TypeRef] = this.arena.primitive_types();
+        for (mut c: i64 = 0; c < candidates.length(); c++) {
+            mut every: boolean = true;
+            for (mut i: i64 = 0; i < traits.length() && every; i++) {
+                every = !this.is_primitive_trait(traits[i]) || this.primitive_trait_admits(traits[i], candidates[c]);
+            }
+            if (every) { admitted.push(candidates[c]); }
+        }
+        return admitted;
+    }
+
+    /// The help a `static match` over an unbounded parameter carries when
+    /// its arms name exactly the types of one primitive trait: that trait,
+    /// as a bound, says so where the parameter is declared.  The parameter
+    /// is not named: in the copy that reports it, it is already bound.
+    /// Empty when the arms' types, as a set, are no primitive trait's.
+    primitive_bound_help(&this, arm_types: &[TypeRef]) -> string {
+        const traits: [DefId] = this.primitive_traits();
+        for (mut i: i64 = 0; i < traits.length(); i++) {
+            const one: [DefId] = [traits[i]];
+            const admitted: [TypeRef] = this.primitive_types_admitted(&one);
+            mut same: boolean = true;
+            for (mut a: i64 = 0; a < admitted.length() && same; a++) {
+                same = TraitChecker::lists_type(arm_types, admitted[a]);
+            }
+            for (mut a: i64 = 0; a < arm_types.length() && same; a++) {
+                same = TraitChecker::lists_type(&admitted, arm_types[a]);
+            }
+            if (!same) { continue; }
+            const shown: string = this.intern_table.resolve(this.generic_registry.get_trait_decl(traits[i]).name);
+            return fmt::format("the arms name exactly the `%s` types: bounding the matched parameter by `%s` where it is declared refuses any other type where it is given",
+                shown, shown).into_raw();
+        }
+        return "";
+    }
+
+    /// Whether `types` holds `ty`.
+    static lists_type(types: &[TypeRef], ty: TypeRef) -> boolean {
+        for (mut i: i64 = 0; i < types.length(); i++) {
+            if (types[i].equals(ty)) { return true; }
+        }
+        return false;
     }
 
     /// Whether a trait object implements `trait_def`.  The compiler makes
@@ -458,6 +566,9 @@ type struct TraitChecker {
                     ty_shown, this.generic_registry.method_object_unavailable(method)).into_raw();
             }
         }
+        if (this.is_primitive_trait(trait_def)) {
+            return fmt::format("`%s` is not one of the built-in types `%s` admits", ty_shown, trait_shown).into_raw();
+        }
         return fmt::format("the trait `%s` is not implemented for `%s`", trait_shown, ty_shown).into_raw();
     }
 
@@ -496,6 +607,17 @@ type struct TraitChecker {
                        written_help: string) -> string {
         if (this.borrowing_closure_not_thread_safe(ty, trait_def)) {
             return "write `move` before the closure, so it owns what it captures";
+        }
+        if (this.is_primitive_trait(trait_def)) {
+            const one: [DefId] = [trait_def];
+            const admitted: [TypeRef] = this.primitive_types_admitted(&one);
+            mut listed: string = "";
+            for (mut i: i64 = 0; i < admitted.length(); i++) {
+                const shown: string = this.arena.format_display(this.arena.lookup(admitted[i]));
+                listed = if (i == 0) { fmt::format("`%s`", shown).into_raw() } else { fmt::format("%s, `%s`", listed, shown).into_raw() };
+            }
+            return fmt::format("`%s` is a primitive trait, which no implementation gives: use one of its types in place of `%s` - %s",
+                trait_shown, ty_shown, listed).into_raw();
         }
         const t: Type* = this.arena.lookup(ty);
         if (t == null || t.kind != TypeKind::Object) {

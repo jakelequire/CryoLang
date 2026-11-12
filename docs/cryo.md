@@ -2436,6 +2436,7 @@ function halve<T>(x: T) -> T {
 | Trait                                                                                                         | Purpose                                                                                                           |
 | ------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | `Copy`                                                                                                        | Marker for types that are bitwise-copyable (no `Drop` impl).                                                      |
+| `Primitive`, `Numeric` (`: Primitive`), `Integer` (`: Numeric`), `SignedInteger` / `UnsignedInteger` (`: Integer`), `Float` (`: Numeric`) | The primitive traits: markers the built-in value types alone have - see [section 11.8](#118-primitive-traits).    |
 | `Drop`                                                                                                        | Explicit destructor; types implementing it are non-`Copy`.                                                        |
 | `Clone`                                                                                                       | Explicit deep duplication via `clone()`.                                                                          |
 | `Default`                                                                                                     | A canonical zero value: `static default() -> This`.                                                               |
@@ -3183,7 +3184,39 @@ implement struct String<A> {
 
 `static match` is also permitted in a trait's default method body, which is what lets `io::Write::write<T>` dispatch on the payload type without each implementor restating the arms.
 
+**A primitive-trait bound makes the arm list checkable.** When a [primitive trait](#118-primitive-traits) bounds the subject - written on it, or the supertrait of a trait written on it - the bound names a closed set of types, and a `static match` with no `_` arm must name every one of them. A missing type is an error (E0645) in the generic body itself, before any instantiation asks for it:
+
+```cryo
+function code<T>() -> i32 where T: UnsignedInteger {
+    return static match (T) {     // E0645: no arm for `u128`, `usize`, which the bounds of `T` allow
+        u8  => { 1 }
+        u16 => { 2 }
+        u32 => { 3 }
+        u64 => { 4 }
+    };
+}
+```
+
+A `_` arm takes every allowed type no arm names. With no primitive-trait bound, the arm list stays the accepted-type list, checked per instantiation as above; when such a match's arms name exactly one primitive trait's types and an instantiation has another type, the E0645 for it names that trait as the bound that would refuse the type where it is given.
+
 **When to reach for it.** Prefer a trait bound when the operation is genuinely the same across types and the set is open. Reach for `static match` when the set of accepted types is closed and each one needs *different* code — width-specific integer handling, or a conversion whose implementation differs per source type. The standard library uses it for `Hash::fold`, `String::push`/`try_push`, `Str::from`, `Atomic<T>`, and `io::Write::write`.
+
+### 11.8 Primitive Traits
+
+`std::core::marker` declares six marker traits, in the prelude, that the built-in value types alone have:
+
+| Trait             | Supertrait  | Types                                                                 |
+| ----------------- | ----------- | --------------------------------------------------------------------- |
+| `Primitive`       |             | every integer, `f32`, `f64`, `boolean`, `char`, `string`              |
+| `Numeric`         | `Primitive` | every integer, `f32`, `f64`                                           |
+| `Integer`         | `Numeric`   | `i8`, `i16`, `i32`, `i64`, `i128`, `isize`, `u8`, `u16`, `u32`, `u64`, `u128`, `usize` |
+| `SignedInteger`   | `Integer`   | `i8`, `i16`, `i32`, `i64`, `i128`, `isize`                            |
+| `UnsignedInteger` | `Integer`   | `u8`, `u16`, `u32`, `u64`, `u128`, `usize`                            |
+| `Float`           | `Numeric`   | `f32`, `f64`                                                          |
+
+They have no methods. The compiler decides each from the type, as it decides `Copy`, so no implementation of one is written, and an `implement` of one is refused (E0312) - for another type, which a `static match` over the trait's types would have no arm for, and for a built-in type, which has it already. A trait may name one as a supertrait (`type trait Halve : UnsignedInteger { ... }`); it can then be implemented only for a type the primitive trait admits.
+
+A bound of one says, in the signature, which types a generic accepts - a call with any other is refused where it is written (E0306 for a function, E0358 for a method) - and closes the set a `static match` over the parameter must cover ([section 11.7](#117-static-match--compile-time-type-dispatch)).
 
 ---
 

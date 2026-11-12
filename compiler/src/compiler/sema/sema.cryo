@@ -762,6 +762,7 @@ type struct SemaVisitor {
 
     visit_impl(mut &this, decl: DeclarationNode*, node: mut ImplBlock*) -> void {
         if (!this.check_derivation(node)) { return; }
+        if (this.refuse_primitive_trait_implementation(decl, node)) { return; }
         this.check_supertraits_implemented(decl, node);
         if (node.is_template()) {
             // A head whose target is a parameter of its own has no owner;
@@ -1353,6 +1354,7 @@ type struct SemaVisitor {
                 "`static match` outside a generic context is not supported yet (its type could not be resolved to a single arm)",
                 stmt.span);
         }
+        this.check_static_match_covers_bounds(node.scrutinee, &node.arms, stmt.span);
         // A concrete (already-pruned) static match has exactly one arm.
         if (this.state.in_symbolic_check && ASTCloner::has_multi_type_arm(&node.arms)) {
             node.arms = ASTCloner::split_multi_type_arms(&node.arms);
@@ -4021,6 +4023,12 @@ type struct SemaVisitor {
         for (mut i: i64 = 0; i < trait_decl.base_traits.length(); i++) {
             const base: DefId = trait_decl.base_traits[i].definition();
             if (!base.is_valid() || registry.get_trait_decl(base) == null) { continue; }
+            // A structural marker has no implementation to find: the type's
+            // shape answers it, once a copy binds a generic owner's
+            // parameters.
+            if (checker.is_structural_marker(base)) {
+                if (generic || checker.type_implements_trait(owner, base, 0)) { continue; }
+            }
             const base_args: [TypeRef] = resolver.supertrait_arguments(node.trait_def, &args, i);
             const heads: [DeclarationNode*] = registry.heads_for(base, owner, this.intern);
             mut found: boolean = false;
@@ -4037,6 +4045,25 @@ type struct SemaVisitor {
                 fmt::format("`%s` does not implement `%s`, which `%s` requires, so `%s` cannot implement `%s`",
                     shown_owner, shown_base, shown_trait, shown_owner, shown_trait), span);
         }
+    }
+
+    /// E0312 at an implementation of a primitive trait, and whether there
+    /// was one.  The built-in value types alone have a primitive trait,
+    /// each by its rule, so none is implemented by writing it: a bound of
+    /// one would otherwise admit a type a `static match` over the trait's
+    /// types has no arm for.
+    refuse_primitive_trait_implementation(mut &this, decl: DeclarationNode*, node: ImplBlock*) -> boolean {
+        if (!node.is_trait_impl() || node.spec_owner.is_valid()) { return false; }
+        if (!this.trait_checker().is_primitive_trait(node.trait_def)) { return false; }
+        const shown: string = this.intern.resolve(this.ctx.generic_registry.get_trait_decl(node.trait_def).name);
+        const written: SourceSpan = annotation_span(node.trait_annotation);
+        const span: SourceSpan = if (written.has_location()) { written } else { decl.span };
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0312_TRAIT_IMPL_MISMATCH,
+            fmt::format("`%s` cannot be implemented: it is a primitive trait, which only the built-in types have", shown));
+        d = d.at(span);
+        d = d.with_note(fmt::format("the compiler decides `%s` from the type; `implement` cannot give it to another type or restate it for a built-in one", shown));
+        this.ctx.emit_diagnostic(d);
+        return true;
     }
 
     /// Whether the implementation a `with [...]` clause generated may be
@@ -4481,6 +4508,7 @@ type struct SemaVisitor {
         // the arm its type selects and copies that arm's body, so an unwalked
         // arm copies with untyped receivers and unbound inner calls.  A concrete
         // (already-pruned) static match has exactly one arm.
+        this.check_static_match_covers_bounds(sm.scrutinee, &sm.arms, e.span);
         if (this.state.in_symbolic_check && ASTCloner::has_multi_type_arm(&sm.arms)) {
             sm.arms = ASTCloner::split_multi_type_arms(&sm.arms);
         }
@@ -4495,6 +4523,61 @@ type struct SemaVisitor {
         this.state.expected_type = outer_expected;
         if (outer_expected.is_valid()) { return outer_expected; }
         return result_type;
+    }
+
+    /// E0645 at a `static match (T)` in a generic body that has no `_` arm
+    /// and misses a type `T`'s bounds allow, when a primitive trait bounds
+    /// `T` - written on it, or a supertrait of a trait written on it.  Those
+    /// bounds close the set of types a copy can bind `T` to, so every one
+    /// needs an arm, and the one missing is reported here rather than in
+    /// whichever copy first asks for it.
+    check_static_match_covers_bounds(mut &this, scrutinee: TypeAnnotation*,
+                                     arms: &[mut StaticMatchArmNode*], span: SourceSpan) -> void {
+        if (!this.state.in_symbolic_check || scrutinee == null || this.arena == null) { return; }
+        for (mut i: i64 = 0; i < arms.length(); i++) {
+            if (arms[i] != null && arms[i].type_patterns.length() == 0) { return; }
+        }
+        mut rc: ResolutionContext = ResolutionContext::new("");
+        this.symbolic.bind_body_scope(&rc);
+        const scrut_t: Type* = this.arena.lookup(this.ctx.type_resolver.resolve(scrutinee, &rc));
+        if (scrut_t == null || scrut_t.kind != TypeKind::GenericParam) { return; }
+        const checker: TraitChecker = this.trait_checker();
+        mut bounding: [DefId] = [];
+        const written: [DefId] = this.binding.param_bound_traits(scrut_t.as_generic_param());
+        for (mut w: i64 = 0; w < written.length(); w++) {
+            const chain: [DefId] = this.binding.trait_chain(written[w]);
+            for (mut c: i64 = 0; c < chain.length(); c++) {
+                if (checker.is_primitive_trait(chain[c])) { bounding.push(chain[c]); }
+            }
+        }
+        if (bounding.length() == 0) { return; }
+        mut named: [TypeRef] = [];
+        for (mut i: i64 = 0; i < arms.length(); i++) {
+            if (arms[i] == null) { continue; }
+            for (mut p: i64 = 0; p < arms[i].type_patterns.length(); p++) {
+                named.push(this.ctx.type_resolver.resolve(arms[i].type_patterns[p], &rc));
+            }
+        }
+        const allowed: [TypeRef] = checker.primitive_types_admitted(&bounding);
+        mut missing: string = "";
+        mut count: i64 = 0;
+        for (mut a: i64 = 0; a < allowed.length(); a++) {
+            if (TraitChecker::lists_type(&named, allowed[a])) { continue; }
+            const shown: string = this.arena.format_display(this.arena.lookup(allowed[a]));
+            missing = if (count == 0) { fmt::format("`%s`", shown).into_raw() } else { fmt::format("%s, `%s`", missing, shown).into_raw() };
+            count += 1;
+        }
+        if (count == 0) { return; }
+        const param_shown: string = TypeAnnotation::spell(scrutinee, this.intern);
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0645_NO_STATIC_MATCH_ARM,
+            fmt::format("this `static match` has no arm for %s, which the bounds of `%s` allow", missing, param_shown));
+        d = d.at(span);
+        d = d.help(if (count == 1) {
+            fmt::format("add an arm for %s, or a `_` arm", missing).into_raw()
+        } else {
+            fmt::format("add arms for %s, or a `_` arm", missing).into_raw()
+        });
+        this.ctx.emit_diagnostic(d);
     }
 
     /// Walk one arm of a `static match (T)`, reporting what is wrong in it

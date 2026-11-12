@@ -387,13 +387,7 @@ type struct MonoAstResolver {
             const only: StaticMatchArmNode* = arms[0];
             if (only == null || only.type_patterns.length() == 0) { return -1; }
             if (this.arm_matches_scrutinee(only, scrut, res_ctx)) { return -1; }
-            const tn0: string = this.arena.format_display(this.arena.lookup(scrut));
-            this.diagnostics.emit(Diagnostic::error(
-                ErrorCode::E0645_NO_STATIC_MATCH_ARM,
-                fmt::format("no `static match` arm matches type `%s`", tn0))
-                .at(span)
-                .with_note("add an arm for this type or a `_` default arm"));
-            this.state.error_count += 1;
+            this.refuse_unmatched_scrutinee(arms, scrut, span, res_ctx);
             return -1;
         }
 
@@ -425,15 +419,32 @@ type struct MonoAstResolver {
         }
         if (match_idx >= 0) { return match_idx; }
         if (wildcard_idx >= 0) { return wildcard_idx; }
-
-        const ty_name: string = this.arena.format_display(this.arena.lookup(scrut));
-        this.diagnostics.emit(Diagnostic::error(
-            ErrorCode::E0645_NO_STATIC_MATCH_ARM,
-            fmt::format("no `static match` arm matches type `%s`", ty_name))
-            .at(span)
-            .with_note("add an arm for this type or a `_` default arm"));
-        this.state.error_count += 1;
+        this.refuse_unmatched_scrutinee(arms, scrut, span, res_ctx);
         return -1;
+    }
+
+    /// E0645 at a `static match` none of whose `arms` names `scrut`, the
+    /// type a copy binds the scrutinee to, and which has no `_` arm.  When
+    /// the arms name exactly one primitive trait's types, the help names
+    /// that trait as the bound that refuses `scrut` where it is given.
+    refuse_unmatched_scrutinee(mut &this, arms: &[mut StaticMatchArmNode*],
+                               scrut: TypeRef, span: SourceSpan, res_ctx: ResolutionContext*) -> void {
+        mut named: [TypeRef] = [];
+        for (mut i: i64 = 0; i < arms.length(); i++) {
+            if (arms[i] == null) { continue; }
+            for (mut p: i64 = 0; p < arms[i].type_patterns.length(); p++) {
+                named.push(this.type_resolver.resolve(arms[i].type_patterns[p], res_ctx));
+            }
+        }
+        const ty_name: string = this.arena.format_display(this.arena.lookup(scrut));
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0645_NO_STATIC_MATCH_ARM,
+            fmt::format("no `static match` arm matches type `%s`", ty_name));
+        d = d.at(span);
+        d = d.with_note("add an arm for this type or a `_` default arm");
+        const bound_help: string = this.trait_spec.trait_checker.primitive_bound_help(&named);
+        if (bound_help != "") { d = d.help(bound_help); }
+        this.diagnostics.emit(d);
+        this.state.error_count += 1;
     }
 
     /// True if the scrutinee's TypeID equals any of `arm`'s `|`-separated type

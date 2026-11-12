@@ -1,0 +1,113 @@
+///! The primitive traits: `Primitive`, `Numeric`, `Integer`,
+///! `SignedInteger`, `UnsignedInteger` and `Float` are had by the built-in
+///! value types the compiler's rule names, with no implementation written,
+///! and a supertrait of each is met through it.  A `static match` over a
+///! parameter one of them bounds that names every allowed type compiles with
+///! no `_` arm.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::PrimitiveTraits;
+
+import std::core::result::{ Result };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_eq };
+import std::sync::atomic::{ Atomic, MemoryOrder };
+
+/// Every signed width, named once: no `_` arm is needed, since the bound
+/// admits nothing else.
+function signed_width<T>() -> i32 where T: SignedInteger {
+    return static match (T) {
+        i8    => { 8 }
+        i16   => { 16 }
+        i32   => { 32 }
+        i64   => { 64 }
+        i128  => { 128 }
+        isize => { 64 }
+    };
+}
+
+/// The two floats, in statement position.
+function float_width<T>() -> i32 where T: Float {
+    mut width: i32 = 0;
+    static match (T) {
+        f32 => { width = 32; }
+        f64 => { width = 64; }
+    }
+    return width;
+}
+
+/// `Integer` gives `Numeric` and `Primitive`, its supertraits.
+function as_numeric<T>(value: T) -> T where T: Numeric { return value; }
+function as_primitive<T>(value: T) -> T where T: Primitive { return value; }
+function through_integer<T>(value: T) -> T where T: Integer {
+    return as_primitive::<T>(as_numeric::<T>(value));
+}
+
+/// Every unsigned width, with the `Primitive` types beyond the integers
+/// left to the `_` arm.
+function unsigned_or_other<T>() -> i32 where T: Primitive {
+    return static match (T) {
+        u8 | u16 | u32 | u64 | u128 | usize => { 1 }
+        _                                    => { 0 }
+    };
+}
+
+/// A user trait whose supertrait is a primitive trait: it is implemented
+/// only for a type that has the supertrait.
+type trait Halve : UnsignedInteger {
+    halve(&this) -> u32;
+}
+
+implement trait Halve for u32 {
+    halve(&this) -> u32 { return *this / 2; }
+}
+
+![test]
+function a_bound_static_match_selects_each_signed_width() -> Result<(), TestError> {
+    expect_eq(signed_width::<i8>(), 8)?;
+    expect_eq(signed_width::<i32>(), 32)?;
+    expect_eq(signed_width::<i128>(), 128)?;
+    expect_eq(signed_width::<isize>(), 64)?;
+    return Result::Ok(());
+}
+
+![test]
+function a_float_bound_static_match_statement_selects_each_float() -> Result<(), TestError> {
+    expect_eq(float_width::<f32>(), 32)?;
+    expect_eq(float_width::<f64>(), 64)?;
+    return Result::Ok(());
+}
+
+![test]
+function a_primitive_trait_gives_its_supertraits() -> Result<(), TestError> {
+    const x: u16 = 7;
+    expect_eq(through_integer::<u16>(x), 7)?;
+    expect_eq(as_primitive::<string>("text") == "text", true)?;
+    expect_eq(as_primitive::<char>('c') == 'c', true)?;
+    expect_eq(as_numeric::<f64>(2.5) == 2.5, true)?;
+    return Result::Ok(());
+}
+
+![test]
+function a_wildcard_arm_takes_the_bound_types_no_arm_names() -> Result<(), TestError> {
+    expect_eq(unsigned_or_other::<usize>(), 1)?;
+    expect_eq(unsigned_or_other::<i64>(), 0)?;
+    expect_eq(unsigned_or_other::<boolean>(), 0)?;
+    return Result::Ok(());
+}
+
+![test]
+function a_trait_over_a_primitive_trait_is_implemented_for_a_built_in_type() -> Result<(), TestError> {
+    const x: u32 = 10;
+    expect_eq(x.halve(), 5)?;
+    return Result::Ok(());
+}
+
+![test]
+function an_integer_atomic_still_adds_and_subtracts() -> Result<(), TestError> {
+    const counter: Atomic<i64> = Atomic::new(5);
+    counter.fetch_add(3, MemoryOrder::SeqCst);
+    counter.fetch_sub(1, MemoryOrder::SeqCst);
+    expect_eq(counter.load(MemoryOrder::SeqCst), 7)?;
+    return Result::Ok(());
+}
