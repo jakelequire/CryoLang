@@ -176,6 +176,15 @@ else
     NOOP   := @:
 endif
 
+# The shell for a host-side bash script.  On Windows a bare `bash` resolves to
+# System32's WSL launcher, which runs the script inside the Linux guest; Git's
+# own bash sits three levels above its exec path.
+ifeq ($(HOST_OS),windows)
+    POSIX_SHELL := $(shell git --exec-path)/../../../bin/bash.exe
+else
+    POSIX_SHELL := bash
+endif
+
 # The LSP binary grows a `.exe` suffix on a Windows host (the self-hosted
 # compiler appends it for windows targets), so the build output and its pin
 # both carry it there; empty elsewhere.
@@ -193,7 +202,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check check-fast lsp-check cross-check vendor-check api-index api-index-check doc-coverage-check doc-coverage-update examples examples-golden valgrind-check verify-freestanding warnings-check runtime-tiers runtime-tiers-win pin \
+.PHONY: help cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check check-fast lsp-check cross-check vendor-check api-index api-index-check doc-coverage-check doc-coverage-update examples examples-golden valgrind-check verify-freestanding warnings-check runtime-tiers runtime-tiers-win runtime-abi-check pin \
         pin-linux-impl pin-windows-impl _pin-windows-do verify-pin verify-pin-clean incremental-check \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -262,6 +271,10 @@ Tests and gates
   make vendor-check      Every constant shape survives `cryo vendor`.
   make verify-freestanding  Runtime tiers' freestanding acceptance check
                          (POSIX only; refuses on Windows).
+  make runtime-abi-check The lang-item registry (runtime/abi/lang_items.def)
+                         against every built runtime link set, and the
+                         `__cryo_` names compiler/src and stdlib/ spell.
+                         Builds the runtime tiers first; a verify gate.
   make selfhost-check    Byte-identity fixed point.  Linux host: the Linux
                          chain, then the Windows chain under wine (a skipped
                          arm fails unless ARGS=--allow-skipped-arm).  Windows
@@ -934,6 +947,12 @@ endif
 # tier archive written last, so a build that changes nothing launches no
 # compiler for them.
 runtime-tiers: $(RUNTIME_TIERS_A)
+
+# The lang-item registry (runtime/abi/lang_items.def) against every link set
+# built under runtime/.bin/<triple>/ and the `__cryo_` names compiler/src and
+# stdlib/ spell; see the script's header.  Reads archives only.
+runtime-abi-check: runtime-tiers
+	@"$(POSIX_SHELL)" scripts/runtime-abi-check.sh
 
 ifeq ($(HOST_OS),windows)
 $(RUNTIME_TIERS_A): $(RUNTIME_SOURCES) $(PIN_EXE)

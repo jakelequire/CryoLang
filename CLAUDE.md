@@ -24,9 +24,11 @@ api-index-check` fails if it is stale.
 make cryo                # build the self-hosted compiler (compiler/build/cryo)
 make test                # unit + compile-fail + project suites
 make test-census         # the same run, with the suite COUNTS and unit/project NAMES asserted
-make verify              # build once; census, examples, lsp, cross, incr, check-fast CONCURRENTLY,
-                         # objects hashed; ARGS="--baseline HEAD --require-identical" proves
-                         # a change moved no compiled output (baseline built in .verify/, cached;
+make verify              # build once; census, examples, lsp, cross, incr, abi, check-fast
+                         # CONCURRENTLY, objects hashed (tests, examples, stdlib archives,
+                         # runtime archive members); ARGS="--baseline HEAD --require-identical"
+                         # proves a change moved no compiled output (baseline = REV's
+                         # compiler/src AND runtime/, the rest from the tree; built in .verify/, cached;
                          # its results recorded per program, so a new test re-runs only itself);
                          # a change that makes a refused program compile DECLARES its project in
                          # tests/started-compiling (refused before, builds now); one that corrects
@@ -36,6 +38,9 @@ make roster-check        # every unit test, project and negative file against th
 make check-fast          # verify's and verify-pin's self-tests + pin integrity, builds nothing.
                          # Run before committing.
 make lsp-check           # compile tools/CryoLSP with the compiler under test
+make runtime-abi-check   # runtime/abi/lang_items.def against every built runtime link set
+                         # (both kinds, both panic strategies) and the `__cryo_` names
+                         # compiler/src and stdlib/ spell; a verify gate (`abi`)
 make warnings-check      # compiler/ + stdlib archive built with -Werror by the compiler
                          # under test, the stdlib for both OSes and both panic strategies;
                          # DELETES the host's prebuilt stdlib archives first

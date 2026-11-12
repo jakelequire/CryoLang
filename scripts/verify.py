@@ -12,6 +12,10 @@ build:
     incr       scripts/incremental-instance-check.py
                                          an edit asking a cached module for a
                                          new generic instance still links
+    abi        scripts/runtime-abi-check.sh
+                                         the lang-item registry against the
+                                         runtime archives and the names the
+                                         compiler and stdlib spell
     fast       make check-fast           verify's self-test, pin integrity
 
 They are independent: each writes its own build directory, and nothing here
@@ -29,12 +33,18 @@ link (`stdlib/.bin/<triple>/prebuilt/`, built by the compiler that links them)
 are a third population, cleared before each run and named by target and
 stdlib root so two compilers' archives line up; a stdlib module's object that
 only the baseline has, when the tree's programs link an archive, is counted as
-replaced by the archive rather than as missing.
+replaced by the archive rather than as missing.  The runtime archives every
+program links (`runtime/.bin/<triple>/libcryort-*.a`) are a fourth population,
+hashed member by member.
 
 `--baseline REV` compares those objects against the ones a baseline compiler
 produces over the SAME population: a compiler built from REV's compiler/src
-with everything else taken from the working tree, which is what "this change
-moved no compiled output" means.  The baseline compiler is built in a clone
+and REV's runtime/, with everything else taken from the working tree, which
+is what "this change moved no compiled output" means.  The runtime goes with
+the compiler because it is the other half of the contract codegen emits
+calls into, and because a program's own files never name it: taking it from
+REV is what makes a runtime change move the runtime population, and a test
+of new runtime behaviour fail on the baseline.  The baseline compiler is built in a clone
 under `.verify/`, never by stashing the working tree, and cached by the bytes
 that decide it.  Its objects and verdicts are recorded per program - the unit
 suite, each test project, each compile-fail file, each example, and the
@@ -113,6 +123,7 @@ GATES = {
     "cross":    ([PY, "scripts/cross-check.py", "--cryo", "{cryo}"], r"^cross-check: "),
     "incr":     ([PY, "scripts/incremental-instance-check.py", "--cryo", "{cryo}"],
                  r"^incremental-instance-check: "),
+    "abi":      (["{bash}", "scripts/runtime-abi-check.sh"], r"^runtime-abi-check: "),
     # `ARGS=` on the command line: `make verify ARGS=...` exports ARGS to
     # child makes, and no check-fast target is meant to receive verify's flags.
     "fast":     (["make", "--no-print-directory", "check-fast", "ARGS="], r"check-fast: "),
@@ -120,8 +131,8 @@ GATES = {
 # The gates whose objects are compared.  A baseline run needs only these.
 POPULATION_GATES = ("census", "examples")
 # The object populations hashed: what the census and the examples sweep
-# compile, and the stdlib archives their programs link.
-POPULATIONS = ("tests", "examples", "stdlib")
+# compile, and the stdlib and runtime archives their programs link.
+POPULATIONS = ("tests", "examples", "stdlib", "runtime")
 
 
 def rel(p):
@@ -237,6 +248,55 @@ def object_rows(base):
     return rows
 
 
+def archive_members(data):
+    """[(member name, bytes)] of the bytes of a `!<arch>` archive, in order,
+    without its symbol index (derived from the members' offsets), or None
+    when they are not one.  Reads the GNU long-name table and the BSD
+    `#1/<length>` names alike."""
+    if not data.startswith(b"!<arch>\n"):
+        return None
+    members, names, pos = [], b"", 8
+    while pos + 60 <= len(data):
+        header = data[pos:pos + 60]
+        name = header[:16].rstrip(b" ")
+        size = int(header[48:58].strip() or b"0")
+        body = data[pos + 60:pos + 60 + size]
+        pos += 60 + size + (size & 1)
+        if name in (b"/", b"/SYM64/", b"__.SYMDEF", b"__.SYMDEF SORTED"):
+            continue
+        if name == b"//":
+            names = body
+            continue
+        if name.startswith(b"#1/"):
+            length = int(name[3:])
+            name, body = body[:length].rstrip(b"\0"), body[length:]
+        elif name.startswith(b"/") and name[1:].isdigit():
+            start = int(name[1:])
+            name = names[start:names.index(b"\n", start)]
+        members.append((name.rstrip(b"/").decode("utf-8", "replace"), body))
+    return members
+
+
+def runtime_rows(directory):
+    """sha256 rows of every member of the runtime archives in `directory`
+    (one target's), each named by its archive and its place there: a member
+    name may repeat, since every tier compiles the shared sources."""
+    rows = []
+    if not directory or not os.path.isdir(directory):
+        return rows
+    for archive in sorted(os.listdir(directory)):
+        if not (archive.startswith("libcryort") and archive.endswith(".a")):
+            continue
+        with open(os.path.join(directory, archive), "rb") as fh:
+            members = archive_members(fh.read())
+        if members is None:
+            raise SystemExit("verify: %s is not an archive" % rel(os.path.join(directory, archive)))
+        for index, (name, body) in enumerate(members):
+            rows.append("%s  runtime/%s/%02d-%s" % (hashlib.sha256(body).hexdigest(),
+                                                   archive, index, name))
+    return rows
+
+
 def write_rows(rows, out_path):
     """Write hash rows sorted by path; returns the count."""
     rows = sorted(rows, key=lambda r: r[66:])
@@ -245,10 +305,14 @@ def write_rows(rows, out_path):
     return len(rows)
 
 
-def hash_objects(base, out_path):
-    """sha256 of every .o under a build/ directory below `base`, or of the
-    stdlib archives' objects when `base` is "stdlib"; returns the count."""
-    return write_rows(prebuilt_rows() if base == "stdlib" else object_rows(base), out_path)
+def hash_objects(base, out_path, runtime_dir):
+    """sha256 of every .o under a build/ directory below `base`, of the
+    stdlib archives' objects when `base` is "stdlib", or of the members of
+    the runtime archives in `runtime_dir` when it is "runtime"; returns the
+    count."""
+    rows = prebuilt_rows() if base == "stdlib" else runtime_rows(runtime_dir) \
+        if base == "runtime" else object_rows(base)
+    return write_rows(rows, out_path)
 
 
 def read_hashes(path):
@@ -263,9 +327,20 @@ def read_hashes(path):
 
 # ---- running gates ---------------------------------------------------------
 
+def posix_shell():
+    """The shell for a host-side bash script.  On Windows a bare `bash`
+    resolves to System32's WSL launcher, which would run the script inside
+    the Linux guest; Git's own bash sits three levels above its exec path."""
+    if os.name != "nt":
+        return "bash"
+    return os.path.normpath(os.path.join(git("--exec-path").strip(), "..", "..", "..",
+                                         "bin", "bash.exe"))
+
+
 def run_gate(name, cryo, logdir, env):
     argv, verdict = GATES[name]
-    argv = [a.replace("{cryo}", cryo).replace("{stdlib}", STDLIB) for a in argv]
+    argv = [a.replace("{cryo}", cryo).replace("{stdlib}", STDLIB).replace("{bash}", posix_shell())
+            for a in argv]
     log = os.path.join(logdir, name + ".log")
     t0 = time.monotonic()
     with open(log, "wb") as fh:
@@ -293,22 +368,24 @@ def report_gates(results):
                                           r["secs"], r["line"] or "<no verdict line; see %s>" % rel(r["log"])))
 
 
-def population(cryo, tag, logdir, env, names):
+def population(cryo, tag, logdir, env, names, runtime_dir):
     """Wipe, run `names` (which include the population gates), hash."""
     wipe_population()
     results = run_gates(names, cryo, logdir, env)
     counts = {}
     for base in POPULATIONS:
-        counts[base] = hash_objects(base, os.path.join(logdir, "%s.%s.sha256" % (tag, base)))
+        counts[base] = hash_objects(base, os.path.join(logdir, "%s.%s.sha256" % (tag, base)),
+                                    runtime_dir)
     return results, counts
 
 
 # ---- the baseline ----------------------------------------------------------
 
-# What a compiler build reads besides compiler/src.  The baseline compiler's
-# cache key and the clone's sync both use this one list, so the key names
-# exactly the files the baseline was built from.
-BUILD_INPUTS = ["stdlib", "runtime", "bin", "compiler", "Makefile"]
+# What a compiler build reads from the working tree besides compiler/src and
+# runtime/, which come from REV.  The baseline compiler's cache key and the
+# clone's sync both use this one list, so the key names exactly the files the
+# baseline was built from.
+BUILD_INPUTS = ["stdlib", "bin", "compiler", "Makefile"]
 
 
 def build_inputs(cwd=ROOT):
@@ -327,12 +404,15 @@ def copy_over(a, b):
 
 
 def sync_clone(src, sha):
-    """Make `src` REV's compiler/src with the working tree's build inputs."""
+    """Make `src` REV's compiler/src and runtime/ with the working tree's
+    build inputs.  The runtime's archives are built afresh: a checkout keeps
+    the ignored runtime/.bin of whatever the clone held before."""
     if not os.path.isdir(os.path.join(src, ".git")):
         os.makedirs(os.path.dirname(src), exist_ok=True)
         subprocess.run(["git", "clone", "--quiet", "--no-checkout", ROOT, src], check=True)
     git("fetch", "--quiet", ROOT, sha, cwd=src)
     git("checkout", "--quiet", "--force", "--detach", sha, cwd=src)
+    git("clean", "--quiet", "-fdx", "--", "runtime", cwd=src)
     tree = build_inputs()
     have = build_inputs(src)
     for f in set(have) - set(tree):
@@ -359,16 +439,21 @@ def sync_clone(src, sha):
 
 
 def baseline_compiler(rev, env):
-    """Path to a compiler built from REV's compiler/src and the tree's everything else."""
+    """Path to a compiler built from REV's compiler/src and runtime/ and the
+    tree's everything else, its home, REV's commit, and the directory holding
+    the runtime archives it links (REV's runtime, built in the clone)."""
     sha = git("rev-parse", "--verify", rev + "^{commit}").strip()
     src_tree = git("rev-parse", sha + ":compiler/src").strip()
-    key = hashlib.sha256((src_tree + digest(build_inputs()).hexdigest()).encode()).hexdigest()[:16]
+    runtime_tree = git("rev-parse", sha + ":runtime").strip()
+    key = hashlib.sha256((src_tree + runtime_tree + digest(build_inputs()).hexdigest())
+                         .encode()).hexdigest()[:16]
     home = os.path.join(STATE, "baseline", key)
     exe = os.path.join(home, "cryo" + EXE)
-    if os.path.isfile(exe):
-        print("verify: baseline compiler for %s (compiler/src %s) is cached: %s"
-              % (rev, src_tree[:12], rel(exe)))
-        return exe, home, sha
+    runtime_home = os.path.join(home, "runtime")
+    if os.path.isfile(exe) and os.path.isdir(runtime_home):
+        print("verify: baseline compiler for %s (compiler/src %s, runtime %s) is cached: %s"
+              % (rev, src_tree[:12], runtime_tree[:12], rel(exe)))
+        return exe, home, sha, runtime_home
     print("verify: building the baseline compiler for %s (compiler/src %s) in %s"
           % (rev, src_tree[:12], rel(os.path.join(STATE, "src"))))
     src = os.path.join(STATE, "src")
@@ -385,12 +470,24 @@ def baseline_compiler(rev, env):
     if rc != 0 or not os.path.isfile(built):
         raise SystemExit("verify: the baseline compiler did not build (exit %d); see %s"
                          % (rc, rel(log)))
-    os.makedirs(home, exist_ok=True)
+    # The clone's build made REV's runtime archives for the host target only,
+    # beside the compiler they link; the baseline's programs link the same.
+    built_runtime = os.path.join(src, "runtime", ".bin")
+    targets = sorted(os.listdir(built_runtime)) if os.path.isdir(built_runtime) else []
+    if len(targets) != 1 or not runtime_rows(os.path.join(built_runtime, targets[0])):
+        raise SystemExit("verify: the baseline build made runtime archives for %d target(s) "
+                         "under %s, not one" % (len(targets), rel(built_runtime)))
+    shutil.rmtree(runtime_home, ignore_errors=True)
+    os.makedirs(os.path.join(runtime_home, targets[0]))
+    for f in os.listdir(os.path.join(built_runtime, targets[0])):
+        if f.startswith("libcryort") and f.endswith(".a"):
+            shutil.copyfile(os.path.join(built_runtime, targets[0], f),
+                            os.path.join(runtime_home, targets[0], f))
     for f in os.listdir(os.path.join(ROOT, "bin")):
         if f.lower().endswith(".dll"):
             shutil.copyfile(os.path.join(ROOT, "bin", f), os.path.join(home, f))
     copy_over(built, exe)
-    return exe, home, sha
+    return exe, home, sha, runtime_home
 
 
 # ---- the baseline, one program at a time -----------------------------------
@@ -461,13 +558,17 @@ def programs():
 
 
 def shared_inputs():
-    """The files every program's build reads."""
-    return (listed(["stdlib", "runtime", "bin"]) + PROCEDURE
+    """The files of the working tree every program's build reads; the
+    runtime it links is the baseline's own, keyed by its archives' bytes."""
+    return (listed(["stdlib", "bin"]) + PROCEDURE
             + [f for f in listed(["tests"]) if not f.startswith("tests/tests/") and f not in BOOKKEEPING])
 
 
-def program_keys(exe, owned):
-    shared = digest(shared_inputs(), h=hashlib.sha256(file_sha(exe).encode())).hexdigest()
+def program_keys(exe, owned, runtime_dir):
+    linked = hashlib.sha256(file_sha(exe).encode())
+    for row in runtime_rows(runtime_dir):
+        linked.update(row.encode())
+    shared = digest(shared_inputs(), h=linked).hexdigest()
     keys = {name: digest(files, h=hashlib.sha256((shared + "\0" + name).encode())).hexdigest()[:32]
             for name, files in owned.items()}
     for name in (CENSUS_ARCHIVES, EXAMPLE_ARCHIVES):
@@ -579,14 +680,15 @@ def run_census_programs(exe, names, everything, logdir, env):
     return runs
 
 
-def baseline_programs(exe, home, bdir, env):
+def baseline_programs(exe, home, bdir, env, runtime_dir):
     """The baseline's object lists (written to `bdir` as base.<population>.sha256)
     and its census verdict, the tuple `judge_baseline_census` reads (accounted,
     unit failed, compile-fail failed, failed programs), from the records of every
     program; the programs with no record are run first and recorded.  Returns
-    None when a program that ran left no verdict."""
+    None when a program that ran left no verdict.  `runtime_dir` holds the
+    runtime archives the baseline's programs link; `env` names it."""
     owned = programs()
-    keys = program_keys(exe, owned)
+    keys = program_keys(exe, owned, runtime_dir)
     store = os.path.join(home, "programs")
     os.makedirs(store, exist_ok=True)
     have = {n: read_record(os.path.join(store, k)) for n, k in keys.items()
@@ -670,15 +772,17 @@ def baseline_programs(exe, home, bdir, env):
             if by_path[base].setdefault(r[66:], r) != r:
                 print("verify: FAIL -- two baseline records disagree on %s" % r[66:])
                 return None
-    lists = {base: list(rows.values()) for base, rows in by_path.items()}
+    lists = {base: list(rows.values()) for base, rows in by_path.items() if base != "runtime"}
+    lists["runtime"] = runtime_rows(runtime_dir)
     for base, rows in lists.items():
         write_rows(rows, os.path.join(bdir, "base.%s.sha256" % base))
     unit = have[UNIT_SUITE]
     failed = sorted({n for n, r in have.items() if r["verdict"] == "FAILED" and n != UNIT_SUITE}
                     | set(unit["unit_failed"]))
     neg_failed = sum(n.startswith(NEGATIVE) and r["verdict"] == "FAILED" for n, r in have.items())
-    print("verify: baseline objects  tests %d  examples %d  stdlib %d"
-          % (len(lists["tests"]), len(lists["examples"]), len(lists["stdlib"])))
+    print("verify: baseline objects  tests %d  examples %d  stdlib %d  runtime %d"
+          % (len(lists["tests"]), len(lists["examples"]), len(lists["stdlib"]),
+             len(lists["runtime"])))
     return (True, unit["unit_counts"][1], neg_failed, failed), lists
 
 
@@ -852,12 +956,12 @@ def judge_builds(name, base_rc, base_out, tree_rc, tree_out, fixed=False):
     return problems
 
 
-def build_copy(cryo, name, dest):
+def build_copy(cryo, name, dest, env):
     """`cryo build` over a copy of project `name` at `dest`: (exit, output)."""
     shutil.rmtree(dest, ignore_errors=True)
     shutil.copytree(os.path.join(ROOT, PROJECTS, name), dest,
                     ignore=shutil.ignore_patterns("build"))
-    r = subprocess.run([cryo, "build", "--stdlib=" + STDLIB], cwd=dest,
+    r = subprocess.run([cryo, "build", "--stdlib=" + STDLIB], cwd=dest, env=env,
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     out = r.stdout.decode("utf-8", "replace")
     with io.open(dest + ".log", "w", encoding="utf-8") as fh:
@@ -865,8 +969,9 @@ def build_copy(cryo, name, dest):
     return r.returncode, out
 
 
-def check_declared(declared, base_exe, cryo, logdir, env, fixed=()):
-    """Build every declared project with both compilers; the problems found."""
+def check_declared(declared, base_exe, cryo, logdir, base_env, env, fixed=()):
+    """Build every declared project with both compilers, each with its own
+    environment; the problems found."""
     problems = []
     for name, is_fixed in sorted([(n, False) for n in declared] + [(n, True) for n in fixed]):
         rel = FIXED if is_fixed else DECLARED
@@ -890,14 +995,28 @@ def check_declared(declared, base_exe, cryo, logdir, env, fixed=()):
             problems.append("%s: declared in %s but %s/%s is not a test project"
                             % (name, rel, PROJECTS, name))
             continue
-        brc, bout = build_copy(base_exe, name, os.path.join(logdir, "declared", "base", name))
-        trc, tout = build_copy(cryo, name, os.path.join(logdir, "declared", "tree", name))
+        brc, bout = build_copy(base_exe, name, os.path.join(logdir, "declared", "base", name),
+                               base_env)
+        trc, tout = build_copy(cryo, name, os.path.join(logdir, "declared", "tree", name), env)
         found = judge_builds(name, brc, bout, trc, tout, is_fixed)
         print("  %-9s %-40s baseline exit %d, tree exit %d  %s"
               % ("passing" if is_fixed else "declared", name, brc, trc,
                  "ok" if not found else "FAIL"))
         problems += found
     return problems
+
+
+def sample_archive():
+    """An archive with a symbol index, a GNU long-name table, an odd-sized
+    member (padded) and a BSD-named member, for the self-test."""
+    def header(name, size):
+        return b"%-16s%-12s%-6s%-6s%-8s%-10d`\n" % (name, b"0", b"0", b"0", b"644", size)
+    longs = b"Entry-long-name.o/\n"
+    return (b"!<arch>\n" + header(b"/", 4) + b"\0\0\0\0"
+            + header(b"//", len(longs)) + longs + b"\n"
+            + header(b"Sys.o/", 3) + b"abc\n"
+            + header(b"/0", 2) + b"xy"
+            + header(b"#1/5", 6) + b"Bsd.oq")
 
 
 def selftest():
@@ -1017,6 +1136,11 @@ def selftest():
          split_replaced(["p/build/x/local/deps/main.o"], True)[1], 1),
         ("archive: a stdlib object missing when no archive was linked",
          split_replaced(["p/build/x/std/deps/std/io.o"], False)[1], 1),
+        ("runtime: members by GNU, long and BSD names, index skipped",
+         [] if archive_members(sample_archive()) == [("Sys.o", b"abc"), ("Entry-long-name.o", b"xy"),
+                                                     ("Bsd.o", b"q")] else ["bad"], 0),
+        ("runtime: bytes that are not an archive",
+         [] if archive_members(b"\x7fELF") is None else ["bad"], 0),
     ]
     bad = 0
     for label, problems, want in cases:
@@ -1160,8 +1284,18 @@ def main():
     # inherited CRYO_STDLIB would silently change every census object.
     env = dict(os.environ)
     env.pop("CRYO_STDLIB", None)
+    # Each compiler links the runtime beside it: the tree's under
+    # runtime/.bin, the baseline's named to it below.  An inherited override
+    # would hand both the same archives.
+    env.pop("CRYO_RUNTIME", None)
     if os.name == "nt":
         env.setdefault("CRYO_CC", "gcc")
+    triple = subprocess.run([cryo, "version", "--triple"], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE).stdout.decode("utf-8", "replace").strip()
+    if not triple:
+        print("verify: FAIL -- `%s version --triple` named no target" % rel(cryo))
+        return 1
+    tree_runtime = os.path.join(ROOT, "runtime", ".bin", triple)
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
     runs = os.path.join(STATE, "runs")
@@ -1178,7 +1312,9 @@ def main():
     declared = {}
     fixed = {}
     if args.baseline:
-        exe, home, sha = baseline_compiler(args.baseline, env)
+        exe, home, sha, runtime_home = baseline_compiler(args.baseline, env)
+        base_env = dict(env, CRYO_RUNTIME=runtime_home)
+        base_runtime = os.path.join(runtime_home, triple)
         declared = declared_since(sha)
         fixed = declared_since(sha, FIXED)
         print("verify: %d program(s) declared as starting to compile since %s%s"
@@ -1189,20 +1325,20 @@ def main():
                  "".join("\n      %s -- %s" % (n, r) for n, r in sorted(fixed.items()))))
         bdir = os.path.join(logdir, "baseline")
         os.makedirs(bdir)
-        answer = baseline_programs(exe, home, bdir, env)
+        answer = baseline_programs(exe, home, bdir, base_env, base_runtime)
         if answer is None:
             return 1
         census, lists = answer
         # A baseline compiler that links no stdlib archive builds none, so
         # the archive population alone may be empty.
-        if not lists["tests"] or not lists["examples"]:
-            print("verify: FAIL -- the baseline has no tests or no examples objects; "
+        if not lists["tests"] or not lists["examples"] or not lists["runtime"]:
+            print("verify: FAIL -- the baseline has no tests, examples or runtime objects; "
                   "an empty list compares clean against anything")
             return 1
         problems = judge_baseline_census(declared, *census, fixed=fixed,
                                          unit_namespaces={n: unit_namespace(n) for n in fixed
                                                           if declared_kind(n) in ("unit", "archive")})
-        problems += check_declared(declared, exe, cryo, logdir, env, fixed)
+        problems += check_declared(declared, exe, cryo, logdir, base_env, env, fixed)
         if problems:
             for p in problems:
                 print("verify: FAIL -- %s" % p)
@@ -1210,13 +1346,16 @@ def main():
         base_counts = bdir
 
     print("verify: gates over %s: %s" % (rel(cryo), ", ".join(names)))
-    results, counts = population(cryo, "tree", logdir, env, names)
+    results, counts = population(cryo, "tree", logdir, env, names, tree_runtime)
     report_gates(results)
     ok = all(r["ok"] for r in results)
     hashed = [b for b, g in (("tests", "census"), ("examples", "examples")) if g in names]
     if "census" in names or "examples" in names:
         print("  objects   %-8s %d (%s)" % ("stdlib", counts["stdlib"],
                                              rel(os.path.join(logdir, "tree.stdlib.sha256"))))
+        # Every hosted program links the runtime, so a run that linked one
+        # and hashed none read the wrong directory.
+        hashed.append("runtime")
     for base in hashed:
         print("  objects   %-8s %d (%s)" % (base, counts[base],
                                              rel(os.path.join(logdir, "tree.%s.sha256" % base))))

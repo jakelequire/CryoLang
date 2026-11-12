@@ -7,7 +7,17 @@
 # by a hand-typed string. When adding or changing a lang item, edit this file
 # first, then the definition.
 #
-# Columns: SYMBOL | SIGNATURE | DEFINED-BY (tier) | STATUS
+# Columns: SYMBOL | SIGNATURE | DEFINED-IN | STATUS
+#
+# DEFINED-IN is what `scripts/runtime-abi-check.sh` checks against the built
+# archives, so it is a list, not prose: the link KINDS whose runtime must
+# define the symbol - `freestanding`, `hosted`, either narrowed to one OS as
+# `freestanding:linux` - and it must be defined under BOTH panic strategies of
+# each. `import` is a system symbol the runtime calls and never defines;
+# `compiler` is a name the compiler gives a symbol of its own, listed so that
+# every `__cryo_` spelling in compiler/src is accounted for here (a trailing
+# `*` makes it a prefix). The check also refuses an exported `__cryo_` symbol
+# no row names, and a `__cryo_` call in compiler/src or stdlib/ no row names.
 #
 # ABI conventions (settled; this file is their source of truth):
 #   - string   : the primitive thin, NUL-terminated `i8*` (8 bytes). This is the
@@ -35,10 +45,10 @@
 # Linux: the ELF entry the linker resolves under `-nostartfiles`. Reads argc/argv
 # off the initial stack, hands them to __cryo_start. Fully freestanding (no libc,
 # no imports). Exit = `exit_group` syscall.
-_start          | ![naked] () -> void                       | core (freestanding, linux) | DONE (linux)
+_start          | ![naked] () -> void                       | freestanding:linux | DONE
 # Startup trampoline: runs the user `main` and exits with its return. `main` is
 # an external C-ABI symbol resolved from the user object.
-__cryo_start    | (argc: i64, argv: i8**) -> never          | core (freestanding, linux) | DONE (linux)
+__cryo_start    | (argc: i64, argv: i8**) -> never          | freestanding | DONE (dual-OS)
 #
 # Windows: PE startup passes no stack args and has no stable raw-syscall ABI, so
 # the entry links ntdll (its sole dependency) and exits via NtTerminateProcess.
@@ -50,14 +60,14 @@ __cryo_start    | (argc: i64, argv: i8**) -> never          | core (freestanding
 # CommandLineToArgvW, which would parse for us but add a third DLL dependency.
 # The driver's no_runtime link emits
 # `-nostartfiles -nostdlib -Wl,-e,_start -lntdll` for a windows target.
-_start          | ![naked] () -> void  (PE entry, /entry=_start) | core (freestanding, windows) | DONE (windows)
+_start          | ![naked] () -> void  (PE entry, /entry=_start) | freestanding:windows | DONE
 # ntdll import, called by the windows exit path with (HANDLE)-1.
-NtTerminateProcess | (process: i64, status: i32) -> i32  (extern, ntdll) | ntdll | (system)
+NtTerminateProcess | (process: i64, status: i32) -> i32  (extern, ntdll) | import | (system)
 # Satisfies the mingw backend's `call __main` in main's prologue (C global-ctor
 # bootstrap). Empty in a freestanding build because there is no CRT and Cryo
 # emits no constructors, so there is genuinely nothing to run; a hosted build
 # does NOT define this -- it calls mingw's real __main instead.
-__main          | () -> void                                | core (freestanding, windows) | DONE (windows)
+__main          | () -> void                                | freestanding:windows | DONE
 #
 # __cryo_start is shared (both OSes): capture arguments, run `main`, exit with
 # its return. Capture itself is per-OS, because the two OSes hand arguments over
@@ -66,8 +76,8 @@ __main          | () -> void                                | core (freestanding
 # receives nothing on the stack (rcx/rdx are zeroed) and parses the PEB command
 # line instead. Programs read the captured values through these accessors, which
 # report 0 / null if the OS could not supply arguments.
-__cryo_argc     | () -> i64                                 | core (freestanding) | DONE (dual-OS)
-__cryo_argv     | () -> i8**                                | core (freestanding) | DONE (dual-OS)
+__cryo_argc     | () -> i64                                 | freestanding | DONE (dual-OS)
+__cryo_argv     | () -> i8**                                | freestanding | DONE (dual-OS)
 
 # --- Entry (hosted profile) -------------------------------------------------
 # A hosted program starts in Cryo too. The link KEEPS the crt objects and only
@@ -96,18 +106,18 @@ __cryo_argv     | () -> i8**                                | core (freestanding
 # first thread-local access (the unwind tier's panic state is thread-local).
 # Measured: a static binary with a retargeted entry segfaults before `main`.
 # Nothing else emits `-static`, so the exception is exactly as narrow as the flag.
-__cryo_entry        | ![naked] () -> void (linux) / () -> never (windows) | core (hosted) | DONE (dual-OS)
+__cryo_entry        | ![naked] () -> void (linux) / () -> never (windows) | hosted | DONE (dual-OS)
 # Shared startup trampoline: image fixups, capture arguments, run static
 # constructors, then `main` -- which here carries the WIDENED C signature
 # `int main(int, char**, char**)` codegen emits for a hosted program, not the
 # zero-arg freestanding form. Terminates through libc `exit`, which is what
 # flushes buffered stdio and runs atexit handlers.
-__cryo_hosted_start | (argc: i64, argv: i8**) -> never       | core (hosted) | DONE (dual-OS)
+__cryo_hosted_start | (argc: i64, argv: i8**) -> never       | hosted | DONE (dual-OS)
 # Startup services the retained crt objects provide, called BY the hosted entry
-# rather than defined by it (windows only).
-_pei386_runtime_relocator | () -> void  (extern, crt2.o)     | mingw crt | (system)
-__p__environ              | () -> i8***  (extern, msvcrt)    | msvcrt    | (system)
-_init                     | () -> void  (extern, crti.o)     | glibc crt | (system)
+# rather than defined by it: the relocator on windows (mingw crt2.o), `_init` on
+# linux (glibc crti.o).
+_pei386_runtime_relocator | () -> void  (extern, crt2.o)     | import | (system)
+_init                     | () -> void  (extern, crti.o)     | import | (system)
 
 # --- Link line -------------------------------------------------------------
 # The driver composes the tier archives itself; a freestanding program links by
@@ -154,7 +164,7 @@ _init                     | () -> void  (extern, crti.o)     | glibc crt | (syst
 # `__cryo_panic` for every panic of a program that links a tier, and the link
 # line names exactly one panic tier (`append_hosted_runtime_libs` /
 # `append_runtime_tier_libs`).
-__cryo_panic              | (msg: string, loc: Location*) -> never           | panic/abort | DONE (runtime def dual-OS + dual-config; compiler routed)
+__cryo_panic              | (msg: string, loc: Location*) -> never           | freestanding, hosted | DONE (both strategies, dual-OS; compiler routed)
 
 # --- Unwind surface ---------------------------------------------------------
 # BOTH panic tiers export every symbol below, and differ only in behaviour: that
@@ -172,11 +182,11 @@ __cryo_panic              | (msg: string, loc: Location*) -> never           | p
 # `_GCC_specific_handler`, which is how libstdc++'s `__gxx_personality_seh0`
 # works. Declaring the Itanium form on Windows would read garbage arguments.
 # Emitted by codegen (`ExprOps::get_or_decl_personality`), not hand-typed.
-__cryo_personality_v0     | per-OS: Itanium (linux) / SEH (windows)           | panic/*     | DONE (both tiers, dual-OS; SEH-backed on windows)
-__cryo_panic_finish       | () -> never                                        | panic/*     | DONE (both tiers; root-catch tail, emitted under unwind)
-__cryo_panic_taken_message| () -> string                                       | panic/*     | DONE (both tiers; abort's returns null - unreachable there)
-__cryo_panic_taken_file   | () -> string                                       | panic/*     | DONE (both tiers; abort's returns null - unreachable there)
-__cryo_panic_taken_line   | () -> u32                                          | panic/*     | DONE (both tiers; abort's returns 0 - unreachable there)
+__cryo_personality_v0     | per-OS: Itanium (linux) / SEH (windows)           | freestanding, hosted | DONE (dual-OS; SEH-backed on windows)
+__cryo_panic_finish       | () -> never                                        | freestanding, hosted | DONE (root-catch tail, emitted under unwind)
+__cryo_panic_taken_message| () -> string                                       | freestanding, hosted | DONE (abort's returns null - unreachable there)
+__cryo_panic_taken_file   | () -> string                                       | freestanding, hosted | DONE (abort's returns null - unreachable there)
+__cryo_panic_taken_line   | () -> u32                                          | freestanding, hosted | DONE (abort's returns 0 - unreachable there)
 
 # --- Check handlers (route raw operands through the funnel) -----------------
 # Each takes RAW operands (not a pre-formatted string) plus a Location POD
@@ -188,10 +198,10 @@ __cryo_panic_taken_line   | () -> u32                                          |
 # there is no libc to resolve it -- so every panic tier failed this workspace's
 # own acceptance check while still compiling cleanly. `op` is a raw arithmetic-op
 # code; 2 = multiply (the array-size guard) is the only value emitted so far.
-__cryo_panic_bounds_check | (loc: Location*, index: u64, len: u64) -> never  | panic/abort | DONE (runtime def + compiler emit, dual-OS)
-__cryo_panic_overflow     | (loc: Location*, op: u32, lhs: u64, rhs: u64) -> never | panic/abort | DONE (runtime def + compiler emit, dual-OS)
-__cryo_panic_div_zero     | (loc: Location*) -> never                        | panic/abort | DONE (runtime def + compiler emit, dual-OS)
-__cryo_panic_no_match     | (loc: Location*) -> never                        | panic/abort | DONE (runtime def + compiler emit, dual-OS)
+__cryo_panic_bounds_check | (loc: Location*, index: u64, len: u64) -> never  | freestanding, hosted | DONE (runtime def + compiler emit, dual-OS)
+__cryo_panic_overflow     | (loc: Location*, op: u32, lhs: u64, rhs: u64) -> never | freestanding, hosted | DONE (runtime def + compiler emit, dual-OS)
+__cryo_panic_div_zero     | (loc: Location*) -> never                        | freestanding, hosted | DONE (runtime def + compiler emit, dual-OS)
+__cryo_panic_no_match     | (loc: Location*) -> never                        | freestanding, hosted | DONE (runtime def + compiler emit, dual-OS)
 
 # --- Allocator (weak / user-overridable) -----------------------------------
 # Every heap site routes through ExprOps::emit_raw_alloc / emit_raw_dealloc
@@ -211,8 +221,8 @@ __cryo_panic_no_match     | (loc: Location*) -> never                        | p
 #
 # `size` is passed 0 at `delete` sites: the site does not carry the allocation
 # size, and the tier recovers the exact mapping from its own header instead.
-__cryo_alloc    | (size: u64, align: u64) -> void*          | alloc | DONE (runtime def weak dual-OS + compiler funnel, no_runtime)
-__cryo_dealloc  | (ptr: void*, size: u64, align: u64) -> void | alloc | DONE (runtime def weak dual-OS + compiler funnel, no_runtime)
+__cryo_alloc    | (size: u64, align: u64) -> void*          | freestanding | DONE (runtime def weak dual-OS + compiler funnel, no_runtime)
+__cryo_dealloc  | (ptr: void*, size: u64, align: u64) -> void | freestanding | DONE (runtime def weak dual-OS + compiler funnel, no_runtime)
 
 # --- Backtrace / diagnostics -----------------------------------------------
 # Print one hex return address per stack frame to stderr. Raw addresses only;
@@ -230,4 +240,16 @@ __cryo_dealloc  | (ptr: void*, size: u64, align: u64) -> void | alloc | DONE (ru
 # _start does not change the outcome. The image carries no language exception
 # handler, so a fault inside the unwinder cannot be dispatched. Hence the
 # self-bounded walk. Do not re-try RtlCaptureStackBackTrace.
-__cryo_backtrace | () -> void                                | backtrace | DONE (dual-OS: linux rbp chain, windows bounded RtlVirtualUnwind over .pdata)
+__cryo_backtrace | () -> void                                | freestanding | DONE (dual-OS: linux rbp chain, windows bounded RtlVirtualUnwind over .pdata)
+
+# --- Names the compiler gives its own symbols --------------------------------
+# Not runtime symbols: each is defined in the program's own objects. Listed so
+# that a `__cryo_` call newly emitted by codegen cannot go unregistered.
+__cryo_user_main         | the user's `main` under test-main codegen   | compiler | (compiler)
+__cryo_test_main         | the generated test runner entry             | compiler | (compiler)
+__cryo_test_descriptors  | the generated test table                    | compiler | (compiler)
+__cryo_test_name_*       | one test's name constant                    | compiler | (compiler)
+__cryo_macro_probe*      | bindgen's macro-evaluation probes           | compiler | (compiler)
+__cryo_try_*             | `?` desugaring temporaries                  | compiler | (compiler)
+__cryo_for_iter_*        | `for` desugaring temporaries                | compiler | (compiler)
+__cryo_coalesce_*        | `??` desugaring temporaries                 | compiler | (compiler)
