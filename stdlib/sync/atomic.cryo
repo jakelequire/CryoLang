@@ -14,9 +14,10 @@
 ///! onto the same unsigned intrinsics.
 ///!
 ///! Supported `T`: `u8`, `u32`, `u64`, `i32`, `i64`, `boolean`.  Instantiating
-///! `Atomic<T>` with any other type - or calling `fetch_add`/`fetch_sub` on
-///! `Atomic<boolean>` - is a compile error (E0645): the absence of a matching
-///! `static match` arm IS the type constraint (no trait bound needed).
+///! `Atomic<T>` with any other type is a compile error (E0645): the absence
+///! of a matching `static match` arm IS the type constraint (no trait bound
+///! needed).  `fetch_add`/`fetch_sub` on `Atomic<boolean>` compile; they
+///! do arithmetic on the 0/1 `u8` backing (see `fetch_add`).
 ///!
 ///! Every operation takes an `MemoryOrder` describing the memory-model
 ///! constraints around it.  When in doubt, `SeqCst` is the always-safe
@@ -63,6 +64,9 @@ public type enum MemoryOrder : u32 {
 }
 
 implement enum MemoryOrder {
+    /// The ordering's number as the compiler's atomic intrinsics take it,
+    /// the same as its discriminant: `Relaxed` 2, `Acquire` 4, `Release` 5,
+    /// `AcqRel` 6, `SeqCst` 7.
     public static to_u32(order: MemoryOrder) -> u32 {
         return match (order) {
             MemoryOrder::Relaxed => { 2 }
@@ -119,6 +123,17 @@ public type struct Atomic<T> {
         return Atomic::<T> { value: initial };
     }
 
+    /// Atomically read the cell's value. `order` is `Relaxed`, `Acquire`
+    /// or `SeqCst`; `Release` and `AcqRel` order writes and are not
+    /// orderings a load can have.
+    ///
+    /// ```cryo
+    /// import std::sync::atomic::{ Atomic, MemoryOrder };
+    ///
+    /// const ready: Atomic<boolean> = Atomic::new(false);
+    /// ready.store(true, MemoryOrder::Release);
+    /// const seen: boolean = ready.load(MemoryOrder::Acquire);   // true
+    /// ```
     public load(&this, order: MemoryOrder) -> T {
         return static match (T) {
             u8      => { intrinsics::atomic_load_u8(&this.value, MemoryOrder::to_u32(order)) }
@@ -130,6 +145,10 @@ public type struct Atomic<T> {
         };
     }
 
+    /// Atomically replace the cell's value with `val`. `order` is
+    /// `Relaxed`, `Release` or `SeqCst`; `Acquire` and `AcqRel` order reads
+    /// and are not orderings a store can have. Use `swap` to get the old
+    /// value back.
     public store(&this,val: T, order: MemoryOrder) -> void {
         static match (T) {
             u8      => { intrinsics::atomic_store_u8(&this.value, val, MemoryOrder::to_u32(order)); }

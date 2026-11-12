@@ -29,8 +29,17 @@ import std::time::duration::{ Duration };
 // WSAStartup is reference-counted and idempotent, so calling it once per
 // socket creation is harmless (we never WSACleanup; Winsock stays loaded for
 // the process lifetime, which is what a long-lived server wants anyway).
+
+/// Prepare the socket layer for use. POSIX sockets need no setup, so this
+/// does nothing.
 ![target(unix)]
 public function net_init() -> void { }
+/// Prepare the socket layer for use: call `WSAStartup` asking for Winsock
+/// 2.2. Safe to call any number of times - Winsock counts the calls and
+/// nothing here ever calls `WSACleanup`, so it stays loaded for the life of
+/// the process. Its result is not checked: a failed start-up shows as the
+/// next socket call failing with the Winsock error. The socket-creating
+/// functions here and `os_getaddrinfo` call it themselves.
 ![target(windows)]
 public function net_init() -> void {
     mut wsadata: [u8; 512];                       // >= sizeof(WSADATA)
@@ -41,12 +50,20 @@ public function net_init() -> void {
 // AF_INET=2, SOCK_STREAM=1, SOCK_DGRAM=2, IPPROTO_TCP=6, IPPROTO_UDP=17 on
 // both platforms.  POSIX adds SOCK_CLOEXEC so a concurrent fork+exec doesn't
 // leak the fd; Windows handles are non-inheritable by default, so no flag.
+
+/// Open an IPv4 TCP socket (`AF_INET`, `SOCK_STREAM`), close-on-exec, in
+/// blocking mode. Returns the descriptor, or -1 with `errno` set (read it
+/// with `last_io_error`).
 ![target(unix)]
 public function os_socket_tcp() -> i32 {
     return libc::socket(libc::AddressFamily::AF_INET,
                         libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
                         libc::Protocol::IPPROTO_IP);
 }
+/// Open an IPv4 TCP socket (`AF_INET`, `SOCK_STREAM`) in blocking mode,
+/// starting Winsock first (`net_init`). Returns the `SOCKET` handle cast to
+/// `i32`, or -1 when Winsock answers `INVALID_SOCKET`; the reason is then
+/// in `WSAGetLastError` (read it with `last_io_error`).
 ![target(windows)]
 public function os_socket_tcp() -> i32 {
     net_init();
@@ -58,12 +75,19 @@ public function os_socket_tcp() -> i32 {
 // AF_INET6 TCP socket (family 10 on Linux, 23 on Windows). The caller
 // (net::socket::tcp) selects this vs os_socket_tcp() per the address family, so
 // sys stays free of net::ip / net::socket_addr imports.
+
+/// Open an IPv6 TCP socket (`AF_INET6`, `SOCK_STREAM`), close-on-exec, in
+/// blocking mode. Returns the descriptor, or -1 with `errno` set.
 ![target(unix)]
 public function os_socket_tcp6() -> i32 {
     return libc::socket(libc::AddressFamily::AF_INET6,
                         libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
                         libc::Protocol::IPPROTO_IP);
 }
+/// Open an IPv6 TCP socket (`AF_INET6`, family 23, `SOCK_STREAM`) in
+/// blocking mode, starting Winsock first. Returns the `SOCKET` handle cast
+/// to `i32`, or -1 on `INVALID_SOCKET` with the reason in
+/// `WSAGetLastError`.
 ![target(windows)]
 public function os_socket_tcp6() -> i32 {
     net_init();
@@ -72,12 +96,18 @@ public function os_socket_tcp6() -> i32 {
     return s as i32;
 }
 
+/// Open an IPv4 UDP socket (`AF_INET`, `SOCK_DGRAM`), close-on-exec, in
+/// blocking mode. Returns the descriptor, or -1 with `errno` set.
 ![target(unix)]
 public function os_socket_udp() -> i32 {
     return libc::socket(libc::AddressFamily::AF_INET,
                         libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
                         libc::Protocol::IPPROTO_UDP);
 }
+/// Open an IPv4 UDP socket (`AF_INET`, `SOCK_DGRAM`, `IPPROTO_UDP`) in
+/// blocking mode, starting Winsock first. Returns the `SOCKET` handle cast
+/// to `i32`, or -1 on `INVALID_SOCKET` with the reason in
+/// `WSAGetLastError`.
 ![target(windows)]
 public function os_socket_udp() -> i32 {
     net_init();
@@ -87,26 +117,58 @@ public function os_socket_udp() -> i32 {
 }
 
 // ---- connection setup ------------------------------------------------------
+
+/// Start connecting socket `fd` to the packed `sockaddr` of `len` bytes at
+/// `addr` (`connect`). Returns 0 on success, -1 with `errno` set on failure
+/// - on a non-blocking socket that includes `EINPROGRESS` for a handshake
+/// still under way.
 ![target(unix)]
 public function os_connect(fd: i32, addr: u8*, len: u32) -> i32 { return libc::connect(fd, addr, len); }
+/// Start connecting socket `fd` to the packed `sockaddr` of `len` bytes at
+/// `addr` (Winsock `connect`). Returns 0 on success, or `SOCKET_ERROR` (-1)
+/// with the reason in `WSAGetLastError` - on a non-blocking socket that
+/// includes `WSAEWOULDBLOCK` for a handshake still under way.
 ![target(windows)]
 public function os_connect(fd: i32, addr: u8*, len: u32) -> i32 { return syscall::connect(fd as u64, addr, len as i32); }
 
+/// Bind socket `fd` to the packed `sockaddr` of `len` bytes at `addr`.
+/// Returns 0 on success, -1 with `errno` set on failure.
 ![target(unix)]
 public function os_bind(fd: i32, addr: u8*, len: u32) -> i32 { return libc::bind(fd, addr, len); }
+/// Bind socket `fd` to the packed `sockaddr` of `len` bytes at `addr`.
+/// Returns 0 on success, or `SOCKET_ERROR` (-1) with the reason in
+/// `WSAGetLastError`.
 ![target(windows)]
 public function os_bind(fd: i32, addr: u8*, len: u32) -> i32 { return syscall::bind(fd as u64, addr, len as i32); }
 
+/// Mark the bound socket `fd` as listening, queueing up to `backlog`
+/// pending connections. Returns 0 on success, -1 with `errno` set on
+/// failure.
 ![target(unix)]
 public function os_listen(fd: i32, backlog: i32) -> i32 { return libc::listen(fd, backlog); }
+/// Mark the bound socket `fd` as listening, queueing up to `backlog`
+/// pending connections. Returns 0 on success, or `SOCKET_ERROR` (-1) with
+/// the reason in `WSAGetLastError`.
 ![target(windows)]
 public function os_listen(fd: i32, backlog: i32) -> i32 { return syscall::listen(fd as u64, backlog); }
 
-// Returns the accepted fd, or -1 on error.
+/// Accept one pending connection on the listening socket `fd`
+/// (`accept4` with `SOCK_CLOEXEC`, so the new descriptor is close-on-exec).
+/// The peer's `sockaddr` is written to `addr`, whose capacity the caller
+/// passes in `*addrlen` and which is updated to the length written.
+/// Returns the new descriptor, or -1 with `errno` set (`EAGAIN` on a
+/// non-blocking listener with nothing pending). The new socket is blocking
+/// whatever the listener's mode.
 ![target(unix)]
 public function os_accept(fd: i32, addr: mut u8*, addrlen: mut u32*) -> i32 {
     return libc::accept4(fd, addr, addrlen, libc::SOCK_CLOEXEC);
 }
+/// Accept one pending connection on the listening socket `fd`. The peer's
+/// `sockaddr` is written to `addr`, whose capacity the caller passes in
+/// `*addrlen` and which is updated to the length written. Returns the new
+/// `SOCKET` cast to `i32`, or -1 on `INVALID_SOCKET` with the reason in
+/// `WSAGetLastError` (`WSAEWOULDBLOCK` on a non-blocking listener with
+/// nothing pending).
 ![target(windows)]
 public function os_accept(fd: i32, addr: mut u8*, addrlen: mut u32*) -> i32 {
     const s: u64 = syscall::accept(fd as u64, addr, addrlen as mut i32*);
@@ -114,71 +176,144 @@ public function os_accept(fd: i32, addr: mut u8*, addrlen: mut u32*) -> i32 {
     return s as i32;
 }
 
+/// Write the local address socket `fd` is bound to into `addr`, whose
+/// capacity the caller passes in `*addrlen` and which is updated to the
+/// length written. Returns 0 on success, -1 with `errno` set on failure.
 ![target(unix)]
 public function os_getsockname(fd: i32, addr: mut u8*, addrlen: mut u32*) -> i32 { return libc::getsockname(fd, addr, addrlen); }
+/// Write the local address socket `fd` is bound to into `addr`, whose
+/// capacity the caller passes in `*addrlen` and which is updated to the
+/// length written. Returns 0 on success, or `SOCKET_ERROR` (-1) with the
+/// reason in `WSAGetLastError`.
 ![target(windows)]
 public function os_getsockname(fd: i32, addr: mut u8*, addrlen: mut u32*) -> i32 { return syscall::getsockname(fd as u64, addr, addrlen as mut i32*); }
 
 // SHUT_RD=0 / SHUT_WR=1 / SHUT_RDWR=2 match SD_RECEIVE/SD_SEND/SD_BOTH.
+
+/// Shut down part of a connection: `how` is 0 for the receive half, 1 for
+/// the send half, 2 for both (`SHUT_RD`/`SHUT_WR`/`SHUT_RDWR`). The
+/// descriptor stays open. Returns 0 on success, -1 with `errno` set on
+/// failure.
 ![target(unix)]
 public function os_shutdown(fd: i32, how: i32) -> i32 { return libc::shutdown(fd, how as libc::ShutdownHow); }
+/// Shut down part of a connection: `how` is 0 for the receive half, 1 for
+/// the send half, 2 for both (`SD_RECEIVE`/`SD_SEND`/`SD_BOTH`). The socket
+/// stays open. Returns 0 on success, or `SOCKET_ERROR` (-1) with the reason
+/// in `WSAGetLastError`.
 ![target(windows)]
 public function os_shutdown(fd: i32, how: i32) -> i32 { return syscall::shutdown(fd as u64, how); }
 
 // ---- data transfer ---------------------------------------------------------
+
+/// Send up to `len` bytes from `buf` on the connected socket `fd`, with no
+/// flags. Returns the number of bytes sent, or -1 with `errno` set
+/// (`EAGAIN` on a non-blocking socket with no room, `EINTR` when a signal
+/// interrupted it). `sock_write` wraps this with the retry and the error
+/// conversion.
 ![target(unix)]
 public function os_send(fd: i32, buf: u8*, len: i64) -> i64 { return libc::send(fd, buf, len as u64, 0); }
+/// Send up to `len` bytes from `buf` on the connected socket `fd`, with no
+/// flags. `len` is narrowed to Winsock's `int` length. Returns the number
+/// of bytes sent, or `SOCKET_ERROR` (-1) with the reason in
+/// `WSAGetLastError` (`WSAEWOULDBLOCK` on a non-blocking socket with no
+/// room).
 ![target(windows)]
 public function os_send(fd: i32, buf: u8*, len: i64) -> i64 { return syscall::send(fd as u64, buf, len as i32, 0) as i64; }
 
+/// Receive up to `len` bytes into `buf` from socket `fd`, with no flags.
+/// Returns the number of bytes received - 0 when a stream peer has closed
+/// its end - or -1 with `errno` set (`EAGAIN` on a non-blocking socket with
+/// nothing to read, `EINTR` when a signal interrupted it).
 ![target(unix)]
 public function os_recv(fd: i32, buf: mut u8*, len: i64) -> i64 { return libc::recv(fd, buf, len as u64, 0); }
+/// Receive up to `len` bytes into `buf` from socket `fd`, with no flags.
+/// `len` is narrowed to Winsock's `int` length. Returns the number of bytes
+/// received - 0 when a stream peer has closed its end - or `SOCKET_ERROR`
+/// (-1) with the reason in `WSAGetLastError` (`WSAEWOULDBLOCK` on a
+/// non-blocking socket with nothing to read).
 ![target(windows)]
 public function os_recv(fd: i32, buf: mut u8*, len: i64) -> i64 { return syscall::recv(fd as u64, buf, len as i32, 0) as i64; }
 
+/// Send one datagram of `len` bytes from `buf` to the packed `sockaddr` of
+/// `addrlen` bytes at `addr`. Returns the number of bytes sent, or -1 with
+/// `errno` set.
 ![target(unix)]
 public function os_sendto(fd: i32, buf: u8*, len: i64, addr: u8*, addrlen: u32) -> i64 {
     return libc::sendto(fd, buf, len as u64, 0, addr, addrlen);
 }
+/// Send one datagram of `len` bytes from `buf` to the packed `sockaddr` of
+/// `addrlen` bytes at `addr`; both lengths are narrowed to Winsock's `int`.
+/// Returns the number of bytes sent, or `SOCKET_ERROR` (-1) with the reason
+/// in `WSAGetLastError`.
 ![target(windows)]
 public function os_sendto(fd: i32, buf: u8*, len: i64, addr: u8*, addrlen: u32) -> i64 {
     return syscall::sendto(fd as u64, buf, len as i32, 0, addr, addrlen as i32) as i64;
 }
 
+/// Receive one datagram, up to `len` bytes, into `buf`; the sender's
+/// `sockaddr` is written to `addr`, whose capacity the caller passes in
+/// `*addrlen` and which is updated to the length written. Returns the
+/// number of bytes received (a longer datagram is cut to `len`), or -1 with
+/// `errno` set.
 ![target(unix)]
 public function os_recvfrom(fd: i32, buf: mut u8*, len: i64, addr: mut u8*, addrlen: mut u32*) -> i64 {
     return libc::recvfrom(fd, buf, len as u64, 0, addr, addrlen);
 }
+/// Receive one datagram, up to `len` bytes, into `buf`; the sender's
+/// `sockaddr` is written to `addr`, whose capacity the caller passes in
+/// `*addrlen` and which is updated to the length written. Returns the
+/// number of bytes received, or `SOCKET_ERROR` (-1) with the reason in
+/// `WSAGetLastError` - Winsock reports a datagram longer than `len` as the
+/// error `WSAEMSGSIZE` (the part that fits is still copied into `buf`).
 ![target(windows)]
 public function os_recvfrom(fd: i32, buf: mut u8*, len: i64, addr: mut u8*, addrlen: mut u32*) -> i64 {
     return syscall::recvfrom(fd as u64, buf, len as i32, 0, addr, addrlen as mut i32*) as i64;
 }
 
 // ---- close -----------------------------------------------------------------
+
+/// Close socket `fd` (`close`). A failure is not reported.
 ![target(unix)]
 public function os_close_sock(fd: i32) -> void { fd::close_fd(fd); }
+/// Close socket `fd` (`closesocket`; a Winsock handle cannot be closed as a
+/// C-runtime descriptor). A failure is not reported.
 ![target(windows)]
 public function os_close_sock(fd: i32) -> void { syscall::closesocket(fd as u64); }
 
 // ---- socket options (semantic; the SO_* constants differ per OS) -----------
 // SOL_SOCKET: 1 (POSIX) vs 0xFFFF (Winsock); SO_REUSEADDR 2 vs 4;
 // SO_BROADCAST 6 vs 32; SO_RCVTIMEO 20 vs 0x1006; SO_SNDTIMEO 21 vs 0x1005.
+
+/// Turn on `SO_REUSEADDR`, so a listener can bind an address still held by
+/// a closed connection in `TIME_WAIT`. Returns 0 on success, -1 with
+/// `errno` set on failure.
 ![target(unix)]
 public function os_set_reuseaddr(fd: i32) -> i32 {
     mut one: i32 = 1;
     return libc::setsockopt(fd, libc::SocketLevel::SOL_SOCKET, libc::SO_REUSEADDR, &one as u8*, 4);
 }
+/// Turn on `SO_REUSEADDR` (level `SOL_SOCKET` 0xFFFF, option 4). On Winsock
+/// this lets the socket bind an address another socket is already bound
+/// to, which is wider than the POSIX meaning. Returns 0 on success, or
+/// `SOCKET_ERROR` (-1) with the reason in `WSAGetLastError`.
 ![target(windows)]
 public function os_set_reuseaddr(fd: i32) -> i32 {
     mut one: i32 = 1;
     return syscall::setsockopt(fd as u64, 65535, 4, &one as u8*, 4);
 }
 
+/// Turn `SO_BROADCAST` on or off, which a datagram socket needs before it
+/// may send to a broadcast address. Returns 0 on success, -1 with `errno`
+/// set on failure.
 ![target(unix)]
 public function os_set_broadcast(fd: i32, on: boolean) -> i32 {
     mut v: i32 = if (on) { 1 } else { 0 };
     return libc::setsockopt(fd, libc::SocketLevel::SOL_SOCKET, libc::SO_BROADCAST, &v as u8*, 4);
 }
+/// Turn `SO_BROADCAST` (level 0xFFFF, option 32) on or off, which a
+/// datagram socket needs before it may send to a broadcast address. Returns
+/// 0 on success, or `SOCKET_ERROR` (-1) with the reason in
+/// `WSAGetLastError`.
 ![target(windows)]
 public function os_set_broadcast(fd: i32, on: boolean) -> i32 {
     mut v: i32 = if (on) { 1 } else { 0 };
@@ -190,6 +325,9 @@ public function os_set_broadcast(fd: i32, on: boolean) -> i32 {
 // calling thread: the reactor does the waiting. POSIX toggles a file-status
 // flag; Winsock has a dedicated ioctl and no way to read the mode back.
 
+/// Turn non-blocking mode on or off for socket `fd`, keeping its other
+/// file-status flags (`fd::set_nonblocking`). Returns 0 on success, -1 on
+/// failure with `errno` still set for `last_io_error`.
 ![target(unix)]
 public function os_set_nonblocking(fd: i32, on: boolean) -> i32 {
     // A failure leaves errno set, which is what `last_io_error` reads.
@@ -198,6 +336,9 @@ public function os_set_nonblocking(fd: i32, on: boolean) -> i32 {
         Result::Err(_) => { -1 }
     };
 }
+/// Turn non-blocking mode on or off for socket `fd` (`ioctlsocket` with
+/// `FIONBIO`). Returns 0 on success, or `SOCKET_ERROR` (-1) with the reason
+/// in `WSAGetLastError`.
 ![target(windows)]
 public function os_set_nonblocking(fd: i32, on: boolean) -> i32 {
     mut v: u32 = if (on) { 1 } else { 0 };
@@ -277,6 +418,10 @@ public function os_sock_error(fd: i32) -> i32 {
     }
     return v;
 }
+/// The latched error on `fd` (`SO_ERROR`), as a Winsock error code: non-zero
+/// is a failed operation (map it with `IoError::from_wsa`), zero means
+/// nothing has failed yet - including a connect still in flight. Returns -1
+/// if the option itself could not be read.
 ![target(windows)]
 public function os_sock_error(fd: i32) -> i32 {
     mut v: i32 = 0;
@@ -290,8 +435,15 @@ public function os_sock_error(fd: i32) -> i32 {
 
 // SO_RCVTIMEO/SO_SNDTIMEO: POSIX wants a 16-byte `struct timeval` (two host-
 // order i64s); Winsock wants a 4-byte DWORD of milliseconds.
-![target(unix)]
 // Host order is little-endian on every supported target.
+
+/// Set the receive (`is_recv`, `SO_RCVTIMEO`) or send (`SO_SNDTIMEO`)
+/// timeout of socket `fd`: a blocking call that waits longer fails with
+/// `EAGAIN`. The duration is passed as a `struct timeval` of whole seconds
+/// and microseconds, so anything below a microsecond is dropped, and a zero
+/// duration means wait forever. Returns 0 on success, -1 with `errno` set
+/// on failure.
+![target(unix)]
 ![target(unix)]
 public function os_set_timeout(fd: i32, is_recv: boolean, timeout: Duration) -> i32 {
     mut timeval: Array<u8> = Array::<u8>::with_capacity(16);
@@ -301,6 +453,13 @@ public function os_set_timeout(fd: i32, is_recv: boolean, timeout: Duration) -> 
     const opt: i32 = if (is_recv) { libc::SO_RCVTIMEO } else { libc::SO_SNDTIMEO };
     return libc::setsockopt(fd, libc::SocketLevel::SOL_SOCKET, opt, timeval.as_ptr(), 16);
 }
+/// Set the receive (`is_recv`, `SO_RCVTIMEO`) or send (`SO_SNDTIMEO`)
+/// timeout of socket `fd`: a blocking call that waits longer fails with
+/// `WSAETIMEDOUT`. Winsock takes whole milliseconds, so the duration is
+/// rounded up (a short non-zero timeout does not become 0, which waits
+/// forever) and capped at `u32::MAX` milliseconds; a zero duration still
+/// means wait forever. Returns 0 on success, or `SOCKET_ERROR` (-1) with the
+/// reason in `WSAGetLastError`.
 ![target(windows)]
 public function os_set_timeout(fd: i32, is_recv: boolean, timeout: Duration) -> i32 {
     mut milliseconds: Array<u8> = Array::<u8>::with_capacity(4);
@@ -315,33 +474,60 @@ public function os_set_timeout(fd: i32, is_recv: boolean, timeout: Duration) -> 
 // ---- errors ----------------------------------------------------------------
 // The last socket error as an IoError: errno on POSIX, WSAGetLastError on
 // Windows.
+
+/// The error the last failed socket call on this thread left in `errno`,
+/// as an `IoError`. Read it straight after the failing call.
 ![target(unix)]
 public function last_io_error() -> IoError { return IoError::last_os_error(); }
+/// The error the last failed socket call on this thread left in
+/// `WSAGetLastError`, as an `IoError` (`IoError::from_wsa`). Winsock keeps
+/// its own error apart from `GetLastError`, so `IoError::last_os_error`
+/// is not the call for a socket. Read it straight after the failing call.
 ![target(windows)]
 public function last_io_error() -> IoError { return IoError::from_wsa(syscall::WSAGetLastError()); }
 
 // ---- name resolution -------------------------------------------------------
 // getaddrinfo/freeaddrinfo exist on both (Winsock needs WSAStartup first).
+
+/// Resolve `node` and `service` (NUL-terminated strings, either may be null)
+/// with `getaddrinfo`, filtered by the packed `struct addrinfo` at `hints`.
+/// On success writes the head of the result list to `*res` - free it with
+/// `os_freeaddrinfo` - and returns 0. On failure returns an `EAI_*` code
+/// (not an `errno` value; `EAI_SYSTEM` means the reason is in `errno`).
+/// Blocks the calling thread for the whole lookup.
 ![target(unix)]
 public function os_getaddrinfo(node: u8*, service: u8*, hints: u8*, res: mut (mut u8*)*) -> i32 {
     return libc::getaddrinfo(node, service, hints, res);
 }
+/// Resolve `node` and `service` (NUL-terminated strings, either may be null)
+/// with `getaddrinfo`, filtered by the packed `struct addrinfo` at `hints`,
+/// starting Winsock first. On success writes the head of the result list to
+/// `*res` - free it with `os_freeaddrinfo` - and returns 0. On failure
+/// returns a non-zero Winsock error code (the `EAI_*` names are aliases of
+/// `WSA*` codes there). Blocks the calling thread for the whole lookup.
 ![target(windows)]
 public function os_getaddrinfo(node: u8*, service: u8*, hints: u8*, res: mut (mut u8*)*) -> i32 {
     net_init();
     return syscall::getaddrinfo(node, service, hints, res);
 }
 
+/// Free a result list `os_getaddrinfo` returned through `res`.
 ![target(unix)]
 public function os_freeaddrinfo(res: mut u8*) -> void { libc::freeaddrinfo(res); }
+/// Free a result list `os_getaddrinfo` returned through `res`.
 ![target(windows)]
 public function os_freeaddrinfo(res: mut u8*) -> void { syscall::freeaddrinfo(res); }
 
 // `struct addrinfo.ai_addr` sits at byte 24 on glibc but byte 32 on Windows
 // (Windows orders ai_canonname before ai_addr).  net::dns reads ai_addr at
 // this offset.  ai_family@4 and ai_next@40 match on both.
+
+/// Byte offset of the `ai_addr` pointer within a `struct addrinfo`: 24 on
+/// Linux, where `ai_addr` comes before `ai_canonname`.
 ![target(linux)]
 public function ai_addr_offset() -> u64 { return 24; }
+/// Byte offset of the `ai_addr` pointer within a `struct addrinfo`: 32 on
+/// Windows, where `ai_canonname` comes before `ai_addr`.
 ![target(windows)]
 public function ai_addr_offset() -> u64 { return 32; }
 
@@ -352,6 +538,12 @@ public function ai_addr_offset() -> u64 { return 32; }
 // platforms).
 // A negative `len` fails with `InvalidInput` before reaching the socket
 // call, which would take it as a huge unsigned size.
+
+/// Receive up to `len` bytes into `buf` from socket `fd`, retrying a call a
+/// signal interrupted. Returns `Ok` with the byte count - 0 when the peer has
+/// closed its end - or `Err` with the socket error (`WouldBlock` on a
+/// non-blocking socket with nothing to read). A negative `len` fails with
+/// `InvalidInput` before the socket is touched.
 public function sock_read(fd: i32, buf: mut u8*, len: i64) -> Result<i64, IoError> {
     if (len < 0) {
         return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
@@ -367,6 +559,11 @@ public function sock_read(fd: i32, buf: mut u8*, len: i64) -> Result<i64, IoErro
     }
 }
 
+/// Send up to `len` bytes from `buf` on socket `fd`, retrying a call a
+/// signal interrupted. Returns `Ok` with the number of bytes sent, which may
+/// be fewer than `len`, or `Err` with the socket error (`WouldBlock` on a
+/// non-blocking socket with no room). A negative `len` fails with
+/// `InvalidInput` before the socket is touched.
 public function sock_write(fd: i32, buf: u8*, len: i64) -> Result<i64, IoError> {
     if (len < 0) {
         return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
@@ -384,6 +581,10 @@ public function sock_write(fd: i32, buf: u8*, len: i64) -> Result<i64, IoError> 
 
 // Apply a receive/send timeout, returning a Result (the raw helper returns an
 // rc).  Shared by tcp/udp `set_*_timeout`.
+
+/// Set the receive (`is_recv`) or send timeout of socket `fd` through
+/// `os_set_timeout`, whose per-OS rounding applies. Returns `Err` with the
+/// socket error if the option could not be set.
 public function set_timeout(fd: i32, is_recv: boolean, timeout: Duration) -> Result<(), IoError> {
     if (os_set_timeout(fd, is_recv, timeout) < 0) {
         return Result::Err(last_io_error());
@@ -395,7 +596,13 @@ public function set_timeout(fd: i32, is_recv: boolean, timeout: Duration) -> Res
 // configured interface) is 0x20; the Windows value differs, so the Windows
 // path passes 0 (standard resolution, all families) rather than risk a
 // wrong flag bit.
+
+/// The `ai_flags` `net::dns` puts in its `getaddrinfo` hints:
+/// `AI_ADDRCONFIG`, so an address family with no configured interface is
+/// left out of the answer.
 ![target(unix)]
 public function dns_hint_flags() -> u32 { return libc::AI_ADDRCONFIG as u32; }
+/// The `ai_flags` `net::dns` puts in its `getaddrinfo` hints: none, so every
+/// address family is returned.
 ![target(windows)]
 public function dns_hint_flags() -> u32 { return 0; }

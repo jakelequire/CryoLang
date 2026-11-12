@@ -3,8 +3,8 @@
 ///! `GlobalAlloc` is the default implementation. Its memory operations are
 ///! delegated to the `backend_*` functions below — libc
 ///! (`aligned_alloc`/`aligned_free`/`realloc`) by default, or the
-///! mmap-backed `alloc::heap` under the temporary `[low_level]
-///! native_alloc` migration switch (Low-Level Plan Stage 3). An arena or
+///! mmap-backed `alloc::heap` when the build sets `[low_level]
+///! native_alloc`. An arena or
 ///! pool can plug in anywhere an `Allocator` is expected.
 ///!
 ///! Collections accept `A: Allocator` as a type parameter so the
@@ -31,6 +31,11 @@ import std::alloc::arena::{ GlobalArena };
 // `native_alloc` backend arms and `NativeHeap`'s implementation below.
 import std::alloc::heap::{ NativeHeap };
 
+/// Why an `Allocator` call failed: the `kind` field of an `AllocError`.
+/// The stdlib's allocators report `OutOfMemory` and `ZeroSized`, and a
+/// `Pool` reports `InvalidLayout` for a layout its slot cannot hold; none
+/// of them reports `Exhausted`, which is there for an allocator written
+/// outside the stdlib.
 public type enum AllocErrorKind with [Eq, Clone] {
     /// The underlying allocator returned null; the system is out of
     /// memory or hit an address-space limit.
@@ -39,7 +44,10 @@ public type enum AllocErrorKind with [Eq, Clone] {
     /// non-null dangling pointer for a zero-sized type should handle
     /// the zero case themselves before calling `allocate`.
     ZeroSized;
-    /// A bounded allocator (arena, pool) has no room for this request.
+    /// A bounded allocator has no room left for this request. No stdlib
+    /// allocator returns it (a full `Arena` or `Pool` reports
+    /// `OutOfMemory`); it is available to allocators written outside the
+    /// stdlib.
     Exhausted;
     /// The requested layout is incompatible with this allocator (e.g.,
     /// the size or alignment doesn't match a Pool's fixed slot). The
@@ -47,10 +55,14 @@ public type enum AllocErrorKind with [Eq, Clone] {
     InvalidLayout;
 }
 
+/// The error an `Allocator` returns: what went wrong (`kind`) and the
+/// layout that was requested when it did (`layout`; for a `reallocate`,
+/// the new layout).
 public type struct AllocError {
     public kind: AllocErrorKind;
     public layout: Layout;
 
+    /// An error of `kind` for a request of `layout`.
     public static new(kind: AllocErrorKind, layout: Layout) -> AllocError {
         return AllocError { kind: kind, layout: layout };
     }
@@ -70,6 +82,24 @@ public type struct AllocError {
     }
 }
 
+/// A source of heap memory: hands out blocks described by a `Layout` and
+/// takes them back. Collections, `Box` and `String` take an
+/// `A: Allocator` type parameter, so the storage strategy is the caller's
+/// choice; `GlobalAlloc` is the default.
+///
+/// ```cryo
+/// import std::alloc::allocator::{ Allocator, GlobalAlloc, AllocError };
+/// import std::alloc::layout::{ Layout };
+/// import std::core::ptr::{ NonNull };
+/// import std::core::result::{ Result };
+///
+/// mut heap: GlobalAlloc = GlobalAlloc::new();
+/// const layout: Layout = Layout::array::<u64>(4);
+/// const r: Result<NonNull<u8>, AllocError> = heap.allocate(layout);
+/// if (r.is_ok()) {
+///     heap.deallocate(r.unwrap(), layout);
+/// }
+/// ```
 public type trait Allocator {
     /// Return a pointer to at least `layout.size` bytes aligned to
     /// `layout.alignment`. The returned memory is uninitialized; the
@@ -130,10 +160,8 @@ internal function next_capacity(current: i64, required: i64, min_capacity: i64) 
 //
 // `GlobalAlloc`'s trait methods keep the policy (zero-size rejection, arena
 // routing) and delegate the actual memory operations to these three
-// config-gated functions.  Default: libc.  Under the temporary `[low_level]
-// native_alloc` migration switch: the mmap-backed `alloc::heap`
-// (Low-Level Plan Stage 3; the switch and the libc arms are deleted once
-// the native heap is proven).  All three return null for "out of memory".
+// config-gated functions.  Default: libc.  Under `[low_level] native_alloc`:
+// the mmap-backed `alloc::heap`.  All three return null for "out of memory".
 
 ![config(not(native_alloc))]
 private function backend_alloc(layout: Layout) -> mut void* {
@@ -198,6 +226,8 @@ private function backend_realloc(ptr: mut void*, old_layout: Layout,
 /// `GlobalAlloc::new()`; all instances dispatch through the same
 /// underlying backend.
 public type struct GlobalAlloc {
+    /// A handle to the process-wide allocator. Holds no state, so it costs
+    /// nothing to make one per call.
     public static new() -> GlobalAlloc {
         return GlobalAlloc { };
     }

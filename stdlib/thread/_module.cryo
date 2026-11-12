@@ -485,6 +485,9 @@ where F: () -> T + Send, T: Send {
 // `pthread_setname_np` (POSIX); the stack size is applied by
 // `os_create_thread`.  The 15-byte limit is shared by both platforms - it is
 // the POSIX maximum, and well within Windows' SetThreadDescription bound.
+/// The longest thread name `Builder::name` keeps, in bytes: 15, the most
+/// `pthread_setname_np` accepts before its terminating NUL. A longer name
+/// is cut to its first 15 bytes on every platform.
 public const MAX_THREAD_NAME: u64 = 15;
 
 /// A configurable thread spawn: set a stack size and/or an OS-visible
@@ -494,8 +497,9 @@ public const MAX_THREAD_NAME: u64 = 15;
 ///
 ///   ```cryo
 ///   const n: i32 = 21;
+///   const one_mebibyte: u64 = 1 << 20;
 ///   const h = thread::Builder::new()
-///       .stack_size(1u64 << 20)            // 1 MiB stack
+///       .stack_size(one_mebibyte)          // 1 MiB stack
 ///       .name(Str::new("worker"))
 ///       .spawn(move () -> i32 { return n * 2; });
 ///   const r: i32 = h.join();               // 42
@@ -588,6 +592,10 @@ public type struct Builder {
 public type struct ThreadId {
     private raw: u64;
 
+    /// True when both ids name the same thread (`pthread_equal` on unix).
+    /// On Windows `JoinHandle.id` holds the thread's handle and
+    /// `thread::current().id()` its numeric id, so an id from one never
+    /// equals an id from the other, even for the same thread.
     public equals(&this, other: &ThreadId) -> boolean {
         return os_thread_equal(this.raw, other.raw);
     }
@@ -598,6 +606,8 @@ public type struct ThreadId {
 public type struct Thread {
     private id_: ThreadId;
 
+    /// The thread's id: its `pthread_t` on unix, its numeric thread id
+    /// (`GetCurrentThreadId`) on Windows.
     public id(&this) -> ThreadId {
         return this.id_;
     }
@@ -718,17 +728,30 @@ implement trait Drop for struct Scope {
 // available_parallelism
 // ---------------------------------------------------------------------------
 
-/// The number of hardware threads available to the process - the natural
-/// default size for a worker pool. Clamped to at least 1 so a pool always
-/// makes progress. Best-effort: returns 1 if the OS query fails.
+/// The number of online logical processors (`sysconf` of
+/// `_SC_NPROCESSORS_ONLN`) - the natural default size for a worker pool.
+/// Clamped to at least 1 so a pool always makes progress: returns 1 if the
+/// query fails. Counts the machine's processors, not a CPU-affinity mask
+/// the process may be restricted to.
 ![target(unix)]
 public function available_parallelism() -> u32 {
-    // _SC_NPROCESSORS_ONLN == 84 on Linux/glibc and the BSDs.
+    // _SC_NPROCESSORS_ONLN is 84 on Linux; other unix systems number it
+    // differently, and this call passes the Linux value.
     const n: i64 = libc::sysconf(84);
     if (n <= 0) { return 1; }
     return n as u32;
 }
 
+/// The number of logical processors `GetSystemInfo` reports - the natural
+/// default size for a worker pool - or 1 if it reports none. On a machine
+/// with more than one processor group this counts the calling thread's
+/// group only.
+///
+/// ```cryo
+/// import std::thread;
+///
+/// const workers: u32 = thread::available_parallelism();   // at least 1
+/// ```
 ![target(windows)]
 public function available_parallelism() -> u32 {
     mut si: syscall::SYSTEM_INFO_PARTIAL = syscall::SYSTEM_INFO_PARTIAL {

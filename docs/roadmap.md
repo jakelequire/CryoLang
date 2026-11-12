@@ -733,6 +733,48 @@ told apart before the warning becomes an error.
 Open: whether `ptr::drop_in_place` stays the spelling for releasing a
 value through a raw pointer.
 
+## Typed JSON through the derive list
+
+`std::json::convert` has `ToJson` and `FromJson`, implemented for the
+primitives, `String`, `Str` (writing only), `Array<T>` and `Option<T>`
+(writing only).  A struct of its own is converted by writing both
+implementations by hand; the derive list writes them instead.
+
+- **Spelling.**  `type struct Server with [ToJson, FromJson] { ... }`, the
+  derive list that exists.  A field's options are a field directive:
+  `![json(rename = "port_number")]` reads and writes the member under that
+  key, `![json(skip)]` leaves the field out of both, `![json(default)]`
+  reads a missing member as the field type's `default()`, and
+  `![json(skip_none)]` leaves an `Option` field that holds `None` out of
+  the written object.
+- **Writing.**  The generated `to_json` makes a `JsonObject` sized for the
+  fields not skipped and puts each one, in declaration order, under its
+  key (its rename, or the field's name) as the field's own `to_json()`,
+  then answers `JsonValue::Object`.  An `Option` field holding `None` is
+  written as `null` unless the field says `skip_none`.  Every field's type
+  must implement `ToJson`, and a refusal names the field.
+- **Reading.**  The generated `from_json` refuses a value that is not an
+  object with `JsonDecodeError::unexpected(Str::new("an object"), value)`.
+  Each field reads the member under its key: a member present is read with
+  the field type's `from_json`, and a refusal there is wrapped with
+  `at_field(<key>)` so the error names the path; a member absent is the
+  type's `default()` for a `default` or `skip` field (which needs
+  `Default`), `None` for an `Option` field, and otherwise
+  `JsonDecodeError::missing_field(<key>)`.  The struct is then built in one
+  literal.  A member the struct does not name is ignored.
+- **Enums.**  An enum whose variants carry nothing is written as its
+  variant's name, `"Red"`, and read back from that string; another string
+  is refused with `unexpected(Str::new("a Color"), value)`.  An enum whose
+  variants carry values is out of scope for the first version, and a
+  derive on one is refused.
+
+It waits on reading an `Option` through `FromJson`, which the compiler
+refuses today (the specialization of `Option<X>`'s static `from_json`
+grows without end through `Result<Option<X>, E>`), and on the map
+implementations, `ToJson` and `FromJson` for a `HashMap` or `BTreeMap`
+keyed by `String`, which need a pin built with the fix to a trait
+implementation's head being checked before it is cloned for an instance.
+
 ## libc bindings spelled as their C headers
 
 Low priority.  Most of the standard library's libc bindings spell C's

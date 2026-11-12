@@ -1,7 +1,9 @@
 ///! HTTP response.
 ///!
-///! Built by handlers, written to any `Write`. The client side parses
-///! one from a `Read` the same way the server parses a `Request`.
+///! Built by handlers and appended to a buffer with `encode_into`. The
+///! client side reads one off a buffered connection with the async
+///! `BufStream::read_response` (in `conn`), the same way the server reads a
+///! `Request`.
 
 namespace std::net::http::response;
 
@@ -26,17 +28,41 @@ import std::net::http::request;
 // malicious server could otherwise make the client pre-allocate (or
 // panic-abort on) gigabytes before a single body byte arrives - a remote
 // DoS.  Mirrors `request::MAX_BODY` (16 MiB) on the server side.
+/// The largest response body, in bytes, the HTTP/1.1 reader accepts:
+/// 16777216 (16 MiB). A declared `Content-Length` above it is refused with
+/// `InvalidData` before any of the body is read; a chunked body, or one
+/// that runs to the end of the connection, is refused as soon as it passes
+/// it.
 public const MAX_BODY: i64 = 16777216;
 /// Cap on the number of response header lines (slow memory-exhaustion DoS
 /// guard). Mirrors `request::MAX_HEADER_COUNT`.
 public const MAX_HEADER_COUNT: u64 = 100;
 
+/// An HTTP/1.1 response: status, version text, headers and body. A handler
+/// builds one with `new`, `text` or `json`; a client receives one from
+/// `BufStream::read_response`. `encode_into` writes the status line from
+/// `status` and its reason phrase, always as `HTTP/1.1`.
+///
+/// ```cryo
+/// import std::collections::array::{ Array };
+/// import std::collections::str::{ Str };
+/// import std::net::http::response::{ Response };
+/// import std::net::http::status::{ StatusCode };
+///
+/// const response: Response = Response::text(StatusCode::ok(), Str::new("hi"));
+/// mut wire: Array<u8> = Array::new();
+/// response.encode_into(&wire).expect("encode");
+/// // HTTP/1.1 200 OK, content-type: text/plain; charset=utf-8,
+/// // content-length: 2, a blank line, then hi
+/// ```
 public type struct Response {
     public status: StatusCode;
     public version: String;
     public headers: Headers;
     public body: Array<u8>;
 
+    /// A response with `status`, version `HTTP/1.1`, no headers and an
+    /// empty body. No `Content-Length` is set until `set_body` is called.
     public static new(status: StatusCode) -> Response {
         return Response {
             status: status,

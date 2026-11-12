@@ -13,6 +13,10 @@ namespace std::process::signal;
 
 import std::core::option::{ Option };
 
+/// The signals this library names, each valued at its Linux number. On
+/// Windows they are only numbers: `Child.send_signal` carries out `SIGKILL`
+/// and `SIGINT`, `Signals` hands over `SIGINT` and `SIGTERM` for the console
+/// events that stand for them, and nothing else uses the rest.
 public type enum SigNo : i32 with [Eq] {
     SIGHUP  = 1;
     SIGINT  = 2;
@@ -64,9 +68,27 @@ implement enum SigNo {
     }
 }
 
+/// A signal, sent with `Child.send_signal` and received with
+/// `signal_handling::Signals`. Build one with a named constructor
+/// (`Signal::kill()`), from a `SigNo` with `new`, or from a raw number with
+/// `from_i32`.
+///
+/// On Windows, which has no signals, only two have an effect: sending
+/// `kill` terminates the process and sending `interrupt` raises Ctrl-Break
+/// in a child that leads its own console process group; sending any other
+/// is refused with `Unsupported`. Each constructor says what its signal
+/// does there.
+///
+/// ```cryo
+/// import std::process::signal::{ Signal, SigNo };
+///
+/// const interrupt: Signal = Signal::interrupt();
+/// // interrupt.as_i32() == 2, and Signal::new(SigNo::SIGINT) is the same signal
+/// ```
 public type struct Signal with [Eq] {
     private value: SigNo;
 
+    /// The signal `value` names.
     public static new(value: SigNo) -> Signal {
         return Signal { value: value };
     }
@@ -80,29 +102,79 @@ public type struct Signal with [Eq] {
         };
     }
 
-    /// Underlying signal number for the libc syscall.
+    /// The signal number, as handed to libc `kill` on POSIX. On Windows it
+    /// is only compared against `Signal::kill()` and `Signal::interrupt()`.
     public as_i32(&this) -> i32 {
         return this.value as i32;
     }
 
     // POSIX signal numbers (Linux).
+
+    /// SIGHUP (1): the controlling terminal hung up; by default it ends the
+    /// process. Windows: refused by `send_signal` (`Unsupported`).
     public static hangup() -> Signal         { return Signal { value: SigNo::SIGHUP }; }
+    /// SIGINT (2): an interrupt from the keyboard (Ctrl-C); by default it
+    /// ends the process. Windows: `send_signal` raises Ctrl-Break in a child
+    /// spawned after `Command.group_descendants`, which reaches its whole
+    /// console process group, and refuses any other child (`Unsupported`);
+    /// `Signals` hands over Ctrl-C and Ctrl-Break as this signal.
     public static interrupt() -> Signal      { return Signal { value: SigNo::SIGINT }; }
+    /// SIGQUIT (3): a quit from the keyboard (Ctrl-\); by default it ends the
+    /// process with a core dump. Windows: refused by `send_signal`
+    /// (`Unsupported`).
     public static quit() -> Signal           { return Signal { value: SigNo::SIGQUIT }; }
+    /// SIGILL (4): the process executed an illegal instruction. Windows:
+    /// refused by `send_signal` (`Unsupported`).
     public static illegal() -> Signal        { return Signal { value: SigNo::SIGILL }; }
+    /// SIGTRAP (5): a breakpoint or trace trap, for debuggers. Windows:
+    /// refused by `send_signal` (`Unsupported`).
     public static trap() -> Signal           { return Signal { value: SigNo::SIGTRAP }; }
+    /// SIGABRT (6): an abort, as raised by `abort()`; by default it ends the
+    /// process with a core dump. Windows: refused by `send_signal`
+    /// (`Unsupported`).
     public static abort() -> Signal          { return Signal { value: SigNo::SIGABRT }; }
+    /// SIGBUS (7): a bus error, such as a misaligned access or a touch of a
+    /// mapped file past its end. Windows: refused by `send_signal`
+    /// (`Unsupported`).
     public static bus() -> Signal            { return Signal { value: SigNo::SIGBUS }; }
+    /// SIGFPE (8): an arithmetic fault, such as an integer division by zero.
+    /// Windows: refused by `send_signal` (`Unsupported`).
     public static floating_point() -> Signal { return Signal { value: SigNo::SIGFPE }; }
+    /// SIGKILL (9): ends the process at once; it cannot be caught or
+    /// ignored. Windows: `send_signal` terminates the process, which exits
+    /// with code 1. `Child.kill` sends this.
     public static kill() -> Signal           { return Signal { value: SigNo::SIGKILL }; }
+    /// SIGUSR1 (10): user-defined, with no meaning of its own; by default it
+    /// ends the process. Windows: refused by `send_signal` (`Unsupported`).
     public static user1() -> Signal          { return Signal { value: SigNo::SIGUSR1 }; }
+    /// SIGSEGV (11): an invalid memory reference, a segmentation fault.
+    /// Windows: refused by `send_signal` (`Unsupported`).
     public static segfault() -> Signal       { return Signal { value: SigNo::SIGSEGV }; }
+    /// SIGUSR2 (12): user-defined, with no meaning of its own; by default it
+    /// ends the process. Windows: refused by `send_signal` (`Unsupported`).
     public static user2() -> Signal          { return Signal { value: SigNo::SIGUSR2 }; }
+    /// SIGPIPE (13): a write to a pipe or socket nobody reads any more; by
+    /// default it ends the process. Windows: refused by `send_signal`
+    /// (`Unsupported`).
     public static pipe() -> Signal           { return Signal { value: SigNo::SIGPIPE }; }
+    /// SIGALRM (14): a timer set by `alarm` ran out; by default it ends the
+    /// process. Windows: refused by `send_signal` (`Unsupported`).
     public static alarm() -> Signal          { return Signal { value: SigNo::SIGALRM }; }
+    /// SIGTERM (15): a request to end, which the process may catch to shut
+    /// down cleanly; by default it ends the process. Windows: refused by
+    /// `send_signal` (`Unsupported`) - use `kill`; `Signals` hands over the
+    /// console closing, logoff and shutdown as this signal.
     public static terminate() -> Signal      { return Signal { value: SigNo::SIGTERM }; }
+    /// SIGCHLD (17): a child process stopped or exited; ignored by default.
+    /// Windows: refused by `send_signal` (`Unsupported`).
     public static child() -> Signal          { return Signal { value: SigNo::SIGCHLD }; }
+    /// SIGCONT (18): resume a stopped process. Windows: refused by
+    /// `send_signal` (`Unsupported`).
     public static cont() -> Signal           { return Signal { value: SigNo::SIGCONT }; }
+    /// SIGSTOP (19): stop the process until a SIGCONT; it cannot be caught
+    /// or ignored. Windows: refused by `send_signal` (`Unsupported`).
     public static stop() -> Signal           { return Signal { value: SigNo::SIGSTOP }; }
+    /// SIGTSTP (20): a stop from the terminal (Ctrl-Z), which the process may
+    /// catch. Windows: refused by `send_signal` (`Unsupported`).
     public static tty_stop() -> Signal       { return Signal { value: SigNo::SIGTSTP }; }
 }

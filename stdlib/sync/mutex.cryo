@@ -139,6 +139,24 @@ implement<T, A> trait Drop for struct MutexGuard<T, A> {
 }
 
 
+/// A value of type `T` that one thread at a time may use. `lock` waits for
+/// the lock and returns a `MutexGuard` through which the value is read and
+/// written; dropping the guard releases the lock. The lock and the value
+/// live in one block allocated from `A`, so the `Mutex` handle can move
+/// while the lock stays put. A `pthread_mutex_t` on unix and an SRW lock
+/// on Windows; neither is recursive, so locking twice from one thread
+/// never returns.
+///
+/// ```cryo
+/// import std::sync::mutex::{ Mutex, MutexGuard };
+/// import std::alloc::allocator::{ GlobalAlloc };
+///
+/// const counter: Mutex<i64> = Mutex::new(0);
+/// {
+///     mut guard: MutexGuard<i64, GlobalAlloc> = counter.lock();
+///     *guard.as_mutable_ptr() = *guard.as_ptr() + 1;
+/// }   // the guard drops here and releases the lock
+/// ```
 public type struct Mutex<T, A = GlobalAlloc> where A: Allocator {
     private inner: mut MutexInner<T, A>*;
 
@@ -154,6 +172,10 @@ public type struct Mutex<T, A = GlobalAlloc> where A: Allocator {
         }
     }
 
+    /// Construct a `Mutex` holding `value`, its block allocated from
+    /// `alloc`, which is kept to free it on drop. Panics when the block
+    /// cannot be allocated or the lock cannot be initialised; use
+    /// `try_new_in` to handle the error.
     public static new_in(value: T, alloc: A) -> Mutex<T, A> {
         match (Mutex::try_new_in(value, alloc)) {
             Result::Ok(m)  => { return m; }
@@ -188,6 +210,11 @@ public type struct Mutex<T, A = GlobalAlloc> where A: Allocator {
         return Result::Ok(Mutex::<T, GlobalAlloc> { inner: inner_ptr });
     }
 
+    /// Construct a `Mutex` holding `value`, its block allocated from
+    /// `alloc`. Returns the allocator's `AllocError` when the block cannot
+    /// be allocated, and an `OutOfMemory` error, after freeing the block,
+    /// when `pthread_mutex_init` fails (unix; the Windows initialisation
+    /// cannot fail).
     public static try_new_in(value: T, alloc: A) -> Result<Mutex<T, A>, AllocError> {
         mut a: A = alloc;
         const header: Layout = Layout::of::<MutexInner<T, A>>();
@@ -207,9 +234,10 @@ public type struct Mutex<T, A = GlobalAlloc> where A: Allocator {
 
     /// Acquire the lock, blocking the current thread until it is
     /// available.  Returns a guard whose `drop()` will release the
-    /// lock.  Panics only on a programming error reported by
-    /// `pthread_mutex_lock` (`EINVAL` from a recursively-locked
-    /// non-recursive mutex or a destroyed mutex).
+    /// lock.  The lock is not recursive: locking it again from the thread
+    /// that holds it never returns (a default-attribute pthread mutex and
+    /// an SRW lock both deadlock).  Panics when `pthread_mutex_lock`
+    /// reports an error (unix); the Windows acquire cannot fail.
     public lock(&this) -> MutexGuard<T, A> {
         const buf_ptr: mut u8* = &this.inner.pthread_buf[0];
         const rc: i32 = mutex_lock_raw(buf_ptr);

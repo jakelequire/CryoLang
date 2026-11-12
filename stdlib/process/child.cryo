@@ -4,7 +4,9 @@
 ///! the caller asked for. `wait` blocks until the child exits;
 ///! `join` is its async spelling; `try_wait` polls; `wait_timeout`
 ///! waits at most a given time; `kill` sends
-///! SIGKILL; `send_signal` sends any other; `kill_tree` ends the child
+///! SIGKILL (terminates the process on Windows); `send_signal` sends any
+///! other on POSIX, while Windows delivers only kill and interrupt and
+///! refuses the rest as `Unsupported`; `kill_tree` ends the child
 ///! with everything it started, when it was spawned after
 ///! `Command.group_descendants`. `ChildStdin` /
 ///! `ChildStdout` / `ChildStderr` implement `Write` / `Read` over a fd.
@@ -419,6 +421,9 @@ private const MAXRSS_UNIT: u64 = 1;
 public type struct ChildStdin {
     private fd: i32;
 
+    /// Wrap `raw_fd`, a pipe descriptor this handle now owns and closes when
+    /// it drops. `Command::spawn` builds these; a descriptor of -1 makes an
+    /// empty handle whose drop closes nothing.
     public static from_fd(raw_fd: i32) -> ChildStdin {
         return ChildStdin { fd: raw_fd };
     }
@@ -446,6 +451,9 @@ implement trait Write for struct ChildStdin {
 public type struct ChildStdout {
     private fd: i32;
 
+    /// Wrap `raw_fd`, a pipe descriptor this handle now owns and closes when
+    /// it drops. `Command::spawn` builds these; a descriptor of -1 makes an
+    /// empty handle whose drop closes nothing.
     public static from_fd(raw_fd: i32) -> ChildStdout {
         return ChildStdout { fd: raw_fd };
     }
@@ -469,6 +477,9 @@ implement trait Read for struct ChildStdout {
 public type struct ChildStderr {
     private fd: i32;
 
+    /// Wrap `raw_fd`, a pipe descriptor this handle now owns and closes when
+    /// it drops. `Command::spawn` builds these; a descriptor of -1 makes an
+    /// empty handle whose drop closes nothing.
     public static from_fd(raw_fd: i32) -> ChildStderr {
         return ChildStderr { fd: raw_fd };
     }
@@ -488,6 +499,11 @@ implement trait Read for struct ChildStderr {
     }
 }
 
+/// A running subprocess, returned by `Command::spawn`. `stdin`, `stdout`
+/// and `stderr` hold the pipe ends for each stream the command asked to
+/// pipe, and `None` for the rest. Wait for it (`wait`, `try_wait`,
+/// `wait_timeout`, `join`) before it drops: dropping a child still running
+/// leaves it running, detached.
 public type struct Child {
 private:
     pid: i32;
@@ -525,6 +541,9 @@ public:
         };
     }
 
+    /// The child's process id: its pid on POSIX, its process identifier on
+    /// Windows. Once the child has been waited for, the system may give the
+    /// same number to an unrelated process.
     id(&this) -> i32 {
         return this.pid;
     }

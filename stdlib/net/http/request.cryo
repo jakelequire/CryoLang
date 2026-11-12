@@ -1,10 +1,10 @@
 ///! HTTP request.
 ///!
-///! A `Request` is parsed from any `Read` (typically a `TcpStream`)
-///! or built by a client and written to any `Write`. The parser is
-///! intentionally basic: request line + headers until CRLF-CRLF +
-///! a body framed by `Content-Length` or the chunked transfer coding
-///! (`conn` reads both).
+///! A server reads a `Request` off a buffered connection with the async
+///! `BufStream::read_request` (in `conn`); a client builds one and appends
+///! its bytes to a buffer with `encode_into`. The reader is intentionally
+///! basic: request line + headers until CRLF-CRLF + a body framed by
+///! `Content-Length` or the chunked transfer coding.
 
 namespace std::net::http::request;
 
@@ -25,8 +25,19 @@ import std::core::primitives;
 import std::net::http::method::{ Method };
 import std::net::http::headers::{ Headers };
 
+/// `"HTTP/1.1"`, the version `Request::new` and `Response::new` store. It is
+/// the only version written on the wire: the encoders emit it literally
+/// whatever a message's `version` field holds.
 public const HTTP_VERSION: Str = Str::new("HTTP/1.1");
+/// The longest line, in bytes, the HTTP/1.1 reader buffers while looking
+/// for its end: 8192. It caps the request line, the status line, each
+/// header and trailer line and each chunk-size line, in both directions;
+/// a peer that sends a longer one is refused with `InvalidData`.
 public const MAX_HEADER_LINE: i64 = 8192;
+/// The largest request body, in bytes, the HTTP/1.1 reader accepts:
+/// 16777216 (16 MiB). A declared `Content-Length` above it is refused with
+/// `InvalidData` before any of the body is read; a chunked body is refused
+/// as soon as its chunks would pass it.
 public const MAX_BODY: i64 = 16777216;  // 16 MiB; hard cap against runaway Content-Length
 /// Cap on the number of header lines. Each line is already bounded by
 /// MAX_HEADER_LINE, but without a count cap the parse loop grows the Headers
@@ -34,6 +45,27 @@ public const MAX_BODY: i64 = 16777216;  // 16 MiB; hard cap against runaway Cont
 /// memory-exhaustion DoS). 100 mirrors common server defaults.
 public const MAX_HEADER_COUNT: u64 = 100;
 
+/// An HTTP/1.1 request: method, target path, version text, headers, body,
+/// and the path parameters a `Router` captured. A server receives one from
+/// `BufStream::read_request`; a client builds one with `new` and the
+/// `with_*` builders and writes it with `encode_into`.
+///
+/// ```cryo
+/// import std::collections::array::{ Array };
+/// import std::collections::str::{ Str };
+/// import std::net::http::method::{ Method };
+/// import std::net::http::request::{ Request };
+///
+/// mut body: Array<u8> = Array::new();
+/// body.append(Str::new("hello").as_bytes());
+/// const request: Request = Request::new(Method::Post, Str::new("/items"))
+///     .with_header(Str::new("Content-Type"), Str::new("text/plain"))
+///     .with_body(body);
+/// mut wire: Array<u8> = Array::new();
+/// request.encode_into(&wire).expect("encode");
+/// // POST /items HTTP/1.1, content-type: text/plain, content-length: 5,
+/// // a blank line, then hello
+/// ```
 public type struct Request with [Clone] {
     public method:  Method;
     public path:    String;
@@ -58,8 +90,8 @@ public type struct Request with [Clone] {
     }
 
     /// Look up a path parameter captured by the router (e.g., `:id`
-    /// in `/users/:id`). Returns an owned copy of the captured segment
-    /// The caller is responsible for dropping it. Returns `None`
+    /// in `/users/:id`). Returns an owned copy of the captured segment,
+    /// or `None`
     /// when the parameter was not captured (no router, or pattern did
     /// not include a segment with that name).
     public param(&this, name: Str) -> Option<String> {
@@ -101,9 +133,9 @@ public type struct Request with [Clone] {
     /// a request with empty headers and no body. Malformed input is
     /// `InvalidData`, which a server surfaces as 400.
     ///
-    /// Split out from the message parse so the grammar has exactly one
-    /// implementation: the blocking `parse` below and the connection's
-    /// `read_request` differ only in how they obtain the line.
+    /// Split out from the message read so the grammar lives with the
+    /// type: the connection's `BufStream::read_request` obtains the line
+    /// and hands it here.
     public static from_request_line(line: Str) -> Result<Request, IoError> {
         mut first_sp: i64 = line.length();
         mut second_sp: i64 = line.length();
