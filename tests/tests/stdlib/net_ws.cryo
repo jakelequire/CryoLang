@@ -393,7 +393,10 @@ function ping_is_answered_inline_without_losing_the_message() -> Result<(), Test
 ///   0 - Close 1000 with the reason "bye", which the server echoes;
 ///   1 - text that is not UTF-8 (0xC3 0x28), answered with 1007;
 ///   2 - a Close of one byte, answered with 1002;
-///   3 - Close 1005, a code no peer may send, answered with 1002.
+///   3 - Close 1005, a code no peer may send, answered with 1002;
+///   4 - an unmasked text frame, which a client may not send, answered
+///       with 1002;
+///   5 - a Close with no status code, answered with 1000.
 /// Returns the status code of the Close the server sends back, or a
 /// negative step code.
 async function ws_raw_client(port: u16, case: i64) -> i64 {
@@ -426,6 +429,11 @@ async function ws_raw_client(port: u16, case: i64) -> i64 {
         } else if (case == 2) {
             body.push(0x03);
             queued = c.queue_frame(true, OpCode::Close, body.as_slice(), true).is_ok();
+        } else if (case == 4) {
+            body.append(Str::new("hi").as_bytes());
+            queued = c.queue_frame(true, OpCode::Text, body.as_slice(), false).is_ok();
+        } else if (case == 5) {
+            queued = c.queue_frame(true, OpCode::Close, body.as_slice(), true).is_ok();
         } else {
             body.push(0x03); body.push(0xED);
             queued = c.queue_frame(true, OpCode::Close, body.as_slice(), true).is_ok();
@@ -457,9 +465,23 @@ async function ws_raw_client(port: u16, case: i64) -> i64 {
     return (((status[0] as i64) << 8) | (status[1] as i64));
 }
 
+/// 1 when `ws` reports the peer's Close as `code` and `reason`, else a
+/// negative step code.
+function close_status_is(ws: &WebSocket<TcpStream>, code: u16, reason: Str) -> i64 {
+    match (ws.close_status()) {
+        option::Option::Some(status) => {
+            if (status.code != code) { return -104; }
+            if (status.reason != reason) { return -105; }
+            return 1;
+        }
+        option::Option::None => { return -106; }
+    }
+}
+
 /// Accept, upgrade and read one message. Returns 1 when `recv` answered as
-/// the case requires - `Message::Close` for case 0, an error otherwise -
-/// and a negative step code when it did not.
+/// the case requires - `Message::Close` carrying the sent status for cases
+/// 0 and 5, an error and no status otherwise - and a negative step code
+/// when it did not.
 async function ws_raw_server(listener: TcpListener, case: i64) -> i64 {
     mut sock: TcpStream = match (await ws_accept_one(listener)) {
         Result::Ok(v)  => { v }
@@ -476,11 +498,13 @@ async function ws_raw_server(listener: TcpListener, case: i64) -> i64 {
                 Message::Text(s)   => { mut _owned: String = s; false }
                 Message::Binary(b) => { mut _bytes: Array<u8> = b; false }
             };
-            if (closed && case == 0) { return 1; }
+            if (closed && case == 0) { return close_status_is(&ws, 1000, Str::new("bye")); }
+            if (closed && case == 5) { return close_status_is(&ws, 1005, Str::new("")); }
             return -102;
         }
         Result::Err(_) => {
-            if (case == 0) { return -103; }
+            if (case == 0 || case == 5) { return -103; }
+            if (ws.close_status().is_some()) { return -107; }
             return 1;
         }
     }
@@ -523,4 +547,18 @@ function malformed_close_is_answered_with_1002() -> Result<(), TestError> {
     const reserved: (i64, i64) = ws_raw_case(3);
     expect_eq(reserved.0, 1 as i64)?;
     return expect_eq(reserved.1, 1002 as i64);
+}
+
+![test]
+function a_frame_masked_the_wrong_way_is_answered_with_1002() -> Result<(), TestError> {
+    const r: (i64, i64) = ws_raw_case(4);
+    expect_eq(r.0, 1 as i64)?;
+    return expect_eq(r.1, 1002 as i64);
+}
+
+![test]
+function a_close_without_a_status_reports_1005() -> Result<(), TestError> {
+    const r: (i64, i64) = ws_raw_case(5);
+    expect_eq(r.0, 1 as i64)?;
+    return expect_eq(r.1, 1000 as i64);
 }

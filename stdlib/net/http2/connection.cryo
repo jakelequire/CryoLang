@@ -162,6 +162,10 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     /// New client-side connection taking ownership of `conn`, coding its
     /// header blocks with `codec`.
     public static new_client_with_codec(conn: BufStream<S>, codec: C) -> Http2Connection<S, C> {
+        // A server never accepts pushed streams, so its SETTINGS_ENABLE_PUSH
+        // starts at 0 and a SETTINGS frame that sets it is refused.
+        mut server_settings: Settings = Settings::defaults();
+        server_settings.enable_push = 0;
         return Http2Connection::<S, C> {
             conn:                  conn,
             codec:                 codec,
@@ -169,7 +173,7 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
             next_stream_id:        1,
             goaway_received:       false,
             last_peer_stream_id:   0,
-            remote_settings:       Settings::defaults(),
+            remote_settings:       server_settings,
             conn_send_window:      DEFAULT_CONNECTION_WINDOW,
             stream_send_window:    65535
         };
@@ -236,7 +240,8 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
         const good: boolean = got == preface_bytes();
         this.conn.consume(PREFACE_LEN);
         if (!good) {
-            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+            const error: IoError = this.fail_connection(frame::PROTOCOL_ERROR);
+            return Result::Err(await this.flush_failure(error));
         }
         this.queue_settings()?;
         (await this.conn.flush())?;
@@ -305,9 +310,21 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
                 }
                 return Result::Ok(true);
             }
+            const previous_window: i64 = this.remote_settings.initial_window_size as i64;
             match (this.remote_settings.apply_payload(fr.payload.as_slice())) {
                 Result::Ok(_)     => { }
                 Result::Err(code) => { return Result::Err(this.fail_connection(code)); }
+            }
+            if (this.is_client && this.remote_settings.enable_push != 0) {
+                return Result::Err(this.fail_connection(frame::PROTOCOL_ERROR));
+            }
+            // A new initial window moves the open stream's window by the
+            // difference, which may leave it negative; past 2^31 - 1 it is
+            // a connection error.
+            this.stream_send_window = this.stream_send_window
+                + (this.remote_settings.initial_window_size as i64) - previous_window;
+            if (this.stream_send_window > settings::MAX_WINDOW_SIZE as i64) {
+                return Result::Err(this.fail_connection(frame::FLOW_CONTROL_ERROR));
             }
             // Our encoder must not exceed the peer's decoder table size.
             this.codec.limit_encoder_table(this.remote_settings.header_table_size as i64);
@@ -562,7 +579,10 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
             // most one frame).
             if (block.length() > LOCAL_MAX_HEADER_LIST_SIZE as i64
                 || body.length() > LOCAL_MAX_BODY_SIZE) {
-                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                mem::drop(block);
+                mem::drop(body);
+                const error: IoError = this.fail_connection(frame::ENHANCE_YOUR_CALM);
+                return Result::Err(await this.flush_failure(error));
             }
             mut fr: Frame = (await this.conn.read_h2_frame(LOCAL_MAX_FRAME_SIZE as i64))?;
             const control: Result<boolean, IoError> = this.process_control(&fr);
@@ -605,14 +625,24 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
             }
         }
 
+        // A block HPACK cannot decode leaves the compression context lost
+        // (COMPRESSION_ERROR); a decoded one that is not a response is
+        // malformed (PROTOCOL_ERROR). Either ends the connection.
+        mut error_code: u32 = frame::COMPRESSION_ERROR;
         const built: Option<Response> = match (this.codec.decode(block.as_slice())) {
-            Option::Some(fields) => { build_response(fields, body) }
+            Option::Some(fields) => {
+                error_code = frame::PROTOCOL_ERROR;
+                build_response(fields, body)
+            }
             Option::None         => { mem::drop(body); Option::None }
         };
         mem::drop(block);
         match (built) {
             Option::Some(resp) => { return Result::Ok(resp); }
-            Option::None       => { return Result::Err(IoError::new(IoErrorKind::InvalidData, 0)); }
+            Option::None       => {
+                const error: IoError = this.fail_connection(error_code);
+                return Result::Err(await this.flush_failure(error));
+            }
         }
     }
 
@@ -660,7 +690,10 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
             // most one frame).
             if (block.length() > LOCAL_MAX_HEADER_LIST_SIZE as i64
                 || body.length() > LOCAL_MAX_BODY_SIZE) {
-                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                mem::drop(block);
+                mem::drop(body);
+                const error: IoError = this.fail_connection(frame::ENHANCE_YOUR_CALM);
+                return Result::Err(await this.flush_failure(error));
             }
             mut fr: Frame = match (await this.conn.read_h2_frame(LOCAL_MAX_FRAME_SIZE as i64)) {
                 Result::Ok(f)  => { f }
@@ -719,8 +752,14 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
             }
         }
 
+        // As in `read_response`: an undecodable block is COMPRESSION_ERROR,
+        // a malformed request PROTOCOL_ERROR, and either ends the connection.
+        mut error_code: u32 = frame::COMPRESSION_ERROR;
         const built: Option<Request> = match (this.codec.decode(block.as_slice())) {
-            Option::Some(fields) => { build_request(fields, body) }
+            Option::Some(fields) => {
+                error_code = frame::PROTOCOL_ERROR;
+                build_request(fields, body)
+            }
             Option::None         => { mem::drop(body); Option::None }
         };
         mem::drop(block);
@@ -728,7 +767,10 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
             Option::Some(req) => {
                 return Result::Ok(Option::Some(RequestOnStream { stream_id: sid, req: req }));
             }
-            Option::None => { return Result::Err(IoError::new(IoErrorKind::InvalidData, 0)); }
+            Option::None => {
+                const error: IoError = this.fail_connection(error_code);
+                return Result::Err(await this.flush_failure(error));
+            }
         }
     }
 

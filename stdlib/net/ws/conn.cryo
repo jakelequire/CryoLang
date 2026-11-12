@@ -78,6 +78,20 @@ public const CLOSE_MESSAGE_TOO_BIG:     u16 = 1009;
 public const CLOSE_MANDATORY_EXTENSION: u16 = 1010;
 /// Status 1011: the server met a condition it could not handle.
 public const CLOSE_INTERNAL_ERROR:      u16 = 1011;
+/// Status 1005: the peer's Close frame carried no status code. Never sent;
+/// `WebSocket.close_status` reports it for such a Close.
+public const CLOSE_NO_STATUS_RECEIVED:  u16 = 1005;
+
+/// The status code and reason of the Close frame a peer sent, as
+/// `WebSocket.close_status` reports them.
+public type struct CloseStatus {
+    /// The peer's status code; `CLOSE_NO_STATUS_RECEIVED` when its Close
+    /// carried none.
+    public code:   u16;
+    /// The peer's reason, UTF-8 and possibly empty. A view of the
+    /// connection's copy, valid while the `WebSocket` is.
+    public reason: Str;
+}
 
 /// A complete application message. Owns its payload.
 public type enum Message {
@@ -113,12 +127,19 @@ public type struct WebSocket<S> {
     private conn:      BufStream<S>;
     private is_client: boolean;
     private closed:    boolean;
+    // The status code of the peer's Close frame, 0 until `recv` has taken
+    // a valid one, and its reason.
+    private peer_close_code:   u16;
+    private peer_close_reason: String;
 
     /// Take ownership of an already-upgraded connection. `is_client` selects
     /// masked (client) vs unmasked (server) framing per RFC 6455. Use
     /// `client_handshake` / `server_handshake` to run the upgrade first.
     public static of(conn: BufStream<S>, is_client: boolean) -> WebSocket<S> {
-        return WebSocket::<S> { conn: conn, is_client: is_client, closed: false };
+        return WebSocket::<S> {
+            conn: conn, is_client: is_client, closed: false,
+            peer_close_code: 0, peer_close_reason: String::new()
+        };
     }
 
     /// The buffered connection, for callers that need the transport itself
@@ -131,6 +152,16 @@ public type struct WebSocket<S> {
     /// Has a Close frame been sent or received on this connection?
     public is_closed(&this) -> boolean {
         return this.closed;
+    }
+
+    /// The status code and reason of the Close frame the peer sent, once
+    /// `recv` has returned `Message::Close` for it; `None` before that, and
+    /// for a Close that broke the protocol, which `recv` reports as an error.
+    public close_status(&this) -> Option<CloseStatus> {
+        if (this.peer_close_code == 0) { return Option::None; }
+        return Option::Some(CloseStatus {
+            code: this.peer_close_code, reason: this.peer_close_reason.as_str()
+        });
     }
 
     /// Client handshake: send the GET upgrade, then verify the `101` and the
@@ -256,11 +287,13 @@ public type struct WebSocket<S> {
     /// Receive the next application message, reassembling fragments and
     /// transparently answering Pings with Pongs and skipping Pongs. A Close
     /// frame surfaces as `Message::Close`, after being answered with a Close
-    /// echoing its status code unless this side already sent one. A Close
-    /// whose status code or reason breaks the protocol is answered with
-    /// `CLOSE_PROTOCOL_ERROR` or `CLOSE_INVALID_PAYLOAD` instead and
-    /// reported as `InvalidData`, as is a text message that is not UTF-8,
-    /// which is answered with `CLOSE_INVALID_PAYLOAD`.
+    /// echoing its status code unless this side already sent one; its code
+    /// and reason are then `close_status`. A Close whose status code or
+    /// reason breaks the protocol is answered with `CLOSE_PROTOCOL_ERROR` or
+    /// `CLOSE_INVALID_PAYLOAD` instead and reported as `InvalidData`, as is
+    /// a text message that is not UTF-8, which is answered with
+    /// `CLOSE_INVALID_PAYLOAD`, and a frame masked the wrong way for this
+    /// side, which is answered with `CLOSE_PROTOCOL_ERROR`.
     public async recv(mut &this) -> Result<Message, IoError>
     where S: AsyncTransport {
         mut acc: Array<u8> = Array::<u8>::new();
@@ -301,7 +334,9 @@ public type struct WebSocket<S> {
                     OpCode::Close => {
                         closing = true;
                         const body: &Slice<u8> = fr.payload.as_slice();
-                        if (body.length() == 1) {
+                        if (body.length() == 0) {
+                            this.peer_close_code = CLOSE_NO_STATUS_RECEIVED;
+                        } else if (body.length() == 1) {
                             // A status code is two bytes or absent.
                             close_answer = CLOSE_PROTOCOL_ERROR;
                             close_broken = true;
@@ -317,11 +352,19 @@ public type struct WebSocket<S> {
                             if (!receivable) {
                                 close_answer = CLOSE_PROTOCOL_ERROR;
                                 close_broken = true;
-                            } else if (Str::from_utf8(body.subslice(2, body.length())).is_err()) {
-                                close_answer = CLOSE_INVALID_PAYLOAD;
-                                close_broken = true;
                             } else {
-                                close_answer = code;
+                                match (Str::from_utf8(body.subslice(2, body.length()))) {
+                                    Result::Ok(reason) => {
+                                        close_answer = code;
+                                        this.peer_close_code = code;
+                                        this.peer_close_reason.clear();
+                                        this.peer_close_reason.push(reason);
+                                    }
+                                    Result::Err(_) => {
+                                        close_answer = CLOSE_INVALID_PAYLOAD;
+                                        close_broken = true;
+                                    }
+                                }
                             }
                         }
                     }
@@ -347,6 +390,13 @@ public type struct WebSocket<S> {
             mem::drop(fr);
 
             if (bad) {
+                // A frame masked the wrong way fails the connection.
+                if (!this.closed) {
+                    match (await this.close(CLOSE_PROTOCOL_ERROR, Str::new(""))) {
+                        Result::Ok(_)  => { }
+                        Result::Err(_) => { }
+                    }
+                }
                 return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
             }
             if (closing) {

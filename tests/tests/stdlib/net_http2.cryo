@@ -42,7 +42,7 @@ import std::io::error::{ IoError };
 import std::io::traits;
 import std::io::buf::{ BufStream };
 import std::net::addr::socket_addr::{ SocketAddr };
-import std::net::socket::tcp::{ TcpConnect, TcpStream };
+import std::net::socket::tcp::{ TcpAccept, TcpAccepted, TcpConnect, TcpListener, TcpStream };
 import std::net::http::method::{ Method };
 import std::net::http::status::{ StatusCode };
 import std::net::http::request::{ Request };
@@ -53,7 +53,7 @@ import std::net::http2::server::{ Http2Server };
 import std::net::http2::connection::{ Http2Connection };
 import std::net::http2::frame::{ Frame };
 import std::net::http2::settings::{ Settings };
-import std::io::bytes::{ ByteReader };
+import std::io::bytes::{ ByteReader, ByteWriter };
 import std::core::mem;
 import std::test::error::{ TestError };
 import std::test::assert::{ bail, expect, expect_eq };
@@ -333,6 +333,226 @@ async function h2_bad_settings_client(port: u16) -> i64 {
     return code as i64;
 }
 
+// ---- a server written frame by frame ------------------------------------------
+
+/// Queue a SETTINGS frame carrying one entry.
+function h2_queue_setting(c: mut &BufStream<TcpStream>, id: u16, value: u32) -> boolean {
+    mut payload: Array<u8> = Array::<u8>::new();
+    settings::push_entry(&payload, id, value);
+    return c.queue_h2_frame(frame::FRAME_SETTINGS, 0, 0, payload.as_slice()).is_ok();
+}
+
+/// A server that writes its frames by hand, for what the public server
+/// never sends. It reads the client's preface, sends one SETTINGS entry,
+/// then for each case:
+///   0 - (ENABLE_PUSH = 1) returns the error code of the GOAWAY the client
+///       answers with;
+///   1 - (INITIAL_WINDOW_SIZE = 10) once the request's first 10 DATA octets
+///       are in, raises the initial window to 110 and sends a PING, and
+///       returns the DATA octets that arrive before the stream ends;
+///   2 - (INITIAL_WINDOW_SIZE = 1000) once the request's HEADERS are in,
+///       fills the stream's window to 2^31 - 1, raises the initial window
+///       by one, and returns the error code of the GOAWAY the client
+///       answers with;
+///   3 - (INITIAL_WINDOW_SIZE = 1000) answers the request's HEADERS with a
+///       header block of 17 fragments of 16384 octets, past the client's
+///       256 KiB limit, and returns the error code of the client's GOAWAY;
+///   4 - (INITIAL_WINDOW_SIZE = 1000) answers with a header block HPACK
+///       cannot decode, and returns the error code of the client's GOAWAY.
+/// An acknowledgement where a GOAWAY or DATA belongs - the client took
+/// the setting, or kept waiting - returns a negative step code, as does a
+/// connection that ends without a GOAWAY.
+async function h2_raw_server(listener: TcpListener, case: i64) -> i64 {
+    mut accepted: TcpAccepted = await TcpAccept::start(listener);
+    mut _listener: TcpListener = accepted.take_listener();
+    mut sock: TcpStream = match (accepted.take_result()) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -200; }
+    };
+    mut c: BufStream<TcpStream> = BufStream::<TcpStream>::of(sock);
+    match (await c.ensure(24)) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -201; }
+    }
+    c.consume(24);
+    mut queued: boolean = false;
+    if (case == 0) {
+        queued = h2_queue_setting(&c, settings::SETTINGS_ENABLE_PUSH, 1);
+    } else if (case == 1) {
+        queued = h2_queue_setting(&c, settings::SETTINGS_INITIAL_WINDOW_SIZE, 10);
+    } else {
+        queued = h2_queue_setting(&c, settings::SETTINGS_INITIAL_WINDOW_SIZE, 1000);
+    }
+    if (!queued) { return -202; }
+    match (await c.flush()) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -203; }
+    }
+    mut data: i64 = 0;
+    mut changed: boolean = false;
+    loop {
+        mut fr: Frame = match (await c.read_h2_frame(16384)) {
+            Result::Ok(f)  => { f }
+            Result::Err(_) => { return -204; }
+        };
+        const ftype: u8 = fr.ftype;
+        const ack: boolean = fr.has_flag(frame::FLAG_ACK);
+        const end: boolean = fr.has_flag(frame::FLAG_END_STREAM);
+        const length: i64 = fr.payload.length();
+        mut fields: ByteReader = ByteReader::new(fr.payload.as_slice());
+        const _last_stream: u32 = fields.read_u32_big_endian().unwrap_or(0);
+        const code: u32 = fields.read_u32_big_endian().unwrap_or(999);
+        mem::drop(fr);
+        if (ftype == frame::FRAME_GOAWAY) {
+            if (case == 1) { return -205; }
+            return code as i64;
+        }
+        if (case == 0) {
+            if (ftype == frame::FRAME_SETTINGS && ack) { return -206; }
+        } else if (case == 1) {
+            if (ftype == frame::FRAME_PING && ack) { return -207; }
+            if (ftype == frame::FRAME_DATA) {
+                data = data + length;
+                if (end) { return data; }
+                if (!changed && data >= 10) {
+                    queued = h2_queue_setting(&c, settings::SETTINGS_INITIAL_WINDOW_SIZE, 110);
+                    queued = queued && c.queue_h2_frame(frame::FRAME_PING, 0, 0,
+                        Str::new("12345678").as_bytes()).is_ok();
+                    if (!queued) { return -208; }
+                    match (await c.flush()) {
+                        Result::Ok(_)  => { }
+                        Result::Err(_) => { return -209; }
+                    }
+                    changed = true;
+                }
+            }
+        } else if (case >= 3) {
+            if (!changed && ftype == frame::FRAME_HEADERS) {
+                if (case == 3) {
+                    mut fragment: Array<u8> = Array::<u8>::new();
+                    for (mut i: i64 = 0; i < 16384; i++) { fragment.push(0); }
+                    for (mut sent: i64 = 0; sent < 17; sent++) {
+                        const ftype_out: u8 = if (sent == 0) { frame::FRAME_HEADERS } else { frame::FRAME_CONTINUATION };
+                        if (!c.queue_h2_frame(ftype_out, 0, 1, fragment.as_slice()).is_ok()) { return -213; }
+                        match (await c.flush()) {
+                            Result::Ok(_)  => { }
+                            Result::Err(_) => { return -214; }
+                        }
+                    }
+                } else {
+                    // 0x80 names entry 0 of the HPACK tables, which none has.
+                    mut block: Array<u8> = Array::<u8>::new();
+                    block.push(0x80);
+                    queued = c.queue_h2_frame(frame::FRAME_HEADERS,
+                        frame::FLAG_END_HEADERS | frame::FLAG_END_STREAM, 1, block.as_slice()).is_ok();
+                    mem::drop(block);
+                    if (!queued) { return -215; }
+                    match (await c.flush()) {
+                        Result::Ok(_)  => { }
+                        Result::Err(_) => { return -216; }
+                    }
+                }
+                changed = true;
+            }
+        } else {
+            if (changed && ftype == frame::FRAME_SETTINGS && ack) { return -210; }
+            if (!changed && ftype == frame::FRAME_HEADERS) {
+                mut increment: Array<u8> = Array::<u8>::with_capacity(4);
+                mut writer: ByteWriter = ByteWriter::new(&increment);
+                writer.write_u32_big_endian(2147483647 - 1000);
+                queued = c.queue_h2_frame(frame::FRAME_WINDOW_UPDATE, 0, 1, increment.as_slice()).is_ok();
+                mem::drop(increment);
+                queued = queued && h2_queue_setting(&c, settings::SETTINGS_INITIAL_WINDOW_SIZE, 1001);
+                if (!queued) { return -211; }
+                match (await c.flush()) {
+                    Result::Ok(_)  => { }
+                    Result::Err(_) => { return -212; }
+                }
+                changed = true;
+            }
+        }
+    }
+}
+
+/// The client half of `h2_raw_server`'s case: handshake, then (case 1) a
+/// 100-octet POST or (cases 2 to 4) a GET. Returns 1 when the connection
+/// failed where the case says it must - in the handshake for case 0, in
+/// the request for cases 2 to 4 - or, for case 1, whatever the request did, since
+/// the server ends the connection without a response; a negative step
+/// code otherwise.
+async function h2_raw_client(port: u16, case: i64) -> i64 {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -300; }
+    };
+    mut conn: Http2Connection<TcpStream> =
+        Http2Connection::<TcpStream>::new_client(BufStream::<TcpStream>::of(sock));
+    match (await conn.handshake_client()) {
+        Result::Ok(_)  => { if (case == 0) { return -301; } }
+        Result::Err(_) => { if (case == 0) { return 1; } return -302; }
+    }
+    mut req: Request = Request::new(Method::Get, Str::new("/"));
+    if (case == 1) {
+        mut body: Array<u8> = Array::<u8>::new();
+        for (mut i: i64 = 0; i < 100; i++) { body.push(h2_pattern_byte(i)); }
+        req = Request::new(Method::Post, Str::new("/")).with_body(body);
+    }
+    match (await conn.request(req, Str::new("http"), Str::new("localhost"))) {
+        Result::Ok(r)  => { mut _response: Response = r; if (case >= 2) { return -303; } return 1; }
+        Result::Err(_) => { return 1; }
+    }
+}
+
+async function h2_raw_pair(listener: TcpListener, port: u16, case: i64) -> (i64, i64) {
+    return await Futures::join(h2_raw_server(listener, case), h2_raw_client(port, case));
+}
+
+/// The server's result and the client's for one case.
+function h2_raw_case(case: i64) -> (i64, i64) {
+    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(0))) {
+        Result::Ok(l)  => { l }
+        Result::Err(_) => { return (-1000, -1000); }
+    };
+    listener.set_nonblocking(true);
+    const port: u16 = match (listener.local_addr()) {
+        Result::Ok(a)  => { a.port }
+        Result::Err(_) => { return (-1001, -1001); }
+    };
+    mut ex: Executor = Executor::new();
+    return ex.block_on(h2_raw_pair(listener, port, case));
+}
+
+/// A client whose 24-octet preface is not HTTP/2's. Returns the error code
+/// of the GOAWAY the server answers with, or a negative step code.
+async function h2_bad_preface_client(port: u16) -> i64 {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -70; }
+    };
+    mut c: BufStream<TcpStream> = BufStream::<TcpStream>::of(sock);
+    match (c.pending().try_append(Str::new("PRI * HTTP/2.0\r\n\r\nXX\r\n\r\n").as_bytes())) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -71; }
+    }
+    match (await c.flush()) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -72; }
+    }
+    mut answer: Frame = match (await c.read_h2_frame(16384)) {
+        Result::Ok(f)  => { f }
+        Result::Err(_) => { return -73; }
+    };
+    if (answer.ftype != frame::FRAME_GOAWAY) { return -74; }
+    mut fields: ByteReader = ByteReader::new(answer.payload.as_slice());
+    const _last_stream: u32 = fields.read_u32_big_endian().unwrap_or(0);
+    return fields.read_u32_big_endian().unwrap_or(999) as i64;
+}
+
+async function h2_join_bad_preface(port: u16, server: Http2Server) -> (i64, i64) {
+    return await Futures::join(h2_serve_one(server, h2_handler),
+                               h2_bad_preface_client(port));
+}
+
 // ---- joins ------------------------------------------------------------------
 
 /// The server's result and the client's, unchanged, so the test can tell
@@ -554,4 +774,67 @@ function settings_payload_stops_at_the_first_refusal() -> Result<(), TestError> 
     expect_eq(s.max_frame_size, 16384)?;
     payload.push(0);
     return expect_eq(refusal_code(s.apply_payload(payload.as_slice())), frame::FRAME_SIZE_ERROR);
+}
+
+/// A client ends a connection whose server says it accepts pushed streams.
+![test]
+function a_client_refuses_a_server_enabling_push() -> Result<(), TestError> {
+    const r: (i64, i64) = h2_raw_case(0);
+    expect_eq(r.1, 1 as i64)?;
+    return expect_eq(r.0, frame::PROTOCOL_ERROR as i64);
+}
+
+/// A larger initial window reaches the stream that is waiting to send.
+![test]
+function a_new_initial_window_moves_the_open_stream_window() -> Result<(), TestError> {
+    const r: (i64, i64) = h2_raw_case(1);
+    expect_eq(r.1, 1 as i64)?;
+    return expect_eq(r.0, 100 as i64);
+}
+
+/// An initial window change that lifts a stream's window past 2^31 - 1
+/// ends the connection with FLOW_CONTROL_ERROR.
+![test]
+function an_initial_window_change_past_the_largest_window_is_refused() -> Result<(), TestError> {
+    const r: (i64, i64) = h2_raw_case(2);
+    expect_eq(r.1, 1 as i64)?;
+    return expect_eq(r.0, frame::FLOW_CONTROL_ERROR as i64);
+}
+
+/// A header block past what this side accepts ends the connection with a
+/// GOAWAY, ENHANCE_YOUR_CALM.
+![test]
+function an_oversized_header_block_is_answered_with_goaway() -> Result<(), TestError> {
+    const r: (i64, i64) = h2_raw_case(3);
+    expect_eq(r.1, 1 as i64)?;
+    return expect_eq(r.0, frame::ENHANCE_YOUR_CALM as i64);
+}
+
+/// A header block HPACK cannot decode ends the connection with a GOAWAY,
+/// COMPRESSION_ERROR.
+![test]
+function an_undecodable_header_block_is_answered_with_goaway() -> Result<(), TestError> {
+    const r: (i64, i64) = h2_raw_case(4);
+    expect_eq(r.1, 1 as i64)?;
+    return expect_eq(r.0, frame::COMPRESSION_ERROR as i64);
+}
+
+/// A connection that does not open with HTTP/2's preface is answered with a
+/// GOAWAY, PROTOCOL_ERROR.
+![test]
+function a_bad_preface_is_answered_with_goaway() -> Result<(), TestError> {
+    g_served = 0; g_body_seen = 0; g_headers_seen = 0;
+    mut server: Http2Server = match (h2_bind()) {
+        Result::Ok(s)  => { s }
+        Result::Err(_) => { return bail(Str::new("h2 bind 127.0.0.1:0 failed")); }
+    };
+    const port: u16 = match (server.local_addr()) {
+        Result::Ok(a)  => { a.port }
+        Result::Err(_) => { return bail(Str::new("local_addr failed")); }
+    };
+    mut ex: Executor = Executor::new();
+    const pair: (i64, i64) = ex.block_on(h2_join_bad_preface(port, server));
+    expect_eq(pair.1, frame::PROTOCOL_ERROR as i64)?;
+    expect_eq(pair.0, -1 as i64)?;
+    return expect_eq(g_served, 0 as i64);
 }
