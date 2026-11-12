@@ -491,6 +491,11 @@ Type               ::= Type "*"                            (* pointer, read-only
                                                               `*` follows (E0100) *)
                      | "&" "mut"? Type                     (* reference *)
                      | "mut" "&" Type                      (* mut-ref alt form *)
+                     | "mut"? "&&" "mut"? Type             (* two references: `&&` is one
+                                                              token, read in a type as
+                                                              `& &`; a `mut` before it marks
+                                                              the outer reference, one after
+                                                              it the inner *)
                      | "const" "&" Type                    (* `&T`, written with `const` *)
                      | "[" Type "]"                        (* dynamic array *)
                      | "[" Type ";" Expr "]"               (* fixed array; the length is a

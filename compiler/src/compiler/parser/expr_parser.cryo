@@ -2894,6 +2894,13 @@ implement struct Parser {
             this.advance(); // consume `mut`
             return this.parse_reference_type_with_mutability(true);
         }
+        if (this.check(TokenType::AmpAmp)) {
+            return this.parse_double_reference_type(false);
+        }
+        if (this.check(TokenType::KwMut) && this.peek_at(1).kind == TokenType::AmpAmp) {
+            this.advance(); // consume `mut`
+            return this.parse_double_reference_type(true);
+        }
 
         // Parenthesized types: tuple `(T, U)`, 1-tuple `(T,)`, grouping `(T)`,
         // unit `()`, or function `(T, U) -> R`. Disambiguated by the trailing
@@ -3533,6 +3540,27 @@ implement struct Parser {
     parse_reference_type_with_mutability(mut &this, is_mutable: boolean) -> mut TypeAnnotation* {
         const start: Token = this.advance(); // consume '&'
         return this.finish_reference_type(start, is_mutable);
+    }
+
+    /// `&&T`: the lexer reads `&&` as one token, which in a type can only be
+    /// two references, `& &T`.  A `mut` written after the pair marks the
+    /// inner one (`&&mut T` is `& &mut T`); `outer_mutable` is a `mut`
+    /// written before it (`mut &&T` is `mut & &T`).
+    parse_double_reference_type(mut &this, outer_mutable: boolean) -> mut TypeAnnotation* {
+        const start: Token = this.advance(); // consume `&&`
+        mut inner_mutable: boolean = false;
+        if (this.check(TokenType::KwMut)) {
+            this.advance();
+            inner_mutable = true;
+        }
+        const inner: mut TypeAnnotation* = this.finish_reference_type(start, inner_mutable);
+        if (inner == null) { return null; }
+        const outer: ReferenceAnnotation* = new ReferenceAnnotation {
+            inner:      inner,
+            is_mutable: outer_mutable,
+            span:       this.span_from(start),
+        };
+        return new TypeAnnotation::Reference(outer);
     }
 
     /// Inner-type + node assembly shared by both reference forms.
