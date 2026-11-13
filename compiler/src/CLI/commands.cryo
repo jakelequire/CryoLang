@@ -38,6 +38,7 @@ import compiler::project_config;
 import utils::keyword::{ Keyword };
 import utils::build_stamp::{ BuildStamp, StampSlot, VersionReport };
 import compiler::build_manifest;
+import compiler::diag::{ ErrorCode };
 import compiler::toolchain::{ ExecutablePath };
 
 // Test-output framing (ASCII only). 80-column rules; kept in sync with the
@@ -827,12 +828,16 @@ type struct Executor {
     ///                       the release profile when none is given
     ///   -Werror             report every warning as an error and fail the
     ///                       build on it, the stdlib archive's build included
+    ///   -Werror=W0017,...   report the warnings named as errors, in this
+    ///                       build's own reports
     ///   --apply-fixes       make every machine-applicable suggestion the
     ///                       build reports in the project's files, then build
     ///                       again
     /// `--release` wins over `--dev` wins over `--profile=` when several are
     /// passed. Leaving all unset keeps the cryoconfig `[profile] default`.
-    static apply_profile_flags(config: mut instance::CompilerConfig*, args: &cli::ParsedArgs) -> void {
+    /// False, with the reason on stderr, when `-Werror=` names something
+    /// that is not a warning.
+    static apply_profile_flags(config: mut instance::CompilerConfig*, args: &cli::ParsedArgs) -> boolean {
         if (args.has_flag("release")) {
             config.profile_override = "release";
         } else if (args.has_flag("dev")) {
@@ -851,6 +856,20 @@ type struct Executor {
         if (args.has_flag("Werror")) {
             config.warnings_as_errors = true;
         }
+        if (args.has_arg("Werror")) {
+            const comma: str::Str = str::Str::new(",");
+            for (piece in str::Str::new(args.get_value("Werror")).split(&comma)) {
+                const name: string = Executor::dup_cstr(piece.trim());
+                match (ErrorCode::warning_named(name)) {
+                    Option::Some(code) => { config.promoted_warnings.push(code.to_u32()); }
+                    Option::None => {
+                        fmt::eprintf("Error: -Werror=%s: `%s` names no warning; write a warning code such as W0017.\n",
+                            args.get_value("Werror"), name);
+                        return false;
+                    }
+                }
+            }
+        }
         if (args.has_flag("apply-fixes")) {
             config.apply_fixes = true;
         }
@@ -864,6 +883,7 @@ type struct Executor {
                 config.profile_override = "release";
             }
         }
+        return true;
     }
 
     /// `cryo version --verbose`: the version line, then what this binary
@@ -1112,6 +1132,8 @@ type struct Executor {
         fmt::printf("                      updating them; fail the build on binding drift\n");
         fmt::printf("  -Werror             Report every warning as an error and fail the build,\n");
         fmt::printf("                      the stdlib archive's build included when it is made\n");
+        fmt::printf("  -Werror=W0017,...   Report the warnings named as errors and fail the build;\n");
+        fmt::printf("                      `cryo test` passes it to every test project's build\n");
         fmt::printf("  --apply-fixes       Make every machine-applicable suggestion in the project's\n");
         fmt::printf("                      own files, then build again\n");
         fmt::printf("  -o, --output PATH   Redirect output (single-file builds; kind inferred\n");
@@ -1445,7 +1467,7 @@ type struct Executor {
         if (args.has_arg("panic")) {
             config.panic = project_config::PanicStrategy::from_string(Keyword::new(args.get_value("panic")));
         }
-        Executor::apply_profile_flags(&config, &args);
+        if (!Executor::apply_profile_flags(&config, &args)) { return 1; }
 
         mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
         Log::debug(LogArea::Driver, f"compiling the project from {config_path}");
@@ -1501,7 +1523,7 @@ type struct Executor {
         if (args.has_arg("target")) {
             config.target_triple_override = args.get_value("target");
         }
-        Executor::apply_profile_flags(&config, &args);
+        if (!Executor::apply_profile_flags(&config, &args)) { return 1; }
 
         mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
         const result: instance::CompilationResult = compiler.compile_project(config_path);
@@ -1566,7 +1588,7 @@ type struct Executor {
         if (args.has_arg("target")) {
             config.target_triple_override = args.get_value("target");
         }
-        Executor::apply_profile_flags(&config, &args);
+        if (!Executor::apply_profile_flags(&config, &args)) { return 1; }
         config.test_mode = true;
 
         mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
@@ -1684,10 +1706,16 @@ type struct Executor {
             // tests/projects/ carrying a test.json. Driven via this compiler
             // as a subprocess (collect / build / run). Absent dir is a
             // clean no-op.
+            // `-Werror=` reaches every project's build; `-Werror` does not,
+            // since a project may assert the warnings it reports.
+            const promoted_names: string = args.get_value("Werror");
+            const promoted: String = if (args.has_arg("Werror")) {
+                f" -Werror={promoted_names}"
+            } else { String::new() };
             const proj_dir: string = path::Path::from(proj_root).join("tests/projects").into_raw();
             const proj_res: NegSuiteResult =
                 Executor::run_projects_suite(self_exe, stdlib_abs, proj_dir,
-                                             pattern, fmt_choice, col_choice, jobs);
+                                             pattern, fmt_choice, col_choice, jobs, promoted.as_str());
             proj_ran      = proj_res.ran;
             proj_failures = proj_res.failures;
             if (proj_failures > 0 && exit_code == 0) {
@@ -2517,11 +2545,12 @@ type struct Executor {
     /// This is the `cryo test` META-RUNNER: it `chdir`s into each
     /// project and drives this very compiler (`self_exe`) as a subprocess,
     /// mirroring how `run_negative_suite` drives `cryo check`. Absent or empty
-    /// `projects_dir` is a clean no-op (returns {0,0}).
+    /// `projects_dir` is a clean no-op (returns {0,0}).  `build_flags` is
+    /// written into every project's command after its verb.
     static run_projects_suite(self_exe: string, stdlib_abs: string,
                               projects_dir: string, pattern: string,
                               fmt_choice: string, col_choice: string,
-                              jobs: u32)
+                              jobs: u32, build_flags: str::Str)
             -> NegSuiteResult {
         // Pre-pass: count projects (subdirs with a readable test.json that
         // pass the filter) so an empty/absent dir prints no section at all.
@@ -2633,7 +2662,7 @@ type struct Executor {
             if (verdict == 0) {
                 const out_path: string = Executor::job_tmp_path(tmp, cmds.length() as u64);
                 job_of.push(cmds.length() as i64);
-                cmds.push(Executor::project_command(self_exe, stdlib_abs, proj_dir, &spec, out_path));
+                cmds.push(Executor::project_command(self_exe, stdlib_abs, proj_dir, &spec, out_path, build_flags));
                 // The fixes are made in a copy, never in the tree's own
                 // sources; the copy's build output is left behind so its
                 // first build analyses the source as written.  A copy that
@@ -2653,7 +2682,7 @@ type struct Executor {
                         const applied_spec: ProjSpec = spec.applied_run();
                         applied_job = cmds.length() as i64;
                         cmds.push(Executor::project_command(self_exe, stdlib_abs, copy_dir,
-                            &applied_spec, Executor::job_tmp_path(tmp, applied_job as u64)));
+                            &applied_spec, Executor::job_tmp_path(tmp, applied_job as u64), build_flags));
                     }
                 }
                 applied_job_of.push(applied_job);
@@ -2849,7 +2878,8 @@ type struct Executor {
     /// directory is shared.  All paths handed to the subprocess (`self_exe`,
     /// `stdlib_abs`, `tmp`) are absolute so the changed cwd doesn't break them.
     static project_command(self_exe_text: string, stdlib_abs_text: string,
-                           proj_dir_text: string, spec: &ProjSpec, tmp_text: string) -> string {
+                           proj_dir_text: string, spec: &ProjSpec, tmp_text: string,
+                           build_flags: str::Str) -> string {
         const self_exe: string = self_exe_text;
         const stdlib_abs: string = stdlib_abs_text;
         const tmp: string = tmp_text;
@@ -2865,6 +2895,7 @@ type struct Executor {
             command.push(shell_set_environment(spec.environment[i]));
         }
         command.push(fmt::format("%s %s%s", self_exe, verb, std_flag));
+        command.push(build_flags);
         for (mut i: i64 = 0; i < spec.arguments.length(); i++) {
             command.push(fmt::format(" \"%s\"", spec.arguments[i]));
         }
@@ -3269,7 +3300,7 @@ type struct Executor {
         }
         // `--release` / `--dev` / `--profile=NAME` and the other build flags
         // a project build takes: the single file is built as a project.
-        Executor::apply_profile_flags(&config, &args);
+        if (!Executor::apply_profile_flags(&config, &args)) { return 1; }
 
         // `-o PATH` / `--output PATH`: single-file output redirect.
         // Path extension picks the emission kind:

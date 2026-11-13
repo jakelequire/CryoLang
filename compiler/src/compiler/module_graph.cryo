@@ -15,8 +15,9 @@ import utils::log::{ Log, LogArea, LogLevel };
 import std::collections::hashmap::{ HashMap };
 import std::ffi::libc;
 import std::fmt;
-import std::fs::path::{ Path };
+import std::fs::path::{ Path, PathBuf };
 import std::collections::string::{ String };
+import std::collections::str::{ Str };
 import std::core::hash::{ Hash, Hasher };
 import std::core::cmp::{ Eq };
 import compiler::resolver::intern_table::{ InternTable };
@@ -294,7 +295,8 @@ public:
     // module's `file_path` (under stdlib_root => Stdlib, under a dependency
     // root => Dep, else Local).  Defaults to Local at construction.
     origin:         ModuleOrigin;
-    origin_name:    string;       // dependency name when origin == Dep, else ""
+    /// The dependency's or vendored library's name; empty for the others.
+    origin_name:    String;
 
 
     /// The module as a definition, registered when the graph adds it
@@ -324,7 +326,7 @@ public:
             written_reexports:    [],
             visible:              [],
             origin:             ModuleOrigin::Local,
-            origin_name:        "",
+            origin_name:        String::new(),
             def:                DefId::invalid(),
             lexed:              LexedSource::empty(),
         };
@@ -359,15 +361,15 @@ public:
     /// can never drift.  Static (not an instance method) so callers holding
     /// only the enum + name can reach it, and to side-step the "unsized enum
     /// return in impl block" codegen wart that bites instance methods.
-    static origin_subdir(origin: ModuleOrigin, origin_name: string) -> string {
+    static origin_subdir(origin: ModuleOrigin, origin_name: Str) -> String {
         return match (origin) {
-            ModuleOrigin::Stdlib => { "std" }
-            ModuleOrigin::Dep    => { origin_name }
-            ModuleOrigin::Local  => { "local" }
+            ModuleOrigin::Stdlib => { String::from_str(Str::new("std")) }
+            ModuleOrigin::Dep    => { String::from_str(origin_name) }
+            ModuleOrigin::Local  => { String::from_str(Str::new("local")) }
             // Each vendored library gets its own subtree beneath `vendor/`
             // (e.g. `vendor/RayLib/deps/*.o`), keyed by the library name in
             // `origin_name`, so multiple vendored libs stay isolated.
-            ModuleOrigin::Vendor => { fmt::format("vendor/%s", origin_name).into_raw() }
+            ModuleOrigin::Vendor => { f"vendor/{origin_name}" }
         };
     }
 
@@ -414,12 +416,7 @@ public:
 /// vendored library, its name.
 type struct ModulePackage {
     origin:      ModuleOrigin;
-    origin_name: string;
-
-    /// Whether this is the same package as `other`.
-    same_as(&this, other: &ModulePackage) -> boolean {
-        return this.origin == other.origin && this.origin_name.eq(other.origin_name);
-    }
+    origin_name: String;
 }
 
 /// The roots a module's file is classified by: under the vendored
@@ -428,28 +425,31 @@ type struct ModulePackage {
 /// dependency's; otherwise the program's own.
 type struct PackageRoots {
     /// `<profile_dir>/vendor`; empty when the build has no project.
-    vendor_root: string;
+    vendor_root: PathBuf;
     /// Empty when the build uses no standard library.
-    stdlib_root: string;
-    dep_roots:   [string];
-    dep_names:   [string];
+    stdlib_root: PathBuf;
+    dep_roots:   [PathBuf];
+    dep_names:   [String];
 
-    /// The package file `file_path` is in.
-    package_of(&this, file_path: string) -> ModulePackage {
-        const file: Path = Path::from(file_path);
-        if (this.vendor_root.length() > 0 && file.starts_with(Path::from(this.vendor_root))) {
+    /// The package `file` is in.
+    package_of(&this, file: Path) -> ModulePackage {
+        if (!this.vendor_root.is_empty() && file.starts_with(this.vendor_root.as_path())) {
             // The library name is the bindings file's directory.
-            return ModulePackage { origin: ModuleOrigin::Vendor, origin_name: file_path.parent_dir().basename() };
+            const library: Str = match (file.parent()) {
+                Option::Some(directory) => { directory.file_name().unwrap_or(Str::new("")) }
+                Option::None            => { Str::new("") }
+            };
+            return ModulePackage { origin: ModuleOrigin::Vendor, origin_name: String::from_str(library) };
         }
-        if (this.stdlib_root.length() > 0 && file.starts_with(Path::from(this.stdlib_root))) {
-            return ModulePackage { origin: ModuleOrigin::Stdlib, origin_name: "" };
+        if (!this.stdlib_root.is_empty() && file.starts_with(this.stdlib_root.as_path())) {
+            return ModulePackage { origin: ModuleOrigin::Stdlib, origin_name: String::new() };
         }
         for (mut i: i64 = 0; i < this.dep_roots.length(); i++) {
-            if (file.starts_with(Path::from(this.dep_roots[i]))) {
-                return ModulePackage { origin: ModuleOrigin::Dep, origin_name: this.dep_names[i] };
+            if (file.starts_with(this.dep_roots[i].as_path())) {
+                return ModulePackage { origin: ModuleOrigin::Dep, origin_name: this.dep_names[i].clone() };
             }
         }
-        return ModulePackage { origin: ModuleOrigin::Local, origin_name: "" };
+        return ModulePackage { origin: ModuleOrigin::Local, origin_name: String::new() };
     }
 }
 
@@ -487,7 +487,6 @@ type struct ModuleGraph {
     // Per-module AST storage: raw pointer array to avoid array[i]=x codegen bug
     module_ast_buf: mut void*;   // malloc'd buffer of ProgramNode* pointers
     module_ast_cap: u32;         // capacity (== modules.length())
-    module_sources: [string];
 
 private:
     // Module name -> index lookup (SymbolStr.id -> module index)
@@ -549,7 +548,6 @@ public:
             topo_unplaced:    [],
             module_ast_buf:   ast_buf,
             module_ast_cap:   initial_cap,
-            module_sources:   [],
             name_index:       HashMap::<ModuleKey, u32, GlobalAlloc, FnvHasher>::new(),
             path_index:       HashMap::<string, u32, GlobalAlloc, FnvHasher>::new(),
             leaf_index:       HashMap::<string, [u32], GlobalAlloc, FnvHasher>::new(),
@@ -573,8 +571,6 @@ public:
                 QualifiedName::leaf_of(intern.resolve(info.namespace_name)), []);
             positions.push(idx);
         }
-        // Read the (Copy) file_path before `info` is moved into `this.modules`.
-        this.module_sources.push(info.file_path);
         this.modules.push(info);
         // A module's identity is made here, where the graph first holds it:
         // a root of the definition tree, named by the path its namespace
@@ -1017,7 +1013,7 @@ public:
         if (ia < 0 || ib < 0) { return false; }
         const ma: const ModuleInfo* = &this.modules[ia];
         const mb: const ModuleInfo* = &this.modules[ib];
-        return ma.origin == mb.origin && ma.origin_name.eq(mb.origin_name);
+        return ma.origin == mb.origin && ma.origin_name == mb.origin_name;
     }
 
     /// Whether the indexed module `m` may be named from module `from`: it
@@ -1026,9 +1022,8 @@ public:
         if (!m.declared_internal) { return true; }
         const index: i64 = this.find_module_index(from);
         if (index < 0) { return false; }
-        const own: ModulePackage = ModulePackage {
-            origin: this.modules[index].origin, origin_name: this.modules[index].origin_name };
-        return own.same_as(&m.package);
+        return this.modules[index].origin == m.package.origin
+            && this.modules[index].origin_name == m.package.origin_name;
     }
 
     /// Whether the module at path `m` is the standard library's: one a

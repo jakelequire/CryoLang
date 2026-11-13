@@ -570,7 +570,7 @@ def run_census_programs(exe, names, everything, logdir, env):
     runs = []
     for i, pattern in enumerate(patterns):
         log = os.path.join(logdir, "census-%03d.log" % i)
-        argv = [exe, "test", "--format=plain"] + ([pattern] if pattern else [])
+        argv = [exe, "test"] + census_module().RUN_FLAGS + ([pattern] if pattern else [])
         with open(log, "wb") as fh:
             subprocess.run(argv, cwd=os.path.join(ROOT, "tests"), env=env, stdout=fh,
                            stderr=subprocess.STDOUT)

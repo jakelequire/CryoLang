@@ -1259,12 +1259,12 @@ type struct CodegenPasses {
     /// module currently being codegen'd, looked up by its source path.
     /// Falls back to `"local"` for single-file builds / when the module
     /// isn't in the graph.
-    static current_origin_subdir(ctx: CompilationContext*) -> string {
-        if (ctx.module_graph == null) { return "local"; }
+    static current_origin_subdir(ctx: CompilationContext*) -> String {
+        if (ctx.module_graph == null) { return String::from_str(Str::new("local")); }
         const idx: i64 = ctx.module_graph.find_module_by_path(ctx.source_file);
-        if (idx < 0) { return "local"; }
+        if (idx < 0) { return String::from_str(Str::new("local")); }
         const mi: ModuleInfo* = &ctx.module_graph.modules[idx];
-        return ModuleInfo::origin_subdir(mi.origin, mi.origin_name);
+        return ModuleInfo::origin_subdir(mi.origin, mi.origin_name.as_str());
     }
 
     /// Build the per-module object path:
@@ -1272,11 +1272,11 @@ type struct CodegenPasses {
     /// Used when no `-o PATH` override is in effect, and for the per-module
     /// object that feeds the Exe link step in single-file mode.
     static legacy_obj_path(ctx: CompilationContext*) -> string {
-        mut output_dir: string = "build/target/release/local/deps";
-        if (ctx.project_config != null) {
-            output_dir = ctx.project_config.deps_dir_for(
-                CodegenPasses::current_origin_subdir(ctx));
-        }
+        const output_dir: PathBuf = if (ctx.project_config != null) {
+            ctx.project_config.deps_dir_for(CodegenPasses::current_origin_subdir(ctx).as_str())
+        } else {
+            PathBuf::from(Str::new("build/target/release/local/deps"))
+        };
         // Object files mirror the module namespace as SUBDIRECTORIES under the
         // origin's `deps/` dir (`std::core::intrinsics` ->
         // `<deps>/std/core/intrinsics.o`), so the build tree mirrors the source
@@ -1287,12 +1287,12 @@ type struct CodegenPasses {
         // predicted path diverges from the emitted one and caching breaks.
         const rel: string = compiler::build_manifest::Manifest::path_module(
             ctx.artifacts.ir.module_name);
-        const obj_path: string = Path::from(output_dir).join(f"{rel}.o".as_str()).into_raw();
+        const obj_path: string = output_dir.join(f"{rel}.o".as_str()).into_raw();
         // mkdir_p the object's PARENT (the namespace subdirs), which subsumes
         // `deps/` and any `--build-dir=...` prefix; a bare `mkdir` of the deep
         // path would fail and object emission would error "No such file or
         // directory".
-        ProjectConfig::mkdir_p(obj_path.parent_dir());
+        ProjectConfig::mkdir_p(Path::from(obj_path.parent_dir()));
         return obj_path;
     }
 
@@ -1370,7 +1370,7 @@ type struct CodegenPasses {
         // for custom `--build-dir=...` paths that haven't been
         // pre-created.
         const profile_dir: string = cfg.profile_dir();
-        ProjectConfig::mkdir_p(profile_dir);
+        ProjectConfig::mkdir_p(Path::from(profile_dir));
         // Test-mode builds use a `-test` suffix so the test executable
         // coexists with a normal `cryo run` build of the same project.
         // The `.exe` suffix (Windows targets) goes on top of `-test` so
@@ -1583,7 +1583,7 @@ type struct CodegenPasses {
         // it.  libc's system(3) runs `sh -c`, so both paths are
         // shell-quoted.
         const hoisted_exe: string = CodegenPasses::bin_artifact_path_for_target(cfg, ctx);
-        ProjectConfig::mkdir_p(output_dir);
+        ProjectConfig::mkdir_p(Path::from(output_dir));
         // `hoist_binary` is host-shell-aware: `cp -f` on a POSIX-hosted
         // compiler, `copy /Y` (backslash paths) on a native Windows one.
         const hrc: i32 = CodegenPasses::hoist_binary(exe_path, hoisted_exe);
@@ -1641,7 +1641,7 @@ type struct CodegenPasses {
             _                  => { fmt::format("lib%s.a", cfg.project_name).into_raw() }
         };
         // Archive lands at the build root (`<output_dir>/lib<name>.a`).
-        ProjectConfig::mkdir_p(cfg.output_dir);
+        ProjectConfig::mkdir_p(Path::from(cfg.output_dir));
         const archive_path: string = cfg.lib_archive_path(archive_name);
         const bundled: PassResult = CodegenPasses::bundle_object_list(ctx, archive_path, &ctx.artifacts.object_files);
         if (!bundled.success || !ctx.module_graph.builds_standard_library) {
