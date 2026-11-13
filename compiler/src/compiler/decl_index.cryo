@@ -1363,16 +1363,6 @@ public:
             if (DeclarationIndex::signature_is_refused(func_decl)) { continue; }
             const slot: FamilySlot = this.family_slot(FamilyOwner::Template(template), func.name);
             if (slot.is_none()) { continue; }
-            mut registered: boolean = false;
-            match (this.overload_index.get_ref(&slot)) {
-                Option::Some(positions) => {
-                    for (mut k: i64 = 0; k < (*positions).length(); k++) {
-                        if (this.overload_func_decl[(*positions)[k] as i64] == method_decl) { registered = true; }
-                    }
-                }
-                Option::None => { }
-            }
-            if (registered) { continue; }
             mut param_types: [TypeRef] = [];
             for (mut p: i64 = 0; p < func.parameters.length(); p++) {
                 const param_decl: DeclarationNode* = func.parameters[p];
@@ -1384,6 +1374,25 @@ public:
             } else {
                 TypeRef::invalid()
             };
+            // A method whose opaque return its body decides is registered
+            // before the decision with no type, and again once its body is
+            // checked: the second registration gives the entry its type.
+            mut registered: boolean = false;
+            match (this.overload_index.get_ref(&slot)) {
+                Option::Some(positions) => {
+                    for (mut k: i64 = 0; k < (*positions).length(); k++) {
+                        const pos: i64 = (*positions)[k] as i64;
+                        if (this.overload_func_decl[pos] != method_decl) { continue; }
+                        registered = true;
+                        if (!this.overload_func_types[pos].is_valid() && func_type_ref.is_valid()) {
+                            this.overload_func_types[pos] = func_type_ref;
+                            this.overload_func_owner_return[pos] = func.resolved_return_type;
+                        }
+                    }
+                }
+                Option::None => { }
+            }
+            if (registered) { continue; }
             const id: OverloadId = this.file_entry(slot, func_type_ref, func.resolved_return_type,
                 SymbolStr::empty(), func.origin_trait,
                 if (func_decl.has_name_span()) { func_decl.name_span } else { func_decl.span }, method_decl);
