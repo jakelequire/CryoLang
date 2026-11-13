@@ -13,6 +13,8 @@ import std::fs::file;
 import std::fs::path::{ Path };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
+import std::core::result::{ Result };
+import std::io::error::{ IoErrorKind };
 import utils::log::{ Log, LogArea, LogLevel, LogSink };
 
 type struct CapturingSink {
@@ -38,6 +40,16 @@ function check(ok: boolean, what: string) -> void {
     } else {
         fmt::println(f"FAIL: {what}");
     }
+}
+
+/// Remove the file at `path` an earlier run left, true once it is gone. One
+/// that was never there is gone already; one that could not be removed would
+/// hand that run's lines to the checks that read it.
+function remove_stale(path: string) -> boolean {
+    return match (File::remove(Path::from(Str::new(path)))) {
+        Result::Ok(_)      => { true }
+        Result::Err(error) => { error.kind == IoErrorKind::NotFound }
+    };
 }
 
 /// A message that counts how often it was built.
@@ -200,7 +212,7 @@ function main() -> int {
 
     reset(&capture);
     const env_path: string = "build/compiler-log-env.txt";
-    File::remove(Path::from(Str::new(env_path)));
+    check(remove_stale(env_path), "the environment's earlier log file is removed");
     env::set_var(Str::new("CRYO_LOG"), Str::new("driver"));
     env::set_var(Str::new("CRYO_LOG_FILE"), Str::new(env_path));
     run_command_line([]);
@@ -210,7 +222,7 @@ function main() -> int {
 
     reset(&capture);
     const flag_path: string = "build/compiler-log-flag.txt";
-    File::remove(Path::from(Str::new(flag_path)));
+    check(remove_stale(flag_path), "the flag's earlier log file is removed");
     run_command_line(["build", "--log=sema", "--log-file=build/compiler-log-flag.txt"]);
     Log::debug(LogArea::Sema, "into the flag's file");
     check(capture.count == 0 && file_holds(flag_path, "[debug sema] ") && file_holds(flag_path, ": into the flag's file\n"),
@@ -218,7 +230,7 @@ function main() -> int {
 
     reset(&capture);
     const spaced_path: string = "build/compiler-log-spaced.txt";
-    File::remove(Path::from(Str::new(spaced_path)));
+    check(remove_stale(spaced_path), "the spaced flag's earlier log file is removed");
     run_command_line(["build", "--log", "sema", "--log-file", spaced_path]);
     Log::debug(LogArea::Sema, "into the spaced flag's file");
     check(capture.count == 0 && file_holds(spaced_path, ": into the spaced flag's file\n"),
@@ -227,8 +239,8 @@ function main() -> int {
     reset(&capture);
     const unused_env_path: string = "build/compiler-log-unused-env.txt";
     const chosen_path: string = "build/compiler-log-chosen.txt";
-    File::remove(Path::from(Str::new(unused_env_path)));
-    File::remove(Path::from(Str::new(chosen_path)));
+    check(remove_stale(unused_env_path) && remove_stale(chosen_path),
+          "the earlier log files of a flag beside the environment are removed");
     env::set_var(Str::new("CRYO_LOG_FILE"), Str::new(unused_env_path));
     run_command_line(["build", "--log=sema", "--log-file=build/compiler-log-chosen.txt"]);
     Log::debug(LogArea::Sema, "into the chosen file");
