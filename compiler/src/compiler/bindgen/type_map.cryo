@@ -9,14 +9,15 @@
 /// NAMED Cryo type the importer emits, qualified under the import's alias
 /// namespace (`probe::Point`); a function-pointer pointee maps to a Cryo
 /// `(Args) -> Ret` type; fixed C arrays map to Cryo fixed-array fields.  A
-/// `null` alias (or an anonymous/unnameable record) falls back to an
-/// opaque `void*` for references we can't name.
+/// record the bindings do not emit (a system-header or nested record) maps to
+/// a layout-faithful blob or an opaque `void*`.
 ///
 /// State (the compilation context + the import's alias namespace) lives on the
 /// `CTypeMapper` object rather than being threaded through every call: build one
-/// per translation unit (`CTypeMapper::new(ctx, alias)`) and call `map(t)`.  The
-/// "no alias" path is just a mapper constructed with an empty alias, in
-/// which records/enums collapse to the opaque `void*` fallback.
+/// per translation unit (`CTypeMapper::new(ctx, alias)`) and call `map(t)`.
+/// Every importer has an alias module - the inline `extern module` path and
+/// the vendor generator both register one before importing - so a named
+/// record or enum is always spelled under it.
 
 namespace compiler::bindgen::type_map;
 
@@ -62,8 +63,7 @@ function scalar_name(k: i32) -> string {
 /// import's alias namespace so neither has to be threaded through the recursion.
 type struct CTypeMapper {
     ctx:   mut CompilationContext*;
-    /// The import's extern-module alias's module (`<mod>::alias`; none for
-    /// the functions-only path, in which records collapse to `void*`).
+    /// The import's extern-module alias's module (`<mod>::alias`).
     alias: ModulePath;
 
     static new(ctx: mut CompilationContext*, alias: ModulePath) -> CTypeMapper {
@@ -167,11 +167,7 @@ type struct CTypeMapper {
     }
 
     /// Qualify a record/enum tag name under the import's alias namespace.
-    /// Empty alias => no qualification (bare name).
     qualify_under_alias(&this, tag: SymbolStr) -> SymbolStr {
-        if (!this.alias.is_valid()) {
-            return tag;
-        }
         return this.alias.qualified(tag, this.ctx.intern_table);
     }
 
@@ -285,7 +281,7 @@ type struct CTypeMapper {
             }
             // Reference to an emitted record: name it, qualified under the alias.
             const tag: SymbolStr = this.tag_name(c);
-            if (!tag.is_empty() && this.alias.is_valid()) {
+            if (!tag.is_empty()) {
                 return this.named(tag);
             }
             return this.ptr(this.prim("void"), false);
@@ -293,10 +289,10 @@ type struct CTypeMapper {
 
         if (k == clang::TK_Enum) {
             const tag: SymbolStr = this.tag_name(c);
-            if (!tag.is_empty() && this.alias.is_valid()) {
+            if (!tag.is_empty()) {
                 return this.named(tag);
             }
-            // Enums with no emittable name still round-trip as their integer width.
+            // An enum with no name still round-trips as its integer width.
             return this.prim("i32");
         }
 
