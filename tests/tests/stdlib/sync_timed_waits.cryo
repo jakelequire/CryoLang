@@ -43,14 +43,13 @@ function receive_timeout_times_out_with_a_sender_alive() -> Result<(), TestError
         Result::Err(ReceiveTimeoutError::Timeout) => { }
     }
     expect(start.elapsed().as_millis() >= 50, Str::new("the wait lasted the duration"))?;
-    sender.send(1);
-    return Result::Ok(());
+    return expect(sender.send(1).is_ok(), Str::new("the receiver still takes a value"));
 }
 
 ![test]
 function receive_timeout_returns_a_queued_value_at_once() -> Result<(), TestError> {
     const { first: sender, second: receiver }: Pair<Sender<i64>, Receiver<i64>> = mpsc::Channel::unbounded::<i64>();
-    sender.send(7);
+    expect(sender.send(7).is_ok(), Str::new("the value is queued"))?;
     match (receiver.receive_timeout(Duration::from_secs(10))) {
         Result::Ok(value) => { expect_eq(value, 7)?; }
         Result::Err(_) => { return Result::Err(TestError::failed(Str::new("the queued value"))); }
@@ -63,8 +62,8 @@ function receive_timeout_takes_a_value_sent_while_it_waits() -> Result<(), TestE
     const { first: sender, second: receiver }: Pair<Sender<i64>, Receiver<i64>> = mpsc::Channel::unbounded::<i64>();
     const worker = thread::spawn(move () -> i64 {
         thread::sleep_ms(30);
-        sender.send(9);
-        return 0;
+        // The test reads the send's outcome from the thread's result.
+        return if (sender.send(9).is_ok()) { 0 } else { 1 };
     });
     const start: Instant = Instant::now();
     match (receiver.receive_timeout(Duration::from_secs(20))) {
@@ -72,8 +71,7 @@ function receive_timeout_takes_a_value_sent_while_it_waits() -> Result<(), TestE
         Result::Err(_) => { return Result::Err(TestError::failed(Str::new("the value sent while waiting"))); }
     }
     expect(start.elapsed().as_secs() < 10, Str::new("woken by the send, not the timeout"))?;
-    worker.join();
-    return Result::Ok(());
+    return expect_eq(worker.join(), 0);
 }
 
 ![test]
