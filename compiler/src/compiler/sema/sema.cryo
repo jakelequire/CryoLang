@@ -1149,6 +1149,9 @@ type struct SemaVisitor {
     /// value's own and a call's callee is the one sema selected.
     warn_discarded_must_use(mut &this, expression: ExpressionNode*, value_type: TypeRef) -> void {
         if (expression == null || expression.generated || !value_type.is_valid()) { return; }
+        // An assignment's statement stores the value: the place holds it.
+        const binary: BinaryExpr* = ExpressionNode::binary_of(expression);
+        if (binary != null && binary.op.kind.is_assignment_op()) { return; }
         const marker: Keyword = Keyword::new("must_use");
         const index: DeclarationIndex* = this.ctx.decl_index;
         const type_declaration: DeclarationNode* =
@@ -4573,28 +4576,16 @@ type struct SemaVisitor {
             if (arm.guard != null) { this.resolve_condition(arm.guard); }
             match (arm.body.kind) {
                 StmtKind::Block(block) => {
-                    const last_idx: i64 = block.statements.length() - 1;
-                    for (mut j: i64 = 0; j < block.statements.length(); j++) {
-                        if (j == last_idx && outer_expected.is_valid()) { this.state.expected_type = outer_expected; }
-                        this.dispatch_stmt(block.statements[j]);
-                        if (j == last_idx) { this.state.expected_type = outer_expected; }
-                    }
-                    if (block.statements.length() > 0) {
-                        match (block.statements[block.statements.length() - 1].kind) {
-                            StmtKind::Expr(es) => {
-                                if (es.expression != null && es.expression.has_resolved_type()) {
-                                    const arm_type: TypeRef = es.expression.resolved_type;
-                                    if (!result_type.is_valid()) {
-                                        result_type = arm_type;
-                                        result_span = es.expression.span;
-                                    } else {
-                                        this.check_branch_agreement(result_type, result_span,
-                                            arm_type, es.expression.span,
-                                            "every arm of a `match` expression must produce the same type");
-                                    }
-                                }
-                            }
-                            _ => {}
+                    const value: ExpressionNode* = this.resolve_value_block(block, outer_expected);
+                    if (value != null && value.has_resolved_type()) {
+                        const arm_type: TypeRef = value.resolved_type;
+                        if (!result_type.is_valid()) {
+                            result_type = arm_type;
+                            result_span = value.span;
+                        } else {
+                            this.check_branch_agreement(result_type, result_span,
+                                arm_type, value.span,
+                                "every arm of a `match` expression must produce the same type");
                         }
                     }
                 }
@@ -4607,6 +4598,32 @@ type struct SemaVisitor {
         this.patterns.check_literal_patterns(match_expr.arms, subject_type);
         if (outer_expected.is_valid()) { return outer_expected; }
         return result_type;
+    }
+
+    /// Type the statements of a block that produces a value, an arm of a
+    /// `match` or `static match` expression, and return its value: the last
+    /// statement when it is an expression, typed against `expected`.  That
+    /// expression is read by whatever holds the block, so it is typed as a
+    /// value rather than visited as a statement, which would report it
+    /// discarded.
+    resolve_value_block(mut &this, block: BlockStmt*, expected: TypeRef) -> ExpressionNode* {
+        const last_index: i64 = block.statements.length() - 1;
+        for (mut j: i64 = 0; j < last_index; j++) {
+            this.dispatch_stmt(block.statements[j]);
+        }
+        if (last_index < 0) { return null; }
+        if (expected.is_valid()) { this.state.expected_type = expected; }
+        const last: Stmt* = block.statements[last_index];
+        mut value: ExpressionNode* = null;
+        match (last.kind) {
+            StmtKind::Expr(statement) => {
+                value = statement.expression;
+                this.resolve_expr(statement.expression);
+            }
+            _ => { this.dispatch_stmt(last); }
+        }
+        this.state.expected_type = expected;
+        return value;
     }
 
     resolve_static_match_expr(mut &this, e: ExpressionNode*, sm: mut StaticMatchExpr*) -> TypeRef {
@@ -4730,20 +4747,8 @@ type struct SemaVisitor {
             null
         };
         if (value_block != null) {
-            const last_idx: i64 = value_block.statements.length() - 1;
-            for (mut j: i64 = 0; j < value_block.statements.length(); j++) {
-                if (j == last_idx && outer_expected.is_valid()) { this.state.expected_type = outer_expected; }
-                this.dispatch_stmt(value_block.statements[j]);
-                if (j == last_idx) { this.state.expected_type = outer_expected; }
-            }
-            if (value_block.statements.length() > 0) {
-                match (value_block.statements[last_idx].kind) {
-                    StmtKind::Expr(es) => {
-                        if (es.expression != null && es.expression.has_resolved_type()) { arm_result = es.expression.resolved_type; }
-                    }
-                    _ => {}
-                }
-            }
+            const value: ExpressionNode* = this.resolve_value_block(value_block, outer_expected);
+            if (value != null && value.has_resolved_type()) { arm_result = value.resolved_type; }
         } else {
             this.dispatch_stmt(body);
         }

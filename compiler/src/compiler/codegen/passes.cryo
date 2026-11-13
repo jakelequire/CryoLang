@@ -203,7 +203,7 @@ type struct LinkerConfig {
                 mut out: string = "";
                 const rc: i32 = CodegenPasses::capture_tool(
                     fmt::format("%s -print-file-name=libgcc_eh.a", driver).into_raw(), log_path_text, &out);
-                File::remove(Path::from(log_path_text));
+                CodegenPasses::remove_tool_file(log_path_text);
                 const answer: string = out;
                 const facts: DriverFacts = DriverFacts {
                     unwinds_with_libgcc: rc == 0 && (answer.contains("/") || answer.contains("\\")),
@@ -334,9 +334,19 @@ type struct CodegenPasses {
         const text: string = *out;
         if (rc == 0) {
             if (text.length() > 0) { fmt::eprintf("%s", text); }
-            File::remove(Path::from(log_path));
+            CodegenPasses::remove_tool_file(log_path);
         }
         return rc;
+    }
+
+    /// Remove a tool's response file or output log once it has served.
+    static remove_tool_file(file_path: string) -> void {
+        match (File::remove(Path::from(file_path))) {
+            Result::Ok(_)  => { }
+            // One left in the build directory is harmless: the next command
+            // that uses the path writes the file whole before it is read.
+            Result::Err(_) => { }
+        }
     }
 
     /// Run a toolchain command with its combined output captured to
@@ -1562,9 +1572,8 @@ type struct CodegenPasses {
             return PassResult::failure(1);
         }
         // The response file has served its purpose; remove it so it doesn't
-        // linger in the per-profile dir (best-effort - a failed unlink is
-        // harmless).
-        File::remove(Path::from(link_rsp_path));
+        // linger in the per-profile dir.
+        CodegenPasses::remove_tool_file(link_rsp_path);
 
         Log::debug(LogArea::Link, f"linked executable {exe_path}");
 
@@ -1709,8 +1718,8 @@ type struct CodegenPasses {
                 fmt::format("ar invocation failed (exited with %d)", rc).into_raw(), cmd, rsp_path, ar_out));
             return PassResult::failure(1);
         }
-        // Drop the response file now the archiver has read it (best-effort).
-        File::remove(Path::from(rsp_path));
+        // Drop the response file now the archiver has read it.
+        CodegenPasses::remove_tool_file(rsp_path);
 
         Log::debug(LogArea::Link, f"archived {archive_path} ({objs.length()} objects)");
         return PassResult::ok();

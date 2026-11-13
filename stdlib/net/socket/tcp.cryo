@@ -501,9 +501,13 @@ implement trait Future for struct TcpAccept {
         loop {
             const client: i32 = sys::os_accept(fd, &addr_buf[0], &addrlen);
             if (client >= 0) {
+                // A connection left blocking would stall the reactor's thread
+                // on its first read, so it is refused, and closed as it drops.
                 mut s: TcpStream = TcpStream::from_fd(client);
-                s.set_nonblocking(true);
-                return this.finish(Result::Ok(s));
+                match (s.set_nonblocking(true)) {
+                    Result::Ok(_)      => { return this.finish(Result::Ok(s)); }
+                    Result::Err(error) => { return this.finish(Result::Err(error)); }
+                }
             }
             const e: IoError = sys::last_io_error();
             match (e.kind) {
