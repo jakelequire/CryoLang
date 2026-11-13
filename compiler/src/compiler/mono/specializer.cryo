@@ -184,7 +184,7 @@ type struct ASTSpecializer {
         mut impl_asts: [DeclarationNode*] = [];
         for (mut i: i64 = 0; i < entry.impl_blocks.length(); i++) {
             const written_block: ImplBlock* = DeclarationNode::impl_of(entry.impl_blocks[i]);
-            if (written_block != null && written_block.is_trait_impl()
+            if (written_block != null
                     && !checker.generic_registry.head_matches_args(written_block, type_args, this.intern_table)) {
                 continue;
             }
@@ -192,7 +192,7 @@ type struct ASTSpecializer {
             if (cloned_impl != null) {
                 const impl_node: mut ImplBlock* = DeclarationNode::impl_of(cloned_impl);
                 mut impl_substituter: mut ASTTypeSubstituter* =
-                    this.impl_substituter(impl_node, entry, spec_sym, type_args, spec_typeref);
+                    this.impl_substituter(impl_node, entry, spec_sym, type_args, spec_typeref, checker);
                 // A method whose receiver is written as this template with
                 // other arguments (`this: &Wrapper<i64>` in `implement
                 // Wrapper<T>`) is not a method of this specialization: its
@@ -235,47 +235,32 @@ type struct ASTSpecializer {
         return SpecializationResult::ok(cloned_ast, &impl_asts, spec_name);
     }
 
-    /// The substituter for one impl block of a specialization: the impl's
-    /// parameters, each bound to the specialization's argument at the
-    /// position the head writes it, in the order the head writes them.  A
-    /// head that writes one parameter twice (`Pair<T, T>`) binds it once, at
-    /// its first position; the head was selected against the arguments, so
-    /// the second position holds the same type.  The arena's parameter type
-    /// for each is minted at its head position, which is the identity every
-    /// other consumer of the impl's parameters mints it under.
+    /// The substituter for one impl block of a specialization: each of the
+    /// impl's parameters the head writes, bound to the part of the
+    /// specialization's arguments in its place (`TraitChecker::
+    /// add_annotation_param_bindings`), in the order the head writes them.
+    /// A head that writes one parameter twice (`Pair<T, T>`) binds it once,
+    /// at its first place; the head was selected against the arguments, so
+    /// the second place holds the same type.
     impl_substituter(&this, impl_node: ImplBlock*, entry: const TemplateEntry*,
                      spec_sym: SymbolStr, type_args: &[TypeRef],
-                     spec_typeref: TypeRef) -> mut ASTTypeSubstituter* {
-        mut syms: [SymbolID] = [];
-        mut arena_ids: [TypeRef] = [];
-        mut replacements: [TypeRef] = [];
+                     spec_typeref: TypeRef, checker: TraitChecker*) -> mut ASTTypeSubstituter* {
+        mut head: TypeSubstitution = TypeSubstitution::empty();
         const n: i64 = if (impl_node.target_args.length() < type_args.length()) {
             impl_node.target_args.length()
         } else {
             type_args.length()
         };
         for (mut ti: i64 = 0; ti < n; ti++) {
-            const ta: TypeAnnotation* = impl_node.target_args[ti];
-            if (ta == null) { continue; }
-            match (*ta) {
-                TypeAnnotation::Named(named) => {
-                    const sym: SymbolID = named.param_sym();
-                    if (!sym.is_valid()) { continue; }
-                    mut seen: boolean = false;
-                    for (mut k: i64 = 0; k < syms.length(); k++) {
-                        if (syms[k].equals(sym)) { seen = true; break; }
-                    }
-                    if (seen) { continue; }
-                    syms.push(sym);
-                    arena_ids.push(this.arena.create_generic_param(sym, named.name, ti as u64));
-                    replacements.push(type_args[ti]);
-                }
-                _ => {}
-            }
+            checker.add_annotation_param_bindings(impl_node, impl_node.target_args[ti], type_args[ti], &head);
+        }
+        mut syms: [SymbolID] = [];
+        for (mut pi: i64 = 0; pi < head.params.length(); pi++) {
+            syms.push(this.arena.generic_param_or_null(head.params[pi]).param_sym);
         }
         const subst_ptr: mut TypeSubstitution* =
             allocator::alloc(sizeof(TypeSubstitution), 16) as mut TypeSubstitution*;
-        *subst_ptr = TypeSubstitution::from_params(&arena_ids, &replacements);
+        *subst_ptr = TypeSubstitution::from_params(&head.params, &head.replacements);
         mut impl_substituter: mut ASTTypeSubstituter* = ASTTypeSubstituter::create(
             subst_ptr, this.arena, this.intern_table,
             entry.def, spec_sym,

@@ -908,20 +908,36 @@ type struct MethodDecl {
     /// struct's or union's own, or an impl block's.  Compared by identity,
     /// never by name.
     static is_method_of(m: DeclarationNode*, decl: DeclarationNode*) -> boolean {
-        if (decl == null) { return false; }
-        const empty: [DeclarationNode*] = [];
-        mut methods: &[DeclarationNode*] = &empty;
-        if (DeclarationNode::struct_of(decl) != null) {
-            methods = &(DeclarationNode::struct_of(decl)).methods;
-        } else if (DeclarationNode::union_of(decl) != null) {
-            methods = &(DeclarationNode::union_of(decl)).methods;
-        } else if (DeclarationNode::impl_of(decl) != null) {
-            methods = &(DeclarationNode::impl_of(decl)).methods;
-        }
-        for (mut k: i64 = 0; k < methods.length(); k++) {
-            if (methods[k] == m) { return true; }
+        const methods: [DeclarationNode*]* = MethodDecl::methods_in(decl);
+        if (methods == null) { return false; }
+        for (mut k: i64 = 0; k < (*methods).length(); k++) {
+            if ((*methods)[k] == m) { return true; }
         }
         return false;
+    }
+
+    /// The methods `decl` holds - a struct's or union's own, or an impl
+    /// block's - or null for any other declaration.
+    static methods_in(decl: DeclarationNode*) -> [DeclarationNode*]* {
+        if (decl == null) { return null; }
+        if (DeclarationNode::struct_of(decl) != null) { return &(DeclarationNode::struct_of(decl)).methods; }
+        if (DeclarationNode::union_of(decl) != null) { return &(DeclarationNode::union_of(decl)).methods; }
+        if (DeclarationNode::impl_of(decl) != null) { return &(DeclarationNode::impl_of(decl)).methods; }
+        return null;
+    }
+
+    /// The method named `name` that `decl` - a struct's or union's body, or
+    /// an implement block - declares, or null.
+    static method_named(decl: DeclarationNode*, name: SymbolStr) -> DeclarationNode* {
+        const methods: [DeclarationNode*]* = MethodDecl::methods_in(decl);
+        if (methods == null) { return null; }
+        for (mut k: i64 = 0; k < (*methods).length(); k++) {
+            const m: MethodDecl* = DeclarationNode::method_of((*methods)[k]);
+            if (m != null && m.func != null && DeclarationNode::fn_of(m.func).name.equals(name)) {
+                return (*methods)[k];
+            }
+        }
+        return null;
     }
 }
 
@@ -2002,6 +2018,26 @@ type struct ImplBlock {
             }
             _ => { DefId::invalid() }
         };
+    }
+
+    /// Whether the head accepts every instance of its target: it writes no
+    /// arguments, or a distinct parameter of its own at each position.
+    accepts_every_instance(&this) -> boolean {
+        for (mut i: i64 = 0; i < this.target_args.length(); i++) {
+            const sym: SymbolID = match (*this.target_args[i]) {
+                TypeAnnotation::Named(n) => { n.param_sym() }
+                _                        => { SymbolID::invalid() }
+            };
+            if (!sym.is_valid()) { return false; }
+            for (mut j: i64 = 0; j < i; j++) {
+                const earlier: SymbolID = match (*this.target_args[j]) {
+                    TypeAnnotation::Named(n) => { n.param_sym() }
+                    _                        => { SymbolID::invalid() }
+                };
+                if (earlier.equals(sym)) { return false; }
+            }
+        }
+        return true;
     }
 
     /// The name the target is registered under, and so the key every

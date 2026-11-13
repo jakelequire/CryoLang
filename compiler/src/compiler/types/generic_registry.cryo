@@ -982,10 +982,44 @@ type struct GenericRegistry {
     /// argument the name layer did not stamp is recorded through `require`
     /// and refutes nothing, so a head is never lost to a missing stamp.
     annotation_unifies(&this, ann: TypeAnnotation*, arg: TypeRef, intern: mut InternTable*) -> boolean {
+        return this.annotation_matches(ann, arg, intern, false);
+    }
+
+    /// Whether `block`'s head is for EVERY instantiation of `args`: as
+    /// `head_matches_args`, except that an argument still holding a type
+    /// parameter of the enclosing template is covered only where the head
+    /// writes a parameter of its own, since nothing later decides it.  An
+    /// inherent block for some instances (`implement<T> struct
+    /// Wrap<Wrap<T>>`) lends its methods to a generic body's `Wrap<U>` only
+    /// if it would lend them to every `U`, which it does not.
+    head_covers_args(&this, block: ImplBlock*, args: &[TypeRef], intern: mut InternTable*) -> boolean {
+        if (block == null) { return false; }
+        if (block.target_args.length() == 0) { return true; }
+        if (block.target_args.length() != args.length()) { return false; }
+        for (mut i: i64 = 0; i < args.length(); i++) {
+            if (!this.annotation_matches(block.target_args[i], args[i], intern, true)) { return false; }
+        }
+        return true;
+    }
+
+    /// `annotation_unifies`, with `abstract_refutes` deciding an abstract
+    /// subject argument: deferred (true) when false, covered only by a
+    /// parameter of the head when true.
+    annotation_matches(&this, ann: TypeAnnotation*, arg: TypeRef, intern: mut InternTable*,
+                       abstract_refutes: boolean) -> boolean {
         if (ann == null) { return true; }
         const at: Type* = this.arena.lookup(arg);
         if (at != null && at.kind == TypeKind::GenericParam) {
-            return true;
+            if (!abstract_refutes) { return true; }
+            return match (*ann) {
+                TypeAnnotation::Named(n) => {
+                    match (n.res.require("generic_registry:impl head argument")) {
+                        Res::GenericParam(_) => { true }
+                        _                    => { false }
+                    }
+                }
+                _ => { false }
+            };
         }
         match (*ann) {
             TypeAnnotation::Named(n) => {
@@ -1005,7 +1039,7 @@ type struct GenericRegistry {
                 return k.is_valid() && k.equals(p.name);
             }
             TypeAnnotation::Generic(g) => {
-                if (!this.annotation_unifies(g.base, arg, intern)) { return false; }
+                if (!this.annotation_matches(g.base, arg, intern, abstract_refutes)) { return false; }
                 const n: i64 = this.arena.inst_type_arg_count(arg);
                 if (n == 0) { return true; }
                 if (g.args.length() > n) { return false; }
@@ -1028,7 +1062,7 @@ type struct GenericRegistry {
                         if (param == null || !param.has_default_annotation()) { return false; }
                         written = param.default_annotation;
                     }
-                    if (!this.annotation_unifies(written, this.arena.inst_type_arg_at(arg, j), intern)) {
+                    if (!this.annotation_matches(written, this.arena.inst_type_arg_at(arg, j), intern, abstract_refutes)) {
                         return false;
                     }
                 }
@@ -1036,11 +1070,11 @@ type struct GenericRegistry {
             }
             TypeAnnotation::Pointer(pa) => {
                 if (at == null || at.kind != TypeKind::Pointer) { return false; }
-                return this.annotation_unifies(pa.inner, at.as_pointer().pointee, intern);
+                return this.annotation_matches(pa.inner, at.as_pointer().pointee, intern, abstract_refutes);
             }
             TypeAnnotation::Reference(ra) => {
                 if (at == null || at.kind != TypeKind::Reference) { return false; }
-                return this.annotation_unifies(ra.inner, at.as_reference().referent, intern);
+                return this.annotation_matches(ra.inner, at.as_reference().referent, intern, abstract_refutes);
             }
             _ => { return true; }
         }

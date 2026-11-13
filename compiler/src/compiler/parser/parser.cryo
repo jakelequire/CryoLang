@@ -2263,14 +2263,6 @@ implement struct Parser {
         return if (had_kind_tag) { 2 } else { 1 };
     }
 
-    /// Whether `gp` repeats a parameter of the leading `implement<...>` list.
-    static declares_generic_param(leading: [DeclarationNode*]*, gp: GenericParamDecl*) -> boolean {
-        for (mut i: i64 = 0; i < (*leading).length(); i++) {
-            if (DeclarationNode::generic_param_of((*leading)[i]).name.equals(gp.name)) { return true; }
-        }
-        return false;
-    }
-
     parse_implementation_block(mut &this) -> mut DeclarationNode* {
         const start: Token = this.advance(); // consume 'implement'
 
@@ -2443,15 +2435,15 @@ implement struct Parser {
 
         // The `<...>` after the target name is what the head writes for the
         // target's parameters, and `target_args` carries it for EVERY head.
-        // On a trait impl it is an argument list, each name bound by the
-        // leading `implement<...>`.  On an inherent impl the same list also
-        // DECLARES its names (`implement enum Option<T>` has no leading list
-        // and `T` is in scope in the body), so each name not declared by a
-        // leading list becomes a parameter, and the list is recorded as the
-        // arguments it also is: `implement<T> struct MyVec<T>` declares `T`
-        // once, not twice.
+        // On a trait impl, and on an inherent impl with a leading
+        // `implement<...>`, it is an argument list, each name bound by the
+        // leading list, so it may write types: `implement<T> enum
+        // Option<Option<T>>` is for the instances whose argument is an
+        // `Option`.  On an inherent impl with no leading list the same list
+        // DECLARES its names (`implement enum Option<T>` puts `T` in scope in
+        // the body), and is recorded as the arguments it also is.
         if (this.check(TokenType::LAngle)) {
-            if (trait_ann == null) {
+            if (trait_ann == null && leading_gen_params.length() == 0) {
                 const gen_list: GenericParameterList = this.parse_generic_params();
                 for (mut bi: i64 = 0; bi < gen_list.bounds.length(); bi++) {
                     node.where_bounds.push(gen_list.bounds[bi].clone());
@@ -2460,7 +2452,7 @@ implement struct Parser {
                 for (mut gi: i64 = 0; gi < gen_list.parameters.length(); gi++) {
                     const gp_decl: DeclarationNode* = gen_list.parameters[gi];
                     const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
-                    if (!Parser::declares_generic_param(&leading_gen_params, gp)) { node.generic_params.push(gp_decl); }
+                    node.generic_params.push(gp_decl);
                     const arg: NamedAnnotation* = new NamedAnnotation {
                         name: gp.name,
                         span: gp_decl.span,

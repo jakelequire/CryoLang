@@ -5324,6 +5324,19 @@ type struct CallResolver {
                        generic: boolean, sel: mut Selection*) -> boolean {
         if (block == null) { return false; }
         const named: [DeclarationNode*] = this.block_methods_named(block, member.member);
+        // An inherent block whose head is for other instances (`implement<T>
+        // enum Option<Option<T>>` asked of an `Option<i32>`) lends this
+        // receiver nothing; monomorphization leaves the block out of such an
+        // instance (`GenericRegistry::head_matches_args`).  A generic body's
+        // receiver must be covered for every instantiation of its parameters
+        // (`head_covers_args`), or the body would fail only at some of them.
+        if (!block.is_trait_impl() && sel.owner_inst.is_valid()) {
+            const owner_args: [TypeRef] = this.inst_args(sel.owner_inst);
+            if (owner_args.length() > 0
+                    && !this.ctx.generic_registry.head_covers_args(block, &owner_args, this.intern)) {
+                return false;
+            }
+        }
         if (!sel.owner_inst.is_valid()) {
             return this.bind_on_methods(visitor, call, member, &block.methods, &named, arg_types,
                                         generic, sel, null);
@@ -6212,8 +6225,23 @@ type struct CallResolver {
             ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
             fmt::format("no method named `%s` found on type `%s`", method_name, type_display));
         diag = diag.at(primary_span);
+        // Declared by an inherent block whose head is for other instances.
+        mut instance_head: string = "";
+        const receiver_template: const TemplateEntry* = this.ctx.generic_registry.template_of_type(
+            this.arena.inst_generic_base(lookup_ref));
+        if (receiver_template != null) {
+            for (mut bi: i64 = 0; bi < receiver_template.impl_blocks.length() && instance_head == ""; bi++) {
+                const block: ImplBlock* = DeclarationNode::impl_of(receiver_template.impl_blocks[bi]);
+                if (block == null || block.is_trait_impl()) { continue; }
+                if (MethodDecl::method_named(receiver_template.impl_blocks[bi], member.member) == null) { continue; }
+                instance_head = block.spell_head(this.intern);
+            }
+        }
         const owning_trait: DeclName = this.binding.lookup_trait_defining_method(member.member);
-        if (owning_trait.is_valid()) {
+        if (instance_head != "") {
+            diag = diag.with_note(fmt::format("the method `%s` is declared for `%s` only, and `%s` is not one of those instances",
+                method_name, instance_head, type_display));
+        } else if (owning_trait.is_valid()) {
             const trait_str: string = this.intern.shown(owning_trait);
             diag = diag.with_note(fmt::format("the method `%s` is defined on trait `%s`", method_name, trait_str));
             diag = diag.help(fmt::format("implement `%s` for `%s`, or change the receiver to a type that already does", trait_str, type_display));

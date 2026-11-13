@@ -822,6 +822,7 @@ type struct SemaVisitor {
         if (!this.check_derivation(node)) { return; }
         if (this.refuse_primitive_trait_implementation(decl, node)) { return; }
         this.check_supertraits_implemented(decl, node);
+        this.refuse_overlapping_inherent_methods(node);
         if (node.is_template()) {
             // A head whose target is a parameter of its own has no owner;
             // its methods' receiver is the type it is written for.
@@ -1505,6 +1506,83 @@ type struct SemaVisitor {
         if (node.owner != null) { this.refuse_constant_member_clash(decl, node); }
         if (this.typed_before_bodies(node)) { return; }
         this.check_var_decl(decl, node);
+    }
+
+    /// A method of an inherent block whose head is for some instances
+    /// (`implement<T> struct Wrap<Wrap<T>>`) shares its name with no method
+    /// the type's body declares, nor with one an earlier inherent block
+    /// whose head overlaps this one's declares, and neither does a method of
+    /// a block for every instance beside an earlier block for some (E0308):
+    /// an instance both heads accept would have two methods of one name,
+    /// and which one a call means would depend on the order the blocks were
+    /// written in.  Heads overlap as trait heads do
+    /// (`GenericRegistry::heads_overlap`): `Wrap<Wrap<T>>` and
+    /// `Wrap<Pair<T>>` are for disjoint instances and may each declare a
+    /// method of one name.  Blocks for every instance overload a name by
+    /// their parameters, as the type's body does, and are not asked here.
+    refuse_overlapping_inherent_methods(mut &this, node: ImplBlock*) -> void {
+        if (node.is_trait_impl() || node.template != null || node.spec_owner.is_valid()) { return; }
+        const node_for_every: boolean = node.accepts_every_instance();
+        mut body: DeclarationNode* = null;
+        mut earlier: [DeclarationNode*] = [];
+        const tmpl: const TemplateEntry* = this.ctx.generic_registry.template_of(node.target_def());
+        if (tmpl != null) {
+            body = tmpl.ast_node;
+            for (mut i: i64 = 0; i < tmpl.impl_blocks.length(); i++) {
+                const block: ImplBlock* = DeclarationNode::impl_of(tmpl.impl_blocks[i]);
+                if (block == node) { break; }
+                if (block != null && !block.is_trait_impl()) { earlier.push(tmpl.impl_blocks[i]); }
+            }
+        } else {
+            const owner: TypeRef = this.ctx.decl_index.impl_owner(node, "sema/inherent overlap");
+            body = this.ctx.generic_registry.lookup_inherent_owner(owner);
+            const blocks: [DeclarationNode*] = this.ctx.generic_registry.inherent_impl_blocks(owner);
+            for (mut i: i64 = 0; i < blocks.length(); i++) {
+                if (DeclarationNode::impl_of(blocks[i]) == node) { break; }
+                earlier.push(blocks[i]);
+            }
+        }
+        const target: string = this.intern.resolve(node.target_type);
+        for (mut mi: i64 = 0; mi < node.methods.length(); mi++) {
+            const m: MethodDecl* = DeclarationNode::method_of(node.methods[mi]);
+            if (m == null || m.func == null) { continue; }
+            const name: SymbolStr = DeclarationNode::fn_of(m.func).name;
+            const spelt: string = this.intern.resolve(name);
+            const in_body: DeclarationNode* = if (node_for_every) { null } else { MethodDecl::method_named(body, name) };
+            if (in_body != null) {
+                mut d: Diagnostic = Diagnostic::error(ErrorCode::E0308_CONFLICTING_TRAIT_IMPL,
+                    fmt::format("conflicting definitions of method `%s`: `%s` declares it in its own body, which every instance has",
+                        spelt, target));
+                d = d.at_with_label(m.func.name_span, "defined again here");
+                d = d.also_at(DeclarationNode::method_of(in_body).func.name_span, "first defined here");
+                d = d.with_note("a block for some instances declares no method of a name its instances already have; rename one, or keep one definition");
+                this.ctx.emit_diagnostic(d);
+                continue;
+            }
+            for (mut ei: i64 = 0; ei < earlier.length(); ei++) {
+                const other_method: DeclarationNode* = MethodDecl::method_named(earlier[ei], name);
+                const other: ImplBlock* = DeclarationNode::impl_of(earlier[ei]);
+                if (other_method == null || (node_for_every && other.accepts_every_instance())
+                        || !GenericRegistry::heads_overlap(other, node)) {
+                    continue;
+                }
+                const this_head: string = node.spell_head(this.intern);
+                const that_head: string = other.spell_head(this.intern);
+                const msg: string = if (this_head == that_head) {
+                    fmt::format("conflicting definitions of method `%s`: two `%s` blocks declare it",
+                        spelt, this_head).into_raw()
+                } else {
+                    fmt::format("conflicting definitions of method `%s`: `%s` overlaps `%s`, so an instance both heads accept would have two",
+                        spelt, this_head, that_head).into_raw()
+                };
+                mut d: Diagnostic = Diagnostic::error(ErrorCode::E0308_CONFLICTING_TRAIT_IMPL, msg);
+                d = d.at_with_label(m.func.name_span, "defined again here");
+                d = d.also_at(DeclarationNode::method_of(other_method).func.name_span, "first defined here");
+                d = d.with_note("a block for some instances may declare a method of a name another inherent block declares only when their heads accept no instance in common; rename one, or keep one definition");
+                this.ctx.emit_diagnostic(d);
+                break;
+            }
+        }
     }
 
     /// A type's constant shares its name with no other member of the type -

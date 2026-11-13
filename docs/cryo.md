@@ -3289,6 +3289,24 @@ implement enum Color {
 }
 ```
 
+**Methods for some instances.** An inherent block on a generic type whose head starts with its own parameter list, `implement<T>`, writes the type's arguments rather than declaring them, so they may be types: the block's methods belong to exactly the instances its head accepts. A call on any other instance does not find them (`E0358`), and a generic body calls them only on a receiver every instantiation of which the head accepts:
+
+```cryo
+type struct Wrap<T> { value: T; }
+
+implement<T> struct Wrap<Wrap<T>> {
+    inner(&this) -> T { return this.value.value; }
+}
+
+const nested: Wrap<Wrap<i32>> = Wrap { value: Wrap { value: 4 } };
+const four: i32 = nested.inner();
+// Wrap { value: 4 }.inner()        // E0358: `Wrap<i32>` is not a `Wrap<Wrap<T>>`
+```
+
+A head with no leading list, `implement struct Wrap<T>`, declares its names and is for every instance.
+
+**A block for some instances adds names.** A method of a block for some instances is refused (`E0308`) where the type's own body declares one of the same name, or where an earlier inherent block whose head accepts an instance this one accepts too declares one, and so is a method of a block for every instance written after such a block: heads overlap as trait heads do (section 12.2). `implement<T> struct Wrap<Wrap<T>>` and `implement<T> struct Wrap<Pair<T>>` accept no instance in common, so each may declare a method of one name; either overlaps `implement struct Wrap<T>`. Blocks for every instance, like the type's body, may overload a name by its parameters.
+
 ### 12.2 Trait Implementation
 
 Provides the method bodies a trait requires for a specific type. Use this to make `T` participate in generic code that has a `where T: SomeTrait` bound.

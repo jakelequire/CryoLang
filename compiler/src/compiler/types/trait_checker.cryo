@@ -829,14 +829,16 @@ type struct TraitChecker {
         if (arg_t == null) { return; }
         match (*ann) {
             TypeAnnotation::Named(n) => {
+                // The name as the head writes it is the parameter the body
+                // reads; the block's declared list only places it.
                 const sym: SymbolID = n.param_sym();
                 if (!sym.is_valid() || this.lookup_subst_for_param(sym, subst).is_valid()) { return; }
+                mut index: u64 = 0;
                 for (mut gi: i64 = 0; gi < impl_block.generic_params.length(); gi++) {
                     const gp: GenericParamDecl* = DeclarationNode::generic_param_of(impl_block.generic_params[gi]);
-                    if (gp == null || !gp.sym_id.equals(sym)) { continue; }
-                    subst.add(this.arena.create_generic_param(gp.sym_id, gp.name, gi as u64), arg);
-                    return;
+                    if (gp != null && gp.sym_id.equals(sym)) { index = gi as u64; }
                 }
+                subst.add(this.arena.create_generic_param(sym, n.name, index), arg);
             }
             TypeAnnotation::Generic(g) => {
                 const count: i64 = this.arena.inst_type_arg_count(arg);
@@ -864,14 +866,16 @@ type struct TraitChecker {
     /// relate to the type's only through the head, so a bound the impl
     /// writes (`where U: Show`) is checked against these bindings and never
     /// against the type's parameters, which may be spelled differently.  A
-    /// head whose argument count differs from `args` binds nothing.
+    /// parameter written inside an argument is bound to the part of the
+    /// instantiation's argument in its place: `T` in `implement<T> enum
+    /// Option<Option<T>>`, for `Option<Option<i32>>`, to `i32`.  A head whose
+    /// argument count differs from `args` binds nothing.
     add_head_param_bindings(&this, impl_block: ImplBlock*, args: &[TypeRef],
                             subst: mut TypeSubstitution*) -> void {
         if (impl_block == null || subst == null) { return; }
         if (impl_block.target_args.length() != args.length()) { return; }
         for (mut gi: i64 = 0; gi < impl_block.target_args.length(); gi++) {
-            const gp_ref: TypeRef = this.head_param_type(impl_block, gi);
-            if (gp_ref.is_valid()) { subst.add(gp_ref, args[gi]); }
+            this.add_annotation_param_bindings(impl_block, impl_block.target_args[gi], args[gi], subst);
         }
     }
 
