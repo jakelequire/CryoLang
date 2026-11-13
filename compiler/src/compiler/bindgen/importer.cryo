@@ -1705,25 +1705,22 @@ type struct Importer {
             src.push(Str::new((*unsaved).contents as string));
             src.push_byte(10 as u8);
         } else {
-            src.push(Str::new(fmt::format("#include \"%s\"\n",
-                Importer::to_forward_slashes(source_filename as string)).into_raw()));
+            src.push(f"#include \"{Importer::to_forward_slashes(source_filename as string)}\"\n");
         }
         // The probe must accept whatever type the expression has, which each
         // language spells differently: `auto` is C++'s, `__auto_type` the C one.
         const auto_kw: string = if (this.is_cpp) { "auto" } else { "__auto_type" };
         for (mut i: i64 = 0; i < this.probe_names.length(); i++) {
             const nm: string = this.ctx.intern_table.resolve(this.probe_names[i]);
-            src.push(Str::new(fmt::format(
-                "#ifdef %s\n%s %s%lld = (%s);\n#endif\n",
-                nm, auto_kw, PROBE_PREFIX, i, nm).into_raw()));
+            src.push(f"#ifdef {nm}\n{auto_kw} {PROBE_PREFIX}{i} = ({nm});\n#endif\n");
         }
 
-        const content: string = src.into_raw();
+        // `src` is not changed again before the parse below reads it.
         const probe_file: string = "__cryo_macro_probe.c";
         mut uf: CXUnsavedFile = CXUnsavedFile {
             filename: probe_file as u8*,
-            contents: content as u8*,
-            length:   content.length() as u64
+            contents: src.as_cstr(),
+            length:   src.length() as u64
         };
         // No detailed preprocessing record: this TU is read for VALUES, and the
         // macro cursors were already collected from the real one.
@@ -2304,7 +2301,7 @@ type struct Importer {
             extern_node.binding_namespace = ctx.module_graph.register_c_import_module(ctx.intern_table.intern(
                 mod_name + "::" + ctx.intern_table.resolve(extern_node.namespace_alias)));
 
-            const source_dir: string = Importer::get_directory(ctx.source_file);
+            const source_dir: String = Importer::get_directory(ctx.source_file);
 
             for (mut j: i64 = 0; j < extern_node.include_paths.length(); j++) {
                 const include_path: string = extern_node.include_paths[j];
@@ -2319,7 +2316,7 @@ type struct Importer {
                     continue;
                 }
 
-                const resolved: string = Importer::resolve_include_path(source_dir, include_path);
+                const resolved: string = Importer::resolve_include_path(source_dir.as_str(), include_path);
                 if (resolved == "") {
                     Log::warn(LogArea::Bindgen, f"header not found: '{include_path}' (relative to '{source_dir}')");
                     continue;
@@ -2365,10 +2362,10 @@ type struct Importer {
                     header)));
             return 0;
         }
-        const content: string = fmt::format("#include <%s>\n", header).into_raw();
+        mut content: String = f"#include <{header}>\n";
         mut uf: CXUnsavedFile = CXUnsavedFile {
             filename: "cryo_syshdr.c" as u8*,
-            contents: content as u8*,
+            contents: content.as_cstr(),
             length:   content.length() as u64
         };
         mut no_extra: [u8*] = [];
@@ -2434,31 +2431,29 @@ type struct Importer {
         // `extra_args` carries the vendor generator's `-I<dir>` / `-D<def>` flags
         // (empty for the inline `#include` path).
         const is_cpp: boolean = (lang as string) == "c++";
+        // The two arguments built here are read by clang_parseTranslationUnit
+        // below, so both are held for the whole function and lent to `args`
+        // as C strings, after their last change.
+        mut std_flag: String = if (cpp_std.length() > 0) {
+            f"-std={cpp_std}"
+        } else {
+            String::from_string("-std=c++17")
+        };
+        mut resource_dir: String = match (env::var(Str::new("CRYO_CLANG_RESOURCE_DIR"))) {
+            Option::Some(v) => { v }
+            Option::None    => { String::new() }
+        };
         mut args: [u8*] = [];
         args.push("-x" as u8*);
         if (is_cpp) {
             args.push("c++" as u8*);
-            const std_flag: string = if (cpp_std.length() > 0) {
-                fmt::format("-std=%s", cpp_std).into_raw()
-            } else {
-                "-std=c++17"
-            };
-            args.push(std_flag as u8*);
+            args.push(std_flag.as_cstr());
         } else {
             args.push("c" as u8*);
         }
-        match (env::var(Str::new("CRYO_CLANG_RESOURCE_DIR"))) {
-            Option::Some(v) => {
-                // Pushed into `args` and read later by clang_parseTranslationUnit,
-                // so the bytes must outlive this scope: hand off an owned raw
-                // `string` (leaked once).
-                const rd: string = v.into_raw();
-                if (rd.length() > 0) {
-                    args.push("-resource-dir" as u8*);
-                    args.push(rd as u8*);
-                }
-            }
-            Option::None => {}
+        if (resource_dir.length() > 0) {
+            args.push("-resource-dir" as u8*);
+            args.push(resource_dir.as_cstr());
         }
         for (mut ei: i64 = 0; ei < extra_args.length(); ei++) {
             args.push(extra_args[ei]);
@@ -2525,52 +2520,34 @@ type struct Importer {
     /// Path with `\` rewritten to `/`.  A Windows path embedded in a generated
     /// `#include "..."` would otherwise put a backslash where C reads an escape;
     /// clang accepts forward slashes on every host.
-    static to_forward_slashes(p_text: string) -> string {
-        const p: string = p_text;
-        const len: i64 = p.length();
-        mut s: String = String::with_capacity(len + 1);
-        for (mut i: i64 = 0; i < len; i++) {
-            if (p[i] == '\\') { s.push_byte('/' as u8); }
-            else              { s.push_byte(p[i] as u8); }
-        }
-        return s.into_raw();
+    static to_forward_slashes(path: string) -> String {
+        return String::from_string(path).replace(&Str::new("\\"), &Str::new("/"));
     }
 
     /// Extract directory component from a file path.
-    static get_directory(path_text: string) -> string {
-        const path: string = path_text;
-        const len: i64 = path.length();
-        mut last_sep: i64 = -1;
-        for (mut i: i64 = 0; i < len; i++) {
+    static get_directory(path: string) -> String {
+        const length: i64 = path.length();
+        mut last_separator: i64 = -1;
+        for (mut i: i64 = 0; i < length; i++) {
             if (path[i] == '/' || path[i] == '\\') {
-                last_sep = i;
+                last_separator = i;
             }
         }
-        if (last_sep < 0) {
-            return ".";
+        if (last_separator < 0) {
+            return String::from_string(".");
         }
-        mut d: String = String::from_str(Str::from_raw(path as u8*, last_sep));
-        return d.into_raw();
+        return String::from_str(Str::from_raw(path as u8*, last_separator));
     }
 
     /// Resolve an include path relative to a source directory.  Returns the
-    /// resolved path if the file exists, empty string otherwise.
-    static resolve_include_path(source_dir_text: string, include_path_text: string) -> string {
-        const include_path: string = include_path_text;
-        const source_dir: string = source_dir_text;
-        const src_len: i64 = source_dir.length();
-        const inc_len: i64 = include_path.length();
-        const total: i64 = src_len + 1 + inc_len + 1;
-        mut s: String = String::with_capacity(total);
-        s.push(Str::from_raw(source_dir as u8*, src_len));
-        s.push_byte('/' as u8);
-        s.push(Str::from_raw(include_path as u8*, inc_len));
-
-        if (Path::from(s.as_cstr() as string).exists()) {
-            return s.into_raw();
+    /// resolved path if the file exists, empty string otherwise.  The path is
+    /// handed on as a C string: libclang parses it, and the build records it
+    /// among the files it read.
+    static resolve_include_path(source_dir: Str, include_path: string) -> string {
+        mut candidate: String = f"{source_dir}/{include_path}";
+        if (Path::from(candidate.as_str()).exists()) {
+            return candidate.into_raw();
         }
-
-        mem::drop(s);
         return "";
     }
 
