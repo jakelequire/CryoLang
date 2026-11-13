@@ -3303,7 +3303,7 @@ const four: i32 = nested.inner();
 // Wrap { value: 4 }.inner()        // E0358: `Wrap<i32>` is not a `Wrap<Wrap<T>>`
 ```
 
-A head with no leading list, `implement struct Wrap<T>`, declares its names and is for every instance.
+A head with no leading list, `implement struct Wrap<T>`, declares its names and is for every instance. A block for one instance whose arguments are all types writes an empty leading list, `implement<> struct Wrap<i64>`: without it the names after the type would be declared, and `i64` is no name to declare.
 
 **A block for some instances adds names.** A method of a block for some instances is refused (`E0308`) where the type's own body declares one of the same name, or where an earlier inherent block whose head accepts an instance this one accepts too declares one, and so is a method of a block for every instance written after such a block: heads overlap as trait heads do (section 12.2). `implement<T> struct Wrap<Wrap<T>>` and `implement<T> struct Wrap<Pair<T>>` accept no instance in common, so each may declare a method of one name; either overlaps `implement struct Wrap<T>`. Blocks for every instance, like the type's body, may overload a name by its parameters; two methods every instance has that share a name and take the same parameter types - in the body, in blocks for every instance, or one in each - are refused (`E0308`), since a call is selected by its arguments and could never reach one of them. The receiver's form (`&this`, `mut &this`) does not tell two methods apart, and a block's parameters are compared as the type's own: `takes(&this, x: T)` in `implement struct Wrap<T>` is the same as in the body of `Wrap<T>`.
 
