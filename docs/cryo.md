@@ -2823,7 +2823,11 @@ the same `Target`; E0312 otherwise), by the same rule:
 receiver lacks a field or method but implements `Deref`, `b.field` /
 `b.method()` retry on the pointee (transitively), inserting the `.deref()`
 chain for you - or the `.deref_mutable()` chain, where the member is written
-or the method takes `mut &this` - the smart-pointer pattern.
+or the method takes `mut &this` - the smart-pointer pattern.  On each
+pointee a call `b.m()` names the method `m` before a field `m`, as a call on
+the pointee itself does, so a private field never hides a public method of
+its name; a pointee with no such method has its field `m` called, when the
+field holds a function.
 
 ```cryo
 type struct Boxed<T> { value: T; }

@@ -241,7 +241,7 @@ type struct MemberResolver {
             // is a place, coerced access serves reads and writes uniformly, and
             // codegen needs nothing new.  The pointee answering with a method
             // (no field pinned) is the same misreading as above.
-            const coerced: TypeRef = this.try_deref_coercion(visitor, member_e, member);
+            const coerced: TypeRef = this.try_deref_coercion(visitor, member_e, member, false);
             if (coerced.is_valid()) {
                 if (!member.resolved_member.is_some()) {
                     this.report_method_read(member, type_name, TypeRef::invalid(), acc_span);
@@ -382,8 +382,10 @@ type struct MemberResolver {
     /// original `member.object` is left untouched and `invalid` returned.
     /// Restricted to concrete user receivers; a bounded `T: Deref` param is not
     /// coerced (its abstract pointee has no field/method to bind pre-mono).
+    /// `called` is true for the callee of a call, which names a pointee's
+    /// method before its field, as a call on the receiver itself does.
     try_deref_coercion(mut &this, visitor: mut SemaVisitor*, member_e: mut ExpressionNode*,
-                       member: mut MemberAccessExpr*) -> TypeRef {
+                       member: mut MemberAccessExpr*, called: boolean) -> TypeRef {
         if (member.object == null) { return TypeRef::invalid(); }
         mut cur_obj: mut ExpressionNode* = member.object;
         mut cur_ty:  TypeRef         = member.object.resolved_type;
@@ -418,7 +420,7 @@ type struct MemberResolver {
             const target_ty: TypeRef = visitor.resolve_expr(star_expr);
             if (!target_ty.is_valid()) { return TypeRef::invalid(); }
             // Re-attempt the field / method lookup on `Target`.
-            const r: TypeRef = this.member_type_on(member_e, member, target_ty);
+            const r: TypeRef = this.member_type_on(member_e, member, target_ty, called);
             if (r.is_valid()) {
                 member.object = star_expr;
                 member_e.set_resolved_type(r);
@@ -444,8 +446,13 @@ type struct MemberResolver {
     /// method call is.  Returns the member's type, or `invalid` on a
     /// genuine miss - emits no diagnostic.  Used by Deref coercion to probe each
     /// pointee in the chain without perturbing the direct-access path.
+    /// When `called`, a method answers before a field of the same name.
     member_type_on(mut &this, member_e: ExpressionNode*, member: mut MemberAccessExpr*,
-                   obj_type: TypeRef) -> TypeRef {
+                   obj_type: TypeRef, called: boolean) -> TypeRef {
+        if (called) {
+            const method_ret: TypeRef = this.method_type_on(member, obj_type);
+            if (method_ret.is_valid()) { return method_ret; }
+        }
         const acc_span: SourceSpan = if (member.member_span.has_location()) {
             member.member_span
         } else {
@@ -456,7 +463,14 @@ type struct MemberResolver {
             this.pin_field(member, &fa, acc_span);
             return fa.ty;
         }
-        // Method (from the dereferenced receiver symbol).
+        if (called) { return TypeRef::invalid(); }
+        return this.method_type_on(member, obj_type);
+    }
+
+    /// The return of the method `member` names on `obj_type`, looked up from
+    /// the type under its pointers, references and instantiation; invalid
+    /// when it names none.
+    method_type_on(&this, member: MemberAccessExpr*, obj_type: TypeRef) -> TypeRef {
         mut walk_ty: TypeRef = obj_type;
         mut walk_t: Type* = this.arena.lookup(walk_ty);
         mut depth: i32 = 0;
