@@ -21,11 +21,13 @@ import std::core::result::{ Result };
 import std::core::slice::{ Slice };
 import std::core::convert;
 import std::core::primitives;
+import std::collections::array::{ Array };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::io::error::{ IoError, IoErrorKind };
 import std::ffi::libc;
 import std::ffi::openssl;
+import std::sys::syscall;
 import std::net::socket::tcp::{ TcpStream };
 import std::net::tls::stream::{ TlsStream };
 import std::net::tls::future::{ TlsHandshake };
@@ -55,13 +57,14 @@ public type struct TlsConnector {
     private ctx: void*;
     private verify: boolean;
 
-    /// New client context with the system trust store loaded and peer
+    /// New client context trusting the system's roots, with peer
     /// verification on by default.
     ///
-    /// The system store is OpenSSL's default verify paths - the OS CA bundle
-    /// on Unix - and, on Windows, the Windows ROOT certificate store as well:
-    /// OpenSSL's default paths there name its own build directory, which an
-    /// ordinary Windows machine does not have.
+    /// On Unix the system's roots are OpenSSL's default verify paths, the OS
+    /// CA bundle. On Windows a server's chain is built and checked by Windows
+    /// itself, which trusts the roots Windows trusts - fetching one the
+    /// machine does not hold yet, as it does for any program - so a site
+    /// whose root no copy of the local store has yet still verifies.
     public static new() -> Result<TlsConnector, IoError> {
         ignore_sigpipe();
         const method: void* = openssl::TLS_client_method();
@@ -69,10 +72,11 @@ public type struct TlsConnector {
         if (ctx == null) {
             return Result::Err(IoError::new(IoErrorKind::Other, 0));
         }
-        if (openssl::SSL_CTX_set_default_verify_paths(ctx) != 1 || !os_load_system_store(ctx)) {
+        if (openssl::SSL_CTX_set_default_verify_paths(ctx) != 1) {
             openssl::SSL_CTX_free(ctx);
             return Result::Err(IoError::new(IoErrorKind::Other, 0));
         }
+        os_configure_verification(ctx);
         return Result::Ok(TlsConnector { ctx: ctx, verify: true });
     }
 
@@ -282,17 +286,117 @@ implement trait Drop for struct TlsAcceptor {
     }
 }
 
-/// Add the Windows ROOT certificate store to `ctx`'s trust sources, through
-/// OpenSSL's `winstore` store loader. False when OpenSSL cannot open it.
+/// Hand the verification of a server's chain to Windows: OpenSSL's default
+/// verify paths there name its own build directory, and a copy of the ROOT
+/// store holds only the roots Windows has already fetched.
 ![target(windows)]
-private function os_load_system_store(ctx: void*) -> boolean {
-    return openssl::SSL_CTX_load_verify_store(ctx, "org.openssl.winstore://") == 1;
+private function os_configure_verification(ctx: void*) -> void {
+    openssl::SSL_CTX_set_cert_verify_callback(ctx, windows_verify_server as void*, null);
 }
 
-/// The default verify paths are the system store on Unix: nothing to add.
+/// On Unix OpenSSL verifies against the default verify paths, the system's
+/// roots: nothing to configure.
 ![target(unix)]
-private function os_load_system_store(_ctx: void*) -> boolean {
-    return true;
+private function os_configure_verification(_ctx: void*) -> void { }
+
+/// OpenSSL's chain verification on Windows. The chain Windows builds from
+/// the server's certificate, with the intermediates the server sent, must
+/// meet the TLS server policy, and the certificate must name the host the
+/// connection asked for. A chain Windows does not trust is asked of
+/// OpenSSL's own verification against the context's store, which holds the
+/// roots `add_root_certificate` added and checks the name itself. Returns 1
+/// to accept the server; a refusal leaves its reason on `store_context`,
+/// where `SSL_get_verify_result` reads it.
+![target(windows)]
+private function windows_verify_server(store_context: void*, _argument: void*) -> i32 {
+    const leaf: void* = openssl::X509_STORE_CTX_get0_cert(store_context);
+    if (leaf == null || !windows_trusts(leaf, openssl::X509_STORE_CTX_get0_untrusted(store_context))) {
+        return openssl::X509_verify_cert(store_context);
+    }
+    // The connection names a host, or an IP address when the name it was
+    // given is one.
+    const parameters: void* = openssl::X509_STORE_CTX_get0_param(store_context);
+    const host: u8* = openssl::X509_VERIFY_PARAM_get0_host(parameters, 0);
+    if (host != null && openssl::X509_check_host(leaf, host, 0, 0, null) != 1) {
+        openssl::X509_STORE_CTX_set_error(store_context, openssl::X509_V_ERR_HOSTNAME_MISMATCH);
+        return 0;
+    }
+    const address: mut u8* = openssl::X509_VERIFY_PARAM_get1_ip_asc(parameters);
+    if (address != null) {
+        const named: boolean = openssl::X509_check_ip_asc(leaf, address, 0) == 1;
+        openssl::CRYPTO_free(address, null, 0);
+        if (!named) {
+            openssl::X509_STORE_CTX_set_error(store_context, openssl::X509_V_ERR_IP_ADDRESS_MISMATCH);
+            return 0;
+        }
+    }
+    openssl::X509_STORE_CTX_set_error(store_context, 0);
+    return 1;
+}
+
+/// Whether Windows builds a chain it trusts from `leaf`, taking issuers
+/// from `intermediates` (an OpenSSL stack of certificates, or null), and
+/// the chain meets the TLS server policy. An intermediate Windows cannot
+/// read is left out, so the chain is built without it.
+![target(windows)]
+private function windows_trusts(leaf: void*, intermediates: void*) -> boolean {
+    const store: void* = syscall::CertOpenStore(syscall::CERT_STORE_PROV_MEMORY, 0, 0, 0, null);
+    if (store == null) { return false; }
+    const count: i32 = if (intermediates == null) { 0 } else { openssl::OPENSSL_sk_num(intermediates) };
+    for (mut i: i32 = 0; i < count; i++) {
+        const issuer: Array<u8> = certificate_der(openssl::OPENSSL_sk_value(intermediates, i));
+        syscall::CertAddEncodedCertificateToStore(store, syscall::CERTIFICATE_ENCODING,
+            issuer.as_ptr(), issuer.length() as u32, syscall::CERT_STORE_ADD_ALWAYS, null);
+    }
+    const leaf_der: Array<u8> = certificate_der(leaf);
+    const certificate: void* = syscall::CertCreateCertificateContext(syscall::CERTIFICATE_ENCODING,
+        leaf_der.as_ptr(), leaf_der.length() as u32);
+    mut trusted: boolean = false;
+    if (certificate != null) {
+        const parameters: syscall::CertificateChainParameters = syscall::CertificateChainParameters {
+            size: sizeof(syscall::CertificateChainParameters) as u32,
+            requested_usage: syscall::CertificateUsageMatch {
+                match_type: 0,
+                usage: syscall::CertificateEnhancedKeyUsage { identifier_count: 0, identifiers: null }
+            }
+        };
+        mut chain: void* = null;
+        if (syscall::CertGetCertificateChain(null, certificate, null, store, &parameters, 0, null, &chain) != 0) {
+            const server: syscall::SslChainPolicyParameters = syscall::SslChainPolicyParameters {
+                size: sizeof(syscall::SslChainPolicyParameters) as u32,
+                authentication_type: syscall::AUTHTYPE_SERVER,
+                ignored_checks: 0,
+                server_name: null
+            };
+            const policy: syscall::CertificateChainPolicyParameters = syscall::CertificateChainPolicyParameters {
+                size: sizeof(syscall::CertificateChainPolicyParameters) as u32,
+                flags: 0,
+                extra: &server
+            };
+            mut status: syscall::CertificateChainPolicyStatus = syscall::CertificateChainPolicyStatus {
+                size: sizeof(syscall::CertificateChainPolicyStatus) as u32,
+                error: 0, chain_index: 0, element_index: 0, extra: null
+            };
+            trusted = syscall::CertVerifyCertificateChainPolicy(syscall::CERT_CHAIN_POLICY_SSL,
+                chain, &policy, &status) != 0 && status.error == 0;
+            syscall::CertFreeCertificateChain(chain);
+        }
+        syscall::CertFreeCertificateContext(certificate);
+    }
+    syscall::CertCloseStore(store, 0);
+    return trusted;
+}
+
+/// `certificate`'s DER encoding; empty when OpenSSL cannot encode it.
+![target(windows)]
+private function certificate_der(certificate: void*) -> Array<u8> {
+    mut bytes: Array<u8> = Array::<u8>::new();
+    const length: i32 = openssl::i2d_X509(certificate, null);
+    if (length <= 0) { return bytes; }
+    bytes.resize(length as i64, 0);
+    mut cursor: mut u8* = bytes.as_mutable_ptr();
+    if (openssl::i2d_X509(certificate, &cursor) != length) { bytes.clear(); }
+    return bytes;
 }
 
 /// Ignore `SIGPIPE` process-wide. OpenSSL writes through a plain socket

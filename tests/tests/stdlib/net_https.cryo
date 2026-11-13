@@ -49,6 +49,7 @@ import std::net::addr::url::{ Url };
 import std::net::http::client::{ Client };
 import std::test::error::{ TestError };
 import std::test::assert::{ bail, expect_eq };
+import std::sys::syscall;
 import std::future::combinator::{ Futures };
 import std::future::executor::{ Executor };
 
@@ -191,6 +192,30 @@ function https_verifies_a_server_against_an_added_root() -> Result<(), TestError
 function https_refuses_a_server_it_does_not_trust() -> Result<(), TestError> {
     const client: Client = Client::new().expect("TLS context");
     return expect_eq(https_exchange(client, "localhost")?, -221 as i64);
+}
+
+/// A trusted chain is not enough: with the fixture added as a root, asking
+/// for `127.0.0.1`, an address the certificate does not name, is refused.
+![test]
+function https_refuses_a_server_that_does_not_name_the_address() -> Result<(), TestError> {
+    mut client: Client = Client::new().expect("TLS context");
+    const pem: Array<u8> = File::read_bytes(Path::new("fixtures/tls/cert.pem")).expect("fixture cert");
+    match (client.add_root_certificate(pem.as_slice())) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return bail(Str::new("the fixture certificate was refused as a root")); }
+    }
+    return expect_eq(https_exchange(client, "127.0.0.1")?, -221 as i64);
+}
+
+/// The crypt32 parameter structures have the sizes and layout Windows
+/// reads them at.
+![target(windows)]
+![test]
+function crypt32_structures_have_their_c_sizes() -> Result<(), TestError> {
+    expect_eq(sizeof(syscall::CertificateChainParameters) as u64, 32 as u64)?;
+    expect_eq(sizeof(syscall::SslChainPolicyParameters) as u64, 24 as u64)?;
+    expect_eq(sizeof(syscall::CertificateChainPolicyParameters) as u64, 16 as u64)?;
+    return expect_eq(sizeof(syscall::CertificateChainPolicyStatus) as u64, 24 as u64);
 }
 
 /// Bytes that hold no PEM certificate are refused, not silently accepted.
