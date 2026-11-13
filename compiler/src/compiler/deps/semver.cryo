@@ -19,7 +19,7 @@
 namespace compiler::deps::semver;
 
 import std::collections::str;
-import std::collections::string;
+import std::collections::string::{ String };
 
 
 /// Parsed `MAJOR.MINOR.PATCH`.  `valid == false` <=> the source string
@@ -45,8 +45,8 @@ type struct Version {
     /// Parse `vX.Y.Z` or `X.Y.Z`.  Anything trailing the patch (e.g.
     /// `-rc.1` or `+build`) is accepted but discarded.  Returns
     /// `Version::invalid()` on malformed input.
-    static parse(s_text: string) -> Version {
-        const bytes: &Slice<u8> = str::Str::from(s_text).as_bytes();
+    static parse(source: str::Str) -> Version {
+        const bytes: &Slice<u8> = source.as_bytes();
         const len: i64 = bytes.length();
         if (len == 0) { return Version::invalid(); }
 
@@ -99,15 +99,15 @@ type struct Constraint {
     /// Parse a constraint string: the value the user wrote in
     /// `version = "..."`.  The leading `^` selects caret semantics; absent
     /// it, exact match.
-    static parse(s_text: string) -> Constraint {
-        const s: string = s_text;
-        if (s.length() == 0) { return Constraint::invalid(); }
+    static parse(source: str::Str) -> Constraint {
+        if (source.length() == 0) { return Constraint::invalid(); }
 
+        const caret: str::Str = str::Str::new("^");
         mut op:   ConstraintOp = ConstraintOp::Exact;
-        mut body: string       = s;
-        if (s[0] == '^') {
-            op = ConstraintOp::Caret;
-            body = s.substr(1, s.length() as i64 - 1);
+        mut body: str::Str     = source;
+        match (source.strip_prefix(&caret)) {
+            Option::Some(rest) => { op = ConstraintOp::Caret; body = rest; }
+            Option::None       => { }
         }
 
         const v: Version = Version::parse(body);
@@ -145,21 +145,21 @@ type struct Constraint {
     ///
     /// Tags that fail to parse as semver are silently skipped; projects
     /// often have non-version refs like `latest` or `nightly` mixed in.
-    static select_best_tag(c: Constraint, tags: [string]) -> string {
-        mut best_tag: string  = "";
-        mut best_v:   Version = Version::invalid();
+    static select_best_tag(c: Constraint, tags: &[String]) -> String {
+        mut best_index: i64 = -1;
+        mut best_v: Version = Version::invalid();
 
         for (mut i: i64 = 0; i < tags.length(); i++) {
-            const tag: string = tags[i];
-            const v:   Version = Version::parse(tag);
+            const v: Version = Version::parse(tags[i].as_str());
             if (!v.valid) { continue; }
             if (!Constraint::satisfies(c, v)) { continue; }
             if (!best_v.valid || Version::cmp(v, best_v) > 0) {
-                best_v   = v;
-                best_tag = tag;
+                best_v     = v;
+                best_index = i;
             }
         }
 
-        return best_tag;
+        if (best_index < 0) { return String::new(); }
+        return String::from_str(tags[best_index].as_str());
     }
 }

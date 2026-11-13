@@ -1,0 +1,379 @@
+///! `cryo api-index write|check <stdlib root> <index file>`: the standard
+///! library's declarations, one line each, read by the compiler's own lexer
+///! and parser - the file a person greps before writing a helper.
+///!
+///! Each namespace is a block headed by its name and its first file; in it
+///! the types, the implementations, the constants, the free functions and
+///! the methods, each group sorted by its text.  A declaration is written as
+///! its source writes it, from its name through its signature (a function's
+///! `where` clause included), each run of whitespace one space.  `check`
+///! fails when the file is not what `write` would write, so an index that is
+///! stale is a gate failure rather than a wrong answer.
+
+namespace cli::api_index;
+
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::core::cmp::{ Ordering };
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::fmt;
+import std::fs::{ File, Path };
+
+import compiler::compilation_context::{ BuildOptions, CompilationContext };
+import compiler::compile_mode::{ CompileMode };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::parser::source_tree::{ SourceTree };
+import compiler::ast::{ Visibility, TypeAnnotation };
+import compiler::ast::node::{ ProgramNode };
+import compiler::ast::node_locator::{ annotation_span };
+import compiler::ast::declaration::{ DeclarationNode, MethodDecl, FunctionDecl, StructDecl, UnionDecl,
+                                     EnumDecl, TraitDecl, TypeAliasDecl, ImplBlock, VarDecl, ExternBlock };
+
+/// What a line of the index lists; the groups are written in this order.
+type enum ApiEntryKind {
+    Type;
+    Implementation;
+    Constant;
+    Function;
+    Method;
+}
+
+implement enum ApiEntryKind {
+    /// The group's place in a namespace's block.
+    rank(&this) -> i32 {
+        return match (this) {
+            ApiEntryKind::Type           => { 0 }
+            ApiEntryKind::Implementation => { 1 }
+            ApiEntryKind::Constant       => { 2 }
+            ApiEntryKind::Function       => { 3 }
+            ApiEntryKind::Method         => { 4 }
+        };
+    }
+}
+
+/// One line of the index.
+type struct ApiEntry {
+    kind: ApiEntryKind;
+    /// The declaration as written: `Array.push(mut &this, value: T) -> void`.
+    text: String;
+    /// `private` or `internal`, empty for a public declaration.
+    reach: String;
+    /// The text lowercased, which a group is sorted by.
+    sort_key: String;
+}
+
+/// The lines of one namespace.
+type struct ApiNamespace {
+    name: String;
+    /// The first of its files, below the standard library's root.
+    file: String;
+    entries: Array<ApiEntry>;
+}
+
+/// The index of a parsed source tree.
+type struct ApiIndex {
+    tree: SourceTree;
+    namespaces: Array<ApiNamespace>;
+    /// The file being walked, an index into the tree.
+    current: i64;
+    context: mut CompilationContext*;
+
+    /// Read every declaration of `tree`.
+    static of(tree: SourceTree, context: mut CompilationContext*) -> ApiIndex {
+        mut index: ApiIndex = ApiIndex { tree: tree, namespaces: Array::new(), current: 0, context: context };
+        for (mut i: i64 = 0; i < index.tree.length(); i++) {
+            index.current = i;
+            index.walk(index.tree.programs[i]);
+        }
+        return index;
+    }
+
+    walk(mut &this, program: ProgramNode*) -> void {
+        const namespace_name: String = String::from_string(program.namespace_name);
+        for (mut i: i64 = 0; i < program.statements.length(); i++) {
+            const declaration: DeclarationNode* = program.statements[i].as_decl();
+            if (declaration == null) { continue; }
+            this.walk_declaration(&namespace_name, declaration);
+        }
+    }
+
+    walk_declaration(mut &this, namespace_name: &String, declaration: DeclarationNode*) -> void {
+        const free_function: FunctionDecl* = DeclarationNode::fn_of(declaration);
+        if (free_function != null) {
+            this.add(namespace_name, ApiEntryKind::Function, this.signature(declaration, free_function), free_function.visibility);
+            return;
+        }
+        const external: ExternBlock* = DeclarationNode::extern_of(declaration);
+        if (external != null) {
+            for (mut i: i64 = 0; i < external.functions.length(); i++) {
+                const prototype: FunctionDecl* = DeclarationNode::fn_of(external.functions[i]);
+                if (prototype == null) { continue; }
+                this.add(namespace_name, ApiEntryKind::Function, this.signature(external.functions[i], prototype), prototype.visibility);
+            }
+            return;
+        }
+        const structure: StructDecl* = DeclarationNode::struct_of(declaration);
+        if (structure != null) {
+            this.add(namespace_name, ApiEntryKind::Type, f"struct {this.head(declaration, &structure.generic_params)}", structure.visibility);
+            this.walk_methods(namespace_name, this.name_of(declaration), &structure.methods);
+            return;
+        }
+        const union_type: UnionDecl* = DeclarationNode::union_of(declaration);
+        if (union_type != null) {
+            this.add(namespace_name, ApiEntryKind::Type, f"union {this.head(declaration, &union_type.generic_params)}", union_type.visibility);
+            this.walk_methods(namespace_name, this.name_of(declaration), &union_type.methods);
+            return;
+        }
+        const enumeration: EnumDecl* = DeclarationNode::enum_of(declaration);
+        if (enumeration != null) {
+            this.add(namespace_name, ApiEntryKind::Type, f"enum {this.head(declaration, &enumeration.generic_params)}", enumeration.visibility);
+            return;
+        }
+        const trait_type: TraitDecl* = DeclarationNode::trait_of(declaration);
+        if (trait_type != null) {
+            this.add(namespace_name, ApiEntryKind::Type, f"trait {this.head(declaration, &trait_type.generic_params)}", trait_type.visibility);
+            const owner: String = this.name_of(declaration);
+            // A trait's methods are as reachable as the trait, and the parser
+            // holds each as the function itself.
+            for (mut i: i64 = 0; i < trait_type.methods.length(); i++) {
+                const method_function: FunctionDecl* = DeclarationNode::fn_of(trait_type.methods[i]);
+                if (method_function == null) { continue; }
+                const separator: Str = if (method_function.is_static) { Str::new("::") } else { Str::new(".") };
+                this.add(namespace_name, ApiEntryKind::Method,
+                         f"{owner}{separator}{this.signature(trait_type.methods[i], method_function)}", trait_type.visibility);
+            }
+            return;
+        }
+        const alias: TypeAliasDecl* = DeclarationNode::alias_of(declaration);
+        if (alias != null) {
+            this.add(namespace_name, ApiEntryKind::Type,
+                     f"type {this.head(declaration, &alias.generic_params)} = {this.annotation_text(alias.target_annotation)}", alias.visibility);
+            return;
+        }
+        const block: ImplBlock* = DeclarationNode::impl_of(declaration);
+        if (block != null) {
+            this.walk_implementation(namespace_name, declaration, block);
+            return;
+        }
+        const variable: VarDecl* = DeclarationNode::var_of(declaration);
+        if (variable != null) {
+            mut text: String = this.written(declaration.name_span);
+            if (variable.type_annotation != null) {
+                text = f"{text}: {this.annotation_text(variable.type_annotation)}";
+            }
+            if (variable.is_mutable) { text = f"mut {text}"; }
+            if (variable.owner != null) { text = f"{this.owner_of(variable.owner)}::{text}"; }
+            this.add(namespace_name, ApiEntryKind::Constant, text, variable.visibility);
+        }
+    }
+
+    /// A trait implementation is one line, `Target: implements Trait`, and
+    /// its methods are the trait's, listed with it; an inherent block's
+    /// methods are its target's own.
+    walk_implementation(mut &this, namespace_name: &String, declaration: DeclarationNode*, block: ImplBlock*) -> void {
+        if (!block.is_trait_impl()) {
+            this.walk_methods(namespace_name, this.written(block.target_type_span), &block.methods);
+            return;
+        }
+        if (block.derived_for != null) {
+            // Generated from a `with [...]` entry: the target is the type the
+            // clause belongs to, the trait the entry as written.
+            this.add(namespace_name, ApiEntryKind::Implementation,
+                     f"{this.type_head(block.derived_for)}: implements {this.written(declaration.span)}", Visibility::Public);
+            return;
+        }
+        mut target: String = this.written(block.target_type_span);
+        if (block.target_args.length() > 0) {
+            mut arguments: String = String::new();
+            for (mut i: i64 = 0; i < block.target_args.length(); i++) {
+                if (i > 0) { arguments.push(", "); }
+                arguments.push(this.annotation_text(block.target_args[i]).as_str());
+            }
+            target = f"{target}<{arguments}>";
+        }
+        if (block.target_reference) {
+            target = if (block.target_reference_mutable) { f"mut &{target}" } else { f"&{target}" };
+        }
+        this.add(namespace_name, ApiEntryKind::Implementation,
+                 f"{target}: implements {this.annotation_text(block.trait_annotation)}", Visibility::Public);
+    }
+
+    /// The methods and statics of `owner`, `Owner.method` and
+    /// `Owner::static`.
+    walk_methods(mut &this, namespace_name: &String, owner: String, methods: &[DeclarationNode*]) -> void {
+        for (mut i: i64 = 0; i < methods.length(); i++) {
+            const method: MethodDecl* = DeclarationNode::method_of(methods[i]);
+            if (method == null || method.func == null) { continue; }
+            const method_function: FunctionDecl* = DeclarationNode::fn_of(method.func);
+            if (method_function == null) { continue; }
+            const separator: Str = if (method.is_static) { Str::new("::") } else { Str::new(".") };
+            this.add(namespace_name, ApiEntryKind::Method,
+                     f"{owner}{separator}{this.signature(method.func, method_function)}", method.visibility);
+        }
+    }
+
+    /// A function from its name through its signature and `where` clause.
+    signature(&this, declaration: DeclarationNode*, declared: FunctionDecl*) -> String {
+        const start: SourceSpan = declaration.name_span;
+        const end: SourceSpan = declared.bounds_anchor;
+        return this.written(SourceSpan::new(start.file, start.start_line, start.start_col, end.end_line, end.end_col));
+    }
+
+    /// A type's name and its generic parameters as written.
+    head(&this, declaration: DeclarationNode*, generic_params: &[DeclarationNode*]) -> String {
+        const name: String = this.written(declaration.name_span);
+        if (generic_params.length() == 0) { return name; }
+        mut parameters: String = String::new();
+        for (mut i: i64 = 0; i < generic_params.length(); i++) {
+            if (i > 0) { parameters.push(", "); }
+            parameters.push(this.written(generic_params[i].span).as_str());
+        }
+        return f"{name}<{parameters}>";
+    }
+
+    /// The head of the struct, union or enum `declaration`.
+    type_head(&this, declaration: DeclarationNode*) -> String {
+        const structure: StructDecl* = DeclarationNode::struct_of(declaration);
+        if (structure != null) { return this.head(declaration, &structure.generic_params); }
+        const union_type: UnionDecl* = DeclarationNode::union_of(declaration);
+        if (union_type != null) { return this.head(declaration, &union_type.generic_params); }
+        const enumeration: EnumDecl* = DeclarationNode::enum_of(declaration);
+        if (enumeration != null) { return this.head(declaration, &enumeration.generic_params); }
+        return this.written(declaration.name_span);
+    }
+
+    /// The type a type constant belongs to: a type, or an inherent block's
+    /// target.
+    owner_of(&this, owner: DeclarationNode*) -> String {
+        const block: ImplBlock* = DeclarationNode::impl_of(owner);
+        if (block != null) { return this.written(block.target_type_span); }
+        return this.name_of(owner);
+    }
+
+    name_of(&this, declaration: DeclarationNode*) -> String {
+        return this.written(declaration.name_span);
+    }
+
+    annotation_text(&this, annotation: TypeAnnotation*) -> String {
+        return this.written(annotation_span(annotation));
+    }
+
+    written(&this, span: SourceSpan) -> String {
+        return this.tree.written_text(this.current, span);
+    }
+
+    add(mut &this, namespace_name: &String, kind: ApiEntryKind, text: String, visibility: Visibility) -> void {
+        const reach: String = match (visibility) {
+            Visibility::Public => { String::new() }
+            _ => { String::from_string(visibility.label()) }
+        };
+        const entry: ApiEntry = ApiEntry { kind: kind, sort_key: text.to_ascii_lowercase(), text: text, reach: reach };
+        for (mut i: i64 = 0; i < this.namespaces.length(); i++) {
+            if (this.namespaces[i].name == *namespace_name) {
+                this.namespaces[i].entries.push(entry);
+                return;
+            }
+        }
+        mut entries: Array<ApiEntry> = Array::new();
+        entries.push(entry);
+        this.namespaces.push(ApiNamespace {
+            name: namespace_name.clone(),
+            file: this.tree.paths[this.current].clone(),
+            entries: entries,
+        });
+    }
+
+    /// The index file's text.
+    render(mut &this) -> String {
+        this.namespaces.sort_by_key((listed: &ApiNamespace) -> String { return listed.name.clone(); });
+        mut body: String = String::new();
+        mut total: i64 = 0;
+        for (mut n: i64 = 0; n < this.namespaces.length(); n++) {
+            this.namespaces[n].entries.sort_by((left: &ApiEntry, right: &ApiEntry) -> Ordering {
+                if (left.kind.rank() != right.kind.rank()) { return left.kind.rank().compare(&right.kind.rank()); }
+                return left.sort_key.compare(&right.sort_key);
+            });
+            const entries: &Array<ApiEntry> = &this.namespaces[n].entries;
+            body.push(RULE);
+            body.push("\n");
+            body.push(f"{this.namespaces[n].name}\n    stdlib/{this.namespaces[n].file}\n");
+            body.push(RULE);
+            body.push("\n");
+            for (mut i: i64 = 0; i < entries.length(); i++) {
+                // A declaration written once per target is listed once.
+                if (i > 0 && entries[i].kind.rank() == entries[i - 1].kind.rank() && entries[i].text == entries[i - 1].text) { continue; }
+                total = total + 1;
+                if (entries[i].reach.length() == 0) {
+                    body.push(f"  {entries[i].text}\n");
+                } else {
+                    body.push(f"  {entries[i].text}   [{entries[i].reach}]\n");
+                }
+            }
+            body.push("\n");
+        }
+        mut text: String = String::new();
+        text.push(HEADER);
+        text.push(f"# {this.namespaces.length()} namespaces, {total} declarations.\n\n");
+        text.push(body.as_str());
+        return text;
+    }
+}
+
+const RULE: string = "==============================================================================";
+
+const HEADER: string = "# Cryo standard library -- API index
+#
+# GENERATED by `cryo api-index`. Do not edit.
+# Regenerate with `make api-index`.
+#
+# Grep this file BEFORE writing a helper. Most utility operations
+# already exist; a near-duplicate is worse than an imperfect call.
+#
+#   Type::NAME: T     a type's constant
+#   Type::name(...)   static method / constructor
+#   Type.name(...)    instance method
+#   name(...)         free function
+#   [private]         not reachable from another module
+#   [internal]        reachable only from the standard library
+#
+";
+
+/// `cryo api-index write|check <stdlib root> <index file>`.
+public function run(mode: Str, root: Str, index_path: Str) -> int {
+    if (mode != Str::new("write") && mode != Str::new("check")) {
+        fmt::eprintln(f"error: cryo api-index: unknown mode `{mode}`; usage: cryo api-index write|check <stdlib root> <index file>");
+        return 2;
+    }
+    mut context: CompilationContext = CompilationContext::new(
+        BuildOptions::defaults(CompileMode::SingleFile), "<api-index>", null);
+    const tree: SourceTree = match (SourceTree::parse(Path::from(root), &context)) {
+        Result::Ok(tree) => { tree }
+        Result::Err(message) => { fmt::eprintln(f"error: cryo api-index: {message}"); return 2; }
+    };
+    mut index: ApiIndex = ApiIndex::of(tree, &context);
+    const text: String = index.render();
+    if (mode == Str::new("check")) {
+        const current: String = match (File::read_text(Path::from(index_path))) {
+            Result::Ok(current) => { current }
+            Result::Err(error) => {
+                fmt::eprintln(f"api-index: {index_path} cannot be read ({error}); run `make api-index`");
+                return 1;
+            }
+        };
+        // A checkout that turned line ends into CRLF holds the same index.
+        if (current.as_str().replace(&Str::new("\r\n"), &Str::new("\n")) != text) {
+            fmt::eprintln(f"api-index: {index_path} is STALE; run `make api-index` and commit the result");
+            return 1;
+        }
+        fmt::println(f"api-index: {index_path} is up to date");
+        return 0;
+    }
+    match (File::write_text(Path::from(index_path), text.as_str())) {
+        Result::Ok(_) => { }
+        Result::Err(error) => { fmt::eprintln(f"error: cryo api-index: cannot write {index_path}: {error}"); return 2; }
+    }
+    fmt::println(f"api-index: wrote {index_path}");
+    return 0;
+}

@@ -7,7 +7,15 @@ namespace CryoTests::Tests::Stdlib::ProcessSignals;
 
 import std::core::result::{ Result };
 import std::core::option::{ Option };
+import std::core::mem;
+import std::collections::array::{ Array };
 import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::io::traits;
+import std::io::stdio::{ stdout, Stdout };
+import std::process::command::{ Command, Stdio };
+import std::process::child::{ Child, ChildStdout, ExitStatus };
+import std::test::test_child::{ TestChild };
 import std::process::signal::{ Signal };
 import std::process::signal_handling::{ Signals };
 import std::time::duration::{ Duration };
@@ -16,7 +24,7 @@ import std::ffi::libc;
 import std::thread;
 import std::thread::{ JoinHandle };
 import std::test::error::{ TestError };
-import std::test::assert::{ expect, expect_eq };
+import std::test::assert::{ bail, expect, expect_eq };
 
 /// With nothing arrived, `try_wait` answers at once and `wait_timeout`
 /// waits its whole duration.
@@ -67,3 +75,125 @@ function a_signal_on_another_thread_wakes_a_blocked_wait() -> Result<(), TestErr
     expect_eq(received.unwrap().as_i32(), Signal::terminate().as_i32())?;
     return expect(elapsed < 4000, Str::new("the wait ends when the signal arrives"));
 }
+
+/// The child the delivery tests listen through: it listens, says it is
+/// ready, and writes the one signal it receives.
+![test_child]
+function listens_and_reports_one_signal() -> Result<(), TestError> {
+    const signals: Signals = Signals::listen()?;
+    mut out: Stdout = stdout();
+    out.write(Str::new("ready\n").as_bytes())?;
+    out.flush()?;
+    match (signals.wait_timeout(Duration::from_millis(10000))) {
+        Option::Some(received) => {
+            mut line: String = String::new();
+            line.push(received.as_i32());
+            line.push_char('\n');
+            out.write(line.as_str().as_bytes())?;
+            out.flush()?;
+            return Result::Ok(());
+        }
+        Option::None => { return bail(Str::new("no signal arrived")); }
+    }
+}
+
+/// A child that listened and stopped: the interrupt's default action is
+/// back, so the interrupt ends it before its sleep is over.
+![test_child]
+function listens_then_stops_listening() -> Result<(), TestError> {
+    const signals: Signals = Signals::listen()?;
+    mem::drop(signals);
+    mut out: Stdout = stdout();
+    out.write(Str::new("ready\n").as_bytes())?;
+    out.flush()?;
+    thread::sleep_ms(10000);
+    return bail(Str::new("the signal did not end the child"));
+}
+
+// Starts `role` as a grouped child with its output piped, and returns once
+// it has said it is ready: a signal sent earlier could land before its
+// handler is in place, or while a Windows child is still loading.
+function start_ready_child(role: Str, output: mut &Option<ChildStdout>) -> Result<Child, TestError> {
+    mut name: String = String::from_str(Str::new("CryoTests::Tests::Stdlib::ProcessSignals::"));
+    name.push(role);
+    mut command: Command = TestChild::command(name.as_str())?;
+    command.stdout(Stdio::Piped).group_descendants();
+    mut child: Child = command.spawn()?;
+    mut pipe: ChildStdout = child.stdout.take().unwrap();
+    mut line: Array<u8> = Array::new();
+    pipe.read_until('\n' as u8, &line)?;
+    expect(Str::from_raw(line.as_ptr(), line.length()).equals(&Str::new("ready\n")),
+           Str::new("the child says it is ready"))?;
+    *output = Option::Some(pipe);
+    return Result::Ok(child);
+}
+
+// Waits up to five seconds for `child` to end, ending its tree if it does
+// not.
+function ending_within_five_seconds(child: mut &Child) -> Result<Option<ExitStatus>, TestError> {
+    const status: Option<ExitStatus> = child.wait_timeout(Duration::from_millis(5000))?;
+    if (status.is_none()) {
+        child.kill_tree()?;
+        child.wait()?;
+    }
+    return Result::Ok(status);
+}
+
+// Sends `sent` to a listening child and checks that it received exactly that
+// signal and ended normally.
+function round_trip(sent: Signal) -> Result<(), TestError> {
+    mut output: Option<ChildStdout> = Option::None;
+    mut child: Child = start_ready_child(Str::new("listens_and_reports_one_signal"), &output)?;
+    child.send_signal(sent)?;
+    const status: Option<ExitStatus> = ending_within_five_seconds(&child)?;
+    mut rest: Array<u8> = Array::new();
+    output.unwrap().read_to_end(&rest)?;
+    mut expected: String = String::new();
+    expected.push(sent.as_i32());
+    expected.push_char('\n');
+    expect(status.is_some(), Str::new("the child ends after the signal"))?;
+    expect_eq(status.unwrap().exit_code(), Option::Some(0))?;
+    return expect(Str::from_raw(rest.as_ptr(), rest.length()).equals(&expected.as_str()),
+                  Str::new("the child received the signal that was sent"));
+}
+
+/// An interrupt sent from another process reaches a listening child.
+![test]
+function an_interrupt_from_another_process_is_received() -> Result<(), TestError> {
+    return round_trip(Signal::interrupt());
+}
+
+/// A terminate sent from another process reaches a listening child.
+/// Windows has no terminate a process can send to another.
+![target(unix)]
+![test]
+function a_terminate_from_another_process_is_received() -> Result<(), TestError> {
+    return round_trip(Signal::terminate());
+}
+
+/// Once the last listener is dropped, the interrupt's default action ends
+/// the process again.
+![test]
+function dropping_the_last_listener_restores_the_default() -> Result<(), TestError> {
+    mut output: Option<ChildStdout> = Option::None;
+    mut child: Child = start_ready_child(Str::new("listens_then_stops_listening"), &output)?;
+    child.send_signal(Signal::interrupt())?;
+    const status: Option<ExitStatus> = ending_within_five_seconds(&child)?;
+    expect(status.is_some(), Str::new("the child ends at the interrupt"))?;
+    return expect_eq(ending_of(status.unwrap()), interrupt_ending());
+}
+
+// What ended a child: the signal on POSIX, the exit code on Windows, 0 for
+// none.
+![target(unix)]
+function ending_of(status: ExitStatus) -> i32 { return status.terminating_signal().unwrap_or(0); }
+![target(windows)]
+function ending_of(status: ExitStatus) -> i32 { return status.exit_code().unwrap_or(0); }
+
+// How the interrupt's default action ends a process. The default console
+// control handler ends it with STATUS_CONTROL_C_EXIT, for Ctrl-Break as for
+// Ctrl-C.
+![target(unix)]
+function interrupt_ending() -> i32 { return Signal::interrupt().as_i32(); }
+![target(windows)]
+function interrupt_ending() -> i32 { return 0xC000013A as i32; }

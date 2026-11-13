@@ -1,0 +1,127 @@
+///! A directory of sources read as written: every `.cryo` file under it
+///! lexed and parsed, nothing resolved.  What a tool that reads declarations
+///! as they are written walks - the API index, the documentation coverage
+///! check - with the text of any construct still to hand.
+
+namespace compiler::parser::source_tree;
+
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::fs::{ Directory, DirectoryEntries, File, Path };
+import std::thread;
+
+import compiler::compilation_context::{ CompilationContext };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::lex::{ Token, TokenType };
+import compiler::lex::lexer::{ Lexer };
+import compiler::parser::cursor::{ Parser };
+import compiler::ast::node::{ ProgramNode };
+
+// The parser recurses once per level of nesting; a thread of its own gives
+// it the stack the compiler's own parsing pass gives it.
+const PARSER_STACK_BYTES: u64 = 64 << 20;
+
+/// Every `.cryo` file under one directory, parsed.  Files are read in path
+/// order, a directory's files before its subdirectories' in name order, so
+/// the order is the same on every host; a directory whose name starts with
+/// `.` (build output) is not read.
+type struct SourceTree {
+    /// Each file's tree.
+    programs: Array<mut ProgramNode*>;
+    /// Each program's file below the root, `/`-separated: `io/stdio.cryo`.
+    paths: Array<String>;
+    /// Each program's parser, which holds the file's tokens: the text of a
+    /// construct is read back through it.
+    parsers: Array<Parser>;
+
+    /// Parse every `.cryo` file under `root`.  An error names the file that
+    /// could not be read or does not parse.
+    static parse(root: Path, context: mut CompilationContext*) -> Result<SourceTree, String> {
+        mut tree: SourceTree = SourceTree { programs: Array::new(), paths: Array::new(), parsers: Array::new() };
+        tree.parse_directory(root, &String::new(), context)?;
+        return Result::Ok(tree);
+    }
+
+    /// How many files were parsed.
+    length(&this) -> i64 {
+        return this.programs.length();
+    }
+
+    /// The tokens of file `index` that `span` covers, as written, each run
+    /// of whitespace between two tokens written as one space and comments
+    /// left out.  Empty for a span no token of the file starts, as a
+    /// construct the parser generated has.
+    written_text(&this, index: i64, span: SourceSpan) -> String {
+        return String::from_string(this.parsers[index].written_text_of(span));
+    }
+
+    parse_directory(mut &this, directory: Path, below_root: &String, context: mut CompilationContext*) -> Result<(), String> {
+        mut entries: DirectoryEntries = match (Directory::entries(directory)) {
+            Result::Ok(entries) => { entries }
+            Result::Err(error) => { return Result::Err(f"{directory.as_str()}: {error}"); }
+        };
+        mut files: Array<String> = Array::new();
+        mut directories: Array<String> = Array::new();
+        loop {
+            match (entries.next()) {
+                Option::Some(entry) => {
+                    if (entry.is_directory()) {
+                        if (!entry.name().starts_with(&Str::new("."))) { directories.push(String::from_str(entry.name())); }
+                    } else if (entry.name().ends_with(&Str::new(".cryo"))) {
+                        files.push(String::from_str(entry.name()));
+                    }
+                }
+                Option::None => { break; }
+            }
+        }
+        files.sort();
+        directories.sort();
+        for (mut i: i64 = 0; i < files.length(); i++) {
+            this.parse_file(directory.join(files[i].as_str()).as_path(), SourceTree::below(below_root, &files[i]), context)?;
+        }
+        for (mut i: i64 = 0; i < directories.length(); i++) {
+            this.parse_directory(directory.join(directories[i].as_str()).as_path(),
+                                 &SourceTree::below(below_root, &directories[i]), context)?;
+        }
+        return Result::Ok(());
+    }
+
+    parse_file(mut &this, path: Path, below_root: String, context: mut CompilationContext*) -> Result<(), String> {
+        const text: String = match (File::read_text(path)) {
+            Result::Ok(text) => { text }
+            Result::Err(error) => { return Result::Err(f"{path.as_str()}: {error}"); }
+        };
+        // The tokens point into both strings for as long as the tree lives.
+        const path_text: string = String::from_str(path.as_str()).into_raw();
+        mut lexer: Lexer = Lexer::new(path_text, text.into_raw(), context.diagnostics);
+        const tokens: [Token] = lexer.lex();
+        mut kept: [Token] = [];
+        for (mut i: i64 = 0; i < tokens.length(); i++) {
+            if (tokens[i].kind != TokenType::Unknown && tokens[i].kind != TokenType::Comment) {
+                kept.push(tokens[i]);
+            }
+        }
+        mut parser: Parser = Parser::new(kept, path_text, context);
+        const parser_at: mut Parser* = &parser;
+        const parsing: thread::JoinHandle<mut ProgramNode*> = thread::Builder::new()
+            .stack_size(PARSER_STACK_BYTES)
+            .spawn(move () -> mut ProgramNode* { return parser_at.parse(); });
+        const root: mut ProgramNode* = parsing.join();
+        if (root == null || context.diagnostics.has_errors()) {
+            return Result::Err(f"{path.as_str()}: does not parse");
+        }
+        this.programs.push(root);
+        this.paths.push(below_root);
+        this.parsers.push(parser);
+        return Result::Ok(());
+    }
+
+    // `name` below the directory `below_root` names, `/`-separated.
+    static below(below_root: &String, name: &String) -> String {
+        if (below_root.length() == 0) { return name.clone(); }
+        return f"{below_root}/{name}";
+    }
+}
