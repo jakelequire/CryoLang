@@ -171,10 +171,10 @@ type struct ModuleLoader {
 
     // Circular dependency detection.
     // loading[i].first is the path; loading[i].second is true while it is being loaded.
-    loading: [Pair<string, boolean>];
+    loading: [Pair<String, boolean>];
 
     // Already-loaded file paths (dedup)
-    loaded_paths: [string];
+    loaded_paths: [String];
 
 private:
     // Normalized file path -> declared namespace, recorded as soon as a
@@ -187,7 +187,7 @@ private:
     // and the module's import list would not reach a module it plainly
     // imports.  This map is what makes the edge resolvable while
     // the target is still on the loading stack.
-    scanned_ns: HashMap<string, string, GlobalAlloc, FnvHasher>;
+    scanned_ns: HashMap<String, string, GlobalAlloc, FnvHasher>;
 
     // Pre-scanned namespace -> file_path map.
     // Built by scan_all_project_files() before discovery begins.
@@ -199,7 +199,7 @@ private:
     // `vendor::<Name>` import resolved to.  The generated file declares
     // `namespace <Name>;`, but the module is registered under the path the
     // import writes, because an import names a module whole.
-    vendor_modules: HashMap<string, string, GlobalAlloc, FnvHasher>;
+    vendor_modules: HashMap<String, string, GlobalAlloc, FnvHasher>;
 
     // Every `module` line of every pre-scanned file, whether or not this
     // build loads that file.  A module's reach is declared by its package's
@@ -265,9 +265,9 @@ public:
             extra_roots:   extra_roots,
             loading: [],
             loaded_paths:  [],
-            scanned_ns:    HashMap::<string, string, GlobalAlloc, FnvHasher>::new(),
+            scanned_ns:    HashMap::<String, string, GlobalAlloc, FnvHasher>::new(),
             ns_map:        HashMap::<string, string, GlobalAlloc, FnvHasher>::new(),
-            vendor_modules: HashMap::<string, string, GlobalAlloc, FnvHasher>::new(),
+            vendor_modules: HashMap::<String, string, GlobalAlloc, FnvHasher>::new(),
             module_lines:   [],
             listings:       DirectoryListings::new(),
             index_cache:    NamespaceIndexCache::closed(),
@@ -539,7 +539,7 @@ public:
                 from_dir:    file_path.parent_dir(),
                 declarer:    ModuleGraph::module_key(file_path),
                 is_internal: declared.module_internal[s],
-                target:      "",
+                target:      String::new(),
                 resolved:    false,
             });
         }
@@ -560,7 +560,7 @@ public:
                 name:              intern.intern(names[i]),
                 file_path:         files[i],
                 package:           roots.package_of(files[i]),
-                declared_internal: this.declared_internal(intern, ModuleGraph::module_key(files[i])),
+                declared_internal: this.declared_internal(intern, ModuleGraph::module_key(files[i]).as_str()),
             });
         }
         return out;
@@ -572,20 +572,20 @@ public:
     /// answer does not depend on which files this build loads.  A line's
     /// path resolves as discovery resolves it, once the pre-scan has
     /// indexed every namespace it can name.
-    declared_internal(mut &this, intern: InternTable*, norm_path: string) -> boolean {
+    declared_internal(mut &this, intern: InternTable*, norm_path: Str) -> boolean {
         for (mut k: i64 = 0; k < this.module_lines.length(); k++) {
             if (this.module_lines[k].resolved) { continue; }
             this.module_lines[k].target = ModuleGraph::module_key(this.resolve_import_path(
                 intern, this.module_lines[k].written, this.module_lines[k].from_dir));
             this.module_lines[k].resolved = true;
         }
-        mut chain: [string] = [norm_path];
+        mut chain: [String] = [String::from_str(norm_path)];
         for (mut c: i64 = 0; c < chain.length(); c++) {
             for (mut k: i64 = 0; k < this.module_lines.length(); k++) {
-                if (!this.module_lines[k].target.eq(chain[c])) { continue; }
+                if (this.module_lines[k].target != chain[c]) { continue; }
                 if (this.module_lines[k].is_internal) { return true; }
                 if (!chain.contains(&this.module_lines[k].declarer)) {
-                    chain.push(this.module_lines[k].declarer);
+                    chain.push(this.module_lines[k].declarer.clone());
                 }
             }
         }
@@ -813,17 +813,17 @@ public:
         // (`<root>/./core/x.cryo` from a `source_dir` of `.`).  The key
         // ensures we only load and register each physical file once, and
         // the module keeps the one spelling.
-        const file_path: string = ModuleGraph::module_spelling(written_path);
-        const norm_path: string = ModuleGraph::module_key(file_path);
+        const file_path: string = ModuleGraph::module_spelling(written_path).into_raw();
+        const norm_path: String = ModuleGraph::module_key(file_path);
 
-        if (this.is_loaded(norm_path)) { return true; }
+        if (this.is_loaded(&norm_path)) { return true; }
 
         // Circular dependency: this module is already being loaded
         // (i.e., we are inside its own import subtree).  This is expected
         // for mutually-referencing modules (e.g., ast::Node <-> ast::Expression).
         // During *discovery* we only need to know that the file exists and
         // will be registered; the topological sort handles actual ordering.
-        if (this.is_loading(norm_path)) {
+        if (this.is_loading(&norm_path)) {
             return true;
         }
 
@@ -840,7 +840,7 @@ public:
         }
 
         // Mark as loading (use normalized path for dedup)
-        this.push_loading(norm_path);
+        this.push_loading(&norm_path);
 
         if (Log::enabled(LogArea::Loader, LogLevel::Trace)) {
             Log::trace(LogArea::Loader, f"discovering {file_path}");
@@ -893,14 +893,14 @@ public:
         const mod_name_str: string = intern.resolve(mod_name);
         mut info: ModuleInfo = ModuleInfo::with_namespace(
             mod_name, file_path, mod_name);
-        info.declared_internal = this.declared_internal(intern, norm_path);
+        info.declared_internal = this.declared_internal(intern, norm_path.as_str());
         info.lexed = lexed;
 
         // Publish this module's namespace BEFORE recursing into its imports.
         // Inside a cycle the recursion comes back around and asks for this
         // module's namespace while it is still mid-load; without this the
         // dependency edge degrades to the raw import path.  See `scanned_ns`.
-        this.scanned_ns.insert(norm_path, mod_name_str);
+        this.scanned_ns.insert(norm_path.clone(), mod_name_str);
 
         // Directory of the current file, used to resolve bare sub-module
         // names (e.g., `module Commands;` in src/CLI/_module.cryo
@@ -1236,8 +1236,8 @@ public:
         graph.add_module(info, intern);
 
         // Mark as loaded, remove from loading set (use normalized path)
+        this.pop_loading(&norm_path);
         this.mark_loaded(norm_path);
-        this.pop_loading(norm_path);
 
         return success;
     }
@@ -1310,38 +1310,33 @@ public:
 
     // Loading set management
 
-    is_loading(&this, path: string) -> boolean {
+    is_loading(&this, path: &String) -> boolean {
         for (mut i: i64 = 0; i < this.loading.length(); i++) {
-            if (this.loading[i].second && this.loading[i].first.eq(path)) {
+            if (this.loading[i].second && this.loading[i].first == *path) {
                 return true;
             }
         }
         return false;
     }
 
-    push_loading(mut &this, path: string) -> void {
-        this.loading.push(Pair::new(path, true));
+    push_loading(mut &this, path: &String) -> void {
+        this.loading.push(Pair::new(path.clone(), true));
     }
 
-    pop_loading(mut &this, path: string) -> void {
+    pop_loading(mut &this, path: &String) -> void {
         for (mut i: i64 = 0; i < this.loading.length(); i++) {
-            if (this.loading[i].second && this.loading[i].first.eq(path)) {
+            if (this.loading[i].second && this.loading[i].first == *path) {
                 this.loading[i].second = false;
                 return;
             }
         }
     }
 
-    is_loaded(&this, path: string) -> boolean {
-        for (mut i: i64 = 0; i < this.loaded_paths.length(); i++) {
-            if (this.loaded_paths[i].eq(path)) {
-                return true;
-            }
-        }
-        return false;
+    is_loaded(&this, path: &String) -> boolean {
+        return this.loaded_paths.contains(path);
     }
 
-    mark_loaded(mut &this, path: string) -> void {
+    mark_loaded(mut &this, path: String) -> void {
         this.loaded_paths.push(path);
     }
 
@@ -1865,8 +1860,8 @@ type struct ModuleScanResult {
 type struct ModuleLine {
     written:     SymbolStr;
     from_dir:    string;
-    declarer:    string;
+    declarer:    String;
     is_internal: boolean;
-    target:      string;
+    target:      String;
     resolved:    boolean;
 }
