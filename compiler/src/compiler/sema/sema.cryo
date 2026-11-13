@@ -780,7 +780,11 @@ type struct SemaVisitor {
         // The declaration's own registration, by the id it stamped - for an
         // injected specialization the one its injector wrote, whichever
         // module the clone was placed in.
-        const st_type: TypeRef = this.ctx.decl_index.type_of_decl(node.def, "sema/visit:StructDecl");        if (node.is_generic()) {
+        const st_type: TypeRef = this.ctx.decl_index.type_of_decl(node.def, "sema/visit:StructDecl");
+        mut in_body: [ImplBlock*] = [];
+        for (mut k: i64 = 0; k < node.methods.length(); k++) { in_body.push(null); }
+        this.refuse_identical_methods(&node.methods, &in_body, 0);
+        if (node.is_generic()) {
             this.symbolic_check_owner_methods(node.methods, st_type, node.generic_params);
             return;
         }
@@ -789,6 +793,9 @@ type struct SemaVisitor {
 
     visit_union(mut &this, node: UnionDecl*) -> void {
         const un_type: TypeRef = this.ctx.decl_index.type_of_decl(node.def, "sema/visit:UnionDecl");
+        mut in_body: [ImplBlock*] = [];
+        for (mut k: i64 = 0; k < node.methods.length(); k++) { in_body.push(null); }
+        this.refuse_identical_methods(&node.methods, &in_body, 0);
         if (node.is_generic()) {
             this.symbolic_check_owner_methods(node.methods, un_type, node.generic_params);
             return;
@@ -1542,6 +1549,31 @@ type struct SemaVisitor {
                 earlier.push(blocks[i]);
             }
         }
+        if (node_for_every) {
+            mut declared: [DeclarationNode*] = [];
+            mut blocks_of: [ImplBlock*] = [];
+            const body_methods: [DeclarationNode*]* = MethodDecl::methods_in(body);
+            if (body_methods != null) {
+                for (mut k: i64 = 0; k < (*body_methods).length(); k++) {
+                    declared.push((*body_methods)[k]);
+                    blocks_of.push(null);
+                }
+            }
+            for (mut ei: i64 = 0; ei < earlier.length(); ei++) {
+                const block: ImplBlock* = DeclarationNode::impl_of(earlier[ei]);
+                if (!block.accepts_every_instance()) { continue; }
+                for (mut k: i64 = 0; k < block.methods.length(); k++) {
+                    declared.push(block.methods[k]);
+                    blocks_of.push(block);
+                }
+            }
+            const first_checked: i64 = declared.length();
+            for (mut k: i64 = 0; k < node.methods.length(); k++) {
+                declared.push(node.methods[k]);
+                blocks_of.push(node);
+            }
+            this.refuse_identical_methods(&declared, &blocks_of, first_checked);
+        }
         const target: string = this.intern.resolve(node.target_type);
         for (mut mi: i64 = 0; mi < node.methods.length(); mi++) {
             const m: MethodDecl* = DeclarationNode::method_of(node.methods[mi]);
@@ -1583,6 +1615,66 @@ type struct SemaVisitor {
                 break;
             }
         }
+    }
+
+    /// No two of the methods every instance of a type has - those its body
+    /// declares and those of its blocks for every instance - share a name
+    /// and take the same parameters (E0308).  A call is selected among the
+    /// methods of its name by its arguments, so of two such declarations
+    /// one could never be called, and which one would depend on the order
+    /// they were written in.  `declared` are the methods in the order they
+    /// were written, each beside the block declaring it (`blocks_of`, null
+    /// for the type's body); those from `first_checked` on are checked
+    /// against every one before them.  Static methods and methods taking a
+    /// receiver are told apart, and so are methods with different numbers
+    /// of type parameters of their own.
+    refuse_identical_methods(mut &this, declared: &[DeclarationNode*], blocks_of: &[ImplBlock*],
+                             first_checked: i64) -> void {
+        for (mut mi: i64 = first_checked; mi < declared.length(); mi++) {
+            const m: MethodDecl* = DeclarationNode::method_of(declared[mi]);
+            if (m == null || m.func == null) { continue; }
+            const name: SymbolStr = DeclarationNode::fn_of(m.func).name;
+            const own_count: i64 = DeclarationNode::fn_of(m.func).generic_params.length();
+            const own_types: [TypeRef] = this.parameters_in_owner(m, blocks_of[mi]);
+            mut first: MethodDecl* = null;
+            for (mut k: i64 = 0; k < mi && first == null; k++) {
+                const candidate: MethodDecl* = DeclarationNode::method_of(declared[k]);
+                if (candidate == null || candidate.func == null || candidate.is_static != m.is_static
+                        || !DeclarationNode::fn_of(candidate.func).name.equals(name)
+                        || DeclarationNode::fn_of(candidate.func).generic_params.length() != own_count) {
+                    continue;
+                }
+                const their_types: [TypeRef] = this.parameters_in_owner(candidate, blocks_of[k]);
+                mut same: boolean = own_types.length() == their_types.length();
+                for (mut i: i64 = 0; i < own_types.length() && same; i++) {
+                    same = own_types[i].is_valid() && own_types[i].equals(their_types[i]);
+                }
+                if (same) { first = candidate; }
+            }
+            if (first == null) { continue; }
+            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0308_CONFLICTING_TRAIT_IMPL,
+                fmt::format("conflicting definitions of method `%s`: both take the same parameters",
+                    this.intern.resolve(name)));
+            d = d.at_with_label(m.func.name_span, "defined again here");
+            d = d.also_at(first.func.name_span, "first defined here");
+            d = d.with_note("a call is selected among the methods of its name by its arguments, so only one of these could ever be called; rename one, or keep one definition");
+            this.ctx.emit_diagnostic(d);
+        }
+    }
+
+    /// The types `method`'s call parameters take, written in the type's own
+    /// parameters: a block's are bound to them through its head
+    /// (`implement<U> struct Wrap<U>`'s `U` is `Wrap`'s `T`), the body's are
+    /// already.  `block` is null for a method of the body.
+    parameters_in_owner(mut &this, method: MethodDecl*, block: ImplBlock*) -> [TypeRef] {
+        const types: [TypeRef] = method.call_parameter_types();
+        if (block == null) { return types; }
+        mut head: TypeSubstitution = TypeResolutionPasses::impl_params_to_owner(block, this.ctx, this.arena);
+        mut in_owner: [TypeRef] = [];
+        for (mut i: i64 = 0; i < types.length(); i++) {
+            in_owner.push(if (types[i].is_valid()) { head.apply(types[i], this.arena) } else { types[i] });
+        }
+        return in_owner;
     }
 
     /// A type's constant shares its name with no other member of the type -
